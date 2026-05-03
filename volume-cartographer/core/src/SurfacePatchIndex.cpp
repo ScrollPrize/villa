@@ -1453,7 +1453,7 @@ SurfacePatchIndex::Impl::collectEntriesForRebuild(QuadSurface* surface,
 
     for (int row = 0; row < cellRowCount; row += samplingStride) {
         for (int col = 0; col < cellColCount; col += samplingStride) {
-            Entry entry;
+            Entry entry{Box3{}, PatchRecord{}};
             if (!buildEntryForCell(surface, points, col, row, samplingStride, bboxPadding, entry)) {
                 continue;
             }
@@ -1547,7 +1547,7 @@ SurfacePatchIndex::Impl::collectMappedEntriesForRebuild(QuadSurface* surface,
 
     for (int row = 0; row < cellRowCount; row += samplingStride) {
         for (int col = 0; col < cellColCount; col += samplingStride) {
-            Entry entry;
+            Entry entry{Box3{}, PatchRecord{}};
             if (!buildMappedEntryForCell(surface, points, col, row, samplingStride, bboxPadding, entry)) {
                 continue;
             }
@@ -2709,7 +2709,7 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
                                              float bboxPadding,
                                              CellEntry& outEntry)
 {
-    Entry entry;
+    Entry entry{Box3{}, PatchRecord{}};
     if (!buildEntryForCell(surface.get(), points, col, row, stride, bboxPadding, entry)) {
         return false;
     }

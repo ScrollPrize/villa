@@ -14,6 +14,7 @@
 #include <QSettings>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/CrashHandler.hpp"
 #include "vc/core/util/Logging.hpp"
 
 #include <opencv2/core.hpp>
@@ -58,6 +59,8 @@ static auto preinitFn = &setThreadPoliciesEarly;
 __attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
 {
+    vc::crash::install();
+
 #ifndef __linux__
     // On non-Linux, preinit_array is unavailable so set env vars at start of main.
     // This may be too late for some libraries that init in static constructors.
@@ -137,12 +140,6 @@ auto main(int argc, char* argv[]) -> int
         "Skip validation of zarr shape against meta.json dimensions");
     parser.addOption(skipShapeCheckOption);
 
-    QCommandLineOption loadFirstOption(
-        "load-first",
-        "Load segmentations from the specified directory first and defer others (e.g. paths or traces).",
-        "dir");
-    parser.addOption(loadFirstOption);
-
     QCommandLineOption cacheSizeOption(
         "cache-size",
         QString("Set the chunk cache size in gigabytes (default: %1 GB).")
@@ -171,12 +168,6 @@ auto main(int argc, char* argv[]) -> int
 
     if (parser.isSet(skipShapeCheckOption)) {
         Volume::skipShapeCheck = true;
-    }
-    if (parser.isSet(loadFirstOption)) {
-        QString loadFirstDir = parser.value(loadFirstOption).trimmed().toLower();
-        if (!loadFirstDir.isEmpty()) {
-            VolumePkg::setLoadFirstSegmentationDirectory(loadFirstDir.toStdString());
-        }
     }
 
     // RAM cache size: CLI flag > QSettings > CMake default

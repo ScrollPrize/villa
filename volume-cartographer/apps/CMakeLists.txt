@@ -126,8 +126,14 @@ target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
 add_executable(vc_surface_diff src/vc_surface_diff.cpp)
 target_link_libraries(vc_surface_diff vc_core Boost::program_options)
 
+add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
+target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
+
 add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
+
+add_executable(vc_volpkg_convert src/vc_volpkg_convert.cpp)
+target_link_libraries(vc_volpkg_convert vc_core)
 
 
 add_executable(vc_ced2d src/vc_ced2d.cpp)

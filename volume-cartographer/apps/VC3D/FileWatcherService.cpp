@@ -55,17 +55,12 @@ void FileWatcherService::startWatching()
         return;
     }
 
-    // Watch both paths and traces directories
-    auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
-    for (const auto& dirName : availableDirs) {
-        std::filesystem::path dirPath = std::filesystem::path(_state->vpkg()->getVolpkgDirectory()) / dirName;
-
+    for (const auto& dirPath : _state->vpkg()->availableSegmentPaths()) {
         if (!std::filesystem::exists(dirPath)) {
             Logger()->debug("Directory {} does not exist, skipping watch", dirPath.string());
             continue;
         }
 
-        // Watch for directory create, delete, and move events
         int wd = inotify_add_watch(_inotifyFd, dirPath.c_str(),
                                   IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_ONLYDIR);
 
@@ -74,8 +69,9 @@ void FileWatcherService::startWatching()
             continue;
         }
 
+        const auto dirName = dirPath.filename().string();
         _watchDescriptors[wd] = WatchDescriptorInfo{dirName, false};
-        Logger()->info("Started inotify watch for {} directory (wd={})", dirName, wd);
+        Logger()->info("Started inotify watch for {} (wd={})", dirPath.string(), wd);
     }
 
     // Watch volumes directory for live updates

@@ -2,6 +2,7 @@
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "VCSettings.hpp"
+#include "UnifiedBrowserDialog.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -10,7 +11,6 @@
 #include "CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "SettingsDialog.hpp"
-#include "S3BrowserDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
@@ -21,6 +21,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/RemoteScroll.hpp"
 #include "vc/core/types/Segmentation.hpp"
@@ -69,9 +70,6 @@
 
 namespace
 {
-constexpr auto kRemoteVolumeRegistryFile = "remote_volumes.json";
-QString extractExceptionMessage(const std::exception& e);
-bool isAuthError(const QString& msg);
 
 static bool run_cli(QWidget* parent, const QString& program, const QStringList& args, QString* outLog = nullptr)
 {
@@ -120,7 +118,6 @@ MenuActionController::MenuActionController(CWindow* window)
     , _window(window)
 {
     _recentActs.fill(nullptr);
-    _recentRemoteActs.fill(nullptr);
 }
 
 void MenuActionController::populateMenus(QMenuBar* menuBar)
@@ -132,24 +129,33 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     auto* qWindow = _window;
 
     // Create actions
-    _openAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogOpenButton), QObject::tr("&Open volpkg..."), this);
+    _newProjectAct = new QAction(QObject::tr("&New Project"), this);
+    connect(_newProjectAct, &QAction::triggered, this, &MenuActionController::newProject);
+
+    _saveProjectAsAct = new QAction(QObject::tr("Save Project &As..."), this);
+    connect(_saveProjectAsAct, &QAction::triggered, this, &MenuActionController::saveProjectAs);
+
+    _attachVolumeAct = new QAction(QObject::tr("Attach &Volume..."), this);
+    connect(_attachVolumeAct, &QAction::triggered, this, &MenuActionController::attachVolume);
+
+    _attachSegmentsAct = new QAction(QObject::tr("Attach Se&gments..."), this);
+    connect(_attachSegmentsAct, &QAction::triggered, this, &MenuActionController::attachSegments);
+
+    _attachNormalGridAct = new QAction(QObject::tr("Attach &Normal Grid..."), this);
+    connect(_attachNormalGridAct, &QAction::triggered, this, &MenuActionController::attachNormalGrid);
+
+    _detachEntryAct = new QAction(QObject::tr("&Detach..."), this);
+    connect(_detachEntryAct, &QAction::triggered, this, &MenuActionController::detachEntry);
+
+    _setOutputSegmentsAct = new QAction(QObject::tr("Set Output Segments..."), this);
+    connect(_setOutputSegmentsAct, &QAction::triggered, this, &MenuActionController::setOutputSegments);
+
+    _convertLegacyAct = new QAction(QObject::tr("Convert Legacy Volpkg..."), this);
+    connect(_convertLegacyAct, &QAction::triggered, this, &MenuActionController::convertLegacyVolpkg);
+
+    _openAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogOpenButton), QObject::tr("&Open Project..."), this);
     _openAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::OpenVolpkg));
     connect(_openAct, &QAction::triggered, this, &MenuActionController::openVolpkg);
-
-    _openLocalZarrAct = new QAction(QObject::tr("Open Local &Zarr..."), this);
-    connect(_openLocalZarrAct, &QAction::triggered, this, &MenuActionController::openLocalZarr);
-
-    _openRemoteAct = new QAction(QObject::tr("Open &Remote Volume..."), this);
-    connect(_openRemoteAct, &QAction::triggered, this, &MenuActionController::openRemoteVolume);
-
-    _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
-    connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
-
-    _attachRemoteSegmentsAct = new QAction(QObject::tr("Attach Remote &Segments..."), this);
-    connect(_attachRemoteSegmentsAct, &QAction::triggered, this, &MenuActionController::attachRemoteSegments);
-
-    _browseS3Act = new QAction(QObject::tr("&Browse S3..."), this);
-    connect(_browseS3Act, &QAction::triggered, this, &MenuActionController::browseS3);
 
     _settingsAct = new QAction(QObject::tr("Settings"), this);
     connect(_settingsAct, &QAction::triggered, this, &MenuActionController::showSettingsDialog);
@@ -201,23 +207,23 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
+    _fileMenu->addAction(_newProjectAct);
     _fileMenu->addAction(_openAct);
-    _fileMenu->addAction(_openLocalZarrAct);
-    _fileMenu->addAction(_openRemoteAct);
-    _fileMenu->addAction(_attachRemoteZarrAct);
-    _fileMenu->addAction(_attachRemoteSegmentsAct);
-    _fileMenu->addAction(_browseS3Act);
+    _fileMenu->addAction(_saveProjectAsAct);
+    _fileMenu->addSeparator();
+    _fileMenu->addAction(_attachVolumeAct);
+    _fileMenu->addAction(_attachSegmentsAct);
+    _fileMenu->addAction(_attachNormalGridAct);
+    _fileMenu->addAction(_detachEntryAct);
+    _fileMenu->addAction(_setOutputSegmentsAct);
+    _fileMenu->addSeparator();
+    _fileMenu->addAction(_convertLegacyAct);
 
-    _recentMenu = new QMenu(QObject::tr("Open &recent volpkg"), _fileMenu);
+    _recentMenu = new QMenu(QObject::tr("Open &recent project"), _fileMenu);
     _recentMenu->setEnabled(false);
     _fileMenu->addMenu(_recentMenu);
 
-    _recentRemoteMenu = new QMenu(QObject::tr("Open recent re&mote volume"), _fileMenu);
-    _recentRemoteMenu->setEnabled(false);
-    _fileMenu->addMenu(_recentRemoteMenu);
-
     ensureRecentActions();
-    ensureRecentRemoteActions();
 
     _fileMenu->addSeparator();
     _fileMenu->addAction(_reportingAct);
@@ -270,7 +276,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     menuBar->addMenu(_helpMenu);
 
     refreshRecentMenu();
-    refreshRecentRemoteMenu();
 }
 
 void MenuActionController::ensureRecentActions()
@@ -292,13 +297,13 @@ void MenuActionController::ensureRecentActions()
 QStringList MenuActionController::loadRecentPaths() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    return settings.value(vc3d::settings::volpkg::RECENT).toStringList();
+    return settings.value(vc3d::settings::project::RECENT).toStringList();
 }
 
 void MenuActionController::saveRecentPaths(const QStringList& paths)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::volpkg::RECENT, paths);
+    settings.setValue(vc3d::settings::project::RECENT, paths);
 }
 
 void MenuActionController::refreshRecentMenu()
@@ -367,56 +372,23 @@ void MenuActionController::openVolpkg()
     if (!_window) {
         return;
     }
-
-    _window->CloseVolume();
-    _window->OpenVolume(QString());
-    loadAttachedRemoteVolumesForCurrentPackage();
-    _window->UpdateView();
-}
-
-void MenuActionController::openLocalZarr()
-{
-    if (!_window) return;
-
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString dir = QFileDialog::getExistingDirectory(
-        _window,
-        QObject::tr("Open Local OME-Zarr Directory"),
-        settings.value(vc3d::settings::volpkg::DEFAULT_PATH).toString(),
-        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks |
-        QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
+    auto file = promptLocation(QObject::tr("Open Project"),
+        QObject::tr("Pick a .volpkg.json file, a legacy volpkg folder, or a remote volpkg URL."),
+        settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+        {"*.volpkg.json"}, true, true);
+    if (file.isEmpty()) return;
 
-    if (dir.isEmpty()) return;
-
-    auto path = std::filesystem::path(dir.toStdString());
-
-    // Validate that this looks like a zarr directory
-    if (!Volume::checkDir(path)) {
-        QMessageBox::warning(
-            _window, QObject::tr("Not a Zarr Volume"),
-            QObject::tr("The selected directory does not appear to be an "
-                         "OME-Zarr volume (no .zgroup, .zattrs, or meta.json found)."));
-        return;
+    if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) {
+        QMessageBox::information(_window, QObject::tr("Convert to .volpkg.json"),
+            QObject::tr("This needs to be converted to a .volpkg.json — pick where to save the converted project."));
+        QString converted;
+        if (!runLegacyVolpkgConvert(file, &converted)) return;
+        file = converted;
     }
-
-    try {
-        auto vol = Volume::New(path);
-        _window->CloseVolume();
-        _window->setVolume(vol);
-        _window->UpdateView();
-
-        if (_window->statusBar()) {
-            _window->statusBar()->showMessage(
-                QObject::tr("Opened local zarr: %1")
-                    .arg(QString::fromStdString(vol->id())),
-                5000);
-        }
-    } catch (const std::exception& e) {
-        QMessageBox::critical(
-            _window, QObject::tr("Error Opening Zarr"),
-            QObject::tr("Failed to open zarr volume:\n%1")
-                .arg(QString::fromStdString(e.what())));
-    }
+    _window->CloseVolume();
+    _window->OpenVolume(file);
+    _window->UpdateView();
 }
 
 void MenuActionController::openRecentVolpkg()
@@ -430,7 +402,6 @@ void MenuActionController::openRecentVolpkg()
         if (!path.isEmpty()) {
             _window->CloseVolume();
             _window->OpenVolume(path);
-            loadAttachedRemoteVolumesForCurrentPackage();
             _window->UpdateView();
         }
     }
@@ -444,206 +415,10 @@ void MenuActionController::openVolpkgAt(const QString& path)
 
     _window->CloseVolume();
     _window->OpenVolume(path);
-    loadAttachedRemoteVolumesForCurrentPackage();
     _window->UpdateView();
 }
 
 // --- Remote recents management ---
-
-QStringList MenuActionController::loadRecentRemoteUrls() const
-{
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    return settings.value(vc3d::settings::viewer::REMOTE_RECENT_URLS).toStringList();
-}
-
-void MenuActionController::saveRecentRemoteUrls(const QStringList& urls)
-{
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::REMOTE_RECENT_URLS, urls);
-}
-
-void MenuActionController::updateRecentRemoteList(const QString& url)
-{
-    QStringList urls = loadRecentRemoteUrls();
-    urls.removeAll(url);
-    urls.prepend(url);
-    while (urls.size() > kMaxRecentRemote) {
-        urls.removeLast();
-    }
-    saveRecentRemoteUrls(urls);
-    refreshRecentRemoteMenu();
-}
-
-void MenuActionController::ensureRecentRemoteActions()
-{
-    if (!_recentRemoteMenu) return;
-
-    for (auto& act : _recentRemoteActs) {
-        if (!act) {
-            act = new QAction(this);
-            act->setVisible(false);
-            connect(act, &QAction::triggered, this, &MenuActionController::openRecentRemoteVolume);
-            _recentRemoteMenu->addAction(act);
-        }
-    }
-}
-
-void MenuActionController::refreshRecentRemoteMenu()
-{
-    ensureRecentRemoteActions();
-
-    QStringList urls = loadRecentRemoteUrls();
-    if (!urls.isEmpty() && urls.last().isEmpty()) {
-        urls.removeLast();
-    }
-
-    const int count = std::min(static_cast<int>(urls.size()), kMaxRecentRemote);
-
-    for (int i = 0; i < count; ++i) {
-        QString text = QObject::tr("&%1 | %2").arg(i + 1).arg(urls[i]);
-        _recentRemoteActs[i]->setText(text);
-        _recentRemoteActs[i]->setData(urls[i]);
-        _recentRemoteActs[i]->setVisible(true);
-    }
-
-    for (int j = count; j < kMaxRecentRemote; ++j) {
-        if (_recentRemoteActs[j]) {
-            _recentRemoteActs[j]->setVisible(false);
-            _recentRemoteActs[j]->setData(QVariant());
-        }
-    }
-
-    if (_recentRemoteMenu) {
-        _recentRemoteMenu->setEnabled(count > 0);
-    }
-}
-
-void MenuActionController::openRecentRemoteVolume()
-{
-    if (!_window) return;
-
-    if (auto* action = qobject_cast<QAction*>(sender())) {
-        const QString url = action->data().toString();
-        if (!url.isEmpty()) {
-            openRemoteUrl(url, false);
-        }
-    }
-}
-
-void MenuActionController::openRemoteVolume()
-{
-    if (!_window) return;
-
-    // Pre-fill with the most recent remote URL
-    QStringList recentUrls = loadRecentRemoteUrls();
-    QString lastUrl = recentUrls.isEmpty() ? QString() : recentUrls.first();
-
-    bool ok = false;
-    QString url = QInputDialog::getText(
-        _window,
-        QObject::tr("Open Remote Volume"),
-        QObject::tr("Enter volume URL (http://, https://, s3://):"),
-        QLineEdit::Normal,
-        lastUrl,
-        &ok);
-
-    if (!ok || url.trimmed().isEmpty()) return;
-
-    openRemoteUrl(url.trimmed(), false);
-}
-
-void MenuActionController::browseS3()
-{
-    if (!_window) return;
-
-    // Get the most recent S3 URL as starting point
-    QStringList recentUrls = loadRecentRemoteUrls();
-    QString startUrl;
-    for (const auto& u : recentUrls) {
-        if (u.startsWith("s3://")) {
-            startUrl = u;
-            break;
-        }
-    }
-
-    // Resolve auth before opening the dialog
-    // Use a dummy s3:// URL to trigger AWS credential resolution
-    QString probeUrl = startUrl.isEmpty() ? QStringLiteral("s3://probe") : startUrl;
-    vc::cache::HttpAuth auth;
-    QString authError;
-    if (!tryResolveRemoteAuth(probeUrl, &auth, true, &authError)) {
-        return;
-    }
-
-    S3BrowserDialog dialog(auth, startUrl, _window);
-    if (dialog.exec() != QDialog::Accepted) return;
-
-    QString selected = dialog.selectedUrl();
-    if (selected.isEmpty()) return;
-
-    openRemoteUrl(selected, false);
-}
-
-void MenuActionController::attachRemoteSegments()
-{
-    if (!_window || !_window->_state) return;
-
-    auto volume = _window->_state->currentVolume();
-    if (!volume) {
-        QMessageBox::warning(_window,
-                             QObject::tr("No Volume Loaded"),
-                             QObject::tr("Open a remote volume first before attaching remote segments."));
-        return;
-    }
-    if (!volume->isRemote()) {
-        QMessageBox::warning(_window,
-                             QObject::tr("Not a Remote Volume"),
-                             QObject::tr("Remote segments can only be attached to a remote volume."));
-        return;
-    }
-
-    const auto auth = volume->remoteAuth();
-    // Use the app-level remote cache directory — the same value every other
-    // entry point (openRemoteUrl, attachRemoteZarrUrl, openRemoteScroll)
-    // passes to Volume::NewFromUrl *and* to promptAndLoadRemoteSegments.
-    // Deriving from volume->path() is wrong: the volume is staged at
-    // `<cache>/<id>` for direct opens and `<cache>/<volpkg>/volumes/<id>` for
-    // scroll opens, so parent_path() lands in the wrong tree depending on
-    // how the volume was loaded. Segments are consistently cached at
-    // `<remoteCacheDirectory()>/paths/<segId>`.
-    const std::string cachePath = remoteCacheDirectory().toStdString();
-    promptAndLoadRemoteSegments(auth, cachePath);
-}
-
-void MenuActionController::attachRemoteZarr()
-{
-    if (!_window) return;
-
-    if (!_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::warning(_window,
-                             QObject::tr("No Volume Package Loaded"),
-                             QObject::tr("Open a volpkg before attaching a remote zarr."));
-        return;
-    }
-
-    QStringList recentUrls = loadRecentRemoteUrls();
-    QString lastUrl = recentUrls.isEmpty() ? QString() : recentUrls.first();
-
-    bool ok = false;
-    QString url = QInputDialog::getText(
-        _window,
-        QObject::tr("Attach Remote Zarr"),
-        QObject::tr("Enter remote OME-Zarr URL (http://, https://, s3://):"),
-        QLineEdit::Normal,
-        lastUrl,
-        &ok);
-
-    if (!ok || url.trimmed().isEmpty()) {
-        return;
-    }
-
-    attachRemoteZarrUrl(url.trimmed(), true);
-}
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
                                                 vc::cache::HttpAuth* authOut,
@@ -697,1041 +472,6 @@ QString MenuActionController::remoteCacheDirectory() const
     QString cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
     QDir().mkpath(cacheDir);
     return cacheDir;
-}
-
-QString MenuActionController::remoteVolumeRegistryPath() const
-{
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        return {};
-    }
-    return QDir(_window->_state->vpkgPath()).filePath(QString::fromLatin1(kRemoteVolumeRegistryFile));
-}
-
-void MenuActionController::persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume)
-{
-    const QString registryPath = remoteVolumeRegistryPath();
-    if (registryPath.isEmpty() || !volume) {
-        return;
-    }
-
-    utils::Json root = {
-        {"version", utils::Json(1)},
-        {"volumes", utils::Json::array()}
-    };
-
-    try {
-        if (QFileInfo::exists(registryPath)) {
-            root = utils::Json::parse_file(registryPath.toStdString());
-        }
-    } catch (const std::exception& e) {
-        Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
-        root = {
-            {"version", utils::Json(1)},
-            {"volumes", utils::Json::array()}
-        };
-    }
-
-    if (!root.is_object()) {
-        root = utils::Json::object();
-    }
-    if (!root.contains("volumes") || !root["volumes"].is_array()) {
-        root["volumes"] = utils::Json::array();
-    }
-    root["version"] = 1;
-
-    const std::string urlStd = url.trimmed().toStdString();
-    const std::string idStd = volume->id();
-    utils::Json updated = utils::Json::array();
-    bool replaced = false;
-
-    for (const auto& entry : root["volumes"]) {
-        if (!entry.is_object()) {
-            continue;
-        }
-        const std::string existingUrl = entry.value("url", std::string{});
-        const std::string existingId = entry.value("id", std::string{});
-        if (existingUrl == urlStd || (!idStd.empty() && existingId == idStd)) {
-            if (!replaced) {
-                updated.push_back({
-                    {"url", urlStd},
-                    {"id", idStd},
-                    {"name", volume->name()}
-                });
-                replaced = true;
-            }
-            continue;
-        }
-        updated.push_back(entry);
-    }
-
-    if (!replaced) {
-        updated.push_back({
-            {"url", urlStd},
-            {"id", idStd},
-            {"name", volume->name()}
-        });
-    }
-
-    root["volumes"] = std::move(updated);
-
-    std::ofstream output(registryPath.toStdString(), std::ofstream::out | std::ofstream::trunc);
-    output << root.dump(2) << '\n';
-}
-
-void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
-{
-    const QString registryPath = remoteVolumeRegistryPath();
-    if (registryPath.isEmpty() || !QFileInfo::exists(registryPath) || !_window || !_window->_state || !_window->_state->vpkg()) {
-        return;
-    }
-
-    utils::Json root;
-    try {
-        root = utils::Json::parse_file(registryPath.toStdString());
-    } catch (const std::exception& e) {
-        Logger()->warn("Failed to parse remote volume registry '{}': {}", registryPath.toStdString(), e.what());
-        if (_window->statusBar()) {
-            _window->statusBar()->showMessage(QObject::tr("Failed to read remote_volumes.json"), 5000);
-        }
-        return;
-    }
-
-    if (!root.contains("volumes") || !root["volumes"].is_array() || root["volumes"].empty()) {
-        return;
-    }
-
-    const QString currentId = QString::fromStdString(_window->_state->currentVolumeId());
-    const QString cacheDir = remoteCacheDirectory();
-    int attachedCount = 0;
-    int skippedCount = 0;
-
-    for (const auto& entry : root["volumes"]) {
-        if (!entry.is_object()) {
-            continue;
-        }
-
-        const QString url = QString::fromStdString(entry.value("url", std::string{})).trimmed();
-        if (url.isEmpty()) {
-            continue;
-        }
-
-        vc::cache::HttpAuth auth;
-        QString authError;
-        if (!tryResolveRemoteAuth(url, &auth, false, &authError)) {
-            Logger()->warn("Skipping persisted remote volume '{}': {}", url.toStdString(), authError.toStdString());
-            skippedCount++;
-            continue;
-        }
-
-        try {
-            auto volume = Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
-            if (_window->_state->vpkg()->hasVolume(volume->id())) {
-                continue;
-            }
-            if (_window->_state->vpkg()->addVolume(volume)) {
-                attachedCount++;
-            } else {
-                skippedCount++;
-            }
-        } catch (const std::exception& e) {
-            Logger()->warn("Failed to attach persisted remote volume '{}': {}", url.toStdString(), e.what());
-            skippedCount++;
-        }
-    }
-
-    if (attachedCount > 0) {
-        _window->refreshCurrentVolumePackageUi(currentId, false);
-        _window->UpdateView();
-    }
-
-    if (_window->statusBar() && (attachedCount > 0 || skippedCount > 0)) {
-        _window->statusBar()->showMessage(
-            QObject::tr("Attached %1 persisted remote volume(s), skipped %2.")
-                .arg(attachedCount)
-                .arg(skippedCount),
-            5000);
-    }
-}
-
-void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistEntry)
-{
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::warning(_window,
-                             QObject::tr("No Volume Package Loaded"),
-                             QObject::tr("Open a volpkg before attaching a remote zarr."));
-        return;
-    }
-
-    auto resolved = vc::resolveRemoteUrl(url.trimmed().toStdString());
-    std::string trimmed = resolved.httpsUrl;
-    while (!trimmed.empty() && trimmed.back() == '/') {
-        trimmed.pop_back();
-    }
-    const bool looksLikeZarr = trimmed.size() >= 5 && trimmed.substr(trimmed.size() - 5) == ".zarr";
-    if (!looksLikeZarr) {
-        QMessageBox::warning(_window,
-                             QObject::tr("Expected Remote Zarr"),
-                             QObject::tr("Attach Remote Zarr expects a direct .zarr URL, not a scroll root."));
-        return;
-    }
-
-    vc::cache::HttpAuth auth;
-    QString authError;
-    if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
-        if (!authError.isEmpty() && authError != QObject::tr("AWS credential entry canceled.")) {
-            QMessageBox::warning(_window, QObject::tr("Authentication Error"), authError);
-        }
-        return;
-    }
-
-    const QString cacheDir = remoteCacheDirectory();
-    updateRecentRemoteList(url);
-    if (_attachRemoteZarrAct) {
-        _attachRemoteZarrAct->setEnabled(false);
-    }
-    if (_window->statusBar()) {
-        _window->statusBar()->showMessage(QObject::tr("Attaching remote zarr..."));
-    }
-
-    auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
-    connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-            [this, watcher, url, persistEntry]() {
-                watcher->deleteLater();
-                if (_attachRemoteZarrAct) {
-                    _attachRemoteZarrAct->setEnabled(true);
-                }
-
-                auto future = watcher->future();
-                QString errorMsg;
-                bool success = false;
-
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-                if (future.isValid() && !future.isCanceled() && future.isResultReadyAt(0)) {
-#else
-                if (future.isFinished() && !future.isCanceled()) {
-#endif
-                    try {
-                        auto volume = future.result();
-                        if (!_window || !_window->_state || !_window->_state->vpkg()) {
-                            return;
-                        }
-
-                        if (!_window->attachVolumeToCurrentPackage(volume)) {
-                            QMessageBox::warning(
-                                _window,
-                                QObject::tr("Attach Remote Zarr"),
-                                QObject::tr("A volume with id '%1' is already present in this volume package.")
-                                    .arg(QString::fromStdString(volume->id())));
-                            return;
-                        }
-
-                        if (persistEntry) {
-                            persistAttachedRemoteVolume(url, volume);
-                        }
-
-                        if (_window->statusBar()) {
-                            _window->statusBar()->showMessage(
-                                QObject::tr("Attached remote zarr: %1")
-                                    .arg(QString::fromStdString(volume->id())),
-                                5000);
-                        }
-                        success = true;
-                    } catch (const std::exception& e) {
-                        errorMsg = extractExceptionMessage(e);
-                    } catch (...) {
-                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
-                    }
-                } else {
-                    try {
-                        future.waitForFinished();
-                        future.result();
-                    } catch (const std::exception& e) {
-                        errorMsg = extractExceptionMessage(e);
-                    } catch (...) {
-                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
-                    }
-                }
-
-                if (success) return;
-
-                if (isAuthError(errorMsg)) {
-                    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                    settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                    settings.remove(vc3d::settings::aws::SECRET_KEY);
-                    settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                    const auto reply = QMessageBox::warning(
-                        _window,
-                        QObject::tr("Authentication Error"),
-                        QObject::tr("Failed to attach remote zarr:\n%1\n\n"
-                                    "Would you like to enter new AWS credentials and retry?")
-                            .arg(errorMsg),
-                        QMessageBox::Yes | QMessageBox::No);
-                    if (reply == QMessageBox::Yes) {
-                        QTimer::singleShot(0, this, [this, url, persistEntry]() {
-                            attachRemoteZarrUrl(url, persistEntry);
-                        });
-                        return;
-                    }
-                }
-
-                QMessageBox::critical(
-                    _window,
-                    QObject::tr("Attach Remote Zarr Error"),
-                    QObject::tr("Failed to attach remote zarr:\n%1").arg(errorMsg));
-            });
-
-    auto future = QtConcurrent::run([url, auth, cacheDir]() -> std::shared_ptr<Volume> {
-        return Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
-    });
-    watcher->setFuture(future);
-}
-
-void MenuActionController::openRemoteUrl(const QString& url, bool isRetry)
-{
-    if (!_window || url.isEmpty()) return;
-
-    if (!isRetry) {
-        _remoteOpenAuthRetries = 0;
-        _remoteScrollAuthRetries = 0;
-    }
-
-    auto urlStr = url.toStdString();
-    auto resolved = vc::resolveRemoteUrl(urlStr);
-    vc::cache::HttpAuth auth;
-    QString authError;
-    if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
-        return;
-    }
-
-    const QString cacheDir = remoteCacheDirectory();
-
-    // Save the URL to recents
-    updateRecentRemoteList(url);
-
-    // Disable the action while loading to prevent double-open
-    _openRemoteAct->setEnabled(false);
-    if (_window->statusBar()) {
-        _window->statusBar()->showMessage(QObject::tr("Opening remote volume..."));
-    }
-
-    auto cachePath = cacheDir.toStdString();
-
-    // Check if this might be a scroll root URL (not ending with .zarr)
-    bool isLikelyZarr = resolved.httpsUrl.size() >= 5 &&
-        resolved.httpsUrl.substr(resolved.httpsUrl.size() - 5) == ".zarr";
-    // Also check without trailing slash
-    {
-        std::string trimmed = resolved.httpsUrl;
-        while (!trimmed.empty() && trimmed.back() == '/') trimmed.pop_back();
-        if (trimmed.size() >= 5 && trimmed.substr(trimmed.size() - 5) == ".zarr") {
-            isLikelyZarr = true;
-        }
-    }
-
-    if (!isLikelyZarr) {
-        // Try scroll discovery first
-        openRemoteScroll(resolved.httpsUrl, auth, cachePath);
-    } else {
-        // Direct zarr volume open (existing flow)
-        openRemoteZarr(resolved.httpsUrl, auth, cachePath);
-    }
-}
-
-namespace
-{
-
-// Helper: extract the real error message from a QFuture exception.
-// Qt wraps task exceptions in QUnhandledException whose what() returns
-// "std::exception" — useless. Unwrap to get the original message.
-QString extractExceptionMessage(const std::exception& e)
-{
-    if (auto* unhandled = dynamic_cast<const QUnhandledException*>(&e)) {
-        auto ptr = unhandled->exception();
-        if (ptr) {
-            try {
-                std::rethrow_exception(ptr);
-            } catch (const std::exception& inner) {
-                return QString::fromStdString(inner.what());
-            } catch (...) {
-                return QObject::tr("Unknown error (non-std::exception)");
-            }
-        }
-    }
-    return QString::fromStdString(e.what());
-}
-
-bool isAuthError(const QString& msg)
-{
-    return msg.contains("Access denied", Qt::CaseInsensitive) ||
-           msg.contains("403", Qt::CaseInsensitive) ||
-           msg.contains("401", Qt::CaseInsensitive) ||
-           msg.contains("credential", Qt::CaseInsensitive) ||
-           msg.contains("Forbidden", Qt::CaseInsensitive);
-}
-
-} // namespace
-
-void MenuActionController::openRemoteZarr(
-    const std::string& httpsUrl,
-    const vc::cache::HttpAuth& auth,
-    const std::string& cachePath)
-{
-    auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
-
-    connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-        [this, watcher, httpsUrl, cachePath, auth]() {
-            watcher->deleteLater();
-            _openRemoteAct->setEnabled(true);
-
-            auto future = watcher->future();
-            QString errorMsg;
-
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-            if (future.isValid() && !future.isCanceled() && future.isResultReadyAt(0)) {
-#else
-            if (future.isFinished() && !future.isCanceled()) {
-#endif
-                try {
-                    auto vol = future.result();
-                    _remoteOpenAuthRetries = 0;
-                    _remoteScrollAuthRetries = 0;
-                    _window->CloseVolume();
-                    _window->setVolume(vol);
-                    _window->UpdateView();
-
-                    if (_window->statusBar()) {
-                        _window->statusBar()->showMessage(
-                            QObject::tr("Opened remote volume: %1")
-                                .arg(QString::fromStdString(vol->id())),
-                            5000);
-                    }
-
-                    // If the user previously attached a remote-segments dir
-                    // to this exact zarr URL, auto-re-attach it silently.
-                    // Otherwise offer the prompt.
-                    {
-                        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                        const QString prevZarr = settings.value(
-                            vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_FOR_ZARR)
-                                .toString();
-                        const QString prevSeg = settings.value(
-                            vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_URL)
-                                .toString();
-                        const QString currentZarr = QString::fromStdString(httpsUrl);
-                        if (!prevSeg.isEmpty() && prevZarr == currentZarr) {
-                            loadRemoteSegmentsWithUrl(prevSeg, auth, cachePath,
-                                                       currentZarr);
-                            return;
-                        }
-                    }
-                    // Offer to load remote segments
-                    promptAndLoadRemoteSegments(auth, cachePath);
-                    return;
-                } catch (const std::exception& e) {
-                    errorMsg = extractExceptionMessage(e);
-                } catch (...) {
-                    errorMsg = QObject::tr("Unknown error opening remote volume");
-                }
-            } else {
-                // Future finished but no result ready — exception was stored
-                try {
-                    future.waitForFinished();
-                    future.result(); // will re-throw
-                } catch (const std::exception& e) {
-                    errorMsg = extractExceptionMessage(e);
-                } catch (...) {
-                    errorMsg = QObject::tr("Unknown error opening remote volume");
-                }
-            }
-
-            // Error path
-            if (_window->statusBar()) {
-                _window->statusBar()->clearMessage();
-            }
-
-            // If it looks like an auth error, offer to re-enter credentials
-            if (isAuthError(errorMsg)) {
-                // Clear stale saved credentials
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                settings.remove(vc3d::settings::aws::SECRET_KEY);
-                settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                auto reply = QMessageBox::warning(
-                    _window,
-                    QObject::tr("Authentication Error"),
-                    QObject::tr("Failed to open remote volume:\n%1\n\n"
-                                "Would you like to enter new AWS credentials and retry?").arg(errorMsg),
-                    QMessageBox::Yes | QMessageBox::No);
-
-                if (reply == QMessageBox::Yes) {
-                    // Re-prompt for credentials by calling openRemoteUrl again.
-                    // Use QTimer::singleShot to break the call stack and avoid
-                    // deep recursion on repeated auth failures (Issue 31).
-                    if (_remoteOpenAuthRetries >= 3) {
-                        if (_window->statusBar()) {
-                            _window->statusBar()->showMessage(
-                                QObject::tr("Authentication failed after 3 attempts"), 5000);
-                        }
-                        _remoteOpenAuthRetries = 0;
-                        return;
-                    }
-                    ++_remoteOpenAuthRetries;
-                    _openRemoteAct->setEnabled(false);
-                    QTimer::singleShot(0, this, [this, httpsUrl]() {
-                        openRemoteUrl(QString::fromStdString(httpsUrl), true);
-                    });
-                    return;
-                }
-
-                _remoteOpenAuthRetries = 0;
-            } else {
-                _remoteOpenAuthRetries = 0;
-                _remoteScrollAuthRetries = 0;
-                QMessageBox::critical(
-                    _window,
-                    QObject::tr("Remote Volume Error"),
-                    QObject::tr("Failed to open remote volume:\n%1").arg(errorMsg));
-            }
-        });
-
-    auto future = QtConcurrent::run(
-        [httpsUrl, cachePath, auth]() -> std::shared_ptr<Volume> {
-            return Volume::NewFromUrl(httpsUrl, cachePath, auth);
-        });
-    watcher->setFuture(future);
-}
-
-// Result struct for background volume+segment loading
-struct ScrollOpenResult {
-    std::shared_ptr<Volume> volume;
-    std::vector<std::pair<std::string, std::shared_ptr<Surface>>> surfaces;
-    std::string errorMsg;
-};
-
-void MenuActionController::promptAndLoadRemoteSegments(
-    const vc::cache::HttpAuth& auth,
-    const std::string& cachePath)
-{
-    bool ok = false;
-    QString segUrl = QInputDialog::getText(
-        _window,
-        QObject::tr("Remote Segments"),
-        QObject::tr("Enter S3/HTTPS URL of directory containing segments\n"
-                     "(leave empty to skip):"),
-        QLineEdit::Normal, QString(), &ok);
-
-    if (!ok || segUrl.trimmed().isEmpty())
-        return;
-
-    QString zarrUrl;
-    if (_window && _window->_state) {
-        if (auto vol = _window->_state->currentVolume())
-            zarrUrl = QString::fromStdString(vol->remoteUrl());
-    }
-    loadRemoteSegmentsWithUrl(segUrl, auth, cachePath, zarrUrl);
-}
-
-void MenuActionController::loadRemoteSegmentsWithUrl(
-    const QString& segUrlIn,
-    const vc::cache::HttpAuth& auth,
-    const std::string& cachePath,
-    const QString& zarrUrl)
-{
-    const QString segUrlTrim = segUrlIn.trimmed();
-    if (segUrlTrim.isEmpty())
-        return;
-
-    auto segResolved = vc::resolveRemoteUrl(segUrlTrim.toStdString());
-    vc::cache::HttpAuth segAuth = auth;
-    if (segResolved.useAwsSigv4 && segAuth.region.empty())
-        segAuth.region = segResolved.awsRegion;
-
-    std::string segBaseUrl = segResolved.httpsUrl;
-    while (!segBaseUrl.empty() && segBaseUrl.back() == '/')
-        segBaseUrl.pop_back();
-
-    if (_window->statusBar())
-        _window->statusBar()->showMessage(QObject::tr("Discovering remote segments..."));
-
-    // Probe the URL for segment subdirectories
-    auto* s3Watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);
-    connect(s3Watcher, &QFutureWatcher<vc::cache::S3ListResult>::finished, this,
-        [this, s3Watcher, segBaseUrl, segAuth, cachePath, zarrUrl]() {
-            s3Watcher->deleteLater();
-
-            vc::cache::S3ListResult extList;
-            try {
-                extList = s3Watcher->result();
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "[RemoteSegments] s3ListObjects failed: %s\n", e.what());
-                if (_window->statusBar())
-                    _window->statusBar()->showMessage(
-                        QObject::tr("Failed to list segments: %1").arg(e.what()), 5000);
-                return;
-            }
-
-            if (extList.prefixes.empty()) {
-                if (_window->statusBar())
-                    _window->statusBar()->showMessage(
-                        QObject::tr("No segment directories found at that URL"), 5000);
-                return;
-            }
-
-            std::fprintf(stderr, "[RemoteSegments] Found %zu segments\n", extList.prefixes.size());
-
-            // Store remote scroll state for on-demand downloads
-            _window->_remoteScroll.baseUrl = segBaseUrl;
-            _window->_remoteScroll.segmentsBaseUrl = segBaseUrl;
-            _window->_remoteScroll.cachePath = cachePath;
-            _window->_remoteScroll.auth = segAuth;
-            _window->_remoteScroll.segSource = vc::RemoteSegmentSource::Direct;
-            _window->_remoteScroll.active = true;
-
-            // Persist (zarrUrl → segmentsUrl) so the next auto-open of the
-            // same remote zarr can re-attach without prompting the user.
-            if (!zarrUrl.isEmpty()) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.setValue(vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_URL,
-                                  QString::fromStdString(segBaseUrl));
-                settings.setValue(vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_FOR_ZARR,
-                                  zarrUrl);
-            }
-
-            // Download metadata + load cached surfaces on background thread
-            auto segIds = extList.prefixes;
-            auto* loadWatcher = new QFutureWatcher<ScrollOpenResult>(this);
-            connect(loadWatcher, &QFutureWatcher<ScrollOpenResult>::finished, this,
-                [this, loadWatcher, segIds]() {
-                    loadWatcher->deleteLater();
-
-                    ScrollOpenResult result;
-                    try {
-                        result = loadWatcher->result();
-                    } catch (const std::exception& e) {
-                        if (_window->statusBar())
-                            _window->statusBar()->showMessage(
-                                QObject::tr("Failed to load segments: %1").arg(e.what()), 5000);
-                        return;
-                    }
-
-                    _window->setRemoteStubs(segIds, result.surfaces);
-                    _window->UpdateView();
-
-                    int cached = static_cast<int>(result.surfaces.size());
-                    int total = static_cast<int>(segIds.size());
-                    if (_window->statusBar())
-                        _window->statusBar()->showMessage(
-                            QObject::tr("Loaded %1/%2 segments (rest on-demand)")
-                                .arg(cached).arg(total), 5000);
-                });
-
-            auto loadFuture = QtConcurrent::run(
-                [segBaseUrl, segIds, cachePath, segAuth]() -> ScrollOpenResult {
-                    ScrollOpenResult result;
-                    std::filesystem::path cacheDir = cachePath;
-                    for (const auto& segId : segIds) {
-                        try {
-                            vc::downloadRemoteSegmentMetadataOnly(
-                                segBaseUrl, segId, cacheDir, segAuth,
-                                vc::RemoteSegmentSource::Direct);
-
-                            if (vc::isRemoteSegmentFullyCached(
-                                    cacheDir, segId, vc::RemoteSegmentSource::Direct)) {
-                                // "Direct" uses "paths" subdir
-                                auto localDir = cacheDir / "paths" / segId;
-                                auto seg = Segmentation::New(localDir);
-                                if (seg && seg->canLoadSurface()) {
-                                    auto surf = seg->loadSurface();
-                                    if (surf)
-                                        result.surfaces.emplace_back(segId, surf);
-                                }
-                            }
-                        } catch (const std::exception& e) {
-                            std::fprintf(stderr, "[RemoteSegments] Failed to process segment %s: %s\n",
-                                         segId.c_str(), e.what());
-                        }
-                    }
-                    return result;
-                });
-            loadWatcher->setFuture(loadFuture);
-        });
-
-    auto s3Future = QtConcurrent::run(
-        [segBaseUrl, segAuth]() -> vc::cache::S3ListResult {
-            return vc::cache::s3ListObjects(segBaseUrl + "/", segAuth);
-        });
-    s3Watcher->setFuture(s3Future);
-}
-
-void MenuActionController::openRemoteScroll(
-    const std::string& httpsUrl,
-    const vc::cache::HttpAuth& auth,
-    const std::string& cachePath)
-{
-    // Phase 1: Discover scroll structure on background thread
-    auto* discoveryWatcher = new QFutureWatcher<vc::RemoteScrollInfo>(this);
-
-    connect(discoveryWatcher, &QFutureWatcher<vc::RemoteScrollInfo>::finished, this,
-        [this, discoveryWatcher, httpsUrl, auth, cachePath]() {
-            discoveryWatcher->deleteLater();
-
-            vc::RemoteScrollInfo scrollInfo;
-            try {
-                scrollInfo = discoveryWatcher->result();
-            } catch (const std::exception& e) {
-                // Discovery failed — fall back to direct zarr open
-                std::fprintf(stderr, "[RemoteScroll] Discovery failed: %s, falling back to zarr\n", e.what());
-                openRemoteZarr(httpsUrl, auth, cachePath);
-                return;
-            }
-
-            // Auth error — prompt for fresh credentials and retry
-            if (scrollInfo.authError) {
-                QString msg = QObject::tr("AWS credentials error: %1\n\n"
-                    "Please enter fresh credentials.")
-                    .arg(QString::fromStdString(scrollInfo.authErrorMessage));
-                QMessageBox::warning(_window, QObject::tr("Credentials Expired"), msg);
-
-                vc::cache::HttpAuth freshAuth = auth;
-                bool credOk = false;
-                QString accessKey = QInputDialog::getText(
-                    _window, QObject::tr("AWS Credentials"),
-                    QObject::tr("AWS_ACCESS_KEY_ID:"),
-                    QLineEdit::Normal, QString(), &credOk);
-                if (!credOk || accessKey.trimmed().isEmpty()) {
-                    _remoteScrollAuthRetries = 0;
-                    _openRemoteAct->setEnabled(true);
-                    if (_window->statusBar()) _window->statusBar()->clearMessage();
-                    return;
-                }
-
-                QString secretKey = QInputDialog::getText(
-                    _window, QObject::tr("AWS Credentials"),
-                    QObject::tr("AWS_SECRET_ACCESS_KEY:"),
-                    QLineEdit::Password, QString(), &credOk);
-                if (!credOk || secretKey.trimmed().isEmpty()) {
-                    _remoteScrollAuthRetries = 0;
-                    _openRemoteAct->setEnabled(true);
-                    if (_window->statusBar()) _window->statusBar()->clearMessage();
-                    return;
-                }
-
-                QString sessionToken = QInputDialog::getText(
-                    _window, QObject::tr("AWS Credentials"),
-                    QObject::tr("AWS_SESSION_TOKEN (optional):"),
-                    QLineEdit::Normal, QString(), &credOk);
-                if (!credOk) {
-                    _remoteScrollAuthRetries = 0;
-                    _openRemoteAct->setEnabled(true);
-                    if (_window->statusBar()) _window->statusBar()->clearMessage();
-                    return;
-                }
-
-                freshAuth.access_key = accessKey.trimmed().toStdString();
-                freshAuth.secret_key = secretKey.trimmed().toStdString();
-                freshAuth.session_token = sessionToken.trimmed().toStdString();
-
-                // Save the fresh credentials
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.setValue(vc3d::settings::aws::ACCESS_KEY,
-                                  QString::fromStdString(freshAuth.access_key));
-                settings.setValue(vc3d::settings::aws::SECRET_KEY,
-                                  QString::fromStdString(freshAuth.secret_key));
-                settings.setValue(vc3d::settings::aws::SESSION_TOKEN,
-                                  QString::fromStdString(freshAuth.session_token));
-
-                // Retry discovery with fresh credentials.
-                // Use QTimer::singleShot to break the call stack and limit
-                // recursive re-entry on repeated auth failures (Issue 31).
-                if (_remoteScrollAuthRetries >= 3) {
-                    if (_window->statusBar()) {
-                        _window->statusBar()->showMessage(
-                            QObject::tr("Authentication failed after 3 attempts"), 5000);
-                    }
-                    _remoteScrollAuthRetries = 0;
-                    _openRemoteAct->setEnabled(true);
-                    return;
-                }
-                ++_remoteScrollAuthRetries;
-                QTimer::singleShot(0, this, [this, httpsUrl, freshAuth, cachePath]() {
-                    openRemoteScroll(httpsUrl, freshAuth, cachePath);
-                });
-                return;
-            }
-
-            _remoteScrollAuthRetries = 0;
-
-            if (scrollInfo.volumeNames.empty()) {
-                // No volumes found — fall back to direct zarr open
-                std::fprintf(stderr, "[RemoteScroll] No volumes found, falling back to zarr\n");
-                openRemoteZarr(httpsUrl, auth, cachePath);
-                return;
-            }
-
-            // Pick volume: if multiple, ask user; if one, auto-select
-            std::string volumeName;
-            if (scrollInfo.volumeNames.size() == 1) {
-                volumeName = scrollInfo.volumeNames.front();
-            } else {
-                QStringList items;
-                for (const auto& v : scrollInfo.volumeNames) {
-                    items << QString::fromStdString(v);
-                }
-                bool ok = false;
-                QString picked = QInputDialog::getItem(
-                    _window,
-                    QObject::tr("Select Volume"),
-                    QObject::tr("Multiple volumes found. Select one:"),
-                    items, 0, false, &ok);
-                if (!ok || picked.isEmpty()) {
-                    _openRemoteAct->setEnabled(true);
-                    if (_window->statusBar()) _window->statusBar()->clearMessage();
-                    return;
-                }
-                volumeName = picked.toStdString();
-            }
-
-            // Continuation: Phase 2 — open volume + download segments on
-            // background thread.  Captured by value so it can be invoked from
-            // either the fast path (no external-segment probe) or the async
-            // s3ListObjects watcher path below.
-            auto continueWithPhase2 = [this, auth, cachePath](
-                vc::RemoteScrollInfo scrollInfo, const std::string& volumeName) {
-
-            // Phase 2: Open volume + fetch segment metadata on background
-            // thread.  Only downloads meta.json for each segment (fast, tiny
-            // files).  Segments whose TIFFs are already cached get loaded
-            // immediately; the rest appear as stubs that download on demand
-            // when the user selects them.
-            if (_window->statusBar()) {
-                _window->statusBar()->showMessage(
-                    QObject::tr("Opening remote scroll (volume: %1, discovering %2 segments)...")
-                        .arg(QString::fromStdString(volumeName))
-                        .arg(scrollInfo.segmentIds.size()));
-            }
-
-            auto* loadWatcher = new QFutureWatcher<ScrollOpenResult>(this);
-
-            connect(loadWatcher, &QFutureWatcher<ScrollOpenResult>::finished, this,
-                [this, loadWatcher, scrollInfo, cachePath]() {
-                    loadWatcher->deleteLater();
-                    _openRemoteAct->setEnabled(true);
-
-                    ScrollOpenResult result;
-                    try {
-                        result = loadWatcher->result();
-                    } catch (const std::exception& e) {
-                        QMessageBox::critical(_window,
-                            QObject::tr("Remote Scroll Error"),
-                            QObject::tr("Failed to open remote scroll:\n%1").arg(e.what()));
-                        if (_window->statusBar()) _window->statusBar()->clearMessage();
-                        return;
-                    }
-
-                    if (!result.errorMsg.empty()) {
-                        QMessageBox::critical(_window,
-                            QObject::tr("Remote Scroll Error"),
-                            QObject::tr("Failed to open remote scroll:\n%1")
-                                .arg(QString::fromStdString(result.errorMsg)));
-                        if (_window->statusBar()) _window->statusBar()->clearMessage();
-                        return;
-                    }
-
-                    _window->CloseVolume();
-
-                    _window->setVolume(result.volume);
-
-                    // Store remote scroll state for on-demand downloads
-                    _window->_remoteScroll.baseUrl = scrollInfo.baseUrl;
-                    _window->_remoteScroll.segmentsBaseUrl = scrollInfo.segmentsBaseUrl;
-                    _window->_remoteScroll.cachePath = cachePath;
-                    _window->_remoteScroll.auth = scrollInfo.auth;
-                    _window->_remoteScroll.segSource = scrollInfo.segmentSource;
-                    _window->_remoteScroll.active = true;
-
-                    // Use lazy loading: show all segments, load only cached ones
-                    _window->setRemoteStubs(scrollInfo.segmentIds, result.surfaces);
-
-                    // Populate volume combo with all discovered volumes
-                    if (_window->volSelect && scrollInfo.volumeNames.size() > 1) {
-                        const QSignalBlocker blocker{_window->volSelect};
-                        _window->volSelect->clear();
-                        for (const auto& vname : scrollInfo.volumeNames) {
-                            QString label = QString::fromStdString(vname);
-                            // Strip .zarr suffix for display
-                            if (label.endsWith(QStringLiteral(".zarr"))) {
-                                label.chop(5);
-                            }
-                            _window->volSelect->addItem(label, QString::fromStdString(vname));
-                        }
-                        // Select the currently loaded volume
-                        const QString currentId = QString::fromStdString(result.volume->id());
-                        for (int i = 0; i < _window->volSelect->count(); ++i) {
-                            if (_window->volSelect->itemData(i).toString().contains(currentId)) {
-                                _window->volSelect->setCurrentIndex(i);
-                                break;
-                            }
-                        }
-                    }
-
-                    _window->UpdateView();
-
-                    int cachedCount = static_cast<int>(result.surfaces.size());
-                    int totalCount = static_cast<int>(scrollInfo.segmentIds.size());
-                    if (_window->statusBar()) {
-                        _window->statusBar()->showMessage(
-                            QObject::tr("Opened remote scroll: %1 (%2/%3 segments cached, rest on-demand)")
-                                .arg(QString::fromStdString(result.volume->id()))
-                                .arg(cachedCount)
-                                .arg(totalCount),
-                            5000);
-                    }
-                });
-
-            auto segIds = scrollInfo.segmentIds;
-            auto scrollAuth = scrollInfo.auth;
-            auto baseUrl = scrollInfo.baseUrl;
-            auto segSource = scrollInfo.segmentSource;
-            auto segBaseUrl = scrollInfo.segmentsBaseUrl;
-
-            auto loadFuture = QtConcurrent::run(
-                [baseUrl, volumeName, segIds, cachePath, scrollAuth, segSource, segBaseUrl]() -> ScrollOpenResult {
-                    ScrollOpenResult result;
-                    try {
-                        // Derive volpkg name from base URL (last path component)
-                        std::string volpkgName = baseUrl;
-                        while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
-                        auto slash = volpkgName.rfind('/');
-                        if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
-
-                        std::filesystem::path volpkgCache = std::filesystem::path(cachePath) / volpkgName;
-
-                        // Open the volume
-                        std::string volumeUrl = baseUrl + "/volumes/" + volumeName;
-                        result.volume = Volume::NewFromUrl(volumeUrl, (volpkgCache / "volumes").string(), scrollAuth);
-
-                        // Pick the right base URL for segment downloads
-                        const std::string& dlBase = (segSource == vc::RemoteSegmentSource::Direct)
-                            ? segBaseUrl : baseUrl;
-
-                        // For Direct sources the on-demand download in CWindow
-                        // uses flat cachePath (no volpkgName nesting). Match that
-                        // layout here so preloaded segments are found on-demand.
-                        const std::filesystem::path segCache =
-                            (segSource == vc::RemoteSegmentSource::Direct)
-                                ? std::filesystem::path(cachePath) : volpkgCache;
-
-                        // Lazy loading: only download meta.json for each segment,
-                        // and fully load only those whose TIFFs are already cached.
-                        for (const auto& segId : segIds) {
-                            try {
-                                // Download metadata only (fast)
-                                vc::downloadRemoteSegmentMetadataOnly(
-                                    dlBase, segId, segCache, scrollAuth, segSource);
-
-                                // If TIFFs are already cached, load the surface
-                                if (vc::isRemoteSegmentFullyCached(segCache, segId, segSource)) {
-                                    const char* subdir = (segSource == vc::RemoteSegmentSource::Segments)
-                                        ? "segments" : "paths";
-                                    auto localDir = segCache / subdir / segId;
-                                    auto seg = Segmentation::New(localDir);
-                                    if (seg && seg->canLoadSurface()) {
-                                        auto surf = seg->loadSurface();
-                                        if (surf) {
-                                            result.surfaces.emplace_back(segId, surf);
-                                        }
-                                    }
-                                }
-                            } catch (const std::exception& e) {
-                                std::fprintf(stderr, "[RemoteScroll] Failed to process segment %s: %s\n",
-                                             segId.c_str(), e.what());
-                            }
-                        }
-                    } catch (const std::exception& e) {
-                        result.errorMsg = e.what();
-                    }
-                    return result;
-                });
-            loadWatcher->setFuture(loadFuture);
-            };  // end continueWithPhase2
-
-            // If no segments found, ask user for an external segments URL
-            if (scrollInfo.segmentIds.empty()) {
-                bool segOk = false;
-                QString segUrl = QInputDialog::getText(
-                    _window,
-                    QObject::tr("Segments Location"),
-                    QObject::tr("No segments found in the volpkg.\n"
-                                "Enter S3/HTTPS URL of directory containing segments\n"
-                                "(leave empty to skip):"),
-                    QLineEdit::Normal, QString(), &segOk);
-
-                if (segOk && !segUrl.trimmed().isEmpty()) {
-                    auto segResolved = vc::resolveRemoteUrl(segUrl.trimmed().toStdString());
-                    vc::cache::HttpAuth segAuth = auth;
-                    if (segResolved.useAwsSigv4 && segAuth.region.empty()) {
-                        segAuth.region = segResolved.awsRegion;
-                    }
-
-                    // Normalize trailing slash
-                    std::string segBaseUrl = segResolved.httpsUrl;
-                    while (!segBaseUrl.empty() && segBaseUrl.back() == '/')
-                        segBaseUrl.pop_back();
-
-                    std::fprintf(stderr, "[RemoteScroll] Probing external segments URL: %s\n",
-                                 segBaseUrl.c_str());
-
-                    // Run s3ListObjects on a background thread to avoid
-                    // blocking the GUI (it has a 30s timeout).
-                    auto* s3Watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);
-                    connect(s3Watcher, &QFutureWatcher<vc::cache::S3ListResult>::finished, this,
-                        [this, s3Watcher, scrollInfo, volumeName, segBaseUrl, segAuth,
-                         continueWithPhase2]() mutable {
-                            s3Watcher->deleteLater();
-
-                            try {
-                                auto extList = s3Watcher->result();
-                                if (!extList.prefixes.empty()) {
-                                    scrollInfo.segmentSource = vc::RemoteSegmentSource::Direct;
-                                    scrollInfo.segmentsBaseUrl = segBaseUrl;
-                                    scrollInfo.auth = segAuth;
-                                    for (const auto& name : extList.prefixes) {
-                                        std::fprintf(stderr, "[RemoteScroll]   external segment: %s\n",
-                                                     name.c_str());
-                                        scrollInfo.segmentIds.push_back(name);
-                                    }
-                                    std::fprintf(stderr, "[RemoteScroll] Found %zu external segments\n",
-                                                 scrollInfo.segmentIds.size());
-                                } else {
-                                    std::fprintf(stderr, "[RemoteScroll] No segments found at external URL\n");
-                                }
-                            } catch (const std::exception& e) {
-                                std::fprintf(stderr, "[RemoteScroll] s3ListObjects failed: %s\n", e.what());
-                            }
-
-                            continueWithPhase2(std::move(scrollInfo), volumeName);
-                        });
-
-                    auto s3Future = QtConcurrent::run(
-                        [segBaseUrl, segAuth]() -> vc::cache::S3ListResult {
-                            return vc::cache::s3ListObjects(segBaseUrl + "/", segAuth);
-                        });
-                    s3Watcher->setFuture(s3Future);
-                    return;  // Phase 2 will be triggered by s3Watcher callback
-                }
-            }
-
-            // Fast path: no external-segment probe needed
-            continueWithPhase2(std::move(scrollInfo), volumeName);
-        });
-
-    auto discoveryFuture = QtConcurrent::run(
-        [httpsUrl, auth]() -> vc::RemoteScrollInfo {
-            return vc::discoverRemoteScroll(httpsUrl, auth);
-        });
-    discoveryWatcher->setFuture(discoveryFuture);
 }
 
 void MenuActionController::triggerTeleaInpaint()
@@ -2185,9 +925,13 @@ void MenuActionController::importObjAsPatch()
         return;
     }
 
-    auto pathsDirFs = std::filesystem::path(_window->_state->vpkg()->getVolpkgDirectory()) /
-                      std::filesystem::path(_window->_state->vpkg()->getSegmentationDirectory());
-    QString pathsDir = QString::fromStdString(pathsDirFs.string());
+    const auto outDir = _window->_state->vpkg()->outputSegmentsPath();
+    if (outDir.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Error"),
+                             QObject::tr("Project has no output segments directory configured."));
+        return;
+    }
+    QString pathsDir = QString::fromStdString(outDir.string());
 
     QStringList successfulIds;
     QStringList failedFiles;
@@ -2243,4 +987,273 @@ void MenuActionController::importObjAsPatch()
     }
 
     QMessageBox::information(_window, QObject::tr("Import Results"), message);
+}
+
+void MenuActionController::newProject()
+{
+    if (!_window) return;
+    auto pkg = VolumePkg::newEmpty();
+    pkg->saveAutosave();
+    _window->_state->setVpkg(pkg);
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::saveProjectAs()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString defaultDir = settings.value(vc3d::settings::project::DEFAULT_PATH).toString();
+    QString file = QFileDialog::getSaveFileName(
+        _window, QObject::tr("Save Project As"), defaultDir,
+        QObject::tr("Project (*.volpkg.json)"));
+    if (file.isEmpty()) return;
+    if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) file += ".volpkg.json";
+    try {
+        _window->_state->vpkg()->save(std::filesystem::path(file.toStdString()));
+        settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(file).absolutePath());
+        updateRecentVolpkgList(file);
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("Save failed"), QString::fromUtf8(e.what()));
+    }
+}
+
+QString MenuActionController::promptLocation(const QString& title,
+                                             const QString& hint,
+                                             const QString& defaultDir,
+                                             const QStringList& localFilters,
+                                             bool acceptFiles,
+                                             bool acceptDirs)
+{
+    UnifiedBrowserDialog dlg(_window);
+    dlg.setWindowTitle(title);
+    dlg.setHint(hint);
+    dlg.setStartUri(defaultDir);
+    dlg.setLocalNameFilters(localFilters);
+    dlg.setAcceptsFiles(acceptFiles);
+    dlg.setAcceptsDirs(acceptDirs);
+    dlg.setAuthResolver([this](const QString& url, vc::cache::HttpAuth* out, QString* err) {
+        return tryResolveRemoteAuth(url, out, true, err);
+    });
+    if (dlg.exec() != QDialog::Accepted) return {};
+    QString uri = dlg.selectedUri();
+    if (uri.startsWith("file://", Qt::CaseInsensitive)) uri = uri.mid(7);
+    const int schemeSep = uri.indexOf("://");
+    const int minLen = (schemeSep < 0) ? 1 : schemeSep + 4;
+    while (uri.size() > minLen && uri.endsWith('/')) uri.chop(1);
+    return uri;
+}
+
+void MenuActionController::attachVolume()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto loc = promptLocation(QObject::tr("Attach Volume"),
+                              QObject::tr("Pick a zarr volume or a folder of zarrs (local or s3://, https://)."),
+                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                              {}, false, true);
+    if (loc.isEmpty()) return;
+    const auto err = vc::project::validateLocation(vc::project::Category::Volumes, loc.toStdString());
+    if (!err.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Not a valid volume location:\n\n%1").arg(QString::fromStdString(err)));
+        return;
+    }
+    bool ok = false;
+    QString tagsStr = QInputDialog::getText(_window, QObject::tr("Attach Volume"),
+        QObject::tr("Tags (comma-separated, optional; e.g. normal3d):"),
+        QLineEdit::Normal, QString(), &ok);
+    if (!ok) return;
+    std::vector<std::string> tags;
+    for (const auto& t : tagsStr.split(',', Qt::SkipEmptyParts)) {
+        const auto trimmed = t.trimmed().toStdString();
+        if (!trimmed.empty()) tags.push_back(trimmed);
+    }
+    if (!_window->_state->vpkg()->addVolumeEntry(loc.toStdString(), tags)) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add volume (already attached?)"));
+        return;
+    }
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::attachSegments()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto loc = promptLocation(QObject::tr("Attach Segments"),
+                              QObject::tr("Pick a segment or a folder of segments (local or s3://, https://)."),
+                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                              {}, false, true);
+    if (loc.isEmpty()) return;
+    const auto err = vc::project::validateLocation(vc::project::Category::Segments, loc.toStdString());
+    if (!err.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Not a valid segments location:\n\n%1").arg(QString::fromStdString(err)));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    if (!pkg->addSegmentsEntry(loc.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add segments (already attached?)"));
+        return;
+    }
+    if (!pkg->hasOutputSegments()) pkg->setOutputSegments(loc.toStdString());
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::attachNormalGrid()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto loc = promptLocation(QObject::tr("Attach Normal Grid"),
+                              QObject::tr("Pick a normal_grids root (xy/xz/yz subdirs)."),
+                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                              {}, false, true);
+    if (loc.isEmpty()) return;
+    const auto err = vc::project::validateLocation(vc::project::Category::NormalGrids, loc.toStdString());
+    if (!err.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Not a valid normal-grid location:\n\n%1").arg(QString::fromStdString(err)));
+        return;
+    }
+    if (!_window->_state->vpkg()->addNormalGridEntry(loc.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add normal grid (already attached?)"));
+        return;
+    }
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::detachEntry()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    QStringList items;
+    QStringList locations;
+    for (const auto& e : pkg->volumeEntries()) {
+        items << QObject::tr("[volume] %1").arg(QString::fromStdString(e.location));
+        locations << QString::fromStdString(e.location);
+    }
+    for (const auto& e : pkg->segmentEntries()) {
+        items << QObject::tr("[segments] %1").arg(QString::fromStdString(e.location));
+        locations << QString::fromStdString(e.location);
+    }
+    for (const auto& e : pkg->normalGridEntries()) {
+        items << QObject::tr("[normal_grid] %1").arg(QString::fromStdString(e.location));
+        locations << QString::fromStdString(e.location);
+    }
+    if (items.isEmpty()) {
+        QMessageBox::information(_window, QObject::tr("Detach"),
+            QObject::tr("Nothing to detach — project has no entries."));
+        return;
+    }
+    bool ok = false;
+    const QString picked = QInputDialog::getItem(_window, QObject::tr("Detach"),
+        QObject::tr("Select an entry to remove from the project:"),
+        items, 0, false, &ok);
+    if (!ok || picked.isEmpty()) return;
+    const int idx = items.indexOf(picked);
+    if (idx < 0) return;
+    const QString loc = locations.at(idx);
+    if (QMessageBox::question(_window, QObject::tr("Detach"),
+            QObject::tr("Remove this entry from the project?\n\n%1").arg(loc),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    if (!pkg->removeEntry(loc.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Detach failed"),
+            QObject::tr("Could not remove entry (not found)."));
+        return;
+    }
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::setOutputSegments()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    QStringList items;
+    for (const auto& e : pkg->segmentEntries()) items << QString::fromStdString(e.location);
+    if (items.isEmpty()) {
+        QMessageBox::information(_window, QObject::tr("No segments"),
+                                 QObject::tr("Attach a segments source first."));
+        return;
+    }
+    bool ok = false;
+    int currentIdx = 0;
+    if (pkg->hasOutputSegments()) {
+        const auto cur = QString::fromStdString(pkg->outputSegmentsPath().string());
+        for (int i = 0; i < items.size(); ++i) {
+            if (items[i] == cur) { currentIdx = i; break; }
+        }
+    }
+    QString chosen = QInputDialog::getItem(_window, QObject::tr("Set Output Segments"),
+        QObject::tr("Where new segments will land:"), items, currentIdx, false, &ok);
+    if (!ok || chosen.isEmpty()) return;
+    pkg->setOutputSegments(chosen.toStdString());
+}
+
+bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString out = QFileDialog::getSaveFileName(_window,
+        QObject::tr("Save converted .volpkg.json"),
+        settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+        QObject::tr("Project (*.volpkg.json)"));
+    if (out.isEmpty()) return false;
+    if (!out.endsWith(".volpkg.json", Qt::CaseInsensitive)) out += ".volpkg.json";
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    auto r = vc::convertVolpkg(inputLocation.toStdString(), std::filesystem::path(out.toStdString()));
+    QApplication::restoreOverrideCursor();
+
+    if (!r.ok) {
+        QMessageBox box(_window);
+        box.setWindowTitle(QObject::tr("Volpkg conversion failed"));
+        box.setIcon(QMessageBox::Warning);
+        box.setText(QObject::tr("Could not convert this volpkg to .volpkg.json."));
+        box.setInformativeText(QObject::tr("Input:  %1\nOutput: %2\n\nReason: %3")
+            .arg(inputLocation, out, QString::fromStdString(r.message)));
+        box.setStandardButtons(QMessageBox::Ok);
+        box.setStyleSheet("QLabel{min-width:600px;}");
+        box.exec();
+        return false;
+    }
+    if (!r.message.empty()) {
+        QMessageBox::information(_window, QObject::tr("Volpkg converted with warnings"),
+            QString::fromStdString(r.message));
+    }
+    if (convertedOut) *convertedOut = out;
+    return true;
+}
+
+void MenuActionController::convertLegacyVolpkg()
+{
+    if (!_window) return;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto in = promptLocation(QObject::tr("Convert Legacy Volpkg"),
+                             QObject::tr("Pick the legacy volpkg directory or remote URL."),
+                             settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                             {}, false, true);
+    if (in.isEmpty()) return;
+    QString out;
+    if (!runLegacyVolpkgConvert(in, &out)) return;
+    auto reply = QMessageBox::question(_window, QObject::tr("Open converted project?"),
+        QObject::tr("Wrote %1 — open it now?").arg(out));
+    if (reply == QMessageBox::Yes) openVolpkgAt(out);
 }

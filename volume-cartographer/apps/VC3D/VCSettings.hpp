@@ -6,18 +6,21 @@
 
 namespace vc3d {
 
-// Prefer /ephemeral/VC3D when the host has local NVMe instance storage
-// mounted there (see scripts/build_dependencies.sh); fall back to ~/.VC3D.
+// Prefer fast local storage when available — /ephemeral (NVMe instance store
+// set up by scripts/build_dependencies.sh) or /volpkgs (manually-mounted
+// scratch volume), whichever exists first. Fall back to ~/.VC3D.
 // Cached on first call because filesystem state doesn't change during a run.
 inline QString defaultCacheBase()
 {
     static const QString base = []() {
-        const QString eph = QStringLiteral("/ephemeral");
-        QFileInfo fi(eph);
-        if (fi.isDir() && fi.isWritable()) {
-            QString p = eph + "/VC3D";
-            QDir().mkpath(p);
-            return p;
+        for (const QString& root : {QStringLiteral("/ephemeral"),
+                                    QStringLiteral("/volpkgs")}) {
+            QFileInfo fi(root);
+            if (fi.isDir() && fi.isWritable()) {
+                QString p = root + "/VC3D";
+                QDir().mkpath(p);
+                return p;
+            }
         }
         return QDir::homePath() + "/.VC3D";
     }();
@@ -47,10 +50,10 @@ namespace settings {
 // -----------------------------------------------------------------------------
 // Volume Package Settings
 // -----------------------------------------------------------------------------
-namespace volpkg {
-    constexpr auto DEFAULT_PATH = "volpkg/default_path";
-    constexpr auto AUTO_OPEN = "volpkg/auto_open";
-    constexpr auto RECENT = "volpkg/recent";
+namespace project {
+    constexpr auto DEFAULT_PATH = "project/default_path";
+    constexpr auto AUTO_OPEN = "project/auto_open";
+    constexpr auto RECENT = "project/recent";
 
     constexpr bool AUTO_OPEN_DEFAULT = true;
 }
@@ -136,15 +139,6 @@ namespace viewer {
     constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
     // Default: vc3d::defaultCacheBase() + "/remote_cache" — uses /ephemeral
     // when mounted, else ~/.VC3D.
-
-    // Recent remote volume URLs
-    constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
-
-    // Last-used remote segments URL and the remote zarr URL it was attached
-    // to. Auto-open uses these so reopening the same zarr auto-re-attaches
-    // the same segments directory instead of showing the prompt.
-    constexpr auto LAST_REMOTE_SEGMENTS_URL = "viewer/last_remote_segments_url";
-    constexpr auto LAST_REMOTE_SEGMENTS_FOR_ZARR = "viewer/last_remote_segments_for_zarr";
 
     // Audio/UX
     constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
