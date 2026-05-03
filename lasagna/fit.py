@@ -400,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
 				progress_fn=_make_progress(),
 				ensure_data_fn=_ensure_data_win,
 				seed_xyz=win_seed,
+				out_dir=str(Path(output_dir) / f"window_{wi:04d}"),
 			)
 
 			# Export this window's tifxyz
@@ -636,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
 		progress_fn=_progress,
 		ensure_data_fn=_ensure_data,
 		seed_xyz=seed_xyz,
+		out_dir=_out_dir,
 	)
 
 	if device.type == "cuda":

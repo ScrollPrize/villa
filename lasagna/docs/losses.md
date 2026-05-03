@@ -33,6 +33,33 @@ Notes:
 
 Optimizer stages can also optionally perform mesh growth + local optimization (see [`docs/model.md`](model.md:1)).
 
+### Optional `pred_dt` dense-flow gate
+
+`pred_dt` snapping can be gated per stage via `global_opt.args`:
+
+```json
+{
+  "name": "snap",
+  "steps": 1000,
+  "params": ["mesh_ms"],
+  "args": {
+    "pred_dt_flow_gate": {
+      "enabled": true,
+      "flow_zero": 50.0,
+      "flow_one": 300.0,
+      "debug": true
+    }
+  }
+}
+```
+
+When enabled, the current single-winding `pred_dt` render is thresholded at
+`127`, routed through `dense_batch_min_cut`, and sampled at the exact model
+grid corners. The resulting gate is linearly mapped from `flow_zero -> 0` to
+`flow_one -> 1` and multiplies the `pred_dt` loss map. The loss denominator
+remains the original validity-mask sum; the gate is intentionally not
+renormalized.
+
 ## 4) Add visualization output (loss map)
 
 - Import the new loss module in [`vis.py`](../vis.py:1).

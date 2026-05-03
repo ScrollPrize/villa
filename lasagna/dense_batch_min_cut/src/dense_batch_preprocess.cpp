@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -31,6 +32,10 @@ constexpr double kFixedThreshold = 127.0;
 constexpr float kMinComponentRidgeRadius = 2.0f;
 constexpr double kMinBoundaryAngleDegrees = 120.0;
 constexpr float kCapacityScale = 2.0f;
+constexpr bool kEnableLegacyVoronoiTreeDensification = false;
+constexpr bool kEnableLegacyDenseDtAscent = false;
+constexpr bool kWriteReferenceDenseBacktrackNn = false;
+constexpr bool kEnablePixelDenseBacktrackFlood = false;
 using Clock = std::chrono::steady_clock;
 
 struct TimingMark {
@@ -78,6 +83,9 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
     }
 
     std::cout << "Timings:\n"
+              << "  opencv_threads=" << cv::getNumThreads()
+              << " hardware_threads="
+              << std::thread::hardware_concurrency() << "\n"
               << "  " << std::left << std::setw(kStageWidth) << "stage"
               << std::right << std::setw(kNumericWidth) << "runtime_%"
               << std::setw(kNumericWidth) << "elapsed_ms"
@@ -2499,7 +2507,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         result.timings.push_back(finish_timing("dense_backtrack_seed", timing));
     }
 
-    {
+    if (kEnablePixelDenseBacktrackFlood) {
         const TimingMark timing = start_timing();
         const std::array<cv::Point, 8> kDirs = {
             cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
@@ -2546,6 +2554,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         }
         result.timings.push_back(
             finish_timing("dense_backtrack_flood", timing));
+    } else {
+        result.timings.push_back({"dense_backtrack_flood_skipped", 0.0, 0.0});
     }
 
     {
@@ -2567,7 +2577,10 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             cv::LineIterator it(white_domain, a, b, 8);
             for (int i = 0; i < it.count; ++i, ++it) {
                 const cv::Point pixel = it.pos();
-                if (!in_white_domain(pixel) ||
+                if (!in_white_domain(pixel)) {
+                    return false;
+                }
+                if (kEnablePixelDenseBacktrackFlood &&
                     routed_flow[linear_index(pixel)] <= 0.0f) {
                     return false;
                 }
@@ -2610,8 +2623,11 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             for (int gx = 0; gx < grid_cols; ++gx) {
                 const cv::Point pixel(grid_xs[gx], grid_ys[gy]);
                 const int index = linear_index(pixel);
-                const int id =
-                    add_carrier(pixel, routed_flow[index], true, false);
+                const float grid_capacity =
+                    kEnablePixelDenseBacktrackFlood
+                        ? routed_flow[index]
+                        : capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
+                const int id = add_carrier(pixel, grid_capacity, true, false);
                 grid_node_ids[static_cast<std::size_t>(gy * grid_cols + gx)] =
                     id;
             }
@@ -3194,8 +3210,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             for (int y = range.start; y < range.end; ++y) {
                 for (int x = 0; x < cols; ++x) {
                     const int index = y * cols + x;
-                    if (white_domain.at<std::uint8_t>(y, x) == 0 ||
-                        routed_flow[index] <= 0.0f) {
+                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
                         continue;
                     }
                     result.nn_flow.at<float>(y, x) = routed_flow[index];
@@ -3302,7 +3317,10 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 continue;
             }
             const int index = y * cols + x;
-            if (routed_flow[index] > 0.0f) {
+            const float reached_value = kEnablePixelDenseBacktrackFlood
+                                            ? routed_flow[index]
+                                            : result.flow.at<float>(y, x);
+            if (reached_value > 0.0f) {
                 ++result.reached_pixels;
             } else {
                 ++result.unreached_white_pixels;
@@ -4147,24 +4165,31 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     std::vector<float> edge_flow(graph.edges.size(), 0.0f);
     {
         const TimingMark timing = start_timing();
-        for (int node = 1; node < node_count; ++node) {
-            node_flow[node] = max_flow_to_node(node, -1);
-        }
-        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
-             ++edge_index) {
-            const GraphEdge& edge = graph.edges[edge_index];
-            double value = 0.0;
-            if (edge.a > 0 && edge.a < node_count) {
-                value = std::max(value, node_flow[edge.a]);
+        cv::parallel_for_(cv::Range(1, node_count), [&](const cv::Range& range) {
+            for (int node = range.start; node < range.end; ++node) {
+                node_flow[node] = max_flow_to_node(node, -1);
             }
-            if (edge.b > 0 && edge.b < node_count) {
-                value = std::max(value, node_flow[edge.b]);
+        });
+        cv::parallel_for_(
+            cv::Range(0, static_cast<int>(graph.edges.size())),
+            [&](const cv::Range& range) {
+                for (int edge_index = range.start; edge_index < range.end;
+                     ++edge_index) {
+                    const GraphEdge& edge = graph.edges[edge_index];
+                    double value = 0.0;
+                    if (edge.a > 0 && edge.a < node_count) {
+                        value = std::max(value, node_flow[edge.a]);
+                    }
+                    if (edge.b > 0 && edge.b < node_count) {
+                        value = std::max(value, node_flow[edge.b]);
+                    }
+                    edge_flow[edge_index] =
+                        value >= kGraphFlowInf * 0.5
+                            ? kDenseFlowInf
+                            : static_cast<float>(std::max(0.0, value));
+                }
             }
-            edge_flow[edge_index] =
-                value >= kGraphFlowInf * 0.5
-                    ? kDenseFlowInf
-                    : static_cast<float>(std::max(0.0, value));
-        }
+        );
         timings.push_back(finish_timing("graph_node_maxflow", timing));
     }
 
@@ -4254,18 +4279,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat graph_flow_dilated;
     {
         const TimingMark timing = start_timing();
-        cv::Mat tree_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
-        for (int y = 0; y < white_domain.rows; ++y) {
-            for (int x = 0; x < white_domain.cols; ++x) {
-                if (white_domain.at<std::uint8_t>(y, x) != 0 &&
-                    source_pixel_ridges.at<std::uint8_t>(y, x) != 0) {
-                    tree_mask.at<std::uint8_t>(y, x) = 255;
-                }
-            }
-        }
-
-        cv::Mat graph_flow_mask = graph_pixel_flow > 0.0f;
-        cv::dilate(graph_flow_mask, graph_flow_dilated, cv::Mat());
         for (int edge_index = 0;
              edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
             if (source_edges[edge_index] == 0) {
@@ -4287,7 +4300,26 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                            cv::FILLED, cv::LINE_8);
             }
         }
+        timings.push_back(finish_timing("source_edge_mask", timing));
+    }
 
+    // Disabled reference path: this Voronoi-tree densification produced the
+    // older tree/NN debug images, but current pred_tree_dense_flow comes from
+    // compute_dense_backtrack_flow below. Keep this code for future expansion.
+    if (kEnableLegacyVoronoiTreeDensification) {
+        const TimingMark timing = start_timing();
+        cv::Mat tree_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
+        for (int y = 0; y < white_domain.rows; ++y) {
+            for (int x = 0; x < white_domain.cols; ++x) {
+                if (white_domain.at<std::uint8_t>(y, x) != 0 &&
+                    source_pixel_ridges.at<std::uint8_t>(y, x) != 0) {
+                    tree_mask.at<std::uint8_t>(y, x) = 255;
+                }
+            }
+        }
+
+        cv::Mat graph_flow_mask = graph_pixel_flow > 0.0f;
+        cv::dilate(graph_flow_mask, graph_flow_dilated, cv::Mat());
         struct QueueItem {
             float flow = 0.0f;
             cv::Point pixel;
@@ -4368,7 +4400,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         timings.push_back(
             finish_timing("voronoi_tree_propagate", propagate_timing));
     }
-    {
+    if (kEnableLegacyVoronoiTreeDensification) {
         const TimingMark timing = start_timing();
         constexpr int kTreeFlowSmoothIterations = 2;
         for (int iteration = 0; iteration < kTreeFlowSmoothIterations;
@@ -4442,7 +4474,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_path_debug(white_domain.size(), CV_32FC3,
                             cv::Scalar(0, 0, 0));
-    {
+    if (kEnableLegacyVoronoiTreeDensification) {
         const TimingMark timing = start_timing();
         cv::Mat tree_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
         for (int y = 0; y < tree_pixel_flow.rows; ++y) {
@@ -4852,6 +4884,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             compute_dense_backtrack_flow(white_domain, dt, graph_pixel_flow,
                                          graph_node_flow, source_edge_mask,
                                          graph.node_mask, graph);
+        // Reference dense flood: useful for later experiments, but its TIFF is
+        // disabled by default so timing focuses on the current tree dense flow.
         dense_backtrack_nn_flow = dense_backtrack.nn_flow;
         smooth_grid_flow = dense_backtrack.smooth_grid_flow;
         tree_dense_flow = dense_backtrack.flow;
@@ -4868,7 +4902,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
 
     cv::Mat dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
-    {
+    if (kEnableLegacyDenseDtAscent) {
         const TimingMark timing = start_timing();
         dense_flow.setTo(-1.0f, white_domain);
         cv::Mat cached_flow(white_domain.size(), CV_32F, cv::Scalar(-1.0f));
@@ -5085,7 +5119,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             flow_attn.at<cv::Vec3f>(y, x) = cv::Vec3f(attn, attn, attn);
         }
     }
-    {
+    if (kEnableLegacyVoronoiTreeDensification) {
         const TimingMark timing = start_timing();
         int tree_label_stride = 0;
         for (int y = 0; y < tree_pixel_flow.rows; ++y) {
@@ -5624,6 +5658,182 @@ void write_named_layered_tiff(const fs::path& path,
 
 }  // namespace
 
+extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
+                                        int width,
+                                        int height,
+                                        int source_x,
+                                        int source_y,
+                                        const float* query_xy,
+                                        int query_count,
+                                        float* query_flow,
+                                        float* dense_flow,
+                                        char* error_message,
+                                        int error_message_size,
+                                        int verbose) {
+    const auto set_error = [&](const std::string& message) {
+        if (error_message != nullptr && error_message_size > 0) {
+            const std::size_t n = std::min<std::size_t>(
+                static_cast<std::size_t>(error_message_size - 1),
+                message.size());
+            std::copy(message.begin(), message.begin() + n, error_message);
+            error_message[n] = '\0';
+        }
+    };
+
+    try {
+        if (image == nullptr) {
+            throw std::runtime_error("image pointer is null");
+        }
+        if (width <= 0 || height <= 0) {
+            throw std::runtime_error("image dimensions must be positive");
+        }
+        if (query_count < 0) {
+            throw std::runtime_error("query_count must be non-negative");
+        }
+        if (query_count > 0 &&
+            (query_xy == nullptr || query_flow == nullptr)) {
+            throw std::runtime_error(
+                "query_xy and query_flow are required when query_count > 0");
+        }
+        struct CoutSilencer {
+            std::streambuf* old = nullptr;
+            std::ostringstream sink;
+            explicit CoutSilencer(bool active) {
+                if (active) {
+                    old = std::cout.rdbuf(sink.rdbuf());
+                }
+            }
+            ~CoutSilencer() {
+                if (old != nullptr) {
+                    std::cout.rdbuf(old);
+                }
+            }
+        } silence(verbose == 0);
+
+        std::vector<StageTiming> timings;
+        const TimingMark total_start = start_timing();
+
+        cv::Mat gray(height, width, CV_8U,
+                     const_cast<unsigned char*>(image));
+        gray = gray.clone();
+
+        cv::Mat binary;
+        {
+            const TimingMark timing = start_timing();
+            binary = binarize_fixed_threshold(gray);
+            timings.push_back(finish_timing("binarize", timing));
+        }
+
+        const cv::Point source(source_x, source_y);
+        {
+            const TimingMark timing = start_timing();
+            binary = keep_source_white_component(binary, source);
+            timings.push_back(
+                finish_timing("source_connected_component", timing));
+        }
+
+        cv::Mat white_domain(binary.size(), CV_8U, cv::Scalar(255));
+        white_domain.setTo(0, binary);
+
+        cv::Mat dt;
+        {
+            const TimingMark timing = start_timing();
+            cv::distanceTransform(white_domain, dt, cv::DIST_L2,
+                                  cv::DIST_MASK_PRECISE);
+            timings.push_back(finish_timing("precise_dt", timing));
+        }
+
+        ComponentVoronoiResult component_voronoi_result;
+        {
+            const TimingMark timing = start_timing();
+            component_voronoi_result = component_voronoi(binary);
+            timings.push_back(finish_timing("component_voronoi", timing));
+            timings.insert(timings.end(),
+                           component_voronoi_result.timings.begin(),
+                           component_voronoi_result.timings.end());
+        }
+
+        {
+            const TimingMark timing = start_timing();
+            component_voronoi_result.cell_loops_connected =
+                add_valid_frame_to_skeleton(
+                    component_voronoi_result.cell_loops_connected, dt);
+            timings.push_back(finish_timing("add_valid_frame", timing));
+        }
+
+        SkeletonGraph graph;
+        {
+            const TimingMark timing = start_timing();
+            graph = extract_skeleton_graph(
+                component_voronoi_result.cell_loops_connected, dt);
+            timings.push_back(finish_timing("graph_extract", timing));
+        }
+
+        DenseFlowResult dense_flow_result =
+            compute_dense_source_flow(
+                white_domain, dt, graph,
+                component_voronoi_result.source_pixel_ridges, source);
+        timings.insert(timings.end(), dense_flow_result.timings.begin(),
+                       dense_flow_result.timings.end());
+
+        if (dense_flow != nullptr) {
+            for (int y = 0; y < height; ++y) {
+                const float* src_row =
+                    dense_flow_result.tree_dense_flow.ptr<float>(y);
+                std::copy(src_row, src_row + width,
+                          dense_flow + static_cast<std::size_t>(y) * width);
+            }
+        }
+
+        const auto sample_flow = [&](const float x, const float y) {
+            if (x < 0.0f || y < 0.0f || x > static_cast<float>(width - 1) ||
+                y > static_cast<float>(height - 1)) {
+                return 0.0f;
+            }
+            const int x0 = std::clamp(static_cast<int>(std::floor(x)), 0,
+                                      width - 1);
+            const int y0 = std::clamp(static_cast<int>(std::floor(y)), 0,
+                                      height - 1);
+            const int x1 = std::min(x0 + 1, width - 1);
+            const int y1 = std::min(y0 + 1, height - 1);
+            const float fx = x - static_cast<float>(x0);
+            const float fy = y - static_cast<float>(y0);
+            const float v00 =
+                dense_flow_result.tree_dense_flow.at<float>(y0, x0);
+            const float v10 =
+                dense_flow_result.tree_dense_flow.at<float>(y0, x1);
+            const float v01 =
+                dense_flow_result.tree_dense_flow.at<float>(y1, x0);
+            const float v11 =
+                dense_flow_result.tree_dense_flow.at<float>(y1, x1);
+            const float v0 = v00 * (1.0f - fx) + v10 * fx;
+            const float v1 = v01 * (1.0f - fx) + v11 * fx;
+            return v0 * (1.0f - fy) + v1 * fy;
+        };
+
+        for (int i = 0; i < query_count; ++i) {
+            query_flow[i] = sample_flow(query_xy[2 * i],
+                                        query_xy[2 * i + 1]);
+        }
+
+        timings.push_back(finish_timing("total", total_start));
+        if (verbose != 0) {
+            print_stage_timings(timings);
+        }
+        if (error_message != nullptr && error_message_size > 0) {
+            error_message[0] = '\0';
+        }
+        return 0;
+    } catch (const std::exception& ex) {
+        set_error(ex.what());
+        return 1;
+    } catch (...) {
+        set_error("unknown dense_batch_flow_grid_u8 error");
+        return 1;
+    }
+}
+
+#ifndef DENSE_BATCH_MIN_CUT_NO_MAIN
 int main(int argc, char** argv) {
     try {
         const TimingMark total_start = start_timing();
@@ -5801,26 +6011,31 @@ int main(int argc, char** argv) {
 
         if (has_dense_flow) {
             const TimingMark timing = start_timing();
-            write_image(workdir / (stem + "_dense_flow.tif"),
-                        dense_flow_result.dense_flow);
-            write_image(workdir / (stem + "_voronoi_tree_flow.tif"),
-                        dense_flow_result.voronoi_tree_flow);
-            write_image(workdir / (stem + "_voronoi_tree_flow_gray_bg.tif"),
-                        dense_flow_result.voronoi_tree_flow_gray_bg);
-            write_image(workdir / (stem + "_tree_dense_nn_flow.tif"),
-                        dense_flow_result.tree_dense_nn_flow);
-            write_image(workdir / (stem + "_dense_backtrack_nn_flow.tif"),
-                        dense_flow_result.dense_backtrack_nn_flow);
+            if (kEnableLegacyDenseDtAscent) {
+                write_image(workdir / (stem + "_dense_flow.tif"),
+                            dense_flow_result.dense_flow);
+            }
+            if (kEnableLegacyVoronoiTreeDensification) {
+                write_image(workdir / (stem + "_voronoi_tree_flow.tif"),
+                            dense_flow_result.voronoi_tree_flow);
+                write_image(workdir /
+                                (stem + "_voronoi_tree_flow_gray_bg.tif"),
+                            dense_flow_result.voronoi_tree_flow_gray_bg);
+                write_image(workdir / (stem + "_tree_dense_nn_flow.tif"),
+                            dense_flow_result.tree_dense_nn_flow);
+                write_image(workdir / (stem + "_tree_flow_attn.tif"),
+                            dense_flow_result.tree_flow_attn);
+            }
+            if (kWriteReferenceDenseBacktrackNn) {
+                write_image(workdir / (stem + "_dense_backtrack_nn_flow.tif"),
+                            dense_flow_result.dense_backtrack_nn_flow);
+            }
             write_image(workdir / (stem + "_smooth_grid_flow.tif"),
                         dense_flow_result.smooth_grid_flow);
             write_image(workdir / (stem + "_tree_dense_flow.tif"),
                         dense_flow_result.tree_dense_flow);
             write_image(workdir / (stem + "_tree_paths_debug.tif"),
                         dense_flow_result.tree_path_debug);
-            write_image(workdir / (stem + "_tree_flow_attn.tif"),
-                        dense_flow_result.tree_flow_attn);
-            write_image(workdir / (stem + "_flow_attn.tif"),
-                        dense_flow_result.flow_attn);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
                         dense_flow_result.graph_edge_flow);
             write_image(workdir / (stem + "_graph_edge_flow_gray_bg.tif"),
@@ -5848,31 +6063,37 @@ int main(int argc, char** argv) {
             {"graph_capacity_gray_bg", to_float_layer(graph_capacity_gray_bg)},
         };
         if (has_dense_flow) {
-            layered_tiff.push_back(
-                {"dense_flow", to_float_layer(dense_flow_result.dense_flow)});
-            layered_tiff.push_back(
-                {"voronoi_tree_flow",
-                 to_float_layer(dense_flow_result.voronoi_tree_flow)});
-            layered_tiff.push_back(
-                {"voronoi_tree_flow_gray_bg",
-                 to_float_layer(dense_flow_result.voronoi_tree_flow_gray_bg)});
-            layered_tiff.push_back(
-                {"tree_dense_nn_flow",
-                 to_float_layer(dense_flow_result.tree_dense_nn_flow)});
-            layered_tiff.push_back(
-                {"dense_backtrack_nn_flow",
-                 to_float_layer(dense_flow_result.dense_backtrack_nn_flow)});
+            if (kEnableLegacyDenseDtAscent) {
+                layered_tiff.push_back(
+                    {"dense_flow",
+                     to_float_layer(dense_flow_result.dense_flow)});
+            }
+            if (kEnableLegacyVoronoiTreeDensification) {
+                layered_tiff.push_back(
+                    {"voronoi_tree_flow",
+                     to_float_layer(dense_flow_result.voronoi_tree_flow)});
+                layered_tiff.push_back(
+                    {"voronoi_tree_flow_gray_bg",
+                     to_float_layer(
+                         dense_flow_result.voronoi_tree_flow_gray_bg)});
+                layered_tiff.push_back(
+                    {"tree_dense_nn_flow",
+                     to_float_layer(dense_flow_result.tree_dense_nn_flow)});
+                layered_tiff.push_back(
+                    {"tree_flow_attn",
+                     to_float_layer(dense_flow_result.tree_flow_attn)});
+            }
+            if (kWriteReferenceDenseBacktrackNn) {
+                layered_tiff.push_back(
+                    {"dense_backtrack_nn_flow",
+                     to_float_layer(dense_flow_result.dense_backtrack_nn_flow)});
+            }
             layered_tiff.push_back(
                 {"smooth_grid_flow",
                  to_float_layer(dense_flow_result.smooth_grid_flow)});
             layered_tiff.push_back(
                 {"tree_dense_flow",
                  to_float_layer(dense_flow_result.tree_dense_flow)});
-            layered_tiff.push_back(
-                {"tree_flow_attn",
-                 to_float_layer(dense_flow_result.tree_flow_attn)});
-            layered_tiff.push_back(
-                {"flow_attn", to_float_layer(dense_flow_result.flow_attn)});
             layered_tiff.push_back(
                 {"graph_edge_flow",
                  to_float_layer(dense_flow_result.graph_edge_flow)});
@@ -6007,30 +6228,35 @@ int main(int argc, char** argv) {
                   << "\n"
                   << "  " << (workdir / (stem + "_layers.tif")) << "\n";
         if (has_dense_flow) {
-            std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
-                      << "\n"
-                      << "  "
-                      << (workdir / (stem + "_voronoi_tree_flow.tif"))
-                      << "\n"
-                      << "  "
-                      << (workdir /
-                          (stem + "_voronoi_tree_flow_gray_bg.tif"))
-                      << "\n"
-                      << "  "
-                      << (workdir / (stem + "_tree_dense_nn_flow.tif"))
-                      << "\n"
-                      << "  "
-                      << (workdir / (stem + "_dense_backtrack_nn_flow.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_smooth_grid_flow.tif"))
+            if (kEnableLegacyDenseDtAscent) {
+                std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
+                          << "\n";
+            }
+            if (kEnableLegacyVoronoiTreeDensification) {
+                std::cout << "  "
+                          << (workdir / (stem + "_voronoi_tree_flow.tif"))
+                          << "\n"
+                          << "  "
+                          << (workdir /
+                              (stem + "_voronoi_tree_flow_gray_bg.tif"))
+                          << "\n"
+                          << "  "
+                          << (workdir / (stem + "_tree_dense_nn_flow.tif"))
+                          << "\n"
+                          << "  " << (workdir / (stem + "_tree_flow_attn.tif"))
+                          << "\n";
+            }
+            if (kWriteReferenceDenseBacktrackNn) {
+                std::cout << "  "
+                          << (workdir /
+                              (stem + "_dense_backtrack_nn_flow.tif"))
+                          << "\n";
+            }
+            std::cout << "  " << (workdir / (stem + "_smooth_grid_flow.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_tree_dense_flow.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_tree_paths_debug.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_tree_flow_attn.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_flow_attn.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
                       << "\n"
@@ -6053,3 +6279,4 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+#endif

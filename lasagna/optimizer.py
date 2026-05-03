@@ -272,6 +272,7 @@ def optimize(
 	progress_fn=None,
 	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
+	out_dir: str | None = None,
 ) -> fit_data.FitData3D:
 	opt_loss_corr.reset_state()
 
@@ -301,6 +302,13 @@ def optimize(
 		# Configure corr Phase D Gaussian-splat σ (default 1.0; 7×7 vertex neighborhood).
 		corr_splat_sigma = float(opt_cfg.args.get("corr_splat_sigma", 1.0)) if opt_cfg.args else 1.0
 		opt_loss_corr.set_splat_sigma(corr_splat_sigma)
+		pred_dt_flow_gate_cfg = opt_cfg.args.get("pred_dt_flow_gate") if opt_cfg.args else None
+		opt_loss_pred_dt.configure_flow_gate(
+			cfg=pred_dt_flow_gate_cfg if _need_term("pred_dt", opt_cfg.eff) > 0 else None,
+			stage_name=stage.name or label,
+			seed_xyz=seed_xyz,
+			out_dir=out_dir,
+		)
 
 		# If arc/straight params not in optimized set, bake into mesh
 		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
