@@ -248,6 +248,7 @@ private:
                              int fbH);
     struct RenderContext;
     struct RenderResult;
+    struct GeneratedSurfaceCache;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
@@ -296,16 +297,8 @@ private:
     std::uint64_t _renderSerial = 0;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
-    cv::Mat_<cv::Vec3f> _genCoords;
-    cv::Mat_<cv::Vec3f> _genNormals;
+    std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
-    Surface* _genCacheSurfKey = nullptr;
-    int _genCacheFbW = 0;
-    int _genCacheFbH = 0;
-    float _genCacheScale = 0.0f;
-    cv::Vec3f _genCacheOffset{0, 0, 0};
-    float _genCacheZOff = 0.0f;
-    cv::Vec3f _genCacheZOffDir{0, 0, 0};
 
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;

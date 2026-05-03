@@ -338,10 +338,25 @@ std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::sha
 
 } // namespace
 
+struct CChunkedVolumeViewer::GeneratedSurfaceCache {
+    std::mutex mutex;
+    bool valid = false;
+    Surface* surface = nullptr;
+    int fbW = 0;
+    int fbH = 0;
+    float scale = 0.0f;
+    cv::Vec3f offset{0, 0, 0};
+    float zOff = 0.0f;
+    cv::Vec3f zOffWorldDir{0, 0, 0};
+    cv::Mat_<cv::Vec3f> coords;
+    cv::Mat_<cv::Vec3f> normals;
+};
+
 CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent)
     : QWidget(parent)
     , _state(state)
     , _viewerManager(manager)
+    , _genSurfaceCache(std::make_shared<GeneratedSurfaceCache>())
 {
     _view = new CVolumeViewerView(this);
     _view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -513,8 +528,12 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _defaultSurface.reset();
     }
     _genCacheDirty = true;
-    _genCoords.release();
-    _genNormals.release();
+    if (_genSurfaceCache) {
+        std::lock_guard lock(_genSurfaceCache->mutex);
+        _genSurfaceCache->valid = false;
+        _genSurfaceCache->coords.release();
+        _genSurfaceCache->normals.release();
+    }
     _zOffWorldDir = {0, 0, 0};
     _stableFramebufferValid = false;
     if (_cursorCrosshair)
@@ -1354,6 +1373,8 @@ struct CChunkedVolumeViewer::RenderContext {
     float overlayWindowLow = 0.0f;
     float overlayWindowHigh = 255.0f;
     bool interactivePreview = false;
+    std::shared_ptr<GeneratedSurfaceCache> genCache;
+    bool genCacheDirty = false;
 };
 
 struct CChunkedVolumeViewer::RenderResult {
@@ -1575,22 +1596,63 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const cv::Vec3f offset(ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f,
                                ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f,
                                0.0f);
-        ctx.surf->gen(&coords, &normals, cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0}, ctx.scale, offset);
-        cv::Vec3f zOffWorldDir = ctx.zOffWorldDir;
-        if (ctx.zOff != 0.0f && zOffWorldDir == cv::Vec3f(0.0f, 0.0f, 0.0f) && !normals.empty()) {
-            const cv::Vec3f n = normals(normals.rows / 2, normals.cols / 2);
-            const float len = static_cast<float>(cv::norm(n));
-            if (len > 1e-6f)
-                zOffWorldDir = n / len;
+
+        bool genCacheHit = false;
+        if (ctx.genCache) {
+            std::lock_guard lock(ctx.genCache->mutex);
+            if (ctx.genCacheDirty) {
+                ctx.genCache->valid = false;
+                ctx.genCache->coords.release();
+                ctx.genCache->normals.release();
+            }
+            genCacheHit =
+                ctx.genCache->valid &&
+                ctx.genCache->surface == ctx.surf.get() &&
+                ctx.genCache->fbW == ctx.fbW &&
+                ctx.genCache->fbH == ctx.fbH &&
+                ctx.genCache->scale == ctx.scale &&
+                ctx.genCache->offset == offset &&
+                ctx.genCache->zOff == ctx.zOff &&
+                ctx.genCache->zOffWorldDir == ctx.zOffWorldDir &&
+                !ctx.genCache->coords.empty();
+            if (genCacheHit) {
+                coords = ctx.genCache->coords;
+                normals = ctx.genCache->normals;
+            }
         }
-        if (ctx.zOff != 0.0f && zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-            const cv::Vec3f tr = zOffWorldDir * ctx.zOff;
-            for (int y = 0; y < coords.rows; ++y) {
-                auto* row = coords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < coords.cols; ++x) {
-                    if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
-                        row[x] += tr;
+
+        if (!genCacheHit) {
+            ctx.surf->gen(&coords, &normals, cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0}, ctx.scale, offset);
+            cv::Vec3f zOffWorldDir = ctx.zOffWorldDir;
+            if (ctx.zOff != 0.0f && zOffWorldDir == cv::Vec3f(0.0f, 0.0f, 0.0f) && !normals.empty()) {
+                const cv::Vec3f n = normals(normals.rows / 2, normals.cols / 2);
+                const float len = static_cast<float>(cv::norm(n));
+                if (len > 1e-6f)
+                    zOffWorldDir = n / len;
+            }
+            if (ctx.zOff != 0.0f && zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
+                const cv::Vec3f tr = zOffWorldDir * ctx.zOff;
+                for (int y = 0; y < coords.rows; ++y) {
+                    auto* row = coords.ptr<cv::Vec3f>(y);
+                    for (int x = 0; x < coords.cols; ++x) {
+                        if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
+                            row[x] += tr;
+                    }
                 }
+            }
+
+            if (ctx.genCache && !coords.empty()) {
+                std::lock_guard lock(ctx.genCache->mutex);
+                ctx.genCache->valid = true;
+                ctx.genCache->surface = ctx.surf.get();
+                ctx.genCache->fbW = ctx.fbW;
+                ctx.genCache->fbH = ctx.fbH;
+                ctx.genCache->scale = ctx.scale;
+                ctx.genCache->offset = offset;
+                ctx.genCache->zOff = ctx.zOff;
+                ctx.genCache->zOffWorldDir = ctx.zOffWorldDir;
+                ctx.genCache->coords = coords;
+                ctx.genCache->normals = normals;
             }
         }
         if (!coords.empty()) {
@@ -1684,6 +1746,9 @@ void CChunkedVolumeViewer::submitRender()
     ctx.overlayWindowLow = _overlayWindowLow;
     ctx.overlayWindowHigh = _overlayWindowHigh;
     ctx.interactivePreview = _interactivePreview;
+    ctx.genCache = _genSurfaceCache;
+    ctx.genCacheDirty = _genCacheDirty;
+    _genCacheDirty = false;
 
     QPointer<CChunkedVolumeViewer> guard(this);
     (void)QtConcurrent::run([guard, ctx = std::move(ctx)]() mutable {
