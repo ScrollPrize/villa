@@ -521,9 +521,14 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                emit sendMouseDoubleClickVolume(
-                    cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
-                    button, modifiers);
+                const auto cursorPos = cursorVolumePosition(scenePos);
+                cv::Vec3f volumePos;
+                if (cursorPos) {
+                    volumePos = *cursorPos;
+                } else {
+                    volumePos = sceneToVolume(scenePos);
+                }
+                emit sendMouseDoubleClickVolume(volumePos, button, modifiers);
             });
     connect(_view, &CVolumeViewerView::sendKeyPress, this, &CChunkedVolumeViewer::onKeyPress);
     connect(_view, &CVolumeViewerView::sendKeyRelease, this, &CChunkedVolumeViewer::onKeyRelease);
@@ -768,7 +773,11 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
 
     if (!isCurrentSurface) {
         if (isIntersectionTarget) {
-            invalidateIntersect(name);
+            if (!isEditUpdate) {
+                invalidateIntersect(name);
+            } else {
+                _lastIntersectFp = {};
+            }
             scheduleIntersectionRender();
         }
         return;
@@ -944,7 +953,7 @@ void CChunkedVolumeViewer::scheduleRender()
 
 void CChunkedVolumeViewer::scheduleIntersectionRender()
 {
-    if (_intersectionRenderTimer) {
+    if (_intersectionRenderTimer && !_intersectionRenderTimer->isActive()) {
         _intersectionRenderTimer->start();
     }
 }
@@ -2591,6 +2600,13 @@ void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     auto surf = _surfWeak.lock();
+    const auto cursorPos = cursorVolumePosition(scenePos);
+    cv::Vec3f volumePos;
+    if (cursorPos) {
+        volumePos = *cursorPos;
+    } else {
+        volumePos = sceneToVolume(scenePos);
+    }
     cv::Vec3f n(0, 0, 1);
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         n = plane->normal({0, 0, 0});
@@ -2603,8 +2619,7 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
             n = surfaceNormal;
         }
     }
-    emit sendVolumeClicked(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
-                           n, surf.get(), button, modifiers);
+    emit sendVolumeClicked(volumePos, n, surf.get(), button, modifiers);
 }
 
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
@@ -2620,15 +2635,23 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
         emit overlaysUpdated();
         return;
     }
-    emit sendMousePressVolume(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
-                              {0, 0, 1}, button, modifiers, scenePos);
+    cv::Vec3f volumePos;
+    if (_lastCursorVolumePos) {
+        volumePos = *_lastCursorVolumePos;
+    } else {
+        volumePos = sceneToVolume(scenePos);
+    }
+    emit sendMousePressVolume(volumePos, {0, 0, 1}, button, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(modifiers);
+    const bool reusedCursorSample = (_lastScenePos == scenePos && _lastCursorVolumePos.has_value());
+    if (!reusedCursorSample) {
+        _lastCursorVolumePos = cursorVolumePosition(scenePos);
+    }
     _lastScenePos = scenePos;
-    _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
     if (_bboxMode && _activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
@@ -2637,8 +2660,13 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
         emit overlaysUpdated();
         return;
     }
-    emit sendMouseMoveVolume(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
-                             buttons, modifiers, scenePos);
+    cv::Vec3f volumePos;
+    if (_lastCursorVolumePos) {
+        volumePos = *_lastCursorVolumePos;
+    } else {
+        volumePos = sceneToVolume(scenePos);
+    }
+    emit sendMouseMoveVolume(volumePos, buttons, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
@@ -2658,8 +2686,13 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
         emit overlaysUpdated();
         return;
     }
-    emit sendMouseReleaseVolume(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
-                                button, modifiers, scenePos);
+    cv::Vec3f volumePos;
+    if (_lastCursorVolumePos) {
+        volumePos = *_lastCursorVolumePos;
+    } else {
+        volumePos = sceneToVolume(scenePos);
+    }
+    emit sendMouseReleaseVolume(volumePos, button, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)
@@ -3015,8 +3048,16 @@ void CChunkedVolumeViewer::clearSelections()
     emit overlaysUpdated();
 }
 
-void CChunkedVolumeViewer::invalidateIntersect(const std::string&)
+void CChunkedVolumeViewer::invalidateIntersect(const std::string& name)
 {
+    if (_segmentationEditActive && name == "segmentation" &&
+        dynamic_cast<PlaneSurface*>(currentSurface())) {
+        _lastIntersectFp = {};
+        _intersectionGeometryCache = {};
+        scheduleIntersectionRender();
+        return;
+    }
+
     clearIntersectionItems();
     _lastIntersectFp = {};
     _intersectionGeometryCache = {};
@@ -3152,7 +3193,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     fp.surfaceCount = patchIndex->surfaceCount();
     fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
     const uint64_t activeGeneration = patchIndex->generation(activeSeg);
-    fp.targetGenerationHash = std::hash<uint64_t>{}(activeGeneration);
+    fp.targetGenerationHash = 0;
 
     // Flattened intersections are built in surface-view scene coordinates.
     // Pan/zoom can reuse the same paths by transforming the existing items.
@@ -3205,12 +3246,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         _flattenedIntersectionCache.indexSamplingStride == stride;
     const bool displayOnlyRefresh =
         cacheCompatible &&
-        _flattenedIntersectionCache.generation == activeGeneration &&
         !_flattenedIntersectionDirtyCells;
-    const bool needsFullRebuild =
-        !cacheCompatible ||
-        (_flattenedIntersectionCache.generation != activeGeneration &&
-         !_flattenedIntersectionDirtyCells);
+    const bool needsFullRebuild = !cacheCompatible;
     std::unordered_map<std::uint64_t, std::unordered_set<int>> dirtyTilePlanes;
 
     auto removeFlattenedTilePlaneItem = [&](std::uint64_t tileKey, int planeIndex) {
@@ -3632,7 +3669,6 @@ void CChunkedVolumeViewer::renderIntersections()
         return;
     }
 
-    clearIntersectionItems();
     _lastIntersectFp = fp;
 
     auto rectContains = [](const cv::Rect& outer, const cv::Rect& inner) {
@@ -3681,8 +3717,10 @@ void CChunkedVolumeViewer::renderIntersections()
     }
 
     const auto& intersections = _intersectionGeometryCache.intersections;
-    if (intersections.empty())
+    if (intersections.empty()) {
+        clearIntersectionItems();
         return;
+    }
 
     std::unordered_map<IntersectionStyle, QPainterPath, IntersectionStyleHash> groupedPaths;
     std::unordered_map<IntersectionStyle, QColor, IntersectionStyleHash> groupedColors;
@@ -3750,22 +3788,48 @@ void CChunkedVolumeViewer::renderIntersections()
         }
     }
 
-    _intersectionItems.reserve(groupedPaths.size());
+    std::size_t itemIndex = 0;
+    _intersectionItems.reserve(std::max(_intersectionItems.size(), groupedPaths.size()));
     for (const auto& [style, path] : groupedPaths) {
         if (path.isEmpty())
             continue;
-        auto* item = new QGraphicsPathItem(path);
+        QGraphicsPathItem* item = nullptr;
+        if (itemIndex < _intersectionItems.size()) {
+            item = dynamic_cast<QGraphicsPathItem*>(_intersectionItems[itemIndex]);
+        }
+        if (!item) {
+            item = new QGraphicsPathItem();
+            item->setBrush(Qt::NoBrush);
+            item->setAcceptedMouseButtons(Qt::NoButton);
+            _scene->addItem(item);
+            if (itemIndex < _intersectionItems.size()) {
+                if (_intersectionItems[itemIndex] && _intersectionItems[itemIndex]->scene()) {
+                    _scene->removeItem(_intersectionItems[itemIndex]);
+                }
+                delete _intersectionItems[itemIndex];
+                _intersectionItems[itemIndex] = item;
+            } else {
+                _intersectionItems.push_back(item);
+            }
+        }
         QPen pen(groupedColors[style]);
         pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         pen.setCosmetic(true);
+        item->setTransform(QTransform());
+        item->setPath(path);
         item->setPen(pen);
-        item->setBrush(Qt::NoBrush);
         item->setZValue(style.z);
-        item->setAcceptedMouseButtons(Qt::NoButton);
-        _scene->addItem(item);
-        _intersectionItems.push_back(item);
+        ++itemIndex;
+    }
+    while (_intersectionItems.size() > itemIndex) {
+        auto* item = _intersectionItems.back();
+        _intersectionItems.pop_back();
+        if (item && item->scene()) {
+            _scene->removeItem(item);
+        }
+        delete item;
     }
     _intersectionItemsCamSurfX = _camSurfX;
     _intersectionItemsCamSurfY = _camSurfY;

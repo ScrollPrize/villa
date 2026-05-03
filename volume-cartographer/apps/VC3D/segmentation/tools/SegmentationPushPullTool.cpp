@@ -932,12 +932,18 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         return;
     }
 
-    if (viewer->surfName() != "segmentation") {
-        if (auto* manager = _module.viewerManager()) {
-            if (auto* index = manager->surfacePatchIndex()) {
-                index->flushPendingUpdates(surface);
-            }
+    if (auto* manager = _module.viewerManager()) {
+        if (auto* index = manager->surfacePatchIndex()) {
+            index->flushPendingUpdates(surface);
         }
+        manager->forEachBaseViewer([viewer](VolumeViewerBase* candidate) {
+            if (!candidate || candidate == viewer) {
+                return;
+            }
+            if (dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
+                candidate->invalidateIntersect("segmentation");
+            }
+        });
     }
 
     if (const auto touched = _editManager->recentTouchedBounds()) {

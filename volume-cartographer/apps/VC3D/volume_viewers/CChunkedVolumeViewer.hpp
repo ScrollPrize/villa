@@ -99,7 +99,7 @@ public:
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
 
-    void setSegmentationEditActive(bool) override {}
+    void setSegmentationEditActive(bool active) override { _segmentationEditActive = active; }
     void setSegmentationCursorMirroring(bool) override {}
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
@@ -284,6 +284,7 @@ private:
     QTimer* _statusTimer = nullptr;
     bool _renderPending = false;
     bool _interactivePreview = false;
+    bool _segmentationEditActive = false;
     QElapsedTimer _interactionClock;
     qint64 _lastInteractionMs = -1;
     qint64 _lastInteractivePreviewMs = -1;
