@@ -3081,8 +3081,6 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                           << "\n";
             }
         };
-        print_carrier_debug(cv::Point(400, 150));
-
         const auto grid_node_id = [&](const int gx, const int gy) {
             if (gx < 0 || gx >= grid_cols || gy < 0 || gy >= grid_rows) {
                 return -1;
@@ -3099,8 +3097,76 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         };
 
         {
+            const std::array<cv::Point, 2> kDebugGridPoints = {
+                cv::Point(236, 180), cv::Point(240, 184)};
+            const std::array<cv::Scalar, 2> kDebugColors = {
+                cv::Scalar(255.0, 0.0, 0.0),
+                cv::Scalar(0.0, 255.0, 0.0)};
+            for (int query_id = 0;
+                 query_id < static_cast<int>(kDebugGridPoints.size());
+                 ++query_id) {
+                const cv::Point query = kDebugGridPoints[query_id];
+                std::cout << "Grid carrier route debug point=(" << query.x
+                          << "," << query.y << ")\n";
+                const auto gx_it =
+                    std::find(grid_xs.begin(), grid_xs.end(), query.x);
+                const auto gy_it =
+                    std::find(grid_ys.begin(), grid_ys.end(), query.y);
+                if (gx_it == grid_xs.end() || gy_it == grid_ys.end()) {
+                    std::cout << "  skipped: not an exact grid point\n";
+                    continue;
+                }
+                const int gx =
+                    static_cast<int>(std::distance(grid_xs.begin(), gx_it));
+                const int gy =
+                    static_cast<int>(std::distance(grid_ys.begin(), gy_it));
+                int current = grid_node_id(gx, gy);
+                if (current < 0) {
+                    std::cout << "  skipped: no grid carrier\n";
+                    continue;
+                }
+                int bucket = route_final_bucket;
+                int steps = 0;
+                std::cout << "  node=" << current
+                          << " base_flow=" << carriers[current].flow
+                          << " smooth_flow=" << carrier_value[current]
+                          << " route_flow="
+                          << route_flow(current, route_final_bucket)
+                          << " route_dist="
+                          << route_distance(current, route_final_bucket)
+                          << " route_next="
+                          << route_next(current, route_final_bucket) << "\n";
+                while (current >= 0 && bucket > 0 &&
+                       steps < static_cast<int>(carriers.size())) {
+                    const int next = route_next(current, bucket);
+                    if (next < 0) {
+                        break;
+                    }
+                    float edge_distance = 0.0f;
+                    for (const CarrierNeighbor neighbor :
+                         carrier_edges[current]) {
+                        if (neighbor.node == next) {
+                            edge_distance = neighbor.distance;
+                            break;
+                        }
+                    }
+                    cv::line(result.debug_paths, carriers[current].pixel,
+                             carriers[next].pixel, kDebugColors[query_id], 1,
+                             cv::LINE_8);
+                    const int bucket_delta = std::max(
+                        1, static_cast<int>(
+                               std::ceil(edge_distance /
+                                         kCarrierRouteBucketPx)));
+                    current = next;
+                    bucket = std::max(0, bucket - bucket_delta);
+                    ++steps;
+                }
+            }
+        }
+
+        if constexpr (false) {
             const std::array<cv::Point, 2> kDebugQueries = {
-                cv::Point(1000, 800), cv::Point(1000, 850)};
+                cv::Point(242, 186), cv::Point(241, 185)};
             const std::array<std::array<cv::Scalar, 4>, 2> kDebugColors = {{
                 {cv::Scalar(255.0, 0.0, 0.0),
                  cv::Scalar(0.0, 255.0, 0.0),
@@ -3152,8 +3218,6 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 double weight_sum = 0.0;
                 double smooth_weighted_sum = 0.0;
                 double smooth_weight_sum = 0.0;
-                cv::circle(result.debug_paths, query, 5,
-                           cv::Scalar(255.0, 255.0, 255.0), 1, cv::LINE_8);
                 for (int i = 0; i < static_cast<int>(corners.size()); ++i) {
                     const auto [gx, gy, bilinear_weight] = corners[i];
                     const int node = grid_node_id(gx, gy);
@@ -3176,8 +3240,6 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                     const cv::Point corner_pixel = carriers[node].pixel;
                     cv::line(result.debug_paths, query, corner_pixel, dark, 1,
                              cv::LINE_8);
-                    cv::circle(result.debug_paths, corner_pixel, 4, bright, 1,
-                               cv::LINE_8);
                     int current = node;
                     int bucket = route_final_bucket;
                     int steps = 0;
@@ -3196,7 +3258,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                             }
                         }
                         cv::line(result.debug_paths, carriers[current].pixel,
-                                 carriers[next].pixel, bright, 2,
+                                 carriers[next].pixel, bright, 1,
                                  cv::LINE_8);
                         const int bucket_delta = std::max(
                             1, static_cast<int>(
@@ -3205,10 +3267,6 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                         current = next;
                         bucket = std::max(0, bucket - bucket_delta);
                         ++steps;
-                    }
-                    if (current >= 0) {
-                        cv::circle(result.debug_paths, carriers[current].pixel, 7, bright,
-                                   2, cv::LINE_8);
                     }
                     std::cout << "  corner_" << i << " node=" << node
                               << " pixel=(" << corner_pixel.x << ","
