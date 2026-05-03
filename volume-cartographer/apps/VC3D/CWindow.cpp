@@ -14,6 +14,7 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
 #include <QDesktopServices>
