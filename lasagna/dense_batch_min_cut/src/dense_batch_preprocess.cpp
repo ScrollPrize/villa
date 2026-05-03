@@ -2081,6 +2081,7 @@ struct DenseFlowResult {
     cv::Mat smooth_grid_flow;
     cv::Mat tree_dense_flow;
     cv::Mat tree_path_debug;
+    cv::Mat carrier_debug;
     cv::Mat tree_flow_attn;
     cv::Mat flow_attn;
     cv::Mat graph_edge_flow;
@@ -2294,6 +2295,7 @@ struct DenseBacktrackResult {
     cv::Mat smooth_grid_flow;
     cv::Mat flow;
     cv::Mat debug_paths;
+    cv::Mat carrier_debug;
     int seeded_pixels = 0;
     int reached_pixels = 0;
     int unreached_white_pixels = 0;
@@ -2594,7 +2596,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
 
         struct CarrierNode {
             cv::Point pixel;
-            float flow = 0.0f;
+            float capacity = 0.0f;
+            float source_flow = 0.0f;
             bool grid = false;
             bool fixed = false;
         };
@@ -2638,26 +2641,53 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         carriers.reserve(static_cast<std::size_t>(grid_cols * grid_rows + 4096));
 
         const auto add_carrier = [&](const cv::Point pixel,
-                                     const float flow,
+                                     const float capacity,
+                                     const float source_flow,
                                      const bool grid,
                                      const bool fixed) {
-            if (!in_white_domain(pixel) || flow <= 0.0f) {
+            if (!in_white_domain(pixel) || capacity <= 0.0f) {
                 return -1;
             }
             const int id = static_cast<int>(carriers.size());
-            carriers.push_back({pixel, flow, grid, fixed});
+            carriers.push_back({pixel, capacity, source_flow, grid, fixed});
             return id;
+        };
+
+        const auto graph_seed_near_grid_point = [&](const cv::Point pixel) {
+            float seed = 0.0f;
+            const int radius = std::max(1, kGridStep);
+            const float radius_sq = static_cast<float>(radius * radius);
+            for (int dy = -radius; dy <= radius; ++dy) {
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    if (dx * dx + dy * dy > radius_sq) {
+                        continue;
+                    }
+                    const cv::Point candidate(pixel.x + dx, pixel.y + dy);
+                    if (!in_white_domain(candidate)) {
+                        continue;
+                    }
+                    const float value = routed_flow[linear_index(candidate)];
+                    if (value <= seed) {
+                        continue;
+                    }
+                    if (!line_in_white(pixel, candidate)) {
+                        continue;
+                    }
+                    seed = value;
+                }
+            }
+            return seed;
         };
 
         for (int gy = 0; gy < grid_rows; ++gy) {
             for (int gx = 0; gx < grid_cols; ++gx) {
                 const cv::Point pixel(grid_xs[gx], grid_ys[gy]);
-                const int index = linear_index(pixel);
                 const float grid_capacity =
-                    kEnablePixelDenseBacktrackFlood
-                        ? routed_flow[index]
-                        : capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
-                const int id = add_carrier(pixel, grid_capacity, true, false);
+                    capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
+                const float source_flow = std::min(
+                    graph_seed_near_grid_point(pixel), grid_capacity);
+                const int id = add_carrier(pixel, grid_capacity, source_flow,
+                                           true, source_flow > 0.0f);
                 grid_node_ids[static_cast<std::size_t>(gy * grid_cols + gx)] =
                     id;
             }
@@ -2666,90 +2696,6 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         int graph_carriers = 0;
         int graph_node_carriers = 0;
         int graph_edge_carriers = 0;
-        std::vector<int> graph_node_carrier_ids(graph.nodes.size(), -1);
-        const auto graph_node_carrier_flow = [&](const cv::Point anchor) {
-            float flow = 0.0f;
-            for (int dy = -2; dy <= 2; ++dy) {
-                for (int dx = -2; dx <= 2; ++dx) {
-                    const int x = anchor.x + dx;
-                    const int y = anchor.y + dy;
-                    if (x < 0 || x >= cols || y < 0 || y >= rows) {
-                        continue;
-                    }
-                    flow = std::max(flow, graph_node_flow.at<float>(y, x));
-                }
-            }
-            return flow;
-        };
-        for (int node = 1; node < static_cast<int>(graph.nodes.size());
-             ++node) {
-            const cv::Point pixel(cvRound(graph.nodes[node].x),
-                                  cvRound(graph.nodes[node].y));
-            const float flow = graph_node_carrier_flow(pixel);
-            if (flow <= 0.0f) {
-                continue;
-            }
-            const int id = add_carrier(pixel, flow, false, true);
-            if (id >= 0) {
-                graph_node_carrier_ids[static_cast<std::size_t>(node)] = id;
-                ++graph_carriers;
-                ++graph_node_carriers;
-            }
-        }
-
-        constexpr float kGraphEdgeCarrierStep = 25.0f;
-        const auto graph_edge_sample_flow = [&](const cv::Point anchor) {
-            float flow = 0.0f;
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const int x = anchor.x + dx;
-                    const int y = anchor.y + dy;
-                    if (x < 0 || x >= cols || y < 0 || y >= rows) {
-                        continue;
-                    }
-                    flow = std::max(flow, graph_pixel_flow.at<float>(y, x));
-                }
-            }
-            return flow;
-        };
-        std::vector<std::vector<int>> graph_edge_sample_carriers(
-            graph.edges.size());
-        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
-             ++edge_index) {
-            const GraphEdge& edge = graph.edges[edge_index];
-            const std::vector<cv::Point> ordered =
-                order_edge_pixels(edge, graph);
-            if (ordered.empty()) {
-                continue;
-            }
-            std::vector<int>& edge_carriers =
-                graph_edge_sample_carriers[static_cast<std::size_t>(edge_index)];
-            float distance_since_sample = kGraphEdgeCarrierStep;
-            cv::Point previous = ordered.front();
-            for (int i = 0; i < static_cast<int>(ordered.size()); ++i) {
-                const cv::Point pixel = ordered[i];
-                if (i > 0) {
-                    distance_since_sample += step_distance(previous, pixel);
-                }
-                previous = pixel;
-                if (distance_since_sample + kFlowEpsilon <
-                    kGraphEdgeCarrierStep) {
-                    continue;
-                }
-                const float flow = graph_edge_sample_flow(pixel);
-                if (flow <= 0.0f) {
-                    continue;
-                }
-                const int id = add_carrier(pixel, flow, false, true);
-                if (id < 0) {
-                    continue;
-                }
-                edge_carriers.push_back(id);
-                distance_since_sample = 0.0f;
-                ++graph_carriers;
-                ++graph_edge_carriers;
-            }
-        }
 
         std::vector<std::vector<CarrierNeighbor>> carrier_edges(
             carriers.size());
@@ -2782,34 +2728,6 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 carrier_edges[b].push_back({a, distance});
             }
         };
-
-        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
-             ++edge_index) {
-            const GraphEdge& edge = graph.edges[edge_index];
-            std::vector<int> edge_carriers;
-            if (edge.a > 0 &&
-                edge.a < static_cast<int>(graph_node_carrier_ids.size()) &&
-                graph_node_carrier_ids[static_cast<std::size_t>(edge.a)] >= 0) {
-                edge_carriers.push_back(
-                    graph_node_carrier_ids[static_cast<std::size_t>(edge.a)]);
-            }
-            const std::vector<int>& samples =
-                graph_edge_sample_carriers[static_cast<std::size_t>(edge_index)];
-            edge_carriers.insert(edge_carriers.end(), samples.begin(),
-                                 samples.end());
-            if (edge.b > 0 &&
-                edge.b < static_cast<int>(graph_node_carrier_ids.size()) &&
-                graph_node_carrier_ids[static_cast<std::size_t>(edge.b)] >= 0 &&
-                (edge_carriers.empty() ||
-                 graph_node_carrier_ids[static_cast<std::size_t>(edge.b)] !=
-                     edge_carriers.back())) {
-                edge_carriers.push_back(
-                    graph_node_carrier_ids[static_cast<std::size_t>(edge.b)]);
-            }
-            for (int i = 1; i < static_cast<int>(edge_carriers.size()); ++i) {
-                add_carrier_edge(edge_carriers[i - 1], edge_carriers[i]);
-            }
-        }
 
         for (int gy = 0; gy < grid_rows; ++gy) {
             for (int gx = 0; gx < grid_cols; ++gx) {
@@ -2886,7 +2804,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             if (!carriers[node].fixed) {
                 continue;
             }
-            carrier_value[node] = carriers[node].flow;
+            carrier_value[node] = carriers[node].source_flow;
             carrier_flow_queue.push({carrier_value[node], node});
             ++carrier_flow_seeds;
         }
@@ -2898,7 +2816,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             }
             for (const CarrierNeighbor neighbor : carrier_edges[item.node]) {
                 const float candidate =
-                    std::min(item.flow, carriers[neighbor.node].flow);
+                    std::min(item.flow, carriers[neighbor.node].capacity);
                 if (candidate <=
                     carrier_value[neighbor.node] + kFlowEpsilon) {
                     continue;
@@ -3041,7 +2959,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                       << carrier.pixel.y << ")"
                       << " distance=" << best_distance
                       << " is_grid=" << carrier.grid
-                      << " flow=" << carrier.flow
+                      << " capacity=" << carrier.capacity
+                      << " source_flow=" << carrier.source_flow
                       << " smooth_flow=" << carrier_value[best_node]
                       << " route300="
                       << route_flow(best_node, route_final_bucket)
@@ -3054,7 +2973,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             std::vector<CarrierNeighbor> neighbors = carrier_edges[best_node];
             std::sort(neighbors.begin(), neighbors.end(),
                       [&](const CarrierNeighbor a, const CarrierNeighbor b) {
-                          return carriers[a.node].flow > carriers[b.node].flow;
+                          return carriers[a.node].capacity >
+                                 carriers[b.node].capacity;
                       });
             const int limit =
                 std::min(12, static_cast<int>(neighbors.size()));
@@ -3067,7 +2987,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                           << next.pixel.y << ")"
                           << " is_grid=" << next.grid
                           << " dist=" << neighbor.distance
-                          << " flow=" << next.flow
+                          << " capacity=" << next.capacity
+                          << " source_flow=" << next.source_flow
                           << " smooth_flow="
                           << carrier_value[neighbor.node]
                           << " route300="
@@ -3077,7 +2998,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                           << " route_next="
                           << route_next(neighbor.node, route_final_bucket)
                           << " uphill="
-                          << (next.flow > carrier.flow + kFlowEpsilon)
+                          << (next.capacity > carrier.capacity + kFlowEpsilon)
                           << "\n";
             }
         };
@@ -3128,7 +3049,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 int bucket = route_final_bucket;
                 int steps = 0;
                 std::cout << "  node=" << current
-                          << " base_flow=" << carriers[current].flow
+                          << " capacity=" << carriers[current].capacity
+                          << " source_flow=" << carriers[current].source_flow
                           << " smooth_flow=" << carrier_value[current]
                           << " route_flow="
                           << route_flow(current, route_final_bucket)
@@ -3272,7 +3194,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                               << " pixel=(" << corner_pixel.x << ","
                               << corner_pixel.y << ")"
                               << " weight=" << bilinear_weight
-                              << " base_flow=" << carriers[node].flow
+                              << " capacity=" << carriers[node].capacity
+                              << " source_flow=" << carriers[node].source_flow
                               << " smooth_flow=" << carrier_value[node]
                               << " route300="
                               << route_flow(node, route_final_bucket)
@@ -3358,6 +3281,76 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 }
             }
         });
+
+        {
+            const TimingMark carrier_debug_timing = start_timing();
+            result.carrier_debug =
+                cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0.0f));
+            for (int y = 0; y < rows; ++y) {
+                float* out_row = result.carrier_debug.ptr<float>(y);
+                for (int x = 0; x < cols; ++x) {
+                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                        continue;
+                    }
+                    const cv::Point pixel(x, y);
+                    const int gx0 = lower_axis_index(grid_xs, x);
+                    const int gy0 = lower_axis_index(grid_ys, y);
+                    const int gx1 = std::min(gx0 + 1, grid_cols - 1);
+                    const int gy1 = std::min(gy0 + 1, grid_rows - 1);
+                    const float x0 = static_cast<float>(grid_xs[gx0]);
+                    const float x1 = static_cast<float>(grid_xs[gx1]);
+                    const float y0 = static_cast<float>(grid_ys[gy0]);
+                    const float y1 = static_cast<float>(grid_ys[gy1]);
+                    const float tx =
+                        x1 > x0 ? (static_cast<float>(x) - x0) / (x1 - x0)
+                                : 0.0f;
+                    const float ty =
+                        y1 > y0 ? (static_cast<float>(y) - y0) / (y1 - y0)
+                                : 0.0f;
+                    const std::array<std::tuple<int, int, double>, 4>
+                        corners = {
+                            std::make_tuple(gx0, gy0,
+                                            (1.0 - tx) * (1.0 - ty)),
+                            std::make_tuple(gx1, gy0, tx * (1.0 - ty)),
+                            std::make_tuple(gx0, gy1, (1.0 - tx) * ty),
+                            std::make_tuple(gx1, gy1, tx * ty)};
+                    double weighted_sum = 0.0;
+                    double weight_sum = 0.0;
+                    for (const auto [gx, gy, bilinear_weight] : corners) {
+                        if (bilinear_weight <= 0.0) {
+                            continue;
+                        }
+                        const int node = grid_node_id(gx, gy);
+                        if (node < 0) {
+                            continue;
+                        }
+                        if (!line_in_white(pixel, carriers[node].pixel)) {
+                            continue;
+                        }
+                        weighted_sum += carrier_value[node] * bilinear_weight;
+                        weight_sum += bilinear_weight;
+                    }
+                    out_row[x] = weight_sum > 0.0
+                                     ? static_cast<float>(weighted_sum /
+                                                          weight_sum)
+                                     : routed_flow[linear_index(pixel)];
+                }
+            }
+            for (int id = 0; id < static_cast<int>(carriers.size()); ++id) {
+                const CarrierNode& carrier = carriers[id];
+                if (carrier.grid) {
+                    continue;
+                }
+                const float value = carrier_value[id];
+                if (value <= 0.0f) {
+                    continue;
+                }
+                cv::circle(result.carrier_debug, carrier.pixel, 2,
+                           cv::Scalar(value), cv::FILLED, cv::LINE_8);
+            }
+            result.timings.push_back(
+                finish_timing("carrier_debug_render", carrier_debug_timing));
+        }
 
         int carrier_edges_count = 0;
         for (const std::vector<CarrierNeighbor>& edges : carrier_edges) {
@@ -4568,6 +4561,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_path_debug(white_domain.size(), CV_32FC3,
                             cv::Scalar(0, 0, 0));
+    cv::Mat carrier_debug(white_domain.size(), CV_32FC3,
+                          cv::Scalar(0, 0, 0));
     if (kEnableLegacyVoronoiTreeDensification) {
         const TimingMark timing = start_timing();
         cv::Mat tree_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
@@ -4987,6 +4982,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         tree_dense_flow =
             bilinear_from_regular_grid_samples(dense_backtrack.flow, grid_step);
         tree_path_debug = dense_backtrack.debug_paths;
+        carrier_debug = dense_backtrack.carrier_debug;
         timings.insert(timings.end(), dense_backtrack.timings.begin(),
                        dense_backtrack.timings.end());
         std::cout << "Dense backtrack:\n"
@@ -5338,6 +5334,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             smooth_grid_flow,
             tree_dense_flow,
             tree_path_debug,
+            carrier_debug,
             tree_flow_attn,
             flow_attn,
             graph_edge_flow,
@@ -6324,6 +6321,8 @@ int main(int argc, char** argv) {
                         dense_flow_result.tree_dense_flow);
             write_image(workdir / (stem + "_tree_paths_debug.tif"),
                         dense_flow_result.tree_path_debug);
+            write_image(workdir / (stem + "_carrier_debug.tif"),
+                        dense_flow_result.carrier_debug);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
                         dense_flow_result.graph_edge_flow);
             write_image(workdir / (stem + "_graph_edge_flow_gray_bg.tif"),
@@ -6384,6 +6383,9 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"tree_dense_flow",
                  to_float_layer(dense_flow_result.tree_dense_flow)});
+            layered_tiff.push_back(
+                {"carrier_debug",
+                 to_float_layer(dense_flow_result.carrier_debug)});
             layered_tiff.push_back(
                 {"graph_edge_flow",
                  to_float_layer(dense_flow_result.graph_edge_flow)});
