@@ -475,9 +475,16 @@ def optimize(
 			with torch.no_grad():
 				_xyz_lr_pf = model._grid_xyz()
 				_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
+				_pred_dt_extra_pf = opt_loss_pred_dt.flow_gate_prefetch_points(
+					data=data,
+					xyz_hr=_xyz_hr_pf,
+					cfg=pred_dt_flow_gate_cfg,
+				)
 			for _cache in _active_caches:
 				_sp = data._spacing_for(_cache.channels[0])
 				_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+				if _pred_dt_extra_pf is not None and "pred_dt" in _cache.channels:
+					_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
 			# Also prefetch chunks for corr points (static positions, loaded once)
 			if data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0:
 				_corr_xyz = data.corr_points.points_xyz_winda[:, :3].to(
@@ -557,9 +564,16 @@ def optimize(
 				with torch.no_grad():
 					_xyz_lr_pf = model._grid_xyz()
 					_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
+					_pred_dt_extra_pf = opt_loss_pred_dt.flow_gate_prefetch_points(
+						data=data,
+						xyz_hr=_xyz_hr_pf,
+						cfg=pred_dt_flow_gate_cfg,
+					)
 				for _cache in _active_caches:
 					_sp = data._spacing_for(_cache.channels[0])
 					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+					if _pred_dt_extra_pf is not None and "pred_dt" in _cache.channels:
+						_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
 				for _cache in _active_caches:
 					_cache.end_iteration()
 			_t_steps_acc += 1
