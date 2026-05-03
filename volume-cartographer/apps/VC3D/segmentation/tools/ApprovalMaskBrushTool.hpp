@@ -42,7 +42,7 @@ public:
     [[nodiscard]] bool strokeActive() const { return _strokeActive; }
     [[nodiscard]] bool hasPendingStrokes() const { return !_pendingStrokes.empty(); }
 
-    // surfacePos is in surface parameter coordinates (from TileScene::sceneToSurface).
+    // surfacePos is in surface parameter coordinates.
     // Grid position is computed as: (surfacePos + surface_center) * surface_scale
     void startStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos);
     void extendStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos, bool forceSample);

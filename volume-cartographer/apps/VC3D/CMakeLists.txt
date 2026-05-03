@@ -7,10 +7,6 @@ set(srcs
     VCAppMain.cpp
     CState.cpp
     CState.hpp
-    SurfaceLRU.cpp
-    SurfaceLRU.hpp
-    RamStats.cpp
-    RamStats.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
@@ -19,11 +15,13 @@ set(srcs
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
+    SurfaceAffineTransformController.cpp
+    SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
-    CVolumeViewerView.cpp
+    volume_viewers/CVolumeViewerView.cpp
     VolumeViewerCmaps.cpp
     VolumeViewerCmaps.hpp
     WindowRangeWidget.cpp
@@ -34,17 +32,19 @@ set(srcs
     elements/DropdownChecklistButton.hpp
     elements/JsonProfileEditor.cpp
     elements/JsonProfileEditor.hpp
+    elements/LabeledControlRow.cpp
+    elements/LabeledControlRow.hpp
     elements/VolumeSelector.cpp
     elements/VolumeSelector.hpp
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
+    elements/ViewerStatsBar.cpp
+    elements/ViewerStatsBar.hpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SeedingWidget.cpp
     SeedingWidget.hpp
-    DrawingWidget.cpp
-    DrawingWidget.hpp
     segmentation/SegmentationCommon.hpp
     segmentation/SegmentationWidget.cpp
     segmentation/SegmentationWidget.hpp
@@ -60,8 +60,6 @@ set(srcs
     segmentation/panels/SegmentationCustomParamsPanel.hpp
     segmentation/panels/SegmentationApprovalMaskPanel.cpp
     segmentation/panels/SegmentationApprovalMaskPanel.hpp
-    segmentation/panels/SegmentationCellReoptPanel.cpp
-    segmentation/panels/SegmentationCellReoptPanel.hpp
     segmentation/panels/SegmentationNeuralTracerPanel.cpp
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
     segmentation/panels/SegmentationDirectionFieldPanel.cpp
@@ -69,8 +67,6 @@ set(srcs
     segmentation/panels/SegmentationManualAddPanel.cpp
     segmentation/panels/SegmentationManualAddPanel.hpp
     segmentation/growth/SegmentationGrowth.cpp
-    segmentation/growth/ExtrapolationGrowth.cpp
-    segmentation/growth/ExtrapolationGrowth.hpp
     segmentation/growth/SegmentationGrower.cpp
     segmentation/growth/SegmentationGrower.hpp
     segmentation/tools/SegmentationEditManager.cpp
@@ -79,8 +75,6 @@ set(srcs
     segmentation/tools/ApprovalMaskBrushTool.hpp
     segmentation/tools/SurfaceMaskBrushTool.cpp
     segmentation/tools/SurfaceMaskBrushTool.hpp
-    segmentation/tools/CellReoptimizationTool.cpp
-    segmentation/tools/CellReoptimizationTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
@@ -109,6 +103,8 @@ set(srcs
     overlays/VectorOverlayController.hpp
     overlays/PlaneSlicingOverlayController.cpp
     overlays/PlaneSlicingOverlayController.hpp
+    overlays/SurfaceRotationOverlayController.cpp
+    overlays/SurfaceRotationOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -132,6 +128,22 @@ set(srcs
     segmentation/panels/SegmentationLasagnaPanel.hpp
     ViewerManager.cpp
     ViewerManager.hpp
+    viewer_controls/ViewerControlsPanel.cpp
+    viewer_controls/ViewerControlsPanel.hpp
+    viewer_controls/panels/ViewerCompositePanel.cpp
+    viewer_controls/panels/ViewerCompositePanel.hpp
+    viewer_controls/panels/ViewerNavigationPanel.cpp
+    viewer_controls/panels/ViewerNavigationPanel.hpp
+    viewer_controls/panels/ViewerNormalVisualizationPanel.cpp
+    viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
+    viewer_controls/panels/ViewerPostprocessingPanel.cpp
+    viewer_controls/panels/ViewerPostprocessingPanel.hpp
+    viewer_controls/panels/ViewerPreprocessingPanel.cpp
+    viewer_controls/panels/ViewerPreprocessingPanel.hpp
+    viewer_controls/panels/ViewerTransformsPanel.cpp
+    viewer_controls/panels/ViewerTransformsPanel.hpp
+    viewer_controls/panels/ViewerViewExtrasPanel.cpp
+    viewer_controls/panels/ViewerViewExtrasPanel.hpp
     SegmentRenderThread.cpp
     SegmentRenderThread.hpp
     elements/ProgressUtil.cpp
@@ -149,8 +161,8 @@ set(srcs
     FiberAnnotationController.hpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
-    adaptive/CAdaptiveVolumeViewer.cpp
-    adaptive/CAdaptiveVolumeViewer.hpp
+    volume_viewers/CChunkedVolumeViewer.cpp
+    volume_viewers/CChunkedVolumeViewer.hpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -163,6 +175,7 @@ add_executable(VC3D ${srcs} resources.qrc)
 target_include_directories(VC3D
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/src
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d

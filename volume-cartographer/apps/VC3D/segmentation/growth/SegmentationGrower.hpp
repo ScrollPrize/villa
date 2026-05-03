@@ -31,10 +31,6 @@ class SurfacePanelController;
 class VolumePkg;
 class Volume;
 class QuadSurface;
-class CAdaptiveVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
 
 class SegmentationGrower : public QObject
 {

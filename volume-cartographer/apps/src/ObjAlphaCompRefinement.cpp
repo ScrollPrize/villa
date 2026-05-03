@@ -11,7 +11,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
 
@@ -131,7 +131,7 @@ bool istype(const std::string &line, const std::string &type)
 
 
 struct DSReader {
-    vc::cache::BlockPipeline* cache;
+    vc::render::IChunkedArray* cache;
     float scale;
     int level;
     std::mutex read_mutex;
@@ -403,7 +403,9 @@ int main(int argc, char *argv[])
     std::cout << "zarr dataset size for scale group " << cfg.dataset_group << " " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
     std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
-    auto chunk_cache = vc::cache::openFilesystemPipeline(ds.get(), cfg.cache_bytes, ds->path());
+    auto chunk_cache = vc::render::createChunkCache(
+        vc::render::openLocalZarrPyramid(ds->path()),
+        cfg.cache_bytes);
 
     DSReader reader = {chunk_cache.get(), cfg.reader_scale, 0};
 

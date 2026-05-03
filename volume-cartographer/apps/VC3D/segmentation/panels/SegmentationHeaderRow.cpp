@@ -13,7 +13,7 @@ SegmentationHeaderRow::SegmentationHeaderRow(QWidget* parent)
     layout->setContentsMargins(0, 0, 0, 0);
 
     _chkAnnotate = new QCheckBox(tr("Annotate"), this);
-    _chkAnnotate->setChecked(true);
+    _chkAnnotate->setChecked(false);
     _chkAnnotate->setToolTip(tr("Toggle annotation mode for placing correction points on surfaces."));
 
     auto* checkLayout = new QVBoxLayout();

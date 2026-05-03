@@ -2,7 +2,6 @@
 
 #include "../SegmentationModule.hpp"
 #include "../../ViewerManager.hpp"
-#include "../../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../SegmentationWidget.hpp"
 #include "../../overlays/SegmentationOverlayController.hpp"
@@ -692,10 +691,7 @@ bool SegmentationPushPullTool::applyStepInternal()
     // Final cleanup happens in stopAll()
     _editManager->refreshActiveDragBasePositions();
 
-    // Trigger visual refresh
-    if (_state) {
-        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
-    }
+    refreshActiveViewer(hover.viewer);
 
     _module.refreshOverlay();
     _module.markAutosaveNeeded();
@@ -728,6 +724,14 @@ void SegmentationPushPullTool::launchAlphaCompute()
 
     // Capture all inputs needed by the background thread on the main thread
     std::shared_ptr<Volume> volume = hover.viewer->currentVolume();
+    if (_state && _state->vpkg()) {
+        const std::string selectedVolumeId = _state->segmentationGrowthVolumeId().empty()
+            ? _state->currentVolumeId()
+            : _state->segmentationGrowthVolumeId();
+        if (!selectedVolumeId.empty() && _state->vpkg()->hasVolume(selectedVolumeId)) {
+            volume = _state->vpkg()->volume(selectedVolumeId);
+        }
+    }
     if (!volume) {
         return;
     }
@@ -914,6 +918,41 @@ void SegmentationPushPullTool::launchAlphaCompute()
     _alphaWatcher.setFuture(future);
 }
 
+void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
+{
+    if (!_editManager || !viewer) {
+        if (_state && _editManager) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
+        return;
+    }
+
+    auto surface = _editManager->previewSurface();
+    if (!surface) {
+        return;
+    }
+
+    if (auto* manager = _module.viewerManager()) {
+        if (auto* index = manager->surfacePatchIndex()) {
+            index->flushPendingUpdates(surface);
+        }
+    }
+
+    if (const auto touched = _editManager->recentTouchedBounds()) {
+        const cv::Rect changedCells(touched->x - 1,
+                                    touched->y - 1,
+                                    touched->width + 1,
+                                    touched->height + 1);
+        viewer->invalidateVisRegion("segmentation", changedCells);
+        viewer->invalidateIntersectRegion("segmentation", changedCells);
+    } else {
+        viewer->invalidateVis();
+        viewer->invalidateIntersect("segmentation");
+    }
+    viewer->renderIntersections();
+    viewer->requestRender();
+}
+
 void SegmentationPushPullTool::applyAlphaResult()
 {
     _alphaComputeRunning = false;
@@ -944,10 +983,8 @@ void SegmentationPushPullTool::applyAlphaResult()
         // Update sample base positions for next tick
         _editManager->refreshActiveDragBasePositions();
 
-        // Trigger visual refresh on the main thread
-        if (_state) {
-            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
-        }
+        const auto hover = _module.hoverInfo();
+        refreshActiveViewer(hover.valid ? hover.viewer : nullptr);
 
         _module.refreshOverlay();
         _module.markAutosaveNeeded();

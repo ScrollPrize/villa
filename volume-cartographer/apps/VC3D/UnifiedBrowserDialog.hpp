@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <functional>
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 
 class QButtonGroup;
 class QLabel;
@@ -31,7 +31,7 @@ public:
     void setStartUri(const QString& uri);
 
     using AuthResolver = std::function<bool(const QString& url,
-                                             vc::cache::HttpAuth* out,
+                                             vc::HttpAuth* out,
                                              QString* err)>;
     void setAuthResolver(AuthResolver r) { _authResolver = std::move(r); }
 
@@ -63,7 +63,7 @@ private:
     QString _currentLocalDir;
     QString _currentRemoteUrl;
 
-    vc::cache::HttpAuth _auth;
+    vc::HttpAuth _auth;
     bool _authResolved = false;
     QString _authProbeUrl;
     AuthResolver _authResolver;

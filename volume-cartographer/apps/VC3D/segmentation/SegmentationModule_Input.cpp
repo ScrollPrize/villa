@@ -1,10 +1,8 @@
 #include "SegmentationModule.hpp"
 
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "tools/SegmentationBrushTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
-#include "tools/CellReoptimizationTool.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/SegmentationLineTool.hpp"
@@ -364,7 +362,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
     return false;
 }
 
-void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
                                           const cv::Vec3f& worldPos,
                                           const cv::Vec3f& /*surfaceNormal*/,
                                           Qt::MouseButton button,
@@ -459,32 +457,6 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
         return;
     }
 
-    // Handle cell reoptimization mode
-    if (_cellReoptMode && isLeftButton) {
-        if (modifiers.testFlag(Qt::ControlModifier) || modifiers.testFlag(Qt::AltModifier)) {
-            return;
-        }
-        if (_cellReoptTool && _editManager) {
-            auto gridIndex = _editManager->worldToGridIndex(worldPos);
-            if (gridIndex) {
-                // Update the tool's surface reference and config
-                if (_editManager->baseSurface()) {
-                    _cellReoptTool->setSurface(_editManager->baseSurface().get());
-                }
-                if (_widget) {
-                    CellReoptimizationTool::Config config;
-                    config.maxFloodSteps = _widget->cellReoptMaxSteps();
-                    config.maxCorrectionPoints = _widget->cellReoptMaxPoints();
-                    config.minBoundarySpacing = _widget->cellReoptMinSpacing();
-                    config.perimeterOffset = _widget->cellReoptPerimeterOffset();
-                    _cellReoptTool->setConfig(config);
-                }
-                _cellReoptTool->executeAtGridPosition(gridIndex->first, gridIndex->second);
-            }
-        }
-        return;
-    }
-
     if (!_editManager || !_editManager->hasSession()) {
         return;
     }
@@ -526,7 +498,7 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
     refreshOverlay();
 }
 
-void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
                                          const cv::Vec3f& worldPos,
                                          Qt::MouseButtons buttons,
                                          Qt::KeyboardModifiers modifiers,
@@ -652,7 +624,7 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
     }
 }
 
-void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
                                             const cv::Vec3f& worldPos,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/,
@@ -740,7 +712,7 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
     finishDrag();
 }
 
-void SegmentationModule::handleMouseDoubleClick(CTiledVolumeViewer* /*viewer*/,
+void SegmentationModule::handleMouseDoubleClick(VolumeViewerBase* /*viewer*/,
                                                  const cv::Vec3f& worldPos,
                                                  Qt::MouseButton button,
                                                  Qt::KeyboardModifiers /*modifiers*/)
@@ -762,7 +734,7 @@ void SegmentationModule::handleMouseDoubleClick(CTiledVolumeViewer* /*viewer*/,
     }
 }
 
-void SegmentationModule::handleWheel(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleWheel(VolumeViewerBase* viewer,
                                      int deltaSteps,
                                      const QPointF& scenePos,
                                      const cv::Vec3f& worldPos)

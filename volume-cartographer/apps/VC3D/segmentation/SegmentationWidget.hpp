@@ -22,7 +22,6 @@ class SegmentationGrowthPanel;
 class SegmentationCorrectionsPanel;
 class SegmentationCustomParamsPanel;
 class SegmentationApprovalMaskPanel;
-class SegmentationCellReoptPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
@@ -51,16 +50,6 @@ public:
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
     [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
-    [[nodiscard]] int extrapolationPointCount() const;
-    [[nodiscard]] ExtrapolationType extrapolationType() const;
-    [[nodiscard]] int sdtMaxSteps() const;
-    [[nodiscard]] float sdtStepSize() const;
-    [[nodiscard]] float sdtConvergence() const;
-    [[nodiscard]] int sdtChunkSize() const;
-    [[nodiscard]] int skeletonConnectivity() const;
-    [[nodiscard]] int skeletonSliceOrientation() const;
-    [[nodiscard]] int skeletonChunkSize() const;
-    [[nodiscard]] int skeletonSearchRadius() const;
     [[nodiscard]] QString customParamsText() const;
     [[nodiscard]] QString customParamsProfile() const;
     [[nodiscard]] bool customParamsValid() const;
@@ -176,17 +165,6 @@ public:
      */
     void setVolumeZarrPath(const QString& path);
 
-    // Cell reoptimization getters — delegated to panel
-    [[nodiscard]] bool cellReoptMode() const;
-    [[nodiscard]] int cellReoptMaxSteps() const;
-    [[nodiscard]] int cellReoptMaxPoints() const;
-    [[nodiscard]] float cellReoptMinSpacing() const;
-    [[nodiscard]] float cellReoptPerimeterOffset() const;
-
-    // Cell reoptimization setters
-    void setCellReoptMode(bool enabled);
-    void setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections);
-
     /** Returns the lasagna panel widget (for hosting in a separate dock). */
     [[nodiscard]] SegmentationLasagnaPanel* lasagnaPanel() const { return _lasagnaPanel; }
 
@@ -262,13 +240,6 @@ signals:
     void lasagnaStatusMessage(const QString& message);
     void seedFromFocusRequested();
 
-    // Cell reoptimization signals
-    void cellReoptModeChanged(bool enabled);
-    void cellReoptMaxStepsChanged(int steps);
-    void cellReoptMaxPointsChanged(int points);
-    void cellReoptMinSpacingChanged(float spacing);
-    void cellReoptPerimeterOffsetChanged(float offset);
-    void cellReoptGrowthRequested(uint64_t collectionId);
     void manualAddConfigChanged();
     void manualAddClearPendingRequested();
     void manualAddRecomputeRequested();
@@ -295,7 +266,6 @@ private:
     SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
     SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
     SegmentationApprovalMaskPanel* _approvalMaskPanel{nullptr};
-    SegmentationCellReoptPanel* _cellReoptPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};

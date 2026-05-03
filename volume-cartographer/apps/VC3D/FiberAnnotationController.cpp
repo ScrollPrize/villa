@@ -3,7 +3,7 @@
 #include "CState.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <QMdiArea>
 #include <QMdiSubWindow>

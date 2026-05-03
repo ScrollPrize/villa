@@ -34,16 +34,6 @@ public:
     // Getters
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
-    [[nodiscard]] int extrapolationPointCount() const { return _extrapolationPointCount; }
-    [[nodiscard]] ExtrapolationType extrapolationType() const { return _extrapolationType; }
-    [[nodiscard]] int sdtMaxSteps() const { return _sdtMaxSteps; }
-    [[nodiscard]] float sdtStepSize() const { return _sdtStepSize; }
-    [[nodiscard]] float sdtConvergence() const { return _sdtConvergence; }
-    [[nodiscard]] int sdtChunkSize() const { return _sdtChunkSize; }
-    [[nodiscard]] int skeletonConnectivity() const { return _skeletonConnectivity; }
-    [[nodiscard]] int skeletonSliceOrientation() const { return _skeletonSliceOrientation; }
-    [[nodiscard]] int skeletonChunkSize() const { return _skeletonChunkSize; }
-    [[nodiscard]] int skeletonSearchRadius() const { return _skeletonSearchRadius; }
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
     [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
     [[nodiscard]] QString patchTracerSourcePath() const { return _patchTracerSourcePath; }
@@ -99,20 +89,6 @@ private:
     QGroupBox* _groupGrowth{nullptr};
     QSpinBox* _spinGrowthSteps{nullptr};
     QComboBox* _comboGrowthMethod{nullptr};
-    QWidget* _extrapolationOptionsPanel{nullptr};
-    QLabel* _lblExtrapolationPoints{nullptr};
-    QSpinBox* _spinExtrapolationPoints{nullptr};
-    QComboBox* _comboExtrapolationType{nullptr};
-    QWidget* _sdtParamsContainer{nullptr};
-    QSpinBox* _spinSDTMaxSteps{nullptr};
-    QDoubleSpinBox* _spinSDTStepSize{nullptr};
-    QDoubleSpinBox* _spinSDTConvergence{nullptr};
-    QSpinBox* _spinSDTChunkSize{nullptr};
-    QWidget* _skeletonParamsContainer{nullptr};
-    QComboBox* _comboSkeletonConnectivity{nullptr};
-    QComboBox* _comboSkeletonSliceOrientation{nullptr};
-    QSpinBox* _spinSkeletonChunkSize{nullptr};
-    QSpinBox* _spinSkeletonSearchRadius{nullptr};
     QPushButton* _btnGrow{nullptr};
     QPushButton* _btnInpaint{nullptr};
     QCheckBox* _chkGrowthDirUp{nullptr};
@@ -151,10 +127,6 @@ private:
     QDoubleSpinBox* _spinPatchZLocationLossWeight{nullptr};
     QDoubleSpinBox* _spinPatchDistLoss2dWeight{nullptr};
     QDoubleSpinBox* _spinPatchDistLoss3dWeight{nullptr};
-    QSpinBox* _spinPatchSdir3dRadius{nullptr};
-    QDoubleSpinBox* _spinPatchSdir3dWeight{nullptr};
-    QDoubleSpinBox* _spinPatchSdir3dGlobalWeight{nullptr};
-    QDoubleSpinBox* _spinPatchSdir3dCandidateMax{nullptr};
     QDoubleSpinBox* _spinPatchStraightMinCount{nullptr};
     QSpinBox* _spinPatchInlierBaseThreshold{nullptr};
     QSpinBox* _spinPatchConsensusDefaultThreshold{nullptr};
@@ -170,18 +142,6 @@ private:
     int _patchTracerGrowthSteps{100000};
     int _growthDirectionMask{0};
     bool _growthKeybindsEnabled{true};
-    int _extrapolationPointCount{7};
-    ExtrapolationType _extrapolationType{ExtrapolationType::Linear};
-
-    int _sdtMaxSteps{5};
-    float _sdtStepSize{0.8f};
-    float _sdtConvergence{0.5f};
-    int _sdtChunkSize{128};
-
-    int _skeletonConnectivity{26};
-    int _skeletonSliceOrientation{0};
-    int _skeletonChunkSize{128};
-    int _skeletonSearchRadius{5};
 
     bool _normalGridAvailable{false};
     QString _normalGridHint;
@@ -207,10 +167,6 @@ private:
     double _patchZLocationLossWeight{0.1};
     double _patchDistLoss2dWeight{1.0};
     double _patchDistLoss3dWeight{2.0};
-    int _patchSdir3dRadius{2};
-    double _patchSdir3dWeight{0.5};
-    double _patchSdir3dGlobalWeight{0.25};
-    double _patchSdir3dCandidateMax{4.0};
     double _patchStraightMinCount{1.0};
     int _patchInlierBaseThreshold{20};
     int _patchConsensusDefaultThreshold{10};

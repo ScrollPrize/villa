@@ -56,12 +56,6 @@ target_link_libraries(vc_tifxyz_inp_mask vc_core)
 add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
-add_executable(vc_fill_quadmesh src/vc_fill_quadmesh.cpp)
-target_link_libraries(vc_fill_quadmesh vc_core vc_tracer Ceres::ceres)
-
-add_executable(vc_tiffxyz_upscale_grounding src/vc_tiffxyz_upscale_grounding.cpp)
-target_link_libraries(vc_tiffxyz_upscale_grounding vc_core vc_tracer)
-
 add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
 target_link_libraries(vc_calc_surface_metrics vc_core vc_ui Boost::program_options)
 
@@ -93,38 +87,11 @@ target_link_libraries(vc_diffuse_winding
         Ceres::ceres
 )
 
-add_executable(vc_render_bench src/vc_render_bench.cpp)
-target_link_libraries(vc_render_bench vc_core)
-
-add_executable(vc_io_bench src/vc_io_bench.cpp)
-target_link_libraries(vc_io_bench vc_core)
-
-add_executable(vc_blockcache_bench src/vc_blockcache_bench.cpp)
-target_link_libraries(vc_blockcache_bench vc_core)
-
-add_executable(vc_transpose_bench src/vc_transpose_bench.cpp)
-target_link_libraries(vc_transpose_bench vc_core)
-
-add_executable(vc_coord_bench src/vc_coord_bench.cpp)
-target_link_libraries(vc_coord_bench vc_core)
-
-add_executable(vc_tifxyz_bench src/vc_tifxyz_bench.cpp)
-target_link_libraries(vc_tifxyz_bench vc_core)
-
 add_executable(vc_tifxyz_mmap_prepare src/vc_tifxyz_mmap_prepare.cpp)
 target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
 
-add_executable(vc_surface_patch_index_bench src/vc_surface_patch_index_bench.cpp)
-target_link_libraries(vc_surface_patch_index_bench vc_core)
-
-add_executable(vc_coord_regression src/vc_coord_regression.cpp)
-target_link_libraries(vc_coord_regression vc_core)
-
 add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
-
-add_executable(vc_surface_diff src/vc_surface_diff.cpp)
-target_link_libraries(vc_surface_diff vc_core Boost::program_options)
 
 add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
 target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
@@ -135,16 +102,6 @@ target_link_libraries(vc_visualize vc_core Boost::program_options)
 add_executable(vc_volpkg_convert src/vc_volpkg_convert.cpp)
 target_link_libraries(vc_volpkg_convert vc_core)
 
-
-add_executable(vc_ced2d src/vc_ced2d.cpp)
-target_link_libraries(vc_ced2d
-    vc_core
-    opencv_core
-    opencv_imgcodecs
-    opencv_imgproc
-    Boost::program_options
-    OpenMP::OpenMP_CXX
-)
 
 # Apply affine + scale to OBJ, single TIFXYZ, or batch TIFXYZ subfolders
 add_executable(vc_transform_geom src/vc_transform_geom.cpp)
@@ -158,10 +115,6 @@ target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
 # Read / visualize NormalGridVolume
 add_executable(vc_ngrids src/vc_ngrids.cpp)
 target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
-
-# Generate normal3d Zarr directly from tifxyz patches
-add_executable(vc_patch_normals3d src/vc_patch_normals3d.cpp)
-target_link_libraries(vc_patch_normals3d vc_core Boost::program_options opencv_core OpenMP::OpenMP_CXX)
 
 add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
 target_link_libraries(vc_tifxyz2rgb
@@ -178,15 +131,6 @@ target_link_libraries(vc_rgb2tifxyz
     # nlohmann_json::nlohmann_json
 )
 
-add_executable(vc_telea_inpaint src/vc_telea_inpaint.cpp)
-target_link_libraries(vc_telea_inpaint
-    vc_core
-    opencv_core
-    opencv_imgcodecs
-    opencv_imgproc
-    opencv_photo
-)
-
 add_executable(vc_thinning src/vc_thinning.cpp)
 target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 
@@ -199,15 +143,8 @@ target_link_libraries(vc_project_tifxyz vc_core Boost::program_options opencv_co
 add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
 target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 
-add_executable(vc_zarr_raw_frames src/vc_zarr_raw_frames.cpp)
-target_link_libraries(vc_zarr_raw_frames vc_core)
-
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core blosc_static)
-
-add_executable(vc_zarr_prefetch src/vc_zarr_prefetch.cpp)
-target_link_libraries(vc_zarr_prefetch vc_core Boost::program_options)
-
 
 # Precompiled headers for CLI apps (reuse vc_core's PCH)
 if(VC_USE_PCH)
@@ -226,25 +163,17 @@ if(VC_USE_PCH)
         vc_tifxyz_winding
         vc_tifxyz2zarr_sparse
         vc_add_ignore_label
-        vc_fill_quadmesh
-        vc_tiffxyz_upscale_grounding
         vc_calc_surface_metrics
         vc_tifxyz_gengt
         vc_diffuse_winding
-        vc_render_bench
         vc_tifxyz_mmap_prepare
-        vc_surface_patch_index_bench
         vc_create_segment_mask
-        vc_surface_diff
         vc_visualize
-        vc_ced2d
         vc_transform_geom
         vc_gen_normalgrids
         vc_ngrids
-        vc_patch_normals3d
         vc_tifxyz2rgb
         vc_rgb2tifxyz
-        vc_telea_inpaint
         vc_thinning
         vc_tifxyz
         vc_project_tifxyz

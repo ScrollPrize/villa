@@ -1,51 +1,29 @@
 #include "CWindow.hpp"
 #include <iostream>
-#include "RamStats.hpp"
 
-#include <cstdlib>
-#include <condition_variable>
 #include <functional>
-#include <mutex>
-#if defined(__GLIBC__)
-#include <malloc.h>
-#endif
-#if defined(VC_HAVE_MIMALLOC)
-#include <mimalloc.h>
-#endif
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
-#include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
-#include <QKeySequence>
-#include <QHBoxLayout>
 #include <QGridLayout>
 #include <QCursor>
 #include <QKeyEvent>
 #include <QResizeEvent>
-#include <QWheelEvent>
 #include <QSettings>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
-#include <QStyleHints>
 #include <QDesktopServices>
-#include <QDialog>
 #include <QUrl>
 #include <QClipboard>
-#include <QDateTime>
 #include <QFileDialog>
-#include <QTextStream>
 #include <QFileInfo>
-#include <QDir>
-#include <QEventLoop>
-#include <QProgressDialog>
+#include <QPointF>
 #include <QMessageBox>
-#include <QInputDialog>
-#include <QThread>
 #include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
 #include <QFutureWatcher>
@@ -56,10 +34,6 @@
 #include <QDoubleSpinBox>
 #include <QSpinBox>
 #include <QSizePolicy>
-#include <QProcess>
-#include <QTemporaryDir>
-#include <QToolBar>
-#include <QFileInfo>
 #include <QTimer>
 #include <QSize>
 #include <QVector>
@@ -68,32 +42,25 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include "utils/Json.hpp"
-#include <QGraphicsSimpleTextItem>
 #include <QPointer>
-#include <QPen>
 #include <QListView>
-#include <QFont>
-#include <QPainter>
 #include <algorithm>
-#include <atomic>
-#include <cmath>
 #include <cmath>
 #include "vc/core/types/Segmentation.hpp"
 #include <limits>
 #include <optional>
 #include <cctype>
-#include <algorithm>
 #include <utility>
 #include <filesystem>
-#include <fstream>
 #include <vector>
-#include <initializer_list>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <QStringList>
 
-#include "CVolumeViewerView.hpp"
-#include "VolumeViewerCmaps.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
+#include "viewer_controls/ViewerControlsPanel.hpp"
+#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
@@ -102,9 +69,7 @@
 #include "FiberAnnotationController.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
-#include "DrawingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
-#include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
@@ -117,8 +82,6 @@
 #include "LasagnaServiceManager.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
-
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -128,8 +91,6 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
-#include "vc/core/util/NetworkFilesystem.hpp"
-#include "vc/core/util/RemoteUrl.hpp"
 #include <utils/zarr.hpp>
 
 
@@ -140,103 +101,36 @@ Q_LOGGING_CATEGORY(lcSegGrowth, "vc.segmentation.growth");
 
 using qga = QGuiApplication;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
-
 namespace
 {
 
-std::string compositeMethodForModeIndex(int index)
+VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
 {
-    switch (index) {
-        case 0:  return "max";
-        case 1:  return "mean";
-        case 2:  return "min";
-        case 3:  return "alpha";
-        case 4:  return "beerLambert";
-        case 5:  return "volumetric";
-        case 6:  return "dvr";
-        case 7:  return "firstHitIso";
-        case 8:  return "devFromMean";
-        case 9:  return "emissionDvr";
-        case 10: return "maxAboveIso";
-        case 11: return "gammaWeighted";
-        case 12: return "gradientMag";
-        case 13: return "pbrIso";
-        case 14: return "shadedDvr";
-        default: return "mean";
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(widget)) {
+        return chunkedViewer;
     }
+    return nullptr;
 }
 
-int compositeModeIndexForMethod(const std::string& method)
+bool isChunkedViewer(VolumeViewerBase* viewer)
 {
-    if (method == "max") return 0;
-    if (method == "mean") return 1;
-    if (method == "min") return 2;
-    if (method == "alpha") return 3;
-    if (method == "beerLambert") return 4;
-    if (method == "volumetric") return 5;
-    if (method == "dvr") return 6;
-    if (method == "firstHitIso") return 7;
-    if (method == "devFromMean") return 8;
-    if (method == "emissionDvr") return 9;
-    if (method == "maxAboveIso") return 10;
-    if (method == "gammaWeighted") return 11;
-    if (method == "gradientMag") return 12;
-    if (method == "pbrIso") return 13;
-    if (method == "shadedDvr") return 14;
-    return 1;
+    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
 }
 
-bool isRemoteTransformSource(const QString& source)
+void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
 {
-    const QString trimmed = source.trimmed();
-    return trimmed.startsWith("http://", Qt::CaseInsensitive) ||
-           trimmed.startsWith("https://", Qt::CaseInsensitive) ||
-           trimmed.startsWith("s3://", Qt::CaseInsensitive) ||
-           trimmed.startsWith("s3+", Qt::CaseInsensitive);
+    if (!viewer) {
+        return;
+    }
+    viewer->centerOnVolumePoint(position, !isChunkedViewer(viewer));
 }
 
-std::filesystem::path expandLocalTransformPath(const QString& source)
+void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
 {
-    QString path = source.trimmed();
-    if (path.startsWith("~/")) {
-        path.replace(0, 1, QDir::homePath());
-    } else if (path == "~") {
-        path = QDir::homePath();
+    if (!viewer) {
+        return;
     }
-
-    std::filesystem::path fsPath = path.toStdString();
-    if (fsPath.is_relative()) {
-        fsPath = std::filesystem::absolute(fsPath);
-    }
-    return fsPath;
-}
-
-vc::cache::HttpAuth authForRemoteTransformSource(const QString& source)
-{
-    vc::cache::HttpAuth auth;
-    const auto resolved = vc::resolveRemoteUrl(source.trimmed().toStdString());
-    if (!resolved.useAwsSigv4) {
-        return auth;
-    }
-
-    auth = vc::cache::loadAwsCredentials();
-    if (auth.region.empty())
-        auth.region = resolved.awsRegion;
-    // Fall back to saved QSettings if ~/.aws/ files had nothing
-    if (auth.access_key.empty() || auth.secret_key.empty()) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
-        const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
-        const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
-
-        if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            auth.access_key = savedAccess.toStdString();
-            auth.secret_key = savedSecret.toStdString();
-            auth.session_token = savedToken.toStdString();
-        }
-    }
-
-    return auth;
+    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
 }
 
 void ensureDockWidgetFeatures(QDockWidget* dock)
@@ -340,415 +234,6 @@ float signedAngleBetween(const cv::Vec3f& from, const cv::Vec3f& to, const cv::V
     return angle * sign;
 }
 
-cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
-{
-    if (path.empty()) {
-        throw std::runtime_error("transform path is empty");
-    }
-    if (!std::filesystem::exists(path)) {
-        throw std::runtime_error("transform.json not found");
-    }
-
-    utils::Json json = utils::Json::parse_file(path);
-
-    if (!json.contains("transformation_matrix")) {
-        throw std::runtime_error("transform.json is missing transformation_matrix");
-    }
-
-    const auto& matrixJson = json.at("transformation_matrix");
-    if (!matrixJson.is_array() || (matrixJson.size() != 3 && matrixJson.size() != 4)) {
-        throw std::runtime_error("transformation_matrix must be 3x4 or 4x4");
-    }
-
-    cv::Matx44d matrix = cv::Matx44d::eye();
-    for (int row = 0; row < static_cast<int>(matrixJson.size()); ++row) {
-        const auto& rowJson = matrixJson.at(row);
-        if (!rowJson.is_array() || rowJson.size() != 4) {
-            throw std::runtime_error("each transformation_matrix row must have 4 values");
-        }
-        for (int col = 0; col < 4; ++col) {
-            matrix(row, col) = rowJson.at(col).get_double();
-        }
-    }
-
-    if (matrixJson.size() == 4) {
-        if (std::abs(matrix(3, 0)) > 1e-12 ||
-            std::abs(matrix(3, 1)) > 1e-12 ||
-            std::abs(matrix(3, 2)) > 1e-12 ||
-            std::abs(matrix(3, 3) - 1.0) > 1e-12) {
-            throw std::runtime_error("transform.json bottom row must be [0, 0, 0, 1]");
-        }
-    }
-
-    return matrix;
-}
-
-cv::Matx44d invertAffineTransformMatrix(const cv::Matx44d& matrix)
-{
-    const cv::Matx33d linear(matrix(0, 0), matrix(0, 1), matrix(0, 2),
-                             matrix(1, 0), matrix(1, 1), matrix(1, 2),
-                             matrix(2, 0), matrix(2, 1), matrix(2, 2));
-    const double determinant = cv::determinant(linear);
-    if (!std::isfinite(determinant) || std::abs(determinant) < std::numeric_limits<double>::epsilon()) {
-        throw std::runtime_error("transform is not invertible");
-    }
-
-    cv::Mat linearMat(3, 3, CV_64F);
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            linearMat.at<double>(row, col) = matrix(row, col);
-        }
-    }
-    cv::Mat linearInvMat;
-    if (cv::invert(linearMat, linearInvMat, cv::DECOMP_SVD) <= 0.0) {
-        throw std::runtime_error("transform is not invertible");
-    }
-
-    cv::Matx33d linearInv;
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            linearInv(row, col) = linearInvMat.at<double>(row, col);
-        }
-    }
-
-    const cv::Vec3d translation(matrix(0, 3), matrix(1, 3), matrix(2, 3));
-    const cv::Vec3d inverseTranslation = -(linearInv * translation);
-
-    cv::Matx44d inverted = cv::Matx44d::eye();
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            inverted(row, col) = linearInv(row, col);
-        }
-    }
-    inverted(0, 3) = inverseTranslation[0];
-    inverted(1, 3) = inverseTranslation[1];
-    inverted(2, 3) = inverseTranslation[2];
-    return inverted;
-}
-
-cv::Vec3f applyAffineTransform(const cv::Vec3f& point, const cv::Matx44d& matrix)
-{
-    if (point[0] == -1.0f) {
-        return point;
-    }
-
-    const cv::Vec4d homogeneous(point[0], point[1], point[2], 1.0);
-    const cv::Vec4d transformed = matrix * homogeneous;
-    return cv::Vec3f(static_cast<float>(transformed[0]),
-                     static_cast<float>(transformed[1]),
-                     static_cast<float>(transformed[2]));
-}
-
-cv::Vec3f applyPreAffineScale(const cv::Vec3f& point, int scale)
-{
-    if (point[0] == -1.0f || scale == 1) {
-        return point;
-    }
-
-    return point * static_cast<float>(scale);
-}
-
-void transformSurfacePoints(QuadSurface* surface, int scale, const std::optional<cv::Matx44d>& matrix)
-{
-    if (!surface) {
-        return;
-    }
-
-    if (auto* points = surface->rawPointsPtr()) {
-        for (int row = 0; row < points->rows; ++row) {
-            for (int col = 0; col < points->cols; ++col) {
-                auto& point = (*points)(row, col);
-                if (point[0] == -1.0f) {
-                    continue;
-                }
-
-                point = applyPreAffineScale(point, scale);
-                if (matrix) {
-                    point = applyAffineTransform(point, *matrix);
-                }
-            }
-        }
-    }
-}
-
-void refreshTransformedSurfaceState(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-
-    surface->invalidateCache();
-
-    if (surface->meta.is_null() || !surface->meta.is_object()) {
-        surface->meta = utils::Json::object();
-    }
-
-    const auto bbox = surface->bbox();
-    {
-        auto lo = utils::Json::array();
-        lo.push_back(bbox.low[0]); lo.push_back(bbox.low[1]); lo.push_back(bbox.low[2]);
-        auto hi = utils::Json::array();
-        hi.push_back(bbox.high[0]); hi.push_back(bbox.high[1]); hi.push_back(bbox.high[2]);
-        auto bb = utils::Json::array();
-        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
-        surface->meta["bbox"] = std::move(bb);
-    }
-    {
-        auto sc = utils::Json::array();
-        sc.push_back(surface->scale()[0]); sc.push_back(surface->scale()[1]);
-        surface->meta["scale"] = std::move(sc);
-    }
-}
-
-std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<QuadSurface>& source)
-{
-    if (!source) {
-        return nullptr;
-    }
-
-    auto clone = std::make_shared<QuadSurface>(source->rawPoints(), source->scale());
-    clone->meta = source->meta.is_null() ? utils::Json::object() : source->meta;
-    clone->id = source->id;
-    clone->path = source->path;
-    clone->setOverlappingIds(source->overlappingIds());
-
-    for (const auto& channelName : source->channelNames()) {
-        clone->setChannel(channelName, source->channel(channelName, SURF_CHANNEL_NORESIZE).clone());
-    }
-
-    return clone;
-}
-
-struct StartupLevelPrefetchProgress {
-    std::atomic<size_t> totalKeys{0};
-    std::atomic<size_t> cachedKeys{0};
-    std::atomic<size_t> missingKeys{0};
-    std::atomic<size_t> ioPending{0};
-};
-
-struct StartupLevelPrefetchResult {
-    bool success{false};
-    QString error;
-    int level{-1};
-    size_t totalKeys{0};
-    size_t initialCached{0};
-    size_t fetchedKeys{0};
-};
-
-std::vector<vc::cache::ChunkKey> collectLevelChunkKeys(
-    vc::cache::BlockPipeline* cache,
-    int level)
-{
-    if (!cache) {
-        throw std::runtime_error("chunk cache is not available");
-    }
-    if (level < 0 || level >= cache->numLevels()) {
-        throw std::runtime_error(
-            "pyramid level " + std::to_string(level)
-            + " is not present in this volume");
-    }
-
-    const auto levelShape = cache->levelShape(level);
-    const auto chunkShape = cache->chunkShape(level);
-    if (levelShape[0] <= 0 || levelShape[1] <= 0 || levelShape[2] <= 0 ||
-        chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) {
-        throw std::runtime_error(
-            "pyramid level " + std::to_string(level)
-            + " has invalid shape or chunk shape");
-    }
-
-    const int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-    const int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-    const int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-    const size_t total = size_t(gridZ) * size_t(gridY) * size_t(gridX);
-
-    std::vector<vc::cache::ChunkKey> keys;
-    keys.reserve(total);
-    for (int iz = 0; iz < gridZ; ++iz)
-        for (int iy = 0; iy < gridY; ++iy)
-            for (int ix = 0; ix < gridX; ++ix)
-                keys.push_back(vc::cache::ChunkKey{level, iz, iy, ix});
-    return keys;
-}
-
-StartupLevelPrefetchResult prefetchRemoteLevelBlocking(
-    const std::shared_ptr<Volume>& volume,
-    int level,
-    const std::shared_ptr<StartupLevelPrefetchProgress>& progress)
-{
-    StartupLevelPrefetchResult result;
-    result.level = level;
-    if (!volume) {
-        result.error = QObject::tr("Volume is not available.");
-        return result;
-    }
-
-    try {
-        auto* cache = volume->tieredCache();
-        const auto keys = collectLevelChunkKeys(cache, level);
-        result.totalKeys = keys.size();
-        progress->totalKeys.store(keys.size(), std::memory_order_relaxed);
-
-        auto missing = cache->chunksMissingFromCache(keys);
-        result.initialCached = keys.size() - missing.size();
-        progress->cachedKeys.store(result.initialCached, std::memory_order_relaxed);
-        progress->missingKeys.store(missing.size(), std::memory_order_relaxed);
-
-        if (missing.empty()) {
-            result.success = true;
-            return result;
-        }
-
-        struct WaitState {
-            std::mutex mtx;
-            std::condition_variable cv;
-        };
-        auto waitState = std::make_shared<WaitState>();
-        const auto listenerId = cache->addChunkReadyListener(
-            [waitState](const vc::cache::ChunkKey&) {
-                waitState->cv.notify_one();
-            });
-
-        cache->fetchInteractive(missing, level);
-
-        size_t lastMissing = missing.size();
-        int idleRetries = 0;
-        while (!missing.empty()) {
-            {
-                std::unique_lock<std::mutex> lk(waitState->mtx);
-                waitState->cv.wait_for(lk, std::chrono::milliseconds(200));
-            }
-
-            missing = cache->chunksMissingFromCache(missing);
-            const auto stats = cache->stats();
-            progress->cachedKeys.store(keys.size() - missing.size(), std::memory_order_relaxed);
-            progress->missingKeys.store(missing.size(), std::memory_order_relaxed);
-            progress->ioPending.store(stats.ioPending, std::memory_order_relaxed);
-
-            if (missing.empty()) break;
-
-            if (stats.ioPending == 0 && missing.size() == lastMissing) {
-                ++idleRetries;
-                cache->fetchInteractive(missing, level);
-                if (idleRetries > 3) {
-                    cache->removeChunkReadyListener(listenerId);
-                    result.error = QObject::tr(
-                        "Remote level prefetch stalled at %1 / %2 chunks cached.")
-                        .arg(keys.size() - missing.size())
-                        .arg(keys.size());
-                    return result;
-                }
-            } else {
-                idleRetries = 0;
-            }
-            lastMissing = missing.size();
-        }
-
-        cache->removeChunkReadyListener(listenerId);
-        result.success = true;
-        result.fetchedKeys = result.totalKeys - result.initialCached;
-        return result;
-    } catch (const std::exception& e) {
-        result.error = QString::fromStdString(e.what());
-        return result;
-    } catch (...) {
-        result.error = QObject::tr("Unknown error during remote level prefetch.");
-        return result;
-    }
-}
-
-void prefetchRemoteLevelWithDialog(CWindow* window,
-                                   const std::shared_ptr<Volume>& volume,
-                                   int level)
-{
-    if (!window || !volume) return;
-
-    auto progressState = std::make_shared<StartupLevelPrefetchProgress>();
-    QProgressDialog progress(
-        QObject::tr("Planning remote level %1 prefetch...").arg(level),
-        QString(), 0, 0, window);
-    progress.setWindowTitle(QObject::tr("Prefetch Remote Volume"));
-    progress.setWindowModality(Qt::ApplicationModal);
-    progress.setAutoClose(false);
-    progress.setAutoReset(false);
-    progress.setMinimumDuration(0);
-    progress.setCancelButton(nullptr);
-
-    QFutureWatcher<StartupLevelPrefetchResult> watcher;
-    QTimer timer;
-    QObject::connect(&watcher, &QFutureWatcher<StartupLevelPrefetchResult>::finished,
-                     &progress, &QDialog::accept);
-    QObject::connect(&timer, &QTimer::timeout, &progress,
-                     [&progress, progressState, level]() {
-        const size_t total = progressState->totalKeys.load(std::memory_order_relaxed);
-        const size_t cached = progressState->cachedKeys.load(std::memory_order_relaxed);
-        const size_t missing = progressState->missingKeys.load(std::memory_order_relaxed);
-        const size_t pending = progressState->ioPending.load(std::memory_order_relaxed);
-
-        if (total > 0) {
-            const int safeTotal = total > size_t(std::numeric_limits<int>::max())
-                ? std::numeric_limits<int>::max()
-                : static_cast<int>(total);
-            const int safeCached = cached > size_t(safeTotal)
-                ? safeTotal
-                : static_cast<int>(cached);
-            progress.setRange(0, safeTotal);
-            progress.setValue(safeCached);
-        } else {
-            progress.setRange(0, 0);
-        }
-
-        progress.setLabelText(
-            QObject::tr("Prefetching remote pyramid level %1...\n"
-                        "Chunks cached: %2 / %3\n"
-                        "Chunks needing download: %4\n"
-                        "Pending I/O: %5")
-                .arg(level)
-                .arg(QString::number(static_cast<qulonglong>(cached)))
-                .arg(QString::number(static_cast<qulonglong>(total)))
-                .arg(QString::number(static_cast<qulonglong>(missing)))
-                .arg(QString::number(static_cast<qulonglong>(pending))));
-    });
-
-    timer.start(100);
-    watcher.setFuture(QtConcurrent::run([volume, level, progressState]() {
-        return prefetchRemoteLevelBlocking(volume, level, progressState);
-    }));
-
-    if (!watcher.isFinished()) {
-        progress.exec();
-    }
-    timer.stop();
-
-    const auto result = watcher.result();
-    if (!result.success) {
-        QMessageBox::warning(
-            window,
-            QObject::tr("Prefetch Remote Volume"),
-            result.error.isEmpty()
-                ? QObject::tr("Failed to prefetch remote pyramid level %1.").arg(level)
-                : result.error);
-        return;
-    }
-
-    if (window->statusBar()) {
-        if (result.fetchedKeys == 0) {
-            window->statusBar()->showMessage(
-                QObject::tr("All %1 chunk(s) for remote level %2 were already cached.")
-                    .arg(QString::number(static_cast<qulonglong>(result.totalKeys)))
-                    .arg(level),
-                7000);
-        } else {
-            window->statusBar()->showMessage(
-                QObject::tr("Prefetched %1 missing chunk(s) for remote level %2 (%3 already cached).")
-                    .arg(QString::number(static_cast<qulonglong>(result.fetchedKeys)))
-                    .arg(level)
-                    .arg(QString::number(static_cast<qulonglong>(result.initialCached))),
-                7000);
-        }
-    }
-}
-
 } // namespace
 
 // Dark mode detection - works on all Qt 6.x versions
@@ -849,44 +334,22 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
+CWindow::CWindow(size_t cacheSizeGB) :
     _cmdRunner(nullptr),
     _seedingWidget(nullptr),
-    _drawingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
-    _startupPrefetchLevel = startupPrefetchLevel;
-
     // Initialize timer for debounced window state saving (500ms delay)
     _windowStateSaveTimer = new QTimer(this);
     _windowStateSaveTimer->setSingleShot(true);
     _windowStateSaveTimer->setInterval(500);
     connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
 
-    // Periodic heap trim: under mimalloc, mi_collect asks it to purge
-    // thread / segment caches and return freed pages to the OS. Under
-    // glibc, malloc_trim returns sbrk-grown segments. Also dumps a RAM
-    // stats line for live monitoring.
-    auto* trimTimer = new QTimer(this);
-    trimTimer->setInterval(1000);
-    connect(trimTimer, &QTimer::timeout, this, [this]() {
-#if defined(VC_HAVE_MIMALLOC)
-        mi_collect(false);
-#elif defined(__GLIBC__)
-        ::malloc_trim(0);
-#endif
-        if (DebugLoggingEnabled()) {
-            vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
-        }
-    });
-    trimTimer->start();
-
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _mirrorCursorToSegmentation = settings.value(vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION,
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
-    ui.cmbCompositeMode->setCurrentIndex(compositeModeIndexForMethod("max"));
     const QString baseTitle = windowTitle();
     const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
     if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
@@ -897,8 +360,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
 
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
-
-    _tickCoordinator = std::make_unique<vc::cache::TickCoordinator>();
 
     _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
@@ -929,17 +390,12 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
-    connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CTiledVolumeViewer* viewer) {
-        configureViewerConnections(viewer);
+    connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
-        auto s = viewer->compositeRenderSettings();
-        s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
-        viewer->setCompositeRenderSettings(s);
-        if (viewer->surfName() == "segmentation") {
-            QSignalBlocker blocker(ui.chkCompositeEnabled);
-            ui.chkCompositeEnabled->setChecked(s.enabled);
+        if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+            configureChunkedViewerConnections(chunkedViewer);
         }
     });
 
@@ -1107,8 +563,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     // Ensure right-side tabified docks have a usable minimum size
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
-                               ui.dockWidgetDistanceTransform,
-                               ui.dockWidgetDrawing }) {
+                               ui.dockWidgetDistanceTransform }) {
         if (dock) {
             dock->setMinimumWidth(250);
             dock->setMinimumHeight(120);
@@ -1124,7 +579,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
-                               ui.dockWidgetDrawing,
                                ui.dockWidgetVolumes,
                                ui.dockWidgetViewerControls  }) {
         ensureDockWidgetFeatures(dock);
@@ -1152,7 +606,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
         for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                    _lasagnaDock,
                                    ui.dockWidgetDistanceTransform,
-                                   ui.dockWidgetDrawing,
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
@@ -1169,34 +622,28 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
                std::max(height(), minWindowSize.height()));
     }
 
-    QTimer::singleShot(0, this, [this]() {
-        std::shared_ptr<VolumePkg> pkg = VolumePkg::loadAutosave();
-        if (!pkg) pkg = VolumePkg::newEmpty();
-        _state->setVpkg(pkg);
-        refreshCurrentVolumePackageUi(QString(), true);
-    });
+    // If enabled, auto open the last used local volume package.
+    if (settings.value(vc3d::settings::project::AUTO_OPEN, vc3d::settings::project::AUTO_OPEN_DEFAULT).toInt() != 0) {
+
+        QStringList files = settings.value(vc3d::settings::project::RECENT).toStringList();
+
+        if (!files.empty() && !files.at(0).isEmpty()) {
+            QString path = files[0];
+            QTimer::singleShot(0, this, [this, path]() {
+                if (_menuController) {
+                    _menuController->openVolpkgAt(path);
+                }
+            });
+        }
+    }
 
     // Create application-wide keyboard shortcuts
-    fDrawingModeShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DrawingMode), this);
-    fDrawingModeShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fDrawingModeShortcut, &QShortcut::activated, [this]() {
-        if (_drawingWidget) {
-            _drawingWidget->toggleDrawingMode();
-        }
-    });
-
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        auto* viewer = segmentationViewer();
-        if (!viewer) {
-            return;
+        if (_viewerControlsPanel) {
+            _viewerControlsPanel->toggleSegmentationComposite();
         }
-        auto s = viewer->compositeRenderSettings();
-        s.enabled = !s.enabled;
-        viewer->setCompositeRenderSettings(s);
-        QSignalBlocker blocker(ui.chkCompositeEnabled);
-        ui.chkCompositeEnabled->setChecked(s.enabled);
     });
 
     // Toggle direction hints overlay (Ctrl+T)
@@ -1209,7 +656,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
         bool next = !current;
         settings.setValue(viewer::SHOW_DIRECTION_HINTS, next ? "1" : "0");
         if (_viewerManager) {
-            _viewerManager->forEachViewer([next](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setShowDirectionHints(next);
                 }
@@ -1227,7 +674,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
         bool next = !current;
         settings.setValue(viewer::SHOW_SURFACE_NORMALS, next ? "1" : "0");
         if (_viewerManager) {
-            _viewerManager->forEachViewer([next](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setShowSurfaceNormals(next);
                 }
@@ -1263,22 +710,16 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     fZoomInShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomIn), this);
     fZoomInShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomInShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustZoomByFactor(ZOOM_FACTOR);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustZoomByFactor(ZOOM_FACTOR);
         }
     });
 
     fZoomOutShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomOut), this);
     fZoomOutShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomOutShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustZoomByFactor(1.0f / ZOOM_FACTOR);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustZoomByFactor(1.0f / ZOOM_FACTOR);
         }
     });
 
@@ -1286,13 +727,10 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     fResetViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ResetView), this);
     fResetViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fResetViewShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->resetSurfaceOffsets();
-                viewer->fitSurfaceInView();
-                viewer->renderVisible(true);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->resetSurfaceOffsets();
+            viewer->fitSurfaceInView();
+            viewer->renderVisible(true);
         }
     });
 
@@ -1300,22 +738,16 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     fWorldOffsetZPosShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZPos), this);
     fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZPosShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustSurfaceOffset(1.0f);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustSurfaceOffset(1.0f);
         }
     });
 
     fWorldOffsetZNegShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZNeg), this);
     fWorldOffsetZNegShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZNegShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustSurfaceOffset(-1.0f);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustSurfaceOffset(-1.0f);
         }
     });
 
@@ -1392,105 +824,87 @@ CWindow::~CWindow()
     CloseVolume();
 }
 
-CTiledVolumeViewer *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
+VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
 {
     if (!_viewerManager) {
         return nullptr;
     }
 
-    CTiledVolumeViewer* viewer = _viewerManager->createViewer(surfaceName, title, mdiArea);
+    VolumeViewerBase* viewer = _viewerManager->createViewer(surfaceName, title, mdiArea);
     if (!viewer) {
         return nullptr;
     }
 
-    configureViewerConnections(viewer);
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+        configureChunkedViewerConnections(chunkedViewer);
+    }
     return viewer;
 }
 
-void CWindow::configureViewerConnections(CTiledVolumeViewer* viewer)
+void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 {
     if (!viewer) {
         return;
     }
 
-    connect(_state, &CState::volumeChanged, viewer, &CTiledVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
-    connect(_state, &CState::volumeClosing, viewer, &CTiledVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
-    connect(viewer, &CTiledVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
+    connect(_state, &CState::volumeChanged, viewer, &CChunkedVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
+    connect(_state, &CState::volumeClosing, viewer, &CChunkedVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
+    connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
 
-    if (viewer->fGraphicsView) {
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMousePress,
-                viewer, &CTiledVolumeViewer::onMousePress, Qt::UniqueConnection);
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseMove,
-                viewer, &CTiledVolumeViewer::onMouseMove, Qt::UniqueConnection);
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseRelease,
-                viewer, &CTiledVolumeViewer::onMouseRelease, Qt::UniqueConnection);
-    }
-
-    if (_drawingWidget && !viewer->property("vc_drawing_bound").toBool()) {
-        connect(_drawingWidget, &DrawingWidget::sendPathsChanged,
-                viewer, &CTiledVolumeViewer::onPathsChanged, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
-                _drawingWidget, &DrawingWidget::onMousePress, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
-                _drawingWidget, &DrawingWidget::onMouseMove, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
-                _drawingWidget, &DrawingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendZSliceChanged,
-                _drawingWidget, &DrawingWidget::updateCurrentZSlice, Qt::UniqueConnection);
-    connect(_drawingWidget, &DrawingWidget::sendDrawingModeActive,
-            this, [this, viewer](bool active) {
-                viewer->onDrawingModeActive(active,
-                    _drawingWidget->getBrushSize(),
-                    _drawingWidget->getBrushShape() == PathBrushShape::Square);
-            });
-        viewer->setProperty("vc_drawing_bound", true);
+    if (auto* graphicsView = viewer->graphicsView()) {
+        connect(graphicsView, &CVolumeViewerView::sendMousePress,
+                viewer, &CChunkedVolumeViewer::onMousePress, Qt::UniqueConnection);
+        connect(graphicsView, &CVolumeViewerView::sendMouseMove,
+                viewer, &CChunkedVolumeViewer::onMouseMove, Qt::UniqueConnection);
+        connect(graphicsView, &CVolumeViewerView::sendMouseRelease,
+                viewer, &CChunkedVolumeViewer::onMouseRelease, Qt::UniqueConnection);
     }
 
     if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
         connect(_seedingWidget, &SeedingWidget::sendPathsChanged,
-                viewer, &CTiledVolumeViewer::onPathsChanged, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
+                viewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
                 _seedingWidget, &SeedingWidget::onMousePress, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
                 _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendZSliceChanged,
+        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
                 _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
     }
 
     if (_point_collection_widget && !viewer->property("vc_points_bound").toBool()) {
         connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
-                viewer, &CTiledVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendCollectionSelected,
+                viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectCollection, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::pointSelected,
-                viewer, &CTiledVolumeViewer::onPointSelected, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::pointSelected,
+                viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::pointClicked,
+        connect(viewer, &CChunkedVolumeViewer::pointClicked,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         viewer->setProperty("vc_points_bound", true);
     }
 
     const std::string& surfName = viewer->surfName();
     if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
-        if (viewer->fGraphicsView) {
-            viewer->fGraphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
+        if (auto* graphicsView = viewer->graphicsView()) {
+            graphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
         }
 
-        connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
                 this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
                     _axisAlignedSliceController->onMousePress(viewer, volLoc, button, modifiers);
                 });
 
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
                 this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
                     _axisAlignedSliceController->onMouseMove(viewer, volLoc, buttons, modifiers);
                 });
 
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
                     _axisAlignedSliceController->onMouseRelease(viewer, button, modifiers);
                 });
@@ -1499,12 +913,25 @@ void CWindow::configureViewerConnections(CTiledVolumeViewer* viewer)
     }
 }
 
-CTiledVolumeViewer* CWindow::segmentationViewer() const
+CChunkedVolumeViewer* CWindow::segmentationViewer() const
 {
     if (!_viewerManager) {
         return nullptr;
     }
-    for (auto* viewer : _viewerManager->viewers()) {
+    for (auto* viewer : _viewerManager->baseViewers()) {
+        if (viewer && viewer->surfName() == "segmentation") {
+            return qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
+        }
+    }
+    return nullptr;
+}
+
+VolumeViewerBase* CWindow::segmentationBaseViewer() const
+{
+    if (!_viewerManager) {
+        return nullptr;
+    }
+    for (auto* viewer : _viewerManager->baseViewers()) {
         if (viewer && viewer->surfName() == "segmentation") {
             return viewer;
         }
@@ -1512,9 +939,23 @@ CTiledVolumeViewer* CWindow::segmentationViewer() const
     return nullptr;
 }
 
+VolumeViewerBase* CWindow::activeBaseViewer() const
+{
+    if (!mdiArea) {
+        return nullptr;
+    }
+    auto* subWindow = mdiArea->activeSubWindow();
+    if (!subWindow) {
+        return nullptr;
+    }
+    return baseViewerFromWidget(subWindow->widget());
+}
+
 void CWindow::clearSurfaceSelection()
 {
-    clearTransformPreview(true);
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->clearPreview(true);
+    }
     _state->clearActiveSurface();
 
     if (_surfacePanel) {
@@ -1529,660 +970,9 @@ void CWindow::clearSurfaceSelection()
         treeWidgetSurfaces->clearSelection();
     }
 
-    refreshTransformsPanelState();
-}
-
-std::shared_ptr<QuadSurface> CWindow::currentTransformSourceSurface() const
-{
-    if (!_state) {
-        return nullptr;
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
     }
-
-    if (auto active = _state->activeSurface().lock()) {
-        return active;
-    }
-
-    if (_state->vpkg()) {
-        const std::string activeId = _state->activeSurfaceId();
-        if (!activeId.empty()) {
-            if (auto surface = _state->vpkg()->getSurface(activeId)) {
-                return surface;
-            }
-        }
-    }
-
-    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-    if (segmentationSurface && segmentationSurface != _transformPreviewSurface) {
-        return segmentationSurface;
-    }
-
-    return _transformPreviewSourceSurface;
-}
-
-QString CWindow::currentTransformSourceDescription() const
-{
-    if (!_customTransformSource.trimmed().isEmpty()) {
-        return _customTransformSource.trimmed();
-    }
-
-    const auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-    if (currentVolume && currentVolume->isRemote() && !remoteTransformUrl.empty()) {
-        return QString::fromStdString(remoteTransformUrl);
-    }
-
-    if (currentVolume && !currentVolume->path().empty()) {
-        return QString::fromStdString((currentVolume->path() / "transform.json").string());
-    }
-
-    const auto localPath = localCurrentTransformJsonPath();
-    if (!localPath.empty()) {
-        return QString::fromStdString(localPath.string());
-    }
-
-    return {};
-}
-
-std::filesystem::path CWindow::localCurrentTransformJsonPath() const
-{
-    if (!_customTransformSource.trimmed().isEmpty()) {
-        return _customTransformLocalPath;
-    }
-
-    if (!_state) {
-        return {};
-    }
-
-    auto currentVolume = _state->currentVolume();
-    if (!currentVolume) {
-        return {};
-    }
-
-    const auto volumePath = currentVolume->path();
-    if (volumePath.empty()) {
-        return {};
-    }
-
-    const auto localTransformPath = volumePath / "transform.json";
-    if (std::filesystem::exists(localTransformPath)) {
-        return localTransformPath;
-    }
-
-    return {};
-}
-
-std::string CWindow::currentRemoteTransformJsonUrl() const
-{
-    if (!_state) {
-        return {};
-    }
-
-    auto currentVolume = _state->currentVolume();
-    if (!currentVolume || !currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
-        return {};
-    }
-
-    std::string remoteTransformUrl = currentVolume->remoteUrl();
-    while (!remoteTransformUrl.empty() && remoteTransformUrl.back() == '/') {
-        remoteTransformUrl.pop_back();
-    }
-    remoteTransformUrl += "/transform.json";
-    return remoteTransformUrl;
-}
-
-void CWindow::ensureCurrentRemoteTransformJsonAsync()
-{
-    if (!_state) {
-        return;
-    }
-
-    auto currentVolume = _state->currentVolume();
-    if (!currentVolume || !currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
-        return;
-    }
-
-    const auto volumePath = currentVolume->path();
-    if (volumePath.empty()) {
-        return;
-    }
-
-    const auto localTransformPath = volumePath / "transform.json";
-    if (std::filesystem::exists(localTransformPath)) {
-        const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-        if (!remoteTransformUrl.empty()) {
-            _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
-        }
-        return;
-    }
-
-    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-    if (remoteTransformUrl.empty()) {
-        return;
-    }
-
-    auto& fetchState = _remoteTransformFetchStates[remoteTransformUrl];
-    if (fetchState == RemoteTransformFetchState::Available &&
-        !std::filesystem::exists(localTransformPath)) {
-        fetchState = RemoteTransformFetchState::Unknown;
-    }
-    if (fetchState != RemoteTransformFetchState::Unknown) {
-        return;
-    }
-
-    fetchState = RemoteTransformFetchState::Pending;
-    const auto auth = currentVolume->remoteAuth();
-    auto* watcher = new QFutureWatcher<bool>(this);
-    connect(watcher, &QFutureWatcher<bool>::finished, this,
-            [this, watcher, remoteTransformUrl, localTransformPath]() {
-                watcher->deleteLater();
-
-                bool downloaded = false;
-                try {
-                    downloaded = watcher->result();
-                } catch (const std::exception&) {
-                    downloaded = false;
-                }
-
-                _remoteTransformFetchStates[remoteTransformUrl] =
-                    (downloaded && std::filesystem::exists(localTransformPath))
-                        ? RemoteTransformFetchState::Available
-                        : RemoteTransformFetchState::Missing;
-
-                if (currentRemoteTransformJsonUrl() == remoteTransformUrl) {
-                    refreshTransformsPanelState();
-                }
-            });
-    watcher->setFuture(QtConcurrent::run(
-        [remoteTransformUrl, localTransformPath, auth]() {
-            return vc::cache::httpDownloadFile(remoteTransformUrl, localTransformPath, auth);
-        }));
-}
-
-bool CWindow::setCustomTransformSource(const QString& source, QString* errorMessage)
-{
-    const QString trimmed = source.trimmed();
-    if (trimmed.isEmpty()) {
-        _customTransformSource.clear();
-        _customTransformLocalPath.clear();
-        _customTransformTempDir.reset();
-        return true;
-    }
-
-    try {
-        std::filesystem::path resolvedPath;
-        if (isRemoteTransformSource(trimmed)) {
-            if (!_customTransformTempDir) {
-                _customTransformTempDir = std::make_unique<QTemporaryDir>();
-            }
-            if (!_customTransformTempDir || !_customTransformTempDir->isValid()) {
-                throw std::runtime_error("failed to create temporary directory for affine download");
-            }
-
-            const auto resolved = vc::resolveRemoteUrl(trimmed.toStdString());
-            const auto auth = authForRemoteTransformSource(trimmed);
-            const auto tempRoot = std::filesystem::path(_customTransformTempDir->path().toStdString());
-            resolvedPath = tempRoot / "custom_transform.json";
-            if (!vc::cache::httpDownloadFile(resolved.httpsUrl, resolvedPath, auth)) {
-                throw std::runtime_error("failed to download affine from the provided path");
-            }
-        } else {
-            resolvedPath = expandLocalTransformPath(trimmed);
-        }
-
-        loadAffineTransformMatrix(resolvedPath);
-        _customTransformSource = trimmed;
-        _customTransformLocalPath = std::move(resolvedPath);
-        return true;
-    } catch (const std::exception& ex) {
-        if (errorMessage) {
-            *errorMessage = QString::fromUtf8(ex.what());
-        }
-        return false;
-    }
-}
-
-std::filesystem::path CWindow::currentTransformJsonPath(bool allowRemoteFetch)
-{
-    if (!_customTransformSource.trimmed().isEmpty()) {
-        return _customTransformLocalPath;
-    }
-
-    if (const auto localTransformPath = localCurrentTransformJsonPath();
-        !localTransformPath.empty()) {
-        const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-        if (!remoteTransformUrl.empty()) {
-            _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
-        }
-        return localTransformPath;
-    }
-
-    if (!_state) {
-        return {};
-    }
-
-    auto currentVolume = _state->currentVolume();
-    if (!currentVolume) {
-        return {};
-    }
-
-    const auto volumePath = currentVolume->path();
-    if (volumePath.empty()) {
-        return {};
-    }
-
-    if (!currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
-        return {};
-    }
-
-    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-    const auto localTransformPath = volumePath / "transform.json";
-
-    if (!allowRemoteFetch) {
-        return {};
-    }
-
-    if (vc::cache::httpDownloadFile(remoteTransformUrl,
-                                    localTransformPath,
-                                    currentVolume->remoteAuth())) {
-        _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
-        return localTransformPath;
-    }
-
-    _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Missing;
-    return {};
-}
-
-void CWindow::clearTransformPreview(bool restoreDisplayedSurface)
-{
-    if (!_state) {
-        _transformPreviewSurface.reset();
-        _transformPreviewSourceSurface.reset();
-        return;
-    }
-
-    auto currentDisplayed = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-    const bool showingPreview = (_transformPreviewSurface && currentDisplayed == _transformPreviewSurface);
-
-    if (restoreDisplayedSurface && showingPreview) {
-        auto restoreSurface = currentTransformSourceSurface();
-        if (!restoreSurface) {
-            restoreSurface = _transformPreviewSourceSurface;
-        }
-        _state->setSurface("segmentation", restoreSurface, false, false);
-        if (_axisAlignedSliceController) {
-            _axisAlignedSliceController->applyOrientation(restoreSurface.get());
-        }
-    }
-
-    _transformPreviewSurface.reset();
-    _transformPreviewSourceSurface.reset();
-}
-
-bool CWindow::applyTransformPreview(bool allowRemoteFetch)
-{
-    if (!_state || (_segmentationModule && _segmentationModule->editingEnabled())) {
-        return false;
-    }
-
-    auto sourceSurface = currentTransformSourceSurface();
-    if (!sourceSurface) {
-        return false;
-    }
-
-    const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
-    const bool scaleOnly = _scaleOnlyTransformCheck && _scaleOnlyTransformCheck->isChecked();
-    std::optional<cv::Matx44d> matrix;
-    if (!scaleOnly) {
-        const auto transformPath = currentTransformJsonPath(allowRemoteFetch);
-        if (!transformPath.empty() && std::filesystem::exists(transformPath)) {
-            matrix = loadAffineTransformMatrix(transformPath);
-            if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
-                matrix = invertAffineTransformMatrix(*matrix);
-            }
-        } else if (scale == 1) {
-            return false;
-        }
-    } else if (scale == 1) {
-        return false;
-    }
-
-    auto previewSurface = cloneSurfaceForTransform(sourceSurface);
-    if (!previewSurface) {
-        return false;
-    }
-
-    previewSurface->path.clear();
-    previewSurface->id.clear();
-
-    transformSurfacePoints(previewSurface.get(), scale, matrix);
-    refreshTransformedSurfaceState(previewSurface.get());
-    if (_viewerManager) {
-        _viewerManager->refreshSurfacePatchIndex(previewSurface);
-    }
-
-    clearTransformPreview(false);
-    _transformPreviewSourceSurface = sourceSurface;
-    _transformPreviewSurface = previewSurface;
-    _state->setSurface("segmentation", previewSurface, false, false);
-    if (_axisAlignedSliceController) {
-        _axisAlignedSliceController->applyOrientation(previewSurface.get());
-    }
-    return true;
-}
-
-void CWindow::refreshTransformsPanelState()
-{
-    if (!_previewTransformCheck || !_scaleOnlyTransformCheck || !_invertTransformCheck || !_transformScaleSpin ||
-        !_loadAffineButton || !_saveTransformedButton || !_transformStatusLabel) {
-        return;
-    }
-
-    const bool editingEnabled = _segmentationModule && _segmentationModule->editingEnabled();
-    const auto sourceSurface = currentTransformSourceSurface();
-    const auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    const bool scaleOnly = _scaleOnlyTransformCheck->isChecked();
-    const auto transformPath = localCurrentTransformJsonPath();
-    const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
-    const int scale = _transformScaleSpin->value();
-    const bool hasScaleOnlyTransform = scale != 1;
-    const bool previewEnabled =
-        sourceSurface && !editingEnabled &&
-        (hasScaleOnlyTransform || (!scaleOnly && hasTransform));
-    const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
-    const bool hasCustomTransform = !_customTransformSource.trimmed().isEmpty();
-    const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-    RemoteTransformFetchState remoteFetchState = RemoteTransformFetchState::Unknown;
-    if (!scaleOnly && !hasCustomTransform && currentVolume && currentVolume->isRemote() &&
-        !remoteTransformUrl.empty()) {
-        if (hasTransform) {
-            _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
-        } else {
-            ensureCurrentRemoteTransformJsonAsync();
-            auto it = _remoteTransformFetchStates.find(remoteTransformUrl);
-            if (it != _remoteTransformFetchStates.end()) {
-                remoteFetchState = it->second;
-            }
-        }
-    }
-
-    const QString transformLocation = currentTransformSourceDescription();
-
-    QString statusText;
-    if (!_state || !_state->vpkg()) {
-        statusText = tr("Open a volume package to use transforms.");
-    } else if (!_state->currentVolume()) {
-        statusText = tr("Select a volume to load transform.json.");
-    } else if (!sourceSurface) {
-        statusText = tr("Select a segmentation to preview or save its transform.");
-    } else if (editingEnabled) {
-        statusText = tr("Transform preview is unavailable while segmentation editing is enabled.");
-    } else if (scaleOnly) {
-        if (hasScaleOnlyTransform) {
-            statusText = hasTransform
-                ? tr("Scaling points by %1 only. Affine from %2 is ignored.")
-                      .arg(scale)
-                      .arg(transformLocation)
-                : tr("Scaling points by %1 only. No affine will be applied.")
-                      .arg(scale);
-        } else {
-            statusText = hasTransform
-                ? tr("Scale only is enabled. Affine from %1 will be ignored until scale is greater than 1.")
-                      .arg(transformLocation)
-                : tr("Scale only is enabled. Increase scale above 1 to preview or save.");
-        }
-    } else if (!hasTransform && remoteFetchState == RemoteTransformFetchState::Pending) {
-        if (hasScaleOnlyTransform) {
-            statusText = tr("Scaling points by %1 while checking %2 for transform.json.")
-                .arg(scale)
-                .arg(transformLocation);
-        } else {
-            statusText = tr("Checking %1 for transform.json.")
-                .arg(transformLocation);
-        }
-    } else if (!hasTransform) {
-        if (hasScaleOnlyTransform) {
-            statusText = hasCustomTransform
-                ? tr("Scaling points by %1. No affine was loaded from %2.")
-                      .arg(scale)
-                      .arg(transformLocation)
-                : tr("Scaling points by %1. No affine transform was found at %2.")
-                      .arg(scale)
-                      .arg(transformLocation);
-        } else {
-            statusText = hasCustomTransform
-                ? tr("No affine was loaded from %1")
-                      .arg(transformLocation)
-                : tr("No transform.json found at %1")
-                      .arg(transformLocation);
-        }
-    } else {
-        statusText = hasCustomTransform
-            ? tr("Using custom affine %1%2 with scale %3")
-                  .arg(transformLocation,
-                       (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
-                  .arg(scale)
-            : tr("Using %1%2 with scale %3")
-                  .arg(transformLocation,
-                       (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
-                  .arg(scale);
-    }
-
-    if (!previewEnabled && _previewTransformCheck->isChecked()) {
-        const QSignalBlocker blocker(_previewTransformCheck);
-        _previewTransformCheck->setChecked(false);
-        clearTransformPreview(true);
-    } else if (previewEnabled && _previewTransformCheck->isChecked()) {
-        try {
-            if (!applyTransformPreview(false)) {
-                clearTransformPreview(true);
-            }
-        } catch (const std::exception& ex) {
-            clearTransformPreview(true);
-            const QSignalBlocker blocker(_previewTransformCheck);
-            _previewTransformCheck->setChecked(false);
-            statusText = tr("Failed to load transform.json: %1")
-                .arg(QString::fromUtf8(ex.what()));
-        }
-    } else if (!_previewTransformCheck->isChecked()) {
-        clearTransformPreview(true);
-    }
-
-    _previewTransformCheck->setEnabled(previewEnabled);
-    _scaleOnlyTransformCheck->setEnabled(sourceSurface && !editingEnabled);
-    _invertTransformCheck->setEnabled(!editingEnabled && hasTransform && !scaleOnly);
-    _transformScaleSpin->setEnabled(sourceSurface && !editingEnabled);
-    _loadAffineButton->setEnabled(!editingEnabled);
-    _saveTransformedButton->setEnabled(saveEnabled);
-    _transformStatusLabel->setText(statusText);
-}
-
-void CWindow::onPreviewTransformToggled(bool enabled)
-{
-    if (!_previewTransformCheck) {
-        return;
-    }
-
-    if (!enabled) {
-        clearTransformPreview(true);
-        refreshTransformsPanelState();
-        return;
-    }
-
-    try {
-        if (!applyTransformPreview()) {
-            throw std::runtime_error("transform preview is unavailable for the current selection");
-        }
-    } catch (const std::exception& ex) {
-        clearTransformPreview(true);
-        {
-            const QSignalBlocker blocker(_previewTransformCheck);
-            _previewTransformCheck->setChecked(false);
-        }
-        statusBar()->showMessage(tr("Failed to preview transform: %1")
-                                     .arg(QString::fromUtf8(ex.what())),
-                                 5000);
-    }
-
-    refreshTransformsPanelState();
-}
-
-void CWindow::onSaveTransformedRequested()
-{
-    if (!_state || !_state->vpkg()) {
-        return;
-    }
-
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        QMessageBox::warning(this, tr("Editing Active"),
-                             tr("Disable segmentation editing before saving a transformed surface."));
-        return;
-    }
-
-    auto sourceSurface = currentTransformSourceSurface();
-    if (!sourceSurface || sourceSurface->path.empty()) {
-        QMessageBox::warning(this, tr("No Segmentation"),
-                             tr("Select a segmentation with files on disk first."));
-        return;
-    }
-
-    const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
-    const bool scaleOnly = _scaleOnlyTransformCheck && _scaleOnlyTransformCheck->isChecked();
-    const auto transformPath = scaleOnly ? std::filesystem::path{} : currentTransformJsonPath();
-    const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
-    if (!hasTransform && scale == 1) {
-        QMessageBox::warning(this, tr("Missing Transform"),
-                             scaleOnly
-                                 ? tr("Scale only is enabled, and scale is set to 1.")
-                                 : (_customTransformSource.trimmed().isEmpty()
-                                        ? tr("No transform.json was found for the current volume, and scale is set to 1.")
-                                        : tr("The selected affine could not be loaded, and scale is set to 1.")));
-        return;
-    }
-
-    const QString defaultName = QString::fromStdString(sourceSurface->id.empty()
-        ? sourceSurface->path.filename().string() + "_transformed"
-        : sourceSurface->id + "_transformed");
-    bool ok = false;
-    QString newName = QInputDialog::getText(this,
-                                            tr("Save Transformed"),
-                                            tr("New surface name:"),
-                                            QLineEdit::Normal,
-                                            defaultName,
-                                            &ok).trimmed();
-    if (!ok || newName.isEmpty()) {
-        return;
-    }
-
-    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
-    if (!validNameRegex.match(newName).hasMatch()) {
-        QMessageBox::warning(this, tr("Invalid Name"),
-                             tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
-        return;
-    }
-
-    const std::string newId = newName.toStdString();
-    const std::filesystem::path sourcePath = sourceSurface->path;
-    const std::filesystem::path parentDir = sourcePath.parent_path();
-    const std::filesystem::path targetPath = parentDir / newId;
-    if (std::filesystem::exists(targetPath)) {
-        QMessageBox::warning(this, tr("Name Exists"),
-                             tr("A surface with the name '%1' already exists.").arg(newName));
-        return;
-    }
-
-    QTemporaryDir stagingRoot;
-    if (!stagingRoot.isValid()) {
-        QMessageBox::critical(this, tr("Temporary Directory Error"),
-                              tr("Failed to create a temporary staging directory."));
-        return;
-    }
-
-    try {
-        std::optional<cv::Matx44d> matrix;
-        if (hasTransform) {
-            matrix = loadAffineTransformMatrix(transformPath);
-            if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
-                matrix = invertAffineTransformMatrix(*matrix);
-            }
-        }
-        auto transformedSurface = cloneSurfaceForTransform(sourceSurface);
-        if (!transformedSurface) {
-            throw std::runtime_error("failed to clone source surface");
-        }
-
-        transformSurfacePoints(transformedSurface.get(), scale, matrix);
-        refreshTransformedSurfaceState(transformedSurface.get());
-
-        const std::filesystem::path stagingPath =
-            std::filesystem::path(stagingRoot.path().toStdString()) / newId;
-        transformedSurface->save(stagingPath.string(), newId, false);
-
-        std::filesystem::copy(sourcePath,
-                              targetPath,
-                              std::filesystem::copy_options::recursive);
-        std::filesystem::copy(stagingPath,
-                              targetPath,
-                              std::filesystem::copy_options::recursive |
-                                  std::filesystem::copy_options::overwrite_existing);
-    } catch (const std::exception& ex) {
-        std::error_code cleanupError;
-        std::filesystem::remove_all(targetPath, cleanupError);
-        QMessageBox::critical(this, tr("Save Failed"),
-                              tr("Failed to save transformed surface: %1")
-                                  .arg(QString::fromUtf8(ex.what())));
-        return;
-    }
-
-    if (_state->vpkg()->addSingleSegmentation(newId)) {
-        if (_surfacePanel) {
-            _surfacePanel->addSingleSegmentation(newId);
-        }
-    } else {
-        _state->vpkg()->refreshSegmentations();
-        if (_surfacePanel) {
-            _surfacePanel->reloadSurfacesFromDisk();
-        }
-    }
-
-    statusBar()->showMessage(tr("Saved transformed surface as '%1'.").arg(newName), 5000);
-    refreshTransformsPanelState();
-}
-
-void CWindow::onLoadAffineRequested()
-{
-    const QString promptText = tr("Enter a local path or URL for an affine JSON (http://, https://, s3://).\n"
-                                  "Leave blank to use the current volume transform.json.");
-    bool accepted = false;
-    const QString source = QInputDialog::getText(this,
-                                                 tr("Load Affine"),
-                                                 promptText,
-                                                 QLineEdit::Normal,
-                                                 _customTransformSource,
-                                                 &accepted).trimmed();
-    if (!accepted) {
-        return;
-    }
-
-    QString errorMessage;
-    if (!setCustomTransformSource(source, &errorMessage)) {
-        QMessageBox::warning(this,
-                             tr("Load Affine Failed"),
-                             tr("Failed to load affine from %1: %2")
-                                 .arg(source.isEmpty() ? tr("(empty path)") : source, errorMessage));
-        return;
-    }
-
-    if (source.isEmpty() && _previewTransformCheck && _previewTransformCheck->isChecked()) {
-        currentTransformJsonPath();
-    }
-
-    if (source.isEmpty()) {
-        statusBar()->showMessage(tr("Using the current volume transform.json."), 5000);
-    } else {
-        statusBar()->showMessage(tr("Loaded affine from %1").arg(source), 5000);
-    }
-
-    refreshTransformsPanelState();
 }
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
@@ -2192,8 +982,6 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
-
-    runStartupPrefetchForVolume(newvol);
 
     const bool growthVolumeValid = _state->hasVpkg() && !_state->segmentationGrowthVolumeId().empty() &&
                                    _state->vpkg()->hasVolume(_state->segmentationGrowthVolumeId());
@@ -2229,33 +1017,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
         _state->setPOI("focus", poi);
     }
 
-    onManualPlaneChanged();
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
-}
-
-void CWindow::runStartupPrefetchForVolume(const std::shared_ptr<Volume>& volume)
-{
-    if (_startupPrefetchLevel < 0 || !volume || !volume->isRemote()) {
-        return;
-    }
-
-    volume->setCacheBudget(_cacheSizeBytes);
-    {
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        volume->setDiskCacheCompressed(
-            settings.value(perf::DISK_CACHE_COMPRESSED,
-                           perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
-    }
-    const int numLevels = static_cast<int>(volume->numScales());
-    if (_startupPrefetchLevel >= numLevels) {
-        prefetchRemoteLevelWithDialog(this, volume, _startupPrefetchLevel);
-        return;
-    }
-
-    for (int level = _startupPrefetchLevel; level < numLevels; ++level) {
-        prefetchRemoteLevelWithDialog(this, volume, level);
-    }
 }
 
 bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
@@ -2269,8 +1031,6 @@ bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume
         return false;
     }
 
-    runStartupPrefetchForVolume(volume);
-
     const bool needSurfaceLoad = _surfacePanel && !_surfacePanel->hasSurfaces();
     refreshCurrentVolumePackageUi(preferredVolumeId.isEmpty()
                                       ? QString::fromStdString(volume->id())
@@ -2278,87 +1038,6 @@ bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume
                                   needSurfaceLoad);
     UpdateView();
     return true;
-}
-
-void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces)
-{
-    if (surfaces.empty()) return;
-
-    if (_surfacePanel) {
-        _surfacePanel->loadRemoteSurfaces(surfaces);
-    }
-
-    // Set the first surface as the active segmentation
-    if (_state) {
-        const auto& [firstId, firstSurf] = surfaces.front();
-        _state->setSurface("segmentation", firstSurf);
-        _state->setActiveSurface(firstId, std::dynamic_pointer_cast<QuadSurface>(firstSurf));
-        _state->emitSurfacesChanged();
-    }
-
-    emit _state->surfacesLoaded();
-    refreshTransformsPanelState();
-}
-
-void CWindow::setRemoteStubs(
-    const std::vector<std::string>& segmentIds,
-    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces)
-{
-    if (_surfacePanel) {
-        _surfacePanel->loadRemoteStubs(segmentIds, cachedSurfaces);
-    }
-
-    // Activate the first cached surface if available
-    if (_state && !cachedSurfaces.empty()) {
-        const auto& [firstId, firstSurf] = cachedSurfaces.front();
-        _state->setSurface("segmentation", firstSurf);
-        _state->setActiveSurface(firstId, std::dynamic_pointer_cast<QuadSurface>(firstSurf));
-        _state->emitSurfacesChanged();
-    }
-
-    emit _state->surfacesLoaded();
-    refreshTransformsPanelState();
-}
-
-void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
-{
-    const std::string segId = segmentId.toStdString();
-    if (!_state || !_state->vpkg()) return;
-    auto vpkg = _state->vpkg();
-
-    if (statusBar()) {
-        statusBar()->showMessage(tr("Downloading segment %1...").arg(segmentId));
-    }
-
-    auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
-    connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished, this,
-        [this, watcher, segId]() {
-            watcher->deleteLater();
-            std::shared_ptr<QuadSurface> surf;
-            try { surf = watcher->result(); }
-            catch (const std::exception& e) {
-                std::fprintf(stderr, "[Remote] Download failed for %s: %s\n", segId.c_str(), e.what());
-            }
-            if (surf) {
-                if (statusBar()) {
-                    statusBar()->showMessage(
-                        tr("Downloaded segment %1").arg(QString::fromStdString(segId)), 3000);
-                }
-                if (_surfacePanel) _surfacePanel->replaceStubWithSurface(segId, surf);
-            } else {
-                if (statusBar()) {
-                    statusBar()->showMessage(
-                        tr("Failed to download segment %1").arg(QString::fromStdString(segId)), 5000);
-                }
-                if (_surfacePanel) _surfacePanel->replaceStubWithSurface(segId, nullptr);
-            }
-        });
-
-    auto future = QtConcurrent::run([vpkg, segId]() -> std::shared_ptr<QuadSurface> {
-        if (!vpkg->ensureRemoteSegmentDownloaded(segId)) return nullptr;
-        return vpkg->loadSurface(segId);
-    });
-    watcher->setFuture(future);
 }
 
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
@@ -2409,7 +1088,9 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
         }
     }
 
-    refreshTransformsPanelState();
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -2520,14 +1201,14 @@ void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
         return;
     }
 
-    _viewerManager->forEachViewer([&position](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
 
         const std::string name = viewer->surfName();
         if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
-            viewer->centerOnVolumePoint(position, true);
+            centerViewerOnVolumePointForNavigation(viewer, position);
         }
     });
 }
@@ -2558,10 +1239,14 @@ void CWindow::recenterSegmentationViewerNear(const cv::Vec3f& position)
         return;
     }
 
-    auto hit = patchIndex->locate(position, kMaxDistanceVoxels, activeSurface);
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = position;
+    query.tolerance = kMaxDistanceVoxels;
+    query.surfaces.only = activeSurface;
+    auto hit = patchIndex->locate(query);
     if (hit && hit->distance <= kMaxDistanceVoxels) {
         const cv::Vec3f loc = activeSurface->loc(hit->ptr);
-        viewer->centerOnSurfacePoint({loc[0], loc[1]}, true);
+        centerViewerOnSurfacePointForNavigation(viewer, {loc[0], loc[1]});
     }
 }
 
@@ -2577,9 +1262,9 @@ bool CWindow::recenterViewersOnCurrentFocus()
     }
 
     const cv::Vec3f position = focus->p;
-    _viewerManager->forEachViewer([&position](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
         if (viewer) {
-            viewer->centerOnVolumePoint(position, true);
+            centerViewerOnVolumePointForNavigation(viewer, position);
         }
     });
 
@@ -2593,12 +1278,18 @@ bool CWindow::centerFocusOnCursor()
     }
 
     const QPoint globalPos = QCursor::pos();
-    auto tryCenterFromViewer = [&](CTiledVolumeViewer* viewer) -> bool {
-        if (!viewer || !viewer->isVisible()) {
+    auto tryCenterFromViewer = [&](VolumeViewerBase* viewer) -> bool {
+        if (!viewer) {
             return false;
         }
 
-        auto* gv = viewer->fGraphicsView;
+        auto* viewerObject = viewer->asQObject();
+        auto* viewerWidget = qobject_cast<QWidget*>(viewerObject);
+        if (viewerWidget && !viewerWidget->isVisible()) {
+            return false;
+        }
+
+        auto* gv = viewer->graphicsView();
         auto* viewport = gv ? gv->viewport() : nullptr;
         if (!viewport) {
             return false;
@@ -2609,10 +1300,11 @@ bool CWindow::centerFocusOnCursor()
             return false;
         }
 
-        cv::Vec3f p, n;
         const QPointF scenePos = gv->mapToScene(viewportPos);
-        if (!viewer->sceneToVolumePN(p, n, scenePos)) {
-            return false;
+        cv::Vec3f p = viewer->sceneToVolume(scenePos);
+        cv::Vec3f n(0, 0, 1);
+        if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+            n = plane->normal(cv::Vec3f(0, 0, 0), {});
         }
 
         return centerFocusAt(p, n, viewer->surfName());
@@ -2623,7 +1315,7 @@ bool CWindow::centerFocusOnCursor()
     // makes the focus jump use the wrong scene transform.
     if (QWidget* hoveredWidget = QApplication::widgetAt(globalPos)) {
         for (QWidget* widget = hoveredWidget; widget; widget = widget->parentWidget()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(widget)) {
+            if (auto* viewer = baseViewerFromWidget(widget)) {
                 if (tryCenterFromViewer(viewer)) {
                     return true;
                 }
@@ -2633,7 +1325,7 @@ bool CWindow::centerFocusOnCursor()
     }
 
     if (_viewerManager) {
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             if (tryCenterFromViewer(viewer)) {
                 return true;
             }
@@ -2643,7 +1335,7 @@ bool CWindow::centerFocusOnCursor()
     // Fall back to the active viewer if the cursor isn't currently over any
     // tiled viewport.
     if (auto* subWindow = mdiArea->activeSubWindow()) {
-        if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
+        if (auto* viewer = baseViewerFromWidget(subWindow->widget())) {
             if (tryCenterFromViewer(viewer)) {
                 return true;
             }
@@ -2695,8 +1387,10 @@ void CWindow::CreateWidgets(void)
     // Ensure the viewer's graphics view gets focus when subwindow is activated
     connect(mdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
         if (subWindow) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->fGraphicsView->setFocus();
+            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
+                if (auto* graphicsView = viewer->graphicsView()) {
+                    graphicsView->setFocus();
+                }
             }
         }
     });
@@ -2731,7 +1425,9 @@ void CWindow::CreateWidgets(void)
         emit _state->surfacesLoaded();
         // Update surface overlay dropdown when surfaces are loaded
         updateSurfaceOverlayDropdown();
-        refreshTransformsPanelState();
+        if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
     });
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceSelectionCleared, this, [this]() {
         clearSurfaceSelection();
@@ -2759,10 +1455,6 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::growSegmentRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onGrowSegmentFromSegment(segmentId.toStdString());
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::addOverlapRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onAddOverlap(segmentId.toStdString());
             });
     connect(_surfacePanel.get(), &SurfacePanelController::neighborCopyRequested,
             this, [this](const QString& segmentId, bool copyOut) {
@@ -2838,10 +1530,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onABFFlatten(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::awsUploadRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onAWSUpload(segmentId.toStdString());
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::exportTifxyzChunksRequested,
         this, [this](const QString& segmentId) {
             _segmentationCommandHandler->onExportWidthChunks(segmentId.toStdString());
@@ -2854,23 +1542,6 @@ void CWindow::CreateWidgets(void)
         this, [this]() {
             _segmentationCommandHandler->onAddIgnoreLabel();
         });
-    connect(_surfacePanel.get(), &SurfacePanelController::fetchRemoteChunksRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onFetchRemoteChunks(segmentId.toStdString());
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::remoteSegmentDownloadRequested,
-            this, &CWindow::downloadRemoteSegmentOnDemand);
-
-    connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
-            this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
-                _segmentationCommandHandler->onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::teleaInpaintRequested,
-            this, [this]() {
-                if (_menuController) {
-                    _menuController->triggerTeleaInpaint();
-                }
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::recalcAreaRequested,
             this, [this](const QStringList& segmentIds) {
                 if (segmentIds.isEmpty()) return;
@@ -2912,10 +1583,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& message, int timeoutMs) {
                 statusBar()->showMessage(message, timeoutMs);
             });
-
-    // i recognize that having both a seeding widget and a drawing widget that both handle mouse events and paths is redundant,
-    // but i can't find an easy way yet to merge them and maintain the path iteration that the seeding widget currently uses
-    // so for now we have both. i suppose i could probably add a 'mode' , but for now i will just hate this section :(
 
     const auto attachScrollAreaToDock = [](QDockWidget* dock, QWidget* content, const QString& objectName) {
         if (!dock || !content) {
@@ -2971,6 +1638,8 @@ void CWindow::CreateWidgets(void)
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
     _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
+    _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
+    _surfaceRotationOverlay->setViewerManager(_viewerManager.get());
 
     _segmentationModule = std::make_unique<SegmentationModule>(
         _segmentationWidget,
@@ -2985,7 +1654,7 @@ void CWindow::CreateWidgets(void)
     if (_segmentationModule && _planeSlicingOverlay) {
         QPointer<PlaneSlicingOverlayController> overlayPtr(_planeSlicingOverlay.get());
         _segmentationModule->setRotationHandleHitTester(
-            [overlayPtr](CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos) {
+            [overlayPtr](VolumeViewerBase* viewer, const cv::Vec3f& worldPos) {
                 if (!overlayPtr) {
                     return false;
                 }
@@ -3119,326 +1788,9 @@ void CWindow::CreateWidgets(void)
     });
 
     connect(_segmentationWidget, &SegmentationWidget::lasagnaOptimizeRequested, this, [this]() {
-        auto& mgr = LasagnaServiceManager::instance();
-        const bool isNewModel = (_segmentationWidget->lasagnaMode() == 1);
-
-        // Ensure service is running (external or internal)
-        if (mgr.isExternal()) {
-            if (!mgr.isRunning()) {
-                auto msg = tr("External service not connected. Select a service or check host/port.");
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                statusBar()->showMessage(msg, 5000);
-                return;
-            }
-        } else {
-            if (!mgr.ensureServiceRunning()) {
-                auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                statusBar()->showMessage(msg, 5000);
-                return;
-            }
+        if (auto* panel = _segmentationWidget->lasagnaPanel()) {
+            panel->startOptimization(_state, statusBar());
         }
-
-        // Get the active segment path
-        std::filesystem::path segPath;
-        auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
-            _state->surface("segmentation"));
-        if (activeSurface && !activeSurface->path.empty()) {
-            segPath = activeSurface->path;
-        }
-
-        bool isOffsetMode = (_segmentationWidget->lasagnaMode() == SegmentationLasagnaPanel::LasagnaMode::Offset);
-
-        // Model path — required for re-optimize/expand, not for new/offset
-        QString modelPath;
-        if (!isNewModel && !isOffsetMode) {
-            if (!segPath.empty()) {
-                auto modelFile = segPath / "model.pt";
-                if (std::filesystem::exists(modelFile)) {
-                    try {
-                        modelPath = QString::fromStdString(
-                            std::filesystem::canonical(modelFile).string());
-                    } catch (const std::filesystem::filesystem_error&) {}
-                }
-            }
-            if (modelPath.isEmpty()) {
-                auto msg = tr("No model.pt found in segment directory. Cannot run lasagna.");
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                statusBar()->showMessage(msg, 5000);
-                return;
-            }
-        }
-
-        // Data input path (zarr)
-        QString dataInput = _segmentationWidget->lasagnaDataInputPath();
-        if (dataInput.isEmpty()) {
-            auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            statusBar()->showMessage(msg, 5000);
-            return;
-        }
-
-        // Output dir: for re-optimize use the segment's parent directory;
-        // for new model use the volpkg's segmentation directory
-        QString outputDir;
-        if (!segPath.empty()) {
-            outputDir = QString::fromStdString(segPath.parent_path().string());
-        } else if (_state->vpkg()) {
-            auto vpkgRoot = std::filesystem::path(_state->vpkg()->getVolpkgDirectory());
-            auto segDir = vpkgRoot / _state->vpkg()->getSegmentationDirectory();
-            outputDir = QString::fromStdString(segDir.string());
-        }
-
-        // --- Compute next version name ---
-        const std::string tifxyzSuffix = ".tifxyz";
-        std::string rootName = "new_model";  // Default fallback
-        QString outputName;
-        {
-            if (isNewModel) {
-                // New model: use the output name field, fall back to "new_model"
-                QString nmName = _segmentationWidget->newModelOutputName();
-                if (!nmName.isEmpty()) {
-                    rootName = nmName.toStdString();
-                }
-            } else if (!segPath.empty()) {
-                // Re-optimize: derive from existing segment name
-                auto segName = segPath.filename().string();
-                std::string baseName = segName;
-                if (baseName.size() > tifxyzSuffix.size() &&
-                    baseName.compare(baseName.size() - tifxyzSuffix.size(),
-                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                    baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
-                }
-                rootName = baseName;
-                // Strip _vNNN version suffix
-                if (rootName.size() > 5) {
-                    auto pos = rootName.rfind("_v");
-                    if (pos != std::string::npos && pos + 2 < rootName.size()) {
-                        bool allDigits = true;
-                        for (size_t i = pos + 2; i < rootName.size(); ++i) {
-                            if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
-                                allDigits = false;
-                                break;
-                            }
-                        }
-                        if (allDigits) rootName = rootName.substr(0, pos);
-                    }
-                }
-                // Strip _offN_wN window suffix
-                {
-                    auto pos = rootName.find("_off");
-                    if (pos != std::string::npos)
-                        rootName = rootName.substr(0, pos);
-                }
-            }
-
-            // Scan for highest existing version in the output directory
-            int maxVersion = 0;
-            if (!outputDir.isEmpty()) {
-                std::error_code ec;
-                for (auto& entry : std::filesystem::directory_iterator(
-                         outputDir.toStdString(), ec)) {
-                    auto name = entry.path().filename().string();
-                    std::string prefix = rootName + "_v";
-                    if (name.size() > prefix.size() + tifxyzSuffix.size() &&
-                        name.compare(0, prefix.size(), prefix) == 0 &&
-                        name.compare(name.size() - tifxyzSuffix.size(),
-                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                        auto numStr = name.substr(prefix.size(),
-                            name.size() - prefix.size() - tifxyzSuffix.size());
-                        bool allDigits = true;
-                        for (auto c : numStr) {
-                            if (!std::isdigit(static_cast<unsigned char>(c)))
-                                allDigits = false;
-                        }
-                        if (allDigits && !numStr.empty()) {
-                            int v = std::stoi(numStr);
-                            if (v > maxVersion) maxVersion = v;
-                        }
-                    }
-                }
-            }
-            char numBuf[16];
-            std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
-            outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
-        }
-
-        // Parse config JSON from the editor
-        QJsonObject config;
-        QString configText = _segmentationWidget->lasagnaConfigText().trimmed();
-        if (!configText.isEmpty()) {
-            QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
-            if (doc.isObject()) {
-                config = doc.object();
-            }
-        }
-
-        // --- New Model: inject crop, init_size_frac, z_size, grow into config ---
-        if (isNewModel) {
-            int nmW = _segmentationWidget->newModelWidth();
-            int nmH = _segmentationWidget->newModelHeight();
-            int nmN = _segmentationWidget->newModelWindings();
-
-            // Get bbox center: use seed point if specified, otherwise focus
-            int cx, cy, cz;
-            QString seedText = _segmentationWidget->seedPointText();
-            bool seedOk = false;
-            if (!seedText.isEmpty()) {
-                QStringList parts = seedText.split(',');
-                if (parts.size() == 3) {
-                    bool ok0, ok1, ok2;
-                    cx = parts[0].trimmed().toInt(&ok0);
-                    cy = parts[1].trimmed().toInt(&ok1);
-                    cz = parts[2].trimmed().toInt(&ok2);
-                    seedOk = ok0 && ok1 && ok2;
-                }
-            }
-            if (!seedOk) {
-                POI* focus = _state ? _state->poi("focus") : nullptr;
-                if (!focus) {
-                    auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
-                    std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                    statusBar()->showMessage(msg, 5000);
-                    return;
-                }
-                cx = static_cast<int>(focus->p[0]);
-                cy = static_cast<int>(focus->p[1]);
-                cz = static_cast<int>(focus->p[2]);
-            }
-
-            // Build/override the "args" section with seed, model-w, model-h, windings
-            QJsonObject args = config[QStringLiteral("args")].toObject();
-            args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
-            args[QStringLiteral("model-w")] = nmW;
-            args[QStringLiteral("model-h")] = nmH;
-            args[QStringLiteral("windings")] = nmN;
-            config[QStringLiteral("args")] = args;
-
-            std::cerr << "[lasagna] new model: seed=(" << cx << "," << cy
-                      << "," << cz << ") w=" << nmW << " h=" << nmH
-                      << " windings=" << nmN << std::endl;
-        }
-
-        // --- Offset mode: inject windings=1, offset_value, and window params ---
-        if (isOffsetMode && !segPath.empty()) {
-            double offsetVal = _segmentationWidget->offsetValue();
-            int windowSize = _segmentationWidget->windowSize();
-            int windowOverlap = _segmentationWidget->windowOverlap();
-
-            QJsonObject args = config[QStringLiteral("args")].toObject();
-            args[QStringLiteral("windings")] = 1;
-            if (windowSize > 0) {
-                args[QStringLiteral("window-size")] = windowSize;
-                args[QStringLiteral("window-overlap")] = windowOverlap;
-            }
-            config[QStringLiteral("args")] = args;
-            config[QStringLiteral("offset_value")] = offsetVal;
-
-            // Windowed offset: override outputName with collision-free base
-            if (windowSize > 0 && !outputDir.isEmpty()) {
-                int offIdx = 1;
-                std::error_code ec2;
-                for (bool collision = true; collision; ++offIdx) {
-                    collision = false;
-                    std::string offPrefix = rootName + "_off" + std::to_string(offIdx) + "_w";
-                    for (auto& entry : std::filesystem::directory_iterator(
-                             outputDir.toStdString(), ec2)) {
-                        auto name = entry.path().filename().string();
-                        if (name.size() > offPrefix.size() + tifxyzSuffix.size() &&
-                            name.compare(0, offPrefix.size(), offPrefix) == 0 &&
-                            name.compare(name.size() - tifxyzSuffix.size(),
-                                         tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                            collision = true;
-                            break;
-                        }
-                    }
-                }
-                // offIdx is one past the collision-free value
-                outputName = QString::fromStdString(
-                    rootName + "_off" + std::to_string(offIdx - 1));
-            }
-
-            std::cerr << "[lasagna] offset mode: offset=" << offsetVal
-                      << " window_size=" << windowSize
-                      << " window_overlap=" << windowOverlap
-                      << " outputName=" << outputName.toStdString() << std::endl;
-        }
-
-        // Inject loaded point collections as corr_points
-        if (_state->pointCollection()) {
-            const auto& cols = _state->pointCollection()->getAllCollections();
-            if (!cols.empty()) {
-                utils::Json corr_json;
-                utils::Json cols_json = utils::Json::object();
-                for (const auto& [cid, col] : cols) {
-                    utils::Json col_json;
-                    to_json(col_json, col);
-                    cols_json[std::to_string(cid)] = col_json;
-                }
-                corr_json["collections"] = cols_json;
-                QJsonDocument corrDoc = QJsonDocument::fromJson(
-                    QByteArray::fromStdString(corr_json.dump()));
-                if (corrDoc.isObject()) {
-                    config[QStringLiteral("corr_points")] = corrDoc.object();
-                    std::cerr << "[lasagna] injected " << cols.size()
-                              << " point collection(s) as corr_points" << std::endl;
-                }
-            }
-        }
-
-        // Inject voxel_size_um from the current volume
-        if (_state->currentVolume()) {
-            try {
-                double vs = _state->currentVolume()->voxelSize();
-                if (std::isfinite(vs) && vs > 0.0) {
-                    config[QStringLiteral("voxel_size_um")] = vs;
-                }
-            } catch (...) {}
-        }
-
-        // Build optimization request
-        QJsonObject request;
-        request[QStringLiteral("data_input")] = dataInput;
-        request[QStringLiteral("single_segment")] = true;
-        request[QStringLiteral("copy_model")] = true;
-        if (!outputName.isEmpty()) {
-            request[QStringLiteral("output_name")] = outputName;
-        }
-        request[QStringLiteral("config")] = config;
-
-        if (isOffsetMode && !segPath.empty()) {
-            // Offset mode: send tifxyz files as base64
-            QJsonObject tifxyzData;
-            for (const auto* fname : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
-                auto filePath = segPath / fname;
-                if (!std::filesystem::exists(filePath)) continue;
-                QFile f(QString::fromStdString(filePath.string()));
-                if (f.open(QIODevice::ReadOnly)) {
-                    tifxyzData[QString::fromLatin1(fname)] =
-                        QString::fromLatin1(f.readAll().toBase64());
-                }
-            }
-            request[QStringLiteral("tifxyz_data")] = tifxyzData;
-        } else if (!isNewModel) {
-            // Re-optimize / Expand: send model.pt as base64 data
-            QFile modelFile(modelPath);
-            if (!modelFile.open(QIODevice::ReadOnly)) {
-                auto msg = tr("Cannot read model file: %1").arg(modelPath);
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                statusBar()->showMessage(msg, 5000);
-                return;
-            }
-            QByteArray modelBytes = modelFile.readAll();
-            modelFile.close();
-            request[QStringLiteral("model_data")] =
-                QString::fromLatin1(modelBytes.toBase64());
-        }
-
-        mgr.startOptimization(request, outputDir);
-        statusBar()->showMessage(
-            tr("Lasagna optimization started (%1). Output: %2")
-                .arg(isNewModel ? tr("new model") : tr("re-optimize"))
-                .arg(outputName), 3000);
     });
 
     connect(_segmentationWidget, &SegmentationWidget::lasagnaStopRequested, this, [this]() {
@@ -3457,18 +1809,6 @@ void CWindow::CreateWidgets(void)
         // corr_points_results will be loaded when the new segment is activated
     });
 
-    // Create Drawing widget
-    _drawingWidget = new DrawingWidget();
-    _drawingWidget->setState(_state);
-    attachScrollAreaToDock(ui.dockWidgetDrawing, _drawingWidget, QStringLiteral("dockWidgetDrawingContent"));
-
-    connect(_state, &CState::volumeChanged, _drawingWidget,
-            static_cast<void (DrawingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&DrawingWidget::onVolumeChanged));
-    connect(_drawingWidget, &DrawingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
-    connect(_state, &CState::surfacesLoaded, _drawingWidget, &DrawingWidget::onSurfacesLoaded);
-
-    // Cache is now obtained from volume->tieredCache()
-
     // Create Seeding widget
     _seedingWidget = new SeedingWidget(_state->pointCollection(), _state);
     attachScrollAreaToDock(ui.dockWidgetDistanceTransform, _seedingWidget, QStringLiteral("dockWidgetDistanceTransformContent"));
@@ -3477,11 +1817,13 @@ void CWindow::CreateWidgets(void)
     connect(_state, &CState::volumeChanged, _seedingWidget,
             static_cast<void (SeedingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&SeedingWidget::onVolumeChanged));
     connect(_state, &CState::volumeChanged, this,
-            [this](std::shared_ptr<Volume>, const std::string&) { refreshTransformsPanelState(); });
+            [this](std::shared_ptr<Volume>, const std::string&) {
+                if (_surfaceAffineTransforms) {
+                    _surfaceAffineTransforms->refresh();
+                }
+            });
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(_state, &CState::surfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
-
-    // Cache is now obtained from volume->tieredCache()
 
     // Create and add the point collection widget
     _point_collection_widget = new CPointCollectionWidget(_state->pointCollection(), this);
@@ -3490,14 +1832,19 @@ void CWindow::CreateWidgets(void)
 
     // Selection dock (removed per request; selection actions remain in the menu)
     if (_viewerManager) {
-        _viewerManager->forEachViewer([this](CTiledVolumeViewer* viewer) {
-            configureViewerConnections(viewer);
-        });
+        for (auto* viewer : _viewerManager->baseViewers()) {
+            if (viewer) {
+                if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+                    configureChunkedViewerConnections(chunkedViewer);
+                }
+            }
+        }
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, and Point Collections together
     // Wire annotate mode & annotation selection: dock widget <-> segmentation module
     // (must be after _point_collection_widget creation)
     connect(_point_collection_widget, &CPointCollectionWidget::annotateToggled,
@@ -3537,280 +1884,157 @@ void CWindow::CreateWidgets(void)
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
 
-    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, Fibers, and Drawing together
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
-    tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
 
     // Make Segmentation dock the active tab by default
     ui.dockWidgetSegmentation->raise();
 
-    // Build Viewer Controls dock from the existing view-related panels.
-    auto* viewerControlsLayout = qobject_cast<QVBoxLayout*>(ui.dockWidgetViewerControlsContents->layout());
-    if (!viewerControlsLayout) {
-        viewerControlsLayout = new QVBoxLayout(ui.dockWidgetViewerControlsContents);
-        viewerControlsLayout->setContentsMargins(4, 4, 4, 4);
-        viewerControlsLayout->setSpacing(8);
+    ViewerControlsPanel::UiRefs viewerControlsUi{
+        .contents = ui.dockWidgetViewerControlsContents,
+        .viewScrollArea = ui.scrollAreaView,
+        .viewContents = ui.dockWidgetViewContents,
+        .overlayScrollArea = ui.scrollAreaOverlay,
+        .overlayContents = ui.dockWidgetOverlayContents,
+        .compositeScrollArea = ui.scrollAreaComposite,
+        .compositeContents = ui.dockWidgetCompositeContents,
+        .compositeEnabled = ui.chkCompositeEnabled,
+        .compositeMode = ui.cmbCompositeMode,
+        .layersInFront = ui.spinLayersInFront,
+        .layersBehind = ui.spinLayersBehind,
+        .alphaMinLabel = ui.lblAlphaMin,
+        .alphaMin = ui.spinAlphaMin,
+        .alphaMaxLabel = ui.lblAlphaMax,
+        .alphaMax = ui.spinAlphaMax,
+        .alphaThresholdLabel = ui.lblAlphaThreshold,
+        .alphaThreshold = ui.spinAlphaThreshold,
+        .materialLabel = ui.lblMaterial,
+        .material = ui.spinMaterial,
+        .reverseDirection = ui.chkReverseDirection,
+        .methodScaleLabel = ui.lblMethodScale,
+        .methodScale = ui.sliderMethodScale,
+        .methodScaleValue = ui.lblMethodScaleValue,
+        .methodParamLabel = ui.lblMethodParam,
+        .methodParam = ui.sliderMethodParam,
+        .methodParamValue = ui.lblMethodParamValue,
+        .blExtinctionLabel = ui.lblBLExtinction,
+        .blExtinction = ui.spinBLExtinction,
+        .blEmissionLabel = ui.lblBLEmission,
+        .blEmission = ui.spinBLEmission,
+        .blAmbientLabel = ui.lblBLAmbient,
+        .blAmbient = ui.spinBLAmbient,
+        .lightingEnabled = ui.chkLightingEnabled,
+        .lightAzimuthLabel = ui.lblLightAzimuth,
+        .lightAzimuth = ui.spinLightAzimuth,
+        .lightElevationLabel = ui.lblLightElevation,
+        .lightElevation = ui.spinLightElevation,
+        .lightDiffuseLabel = ui.lblLightDiffuse,
+        .lightDiffuse = ui.spinLightDiffuse,
+        .lightAmbientLabel = ui.lblLightAmbient,
+        .lightAmbient = ui.spinLightAmbient,
+        .useVolumeGradients = ui.chkUseVolumeGradients,
+        .shadowStepsLabel = ui.lblShadowSteps,
+        .shadowSteps = ui.spinShadowSteps,
+        .rakingEnabled = ui.chkRakingEnabled,
+        .rakingAzimuthLabel = ui.lblRakingAzimuth,
+        .rakingAzimuth = ui.spinRakingAzimuth,
+        .rakingElevationLabel = ui.lblRakingElevation,
+        .rakingElevation = ui.spinRakingElevation,
+        .rakingStrengthLabel = ui.lblRakingStrength,
+        .rakingStrength = ui.spinRakingStrength,
+        .rakingDepthLabel = ui.lblRakingDepth,
+        .rakingDepthScale = ui.spinRakingDepthScale,
+        .preNormalizeLayers = ui.chkPreNormalizeLayers,
+        .preHistEqLayers = ui.chkPreHistEqLayers,
+        .preTfEnabled = ui.chkPreTfEnabled,
+        .preTfX1 = ui.spinPreTfX1,
+        .preTfY1 = ui.spinPreTfY1,
+        .preTfKnot2Label = ui.lblPreTfKnot2,
+        .preTfX2 = ui.spinPreTfX2,
+        .preTfY2 = ui.spinPreTfY2,
+        .postTfEnabled = ui.chkPostTfEnabled,
+        .postTfX1 = ui.spinPostTfX1,
+        .postTfY1 = ui.spinPostTfY1,
+        .postTfKnot2Label = ui.lblPostTfKnot2,
+        .postTfX2 = ui.spinPostTfX2,
+        .postTfY2 = ui.spinPostTfY2,
+        .dvrAmbientLabel = ui.lblDvrAmbient,
+        .dvrAmbient = ui.spinDvrAmbient,
+        .pbrRoughnessLabel = ui.lblPbrRoughness,
+        .pbrRoughness = ui.spinPbrRoughness,
+        .pbrMetallicLabel = ui.lblPbrMetallic,
+        .pbrMetallic = ui.spinPbrMetallic,
+        .planeCompositeXY = ui.chkPlaneCompositeXY,
+        .planeCompositeXZ = ui.chkPlaneCompositeXZ,
+        .planeCompositeYZ = ui.chkPlaneCompositeYZ,
+        .planeLayersFront = ui.spinPlaneLayersFront,
+        .planeLayersBehind = ui.spinPlaneLayersBehind,
+        .renderSettingsScrollArea = ui.scrollAreaRenderSettings,
+        .renderSettingsContents = ui.dockWidgetRenderSettingsContents,
+        .normalVisualizationContents = ui.dockWidgetNormalVisContents,
+        .showSurfaceNormals = ui.chkShowSurfaceNormals,
+        .normalArrowLengthLabel = ui.labelNormalArrowLength,
+        .normalArrowLengthSlider = ui.sliderNormalArrowLength,
+        .normalArrowLengthValueLabel = ui.labelNormalArrowLengthValue,
+        .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
+        .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
+        .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
+        .preprocessingScrollArea = ui.scrollAreaPreprocessing,
+        .preprocessingContents = ui.dockWidgetPreprocessingContents,
+        .isoCutoff = ui.sliderIsoCutoff,
+        .isoCutoffValue = ui.lblIsoCutoffValue,
+        .postprocessingScrollArea = ui.scrollAreaPostprocessing,
+        .postprocessingContents = ui.dockWidgetPostprocessingContents,
+        .baseColormap = ui.baseColormapSelect,
+        .stretchValuesPost = ui.chkStretchValuesPost,
+        .removeSmallComponents = ui.chkRemoveSmallComponents,
+        .minComponentSizeLabel = ui.lblMinComponentSize,
+        .minComponentSize = ui.spinMinComponentSize,
+        .claheEnabled = ui.chkClaheEnabled,
+        .claheClipLimitLabel = ui.lblClaheClipLimit,
+        .claheClipLimit = ui.spinClaheClipLimit,
+        .claheTileSizeLabel = ui.lblClaheTileSize,
+        .claheTileSize = ui.spinClaheTileSize,
+        .zoomInButton = ui.btnZoomIn,
+        .zoomOutButton = ui.btnZoomOut,
+        .sliceStepSizeSpin = ui.spinSliceStepSize,
+        .volumeWindowContainer = ui.volumeWindowContainer,
+        .overlayWindowContainer = ui.overlayWindowContainer,
+        .intersectionOpacitySpin = ui.spinIntersectionOpacity,
+        .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
+    };
+    _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
+                                                                 _viewerManager.get(),
+                                                                 ui.dockWidgetViewerControlsContents);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomInRequested,
+            this, &CWindow::onZoomIn);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
+            this, &CWindow::onZoomOut);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::sliceStepSizeChanged,
+            this, &CWindow::onSliceStepSizeChanged);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::statusMessageRequested,
+            this, &CWindow::onShowStatusMessage);
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setViewControlsEnabled(!ui.grpVolManager || ui.grpVolManager->isEnabled());
     }
 
-    auto detachScrollContents = [](QScrollArea* scrollArea, QWidget* contents) -> QWidget* {
-        if (!contents) {
-            return nullptr;
-        }
-        if (scrollArea && scrollArea->widget() == contents) {
-            scrollArea->takeWidget();
-        }
-        contents->setParent(nullptr);
-        return contents;
-    };
-
-    auto moveGridLayoutItems = [](QGridLayout* from, QGridLayout* to, QWidget* newParent) {
-        if (!from || !to) {
-            return;
-        }
-        to->setContentsMargins(from->contentsMargins());
-        to->setHorizontalSpacing(from->horizontalSpacing());
-        to->setVerticalSpacing(from->verticalSpacing());
-        for (int column = 0; column < from->columnCount(); ++column) {
-            to->setColumnStretch(column, from->columnStretch(column));
-            to->setColumnMinimumWidth(column, from->columnMinimumWidth(column));
-        }
-        for (int row = 0; row < from->rowCount(); ++row) {
-            to->setRowStretch(row, from->rowStretch(row));
-            to->setRowMinimumHeight(row, from->rowMinimumHeight(row));
-        }
-        for (int index = from->count() - 1; index >= 0; --index) {
-            int row = 0;
-            int column = 0;
-            int rowSpan = 1;
-            int columnSpan = 1;
-            from->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
-            if (auto* item = from->takeAt(index)) {
-                if (newParent) {
-                    if (auto* widget = item->widget()) {
-                        widget->setParent(newParent);
-                    } else if (auto* layout = item->layout()) {
-                        layout->setParent(newParent);
-                    }
-                }
-                to->addItem(item, row, column, rowSpan, columnSpan, item->alignment());
-            }
-        }
-    };
-
-    auto* normalVisContainer = new QWidget(ui.dockWidgetViewerControlsContents);
-    auto* normalVisLayout = new QGridLayout(normalVisContainer);
-    moveGridLayoutItems(qobject_cast<QGridLayout*>(ui.dockWidgetNormalVisContents->layout()),
-                        normalVisLayout,
-                        normalVisContainer);
-
-    auto* transformsContainer = new QWidget(ui.dockWidgetViewerControlsContents);
-    auto* transformsLayout = new QVBoxLayout(transformsContainer);
-    transformsLayout->setContentsMargins(0, 0, 0, 0);
-    transformsLayout->setSpacing(8);
-
-    _previewTransformCheck = new QCheckBox(tr("Preview Result"), transformsContainer);
-    _previewTransformCheck->setToolTip(
-        tr("Preview the scaled and/or affine-transformed segmentation."));
-    transformsLayout->addWidget(_previewTransformCheck);
-
-    _scaleOnlyTransformCheck = new QCheckBox(tr("Scale Only"), transformsContainer);
-    _scaleOnlyTransformCheck->setToolTip(
-        tr("Ignore any loaded or volume affine and apply scale only."));
-    transformsLayout->addWidget(_scaleOnlyTransformCheck);
-
-    _invertTransformCheck = new QCheckBox(tr("Invert Affine"), transformsContainer);
-    _invertTransformCheck->setToolTip(
-        tr("Invert the loaded affine. Ignored when no affine transform is loaded."));
-    transformsLayout->addWidget(_invertTransformCheck);
-
-    auto* transformScaleRow = new QHBoxLayout();
-    transformScaleRow->setContentsMargins(0, 0, 0, 0);
-    transformScaleRow->setSpacing(8);
-    transformScaleRow->addWidget(new QLabel(tr("Scale"), transformsContainer));
-    _transformScaleSpin = new QSpinBox(transformsContainer);
-    _transformScaleSpin->setMinimum(1);
-    _transformScaleSpin->setMaximum(1000);
-    _transformScaleSpin->setValue(1);
-    _transformScaleSpin->setToolTip(
-        tr("Multiply segmentation points by this integer. Works with or without an affine transform."));
-    transformScaleRow->addWidget(_transformScaleSpin);
-    transformsLayout->addLayout(transformScaleRow);
-
-    _loadAffineButton = new QPushButton(tr("Load Affine (Optional)"), transformsContainer);
-    _loadAffineButton->setToolTip(
-        tr("Load an affine JSON from a local path or URL. Leave the dialog blank to return to the current volume transform."));
-    transformsLayout->addWidget(_loadAffineButton);
-
-    _saveTransformedButton = new QPushButton(tr("Save Transformed"), transformsContainer);
-    _saveTransformedButton->setToolTip(
-        tr("Save a new surface using the current scale and optional affine transform."));
-    transformsLayout->addWidget(_saveTransformedButton);
-
-    _transformStatusLabel = new QLabel(transformsContainer);
-    _transformStatusLabel->setWordWrap(true);
-    _transformStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    transformsLayout->addWidget(_transformStatusLabel);
-
-    connect(_previewTransformCheck, &QCheckBox::toggled,
-            this, &CWindow::onPreviewTransformToggled);
-    connect(_scaleOnlyTransformCheck, &QCheckBox::toggled,
-            this, [this](bool) { refreshTransformsPanelState(); });
-    connect(_invertTransformCheck, &QCheckBox::toggled,
-            this, [this](bool) { refreshTransformsPanelState(); });
-    connect(_transformScaleSpin, QOverload<int>::of(&QSpinBox::valueChanged),
-            this, [this](int) { refreshTransformsPanelState(); });
-    connect(_loadAffineButton, &QPushButton::clicked,
-            this, &CWindow::onLoadAffineRequested);
-    connect(_saveTransformedButton, &QPushButton::clicked,
-            this, &CWindow::onSaveTransformedRequested);
-
-    auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const char* key) {
-        if (!group) {
-            return;
-        }
-        connect(group, &CollapsibleSettingsGroup::toggled, this, [key](bool expanded) {
-            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-            settings.setValue(key, expanded);
-        });
-    };
-
-    auto addViewerGroup = [this, &settings, viewerControlsLayout, &rememberGroupState](
-                              const QString& title, QWidget* contents, const char* key, bool defaultExpanded) {
-        if (!viewerControlsLayout || !contents) {
-            return static_cast<CollapsibleSettingsGroup*>(nullptr);
-        }
-        auto* group = new CollapsibleSettingsGroup(title, ui.dockWidgetViewerControlsContents);
-        group->contentLayout()->addWidget(contents);
-        viewerControlsLayout->addWidget(group);
-        group->setExpanded(settings.value(key, defaultExpanded).toBool());
-        rememberGroupState(group, key);
-        return group;
-    };
-
-    using namespace vc3d::settings;
-    auto* viewGroup = addViewerGroup(tr("View"),
-                   detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
-                   viewer::GROUP_VIEW_EXPANDED,
-                   viewer::GROUP_VIEW_EXPANDED_DEFAULT);
-
-    // Interpolation + highlight-downscaled live inside the View group so
-    // all display-affecting toggles sit together.
-    auto* viewExtrasLayout = viewGroup ? viewGroup->contentLayout() : viewerControlsLayout;
-
-    // Interpolation method selector
-    {
-        auto* interpWidget = new QWidget;
-        auto* interpLayout = new QHBoxLayout(interpWidget);
-        interpLayout->setContentsMargins(2, 2, 2, 2);
-        interpLayout->addWidget(new QLabel(tr("Interpolation")));
-        auto* cmbInterp = new QComboBox;
-        cmbInterp->addItem(tr("Nearest"));
-        cmbInterp->addItem(tr("Trilinear"));
-        cmbInterp->addItem(tr("Tricubic"));
-        cmbInterp->addItem(tr("Lanczos"));
-        cmbInterp->setCurrentIndex(settings.value(perf::INTERPOLATION_METHOD, 1).toInt());
-        interpLayout->addWidget(cmbInterp);
-        connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
-            _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
-                v->reloadPerfSettings();
-                v->update();
-            });
-        });
-        viewExtrasLayout->addWidget(interpWidget);
-    }
-
-    // Highlight downscaled chunks — tints pixels that rendered against a
-    // coarser pyramid level than the zoom-level target (green → red).
-    {
-        auto* chkHighlight = new QCheckBox(tr("Highlight downscaled chunks"));
-        chkHighlight->setToolTip(
-            tr("Tint pixels sourced from a coarser pyramid level than the current zoom "
-               "target. Green = 1 level coarser; red = 5+ levels coarser. Untinted pixels "
-               "rendered at the requested resolution."));
-        chkHighlight->setChecked(
-            settings.value("viewer_controls/highlight_downscaled", false).toBool());
-        connect(chkHighlight, &QCheckBox::toggled, this, [this](bool on) {
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue("viewer_controls/highlight_downscaled", on);
-            if (_viewerManager) {
-                _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
-                    v->reloadPerfSettings();
-                    v->renderVisible(true);
-                });
-            }
-        });
-        viewExtrasLayout->addWidget(chkHighlight);
-    }
-
-    // Navigation sensitivity controls
-    {
-        auto* navWidget = new QWidget;
-        auto* navLayout = new QGridLayout(navWidget);
-        navLayout->setContentsMargins(2, 2, 2, 2);
-        navLayout->setVerticalSpacing(2);
-
-        auto addSpin = [&](int row, const QString& label, const char* settingsKey, float defaultVal) {
-            navLayout->addWidget(new QLabel(label), row, 0);
-            auto* spin = new QDoubleSpinBox;
-            spin->setRange(0.1, 100.0);
-            spin->setSingleStep(0.1);
-            spin->setDecimals(1);
-            spin->setValue(settings.value(settingsKey, defaultVal).toDouble());
-            navLayout->addWidget(spin, row, 1);
-            connect(spin, &QDoubleSpinBox::valueChanged, this, [this, settingsKey](double v) {
-                QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-                s.setValue(settingsKey, v);
-                if (_viewerManager) {
-                    _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
-                        v->reloadPerfSettings();
-                    });
-                }
-            });
-        };
-        addSpin(0, tr("Pan sensitivity"), viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT);
-        addSpin(1, tr("Zoom sensitivity"), viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT);
-        addSpin(2, tr("Z-scroll sensitivity"), viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT);
-
-        addViewerGroup(tr("Navigation"),
-                       navWidget,
-                       "viewer_controls/group_navigation_expanded",
-                       true);
-    }
-
-    addViewerGroup(tr("Overlay"),
-                   detachScrollContents(ui.scrollAreaOverlay, ui.dockWidgetOverlayContents),
-                   viewer::GROUP_OVERLAY_EXPANDED,
-                   viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Composite View"),
-                   detachScrollContents(ui.scrollAreaComposite, ui.dockWidgetCompositeContents),
-                   viewer::GROUP_COMPOSITE_EXPANDED,
-                   viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Render Settings"),
-                   detachScrollContents(ui.scrollAreaRenderSettings, ui.dockWidgetRenderSettingsContents),
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Normal Visualization"),
-                   normalVisContainer,
-                   viewer::GROUP_NORMAL_VIS_EXPANDED,
-                   viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Preprocessing"),
-                   detachScrollContents(ui.scrollAreaPreprocessing, ui.dockWidgetPreprocessingContents),
-                   viewer::GROUP_PREPROCESSING_EXPANDED,
-                   viewer::GROUP_PREPROCESSING_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Postprocessing"),
-                   detachScrollContents(ui.scrollAreaPostprocessing, ui.dockWidgetPostprocessingContents),
-                   viewer::GROUP_POSTPROCESSING_EXPANDED,
-                   viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Transforms"),
-                   transformsContainer,
-                   viewer::GROUP_TRANSFORMS_EXPANDED,
-                   viewer::GROUP_TRANSFORMS_EXPANDED_DEFAULT);
-    viewerControlsLayout->addStretch(1);
+    _surfaceAffineTransforms = std::make_unique<SurfaceAffineTransformController>(
+        SurfaceAffineTransformController::Deps{
+            .state = _state,
+            .viewerControlsPanel = _viewerControlsPanel.get(),
+            .viewerManager = _viewerManager.get(),
+            .segmentationModule = _segmentationModule.get(),
+            .surfacePanel = _surfacePanel.get(),
+            .axisAlignedSliceController = _axisAlignedSliceController.get(),
+            .dialogParent = this,
+            .showStatus = [this](const QString& text, int timeoutMs) {
+                onShowStatusMessage(text, timeoutMs);
+            },
+        },
+        this);
 
     addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
     splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
@@ -3839,7 +2063,9 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onSurfaceActivated);
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
             this, &CWindow::onSurfaceActivatedPreserveEditing);
-    refreshTransformsPanelState();
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
 
     // new and remove path buttons
     // connect(ui.btnNewPath, SIGNAL(clicked()), this, SLOT(OnNewPathClicked()));
@@ -3867,31 +2093,15 @@ void CWindow::CreateWidgets(void)
             .thresholdSpin = ui.overlayThresholdSpin,
         };
         _volumeOverlay->setUi(overlayUi);
-    }
-
-        // Setup base colormap selector
-    {
-        const auto& entries = volume_viewer_cmaps::entries(volume_viewer_cmaps::EntryScope::SharedOnly);
-        ui.baseColormapSelect->clear();
-        ui.baseColormapSelect->addItem(tr("None (Grayscale)"), QString());
-        for (const auto& entry : entries) {
-            ui.baseColormapSelect->addItem(entry.label, QString::fromStdString(entry.id));
+        if (_viewerControlsPanel) {
+            _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay->hasOverlaySelection());
         }
-        ui.baseColormapSelect->setCurrentIndex(0);
     }
-
-    connect(ui.baseColormapSelect, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
-        if (index < 0 || !_viewerManager) return;
-        const QString id = ui.baseColormapSelect->currentData().toString();
-        _viewerManager->forEachViewer([&id](CTiledVolumeViewer* viewer) {
-            viewer->setBaseColormap(id.toStdString());
-        });
-    });
 
     // Setup surface overlay controls
     connect(ui.chkSurfaceOverlay, &QCheckBox::toggled, [this](bool checked) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
             viewer->setSurfaceOverlayEnabled(checked);
         });
         ui.surfaceOverlaySelect->setEnabled(checked);
@@ -3900,7 +2110,7 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
             viewer->setSurfaceOverlapThreshold(static_cast<float>(value));
         });
     });
@@ -3951,7 +2161,6 @@ void CWindow::CreateWidgets(void)
         .approved = ui.chkApproved,
         .defective = ui.chkDefective,
         .reviewed = ui.chkReviewed,
-        .revisit = ui.chkRevisit,
         .inspect = ui.chkInspect,
     };
     _surfacePanel->configureTags(tagUi);
@@ -3987,381 +2196,8 @@ void CWindow::CreateWidgets(void)
         connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
     }
 
-    if (auto* spinSliceStep = ui.spinSliceStepSize) {
-        int savedStep = settings.value(vc3d::settings::viewer::SLICE_STEP_SIZE,
-                                       vc3d::settings::viewer::SLICE_STEP_SIZE_DEFAULT).toInt();
-        savedStep = std::clamp(savedStep, spinSliceStep->minimum(), spinSliceStep->maximum());
-        QSignalBlocker blocker(spinSliceStep);
-        spinSliceStep->setValue(savedStep);
-        if (_viewerManager) {
-            _viewerManager->setSliceStepSize(savedStep);
-        }
-        connect(spinSliceStep, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_viewerManager) {
-                _viewerManager->setSliceStepSize(value);
-            }
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, value);
-            if (_sliceStepLabel) {
-                _sliceStepLabel->setText(tr("Step: %1").arg(value));
-            }
-        });
-    }
-
-    // Surface normals visualization controls
-    if (auto* chkShowNormals = ui.chkShowSurfaceNormals) {
-        bool showNormals = settings.value(vc3d::settings::viewer::SHOW_SURFACE_NORMALS,
-                                          vc3d::settings::viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
-        QSignalBlocker blocker(chkShowNormals);
-        chkShowNormals->setChecked(showNormals);
-
-        // Enable/disable the arrow length and max arrows controls based on checkbox state
-        if (auto* lblArrowLength = ui.labelNormalArrowLength) {
-            lblArrowLength->setEnabled(showNormals);
-        }
-        if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
-            sliderArrowLength->setEnabled(showNormals);
-        }
-        if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-            lblArrowLengthValue->setEnabled(showNormals);
-        }
-        if (auto* lblMaxArrows = ui.labelNormalMaxArrows) {
-            lblMaxArrows->setEnabled(showNormals);
-        }
-        if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
-            sliderMaxArrows->setEnabled(showNormals);
-        }
-        if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-            lblMaxArrowsValue->setEnabled(showNormals);
-        }
-
-        connect(chkShowNormals, &QCheckBox::toggled, this, [this](bool checked) {
-            using namespace vc3d::settings;
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(viewer::SHOW_SURFACE_NORMALS, checked ? "1" : "0");
-            if (_viewerManager) {
-                _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
-                    if (viewer) {
-                        viewer->setShowSurfaceNormals(checked);
-                    }
-                });
-            }
-            // Enable/disable arrow length and max arrows controls
-            if (auto* lblArrowLength = ui.labelNormalArrowLength) {
-                lblArrowLength->setEnabled(checked);
-            }
-            if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
-                sliderArrowLength->setEnabled(checked);
-            }
-            if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-                lblArrowLengthValue->setEnabled(checked);
-            }
-            if (auto* lblMaxArrows = ui.labelNormalMaxArrows) {
-                lblMaxArrows->setEnabled(checked);
-            }
-            if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
-                sliderMaxArrows->setEnabled(checked);
-            }
-            if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-                lblMaxArrowsValue->setEnabled(checked);
-            }
-            statusBar()->showMessage(checked ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
-        });
-    }
-
-    if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
-        int savedScale = settings.value(vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE,
-                                        vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE_DEFAULT).toInt();
-        savedScale = std::clamp(savedScale, sliderArrowLength->minimum(), sliderArrowLength->maximum());
-        QSignalBlocker blocker(sliderArrowLength);
-        sliderArrowLength->setValue(savedScale);
-
-        if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-            lblArrowLengthValue->setText(tr("%1%").arg(savedScale));
-        }
-
-        float scaleFloat = static_cast<float>(savedScale) / 100.0f;
-        if (_viewerManager) {
-            _viewerManager->forEachViewer([scaleFloat](CTiledVolumeViewer* viewer) {
-                if (viewer) {
-                    viewer->setNormalArrowLengthScale(scaleFloat);
-                }
-            });
-        }
-
-        connect(sliderArrowLength, &QSlider::valueChanged, this, [this](int value) {
-            using namespace vc3d::settings;
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(viewer::NORMAL_ARROW_LENGTH_SCALE, value);
-
-            if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-                lblArrowLengthValue->setText(tr("%1%").arg(value));
-            }
-
-            float scaleFloat = static_cast<float>(value) / 100.0f;
-            if (_viewerManager) {
-                _viewerManager->forEachViewer([scaleFloat](CTiledVolumeViewer* viewer) {
-                    if (viewer) {
-                        viewer->setNormalArrowLengthScale(scaleFloat);
-                    }
-                });
-            }
-        });
-    }
-
-    if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
-        int savedMaxArrows = settings.value(vc3d::settings::viewer::NORMAL_MAX_ARROWS,
-                                            vc3d::settings::viewer::NORMAL_MAX_ARROWS_DEFAULT).toInt();
-        savedMaxArrows = std::clamp(savedMaxArrows, sliderMaxArrows->minimum(), sliderMaxArrows->maximum());
-        QSignalBlocker blocker(sliderMaxArrows);
-        sliderMaxArrows->setValue(savedMaxArrows);
-
-        if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-            lblMaxArrowsValue->setText(QString::number(savedMaxArrows));
-        }
-
-        if (_viewerManager) {
-            _viewerManager->forEachViewer([savedMaxArrows](CTiledVolumeViewer* viewer) {
-                if (viewer) {
-                    viewer->setNormalMaxArrows(savedMaxArrows);
-                }
-            });
-        }
-
-        connect(sliderMaxArrows, &QSlider::valueChanged, this, [this](int value) {
-            using namespace vc3d::settings;
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(viewer::NORMAL_MAX_ARROWS, value);
-
-            if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-                lblMaxArrowsValue->setText(QString::number(value));
-            }
-
-            if (_viewerManager) {
-                _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
-                    if (viewer) {
-                        viewer->setNormalMaxArrows(value);
-                    }
-                });
-            }
-        });
-    }
-
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
-    }
-
-    // Zoom buttons
-    btnZoomIn = ui.btnZoomIn;
-    btnZoomOut = ui.btnZoomOut;
-
-    connect(btnZoomIn, &QPushButton::clicked, this, &CWindow::onZoomIn);
-    connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
-
-    if (auto* volumeContainer = ui.volumeWindowContainer) {
-        auto* layout = new QHBoxLayout(volumeContainer);
-        layout->setContentsMargins(0, 0, 0, 0);
-        layout->setSpacing(6);
-
-        _volumeWindowWidget = new WindowRangeWidget(volumeContainer);
-        _volumeWindowWidget->setRange(0, 255);
-        _volumeWindowWidget->setMinimumSeparation(1);
-        _volumeWindowWidget->setControlsEnabled(false);
-        layout->addWidget(_volumeWindowWidget);
-
-        connect(_volumeWindowWidget, &WindowRangeWidget::windowValuesChanged,
-                this, [this](int low, int high) {
-                    if (_viewerManager) {
-                        _viewerManager->setVolumeWindow(static_cast<float>(low),
-                                                        static_cast<float>(high));
-                    }
-                });
-
-        if (_viewerManager) {
-            connect(_viewerManager.get(), &ViewerManager::volumeWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_volumeWindowWidget) {
-                            return;
-                        }
-                        const int lowInt = static_cast<int>(std::lround(low));
-                        const int highInt = static_cast<int>(std::lround(high));
-                        _volumeWindowWidget->setWindowValues(lowInt, highInt);
-                    });
-
-            _volumeWindowWidget->setWindowValues(
-                static_cast<int>(std::lround(_viewerManager->volumeWindowLow())),
-                static_cast<int>(std::lround(_viewerManager->volumeWindowHigh())));
-        }
-
-        const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
-        _volumeWindowWidget->setControlsEnabled(viewEnabled);
-    }
-
-    if (auto* container = ui.overlayWindowContainer) {
-        auto* layout = new QHBoxLayout(container);
-        layout->setContentsMargins(0, 0, 0, 0);
-        layout->setSpacing(6);
-
-        _overlayWindowWidget = new WindowRangeWidget(container);
-        _overlayWindowWidget->setRange(0, 255);
-        _overlayWindowWidget->setMinimumSeparation(1);
-        _overlayWindowWidget->setControlsEnabled(false);
-        layout->addWidget(_overlayWindowWidget);
-
-        connect(_overlayWindowWidget, &WindowRangeWidget::windowValuesChanged,
-                this, [this](int low, int high) {
-                    if (_viewerManager) {
-                        _viewerManager->setOverlayWindow(static_cast<float>(low),
-                                                         static_cast<float>(high));
-                    }
-                });
-
-        if (_viewerManager) {
-            connect(_viewerManager.get(), &ViewerManager::overlayWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_overlayWindowWidget) {
-                            return;
-                        }
-                        const int lowInt = static_cast<int>(std::lround(low));
-                        const int highInt = static_cast<int>(std::lround(high));
-                        _overlayWindowWidget->setWindowValues(lowInt, highInt);
-                    });
-
-            _overlayWindowWidget->setWindowValues(
-                static_cast<int>(std::lround(_viewerManager->overlayWindowLow())),
-                static_cast<int>(std::lround(_viewerManager->overlayWindowHigh())));
-        }
-    }
-
-    if (_viewerManager && _overlayWindowWidget) {
-        connect(_viewerManager.get(), &ViewerManager::overlayVolumeAvailabilityChanged,
-                this, [this](bool hasOverlay) {
-                    if (!_overlayWindowWidget) {
-                        return;
-                    }
-                    const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
-                    _overlayWindowWidget->setControlsEnabled(hasOverlay && viewEnabled);
-                });
-    }
-
-    if (_overlayWindowWidget) {
-        const bool hasOverlay = _volumeOverlay && _volumeOverlay->hasOverlaySelection();
-        const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
-        _overlayWindowWidget->setControlsEnabled(hasOverlay && viewEnabled);
-    }
-
-    auto* spinIntersectionOpacity = ui.spinIntersectionOpacity;
-    const int savedIntersectionOpacity = settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
-                                                        spinIntersectionOpacity->value()).toInt();
-    const int boundedIntersectionOpacity = std::clamp(savedIntersectionOpacity,
-                                                      spinIntersectionOpacity->minimum(),
-                                                      spinIntersectionOpacity->maximum());
-    spinIntersectionOpacity->setValue(boundedIntersectionOpacity);
-
-    connect(spinIntersectionOpacity, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (!_viewerManager) {
-            return;
-        }
-        const float normalized = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
-        _viewerManager->setIntersectionOpacity(normalized);
-    });
-    if (_viewerManager) {
-        _viewerManager->setIntersectionOpacity(spinIntersectionOpacity->value() / 100.0f);
-    }
-
-    if (auto* spinIntersectionThickness = ui.doubleSpinIntersectionThickness) {
-        const double savedThickness = settings.value(vc3d::settings::viewer::INTERSECTION_THICKNESS,
-                                                     spinIntersectionThickness->value()).toDouble();
-        const double boundedThickness = std::clamp(savedThickness,
-                                                   static_cast<double>(spinIntersectionThickness->minimum()),
-                                                   static_cast<double>(spinIntersectionThickness->maximum()));
-        spinIntersectionThickness->setValue(boundedThickness);
-        connect(spinIntersectionThickness,
-                QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-                this,
-                [this](double value) {
-                    if (!_viewerManager) {
-                        return;
-                    }
-                    _viewerManager->setIntersectionThickness(static_cast<float>(value));
-                });
-        if (_viewerManager) {
-            _viewerManager->setIntersectionThickness(static_cast<float>(spinIntersectionThickness->value()));
-        }
-    }
-
-    auto* comboIntersectionSampling = ui.comboIntersectionSampling;
-    if (comboIntersectionSampling) {
-        struct SamplingOption {
-            const char* label;
-            int stride;
-        };
-        const SamplingOption options[] = {
-            {"Full (1x)", 1},
-            {"2x", 2},
-            {"4x", 4},
-            {"8x", 8},
-            {"16x", 16},
-            {"32x", 32},
-        };
-        comboIntersectionSampling->clear();
-        for (const auto& opt : options) {
-            comboIntersectionSampling->addItem(tr(opt.label), opt.stride);
-        }
-
-        const bool strideUserSet = settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET,
-                                                  false).toBool();
-        const int savedStride = strideUserSet
-            ? settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE,
-                             vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt()
-            : vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT;
-        int selectedIndex = comboIntersectionSampling->findData(savedStride);
-        if (selectedIndex < 0) {
-            selectedIndex = comboIntersectionSampling->findData(1);
-        }
-        if (selectedIndex >= 0) {
-            comboIntersectionSampling->setCurrentIndex(selectedIndex);
-        }
-
-        connect(comboIntersectionSampling,
-                QOverload<int>::of(&QComboBox::currentIndexChanged),
-                this,
-                [this, comboIntersectionSampling](int) {
-                    if (!_viewerManager) {
-                        return;
-                    }
-                    const int stride = std::max(1, comboIntersectionSampling->currentData().toInt());
-                    _viewerManager->setSurfacePatchSamplingStride(stride);
-                });
-
-        // Update combobox when stride changes programmatically.
-        if (_viewerManager) {
-            connect(_viewerManager.get(),
-                    &ViewerManager::samplingStrideChanged,
-                    this,
-                    [comboIntersectionSampling](int stride) {
-                        const int index = comboIntersectionSampling->findData(stride);
-                        if (index >= 0 && index != comboIntersectionSampling->currentIndex()) {
-                            QSignalBlocker blocker(comboIntersectionSampling);
-                            comboIntersectionSampling->setCurrentIndex(index);
-                        }
-                    });
-        }
-    }
-
-    // Max intersection surfaces spinbox
-    if (auto* spinMaxSurfaces = ui.spinIntersectionMaxSurfaces) {
-        const int savedMax =
-            settings.value(vc3d::settings::viewer::INTERSECTION_MAX_SURFACES, vc3d::settings::viewer::INTERSECTION_MAX_SURFACES_DEFAULT).toInt();
-        spinMaxSurfaces->setValue(std::max(0, savedMax));
-        connect(spinMaxSurfaces, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_viewerManager) {
-                _viewerManager->setIntersectionMaxSurfaces(value);
-            }
-        });
-        if (_viewerManager) {
-            _viewerManager->setIntersectionMaxSurfaces(savedMax);
-        }
     }
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
@@ -4373,43 +2209,8 @@ void CWindow::CreateWidgets(void)
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
     }
 
-    spNorm[0] = ui.dspNX;
-    spNorm[1] = ui.dspNY;
-    spNorm[2] = ui.dspNZ;
-
-    for (int i = 0; i < 3; i++) {
-        spNorm[i]->setRange(-10, 10);
-    }
-
-    connect(spNorm[0], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
-    connect(spNorm[1], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
-    connect(spNorm[2], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
-
     connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
     connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
-    // Connect composite view controls
-    connect(ui.chkCompositeEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.enabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (!_viewerManager) {
-            return;
-        }
-        const std::string method = compositeMethodForModeIndex(index);
-        _viewerManager->forEachViewer([&method](CTiledVolumeViewer* viewer) {
-            if (!viewer) {
-                return;
-            }
-            auto s = viewer->compositeRenderSettings();
-            s.params.method = method;
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
 
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
@@ -4421,548 +2222,10 @@ void CWindow::CreateWidgets(void)
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
 
-    // Connect Layers In Front controls
-    connect(ui.spinLayersInFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.layersFront = value;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Layers Behind controls
-    connect(ui.spinLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.layersBehind = value;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Alpha Min controls
-    connect(ui.spinAlphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaMin = value / 255.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Alpha Max controls
-    connect(ui.spinAlphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaMax = value / 255.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Alpha Threshold controls
-    connect(ui.spinAlphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaCutoff = value / 10000.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Material controls
-    connect(ui.spinMaterial, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaOpacity = value / 255.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Reverse Direction control
-    connect(ui.chkReverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.reverseDirection = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Beer-Lambert Extinction control
-    connect(ui.spinBLExtinction, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.blExtinction = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Beer-Lambert Emission control
-    connect(ui.spinBLEmission, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.blEmission = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Beer-Lambert Ambient control
-    connect(ui.spinBLAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.blAmbient = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Lighting Enable control
-    connect(ui.chkLightingEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightingEnabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Azimuth control
-    connect(ui.spinLightAzimuth, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightAzimuth = static_cast<float>(value);
-            s.params.updateLightDir();
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Elevation control
-    connect(ui.spinLightElevation, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightElevation = static_cast<float>(value);
-            s.params.updateLightDir();
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Diffuse control
-    connect(ui.spinLightDiffuse, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightDiffuse = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Ambient control
-    connect(ui.spinLightAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightAmbient = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Volume Gradients checkbox — switches the lighting normal
-    // source between mesh-interpolated (0) and per-sample volume gradient (1).
-    connect(ui.chkUseVolumeGradients, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.useVolumeGradients = checked;
-            s.params.lightNormalSource = checked ? 1 : 0;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Shadow Steps spinbox (Volumetric method)
-    connect(ui.spinShadowSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.shadowSteps = std::clamp(value, 1, 64);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Per-ray layer preprocess (applied to N composite samples before composite method)
-    connect(ui.chkPreNormalizeLayers, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.preNormalizeLayers = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-    connect(ui.chkPreHistEqLayers, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.preHistEqLayers = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Pre-TF / Post-TF: 4-knot piecewise-linear LUTs. Endpoints (0,0) and
-    // (255,255) are fixed; only the two middle knots are editable.
-    auto applyTfParam = [this](auto&& mutate) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            mutate(s.params);
-            viewer->setCompositeRenderSettings(s);
-        }
-    };
-    connect(ui.chkPreTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
-        applyTfParam([v](CompositeParams& p) { p.preTfEnabled = v; });
-    });
-    connect(ui.spinPreTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX1 = uint8_t(v); }); });
-    connect(ui.spinPreTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY1 = uint8_t(v); }); });
-    connect(ui.spinPreTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX2 = uint8_t(v); }); });
-    connect(ui.spinPreTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY2 = uint8_t(v); }); });
-    connect(ui.chkPostTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
-        applyTfParam([v](CompositeParams& p) { p.postTfEnabled = v; });
-    });
-    connect(ui.spinPostTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX1 = uint8_t(v); }); });
-    connect(ui.spinPostTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY1 = uint8_t(v); }); });
-    connect(ui.spinPostTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX2 = uint8_t(v); }); });
-    connect(ui.spinPostTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY2 = uint8_t(v); }); });
-    connect(ui.spinDvrAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
-        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.dvrAmbient = float(v); }); });
-    connect(ui.spinPbrRoughness, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
-        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrRoughness = float(v); }); });
-    connect(ui.spinPbrMetallic, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
-        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrMetallic = float(v); }); });
-
-    // Connect ISO Cutoff slider - applies to all viewers (segmentation, XY, XZ, YZ)
-    connect(ui.sliderIsoCutoff, &QSlider::valueChanged, this, [this](int value) {
-        ui.lblIsoCutoffValue->setText(QString::number(value));
-        if (!_viewerManager) {
-            return;
-        }
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.isoCutoff = static_cast<uint8_t>(std::clamp(value, 0, 255));
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-    // Connect Method Scale slider (for methods with scale parameters)
-    connect(ui.sliderMethodScale, &QSlider::valueChanged, this, [this](int value) {
-        // Convert slider value (1-100) to scale (0.1-10.0)
-        float scale = value / 10.0f;
-        ui.lblMethodScaleValue->setText(QString::number(scale, 'f', 1));
-
-        if (!_viewerManager) {
-            return;
-        }
-
-        // Currently no methods use the scale parameter
-        (void)scale;
-    });
-
-    // Connect Method Param slider (for methods with threshold/percentile parameters)
-    connect(ui.sliderMethodParam, &QSlider::valueChanged, this, [this](int value) {
-        // Currently no methods use this parameter
-        (void)value;
-    });
-
-    // Helper lambda to update visibility of method-specific parameters
-    auto updateCompositeParamsVisibility = [this]() {
-        const int methodIndex = ui.cmbCompositeMode->currentIndex();
-        const bool lightingOn = ui.chkLightingEnabled->isChecked();
-        const bool preTfOn = ui.chkPreTfEnabled->isChecked();
-        const bool postTfOn = ui.chkPostTfEnabled->isChecked();
-
-        // Method-family flags.
-        const bool isAlpha    = (methodIndex == 3);
-        const bool isBL       = (methodIndex == 4);
-        const bool isVolum    = (methodIndex == 5);
-        const bool isDvr      = (methodIndex == 6);
-        const bool isFirstHit = (methodIndex == 7);
-        const bool isPbr      = (methodIndex == 13);
-        const bool isShadedDvr = (methodIndex == 14);
-
-        // Alpha knobs: only for the Alpha method.
-        ui.lblAlphaMin->setVisible(isAlpha);
-        ui.spinAlphaMin->setVisible(isAlpha);
-        ui.lblAlphaMax->setVisible(isAlpha);
-        ui.spinAlphaMax->setVisible(isAlpha);
-        ui.lblAlphaThreshold->setVisible(isAlpha);
-        ui.spinAlphaThreshold->setVisible(isAlpha);
-        ui.lblMaterial->setVisible(isAlpha);
-        ui.spinMaterial->setVisible(isAlpha);
-
-        // Beer-Lambert knobs: shared by Beer-Lambert and Volumetric modes.
-        const bool showBL = isBL || isVolum;
-        ui.lblBLExtinction->setVisible(showBL);
-        ui.spinBLExtinction->setVisible(showBL);
-        ui.lblBLEmission->setVisible(showBL);
-        ui.spinBLEmission->setVisible(showBL);
-        ui.lblBLAmbient->setVisible(showBL);
-        ui.spinBLAmbient->setVisible(showBL);
-
-        // Shadow-ray steps: only Volumetric uses the secondary shadow ray.
-        ui.lblShadowSteps->setVisible(isVolum);
-        ui.spinShadowSteps->setVisible(isVolum);
-
-        // DVR ambient: DVR and shaded-DVR methods.
-        const bool showDvrAmbient = isDvr || isShadedDvr;
-        ui.lblDvrAmbient->setVisible(showDvrAmbient);
-        ui.spinDvrAmbient->setVisible(showDvrAmbient);
-
-        // PBR roughness/metallic knobs: only the PBR method.
-        ui.lblPbrRoughness->setVisible(isPbr);
-        ui.spinPbrRoughness->setVisible(isPbr);
-        ui.lblPbrMetallic->setVisible(isPbr);
-        ui.spinPbrMetallic->setVisible(isPbr);
-
-        // Lighting: check always visible (user toggles on/off); the
-        // direction/diffuse/ambient knobs appear only when lighting is
-        // actually on. First-Hit Iso is a shading-heavy method so we
-        // gently enforce its need for lighting by showing the chk always.
-        ui.chkLightingEnabled->setVisible(true);
-        ui.lblLightAzimuth->setVisible(lightingOn);
-        ui.spinLightAzimuth->setVisible(lightingOn);
-        ui.lblLightElevation->setVisible(lightingOn);
-        ui.spinLightElevation->setVisible(lightingOn);
-        ui.lblLightDiffuse->setVisible(lightingOn);
-        ui.spinLightDiffuse->setVisible(lightingOn);
-        ui.lblLightAmbient->setVisible(lightingOn);
-        ui.spinLightAmbient->setVisible(lightingOn);
-        ui.chkUseVolumeGradients->setVisible(lightingOn);
-
-        // Pre/Post TF knots: spinboxes + knot-2 labels appear only when
-        // the corresponding enable checkbox is ticked.
-        ui.spinPreTfX1->setVisible(preTfOn);
-        ui.spinPreTfY1->setVisible(preTfOn);
-        ui.spinPreTfX2->setVisible(preTfOn);
-        ui.spinPreTfY2->setVisible(preTfOn);
-        ui.lblPreTfKnot2->setVisible(preTfOn);
-        ui.spinPostTfX1->setVisible(postTfOn);
-        ui.spinPostTfY1->setVisible(postTfOn);
-        ui.spinPostTfX2->setVisible(postTfOn);
-        ui.spinPostTfY2->setVisible(postTfOn);
-        ui.lblPostTfKnot2->setVisible(postTfOn);
-
-        // No methods currently use scale or param sliders.
-        ui.lblMethodScale->setVisible(false);
-        ui.sliderMethodScale->setVisible(false);
-        ui.lblMethodScaleValue->setVisible(false);
-        ui.lblMethodParam->setVisible(false);
-        ui.sliderMethodParam->setVisible(false);
-        ui.lblMethodParamValue->setVisible(false);
-
-        (void)isFirstHit;  // reserved for future First-Hit-specific knobs
-        (void)isShadedDvr; (void)isPbr; // already consumed above
-    };
-
-    // Re-run visibility logic whenever any of the inputs that gate widgets
-    // change — composite method, or any of the three enable checkboxes
-    // that each control a sub-group of knobs.
-    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, [updateCompositeParamsVisibility](int) { updateCompositeParamsVisibility(); });
-    connect(ui.chkLightingEnabled, &QCheckBox::toggled,
-            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
-    connect(ui.chkPreTfEnabled, &QCheckBox::toggled,
-            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
-    connect(ui.chkPostTfEnabled, &QCheckBox::toggled,
-            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
-
-    // Initialize visibility from current UI state.
-    updateCompositeParamsVisibility();
-
-    // Connect Plane Composite controls (separate enable for XY/XZ/YZ, shared layer counts)
-    connect(ui.chkPlaneCompositeXY, &QCheckBox::toggled, this, [this](bool checked) {
-        if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (viewer->surfName() == "xy plane") {
-                auto s = viewer->compositeRenderSettings();
-                s.planeEnabled = checked;
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    connect(ui.chkPlaneCompositeXZ, &QCheckBox::toggled, this, [this](bool checked) {
-        if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (viewer->surfName() == "seg xz") {
-                auto s = viewer->compositeRenderSettings();
-                s.planeEnabled = checked;
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    connect(ui.chkPlaneCompositeYZ, &QCheckBox::toggled, this, [this](bool checked) {
-        if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (viewer->surfName() == "seg yz") {
-                auto s = viewer->compositeRenderSettings();
-                s.planeEnabled = checked;
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    auto isPlaneViewer = [](const std::string& name) {
-        return name == "seg xz" || name == "seg yz" || name == "xy plane";
-    };
-
-    connect(ui.spinPlaneLayersFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
-        if (!_viewerManager) return;
-        int behind = ui.spinPlaneLayersBehind->value();
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (isPlaneViewer(viewer->surfName())) {
-                auto s = viewer->compositeRenderSettings();
-                s.planeLayersFront = std::max(0, value);
-                s.planeLayersBehind = std::max(0, behind);
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    connect(ui.spinPlaneLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
-        if (!_viewerManager) return;
-        int front = ui.spinPlaneLayersFront->value();
-        for (auto* viewer : _viewerManager->viewers()) {
-            if (isPlaneViewer(viewer->surfName())) {
-                auto s = viewer->compositeRenderSettings();
-                s.planeLayersFront = std::max(0, front);
-                s.planeLayersBehind = std::max(0, value);
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    // Connect Postprocessing controls
-    connect(ui.chkStretchValuesPost, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.postStretchValues = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    connect(ui.chkRemoveSmallComponents, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRemoveSmallComponents = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-        // Enable/disable the min component size spinbox based on checkbox state
-        ui.spinMinComponentSize->setEnabled(checked);
-        ui.lblMinComponentSize->setEnabled(checked);
-    });
-
-    connect(ui.spinMinComponentSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.postMinComponentSize = std::clamp(value, 1, 100000);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Initialize min component size controls based on checkbox state
-    ui.spinMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
-    ui.lblMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
-
-    // CLAHE postprocessing — applied to every viewer
-    auto setClaheEnabled = [this](bool on) {
-        ui.spinClaheClipLimit->setEnabled(on);
-        ui.spinClaheTileSize->setEnabled(on);
-        ui.lblClaheClipLimit->setEnabled(on);
-        ui.lblClaheTileSize->setEnabled(on);
-    };
-    setClaheEnabled(ui.chkClaheEnabled->isChecked());
-
-    connect(ui.chkClaheEnabled, &QCheckBox::toggled, this, [this, setClaheEnabled](bool checked) {
-        setClaheEnabled(checked);
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postClaheEnabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-    connect(ui.spinClaheClipLimit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postClaheClipLimit = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-    connect(ui.spinClaheTileSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postClaheTileSize = std::clamp(value, 2, 64);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-    // Raking light — heightfield post-process
-    auto setRakingEnabled = [this](bool on) {
-        ui.spinRakingAzimuth->setEnabled(on);
-        ui.spinRakingElevation->setEnabled(on);
-        ui.spinRakingStrength->setEnabled(on);
-        ui.spinRakingDepthScale->setEnabled(on);
-        ui.lblRakingAzimuth->setEnabled(on);
-        ui.lblRakingElevation->setEnabled(on);
-        ui.lblRakingStrength->setEnabled(on);
-        ui.lblRakingDepth->setEnabled(on);
-    };
-    setRakingEnabled(ui.chkRakingEnabled->isChecked());
-
-    connect(ui.chkRakingEnabled, &QCheckBox::toggled, this, [this, setRakingEnabled](bool checked) {
-        setRakingEnabled(checked);
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingEnabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingAzimuth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingAzimuth = float(v);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingElevation, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingElevation = float(v);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingStrength, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingStrength = std::clamp(float(v), 0.0f, 1.0f);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingDepthScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingDepthScale = std::max(0.01f, float(v));
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
     if (_viewerManager) {
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             viewer->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
             _viewerManager->setResetDefaultFor(viewer, resetViewOnSurfaceChange);
         }
@@ -5088,12 +2351,9 @@ void CWindow::closeEvent(QCloseEvent* event)
 void CWindow::setWidgetsEnabled(bool state)
 {
     ui.grpVolManager->setEnabled(state);
-    if (_volumeWindowWidget) {
-        _volumeWindowWidget->setControlsEnabled(state);
-    }
-    if (_overlayWindowWidget) {
-        const bool hasOverlay = _volumeOverlay && _volumeOverlay->hasOverlaySelection();
-        _overlayWindowWidget->setControlsEnabled(state && hasOverlay);
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setViewControlsEnabled(state);
+        _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay && _volumeOverlay->hasOverlaySelection());
     }
 }
 
@@ -5103,6 +2363,9 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
     updateNormalGridAvailability();
     if (_segmentationModule && _segmentationModule->editingEnabled()) {
         _segmentationModule->setEditingEnabled(false);
+    }
+    if (_segmentationModule) {
+        _segmentationModule->setAnnotateMode(false);
     }
     if (_segmentationWidget) {
         if (!_segmentationModule || _segmentationWidget->isEditingEnabled()) {
@@ -5211,25 +2474,9 @@ void CWindow::onSliceStepSizeChanged(int newSize)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, newSize);
 
-    // Update View dock widget spinbox
-    if (auto* spinSliceStep = ui.spinSliceStepSize) {
-        QSignalBlocker blocker(spinSliceStep);
-        spinSliceStep->setValue(newSize);
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setSliceStepSize(newSize);
     }
-}
-
-std::filesystem::path seg_path_name(const std::filesystem::path &path)
-{
-    std::string name;
-    bool store = false;
-    for(auto elm : path) {
-        if (store)
-            name += "/"+elm.string();
-        else if (elm == "paths")
-            store = true;
-    }
-    name.erase(0,1);
-    return name;
 }
 
 // Open volume package
@@ -5251,26 +2498,6 @@ void CWindow::OpenVolume(const QString& path)
 
     if (!InitializeVolumePkg(aVpkgPath.toStdString())) {
         return;
-    }
-
-    // Detect network-mounted volpkg and inform user about auto-caching
-    {
-        namespace fs = std::filesystem;
-        auto mountInfo = vc::detectNetworkMount(fs::path(aVpkgPath.toStdString()));
-        if (mountInfo.type == vc::FilesystemType::NetworkMount) {
-            auto label = mountInfo.label;
-            if (!mountInfo.cacheDir.empty()) {
-                statusBar()->showMessage(
-                    tr("Detected %1 mount (use_cache active) \u2014 using s3fs disk cache")
-                        .arg(QString::fromStdString(label)), 8000);
-                Logger()->info("Detected {} mount with use_cache={}; using s3fs disk cache",
-                               label, mountInfo.cacheDir);
-            } else {
-                statusBar()->showMessage(
-                    tr("Detected %1 mount").arg(QString::fromStdString(label)), 8000);
-                Logger()->info("Detected network filesystem ({})", label);
-            }
-        }
     }
 
     // Check version number
@@ -5434,7 +2661,9 @@ void CWindow::CloseVolume(void)
         _fileWatcher->stopWatching();
     }
 
-    clearTransformPreview(false);
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->clearPreview(false);
+    }
 
     // Tear down active segmentation editing before surfaces disappear to avoid
     // dangling pointers inside the edit manager when the underlying surfaces
@@ -5473,7 +2702,9 @@ void CWindow::CloseVolume(void)
         _volumeOverlay->clearVolumePkg();
     }
 
-    refreshTransformsPanelState();
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
 }
 
 // Handle open request
@@ -5487,13 +2718,6 @@ auto CWindow::can_change_volume_() -> bool
         return true;
     }
     return false;
-}
-
-// Handle request to step impact range down
-void CWindow::onLocChanged(void)
-{
-    // std::cout << "loc changed!" << "\n";
-
 }
 
 void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)
@@ -5516,24 +2740,6 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
     }
     else {
     }
-}
-
-void CWindow::onManualPlaneChanged(void)
-{
-    cv::Vec3f normal;
-
-    for(int i=0;i<3;i++) {
-        normal[i] = spNorm[i]->value();
-    }
-
-    auto planeShared = _state->surface("manual plane");
-    PlaneSurface *plane = dynamic_cast<PlaneSurface*>(planeShared.get());
-
-    if (!plane)
-        return;
-
-    plane->setNormal(normal);
-    _state->setSurface("manual plane", planeShared);
 }
 
 void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
@@ -5583,7 +2789,9 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         }
     }
 
-    if (_axisAlignedSliceController) {
+    const bool activatingAxisAlignedPlane =
+        newSurfId == "xy plane" || newSurfId == "seg xz" || newSurfId == "seg yz";
+    if (_axisAlignedSliceController && !activatingAxisAlignedPlane) {
         _axisAlignedSliceController->resetAll();
     }
 
@@ -5635,7 +2843,9 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         _surfacePanel->refreshFiltersOnly();
     }
 
-    refreshTransformsPanelState();
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
 }
 
 void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface)
@@ -5688,7 +2898,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
                 if (targetSurface) {
                     _segmentationModule->endEditingSession();
                     if (_segmentationModule->beginEditingSession(targetSurface) && _viewerManager) {
-                        _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
+                        _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
                             if (viewer) {
                                 viewer->clearOverlayGroup("segmentation_radius_indicator");
                             }
@@ -5719,7 +2929,9 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
         _surfacePanel->refreshFiltersOnly();
     }
 
-    refreshTransformsPanelState();
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
 }
 
 void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)
@@ -5987,20 +3199,9 @@ void CWindow::onManualLocationChanged()
 
 void CWindow::onZoomIn()
 {
-    // Get the active sub-window
-    QMdiSubWindow* activeWindow = mdiArea->activeSubWindow();
-    if (!activeWindow) return;
-
-    // Get the viewer from the active window
-    CTiledVolumeViewer* viewer = qobject_cast<CTiledVolumeViewer*>(activeWindow->widget());
-    if (!viewer) return;
-
-    // Get the center of the current view as the zoom point
-    QPointF center = viewer->fGraphicsView->mapToScene(
-        viewer->fGraphicsView->viewport()->rect().center());
-
-    // Trigger zoom in (positive steps)
-    viewer->onZoom(1, center, Qt::NoModifier);
+    if (auto* viewer = activeBaseViewer()) {
+        viewer->adjustZoomByFactor(1.15f);
+    }
 }
 
 void CWindow::onFocusPOIChanged(std::string name, POI* poi)
@@ -6075,20 +3276,9 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
 
 void CWindow::onZoomOut()
 {
-    // Get the active sub-window
-    QMdiSubWindow* activeWindow = mdiArea->activeSubWindow();
-    if (!activeWindow) return;
-
-    // Get the viewer from the active window
-    CTiledVolumeViewer* viewer = qobject_cast<CTiledVolumeViewer*>(activeWindow->widget());
-    if (!viewer) return;
-
-    // Get the center of the current view as the zoom point
-    QPointF center = viewer->fGraphicsView->mapToScene(
-        viewer->fGraphicsView->viewport()->rect().center());
-
-    // Trigger zoom out (negative steps)
-    viewer->onZoom(-1, center, Qt::NoModifier);
+    if (auto* viewer = activeBaseViewer()) {
+        viewer->adjustZoomByFactor(1.0f / 1.15f);
+    }
 }
 
 void CWindow::onCopyCoordinates()
@@ -6163,7 +3353,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
 
     // Set flag BEFORE beginEditingSession so the surface change doesn't reset view
     if (_viewerManager) {
-        _viewerManager->forEachViewer([this, enabled](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([this, enabled](VolumeViewerBase* viewer) {
             if (!viewer) {
                 return;
             }
@@ -6192,7 +3382,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         }
 
         if (_viewerManager) {
-            _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->clearOverlayGroup("segmentation_radius_indicator");
                 }
@@ -6210,7 +3400,9 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
     statusBar()->showMessage(message, 2000);
-    refreshTransformsPanelState();
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
 }
 
 void CWindow::onSegmentationStopToolsRequested()
@@ -6391,7 +3583,7 @@ void CWindow::onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft,
     }
 
     // Propagate to all viewers
-    _viewerManager->forEachViewer([&selectedSurfaces](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([&selectedSurfaces](VolumeViewerBase* viewer) {
         viewer->setSurfaceOverlays(selectedSurfaces);
     });
 }
@@ -6611,7 +3803,7 @@ void CWindow::onNewFiberRequested()
 void CWindow::onFiberCrosshairModeChanged(bool active)
 {
     if (!_viewerManager) return;
-    _viewerManager->forEachViewer([active](CTiledVolumeViewer* v) {
+    _viewerManager->forEachBaseViewer([active](VolumeViewerBase* v) {
         if (v->graphicsView()) {
             v->graphicsView()->setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
         }
@@ -6629,8 +3821,11 @@ void CWindow::onFiberViewersRequested()
     for (int i = 0; i < N; ++i) {
         QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
 
-        auto* viewer = newConnectedViewer(
+        auto* baseViewer = newConnectedViewer(
             FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
+        auto* viewer = baseViewer
+            ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())
+            : nullptr;
         if (!viewer) continue;
 
         _fiberController->setFiberViewer(i, viewer);

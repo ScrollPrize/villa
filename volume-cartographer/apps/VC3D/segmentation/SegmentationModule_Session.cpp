@@ -3,7 +3,6 @@
 #include "../CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
-#include "tools/CellReoptimizationTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
@@ -69,6 +68,8 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
     emitPendingChanges();
     _pendingAutosave = false;
+    _pendingAutosaveVertexUpdates.clear();
+    _saveSnapshot.reset();
     _autosaveNotifiedFailure = false;
     updateAutosaveState();
     return true;
@@ -116,10 +117,10 @@ void SegmentationModule::endEditingSession()
     if (_editManager) {
         _editManager->endSession();
     }
-    if (_cellReoptTool) {
-        _cellReoptTool->setSurface(nullptr);
+    if (!_saveInProgress) {
+        _saveSnapshot.reset();
     }
-
+    _pendingAutosaveVertexUpdates.clear();
     updateAutosaveState();
 }
 
@@ -358,12 +359,9 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
         _overlay->loadApprovalMaskImage(baseSurf);
     }
 
-    // Auto-approve the growth region if approval mask is active (growth = reviewed/corrected)
-    // Now that images are correctly sized, we can safely paint the auto-approval
-    // Skip auto-approval for cell reoptimization - user hasn't reviewed results yet
-    const bool skipAutoApproval = _skipAutoApprovalOnGrowth;
-    _skipAutoApprovalOnGrowth = false;  // Clear flag regardless
-    if (!skipAutoApproval && _autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData() && vertexRect.area() > 0) {
+    // Auto-approve the growth region if approval mask is active (growth = reviewed/corrected).
+    // Now that images are correctly sized, we can safely paint the auto-approval.
+    if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData() && vertexRect.area() > 0) {
         std::vector<std::pair<int, int>> gridPositions;
         gridPositions.reserve(static_cast<size_t>(vertexRect.area()));
         for (int row = vertexRect.y; row < vertexRect.y + vertexRect.height; ++row) {

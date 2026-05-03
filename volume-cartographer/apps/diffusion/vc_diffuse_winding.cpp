@@ -26,7 +26,7 @@
 
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/GridStore.hpp"
 
 #include "discrete.hpp"
@@ -193,7 +193,9 @@ int main(int argc, char** argv) {
     cv::Mat slice_mat(shape[1], shape[2], CV_8U);
     Array3D<uint8_t> slice_data({1, shape[1], shape[2]});
     cv::Vec3i offset = {z_slice, 0, 0};
-    auto cache = vc::cache::openFilesystemPipeline(ds.get(), 4llu*1024*1024*1024, ds->path());
+    auto cache = vc::render::createChunkCache(
+        vc::render::openLocalZarrPyramid(ds->path()),
+        4llu*1024*1024*1024);
     readArea3D(slice_data, offset, cache.get(), 0);
     
     for (int y = 0; y < shape[1]; ++y) {

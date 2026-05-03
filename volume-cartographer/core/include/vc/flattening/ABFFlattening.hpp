@@ -2,6 +2,8 @@
 
 #include <opencv2/core.hpp>
 #include <cstddef>
+#include <string>
+#include <vector>
 
 // Forward declaration
 class QuadSurface;
@@ -40,6 +42,27 @@ struct ABFConfig {
     bool rotateHighZToTop = false;
 };
 
+struct ABFVertexIssue {
+    cv::Vec2i point = {-1, -1};
+    float score = 0.f;
+};
+
+struct ABFDiagnostics {
+    bool success = false;
+    bool exploded = false;
+    std::string failureReason;
+    std::size_t abfIterations = 0;
+    double abfGradient = 0.0;
+    int validUvCount = 0;
+    int flippedTriangles = 0;
+    int nearZeroUvTriangles = 0;
+    int crowdedUvPairs = 0;
+    float maxVertexBadness = 0.f;
+    cv::Mat_<cv::Vec2f> uv;
+    cv::Mat_<float> vertexBadness;
+    std::vector<ABFVertexIssue> worstVertices;
+};
+
 /**
  * @brief Flatten a QuadSurface mesh using ABF++ (Angle-Based Flattening)
  *
@@ -52,6 +75,17 @@ struct ABFConfig {
  * @return cv::Mat_<cv::Vec2f> UV coordinates matching grid layout, or empty on failure
  */
 cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& config = {});
+
+/**
+ * @brief Run ABF/LSCM and return per-grid-vertex diagnostics.
+ *
+ * The returned badness combines ABF angle-constraint diagnostics with
+ * post-LSCM UV sanity checks such as flipped/near-zero triangles and extreme
+ * stretch/compression. Grid coordinates are row/col in the provided surface.
+ */
+ABFDiagnostics diagnoseAbfFlattening(const QuadSurface& surface,
+                                     const ABFConfig& config = {},
+                                     std::size_t maxWorstVertices = 64);
 
 /**
  * @brief Flatten and store UVs in the surface's "uv" channel
