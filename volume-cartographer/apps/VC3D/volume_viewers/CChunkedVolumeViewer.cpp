@@ -2448,15 +2448,9 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
     if (modifiers & Qt::ShiftModifier) {
         _zOff += static_cast<float>(steps) * _zScrollSensitivity;
         _genCacheDirty = true;
-        const double motionPx = std::abs(double(steps)) * 96.0;
-        markInteractiveMotion(motionPx);
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
             const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
             prefetchPlaneNormalNeighbors(*plane, renderStartLevel(false), options);
-        }
-        if (shouldRefreshInteractivePreview()) {
-            _renderPending = false;
-            submitRender();
         }
         scheduleRender();
     } else if (modifiers & Qt::ControlModifier) {
