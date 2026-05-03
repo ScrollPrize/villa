@@ -32,6 +32,7 @@ class QGraphicsItem;
 class QGraphicsScene;
 class QTimer;
 struct POI;
+class PlaneSurface;
 class Surface;
 class ViewerManager;
 class ViewerStatsBar;
@@ -53,7 +54,7 @@ public:
     void setIntersects(const std::set<std::string>& names) override { _intersectTgts = names; renderIntersections(); }
     void renderVisible(bool force = false) override;
     void requestRender() override { scheduleRender(); }
-    void invalidateVis() override { _genCacheDirty = true; _stableFramebufferValid = false; }
+    void invalidateVis() override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
     void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) override;
     void adjustSurfaceOffset(float delta) override;
@@ -241,11 +242,15 @@ private:
                            const cv::Vec3f& vyStep,
                            int startLevel,
                            const vc::render::ChunkedPlaneSampler::Options& options);
+    void prefetchPlaneNormalNeighbors(PlaneSurface& plane,
+                                      int startLevel,
+                                      const vc::render::ChunkedPlaneSampler::Options& options);
     void prefetchSurfaceHalo(Surface& surf,
                              int startLevel,
                              const vc::render::ChunkedPlaneSampler::Options& options,
                              int fbW,
                              int fbH);
+    void prefetchVisibleSurfaceChunks(int priorityOffset = 0);
     struct RenderContext;
     struct RenderResult;
     struct GeneratedSurfaceCache;
@@ -299,6 +304,16 @@ private:
     cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
+
+    struct SurfaceChunkPrefetchCache {
+        Surface* surface = nullptr;
+        int level = -1;
+        vc::Sampling sampling = vc::Sampling::Trilinear;
+        bool valid = false;
+        cv::Rect prefetchedCellRect;
+        std::unordered_map<std::uint64_t, std::vector<vc::render::ChunkKey>> tileKeys;
+    };
+    SurfaceChunkPrefetchCache _surfaceChunkPrefetchCache;
 
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;

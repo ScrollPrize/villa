@@ -642,23 +642,8 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
     auto processTileRange = [&](std::size_t begin, std::size_t end) {
         ChunkedPlaneSampler::Stats localStats;
         LocalChunkCache chunkCache(array);
-        std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
-        tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
         for (std::size_t i = begin; i < end; ++i) {
             const SampleTile& sampleTile = tiles[i];
-            tileKeys.clear();
-            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
-                const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
-                const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
-                    if (!overwriteCovered && coverageRow[x])
-                        continue;
-                    (void)collectPointDependencies(array, access, level, coordRow[x],
-                                                   options.sampling, true, tileKeys);
-                }
-            }
-            requestDependencies(chunkCache, tileKeys, localStats);
-
             for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
                 const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
                 uint8_t* outRow = out.ptr<uint8_t>(y);
