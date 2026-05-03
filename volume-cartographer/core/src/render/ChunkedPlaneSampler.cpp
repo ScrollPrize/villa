@@ -1,11 +1,16 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 
+#include <utils/thread_pool.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <future>
 #include <limits>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace vc::render {
 namespace {
@@ -37,11 +42,42 @@ struct LocalChunkCache {
     std::unordered_set<ChunkKey, ChunkKeyHash> errorKeys;
 };
 
+constexpr int kParallelMinPixels = 128 * 128;
+constexpr int kMaxRenderSamplerWorkers = 8;
+
+int renderSamplerWorkerCount()
+{
+    const unsigned hc = std::thread::hardware_concurrency();
+    if (hc <= 2)
+        return 1;
+    return std::clamp(static_cast<int>(hc) - 2, 1, kMaxRenderSamplerWorkers);
+}
+
+utils::ThreadPool& renderSamplerPool()
+{
+    static utils::ThreadPool pool(static_cast<std::size_t>(renderSamplerWorkerCount()));
+    return pool;
+}
+
+bool shouldParallelizeSamples(int rows, int cols)
+{
+    return renderSamplerWorkerCount() > 1 &&
+           rows > 0 && cols > 0 &&
+           rows * cols >= kParallelMinPixels;
+}
+
 struct LevelAccess {
     std::array<int, 3> shape{};
     std::array<int, 3> chunkShape{};
     IChunkedArray::LevelTransform transform;
     uint8_t fill = 0;
+};
+
+struct SampleTile {
+    int tx = 0;
+    int ty = 0;
+    int xEnd = 0;
+    int yEnd = 0;
 };
 
 bool finiteCoord(const cv::Vec3f& p)
@@ -496,48 +532,81 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
-    LocalChunkCache chunkCache(array);
     const int tile = std::max(1, options.tileSize);
-    std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
-    tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
+    std::vector<SampleTile> tiles;
+    tiles.reserve(std::size_t((out.rows + tile - 1) / tile) *
+                  std::size_t((out.cols + tile - 1) / tile));
     for (int ty = 0; ty < out.rows; ty += tile) {
         const int yEnd = std::min(ty + tile, out.rows);
         for (int tx = 0; tx < out.cols; tx += tile) {
             const int xEnd = std::min(tx + tile, out.cols);
+            tiles.push_back({tx, ty, xEnd, yEnd});
+        }
+    }
+
+    auto processTileRange = [&](std::size_t begin, std::size_t end) {
+        ChunkedPlaneSampler::Stats localStats;
+        LocalChunkCache chunkCache(array);
+        std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
+        tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
+        for (std::size_t i = begin; i < end; ++i) {
+            const SampleTile& sampleTile = tiles[i];
             tileKeys.clear();
-            for (int y = ty; y < yEnd; ++y) {
+            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
                 const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
                 const cv::Vec3f rowBase = origin + vyStep * float(y);
-                for (int x = tx; x < xEnd; ++x) {
+                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
                     if (!overwriteCovered && coverageRow[x])
                         continue;
                     (void)collectPointDependencies(array, access, level, rowBase + vxStep * float(x),
                                                    options.sampling, false, tileKeys);
                 }
             }
-            requestDependencies(chunkCache, tileKeys, stats);
+            requestDependencies(chunkCache, tileKeys, localStats);
 
-            for (int y = ty; y < yEnd; ++y) {
+            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
                 uint8_t* outRow = out.ptr<uint8_t>(y);
                 uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
                 const cv::Vec3f rowBase = origin + vyStep * float(y);
-                for (int x = tx; x < xEnd; ++x) {
+                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
                     if (!overwriteCovered && coverageRow[x])
                         continue;
 
                     uint8_t value = 0;
                     if (samplePoint(array, chunkCache, access, level, rowBase + vxStep * float(x),
                                     options.sampling, false, value,
-                                    stats.requestedChunks, stats.errorChunks)) {
+                                    localStats.requestedChunks, localStats.errorChunks)) {
                         const bool wasCovered = coverageRow[x] != 0;
                         outRow[x] = value;
                         coverageRow[x] = 1;
                         if (!wasCovered)
-                            ++stats.coveredPixels;
+                            ++localStats.coveredPixels;
                     }
                 }
             }
         }
+        return localStats;
+    };
+
+    if (!shouldParallelizeSamples(out.rows, out.cols) || tiles.size() <= 1)
+        return processTileRange(0, tiles.size());
+
+    const std::size_t workerCount = std::min<std::size_t>(
+        renderSamplerPool().worker_count(), tiles.size());
+    const std::size_t tilesPerWorker = (tiles.size() + workerCount - 1) / workerCount;
+    std::vector<std::future<ChunkedPlaneSampler::Stats>> futures;
+    futures.reserve(workerCount);
+    for (std::size_t worker = 0; worker < workerCount; ++worker) {
+        const std::size_t begin = worker * tilesPerWorker;
+        const std::size_t end = std::min(begin + tilesPerWorker, tiles.size());
+        if (begin >= end)
+            break;
+        futures.push_back(renderSamplerPool().submit([&, begin, end] {
+            return processTileRange(begin, end);
+        }));
+    }
+    for (auto& future : futures) {
+        addStats(stats, future.get());
     }
     return stats;
 }
@@ -556,49 +625,82 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
-    LocalChunkCache chunkCache(array);
     const int tile = std::max(1, options.tileSize);
     const int h = std::min({coords.rows, out.rows, coverage.rows});
     const int w = std::min({coords.cols, out.cols, coverage.cols});
-    std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
-    tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
+    std::vector<SampleTile> tiles;
+    tiles.reserve(std::size_t((h + tile - 1) / tile) *
+                  std::size_t((w + tile - 1) / tile));
     for (int ty = 0; ty < h; ty += tile) {
         const int yEnd = std::min(ty + tile, h);
         for (int tx = 0; tx < w; tx += tile) {
             const int xEnd = std::min(tx + tile, w);
+            tiles.push_back({tx, ty, xEnd, yEnd});
+        }
+    }
+
+    auto processTileRange = [&](std::size_t begin, std::size_t end) {
+        ChunkedPlaneSampler::Stats localStats;
+        LocalChunkCache chunkCache(array);
+        std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
+        tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
+        for (std::size_t i = begin; i < end; ++i) {
+            const SampleTile& sampleTile = tiles[i];
             tileKeys.clear();
-            for (int y = ty; y < yEnd; ++y) {
+            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
                 const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
                 const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                for (int x = tx; x < xEnd; ++x) {
+                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
                     if (!overwriteCovered && coverageRow[x])
                         continue;
                     (void)collectPointDependencies(array, access, level, coordRow[x],
                                                    options.sampling, true, tileKeys);
                 }
             }
-            requestDependencies(chunkCache, tileKeys, stats);
+            requestDependencies(chunkCache, tileKeys, localStats);
 
-            for (int y = ty; y < yEnd; ++y) {
+            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
                 const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
                 uint8_t* outRow = out.ptr<uint8_t>(y);
                 uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                for (int x = tx; x < xEnd; ++x) {
+                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
                     if (!overwriteCovered && coverageRow[x])
                         continue;
 
                     uint8_t value = 0;
                     if (samplePoint(array, chunkCache, access, level, coordRow[x], options.sampling,
-                                    true, value, stats.requestedChunks, stats.errorChunks)) {
+                                    true, value, localStats.requestedChunks, localStats.errorChunks)) {
                         const bool wasCovered = coverageRow[x] != 0;
                         outRow[x] = value;
                         coverageRow[x] = 1;
                         if (!wasCovered)
-                            ++stats.coveredPixels;
+                            ++localStats.coveredPixels;
                     }
                 }
             }
         }
+        return localStats;
+    };
+
+    if (!shouldParallelizeSamples(h, w) || tiles.size() <= 1)
+        return processTileRange(0, tiles.size());
+
+    const std::size_t workerCount = std::min<std::size_t>(
+        renderSamplerPool().worker_count(), tiles.size());
+    const std::size_t tilesPerWorker = (tiles.size() + workerCount - 1) / workerCount;
+    std::vector<std::future<ChunkedPlaneSampler::Stats>> futures;
+    futures.reserve(workerCount);
+    for (std::size_t worker = 0; worker < workerCount; ++worker) {
+        const std::size_t begin = worker * tilesPerWorker;
+        const std::size_t end = std::min(begin + tilesPerWorker, tiles.size());
+        if (begin >= end)
+            break;
+        futures.push_back(renderSamplerPool().submit([&, begin, end] {
+            return processTileRange(begin, end);
+        }));
+    }
+    for (auto& future : futures) {
+        addStats(stats, future.get());
     }
     return stats;
 }
