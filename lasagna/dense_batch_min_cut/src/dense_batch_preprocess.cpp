@@ -119,12 +119,15 @@ struct Args {
     cv::Point source{-1, -1};
     int grid_step = 50;
     float backtrack_distance = 10.0f;
+    float flow_weight_one = 100.0f;
+    float flow_weight_zero = 20.0f;
 };
 
 void print_usage(const char* argv0) {
     std::cerr << "Usage: " << argv0
               << " -i <image> [--source x,y] [--grid-step pixels]"
-              << " [--backtrack-distance pixels]\n";
+              << " [--backtrack-distance pixels]"
+              << " [--flow-weight-one value] [--flow-weight-zero value]\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -147,6 +150,10 @@ Args parse_args(int argc, char** argv) {
         } else if (key == "--backtrack-distance" && i + 1 < argc) {
             args.backtrack_distance =
                 std::max(0.0f, std::stof(argv[++i]));
+        } else if (key == "--flow-weight-one" && i + 1 < argc) {
+            args.flow_weight_one = std::stof(argv[++i]);
+        } else if (key == "--flow-weight-zero" && i + 1 < argc) {
+            args.flow_weight_zero = std::stof(argv[++i]);
         } else if (key == "--help" || key == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -2081,6 +2088,7 @@ struct DenseFlowResult {
     cv::Mat edge_flow_px;
     cv::Mat edge_flow_px_gray_bg;
     cv::Mat graph_source_edges;
+    cv::Mat flow_gate_weight;
     int source_edges = 0;
     int seeded_nodes = 0;
     float finite_edge_flow_min = 0.0f;
@@ -5273,6 +5281,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             edge_flow_px,
             edge_flow_px_gray_bg,
             graph_source_edges,
+            cv::Mat(),
             source_edge_count,
             seeded_node_count,
             finite_edge_flow_min,
@@ -5359,6 +5368,66 @@ cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
     });
 
     return out;
+}
+
+cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
+                                       const cv::Mat& dt,
+                                       const cv::Point source,
+                                       const int grid_step,
+                                       const float configured_one,
+                                       const float configured_zero) {
+    CV_Assert(flow.type() == CV_32F);
+    CV_Assert(dt.type() == CV_32F);
+    CV_Assert(flow.size() == dt.size());
+    const int rows = flow.rows;
+    const int cols = flow.cols;
+    cv::Mat weight(flow.size(), CV_32F, cv::Scalar(0));
+    if (source.x < 0 || source.x >= cols || source.y < 0 ||
+        source.y >= rows) {
+        return weight;
+    }
+
+    const float safe_one = std::max(1.0e-6f, configured_one);
+    const float seed_dt = dt.at<float>(source.y, source.x);
+    float effective_one = safe_one;
+    float effective_zero = configured_zero;
+    if (seed_dt > 0.0f && seed_dt < safe_one) {
+        const float scale = seed_dt / safe_one;
+        effective_one = seed_dt;
+        effective_zero = configured_zero * scale;
+    }
+    if (effective_one <= effective_zero) {
+        effective_zero = std::max(0.0f, effective_one - 1.0f);
+    }
+    const float denom = std::max(1.0e-6f, effective_one - effective_zero);
+    const float seed_radius_px =
+        2.0f * static_cast<float>(std::max(1, grid_step));
+    const float seed_radius_sq = seed_radius_px * seed_radius_px;
+
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            float* out_row = weight.ptr<float>(y);
+            const float* flow_row = flow.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                float value = (flow_row[x] - effective_zero) / denom;
+                value = std::max(0.0f, std::min(1.0f, value));
+                const float dx = static_cast<float>(x - source.x);
+                const float dy = static_cast<float>(y - source.y);
+                if (dx * dx + dy * dy <= seed_radius_sq) {
+                    value = 1.0f;
+                }
+                out_row[x] = value;
+            }
+        }
+    });
+
+    std::cout << "Flow gate weight:\n"
+              << "  seed_dt: " << seed_dt << "\n"
+              << "  configured_zero: " << configured_zero << "\n"
+              << "  configured_one: " << safe_one << "\n"
+              << "  effective_zero: " << effective_zero << "\n"
+              << "  effective_one: " << effective_one << "\n";
+    return weight;
 }
 
 cv::Mat labels_to_u16(const cv::Mat& labels, int max_label) {
@@ -6064,11 +6133,21 @@ int main(int argc, char** argv) {
         DenseFlowResult dense_flow_result;
         bool has_dense_flow = false;
         if (args.has_source) {
-        dense_flow_result =
+            dense_flow_result =
                 compute_dense_source_flow(
                     white_domain, dt, graph,
                     component_voronoi_result.source_pixel_ridges, args.source,
                     args.grid_step, args.backtrack_distance);
+            {
+                const TimingMark timing = start_timing();
+                dense_flow_result.flow_gate_weight =
+                    compute_flow_gate_weight_image(
+                        dense_flow_result.tree_dense_flow, dt, args.source,
+                        args.grid_step, args.flow_weight_one,
+                        args.flow_weight_zero);
+                timings.push_back(
+                    finish_timing("flow_gate_weight", timing));
+            }
             timings.insert(timings.end(), dense_flow_result.timings.begin(),
                            dense_flow_result.timings.end());
             has_dense_flow = true;
@@ -6169,6 +6248,8 @@ int main(int argc, char** argv) {
                         dense_flow_result.edge_flow_px_gray_bg);
             write_image(workdir / (stem + "_graph_source_edges.tif"),
                         dense_flow_result.graph_source_edges);
+            write_image(workdir / (stem + "_flow_gate_weight.tif"),
+                        dense_flow_result.flow_gate_weight);
             timings.push_back(finish_timing("dense_flow_write", timing));
         }
 
@@ -6232,6 +6313,9 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"graph_source_edges",
                  to_float_layer(dense_flow_result.graph_source_edges)});
+            layered_tiff.push_back(
+                {"flow_gate_weight",
+                 to_float_layer(dense_flow_result.flow_gate_weight)});
         }
         {
             const TimingMark timing = start_timing();

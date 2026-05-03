@@ -170,11 +170,32 @@ def _flow_gate_white_domain_u8(pred_u8: np.ndarray, threshold: float) -> np.ndar
 	return white_domain.astype(np.uint8) * 255
 
 
+def _flow_gate_seed_dt(pred_u8: np.ndarray, threshold: float, source_x: int, source_y: int) -> float:
+	if source_x < 0 or source_x >= pred_u8.shape[1] or source_y < 0 or source_y >= pred_u8.shape[0]:
+		return 0.0
+	white_domain = _flow_gate_white_domain_u8(pred_u8, threshold)
+	try:
+		import cv2
+		dt = cv2.distanceTransform(white_domain, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+		return float(dt[source_y, source_x])
+	except Exception:
+		# Fallback is only for environments missing cv2; the C++ path uses OpenCV.
+		if white_domain[source_y, source_x] == 0:
+			return 0.0
+		ys, xs = np.nonzero(white_domain == 0)
+		if xs.size == 0:
+			return 0.0
+		dx = xs.astype(np.float32) - float(source_x)
+		dy = ys.astype(np.float32) - float(source_y)
+		return float(np.sqrt(np.min(dx * dx + dy * dy)))
+
+
 def _sample_pred_dt_max3d(
 	*,
 	res: fit_model.FitResult3D,
 	xyz_hr: torch.Tensor,
 	radius: int,
+	step_scale: float,
 ) -> torch.Tensor:
 	"""Pred-dt render for flow gating, max-pooled in 3D around surface samples."""
 	r = int(max(0, radius))
@@ -197,7 +218,7 @@ def _sample_pred_dt_max3d(
 		device=xyz_hr.device,
 		dtype=xyz_hr.dtype,
 	)
-	offsets = offsets * spacing.view(1, 3)
+	offsets = offsets * spacing.view(1, 3) * float(step_scale)
 	query = xyz_hr.unsqueeze(0) + offsets.view(-1, 1, 1, 3)
 	sampled = res.data.grid_sample_fullres(query).pred_dt
 	if sampled is None:
@@ -343,10 +364,11 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 		raise RuntimeError("pred_dt_flow_gate requires pred_dt to be loaded")
 
 	threshold = _FLOW_GATE_THRESHOLD
-	flow_zero = float(cfg.get("flow_zero", 50.0))
-	flow_one = float(cfg.get("flow_one", 300.0))
+	flow_zero = float(cfg.get("flow_zero", 20.0))
+	flow_one = float(cfg.get("flow_one", 100.0))
 	backtrack_distance = float(cfg.get("backtrack_distance", 10.0))
 	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 1))
+	pred_dt_pool_step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
 	if flow_one <= flow_zero:
 		raise ValueError("pred_dt_flow_gate requires flow_one > flow_zero")
 	debug = bool(cfg.get("debug", True))
@@ -362,6 +384,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 			res=res,
 			xyz_hr=xyz_hr,
 			radius=pred_dt_pool_radius,
+			step_scale=pred_dt_pool_step_scale,
 		)
 		pred_img = pred_hr.detach().clamp(0, 255).round().to(torch.uint8).cpu().numpy()
 		He, We = pred_img.shape
@@ -510,12 +533,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 			device=res.xyz_lr.device,
 			dtype=torch.float32,
 		).view(1, 1, Hm, Wm)
-		seed_flow = float(dense_flow[source_y, source_x]) if 0 <= source_y < He and 0 <= source_x < We else 0.0
+		seed_dt = _flow_gate_seed_dt(pred_img, threshold, source_x, source_y)
 		effective_flow_one = flow_one
 		effective_flow_zero = flow_zero
-		if seed_flow > 0.0 and seed_flow < flow_one:
-			scale = seed_flow / flow_one
-			effective_flow_one = seed_flow
+		if seed_dt > 0.0 and seed_dt < flow_one:
+			scale = seed_dt / flow_one
+			effective_flow_one = seed_dt
 			effective_flow_zero = flow_zero * scale
 		if effective_flow_one <= effective_flow_zero:
 			effective_flow_zero = max(0.0, effective_flow_one - 1.0)
