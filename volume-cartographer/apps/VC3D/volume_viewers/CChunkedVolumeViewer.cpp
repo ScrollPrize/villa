@@ -1657,8 +1657,12 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
     if (visibleCells.empty())
         return;
 
-    const int padX = std::max(kSurfaceCellTileSize, visibleCells.width / 2);
-    const int padY = std::max(kSurfaceCellTileSize, visibleCells.height / 2);
+    const float cellsPerPixelX =
+        float(visibleCells.width) / float(std::max(1, _framebuffer.width()));
+    const float cellsPerPixelY =
+        float(visibleCells.height) / float(std::max(1, _framebuffer.height()));
+    const int padX = std::max(1, int(std::ceil(float(kChunkPrefetchHaloPx) * cellsPerPixelX)) + 2);
+    const int padY = std::max(1, int(std::ceil(float(kChunkPrefetchHaloPx) * cellsPerPixelY)) + 2);
     cv::Rect paddedCells(
         visibleCells.x - padX,
         visibleCells.y - padY,
