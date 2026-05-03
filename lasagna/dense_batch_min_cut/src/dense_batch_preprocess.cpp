@@ -2089,6 +2089,8 @@ struct DenseFlowResult {
     cv::Mat edge_flow_px_gray_bg;
     cv::Mat graph_source_edges;
     cv::Mat flow_gate_weight;
+    cv::Point source_seed_pixel{-1, -1};
+    float source_seed_capacity = 0.0f;
     int source_edges = 0;
     int seeded_nodes = 0;
     float finite_edge_flow_min = 0.0f;
@@ -3957,6 +3959,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     rebuild_graph_edge_maps();
 
     int source_seed_node = -1;
+    cv::Point source_seed_pixel(-1, -1);
     float source_seed_capacity = 0.0f;
     {
         const TimingMark timing = start_timing();
@@ -4081,6 +4084,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                 }
 
                 const cv::Point split_pixel = ordered[split_index];
+                source_seed_pixel = split_pixel;
                 source_seed_node = static_cast<int>(graph.nodes.size());
                 graph.nodes.push_back(cv::Point2f(
                     static_cast<float>(split_pixel.x),
@@ -4123,6 +4127,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         }
         std::cout << "Source graph split:\n"
                   << "  source_seed_node: " << source_seed_node << "\n"
+                  << "  source_seed_pixel: (" << source_seed_pixel.x
+                  << "," << source_seed_pixel.y << ")\n"
                   << "  source_seed_capacity: " << source_seed_capacity << "\n";
         timings.push_back(finish_timing("source_region_detect", timing));
     }
@@ -5282,6 +5288,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             edge_flow_px_gray_bg,
             graph_source_edges,
             cv::Mat(),
+            source_seed_pixel,
+            source_seed_capacity,
             source_edge_count,
             seeded_node_count,
             finite_edge_flow_min,
@@ -5372,7 +5380,8 @@ cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
 
 cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
                                        const cv::Mat& dt,
-                                       const cv::Point source,
+                                       const cv::Point gate_source,
+                                       const float gate_source_capacity,
                                        const int grid_step,
                                        const float configured_one,
                                        const float configured_zero) {
@@ -5382,18 +5391,21 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
     const int rows = flow.rows;
     const int cols = flow.cols;
     cv::Mat weight(flow.size(), CV_32F, cv::Scalar(0));
-    if (source.x < 0 || source.x >= cols || source.y < 0 ||
-        source.y >= rows) {
+    if (gate_source.x < 0 || gate_source.x >= cols || gate_source.y < 0 ||
+        gate_source.y >= rows) {
         return weight;
     }
 
     const float safe_one = std::max(1.0e-6f, configured_one);
-    const float seed_dt = dt.at<float>(source.y, source.x);
+    const float seed_dt = dt.at<float>(gate_source.y, gate_source.x);
+    const float seed_capacity =
+        gate_source_capacity > 0.0f ? gate_source_capacity
+                                    : capacity_from_dt(seed_dt);
     float effective_one = safe_one;
     float effective_zero = configured_zero;
-    if (seed_dt > 0.0f && seed_dt < safe_one) {
-        const float scale = seed_dt / safe_one;
-        effective_one = seed_dt;
+    if (seed_capacity > 0.0f && seed_capacity < safe_one) {
+        const float scale = seed_capacity / safe_one;
+        effective_one = seed_capacity;
         effective_zero = configured_zero * scale;
     }
     if (effective_one <= effective_zero) {
@@ -5411,8 +5423,8 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
             for (int x = 0; x < cols; ++x) {
                 float value = (flow_row[x] - effective_zero) / denom;
                 value = std::max(0.0f, std::min(1.0f, value));
-                const float dx = static_cast<float>(x - source.x);
-                const float dy = static_cast<float>(y - source.y);
+                const float dx = static_cast<float>(x - gate_source.x);
+                const float dy = static_cast<float>(y - gate_source.y);
                 if (dx * dx + dy * dy <= seed_radius_sq) {
                     value = 1.0f;
                 }
@@ -5422,7 +5434,10 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
     });
 
     std::cout << "Flow gate weight:\n"
-              << "  seed_dt: " << seed_dt << "\n"
+              << "  gate_source: (" << gate_source.x << "," << gate_source.y
+              << ")\n"
+              << "  gate_source_dt: " << seed_dt << "\n"
+              << "  gate_source_capacity: " << seed_capacity << "\n"
               << "  configured_zero: " << configured_zero << "\n"
               << "  configured_one: " << safe_one << "\n"
               << "  effective_zero: " << effective_zero << "\n"
@@ -5832,6 +5847,9 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                                         float* graph_edge_flow_rgb,
                                         int grid_step,
                                         float backtrack_distance,
+                                        int* resolved_source_x,
+                                        int* resolved_source_y,
+                                        float* resolved_source_capacity,
                                         char* error_message,
                                         int error_message_size,
                                         int verbose) {
@@ -5939,6 +5957,15 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                 white_domain, dt, graph,
                 component_voronoi_result.source_pixel_ridges, source,
                 grid_step, backtrack_distance);
+        if (resolved_source_x != nullptr) {
+            *resolved_source_x = dense_flow_result.source_seed_pixel.x;
+        }
+        if (resolved_source_y != nullptr) {
+            *resolved_source_y = dense_flow_result.source_seed_pixel.y;
+        }
+        if (resolved_source_capacity != nullptr) {
+            *resolved_source_capacity = dense_flow_result.source_seed_capacity;
+        }
         timings.insert(timings.end(), dense_flow_result.timings.begin(),
                        dense_flow_result.timings.end());
 
@@ -6142,9 +6169,10 @@ int main(int argc, char** argv) {
                 const TimingMark timing = start_timing();
                 dense_flow_result.flow_gate_weight =
                     compute_flow_gate_weight_image(
-                        dense_flow_result.tree_dense_flow, dt, args.source,
-                        args.grid_step, args.flow_weight_one,
-                        args.flow_weight_zero);
+                        dense_flow_result.tree_dense_flow, dt,
+                        dense_flow_result.source_seed_pixel,
+                        dense_flow_result.source_seed_capacity, args.grid_step,
+                        args.flow_weight_one, args.flow_weight_zero);
                 timings.push_back(
                     finish_timing("flow_gate_weight", timing));
             }

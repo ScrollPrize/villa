@@ -39,6 +39,9 @@ def _load_library() -> ctypes.CDLL:
 				ctypes.POINTER(ctypes.c_float),
 				ctypes.c_int,
 				ctypes.c_float,
+				ctypes.POINTER(ctypes.c_int),
+				ctypes.POINTER(ctypes.c_int),
+				ctypes.POINTER(ctypes.c_float),
 				ctypes.c_char_p,
 				ctypes.c_int,
 				ctypes.c_int,
@@ -62,6 +65,7 @@ def compute_flow_grid(
 	query_xy: np.ndarray,
 	verbose: bool = False,
 	return_debug: bool = False,
+	return_metadata: bool = False,
 	grid_step: int = 50,
 	backtrack_distance: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -83,6 +87,9 @@ def compute_flow_grid(
 	dense_flow = np.zeros((height, width), dtype=np.float32)
 	smooth_grid_flow = np.zeros((height, width), dtype=np.float32) if return_debug else None
 	graph_edge_flow = np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
+	resolved_source_x = ctypes.c_int(-1)
+	resolved_source_y = ctypes.c_int(-1)
+	resolved_source_capacity = ctypes.c_float(0.0)
 	err = ctypes.create_string_buffer(4096)
 	lib = _load_library()
 	rc = lib.dense_batch_flow_grid_u8(
@@ -107,6 +114,9 @@ def compute_flow_grid(
 		),
 		int(max(1, grid_step)),
 		ctypes.c_float(max(0.0, float(backtrack_distance))),
+		ctypes.byref(resolved_source_x),
+		ctypes.byref(resolved_source_y),
+		ctypes.byref(resolved_source_capacity),
 		err,
 		ctypes.sizeof(err),
 		1 if verbose else 0,
@@ -114,6 +124,15 @@ def compute_flow_grid(
 	if rc != 0:
 		message = err.value.decode("utf-8", errors="replace")
 		raise RuntimeError(f"dense_batch_flow failed: {message}")
+	metadata = {
+		"source_x": int(resolved_source_x.value),
+		"source_y": int(resolved_source_y.value),
+		"source_capacity": float(resolved_source_capacity.value),
+	}
 	if return_debug:
-		return query_flow, dense_flow, smooth_grid_flow, graph_edge_flow
-	return query_flow, dense_flow
+		result = (query_flow, dense_flow, smooth_grid_flow, graph_edge_flow)
+	else:
+		result = (query_flow, dense_flow)
+	if return_metadata:
+		return (*result, metadata)
+	return result

@@ -512,14 +512,15 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 				query_xy=query_xy,
 				verbose=False,
 				return_debug=write_layer_debug,
+				return_metadata=True,
 				grid_step=grid_step,
 				backtrack_distance=backtrack_distance,
 			)
 			done("compute_flow_grid", _t)
 			if write_layer_debug:
-				query_flow, dense_flow, smooth_grid_flow, graph_edge_flow_rgb = flow_outputs
+				query_flow, dense_flow, smooth_grid_flow, graph_edge_flow_rgb, flow_metadata = flow_outputs
 			else:
-				query_flow, dense_flow = flow_outputs
+				query_flow, dense_flow, flow_metadata = flow_outputs
 				smooth_grid_flow = None
 				graph_edge_flow_rgb = None
 		except RuntimeError as exc:
@@ -584,12 +585,14 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 			dtype=torch.float32,
 		).view(1, 1, Hm, Wm)
 		_t = mark("compute_weight")
-		seed_dt = _flow_gate_seed_dt(pred_img, threshold, source_x, source_y)
+		seed_capacity = float(flow_metadata.get("source_capacity", 0.0))
+		if seed_capacity <= 0.0:
+			seed_capacity = _flow_gate_seed_dt(pred_img, threshold, source_x, source_y)
 		effective_flow_one = flow_one
 		effective_flow_zero = flow_zero
-		if seed_dt > 0.0 and seed_dt < flow_one:
-			scale = seed_dt / flow_one
-			effective_flow_one = seed_dt
+		if seed_capacity > 0.0 and seed_capacity < flow_one:
+			scale = seed_capacity / flow_one
+			effective_flow_one = seed_capacity
 			effective_flow_zero = flow_zero * scale
 		if effective_flow_one <= effective_flow_zero:
 			effective_flow_zero = max(0.0, effective_flow_one - 1.0)
