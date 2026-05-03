@@ -422,7 +422,7 @@ def optimize(
 			_stage_done(f"{label}.ensure_data", _t)
 
 		# Initial evaluation
-		def _eval_terms(res_, eff_):
+		def _eval_terms(res_, eff_, *, profile_label: str | None = None):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
@@ -439,7 +439,10 @@ def optimize(
 				else:
 					if _need_term(name, eff_) == 0.0:
 						continue
+				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				result = t["loss"](res=res_)
+				if _t_loss is not None:
+					_stage_done(f"{profile_label}.{name}", _t_loss)
 				if isinstance(result, dict):
 					for sub_name, (lv, lms, masks) in result.items():
 						w = _need_term(sub_name, eff_)
@@ -497,15 +500,24 @@ def optimize(
 
 		_t = _stage_start(f"{label}.initial_eval")
 		with torch.no_grad():
+			_t_forward = _stage_start(f"{label}.initial_eval.model_forward")
 			res0 = model(data)
-			loss0, term_vals0 = _eval_terms(res0, opt_cfg.eff)
+			_stage_done(f"{label}.initial_eval.model_forward", _t_forward)
+			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
+			loss0, term_vals0 = _eval_terms(
+				res0, opt_cfg.eff, profile_label=f"{label}.initial_eval.loss")
+			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
+			_t_params = _stage_start(f"{label}.initial_eval.param_values")
 			param_vals0: dict[str, float] = {}
 			for k, vs in all_params.items():
 				if len(vs) == 1 and vs[0].numel() == 1:
 					param_vals0[k] = float(vs[0].detach().cpu())
+			_stage_done(f"{label}.initial_eval.param_values", _t_params)
+			_t_status = _stage_start(f"{label}.initial_eval.status_print")
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
+			_stage_done(f"{label}.initial_eval.status_print", _t_status)
 			# Print corr detail after initial eval (first stage only)
 			if not _corr_start_printed[0] and "corr" in term_vals0:
 				opt_loss_corr.print_detail("START")

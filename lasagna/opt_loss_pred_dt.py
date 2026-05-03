@@ -170,6 +170,44 @@ def _flow_gate_white_domain_u8(pred_u8: np.ndarray, threshold: float) -> np.ndar
 	return white_domain.astype(np.uint8) * 255
 
 
+def _sample_pred_dt_max3d(
+	*,
+	res: fit_model.FitResult3D,
+	xyz_hr: torch.Tensor,
+	radius: int,
+) -> torch.Tensor:
+	"""Pred-dt render for flow gating, max-pooled in 3D around surface samples."""
+	r = int(max(0, radius))
+	if r <= 0:
+		pred_hr = res.data_s.pred_dt.squeeze(0).squeeze(0)
+		if pred_hr.ndim != 3 or pred_hr.shape[0] != 1:
+			raise RuntimeError(f"pred_dt_flow_gate expected pred_dt render shape (1,H,W), got {tuple(pred_hr.shape)}")
+		return pred_hr[0]
+
+	offsets = torch.tensor(
+		[(dx, dy, dz)
+		 for dz in range(-r, r + 1)
+		 for dy in range(-r, r + 1)
+		 for dx in range(-r, r + 1)],
+		device=xyz_hr.device,
+		dtype=xyz_hr.dtype,
+	)
+	spacing = torch.tensor(
+		res.data._spacing_for("pred_dt"),
+		device=xyz_hr.device,
+		dtype=xyz_hr.dtype,
+	)
+	offsets = offsets * spacing.view(1, 3)
+	query = xyz_hr.unsqueeze(0) + offsets.view(-1, 1, 1, 3)
+	sampled = res.data.grid_sample_fullres(query).pred_dt
+	if sampled is None:
+		raise RuntimeError("pred_dt_flow_gate requires pred_dt to be loaded")
+	pred = sampled.squeeze(0).squeeze(0)
+	if pred.ndim != 3:
+		raise RuntimeError(f"pred_dt_flow_gate expected pooled pred_dt shape (N,H,W), got {tuple(pred.shape)}")
+	return pred.amax(dim=0)
+
+
 def configure_flow_gate(
 	*,
 	cfg: dict | None,
@@ -308,6 +346,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 	flow_zero = float(cfg.get("flow_zero", 50.0))
 	flow_one = float(cfg.get("flow_one", 300.0))
 	backtrack_distance = float(cfg.get("backtrack_distance", 10.0))
+	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 1))
 	if flow_one <= flow_zero:
 		raise ValueError("pred_dt_flow_gate requires flow_one > flow_zero")
 	debug = bool(cfg.get("debug", True))
@@ -318,13 +357,15 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 	write_layer_debug = debug and (debug_index % 10) == 0
 
 	with torch.no_grad():
-		pred_hr = res.data_s.pred_dt.squeeze(0).squeeze(0)
-		if pred_hr.ndim != 3 or pred_hr.shape[0] != 1:
-			raise RuntimeError(f"pred_dt_flow_gate expected pred_dt render shape (1,H,W), got {tuple(pred_hr.shape)}")
-		pred_img = pred_hr[0].detach().clamp(0, 255).round().to(torch.uint8).cpu().numpy()
+		xyz_hr = res.xyz_hr[0].detach()
+		pred_hr = _sample_pred_dt_max3d(
+			res=res,
+			xyz_hr=xyz_hr,
+			radius=pred_dt_pool_radius,
+		)
+		pred_img = pred_hr.detach().clamp(0, 255).round().to(torch.uint8).cpu().numpy()
 		He, We = pred_img.shape
 
-		xyz_hr = res.xyz_hr[0].detach()
 		seed = torch.tensor(_flow_gate_seed_xyz, device=xyz_hr.device, dtype=xyz_hr.dtype)
 		n_gt = _seed_gt_normal(seed_xyz=seed, res=res)
 		source_xy = None
