@@ -84,31 +84,42 @@ def _seed_surface_intersection_xy(
 	if H < 2 or W < 2:
 		return None
 
-	best: tuple[float, float, float] | None = None
-	best_score = float("inf")
-	for y in range(H - 1):
-		for x in range(W - 1):
-			P00 = xyz_img[y, x]
-			P10 = xyz_img[y + 1, x]
-			P01 = xyz_img[y, x + 1]
-			P11 = xyz_img[y + 1, x + 1]
-			try:
-				u, v, p = _intersect_single_quad(
-					seed_xyz, n_gt, P00, P10, P01, P11, 0.5, 0.5)
-			except Exception:
-				continue
-			if u < -1.0e-4 or u > 1.0 + 1.0e-4 or v < -1.0e-4 or v > 1.0 + 1.0e-4:
-				continue
-			delta = p - seed_xyz
-			t = torch.dot(delta, n_gt).item()
-			residual = (delta - t * n_gt).norm().item()
-			score = residual * 1000.0 + abs(t)
-			if score < best_score:
-				best_score = score
-				best = (float(x) + float(v), float(y) + float(u), t)
-	if best is None:
+	M00 = xyz_img[:-1, :-1]
+	M10 = xyz_img[1:, :-1]
+	M01 = xyz_img[:-1, 1:]
+	M11 = xyz_img[1:, 1:]
+	frac_h = torch.tensor(0.5, device=xyz_img.device, dtype=xyz_img.dtype)
+	frac_w = torch.tensor(0.5, device=xyz_img.device, dtype=xyz_img.dtype)
+
+	u, v = fit_model.Model3D._ray_bilinear_intersect(
+		seed_xyz, n_gt, M00, M10, M01, M11, frac_h, frac_w)
+	valid = (
+		torch.isfinite(u) & torch.isfinite(v) &
+		(u >= -1.0e-4) & (u <= 1.0 + 1.0e-4) &
+		(v >= -1.0e-4) & (v <= 1.0 + 1.0e-4)
+	)
+	p = (
+		(1.0 - u).unsqueeze(-1) * (1.0 - v).unsqueeze(-1) * M00 +
+		u.unsqueeze(-1) * (1.0 - v).unsqueeze(-1) * M10 +
+		(1.0 - u).unsqueeze(-1) * v.unsqueeze(-1) * M01 +
+		u.unsqueeze(-1) * v.unsqueeze(-1) * M11
+	)
+	delta = p - seed_xyz.view(1, 1, 3)
+	t = (delta * n_gt.view(1, 1, 3)).sum(dim=-1)
+	residual = (delta - t.unsqueeze(-1) * n_gt.view(1, 1, 3)).norm(dim=-1)
+	score = residual * 1000.0 + t.abs()
+	score = score.masked_fill(~valid, float("inf"))
+	best_flat_t = torch.argmin(score)
+	best_score = score.reshape(-1)[best_flat_t]
+	if not torch.isfinite(best_score).detach().cpu().item():
 		return None
-	return best[0], best[1]
+	best_flat = int(best_flat_t.detach().cpu())
+	y = best_flat // (W - 1)
+	x = best_flat % (W - 1)
+	return (
+		float((torch.as_tensor(float(x), device=xyz_img.device, dtype=xyz_img.dtype) + v[y, x]).detach().cpu()),
+		float((torch.as_tensor(float(y), device=xyz_img.device, dtype=xyz_img.dtype) + u[y, x]).detach().cpu()),
+	)
 
 
 def _seed_surface_intersection_xy_from_cache(

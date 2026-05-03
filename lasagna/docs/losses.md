@@ -47,6 +47,7 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
       "enabled": true,
       "flow_zero": 50.0,
       "flow_one": 300.0,
+      "backtrack_distance": 10.0,
       "debug": true
     }
   }
@@ -59,6 +60,14 @@ grid corners. The resulting gate is linearly mapped from `flow_zero -> 0` to
 `flow_one -> 1` and multiplies the `pred_dt` loss map. The loss denominator
 remains the original validity-mask sum; the gate is intentionally not
 renormalized.
+
+`backtrack_distance` is measured in the rendered `pred_dt` image pixel units.
+It is passed through to the dense grid flow routing and matches the C++ debug
+CLI option:
+
+```bash
+./dense_batch_preprocess -i pred.tif --source 240,240 --grid-step 4 --backtrack-distance 10
+```
 
 ## 4) Add visualization output (loss map)
 
