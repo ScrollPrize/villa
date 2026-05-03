@@ -19,6 +19,22 @@
 namespace
 {
 
+void reparentItemWidgets(QLayoutItem* item, QWidget* newParent)
+{
+    if (!item || !newParent) {
+        return;
+    }
+    if (auto* widget = item->widget()) {
+        widget->setParent(newParent);
+        return;
+    }
+    if (auto* layout = item->layout()) {
+        for (int i = 0; i < layout->count(); ++i) {
+            reparentItemWidgets(layout->itemAt(i), newParent);
+        }
+    }
+}
+
 void moveLayoutItems(QLayout* from, QLayout* to, QWidget* newParent)
 {
     if (!from || !to) {
@@ -27,12 +43,9 @@ void moveLayoutItems(QLayout* from, QLayout* to, QWidget* newParent)
     to->setContentsMargins(from->contentsMargins());
     to->setSpacing(from->spacing());
     while (auto* item = from->takeAt(0)) {
-        if (newParent) {
-            if (auto* widget = item->widget()) {
-                widget->setParent(newParent);
-            } else if (auto* layout = item->layout()) {
-                layout->setParent(newParent);
-            }
+        reparentItemWidgets(item, newParent);
+        if (auto* layout = item->layout()) {
+            layout->setParent(to);
         }
         to->addItem(item);
     }

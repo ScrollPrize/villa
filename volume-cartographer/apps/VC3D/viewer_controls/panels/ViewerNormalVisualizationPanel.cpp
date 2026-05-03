@@ -16,6 +16,22 @@
 namespace
 {
 
+void reparentItemWidgets(QLayoutItem* item, QWidget* newParent)
+{
+    if (!item || !newParent) {
+        return;
+    }
+    if (auto* widget = item->widget()) {
+        widget->setParent(newParent);
+        return;
+    }
+    if (auto* layout = item->layout()) {
+        for (int i = 0; i < layout->count(); ++i) {
+            reparentItemWidgets(layout->itemAt(i), newParent);
+        }
+    }
+}
+
 void moveGridLayoutItems(QGridLayout* from, QGridLayout* to, QWidget* newParent)
 {
     if (!from || !to) {
@@ -39,12 +55,9 @@ void moveGridLayoutItems(QGridLayout* from, QGridLayout* to, QWidget* newParent)
         int columnSpan = 1;
         from->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
         if (auto* item = from->takeAt(index)) {
-            if (newParent) {
-                if (auto* widget = item->widget()) {
-                    widget->setParent(newParent);
-                } else if (auto* layout = item->layout()) {
-                    layout->setParent(newParent);
-                }
+            reparentItemWidgets(item, newParent);
+            if (auto* layout = item->layout()) {
+                layout->setParent(to);
             }
             to->addItem(item, row, column, rowSpan, columnSpan, item->alignment());
         }
