@@ -540,6 +540,10 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
 
     const GridKey centerKey = _activeDrag.center;
     bool centerUpdated = false;
+    int minRow = std::numeric_limits<int>::max();
+    int maxRow = std::numeric_limits<int>::min();
+    int minCol = std::numeric_limits<int>::max();
+    int maxCol = std::numeric_limits<int>::min();
 
     for (std::size_t i = 0; i < sampleCount; ++i) {
         const auto& sample = _activeDrag.samples[i];
@@ -550,8 +554,12 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
 
         const cv::Vec3f scaledWorld = sample.baseWorld + (rawTarget - sample.baseWorld) * _editScale;
         (*_previewPoints)(sample.row, sample.col) = scaledWorld;
-        recordVertexEdit(sample.row, sample.col, scaledWorld);
+        recordVertexEdit(sample.row, sample.col, scaledWorld, false);
         _recentTouched.push_back(GridKey{sample.row, sample.col});
+        minRow = std::min(minRow, sample.row);
+        maxRow = std::max(maxRow, sample.row);
+        minCol = std::min(minCol, sample.col);
+        maxCol = std::max(maxCol, sample.col);
 
         if (!centerUpdated && sample.row == centerKey.row && sample.col == centerKey.col) {
             _activeDrag.targetWorld = scaledWorld;
@@ -562,6 +570,8 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
     if (!centerUpdated) {
         _activeDrag.targetWorld = newWorldPositions.front();
     }
+
+    queuePatchIndexRangeForVertices(minRow, maxRow, minCol, maxCol);
 
     _hasPendingEdits = true;
     if (_pendingGrowthMarking) {

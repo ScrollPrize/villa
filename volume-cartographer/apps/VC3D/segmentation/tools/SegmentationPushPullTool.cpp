@@ -932,9 +932,11 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         return;
     }
 
-    if (auto* manager = _module.viewerManager()) {
-        if (auto* index = manager->surfacePatchIndex()) {
-            index->flushPendingUpdates(surface);
+    if (viewer->surfName() != "segmentation") {
+        if (auto* manager = _module.viewerManager()) {
+            if (auto* index = manager->surfacePatchIndex()) {
+                index->flushPendingUpdates(surface);
+            }
         }
     }
 

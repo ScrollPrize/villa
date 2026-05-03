@@ -2170,6 +2170,22 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
     _drag.lastWorld = worldPos;
     _drag.moved = true;
 
+    if (_drag.viewer) {
+        if (const auto touched = _editManager->recentTouchedBounds()) {
+            const cv::Rect changedCells(touched->x - 1,
+                                        touched->y - 1,
+                                        touched->width + 1,
+                                        touched->height + 1);
+            _drag.viewer->invalidateVisRegion("segmentation", changedCells);
+            _drag.viewer->invalidateIntersectRegion("segmentation", changedCells);
+        } else {
+            _drag.viewer->invalidateVis();
+            _drag.viewer->invalidateIntersect("segmentation");
+        }
+        _drag.viewer->renderIntersections();
+        _drag.viewer->requestRender();
+    }
+
     refreshOverlay();
     emitPendingChanges();
 }

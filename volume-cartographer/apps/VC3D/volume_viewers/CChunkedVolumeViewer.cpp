@@ -770,7 +770,6 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     _surfWeak = surf;
     if (isSameCurrentSurface && isEditUpdate) {
         _genCacheDirty = true;
-        _surfaceChunkPrefetchCache = {};
         _zOffWorldDir = {0, 0, 0};
         _stableFramebufferValid = false;
         updateContentBounds();
@@ -3147,7 +3146,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     // Pan/zoom can reuse the same paths by transforming the existing items.
     fp.cameraHash = 0;
     fp.valid = true;
-    if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
+    if (_lastIntersectFp == fp && !_intersectionItems.empty() &&
+        !_flattenedIntersectionDirtyCells) {
         updateIntersectionPreviewTransform();
         return;
     }
@@ -3452,10 +3452,16 @@ void CChunkedVolumeViewer::renderIntersections()
         return;
     }
 
+    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
     std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
     auto addTarget = [&](const std::string& name) {
-        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name)))
+        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name))) {
+            if (activeSeg && quad != activeSeg && !activeSeg->id.empty() &&
+                quad->id == activeSeg->id) {
+                return;
+            }
             targets.insert(std::move(quad));
+        }
     };
     for (const auto& name : _intersectTgts) {
         if (name == "visible_segmentation") {
@@ -3500,8 +3506,6 @@ void CChunkedVolumeViewer::renderIntersections()
     cv::Rect planeRoi{int(std::floor(minX)), int(std::floor(minY)),
                       std::max(1, int(std::ceil(maxX - minX))),
                       std::max(1, int(std::ceil(maxY - minY)))};
-
-    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
 
     IntersectFingerprint fp;
     fp.roiX = planeRoi.x;
