@@ -66,6 +66,7 @@ private:
     void launchAlphaCompute();
     void applyAlphaResult();
     void refreshActiveViewer(VolumeViewerBase* viewer);
+    void setDeferredPlaneIntersections(VolumeViewerBase* activeViewer, bool defer);
 
     static std::optional<cv::Vec3f> computeAlphaTargetStatic(
         const cv::Vec3f& centerWorld,
@@ -90,7 +91,10 @@ private:
     };
 
     State _ppState;
+    VolumeViewerBase* _activeViewer{nullptr};
+    VolumeViewerBase* _deferredPlaneIntersectionActiveViewer{nullptr};
     QTimer* _timer{nullptr};
+    QTimer* _deferredPlaneIntersectionReleaseTimer{nullptr};
     float _stepMultiplier{4.0f};
     bool _activeAlphaEnabled{false};
     bool _alphaOverrideActive{false};

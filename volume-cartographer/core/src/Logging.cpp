@@ -11,6 +11,7 @@
 
 namespace {
 std::atomic_bool g_debugLoggingEnabled{false};
+std::atomic_bool g_profileLoggingEnabled{false};
 }
 
 // Internal implementation class
@@ -140,4 +141,12 @@ void SetDebugLoggingEnabled(bool enabled) {
 
 bool DebugLoggingEnabled() {
     return g_debugLoggingEnabled.load(std::memory_order_relaxed);
+}
+
+void SetProfileLoggingEnabled(bool enabled) {
+    g_profileLoggingEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool ProfileLoggingEnabled() {
+    return g_profileLoggingEnabled.load(std::memory_order_relaxed);
 }

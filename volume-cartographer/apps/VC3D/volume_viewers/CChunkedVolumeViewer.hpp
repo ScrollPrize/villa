@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <source_location>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,6 +30,7 @@
 
 class CState;
 class QGraphicsItem;
+class QGraphicsPathItem;
 class QGraphicsScene;
 class QTimer;
 struct POI;
@@ -51,9 +53,14 @@ public:
 
     void setPointCollection(VCCollection* pc) { _pointCollection = pc; }
     void setSurface(const std::string& name) override;
-    void setIntersects(const std::set<std::string>& names) override { _intersectTgts = names; renderIntersections(); }
-    void renderVisible(bool force = false) override;
-    void requestRender() override { scheduleRender(); }
+    void setIntersects(const std::set<std::string>& names) override { _intersectTgts = names; renderIntersections("setIntersects"); }
+    void renderVisible(
+        bool force = false,
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) override;
+    void requestRender(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) override;
     void invalidateVis() override;
     void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells) override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
@@ -73,14 +80,14 @@ public:
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
-    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { _compositeSettings = s; scheduleRender(); }
+    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { _compositeSettings = s; scheduleRender("setCompositeRenderSettings"); }
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
     bool isCompositeEnabled() const override { return _compositeSettings.enabled && !streamingCompositeUnsupported(); }
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
     void setVolumeWindow(float low, float high) override;
-    void setBaseColormap(const std::string& id) override { _baseColormapId = id; scheduleRender(); }
-    void setStretchValues(bool) { scheduleRender(); }
+    void setBaseColormap(const std::string& id) override { _baseColormapId = id; scheduleRender("setBaseColormap"); }
+    void setStretchValues(bool) { scheduleRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
 
     void setShowDirectionHints(bool on) override { _showDirectionHints = on; emit overlaysUpdated(); }
@@ -98,7 +105,8 @@ public:
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
 
-    void setSegmentationEditActive(bool) override {}
+    void setSegmentationEditActive(bool active) override { _segmentationEditActive = active; }
+    void setSegmentationIntersectionDeferral(bool active) override;
     void setSegmentationCursorMirroring(bool) override {}
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
@@ -118,16 +126,18 @@ public:
     QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect) override;
     void clearSelections() override;
 
-    void renderIntersections() override;
+    void renderIntersections(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) override;
     void invalidateIntersect(const std::string& = "") override;
     void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells) override;
     float intersectionOpacity() const override { return _intersectionOpacity; }
     float intersectionThickness() const override { return _intersectionThickness; }
     int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
-    void setIntersectionOpacity(float v) override { _intersectionOpacity = v; renderIntersections(); }
-    void setIntersectionThickness(float v) override { _intersectionThickness = v; renderIntersections(); }
+    void setIntersectionOpacity(float v) override { _intersectionOpacity = v; renderIntersections("setIntersectionOpacity"); }
+    void setIntersectionThickness(float v) override { _intersectionThickness = v; renderIntersections("setIntersectionThickness"); }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
-    void setSurfacePatchSamplingStride(int s) override { _surfacePatchSamplingStride = s; invalidateIntersect(); renderIntersections(); }
+    void setSurfacePatchSamplingStride(int s) override { _surfacePatchSamplingStride = s; invalidateIntersect(); renderIntersections("setSurfacePatchSamplingStride"); }
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;
@@ -196,8 +206,15 @@ signals:
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
 
 private:
-    void scheduleRender();
-    void submitRender();
+    void scheduleRender(
+        const char* reason = "internal caller",
+        std::source_location caller = std::source_location::current());
+    void scheduleIntersectionRender(
+        const char* reason = "internal caller",
+        std::source_location caller = std::source_location::current());
+    void submitRender(
+        const char* reason = "internal caller",
+        std::source_location caller = std::source_location::current());
     void updateStatusLabel();
     void rebuildChunkArray();
     void syncCameraTransform();
@@ -266,7 +283,9 @@ private:
     void updateFocusMarker(POI* poi = nullptr);
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
-    void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf);
+    void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
+                                      const char* reason,
+                                      std::source_location caller);
     QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
 
     CState* _state = nullptr;
@@ -277,10 +296,19 @@ private:
     ViewerStatsBar* _statsBar = nullptr;
     QTimer* _renderTimer = nullptr;
     QTimer* _settleRenderTimer = nullptr;
+    QTimer* _intersectionRenderTimer = nullptr;
     QTimer* _resizeRenderTimer = nullptr;
     QTimer* _statusTimer = nullptr;
     bool _renderPending = false;
     bool _interactivePreview = false;
+    bool _segmentationEditActive = false;
+    bool _deferSegmentationIntersections = false;
+    bool _deferredSegmentationIntersectionsDirty = false;
+    bool _suppressNextSurfaceEditRender = false;
+    std::string _pendingRenderReason;
+    std::string _pendingRenderCaller;
+    std::string _pendingIntersectionReason;
+    std::string _pendingIntersectionCaller;
     QElapsedTimer _interactionClock;
     qint64 _lastInteractionMs = -1;
     qint64 _lastInteractivePreviewMs = -1;
@@ -416,7 +444,7 @@ private:
         uint64_t generation = 0;
         bool valid = false;
         std::unordered_map<std::uint64_t, std::vector<FlattenedIntersectionLine>> cellLines;
-        std::unordered_map<std::uint64_t, std::vector<QGraphicsItem*>> tileItems;
+        std::unordered_map<std::uint64_t, std::vector<QGraphicsPathItem*>> tileItems;
     };
     FlattenedIntersectionCache _flattenedIntersectionCache;
     std::optional<cv::Rect> _flattenedIntersectionDirtyCells;

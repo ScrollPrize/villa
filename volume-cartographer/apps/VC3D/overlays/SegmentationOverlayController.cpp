@@ -66,6 +66,29 @@ qreal manualAddIntersectionWidth(qreal baseWidth)
     return std::max(baseWidth * kManualAddIntersectionWidthScale,
                     baseWidth + kManualAddIntersectionMinWidthDelta);
 }
+
+std::optional<QPointF> markerGridToScene(VolumeViewerBase* viewer,
+                                         const SegmentationOverlayController::VertexMarker& marker)
+{
+    if (!viewer || viewer->surfName() != "segmentation") {
+        return std::nullopt;
+    }
+
+    auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    if (!quad) {
+        return std::nullopt;
+    }
+
+    const cv::Vec2f scale = quad->scale();
+    if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
+        return std::nullopt;
+    }
+
+    const cv::Vec3f center = quad->center();
+    const float surfaceX = static_cast<float>(marker.col) / scale[0] - center[0];
+    const float surfaceY = static_cast<float>(marker.row) / scale[1] - center[1];
+    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+}
 }
 
 bool SegmentationOverlayController::State::operator==(const State& rhs) const
@@ -1089,7 +1112,8 @@ void SegmentationOverlayController::buildVertexMarkers(const State& state,
     };
 
     const auto appendMarker = [&](VertexMarker marker) {
-        const QPointF scene = viewer->volumeToScene(marker.world);
+        const auto directScene = markerGridToScene(viewer, marker);
+        const QPointF scene = directScene ? *directScene : viewer->volumeToScene(marker.world);
         const auto style = buildStyle(marker);
         builder.addCircle(scene, kMarkerRadius, true, style);
     };

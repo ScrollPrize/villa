@@ -36,6 +36,7 @@ namespace
 constexpr int kPushPullIntervalMs = 16;       // ~60fps for smooth feedback
 constexpr int kPushPullIntervalMsFast = 16;   // Non-alpha mode: faster feedback
 constexpr int kPushPullIntervalMsSlow = 33;   // Alpha mode: ~30fps for responsiveness
+constexpr int kPlaneIntersectionReleaseIdleMs = 180;
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
@@ -382,6 +383,17 @@ SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
     , _state(state)
 {
     ensureTimer();
+    _deferredPlaneIntersectionReleaseTimer = new QTimer(&_module);
+    _deferredPlaneIntersectionReleaseTimer->setSingleShot(true);
+    QObject::connect(_deferredPlaneIntersectionReleaseTimer, &QTimer::timeout,
+                     &_module, [this]() {
+        if (!_deferredPlaneIntersectionActiveViewer) {
+            return;
+        }
+        auto* activeViewer = _deferredPlaneIntersectionActiveViewer;
+        _deferredPlaneIntersectionActiveViewer = nullptr;
+        setDeferredPlaneIntersections(activeViewer, false);
+    });
 
     QObject::connect(&_alphaWatcher, &QFutureWatcher<AlphaResult>::finished,
                      &_module, [this]() { applyAlphaResult(); });
@@ -482,6 +494,16 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
 
     _ppState.active = true;
     _ppState.direction = direction;
+    _activeViewer = hover.viewer;
+    if (_deferredPlaneIntersectionReleaseTimer) {
+        _deferredPlaneIntersectionReleaseTimer->stop();
+    }
+    if (_deferredPlaneIntersectionActiveViewer &&
+        _deferredPlaneIntersectionActiveViewer != _activeViewer) {
+        setDeferredPlaneIntersections(_deferredPlaneIntersectionActiveViewer, false);
+    }
+    _deferredPlaneIntersectionActiveViewer = _activeViewer;
+    setDeferredPlaneIntersections(_activeViewer, true);
     _undoCaptured = false;
 
     // Reset cached position for new operation
@@ -518,8 +540,10 @@ void SegmentationPushPullTool::stop(int direction)
 void SegmentationPushPullTool::stopAll()
 {
     const bool wasActive = _ppState.active;
+    VolumeViewerBase* activeViewer = _activeViewer;
     _ppState.active = false;
     _ppState.direction = 0;
+    _activeViewer = nullptr;
     if (_timer && _timer->isActive()) {
         _timer->stop();
     }
@@ -564,6 +588,16 @@ void SegmentationPushPullTool::stopAll()
         _editManager->applyPreview();
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         _module.emitPendingChanges();
+    }
+
+    if (wasActive) {
+        _deferredPlaneIntersectionActiveViewer = activeViewer;
+        if (_deferredPlaneIntersectionReleaseTimer) {
+            _deferredPlaneIntersectionReleaseTimer->start(kPlaneIntersectionReleaseIdleMs);
+        } else {
+            setDeferredPlaneIntersections(activeViewer, false);
+            _deferredPlaneIntersectionActiveViewer = nullptr;
+        }
     }
 
     _undoCaptured = false;
@@ -936,6 +970,14 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         if (auto* index = manager->surfacePatchIndex()) {
             index->flushPendingUpdates(surface);
         }
+        manager->forEachBaseViewer([viewer](VolumeViewerBase* candidate) {
+            if (!candidate || candidate == viewer) {
+                return;
+            }
+            if (dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
+                candidate->invalidateIntersect("segmentation");
+            }
+        });
     }
 
     if (const auto touched = _editManager->recentTouchedBounds()) {
@@ -949,8 +991,26 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         viewer->invalidateVis();
         viewer->invalidateIntersect("segmentation");
     }
-    viewer->renderIntersections();
-    viewer->requestRender();
+    viewer->requestRender("push/pull active viewer refresh");
+}
+
+void SegmentationPushPullTool::setDeferredPlaneIntersections(VolumeViewerBase* activeViewer,
+                                                             bool defer)
+{
+    auto* manager = _module.viewerManager();
+    if (!manager) {
+        return;
+    }
+
+    manager->forEachBaseViewer([activeViewer, defer](VolumeViewerBase* candidate) {
+        if (!candidate || candidate == activeViewer) {
+            return;
+        }
+        if (defer && !dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
+            return;
+        }
+        candidate->setSegmentationIntersectionDeferral(defer);
+    });
 }
 
 void SegmentationPushPullTool::applyAlphaResult()
