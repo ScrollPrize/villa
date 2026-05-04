@@ -78,8 +78,6 @@ target_link_libraries(utils_c3d_codec PUBLIC c3d)
 target_compile_definitions(utils_c3d_codec PUBLIC UTILS_HAS_C3D_CODEC=1)
 set_target_properties(utils_c3d_codec PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
 
-# Tests
-if(VC_BUILD_TESTS)
-    enable_testing()
+if(VC_BUILD_TESTS AND BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
 endif()

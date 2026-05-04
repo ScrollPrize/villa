@@ -1,5 +1,3 @@
-# VCSanitizers.cmake - Sanitizer and debug instrumentation
-
 if(VC_ENABLE_ASAN AND VC_ENABLE_TSAN)
     message(FATAL_ERROR "AddressSanitizer and ThreadSanitizer cannot be used together")
 endif()
@@ -48,20 +46,6 @@ if(VC_ENABLE_LSAN)
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=leak")
 endif()
 
-# Code coverage (works with both GCC and Clang)
-# Usage:
-#   cmake -DVC_ENABLE_COVERAGE=ON -DCMAKE_BUILD_TYPE=Debug ..
-#   cmake --build . --target VC3D
-#   ./bin/VC3D                    # or run tests, or use the app normally
-#   # GCC: generates .gcda/.gcno files, use gcovr/lcov to report
-#   # Clang: generates .profraw, merge with llvm-profdata, report with llvm-cov
-#
-# Quick report with gcovr (GCC):
-#   gcovr -r ../core --html-details coverage.html
-#
-# Quick report with llvm-cov (Clang):
-#   llvm-profdata merge -sparse *.profraw -o merged.profdata
-#   llvm-cov show ./bin/VC3D -instr-profile=merged.profdata -format=html > coverage.html
 if(VC_ENABLE_COVERAGE)
     message(STATUS "Code coverage enabled")
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -78,7 +62,6 @@ if(VC_ENABLE_COVERAGE)
     endif()
 endif()
 
-# Valgrind: disable LTO, restrict ISA to baseline x86-64
 if(VC_USE_VALGRIND)
     message(STATUS "Valgrind support enabled")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-lto -march=x86-64 -mtune=generic -mno-avx -mno-avx2 -mno-avx512f -mno-fma -mno-bmi -mno-bmi2 -Og -g -fno-omit-frame-pointer")

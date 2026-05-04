@@ -35,7 +35,6 @@ if(NOT DEFINED qt_generate_deploy_app_script)
 endif()
 
 # ---- CUDA sparse toggle ------------------------------------------------------
-option(VC_WITH_CUDA_SPARSE "use cudss" ON)
 if (VC_WITH_CUDA_SPARSE)
     add_definitions(-DVC_USE_CUDA_SPARSE=1)
 endif()

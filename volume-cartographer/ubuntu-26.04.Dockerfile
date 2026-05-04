@@ -5,7 +5,7 @@
 # CI uses this stage via `docker build --target builder` for a cached
 # environment to compile + test in.
 # ============================================================================
-FROM ubuntu:noble AS builder
+FROM ubuntu:26.04 AS builder
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -y \
@@ -24,6 +24,7 @@ RUN apt-get update -y \
         libde265-dev libx265-dev liblz4-dev libtiff-dev \
         flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev \
         libscotch-dev libhwloc-dev \
+        libbacktrace-dev \
         file curl unzip ca-certificates bzip2 wget jq \
         gcovr lcov \
  && rm -rf /var/lib/apt/lists/*
@@ -39,8 +40,6 @@ RUN ARCH=$(uname -m) && \
 
 # ============================================================================
 # Stage 2: build third-party — scotch, pastix, libigl/flatboi.
-# Split out so the toolchain layer above remains cacheable independently of
-# the project sources.
 # ============================================================================
 FROM builder AS thirdparty
 ARG LIBIGL_COMMIT=ae8f959ea26d7059abad4c698aba8d6b7c3205e8
@@ -63,7 +62,6 @@ RUN cp /src/libs/config.in config.in \
  && make -j"$(nproc --all)" SCOTCH_HOME=/usr/local/scotch \
  && make SCOTCH_HOME=/usr/local/scotch install
 
-# libigl: pin to a specific upstream commit, then overlay local patches.
 RUN git clone https://github.com/libigl/libigl.git /src/libs/libigl \
  && cd /src/libs/libigl \
  && git fetch --depth 1 origin ${LIBIGL_COMMIT} \
@@ -94,8 +92,7 @@ RUN cmake --preset ci-release-gcc -B /src/build/ci-release-gcc \
  && cp /src/build/ci-release-gcc/bin/* /usr/local/bin/
 
 # ============================================================================
-# Stage 4: runtime — the published image. Same package set as builder for now;
-# a future PR can split runtime-only deps out for size.
+# Stage 4: runtime — the published image.
 # ============================================================================
 FROM build AS runtime
 

@@ -23,8 +23,6 @@ if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     endforeach()
 endif()
 
-# ccache
-option(VC_USE_CCACHE "Use ccache for compilation" ON)
 if(VC_USE_CCACHE)
     find_program(CCACHE_PROGRAM ccache)
     if(CCACHE_PROGRAM)
