@@ -110,6 +110,10 @@ public:
 
     void setSegmentsChangedCallback(std::function<void()> cb);
 
+    [[nodiscard]] bool hasRemoteCacheRoot() const;
+    [[nodiscard]] std::string remoteCacheRootOrEmpty() const;
+    void setRemoteCacheRoot(const std::filesystem::path& dir);
+
     [[nodiscard]] std::string getVolpkgDirectory() const;
     [[nodiscard]] std::string getSegmentationDirectory() const;
     [[nodiscard]] std::vector<std::string> getAvailableSegmentationDirectories() const;
@@ -128,6 +132,7 @@ private:
     std::string name_ = "Untitled";
     int version_ = 1;
     vc::project::LoadOptions opts_;
+    std::filesystem::path remoteCacheRoot_;
 
     std::vector<vc::project::Entry> volumes_;
     std::vector<vc::project::Entry> segments_;
