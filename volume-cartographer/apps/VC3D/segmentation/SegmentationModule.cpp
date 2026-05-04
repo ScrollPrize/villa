@@ -2174,8 +2174,8 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
         if (const auto touched = _editManager->recentTouchedBounds()) {
             const cv::Rect changedCells(touched->x - 1,
                                         touched->y - 1,
-                                        touched->width + 1,
-                                        touched->height + 1);
+                                        touched->width + 2,
+                                        touched->height + 2);
             _drag.viewer->invalidateVisRegion("segmentation", changedCells);
             _drag.viewer->invalidateIntersectRegion("segmentation", changedCells);
         } else {

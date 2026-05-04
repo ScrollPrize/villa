@@ -211,7 +211,9 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
                                                  ~(Qt::ControlModifier | Qt::KeypadModifier);
     if (pushPullKey && disallowedMods == Qt::NoModifier) {
         if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
-            return false;
+            emit statusMessageRequested(tr("Enable segmentation editing before using push/pull."), kStatusMedium);
+            event->accept();
+            return true;
         }
 
         const int direction = (event->key() == vc3d::keybinds::keypress::PushPullOut.key) ? 1 : -1;
@@ -220,7 +222,10 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             event->accept();
             return true;
         }
-        return false;
+        emit statusMessageRequested(tr("Move the cursor over the segmentation view before using push/pull."),
+                                    kStatusMedium);
+        event->accept();
+        return true;
     }
 
     // Q and E keys to adjust push pull radius

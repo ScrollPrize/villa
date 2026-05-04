@@ -350,6 +350,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
+    qApp->installEventFilter(this);
     const QString baseTitle = windowTitle();
     const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
     if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
@@ -810,6 +811,10 @@ CWindow::CWindow(size_t cacheSizeGB) :
 // Destructor
 CWindow::~CWindow()
 {
+    if (qApp) {
+        qApp->removeEventFilter(this);
+    }
+
     // Backstop in case ~CWindow is reached without closeEvent firing (e.g.
     // if the app is torn down programmatically). Same rationale as the
     // closeEvent hook — skip SurfacePatchIndex removal during teardown.
@@ -858,6 +863,33 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 viewer, &CChunkedVolumeViewer::onMouseMove, Qt::UniqueConnection);
         connect(graphicsView, &CVolumeViewerView::sendMouseRelease,
                 viewer, &CChunkedVolumeViewer::onMouseRelease, Qt::UniqueConnection);
+        if (!graphicsView->property("vc_segmentation_push_pull_keys_bound").toBool()) {
+            connect(graphicsView, &CVolumeViewerView::sendKeyPress,
+                    this, [this](int key, Qt::KeyboardModifiers modifiers) {
+                        if (key != vc3d::keybinds::keypress::PushPullIn.key &&
+                            key != vc3d::keybinds::keypress::PushPullOut.key) {
+                            return;
+                        }
+                        if (!_segmentationModule) {
+                            return;
+                        }
+                        QKeyEvent event(QEvent::KeyPress, key, modifiers);
+                        _segmentationModule->handleKeyPress(&event);
+                    });
+            connect(graphicsView, &CVolumeViewerView::sendKeyRelease,
+                    this, [this](int key, Qt::KeyboardModifiers modifiers) {
+                        if (key != vc3d::keybinds::keypress::PushPullIn.key &&
+                            key != vc3d::keybinds::keypress::PushPullOut.key) {
+                            return;
+                        }
+                        if (!_segmentationModule) {
+                            return;
+                        }
+                        QKeyEvent event(QEvent::KeyRelease, key, modifiers);
+                        _segmentationModule->handleKeyRelease(&event);
+                    });
+            graphicsView->setProperty("vc_segmentation_push_pull_keys_bound", true);
+        }
     }
 
     if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
@@ -2231,6 +2263,51 @@ void CWindow::CreateWidgets(void)
         }
     }
 
+}
+
+bool CWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    if (!event) {
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    const QEvent::Type type = event->type();
+    if (type != QEvent::ShortcutOverride &&
+        type != QEvent::KeyPress &&
+        type != QEvent::KeyRelease) {
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    auto* keyEvent = static_cast<QKeyEvent*>(event);
+    const bool pushPullKey =
+        keyEvent->key() == vc3d::keybinds::keypress::PushPullIn.key ||
+        keyEvent->key() == vc3d::keybinds::keypress::PushPullOut.key;
+    const Qt::KeyboardModifiers disallowedMods = keyEvent->modifiers() &
+                                                 ~(Qt::ControlModifier | Qt::KeypadModifier);
+    if (!pushPullKey || disallowedMods != Qt::NoModifier) {
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    if (type == QEvent::ShortcutOverride) {
+        if (_segmentationModule) {
+            event->accept();
+            return true;
+        }
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    if (!_segmentationModule) {
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    const bool handled = type == QEvent::KeyPress
+        ? _segmentationModule->handleKeyPress(keyEvent)
+        : _segmentationModule->handleKeyRelease(keyEvent);
+    if (handled) {
+        return true;
+    }
+
+    return QMainWindow::eventFilter(watched, event);
 }
 
 // Create menus
