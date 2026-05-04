@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -26,6 +28,7 @@
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
 #include "utils/hash.hpp"
+#include "utils/zarr.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
@@ -338,6 +341,391 @@ std::array<int, 3> xyzToZyx(const std::array<int, 3>& xyz)
     return {xyz[2], xyz[1], xyz[0]};
 }
 
+utils::ZarrDtype zarrDtypeFromChunkDtype(vc::render::ChunkDtype dtype)
+{
+    switch (dtype) {
+    case vc::render::ChunkDtype::UInt8:
+        return utils::ZarrDtype::uint8;
+    case vc::render::ChunkDtype::UInt16:
+        return utils::ZarrDtype::uint16;
+    }
+    throw std::runtime_error("unsupported Volume zarr dtype");
+}
+
+vc::render::ChunkDtype chunkDtypeFromZarr(utils::ZarrDtype dtype)
+{
+    if (dtype == utils::ZarrDtype::uint8)
+        return vc::render::ChunkDtype::UInt8;
+    if (dtype == utils::ZarrDtype::uint16)
+        return vc::render::ChunkDtype::UInt16;
+    throw std::runtime_error("Volume zarr writes only support uint8 and uint16");
+}
+
+template <typename T>
+vc::render::ChunkDtype chunkDtypeFor()
+{
+    if constexpr (std::is_same_v<T, uint8_t>)
+        return vc::render::ChunkDtype::UInt8;
+    else
+        return vc::render::ChunkDtype::UInt16;
+}
+
+template <typename T>
+T typedFillValue(double fill)
+{
+    if constexpr (std::is_same_v<T, uint8_t>)
+        return static_cast<uint8_t>(std::clamp(fill, 0.0, 255.0));
+    else
+        return static_cast<uint16_t>(std::clamp(fill, 0.0, 65535.0));
+}
+
+utils::ZarrArray::Codec zarrCodecFor(const std::string& compressor, int level)
+{
+    if (compressor.empty() || compressor == "none")
+        return {};
+#if UTILS_HAS_COMPRESSION
+    return utils::make_zarr_codec(compressor, level);
+#else
+    throw std::runtime_error("zarr compression support is unavailable for compressor: " + compressor);
+#endif
+}
+
+utils::ZarrArray::CodecRegistry zarrCodecRegistry()
+{
+    utils::ZarrArray::CodecRegistry registry;
+#if UTILS_HAS_COMPRESSION
+    for (const char* name : {"blosc", "zstd", "gzip", "zlib", "lz4"}) {
+        try {
+            registry.emplace(name, utils::make_zarr_codec(name));
+        } catch (...) {
+        }
+    }
+#endif
+    return registry;
+}
+
+utils::ZarrArray openLocalZarrArrayForWrite(const std::filesystem::path& path)
+{
+    auto registry = zarrCodecRegistry();
+    if (!registry.empty())
+        return utils::ZarrArray::open(path, std::move(registry));
+
+    auto array = utils::ZarrArray::open(path);
+    const auto& meta = array.metadata();
+    if (!meta.compressor_id.empty() || !meta.codecs.empty())
+        throw std::runtime_error("cannot write compressed zarr without compression codec support: " + path.string());
+    return array;
+}
+
+std::vector<size_t> toVector(const std::array<size_t, 3>& value)
+{
+    return {value[0], value[1], value[2]};
+}
+
+std::array<size_t, 3> ceilHalfShape(const std::array<size_t, 3>& shape)
+{
+    return {(shape[0] + 1) / 2, (shape[1] + 1) / 2, (shape[2] + 1) / 2};
+}
+
+std::array<size_t, 3> clampChunkShape(const std::array<size_t, 3>& chunkShape,
+                                      const std::array<size_t, 3>& shape)
+{
+    return {
+        std::max<size_t>(1, std::min(chunkShape[0], shape[0])),
+        std::max<size_t>(1, std::min(chunkShape[1], shape[1])),
+        std::max<size_t>(1, std::min(chunkShape[2], shape[2])),
+    };
+}
+
+template <typename T>
+void fillRawChunk(std::vector<std::byte>& chunkBytes, T fill)
+{
+    auto* typed = reinterpret_cast<T*>(chunkBytes.data());
+    std::fill(typed, typed + chunkBytes.size() / sizeof(T), fill);
+}
+
+template <typename T>
+void readZarrRegionZYX(utils::ZarrArray& array,
+                       Array3D<T>& out,
+                       const std::array<size_t, 3>& offsetZYX)
+{
+    const auto& meta = array.metadata();
+    if (chunkDtypeFromZarr(meta.dtype) != chunkDtypeFor<T>())
+        throw std::runtime_error("Volume::read/write dtype does not match zarr dtype");
+    if (meta.shape.size() != 3 || meta.chunks.size() != 3)
+        throw std::runtime_error("Volume zarr region I/O requires 3D arrays");
+
+    const auto outShape = out.shape();
+    if (outShape[0] == 0 || outShape[1] == 0 || outShape[2] == 0)
+        return;
+
+    const T fill = typedFillValue<T>(meta.fill_value.value_or(0.0));
+    out.fill(fill);
+
+    std::array<size_t, 3> shape{meta.shape[0], meta.shape[1], meta.shape[2]};
+    std::array<size_t, 3> chunks{meta.chunks[0], meta.chunks[1], meta.chunks[2]};
+    for (size_t d = 0; d < 3; ++d) {
+        if (offsetZYX[d] >= shape[d])
+            return;
+    }
+
+    const std::array<size_t, 3> endZYX{
+        std::min(shape[0], offsetZYX[0] + outShape[0]),
+        std::min(shape[1], offsetZYX[1] + outShape[1]),
+        std::min(shape[2], offsetZYX[2] + outShape[2]),
+    };
+    if (offsetZYX[0] >= endZYX[0] || offsetZYX[1] >= endZYX[1] || offsetZYX[2] >= endZYX[2])
+        return;
+
+    const size_t chunkBytes = chunks[0] * chunks[1] * chunks[2] * sizeof(T);
+    const size_t chunkStrideY = chunks[2];
+    const size_t chunkStrideZ = chunks[1] * chunkStrideY;
+
+    for (size_t cz = offsetZYX[0] / chunks[0]; cz <= (endZYX[0] - 1) / chunks[0]; ++cz) {
+        const size_t chunkBaseZ = cz * chunks[0];
+        for (size_t cy = offsetZYX[1] / chunks[1]; cy <= (endZYX[1] - 1) / chunks[1]; ++cy) {
+            const size_t chunkBaseY = cy * chunks[1];
+            for (size_t cx = offsetZYX[2] / chunks[2]; cx <= (endZYX[2] - 1) / chunks[2]; ++cx) {
+                const size_t chunkBaseX = cx * chunks[2];
+                const std::array<size_t, 3> indices{cz, cy, cx};
+                auto bytes = array.read_chunk(indices);
+                const T* src = nullptr;
+                if (bytes && bytes->size() >= chunkBytes)
+                    src = reinterpret_cast<const T*>(bytes->data());
+
+                const size_t z0 = std::max(chunkBaseZ, offsetZYX[0]);
+                const size_t y0 = std::max(chunkBaseY, offsetZYX[1]);
+                const size_t x0 = std::max(chunkBaseX, offsetZYX[2]);
+                const size_t z1 = std::min(chunkBaseZ + chunks[0], endZYX[0]);
+                const size_t y1 = std::min(chunkBaseY + chunks[1], endZYX[1]);
+                const size_t x1 = std::min(chunkBaseX + chunks[2], endZYX[2]);
+
+                for (size_t z = z0; z < z1; ++z) {
+                    for (size_t y = y0; y < y1; ++y) {
+                        for (size_t x = x0; x < x1; ++x) {
+                            const size_t dstZ = z - offsetZYX[0];
+                            const size_t dstY = y - offsetZYX[1];
+                            const size_t dstX = x - offsetZYX[2];
+                            if (src) {
+                                const size_t srcOff =
+                                    (z - chunkBaseZ) * chunkStrideZ +
+                                    (y - chunkBaseY) * chunkStrideY +
+                                    (x - chunkBaseX);
+                                out(dstZ, dstY, dstX) = src[srcOff];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+void writeZarrRegionZYX(utils::ZarrArray& array,
+                        const Array3D<T>& data,
+                        const std::array<size_t, 3>& offsetZYX)
+{
+    const auto& meta = array.metadata();
+    if (chunkDtypeFromZarr(meta.dtype) != chunkDtypeFor<T>())
+        throw std::runtime_error("Volume::write dtype does not match zarr dtype");
+    if (meta.shape.size() != 3 || meta.chunks.size() != 3)
+        throw std::runtime_error("Volume zarr writes require 3D arrays");
+
+    const auto regionShape = data.shape();
+    if (regionShape[0] == 0 || regionShape[1] == 0 || regionShape[2] == 0)
+        return;
+
+    std::array<size_t, 3> shape{meta.shape[0], meta.shape[1], meta.shape[2]};
+    std::array<size_t, 3> chunks{meta.chunks[0], meta.chunks[1], meta.chunks[2]};
+    for (size_t d = 0; d < 3; ++d) {
+        if (offsetZYX[d] > shape[d] || regionShape[d] > shape[d] - offsetZYX[d])
+            throw std::out_of_range("Volume::write region exceeds zarr bounds");
+        if (chunks[d] == 0)
+            throw std::runtime_error("Volume::write encountered invalid zarr chunk shape");
+    }
+
+    const T fill = typedFillValue<T>(meta.fill_value.value_or(0.0));
+    const size_t chunkElems = chunks[0] * chunks[1] * chunks[2];
+    const size_t chunkBytes = chunkElems * sizeof(T);
+    const size_t chunkStrideY = chunks[2];
+    const size_t chunkStrideZ = chunks[1] * chunkStrideY;
+    std::vector<std::byte> chunkBuf(chunkBytes);
+
+    const std::array<size_t, 3> endZYX{
+        offsetZYX[0] + regionShape[0],
+        offsetZYX[1] + regionShape[1],
+        offsetZYX[2] + regionShape[2],
+    };
+
+    for (size_t cz = offsetZYX[0] / chunks[0]; cz <= (endZYX[0] - 1) / chunks[0]; ++cz) {
+        const size_t chunkBaseZ = cz * chunks[0];
+        for (size_t cy = offsetZYX[1] / chunks[1]; cy <= (endZYX[1] - 1) / chunks[1]; ++cy) {
+            const size_t chunkBaseY = cy * chunks[1];
+            for (size_t cx = offsetZYX[2] / chunks[2]; cx <= (endZYX[2] - 1) / chunks[2]; ++cx) {
+                const size_t chunkBaseX = cx * chunks[2];
+                const std::array<size_t, 3> indices{cz, cy, cx};
+
+                const size_t z0 = std::max(chunkBaseZ, offsetZYX[0]);
+                const size_t y0 = std::max(chunkBaseY, offsetZYX[1]);
+                const size_t x0 = std::max(chunkBaseX, offsetZYX[2]);
+                const size_t z1 = std::min(chunkBaseZ + chunks[0], endZYX[0]);
+                const size_t y1 = std::min(chunkBaseY + chunks[1], endZYX[1]);
+                const size_t x1 = std::min(chunkBaseX + chunks[2], endZYX[2]);
+
+                const bool fullChunk =
+                    z0 == chunkBaseZ && y0 == chunkBaseY && x0 == chunkBaseX &&
+                    z1 == chunkBaseZ + chunks[0] &&
+                    y1 == chunkBaseY + chunks[1] &&
+                    x1 == chunkBaseX + chunks[2];
+
+                if (!fullChunk) {
+                    auto existing = array.read_chunk(indices);
+                    if (existing && existing->size() >= chunkBytes) {
+                        std::memcpy(chunkBuf.data(), existing->data(), chunkBytes);
+                    } else {
+                        fillRawChunk(chunkBuf, fill);
+                    }
+                } else {
+                    fillRawChunk(chunkBuf, fill);
+                }
+
+                auto* dst = reinterpret_cast<T*>(chunkBuf.data());
+                for (size_t z = z0; z < z1; ++z) {
+                    for (size_t y = y0; y < y1; ++y) {
+                        for (size_t x = x0; x < x1; ++x) {
+                            const size_t srcZ = z - offsetZYX[0];
+                            const size_t srcY = y - offsetZYX[1];
+                            const size_t srcX = x - offsetZYX[2];
+                            const size_t dstOff =
+                                (z - chunkBaseZ) * chunkStrideZ +
+                                (y - chunkBaseY) * chunkStrideY +
+                                (x - chunkBaseX);
+                            dst[dstOff] = data(srcZ, srcY, srcX);
+                        }
+                    }
+                }
+
+                array.write_chunk(indices, std::span<const std::byte>(chunkBuf.data(), chunkBuf.size()));
+            }
+        }
+    }
+}
+
+void writeTextFile(const std::filesystem::path& path, const std::string& text)
+{
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary);
+    if (!out)
+        throw std::runtime_error("failed to open for write: " + path.string());
+    out << text;
+    if (!out)
+        throw std::runtime_error("failed to write: " + path.string());
+}
+
+void createLocalOmeZarr(const std::filesystem::path& path,
+                        const Volume::ZarrCreateOptions& options)
+{
+    if (options.shapeZYX[0] == 0 || options.shapeZYX[1] == 0 || options.shapeZYX[2] == 0)
+        throw std::runtime_error("Volume::New zarr creation requires a non-empty shapeZYX");
+    if (options.numLevels == 0)
+        throw std::runtime_error("Volume::New zarr creation requires at least one level");
+
+    if (options.overwriteExisting) {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+        if (ec)
+            throw std::runtime_error("failed to remove existing zarr path: " + path.string());
+    }
+
+    std::filesystem::create_directories(path);
+    writeTextFile(path / ".zgroup", R"({"zarr_format": 2})" "\n");
+
+    const auto dtype = zarrDtypeFromChunkDtype(options.dtype);
+    std::array<size_t, 3> levelShape = options.shapeZYX;
+    for (size_t level = 0; level < options.numLevels; ++level) {
+        utils::ZarrMetadata meta;
+        meta.version = utils::ZarrVersion::v2;
+        meta.shape = toVector(levelShape);
+        meta.chunks = toVector(clampChunkShape(options.chunkShapeZYX, levelShape));
+        meta.dtype = dtype;
+        meta.fill_value = options.fillValue;
+        meta.dimension_separator = ".";
+        if (!options.compressor.empty() && options.compressor != "none") {
+            meta.compressor_id = options.compressor;
+            meta.compression_level = options.compressionLevel;
+        }
+        utils::ZarrArray::create(path / std::to_string(level),
+                                 std::move(meta),
+                                 zarrCodecFor(options.compressor, options.compressionLevel));
+        levelShape = ceilHalfShape(levelShape);
+    }
+
+    const auto baseName = path.filename().string();
+    const std::string uuid = options.uuid.empty() ? baseName : options.uuid;
+    const std::string name = options.name.empty() ? baseName : options.name;
+
+    utils::Json metadata;
+    metadata["type"] = "vol";
+    metadata["uuid"] = uuid;
+    metadata["name"] = name;
+    metadata["format"] = "zarr";
+    metadata["width"] = static_cast<int>(options.shapeZYX[2]);
+    metadata["height"] = static_cast<int>(options.shapeZYX[1]);
+    metadata["slices"] = static_cast<int>(options.shapeZYX[0]);
+    metadata["voxelsize"] = options.voxelSize;
+    metadata["min"] = 0.0;
+    metadata["max"] = options.dtype == vc::render::ChunkDtype::UInt8 ? 255.0 : 65535.0;
+    writeTextFile(path / METADATA_FILE, metadata.dump(2) + "\n");
+
+    utils::Json attrs;
+    attrs["note_axes_order"] = "ZYX (slice, row, col)";
+    utils::Json multiscale;
+    multiscale["version"] = "0.4";
+    multiscale["name"] = name;
+    utils::Json axes = utils::Json::array();
+    for (const char* axisName : {"z", "y", "x"}) {
+        utils::Json axis{{"name", axisName}, {"type", "space"}};
+        if (!options.voxelUnit.empty())
+            axis["unit"] = options.voxelUnit;
+        axes.push_back(std::move(axis));
+    }
+    multiscale["axes"] = std::move(axes);
+    multiscale["datasets"] = utils::Json::array();
+    for (size_t level = 0; level < options.numLevels; ++level) {
+        const double scale = options.voxelSize * static_cast<double>(size_t{1} << level);
+        utils::Json scaleValues = utils::Json::array();
+        scaleValues.push_back(scale);
+        scaleValues.push_back(scale);
+        scaleValues.push_back(scale);
+        utils::Json transforms = utils::Json::array();
+        transforms.push_back(utils::Json{{"type", "scale"}, {"scale", std::move(scaleValues)}});
+        multiscale["datasets"].push_back(utils::Json{
+            {"path", std::to_string(level)},
+            {"coordinateTransformations", std::move(transforms)}
+        });
+    }
+    multiscale["metadata"] = utils::Json{{"downsampling_method", "mean"}};
+    attrs["multiscales"] = utils::Json::array();
+    attrs["multiscales"].push_back(std::move(multiscale));
+    writeTextFile(path / ".zattrs", attrs.dump(2) + "\n");
+}
+
+std::filesystem::path zarrArrayPathForLevel(const std::filesystem::path& root, int level)
+{
+    const auto levelPath = root / std::to_string(level);
+    if (std::filesystem::exists(levelPath / ".zarray") ||
+        std::filesystem::exists(levelPath / "zarr.json")) {
+        return levelPath;
+    }
+    if (level == 0 &&
+        (std::filesystem::exists(root / ".zarray") ||
+         std::filesystem::exists(root / "zarr.json"))) {
+        return root;
+    }
+    return levelPath;
+}
+
 } // namespace
 
 Volume::Volume(std::filesystem::path path) : path_(std::move(path))
@@ -517,6 +905,15 @@ void Volume::zarrOpen()
 
 std::shared_ptr<Volume> Volume::New(std::filesystem::path path)
 {
+    return std::make_shared<Volume>(std::move(path));
+}
+
+std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
+                                    const ZarrCreateOptions& options)
+{
+    if (options.overwriteExisting || !checkDir(path)) {
+        createLocalOmeZarr(path, options);
+    }
     return std::make_shared<Volume>(std::move(path));
 }
 
@@ -743,6 +1140,12 @@ void Volume::setIOThreads(int count)
     chunkedCache_.reset();
 }
 
+void Volume::invalidateCache()
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    chunkedCache_.reset();
+}
+
 // ============================================================================
 // Sampling API
 // ============================================================================
@@ -891,4 +1294,109 @@ bool Volume::readXYZ(Array3D<uint16_t>& out,
                            MissingScaleLevelPolicy missingPolicy)
 {
     return readZYX(out, xyzToZyx(offsetXYZ), level, missingPolicy);
+}
+
+template <typename T>
+static void writeVolumeZYX(Volume& volume,
+                           const Array3D<T>& data,
+                           const std::array<int, 3>& offsetZYX,
+                           int level)
+{
+    if (volume.isRemote())
+        throw std::runtime_error("Volume::write is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::write level must be non-negative");
+    if (!volume.hasScaleLevel(level))
+        throw std::out_of_range("Volume::write requested missing zarr scale level " + std::to_string(level));
+    if (volume.dtype() != chunkDtypeFor<T>())
+        throw std::runtime_error("Volume::write dtype does not match volume dtype");
+
+    std::array<size_t, 3> writeOffset{};
+    for (size_t d = 0; d < 3; ++d) {
+        if (offsetZYX[d] < 0)
+            throw std::out_of_range("Volume::write offset must be non-negative");
+        writeOffset[d] = static_cast<size_t>(offsetZYX[d]);
+    }
+
+    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), level));
+    writeZarrRegionZYX(array, data, writeOffset);
+
+    std::array<size_t, 3> affectedOffset = writeOffset;
+    std::array<size_t, 3> affectedShape = data.shape();
+    for (int dstLevel = level + 1;
+         dstLevel < static_cast<int>(volume.numScales()) && volume.hasScaleLevel(dstLevel);
+         ++dstLevel) {
+        const int srcLevel = dstLevel - 1;
+        auto srcArray = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), srcLevel));
+        auto dstArray = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), dstLevel));
+
+        std::array<size_t, 3> dstOffset{};
+        std::array<size_t, 3> dstEnd{};
+        std::array<size_t, 3> dstShape{};
+        for (size_t d = 0; d < 3; ++d) {
+            const size_t srcEnd = affectedOffset[d] + affectedShape[d];
+            dstOffset[d] = affectedOffset[d] / 2;
+            dstEnd[d] = (srcEnd + 1) / 2;
+            dstShape[d] = dstEnd[d] - dstOffset[d];
+        }
+        if (dstShape[0] == 0 || dstShape[1] == 0 || dstShape[2] == 0)
+            break;
+
+        const auto srcVolumeShape = volume.shape(srcLevel);
+        std::array<size_t, 3> srcReadOffset{
+            dstOffset[0] * 2,
+            dstOffset[1] * 2,
+            dstOffset[2] * 2,
+        };
+        std::array<size_t, 3> srcReadShape{
+            std::min(dstShape[0] * 2, static_cast<size_t>(srcVolumeShape[0]) - srcReadOffset[0]),
+            std::min(dstShape[1] * 2, static_cast<size_t>(srcVolumeShape[1]) - srcReadOffset[1]),
+            std::min(dstShape[2] * 2, static_cast<size_t>(srcVolumeShape[2]) - srcReadOffset[2]),
+        };
+
+        Array3D<T> source(srcReadShape);
+        readZarrRegionZYX(srcArray, source, srcReadOffset);
+
+        Array3D<T> downsampled(dstShape);
+        std::array<int, 3> srcReadOffsetInt{
+            static_cast<int>(srcReadOffset[0]),
+            static_cast<int>(srcReadOffset[1]),
+            static_cast<int>(srcReadOffset[2]),
+        };
+        downsampleMeanZYX(downsampled, source, srcReadOffsetInt, srcVolumeShape, 2);
+        writeZarrRegionZYX(dstArray, downsampled, dstOffset);
+
+        affectedOffset = dstOffset;
+        affectedShape = dstShape;
+    }
+
+    volume.invalidateCache();
+}
+
+void Volume::writeZYX(const Array3D<uint8_t>& data,
+                      const std::array<int, 3>& offsetZYX,
+                      int level)
+{
+    writeVolumeZYX(*this, data, offsetZYX, level);
+}
+
+void Volume::writeZYX(const Array3D<uint16_t>& data,
+                      const std::array<int, 3>& offsetZYX,
+                      int level)
+{
+    writeVolumeZYX(*this, data, offsetZYX, level);
+}
+
+void Volume::writeXYZ(const Array3D<uint8_t>& data,
+                      const std::array<int, 3>& offsetXYZ,
+                      int level)
+{
+    writeZYX(data, xyzToZyx(offsetXYZ), level);
+}
+
+void Volume::writeXYZ(const Array3D<uint16_t>& data,
+                      const std::array<int, 3>& offsetXYZ,
+                      int level)
+{
+    writeZYX(data, xyzToZyx(offsetXYZ), level);
 }

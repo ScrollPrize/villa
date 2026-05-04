@@ -1,9 +1,11 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -34,6 +36,28 @@ public:
 
 
     static std::shared_ptr<Volume> New(std::filesystem::path path);
+
+    struct ZarrCreateOptions {
+        // Base level shape in zarr/storage order: [z, y, x].
+        std::array<size_t, 3> shapeZYX{};
+        std::array<size_t, 3> chunkShapeZYX{64, 64, 64};
+        vc::render::ChunkDtype dtype = vc::render::ChunkDtype::UInt8;
+        size_t numLevels = 1;
+        double fillValue = 0.0;
+        double voxelSize = 1.0;
+        std::string voxelUnit;
+        std::string uuid;
+        std::string name;
+        std::string compressor = "blosc";
+        int compressionLevel = 3;
+        bool overwriteExisting = false;
+    };
+
+    // Open an existing local volume, or create a local OME-Zarr pyramid when
+    // the path does not already contain a volume/zarr. Existing volumes are
+    // opened as-is unless overwriteExisting is set.
+    static std::shared_ptr<Volume> New(std::filesystem::path path,
+                                       const ZarrCreateOptions& options);
 
     // Create a Volume backed by a remote zarr store over HTTP.
     // If auth is provided, it is used as-is; otherwise credentials are read
@@ -88,6 +112,9 @@ public:
     // Set the number of background IO threads for chunk fetching.
     void setIOThreads(int count);
 
+    // Drop decoded/read cache state. Writes call this automatically.
+    void invalidateCache();
+
     // --- Sampling API ---
 
     // Single-slice blocking sample (uint8)
@@ -131,6 +158,22 @@ public:
                  const std::array<int, 3>& offsetXYZ,
                  int level = 0,
                  MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
+
+    // Local zarr region writes. Input arrays are indexed/stored as [z, y, x].
+    // Writes to level 0 update coarser pyramid levels by exact integer mean
+    // downsampling over 2x2x2 blocks.
+    void writeZYX(const Array3D<uint8_t>& data,
+                  const std::array<int, 3>& offsetZYX,
+                  int level = 0);
+    void writeZYX(const Array3D<uint16_t>& data,
+                  const std::array<int, 3>& offsetZYX,
+                  int level = 0);
+    void writeXYZ(const Array3D<uint8_t>& data,
+                  const std::array<int, 3>& offsetXYZ,
+                  int level = 0);
+    void writeXYZ(const Array3D<uint16_t>& data,
+                  const std::array<int, 3>& offsetXYZ,
+                  int level = 0);
 
     [[nodiscard]] static bool checkDir(const std::filesystem::path& path);
 
