@@ -1318,10 +1318,10 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 
 
 def pred_dt_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Pred-DT loss: two clamped L1 terms pushing mesh into the prediction.
+	"""Pred-DT loss: clamped outside L2 plus inside L1 pushing mesh into prediction.
 
 	Encoding: outside=[80,127], inside=[128,175], boundary at 127.5.
-	lm_out = clamp(127 - raw, min=0)      — active outside, zero inside
+	lm_out = clamp(127 - raw, min=0)^2    — active outside, zero inside
 	lm_in  = clamp(255 - raw, max=127)    — active inside, constant (no grad) outside
 	lm = lm_out + 0.25 * lm_in
 	"""
@@ -1332,7 +1332,8 @@ def pred_dt_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[tor
 	sampled = res.data.grid_sample_fullres(xyz, diff=True, channels={"pred_dt"})
 	sampled_raw = sampled.pred_dt.squeeze(0).permute(1, 0, 2, 3)  # (D, 1, Hm, Wm)
 
-	lm_out = (127.0 - sampled_raw).clamp(min=0)      # outside: 1–47, inside: 0 (no grad)
+	lm_out_l1 = (127.0 - sampled_raw).clamp(min=0)   # outside: 1–47, inside: 0 (no grad)
+	lm_out = lm_out_l1 * lm_out_l1
 	lm_in = (255.0 - sampled_raw).clamp(max=127.0)    # inside: 80–127, outside: 127 (constant, no grad)
 	lm = lm_out + _INNER_FACTOR * lm_in
 
