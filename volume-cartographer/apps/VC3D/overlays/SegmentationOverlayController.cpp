@@ -1420,7 +1420,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
     // Draw brush reticle at hover position
     // Show when we have a hover position (which only exists in edit approval mask mode)
-    // Flat cylinder model: circle in XY/XZ/YZ planes, rectangle in flattened view
+    // Flat cylinder model: circle in XY/XZ/YZ planes and flattened view
     if (state.approvalHoverWorld) {
         const cv::Vec3f& hoverWorld = *state.approvalHoverWorld;
         const float brushRadiusNative = state.approvalBrushRadius;
@@ -1458,9 +1458,8 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
                 builder.addCircle(sceneCenter, radiusPixels, false, style);
             }
         } else {
-            // For segmentation/flattened view: convert world position to scene coordinates
-            // Draw a rectangle (cylinder side view): Width = 2 * radius (diameter), Height = depth
-            const float brushDepthNative = state.approvalBrushDepth;
+            // For segmentation/flattened view: draw the same circular 2D brush
+            // that is stamped into the approval-mask image.
             const float thisViewerScale = viewer->getCurrentScale();
 
             QPointF sceneCenter;
@@ -1479,17 +1478,15 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
                 surfaceScale = (scale[0] + scale[1]) * 0.5f;
             }
             const float gridRadius = brushRadiusNative * surfaceScale;
-            const float gridDepth = brushDepthNative * surfaceScale;
 
             // Convert grid units to scene pixels using viewer scale
             const qreal gridToScene = thisViewerScale / surfaceScale;
 
             // Add a small offset to account for painting extending to cell edges
             constexpr float gridOffset = 0.5f;
-            const qreal rectHalfWidth = (gridRadius + gridOffset) * gridToScene;
-            const qreal rectHalfHeight = (gridDepth / 2.0f + gridOffset) * gridToScene;
+            const qreal radiusPixels = (gridRadius + gridOffset) * gridToScene;
 
-            if (rectHalfWidth > 1.0 && rectHalfHeight > 1.0) {
+            if (radiusPixels > 1.0) {
                 ViewerOverlayControllerBase::OverlayStyle style;
                 style.penColor = state.paintingApproval ? QColor(0, 0, 255) : QColor(255, 0, 0);
                 style.penWidth = viewer->intersectionThickness();
@@ -1499,57 +1496,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
                 style.dashPattern = {4.0, 4.0};  // Dashed pattern
                 style.z = kApprovalMaskZ + 10.0;
 
-                // Determine rectangle orientation based on cylinder axis (plane normal)
-                qreal rotationDegrees = 0.0;
-                if (state.approvalHoverPlaneNormal) {
-                    // When hovering in XY/XZ/YZ planes, orient the rectangle along the cylinder axis
-                    // Project the cylinder axis (plane normal) into the flattened view
-                    const cv::Vec3f& normal = *state.approvalHoverPlaneNormal;
-                    const cv::Vec3f axisEndWorld = hoverWorld + normal * brushDepthNative;
-                    const QPointF axisEndScene = viewer->volumeToScene(axisEndWorld);
-
-                    // Compute angle from center to axis end
-                    const qreal dx = axisEndScene.x() - sceneCenter.x();
-                    const qreal dy = axisEndScene.y() - sceneCenter.y();
-                    if (std::abs(dx) > 0.1 || std::abs(dy) > 0.1) {
-                        // atan2 gives angle from positive X axis, we want rotation where
-                        // the rectangle's height (Y) aligns with the cylinder axis
-                        rotationDegrees = std::atan2(dy, dx) * 180.0 / M_PI - 90.0;
-                    }
-                }
-
-                if (std::abs(rotationDegrees) < 0.1) {
-                    // No rotation needed - draw axis-aligned rectangle
-                    const QRectF rect(sceneCenter.x() - rectHalfWidth,
-                                      sceneCenter.y() - rectHalfHeight,
-                                      rectHalfWidth * 2.0,
-                                      rectHalfHeight * 2.0);
-                    builder.addRect(rect, false, style);
-                } else {
-                    // Draw rotated rectangle as a closed line strip
-                    const qreal angleRad = rotationDegrees * M_PI / 180.0;
-                    const qreal cosA = std::cos(angleRad);
-                    const qreal sinA = std::sin(angleRad);
-
-                    // Rectangle corners before rotation (centered at origin)
-                    // Width along X, Height along Y
-                    const std::array<QPointF, 4> corners = {{
-                        {-rectHalfWidth, -rectHalfHeight},
-                        { rectHalfWidth, -rectHalfHeight},
-                        { rectHalfWidth,  rectHalfHeight},
-                        {-rectHalfWidth,  rectHalfHeight}
-                    }};
-
-                    std::vector<QPointF> points;
-                    points.reserve(4);
-                    for (const auto& corner : corners) {
-                        // Rotate and translate
-                        const qreal rx = corner.x() * cosA - corner.y() * sinA + sceneCenter.x();
-                        const qreal ry = corner.x() * sinA + corner.y() * cosA + sceneCenter.y();
-                        points.emplace_back(rx, ry);
-                    }
-                    builder.addLineStrip(points, true, style);
-                }
+                builder.addCircle(sceneCenter, radiusPixels, false, style);
             }
         }
     }
