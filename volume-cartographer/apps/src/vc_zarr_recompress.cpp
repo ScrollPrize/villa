@@ -61,7 +61,7 @@
 #include <chrono>
 
 #include "utils/Json.hpp"
-#include <blosc.h>
+#include <blosc2.h>
 
 #include "utils/c3d_codec.hpp"
 #include "utils/http_fetch.hpp"
@@ -346,26 +346,27 @@ static std::unique_ptr<IOBackend> make_backend(const std::string& path) {
 
 static std::vector<std::byte> decompress_blosc(const std::vector<std::byte>& compressed,
                                                  size_t expected_size) {
-    // Check blosc header magic (first byte 0x02)
     if (compressed.size() < 16 ||
         static_cast<uint8_t>(compressed[0]) != 0x02) {
-        // Not blosc — assume raw
         return compressed;
     }
 
-    // Read nbytes from blosc header (bytes 4-7, little-endian)
-    size_t nbytes = 0;
+    int32_t nbytes = 0;
     std::memcpy(&nbytes, reinterpret_cast<const char*>(compressed.data()) + 4, 4);
 
-    std::vector<std::byte> output(nbytes);
-    int ret = blosc_decompress(
-        reinterpret_cast<const void*>(compressed.data()),
-        reinterpret_cast<void*>(output.data()),
-        nbytes);
+    std::vector<std::byte> output(static_cast<size_t>(nbytes));
+    blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
+    blosc2_context* ctx = blosc2_create_dctx(dparams);
+    const int ret = blosc2_decompress_ctx(ctx,
+                                          compressed.data(),
+                                          static_cast<int32_t>(compressed.size()),
+                                          output.data(),
+                                          nbytes);
+    blosc2_free_ctx(ctx);
     if (ret < 0) {
-        throw std::runtime_error("blosc_decompress failed: " + std::to_string(ret));
+        throw std::runtime_error("blosc2_decompress_ctx failed: " + std::to_string(ret));
     }
-    output.resize(ret);
+    output.resize(static_cast<size_t>(ret));
     return output;
 }
 
@@ -686,8 +687,6 @@ int main(int argc, char** argv) {
                   << "                          {L} in path is replaced by level number.\n";
         return 1;
     }
-
-    blosc_init();
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
@@ -1725,6 +1724,5 @@ int main(int argc, char** argv) {
         }
     }
 
-    blosc_destroy();
     return 0;
 }

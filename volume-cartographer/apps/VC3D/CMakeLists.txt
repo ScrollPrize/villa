@@ -1,7 +1,3 @@
-set(CMAKE_AUTORCC ON)
-
-add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
-
 set(srcs
     VCAppMain.cpp
     CState.cpp
@@ -215,9 +211,5 @@ target_link_libraries(VC3D
     Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
-    blosc_static
+    PkgConfig::BLOSC2
 )
-
-if(VC_USE_PCH)
-    target_precompile_headers(VC3D REUSE_FROM vc_core)
-endif()

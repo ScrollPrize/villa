@@ -1,57 +1,26 @@
 #include "vc/core/Version.hpp"
 
-
-
 auto ProjectInfo::Name() -> std::string
 {
-    static std::string name{"volume-cartographer"};
-    return name;
-}
-
-auto ProjectInfo::VersionMajor() -> std::uint32_t
-{
-    static std::uint32_t vMaj{@PROJECT_VERSION_MAJOR@};
-    return vMaj;
-}
-
-auto ProjectInfo::VersionMinor() -> std::uint32_t
-{
-    static std::uint32_t vMin{@PROJECT_VERSION_MINOR@};
-    return vMin;
-}
-
-auto ProjectInfo::VersionPatch() -> std::uint32_t
-{
-    static std::uint32_t vPatch{@PROJECT_VERSION_PATCH@};
-    return vPatch;
+    return "volume-cartographer";
 }
 
 auto ProjectInfo::VersionString() -> std::string
 {
-    static std::string version("@PROJECT_VERSION@");
-    return version;
+    return "@VC_VERSION_STRING@";
 }
 
 auto ProjectInfo::NameAndVersion() -> std::string
 {
-    static std::string nameAndVersion{"volume-cartographer @PROJECT_VERSION@"};
-    return nameAndVersion;
-}
-
-auto ProjectInfo::RepositoryURL() -> std::string
-{
-    static std::string repo("https://github.com/ScrollPrize/villa/tree/main/volume-cartographer");
-    return repo;
+    return "volume-cartographer @VC_VERSION_STRING@";
 }
 
 auto ProjectInfo::RepositoryHash() -> std::string
 {
-    static std::string hash("@GIT_SHA1@");
-    return hash;
+    return "@GIT_SHA1@";
 }
 
 auto ProjectInfo::RepositoryShortHash() -> std::string
 {
-    static std::string hashShort("@GIT_SHA1_SHORT@");
-    return hashShort;
+    return "@GIT_SHA1_SHORT@";
 }

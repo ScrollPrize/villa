@@ -2,8 +2,6 @@
 
 #include "vc/core/render/IChunkedArray.hpp"
 
-#include <utils/thread_pool.hpp>
-
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>

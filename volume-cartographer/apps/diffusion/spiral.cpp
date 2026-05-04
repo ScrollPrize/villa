@@ -352,9 +352,6 @@ void run_spiral_generation(
     ceres::Solver::Options options;
     options.max_num_iterations = 10000;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    // #ifdef VC_USE_CUDA_SPARSE
-    // options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-    // #endif
     options.num_threads = omp_get_max_threads();
     options.minimizer_progress_to_stdout = true;
     ceres::Solver::Summary summary;

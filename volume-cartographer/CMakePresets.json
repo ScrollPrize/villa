@@ -9,10 +9,6 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
-        "VC_WITH_CUDA_SPARSE": "OFF",
-        "VC_WITH_PASTIX": "OFF",
-        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
-        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     },
@@ -21,7 +17,8 @@
       "hidden": true,
       "inherits": "_base",
       "cacheVariables": {
-        "VC_NATIVE_ARCH": "OFF"
+        "VC_NATIVE_ARCH": "OFF",
+        "VC_USE_CCACHE": "OFF"
       }
     },
     {
@@ -30,7 +27,9 @@
       "inherits": "_base",
       "cacheVariables": {
         "VC_NATIVE_ARCH": "ON",
-        "VC_BUILD_TESTS": "ON"
+        "VC_TESTING": "ON",
+        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache"
       }
     },
 
@@ -65,59 +64,49 @@
     },
 
     { "name": "ci-debug-gcc",            "displayName": "CI Debug (gcc)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "OFF" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "OFF" } },
     { "name": "ci-debug-clang",          "displayName": "CI Debug (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "OFF" } },
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "OFF" } },
 
     { "name": "ci-release-gcc",          "displayName": "CI Release (gcc, portable)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_BUILD_TESTS": "OFF" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "OFF" } },
     { "name": "ci-release-clang",        "displayName": "CI Release (clang, portable)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_BUILD_TESTS": "OFF" } },
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "OFF" } },
 
     { "name": "ci-relwithdebinfo-gcc",   "displayName": "CI RelWithDebInfo (gcc)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_BUILD_TESTS": "OFF" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_TESTING": "OFF" } },
     { "name": "ci-relwithdebinfo-clang", "displayName": "CI RelWithDebInfo (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_BUILD_TESTS": "OFF" } },
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_TESTING": "OFF" } },
 
-    { "name": "ci-profiling-gcc",        "displayName": "CI Profiling (gcc, MinSizeRel + debug info, no strip)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "MinSizeRel",     "VC_BUILD_TESTS": "OFF",  "VC_STRIP_BINARIES": "OFF" } },
-    { "name": "ci-profiling-clang",      "displayName": "CI Profiling (clang, MinSizeRel + debug info, no strip)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "MinSizeRel",     "VC_BUILD_TESTS": "OFF",  "VC_STRIP_BINARIES": "OFF" } },
+    { "name": "ci-profiling-gcc",        "displayName": "CI Profiling (gcc, MinSizeRel + debug info)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "MinSizeRel",     "VC_TESTING": "OFF" } },
+    { "name": "ci-profiling-clang",      "displayName": "CI Profiling (clang, MinSizeRel + debug info)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "MinSizeRel",     "VC_TESTING": "OFF" } },
 
     { "name": "ci-tests-gcc",            "displayName": "CI Tests (gcc, Debug, tests on)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON" } },
     { "name": "ci-tests-clang",          "displayName": "CI Tests (clang, Debug, tests on)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON" } },
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON" } },
 
     { "name": "ci-asan-ubsan-gcc",       "displayName": "CI ASan + UBSan (gcc)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_ENABLE_ASAN": "ON", "VC_ENABLE_UBSAN": "ON" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_ASAN": "ON", "VC_ENABLE_UBSAN": "ON" } },
     { "name": "ci-asan-ubsan-clang",     "displayName": "CI ASan + UBSan (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_ENABLE_ASAN": "ON", "VC_ENABLE_UBSAN": "ON" } },
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_ASAN": "ON", "VC_ENABLE_UBSAN": "ON" } },
 
     { "name": "ci-tsan-gcc",             "displayName": "CI ThreadSanitizer (gcc)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_ENABLE_TSAN": "ON" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_TSAN": "ON" } },
     { "name": "ci-tsan-clang",           "displayName": "CI ThreadSanitizer (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_ENABLE_TSAN": "ON" } },
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_TSAN": "ON" } },
 
     { "name": "ci-coverage-gcc",         "displayName": "CI Coverage (gcc, gcov)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
     { "name": "ci-coverage-clang",       "displayName": "CI Coverage (clang, source-based)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
-
-    { "name": "ci-pgo-instrument-gcc",   "displayName": "CI PGO instrument (gcc)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_BUILD_TESTS": "OFF",  "VC_PGO_GENERATE": "ON" } },
-    { "name": "ci-pgo-instrument-clang", "displayName": "CI PGO instrument (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_BUILD_TESTS": "OFF",  "VC_PGO_GENERATE": "ON" } },
-
-    { "name": "ci-pgo-use-gcc",          "displayName": "CI PGO use (gcc)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_BUILD_TESTS": "OFF",  "VC_PGO_USE": "ON" } },
-    { "name": "ci-pgo-use-clang",        "displayName": "CI PGO use (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_BUILD_TESTS": "OFF",  "VC_PGO_USE": "ON" } },
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
 
     { "name": "ci-strict-warnings-gcc",  "displayName": "CI Strict warnings + -Werror (gcc)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
     { "name": "ci-strict-warnings-clang","displayName": "CI Strict warnings + -Werror (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_BUILD_TESTS": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } }
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } }
   ],
 
   "buildPresets": [
@@ -140,10 +129,6 @@
     { "name": "ci-tsan-clang",            "configurePreset": "ci-tsan-clang" },
     { "name": "ci-coverage-gcc",          "configurePreset": "ci-coverage-gcc" },
     { "name": "ci-coverage-clang",        "configurePreset": "ci-coverage-clang" },
-    { "name": "ci-pgo-instrument-gcc",    "configurePreset": "ci-pgo-instrument-gcc" },
-    { "name": "ci-pgo-instrument-clang",  "configurePreset": "ci-pgo-instrument-clang" },
-    { "name": "ci-pgo-use-gcc",           "configurePreset": "ci-pgo-use-gcc" },
-    { "name": "ci-pgo-use-clang",         "configurePreset": "ci-pgo-use-clang" },
     { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc" },
     { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" }
   ],

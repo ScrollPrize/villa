@@ -2801,27 +2801,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     if (parallel)
         options.num_threads = omp_get_max_threads();
 
-//    if (problem.NumParameterBlocks() > 1) {
-//        options.use_inner_iterations = true;
-//    }
-// // NOTE currently CPU seems always faster (40x , AMD 5800H vs RTX 3080 mobile, even a 5090 would probably be slower?)
-// #ifdef VC_USE_CUDA_SPARSE
-//     // Check if Ceres was actually built with CUDA sparse support
-//     if (g_use_cuda) {
-//         if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-//             options.linear_solver_type = ceres::SPARSE_SCHUR;
-//             // options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-//             options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-//
-//             // if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-//                 options.use_mixed_precision_solves = true;
-//             // }
-//         } else {
-//             std::cerr << "Warning: use_cuda=true but Ceres was not built with CUDA sparse support. Falling back to CPU sparse." << std::endl;
-//         }
-//     }
-// #endif
-
     ceres::Solver::Summary summary;
 
     ceres::Solve(options, &problem, &summary);

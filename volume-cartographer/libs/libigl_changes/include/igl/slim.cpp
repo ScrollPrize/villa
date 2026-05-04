@@ -47,9 +47,6 @@
 #ifdef CHOLMOD
 #  include <Eigen/CholmodSupport>
 #endif
-#ifdef PASTIX
-#  include <Eigen/PaStiXSupport>
-#endif
 
 namespace igl
 {
@@ -127,7 +124,10 @@ namespace igl
       //t.start();
       // solve
       Eigen::VectorXd Uc;
-#if !defined(CHOLMOD) && !defined(PASTIX)
+#ifdef CHOLMOD
+        Eigen::CholmodSimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+        Uc = solver.compute(L).solve(s.rhs);
+#else
       if (s.dim == 2)
       {
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
@@ -142,22 +142,7 @@ namespace igl
         cg.compute(L);
         Uc = cg.solveWithGuess(s.rhs, guess);
       }
-#elif defined(PASTIX)
-        // PaStiX expects SPD; LLT is fine here (L = Aᵀ W A + λI + diag)
-        // std::cerr << "[SLIM] Backend: PaStiX (Eigen::PastixLDLT)\n";
-        using SpMat = Eigen::SparseMatrix<double>;
-        static bool analyzed = false;
-        static Eigen::PastixLDLT<SpMat, Eigen::Lower> solver;
-        if(!analyzed){
-          solver.analyzePattern(L);
-          analyzed = true;
-        }
-        solver.factorize(L);
-        Uc = solver.solve(s.rhs);
-#else /* CHOLMOD */
-        Eigen::CholmodSimplicialLDLT<Eigen::SparseMatrix<double>> solver;
-        Uc = solver.compute(L).solve(s.rhs);
-#endif /* solvers */
+#endif
       for (int i = 0; i < s.dim; i++)
         uv.col(i) = Uc.block(i * s.v_n, 0, s.v_n, 1);
 

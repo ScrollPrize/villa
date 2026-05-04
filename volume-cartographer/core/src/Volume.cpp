@@ -19,10 +19,22 @@
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/types/VcDataset.hpp"
-#include "utils/hash.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
+
+namespace
+{
+std::uint64_t fnv1a(std::string_view sv) noexcept
+{
+    std::uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : sv) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+}
 
 namespace
 {
@@ -62,7 +74,7 @@ std::string deriveRemoteVolumeId(const std::string& url)
 {
     const auto normalized = normalizeRemoteVolumeUrl(url);
     const auto name = deriveRemoteVolumeName(normalized);
-    const auto hash = utils::fnv1a(std::string_view(normalized));
+    const auto hash = fnv1a(std::string_view(normalized));
 
     std::ostringstream out;
     out << name << "-" << std::hex << std::nouppercase << std::setw(16)

@@ -163,8 +163,7 @@ static QString findFlatboiExecutable()
 {
     return findExecutable(
         QStringLiteral("flatboi"),
-        {QStringLiteral("/usr/local/bin/flatboi"),
-         QStringLiteral("/home/builder/vc-dependencies/bin/flatboi")},
+        {QStringLiteral("/usr/local/bin/flatboi")},
         QStringLiteral("FLATBOI"));
 }
 

@@ -150,73 +150,15 @@ if(LIBIGL_WITH_CHOLMOD)
   #link_libraries(igl::cholmod)
 
   # Try to enable OpenMP for CHOLMOD parallelism
-  find_package(OpenMP)
-  if (OpenMP_CXX_FOUND)
+  if(NOT TARGET OpenMP::OpenMP_CXX)
+    find_package(OpenMP)
+  endif()
+  if (TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(igl_cholmod INTERFACE OpenMP::OpenMP_CXX)
   endif()
   # If we install, export the interface target too (harmless no-op otherwise)
   if(LIBIGL_INSTALL)
     install(TARGETS igl_cholmod EXPORT LibiglTargets)
-  endif()
-endif()
-# ===========================================================================
-
-# ============================ PaStiX (v5.x) ================================
-option(LIBIGL_WITH_PASTIX "Enable PaStiX 5.x support (NOMPI+OpenMP)" OFF)
-if(LIBIGL_WITH_PASTIX)
-  add_compile_definitions(PASTIX)
-  add_library(igl_pastix INTERFACE)
-  add_library(igl::pastix ALIAS igl_pastix)
-  target_compile_definitions(igl_pastix INTERFACE PASTIX)
-
-  # If you installed PaStiX into a custom prefix, point CMake at it:
-  # cmake .. -DCMAKE_PREFIX_PATH=$HOME/pastix
-  # Headers live in include/pastix/, library name may vary:
-  find_path(PASTIX_INCLUDE_DIR NAMES pastix_nompi.h pastix.h
-            PATH_SUFFIXES pastix)
-  # prefer NOMPI+double if present, else try generic
-  find_library(PASTIX_LIB NAMES pastix_nompi_double pastix)
-
-  # Common PaStiX 5 deps (adjust if you built without them)
-  find_library(PASTIX_SCOTCH_LIB NAMES scotch)
-  find_library(PASTIX_SCOTCHERR_LIB NAMES scotcherr scotcherrexit)
-  #find_library(PASTIX_HWLOC_LIB NAMES hwloc)
-
-  # BLAS/LAPACK (OpenBLAS recommended)
-  find_package(BLAS REQUIRED)
-  find_package(LAPACK REQUIRED)
-
-  if(NOT PASTIX_INCLUDE_DIR OR NOT PASTIX_LIB)
-    message(FATAL_ERROR "PaStiX not found. Set CMAKE_PREFIX_PATH to your PaStiX 5.x install prefix.")
-  endif()
-
-  target_include_directories(igl_pastix INTERFACE ${PASTIX_INCLUDE_DIR})
-  target_link_libraries(igl_pastix INTERFACE
-    ${PASTIX_LIB}
-    ${PASTIX_SCOTCH_LIB}
-    ${PASTIX_SCOTCHERR_LIB}
-    #${PASTIX_HWLOC_LIB}
-    LAPACK::LAPACK BLAS::BLAS)
-
-  # Ensure all compilation units in this directory see <pastix_nompi.h>
-  include_directories(SYSTEM ${PASTIX_INCLUDE_DIR})
-  
-  # Make all later targets pull PaStiX in
-  #link_libraries(igl::pastix)
-
-  # Optional: OpenMP (PaStiX is OpenMP-parallel)
-  find_package(OpenMP)
-  if(OpenMP_CXX_FOUND)
-    target_link_libraries(igl_pastix INTERFACE OpenMP::OpenMP_CXX)
-  endif()
-
-  message(STATUS "PaStiX enabled:")
-  message(STATUS "  include: ${PASTIX_INCLUDE_DIR}")
-  message(STATUS "  lib    : ${PASTIX_LIB}")
-
-  # If we install, export the interface target so exports are consistent
-  if(LIBIGL_INSTALL)
-    install(TARGETS igl_pastix EXPORT LibiglTargets)
   endif()
 endif()
 # ===========================================================================

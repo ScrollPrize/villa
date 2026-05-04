@@ -5,12 +5,6 @@
 
 #include <boost/program_options.hpp>
 
-#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
-#include <CGAL/Polygon_mesh_processing/bbox.h>
-#include <CGAL/Side_of_triangle_mesh.h>
-#include <CGAL/Surface_mesh.h>
-#include <CGAL/alpha_wrap_3.h>
-
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -62,9 +56,6 @@ constexpr double kDefaultRamBudgetGb = 0.0;   // 0 => auto
 constexpr double kDefaultAutoRamFraction = 0.60;
 
 using Shape3 = std::array<std::size_t, 3>;
-using AlphaWrapKernel = CGAL::Exact_predicates_inexact_constructions_kernel;
-using AlphaWrapPoint = AlphaWrapKernel::Point_3;
-using AlphaWrapMesh = CGAL::Surface_mesh<AlphaWrapPoint>;
 
 enum class MapMode {
     legacy,
@@ -2587,18 +2578,81 @@ static std::size_t countNonZeroInRelativeBox(const std::vector<uint8_t>& volume,
     return count;
 }
 
-static AlphaWrapPoint voxelCenterPoint(std::size_t z, std::size_t y, std::size_t x)
+static void edt1d(const double* f, double* d, std::size_t n,
+                  std::int64_t* v, double* zEnv)
 {
-    return AlphaWrapPoint(static_cast<double>(z) + 0.5,
-                          static_cast<double>(y) + 0.5,
-                          static_cast<double>(x) + 0.5);
+    constexpr double INF = std::numeric_limits<double>::infinity();
+    std::int64_t k = 0;
+    v[0] = 0;
+    zEnv[0] = -INF;
+    zEnv[1] = INF;
+    for (std::int64_t q = 1; q < static_cast<std::int64_t>(n); ++q) {
+        double s;
+        for (;;) {
+            const std::int64_t vk = v[k];
+            s = ((f[q] + static_cast<double>(q) * q) -
+                 (f[vk] + static_cast<double>(vk) * vk)) /
+                (2.0 * static_cast<double>(q - vk));
+            if (s > zEnv[k]) break;
+            --k;
+        }
+        ++k;
+        v[k] = q;
+        zEnv[k] = s;
+        zEnv[k + 1] = INF;
+    }
+    k = 0;
+    for (std::int64_t q = 0; q < static_cast<std::int64_t>(n); ++q) {
+        while (zEnv[k + 1] < static_cast<double>(q)) ++k;
+        const std::int64_t dq = q - v[k];
+        d[q] = static_cast<double>(dq) * dq + f[v[k]];
+    }
 }
 
-static bool bboxContains(const CGAL::Bbox_3& bbox, const AlphaWrapPoint& p)
+static std::vector<double> squaredEDT3D(const std::vector<uint8_t>& mask,
+                                        const Shape3& shape)
 {
-    return p.x() >= bbox.xmin() && p.x() <= bbox.xmax() &&
-           p.y() >= bbox.ymin() && p.y() <= bbox.ymax() &&
-           p.z() >= bbox.zmin() && p.z() <= bbox.zmax();
+    constexpr double INF = std::numeric_limits<double>::infinity();
+    const std::size_t nZ = shape[0], nY = shape[1], nX = shape[2];
+    const std::size_t total = nZ * nY * nX;
+
+    std::vector<double> f(total);
+    for (std::size_t i = 0; i < total; ++i) {
+        f[i] = (mask[i] != 0) ? 0.0 : INF;
+    }
+
+    const std::size_t nMax = std::max({nZ, nY, nX});
+    std::vector<double> col(nMax);
+    std::vector<double> dOut(nMax);
+    std::vector<std::int64_t> v(nMax);
+    std::vector<double> zEnv(nMax + 1);
+
+    for (std::size_t zi = 0; zi < nZ; ++zi) {
+        for (std::size_t yi = 0; yi < nY; ++yi) {
+            const std::size_t base = (zi * nY + yi) * nX;
+            edt1d(f.data() + base, dOut.data(), nX, v.data(), zEnv.data());
+            std::copy_n(dOut.data(), nX, f.data() + base);
+        }
+    }
+    for (std::size_t zi = 0; zi < nZ; ++zi) {
+        for (std::size_t xi = 0; xi < nX; ++xi) {
+            for (std::size_t yi = 0; yi < nY; ++yi)
+                col[yi] = f[(zi * nY + yi) * nX + xi];
+            edt1d(col.data(), dOut.data(), nY, v.data(), zEnv.data());
+            for (std::size_t yi = 0; yi < nY; ++yi)
+                f[(zi * nY + yi) * nX + xi] = dOut[yi];
+        }
+    }
+    for (std::size_t yi = 0; yi < nY; ++yi) {
+        for (std::size_t xi = 0; xi < nX; ++xi) {
+            for (std::size_t zi = 0; zi < nZ; ++zi)
+                col[zi] = f[(zi * nY + yi) * nX + xi];
+            edt1d(col.data(), dOut.data(), nZ, v.data(), zEnv.data());
+            for (std::size_t zi = 0; zi < nZ; ++zi)
+                f[(zi * nY + yi) * nX + xi] = dOut[zi];
+        }
+    }
+    return f;
 }
 
 static std::vector<uint8_t> classifyOuterAlphaWrapCore(const std::vector<uint8_t>& halo,
@@ -2607,36 +2661,16 @@ static std::vector<uint8_t> classifyOuterAlphaWrapCore(const std::vector<uint8_t
                                                        double alpha,
                                                        double offset)
 {
-    std::vector<AlphaWrapPoint> points;
-    points.reserve(countNonZero(halo.data(), halo.size()));
-    for (std::size_t z = 0; z < haloBox.shape[0]; ++z) {
-        for (std::size_t y = 0; y < haloBox.shape[1]; ++y) {
-            const std::size_t base = linearIndex(haloBox.shape, z, y, 0);
-            for (std::size_t x = 0; x < haloBox.shape[2]; ++x) {
-                if (halo[base + x] == 0) {
-                    continue;
-                }
-                points.push_back(voxelCenterPoint(haloBox.origin[0] + z,
-                                                  haloBox.origin[1] + y,
-                                                  haloBox.origin[2] + x));
-            }
-        }
-    }
-
+    (void)alpha;
     const Shape3 coreRel = relativeOrigin(coreBox, haloBox);
     std::vector<uint8_t> ignore(volumeElements(coreBox.shape), 0);
-    if (points.size() < 4) {
+
+    if (countNonZero(halo.data(), halo.size()) < 4) {
         return ignore;
     }
 
-    AlphaWrapMesh wrap;
-    CGAL::alpha_wrap_3(points, alpha, offset, wrap);
-    if (num_faces(wrap) == 0) {
-        return ignore;
-    }
-
-    const CGAL::Bbox_3 bbox = CGAL::Polygon_mesh_processing::bbox(wrap);
-    CGAL::Side_of_triangle_mesh<AlphaWrapMesh, AlphaWrapKernel> sideOfMesh(wrap);
+    const std::vector<double> sqDist = squaredEDT3D(halo, haloBox.shape);
+    const double offset2 = offset * offset;
 
     for (std::size_t z = 0; z < coreBox.shape[0]; ++z) {
         for (std::size_t y = 0; y < coreBox.shape[1]; ++y) {
@@ -2648,17 +2682,12 @@ static std::vector<uint8_t> classifyOuterAlphaWrapCore(const std::vector<uint8_t
                 if (halo[haloIdx] != 0) {
                     continue;
                 }
-
-                const AlphaWrapPoint p = voxelCenterPoint(coreBox.origin[0] + z,
-                                                          coreBox.origin[1] + y,
-                                                          coreBox.origin[2] + x);
-                if (!bboxContains(bbox, p) || sideOfMesh(p) == CGAL::ON_UNBOUNDED_SIDE) {
+                if (sqDist[haloIdx] > offset2) {
                     ignore[linearIndex(coreBox.shape, z, y, x)] = 255;
                 }
             }
         }
     }
-
     return ignore;
 }
 

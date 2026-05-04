@@ -1031,16 +1031,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     ceres::Solver::Summary summary;
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_SCHUR;
-#ifdef VC_USE_CUDA_SPARSE
-    // Check if Ceres was actually built with CUDA sparse support
-    if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-        options.linear_solver_type = ceres::SPARSE_SCHUR;
-        options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-
-    } else {
-        std::cerr << "Warning: CUDA_SPARSE requested but Ceres was not built with CUDA sparse support. Falling back to default solver." << std::endl;
-    }
-#endif
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 100;
     options.num_threads = omp_get_max_threads();

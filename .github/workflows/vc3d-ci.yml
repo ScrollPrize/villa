@@ -47,78 +47,51 @@ jobs:
         image: ["ubuntu-24.04", "ubuntu-26.04", "alpine-3.21"]
         compiler: [gcc, clang]
         preset: [ci-tests, ci-asan-ubsan]
-        include:
-          - image: "ubuntu-24.04"
-            dockerfile: "ubuntu-24.04-noble.Dockerfile"
-          - image: "ubuntu-26.04"
-            dockerfile: "ubuntu-26.04.Dockerfile"
-          - image: "alpine-3.21"
-            dockerfile: "alpine.Dockerfile"
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/setup-buildx-action@v3
-
       - name: Build builder image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./volume-cartographer
-          file: ./volume-cartographer/${{ matrix.dockerfile }}
-          target: builder
-          tags: vc-builder:${{ matrix.image }}
-          load: true
-          cache-from: type=gha,scope=vc-builder-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=vc-builder-${{ matrix.image }}
-
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-vc-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','volume-cartographer/CMakePresets.json') }}
-          restore-keys: |
-            ccache-vc-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-
-            ccache-vc-${{ matrix.image }}-${{ matrix.compiler }}-
-
-      - name: Configure (${{ matrix.preset }}-${{ matrix.compiler }})
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}/volume-cartographer:/src \
-            -v ${{ github.workspace }}/.ccache:/root/.ccache \
-            -e CCACHE_DIR=/root/.ccache \
-            -w /src \
-            vc-builder:${{ matrix.image }} \
-            cmake --preset ${{ matrix.preset }}-${{ matrix.compiler }}
-
-      - name: Build
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}/volume-cartographer:/src \
-            -v ${{ github.workspace }}/.ccache:/root/.ccache \
-            -e CCACHE_DIR=/root/.ccache \
-            -w /src \
-            vc-builder:${{ matrix.image }} \
-            cmake --build --preset ${{ matrix.preset }}-${{ matrix.compiler }}
-
+        run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
       - name: Test
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}/volume-cartographer:/src \
-            -w /src \
-            vc-builder:${{ matrix.image }} \
-            ctest --preset ${{ matrix.preset }}-${{ matrix.compiler }}
+        run: volume-cartographer/scripts/ci.sh test ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
 
-      - name: ccache stats
-        if: always()
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}/.ccache:/root/.ccache \
-            -e CCACHE_DIR=/root/.ccache \
-            vc-builder:${{ matrix.image }} \
-            ccache -s || true
-
-      - name: Save ccache
-        if: always()
-        uses: actions/cache/save@v4
+  coverage:
+    name: Coverage (gcc, gcov)
+    needs: changes
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
         with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-vc-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','volume-cartographer/CMakePresets.json') }}
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - name: Build builder image
+        run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
+      - name: Run coverage
+        run: volume-cartographer/scripts/ci.sh coverage ubuntu-24.04
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: volume-cartographer/coverage/
+      - name: Print coverage summary
+        run: |
+          {
+            echo "## Total coverage"
+            echo '```'
+            cat volume-cartographer/coverage/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Patch coverage (lines added vs base branch)
+        if: github.event_name == 'pull_request'
+        run: |
+          pip install --quiet diff-cover
+          cd volume-cartographer
+          git fetch --quiet origin ${{ github.base_ref }}
+          diff-cover coverage/cobertura.xml \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --markdown-report=coverage/patch.md \
+            --html-report=coverage/patch.html || true
+          {
+            echo "## Patch coverage (vs ${{ github.base_ref }})"
+            cat coverage/patch.md
+          } >> "$GITHUB_STEP_SUMMARY"

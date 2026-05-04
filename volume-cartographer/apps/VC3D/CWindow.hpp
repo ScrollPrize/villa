@@ -89,7 +89,7 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public:
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
+    explicit CWindow(size_t cacheSizeGB = 10);
     ~CWindow(void);
 
     // Helper method to get the current volume path

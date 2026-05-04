@@ -29,18 +29,6 @@ using vc::render::ChunkResult;
 using vc::render::ChunkStatus;
 using vc::render::IChunkedArray;
 
-VC_FORCE_INLINE bool isnan_bitwise(float f) {
-    uint32_t u;
-    __builtin_memcpy(&u, &f, 4);
-    return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0;
-}
-
-VC_FORCE_INLINE bool isfinite_bitwise(float f) {
-    uint32_t u;
-    __builtin_memcpy(&u, &f, 4);
-    return (u & 0x7f800000u) != 0x7f800000u;
-}
-
 template<typename T>
 VC_FORCE_INLINE void nt_store(T* dst, T val) {
 #if __has_builtin(__builtin_nontemporal_store)
@@ -630,7 +618,7 @@ void readCompositeFastImpl(
             for (int x = 0; x < w; x++) {
                 const cv::Vec3f& base = bRow[x];
                 const cv::Vec3f& n = nRow[x];
-                if (!isfinite_bitwise(base[0]) || !isfinite_bitwise(n[0])) continue;
+                if (!std::isfinite(base[0]) || !std::isfinite(n[0])) continue;
 
                 float accum = 0.f, mx = 0.f, mn = float(std::numeric_limits<T>::max());
                 int count = 0;
@@ -737,7 +725,7 @@ void readMultiSliceImpl(
         const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
         const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
         for (int x = 0; x < w; x++) {
-            if (!isfinite_bitwise(bRow[x][0])) continue;
+            if (!std::isfinite(bRow[x][0])) continue;
             cv::Vec3f lo = bRow[x] + sRow[x] * minOff;
             cv::Vec3f hi = bRow[x] + sRow[x] * maxOff;
             minVx = std::min(minVx, std::min(lo[0], hi[0]));

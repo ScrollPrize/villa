@@ -679,8 +679,7 @@ static QString findFlatboiExecutable()
     }
 
     const QStringList known = {
-        "/usr/local/bin/flatboi",
-        "/home/builder/vc-dependencies/bin/flatboi"
+        "/usr/local/bin/flatboi"
     };
     for (const QString& p : known) {
         QFileInfo fi(p);
