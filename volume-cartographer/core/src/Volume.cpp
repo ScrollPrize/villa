@@ -381,6 +381,9 @@ void Volume::zarrOpen()
 
         for (size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
             const auto& shape = zarrLevelShapes_[level];
+            if (shape[0] == 0 && shape[1] == 0 && shape[2] == 0) {
+                continue;
+            }
             const int levelInt = static_cast<int>(level);
 
             if (!hasReference) {
@@ -425,6 +428,9 @@ void Volume::zarrOpen()
         bool hasAnyPhysicalScale = false;
         for (size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
             const auto& shape = zarrLevelShapes_[level];
+            if (shape[0] == 0 && shape[1] == 0 && shape[2] == 0) {
+                continue;
+            }
             hasAnyPhysicalScale = true;
 
             const int expectedSlices = ceilDivPow2(_slices, static_cast<int>(level));
@@ -501,6 +507,17 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     if (opened.shapes.empty())
         throw std::runtime_error("No zarr levels found at " + remoteUrl);
 
+    int firstPresentLevel = -1;
+    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
+        const auto& shape = opened.shapes[level];
+        if (shape[0] != 0 || shape[1] != 0 || shape[2] != 0) {
+            firstPresentLevel = static_cast<int>(level);
+            break;
+        }
+    }
+    if (firstPresentLevel < 0)
+        throw std::runtime_error("No zarr levels found at " + remoteUrl);
+
     auto vol = std::make_shared<Volume>(std::filesystem::path{}, RemoteConstructTag{});
 
     vol->isRemote_ = true;
@@ -509,9 +526,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteNumScales_ = opened.shapes.size();
     vol->zarrLevelShapes_ = opened.shapes;
     vol->zarrDtype_ = opened.dtype;
-    vol->_slices = opened.shapes[0][0];
-    vol->_height = opened.shapes[0][1];
-    vol->_width = opened.shapes[0][2];
+    const auto& firstShape = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
+    const size_t firstScale = size_t{1} << firstPresentLevel;
+    vol->_slices = static_cast<int>(static_cast<size_t>(firstShape[0]) * firstScale);
+    vol->_height = static_cast<int>(static_cast<size_t>(firstShape[1]) * firstScale);
+    vol->_width = static_cast<int>(static_cast<size_t>(firstShape[2]) * firstScale);
 
     const auto id = deriveRemoteVolumeId(remoteUrl);
     vol->metadata_["uuid"] = id;
@@ -550,7 +569,11 @@ std::array<int, 3> Volume::shape(int level) const
     }
     const auto index = static_cast<std::size_t>(level);
     if (index < zarrLevelShapes_.size()) {
-        return zarrLevelShapes_[index];
+        const auto shapeZYX = zarrLevelShapes_[index];
+        if (shapeZYX[0] == 0 && shapeZYX[1] == 0 && shapeZYX[2] == 0) {
+            throw std::out_of_range("Volume::shape level is not present");
+        }
+        return shapeZYX;
     }
     if (level == 0) {
         return shape();

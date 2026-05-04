@@ -85,8 +85,12 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
     if (state_->levels_.size() != state_->fetchers_.size())
         throw std::invalid_argument("ChunkCache level/fetcher count mismatch");
     for (std::size_t i = 0; i < state_->levels_.size(); ++i) {
-        if (!state_->fetchers_[i])
-            throw std::invalid_argument("ChunkCache fetcher must not be null");
+        const bool missingLevel =
+            state_->levels_[i].shape[0] == 0 &&
+            state_->levels_[i].shape[1] == 0 &&
+            state_->levels_[i].shape[2] == 0;
+        if (!state_->fetchers_[i] && !missingLevel)
+            throw std::invalid_argument("ChunkCache fetcher must not be null for present level");
         for (int dim : state_->levels_[i].shape) {
             if (dim < 0)
                 throw std::invalid_argument("ChunkCache level shape must be non-negative");
@@ -644,6 +648,8 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
 bool ChunkCache::isValidKey(const State& state, const ChunkKey& key)
 {
     if (key.level < 0 || key.level >= static_cast<int>(state.levels_.size()))
+        return false;
+    if (!state.fetchers_[static_cast<std::size_t>(key.level)])
         return false;
     const auto& level = state.levels_[static_cast<std::size_t>(key.level)];
     const std::array<int, 3> coords{key.iz, key.iy, key.ix};

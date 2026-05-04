@@ -2938,7 +2938,7 @@ struct thresholdedDistance
 
 QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
 {
-    const std::array<int, 3> volume_shape_zyx = volume.shape();
+    const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
 
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
