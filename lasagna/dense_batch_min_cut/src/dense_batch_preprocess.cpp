@@ -28,7 +28,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr double kFixedThreshold = 100.0;
+constexpr double kFixedThreshold = 110.0;
 constexpr float kMinComponentRidgeRadius = 2.0f;
 constexpr double kMinBoundaryAngleDegrees = 120.0;
 constexpr float kCapacityScale = 2.0f;
@@ -205,11 +205,10 @@ cv::Mat to_u8_for_threshold(const cv::Mat& src) {
 
 cv::Mat binarize_fixed_threshold(const cv::Mat& gray) {
     cv::Mat u8 = to_u8_for_threshold(gray);
+    cv::Mat median;
+    cv::medianBlur(u8, median, 3);
     cv::Mat white_domain;
-    cv::threshold(u8, white_domain, kFixedThreshold, 255, cv::THRESH_BINARY);
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {3, 3});
-    cv::dilate(white_domain, white_domain, kernel, {-1, -1}, 2);
-    cv::erode(white_domain, white_domain, kernel, {-1, -1}, 2);
+    cv::threshold(median, white_domain, kFixedThreshold, 255, cv::THRESH_BINARY);
 
     cv::Mat binary;
     cv::bitwise_not(white_domain, binary);

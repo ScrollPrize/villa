@@ -54,12 +54,12 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
 }
 ```
 
-When enabled, the current single-winding `pred_dt` render is thresholded at
-`127`, routed through `dense_batch_min_cut`, and sampled at the exact model
-grid corners. The resulting gate is linearly mapped from `flow_zero -> 0` to
-`flow_one -> 1` and multiplies the `pred_dt` loss map. The loss denominator
-remains the original validity-mask sum; the gate is intentionally not
-renormalized.
+When enabled, the current single-winding `pred_dt` render is median-filtered
+with radius 1, thresholded at `110`, routed through `dense_batch_min_cut`, and
+sampled at the exact model grid corners. The resulting gate is linearly mapped
+from `flow_zero -> 0` to `flow_one -> 1` and multiplies the `pred_dt` loss map.
+The loss denominator remains the original validity-mask sum; the gate is
+intentionally not renormalized.
 
 `backtrack_distance` is measured in the rendered `pred_dt` image pixel units.
 It is passed through to the dense grid flow routing and matches the C++ debug

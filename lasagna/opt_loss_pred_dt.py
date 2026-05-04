@@ -13,8 +13,6 @@ from opt_loss_dir import _vertex_normals
 from opt_loss_station import _intersect_single_quad
 
 _INNER_FACTOR = 0.25  # penalty reduction for points inside the predicted surface
-_FLOW_GATE_THRESHOLD = 100.0
-
 _flow_gate_cfg: dict | None = None
 _flow_gate_stage: str = "stage"
 _flow_gate_seed_xyz: tuple[float, float, float] | None = None
@@ -36,7 +34,7 @@ def flow_gate_prefetch_points(
 		return None
 	if xyz_hr.shape[0] != 1:
 		return None
-	r = int(max(0, int(cfg.get("pred_dt_pool_radius", 1))))
+	r = int(max(0, int(cfg.get("pred_dt_pool_radius", 0))))
 	if r <= 0:
 		return None
 	step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
@@ -184,57 +182,6 @@ def _seed_surface_intersection_xy_from_cache(
 	return float(new_col) + float(v2), float(new_row) + float(u2)
 
 
-def _dilate_binary_3x3(mask: np.ndarray, iterations: int) -> np.ndarray:
-	out = mask.astype(bool, copy=False)
-	for _ in range(max(0, int(iterations))):
-		p = np.pad(out, ((1, 1), (1, 1)), mode="constant", constant_values=False)
-		out = (
-			p[:-2, :-2] | p[:-2, 1:-1] | p[:-2, 2:] |
-			p[1:-1, :-2] | p[1:-1, 1:-1] | p[1:-1, 2:] |
-			p[2:, :-2] | p[2:, 1:-1] | p[2:, 2:]
-		)
-	return out
-
-
-def _erode_binary_3x3(mask: np.ndarray, iterations: int) -> np.ndarray:
-	out = mask.astype(bool, copy=False)
-	for _ in range(max(0, int(iterations))):
-		p = np.pad(out, ((1, 1), (1, 1)), mode="constant", constant_values=False)
-		out = (
-			p[:-2, :-2] & p[:-2, 1:-1] & p[:-2, 2:] &
-			p[1:-1, :-2] & p[1:-1, 1:-1] & p[1:-1, 2:] &
-			p[2:, :-2] & p[2:, 1:-1] & p[2:, 2:]
-		)
-	return out
-
-
-def _flow_gate_white_domain_u8(pred_u8: np.ndarray, threshold: float) -> np.ndarray:
-	white_domain = pred_u8 > threshold
-	white_domain = _dilate_binary_3x3(white_domain, 2)
-	white_domain = _erode_binary_3x3(white_domain, 2)
-	return white_domain.astype(np.uint8) * 255
-
-
-def _flow_gate_seed_dt(pred_u8: np.ndarray, threshold: float, source_x: int, source_y: int) -> float:
-	if source_x < 0 or source_x >= pred_u8.shape[1] or source_y < 0 or source_y >= pred_u8.shape[0]:
-		return 0.0
-	white_domain = _flow_gate_white_domain_u8(pred_u8, threshold)
-	try:
-		import cv2
-		dt = cv2.distanceTransform(white_domain, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-		return float(dt[source_y, source_x])
-	except Exception:
-		# Fallback is only for environments missing cv2; the C++ path uses OpenCV.
-		if white_domain[source_y, source_x] == 0:
-			return 0.0
-		ys, xs = np.nonzero(white_domain == 0)
-		if xs.size == 0:
-			return 0.0
-		dx = xs.astype(np.float32) - float(source_x)
-		dy = ys.astype(np.float32) - float(source_y)
-		return float(np.sqrt(np.min(dx * dx + dy * dy)))
-
-
 def _sample_pred_dt_max3d(
 	*,
 	res: fit_model.FitResult3D,
@@ -312,8 +259,6 @@ def _write_flow_gate_debug(
 	graph_edge_flow_rgb: np.ndarray | None,
 	weight_hr: np.ndarray | None,
 	out_dir: Path | None,
-	threshold: float,
-	source_xy: tuple[int, int] | None = None,
 ) -> None:
 	if out_dir is None:
 		return
@@ -323,13 +268,11 @@ def _write_flow_gate_debug(
 		print(f"[pred_dt_flow_gate] debug write skipped: tifffile import failed: {exc}", flush=True)
 		return
 	out_dir.mkdir(parents=True, exist_ok=True)
-	# Match dense_batch_min_cut's fixed binarization white distance domain.
-	thresholded_u8 = _flow_gate_white_domain_u8(pred_u8, threshold)
 	pred_raw_u8 = pred_u8.astype(np.uint8, copy=True)
-	flow = np.zeros_like(thresholded_u8, dtype=np.float32) if flow_hr is None else np.asarray(flow_hr, dtype=np.float32)
+	flow = np.zeros_like(pred_raw_u8, dtype=np.float32) if flow_hr is None else np.asarray(flow_hr, dtype=np.float32)
 	grid_flow = None if smooth_grid_flow is None else np.asarray(smooth_grid_flow, dtype=np.float32)
 	graph_flow = None if graph_edge_flow_rgb is None else np.asarray(graph_edge_flow_rgb, dtype=np.float32)
-	weights = np.zeros_like(thresholded_u8, dtype=np.float32) if weight_hr is None else np.asarray(weight_hr, dtype=np.float32)
+	weights = np.zeros_like(pred_raw_u8, dtype=np.float32) if weight_hr is None else np.asarray(weight_hr, dtype=np.float32)
 	def write_named_layer(tw, image: np.ndarray, *, name: str) -> None:
 		arr = np.asarray(image)
 		if arr.ndim == 2:
@@ -347,7 +290,6 @@ def _write_flow_gate_debug(
 	for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
 		with tifffile.TiffWriter(str(out_dir / f"pred_dt_flow_gate_{suffix}_layers.tif")) as tw:
 			write_named_layer(tw, pred_raw_u8, name="pred_dt")
-			write_named_layer(tw, thresholded_u8, name="thresholded_pred_dt")
 			write_named_layer(tw, flow, name="raw_flow_bilinear")
 			if grid_flow is not None:
 				write_named_layer(tw, grid_flow, name="smooth_grid_flow")
@@ -355,7 +297,6 @@ def _write_flow_gate_debug(
 				write_named_layer(tw, graph_flow, name="graph_edge_flow")
 			write_named_layer(tw, weights, name="flow_gate_weight")
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_pred_dt.tif"), pred_raw_u8)
-		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_thresholded.tif"), thresholded_u8)
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_raw_flow.tif"), flow)
 		if grid_flow is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_smooth_grid_flow.tif"), grid_flow)
@@ -408,11 +349,10 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 	if res.data_s.pred_dt is None:
 		raise RuntimeError("pred_dt_flow_gate requires pred_dt to be loaded")
 
-	threshold = _FLOW_GATE_THRESHOLD
 	flow_zero = float(cfg.get("flow_zero", 20.0))
 	flow_one = float(cfg.get("flow_one", 100.0))
 	backtrack_distance = float(cfg.get("backtrack_distance", 10.0))
-	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 1))
+	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 0))
 	pred_dt_pool_step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
 	if flow_one <= flow_zero:
 		raise ValueError("pred_dt_flow_gate requires flow_one > flow_zero")
@@ -423,11 +363,10 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 		_flow_gate_debug_counts[_flow_gate_stage] = debug_index + 1
 	write_layer_debug = debug and (debug_index % 10) == 0
 	def mark(label: str) -> float:
-		print(f"[pred_dt_flow_gate] stage start: {_flow_gate_stage}.{debug_index:06d}.{label}", flush=True)
 		return time.perf_counter()
 
 	def done(label: str, t0: float) -> None:
-		print(f"[pred_dt_flow_gate] stage done: {_flow_gate_stage}.{debug_index:06d}.{label} ({time.perf_counter() - t0:.3f}s)", flush=True)
+		return None
 
 	with torch.no_grad():
 		xyz_hr = res.xyz_hr[0].detach()
@@ -511,8 +450,6 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 				graph_edge_flow_rgb=None,
 				weight_hr=None,
 				out_dir=_flow_gate_out_dir,
-				threshold=threshold,
-				source_xy=(source_x, source_y),
 			)
 			done("write_initial_debug", _t)
 		try:
@@ -535,14 +472,9 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 				smooth_grid_flow = None
 				graph_edge_flow_rgb = None
 		except RuntimeError as exc:
-			white_domain = _flow_gate_white_domain_u8(pred_img, threshold)
+			message = str(exc)
 			source_value = int(pred_img[source_y, source_x]) if 0 <= source_y < He and 0 <= source_x < We else -1
-			source_in_domain = bool(
-				0 <= source_y < He and 0 <= source_x < We and
-				white_domain[source_y, source_x] > 0
-			)
-			domain_pixels = int(np.count_nonzero(white_domain))
-			if not source_in_domain:
+			if "white distance domain" in message:
 				weight = seed_area.to(dtype=torch.float32)
 				valid = res.mask_lr > 0.0
 				valid_count = max(1.0, float(valid.sum().detach().cpu()))
@@ -553,8 +485,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 				}
 				print(
 					f"[pred_dt_flow_gate] {_flow_gate_stage}: skipped flow "
-					f"(source outside white domain, value={source_value}, "
-					f"domain={domain_pixels}/{We * He})",
+					f"(source outside C++ flow domain, value={source_value})",
 					flush=True,
 				)
 				if write_layer_debug:
@@ -573,8 +504,6 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 						graph_edge_flow_rgb=None,
 						weight_hr=weight_hr,
 						out_dir=_flow_gate_out_dir,
-						threshold=threshold,
-						source_xy=(source_x, source_y),
 					)
 				if debug:
 					_write_flow_gate_weight_jpg(
@@ -586,9 +515,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 				return weight
 			raise RuntimeError(
 				f"{exc}; pred_dt source_value={source_value} "
-				f"source_in_flow_domain={source_in_domain} "
-				f"domain_pixels={domain_pixels}/{We * He}; "
-				f"wrote threshold debug to {_flow_gate_out_dir}"
+				f"wrote debug to {_flow_gate_out_dir}"
 			) from exc
 		flow_lr = torch.as_tensor(
 			query_flow.reshape(Hm, Wm),
@@ -597,8 +524,6 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 		).view(1, 1, Hm, Wm)
 		_t = mark("compute_weight")
 		seed_capacity = float(flow_metadata.get("source_capacity", 0.0))
-		if seed_capacity <= 0.0:
-			seed_capacity = _flow_gate_seed_dt(pred_img, threshold, source_x, source_y)
 		effective_flow_one = flow_one
 		effective_flow_zero = flow_zero
 		if seed_capacity > 0.0 and seed_capacity < flow_one:
@@ -641,8 +566,6 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | None:
 				graph_edge_flow_rgb=graph_edge_flow_rgb,
 				weight_hr=weight_hr,
 				out_dir=_flow_gate_out_dir,
-				threshold=threshold,
-				source_xy=(source_x, source_y),
 			)
 			done("write_layer_debug", _t)
 		if debug:
