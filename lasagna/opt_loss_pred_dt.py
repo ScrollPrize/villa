@@ -667,7 +667,7 @@ def _write_anticipatory_fit_debug_mosaic(
 		rgb = cv2.resize(rgb, (slice_w * up, slice_h * up), interpolation=cv2.INTER_NEAREST)
 		y0 = int(round((0.0 + 1.0) * 0.5 * (slice_h - 1) * up))
 		best_offset = float(candidates["offset"][cand_i].detach().cpu())
-		y_line = int(round((1.0 - ((best_offset / search_radius) + 1.0) * 0.5) * (slice_h - 1) * up))
+		y_line = int(round(((best_offset / search_radius) + 1.0) * 0.5 * (slice_h - 1) * up))
 		x_root = int(round((0.0 + 0.25) / 1.5 * (slice_w - 1) * up))
 		x_tip = int(round((1.0 + 0.25) / 1.5 * (slice_w - 1) * up))
 		cv2.line(rgb, (x_root, y0), (x_tip, y0), (140, 140, 140), 1, cv2.LINE_AA)
@@ -677,12 +677,22 @@ def _write_anticipatory_fit_debug_mosaic(
 		draw_text_bg(rgb, "T0", (min(rgb.shape[1] - 20, x_tip + 3), max(10, y0 - 6)), 0.28, (255, 0, 128))
 		cv2.line(rgb, (x_root, y_line), (x_tip, y_line), (0, 255, 255), 1, cv2.LINE_AA)
 		inliers = candidates["inliers"][cand_i].detach().cpu().numpy()
+		baseline_scores: list[float] | None = None
+		if 0 <= y0 // up < gray.shape[0]:
+			baseline_scores = []
 		for si, score in enumerate(inliers):
 			a = si / max(1, len(inliers) - 1)
 			xp = int(round(((a + 0.25) / 1.5) * (slice_w - 1) * up))
 			cv2.circle(rgb, (xp, y_line), 2, (0, 0, 255), -1, cv2.LINE_AA)
 			if si < 8:
 				draw_text_bg(rgb, f"{score:.2f}", (max(0, xp - 14), min(rgb.shape[0] - 4, y_line + 16 + (si % 2) * 12)), 0.28, (255, 255, 255))
+			if baseline_scores is not None:
+				xg = max(0, min(gray.shape[1] - 1, int(round(xp / up))))
+				yg = max(0, min(gray.shape[0] - 1, int(round(y0 / up))))
+				baseline_scores.append(float(gray[yg, xg].detach().cpu()))
+				cv2.circle(rgb, (xp, y0), 2, (255, 180, 0), -1, cv2.LINE_AA)
+				if si < 8:
+					draw_text_bg(rgb, f"{baseline_scores[-1]:.2f}", (max(0, xp - 14), max(10, y0 - 10 - (si % 2) * 12)), 0.28, (255, 180, 0))
 		prefix = float(candidates["prefix"][cand_i].detach().cpu())
 		draw_text_bg(rgb, f"{label} tip=({th},{tw}) root=({rh},{rw})", (6, 12), 0.35, (255, 255, 255))
 		draw_text_bg(rgb, f"line={prefix:.3f} off={best_offset:.2f}", (6, 26), 0.35, (0, 255, 255))
