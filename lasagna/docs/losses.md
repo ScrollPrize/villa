@@ -53,7 +53,9 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
         "samples": 8,
         "inlier_zero": 80.0,
         "inlier_one": 120.0,
-        "loss_weight": 1.0
+        "loss_weight": 1.0,
+        "debug_points": [[40, 50], [40, 51]],
+        "debug_slice_upsample": 8
       },
       "debug": true
     }
@@ -83,6 +85,14 @@ whose root gate is higher/nonzero and whose tip gate is below 1 contributes an
 independent straight pull to the tip corner, weighted by root gate and prefix
 inlier score. The pull is not winner-take-all; multiple neighbor lines may
 contribute to the same tip.
+
+When `anticipatory_pull.debug_points` is set, every normal flow-gate layer-debug
+iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.tif`.
+Points are LR mesh tip coordinates `(h,w)`. Each tile shows a slice around the
+selected root-tip line, with `pred_dt` scaled from `inlier_zero` to
+`inlier_one`, the fitted straight line, per-sample inlier scores, and the
+complete prefix score. Tiles are upsampled by `debug_slice_upsample` and packed
+into an approximately 2:1 mosaic.
 
 ## 4) Add visualization output (loss map)
 

@@ -308,10 +308,6 @@ def _anticipatory_pull_prefetch_points(*, xyz_lr: torch.Tensor, cfg: dict) -> to
 	line = root.unsqueeze(1) + t * (tip - root).unsqueeze(1)
 	normals = _vertex_normals(xyz_lr.detach())[0]
 	offsets = _anticipatory_offset_values(xyz_lr=xyz0.unsqueeze(0), normals=normals.unsqueeze(0), cfg=cfg)
-	max_pf_offsets = max(1, int(cfg.get("prefetch_search_steps", 3)))
-	if offsets.numel() > max_pf_offsets:
-		pf_idx = torch.linspace(0, offsets.numel() - 1, max_pf_offsets, device=offsets.device).round().long()
-		offsets = offsets[pf_idx].unique(sorted=True)
 	if offsets.numel() > 1:
 		n = normals[tip_h, tip_w]
 		line = line.unsqueeze(1) + offsets.view(1, -1, 1, 1) * n.view(-1, 1, 1, 3)
@@ -345,6 +341,8 @@ def _score_anticipatory_pull_candidates(
 	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
 	targets: list[torch.Tensor] = []
 	prefixes: list[torch.Tensor] = []
+	best_inliers: list[torch.Tensor] = []
+	best_offsets_all: list[torch.Tensor] = []
 	with torch.no_grad():
 		for c0 in range(0, n_candidates, chunk_candidates):
 			c1 = min(n_candidates, c0 + chunk_candidates)
@@ -368,13 +366,19 @@ def _score_anticipatory_pull_candidates(
 			best_offsets = offsets[best_off]
 			targets.append(tip + best_offsets.unsqueeze(-1) * n)
 			prefixes.append(best_score)
+			best_inliers.append(inlier[torch.arange(c1 - c0, device=xyz0.device), best_off])
+			best_offsets_all.append(best_offsets)
+	candidate_idx = torch.arange(n_candidates, device=xyz0.device, dtype=torch.long)
 	return {
+		"candidate_idx": candidate_idx,
 		"tip_h": tip_h,
 		"tip_w": tip_w,
 		"root_h": root_h,
 		"root_w": root_w,
 		"target_xyz": torch.cat(targets, dim=0),
 		"prefix": torch.cat(prefixes, dim=0),
+		"inliers": torch.cat(best_inliers, dim=0),
+		"offset": torch.cat(best_offsets_all, dim=0),
 	}
 
 
@@ -398,6 +402,7 @@ def _activate_anticipatory_pull(
 	active = (tip_weight < 1.0) & (root_weight > 0.0) & (root_weight > tip_weight) & (prefix > 0.0) & (tip_mask > 0.0)
 	if not bool(active.any().detach().cpu()):
 		return {
+			"candidate_idx": candidates["candidate_idx"][:0],
 			"tip_h": tip_h[:0],
 			"tip_w": tip_w[:0],
 			"root_h": root_h[:0],
@@ -410,6 +415,7 @@ def _activate_anticipatory_pull(
 	loss_weight = float(cfg.get("loss_weight", 1.0))
 	candidate_weight = root_weight[active] * prefix[active] * tip_mask[active] * loss_weight
 	return {
+		"candidate_idx": candidates["candidate_idx"][active],
 		"tip_h": tip_h[active],
 		"tip_w": tip_w[active],
 		"root_h": root_h[active],
@@ -501,6 +507,150 @@ def _anticipatory_pull_overlay(
 				y = int(round((1.0 - a) * y0 + a * y1))
 				img[y, x] = color
 	return img
+
+
+def _anticipatory_debug_points(cfg: dict) -> list[tuple[int, int]]:
+	points = cfg.get("debug_points", None)
+	if points is None:
+		points = cfg.get("debug_fit_points", None)
+	if not isinstance(points, (list, tuple)):
+		return []
+	out: list[tuple[int, int]] = []
+	for p in points:
+		if not isinstance(p, (list, tuple)) or len(p) < 2:
+			continue
+		try:
+			out.append((int(p[0]), int(p[1])))
+		except Exception:
+			continue
+	return out
+
+
+def _write_anticipatory_fit_debug_mosaic(
+	*,
+	res: fit_model.FitResult3D,
+	cfg: dict,
+	candidates: dict | None,
+	pull: dict | None,
+	stage_name: str,
+	debug_index: int,
+	out_dir: Path | None,
+) -> None:
+	points = _anticipatory_debug_points(cfg)
+	if out_dir is None or not points or candidates is None:
+		return
+	try:
+		import cv2
+	except Exception as exc:
+		print(f"[pred_dt_flow_gate] anticipatory fit debug skipped: cv2 import failed: {exc}", flush=True)
+		return
+	try:
+		import tifffile
+	except Exception as exc:
+		print(f"[pred_dt_flow_gate] anticipatory fit debug skipped: tifffile import failed: {exc}", flush=True)
+		return
+
+	xyz0 = res.xyz_lr[0].detach()
+	Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
+	if Hm <= 1 or Wm <= 1:
+		return
+	normals = _vertex_normals(res.xyz_lr.detach())[0]
+	up = max(1, int(cfg.get("debug_slice_upsample", 8)))
+	slice_w = max(24, int(cfg.get("debug_slice_width", 96)))
+	slice_h = max(16, int(cfg.get("debug_slice_height", 48)))
+	inlier_zero = float(cfg.get("inlier_zero", 80.0))
+	inlier_one = float(cfg.get("inlier_one", 120.0))
+	if inlier_one <= inlier_zero:
+		return
+	active_idx = None
+	if pull is not None and int(pull["candidate_idx"].numel()) > 0:
+		active_idx = pull["candidate_idx"].detach()
+
+	def _candidate_for_point(h: int, w: int) -> int | None:
+		if h < 0 or h >= Hm or w < 0 or w >= Wm:
+			return None
+		tip_match = (candidates["tip_h"] == h) & (candidates["tip_w"] == w)
+		if active_idx is not None and int(active_idx.numel()) > 0:
+			active_match = tip_match[active_idx]
+			if bool(active_match.any().detach().cpu()):
+				sub_idx = active_idx[active_match]
+				prefix = candidates["prefix"][sub_idx]
+				return int(sub_idx[int(torch.argmax(prefix).detach().cpu())].detach().cpu())
+		if not bool(tip_match.any().detach().cpu()):
+			return None
+		sub_idx = tip_match.nonzero(as_tuple=True)[0]
+		prefix = candidates["prefix"][sub_idx]
+		return int(sub_idx[int(torch.argmax(prefix).detach().cpu())].detach().cpu())
+
+	tiles: list[np.ndarray] = []
+	xs_unit = torch.linspace(-0.25, 1.25, slice_w, device=xyz0.device, dtype=xyz0.dtype)
+	ys_unit = torch.linspace(-1.0, 1.0, slice_h, device=xyz0.device, dtype=xyz0.dtype)
+	for point_i, (tip_h, tip_w) in enumerate(points):
+		cand_i = _candidate_for_point(tip_h, tip_w)
+		if cand_i is None:
+			tile = np.zeros((slice_h * up, slice_w * up, 3), dtype=np.uint8)
+			cv2.putText(tile, f"tip=({tip_h},{tip_w}) no cand", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+			tiles.append(tile)
+			continue
+		rh = int(candidates["root_h"][cand_i].detach().cpu())
+		rw = int(candidates["root_w"][cand_i].detach().cpu())
+		th = int(candidates["tip_h"][cand_i].detach().cpu())
+		tw = int(candidates["tip_w"][cand_i].detach().cpu())
+		root = xyz0[rh, rw]
+		tip = xyz0[th, tw]
+		line = tip - root
+		line_len = line.norm().clamp_min(1e-6)
+		line_dir = line / line_len
+		normal = normals[th, tw]
+		normal = normal / normal.norm().clamp_min(1e-6)
+		search_radius = float(max(abs(float(candidates["offset"][cand_i].detach().cpu())), 1.0e-6))
+		default_offsets = _anticipatory_offset_values(xyz_lr=xyz0.unsqueeze(0), normals=normals.unsqueeze(0), cfg=cfg)
+		if default_offsets.numel() > 1:
+			search_radius = max(search_radius, float(default_offsets.abs().max().detach().cpu()))
+		xs = xs_unit * line_len
+		ys = ys_unit * search_radius
+		grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+		query = root.view(1, 1, 3) + grid_x.unsqueeze(-1) * line_dir.view(1, 1, 3) + grid_y.unsqueeze(-1) * normal.view(1, 1, 3)
+		sampled = res.data.grid_sample_fullres(query.view(1, slice_h, slice_w, 3)).pred_dt
+		if sampled is None:
+			continue
+		pred = sampled.squeeze(0).squeeze(0).squeeze(0)
+		gray = ((pred - inlier_zero) / (inlier_one - inlier_zero)).clamp(0.0, 1.0)
+		img = (gray.detach().cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+		rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+		rgb = cv2.resize(rgb, (slice_w * up, slice_h * up), interpolation=cv2.INTER_NEAREST)
+		y0 = int(round((0.0 + 1.0) * 0.5 * (slice_h - 1) * up))
+		best_offset = float(candidates["offset"][cand_i].detach().cpu())
+		y_line = int(round((1.0 - ((best_offset / search_radius) + 1.0) * 0.5) * (slice_h - 1) * up))
+		x_root = int(round((0.0 + 0.25) / 1.5 * (slice_w - 1) * up))
+		x_tip = int(round((1.0 + 0.25) / 1.5 * (slice_w - 1) * up))
+		cv2.line(rgb, (x_root, y_line), (x_tip, y_line), (0, 255, 255), 1, cv2.LINE_AA)
+		inliers = candidates["inliers"][cand_i].detach().cpu().numpy()
+		for si, score in enumerate(inliers):
+			a = si / max(1, len(inliers) - 1)
+			xp = int(round(((a + 0.25) / 1.5) * (slice_w - 1) * up))
+			cv2.circle(rgb, (xp, y_line), 2, (0, 0, 255), -1, cv2.LINE_AA)
+			if si < 8:
+				cv2.putText(rgb, f"{score:.2f}", (max(0, xp - 14), min(rgb.shape[0] - 4, y_line + 16 + (si % 2) * 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1, cv2.LINE_AA)
+		prefix = float(candidates["prefix"][cand_i].detach().cpu())
+		cv2.putText(rgb, f"tip=({th},{tw}) root=({rh},{rw})", (6, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+		cv2.putText(rgb, f"line={prefix:.3f} off={best_offset:.2f}", (6, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+		cv2.line(rgb, (0, y0), (rgb.shape[1] - 1, y0), (96, 96, 96), 1, cv2.LINE_AA)
+		tiles.append(rgb)
+	if not tiles:
+		return
+	n = len(tiles)
+	cols = max(1, int(np.ceil(np.sqrt(2.0 * n))))
+	rows = int(np.ceil(n / cols))
+	tile_h, tile_w = tiles[0].shape[:2]
+	mosaic = np.zeros((rows * tile_h, cols * tile_w, 3), dtype=np.uint8)
+	for i, tile in enumerate(tiles):
+		r = i // cols
+		c = i % cols
+		mosaic[r * tile_h:(r + 1) * tile_h, c * tile_w:(c + 1) * tile_w] = tile
+	out_dir.mkdir(parents=True, exist_ok=True)
+	for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
+		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_fit_points.tif"), mosaic)
 
 
 def configure_flow_gate(
@@ -946,6 +1096,16 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				pull_overlay_rgb=pull_overlay_rgb,
 				out_dir=_flow_gate_out_dir,
 			)
+			if pull_cfg is not None:
+				_write_anticipatory_fit_debug_mosaic(
+					res=res,
+					cfg=pull_cfg,
+					candidates=pull_candidates,
+					pull=pull,
+					stage_name=_flow_gate_stage,
+					debug_index=debug_index,
+					out_dir=_flow_gate_out_dir,
+				)
 			done("write_layer_debug", _t)
 		if debug:
 			_t = mark("write_weight_jpg")
