@@ -22,11 +22,9 @@
 
 #include <ceres/ceres.h>
 
-#include "vc/core/types/VcDataset.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include "vc/ui/VCCollection.hpp"
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/GridStore.hpp"
 
 #include "discrete.hpp"
@@ -174,13 +172,14 @@ int main(int argc, char** argv) {
     }
     std::cout << "Found umbilicus point at: " << *umbilicus_point << std::endl;
 
-    // Load volume data using VcDataset
-    auto ds = std::make_unique<vc::VcDataset>(volume_path / dataset_name);
-    if (!ds) {
-        std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;
-        return 1;
-    }
-    auto shape = ds->shape();
+    const int level = std::stoi(dataset_name);
+    Volume volume(volume_path);
+    auto shapeArray = volume.chunkedCache()->shape(level);
+    std::vector<size_t> shape = {
+        static_cast<size_t>(shapeArray[0]),
+        static_cast<size_t>(shapeArray[1]),
+        static_cast<size_t>(shapeArray[2]),
+    };
     std::cout << "Volume shape: (" << shape[0] << ", " << shape[1] << ", " << shape[2] << ")" << std::endl;
 
     // Extract XY slice
@@ -192,11 +191,8 @@ int main(int argc, char** argv) {
 
     cv::Mat slice_mat(shape[1], shape[2], CV_8U);
     Array3D<uint8_t> slice_data({1, shape[1], shape[2]});
-    cv::Vec3i offset = {z_slice, 0, 0};
-    auto cache = vc::render::createChunkCache(
-        vc::render::openLocalZarrPyramid(ds->path()),
-        4llu*1024*1024*1024);
-    readArea3D(slice_data, offset, cache.get(), 0);
+    volume.setCacheBudget(4llu * 1024 * 1024 * 1024);
+    volume.readZYX(slice_data, {z_slice, 0, 0}, level);
     
     for (int y = 0; y < shape[1]; ++y) {
         for (int x = 0; x < shape[2]; ++x) {

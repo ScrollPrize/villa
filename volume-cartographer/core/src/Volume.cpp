@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <type_traits>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -21,7 +22,8 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/PostProcess.hpp"
-#include "vc/core/types/VcDataset.hpp"
+#include "vc/core/render/IChunkedArray.hpp"
+#include "vc/core/render/ChunkFetch.hpp"
 #include "utils/hash.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
@@ -102,6 +104,164 @@ std::string deriveRemoteVolumeId(const std::string& url)
     out << name << "-" << std::hex << std::nouppercase << std::setw(16)
         << std::setfill('0') << hash;
     return out.str();
+}
+
+} // namespace
+
+namespace {
+
+template <typename T>
+T typedFillValue(vc::render::IChunkedArray& array)
+{
+    const double fill = array.fillValue();
+    if constexpr (std::is_same_v<T, uint8_t>) {
+        return static_cast<uint8_t>(std::clamp(fill, 0.0, 255.0));
+    } else {
+        return static_cast<uint16_t>(std::clamp(fill, 0.0, 65535.0));
+    }
+}
+
+template <typename T>
+void readFromChunkedArrayZYX(Array3D<T>& out,
+                                   const std::array<int, 3>& offsetZYX,
+                                   vc::render::IChunkedArray& array,
+                                   int level)
+{
+    using vc::render::ChunkKey;
+    using vc::render::ChunkStatus;
+    using vc::render::ChunkDtype;
+
+    const ChunkDtype expectedDtype = std::is_same_v<T, uint8_t>
+        ? ChunkDtype::UInt8
+        : ChunkDtype::UInt16;
+    if (array.dtype() != expectedDtype) {
+        throw std::runtime_error("Volume::read dtype does not match volume dtype");
+    }
+
+    const auto outShape = out.shape();
+    if (outShape[0] == 0 || outShape[1] == 0 || outShape[2] == 0) {
+        return;
+    }
+    out.fill(T{});
+
+    const auto volumeShape = array.shape(level);
+    const auto chunkShape = array.chunkShape(level);
+    if (chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) {
+        throw std::runtime_error("Volume::read encountered invalid chunk shape");
+    }
+
+    const int z0 = offsetZYX[0];
+    const int y0 = offsetZYX[1];
+    const int x0 = offsetZYX[2];
+    const int z1 = z0 + static_cast<int>(outShape[0]) - 1;
+    const int y1 = y0 + static_cast<int>(outShape[1]) - 1;
+    const int x1 = x0 + static_cast<int>(outShape[2]) - 1;
+
+    const int readZ0 = std::max(0, z0);
+    const int readY0 = std::max(0, y0);
+    const int readX0 = std::max(0, x0);
+    const int readZ1 = std::min(volumeShape[0] - 1, z1);
+    const int readY1 = std::min(volumeShape[1] - 1, y1);
+    const int readX1 = std::min(volumeShape[2] - 1, x1);
+
+    if (readZ0 <= readZ1 && readY0 <= readY1 && readX0 <= readX1) {
+        std::vector<ChunkKey> keys;
+        const int cZ0 = readZ0 / chunkShape[0];
+        const int cY0 = readY0 / chunkShape[1];
+        const int cX0 = readX0 / chunkShape[2];
+        const int cZ1 = readZ1 / chunkShape[0];
+        const int cY1 = readY1 / chunkShape[1];
+        const int cX1 = readX1 / chunkShape[2];
+        keys.reserve(static_cast<size_t>(cZ1 - cZ0 + 1) *
+                     static_cast<size_t>(cY1 - cY0 + 1) *
+                     static_cast<size_t>(cX1 - cX0 + 1));
+        for (int cz = cZ0; cz <= cZ1; ++cz) {
+            for (int cy = cY0; cy <= cY1; ++cy) {
+                for (int cx = cX0; cx <= cX1; ++cx) {
+                    keys.push_back({level, cz, cy, cx});
+                }
+            }
+        }
+        if (!keys.empty()) {
+            array.prefetchChunks(keys, false);
+        }
+    }
+
+    const T fill = typedFillValue<T>(array);
+    const size_t chunkStrideY = static_cast<size_t>(chunkShape[2]);
+    const size_t chunkStrideZ = static_cast<size_t>(chunkShape[1]) * chunkStrideY;
+
+    #pragma omp parallel
+    {
+        struct CachedChunk {
+            int cz = std::numeric_limits<int>::min();
+            int cy = std::numeric_limits<int>::min();
+            int cx = std::numeric_limits<int>::min();
+            bool allFill = false;
+            const T* data = nullptr;
+            std::shared_ptr<const std::vector<std::byte>> bytes;
+        } cached;
+
+        auto loadChunk = [&](int cz, int cy, int cx) {
+            if (cached.cz == cz && cached.cy == cy && cached.cx == cx) {
+                return;
+            }
+            cached = {};
+            cached.cz = cz;
+            cached.cy = cy;
+            cached.cx = cx;
+
+            const auto result = array.getChunkBlocking(level, cz, cy, cx);
+            if (result.status == ChunkStatus::AllFill) {
+                cached.allFill = true;
+            } else if (result.status == ChunkStatus::Data && result.bytes) {
+                cached.bytes = result.bytes;
+                cached.data = reinterpret_cast<const T*>(cached.bytes->data());
+            } else if (result.status == ChunkStatus::Error) {
+                throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
+            } else {
+                cached.allFill = true;
+            }
+        };
+
+        #pragma omp for schedule(dynamic, 4) collapse(2)
+        for (size_t z = 0; z < outShape[0]; ++z) {
+            for (size_t y = 0; y < outShape[1]; ++y) {
+                const int iz = z0 + static_cast<int>(z);
+                const int iy = y0 + static_cast<int>(y);
+                if (iz < 0 || iz >= volumeShape[0] ||
+                    iy < 0 || iy >= volumeShape[1]) {
+                    continue;
+                }
+                const int cz = iz / chunkShape[0];
+                const int cy = iy / chunkShape[1];
+                const int lz = iz - cz * chunkShape[0];
+                const int ly = iy - cy * chunkShape[1];
+                for (size_t x = 0; x < outShape[2]; ++x) {
+                    const int ix = x0 + static_cast<int>(x);
+                    if (ix < 0 || ix >= volumeShape[2]) {
+                        continue;
+                    }
+                    const int cx = ix / chunkShape[2];
+                    const int lx = ix - cx * chunkShape[2];
+                    loadChunk(cz, cy, cx);
+                    if (cached.allFill || !cached.data) {
+                        out(z, y, x) = fill;
+                    } else {
+                        const size_t offset = static_cast<size_t>(lz) * chunkStrideZ +
+                                              static_cast<size_t>(ly) * chunkStrideY +
+                                              static_cast<size_t>(lx);
+                        out(z, y, x) = cached.data[offset];
+                    }
+                }
+            }
+        }
+    }
+}
+
+std::array<int, 3> xyzToZyx(const std::array<int, 3>& xyz)
+{
+    return {xyz[2], xyz[1], xyz[0]};
 }
 
 } // namespace
@@ -190,60 +350,27 @@ void Volume::zarrOpen()
     if (!metadata_.contains("format") || metadata_["format"].get_string() != "zarr")
         return;
 
-    {
-        auto compactDs = vc::openZarrLevels(path_);
-
-        // Reindex so zarrDs_[i] corresponds to actual scale level i.
-        // openZarrLevels() returns a compact vector; directory names give the
-        // true level number. Power-of-2 scaling is assumed but not every level
-        // needs to be present (e.g. only levels 1,2,3 or 0,2).
-        int maxLevel = 0;
-        for (auto& ds : compactDs) {
-            try {
-                int lvl = std::stoi(ds->path().filename().string());
-                maxLevel = std::max(maxLevel, lvl);
-            } catch (...) {
-                fprintf(stderr, "[Volume] skipping non-numeric zarr level '%s'\n",
-                        ds->path().filename().string().c_str());
-            }
-        }
-        zarrDs_.resize(maxLevel + 1);
-        for (auto& ds : compactDs) {
-            try {
-                int lvl = std::stoi(ds->path().filename().string());
-                zarrDs_[lvl] = std::move(ds);
-            } catch (...) {}
-        }
+    auto opened = vc::render::openLocalZarrPyramid(path_);
+    if (opened.shapes.empty()) {
+        throw std::runtime_error("no physical zarr dataset directories found in " + path_.string());
     }
-
-    for (size_t i = 0; i < zarrDs_.size(); i++) {
-        if (!zarrDs_[i]) continue;  // missing level
-        auto dtype = zarrDs_[i]->getDtype();
-        if (dtype != vc::VcDtype::uint8 && dtype != vc::VcDtype::uint16)
-            throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets, incompatible type found in " + path_.string());
-    }
+    zarrLevelShapes_ = opened.shapes;
 
     if (metadataAutoGenerated_) {
-
         bool hasReference = false;
         int baseSlices = 0;
         int baseHeight = 0;
         int baseWidth = 0;
 
-        for (size_t level = 0; level < zarrDs_.size(); ++level) {
-            const auto& ds = zarrDs_[level];
-            if (!ds) {
-                continue;
-            }
-
-            const auto& shape = ds->shape();
+        for (size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
+            const auto& shape = zarrLevelShapes_[level];
             const int levelInt = static_cast<int>(level);
 
             if (!hasReference) {
                 const size_t scale = size_t{1} << levelInt;
-                baseSlices = static_cast<int>(shape[0] * scale);
-                baseHeight = static_cast<int>(shape[1] * scale);
-                baseWidth = static_cast<int>(shape[2] * scale);
+                baseSlices = static_cast<int>(static_cast<size_t>(shape[0]) * scale);
+                baseHeight = static_cast<int>(static_cast<size_t>(shape[1]) * scale);
+                baseWidth = static_cast<int>(static_cast<size_t>(shape[2]) * scale);
                 hasReference = true;
             }
 
@@ -279,14 +406,10 @@ void Volume::zarrOpen()
     // zarr shape is [z, y, x] = [slices, height, width]
     if (!skipShapeCheck) {
         bool hasAnyPhysicalScale = false;
-        for (size_t level = 0; level < zarrDs_.size(); ++level) {
-            const auto& ds = zarrDs_[level];
-            if (!ds) {
-                continue;
-            }
+        for (size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
+            const auto& shape = zarrLevelShapes_[level];
             hasAnyPhysicalScale = true;
 
-            const auto& shape = ds->shape();
             const int expectedSlices = ceilDivPow2(_slices, static_cast<int>(level));
             const int expectedHeight = ceilDivPow2(_height, static_cast<int>(level));
             const int expectedWidth = ceilDivPow2(_width, static_cast<int>(level));
@@ -407,29 +530,10 @@ double Volume::voxelSize() const
     return metadata_["voxelsize"].get_double();
 }
 
-vc::VcDataset *Volume::zarrDataset(int level) const {
-    if (level < 0 || zarrDs_.empty())
-        return nullptr;
-
-    if (static_cast<size_t>(level) < zarrDs_.size()) {
-        auto* ds = zarrDs_[static_cast<size_t>(level)].get();
-        if (ds) return ds;
-    }
-
-    // Requested level is missing (padded gap). When called with
-    // default level=0, callers just want "any dataset" as a validity
-    // check — return the first non-null entry.
-    if (level == 0) {
-        for (auto& d : zarrDs_)
-            if (d) return d.get();
-    }
-    return nullptr;
-}
-
 size_t Volume::numScales() const noexcept {
     if (isRemote_)
         return remoteNumScales_;
-    return zarrDs_.size();
+    return zarrLevelShapes_.size();
 }
 
 // ============================================================================
@@ -511,4 +615,48 @@ void Volume::sample(cv::Mat_<uint16_t>& out,
 {
     const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
+}
+
+void Volume::readZYX(Array3D<uint8_t>& out,
+                           const std::array<int, 3>& offsetZYX,
+                           int level)
+{
+    readFromChunkedArrayZYX(out, offsetZYX, *chunkedCache(), level);
+}
+
+void Volume::readZYX(Array3D<uint16_t>& out,
+                           const std::array<int, 3>& offsetZYX,
+                           int level)
+{
+    readFromChunkedArrayZYX(out, offsetZYX, *chunkedCache(), level);
+}
+
+void Volume::readZYX(Array3D<uint8_t>& out,
+                           const std::array<int, 3>& offsetZYX,
+                           vc::render::IChunkedArray& array,
+                           int level)
+{
+    readFromChunkedArrayZYX(out, offsetZYX, array, level);
+}
+
+void Volume::readZYX(Array3D<uint16_t>& out,
+                           const std::array<int, 3>& offsetZYX,
+                           vc::render::IChunkedArray& array,
+                           int level)
+{
+    readFromChunkedArrayZYX(out, offsetZYX, array, level);
+}
+
+void Volume::readXYZ(Array3D<uint8_t>& out,
+                           const std::array<int, 3>& offsetXYZ,
+                           int level)
+{
+    readZYX(out, xyzToZyx(offsetXYZ), level);
+}
+
+void Volume::readXYZ(Array3D<uint16_t>& out,
+                           const std::array<int, 3>& offsetXYZ,
+                           int level)
+{
+    readZYX(out, xyzToZyx(offsetXYZ), level);
 }

@@ -380,12 +380,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
     ensureNormalsInward(context.resumeSurface, context.volume);
 
-    vc::VcDataset* dataset = context.volume->zarrDataset(0);
-    if (!dataset) {
-        result.error = QStringLiteral("Unable to access primary volume dataset");
-        return result;
-    }
-
     if (!context.cacheRoot.isEmpty()) {
         std::error_code ec;
         std::filesystem::create_directories(context.cacheRoot.toStdString(), ec);
@@ -525,9 +519,8 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             qCInfo(lcSegGrowth) << "  regular tracer OpenMP threads forced to 1";
         }
 
-        QuadSurface* surface = tracer(dataset,
+        QuadSurface* surface = tracer(*context.volume,
                                       1.0f,
-                                      context.volume->chunkedCache(),
                                       context.level,
                                       origin,
                                       params,

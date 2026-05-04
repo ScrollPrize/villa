@@ -10,10 +10,8 @@
 
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/SampleParams.hpp"
+#include "vc/core/types/Array3D.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
-
-// Forward declarations
-namespace vc { class VcDataset; }
 
 namespace vc::render { class ChunkCache; class IChunkedArray; }
 
@@ -61,7 +59,6 @@ public:
     [[nodiscard]] std::array<int, 3> shapeXyz() const noexcept;
     [[nodiscard]] double voxelSize() const;
 
-    [[nodiscard]] vc::VcDataset *zarrDataset(int level = 0) const;
     [[nodiscard]] size_t numScales() const noexcept;
     [[nodiscard]] int baseScaleLevel() const noexcept { return 0; }
 
@@ -87,6 +84,34 @@ public:
                 const cv::Mat_<cv::Vec3f>& coords,
                 const vc::SampleParams& params);
 
+    // Blocking integer reads through the chunked local/remote cache.
+    // ZYX order matches zarr storage and numpy-style volume indexing:
+    //   offset = [z, y, x], shape = [z, y, x].
+    void readZYX(Array3D<uint8_t>& out,
+                 const std::array<int, 3>& offsetZYX,
+                 int level = 0);
+    void readZYX(Array3D<uint16_t>& out,
+                 const std::array<int, 3>& offsetZYX,
+                 int level = 0);
+    static void readZYX(Array3D<uint8_t>& out,
+                        const std::array<int, 3>& offsetZYX,
+                        vc::render::IChunkedArray& array,
+                        int level = 0);
+    static void readZYX(Array3D<uint16_t>& out,
+                        const std::array<int, 3>& offsetZYX,
+                        vc::render::IChunkedArray& array,
+                        int level = 0);
+
+    // UI/coordinate-order convenience:
+    //   offset = [x, y, z], shape = [x, y, z].
+    // Returned Array3D is still stored/indexed as [z, y, x].
+    void readXYZ(Array3D<uint8_t>& out,
+                 const std::array<int, 3>& offsetXYZ,
+                 int level = 0);
+    void readXYZ(Array3D<uint16_t>& out,
+                 const std::array<int, 3>& offsetXYZ,
+                 int level = 0);
+
     [[nodiscard]] static bool checkDir(const std::filesystem::path& path);
 
 protected:
@@ -98,7 +123,7 @@ protected:
     int _height{0};
     int _slices{0};
 
-    std::vector<std::unique_ptr<vc::VcDataset>> zarrDs_;
+    std::vector<std::array<int, 3>> zarrLevelShapes_;
     void zarrOpen();
 
     // Cache ownership

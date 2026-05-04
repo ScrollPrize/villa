@@ -4,7 +4,6 @@
 #include <utils/zarr.hpp>
 
 #include "vc/core/util/Geometry.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -13,6 +12,7 @@
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "utils/Json.hpp"
 
 #include "vc/core/util/NormalGridVolume.hpp"
@@ -762,7 +762,11 @@ static SDTChunk* get_or_compute_sdt_chunk(SDTContext& ctx, const cv::Vec3f& worl
         Array3D<uint8_t> read_buf({static_cast<size_t>(read_size_zyx[0]),
                                   static_cast<size_t>(read_size_zyx[1]),
                                   static_cast<size_t>(read_size_zyx[2])});
-        readArea3D(read_buf, clamped_origin_zyx, ctx.cache, ctx.level);
+        Volume::readZYX(
+            read_buf,
+            {clamped_origin_zyx[0], clamped_origin_zyx[1], clamped_origin_zyx[2]},
+            *ctx.cache,
+            ctx.level);
 
         const cv::Vec3i offset = clamped_origin - origin;
         for (int z = 0; z < read_size[2]; ++z) {
@@ -2932,25 +2936,11 @@ struct thresholdedDistance
 
 };
 
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
 {
-    if (!ds) {
-        throw std::runtime_error("tracer requires a volume shape or dataset");
-    }
-    const auto& shape = ds->shape();
-    if (shape.size() < 3) {
-        throw std::runtime_error("tracer dataset shape is not 3D");
-    }
-    const std::array<int, 3> volume_shape_zyx{
-        static_cast<int>(shape[0]),
-        static_cast<int>(shape[1]),
-        static_cast<int>(shape[2])};
-    return tracer(volume_shape_zyx, scale, cache, level, origin, params, cache_root, voxelsize,
-                  direction_fields, resume_surf, tgt_path, meta_params, corrections, allowed_growth_mask);
-}
+    const std::array<int, 3> volume_shape_zyx = volume.shape();
+    auto* cache = volume.chunkedCache();
 
-QuadSurface *tracer(const std::array<int, 3>& volume_shape_zyx, float scale, vc::render::IChunkedArray *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
-{
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     if (params.contains("neural_socket")) {

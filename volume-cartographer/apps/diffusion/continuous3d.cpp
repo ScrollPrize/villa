@@ -2,12 +2,9 @@
 #include <iostream>
 
 #include "common.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
-
 #include <vc/ui/VCCollection.hpp>
 #include <vc/core/util/GridStore.hpp>
-#include "vc/core/types/VcDataset.hpp"
-#include "vc/core/util/Slicing.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <boost/program_options.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -122,13 +119,14 @@ int continuous3d_main(const po::variables_map& vm) {
 
     std::cout << "Found point " << *target_point << " for winding " << target_winding << std::endl;
 
-    auto ds = std::make_unique<vc::VcDataset>(volume_path / dataset_name);
-    if (!ds) {
-        std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;
-        return 1;
-    }
-
-    auto shape = ds->shape();
+    const int level = std::stoi(dataset_name);
+    Volume volume(volume_path);
+    auto shapeArray = volume.chunkedCache()->shape(level);
+    std::vector<size_t> shape = {
+        static_cast<size_t>(shapeArray[0]),
+        static_cast<size_t>(shapeArray[1]),
+        static_cast<size_t>(shapeArray[2]),
+    };
     std::cout << "Volume shape: (" << shape[0] << ", " << shape[1] << ", " << shape[2] << ")" << std::endl;
 
     StupidTensor<uint8_t> volume_slice(cv::Size(box_w, box_h), box_d);
@@ -140,11 +138,8 @@ int continuous3d_main(const po::variables_map& vm) {
     };
 
     Array3D<uint8_t> slice_data({(size_t)box_d, (size_t)box_h, (size_t)box_w});
-
-    auto cache = vc::render::createChunkCache(
-        vc::render::openLocalZarrPyramid(ds->path()),
-        4llu*1024*1024*1024);
-    readArea3D(slice_data, offset, cache.get(), 0);
+    volume.setCacheBudget(4llu * 1024 * 1024 * 1024);
+    volume.readZYX(slice_data, {offset[0], offset[1], offset[2]}, level);
 
     for (int z = 0; z < box_d; ++z) {
         for (int y = 0; y < box_h; ++y) {

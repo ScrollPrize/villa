@@ -1,11 +1,11 @@
 #pragma once
 
-#include "vc/core/util/Slicing.hpp"
 #include <iostream>
 #include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/Array3D.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -316,7 +316,11 @@ public:
             large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
             large.fill(C::FILL_V);
 
-            readArea3D(large, offset, _cache, _level);
+            Volume::readZYX(
+                large,
+                {offset[0], offset[1], offset[2]},
+                *_cache,
+                _level);
         }
 
         _compute_f.template compute<CHUNKT,T>(large, small, offset);
@@ -362,7 +366,11 @@ public:
             large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
             large.fill(C::FILL_V);
             
-            readArea3D(large, offset, _cache, _level);
+            Volume::readZYX(
+                large,
+                {offset[0], offset[1], offset[2]},
+                *_cache,
+                _level);
         }
 
         _compute_f.template compute<CHUNKT,T>(large, small, offset);
@@ -387,38 +395,6 @@ public:
         return chunk;
     }
 
-    // T *cache_chunk_safe_alloc(const cv::Vec3i &id)
-    // {
-    //     auto s = C::CHUNK_SIZE;
-    //     CHUNKT large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
-    //     large.fill(C::FILL_V);
-    //     CHUNKT small = Array3D<T>({(size_t)s,(size_t)s,(size_t)s});
-    //
-    //     cv::Vec3i offset =
-    //     {id[0]*s-_border,
-    //         id[1]*s-_border,
-    //         id[2]*s-_border};
-    //
-    //     readArea3D(large, offset, _cache, _level);
-    //
-    //     _compute_f.template compute<CHUNKT,T>(large, small);
-    //
-    //     _mutex.lock();
-    //     if (!_chunks.count(id))
-    //         _chunks[id] = small;
-    //     else {
-    //         #pragma omp atomic
-    //         chunk_compute_collisions++;
-    //         delete small;
-    //         small = _chunks[id];
-    //     }
-    //     #pragma omp atomic
-    //     chunk_compute_total++;
-    //     _mutex.unlock();
-    //
-    //     return small;
-    // }
-
     T *cache_chunk_safe(const cv::Vec3i &id)
     {
         if (_cache_dir.empty())
@@ -429,22 +405,6 @@ public:
 
     T *cache_chunk(const cv::Vec3i &id) {
         return cache_chunk_safe(id);
-        // auto s = C::CHUNK_SIZE;
-        // CHUNKT large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
-        // large.fill(C::FILL_V);
-        // CHUNKT *small = new CHUNKT();
-        // *small = Array3D<T>({(size_t)s,(size_t)s,(size_t)s});
-        //
-        // cv::Vec3i offset =
-        // {id[0]*s-_border,
-        //     id[1]*s-_border,
-        //     id[2]*s-_border};
-        //
-        //     readArea3D(large, offset, _cache, _level);
-        //
-        //     _compute_f.template compute<CHUNKT,T>(large, *small);
-        //
-        //     _chunks[id] = small;
         //
         // return small;
     }
