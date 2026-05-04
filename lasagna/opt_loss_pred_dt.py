@@ -783,7 +783,6 @@ def _write_anticipatory_fit_debug_mosaic(
 	out_dir.mkdir(parents=True, exist_ok=True)
 	for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
 		path = out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_fit_points.jpg"
-		print(f"[pred_dt_flow_gate] writing anticipatory fit debug jpg: {path}", flush=True)
 		cv2.imwrite(str(path), mosaic)
 
 
@@ -863,7 +862,6 @@ def _write_flow_gate_debug(
 		)
 	for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
 		layers_path = out_dir / f"pred_dt_flow_gate_{suffix}_layers.tif"
-		print(f"[pred_dt_flow_gate] writing debug layers: {layers_path}", flush=True)
 		with tifffile.TiffWriter(str(layers_path)) as tw:
 			write_named_layer(tw, pred_raw_u8, name="pred_dt")
 			write_named_layer(tw, flow, name="raw_flow_bilinear")
@@ -925,7 +923,6 @@ def _write_flow_gate_weight_jpg(
 		jpg_dir.mkdir(parents=True, exist_ok=True)
 		for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
 			path = jpg_dir / f"{suffix}_pred_dt_and_used_weight.jpg"
-			print(f"[pred_dt_flow_gate] writing weight jpg: {path}", flush=True)
 			try:
 				import cv2
 				cv2.imwrite(str(path), img)
