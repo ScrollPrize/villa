@@ -558,12 +558,6 @@ def _write_anticipatory_fit_debug_mosaic(
 	except Exception as exc:
 		print(f"[pred_dt_flow_gate] anticipatory fit debug skipped: cv2 import failed: {exc}", flush=True)
 		return
-	try:
-		import tifffile
-	except Exception as exc:
-		print(f"[pred_dt_flow_gate] anticipatory fit debug skipped: tifffile import failed: {exc}", flush=True)
-		return
-
 	xyz0 = res.xyz_lr[0].detach()
 	Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
 	if Hm <= 1 or Wm <= 1:
@@ -626,10 +620,22 @@ def _write_anticipatory_fit_debug_mosaic(
 	tiles: list[np.ndarray] = []
 	xs_unit = torch.linspace(-0.25, 1.25, slice_w, device=xyz0.device, dtype=xyz0.dtype)
 	ys_unit = torch.linspace(-1.0, 1.0, slice_h, device=xyz0.device, dtype=xyz0.dtype)
+	def draw_text_bg(img: np.ndarray, text: str, org: tuple[int, int], font_scale: float, color: tuple[int, int, int]) -> None:
+		font = cv2.FONT_HERSHEY_SIMPLEX
+		thickness = 1
+		(size_w, size_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+		x, y = org
+		x0 = max(0, x - 2)
+		y0 = max(0, y - size_h - 3)
+		x1 = min(img.shape[1] - 1, x + size_w + 2)
+		y1 = min(img.shape[0] - 1, y + baseline + 3)
+		cv2.rectangle(img, (x0, y0), (x1, y1), (0, 0, 0), -1)
+		cv2.putText(img, text, org, font, font_scale, color, thickness, cv2.LINE_AA)
+
 	for cand_i, label in debug_candidates:
 		if cand_i is None:
 			tile = np.zeros((slice_h * up, slice_w * up, 3), dtype=np.uint8)
-			cv2.putText(tile, f"{label} no cand", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+			draw_text_bg(tile, f"{label} no cand", (6, 18), 0.45, (255, 255, 255))
 			tiles.append(tile)
 			continue
 		rh = int(candidates["root_h"][cand_i].detach().cpu())
@@ -664,6 +670,11 @@ def _write_anticipatory_fit_debug_mosaic(
 		y_line = int(round((1.0 - ((best_offset / search_radius) + 1.0) * 0.5) * (slice_h - 1) * up))
 		x_root = int(round((0.0 + 0.25) / 1.5 * (slice_w - 1) * up))
 		x_tip = int(round((1.0 + 0.25) / 1.5 * (slice_w - 1) * up))
+		cv2.line(rgb, (x_root, y0), (x_tip, y0), (140, 140, 140), 1, cv2.LINE_AA)
+		cv2.circle(rgb, (x_root, y0), 3, (255, 128, 0), -1, cv2.LINE_AA)
+		cv2.circle(rgb, (x_tip, y0), 3, (255, 0, 128), -1, cv2.LINE_AA)
+		draw_text_bg(rgb, "R0", (max(0, x_root - 8), max(10, y0 - 6)), 0.28, (255, 128, 0))
+		draw_text_bg(rgb, "T0", (min(rgb.shape[1] - 20, x_tip + 3), max(10, y0 - 6)), 0.28, (255, 0, 128))
 		cv2.line(rgb, (x_root, y_line), (x_tip, y_line), (0, 255, 255), 1, cv2.LINE_AA)
 		inliers = candidates["inliers"][cand_i].detach().cpu().numpy()
 		for si, score in enumerate(inliers):
@@ -671,10 +682,10 @@ def _write_anticipatory_fit_debug_mosaic(
 			xp = int(round(((a + 0.25) / 1.5) * (slice_w - 1) * up))
 			cv2.circle(rgb, (xp, y_line), 2, (0, 0, 255), -1, cv2.LINE_AA)
 			if si < 8:
-				cv2.putText(rgb, f"{score:.2f}", (max(0, xp - 14), min(rgb.shape[0] - 4, y_line + 16 + (si % 2) * 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1, cv2.LINE_AA)
+				draw_text_bg(rgb, f"{score:.2f}", (max(0, xp - 14), min(rgb.shape[0] - 4, y_line + 16 + (si % 2) * 12)), 0.28, (255, 255, 255))
 		prefix = float(candidates["prefix"][cand_i].detach().cpu())
-		cv2.putText(rgb, f"{label} tip=({th},{tw}) root=({rh},{rw})", (6, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-		cv2.putText(rgb, f"line={prefix:.3f} off={best_offset:.2f}", (6, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+		draw_text_bg(rgb, f"{label} tip=({th},{tw}) root=({rh},{rw})", (6, 12), 0.35, (255, 255, 255))
+		draw_text_bg(rgb, f"line={prefix:.3f} off={best_offset:.2f}", (6, 26), 0.35, (0, 255, 255))
 		cv2.line(rgb, (0, y0), (rgb.shape[1] - 1, y0), (96, 96, 96), 1, cv2.LINE_AA)
 		tiles.append(rgb)
 	if not tiles:
@@ -690,7 +701,9 @@ def _write_anticipatory_fit_debug_mosaic(
 		mosaic[r * tile_h:(r + 1) * tile_h, c * tile_w:(c + 1) * tile_w] = tile
 	out_dir.mkdir(parents=True, exist_ok=True)
 	for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
-		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_fit_points.tif"), mosaic)
+		path = out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_fit_points.jpg"
+		print(f"[pred_dt_flow_gate] writing anticipatory fit debug jpg: {path}", flush=True)
+		cv2.imwrite(str(path), mosaic)
 
 
 def configure_flow_gate(
@@ -768,7 +781,9 @@ def _write_flow_gate_debug(
 			extratags=[(285, "s", 0, name, False)],  # TIFFTAG_PAGENAME
 		)
 	for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
-		with tifffile.TiffWriter(str(out_dir / f"pred_dt_flow_gate_{suffix}_layers.tif")) as tw:
+		layers_path = out_dir / f"pred_dt_flow_gate_{suffix}_layers.tif"
+		print(f"[pred_dt_flow_gate] writing debug layers: {layers_path}", flush=True)
+		with tifffile.TiffWriter(str(layers_path)) as tw:
 			write_named_layer(tw, pred_raw_u8, name="pred_dt")
 			write_named_layer(tw, flow, name="raw_flow_bilinear")
 			if grid_flow is not None:
@@ -829,6 +844,7 @@ def _write_flow_gate_weight_jpg(
 		jpg_dir.mkdir(parents=True, exist_ok=True)
 		for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
 			path = jpg_dir / f"{suffix}_pred_dt_and_used_weight.jpg"
+			print(f"[pred_dt_flow_gate] writing weight jpg: {path}", flush=True)
 			try:
 				import cv2
 				cv2.imwrite(str(path), img)

@@ -707,6 +707,16 @@ def main() -> None:
     if args.no_gpu_pause:
         _gpu_pause_enabled = False
 
+    datasets = _list_datasets()
+    if not datasets:
+        data_dir_msg = _data_dir if _data_dir else "<not set>"
+        print(
+            f"[fit-service] error: no .lasagna.json datasets found in --data-dir {data_dir_msg}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(2)
+
     server = HTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]
 
