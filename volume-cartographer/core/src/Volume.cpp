@@ -1639,7 +1639,7 @@ static void writeVolumeZYX(Volume& volume,
                       srcReadOffset,
                       srcVolumeShape,
                       scaleZYX,
-                      volume.pyramidReduction_);
+                      volume.pyramidReduction());
         writeZarrRegionZYX(dstArray, downsampled, dstOffset);
 
         affectedOffset = dstOffset;
