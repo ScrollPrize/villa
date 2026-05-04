@@ -12,6 +12,8 @@ void AddLogFile(const std::filesystem::path& path);
 void SetLogLevel(const std::string& s);
 void SetDebugLoggingEnabled(bool enabled);
 bool DebugLoggingEnabled();
+void SetProfileLoggingEnabled(bool enabled);
+bool ProfileLoggingEnabled();
 auto Logger() -> std::shared_ptr<MinimalLogger>;
 
 enum class LogLevel {

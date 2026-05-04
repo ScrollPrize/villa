@@ -12,6 +12,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/Surface.hpp"
 
 #include <QApplication>
@@ -37,6 +38,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <source_location>
 #include <sstream>
 #include <unordered_map>
 
@@ -200,6 +202,76 @@ bool validSurfacePoint(const cv::Vec3f& p)
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
            p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
 }
+
+std::string profileCaller(const std::source_location& caller)
+{
+    return std::format("{}:{} {}", caller.file_name(), caller.line(), caller.function_name());
+}
+
+std::string profileVec3(const cv::Vec3f& v)
+{
+    return std::format("[{:.3f},{:.3f},{:.3f}]", v[0], v[1], v[2]);
+}
+
+std::string profileRect(const cv::Rect& r)
+{
+    return std::format("[x={},y={},w={},h={}]", r.x, r.y, r.width, r.height);
+}
+
+std::string profileRectF(const QRectF& r)
+{
+    return std::format("[x={:.2f},y={:.2f},w={:.2f},h={:.2f}]",
+                       r.x(), r.y(), r.width(), r.height());
+}
+
+class ProfileScope {
+public:
+    ProfileScope(std::string event,
+                 const char* reason,
+                 const std::source_location& caller,
+                 std::string details = {})
+        : event_(std::move(event))
+        , reason_(reason ? reason : "")
+        , caller_(profileCaller(caller))
+        , enabled_(ProfileLoggingEnabled())
+    {
+        if (!enabled_)
+            return;
+        timer_.start();
+        Logger()->info("[vc3d-profile] {} begin reason='{}' caller='{}'{}{}",
+                       event_, reason_, caller_, details.empty() ? "" : " ",
+                       details);
+    }
+
+    ~ProfileScope()
+    {
+        finish();
+    }
+
+    void setDetails(std::string details)
+    {
+        details_ = std::move(details);
+    }
+
+    void finish()
+    {
+        if (!enabled_ || finished_)
+            return;
+        finished_ = true;
+        Logger()->info("[vc3d-profile] {} end elapsed_ms={} reason='{}' caller='{}'{}{}",
+                       event_, timer_.elapsed(), reason_, caller_,
+                       details_.empty() ? "" : " ", details_);
+    }
+
+private:
+    std::string event_;
+    std::string reason_;
+    std::string caller_;
+    bool enabled_ = false;
+    bool finished_ = false;
+    QElapsedTimer timer_;
+    std::string details_;
+};
 
 void applyPerPixelNormalOffset(cv::Mat_<cv::Vec3f>& coords,
                                const cv::Mat_<cv::Vec3f>& normals,
@@ -550,7 +622,10 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
             return;
         }
         _renderPending = false;
-        submitRender();
+        const std::string reason = std::format(
+            "render timer fired; scheduledReason='{}'; scheduledCaller='{}'",
+            _pendingRenderReason, _pendingRenderCaller);
+        submitRender(reason.c_str());
         updateStatusLabel();
     });
 
@@ -560,7 +635,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_settleRenderTimer, &QTimer::timeout, this, [this]() {
         if (!_isPanning) {
             _interactivePreview = false;
-            scheduleRender();
+            scheduleRender("interaction settled");
         }
     });
 
@@ -568,7 +643,10 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _intersectionRenderTimer->setSingleShot(true);
     _intersectionRenderTimer->setInterval(50);
     connect(_intersectionRenderTimer, &QTimer::timeout, this, [this]() {
-        renderIntersections();
+        const std::string reason = std::format(
+            "intersection timer fired; scheduledReason='{}'; scheduledCaller='{}'",
+            _pendingIntersectionReason, _pendingIntersectionCaller);
+        renderIntersections(reason.c_str());
         emit overlaysUpdated();
     });
 
@@ -576,7 +654,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _resizeRenderTimer->setSingleShot(true);
     _resizeRenderTimer->setInterval(kResizeSettleMs);
     connect(_resizeRenderTimer, &QTimer::timeout, this, [this]() {
-        scheduleRender();
+        scheduleRender("resize settled");
         emit overlaysUpdated();
     });
 
@@ -672,7 +750,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
                     guard->_settleRenderTimer->start(kChunkReadyActiveDelayMs);
                 return;
             }
-            guard->scheduleRender();
+            guard->scheduleRender("chunk ready");
         }, Qt::QueuedConnection);
     });
 }
@@ -714,8 +792,8 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
     updateContentBounds();
     resizeFramebuffer();
-    scheduleRender();
-    renderIntersections();
+    scheduleRender("volume changed");
+    renderIntersections("volume changed");
     updateStatusLabel();
 }
 
@@ -777,8 +855,14 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                 invalidateIntersect(name);
             } else {
                 _lastIntersectFp = {};
+                if (_deferSegmentationIntersections && name == "segmentation" &&
+                    dynamic_cast<PlaneSurface*>(currentSurface())) {
+                    _intersectionGeometryCache = {};
+                    _deferredSegmentationIntersectionsDirty = true;
+                    return;
+                }
             }
-            scheduleIntersectionRender();
+            scheduleIntersectionRender("intersection target surface changed");
         }
         return;
     }
@@ -790,8 +874,12 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         _stableFramebufferValid = false;
         updateContentBounds();
         updateFocusMarker();
-        scheduleRender();
-        scheduleIntersectionRender();
+        if (_suppressNextSurfaceEditRender) {
+            _suppressNextSurfaceEditRender = false;
+        } else {
+            scheduleRender("current surface edit update");
+        }
+        scheduleIntersectionRender("current surface edit update");
         return;
     }
 
@@ -820,8 +908,8 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         recalcPyramidLevel();
     }
     updateFocusMarker();
-    scheduleRender();
-    scheduleIntersectionRender();
+    scheduleRender("current surface changed");
+    scheduleIntersectionRender("current surface changed");
 }
 
 void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std::shared_ptr<Surface>& surf)
@@ -860,8 +948,8 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     updateFocusMarker(poi);
     updateStatusLabel();
     emit overlaysUpdated();
-    scheduleRender();
-    renderIntersections();
+    scheduleRender("focus POI changed");
+    renderIntersections("focus POI changed");
 }
 
 void CChunkedVolumeViewer::ensureDefaultSurface()
@@ -938,23 +1026,66 @@ void CChunkedVolumeViewer::resizeFramebuffer()
     _scene->setSceneRect(0, 0, w, h);
 }
 
-void CChunkedVolumeViewer::scheduleRender()
+void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_location caller)
 {
+    _pendingRenderReason = reason ? reason : "";
+    _pendingRenderCaller = profileCaller(caller);
+    ProfileScope profile("scheduleRender", reason, caller,
+                         std::format("surf='{}' force=false pending={} interactive={} scale={:.4f} zOff={:.3f}",
+                                     _surfName, _renderPending, _interactivePreview, _scale, _zOff));
     syncCameraTransform();
     _renderPending = true;
     if (_interactivePreview) {
         if (_settleRenderTimer)
             _settleRenderTimer->start();
+        profile.setDetails("action=settle_timer");
         return;
     }
-    if (_renderTimer && !_renderTimer->isActive())
+    if (_renderTimer && !_renderTimer->isActive()) {
         _renderTimer->start();
+        profile.setDetails("action=render_timer_start");
+    } else {
+        profile.setDetails("action=already_scheduled");
+    }
 }
 
-void CChunkedVolumeViewer::scheduleIntersectionRender()
+void CChunkedVolumeViewer::requestRender(const char* reason, std::source_location caller)
 {
+    if (reason && std::string_view(reason) == "push/pull active viewer refresh") {
+        _suppressNextSurfaceEditRender = true;
+    }
+    scheduleRender(reason, caller);
+}
+
+void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::source_location caller)
+{
+    _pendingIntersectionReason = reason ? reason : "";
+    _pendingIntersectionCaller = profileCaller(caller);
+    ProfileScope profile("scheduleIntersectionRender", reason, caller,
+                         std::format("surf='{}' targets={}", _surfName, _intersectTgts.size()));
+    if (_deferSegmentationIntersections && dynamic_cast<PlaneSurface*>(currentSurface())) {
+        _deferredSegmentationIntersectionsDirty = true;
+        profile.setDetails("action=deferred_segmentation_edit");
+        return;
+    }
     if (_intersectionRenderTimer && !_intersectionRenderTimer->isActive()) {
         _intersectionRenderTimer->start();
+        profile.setDetails("action=intersection_timer_start");
+    } else {
+        profile.setDetails("action=already_scheduled");
+    }
+}
+
+void CChunkedVolumeViewer::setSegmentationIntersectionDeferral(bool active)
+{
+    if (_deferSegmentationIntersections == active) {
+        return;
+    }
+
+    _deferSegmentationIntersections = active;
+    if (!active && _deferredSegmentationIntersectionsDirty) {
+        _deferredSegmentationIntersectionsDirty = false;
+        scheduleIntersectionRender("deferred segmentation intersection refresh");
     }
 }
 
@@ -968,15 +1099,27 @@ void CChunkedVolumeViewer::syncCameraTransform()
 
 bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
 {
-    if (!_chunkArray || !_volume || _framebuffer.isNull())
+    ProfileScope profile("renderInteractiveAxisAlignedSlicePreview",
+                         "interactive preview requested",
+                         std::source_location::current(),
+                         std::format("surf='{}' framebuffer={}x{} scale={:.4f} zOff={:.3f}",
+                                     _surfName, _framebuffer.width(), _framebuffer.height(),
+                                     _scale, _zOff));
+    if (!_chunkArray || !_volume || _framebuffer.isNull()) {
+        profile.setDetails("action=skip missing_input");
         return false;
-    if (_overlayVolume || _compositeSettings.enabled || _compositeSettings.planeEnabled)
+    }
+    if (_overlayVolume || _compositeSettings.enabled || _compositeSettings.planeEnabled) {
+        profile.setDetails("action=skip overlay_or_composite");
         return false;
+    }
 
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    if (!plane)
+    if (!plane) {
+        profile.setDetails("action=skip non_plane");
         return false;
+    }
 
     const cv::Vec3f vx = plane->basisX();
     const cv::Vec3f vy = plane->basisY();
@@ -985,24 +1128,32 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
     const int vAxis = dominantAxis(vy);
     const int fixedAxis = dominantAxis(n);
     if (uAxis < 0 || vAxis < 0 || fixedAxis < 0 ||
-        uAxis == vAxis || uAxis == fixedAxis || vAxis == fixedAxis)
+        uAxis == vAxis || uAxis == fixedAxis || vAxis == fixedAxis) {
+        profile.setDetails("action=skip non_axis_aligned");
         return false;
+    }
 
     const int fbW = _framebuffer.width();
     const int fbH = _framebuffer.height();
-    if (fbW <= 0 || fbH <= 0)
+    if (fbW <= 0 || fbH <= 0) {
+        profile.setDetails("action=skip invalid_framebuffer");
         return false;
+    }
 
     const int level = renderStartLevel();
-    if (level < 0 || level >= _chunkArray->numLevels())
+    if (level < 0 || level >= _chunkArray->numLevels()) {
+        profile.setDetails(std::format("action=skip invalid_level level={}", level));
         return false;
+    }
 
     const auto shapeZyx = _chunkArray->shape(level);
     const auto chunkZyx = _chunkArray->chunkShape(level);
     std::array<int, 3> shapeXyz{shapeZyx[2], shapeZyx[1], shapeZyx[0]};
     std::array<int, 3> chunkXyz{chunkZyx[2], chunkZyx[1], chunkZyx[0]};
-    if (chunkXyz[0] <= 0 || chunkXyz[1] <= 0 || chunkXyz[2] <= 0)
+    if (chunkXyz[0] <= 0 || chunkXyz[1] <= 0 || chunkXyz[2] <= 0) {
+        profile.setDetails("action=skip invalid_chunk_shape");
         return false;
+    }
 
     const float halfW = static_cast<float>(fbW) * 0.5f / _scale;
     const float halfH = static_cast<float>(fbH) * 0.5f / _scale;
@@ -1029,11 +1180,16 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
     const cv::Vec3f origin = toLevel(origin0);
     const cv::Vec3f uStep = stepToLevel(vxStep0);
     const cv::Vec3f vStep = stepToLevel(vyStep0);
-    if (std::abs(uStep[fixedAxis]) > 1e-5f || std::abs(vStep[fixedAxis]) > 1e-5f)
+    if (std::abs(uStep[fixedAxis]) > 1e-5f || std::abs(vStep[fixedAxis]) > 1e-5f) {
+        profile.setDetails("action=skip non_axis_steps");
         return false;
+    }
 
-    if (origin[fixedAxis] < 0.0f || origin[fixedAxis] >= float(shapeXyz[fixedAxis]))
+    if (origin[fixedAxis] < 0.0f || origin[fixedAxis] >= float(shapeXyz[fixedAxis])) {
+        profile.setDetails(std::format("action=skip out_of_bounds fixedAxis={} origin={}",
+                                       fixedAxis, profileVec3(origin)));
         return false;
+    }
 
     const int fixed = std::clamp(int(std::lround(origin[fixedAxis])), 0, shapeXyz[fixedAxis] - 1);
     const float u0 = origin[uAxis];
@@ -1049,14 +1205,17 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
         _framebuffer.fill(QColor(64, 64, 64));
         syncCameraTransform();
         _view->viewport()->update();
+        profile.setDetails("action=empty_visible_region");
         return true;
     }
 
     const int srcW = uEnd - uBegin;
     const int srcH = vEnd - vBegin;
     constexpr int kMaxPreviewSourcePixels = 4096 * 4096;
-    if (srcW <= 0 || srcH <= 0 || srcW * srcH > kMaxPreviewSourcePixels)
+    if (srcW <= 0 || srcH <= 0 || srcW * srcH > kMaxPreviewSourcePixels) {
+        profile.setDetails(std::format("action=skip source_too_large source={}x{}", srcW, srcH));
         return false;
+    }
 
     const uint8_t fillByte = static_cast<uint8_t>(
         std::clamp(std::lround(_chunkArray->fillValue()), 0L, 255L));
@@ -1130,8 +1289,10 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
         }
     }
 
-    if (coveredChunks == 0)
+    if (coveredChunks == 0) {
+        profile.setDetails("action=skip no_chunks_ready");
         return false;
+    }
 
     cv::Mat_<uint8_t> displayValues;
     cv::Mat_<uint8_t> displayCoverage;
@@ -1163,9 +1324,11 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
     if (_interactivePreview)
         updateIntersectionPreviewTransform();
     else
-        renderIntersections();
+        renderIntersections("interactive axis-aligned preview rendered");
     emit overlaysUpdated();
     _view->viewport()->update();
+    profile.setDetails(std::format("action=rendered level={} source={}x{} coveredChunks={} fixedAxis={} fixed={}",
+                                   level, srcW, srcH, coveredChunks, fixedAxis, fixed));
     return true;
 }
 
@@ -1184,7 +1347,7 @@ void CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurf
         if (_interactivePreview)
             updateIntersectionPreviewTransform();
         else
-            renderIntersections();
+            renderIntersections("interactive preview fallback no stable frame");
         _view->viewport()->update();
         return;
     }
@@ -1211,7 +1374,7 @@ void CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurf
     if (_interactivePreview)
         updateIntersectionPreviewTransform();
     else
-        renderIntersections();
+        renderIntersections("interactive preview transformed stable frame");
     emit overlaysUpdated();
     _view->viewport()->update();
 }
@@ -1780,6 +1943,8 @@ struct CChunkedVolumeViewer::RenderContext {
     bool interactivePreview = false;
     std::shared_ptr<GeneratedSurfaceCache> genCache;
     bool genCacheDirty = false;
+    std::string profileReason;
+    std::string profileCaller;
 };
 
 struct CChunkedVolumeViewer::RenderResult {
@@ -1788,10 +1953,21 @@ struct CChunkedVolumeViewer::RenderResult {
     float surfacePtrX = 0.0f;
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
+    qint64 renderFrameElapsedMs = 0;
 };
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
+    QElapsedTimer renderTimer;
+    if (ProfileLoggingEnabled()) {
+        renderTimer.start();
+        Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} interactive={} overlay={} composite={} planeComposite={}",
+                       ctx.profileReason, ctx.profileCaller, ctx.serial,
+                       ctx.surf ? ctx.surf->id : std::string(""),
+                       ctx.fbW, ctx.fbH, ctx.startLevel, ctx.interactivePreview,
+                       bool(ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f),
+                       ctx.compositeSettings.enabled, ctx.compositeSettings.planeEnabled);
+    }
     RenderResult result;
     result.serial = ctx.serial;
     result.surfacePtrX = ctx.surfacePtrX;
@@ -1800,8 +1976,19 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
     result.framebuffer.fill(QColor(64, 64, 64));
 
-    if (!ctx.surf || !ctx.chunkArray || ctx.fbW <= 0 || ctx.fbH <= 0)
+    auto finishRenderFrameProfile = [&]() {
+        if (!ProfileLoggingEnabled() || !renderTimer.isValid())
+            return;
+        result.renderFrameElapsedMs = renderTimer.elapsed();
+        Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
+                       result.renderFrameElapsedMs, ctx.profileReason, ctx.profileCaller,
+                       result.serial, result.framebuffer.width(), result.framebuffer.height());
+    };
+
+    if (!ctx.surf || !ctx.chunkArray || ctx.fbW <= 0 || ctx.fbH <= 0) {
+        finishRenderFrameProfile();
         return result;
+    }
 
     cv::Mat_<uint8_t> values(ctx.fbH, ctx.fbW, uint8_t(0));
     cv::Mat_<uint8_t> coverage(ctx.fbH, ctx.fbW, uint8_t(0));
@@ -2096,23 +2283,33 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             row[x] = pixel;
         }
     }
+    finishRenderFrameProfile();
     return result;
 }
 
-void CChunkedVolumeViewer::submitRender()
+void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location caller)
 {
+    ProfileScope profile("submitRender", reason, caller,
+                         std::format("surf='{}' volume={} chunkArray={} busy={}",
+                                     _surfName, bool(_volume), bool(_chunkArray),
+                                     _renderWorkerBusy.load(std::memory_order_acquire)));
     auto surf = _surfWeak.lock();
-    if (!surf || !_volume || !_chunkArray)
+    if (!surf || !_volume || !_chunkArray) {
+        profile.setDetails("action=skip missing_input");
         return;
+    }
 
     resizeFramebuffer();
     const int fbW = _framebuffer.width();
     const int fbH = _framebuffer.height();
-    if (fbW <= 0 || fbH <= 0)
+    if (fbW <= 0 || fbH <= 0) {
+        profile.setDetails(std::format("action=skip invalid_framebuffer size={}x{}", fbW, fbH));
         return;
+    }
 
     if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
         _renderPendingAfterWorker = true;
+        profile.setDetails("action=queued_after_worker");
         return;
     }
 
@@ -2144,7 +2341,12 @@ void CChunkedVolumeViewer::submitRender()
     ctx.interactivePreview = _interactivePreview;
     ctx.genCache = _genSurfaceCache;
     ctx.genCacheDirty = _genCacheDirty;
+    ctx.profileReason = reason ? reason : "";
+    ctx.profileCaller = profileCaller(caller);
     _genCacheDirty = false;
+    profile.setDetails(std::format("action=worker_start serial={} size={}x{} level={} interactive={}",
+                                   ctx.serial, ctx.fbW, ctx.fbH, ctx.startLevel,
+                                   ctx.interactivePreview));
 
     QPointer<CChunkedVolumeViewer> guard(this);
     (void)QtConcurrent::run([guard, ctx = std::move(ctx)]() mutable {
@@ -2158,12 +2360,18 @@ void CChunkedVolumeViewer::submitRender()
 
 void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult> result)
 {
+    ProfileScope profile("finishRenderOnMainThread", "render worker finished",
+                         std::source_location::current(),
+                         std::format("result={} serial={} currentSerial={} pendingAfterWorker={}",
+                                     bool(result), result ? result->serial : 0,
+                                     _renderSerial, _renderPendingAfterWorker));
     _renderWorkerBusy.store(false, std::memory_order_release);
     if (!result || result->serial != _renderSerial) {
         if (_renderPendingAfterWorker) {
             _renderPendingAfterWorker = false;
-            scheduleRender();
+            scheduleRender("stale render result had pending worker");
         }
+        profile.setDetails("action=drop_stale_result");
         return;
     }
 
@@ -2172,7 +2380,7 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (_interactivePreview)
         updateIntersectionPreviewTransform();
     else
-        scheduleIntersectionRender();
+        scheduleIntersectionRender("stable render finished");
     if (!_interactivePreview) {
         if (auto surf = _surfWeak.lock()) {
             const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
@@ -2206,8 +2414,11 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
 
     if (_renderPendingAfterWorker) {
         _renderPendingAfterWorker = false;
-        scheduleRender();
+            scheduleRender("worker finished with pending render");
     }
+    profile.setDetails(std::format("action=display serial={} worker_elapsed_ms={} framebuffer={}x{}",
+                                   result->serial, result->renderFrameElapsedMs,
+                                   _framebuffer.width(), _framebuffer.height()));
 }
 
 void CChunkedVolumeViewer::renderOverlayVolumeForPlane(
@@ -2219,9 +2430,17 @@ void CChunkedVolumeViewer::renderOverlayVolumeForPlane(
     cv::Mat_<uint8_t>& overlayValues,
     cv::Mat_<uint8_t>& overlayCoverage)
 {
+    ProfileScope profile("renderOverlayVolumeForPlane",
+                         "overlay plane render",
+                         std::source_location::current(),
+                         std::format("surf='{}' startLevel={} origin={} vxStep={} vyStep={}",
+                                     _surfName, startLevel, profileVec3(origin),
+                                     profileVec3(vxStep), profileVec3(vyStep)));
     if (!_overlayVolume || !_overlayChunkArray || _overlayOpacity <= 0.0f ||
-        _coverage.empty() || _overlayChunkArray->numLevels() <= 0)
+        _coverage.empty() || _overlayChunkArray->numLevels() <= 0) {
+        profile.setDetails("action=skip missing_overlay");
         return;
+    }
 
     overlayValues.create(_coverage.rows, _coverage.cols);
     overlayCoverage.create(_coverage.rows, _coverage.cols);
@@ -2237,6 +2456,9 @@ void CChunkedVolumeViewer::renderOverlayVolumeForPlane(
             *_overlayChunkArray, level, origin, vxStep, vyStep,
             overlayValues, overlayCoverage, options);
     }
+    profile.setDetails(std::format("action=rendered level={} size={}x{} interactive={}",
+                                   level, overlayValues.cols, overlayValues.rows,
+                                   _interactivePreview));
 }
 
 void CChunkedVolumeViewer::renderOverlayVolumeForCoords(
@@ -2246,9 +2468,16 @@ void CChunkedVolumeViewer::renderOverlayVolumeForCoords(
     cv::Mat_<uint8_t>& overlayValues,
     cv::Mat_<uint8_t>& overlayCoverage)
 {
+    ProfileScope profile("renderOverlayVolumeForCoords",
+                         "overlay coords render",
+                         std::source_location::current(),
+                         std::format("surf='{}' startLevel={} coords={}x{}",
+                                     _surfName, startLevel, coords.cols, coords.rows));
     if (!_overlayVolume || !_overlayChunkArray || _overlayOpacity <= 0.0f ||
-        _coverage.empty() || coords.empty() || _overlayChunkArray->numLevels() <= 0)
+        _coverage.empty() || coords.empty() || _overlayChunkArray->numLevels() <= 0) {
+        profile.setDetails("action=skip missing_overlay_or_coords");
         return;
+    }
 
     overlayValues.create(_coverage.rows, _coverage.cols);
     overlayCoverage.create(_coverage.rows, _coverage.cols);
@@ -2262,19 +2491,28 @@ void CChunkedVolumeViewer::renderOverlayVolumeForCoords(
         vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
             *_overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
     }
+    profile.setDetails(std::format("action=rendered level={} size={}x{} interactive={}",
+                                   level, overlayValues.cols, overlayValues.rows,
+                                   _interactivePreview));
 }
 
-void CChunkedVolumeViewer::renderVisible(bool force)
+void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::source_location caller)
 {
+    ProfileScope profile("renderVisible", reason, caller,
+                         std::format("surf='{}' force={} pending={} interactive={} scale={:.4f} zOff={:.3f}",
+                                     _surfName, force, _renderPending, _interactivePreview,
+                                     _scale, _zOff));
     if (!force) {
-        scheduleRender();
+        scheduleRender("renderVisible non-force", caller);
+        profile.setDetails("action=schedule");
         return;
     }
     if (_renderTimer && _renderTimer->isActive())
         _renderTimer->stop();
     _renderPending = false;
-    submitRender();
+    submitRender("renderVisible force", caller);
     updateStatusLabel();
+    profile.setDetails("action=submit");
 }
 
 void CChunkedVolumeViewer::setVolumeWindow(float low, float high)
@@ -2288,7 +2526,7 @@ void CChunkedVolumeViewer::setVolumeWindow(float low, float high)
         return;
     _windowLow = clampedLow;
     _windowHigh = clampedHigh;
-    scheduleRender();
+    scheduleRender("volume window changed");
 }
 
 void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
@@ -2320,24 +2558,24 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                             guard->_settleRenderTimer->start(kChunkReadyActiveDelayMs);
                         return;
                     }
-                    guard->scheduleRender();
+                    guard->scheduleRender("overlay chunk ready");
                 }, Qt::QueuedConnection);
             });
         }
     }
-    scheduleRender();
+    scheduleRender("overlay volume changed");
 }
 
 void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
 {
     _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
-    scheduleRender();
+    scheduleRender("overlay opacity changed");
 }
 
 void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
 {
     _overlayColormapId = colormapId;
-    scheduleRender();
+    scheduleRender("overlay colormap changed");
 }
 
 void CChunkedVolumeViewer::setOverlayThreshold(float threshold)
@@ -2349,7 +2587,7 @@ void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
 {
     _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
     _overlayWindowHigh = std::clamp(high, _overlayWindowLow + 1.0f, 255.0f);
-    scheduleRender();
+    scheduleRender("overlay window changed");
 }
 
 void CChunkedVolumeViewer::panByF(float dx, float dy)
@@ -2365,7 +2603,7 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
     prefetchVisibleSurfaceChunks();
     if (shouldRefreshInteractivePreview())
         updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
-    scheduleRender();
+    scheduleRender("pan");
     emit overlaysUpdated();
 }
 
@@ -2398,7 +2636,7 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     prefetchVisibleSurfaceChunks();
     if (shouldRefreshInteractivePreview())
         updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
-    scheduleRender();
+    scheduleRender("zoom");
     emit overlaysUpdated();
 }
 
@@ -2418,9 +2656,9 @@ void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)
     prefetchVisibleSurfaceChunks();
     if (shouldRefreshInteractivePreview()) {
         _renderPending = false;
-        submitRender();
+        submitRender("interactive view change preview");
     }
-    scheduleRender();
+    scheduleRender("interactive view change final render");
     emit overlaysUpdated();
 }
 
@@ -2433,7 +2671,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
     }
     _zOff = std::clamp(_zOff + delta, -maxZ, maxZ);
     _genCacheDirty = true;
-    scheduleRender();
+    scheduleRender("surface offset changed");
     updateStatusLabel();
 }
 
@@ -2445,7 +2683,7 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
     _stableFramebufferValid = false;
-    scheduleRender();
+    scheduleRender("surface offsets reset");
 }
 
 void CChunkedVolumeViewer::fitSurfaceInView()
@@ -2456,7 +2694,7 @@ void CChunkedVolumeViewer::fitSurfaceInView()
     recalcPyramidLevel();
     _genCacheDirty = true;
     _stableFramebufferValid = false;
-    scheduleRender();
+    scheduleRender("fit surface in view");
 }
 
 void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forceRender)
@@ -2501,7 +2739,7 @@ void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool for
     _genCacheDirty = true;
     if (forceRender) {
         _stableFramebufferValid = false;
-        renderVisible(true);
+        renderVisible(true, "center on surface point");
     } else {
         const double motionPx = std::hypot(double(_surfacePtrX - oldSurfacePtrX),
                                           double(_surfacePtrY - oldSurfacePtrY)) *
@@ -2509,7 +2747,7 @@ void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool for
         markInteractiveMotion(motionPx);
         if (shouldRefreshInteractivePreview())
             updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
-        scheduleRender();
+        scheduleRender("center on surface point");
     }
     emit overlaysUpdated();
 }
@@ -2526,7 +2764,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
             const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
             prefetchPlaneNormalNeighbors(*plane, renderStartLevel(false), options);
         }
-        scheduleRender();
+        scheduleRender("z offset mouse wheel");
     } else if (modifiers & Qt::ControlModifier) {
         emit sendSegmentationRadiusWheel(steps, scenePoint, sceneToVolume(scenePoint));
     } else {
@@ -2594,7 +2832,7 @@ void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
     _lastInteractivePreviewMs = -1;
     if (_settleRenderTimer)
         _settleRenderTimer->stop();
-    scheduleRender();
+    scheduleRender("pan released");
 }
 
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
@@ -3054,7 +3292,11 @@ void CChunkedVolumeViewer::invalidateIntersect(const std::string& name)
         dynamic_cast<PlaneSurface*>(currentSurface())) {
         _lastIntersectFp = {};
         _intersectionGeometryCache = {};
-        scheduleIntersectionRender();
+        if (_deferSegmentationIntersections) {
+            _deferredSegmentationIntersectionsDirty = true;
+            return;
+        }
+        scheduleIntersectionRender("segmentation intersection invalidated during edit");
         return;
     }
 
@@ -3087,7 +3329,7 @@ void CChunkedVolumeViewer::invalidateIntersectRegion(const std::string& name,
                   : (*_flattenedIntersectionDirtyCells | changedCells)
             : changedCells;
     _lastIntersectFp = {};
-    scheduleIntersectionRender();
+    scheduleIntersectionRender("segmentation intersection region invalidated");
 }
 
 void CChunkedVolumeViewer::clearIntersectionItems()
@@ -3126,12 +3368,17 @@ void CChunkedVolumeViewer::updateIntersectionPreviewTransform()
     }
 }
 
-void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Surface>& surf)
+void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
+                                                        const char* reason,
+                                                        std::source_location caller)
 {
+    ProfileScope profile("renderFlattenedIntersections", reason, caller,
+                         std::format("surf='{}' targets={}", _surfName, _intersectTgts.size()));
     auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(surf);
     if (!activeSeg || !_state || _state->surface("segmentation") != activeSeg) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip inactive_segmentation");
         return;
     }
 
@@ -3139,6 +3386,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     if (!patchIndex || patchIndex->empty()) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip empty_patch_index");
         return;
     }
 
@@ -3163,6 +3411,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     if (planes.empty()) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip no_planes");
         return;
     }
 
@@ -3202,6 +3451,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     if (_lastIntersectFp == fp && !_intersectionItems.empty() &&
         !_flattenedIntersectionDirtyCells) {
         updateIntersectionPreviewTransform();
+        profile.setDetails(std::format("action=cache_hit planes={} items={}",
+                                       planes.size(), _intersectionItems.size()));
         return;
     }
 
@@ -3232,6 +3483,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     if (!points || points->cols < 2 || points->rows < 2) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip no_points");
         return;
     }
 
@@ -3434,6 +3686,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     } else if (!cacheCompatible) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip incompatible_cache");
         return;
     }
     _flattenedIntersectionCache.generation = activeGeneration;
@@ -3464,6 +3717,10 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         _intersectionItemsCamScale = _camScale;
         _intersectionItemsHaveCamera = !_intersectionItems.empty();
         _view->viewport()->update();
+        profile.setDetails(std::format("action=no_dirty_tiles planes={} cells={} items={}",
+                                       planes.size(),
+                                       _flattenedIntersectionCache.cellLines.size(),
+                                       _intersectionItems.size()));
         return;
     }
 
@@ -3542,6 +3799,10 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     if (_intersectionItems.empty()) {
         _intersectionItemsHaveCamera = false;
         _view->viewport()->update();
+        profile.setDetails(std::format("action=empty_result planes={} cells={} dirtyTiles={}",
+                                       planes.size(),
+                                       _flattenedIntersectionCache.cellLines.size(),
+                                       dirtyTilePlanes.size()));
         return;
     }
 
@@ -3550,19 +3811,34 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     _intersectionItemsCamScale = _camScale;
     _intersectionItemsHaveCamera = !_intersectionItems.empty();
     _view->viewport()->update();
+    profile.setDetails(std::format("action=rendered planes={} cells={} dirtyTiles={} items={} fullRebuild={} dirtyCells={}",
+                                   planes.size(),
+                                   _flattenedIntersectionCache.cellLines.size(),
+                                   dirtyTilePlanes.size(),
+                                   _intersectionItems.size(),
+                                   needsFullRebuild,
+                                   bool(_flattenedIntersectionDirtyCells)));
 }
 
-void CChunkedVolumeViewer::renderIntersections()
+void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_location caller)
 {
+    ProfileScope profile("renderIntersections", reason, caller,
+                         std::format("surf='{}' targets={} viewport={} scale={:.4f} zOff={:.3f}",
+                                     _surfName, _intersectTgts.size(),
+                                     _view ? profileRectF(_view->mapToScene(_view->viewport()->rect()).boundingRect())
+                                           : std::string("[]"),
+                                     _scale, _zOff));
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
     if (!surf || !_state || !_viewerManager || !_scene || !_view) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip missing_input");
         return;
     }
     if (!plane) {
-        renderFlattenedIntersections(surf);
+        renderFlattenedIntersections(surf, reason, caller);
+        profile.setDetails("action=delegated_flattened");
         return;
     }
 
@@ -3570,6 +3846,7 @@ void CChunkedVolumeViewer::renderIntersections()
     if (!patchIndex || patchIndex->empty()) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip empty_patch_index");
         return;
     }
 
@@ -3599,6 +3876,7 @@ void CChunkedVolumeViewer::renderIntersections()
     if (targets.empty()) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip no_targets");
         return;
     }
 
@@ -3606,6 +3884,7 @@ void CChunkedVolumeViewer::renderIntersections()
     if (!sceneRect.isValid()) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        profile.setDetails("action=skip invalid_scene_rect");
         return;
     }
 
@@ -3666,6 +3945,9 @@ void CChunkedVolumeViewer::renderIntersections()
     fp.valid = true;
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         updateIntersectionPreviewTransform();
+        profile.setDetails(std::format("action=cache_hit targetSurfaces={} items={} roi={}",
+                                       targets.size(), _intersectionItems.size(),
+                                       profileRect(planeRoi)));
         return;
     }
 
@@ -3719,7 +4001,16 @@ void CChunkedVolumeViewer::renderIntersections()
     const auto& intersections = _intersectionGeometryCache.intersections;
     if (intersections.empty()) {
         clearIntersectionItems();
+        profile.setDetails(std::format("action=empty_result targetSurfaces={} roi={} geometryCacheHit={}",
+                                       targets.size(), profileRect(planeRoi),
+                                       geometryCacheValid));
         return;
+    }
+
+    std::size_t segmentCount = 0;
+    for (const auto& [target, segments] : intersections) {
+        (void)target;
+        segmentCount += segments.size();
     }
 
     std::unordered_map<IntersectionStyle, QPainterPath, IntersectionStyleHash> groupedPaths;
@@ -3837,6 +4128,12 @@ void CChunkedVolumeViewer::renderIntersections()
     _intersectionItemsHaveCamera = !_intersectionItems.empty();
 
     _view->viewport()->update();
+    profile.setDetails(std::format("action=rendered targetSurfaces={} intersectingSurfaces={} segments={} groupedPaths={} items={} roi={} cacheRoi={} geometryCacheHit={}",
+                                   targets.size(), intersections.size(), segmentCount,
+                                   groupedPaths.size(), _intersectionItems.size(),
+                                   profileRect(planeRoi),
+                                   profileRect(_intersectionGeometryCache.roi),
+                                   geometryCacheValid));
 }
 
 void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
@@ -3844,7 +4141,7 @@ void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::strin
     _highlightedSurfaceIds.clear();
     for (const auto& id : ids)
         _highlightedSurfaceIds.insert(id);
-    renderIntersections();
+    renderIntersections("highlighted surface ids changed");
 }
 
 const VolumeViewerBase::ActiveSegmentationHandle& CChunkedVolumeViewer::activeSegmentationHandle() const

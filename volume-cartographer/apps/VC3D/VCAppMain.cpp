@@ -175,11 +175,20 @@ auto main(int argc, char* argv[]) -> int
         "Enable verbose diagnostic logging while loading and trimming surfaces.");
     parser.addOption(debugOption);
 
+    QCommandLineOption profileOption(
+        "profile",
+        "Enable VC3D render profiling logs.");
+    parser.addOption(profileOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
         SetDebugLoggingEnabled(true);
         SetLogLevel("debug");
+    }
+    if (parser.isSet(profileOption)) {
+        SetProfileLoggingEnabled(true);
+        Logger()->info("[vc3d-profile] enabled");
     }
 
     if (parser.isSet(skipShapeCheckOption)) {

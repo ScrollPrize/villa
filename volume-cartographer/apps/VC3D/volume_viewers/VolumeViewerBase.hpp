@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <source_location>
 #include <string>
 #include <vector>
 
@@ -61,8 +62,13 @@ public:
     // --- Common viewer controls ---
     virtual void setSurface(const std::string& name) = 0;
     virtual void setIntersects(const std::set<std::string>& names) = 0;
-    virtual void renderVisible(bool force = false) = 0;
-    virtual void requestRender() = 0;
+    virtual void renderVisible(
+        bool force = false,
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) = 0;
+    virtual void requestRender(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) = 0;
     virtual void invalidateVis() = 0;
     virtual void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
     {
@@ -109,6 +115,7 @@ public:
     virtual void setShowDirectionHints(bool enabled) = 0;
     virtual void setShowSurfaceNormals(bool enabled) = 0;
     virtual void setSegmentationEditActive(bool active) = 0;
+    virtual void setSegmentationIntersectionDeferral(bool active) = 0;
     virtual void setSegmentationCursorMirroring(bool enabled) = 0;
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
@@ -137,7 +144,9 @@ public:
     virtual void clearSelections() = 0;
 
     // --- Intersection rendering ---
-    virtual void renderIntersections() = 0;
+    virtual void renderIntersections(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) = 0;
     virtual void invalidateIntersect(const std::string& name = "") = 0;
     virtual void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells)
     {
