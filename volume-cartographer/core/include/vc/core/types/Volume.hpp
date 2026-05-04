@@ -64,6 +64,17 @@ public:
 
     [[nodiscard]] size_t numScales() const noexcept;
     [[nodiscard]] int baseScaleLevel() const noexcept { return 0; }
+    [[nodiscard]] bool hasScaleLevel(int level) const noexcept;
+    [[nodiscard]] std::vector<int> presentScaleLevels() const;
+    [[nodiscard]] int firstPresentScaleLevel() const;
+    [[nodiscard]] int finestPresentScaleLevelAtOrBelow(int level) const;
+
+    enum class MissingScaleLevelPolicy {
+        Error,
+        AllFill,
+        Empty,
+        VirtualDownsample,
+    };
 
     // --- Cache management ---
 
@@ -92,12 +103,14 @@ public:
     // Blocking integer reads through the chunked local/remote cache.
     // ZYX order matches zarr storage and numpy-style volume indexing:
     //   offset = [z, y, x], shape = [z, y, x].
-    void readZYX(Array3D<uint8_t>& out,
+    bool readZYX(Array3D<uint8_t>& out,
                  const std::array<int, 3>& offsetZYX,
-                 int level = 0);
-    void readZYX(Array3D<uint16_t>& out,
+                 int level = 0,
+                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
+    bool readZYX(Array3D<uint16_t>& out,
                  const std::array<int, 3>& offsetZYX,
-                 int level = 0);
+                 int level = 0,
+                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
     static void readZYX(Array3D<uint8_t>& out,
                         const std::array<int, 3>& offsetZYX,
                         vc::render::IChunkedArray& array,
@@ -110,12 +123,14 @@ public:
     // UI/coordinate-order convenience:
     //   offset = [x, y, z], shape = [x, y, z].
     // Returned Array3D is still stored/indexed as [z, y, x].
-    void readXYZ(Array3D<uint8_t>& out,
+    bool readXYZ(Array3D<uint8_t>& out,
                  const std::array<int, 3>& offsetXYZ,
-                 int level = 0);
-    void readXYZ(Array3D<uint16_t>& out,
+                 int level = 0,
+                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
+    bool readXYZ(Array3D<uint16_t>& out,
                  const std::array<int, 3>& offsetXYZ,
-                 int level = 0);
+                 int level = 0,
+                 MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
 
     [[nodiscard]] static bool checkDir(const std::filesystem::path& path);
 

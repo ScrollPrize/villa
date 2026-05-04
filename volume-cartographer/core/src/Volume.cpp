@@ -138,6 +138,12 @@ T typedFillValue(vc::render::IChunkedArray& array)
 }
 
 template <typename T>
+void fillFromChunkedArrayFillValue(Array3D<T>& out, vc::render::IChunkedArray& array)
+{
+    out.fill(typedFillValue<T>(array));
+}
+
+template <typename T>
 void readFromChunkedArrayZYX(Array3D<T>& out,
                                    const std::array<int, 3>& offsetZYX,
                                    vc::render::IChunkedArray& array,
@@ -270,6 +276,40 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                         out(z, y, x) = cached.data[offset];
                     }
                 }
+            }
+        }
+    }
+}
+
+template <typename T>
+void downsampleMeanZYX(Array3D<T>& out, const Array3D<T>& src, int factor)
+{
+    const auto outShape = out.shape();
+    const auto srcShape = src.shape();
+    const std::uint64_t denom = static_cast<std::uint64_t>(factor) *
+                                static_cast<std::uint64_t>(factor) *
+                                static_cast<std::uint64_t>(factor);
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (std::int64_t z = 0; z < static_cast<std::int64_t>(outShape[0]); ++z) {
+        for (std::int64_t y = 0; y < static_cast<std::int64_t>(outShape[1]); ++y) {
+            for (std::size_t x = 0; x < outShape[2]; ++x) {
+                std::uint64_t sum = 0;
+                const std::size_t srcZ0 = static_cast<std::size_t>(z) * static_cast<std::size_t>(factor);
+                const std::size_t srcY0 = static_cast<std::size_t>(y) * static_cast<std::size_t>(factor);
+                const std::size_t srcX0 = x * static_cast<std::size_t>(factor);
+                for (int dz = 0; dz < factor; ++dz) {
+                    for (int dy = 0; dy < factor; ++dy) {
+                        for (int dx = 0; dx < factor; ++dx) {
+                            const std::size_t sz = std::min(srcZ0 + static_cast<std::size_t>(dz), srcShape[0] - 1);
+                            const std::size_t sy = std::min(srcY0 + static_cast<std::size_t>(dy), srcShape[1] - 1);
+                            const std::size_t sx = std::min(srcX0 + static_cast<std::size_t>(dx), srcShape[2] - 1);
+                            sum += src(sz, sy, sx);
+                        }
+                    }
+                }
+                out(static_cast<std::size_t>(z), static_cast<std::size_t>(y), x) =
+                    static_cast<T>((sum + denom / 2) / denom);
             }
         }
     }
@@ -592,6 +632,47 @@ size_t Volume::numScales() const noexcept {
     return zarrLevelShapes_.size();
 }
 
+bool Volume::hasScaleLevel(int level) const noexcept
+{
+    if (level < 0)
+        return false;
+    const auto index = static_cast<std::size_t>(level);
+    if (index >= zarrLevelShapes_.size())
+        return false;
+    const auto& shape = zarrLevelShapes_[index];
+    return shape[0] != 0 || shape[1] != 0 || shape[2] != 0;
+}
+
+std::vector<int> Volume::presentScaleLevels() const
+{
+    std::vector<int> levels;
+    for (std::size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
+        if (hasScaleLevel(static_cast<int>(level)))
+            levels.push_back(static_cast<int>(level));
+    }
+    return levels;
+}
+
+int Volume::firstPresentScaleLevel() const
+{
+    for (std::size_t level = 0; level < zarrLevelShapes_.size(); ++level) {
+        if (hasScaleLevel(static_cast<int>(level)))
+            return static_cast<int>(level);
+    }
+    throw std::runtime_error("Volume has no present zarr scale levels");
+}
+
+int Volume::finestPresentScaleLevelAtOrBelow(int level) const
+{
+    if (level < 0)
+        throw std::out_of_range("scale level must be non-negative");
+    for (int candidate = level - 1; candidate >= 0; --candidate) {
+        if (hasScaleLevel(candidate))
+            return candidate;
+    }
+    throw std::out_of_range("no finer present zarr scale level available for virtual downsample");
+}
+
 // ============================================================================
 // Cache management
 // ============================================================================
@@ -692,18 +773,74 @@ void Volume::sample(cv::Mat_<uint16_t>& out,
     readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
 }
 
-void Volume::readZYX(Array3D<uint8_t>& out,
-                           const std::array<int, 3>& offsetZYX,
-                           int level)
+template <typename T>
+static bool readVolumeZYXWithPolicy(Volume& volume,
+                                    Array3D<T>& out,
+                                    const std::array<int, 3>& offsetZYX,
+                                    int level,
+                                    Volume::MissingScaleLevelPolicy missingPolicy)
 {
-    readFromChunkedArrayZYX(out, offsetZYX, *chunkedCache(), level);
+    if (level < 0)
+        throw std::out_of_range("Volume::read level must be non-negative");
+
+    auto* cache = volume.chunkedCache();
+    if (volume.hasScaleLevel(level)) {
+        readFromChunkedArrayZYX(out, offsetZYX, *cache, level);
+        return true;
+    }
+
+    switch (missingPolicy) {
+    case Volume::MissingScaleLevelPolicy::Error:
+        throw std::out_of_range("Volume::read requested missing zarr scale level " + std::to_string(level));
+    case Volume::MissingScaleLevelPolicy::AllFill:
+        fillFromChunkedArrayFillValue(out, *cache);
+        return true;
+    case Volume::MissingScaleLevelPolicy::Empty:
+        return false;
+    case Volume::MissingScaleLevelPolicy::VirtualDownsample:
+        break;
+    }
+
+    const int sourceLevel = volume.finestPresentScaleLevelAtOrBelow(level);
+    const int levelDelta = level - sourceLevel;
+    if (levelDelta <= 0 || levelDelta >= static_cast<int>(sizeof(int) * 8 - 1)) {
+        throw std::out_of_range("invalid virtual zarr scale level delta");
+    }
+    const int factor = 1 << levelDelta;
+    const auto outShape = out.shape();
+    if (outShape[0] == 0 || outShape[1] == 0 || outShape[2] == 0)
+        return true;
+
+    std::array<size_t, 3> sourceReadShape{
+        outShape[0] * static_cast<size_t>(factor),
+        outShape[1] * static_cast<size_t>(factor),
+        outShape[2] * static_cast<size_t>(factor),
+    };
+    Array3D<T> source(sourceReadShape);
+    std::array<int, 3> sourceOffset{
+        offsetZYX[0] * factor,
+        offsetZYX[1] * factor,
+        offsetZYX[2] * factor,
+    };
+    readFromChunkedArrayZYX(source, sourceOffset, *cache, sourceLevel);
+    downsampleMeanZYX(out, source, factor);
+    return true;
 }
 
-void Volume::readZYX(Array3D<uint16_t>& out,
+bool Volume::readZYX(Array3D<uint8_t>& out,
                            const std::array<int, 3>& offsetZYX,
-                           int level)
+                           int level,
+                           MissingScaleLevelPolicy missingPolicy)
 {
-    readFromChunkedArrayZYX(out, offsetZYX, *chunkedCache(), level);
+    return readVolumeZYXWithPolicy(*this, out, offsetZYX, level, missingPolicy);
+}
+
+bool Volume::readZYX(Array3D<uint16_t>& out,
+                           const std::array<int, 3>& offsetZYX,
+                           int level,
+                           MissingScaleLevelPolicy missingPolicy)
+{
+    return readVolumeZYXWithPolicy(*this, out, offsetZYX, level, missingPolicy);
 }
 
 void Volume::readZYX(Array3D<uint8_t>& out,
@@ -722,16 +859,18 @@ void Volume::readZYX(Array3D<uint16_t>& out,
     readFromChunkedArrayZYX(out, offsetZYX, array, level);
 }
 
-void Volume::readXYZ(Array3D<uint8_t>& out,
+bool Volume::readXYZ(Array3D<uint8_t>& out,
                            const std::array<int, 3>& offsetXYZ,
-                           int level)
+                           int level,
+                           MissingScaleLevelPolicy missingPolicy)
 {
-    readZYX(out, xyzToZyx(offsetXYZ), level);
+    return readZYX(out, xyzToZyx(offsetXYZ), level, missingPolicy);
 }
 
-void Volume::readXYZ(Array3D<uint16_t>& out,
+bool Volume::readXYZ(Array3D<uint16_t>& out,
                            const std::array<int, 3>& offsetXYZ,
-                           int level)
+                           int level,
+                           MissingScaleLevelPolicy missingPolicy)
 {
-    readZYX(out, xyzToZyx(offsetXYZ), level);
+    return readZYX(out, xyzToZyx(offsetXYZ), level, missingPolicy);
 }
