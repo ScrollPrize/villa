@@ -11,6 +11,7 @@
 
 #include "vc/core/types/VcDataset.hpp"
 
+#include <array>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -97,6 +98,13 @@ public:
     Chunked3d(C &compute_f, vc::VcDataset *ds, vc::render::IChunkedArray *cache, int level) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
         _border = compute_f.BORDER;
+        if (_ds)
+            _shape = {static_cast<int>(_ds->shape()[0]), static_cast<int>(_ds->shape()[1]), static_cast<int>(_ds->shape()[2])};
+    };
+    Chunked3d(C &compute_f, const std::array<int, 3>& shape, vc::render::IChunkedArray *cache, int level) : _compute_f(compute_f), _ds(nullptr), _cache(cache), _level(level)
+    {
+        _border = compute_f.BORDER;
+        _shape = {shape[0], shape[1], shape[2]};
     };
     ~Chunked3d()
     {
@@ -179,6 +187,23 @@ public:
         if (_cache_dir.empty())
             throw std::runtime_error("could not create cache dir - maybe too many caches in cache root (max 1000!)");
         
+    };
+    Chunked3d(C &compute_f, const std::array<int, 3>& shape, vc::render::IChunkedArray *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(nullptr), _cache(cache), _level(level)
+    {
+        _border = compute_f.BORDER;
+        _shape = {shape[0], shape[1], shape[2]};
+
+        if (cache_root.empty())
+            return;
+
+        if (!_compute_f.UNIQUE_ID_STRING.size())
+            throw std::runtime_error("requested fs cache for compute function without identifier");
+
+        _persistent = false;
+        std::filesystem::path root = cache_root/_compute_f.UNIQUE_ID_STRING;
+        std::filesystem::create_directories(root);
+        _cache_dir = root/tmp_name_proc_thread();
+        std::filesystem::create_directories(_cache_dir);
     };
     size_t calc_off(const cv::Vec3i &p)
     {
@@ -287,7 +312,7 @@ public:
 
         CHUNKT small = Array3D<T>({(size_t)s,(size_t)s,(size_t)s});
         CHUNKT large;
-        if (_ds) {
+        if (_cache) {
             large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
             large.fill(C::FILL_V);
 
@@ -333,7 +358,7 @@ public:
             static_cast<int>(id[2]*s-_border)};
             
         CHUNKT large;
-        if (_ds) {
+        if (_cache) {
             large = Array3D<T>({(size_t)(s+2*_border),(size_t)(s+2*_border),(size_t)(s+2*_border)});
             large.fill(C::FILL_V);
             

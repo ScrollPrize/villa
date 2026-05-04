@@ -826,7 +826,7 @@ static std::filesystem::path normalized_existing_path(const std::filesystem::pat
 
 static std::unique_ptr<TraceData::PatchNormalContext> load_patch_normal_context(
     const utils::Json& params,
-    const vc::VcDataset& ds,
+    const std::array<int, 3>& volume_shape_zyx,
     QuadSurface* resume_surf)
 {
     std::string patches_path;
@@ -883,13 +883,9 @@ static std::unique_ptr<TraceData::PatchNormalContext> load_patch_normal_context(
     ctx->index->rebuild(ctx->surfaces, 0.0f);
 
     if (params.contains("umbilicus_path") && params["umbilicus_path"].is_string()) {
-        const auto& shape = ds.shape();
-        if (shape.size() < 3) {
-            throw std::runtime_error("dataset shape is not 3D; cannot load umbilicus for patch normals");
-        }
-        const cv::Vec3i volume_shape(static_cast<int>(shape[0]),
-                                     static_cast<int>(shape[1]),
-                                     static_cast<int>(shape[2]));
+        const cv::Vec3i volume_shape(volume_shape_zyx[0],
+                                     volume_shape_zyx[1],
+                                     volume_shape_zyx[2]);
         ctx->umbilicus = Umbilicus::FromFile(params["umbilicus_path"].get_string(), volume_shape);
         ctx->signed_normals = true;
     }
@@ -2937,7 +2933,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(const std::array<int, 3>& volume_shape_zyx, float scale, vc::render::IChunkedArray *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
@@ -3048,10 +3044,9 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *c
             }
 
             // Derive scale purely from shapes: main volume is full-res, normal zarr is downsampled.
-            const auto& vol_shape_zyx = ds->shape();
-            const int vol_z = static_cast<int>(vol_shape_zyx.at(0));
-            const int vol_y = static_cast<int>(vol_shape_zyx.at(1));
-            const int vol_x = static_cast<int>(vol_shape_zyx.at(2));
+            const int vol_z = volume_shape_zyx.at(0);
+            const int vol_y = volume_shape_zyx.at(1);
+            const int vol_x = volume_shape_zyx.at(2);
 
             auto x_ds = std::make_unique<vc::VcDataset>(zarr_root / "x" / "0");
             const auto& nshape = x_ds->shape();
@@ -3127,7 +3122,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *c
 
     if (patch_normals_requested) {
         try {
-            trace_data.patch_normals = load_patch_normal_context(params, *ds, resume_surf);
+            trace_data.patch_normals = load_patch_normal_context(params, volume_shape_zyx, resume_surf);
         } catch (const std::exception& e) {
             std::cerr << "Failed to load patch-normal constraints: " << e.what() << std::endl;
             trace_data.patch_normals.reset();
@@ -3303,13 +3298,13 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *c
 
     // Together these represent the cached distance-transform of the thresholded surface volume
     thresholdedDistance compute;
-    Chunked3d<uint8_t,thresholdedDistance> proc_tensor(compute, ds, cache, level, cache_root);
+    Chunked3d<uint8_t,thresholdedDistance> proc_tensor(compute, volume_shape_zyx, cache, level, cache_root);
 
     if (loss_settings.w[LossType::SPACELINE] > 0.0f && loss_settings.space_line_steps >= 2) {
         trace_data.space_line_compute = std::make_unique<lineLossDistance>(loss_settings.space_line_threshold,
                                                                            loss_settings.space_line_invert);
         trace_data.space_line_volume = std::make_unique<Chunked3d<uint8_t, lineLossDistance>>(
-            *trace_data.space_line_compute, ds, cache, level, cache_root);
+            *trace_data.space_line_compute, volume_shape_zyx, cache, level, cache_root);
         std::cout << "Space-line loss EDT enabled (threshold=" << loss_settings.space_line_threshold
                   << ", steps=" << loss_settings.space_line_steps
                   << ", invert=" << loss_settings.space_line_invert << ")" << std::endl;
@@ -3317,7 +3312,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *c
 
     // Debug: test the chunk cache by reading one voxel
     passTroughComputor pass;
-    Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, ds, cache, level);
+    Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, volume_shape_zyx, cache, level);
     trace_data.raw_volume = &dbg_tensor;
     std::cout << "seed val " << origin << " " <<
     (int)dbg_tensor(origin[2],origin[1],origin[0]) << std::endl;

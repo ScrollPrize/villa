@@ -1083,6 +1083,8 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
         _segmentationWidget->setVolumePackagePath(_state->vpkgPath());
     }
 
+    updateNormalGridAvailability();
+
     refreshVolumeSelectionUi(preferredVolumeId);
     if (!_state->vpkg()->hasVolumes()) {
         Logger()->info("Opened volpkg '{}' with no volumes", _state->vpkgPath().toStdString());
@@ -3162,10 +3164,14 @@ void CWindow::onAppendMaskPressed(void)
 
 QString CWindow::getCurrentVolumePath() const
 {
-    if (_state->currentVolume() == nullptr) {
+    auto volume = _state->currentVolume();
+    if (volume == nullptr) {
         return QString();
     }
-    return QString::fromStdString(_state->currentVolume()->path().string());
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl());
+    }
+    return QString::fromStdString(volume->path().string());
 }
 
 void CWindow::onSegmentationDirChanged(int index)

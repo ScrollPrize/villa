@@ -96,6 +96,17 @@ static QStringList applicationRelativeExecutablePaths(const QString& name)
     return candidates;
 }
 
+static QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return QString();
+    }
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl());
+    }
+    return QString::fromStdString(volume->path().string());
+}
+
 static QString findExecutable(
     const QString& name,
     const QStringList& extraPaths = {},
@@ -1270,7 +1281,7 @@ QString SegmentationCommandHandler::getCurrentVolumePath() const
     if (_state->currentVolume() == nullptr) {
         return QString();
     }
-    return QString::fromStdString(_state->currentVolume()->path().string());
+    return commandPathForVolume(_state->currentVolume());
 }
 
 QString SegmentationCommandHandler::getCurrentRenderVolumePath(QString* remoteUrlOut) const
@@ -1347,7 +1358,7 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
         VolumeSelector::VolumeOption opt;
         opt.id = QString::fromStdString(volumeId);
         opt.name = QString::fromStdString(volume->name());
-        opt.path = QString::fromStdString(volume->path().string());
+        opt.path = commandPathForVolume(volume);
         options.push_back(opt);
     }
 

@@ -2,7 +2,6 @@
 #include <random>
 
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
@@ -10,6 +9,7 @@
 #include <opencv2/imgproc.hpp>
 #include "utils/Json.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 
@@ -31,6 +31,31 @@ using shape = std::vector<size_t>;
 
 
 using Json = utils::Json;
+
+static bool is_remote_volume_path(const std::string& path)
+{
+    return path.rfind("http://", 0) == 0 ||
+           path.rfind("https://", 0) == 0 ||
+           path.rfind("s3://", 0) == 0;
+}
+
+static bool chunk_has_source_data(vc::render::IChunkedArray& chunks,
+                                  int level,
+                                  size_t iz,
+                                  size_t iy,
+                                  size_t ix)
+{
+    const auto result = chunks.getChunkBlocking(level,
+                                                static_cast<int>(iz),
+                                                static_cast<int>(iy),
+                                                static_cast<int>(ix));
+    if (result.status == vc::render::ChunkStatus::Error) {
+        throw std::runtime_error(result.error.empty()
+            ? std::string("Failed to read zarr chunk")
+            : result.error);
+    }
+    return result.status == vc::render::ChunkStatus::Data;
+}
 
 static void add_target_context(Json& meta, const std::filesystem::path& volume_path)
 {
@@ -299,20 +324,27 @@ int main(int argc, char *argv[])
         set_space_tracing_use_cuda(true);
     }
 
-    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "0");
+    const std::string volume_arg = vol_path.string();
+    const bool remote_volume = is_remote_volume_path(volume_arg);
+    auto volume = remote_volume
+        ? Volume::NewFromUrl(volume_arg)
+        : Volume::New(vol_path);
+    volume->setCacheBudget(size_t(params.value("cache_size", 1e9)));
+    auto* chunk_cache = volume->chunkedCache();
+    const std::array<int, 3> volume_shape_zyx{
+        volume->numSlices(),
+        volume->sliceHeight(),
+        volume->sliceWidth()};
+    const auto chunk_shape_zyx = chunk_cache->chunkShape(0);
 
-    std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
-
-    auto chunk_cache = vc::render::createChunkCache(
-        vc::render::openLocalZarrPyramid(ds->path()),
-        size_t(params.value("cache_size", 1e9)));
+    std::cout << "zarr dataset size for scale group 0 " << volume_shape_zyx << std::endl;
+    std::cout << "chunk shape shape " << chunk_shape_zyx << std::endl;
 
     passTroughComputor pass;
-    Chunked3d<uint8_t,passTroughComputor> tensor(pass, ds.get(), chunk_cache.get(), 0);
+    Chunked3d<uint8_t,passTroughComputor> tensor(pass, volume_shape_zyx, chunk_cache, 0);
     CachedChunked3dInterpolator<uint8_t,passTroughComputor> interpolator(tensor);
 
-    auto chunk_size = ds->defaultChunkShape();
+    auto chunk_size = chunk_shape_zyx;
 
     srand(clock());
 
@@ -322,7 +354,7 @@ int main(int argc, char *argv[])
     int search_effort = params.value("search_effort", 10);
     int thread_limit = params.value("thread_limit", 0);
 
-    float voxelsize = Json::parse_file(vol_path/"meta.json")["voxelsize"].get_float();
+    const float voxelsize = static_cast<float>(volume->voxelSize());
     
     std::filesystem::path cache_root;
     if (params.contains("cache_root") && params["cache_root"].is_string()) {
@@ -484,9 +516,9 @@ int main(int argc, char *argv[])
             int max_attempts = 1000;
             
             while(count < max_attempts && !succ) {
-                origin[0] = static_cast<double>(128 + (rand() % (ds->shape()[2]-384)));
-                origin[1] = static_cast<double>(128 + (rand() % (ds->shape()[1]-384)));
-                origin[2] = static_cast<double>(128 + (rand() % (ds->shape()[0]-384)));
+                origin[0] = static_cast<double>(128 + (rand() % (volume_shape_zyx[2]-384)));
+                origin[1] = static_cast<double>(128 + (rand() % (volume_shape_zyx[1]-384)));
+                origin[2] = static_cast<double>(128 + (rand() % (volume_shape_zyx[0]-384)));
 
                 count++;
                 auto chunk_id = chunk_size;
@@ -494,7 +526,7 @@ int main(int argc, char *argv[])
                 chunk_id[1] = origin[1]/chunk_id[1];
                 chunk_id[2] = origin[0]/chunk_id[2];
 
-                if (!ds->chunkExists(chunk_id[0], chunk_id[1], chunk_id[2]))
+                if (!chunk_has_source_data(*chunk_cache, 0, chunk_id[0], chunk_id[1], chunk_id[2]))
                     continue;
 
                 cv::Vec3d dir = {static_cast<double>((rand() % 1024) - 512),
@@ -1363,7 +1395,7 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(ds.get(), 1.0, chunk_cache.get(), 0, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    QuadSurface *surf = tracer(volume_shape_zyx, 1.0, chunk_cache, 0, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
 
     double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {

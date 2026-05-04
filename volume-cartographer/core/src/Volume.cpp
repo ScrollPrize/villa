@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 
 #ifdef __aarch64__
@@ -14,8 +15,10 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include "vc/core/util/LoadJson.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/types/VcDataset.hpp"
@@ -56,6 +59,37 @@ std::string deriveRemoteVolumeName(const std::string& url)
     if (pos != std::string::npos && pos + 1 < normalized.size())
         return normalized.substr(pos + 1);
     return normalized.empty() ? std::string("remote") : normalized;
+}
+
+std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
+                                                    const vc::HttpAuth& auth)
+{
+    const auto load = [&](const std::string& name) -> std::optional<utils::Json> {
+        const auto url = remoteUrl + "/" + name;
+        const auto body = vc::httpGetString(url, auth);
+        if (body.empty()) {
+            return std::nullopt;
+        }
+        auto json = utils::Json::parse(body);
+        if (name == METADATA_FILE_ALT.string()) {
+            if (!json.contains("scan")) {
+                throw std::runtime_error("metadata.json missing 'scan' key: " + url);
+            }
+            json.update(json["scan"]);
+            if (!json.contains("format")) {
+                json["format"] = "zarr";
+            }
+        }
+        if (!json.is_object()) {
+            throw std::runtime_error("remote volume metadata is not an object: " + url);
+        }
+        return json;
+    };
+
+    if (auto meta = load(METADATA_FILE.string())) {
+        return meta;
+    }
+    return load(METADATA_FILE_ALT.string());
 }
 
 std::string deriveRemoteVolumeId(const std::string& url)
@@ -101,7 +135,8 @@ void Volume::loadMetadata()
             throw std::runtime_error(
                 "metadata.json missing 'scan' key: " + altPath.string());
         }
-        metadata_ = full["scan"];
+        metadata_ = full;
+        metadata_.update(full["scan"]);
         if (!metadata_.contains("format")) {
             metadata_["format"] = "zarr";
         }
@@ -347,6 +382,17 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->metadata_["voxelsize"] = double{};
     vol->metadata_["min"] = double{};
     vol->metadata_["max"] = double{};
+
+    try {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
+            vol->metadata_.update(*remoteMeta);
+            vol->metadata_["width"] = vol->_width;
+            vol->metadata_["height"] = vol->_height;
+            vol->metadata_["slices"] = vol->_slices;
+        }
+    } catch (const std::exception& e) {
+        Logger()->warn("Failed to load remote volume metadata for '{}': {}", remoteUrl, e.what());
+    }
 
     return vol;
 }
