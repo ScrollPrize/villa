@@ -6,7 +6,6 @@
 #include "ViewerManager.hpp"
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "render/ChunkCache.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -118,21 +117,6 @@ int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
             return -1;
     }
     return axis;
-}
-
-std::vector<vc::render::ChunkCache::LevelInfo>
-makeLevelInfo(const vc::render::OpenedChunkedZarr& opened)
-{
-    std::vector<vc::render::ChunkCache::LevelInfo> levels;
-    levels.reserve(opened.fetchers.size());
-    for (std::size_t i = 0; i < opened.fetchers.size(); ++i) {
-        vc::render::ChunkCache::LevelInfo level;
-        level.shape = opened.shapes[i];
-        level.chunkShape = opened.chunkShapes[i];
-        level.transform = opened.transforms[i];
-        levels.push_back(level);
-    }
-    return levels;
 }
 
 std::string stableHexHash(const std::string& value)
@@ -514,27 +498,17 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     if (!volume)
         return nullptr;
 
-    const bool isRemote = volume->isRemote();
-    vc::render::OpenedChunkedZarr opened = isRemote
-        ? vc::render::openHttpZarrPyramid(
-              volume->remoteUrl(), volume->remoteAuth(), volume->baseScaleLevel())
-        : vc::render::openLocalZarrPyramid(volume->path());
-
-    if (opened.fetchers.empty())
-        return nullptr;
-
     vc::render::ChunkCache::Options options;
     options.decodedByteCapacity = decodedByteCapacity > 0
         ? decodedByteCapacity
         : streamingCacheCapacityBytes(nullptr);
     options.maxConcurrentReads = 16;
-    if (isRemote) {
+    if (volume->isRemote()) {
         const auto cacheRoot = remoteCacheRootForState(state);
         options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
     }
 
-    return std::make_shared<vc::render::ChunkCache>(
-        makeLevelInfo(opened), opened.fetchers, opened.fillValue, opened.dtype, options);
+    return volume->createChunkCache(std::move(options));
 }
 
 std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::shared_ptr<Volume>& volume,

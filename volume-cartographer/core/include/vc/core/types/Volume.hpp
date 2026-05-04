@@ -11,9 +11,10 @@
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/types/Array3D.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
 
-namespace vc::render { class ChunkCache; class IChunkedArray; }
+namespace vc::render { class IChunkedArray; }
 
 struct CompositeParams;
 
@@ -55,9 +56,11 @@ public:
     [[nodiscard]] int numSlices() const noexcept;
     // Zarr/storage order: [z, y, x] = [slices, height, width].
     [[nodiscard]] std::array<int, 3> shape() const noexcept;
+    [[nodiscard]] std::array<int, 3> shape(int level) const;
     // Coordinate/UI order: [x, y, z] = [width, height, slices].
     [[nodiscard]] std::array<int, 3> shapeXyz() const noexcept;
     [[nodiscard]] double voxelSize() const;
+    [[nodiscard]] vc::render::ChunkDtype dtype() const noexcept { return zarrDtype_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
     [[nodiscard]] int baseScaleLevel() const noexcept { return 0; }
@@ -65,6 +68,8 @@ public:
     // --- Cache management ---
 
     [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
+    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
+        vc::render::ChunkCache::Options options) const;
 
     // Set cache budget for the chunked sampling cache.
     void setCacheBudget(size_t hotBytes);
@@ -124,10 +129,11 @@ protected:
     int _slices{0};
 
     std::vector<std::array<int, 3>> zarrLevelShapes_;
+    vc::render::ChunkDtype zarrDtype_ = vc::render::ChunkDtype::UInt8;
     void zarrOpen();
 
     // Cache ownership
-    mutable std::unique_ptr<vc::render::ChunkCache> chunkedCache_;
+    mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
     mutable std::mutex cacheMutex_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     int ioThreads_ = 0;  // 0 = use default
