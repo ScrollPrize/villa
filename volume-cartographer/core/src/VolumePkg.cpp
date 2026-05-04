@@ -662,6 +662,23 @@ bool VolumePkg::isRemote() const
     return anyRemote(volumes_) || anyRemote(normalGrids_);
 }
 
+bool VolumePkg::hasRemoteCacheRoot() const
+{
+    return !remoteCacheRoot_.empty();
+}
+
+std::string VolumePkg::remoteCacheRootOrEmpty() const
+{
+    return remoteCacheRoot_.string();
+}
+
+void VolumePkg::setRemoteCacheRoot(const fs::path& dir)
+{
+    remoteCacheRoot_ = dir;
+    opts_.remoteCacheRoot = dir;
+    persistProjectState();
+}
+
 void VolumePkg::save(const fs::path& target)
 {
     writeJsonTo(target);
@@ -847,6 +864,7 @@ utils::Json VolumePkg::toJson() const
     j["volumes"] = entriesToJson(volumes_);
     j["segments"] = entriesToJson(segments_);
     j["normal_grids"] = entriesToJson(normalGrids_);
+    if (!remoteCacheRoot_.empty()) j["remote_cache_root"] = remoteCacheRoot_.string();
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     return j;
 }
@@ -858,6 +876,12 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("volumes")) volumes_ = entriesFromJson(j.at("volumes"));
     if (j.contains("segments")) segments_ = entriesFromJson(j.at("segments"));
     if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));
+    if (j.contains("remote_cache_root")) {
+        remoteCacheRoot_ = j.at("remote_cache_root").get_string();
+        if (!remoteCacheRoot_.empty()) {
+            opts_.remoteCacheRoot = remoteCacheRoot_;
+        }
+    }
     if (j.contains("output_segments")) outputSegments_ = j.at("output_segments").get_string();
 }
 

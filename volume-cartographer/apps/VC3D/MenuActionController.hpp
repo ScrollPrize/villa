@@ -73,7 +73,11 @@ private:
     // prompts the user for an output .volpkg.json, and returns the written path
     // via `convertedOut` on success.
     bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
-    QString remoteCacheDirectory() const;
+    QString remoteCacheDirectory(bool allowPrompt);
+    QString configuredRemoteCacheDirectory() const;
+    QString suggestedRemoteCacheDirectory() const;
+    QString remoteVolumeRegistryCacheRoot() const;
+    void persistRemoteVolumeRegistryCacheRoot(const QString& cacheRoot);
     QString remoteVolumeRegistryPath() const;
     void persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume);
     QString promptLocation(const QString& title,

@@ -491,8 +491,25 @@ float scaleForCoarsestPlaneRenderLevel(int numLevels)
     return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
 }
 
+std::filesystem::path remoteCacheRootForState(const CState* state)
+{
+    if (state && state->vpkg()) {
+        const auto projectCache = state->vpkg()->remoteCacheRootOrEmpty();
+        if (!projectCache.empty()) {
+            return projectCache;
+        }
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
+    return settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache)
+        .toString()
+        .toStdString();
+}
+
 std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
-                                                                std::size_t decodedByteCapacity)
+                                                                std::size_t decodedByteCapacity,
+                                                                const CState* state)
 {
     if (!volume)
         return nullptr;
@@ -512,12 +529,7 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
         : streamingCacheCapacityBytes(nullptr);
     options.maxConcurrentReads = 16;
     if (isRemote) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
-        const auto cacheRoot = std::filesystem::path(
-            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache)
-                .toString()
-                .toStdString());
+        const auto cacheRoot = remoteCacheRootForState(state);
         options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
     }
 
@@ -526,7 +538,8 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
 }
 
 std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
-                                                                  std::size_t decodedByteCapacity)
+                                                                  std::size_t decodedByteCapacity,
+                                                                  const CState* state)
 {
     if (!volume)
         return nullptr;
@@ -535,7 +548,8 @@ std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::sha
         ? decodedByteCapacity
         : streamingCacheCapacityBytes(nullptr);
     const std::string key = normalizedVolumeCacheIdentity(volume) +
-                            "|decoded=" + std::to_string(capacity);
+                            "|decoded=" + std::to_string(capacity) +
+                            "|cache=" + (volume->isRemote() ? remoteCacheRootForState(state).string() : std::string{});
 
     static std::mutex cacheMutex;
     static std::unordered_map<std::string, std::weak_ptr<vc::render::ChunkCache>> caches;
@@ -550,7 +564,7 @@ std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::sha
         }
     }
 
-    auto cache = makeChunkCacheForVolume(volume, capacity);
+    auto cache = makeChunkCacheForVolume(volume, capacity, state);
     if (!cache)
         return nullptr;
 
@@ -740,7 +754,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
         return;
 
     try {
-        _chunkArray = sharedChunkCacheForVolume(_volume, streamingCacheCapacityBytes(_state));
+        _chunkArray = sharedChunkCacheForVolume(_volume, streamingCacheCapacityBytes(_state), _state);
     } catch (const std::exception& e) {
         if (_statsBar)
             _statsBar->setItems({QString("Streaming unavailable: %1").arg(e.what())});
@@ -2600,7 +2614,7 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     _overlayChunkArray.reset();
     if (_overlayVolume) {
         try {
-            _overlayChunkArray = sharedChunkCacheForVolume(_overlayVolume, streamingCacheCapacityBytes(_state));
+            _overlayChunkArray = sharedChunkCacheForVolume(_overlayVolume, streamingCacheCapacityBytes(_state), _state);
         } catch (const std::exception&) {
             _overlayChunkArray.reset();
         }
