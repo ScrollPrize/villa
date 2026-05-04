@@ -1586,20 +1586,28 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
         return viewer->surfaceCoordsToScene(surfX, surfY);
     };
 
-    // Calculate grid-to-scene scale from adjacent cells
-    QPointF p0 = gridToScene(0, 0);
-    QPointF p1 = gridToScene(0, 1);
-    qreal gridToSceneScale = std::hypot(p1.x() - p0.x(), p1.y() - p0.y());
+    // Calculate per-axis grid-to-scene scale from adjacent cells. Approval
+    // mask pixels are addressed as grid samples, so pixel centers should land
+    // on the same grid positions used by the brush hit-test.
+    const QPointF grid00 = gridToScene(0, 0);
+    const QPointF grid01 = gridToScene(0, 1);
+    const QPointF grid10 = gridToScene(1, 0);
+    const QPointF colStep = grid01 - grid00;
+    const QPointF rowStep = grid10 - grid00;
+    const qreal gridToSceneScaleX = std::hypot(colStep.x(), colStep.y());
+    const qreal gridToSceneScaleY = std::hypot(rowStep.x(), rowStep.y());
 
-    if (gridToSceneScale < 1e-6) {
+    if (gridToSceneScaleX < 1e-6 || gridToSceneScaleY < 1e-6) {
         return;
     }
 
     // Render the composite image as a single scaled image overlay
-    QPointF topLeft = gridToScene(0, 0);
+    const QPointF topLeft = grid00 - colStep * 0.5 - rowStep * 0.5;
     const qreal opacity = static_cast<qreal>(_approvalMaskOpacity) / 100.0;
 
-    builder.addImage(cache.compositeImage, topLeft, gridToSceneScale, opacity, kApprovalMaskZ);
+    builder.addImage(cache.compositeImage, topLeft,
+                     gridToSceneScaleX, gridToSceneScaleY,
+                     opacity, kApprovalMaskZ);
 }
 
 void SegmentationOverlayController::buildSurfaceOverlapOverlay(

@@ -3134,7 +3134,7 @@ void CWindow::onSegmentationDirChanged(int index)
             _viewerManager->resetStrideUserOverride();
         }
         if (_surfacePanel) {
-            _surfacePanel->loadSurfaces(false);
+            _surfacePanel->loadSurfaces(true);
         }
 
         // Update the status bar to show the change

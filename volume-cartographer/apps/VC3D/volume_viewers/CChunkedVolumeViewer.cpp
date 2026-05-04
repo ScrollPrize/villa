@@ -1108,6 +1108,7 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camSurfY = _surfacePtrY;
     _camScale = _scale;
     updateFocusMarker();
+    updateOverlayGroupPreviewTransforms();
 }
 
 bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
@@ -3166,11 +3167,22 @@ cv::Vec3f CChunkedVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
 void CChunkedVolumeViewer::setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items)
 {
     clearOverlayGroup(key);
-    _overlayGroups[key] = items;
+    OverlayGroupEntry entry;
+    entry.items = items;
+    entry.basePositions.reserve(items.size());
+    entry.baseTransforms.reserve(items.size());
+    entry.camSurfX = _camSurfX;
+    entry.camSurfY = _camSurfY;
+    entry.camScale = _camScale;
     for (auto* item : items) {
-        if (item && !item->scene())
+        if (item && !item->scene()) {
             _scene->addItem(item);
+        }
+        entry.basePositions.push_back(item ? item->pos() : QPointF());
+        entry.baseTransforms.push_back(item ? item->transform() : QTransform());
     }
+    _overlayGroups[key] = std::move(entry);
+    updateOverlayGroupPreviewTransforms();
 }
 
 void CChunkedVolumeViewer::clearOverlayGroup(const std::string& key)
@@ -3178,15 +3190,15 @@ void CChunkedVolumeViewer::clearOverlayGroup(const std::string& key)
     auto it = _overlayGroups.find(key);
     if (it == _overlayGroups.end())
         return;
-    for (auto* item : it->second)
+    for (auto* item : it->second.items)
         delete item;
     _overlayGroups.erase(it);
 }
 
 void CChunkedVolumeViewer::clearAllOverlayGroups()
 {
-    for (auto& [_, items] : _overlayGroups) {
-        for (auto* item : items)
+    for (auto& [_, entry] : _overlayGroups) {
+        for (auto* item : entry.items)
             delete item;
     }
     _overlayGroups.clear();
@@ -3416,6 +3428,42 @@ void CChunkedVolumeViewer::updateIntersectionPreviewTransform()
     for (auto* item : _intersectionItems) {
         if (item)
             item->setTransform(transform);
+    }
+}
+
+void CChunkedVolumeViewer::updateOverlayGroupPreviewTransforms()
+{
+    if (_overlayGroups.empty() || _camScale <= 0.0f || _framebuffer.isNull()) {
+        return;
+    }
+
+    const qreal vpCx = qreal(_framebuffer.width()) * 0.5;
+    const qreal vpCy = qreal(_framebuffer.height()) * 0.5;
+    for (auto& [_, entry] : _overlayGroups) {
+        if (entry.camScale <= 0.0f) {
+            continue;
+        }
+
+        const qreal scale = qreal(_camScale / entry.camScale);
+        const qreal tx = (qreal(entry.camSurfX) - qreal(_camSurfX)) * qreal(_camScale)
+                       + vpCx - vpCx * scale;
+        const qreal ty = (qreal(entry.camSurfY) - qreal(_camSurfY)) * qreal(_camScale)
+                       + vpCy - vpCy * scale;
+        const QTransform localScale = QTransform::fromScale(scale, scale);
+
+        const std::size_t count = std::min({entry.items.size(),
+                                            entry.basePositions.size(),
+                                            entry.baseTransforms.size()});
+        for (std::size_t i = 0; i < count; ++i) {
+            QGraphicsItem* item = entry.items[i];
+            if (!item) {
+                continue;
+            }
+            const QPointF basePos = entry.basePositions[i];
+            item->setPos(QPointF(basePos.x() * scale + tx,
+                                 basePos.y() * scale + ty));
+            item->setTransform(localScale * entry.baseTransforms[i]);
+        }
     }
 }
 

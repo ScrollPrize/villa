@@ -118,7 +118,8 @@ public:
     struct ImagePrimitive {
         QImage image;
         QPointF offset{0.0, 0.0};  // Scene-space offset (like setOffset)
-        qreal scale{1.0};           // Uniform scale factor (like setScale)
+        qreal scaleX{1.0};
+        qreal scaleY{1.0};
         qreal opacity{1.0};
         qreal z{0.0};
     };
@@ -204,6 +205,13 @@ protected:
         void addImage(const QImage& image,
                       const QPointF& offset,
                       qreal scale,
+                      qreal opacity,
+                      qreal z);
+
+        void addImage(const QImage& image,
+                      const QPointF& offset,
+                      qreal scaleX,
+                      qreal scaleY,
                       qreal opacity,
                       qreal z);
 
