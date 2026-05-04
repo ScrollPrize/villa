@@ -96,6 +96,17 @@ static QStringList applicationRelativeExecutablePaths(const QString& name)
     return candidates;
 }
 
+static QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return QString();
+    }
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl());
+    }
+    return QString::fromStdString(volume->path().string());
+}
+
 static QString findExecutable(
     const QString& name,
     const QStringList& extraPaths = {},
@@ -1270,7 +1281,7 @@ QString SegmentationCommandHandler::getCurrentVolumePath() const
     if (_state->currentVolume() == nullptr) {
         return QString();
     }
-    return QString::fromStdString(_state->currentVolume()->path().string());
+    return commandPathForVolume(_state->currentVolume());
 }
 
 QString SegmentationCommandHandler::getCurrentRenderVolumePath(QString* remoteUrlOut) const
@@ -1347,7 +1358,7 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
         VolumeSelector::VolumeOption opt;
         opt.id = QString::fromStdString(volumeId);
         opt.name = QString::fromStdString(volume->name());
-        opt.path = QString::fromStdString(volume->path().string());
+        opt.path = commandPathForVolume(volume);
         options.push_back(opt);
     }
 
@@ -1365,6 +1376,38 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
     }
 
     return options;
+}
+
+void SegmentationCommandHandler::configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath)
+{
+    if (!_cmdRunner) {
+        return;
+    }
+
+    _cmdRunner->setRemoteVolumeUrl(QString());
+    _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
+
+    if (!_state || !_state->vpkg() || volumePath.isEmpty()) {
+        return;
+    }
+
+    for (const auto& volumeId : _state->vpkg()->volumeIDs()) {
+        auto volume = _state->vpkg()->volume(volumeId);
+        if (!volume || !volume->isRemote()) {
+            continue;
+        }
+        if (commandPathForVolume(volume) != volumePath) {
+            continue;
+        }
+
+        const auto& auth = volume->remoteAuth();
+        _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteUrl()));
+        _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
+                                        QString::fromStdString(auth.secret_key),
+                                        QString::fromStdString(auth.session_token),
+                                        QString::fromStdString(auth.region));
+        return;
+    }
 }
 
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
@@ -1879,6 +1922,7 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
                                       QString::fromStdString(surf->path.string()),
                                       outputDirPath,
                                       QStringLiteral("local"));
+    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
     _cmdRunner->setOmpThreads(ompThreads);
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
@@ -2263,6 +2307,7 @@ bool SegmentationCommandHandler::startNeighborCopyPass(const QString& paramsPath
     }
 
     auto& job = *_neighborCopyJob;
+    configureCommandRunnerRemoteAuthForVolumePath(job.volumePath);
     _cmdRunner->setNeighborCopyParams(
         job.volumePath,
         paramsPath,

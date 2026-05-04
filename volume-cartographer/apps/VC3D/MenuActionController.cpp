@@ -1498,6 +1498,7 @@ void MenuActionController::setOutputSegments()
         QObject::tr("Where new segments will land:"), items, currentIdx, false, &ok);
     if (!ok || chosen.isEmpty()) return;
     pkg->setOutputSegments(chosen.toStdString());
+    _window->refreshCurrentVolumePackageUi(QString(), true);
 }
 
 bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut)

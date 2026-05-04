@@ -213,6 +213,43 @@ void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
     opened.fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
 }
 
+void addPhysicalLevel(OpenedChunkedZarr& opened, int physicalLevel, utils::ZarrArray array)
+{
+    if (physicalLevel < 0)
+        throw std::runtime_error("zarr physical level must be non-negative");
+
+    const auto index = static_cast<std::size_t>(physicalLevel);
+    if (opened.shapes.size() <= index) {
+        opened.levelNumbers.resize(index + 1, -1);
+        opened.transforms.resize(index + 1);
+        opened.shapes.resize(index + 1, {0, 0, 0});
+        opened.chunkShapes.resize(index + 1, {1, 1, 1});
+        opened.fetchers.resize(index + 1);
+    }
+    if (opened.fetchers[index])
+        throw std::runtime_error("duplicate zarr physical level " + std::to_string(physicalLevel));
+
+    OpenedChunkedZarr single;
+    addLevel(single, std::move(array));
+    const bool hasExistingLevel = std::any_of(
+        opened.fetchers.begin(),
+        opened.fetchers.end(),
+        [](const auto& fetcher) { return static_cast<bool>(fetcher); });
+    if (hasExistingLevel && opened.dtype != single.dtype)
+        throw std::runtime_error("streaming zarr fetcher requires all levels to have the same dtype");
+
+    opened.levelNumbers[index] = physicalLevel;
+    opened.shapes[index] = single.shapes[0];
+    opened.chunkShapes[index] = single.chunkShapes[0];
+    IChunkedArray::LevelTransform transform;
+    const double invScale = 1.0 / static_cast<double>(std::uint64_t{1} << physicalLevel);
+    transform.scaleFromLevel0 = {invScale, invScale, invScale};
+    opened.transforms[index] = transform;
+    opened.fillValue = single.fillValue;
+    opened.dtype = single.dtype;
+    opened.fetchers[index] = std::move(single.fetchers[0]);
+}
+
 std::vector<int> localLevelNumbers(const std::filesystem::path& root)
 {
     std::vector<int> levels;
@@ -233,7 +270,7 @@ std::vector<int> localLevelNumbers(const std::filesystem::path& root)
     return levels;
 }
 
-std::vector<std::string> remoteLevelKeysFromZattrs(
+std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
     const std::shared_ptr<utils::Store>& store,
     int firstLevel)
 {
@@ -252,7 +289,7 @@ std::vector<std::string> remoteLevelKeysFromZattrs(
     if (!ms0.contains("datasets") || !ms0["datasets"].is_array())
         return {};
 
-    std::vector<std::string> keys;
+    std::vector<std::pair<int, std::string>> keys;
     int datasetIndex = 0;
     for (const auto& dataset : ms0["datasets"]) {
         if (!dataset.contains("path") || !dataset["path"].is_string()) {
@@ -265,7 +302,7 @@ std::vector<std::string> remoteLevelKeysFromZattrs(
         while (!path.empty() && path.back() == '/')
             path.pop_back();
         if (!path.empty() && datasetIndex >= firstLevel)
-            keys.push_back(std::move(path));
+            keys.emplace_back(datasetIndex, std::move(path));
         ++datasetIndex;
     }
     return keys;
@@ -274,12 +311,13 @@ std::vector<std::string> remoteLevelKeysFromZattrs(
 void addRemoteLevelFromKey(
     OpenedChunkedZarr& opened,
     const std::shared_ptr<utils::Store>& store,
-    const std::string& key)
+    const std::string& key,
+    int physicalLevel)
 {
     auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
     if (array.metadata().dtype == utils::ZarrDtype::uint16)
         array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
-    addLevel(opened, std::move(array));
+    addPhysicalLevel(opened, physicalLevel, std::move(array));
 }
 
 } // namespace
@@ -294,13 +332,13 @@ OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root)
             array = utils::ZarrArray::open(root / std::to_string(level),
                                            vc::buildZarrCodecRegistry(2));
         }
-        addLevel(opened, std::move(array));
+        addPhysicalLevel(opened, level, std::move(array));
     }
     if (opened.fetchers.empty()) {
         auto array = utils::ZarrArray::open(root, vc::buildZarrCodecRegistry(1));
         if (array.metadata().dtype == utils::ZarrDtype::uint16)
             array = utils::ZarrArray::open(root, vc::buildZarrCodecRegistry(2));
-        addLevel(opened, std::move(array));
+        addPhysicalLevel(opened, 0, std::move(array));
     }
     return opened;
 }
@@ -316,8 +354,8 @@ OpenedChunkedZarr openHttpZarrPyramid(
 
     const auto zattrsLevelKeys = remoteLevelKeysFromZattrs(store, firstPhysicalLevel);
     if (!zattrsLevelKeys.empty()) {
-        for (const auto& key : zattrsLevelKeys) {
-            addRemoteLevelFromKey(opened, store, key);
+        for (const auto& [physicalLevel, key] : zattrsLevelKeys) {
+            addRemoteLevelFromKey(opened, store, key, physicalLevel);
         }
         return opened;
     }
@@ -325,7 +363,7 @@ OpenedChunkedZarr openHttpZarrPyramid(
     for (int physicalLevel = firstPhysicalLevel; physicalLevel < 32; ++physicalLevel) {
         const auto key = std::to_string(physicalLevel);
         try {
-            addRemoteLevelFromKey(opened, store, key);
+            addRemoteLevelFromKey(opened, store, key, physicalLevel);
         } catch (const HttpStatusError& e) {
             if (e.status() == 404 ||
                 (e.status() == 403 && (!opened.fetchers.empty() || firstPhysicalLevel == 0)))
@@ -341,7 +379,7 @@ OpenedChunkedZarr openHttpZarrPyramid(
         auto array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(1));
         if (array.metadata().dtype == utils::ZarrDtype::uint16)
             array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(2));
-        addLevel(opened, std::move(array));
+        addPhysicalLevel(opened, 0, std::move(array));
     }
     return opened;
 }

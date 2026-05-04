@@ -129,7 +129,7 @@ public:
         }
         volume_ = vpkg_->volume(volume_id);
         std::cout << "Using volume: " << volume_id << " (" << volume_->name() << ")" << std::endl;
-        auto [w, h, d] = volume_->shape();
+        auto [w, h, d] = volume_->shapeXyz();
         std::cout << "Volume dimensions: " << w << "x" << h << "x" << d << std::endl;
     }
 

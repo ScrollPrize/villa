@@ -2,18 +2,56 @@
 #include <iostream>
 
 #include "common.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
-
 #include <vc/ui/VCCollection.hpp>
 #include <vc/core/util/GridStore.hpp>
-#include "vc/core/types/VcDataset.hpp"
-#include "vc/core/util/Slicing.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <boost/program_options.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <optional>
+
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
+
+namespace {
+
+std::optional<int> parseScaleLevelDatasetName(const std::string& datasetName,
+                                              size_t numScales,
+                                              std::ostream& err)
+{
+    if (datasetName.empty()) {
+        err << "Error: --dataset must be a numeric zarr scale-level dataset name, e.g. 0 or 1." << std::endl;
+        return std::nullopt;
+    }
+
+    size_t pos = 0;
+    int level = 0;
+    try {
+        level = std::stoi(datasetName, &pos);
+    } catch (const std::exception&) {
+        err << "Error: --dataset must be a numeric zarr scale-level dataset name, got '"
+            << datasetName << "'." << std::endl;
+        return std::nullopt;
+    }
+
+    if (pos != datasetName.size() || level < 0) {
+        err << "Error: --dataset must be a non-negative numeric zarr scale-level dataset name, got '"
+            << datasetName << "'." << std::endl;
+        return std::nullopt;
+    }
+
+    if (static_cast<size_t>(level) >= numScales) {
+        err << "Error: zarr scale level " << level << " is not available; volume has "
+            << numScales << " scale level" << (numScales == 1 ? "" : "s")
+            << ". For a root-array zarr without level datasets, use --dataset 0." << std::endl;
+        return std::nullopt;
+    }
+
+    return level;
+}
+
+} // namespace
 
 // A simple tensor implementation based on a vector of cv::Mat_
 template <typename T>
@@ -122,13 +160,19 @@ int continuous3d_main(const po::variables_map& vm) {
 
     std::cout << "Found point " << *target_point << " for winding " << target_winding << std::endl;
 
-    auto ds = std::make_unique<vc::VcDataset>(volume_path / dataset_name);
-    if (!ds) {
-        std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;
+    Volume volume(volume_path);
+    volume.setCacheBudget(4llu * 1024 * 1024 * 1024);
+    const auto parsedLevel = parseScaleLevelDatasetName(dataset_name, volume.numScales(), std::cerr);
+    if (!parsedLevel) {
         return 1;
     }
-
-    auto shape = ds->shape();
+    const int level = *parsedLevel;
+    auto shapeArray = volume.shape(level);
+    std::vector<size_t> shape = {
+        static_cast<size_t>(shapeArray[0]),
+        static_cast<size_t>(shapeArray[1]),
+        static_cast<size_t>(shapeArray[2]),
+    };
     std::cout << "Volume shape: (" << shape[0] << ", " << shape[1] << ", " << shape[2] << ")" << std::endl;
 
     StupidTensor<uint8_t> volume_slice(cv::Size(box_w, box_h), box_d);
@@ -140,11 +184,7 @@ int continuous3d_main(const po::variables_map& vm) {
     };
 
     Array3D<uint8_t> slice_data({(size_t)box_d, (size_t)box_h, (size_t)box_w});
-
-    auto cache = vc::render::createChunkCache(
-        vc::render::openLocalZarrPyramid(ds->path()),
-        4llu*1024*1024*1024);
-    readArea3D(slice_data, offset, cache.get(), 0);
+    volume.readZYX(slice_data, {offset[0], offset[1], offset[2]}, level);
 
     for (int z = 0; z < box_d; ++z) {
         for (int y = 0; y < box_h; ++y) {

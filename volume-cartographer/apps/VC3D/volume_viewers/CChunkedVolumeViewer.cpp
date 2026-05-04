@@ -6,7 +6,6 @@
 #include "ViewerManager.hpp"
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "render/ChunkCache.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -118,21 +117,6 @@ int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
             return -1;
     }
     return axis;
-}
-
-std::vector<vc::render::ChunkCache::LevelInfo>
-makeLevelInfo(const vc::render::OpenedChunkedZarr& opened)
-{
-    std::vector<vc::render::ChunkCache::LevelInfo> levels;
-    levels.reserve(opened.fetchers.size());
-    for (std::size_t i = 0; i < opened.fetchers.size(); ++i) {
-        vc::render::ChunkCache::LevelInfo level;
-        level.shape = opened.shapes[i];
-        level.chunkShape = opened.chunkShapes[i];
-        level.transform = opened.transforms[i];
-        levels.push_back(level);
-    }
-    return levels;
 }
 
 std::string stableHexHash(const std::string& value)
@@ -514,27 +498,17 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     if (!volume)
         return nullptr;
 
-    const bool isRemote = volume->isRemote();
-    vc::render::OpenedChunkedZarr opened = isRemote
-        ? vc::render::openHttpZarrPyramid(
-              volume->remoteUrl(), volume->remoteAuth(), volume->baseScaleLevel())
-        : vc::render::openLocalZarrPyramid(volume->path());
-
-    if (opened.fetchers.empty())
-        return nullptr;
-
     vc::render::ChunkCache::Options options;
     options.decodedByteCapacity = decodedByteCapacity > 0
         ? decodedByteCapacity
         : streamingCacheCapacityBytes(nullptr);
     options.maxConcurrentReads = 16;
-    if (isRemote) {
+    if (volume->isRemote()) {
         const auto cacheRoot = remoteCacheRootForState(state);
         options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
     }
 
-    return std::make_shared<vc::render::ChunkCache>(
-        makeLevelInfo(opened), opened.fetchers, opened.fillValue, opened.dtype, options);
+    return volume->createChunkCache(std::move(options));
 }
 
 std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
@@ -965,6 +939,7 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
         return;
 
     auto surf = _surfWeak.lock();
+    const bool isPlaneSurface = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         plane->setOrigin(poi->p);
         if (cv::norm(poi->n) > 0.5f)
@@ -977,14 +952,15 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     updateStatusLabel();
     emit overlaysUpdated();
     scheduleRender("focus POI changed");
-    renderIntersections("focus POI changed");
+    if (!isPlaneSurface || !poi->suppressTransientPlaneIntersections)
+        renderIntersections("focus POI changed");
 }
 
 void CChunkedVolumeViewer::ensureDefaultSurface()
 {
     if (_surfWeak.lock() || !_volume || !isAxisAlignedView())
         return;
-    const auto shape = _volume->shape();
+    const auto shape = _volume->shapeXyz();
     cv::Vec3f center(static_cast<float>(shape[0]) * 0.5f,
                      static_cast<float>(shape[1]) * 0.5f,
                      static_cast<float>(shape[2]) * 0.5f);
@@ -1012,7 +988,7 @@ void CChunkedVolumeViewer::updateContentBounds()
     if (!plane)
         return;
 
-    const auto [w, h, d] = _volume->shape();
+    const auto [w, h, d] = _volume->shapeXyz();
     const float corners[][3] = {
         {0, 0, 0}, {float(w), 0, 0}, {0, float(h), 0}, {float(w), float(h), 0},
         {0, 0, float(d)}, {float(w), 0, float(d)}, {0, float(h), float(d)}, {float(w), float(h), float(d)}
@@ -2741,7 +2717,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
 {
     float maxZ = 10000.0f;
     if (_volume) {
-        const auto [w, h, d] = _volume->shape();
+        const auto [w, h, d] = _volume->shapeXyz();
         maxZ = static_cast<float>(std::max({w, h, d}));
     }
     _zOff = std::clamp(_zOff + delta, -maxZ, maxZ);
@@ -3034,20 +3010,19 @@ QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
 {
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    const qreal vx = (surfX - _camSurfX) * _camScale + vpCx;
-    const qreal vy = (surfY - _camSurfY) * _camScale + vpCy;
-    return _view->mapToScene(QPointF(vx, vy).toPoint());
+    const qreal vx = (surfX - _surfacePtrX) * _scale + vpCx;
+    const qreal vy = (surfY - _surfacePtrY) * _scale + vpCy;
+    return QPointF(vx, vy);
 }
 
 cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
 {
-    if (_framebuffer.isNull() || _camScale <= 0.0f)
+    if (_framebuffer.isNull() || _scale <= 0.0f)
         return {0, 0};
-    const QPoint vp = _view->mapFromScene(scenePos);
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    return {(static_cast<float>(vp.x()) - vpCx) / _camScale + _camSurfX,
-            (static_cast<float>(vp.y()) - vpCy) / _camScale + _camSurfY};
+    return {(static_cast<float>(scenePos.x()) - vpCx) / _scale + _surfacePtrX,
+            (static_cast<float>(scenePos.y()) - vpCy) / _scale + _surfacePtrY};
 }
 
 QRectF CChunkedVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const
@@ -3514,7 +3489,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     fp.flattenedPlanesHash = planesHash;
     fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
     fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
-    fp.indexSamplingStride = patchIndex->samplingStride();
+    fp.indexSamplingStride = 1;
     fp.patchCount = patchIndex->patchCount();
     fp.surfaceCount = patchIndex->surfaceCount();
     fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
@@ -3537,13 +3512,13 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
 
     Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
     if (_volume) {
-        auto [w, h, d] = _volume->shape();
+        auto [w, h, d] = _volume->shapeXyz();
         allBounds.high = {static_cast<float>(w),
                           static_cast<float>(h),
                           static_cast<float>(d)};
     }
 
-    const float clipTol = std::max(_intersectionThickness, 1e-4f);
+    const float clipTol = 1e-4f;
     const float penWidth = std::max(_intersectionThickness,
                                     kActiveIntersectionMinWidthDelta);
     const float opacity = std::clamp(
@@ -3569,7 +3544,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     auto cellBounds = [&]() {
         return cv::Rect(0, 0, points->cols - 1, points->rows - 1);
     };
-    const int stride = std::max(1, patchIndex->samplingStride());
+    const int stride = 1;
     const bool cacheCompatible =
         _flattenedIntersectionCache.valid &&
         _flattenedIntersectionCache.surface == activeSeg.get() &&

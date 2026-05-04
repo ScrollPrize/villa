@@ -13,6 +13,7 @@
 namespace vc::render {
 
 struct OpenedChunkedZarr {
+    std::vector<int> levelNumbers;
     std::vector<IChunkedArray::LevelTransform> transforms;
     std::vector<std::array<int, 3>> shapes;
     std::vector<std::array<int, 3>> chunkShapes;

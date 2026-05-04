@@ -350,7 +350,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
-    qApp->installEventFilter(this);
     const QString baseTitle = windowTitle();
     const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
     if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
@@ -863,33 +862,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 viewer, &CChunkedVolumeViewer::onMouseMove, Qt::UniqueConnection);
         connect(graphicsView, &CVolumeViewerView::sendMouseRelease,
                 viewer, &CChunkedVolumeViewer::onMouseRelease, Qt::UniqueConnection);
-        if (!graphicsView->property("vc_segmentation_push_pull_keys_bound").toBool()) {
-            connect(graphicsView, &CVolumeViewerView::sendKeyPress,
-                    this, [this](int key, Qt::KeyboardModifiers modifiers) {
-                        if (key != vc3d::keybinds::keypress::PushPullIn.key &&
-                            key != vc3d::keybinds::keypress::PushPullOut.key) {
-                            return;
-                        }
-                        if (!_segmentationModule) {
-                            return;
-                        }
-                        QKeyEvent event(QEvent::KeyPress, key, modifiers);
-                        _segmentationModule->handleKeyPress(&event);
-                    });
-            connect(graphicsView, &CVolumeViewerView::sendKeyRelease,
-                    this, [this](int key, Qt::KeyboardModifiers modifiers) {
-                        if (key != vc3d::keybinds::keypress::PushPullIn.key &&
-                            key != vc3d::keybinds::keypress::PushPullOut.key) {
-                            return;
-                        }
-                        if (!_segmentationModule) {
-                            return;
-                        }
-                        QKeyEvent event(QEvent::KeyRelease, key, modifiers);
-                        _segmentationModule->handleKeyRelease(&event);
-                    });
-            graphicsView->setProperty("vc_segmentation_push_pull_keys_bound", true);
-        }
     }
 
     if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
@@ -1027,7 +999,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     updateNormalGridAvailability();
 
     if (_state->currentVolume() && _state) {
-        auto [w, h, d] = _state->currentVolume()->shape();
+        auto [w, h, d] = _state->currentVolume()->shapeXyz();
         float x0 = 0, y0 = 0, z0 = 0;
         float x1 = static_cast<float>(w - 1), y1 = static_cast<float>(h - 1), z1 = static_cast<float>(d - 1);
 
@@ -1082,6 +1054,8 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     if (_segmentationWidget) {
         _segmentationWidget->setVolumePackagePath(_state->vpkgPath());
     }
+
+    updateNormalGridAvailability();
 
     refreshVolumeSelectionUi(preferredVolumeId);
     if (!_state->vpkg()->hasVolumes()) {
@@ -1214,6 +1188,7 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
         focus->surfaceId = "segmentation";
     }
 
+    focus->suppressTransientPlaneIntersections = true;
     _state->setPOI("focus", focus);
     recenterSegmentationViewerNear(position);
 
@@ -1538,7 +1513,7 @@ void CWindow::CreateWidgets(void)
                     normal = cv::Vec3f(0, 0, 1);
                 }
                 if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shape();
+                    auto [w, h, d] = vol->shapeXyz();
                     cv::Vec3f clamped = worldCenter;
                     clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
                     clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
@@ -2265,51 +2240,6 @@ void CWindow::CreateWidgets(void)
 
 }
 
-bool CWindow::eventFilter(QObject* watched, QEvent* event)
-{
-    if (!event) {
-        return QMainWindow::eventFilter(watched, event);
-    }
-
-    const QEvent::Type type = event->type();
-    if (type != QEvent::ShortcutOverride &&
-        type != QEvent::KeyPress &&
-        type != QEvent::KeyRelease) {
-        return QMainWindow::eventFilter(watched, event);
-    }
-
-    auto* keyEvent = static_cast<QKeyEvent*>(event);
-    const bool pushPullKey =
-        keyEvent->key() == vc3d::keybinds::keypress::PushPullIn.key ||
-        keyEvent->key() == vc3d::keybinds::keypress::PushPullOut.key;
-    const Qt::KeyboardModifiers disallowedMods = keyEvent->modifiers() &
-                                                 ~(Qt::ControlModifier | Qt::KeypadModifier);
-    if (!pushPullKey || disallowedMods != Qt::NoModifier) {
-        return QMainWindow::eventFilter(watched, event);
-    }
-
-    if (type == QEvent::ShortcutOverride) {
-        if (_segmentationModule) {
-            event->accept();
-            return true;
-        }
-        return QMainWindow::eventFilter(watched, event);
-    }
-
-    if (!_segmentationModule) {
-        return QMainWindow::eventFilter(watched, event);
-    }
-
-    const bool handled = type == QEvent::KeyPress
-        ? _segmentationModule->handleKeyPress(keyEvent)
-        : _segmentationModule->handleKeyRelease(keyEvent);
-    if (handled) {
-        return true;
-    }
-
-    return QMainWindow::eventFilter(watched, event);
-}
-
 // Create menus
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
@@ -2882,7 +2812,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
                 && worldCenter[0] >= 0.0f;
             if (centerValid) {
                 if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shape();
+                    auto [w, h, d] = vol->shapeXyz();
                     cv::Vec3f clamped = worldCenter;
                     clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
                     clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
@@ -3165,10 +3095,14 @@ void CWindow::onAppendMaskPressed(void)
 
 QString CWindow::getCurrentVolumePath() const
 {
-    if (_state->currentVolume() == nullptr) {
+    auto volume = _state->currentVolume();
+    if (volume == nullptr) {
         return QString();
     }
-    return QString::fromStdString(_state->currentVolume()->path().string());
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl());
+    }
+    return QString::fromStdString(volume->path().string());
 }
 
 void CWindow::onSegmentationDirChanged(int index)
@@ -3200,7 +3134,7 @@ void CWindow::onSegmentationDirChanged(int index)
             _viewerManager->resetStrideUserOverride();
         }
         if (_surfacePanel) {
-            _surfacePanel->loadSurfaces(false);
+            _surfacePanel->loadSurfaces(true);
         }
 
         // Update the status bar to show the change
@@ -3253,7 +3187,7 @@ void CWindow::onManualLocationChanged()
     }
 
     // Clamp values to physical volume bounds
-    auto [w, h, d] = _state->currentVolume()->shape();
+    auto [w, h, d] = _state->currentVolume()->shapeXyz();
     int cx0 = 0, cy0 = 0, cz0 = 0;
     int cx1 = w - 1, cy1 = h - 1, cz1 = d - 1;
 

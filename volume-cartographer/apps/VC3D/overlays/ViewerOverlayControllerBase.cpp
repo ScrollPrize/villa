@@ -192,10 +192,33 @@ void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
                                                             qreal opacity,
                                                             qreal z)
 {
+    addImage(image, offset, scale, scale, opacity, z);
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
+                                                            const QPointF& offset,
+                                                            qreal scaleX,
+                                                            qreal scaleY,
+                                                            qreal opacity,
+                                                            qreal z)
+{
     ImagePrimitive prim;
     prim.image = image;
     prim.offset = offset;
-    prim.scale = scale;
+    prim.transform = QTransform::fromScale(scaleX, scaleY);
+    prim.opacity = opacity;
+    prim.z = z;
+    _primitives.emplace_back(std::move(prim));
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
+                                                            const QTransform& transform,
+                                                            qreal opacity,
+                                                            qreal z)
+{
+    ImagePrimitive prim;
+    prim.image = image;
+    prim.transform = transform;
     prim.opacity = opacity;
     prim.z = z;
     _primitives.emplace_back(std::move(prim));
@@ -777,7 +800,7 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                     item->setOpacity(std::clamp(prim.opacity, 0.0, 1.0));
                     item->setZValue(prim.z);
                     item->setPos(prim.offset);
-                    item->setScale(prim.scale);
+                    item->setTransform(prim.transform);
 
                     scene->addItem(item);
                     items.push_back(item);
