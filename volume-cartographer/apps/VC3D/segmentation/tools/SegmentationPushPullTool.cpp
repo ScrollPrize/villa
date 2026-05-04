@@ -1064,8 +1064,8 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
     if (const auto touched = _editManager->recentTouchedBounds()) {
         const cv::Rect changedCells(touched->x - 1,
                                     touched->y - 1,
-                                    touched->width + 1,
-                                    touched->height + 1);
+                                    touched->width + 2,
+                                    touched->height + 2);
         viewer->invalidateVisRegion("segmentation", changedCells);
         viewer->invalidateIntersectRegion("segmentation", changedCells);
     } else {
