@@ -1006,9 +1006,10 @@ void SegmentationPushPullTool::setDeferredPlaneIntersections(VolumeViewerBase* a
         if (!candidate || candidate == activeViewer) {
             return;
         }
-        if (dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
-            candidate->setSegmentationIntersectionDeferral(defer);
+        if (defer && !dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
+            return;
         }
+        candidate->setSegmentationIntersectionDeferral(defer);
     });
 }
 
