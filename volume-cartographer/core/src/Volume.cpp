@@ -282,7 +282,11 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
 }
 
 template <typename T>
-void downsampleMeanZYX(Array3D<T>& out, const Array3D<T>& src, int factor)
+void downsampleMeanZYX(Array3D<T>& out,
+                       const Array3D<T>& src,
+                       const std::array<int, 3>& srcOffsetZYX,
+                       const std::array<int, 3>& srcVolumeShapeZYX,
+                       int factor)
 {
     const auto outShape = out.shape();
     const auto srcShape = src.shape();
@@ -301,10 +305,24 @@ void downsampleMeanZYX(Array3D<T>& out, const Array3D<T>& src, int factor)
                 for (int dz = 0; dz < factor; ++dz) {
                     for (int dy = 0; dy < factor; ++dy) {
                         for (int dx = 0; dx < factor; ++dx) {
-                            const std::size_t sz = std::min(srcZ0 + static_cast<std::size_t>(dz), srcShape[0] - 1);
-                            const std::size_t sy = std::min(srcY0 + static_cast<std::size_t>(dy), srcShape[1] - 1);
-                            const std::size_t sx = std::min(srcX0 + static_cast<std::size_t>(dx), srcShape[2] - 1);
-                            sum += src(sz, sy, sx);
+                            const int absZ = std::clamp(
+                                srcOffsetZYX[0] + static_cast<int>(srcZ0) + dz,
+                                0,
+                                srcVolumeShapeZYX[0] - 1);
+                            const int absY = std::clamp(
+                                srcOffsetZYX[1] + static_cast<int>(srcY0) + dy,
+                                0,
+                                srcVolumeShapeZYX[1] - 1);
+                            const int absX = std::clamp(
+                                srcOffsetZYX[2] + static_cast<int>(srcX0) + dx,
+                                0,
+                                srcVolumeShapeZYX[2] - 1);
+                            const std::size_t sz = static_cast<std::size_t>(absZ - srcOffsetZYX[0]);
+                            const std::size_t sy = static_cast<std::size_t>(absY - srcOffsetZYX[1]);
+                            const std::size_t sx = static_cast<std::size_t>(absX - srcOffsetZYX[2]);
+                            if (sz < srcShape[0] && sy < srcShape[1] && sx < srcShape[2]) {
+                                sum += src(sz, sy, sx);
+                            }
                         }
                     }
                 }
@@ -823,7 +841,7 @@ static bool readVolumeZYXWithPolicy(Volume& volume,
         offsetZYX[2] * factor,
     };
     readFromChunkedArrayZYX(source, sourceOffset, *cache, sourceLevel);
-    downsampleMeanZYX(out, source, factor);
+    downsampleMeanZYX(out, source, sourceOffset, cache->shape(sourceLevel), factor);
     return true;
 }
 
