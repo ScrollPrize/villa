@@ -240,7 +240,7 @@ class SparseChunkGroupCache:
 
         Returns (C, D, H, W) — uint8 for non-diff, float32 for diff.
         """
-        check_enabled = os.environ.get("LASAGNA_CHECK_SPARSE_CACHE", "1") != "0"
+        check_enabled = os.environ.get("LASAGNA_CHECK_SPARSE_CACHE", "0") != "0"
         if check_enabled:
             self._check_sample_chunks_loaded(
                 xyz_fullres,
@@ -322,7 +322,7 @@ class SparseChunkGroupCache:
                 f"first_chunks_zyx={first_chunks.tolist()} "
                 f"first_local_xyz={first_local.tolist()} "
                 f"first_full_xyz={first_full.tolist()}. "
-                "Set LASAGNA_CHECK_SPARSE_CACHE=0 to disable this debug guard."
+                "Unset LASAGNA_CHECK_SPARSE_CACHE or set it to 0 to disable this debug guard."
             )
 
     def loaded_chunks(self) -> int:
