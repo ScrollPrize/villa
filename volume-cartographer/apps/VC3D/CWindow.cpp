@@ -2289,10 +2289,6 @@ bool CWindow::eventFilter(QObject* watched, QEvent* event)
     }
 
     if (type == QEvent::ShortcutOverride) {
-        if (_segmentationModule) {
-            event->accept();
-            return true;
-        }
         return QMainWindow::eventFilter(watched, event);
     }
 

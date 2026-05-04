@@ -303,13 +303,6 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 
 void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 {
-    const bool pushPullKey = event->key() == Qt::Key_A || event->key() == Qt::Key_D;
-    if (pushPullKey) {
-        emit sendKeyPress(event->key(), event->modifiers());
-        event->accept();
-        return;
-    }
-
     if (_scrollPanDisabled) {
         switch (event->key()) {
         case Qt::Key_Left:
