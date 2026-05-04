@@ -37,6 +37,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMainWindow>
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -475,11 +476,134 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     return true;
 }
 
-QString MenuActionController::remoteCacheDirectory() const
+QString MenuActionController::suggestedRemoteCacheDirectory() const
 {
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
-    QString cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
+    if (_window && _window->_state && _window->_state->vpkg()) {
+        const QString projectDir = QString::fromStdString(_window->_state->vpkg()->getVolpkgDirectory());
+        if (!projectDir.isEmpty()) {
+            return QDir(projectDir).filePath("remote_cache");
+        }
+    }
+
+    return vc3d::defaultCacheBase() + "/remote_cache";
+}
+
+QString MenuActionController::remoteVolumeRegistryCacheRoot() const
+{
+    const QString registryPath = remoteVolumeRegistryPath();
+    if (registryPath.isEmpty() || !QFileInfo::exists(registryPath)) {
+        return {};
+    }
+
+    try {
+        auto root = utils::Json::parse_file(registryPath.toStdString());
+        if (root.is_object() && root.contains("cache_root")) {
+            return QString::fromStdString(root.value("cache_root", std::string{})).trimmed();
+        }
+    } catch (const std::exception& e) {
+        Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
+    }
+
+    return {};
+}
+
+QString MenuActionController::configuredRemoteCacheDirectory() const
+{
+    if (_window && _window->_state && _window->_state->vpkg()) {
+        const QString projectCache =
+            QString::fromStdString(_window->_state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
+        if (!projectCache.isEmpty()) {
+            return projectCache;
+        }
+    }
+
+    const QString registryCache = remoteVolumeRegistryCacheRoot();
+    if (!registryCache.isEmpty()) {
+        return registryCache;
+    }
+
+    return {};
+}
+
+void MenuActionController::persistRemoteVolumeRegistryCacheRoot(const QString& cacheRoot)
+{
+    const QString registryPath = remoteVolumeRegistryPath();
+    if (registryPath.isEmpty() || cacheRoot.trimmed().isEmpty()) {
+        return;
+    }
+
+    utils::Json root = {
+        {"version", utils::Json(1)},
+        {"volumes", utils::Json::array()}
+    };
+
+    try {
+        if (QFileInfo::exists(registryPath)) {
+            root = utils::Json::parse_file(registryPath.toStdString());
+        }
+    } catch (const std::exception& e) {
+        Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
+        root = {
+            {"version", utils::Json(1)},
+            {"volumes", utils::Json::array()}
+        };
+    }
+
+    if (!root.is_object()) {
+        root = utils::Json::object();
+    }
+    if (!root.contains("volumes") || !root["volumes"].is_array()) {
+        root["volumes"] = utils::Json::array();
+    }
+    root["version"] = 1;
+    root["cache_root"] = cacheRoot.trimmed().toStdString();
+
+    std::ofstream output(registryPath.toStdString(), std::ofstream::out | std::ofstream::trunc);
+    output << root.dump(2) << '\n';
+}
+
+QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
+{
+    QString cacheDir = configuredRemoteCacheDirectory();
+    bool shouldPersistCacheRoot = !cacheDir.isEmpty();
+
+    if (cacheDir.isEmpty() && allowPrompt) {
+        bool ok = false;
+        cacheDir = QInputDialog::getText(
+            _window,
+            QObject::tr("Remote Cache Location"),
+            QObject::tr("Choose where this project should store downloaded remote volume chunks."),
+            QLineEdit::Normal,
+            suggestedRemoteCacheDirectory(),
+            &ok).trimmed();
+        if (!ok) {
+            return {};
+        }
+        shouldPersistCacheRoot = !cacheDir.isEmpty();
+    }
+
+    if (cacheDir.isEmpty()) {
+        // Legacy fallback for projects opened before a project/registry cache root existed.
+        // This path is non-prompting so startup and persisted remote loading stay quiet.
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
+        cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
+    }
+
+    if (QDir::isRelativePath(cacheDir)) {
+        cacheDir = QDir::cleanPath(QDir::current().absoluteFilePath(cacheDir));
+    }
+
+    if (shouldPersistCacheRoot && _window && _window->_state && _window->_state->vpkg()) {
+        auto pkg = _window->_state->vpkg();
+        if (!pkg->hasRemoteCacheRoot()) {
+            pkg->setRemoteCacheRoot(cacheDir.toStdString());
+        }
+    }
+    if (shouldPersistCacheRoot) {
+        persistRemoteVolumeRegistryCacheRoot(cacheDir);
+    }
+
     QDir().mkpath(cacheDir);
     return cacheDir;
 }
@@ -523,6 +647,10 @@ void MenuActionController::persistAttachedRemoteVolume(const QString& url, const
         root["volumes"] = utils::Json::array();
     }
     root["version"] = 1;
+    const QString cacheRoot = configuredRemoteCacheDirectory();
+    if (!cacheRoot.isEmpty()) {
+        root["cache_root"] = cacheRoot.toStdString();
+    }
 
     const std::string urlStd = url.trimmed().toStdString();
     const std::string idStd = volume->id();
@@ -581,12 +709,20 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
         return;
     }
 
+    if (root.contains("cache_root") && _window && _window->_state && _window->_state->vpkg()) {
+        const QString registryCacheRoot =
+            QString::fromStdString(root.value("cache_root", std::string{})).trimmed();
+        if (!registryCacheRoot.isEmpty() && !_window->_state->vpkg()->hasRemoteCacheRoot()) {
+            _window->_state->vpkg()->setRemoteCacheRoot(registryCacheRoot.toStdString());
+        }
+    }
+
     if (!root.contains("volumes") || !root["volumes"].is_array() || root["volumes"].empty()) {
         return;
     }
 
     const QString currentId = QString::fromStdString(_window->_state->currentVolumeId());
-    const QString cacheDir = remoteCacheDirectory();
+    const QString cacheDir = remoteCacheDirectory(false);
     int attachedCount = 0;
     int skippedCount = 0;
     QString firstAttachedId;
@@ -673,7 +809,10 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
         return;
     }
 
-    const QString cacheDir = remoteCacheDirectory();
+    const QString cacheDir = remoteCacheDirectory(true);
+    if (cacheDir.isEmpty()) {
+        return;
+    }
     updateRecentRemoteList(url);
     if (_attachRemoteZarrAct) {
         _attachRemoteZarrAct->setEnabled(false);
