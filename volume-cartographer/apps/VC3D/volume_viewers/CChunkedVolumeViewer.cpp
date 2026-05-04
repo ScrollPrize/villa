@@ -3012,18 +3012,17 @@ QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
     const qreal vx = (surfX - _surfacePtrX) * _scale + vpCx;
     const qreal vy = (surfY - _surfacePtrY) * _scale + vpCy;
-    return _view->mapToScene(QPointF(vx, vy).toPoint());
+    return QPointF(vx, vy);
 }
 
 cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
 {
     if (_framebuffer.isNull() || _scale <= 0.0f)
         return {0, 0};
-    const QPoint vp = _view->mapFromScene(scenePos);
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    return {(static_cast<float>(vp.x()) - vpCx) / _scale + _surfacePtrX,
-            (static_cast<float>(vp.y()) - vpCy) / _scale + _surfacePtrY};
+    return {(static_cast<float>(scenePos.x()) - vpCx) / _scale + _surfacePtrX,
+            (static_cast<float>(scenePos.y()) - vpCy) / _scale + _surfacePtrY};
 }
 
 QRectF CChunkedVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const

@@ -1558,17 +1558,23 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
         return;  // Mask image handled by renderIntersections()
     }
 
-    // For segmentation view (QuadSurface), render as image overlay
+    // For segmentation view (QuadSurface), render as a 2D image overlay in the
+    // viewer's current parameterization. The approval image pixels are addressed
+    // by the same grid coordinates used by the flattened brush.
+    auto* renderSurface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    if (!renderSurface) {
+        renderSurface = state.surface;
+    }
 
     // Check if we need to rebuild the COMPOSITE IMAGE (only when masks change, not when view changes)
     auto it = _viewerCaches.find(viewer);
     bool needsRebuild = (it == _viewerCaches.end()) ||
-                       (it->second.surface != state.surface) ||
+                       (it->second.surface != renderSurface) ||
                        (it->second.savedImageVersion != _savedImageVersion) ||
                        (it->second.pendingImageVersion != _pendingImageVersion);
 
     if (needsRebuild) {
-        rebuildViewerCache(viewer, state.surface);
+        rebuildViewerCache(viewer, renderSurface);
         it = _viewerCaches.find(viewer);
     }
 
@@ -1579,12 +1585,12 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
     const ViewerImageCache& cache = it->second;
 
-    const cv::Vec2f surfScale = state.surface->scale();
+    const cv::Vec2f surfScale = renderSurface->scale();
 
     // Grid index (row, col) -> surface coords, then to scene coords.
     // Surface space is centered: grid center = (0,0) in surface space.
     // Grid (0,0) maps to (-center.x, -center.y) in surface space.
-    const cv::Vec3f center = state.surface->center();
+    const cv::Vec3f center = renderSurface->center();
     auto gridToScene = [&](int row, int col) -> QPointF {
         const float surfX = static_cast<float>(col) / surfScale[0] - center[0];
         const float surfY = static_cast<float>(row) / surfScale[1] - center[1];
@@ -1596,22 +1602,19 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     const QPointF grid10 = gridToScene(1, 0);
     const QPointF colStep = grid01 - grid00;
     const QPointF rowStep = grid10 - grid00;
+    const qreal gridToSceneScaleX = std::hypot(colStep.x(), colStep.y());
+    const qreal gridToSceneScaleY = std::hypot(rowStep.x(), rowStep.y());
 
-    if (std::hypot(colStep.x(), colStep.y()) < 1e-6 ||
-        std::hypot(rowStep.x(), rowStep.y()) < 1e-6) {
+    if (gridToSceneScaleX < 1e-6 || gridToSceneScaleY < 1e-6) {
         return;
     }
 
-    // Map image pixel coordinates directly into scene coordinates:
-    // pixel (col,row) center -> surface grid (row,col). The half-pixel offset
-    // makes the painted mask pixel center line up with the brush grid index.
-    const QPointF topLeft = grid00 - colStep * 0.5 - rowStep * 0.5;
+    // Keep this identical in spirit to markerGridToScene(): image pixel
+    // (col,row) is drawn at the scene position for grid index (row,col).
     const qreal opacity = static_cast<qreal>(_approvalMaskOpacity) / 100.0;
-    const QTransform imageToScene(colStep.x(), colStep.y(),
-                                  rowStep.x(), rowStep.y(),
-                                  topLeft.x(), topLeft.y());
-
-    builder.addImage(cache.compositeImage, imageToScene, opacity, kApprovalMaskZ);
+    builder.addImage(cache.compositeImage, grid00,
+                     gridToSceneScaleX, gridToSceneScaleY,
+                     opacity, kApprovalMaskZ);
 }
 
 void SegmentationOverlayController::buildSurfaceOverlapOverlay(

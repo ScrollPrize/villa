@@ -91,7 +91,9 @@ void ApprovalMaskBrushTool::setActive(bool active)
     _module.refreshOverlay();
 }
 
-void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos)
+void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos,
+                                        const QPointF& surfacePos,
+                                        std::optional<std::pair<int, int>> gridIndex)
 {
     qCDebug(lcApprovalMask) << "Starting approval stroke at:" << worldPos[0] << worldPos[1] << worldPos[2]
                            << "surfacePos:" << surfacePos.x() << surfacePos.y();
@@ -116,6 +118,7 @@ void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF
     // Clear accumulated grid positions for real-time painting
     _accumulatedGridPositions.clear();
     _accumulatedGridPosSet.clear();
+    _lastGridSample.reset();
 
     // Disable plane effective radius mode for flattened view
     _usePlaneEffectiveRadius = false;
@@ -127,12 +130,11 @@ void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF
     _hoverEffectiveRadius = _module.approvalMaskBrushRadius();
 
     // Add the starting point for painting - compute grid position from surface coordinates
-    auto gridIdx = surfaceToGridIndex(surfacePos);
+    auto gridIdx = gridIndex ? gridIndex : surfaceToGridIndex(surfacePos);
     if (gridIdx) {
         qCDebug(lcApprovalMask) << "  Grid index:" << gridIdx->first << gridIdx->second;
-        const uint64_t hash = (static_cast<uint64_t>(gridIdx->first) << 32) | static_cast<uint64_t>(gridIdx->second);
-        _accumulatedGridPosSet.insert(hash);
-        _accumulatedGridPositions.push_back(*gridIdx);
+        addAccumulatedGridPosition(*gridIdx);
+        _lastGridSample = *gridIdx;
 
         // Paint immediately for instant feedback on first click
         paintAccumulatedPointsToImage();
@@ -143,14 +145,17 @@ void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF
     // Note: paintAccumulatedPointsToImage already calls refreshOverlay
 }
 
-void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos, bool forceSample)
+void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos,
+                                         const QPointF& surfacePos,
+                                         bool forceSample,
+                                         std::optional<std::pair<int, int>> gridIndex)
 {
     if (!_strokeActive) {
         return;
     }
 
     // Check if position is within valid surface bounds using surface coordinates
-    auto gridIdx = surfaceToGridIndex(surfacePos);
+    auto gridIdx = gridIndex ? gridIndex : surfaceToGridIndex(surfacePos);
     if (!gridIdx) {
         // Outside valid surface area - break the current stroke segment
         // but keep stroke active so we can start a new segment when back in bounds
@@ -168,6 +173,7 @@ void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos, const QPoint
         // Reset last sample tracking so we don't interpolate across the gap
         _hasLastSample = false;
         _hasLastOverlaySample = false;
+        _lastGridSample.reset();
         return;
     }
 
@@ -208,12 +214,14 @@ void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos, const QPoint
     // For flattened view, use full brush radius (no effective radius calculation needed)
     _hoverEffectiveRadius = _module.approvalMaskBrushRadius();
 
-    // Accumulate grid position for real-time painting (reuse gridIdx from above)
-    // We know gridIdx is valid here because we would have returned early if it was nullopt
-    const uint64_t hash = (static_cast<uint64_t>(gridIdx->first) << 32) | static_cast<uint64_t>(gridIdx->second);
-    if (_accumulatedGridPosSet.insert(hash).second) {
-        _accumulatedGridPositions.push_back(*gridIdx);
+    // Accumulate all image-space grid positions between mouse events so fast
+    // strokes stay continuous even when Qt coalesces move events.
+    if (_lastGridSample) {
+        addInterpolatedGridPositions(*_lastGridSample, *gridIdx);
+    } else {
+        addAccumulatedGridPosition(*gridIdx);
     }
+    _lastGridSample = *gridIdx;
 
     // Paint with time-based throttling to avoid performance issues
     // Paint every 50ms or when we have accumulated enough points
@@ -291,6 +299,7 @@ void ApprovalMaskBrushTool::finishStroke()
 
     _hasLastSample = false;
     _hasLastOverlaySample = false;
+    _lastGridSample.reset();
 
     // Refresh on finish to show final state (even if throttled during drawing)
     if (_pendingRefresh) {
@@ -340,6 +349,7 @@ bool ApprovalMaskBrushTool::applyPending(float /*dragRadiusSteps*/)
     _overlayStrokeSegments.clear();
     _accumulatedGridPositions.clear();
     _accumulatedGridPosSet.clear();
+    _lastGridSample.reset();
 
     _module.refreshOverlay();
 
@@ -359,6 +369,7 @@ void ApprovalMaskBrushTool::clear()
     _overlayStrokeSegments.clear();
     _accumulatedGridPositions.clear();
     _accumulatedGridPosSet.clear();
+    _lastGridSample.reset();
     _hasLastSample = false;
     _hasLastOverlaySample = false;
     _hasLastSearchCache = false;
@@ -391,10 +402,9 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
     const uint8_t paintValue = (_paintMode == PaintMode::Approve) ? 255 : 0;
 
     // Cylinder brush model:
-    // - Radius = circle in plane views, rectangle width in flattened view (diameter = 2*radius)
-    // - Depth = cylinder thickness, rectangle height in flattened view
+    // - Radius = circle in plane views and flattened view
+    // - Depth = cylinder thickness for plane-view hit testing
     const float brushRadiusNative = _module.approvalMaskBrushRadius();
-    const float brushDepthNative = _module.approvalBrushDepth();
 
     // Convert from native voxels to grid units for painting into the QImage
     float avgScale = 1.0f;
@@ -403,7 +413,6 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
         avgScale = (scale[0] + scale[1]) * 0.5f;
     }
     const float gridRadius = brushRadiusNative * avgScale;
-    const float gridDepth = brushDepthNative * avgScale;
 
     float paintRadius;
     float paintWidth = 0.0f;
@@ -416,12 +425,10 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
         paintRadius = 1.0f;
         useRectangle = false;  // Plane views paint individual cells
     } else {
-        // For segmentation/flattened view strokes: paint a rectangle (cylinder side view)
-        // Width = diameter (2 * radius), Height = depth
-        paintWidth = gridRadius * 2.0f;
-        paintHeight = gridDepth;
+        // For segmentation/flattened view strokes: paint a circular 2D brush
+        // directly in approval-mask image coordinates.
         paintRadius = gridRadius;
-        useRectangle = true;
+        useRectangle = false;
     }
     const float clampedRadius = std::clamp(paintRadius, 0.5f, 500.0f);
     const QColor brushColor = _module.approvalBrushColor();
@@ -436,6 +443,34 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
 
     // Trigger overlay refresh to show the updated image
     _module.refreshOverlay();
+}
+
+void ApprovalMaskBrushTool::addAccumulatedGridPosition(const std::pair<int, int>& gridIdx)
+{
+    const uint64_t hash = (static_cast<uint64_t>(gridIdx.first) << 32) |
+                          static_cast<uint32_t>(gridIdx.second);
+    if (_accumulatedGridPosSet.insert(hash).second) {
+        _accumulatedGridPositions.push_back(gridIdx);
+    }
+}
+
+void ApprovalMaskBrushTool::addInterpolatedGridPositions(const std::pair<int, int>& from,
+                                                         const std::pair<int, int>& to)
+{
+    const int dr = to.first - from.first;
+    const int dc = to.second - from.second;
+    const int steps = std::max(std::abs(dr), std::abs(dc));
+    if (steps <= 0) {
+        addAccumulatedGridPosition(to);
+        return;
+    }
+
+    for (int i = 1; i <= steps; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(steps);
+        const int row = static_cast<int>(std::lround(static_cast<float>(from.first) + static_cast<float>(dr) * t));
+        const int col = static_cast<int>(std::lround(static_cast<float>(from.second) + static_cast<float>(dc) * t));
+        addAccumulatedGridPosition({row, col});
+    }
 }
 
 std::vector<std::pair<int, int>> ApprovalMaskBrushTool::findGridCellsInSphere(const cv::Vec3f& worldPos, float radius) const
