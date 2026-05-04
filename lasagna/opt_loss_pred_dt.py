@@ -483,14 +483,18 @@ def _activate_anticipatory_pull(
 	}
 
 
-def _anticipatory_pull_loss(*, res: fit_model.FitResult3D, pull: dict | None) -> torch.Tensor:
+def _anticipatory_pull_loss_map(*, res: fit_model.FitResult3D, pull: dict | None) -> torch.Tensor:
+	out = torch.zeros_like(res.mask_lr)
 	if pull is None or int(pull["tip_h"].numel()) == 0:
-		return torch.zeros((), device=res.xyz_lr.device, dtype=res.xyz_lr.dtype)
+		return out
 	live_tip = res.xyz_lr[0, pull["tip_h"], pull["tip_w"]]
 	target = pull["target_xyz"].to(device=live_tip.device, dtype=live_tip.dtype)
 	candidate_weight = pull["candidate_weight"].to(device=live_tip.device, dtype=live_tip.dtype)
 	per_candidate = F.smooth_l1_loss(live_tip, target, reduction="none").sum(dim=-1)
-	return (per_candidate * candidate_weight).sum()
+	idx = pull["tip_h"] * int(res.xyz_lr.shape[2]) + pull["tip_w"]
+	out_flat = out[0, 0].reshape(-1)
+	out_flat.index_add_(0, idx, per_candidate * candidate_weight)
+	return out
 
 
 def _anticipatory_pull_debug_lr(
@@ -925,7 +929,8 @@ def _write_flow_gate_weight_jpg(
 			path = jpg_dir / f"{suffix}_pred_dt_and_used_weight.jpg"
 			try:
 				import cv2
-				cv2.imwrite(str(path), img)
+				if not cv2.imwrite(str(path), img):
+					raise RuntimeError("cv2.imwrite returned false")
 			except Exception:
 				from PIL import Image
 				Image.fromarray(img, mode="L").save(str(path), quality=95)
@@ -1216,24 +1221,9 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					Wm=Wm,
 					device=res.xyz_lr.device,
 				)
-				pull_weight_hr = F.interpolate(
-					pull_weight_lr.view(1, 1, Hm, Wm),
-					size=(He, We),
-					mode="bilinear",
-					align_corners=True,
-				)[0, 0].detach().cpu().numpy().astype(np.float32)
-				pull_prefix_hr = F.interpolate(
-					pull_prefix_lr.view(1, 1, Hm, Wm),
-					size=(He, We),
-					mode="bilinear",
-					align_corners=True,
-				)[0, 0].detach().cpu().numpy().astype(np.float32)
-				pull_root_weight_hr = F.interpolate(
-					pull_root_weight_lr.view(1, 1, Hm, Wm),
-					size=(He, We),
-					mode="bilinear",
-					align_corners=True,
-				)[0, 0].detach().cpu().numpy().astype(np.float32)
+				pull_weight_hr = pull_weight_lr.detach().cpu().numpy().astype(np.float32)
+				pull_prefix_hr = pull_prefix_lr.detach().cpu().numpy().astype(np.float32)
+				pull_root_weight_hr = pull_root_weight_lr.detach().cpu().numpy().astype(np.float32)
 				pull_overlay_rgb = _anticipatory_pull_overlay(
 					pull=pull,
 					height=He,
@@ -1316,14 +1306,14 @@ def pred_dt_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[tor
 	else:
 		flow_gate = flow_result
 	wsum = mask.sum()
-	if float(wsum) > 0.0:
-		if flow_gate is not None:
-			pull_loss = _anticipatory_pull_loss(res=res, pull=pull)
-			loss = ((lm * mask * flow_gate).sum() + pull_loss) / wsum
-		else:
-			loss = (lm * mask).sum() / wsum
-	else:
-		loss = lm.mean()
 	if flow_gate is not None:
-		return loss, (lm,), (mask * flow_gate,)
+		pull_lm = _anticipatory_pull_loss_map(res=res, pull=pull)
+		loss = (lm * mask * flow_gate + pull_lm).mean()
+	else:
+		if float(wsum) > 0.0:
+			loss = (lm * mask).sum() / wsum
+		else:
+			loss = lm.mean()
+	if flow_gate is not None:
+		return loss, (lm, pull_lm), (mask * flow_gate, torch.ones_like(pull_lm))
 	return loss, (lm,), (mask,)
