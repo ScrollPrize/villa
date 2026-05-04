@@ -323,6 +323,10 @@ def optimize(
 		corr_splat_sigma = float(opt_cfg.args.get("corr_splat_sigma", 1.0)) if opt_cfg.args else 1.0
 		opt_loss_corr.set_splat_sigma(corr_splat_sigma)
 		pred_dt_flow_gate_cfg = opt_cfg.args.get("pred_dt_flow_gate") if opt_cfg.args else None
+		pred_dt_normal_source = (opt_cfg.args or {}).get("pred_dt_normal_source", None)
+		if pred_dt_normal_source is None and isinstance(pred_dt_flow_gate_cfg, dict):
+			pred_dt_normal_source = pred_dt_flow_gate_cfg.get("normal_source", None)
+		opt_loss_pred_dt.configure_pred_dt(normal_source=pred_dt_normal_source)
 		opt_loss_pred_dt.configure_flow_gate(
 			cfg=pred_dt_flow_gate_cfg if _need_term("pred_dt", opt_cfg.eff) > 0 else None,
 			stage_name=stage.name or label,

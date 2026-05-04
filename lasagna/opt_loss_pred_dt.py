@@ -22,6 +22,7 @@ _flow_gate_debug_counts: dict[str, int] = {}
 _flow_gate_last_stats: dict[str, float] = {}
 _flow_gate_seed_hw_cache: tuple[int, int, float, float] | None = None
 _flow_gate_jpg_warned: bool = False
+_pred_dt_normal_source: str = "model"
 
 
 def flow_gate_prefetch_points(
@@ -234,7 +235,15 @@ def _sample_pred_dt_max3d(
 
 def _pred_dt_loss_sample_xyz(res: fit_model.FitResult3D) -> torch.Tensor:
 	"""Exact LR positions used by pred_dt_loss for differentiable pred-dt sampling."""
-	n = _vertex_normals(res.xyz_lr.detach())
+	if _pred_dt_normal_source == "model":
+		n = _vertex_normals(res.xyz_lr.detach())
+	elif _pred_dt_normal_source == "gt":
+		if res.gt_normal_lr is None:
+			raise RuntimeError("pred_dt_loss normal_source='gt' requires gt_normal_lr")
+		n = res.gt_normal_lr.detach().to(device=res.xyz_lr.device, dtype=res.xyz_lr.dtype)
+	else:
+		raise RuntimeError(f"unsupported pred_dt normal_source: {_pred_dt_normal_source!r}")
+	n = n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 	proj_len = (res.xyz_lr * n).sum(dim=-1, keepdim=True)
 	xyz_normal = proj_len * n
 	xyz_tangential = res.xyz_lr - xyz_normal
@@ -495,6 +504,7 @@ def _activate_anticipatory_pull(
 	flow_weight: torch.Tensor,
 	mask_lr: torch.Tensor,
 	cfg: dict,
+	weight_scale: float = 1.0,
 ) -> dict | None:
 	if candidates is None:
 		return None
@@ -520,7 +530,7 @@ def _activate_anticipatory_pull(
 			"root_weight": root_weight[:0],
 		}
 	loss_weight = float(cfg.get("loss_weight", 1.0))
-	candidate_weight = root_weight[active] * prefix[active] * tip_mask[active] * loss_weight
+	candidate_weight = root_weight[active] * prefix[active] * tip_mask[active] * loss_weight * float(weight_scale)
 	return {
 		"candidate_idx": candidates["candidate_idx"][active],
 		"tip_h": tip_h[active],
@@ -857,6 +867,14 @@ def configure_flow_gate(
 	debug_out_dir = _flow_gate_cfg.get("debug_out_dir", None)
 	_flow_gate_out_dir = Path(debug_out_dir) if debug_out_dir else (Path(out_dir) if out_dir else None)
 	_flow_gate_debug_counts[str(stage_name)] = 0
+
+
+def configure_pred_dt(*, normal_source: str | None = None) -> None:
+	global _pred_dt_normal_source
+	src = "model" if normal_source is None else str(normal_source)
+	if src not in {"model", "gt"}:
+		raise ValueError("pred_dt normal_source must be 'model' or 'gt'")
+	_pred_dt_normal_source = src
 
 
 def flow_gate_last_stats() -> dict[str, float]:
@@ -1230,9 +1248,10 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 		if pull_cfg is not None:
 			pull = _activate_anticipatory_pull(
 				candidates=pull_candidates,
-				flow_weight=weight,
+				flow_weight=gate_weight,
 				mask_lr=res.mask_lr,
 				cfg=pull_cfg,
+				weight_scale=gate_factor,
 			)
 			active_count = 0 if pull is None else int(pull["tip_h"].numel())
 			candidate_count = 0 if pull_candidates is None else int(pull_candidates["tip_h"].numel())
@@ -1302,7 +1321,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					cfg=pull_cfg,
 					candidates=pull_candidates,
 					pull=pull,
-					flow_weight=weight,
+					flow_weight=gate_weight,
 					stage_name=_flow_gate_stage,
 					debug_index=debug_index,
 					out_dir=_flow_gate_out_dir,

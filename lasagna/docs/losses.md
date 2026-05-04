@@ -43,6 +43,7 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
   "steps": 1000,
   "params": ["mesh_ms"],
   "args": {
+    "pred_dt_normal_source": "model",
     "pred_dt_flow_gate": {
       "enabled": true,
       "flow_zero": 50.0,
@@ -70,13 +71,19 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
 }
 ```
 
+`pred_dt_normal_source` controls the normal used for the pred-dt sampling
+projection. The default is `"model"` for current mesh normals. Set it to `"gt"`
+to project along sampled GT normals for that stage.
+
 When enabled, the current single-winding `pred_dt` render is median-filtered
 with radius 1, thresholded at `110`, routed through `dense_batch_min_cut`, and
 sampled at the exact model grid corners. The resulting gate is linearly mapped
 from `flow_zero -> 0` to `flow_one -> 1` and multiplies the `pred_dt` loss map.
-`gate_factor` controls how much of the weight comes from the gate:
+`gate_factor` controls how much of the regular pred-dt weight comes from the gate:
 `weight = gate_factor * gate + (1 - gate_factor)`, so `0.99` keeps a `0.01`
-baseline loss weight active everywhere.
+baseline pred-dt loss weight active everywhere. The anticipatory pull uses the
+raw gate for activation and is scaled only by `gate_factor`; the baseline term
+does not activate anticipatory pulls.
 The loss denominator remains the original validity-mask sum; the gate is
 intentionally not renormalized.
 
