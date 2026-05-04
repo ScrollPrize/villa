@@ -3514,7 +3514,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     fp.flattenedPlanesHash = planesHash;
     fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
     fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
-    fp.indexSamplingStride = patchIndex->samplingStride();
+    fp.indexSamplingStride = 1;
     fp.patchCount = patchIndex->patchCount();
     fp.surfaceCount = patchIndex->surfaceCount();
     fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
@@ -3543,7 +3543,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                           static_cast<float>(d)};
     }
 
-    const float clipTol = std::max(_intersectionThickness, 1e-4f);
+    const float clipTol = 1e-4f;
     const float penWidth = std::max(_intersectionThickness,
                                     kActiveIntersectionMinWidthDelta);
     const float opacity = std::clamp(
@@ -3569,7 +3569,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     auto cellBounds = [&]() {
         return cv::Rect(0, 0, points->cols - 1, points->rows - 1);
     };
-    const int stride = std::max(1, patchIndex->samplingStride());
+    const int stride = 1;
     const bool cacheCompatible =
         _flattenedIntersectionCache.valid &&
         _flattenedIntersectionCache.surface == activeSeg.get() &&
