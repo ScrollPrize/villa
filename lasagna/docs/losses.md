@@ -48,6 +48,13 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
       "flow_zero": 50.0,
       "flow_one": 300.0,
       "backtrack_distance": 10.0,
+      "anticipatory_pull": {
+        "enabled": true,
+        "samples": 8,
+        "inlier_zero": 80.0,
+        "inlier_one": 120.0,
+        "loss_weight": 1.0
+      },
       "debug": true
     }
   }
@@ -68,6 +75,14 @@ CLI option:
 ```bash
 ./dense_batch_preprocess -i pred.tif --source 240,240 --grid-step 4 --backtrack-distance 10
 ```
+
+`anticipatory_pull` is optional and only runs with active flow gating. It scores
+all one-step straight LR neighbor lines before flow weights are known, using
+subsampled `pred_dt` values along each line. After flow returns, each candidate
+whose root gate is higher/nonzero and whose tip gate is below 1 contributes an
+independent straight pull to the tip corner, weighted by root gate and prefix
+inlier score. The pull is not winner-take-all; multiple neighbor lines may
+contribute to the same tip.
 
 ## 4) Add visualization output (loss map)
 

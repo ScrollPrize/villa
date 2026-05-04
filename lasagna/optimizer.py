@@ -478,6 +478,7 @@ def optimize(
 				_pred_dt_extra_pf = opt_loss_pred_dt.flow_gate_prefetch_points(
 					data=data,
 					xyz_hr=_xyz_hr_pf,
+					xyz_lr=_xyz_lr_pf,
 					cfg=pred_dt_flow_gate_cfg,
 				)
 			for _cache in _active_caches:
@@ -567,6 +568,7 @@ def optimize(
 					_pred_dt_extra_pf = opt_loss_pred_dt.flow_gate_prefetch_points(
 						data=data,
 						xyz_hr=_xyz_hr_pf,
+						xyz_lr=_xyz_lr_pf,
 						cfg=pred_dt_flow_gate_cfg,
 					)
 				for _cache in _active_caches:
