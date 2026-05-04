@@ -526,18 +526,32 @@ def _anticipatory_debug_points(cfg: dict) -> list[tuple[int, int]]:
 	return out
 
 
+def _anticipatory_debug_roi_center(cfg: dict) -> tuple[float, float, float] | None:
+	center = cfg.get("debug_roi_center_xyz", None)
+	if center is None:
+		center = cfg.get("debug_center_xyz", None)
+	if not isinstance(center, (list, tuple)) or len(center) < 3:
+		return None
+	try:
+		return (float(center[0]), float(center[1]), float(center[2]))
+	except Exception:
+		return None
+
+
 def _write_anticipatory_fit_debug_mosaic(
 	*,
 	res: fit_model.FitResult3D,
 	cfg: dict,
 	candidates: dict | None,
 	pull: dict | None,
+	flow_weight: torch.Tensor | None,
 	stage_name: str,
 	debug_index: int,
 	out_dir: Path | None,
 ) -> None:
 	points = _anticipatory_debug_points(cfg)
-	if out_dir is None or not points or candidates is None:
+	roi_center = _anticipatory_debug_roi_center(cfg)
+	if out_dir is None or (not points and roi_center is None) or candidates is None:
 		return
 	try:
 		import cv2
@@ -582,14 +596,40 @@ def _write_anticipatory_fit_debug_mosaic(
 		prefix = candidates["prefix"][sub_idx]
 		return int(sub_idx[int(torch.argmax(prefix).detach().cpu())].detach().cpu())
 
+	debug_candidates: list[tuple[int | None, str]] = []
+	for tip_h, tip_w in points:
+		cand_i = _candidate_for_point(tip_h, tip_w)
+		debug_candidates.append((cand_i, f"tip=({tip_h},{tip_w})"))
+
+	if roi_center is not None and flow_weight is not None:
+		k = max(1, int(cfg.get("debug_roi_k", 8)))
+		root_threshold = float(cfg.get("debug_roi_root_min", 0.5))
+		tip_threshold = float(cfg.get("debug_roi_tip_max", 0.5))
+		center_t = torch.tensor(roi_center, device=xyz0.device, dtype=xyz0.dtype)
+		rh = candidates["root_h"]
+		rw = candidates["root_w"]
+		th = candidates["tip_h"]
+		tw = candidates["tip_w"]
+		root_weight = flow_weight[0, 0, rh, rw].detach()
+		tip_weight = flow_weight[0, 0, th, tw].detach()
+		eligible = (root_weight > root_threshold) & (tip_weight < tip_threshold)
+		if bool(eligible.any().detach().cpu()):
+			dist2 = ((xyz0[rh, rw] - center_t.view(1, 3)) ** 2).sum(dim=-1)
+			dist2 = dist2.masked_fill(~eligible, float("inf"))
+			n_pick = min(k, int(eligible.sum().detach().cpu()))
+			picked = torch.topk(-dist2, k=n_pick, largest=True).indices
+			for cand_t in picked:
+				cand_i = int(cand_t.detach().cpu())
+				d = float(dist2[cand_i].sqrt().detach().cpu())
+				debug_candidates.append((cand_i, f"roi d={d:.1f}"))
+
 	tiles: list[np.ndarray] = []
 	xs_unit = torch.linspace(-0.25, 1.25, slice_w, device=xyz0.device, dtype=xyz0.dtype)
 	ys_unit = torch.linspace(-1.0, 1.0, slice_h, device=xyz0.device, dtype=xyz0.dtype)
-	for point_i, (tip_h, tip_w) in enumerate(points):
-		cand_i = _candidate_for_point(tip_h, tip_w)
+	for cand_i, label in debug_candidates:
 		if cand_i is None:
 			tile = np.zeros((slice_h * up, slice_w * up, 3), dtype=np.uint8)
-			cv2.putText(tile, f"tip=({tip_h},{tip_w}) no cand", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+			cv2.putText(tile, f"{label} no cand", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 			tiles.append(tile)
 			continue
 		rh = int(candidates["root_h"][cand_i].detach().cpu())
@@ -633,7 +673,7 @@ def _write_anticipatory_fit_debug_mosaic(
 			if si < 8:
 				cv2.putText(rgb, f"{score:.2f}", (max(0, xp - 14), min(rgb.shape[0] - 4, y_line + 16 + (si % 2) * 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1, cv2.LINE_AA)
 		prefix = float(candidates["prefix"][cand_i].detach().cpu())
-		cv2.putText(rgb, f"tip=({th},{tw}) root=({rh},{rw})", (6, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+		cv2.putText(rgb, f"{label} tip=({th},{tw}) root=({rh},{rw})", (6, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
 		cv2.putText(rgb, f"line={prefix:.3f} off={best_offset:.2f}", (6, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
 		cv2.line(rgb, (0, y0), (rgb.shape[1] - 1, y0), (96, 96, 96), 1, cv2.LINE_AA)
 		tiles.append(rgb)
@@ -765,21 +805,30 @@ def _write_flow_gate_weight_jpg(
 	*,
 	stage_name: str,
 	debug_index: int,
-	used_weight_lr: torch.Tensor,
+	pred_u8: np.ndarray,
+	used_weight_hr: np.ndarray,
 	out_dir: Path | None,
 ) -> None:
 	global _flow_gate_jpg_warned
 	if out_dir is None:
 		return
-	arr = used_weight_lr.detach().squeeze().clamp(0.0, 1.0).cpu().numpy()
-	if arr.ndim != 2:
+	pred = np.asarray(pred_u8)
+	weight = np.asarray(used_weight_hr, dtype=np.float32)
+	if pred.ndim != 2 or weight.ndim != 2:
 		return
-	img = (arr * 255.0 + 0.5).astype(np.uint8)
+	if pred.shape != weight.shape:
+		return
+	pred_vis = ((pred.astype(np.float32) - 80.0) / (127.0 - 80.0)).clip(0.0, 1.0)
+	weight_vis = weight.clip(0.0, 1.0)
+	img = np.concatenate([
+		(pred_vis * 255.0 + 0.5).astype(np.uint8),
+		(weight_vis * 255.0 + 0.5).astype(np.uint8),
+	], axis=1)
 	jpg_dir = out_dir / "pred_dt_flow_gate_weight_jpg"
 	try:
 		jpg_dir.mkdir(parents=True, exist_ok=True)
 		for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
-			path = jpg_dir / f"{suffix}_used_weight.jpg"
+			path = jpg_dir / f"{suffix}_pred_dt_and_used_weight.jpg"
 			try:
 				import cv2
 				cv2.imwrite(str(path), img)
@@ -948,7 +997,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				used_weight = weight * res.mask_lr
 				_flow_gate_last_stats = {
 					"pred_dt_gate_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_gate_eq1": float(((weight >= 1.0) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_n_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_n_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_n_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_pull_active_frac": 0.0,
 					"pred_dt_pull_weight_mean": 0.0,
 					"pred_dt_pull_prefix_mean": 0.0,
@@ -976,10 +1030,16 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						out_dir=_flow_gate_out_dir,
 					)
 				if debug:
+					used_weight_hr = F.interpolate(
+						used_weight,
+						size=(He, We),
+						mode="nearest",
+					)[0, 0].detach().cpu().numpy().astype(np.float32)
 					_write_flow_gate_weight_jpg(
 						stage_name=_flow_gate_stage,
 						debug_index=debug_index,
-						used_weight_lr=used_weight,
+						pred_u8=pred_img,
+						used_weight_hr=used_weight_hr,
 						out_dir=_flow_gate_out_dir,
 					)
 				return weight, None
@@ -1009,7 +1069,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 		used_weight = weight * res.mask_lr
 		_flow_gate_last_stats = {
 			"pred_dt_gate_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
 			"pred_dt_gate_eq1": float(((weight >= 1.0) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_n_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_n_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_n_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
 		}
 		pull = None
 		if pull_cfg is not None:
@@ -1102,6 +1167,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					cfg=pull_cfg,
 					candidates=pull_candidates,
 					pull=pull,
+					flow_weight=weight,
 					stage_name=_flow_gate_stage,
 					debug_index=debug_index,
 					out_dir=_flow_gate_out_dir,
@@ -1109,10 +1175,16 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			done("write_layer_debug", _t)
 		if debug:
 			_t = mark("write_weight_jpg")
+			used_weight_hr = F.interpolate(
+				used_weight,
+				size=(He, We),
+				mode="nearest",
+			)[0, 0].detach().cpu().numpy().astype(np.float32)
 			_write_flow_gate_weight_jpg(
 				stage_name=_flow_gate_stage,
 				debug_index=debug_index,
-				used_weight_lr=used_weight,
+				pred_u8=pred_img,
+				used_weight_hr=used_weight_hr,
 				out_dir=_flow_gate_out_dir,
 			)
 			done("write_weight_jpg", _t)

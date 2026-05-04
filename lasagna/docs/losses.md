@@ -55,6 +55,10 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
         "inlier_one": 120.0,
         "loss_weight": 1.0,
         "debug_points": [[40, 50], [40, 51]],
+        "debug_roi_center_xyz": [15733, 14023, 51588],
+        "debug_roi_k": 8,
+        "debug_roi_root_min": 0.5,
+        "debug_roi_tip_max": 0.5,
         "debug_slice_upsample": 8
       },
       "debug": true
@@ -86,13 +90,21 @@ independent straight pull to the tip corner, weighted by root gate and prefix
 inlier score. The pull is not winner-take-all; multiple neighbor lines may
 contribute to the same tip.
 
-When `anticipatory_pull.debug_points` is set, every normal flow-gate layer-debug
+The optimizer status table reports the flow-gate strength as fractions and
+corner counts for gate weights `>0`, `>0.1`, and `>0.5`, plus the fraction at
+`1.0`.
+
+When `anticipatory_pull.debug_points` or `debug_roi_center_xyz` is set, every normal flow-gate layer-debug
 iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.tif`.
-Points are LR mesh tip coordinates `(h,w)`. Each tile shows a slice around the
-selected root-tip line, with `pred_dt` scaled from `inlier_zero` to
-`inlier_one`, the fitted straight line, per-sample inlier scores, and the
-complete prefix score. Tiles are upsampled by `debug_slice_upsample` and packed
-into an approximately 2:1 mosaic.
+Explicit `debug_points` are LR mesh tip coordinates `(h,w)`. The ROI selector
+uses the current root corner position and selects the `debug_roi_k` closest
+individual root->tip snap candidates to `debug_roi_center_xyz`, restricted to
+directions where the root flow gate is above `debug_roi_root_min` and the tip
+flow gate is below `debug_roi_tip_max`. Each tile shows a slice around one
+root-tip line, with `pred_dt` scaled from `inlier_zero` to `inlier_one`, the
+fitted straight line, per-sample inlier scores, and the complete prefix score.
+Tiles are upsampled by `debug_slice_upsample` and packed into an approximately
+2:1 mosaic.
 
 ## 4) Add visualization output (loss map)
 

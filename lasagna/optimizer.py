@@ -393,21 +393,62 @@ def optimize(
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
 						  its: float | None = None) -> None:
 			nonlocal _status_rows
-			tv_keys = sorted(tv.keys())
+			label_map = {
+				"pred_dt_gate_gt0": "g>0",
+				"pred_dt_gate_gt01": "g>.1",
+				"pred_dt_gate_gt05": "g>.5",
+				"pred_dt_gate_eq1": "g=1",
+				"pred_dt_gate_n_gt0": "n>0",
+				"pred_dt_gate_n_gt01": "n>.1",
+				"pred_dt_gate_n_gt05": "n>.5",
+				"pred_dt_pull_active_frac": "pull%",
+				"pred_dt_pull_prefix_mean": "pullpre",
+				"pred_dt_pull_weight_mean": "pullw",
+			}
+			key_order = {
+				"pred_dt_gate_gt0": 100,
+				"pred_dt_gate_gt01": 101,
+				"pred_dt_gate_gt05": 102,
+				"pred_dt_gate_eq1": 103,
+				"pred_dt_gate_n_gt0": 104,
+				"pred_dt_gate_n_gt01": 105,
+				"pred_dt_gate_n_gt05": 106,
+				"pred_dt_pull_active_frac": 107,
+				"pred_dt_pull_prefix_mean": 108,
+				"pred_dt_pull_weight_mean": 109,
+			}
+			def _sort_key(k: str) -> tuple[int, str]:
+				return (key_order.get(k, 0), k)
+			def _display_key(k: str) -> str:
+				return label_map.get(k, k)
+			def _fmt_val(k: str, v: float) -> str:
+				av = abs(v)
+				if av != 0.0 and (av >= 1000.0 or av < 1.0e-3):
+					return f"{v:.2e}"
+				if av < 10.0:
+					return f"{v:.4f}"
+				if av < 100.0:
+					return f"{v:.3f}"
+				return f"{v:.1f}"
+			tv_keys = sorted(tv.keys(), key=_sort_key)
 			pv_keys = sorted(pv.keys())
 			cols = tv_keys + [f"p:{k}" for k in pv_keys]
+			values = {k: _fmt_val(k, tv[k]) for k in tv_keys}
+			values.update({f"p:{k}": _fmt_val(f"p:{k}", pv[k]) for k in pv_keys})
+			widths = {k: max(len(_display_key(k)), len(values[k]), 5) for k in cols}
 			if _status_rows % 20 == 0:
-				hdr = f"{'step':>20s}  {'loss':>8s}  {'it/s':>6s}"
+				hdr = f"{'step':>16s} {'loss':>8s} {'it/s':>5s}"
 				for c in cols:
-					hdr += f"  {c:>10s}"
+					hdr += f" {_display_key(c):>{widths[c]}s}"
 				print(hdr)
 			_status_rows += 1
-			its_str = f"{its:6.1f}" if its is not None else f"{'':>6s}"
-			row = f"{step_label:>20s}  {loss_val:8.4f}  {its_str}"
+			its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
+			row = f"{step_label:>16s} {loss_val:8.4f} {its_str}"
 			for k in tv_keys:
-				row += f"  {tv[k]:10.4f}"
+				row += f" {values[k]:>{widths[k]}s}"
 			for k in pv_keys:
-				row += f"  {pv[k]:10.4f}"
+				pk = f"p:{k}"
+				row += f" {values[pk]:>{widths[pk]}s}"
 			print(row)
 
 		# Ensure data covers mesh and has all channels needed by this stage
