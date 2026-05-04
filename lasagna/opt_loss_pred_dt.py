@@ -13,7 +13,7 @@ import model as fit_model
 from opt_loss_dir import _vertex_normals
 from opt_loss_station import _intersect_single_quad
 
-_INNER_FACTOR = 0.25  # penalty reduction for points inside the predicted surface
+_INNER_FACTOR = 0.0  # penalty reduction for points inside the predicted surface
 _flow_gate_cfg: dict | None = None
 _flow_gate_stage: str = "stage"
 _flow_gate_seed_xyz: tuple[float, float, float] | None = None
@@ -1000,12 +1000,15 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 
 	flow_zero = float(cfg.get("flow_zero", 20.0))
 	flow_one = float(cfg.get("flow_one", 100.0))
+	gate_factor = float(cfg.get("gate_factor", 1.0))
 	backtrack_distance = float(cfg.get("backtrack_distance", 10.0))
 	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 0))
 	pred_dt_pool_step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
 	pull_cfg = _anticipatory_pull_cfg(cfg)
 	if flow_one <= flow_zero:
 		raise ValueError("pred_dt_flow_gate requires flow_one > flow_zero")
+	if not 0.0 <= gate_factor <= 1.0:
+		raise ValueError("pred_dt_flow_gate requires gate_factor in [0, 1]")
 	debug = bool(cfg.get("debug", True))
 	debug_index = 0
 	if debug:
@@ -1135,18 +1138,21 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			message = str(exc)
 			source_value = int(pred_img[source_y, source_x]) if 0 <= source_y < He and 0 <= source_x < We else -1
 			if "white distance domain" in message:
-				weight = seed_area.to(dtype=torch.float32)
+				gate_weight = seed_area.to(dtype=torch.float32)
+				weight = gate_weight
+				if gate_factor < 1.0:
+					weight = gate_factor * gate_weight + (1.0 - gate_factor)
 				valid = res.mask_lr > 0.0
 				valid_count = max(1.0, float(valid.sum().detach().cpu()))
 				used_weight = weight * res.mask_lr
 				_flow_gate_last_stats = {
-					"pred_dt_gate_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
-					"pred_dt_gate_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
-					"pred_dt_gate_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
-					"pred_dt_gate_eq1": float(((weight >= 1.0) & valid).sum().detach().cpu()) / valid_count,
-					"pred_dt_gate_n_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
-					"pred_dt_gate_n_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
-					"pred_dt_gate_n_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_gt05": float(((gate_weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_eq1": float(((gate_weight >= 1.0) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_n_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_n_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_gate_n_gt05": float(((gate_weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_pull_active_frac": 0.0,
 					"pred_dt_pull_weight_mean": 0.0,
 					"pred_dt_pull_prefix_mean": 0.0,
@@ -1203,19 +1209,22 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			effective_flow_zero = flow_zero * scale
 		if effective_flow_one <= effective_flow_zero:
 			effective_flow_zero = max(0.0, effective_flow_one - 1.0)
-		weight = ((flow_lr - effective_flow_zero) / (effective_flow_one - effective_flow_zero)).clamp(0.0, 1.0)
-		weight = torch.where(seed_area, torch.ones_like(weight), weight)
+		gate_weight = ((flow_lr - effective_flow_zero) / (effective_flow_one - effective_flow_zero)).clamp(0.0, 1.0)
+		gate_weight = torch.where(seed_area, torch.ones_like(gate_weight), gate_weight)
+		weight = gate_weight
+		if gate_factor < 1.0:
+			weight = gate_factor * gate_weight + (1.0 - gate_factor)
 		valid = res.mask_lr > 0.0
 		valid_count = max(1.0, float(valid.sum().detach().cpu()))
 		used_weight = weight * res.mask_lr
 		_flow_gate_last_stats = {
-			"pred_dt_gate_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
-			"pred_dt_gate_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
-			"pred_dt_gate_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
-			"pred_dt_gate_eq1": float(((weight >= 1.0) & valid).sum().detach().cpu()) / valid_count,
-			"pred_dt_gate_n_gt0": float(((weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
-			"pred_dt_gate_n_gt01": float(((weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
-			"pred_dt_gate_n_gt05": float(((weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_gt05": float(((gate_weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_eq1": float(((gate_weight >= 1.0) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_n_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_n_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
+			"pred_dt_gate_n_gt05": float(((gate_weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
 		}
 		pull = None
 		if pull_cfg is not None:
