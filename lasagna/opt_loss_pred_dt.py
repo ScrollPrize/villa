@@ -69,7 +69,7 @@ def flow_gate_prefetch_points(
 
 def _seed_gt_normal(*, seed_xyz: torch.Tensor, res: fit_model.FitResult3D) -> torch.Tensor:
 	query = seed_xyz.view(1, 1, 1, 3)
-	sampled = res.data.grid_sample_fullres(query)
+	sampled = res.data.grid_sample_fullres(query, channels={"nx", "ny"})
 	nx = sampled.nx.squeeze()
 	ny = sampled.ny.squeeze()
 	nz = (1.0 - nx * nx - ny * ny).clamp(min=0.0).sqrt()
@@ -223,13 +223,22 @@ def _sample_pred_dt_max3d(
 	)
 	offsets = offsets * spacing.view(1, 3) * float(step_scale)
 	query = xyz_hr.unsqueeze(0) + offsets.view(-1, 1, 1, 3)
-	sampled = res.data.grid_sample_fullres(query).pred_dt
+	sampled = res.data.grid_sample_fullres(query, channels={"pred_dt"}).pred_dt
 	if sampled is None:
 		raise RuntimeError("pred_dt_flow_gate requires pred_dt to be loaded")
 	pred = sampled.squeeze(0).squeeze(0)
 	if pred.ndim != 3:
 		raise RuntimeError(f"pred_dt_flow_gate expected pooled pred_dt shape (N,H,W), got {tuple(pred.shape)}")
 	return pred.amax(dim=0)
+
+
+def _pred_dt_loss_sample_xyz(res: fit_model.FitResult3D) -> torch.Tensor:
+	"""Exact LR positions used by pred_dt_loss for differentiable pred-dt sampling."""
+	n = _vertex_normals(res.xyz_lr.detach())
+	proj_len = (res.xyz_lr * n).sum(dim=-1, keepdim=True)
+	xyz_normal = proj_len * n
+	xyz_tangential = res.xyz_lr - xyz_normal
+	return xyz_normal + xyz_tangential.detach()
 
 
 def _neighbor_candidate_indices(*, Hm: int, Wm: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -274,51 +283,32 @@ def _anticipatory_pull_cfg(cfg: dict | None) -> dict | None:
 	return pull_cfg
 
 
-def _anticipatory_angle_values(*, cfg: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _anticipatory_normal_offset_factors(*, cfg: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 	steps = max(1, int(cfg.get("search_steps", 21)))
 	if steps % 2 == 0:
 		steps += 1
 	deg = float(cfg.get("search_angle_degrees", 60.0))
 	rad = np.deg2rad(max(0.0, deg))
-	return torch.linspace(-rad, rad, steps, device=device, dtype=dtype)
+	return torch.linspace(-float(np.tan(rad)), float(np.tan(rad)), steps, device=device, dtype=dtype)
 
 
-def _anticipatory_rotation_axes(
+def _anticipatory_reference_step(
 	*,
-	xyz0: torch.Tensor,
-	normals: torch.Tensor,
-	tip_h: torch.Tensor,
-	tip_w: torch.Tensor,
-	root_h: torch.Tensor,
-	root_w: torch.Tensor,
+	cfg: dict,
+	device: torch.device,
+	dtype: torch.dtype,
+	params: fit_model.ModelParams3D | None = None,
+	xyz0: torch.Tensor | None = None,
 ) -> torch.Tensor:
-	"""Local tangent axis through root, perpendicular to the root->tip grid direction."""
-	Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
-	dh = tip_h - root_h
-	dw = tip_w - root_w
-	perp_h = -dw
-	perp_w = dh
-	plus_h = (root_h + perp_h).clamp(0, Hm - 1)
-	plus_w = (root_w + perp_w).clamp(0, Wm - 1)
-	minus_h = (root_h - perp_h).clamp(0, Hm - 1)
-	minus_w = (root_w - perp_w).clamp(0, Wm - 1)
-	axis = xyz0[plus_h, plus_w] - xyz0[minus_h, minus_w]
-	line = xyz0[tip_h, tip_w] - xyz0[root_h, root_w]
-	line_dir = line / line.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-	n = normals[root_h, root_w]
-	fallback = torch.linalg.cross(n, line_dir, dim=-1)
-	axis_norm = axis.norm(dim=-1, keepdim=True)
-	fallback_norm = fallback.norm(dim=-1, keepdim=True)
-	axis = torch.where(axis_norm > 1e-6, axis, fallback)
-	axis_norm = axis.norm(dim=-1, keepdim=True)
-	axis = torch.where(axis_norm > 1e-6, axis / axis_norm.clamp_min(1e-6), n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6))
-	return axis
-
-
-def _rotate_vectors(v: torch.Tensor, axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-	c = torch.cos(angle).unsqueeze(-1)
-	s = torch.sin(angle).unsqueeze(-1)
-	return v * c + torch.linalg.cross(axis, v, dim=-1) * s + axis * (axis * v).sum(dim=-1, keepdim=True) * (1.0 - c)
+	if "search_step_length" in cfg:
+		return torch.tensor(float(cfg["search_step_length"]), device=device, dtype=dtype).clamp_min(1e-6)
+	if params is not None:
+		return torch.tensor(float(params.mesh_step), device=device, dtype=dtype).clamp_min(1e-6)
+	if xyz0 is not None:
+		dh = (xyz0[1:] - xyz0[:-1]).norm(dim=-1).median() if xyz0.shape[0] > 1 else torch.tensor(1.0, device=device, dtype=dtype)
+		dw = (xyz0[:, 1:] - xyz0[:, :-1]).norm(dim=-1).median() if xyz0.shape[1] > 1 else torch.tensor(1.0, device=device, dtype=dtype)
+		return (0.5 * (dh + dw)).to(device=device, dtype=dtype).clamp_min(1e-6)
+	return torch.tensor(1.0, device=device, dtype=dtype)
 
 
 def _anticipatory_pull_prefetch_points(*, xyz_lr: torch.Tensor, cfg: dict) -> torch.Tensor | None:
@@ -334,24 +324,97 @@ def _anticipatory_pull_prefetch_points(*, xyz_lr: torch.Tensor, cfg: dict) -> to
 	root = xyz0[root_h, root_w]
 	tip = xyz0[tip_h, tip_w]
 	normals = _vertex_normals(xyz_lr.detach())[0]
-	axis = _anticipatory_rotation_axes(
-		xyz0=xyz0,
-		normals=normals,
-		tip_h=tip_h,
-		tip_w=tip_w,
-		root_h=root_h,
-		root_w=root_w,
-	)
-	angles = _anticipatory_angle_values(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
+	offset_factors = _anticipatory_normal_offset_factors(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
 	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
 	line_vec = tip - root
-	rot = _rotate_vectors(
-		line_vec.view(-1, 1, 1, 3),
-		axis.view(-1, 1, 1, 3),
-		angles.view(1, -1, 1),
-	)
-	line = root.view(-1, 1, 1, 3) + t * rot
+	ref_step = _anticipatory_reference_step(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype, xyz0=xyz0)
+	n = normals[tip_h, tip_w]
+	offset = ref_step * offset_factors.view(1, -1)
+	target_vec = line_vec.view(-1, 1, 3) + offset.unsqueeze(-1) * n.view(-1, 1, 3)
+	line = root.view(-1, 1, 1, 3) + t * target_vec.view(-1, int(offset_factors.numel()), 1, 3)
 	return line.reshape(-1, 3)
+
+
+def flow_gate_prefetch_points_for_result(
+	*,
+	res: fit_model.FitResult3D,
+	cfg: dict | None,
+) -> torch.Tensor | None:
+	items = flow_gate_prefetch_items_for_result(res=res, cfg=cfg)
+	return items.get("pred_dt")
+
+
+def flow_gate_prefetch_items_for_result(
+	*,
+	res: fit_model.FitResult3D,
+	cfg: dict | None,
+) -> dict[str, torch.Tensor]:
+	"""Exact channel sample positions for active flow-gate losses after model forward."""
+	out: dict[str, torch.Tensor] = {}
+	if cfg is None or not bool(cfg.get("enabled", False)):
+		return out
+	if res.xyz_lr.shape[0] != 1:
+		return out
+	xyz_hr = res.xyz_hr[0].detach()
+	device = xyz_hr.device
+	dtype = xyz_hr.dtype
+
+	if _flow_gate_seed_xyz is not None:
+		seed = torch.tensor(_flow_gate_seed_xyz, device=device, dtype=dtype).view(1, 1, 1, 3)
+		out["nx"] = seed
+		out["ny"] = seed
+
+	loss_xyz = _pred_dt_loss_sample_xyz(res).detach().reshape(1, 1, -1, 3)
+	out["pred_dt"] = loss_xyz
+
+	r = int(max(0, int(cfg.get("pred_dt_pool_radius", 0))))
+	if r > 0:
+		step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
+		offsets = torch.tensor(
+			[(dx, dy, dz)
+			 for dz in range(-r, r + 1)
+			 for dy in range(-r, r + 1)
+			 for dx in range(-r, r + 1)],
+			device=device,
+			dtype=dtype,
+		)
+		spacing = torch.tensor(res.data._spacing_for("pred_dt"), device=device, dtype=dtype)
+		offsets = offsets * spacing.view(1, 3) * step_scale
+		pool_points = (xyz_hr.unsqueeze(0) + offsets.view(-1, 1, 1, 3)).reshape(1, 1, -1, 3)
+		out["pred_dt"] = torch.cat([out["pred_dt"], pool_points], dim=2)
+
+	pull_cfg = _anticipatory_pull_cfg(cfg)
+	if pull_cfg is not None:
+		xyz0 = res.xyz_lr[0].detach()
+		Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
+		if Hm > 1 and Wm > 1:
+			samples_n = max(2, int(pull_cfg.get("samples", 8)))
+			tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
+			root = xyz0[root_h, root_w]
+			tip = xyz0[tip_h, tip_w]
+			line_vec = tip - root
+			n = _tip_gt_normals_from_result(res=res, tip_h=tip_h, tip_w=tip_w)
+			offset_factors = _anticipatory_normal_offset_factors(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype)
+			ref_step = _anticipatory_reference_step(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
+			offset = ref_step * offset_factors.view(1, -1)
+			target_vec = line_vec.view(-1, 1, 3) + offset.unsqueeze(-1) * n.view(-1, 1, 3)
+			t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
+			line = root.view(-1, 1, 1, 3) + t * target_vec.view(-1, int(offset_factors.numel()), 1, 3)
+			pull_points = line.reshape(1, 1, -1, 3)
+			out["pred_dt"] = torch.cat([out["pred_dt"], pull_points], dim=2) if "pred_dt" in out else pull_points
+	return out
+
+
+def _tip_gt_normals_from_result(
+	*,
+	res: fit_model.FitResult3D,
+	tip_h: torch.Tensor,
+	tip_w: torch.Tensor,
+) -> torch.Tensor:
+	if res.gt_normal_lr is None:
+		raise RuntimeError("anticipatory_pull requires gt_normal_lr; GT nx/ny normals are missing at LR mesh points")
+	n = res.gt_normal_lr[0, tip_h, tip_w].detach().to(device=res.xyz_lr.device, dtype=res.xyz_lr.dtype)
+	return n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
 def _score_anticipatory_pull_candidates(
@@ -376,14 +439,15 @@ def _score_anticipatory_pull_candidates(
 	n_candidates = int(tip_h.numel())
 	if n_candidates <= 0:
 		return None
-	normals = _vertex_normals(res.xyz_lr.detach())[0]
-	angles = _anticipatory_angle_values(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
+	offset_factors = _anticipatory_normal_offset_factors(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
+	ref_step = _anticipatory_reference_step(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
+	if offset_factors.ndim != 1:
+		raise RuntimeError(f"anticipatory_pull expected 1D offset factors, got {tuple(offset_factors.shape)}")
 	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
 	targets: list[torch.Tensor] = []
 	prefixes: list[torch.Tensor] = []
 	best_inliers: list[torch.Tensor] = []
-	best_angles_all: list[torch.Tensor] = []
-	best_axes_all: list[torch.Tensor] = []
+	best_offsets_all: list[torch.Tensor] = []
 	with torch.no_grad():
 		for c0 in range(0, n_candidates, chunk_candidates):
 			c1 = min(n_candidates, c0 + chunk_candidates)
@@ -393,36 +457,24 @@ def _score_anticipatory_pull_candidates(
 			rw = root_w[c0:c1]
 			root = xyz0[rh, rw]
 			tip = xyz0[th, tw]
-			axis = _anticipatory_rotation_axes(
-				xyz0=xyz0,
-				normals=normals,
-				tip_h=th,
-				tip_w=tw,
-				root_h=rh,
-				root_w=rw,
-			)
 			line_vec = tip - root
-			rot = _rotate_vectors(
-				line_vec.view(-1, 1, 1, 3),
-				axis.view(-1, 1, 1, 3),
-				angles.view(1, -1, 1),
-			)
-			query = root.view(-1, 1, 1, 3) + t * rot
+			n = _tip_gt_normals_from_result(res=res, tip_h=th, tip_w=tw)
+			offsets = ref_step * offset_factors
+			target_vec = line_vec.view(-1, 1, 3) + offsets.view(1, -1, 1) * n.view(-1, 1, 3)
+			query = root.view(-1, 1, 1, 3) + t * target_vec.view(c1 - c0, int(offset_factors.numel()), 1, 3)
 			flat_query = query.reshape(1, 1, -1, 3)
-			sampled = res.data.grid_sample_fullres(flat_query).pred_dt
+			sampled = res.data.grid_sample_fullres(flat_query, channels={"pred_dt"}).pred_dt
 			if sampled is None:
 				raise RuntimeError("anticipatory_pull requires pred_dt to be loaded")
-			pred = sampled.reshape(c1 - c0, int(angles.numel()), samples_n)
+			pred = sampled.reshape(c1 - c0, int(offset_factors.numel()), samples_n)
 			inlier = ((pred - inlier_zero) / (inlier_one - inlier_zero)).clamp(0.0, 1.0)
 			prefix = inlier.cumprod(dim=2).mean(dim=2)
-			best_score, best_angle_idx = prefix.max(dim=1)
-			best_angles = angles[best_angle_idx]
-			best_rot = _rotate_vectors(line_vec, axis, best_angles)
-			targets.append(root + best_rot)
+			best_score, best_offset_idx = prefix.max(dim=1)
+			best_offsets = offsets[best_offset_idx]
+			targets.append(tip + best_offsets.unsqueeze(-1) * n)
 			prefixes.append(best_score)
-			best_inliers.append(inlier[torch.arange(c1 - c0, device=xyz0.device), best_angle_idx])
-			best_angles_all.append(best_angles)
-			best_axes_all.append(axis)
+			best_inliers.append(inlier[torch.arange(c1 - c0, device=xyz0.device), best_offset_idx])
+			best_offsets_all.append(best_offsets)
 	candidate_idx = torch.arange(n_candidates, device=xyz0.device, dtype=torch.long)
 	return {
 		"candidate_idx": candidate_idx,
@@ -433,8 +485,7 @@ def _score_anticipatory_pull_candidates(
 		"target_xyz": torch.cat(targets, dim=0),
 		"prefix": torch.cat(prefixes, dim=0),
 		"inliers": torch.cat(best_inliers, dim=0),
-		"angle_rad": torch.cat(best_angles_all, dim=0),
-		"axis": torch.cat(best_axes_all, dim=0),
+		"offset": torch.cat(best_offsets_all, dim=0),
 	}
 
 
@@ -707,29 +758,24 @@ def _write_anticipatory_fit_debug_mosaic(
 		line = tip - root
 		line_len = line.norm().clamp_min(1e-6)
 		line_dir = line / line_len
-		axis = candidates.get("axis", None)
-		if axis is None:
-			axis_v = _anticipatory_rotation_axes(
-				xyz0=xyz0,
-				normals=normals,
-				tip_h=torch.tensor([th], device=xyz0.device, dtype=torch.long),
-				tip_w=torch.tensor([tw], device=xyz0.device, dtype=torch.long),
-				root_h=torch.tensor([rh], device=xyz0.device, dtype=torch.long),
-				root_w=torch.tensor([rw], device=xyz0.device, dtype=torch.long),
-			)[0]
-		else:
-			axis_v = axis[cand_i].to(device=xyz0.device, dtype=xyz0.dtype)
-		axis_v = axis_v / axis_v.norm().clamp_min(1e-6)
-		bend_dir = torch.linalg.cross(axis_v, line_dir, dim=0)
-		bend_dir = bend_dir / bend_dir.norm().clamp_min(1e-6)
-		angles = _anticipatory_angle_values(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
-		max_angle = float(angles.abs().max().detach().cpu()) if angles.numel() > 0 else np.deg2rad(60.0)
-		search_radius = float(line_len.detach().cpu()) * max(0.1, float(np.sin(max_angle)))
+		normal = _tip_gt_normals_from_result(
+			res=res,
+			tip_h=torch.tensor([th], device=xyz0.device, dtype=torch.long),
+			tip_w=torch.tensor([tw], device=xyz0.device, dtype=torch.long),
+		)[0]
+		normal = normal / normal.norm().clamp_min(1e-6)
+		offset_factors = _anticipatory_normal_offset_factors(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
+		ref_step = _anticipatory_reference_step(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
+		search_radius = float((ref_step * offset_factors.abs().max()).detach().cpu()) if offset_factors.numel() > 0 else float(ref_step.detach().cpu())
+		search_radius = max(search_radius, 1.0e-6)
 		xs = xs_unit * line_len
 		ys = ys_unit * search_radius
 		grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-		query = root.view(1, 1, 3) + grid_x.unsqueeze(-1) * line_dir.view(1, 1, 3) + grid_y.unsqueeze(-1) * bend_dir.view(1, 1, 3)
-		sampled = res.data.grid_sample_fullres(query.view(1, slice_h, slice_w, 3)).pred_dt
+		query = root.view(1, 1, 3) + grid_x.unsqueeze(-1) * line_dir.view(1, 1, 3) + grid_y.unsqueeze(-1) * normal.view(1, 1, 3)
+		sampled = res.data.grid_sample_fullres(
+			query.view(1, slice_h, slice_w, 3),
+			channels={"pred_dt"},
+		).pred_dt
 		if sampled is None:
 			continue
 		pred = sampled.squeeze(0).squeeze(0).squeeze(0)
@@ -738,17 +784,16 @@ def _write_anticipatory_fit_debug_mosaic(
 		rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 		rgb = cv2.resize(rgb, (slice_w * up, slice_h * up), interpolation=cv2.INTER_NEAREST)
 		y0 = int(round((0.0 + 1.0) * 0.5 * (slice_h - 1) * up))
-		best_angle = float(candidates["angle_rad"][cand_i].detach().cpu()) if "angle_rad" in candidates else 0.0
+		best_offset = float(candidates["offset"][cand_i].detach().cpu()) if "offset" in candidates else 0.0
 		x_root = int(round((0.0 + 0.25) / 1.5 * (slice_w - 1) * up))
 		x_tip = int(round((1.0 + 0.25) / 1.5 * (slice_w - 1) * up))
-		x_tip_rot = int(round(((np.cos(best_angle) + 0.25) / 1.5) * (slice_w - 1) * up))
-		y_tip_rot = int(round(((line_len.detach().cpu().item() * np.sin(best_angle) / search_radius + 1.0) * 0.5) * (slice_h - 1) * up))
+		y_tip_offset = int(round(((best_offset / search_radius) + 1.0) * 0.5 * (slice_h - 1) * up))
 		cv2.line(rgb, (x_root, y0), (x_tip, y0), (140, 140, 140), 1, cv2.LINE_AA)
 		cv2.circle(rgb, (x_root, y0), 3, (255, 128, 0), -1, cv2.LINE_AA)
 		cv2.circle(rgb, (x_tip, y0), 3, (255, 0, 128), -1, cv2.LINE_AA)
 		draw_text_bg(rgb, "R0", (max(0, x_root - 8), max(10, y0 - 6)), 0.28, (255, 128, 0))
 		draw_text_bg(rgb, "T0", (min(rgb.shape[1] - 20, x_tip + 3), max(10, y0 - 6)), 0.28, (255, 0, 128))
-		cv2.line(rgb, (x_root, y0), (x_tip_rot, y_tip_rot), (0, 255, 255), 1, cv2.LINE_AA)
+		cv2.line(rgb, (x_root, y0), (x_tip, y_tip_offset), (0, 255, 255), 1, cv2.LINE_AA)
 		inliers = candidates["inliers"][cand_i].detach().cpu().numpy()
 		baseline_scores: list[float] | None = None
 		if 0 <= y0 // up < gray.shape[0]:
@@ -756,11 +801,10 @@ def _write_anticipatory_fit_debug_mosaic(
 		for si, score in enumerate(inliers):
 			a = si / max(1, len(inliers) - 1)
 			xp = int(round(((a + 0.25) / 1.5) * (slice_w - 1) * up))
-			xp_rot = int(round(((a * np.cos(best_angle) + 0.25) / 1.5) * (slice_w - 1) * up))
-			yp_rot = int(round(((a * line_len.detach().cpu().item() * np.sin(best_angle) / search_radius + 1.0) * 0.5) * (slice_h - 1) * up))
-			cv2.circle(rgb, (xp_rot, yp_rot), 2, (0, 0, 255), -1, cv2.LINE_AA)
+			yp = int(round(((a * best_offset / search_radius) + 1.0) * 0.5 * (slice_h - 1) * up))
+			cv2.circle(rgb, (xp, yp), 2, (0, 0, 255), -1, cv2.LINE_AA)
 			if si < 8:
-				draw_text_bg(rgb, f"{score:.2f}", (max(0, xp_rot - 14), min(rgb.shape[0] - 4, yp_rot + 16 + (si % 2) * 12)), 0.28, (255, 255, 255))
+				draw_text_bg(rgb, f"{score:.2f}", (max(0, xp - 14), min(rgb.shape[0] - 4, yp + 16 + (si % 2) * 12)), 0.28, (255, 255, 255))
 			if baseline_scores is not None:
 				xg = max(0, min(gray.shape[1] - 1, int(round(xp / up))))
 				yg = max(0, min(gray.shape[0] - 1, int(round(y0 / up))))
@@ -770,7 +814,8 @@ def _write_anticipatory_fit_debug_mosaic(
 					draw_text_bg(rgb, f"{baseline_scores[-1]:.2f}", (max(0, xp - 14), max(10, y0 - 10 - (si % 2) * 12)), 0.28, (255, 180, 0))
 		prefix = float(candidates["prefix"][cand_i].detach().cpu())
 		draw_text_bg(rgb, f"{label} tip=({th},{tw}) root=({rh},{rw})", (6, 12), 0.35, (255, 255, 255))
-		draw_text_bg(rgb, f"line={prefix:.3f} angle={np.rad2deg(best_angle):.1f}", (6, 26), 0.35, (0, 255, 255))
+		eq_angle = np.rad2deg(np.arctan2(best_offset, float(ref_step.detach().cpu())))
+		draw_text_bg(rgb, f"line={prefix:.3f} off={best_offset:.1f} eq={eq_angle:.1f}", (6, 26), 0.35, (0, 255, 255))
 		cv2.line(rgb, (0, y0), (rgb.shape[1] - 1, y0), (96, 96, 96), 1, cv2.LINE_AA)
 		tiles.append(rgb)
 	if not tiles:
@@ -1142,10 +1187,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						out_dir=_flow_gate_out_dir,
 					)
 				return weight, None
-			raise RuntimeError(
-				f"{exc}; pred_dt source_value={source_value} "
-				f"wrote debug to {_flow_gate_out_dir}"
-			) from exc
+			raise
 		flow_lr = torch.as_tensor(
 			query_flow.reshape(Hm, Wm),
 			device=res.xyz_lr.device,
@@ -1284,14 +1326,10 @@ def pred_dt_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[tor
 	lm = lm_out + 0.25 * lm_in
 	"""
 	# Project gradients onto surface normal only (prevents tangential crimping)
-	n = _vertex_normals(res.xyz_lr.detach())
-	proj_len = (res.xyz_lr * n).sum(dim=-1, keepdim=True)
-	xyz_normal = proj_len * n
-	xyz_tangential = res.xyz_lr - xyz_normal
-	xyz = xyz_normal + xyz_tangential.detach()
+	xyz = _pred_dt_loss_sample_xyz(res)
 
 	# Sample pred_dt using common sampling with per-channel spacing and diff gradients
-	sampled = res.data.grid_sample_fullres(xyz, diff=True)
+	sampled = res.data.grid_sample_fullres(xyz, diff=True, channels={"pred_dt"})
 	sampled_raw = sampled.pred_dt.squeeze(0).permute(1, 0, 2, 3)  # (D, 1, Hm, Wm)
 
 	lm_out = (127.0 - sampled_raw).clamp(min=0)      # outside: 1–47, inside: 0 (no grad)

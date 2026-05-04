@@ -1,6 +1,7 @@
 """Sparse GPU chunk cache for streaming zarr volumes."""
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import TYPE_CHECKING
@@ -233,20 +234,95 @@ class SparseChunkGroupCache:
               f"total={total} ({total_mib:.1f}MiB)", flush=True)
 
     def grid_sample(self, xyz_fullres: torch.Tensor, origin: torch.Tensor,
-                    inv_scale: torch.Tensor, *, diff: bool = False) -> torch.Tensor:
+                    inv_scale: torch.Tensor, *, diff: bool = False,
+                    context: str = "") -> torch.Tensor:
         """Sample from sparse chunk cache.
 
         Returns (C, D, H, W) — uint8 for non-diff, float32 for diff.
         """
+        check_enabled = os.environ.get("LASAGNA_CHECK_SPARSE_CACHE", "1") != "0"
+        if check_enabled:
+            self._check_sample_chunks_loaded(
+                xyz_fullres,
+                origin,
+                inv_scale,
+                context=context,
+            )
         if diff:
             from sparse_grid_sample_3d_u8_diff import sparse_grid_sample_3d_u8_diff
-            return sparse_grid_sample_3d_u8_diff(
+            out = sparse_grid_sample_3d_u8_diff(
                 self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
             )
         else:
             from sparse_grid_sample_3d_u8 import sparse_grid_sample_3d_u8
-            return sparse_grid_sample_3d_u8(
+            out = sparse_grid_sample_3d_u8(
                 self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
+            )
+        if check_enabled:
+            try:
+                torch.cuda.synchronize(self.device)
+            except RuntimeError as exc:
+                shape = tuple(int(v) for v in xyz_fullres.shape)
+                ctx = f" context={context}" if context else ""
+                raise RuntimeError(
+                    "sparse CUDA sample failed after cache coverage check: "
+                    f"channels={','.join(self.channels)}{ctx} diff={diff} "
+                    f"sample_shape={shape} loaded_chunks={self.loaded_chunks()} "
+                    f"chunk_grid={self.chunk_grid}"
+                ) from exc
+        return out
+
+    def _check_sample_chunks_loaded(
+        self,
+        xyz_fullres: torch.Tensor,
+        origin: torch.Tensor,
+        inv_scale: torch.Tensor,
+        *,
+        context: str = "",
+    ) -> None:
+        """Fail before CUDA sampling when in-volume sample chunks were not prefetched."""
+        cZ, cY, cX = self.chunk_grid
+        with torch.no_grad():
+            flat = xyz_fullres.reshape(-1, 3)
+            local = (flat - origin.view(1, 3)) * inv_scale.view(1, 3)
+            finite = torch.isfinite(local).all(dim=1)
+            ci_x = torch.floor(local[:, 0] / float(_CHUNK_SIZE)).to(torch.long)
+            ci_y = torch.floor(local[:, 1] / float(_CHUNK_SIZE)).to(torch.long)
+            ci_z = torch.floor(local[:, 2] / float(_CHUNK_SIZE)).to(torch.long)
+            in_bounds = (
+                finite &
+                (ci_x >= 0) & (ci_x < cX) &
+                (ci_y >= 0) & (ci_y < cY) &
+                (ci_z >= 0) & (ci_z < cZ)
+            )
+            if not bool(in_bounds.any().detach().cpu()):
+                return
+            idx = in_bounds.nonzero(as_tuple=False).flatten()
+            loaded = self.chunk_table[ci_z[idx], ci_y[idx], ci_x[idx]] != 0
+            if bool(loaded.all().detach().cpu()):
+                return
+            missing_idx = idx[~loaded]
+            first = missing_idx[:8]
+            first_local = local[first].detach().cpu().numpy()
+            first_full = flat[first].detach().cpu().numpy()
+            first_chunks = torch.stack(
+                [ci_z[first], ci_y[first], ci_x[first]], dim=1
+            ).detach().cpu().numpy()
+            total = int(flat.shape[0])
+            n_in = int(idx.numel())
+            n_missing = int(missing_idx.numel())
+            loaded_total = int((self.chunk_table != 0).sum().detach().cpu())
+            ctx = f" context={context}" if context else ""
+            raise RuntimeError(
+                "sparse chunk cache miss before CUDA sample: "
+                f"channels={','.join(self.channels)}{ctx} "
+                f"missing={n_missing}/{n_in} in-volume samples "
+                f"total_samples={total} loaded_chunks={loaded_total} "
+                f"chunk_grid={cZ}x{cY}x{cX} "
+                f"first_chunks_zyx={first_chunks.tolist()} "
+                f"first_local_xyz={first_local.tolist()} "
+                f"first_full_xyz={first_full.tolist()}. "
+                "Set LASAGNA_CHECK_SPARSE_CACHE=0 to disable this debug guard."
             )
 
     def loaded_chunks(self) -> int:

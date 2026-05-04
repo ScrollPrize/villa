@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 
@@ -18,6 +19,16 @@ import opt_loss_corr
 import opt_loss_winding_volume
 import opt_loss_station
 import opt_loss_bend
+
+
+def _debug_cuda_sync(label: str) -> None:
+	if os.environ.get("LASAGNA_SYNC_DEBUG", "0") == "0":
+		return
+	if torch.cuda.is_available():
+		try:
+			torch.cuda.synchronize()
+		except RuntimeError as exc:
+			raise RuntimeError(f"CUDA failure after {label}") from exc
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -462,6 +473,30 @@ def optimize(
 			data = ensure_data_fn(data, _needed_channels)
 			_stage_done(f"{label}.ensure_data", _t)
 
+		def _prefetch_loss_points_for_result(res_) -> None:
+			if not _active_caches:
+				return
+			with torch.no_grad():
+				_loss_prefetch_items = opt_loss_pred_dt.flow_gate_prefetch_items_for_result(
+					res=res_,
+					cfg=pred_dt_flow_gate_cfg,
+				)
+			if not _loss_prefetch_items:
+				return
+			for _cache in _active_caches:
+				points = [
+					_loss_prefetch_items[ch].reshape(1, 1, -1, 3)
+					for ch in _cache.channels
+					if ch in _loss_prefetch_items
+				]
+				if points:
+					_pf = torch.cat(points, dim=2) if len(points) > 1 else points[0]
+					_sp = data._spacing_for(_cache.channels[0])
+					_cache.prefetch(_pf, data.origin_fullres, _sp)
+			for _cache in _active_caches:
+				if any(ch in _loss_prefetch_items for ch in _cache.channels):
+					_cache.sync()
+
 		# Initial evaluation
 		def _eval_terms(res_, eff_, *, profile_label: str | None = None):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
@@ -482,6 +517,7 @@ def optimize(
 						continue
 				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				result = t["loss"](res=res_)
+				_debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
 				if _t_loss is not None:
 					_stage_done(f"{profile_label}.{name}", _t_loss)
 				if isinstance(result, dict):
@@ -509,6 +545,17 @@ def optimize(
 			for _cache in data.sparse_caches.values():
 				if _stage_channels & set(_cache.channels):
 					_active_caches.append(_cache)
+			_active_channels = {
+				ch
+				for _cache in _active_caches
+				for ch in _cache.channels
+			}
+			_unwanted_optional = (_active_channels & {"cos", "pred_dt"}) - _needed_channels
+			if _unwanted_optional:
+				raise RuntimeError(
+					f"{label}: streaming cache has optional channel(s) not needed by this stage: "
+					f"{sorted(_unwanted_optional)}; needed={sorted(_needed_channels)}"
+				)
 
 		# Initial prefetch for streaming mode
 		if _active_caches:
@@ -551,7 +598,12 @@ def optimize(
 		with torch.no_grad():
 			_t_forward = _stage_start(f"{label}.initial_eval.model_forward")
 			res0 = model(data)
+			_debug_cuda_sync(f"{label}.initial_eval.model_forward")
 			_stage_done(f"{label}.initial_eval.model_forward", _t_forward)
+			_t_loss_prefetch = _stage_start(f"{label}.initial_eval.loss_prefetch")
+			_prefetch_loss_points_for_result(res0)
+			_debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
+			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
 			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
 			loss0, term_vals0 = _eval_terms(
 				res0, opt_cfg.eff, profile_label=f"{label}.initial_eval.loss")
@@ -591,6 +643,9 @@ def optimize(
 			if fit_data.CHUNK_STATS_ENABLED:
 				fit_data._chunk_stats.begin_iteration()
 			res = model(data)
+			_debug_cuda_sync(f"{label}.{step + 1}.model_forward")
+			_prefetch_loss_points_for_result(res)
+			_debug_cuda_sync(f"{label}.{step + 1}.loss_prefetch")
 			loss, term_vals = _eval_terms(res, opt_cfg.eff)
 			if fit_data.CHUNK_STATS_ENABLED:
 				fit_data._chunk_stats.end_iteration()

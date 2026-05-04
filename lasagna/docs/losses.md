@@ -86,10 +86,10 @@ CLI option:
 
 `anticipatory_pull` is optional and only runs with active flow gating. It scores
 all one-step LR neighbor lines before flow weights are known, using subsampled
-`pred_dt` values along each line. Each candidate is brute-force searched by
-rotating the root->tip segment around the root point; the rotation axis is the
-local mesh tangent through the root and perpendicular to the root->tip grid
-direction. By default it evaluates 21 angles between `-60` and `+60` degrees.
+`pred_dt` values along each line. Each candidate keeps the root fixed and
+brute-force searches a tip push/pull along the GT normal sampled at the current
+tip position. The default range uses 21 offsets equivalent to `-60` to `+60`
+degrees on a flat mesh with the canonical `mesh_step` as reference length.
 After flow returns, each candidate whose root gate is higher/nonzero and whose
 tip gate is below 1 contributes an independent straight pull to the tip corner,
 weighted by root gate and prefix inlier score. The pull is not winner-take-all;
