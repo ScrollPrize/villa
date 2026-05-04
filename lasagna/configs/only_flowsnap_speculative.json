@@ -33,7 +33,7 @@
 						"samples": 8,
 						"inlier_zero": 80.0,
 						"inlier_one": 120.0,
-						"loss_weight": 0.0,
+						"loss_weight": 0.1,
 						"_debug_roi_center_xyz": [17499, 13412, 51144],
 						"debug_roi_k": 8,
 						"debug_roi_root_min": 0.5,
