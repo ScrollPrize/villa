@@ -2,9 +2,12 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include "utils/Json.hpp"
@@ -37,12 +40,19 @@ public:
 
     static std::shared_ptr<Volume> New(std::filesystem::path path);
 
+    struct PyramidPolicy {
+        // Per-level downsample from one level to the next in zarr/storage order
+        // [z, y, x]. The default creates a conventional 2x pyramid in all dims.
+        std::array<double, 3> downsampleZYX{2.0, 2.0, 2.0};
+    };
+
     struct ZarrCreateOptions {
         // Base level shape in zarr/storage order: [z, y, x].
         std::array<size_t, 3> shapeZYX{};
         std::array<size_t, 3> chunkShapeZYX{64, 64, 64};
         vc::render::ChunkDtype dtype = vc::render::ChunkDtype::UInt8;
         size_t numLevels = 1;
+        PyramidPolicy pyramid;
         double fillValue = 0.0;
         double voxelSize = 1.0;
         std::string voxelUnit;
@@ -160,8 +170,8 @@ public:
                  MissingScaleLevelPolicy missingPolicy = MissingScaleLevelPolicy::Error);
 
     // Local zarr region writes. Input arrays are indexed/stored as [z, y, x].
-    // Writes to level 0 update coarser pyramid levels by exact integer mean
-    // downsampling over 2x2x2 blocks.
+    // Writes update coarser pyramid levels by mean downsampling using each
+    // adjacent level's shape ratio.
     void writeZYX(const Array3D<uint8_t>& data,
                   const std::array<int, 3>& offsetZYX,
                   int level = 0);
@@ -174,6 +184,29 @@ public:
     void writeXYZ(const Array3D<uint16_t>& data,
                   const std::array<int, 3>& offsetXYZ,
                   int level = 0);
+
+    // Local zarr chunk I/O. Chunk coordinates are [z, y, x]. Data is raw,
+    // uncompressed chunk payload with exactly chunk_elems * dtype_size bytes.
+    [[nodiscard]] std::optional<std::vector<std::byte>> readChunk(
+        int level,
+        const std::array<size_t, 3>& chunkZYX) const;
+    [[nodiscard]] std::vector<std::byte> readChunkOrFill(
+        int level,
+        const std::array<size_t, 3>& chunkZYX) const;
+    struct ChunkWriteOptions {
+        // When false, chunks containing only the zarr fill value are removed
+        // instead of written, matching zarr's write_empty_chunks=false behavior.
+        bool writeEmptyChunks = true;
+    };
+    void writeChunk(int level,
+                    const std::array<size_t, 3>& chunkZYX,
+                    std::span<const std::byte> data);
+    void writeChunk(int level,
+                    const std::array<size_t, 3>& chunkZYX,
+                    std::span<const std::byte> data,
+                    ChunkWriteOptions options);
+    bool removeChunk(int level,
+                     const std::array<size_t, 3>& chunkZYX);
 
     [[nodiscard]] static bool checkDir(const std::filesystem::path& path);
 

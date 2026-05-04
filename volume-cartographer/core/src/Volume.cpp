@@ -9,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -422,9 +423,30 @@ std::vector<size_t> toVector(const std::array<size_t, 3>& value)
     return {value[0], value[1], value[2]};
 }
 
-std::array<size_t, 3> ceilHalfShape(const std::array<size_t, 3>& shape)
+void validatePyramidPolicy(const Volume::PyramidPolicy& policy)
 {
-    return {(shape[0] + 1) / 2, (shape[1] + 1) / 2, (shape[2] + 1) / 2};
+    for (double scale : policy.downsampleZYX) {
+        if (!std::isfinite(scale) || scale < 1.0) {
+            throw std::runtime_error("Volume pyramid downsample values must be finite and >= 1.0");
+        }
+    }
+}
+
+size_t downsampledDim(size_t dim, double scale)
+{
+    if (scale <= 1.0)
+        return dim;
+    return std::max<size_t>(1, static_cast<size_t>(std::ceil(static_cast<double>(dim) / scale)));
+}
+
+std::array<size_t, 3> downsampledShape(const std::array<size_t, 3>& shape,
+                                       const Volume::PyramidPolicy& policy)
+{
+    return {
+        downsampledDim(shape[0], policy.downsampleZYX[0]),
+        downsampledDim(shape[1], policy.downsampleZYX[1]),
+        downsampledDim(shape[2], policy.downsampleZYX[2]),
+    };
 }
 
 std::array<size_t, 3> clampChunkShape(const std::array<size_t, 3>& chunkShape,
@@ -521,6 +543,37 @@ void readZarrRegionZYX(utils::ZarrArray& array,
     }
 }
 
+size_t zarrDtypeSize(const utils::ZarrArray& array)
+{
+    return utils::dtype_size(array.metadata().dtype);
+}
+
+std::vector<std::byte> filledChunkBytes(const utils::ZarrArray& array)
+{
+    const size_t chunkElems = array.metadata().sub_chunk_byte_size() / zarrDtypeSize(array);
+    const size_t dtypeSize = zarrDtypeSize(array);
+    std::vector<std::byte> out(chunkElems * dtypeSize);
+    const double fill = array.metadata().fill_value.value_or(0.0);
+    switch (array.metadata().dtype) {
+    case utils::ZarrDtype::uint8:
+        fillRawChunk<uint8_t>(out, typedFillValue<uint8_t>(fill));
+        break;
+    case utils::ZarrDtype::uint16:
+        fillRawChunk<uint16_t>(out, typedFillValue<uint16_t>(fill));
+        break;
+    default:
+        throw std::runtime_error("Volume chunk fill only supports uint8 and uint16");
+    }
+    return out;
+}
+
+bool chunkMatchesFill(const utils::ZarrArray& array, std::span<const std::byte> data)
+{
+    const auto fill = filledChunkBytes(array);
+    return data.size() == fill.size() &&
+           std::equal(data.begin(), data.end(), fill.begin());
+}
+
 template <typename T>
 void writeZarrRegionZYX(utils::ZarrArray& array,
                         const Array3D<T>& data,
@@ -612,6 +665,64 @@ void writeZarrRegionZYX(utils::ZarrArray& array,
     }
 }
 
+template <typename T>
+void downsampleMeanZYX(Array3D<T>& out,
+                       const Array3D<T>& src,
+                       const std::array<size_t, 3>& srcOffsetZYX,
+                       const std::array<size_t, 3>& srcVolumeShapeZYX,
+                       const std::array<double, 3>& scaleZYX)
+{
+    const auto outShape = out.shape();
+    const auto srcShape = src.shape();
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (std::int64_t z = 0; z < static_cast<std::int64_t>(outShape[0]); ++z) {
+        for (std::int64_t y = 0; y < static_cast<std::int64_t>(outShape[1]); ++y) {
+            for (std::size_t x = 0; x < outShape[2]; ++x) {
+                const std::array<size_t, 3> dstAbs{
+                    static_cast<size_t>(z),
+                    static_cast<size_t>(y),
+                    x,
+                };
+                std::array<size_t, 3> srcBegin{};
+                std::array<size_t, 3> srcEnd{};
+                for (size_t d = 0; d < 3; ++d) {
+                    const double begin = static_cast<double>(dstAbs[d]) * scaleZYX[d];
+                    const double end = static_cast<double>(dstAbs[d] + 1) * scaleZYX[d];
+                    srcBegin[d] = std::min(srcVolumeShapeZYX[d],
+                                           static_cast<size_t>(std::floor(begin)));
+                    srcEnd[d] = std::min(srcVolumeShapeZYX[d],
+                                         static_cast<size_t>(std::ceil(end)));
+                    if (srcEnd[d] <= srcBegin[d] && srcBegin[d] < srcVolumeShapeZYX[d])
+                        srcEnd[d] = srcBegin[d] + 1;
+                }
+
+                std::uint64_t sum = 0;
+                std::uint64_t count = 0;
+                for (size_t szAbs = srcBegin[0]; szAbs < srcEnd[0]; ++szAbs) {
+                    const size_t sz = szAbs - srcOffsetZYX[0];
+                    if (sz >= srcShape[0])
+                        continue;
+                    for (size_t syAbs = srcBegin[1]; syAbs < srcEnd[1]; ++syAbs) {
+                        const size_t sy = syAbs - srcOffsetZYX[1];
+                        if (sy >= srcShape[1])
+                            continue;
+                        for (size_t sxAbs = srcBegin[2]; sxAbs < srcEnd[2]; ++sxAbs) {
+                            const size_t sx = sxAbs - srcOffsetZYX[2];
+                            if (sx >= srcShape[2])
+                                continue;
+                            sum += src(sz, sy, sx);
+                            ++count;
+                        }
+                    }
+                }
+                out(static_cast<size_t>(z), static_cast<size_t>(y), x) =
+                    count == 0 ? T{} : static_cast<T>((sum + count / 2) / count);
+            }
+        }
+    }
+}
+
 void writeTextFile(const std::filesystem::path& path, const std::string& text)
 {
     std::filesystem::create_directories(path.parent_path());
@@ -630,6 +741,7 @@ void createLocalOmeZarr(const std::filesystem::path& path,
         throw std::runtime_error("Volume::New zarr creation requires a non-empty shapeZYX");
     if (options.numLevels == 0)
         throw std::runtime_error("Volume::New zarr creation requires at least one level");
+    validatePyramidPolicy(options.pyramid);
 
     if (options.overwriteExisting) {
         std::error_code ec;
@@ -658,7 +770,7 @@ void createLocalOmeZarr(const std::filesystem::path& path,
         utils::ZarrArray::create(path / std::to_string(level),
                                  std::move(meta),
                                  zarrCodecFor(options.compressor, options.compressionLevel));
-        levelShape = ceilHalfShape(levelShape);
+        levelShape = downsampledShape(levelShape, options.pyramid);
     }
 
     const auto baseName = path.filename().string();
@@ -693,11 +805,18 @@ void createLocalOmeZarr(const std::filesystem::path& path,
     multiscale["axes"] = std::move(axes);
     multiscale["datasets"] = utils::Json::array();
     for (size_t level = 0; level < options.numLevels; ++level) {
-        const double scale = options.voxelSize * static_cast<double>(size_t{1} << level);
+        double scaleZ = options.voxelSize;
+        double scaleY = options.voxelSize;
+        double scaleX = options.voxelSize;
+        for (size_t i = 0; i < level; ++i) {
+            scaleZ *= options.pyramid.downsampleZYX[0];
+            scaleY *= options.pyramid.downsampleZYX[1];
+            scaleX *= options.pyramid.downsampleZYX[2];
+        }
         utils::Json scaleValues = utils::Json::array();
-        scaleValues.push_back(scale);
-        scaleValues.push_back(scale);
-        scaleValues.push_back(scale);
+        scaleValues.push_back(scaleZ);
+        scaleValues.push_back(scaleY);
+        scaleValues.push_back(scaleX);
         utils::Json transforms = utils::Json::array();
         transforms.push_back(utils::Json{{"type", "scale"}, {"scale", std::move(scaleValues)}});
         multiscale["datasets"].push_back(utils::Json{
@@ -724,6 +843,25 @@ std::filesystem::path zarrArrayPathForLevel(const std::filesystem::path& root, i
         return root;
     }
     return levelPath;
+}
+
+bool hasAnyLocalZarrArray(const std::filesystem::path& path)
+{
+    if (std::filesystem::exists(path / ".zarray") ||
+        std::filesystem::exists(path / "zarr.json")) {
+        return true;
+    }
+    if (!std::filesystem::is_directory(path))
+        return false;
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+        if (!entry.is_directory())
+            continue;
+        if (std::filesystem::exists(entry.path() / ".zarray") ||
+            std::filesystem::exists(entry.path() / "zarr.json")) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -797,8 +935,7 @@ bool Volume::checkDir(const std::filesystem::path& path)
     return std::filesystem::is_directory(path) &&
            (std::filesystem::exists(path / METADATA_FILE) ||
             std::filesystem::exists(path / METADATA_FILE_ALT) ||
-            std::filesystem::exists(path / ".zgroup") ||
-            std::filesystem::exists(path / ".zattrs"));
+            hasAnyLocalZarrArray(path));
 }
 
 static int ceilDivPow2(int v, int level)
@@ -911,7 +1048,7 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path)
 std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
                                     const ZarrCreateOptions& options)
 {
-    if (options.overwriteExisting || !checkDir(path)) {
+    if (options.overwriteExisting || !hasAnyLocalZarrArray(path)) {
         createLocalOmeZarr(path, options);
     }
     return std::make_shared<Volume>(std::move(path));
@@ -1329,41 +1466,65 @@ static void writeVolumeZYX(Volume& volume,
         const int srcLevel = dstLevel - 1;
         auto srcArray = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), srcLevel));
         auto dstArray = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), dstLevel));
+        const auto srcVolumeShapeInt = volume.shape(srcLevel);
+        const auto dstVolumeShapeInt = volume.shape(dstLevel);
+        std::array<size_t, 3> srcVolumeShape{
+            static_cast<size_t>(srcVolumeShapeInt[0]),
+            static_cast<size_t>(srcVolumeShapeInt[1]),
+            static_cast<size_t>(srcVolumeShapeInt[2]),
+        };
+        std::array<size_t, 3> dstVolumeShape{
+            static_cast<size_t>(dstVolumeShapeInt[0]),
+            static_cast<size_t>(dstVolumeShapeInt[1]),
+            static_cast<size_t>(dstVolumeShapeInt[2]),
+        };
+        std::array<double, 3> scaleZYX{};
+        for (size_t d = 0; d < 3; ++d) {
+            scaleZYX[d] = static_cast<double>(srcVolumeShape[d]) /
+                          static_cast<double>(std::max<size_t>(1, dstVolumeShape[d]));
+            if (scaleZYX[d] < 1.0)
+                scaleZYX[d] = 1.0;
+        }
 
         std::array<size_t, 3> dstOffset{};
         std::array<size_t, 3> dstEnd{};
         std::array<size_t, 3> dstShape{};
         for (size_t d = 0; d < 3; ++d) {
             const size_t srcEnd = affectedOffset[d] + affectedShape[d];
-            dstOffset[d] = affectedOffset[d] / 2;
-            dstEnd[d] = (srcEnd + 1) / 2;
-            dstShape[d] = dstEnd[d] - dstOffset[d];
+            dstOffset[d] = std::min(
+                dstVolumeShape[d],
+                static_cast<size_t>(std::floor(static_cast<double>(affectedOffset[d]) / scaleZYX[d])));
+            dstEnd[d] = std::min(
+                dstVolumeShape[d],
+                static_cast<size_t>(std::ceil(static_cast<double>(srcEnd) / scaleZYX[d])));
+            dstShape[d] = dstEnd[d] > dstOffset[d] ? dstEnd[d] - dstOffset[d] : 0;
         }
         if (dstShape[0] == 0 || dstShape[1] == 0 || dstShape[2] == 0)
             break;
 
-        const auto srcVolumeShape = volume.shape(srcLevel);
         std::array<size_t, 3> srcReadOffset{
-            dstOffset[0] * 2,
-            dstOffset[1] * 2,
-            dstOffset[2] * 2,
+            std::min(srcVolumeShape[0], static_cast<size_t>(std::floor(static_cast<double>(dstOffset[0]) * scaleZYX[0]))),
+            std::min(srcVolumeShape[1], static_cast<size_t>(std::floor(static_cast<double>(dstOffset[1]) * scaleZYX[1]))),
+            std::min(srcVolumeShape[2], static_cast<size_t>(std::floor(static_cast<double>(dstOffset[2]) * scaleZYX[2]))),
+        };
+        std::array<size_t, 3> srcReadEnd{
+            std::min(srcVolumeShape[0], static_cast<size_t>(std::ceil(static_cast<double>(dstEnd[0]) * scaleZYX[0]))),
+            std::min(srcVolumeShape[1], static_cast<size_t>(std::ceil(static_cast<double>(dstEnd[1]) * scaleZYX[1]))),
+            std::min(srcVolumeShape[2], static_cast<size_t>(std::ceil(static_cast<double>(dstEnd[2]) * scaleZYX[2]))),
         };
         std::array<size_t, 3> srcReadShape{
-            std::min(dstShape[0] * 2, static_cast<size_t>(srcVolumeShape[0]) - srcReadOffset[0]),
-            std::min(dstShape[1] * 2, static_cast<size_t>(srcVolumeShape[1]) - srcReadOffset[1]),
-            std::min(dstShape[2] * 2, static_cast<size_t>(srcVolumeShape[2]) - srcReadOffset[2]),
+            srcReadEnd[0] > srcReadOffset[0] ? srcReadEnd[0] - srcReadOffset[0] : 0,
+            srcReadEnd[1] > srcReadOffset[1] ? srcReadEnd[1] - srcReadOffset[1] : 0,
+            srcReadEnd[2] > srcReadOffset[2] ? srcReadEnd[2] - srcReadOffset[2] : 0,
         };
+        if (srcReadShape[0] == 0 || srcReadShape[1] == 0 || srcReadShape[2] == 0)
+            break;
 
         Array3D<T> source(srcReadShape);
         readZarrRegionZYX(srcArray, source, srcReadOffset);
 
         Array3D<T> downsampled(dstShape);
-        std::array<int, 3> srcReadOffsetInt{
-            static_cast<int>(srcReadOffset[0]),
-            static_cast<int>(srcReadOffset[1]),
-            static_cast<int>(srcReadOffset[2]),
-        };
-        downsampleMeanZYX(downsampled, source, srcReadOffsetInt, srcVolumeShape, 2);
+        downsampleMeanZYX(downsampled, source, srcReadOffset, srcVolumeShape, scaleZYX);
         writeZarrRegionZYX(dstArray, downsampled, dstOffset);
 
         affectedOffset = dstOffset;
@@ -1399,4 +1560,95 @@ void Volume::writeXYZ(const Array3D<uint16_t>& data,
                       int level)
 {
     writeZYX(data, xyzToZyx(offsetXYZ), level);
+}
+
+std::optional<std::vector<std::byte>> Volume::readChunk(
+    int level,
+    const std::array<size_t, 3>& chunkZYX) const
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::readChunk is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::readChunk level must be non-negative");
+    if (!hasScaleLevel(level))
+        throw std::out_of_range("Volume::readChunk requested missing zarr scale level " + std::to_string(level));
+
+    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    return array.read_chunk(chunkZYX);
+}
+
+std::vector<std::byte> Volume::readChunkOrFill(
+    int level,
+    const std::array<size_t, 3>& chunkZYX) const
+{
+    if (auto chunk = readChunk(level, chunkZYX))
+        return std::move(*chunk);
+
+    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    return filledChunkBytes(array);
+}
+
+void Volume::writeChunk(int level,
+                        const std::array<size_t, 3>& chunkZYX,
+                        std::span<const std::byte> data)
+{
+    writeChunk(level, chunkZYX, data, ChunkWriteOptions{});
+}
+
+void Volume::writeChunk(int level,
+                        const std::array<size_t, 3>& chunkZYX,
+                        std::span<const std::byte> data,
+                        ChunkWriteOptions options)
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::writeChunk is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::writeChunk level must be non-negative");
+    if (!hasScaleLevel(level))
+        throw std::out_of_range("Volume::writeChunk requested missing zarr scale level " + std::to_string(level));
+
+    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    const size_t expectedBytes = array.metadata().sub_chunk_byte_size();
+    if (data.size() != expectedBytes) {
+        throw std::runtime_error("Volume::writeChunk byte count does not match zarr chunk byte size");
+    }
+
+    if (!options.writeEmptyChunks && chunkMatchesFill(array, data)) {
+        removeChunk(level, chunkZYX);
+        return;
+    }
+
+    if (array.is_sharded())
+        array.write_inner_chunk_to_shard(chunkZYX, data);
+    else
+        array.write_chunk(chunkZYX, data);
+    invalidateCache();
+}
+
+bool Volume::removeChunk(int level,
+                         const std::array<size_t, 3>& chunkZYX)
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::removeChunk is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::removeChunk level must be non-negative");
+    if (!hasScaleLevel(level))
+        throw std::out_of_range("Volume::removeChunk requested missing zarr scale level " + std::to_string(level));
+
+    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    if (array.is_sharded()) {
+        const bool existed = array.inner_chunk_exists(chunkZYX);
+        array.mark_inner_chunk_empty(chunkZYX);
+        invalidateCache();
+        return existed;
+    }
+
+    const auto chunkPath = array.chunk_path(chunkZYX);
+    std::error_code ec;
+    const bool removed = std::filesystem::remove(chunkPath, ec);
+    if (ec)
+        throw std::runtime_error("failed removing zarr chunk: " + chunkPath.string());
+    if (removed)
+        invalidateCache();
+    return removed;
 }
