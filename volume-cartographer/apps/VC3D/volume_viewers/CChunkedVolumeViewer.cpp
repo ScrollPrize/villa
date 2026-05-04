@@ -1108,7 +1108,6 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camSurfY = _surfacePtrY;
     _camScale = _scale;
     updateFocusMarker();
-    updateOverlayGroupPreviewTransforms();
 }
 
 bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
@@ -3011,20 +3010,20 @@ QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
 {
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    const qreal vx = (surfX - _camSurfX) * _camScale + vpCx;
-    const qreal vy = (surfY - _camSurfY) * _camScale + vpCy;
+    const qreal vx = (surfX - _surfacePtrX) * _scale + vpCx;
+    const qreal vy = (surfY - _surfacePtrY) * _scale + vpCy;
     return _view->mapToScene(QPointF(vx, vy).toPoint());
 }
 
 cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
 {
-    if (_framebuffer.isNull() || _camScale <= 0.0f)
+    if (_framebuffer.isNull() || _scale <= 0.0f)
         return {0, 0};
     const QPoint vp = _view->mapFromScene(scenePos);
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    return {(static_cast<float>(vp.x()) - vpCx) / _camScale + _camSurfX,
-            (static_cast<float>(vp.y()) - vpCy) / _camScale + _camSurfY};
+    return {(static_cast<float>(vp.x()) - vpCx) / _scale + _surfacePtrX,
+            (static_cast<float>(vp.y()) - vpCy) / _scale + _surfacePtrY};
 }
 
 QRectF CChunkedVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const
@@ -3167,22 +3166,11 @@ cv::Vec3f CChunkedVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
 void CChunkedVolumeViewer::setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items)
 {
     clearOverlayGroup(key);
-    OverlayGroupEntry entry;
-    entry.items = items;
-    entry.basePositions.reserve(items.size());
-    entry.baseTransforms.reserve(items.size());
-    entry.camSurfX = _camSurfX;
-    entry.camSurfY = _camSurfY;
-    entry.camScale = _camScale;
+    _overlayGroups[key] = items;
     for (auto* item : items) {
-        if (item && !item->scene()) {
+        if (item && !item->scene())
             _scene->addItem(item);
-        }
-        entry.basePositions.push_back(item ? item->pos() : QPointF());
-        entry.baseTransforms.push_back(item ? item->transform() : QTransform());
     }
-    _overlayGroups[key] = std::move(entry);
-    updateOverlayGroupPreviewTransforms();
 }
 
 void CChunkedVolumeViewer::clearOverlayGroup(const std::string& key)
@@ -3190,15 +3178,15 @@ void CChunkedVolumeViewer::clearOverlayGroup(const std::string& key)
     auto it = _overlayGroups.find(key);
     if (it == _overlayGroups.end())
         return;
-    for (auto* item : it->second.items)
+    for (auto* item : it->second)
         delete item;
     _overlayGroups.erase(it);
 }
 
 void CChunkedVolumeViewer::clearAllOverlayGroups()
 {
-    for (auto& [_, entry] : _overlayGroups) {
-        for (auto* item : entry.items)
+    for (auto& [_, items] : _overlayGroups) {
+        for (auto* item : items)
             delete item;
     }
     _overlayGroups.clear();
@@ -3428,42 +3416,6 @@ void CChunkedVolumeViewer::updateIntersectionPreviewTransform()
     for (auto* item : _intersectionItems) {
         if (item)
             item->setTransform(transform);
-    }
-}
-
-void CChunkedVolumeViewer::updateOverlayGroupPreviewTransforms()
-{
-    if (_overlayGroups.empty() || _camScale <= 0.0f || _framebuffer.isNull()) {
-        return;
-    }
-
-    const qreal vpCx = qreal(_framebuffer.width()) * 0.5;
-    const qreal vpCy = qreal(_framebuffer.height()) * 0.5;
-    for (auto& [_, entry] : _overlayGroups) {
-        if (entry.camScale <= 0.0f) {
-            continue;
-        }
-
-        const qreal scale = qreal(_camScale / entry.camScale);
-        const qreal tx = (qreal(entry.camSurfX) - qreal(_camSurfX)) * qreal(_camScale)
-                       + vpCx - vpCx * scale;
-        const qreal ty = (qreal(entry.camSurfY) - qreal(_camSurfY)) * qreal(_camScale)
-                       + vpCy - vpCy * scale;
-        const QTransform localScale = QTransform::fromScale(scale, scale);
-
-        const std::size_t count = std::min({entry.items.size(),
-                                            entry.basePositions.size(),
-                                            entry.baseTransforms.size()});
-        for (std::size_t i = 0; i < count; ++i) {
-            QGraphicsItem* item = entry.items[i];
-            if (!item) {
-                continue;
-            }
-            const QPointF basePos = entry.basePositions[i];
-            item->setPos(QPointF(basePos.x() * scale + tx,
-                                 basePos.y() * scale + ty));
-            item->setTransform(localScale * entry.baseTransforms[i]);
-        }
     }
 }
 

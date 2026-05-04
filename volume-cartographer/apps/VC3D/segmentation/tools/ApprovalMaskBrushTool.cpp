@@ -122,6 +122,8 @@ void ApprovalMaskBrushTool::startStroke(const cv::Vec3f& worldPos, const QPointF
 
     // Update hover position for brush circle display
     _hoverWorldPos = worldPos;
+    _hoverSurfacePos = surfacePos;
+    _hoverPlaneNormal = std::nullopt;
     _hoverEffectiveRadius = _module.approvalMaskBrushRadius();
 
     // Add the starting point for painting - compute grid position from surface coordinates
@@ -201,6 +203,8 @@ void ApprovalMaskBrushTool::extendStroke(const cv::Vec3f& worldPos, const QPoint
 
     // Update hover position for brush circle display during drag
     _hoverWorldPos = worldPos;
+    _hoverSurfacePos = surfacePos;
+    _hoverPlaneNormal = std::nullopt;
     // For flattened view, use full brush radius (no effective radius calculation needed)
     _hoverEffectiveRadius = _module.approvalMaskBrushRadius();
 

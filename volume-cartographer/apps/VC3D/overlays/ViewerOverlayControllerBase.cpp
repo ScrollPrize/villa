@@ -15,7 +15,6 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QBrush>
-#include <QTransform>
 #include <QVector>
 
 #include <algorithm>
@@ -206,8 +205,20 @@ void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
     ImagePrimitive prim;
     prim.image = image;
     prim.offset = offset;
-    prim.scaleX = scaleX;
-    prim.scaleY = scaleY;
+    prim.transform = QTransform::fromScale(scaleX, scaleY);
+    prim.opacity = opacity;
+    prim.z = z;
+    _primitives.emplace_back(std::move(prim));
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
+                                                            const QTransform& transform,
+                                                            qreal opacity,
+                                                            qreal z)
+{
+    ImagePrimitive prim;
+    prim.image = image;
+    prim.transform = transform;
     prim.opacity = opacity;
     prim.z = z;
     _primitives.emplace_back(std::move(prim));
@@ -789,7 +800,7 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                     item->setOpacity(std::clamp(prim.opacity, 0.0, 1.0));
                     item->setZValue(prim.z);
                     item->setPos(prim.offset);
-                    item->setTransform(QTransform::fromScale(prim.scaleX, prim.scaleY));
+                    item->setTransform(prim.transform);
 
                     scene->addItem(item);
                     items.push_back(item);

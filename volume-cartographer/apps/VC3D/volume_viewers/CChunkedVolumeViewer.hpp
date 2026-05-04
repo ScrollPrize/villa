@@ -283,7 +283,6 @@ private:
     void updateFocusMarker(POI* poi = nullptr);
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
-    void updateOverlayGroupPreviewTransforms();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
                                       const char* reason,
                                       std::source_location caller);
@@ -463,15 +462,7 @@ private:
     std::optional<cv::Vec3f> _lastCursorVolumePos;
 
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
-    struct OverlayGroupEntry {
-        std::vector<QGraphicsItem*> items;
-        std::vector<QPointF> basePositions;
-        std::vector<QTransform> baseTransforms;
-        float camSurfX = 0.0f;
-        float camSurfY = 0.0f;
-        float camScale = 0.0f;
-    };
-    std::unordered_map<std::string, OverlayGroupEntry> _overlayGroups;
+    std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
     QGraphicsItem* _focusMarker = nullptr;
 
