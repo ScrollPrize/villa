@@ -41,9 +41,16 @@ public:
     static std::shared_ptr<Volume> New(std::filesystem::path path);
 
     struct PyramidPolicy {
+        enum class Reduction {
+            Mean,
+            Max,
+            BinaryOr,
+        };
+
         // Per-level downsample from one level to the next in zarr/storage order
         // [z, y, x]. The default creates a conventional 2x pyramid in all dims.
         std::array<double, 3> downsampleZYX{2.0, 2.0, 2.0};
+        Reduction reduction = Reduction::Mean;
     };
 
     struct ZarrCreateOptions {
@@ -81,6 +88,11 @@ public:
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
     [[nodiscard]] const utils::Json& metadata() const noexcept { return metadata_; }
+    [[nodiscard]] utils::Json rootAttributes() const;
+    void writeRootAttributes(const utils::Json& attrs);
+    void updateRootAttributes(const utils::Json& attrs);
+    void writeMetadata(const utils::Json& metadata);
+    void updateMetadata(const utils::Json& metadata);
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
@@ -102,6 +114,10 @@ public:
     [[nodiscard]] std::vector<int> presentScaleLevels() const;
     [[nodiscard]] int firstPresentScaleLevel() const;
     [[nodiscard]] int finestPresentScaleLevelAtOrBelow(int level) const;
+    [[nodiscard]] PyramidPolicy::Reduction pyramidReduction() const noexcept
+    {
+        return pyramidReduction_;
+    }
 
     enum class MissingScaleLevelPolicy {
         Error,
@@ -193,6 +209,9 @@ public:
     [[nodiscard]] std::vector<std::byte> readChunkOrFill(
         int level,
         const std::array<size_t, 3>& chunkZYX) const;
+    [[nodiscard]] bool chunkExists(
+        int level,
+        const std::array<size_t, 3>& chunkZYX) const;
     struct ChunkWriteOptions {
         // When false, chunks containing only the zarr fill value are removed
         // instead of written, matching zarr's write_empty_chunks=false behavior.
@@ -221,6 +240,7 @@ protected:
 
     std::vector<std::array<int, 3>> zarrLevelShapes_;
     vc::render::ChunkDtype zarrDtype_ = vc::render::ChunkDtype::UInt8;
+    PyramidPolicy::Reduction pyramidReduction_ = PyramidPolicy::Reduction::Mean;
     void zarrOpen();
 
     // Cache ownership

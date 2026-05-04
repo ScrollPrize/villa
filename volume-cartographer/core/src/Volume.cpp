@@ -666,11 +666,12 @@ void writeZarrRegionZYX(utils::ZarrArray& array,
 }
 
 template <typename T>
-void downsampleMeanZYX(Array3D<T>& out,
-                       const Array3D<T>& src,
-                       const std::array<size_t, 3>& srcOffsetZYX,
-                       const std::array<size_t, 3>& srcVolumeShapeZYX,
-                       const std::array<double, 3>& scaleZYX)
+void downsampleZYX(Array3D<T>& out,
+                   const Array3D<T>& src,
+                   const std::array<size_t, 3>& srcOffsetZYX,
+                   const std::array<size_t, 3>& srcVolumeShapeZYX,
+                   const std::array<double, 3>& scaleZYX,
+                   Volume::PyramidPolicy::Reduction reduction)
 {
     const auto outShape = out.shape();
     const auto srcShape = src.shape();
@@ -699,6 +700,7 @@ void downsampleMeanZYX(Array3D<T>& out,
 
                 std::uint64_t sum = 0;
                 std::uint64_t count = 0;
+                T maxValue = T{};
                 for (size_t szAbs = srcBegin[0]; szAbs < srcEnd[0]; ++szAbs) {
                     const size_t sz = szAbs - srcOffsetZYX[0];
                     if (sz >= srcShape[0])
@@ -711,13 +713,28 @@ void downsampleMeanZYX(Array3D<T>& out,
                             const size_t sx = sxAbs - srcOffsetZYX[2];
                             if (sx >= srcShape[2])
                                 continue;
-                            sum += src(sz, sy, sx);
+                            const T value = src(sz, sy, sx);
+                            sum += value;
+                            maxValue = std::max(maxValue, value);
                             ++count;
                         }
                     }
                 }
-                out(static_cast<size_t>(z), static_cast<size_t>(y), x) =
-                    count == 0 ? T{} : static_cast<T>((sum + count / 2) / count);
+                T result = T{};
+                if (count != 0) {
+                    switch (reduction) {
+                    case Volume::PyramidPolicy::Reduction::Mean:
+                        result = static_cast<T>((sum + count / 2) / count);
+                        break;
+                    case Volume::PyramidPolicy::Reduction::Max:
+                        result = maxValue;
+                        break;
+                    case Volume::PyramidPolicy::Reduction::BinaryOr:
+                        result = maxValue == T{} ? T{} : T{1};
+                        break;
+                    }
+                }
+                out(static_cast<size_t>(z), static_cast<size_t>(y), x) = result;
             }
         }
     }
@@ -824,7 +841,19 @@ void createLocalOmeZarr(const std::filesystem::path& path,
             {"coordinateTransformations", std::move(transforms)}
         });
     }
-    multiscale["metadata"] = utils::Json{{"downsampling_method", "mean"}};
+    const char* downsamplingMethod = "mean";
+    switch (options.pyramid.reduction) {
+    case Volume::PyramidPolicy::Reduction::Mean:
+        downsamplingMethod = "mean";
+        break;
+    case Volume::PyramidPolicy::Reduction::Max:
+        downsamplingMethod = "max";
+        break;
+    case Volume::PyramidPolicy::Reduction::BinaryOr:
+        downsamplingMethod = "binary_or";
+        break;
+    }
+    multiscale["metadata"] = utils::Json{{"downsampling_method", downsamplingMethod}};
     attrs["multiscales"] = utils::Json::array();
     attrs["multiscales"].push_back(std::move(multiscale));
     writeTextFile(path / ".zattrs", attrs.dump(2) + "\n");
@@ -862,6 +891,15 @@ bool hasAnyLocalZarrArray(const std::filesystem::path& path)
         }
     }
     return false;
+}
+
+Volume::PyramidPolicy::Reduction reductionFromMethod(const std::string& method)
+{
+    if (method == "max")
+        return Volume::PyramidPolicy::Reduction::Max;
+    if (method == "binary_or" || method == "or" || method == "nearest")
+        return Volume::PyramidPolicy::Reduction::BinaryOr;
+    return Volume::PyramidPolicy::Reduction::Mean;
 }
 
 } // namespace
@@ -930,6 +968,59 @@ std::string Volume::name() const
     return metadata_["name"].get_string();
 }
 
+utils::Json Volume::rootAttributes() const
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::rootAttributes is only supported for local zarr volumes");
+    const auto attrsPath = path_ / ".zattrs";
+    if (!std::filesystem::exists(attrsPath))
+        return utils::Json::object();
+    return utils::Json::parse_file(attrsPath);
+}
+
+void Volume::writeRootAttributes(const utils::Json& attrs)
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::writeRootAttributes is only supported for local zarr volumes");
+    if (!attrs.is_object())
+        throw std::runtime_error("Volume::writeRootAttributes requires a JSON object");
+    writeTextFile(path_ / ".zattrs", attrs.dump(2) + "\n");
+}
+
+void Volume::updateRootAttributes(const utils::Json& attrs)
+{
+    if (!attrs.is_object())
+        throw std::runtime_error("Volume::updateRootAttributes requires a JSON object");
+    auto merged = rootAttributes();
+    merged.update(attrs);
+    writeRootAttributes(merged);
+}
+
+void Volume::writeMetadata(const utils::Json& metadata)
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::writeMetadata is only supported for local zarr volumes");
+    if (!metadata.is_object())
+        throw std::runtime_error("Volume::writeMetadata requires a JSON object");
+    writeTextFile(path_ / METADATA_FILE, metadata.dump(2) + "\n");
+    metadata_ = metadata;
+    if (metadata_.contains("width") && metadata_["width"].is_number())
+        _width = metadata_["width"].get_int();
+    if (metadata_.contains("height") && metadata_["height"].is_number())
+        _height = metadata_["height"].get_int();
+    if (metadata_.contains("slices") && metadata_["slices"].is_number())
+        _slices = metadata_["slices"].get_int();
+}
+
+void Volume::updateMetadata(const utils::Json& metadata)
+{
+    if (!metadata.is_object())
+        throw std::runtime_error("Volume::updateMetadata requires a JSON object");
+    auto merged = metadata_;
+    merged.update(metadata);
+    writeMetadata(merged);
+}
+
 bool Volume::checkDir(const std::filesystem::path& path)
 {
     return std::filesystem::is_directory(path) &&
@@ -955,6 +1046,23 @@ void Volume::zarrOpen()
     }
     zarrLevelShapes_ = opened.shapes;
     zarrDtype_ = opened.dtype;
+
+    try {
+        const auto attrs = rootAttributes();
+        if (attrs.contains("multiscales") && attrs["multiscales"].is_array() &&
+            attrs["multiscales"].size() > 0) {
+            const auto ms = attrs["multiscales"][0];
+            if (ms.contains("metadata") && ms["metadata"].is_object()) {
+                const auto meta = ms["metadata"];
+                if (meta.contains("downsampling_method") &&
+                    meta["downsampling_method"].is_string()) {
+                    pyramidReduction_ = reductionFromMethod(
+                        meta["downsampling_method"].get_string());
+                }
+            }
+        }
+    } catch (...) {
+    }
 
     if (metadataAutoGenerated_) {
         bool hasReference = false;
@@ -1051,7 +1159,9 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
     if (options.overwriteExisting || !hasAnyLocalZarrArray(path)) {
         createLocalOmeZarr(path, options);
     }
-    return std::make_shared<Volume>(std::move(path));
+    auto volume = std::make_shared<Volume>(std::move(path));
+    volume->pyramidReduction_ = options.pyramid.reduction;
+    return volume;
 }
 
 std::shared_ptr<Volume> Volume::NewFromUrl(
@@ -1524,7 +1634,12 @@ static void writeVolumeZYX(Volume& volume,
         readZarrRegionZYX(srcArray, source, srcReadOffset);
 
         Array3D<T> downsampled(dstShape);
-        downsampleMeanZYX(downsampled, source, srcReadOffset, srcVolumeShape, scaleZYX);
+        downsampleZYX(downsampled,
+                      source,
+                      srcReadOffset,
+                      srcVolumeShape,
+                      scaleZYX,
+                      volume.pyramidReduction_);
         writeZarrRegionZYX(dstArray, downsampled, dstOffset);
 
         affectedOffset = dstOffset;
@@ -1586,6 +1701,23 @@ std::vector<std::byte> Volume::readChunkOrFill(
 
     auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
     return filledChunkBytes(array);
+}
+
+bool Volume::chunkExists(
+    int level,
+    const std::array<size_t, 3>& chunkZYX) const
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::chunkExists is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::chunkExists level must be non-negative");
+    if (!hasScaleLevel(level))
+        throw std::out_of_range("Volume::chunkExists requested missing zarr scale level " + std::to_string(level));
+
+    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    if (array.is_sharded())
+        return array.inner_chunk_exists(chunkZYX);
+    return array.chunk_exists(chunkZYX);
 }
 
 void Volume::writeChunk(int level,
