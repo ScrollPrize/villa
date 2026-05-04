@@ -1027,7 +1027,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     updateNormalGridAvailability();
 
     if (_state->currentVolume() && _state) {
-        auto [w, h, d] = _state->currentVolume()->shape();
+        auto [w, h, d] = _state->currentVolume()->shapeXyz();
         float x0 = 0, y0 = 0, z0 = 0;
         float x1 = static_cast<float>(w - 1), y1 = static_cast<float>(h - 1), z1 = static_cast<float>(d - 1);
 
@@ -1541,7 +1541,7 @@ void CWindow::CreateWidgets(void)
                     normal = cv::Vec3f(0, 0, 1);
                 }
                 if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shape();
+                    auto [w, h, d] = vol->shapeXyz();
                     cv::Vec3f clamped = worldCenter;
                     clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
                     clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
@@ -2881,7 +2881,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
                 && worldCenter[0] >= 0.0f;
             if (centerValid) {
                 if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shape();
+                    auto [w, h, d] = vol->shapeXyz();
                     cv::Vec3f clamped = worldCenter;
                     clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
                     clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
@@ -3256,7 +3256,7 @@ void CWindow::onManualLocationChanged()
     }
 
     // Clamp values to physical volume bounds
-    auto [w, h, d] = _state->currentVolume()->shape();
+    auto [w, h, d] = _state->currentVolume()->shapeXyz();
     int cx0 = 0, cy0 = 0, cz0 = 0;
     int cx1 = w - 1, cy1 = h - 1, cz1 = d - 1;
 

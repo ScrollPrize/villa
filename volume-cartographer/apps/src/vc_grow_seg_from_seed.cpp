@@ -337,8 +337,12 @@ int main(int argc, char *argv[])
         volume->sliceWidth()};
     const auto chunk_shape_zyx = chunk_cache->chunkShape(0);
 
-    std::cout << "zarr dataset size for scale group 0 " << volume_shape_zyx << std::endl;
-    std::cout << "chunk shape shape " << chunk_shape_zyx << std::endl;
+    std::cout << "zarr dataset size for scale group 0 "
+              << "[" << volume_shape_zyx[0] << ", " << volume_shape_zyx[1] << ", " << volume_shape_zyx[2] << "]"
+              << std::endl;
+    std::cout << "chunk shape shape "
+              << "[" << chunk_shape_zyx[0] << ", " << chunk_shape_zyx[1] << ", " << chunk_shape_zyx[2] << "]"
+              << std::endl;
 
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> tensor(pass, volume_shape_zyx, chunk_cache, 0);

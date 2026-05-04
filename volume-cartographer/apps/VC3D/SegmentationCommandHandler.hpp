@@ -167,6 +167,7 @@ private:
      */
     QVector<VolumeSelector::VolumeOption> buildVolumeOptionList(
         QString* defaultOut = nullptr);
+    void configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath);
 
     QWidget* _parentWidget{nullptr};
     CState* _state{nullptr};

@@ -55,7 +55,10 @@ public:
     [[nodiscard]] int sliceWidth() const noexcept;
     [[nodiscard]] int sliceHeight() const noexcept;
     [[nodiscard]] int numSlices() const noexcept;
+    // Zarr/storage order: [z, y, x] = [slices, height, width].
     [[nodiscard]] std::array<int, 3> shape() const noexcept;
+    // Coordinate/UI order: [x, y, z] = [width, height, slices].
+    [[nodiscard]] std::array<int, 3> shapeXyz() const noexcept;
     [[nodiscard]] double voxelSize() const;
 
     [[nodiscard]] vc::VcDataset *zarrDataset(int level = 0) const;

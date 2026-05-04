@@ -986,7 +986,7 @@ void CChunkedVolumeViewer::ensureDefaultSurface()
 {
     if (_surfWeak.lock() || !_volume || !isAxisAlignedView())
         return;
-    const auto shape = _volume->shape();
+    const auto shape = _volume->shapeXyz();
     cv::Vec3f center(static_cast<float>(shape[0]) * 0.5f,
                      static_cast<float>(shape[1]) * 0.5f,
                      static_cast<float>(shape[2]) * 0.5f);
@@ -1014,7 +1014,7 @@ void CChunkedVolumeViewer::updateContentBounds()
     if (!plane)
         return;
 
-    const auto [w, h, d] = _volume->shape();
+    const auto [w, h, d] = _volume->shapeXyz();
     const float corners[][3] = {
         {0, 0, 0}, {float(w), 0, 0}, {0, float(h), 0}, {float(w), float(h), 0},
         {0, 0, float(d)}, {float(w), 0, float(d)}, {0, float(h), float(d)}, {float(w), float(h), float(d)}
@@ -2743,7 +2743,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
 {
     float maxZ = 10000.0f;
     if (_volume) {
-        const auto [w, h, d] = _volume->shape();
+        const auto [w, h, d] = _volume->shapeXyz();
         maxZ = static_cast<float>(std::max({w, h, d}));
     }
     _zOff = std::clamp(_zOff + delta, -maxZ, maxZ);
@@ -3539,7 +3539,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
 
     Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
     if (_volume) {
-        auto [w, h, d] = _volume->shape();
+        auto [w, h, d] = _volume->shapeXyz();
         allBounds.high = {static_cast<float>(w),
                           static_cast<float>(h),
                           static_cast<float>(d)};

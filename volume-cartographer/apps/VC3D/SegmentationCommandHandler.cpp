@@ -1378,6 +1378,38 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
     return options;
 }
 
+void SegmentationCommandHandler::configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath)
+{
+    if (!_cmdRunner) {
+        return;
+    }
+
+    _cmdRunner->setRemoteVolumeUrl(QString());
+    _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
+
+    if (!_state || !_state->vpkg() || volumePath.isEmpty()) {
+        return;
+    }
+
+    for (const auto& volumeId : _state->vpkg()->volumeIDs()) {
+        auto volume = _state->vpkg()->volume(volumeId);
+        if (!volume || !volume->isRemote()) {
+            continue;
+        }
+        if (commandPathForVolume(volume) != volumePath) {
+            continue;
+        }
+
+        const auto& auth = volume->remoteAuth();
+        _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteUrl()));
+        _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
+                                        QString::fromStdString(auth.secret_key),
+                                        QString::fromStdString(auth.session_token),
+                                        QString::fromStdString(auth.region));
+        return;
+    }
+}
+
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 {
     auto* surface = requireSurfaceAndRunner(segmentId, false);
@@ -1890,6 +1922,7 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
                                       QString::fromStdString(surf->path.string()),
                                       outputDirPath,
                                       QStringLiteral("local"));
+    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
     _cmdRunner->setOmpThreads(ompThreads);
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
@@ -2274,6 +2307,7 @@ bool SegmentationCommandHandler::startNeighborCopyPass(const QString& paramsPath
     }
 
     auto& job = *_neighborCopyJob;
+    configureCommandRunnerRemoteAuthForVolumePath(job.volumePath);
     _cmdRunner->setNeighborCopyParams(
         job.volumePath,
         paramsPath,

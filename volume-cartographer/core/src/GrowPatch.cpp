@@ -2932,6 +2932,22 @@ struct thresholdedDistance
 
 };
 
+QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
+{
+    if (!ds) {
+        throw std::runtime_error("tracer requires a volume shape or dataset");
+    }
+    const auto& shape = ds->shape();
+    if (shape.size() < 3) {
+        throw std::runtime_error("tracer dataset shape is not 3D");
+    }
+    const std::array<int, 3> volume_shape_zyx{
+        static_cast<int>(shape[0]),
+        static_cast<int>(shape[1]),
+        static_cast<int>(shape[2])};
+    return tracer(volume_shape_zyx, scale, cache, level, origin, params, cache_root, voxelsize,
+                  direction_fields, resume_surf, tgt_path, meta_params, corrections, allowed_growth_mask);
+}
 
 QuadSurface *tracer(const std::array<int, 3>& volume_shape_zyx, float scale, vc::render::IChunkedArray *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
 {

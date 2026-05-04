@@ -400,7 +400,8 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 int Volume::sliceWidth() const noexcept { return _width; }
 int Volume::sliceHeight() const noexcept { return _height; }
 int Volume::numSlices() const noexcept { return _slices; }
-std::array<int, 3> Volume::shape() const noexcept { return {_width, _height, _slices}; }
+std::array<int, 3> Volume::shape() const noexcept { return {_slices, _height, _width}; }
+std::array<int, 3> Volume::shapeXyz() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
     return metadata_["voxelsize"].get_double();
