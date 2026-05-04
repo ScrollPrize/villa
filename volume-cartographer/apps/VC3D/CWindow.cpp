@@ -1214,6 +1214,7 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
         focus->surfaceId = "segmentation";
     }
 
+    focus->suppressTransientPlaneIntersections = true;
     _state->setPOI("focus", focus);
     recenterSegmentationViewerNear(position);
 

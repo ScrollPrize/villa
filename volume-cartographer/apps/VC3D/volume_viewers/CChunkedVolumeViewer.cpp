@@ -965,6 +965,7 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
         return;
 
     auto surf = _surfWeak.lock();
+    const bool isPlaneSurface = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         plane->setOrigin(poi->p);
         if (cv::norm(poi->n) > 0.5f)
@@ -977,7 +978,8 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     updateStatusLabel();
     emit overlaysUpdated();
     scheduleRender("focus POI changed");
-    renderIntersections("focus POI changed");
+    if (!isPlaneSurface || !poi->suppressTransientPlaneIntersections)
+        renderIntersections("focus POI changed");
 }
 
 void CChunkedVolumeViewer::ensureDefaultSurface()
