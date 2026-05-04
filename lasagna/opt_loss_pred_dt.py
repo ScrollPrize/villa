@@ -274,22 +274,51 @@ def _anticipatory_pull_cfg(cfg: dict | None) -> dict | None:
 	return pull_cfg
 
 
-def _anticipatory_offset_values(*, xyz_lr: torch.Tensor, normals: torch.Tensor, cfg: dict) -> torch.Tensor:
-	steps = max(1, int(cfg.get("search_steps", 9)))
+def _anticipatory_angle_values(*, cfg: dict, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+	steps = max(1, int(cfg.get("search_steps", 21)))
 	if steps % 2 == 0:
 		steps += 1
-	radius = cfg.get("search_radius", None)
-	if radius is None:
-		# Default to one local mesh step. The line itself remains one root-tip
-		# step long; these offsets translate that straight line along the tip normal.
-		dh = (xyz_lr[:, 1:] - xyz_lr[:, :-1]).norm(dim=-1).median() if xyz_lr.shape[1] > 1 else torch.tensor(1.0, device=xyz_lr.device)
-		dw = (xyz_lr[:, :, 1:] - xyz_lr[:, :, :-1]).norm(dim=-1).median() if xyz_lr.shape[2] > 1 else torch.tensor(1.0, device=xyz_lr.device)
-		radius_t = 0.5 * (dh + dw)
-	else:
-		radius_t = torch.tensor(float(radius), device=xyz_lr.device, dtype=xyz_lr.dtype)
-	if float(radius_t.detach().cpu()) <= 0.0:
-		return torch.zeros(1, device=xyz_lr.device, dtype=xyz_lr.dtype)
-	return torch.linspace(-float(radius_t.detach().cpu()), float(radius_t.detach().cpu()), steps, device=xyz_lr.device, dtype=xyz_lr.dtype)
+	deg = float(cfg.get("search_angle_degrees", 60.0))
+	rad = np.deg2rad(max(0.0, deg))
+	return torch.linspace(-rad, rad, steps, device=device, dtype=dtype)
+
+
+def _anticipatory_rotation_axes(
+	*,
+	xyz0: torch.Tensor,
+	normals: torch.Tensor,
+	tip_h: torch.Tensor,
+	tip_w: torch.Tensor,
+	root_h: torch.Tensor,
+	root_w: torch.Tensor,
+) -> torch.Tensor:
+	"""Local tangent axis through root, perpendicular to the root->tip grid direction."""
+	Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
+	dh = tip_h - root_h
+	dw = tip_w - root_w
+	perp_h = -dw
+	perp_w = dh
+	plus_h = (root_h + perp_h).clamp(0, Hm - 1)
+	plus_w = (root_w + perp_w).clamp(0, Wm - 1)
+	minus_h = (root_h - perp_h).clamp(0, Hm - 1)
+	minus_w = (root_w - perp_w).clamp(0, Wm - 1)
+	axis = xyz0[plus_h, plus_w] - xyz0[minus_h, minus_w]
+	line = xyz0[tip_h, tip_w] - xyz0[root_h, root_w]
+	line_dir = line / line.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+	n = normals[root_h, root_w]
+	fallback = torch.linalg.cross(n, line_dir, dim=-1)
+	axis_norm = axis.norm(dim=-1, keepdim=True)
+	fallback_norm = fallback.norm(dim=-1, keepdim=True)
+	axis = torch.where(axis_norm > 1e-6, axis, fallback)
+	axis_norm = axis.norm(dim=-1, keepdim=True)
+	axis = torch.where(axis_norm > 1e-6, axis / axis_norm.clamp_min(1e-6), n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6))
+	return axis
+
+
+def _rotate_vectors(v: torch.Tensor, axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+	c = torch.cos(angle).unsqueeze(-1)
+	s = torch.sin(angle).unsqueeze(-1)
+	return v * c + torch.linalg.cross(axis, v, dim=-1) * s + axis * (axis * v).sum(dim=-1, keepdim=True) * (1.0 - c)
 
 
 def _anticipatory_pull_prefetch_points(*, xyz_lr: torch.Tensor, cfg: dict) -> torch.Tensor | None:
@@ -304,13 +333,24 @@ def _anticipatory_pull_prefetch_points(*, xyz_lr: torch.Tensor, cfg: dict) -> to
 	tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
 	root = xyz0[root_h, root_w]
 	tip = xyz0[tip_h, tip_w]
-	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, samples_n, 1)
-	line = root.unsqueeze(1) + t * (tip - root).unsqueeze(1)
 	normals = _vertex_normals(xyz_lr.detach())[0]
-	offsets = _anticipatory_offset_values(xyz_lr=xyz0.unsqueeze(0), normals=normals.unsqueeze(0), cfg=cfg)
-	if offsets.numel() > 1:
-		n = normals[tip_h, tip_w]
-		line = line.unsqueeze(1) + offsets.view(1, -1, 1, 1) * n.view(-1, 1, 1, 3)
+	axis = _anticipatory_rotation_axes(
+		xyz0=xyz0,
+		normals=normals,
+		tip_h=tip_h,
+		tip_w=tip_w,
+		root_h=root_h,
+		root_w=root_w,
+	)
+	angles = _anticipatory_angle_values(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
+	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
+	line_vec = tip - root
+	rot = _rotate_vectors(
+		line_vec.view(-1, 1, 1, 3),
+		axis.view(-1, 1, 1, 3),
+		angles.view(1, -1, 1),
+	)
+	line = root.view(-1, 1, 1, 3) + t * rot
 	return line.reshape(-1, 3)
 
 
@@ -337,12 +377,13 @@ def _score_anticipatory_pull_candidates(
 	if n_candidates <= 0:
 		return None
 	normals = _vertex_normals(res.xyz_lr.detach())[0]
-	offsets = _anticipatory_offset_values(xyz_lr=xyz0.unsqueeze(0), normals=normals.unsqueeze(0), cfg=cfg)
+	angles = _anticipatory_angle_values(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
 	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
 	targets: list[torch.Tensor] = []
 	prefixes: list[torch.Tensor] = []
 	best_inliers: list[torch.Tensor] = []
-	best_offsets_all: list[torch.Tensor] = []
+	best_angles_all: list[torch.Tensor] = []
+	best_axes_all: list[torch.Tensor] = []
 	with torch.no_grad():
 		for c0 in range(0, n_candidates, chunk_candidates):
 			c1 = min(n_candidates, c0 + chunk_candidates)
@@ -352,22 +393,36 @@ def _score_anticipatory_pull_candidates(
 			rw = root_w[c0:c1]
 			root = xyz0[rh, rw]
 			tip = xyz0[th, tw]
-			line0 = root.view(-1, 1, 1, 3) + t * (tip - root).view(-1, 1, 1, 3)
-			n = normals[th, tw]
-			query = line0 + offsets.view(1, -1, 1, 1) * n.view(-1, 1, 1, 3)
+			axis = _anticipatory_rotation_axes(
+				xyz0=xyz0,
+				normals=normals,
+				tip_h=th,
+				tip_w=tw,
+				root_h=rh,
+				root_w=rw,
+			)
+			line_vec = tip - root
+			rot = _rotate_vectors(
+				line_vec.view(-1, 1, 1, 3),
+				axis.view(-1, 1, 1, 3),
+				angles.view(1, -1, 1),
+			)
+			query = root.view(-1, 1, 1, 3) + t * rot
 			flat_query = query.reshape(1, 1, -1, 3)
 			sampled = res.data.grid_sample_fullres(flat_query).pred_dt
 			if sampled is None:
 				raise RuntimeError("anticipatory_pull requires pred_dt to be loaded")
-			pred = sampled.reshape(c1 - c0, int(offsets.numel()), samples_n)
+			pred = sampled.reshape(c1 - c0, int(angles.numel()), samples_n)
 			inlier = ((pred - inlier_zero) / (inlier_one - inlier_zero)).clamp(0.0, 1.0)
 			prefix = inlier.cumprod(dim=2).mean(dim=2)
-			best_score, best_off = prefix.max(dim=1)
-			best_offsets = offsets[best_off]
-			targets.append(tip + best_offsets.unsqueeze(-1) * n)
+			best_score, best_angle_idx = prefix.max(dim=1)
+			best_angles = angles[best_angle_idx]
+			best_rot = _rotate_vectors(line_vec, axis, best_angles)
+			targets.append(root + best_rot)
 			prefixes.append(best_score)
-			best_inliers.append(inlier[torch.arange(c1 - c0, device=xyz0.device), best_off])
-			best_offsets_all.append(best_offsets)
+			best_inliers.append(inlier[torch.arange(c1 - c0, device=xyz0.device), best_angle_idx])
+			best_angles_all.append(best_angles)
+			best_axes_all.append(axis)
 	candidate_idx = torch.arange(n_candidates, device=xyz0.device, dtype=torch.long)
 	return {
 		"candidate_idx": candidate_idx,
@@ -378,7 +433,8 @@ def _score_anticipatory_pull_candidates(
 		"target_xyz": torch.cat(targets, dim=0),
 		"prefix": torch.cat(prefixes, dim=0),
 		"inliers": torch.cat(best_inliers, dim=0),
-		"offset": torch.cat(best_offsets_all, dim=0),
+		"angle_rad": torch.cat(best_angles_all, dim=0),
+		"axis": torch.cat(best_axes_all, dim=0),
 	}
 
 
@@ -647,16 +703,28 @@ def _write_anticipatory_fit_debug_mosaic(
 		line = tip - root
 		line_len = line.norm().clamp_min(1e-6)
 		line_dir = line / line_len
-		normal = normals[th, tw]
-		normal = normal / normal.norm().clamp_min(1e-6)
-		search_radius = float(max(abs(float(candidates["offset"][cand_i].detach().cpu())), 1.0e-6))
-		default_offsets = _anticipatory_offset_values(xyz_lr=xyz0.unsqueeze(0), normals=normals.unsqueeze(0), cfg=cfg)
-		if default_offsets.numel() > 1:
-			search_radius = max(search_radius, float(default_offsets.abs().max().detach().cpu()))
+		axis = candidates.get("axis", None)
+		if axis is None:
+			axis_v = _anticipatory_rotation_axes(
+				xyz0=xyz0,
+				normals=normals,
+				tip_h=torch.tensor([th], device=xyz0.device, dtype=torch.long),
+				tip_w=torch.tensor([tw], device=xyz0.device, dtype=torch.long),
+				root_h=torch.tensor([rh], device=xyz0.device, dtype=torch.long),
+				root_w=torch.tensor([rw], device=xyz0.device, dtype=torch.long),
+			)[0]
+		else:
+			axis_v = axis[cand_i].to(device=xyz0.device, dtype=xyz0.dtype)
+		axis_v = axis_v / axis_v.norm().clamp_min(1e-6)
+		bend_dir = torch.linalg.cross(axis_v, line_dir, dim=0)
+		bend_dir = bend_dir / bend_dir.norm().clamp_min(1e-6)
+		angles = _anticipatory_angle_values(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
+		max_angle = float(angles.abs().max().detach().cpu()) if angles.numel() > 0 else np.deg2rad(60.0)
+		search_radius = float(line_len.detach().cpu()) * max(0.1, float(np.sin(max_angle)))
 		xs = xs_unit * line_len
 		ys = ys_unit * search_radius
 		grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-		query = root.view(1, 1, 3) + grid_x.unsqueeze(-1) * line_dir.view(1, 1, 3) + grid_y.unsqueeze(-1) * normal.view(1, 1, 3)
+		query = root.view(1, 1, 3) + grid_x.unsqueeze(-1) * line_dir.view(1, 1, 3) + grid_y.unsqueeze(-1) * bend_dir.view(1, 1, 3)
 		sampled = res.data.grid_sample_fullres(query.view(1, slice_h, slice_w, 3)).pred_dt
 		if sampled is None:
 			continue
@@ -666,16 +734,17 @@ def _write_anticipatory_fit_debug_mosaic(
 		rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 		rgb = cv2.resize(rgb, (slice_w * up, slice_h * up), interpolation=cv2.INTER_NEAREST)
 		y0 = int(round((0.0 + 1.0) * 0.5 * (slice_h - 1) * up))
-		best_offset = float(candidates["offset"][cand_i].detach().cpu())
-		y_line = int(round(((best_offset / search_radius) + 1.0) * 0.5 * (slice_h - 1) * up))
+		best_angle = float(candidates["angle_rad"][cand_i].detach().cpu()) if "angle_rad" in candidates else 0.0
 		x_root = int(round((0.0 + 0.25) / 1.5 * (slice_w - 1) * up))
 		x_tip = int(round((1.0 + 0.25) / 1.5 * (slice_w - 1) * up))
+		x_tip_rot = int(round(((np.cos(best_angle) + 0.25) / 1.5) * (slice_w - 1) * up))
+		y_tip_rot = int(round(((line_len.detach().cpu().item() * np.sin(best_angle) / search_radius + 1.0) * 0.5) * (slice_h - 1) * up))
 		cv2.line(rgb, (x_root, y0), (x_tip, y0), (140, 140, 140), 1, cv2.LINE_AA)
 		cv2.circle(rgb, (x_root, y0), 3, (255, 128, 0), -1, cv2.LINE_AA)
 		cv2.circle(rgb, (x_tip, y0), 3, (255, 0, 128), -1, cv2.LINE_AA)
 		draw_text_bg(rgb, "R0", (max(0, x_root - 8), max(10, y0 - 6)), 0.28, (255, 128, 0))
 		draw_text_bg(rgb, "T0", (min(rgb.shape[1] - 20, x_tip + 3), max(10, y0 - 6)), 0.28, (255, 0, 128))
-		cv2.line(rgb, (x_root, y_line), (x_tip, y_line), (0, 255, 255), 1, cv2.LINE_AA)
+		cv2.line(rgb, (x_root, y0), (x_tip_rot, y_tip_rot), (0, 255, 255), 1, cv2.LINE_AA)
 		inliers = candidates["inliers"][cand_i].detach().cpu().numpy()
 		baseline_scores: list[float] | None = None
 		if 0 <= y0 // up < gray.shape[0]:
@@ -683,9 +752,11 @@ def _write_anticipatory_fit_debug_mosaic(
 		for si, score in enumerate(inliers):
 			a = si / max(1, len(inliers) - 1)
 			xp = int(round(((a + 0.25) / 1.5) * (slice_w - 1) * up))
-			cv2.circle(rgb, (xp, y_line), 2, (0, 0, 255), -1, cv2.LINE_AA)
+			xp_rot = int(round(((a * np.cos(best_angle) + 0.25) / 1.5) * (slice_w - 1) * up))
+			yp_rot = int(round(((a * line_len.detach().cpu().item() * np.sin(best_angle) / search_radius + 1.0) * 0.5) * (slice_h - 1) * up))
+			cv2.circle(rgb, (xp_rot, yp_rot), 2, (0, 0, 255), -1, cv2.LINE_AA)
 			if si < 8:
-				draw_text_bg(rgb, f"{score:.2f}", (max(0, xp - 14), min(rgb.shape[0] - 4, y_line + 16 + (si % 2) * 12)), 0.28, (255, 255, 255))
+				draw_text_bg(rgb, f"{score:.2f}", (max(0, xp_rot - 14), min(rgb.shape[0] - 4, yp_rot + 16 + (si % 2) * 12)), 0.28, (255, 255, 255))
 			if baseline_scores is not None:
 				xg = max(0, min(gray.shape[1] - 1, int(round(xp / up))))
 				yg = max(0, min(gray.shape[0] - 1, int(round(y0 / up))))
@@ -695,7 +766,7 @@ def _write_anticipatory_fit_debug_mosaic(
 					draw_text_bg(rgb, f"{baseline_scores[-1]:.2f}", (max(0, xp - 14), max(10, y0 - 10 - (si % 2) * 12)), 0.28, (255, 180, 0))
 		prefix = float(candidates["prefix"][cand_i].detach().cpu())
 		draw_text_bg(rgb, f"{label} tip=({th},{tw}) root=({rh},{rw})", (6, 12), 0.35, (255, 255, 255))
-		draw_text_bg(rgb, f"line={prefix:.3f} off={best_offset:.2f}", (6, 26), 0.35, (0, 255, 255))
+		draw_text_bg(rgb, f"line={prefix:.3f} angle={np.rad2deg(best_angle):.1f}", (6, 26), 0.35, (0, 255, 255))
 		cv2.line(rgb, (0, y0), (rgb.shape[1] - 1, y0), (96, 96, 96), 1, cv2.LINE_AA)
 		tiles.append(rgb)
 	if not tiles:

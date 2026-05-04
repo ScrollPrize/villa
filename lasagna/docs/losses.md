@@ -51,6 +51,8 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
       "anticipatory_pull": {
         "enabled": true,
         "samples": 8,
+        "search_steps": 21,
+        "search_angle_degrees": 60.0,
         "inlier_zero": 80.0,
         "inlier_one": 120.0,
         "loss_weight": 1.0,
@@ -83,19 +85,22 @@ CLI option:
 ```
 
 `anticipatory_pull` is optional and only runs with active flow gating. It scores
-all one-step straight LR neighbor lines before flow weights are known, using
-subsampled `pred_dt` values along each line. After flow returns, each candidate
-whose root gate is higher/nonzero and whose tip gate is below 1 contributes an
-independent straight pull to the tip corner, weighted by root gate and prefix
-inlier score. The pull is not winner-take-all; multiple neighbor lines may
-contribute to the same tip.
+all one-step LR neighbor lines before flow weights are known, using subsampled
+`pred_dt` values along each line. Each candidate is brute-force searched by
+rotating the root->tip segment around the root point; the rotation axis is the
+local mesh tangent through the root and perpendicular to the root->tip grid
+direction. By default it evaluates 21 angles between `-60` and `+60` degrees.
+After flow returns, each candidate whose root gate is higher/nonzero and whose
+tip gate is below 1 contributes an independent straight pull to the tip corner,
+weighted by root gate and prefix inlier score. The pull is not winner-take-all;
+multiple neighbor lines may contribute to the same tip.
 
 The optimizer status table reports the flow-gate strength as fractions and
 corner counts for gate weights `>0`, `>0.1`, and `>0.5`, plus the fraction at
 `1.0`.
 
 When `anticipatory_pull.debug_points` or `debug_roi_center_xyz` is set, every normal flow-gate layer-debug
-iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.tif`.
+iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.jpg`.
 Explicit `debug_points` are LR mesh tip coordinates `(h,w)`. The ROI selector
 uses the current root corner position and selects the `debug_roi_k` closest
 individual root->tip snap candidates to `debug_roi_center_xyz`, restricted to
