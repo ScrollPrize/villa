@@ -3063,6 +3063,7 @@ void CWindow::onAppendMaskPressed(void)
                 float surfScale = surf->scale()[0];
                 cv::Mat_<cv::Vec3f> coords;
                 surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
+                img.create(coords.size());
                 render_image_from_coords(coords, img, volume.get());
             }
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
