@@ -462,7 +462,9 @@ void SurfaceRotationOverlayController::applyRotation()
 
     try {
         if (std::abs(_angleDeg) >= 0.01) {
-            _sourceSurface->saveSnapshot();
+            // saveOverwrite() now handles its own pre-overwrite snapshot,
+            // so the explicit saveSnapshot() that used to live here would
+            // double-rotate the backup ring and waste a slot.
             _sourceSurface->rotate(static_cast<float>(_angleDeg));
             _sourceSurface->saveOverwrite();
             if (_viewerManager) {

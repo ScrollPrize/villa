@@ -91,6 +91,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
+#include "vc/core/util/Tiff.hpp"
 #include <utils/zarr.hpp>
 
 
@@ -3069,7 +3070,7 @@ void CWindow::onAppendMaskPressed(void)
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
             existing_layers.push_back(img);
-            imwritemulti(path.string(), existing_layers);
+            atomicImwriteMulti(path, existing_layers);
 
             QString msg = QString("Appended surface image to existing mask (now %1 layers)")
                               .arg(existing_layers.size());
@@ -3085,7 +3086,7 @@ void CWindow::onAppendMaskPressed(void)
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
             std::vector<cv::Mat> layers = {mask, img};
-            imwritemulti(path.string(), layers);
+            atomicImwriteMulti(path, layers);
 
             surf->meta["date_last_modified"] = get_surface_time_str();
             surf->save_meta();

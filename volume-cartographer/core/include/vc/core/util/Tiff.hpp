@@ -95,3 +95,12 @@ private:
 // merges them tile-by-tile, and removes the part files.
 // Returns true on success, false if no part files found or on error.
 bool mergeTiffParts(const std::string& outputPath, int numParts);
+
+// Atomic multi-page TIFF write: write all pages to <outPath>.tmp, then
+// rename over outPath. A crash mid-write leaves the previous file (or
+// nothing, if there was none) intact rather than a torn half-written
+// TIFF. Throws on failure (write or rename). The .tmp is written
+// inside the same directory as outPath to avoid EXDEV from cross-mount
+// renames.
+void atomicImwriteMulti(const std::filesystem::path& outPath,
+                        const std::vector<cv::Mat>& pages);

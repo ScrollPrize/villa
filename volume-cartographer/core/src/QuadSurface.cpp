@@ -1307,6 +1307,18 @@ void QuadSurface::saveOverwrite()
         throw std::runtime_error("QuadSurface::saveOverwrite() requires a non-empty uuid");
     }
 
+    // Snapshot the on-disk state before overwriting. saveSnapshot() writes
+    // a rotating backup at <volpkg>/backups/<segname>/{0..N-1}/ so a
+    // destructive save (e.g. corrupted in-memory _points) is recoverable.
+    // Failures (disk full, permissions) are logged but never block the
+    // user's edit — the backup is best-effort.
+    try {
+        saveSnapshot(8);
+    } catch (const std::exception& e) {
+        Logger()->warn("saveOverwrite: snapshot failed for {}: {}",
+                       final_path.string(), e.what());
+    }
+
     save(final_path.string(), uuid, true);
     path = final_path;
     id = uuid;
