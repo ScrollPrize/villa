@@ -286,6 +286,11 @@ void SurfaceRotationOverlayController::cancelRotate()
     _angleDeg = 0.0;
     _sourceSurface.reset();
     _previewSurface.reset();
+    // Invalidate any in-flight save worker — the session it was
+    // started for is over, so its completion callback will see a
+    // mismatched session id and drop its state changes.
+    ++_saveSessionId;
+    _saveInFlight = false;
     clearWidgets();
 }
 
@@ -463,6 +468,14 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
+    // Reentrancy guard: another save is already running for this
+    // surface. A second rotate()/saveOverwrite() racing the first
+    // would mutate _points and the on-disk files concurrently.
+    // Just ignore the duplicate Apply.
+    if (_saveInFlight) {
+        return;
+    }
+
     // Trivial rotation: no I/O, nothing to do off-thread.
     if (std::abs(_angleDeg) < 0.01) {
         _state->setSurface("segmentation", _sourceSurface, false, true);
@@ -480,15 +493,26 @@ void SurfaceRotationOverlayController::applyRotation()
     // then post UI work back on completion.
     auto surface = _sourceSurface;
     const float angleDeg = static_cast<float>(_angleDeg);
+    const int session = ++_saveSessionId;
+    _saveInFlight = true;
     QPointer<SurfaceRotationOverlayController> self(this);
 
     auto* watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this,
-            [self, watcher, surface]() {
+            [self, watcher, surface, session]() {
                 watcher->deleteLater();
                 if (!self || !self->_state) {
                     return;
                 }
+                // Stale completion: cancelRotate() or another Apply
+                // bumped the session id. The user's current rotation
+                // session (if any) belongs to a different surface or
+                // was cancelled — applying our results would
+                // overwrite live state with state from an old session.
+                if (session != self->_saveSessionId) {
+                    return;
+                }
+                self->_saveInFlight = false;
 
                 bool failed = false;
                 try {
