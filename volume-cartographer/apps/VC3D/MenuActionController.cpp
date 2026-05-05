@@ -721,61 +721,138 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
         return;
     }
 
-    const QString currentId = QString::fromStdString(_window->_state->currentVolumeId());
-    const QString cacheDir = remoteCacheDirectory(false);
-    int attachedCount = 0;
-    int skippedCount = 0;
-    QString firstAttachedId;
+    // Snapshot per-entry state on the UI thread (auth resolution may
+    // pop a credentials prompt) before handing the slow Volume::NewFromUrl
+    // calls off to a worker. Pre-fix this loop ran every NewFromUrl
+    // synchronously, freezing the UI for the sum of N round-trips on
+    // every project open.
+    struct PendingEntry {
+        std::string url;
+        vc::HttpAuth auth;
+    };
+    std::vector<PendingEntry> pending;
+    int preSkipped = 0;
 
     for (const auto& entry : root["volumes"]) {
         if (!entry.is_object()) {
             continue;
         }
-
         const QString url = QString::fromStdString(entry.value("url", std::string{})).trimmed();
         if (url.isEmpty()) {
             continue;
         }
-
         vc::HttpAuth auth;
         QString authError;
         if (!tryResolveRemoteAuth(url, &auth, false, &authError)) {
-            Logger()->warn("Skipping persisted remote volume '{}': {}", url.toStdString(), authError.toStdString());
-            skippedCount++;
+            Logger()->warn("Skipping persisted remote volume '{}': {}",
+                           url.toStdString(), authError.toStdString());
+            preSkipped++;
             continue;
         }
+        pending.push_back({url.toStdString(), auth});
+    }
 
-        try {
-            auto volume = Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
-            if (_window->_state->vpkg()->hasVolume(volume->id())) {
-                continue;
-            }
-            if (_window->_state->vpkg()->addVolume(volume)) {
-                if (firstAttachedId.isEmpty()) {
-                    firstAttachedId = QString::fromStdString(volume->id());
-                }
-                attachedCount++;
-            } else {
-                skippedCount++;
-            }
-        } catch (const std::exception& e) {
-            Logger()->warn("Failed to attach persisted remote volume '{}': {}", url.toStdString(), e.what());
-            skippedCount++;
+    if (pending.empty()) {
+        if (preSkipped > 0 && _window->statusBar()) {
+            _window->statusBar()->showMessage(
+                QObject::tr("Attached 0 persisted remote volume(s), skipped %1.").arg(preSkipped),
+                5000);
         }
+        return;
     }
 
-    if (attachedCount > 0) {
-        _window->refreshCurrentVolumePackageUi(firstAttachedId.isEmpty() ? currentId : firstAttachedId, false);
-        _window->UpdateView();
-    }
-
-    if (_window->statusBar() && (attachedCount > 0 || skippedCount > 0)) {
+    const QString cacheDir = remoteCacheDirectory(false);
+    if (_window->statusBar()) {
         _window->statusBar()->showMessage(
-            QObject::tr("Attached %1 persisted remote volume(s), skipped %2.")
-                .arg(attachedCount)
-                .arg(skippedCount),
-            5000);
+            QObject::tr("Loading %1 attached remote volume(s)...").arg(pending.size()));
     }
+
+    struct LoadResult {
+        std::shared_ptr<Volume> volume;  // null on failure
+        std::string url;                 // for logging on failure
+        std::string error;
+    };
+
+    QPointer<MenuActionController> self(this);
+    auto* watcher = new QFutureWatcher<std::vector<LoadResult>>(this);
+    connect(watcher, &QFutureWatcher<std::vector<LoadResult>>::finished, this,
+            [self, watcher, preSkipped]() {
+                watcher->deleteLater();
+                if (!self || !self->_window || !self->_window->_state ||
+                    !self->_window->_state->vpkg()) {
+                    return;
+                }
+
+                std::vector<LoadResult> results;
+                try {
+                    results = watcher->result();
+                } catch (const std::exception& e) {
+                    Logger()->warn("Loading remote volumes failed: {}", e.what());
+                    return;
+                }
+
+                int attachedCount = 0;
+                int skippedCount = preSkipped;
+                QString firstAttachedId;
+                const QString currentId =
+                    QString::fromStdString(self->_window->_state->currentVolumeId());
+                auto vpkg = self->_window->_state->vpkg();
+
+                for (auto& r : results) {
+                    if (!r.volume) {
+                        Logger()->warn("Failed to attach persisted remote volume '{}': {}",
+                                       r.url, r.error);
+                        skippedCount++;
+                        continue;
+                    }
+                    if (vpkg->hasVolume(r.volume->id())) {
+                        continue;
+                    }
+                    if (vpkg->addVolume(r.volume)) {
+                        if (firstAttachedId.isEmpty()) {
+                            firstAttachedId =
+                                QString::fromStdString(r.volume->id());
+                        }
+                        attachedCount++;
+                    } else {
+                        skippedCount++;
+                    }
+                }
+
+                if (attachedCount > 0) {
+                    self->_window->refreshCurrentVolumePackageUi(
+                        firstAttachedId.isEmpty() ? currentId : firstAttachedId, false);
+                    self->_window->UpdateView();
+                }
+
+                if (self->_window->statusBar() && (attachedCount > 0 || skippedCount > 0)) {
+                    self->_window->statusBar()->showMessage(
+                        QObject::tr("Attached %1 persisted remote volume(s), skipped %2.")
+                            .arg(attachedCount)
+                            .arg(skippedCount),
+                        5000);
+                }
+            });
+
+    const std::string cacheDirStd = cacheDir.toStdString();
+    auto future = QtConcurrent::run([pending, cacheDirStd]() -> std::vector<LoadResult> {
+        std::vector<LoadResult> out;
+        out.reserve(pending.size());
+        for (const auto& p : pending) {
+            LoadResult r;
+            r.url = p.url;
+            try {
+                r.volume = Volume::NewFromUrl(p.url, cacheDirStd, p.auth);
+            } catch (const std::exception& e) {
+                r.error = e.what();
+            } catch (...) {
+                r.error = "unknown error";
+            }
+            out.push_back(std::move(r));
+        }
+        return out;
+    });
+    watcher->setFuture(future);
 }
 
 void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistEntry)
