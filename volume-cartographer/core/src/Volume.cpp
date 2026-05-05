@@ -1484,6 +1484,11 @@ void Volume::sample(cv::Mat_<uint8_t>& out,
                     const cv::Mat_<cv::Vec3f>& coords,
                     const vc::SampleParams& params)
 {
+    if (coords.empty()) {
+        out.release();
+        return;
+    }
+    out.create(coords.size());
     const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
     applyOptionalPostProcess(out, params);
@@ -1493,6 +1498,11 @@ void Volume::sample(cv::Mat_<uint16_t>& out,
                     const cv::Mat_<cv::Vec3f>& coords,
                     const vc::SampleParams& params)
 {
+    if (coords.empty()) {
+        out.release();
+        return;
+    }
+    out.create(coords.size());
     const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
 }

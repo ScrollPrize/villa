@@ -82,6 +82,11 @@ void render_image_from_coords(const cv::Mat_<cv::Vec3f>& coords,
     if (!volume) {
         throw std::runtime_error("Volume is null in render_image_from_coords");
     }
+    if (coords.empty()) {
+        img.release();
+        return;
+    }
+    img.create(coords.size());
 
     vc::SampleParams sp;
     sp.level = level;

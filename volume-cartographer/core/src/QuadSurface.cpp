@@ -12,6 +12,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <system_error>
@@ -638,6 +639,53 @@ bool QuadSurface::trimToValidBbox()
     const int bbW = c1 - c0 + 1;
     // Skip only if nothing to trim (bbox already matches grid exactly).
     if (bbH == rows && bbW == cols) return false;
+
+    // Aggressive-trim guard. If on-disk x/y/z.tif somehow contain a tiny
+    // valid patch surrounded by (-1,-1,-1) cells (corruption on save, torn
+    // write, or upstream preview leaving the rest of the grid invalid),
+    // the naive crop would shrink the surface to just that patch and the
+    // next saveOverwrite would discard the rest of the mesh permanently.
+    // Refuse to trim when keep-fraction is below a threshold AND the
+    // original grid is larger than a size floor (tiny surfaces are exempt
+    // because aggressive trimming is normal there).
+    //
+    // Tunable via VC_TRIM_MIN_FRACTION env var (default 0.40); set to 0.0
+    // to disable the guard for a session.
+    {
+        static const double kTrimMinFraction = []() {
+            if (const char* env = std::getenv("VC_TRIM_MIN_FRACTION")) {
+                try {
+                    double v = std::stod(env);
+                    if (v >= 0.0 && v <= 1.0) return v;
+                } catch (...) {}
+            }
+            return 0.40;
+        }();
+        constexpr int kSizeFloor = 50 * 50;
+        const double keepFraction =
+            double(bbH) * double(bbW) / (double(rows) * double(cols));
+        const int origCells = rows * cols;
+        const std::string& tag = !path.empty() ? path.string() : id;
+        if (keepFraction < kTrimMinFraction && origCells > kSizeFloor) {
+            Logger()->warn(
+                "trimToValidBbox refused (surface={}): {}x{} -> {}x{} "
+                "keep={:.1f}% < threshold {:.1f}% "
+                "(set VC_TRIM_MIN_FRACTION=0.0 to override)",
+                tag, cols, rows, bbW, bbH,
+                keepFraction * 100.0, kTrimMinFraction * 100.0);
+            return false;
+        }
+        if (keepFraction < 0.25) {
+            // Telemetry: still allowed (size floor or env override), but
+            // surface this so we know if the upstream preview is producing
+            // sparse points.
+            Logger()->warn(
+                "trimToValidBbox aggressive (surface={}): {}x{} -> {}x{} "
+                "keep={:.1f}%",
+                tag, cols, rows, bbW, bbH, keepFraction * 100.0);
+        }
+    }
+
     const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
     const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
     const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
@@ -1259,6 +1307,18 @@ void QuadSurface::saveOverwrite()
         throw std::runtime_error("QuadSurface::saveOverwrite() requires a non-empty uuid");
     }
 
+    // Snapshot the on-disk state before overwriting. saveSnapshot() writes
+    // a rotating backup at <volpkg>/backups/<segname>/{0..N-1}/ so a
+    // destructive save (e.g. corrupted in-memory _points) is recoverable.
+    // Failures (disk full, permissions) are logged but never block the
+    // user's edit — the backup is best-effort.
+    try {
+        saveSnapshot(8);
+    } catch (const std::exception& e) {
+        Logger()->warn("saveOverwrite: snapshot failed for {}: {}",
+                       final_path.string(), e.what());
+    }
+
     save(final_path.string(), uuid, true);
     path = final_path;
     id = uuid;
@@ -1326,6 +1386,15 @@ void QuadSurface::saveSnapshot(int maxBackups)
 {
     if (path.empty()) {
         throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
+    }
+
+    // No on-disk state to back up yet — the first save will populate
+    // the directory; subsequent saveOverwrite calls will pick up the
+    // rolling history from then on. Treat this as a no-op rather than
+    // an error so the saveOverwrite call site doesn't have to special
+    // case it.
+    if (!std::filesystem::exists(path / "x.tif")) {
+        return;
     }
 
     // Path is expected to be: /path/to/scroll.volpkg/paths/segment_name
@@ -1396,47 +1465,37 @@ void QuadSurface::saveSnapshot(int maxBackups)
         throw std::runtime_error("Failed to create snapshot directory: " + ec.message());
     }
 
-    // Write surface data (skip mask - we'll copy it from disk instead)
-    writeDataToDirectory(snapshot_dest, "mask");
-
-    // Write metadata - create a copy so we don't modify the original
-    utils::Json snapshotMeta = meta;
-    {
-        auto lo = utils::Json::array();
-        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
-        auto hi = utils::Json::array();
-        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
-        auto bb = utils::Json::array();
-        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
-        snapshotMeta["bbox"] = std::move(bb);
+    // Capture the LAST PERSISTED state — copy every regular file in
+    // path/ verbatim into the snapshot slot. This preserves x/y/z.tif,
+    // mask.tif, ancillary channels, meta.json, corrections.json, etc.
+    // without re-serializing in-memory data.
+    //
+    // The previous implementation called writeDataToDirectory(...)
+    // which serialized the current in-memory _points. That broke
+    // recovery for the saveOverwrite case: when the in-memory state
+    // is what we're trying to roll back FROM, persisting it as the
+    // backup snapshot leaves no good state to recover.
+    //
+    // Subdirectories (e.g. .tmp_* from in-flight saves) are skipped.
+    for (const auto& entry : std::filesystem::directory_iterator(path, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::error_code copyEc;
+        std::filesystem::copy_file(
+            entry.path(),
+            snapshot_dest / entry.path().filename(),
+            std::filesystem::copy_options::overwrite_existing,
+            copyEc);
+        if (copyEc) {
+            Logger()->warn("saveSnapshot: copy failed for {}: {}",
+                           entry.path().string(), copyEc.message());
+        }
     }
-    snapshotMeta["type"] = "seg";
-    snapshotMeta["uuid"] = id;
-    snapshotMeta["format"] = "tifxyz";
-    {
-        auto sc = utils::Json::array();
-        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
-        snapshotMeta["scale"] = std::move(sc);
-    }
-
-    std::ofstream o(snapshot_dest / "meta.json");
-    o << snapshotMeta.dump(4) << std::endl;
-    o.close();
-
-    // Copy mask.tif and generations.tif if they exist on disk
-    std::filesystem::path maskFile = path / "mask.tif";
-    std::filesystem::path generationsFile = path / "generations.tif";
-
-    if (std::filesystem::exists(maskFile)) {
-        std::filesystem::path destMask = snapshot_dest / "mask.tif";
-        std::filesystem::copy_file(maskFile, destMask,
-            std::filesystem::copy_options::overwrite_existing, ec);
-    }
-
-    if (std::filesystem::exists(generationsFile)) {
-        std::filesystem::path destGenerations = snapshot_dest / "generations.tif";
-        std::filesystem::copy_file(generationsFile, destGenerations,
-            std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        Logger()->warn("saveSnapshot: directory iteration failed for {}: {}",
+                       path.string(), ec.message());
     }
 }
 
