@@ -71,6 +71,46 @@ constexpr int kMaxStoredRemoteUrls = 10;
 QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
 
+// Atomically replace the JSON registry file: write to .tmp inside the
+// same directory, then rename. Crash mid-write leaves the prior file
+// intact instead of an empty/truncated registry. Returns true on
+// success; logs and returns false on failure (the previous registry,
+// if any, is preserved).
+bool atomicWriteJsonFile(const QString& finalPath, const utils::Json& json)
+{
+    const std::filesystem::path target(finalPath.toStdString());
+    std::filesystem::path tmp = target;
+    tmp += ".tmp";
+
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);  // best effort
+
+    {
+        std::ofstream out(tmp, std::ofstream::out | std::ofstream::trunc);
+        if (!out) {
+            Logger()->warn("Failed to open '{}' for writing", tmp.string());
+            return false;
+        }
+        out << json.dump(2) << '\n';
+        out.flush();
+        if (!out) {
+            Logger()->warn("Failed to write '{}': stream not good after dump",
+                           tmp.string());
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+
+    std::filesystem::rename(tmp, target, ec);
+    if (ec) {
+        Logger()->warn("Failed to rename '{}' -> '{}': {}",
+                       tmp.string(), target.string(), ec.message());
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 MenuActionController::MenuActionController(CWindow* window)
@@ -558,8 +598,7 @@ void MenuActionController::persistRemoteVolumeRegistryCacheRoot(const QString& c
     root["version"] = 1;
     root["cache_root"] = cacheRoot.trimmed().toStdString();
 
-    std::ofstream output(registryPath.toStdString(), std::ofstream::out | std::ofstream::trunc);
-    output << root.dump(2) << '\n';
+    atomicWriteJsonFile(registryPath, root);
 }
 
 QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
@@ -687,8 +726,7 @@ void MenuActionController::persistAttachedRemoteVolume(const QString& url, const
 
     root["volumes"] = std::move(updated);
 
-    std::ofstream output(registryPath.toStdString(), std::ofstream::out | std::ofstream::trunc);
-    output << root.dump(2) << '\n';
+    atomicWriteJsonFile(registryPath, root);
 }
 
 void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
