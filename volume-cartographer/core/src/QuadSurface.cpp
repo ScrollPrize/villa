@@ -1388,6 +1388,15 @@ void QuadSurface::saveSnapshot(int maxBackups)
         throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
     }
 
+    // No on-disk state to back up yet — the first save will populate
+    // the directory; subsequent saveOverwrite calls will pick up the
+    // rolling history from then on. Treat this as a no-op rather than
+    // an error so the saveOverwrite call site doesn't have to special
+    // case it.
+    if (!std::filesystem::exists(path / "x.tif")) {
+        return;
+    }
+
     // Path is expected to be: /path/to/scroll.volpkg/paths/segment_name
     std::filesystem::path volpkgRoot = path.parent_path().parent_path();
     std::string segmentName = path.filename().string();
@@ -1456,47 +1465,37 @@ void QuadSurface::saveSnapshot(int maxBackups)
         throw std::runtime_error("Failed to create snapshot directory: " + ec.message());
     }
 
-    // Write surface data (skip mask - we'll copy it from disk instead)
-    writeDataToDirectory(snapshot_dest, "mask");
-
-    // Write metadata - create a copy so we don't modify the original
-    utils::Json snapshotMeta = meta;
-    {
-        auto lo = utils::Json::array();
-        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
-        auto hi = utils::Json::array();
-        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
-        auto bb = utils::Json::array();
-        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
-        snapshotMeta["bbox"] = std::move(bb);
+    // Capture the LAST PERSISTED state — copy every regular file in
+    // path/ verbatim into the snapshot slot. This preserves x/y/z.tif,
+    // mask.tif, ancillary channels, meta.json, corrections.json, etc.
+    // without re-serializing in-memory data.
+    //
+    // The previous implementation called writeDataToDirectory(...)
+    // which serialized the current in-memory _points. That broke
+    // recovery for the saveOverwrite case: when the in-memory state
+    // is what we're trying to roll back FROM, persisting it as the
+    // backup snapshot leaves no good state to recover.
+    //
+    // Subdirectories (e.g. .tmp_* from in-flight saves) are skipped.
+    for (const auto& entry : std::filesystem::directory_iterator(path, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::error_code copyEc;
+        std::filesystem::copy_file(
+            entry.path(),
+            snapshot_dest / entry.path().filename(),
+            std::filesystem::copy_options::overwrite_existing,
+            copyEc);
+        if (copyEc) {
+            Logger()->warn("saveSnapshot: copy failed for {}: {}",
+                           entry.path().string(), copyEc.message());
+        }
     }
-    snapshotMeta["type"] = "seg";
-    snapshotMeta["uuid"] = id;
-    snapshotMeta["format"] = "tifxyz";
-    {
-        auto sc = utils::Json::array();
-        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
-        snapshotMeta["scale"] = std::move(sc);
-    }
-
-    std::ofstream o(snapshot_dest / "meta.json");
-    o << snapshotMeta.dump(4) << std::endl;
-    o.close();
-
-    // Copy mask.tif and generations.tif if they exist on disk
-    std::filesystem::path maskFile = path / "mask.tif";
-    std::filesystem::path generationsFile = path / "generations.tif";
-
-    if (std::filesystem::exists(maskFile)) {
-        std::filesystem::path destMask = snapshot_dest / "mask.tif";
-        std::filesystem::copy_file(maskFile, destMask,
-            std::filesystem::copy_options::overwrite_existing, ec);
-    }
-
-    if (std::filesystem::exists(generationsFile)) {
-        std::filesystem::path destGenerations = snapshot_dest / "generations.tif";
-        std::filesystem::copy_file(generationsFile, destGenerations,
-            std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        Logger()->warn("saveSnapshot: directory iteration failed for {}: {}",
+                       path.string(), ec.message());
     }
 }
 

@@ -462,14 +462,11 @@ void SurfaceRotationOverlayController::applyRotation()
 
     try {
         if (std::abs(_angleDeg) >= 0.01) {
-            // Snapshot BEFORE we mutate the surface so an accidental
-            // rotation can be recovered from the backup ring.
-            // saveOverwrite() also takes its own snapshot, but that one
-            // captures the post-rotation state — useful as a per-save
-            // history but not as a pre-rotation recovery point. Keeping
-            // both snapshots costs one extra slot in the rotating ring
-            // (8 deep) per apply; the recovery semantics are worth it.
-            _sourceSurface->saveSnapshot();
+            // saveOverwrite() snapshots the on-disk state before
+            // overwriting it, so the backup ring captures the
+            // pre-rotation files (no explicit pre-rotate snapshot
+            // needed: the on-disk state is still pre-rotate at that
+            // point because rotate() only mutates _points in memory).
             _sourceSurface->rotate(static_cast<float>(_angleDeg));
             _sourceSurface->saveOverwrite();
             if (_viewerManager) {
