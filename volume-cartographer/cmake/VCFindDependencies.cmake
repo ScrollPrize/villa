@@ -110,18 +110,23 @@ else()
 endif()
 
 # ---- nlohmann/json -----------------------------------------------------------
-FetchContent_Declare(
-    json
-    DOWNLOAD_EXTRACT_TIMESTAMP ON
-    URL https://github.com/nlohmann/json/archive/v3.12.0.tar.gz
-)
-FetchContent_GetProperties(json)
-if (NOT json_POPULATED)
-    set(JSON_BuildTests OFF CACHE INTERNAL "")
-    set(JSON_Install   ON  CACHE INTERNAL "")
-    FetchContent_Populate(json)
-    add_subdirectory(${json_SOURCE_DIR} ${json_BINARY_DIR} EXCLUDE_FROM_ALL)
-    vc_suppress_warnings("${json_SOURCE_DIR}")
+if(APPLE)
+    find_package(nlohmann_json QUIET)
+endif()
+if(NOT nlohmann_json_FOUND)
+    FetchContent_Declare(
+        json
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+        URL https://github.com/nlohmann/json/archive/v3.12.0.tar.gz
+    )
+    FetchContent_GetProperties(json)
+    if (NOT json_POPULATED)
+        set(JSON_BuildTests OFF CACHE INTERNAL "")
+        set(JSON_Install   ON  CACHE INTERNAL "")
+        FetchContent_Populate(json)
+        add_subdirectory(${json_SOURCE_DIR} ${json_BINARY_DIR} EXCLUDE_FROM_ALL)
+        vc_suppress_warnings("${json_SOURCE_DIR}")
+    endif()
 endif()
 
 # ---- c-blosc (compression for zarr chunks) -----------------------------------
