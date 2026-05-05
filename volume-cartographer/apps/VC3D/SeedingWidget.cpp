@@ -29,12 +29,43 @@
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <memory>
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
+namespace {
 
+std::filesystem::path configuredSegmentFolder(const std::shared_ptr<VolumePkg>& pkg,
+                                              const std::string& folderName)
+{
+    if (!pkg) {
+        return {};
+    }
+    auto path = pkg->findSegmentPathByName(folderName);
+    if (!path.empty()) {
+        return path;
+    }
+    return std::filesystem::path(pkg->getVolpkgDirectory()) / folderName;
+}
+
+std::filesystem::path configuredPathsFolder(const std::shared_ptr<VolumePkg>& pkg)
+{
+    auto pathsDir = configuredSegmentFolder(pkg, "paths");
+    if (!pathsDir.empty()) {
+        return pathsDir;
+    }
+    if (pkg && pkg->hasSegmentations() && !pkg->segmentationIDs().empty()) {
+        auto seg = pkg->segmentation(pkg->segmentationIDs().front());
+        if (seg) {
+            return seg->path().parent_path();
+        }
+    }
+    return {};
+}
+
+}  // namespace
 
 
 
@@ -958,12 +989,9 @@ void SeedingWidget::onRunSegmentationClicked()
     std::filesystem::path pathsDir;
     std::filesystem::path seedJsonPath;
 
-    if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-        seedJsonPath = pathsDir.parent_path() / "seed.json";
-    } else {
+    pathsDir = configuredPathsFolder(fVpkg);
+    seedJsonPath = std::filesystem::path(fVpkg->getVolpkgDirectory()) / "seed.json";
+    if (pathsDir.empty()) {
         if (!fVpkg->hasVolumes()) {
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
             return;
@@ -974,10 +1002,11 @@ void SeedingWidget::onRunSegmentationClicked()
         pathsDir = vpkgPath / "paths";
         seedJsonPath = vpkgPath / "seed.json";
 
-        if (!std::filesystem::exists(pathsDir)) {
-            QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            return;
-        }
+    }
+
+    if (!std::filesystem::exists(pathsDir)) {
+        QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
+        return;
     }
 
     if (!std::filesystem::exists(seedJsonPath)) {
@@ -991,7 +1020,7 @@ void SeedingWidget::onRunSegmentationClicked()
     }
 
     std::filesystem::path volumePath = currentVolume->path();
-    QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
+    QString workingDir = QString::fromStdString(fVpkg->getVolpkgDirectory());
 
     // Update UI
     infoLabel->setText("Running segmentation jobs...");
@@ -1718,12 +1747,9 @@ void SeedingWidget::onExpandSeedsClicked()
     std::filesystem::path pathsDir;
     std::filesystem::path expandJsonPath;
 
-    if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-        expandJsonPath = pathsDir.parent_path() / "expand.json";
-    } else {
+    pathsDir = configuredPathsFolder(fVpkg);
+    expandJsonPath = std::filesystem::path(fVpkg->getVolpkgDirectory()) / "expand.json";
+    if (pathsDir.empty()) {
         if (!fVpkg->hasVolumes()) {
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
             return;
@@ -1734,10 +1760,11 @@ void SeedingWidget::onExpandSeedsClicked()
         pathsDir = vpkgPath / "paths";
         expandJsonPath = vpkgPath / "expand.json";
 
-        if (!std::filesystem::exists(pathsDir)) {
-            QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            return;
-        }
+    }
+
+    if (!std::filesystem::exists(pathsDir)) {
+        QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
+        return;
     }
 
     if (!std::filesystem::exists(expandJsonPath)) {
@@ -1746,7 +1773,7 @@ void SeedingWidget::onExpandSeedsClicked()
     }
 
     std::filesystem::path volumePath = currentVolume->path();
-    QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
+    QString workingDir = QString::fromStdString(fVpkg->getVolpkgDirectory());
 
     // Update UI
     infoLabel->setText("Running expansion jobs...");
@@ -2030,15 +2057,15 @@ void SeedingWidget::onNeuralTraceClicked()
 
     // Get output path (paths directory in the volume package)
     std::filesystem::path pathsDir;
-    if (fVpkg && fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-    } else if (fVpkg && fVpkg->hasVolumes()) {
+    if (fVpkg) {
+        pathsDir = configuredPathsFolder(fVpkg);
+    }
+    if (pathsDir.empty() && fVpkg && fVpkg->hasVolumes()) {
         auto vol = fVpkg->volume();
         std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
         pathsDir = vpkgPath / "paths";
-    } else {
+    }
+    if (pathsDir.empty()) {
         QMessageBox::warning(this, "Error", "Could not determine output directory.");
         return;
     }

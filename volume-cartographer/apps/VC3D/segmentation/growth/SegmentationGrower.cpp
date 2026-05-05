@@ -758,6 +758,10 @@ QString defaultPatchTracerSourcePath(const std::shared_ptr<VolumePkg>& pkg)
     if (!pkg) {
         return QString();
     }
+    const auto pathsDir = pkg->findSegmentPathByName("paths");
+    if (!pathsDir.empty()) {
+        return QString::fromStdString(pathsDir.string());
+    }
     return QDir(QString::fromStdString(pkg->getVolpkgDirectory())).filePath(QStringLiteral("paths"));
 }
 
