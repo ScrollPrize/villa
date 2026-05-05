@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <cstdio>
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
@@ -116,6 +117,7 @@ struct AssembledSlice {
     size_t localSliceIndex = 0;
     cv::Mat binarySlice;
     bool anyNonZero = false;
+    double extractSeconds = 0.0;
 };
 
 static const char* direction_name(SliceDirection dir) {
@@ -219,6 +221,156 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
     }
 }
 
+// --- Debug/timing helpers --------------------------------------------------
+
+static inline double seconds_since(std::chrono::steady_clock::time_point t0)
+{
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
+template <class M>
+static inline void record_timing(M& m, const char* name, double s)
+{
+    m.timingTotals[name] += s;
+    m.timingCounts[name] += 1;
+}
+
+struct ProgressSnap {
+    size_t done;
+    size_t total;
+    double elapsed;
+    double rate;
+    double eta;
+};
+
+static ProgressSnap take_progress(
+    std::atomic<size_t>& counter,
+    std::chrono::steady_clock::time_point start,
+    size_t total)
+{
+    const size_t done = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    const double elapsed = seconds_since(start);
+    const double rate = elapsed > 0.0 ? static_cast<double>(done) / elapsed : 0.0;
+    const double eta = (rate > 0.0 && done < total)
+        ? static_cast<double>(total - done) / rate : 0.0;
+    return {done, total, elapsed, rate, eta};
+}
+
+static void log_slice_existing(
+    const std::string& dir, size_t idx, const ProgressSnap& p)
+{
+    std::cout << "[slice] dir=" << dir
+              << " idx=" << idx
+              << " outcome=existing"
+              << " progress=" << p.done << "/" << p.total
+              << " elapsed=" << std::fixed << std::setprecision(3) << p.elapsed << "s"
+              << " rate=" << std::setprecision(2) << p.rate << "it/s"
+              << " eta=" << std::setprecision(1) << p.eta << "s"
+              << std::endl;
+}
+
+static void log_slice_empty_binary(
+    const std::string& dir, size_t idx, int tid, const ProgressSnap& p,
+    double extract_s, int slice_w, int slice_h)
+{
+    #pragma omp critical(debug_per_slice_log)
+    std::cout << "[slice] dir=" << dir
+              << " idx=" << idx
+              << " outcome=empty_binary tid=" << tid
+              << " progress=" << p.done << "/" << p.total
+              << " elapsed=" << std::fixed << std::setprecision(3) << p.elapsed << "s"
+              << " rate=" << std::setprecision(2) << p.rate << "it/s"
+              << " eta=" << std::setprecision(1) << p.eta << "s"
+              << " extract=" << std::setprecision(4) << extract_s << "s"
+              << " slice_size=" << slice_w << "x" << slice_h
+              << std::endl;
+}
+
+static void log_slice_empty_trace(
+    const std::string& dir, size_t idx, int tid, const ProgressSnap& p,
+    double extract_s, double thinning_s)
+{
+    #pragma omp critical(debug_per_slice_log)
+    std::cout << "[slice] dir=" << dir
+              << " idx=" << idx
+              << " outcome=empty_trace tid=" << tid
+              << " progress=" << p.done << "/" << p.total
+              << " elapsed=" << std::fixed << std::setprecision(3) << p.elapsed << "s"
+              << " rate=" << std::setprecision(2) << p.rate << "it/s"
+              << " eta=" << std::setprecision(1) << p.eta << "s"
+              << " extract=" << std::setprecision(4) << extract_s << "s"
+              << " thinning=" << thinning_s << "s"
+              << std::endl;
+}
+
+static void log_slice_written(
+    const std::string& dir, size_t idx, int tid, const ProgressSnap& p,
+    double extract_s, double thinning_s, double populate_s, double save_s,
+    size_t bytes, size_t segments, size_t buckets)
+{
+    #pragma omp critical(debug_per_slice_log)
+    std::cout << "[slice] dir=" << dir
+              << " idx=" << idx
+              << " outcome=written tid=" << tid
+              << " progress=" << p.done << "/" << p.total
+              << " elapsed=" << std::fixed << std::setprecision(3) << p.elapsed << "s"
+              << " rate=" << std::setprecision(2) << p.rate << "it/s"
+              << " eta=" << std::setprecision(1) << p.eta << "s"
+              << " extract=" << std::setprecision(4) << extract_s << "s"
+              << " thinning=" << thinning_s << "s"
+              << " populate=" << populate_s << "s"
+              << " save=" << save_s << "s"
+              << " bytes=" << bytes
+              << " segments=" << segments
+              << " buckets=" << buckets
+              << std::endl;
+}
+
+static void log_batch(
+    const std::string& dir, size_t chunk_i, size_t chunk_n,
+    size_t batch_size, size_t existing, size_t to_process,
+    double prep_s, double elapsed)
+{
+    std::cout << "[batch] dir=" << dir
+              << " chunk=" << chunk_i << "/" << chunk_n
+              << " batch_size=" << batch_size
+              << " existing=" << existing
+              << " to_process=" << to_process
+              << " prep=" << std::fixed << std::setprecision(3) << prep_s << "s"
+              << " elapsed=" << elapsed << "s"
+              << std::endl;
+}
+
+static void log_chunk_io(
+    const std::string& dir, size_t chunk_i, size_t chunk_n,
+    size_t source_chunk_idx, size_t batch_size,
+    size_t slab_z, size_t slab_y, size_t slab_x,
+    double slab_mib, double read_s, double mibps, double elapsed)
+{
+    std::cout << "[chunk] dir=" << dir
+              << " chunk=" << chunk_i << "/" << chunk_n
+              << " source_chunk_idx=" << source_chunk_idx
+              << " batch_size=" << batch_size
+              << " slab=" << slab_z << "x" << slab_y << "x" << slab_x
+              << " (" << std::fixed << std::setprecision(1) << slab_mib << "MiB)"
+              << " read=" << std::setprecision(3) << read_s << "s"
+              << " (" << std::setprecision(1) << mibps << "MiB/s)"
+              << " elapsed=" << std::setprecision(3) << elapsed << "s"
+              << std::endl;
+}
+
+static void log_chunk_extract(
+    const std::string& dir, size_t chunk_i, size_t chunk_n,
+    double extract_loop_s, size_t n_slices)
+{
+    std::cout << "[chunk] dir=" << dir
+              << " chunk=" << chunk_i << "/" << chunk_n
+              << " extract_loop=" << std::fixed << std::setprecision(3) << extract_loop_s << "s"
+              << " (" << n_slices << " slices)"
+              << std::endl;
+}
+
 } // namespace
 
 void run_generate(const po::variables_map& vm);
@@ -247,6 +399,7 @@ static void print_usage() {
               << "  --chunk-budget-mib  Max chunk batch budget per direction (default: 512)\n"
               << "  --preview-every     Write preview image every N written slices, 0 disables (default: 100)\n"
               << "  --verify-grid-save  Verify GridStore save by reloading each file (default: false)\n"
+              << "  --debug-per-slice   Emit a stdout log line for every slice (existing/empty/written) (default: false)\n"
               << "  --metrics-json      Write structured metrics json\n"
               << "  --print-plan        Print partition plan as JSON to stdout and exit (no work done)\n\n"
               << "Convert options:\n"
@@ -255,6 +408,9 @@ static void print_usage() {
 }
 
 int main(int argc, char* argv[]) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+
     po::options_description global("Global options");
     global.add_options()
         ("help,h", "Print usage message")
@@ -312,6 +468,7 @@ int main(int argc, char* argv[]) {
             ("chunk-budget-mib", po::value<size_t>()->default_value(512), "Maximum chunk batch budget in MiB")
             ("preview-every", po::value<int>()->default_value(100), "Write preview image every N written slices, 0 disables")
             ("verify-grid-save", po::bool_switch()->default_value(false), "Verify GridStore files by reloading after save")
+            ("debug-per-slice", po::bool_switch()->default_value(false), "Emit a stdout log line for every slice processed (existing/empty_binary/empty_trace/written)")
             ("metrics-json", po::value<std::string>(), "Write structured metrics json")
             ("print-plan", po::bool_switch()->default_value(false), "Print partition plan as JSON to stdout and exit (no work done)");
 
@@ -492,6 +649,7 @@ void run_generate(const po::variables_map& vm) {
         throw std::runtime_error("--preview-every must be >= 0");
     }
     const bool verify_grid_save = vm["verify-grid-save"].as<bool>();
+    const bool debug_per_slice = vm["debug-per-slice"].as<bool>();
     const std::optional<fs::path> metrics_json_path = vm.count("metrics-json")
         ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
         : std::nullopt;
@@ -525,6 +683,10 @@ void run_generate(const po::variables_map& vm) {
         }
     }
 
+    if (!print_plan) {
+        std::cout << "Opening volume: " << input_path << std::endl;
+    }
+    const auto open_start = std::chrono::steady_clock::now();
     Volume input_volume{fs::path(input_path)};
     auto* input_chunks = input_volume.chunkedCache();
     const auto level_shape = input_chunks->shape(input_level);
@@ -540,6 +702,14 @@ void run_generate(const po::variables_map& vm) {
         static_cast<size_t>(level_chunk_shape[1]),
         static_cast<size_t>(level_chunk_shape[2]),
     };
+    if (!print_plan) {
+        const double open_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - open_start).count();
+        std::cout << "Volume opened in " << std::fixed << std::setprecision(2) << open_seconds
+                  << "s. shape_zyx=[" << shape[0] << "," << shape[1] << "," << shape[2] << "]"
+                  << " chunk_zyx=[" << source_chunk_shape[0] << "," << source_chunk_shape[1]
+                  << "," << source_chunk_shape[2] << "]" << std::endl;
+    }
 
     if (print_plan) {
         Json plan;
@@ -640,6 +810,7 @@ void run_generate(const po::variables_map& vm) {
         metadata["chunk-budget-mib"] = chunk_budget_mib;
         metadata["preview-every"] = preview_every;
         metadata["verify-grid-save"] = verify_grid_save;
+        metadata["debug-per-slice"] = debug_per_slice;
         std::ofstream o(output_fs_path / "metadata.json");
         o << metadata.dump(4) << std::endl;
     }
@@ -662,6 +833,8 @@ void run_generate(const po::variables_map& vm) {
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
 
+    std::cout << "Setting cache budget: " << (cache_budget_bytes / (1024 * 1024))
+              << " MiB" << std::endl;
     input_volume.setCacheBudget(cache_budget_bytes);
 
     struct DirectionShardPlan {
@@ -691,6 +864,10 @@ void run_generate(const po::variables_map& vm) {
             dp.shardSliceTotal += cp.sourceSliceCount;
             dp.shardSampledTotal += cp.sampledSlices.size();
         }
+        std::cout << "Shard plan " << direction_name(dir) << ": "
+                  << dp.chunkPlans.size() << "/" << total_chunks << " source chunks, "
+                  << dp.shardSampledTotal << " sampled slices, "
+                  << dp.shardSliceTotal << " source slices." << std::endl;
         direction_plans.push_back(std::move(dp));
     }
 
@@ -753,6 +930,8 @@ void run_generate(const po::variables_map& vm) {
         auto last_report_time = std::chrono::steady_clock::now();
         auto start_time = std::chrono::steady_clock::now();
         std::atomic<size_t> written_counter{0};
+        std::atomic<size_t> slice_done_counter{0};
+        const size_t slice_progress_total = sampled_slices_total;
         run_metrics.totalProcessedAllDirs += unsampled;
 
         const cv::Size slice_size = vc::core::util::normalGridSliceSize(
@@ -762,7 +941,18 @@ void run_generate(const po::variables_map& vm) {
         const size_t chunk_count_y = (shape[1] + source_chunk_shape[1] - 1) / source_chunk_shape[1];
         const size_t chunk_count_x = (shape[2] + source_chunk_shape[2] - 1) / source_chunk_shape[2];
 
+        std::cout << "Direction " << dir_metrics.direction << " starting: "
+                  << sampled_chunk_plans.size() << " source chunks, "
+                  << sampled_slices_total << " sampled slices to process." << std::endl;
+
+        size_t chunk_index = 0;
         for (const auto& source_chunk_plan : sampled_chunk_plans) {
+            ++chunk_index;
+            std::cout << "  [" << dir_metrics.direction << "] source chunk "
+                      << chunk_index << "/" << sampled_chunk_plans.size()
+                      << " (sourceChunkIndex=" << source_chunk_plan.sourceChunkIndex
+                      << ", " << source_chunk_plan.sampledSlices.size() << " sampled slices)"
+                      << std::endl;
             for (size_t batch_start = 0;
                  batch_start < source_chunk_plan.sampledSlices.size();
                  batch_start += chunk_size_tgt) {
@@ -776,6 +966,7 @@ void run_generate(const po::variables_map& vm) {
                 assembled_slices.reserve(batch_size);
                 size_t batch_existing = 0;
 
+                const auto prep_start = std::chrono::steady_clock::now();
                 for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
                     const auto& sampled =
                         source_chunk_plan.sampledSlices[batch_start + batch_index];
@@ -794,6 +985,11 @@ void run_generate(const po::variables_map& vm) {
                     if (fs::exists(task.outPath)) {
                         task.kind = SliceTaskKind::Exists;
                         ++batch_existing;
+                        if (debug_per_slice) {
+                            const auto p = take_progress(
+                                slice_done_counter, start_time, slice_progress_total);
+                            log_slice_existing(dir_metrics.direction, task.sliceIndex, p);
+                        }
                         continue;
                     }
 
@@ -802,6 +998,14 @@ void run_generate(const po::variables_map& vm) {
                     assembled.task = task;
                     assembled.localSliceIndex = sampled.localSliceIndex;
                     assembled.binarySlice = cv::Mat::zeros(slice_size, CV_8U);
+                }
+                const double prep_seconds = seconds_since(prep_start);
+
+                if (debug_per_slice) {
+                    log_batch(dir_metrics.direction, chunk_index,
+                              sampled_chunk_plans.size(), batch_size, batch_existing,
+                              assembled_slices.size(), prep_seconds,
+                              seconds_since(start_time));
                 }
 
                 if (!assembled_slices.empty()) {
@@ -844,17 +1048,42 @@ void run_generate(const po::variables_map& vm) {
                     const auto read_start = std::chrono::steady_clock::now();
                     Array3D<uint8_t> chunk_data(slab_shape);
                     input_volume.readZYX(chunk_data, slab_offset, input_level);
-                    dir_metrics.timingTotals["read_chunk"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - read_start).count();
-                    dir_metrics.timingCounts["read_chunk"] += 1;
+                    const double read_seconds = seconds_since(read_start);
+                    record_timing(dir_metrics, "read_chunk", read_seconds);
 
+                    const size_t slab_voxels = slab_shape[0] * slab_shape[1] * slab_shape[2];
+                    const size_t slab_bytes = slab_voxels * sizeof(uint8_t);
+
+                    if (debug_per_slice) {
+                        const double mib = static_cast<double>(slab_bytes) / (1024.0 * 1024.0);
+                        const double mibps = read_seconds > 0.0 ? mib / read_seconds : 0.0;
+                        log_chunk_io(dir_metrics.direction, chunk_index,
+                                     sampled_chunk_plans.size(),
+                                     source_chunk_plan.sourceChunkIndex,
+                                     assembled_slices.size(),
+                                     slab_shape[0], slab_shape[1], slab_shape[2],
+                                     mib, read_seconds, mibps,
+                                     seconds_since(start_time));
+                    }
+
+                    const auto extract_loop_start = std::chrono::steady_clock::now();
                     for (auto& assembled : assembled_slices) {
+                        const auto extract_start = std::chrono::steady_clock::now();
                         const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
                             chunk_data,
                             to_normal_grid_direction(dir),
                             assembled.localSliceIndex,
                             assembled.binarySlice);
+                        assembled.extractSeconds = seconds_since(extract_start);
                         assembled.anyNonZero = assembled.anyNonZero || any_nonzero;
+                    }
+                    const double extract_loop_seconds = seconds_since(extract_loop_start);
+
+                    if (debug_per_slice) {
+                        log_chunk_extract(dir_metrics.direction, chunk_index,
+                                          sampled_chunk_plans.size(),
+                                          extract_loop_seconds,
+                                          assembled_slices.size());
                     }
                 }
 
@@ -872,6 +1101,14 @@ void run_generate(const po::variables_map& vm) {
                         std::ofstream ofs(task.outPath);
                         ++local_stats.emptyBinary;
                         ++local_stats.processed;
+                        if (debug_per_slice) {
+                            const auto p = take_progress(
+                                slice_done_counter, start_time, slice_progress_total);
+                            log_slice_empty_binary(dir_metrics.direction,
+                                task.sliceIndex, tid, p,
+                                assembled.extractSeconds,
+                                assembled.binarySlice.cols, assembled.binarySlice.rows);
+                        }
                         continue;
                     }
 
@@ -879,9 +1116,8 @@ void run_generate(const po::variables_map& vm) {
                     const auto thinning_start = std::chrono::steady_clock::now();
                     ThinningStats thinning_stats;
                     customThinningTraceOnly(assembled.binarySlice, scratch.traces, &thinning_stats);
-                    local_stats.timingTotals["thinning"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - thinning_start).count();
-                    local_stats.timingCounts["thinning"] += 1;
+                    const double thinning_seconds = seconds_since(thinning_start);
+                    record_timing(local_stats, "thinning", thinning_seconds);
                     local_stats.thinningStats.accumulate(thinning_stats);
                     ++local_stats.thinningCalls;
 
@@ -889,6 +1125,13 @@ void run_generate(const po::variables_map& vm) {
                         std::ofstream ofs(task.outPath);
                         ++local_stats.emptyTrace;
                         ++local_stats.processed;
+                        if (debug_per_slice) {
+                            const auto p = take_progress(
+                                slice_done_counter, start_time, slice_progress_total);
+                            log_slice_empty_trace(dir_metrics.direction,
+                                task.sliceIndex, tid, p,
+                                assembled.extractSeconds, thinning_seconds);
+                        }
                         continue;
                     }
 
@@ -898,34 +1141,40 @@ void run_generate(const po::variables_map& vm) {
 
                     const auto populate_start = std::chrono::steady_clock::now();
                     populate_normal_grid(scratch.traces, grid_store, spiral_step);
-                    local_stats.timingTotals["populate_grid"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - populate_start).count();
-                    local_stats.timingCounts["populate_grid"] += 1;
+                    const double populate_seconds = seconds_since(populate_start);
+                    record_timing(local_stats, "populate_grid", populate_seconds);
 
                     const auto save_start = std::chrono::steady_clock::now();
                     grid_store.save(task.tmpPath.string(), vc::core::util::GridStore::SaveOptions{
                         .verify_reload = verify_grid_save,
                     });
                     fs::rename(task.tmpPath, task.outPath);
-                    local_stats.timingTotals["save_grid"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - save_start).count();
-                    local_stats.timingCounts["save_grid"] += 1;
+                    const double save_seconds = seconds_since(save_start);
+                    record_timing(local_stats, "save_grid", save_seconds);
 
                     const size_t written_index = written_counter.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (preview_every > 0 && (written_index % static_cast<size_t>(preview_every)) == 0) {
                         const auto preview_start = std::chrono::steady_clock::now();
                         cv::imwrite(task.previewPath.string(), assembled.binarySlice);
-                        local_stats.timingTotals["preview_image"] += std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - preview_start).count();
-                        local_stats.timingCounts["preview_image"] += 1;
+                        record_timing(local_stats, "preview_image", seconds_since(preview_start));
                         ++local_stats.previewWrites;
                     }
 
-                    local_stats.totalSize += fs::file_size(task.outPath);
+                    const size_t written_bytes = fs::file_size(task.outPath);
+                    local_stats.totalSize += written_bytes;
                     local_stats.totalSegments += grid_store.numSegments();
                     local_stats.totalBuckets += grid_store.numNonEmptyBuckets();
                     ++local_stats.written;
                     ++local_stats.processed;
+
+                    if (debug_per_slice) {
+                        const auto p = take_progress(
+                            slice_done_counter, start_time, slice_progress_total);
+                        log_slice_written(dir_metrics.direction, task.sliceIndex,
+                            tid, p, assembled.extractSeconds, thinning_seconds,
+                            populate_seconds, save_seconds, written_bytes,
+                            grid_store.numSegments(), grid_store.numNonEmptyBuckets());
+                    }
                 }
 
                 processed += batch_existing;
@@ -953,7 +1202,7 @@ void run_generate(const po::variables_map& vm) {
             }
 
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 5) {
                 last_report_time = now;
                 const auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
                 const size_t active_processed = processed > (skipped_existing + unsampled)
