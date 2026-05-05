@@ -235,6 +235,7 @@ static void print_usage() {
               << "  --level            Input OME-Zarr pyramid level (default: 0)\n"
               << "  --spiral-step       Spiral step for resampling paths (default: 20.0)\n"
               << "  --grid-step         Grid cell size for spatial indexing (default: 64)\n"
+              << "  --direction         Single slice direction: xy, xz, or yz (default: all three)\n"
               << "  --sparse-volume     Process every N-th slice, 1 = all (default: 1)\n"
               << "  --chunk-budget-mib  Max chunk batch budget per direction (default: 512)\n"
               << "  --preview-every     Write preview image every N written slices, 0 disables (default: 100)\n"
@@ -296,6 +297,7 @@ int main(int argc, char* argv[]) {
             ("level", po::value<int>()->default_value(0), "Input OME-Zarr level to read")
             ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling paths")
             ("grid-step", po::value<int>()->default_value(64), "Grid cell size for spatial indexing")
+            ("direction", po::value<std::string>(), "Single slice direction to process: xy, xz, or yz (default: all three)")
             ("sparse-volume", po::value<int>()->default_value(1), "Process every N-th slice (1 = all slices)")
             ("chunk-budget-mib", po::value<size_t>()->default_value(512), "Maximum chunk batch budget in MiB")
             ("preview-every", po::value<int>()->default_value(100), "Write preview image every N written slices, 0 disables")
@@ -477,6 +479,17 @@ void run_generate(const po::variables_map& vm) {
         ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
         : std::nullopt;
 
+    std::vector<SliceDirection> directions_to_run;
+    if (vm.count("direction")) {
+        const std::string& d = vm["direction"].as<std::string>();
+        if (d == "xy") directions_to_run = {SliceDirection::XY};
+        else if (d == "xz") directions_to_run = {SliceDirection::XZ};
+        else if (d == "yz") directions_to_run = {SliceDirection::YZ};
+        else throw std::runtime_error("--direction must be one of: xy, xz, yz");
+    } else {
+        directions_to_run = {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ};
+    }
+
     std::cout << "Input Zarr path: " << input_path << std::endl;
     std::cout << "Input level: " << input_level << std::endl;
     std::cout << "Output directory: " << output_path << std::endl;
@@ -493,12 +506,11 @@ void run_generate(const po::variables_map& vm) {
     };
 
     fs::path output_fs_path(output_path);
-    fs::create_directories(output_fs_path / "xy");
-    fs::create_directories(output_fs_path / "xz");
-    fs::create_directories(output_fs_path / "yz");
-    fs::create_directories(output_fs_path / "xy_img");
-    fs::create_directories(output_fs_path / "xz_img");
-    fs::create_directories(output_fs_path / "yz_img");
+    for (SliceDirection dir : directions_to_run) {
+        const std::string dname = direction_name(dir);
+        fs::create_directories(output_fs_path / dname);
+        fs::create_directories(output_fs_path / (dname + "_img"));
+    }
 
     Json metadata;
     metadata["spiral-step"] = spiral_step;
@@ -515,7 +527,7 @@ void run_generate(const po::variables_map& vm) {
     if (num_threads == 0) num_threads = 1;
 
     size_t max_estimated_batch_bytes = 0;
-    for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
+    for (SliceDirection dir : directions_to_run) {
         const auto batch_plan = vc::core::util::planNormalGridBatch(
             shape,
             to_normal_grid_direction(dir),
@@ -544,7 +556,14 @@ void run_generate(const po::variables_map& vm) {
     run_metrics.ompThreads = num_threads;
     run_metrics.cacheBudgetBytes = cache_budget_bytes;
     run_metrics.levelShape = shape;
-    run_metrics.totalSlicesAllDirs = shape[0] + shape[1] + shape[2];
+    run_metrics.totalSlicesAllDirs = 0;
+    for (SliceDirection dir : directions_to_run) {
+        switch (dir) {
+        case SliceDirection::XY: run_metrics.totalSlicesAllDirs += shape[0]; break;
+        case SliceDirection::XZ: run_metrics.totalSlicesAllDirs += shape[1]; break;
+        case SliceDirection::YZ: run_metrics.totalSlicesAllDirs += shape[2]; break;
+        }
+    }
 
     std::vector<ThreadScratch> thread_scratch(static_cast<size_t>(num_threads));
     for (auto& scratch : thread_scratch) {
@@ -556,7 +575,7 @@ void run_generate(const po::variables_map& vm) {
         static_cast<size_t>(level_chunk_shape[2]),
     };
 
-    for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
+    for (SliceDirection dir : directions_to_run) {
         DirectionMetrics dir_metrics;
         dir_metrics.direction = direction_name(dir);
 
