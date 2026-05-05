@@ -170,8 +170,6 @@ if(VC_USE_PCH)
         vc_calc_surface_metrics
         vc_tifxyz_gengt
         vc_diffuse_winding
-        vc_render_bench
-        vc_surface_patch_index_bench
         vc_tifxyz_mmap_prepare
         vc_create_segment_mask
         vc_visualize
