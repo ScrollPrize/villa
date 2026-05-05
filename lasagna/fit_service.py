@@ -426,7 +426,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 export_argv = ["--input", str(model_output), "--output", str(output_dir)]
                 if body.get("single_segment"):
                     export_argv.append("--single-segment")
-                if body.get("copy_model"):
+                copy_model = bool(body.get("copy_model")) or results_tmp is not None
+                if copy_model:
                     export_argv.append("--copy-model")
                 output_name = body.get("output_name")
                 if output_name:

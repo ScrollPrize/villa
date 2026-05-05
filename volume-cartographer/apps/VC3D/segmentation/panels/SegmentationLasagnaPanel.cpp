@@ -45,6 +45,70 @@
 #include <iostream>
 #include <memory>
 
+namespace {
+
+QString pathToQString(const std::filesystem::path& path)
+{
+    return QString::fromStdString(path.string());
+}
+
+bool pathExists(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
+QString canonicalPathString(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    auto canonical = std::filesystem::canonical(path, ec);
+    return pathToQString(ec ? path : canonical);
+}
+
+QString metaModelSource(const std::filesystem::path& segPath)
+{
+    QFile metaFile(pathToQString(segPath / "meta.json"));
+    if (!metaFile.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+
+    QJsonParseError parseError;
+    const auto doc = QJsonDocument::fromJson(metaFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return {};
+    }
+
+    return doc.object().value(QStringLiteral("model_source")).toString().trimmed();
+}
+
+QString resolveLasagnaModelPath(const std::filesystem::path& segPath,
+                                QStringList& checkedPaths)
+{
+    if (segPath.empty()) {
+        checkedPaths << QStringLiteral("<no active segment directory>");
+        return {};
+    }
+
+    const auto segmentModel = segPath / "model.pt";
+    checkedPaths << pathToQString(segmentModel);
+    if (pathExists(segmentModel)) {
+        return canonicalPathString(segmentModel);
+    }
+
+    const QString recordedSource = metaModelSource(segPath);
+    if (!recordedSource.isEmpty()) {
+        const std::filesystem::path sourcePath = recordedSource.toStdString();
+        checkedPaths << recordedSource;
+        if (pathExists(sourcePath)) {
+            return canonicalPathString(sourcePath);
+        }
+    }
+
+    return {};
+}
+
+} // namespace
+
 SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     const QString& settingsGroup, QWidget* parent)
     : QWidget(parent)
@@ -832,21 +896,17 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
 
     QString modelPath;
     if (!isNewModel && !isOffsetMode) {
-        if (!segPath.empty()) {
-            auto modelFile = segPath / "model.pt";
-            if (std::filesystem::exists(modelFile)) {
-                try {
-                    modelPath = QString::fromStdString(std::filesystem::canonical(modelFile).string());
-                } catch (const std::filesystem::filesystem_error&) {
-                }
-            }
-        }
+        QStringList checkedModelPaths;
+        modelPath = resolveLasagnaModelPath(segPath, checkedModelPaths);
         if (modelPath.isEmpty()) {
-            auto msg = tr("No model.pt found in segment directory. Cannot run lasagna.");
+            auto msg = tr("No model.pt found for active segment. Cannot run lasagna. Checked: %1")
+                .arg(checkedModelPaths.join(QStringLiteral(", ")));
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
             return;
         }
+        std::cerr << "[lasagna] re-optimize model: "
+                  << modelPath.toStdString() << std::endl;
     }
 
     QString dataInput = lasagnaDataInputPath();
