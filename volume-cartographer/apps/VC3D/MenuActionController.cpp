@@ -773,13 +773,24 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
         std::string error;
     };
 
+    // Bind the async load to the package that's active right now. If the
+    // user opens or switches to a different volpkg while the loads are in
+    // flight, the completion callback must NOT mutate the new package
+    // with results meant for the old one. Pre-async this was implicit
+    // because attachment happened synchronously against vpkg() at call
+    // time; we re-establish that invariant here by snapshotting the
+    // initiating package and dropping the results if it's no longer
+    // active on completion.
+    auto initiatingVpkg = _window->_state->vpkg();
+    const QString initiatingCurrentId =
+        QString::fromStdString(_window->_state->currentVolumeId());
+
     QPointer<MenuActionController> self(this);
     auto* watcher = new QFutureWatcher<std::vector<LoadResult>>(this);
     connect(watcher, &QFutureWatcher<std::vector<LoadResult>>::finished, this,
-            [self, watcher, preSkipped]() {
+            [self, watcher, preSkipped, initiatingVpkg, initiatingCurrentId]() {
                 watcher->deleteLater();
-                if (!self || !self->_window || !self->_window->_state ||
-                    !self->_window->_state->vpkg()) {
+                if (!self || !self->_window || !self->_window->_state) {
                     return;
                 }
 
@@ -791,12 +802,25 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
                     return;
                 }
 
+                // If the user switched volpkg while the load was in
+                // flight, drop the results — they were resolved against
+                // the previous package and must not silently mutate the
+                // new one. Pre-async this was implicit because the
+                // attach happened synchronously against vpkg() at call
+                // time.
+                auto activeVpkg = self->_window->_state->vpkg();
+                if (!activeVpkg || activeVpkg != initiatingVpkg) {
+                    Logger()->info(
+                        "Dropping {} remote volume load result(s): volpkg "
+                        "changed during load",
+                        results.size());
+                    return;
+                }
+
                 int attachedCount = 0;
                 int skippedCount = preSkipped;
                 QString firstAttachedId;
-                const QString currentId =
-                    QString::fromStdString(self->_window->_state->currentVolumeId());
-                auto vpkg = self->_window->_state->vpkg();
+                auto vpkg = initiatingVpkg;
 
                 for (auto& r : results) {
                     if (!r.volume) {
@@ -821,7 +845,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
 
                 if (attachedCount > 0) {
                     self->_window->refreshCurrentVolumePackageUi(
-                        firstAttachedId.isEmpty() ? currentId : firstAttachedId, false);
+                        firstAttachedId.isEmpty() ? initiatingCurrentId : firstAttachedId, false);
                     self->_window->UpdateView();
                 }
 
