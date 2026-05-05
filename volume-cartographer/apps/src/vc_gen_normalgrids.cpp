@@ -529,6 +529,10 @@ void run_generate(const po::variables_map& vm) {
         }
     }
 
+    if (!print_plan) {
+        std::cout << "Opening volume: " << input_path << std::endl;
+    }
+    const auto open_start = std::chrono::steady_clock::now();
     Volume input_volume{fs::path(input_path)};
     auto* input_chunks = input_volume.chunkedCache();
     const auto level_shape = input_chunks->shape(input_level);
@@ -544,6 +548,14 @@ void run_generate(const po::variables_map& vm) {
         static_cast<size_t>(level_chunk_shape[1]),
         static_cast<size_t>(level_chunk_shape[2]),
     };
+    if (!print_plan) {
+        const double open_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - open_start).count();
+        std::cout << "Volume opened in " << std::fixed << std::setprecision(2) << open_seconds
+                  << "s. shape_zyx=[" << shape[0] << "," << shape[1] << "," << shape[2] << "]"
+                  << " chunk_zyx=[" << source_chunk_shape[0] << "," << source_chunk_shape[1]
+                  << "," << source_chunk_shape[2] << "]" << std::endl;
+    }
 
     if (print_plan) {
         Json plan;
@@ -666,6 +678,8 @@ void run_generate(const po::variables_map& vm) {
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
 
+    std::cout << "Setting cache budget: " << (cache_budget_bytes / (1024 * 1024))
+              << " MiB" << std::endl;
     input_volume.setCacheBudget(cache_budget_bytes);
 
     struct DirectionShardPlan {
@@ -695,6 +709,10 @@ void run_generate(const po::variables_map& vm) {
             dp.shardSliceTotal += cp.sourceSliceCount;
             dp.shardSampledTotal += cp.sampledSlices.size();
         }
+        std::cout << "Shard plan " << direction_name(dir) << ": "
+                  << dp.chunkPlans.size() << "/" << total_chunks << " source chunks, "
+                  << dp.shardSampledTotal << " sampled slices, "
+                  << dp.shardSliceTotal << " source slices." << std::endl;
         direction_plans.push_back(std::move(dp));
     }
 
@@ -766,7 +784,18 @@ void run_generate(const po::variables_map& vm) {
         const size_t chunk_count_y = (shape[1] + source_chunk_shape[1] - 1) / source_chunk_shape[1];
         const size_t chunk_count_x = (shape[2] + source_chunk_shape[2] - 1) / source_chunk_shape[2];
 
+        std::cout << "Direction " << dir_metrics.direction << " starting: "
+                  << sampled_chunk_plans.size() << " source chunks, "
+                  << sampled_slices_total << " sampled slices to process." << std::endl;
+
+        size_t chunk_index = 0;
         for (const auto& source_chunk_plan : sampled_chunk_plans) {
+            ++chunk_index;
+            std::cout << "  [" << dir_metrics.direction << "] source chunk "
+                      << chunk_index << "/" << sampled_chunk_plans.size()
+                      << " (sourceChunkIndex=" << source_chunk_plan.sourceChunkIndex
+                      << ", " << source_chunk_plan.sampledSlices.size() << " sampled slices)"
+                      << std::endl;
             for (size_t batch_start = 0;
                  batch_start < source_chunk_plan.sampledSlices.size();
                  batch_start += chunk_size_tgt) {
