@@ -656,13 +656,23 @@ void LasagnaServiceManager::downloadResults()
                   << data.size() << " bytes)" << std::endl;
 
         // Write tar.gz to a temp file, then extract into _localOutputDir
+        if (!QDir().mkpath(_localOutputDir)) {
+            emit optimizationError(tr("Cannot create output directory: %1").arg(_localOutputDir));
+            return;
+        }
+
         QString tarPath = _localOutputDir + QStringLiteral("/.lasagna_results.tar.gz");
         QFile tarFile(tarPath);
         if (!tarFile.open(QIODevice::WriteOnly)) {
-            emit optimizationError(tr("Cannot write temp file: %1").arg(tarPath));
+            emit optimizationError(
+                tr("Cannot write temp file: %1 (%2)").arg(tarPath, tarFile.errorString()));
             return;
         }
-        tarFile.write(data);
+        if (tarFile.write(data) != data.size()) {
+            emit optimizationError(
+                tr("Cannot write temp file: %1 (%2)").arg(tarPath, tarFile.errorString()));
+            return;
+        }
         tarFile.close();
 
         // Extract using tar
