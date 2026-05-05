@@ -370,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
 				d = fit_data.load_3d_streaming(
 					path=str(data_cfg.input),
 					device=device,
+					sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 				)
 				Z, Y, X = d.size
 				sx, sy, sz = d.spacing
@@ -543,6 +544,7 @@ def main(argv: list[str] | None = None) -> int:
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
+			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 		)
 		Z, Y, X = d.size
 		# Volume extent covers the full zarr volume

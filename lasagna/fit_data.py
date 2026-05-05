@@ -878,6 +878,7 @@ def load_3d_streaming(
 	path: str,
 	device: torch.device,
 	skip_channels: set[str] | None = None,
+	sparse_prefetch_backend: str = "cuda",
 ) -> FitData3D:
 	"""Load .lasagna.json as sparse streaming cache — no upfront data load.
 
@@ -934,6 +935,7 @@ def load_3d_streaming(
 			channel_indices=channel_indices,
 			is_3d_zarr=is_3d,
 			device=device,
+			prefetch_backend=sparse_prefetch_backend,
 		)
 		sparse_caches[group_name] = cache
 
@@ -955,7 +957,8 @@ def load_3d_streaming(
 
 	print(f"[fit_data] load_3d_streaming: origin={origin_fullres} "
 		  f"primary_spacing={primary_spacing} source_to_base={s2b} "
-		  f"groups={list(sparse_caches.keys())}", flush=True)
+		  f"groups={list(sparse_caches.keys())} "
+		  f"sparse_prefetch={sparse_prefetch_backend}", flush=True)
 
 	return FitData3D(
 		cos=None,

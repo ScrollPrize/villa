@@ -32,6 +32,7 @@ from typing import Any
 
 _data_dir: str | None = None  # Set via --data-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
+_sparse_prefetch_backend: str = "cuda"  # Set via --sparse-prefetch-backend
 
 
 def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
@@ -367,6 +368,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
 
         args_section = dict(cfg.get("args", {}))
         args_section["input"] = str(data_input)
+        args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_input:
             args_section["model-input"] = str(model_input)
         args_section["model-output"] = str(model_output)
@@ -691,7 +693,7 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _data_dir, _gpu_pause_enabled
+    global _data_dir, _gpu_pause_enabled, _sparse_prefetch_backend
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
     p.add_argument("--port", type=int, default=9999, help="Port (default 9999)")
@@ -700,12 +702,16 @@ def main() -> None:
                    help="Directory containing .lasagna.json datasets")
     p.add_argument("--no-gpu-pause", action="store_true", default=False,
                    help="Disable automatic GPU pause/resume of training")
+    p.add_argument("--sparse-prefetch-backend", choices=("cuda", "python"),
+                   default="cuda",
+                   help="Sparse streaming prefetch backend for fit jobs")
     args = p.parse_args()
 
     if args.data_dir:
         _data_dir = str(Path(args.data_dir).resolve())
     if args.no_gpu_pause:
         _gpu_pause_enabled = False
+    _sparse_prefetch_backend = str(args.sparse_prefetch_backend)
 
     server = HTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]

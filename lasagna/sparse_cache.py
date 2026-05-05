@@ -54,6 +54,7 @@ class SparseChunkGroupCache:
         is_3d_zarr: bool,
         device: torch.device,
         n_workers: int = 8,
+        prefetch_backend: str = "cuda",
     ) -> None:
         self.channels = channels
         self.zarr_path = zarr_path
@@ -62,6 +63,11 @@ class SparseChunkGroupCache:
         self.channel_indices = channel_indices  # channel_name -> index in zarr C dim
         self.is_3d_zarr = is_3d_zarr
         self.device = device
+        self.prefetch_backend = str(prefetch_backend)
+        if self.prefetch_backend not in {"cuda", "python"}:
+            raise ValueError(
+                f"unknown sparse prefetch backend {self.prefetch_backend!r}; "
+                "expected 'cuda' or 'python'")
 
         Z, Y, X = vol_shape_zyx
         self.chunk_grid = (
@@ -91,7 +97,8 @@ class SparseChunkGroupCache:
 
         table_mib = cZ * cY * cX * 8 / 1024**2
         print(f"[sparse_cache] {','.join(channels)}: chunk_grid={cZ}x{cY}x{cX} "
-              f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB", flush=True)
+              f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB "
+              f"prefetch={self.prefetch_backend}", flush=True)
 
     def prefetch(self, xyz_fullres: torch.Tensor, origin: tuple[float, float, float],
                  spacing: tuple[float, float, float]) -> None:
@@ -99,30 +106,9 @@ class SparseChunkGroupCache:
 
         xyz_fullres: (..., 3) float32 GPU — sample positions in fullres coords.
         """
-        cZ, cY, cX = self.chunk_grid
-        dev = xyz_fullres.device
-        origin_t = torch.tensor(origin, dtype=torch.float32, device=dev)
-        spacing_t = torch.tensor(spacing, dtype=torch.float32, device=dev)
-
-        with torch.no_grad():
-            flat = xyz_fullres.reshape(-1, 3)
-            local = (flat - origin_t) / spacing_t
-            ci_x = (local[:, 0] / _CHUNK_SIZE).long().clamp(0, cX - 1)
-            ci_y = (local[:, 1] / _CHUNK_SIZE).long().clamp(0, cY - 1)
-            ci_z = (local[:, 2] / _CHUNK_SIZE).long().clamp(0, cZ - 1)
-
-            # Build needed bool tensor
-            needed = torch.zeros(cZ, cY, cX, dtype=torch.bool, device=dev)
-            needed[ci_z, ci_y, ci_x] = True
-            # Dilate for prefetch safety
-            needed = _dilate26(needed)
-            # Find chunks not yet loaded
-            missing = needed & (self.chunk_table == 0)
-
-        if not missing.any():
+        coords = self._missing_chunk_coords(xyz_fullres, origin, spacing)
+        if coords.numel() == 0:
             return
-
-        coords = missing.nonzero().cpu()  # (N, 3) — (cz, cy, cx)
         n_missing = coords.shape[0]
 
         # Submit reads to thread pool
@@ -130,6 +116,33 @@ class SparseChunkGroupCache:
             cz, cy, cx = int(coords[i, 0]), int(coords[i, 1]), int(coords[i, 2])
             fut = self._executor.submit(self._load_chunk, cz, cy, cx)
             self._pending.append(fut)
+
+    def _missing_chunk_coords(self, xyz_fullres: torch.Tensor,
+                              origin: tuple[float, float, float],
+                              spacing: tuple[float, float, float]) -> torch.Tensor:
+        """Return CPU int64 (N, 3) missing chunk coordinates as (cz, cy, cx)."""
+        cZ, cY, cX = self.chunk_grid
+        dev = xyz_fullres.device
+        origin_t = torch.tensor(origin, dtype=torch.float32, device=dev)
+        spacing_t = torch.tensor(spacing, dtype=torch.float32, device=dev)
+
+        with torch.no_grad():
+            if self.prefetch_backend == "cuda":
+                from sparse_prefetch_chunks import missing_chunks
+                return missing_chunks(
+                    xyz_fullres, self.chunk_table, origin_t, spacing_t).cpu()
+
+            flat = xyz_fullres.reshape(-1, 3)
+            local = (flat - origin_t) / spacing_t
+            ci_x = (local[:, 0] / _CHUNK_SIZE).long().clamp(0, cX - 1)
+            ci_y = (local[:, 1] / _CHUNK_SIZE).long().clamp(0, cY - 1)
+            ci_z = (local[:, 2] / _CHUNK_SIZE).long().clamp(0, cZ - 1)
+
+            needed = torch.zeros(cZ, cY, cX, dtype=torch.bool, device=dev)
+            needed[ci_z, ci_y, ci_x] = True
+            needed = _dilate26(needed)
+            missing = needed & (self.chunk_table == 0)
+            return missing.nonzero().cpu()
 
     def _load_chunk(self, cz: int, cy: int, cx: int) -> tuple[int, int, int, np.ndarray]:
         """Read a 34³ padded chunk from zarr. Runs in thread pool."""
