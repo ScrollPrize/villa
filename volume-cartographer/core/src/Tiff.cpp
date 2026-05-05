@@ -378,9 +378,16 @@ void atomicImwriteMulti(const std::filesystem::path& outPath,
     }
 
     // Write the .tmp inside the same directory as the final path so the
-    // rename never crosses a filesystem boundary (EXDEV).
-    std::filesystem::path tmpPath = outPath;
-    tmpPath += ".tmp";
+    // rename never crosses a filesystem boundary (EXDEV). Keep the
+    // original extension on the tail so cv::imwritemulti still picks
+    // the TIFF codec from the filename — `.tif.tmp` would dispatch as
+    // an unknown extension and the write would fail. Result: for
+    // `mask.tif` we write to `mask.tmp.tif`, then rename to `mask.tif`.
+    const std::filesystem::path parent = outPath.parent_path();
+    const std::string stem = outPath.stem().string();
+    const std::string ext = outPath.extension().string();  // includes the dot, may be empty
+    std::filesystem::path tmpPath =
+        parent / (stem + ".tmp" + (ext.empty() ? std::string{".tif"} : ext));
 
     std::error_code ec;
     std::filesystem::remove(tmpPath, ec);  // best effort

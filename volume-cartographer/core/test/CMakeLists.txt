@@ -25,6 +25,10 @@ add_executable(test_quadsurface_save_roundtrip test_quadsurface_save_roundtrip.c
 target_link_libraries(test_quadsurface_save_roundtrip PRIVATE doctest::doctest vc_core)
 add_test(NAME test_quadsurface_save_roundtrip COMMAND test_quadsurface_save_roundtrip)
 
+add_executable(test_atomic_imwrite_multi test_atomic_imwrite_multi.cpp)
+target_link_libraries(test_atomic_imwrite_multi PRIVATE doctest::doctest vc_core)
+add_test(NAME test_atomic_imwrite_multi COMMAND test_atomic_imwrite_multi)
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 # Bench has a generous wall-clock assertion; not part of default ctest
