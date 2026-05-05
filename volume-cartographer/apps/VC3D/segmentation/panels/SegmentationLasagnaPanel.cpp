@@ -136,6 +136,16 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         row->addWidget(_dataInputStack, 1);
     }, tr("Input data (.lasagna.json) required by the lasagna."));
 
+    _connectionGroup->addRow(tr("Input scale:"), [&](QHBoxLayout* row) {
+        _inputScaleSpin = new QDoubleSpinBox(connContent);
+        _inputScaleSpin->setRange(0.0001, 1000.0);
+        _inputScaleSpin->setSingleStep(0.25);
+        _inputScaleSpin->setDecimals(4);
+        _inputScaleSpin->setValue(1.0);
+        _inputScaleSpin->setToolTip(tr("Multiplier for coordinates sent to lasagna, including seed and correction points."));
+        row->addWidget(_inputScaleSpin);
+    }, tr("Coordinate multiplier applied to VC3D input coordinates before lasagna optimization."));
+
     _connectionGroup->addRow(tr("Output scale:"), [&](QHBoxLayout* row) {
         _outputScaleSpin = new QDoubleSpinBox(connContent);
         _outputScaleSpin->setRange(0.0001, 1000.0);
@@ -456,6 +466,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_outputNameEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         writeSetting(QStringLiteral("lasagna_output_name"), text.trimmed());
+    });
+    connect(_inputScaleSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        writeSetting(QStringLiteral("lasagna_input_scale"), v);
     });
     connect(_outputScaleSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         writeSetting(QStringLiteral("lasagna_output_scale"), v);
@@ -939,6 +952,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         int nmW = newModelWidth();
         int nmH = newModelHeight();
         int nmN = newModelWindings();
+        const double inScale = inputScale();
 
         int cx = 0;
         int cy = 0;
@@ -969,6 +983,9 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
             cy = static_cast<int>(focus->p[1]);
             cz = static_cast<int>(focus->p[2]);
         }
+        cx = static_cast<int>(std::lround(static_cast<double>(cx) * inScale));
+        cy = static_cast<int>(std::lround(static_cast<double>(cy) * inScale));
+        cz = static_cast<int>(std::lround(static_cast<double>(cz) * inScale));
 
         QJsonObject args = config[QStringLiteral("args")].toObject();
         args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
@@ -1025,11 +1042,16 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     if (state && state->pointCollection()) {
         const auto& cols = state->pointCollection()->getAllCollections();
         if (!cols.empty()) {
+            const float inScale = static_cast<float>(inputScale());
             utils::Json corrJson;
             utils::Json colsJson = utils::Json::object();
             for (const auto& [cid, col] : cols) {
+                auto scaledCol = col;
+                for (auto& pointEntry : scaledCol.points) {
+                    pointEntry.second.p *= inScale;
+                }
                 utils::Json colJson;
-                to_json(colJson, col);
+                to_json(colJson, scaledCol);
                 colsJson[std::to_string(cid)] = colJson;
             }
             corrJson["collections"] = colsJson;
@@ -1139,7 +1161,11 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker b(_outputNameEdit);
         _outputNameEdit->setText(settings.value(QStringLiteral("lasagna_output_name"), QString()).toString());
     }
-    // Output coordinate scale
+    // Coordinate scales
+    if (_inputScaleSpin) {
+        const QSignalBlocker b(_inputScaleSpin);
+        _inputScaleSpin->setValue(settings.value(QStringLiteral("lasagna_input_scale"), 1.0).toDouble());
+    }
     if (_outputScaleSpin) {
         const QSignalBlocker b(_outputScaleSpin);
         _outputScaleSpin->setValue(settings.value(QStringLiteral("lasagna_output_scale"), 1.0).toDouble());
@@ -1380,6 +1406,11 @@ QString SegmentationLasagnaPanel::newModelOutputName() const
 double SegmentationLasagnaPanel::outputScale() const
 {
     return _outputScaleSpin ? _outputScaleSpin->value() : 1.0;
+}
+
+double SegmentationLasagnaPanel::inputScale() const
+{
+    return _inputScaleSpin ? _inputScaleSpin->value() : 1.0;
 }
 
 double SegmentationLasagnaPanel::offsetValue() const
