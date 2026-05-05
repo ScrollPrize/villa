@@ -1,6 +1,6 @@
 # VCCompilerFlags.cmake - Compiler flag orchestration
 
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++23 -DWITH_BLOSC=1 -DWITH_ZLIB=1 -mcpu=native -pipe ")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=native -pipe")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")

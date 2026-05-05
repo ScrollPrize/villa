@@ -61,6 +61,7 @@ required_formulae=(
   llvm
   cmake
   ninja
+  pkgconf
   qt
   ceres-solver
   eigen
