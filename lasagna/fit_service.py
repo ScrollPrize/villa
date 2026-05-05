@@ -116,6 +116,7 @@ def _start_avahi_publish(port: int) -> None:
     global _avahi_proc
 
     txt_records: list[str] = []
+    txt_records.append(f"pid={os.getpid()}")
     if _data_dir:
         txt_records.append(f"data_dir={_data_dir}")
     datasets = _list_datasets()

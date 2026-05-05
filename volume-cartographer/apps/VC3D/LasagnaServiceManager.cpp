@@ -36,6 +36,59 @@ constexpr int kServiceStartTimeoutMs = 60000;  // 1 minute (no torch compile)
 constexpr int kServiceStopTimeoutMs = 500;
 constexpr int kPollIntervalMs = 500;
 
+int servicePid(const QJsonObject& obj)
+{
+    int pid = obj[QStringLiteral("pid")].toInt(-1);
+    if (pid > 0) {
+        return pid;
+    }
+    static const QRegularExpression re(QStringLiteral(R"(pid\s+(\d+))"));
+    auto match = re.match(obj[QStringLiteral("name")].toString());
+    return match.hasMatch() ? match.captured(1).toInt() : -1;
+}
+
+QString serviceKey(const QJsonObject& obj)
+{
+    const int pid = servicePid(obj);
+    if (pid > 0) {
+        return QStringLiteral("pid:%1").arg(pid);
+    }
+    if (obj.contains(QStringLiteral("name"))) {
+        return QStringLiteral("name:%1:%2")
+            .arg(obj[QStringLiteral("name")].toString())
+            .arg(obj[QStringLiteral("port")].toInt());
+    }
+    return QStringLiteral("addr:%1:%2")
+        .arg(obj[QStringLiteral("host")].toString())
+        .arg(obj[QStringLiteral("port")].toInt());
+}
+
+int hostPreferenceScore(const QString& host)
+{
+    if (host == QStringLiteral("127.0.0.1") ||
+        host == QStringLiteral("::1") ||
+        host.compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0) {
+        return 0;
+    }
+    if (host == QStringLiteral("0.0.0.0") || host == QStringLiteral("::")) {
+        return 3;
+    }
+    if (!host.contains(QLatin1Char(':'))) {
+        return 1;
+    }
+    return 2;
+}
+
+bool preferServiceEndpoint(const QJsonObject& candidate, const QJsonObject& current)
+{
+    const int candScore = hostPreferenceScore(candidate[QStringLiteral("host")].toString());
+    const int curScore = hostPreferenceScore(current[QStringLiteral("host")].toString());
+    if (candScore != curScore) {
+        return candScore < curScore;
+    }
+    return candidate.contains(QStringLiteral("pid")) && !current.contains(QStringLiteral("pid"));
+}
+
 QString findPythonExecutable()
 {
     QStringList candidates;
@@ -644,8 +697,27 @@ QJsonArray LasagnaServiceManager::discoverServices()
 {
     QJsonArray result;
 
-    // Track seen host:port to avoid duplicates between file and mDNS discovery
     QSet<QString> seen;
+
+    auto addService = [&](QJsonObject obj) {
+        const int pid = servicePid(obj);
+        if (pid > 0) {
+            obj[QStringLiteral("pid")] = pid;
+        }
+        const QString key = serviceKey(obj);
+        if (!seen.contains(key)) {
+            seen.insert(key);
+            result.append(obj);
+            return;
+        }
+        for (int i = 0; i < result.size(); ++i) {
+            QJsonObject current = result.at(i).toObject();
+            if (serviceKey(current) == key && preferServiceEndpoint(obj, current)) {
+                result[i] = obj;
+                return;
+            }
+        }
+    };
 
     // --- File-based discovery (local) ---
     QString dirPath = QDir::homePath() + QStringLiteral("/.fit_services");
@@ -678,11 +750,7 @@ QJsonArray LasagnaServiceManager::discoverServices()
             }
 #endif
 
-            QString key = QStringLiteral("%1:%2")
-                .arg(obj[QStringLiteral("host")].toString())
-                .arg(obj[QStringLiteral("port")].toInt());
-            seen.insert(key);
-            result.append(obj);
+            addService(obj);
         }
     }
 
@@ -707,9 +775,6 @@ QJsonArray LasagnaServiceManager::discoverServices()
                 char addrBuf[AVAHI_ADDRESS_STR_MAX];
                 avahi_address_snprint(addrBuf, sizeof(addrBuf), addr);
                 QString host = QString::fromUtf8(addrBuf);
-                QString key = QStringLiteral("%1:%2").arg(host).arg(port);
-                if (seen->contains(key)) return;
-                seen->insert(key);
 
                 QJsonObject obj;
                 obj[QStringLiteral("host")] = host;
@@ -722,7 +787,9 @@ QJsonArray LasagnaServiceManager::discoverServices()
                     if (avahi_string_list_get_pair(t, &k, &v, nullptr) == 0 && k) {
                         QString tk = QString::fromUtf8(k);
                         QString tv = v ? QString::fromUtf8(v) : QString();
-                        if (tk == QStringLiteral("data_dir"))
+                        if (tk == QStringLiteral("pid"))
+                            obj[QStringLiteral("pid")] = tv.toInt();
+                        else if (tk == QStringLiteral("data_dir"))
                             obj[QStringLiteral("data_dir")] = tv;
                         else if (tk == QStringLiteral("datasets")) {
                             QJsonArray ds;
@@ -734,7 +801,23 @@ QJsonArray LasagnaServiceManager::discoverServices()
                         avahi_free(v);
                     }
                 }
-                result->append(obj);
+                const int pid = servicePid(obj);
+                if (pid > 0) {
+                    obj[QStringLiteral("pid")] = pid;
+                }
+                const QString key = serviceKey(obj);
+                if (!seen->contains(key)) {
+                    seen->insert(key);
+                    result->append(obj);
+                    return;
+                }
+                for (int i = 0; i < result->size(); ++i) {
+                    QJsonObject current = result->at(i).toObject();
+                    if (serviceKey(current) == key && preferServiceEndpoint(obj, current)) {
+                        (*result)[i] = obj;
+                        return;
+                    }
+                }
             }
 
             static void resolveCallback(
