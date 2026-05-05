@@ -317,6 +317,9 @@ def optimize(
 			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0:
 			return data
+		stage_args = opt_cfg.args or {}
+		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
+		status_interval = max(0, int(status_interval_raw))
 
 		# Configure corr Phase D Gaussian-splat σ (default 1.0; 7×7 vertex neighborhood).
 		_t = _stage_start(f"{label}.configure_losses")
@@ -636,7 +639,6 @@ def optimize(
 		_t_wall_start = time.perf_counter()
 		_t_steps_acc = 0
 		loss = loss0
-		status_interval = 1
 
 		for step in range(max_steps):
 			# Sync: wait for chunks loaded by last prefetch
@@ -692,7 +694,7 @@ def optimize(
 					stage_name=stage.name,
 				)
 
-			if step == 0 or step1 == max_steps or (step1 % status_interval) == 0:
+			if step == 0 or step1 == max_steps or (status_interval > 0 and (step1 % status_interval) == 0):
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:

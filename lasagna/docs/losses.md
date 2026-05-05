@@ -33,6 +33,20 @@ Notes:
 
 Optimizer stages can also optionally perform mesh growth + local optimization (see [`docs/model.md`](model.md:1)).
 
+The optimizer status table prints on the first step, final step, and every 100
+iterations by default. Override per stage with `global_opt.args.status_interval`
+(`0` keeps only first/final prints):
+
+```json
+{
+  "name": "snap",
+  "steps": 1000,
+  "args": {
+    "status_interval": 25
+  }
+}
+```
+
 ### Optional `pred_dt` dense-flow gate
 
 `pred_dt` snapping can be gated per stage via `global_opt.args`:
