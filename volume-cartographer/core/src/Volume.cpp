@@ -1045,7 +1045,9 @@ void Volume::zarrOpen()
         throw std::runtime_error("no physical zarr dataset directories found in " + path_.string());
     }
     zarrLevelShapes_ = opened.shapes;
+    zarrLevelChunkShapes_ = opened.chunkShapes;
     zarrDtype_ = opened.dtype;
+    zarrFillValue_ = opened.fillValue;
 
     try {
         const auto attrs = rootAttributes();
@@ -1227,7 +1229,9 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteAuth_ = auth;
     vol->remoteNumScales_ = opened.shapes.size();
     vol->zarrLevelShapes_ = opened.shapes;
+    vol->zarrLevelChunkShapes_ = opened.chunkShapes;
     vol->zarrDtype_ = opened.dtype;
+    vol->zarrFillValue_ = opened.fillValue;
     const auto& firstShape = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
     const size_t firstScale = size_t{1} << firstPresentLevel;
     vol->_slices = static_cast<int>(static_cast<size_t>(firstShape[0]) * firstScale);
@@ -1282,10 +1286,62 @@ std::array<int, 3> Volume::shape(int level) const
     }
     throw std::out_of_range("Volume::shape level out of range");
 }
+
+std::array<int, 3> Volume::levelShape(int level) const
+{
+    return shape(level);
+}
+
+std::array<int, 3> Volume::chunkShape(int level) const
+{
+    if (level < 0) {
+        throw std::out_of_range("Volume::chunkShape level must be non-negative");
+    }
+    const auto index = static_cast<std::size_t>(level);
+    if (index >= zarrLevelChunkShapes_.size() || !hasScaleLevel(level)) {
+        throw std::out_of_range("Volume::chunkShape requested missing zarr scale level " + std::to_string(level));
+    }
+    const auto chunkShapeZYX = zarrLevelChunkShapes_[index];
+    if (chunkShapeZYX[0] <= 0 || chunkShapeZYX[1] <= 0 || chunkShapeZYX[2] <= 0) {
+        throw std::runtime_error("Volume::chunkShape encountered invalid zarr chunk shape");
+    }
+    return chunkShapeZYX;
+}
+
+std::array<int, 3> Volume::chunkGridShape(int level) const
+{
+    const auto levelShapeZYX = shape(level);
+    const auto chunkShapeZYX = chunkShape(level);
+    return {
+        (levelShapeZYX[0] + chunkShapeZYX[0] - 1) / chunkShapeZYX[0],
+        (levelShapeZYX[1] + chunkShapeZYX[1] - 1) / chunkShapeZYX[1],
+        (levelShapeZYX[2] + chunkShapeZYX[2] - 1) / chunkShapeZYX[2],
+    };
+}
+
+size_t Volume::chunkCount(int level) const
+{
+    const auto grid = chunkGridShape(level);
+    return static_cast<size_t>(grid[0]) *
+           static_cast<size_t>(grid[1]) *
+           static_cast<size_t>(grid[2]);
+}
+
 std::array<int, 3> Volume::shapeXyz() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
     return metadata_["voxelsize"].get_double();
+}
+
+size_t Volume::dtypeSize() const noexcept
+{
+    switch (zarrDtype_) {
+    case vc::render::ChunkDtype::UInt8:
+        return 1;
+    case vc::render::ChunkDtype::UInt16:
+        return 2;
+    }
+    return 1;
 }
 
 size_t Volume::numScales() const noexcept {
@@ -1428,6 +1484,11 @@ void Volume::sample(cv::Mat_<uint8_t>& out,
                     const cv::Mat_<cv::Vec3f>& coords,
                     const vc::SampleParams& params)
 {
+    if (coords.empty()) {
+        out.release();
+        return;
+    }
+    out.create(coords.size());
     const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
     applyOptionalPostProcess(out, params);
@@ -1437,6 +1498,11 @@ void Volume::sample(cv::Mat_<uint16_t>& out,
                     const cv::Mat_<cv::Vec3f>& coords,
                     const vc::SampleParams& params)
 {
+    if (coords.empty()) {
+        out.release();
+        return;
+    }
+    out.create(coords.size());
     const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
 }

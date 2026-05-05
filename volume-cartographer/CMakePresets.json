@@ -1,0 +1,30 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "macos-homebrew-llvm",
+      "displayName": "macOS Homebrew LLVM",
+      "description": "Native macOS build using Homebrew LLVM/Clang and Homebrew dependencies.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-macos",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang++",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
+        "VC_WITH_CUDA_SPARSE": "OFF",
+        "VC_WITH_PASTIX": "OFF",
+        "VC_USE_OPENMP": "OFF",
+        "VC_BUILD_TESTS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "macos-homebrew-llvm",
+      "displayName": "Build macOS Homebrew LLVM",
+      "configurePreset": "macos-homebrew-llvm",
+      "jobs": 8
+    }
+  ]
+}

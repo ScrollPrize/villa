@@ -1,7 +1,11 @@
 # GCCToolchain.cmake - GCC/glibc optimization flags
 
 set(VC_LTO_FLAGS "-flto=auto -ffunction-sections -fdata-sections")
-set(VC_LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed")
+if(APPLE)
+    set(VC_LINKER_FLAGS "")
+else()
+    set(VC_LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed")
+endif()
 set(VC_UNSAFE_CXX_FLAGS "-ffast-math -fno-finite-math-only -funroll-loops -ffp-contract=fast -fdevirtualize-at-ltrans")
 set(VC_UNSAFE_LINKER_FLAGS "")
 set(VC_THINLTO_CACHE_FLAGS "")

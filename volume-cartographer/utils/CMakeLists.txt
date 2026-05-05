@@ -81,5 +81,9 @@ set_target_properties(utils_c3d_codec PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC
 # Tests
 if(VC_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests)
+    # Gate on directory existence — utils/tests/ is not currently present
+    # in the source tree but the subdir-add was unconditional.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
+        add_subdirectory(tests)
+    endif()
 endif()
