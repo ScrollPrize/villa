@@ -12,6 +12,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <system_error>
@@ -638,6 +639,53 @@ bool QuadSurface::trimToValidBbox()
     const int bbW = c1 - c0 + 1;
     // Skip only if nothing to trim (bbox already matches grid exactly).
     if (bbH == rows && bbW == cols) return false;
+
+    // Aggressive-trim guard. If on-disk x/y/z.tif somehow contain a tiny
+    // valid patch surrounded by (-1,-1,-1) cells (corruption on save, torn
+    // write, or upstream preview leaving the rest of the grid invalid),
+    // the naive crop would shrink the surface to just that patch and the
+    // next saveOverwrite would discard the rest of the mesh permanently.
+    // Refuse to trim when keep-fraction is below a threshold AND the
+    // original grid is larger than a size floor (tiny surfaces are exempt
+    // because aggressive trimming is normal there).
+    //
+    // Tunable via VC_TRIM_MIN_FRACTION env var (default 0.40); set to 0.0
+    // to disable the guard for a session.
+    {
+        static const double kTrimMinFraction = []() {
+            if (const char* env = std::getenv("VC_TRIM_MIN_FRACTION")) {
+                try {
+                    double v = std::stod(env);
+                    if (v >= 0.0 && v <= 1.0) return v;
+                } catch (...) {}
+            }
+            return 0.40;
+        }();
+        constexpr int kSizeFloor = 50 * 50;
+        const double keepFraction =
+            double(bbH) * double(bbW) / (double(rows) * double(cols));
+        const int origCells = rows * cols;
+        const std::string& tag = !path.empty() ? path.string() : id;
+        if (keepFraction < kTrimMinFraction && origCells > kSizeFloor) {
+            Logger()->warn(
+                "trimToValidBbox refused (surface={}): {}x{} -> {}x{} "
+                "keep={:.1f}% < threshold {:.1f}% "
+                "(set VC_TRIM_MIN_FRACTION=0.0 to override)",
+                tag, cols, rows, bbW, bbH,
+                keepFraction * 100.0, kTrimMinFraction * 100.0);
+            return false;
+        }
+        if (keepFraction < 0.25) {
+            // Telemetry: still allowed (size floor or env override), but
+            // surface this so we know if the upstream preview is producing
+            // sparse points.
+            Logger()->warn(
+                "trimToValidBbox aggressive (surface={}): {}x{} -> {}x{} "
+                "keep={:.1f}%",
+                tag, cols, rows, bbW, bbH, keepFraction * 100.0);
+        }
+    }
+
     const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
     const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
     const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
