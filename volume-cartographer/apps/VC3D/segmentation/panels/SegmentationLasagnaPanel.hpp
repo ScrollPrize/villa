@@ -49,6 +49,7 @@ public:
     [[nodiscard]] int newModelWindings() const;
     [[nodiscard]] QString seedPointText() const;
     [[nodiscard]] QString newModelOutputName() const;
+    [[nodiscard]] double outputScale() const;
     [[nodiscard]] double offsetValue() const;
     [[nodiscard]] int windowSize() const;
     [[nodiscard]] int windowOverlap() const;
@@ -110,6 +111,7 @@ private:
     QLineEdit* _seedEdit{nullptr};
     QPushButton* _seedFromFocusBtn{nullptr};
     QLineEdit* _outputNameEdit{nullptr};
+    QDoubleSpinBox* _outputScaleSpin{nullptr};
 
     // Config combos (one per section)
     QComboBox* _newModelConfigCombo{nullptr};

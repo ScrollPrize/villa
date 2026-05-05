@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import math
 import os
 import subprocess
 import sys
@@ -309,6 +310,10 @@ def _run_optimization(body: dict[str, Any]) -> None:
 
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
+        output_scale = float(body.get("output_scale", 1.0))
+        if not math.isfinite(output_scale) or output_scale <= 0.0:
+            raise ValueError(f"output_scale must be positive and finite, got {output_scale}")
+        cfg["output_scale"] = output_scale
 
         # Decode tifxyz data if present (offset mode — files sent as base64)
         tifxyz_data = body.get("tifxyz_data")
@@ -428,6 +433,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 voxel_size_um = config.get("voxel_size_um")
                 if voxel_size_um is not None:
                     export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
+                if output_scale != 1.0:
+                    export_argv.extend(["--output-scale", str(output_scale)])
                 fit2tifxyz.main(export_argv)
 
         # Clean up intermediate files (but keep results_tmp for download)

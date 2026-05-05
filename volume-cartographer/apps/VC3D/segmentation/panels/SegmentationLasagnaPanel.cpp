@@ -11,6 +11,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
@@ -134,6 +135,16 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     _connectionGroup->addRow(tr("Data:"), [&](QHBoxLayout* row) {
         row->addWidget(_dataInputStack, 1);
     }, tr("Input data (.lasagna.json) required by the lasagna."));
+
+    _connectionGroup->addRow(tr("Output scale:"), [&](QHBoxLayout* row) {
+        _outputScaleSpin = new QDoubleSpinBox(connContent);
+        _outputScaleSpin->setRange(0.0001, 1000.0);
+        _outputScaleSpin->setSingleStep(0.25);
+        _outputScaleSpin->setDecimals(4);
+        _outputScaleSpin->setValue(1.0);
+        _outputScaleSpin->setToolTip(tr("Multiplier for exported tifxyz coordinates. Use 1 for full-res coordinates, or 0.25 to map 2um coordinates into 8um volume coordinates."));
+        row->addWidget(_outputScaleSpin);
+    }, tr("Coordinate multiplier applied to lasagna output surfaces before VC3D reloads them."));
 
     panelLayout->addWidget(_connectionGroup);
 
@@ -445,6 +456,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_outputNameEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         writeSetting(QStringLiteral("lasagna_output_name"), text.trimmed());
+    });
+    connect(_outputScaleSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        writeSetting(QStringLiteral("lasagna_output_scale"), v);
     });
     connect(_seedFromFocusBtn, &QPushButton::clicked, this,
             &SegmentationLasagnaPanel::seedFromFocusRequested);
@@ -1043,6 +1057,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
     }
+    request[QStringLiteral("output_scale")] = outputScale();
     request[QStringLiteral("config")] = config;
 
     if (isOffsetMode && !segPath.empty()) {
@@ -1120,6 +1135,11 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     if (_outputNameEdit) {
         const QSignalBlocker b(_outputNameEdit);
         _outputNameEdit->setText(settings.value(QStringLiteral("lasagna_output_name"), QString()).toString());
+    }
+    // Output coordinate scale
+    if (_outputScaleSpin) {
+        const QSignalBlocker b(_outputScaleSpin);
+        _outputScaleSpin->setValue(settings.value(QStringLiteral("lasagna_output_scale"), 1.0).toDouble());
     }
     // Dimensions
     if (_widthSpin) {
@@ -1352,6 +1372,11 @@ QString SegmentationLasagnaPanel::seedPointText() const
 QString SegmentationLasagnaPanel::newModelOutputName() const
 {
     return _outputNameEdit ? _outputNameEdit->text().trimmed() : QString();
+}
+
+double SegmentationLasagnaPanel::outputScale() const
+{
+    return _outputScaleSpin ? _outputScaleSpin->value() : 1.0;
 }
 
 double SegmentationLasagnaPanel::offsetValue() const

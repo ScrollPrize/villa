@@ -708,7 +708,7 @@ def blur_3d(data: FitData3D, sigma: float) -> None:
 	_blur_normals_tensor(data, _blur_separable)
 
 
-def get_preprocessed_params(path: str) -> dict:
+def get_preprocessed_params(path: str, skip_channels: set[str] | None = None) -> dict:
 	"""Probe .lasagna.json metadata for scaledown and volume extent.
 
 	Returns dict with keys 'scaledown', 'volume_extent_fullres', 'source_to_base'.
@@ -717,10 +717,14 @@ def get_preprocessed_params(path: str) -> dict:
 	"""
 	vol = LasagnaVolume.load(path)
 	s2b = vol.source_to_base
+	_skip = skip_channels or set()
+	groups = [g for g in vol.groups.values() if any(ch not in _skip for ch in g.channels)]
+	if not groups:
+		raise ValueError(f"no usable channel groups in {path}; skip_channels={sorted(_skip)}")
 	# Use finest-resolution group to determine volume extent
-	min_sd = min(g.sd_fac for g in vol.groups.values())
+	min_sd = min(g.sd_fac for g in groups)
 	# Find a group at finest resolution, open its zarr to get spatial dims
-	for g in vol.groups.values():
+	for g in groups:
 		if g.sd_fac == min_sd:
 			zarr_path = str(vol.path.parent / g.zarr_path)
 			zsrc = zarr.open(zarr_path, mode="r")

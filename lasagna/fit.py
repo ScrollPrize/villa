@@ -174,6 +174,32 @@ def _build_parser() -> argparse.ArgumentParser:
 	return p
 
 
+def _optimizer_stage_cfg(cfg: dict) -> dict:
+	stage_cfg = dict(cfg)
+	stage_cfg.pop("args", None)
+	stage_cfg.pop("voxel_size_um", None)
+	stage_cfg.pop("external_surfaces", None)
+	stage_cfg.pop("tifxyz_data", None)
+	stage_cfg.pop("offset_value", None)
+	stage_cfg.pop("output_scale", None)
+	return stage_cfg
+
+
+def _optional_channels_to_skip(stages: list["optimizer.Stage"]) -> set[str]:
+	def _term_active(term: str) -> bool:
+		return any(
+			s.global_opt.steps > 0 and float(s.global_opt.eff.get(term, 0.0)) > 0.0
+			for s in stages
+		)
+
+	skip: set[str] = set()
+	if not (_term_active("data") or _term_active("data_plain")):
+		skip.add("cos")
+	if not _term_active("pred_dt"):
+		skip.add("pred_dt")
+	return skip
+
+
 def _compute_window_grid(
 	H: int, W: int, mesh_step: int, window_size: int, overlap: int,
 ) -> list[tuple[int, int, int, int]]:
@@ -224,6 +250,16 @@ def main(argv: list[str] | None = None) -> int:
 	opt_cfg = cli_opt.from_args(args)
 	progress_enabled = bool(args.progress)
 	_out_dir = args.out_dir
+	output_scale = float(cfg.get("output_scale", 1.0))
+	if not math.isfinite(output_scale) or output_scale <= 0.0:
+		raise ValueError(f"output_scale must be positive and finite, got {output_scale}")
+	stage_cfg = _optimizer_stage_cfg(cfg)
+	stages = optimizer.load_stages_cfg(stage_cfg)
+	skip_channels = _optional_channels_to_skip(stages)
+	if "cos" in skip_channels:
+		print("[fit] skipping optional channel 'cos': data/data_plain losses are disabled", flush=True)
+	if "pred_dt" in skip_channels:
+		print("[fit] skipping optional channel 'pred_dt': pred_dt loss is disabled", flush=True)
 
 	print("data:", data_cfg)
 	print("model:", model_cfg)
@@ -232,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
 	device = torch.device(data_cfg.device)
 
 	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
-	prep_params = fit_data.get_preprocessed_params(str(data_cfg.input))
+	prep_params = fit_data.get_preprocessed_params(str(data_cfg.input), skip_channels=skip_channels)
 	source_to_base = float(prep_params.get("source_to_base", 1.0))
 	# Model scaledown in base coords = channel_scaledown * source_to_base
 	scaledown = float(prep_params["scaledown"]) * source_to_base
@@ -292,12 +328,6 @@ def main(argv: list[str] | None = None) -> int:
 
 		# Parse stages and channel skipping (shared across windows)
 		cfg.pop("corr_points", None)
-		cfg.pop("args", None)
-		cfg.pop("voxel_size_um", None)
-		cfg.pop("external_surfaces", None)
-		cfg.pop("tifxyz_data", None)
-		cfg.pop("offset_value", None)
-		stages = optimizer.load_stages_cfg(cfg)
 
 		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
 		n_windows = len(windows)
@@ -353,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
 				d = fit_data.load_3d_streaming(
 					path=str(data_cfg.input),
 					device=device,
+					skip_channels=skip_channels,
 				)
 				Z, Y, X = d.size
 				sx, sy, sz = d.spacing
@@ -409,11 +440,16 @@ def main(argv: list[str] | None = None) -> int:
 			x_out = mesh_np[0, 0]  # (Hm, Wm)
 			y_out = mesh_np[1, 0]
 			z_out = mesh_np[2, 0]
-			meta_scale = 1.0 / float(mesh_step)
+			if output_scale != 1.0:
+				x_out = x_out * output_scale
+				y_out = y_out * output_scale
+				z_out = z_out * output_scale
+			mesh_step_output = float(mesh_step) * output_scale
+			meta_scale = 1.0 / mesh_step_output
 
 			win_name = f"window_{wi:04d}.tifxyz"
 			win_dir = Path(output_dir) / win_name
-			area = _f2t._get_area(x_out, y_out, z_out, float(mesh_step),
+			area = _f2t._get_area(x_out, y_out, z_out, mesh_step_output,
 								  float(voxel_size_um) if voxel_size_um else None)
 			_f2t._write_tifxyz(
 				out_dir=win_dir, x=x_out, y=y_out, z=z_out,
@@ -504,19 +540,12 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] corr_points: not found in config (type={type(corr_points_obj).__name__})", flush=True)
 
-	# Strip non-stage keys before parsing stages
-	cfg.pop("args", None)
-	cfg.pop("voxel_size_um", None)
-	cfg.pop("external_surfaces", None)
-	cfg.pop("tifxyz_data", None)
-	cfg.pop("offset_value", None)
-	stages = optimizer.load_stages_cfg(cfg)
-
 	# --- Streaming data loader ---
 	def _load_streaming() -> fit_data.FitData3D:
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
+			skip_channels=skip_channels,
 		)
 		Z, Y, X = d.size
 		# Volume extent covers the full zarr volume

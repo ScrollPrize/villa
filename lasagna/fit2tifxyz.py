@@ -25,6 +25,7 @@ class ExportConfig:
 	copy_model: bool = False
 	output_name: str | None = None
 	voxel_size_um: float | None = None
+	output_scale: float = 1.0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -41,6 +42,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	g.add_argument("--output-name", default=None, help="Override tifxyz directory name")
 	g.add_argument("--voxel-size-um", type=float, default=None,
 		help="Voxel size in micrometers (for area calculation)")
+	g.add_argument("--output-scale", type=float, default=1.0,
+		help="Multiplier applied to exported x/y/z coordinates")
 	return p
 
 
@@ -129,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
 		copy_model=bool(args.copy_model),
 		output_name=None if args.output_name in (None, "") else str(args.output_name),
 		voxel_size_um=args.voxel_size_um,
+		output_scale=float(args.output_scale),
 	)
 
 	dev = torch.device(cfg.device)
@@ -155,16 +159,22 @@ def main(argv: list[str] | None = None) -> int:
 	mesh_step = 100
 	if model_params is not None:
 		mesh_step = int(model_params.get("mesh_step", 100))
-	xy_step_fullres = float(mesh_step)
-	meta_scale = 1.0 / xy_step_fullres
+	coord_scale = float(cfg.output_scale)
+	if not np.isfinite(coord_scale) or coord_scale <= 0.0:
+		raise ValueError(f"output_scale must be positive and finite, got {coord_scale}")
+	xy_step_output = float(mesh_step) * coord_scale
+	meta_scale = 1.0 / xy_step_output
 
 	out_base = Path(cfg.output)
 	out_base.mkdir(parents=True, exist_ok=True)
 
 	BORDER_W = 2
 
+	if coord_scale != 1.0:
+		mesh_np = mesh_np * coord_scale
+
 	print(f"[fit2tifxyz] exporting D={D} Hm={Hm} Wm={Wm}, mesh already in fullres coords"
-		  f", voxel_size_um={cfg.voxel_size_um}")
+		  f", output_scale={coord_scale}, voxel_size_um={cfg.voxel_size_um}")
 
 	if cfg.single_segment:
 		# Combine all depth layers horizontally
@@ -186,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
 
 		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
 		out_dir = out_base / seg_name
-		area = _get_area(x_all, y_all, z_all, xy_step_fullres, cfg.voxel_size_um)
+		area = _get_area(x_all, y_all, z_all, xy_step_output, cfg.voxel_size_um)
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 					  area=area, components=components if D > 1 else None)
@@ -206,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
 			z = mesh_np[2, d]
 			valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
 			d_layer = np.where(valid, float(d), -1.0).astype(np.float32)
-			area = _get_area(x, y, z, xy_step_fullres, cfg.voxel_size_um)
+			area = _get_area(x, y, z, xy_step_output, cfg.voxel_size_um)
 			total_area["area_vx2"] += area["area_vx2"]
 			if "area_cm2" in area:
 				total_area["area_cm2"] += area["area_cm2"]
