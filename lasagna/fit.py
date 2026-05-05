@@ -3,7 +3,6 @@ import copy
 import dataclasses
 import math
 import sys
-import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -21,12 +20,11 @@ import optimizer
 
 
 def _stage_start(label: str) -> float:
-	print(f"[fit] stage start: {label}", flush=True)
-	return time.perf_counter()
+	return 0.0
 
 
 def _stage_done(label: str, t0: float) -> None:
-	print(f"[fit] stage done: {label} ({time.perf_counter() - t0:.3f}s)", flush=True)
+	return None
 
 
 def _grid_center(mdl: "model.Model3D") -> torch.Tensor:

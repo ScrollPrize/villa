@@ -235,15 +235,7 @@ def _sample_pred_dt_max3d(
 
 def _pred_dt_loss_sample_xyz(res: fit_model.FitResult3D) -> torch.Tensor:
 	"""Exact LR positions used by pred_dt_loss for differentiable pred-dt sampling."""
-	if _pred_dt_normal_source == "model":
-		n = _vertex_normals(res.xyz_lr.detach())
-	elif _pred_dt_normal_source == "gt":
-		if res.gt_normal_lr is None:
-			raise RuntimeError("pred_dt_loss normal_source='gt' requires gt_normal_lr")
-		n = res.gt_normal_lr.detach().to(device=res.xyz_lr.device, dtype=res.xyz_lr.dtype)
-	else:
-		raise RuntimeError(f"unsupported pred_dt normal_source: {_pred_dt_normal_source!r}")
-	n = n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+	n = _pred_dt_projection_normals(res)
 	proj_len = (res.xyz_lr * n).sum(dim=-1, keepdim=True)
 	xyz_normal = proj_len * n
 	xyz_tangential = res.xyz_lr - xyz_normal
@@ -402,7 +394,7 @@ def flow_gate_prefetch_items_for_result(
 			root = xyz0[root_h, root_w]
 			tip = xyz0[tip_h, tip_w]
 			line_vec = tip - root
-			n = _tip_gt_normals_from_result(res=res, tip_h=tip_h, tip_w=tip_w)
+			n = _tip_normals_from_result(res=res, tip_h=tip_h, tip_w=tip_w)
 			offset_factors = _anticipatory_normal_offset_factors(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype)
 			ref_step = _anticipatory_reference_step(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
 			offset = ref_step * offset_factors.view(1, -1)
@@ -414,15 +406,25 @@ def flow_gate_prefetch_items_for_result(
 	return out
 
 
-def _tip_gt_normals_from_result(
+def _pred_dt_projection_normals(res: fit_model.FitResult3D) -> torch.Tensor:
+	if _pred_dt_normal_source == "model":
+		n = _vertex_normals(res.xyz_lr.detach())
+	elif _pred_dt_normal_source == "gt":
+		if res.gt_normal_lr is None:
+			raise RuntimeError("pred_dt normal_source='gt' requires gt_normal_lr")
+		n = res.gt_normal_lr.detach().to(device=res.xyz_lr.device, dtype=res.xyz_lr.dtype)
+	else:
+		raise RuntimeError(f"unsupported pred_dt normal_source: {_pred_dt_normal_source!r}")
+	return n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def _tip_normals_from_result(
 	*,
 	res: fit_model.FitResult3D,
 	tip_h: torch.Tensor,
 	tip_w: torch.Tensor,
 ) -> torch.Tensor:
-	if res.gt_normal_lr is None:
-		raise RuntimeError("anticipatory_pull requires gt_normal_lr; GT nx/ny normals are missing at LR mesh points")
-	n = res.gt_normal_lr[0, tip_h, tip_w].detach().to(device=res.xyz_lr.device, dtype=res.xyz_lr.dtype)
+	n = _pred_dt_projection_normals(res)[0, tip_h, tip_w].detach()
 	return n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
@@ -467,7 +469,7 @@ def _score_anticipatory_pull_candidates(
 			root = xyz0[rh, rw]
 			tip = xyz0[th, tw]
 			line_vec = tip - root
-			n = _tip_gt_normals_from_result(res=res, tip_h=th, tip_w=tw)
+			n = _tip_normals_from_result(res=res, tip_h=th, tip_w=tw)
 			offsets = ref_step * offset_factors
 			target_vec = line_vec.view(-1, 1, 3) + offsets.view(1, -1, 1) * n.view(-1, 1, 3)
 			query = root.view(-1, 1, 1, 3) + t * target_vec.view(c1 - c0, int(offset_factors.numel()), 1, 3)
@@ -768,7 +770,7 @@ def _write_anticipatory_fit_debug_mosaic(
 		line = tip - root
 		line_len = line.norm().clamp_min(1e-6)
 		line_dir = line / line_len
-		normal = _tip_gt_normals_from_result(
+		normal = _tip_normals_from_result(
 			res=res,
 			tip_h=torch.tensor([th], device=xyz0.device, dtype=torch.long),
 			tip_w=torch.tensor([tw], device=xyz0.device, dtype=torch.long),

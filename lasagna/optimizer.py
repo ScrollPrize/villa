@@ -288,11 +288,10 @@ def optimize(
 	opt_loss_corr.reset_state()
 
 	def _stage_start(name: str) -> float:
-		print(f"[optimizer] stage start: {name}", flush=True)
-		return time.perf_counter()
+		return 0.0
 
 	def _stage_done(name: str, t0: float) -> None:
-		print(f"[optimizer] stage done: {name} ({time.perf_counter() - t0:.3f}s)", flush=True)
+		return None
 
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
@@ -439,7 +438,7 @@ def optimize(
 			def _fmt_val(k: str, v: float) -> str:
 				av = abs(v)
 				if av != 0.0 and (av >= 1000.0 or av < 1.0e-3):
-					return f"{v:.2e}"
+					return f"{v:.1e}"
 				if av < 10.0:
 					return f"{v:.4f}"
 				if av < 100.0:

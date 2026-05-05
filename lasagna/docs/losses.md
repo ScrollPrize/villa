@@ -72,8 +72,8 @@ Optimizer stages can also optionally perform mesh growth + local optimization (s
 ```
 
 `pred_dt_normal_source` controls the normal used for the pred-dt sampling
-projection. The default is `"model"` for current mesh normals. Set it to `"gt"`
-to project along sampled GT normals for that stage.
+projection and anticipatory pull search. The default is `"model"` for current
+mesh normals. Set it to `"gt"` to use sampled GT normals for that stage.
 
 When enabled, the current single-winding `pred_dt` render is median-filtered
 with radius 1, thresholded at `110`, routed through `dense_batch_min_cut`, and
