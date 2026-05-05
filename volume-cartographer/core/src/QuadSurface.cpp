@@ -449,36 +449,6 @@ void QuadSurface::ensureLoaded()
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
 
-    for (auto& [name, mat] : _channels) {
-        if (mat.empty()) {
-            std::filesystem::path channel_path = path / (name + ".tif");
-            if (std::filesystem::exists(channel_path)) {
-                std::vector<cv::Mat> layers;
-                cv::imreadmulti(channel_path.string(), layers, cv::IMREAD_UNCHANGED);
-                if (!layers.empty()) {
-                    mat = layers[0];
-                }
-            }
-        }
-    }
-
-    trimToValidBbox();
-
-    if (_points && !_points->empty()) {
-        const int pr = _points->rows;
-        const int pc = _points->cols;
-        for (auto& [_, mat] : _channels) {
-            if (mat.empty() || (mat.rows == pr && mat.cols == pc)) {
-                continue;
-            }
-            if (mat.rows >= pr && mat.cols >= pc) {
-                const int dy = mat.rows - pr;
-                const int dx = mat.cols - pc;
-                mat = mat(cv::Rect(dx / 2, dy / 2, pc, pr)).clone();
-            }
-        }
-    }
-
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
         _bbox = loaded->_bbox;
@@ -586,6 +556,7 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
     if (_channels.count(name)) {
         cv::Mat& channel = _channels[name];
         if (channel.empty()) {
+            // On-demand loading
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {
                 std::vector<cv::Mat> layers;
@@ -593,13 +564,6 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
                 if (!layers.empty()) {
                     channel = layers[0];
                 }
-            }
-            if (!channel.empty() && _points && !_points->empty() &&
-                (channel.rows != _points->rows || channel.cols != _points->cols) &&
-                channel.rows >= _points->rows && channel.cols >= _points->cols) {
-                const int dy = channel.rows - _points->rows;
-                const int dx = channel.cols - _points->cols;
-                channel = channel(cv::Rect(dx / 2, dy / 2, _points->cols, _points->rows)).clone();
             }
         }
 
@@ -643,62 +607,6 @@ int QuadSurface::countValidQuads() const
     if (!_points) return 0;
     auto range = validQuads();
     return static_cast<int>(std::distance(range.begin(), range.end()));
-}
-
-bool QuadSurface::trimToValidBbox()
-{
-    if (!_points || _points->empty()) return false;
-    const int rows = _points->rows;
-    const int cols = _points->cols;
-    int r0 = rows, r1 = -1, c0 = cols, c1 = -1;
-    for (int r = 0; r < rows; r++) {
-        const cv::Vec3f* row = (*_points)[r];
-        int rc0 = cols, rc1 = -1;
-        for (int c = 0; c < cols; c++) {
-            if (row[c][0] != -1.f) {
-                if (c < rc0) rc0 = c;
-                rc1 = c;
-            }
-        }
-        if (rc1 >= 0) {
-            if (r < r0) r0 = r;
-            r1 = r;
-            if (rc0 < c0) c0 = rc0;
-            if (rc1 > c1) c1 = rc1;
-        }
-    }
-    if (r1 < 0 || c1 < 0) return false;
-    const int bbH = r1 - r0 + 1;
-    const int bbW = c1 - c0 + 1;
-    // Skip only if nothing to trim (bbox already matches grid exactly).
-    if (bbH == rows && bbW == cols) return false;
-    const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
-    const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
-    const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
-    const cv::Rect cropRect(c0, r0, bbW, bbH);
-    *_points = (*_points)(cropRect).clone();
-    for (auto& [_, mat] : _channels) {
-        if (!mat.empty() && mat.rows == rows && mat.cols == cols) {
-            mat = mat(cropRect).clone();
-        }
-    }
-    // Shift center: after cropping by (c0, r0), the new grid index 0
-    // corresponds to the old index (c0, r0), so we must subtract.
-    _center[0] -= float(c0) / _scale[0];
-    _center[1] -= float(r0) / _scale[1];
-    _bounds = {0, 0, bbW - 1, bbH - 1};
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};  // World bbox cached, needs recompute.
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
-    if (DebugLoggingEnabled()) {
-        std::fprintf(stderr,
-            "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
-            id.c_str(), cols, rows, bbW, bbH,
-            (origBytes - trimBytes) / (1024 * 1024),
-            pctSaved * 100.0);
-    }
-    return true;
 }
 
 void QuadSurface::unloadPoints()
