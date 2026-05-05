@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <cstdio>
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
@@ -255,6 +256,9 @@ static void print_usage() {
 }
 
 int main(int argc, char* argv[]) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+
     po::options_description global("Global options");
     global.add_options()
         ("help,h", "Print usage message")
@@ -953,7 +957,7 @@ void run_generate(const po::variables_map& vm) {
             }
 
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 1) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 5) {
                 last_report_time = now;
                 const auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
                 const size_t active_processed = processed > (skipped_existing + unsampled)
