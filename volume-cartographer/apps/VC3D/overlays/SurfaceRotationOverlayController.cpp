@@ -9,6 +9,7 @@
 
 #include <QApplication>
 #include <QDoubleSpinBox>
+#include <QFutureWatcher>
 #include <QGraphicsProxyWidget>
 #include <QGraphicsScene>
 #include <QHBoxLayout>
@@ -16,11 +17,13 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointer>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QtConcurrent>
 
 #include <algorithm>
 #include <cmath>
@@ -460,37 +463,76 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
-    try {
-        if (std::abs(_angleDeg) >= 0.01) {
-            // saveOverwrite() snapshots the on-disk state before
-            // overwriting it, so the backup ring captures the
-            // pre-rotation files (no explicit pre-rotate snapshot
-            // needed: the on-disk state is still pre-rotate at that
-            // point because rotate() only mutates _points in memory).
-            _sourceSurface->rotate(static_cast<float>(_angleDeg));
-            _sourceSurface->saveOverwrite();
-            if (_viewerManager) {
-                _viewerManager->refreshSurfacePatchIndex(_sourceSurface);
-            }
-        }
+    // Trivial rotation: no I/O, nothing to do off-thread.
+    if (std::abs(_angleDeg) < 0.01) {
         _state->setSurface("segmentation", _sourceSurface, false, true);
-    } catch (const std::exception&) {
-        _state->setSurface("segmentation", _sourceSurface, false, true);
-        clearWidgets();
         _rotateActive = false;
+        _angleDeg = 0.0;
         _previewSurface.reset();
         _sourceSurface.reset();
-        QMessageBox::warning(nullptr,
-                             tr("Rotation Failed"),
-                             tr("Failed to save the rotated surface."));
+        clearWidgets();
         return;
     }
 
-    _rotateActive = false;
-    _angleDeg = 0.0;
-    _previewSurface.reset();
-    _sourceSurface.reset();
-    clearWidgets();
+    // Pre-fix this method ran rotate() + saveOverwrite() on the GUI
+    // thread, freezing the UI for several seconds on large surfaces.
+    // Move both into a worker (mirrors SegmentationModule::performAutosave),
+    // then post UI work back on completion.
+    auto surface = _sourceSurface;
+    const float angleDeg = static_cast<float>(_angleDeg);
+    QPointer<SurfaceRotationOverlayController> self(this);
+
+    auto* watcher = new QFutureWatcher<void>(this);
+    connect(watcher, &QFutureWatcher<void>::finished, this,
+            [self, watcher, surface]() {
+                watcher->deleteLater();
+                if (!self || !self->_state) {
+                    return;
+                }
+
+                bool failed = false;
+                try {
+                    watcher->waitForFinished();  // surface exception if any
+                } catch (const std::exception&) {
+                    failed = true;
+                } catch (...) {
+                    failed = true;
+                }
+
+                if (failed) {
+                    self->_state->setSurface("segmentation", surface, false, true);
+                    self->clearWidgets();
+                    self->_rotateActive = false;
+                    self->_previewSurface.reset();
+                    self->_sourceSurface.reset();
+                    QMessageBox::warning(nullptr,
+                                         tr("Rotation Failed"),
+                                         tr("Failed to save the rotated surface."));
+                    return;
+                }
+
+                if (self->_viewerManager) {
+                    self->_viewerManager->refreshSurfacePatchIndex(surface);
+                }
+                self->_state->setSurface("segmentation", surface, false, true);
+
+                self->_rotateActive = false;
+                self->_angleDeg = 0.0;
+                self->_previewSurface.reset();
+                self->_sourceSurface.reset();
+                self->clearWidgets();
+            });
+
+    auto future = QtConcurrent::run([surface, angleDeg]() {
+        // saveOverwrite() snapshots the on-disk state before
+        // overwriting it. rotate() only mutates _points in memory,
+        // so the on-disk x/y/z.tif are still pre-rotate when the
+        // snapshot is taken — the backup ring captures the
+        // pre-rotation files automatically.
+        surface->rotate(angleDeg);
+        surface->saveOverwrite();
+    });
+    watcher->setFuture(future);
 }
 
 std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::cloneSurface(const std::shared_ptr<QuadSurface>& surface)
