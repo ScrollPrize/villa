@@ -279,7 +279,18 @@ void SurfaceRotationOverlayController::beginRotate()
 
 void SurfaceRotationOverlayController::cancelRotate()
 {
-    if (_rotateActive && _state && _sourceSurface) {
+    // Restore the un-previewed source surface — but only if no save
+    // worker is currently mutating it. Publishing _sourceSurface
+    // while applyRotation()'s background rotate() / saveOverwrite()
+    // is running would point surfaceChanged consumers at a cv::Mat
+    // the worker is concurrently writing, racing on _points and the
+    // ancillary channels. Whatever was previously active (typically
+    // the last _previewSurface from a dial drag) stays in place; the
+    // worker's finished slot already drops its own setSurface via
+    // the stale-completion guard, so the UI never sees the
+    // cancelled-session's post-rotate output either. A user who
+    // wants the on-disk post-rotate state can reopen the segment.
+    if (_rotateActive && _state && _sourceSurface && !_saveInFlight) {
         _state->setSurface("segmentation", _sourceSurface, false, true);
     }
     _rotateActive = false;
