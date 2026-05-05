@@ -103,10 +103,16 @@ public:
     // Zarr/storage order: [z, y, x] = [slices, height, width].
     [[nodiscard]] std::array<int, 3> shape() const noexcept;
     [[nodiscard]] std::array<int, 3> shape(int level) const;
+    [[nodiscard]] std::array<int, 3> levelShape(int level) const;
+    [[nodiscard]] std::array<int, 3> chunkShape(int level) const;
+    [[nodiscard]] std::array<int, 3> chunkGridShape(int level) const;
+    [[nodiscard]] size_t chunkCount(int level) const;
     // Coordinate/UI order: [x, y, z] = [width, height, slices].
     [[nodiscard]] std::array<int, 3> shapeXyz() const noexcept;
     [[nodiscard]] double voxelSize() const;
     [[nodiscard]] vc::render::ChunkDtype dtype() const noexcept { return zarrDtype_; }
+    [[nodiscard]] size_t dtypeSize() const noexcept;
+    [[nodiscard]] double fillValue() const noexcept { return zarrFillValue_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
     [[nodiscard]] int baseScaleLevel() const noexcept { return 0; }
@@ -239,7 +245,9 @@ protected:
     int _slices{0};
 
     std::vector<std::array<int, 3>> zarrLevelShapes_;
+    std::vector<std::array<int, 3>> zarrLevelChunkShapes_;
     vc::render::ChunkDtype zarrDtype_ = vc::render::ChunkDtype::UInt8;
+    double zarrFillValue_ = 0.0;
     PyramidPolicy::Reduction pyramidReduction_ = PyramidPolicy::Reduction::Mean;
     void zarrOpen();
 

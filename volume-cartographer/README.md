@@ -23,6 +23,18 @@ docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 
 If you want to install vc3d from source, the easiest path is to look at the [dockerfile](ubuntu-24.04-noble.Dockerfile) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
 
+On macOS, use the Homebrew LLVM build helper:
+
+```bash
+scripts/build_macos.sh --install-deps
+```
+
+After dependencies are installed, rebuilds can use:
+
+```bash
+scripts/build_macos.sh
+```
+
 [installation instructions for docker](https://docs.docker.com/engine/install/)
 
 [running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
