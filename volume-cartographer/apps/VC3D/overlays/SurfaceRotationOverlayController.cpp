@@ -288,9 +288,14 @@ void SurfaceRotationOverlayController::cancelRotate()
     _previewSurface.reset();
     // Invalidate any in-flight save worker — the session it was
     // started for is over, so its completion callback will see a
-    // mismatched session id and drop its state changes.
+    // mismatched session id and drop its state changes. We do NOT
+    // clear _saveInFlight here: the worker is still running and a
+    // new Apply on a freshly begun session must wait for it to
+    // finish, otherwise two workers could race rotate()/saveOverwrite()
+    // on the same QuadSurface (the new session may target the very
+    // same segment). The finished slot clears _saveInFlight whether
+    // it applies or drops the result.
     ++_saveSessionId;
-    _saveInFlight = false;
     clearWidgets();
 }
 
@@ -446,6 +451,14 @@ void SurfaceRotationOverlayController::updatePreview()
     if (!_rotateActive || !_state || !_sourceSurface) {
         return;
     }
+    // While a save worker is running, _sourceSurface is being mutated
+    // (rotate + saveOverwrite) on the worker thread. Cloning it here on
+    // the UI thread would race the worker's writes — read while another
+    // thread mutates the same cv::Mat data. Skip the preview update; the
+    // worker will tear the controller down via its finished slot anyway.
+    if (_saveInFlight) {
+        return;
+    }
 
     if (std::abs(_angleDeg) < 0.01) {
         _previewSurface.reset();
@@ -501,7 +514,15 @@ void SurfaceRotationOverlayController::applyRotation()
     connect(watcher, &QFutureWatcher<void>::finished, this,
             [self, watcher, surface, session]() {
                 watcher->deleteLater();
-                if (!self || !self->_state) {
+                if (!self) {
+                    return;
+                }
+                // Always clear the in-flight flag once the worker is
+                // done, even on stale/cancelled completion. The
+                // reentrancy guard relies on this — leaving it set
+                // would lock out future Applies after a cancel.
+                self->_saveInFlight = false;
+                if (!self->_state) {
                     return;
                 }
                 // Stale completion: cancelRotate() or another Apply
@@ -512,7 +533,6 @@ void SurfaceRotationOverlayController::applyRotation()
                 if (session != self->_saveSessionId) {
                     return;
                 }
-                self->_saveInFlight = false;
 
                 bool failed = false;
                 try {
