@@ -114,6 +114,7 @@ RUN install -m 0755 /src/libs/flatboi/build/flatboi /usr/local/bin/flatboi
 RUN mkdir -p /src/build
 WORKDIR /src/build
 RUN cmake -DVC_WITH_CUDA_SPARSE=off \
+          -DVC_USE_OPENMP=ON \
           -GNinja /src \
  && ninja \
  && cp bin/* /usr/local/bin/
