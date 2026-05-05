@@ -21,7 +21,7 @@ class DataConfig:
 	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 	erode_valid_mask: int                                # erode grad_mag validity mask by N voxels
-	sparse_prefetch_backend: str                         # "tensorstore" or "python" streaming prefetcher
+	sparse_prefetch_backend: str                         # "tensorstore" or "python-zarr" streaming prefetcher
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -47,8 +47,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Use custom CUDA uint8 grid_sample kernel (1=yes, 0=fallback to PyTorch F.grid_sample)")
 	g.add_argument("--erode-valid-mask", type=int, default=0,
 		help="Erode grad_mag validity mask inward by N voxels (excludes noisy borders from all losses)")
-	g.add_argument("--sparse-prefetch-backend", choices=("tensorstore", "python", "cuda", "tensorstore_cpp"), default="tensorstore",
-		help="Sparse streaming prefetch backend: tensorstore uses TensorStore Python, python uses the old zarr path")
+	g.add_argument("--sparse-prefetch-backend", choices=("tensorstore", "python-zarr"), default="tensorstore",
+		help="Sparse streaming prefetch backend: tensorstore uses TensorStore Python, python-zarr uses the zarr fallback")
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:

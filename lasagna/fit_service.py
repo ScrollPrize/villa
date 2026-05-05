@@ -703,7 +703,7 @@ def main() -> None:
     p.add_argument("--no-gpu-pause", action="store_true", default=False,
                    help="Disable automatic GPU pause/resume of training")
     p.add_argument("--sparse-prefetch-backend",
-                   choices=("tensorstore", "python", "cuda", "tensorstore_cpp"),
+                   choices=("tensorstore", "python-zarr"),
                    default="tensorstore",
                    help="Sparse streaming prefetch backend for fit jobs")
     args = p.parse_args()

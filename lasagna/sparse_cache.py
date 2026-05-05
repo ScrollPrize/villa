@@ -17,24 +17,6 @@ _CHUNK_SIZE = 32
 _PADDED = _CHUNK_SIZE + 2  # 34: 1 voxel margin each side
 
 
-def _dilate26(t: torch.Tensor) -> torch.Tensor:
-    """26-connected dilation of a 3D bool tensor (full 3x3x3 neighborhood)."""
-    d = t.clone()
-    for dz in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dz == 0 and dy == 0 and dx == 0:
-                    continue
-                sz = slice(max(0, dz), t.shape[0] + min(0, dz))
-                sy = slice(max(0, dy), t.shape[1] + min(0, dy))
-                sx = slice(max(0, dx), t.shape[2] + min(0, dx))
-                tz = slice(max(0, -dz), t.shape[0] + min(0, -dz))
-                ty = slice(max(0, -dy), t.shape[1] + min(0, -dy))
-                tx = slice(max(0, -dx), t.shape[2] + min(0, -dx))
-                d[sz, sy, sx] |= t[tz, ty, tx]
-    return d
-
-
 class SparseChunkGroupCache:
     """Sparse GPU chunk cache for one zarr channel group.
 
@@ -55,7 +37,6 @@ class SparseChunkGroupCache:
         is_3d_zarr: bool,
         device: torch.device,
         n_workers: int = 8,
-        prefetch_backend: str = "cuda",
     ) -> None:
         self.channels = channels
         self.zarr_path = zarr_path
@@ -64,12 +45,6 @@ class SparseChunkGroupCache:
         self.channel_indices = channel_indices  # channel_name -> index in zarr C dim
         self.is_3d_zarr = is_3d_zarr
         self.device = device
-        self.prefetch_backend = str(prefetch_backend)
-        if self.prefetch_backend not in {"cuda", "python"}:
-            raise ValueError(
-                f"unknown sparse prefetch backend {self.prefetch_backend!r}; "
-                "expected 'cuda' or 'python'")
-
         Z, Y, X = vol_shape_zyx
         self.chunk_grid = (
             (Z + _CHUNK_SIZE - 1) // _CHUNK_SIZE,
@@ -99,7 +74,7 @@ class SparseChunkGroupCache:
         table_mib = cZ * cY * cX * 8 / 1024**2
         print(f"[sparse_cache] {','.join(channels)}: chunk_grid={cZ}x{cY}x{cX} "
               f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB "
-              f"prefetch={self.prefetch_backend}", flush=True)
+              f"prefetch=cuda", flush=True)
 
     def prefetch(self, xyz_fullres: torch.Tensor, origin: tuple[float, float, float],
                  spacing: tuple[float, float, float]) -> None:
@@ -128,22 +103,9 @@ class SparseChunkGroupCache:
         spacing_t = torch.tensor(spacing, dtype=torch.float32, device=dev)
 
         with torch.no_grad():
-            if self.prefetch_backend == "cuda":
-                from sparse_prefetch_chunks import missing_chunks
-                return missing_chunks(
-                    xyz_fullres, self.chunk_table, origin_t, spacing_t).cpu()
-
-            flat = xyz_fullres.reshape(-1, 3)
-            local = (flat - origin_t) / spacing_t
-            ci_x = (local[:, 0] / _CHUNK_SIZE).long().clamp(0, cX - 1)
-            ci_y = (local[:, 1] / _CHUNK_SIZE).long().clamp(0, cY - 1)
-            ci_z = (local[:, 2] / _CHUNK_SIZE).long().clamp(0, cZ - 1)
-
-            needed = torch.zeros(cZ, cY, cX, dtype=torch.bool, device=dev)
-            needed[ci_z, ci_y, ci_x] = True
-            needed = _dilate26(needed)
-            missing = needed & (self.chunk_table == 0)
-            return missing.nonzero().cpu()
+            from sparse_prefetch_chunks import missing_chunks
+            return missing_chunks(
+                xyz_fullres, self.chunk_table, origin_t, spacing_t).cpu()
 
     def _load_chunk(self, cz: int, cy: int, cx: int) -> tuple[int, int, int, np.ndarray]:
         """Read a 34³ padded chunk from zarr. Runs in thread pool."""

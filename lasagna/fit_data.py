@@ -942,10 +942,11 @@ def load_3d_streaming(
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
 	_skip = skip_channels or set()
-	_backend = "tensorstore" if sparse_prefetch_backend in {"tensorstore_cpp", "tensorstore"} else sparse_prefetch_backend
-	if sparse_prefetch_backend == "tensorstore_cpp":
-		print("[fit_data] WARNING: sparse_prefetch_backend=tensorstore_cpp is deprecated; "
-			  "using tensorstore", flush=True)
+	_backend = str(sparse_prefetch_backend)
+	if _backend not in {"tensorstore", "python-zarr"}:
+		raise ValueError(
+			f"unknown sparse_prefetch_backend={_backend!r}; "
+			"expected 'tensorstore' or 'python-zarr'")
 
 	# Build sparse caches per group
 	sparse_caches: dict[str, SparseChunkGroupCache] = {}
@@ -1001,7 +1002,6 @@ def load_3d_streaming(
 				channel_indices=channel_indices,
 				is_3d_zarr=is_3d,
 				device=device,
-				prefetch_backend="cuda" if _backend == "cuda" else "python",
 			)
 		sparse_caches[group_name] = cache
 
