@@ -15,7 +15,7 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--winding-volume` optional winding volume zarr path
   - `--cuda-gridsample` enable custom CUDA uint8 sampling kernel
   - `--erode-valid-mask` erode valid mask by N pixels
-  - `--sparse-prefetch-backend` sparse streaming prefetcher (`cuda` default; `python` keeps the old tensor/Python path)
+  - `--sparse-prefetch-backend` sparse streaming prefetcher (`tensorstore_cpp` default; `python` keeps the old zarr path)
 
 - **model**: [`cli_model.py`](../cli_model.py)
   - `--mesh-step` (default 100) height step in fullres voxels

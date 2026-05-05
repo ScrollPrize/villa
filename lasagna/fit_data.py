@@ -878,7 +878,7 @@ def load_3d_streaming(
 	path: str,
 	device: torch.device,
 	skip_channels: set[str] | None = None,
-	sparse_prefetch_backend: str = "cuda",
+	sparse_prefetch_backend: str = "tensorstore_cpp",
 ) -> FitData3D:
 	"""Load .lasagna.json as sparse streaming cache — no upfront data load.
 
@@ -928,15 +928,27 @@ def load_3d_streaming(
 			ch_idx = group.channels.index(ch)
 			channel_indices[ch] = ch_idx
 
-		cache = SparseChunkGroupCache(
-			channels=channels,
-			zarr_path=zarr_path,
-			vol_shape_zyx=(Z, Y, X),
-			channel_indices=channel_indices,
-			is_3d_zarr=is_3d,
-			device=device,
-			prefetch_backend=sparse_prefetch_backend,
-		)
+		_backend = "tensorstore_cpp" if sparse_prefetch_backend in {"tensorstore_cpp", "tensorstore"} else sparse_prefetch_backend
+		if _backend == "tensorstore_cpp":
+			from sparse_tensorstore_cache import TensorStoreSparseChunkGroupCache
+			cache = TensorStoreSparseChunkGroupCache(
+				channels=channels,
+				zarr_path=zarr_path,
+				vol_shape_zyx=(Z, Y, X),
+				channel_indices=channel_indices,
+				is_3d_zarr=is_3d,
+				device=device,
+			)
+		else:
+			cache = SparseChunkGroupCache(
+				channels=channels,
+				zarr_path=zarr_path,
+				vol_shape_zyx=(Z, Y, X),
+				channel_indices=channel_indices,
+				is_3d_zarr=is_3d,
+				device=device,
+				prefetch_backend="cuda" if _backend == "cuda" else "python",
+			)
 		sparse_caches[group_name] = cache
 
 		# Per-channel spacing

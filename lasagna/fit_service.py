@@ -32,7 +32,7 @@ from typing import Any
 
 _data_dir: str | None = None  # Set via --data-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
-_sparse_prefetch_backend: str = "cuda"  # Set via --sparse-prefetch-backend
+_sparse_prefetch_backend: str = "tensorstore_cpp"  # Set via --sparse-prefetch-backend
 
 
 def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
@@ -702,8 +702,9 @@ def main() -> None:
                    help="Directory containing .lasagna.json datasets")
     p.add_argument("--no-gpu-pause", action="store_true", default=False,
                    help="Disable automatic GPU pause/resume of training")
-    p.add_argument("--sparse-prefetch-backend", choices=("cuda", "python"),
-                   default="cuda",
+    p.add_argument("--sparse-prefetch-backend",
+                   choices=("tensorstore_cpp", "python", "cuda", "tensorstore"),
+                   default="tensorstore_cpp",
                    help="Sparse streaming prefetch backend for fit jobs")
     args = p.parse_args()
 
