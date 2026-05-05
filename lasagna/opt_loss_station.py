@@ -37,7 +37,7 @@ def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
 
     # Sample GT normal at seed point
     query = seed_xyz.view(1, 1, 1, 3)  # (D=1, H=1, W=1, 3)
-    sampled = data.grid_sample_fullres(query)
+    sampled = data.grid_sample_fullres(query, channels={"nx", "ny"})
     nx = sampled.nx.squeeze().item()
     ny = sampled.ny.squeeze().item()
     nz_sq = max(0.0, 1.0 - nx * nx - ny * ny)

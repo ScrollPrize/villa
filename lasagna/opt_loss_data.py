@@ -25,7 +25,7 @@ def _sample_cos_diff(res: fit_model.FitResult3D) -> torch.Tensor:
 	"""Differentiably sample cos channel at xyz_hr. Returns (D, 1, He, We)."""
 	if res.data.sparse_caches:
 		# Sparse streaming mode: go through unified grid_sample_fullres path
-		sampled = res.data.grid_sample_fullres(res.xyz_hr, diff=True)
+		sampled = res.data.grid_sample_fullres(res.xyz_hr, diff=True, channels={"cos"})
 		return sampled.cos.squeeze(0).permute(1, 0, 2, 3)  # (D, 1, He, We)
 	# Dense mode: direct kernel call (cos channel only, more efficient)
 	dev = res.xyz_hr.device
