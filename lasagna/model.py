@@ -43,6 +43,8 @@ class FitResult3D:
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
+	boundary_anchors: list | None = None
+	# Per anchor: (target_xyz, mask), with target_xyz (H, W, 3), mask (H, W).
 
 
 class Model3D(nn.Module):
@@ -124,6 +126,7 @@ class Model3D(nn.Module):
 		self._ext_conn_params: list[dict] = []                # cached intersection params per ext surface
 		self._ext_normals: list[torch.Tensor] = []            # each (H_ext, W_ext, 3) precomputed unit normals
 		self._ext_offsets: list[float] = []                   # target integral offset per ext surface
+		self._boundary_anchors: list[tuple[torch.Tensor, torch.Tensor]] = []
 
 		# Amplitude and bias for data matching (deferred but needed for FitResult3D)
 		amp_init = torch.full((self.depth, 1, self.mesh_h, self.mesh_w), 1.0, device=device, dtype=torch.float32)
@@ -733,6 +736,26 @@ class Model3D(nn.Module):
 		self._ext_offsets.append(float(offset))
 		return idx
 
+	def add_boundary_anchor_surface(self, xyz: torch.Tensor, valid: torch.Tensor,
+									ring_width: int = 1) -> int:
+		"""Anchor valid vertices adjacent to invalid vertices.
+
+		The ring represents the Dirichlet boundary for tifxyz hole filling:
+		valid rim vertices should remain fixed while invalid interiors are
+		reconstructed by the model and volume losses.
+		"""
+		dev = self.conn_offsets.device
+		valid_dev = valid.to(device=dev, dtype=torch.bool)
+		invalid = (~valid_dev).float().unsqueeze(0).unsqueeze(0)
+		width = max(1, int(ring_width))
+		dilated_invalid = invalid
+		for _ in range(width):
+			dilated_invalid = F.max_pool2d(dilated_invalid, kernel_size=3, stride=1, padding=1)
+		mask = valid_dev & (dilated_invalid.squeeze(0).squeeze(0) > 0.0)
+		target = xyz.detach().to(device=dev, dtype=torch.float32)
+		self._boundary_anchors.append((target, mask))
+		return len(self._boundary_anchors) - 1
+
 	def update_ext_conn_offsets(self) -> None:
 		"""Two-pass intersection update using current (post-step) model params.
 
@@ -1005,6 +1028,7 @@ class Model3D(nn.Module):
 			params=self.params,
 			gt_normal_lr=gt_normal_lr,
 			ext_conn=ext_conn,
+			boundary_anchors=self._boundary_anchors,
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:

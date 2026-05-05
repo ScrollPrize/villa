@@ -38,18 +38,44 @@
 
 #include "utils/Json.hpp"
 
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+
+#include <tiffio.h>
+
+#include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <vector>
 
 namespace {
 
 QString pathToQString(const std::filesystem::path& path)
 {
     return QString::fromStdString(path.string());
+}
+
+QString extendDirectionToken(SegmentationGrowthDirection direction)
+{
+    switch (direction) {
+    case SegmentationGrowthDirection::Up:
+        return QStringLiteral("up");
+    case SegmentationGrowthDirection::Down:
+        return QStringLiteral("down");
+    case SegmentationGrowthDirection::Left:
+        return QStringLiteral("left");
+    case SegmentationGrowthDirection::Right:
+        return QStringLiteral("right");
+    case SegmentationGrowthDirection::All:
+    case SegmentationGrowthDirection::Fill:
+        return QStringLiteral("all");
+    }
+    return QStringLiteral("all");
 }
 
 bool pathExists(const std::filesystem::path& path)
@@ -79,6 +105,240 @@ QString metaModelSource(const std::filesystem::path& segPath)
     }
 
     return doc.object().value(QStringLiteral("model_source")).toString().trimmed();
+}
+
+bool readTifxyzPlane(const std::filesystem::path& path,
+                     cv::Mat& out,
+                     QString& error)
+{
+    TIFF* tif = TIFFOpen(path.string().c_str(), "r");
+    if (!tif) {
+        error = QStringLiteral("Cannot read tifxyz plane: %1").arg(pathToQString(path));
+        return false;
+    }
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) ||
+        !TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height) ||
+        width == 0 || height == 0) {
+        TIFFClose(tif);
+        error = QStringLiteral("Cannot read tifxyz plane geometry: %1").arg(pathToQString(path));
+        return false;
+    }
+
+    uint16_t samplesPerPixel = 1;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &samplesPerPixel);
+    if (samplesPerPixel != 1) {
+        TIFFClose(tif);
+        error = QStringLiteral("Expected single-channel tifxyz plane: %1").arg(pathToQString(path));
+        return false;
+    }
+
+    uint16_t bitsPerSample = 0;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &bitsPerSample);
+    uint16_t sampleFormat = SAMPLEFORMAT_UINT;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &sampleFormat);
+    const int bytesPerSample = static_cast<int>((bitsPerSample + 7) / 8);
+    if (!(bitsPerSample == 8 || bitsPerSample == 16 ||
+          bitsPerSample == 32 || bitsPerSample == 64)) {
+        TIFFClose(tif);
+        error = QStringLiteral("Unsupported tifxyz plane bit depth: %1").arg(pathToQString(path));
+        return false;
+    }
+
+    auto sampleToFloat = [sampleFormat, bitsPerSample, bytesPerSample](const uint8_t* p) -> float {
+        switch (sampleFormat) {
+        case SAMPLEFORMAT_IEEEFP:
+            if (bitsPerSample == 32) {
+                float v = 0.0f;
+                std::memcpy(&v, p, sizeof(v));
+                return v;
+            }
+            if (bitsPerSample == 64) {
+                double v = 0.0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        case SAMPLEFORMAT_UINT:
+            if (bitsPerSample == 8) return static_cast<float>(*p);
+            if (bitsPerSample == 16) {
+                uint16_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            if (bitsPerSample == 32) {
+                uint32_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        case SAMPLEFORMAT_INT:
+            if (bitsPerSample == 8) return static_cast<float>(*reinterpret_cast<const int8_t*>(p));
+            if (bitsPerSample == 16) {
+                int16_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            if (bitsPerSample == 32) {
+                int32_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        default:
+            break;
+        }
+
+        float v = 0.0f;
+        std::memcpy(&v, p, std::min(bytesPerSample, static_cast<int>(sizeof(v))));
+        return v;
+    };
+
+    out.create(static_cast<int>(height), static_cast<int>(width), CV_32FC1);
+
+    bool ok = true;
+    if (TIFFIsTiled(tif)) {
+        uint32_t tileWidth = 0;
+        uint32_t tileHeight = 0;
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tileWidth);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tileHeight);
+        if (tileWidth == 0 || tileHeight == 0) {
+            ok = false;
+        } else {
+            const tmsize_t tileBytes = TIFFTileSize(tif);
+            std::vector<uint8_t> tileBuf(static_cast<size_t>(std::max<tmsize_t>(tileBytes, 0)));
+            for (uint32_t y0 = 0; ok && y0 < height; y0 += tileHeight) {
+                const uint32_t dy = std::min(tileHeight, height - y0);
+                for (uint32_t x0 = 0; ok && x0 < width; x0 += tileWidth) {
+                    const uint32_t dx = std::min(tileWidth, width - x0);
+                    const ttile_t tileIndex = TIFFComputeTile(tif, x0, y0, 0, 0);
+                    if (TIFFReadEncodedTile(tif, tileIndex, tileBuf.data(), tileBytes) < 0) {
+                        ok = false;
+                        break;
+                    }
+                    for (uint32_t ty = 0; ty < dy; ++ty) {
+                        const uint8_t* srcRow = tileBuf.data() +
+                            static_cast<size_t>(ty) * tileWidth * bytesPerSample;
+                        float* dstRow = out.ptr<float>(static_cast<int>(y0 + ty));
+                        for (uint32_t tx = 0; tx < dx; ++tx) {
+                            dstRow[x0 + tx] = sampleToFloat(srcRow + static_cast<size_t>(tx) * bytesPerSample);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        const tmsize_t scanlineBytes = TIFFScanlineSize(tif);
+        std::vector<uint8_t> scanlineBuf(static_cast<size_t>(std::max<tmsize_t>(scanlineBytes, 0)));
+        for (uint32_t y = 0; ok && y < height; ++y) {
+            if (TIFFReadScanline(tif, scanlineBuf.data(), y, 0) != 1) {
+                ok = false;
+                break;
+            }
+            float* dstRow = out.ptr<float>(static_cast<int>(y));
+            for (uint32_t x = 0; x < width; ++x) {
+                dstRow[x] = sampleToFloat(scanlineBuf.data() + static_cast<size_t>(x) * bytesPerSample);
+            }
+        }
+    }
+
+    TIFFClose(tif);
+    if (!ok) {
+        error = QStringLiteral("Cannot read tifxyz plane pixels: %1").arg(pathToQString(path));
+        out.release();
+        return false;
+    }
+
+    return true;
+}
+
+bool encodeTiffBytes(const cv::Mat& mat,
+                     QByteArray& out,
+                     QString& error,
+                     const QString& label)
+{
+    std::vector<uchar> encoded;
+    if (!cv::imencode(".tif", mat, encoded)) {
+        error = QStringLiteral("Cannot encode scaled tifxyz plane: %1").arg(label);
+        return false;
+    }
+    out = QByteArray(reinterpret_cast<const char*>(encoded.data()),
+                     static_cast<int>(encoded.size()));
+    return true;
+}
+
+bool scaledTifxyzDataForLasagna(const std::filesystem::path& segPath,
+                                double coordScale,
+                                QJsonObject& tifxyzData,
+                                QString& error)
+{
+    if (!std::isfinite(coordScale) || coordScale <= 0.0) {
+        error = QStringLiteral("Invalid Lasagna input scale.");
+        return false;
+    }
+
+    cv::Mat x;
+    cv::Mat y;
+    cv::Mat z;
+    if (!readTifxyzPlane(segPath / "x.tif", x, error) ||
+        !readTifxyzPlane(segPath / "y.tif", y, error) ||
+        !readTifxyzPlane(segPath / "z.tif", z, error)) {
+        return false;
+    }
+    if (x.size() != y.size() || x.size() != z.size()) {
+        error = QStringLiteral("tifxyz coordinate planes have mismatched sizes.");
+        return false;
+    }
+
+    for (int r = 0; r < x.rows; ++r) {
+        float* xr = x.ptr<float>(r);
+        float* yr = y.ptr<float>(r);
+        float* zr = z.ptr<float>(r);
+        for (int c = 0; c < x.cols; ++c) {
+            const bool invalid = xr[c] == -1.0f && yr[c] == -1.0f && zr[c] == -1.0f;
+            if (invalid) {
+                continue;
+            }
+            xr[c] = static_cast<float>(static_cast<double>(xr[c]) * coordScale);
+            yr[c] = static_cast<float>(static_cast<double>(yr[c]) * coordScale);
+            zr[c] = static_cast<float>(static_cast<double>(zr[c]) * coordScale);
+        }
+    }
+
+    QByteArray bytes;
+    if (!encodeTiffBytes(x, bytes, error, QStringLiteral("x.tif"))) return false;
+    tifxyzData[QStringLiteral("x.tif")] = QString::fromLatin1(bytes.toBase64());
+    if (!encodeTiffBytes(y, bytes, error, QStringLiteral("y.tif"))) return false;
+    tifxyzData[QStringLiteral("y.tif")] = QString::fromLatin1(bytes.toBase64());
+    if (!encodeTiffBytes(z, bytes, error, QStringLiteral("z.tif"))) return false;
+    tifxyzData[QStringLiteral("z.tif")] = QString::fromLatin1(bytes.toBase64());
+
+    QFile metaFile(pathToQString(segPath / "meta.json"));
+    if (!metaFile.open(QIODevice::ReadOnly)) {
+        error = QStringLiteral("Cannot read tifxyz meta.json: %1")
+            .arg(pathToQString(segPath / "meta.json"));
+        return false;
+    }
+    QJsonParseError parseError;
+    QJsonDocument metaDoc = QJsonDocument::fromJson(metaFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !metaDoc.isObject()) {
+        error = QStringLiteral("Cannot parse tifxyz meta.json: %1").arg(parseError.errorString());
+        return false;
+    }
+    QJsonObject meta = metaDoc.object();
+    QJsonArray scale = meta.value(QStringLiteral("scale")).toArray();
+    if (!scale.isEmpty()) {
+        QJsonArray scaled;
+        for (const auto& value : scale) {
+            scaled.append(value.toDouble() / coordScale);
+        }
+        meta[QStringLiteral("scale")] = scaled;
+    }
+    tifxyzData[QStringLiteral("meta.json")] =
+        QString::fromLatin1(QJsonDocument(meta).toJson(QJsonDocument::Compact).toBase64());
+    return true;
 }
 
 QString resolveLasagnaModelPath(const std::filesystem::path& segPath,
@@ -220,6 +480,14 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         row->addWidget(_outputScaleSpin);
     }, tr("Coordinate multiplier applied to lasagna output surfaces before VC3D reloads them."));
 
+    _connectionGroup->addRow(tr("Solver device:"), [&](QHBoxLayout* row) {
+        _solverDeviceCombo = new QComboBox(connContent);
+        _solverDeviceCombo->addItem(tr("Config/default"));
+        _solverDeviceCombo->addItem(tr("CPU only"));
+        _solverDeviceCombo->setToolTip(tr("CPU only sends device=cpu to the lasagna solver even when CUDA is available."));
+        row->addWidget(_solverDeviceCombo, 1);
+    }, tr("Controls the compute device requested for lasagna optimization."));
+
     panelLayout->addWidget(_connectionGroup);
 
     // =======================================================================
@@ -296,6 +564,26 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         seedLayout->addWidget(_seedFromFocusBtn);
 
         _newModelGroup->contentLayout()->addWidget(seedWidget);
+    }
+
+    // Umbilicus row
+    {
+        auto* umbWidget = new QWidget(nmContent);
+        auto* umbLayout = new QHBoxLayout(umbWidget);
+        umbLayout->setContentsMargins(0, 0, 0, 0);
+        umbLayout->setSpacing(4);
+
+        umbLayout->addWidget(new QLabel(tr("Umbilicus:"), umbWidget));
+        _umbilicusEdit = new QLineEdit(umbWidget);
+        _umbilicusEdit->setPlaceholderText(tr("auto (volpkg/umbilicus.json)"));
+        _umbilicusEdit->setToolTip(tr("Optional umbilicus path used as the true scroll center for arc initialization."));
+        _umbilicusBrowse = new QToolButton(umbWidget);
+        _umbilicusBrowse->setText(QStringLiteral("..."));
+        _umbilicusBrowse->setToolTip(tr("Browse for an umbilicus JSON or text file"));
+        umbLayout->addWidget(_umbilicusEdit, 1);
+        umbLayout->addWidget(_umbilicusBrowse);
+
+        _newModelGroup->contentLayout()->addWidget(umbWidget);
     }
 
     // Output name row
@@ -528,6 +816,21 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     connect(_seedEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         writeSetting(QStringLiteral("lasagna_seed_point"), text.trimmed());
     });
+    connect(_umbilicusEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
+        _umbilicusPath = text.trimmed();
+        writeSetting(QStringLiteral("lasagna_umbilicus_path"), _umbilicusPath);
+    });
+    connect(_umbilicusBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _umbilicusPath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_umbilicusPath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select umbilicus file"), initial,
+            tr("Umbilicus files (*.json *.txt *.csv);;All files (*)"));
+        if (!path.isEmpty()) {
+            _umbilicusPath = path;
+            _umbilicusEdit->setText(path);
+        }
+    });
     connect(_outputNameEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
         writeSetting(QStringLiteral("lasagna_output_name"), text.trimmed());
     });
@@ -536,6 +839,10 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_outputScaleSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         writeSetting(QStringLiteral("lasagna_output_scale"), v);
+    });
+    connect(_solverDeviceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        _solverDeviceMode = index;
+        writeSetting(QStringLiteral("lasagna_solver_device_mode"), _solverDeviceMode);
     });
     connect(_seedFromFocusBtn, &QPushButton::clicked, this,
             &SegmentationLasagnaPanel::seedFromFocusRequested);
@@ -812,7 +1119,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 void SegmentationLasagnaPanel::triggerOptimization()
 {
     const QString& configPath = (_lasagnaMode == 1) ? _newModelConfigFilePath
-                              : (_lasagnaMode == 3) ? _offsetConfigFilePath
+                              : (_lasagnaMode == 3 || _lasagnaMode == 4) ? _offsetConfigFilePath
                               : _reoptConfigFilePath;
 
     if (configPath.isEmpty()) {
@@ -893,9 +1200,16 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     }
 
     const bool isOffsetMode = (lasagnaMode() == LasagnaMode::Offset);
+    const bool isExtendMode = (lasagnaMode() == LasagnaMode::Extend);
+    if (isExtendMode && segPath.empty()) {
+        auto msg = tr("Active segment must be saved before Lasagna Extend can run.");
+        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+        showStatus(msg, 5000);
+        return;
+    }
 
     QString modelPath;
-    if (!isNewModel && !isOffsetMode) {
+    if (!isNewModel && !isOffsetMode && !isExtendMode) {
         QStringList checkedModelPaths;
         modelPath = resolveLasagnaModelPath(segPath, checkedModelPaths);
         if (modelPath.isEmpty()) {
@@ -1008,6 +1322,13 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         }
     }
 
+    if (_solverDeviceMode == 1) {
+        QJsonObject args = config[QStringLiteral("args")].toObject();
+        args[QStringLiteral("device")] = QStringLiteral("cpu");
+        args[QStringLiteral("cuda-gridsample")] = 0;
+        config[QStringLiteral("args")] = args;
+    }
+
     if (isNewModel) {
         int nmW = newModelWidth();
         int nmH = newModelHeight();
@@ -1052,14 +1373,31 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         args[QStringLiteral("model-w")] = nmW;
         args[QStringLiteral("model-h")] = nmH;
         args[QStringLiteral("windings")] = nmN;
+        QString umbPath = umbilicusPath();
+        if (umbPath.isEmpty() && state && state->vpkg()) {
+            const auto defaultUmbilicus =
+                std::filesystem::path(state->vpkg()->getVolpkgDirectory()) / "umbilicus.json";
+            std::error_code ec;
+            if (std::filesystem::exists(defaultUmbilicus, ec) && !ec) {
+                umbPath = QString::fromStdString(defaultUmbilicus.string());
+            }
+        }
+        if (!umbPath.isEmpty()) {
+            args[QStringLiteral("umbilicus")] = umbPath;
+            args[QStringLiteral("umbilicus-scale")] = coordScale;
+        }
         config[QStringLiteral("args")] = args;
 
         std::cerr << "[lasagna] new model: seed=(" << cx << "," << cy
                   << "," << cz << ") w=" << nmW << " h=" << nmH
-                  << " windings=" << nmN << std::endl;
+                  << " windings=" << nmN;
+        if (!umbPath.isEmpty()) {
+            std::cerr << " umbilicus=" << umbPath.toStdString();
+        }
+        std::cerr << std::endl;
     }
 
-    if (isOffsetMode && !segPath.empty()) {
+    if ((isOffsetMode || isExtendMode) && !segPath.empty()) {
         double offsetVal = offsetValue();
         int size = windowSize();
         int overlap = windowOverlap();
@@ -1072,13 +1410,19 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         }
         config[QStringLiteral("args")] = args;
         config[QStringLiteral("offset_value")] = offsetVal;
+        if (isExtendMode) {
+            config[QStringLiteral("mode")] = QStringLiteral("extend");
+            config[QStringLiteral("extend_direction")] = extendDirectionToken(_extendDirection);
+            config[QStringLiteral("extend_steps")] = std::max(1, _extendSteps);
+        }
 
         if (size > 0 && !outputDir.isEmpty()) {
             int offIdx = 1;
             std::error_code ec2;
+            const std::string suffix = isExtendMode ? "_ext" : "_off";
             for (bool collision = true; collision; ++offIdx) {
                 collision = false;
-                std::string offPrefix = rootName + "_off" + std::to_string(offIdx) + "_w";
+                std::string offPrefix = rootName + suffix + std::to_string(offIdx);
                 for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec2)) {
                     auto name = entry.path().filename().string();
                     if (name.size() > offPrefix.size() + tifxyzSuffix.size() &&
@@ -1090,10 +1434,11 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
                     }
                 }
             }
-            outputName = QString::fromStdString(rootName + "_off" + std::to_string(offIdx - 1));
+            outputName = QString::fromStdString(rootName + suffix + std::to_string(offIdx - 1) + ".tifxyz");
         }
 
-        std::cerr << "[lasagna] offset mode: offset=" << offsetVal
+        std::cerr << "[lasagna] " << (isExtendMode ? "extend" : "offset")
+                  << " mode: offset=" << offsetVal
                   << " window_size=" << size
                   << " window_overlap=" << overlap
                   << " outputName=" << outputName.toStdString() << std::endl;
@@ -1143,20 +1488,20 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         request[QStringLiteral("output_name")] = outputName;
     }
     request[QStringLiteral("output_scale")] = outputScale();
+    if (_solverDeviceMode == 1) {
+        request[QStringLiteral("device")] = QStringLiteral("cpu");
+    }
     request[QStringLiteral("config")] = config;
 
-    if (isOffsetMode && !segPath.empty()) {
+    if ((isOffsetMode || isExtendMode) && !segPath.empty()) {
         QJsonObject tifxyzData;
-        for (const auto* fname : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
-            auto filePath = segPath / fname;
-            if (!std::filesystem::exists(filePath)) {
-                continue;
-            }
-            QFile f(QString::fromStdString(filePath.string()));
-            if (f.open(QIODevice::ReadOnly)) {
-                tifxyzData[QString::fromLatin1(fname)] =
-                    QString::fromLatin1(f.readAll().toBase64());
-            }
+        QString tifxyzError;
+        if (!scaledTifxyzDataForLasagna(segPath, 1.0 / inputScale(),
+                                        tifxyzData, tifxyzError)) {
+            auto msg = tr("Cannot prepare active segment for Lasagna: %1").arg(tifxyzError);
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return;
         }
         request[QStringLiteral("tifxyz_data")] = tifxyzData;
     } else if (!isNewModel) {
@@ -1178,6 +1523,17 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
             .arg(isNewModel ? tr("new model") : tr("re-optimize"))
             .arg(outputName),
         3000);
+}
+
+void SegmentationLasagnaPanel::startExtendOptimization(CState* state,
+                                                       QStatusBar* statusBar,
+                                                       SegmentationGrowthDirection direction,
+                                                       int steps)
+{
+    _lasagnaMode = LasagnaMode::Extend;
+    _extendDirection = direction;
+    _extendSteps = std::max(1, steps);
+    startOptimization(state, statusBar);
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,6 +1572,11 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker b(_seedEdit);
         _seedEdit->setText(settings.value(QStringLiteral("lasagna_seed_point"), QString()).toString());
     }
+    _umbilicusPath = settings.value(QStringLiteral("lasagna_umbilicus_path"), QString()).toString();
+    if (_umbilicusEdit) {
+        const QSignalBlocker b(_umbilicusEdit);
+        _umbilicusEdit->setText(_umbilicusPath);
+    }
     // Output name
     if (_outputNameEdit) {
         const QSignalBlocker b(_outputNameEdit);
@@ -1229,6 +1590,14 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     if (_outputScaleSpin) {
         const QSignalBlocker b(_outputScaleSpin);
         _outputScaleSpin->setValue(settings.value(QStringLiteral("lasagna_output_scale"), 1.0).toDouble());
+    }
+    _solverDeviceMode = settings.value(QStringLiteral("lasagna_solver_device_mode"), 0).toInt();
+    if (_solverDeviceMode < 0 || _solverDeviceMode > 1) {
+        _solverDeviceMode = 0;
+    }
+    if (_solverDeviceCombo) {
+        const QSignalBlocker b(_solverDeviceCombo);
+        _solverDeviceCombo->setCurrentIndex(_solverDeviceMode);
     }
     // Dimensions
     if (_widthSpin) {
@@ -1456,6 +1825,11 @@ int SegmentationLasagnaPanel::newModelWindings() const
 QString SegmentationLasagnaPanel::seedPointText() const
 {
     return _seedEdit ? _seedEdit->text().trimmed() : QString();
+}
+
+QString SegmentationLasagnaPanel::umbilicusPath() const
+{
+    return _umbilicusEdit ? _umbilicusEdit->text().trimmed() : _umbilicusPath;
 }
 
 QString SegmentationLasagnaPanel::newModelOutputName() const

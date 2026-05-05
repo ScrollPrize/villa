@@ -1719,7 +1719,17 @@ def run(args):
             )
     dense_subsample_stride = int(max(1, tifxyz_step_size))
 
-    volume_root = zarr.open(args.volume_path, mode="r")
+    if str(args.volume_path).startswith("s3://"):
+        from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
+
+        store = zarr.storage.FsspecStore.from_url(
+            str(args.volume_path).rstrip("/"),
+            storage_options=s3_storage_options_for_path(args.volume_path),
+            read_only=True,
+        )
+        volume_root = zarr.open(store, mode="r")
+    else:
+        volume_root = zarr.open(args.volume_path, mode="r")
 
     class _Holder:
         pass

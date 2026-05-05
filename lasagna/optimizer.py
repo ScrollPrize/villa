@@ -18,6 +18,7 @@ import opt_loss_corr
 import opt_loss_winding_volume
 import opt_loss_station
 import opt_loss_bend
+import opt_loss_boundary_anchor
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -157,6 +158,7 @@ lambda_global: dict[str, float] = {
 	"station_t": 0.0,
 	"bend": 0.0,
 	"ext_offset": 0.0,
+	"boundary_anchor": 0.0,
 }
 
 
@@ -288,6 +290,7 @@ def optimize(
 		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
 		"bend": {"loss": opt_loss_bend.bend_loss},
 		"ext_offset": {"loss": opt_loss_winding_density.ext_offset_loss},
+		"boundary_anchor": {"loss": opt_loss_boundary_anchor.boundary_anchor_loss},
 	}
 
 	_corr_start_printed = [False]

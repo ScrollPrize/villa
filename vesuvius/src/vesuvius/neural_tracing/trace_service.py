@@ -39,9 +39,9 @@ def _print_json_log(label, payload):
 )
 @click.option(
     "--volume_zarr",
-    type=click.Path(exists=True),
+    type=str,
     required=True,
-    help="Path to ome-zarr folder (used as default volume_path for dense requests).",
+    help="Path or URI to ome-zarr folder (used as default volume_path for dense requests).",
 )
 @click.option("--volume_scale", type=int, required=True, help="OME scale to use")
 @click.option("--socket_path", type=click.Path(), required=True, help="Path to Unix domain socket")

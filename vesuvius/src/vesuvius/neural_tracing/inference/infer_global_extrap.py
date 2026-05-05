@@ -2501,7 +2501,17 @@ def _run_with_args(args, parse_done):
         )
 
     with profiler.section("setup_segment"):
-        volume = zarr.open_group(args.volume_path, mode="r")
+        if str(args.volume_path).startswith("s3://"):
+            from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
+
+            store = zarr.storage.FsspecStore.from_url(
+                str(args.volume_path).rstrip("/"),
+                storage_options=s3_storage_options_for_path(args.volume_path),
+                read_only=True,
+            )
+            volume = zarr.open_group(store, mode="r")
+        else:
+            volume = zarr.open_group(args.volume_path, mode="r")
         tgt_segment, stored_zyxs, valid_s, _, h_s, w_s = _setup_segment_with_requested_direction(args, volume)
     grow_directions = _resolve_growth_directions(args.grow_direction, valid_s)
     multi_direction_mode = (args.grow_direction == "all")

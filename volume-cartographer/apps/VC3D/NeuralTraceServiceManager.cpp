@@ -24,6 +24,14 @@ constexpr int kServiceStopTimeoutMs = 500;     // 500ms then kill
 const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
 const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
 
+bool isRemoteVolumeLocation(const QString& location)
+{
+    const QString trimmed = location.trimmed();
+    return trimmed.startsWith(QStringLiteral("s3://"), Qt::CaseInsensitive) ||
+           trimmed.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive) ||
+           trimmed.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive);
+}
+
 bool isCheckpointSentinel(const QString& checkpointPath)
 {
     const QString trimmed = checkpointPath.trimmed();
@@ -35,6 +43,9 @@ QString normalizeExistingPath(const QString& path)
     const QString trimmed = path.trimmed();
     if (trimmed.isEmpty()) {
         return QString();
+    }
+    if (isRemoteVolumeLocation(trimmed)) {
+        return trimmed;
     }
 
     QFileInfo info(trimmed);
@@ -48,7 +59,7 @@ QString normalizeExistingPath(const QString& path)
 QString normalizeCheckpointValue(const QString& checkpointPath)
 {
     if (isCheckpointSentinel(checkpointPath)) {
-        return kDenseLatestSentinel;
+        return checkpointPath.trimmed();
     }
     return normalizeExistingPath(checkpointPath);
 }
@@ -195,7 +206,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
         emit serviceError(_lastError);
         return false;
     }
-    if (!QDir(volumeZarr).exists()) {
+    if (!isRemoteVolumeLocation(volumeZarr) && !QDir(volumeZarr).exists()) {
         _lastError = tr("Volume zarr directory does not exist: %1").arg(volumeZarr);
         emit serviceError(_lastError);
         return false;

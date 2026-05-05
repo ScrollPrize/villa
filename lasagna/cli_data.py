@@ -18,6 +18,8 @@ class DataConfig:
 	model_w: int | None                                  # model width in fullres voxels
 	model_h: int | None                                  # model height in fullres voxels
 	windings: int | None                                 # number of windings
+	umbilicus: str | None                                # path to umbilicus centerline
+	umbilicus_scale: float                               # multiplier from file coords to fitting coords
 	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 	erode_valid_mask: int                                # erode grad_mag validity mask by N voxels
@@ -40,6 +42,10 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Model height in fullres voxels")
 	g.add_argument("--windings", type=int, default=None,
 		help="Number of windings")
+	g.add_argument("--umbilicus", default=None,
+		help="Path to umbilicus JSON/text file used as true scroll center")
+	g.add_argument("--umbilicus-scale", type=float, default=1.0,
+		help="Multiplier applied to umbilicus coordinates before use")
 	g.add_argument("--winding-volume", default=None,
 		help="Path to winding volume zarr (float32, from labels_to_winding_volume.py)")
 	g.add_argument("--cuda-gridsample", type=int, default=1,
@@ -64,6 +70,9 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 	model_w = None if getattr(args, "model_w", None) is None else int(args.model_w)
 	model_h = None if getattr(args, "model_h", None) is None else int(args.model_h)
 	windings = None if getattr(args, "windings", None) is None else int(args.windings)
+	umbilicus = getattr(args, "umbilicus", None)
+	if umbilicus is not None:
+		umbilicus = str(umbilicus).strip() or None
 	winding_volume = getattr(args, "winding_volume", None)
 	if winding_volume is not None:
 		winding_volume = str(winding_volume)
@@ -76,6 +85,8 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		model_w=model_w,
 		model_h=model_h,
 		windings=windings,
+		umbilicus=umbilicus,
+		umbilicus_scale=float(getattr(args, "umbilicus_scale", 1.0)),
 		winding_volume=winding_volume,
 		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
 		erode_valid_mask=int(getattr(args, "erode_valid_mask", 0)),

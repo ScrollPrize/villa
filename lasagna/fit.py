@@ -1,6 +1,7 @@
 import argparse
 import copy
 import dataclasses
+import json
 import math
 import sys
 from dataclasses import asdict
@@ -37,6 +38,7 @@ def _arc_params_from_seed(
 	seed: tuple[int, int, int],
 	model_w: int,
 	volume_extent_fullres: tuple[int, int, int],
+	umbilicus_center: tuple[float, float] | None = None,
 ) -> dict:
 	"""Derive arc params from seed point and model width.
 
@@ -48,9 +50,12 @@ def _arc_params_from_seed(
 	seed_cx, seed_cy, seed_cz = float(seed[0]), float(seed[1]), float(seed[2])
 	vol_x, vol_y, _vol_z = volume_extent_fullres
 
-	# Volume center XY = estimate of scroll axis
-	arc_cx = vol_x / 2.0
-	arc_cy = vol_y / 2.0
+	if umbilicus_center is not None:
+		arc_cx, arc_cy = umbilicus_center
+	else:
+		# Volume center XY = fallback estimate of scroll axis
+		arc_cx = vol_x / 2.0
+		arc_cy = vol_y / 2.0
 
 	# Arc radius = distance from volume center to seed point
 	dx = seed_cx - arc_cx
@@ -73,6 +78,64 @@ def _arc_params_from_seed(
 		"arc_angle1": seed_angle + half_angle,
 		"z_center": seed_cz,
 	}
+
+
+def _load_umbilicus_points(path: str) -> list[tuple[float, float, float]]:
+	p = Path(path)
+	if p.suffix.lower() == ".json":
+		document = json.loads(p.read_text(encoding="utf-8"))
+		entries = (
+			document.get("points", document.get("control_points", document))
+			if isinstance(document, dict)
+			else document
+		)
+		if not isinstance(entries, list):
+			raise ValueError(
+				"umbilicus JSON root must be an array or contain a "
+				"'points' or 'control_points' array"
+			)
+		points: list[tuple[float, float, float]] = []
+		for i, entry in enumerate(entries):
+			if isinstance(entry, dict):
+				points.append((float(entry["x"]), float(entry["y"]), float(entry["z"])))
+			elif isinstance(entry, list) and len(entry) >= 3:
+				z, y, x = entry[:3]
+				points.append((float(x), float(y), float(z)))
+			else:
+				raise ValueError(f"unsupported umbilicus JSON entry at index {i}")
+		if not points:
+			raise ValueError("umbilicus file contained no points")
+		return points
+
+	points = []
+	for line_no, line in enumerate(p.read_text(encoding="utf-8").splitlines(), start=1):
+		line = line.strip()
+		if not line or line.startswith("#"):
+			continue
+		parts = [part.strip() for part in line.split(",") if part.strip()]
+		if len(parts) != 3:
+			raise ValueError(f"umbilicus text line {line_no} must contain z,y,x")
+		z, y, x = (float(v) for v in parts)
+		points.append((x, y, z))
+	if not points:
+		raise ValueError("umbilicus file contained no points")
+	return points
+
+
+def _umbilicus_center_at_z(path: str, z: float, *, scale: float = 1.0) -> tuple[float, float]:
+	points = _load_umbilicus_points(path)
+	points = [(x * scale, y * scale, z0 * scale) for x, y, z0 in points]
+	points.sort(key=lambda p: p[2])
+	if z <= points[0][2]:
+		return points[0][0], points[0][1]
+	if z >= points[-1][2]:
+		return points[-1][0], points[-1][1]
+	for p0, p1 in zip(points, points[1:]):
+		if p0[2] <= z <= p1[2]:
+			dz = p1[2] - p0[2]
+			t = 0.0 if dz == 0.0 else (z - p0[2]) / dz
+			return p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t
+	return points[-1][0], points[-1][1]
 
 
 def _straight_params_from_seed(
@@ -182,7 +245,176 @@ def _optimizer_stage_cfg(cfg: dict) -> dict:
 	stage_cfg.pop("tifxyz_data", None)
 	stage_cfg.pop("offset_value", None)
 	stage_cfg.pop("output_scale", None)
+	stage_cfg.pop("mode", None)
+	stage_cfg.pop("boundary_anchor", None)
 	return stage_cfg
+
+
+def _valid_xyz_np(xyz) -> "np.ndarray":
+	import numpy as np
+	arr = xyz.detach().cpu().numpy()
+	return np.isfinite(arr).all(axis=-1) & (arr != -1.0).all(axis=-1)
+
+
+def _point_grid_index(pd: dict, full_xyz_np, full_valid_np) -> tuple[int, int] | None:
+	import numpy as np
+	grid = pd.get("grid", None)
+	if isinstance(grid, (list, tuple)) and len(grid) >= 2:
+		try:
+			return int(grid[0]), int(grid[1])
+		except Exception:
+			pass
+	p = pd.get("p", None)
+	if not isinstance(p, (list, tuple)) or len(p) < 3:
+		return None
+	pt = np.asarray([float(p[0]), float(p[1]), float(p[2])], dtype=np.float32)
+	if not np.isfinite(pt).all() or not full_valid_np.any():
+		return None
+	diff = full_xyz_np - pt.reshape(1, 1, 3)
+	dist2 = np.einsum("...i,...i->...", diff, diff)
+	dist2 = np.where(full_valid_np, dist2, np.inf)
+	idx = int(np.argmin(dist2))
+	if not np.isfinite(dist2.reshape(-1)[idx]):
+		return None
+	return tuple(int(v) for v in np.unravel_index(idx, dist2.shape))
+
+
+def _filter_corr_points_for_window(corr_points_obj: dict | None, *,
+								   h0: int, h1: int, w0: int, w1: int,
+								   full_xyz_np, full_valid_np) -> dict | None:
+	if not isinstance(corr_points_obj, dict):
+		return None
+	cols = corr_points_obj.get("collections", {})
+	if not isinstance(cols, dict):
+		return None
+	out_cols: dict = {}
+	for cid, col in cols.items():
+		if not isinstance(col, dict):
+			continue
+		pts = col.get("points", {})
+		if not isinstance(pts, dict):
+			continue
+		out_pts: dict = {}
+		for pid, pd in pts.items():
+			if not isinstance(pd, dict):
+				continue
+			idx = _point_grid_index(pd, full_xyz_np, full_valid_np)
+			if idx is None:
+				continue
+			r, c = idx
+			if h0 <= r < h1 and w0 <= c < w1:
+				out_pts[pid] = copy.deepcopy(pd)
+		if out_pts:
+			out_col = copy.deepcopy(col)
+			out_col["points"] = out_pts
+			md = out_col.setdefault("metadata", {})
+			if isinstance(md, dict):
+				md["winding_is_absolute"] = True
+			out_cols[cid] = out_col
+	if not out_cols:
+		return None
+	out = copy.deepcopy(corr_points_obj)
+	out["collections"] = out_cols
+	return out
+
+
+def _merge_window_tifxyz(*, windows: list[Path], out_dir: Path,
+						 base_xyz, base_valid, scale: float,
+						 voxel_size_um: float | None,
+						 preserve_existing: bool = True) -> None:
+	import json as _json
+	import numpy as np
+	import tifffile
+	import fit2tifxyz as _f2t
+
+	base_np = base_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
+	base_valid_np = base_valid.detach().cpu().numpy().astype(bool, copy=False)
+	H, W, _ = base_np.shape
+	x_all = np.full((H, W), -1.0, dtype=np.float32)
+	y_all = np.full((H, W), -1.0, dtype=np.float32)
+	z_all = np.full((H, W), -1.0, dtype=np.float32)
+	locked = np.zeros((H, W), dtype=bool)
+	if preserve_existing:
+		x_all[base_valid_np] = base_np[..., 0][base_valid_np]
+		y_all[base_valid_np] = base_np[..., 1][base_valid_np]
+		z_all[base_valid_np] = base_np[..., 2][base_valid_np]
+		locked = base_valid_np.copy()
+	best = np.full((H, W), -np.inf, dtype=np.float32)
+
+	for win_dir in windows:
+		meta = _json.loads((win_dir / "meta.json").read_text(encoding="utf-8"))
+		h0, w0 = [int(v) for v in meta["window_origin_verts"]]
+		wh, ww = [int(v) for v in meta["window_size_verts"]]
+		x = tifffile.imread(str(win_dir / "x.tif")).astype(np.float32)
+		y = tifffile.imread(str(win_dir / "y.tif")).astype(np.float32)
+		z = tifffile.imread(str(win_dir / "z.tif")).astype(np.float32)
+		wh = min(wh, x.shape[0], H - h0)
+		ww = min(ww, x.shape[1], W - w0)
+		if wh <= 0 or ww <= 0:
+			continue
+		x = x[:wh, :ww]
+		y = y[:wh, :ww]
+		z = z[:wh, :ww]
+		valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & ~((x == -1.0) & (y == -1.0) & (z == -1.0))
+		rr = np.arange(wh, dtype=np.float32)[:, None]
+		cc = np.arange(ww, dtype=np.float32)[None, :]
+		row_weight = np.minimum(rr + 1.0, wh - rr)
+		col_weight = np.minimum(cc + 1.0, ww - cc)
+		weight = np.minimum(row_weight, col_weight)
+		dst = (slice(h0, h0 + wh), slice(w0, w0 + ww))
+		can_write = valid & ~locked[dst] & (weight > best[dst])
+		x_dst = x_all[dst]
+		y_dst = y_all[dst]
+		z_dst = z_all[dst]
+		best_dst = best[dst]
+		x_dst[can_write] = x[can_write]
+		y_dst[can_write] = y[can_write]
+		z_dst[can_write] = z[can_write]
+		best_dst[can_write] = weight[can_write]
+
+	area = _f2t._get_area(x_all, y_all, z_all, 1.0 / scale, voxel_size_um)
+	_f2t._write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all,
+						scale=scale, area=area)
+	meta_path = out_dir / "meta.json"
+	meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+	meta["extend_merged"] = True
+	meta["preserved_existing_vertices"] = bool(preserve_existing)
+	meta["source_grid_size_verts"] = [int(H), int(W)]
+	meta["window_count"] = len(windows)
+	meta_path.write_text(_json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+	_f2t._print_area(area)
+
+
+def _extend_padding_from_cfg(cfg: dict) -> tuple[int, int, int, int]:
+	direction = str(cfg.get("extend_direction", "all")).lower()
+	steps = max(1, int(cfg.get("extend_steps", 1)))
+	if direction == "left":
+		return 0, 0, steps, 0
+	if direction == "right":
+		return 0, 0, 0, steps
+	if direction == "up":
+		return steps, 0, 0, 0
+	if direction == "down":
+		return 0, steps, 0, 0
+	return steps, steps, steps, steps
+
+
+def _pad_tifxyz_for_extend(full_xyz: torch.Tensor,
+						   full_valid: torch.Tensor,
+						   cfg: dict) -> tuple[torch.Tensor, torch.Tensor]:
+	top, bottom, left, right = _extend_padding_from_cfg(cfg)
+	if top == 0 and bottom == 0 and left == 0 and right == 0:
+		return full_xyz, full_valid
+	H, W, _ = full_xyz.shape
+	new_h = H + top + bottom
+	new_w = W + left + right
+	padded_xyz = torch.full((new_h, new_w, 3), -1.0, dtype=full_xyz.dtype, device=full_xyz.device)
+	padded_valid = torch.zeros((new_h, new_w), dtype=full_valid.dtype, device=full_valid.device)
+	padded_xyz[top:top + H, left:left + W] = full_xyz
+	padded_valid[top:top + H, left:left + W] = full_valid
+	print(f"[fit] extend mode: padded grid {H}x{W} -> {new_h}x{new_w} "
+		  f"(top={top} bottom={bottom} left={left} right={right})", flush=True)
+	return padded_xyz, padded_valid
 
 
 def _optional_channels_to_skip(stages: list["optimizer.Stage"]) -> set[str]:
@@ -228,6 +460,38 @@ def _compute_window_grid(
 			break
 		h += stride
 	return windows
+
+
+def _slice_tifxyz_with_invalid_padding(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	*,
+	h0: int,
+	h1: int,
+	w0: int,
+	w1: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Slice a vertex grid, filling out-of-bounds halo with invalid vertices."""
+	H, W, C = xyz.shape
+	out_h = max(0, h1 - h0)
+	out_w = max(0, w1 - w0)
+	out_xyz = torch.full((out_h, out_w, C), -1.0, dtype=xyz.dtype, device=xyz.device)
+	out_valid = torch.zeros((out_h, out_w), dtype=valid.dtype, device=valid.device)
+
+	src_h0 = max(0, h0)
+	src_h1 = min(H, h1)
+	src_w0 = max(0, w0)
+	src_w1 = min(W, w1)
+	if src_h1 <= src_h0 or src_w1 <= src_w0:
+		return out_xyz, out_valid
+
+	dst_h0 = src_h0 - h0
+	dst_w0 = src_w0 - w0
+	dst_h1 = dst_h0 + (src_h1 - src_h0)
+	dst_w1 = dst_w0 + (src_w1 - src_w0)
+	out_xyz[dst_h0:dst_h1, dst_w0:dst_w1] = xyz[src_h0:src_h1, src_w0:src_w1]
+	out_valid[dst_h0:dst_h1, dst_w0:dst_w1] = valid[src_h0:src_h1, src_w0:src_w1]
+	return out_xyz, out_valid
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -286,7 +550,20 @@ def main(argv: list[str] | None = None) -> int:
 				  f"angle={sp['straight_angle']:.3f} half_w={sp['straight_half_w']:.1f} "
 				  f"z={sp['z_center']:.1f}", flush=True)
 		elif volume_extent_fullres is not None:
-			arc = _arc_params_from_seed(data_cfg.seed, data_cfg.model_w, volume_extent_fullres)
+			umb_center = None
+			if data_cfg.umbilicus:
+				umb_center = _umbilicus_center_at_z(
+					data_cfg.umbilicus,
+					float(data_cfg.seed[2]),
+					scale=float(data_cfg.umbilicus_scale),
+				)
+				print(f"[fit] umbilicus center at z={data_cfg.seed[2]}: "
+					  f"cx={umb_center[0]:.1f} cy={umb_center[1]:.1f} "
+					  f"path={data_cfg.umbilicus}", flush=True)
+			arc = _arc_params_from_seed(
+				data_cfg.seed, data_cfg.model_w, volume_extent_fullres,
+				umbilicus_center=umb_center,
+			)
 			model_cfg = dataclasses.replace(model_cfg, **arc)
 			print(f"[fit] arc from seed: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
 				  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
@@ -305,6 +582,10 @@ def main(argv: list[str] | None = None) -> int:
 	tifxyz_init = getattr(args, "tifxyz_init", None)
 	window_size = getattr(args, "window_size", None) or 0
 	window_overlap = getattr(args, "window_overlap", 0)
+	extend_mode = str(cfg.get("mode", "")).lower() == "extend"
+	boundary_anchor_cfg = cfg.get("boundary_anchor")
+	boundary_anchor_enabled = isinstance(boundary_anchor_cfg, dict) and bool(boundary_anchor_cfg.get("enabled", False))
+	boundary_anchor_ring = int(boundary_anchor_cfg.get("ring_width", 1)) if isinstance(boundary_anchor_cfg, dict) else 1
 
 	if tifxyz_init and window_size > 0:
 		from tifxyz_io import load_tifxyz
@@ -313,6 +594,10 @@ def main(argv: list[str] | None = None) -> int:
 
 		# Load full tifxyz to CPU (save GPU mem)
 		full_xyz, full_valid, full_meta = load_tifxyz(tifxyz_init, device="cpu")
+		if extend_mode:
+			full_xyz, full_valid = _pad_tifxyz_for_extend(full_xyz, full_valid, cfg)
+		full_xyz_np = full_xyz.detach().cpu().numpy()
+		full_valid_np = full_valid.detach().cpu().numpy().astype(bool)
 		H_full, W_full, _ = full_xyz.shape
 		mesh_step = model_cfg.mesh_step
 		scale = full_meta.get("scale")
@@ -327,13 +612,16 @@ def main(argv: list[str] | None = None) -> int:
 		ext_margin = max(4, int(2 * abs(offset_val) / mesh_step) + 2)
 
 		# Parse stages and channel skipping (shared across windows)
-		cfg.pop("corr_points", None)
+		extend_corr_points_obj = cfg.get("corr_points") if extend_mode else None
+		if not extend_mode:
+			cfg.pop("corr_points", None)
 
 		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
 		n_windows = len(windows)
 		overlap_verts = window_overlap // mesh_step
-		print(f"[fit] windowed mode: {n_windows} windows, window_size={window_size} "
-			  f"overlap={window_overlap} mesh_step={mesh_step} grid={H_full}x{W_full}",
+		opt_halo_verts = max(overlap_verts, ext_margin)
+		print(f"[fit] windowed mode: {n_windows} windows, mode={'extend' if extend_mode else 'default'}, window_size={window_size} "
+			  f"overlap={window_overlap} mesh_step={mesh_step} opt_halo={opt_halo_verts} grid={H_full}x{W_full}",
 			  flush=True)
 
 		# Output directory for window tifxyz exports
@@ -347,14 +635,30 @@ def main(argv: list[str] | None = None) -> int:
 		Path(output_dir).mkdir(parents=True, exist_ok=True)
 
 		voxel_size_um = fit_config.get("voxel_size_um")
+		window_output_dirs: list[Path] = []
 
 		for wi, (h0, h1, w0, w1) in enumerate(windows):
 			print(f"\n[fit] === window {wi+1}/{n_windows}: rows [{h0}:{h1}], cols [{w0}:{w1}] "
 				  f"({h1-h0}x{w1-w0} verts) ===", flush=True)
+			window_corr_points_3d = None
+			if extend_mode:
+				window_corr_obj = _filter_corr_points_for_window(
+					extend_corr_points_obj, h0=h0, h1=h1, w0=w0, w1=w1,
+					full_xyz_np=full_xyz_np, full_valid_np=full_valid_np)
+				if window_corr_obj is not None:
+					window_corr_points_3d = _parse_corr_points(window_corr_obj, device)
 
-			# Crop tifxyz to window
-			crop_xyz = full_xyz[h0:h1, w0:w1].to(device)
-			crop_valid = full_valid[h0:h1, w0:w1].to(device)
+			# Optimize a halo around the intended output window. If the
+			# halo extends beyond the source surface, keep it invalid
+			# instead of duplicating/clamping edge coordinates.
+			oh0 = h0 - opt_halo_verts
+			oh1 = h1 + opt_halo_verts
+			ow0 = w0 - opt_halo_verts
+			ow1 = w1 + opt_halo_verts
+			crop_xyz_cpu, crop_valid_cpu = _slice_tifxyz_with_invalid_padding(
+				full_xyz, full_valid, h0=oh0, h1=oh1, w0=ow0, w1=ow1)
+			crop_xyz = crop_xyz_cpu.to(device)
+			crop_valid = crop_valid_cpu.to(device)
 
 			# Create model from crop
 			mdl = model.Model3D.from_tifxyz_crop(
@@ -363,23 +667,54 @@ def main(argv: list[str] | None = None) -> int:
 				subsample_mesh=model_cfg.subsample_mesh,
 				subsample_winding=model_cfg.subsample_winding,
 			)
+			if boundary_anchor_enabled:
+				anchor_idx = mdl.add_boundary_anchor_surface(
+					crop_xyz, crop_valid, ring_width=boundary_anchor_ring)
+				print(f"[fit] boundary anchor {anchor_idx}: ring_width={boundary_anchor_ring} "
+					  f"anchors={int(mdl._boundary_anchors[anchor_idx][1].sum())}", flush=True)
 
-			# Crop external surface with margin for ray intersection at boundaries
-			eh0 = max(0, h0 - ext_margin)
-			eh1 = min(H_full, h1 + ext_margin)
-			ew0 = max(0, w0 - ext_margin)
-			ew1 = min(W_full, w1 + ext_margin)
-			ext_xyz = full_xyz[eh0:eh1, ew0:ew1].to(device)
-			ext_valid = full_valid[eh0:eh1, ew0:ew1].to(device)
+			# External reference surface gets its own halo. Out-of-bounds
+			# regions remain invalid rather than clamped to the source edge.
+			eh0 = oh0 - ext_margin
+			eh1 = oh1 + ext_margin
+			ew0 = ow0 - ext_margin
+			ew1 = ow1 + ext_margin
+			ext_xyz_cpu, ext_valid_cpu = _slice_tifxyz_with_invalid_padding(
+				full_xyz, full_valid, h0=eh0, h1=eh1, w0=ew0, w1=ew1)
+			ext_xyz = ext_xyz_cpu.to(device)
+			ext_valid = ext_valid_cpu.to(device)
 			ext_idx = mdl.add_external_surface(ext_xyz, valid=ext_valid, offset=offset_val)
-			# ext→model mapping: ext corner r → model grid r + h_off
-			# ext grid 0 = fullres eh0, model grid 0 = fullres h0
-			# so model_h = r + (eh0 - h0)
-			mdl._ext_conn_offsets[ext_idx][0] = float(eh0 - h0)
-			mdl._ext_conn_offsets[ext_idx][1] = float(ew0 - w0)
+			# ext->model mapping: ext corner r -> model grid r + h_off
+			# ext grid 0 = fullres eh0, model grid 0 = fullres oh0
+			# so model_h = r + (eh0 - oh0)
+			mdl._ext_conn_offsets[ext_idx][0] = float(eh0 - oh0)
+			mdl._ext_conn_offsets[ext_idx][1] = float(ew0 - ow0)
 
-			# Streaming data loader for this window
-			def _load_streaming_win() -> fit_data.FitData3D:
+			# CUDA uses sparse streaming; CPU uses the existing dense cropped
+			# loader because SparseChunkGroupCache stores CUDA pointers.
+			def _load_data_win() -> fit_data.FitData3D:
+				if device.type != "cuda":
+					d = fit_data.load_3d_for_model(
+						path=str(data_cfg.input),
+						device=device,
+						model=mdl,
+						erode_valid_mask=data_cfg.erode_valid_mask,
+						cuda_gridsample=data_cfg.cuda_gridsample,
+						skip_channels=skip_channels,
+					)
+					Z, Y, X = d.size
+					sx, sy, sz = d.spacing
+					volume_extent = (
+						d.origin_fullres[0], d.origin_fullres[1], d.origin_fullres[2],
+						d.origin_fullres[0] + (X - 1) * sx,
+						d.origin_fullres[1] + (Y - 1) * sy,
+						d.origin_fullres[2] + (Z - 1) * sz,
+					)
+					mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
+					if window_corr_points_3d is not None:
+						d = dataclasses.replace(d, corr_points=window_corr_points_3d)
+					return d
+
 				d = fit_data.load_3d_streaming(
 					path=str(data_cfg.input),
 					device=device,
@@ -394,11 +729,13 @@ def main(argv: list[str] | None = None) -> int:
 					d.origin_fullres[2] + (Z - 1) * sz,
 				)
 				mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
+				if window_corr_points_3d is not None:
+					d = dataclasses.replace(d, corr_points=window_corr_points_3d)
 				return d
 
 			def _ensure_data_win(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
 				if data is None:
-					return _load_streaming_win()
+					return _load_data_win()
 				return data
 
 			data = _ensure_data_win(None, set())
@@ -417,7 +754,7 @@ def main(argv: list[str] | None = None) -> int:
 			opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
 
 			# Seed from center of model grid (matches h_mid/w_mid in station loss)
-			center_pt = _grid_center(mdl)
+			center_pt = _grid_center(mdl).detach()
 			win_seed = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 			print(f"[fit] window seed: ({win_seed[0]:.0f}, {win_seed[1]:.0f}, {win_seed[2]:.0f})",
 				  flush=True)
@@ -437,9 +774,13 @@ def main(argv: list[str] | None = None) -> int:
 			mesh = mdl.mesh_coarse()  # (3, 1, Hm, Wm)
 			mesh_np = mesh.detach().cpu().numpy()
 			Hm, Wm = mesh_np.shape[2], mesh_np.shape[3]
-			x_out = mesh_np[0, 0]  # (Hm, Wm)
-			y_out = mesh_np[1, 0]
-			z_out = mesh_np[2, 0]
+			core_h0 = h0 - oh0
+			core_h1 = core_h0 + (h1 - h0)
+			core_w0 = w0 - ow0
+			core_w1 = core_w0 + (w1 - w0)
+			x_out = mesh_np[0, 0, core_h0:core_h1, core_w0:core_w1]
+			y_out = mesh_np[1, 0, core_h0:core_h1, core_w0:core_w1]
+			z_out = mesh_np[2, 0, core_h0:core_h1, core_w0:core_w1]
 			if output_scale != 1.0:
 				x_out = x_out * output_scale
 				y_out = y_out * output_scale
@@ -449,6 +790,7 @@ def main(argv: list[str] | None = None) -> int:
 
 			win_name = f"window_{wi:04d}.tifxyz"
 			win_dir = Path(output_dir) / win_name
+			window_output_dirs.append(win_dir)
 			area = _f2t._get_area(x_out, y_out, z_out, mesh_step_output,
 								  float(voxel_size_um) if voxel_size_um else None)
 			_f2t._write_tifxyz(
@@ -461,17 +803,34 @@ def main(argv: list[str] | None = None) -> int:
 			meta["window_index"] = wi
 			meta["window_origin_verts"] = [h0, w0]
 			meta["window_size_verts"] = [h1 - h0, w1 - w0]
+			meta["optimized_origin_verts"] = [oh0, ow0]
+			meta["optimized_size_verts"] = [oh1 - oh0, ow1 - ow0]
 			meta["source_grid_size_verts"] = [H_full, W_full]
 			meta["overlap_verts"] = overlap_verts
+			meta["optimization_halo_verts"] = opt_halo_verts
 			meta_path.write_text(_json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
 			_f2t._print_area(area)
 			print(f"[fit] exported {win_name}", flush=True)
 
 			# Free GPU memory before next window
-			del mdl, data, crop_xyz, crop_valid, ext_xyz, ext_valid, mesh, mesh_np
+			del mdl, data, crop_xyz, crop_valid, crop_xyz_cpu, crop_valid_cpu
+			del ext_xyz, ext_valid, ext_xyz_cpu, ext_valid_cpu, mesh, mesh_np
 			if device.type == "cuda":
 				torch.cuda.empty_cache()
+
+		if extend_mode:
+			merge_name = "extend_merged.tifxyz"
+			print(f"\n[fit] extend mode: merging {len(window_output_dirs)} windows into {merge_name}",
+				  flush=True)
+			_merge_window_tifxyz(
+				windows=window_output_dirs,
+				out_dir=Path(output_dir) / merge_name,
+				base_xyz=full_xyz,
+				base_valid=full_valid,
+				scale=1.0 / (float(mesh_step) * output_scale),
+				voxel_size_um=float(voxel_size_um) if voxel_size_um else None,
+				preserve_existing=True)
 
 		print(f"\n[fit] windowed mode complete: {n_windows} windows exported to {output_dir}",
 			  flush=True)
@@ -531,6 +890,11 @@ def main(argv: list[str] | None = None) -> int:
 			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
 			print(f"[fit] external surface {idx}: path={es_path} offset={es_offset} "
 				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()}", flush=True)
+			if boundary_anchor_enabled and abs(es_offset) <= 1e-9:
+				anchor_idx = mdl.add_boundary_anchor_surface(
+					xyz_ext, valid_ext, ring_width=boundary_anchor_ring)
+				print(f"[fit] boundary anchor {anchor_idx}: ring_width={boundary_anchor_ring} "
+					  f"anchors={int(mdl._boundary_anchors[anchor_idx][1].sum())}", flush=True)
 
 	# Parse correction points from config (injected by VC3D)
 	corr_points_obj = cfg.pop("corr_points", None)
@@ -540,8 +904,39 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] corr_points: not found in config (type={type(corr_points_obj).__name__})", flush=True)
 
-	# --- Streaming data loader ---
-	def _load_streaming() -> fit_data.FitData3D:
+	# CUDA uses sparse streaming; CPU uses the existing dense cropped loader
+	# because SparseChunkGroupCache stores CUDA pointers.
+	def _load_data() -> fit_data.FitData3D:
+		if device.type != "cuda":
+			d = fit_data.load_3d_for_model(
+				path=str(data_cfg.input),
+				device=device,
+				model=mdl,
+				erode_valid_mask=data_cfg.erode_valid_mask,
+				cuda_gridsample=data_cfg.cuda_gridsample,
+				skip_channels=skip_channels,
+			)
+			Z, Y, X = d.size
+			sx, sy, sz = d.spacing
+			volume_extent = (
+				d.origin_fullres[0],
+				d.origin_fullres[1],
+				d.origin_fullres[2],
+				d.origin_fullres[0] + (X - 1) * sx,
+				d.origin_fullres[1] + (Y - 1) * sy,
+				d.origin_fullres[2] + (Z - 1) * sz,
+			)
+			mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
+			if corr_points_3d is not None:
+				d = dataclasses.replace(d, corr_points=corr_points_3d)
+			if data_cfg.winding_volume is not None:
+				wv_t, wv_min, wv_max = fit_data.load_winding_volume(
+					path=data_cfg.winding_volume, device=device,
+					crop=None, downscale=scaledown)
+				d = dataclasses.replace(d, winding_volume=wv_t,
+							winding_min=wv_min, winding_max=wv_max)
+			return d
+
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
@@ -571,7 +966,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	def _ensure_data(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
 		if data is None:
-			return _load_streaming()
+			return _load_data()
 		# Streaming covers full volume — no border checks or channel loading needed
 		return data
 

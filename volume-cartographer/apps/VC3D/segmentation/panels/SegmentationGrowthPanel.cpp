@@ -85,10 +85,12 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
     _comboGrowthMethod->addItem(tr("Patch Tracer"), static_cast<int>(SegmentationGrowthMethod::PatchTracer));
     _comboGrowthMethod->addItem(tr("Manual Add"), static_cast<int>(SegmentationGrowthMethod::ManualAdd));
+    _comboGrowthMethod->addItem(tr("Extend"), static_cast<int>(SegmentationGrowthMethod::Extend));
     _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
                                       "- Tracer: Neural-guided growth using volume data\n"
                                       "- Patch Tracer: Patch-index based growth from loaded surfaces\n"
-                                      "- Manual Add: Interactive invalid-region bridging"));
+                                      "- Manual Add: Interactive invalid-region bridging\n"
+                                      "- Extend: Lasagna windowed extension using anchored existing surface points"));
     methodRow->addWidget(methodLabel);
     methodRow->addWidget(_comboGrowthMethod);
     methodRow->addStretch(1);

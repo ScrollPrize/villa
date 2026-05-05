@@ -17,6 +17,7 @@ import re
 from functools import lru_cache
 from scipy import ndimage
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
+from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
 import tifffile
 import warnings
 
@@ -380,7 +381,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
     if is_s3:
         remote = zarr.storage.FsspecStore.from_url(
             path.rstrip('/'),
-            storage_options={'anon': False},
+            storage_options=s3_storage_options_for_path(path),
             read_only=True,
         )
         store = _DiskCacheStore(
@@ -439,7 +440,7 @@ def open_zarr_group(path, auth_json_path=None, config=None):
 
     if is_s3:
         remote = zarr.storage.FsspecStore.from_url(
-            path.rstrip('/'), storage_options={'anon': False},
+            path.rstrip('/'), storage_options=s3_storage_options_for_path(path),
             read_only=True,
         )
         store = _DiskCacheStore(

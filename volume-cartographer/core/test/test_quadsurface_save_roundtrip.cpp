@@ -216,3 +216,37 @@ TEST_CASE("stale .tmp file in segment dir does not break reload")
     CHECK(reloaded.rawPointsPtr() != nullptr);
     CHECK(reloaded.rawPointsPtr()->size() == cv::Size(64, 64));
 }
+
+TEST_CASE("saveOverwrite preserves auxiliary model file")
+{
+    TmpVolpkg pkg("preserve_model_pt");
+
+    cv::Mat_<cv::Vec3f> pts(64, 64, cv::Vec3f(0.f, 0.f, 50.f));
+
+    {
+        QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
+        surf.path = pkg.segDir;
+        surf.id = pkg.segName;
+        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+    }
+
+    const fs::path modelPath = pkg.segDir / "model.pt";
+    const std::string modelBytes = "fake torch model bytes";
+    {
+        std::ofstream model(modelPath, std::ios::binary);
+        model << modelBytes;
+    }
+    REQUIRE(fs::exists(modelPath));
+
+    {
+        QuadSurface loaded(pkg.segDir);
+        loaded.ensureLoaded();
+        loaded.saveOverwrite();
+    }
+
+    REQUIRE(fs::exists(modelPath));
+    std::ifstream model(modelPath, std::ios::binary);
+    const std::string savedBytes{std::istreambuf_iterator<char>(model),
+                                 std::istreambuf_iterator<char>{}};
+    CHECK(savedBytes == modelBytes);
+}

@@ -2,6 +2,7 @@
 
 #include <QWidget>
 
+#include "segmentation/growth/SegmentationGrowth.hpp"
 #include "utils/Json.hpp"
 
 class CollapsibleSettingsGroup;
@@ -36,7 +37,7 @@ public:
     explicit SegmentationLasagnaPanel(const QString& settingsGroup,
                                             QWidget* parent = nullptr);
 
-    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Offset = 3 };
+    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Offset = 3, Extend = 4 };
 
     // Getters
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
@@ -48,6 +49,7 @@ public:
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelWindings() const;
     [[nodiscard]] QString seedPointText() const;
+    [[nodiscard]] QString umbilicusPath() const;
     [[nodiscard]] QString newModelOutputName() const;
     [[nodiscard]] double inputScale() const;
     [[nodiscard]] double outputScale() const;
@@ -61,6 +63,10 @@ public:
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
     void startOptimization(CState* state, QStatusBar* statusBar);
+    void startExtendOptimization(CState* state,
+                                 QStatusBar* statusBar,
+                                 SegmentationGrowthDirection direction,
+                                 int steps);
 
 public slots:
     void setSeedFromFocus(int x, int y, int z);
@@ -105,6 +111,7 @@ private:
     QStackedWidget* _dataInputStack{nullptr};
     QLineEdit* _dataInputEdit{nullptr};
     QToolButton* _dataInputBrowse{nullptr};
+    QComboBox* _solverDeviceCombo{nullptr};
 
     // New model settings
     QSpinBox* _widthSpin{nullptr};
@@ -112,6 +119,8 @@ private:
     QSpinBox* _windingsSpin{nullptr};
     QLineEdit* _seedEdit{nullptr};
     QPushButton* _seedFromFocusBtn{nullptr};
+    QLineEdit* _umbilicusEdit{nullptr};
+    QToolButton* _umbilicusBrowse{nullptr};
     QLineEdit* _outputNameEdit{nullptr};
     QDoubleSpinBox* _inputScaleSpin{nullptr};
     QDoubleSpinBox* _outputScaleSpin{nullptr};
@@ -141,9 +150,13 @@ private:
     QString _newModelConfigFilePath;
     QString _reoptConfigFilePath;
     QString _offsetConfigFilePath;
+    QString _umbilicusPath;
 
-    int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
+    int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset, 4=extend
+    SegmentationGrowthDirection _extendDirection{SegmentationGrowthDirection::All};
+    int _extendSteps{0};
     int _connectionMode{0};  // 0=internal, 1=external
+    int _solverDeviceMode{0}; // 0=config/default, 1=CPU only
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};
 

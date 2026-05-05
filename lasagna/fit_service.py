@@ -331,6 +331,14 @@ def _run_optimization(body: dict[str, Any]) -> None:
             cfg["args"] = args_section_pre
             offset_val = float(cfg.pop("offset_value", 1.0))
             cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
+            if math.isclose(offset_val, 0.0, abs_tol=1e-9):
+                cfg.setdefault("boundary_anchor", {})
+                if isinstance(cfg["boundary_anchor"], dict):
+                    cfg["boundary_anchor"].setdefault("enabled", True)
+                    cfg["boundary_anchor"].setdefault("ring_width", 1)
+                base_cfg = cfg.setdefault("base", {})
+                if isinstance(base_cfg, dict):
+                    base_cfg.setdefault("boundary_anchor", 10.0)
 
         args_section = dict(cfg.get("args", {}))
         args_section["input"] = str(data_input)
@@ -402,15 +410,17 @@ def _run_optimization(body: dict[str, Any]) -> None:
                               if p.name.endswith(".tifxyz") and p.is_dir()]
             if _window_tifxyz:
                 import shutil as _shutil
-                _win_base = body.get("output_name", "")
-                if _win_base.endswith(".tifxyz"):
-                    _win_base = _win_base[:-len(".tifxyz")]
-                for i, p in enumerate(sorted(_window_tifxyz, key=lambda x: x.name)):
-                    dst_name = f"{_win_base}_w{i}.tifxyz" if _win_base else p.name
+                _extend_mode = str(config.get("mode", body.get("mode", ""))).lower() == "extend"
+                _merged = Path(tmp_dir) / "extend_merged.tifxyz"
+                if _extend_mode and _merged.is_dir():
+                    dst_name = body.get("output_name") or "extend.tifxyz"
+                    dst_name = str(dst_name)
+                    if not dst_name.endswith(".tifxyz"):
+                        dst_name += ".tifxyz"
                     dst = Path(output_dir) / dst_name
                     if dst.exists():
                         _shutil.rmtree(dst)
-                    _shutil.move(str(p), str(dst))
+                    _shutil.move(str(_merged), str(dst))
                     # Update UUID in meta.json to match the new directory name
                     _meta_path = dst / "meta.json"
                     if _meta_path.exists():
@@ -418,8 +428,26 @@ def _run_optimization(body: dict[str, Any]) -> None:
                         _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
                         _meta["uuid"] = dst_name
                         _meta_path.write_text(_json.dumps(_meta, indent=2) + "\n", encoding="utf-8")
-                print(f"[fit-service] windowed mode: moved {len(_window_tifxyz)} "
-                      f"window tifxyz to {output_dir}", flush=True)
+                    print(f"[fit-service] extend mode: moved merged tifxyz to {dst}", flush=True)
+                else:
+                    _win_base = body.get("output_name", "")
+                    if _win_base.endswith(".tifxyz"):
+                        _win_base = _win_base[:-len(".tifxyz")]
+                    for i, p in enumerate(sorted(_window_tifxyz, key=lambda x: x.name)):
+                        dst_name = f"{_win_base}_w{i}.tifxyz" if _win_base else p.name
+                        dst = Path(output_dir) / dst_name
+                        if dst.exists():
+                            _shutil.rmtree(dst)
+                        _shutil.move(str(p), str(dst))
+                        # Update UUID in meta.json to match the new directory name
+                        _meta_path = dst / "meta.json"
+                        if _meta_path.exists():
+                            import json as _json
+                            _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
+                            _meta["uuid"] = dst_name
+                            _meta_path.write_text(_json.dumps(_meta, indent=2) + "\n", encoding="utf-8")
+                    print(f"[fit-service] windowed mode: moved {len(_window_tifxyz)} "
+                          f"window tifxyz to {output_dir}", flush=True)
             else:
                 _job.set_running("exporting", 0, 0, 0.0)
                 import fit2tifxyz

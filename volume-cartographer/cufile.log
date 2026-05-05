@@ -1,0 +1,4 @@
+ 05-05-2026 12:29:37:274 [pid=2237984 tid=2237984] NOTICE  cufio-drv:851 running in compatible mode
+ 05-05-2026 12:29:37:702 [pid=2237984 tid=2238052] ERROR  cufio_core:56 Threadpool Thread ID:  252547739611552 cuDevicePrimaryCtxRetain failed with error 2
+ 05-05-2026 12:30:32:749 [pid=2239034 tid=2239034] NOTICE  cufio-drv:851 running in compatible mode
+ 05-05-2026 12:31:19:549 [pid=2240203 tid=2240203] NOTICE  cufio-drv:851 running in compatible mode

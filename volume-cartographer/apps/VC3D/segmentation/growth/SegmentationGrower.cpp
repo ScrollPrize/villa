@@ -63,6 +63,17 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
     return QDir(base).filePath(QStringLiteral("cache"));
 }
 
+QString neuralVolumeLocation(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return QString();
+    }
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl()).trimmed();
+    }
+    return QString::fromStdString(volume->path().string()).trimmed();
+}
+
 // NOTE: SegmentationGrowth.cpp has an equivalent ensureGenerationsChannel with a bool
 // return value. These two live in separate anonymous namespaces (different TUs) and
 // cannot easily be merged without a shared header; keep them in sync if modified.
@@ -1515,14 +1526,32 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
     const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
+    const NeuralTracerModelType neuralModelType = _context.widget->neuralModelType();
     const bool denseMode = neuralTracerEnabled &&
-        _context.widget->neuralModelType() == NeuralTracerModelType::DenseDisplacement &&
+        neuralModelType == NeuralTracerModelType::DenseDisplacement &&
         !manualAddTracerMask;
+
+    if (neuralTracerEnabled) {
+        QString neuralMode = tr("Heatmap");
+        if (neuralModelType == NeuralTracerModelType::DenseDisplacement) {
+            neuralMode = tr("Dense displacement");
+        } else if (neuralModelType == NeuralTracerModelType::DisplacementCopy) {
+            neuralMode = tr("Displacement Copy");
+        }
+        qCInfo(lcSegGrowth) << "Neural tracer growth requested"
+                            << "mode" << neuralMode
+                            << "manualAddMask" << manualAddTracerMask
+                            << "steps" << sanitizedSteps;
+        showStatus(tr("Neural tracer growth requested (%1)...").arg(neuralMode), kStatusMedium);
+    }
 
     if (denseMode) {
         const QString denseCheckpointPath = _context.widget->denseCheckpointPath().trimmed();
         const QString pythonPath = _context.widget->neuralPythonPath();
-        const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+        QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+        if (volumeZarr.isEmpty() && growthVolume) {
+            volumeZarr = neuralVolumeLocation(growthVolume);
+        }
         const int volumeScale = _context.widget->neuralVolumeScale();
         const DenseTtaMode denseTtaMode = _context.widget->denseTtaMode();
         const QString denseTtaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
@@ -1530,35 +1559,46 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         const auto outputMode = _context.widget->neuralOutputMode();
 
         if (denseCheckpointPath.isEmpty()) {
+            qCWarning(lcSegGrowth) << "Dense displacement aborted: checkpoint path is empty";
             showStatus(tr("Dense displacement requires a dense checkpoint path."), kStatusLong);
             return false;
         }
         const bool usingDenseLatestPreset = denseCheckpointPath == kDenseLatestSentinel;
         if (!usingDenseLatestPreset &&
             (!QFileInfo::exists(denseCheckpointPath) || !QFileInfo(denseCheckpointPath).isFile())) {
+            qCWarning(lcSegGrowth) << "Dense displacement aborted: checkpoint does not exist"
+                                   << denseCheckpointPath;
             showStatus(tr("Dense checkpoint does not exist: %1").arg(denseCheckpointPath), kStatusLong);
             return false;
         }
         if (volumeZarr.isEmpty()) {
+            qCWarning(lcSegGrowth) << "Dense displacement aborted: volume zarr path is empty"
+                                   << "growthVolumeId" << QString::fromStdString(growthVolumeId)
+                                   << "remote" << (growthVolume ? growthVolume->isRemote() : false);
             showStatus(tr("Dense displacement requires a volume zarr path."), kStatusLong);
             return false;
         }
+        qCInfo(lcSegGrowth) << "Dense displacement using volume zarr" << volumeZarr;
 
         auto& serviceManager = NeuralTraceServiceManager::instance();
         showStatus(tr("Starting neural trace service for dense displacement..."), kStatusLong);
         if (!serviceManager.ensureServiceRunning(denseCheckpointPath, volumeZarr, volumeScale, pythonPath)) {
             const QString error = serviceManager.lastError();
+            qCWarning(lcSegGrowth) << "Dense displacement aborted: neural trace service failed to start"
+                                   << error;
             showStatus(tr("Failed to start neural trace service: %1").arg(error), kStatusLong);
             return false;
         }
         const QString socketPath = serviceManager.socketPath();
         if (socketPath.isEmpty()) {
+            qCWarning(lcSegGrowth) << "Dense displacement aborted: neural trace service socket path is empty";
             showStatus(tr("Neural trace service is running but socket path is unavailable."), kStatusLong);
             return false;
         }
 
         const auto denseDirections = resolveDenseDirections(effectiveDirection, request.allowedDirections);
         if (denseDirections.empty()) {
+            qCWarning(lcSegGrowth) << "Dense displacement aborted: no valid growth directions";
             showStatus(tr("No valid dense growth directions are enabled."), kStatusLong);
             return false;
         }
@@ -1662,6 +1702,11 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     // Heatmap neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
     if (neuralTracerEnabled) {
+        if (neuralModelType == NeuralTracerModelType::DisplacementCopy) {
+            showStatus(tr("Displacement Copy uses the Copy with NT button, not Grow."), kStatusLong);
+            return false;
+        }
+
         const QString checkpointPath = _context.widget->neuralCheckpointPath();
         const QString pythonPath = _context.widget->neuralPythonPath();
         const QString volumeZarr = _context.widget->volumeZarrPath();
@@ -1911,7 +1956,10 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 
     const QString copyCheckpointPath = _context.widget->copyCheckpointPath().trimmed();
     const QString pythonPath = _context.widget->neuralPythonPath();
-    const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+    QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+    if (volumeZarr.isEmpty() && growthVolume) {
+        volumeZarr = neuralVolumeLocation(growthVolume);
+    }
     const int volumeScale = _context.widget->neuralVolumeScale();
     const DenseTtaMode ttaMode = _context.widget->denseTtaMode();
     const QString ttaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
@@ -1928,9 +1976,13 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
     if (volumeZarr.isEmpty()) {
+        qCWarning(lcSegGrowth) << "Displacement copy aborted: volume zarr path is empty"
+                               << "growthVolumeId" << QString::fromStdString(growthVolumeId)
+                               << "remote" << (growthVolume ? growthVolume->isRemote() : false);
         showStatus(tr("Displacement copy requires a volume zarr path."), kStatusLong);
         return false;
     }
+    qCInfo(lcSegGrowth) << "Displacement copy using volume zarr" << volumeZarr;
 
     auto& serviceManager = NeuralTraceServiceManager::instance();
     showStatus(tr("Starting neural trace service for displacement copy..."), kStatusLong);

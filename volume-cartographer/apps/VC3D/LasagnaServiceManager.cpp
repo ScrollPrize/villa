@@ -134,6 +134,8 @@ QString findLasagnaServiceScript()
         QDir(appDir).filePath("../../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
         // Installed
         QDir(appDir).filePath("../share/vesuvius/exps_2d_model/fit_service.py"),
+        // Standalone lasagna checkout
+        QDir(qEnvironmentVariable("LASAGNA_REPO", QStringLiteral("/home/sean/villa/lasagna"))).filePath("fit_service.py"),
         // Environment variable
         qEnvironmentVariable("LASAGNA_SERVICE_PATH"),
     };

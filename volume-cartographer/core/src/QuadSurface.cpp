@@ -70,6 +70,39 @@ void normalizeMaskChannel(cv::Mat& mask)
     mask = singleChannel;
 }
 
+void preserveAuxiliaryFiles(const std::filesystem::path& sourceDir,
+                            const std::filesystem::path& destDir)
+{
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(sourceDir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+
+        const std::filesystem::path destPath = destDir / entry.path().filename();
+        if (std::filesystem::exists(destPath)) {
+            continue;
+        }
+
+        std::error_code copyEc;
+        std::filesystem::copy_file(entry.path(),
+                                   destPath,
+                                   std::filesystem::copy_options::none,
+                                   copyEc);
+        if (copyEc) {
+            Logger()->warn("save: preserving auxiliary file failed for {}: {}",
+                           entry.path().string(), copyEc.message());
+        }
+    }
+    if (ec) {
+        Logger()->warn("save: auxiliary file iteration failed for {}: {}",
+                       sourceDir.string(), ec.message());
+    }
+}
+
 inline bool isValidPointSample(const cv::Vec3f& point)
 {
     return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
@@ -1560,16 +1593,11 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     // Rename to make creation atomic
     std::filesystem::rename(path / "meta.json.tmp", path / "meta.json");
 
-    // Preserve auxiliary files from the existing directory before replacing
+    // Preserve auxiliary files from the existing directory before replacing.
+    // The tifxyz writer regenerates x/y/z, channels, and meta.json in temp_path;
+    // carry forward anything it did not rewrite, such as model.pt.
     if (force_overwrite && std::filesystem::exists(final_path)) {
-        // Copy corrections.json if it exists
-        std::filesystem::path correctionsFile = final_path / "corrections.json";
-        if (std::filesystem::exists(correctionsFile)) {
-            std::error_code copyEc;
-            std::filesystem::copy_file(correctionsFile, temp_path / "corrections.json",
-                std::filesystem::copy_options::overwrite_existing, copyEc);
-            // Ignore errors - corrections are not critical for surface integrity
-        }
+        preserveAuxiliaryFiles(final_path, temp_path);
     }
 
     // Atomically move the saved data to the final location

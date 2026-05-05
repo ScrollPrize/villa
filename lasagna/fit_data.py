@@ -566,7 +566,7 @@ def load_3d_for_model(
 	print(f"[fit_data] mesh bbox: "
 		  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
 		  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
-	prep = get_preprocessed_params(path)
+	prep = get_preprocessed_params(path, skip_channels=skip_channels)
 	crop = auto_crop_for_mesh(mesh_bbox, prep["volume_extent_fullres"])
 	print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
 		  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
@@ -724,10 +724,15 @@ def get_preprocessed_params(path: str, skip_channels: set[str] | None = None) ->
 	# Use finest-resolution group to determine volume extent
 	min_sd = min(g.sd_fac for g in groups)
 	# Find a group at finest resolution, open its zarr to get spatial dims
+	last_open_error: Exception | None = None
 	for g in groups:
 		if g.sd_fac == min_sd:
 			zarr_path = str(vol.path.parent / g.zarr_path)
-			zsrc = zarr.open(zarr_path, mode="r")
+			try:
+				zsrc = zarr.open(zarr_path, mode="r")
+			except Exception as exc:
+				last_open_error = exc
+				continue
 			if not isinstance(zsrc, zarr.Array):
 				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
 			shape = tuple(int(v) for v in zsrc.shape)
@@ -748,6 +753,11 @@ def get_preprocessed_params(path: str, skip_channels: set[str] | None = None) ->
 				"volume_extent_fullres": volume_extent_fullres,
 				"source_to_base": s2b,
 			}
+	if last_open_error is not None:
+		raise ValueError(
+			f"no readable zarr group at finest scaledown {min_sd} in {path}; "
+			f"last error: {last_open_error}"
+		)
 	raise ValueError(f"no groups in {path}")
 
 

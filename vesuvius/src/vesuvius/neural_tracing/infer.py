@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from cachetools import LRUCache
 
 from vesuvius.neural_tracing.heatmap_single_point.dataset import get_crop_from_volume, build_localiser, make_heatmaps, mark_context_point
+from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.models.run.tta import infer_with_tta
 
@@ -272,10 +273,30 @@ class Inference:
         self.model.eval()
 
         print(f"loading volume zarr {volume_zarr}...")
-        ome_zarr = zarr.open_group(volume_zarr, mode='r')
+        if str(volume_zarr).startswith("s3://"):
+            store = zarr.storage.FsspecStore.from_url(
+                str(volume_zarr).rstrip("/"),
+                storage_options=s3_storage_options_for_path(volume_zarr),
+                read_only=True,
+            )
+            ome_zarr = zarr.open_group(store, mode='r')
+        else:
+            ome_zarr = zarr.open_group(volume_zarr, mode='r')
         self.volume = ome_zarr[str(volume_scale)]
-        with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
-            self.voxel_size_um = json.load(meta_fp)['voxelsize']
+        self.voxel_size_um = ome_zarr.attrs.get('voxelsize')
+        if self.voxel_size_um is None:
+            if str(volume_zarr).startswith("s3://"):
+                import fsspec
+
+                with fsspec.open(
+                    f'{str(volume_zarr).rstrip("/")}/meta.json',
+                    'rt',
+                    **s3_storage_options_for_path(volume_zarr),
+                ) as meta_fp:
+                    self.voxel_size_um = json.load(meta_fp)['voxelsize']
+            else:
+                with open(f'{volume_zarr}/meta.json', 'rt') as meta_fp:
+                    self.voxel_size_um = json.load(meta_fp)['voxelsize']
         print(f"volume shape: {self.volume.shape}, dtype: {self.volume.dtype}, voxel-size: {self.voxel_size_um * 2 ** volume_scale}um")
 
         # cache for prefetching

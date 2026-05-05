@@ -3434,6 +3434,19 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                         int steps,
                                         bool inpaintOnly)
 {
+    if (method == SegmentationGrowthMethod::Extend) {
+        if (inpaintOnly) {
+            statusBar()->showMessage(tr("Lasagna Extend does not support inpaint-only growth."), 4000);
+            return;
+        }
+        if (auto* panel = _segmentationWidget ? _segmentationWidget->lasagnaPanel() : nullptr) {
+            panel->startExtendOptimization(_state, statusBar(), direction, steps);
+        } else {
+            statusBar()->showMessage(tr("Lasagna Extend is unavailable."), 4000);
+        }
+        return;
+    }
+
     if (!_segmentationGrower) {
         statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
