@@ -563,9 +563,9 @@ class Model3D(nn.Module):
 			def _valid_mask(gm: torch.Tensor) -> torch.Tensor:
 				return (gm.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz_lr.dtype).unsqueeze(1)
 
-			mask_prev = _valid_mask(data.grid_sample_fullres(prev_full.detach()).grad_mag)
-			mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr.detach()).grad_mag)
-			mask_next = _valid_mask(data.grid_sample_fullres(next_full.detach()).grad_mag)
+			mask_prev = _valid_mask(data.grid_sample_fullres(prev_full.detach(), channels={"grad_mag"}).grad_mag)
+			mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr.detach(), channels={"grad_mag"}).grad_mag)
+			mask_next = _valid_mask(data.grid_sample_fullres(next_full.detach(), channels={"grad_mag"}).grad_mag)
 
 			# Apply uv validity (also zeros boundary edges: d=0 prev, d=D-1 next)
 			mask_prev = mask_prev * prev_uv_ok.unsqueeze(1)
@@ -951,7 +951,10 @@ class Model3D(nn.Module):
 	def forward(self, data: fit_data.FitData3D) -> FitResult3D:
 		xyz_lr = self._grid_xyz()  # (D, Hm, Wm, 3)
 		xyz_hr = self._grid_xyz_hr(xyz_lr)  # (D, He, We, 3)
-		data_s = data.grid_sample_fullres(xyz_hr)
+		hr_channels = {"grad_mag"}
+		if data.has_channel("pred_dt"):
+			hr_channels.add("pred_dt")
+		data_s = data.grid_sample_fullres(xyz_hr, channels=hr_channels)
 		xy_conn, mask_conn, sign_conn, normals = self._xyz_conn(xyz_lr, data)
 
 		D = self.depth
@@ -979,8 +982,8 @@ class Model3D(nn.Module):
 			bias_lr = self.bias.clamp(0.0, 0.45)
 
 		# Masking via grad_mag > 0 + GT normals at LR positions
-		data_lr = data.grid_sample_fullres(xyz_lr.detach())
-		mask_hr = (data.grid_sample_fullres(xyz_hr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
+		data_lr = data.grid_sample_fullres(xyz_lr.detach(), channels={"grad_mag", "nx", "ny"})
+		mask_hr = (data_s.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 		mask_lr = (data_lr.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 		gt_normal_lr = data_lr.normal_3d  # (D, Hm, Wm, 3) or None
 

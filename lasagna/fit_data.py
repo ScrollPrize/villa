@@ -250,23 +250,43 @@ class FitData3D:
 			return self.size
 		return int(t.shape[2]), int(t.shape[3]), int(t.shape[4])
 
-	def grid_sample_fullres(self, xyz_fullres: torch.Tensor, *, diff: bool = False) -> "FitData3D":
+	def has_channel(self, channel: str) -> bool:
+		if getattr(self, channel, None) is not None:
+			return True
+		if self.sparse_caches:
+			return any(channel in cache.channels for cache in self.sparse_caches.values())
+		return False
+
+	def grid_sample_fullres(
+		self,
+		xyz_fullres: torch.Tensor,
+		*,
+		diff: bool = False,
+		channels: set[str] | None = None,
+	) -> "FitData3D":
 		"""Sample at fullres positions.
 
 		xyz_fullres: (D, H, W, 3) where last dim is (x, y, z) in fullres coords.
 		Returns FitData3D with float32 decoded values in (1, 1, D, H, W).
 		Uses custom CUDA uint8 kernel when cuda_gridsample=True, else PyTorch F.grid_sample.
 		diff=True: use differentiable CUDA kernel (gradients flow through xyz).
+		channels: optional channel names to sample; omitted channels are returned as None.
 		"""
 		if CHUNK_STATS_ENABLED:
 			_record_chunks(self, xyz_fullres)
 		if self.sparse_caches:
-			return self._grid_sample_sparse(xyz_fullres, diff=diff)
+			return self._grid_sample_sparse(xyz_fullres, diff=diff, channels=channels)
 		if self.cuda_gridsample:
-			return self._grid_sample_cuda(xyz_fullres, diff=diff)
-		return self._grid_sample_torch(xyz_fullres)
+			return self._grid_sample_cuda(xyz_fullres, diff=diff, channels=channels)
+		return self._grid_sample_torch(xyz_fullres, channels=channels)
 
-	def _grid_sample_cuda(self, xyz_fullres: torch.Tensor, *, diff: bool = False) -> "FitData3D":
+	def _grid_sample_cuda(
+		self,
+		xyz_fullres: torch.Tensor,
+		*,
+		diff: bool = False,
+		channels: set[str] | None = None,
+	) -> "FitData3D":
 		import importlib.util, os
 		if diff:
 			_spec = importlib.util.spec_from_file_location(
@@ -287,8 +307,11 @@ class FitData3D:
 
 		dev = xyz_fullres.device
 		offset = torch.tensor(self.origin_fullres, dtype=torch.float32, device=dev)
+		_want = channels
 
 		def _gs(t: torch.Tensor | None, decode, channel: str) -> torch.Tensor | None:
+			if _want is not None and channel not in _want:
+				return None
 			if t is None:
 				return None
 			sp = self._spacing_for(channel)
@@ -317,23 +340,43 @@ class FitData3D:
 			cuda_gridsample=self.cuda_gridsample,
 		)
 
-	def _grid_sample_sparse(self, xyz_fullres: torch.Tensor, *, diff: bool = False) -> "FitData3D":
+	def _grid_sample_sparse(
+		self,
+		xyz_fullres: torch.Tensor,
+		*,
+		diff: bool = False,
+		channels: set[str] | None = None,
+	) -> "FitData3D":
 		"""Sample from sparse chunk caches."""
 		from sparse_cache import SparseChunkGroupCache
 
 		dev = xyz_fullres.device
 		offset = torch.tensor(self.origin_fullres, dtype=torch.float32, device=dev)
+		_want = channels
 
 		# Collect raw samples from each cache group
 		raw: dict[str, torch.Tensor] = {}  # channel_name -> (1, D, H, W)
 		for group_name, cache in self.sparse_caches.items():
+			selected = [
+				(i, ch_name)
+				for i, ch_name in enumerate(cache.channels)
+				if _want is None or ch_name in _want
+			]
+			if not selected:
+				continue
 			sp = self._spacing_for(cache.channels[0])
 			inv_scale = torch.tensor([1.0 / s for s in sp], dtype=torch.float32, device=dev)
 			# (C, D, H, W) raw interpolated values
-			sampled = cache.grid_sample(xyz_fullres, offset, inv_scale, diff=diff)
+			sampled = cache.grid_sample(
+				xyz_fullres,
+				offset,
+				inv_scale,
+				diff=diff,
+				context=f"FitData3D.grid_sample_fullres(diff={diff})",
+			)
 			if not diff:
 				sampled = sampled.float()
-			for i, ch_name in enumerate(cache.channels):
+			for i, ch_name in selected:
 				raw[ch_name] = sampled[i:i+1].unsqueeze(0)  # (1, 1, D, H, W)
 
 		# Decode per-channel (same as _grid_sample_cuda)
@@ -369,7 +412,13 @@ class FitData3D:
 			cuda_gridsample=self.cuda_gridsample,
 		)
 
-	def _grid_sample_torch(self, xyz_fullres: torch.Tensor) -> "FitData3D":
+	def _grid_sample_torch(
+		self,
+		xyz_fullres: torch.Tensor,
+		*,
+		channels: set[str] | None = None,
+	) -> "FitData3D":
+		_want = channels
 		def _make_grid(channel: str, t: torch.Tensor | None) -> torch.Tensor:
 			sp = self._spacing_for(channel)
 			Z, Y, X = self._size_of(t)
@@ -383,6 +432,8 @@ class FitData3D:
 			return g
 
 		def _gs(t: torch.Tensor | None, decode, channel: str) -> torch.Tensor | None:
+			if _want is not None and channel not in _want:
+				return None
 			if t is None:
 				return None
 			grid_5d = _make_grid(channel, t).unsqueeze(0)
@@ -878,7 +929,7 @@ def load_3d_streaming(
 	path: str,
 	device: torch.device,
 	skip_channels: set[str] | None = None,
-	sparse_prefetch_backend: str = "tensorstore_cpp",
+	sparse_prefetch_backend: str = "tensorstore",
 ) -> FitData3D:
 	"""Load .lasagna.json as sparse streaming cache — no upfront data load.
 
@@ -891,6 +942,10 @@ def load_3d_streaming(
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
 	_skip = skip_channels or set()
+	_backend = "tensorstore" if sparse_prefetch_backend in {"tensorstore_cpp", "tensorstore"} else sparse_prefetch_backend
+	if sparse_prefetch_backend == "tensorstore_cpp":
+		print("[fit_data] WARNING: sparse_prefetch_backend=tensorstore_cpp is deprecated; "
+			  "using tensorstore", flush=True)
 
 	# Build sparse caches per group
 	sparse_caches: dict[str, SparseChunkGroupCache] = {}
@@ -928,8 +983,7 @@ def load_3d_streaming(
 			ch_idx = group.channels.index(ch)
 			channel_indices[ch] = ch_idx
 
-		_backend = "tensorstore_cpp" if sparse_prefetch_backend in {"tensorstore_cpp", "tensorstore"} else sparse_prefetch_backend
-		if _backend == "tensorstore_cpp":
+		if _backend == "tensorstore":
 			from sparse_tensorstore_cache import TensorStoreSparseChunkGroupCache
 			cache = TensorStoreSparseChunkGroupCache(
 				channels=channels,

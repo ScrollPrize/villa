@@ -366,11 +366,25 @@ def main(argv: list[str] | None = None) -> int:
 			mdl._ext_conn_offsets[ext_idx][1] = float(ew0 - w0)
 
 			# Streaming data loader for this window
-			def _load_streaming_win() -> fit_data.FitData3D:
+			def _streaming_skip_channels(needed_channels: set[str]) -> set[str]:
+				optional = {"cos", "pred_dt"}
+				return optional - set(needed_channels)
+
+			def _streaming_loaded_channels(d: fit_data.FitData3D) -> set[str]:
+				if not d.sparse_caches:
+					return set()
+				return {
+					ch
+					for cache in d.sparse_caches.values()
+					for ch in cache.channels
+				}
+
+			def _load_streaming_win(needed_channels: set[str]) -> fit_data.FitData3D:
 				d = fit_data.load_3d_streaming(
 					path=str(data_cfg.input),
 					device=device,
 					sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
+					skip_channels=_streaming_skip_channels(needed_channels),
 				)
 				Z, Y, X = d.size
 				sx, sy, sz = d.spacing
@@ -385,7 +399,11 @@ def main(argv: list[str] | None = None) -> int:
 
 			def _ensure_data_win(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
 				if data is None:
-					return _load_streaming_win()
+					return _load_streaming_win(needed_channels)
+				loaded = _streaming_loaded_channels(data)
+				required = {"grad_mag", "nx", "ny"} | set(needed_channels)
+				if not required.issubset(loaded) or (loaded & {"cos", "pred_dt"}) != (required & {"cos", "pred_dt"}):
+					return _load_streaming_win(needed_channels)
 				return data
 
 			data = _ensure_data_win(None, set())
@@ -540,11 +558,25 @@ def main(argv: list[str] | None = None) -> int:
 	_stage_done("load_optimizer_stages", _t)
 
 	# --- Streaming data loader ---
-	def _load_streaming() -> fit_data.FitData3D:
+	def _streaming_skip_channels(needed_channels: set[str]) -> set[str]:
+		optional = {"cos", "pred_dt"}
+		return optional - set(needed_channels)
+
+	def _streaming_loaded_channels(d: fit_data.FitData3D) -> set[str]:
+		if not d.sparse_caches:
+			return set()
+		return {
+			ch
+			for cache in d.sparse_caches.values()
+			for ch in cache.channels
+		}
+
+	def _load_streaming(needed_channels: set[str]) -> fit_data.FitData3D:
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
 			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
+			skip_channels=_streaming_skip_channels(needed_channels),
 		)
 		Z, Y, X = d.size
 		# Volume extent covers the full zarr volume
@@ -570,8 +602,22 @@ def main(argv: list[str] | None = None) -> int:
 
 	def _ensure_data(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
 		if data is None:
-			return _load_streaming()
-		# Streaming covers full volume — no border checks or channel loading needed
+			return _load_streaming(needed_channels)
+		loaded = _streaming_loaded_channels(data)
+		required = {"grad_mag", "nx", "ny"} | set(needed_channels)
+		if not required.issubset(loaded) or (loaded & {"cos", "pred_dt"}) != (required & {"cos", "pred_dt"}):
+			d = _load_streaming(needed_channels)
+			if data.corr_points is not None:
+				d = dataclasses.replace(d, corr_points=data.corr_points)
+			if data.winding_volume is not None:
+				d = dataclasses.replace(
+					d,
+					winding_volume=data.winding_volume,
+					winding_min=data.winding_min,
+					winding_max=data.winding_max,
+				)
+			return d
+		# Streaming covers full volume — no border checks needed
 		return data
 
 	_t = _stage_start("load_data")

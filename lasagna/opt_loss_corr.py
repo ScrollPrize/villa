@@ -336,7 +336,7 @@ def _wind_strip_integral(
 	strip = P.unsqueeze(1) + t.view(1, -1, 1) * diff.unsqueeze(1)  # (K, S, 3)
 
 	strip_flat = strip.reshape(1, 1, K * strip_samples, 3)
-	sampled = data.grid_sample_fullres(strip_flat)
+	sampled = data.grid_sample_fullres(strip_flat, channels={"grad_mag"})
 	mag_raw = sampled.grad_mag  # (1, 1, 1, 1, K*S)
 	mag = mag_raw.reshape(K, strip_samples)
 
@@ -859,7 +859,7 @@ def _corr_winding_loss(
 	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
 
 	# Sample GT normals at corr point positions
-	gt_n_sampled = res.data.grid_sample_fullres(P.reshape(1, 1, K, 3))
+	gt_n_sampled = res.data.grid_sample_fullres(P.reshape(1, 1, K, 3), channels={"nx", "ny"})
 	gt_n = gt_n_sampled.normal_3d  # (1, 1, K, 3) after squeeze in property
 	gt_n = gt_n.reshape(K, 3)
 	gt_n = gt_n / (gt_n.norm(dim=-1, keepdim=True) + 1e-8)
@@ -1056,7 +1056,10 @@ def _corr_winding_loss(
 			layer_d = d_ci.to(dt)
 			tgt = layer_d - target[vi]
 			err = sw - tgt
-			gt_n_q_sampled = res.data.grid_sample_fullres(Q_det.reshape(1, 1, int(Q_det.shape[0]), 3))
+			gt_n_q_sampled = res.data.grid_sample_fullres(
+				Q_det.reshape(1, 1, int(Q_det.shape[0]), 3),
+				channels={"nx", "ny"},
+			)
 			gt_n_q = gt_n_q_sampled.normal_3d.reshape(int(Q_det.shape[0]), 3)
 			gt_n_q = gt_n_q / (gt_n_q.norm(dim=-1, keepdim=True) + 1e-8)
 			normal_align = (gt_n_q * gt_n[vi]).sum(dim=-1).clamp(-1.0, 1.0)
@@ -1118,7 +1121,10 @@ def _corr_winding_loss(
 
 		# Sample GT normal at each active vertex's 3D position (detached)
 		Na = int(M_active.shape[0])
-		gt_n_v_sampled = res.data.grid_sample_fullres(M_det_active.reshape(1, 1, Na, 3))
+		gt_n_v_sampled = res.data.grid_sample_fullres(
+			M_det_active.reshape(1, 1, Na, 3),
+			channels={"nx", "ny"},
+		)
 		gt_n_v = gt_n_v_sampled.normal_3d.reshape(Na, 3)
 		gt_n_v = gt_n_v / (gt_n_v.norm(dim=-1, keepdim=True) + 1e-8)
 
