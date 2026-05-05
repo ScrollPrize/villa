@@ -151,11 +151,12 @@ private:
     void queuePatchIndexRangeForVertices(int minRow, int maxRow, int minCol, int maxCol);
     void clearActiveDrag();
     float stepNormalization() const;
+    cv::Mat_<cv::Vec3f>* previewPointsPtr();
+    const cv::Mat_<cv::Vec3f>* previewPointsPtr() const;
 
     std::shared_ptr<QuadSurface> _baseSurface;
     ViewerManager* _viewerManager{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
-    cv::Mat_<cv::Vec3f>* _previewPoints{nullptr};
 
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};
