@@ -17,10 +17,6 @@ add_executable(test_appendmask_render test_appendmask_render.cpp)
 target_link_libraries(test_appendmask_render PRIVATE doctest::doctest vc_core)
 add_test(NAME test_appendmask_render COMMAND test_appendmask_render)
 
-add_executable(test_quadsurface_trim test_quadsurface_trim.cpp)
-target_link_libraries(test_quadsurface_trim PRIVATE doctest::doctest vc_core)
-add_test(NAME test_quadsurface_trim COMMAND test_quadsurface_trim)
-
 add_executable(test_quadsurface_save_roundtrip test_quadsurface_save_roundtrip.cpp)
 target_link_libraries(test_quadsurface_save_roundtrip PRIVATE doctest::doctest vc_core)
 add_test(NAME test_quadsurface_save_roundtrip COMMAND test_quadsurface_save_roundtrip)

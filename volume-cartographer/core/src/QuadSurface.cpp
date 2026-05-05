@@ -450,8 +450,6 @@ void QuadSurface::ensureLoaded()
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
 
-    trimToValidBbox();
-
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
         _bbox = loaded->_bbox;
@@ -610,105 +608,6 @@ int QuadSurface::countValidQuads() const
     if (!_points) return 0;
     auto range = validQuads();
     return static_cast<int>(std::distance(range.begin(), range.end()));
-}
-
-bool QuadSurface::trimToValidBbox()
-{
-    if (!_points || _points->empty()) return false;
-    const int rows = _points->rows;
-    const int cols = _points->cols;
-    int r0 = rows, r1 = -1, c0 = cols, c1 = -1;
-    for (int r = 0; r < rows; r++) {
-        const cv::Vec3f* row = (*_points)[r];
-        int rc0 = cols, rc1 = -1;
-        for (int c = 0; c < cols; c++) {
-            if (row[c][0] != -1.f) {
-                if (c < rc0) rc0 = c;
-                rc1 = c;
-            }
-        }
-        if (rc1 >= 0) {
-            if (r < r0) r0 = r;
-            r1 = r;
-            if (rc0 < c0) c0 = rc0;
-            if (rc1 > c1) c1 = rc1;
-        }
-    }
-    if (r1 < 0 || c1 < 0) return false;
-    const int bbH = r1 - r0 + 1;
-    const int bbW = c1 - c0 + 1;
-    // Skip only if nothing to trim (bbox already matches grid exactly).
-    if (bbH == rows && bbW == cols) return false;
-
-    // Aggressive-trim guard. If on-disk x/y/z.tif somehow contain a tiny
-    // valid patch surrounded by (-1,-1,-1) cells (corruption on save, torn
-    // write, or upstream preview leaving the rest of the grid invalid),
-    // the naive crop would shrink the surface to just that patch and the
-    // next saveOverwrite would discard the rest of the mesh permanently.
-    // Refuse to trim when keep-fraction is below a threshold AND the
-    // original grid is larger than a size floor (tiny surfaces are exempt
-    // because aggressive trimming is normal there).
-    //
-    // Tunable via VC_TRIM_MIN_FRACTION env var (default 0.40); set to 0.0
-    // to disable the guard for a session.
-    {
-        static const double kTrimMinFraction = []() {
-            if (const char* env = std::getenv("VC_TRIM_MIN_FRACTION")) {
-                try {
-                    double v = std::stod(env);
-                    if (v >= 0.0 && v <= 1.0) return v;
-                } catch (...) {}
-            }
-            return 0.40;
-        }();
-        constexpr int kSizeFloor = 50 * 50;
-        const double keepFraction =
-            double(bbH) * double(bbW) / (double(rows) * double(cols));
-        const int origCells = rows * cols;
-        const std::string& tag = !path.empty() ? path.string() : id;
-        if (keepFraction < kTrimMinFraction && origCells > kSizeFloor) {
-            Logger()->warn(
-                "trimToValidBbox refused (surface={}): {}x{} -> {}x{} "
-                "keep={:.1f}% < threshold {:.1f}% "
-                "(set VC_TRIM_MIN_FRACTION=0.0 to override)",
-                tag, cols, rows, bbW, bbH,
-                keepFraction * 100.0, kTrimMinFraction * 100.0);
-            return false;
-        }
-        if (keepFraction < 0.25) {
-            // Telemetry: still allowed (size floor or env override), but
-            // surface this so we know if the upstream preview is producing
-            // sparse points.
-            Logger()->warn(
-                "trimToValidBbox aggressive (surface={}): {}x{} -> {}x{} "
-                "keep={:.1f}%",
-                tag, cols, rows, bbW, bbH, keepFraction * 100.0);
-        }
-    }
-
-    const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
-    const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
-    const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
-    auto trimmed = std::make_unique<cv::Mat_<cv::Vec3f>>(
-        (*_points)(cv::Rect(c0, r0, bbW, bbH)).clone());
-    _points = std::move(trimmed);
-    // Shift center: after cropping by (c0, r0), the new grid index 0
-    // corresponds to the old index (c0, r0), so we must subtract.
-    _center[0] -= float(c0) / _scale[0];
-    _center[1] -= float(r0) / _scale[1];
-    _bounds = {0, 0, bbW - 1, bbH - 1};
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};  // World bbox cached, needs recompute.
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
-    if (DebugLoggingEnabled()) {
-        std::fprintf(stderr,
-            "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
-            id.c_str(), cols, rows, bbW, bbH,
-            (origBytes - trimBytes) / (1024 * 1024),
-            pctSaved * 100.0);
-    }
-    return true;
 }
 
 void QuadSurface::unloadPoints()
@@ -1341,10 +1240,6 @@ void QuadSurface::invalidateMask()
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
 {
-    // Trim padding before serializing so the on-disk grid matches the in-RAM
-    // one. No-op if already trimmed or saving would save <25%.
-    trimToValidBbox();
-
     // Split the points matrix into x, y, z channels
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);

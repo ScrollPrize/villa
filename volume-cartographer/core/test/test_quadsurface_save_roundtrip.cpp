@@ -1,18 +1,17 @@
 // Round-trip + recovery tests for QuadSurface::saveOverwrite().
 //
-// Pre-fix scenario the annotator hit: a tall-skinny segment came back
-// containing only the small Shift-E hole-fill patches because the
-// in-memory points had (-1,-1,-1) outside the patch when save ran;
-// load + trim then cropped to the patch and the next save wrote that
-// crop as the entire segment, permanently losing the rest.
+// QuadSurface does not auto-trim on load or save. A surface with a
+// sparse valid region surrounded by (-1,-1,-1) cells round-trips
+// at its original grid size; cropping to the valid bbox is only
+// done when the user explicitly invokes vc_tifxyz_trim.
 //
-// Defenses verified here:
-//  1) M2 aggressive-trim guard: a sparse on-disk surface still loads
-//     at original size and saveOverwrite preserves it.
-//  2) M3 saveSnapshot before saveOverwrite: the rotating backup at
-//     <volpkg>/backups/<seg>/0/ contains the prior state.
-//  3) M3 atomic TIFF writes (already provided by save's directory
-//     swap on Linux): a stray .tmp file does not break reload.
+// Verified here:
+//  1) Size is preserved across save+load cycles for a sparse-but-
+//     large surface.
+//  2) saveSnapshot before saveOverwrite: the rotating backup at
+//     <volpkg>/backups/<seg>/0/ contains the prior on-disk state.
+//  3) Atomic TIFF writes (provided by save's directory swap on
+//     Linux): a stray .tmp file does not break reload.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -78,10 +77,8 @@ TEST_CASE("saveOverwrite round-trip preserves sparse-but-large surface")
 {
     TmpVolpkg pkg("roundtrip_sparse");
 
-    // 200x200 with a 30x30 patch. keepFraction = 900/40000 = 2.25% which
-    // is well under the M2 guard threshold (40%). With the guard the
-    // load-side trim refuses to crop, so the on-disk x/y/z.tif stay
-    // 200x200 across save+load cycles.
+    // 200x200 with a 30x30 patch. With auto-trim removed, the
+    // on-disk x/y/z.tif stay 200x200 across save+load cycles.
     cv::Mat_<cv::Vec3f> pts = makeSparseGrid(200, 200, 30, 30);
 
     // First save creates the segment dir.
@@ -97,7 +94,6 @@ TEST_CASE("saveOverwrite round-trip preserves sparse-but-large surface")
         QuadSurface loaded(pkg.segDir);
         loaded.ensureLoaded();
         REQUIRE(loaded.rawPointsPtr() != nullptr);
-        // M2 guard kept the size at 200x200.
         CHECK(loaded.rawPointsPtr()->size() == cv::Size(200, 200));
         loaded.saveOverwrite();
     }
