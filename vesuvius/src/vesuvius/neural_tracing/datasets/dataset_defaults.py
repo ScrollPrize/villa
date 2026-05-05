@@ -9,6 +9,7 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("dilation_radius", 1)  # voxels
     config.setdefault("cond_percent", [0.1, 0.5])
     config.setdefault("use_dense_displacement", True)
+    config.setdefault("use_flow_refinement_targets", False)
     config.setdefault("supervise_conditioning", False)
     config.setdefault("cond_supervision_weight", 0.1)
     config.setdefault("force_recompute_patches", False)
@@ -151,6 +152,7 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     use_dense_displacement = bool(config.get("use_dense_displacement", False))
     use_triplet_wrap_displacement = bool(config.get("use_triplet_wrap_displacement", False))
+    use_flow_refinement_targets = bool(config.get("use_flow_refinement_targets", False))
 
     if not use_triplet_wrap_displacement and not use_dense_displacement:
         raise ValueError(
@@ -162,6 +164,10 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
         raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
 
     if use_triplet_wrap_displacement:
+        if use_flow_refinement_targets:
+            raise ValueError(
+                "use_flow_refinement_targets=True is currently supported only for regular single-wrap dense mode"
+            )
         if not use_dense_displacement:
             raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
         if config.get("use_other_wrap_cond", False):

@@ -1167,17 +1167,32 @@ class EdtSegDataset(Dataset):
         masked_seg: torch.Tensor,
     ):
         full_dense_surface = torch.maximum(masked_seg, cond_seg_gt)
-        dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
-            full_dense_surface.detach().cpu().numpy()
-        )
+        use_flow_refinement_targets = bool(self.config.get("use_flow_refinement_targets", False))
+        if use_flow_refinement_targets:
+            dense_disp_np, dense_weight_np, dense_dist_np = self._compute_dense_displacement_field(
+                full_dense_surface.detach().cpu().numpy(),
+                return_distances=True,
+            )
+        else:
+            dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
+                full_dense_surface.detach().cpu().numpy()
+            )
+            dense_dist_np = None
         if dense_disp_np is None:
             return None
         dense_gt_disp = torch.from_numpy(dense_disp_np).to(torch.float32)
         dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
-        return {
+        result = {
             "dense_gt_displacement": dense_gt_disp,  # (3, D, H, W)
             "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
         }
+        if use_flow_refinement_targets:
+            disp_norm_np = np.linalg.norm(dense_disp_np, axis=0, keepdims=True)
+            flow_dir_np = dense_disp_np / np.maximum(disp_norm_np, 1e-6)
+            flow_dist_np = dense_dist_np[None].astype(np.float32, copy=False)
+            result["flow_dir"] = torch.from_numpy(flow_dir_np).to(torch.float32)
+            result["flow_dist"] = torch.from_numpy(flow_dist_np).to(torch.float32)
+        return result
 
     def _format_triplet_target_unavailable_reason(self):
         reason = "triplet target payload unavailable"

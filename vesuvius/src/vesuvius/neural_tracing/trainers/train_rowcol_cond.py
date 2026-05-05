@@ -14,6 +14,7 @@ import copy
 import random
 import accelerate
 import numpy as np
+import torch.nn.functional as F
 from tqdm import tqdm
 import time
 
@@ -120,6 +121,10 @@ def collate_with_padding(batch):
         result['dense_gt_displacement'] = torch.stack([b['dense_gt_displacement'] for b in batch])
         if 'dense_loss_weight' in batch[0]:
             result['dense_loss_weight'] = torch.stack([b['dense_loss_weight'] for b in batch])
+    if 'flow_dir' in batch[0]:
+        result['flow_dir'] = torch.stack([b['flow_dir'] for b in batch])
+    if 'flow_dist' in batch[0]:
+        result['flow_dist'] = torch.stack([b['flow_dist'] for b in batch])
     if 'dir_priors' in batch[0]:
         result['dir_priors'] = torch.stack([b['dir_priors'] for b in batch])
     if 'triplet_channel_order' in batch[0]:
@@ -172,6 +177,8 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=Fals
 
     dense_gt_displacement = batch.get('dense_gt_displacement', None)  # [B, C, D, H, W]
     dense_loss_weight = batch.get('dense_loss_weight', None)  # [B, 1, D, H, W]
+    flow_dir_target = batch.get('flow_dir', None)  # [B, C, D, H, W]
+    flow_dist_target = batch.get('flow_dist', None)  # [B, C//3, D, H, W]
 
     sdt_target = batch['sdt'].unsqueeze(1) if use_sdt and 'sdt' in batch else None  # [B, 1, D, H, W]
     heatmap_target = batch['heatmap_target'].unsqueeze(1) if use_heatmap and 'heatmap_target' in batch else None  # [B, 1, D, H, W]
@@ -191,6 +198,8 @@ def prepare_batch(batch, use_sdt=False, use_heatmap=False, use_segmentation=Fals
         point_normals,
         dense_gt_displacement,
         dense_loss_weight,
+        flow_dir_target,
+        flow_dist_target,
         sdt_target,
         heatmap_target,
         seg_target,
@@ -260,6 +269,10 @@ def train(config_path):
     config.setdefault('lambda_cond_disp', 0.0)
     config.setdefault('triplet_min_disp_vox', 1.0)
     config.setdefault('lambda_triplet_min_disp', 0.0)
+    config.setdefault('use_flow_refinement_targets', False)
+    config.setdefault('lambda_flow_dir', 0.1)
+    config.setdefault('lambda_flow_dist', 0.1)
+    config.setdefault('flow_dist_huber_beta', config.get('displacement_huber_beta', 5.0))
     config.setdefault('displacement_supervision', 'vector')  # 'vector' or 'normal_scalar'
     config.setdefault('displacement_loss_type', 'vector_l2')
     config.setdefault('displacement_huber_beta', 5.0)
@@ -288,6 +301,10 @@ def train(config_path):
     targets = {
         'displacement': {'out_channels': displacement_out_channels, 'activation': 'none'}
     }
+    use_flow_refinement_targets = bool(config.get('use_flow_refinement_targets', False))
+    if use_flow_refinement_targets:
+        targets['flow_dir'] = {'out_channels': displacement_out_channels, 'activation': 'none'}
+        targets['flow_dist'] = {'out_channels': displacement_out_channels // 3, 'activation': 'none'}
     use_sdt = config.get('use_sdt', False)
     if use_sdt:
         targets['sdt'] = {'out_channels': 1, 'activation': 'none'}
@@ -375,6 +392,8 @@ def train(config_path):
     lambda_cond_disp = config.get('lambda_cond_disp', 0.0)
     triplet_min_disp_vox = float(config.get('triplet_min_disp_vox', 1.0))
     lambda_triplet_min_disp = float(config.get('lambda_triplet_min_disp', 0.0))
+    lambda_flow_dir = float(config.get('lambda_flow_dir', 0.0))
+    lambda_flow_dist = float(config.get('lambda_flow_dist', 0.0))
     lambda_smooth = config.get('lambda_smooth', 0.0)
     if config.get('supervise_conditioning', False) and lambda_cond_disp > 0.0:
         raise ValueError(
@@ -390,6 +409,8 @@ def train(config_path):
         raise ValueError(f"triplet_min_disp_vox must be >= 0, got {triplet_min_disp_vox}")
     if lambda_triplet_min_disp > 0.0 and not triplet_mode:
         raise ValueError("lambda_triplet_min_disp > 0 requires use_triplet_wrap_displacement=True")
+    if use_flow_refinement_targets and triplet_mode:
+        raise ValueError("use_flow_refinement_targets=True is currently supported only for regular single-wrap dense mode")
     disp_supervision = str(config.get('displacement_supervision', 'vector')).lower()
     if not use_dense_displacement:
         raise ValueError(
@@ -399,6 +420,7 @@ def train(config_path):
         raise ValueError("displacement_supervision='normal_scalar' is not supported in dense-only rowcol_cond training")
     disp_loss_type = config.get('displacement_loss_type', 'vector_l2')
     disp_huber_beta = config.get('displacement_huber_beta', 5.0)
+    flow_dist_huber_beta = float(config.get('flow_dist_huber_beta', disp_huber_beta))
     normal_loss_type = str(config.get('normal_loss_type', 'normal_huber')).lower()
     normal_loss_beta = float(config.get('normal_loss_beta', disp_huber_beta))
     if normal_loss_type in {'huber', 'l2', 'l1'}:
@@ -475,6 +497,31 @@ def train(config_path):
             disp_pred, extrap_coords, gt_displacement, valid_mask,
             loss_type=disp_loss_type, beta=disp_huber_beta, sample_weights=point_weights
         )
+
+    def compute_flow_refinement_loss(flow_dir_pred, flow_dist_pred, flow_dir_target, flow_dist_target, dense_loss_weight):
+        if flow_dir_target is None or flow_dist_target is None:
+            raise ValueError("Flow refinement targets are enabled but missing from the batch")
+        if dense_loss_weight is None:
+            dense_loss_weight = torch.ones_like(flow_dist_target[:, :1])
+
+        pred_dir = F.normalize(flow_dir_pred.float(), dim=1, eps=1e-6)
+        target_dir = F.normalize(flow_dir_target.float(), dim=1, eps=1e-6)
+        dir_diff = 1.0 - (pred_dir * target_dir).sum(dim=1, keepdim=True).clamp(min=-1.0, max=1.0)
+        dir_loss = (dir_diff * dense_loss_weight).sum() / dense_loss_weight.sum().clamp(min=1.0)
+
+        dist_pred = flow_dist_pred.float()
+        dist_target = flow_dist_target.float()
+        dist_weight = dense_loss_weight
+        if dist_weight.shape[1] != dist_pred.shape[1]:
+            dist_weight = dist_weight.expand(-1, dist_pred.shape[1], -1, -1, -1)
+        dist_diff = F.smooth_l1_loss(
+            dist_pred,
+            dist_target,
+            beta=flow_dist_huber_beta,
+            reduction='none',
+        )
+        dist_loss = (dist_diff * dist_weight).sum() / dist_weight.sum().clamp(min=1.0)
+        return dir_loss, dist_loss
 
     def make_generator(offset=0):
         gen = torch.Generator()
@@ -695,6 +742,8 @@ def train(config_path):
         else:
             accelerator.print(f"Displacement supervision: {disp_supervision} ({disp_loss_type}, beta={disp_huber_beta})")
         output_str = f"Output: displacement ({displacement_out_channels}ch)"
+        if use_flow_refinement_targets:
+            output_str += f" + flow_dir ({displacement_out_channels}ch) + flow_dist ({displacement_out_channels // 3}ch)"
         if use_sdt:
             output_str += " + SDT (1ch)"
         if use_heatmap:
@@ -713,6 +762,11 @@ def train(config_path):
         if lambda_triplet_min_disp > 0.0:
             accelerator.print(
                 f"Lambda triplet min disp: {lambda_triplet_min_disp} (min={triplet_min_disp_vox} vx)"
+            )
+        if use_flow_refinement_targets:
+            accelerator.print(
+                f"Flow refinement losses: lambda_dir={lambda_flow_dir}, "
+                f"lambda_dist={lambda_flow_dist}, dist_beta={flow_dist_huber_beta}"
             )
         if triplet_mode:
             accelerator.print(
@@ -770,7 +824,7 @@ def train(config_path):
         if config['verbose']:
             print(f"got batch, keys: {batch.keys()}")
 
-        inputs, extrap_coords, gt_displacement, valid_mask, point_weights, point_normals, dense_gt_displacement, dense_loss_weight, sdt_target, heatmap_target, seg_target, seg_skel = prepare_batch(
+        inputs, extrap_coords, gt_displacement, valid_mask, point_weights, point_normals, dense_gt_displacement, dense_loss_weight, flow_dir_target, flow_dist_target, sdt_target, heatmap_target, seg_target, seg_skel = prepare_batch(
             batch, use_sdt, use_heatmap, use_segmentation
         )
 
@@ -795,6 +849,20 @@ def train(config_path):
             total_loss = surf_loss
 
             wandb_log['surf_loss'] = surf_loss.detach().item()
+
+            if use_flow_refinement_targets and (lambda_flow_dir > 0.0 or lambda_flow_dist > 0.0):
+                flow_dir_loss, flow_dist_loss = compute_flow_refinement_loss(
+                    output['flow_dir'],
+                    output['flow_dist'],
+                    flow_dir_target,
+                    flow_dist_target,
+                    dense_loss_weight,
+                )
+                weighted_flow_dir_loss = lambda_flow_dir * flow_dir_loss
+                weighted_flow_dist_loss = lambda_flow_dist * flow_dist_loss
+                total_loss = total_loss + weighted_flow_dir_loss + weighted_flow_dist_loss
+                wandb_log['flow_dir_loss'] = weighted_flow_dir_loss.detach().item()
+                wandb_log['flow_dist_loss'] = weighted_flow_dist_loss.detach().item()
 
             # Smoothness loss on displacement field
             if lambda_smooth > 0:
@@ -899,6 +967,10 @@ def train(config_path):
             postfix['hm'] = f"{wandb_log['heatmap_loss']:.4f}"
         if use_segmentation:
             postfix['seg'] = f"{wandb_log['seg_loss']:.4f}"
+        if use_flow_refinement_targets and lambda_flow_dir > 0.0:
+            postfix['flow_dir'] = f"{wandb_log['flow_dir_loss']:.4f}"
+        if use_flow_refinement_targets and lambda_flow_dist > 0.0:
+            postfix['flow_dist'] = f"{wandb_log['flow_dist_loss']:.4f}"
         if lambda_cond_disp > 0.0:
             postfix['cond'] = f"{wandb_log['cond_disp_loss']:.4f}"
         if lambda_triplet_min_disp > 0.0:
@@ -933,6 +1005,10 @@ def train(config_path):
                     val_metric_sums['val_cond_disp_loss'] = 0.0
                 if lambda_triplet_min_disp > 0.0:
                     val_metric_sums['val_triplet_min_disp_loss'] = 0.0
+                if use_flow_refinement_targets and lambda_flow_dir > 0.0:
+                    val_metric_sums['val_flow_dir_loss'] = 0.0
+                if use_flow_refinement_targets and lambda_flow_dist > 0.0:
+                    val_metric_sums['val_flow_dist_loss'] = 0.0
 
                 first_val_vis = None
                 for val_batch_idx in range(val_batches_per_log):
@@ -942,7 +1018,7 @@ def train(config_path):
                         val_iterator = iter(val_dataloader)
                         val_batch = next(val_iterator)
 
-                    val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_point_weights, val_point_normals, val_dense_gt_displacement, val_dense_loss_weight, val_sdt_target, val_heatmap_target, val_seg_target, val_seg_skel = prepare_batch(
+                    val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_point_weights, val_point_normals, val_dense_gt_displacement, val_dense_loss_weight, val_flow_dir_target, val_flow_dist_target, val_sdt_target, val_heatmap_target, val_seg_target, val_seg_skel = prepare_batch(
                         val_batch, use_sdt, use_heatmap, use_segmentation
                     )
 
@@ -964,6 +1040,22 @@ def train(config_path):
                     val_metric_sums['val_surf_loss'] += val_surf_loss.item()
 
                     val_sdt_pred = None
+                    if use_flow_refinement_targets and (lambda_flow_dir > 0.0 or lambda_flow_dist > 0.0):
+                        val_flow_dir_loss, val_flow_dist_loss = compute_flow_refinement_loss(
+                            val_output['flow_dir'],
+                            val_output['flow_dist'],
+                            val_flow_dir_target,
+                            val_flow_dist_target,
+                            val_dense_loss_weight,
+                        )
+                        val_weighted_flow_dir_loss = lambda_flow_dir * val_flow_dir_loss
+                        val_weighted_flow_dist_loss = lambda_flow_dist * val_flow_dist_loss
+                        val_total_loss = val_total_loss + val_weighted_flow_dir_loss + val_weighted_flow_dist_loss
+                        if lambda_flow_dir > 0.0:
+                            val_metric_sums['val_flow_dir_loss'] += val_weighted_flow_dir_loss.item()
+                        if lambda_flow_dist > 0.0:
+                            val_metric_sums['val_flow_dist_loss'] += val_weighted_flow_dist_loss.item()
+
                     if lambda_smooth > 0:
                         val_smooth_loss = smoothness_loss(val_disp_pred)
                         val_weighted_smooth_loss = lambda_smooth * val_smooth_loss
@@ -1114,7 +1206,7 @@ def train(config_path):
                         val_pert_iterator = iter(val_pert_dataloader)
                         val_pert_batch = next(val_pert_iterator)
 
-                    val_pert_inputs, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask, val_pert_point_weights, val_pert_point_normals, val_pert_dense_gt_displacement, val_pert_dense_loss_weight, val_pert_sdt_target, val_pert_heatmap_target, val_pert_seg_target, val_pert_seg_skel = prepare_batch(
+                    val_pert_inputs, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask, val_pert_point_weights, val_pert_point_normals, val_pert_dense_gt_displacement, val_pert_dense_loss_weight, val_pert_flow_dir_target, val_pert_flow_dist_target, val_pert_sdt_target, val_pert_heatmap_target, val_pert_seg_target, val_pert_seg_skel = prepare_batch(
                         val_pert_batch, use_sdt, use_heatmap, use_segmentation
                     )
 
@@ -1136,6 +1228,26 @@ def train(config_path):
                     wandb_log['val_pert_surf_loss'] = val_pert_surf_loss.item()
 
                     val_pert_sdt_pred = None
+                    if use_flow_refinement_targets and (lambda_flow_dir > 0.0 or lambda_flow_dist > 0.0):
+                        val_pert_flow_dir_loss, val_pert_flow_dist_loss = compute_flow_refinement_loss(
+                            val_pert_output['flow_dir'],
+                            val_pert_output['flow_dist'],
+                            val_pert_flow_dir_target,
+                            val_pert_flow_dist_target,
+                            val_pert_dense_loss_weight,
+                        )
+                        val_pert_weighted_flow_dir_loss = lambda_flow_dir * val_pert_flow_dir_loss
+                        val_pert_weighted_flow_dist_loss = lambda_flow_dist * val_pert_flow_dist_loss
+                        val_pert_total_loss = (
+                            val_pert_total_loss +
+                            val_pert_weighted_flow_dir_loss +
+                            val_pert_weighted_flow_dist_loss
+                        )
+                        if lambda_flow_dir > 0.0:
+                            wandb_log['val_pert_flow_dir_loss'] = val_pert_weighted_flow_dir_loss.item()
+                        if lambda_flow_dist > 0.0:
+                            wandb_log['val_pert_flow_dist_loss'] = val_pert_weighted_flow_dist_loss.item()
+
                     if lambda_smooth > 0:
                         val_pert_smooth_loss = smoothness_loss(val_pert_disp_pred)
                         val_pert_weighted_smooth_loss = lambda_smooth * val_pert_smooth_loss
