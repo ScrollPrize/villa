@@ -370,6 +370,22 @@ static utils::ZarrArray::Codec codecFromConfig(const CompressorConfig& cfg)
     return codec;
 }
 
+utils::ZarrArray::CodecRegistry buildZarrCodecRegistry(int dtypeSize)
+{
+    utils::ZarrArray::CodecRegistry reg;
+    for (const char* name : {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d"}) {
+        CompressorConfig cfg;
+        if      (std::string(name) == "blosc") cfg.id = CompressorId::Blosc;
+        else if (std::string(name) == "zstd")  cfg.id = CompressorId::Zstd;
+        else if (std::string(name) == "lz4")   cfg.id = CompressorId::Lz4;
+        else if (std::string(name) == "c3d")   cfg.id = CompressorId::C3d;
+        else                                   cfg.id = CompressorId::Gzip;
+        cfg.blosc_typesize = dtypeSize;
+        reg[name] = codecFromConfig(cfg);
+    }
+    return reg;
+}
+
 // ============================================================================
 // VcDataset::Impl
 // ============================================================================
@@ -423,7 +439,7 @@ struct VcDataset::Impl {
         // cache would rebuild the HTTP source from the local cache metadata.
         if (std::filesystem::exists(path / ".zarray")) {
             auto meta = utils::detail::parse_zarray(readTextFile(path / ".zarray"));
-            auto registry = buildCodecRegistry(/*dtypeSize guess*/1);
+            auto registry = buildZarrCodecRegistry(/*dtypeSize guess*/1);
             utils::ZarrArray::Codec codec;
             if (!meta.compressor_id.empty()) {
                 auto it = registry.find(meta.compressor_id);

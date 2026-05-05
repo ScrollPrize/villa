@@ -11,11 +11,9 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/cache/BlockCache.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/ui/VCCollection.hpp"
-#include "SurfaceLRU.hpp"
 
 struct POI
 {
@@ -23,6 +21,7 @@ struct POI
     std::string surfaceId;  // ID of the source surface (for lookup, not ownership)
     cv::Vec3f n = {0,0,0};
     bool suppressViewerRecenter = false;
+    bool suppressTransientPlaneIntersections = false;
 };
 
 class CState : public QObject
@@ -62,9 +61,6 @@ public:
 
     // --- Teardown ---
     void closeAll();
-
-    // --- Surface LRU (point-grid eviction) ---
-    SurfaceLRU& surfaceLRU() { return _surfaceLRU; }
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
@@ -106,12 +102,8 @@ private:
     VCCollection* _pointCollection;
 
     size_t _cacheSizeBytes;
-    std::unique_ptr<vc::cache::BlockCache> _blockCache;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, std::unique_ptr<POI>> _pois;
-
-    // See SurfaceLRU default — 4 resident × ~170 MiB/surface cap.
-    SurfaceLRU _surfaceLRU{4};
 };

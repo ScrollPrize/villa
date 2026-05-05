@@ -273,16 +273,8 @@ void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
     }
     cv::normalize(normal, normal);
 
-    auto [w, h, d] = volume->shape();
-    const auto& db = volume->dataBounds();
-    cv::Vec3f volumeCenter;
-    if (db.valid) {
-        volumeCenter = cv::Vec3f((db.minX + db.maxX) * 0.5f,
-                                  (db.minY + db.maxY) * 0.5f,
-                                  (db.minZ + db.maxZ) * 0.5f);
-    } else {
-        volumeCenter = cv::Vec3f(w * 0.5f, h * 0.5f, d * 0.5f);
-    }
+    auto [w, h, d] = volume->shapeXyz();
+    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
     cv::Vec3f toCenter = volumeCenter - p;
     toCenter[2] = 0.0f;
 
@@ -387,12 +379,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         return result;
     }
     ensureNormalsInward(context.resumeSurface, context.volume);
-
-    vc::VcDataset* dataset = context.volume->zarrDataset(0);
-    if (!dataset) {
-        result.error = QStringLiteral("Unable to access primary volume dataset");
-        return result;
-    }
 
     if (!context.cacheRoot.isEmpty()) {
         std::error_code ec;
@@ -533,9 +519,8 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             qCInfo(lcSegGrowth) << "  regular tracer OpenMP threads forced to 1";
         }
 
-        QuadSurface* surface = tracer(dataset,
+        QuadSurface* surface = tracer(*context.volume,
                                       1.0f,
-                                      context.volume->tieredCache(),
                                       context.level,
                                       origin,
                                       params,

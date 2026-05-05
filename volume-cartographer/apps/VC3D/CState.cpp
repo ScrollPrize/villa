@@ -48,17 +48,6 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
-    if (_currentVolume) {
-        auto* oldPipeline = _currentVolume->tieredCache();
-        if (oldPipeline) {
-            oldPipeline->shutdown();
-            oldPipeline->clearMemory();
-        }
-        _currentVolume->resetTieredCache();
-    }
-    if (_blockCache) {
-        _blockCache->clear();
-    }
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
@@ -105,24 +94,6 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
-
-        // Apply disk-cache compression setting
-        {
-            using namespace vc3d::settings;
-            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-            vol->setDiskCacheCompressed(
-                settings.value(perf::DISK_CACHE_COMPRESSED,
-                               perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
-        }
-
-        if (!_blockCache) {
-            vc::cache::BlockCache::Config bcfg;
-            bcfg.bytes = _cacheSizeBytes;
-            for (auto& f : bcfg.levelFloor) f = 4096;
-            const_cast<CState*>(this)->_blockCache =
-                std::make_unique<vc::cache::BlockCache>(bcfg);
-        }
-        vol->setBlockCache(_blockCache.get());
     }
 }
 
@@ -178,6 +149,10 @@ void CState::closeAll()
 void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend, bool isEditUpdate)
 {
     auto it = _surfs.find(name);
+    const bool sameSurface = it != _surfs.end() && it->second == surf;
+    if (sameSurface && !isEditUpdate && surf != nullptr) {
+        return;
+    }
     if (it != _surfs.end() && it->second && it->second != surf) {
         emit surfaceWillBeDeleted(name, it->second);
     }
@@ -251,11 +226,13 @@ void CState::setPOI(const std::string& name, POI* poi)
         // Same pointer re-submitted (caller mutated in place) - just signal
         emit poiChanged(name, poi);
         poi->suppressViewerRecenter = false;
+        poi->suppressTransientPlaneIntersections = false;
         return;
     }
     _pois[name] = std::unique_ptr<POI>(poi);
     emit poiChanged(name, poi);
     poi->suppressViewerRecenter = false;
+    poi->suppressTransientPlaneIntersections = false;
 }
 
 POI* CState::poi(const std::string& name)

@@ -7,8 +7,6 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QTextStream>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QMessageBox>
 #include <QClipboard>
 #include <QApplication>
@@ -68,11 +66,6 @@ CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mai
     , _scale(1.0f)
     , _resolution(0)
     , _layers(31)
-    , _seed_x(0)
-    , _seed_y(0)
-    , _seed_z(0)
-    , _parallelProcesses(8)
-    , _iterationCount(1000)
     , _logFile(nullptr)
     , _logStream(nullptr)
 {
@@ -114,6 +107,22 @@ void CommandLineToolRunner::setVolumePath(const QString& path)
     _explicitVolumePath = !_volumePath.isEmpty();
 }
 
+void CommandLineToolRunner::setRemoteVolumeUrl(const QString& url)
+{
+    _remoteVolumeUrl = url.trimmed();
+}
+
+void CommandLineToolRunner::setRemoteVolumeAuth(const QString& accessKey,
+                                                const QString& secretKey,
+                                                const QString& sessionToken,
+                                                const QString& region)
+{
+    _remoteAccessKey = accessKey;
+    _remoteSecretKey = secretKey;
+    _remoteSessionToken = sessionToken;
+    _remoteRegion = region;
+}
+
 void CommandLineToolRunner::setSegmentPath(const QString& path)
 {
     _segmentPath = path;
@@ -131,43 +140,6 @@ void CommandLineToolRunner::setRenderParams(float scale, int resolution, int lay
     _layers = layers;
 }
 
-void CommandLineToolRunner::setGrowParams(QString volumePath, QString tgtDir, QString jsonParams, int seed_x, int seed_y, int seed_z, bool useExpandMode, bool useRandomSeed)
-{
-    setVolumePath(volumePath);
-    _tgtDir = tgtDir;
-    _jsonParams = jsonParams;
-    _seed_x = seed_x;
-    _seed_y = seed_y;
-    _seed_z = seed_z;
-    _useExpandMode = useExpandMode;
-    _useRandomSeed = useRandomSeed;
-
-    QFile file(_jsonParams);
-    if (file.open(QIODevice::ReadOnly)) {
-        QByteArray jsonData = file.readAll();
-        file.close();
-
-        QJsonDocument doc = QJsonDocument::fromJson(jsonData);
-        QJsonObject jsonObj = doc.object();
-
-        if (useExpandMode) {
-            jsonObj["mode"] = "expansion";
-        } else if (useRandomSeed) {
-            jsonObj["mode"] = "random_seed";
-        } else {
-            jsonObj["mode"] = "explicit_seed";
-        }
-
-        doc.setObject(jsonObj);
-        jsonData = doc.toJson();
-
-        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            file.write(jsonData);
-            file.close();
-        }
-    }
-}
-
 void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
 {
     setVolumePath(volumePath);
@@ -175,12 +147,6 @@ void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, Q
     _tgtDir = tgtDir;
     _jsonParams = jsonParams;
     _srcSegment = srcSegment;
-}
-
-void CommandLineToolRunner::setAddOverlapParams(QString tgtDir, QString tifxyzPath)
-{
-    _tgtDir = tgtDir;
-    _tifxyzPath = tifxyzPath;
 }
 
 void CommandLineToolRunner::setToObjParams(QString tifxyzPath, QString objPath)
@@ -373,6 +339,27 @@ bool CommandLineToolRunner::execute(Tool tool)
                 _logStream->flush();
             }
         }
+        if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
+            env.insert("AWS_ACCESS_KEY_ID", _remoteAccessKey);
+            env.insert("AWS_SECRET_ACCESS_KEY", _remoteSecretKey);
+            if (!_remoteSessionToken.isEmpty()) {
+                env.insert("AWS_SESSION_TOKEN", _remoteSessionToken);
+            }
+            if (!_remoteRegion.isEmpty()) {
+                env.insert("AWS_DEFAULT_REGION", _remoteRegion);
+            }
+            if (_logStream) {
+                *_logStream << "ENV: AWS_ACCESS_KEY_ID=<set>" << Qt::endl;
+                *_logStream << "ENV: AWS_SECRET_ACCESS_KEY=<set>" << Qt::endl;
+                if (!_remoteSessionToken.isEmpty()) {
+                    *_logStream << "ENV: AWS_SESSION_TOKEN=<set>" << Qt::endl;
+                }
+                if (!_remoteRegion.isEmpty()) {
+                    *_logStream << "ENV: AWS_DEFAULT_REGION=" << _remoteRegion << Qt::endl;
+                }
+                _logStream->flush();
+            }
+        }
         _process->setProcessEnvironment(env);
     }
 
@@ -386,50 +373,24 @@ bool CommandLineToolRunner::execute(Tool tool)
                                                        : _customLabel)
                               : QFileInfo(toolCommand).baseName();
 
-    if (tool == Tool::GrowSegFromSeeds) {
-        // vc_grow_seg_from_seeds needs to use xargs for parallell processes
-        startMessage = tr("Starting %1 with %2 parallel processes for: %3")
-                          .arg(toolLabel)
-                          .arg(_parallelProcesses)
-                          .arg(QFileInfo(_segmentPath).fileName());
+    startMessage = isCustom ? tr("Starting %1").arg(toolLabel)
+                           : tr("Starting %1 for: %2")
+                                 .arg(toolLabel)
+                                 .arg(QFileInfo(_segmentPath).fileName());
+    emit toolStarted(_currentTool, startMessage);
 
-        QString baseCmd = QString("%1 %2").arg(toolCommand).arg(args.join(" "));
-        QString shellCmd = QString("time seq 1 %1 | xargs -i -P %2 bash -c 'nice ionice %3 || true'")
-                              .arg(_iterationCount)
-                              .arg(_parallelProcesses)
-                              .arg(baseCmd.replace("'", "\\'"));
-
-        emit toolStarted(_currentTool, startMessage);
-
-        _consoleOutput->setTitle(tr("Running: %1 (with xargs)").arg(toolLabel));
-
-        if (_autoShowConsole) {
-            showConsoleOutput();
-        }
-
-        _process->setProgram("/bin/bash");
-        _process->setArguments(QStringList() << "-c" << shellCmd);
-        _process->start();
-    } else {
-        startMessage = isCustom ? tr("Starting %1").arg(toolLabel)
-                               : tr("Starting %1 for: %2")
-                                     .arg(toolLabel)
-                                     .arg(QFileInfo(_segmentPath).fileName());
-        emit toolStarted(_currentTool, startMessage);
-
-        _consoleOutput->setTitle(tr("Running: %1").arg(toolLabel));
-        _consoleOutput->appendOutput(tr("Command: %1\n").arg(formattedCommand));
-        if (_logStream) {
-            *_logStream << "Command: " << formattedCommand << Qt::endl;
-            _logStream->flush();
-        }
-
-        if (_autoShowConsole) {
-            showConsoleOutput();
-        }
-
-        _process->start(toolCommand, args);
+    _consoleOutput->setTitle(tr("Running: %1").arg(toolLabel));
+    _consoleOutput->appendOutput(tr("Command: %1\n").arg(formattedCommand));
+    if (_logStream) {
+        *_logStream << "Command: " << formattedCommand << Qt::endl;
+        _logStream->flush();
     }
+
+    if (_autoShowConsole) {
+        showConsoleOutput();
+    }
+
+    _process->start(toolCommand, args);
 
     return true;
 }
@@ -480,16 +441,6 @@ void CommandLineToolRunner::setAutoShowConsoleOutput(bool autoShow)
 void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
 {
     _preserveConsoleOutput = preserve;
-}
-
-void CommandLineToolRunner::setParallelProcesses(int count)
-{
-    _parallelProcesses = count;
-}
-
-void CommandLineToolRunner::setIterationCount(int count)
-{
-    _iterationCount = count;
 }
 
 void CommandLineToolRunner::onProcessReadyRead()
@@ -622,6 +573,9 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
+            if (!_remoteVolumeUrl.isEmpty()) {
+                args << "--remote-url" << _remoteVolumeUrl;
+            }
             // Advanced / optional args
             if (_cropWidth > 0 && _cropHeight > 0) {
                 args << "--crop-x" << QString::number(_cropX)
@@ -660,23 +614,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << _srcSegment;
             break;
 
-
-        case Tool::GrowSegFromSeeds:
-            args << _volumePath
-                 << _tgtDir
-                 << _jsonParams;
-            // Only add coordinates if not in expand mode and not using random seeding
-            if (!_useExpandMode && !_useRandomSeed) {
-                args << QString::number(_seed_x)
-                     << QString::number(_seed_y)
-                     << QString::number(_seed_z);
-            }
-            break;
-
-        case Tool::SegAddOverlap:
-            args << _tgtDir
-                 << _tifxyzPath;
-            break;
 
         case Tool::tifxyz2obj:
             args << _tifxyzPath
@@ -723,12 +660,6 @@ QString CommandLineToolRunner::toolName(Tool tool) const
 
         case Tool::GrowSegFromSegment:
             return basePath + "vc_grow_seg_from_segments";
-
-        case Tool::GrowSegFromSeeds:
-            return basePath + "vc_grow_seg_from_seed";
-
-        case Tool::SegAddOverlap:
-            return basePath + "vc_seg_add_overlap";
 
         case Tool::tifxyz2obj:
             return basePath + "vc_tifxyz2obj";

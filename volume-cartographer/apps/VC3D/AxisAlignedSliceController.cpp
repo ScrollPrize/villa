@@ -1,9 +1,10 @@
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "ViewerManager.hpp"
+#include "volume_viewers/VolumeViewerBase.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
-#include "CVolumeViewerView.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -23,7 +24,7 @@ constexpr float kAxisRotationDegreesPerScenePixel = 0.25f;
 constexpr float kMaxTiltDegrees = 45.0f;
 constexpr float kEpsilon = 1e-6f;
 constexpr float kDegToRad = static_cast<float>(CV_PI / 180.0);
-constexpr int kRotationApplyDelayMs = 25;
+constexpr int kRotationApplyDelayMs = 120;
 
 cv::Vec3f rotateAroundZ(const cv::Vec3f& v, float radians)
 {
@@ -141,7 +142,7 @@ void AxisAlignedSliceController::resetAll()
     cancelOrientationTimer();
 }
 
-void AxisAlignedSliceController::onTiltHandleChanged(CTiledVolumeViewer* viewer, QPointF tilt)
+void AxisAlignedSliceController::onTiltHandleChanged(VolumeViewerBase* viewer, QPointF tilt)
 {
     if (!_enabled || !viewer) {
         return;
@@ -162,6 +163,7 @@ void AxisAlignedSliceController::onTiltHandleChanged(CTiledVolumeViewer* viewer,
         return;
     }
 
+    _pendingOrientationMotionPx = std::max(_pendingOrientationMotionPx, 96.0);
     scheduleOrientationUpdate();
     updateTiltHandles();
 }
@@ -171,7 +173,7 @@ void AxisAlignedSliceController::onTiltHandleReset()
     resetTilt();
 }
 
-void AxisAlignedSliceController::onMousePress(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers)
+void AxisAlignedSliceController::onMousePress(VolumeViewerBase* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers)
 {
     if (!_enabled || button != Qt::MiddleButton || !viewer) {
         return;
@@ -188,7 +190,7 @@ void AxisAlignedSliceController::onMousePress(CTiledVolumeViewer* viewer, const 
     state.startRotationDegrees = currentRotationDegrees(surfaceName);
 }
 
-void AxisAlignedSliceController::onMouseMove(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers)
+void AxisAlignedSliceController::onMouseMove(VolumeViewerBase* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers)
 {
     if (!_enabled || !viewer || !(buttons & Qt::MiddleButton)) {
         return;
@@ -210,15 +212,16 @@ void AxisAlignedSliceController::onMouseMove(CTiledVolumeViewer* viewer, const c
     const float candidate = normalizeDegrees(state.startRotationDegrees - dragPixels * kAxisRotationDegreesPerScenePixel);
     const float currentRotation = currentRotationDegrees(surfaceName);
 
-    if (std::abs(candidate - currentRotation) < 0.01f) {
+    if (std::abs(candidate - currentRotation) < 0.5f) {
         return;
     }
 
     setRotationDegrees(surfaceName, candidate);
+    _pendingOrientationMotionPx = std::max(_pendingOrientationMotionPx, std::abs(double(dragPixels)));
     scheduleOrientationUpdate();
 }
 
-void AxisAlignedSliceController::onMouseRelease(CTiledVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers)
+void AxisAlignedSliceController::onMouseRelease(VolumeViewerBase* viewer, Qt::MouseButton button, Qt::KeyboardModifiers)
 {
     if (button != Qt::MiddleButton) {
         return;
@@ -312,7 +315,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             }
         }
 
-        _state->setSurface(planeName, planeShared);
+        _state->setSurface(planeName, planeShared, false, true);
         return planeShared;
     };
 
@@ -362,8 +365,8 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         segXZShared->setInPlaneRotation(0.0f);
         segYZShared->setInPlaneRotation(0.0f);
 
-        _state->setSurface("seg xz", segXZShared);
-        _state->setSurface("seg yz", segYZShared);
+        _state->setSurface("seg xz", segXZShared, false, true);
+        _state->setSurface("seg yz", segYZShared, false, true);
     }
 
     if (_planeSlicingOverlay) {
@@ -422,8 +425,11 @@ void AxisAlignedSliceController::flushOrientationUpdate()
     if (!_orientationDirty) {
         return;
     }
+    const double motionPx = _pendingOrientationMotionPx;
     cancelOrientationTimer();
     applyOrientation();
+    notifyInteractiveOrientationViewers(motionPx);
+    _pendingOrientationMotionPx = 0.0;
 }
 
 void AxisAlignedSliceController::processOrientationUpdate()
@@ -431,8 +437,11 @@ void AxisAlignedSliceController::processOrientationUpdate()
     if (!_orientationDirty) {
         return;
     }
+    const double motionPx = _pendingOrientationMotionPx;
     _orientationDirty = false;
+    _pendingOrientationMotionPx = 0.0;
     applyOrientation();
+    notifyInteractiveOrientationViewers(motionPx);
 }
 
 void AxisAlignedSliceController::cancelOrientationTimer()
@@ -443,21 +452,42 @@ void AxisAlignedSliceController::cancelOrientationTimer()
     _orientationDirty = false;
 }
 
+void AxisAlignedSliceController::notifyInteractiveOrientationViewers(double motionPx)
+{
+    if (!_viewerManager) {
+        return;
+    }
+
+    const double clampedMotionPx = std::max(0.0, motionPx);
+    _viewerManager->forEachBaseViewer([clampedMotionPx](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        const std::string name = viewer->surfName();
+        if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
+            if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
+                chunkedViewer->notifyInteractiveViewChange(clampedMotionPx);
+            }
+        }
+    });
+}
+
 void AxisAlignedSliceController::updateSliceInteraction()
 {
     if (!_viewerManager) {
         return;
     }
 
-    _viewerManager->forEachViewer([this](CTiledVolumeViewer* viewer) {
-        if (!viewer || !viewer->fGraphicsView) {
+    _viewerManager->forEachBaseViewer([this](VolumeViewerBase* viewer) {
+        auto* graphicsView = viewer ? viewer->graphicsView() : nullptr;
+        if (!viewer || !graphicsView) {
             return;
         }
         const std::string& name = viewer->surfName();
         if (name == "seg xz" || name == "seg yz") {
-            viewer->fGraphicsView->setMiddleButtonPanEnabled(!_enabled);
+            graphicsView->setMiddleButtonPanEnabled(!_enabled);
             qCDebug(lcAxisSlices2) << "Middle-button pan set" << QString::fromStdString(name)
-                                   << "enabled" << viewer->fGraphicsView->middleButtonPanEnabled();
+                                   << "enabled" << graphicsView->middleButtonPanEnabled();
         }
     });
     updateTiltHandles();
@@ -469,21 +499,22 @@ void AxisAlignedSliceController::updateTiltHandles()
         return;
     }
 
-    _viewerManager->forEachViewer([this](CTiledVolumeViewer* viewer) {
-        if (!viewer || !viewer->fGraphicsView) {
+    _viewerManager->forEachBaseViewer([this](VolumeViewerBase* viewer) {
+        auto* graphicsView = viewer ? viewer->graphicsView() : nullptr;
+        if (!viewer || !graphicsView) {
             return;
         }
 
-        if (!viewer->fGraphicsView->property("vc_tilt_handle_bound").toBool()) {
-            connect(viewer->fGraphicsView, &CVolumeViewerView::sendTiltHandleChanged,
+        if (!graphicsView->property("vc_tilt_handle_bound").toBool()) {
+            connect(graphicsView, &CVolumeViewerView::sendTiltHandleChanged,
                     this, [this, viewer](QPointF tilt) {
                         onTiltHandleChanged(viewer, tilt);
                     });
-            connect(viewer->fGraphicsView, &CVolumeViewerView::sendTiltHandleReset,
+            connect(graphicsView, &CVolumeViewerView::sendTiltHandleReset,
                     this, [this]() {
                         onTiltHandleReset();
                     });
-            viewer->fGraphicsView->setProperty("vc_tilt_handle_bound", true);
+            graphicsView->setProperty("vc_tilt_handle_bound", true);
         }
 
         const std::string& name = viewer->surfName();
@@ -498,6 +529,6 @@ void AxisAlignedSliceController::updateTiltHandles()
             mode = CVolumeViewerView::TiltHandleMode::SemiCircleY;
             value = QPointF(0.0, _segYZTilt);
         }
-        viewer->fGraphicsView->setTiltHandle(mode, value);
+        graphicsView->setTiltHandle(mode, value);
     });
 }

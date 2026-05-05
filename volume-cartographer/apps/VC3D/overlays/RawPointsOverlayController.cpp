@@ -1,11 +1,12 @@
 #include "RawPointsOverlayController.hpp"
 
 #include "../CState.hpp"
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
-#include "../VolumeViewerBase.hpp"
+#include "../ViewerManager.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -174,22 +175,29 @@ std::optional<std::pair<int, int>> RawPointsOverlayController::focusGridPosition
         return std::nullopt;
     }
 
-    // Convert world position to grid position using pointTo
-    cv::Vec3f ptr(0, 0, 0);
-    float dist = surface->pointTo(ptr, focusPoi->p, 10.0f, 100);
-    if (dist > 5.0f) {
+    auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
+    if (!patchIndex || patchIndex->empty()) {
         return std::nullopt;
     }
 
-    // ptr is now in pointer space (relative to surface center)
-    // Convert to grid indices
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = focusPoi->p;
+    query.tolerance = 10.0f;
+    query.surfaces.only = SurfacePatchIndex::SurfacePtr(surface, [](QuadSurface*) {});
+
+    const auto hit = patchIndex->locate(query);
+    if (!hit || hit->distance > 5.0f) {
+        return std::nullopt;
+    }
+
     const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
     if (!points || points->empty()) {
         return std::nullopt;
     }
 
-    int col = static_cast<int>(std::round(ptr[0] + points->cols / 2.0f));
-    int row = static_cast<int>(std::round(ptr[1] + points->rows / 2.0f));
+    const cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
+    int col = static_cast<int>(std::round(grid[0]));
+    int row = static_cast<int>(std::round(grid[1]));
 
     if (row < 0 || row >= points->rows || col < 0 || col >= points->cols) {
         return std::nullopt;

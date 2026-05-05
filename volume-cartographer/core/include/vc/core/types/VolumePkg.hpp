@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +12,6 @@
 #include <vector>
 
 #include "utils/Json.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 
@@ -29,12 +27,6 @@ enum class Category { Volumes, Segments, NormalGrids };
 struct LoadOptions {
     std::filesystem::path remoteCacheRoot;
     bool failOnRemoteError = false;
-};
-
-struct RemoteSegmentInfo {
-    std::string baseUrl;
-    std::filesystem::path cacheRoot;
-    vc::cache::HttpAuth auth;
 };
 
 bool isLocationRemote(const std::string& location);
@@ -55,6 +47,7 @@ public:
 
     static std::shared_ptr<VolumePkg> New(const std::filesystem::path& jsonFile);
 
+    static void setLoadFirstSegmentationDirectory(const std::string& dirName);
     static void setAutosaveRoot(const std::filesystem::path& dir);
     static std::filesystem::path autosaveRoot();
     static std::filesystem::path autosaveFile();
@@ -102,10 +95,6 @@ public:
     [[nodiscard]] std::vector<std::filesystem::path> normalGridPaths() const;
     [[nodiscard]] std::vector<std::filesystem::path> normal3dZarrPaths() const;
 
-    [[nodiscard]] bool isRemoteSegment(const std::string& id) const;
-    [[nodiscard]] bool isRemoteSegmentCached(const std::string& id) const;
-    bool ensureRemoteSegmentDownloaded(const std::string& id);
-
     [[nodiscard]] std::vector<std::string> volumeTags(const std::string& volumeId) const;
     [[nodiscard]] std::vector<std::string> segmentationTags(const std::string& segmentId) const;
 
@@ -120,6 +109,10 @@ public:
     [[nodiscard]] bool isRemote() const;
 
     void setSegmentsChangedCallback(std::function<void()> cb);
+
+    [[nodiscard]] bool hasRemoteCacheRoot() const;
+    [[nodiscard]] std::string remoteCacheRootOrEmpty() const;
+    void setRemoteCacheRoot(const std::filesystem::path& dir);
 
     [[nodiscard]] std::string getVolpkgDirectory() const;
     [[nodiscard]] std::string getSegmentationDirectory() const;
@@ -139,6 +132,7 @@ private:
     std::string name_ = "Untitled";
     int version_ = 1;
     vc::project::LoadOptions opts_;
+    std::filesystem::path remoteCacheRoot_;
 
     std::vector<vc::project::Entry> volumes_;
     std::vector<vc::project::Entry> segments_;
@@ -150,24 +144,22 @@ private:
     std::map<std::string, std::shared_ptr<Segmentation>> loadedSegmentations_;
     std::map<std::string, std::vector<std::string>> segmentationTagsByID_;
     std::vector<std::filesystem::path> resolvedNormalGridPaths_;
-    std::map<std::string, vc::project::RemoteSegmentInfo> remoteSegmentInfo_;
 
     void resolveAll();
     void resolveVolumeEntry(const vc::project::Entry& e);
-    void resolveSegmentsEntry(const vc::project::Entry& e, std::uint64_t generation);
+    void resolveSegmentsEntry(const vc::project::Entry& e);
     void resolveNormalGridEntry(const vc::project::Entry& e);
-    void loadRemoteSegmentsAsync(vc::project::Entry e, std::uint64_t generation);
     void notifySegmentsChanged();
 
+    void persistProjectState();
     void writeJsonTo(const std::filesystem::path& target) const;
     void readJsonFrom(const std::filesystem::path& source);
     [[nodiscard]] utils::Json toJson() const;
     void fromJson(const utils::Json& j);
 
     static std::filesystem::path autosaveRoot_;
+    static std::optional<std::string> loadFirstSegmentationDir_;
 
     mutable std::mutex segmentsMutex_;
     std::function<void()> segmentsChangedCb_;
-    std::atomic<std::uint64_t> loadGeneration_{0};
-    std::atomic<bool> shuttingDown_{false};
 };

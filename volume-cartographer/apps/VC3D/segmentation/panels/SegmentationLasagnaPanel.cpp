@@ -1,8 +1,13 @@
 #include "SegmentationLasagnaPanel.hpp"
 
+#include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/ui/VCCollection.hpp"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -25,12 +30,19 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStatusBar>
+#include <QStringList>
 #include <QToolButton>
 #include <QVBoxLayout>
 
 #include "utils/Json.hpp"
 
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 
 SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     const QString& settingsGroup, QWidget* parent)
@@ -751,6 +763,321 @@ void SegmentationLasagnaPanel::triggerOptimization()
     }
 
     emit lasagnaOptimizeRequested();
+}
+
+void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* statusBar)
+{
+    auto showStatus = [statusBar](const QString& msg, int timeout) {
+        if (statusBar) {
+            statusBar->showMessage(msg, timeout);
+        }
+    };
+
+    auto& mgr = LasagnaServiceManager::instance();
+    const bool isNewModel = (lasagnaMode() == LasagnaMode::NewModel);
+
+    if (mgr.isExternal()) {
+        if (!mgr.isRunning()) {
+            auto msg = tr("External service not connected. Select a service or check host/port.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return;
+        }
+    } else {
+        if (!mgr.ensureServiceRunning()) {
+            auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return;
+        }
+    }
+
+    std::filesystem::path segPath;
+    if (state) {
+        auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
+        if (activeSurface && !activeSurface->path.empty()) {
+            segPath = activeSurface->path;
+        }
+    }
+
+    const bool isOffsetMode = (lasagnaMode() == LasagnaMode::Offset);
+
+    QString modelPath;
+    if (!isNewModel && !isOffsetMode) {
+        if (!segPath.empty()) {
+            auto modelFile = segPath / "model.pt";
+            if (std::filesystem::exists(modelFile)) {
+                try {
+                    modelPath = QString::fromStdString(std::filesystem::canonical(modelFile).string());
+                } catch (const std::filesystem::filesystem_error&) {
+                }
+            }
+        }
+        if (modelPath.isEmpty()) {
+            auto msg = tr("No model.pt found in segment directory. Cannot run lasagna.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return;
+        }
+    }
+
+    QString dataInput = lasagnaDataInputPath();
+    if (dataInput.isEmpty()) {
+        auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
+        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+        showStatus(msg, 5000);
+        return;
+    }
+
+    QString outputDir;
+    if (!segPath.empty()) {
+        outputDir = QString::fromStdString(segPath.parent_path().string());
+    } else if (state && state->vpkg()) {
+        auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
+        auto segDir = vpkgRoot / state->vpkg()->getSegmentationDirectory();
+        outputDir = QString::fromStdString(segDir.string());
+    }
+
+    const std::string tifxyzSuffix = ".tifxyz";
+    std::string rootName = "new_model";
+    QString outputName;
+    {
+        if (isNewModel) {
+            QString nmName = newModelOutputName();
+            if (!nmName.isEmpty()) {
+                rootName = nmName.toStdString();
+            }
+        } else if (!segPath.empty()) {
+            auto segName = segPath.filename().string();
+            std::string baseName = segName;
+            if (baseName.size() > tifxyzSuffix.size() &&
+                baseName.compare(baseName.size() - tifxyzSuffix.size(),
+                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
+            }
+            rootName = baseName;
+            if (rootName.size() > 5) {
+                auto pos = rootName.rfind("_v");
+                if (pos != std::string::npos && pos + 2 < rootName.size()) {
+                    bool allDigits = true;
+                    for (size_t i = pos + 2; i < rootName.size(); ++i) {
+                        if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
+                            allDigits = false;
+                            break;
+                        }
+                    }
+                    if (allDigits) {
+                        rootName = rootName.substr(0, pos);
+                    }
+                }
+            }
+            auto pos = rootName.find("_off");
+            if (pos != std::string::npos) {
+                rootName = rootName.substr(0, pos);
+            }
+        }
+
+        int maxVersion = 0;
+        if (!outputDir.isEmpty()) {
+            std::error_code ec;
+            for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec)) {
+                auto name = entry.path().filename().string();
+                std::string prefix = rootName + "_v";
+                if (name.size() > prefix.size() + tifxyzSuffix.size() &&
+                    name.compare(0, prefix.size(), prefix) == 0 &&
+                    name.compare(name.size() - tifxyzSuffix.size(),
+                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                    auto numStr = name.substr(prefix.size(),
+                        name.size() - prefix.size() - tifxyzSuffix.size());
+                    bool allDigits = true;
+                    for (auto c : numStr) {
+                        if (!std::isdigit(static_cast<unsigned char>(c))) {
+                            allDigits = false;
+                        }
+                    }
+                    if (allDigits && !numStr.empty()) {
+                        int v = std::stoi(numStr);
+                        if (v > maxVersion) {
+                            maxVersion = v;
+                        }
+                    }
+                }
+            }
+        }
+        char numBuf[16];
+        std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
+        outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
+    }
+
+    QJsonObject config;
+    QString configText = lasagnaConfigText().trimmed();
+    if (!configText.isEmpty()) {
+        QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
+        if (doc.isObject()) {
+            config = doc.object();
+        }
+    }
+
+    if (isNewModel) {
+        int nmW = newModelWidth();
+        int nmH = newModelHeight();
+        int nmN = newModelWindings();
+
+        int cx = 0;
+        int cy = 0;
+        int cz = 0;
+        QString seedText = seedPointText();
+        bool seedOk = false;
+        if (!seedText.isEmpty()) {
+            QStringList parts = seedText.split(',');
+            if (parts.size() == 3) {
+                bool ok0 = false;
+                bool ok1 = false;
+                bool ok2 = false;
+                cx = parts[0].trimmed().toInt(&ok0);
+                cy = parts[1].trimmed().toInt(&ok1);
+                cz = parts[2].trimmed().toInt(&ok2);
+                seedOk = ok0 && ok1 && ok2;
+            }
+        }
+        if (!seedOk) {
+            POI* focus = state ? state->poi("focus") : nullptr;
+            if (!focus) {
+                auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                showStatus(msg, 5000);
+                return;
+            }
+            cx = static_cast<int>(focus->p[0]);
+            cy = static_cast<int>(focus->p[1]);
+            cz = static_cast<int>(focus->p[2]);
+        }
+
+        QJsonObject args = config[QStringLiteral("args")].toObject();
+        args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
+        args[QStringLiteral("model-w")] = nmW;
+        args[QStringLiteral("model-h")] = nmH;
+        args[QStringLiteral("windings")] = nmN;
+        config[QStringLiteral("args")] = args;
+
+        std::cerr << "[lasagna] new model: seed=(" << cx << "," << cy
+                  << "," << cz << ") w=" << nmW << " h=" << nmH
+                  << " windings=" << nmN << std::endl;
+    }
+
+    if (isOffsetMode && !segPath.empty()) {
+        double offsetVal = offsetValue();
+        int size = windowSize();
+        int overlap = windowOverlap();
+
+        QJsonObject args = config[QStringLiteral("args")].toObject();
+        args[QStringLiteral("windings")] = 1;
+        if (size > 0) {
+            args[QStringLiteral("window-size")] = size;
+            args[QStringLiteral("window-overlap")] = overlap;
+        }
+        config[QStringLiteral("args")] = args;
+        config[QStringLiteral("offset_value")] = offsetVal;
+
+        if (size > 0 && !outputDir.isEmpty()) {
+            int offIdx = 1;
+            std::error_code ec2;
+            for (bool collision = true; collision; ++offIdx) {
+                collision = false;
+                std::string offPrefix = rootName + "_off" + std::to_string(offIdx) + "_w";
+                for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec2)) {
+                    auto name = entry.path().filename().string();
+                    if (name.size() > offPrefix.size() + tifxyzSuffix.size() &&
+                        name.compare(0, offPrefix.size(), offPrefix) == 0 &&
+                        name.compare(name.size() - tifxyzSuffix.size(),
+                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                        collision = true;
+                        break;
+                    }
+                }
+            }
+            outputName = QString::fromStdString(rootName + "_off" + std::to_string(offIdx - 1));
+        }
+
+        std::cerr << "[lasagna] offset mode: offset=" << offsetVal
+                  << " window_size=" << size
+                  << " window_overlap=" << overlap
+                  << " outputName=" << outputName.toStdString() << std::endl;
+    }
+
+    if (state && state->pointCollection()) {
+        const auto& cols = state->pointCollection()->getAllCollections();
+        if (!cols.empty()) {
+            utils::Json corrJson;
+            utils::Json colsJson = utils::Json::object();
+            for (const auto& [cid, col] : cols) {
+                utils::Json colJson;
+                to_json(colJson, col);
+                colsJson[std::to_string(cid)] = colJson;
+            }
+            corrJson["collections"] = colsJson;
+            QJsonDocument corrDoc = QJsonDocument::fromJson(
+                QByteArray::fromStdString(corrJson.dump()));
+            if (corrDoc.isObject()) {
+                config[QStringLiteral("corr_points")] = corrDoc.object();
+                std::cerr << "[lasagna] injected " << cols.size()
+                          << " point collection(s) as corr_points" << std::endl;
+            }
+        }
+    }
+
+    if (state && state->currentVolume()) {
+        try {
+            double vs = state->currentVolume()->voxelSize();
+            if (std::isfinite(vs) && vs > 0.0) {
+                config[QStringLiteral("voxel_size_um")] = vs;
+            }
+        } catch (...) {
+        }
+    }
+
+    QJsonObject request;
+    request[QStringLiteral("data_input")] = dataInput;
+    request[QStringLiteral("single_segment")] = true;
+    request[QStringLiteral("copy_model")] = true;
+    if (!outputName.isEmpty()) {
+        request[QStringLiteral("output_name")] = outputName;
+    }
+    request[QStringLiteral("config")] = config;
+
+    if (isOffsetMode && !segPath.empty()) {
+        QJsonObject tifxyzData;
+        for (const auto* fname : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
+            auto filePath = segPath / fname;
+            if (!std::filesystem::exists(filePath)) {
+                continue;
+            }
+            QFile f(QString::fromStdString(filePath.string()));
+            if (f.open(QIODevice::ReadOnly)) {
+                tifxyzData[QString::fromLatin1(fname)] =
+                    QString::fromLatin1(f.readAll().toBase64());
+            }
+        }
+        request[QStringLiteral("tifxyz_data")] = tifxyzData;
+    } else if (!isNewModel) {
+        QFile modelFile(modelPath);
+        if (!modelFile.open(QIODevice::ReadOnly)) {
+            auto msg = tr("Cannot read model file: %1").arg(modelPath);
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return;
+        }
+        QByteArray modelBytes = modelFile.readAll();
+        modelFile.close();
+        request[QStringLiteral("model_data")] = QString::fromLatin1(modelBytes.toBase64());
+    }
+
+    mgr.startOptimization(request, outputDir);
+    showStatus(
+        tr("Lasagna optimization started (%1). Output: %2")
+            .arg(isNewModel ? tr("new model") : tr("re-optimize"))
+            .arg(outputName),
+        3000);
 }
 
 // ---------------------------------------------------------------------------

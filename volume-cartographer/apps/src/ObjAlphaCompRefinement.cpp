@@ -1,7 +1,7 @@
 #include "utils/Json.hpp"
 
 
-#include "vc/core/types/VcDataset.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
@@ -10,8 +10,6 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
 
@@ -131,7 +129,7 @@ bool istype(const std::string &line, const std::string &type)
 
 
 struct DSReader {
-    vc::cache::BlockPipeline* cache;
+    Volume* volume;
     float scale;
     int level;
     std::mutex read_mutex;
@@ -151,16 +149,16 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
     PlaneSurface plane(point, normal);
     plane.gen(&coords, nullptr, size, cv::Vec3f(0,0,0), reader.scale, {0,0,0});
 
-    coords *= reader.scale;
     float s = copysignf(1.0,step);
 
     for(double off=start;off*s<=stop*s;off+=step) {
         cv::Mat_<uint8_t> slice;
-        //I hate opencv
-        cv::Mat_<cv::Vec3f> offmat(size, normal*off*reader.scale);
+        cv::Mat_<cv::Vec3f> offmat(size, normal*off);
         {
             std::lock_guard<std::mutex> lock(reader.read_mutex);
-            readInterpolated3D(slice, reader.cache, reader.level, coords+offmat);
+            vc::SampleParams sp;
+            sp.level = reader.level;
+            reader.volume->sample(slice, coords+offmat, sp);
         }
 
         cv::Mat floatslice;
@@ -259,7 +257,9 @@ int process_obj(const std::string& src,
     if (vertexcolor) {
         std::lock_guard<std::mutex> lock(reader.read_mutex);
         cv::Mat_<cv::Vec3f> vs_mat(static_cast<int>(vs.size()), 1, vs.data());
-        readInterpolated3D(slice, reader.cache, reader.level, vs_mat*reader.scale);
+        vc::SampleParams sp;
+        sp.level = reader.level;
+        reader.volume->sample(slice, vs_mat, sp);
     }
 
     obj.clear();
@@ -398,14 +398,20 @@ int main(int argc, char *argv[])
     const utils::Json params = utils::Json::parse_file(params_path);
     const RefinementConfig cfg = parse_config(params);
 
-    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / cfg.dataset_group);
+    const int level = std::stoi(cfg.dataset_group);
+    Volume volume(vol_path);
+    volume.setCacheBudget(cfg.cache_bytes);
+    auto* chunk_cache = volume.chunkedCache();
 
-    std::cout << "zarr dataset size for scale group " << cfg.dataset_group << " " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
+    const auto shape = chunk_cache->shape(level);
+    const auto chunk_shape = chunk_cache->chunkShape(level);
+    std::cout << "zarr dataset size for scale group " << cfg.dataset_group
+              << " [" << shape[0] << ", " << shape[1] << ", " << shape[2] << "]" << std::endl;
+    std::cout << "chunk shape shape "
+              << "[" << chunk_shape[0] << ", " << chunk_shape[1] << ", " << chunk_shape[2] << "]" << std::endl;
     std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
-    auto chunk_cache = vc::cache::openFilesystemPipeline(ds.get(), cfg.cache_bytes, ds->path());
 
-    DSReader reader = {chunk_cache.get(), cfg.reader_scale, 0};
+    DSReader reader = {&volume, cfg.reader_scale, level};
 
     MeasureLife timer("processing surface ...\n");
 

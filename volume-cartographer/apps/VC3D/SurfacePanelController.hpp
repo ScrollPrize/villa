@@ -7,7 +7,6 @@
 
 #include <functional>
 #include <memory>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -16,10 +15,7 @@ class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
 class VolumePkg;
-class CAdaptiveVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
+class CChunkedVolumeViewer;
 class VCCollection;
 class QTreeWidget;
 class QCheckBox;
@@ -50,7 +46,6 @@ public:
         QPushButton* pointSetNone{nullptr};
         QComboBox* pointSetMode{nullptr};
         QCheckBox* unreviewed{nullptr};
-        QCheckBox* revisit{nullptr};
         QCheckBox* noExpansion{nullptr};
         QCheckBox* noDefective{nullptr};
         QCheckBox* partialReview{nullptr};
@@ -64,7 +59,6 @@ public:
         QCheckBox* approved{nullptr};
         QCheckBox* defective{nullptr};
         QCheckBox* reviewed{nullptr};
-        QCheckBox* revisit{nullptr};
         QCheckBox* inspect{nullptr};
     };
 
@@ -72,14 +66,13 @@ public:
         Approved,
         Defective,
         Reviewed,
-        Revisit,
         Inspect,
     };
 
     SurfacePanelController(const UiRefs& ui,
                            CState* state,
                            ViewerManager* viewerManager,
-                           std::function<CTiledVolumeViewer*()> segmentationViewerProvider,
+                           std::function<CChunkedVolumeViewer*()> segmentationViewerProvider,
                            std::function<void()> filtersUpdated,
                            QObject* parent = nullptr);
 
@@ -90,12 +83,6 @@ public:
     void loadSurfaces(bool reload);
     void loadSurfacesIncremental();
     void refreshSurfaceList();
-    void loadRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
-    void loadRemoteStubs(
-        const std::vector<std::string>& segmentIds,
-        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces);
-    void replaceStubWithSurface(const std::string& segmentId, std::shared_ptr<Surface> surface);
-    bool isRemoteStub(const std::string& segmentId) const;
     void updateTreeItemIcon(SurfaceTreeWidgetItem* item);
     void refreshSurfaceMetrics(const std::string& surfaceId);
 
@@ -126,22 +113,16 @@ signals:
     void copySegmentPathRequested(const QString& segmentId);
     void renderSegmentRequested(const QString& segmentId);
     void growSegmentRequested(const QString& segmentId);
-    void addOverlapRequested(const QString& segmentId);
     void convertToObjRequested(const QString& segmentId);
     void visLasagnaObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
     void abfFlattenRequested(const QString& segmentId);
-    void awsUploadRequested(const QString& segmentId);
-    void growSeedsRequested(const QString& segmentId, bool isExpand, bool isRandomSeed);
-    void teleaInpaintRequested();
     void recalcAreaRequested(const QStringList& segmentIds);
     void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
-    void fetchRemoteChunksRequested(const QString& segmentId);
-    void remoteSegmentDownloadRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
     void renameSurfaceRequested(const QString& segmentId);
@@ -179,7 +160,6 @@ private:
     void setTagCheckboxEnabled(bool enabledApproved,
                                bool enabledDefective,
                                bool enabledReviewed,
-                               bool enabledRevisit,
                                bool enabledInspect);
     void logSurfaceLoadSummary() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
@@ -190,7 +170,7 @@ private:
     CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
     std::shared_ptr<VolumePkg> _volumePkg;
-    std::function<CTiledVolumeViewer*()> _segmentationViewerProvider;
+    std::function<CChunkedVolumeViewer*()> _segmentationViewerProvider;
     std::function<void()> _filtersUpdated;
     FilterUiRefs _filters;
     TagUiRefs _tags;
@@ -202,9 +182,4 @@ private:
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};
     std::unordered_set<std::string> _highlightedSurfaceIds;
-    // Segment IDs that are remote stubs (metadata-only, TIFFs not yet downloaded).
-    // Selecting one of these triggers an on-demand download.
-    std::unordered_set<std::string> _remoteStubSegments;
-    // Segment IDs currently being downloaded (avoid duplicate downloads).
-    std::unordered_set<std::string> _remoteDownloading;
 };

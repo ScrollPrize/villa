@@ -5,22 +5,22 @@
 
 #include <memory>
 #include <optional>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 #include <opencv2/core.hpp>
 #include <QFutureWatcher>
+#include <QString>
 
 class SegmentationEditManager;
 class SegmentationWidget;
 class SegmentationOverlayController;
 class CState;
 class SegmentationModule;
-class CAdaptiveVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
 class QuadSurface;
 class Volume;
+class VolumeViewerBase;
 class QTimer;
 
 class SegmentationPushPullTool : public SegmentationTool
@@ -61,6 +61,8 @@ public:
         bool perVertex{false};
         std::optional<cv::Vec3f> singleTarget;
         std::vector<cv::Vec3f> perVertexTargets;
+        std::string noMovementReason;
+        std::uint64_t generation{0};
     };
 
 private:
@@ -68,6 +70,8 @@ private:
     void ensureTimer();
     void launchAlphaCompute();
     void applyAlphaResult();
+    void refreshActiveViewer(VolumeViewerBase* viewer);
+    void setDeferredPlaneIntersections(VolumeViewerBase* activeViewer, bool defer);
 
     static std::optional<cv::Vec3f> computeAlphaTargetStatic(
         const cv::Vec3f& centerWorld,
@@ -77,7 +81,8 @@ private:
         const std::shared_ptr<Volume>& volume,
         int datasetIndex,
         float scale,
-        bool* outUnavailable);
+        bool* outUnavailable,
+        std::string* outNoTargetReason = nullptr);
 
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
@@ -92,12 +97,16 @@ private:
     };
 
     State _ppState;
+    VolumeViewerBase* _activeViewer{nullptr};
+    VolumeViewerBase* _deferredPlaneIntersectionActiveViewer{nullptr};
     QTimer* _timer{nullptr};
+    QTimer* _deferredPlaneIntersectionReleaseTimer{nullptr};
     float _stepMultiplier{4.0f};
     bool _activeAlphaEnabled{false};
     bool _alphaOverrideActive{false};
     AlphaPushPullConfig _alphaConfig{};
     bool _undoCaptured{false};
+    QString _lastAlphaStartFailure;
 
     // Cached state to avoid rebuilding samples every tick
     int _cachedRow{-1};
@@ -108,4 +117,6 @@ private:
     QFutureWatcher<AlphaResult> _alphaWatcher;
     bool _alphaComputeRunning{false};
     bool _alphaComputePending{false};
+    bool _stopAfterAlphaResult{false};
+    std::uint64_t _alphaGeneration{0};
 };

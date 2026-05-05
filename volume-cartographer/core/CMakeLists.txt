@@ -15,6 +15,7 @@ add_library(vc_core
         src/SparseChunkSpool.cpp
         src/Slicing.cpp
         src/Compositing.cpp
+        src/AffineTransform.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
@@ -22,25 +23,18 @@ add_library(vc_core
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
-        src/NetworkFilesystem.cpp
-        src/cache/VolumeSource.cpp
-        src/cache/HttpMetadataFetcher.cpp
-        src/cache/BlockCache.cpp
-        src/cache/ChunkData.cpp
-        src/cache/IOPool.cpp
-        src/cache/BlockPipeline.cpp
-        src/cache/TickCoordinator.cpp
-        src/cache/VcDecompressor.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
-        src/RemoteScroll.cpp
+        src/HttpFetch.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
-        src/render/AdaptiveCamera.cpp
+        src/render/ChunkCache.cpp
+        src/render/ChunkedPlaneSampler.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
+        src/render/ZarrChunkFetcher.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
@@ -157,8 +151,17 @@ endif()
 add_library(vc_flattening src/ABFFlattening.cpp)
 target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
 
-add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp src/NeuralTracerConnection.cpp src/ChunkedTensor.cpp)
-target_link_libraries(vc_tracer PUBLIC vc_core vc_ui Ceres::ceres Qt6::Core)
+add_library(vc_tracer
+    src/GrowPatch.cpp
+    src/GrowSurface.cpp
+    src/SurfTrackerData.cpp
+    src/NeuralTracerConnection.cpp
+    src/ChunkedTensor.cpp
+    src/growth_strategies/CandidateOrdering.cpp
+    src/growth_strategies/ComponentPruning.cpp
+    src/growth_strategies/GrowthConfig.cpp
+)
+target_link_libraries(vc_tracer PUBLIC vc_core vc_ui vc_flattening Ceres::ceres Qt6::Core)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 if(VC_USE_PCH)
     target_precompile_headers(vc_tracer REUSE_FROM vc_core)

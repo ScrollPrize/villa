@@ -1,7 +1,7 @@
 #include "ViewerOverlayControllerBase.hpp"
 
-#include "../VolumeViewerBase.hpp"
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
+#include "../volume_viewers/CVolumeViewerView.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../elements/COutlinedTextItem.hpp"
 
@@ -192,10 +192,33 @@ void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
                                                             qreal opacity,
                                                             qreal z)
 {
+    addImage(image, offset, scale, scale, opacity, z);
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
+                                                            const QPointF& offset,
+                                                            qreal scaleX,
+                                                            qreal scaleY,
+                                                            qreal opacity,
+                                                            qreal z)
+{
     ImagePrimitive prim;
     prim.image = image;
     prim.offset = offset;
-    prim.scale = scale;
+    prim.transform = QTransform::fromScale(scaleX, scaleY);
+    prim.opacity = opacity;
+    prim.z = z;
+    _primitives.emplace_back(std::move(prim));
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addImage(const QImage& image,
+                                                            const QTransform& transform,
+                                                            qreal opacity,
+                                                            qreal z)
+{
+    ImagePrimitive prim;
+    prim.image = image;
+    prim.transform = transform;
     prim.opacity = opacity;
     prim.z = z;
     _primitives.emplace_back(std::move(prim));
@@ -309,8 +332,8 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
         return;
     }
 
-    _managerCreatedConn = QObject::connect(_manager, &ViewerManager::viewerCreated,
-                                           this, [this](CTiledVolumeViewer* viewer) {
+    _managerCreatedConn = QObject::connect(_manager, &ViewerManager::baseViewerCreated,
+                                           this, [this](VolumeViewerBase* viewer) {
                                                attachViewer(viewer);
                                            });
 
@@ -320,7 +343,7 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
                                                  _manager = nullptr;
                                              });
 
-    _manager->forEachViewer([this](CTiledVolumeViewer* viewer) {
+    _manager->forEachBaseViewer([this](VolumeViewerBase* viewer) {
         attachViewer(viewer);
     });
 }
@@ -777,7 +800,7 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                     item->setOpacity(std::clamp(prim.opacity, 0.0, 1.0));
                     item->setZValue(prim.z);
                     item->setPos(prim.offset);
-                    item->setScale(prim.scale);
+                    item->setTransform(prim.transform);
 
                     scene->addItem(item);
                     items.push_back(item);

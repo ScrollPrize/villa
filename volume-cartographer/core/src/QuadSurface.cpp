@@ -12,6 +12,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <system_error>
@@ -118,6 +119,63 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     }
 
     return resampled;
+}
+
+cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
+    const cv::Mat_<cv::Vec3f>& points,
+    const cv::Mat& srcToDst,
+    const cv::Size& dstSize)
+{
+    cv::Mat_<cv::Vec3f> warped(dstSize.height, dstSize.width,
+                               cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    if (points.empty() || dstSize.width <= 0 || dstSize.height <= 0) {
+        return warped;
+    }
+
+    cv::Mat dstToSrc;
+    cv::invertAffineTransform(srcToDst, dstToSrc);
+
+    constexpr double kBoundsEpsilon = 1e-5;
+    for (int dstY = 0; dstY < dstSize.height; ++dstY) {
+        for (int dstX = 0; dstX < dstSize.width; ++dstX) {
+            double srcX = dstToSrc.at<double>(0, 0) * dstX
+                        + dstToSrc.at<double>(0, 1) * dstY
+                        + dstToSrc.at<double>(0, 2);
+            double srcY = dstToSrc.at<double>(1, 0) * dstX
+                        + dstToSrc.at<double>(1, 1) * dstY
+                        + dstToSrc.at<double>(1, 2);
+
+            if (srcX < -kBoundsEpsilon || srcY < -kBoundsEpsilon
+                || srcX > static_cast<double>(points.cols - 1) + kBoundsEpsilon
+                || srcY > static_cast<double>(points.rows - 1) + kBoundsEpsilon) {
+                continue;
+            }
+
+            srcX = std::clamp(srcX, 0.0, static_cast<double>(points.cols - 1));
+            srcY = std::clamp(srcY, 0.0, static_cast<double>(points.rows - 1));
+            const int x0 = static_cast<int>(std::floor(srcX));
+            const int y0 = static_cast<int>(std::floor(srcY));
+            const int x1 = std::min(x0 + 1, points.cols - 1);
+            const int y1 = std::min(y0 + 1, points.rows - 1);
+            const float fx = static_cast<float>(srcX - static_cast<double>(x0));
+            const float fy = static_cast<float>(srcY - static_cast<double>(y0));
+
+            const cv::Vec3f& p00 = points(y0, x0);
+            const cv::Vec3f& p01 = points(y0, x1);
+            const cv::Vec3f& p10 = points(y1, x0);
+            const cv::Vec3f& p11 = points(y1, x1);
+            if (!isValidPointSample(p00) || !isValidPointSample(p01)
+                || !isValidPointSample(p10) || !isValidPointSample(p11)) {
+                continue;
+            }
+
+            const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
+            const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
+            warped(dstY, dstX) = top * (1.0f - fy) + bottom * fy;
+        }
+    }
+
+    return warped;
 }
 
 } // namespace
@@ -392,8 +450,6 @@ void QuadSurface::ensureLoaded()
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
 
-    trimToValidBbox();
-
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
         _bbox = loaded->_bbox;
@@ -552,58 +608,6 @@ int QuadSurface::countValidQuads() const
     if (!_points) return 0;
     auto range = validQuads();
     return static_cast<int>(std::distance(range.begin(), range.end()));
-}
-
-bool QuadSurface::trimToValidBbox()
-{
-    if (!_points || _points->empty()) return false;
-    const int rows = _points->rows;
-    const int cols = _points->cols;
-    int r0 = rows, r1 = -1, c0 = cols, c1 = -1;
-    for (int r = 0; r < rows; r++) {
-        const cv::Vec3f* row = (*_points)[r];
-        int rc0 = cols, rc1 = -1;
-        for (int c = 0; c < cols; c++) {
-            if (row[c][0] != -1.f) {
-                if (c < rc0) rc0 = c;
-                rc1 = c;
-            }
-        }
-        if (rc1 >= 0) {
-            if (r < r0) r0 = r;
-            r1 = r;
-            if (rc0 < c0) c0 = rc0;
-            if (rc1 > c1) c1 = rc1;
-        }
-    }
-    if (r1 < 0 || c1 < 0) return false;
-    const int bbH = r1 - r0 + 1;
-    const int bbW = c1 - c0 + 1;
-    // Skip only if nothing to trim (bbox already matches grid exactly).
-    if (bbH == rows && bbW == cols) return false;
-    const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
-    const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
-    const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
-    auto trimmed = std::make_unique<cv::Mat_<cv::Vec3f>>(
-        (*_points)(cv::Rect(c0, r0, bbW, bbH)).clone());
-    _points = std::move(trimmed);
-    // Shift center: after cropping by (c0, r0), the new grid index 0
-    // corresponds to the old index (c0, r0), so we must subtract.
-    _center[0] -= float(c0) / _scale[0];
-    _center[1] -= float(r0) / _scale[1];
-    _bounds = {0, 0, bbW - 1, bbH - 1};
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};  // World bbox cached, needs recompute.
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
-    if (DebugLoggingEnabled()) {
-        std::fprintf(stderr,
-            "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
-            id.c_str(), cols, rows, bbW, bbH,
-            (origBytes - trimBytes) / (1024 * 1024),
-            pctSaved * 100.0);
-    }
-    return true;
 }
 
 void QuadSurface::unloadPoints()
@@ -924,12 +928,6 @@ static inline cv::Vec2f mul(const cv::Vec2f &a, const cv::Vec2f &b)
     return{a[0]*b[0],a[1]*b[1]};
 }
 
-// Gauss-Newton was tried here (2026-04) with full regression coverage
-// (vc_coord_regression against synthetic + three real tifxyz segments).
-// Result: neutral on performance, no reliable accuracy gain. The 8-neighbour
-// halving below is well-tuned for scroll-surface topology (folds, twists,
-// noise) where Newton's linear-regime assumption doesn't hold. See
-// vc_coord_regression for the harness if you want to try again.
 template <typename E>
 static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f &out, cv::Vec3f tgt, cv::Vec2f init_step, float min_step_x)
 {
@@ -1098,7 +1096,11 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     // Try accelerated search using spatial indices
     if (surfaceIndex && !surfaceIndex->empty()) {
         SurfacePatchIndex::SurfacePtr targetSurface(this, [](QuadSurface*) {});
-        if (auto hit = surfaceIndex->locate(tgt, th, targetSurface)) {
+        SurfacePatchIndex::PointQuery query;
+        query.worldPoint = tgt;
+        query.tolerance = th;
+        query.surfaces.only = targetSurface;
+        if (auto hit = surfaceIndex->locate(query)) {
             ptr = hit->ptr;
             return hit->distance;
         }
@@ -1204,6 +1206,18 @@ void QuadSurface::saveOverwrite()
         throw std::runtime_error("QuadSurface::saveOverwrite() requires a non-empty uuid");
     }
 
+    // Snapshot the on-disk state before overwriting. saveSnapshot() writes
+    // a rotating backup at <volpkg>/backups/<segname>/{0..N-1}/ so a
+    // destructive save (e.g. corrupted in-memory _points) is recoverable.
+    // Failures (disk full, permissions) are logged but never block the
+    // user's edit — the backup is best-effort.
+    try {
+        saveSnapshot(8);
+    } catch (const std::exception& e) {
+        Logger()->warn("saveOverwrite: snapshot failed for {}: {}",
+                       final_path.string(), e.what());
+    }
+
     save(final_path.string(), uuid, true);
     path = final_path;
     id = uuid;
@@ -1226,10 +1240,6 @@ void QuadSurface::invalidateMask()
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
 {
-    // Trim padding before serializing so the on-disk grid matches the in-RAM
-    // one. No-op if already trimmed or saving would save <25%.
-    trimToValidBbox();
-
     // Split the points matrix into x, y, z channels
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);
@@ -1271,6 +1281,15 @@ void QuadSurface::saveSnapshot(int maxBackups)
 {
     if (path.empty()) {
         throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
+    }
+
+    // No on-disk state to back up yet — the first save will populate
+    // the directory; subsequent saveOverwrite calls will pick up the
+    // rolling history from then on. Treat this as a no-op rather than
+    // an error so the saveOverwrite call site doesn't have to special
+    // case it.
+    if (!std::filesystem::exists(path / "x.tif")) {
+        return;
     }
 
     // Path is expected to be: /path/to/scroll.volpkg/paths/segment_name
@@ -1341,47 +1360,37 @@ void QuadSurface::saveSnapshot(int maxBackups)
         throw std::runtime_error("Failed to create snapshot directory: " + ec.message());
     }
 
-    // Write surface data (skip mask - we'll copy it from disk instead)
-    writeDataToDirectory(snapshot_dest, "mask");
-
-    // Write metadata - create a copy so we don't modify the original
-    utils::Json snapshotMeta = meta;
-    {
-        auto lo = utils::Json::array();
-        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
-        auto hi = utils::Json::array();
-        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
-        auto bb = utils::Json::array();
-        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
-        snapshotMeta["bbox"] = std::move(bb);
+    // Capture the LAST PERSISTED state — copy every regular file in
+    // path/ verbatim into the snapshot slot. This preserves x/y/z.tif,
+    // mask.tif, ancillary channels, meta.json, corrections.json, etc.
+    // without re-serializing in-memory data.
+    //
+    // The previous implementation called writeDataToDirectory(...)
+    // which serialized the current in-memory _points. That broke
+    // recovery for the saveOverwrite case: when the in-memory state
+    // is what we're trying to roll back FROM, persisting it as the
+    // backup snapshot leaves no good state to recover.
+    //
+    // Subdirectories (e.g. .tmp_* from in-flight saves) are skipped.
+    for (const auto& entry : std::filesystem::directory_iterator(path, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::error_code copyEc;
+        std::filesystem::copy_file(
+            entry.path(),
+            snapshot_dest / entry.path().filename(),
+            std::filesystem::copy_options::overwrite_existing,
+            copyEc);
+        if (copyEc) {
+            Logger()->warn("saveSnapshot: copy failed for {}: {}",
+                           entry.path().string(), copyEc.message());
+        }
     }
-    snapshotMeta["type"] = "seg";
-    snapshotMeta["uuid"] = id;
-    snapshotMeta["format"] = "tifxyz";
-    {
-        auto sc = utils::Json::array();
-        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
-        snapshotMeta["scale"] = std::move(sc);
-    }
-
-    std::ofstream o(snapshot_dest / "meta.json");
-    o << snapshotMeta.dump(4) << std::endl;
-    o.close();
-
-    // Copy mask.tif and generations.tif if they exist on disk
-    std::filesystem::path maskFile = path / "mask.tif";
-    std::filesystem::path generationsFile = path / "generations.tif";
-
-    if (std::filesystem::exists(maskFile)) {
-        std::filesystem::path destMask = snapshot_dest / "mask.tif";
-        std::filesystem::copy_file(maskFile, destMask,
-            std::filesystem::copy_options::overwrite_existing, ec);
-    }
-
-    if (std::filesystem::exists(generationsFile)) {
-        std::filesystem::path destGenerations = snapshot_dest / "generations.tif";
-        std::filesystem::copy_file(generationsFile, destGenerations,
-            std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        Logger()->warn("saveSnapshot: directory iteration failed for {}: {}",
+                       path.string(), ec.message());
     }
 }
 
@@ -1516,6 +1525,33 @@ void QuadSurface::save_meta()
         throw std::runtime_error("can't save_meta() without metadata!");
     if (path.empty())
         throw std::runtime_error("no storage path for QuadSurface");
+
+    if (!meta.is_object()) {
+        throw std::runtime_error("can't save_meta() with non-object metadata!");
+    }
+
+    const std::string uuid = !id.empty() ? id : path.filename().string();
+    if (uuid.empty()) {
+        throw std::runtime_error("QuadSurface::save_meta() requires a non-empty uuid");
+    }
+
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        meta["bbox"] = std::move(bb);
+    }
+    meta["type"] = "seg";
+    meta["uuid"] = uuid;
+    meta["format"] = "tifxyz";
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
+        meta["scale"] = std::move(sc);
+    }
 
     std::ofstream o(path/"meta.json.tmp");
     o << meta.dump(4) << std::endl;
@@ -1996,24 +2032,10 @@ void QuadSurface::rotate(float angleDeg)
     rotMat.at<double>(0, 2) += bbox.width / 2.0 - center.x;
     rotMat.at<double>(1, 2) += bbox.height / 2.0 - center.y;
 
-    // Rotate points
-    cv::Mat rotatedMat;
-    cv::warpAffine(
-        *_points,
-        rotatedMat,
-        rotMat,
-        bbox.size(),
-        cv::INTER_LINEAR,
-        cv::BORDER_CONSTANT,
-        cv::Scalar(-1.f, -1.f, -1.f)
-    );
-
-    // Clean up edge artifacts from interpolation: dilate invalid region by 1 pixel
-    cv::Mat mask;
-    cv::inRange(rotatedMat, cv::Scalar(-1, -1, -1), cv::Scalar(-1, -1, -1), mask);
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::dilate(mask, mask, kernel, cv::Point(-1, -1), 1);
-    rotatedMat.setTo(cv::Scalar(-1.f, -1.f, -1.f), mask);
+    // Rotate points without blending invalid sentinels into finite coordinates.
+    const cv::Size dstSize = bbox.size();
+    cv::Mat_<cv::Vec3f> rotatedMat =
+        warpAffinePointsLinearPreservingInvalids(*_points, rotMat, dstSize);
 
     // Update points
     *_points = rotatedMat;
@@ -2028,7 +2050,7 @@ void QuadSurface::rotate(float angleDeg)
             channel,
             rotatedChannel,
             rotMat,
-            bbox.size(),
+            dstSize,
             cv::INTER_LINEAR,
             cv::BORDER_CONSTANT,
             borderValue

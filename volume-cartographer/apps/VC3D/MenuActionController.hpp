@@ -3,9 +3,10 @@
 #include <QObject>
 #include <QPointer>
 #include <array>
+#include <memory>
 #include <string>
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 
 class QAction;
 class QDialog;
@@ -28,7 +29,6 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
-    void triggerTeleaInpaint();
 
 private slots:
     void newProject();
@@ -41,18 +41,18 @@ private slots:
     void convertLegacyVolpkg();
     void openVolpkg();
     void openRecentVolpkg();
+    void attachRemoteZarr();
     void showSettingsDialog();
     void showAboutDialog();
     void showKeybindings();
     void resetSegmentationViews();
     void toggleConsoleOutput();
-    void generateReviewReport();
     void toggleDrawBBox(bool enabled);
     void toggleCursorMirroring(bool enabled);
     void surfaceFromSelection();
     void clearSelection();
-    void runTeleaInpaint();
     void importObjAsPatch();
+    void beginRotateSurfaceTransform();
     void exitApplication();
 
 private:
@@ -60,15 +60,21 @@ private:
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
 
+    QStringList loadRecentRemoteUrls() const;
+    void saveRecentRemoteUrls(const QStringList& urls);
+    void updateRecentRemoteList(const QString& url);
+    void attachRemoteZarrUrl(const QString& url);
     bool tryResolveRemoteAuth(const QString& url,
-                              vc::cache::HttpAuth* authOut,
+                              vc::HttpAuth* authOut,
                               bool allowPrompt,
                               QString* errorMessage = nullptr) const;
     // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
     // prompts the user for an output .volpkg.json, and returns the written path
     // via `convertedOut` on success.
     bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
-    QString remoteCacheDirectory() const;
+    QString remoteCacheDirectory(bool allowPrompt);
+    QString configuredRemoteCacheDirectory() const;
+    QString suggestedRemoteCacheDirectory() const;
     QString promptLocation(const QString& title,
                            const QString& hint,
                            const QString& defaultDir,
@@ -82,6 +88,7 @@ private:
     QMenu* _editMenu{nullptr};
     QMenu* _viewMenu{nullptr};
     QMenu* _actionsMenu{nullptr};
+    QMenu* _transformsMenu{nullptr};
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
@@ -95,6 +102,7 @@ private:
     QAction* _setOutputSegmentsAct{nullptr};
     QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
+    QAction* _attachRemoteZarrAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
@@ -102,13 +110,12 @@ private:
     QAction* _aboutAct{nullptr};
     QAction* _resetViewsAct{nullptr};
     QAction* _showConsoleAct{nullptr};
-    QAction* _reportingAct{nullptr};
     QAction* _drawBBoxAct{nullptr};
     QAction* _mirrorCursorAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
-    QAction* _teleaAct{nullptr};
     QAction* _importObjAct{nullptr};
+    QAction* _rotateSurfaceAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
 };

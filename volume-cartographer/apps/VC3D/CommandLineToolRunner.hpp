@@ -32,8 +32,6 @@ public:
     enum class Tool {
         RenderTifXYZ,
         GrowSegFromSegment,
-        GrowSegFromSeeds,
-        SegAddOverlap,
         tifxyz2obj,
         obj2tifxyz,
         AlphaCompRefine,
@@ -42,6 +40,11 @@ public:
     };
 
     void setVolumePath(const QString& path);
+    void setRemoteVolumeUrl(const QString& url);
+    void setRemoteVolumeAuth(const QString& accessKey,
+                             const QString& secretKey,
+                             const QString& sessionToken,
+                             const QString& region);
     void setSegmentPath(const QString& path);
     void setOutputPattern(const QString& pattern);
 
@@ -54,9 +57,7 @@ public:
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            const QString& affinePath, bool invertAffine,
                            float scaleSegmentation, double rotateDegrees, int flipAxis);
-    void setGrowParams(QString volumePath, QString tgtDir, QString jsonParams, int seed_x = 0, int seed_y = 0, int seed_z = 0, bool useExpandMode = false, bool useRandomSeed = false);
     void setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment);
-    void setAddOverlapParams(QString tgtDir, QString tifxyzPath);
     void setToObjParams(QString tifxyzPath, QString objPath);
     void setToObjOptions(bool normalizeUV, bool alignGrid);
     void setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
@@ -79,8 +80,6 @@ public:
     void showConsoleOutput();
     void hideConsoleOutput();
     void setAutoShowConsoleOutput(bool autoShow);
-    void setParallelProcesses(int count);
-    void setIterationCount(int count);
     void setIncludeTifs(bool include);
     void setOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
@@ -111,6 +110,11 @@ private:
     bool _autoShowConsole;
     
     QString _volumePath;
+    QString _remoteVolumeUrl;
+    QString _remoteAccessKey;
+    QString _remoteSecretKey;
+    QString _remoteSessionToken;
+    QString _remoteRegion;
     QString _segmentPath;
     QString _outputPattern;
     QString _tgtDir;
@@ -125,14 +129,6 @@ private:
     float _scale;
     int _resolution;
     int _layers;
-    int _seed_x;
-    int _seed_y;
-    int _seed_z;
-    bool _useExpandMode;
-    bool _useRandomSeed;
-    int _parallelProcesses;  // processes for xargs
-    int _iterationCount;     // iterations for xargs
-
     // Advanced render options
     int _cropX{0};
     int _cropY{0};

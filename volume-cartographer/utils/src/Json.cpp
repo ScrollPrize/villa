@@ -64,6 +64,9 @@ Json::Json(bool v) : impl_(std::make_unique<Impl>(njson(v))) {}
 Json::Json(int v) : impl_(std::make_unique<Impl>(njson(v))) {}
 Json::Json(int64_t v) : impl_(std::make_unique<Impl>(njson(v))) {}
 Json::Json(uint64_t v) : impl_(std::make_unique<Impl>(njson(v))) {}
+#if defined(__APPLE__)
+Json::Json(size_t v) : impl_(std::make_unique<Impl>(njson(static_cast<uint64_t>(v)))) {}
+#endif
 Json::Json(double v) : impl_(std::make_unique<Impl>(njson(v))) {}
 Json::Json(const char* v) : impl_(std::make_unique<Impl>(njson(std::string(v)))) {}
 Json::Json(const std::string& v) : impl_(std::make_unique<Impl>(njson(v))) {}
@@ -261,6 +264,9 @@ Json& Json::operator=(bool v) { impl_->j() = v; return *this; }
 Json& Json::operator=(int v) { impl_->j() = v; return *this; }
 Json& Json::operator=(int64_t v) { impl_->j() = v; return *this; }
 Json& Json::operator=(uint64_t v) { impl_->j() = v; return *this; }
+#if defined(__APPLE__)
+Json& Json::operator=(size_t v) { impl_->j() = static_cast<uint64_t>(v); return *this; }
+#endif
 Json& Json::operator=(double v) { impl_->j() = v; return *this; }
 Json& Json::operator=(const char* v) { impl_->j() = std::string(v); return *this; }
 Json& Json::operator=(const std::string& v) { impl_->j() = v; return *this; }

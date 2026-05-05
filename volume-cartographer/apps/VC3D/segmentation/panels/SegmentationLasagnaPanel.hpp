@@ -5,11 +5,13 @@
 #include "utils/Json.hpp"
 
 class CollapsibleSettingsGroup;
+class CState;
 class QComboBox;
 class QLabel;
 class QLineEdit;
 class QProgressBar;
 class QPushButton;
+class QStatusBar;
 class QSettings;
 class QDoubleSpinBox;
 class QSpinBox;
@@ -56,6 +58,7 @@ public:
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
+    void startOptimization(CState* state, QStatusBar* statusBar);
 
 public slots:
     void setSeedFromFocus(int x, int y, int z);

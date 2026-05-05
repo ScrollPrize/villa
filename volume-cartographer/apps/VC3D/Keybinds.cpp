@@ -49,14 +49,6 @@ const ShortcutDef OpenVolpkg{
     nullptr,
     QKeySequence::Open
 };
-const ShortcutDef TeleaInpaint{
-    "telea_inpaint",
-    kSectionFileMenu,
-    "Inpaint (Telea) & Rebuild Segment",
-    ShortcutKind::Text,
-    "Ctrl+I",
-    QKeySequence::Open
-};
 const ShortcutDef AxisAlignedSlices{
     "axis_aligned_slices",
     kSectionViewMenu,
@@ -87,14 +79,6 @@ const ShortcutDef CompositeView{
     "Toggle composite view",
     ShortcutKind::Text,
     "C",
-    QKeySequence::Open
-};
-const ShortcutDef DrawingMode{
-    "drawing_mode",
-    kSectionViewMenu,
-    "Toggle drawing mode",
-    ShortcutKind::Text,
-    "Ctrl+Shift+D",
     QKeySequence::Open
 };
 const ShortcutDef RawPointsOverlay{
@@ -484,13 +468,10 @@ QString buildKeybindsHelpText()
 {
     const HelpEntry kHelpEntries[] = {
         { kSectionFileMenu, shortcuts::OpenVolpkg.description, HelpKeyType::Shortcut, &shortcuts::OpenVolpkg, nullptr, nullptr },
-        { kSectionFileMenu, shortcuts::TeleaInpaint.description, HelpKeyType::Shortcut, &shortcuts::TeleaInpaint, nullptr, nullptr },
-
         { kSectionViewMenu, shortcuts::AxisAlignedSlices.description, HelpKeyType::Shortcut, &shortcuts::AxisAlignedSlices, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::DirectionHints.description, HelpKeyType::Shortcut, &shortcuts::DirectionHints, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::CompositeView.description, HelpKeyType::Shortcut, &shortcuts::CompositeView, nullptr, nullptr },
-        { kSectionViewMenu, shortcuts::DrawingMode.description, HelpKeyType::Shortcut, &shortcuts::DrawingMode, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::RawPointsOverlay.description, HelpKeyType::Shortcut, &shortcuts::RawPointsOverlay, nullptr, nullptr },
         { kSectionViewMenu, keypress::ToggleVolumeOverlay.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleVolumeOverlay, nullptr },
         { kSectionViewMenu, shortcuts::FocusedView.description, HelpKeyType::Shortcut, &shortcuts::FocusedView, nullptr, nullptr },

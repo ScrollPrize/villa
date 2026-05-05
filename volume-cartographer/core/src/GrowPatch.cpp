@@ -4,18 +4,20 @@
 #include <utils/zarr.hpp>
 
 #include "vc/core/util/Geometry.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "utils/Json.hpp"
 
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 #include "vc/tracer/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
@@ -69,6 +71,8 @@ DirectionField& DirectionField::operator=(DirectionField&&) noexcept = default;
 namespace { // Anonymous namespace for local helpers
 
 struct SDTContext;
+
+using Umbilicus = vc::core::util::Umbilicus;
 
 std::optional<uint32_t> environment_seed()
 {
@@ -533,6 +537,15 @@ struct TraceData {
     std::unique_ptr<Chunked3dVec3fFromUint8> normal3d_field;
     std::unique_ptr<NormalFitQualityWeightField> normal3d_fit_quality;
 
+    struct PatchNormalContext {
+        std::vector<SurfacePatchIndex::SurfacePtr> surfaces;
+        std::unique_ptr<SurfacePatchIndex> index;
+        std::optional<Umbilicus> umbilicus;
+        float tolerance = 20.0f;
+        bool signed_normals = false;
+    };
+    std::unique_ptr<PatchNormalContext> patch_normals;
+
     Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
     std::unique_ptr<lineLossDistance> space_line_compute;
     std::unique_ptr<Chunked3d<uint8_t, lineLossDistance>> space_line_volume;
@@ -696,7 +709,7 @@ struct Vec3iEqual {
 };
 
 struct SDTContext {
-    vc::cache::BlockPipeline* cache = nullptr;
+    vc::render::IChunkedArray* cache = nullptr;
     int level = 0;
     int chunk_size = 64;
     float threshold = 1.0f;
@@ -732,7 +745,7 @@ static SDTChunk* get_or_compute_sdt_chunk(SDTContext& ctx, const cv::Vec3f& worl
     const cv::Vec3i size(cs, cs, cs);
     Array3D<uint8_t> binary_data({static_cast<size_t>(cs), static_cast<size_t>(cs), static_cast<size_t>(cs)});
 
-    auto shape = ctx.cache->levelShape(ctx.level); // z,y,x
+    auto shape = ctx.cache->shape(ctx.level); // z,y,x
     cv::Vec3i clamped_origin(
         std::max(0, origin[0]),
         std::max(0, origin[1]),
@@ -749,7 +762,11 @@ static SDTChunk* get_or_compute_sdt_chunk(SDTContext& ctx, const cv::Vec3f& worl
         Array3D<uint8_t> read_buf({static_cast<size_t>(read_size_zyx[0]),
                                   static_cast<size_t>(read_size_zyx[1]),
                                   static_cast<size_t>(read_size_zyx[2])});
-        readArea3D(read_buf, clamped_origin_zyx, ctx.cache, ctx.level);
+        Volume::readZYX(
+            read_buf,
+            {clamped_origin_zyx[0], clamped_origin_zyx[1], clamped_origin_zyx[2]},
+            *ctx.cache,
+            ctx.level);
 
         const cv::Vec3i offset = clamped_origin - origin;
         for (int z = 0; z < read_size[2]; ++z) {
@@ -802,6 +819,96 @@ static float sample_sdt(SDTContext& ctx, const cv::Vec3f& world_pt)
     int z = std::clamp(static_cast<int>(std::round(local[2])), 0, chunk->size[2] - 1);
     return chunk->data[static_cast<size_t>(z) * chunk->size[1] * chunk->size[0] +
                        static_cast<size_t>(y) * chunk->size[0] + static_cast<size_t>(x)];
+}
+
+static std::filesystem::path normalized_existing_path(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    auto normalized = std::filesystem::weakly_canonical(path, ec);
+    return ec ? path.lexically_normal() : normalized;
+}
+
+static std::unique_ptr<TraceData::PatchNormalContext> load_patch_normal_context(
+    const utils::Json& params,
+    const std::array<int, 3>& volume_shape_zyx,
+    QuadSurface* resume_surf)
+{
+    std::string patches_path;
+    for (const char* key : {"patch_normal_path", "patch_normal_dir", "patch_normals_path"}) {
+        if (params.contains(key) && params[key].is_string()) {
+            patches_path = params[key].get_string();
+            break;
+        }
+    }
+    if (patches_path.empty()) {
+        return nullptr;
+    }
+
+    const std::filesystem::path root = patches_path;
+    if (!std::filesystem::exists(root) || !std::filesystem::is_directory(root)) {
+        throw std::runtime_error("patch normal path is not a directory: " + root.string());
+    }
+
+    auto ctx = std::make_unique<TraceData::PatchNormalContext>();
+    ctx->tolerance = std::max(0.0f, static_cast<float>(params.value("patch_normal_tolerance", 20.0)));
+
+    const std::filesystem::path resume_path =
+        resume_surf && !resume_surf->path.empty() ? normalized_existing_path(resume_surf->path) : std::filesystem::path();
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_directory(ec)) {
+            continue;
+        }
+
+        const std::filesystem::path path = entry.path();
+        if (!resume_path.empty() && normalized_existing_path(path) == resume_path) {
+            continue;
+        }
+
+        try {
+            auto surface = load_quad_from_tifxyz(path.string());
+            if (surface) {
+                ctx->surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(surface.release()));
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Skipping patch-normal surface " << path << ": " << e.what() << std::endl;
+        }
+    }
+
+    if (ctx->surfaces.empty()) {
+        throw std::runtime_error("patch normal path contains no loadable tifxyz surfaces: " + root.string());
+    }
+
+    ctx->index = std::make_unique<SurfacePatchIndex>();
+    ctx->index->rebuild(ctx->surfaces, 0.0f);
+
+    if (params.contains("umbilicus_path") && params["umbilicus_path"].is_string()) {
+        const cv::Vec3i volume_shape(volume_shape_zyx[0],
+                                     volume_shape_zyx[1],
+                                     volume_shape_zyx[2]);
+        ctx->umbilicus = Umbilicus::FromFile(params["umbilicus_path"].get_string(), volume_shape);
+        ctx->signed_normals = true;
+    }
+
+    if (params.contains("patch_normal_signed")) {
+        if (params["patch_normal_signed"].is_boolean()) {
+            ctx->signed_normals = params["patch_normal_signed"].get_bool();
+        } else {
+            std::cerr << "patch_normal_signed must be boolean" << std::endl;
+        }
+    }
+
+    std::cout << "Loaded patch-normal index from " << root
+              << " surfaces=" << ctx->surfaces.size()
+              << " patches=" << ctx->index->patchCount()
+              << " tolerance=" << ctx->tolerance
+              << " signed=" << (ctx->signed_normals ? "true" : "false")
+              << std::endl;
+    return ctx;
 }
 
 class NormalOnlyPenalty {
@@ -876,6 +983,49 @@ private:
     double weight_;
 };
 
+class FixedPatchNormalAlignment {
+public:
+    FixedPatchNormalAlignment(cv::Vec3d target_normal, double weight, bool signed_alignment)
+        : target_normal_(target_normal), weight_(weight), signed_alignment_(signed_alignment) {}
+
+    template <typename T>
+    bool operator()(const T* const pA,
+                    const T* const pB1,
+                    const T* const pB2,
+                    const T* const pC,
+                    T* residual) const {
+        (void)pC;
+        const T u[3] = {pB1[0] - pA[0], pB1[1] - pA[1], pB1[2] - pA[2]};
+        const T v[3] = {pB2[0] - pA[0], pB2[1] - pA[1], pB2[2] - pA[2]};
+        const T n[3] = {
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        };
+        const T n_len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] + T(1e-12));
+        T dot = (n[0] * T(target_normal_[0]) +
+                 n[1] * T(target_normal_[1]) +
+                 n[2] * T(target_normal_[2])) / n_len;
+        if (!signed_alignment_) {
+            using std::abs;
+            dot = abs(dot);
+        }
+        residual[0] = T(weight_) * (T(1) - dot);
+        return true;
+    }
+
+    static ceres::CostFunction* Create(cv::Vec3d target_normal, double weight, bool signed_alignment)
+    {
+        return new ceres::AutoDiffCostFunction<FixedPatchNormalAlignment, 1, 3, 3, 3, 3>(
+            new FixedPatchNormalAlignment(target_normal, weight, signed_alignment));
+    }
+
+private:
+    cv::Vec3d target_normal_;
+    double weight_;
+    bool signed_alignment_;
+};
+
 struct TraceParameters {
     cv::Mat_<uint8_t> state;
     cv::Mat_<cv::Vec3d> dpoints;
@@ -894,6 +1044,7 @@ enum LossType {
     REFERENCE_RAY,
     SURFACE_SDT,
     SPACELINE,
+    PATCH_NORMAL,
     COUNT
 };
 
@@ -913,6 +1064,7 @@ struct LossSettings {
         w[LossType::REFERENCE_RAY] = 0.0f;
         w[LossType::SURFACE_SDT] = 0.0f;
         w[LossType::SPACELINE] = 0.0f;
+        w[LossType::PATCH_NORMAL] = 0.0f;
     }
 
     struct ReferenceRaycastSettings {
@@ -951,6 +1103,7 @@ struct LossSettings {
         set_weight("reference_ray_weight", LossType::REFERENCE_RAY);
         set_weight("sdt_weight", LossType::SURFACE_SDT);
         set_weight("space_line_weight", LossType::SPACELINE);
+        set_weight("patch_normal_weight", LossType::PATCH_NORMAL);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -1688,7 +1841,7 @@ static int conditional_straight_loss(int bit, const cv::Vec2i &p, const cv::Vec2
 
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
 {
-    if (!trace_data.ngv) return 0;
+    if (!trace_data.ngv && !trace_data.patch_normals) return 0;
 
     cv::Vec2i p_br = p + cv::Vec2i(1,1);
     if (!coord_valid(params.state(p)) || !coord_valid(params.state(p[0], p_br[1])) || !coord_valid(params.state(p_br[0], p[1])) || !coord_valid(params.state(p_br))) {
@@ -1711,20 +1864,58 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
     }
 
     int count = 0;
-    // int i = 1;
-    for (int i = 0; i < 3; ++i) { // For each plane
-        // bool direction_aware = (i == 0); // XY plane
+    if (trace_data.ngv) {
+        // int i = 1;
+        for (int i = 0; i < 3; ++i) { // For each plane
+            // bool direction_aware = (i == 0); // XY plane
 
-        bool direction_aware = false; // this is not that simple ...
-        // Loss with p as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
-        // Loss with p_br as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
-        // Loss with p_tr as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
-        // Loss with p_bl as base point A
-        problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
-        count += 4;
+            bool direction_aware = false; // this is not that simple ...
+            // Loss with p as base point A
+            problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pA, pB1, pB2, pC);
+            // Loss with p_br as base point A
+            problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pC, pB2, pB1, pA);
+            // Loss with p_tr as base point A
+            problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB1, pC, pA, pB2);
+            // Loss with p_bl as base point A
+            problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), trace_data.normal3d_fit_quality.get(), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
+            count += 4;
+        }
+    }
+
+    if (trace_data.patch_normals) {
+        const float w = settings(LossType::PATCH_NORMAL, p);
+        if (w > 0.0f && trace_data.patch_normals->index && !trace_data.patch_normals->index->empty()) {
+            const cv::Vec3d center_d = (params.dpoints(p) + params.dpoints(p_tr) + params.dpoints(p_bl) + params.dpoints(p_br)) * 0.25;
+            const cv::Vec3f center_f(static_cast<float>(center_d[0]),
+                                     static_cast<float>(center_d[1]),
+                                     static_cast<float>(center_d[2]));
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = center_f;
+            query.tolerance = trace_data.patch_normals->tolerance;
+            auto hit = trace_data.patch_normals->index->locate(query);
+            if (hit && hit->surface) {
+                cv::Vec3f normal_f = hit->surface->normal(hit->ptr);
+                const float norm = cv::norm(normal_f);
+                if (std::isfinite(norm) && norm > 1e-6f) {
+                    normal_f /= norm;
+                    if (trace_data.patch_normals->umbilicus) {
+                        const cv::Vec3f to_umbilicus = trace_data.patch_normals->umbilicus->vector_to_umbilicus(center_f);
+                        const cv::Vec3f outward = -to_umbilicus;
+                        if (normal_f.dot(outward) < 0.0f) {
+                            normal_f = -normal_f;
+                        }
+                    }
+
+                    const cv::Vec3d normal_d(normal_f[0], normal_f[1], normal_f[2]);
+                    const bool signed_alignment = trace_data.patch_normals->signed_normals;
+                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pA, pB1, pB2, pC);
+                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pC, pB2, pB1, pA);
+                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pB1, pC, pA, pB2);
+                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pB2, pA, pC, pB1);
+                    count += 4;
+                }
+            }
+        }
     }
 
     //FIXME make params constant if not optimize-all is set
@@ -2745,9 +2936,11 @@ struct thresholdedDistance
 
 };
 
-
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
 {
+    const std::array<int, 3> volume_shape_zyx = volume.shape(level);
+    auto* cache = volume.chunkedCache();
+
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     if (params.contains("neural_socket")) {
@@ -2770,6 +2963,14 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
+    const bool patch_normals_requested =
+        (params.contains("patch_normal_path") && params["patch_normal_path"].is_string()) ||
+        (params.contains("patch_normal_dir") && params["patch_normal_dir"].is_string()) ||
+        (params.contains("patch_normals_path") && params["patch_normals_path"].is_string());
+    if (patch_normals_requested &&
+        (!params.contains("patch_normal_weight") || params["patch_normal_weight"].is_null())) {
+        loss_settings[LossType::PATCH_NORMAL] = 1.0f;
+    }
     loss_settings.space_line_steps = std::max(2, params.value("space_line_steps", loss_settings.space_line_steps));
     loss_settings.space_line_threshold = std::clamp(static_cast<float>(params.value("space_line_threshold", loss_settings.space_line_threshold)), 0.0f, 255.0f);
     loss_settings.space_line_invert = params.value("space_line_invert", loss_settings.space_line_invert);
@@ -2849,10 +3050,9 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
             }
 
             // Derive scale purely from shapes: main volume is full-res, normal zarr is downsampled.
-            const auto& vol_shape_zyx = ds->shape();
-            const int vol_z = static_cast<int>(vol_shape_zyx.at(0));
-            const int vol_y = static_cast<int>(vol_shape_zyx.at(1));
-            const int vol_x = static_cast<int>(vol_shape_zyx.at(2));
+            const int vol_z = volume_shape_zyx.at(0);
+            const int vol_y = volume_shape_zyx.at(1);
+            const int vol_x = volume_shape_zyx.at(2);
 
             auto x_ds = std::make_unique<vc::VcDataset>(zarr_root / "x" / "0");
             const auto& nshape = x_ds->shape();
@@ -2923,6 +3123,16 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
             std::cerr << "Failed to load normal3d zarr field: " << e.what() << std::endl;
             trace_data.normal3d_field.reset();
             trace_data.normal3d_fit_quality.reset();
+        }
+    }
+
+    if (patch_normals_requested) {
+        try {
+            trace_data.patch_normals = load_patch_normal_context(params, volume_shape_zyx, resume_surf);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load patch-normal constraints: " << e.what() << std::endl;
+            trace_data.patch_normals.reset();
+            loss_settings[LossType::PATCH_NORMAL] = 0.0f;
         }
     }
 
@@ -3094,13 +3304,13 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
 
     // Together these represent the cached distance-transform of the thresholded surface volume
     thresholdedDistance compute;
-    Chunked3d<uint8_t,thresholdedDistance> proc_tensor(compute, ds, cache, level, cache_root);
+    Chunked3d<uint8_t,thresholdedDistance> proc_tensor(compute, volume_shape_zyx, cache, level, cache_root);
 
     if (loss_settings.w[LossType::SPACELINE] > 0.0f && loss_settings.space_line_steps >= 2) {
         trace_data.space_line_compute = std::make_unique<lineLossDistance>(loss_settings.space_line_threshold,
                                                                            loss_settings.space_line_invert);
         trace_data.space_line_volume = std::make_unique<Chunked3d<uint8_t, lineLossDistance>>(
-            *trace_data.space_line_compute, ds, cache, level, cache_root);
+            *trace_data.space_line_compute, volume_shape_zyx, cache, level, cache_root);
         std::cout << "Space-line loss EDT enabled (threshold=" << loss_settings.space_line_threshold
                   << ", steps=" << loss_settings.space_line_steps
                   << ", invert=" << loss_settings.space_line_invert << ")" << std::endl;
@@ -3108,7 +3318,7 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
 
     // Debug: test the chunk cache by reading one voxel
     passTroughComputor pass;
-    Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, ds, cache, level);
+    Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, volume_shape_zyx, cache, level);
     trace_data.raw_volume = &dbg_tensor;
     std::cout << "seed val " << origin << " " <<
     (int)dbg_tensor(origin[2],origin[1],origin[0]) << std::endl;

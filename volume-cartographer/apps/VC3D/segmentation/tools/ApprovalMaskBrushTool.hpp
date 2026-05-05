@@ -42,10 +42,15 @@ public:
     [[nodiscard]] bool strokeActive() const { return _strokeActive; }
     [[nodiscard]] bool hasPendingStrokes() const { return !_pendingStrokes.empty(); }
 
-    // surfacePos is in surface parameter coordinates (from TileScene::sceneToSurface).
+    // surfacePos is in surface parameter coordinates.
     // Grid position is computed as: (surfacePos + surface_center) * surface_scale
-    void startStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos);
-    void extendStroke(const cv::Vec3f& worldPos, const QPointF& surfacePos, bool forceSample);
+    void startStroke(const cv::Vec3f& worldPos,
+                     const QPointF& surfacePos,
+                     std::optional<std::pair<int, int>> gridIndex = std::nullopt);
+    void extendStroke(const cv::Vec3f& worldPos,
+                      const QPointF& surfacePos,
+                      bool forceSample,
+                      std::optional<std::pair<int, int>> gridIndex = std::nullopt);
     void finishStroke();
 
     // For plane viewers: paint approval based on 3D world position, plane normal, and radius
@@ -97,6 +102,9 @@ private:
 
     // Paint accumulated points into QImage (for real-time painting)
     void paintAccumulatedPointsToImage();
+    void addAccumulatedGridPosition(const std::pair<int, int>& gridIdx);
+    void addInterpolatedGridPositions(const std::pair<int, int>& from,
+                                      const std::pair<int, int>& to);
 
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
@@ -123,6 +131,7 @@ private:
     // Accumulated grid positions for real-time painting
     std::vector<std::pair<int, int>> _accumulatedGridPositions;
     std::unordered_set<uint64_t> _accumulatedGridPosSet;  // For deduplication
+    std::optional<std::pair<int, int>> _lastGridSample;
 
     // For plane viewer strokes: effective paint radius = brushRadius - distanceFromLine
     float _effectivePaintRadiusNative{0.0f};

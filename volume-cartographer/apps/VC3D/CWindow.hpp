@@ -6,9 +6,9 @@
 #include <opencv2/core.hpp>
 #include <QComboBox>
 #include <QCheckBox>
-#include <QPointF>
 #include <QString>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "ui_VCMain.h"
 
@@ -21,8 +21,6 @@
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
-#include "DrawingWidget.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -31,23 +29,24 @@
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
+#include "overlays/SurfaceRotationOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
+#include "SurfaceAffineTransformController.hpp"
+
+class CChunkedVolumeViewer;
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
-#include "vc/core/cache/TickCoordinator.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/RemoteScroll.hpp"
 
 #define MAX_RECENT_VOLPKG 10
 
-// Volpkg version required by this app
+// Project JSON schema version required by this app.
 static constexpr int VOLPKG_MIN_VERSION = 1;
-static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
@@ -57,15 +56,14 @@ class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
 class SegmentationGrower;
-class WindowRangeWidget;
+class ViewerControlsPanel;
 class QLabel;
 class QSpinBox;
-class QTemporaryFile;
-class QTemporaryDir;
 class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
+class ViewerTransformsPanel;
 
 class CWindow : public QMainWindow
 {
@@ -75,15 +73,10 @@ class CWindow : public QMainWindow
     friend class MenuActionController;
 
 public:
-    enum SaveResponse : bool { Cancelled, Continue };
-
-
 signals:
 
 public slots:
     void onShowStatusMessage(QString text, int timeout);
-    void onLocChanged(void);
-    void onManualPlaneChanged(void);
     void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onVisLasagnaObj(const std::string& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
@@ -96,8 +89,7 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public:
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     int startupPrefetchLevel = -1);
+    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
     ~CWindow(void);
 
     // Helper method to get the current volume path
@@ -119,7 +111,7 @@ private:
     // Helper method for command line tools
     bool initializeCommandLineRunner(void);
 
-    CTiledVolumeViewer *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
+    VolumeViewerBase *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
     void closeEvent(QCloseEvent* event) override;
 
     void setWidgetsEnabled(bool state);
@@ -131,16 +123,8 @@ private:
 
 
     void setVolume(std::shared_ptr<Volume> newvol);
-    void runStartupPrefetchForVolume(const std::shared_ptr<Volume>& volume);
     bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
                                       const QString& preferredVolumeId = QString());
-    void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
-    // Lazy loading: set remote stubs (segments listed but not yet downloaded)
-    void setRemoteStubs(
-        const std::vector<std::string>& segmentIds,
-        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces);
-    // Download a single remote segment on demand (called when user selects a stub)
-    void downloadRemoteSegmentOnDemand(const QString& segmentId);
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void updateNormalGridAvailability();
@@ -171,9 +155,11 @@ private slots:
     void onAxisOverlayOpacityChanged(int value);
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
-    void configureViewerConnections(CTiledVolumeViewer* viewer);
+    void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);
 
-    CTiledVolumeViewer* segmentationViewer() const;
+    CChunkedVolumeViewer* segmentationViewer() const;
+    VolumeViewerBase* segmentationBaseViewer() const;
+    VolumeViewerBase* activeBaseViewer() const;
     void clearSurfaceSelection();
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
@@ -186,9 +172,6 @@ private slots:
     void onFiberViewersRequested();
     void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
-    void onPreviewTransformToggled(bool enabled);
-    void onSaveTransformedRequested();
-    void onLoadAffineRequested();
 
 private:
     CState* _state;
@@ -200,7 +183,6 @@ private:
     SeedingWidget* _seedingWidget;
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
-    DrawingWidget* _drawingWidget;
     CPointCollectionWidget* _point_collection_widget;
     CFiberWidget* _fiberWidget{nullptr};
     std::unique_ptr<FiberAnnotationController> _fiberController;
@@ -210,21 +192,7 @@ private:
 
     //TODO abstract these into separate QWidget class?
     QLineEdit* lblLocFocus;
-    QDoubleSpinBox* spNorm[3];
-    QPushButton* btnZoomIn;
-   QPushButton* btnZoomOut;
     QCheckBox* chkAxisAlignedSlices;
-    QCheckBox* _previewTransformCheck{nullptr};
-    QCheckBox* _scaleOnlyTransformCheck{nullptr};
-    QCheckBox* _invertTransformCheck{nullptr};
-    QSpinBox* _transformScaleSpin{nullptr};
-    QPushButton* _loadAffineButton{nullptr};
-    QPushButton* _saveTransformedButton{nullptr};
-    QLabel* _transformStatusLabel{nullptr};
-    enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
-    std::unordered_map<std::string, RemoteTransformFetchState> _remoteTransformFetchStates;
-    WindowRangeWidget* _volumeWindowWidget{nullptr};
-    WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
     QLabel* _sliceStepLabel{nullptr};
     QString _segmentationGrowthStatusText;
@@ -236,16 +204,10 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
-    int _startupPrefetchLevel = -1;
-
-    // Declared early so that the publisher thread joins (via ~jthread) after
-    // all viewers and caches below have been destroyed. Readers hold raw
-    // const pointers into FrameState buffers owned here; the coordinator
-    // must outlive every possible reader.
-    std::unique_ptr<vc::cache::TickCoordinator> _tickCoordinator;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
+    std::unique_ptr<ViewerControlsPanel> _viewerControlsPanel;
     bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 
@@ -262,9 +224,11 @@ private:
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
+    std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;
+    std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
     bool _normalGridAvailable{false};
@@ -274,14 +238,7 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
-    std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;
-    std::shared_ptr<QuadSurface> _transformPreviewSurface;
-    QString _customTransformSource;
-    std::filesystem::path _customTransformLocalPath;
-    std::unique_ptr<QTemporaryDir> _customTransformTempDir;
-
     // Keyboard shortcuts
-    QShortcut* fDrawingModeShortcut;
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
     QShortcut* fSurfaceNormalsShortcut;
@@ -312,16 +269,5 @@ private:
     QTimer* _windowStateSaveTimer{nullptr};
     void scheduleWindowStateSave();
     void saveWindowState();
-    void refreshTransformsPanelState();
-    void ensureCurrentRemoteTransformJsonAsync();
-    void clearTransformPreview(bool restoreDisplayedSurface = true);
-    bool applyTransformPreview(bool allowRemoteFetch = true);
-    std::shared_ptr<QuadSurface> currentTransformSourceSurface() const;
-    QString currentTransformSourceDescription() const;
-    bool setCustomTransformSource(const QString& source, QString* errorMessage = nullptr);
-    std::filesystem::path localCurrentTransformJsonPath() const;
-    std::string currentRemoteTransformJsonUrl() const;
-    std::filesystem::path currentTransformJsonPath(bool allowRemoteFetch = true);
-
 
 };  // class CWindow

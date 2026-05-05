@@ -615,15 +615,9 @@ void SeedingWidget::onCastRaysClicked()
         };
 
         // Get volume bounds
-        auto [vw, vh, vd] = currentVolume->shape();
+        auto [vw, vh, vd] = currentVolume->shapeXyz();
         float bx0 = 0, by0 = 0, bz0 = 0;
         float bx1 = static_cast<float>(vw), by1 = static_cast<float>(vh), bz1 = static_cast<float>(vd);
-        const auto& db = currentVolume->dataBounds();
-        if (db.valid) {
-            bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
-            by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
-            bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
-        }
 
         if (_castRaysWasPointMode) {
             // --- Point mode: cast rays ---
@@ -819,15 +813,9 @@ void SeedingWidget::findPeaksAlongRay(
     }
     
     const int maxRadius = maxRadiusSpinBox->value();
-    auto [width, height, depth] = currentVolume->shape();
+    auto [width, height, depth] = currentVolume->shapeXyz();
     float bx0 = 0, by0 = 0, bz0 = 0;
     float bx1 = static_cast<float>(width), by1 = static_cast<float>(height), bz1 = static_cast<float>(depth);
-    const auto& db = currentVolume->dataBounds();
-    if (db.valid) {
-        bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
-        by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
-        bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
-    }
 
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;
@@ -1295,15 +1283,9 @@ void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
     PathPrimitive densifiedPath = path.densify(0.5f); // Sample every 0.5 pixels
 
     // Get data bounds for bounds checking
-    auto [width, height, depth] = currentVolume->shape();
+    auto [width, height, depth] = currentVolume->shapeXyz();
     float bx0 = 0, by0 = 0, bz0 = 0;
     float bx1 = static_cast<float>(width), by1 = static_cast<float>(height), bz1 = static_cast<float>(depth);
-    const auto& db = currentVolume->dataBounds();
-    if (db.valid) {
-        bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
-        by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
-        bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
-    }
 
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;
@@ -1514,15 +1496,9 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
 
     PathPrimitive densifiedPath = path.densify(0.5f);
 
-    auto [width, height, depth] = currentVolume->shape();
+    auto [width, height, depth] = currentVolume->shapeXyz();
     float bx0 = 0, by0 = 0, bz0 = 0;
     float bx1 = static_cast<float>(width), by1 = static_cast<float>(height), bz1 = static_cast<float>(depth);
-    const auto& db = currentVolume->dataBounds();
-    if (db.valid) {
-        bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
-        by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
-        bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
-    }
 
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;

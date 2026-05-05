@@ -12,10 +12,7 @@ class QSpinBox;
 class CState;
 class ViewerManager;
 class PlaneSlicingOverlayController;
-class CAdaptiveVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
+class VolumeViewerBase;
 class Surface;
 
 class AxisAlignedSliceController : public QObject
@@ -39,10 +36,10 @@ public:
     void resetAll();
 
     // Mouse event handlers for rotation dragging
-    void onMousePress(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
-    void onMouseMove(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
-    void onMouseRelease(CTiledVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
-    void onTiltHandleChanged(CTiledVolumeViewer* viewer, QPointF tilt);
+    void onMousePress(VolumeViewerBase* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void onMouseMove(VolumeViewerBase* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
+    void onMouseRelease(VolumeViewerBase* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void onTiltHandleChanged(VolumeViewerBase* viewer, QPointF tilt);
     void onTiltHandleReset();
 
     // Apply slice plane orientations based on current state
@@ -78,11 +75,13 @@ private:
         QPointF startScenePos;
         float startRotationDegrees = 0.0f;
     };
-    std::unordered_map<const CTiledVolumeViewer*, DragState> _drags;
+    std::unordered_map<const VolumeViewerBase*, DragState> _drags;
 
     QTimer* _rotationTimer{nullptr};
     bool _orientationDirty{false};
+    double _pendingOrientationMotionPx{0.0};
 
     void processOrientationUpdate();
+    void notifyInteractiveOrientationViewers(double motionPx);
     void updateTiltHandles();
 };

@@ -1,27 +1,25 @@
 #include "vc/core/types/VolumePkg.hpp"
 
 #include <algorithm>
-#include <atomic>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <set>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include <pwd.h>
 #include <unistd.h>
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/RemoteScroll.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 namespace fs = std::filesystem;
 
 std::filesystem::path VolumePkg::autosaveRoot_;
+std::optional<std::string> VolumePkg::loadFirstSegmentationDir_{};
 
 namespace vc::project {
 
@@ -47,6 +45,13 @@ fs::path resolveLocalPath(const std::string& location, const fs::path& base)
 }
 
 namespace {
+
+std::string asciiLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
 
 bool hasZarrMarkerAtRoot(const fs::path& dir)
 {
@@ -84,6 +89,19 @@ bool isNormalGridDir(const fs::path& dir)
         && fs::exists(dir / "metadata.json");
 }
 
+bool isDirectRemoteZarrLocation(std::string location)
+{
+    location = asciiLower(std::move(location));
+    const auto fragment = location.find('#');
+    if (fragment != std::string::npos) location.erase(fragment);
+    const auto query = location.find('?');
+    if (query != std::string::npos) location.erase(query);
+    while (!location.empty() && location.back() == '/') location.pop_back();
+    constexpr std::string_view suffix = ".zarr";
+    return location.size() >= suffix.size()
+        && location.compare(location.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
 {
     std::vector<fs::path> out;
@@ -104,6 +122,85 @@ bool anyImmediateSubdir(const fs::path& dir, bool (*test)(const fs::path&))
         if (test(child)) return true;
     }
     return false;
+}
+
+std::string trimTrailingSeparators(std::string value)
+{
+    while (value.size() > 1 && (value.back() == '/' || value.back() == '\\')) {
+        value.pop_back();
+    }
+    return value;
+}
+
+fs::path normalizedLocalPath(const std::string& location, const fs::path& base)
+{
+    return vc::project::resolveLocalPath(trimTrailingSeparators(location), base).lexically_normal();
+}
+
+std::string normalizedPathName(std::string value)
+{
+    value = trimTrailingSeparators(std::move(value));
+    fs::path path(value);
+    std::string name = path.filename().string();
+    if (name.empty() && path.has_parent_path()) {
+        name = path.parent_path().filename().string();
+    }
+    return name;
+}
+
+bool sameLocalSegmentsLocation(const vc::project::Entry& entry,
+                               const std::string& location,
+                               const fs::path& base)
+{
+    if (entry.location == location) return true;
+    if (vc::project::isLocationRemote(entry.location) || vc::project::isLocationRemote(location)) {
+        return false;
+    }
+    return normalizedLocalPath(entry.location, base) == normalizedLocalPath(location, base);
+}
+
+bool matchesSegmentsDirectoryName(const vc::project::Entry& entry,
+                                  const std::string& dirName,
+                                  const fs::path& base)
+{
+    if (vc::project::isLocationRemote(entry.location)) return false;
+    const auto requested = asciiLower(trimTrailingSeparators(dirName));
+    const auto requestedName = asciiLower(normalizedPathName(dirName));
+    const auto entryPath = normalizedLocalPath(entry.location, base);
+    return asciiLower(entryPath.filename().string()) == requested
+        || (!requestedName.empty() && asciiLower(entryPath.filename().string()) == requestedName)
+        || asciiLower(entryPath.string()) == requested
+        || asciiLower(trimTrailingSeparators(entry.location)) == requested;
+}
+
+const vc::project::Entry* findSegmentsEntryByLocation(const std::vector<vc::project::Entry>& entries,
+                                                      const std::string& location,
+                                                      const fs::path& base)
+{
+    if (location.empty()) return nullptr;
+    for (const auto& entry : entries) {
+        if (sameLocalSegmentsLocation(entry, location, base)) return &entry;
+    }
+    return nullptr;
+}
+
+const vc::project::Entry* findSegmentsEntryByDirectoryName(const std::vector<vc::project::Entry>& entries,
+                                                           const std::string& dirName,
+                                                           const fs::path& base)
+{
+    if (dirName.empty()) return nullptr;
+    for (const auto& entry : entries) {
+        if (matchesSegmentsDirectoryName(entry, dirName, base)) return &entry;
+    }
+    return nullptr;
+}
+
+const vc::project::Entry* firstLocalSegmentsEntry(const std::vector<vc::project::Entry>& entries)
+{
+    for (const auto& entry : entries) {
+        if (!vc::project::isLocationRemote(entry.location)) return &entry;
+    }
+    return nullptr;
 }
 
 fs::path defaultAutosaveRoot()
@@ -176,6 +273,9 @@ std::string validateLocation(Category category, const std::string& location)
     if (location.empty()) return "Location is empty.";
 
     if (isLocationRemote(location)) {
+        if (category != Category::Volumes) {
+            return "Remote locations are only supported for volumes.";
+        }
         const auto schemeEnd = location.find("://");
         if (schemeEnd == std::string::npos) {
             return "Remote URL is missing scheme separator (expected '://').";
@@ -214,13 +314,21 @@ VolumePkg::VolumePkg() = default;
 
 VolumePkg::~VolumePkg()
 {
-    shuttingDown_.store(true, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(segmentsMutex_);
     segmentsChangedCb_ = nullptr;
 }
 
 void VolumePkg::setAutosaveRoot(const fs::path& dir) { autosaveRoot_ = dir; }
 fs::path VolumePkg::autosaveRoot() { return autosaveRoot_; }
+
+void VolumePkg::setLoadFirstSegmentationDirectory(const std::string& dirName)
+{
+    if (dirName.empty()) {
+        loadFirstSegmentationDir_.reset();
+        return;
+    }
+    loadFirstSegmentationDir_ = dirName;
+}
 
 fs::path VolumePkg::autosaveFile()
 {
@@ -264,7 +372,7 @@ std::shared_ptr<VolumePkg> VolumePkg::New(const fs::path& jsonFile)
 
 fs::path VolumePkg::path() const { return path_; }
 std::string VolumePkg::name() const { return name_; }
-void VolumePkg::setName(const std::string& v) { name_ = v; saveAutosave(); }
+void VolumePkg::setName(const std::string& v) { name_ = v; persistProjectState(); }
 int VolumePkg::version() const { return version_; }
 
 const std::vector<vc::project::Entry>& VolumePkg::volumeEntries() const { return volumes_; }
@@ -277,7 +385,7 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
     for (const auto& e : volumes_) if (e.location == location) return false;
     volumes_.push_back({location, std::move(tags)});
     resolveVolumeEntry(volumes_.back());
-    saveAutosave();
+    persistProjectState();
     return true;
 }
 
@@ -286,8 +394,11 @@ bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::s
     if (location.empty()) return false;
     for (const auto& e : segments_) if (e.location == location) return false;
     segments_.push_back({location, std::move(tags)});
-    resolveSegmentsEntry(segments_.back(), loadGeneration_.load(std::memory_order_relaxed));
-    saveAutosave();
+    if (!outputSegments_) {
+        outputSegments_ = location;
+    }
+    refreshSegmentations();
+    persistProjectState();
     return true;
 }
 
@@ -297,7 +408,7 @@ bool VolumePkg::addNormalGridEntry(const std::string& location, std::vector<std:
     for (const auto& e : normalGrids_) if (e.location == location) return false;
     normalGrids_.push_back({location, std::move(tags)});
     resolveNormalGridEntry(normalGrids_.back());
-    saveAutosave();
+    persistProjectState();
     return true;
 }
 
@@ -317,7 +428,7 @@ bool VolumePkg::removeEntry(const std::string& location)
     if (removed) {
         if (outputSegments_ && *outputSegments_ == location) outputSegments_.reset();
         resolveAll();
-        saveAutosave();
+        persistProjectState();
     }
     return removed;
 }
@@ -325,13 +436,14 @@ bool VolumePkg::removeEntry(const std::string& location)
 void VolumePkg::setOutputSegments(const std::string& location)
 {
     outputSegments_ = location;
-    saveAutosave();
+    refreshSegmentations();
+    persistProjectState();
 }
 
 void VolumePkg::clearOutputSegments()
 {
     outputSegments_.reset();
-    saveAutosave();
+    persistProjectState();
 }
 
 bool VolumePkg::hasOutputSegments() const { return outputSegments_.has_value(); }
@@ -370,10 +482,23 @@ std::shared_ptr<Volume> VolumePkg::volume()
 
 bool VolumePkg::addVolume(const std::shared_ptr<Volume>& volume)
 {
-    if (!volume) return false;
+    if (!volume) {
+        Logger()->warn("Cannot add null volume to package");
+        return false;
+    }
+
     const auto id = volume->id();
     auto result = loadedVolumes_.emplace(id, volume);
-    return result.second;
+    if (!result.second) {
+        Logger()->warn("Volume '{}' already exists in package", id);
+        return false;
+    }
+
+    const auto source = volume->isRemote()
+        ? volume->remoteUrl()
+        : volume->path().string();
+    Logger()->info("Added external volume '{}' from '{}'", id, source);
+    return true;
 }
 
 bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
@@ -477,44 +602,6 @@ std::vector<fs::path> VolumePkg::normalGridPaths() const
     return resolvedNormalGridPaths_;
 }
 
-bool VolumePkg::isRemoteSegment(const std::string& id) const
-{
-    std::lock_guard<std::mutex> lk(segmentsMutex_);
-    return remoteSegmentInfo_.count(id) > 0;
-}
-
-bool VolumePkg::isRemoteSegmentCached(const std::string& id) const
-{
-    vc::project::RemoteSegmentInfo info;
-    {
-        std::lock_guard<std::mutex> lk(segmentsMutex_);
-        auto it = remoteSegmentInfo_.find(id);
-        if (it == remoteSegmentInfo_.end()) return true;
-        info = it->second;
-    }
-    return vc::isRemoteSegmentFullyCached(info.cacheRoot, id, vc::RemoteSegmentSource::Direct);
-}
-
-bool VolumePkg::ensureRemoteSegmentDownloaded(const std::string& id)
-{
-    vc::project::RemoteSegmentInfo info;
-    {
-        std::lock_guard<std::mutex> lk(segmentsMutex_);
-        auto it = remoteSegmentInfo_.find(id);
-        if (it == remoteSegmentInfo_.end()) return true;
-        info = it->second;
-    }
-    if (vc::isRemoteSegmentFullyCached(info.cacheRoot, id, vc::RemoteSegmentSource::Direct)) return true;
-    try {
-        vc::downloadRemoteSegment(info.baseUrl, id, info.cacheRoot,
-                                  info.auth, vc::RemoteSegmentSource::Direct);
-        return true;
-    } catch (const std::exception& ex) {
-        Logger()->error("Remote segment '{}' TIFF download failed: {}", id, ex.what());
-        return false;
-    }
-}
-
 std::vector<fs::path> VolumePkg::normal3dZarrPaths() const
 {
     std::vector<fs::path> out;
@@ -557,7 +644,6 @@ bool VolumePkg::isSurfaceLoaded(const std::string& id) const
 std::shared_ptr<QuadSurface> VolumePkg::loadSurface(const std::string& id)
 {
     std::shared_ptr<Segmentation> seg;
-    std::optional<vc::project::RemoteSegmentInfo> remoteInfo;
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         auto it = loadedSegmentations_.find(id);
@@ -566,19 +652,6 @@ std::shared_ptr<QuadSurface> VolumePkg::loadSurface(const std::string& id)
             return nullptr;
         }
         seg = it->second;
-        auto rit = remoteSegmentInfo_.find(id);
-        if (rit != remoteSegmentInfo_.end()) remoteInfo = rit->second;
-    }
-    if (remoteInfo &&
-        !vc::isRemoteSegmentFullyCached(remoteInfo->cacheRoot, id, vc::RemoteSegmentSource::Direct))
-    {
-        try {
-            vc::downloadRemoteSegment(remoteInfo->baseUrl, id, remoteInfo->cacheRoot,
-                                      remoteInfo->auth, vc::RemoteSegmentSource::Direct);
-        } catch (const std::exception& ex) {
-            Logger()->error("Remote segment '{}' TIFF download failed: {}", id, ex.what());
-            return nullptr;
-        }
     }
     return seg->loadSurface();
 }
@@ -650,11 +723,6 @@ void VolumePkg::loadSurfacesBatch(const std::vector<std::string>& ids)
             auto it = loadedSegmentations_.find(id);
             if (it == loadedSegmentations_.end()) continue;
             if (it->second->isSurfaceLoaded() || !it->second->canLoadSurface()) continue;
-            if (remoteSegmentInfo_.count(id) > 0
-                && !vc::isRemoteSegmentFullyCached(remoteSegmentInfo_.at(id).cacheRoot, id, vc::RemoteSegmentSource::Direct))
-            {
-                continue;
-            }
             toLoad.push_back(it->second);
         }
     }
@@ -674,7 +742,24 @@ bool VolumePkg::isRemote() const
         return std::any_of(v.begin(), v.end(),
                            [](const auto& e) { return vc::project::isLocationRemote(e.location); });
     };
-    return anyRemote(volumes_) || anyRemote(segments_) || anyRemote(normalGrids_);
+    return anyRemote(volumes_) || anyRemote(normalGrids_);
+}
+
+bool VolumePkg::hasRemoteCacheRoot() const
+{
+    return !remoteCacheRoot_.empty();
+}
+
+std::string VolumePkg::remoteCacheRootOrEmpty() const
+{
+    return remoteCacheRoot_.string();
+}
+
+void VolumePkg::setRemoteCacheRoot(const fs::path& dir)
+{
+    remoteCacheRoot_ = dir;
+    opts_.remoteCacheRoot = dir;
+    persistProjectState();
 }
 
 void VolumePkg::save(const fs::path& target)
@@ -690,71 +775,73 @@ void VolumePkg::saveAutosave()
     writeJsonTo(file);
 }
 
+void VolumePkg::persistProjectState()
+{
+    saveAutosave();
+    if (!path_.empty()) {
+        writeJsonTo(path_);
+    }
+}
+
 void VolumePkg::resolveAll()
 {
-    const auto gen = loadGeneration_.fetch_add(1, std::memory_order_relaxed) + 1;
     loadedVolumes_.clear();
     volumeTagsByID_.clear();
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         loadedSegmentations_.clear();
         segmentationTagsByID_.clear();
-        remoteSegmentInfo_.clear();
     }
     resolvedNormalGridPaths_.clear();
     for (const auto& e : volumes_) resolveVolumeEntry(e);
-    for (const auto& e : segments_) resolveSegmentsEntry(e, gen);
+
+    const vc::project::Entry* selectedSegments = nullptr;
+    if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
+        selectedSegments = findSegmentsEntryByDirectoryName(
+            segments_, *loadFirstSegmentationDir_, path_.parent_path());
+        if (!selectedSegments) {
+            Logger()->warn("Requested load-first segmentation directory '{}' not available; using the selected segmentation directory.",
+                           *loadFirstSegmentationDir_);
+        }
+    }
+    if (!selectedSegments && outputSegments_) {
+        selectedSegments = findSegmentsEntryByLocation(segments_, *outputSegments_, path_.parent_path());
+    }
+    if (!selectedSegments) {
+        selectedSegments = firstLocalSegmentsEntry(segments_);
+    }
+    if (selectedSegments) {
+        outputSegments_ = selectedSegments->location;
+        resolveSegmentsEntry(*selectedSegments);
+    }
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
 }
 
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
     if (vc::project::isLocationRemote(e.location)) {
+        if (!isDirectRemoteZarrLocation(e.location)) {
+            Logger()->warn("Skipping remote volume collection '{}': remote listing is not supported in this branch", e.location);
+            return;
+        }
+
         try {
             auto v = Volume::NewFromUrl(e.location, opts_.remoteCacheRoot, {});
             const auto id = v->id();
+            if (loadedVolumes_.count(id) > 0) {
+                Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
+                return;
+            }
             loadedVolumes_.emplace(id, v);
             if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
             return;
-        } catch (const std::exception&) {
-        }
-
-        auto resolved = vc::resolveRemoteUrl(e.location);
-        std::string base = resolved.httpsUrl;
-        if (base.empty()) {
-            Logger()->warn("Cannot resolve remote volumes URL '{}'", e.location);
-            return;
-        }
-        if (base.back() != '/') base += '/';
-        vc::cache::HttpAuth auth;
-        if (resolved.useAwsSigv4) auth = vc::cache::loadAwsCredentials();
-
-        vc::cache::S3ListResult listing;
-        try {
-            listing = vc::cache::s3ListObjects(base, auth);
         } catch (const std::exception& ex) {
-            Logger()->warn("Cannot list remote volumes at '{}': {}", e.location, ex.what());
-            return;
-        }
-        if (listing.authError) {
-            Logger()->warn("Auth error listing remote volumes at '{}': {}", e.location, listing.errorMessage);
-            return;
+            if (opts_.failOnRemoteError) {
+                throw;
+            }
+            Logger()->warn("Failed to load remote zarr volume '{}': {}", e.location, ex.what());
         }
 
-        std::string locBase = e.location;
-        if (locBase.empty() || locBase.back() != '/') locBase += '/';
-        for (const auto& subName : listing.prefixes) {
-            const std::string subUrl = locBase + subName + "/";
-            try {
-                auto v = Volume::NewFromUrl(subUrl, opts_.remoteCacheRoot, {});
-                const auto id = v->id();
-                if (loadedVolumes_.count(id) > 0) continue;
-                loadedVolumes_.emplace(id, v);
-                if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
-            } catch (const std::exception& ex) {
-                Logger()->warn("Skipping remote volume '{}': {}", subUrl, ex.what());
-            }
-        }
         return;
     }
 
@@ -786,18 +873,8 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     }
 }
 
-void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e, std::uint64_t generation)
+void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e)
 {
-    if (vc::project::isLocationRemote(e.location)) {
-        auto self = weak_from_this();
-        std::thread([self, e, generation]() {
-            auto pkg = self.lock();
-            if (!pkg) return;
-            pkg->loadRemoteSegmentsAsync(e, generation);
-        }).detach();
-        return;
-    }
-
     const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
     if (!fs::exists(path)) {
         Logger()->warn("Skipping segments '{}': path does not exist", e.location);
@@ -825,97 +902,6 @@ void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e, std::uint64_t 
             if (isSegmentDir(child)) loadOne(child);
         }
     }
-}
-
-void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e, std::uint64_t generation)
-{
-    auto stale = [&]() {
-        return shuttingDown_.load(std::memory_order_relaxed)
-            || loadGeneration_.load(std::memory_order_relaxed) != generation;
-    };
-    if (stale()) return;
-
-    auto resolved = vc::resolveRemoteUrl(e.location);
-    std::string base = resolved.httpsUrl;
-    if (base.empty()) {
-        Logger()->warn("Cannot resolve remote segments URL '{}'", e.location);
-        return;
-    }
-    if (base.back() != '/') base += '/';
-    vc::cache::HttpAuth auth;
-    if (resolved.useAwsSigv4) auth = vc::cache::loadAwsCredentials();
-
-    vc::cache::S3ListResult listing;
-    try {
-        listing = vc::cache::s3ListObjects(base, auth);
-    } catch (const std::exception& ex) {
-        Logger()->warn("Cannot list remote segments at '{}': {}", e.location, ex.what());
-        return;
-    }
-    if (listing.authError) {
-        Logger()->warn("Auth error listing remote segments at '{}': {}", e.location, listing.errorMessage);
-        return;
-    }
-    if (stale()) return;
-
-    const auto cacheRoot = opts_.remoteCacheRoot.empty()
-        ? (defaultAutosaveRoot() / "remote_cache")
-        : opts_.remoteCacheRoot;
-
-    std::string baseNoSlash = base;
-    while (!baseNoSlash.empty() && baseNoSlash.back() == '/') baseNoSlash.pop_back();
-
-    const size_t total = listing.prefixes.size();
-    if (total == 0) return;
-
-    const size_t threadCount = std::min<size_t>(16, total);
-    std::atomic<size_t> nextIdx{0};
-    std::atomic<size_t> insertedSinceNotify{0};
-
-    auto worker = [&]() {
-        while (!stale()) {
-            const size_t i = nextIdx.fetch_add(1);
-            if (i >= total) return;
-            const auto& prefix = listing.prefixes[i];
-            std::string trimmed = prefix;
-            if (!trimmed.empty() && trimmed.back() == '/') trimmed.pop_back();
-            const auto slash = trimmed.find_last_of('/');
-            std::string segId = (slash == std::string::npos) ? trimmed : trimmed.substr(slash + 1);
-            if (segId.empty() || segId[0] == '.') continue;
-            try {
-                auto localDir = vc::downloadRemoteSegmentMetadataOnly(
-                    baseNoSlash, segId, cacheRoot, auth, vc::RemoteSegmentSource::Direct);
-                auto s = Segmentation::New(localDir);
-                const auto id = s->id();
-                bool inserted = false;
-                {
-                    std::lock_guard<std::mutex> lk(segmentsMutex_);
-                    if (stale()) return;
-                    if (loadedSegmentations_.count(id) > 0) continue;
-                    loadedSegmentations_.emplace(id, s);
-                    if (!e.tags.empty()) segmentationTagsByID_[id] = e.tags;
-                    remoteSegmentInfo_[id] = {baseNoSlash, cacheRoot, auth};
-                    inserted = true;
-                }
-                if (inserted) {
-                    size_t prev = insertedSinceNotify.fetch_add(1);
-                    if (prev + 1 >= 16) {
-                        insertedSinceNotify.fetch_sub(prev + 1);
-                        notifySegmentsChanged();
-                    }
-                }
-            } catch (const std::exception& ex) {
-                Logger()->warn("Failed remote segment '{}': {}", segId, ex.what());
-            }
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(threadCount);
-    for (size_t t = 0; t < threadCount; ++t) threads.emplace_back(worker);
-    for (auto& th : threads) th.join();
-
-    if (!stale()) notifySegmentsChanged();
 }
 
 void VolumePkg::setSegmentsChangedCallback(std::function<void()> cb)
@@ -962,6 +948,7 @@ utils::Json VolumePkg::toJson() const
     j["volumes"] = entriesToJson(volumes_);
     j["segments"] = entriesToJson(segments_);
     j["normal_grids"] = entriesToJson(normalGrids_);
+    if (!remoteCacheRoot_.empty()) j["remote_cache_root"] = remoteCacheRoot_.string();
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     return j;
 }
@@ -973,6 +960,12 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("volumes")) volumes_ = entriesFromJson(j.at("volumes"));
     if (j.contains("segments")) segments_ = entriesFromJson(j.at("segments"));
     if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));
+    if (j.contains("remote_cache_root")) {
+        remoteCacheRoot_ = j.at("remote_cache_root").get_string();
+        if (!remoteCacheRoot_.empty()) {
+            opts_.remoteCacheRoot = remoteCacheRoot_;
+        }
+    }
     if (j.contains("output_segments")) outputSegments_ = j.at("output_segments").get_string();
 }
 
@@ -1019,7 +1012,6 @@ std::vector<fs::path> VolumePkg::availableSegmentPaths() const
     std::vector<fs::path> out;
     out.reserve(segments_.size());
     for (const auto& e : segments_) {
-        if (vc::project::isLocationRemote(e.location)) continue;
         out.push_back(vc::project::resolveLocalPath(e.location, path_.parent_path()));
     }
     return out;
@@ -1028,7 +1020,6 @@ std::vector<fs::path> VolumePkg::availableSegmentPaths() const
 fs::path VolumePkg::findSegmentPathByName(const std::string& dirName) const
 {
     for (const auto& e : segments_) {
-        if (vc::project::isLocationRemote(e.location)) continue;
         const auto p = vc::project::resolveLocalPath(e.location, path_.parent_path());
         if (p.filename().string() == dirName) return p;
     }
@@ -1037,26 +1028,40 @@ fs::path VolumePkg::findSegmentPathByName(const std::string& dirName) const
 
 void VolumePkg::setSegmentationDirectory(const std::string& dirName)
 {
-    for (const auto& e : segments_) {
-        if (vc::project::isLocationRemote(e.location)) continue;
-        if (vc::project::resolveLocalPath(e.location, path_.parent_path()).filename().string() == dirName) {
-            setOutputSegments(e.location);
-            return;
-        }
+    if (const auto* entry = findSegmentsEntryByDirectoryName(segments_, dirName, path_.parent_path())) {
+        setOutputSegments(entry->location);
+        return;
     }
     Logger()->warn("setSegmentationDirectory('{}'): no matching segments entry", dirName);
 }
 
 void VolumePkg::refreshSegmentations()
 {
-    const auto gen = loadGeneration_.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         loadedSegmentations_.clear();
         segmentationTagsByID_.clear();
-        remoteSegmentInfo_.clear();
     }
-    for (const auto& e : segments_) resolveSegmentsEntry(e, gen);
+
+    const vc::project::Entry* selectedSegments = nullptr;
+    if (outputSegments_) {
+        selectedSegments = findSegmentsEntryByLocation(segments_, *outputSegments_, path_.parent_path());
+    }
+    if (!selectedSegments && loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
+        selectedSegments = findSegmentsEntryByDirectoryName(
+            segments_, *loadFirstSegmentationDir_, path_.parent_path());
+        if (!selectedSegments) {
+            Logger()->warn("Requested load-first segmentation directory '{}' not available; using the selected segmentation directory.",
+                           *loadFirstSegmentationDir_);
+        }
+    }
+    if (!selectedSegments) {
+        selectedSegments = firstLocalSegmentsEntry(segments_);
+    }
+    if (selectedSegments) {
+        outputSegments_ = selectedSegments->location;
+        resolveSegmentsEntry(*selectedSegments);
+    }
 }
 
 bool VolumePkg::addSingleSegmentation(const std::string& id)

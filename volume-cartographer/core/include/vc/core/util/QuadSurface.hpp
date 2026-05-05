@@ -321,12 +321,6 @@ public:
     // disk on next access. No-op for in-memory-only surfaces.
     void unloadPoints();
 
-    // Crop _points to the bounding box of valid (non-sentinel) cells.
-    // Shifts _center so existing ptr-space coords still resolve to the same
-    // world positions. Returns true if a trim was applied. No-op if the trim
-    // would save less than 25%.
-    bool trimToValidBbox();
-
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
     virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { const_cast<QuadSurface*>(this)->ensureLoaded(); return _points.get(); }

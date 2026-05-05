@@ -17,9 +17,7 @@
 #include <omp.h>
 
 
-#include "vc/core/types/VcDataset.hpp"
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/types/Volume.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
@@ -483,9 +481,16 @@ void run_generate(const po::variables_map& vm) {
     std::cout << "Input level: " << input_level << std::endl;
     std::cout << "Output directory: " << output_path << std::endl;
 
-    const fs::path input_dataset_path = fs::path(input_path) / std::to_string(input_level);
-    auto ds = std::make_unique<vc::VcDataset>(input_dataset_path);
-    const auto shape = ds->shape();
+    Volume input_volume{fs::path(input_path)};
+    auto* input_chunks = input_volume.chunkedCache();
+    const auto level_shape = input_chunks->shape(input_level);
+    const auto level_chunk_shape = input_chunks->chunkShape(input_level);
+    const size_t dtype_size = input_chunks->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
+    const std::vector<size_t> shape = {
+        static_cast<size_t>(level_shape[0]),
+        static_cast<size_t>(level_shape[1]),
+        static_cast<size_t>(level_shape[2]),
+    };
 
     fs::path output_fs_path(output_path);
     fs::create_directories(output_fs_path / "xy");
@@ -517,14 +522,14 @@ void run_generate(const po::variables_map& vm) {
             num_threads,
             sparse_volume,
             chunk_budget_mib,
-            ds->dtypeSize());
+            dtype_size);
         max_estimated_batch_bytes = std::max(max_estimated_batch_bytes, batch_plan.estimatedBatchBytes);
     }
     const size_t cache_budget_bytes = std::min<size_t>(
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
 
-    auto cache = vc::cache::openFilesystemPipeline(ds.get(), cache_budget_bytes, ds->path());
+    input_volume.setCacheBudget(cache_budget_bytes);
 
     RunMetrics run_metrics;
     run_metrics.inputPath = input_path;
@@ -545,7 +550,11 @@ void run_generate(const po::variables_map& vm) {
     for (auto& scratch : thread_scratch) {
         scratch.traces.reserve(256);
     }
-    const auto source_chunk_shape = ds->defaultChunkShape();
+    const std::vector<size_t> source_chunk_shape = {
+        static_cast<size_t>(level_chunk_shape[0]),
+        static_cast<size_t>(level_chunk_shape[1]),
+        static_cast<size_t>(level_chunk_shape[2]),
+    };
 
     for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
         DirectionMetrics dir_metrics;
@@ -565,7 +574,7 @@ void run_generate(const po::variables_map& vm) {
             num_threads,
             sparse_volume,
             chunk_budget_mib,
-            ds->dtypeSize());
+            dtype_size);
         const size_t chunk_size_tgt = std::max<size_t>(1, batch_plan.chunkSizeTarget);
         dir_metrics.chunkSizeTarget = chunk_size_tgt;
         dir_metrics.bytesPerSlice = batch_plan.bytesPerSlice;
@@ -645,7 +654,7 @@ void run_generate(const po::variables_map& vm) {
 
                 if (!assembled_slices.empty()) {
                     std::array<size_t, 3> slab_shape;
-                    cv::Vec3i slab_offset;
+                    std::array<int, 3> slab_offset;
                     switch (dir) {
                     case SliceDirection::XY:
                         slab_shape = {source_chunk_shape[0], shape[1], shape[2]};
@@ -682,7 +691,7 @@ void run_generate(const po::variables_map& vm) {
 
                     const auto read_start = std::chrono::steady_clock::now();
                     Array3D<uint8_t> chunk_data(slab_shape);
-                    readArea3D(chunk_data, slab_offset, cache.get(), 0);
+                    input_volume.readZYX(chunk_data, slab_offset, input_level);
                     dir_metrics.timingTotals["read_chunk"] += std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - read_start).count();
                     dir_metrics.timingCounts["read_chunk"] += 1;

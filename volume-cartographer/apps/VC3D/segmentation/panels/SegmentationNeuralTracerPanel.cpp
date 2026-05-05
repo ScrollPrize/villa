@@ -81,7 +81,7 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
     _groupNeuralTracer->addRow(tr("Model type:"), [&](QHBoxLayout* row) {
         _comboNeuralModelType = new QComboBox(neuralParent);
         _comboNeuralModelType->addItem(tr("Heatmap"), static_cast<int>(NeuralTracerModelType::Heatmap));
-        _comboNeuralModelType->addItem(tr("Extrapolation growth"), static_cast<int>(NeuralTracerModelType::DenseDisplacement));
+        _comboNeuralModelType->addItem(tr("Dense displacement"), static_cast<int>(NeuralTracerModelType::DenseDisplacement));
         _comboNeuralModelType->addItem(tr("Displacement Copy"), static_cast<int>(NeuralTracerModelType::DisplacementCopy));
         _comboNeuralModelType->setToolTip(tr("Select which neural tracing model path to use."));
         row->addWidget(_comboNeuralModelType);
@@ -165,7 +165,7 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
     _groupNeuralTracer->addRow(tr("Checkpoint:"), [&](QHBoxLayout* row) {
         _neuralCheckpointEdit = new QLineEdit(neuralParent);
         _neuralCheckpointEdit->setPlaceholderText(tr("Path to model checkpoint (.pt)"));
-        _neuralCheckpointEdit->setToolTip(tr("Checkpoint path used for Heatmap and for Extrapolation growth when Checkpoint path is set to Custom path."));
+        _neuralCheckpointEdit->setToolTip(tr("Checkpoint path used for Heatmap and Dense displacement when Checkpoint path is set to Custom path."));
         _neuralCheckpointBrowse = new QToolButton(neuralParent);
         _neuralCheckpointBrowse->setText(QStringLiteral("..."));
         _neuralCheckpointBrowse->setToolTip(tr("Browse for checkpoint file."));

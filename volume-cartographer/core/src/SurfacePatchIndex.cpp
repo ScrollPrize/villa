@@ -173,6 +173,295 @@ inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
         && low[0] <= high[0] && low[1] <= high[1] && low[2] <= high[2];
 }
 
+struct RawSurfaceFilter {
+    QuadSurface* only = nullptr;
+    bool hasInclude = false;
+    bool rejectAllIncludes = false;
+    std::unordered_set<QuadSurface*> include;
+    std::unordered_set<QuadSurface*> exclude;
+
+    bool accepts(QuadSurface* surface) const
+    {
+        if (!surface || (only && surface != only)) {
+            return false;
+        }
+        if (hasInclude) {
+            if (rejectAllIncludes || include.find(surface) == include.end()) {
+                return false;
+            }
+        }
+        return exclude.find(surface) == exclude.end();
+    }
+};
+
+RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& filter)
+{
+    RawSurfaceFilter raw;
+    raw.only = filter.only ? filter.only.get() : nullptr;
+
+    if (filter.include) {
+        raw.hasInclude = true;
+        raw.include.reserve(filter.include->size());
+        for (const auto& surface : *filter.include) {
+            if (surface) {
+                raw.include.insert(surface.get());
+            }
+        }
+        raw.rejectAllIncludes = raw.include.empty();
+    }
+
+    if (filter.exclude) {
+        raw.exclude.reserve(filter.exclude->size());
+        for (const auto& surface : *filter.exclude) {
+            if (surface) {
+                raw.exclude.insert(surface.get());
+            }
+        }
+    }
+
+    return raw;
+}
+
+struct TiffMmapInfo {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint16_t bits = 0;
+    uint16_t sampleFormat = SAMPLEFORMAT_UINT;
+    uint16_t samplesPerPixel = 1;
+    uint16_t compression = COMPRESSION_NONE;
+    uint32_t rowsPerStrip = 0;
+    tstrip_t strips = 0;
+    bool tiled = false;
+    bool byteSwapped = false;
+};
+
+TiffMmapInfo readTiffMmapInfo(const std::filesystem::path& path)
+{
+    TIFF* tif = TIFFOpen(path.string().c_str(), "r");
+    if (!tif) {
+        throw std::runtime_error("failed to open TIFF: " + path.string());
+    }
+
+    TiffMmapInfo info;
+    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &info.width);
+    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &info.height);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &info.bits);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &info.sampleFormat);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &info.samplesPerPixel);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &info.compression);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &info.rowsPerStrip);
+    info.strips = TIFFNumberOfStrips(tif);
+    info.tiled = TIFFIsTiled(tif);
+    info.byteSwapped = TIFFIsByteSwapped(tif);
+    TIFFClose(tif);
+    return info;
+}
+
+bool isTiffMmapCompatible(const TiffMmapInfo& info)
+{
+    return !info.tiled &&
+           !info.byteSwapped &&
+           info.samplesPerPixel == 1 &&
+           info.bits == 32 &&
+           info.sampleFormat == SAMPLEFORMAT_IEEEFP &&
+           info.compression == COMPRESSION_NONE &&
+           info.strips > 0 &&
+           info.rowsPerStrip > 0;
+}
+
+float tiffSampleToFloat(const uint8_t* p, uint16_t sampleFormat, uint16_t bits)
+{
+    switch (sampleFormat) {
+        case SAMPLEFORMAT_IEEEFP:
+            if (bits == 32) {
+                float v = 0.0f;
+                std::memcpy(&v, p, sizeof(v));
+                return v;
+            }
+            if (bits == 64) {
+                double v = 0.0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        case SAMPLEFORMAT_UINT:
+            if (bits == 8) {
+                return static_cast<float>(*p);
+            }
+            if (bits == 16) {
+                uint16_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            if (bits == 32) {
+                uint32_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        case SAMPLEFORMAT_INT:
+            if (bits == 8) {
+                return static_cast<float>(*reinterpret_cast<const int8_t*>(p));
+            }
+            if (bits == 16) {
+                int16_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            if (bits == 32) {
+                int32_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        default:
+            break;
+    }
+    throw std::runtime_error("unsupported TIFF sample type");
+}
+
+std::vector<float> readTiffBandAsFloat(const std::filesystem::path& path, TiffMmapInfo* outInfo)
+{
+    TIFF* tif = TIFFOpen(path.string().c_str(), "r");
+    if (!tif) {
+        throw std::runtime_error("failed to open TIFF: " + path.string());
+    }
+
+    TiffMmapInfo info = readTiffMmapInfo(path);
+    if (info.width == 0 || info.height == 0 || info.samplesPerPixel != 1) {
+        TIFFClose(tif);
+        throw std::runtime_error("unsupported TIFF geometry: " + path.string());
+    }
+    if (!(info.bits == 8 || info.bits == 16 || info.bits == 32 || info.bits == 64)) {
+        TIFFClose(tif);
+        throw std::runtime_error("unsupported TIFF bits per sample: " + path.string());
+    }
+    const int bytesPer = (info.bits + 7) / 8;
+
+    std::vector<float> pixels(static_cast<std::size_t>(info.width) * info.height);
+    if (TIFFIsTiled(tif)) {
+        uint32_t tileW = 0;
+        uint32_t tileH = 0;
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tileW);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tileH);
+        if (tileW == 0 || tileH == 0) {
+            TIFFClose(tif);
+            throw std::runtime_error("invalid TIFF tile geometry: " + path.string());
+        }
+
+        const tmsize_t tileBytes = TIFFTileSize(tif);
+        std::vector<uint8_t> tileBuf(static_cast<std::size_t>(tileBytes));
+        for (uint32_t y0 = 0; y0 < info.height; y0 += tileH) {
+            const uint32_t dy = std::min(tileH, info.height - y0);
+            for (uint32_t x0 = 0; x0 < info.width; x0 += tileW) {
+                const uint32_t dx = std::min(tileW, info.width - x0);
+                const ttile_t tidx = TIFFComputeTile(tif, x0, y0, 0, 0);
+                if (TIFFReadEncodedTile(tif, tidx, tileBuf.data(), tileBytes) < 0) {
+                    TIFFClose(tif);
+                    throw std::runtime_error("failed reading tile: " + path.string());
+                }
+                for (uint32_t y = 0; y < dy; ++y) {
+                    const uint8_t* row = tileBuf.data() + static_cast<std::size_t>(y) * tileW * bytesPer;
+                    for (uint32_t x = 0; x < dx; ++x) {
+                        pixels[static_cast<std::size_t>(y0 + y) * info.width + x0 + x] =
+                            tiffSampleToFloat(row + static_cast<std::size_t>(x) * bytesPer,
+                                              info.sampleFormat,
+                                              info.bits);
+                    }
+                }
+            }
+        }
+    } else {
+        const tmsize_t scanBytes = TIFFScanlineSize(tif);
+        std::vector<uint8_t> scanBuf(static_cast<std::size_t>(scanBytes));
+        for (uint32_t y = 0; y < info.height; ++y) {
+            if (TIFFReadScanline(tif, scanBuf.data(), y, 0) != 1) {
+                TIFFClose(tif);
+                throw std::runtime_error("failed reading scanline: " + path.string());
+            }
+            for (uint32_t x = 0; x < info.width; ++x) {
+                pixels[static_cast<std::size_t>(y) * info.width + x] =
+                    tiffSampleToFloat(scanBuf.data() + static_cast<std::size_t>(x) * bytesPer,
+                                      info.sampleFormat,
+                                      info.bits);
+            }
+        }
+    }
+
+    TIFFClose(tif);
+    if (outInfo) {
+        *outInfo = info;
+    }
+    return pixels;
+}
+
+void writeMmapCompatibleTiffBand(const std::filesystem::path& path,
+                                 const TiffMmapInfo& info,
+                                 const std::vector<float>& pixels)
+{
+    const std::filesystem::path tmp = path.string() + ".mmap_tmp";
+    TIFF* out = TIFFOpen(tmp.string().c_str(), "w");
+    if (!out) {
+        throw std::runtime_error("failed to create " + tmp.string());
+    }
+
+    TIFFSetField(out, TIFFTAG_IMAGEWIDTH, info.width);
+    TIFFSetField(out, TIFFTAG_IMAGELENGTH, info.height);
+    TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 1);
+    TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 32);
+    TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+    TIFFSetField(out, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+    TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, info.height);
+
+    const tsize_t bytes = static_cast<tsize_t>(pixels.size() * sizeof(float));
+    if (TIFFWriteEncodedStrip(out, 0, const_cast<float*>(pixels.data()), bytes) < 0) {
+        TIFFClose(out);
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        throw std::runtime_error("failed writing " + tmp.string());
+    }
+    TIFFClose(out);
+    std::filesystem::rename(tmp, path);
+}
+
+bool repairTifxyzBandForMmap(const std::filesystem::path& path)
+{
+    const TiffMmapInfo info = readTiffMmapInfo(path);
+    if (isTiffMmapCompatible(info)) {
+        return false;
+    }
+    if (info.samplesPerPixel != 1 ||
+        info.bits != 32 ||
+        info.sampleFormat != SAMPLEFORMAT_IEEEFP) {
+        std::ostringstream oss;
+        oss << "cannot repair TIFF for mmap without changing sample type: "
+            << path.string()
+            << " spp=" << info.samplesPerPixel
+            << " bps=" << info.bits
+            << " sample_format=" << info.sampleFormat;
+        throw std::runtime_error(oss.str());
+    }
+
+    TiffMmapInfo readBack;
+    auto pixels = readTiffBandAsFloat(path, &readBack);
+    writeMmapCompatibleTiffBand(path, readBack, pixels);
+    return true;
+}
+
+void repairTifxyzForMmapIfNeeded(const std::filesystem::path& dir)
+{
+    bool changed = false;
+    changed = repairTifxyzBandForMmap(dir / "x.tif") || changed;
+    changed = repairTifxyzBandForMmap(dir / "y.tif") || changed;
+    changed = repairTifxyzBandForMmap(dir / "z.tif") || changed;
+    if (changed) {
+        std::cout << "[SurfacePatchIndex] repaired tifxyz TIFF layout for mmap: "
+                  << dir.string() << std::endl;
+    }
+}
+
 class FileMapping {
 public:
     FileMapping() = default;
@@ -355,6 +644,7 @@ class MappedTifxyzSurface {
 public:
     explicit MappedTifxyzSurface(const std::filesystem::path& dir)
     {
+        repairTifxyzForMmapIfNeeded(dir);
         x_.open(dir / "x.tif");
         y_.open(dir / "y.tif");
         z_.open(dir / "z.tif");
@@ -1081,7 +1371,6 @@ std::string SurfacePatchIndex::cacheKeyForSurfaces(const std::vector<SurfacePtr>
             hash_path_identity(h, base / "x.tif");
             hash_path_identity(h, base / "y.tif");
             hash_path_identity(h, base / "z.tif");
-            hash_path_identity(h, base / "overlapping.json");
         }
     }
 
@@ -1764,19 +2053,28 @@ bool SurfacePatchIndex::containsSurface(const SurfacePtr& surface) const
 }
 
 std::optional<SurfacePatchIndex::LookupResult>
-SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
+SurfacePatchIndex::locate(const PointQuery& pointQuery) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
         return std::nullopt;
     }
 
-    const float tol = std::max(tolerance, 0.0f);
-    Impl::Point3 min_pt(worldPoint[0] - tol, worldPoint[1] - tol, worldPoint[2] - tol);
-    Impl::Point3 max_pt(worldPoint[0] + tol, worldPoint[1] + tol, worldPoint[2] + tol);
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
     Impl::Box3 query(min_pt, max_pt);
 
     const float toleranceSq = tol * tol;
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(pointQuery.surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return std::nullopt;
+    }
     SurfacePatchIndex::LookupResult best;
     QuadSurface* bestSurfaceRaw = nullptr;
     float bestDistSq = toleranceSq;
@@ -1799,12 +2097,12 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface != targetSurface.get()) {
+        if (!surfaceFilter.accepts(rec.surface)) {
             return;
         }
 
         Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
-                                                  impl_->samplingStride, worldPoint);
+                                                  impl_->samplingStride, pointQuery.worldPoint);
         if (!hit.valid || hit.distSq > bestDistSq) {
             return;
         }
@@ -1848,85 +2146,242 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
     return best;
 }
 
-void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
-                                       const SurfacePtr& targetSurface,
-                                       std::vector<TriangleCandidate>& outCandidates) const
+std::vector<SurfacePatchIndex::LookupResult>
+SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
 {
-    outCandidates.clear();
-    // Rough upper bound: keep whatever capacity the vector already had.
-    // A typical viewport has a few thousand triangle candidates; a small
-    // reserve avoids 3-4 reallocations during the push_back loop.
-    if (outCandidates.capacity() < 2048) {
-        outCandidates.reserve(2048);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
+        return {};
     }
-    forEachTriangleImpl(bounds, targetSurface, nullptr, [&](const TriangleCandidate& candidate) {
-        outCandidates.push_back(candidate);
-    });
+
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
+    Impl::Box3 query(min_pt, max_pt);
+
+    const float toleranceSq = tol * tol;
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(pointQuery.surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return {};
+    }
+
+    struct SurfaceInfo {
+        cv::Vec3f center;
+        cv::Vec2f scale;
+    };
+    std::unordered_map<QuadSurface*, SurfaceInfo> surfaceInfoCache;
+    surfaceInfoCache.reserve(4);
+    auto ensureSurfaceInfo = [&](QuadSurface* surface) -> const SurfaceInfo& {
+        auto it = surfaceInfoCache.find(surface);
+        if (it != surfaceInfoCache.end()) {
+            return it->second;
+        }
+        SurfaceInfo info{surface->center(), surface->scale()};
+        auto [insertIt, _] = surfaceInfoCache.emplace(surface, info);
+        return insertIt->second;
+    };
+
+    struct SurfaceHit {
+        LookupResult result;
+        float distSq = std::numeric_limits<float>::infinity();
+    };
+    std::unordered_map<QuadSurface*, SurfaceHit> hits;
+    hits.reserve(8);
+
+    auto processEntry = [&](const Impl::Entry& entry) {
+        const Impl::PatchRecord& rec = entry.second;
+        if (!surfaceFilter.accepts(rec.surface)) {
+            return;
+        }
+
+        Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
+                                                  impl_->samplingStride, pointQuery.worldPoint);
+        if (!hit.valid || hit.distSq > toleranceSq) {
+            return;
+        }
+
+        auto& best = hits[rec.surface];
+        if (hit.distSq > best.distSq) {
+            return;
+        }
+
+        const SurfaceInfo& info = ensureSurfaceInfo(rec.surface);
+        const float absX = static_cast<float>(rec.i) + hit.u;
+        const float absY = static_cast<float>(rec.j) + hit.v;
+        best.result.ptr = {
+            absX - info.center[0] * info.scale[0],
+            absY - info.center[1] * info.scale[1],
+            0.0f
+        };
+        best.distSq = hit.distSq;
+    };
+
+    try {
+        impl_->tree->query(
+            bgi::intersects(query),
+            boost::make_function_output_iterator(processEntry));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locateAll query failed: " << e.what() << std::endl;
+        return {};
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locateAll query failed: unknown exception" << std::endl;
+        return {};
+    }
+
+    std::vector<LookupResult> results;
+    results.reserve(hits.size());
+    for (auto& [surfaceRaw, hit] : hits) {
+        auto srIt = impl_->surfaceRecords.find(surfaceRaw);
+        if (srIt == impl_->surfaceRecords.end()) {
+            continue;
+        }
+        hit.result.surface = srIt->second.surface;
+        hit.result.distance = std::sqrt(hit.distSq);
+        results.push_back(std::move(hit.result));
+    }
+    return results;
 }
 
-void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
-                                       const std::unordered_set<SurfacePtr>& targetSurfaces,
-                                       std::vector<TriangleCandidate>& outCandidates) const
+std::vector<SurfacePatchIndex::SurfacePtr>
+SurfacePatchIndex::locateSurfaces(const PointQuery& pointQuery) const
 {
-    outCandidates.clear();
-    if (targetSurfaces.empty()) {
-        return;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
+        return {};
     }
-    if (outCandidates.capacity() < 2048) {
-        outCandidates.reserve(2048);
+
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
+    Impl::Box3 query(min_pt, max_pt);
+    const float toleranceSq = tol * tol;
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(pointQuery.surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return {};
     }
-    forEachTriangleImpl(bounds, nullptr, &targetSurfaces, [&](const TriangleCandidate& candidate) {
-        outCandidates.push_back(candidate);
-    });
+
+    std::vector<SurfacePtr> surfaces;
+    surfaces.reserve(8);
+    std::unordered_set<QuadSurface*> emitted;
+    emitted.reserve(8);
+
+    auto processEntry = [&](const Impl::Entry& entry) {
+        const Impl::PatchRecord& rec = entry.second;
+        if (!surfaceFilter.accepts(rec.surface) || emitted.find(rec.surface) != emitted.end()) {
+            return;
+        }
+
+        Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
+                                                  impl_->samplingStride, pointQuery.worldPoint);
+        if (!hit.valid || hit.distSq > toleranceSq) {
+            return;
+        }
+
+        auto srIt = impl_->surfaceRecords.find(rec.surface);
+        if (srIt == impl_->surfaceRecords.end()) {
+            return;
+        }
+        emitted.insert(rec.surface);
+        surfaces.push_back(srIt->second.surface);
+    };
+
+    try {
+        impl_->tree->query(
+            bgi::intersects(query),
+            boost::make_function_output_iterator(processEntry));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locateSurfaces query failed: "
+                  << e.what() << std::endl;
+        return {};
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locateSurfaces query failed: unknown exception"
+                  << std::endl;
+        return {};
+    }
+
+    return surfaces;
 }
 
-void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
-                                        const SurfacePtr& targetSurface,
-                                        const std::function<void(const TriangleCandidate&)>& visitor) const
-{
-    if (!visitor) return;
-    forEachTriangleImpl(bounds, targetSurface, nullptr, visitor);
-}
-
-void SurfacePatchIndex::forEachTriangleIntersectingRay(
-    const Rect3D& bounds,
-    const SurfacePtr& targetSurface,
-    const cv::Vec3f& origin,
-    const cv::Vec3f& dir,
-    float minT,
-    float maxT,
+void SurfacePatchIndex::forEachTriangle(
+    const TriangleQuery& query,
     const std::function<void(const TriangleCandidate&)>& visitor) const
 {
-    if (!visitor || minT > maxT) {
+    if (!visitor) {
         return;
     }
 
-    auto rayIntersectsBox = [&](const Impl::Box3& box) {
+    auto patchFilter = [&](const Impl::Box3& box) {
+        if (!query.patchFilter) {
+            return true;
+        }
+        const PatchBounds bounds{
+            cv::Vec3f(box.min_corner().get<0>(),
+                      box.min_corner().get<1>(),
+                      box.min_corner().get<2>()),
+            cv::Vec3f(box.max_corner().get<0>(),
+                      box.max_corner().get<1>(),
+                      box.max_corner().get<2>())
+        };
+        return query.patchFilter(bounds);
+    };
+
+    forEachTriangleImpl(query.bounds,
+                        query.surfaces,
+                        visitor,
+                        patchFilter);
+}
+
+void SurfacePatchIndex::forEachTriangle(
+    const RayQuery& query,
+    const std::function<void(const TriangleCandidate&)>& visitor) const
+{
+    if (!visitor || !isFinitePoint(query.src) || !isFinitePoint(query.end) ||
+        !std::isfinite(query.minT) || !std::isfinite(query.bboxPadding)) {
+        return;
+    }
+
+    const cv::Vec3f ray = query.end - query.src;
+    const float maxT = cv::norm(ray);
+    if (!std::isfinite(maxT) || maxT <= 1e-6f || query.minT > maxT) {
+        return;
+    }
+
+    const cv::Vec3f dir = ray * (1.0f / maxT);
+    Rect3D bounds;
+    for (int ax = 0; ax < 3; ++ax) {
+        bounds.low[ax] = std::min(query.src[ax], query.end[ax]) - query.bboxPadding;
+        bounds.high[ax] = std::max(query.src[ax], query.end[ax]) + query.bboxPadding;
+    }
+
+    TriangleQuery triangleQuery;
+    triangleQuery.bounds = bounds;
+    triangleQuery.surfaces = query.surfaces;
+    triangleQuery.patchFilter = [src = query.src, dir, minT = query.minT, maxT](
+        const PatchBounds& patchBounds) {
         float t0 = minT;
         float t1 = maxT;
-        const float lows[3] = {
-            box.min_corner().get<0>(),
-            box.min_corner().get<1>(),
-            box.min_corner().get<2>()
-        };
-        const float highs[3] = {
-            box.max_corner().get<0>(),
-            box.max_corner().get<1>(),
-            box.max_corner().get<2>()
-        };
-
         for (int ax = 0; ax < 3; ++ax) {
             const float d = dir[ax];
             if (std::abs(d) <= 1e-8f) {
-                if (origin[ax] < lows[ax] || origin[ax] > highs[ax]) {
+                if (src[ax] < patchBounds.low[ax] || src[ax] > patchBounds.high[ax]) {
                     return false;
                 }
                 continue;
             }
 
             const float invD = 1.0f / d;
-            float nearT = (lows[ax] - origin[ax]) * invD;
-            float farT = (highs[ax] - origin[ax]) * invD;
+            float nearT = (patchBounds.low[ax] - src[ax]) * invD;
+            float farT = (patchBounds.high[ax] - src[ax]) * invD;
             if (nearT > farT) {
                 std::swap(nearT, farT);
             }
@@ -1936,28 +2391,16 @@ void SurfacePatchIndex::forEachTriangleIntersectingRay(
                 return false;
             }
         }
-
         return true;
     };
 
-    forEachTriangleImpl(bounds, targetSurface, nullptr, visitor, rayIntersectsBox);
-}
-
-void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
-                                        const std::unordered_set<SurfacePtr>& targetSurfaces,
-                                        const std::function<void(const TriangleCandidate&)>& visitor) const
-{
-    if (!visitor || targetSurfaces.empty()) {
-        return;
-    }
-    forEachTriangleImpl(bounds, nullptr, &targetSurfaces, visitor);
+    forEachTriangle(triangleQuery, visitor);
 }
 
 template <typename Visitor, typename PatchFilter>
 void SurfacePatchIndex::forEachTriangleImpl(
     const Rect3D& bounds,
-    const SurfacePtr& targetSurface,
-    const std::unordered_set<SurfacePtr>* filterSurfaces,
+    const SurfaceFilter& surfaces,
     Visitor&& visitor,
     PatchFilter&& patchFilter) const
 {
@@ -1983,27 +2426,16 @@ void SurfacePatchIndex::forEachTriangleImpl(
     };
     std::unordered_map<QuadSurface*, SurfaceCache> surfaceCacheMap;
     surfaceCacheMap.reserve(std::min<std::size_t>(
-        filterSurfaces ? filterSurfaces->size() : 4, 4096));
+        surfaces.include ? surfaces.include->size() : 4, 4096));
 
-    std::unordered_set<QuadSurface*> filterSurfaceRaw;
-    if (filterSurfaces) {
-        filterSurfaceRaw.reserve(filterSurfaces->size());
-        for (const auto& surface : *filterSurfaces) {
-            if (surface) {
-                filterSurfaceRaw.insert(surface.get());
-            }
-        }
-        if (filterSurfaceRaw.empty()) {
-            return;
-        }
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return;
     }
 
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface != targetSurface.get()) {
-            return;
-        }
-        if (filterSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) {
+        if (!surfaceFilter.accepts(rec.surface)) {
             return;
         }
         // Optional caller-supplied bbox-level reject (e.g. plane-vs-bbox).
@@ -2469,12 +2901,6 @@ void SurfacePatchIndex::setReadOnly(bool readOnly)
     impl_->tree.reset();
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
-}
-
-bool SurfacePatchIndex::readOnly() const
-{
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    return impl_ && impl_->readOnly;
 }
 
 std::optional<SurfacePatchIndex::Impl::Entry>
@@ -3034,15 +3460,6 @@ bool SurfacePatchIndex::hasPendingUpdates(const SurfacePtr& surface) const
 // Generation tracking for undo/redo detection
 // ============================================================================
 
-void SurfacePatchIndex::incrementGeneration(const SurfacePtr& surface)
-{
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !surface) {
-        return;
-    }
-    ++impl_->surfaceGenerations[surface.get()];
-}
-
 uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -3051,36 +3468,6 @@ uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
     }
     auto it = impl_->surfaceGenerations.find(surface.get());
     return it != impl_->surfaceGenerations.end() ? it->second : 0;
-}
-
-void SurfacePatchIndex::setGeneration(const SurfacePtr& surface, uint64_t gen)
-{
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !surface) {
-        return;
-    }
-    impl_->surfaceGenerations[surface.get()] = gen;
-}
-
-bool SurfacePatchIndex::segmentsEqual(const std::vector<TriangleSegment>& a,
-                                      const std::vector<TriangleSegment>& b,
-                                      float epsilon)
-{
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-        for (int j = 0; j < 2; ++j) {
-            const auto& wa = a[i].world[j];
-            const auto& wb = b[i].world[j];
-            if (std::abs(wa[0] - wb[0]) > epsilon ||
-                std::abs(wa[1] - wb[1]) > epsilon ||
-                std::abs(wa[2] - wb[2]) > epsilon) {
-                return false;
-            }
-        }
-    }
-    return true;
 }
 
 std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<SurfacePatchIndex::TriangleSegment>>
@@ -3181,7 +3568,9 @@ SurfacePatchIndex::computePlaneIntersections(
     // against the plane right there and append the resulting segment to
     // the per-surface bucket. Skips the intermediate TriangleCandidate
     // vector and the bySurface grouping pass entirely.
-    forEachTriangleImpl(viewBbox, nullptr, &targets,
+    SurfaceFilter surfaceFilter;
+    surfaceFilter.include = &targets;
+    forEachTriangleImpl(viewBbox, surfaceFilter,
         [&](const TriangleCandidate& tri) {
             auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
             if (!seg) return;

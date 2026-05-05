@@ -8,9 +8,9 @@
 
 class CState;
 class VCCollection;
-class CAdaptiveVolumeViewer;
+class CChunkedVolumeViewer;
 #ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
+#define CTiledVolumeViewer CChunkedVolumeViewer
 #endif
 class QMdiArea;
 class QMdiSubWindow;

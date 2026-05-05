@@ -2,15 +2,13 @@
 #include "utils/Json.hpp"
 
 
-#include "vc/core/types/VcDataset.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -88,14 +86,21 @@ int main(int argc, char *argv[])
     for(int i=3;i<argc;i++)
         seg_dirs.push_back(argv[i]);
 
-    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "1");
-
-    std::cout << "zarr dataset size for scale group 1 " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
-
     cv::Size tgt_size = {3840, 2160};
 
-    auto chunk_cache = vc::cache::openFilesystemPipeline(ds.get(), 10e9, ds->path());
+    Volume volume(vol_path);
+    volume.setCacheBudget(size_t(10e9));
+    constexpr int renderLevel = 1;
+    auto* chunk_cache = volume.chunkedCache();
+
+    std::cout << "zarr dataset size for scale group " << renderLevel
+              << " [" << chunk_cache->shape(renderLevel)[0]
+              << ", " << chunk_cache->shape(renderLevel)[1]
+              << ", " << chunk_cache->shape(renderLevel)[2] << "]" << std::endl;
+    std::cout << "chunk shape shape "
+              << "[" << chunk_cache->chunkShape(renderLevel)[0]
+              << ", " << chunk_cache->chunkShape(renderLevel)[1]
+              << ", " << chunk_cache->chunkShape(renderLevel)[2] << "]" << std::endl;
 
     cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 
@@ -114,9 +119,9 @@ int main(int argc, char *argv[])
 
         cv::Mat_<uint8_t> img;
 
-        points = points*0.5;
-
-        readInterpolated3D(img, chunk_cache.get(), 0, points);
+        vc::SampleParams sp;
+        sp.level = renderLevel;
+        volume.sample(img, points, sp);
 
         cv::Mat_<uint8_t> frame(tgt_size, 0);
         int pad_x = (tgt_size.width - img.size().width)/2;

@@ -129,7 +129,7 @@ public:
         }
         volume_ = vpkg_->volume(volume_id);
         std::cout << "Using volume: " << volume_id << " (" << volume_->name() << ")" << std::endl;
-        auto [w, h, d] = volume_->shape();
+        auto [w, h, d] = volume_->shapeXyz();
         std::cout << "Volume dimensions: " << w << "x" << h << "x" << d << std::endl;
     }
 
@@ -267,7 +267,10 @@ private:
                 bool found_match = false;
                 int matched_idx = -1;
 
-                auto result = patchIndex.locate(point, tolerance);
+                SurfacePatchIndex::PointQuery query;
+                query.worldPoint = point;
+                query.tolerance = tolerance;
+                auto result = patchIndex.locate(query);
                 if (result.has_value()) {
                     // Find matching surface index
                     for (size_t idx = 0; idx < surfaces.size(); idx++) {

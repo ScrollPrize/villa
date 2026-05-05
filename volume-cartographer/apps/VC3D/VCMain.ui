@@ -78,36 +78,6 @@
     </item>
    </layout>
   </widget>
-  <widget class="QDockWidget" name="dockWidgetDrawing">
-   <property name="minimumSize">
-    <size>
-     <width>150</width>
-     <height>400</height>
-    </size>
-   </property>
-   <property name="allowedAreas">
-    <set>Qt::DockWidgetArea::LeftDockWidgetArea|Qt::DockWidgetArea::RightDockWidgetArea</set>
-   </property>
-   <property name="windowTitle">
-    <string>Drawing</string>
-   </property>
-   <attribute name="dockWidgetArea">
-    <number>2</number>
-   </attribute>
-   <widget class="QWidget" name="dockWidgetDrawingContent">
-    <layout class="QVBoxLayout" name="verticalLayout_17">
-     <property name="leftMargin">
-      <number>3</number>
-     </property>
-     <property name="topMargin">
-      <number>3</number>
-     </property>
-     <property name="rightMargin">
-      <number>3</number>
-     </property>
-    </layout>
-   </widget>
-  </widget>
   <widget class="QDockWidget" name="dockWidgetDistanceTransform">
    <property name="minimumSize">
     <size>
@@ -124,19 +94,6 @@
    <attribute name="dockWidgetArea">
     <number>2</number>
    </attribute>
-   <widget class="QWidget" name="dockWidgetDistanceTransformContent">
-    <layout class="QVBoxLayout" name="verticalLayout_13">
-     <property name="leftMargin">
-      <number>3</number>
-     </property>
-     <property name="topMargin">
-      <number>3</number>
-     </property>
-     <property name="rightMargin">
-      <number>3</number>
-     </property>
-    </layout>
-   </widget>
   </widget>
   <widget class="QDockWidget" name="dockWidgetVolumes">
    <property name="minimumSize">
@@ -418,13 +375,6 @@
               </widget>
              </item>
              <item row="1" column="3">
-              <widget class="QCheckBox" name="chkRevisit">
-               <property name="text">
-                <string>Revisit</string>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="4">
               <widget class="QCheckBox" name="chkInspect">
                <property name="text">
                 <string>Inspect</string>
@@ -478,29 +428,6 @@
    <attribute name="dockWidgetArea">
     <number>2</number>
    </attribute>
-   <widget class="QWidget" name="dockWidgetSegmentationContent">
-    <layout class="QVBoxLayout" name="verticalLayout_14">
-     <property name="leftMargin">
-      <number>3</number>
-     </property>
-     <property name="topMargin">
-      <number>6</number>
-     </property>
-     <property name="rightMargin">
-      <number>6</number>
-     </property>
-     <property name="bottomMargin">
-      <number>6</number>
-     </property>
-     <item>
-      <widget class="QPushButton" name="btnStopTools">
-       <property name="text">
-        <string>Stop</string>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </widget>
   </widget>
   <widget class="QDockWidget" name="dockWidgetViewerControls">
    <property name="minimumSize">
@@ -1809,70 +1736,6 @@
          </property>
         </widget>
        </item>
-       <item row="1" column="2">
-        <widget class="QDoubleSpinBox" name="dspNY">
-         <property name="enabled">
-          <bool>false</bool>
-         </property>
-         <property name="minimum">
-          <double>-10.000000000000000</double>
-         </property>
-         <property name="maximum">
-          <double>10.000000000000000</double>
-         </property>
-         <property name="singleStep">
-          <double>0.010000000000000</double>
-         </property>
-         <property name="value">
-          <double>0.500000000000000</double>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="1">
-        <widget class="QDoubleSpinBox" name="dspNX">
-         <property name="enabled">
-          <bool>false</bool>
-         </property>
-         <property name="minimum">
-          <double>-10.000000000000000</double>
-         </property>
-         <property name="maximum">
-          <double>10.000000000000000</double>
-         </property>
-         <property name="singleStep">
-          <double>0.010000000000000</double>
-         </property>
-         <property name="value">
-          <double>0.500000000000000</double>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="0">
-        <widget class="QLabel" name="label_12">
-         <property name="text">
-          <string>Normal</string>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="3">
-        <widget class="QDoubleSpinBox" name="dspNZ">
-         <property name="enabled">
-          <bool>false</bool>
-         </property>
-         <property name="minimum">
-          <double>-10.000000000000000</double>
-         </property>
-         <property name="maximum">
-          <double>10.000000000000000</double>
-         </property>
-         <property name="singleStep">
-          <double>0.010000000000000</double>
-         </property>
-         <property name="value">
-          <double>0.500000000000000</double>
-         </property>
-        </widget>
-       </item>
        <item row="0" column="1" colspan="2">
         <widget class="QLineEdit" name="sliceFocus">
          <property name="text">
@@ -1991,16 +1854,6 @@
        </property>
      </widget>
     </item>
-    <item row="4" column="0">
-      <widget class="QLabel" name="labelIntersectionSampling">
-       <property name="text">
-        <string>Intersection sampling</string>
-       </property>
-      </widget>
-     </item>
-     <item row="4" column="1" colspan="2">
-      <widget class="QComboBox" name="comboIntersectionSampling"/>
-     </item>
      <item row="5" column="0">
       <widget class="QLabel" name="labelIntersectionThickness">
        <property name="text">
@@ -2030,32 +1883,6 @@
        </property>
        <property name="toolTip">
         <string>Distance on either side of the plane (in voxels) considered a hit</string>
-       </property>
-      </widget>
-     </item>
-     <item row="6" column="0">
-      <widget class="QLabel" name="labelIntersectionMaxSurfaces">
-       <property name="text">
-        <string>Max intersection surfaces</string>
-       </property>
-      </widget>
-     </item>
-     <item row="6" column="1" colspan="2">
-      <widget class="QSpinBox" name="spinIntersectionMaxSurfaces">
-       <property name="minimum">
-        <number>0</number>
-       </property>
-       <property name="maximum">
-        <number>10000</number>
-       </property>
-       <property name="value">
-        <number>0</number>
-       </property>
-       <property name="specialValueText">
-        <string>Unlimited</string>
-       </property>
-       <property name="toolTip">
-        <string>Max surfaces to load for intersection rendering (0 = unlimited). Lower values reduce RAM usage.</string>
        </property>
       </widget>
      </item>

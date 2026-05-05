@@ -16,10 +16,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
-class CAdaptiveVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
+class CChunkedVolumeViewer;
 class CState;
 class VCCollection;
 class SegmentationOverlayController;
@@ -31,6 +28,7 @@ class VectorOverlayController;
 class VolumeOverlayController;
 class SegmentationModule;
 class ViewerOverlayControllerBase;
+class VolumeViewerBase;
 class Volume;
 class Surface;
 class QuadSurface;
@@ -44,11 +42,11 @@ public:
                   VCCollection* points,
                   QObject* parent = nullptr);
 
-    CTiledVolumeViewer* createViewer(const std::string& surfaceName,
-                                     const QString& title,
-                                     QMdiArea* mdiArea);
+    VolumeViewerBase* createViewer(const std::string& surfaceName,
+                                   const QString& title,
+                                   QMdiArea* mdiArea);
 
-    const std::vector<CTiledVolumeViewer*>& viewers() const { return _viewers; }
+    const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
     SegmentationOverlayController* segmentationOverlay() const { return _segmentationOverlay; }
@@ -92,16 +90,18 @@ public:
     void primeSurfacePatchIndicesAsync();
     void resetStrideUserOverride() {}
 
-    bool resetDefaultFor(CTiledVolumeViewer* viewer) const;
-    void setResetDefaultFor(CTiledVolumeViewer* viewer, bool value);
+    bool resetDefaultFor(VolumeViewerBase* viewer) const;
+    void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
+    void broadcastLinkedCursor(VolumeViewerBase* source,
+                               const std::optional<cv::Vec3f>& point);
 
     void setSliceStepSize(int size);
     int sliceStepSize() const { return _sliceStepSize; }
 
-    void forEachViewer(const std::function<void(CTiledVolumeViewer*)>& fn) const;
+    void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
@@ -117,7 +117,7 @@ public:
     void beginShutdown() noexcept { _shuttingDown = true; }
 
 signals:
-    void viewerCreated(CTiledVolumeViewer* viewer);
+    void baseViewerCreated(VolumeViewerBase* viewer);
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
@@ -167,8 +167,8 @@ private:
     std::vector<ViewerOverlayControllerBase*> _allOverlays;
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
-    std::vector<CTiledVolumeViewer*> _viewers;
-    std::unordered_map<CTiledVolumeViewer*, bool> _resetDefaults;
+    std::vector<VolumeViewerBase*> _baseViewers;
+    std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;
