@@ -721,6 +721,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             }
             _discoveryCombo->addItem(label, QJsonDocument(svc).toJson(QJsonDocument::Compact));
         }
+        selectSoleDiscoveredServiceIfExternal();
     });
     watcher->setFuture(QtConcurrent::run([]() {
         return LasagnaServiceManager::discoverServices();
@@ -1425,6 +1426,8 @@ void SegmentationLasagnaPanel::updateConnectionWidgets()
     bool external = (_connectionMode == 1);
     if (_externalWidget) _externalWidget->setVisible(external);
 
+    selectSoleDiscoveredServiceIfExternal();
+
     if (_dataInputStack) {
         _dataInputStack->setCurrentIndex(external ? 1 : 0);
     }
@@ -1472,6 +1475,7 @@ void SegmentationLasagnaPanel::refreshDiscoveredServices()
         }
         _discoveryCombo->addItem(label, QJsonDocument(svc).toJson(QJsonDocument::Compact));
     }
+    selectSoleDiscoveredServiceIfExternal();
 }
 
 void SegmentationLasagnaPanel::onDiscoveredServiceSelected(int index)
@@ -1502,4 +1506,15 @@ void SegmentationLasagnaPanel::onDiscoveredServiceSelected(int index)
 
     // Auto-connect (datasets are fetched via the permanent serviceStarted handler)
     LasagnaServiceManager::instance().connectToExternal(host, port);
+}
+
+void SegmentationLasagnaPanel::selectSoleDiscoveredServiceIfExternal()
+{
+    if (_connectionMode != 1 || !_discoveryCombo) return;
+
+    // Index 0 is the manual entry. If there is exactly one discovered service,
+    // select it so the user does not have to confirm the only valid choice.
+    if (_discoveryCombo->count() == 2 && _discoveryCombo->currentIndex() <= 0) {
+        _discoveryCombo->setCurrentIndex(1);
+    }
 }

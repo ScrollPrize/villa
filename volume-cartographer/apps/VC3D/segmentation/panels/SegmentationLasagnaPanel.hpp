@@ -78,6 +78,7 @@ private:
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
     void onDiscoveredServiceSelected(int index);
+    void selectSoleDiscoveredServiceIfExternal();
     void updateConnectionWidgets();
     void triggerOptimization();
 
