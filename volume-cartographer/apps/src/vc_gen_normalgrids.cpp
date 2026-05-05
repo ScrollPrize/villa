@@ -3,6 +3,7 @@
 #include <vector>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
@@ -235,7 +236,7 @@ static void print_usage() {
               << "  vc_gen_normalgrids convert -i /path/to/grids/\n\n"
               << "Generate options:\n"
               << "  -i, --input         Input Zarr volume path (required)\n"
-              << "  -o, --output        Output directory path (required)\n"
+              << "  -o, --output        Output directory path (required unless --print-plan)\n"
               << "  --level            Input OME-Zarr pyramid level (default: 0)\n"
               << "  --spiral-step       Spiral step for resampling paths (default: 20.0)\n"
               << "  --grid-step         Grid cell size for spatial indexing (default: 64)\n"
@@ -246,7 +247,8 @@ static void print_usage() {
               << "  --chunk-budget-mib  Max chunk batch budget per direction (default: 512)\n"
               << "  --preview-every     Write preview image every N written slices, 0 disables (default: 100)\n"
               << "  --verify-grid-save  Verify GridStore save by reloading each file (default: false)\n"
-              << "  --metrics-json      Write structured metrics json\n\n"
+              << "  --metrics-json      Write structured metrics json\n"
+              << "  --print-plan        Print partition plan as JSON to stdout and exit (no work done)\n\n"
               << "Convert options:\n"
               << "  -i, --input         Input directory to scan for .grid files (required)\n"
               << "  --grid-step         New grid cell size (default: 64)\n";
@@ -299,7 +301,7 @@ int main(int argc, char* argv[]) {
         generate_desc.add_options()
             ("help,h", "Print this help message")
             ("input,i", po::value<std::string>()->required(), "Input Zarr volume path")
-            ("output,o", po::value<std::string>()->required(), "Output directory path")
+            ("output,o", po::value<std::string>(), "Output directory path (required unless --print-plan)")
             ("level", po::value<int>()->default_value(0), "Input OME-Zarr level to read")
             ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling paths")
             ("grid-step", po::value<int>()->default_value(64), "Grid cell size for spatial indexing")
@@ -310,7 +312,8 @@ int main(int argc, char* argv[]) {
             ("chunk-budget-mib", po::value<size_t>()->default_value(512), "Maximum chunk batch budget in MiB")
             ("preview-every", po::value<int>()->default_value(100), "Write preview image every N written slices, 0 disables")
             ("verify-grid-save", po::bool_switch()->default_value(false), "Verify GridStore files by reloading after save")
-            ("metrics-json", po::value<std::string>(), "Write structured metrics json");
+            ("metrics-json", po::value<std::string>(), "Write structured metrics json")
+            ("print-plan", po::bool_switch()->default_value(false), "Print partition plan as JSON to stdout and exit (no work done)");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
         if (explicit_command && !opts.empty()) {
@@ -467,7 +470,13 @@ void run_convert(const po::variables_map& vm) {
 void run_generate(const po::variables_map& vm) {
     const auto total_start = std::chrono::steady_clock::now();
     const std::string input_path = vm["input"].as<std::string>();
-    const std::string output_path = vm["output"].as<std::string>();
+    const bool print_plan = vm["print-plan"].as<bool>();
+    const std::string output_path = vm.count("output")
+        ? vm["output"].as<std::string>()
+        : std::string();
+    if (!print_plan && output_path.empty()) {
+        throw std::runtime_error("--output is required (omit only when using --print-plan)");
+    }
     const int input_level = vm["level"].as<int>();
     if (input_level < 0) {
         throw std::runtime_error("--level must be >= 0");
@@ -507,11 +516,13 @@ void run_generate(const po::variables_map& vm) {
         throw std::runtime_error("--part-id must satisfy 0 <= part-id < num-parts");
     }
 
-    std::cout << "Input Zarr path: " << input_path << std::endl;
-    std::cout << "Input level: " << input_level << std::endl;
-    std::cout << "Output directory: " << output_path << std::endl;
-    if (num_parts > 1) {
-        std::cout << "Shard: part " << part_id << " / " << num_parts << std::endl;
+    if (!print_plan) {
+        std::cout << "Input Zarr path: " << input_path << std::endl;
+        std::cout << "Input level: " << input_level << std::endl;
+        std::cout << "Output directory: " << output_path << std::endl;
+        if (num_parts > 1) {
+            std::cout << "Shard: part " << part_id << " / " << num_parts << std::endl;
+        }
     }
 
     Volume input_volume{fs::path(input_path)};
@@ -524,6 +535,94 @@ void run_generate(const po::variables_map& vm) {
         static_cast<size_t>(level_shape[1]),
         static_cast<size_t>(level_shape[2]),
     };
+    const std::vector<size_t> source_chunk_shape = {
+        static_cast<size_t>(level_chunk_shape[0]),
+        static_cast<size_t>(level_chunk_shape[1]),
+        static_cast<size_t>(level_chunk_shape[2]),
+    };
+
+    if (print_plan) {
+        Json plan;
+        plan["version"] = 1;
+        plan["input"] = input_path;
+        plan["input_level"] = input_level;
+        plan["sparse_volume"] = sparse_volume;
+        plan["num_parts"] = num_parts;
+        plan["part_id"] = part_id;
+        {
+            Json arr = Json::array();
+            for (auto v : shape) arr.push_back(static_cast<int64_t>(v));
+            plan["level_shape_zyx"] = std::move(arr);
+        }
+        {
+            Json arr = Json::array();
+            for (auto v : source_chunk_shape) arr.push_back(static_cast<int64_t>(v));
+            plan["source_chunk_shape_zyx"] = std::move(arr);
+        }
+
+        Json directions = Json::array();
+        size_t recommended_max = std::numeric_limits<size_t>::max();
+        for (SliceDirection dir : directions_to_run) {
+            const size_t axis = vc::core::util::normalGridSliceAxis(
+                to_normal_grid_direction(dir));
+            const auto plans = vc::core::util::planNormalGridSampledChunks(
+                shape,
+                source_chunk_shape,
+                to_normal_grid_direction(dir),
+                sparse_volume);
+
+            const size_t axis_length = shape[axis];
+            const size_t axis_chunk_depth = source_chunk_shape[axis];
+            const size_t total_source_chunks =
+                (axis_length + axis_chunk_depth - 1) / axis_chunk_depth;
+            const size_t chunks_with_sampled_slices = plans.size();
+            size_t total_sampled_slices = 0;
+            for (const auto& cp : plans) {
+                total_sampled_slices += cp.sampledSlices.size();
+            }
+
+            Json d;
+            d["direction"] = direction_name(dir);
+            d["axis_length"] = axis_length;
+            d["axis_chunk_depth"] = axis_chunk_depth;
+            d["total_source_chunks"] = total_source_chunks;
+            d["chunks_with_sampled_slices"] = chunks_with_sampled_slices;
+            d["total_sampled_slices"] = total_sampled_slices;
+            d["max_useful_num_parts"] = chunks_with_sampled_slices;
+
+            if (num_parts > 1) {
+                Json shards = Json::array();
+                for (int p = 0; p < num_parts; ++p) {
+                    const size_t lo = (chunks_with_sampled_slices * static_cast<size_t>(p)) /
+                        static_cast<size_t>(num_parts);
+                    const size_t hi = (chunks_with_sampled_slices * static_cast<size_t>(p + 1)) /
+                        static_cast<size_t>(num_parts);
+                    size_t shard_sampled = 0;
+                    size_t shard_source_slices = 0;
+                    for (size_t i = lo; i < hi; ++i) {
+                        shard_sampled += plans[i].sampledSlices.size();
+                        shard_source_slices += plans[i].sourceSliceCount;
+                    }
+                    Json s;
+                    s["part_id"] = p;
+                    s["chunks"] = hi - lo;
+                    s["source_slices"] = shard_source_slices;
+                    s["sampled_slices"] = shard_sampled;
+                    shards.push_back(std::move(s));
+                }
+                d["shards"] = std::move(shards);
+            }
+
+            directions.push_back(std::move(d));
+            recommended_max = std::min(recommended_max, chunks_with_sampled_slices);
+        }
+        plan["directions"] = std::move(directions);
+        plan["recommended_max_num_parts"] =
+            recommended_max == std::numeric_limits<size_t>::max() ? 0 : recommended_max;
+
+        std::cout << plan.dump(2) << std::endl;
+        return;
+    }
 
     fs::path output_fs_path(output_path);
     for (SliceDirection dir : directions_to_run) {
@@ -564,12 +663,6 @@ void run_generate(const po::variables_map& vm) {
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
 
     input_volume.setCacheBudget(cache_budget_bytes);
-
-    const std::vector<size_t> source_chunk_shape = {
-        static_cast<size_t>(level_chunk_shape[0]),
-        static_cast<size_t>(level_chunk_shape[1]),
-        static_cast<size_t>(level_chunk_shape[2]),
-    };
 
     struct DirectionShardPlan {
         SliceDirection dir;
