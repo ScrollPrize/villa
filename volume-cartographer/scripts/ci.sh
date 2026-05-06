@@ -82,6 +82,22 @@ total_coverage_pct() {
 
 cmd_builder() {
     local image=$1
+    local local_tag="vc-builder:$image"
+
+    # Try pulling the published image from ghcr first. Skip the pull if
+    # VC_BUILDER_FORCE_LOCAL=1 is set (the PR touched a Dockerfile, or
+    # the user explicitly wants a from-scratch local build).
+    if [[ "${VC_BUILDER_FORCE_LOCAL:-0}" != "1" ]]; then
+        local owner
+        owner=$(echo "${VC_BUILDER_REGISTRY_OWNER:-${GITHUB_REPOSITORY_OWNER:-scrollprize}}" | tr 'A-Z' 'a-z')
+        local remote="ghcr.io/$owner/vc-builder:$image"
+        if docker pull "$remote" 2>/dev/null; then
+            docker tag "$remote" "$local_tag"
+            return 0
+        fi
+        echo "ci.sh: ghcr pull of $remote failed; building locally" >&2
+    fi
+
     local dockerfile
     dockerfile="$(dockerfile_for "$image")"
 
@@ -95,10 +111,28 @@ cmd_builder() {
 
     docker buildx build \
         --target builder \
-        --tag "vc-builder:$image" \
+        --tag "$local_tag" \
         --file "$dockerfile" \
         --load \
         "${cache_args[@]}" \
+        .
+}
+
+cmd_publish() {
+    local image=$1
+    local owner
+    owner=$(echo "${VC_BUILDER_REGISTRY_OWNER:-${GITHUB_REPOSITORY_OWNER:-scrollprize}}" | tr 'A-Z' 'a-z')
+    local dockerfile
+    dockerfile="$(dockerfile_for "$image")"
+    local remote="ghcr.io/$owner/vc-builder:$image"
+    local sha=${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}
+
+    docker buildx build \
+        --target builder \
+        --tag "$remote" \
+        --tag "$remote-$sha" \
+        --file "$dockerfile" \
+        --push \
         .
 }
 
@@ -217,10 +251,12 @@ case "${1:-all}" in
     patch-coverage)       shift; cmd_patch_coverage "$@" ;;
     coverage-regression)  shift; cmd_coverage_regression "$@" ;;
     dead-code)            shift; cmd_dead_code "$@" ;;
+    publish)              shift; cmd_publish "$@" ;;
     *)
         cat >&2 <<EOF
 Usage: $0 [all
           | builder <image>
+          | publish <image>
           | test <image> <compiler> <preset>
           | coverage [image]
           | patch-coverage <base_ref> [image]

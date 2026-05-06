@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
+      dockerfile: ${{ steps.filter.outputs.dockerfile }}
     steps:
       - uses: actions/checkout@v4
       - id: filter
@@ -27,6 +28,10 @@ jobs:
             vc:
               - 'volume-cartographer/**'
               - '.github/workflows/vc3d-ci.yml'
+            dockerfile:
+              - 'volume-cartographer/*.Dockerfile'
+              - 'volume-cartographer/.dockerignore'
+              - 'volume-cartographer/scripts/ci.sh'
 
   skip:
     name: Skip (no volume-cartographer changes)
@@ -45,15 +50,20 @@ jobs:
       fail-fast: false
       matrix:
         image: ["ubuntu-24.04", "ubuntu-26.04"]
+    env:
+      # If the PR touched a Dockerfile (or ci.sh), the published ghcr image
+      # is stale for this PR. Force a local build with the GHA buildx cache.
+      # Otherwise ci.sh builder will docker pull the published image.
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Build builder image (pushes layers to GHA cache)
+      - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
 
   build-test:
     name: ${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
-    needs: builder
+    needs: [changes, builder]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -68,6 +78,8 @@ jobs:
           - { image: "ubuntu-24.04", compiler: clang, preset: ci-asan-ubsan }
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests }
+    env:
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -78,15 +90,17 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-
             ccache-${{ matrix.image }}-${{ matrix.compiler }}-
-      - name: Pull builder from GHA cache
+      - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
       - name: Test
         run: volume-cartographer/scripts/ci.sh test ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
 
   coverage:
     name: Coverage (gcc, gcov)
-    needs: builder
+    needs: [changes, builder]
     runs-on: ubuntu-24.04
+    env:
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,7 +113,7 @@ jobs:
           restore-keys: |
             ccache-ubuntu-24.04-coverage-
             ccache-ubuntu-24.04-gcc-
-      - name: Pull builder from GHA cache
+      - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
       - name: Run coverage
         run: volume-cartographer/scripts/ci.sh coverage ubuntu-24.04
@@ -131,8 +145,10 @@ jobs:
 
   dead-code:
     name: Dead-code report (clang, nm + --print-gc-sections)
-    needs: builder
+    needs: [changes, builder]
     runs-on: ubuntu-24.04
+    env:
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -143,7 +159,7 @@ jobs:
           restore-keys: |
             ccache-ubuntu-24.04-dead-code-
             ccache-ubuntu-24.04-clang-
-      - name: Pull builder from GHA cache
+      - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
       - name: Run dead-code analysis
         run: volume-cartographer/scripts/ci.sh dead-code ubuntu-24.04 clang
