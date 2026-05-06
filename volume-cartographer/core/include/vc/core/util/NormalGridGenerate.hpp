@@ -223,43 +223,47 @@ inline bool extractBinarySliceFromChunk(
     cv::Mat& binarySlice)
 {
     bool anyNonZero = false;
+    const auto& shape = chunkData.shape();
+    const auto* data = chunkData.data();
+    const size_t strideY = shape[0];
+    const size_t strideX = shape[0] * shape[1];
 
     switch (direction) {
     case NormalGridSliceDirection::XY:
-        binarySlice.create(static_cast<int>(chunkData.shape()[1]),
-                           static_cast<int>(chunkData.shape()[2]),
+        binarySlice.create(static_cast<int>(shape[1]),
+                           static_cast<int>(shape[2]),
                            CV_8U);
-        for (int row = 0; row < binarySlice.rows; ++row) {
-            uint8_t* dst = binarySlice.ptr<uint8_t>(row);
-            for (int col = 0; col < binarySlice.cols; ++col) {
-                const bool isSet = chunkData(iChunk, static_cast<size_t>(row), static_cast<size_t>(col)) > 0;
-                dst[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+        for (int col = 0; col < binarySlice.cols; ++col) {
+            const size_t srcColBase = iChunk + static_cast<size_t>(col) * strideX;
+            for (int row = 0; row < binarySlice.rows; ++row) {
+                const bool isSet = data[srcColBase + static_cast<size_t>(row) * strideY] > 0;
+                binarySlice.ptr<uint8_t>(row)[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
                 anyNonZero = anyNonZero || isSet;
             }
         }
         break;
     case NormalGridSliceDirection::XZ:
-        binarySlice.create(static_cast<int>(chunkData.shape()[0]),
-                           static_cast<int>(chunkData.shape()[2]),
+        binarySlice.create(static_cast<int>(shape[0]),
+                           static_cast<int>(shape[2]),
                            CV_8U);
-        for (int row = 0; row < binarySlice.rows; ++row) {
-            uint8_t* dst = binarySlice.ptr<uint8_t>(row);
-            for (int col = 0; col < binarySlice.cols; ++col) {
-                const bool isSet = chunkData(static_cast<size_t>(row), iChunk, static_cast<size_t>(col)) > 0;
-                dst[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+        for (int col = 0; col < binarySlice.cols; ++col) {
+            const size_t srcColBase = iChunk * strideY + static_cast<size_t>(col) * strideX;
+            for (int row = 0; row < binarySlice.rows; ++row) {
+                const bool isSet = data[srcColBase + static_cast<size_t>(row)] > 0;
+                binarySlice.ptr<uint8_t>(row)[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
                 anyNonZero = anyNonZero || isSet;
             }
         }
         break;
     case NormalGridSliceDirection::YZ:
-        binarySlice.create(static_cast<int>(chunkData.shape()[0]),
-                           static_cast<int>(chunkData.shape()[1]),
+        binarySlice.create(static_cast<int>(shape[0]),
+                           static_cast<int>(shape[1]),
                            CV_8U);
-        for (int row = 0; row < binarySlice.rows; ++row) {
-            uint8_t* dst = binarySlice.ptr<uint8_t>(row);
-            for (int col = 0; col < binarySlice.cols; ++col) {
-                const bool isSet = chunkData(static_cast<size_t>(row), static_cast<size_t>(col), iChunk) > 0;
-                dst[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+        for (int col = 0; col < binarySlice.cols; ++col) {
+            const size_t srcColBase = static_cast<size_t>(col) * strideY + iChunk * strideX;
+            for (int row = 0; row < binarySlice.rows; ++row) {
+                const bool isSet = data[srcColBase + static_cast<size_t>(row)] > 0;
+                binarySlice.ptr<uint8_t>(row)[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
                 anyNonZero = anyNonZero || isSet;
             }
         }
