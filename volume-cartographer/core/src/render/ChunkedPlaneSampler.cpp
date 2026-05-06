@@ -145,7 +145,9 @@ bool readVoxel(IChunkedArray& array,
     const int cy = iy / chunkShape[1];
     const int cx = ix / chunkShape[2];
     ChunkResult result = cache.get({level, cz, cy, cx}, requested, errors);
-    if (result.status == ChunkStatus::MissQueued || result.status == ChunkStatus::Error)
+    if (result.status == ChunkStatus::MissQueued ||
+        result.status == ChunkStatus::Missing ||
+        result.status == ChunkStatus::Error)
         return false;
 
     if (result.status == ChunkStatus::AllFill) {
