@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <queue>
 #include <sstream>
@@ -120,6 +121,9 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
         if (name.rfind("component.connect_ridges.", 0) == 0) {
             return "component.connect_ridges";
         }
+        if (name.rfind("source_rim.rim_distance_ridges.", 0) == 0) {
+            return "source_rim.rim_distance_ridges";
+        }
         if (name.rfind("source_rim.", 0) == 0) {
             return "source_rim_skeleton";
         }
@@ -135,6 +139,11 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
         if (name.rfind("component.connect_ridges.", 0) == 0) {
             return "        " +
                    name.substr(std::string("component.connect_ridges.").size());
+        }
+        if (name.rfind("source_rim.rim_distance_ridges.", 0) == 0) {
+            return "        " +
+                   name.substr(
+                       std::string("source_rim.rim_distance_ridges.").size());
         }
         if (name.rfind("source_rim.", 0) == 0) {
             return "    " + name.substr(std::string("source_rim.").size());
@@ -1181,7 +1190,8 @@ cv::Mat source_rim_distance_label_ridges(
     const cv::Mat& white_domain, const cv::Mat& source_pixel_labels,
     const std::vector<cv::Point>& source_points,
     const float min_rim_distance_px,
-    cv::Mat* rim_distance_debug_out = nullptr) {
+    cv::Mat* rim_distance_debug_out = nullptr,
+    std::vector<StageTiming>* timings = nullptr) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(source_pixel_labels.type() == CV_32S);
 
@@ -1195,52 +1205,82 @@ cv::Mat source_rim_distance_label_ridges(
     const int cols = white_domain.cols;
     constexpr bool kDebugSourceRimPixel = false;
     const cv::Point debug_pixel(129, 218);
-
-    cv::Mat source_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
-    for (int y = 0; y < rows; ++y) {
-        const std::uint8_t* src = white_domain.ptr<std::uint8_t>(y);
-        std::uint8_t* dst = source_mask.ptr<std::uint8_t>(y);
-        for (int x = 0; x < cols; ++x) {
-            dst[x] = src[x] == 0 ? 255 : 0;
+    const auto record_timing = [&](const std::string& name,
+                                   const TimingMark& timing) {
+        if (timings != nullptr) {
+            timings->push_back(finish_timing(
+                "source_rim.rim_distance_ridges." + name, timing));
         }
-    }
-    for (int x = 0; x < cols; ++x) {
-        source_mask.at<std::uint8_t>(0, x) = 255;
-        source_mask.at<std::uint8_t>(rows - 1, x) = 255;
-    }
-    for (int y = 0; y < rows; ++y) {
-        source_mask.at<std::uint8_t>(y, 0) = 255;
-        source_mask.at<std::uint8_t>(y, cols - 1) = 255;
+    };
+
+    cv::Mat source_mask;
+    {
+        const TimingMark timing = start_timing();
+        source_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
+        for (int y = 0; y < rows; ++y) {
+            const std::uint8_t* src = white_domain.ptr<std::uint8_t>(y);
+            std::uint8_t* dst = source_mask.ptr<std::uint8_t>(y);
+            for (int x = 0; x < cols; ++x) {
+                dst[x] = src[x] == 0 ? 255 : 0;
+            }
+        }
+        for (int x = 0; x < cols; ++x) {
+            source_mask.at<std::uint8_t>(0, x) = 255;
+            source_mask.at<std::uint8_t>(rows - 1, x) = 255;
+        }
+        for (int y = 0; y < rows; ++y) {
+            source_mask.at<std::uint8_t>(y, 0) = 255;
+            source_mask.at<std::uint8_t>(y, cols - 1) = 255;
+        }
+        record_timing("source_mask", timing);
     }
 
     cv::Mat source_components;
     cv::Mat source_stats;
     cv::Mat source_centroids;
-    const int source_component_count = cv::connectedComponentsWithStats(
-        source_mask, source_components, source_stats, source_centroids, 4,
-        CV_32S);
+    int source_component_count = 0;
+    {
+        const TimingMark timing = start_timing();
+        source_component_count = cv::connectedComponentsWithStats(
+            source_mask, source_components, source_stats, source_centroids, 4,
+            CV_32S);
+        record_timing("connected_components", timing);
+    }
 
-    cv::Mat cleaned_source = cv::Mat::zeros(source_mask.size(), CV_8U);
+    cv::Mat cleaned_source;
     constexpr int kMinSourceComponentArea = 8;
-    for (int y = 0; y < rows; ++y) {
-        const int* labels = source_components.ptr<int>(y);
-        std::uint8_t* dst = cleaned_source.ptr<std::uint8_t>(y);
-        for (int x = 0; x < cols; ++x) {
-            const int label = labels[x];
-            if (label > 0 && label < source_component_count &&
-                source_stats.at<int>(label, cv::CC_STAT_AREA) >=
-                    kMinSourceComponentArea) {
-                dst[x] = 255;
+    {
+        const TimingMark timing = start_timing();
+        cleaned_source = cv::Mat::zeros(source_mask.size(), CV_8U);
+        for (int y = 0; y < rows; ++y) {
+            const int* labels = source_components.ptr<int>(y);
+            std::uint8_t* dst = cleaned_source.ptr<std::uint8_t>(y);
+            for (int x = 0; x < cols; ++x) {
+                const int label = labels[x];
+                if (label > 0 && label < source_component_count &&
+                    source_stats.at<int>(label, cv::CC_STAT_AREA) >=
+                        kMinSourceComponentArea) {
+                    dst[x] = 255;
+                }
             }
         }
+        record_timing("cleanup", timing);
     }
 
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(cleaned_source.clone(), contours, cv::RETR_LIST,
-                     cv::CHAIN_APPROX_NONE);
+    {
+        const TimingMark timing = start_timing();
+        cv::findContours(cleaned_source.clone(), contours, cv::RETR_LIST,
+                         cv::CHAIN_APPROX_NONE);
+        record_timing("find_contours", timing);
+    }
 
-    std::vector<RimPosition> rim_lookup(
-        static_cast<std::size_t>(rows * cols));
+    std::vector<RimPosition> rim_lookup;
+    {
+        const TimingMark timing = start_timing();
+        rim_lookup.resize(static_cast<std::size_t>(rows * cols));
+        record_timing("rim_lookup_alloc", timing);
+    }
     const auto linear_index = [cols](const cv::Point pixel) {
         return static_cast<std::size_t>(pixel.y * cols + pixel.x);
     };
@@ -1264,42 +1304,48 @@ cv::Mat source_rim_distance_label_ridges(
         }
     };
 
-    for (int contour_id = 0; contour_id < static_cast<int>(contours.size());
-         ++contour_id) {
-        const std::vector<cv::Point>& contour = contours[contour_id];
-        if (contour.size() < 4) {
-            continue;
-        }
+    {
+        const TimingMark timing = start_timing();
+        for (int contour_id = 0; contour_id < static_cast<int>(contours.size());
+             ++contour_id) {
+            const std::vector<cv::Point>& contour = contours[contour_id];
+            if (contour.size() < 4) {
+                continue;
+            }
 
-        std::vector<float> arc(contour.size(), 0.0f);
-        for (std::size_t i = 1; i < contour.size(); ++i) {
-            arc[i] = arc[i - 1] + segment_length(contour[i], contour[i - 1]);
-        }
-        const float total_length =
-            arc.back() + segment_length(contour.front(), contour.back());
-        if (total_length <= 0.0f) {
-            continue;
-        }
+            std::vector<float> arc(contour.size(), 0.0f);
+            for (std::size_t i = 1; i < contour.size(); ++i) {
+                arc[i] =
+                    arc[i - 1] + segment_length(contour[i], contour[i - 1]);
+            }
+            const float total_length =
+                arc.back() + segment_length(contour.front(), contour.back());
+            if (total_length <= 0.0f) {
+                continue;
+            }
 
-        for (std::size_t i = 0; i < contour.size(); ++i) {
-            assign_rim_position(
-                contour[i],
-                {contour_id, arc[i], total_length});
-        }
-        for (std::size_t i = 0; i < contour.size(); ++i) {
-            const RimPosition position{contour_id, arc[i], total_length};
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const cv::Point pixel = contour[i] + cv::Point(dx, dy);
-                    if (!in_bounds(pixel) ||
-                        cleaned_source.at<std::uint8_t>(pixel.y, pixel.x) ==
-                            0) {
-                        continue;
+            for (std::size_t i = 0; i < contour.size(); ++i) {
+                assign_rim_position(
+                    contour[i],
+                    {contour_id, arc[i], total_length});
+            }
+            for (std::size_t i = 0; i < contour.size(); ++i) {
+                const RimPosition position{contour_id, arc[i], total_length};
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const cv::Point pixel =
+                            contour[i] + cv::Point(dx, dy);
+                        if (!in_bounds(pixel) ||
+                            cleaned_source.at<std::uint8_t>(pixel.y,
+                                                             pixel.x) == 0) {
+                            continue;
+                        }
+                        assign_rim_position(pixel, position);
                     }
-                    assign_rim_position(pixel, position);
                 }
             }
         }
+        record_timing("rim_lookup", timing);
     }
 
     const auto rim_position = [&](const cv::Point pixel) {
@@ -1309,57 +1355,64 @@ cv::Mat source_rim_distance_label_ridges(
         return rim_lookup[linear_index(pixel)];
     };
 
-    cv::Mat ridges = cv::Mat::zeros(white_domain.size(), CV_8U);
-    cv::Mat rim_distance_debug = cv::Mat::zeros(white_domain.size(), CV_8U);
-    cv::parallel_for_(cv::Range(0, white_domain.rows),
-                      [&](const cv::Range& range) {
+    cv::Mat ridges;
+    cv::Mat rim_distance_debug;
+    {
+        const TimingMark timing = start_timing();
+        ridges = cv::Mat::zeros(white_domain.size(), CV_8U);
+        rim_distance_debug = cv::Mat::zeros(white_domain.size(), CV_8U);
+        cv::parallel_for_(cv::Range(0, white_domain.rows),
+                          [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             for (int x = 0; x < white_domain.cols; ++x) {
                 const bool debug_this_pixel =
                     kDebugSourceRimPixel && x == debug_pixel.x &&
                     y == debug_pixel.y;
-                std::ostringstream debug;
-                if (debug_this_pixel) {
-                    debug << "source_rim_ridges debug pixel=("
-                          << x << "," << y << ")\n";
+                std::unique_ptr<std::ostringstream> debug;
+                if constexpr (kDebugSourceRimPixel) {
+                    if (debug_this_pixel) {
+                        debug = std::make_unique<std::ostringstream>();
+                        *debug << "source_rim_ridges debug pixel=("
+                               << x << "," << y << ")\n";
+                    }
                 }
                 if (white_domain.at<std::uint8_t>(y, x) == 0) {
-                    if (debug_this_pixel) {
-                        debug << "  skipped: outside white domain\n";
-                        std::cout << debug.str();
+                    if (debug != nullptr) {
+                        *debug << "  skipped: outside white domain\n";
+                        std::cout << debug->str();
                     }
                     continue;
                 }
                 const int center = source_pixel_labels.at<int>(y, x);
                 if (center <= 0 ||
                     center >= static_cast<int>(source_points.size())) {
-                    if (debug_this_pixel) {
-                        debug << "  skipped: invalid center_label=" << center
-                              << " source_points="
-                              << source_points.size() << "\n";
-                        std::cout << debug.str();
+                    if (debug != nullptr) {
+                        *debug << "  skipped: invalid center_label=" << center
+                               << " source_points="
+                               << source_points.size() << "\n";
+                        std::cout << debug->str();
                     }
                     continue;
                 }
                 const cv::Point center_source = source_points[center];
                 if (center_source.x < 0) {
-                    if (debug_this_pixel) {
-                        debug << "  skipped: missing center_source for label="
-                              << center << "\n";
-                        std::cout << debug.str();
+                    if (debug != nullptr) {
+                        *debug << "  skipped: missing center_source for label="
+                               << center << "\n";
+                        std::cout << debug->str();
                     }
                     continue;
                 }
-                if (debug_this_pixel) {
-                    debug << "  center_label=" << center
-                          << " center_source=(" << center_source.x << ","
-                          << center_source.y << ")";
+                if (debug != nullptr) {
+                    *debug << "  center_label=" << center
+                           << " center_source=(" << center_source.x << ","
+                           << center_source.y << ")";
                 }
                 const RimPosition center_rim = rim_position(center_source);
-                if (debug_this_pixel) {
-                    debug << " center_contour=" << center_rim.contour
-                          << " center_arc=" << center_rim.arc
-                          << " center_total=" << center_rim.total << "\n";
+                if (debug != nullptr) {
+                    *debug << " center_contour=" << center_rim.contour
+                           << " center_arc=" << center_rim.arc
+                           << " center_total=" << center_rim.total << "\n";
                 }
 
                 float max_neighbor_rim_distance = 0.0f;
@@ -1412,25 +1465,25 @@ cv::Mat source_rim_distance_label_ridges(
                             }
                         }
 
-                        if (debug_this_pixel) {
-                            debug << "  neighbor=(" << nx << "," << ny
-                                  << ") other_label=" << other
-                                  << " other_source=(" << other_source.x
-                                  << "," << other_source.y << ")"
-                                  << " center_contour="
-                                  << center_rim.contour
-                                  << " center_arc=" << center_rim.arc
-                                  << " center_total=" << center_rim.total
-                                  << " other_contour=" << other_rim.contour
-                                  << " other_arc=" << other_rim.arc
-                                  << " other_total=" << other_rim.total
-                                  << " rim_dist=" << rim_distance
-                                  << " threshold=" << min_rim_distance_px
-                                  << " reason=" << reason
-                                  << " keep="
-                                  << (rim_distance > min_rim_distance_px ? 1
-                                                                         : 0)
-                                  << "\n";
+                        if (debug != nullptr) {
+                            *debug << "  neighbor=(" << nx << "," << ny
+                                   << ") other_label=" << other
+                                   << " other_source=(" << other_source.x
+                                   << "," << other_source.y << ")"
+                                   << " center_contour="
+                                   << center_rim.contour
+                                   << " center_arc=" << center_rim.arc
+                                   << " center_total=" << center_rim.total
+                                   << " other_contour=" << other_rim.contour
+                                   << " other_arc=" << other_rim.arc
+                                   << " other_total=" << other_rim.total
+                                   << " rim_dist=" << rim_distance
+                                   << " threshold=" << min_rim_distance_px
+                                   << " reason=" << reason
+                                   << " keep="
+                                   << (rim_distance > min_rim_distance_px ? 1
+                                                                          : 0)
+                                   << "\n";
                         }
                     }
                 }
@@ -1443,15 +1496,17 @@ cv::Mat source_rim_distance_label_ridges(
                 rim_distance_debug.at<std::uint8_t>(y, x) =
                     static_cast<std::uint8_t>(
                         std::min(255.0f, max_neighbor_rim_distance));
-                if (debug_this_pixel) {
-                    debug << "  max_neighbor_rim_dist="
-                          << max_neighbor_rim_distance
-                          << " final_keep=" << (keep ? 1 : 0) << "\n";
-                    std::cout << debug.str();
+                if (debug != nullptr) {
+                    *debug << "  max_neighbor_rim_dist="
+                           << max_neighbor_rim_distance
+                           << " final_keep=" << (keep ? 1 : 0) << "\n";
+                    std::cout << debug->str();
                 }
             }
         }
-    });
+        });
+        record_timing("pixel_scan", timing);
+    }
 
     if (rim_distance_debug_out != nullptr) {
         *rim_distance_debug_out = rim_distance_debug;
@@ -6527,7 +6582,7 @@ SourceRimSkeletonResult source_rim_skeleton(const cv::Mat& binary) {
             source_rim_distance_label_ridges(
                 source_mask, source_pixel_labels, source_points,
                 kSourceRimRidgeThresholdPx,
-                &source_rim_distance);
+                &source_rim_distance, &timings);
         timings.push_back(
             finish_timing("source_rim.rim_distance_ridges", timing));
     }
@@ -6543,6 +6598,78 @@ SourceRimSkeletonResult source_rim_skeleton(const cv::Mat& binary) {
             source_rim_distance,
             loops_connected,
             timings};
+}
+
+cv::Mat opencv_watershed_inverted_dt_ridges(const cv::Mat& binary,
+                                            const cv::Mat& dt) {
+    CV_Assert(binary.type() == CV_8U);
+    CV_Assert(dt.type() == CV_32F);
+    CV_Assert(binary.size() == dt.size());
+
+    cv::Mat source_mask;
+    cv::threshold(binary, source_mask, 0, 255, cv::THRESH_BINARY);
+    for (int x = 0; x < source_mask.cols; ++x) {
+        source_mask.at<std::uint8_t>(0, x) = 255;
+        source_mask.at<std::uint8_t>(source_mask.rows - 1, x) = 255;
+    }
+    for (int y = 0; y < source_mask.rows; ++y) {
+        source_mask.at<std::uint8_t>(y, 0) = 255;
+        source_mask.at<std::uint8_t>(y, source_mask.cols - 1) = 255;
+    }
+
+    cv::Mat source_components;
+    cv::Mat source_stats;
+    cv::Mat source_centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        source_mask, source_components, source_stats, source_centroids, 4,
+        CV_32S);
+
+    cv::Mat markers = cv::Mat::zeros(binary.size(), CV_32S);
+    constexpr int kMinSourceComponentArea = 8;
+    int marker = 1;
+    for (int y = 0; y < source_components.rows; ++y) {
+        const int* labels = source_components.ptr<int>(y);
+        int* dst = markers.ptr<int>(y);
+        for (int x = 0; x < source_components.cols; ++x) {
+            const int label = labels[x];
+            if (label > 0 && label < component_count &&
+                source_stats.at<int>(label, cv::CC_STAT_AREA) >=
+                    kMinSourceComponentArea) {
+                dst[x] = label;
+                marker = std::max(marker, label + 1);
+            }
+        }
+    }
+    (void)marker;
+
+    cv::Mat white_domain(binary.size(), CV_8U, cv::Scalar(255));
+    white_domain.setTo(0, binary);
+    double max_dt = 0.0;
+    cv::minMaxLoc(dt, nullptr, &max_dt, nullptr, nullptr, white_domain);
+    cv::Mat dt_u8;
+    if (max_dt > 0.0) {
+        dt.convertTo(dt_u8, CV_8U, 255.0 / max_dt);
+        cv::subtract(cv::Scalar(255), dt_u8, dt_u8, white_domain);
+    } else {
+        dt_u8 = cv::Mat::zeros(dt.size(), CV_8U);
+    }
+    cv::Mat watershed_input;
+    cv::cvtColor(dt_u8, watershed_input, cv::COLOR_GRAY2BGR);
+
+    cv::watershed(watershed_input, markers);
+
+    cv::Mat ridges = cv::Mat::zeros(binary.size(), CV_8U);
+    for (int y = 0; y < markers.rows; ++y) {
+        const int* marker_row = markers.ptr<int>(y);
+        const std::uint8_t* domain_row = white_domain.ptr<std::uint8_t>(y);
+        std::uint8_t* out_row = ridges.ptr<std::uint8_t>(y);
+        for (int x = 0; x < markers.cols; ++x) {
+            if (marker_row[x] == -1 && domain_row[x] != 0) {
+                out_row[x] = 255;
+            }
+        }
+    }
+    return ridges;
 }
 
 cv::Mat add_valid_frame_to_skeleton(const cv::Mat& skeleton, const cv::Mat& dt) {
@@ -6964,6 +7091,7 @@ int main(int argc, char** argv) {
         cv::Mat white_domain;
         cv::Mat dt;
         SourceRimSkeletonResult source_rim_result;
+        cv::Mat opencv_watershed_inverted_dt_ridges_img;
         SkeletonGraph graph;
         GraphConnectivityStats graph_stats;
         cv::Mat graph_random_colors;
@@ -7005,6 +7133,14 @@ int main(int argc, char** argv) {
                 timings.insert(timings.end(),
                                source_rim_result.timings.begin(),
                                source_rim_result.timings.end());
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                opencv_watershed_inverted_dt_ridges_img =
+                    opencv_watershed_inverted_dt_ridges(binary, dt);
+                timings.push_back(finish_timing(
+                    "opencv_watershed_inverted_dt", timing));
             }
 
             {
@@ -7101,6 +7237,9 @@ int main(int argc, char** argv) {
                         source_rim_result.source_rim_distance);
             write_image(workdir / (stem + "_source_rim_skeleton.tif"),
                         source_rim_result.loops_connected);
+            write_image(workdir /
+                            (stem + "_opencv_watershed_inverted_dt_ridges.tif"),
+                        opencv_watershed_inverted_dt_ridges_img);
             write_image(workdir / (stem + "_graph_random_edges.tif"),
                         graph_random_colors);
             write_image(workdir / (stem + "_graph_edges_random.tif"),
@@ -7169,6 +7308,8 @@ int main(int argc, char** argv) {
              to_float_layer(source_rim_result.source_rim_ridges)},
             {"source_rim_distance",
              to_float_layer(source_rim_result.source_rim_distance)},
+            {"opencv_watershed_inverted_dt_ridges",
+             to_float_layer(opencv_watershed_inverted_dt_ridges_img)},
             {"graph_random_edges", to_float_layer(graph_random_colors)},
             {"graph_edges_random", to_float_layer(graph_edges_random_colors)},
             {"graph_nodes", to_float_layer(graph_nodes)},
