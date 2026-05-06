@@ -81,17 +81,16 @@ jobs:
             cat volume-cartographer/coverage/summary.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Patch coverage (lines added vs base branch)
+      - name: Patch coverage gate (vs base branch)
         if: github.event_name == 'pull_request'
+        env:
+          PATCH_COVERAGE_MIN: '0'
         run: |
-          pip install --quiet diff-cover
-          cd volume-cartographer
-          git fetch --quiet origin ${{ github.base_ref }}
-          diff-cover coverage/cobertura.xml \
-            --compare-branch=origin/${{ github.base_ref }} \
-            --markdown-report=coverage/patch.md \
-            --html-report=coverage/patch.html || true
+          volume-cartographer/scripts/ci.sh patch-coverage origin/${{ github.base_ref }}
           {
-            echo "## Patch coverage (vs ${{ github.base_ref }})"
-            cat coverage/patch.md
+            echo "## Patch coverage (vs ${{ github.base_ref }}, gate ≥ ${PATCH_COVERAGE_MIN}%)"
+            cat volume-cartographer/coverage/patch.md
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Total coverage non-regression vs base branch
+        if: github.event_name == 'pull_request'
+        run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }}
