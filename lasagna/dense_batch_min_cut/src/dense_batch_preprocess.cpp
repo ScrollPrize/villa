@@ -2770,7 +2770,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
     }
 
     {
-        const TimingMark timing = start_timing();
+        const TimingMark dense_grid_outer_timing = start_timing();
+        const std::size_t dense_grid_timing_start = result.timings.size();
         const int kGridStep = std::max(1, grid_step);
 
         struct CarrierNode {
@@ -3615,8 +3616,23 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                   << "  improved_carriers: " << improved_carriers << "\n"
                   << "  min_route_distance: " << min_route_distance << "\n"
                   << "  max_route_distance: " << max_route_distance << "\n";
-        result.timings.push_back(
-            finish_timing("dense_backtrack_grid_carrier", timing));
+        StageTiming dense_grid_total =
+            finish_timing("dense_backtrack_grid_carrier",
+                          dense_grid_outer_timing);
+        for (std::size_t i = dense_grid_timing_start;
+             i < result.timings.size(); ++i) {
+            const std::string& name = result.timings[i].name;
+            if (name == "dense_grid.debug_paths" ||
+                name == "carrier_debug_render") {
+                dense_grid_total.elapsed_ms =
+                    std::max(0.0, dense_grid_total.elapsed_ms -
+                                      result.timings[i].elapsed_ms);
+                dense_grid_total.cpu_ms =
+                    std::max(0.0,
+                             dense_grid_total.cpu_ms - result.timings[i].cpu_ms);
+            }
+        }
+        result.timings.push_back(dense_grid_total);
     }
 
     for (int y = 0; y < rows; ++y) {
