@@ -3,6 +3,12 @@
 FROM ubuntu:noble AS builder
 ARG DEBIAN_FRONTEND=noninteractive
 
+# Link the published ghcr image to the repo so repo admins manage it
+# (vs. needing org-owner access to package settings).
+LABEL org.opencontainers.image.source="https://github.com/ScrollPrize/villa"
+LABEL org.opencontainers.image.description="volume-cartographer CI builder (Ubuntu 24.04 noble)"
+LABEL org.opencontainers.image.licenses="GPL-3.0"
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update -y \
