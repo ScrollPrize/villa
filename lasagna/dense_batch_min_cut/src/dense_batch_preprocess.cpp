@@ -6542,36 +6542,15 @@ cv::Mat labels_to_u16(const cv::Mat& labels, int max_label) {
     return out;
 }
 
-SourceRimSkeletonResult source_rim_skeleton(const cv::Mat& binary) {
-    CV_Assert(binary.type() == CV_8U);
+SourceRimSkeletonResult source_rim_skeleton(
+    const cv::Mat& white_domain,
+    const cv::Mat& source_pixel_labels,
+    const std::vector<cv::Point>& source_points) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(source_pixel_labels.type() == CV_32S);
+    CV_Assert(white_domain.size() == source_pixel_labels.size());
 
     std::vector<StageTiming> timings;
-
-    cv::Mat source_mask;
-    {
-        const TimingMark timing = start_timing();
-        source_mask = cv::Mat(binary.size(), CV_8U, cv::Scalar(255));
-        source_mask.setTo(0, binary);
-        timings.push_back(finish_timing("source_rim.source_mask", timing));
-    }
-
-    cv::Mat dt_to_source;
-    cv::Mat source_pixel_labels;
-    {
-        const TimingMark timing = start_timing();
-        cv::distanceTransform(source_mask, dt_to_source, source_pixel_labels,
-                              cv::DIST_L2, cv::DIST_MASK_5,
-                              cv::DIST_LABEL_PIXEL);
-        timings.push_back(finish_timing("source_rim.labeled_dt", timing));
-    }
-
-    std::vector<cv::Point> source_points;
-    {
-        const TimingMark timing = start_timing();
-        source_points = label_source_points(source_mask, source_pixel_labels);
-        timings.push_back(
-            finish_timing("source_rim.label_source_points", timing));
-    }
 
     cv::Mat source_rim_ridges;
     cv::Mat source_rim_distance;
@@ -6580,7 +6559,7 @@ SourceRimSkeletonResult source_rim_skeleton(const cv::Mat& binary) {
         constexpr float kSourceRimRidgeThresholdPx = 12.0f;
         source_rim_ridges =
             source_rim_distance_label_ridges(
-                source_mask, source_pixel_labels, source_points,
+                white_domain, source_pixel_labels, source_points,
                 kSourceRimRidgeThresholdPx,
                 &source_rim_distance, &timings);
         timings.push_back(
@@ -6598,78 +6577,6 @@ SourceRimSkeletonResult source_rim_skeleton(const cv::Mat& binary) {
             source_rim_distance,
             loops_connected,
             timings};
-}
-
-cv::Mat opencv_watershed_inverted_dt_ridges(const cv::Mat& binary,
-                                            const cv::Mat& dt) {
-    CV_Assert(binary.type() == CV_8U);
-    CV_Assert(dt.type() == CV_32F);
-    CV_Assert(binary.size() == dt.size());
-
-    cv::Mat source_mask;
-    cv::threshold(binary, source_mask, 0, 255, cv::THRESH_BINARY);
-    for (int x = 0; x < source_mask.cols; ++x) {
-        source_mask.at<std::uint8_t>(0, x) = 255;
-        source_mask.at<std::uint8_t>(source_mask.rows - 1, x) = 255;
-    }
-    for (int y = 0; y < source_mask.rows; ++y) {
-        source_mask.at<std::uint8_t>(y, 0) = 255;
-        source_mask.at<std::uint8_t>(y, source_mask.cols - 1) = 255;
-    }
-
-    cv::Mat source_components;
-    cv::Mat source_stats;
-    cv::Mat source_centroids;
-    const int component_count = cv::connectedComponentsWithStats(
-        source_mask, source_components, source_stats, source_centroids, 4,
-        CV_32S);
-
-    cv::Mat markers = cv::Mat::zeros(binary.size(), CV_32S);
-    constexpr int kMinSourceComponentArea = 8;
-    int marker = 1;
-    for (int y = 0; y < source_components.rows; ++y) {
-        const int* labels = source_components.ptr<int>(y);
-        int* dst = markers.ptr<int>(y);
-        for (int x = 0; x < source_components.cols; ++x) {
-            const int label = labels[x];
-            if (label > 0 && label < component_count &&
-                source_stats.at<int>(label, cv::CC_STAT_AREA) >=
-                    kMinSourceComponentArea) {
-                dst[x] = label;
-                marker = std::max(marker, label + 1);
-            }
-        }
-    }
-    (void)marker;
-
-    cv::Mat white_domain(binary.size(), CV_8U, cv::Scalar(255));
-    white_domain.setTo(0, binary);
-    double max_dt = 0.0;
-    cv::minMaxLoc(dt, nullptr, &max_dt, nullptr, nullptr, white_domain);
-    cv::Mat dt_u8;
-    if (max_dt > 0.0) {
-        dt.convertTo(dt_u8, CV_8U, 255.0 / max_dt);
-        cv::subtract(cv::Scalar(255), dt_u8, dt_u8, white_domain);
-    } else {
-        dt_u8 = cv::Mat::zeros(dt.size(), CV_8U);
-    }
-    cv::Mat watershed_input;
-    cv::cvtColor(dt_u8, watershed_input, cv::COLOR_GRAY2BGR);
-
-    cv::watershed(watershed_input, markers);
-
-    cv::Mat ridges = cv::Mat::zeros(binary.size(), CV_8U);
-    for (int y = 0; y < markers.rows; ++y) {
-        const int* marker_row = markers.ptr<int>(y);
-        const std::uint8_t* domain_row = white_domain.ptr<std::uint8_t>(y);
-        std::uint8_t* out_row = ridges.ptr<std::uint8_t>(y);
-        for (int x = 0; x < markers.cols; ++x) {
-            if (marker_row[x] == -1 && domain_row[x] != 0) {
-                out_row[x] = 255;
-            }
-        }
-    }
-    return ridges;
 }
 
 cv::Mat add_valid_frame_to_skeleton(const cv::Mat& skeleton, const cv::Mat& dt) {
@@ -6937,17 +6844,28 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         white_domain.setTo(0, binary);
 
         cv::Mat dt;
+        cv::Mat source_pixel_labels;
         {
             const TimingMark timing = start_timing();
-            cv::distanceTransform(white_domain, dt, cv::DIST_L2,
-                                  cv::DIST_MASK_PRECISE);
-            timings.push_back(finish_timing("precise_dt", timing));
+            cv::distanceTransform(white_domain, dt, source_pixel_labels,
+                                  cv::DIST_L2, cv::DIST_MASK_5,
+                                  cv::DIST_LABEL_PIXEL);
+            timings.push_back(finish_timing("labeled_dt", timing));
+        }
+
+        std::vector<cv::Point> source_points;
+        {
+            const TimingMark timing = start_timing();
+            source_points =
+                label_source_points(white_domain, source_pixel_labels);
+            timings.push_back(finish_timing("label_source_points", timing));
         }
 
         SourceRimSkeletonResult source_rim_result;
         {
             const TimingMark timing = start_timing();
-            source_rim_result = source_rim_skeleton(binary);
+            source_rim_result = source_rim_skeleton(
+                white_domain, source_pixel_labels, source_points);
             timings.push_back(finish_timing("source_rim_skeleton", timing));
             timings.insert(timings.end(),
                            source_rim_result.timings.begin(),
@@ -7090,8 +7008,9 @@ int main(int argc, char** argv) {
         cv::Mat binary;
         cv::Mat white_domain;
         cv::Mat dt;
+        cv::Mat source_pixel_labels;
+        std::vector<cv::Point> source_points;
         SourceRimSkeletonResult source_rim_result;
-        cv::Mat opencv_watershed_inverted_dt_ridges_img;
         SkeletonGraph graph;
         GraphConnectivityStats graph_stats;
         cv::Mat graph_random_colors;
@@ -7121,26 +7040,27 @@ int main(int argc, char** argv) {
 
             {
                 const TimingMark timing = start_timing();
-                cv::distanceTransform(white_domain, dt, cv::DIST_L2,
-                                      cv::DIST_MASK_PRECISE);
-                timings.push_back(finish_timing("precise_dt", timing));
+                cv::distanceTransform(white_domain, dt, source_pixel_labels,
+                                      cv::DIST_L2, cv::DIST_MASK_5,
+                                      cv::DIST_LABEL_PIXEL);
+                timings.push_back(finish_timing("labeled_dt", timing));
             }
 
             {
                 const TimingMark timing = start_timing();
-                source_rim_result = source_rim_skeleton(binary);
+                source_points =
+                    label_source_points(white_domain, source_pixel_labels);
+                timings.push_back(finish_timing("label_source_points", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                source_rim_result = source_rim_skeleton(
+                    white_domain, source_pixel_labels, source_points);
                 timings.push_back(finish_timing("source_rim_skeleton", timing));
                 timings.insert(timings.end(),
                                source_rim_result.timings.begin(),
                                source_rim_result.timings.end());
-            }
-
-            {
-                const TimingMark timing = start_timing();
-                opencv_watershed_inverted_dt_ridges_img =
-                    opencv_watershed_inverted_dt_ridges(binary, dt);
-                timings.push_back(finish_timing(
-                    "opencv_watershed_inverted_dt", timing));
             }
 
             {
@@ -7237,9 +7157,6 @@ int main(int argc, char** argv) {
                         source_rim_result.source_rim_distance);
             write_image(workdir / (stem + "_source_rim_skeleton.tif"),
                         source_rim_result.loops_connected);
-            write_image(workdir /
-                            (stem + "_opencv_watershed_inverted_dt_ridges.tif"),
-                        opencv_watershed_inverted_dt_ridges_img);
             write_image(workdir / (stem + "_graph_random_edges.tif"),
                         graph_random_colors);
             write_image(workdir / (stem + "_graph_edges_random.tif"),
@@ -7308,8 +7225,6 @@ int main(int argc, char** argv) {
              to_float_layer(source_rim_result.source_rim_ridges)},
             {"source_rim_distance",
              to_float_layer(source_rim_result.source_rim_distance)},
-            {"opencv_watershed_inverted_dt_ridges",
-             to_float_layer(opencv_watershed_inverted_dt_ridges_img)},
             {"graph_random_edges", to_float_layer(graph_random_colors)},
             {"graph_edges_random", to_float_layer(graph_edges_random_colors)},
             {"graph_nodes", to_float_layer(graph_nodes)},
