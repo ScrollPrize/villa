@@ -293,6 +293,57 @@ def optimize(
 	def _stage_done(name: str, t0: float) -> None:
 		return None
 
+	def _timing_cuda_sync() -> None:
+		if torch.cuda.is_available():
+			torch.cuda.synchronize()
+
+	class _FlowTimingWindow:
+		def __init__(self, *, interval: int = 100) -> None:
+			self.interval = max(1, int(interval))
+			self.count = 0
+			self.acc = {
+				"total": 0.0,
+				"io_prefetch": 0.0,
+				"flow_sampling": 0.0,
+				"flow_calc": 0.0,
+				"opt_step": 0.0,
+				"model_forward": 0.0,
+				"loss_eval": 0.0,
+			}
+
+		def add(self, key: str, seconds: float) -> None:
+			self.acc[key] = self.acc.get(key, 0.0) + max(0.0, float(seconds))
+
+		def finish_iter(self, *, label: str, step1: int, max_steps: int) -> None:
+			self.count += 1
+			if (step1 % self.interval) != 0 and step1 != max_steps:
+				return
+			if self.count <= 0:
+				return
+			total = max(1.0e-12, self.acc.get("total", 0.0))
+			io_prefetch = self.acc.get("io_prefetch", 0.0)
+			flow_sampling = self.acc.get("flow_sampling", 0.0)
+			flow_calc = self.acc.get("flow_calc", 0.0)
+			opt_step = self.acc.get("opt_step", 0.0)
+			measured = io_prefetch + flow_sampling + flow_calc + opt_step
+			other = max(0.0, total - measured)
+			rows = [
+				("io/prefetch", io_prefetch),
+				("flow sampling", flow_sampling),
+				("flow calc", flow_calc),
+				("opt step", opt_step),
+				("other", other),
+			]
+			print(f"[flow_timing] {label} {step1}/{max_steps} over {self.count} iters", flush=True)
+			print(f"{'part':<16s} {'runtime_%':>9s} {'ms/it':>10s}", flush=True)
+			for name, seconds in rows:
+				pct = 100.0 * seconds / total
+				ms_it = 1000.0 * seconds / float(self.count)
+				print(f"{name:<16s} {pct:9.2f} {ms_it:10.2f}", flush=True)
+			self.count = 0
+			for key in list(self.acc.keys()):
+				self.acc[key] = 0.0
+
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
 		"smooth": {"loss": opt_loss_smooth.smooth_loss},
@@ -638,30 +689,56 @@ def optimize(
 		_t_wall_start = time.perf_counter()
 		_t_steps_acc = 0
 		loss = loss0
+		_flow_timing = None
+		if pred_dt_flow_gate_cfg is not None and bool(pred_dt_flow_gate_cfg.get("enabled", False)) and _need_term("pred_dt", opt_cfg.eff) > 0:
+			_flow_timing = _FlowTimingWindow(interval=100)
 
 		for step in range(max_steps):
+			_t_iter = time.perf_counter()
 			# Sync: wait for chunks loaded by last prefetch
+			_t_io = time.perf_counter()
 			if _active_caches:
 				for _cache in _active_caches:
 					_cache.sync()
+			if _flow_timing is not None:
+				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 
 			if fit_data.CHUNK_STATS_ENABLED:
 				fit_data._chunk_stats.begin_iteration()
+			_t_forward = time.perf_counter()
 			res = model(data)
 			_debug_cuda_sync(f"{label}.{step + 1}.model_forward")
+			if _flow_timing is not None:
+				_timing_cuda_sync()
+				_flow_timing.add("model_forward", time.perf_counter() - _t_forward)
+			_t_io = time.perf_counter()
 			_prefetch_loss_points_for_result(res)
 			_debug_cuda_sync(f"{label}.{step + 1}.loss_prefetch")
+			if _flow_timing is not None:
+				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
+			_t_loss_eval = time.perf_counter()
 			loss, term_vals = _eval_terms(res, opt_cfg.eff)
+			if _flow_timing is not None:
+				_timing_cuda_sync()
+				_flow_timing.add("loss_eval", time.perf_counter() - _t_loss_eval)
+				_flow_parts = opt_loss_pred_dt.flow_gate_last_timing()
+				_flow_timing.add("flow_sampling", _flow_parts.get("flow_sampling", 0.0))
+				_flow_timing.add("flow_calc", _flow_parts.get("flow_calc", 0.0))
 			if fit_data.CHUNK_STATS_ENABLED:
 				fit_data._chunk_stats.end_iteration()
 
+			_t_opt = time.perf_counter()
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
 			opt.step()
 			model.update_conn_offsets()
 			model.update_ext_conn_offsets()
+			if _flow_timing is not None:
+				_timing_cuda_sync()
+				_flow_timing.add("opt_step", time.perf_counter() - _t_opt)
 
 			# Prefetch: predict next iteration's chunks from updated mesh
+			_t_io = time.perf_counter()
 			if _active_caches:
 				with torch.no_grad():
 					_xyz_lr_pf = model._grid_xyz()
@@ -679,6 +756,8 @@ def optimize(
 						_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
 				for _cache in _active_caches:
 					_cache.end_iteration()
+			if _flow_timing is not None:
+				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			_t_steps_acc += 1
 			_done_steps[0] += 1
 
@@ -709,7 +788,14 @@ def optimize(
 				_t_wall_start = _t_wall_now
 
 			if ensure_data_fn is not None and (step1 % 100) == 0:
+				_t_io = time.perf_counter()
 				data = ensure_data_fn(data, _needed_channels)
+				if _flow_timing is not None:
+					_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
+
+			if _flow_timing is not None:
+				_flow_timing.add("total", time.perf_counter() - _t_iter)
+				_flow_timing.finish_iter(label=label, step1=step1, max_steps=max_steps)
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res)

@@ -49,6 +49,21 @@ struct StageTiming {
     double cpu_ms = 0.0;
 };
 
+struct CoutSilencer {
+    std::streambuf* old = nullptr;
+    std::ostringstream sink;
+    explicit CoutSilencer(bool active) {
+        if (active) {
+            old = std::cout.rdbuf(sink.rdbuf());
+        }
+    }
+    ~CoutSilencer() {
+        if (old != nullptr) {
+            std::cout.rdbuf(old);
+        }
+    }
+};
+
 TimingMark start_timing() {
     return {Clock::now(), std::clock()};
 }
@@ -71,45 +86,149 @@ float capacity_from_dt(float value) {
 void print_stage_timings(const std::vector<StageTiming>& timings) {
     constexpr int kStageWidth = 44;
     constexpr int kNumericWidth = 14;
-    double total_elapsed_ms = 0.0;
+    constexpr int kSpeedupWidth = 20;
+    std::vector<StageTiming> aggregated;
     for (const StageTiming& timing : timings) {
-        if (timing.name == "total") {
+        auto it = std::find_if(aggregated.begin(), aggregated.end(),
+                               [&](const StageTiming& other) {
+                                   return other.name == timing.name;
+                               });
+        if (it == aggregated.end()) {
+            aggregated.push_back(timing);
+        } else {
+            it->elapsed_ms += timing.elapsed_ms;
+            it->cpu_ms += timing.cpu_ms;
+        }
+    }
+    auto is_total = [](const StageTiming& timing) {
+        return timing.name == "total";
+    };
+    auto is_io_stage = [](const StageTiming& timing) {
+        return timing.name == "input_load" ||
+               timing.name == "write_regular_outputs" ||
+               timing.name == "dense_flow_write" ||
+               timing.name == "write_layered_tiff" ||
+               timing.name == "carrier_debug_render" ||
+               timing.name == "carrier_debug_render_skipped" ||
+               timing.name == "dense_grid.debug_paths" ||
+               timing.name == "dense_grid.debug_paths_skipped" ||
+               timing.name == "dense_backtrack_debug_render" ||
+               timing.name == "dense_backtrack_stall_diagnostics" ||
+               timing.name == "tree_path_debug_render";
+    };
+
+    double total_elapsed_ms = 0.0;
+    double total_cpu_ms = 0.0;
+    double compute_elapsed_ms = 0.0;
+    double compute_cpu_ms = 0.0;
+    double io_elapsed_ms = 0.0;
+    double io_cpu_ms = 0.0;
+    for (const StageTiming& timing : aggregated) {
+        if (is_total(timing)) {
             total_elapsed_ms = timing.elapsed_ms;
-            break;
+            total_cpu_ms = timing.cpu_ms;
+        } else if (is_io_stage(timing)) {
+            io_elapsed_ms += timing.elapsed_ms;
+            io_cpu_ms += timing.cpu_ms;
+        } else {
+            compute_elapsed_ms += timing.elapsed_ms;
+            compute_cpu_ms += timing.cpu_ms;
         }
     }
     if (total_elapsed_ms <= 0.0 && !timings.empty()) {
         total_elapsed_ms = timings.back().elapsed_ms;
     }
+    if (total_elapsed_ms > 0.0) {
+        compute_elapsed_ms = std::max(0.0, total_elapsed_ms - io_elapsed_ms);
+    }
+    if (total_cpu_ms > 0.0) {
+        compute_cpu_ms = std::max(0.0, total_cpu_ms - io_cpu_ms);
+    }
+    if (compute_elapsed_ms <= 0.0) {
+        compute_elapsed_ms = total_elapsed_ms;
+    }
+    if (io_elapsed_ms <= 0.0) {
+        io_elapsed_ms = 1.0;
+    }
+
+    auto print_summary = [&](const std::string& name, const double elapsed_ms,
+                             const double cpu_ms) {
+        const double utilization =
+            elapsed_ms > 0.0 ? cpu_ms / elapsed_ms : 0.0;
+        std::cout << "  " << std::left << std::setw(kStageWidth) << name
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(kNumericWidth) << 100.0
+                  << std::setw(kNumericWidth) << elapsed_ms
+                  << std::setw(kNumericWidth) << cpu_ms
+                  << std::setw(kNumericWidth) << utilization
+                  << std::setw(kSpeedupWidth) << 1.0
+                  << "\n";
+    };
+
+    auto print_table = [&](const std::string& title, const double denom_ms,
+                           const double summary_cpu_ms, const bool want_io) {
+        std::cout << title << ":\n"
+                  << "  " << std::left << std::setw(kStageWidth) << "stage"
+                  << std::right << std::setw(kNumericWidth) << "runtime_%"
+                  << std::setw(kNumericWidth) << "elapsed_ms"
+                  << std::setw(kNumericWidth) << "cpu_ms"
+                  << std::setw(kNumericWidth) << "cpu/elapsed"
+                  << std::setw(kSpeedupWidth) << "perfect_par_gain_%"
+                  << "\n";
+        std::cout << "  "
+                  << std::string(kStageWidth + 4 * kNumericWidth +
+                                     kSpeedupWidth,
+                                 '-')
+                  << "\n";
+        for (const StageTiming& timing : aggregated) {
+            if (is_total(timing) || is_io_stage(timing) != want_io) {
+                continue;
+            }
+            const double runtime_fraction =
+                denom_ms > 0.0 ? timing.elapsed_ms / denom_ms : 0.0;
+            const double runtime_percent =
+                100.0 * runtime_fraction;
+            const double utilization =
+                timing.elapsed_ms > 0.0 ? timing.cpu_ms / timing.elapsed_ms
+                                        : 0.0;
+            const double perfect_parallel_speedup =
+                runtime_fraction < 1.0
+                    ? 1.0 / std::max(1.0e-12, 1.0 - runtime_fraction)
+                    : std::numeric_limits<double>::infinity();
+            const double perfect_parallel_gain_percent =
+                100.0 * (perfect_parallel_speedup - 1.0);
+            std::cout << "  " << std::left << std::setw(kStageWidth)
+                      << timing.name
+                      << std::right << std::fixed << std::setprecision(2)
+                      << std::setw(kNumericWidth) << runtime_percent
+                      << std::setw(kNumericWidth) << timing.elapsed_ms
+                      << std::setw(kNumericWidth) << timing.cpu_ms
+                      << std::setw(kNumericWidth) << utilization
+                      << std::setw(kSpeedupWidth)
+                      << perfect_parallel_gain_percent
+                      << "\n";
+        }
+        print_summary(want_io ? "io_debug_total" : "compute_total",
+                      denom_ms, summary_cpu_ms);
+    };
 
     std::cout << "Timings:\n"
               << "  opencv_threads=" << cv::getNumThreads()
               << " hardware_threads="
-              << std::thread::hardware_concurrency() << "\n"
-              << "  " << std::left << std::setw(kStageWidth) << "stage"
-              << std::right << std::setw(kNumericWidth) << "runtime_%"
-              << std::setw(kNumericWidth) << "elapsed_ms"
-              << std::setw(kNumericWidth) << "cpu_ms"
-              << std::setw(kNumericWidth) << "cpu/elapsed"
-              << "\n";
-    std::cout << "  "
-              << std::string(kStageWidth + 4 * kNumericWidth, '-')
-              << "\n";
-    for (const StageTiming& timing : timings) {
-        const double runtime_percent =
-            total_elapsed_ms > 0.0
-                ? (100.0 * timing.elapsed_ms / total_elapsed_ms)
-                : 0.0;
-        const double utilization =
-            timing.elapsed_ms > 0.0 ? timing.cpu_ms / timing.elapsed_ms : 0.0;
-        std::cout << "  " << std::left << std::setw(kStageWidth)
-                  << timing.name
-                  << std::right << std::fixed << std::setprecision(2)
-                  << std::setw(kNumericWidth) << runtime_percent
-                  << std::setw(kNumericWidth) << timing.elapsed_ms
-                  << std::setw(kNumericWidth) << timing.cpu_ms
-                  << std::setw(kNumericWidth) << utilization
-                  << "\n";
+              << std::thread::hardware_concurrency() << "\n";
+    print_table("  compute", compute_elapsed_ms, compute_cpu_ms, false);
+    print_table("  io_debug", io_elapsed_ms, io_cpu_ms, true);
+    for (const StageTiming& timing : aggregated) {
+        if (is_total(timing)) {
+            const double utilization =
+                timing.elapsed_ms > 0.0 ? timing.cpu_ms / timing.elapsed_ms
+                                        : 0.0;
+            std::cout << "  total_elapsed_ms=" << std::fixed
+                      << std::setprecision(2) << timing.elapsed_ms
+                      << " total_cpu_ms=" << timing.cpu_ms
+                      << " total_cpu/elapsed=" << utilization << "\n";
+            break;
+        }
     }
 }
 
@@ -121,13 +240,16 @@ struct Args {
     float backtrack_distance = 10.0f;
     float flow_weight_one = 100.0f;
     float flow_weight_zero = 20.0f;
+    int compute_repeats = 1;
+    bool write_outputs = true;
 };
 
 void print_usage(const char* argv0) {
     std::cerr << "Usage: " << argv0
               << " -i <image> [--source x,y] [--grid-step pixels]"
               << " [--backtrack-distance pixels]"
-              << " [--flow-weight-one value] [--flow-weight-zero value]\n";
+              << " [--flow-weight-one value] [--flow-weight-zero value]"
+              << " [--compute-repeats n] [--no-write]\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -154,6 +276,10 @@ Args parse_args(int argc, char** argv) {
             args.flow_weight_one = std::stof(argv[++i]);
         } else if (key == "--flow-weight-zero" && i + 1 < argc) {
             args.flow_weight_zero = std::stof(argv[++i]);
+        } else if (key == "--compute-repeats" && i + 1 < argc) {
+            args.compute_repeats = std::max(1, std::stoi(argv[++i]));
+        } else if (key == "--no-write") {
+            args.write_outputs = false;
         } else if (key == "--help" || key == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -2312,7 +2438,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                                                   const cv::Mat& graph_node_mask,
                                                   const SkeletonGraph& graph,
                                                   int grid_step,
-                                                  float backtrack_distance) {
+                                                  float backtrack_distance,
+                                                  bool enable_debug_outputs) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
     CV_Assert(graph_pixel_flow.type() == CV_32F);
@@ -2324,8 +2451,10 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
     result.nn_flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
     result.smooth_grid_flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
     result.flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
-    result.debug_paths =
-        cv::Mat(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
+    if (enable_debug_outputs) {
+        result.debug_paths =
+            cv::Mat(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
+    }
 
     constexpr float kFlowEpsilon = 1.0e-4f;
     const float kBacktrackRadius = std::max(0.0f, backtrack_distance);
@@ -2630,6 +2759,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             return axis;
         };
 
+        const TimingMark axis_setup_timing = start_timing();
         const std::vector<int> grid_xs = add_axis(cols);
         const std::vector<int> grid_ys = add_axis(rows);
         const int grid_cols = static_cast<int>(grid_xs.size());
@@ -2638,6 +2768,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             static_cast<std::size_t>(grid_cols * grid_rows), -1);
         std::vector<CarrierNode> carriers;
         carriers.reserve(static_cast<std::size_t>(grid_cols * grid_rows + 4096));
+        result.timings.push_back(
+            finish_timing("dense_grid.axis_setup", axis_setup_timing));
 
         const auto add_carrier = [&](const cv::Point pixel,
                                      const float capacity,
@@ -2678,18 +2810,23 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             return seed;
         };
 
-        for (int gy = 0; gy < grid_rows; ++gy) {
-            for (int gx = 0; gx < grid_cols; ++gx) {
-                const cv::Point pixel(grid_xs[gx], grid_ys[gy]);
-                const float grid_capacity =
-                    capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
-                const float source_flow = std::min(
-                    graph_seed_near_grid_point(pixel), grid_capacity);
-                const int id = add_carrier(pixel, grid_capacity, source_flow,
-                                           true, source_flow > 0.0f);
-                grid_node_ids[static_cast<std::size_t>(gy * grid_cols + gx)] =
-                    id;
+        {
+            const TimingMark grid_carrier_seed_timing = start_timing();
+            for (int gy = 0; gy < grid_rows; ++gy) {
+                for (int gx = 0; gx < grid_cols; ++gx) {
+                    const cv::Point pixel(grid_xs[gx], grid_ys[gy]);
+                    const float grid_capacity =
+                        capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
+                    const float source_flow = std::min(
+                        graph_seed_near_grid_point(pixel), grid_capacity);
+                    const int id = add_carrier(pixel, grid_capacity, source_flow,
+                                               true, source_flow > 0.0f);
+                    grid_node_ids[static_cast<std::size_t>(gy * grid_cols + gx)] =
+                        id;
+                }
             }
+            result.timings.push_back(finish_timing(
+                "dense_grid.grid_carrier_seed", grid_carrier_seed_timing));
         }
 
         int graph_carriers = 0;
@@ -2728,32 +2865,38 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             }
         };
 
-        for (int gy = 0; gy < grid_rows; ++gy) {
-            for (int gx = 0; gx < grid_cols; ++gx) {
-                const int a =
-                    grid_node_ids[static_cast<std::size_t>(gy * grid_cols + gx)];
-                if (a < 0) {
-                    continue;
-                }
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0) {
-                            continue;
-                        }
-                        const int nx = gx + dx;
-                        const int ny = gy + dy;
-                        if (nx < 0 || nx >= grid_cols || ny < 0 ||
-                            ny >= grid_rows) {
-                            continue;
-                        }
-                        const int b = grid_node_ids[static_cast<std::size_t>(
-                            ny * grid_cols + nx)];
-                        if (b >= 0) {
-                            add_carrier_edge(a, b);
+        {
+            const TimingMark grid_edges_timing = start_timing();
+            for (int gy = 0; gy < grid_rows; ++gy) {
+                for (int gx = 0; gx < grid_cols; ++gx) {
+                    const int a = grid_node_ids[static_cast<std::size_t>(
+                        gy * grid_cols + gx)];
+                    if (a < 0) {
+                        continue;
+                    }
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dx == 0 && dy == 0) {
+                                continue;
+                            }
+                            const int nx = gx + dx;
+                            const int ny = gy + dy;
+                            if (nx < 0 || nx >= grid_cols || ny < 0 ||
+                                ny >= grid_rows) {
+                                continue;
+                            }
+                            const int b =
+                                grid_node_ids[static_cast<std::size_t>(
+                                    ny * grid_cols + nx)];
+                            if (b >= 0) {
+                                add_carrier_edge(a, b);
+                            }
                         }
                     }
                 }
             }
+            result.timings.push_back(
+                finish_timing("dense_grid.grid_edges", grid_edges_timing));
         }
 
         int grid_carriers = 0;
@@ -2762,28 +2905,34 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 ++grid_carriers;
             }
         }
-        for (int id = 0; id < static_cast<int>(carriers.size()); ++id) {
-            if (carriers[id].grid) {
-                continue;
-            }
-            std::vector<std::pair<float, int>> nearest;
-            for (int candidate = 0; candidate < static_cast<int>(carriers.size());
-                 ++candidate) {
-                if (!carriers[candidate].grid) {
+        {
+            const TimingMark graph_edges_timing = start_timing();
+            for (int id = 0; id < static_cast<int>(carriers.size()); ++id) {
+                if (carriers[id].grid) {
                     continue;
                 }
-                const float distance = static_cast<float>(
-                    cv::norm(carriers[id].pixel - carriers[candidate].pixel));
-                if (distance > kGridStep * 1.75f) {
-                    continue;
+                std::vector<std::pair<float, int>> nearest;
+                for (int candidate = 0;
+                     candidate < static_cast<int>(carriers.size());
+                     ++candidate) {
+                    if (!carriers[candidate].grid) {
+                        continue;
+                    }
+                    const float distance = static_cast<float>(
+                        cv::norm(carriers[id].pixel - carriers[candidate].pixel));
+                    if (distance > kGridStep * 1.75f) {
+                        continue;
+                    }
+                    nearest.push_back({distance, candidate});
                 }
-                nearest.push_back({distance, candidate});
+                std::sort(nearest.begin(), nearest.end());
+                const int limit = std::min(4, static_cast<int>(nearest.size()));
+                for (int i = 0; i < limit; ++i) {
+                    add_carrier_edge(id, nearest[i].second);
+                }
             }
-            std::sort(nearest.begin(), nearest.end());
-            const int limit = std::min(4, static_cast<int>(nearest.size()));
-            for (int i = 0; i < limit; ++i) {
-                add_carrier_edge(id, nearest[i].second);
-            }
+            result.timings.push_back(
+                finish_timing("dense_grid.graph_edges", graph_edges_timing));
         }
 
         std::vector<float> carrier_value(carriers.size(), 0.0f);
@@ -2799,30 +2948,36 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         };
         std::priority_queue<CarrierFlowItem> carrier_flow_queue;
         int carrier_flow_seeds = 0;
-        for (int node = 0; node < static_cast<int>(carriers.size()); ++node) {
-            if (!carriers[node].fixed) {
-                continue;
-            }
-            carrier_value[node] = carriers[node].source_flow;
-            carrier_flow_queue.push({carrier_value[node], node});
-            ++carrier_flow_seeds;
-        }
-        while (!carrier_flow_queue.empty()) {
-            const CarrierFlowItem item = carrier_flow_queue.top();
-            carrier_flow_queue.pop();
-            if (item.flow + kFlowEpsilon < carrier_value[item.node]) {
-                continue;
-            }
-            for (const CarrierNeighbor neighbor : carrier_edges[item.node]) {
-                const float candidate =
-                    std::min(item.flow, carriers[neighbor.node].capacity);
-                if (candidate <=
-                    carrier_value[neighbor.node] + kFlowEpsilon) {
+        {
+            const TimingMark carrier_flow_timing = start_timing();
+            for (int node = 0; node < static_cast<int>(carriers.size());
+                 ++node) {
+                if (!carriers[node].fixed) {
                     continue;
                 }
-                carrier_value[neighbor.node] = candidate;
-                carrier_flow_queue.push({candidate, neighbor.node});
+                carrier_value[node] = carriers[node].source_flow;
+                carrier_flow_queue.push({carrier_value[node], node});
+                ++carrier_flow_seeds;
             }
+            while (!carrier_flow_queue.empty()) {
+                const CarrierFlowItem item = carrier_flow_queue.top();
+                carrier_flow_queue.pop();
+                if (item.flow + kFlowEpsilon < carrier_value[item.node]) {
+                    continue;
+                }
+                for (const CarrierNeighbor neighbor : carrier_edges[item.node]) {
+                    const float candidate =
+                        std::min(item.flow, carriers[neighbor.node].capacity);
+                    if (candidate <=
+                        carrier_value[neighbor.node] + kFlowEpsilon) {
+                        continue;
+                    }
+                    carrier_value[neighbor.node] = candidate;
+                    carrier_flow_queue.push({candidate, neighbor.node});
+                }
+            }
+            result.timings.push_back(
+                finish_timing("dense_grid.carrier_flow", carrier_flow_timing));
         }
         int carrier_flow_reached = 0;
         for (const float value : carrier_value) {
@@ -2858,64 +3013,69 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         const auto route_next = [&](const int node, const int bucket) -> int& {
             return carrier_route_next[route_index(node, bucket)];
         };
-        for (int node = 0; node < carrier_count; ++node) {
-            route_flow(node, 0) = carrier_value[node];
-            route_distance(node, 0) = 0.0f;
-        }
-        for (int bucket = 1; bucket < kCarrierRouteBuckets; ++bucket) {
-            const float budget = bucket * kCarrierRouteBucketPx;
+        {
+            const TimingMark route_dp_timing = start_timing();
             for (int node = 0; node < carrier_count; ++node) {
-                float best_flow = carrier_value[node];
-                float best_distance = 0.0f;
-                int best_next = -1;
-                for (const CarrierNeighbor neighbor : carrier_edges[node]) {
-                    float candidate_flow = carrier_value[neighbor.node];
-                    float candidate_distance =
-                        std::min(neighbor.distance, budget);
-                    if (neighbor.distance >= budget - kFlowEpsilon) {
-                        const float t =
-                            neighbor.distance > 0.0f
-                                ? std::clamp(budget / neighbor.distance, 0.0f,
-                                             1.0f)
-                                : 1.0f;
-                        candidate_flow =
-                            carrier_value[node] * (1.0f - t) +
-                            carrier_value[neighbor.node] * t;
-                    } else {
-                        const int next_bucket = std::clamp(
-                            static_cast<int>(
-                                std::floor((budget - neighbor.distance) /
-                                           kCarrierRouteBucketPx)),
-                            0, bucket - 1);
-                        candidate_flow =
-                            route_flow(neighbor.node, next_bucket);
-                        candidate_distance =
-                            neighbor.distance +
-                            route_distance(neighbor.node, next_bucket);
-                    }
-                    const bool better_flow =
-                        candidate_flow > best_flow + kFlowEpsilon;
-                    const bool same_flow_longer =
-                        std::abs(candidate_flow - best_flow) <=
-                            kFlowEpsilon &&
-                        candidate_distance > best_distance + kFlowEpsilon;
-                    const bool same_flow_same_distance_stable =
-                        std::abs(candidate_flow - best_flow) <=
-                            kFlowEpsilon &&
-                        std::abs(candidate_distance - best_distance) <=
-                            kFlowEpsilon &&
-                        (best_next < 0 || neighbor.node < best_next);
-                    if (better_flow || same_flow_longer ||
-                        same_flow_same_distance_stable) {
-                        best_flow = candidate_flow;
-                        best_distance = candidate_distance;
-                        best_next = neighbor.node;
-                    }
-                }
-                route_flow(node, bucket) = best_flow;
-                route_distance(node, bucket) = best_distance;
-                route_next(node, bucket) = best_next;
+                route_flow(node, 0) = carrier_value[node];
+                route_distance(node, 0) = 0.0f;
             }
+            for (int bucket = 1; bucket < kCarrierRouteBuckets; ++bucket) {
+                const float budget = bucket * kCarrierRouteBucketPx;
+                for (int node = 0; node < carrier_count; ++node) {
+                    float best_flow = carrier_value[node];
+                    float best_distance = 0.0f;
+                    int best_next = -1;
+                    for (const CarrierNeighbor neighbor : carrier_edges[node]) {
+                        float candidate_flow = carrier_value[neighbor.node];
+                        float candidate_distance =
+                            std::min(neighbor.distance, budget);
+                        if (neighbor.distance >= budget - kFlowEpsilon) {
+                            const float t = neighbor.distance > 0.0f
+                                                ? std::clamp(
+                                                      budget / neighbor.distance,
+                                                      0.0f, 1.0f)
+                                                : 1.0f;
+                            candidate_flow =
+                                carrier_value[node] * (1.0f - t) +
+                                carrier_value[neighbor.node] * t;
+                        } else {
+                            const int next_bucket = std::clamp(
+                                static_cast<int>(
+                                    std::floor((budget - neighbor.distance) /
+                                               kCarrierRouteBucketPx)),
+                                0, bucket - 1);
+                            candidate_flow =
+                                route_flow(neighbor.node, next_bucket);
+                            candidate_distance =
+                                neighbor.distance +
+                                route_distance(neighbor.node, next_bucket);
+                        }
+                        const bool better_flow =
+                            candidate_flow > best_flow + kFlowEpsilon;
+                        const bool same_flow_longer =
+                            std::abs(candidate_flow - best_flow) <=
+                                kFlowEpsilon &&
+                            candidate_distance > best_distance + kFlowEpsilon;
+                        const bool same_flow_same_distance_stable =
+                            std::abs(candidate_flow - best_flow) <=
+                                kFlowEpsilon &&
+                            std::abs(candidate_distance - best_distance) <=
+                                kFlowEpsilon &&
+                            (best_next < 0 || neighbor.node < best_next);
+                        if (better_flow || same_flow_longer ||
+                            same_flow_same_distance_stable) {
+                            best_flow = candidate_flow;
+                            best_distance = candidate_distance;
+                            best_next = neighbor.node;
+                        }
+                    }
+                    route_flow(node, bucket) = best_flow;
+                    route_distance(node, bucket) = best_distance;
+                    route_next(node, bucket) = best_next;
+                }
+            }
+            result.timings.push_back(
+                finish_timing("dense_grid.route_dp", route_dp_timing));
         }
         const int route_final_bucket = kCarrierRouteBuckets - 1;
 
@@ -3016,7 +3176,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             return static_cast<int>(std::distance(axis.begin(), upper)) - 1;
         };
 
-        {
+        if (enable_debug_outputs) {
+            const TimingMark debug_paths_timing = start_timing();
             const std::array<cv::Point, 2> kDebugGridPoints = {
                 cv::Point(236, 180), cv::Point(240, 184)};
             const std::array<cv::Scalar, 2> kDebugColors = {
@@ -3083,6 +3244,11 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                     ++steps;
                 }
             }
+            result.timings.push_back(
+                finish_timing("dense_grid.debug_paths", debug_paths_timing));
+        } else {
+            result.timings.push_back({"dense_grid.debug_paths_skipped", 0.0,
+                                      0.0});
         }
 
         if constexpr (false) {
@@ -3216,72 +3382,80 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             }
         }
 
-        cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
-            for (int y = range.start; y < range.end; ++y) {
-                for (int x = 0; x < cols; ++x) {
-                    const int index = y * cols + x;
-                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
-                        continue;
-                    }
-                    result.nn_flow.at<float>(y, x) = routed_flow[index];
-                    const cv::Point pixel(x, y);
-                    const int gx0 = lower_axis_index(grid_xs, x);
-                    const int gy0 = lower_axis_index(grid_ys, y);
-                    const int gx1 = std::min(gx0 + 1, grid_cols - 1);
-                    const int gy1 = std::min(gy0 + 1, grid_rows - 1);
-                    const float x0 = static_cast<float>(grid_xs[gx0]);
-                    const float x1 = static_cast<float>(grid_xs[gx1]);
-                    const float y0 = static_cast<float>(grid_ys[gy0]);
-                    const float y1 = static_cast<float>(grid_ys[gy1]);
-                    const float tx =
-                        x1 > x0 ? (static_cast<float>(x) - x0) / (x1 - x0)
-                                : 0.0f;
-                    const float ty =
-                        y1 > y0 ? (static_cast<float>(y) - y0) / (y1 - y0)
-                                : 0.0f;
-                    const std::array<std::tuple<int, int, double>, 4>
-                        corners = {
-                            std::make_tuple(gx0, gy0,
-                                            (1.0 - tx) * (1.0 - ty)),
-                            std::make_tuple(gx1, gy0, tx * (1.0 - ty)),
-                            std::make_tuple(gx0, gy1, (1.0 - tx) * ty),
-                            std::make_tuple(gx1, gy1, tx * ty)};
-                    double weighted_sum = 0.0;
-                    double weight_sum = 0.0;
-                    double smooth_weighted_sum = 0.0;
-                    double smooth_weight_sum = 0.0;
-                    for (const auto [gx, gy, bilinear_weight] : corners) {
-                        if (bilinear_weight <= 0.0) {
-                            continue;
-                        }
-                        const int node = grid_node_id(gx, gy);
-                        if (node < 0) {
-                            continue;
-                        }
-                        if (!line_in_white(pixel, carriers[node].pixel)) {
-                            continue;
-                        }
-                        weighted_sum += route_flow(node, route_final_bucket) *
-                                        bilinear_weight;
-                        weight_sum += bilinear_weight;
-                        smooth_weighted_sum += carrier_value[node] *
-                                               bilinear_weight;
-                        smooth_weight_sum += bilinear_weight;
-                    }
-                    result.flow.at<float>(y, x) =
-                        weight_sum > 0.0
-                            ? static_cast<float>(weighted_sum / weight_sum)
-                            : routed_flow[index];
-                    result.smooth_grid_flow.at<float>(y, x) =
-                        smooth_weight_sum > 0.0
-                            ? static_cast<float>(smooth_weighted_sum /
-                                                 smooth_weight_sum)
-                            : routed_flow[index];
-                }
-            }
-        });
-
         {
+            const TimingMark dense_render_timing = start_timing();
+            cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+                for (int y = range.start; y < range.end; ++y) {
+                    for (int x = 0; x < cols; ++x) {
+                        const int index = y * cols + x;
+                        if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                            continue;
+                        }
+                        result.nn_flow.at<float>(y, x) = routed_flow[index];
+                        const cv::Point pixel(x, y);
+                        const int gx0 = lower_axis_index(grid_xs, x);
+                        const int gy0 = lower_axis_index(grid_ys, y);
+                        const int gx1 = std::min(gx0 + 1, grid_cols - 1);
+                        const int gy1 = std::min(gy0 + 1, grid_rows - 1);
+                        const float x0 = static_cast<float>(grid_xs[gx0]);
+                        const float x1 = static_cast<float>(grid_xs[gx1]);
+                        const float y0 = static_cast<float>(grid_ys[gy0]);
+                        const float y1 = static_cast<float>(grid_ys[gy1]);
+                        const float tx =
+                            x1 > x0
+                                ? (static_cast<float>(x) - x0) / (x1 - x0)
+                                : 0.0f;
+                        const float ty =
+                            y1 > y0
+                                ? (static_cast<float>(y) - y0) / (y1 - y0)
+                                : 0.0f;
+                        const std::array<std::tuple<int, int, double>, 4>
+                            corners = {
+                                std::make_tuple(gx0, gy0,
+                                                (1.0 - tx) * (1.0 - ty)),
+                                std::make_tuple(gx1, gy0, tx * (1.0 - ty)),
+                                std::make_tuple(gx0, gy1, (1.0 - tx) * ty),
+                                std::make_tuple(gx1, gy1, tx * ty)};
+                        double weighted_sum = 0.0;
+                        double weight_sum = 0.0;
+                        double smooth_weighted_sum = 0.0;
+                        double smooth_weight_sum = 0.0;
+                        for (const auto [gx, gy, bilinear_weight] : corners) {
+                            if (bilinear_weight <= 0.0) {
+                                continue;
+                            }
+                            const int node = grid_node_id(gx, gy);
+                            if (node < 0) {
+                                continue;
+                            }
+                            if (!line_in_white(pixel, carriers[node].pixel)) {
+                                continue;
+                            }
+                            weighted_sum +=
+                                route_flow(node, route_final_bucket) *
+                                bilinear_weight;
+                            weight_sum += bilinear_weight;
+                            smooth_weighted_sum += carrier_value[node] *
+                                                   bilinear_weight;
+                            smooth_weight_sum += bilinear_weight;
+                        }
+                        result.flow.at<float>(y, x) =
+                            weight_sum > 0.0
+                                ? static_cast<float>(weighted_sum / weight_sum)
+                                : routed_flow[index];
+                        result.smooth_grid_flow.at<float>(y, x) =
+                            smooth_weight_sum > 0.0
+                                ? static_cast<float>(smooth_weighted_sum /
+                                                     smooth_weight_sum)
+                                : routed_flow[index];
+                    }
+                }
+            });
+            result.timings.push_back(
+                finish_timing("dense_grid.dense_render", dense_render_timing));
+        }
+
+        if (enable_debug_outputs) {
             const TimingMark carrier_debug_timing = start_timing();
             result.carrier_debug =
                 cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0.0f));
@@ -3349,6 +3523,9 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             }
             result.timings.push_back(
                 finish_timing("carrier_debug_render", carrier_debug_timing));
+        } else {
+            result.timings.push_back({"carrier_debug_render_skipped", 0.0,
+                                      0.0});
         }
 
         int carrier_edges_count = 0;
@@ -3969,7 +4146,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                                           const cv::Mat& source_pixel_ridges,
                                           const cv::Point source,
                                           int grid_step = 50,
-                                          float backtrack_distance = 10.0f) {
+                                          float backtrack_distance = 10.0f,
+                                          bool enable_debug_outputs = true) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
     CV_Assert(source_pixel_ridges.type() == CV_8U);
@@ -4972,7 +5150,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             compute_dense_backtrack_flow(white_domain, dt, graph_pixel_flow,
                                          graph_node_flow, source_edge_mask,
                                          graph.node_mask, graph, grid_step,
-                                         backtrack_distance);
+                                         backtrack_distance,
+                                         enable_debug_outputs);
         // Reference dense flood: useful for later experiments, but its TIFF is
         // disabled by default so timing focuses on the current tree dense flow.
         dense_backtrack_nn_flow = dense_backtrack.nn_flow;
@@ -6006,11 +6185,13 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             timings.push_back(finish_timing("graph_extract", timing));
         }
 
+        const bool enable_debug_outputs =
+            smooth_grid_flow != nullptr || graph_edge_flow_rgb != nullptr;
         DenseFlowResult dense_flow_result =
             compute_dense_source_flow(
                 white_domain, dt, graph,
                 component_voronoi_result.source_pixel_ridges, source,
-                grid_step, backtrack_distance);
+                grid_step, backtrack_distance, enable_debug_outputs);
         if (resolved_source_x != nullptr) {
             *resolved_source_x = dense_flow_result.source_seed_pixel.x;
         }
@@ -6122,127 +6303,143 @@ int main(int argc, char** argv) {
         }
 
         cv::Mat binary;
-        {
-            const TimingMark timing = start_timing();
-            binary = binarize_fixed_threshold(gray);
-            timings.push_back(finish_timing("binarize", timing));
-        }
-        if (args.has_source) {
-            const TimingMark timing = start_timing();
-            binary = keep_source_white_component(binary, args.source);
-            timings.push_back(
-                finish_timing("source_connected_component", timing));
-        }
-
-        cv::Mat white_domain(binary.size(), CV_8U, cv::Scalar(255));
-        white_domain.setTo(0, binary);
-
+        cv::Mat white_domain;
         cv::Mat dt;
-        {
-            const TimingMark timing = start_timing();
-            cv::distanceTransform(white_domain, dt, cv::DIST_L2,
-                                  cv::DIST_MASK_PRECISE);
-            timings.push_back(finish_timing("precise_dt", timing));
-        }
-
         ComponentVoronoiResult component_voronoi_result;
-        {
-            const TimingMark timing = start_timing();
-            component_voronoi_result = component_voronoi(binary);
-            timings.push_back(finish_timing("component_voronoi", timing));
-            timings.insert(timings.end(),
-                           component_voronoi_result.timings.begin(),
-                           component_voronoi_result.timings.end());
-        }
-
-        {
-            const TimingMark timing = start_timing();
-            component_voronoi_result.cell_loops_connected =
-                add_valid_frame_to_skeleton(
-                    component_voronoi_result.cell_loops_connected, dt);
-            timings.push_back(finish_timing("add_valid_frame", timing));
-        }
-
         SkeletonGraph graph;
-        {
-            const TimingMark timing = start_timing();
-            graph = extract_skeleton_graph(
-                component_voronoi_result.cell_loops_connected, dt);
-            timings.push_back(finish_timing("graph_extract", timing));
-        }
-
         GraphConnectivityStats graph_stats;
-        {
-            const TimingMark timing = start_timing();
-            graph_stats = graph_connectivity_stats(graph);
-            timings.push_back(finish_timing("graph_connectivity_stats", timing));
-        }
-
         cv::Mat graph_random_colors;
-        {
-            const TimingMark timing = start_timing();
-            graph_random_colors = render_graph_random_colors(graph, binary.size());
-            timings.push_back(finish_timing("graph_random_color_render", timing));
-        }
-
         cv::Mat graph_edges_random_colors;
-        {
-            const TimingMark timing = start_timing();
-            graph_edges_random_colors =
-                render_graph_edges_random_colors(graph, binary.size());
-            timings.push_back(
-                finish_timing("graph_edge_only_random_color_render", timing));
-        }
-
         cv::Mat graph_nodes;
-        {
-            const TimingMark timing = start_timing();
-            graph_nodes = render_graph_nodes(graph, binary.size());
-            timings.push_back(finish_timing("graph_node_render", timing));
-        }
-
         cv::Mat graph_capacity;
         cv::Mat graph_capacity_gray_bg;
-        {
-            const TimingMark timing = start_timing();
-            graph_capacity = render_graph_capacity(graph, binary.size(), 0);
-            graph_capacity_gray_bg =
-                render_graph_capacity(graph, binary.size(), 127);
-            timings.push_back(finish_timing("graph_capacity_render", timing));
-        }
-
         DenseFlowResult dense_flow_result;
         bool has_dense_flow = false;
-        if (args.has_source) {
-            dense_flow_result =
-                compute_dense_source_flow(
-                    white_domain, dt, graph,
-                    component_voronoi_result.source_pixel_ridges, args.source,
-                    args.grid_step, args.backtrack_distance);
+        cv::Mat contour_loops;
+        for (int repeat = 0; repeat < args.compute_repeats; ++repeat) {
+            CoutSilencer silence_repeated_details(
+                args.compute_repeats > 1 && repeat + 1 < args.compute_repeats);
             {
                 const TimingMark timing = start_timing();
-                dense_flow_result.flow_gate_weight =
-                    compute_flow_gate_weight_image(
-                        dense_flow_result.tree_dense_flow, dt,
-                        dense_flow_result.source_seed_pixel,
-                        dense_flow_result.source_seed_capacity, args.grid_step,
-                        args.flow_weight_one, args.flow_weight_zero);
-                timings.push_back(
-                    finish_timing("flow_gate_weight", timing));
+                binary = binarize_fixed_threshold(gray);
+                timings.push_back(finish_timing("binarize", timing));
             }
-            timings.insert(timings.end(), dense_flow_result.timings.begin(),
-                           dense_flow_result.timings.end());
-            has_dense_flow = true;
-        }
+            if (args.has_source) {
+                const TimingMark timing = start_timing();
+                binary = keep_source_white_component(binary, args.source);
+                timings.push_back(
+                    finish_timing("source_connected_component", timing));
+            }
 
-        cv::Mat contour_loops;
-        {
-            const TimingMark timing = start_timing();
-            contour_loops = binary_contour_loops(binary);
-            timings.push_back(finish_timing("binary_contour_loops", timing));
+            white_domain = cv::Mat(binary.size(), CV_8U, cv::Scalar(255));
+            white_domain.setTo(0, binary);
+
+            {
+                const TimingMark timing = start_timing();
+                cv::distanceTransform(white_domain, dt, cv::DIST_L2,
+                                      cv::DIST_MASK_PRECISE);
+                timings.push_back(finish_timing("precise_dt", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                component_voronoi_result = component_voronoi(binary);
+                timings.push_back(finish_timing("component_voronoi", timing));
+                timings.insert(timings.end(),
+                               component_voronoi_result.timings.begin(),
+                               component_voronoi_result.timings.end());
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                component_voronoi_result.cell_loops_connected =
+                    add_valid_frame_to_skeleton(
+                        component_voronoi_result.cell_loops_connected, dt);
+                timings.push_back(finish_timing("add_valid_frame", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                graph = extract_skeleton_graph(
+                    component_voronoi_result.cell_loops_connected, dt);
+                timings.push_back(finish_timing("graph_extract", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                graph_stats = graph_connectivity_stats(graph);
+                timings.push_back(
+                    finish_timing("graph_connectivity_stats", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                graph_random_colors =
+                    render_graph_random_colors(graph, binary.size());
+                timings.push_back(
+                    finish_timing("graph_random_color_render", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                graph_edges_random_colors =
+                    render_graph_edges_random_colors(graph, binary.size());
+                timings.push_back(
+                    finish_timing("graph_edge_only_random_color_render",
+                                  timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                graph_nodes = render_graph_nodes(graph, binary.size());
+                timings.push_back(finish_timing("graph_node_render", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                graph_capacity =
+                    render_graph_capacity(graph, binary.size(), 0);
+                graph_capacity_gray_bg =
+                    render_graph_capacity(graph, binary.size(), 127);
+                timings.push_back(
+                    finish_timing("graph_capacity_render", timing));
+            }
+
+            has_dense_flow = false;
+            if (args.has_source) {
+                dense_flow_result =
+                    compute_dense_source_flow(
+                        white_domain, dt, graph,
+                        component_voronoi_result.source_pixel_ridges,
+                        args.source, args.grid_step,
+                        args.backtrack_distance, args.write_outputs);
+                {
+                    const TimingMark timing = start_timing();
+                    dense_flow_result.flow_gate_weight =
+                        compute_flow_gate_weight_image(
+                            dense_flow_result.tree_dense_flow, dt,
+                            dense_flow_result.source_seed_pixel,
+                            dense_flow_result.source_seed_capacity,
+                            args.grid_step, args.flow_weight_one,
+                            args.flow_weight_zero);
+                    timings.push_back(
+                        finish_timing("flow_gate_weight", timing));
+                }
+                timings.insert(timings.end(), dense_flow_result.timings.begin(),
+                               dense_flow_result.timings.end());
+                has_dense_flow = true;
+            }
+
+            {
+                const TimingMark timing = start_timing();
+                contour_loops = binary_contour_loops(binary);
+                timings.push_back(finish_timing("binary_contour_loops",
+                                                timing));
+            }
         }
 
         const std::string stem = args.input.stem().string();
+        if (args.write_outputs) {
         {
             const TimingMark timing = start_timing();
             write_image(workdir / (stem + "_binary.tif"), binary);
@@ -6410,9 +6607,9 @@ int main(int argc, char** argv) {
                                      layered_tiff);
             timings.push_back(finish_timing("write_layered_tiff", timing));
         }
+        }
         timings.push_back(finish_timing("total", total_start));
 
-        print_stage_timings(timings);
         std::cout << "Graph:\n"
                   << "  graph_nodes: " << (graph.nodes.size() > 0
                                                ? graph.nodes.size() - 1
@@ -6465,106 +6662,7 @@ int main(int argc, char** argv) {
                       << dense_flow_result.finite_edge_flow_max << "\n";
         }
 
-        std::cout << "Wrote:\n"
-                  << "  " << (workdir / (stem + "_binary.tif")) << "\n"
-                  << "  " << (workdir / (stem + "_dt.tif")) << "\n"
-                  << "  "
-                  << (workdir / (stem + "_component_voronoi_labels.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir / (stem + "_component_voronoi_boundaries.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir /
-                      (stem + "_component_voronoi_boundary_skeleton.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir /
-                      (stem +
-                       "_component_voronoi_boundary_skeleton_pruned.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir / (stem + "_source_pixel_voronoi_ridges.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir /
-                      (stem + "_source_pixel_voronoi_ridge_skeleton.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir /
-                      (stem +
-                       "_component_voronoi_boundary_skeleton_hybrid.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir / (stem + "_component_voronoi_cell_loops.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir /
-                      (stem + "_component_voronoi_cell_loops_connected.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir / (stem + "_component_voronoi_rings.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_binary_contour_loops.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_graph_random_edges.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_graph_edges_random.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_graph_nodes.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_graph_capacity.tif"))
-                  << "\n"
-                  << "  "
-                  << (workdir / (stem + "_graph_capacity_gray_bg.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_graph_components.txt"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_layers.tif")) << "\n";
-        if (has_dense_flow) {
-            if (kEnableLegacyDenseDtAscent) {
-                std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
-                          << "\n";
-            }
-            if (kEnableLegacyVoronoiTreeDensification) {
-                std::cout << "  "
-                          << (workdir / (stem + "_voronoi_tree_flow.tif"))
-                          << "\n"
-                          << "  "
-                          << (workdir /
-                              (stem + "_voronoi_tree_flow_gray_bg.tif"))
-                          << "\n"
-                          << "  "
-                          << (workdir / (stem + "_tree_dense_nn_flow.tif"))
-                          << "\n"
-                          << "  " << (workdir / (stem + "_tree_flow_attn.tif"))
-                          << "\n";
-            }
-            if (kWriteReferenceDenseBacktrackNn) {
-                std::cout << "  "
-                          << (workdir /
-                              (stem + "_dense_backtrack_nn_flow.tif"))
-                          << "\n";
-            }
-            std::cout << "  " << (workdir / (stem + "_smooth_grid_flow.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_tree_dense_flow.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_tree_paths_debug.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
-                      << "\n"
-                      << "  "
-                      << (workdir / (stem + "_graph_edge_flow_gray_bg.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_edge_flow_px.tif"))
-                      << "\n"
-                      << "  "
-                      << (workdir / (stem + "_edge_flow_px_gray_bg.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_graph_source_edges.tif"))
-                      << "\n";
-        }
+        print_stage_timings(timings);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         print_usage(argv[0]);
