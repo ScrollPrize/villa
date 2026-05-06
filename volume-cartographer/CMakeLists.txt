@@ -17,6 +17,7 @@ option(VC_ENABLE_NSAN     "NumericalStabilitySanitizer (clang-only, LLVM 19+)" O
 option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
+option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
@@ -191,6 +192,18 @@ elseif(VC_WARNINGS)
 endif()
 if(VC_WERROR)
     add_compile_options(-Werror)
+endif()
+
+if(VC_PROFILE_COMPILE)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        # Per-TU JSON traces alongside each .o (chrome://tracing format).
+        # 200us granularity is a reasonable signal/noise default.
+        add_compile_options(-ftime-trace -ftime-trace-granularity=200)
+    else()
+        # gcc has no -ftime-trace; -ftime-report dumps a text summary at
+        # the end of every compile (noisy, but useful for one-off probes).
+        add_compile_options(-ftime-report)
+    endif()
 endif()
 
 if(VC_DEAD_CODE_REPORT)

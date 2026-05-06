@@ -60,6 +60,12 @@
       "inherits": ["_dev-base", "_clang"],
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
     },
+    {
+      "name": "dev-profile-clang",
+      "displayName": "Compile-time profile (clang, -ftime-trace)",
+      "inherits": ["_dev-base", "_clang"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_PROFILE_COMPILE": "ON" }
+    },
 
     { "name": "ci-debug-gcc",            "displayName": "CI Debug (gcc)",
       "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "OFF" } },
@@ -120,6 +126,7 @@
   "buildPresets": [
     { "name": "dev-gcc",                  "configurePreset": "dev-gcc" },
     { "name": "dev-clang",                "configurePreset": "dev-clang" },
+    { "name": "dev-profile-clang",        "configurePreset": "dev-profile-clang" },
 
     { "name": "ci-debug-gcc",             "configurePreset": "ci-debug-gcc" },
     { "name": "ci-debug-clang",           "configurePreset": "ci-debug-clang" },
