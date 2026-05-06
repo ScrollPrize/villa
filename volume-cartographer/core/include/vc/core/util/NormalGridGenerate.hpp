@@ -233,11 +233,12 @@ inline bool extractBinarySliceFromChunk(
         binarySlice.create(static_cast<int>(shape[1]),
                            static_cast<int>(shape[2]),
                            CV_8U);
-        for (int col = 0; col < binarySlice.cols; ++col) {
-            const size_t srcColBase = iChunk + static_cast<size_t>(col) * strideX;
-            for (int row = 0; row < binarySlice.rows; ++row) {
-                const bool isSet = data[srcColBase + static_cast<size_t>(row) * strideY] > 0;
-                binarySlice.ptr<uint8_t>(row)[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+        for (int row = 0; row < binarySlice.rows; ++row) {
+            uint8_t* dst = binarySlice.ptr<uint8_t>(row);
+            const size_t srcRowBase = iChunk + static_cast<size_t>(row) * strideY;
+            for (int col = 0; col < binarySlice.cols; ++col) {
+                const bool isSet = data[srcRowBase + static_cast<size_t>(col) * strideX] > 0;
+                dst[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
                 anyNonZero = anyNonZero || isSet;
             }
         }
@@ -246,26 +247,34 @@ inline bool extractBinarySliceFromChunk(
         binarySlice.create(static_cast<int>(shape[0]),
                            static_cast<int>(shape[2]),
                            CV_8U);
+        {
+        const size_t dstStep = binarySlice.step[0] / sizeof(uint8_t);
         for (int col = 0; col < binarySlice.cols; ++col) {
             const size_t srcColBase = iChunk * strideY + static_cast<size_t>(col) * strideX;
+            uint8_t* dst = binarySlice.ptr<uint8_t>(0) + static_cast<size_t>(col);
             for (int row = 0; row < binarySlice.rows; ++row) {
                 const bool isSet = data[srcColBase + static_cast<size_t>(row)] > 0;
-                binarySlice.ptr<uint8_t>(row)[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+                dst[static_cast<size_t>(row) * dstStep] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
                 anyNonZero = anyNonZero || isSet;
             }
+        }
         }
         break;
     case NormalGridSliceDirection::YZ:
         binarySlice.create(static_cast<int>(shape[0]),
                            static_cast<int>(shape[1]),
                            CV_8U);
+        {
+        const size_t dstStep = binarySlice.step[0] / sizeof(uint8_t);
         for (int col = 0; col < binarySlice.cols; ++col) {
             const size_t srcColBase = static_cast<size_t>(col) * strideY + iChunk * strideX;
+            uint8_t* dst = binarySlice.ptr<uint8_t>(0) + static_cast<size_t>(col);
             for (int row = 0; row < binarySlice.rows; ++row) {
                 const bool isSet = data[srcColBase + static_cast<size_t>(row)] > 0;
-                binarySlice.ptr<uint8_t>(row)[col] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+                dst[static_cast<size_t>(row) * dstStep] = isSet ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
                 anyNonZero = anyNonZero || isSet;
             }
+        }
         }
         break;
     }
