@@ -76,10 +76,12 @@ jobs:
           - { image: "ubuntu-24.04", compiler: clang, preset: ci-release,    action: compile }
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests,      action: test }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests,      action: test }
-          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-asan-ubsan, action: test }
+          # Sanitizer cells are clang-only — clang's runtime is more
+          # complete (TySan, NSan) and we don't need duplicate gcc coverage.
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-asan-ubsan, action: test }
-          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tsan,       action: test }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-tsan,       action: test }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tysan,      action: test }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-nsan,       action: test }
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
