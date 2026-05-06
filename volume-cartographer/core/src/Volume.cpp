@@ -14,6 +14,10 @@
 #include <stdexcept>
 #include <type_traits>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef __aarch64__
 #include <arm_neon.h>
 #endif
@@ -168,7 +172,6 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     if (outShape[0] == 0 || outShape[1] == 0 || outShape[2] == 0) {
         return;
     }
-    out.fill(T{});
 
     const auto volumeShape = array.shape(level);
     const auto chunkShape = array.chunkShape(level);
@@ -182,6 +185,13 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     const int z1 = z0 + static_cast<int>(outShape[0]) - 1;
     const int y1 = y0 + static_cast<int>(outShape[1]) - 1;
     const int x1 = x0 + static_cast<int>(outShape[2]) - 1;
+
+    const bool fullyInBounds =
+        z0 >= 0 && y0 >= 0 && x0 >= 0 &&
+        z1 < volumeShape[0] && y1 < volumeShape[1] && x1 < volumeShape[2];
+    if (!fullyInBounds) {
+        out.fill(T{});
+    }
 
     const int readZ0 = std::max(0, z0);
     const int readY0 = std::max(0, y0);
@@ -273,8 +283,7 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     std::exception_ptr firstException;
     std::mutex exceptionMutex;
 
-    #pragma omp parallel for schedule(dynamic)
-    for (size_t planIndex = 0; planIndex < plans.size(); ++planIndex) {
+    const auto processPlan = [&](size_t planIndex) {
         try {
             const auto& plan = plans[planIndex];
             const auto result = array.getChunkBlocking(level, plan.cz, plan.cy, plan.cx);
@@ -325,6 +334,23 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
             if (!firstException) {
                 firstException = std::current_exception();
             }
+        }
+    };
+
+#ifdef _OPENMP
+    const bool useParallelCopy = plans.size() >= 4 && omp_in_parallel() == 0;
+#else
+    const bool useParallelCopy = false;
+#endif
+
+    if (useParallelCopy) {
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t planIndex = 0; planIndex < plans.size(); ++planIndex) {
+            processPlan(planIndex);
+        }
+    } else {
+        for (size_t planIndex = 0; planIndex < plans.size(); ++planIndex) {
+            processPlan(planIndex);
         }
     }
 
