@@ -514,20 +514,7 @@ void run_generate(const po::variables_map& vm) {
     int num_threads = omp_get_max_threads();
     if (num_threads == 0) num_threads = 1;
 
-    size_t max_estimated_batch_bytes = 0;
-    for (SliceDirection dir : {SliceDirection::XY, SliceDirection::XZ, SliceDirection::YZ}) {
-        const auto batch_plan = vc::core::util::planNormalGridBatch(
-            shape,
-            to_normal_grid_direction(dir),
-            num_threads,
-            sparse_volume,
-            chunk_budget_mib,
-            dtype_size);
-        max_estimated_batch_bytes = std::max(max_estimated_batch_bytes, batch_plan.estimatedBatchBytes);
-    }
-    const size_t cache_budget_bytes = std::min<size_t>(
-        256ull * 1024ull * 1024ull,
-        std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
+    const size_t cache_budget_bytes = 10ull * 1024ull * 1024ull * 1024ull;
 
     input_volume.setCacheBudget(cache_budget_bytes);
 
