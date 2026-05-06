@@ -117,7 +117,6 @@ struct AssembledSlice {
     size_t localSliceIndex = 0;
     cv::Mat binarySlice;
     bool anyNonZero = false;
-    double extractSeconds = 0.0;
 };
 
 static const char* direction_name(SliceDirection dir) {
@@ -272,7 +271,7 @@ static void log_slice_existing(
 
 static void log_slice_empty_binary(
     const std::string& dir, size_t idx, int tid, const ProgressSnap& p,
-    double extract_s, int slice_w, int slice_h)
+    int slice_w, int slice_h)
 {
     #pragma omp critical(debug_per_slice_log)
     std::cout << "[slice] dir=" << dir
@@ -282,14 +281,13 @@ static void log_slice_empty_binary(
               << " elapsed=" << std::fixed << std::setprecision(3) << p.elapsed << "s"
               << " rate=" << std::setprecision(2) << p.rate << "it/s"
               << " eta=" << std::setprecision(1) << p.eta << "s"
-              << " extract=" << std::setprecision(4) << extract_s << "s"
               << " slice_size=" << slice_w << "x" << slice_h
               << std::endl;
 }
 
 static void log_slice_empty_trace(
     const std::string& dir, size_t idx, int tid, const ProgressSnap& p,
-    double extract_s, double thinning_s)
+    double thinning_s)
 {
     #pragma omp critical(debug_per_slice_log)
     std::cout << "[slice] dir=" << dir
@@ -299,14 +297,13 @@ static void log_slice_empty_trace(
               << " elapsed=" << std::fixed << std::setprecision(3) << p.elapsed << "s"
               << " rate=" << std::setprecision(2) << p.rate << "it/s"
               << " eta=" << std::setprecision(1) << p.eta << "s"
-              << " extract=" << std::setprecision(4) << extract_s << "s"
               << " thinning=" << thinning_s << "s"
               << std::endl;
 }
 
 static void log_slice_written(
     const std::string& dir, size_t idx, int tid, const ProgressSnap& p,
-    double extract_s, double thinning_s, double populate_s, double save_s,
+    double thinning_s, double populate_s, double save_s,
     size_t bytes, size_t segments, size_t buckets)
 {
     #pragma omp critical(debug_per_slice_log)
@@ -317,7 +314,6 @@ static void log_slice_written(
               << " elapsed=" << std::fixed << std::setprecision(3) << p.elapsed << "s"
               << " rate=" << std::setprecision(2) << p.rate << "it/s"
               << " eta=" << std::setprecision(1) << p.eta << "s"
-              << " extract=" << std::setprecision(4) << extract_s << "s"
               << " thinning=" << thinning_s << "s"
               << " populate=" << populate_s << "s"
               << " save=" << save_s << "s"
@@ -345,29 +341,14 @@ static void log_batch(
 static void log_chunk_io(
     const std::string& dir, size_t chunk_i, size_t chunk_n,
     size_t source_chunk_idx, size_t batch_size,
-    size_t slab_z, size_t slab_y, size_t slab_x,
-    double slab_mib, double read_s, double mibps, double elapsed)
+    double read_s, double elapsed)
 {
     std::cout << "[chunk] dir=" << dir
               << " chunk=" << chunk_i << "/" << chunk_n
               << " source_chunk_idx=" << source_chunk_idx
               << " batch_size=" << batch_size
-              << " slab=" << slab_z << "x" << slab_y << "x" << slab_x
-              << " (" << std::fixed << std::setprecision(1) << slab_mib << "MiB)"
-              << " read=" << std::setprecision(3) << read_s << "s"
-              << " (" << std::setprecision(1) << mibps << "MiB/s)"
+              << " read=" << std::fixed << std::setprecision(3) << read_s << "s"
               << " elapsed=" << std::setprecision(3) << elapsed << "s"
-              << std::endl;
-}
-
-static void log_chunk_extract(
-    const std::string& dir, size_t chunk_i, size_t chunk_n,
-    double extract_loop_s, size_t n_slices)
-{
-    std::cout << "[chunk] dir=" << dir
-              << " chunk=" << chunk_i << "/" << chunk_n
-              << " extract_loop=" << std::fixed << std::setprecision(3) << extract_loop_s << "s"
-              << " (" << n_slices << " slices)"
               << std::endl;
 }
 
@@ -941,9 +922,22 @@ void run_generate(const po::variables_map& vm) {
         const size_t chunk_count_y = (shape[1] + source_chunk_shape[1] - 1) / source_chunk_shape[1];
         const size_t chunk_count_x = (shape[2] + source_chunk_shape[2] - 1) / source_chunk_shape[2];
 
+        const size_t slice_axis_chunk_depth = source_chunk_shape[
+            vc::core::util::normalGridSliceAxis(to_normal_grid_direction(dir))];
+        const double bytes_per_slice_mib =
+            static_cast<double>(batch_plan.bytesPerSlice) / (1024.0 * 1024.0);
+        const double estimated_batch_mib =
+            static_cast<double>(batch_plan.estimatedBatchBytes) / (1024.0 * 1024.0);
         std::cout << "Direction " << dir_metrics.direction << " starting: "
                   << sampled_chunk_plans.size() << " source chunks, "
-                  << sampled_slices_total << " sampled slices to process." << std::endl;
+                  << sampled_slices_total << " sampled slices to process."
+                  << " batch_size=" << chunk_size_tgt << "/" << slice_axis_chunk_depth
+                  << " (slices per slab read)"
+                  << " bytes_per_slice=" << std::fixed << std::setprecision(1)
+                  << bytes_per_slice_mib << "MiB"
+                  << " budget_used=" << estimated_batch_mib << "/"
+                  << chunk_budget_mib << "MiB"
+                  << std::endl;
 
         size_t chunk_index = 0;
         for (const auto& source_chunk_plan : sampled_chunk_plans) {
@@ -1043,7 +1037,6 @@ void run_generate(const po::variables_map& vm) {
 
                     for (size_t i = 0; i < targets.size(); ++i) {
                         assembled_slices[i].anyNonZero = targets[i].anyNonZero;
-                        assembled_slices[i].extractSeconds = 0.0;
                     }
 
                     if (debug_per_slice) {
@@ -1051,8 +1044,7 @@ void run_generate(const po::variables_map& vm) {
                                      sampled_chunk_plans.size(),
                                      source_chunk_plan.sourceChunkIndex,
                                      assembled_slices.size(),
-                                     0, 0, 0,
-                                     0.0, read_seconds, 0.0,
+                                     read_seconds,
                                      seconds_since(start_time));
                     }
                 }
@@ -1076,7 +1068,6 @@ void run_generate(const po::variables_map& vm) {
                                 slice_done_counter, start_time, slice_progress_total);
                             log_slice_empty_binary(dir_metrics.direction,
                                 task.sliceIndex, tid, p,
-                                assembled.extractSeconds,
                                 assembled.binarySlice.cols, assembled.binarySlice.rows);
                         }
                         continue;
@@ -1099,8 +1090,7 @@ void run_generate(const po::variables_map& vm) {
                             const auto p = take_progress(
                                 slice_done_counter, start_time, slice_progress_total);
                             log_slice_empty_trace(dir_metrics.direction,
-                                task.sliceIndex, tid, p,
-                                assembled.extractSeconds, thinning_seconds);
+                                task.sliceIndex, tid, p, thinning_seconds);
                         }
                         continue;
                     }
@@ -1141,7 +1131,7 @@ void run_generate(const po::variables_map& vm) {
                         const auto p = take_progress(
                             slice_done_counter, start_time, slice_progress_total);
                         log_slice_written(dir_metrics.direction, task.sliceIndex,
-                            tid, p, assembled.extractSeconds, thinning_seconds,
+                            tid, p, thinning_seconds,
                             populate_seconds, save_seconds, written_bytes,
                             grid_store.numSegments(), grid_store.numNonEmptyBuckets());
                     }
