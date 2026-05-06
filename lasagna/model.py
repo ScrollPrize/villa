@@ -621,24 +621,24 @@ class Model3D(nn.Module):
 		H, W, _ = xyz.shape
 		# h-tangent: fwd + bwd where both neighbors valid → central diff
 		fwd_h = torch.zeros_like(xyz)
-		fwd_h[:-1] = xyz[1:] - xyz[:-1]
 		bwd_h = torch.zeros_like(xyz)
-		bwd_h[1:] = xyz[1:] - xyz[:-1]
-		next_h_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
-		next_h_v[:-1] = valid[1:]
-		prev_h_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
-		prev_h_v[1:] = valid[:-1]
-		dh = fwd_h * next_h_v.unsqueeze(-1) + bwd_h * prev_h_v.unsqueeze(-1)
+		if H > 1:
+			diff_h = xyz[1:] - xyz[:-1]
+			pair_h = (valid[1:] & valid[:-1]).unsqueeze(-1)
+			diff_h = torch.where(pair_h, diff_h, torch.zeros_like(diff_h))
+			fwd_h[:-1] = diff_h
+			bwd_h[1:] = diff_h
+		dh = fwd_h + bwd_h
 		# w-tangent
 		fwd_w = torch.zeros_like(xyz)
-		fwd_w[:, :-1] = xyz[:, 1:] - xyz[:, :-1]
 		bwd_w = torch.zeros_like(xyz)
-		bwd_w[:, 1:] = xyz[:, 1:] - xyz[:, :-1]
-		next_w_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
-		next_w_v[:, :-1] = valid[:, 1:]
-		prev_w_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
-		prev_w_v[:, 1:] = valid[:, :-1]
-		dw = fwd_w * next_w_v.unsqueeze(-1) + bwd_w * prev_w_v.unsqueeze(-1)
+		if W > 1:
+			diff_w = xyz[:, 1:] - xyz[:, :-1]
+			pair_w = (valid[:, 1:] & valid[:, :-1]).unsqueeze(-1)
+			diff_w = torch.where(pair_w, diff_w, torch.zeros_like(diff_w))
+			fwd_w[:, :-1] = diff_w
+			bwd_w[:, 1:] = diff_w
+		dw = fwd_w + bwd_w
 		n = torch.cross(dh, dw, dim=-1)
 		n = n / (n.norm(dim=-1, keepdim=True) + 1e-8)
 		n[~valid] = 0.0
@@ -719,12 +719,20 @@ class Model3D(nn.Module):
 		"""
 		dev = self.conn_offsets.device
 		idx = len(self._ext_surfaces)
-		self._ext_surfaces.append(xyz.detach().to(device=dev))
 		if valid is None:
 			valid = torch.ones(xyz.shape[0], xyz.shape[1], dtype=torch.bool, device=dev)
 		valid_dev = valid.to(device=dev)
+		xyz_dev = xyz.detach().to(device=dev)
+		finite_xyz = torch.isfinite(xyz_dev).all(dim=-1)
+		valid_dev = valid_dev & finite_xyz
+		xyz_dev = torch.where(
+			valid_dev.unsqueeze(-1),
+			xyz_dev,
+			torch.full_like(xyz_dev, float("nan")),
+		)
+		self._ext_surfaces.append(xyz_dev)
 		self._ext_valid.append(valid_dev)
-		self._ext_normals.append(Model3D._compute_ext_normals(xyz.detach().to(device=dev), valid_dev))
+		self._ext_normals.append(Model3D._compute_ext_normals(xyz_dev, valid_dev))
 		H_ext, W_ext = int(xyz.shape[0]), int(xyz.shape[1])
 		self._ext_conn_offsets.append(
 			torch.zeros(2, self.depth, H_ext, W_ext,
@@ -755,6 +763,13 @@ class Model3D(nn.Module):
 				ext_off = self._ext_conn_offsets[i]
 				h_off, w_off = ext_off[0], ext_off[1]
 				ext_norms = self._ext_normals[i]
+				ext_corner_valid_2d = (
+					self._ext_valid[i] &
+					torch.isfinite(ext_xyz).all(dim=-1) &
+					torch.isfinite(ext_norms).all(dim=-1) &
+					(ext_norms.norm(dim=-1) > 1e-8)
+				)
+				ext_corner_valid = ext_corner_valid_2d.unsqueeze(0).expand(D, -1, -1)
 
 				r_idx = torch.arange(H_ext, device=device, dtype=torch.float32).view(1, H_ext, 1).expand(D, H_ext, W_ext)
 				c_idx = torch.arange(W_ext, device=device, dtype=torch.float32).view(1, 1, W_ext).expand(D, H_ext, W_ext)
@@ -804,8 +819,10 @@ class Model3D(nn.Module):
 				# Clamp so model_h stays in valid quad range [0, Hm-2]
 				new_h_off = (r_idx + new_h_off).clamp(0, Hm - 2) - r_idx
 				new_w_off = (c_idx + new_w_off).clamp(0, Wm - 2) - c_idx
-				self._ext_conn_offsets[i][0] = new_h_off.nan_to_num_(0.0)
-				self._ext_conn_offsets[i][1] = new_w_off.nan_to_num_(0.0)
+				update_valid = ext_corner_valid & torch.isfinite(new_h_off) & torch.isfinite(new_w_off)
+				zeros = torch.zeros_like(new_h_off)
+				self._ext_conn_offsets[i][0] = torch.where(update_valid, new_h_off, zeros)
+				self._ext_conn_offsets[i][1] = torch.where(update_valid, new_w_off, zeros)
 
 	@staticmethod
 	def from_tifxyz_crop(xyz: torch.Tensor, valid: torch.Tensor, *,
@@ -891,6 +908,30 @@ class Model3D(nn.Module):
 			ext_off = self._ext_conn_offsets[ei]  # (2, D, H_ext, W_ext)
 			h_off = ext_off[0]  # (D, H_ext, W_ext)
 			w_off = ext_off[1]
+			ext_norms = self._ext_normals[ei]  # (H_ext, W_ext, 3)
+			ext_corner_valid_2d = (
+				self._ext_valid[ei] &
+				torch.isfinite(ext_xyz).all(dim=-1) &
+				torch.isfinite(ext_norms).all(dim=-1) &
+				(ext_norms.norm(dim=-1) > 1e-8)
+			)
+			if H_ext > 1 and W_ext > 1:
+				ext_quad_valid_2d = (
+					ext_corner_valid_2d[:-1, :-1] &
+					ext_corner_valid_2d[1:, :-1] &
+					ext_corner_valid_2d[:-1, 1:] &
+					ext_corner_valid_2d[1:, 1:]
+				)
+				ext_corner_used_2d = torch.zeros_like(ext_corner_valid_2d)
+				ext_corner_used_2d[:-1, :-1] |= ext_quad_valid_2d
+				ext_corner_used_2d[1:, :-1] |= ext_quad_valid_2d
+				ext_corner_used_2d[:-1, 1:] |= ext_quad_valid_2d
+				ext_corner_used_2d[1:, 1:] |= ext_quad_valid_2d
+			else:
+				ext_quad_valid_2d = torch.zeros(
+					max(0, H_ext - 1), max(0, W_ext - 1),
+					device=device, dtype=torch.bool)
+				ext_corner_used_2d = torch.zeros_like(ext_corner_valid_2d)
 
 			# Ext corner grid indices
 			r_idx = torch.arange(H_ext, device=device, dtype=torch.float32).view(1, H_ext, 1).expand(D, H_ext, W_ext)
@@ -919,9 +960,12 @@ class Model3D(nn.Module):
 			M11 = xyz_lr[d_idx, row + 1, col + 1].detach()
 
 			# Ext corner position and normal (detached, frozen)
-			ext_norms = self._ext_normals[ei]  # (H_ext, W_ext, 3)
 			ext_P = ext_xyz.unsqueeze(0).expand(D, -1, -1, -1)  # (D, H_ext, W_ext, 3)
 			ext_N = ext_norms.unsqueeze(0).expand(D, -1, -1, -1)
+			ext_corner_used = ext_corner_used_2d.unsqueeze(0).expand(D, -1, -1)
+			nan_p = torch.full_like(ext_P, float("nan"))
+			ext_P = torch.where(ext_corner_used.unsqueeze(-1), ext_P, nan_p)
+			ext_N = torch.where(ext_corner_used.unsqueeze(-1), ext_N, nan_p)
 
 			# Ray-bilinear-patch intersection → (u, v) unclamped
 			u, v = Model3D._ray_bilinear_intersect(
@@ -933,9 +977,9 @@ class Model3D(nn.Module):
 
 			# Validity: ext corner valid, model quad in bounds, intersection in [0,1]²
 			uv_ok = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
-			ext_v = self._ext_valid[ei]  # (H_ext, W_ext)
-			ext_corner_valid = ext_v.unsqueeze(0).expand(D, -1, -1)
-			valid = (in_bounds & uv_ok & ext_corner_valid).to(dtype=xyz_lr.dtype).unsqueeze(1)
+			valid = (in_bounds & uv_ok & ext_corner_used).to(dtype=xyz_lr.dtype).unsqueeze(1)
+			full_h = torch.where(valid.squeeze(1).bool(), full_h, torch.full_like(full_h, float("nan")))
+			full_w = torch.where(valid.squeeze(1).bool(), full_w, torch.full_like(full_w, float("nan")))
 
 			# Cache intersection params for conn_offset update
 			self._ext_conn_params[ei] = {"u": u, "v": v, "row": row, "col": col}
@@ -944,6 +988,7 @@ class Model3D(nn.Module):
 				valid, offset,
 				ext_P.detach(), ext_N.detach(),
 				full_h.detach(), full_w.detach(),
+				ext_quad_valid_2d.unsqueeze(0).unsqueeze(1).expand(D, -1, -1, -1).to(dtype=xyz_lr.dtype),
 			))
 
 		return results

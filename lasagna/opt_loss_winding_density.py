@@ -160,27 +160,36 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
 	upsample = max(1, int(res.params.subsample_mesh))
 
-	def _up_hw(t: torch.Tensor) -> torch.Tensor:
-		"""Upsample (D, H, W, C) → (D, H*up, W*up, C) bilinear."""
-		if upsample <= 1:
-			return t
-		return F.interpolate(t.permute(0, 3, 1, 2), scale_factor=upsample,
-							 mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+	def _cell_interp_hw(t: torch.Tensor) -> torch.Tensor:
+		"""Sample inside external cells; invalid cells are filtered separately."""
+		D_, H_, W_, C_ = t.shape
+		if H_ < 2 or W_ < 2:
+			return torch.empty(D_, 0, 0, C_, device=t.device, dtype=t.dtype)
+		a = torch.linspace(0.0, 1.0, upsample, device=t.device, dtype=t.dtype).view(1, 1, 1, upsample, 1, 1)
+		b = torch.linspace(0.0, 1.0, upsample, device=t.device, dtype=t.dtype).view(1, 1, 1, 1, upsample, 1)
+		q00 = t[:, :-1, :-1].unsqueeze(3).unsqueeze(4)
+		q10 = t[:, 1:, :-1].unsqueeze(3).unsqueeze(4)
+		q01 = t[:, :-1, 1:].unsqueeze(3).unsqueeze(4)
+		q11 = t[:, 1:, 1:].unsqueeze(3).unsqueeze(4)
+		out = (1 - a) * (1 - b) * q00 + a * (1 - b) * q10 + (1 - a) * b * q01 + a * b * q11
+		return out.reshape(D_, (H_ - 1) * upsample, (W_ - 1) * upsample, C_)
 
-	def _up_scalar(t: torch.Tensor) -> torch.Tensor:
-		"""Upsample (D, H, W) → (D, H*up, W*up) bilinear."""
-		if upsample <= 1:
-			return t
-		return F.interpolate(t.unsqueeze(1), scale_factor=upsample,
-							 mode='bilinear', align_corners=True).squeeze(1)
+	def _cell_interp_scalar(t: torch.Tensor) -> torch.Tensor:
+		return _cell_interp_hw(t.unsqueeze(-1)).squeeze(-1)
 
-	def _up_mask(t: torch.Tensor) -> torch.Tensor:
-		"""Upsample (D, 1, H, W) → (D, 1, H*up, W*up). Bilinear + threshold
-		so only points where all contributing corners are valid pass."""
-		if upsample <= 1:
-			return t
-		up = F.interpolate(t, scale_factor=upsample, mode='bilinear', align_corners=True)
-		return (up >= 1.0).to(dtype=t.dtype)
+	def _cell_mask(corner_mask: torch.Tensor, quad_mask: torch.Tensor, full_h: torch.Tensor, full_w: torch.Tensor) -> torch.Tensor:
+		"""Return repeated valid-cell mask. A cell is valid only if all corners are valid."""
+		if full_h.shape[1] < 2 or full_h.shape[2] < 2:
+			return torch.empty(full_h.shape[0], 1, 0, 0, device=full_h.device, dtype=full_h.dtype)
+		cm = corner_mask.squeeze(1).bool()
+		finite = torch.isfinite(full_h) & torch.isfinite(full_w)
+		cell = (
+			quad_mask.squeeze(1).bool() &
+			cm[:, :-1, :-1] & cm[:, 1:, :-1] & cm[:, :-1, 1:] & cm[:, 1:, 1:] &
+			finite[:, :-1, :-1] & finite[:, 1:, :-1] & finite[:, :-1, 1:] & finite[:, 1:, 1:]
+		)
+		cell = cell.repeat_interleave(upsample, dim=1).repeat_interleave(upsample, dim=2)
+		return cell.unsqueeze(1).to(dtype=full_h.dtype)
 
 	total_loss = torch.zeros((), device=device, dtype=dtype)
 	total_wsum = 0.0
@@ -190,28 +199,43 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	Hm = int(res.xyz_lr.shape[1])
 	Wm = int(res.xyz_lr.shape[2])
 
-	for (ext_mask, offset, ext_P, ext_N, full_h, full_w) in res.ext_conn:
+	for item in res.ext_conn:
+		if len(item) == 7:
+			ext_mask, offset, ext_P, ext_N, full_h, full_w, ext_quad_mask = item
+		else:
+			ext_mask, offset, ext_P, ext_N, full_h, full_w = item
+			ext_quad_mask = (
+				ext_mask[:, :, :-1, :-1] *
+				ext_mask[:, :, 1:, :-1] *
+				ext_mask[:, :, :-1, 1:] *
+				ext_mask[:, :, 1:, 1:]
+			)
 
-		# Upsample ext surface data + model grid positions
-		ext_mask_up = _up_mask(ext_mask)
-		ext_P_up = _up_hw(ext_P)
-		ext_N_up = _up_hw(ext_N)
+		# Sample inside valid external quads only; never interpolate across holes.
+		ext_mask_up = _cell_mask(ext_mask, ext_quad_mask, full_h, full_w)
+		ext_P_up = _cell_interp_hw(ext_P)
+		ext_N_up = _cell_interp_hw(ext_N)
 		ext_N_up = ext_N_up / (ext_N_up.norm(dim=-1, keepdim=True) + 1e-8)
-		full_h_up = _up_scalar(full_h)
-		full_w_up = _up_scalar(full_w)
+		full_h_up = _cell_interp_scalar(full_h)
+		full_w_up = _cell_interp_scalar(full_w)
 
 		# Derive per-upsampled-point model quad from interpolated grid position
 		D = full_h_up.shape[0]
 		He = full_h_up.shape[1]
 		We = full_h_up.shape[2]
+		if He == 0 or We == 0:
+			continue
 
 		# In-bounds: upsampled point must map to valid model quad
 		in_bounds = (full_h_up >= 0) & (full_h_up < Hm - 1) & (full_w_up >= 0) & (full_w_up < Wm - 1)
 		ext_mask_up = ext_mask_up * in_bounds.unsqueeze(1).to(dtype=dtype)
+		sample_valid = ext_mask_up.squeeze(1) > 0
 
 		# Clamp for safe indexing (out-of-bounds already masked)
-		fh_c = full_h_up.clamp(0, Hm - 1)
-		fw_c = full_w_up.clamp(0, Wm - 1)
+		fh_safe = torch.where(sample_valid, full_h_up, torch.zeros_like(full_h_up))
+		fw_safe = torch.where(sample_valid, full_w_up, torch.zeros_like(full_w_up))
+		fh_c = fh_safe.clamp(0, Hm - 1)
+		fw_c = fw_safe.clamp(0, Wm - 1)
 		row = fh_c.floor().clamp(0, Hm - 2).long()
 		col = fw_c.floor().clamp(0, Wm - 2).long()
 		u_frac = fh_c - row.float()
@@ -235,10 +259,13 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			vf = v_frac.unsqueeze(-1)
 			M_bilin = (1-uf)*(1-vf)*M00_det + uf*(1-vf)*M10_det + (1-uf)*vf*M01_det + uf*vf*M11_det
 
+			ext_P_safe = torch.where(sample_valid.unsqueeze(-1), ext_P_up, torch.zeros_like(ext_P_up))
+			ext_N_safe = torch.where(sample_valid.unsqueeze(-1), ext_N_up, torch.zeros_like(ext_N_up))
+
 			# Strip: ext_P → M_bilin, sample grad_mag
-			diff = M_bilin - ext_P_up
+			diff = M_bilin - ext_P_safe
 			t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
-			strip = ext_P_up.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
+			strip = ext_P_safe.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
 			strip_flat = strip.reshape(D, He, We * strip_samples, 3)
 			sampled = res.data.grid_sample_fullres(strip_flat, channels={"grad_mag"})
 			mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, He, We, strip_samples)
@@ -250,7 +277,7 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			mask = (ext_mask_up.squeeze(1) * sv).unsqueeze(1)
 
 			# Sign: which side of ext surface (+1 or -1)
-			signed_normal_disp = ((M_bilin - ext_P_up) * ext_N_up).sum(dim=-1)
+			signed_normal_disp = ((M_bilin - ext_P_safe) * ext_N_safe).sum(dim=-1)
 			int_sign = torch.sign(signed_normal_disp)
 
 			# Magnitude: unsigned winding count from strip integral
@@ -263,11 +290,11 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 
 			# Proxy normal: GT sampled at upsampled ext positions, or ext_N
 			if EXT_OFFSET_USE_GT_NORMALS:
-				gt_n = res.data.grid_sample_fullres(ext_P_up, channels={"nx", "ny"}).normal_3d
-				dot = (gt_n * ext_N_up).sum(dim=-1, keepdim=True)
+				gt_n = res.data.grid_sample_fullres(ext_P_safe, channels={"nx", "ny"}).normal_3d
+				dot = (gt_n * ext_N_safe).sum(dim=-1, keepdim=True)
 				proxy_n = torch.where(dot >= 0, gt_n, -gt_n)
 			else:
-				proxy_n = ext_N_up
+				proxy_n = ext_N_safe
 
 			# 4 proxies: model quad corner - proxy_n * winding_err
 			we = winding_err.unsqueeze(-1)
@@ -291,15 +318,20 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 
 		wsum = float(mask.sum().detach().cpu())
 		if wsum > 0.0:
-			total_loss = total_loss + (lm * mask).sum() / wsum
+			total_loss = total_loss + torch.where(mask > 0, lm, torch.zeros_like(lm)).sum() / wsum
 			total_wsum += wsum
-		all_lm.append(lm)
+		all_lm.append(torch.where(mask > 0, lm, torch.full_like(lm, float("nan"))))
 		all_mask.append(mask)
 
-	n_ext = len(res.ext_conn)
+	n_ext = len(all_lm)
+	if n_ext == 0:
+		z = torch.zeros((), device=device, dtype=dtype)
+		return z, (z.unsqueeze(0),), (z.unsqueeze(0),)
 	if n_ext > 1:
 		total_loss = total_loss / n_ext
 
-	lm_avg = sum(all_lm) / n_ext
+	lm_stack = torch.stack(all_lm)
+	lm_avg = torch.nanmean(lm_stack, dim=0)
+	lm_avg = torch.where(torch.isfinite(lm_avg), lm_avg, torch.full_like(lm_avg, float("nan")))
 	mask_avg = sum(all_mask).clamp(max=1.0) / n_ext
 	return total_loss, (lm_avg,), (mask_avg,)
