@@ -62,22 +62,22 @@ jobs:
         run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
 
   build-test:
-    name: ${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
+    name: ${{ matrix.action }}-${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
     needs: [changes, builder]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      # Full matrix on ubuntu-24.04 (tests + sanitizers, gcc + clang).
-      # ubuntu-26.04 is just a compile/test smoke for both compilers — the
-      # heavier sanitizer cells only run on 24.04.
+      # ubuntu-24.04: compile-only smoke (Release, no tests).
+      # ubuntu-26.04: full test + sanitizer matrix.
+      # Coverage and dead-code (defined below) also run on ubuntu-26.04.
       matrix:
         include:
-          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-tests }
-          - { image: "ubuntu-24.04", compiler: clang, preset: ci-tests }
-          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-asan-ubsan }
-          - { image: "ubuntu-24.04", compiler: clang, preset: ci-asan-ubsan }
-          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests }
-          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests }
+          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-release,    action: compile }
+          - { image: "ubuntu-24.04", compiler: clang, preset: ci-release,    action: compile }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests,      action: test }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests,      action: test }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-asan-ubsan, action: test }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-asan-ubsan, action: test }
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
@@ -92,8 +92,8 @@ jobs:
             ccache-${{ matrix.image }}-${{ matrix.compiler }}-
       - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
-      - name: Test
-        run: volume-cartographer/scripts/ci.sh test ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
+      - name: ${{ matrix.action }}
+        run: volume-cartographer/scripts/ci.sh ${{ matrix.action }} ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
 
   coverage:
     name: Coverage (gcc, gcov)
@@ -108,15 +108,15 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: actions/cache@v4
         with:
-          path: volume-cartographer/.ccache/ubuntu-24.04
-          key: ccache-ubuntu-24.04-coverage-${{ github.run_id }}
+          path: volume-cartographer/.ccache/ubuntu-26.04
+          key: ccache-ubuntu-26.04-coverage-${{ github.run_id }}
           restore-keys: |
-            ccache-ubuntu-24.04-coverage-
-            ccache-ubuntu-24.04-gcc-
+            ccache-ubuntu-26.04-coverage-
+            ccache-ubuntu-26.04-gcc-
       - name: Pull or build builder image
-        run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
+        run: volume-cartographer/scripts/ci.sh builder ubuntu-26.04
       - name: Run coverage
-        run: volume-cartographer/scripts/ci.sh coverage ubuntu-24.04
+        run: volume-cartographer/scripts/ci.sh coverage ubuntu-26.04
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-html
@@ -134,14 +134,14 @@ jobs:
         env:
           PATCH_COVERAGE_MIN: '0'
         run: |
-          volume-cartographer/scripts/ci.sh patch-coverage origin/${{ github.base_ref }}
+          volume-cartographer/scripts/ci.sh patch-coverage origin/${{ github.base_ref }} ubuntu-26.04
           {
             echo "## Patch coverage (vs ${{ github.base_ref }}, gate ≥ ${PATCH_COVERAGE_MIN}%)"
             cat volume-cartographer/coverage/patch.md
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Total coverage non-regression vs base branch
         if: github.event_name == 'pull_request'
-        run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }}
+        run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }} ubuntu-26.04
 
   dead-code:
     name: Dead-code report (clang, nm + --print-gc-sections)
@@ -154,15 +154,15 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: actions/cache@v4
         with:
-          path: volume-cartographer/.ccache/ubuntu-24.04
-          key: ccache-ubuntu-24.04-dead-code-${{ github.run_id }}
+          path: volume-cartographer/.ccache/ubuntu-26.04
+          key: ccache-ubuntu-26.04-dead-code-${{ github.run_id }}
           restore-keys: |
-            ccache-ubuntu-24.04-dead-code-
-            ccache-ubuntu-24.04-clang-
+            ccache-ubuntu-26.04-dead-code-
+            ccache-ubuntu-26.04-clang-
       - name: Pull or build builder image
-        run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
+        run: volume-cartographer/scripts/ci.sh builder ubuntu-26.04
       - name: Run dead-code analysis
-        run: volume-cartographer/scripts/ci.sh dead-code ubuntu-24.04 clang
+        run: volume-cartographer/scripts/ci.sh dead-code ubuntu-26.04 clang
       - uses: actions/upload-artifact@v4
         with:
           name: dead-code

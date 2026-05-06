@@ -144,6 +144,13 @@ cmd_test() {
         ctest --preset $preset-$compiler"
 }
 
+cmd_compile() {
+    local image=$1 compiler=$2 preset=$3
+    run_in_builder "$image" "$REPO_ROOT" "
+        cmake --preset $preset-$compiler &&
+        cmake --build --preset $preset-$compiler"
+}
+
 cmd_coverage() {
     local image=${1:-ubuntu-24.04}
     coverage_in_dir "$image" "$REPO_ROOT"
@@ -247,6 +254,7 @@ case "${1:-all}" in
     all)                  cmd_all ;;
     builder)              shift; cmd_builder "$@" ;;
     test)                 shift; cmd_test "$@" ;;
+    compile)              shift; cmd_compile "$@" ;;
     coverage)             shift; cmd_coverage "$@" ;;
     patch-coverage)       shift; cmd_patch_coverage "$@" ;;
     coverage-regression)  shift; cmd_coverage_regression "$@" ;;
@@ -258,6 +266,7 @@ Usage: $0 [all
           | builder <image>
           | publish <image>
           | test <image> <compiler> <preset>
+          | compile <image> <compiler> <preset>
           | coverage [image]
           | patch-coverage <base_ref> [image]
           | coverage-regression <base_ref> [image]
