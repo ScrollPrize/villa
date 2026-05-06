@@ -540,7 +540,7 @@ cv::Mat optimized_thinning(const cv::Mat& src) {
     cv::Mat binary;
     cv::threshold(src, binary, 0, 255, cv::THRESH_BINARY);
     cv::Mat out;
-    cv::ximgproc::thinning(binary, out, cv::ximgproc::THINNING_ZHANGSUEN);
+    cv::ximgproc::thinning(binary, out, cv::ximgproc::THINNING_GUOHALL);
     return out;
 }
 
