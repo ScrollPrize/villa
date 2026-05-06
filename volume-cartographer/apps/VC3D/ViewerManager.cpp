@@ -104,7 +104,8 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
 
     auto* win = mdiArea->addSubWindow(widget);
     win->setWindowTitle(title);
-    win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
+    win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
+    win->setAttribute(Qt::WA_DeleteOnClose);
     win->installEventFilter(widget);
 
     chunkedViewer->setPointCollection(_points);

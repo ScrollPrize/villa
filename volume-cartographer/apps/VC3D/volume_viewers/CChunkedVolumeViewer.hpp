@@ -29,6 +29,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class CState;
+class QEvent;
 class QGraphicsItem;
 class QGraphicsPathItem;
 class QGraphicsScene;
@@ -162,6 +163,9 @@ public:
 
     void reloadPerfSettings() override;
 
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
     void onSurfaceChanged(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate = false);
@@ -212,6 +216,7 @@ private:
     void scheduleIntersectionRender(
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
+    void quiesceForClose();
     void submitRender(
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
@@ -299,6 +304,7 @@ private:
     QTimer* _intersectionRenderTimer = nullptr;
     QTimer* _resizeRenderTimer = nullptr;
     QTimer* _statusTimer = nullptr;
+    bool _closing = false;
     bool _renderPending = false;
     bool _interactivePreview = false;
     bool _segmentationEditActive = false;

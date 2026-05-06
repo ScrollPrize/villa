@@ -17,6 +17,7 @@
 #include <QApplication>
 #include <QCursor>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QGraphicsEllipseItem>
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
@@ -679,6 +680,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
 {
+    quiesceForClose();
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -688,6 +690,46 @@ CChunkedVolumeViewer::~CChunkedVolumeViewer()
         _overlayChunkCbId = 0;
     }
     clearIntersectionItems();
+}
+
+bool CChunkedVolumeViewer::eventFilter(QObject* watched, QEvent* event)
+{
+    if (event && event->type() == QEvent::Close && watched == parentWidget()) {
+        quiesceForClose();
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void CChunkedVolumeViewer::quiesceForClose()
+{
+    if (_closing) {
+        return;
+    }
+    _closing = true;
+
+    if (_renderTimer)
+        _renderTimer->stop();
+    if (_settleRenderTimer)
+        _settleRenderTimer->stop();
+    if (_intersectionRenderTimer)
+        _intersectionRenderTimer->stop();
+    if (_resizeRenderTimer)
+        _resizeRenderTimer->stop();
+    if (_statusTimer)
+        _statusTimer->stop();
+
+    _renderPending = false;
+    _renderPendingAfterWorker = false;
+    ++_renderSerial;
+
+    if (_chunkCbId != 0 && _chunkArray) {
+        _chunkArray->removeChunkReadyListener(_chunkCbId);
+        _chunkCbId = 0;
+    }
+    if (_overlayChunkCbId != 0 && _overlayChunkArray) {
+        _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
+        _overlayChunkCbId = 0;
+    }
 }
 
 void CChunkedVolumeViewer::reloadPerfSettings()
@@ -801,6 +843,9 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
 void CChunkedVolumeViewer::invalidateVis()
 {
+    if (_closing) {
+        return;
+    }
     _genCacheDirty = true;
     _stableFramebufferValid = false;
     _surfaceChunkPrefetchCache = {};
@@ -1032,6 +1077,9 @@ void CChunkedVolumeViewer::resizeFramebuffer()
 
 void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_location caller)
 {
+    if (_closing) {
+        return;
+    }
     if (ProfileLoggingEnabled()) {
         _pendingRenderReason = reason ? reason : "";
         _pendingRenderCaller = profileCaller(caller);
@@ -1068,6 +1116,9 @@ void CChunkedVolumeViewer::requestRender(const char* reason, std::source_locatio
 
 void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::source_location caller)
 {
+    if (_closing) {
+        return;
+    }
     if (ProfileLoggingEnabled()) {
         _pendingIntersectionReason = reason ? reason : "";
         _pendingIntersectionCaller = profileCaller(caller);
@@ -2347,6 +2398,11 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
             _surfName, bool(_volume), bool(_chunkArray),
             _renderWorkerBusy.load(std::memory_order_acquire)));
     }
+    if (_closing) {
+        profile.setDetails("action=skip closing");
+        return;
+    }
+
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_chunkArray) {
         profile.setDetails("action=skip missing_input");
@@ -2430,6 +2486,10 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             _renderPendingAfterWorker));
     }
     _renderWorkerBusy.store(false, std::memory_order_release);
+    if (_closing) {
+        profile.setDetails("action=drop_closing");
+        return;
+    }
     if (!result || result->serial != _renderSerial) {
         if (_renderPendingAfterWorker) {
             _renderPendingAfterWorker = false;
@@ -2579,6 +2639,10 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
         profile.setDetails(std::format(
             "surf='{}' force={} pending={} interactive={} scale={:.4f} zOff={:.3f}",
             _surfName, force, _renderPending, _interactivePreview, _scale, _zOff));
+    }
+    if (_closing) {
+        profile.setDetails("action=skip closing");
+        return;
     }
     if (!force) {
         scheduleRender("renderVisible non-force", caller);
@@ -3383,6 +3447,9 @@ void CChunkedVolumeViewer::clearSelections()
 
 void CChunkedVolumeViewer::invalidateIntersect(const std::string& name)
 {
+    if (_closing) {
+        return;
+    }
     if (_segmentationEditActive && name == "segmentation" &&
         dynamic_cast<PlaneSurface*>(currentSurface())) {
         _lastIntersectFp = {};
@@ -3934,6 +4001,11 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                   : std::string("[]"),
             _scale, _zOff));
     }
+    if (_closing) {
+        profile.setDetails("action=skip closing");
+        return;
+    }
+
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
     if (!surf || !_state || !_viewerManager || !_scene || !_view) {
