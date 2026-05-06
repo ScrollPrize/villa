@@ -1171,6 +1171,167 @@ cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
     return ridges;
 }
 
+cv::Mat source_distance_filtered_label_ridges(
+    const cv::Mat& white_domain, const cv::Mat& source_pixel_labels,
+    const std::vector<cv::Point>& source_points,
+    const float min_source_distance_px) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(source_pixel_labels.type() == CV_32S);
+
+    constexpr float kRightAngleSourceDistancePx = 2.0f;
+    const float opposing_source_distance_px = min_source_distance_px;
+    const cv::Point debug_pixel(177, 371);
+    cv::Mat ridges = cv::Mat::zeros(white_domain.size(), CV_8U);
+    cv::parallel_for_(cv::Range(0, white_domain.rows),
+                      [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            for (int x = 0; x < white_domain.cols; ++x) {
+                const bool debug_this_pixel =
+                    x == debug_pixel.x && y == debug_pixel.y;
+                std::ostringstream debug;
+                if (debug_this_pixel) {
+                    debug << "source_distance_filtered_ridges debug pixel=("
+                          << x << "," << y << ")\n";
+                }
+                if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                    if (debug_this_pixel) {
+                        debug << "  skipped: outside white domain\n";
+                        std::cout << debug.str();
+                    }
+                    continue;
+                }
+                const int center = source_pixel_labels.at<int>(y, x);
+                if (center <= 0 ||
+                    center >= static_cast<int>(source_points.size())) {
+                    if (debug_this_pixel) {
+                        debug << "  skipped: invalid center_label=" << center
+                              << " source_points="
+                              << source_points.size() << "\n";
+                        std::cout << debug.str();
+                    }
+                    continue;
+                }
+                const cv::Point center_source = source_points[center];
+                if (center_source.x < 0) {
+                    if (debug_this_pixel) {
+                        debug << "  skipped: missing center_source for label="
+                              << center << "\n";
+                        std::cout << debug.str();
+                    }
+                    continue;
+                }
+                if (debug_this_pixel) {
+                    debug << "  center_label=" << center
+                          << " center_source=(" << center_source.x << ","
+                          << center_source.y << ")\n";
+                }
+
+                bool keep = false;
+                for (int dy = -1; dy <= 1 && !keep; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= white_domain.cols || ny < 0 ||
+                            ny >= white_domain.rows ||
+                            white_domain.at<std::uint8_t>(ny, nx) == 0) {
+                            continue;
+                        }
+                        const int other =
+                            source_pixel_labels.at<int>(ny, nx);
+                        if (other <= 0 || other == center ||
+                            other >= static_cast<int>(source_points.size())) {
+                            continue;
+                        }
+                        const cv::Point other_source = source_points[other];
+                        if (other_source.x < 0) {
+                            continue;
+                        }
+                        const float source_pair_dx =
+                            static_cast<float>(other_source.x -
+                                               center_source.x);
+                        const float source_pair_dy =
+                            static_cast<float>(other_source.y -
+                                               center_source.y);
+                        const float source_pair_distance_sq =
+                            source_pair_dx * source_pair_dx +
+                            source_pair_dy * source_pair_dy;
+
+                        const float center_vx =
+                            static_cast<float>(center_source.x - x);
+                        const float center_vy =
+                            static_cast<float>(center_source.y - y);
+                        const float other_vx =
+                            static_cast<float>(other_source.x - x);
+                        const float other_vy =
+                            static_cast<float>(other_source.y - y);
+                        const float center_len_sq =
+                            center_vx * center_vx + center_vy * center_vy;
+                        const float other_len_sq =
+                            other_vx * other_vx + other_vy * other_vy;
+                        if (center_len_sq <= 0.0f || other_len_sq <= 0.0f) {
+                            continue;
+                        }
+
+                        const float dot = center_vx * other_vx +
+                                          center_vy * other_vy;
+                        const float denom =
+                            std::sqrt(center_len_sq * other_len_sq);
+                        const float cos_angle =
+                            std::max(-1.0f,
+                                     std::min(1.0f, dot / denom));
+                        const float angle_degrees =
+                            std::acos(cos_angle) * 180.0f /
+                            static_cast<float>(CV_PI);
+                        const float angle_t_linear = std::max(
+                            0.0f,
+                            std::min(1.0f,
+                                     (angle_degrees - 90.0f) / 90.0f));
+                        const float angle_t = angle_t_linear * angle_t_linear;
+                        const float dynamic_threshold_px =
+                            kRightAngleSourceDistancePx +
+                            (opposing_source_distance_px -
+                             kRightAngleSourceDistancePx) *
+                                angle_t;
+                        const float dynamic_threshold_sq =
+                            dynamic_threshold_px * dynamic_threshold_px;
+                        const bool pair_keep =
+                            source_pair_distance_sq >= dynamic_threshold_sq;
+                        if (debug_this_pixel) {
+                            debug << "  neighbor=(" << nx << "," << ny
+                                  << ") other_label=" << other
+                                  << " other_source=(" << other_source.x
+                                  << "," << other_source.y << ")"
+                                  << " source_dist="
+                                  << std::sqrt(source_pair_distance_sq)
+                                  << " angle_deg=" << angle_degrees
+                                  << " threshold=" << dynamic_threshold_px
+                                  << " keep=" << (pair_keep ? 1 : 0)
+                                  << "\n";
+                        }
+                        if (pair_keep) {
+                            keep = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (keep) {
+                    ridges.at<std::uint8_t>(y, x) = 255;
+                }
+                if (debug_this_pixel) {
+                    debug << "  final_keep=" << (keep ? 1 : 0) << "\n";
+                    std::cout << debug.str();
+                }
+            }
+        }
+    });
+
+    return ridges;
+}
+
 cv::Mat connect_clean_skeleton_with_source_ridges(
     const cv::Mat& clean_skeleton,
     const cv::Mat& source_skeleton,
@@ -1392,11 +1553,24 @@ cv::Mat connect_clean_skeleton_with_source_ridges(
         static_cast<std::size_t>(num_candidates));
     {
         const TimingMark timing = start_timing();
+        struct CandidateSearchTiming {
+            double probe_ms = 0.0;
+            double sparse_graph_build_ms = 0.0;
+            double sparse_search_ms = 0.0;
+            double sparse_materialize_ms = 0.0;
+        };
+        std::vector<CandidateSearchTiming> candidate_search_timings(
+            static_cast<std::size_t>(num_candidates));
+        const auto elapsed_ms_since = [](const Clock::time_point& start) {
+            return std::chrono::duration<double, std::milli>(Clock::now() -
+                                                             start)
+                .count();
+        };
         cv::parallel_for_(cv::Range(1, num_candidates),
                           [&](const cv::Range& range) {
             for (int label = range.start; label < range.end; ++label) {
             struct State {
-                int idx = 0;
+                int node = 0;
                 int owner = 0;
                 float bottleneck = 0.0f;
                 int length = 0;
@@ -1409,7 +1583,10 @@ cv::Mat connect_clean_skeleton_with_source_ridges(
                     if (a.length != b.length) {
                         return a.length > b.length;
                     }
-                    return a.owner > b.owner;
+                    if (a.owner != b.owner) {
+                        return a.owner > b.owner;
+                    }
+                    return a.node > b.node;
                 }
             };
 
@@ -1419,10 +1596,19 @@ cv::Mat connect_clean_skeleton_with_source_ridges(
                 int b = 0;
                 float bottleneck_dt = 0.0f;
                 int length = 0;
-                int a_idx = -1;
-                int b_idx = -1;
+                int a_node = -1;
+                int b_node = -1;
+                int crossing_edge = -1;
                 cv::Point clean_a{-1, -1};
                 cv::Point clean_b{-1, -1};
+            };
+
+            struct GraphEdge {
+                int u = -1;
+                int v = -1;
+                float min_dt = 0.0f;
+                int length = 0;
+                std::vector<cv::Point> path;
             };
 
             const CandidateWorkspace& workspace = candidate_workspaces[label];
@@ -1431,13 +1617,170 @@ cv::Mat connect_clean_skeleton_with_source_ridges(
                 continue;
             }
 
-            std::vector<float> best(static_cast<std::size_t>(total), -1.0f);
-            std::vector<int> best_length(static_cast<std::size_t>(total),
+            const Clock::time_point probe_start = Clock::now();
+            std::vector<std::array<int, 8>> pixel_neighbors(
+                static_cast<std::size_t>(total));
+            std::vector<std::uint8_t> pixel_degree(
+                static_cast<std::size_t>(total), 0);
+            for (int idx = 0; idx < total; ++idx) {
+                pixel_neighbors[idx].fill(-1);
+                const cv::Point pixel = workspace.pixels[idx];
+                int degree = 0;
+                for (const cv::Point dir : kDirs) {
+                    const cv::Point next_pixel = pixel + dir;
+                    if (!workspace.bounds.contains(next_pixel)) {
+                        continue;
+                    }
+                    const int next_idx = workspace.local_index.at<int>(
+                        next_pixel.y - workspace.bounds.y,
+                        next_pixel.x - workspace.bounds.x);
+                    if (next_idx >= 0) {
+                        pixel_neighbors[idx][degree++] = next_idx;
+                    }
+                }
+                pixel_degree[idx] = static_cast<std::uint8_t>(degree);
+            }
+
+            std::vector<std::uint8_t> is_attachment(
+                static_cast<std::size_t>(total), 0);
+            for (const Attachment& attachment : attachments[label]) {
+                const int idx = workspace.local_index.at<int>(
+                    attachment.pixel.y - workspace.bounds.y,
+                    attachment.pixel.x - workspace.bounds.x);
+                if (idx < 0) {
+                    continue;
+                }
+                is_attachment[idx] = 1;
+            }
+
+            std::vector<int> node_for_pixel(static_cast<std::size_t>(total),
+                                            -1);
+            std::vector<int> node_pixels;
+            node_pixels.reserve(static_cast<std::size_t>(total / 4 + 1));
+            for (int idx = 0; idx < total; ++idx) {
+                if (pixel_degree[idx] != 2 || is_attachment[idx] != 0) {
+                    node_for_pixel[idx] =
+                        static_cast<int>(node_pixels.size());
+                    node_pixels.push_back(idx);
+                }
+            }
+            candidate_search_timings[label].probe_ms =
+                elapsed_ms_since(probe_start);
+            if (node_pixels.empty()) {
+                continue;
+            }
+
+            const Clock::time_point sparse_graph_build_start = Clock::now();
+            std::vector<GraphEdge> graph_edges;
+            std::vector<std::vector<int>> adjacency(node_pixels.size());
+            std::unordered_set<std::uint64_t> visited_starts;
+            const auto directed_key = [](int a, int b) {
+                return (static_cast<std::uint64_t>(
+                            static_cast<std::uint32_t>(a))
+                        << 32) |
+                       static_cast<std::uint32_t>(b);
+            };
+            const auto add_graph_edge = [&](GraphEdge edge) {
+                if (edge.u < 0 || edge.v < 0 || edge.u == edge.v ||
+                    edge.path.size() < 2) {
+                    return;
+                }
+                edge.length = static_cast<int>(edge.path.size());
+                const int edge_id = static_cast<int>(graph_edges.size());
+                adjacency[static_cast<std::size_t>(edge.u)].push_back(edge_id);
+                adjacency[static_cast<std::size_t>(edge.v)].push_back(edge_id);
+                graph_edges.push_back(std::move(edge));
+            };
+
+            for (int start_node = 0;
+                 start_node < static_cast<int>(node_pixels.size());
+                 ++start_node) {
+                const int start_idx = node_pixels[start_node];
+                const cv::Point start_pixel = workspace.pixels[start_idx];
+                for (int neighbor_slot = 0; neighbor_slot < 8;
+                     ++neighbor_slot) {
+                    const int first_idx =
+                        pixel_neighbors[start_idx][neighbor_slot];
+                    if (first_idx < 0) {
+                        break;
+                    }
+                    const std::uint64_t start_key =
+                        directed_key(start_idx, first_idx);
+                    if (visited_starts.find(start_key) !=
+                        visited_starts.end()) {
+                        continue;
+                    }
+                    visited_starts.insert(start_key);
+
+                    GraphEdge edge;
+                    edge.u = start_node;
+                    edge.min_dt =
+                        dt.at<float>(start_pixel.y, start_pixel.x);
+                    edge.path.push_back(start_pixel);
+
+                    int prev_idx = start_idx;
+                    int cur_idx = first_idx;
+                    bool valid = true;
+                    while (true) {
+                        const cv::Point cur_pixel =
+                            workspace.pixels[cur_idx];
+                        edge.path.push_back(cur_pixel);
+                        edge.min_dt = std::min(
+                            edge.min_dt,
+                            dt.at<float>(cur_pixel.y, cur_pixel.x));
+
+                        const int cur_node = node_for_pixel[cur_idx];
+                        if (cur_node >= 0) {
+                            edge.v = cur_node;
+                            visited_starts.insert(
+                                directed_key(cur_idx, prev_idx));
+                            break;
+                        }
+
+                        int next_idx = -1;
+                        for (int slot = 0; slot < 8; ++slot) {
+                            const int candidate =
+                                pixel_neighbors[cur_idx][slot];
+                            if (candidate < 0) {
+                                break;
+                            }
+                            if (candidate != prev_idx) {
+                                next_idx = candidate;
+                                break;
+                            }
+                        }
+                        if (next_idx < 0) {
+                            valid = false;
+                            break;
+                        }
+                        prev_idx = cur_idx;
+                        cur_idx = next_idx;
+                    }
+
+                    if (valid) {
+                        add_graph_edge(std::move(edge));
+                    }
+                }
+            }
+            if (graph_edges.empty()) {
+                continue;
+            }
+            candidate_search_timings[label].sparse_graph_build_ms =
+                elapsed_ms_since(sparse_graph_build_start);
+
+            const Clock::time_point sparse_search_start = Clock::now();
+            const int node_count = static_cast<int>(node_pixels.size());
+            std::vector<float> best(static_cast<std::size_t>(node_count),
+                                    -1.0f);
+            std::vector<int> best_length(static_cast<std::size_t>(node_count),
                                          std::numeric_limits<int>::max());
-            std::vector<int> parent(static_cast<std::size_t>(total), -1);
-            std::vector<int> owner(static_cast<std::size_t>(total), 0);
+            std::vector<int> parent_node(static_cast<std::size_t>(node_count),
+                                         -1);
+            std::vector<int> parent_edge(static_cast<std::size_t>(node_count),
+                                         -1);
+            std::vector<int> owner(static_cast<std::size_t>(node_count), 0);
             std::vector<cv::Point> owner_clean(
-                static_cast<std::size_t>(total), cv::Point(-1, -1));
+                static_cast<std::size_t>(node_count), cv::Point(-1, -1));
             std::priority_queue<State, std::vector<State>, StateLess> queue;
 
             for (const Attachment& attachment : attachments[label]) {
@@ -1447,99 +1790,139 @@ cv::Mat connect_clean_skeleton_with_source_ridges(
                 if (idx < 0) {
                     continue;
                 }
+                const int node = node_for_pixel[idx];
+                if (node < 0) {
+                    continue;
+                }
                 const float start_dt =
                     dt.at<float>(attachment.pixel.y, attachment.pixel.x);
                 const bool better =
-                    start_dt > best[idx] ||
-                    (start_dt == best[idx] &&
-                     (owner[idx] == 0 || attachment.component < owner[idx]));
+                    start_dt > best[node] ||
+                    (start_dt == best[node] &&
+                     (owner[node] == 0 ||
+                      attachment.component < owner[node]));
                 if (!better) {
                     continue;
                 }
-                best[idx] = start_dt;
-                best_length[idx] = 1;
-                parent[idx] = idx;
-                owner[idx] = attachment.component;
-                owner_clean[idx] = attachment.clean_pixel;
-                queue.push({idx, attachment.component, start_dt, 1});
+                best[node] = start_dt;
+                best_length[node] = 1;
+                parent_node[node] = node;
+                parent_edge[node] = -1;
+                owner[node] = attachment.component;
+                owner_clean[node] = attachment.clean_pixel;
+                queue.push({node, attachment.component, start_dt, 1});
             }
 
-            std::vector<CandidateEdge> local_edges;
+            if (queue.empty()) {
+                continue;
+            }
 
-            const auto path_to_root = [&](int idx) {
+            const auto edge_path_between = [&](int edge_id, int from,
+                                               int to) {
+                const GraphEdge& graph_edge = graph_edges[edge_id];
+                std::vector<cv::Point> path = graph_edge.path;
+                if (graph_edge.u == from && graph_edge.v == to) {
+                    return path;
+                }
+                std::reverse(path.begin(), path.end());
+                return path;
+            };
+
+            const auto path_to_root = [&](int node) {
                 std::vector<cv::Point> path;
-                while (idx >= 0) {
-                    path.push_back(workspace.pixels[idx]);
-                    if (parent[idx] == idx) {
-                        break;
-                    }
-                    idx = parent[idx];
+                if (node < 0) {
+                    return path;
+                }
+
+                path.push_back(workspace.pixels[node_pixels[node]]);
+                while (parent_node[node] >= 0 &&
+                       parent_node[node] != node) {
+                    const int next_node = parent_node[node];
+                    const int edge_id = parent_edge[node];
+                    std::vector<cv::Point> segment =
+                        edge_path_between(edge_id, node, next_node);
+                    path.insert(path.end(), segment.begin() + 1,
+                                segment.end());
+                    node = next_node;
                 }
                 return path;
             };
+
+            const auto append_path_tail =
+                [](std::vector<cv::Point>& dst,
+                   const std::vector<cv::Point>& src) {
+                    if (src.empty()) {
+                        return;
+                    }
+                    if (dst.empty()) {
+                        dst.insert(dst.end(), src.begin(), src.end());
+                    } else {
+                        dst.insert(dst.end(), src.begin() + 1, src.end());
+                    }
+                };
 
             std::vector<LocalEdgeCandidate> local_candidates;
             while (!queue.empty()) {
                 const State state = queue.top();
                 queue.pop();
-                if (state.owner != owner[state.idx] ||
-                    state.bottleneck < best[state.idx] ||
-                    (state.bottleneck == best[state.idx] &&
-                     state.length > best_length[state.idx])) {
+                if (state.owner != owner[state.node] ||
+                    state.bottleneck < best[state.node] ||
+                    (state.bottleneck == best[state.node] &&
+                     state.length > best_length[state.node])) {
                     continue;
                 }
 
-                const cv::Point pixel = workspace.pixels[state.idx];
-                for (const cv::Point dir : kDirs) {
-                    const cv::Point next_pixel = pixel + dir;
-                    if (!workspace.bounds.contains(next_pixel)) {
-                        continue;
-                    }
-                    const int next_idx = workspace.local_index.at<int>(
-                        next_pixel.y - workspace.bounds.y,
-                        next_pixel.x - workspace.bounds.x);
-                    if (next_idx < 0) {
-                        continue;
-                    }
+                for (const int edge_id : adjacency[state.node]) {
+                    const GraphEdge& graph_edge = graph_edges[edge_id];
+                    const int next_node =
+                        graph_edge.u == state.node ? graph_edge.v
+                                                   : graph_edge.u;
 
-                    if (owner[next_idx] > 0 &&
-                        owner[next_idx] != state.owner) {
+                    if (owner[next_node] > 0 &&
+                        owner[next_node] != state.owner) {
                         LocalEdgeCandidate edge;
                         edge.label = label;
                         edge.a = state.owner;
-                        edge.b = owner[next_idx];
-                        edge.clean_a = owner_clean[state.idx];
-                        edge.clean_b = owner_clean[next_idx];
+                        edge.b = owner[next_node];
+                        edge.clean_a = owner_clean[state.node];
+                        edge.clean_b = owner_clean[next_node];
                         edge.bottleneck_dt =
-                            std::min(state.bottleneck, best[next_idx]);
-                        edge.length =
-                            best_length[next_idx] + best_length[state.idx];
-                        edge.a_idx = state.idx;
-                        edge.b_idx = next_idx;
+                            std::min({state.bottleneck, best[next_node],
+                                      graph_edge.min_dt});
+                        edge.length = best_length[state.node] +
+                                      best_length[next_node] +
+                                      graph_edge.length - 2;
+                        edge.a_node = state.node;
+                        edge.b_node = next_node;
+                        edge.crossing_edge = edge_id;
                         local_candidates.push_back(edge);
-                        continue;
+                        break;
                     }
 
                     const float next_bottleneck =
-                        std::min(state.bottleneck,
-                                 dt.at<float>(next_pixel.y, next_pixel.x));
-                    const int next_length = state.length + 1;
-                    if (owner[next_idx] == 0 ||
-                        next_bottleneck > best[next_idx] ||
-                        (owner[next_idx] == state.owner &&
-                         next_bottleneck == best[next_idx] &&
-                         next_length < best_length[next_idx])) {
-                        best[next_idx] = next_bottleneck;
-                        best_length[next_idx] = next_length;
-                        parent[next_idx] = state.idx;
-                        owner[next_idx] = state.owner;
-                        owner_clean[next_idx] = owner_clean[state.idx];
-                        queue.push({next_idx, state.owner, next_bottleneck,
+                        std::min(state.bottleneck, graph_edge.min_dt);
+                    const int next_length =
+                        state.length + graph_edge.length - 1;
+                    if (owner[next_node] == 0 ||
+                        next_bottleneck > best[next_node] ||
+                        (owner[next_node] == state.owner &&
+                         next_bottleneck == best[next_node] &&
+                         next_length < best_length[next_node])) {
+                        best[next_node] = next_bottleneck;
+                        best_length[next_node] = next_length;
+                        parent_node[next_node] = state.node;
+                        parent_edge[next_node] = edge_id;
+                        owner[next_node] = state.owner;
+                        owner_clean[next_node] = owner_clean[state.node];
+                        queue.push({next_node, state.owner, next_bottleneck,
                                     next_length});
                     }
                 }
             }
+            candidate_search_timings[label].sparse_search_ms =
+                elapsed_ms_since(sparse_search_start);
 
+            const Clock::time_point sparse_materialize_start = Clock::now();
             std::sort(local_candidates.begin(), local_candidates.end(),
                       [](const LocalEdgeCandidate& a,
                          const LocalEdgeCandidate& b) {
@@ -1587,20 +1970,52 @@ cv::Mat connect_clean_skeleton_with_source_ridges(
                 edge.clean_b = candidate.clean_b;
 
                 std::vector<cv::Point> b_path =
-                    path_to_root(candidate.b_idx);
+                    path_to_root(candidate.b_node);
                 std::reverse(b_path.begin(), b_path.end());
                 edge.path = std::move(b_path);
+                std::vector<cv::Point> crossing_path = edge_path_between(
+                    candidate.crossing_edge, candidate.b_node,
+                    candidate.a_node);
+                append_path_tail(edge.path, crossing_path);
                 std::vector<cv::Point> a_path =
-                    path_to_root(candidate.a_idx);
-                edge.path.insert(edge.path.end(), a_path.begin(),
-                                 a_path.end());
+                    path_to_root(candidate.a_node);
+                append_path_tail(edge.path, a_path);
                 edge.length = static_cast<int>(edge.path.size());
                 deduped_edges.push_back(std::move(edge));
             }
             edges_by_candidate[label] = std::move(deduped_edges);
+            candidate_search_timings[label].sparse_materialize_ms =
+                elapsed_ms_since(sparse_materialize_start);
         }
     });
         if (timings != nullptr) {
+            CandidateSearchTiming total_search_timing;
+            for (const CandidateSearchTiming& candidate_timing :
+                 candidate_search_timings) {
+                total_search_timing.probe_ms += candidate_timing.probe_ms;
+                total_search_timing.sparse_graph_build_ms +=
+                    candidate_timing.sparse_graph_build_ms;
+                total_search_timing.sparse_search_ms +=
+                    candidate_timing.sparse_search_ms;
+                total_search_timing.sparse_materialize_ms +=
+                    candidate_timing.sparse_materialize_ms;
+            }
+            timings->push_back(
+                {"component.connect_ridges.candidate_probe_work",
+                 total_search_timing.probe_ms,
+                 total_search_timing.probe_ms});
+            timings->push_back(
+                {"component.connect_ridges.sparse_graph_build_work",
+                 total_search_timing.sparse_graph_build_ms,
+                 total_search_timing.sparse_graph_build_ms});
+            timings->push_back(
+                {"component.connect_ridges.sparse_search_work",
+                 total_search_timing.sparse_search_ms,
+                 total_search_timing.sparse_search_ms});
+            timings->push_back(
+                {"component.connect_ridges.sparse_materialize_work",
+                 total_search_timing.sparse_materialize_ms,
+                 total_search_timing.sparse_materialize_ms});
             timings->push_back(finish_timing(
                 "component.connect_ridges.candidate_search", timing));
         }
@@ -1668,6 +2083,7 @@ struct ComponentVoronoiResult {
     cv::Mat boundary_skeleton;
     cv::Mat boundary_skeleton_pruned;
     cv::Mat source_pixel_ridges;
+    cv::Mat source_distance_filtered_ridges;
     cv::Mat source_pixel_ridge_skeleton;
     cv::Mat boundary_skeleton_hybrid;
     cv::Mat cell_loops;
@@ -6091,6 +6507,16 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
             finish_timing("component.source_pixel_ridges", timing));
     }
 
+    cv::Mat source_distance_filtered_ridges;
+    {
+        const TimingMark timing = start_timing();
+        source_distance_filtered_ridges =
+            source_distance_filtered_label_ridges(
+                source_mask, source_pixel_labels, source_points, 8.0f);
+        timings.push_back(finish_timing(
+            "component.source_distance_filtered_ridges", timing));
+    }
+
     cv::Mat source_pixel_ridge_skeleton;
     {
         const TimingMark timing = start_timing();
@@ -6131,6 +6557,7 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
             boundary_skeleton,
             boundary_skeleton_pruned,
             source_pixel_ridges,
+            source_distance_filtered_ridges,
             source_pixel_ridge_skeleton,
             connected_skeleton,
             cell_loops,
@@ -6711,6 +7138,10 @@ int main(int argc, char** argv) {
                             (stem + "_source_pixel_voronoi_ridges.tif"),
                         component_voronoi_result.source_pixel_ridges);
             write_image(workdir /
+                            (stem + "_source_distance_filtered_ridges.tif"),
+                        component_voronoi_result
+                            .source_distance_filtered_ridges);
+            write_image(workdir /
                             (stem + "_source_pixel_voronoi_ridge_skeleton.tif"),
                         component_voronoi_result.source_pixel_ridge_skeleton);
             write_image(
@@ -6793,6 +7224,9 @@ int main(int argc, char** argv) {
              to_float_layer(component_voronoi_result.boundary_skeleton_pruned)},
             {"loops_connected",
              to_float_layer(component_voronoi_result.cell_loops_connected)},
+            {"source_distance_filtered_ridges",
+             to_float_layer(
+                 component_voronoi_result.source_distance_filtered_ridges)},
             {"graph_random_edges", to_float_layer(graph_random_colors)},
             {"graph_edges_random", to_float_layer(graph_edges_random_colors)},
             {"graph_nodes", to_float_layer(graph_nodes)},
