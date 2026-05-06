@@ -707,6 +707,10 @@ void CChunkedVolumeViewer::quiesceForClose()
     }
     _closing = true;
 
+    if (_viewerManager) {
+        _viewerManager->unregisterViewer(this);
+    }
+
     if (_renderTimer)
         _renderTimer->stop();
     if (_settleRenderTimer)
