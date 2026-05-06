@@ -4099,11 +4099,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     auto* approvalOverlay = _viewerManager ? _viewerManager->segmentationOverlay() : nullptr;
     const bool showApprovalMaskIntersections =
         approvalOverlay && activeSeg && approvalOverlay->hasApprovalMaskData();
-    const cv::Vec3f activeSegCenter = activeSeg ? activeSeg->center() : cv::Vec3f(0, 0, 0);
-    const cv::Vec2f activeSegScale = activeSeg ? activeSeg->scale() : cv::Vec2f(1, 1);
     auto paramToApprovalGrid = [&](const cv::Vec3f& param) {
-        return QPointF(param[0] + activeSegCenter[0] * activeSegScale[0],
-                       param[1] + activeSegCenter[1] * activeSegScale[1]);
+        if (!activeSeg) {
+            return QPointF();
+        }
+        const cv::Vec2f grid = activeSeg->ptrToGrid(param);
+        return QPointF(grid[0], grid[1]);
     };
     auto addApprovalMaskIntersection = [&](const SurfacePatchIndex::TriangleSegment& seg,
                                            float renderedOpacity,
