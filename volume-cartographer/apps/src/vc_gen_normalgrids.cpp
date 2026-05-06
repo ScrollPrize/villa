@@ -598,193 +598,183 @@ void run_generate(const po::variables_map& vm) {
         const size_t chunk_count_x = (shape[2] + source_chunk_shape[2] - 1) / source_chunk_shape[2];
 
         for (const auto& source_chunk_plan : sampled_chunk_plans) {
-            for (size_t batch_start = 0;
-                 batch_start < source_chunk_plan.sampledSlices.size();
-                 batch_start += chunk_size_tgt) {
-                const size_t batch_end = std::min(
-                    batch_start + chunk_size_tgt,
-                    source_chunk_plan.sampledSlices.size());
-                const size_t batch_size = batch_end - batch_start;
+            const size_t chunk_sample_count = source_chunk_plan.sampledSlices.size();
+            std::vector<SliceTask> tasks(chunk_sample_count);
+            std::vector<AssembledSlice> assembled_slices;
+            assembled_slices.reserve(chunk_sample_count);
+            size_t chunk_existing = 0;
 
-                std::vector<SliceTask> tasks(batch_size);
-                std::vector<AssembledSlice> assembled_slices;
-                assembled_slices.reserve(batch_size);
-                size_t batch_existing = 0;
+            for (size_t sampled_index = 0; sampled_index < chunk_sample_count; ++sampled_index) {
+                const auto& sampled = source_chunk_plan.sampledSlices[sampled_index];
+                auto& task = tasks[sampled_index];
+                task.sliceIndex = sampled.sliceIndex;
 
-                for (size_t batch_index = 0; batch_index < batch_size; ++batch_index) {
-                    const auto& sampled =
-                        source_chunk_plan.sampledSlices[batch_start + batch_index];
-                    auto& task = tasks[batch_index];
-                    task.sliceIndex = sampled.sliceIndex;
+                char filename[256];
+                snprintf(filename, sizeof(filename), "%06zu.grid", sampled.sliceIndex);
+                task.outPath = output_fs_path / dir_metrics.direction / filename;
+                task.tmpPath = fs::path(task.outPath.string() + ".tmp");
 
-                    char filename[256];
-                    snprintf(filename, sizeof(filename), "%06zu.grid", sampled.sliceIndex);
-                    task.outPath = output_fs_path / dir_metrics.direction / filename;
-                    task.tmpPath = fs::path(task.outPath.string() + ".tmp");
+                char preview_filename[256];
+                snprintf(preview_filename, sizeof(preview_filename), "%06zu.jpg", sampled.sliceIndex);
+                task.previewPath = output_fs_path / (dir_metrics.direction + "_img") / preview_filename;
 
-                    char preview_filename[256];
-                    snprintf(preview_filename, sizeof(preview_filename), "%06zu.jpg", sampled.sliceIndex);
-                    task.previewPath = output_fs_path / (dir_metrics.direction + "_img") / preview_filename;
-
-                    if (fs::exists(task.outPath)) {
-                        task.kind = SliceTaskKind::Exists;
-                        ++batch_existing;
-                        continue;
-                    }
-
-                    task.kind = SliceTaskKind::Process;
-                    auto& assembled = assembled_slices.emplace_back();
-                    assembled.task = task;
-                    assembled.localSliceIndex = sampled.localSliceIndex;
-                    assembled.binarySlice = cv::Mat::zeros(slice_size, CV_8U);
+                if (fs::exists(task.outPath)) {
+                    task.kind = SliceTaskKind::Exists;
+                    ++chunk_existing;
+                    continue;
                 }
 
-                if (!assembled_slices.empty()) {
-                    std::array<size_t, 3> slab_shape;
-                    std::array<int, 3> slab_offset;
-                    switch (dir) {
-                    case SliceDirection::XY:
-                        slab_shape = {source_chunk_shape[0], shape[1], shape[2]};
-                        slab_offset = {
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[0]),
-                            0,
-                            0,
-                        };
-                        break;
-                    case SliceDirection::XZ:
-                        slab_shape = {shape[0], source_chunk_shape[1], shape[2]};
-                        slab_offset = {
-                            0,
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[1]),
-                            0,
-                        };
-                        break;
-                    case SliceDirection::YZ:
-                        slab_shape = {shape[0], shape[1], source_chunk_shape[2]};
-                        slab_offset = {
-                            0,
-                            0,
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[2]),
-                        };
-                        break;
-                    }
-                    // Clip slab to actual volume extents so we do not read past the end.
-                    for (int axis = 0; axis < 3; ++axis) {
-                        const size_t end = static_cast<size_t>(slab_offset[axis]) + slab_shape[axis];
-                        if (end > shape[axis]) {
-                            slab_shape[axis] = shape[axis] - static_cast<size_t>(slab_offset[axis]);
-                        }
-                    }
+                task.kind = SliceTaskKind::Process;
+                auto& assembled = assembled_slices.emplace_back();
+                assembled.task = task;
+                assembled.localSliceIndex = sampled.localSliceIndex;
+                assembled.binarySlice.create(slice_size, CV_8U);
+            }
 
-                    const auto read_start = std::chrono::steady_clock::now();
-                    Array3D<uint8_t> chunk_data(slab_shape);
-                    input_volume.readZYX(chunk_data, slab_offset, input_level);
-                    dir_metrics.timingTotals["read_chunk"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - read_start).count();
-                    dir_metrics.timingCounts["read_chunk"] += 1;
-
-                    for (auto& assembled : assembled_slices) {
-                        const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
-                            chunk_data,
-                            to_normal_grid_direction(dir),
-                            assembled.localSliceIndex,
-                            assembled.binarySlice);
-                        assembled.anyNonZero = assembled.anyNonZero || any_nonzero;
+            if (!assembled_slices.empty()) {
+                std::array<size_t, 3> slab_shape;
+                std::array<int, 3> slab_offset;
+                switch (dir) {
+                case SliceDirection::XY:
+                    slab_shape = {source_chunk_shape[0], shape[1], shape[2]};
+                    slab_offset = {
+                        static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[0]),
+                        0,
+                        0,
+                    };
+                    break;
+                case SliceDirection::XZ:
+                    slab_shape = {shape[0], source_chunk_shape[1], shape[2]};
+                    slab_offset = {
+                        0,
+                        static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[1]),
+                        0,
+                    };
+                    break;
+                case SliceDirection::YZ:
+                    slab_shape = {shape[0], shape[1], source_chunk_shape[2]};
+                    slab_offset = {
+                        0,
+                        0,
+                        static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[2]),
+                    };
+                    break;
+                }
+                for (int axis = 0; axis < 3; ++axis) {
+                    const size_t end = static_cast<size_t>(slab_offset[axis]) + slab_shape[axis];
+                    if (end > shape[axis]) {
+                        slab_shape[axis] = shape[axis] - static_cast<size_t>(slab_offset[axis]);
                     }
                 }
 
-                std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));
+                const auto read_start = std::chrono::steady_clock::now();
+                Array3D<uint8_t> chunk_data(slab_shape);
+                input_volume.readZYX(chunk_data, slab_offset, input_level);
+                dir_metrics.timingTotals["read_chunk"] += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - read_start).count();
+                dir_metrics.timingCounts["read_chunk"] += 1;
 
-                #pragma omp parallel for schedule(dynamic)
-                for (size_t batch_index = 0; batch_index < assembled_slices.size(); ++batch_index) {
-                    const int tid = omp_get_thread_num();
-                    ThreadSliceStats& local_stats = thread_stats[static_cast<size_t>(tid)];
-                    ThreadScratch& scratch = thread_scratch[static_cast<size_t>(tid)];
-                    const auto& assembled = assembled_slices[batch_index];
-                    const SliceTask& task = assembled.task;
+                for (auto& assembled : assembled_slices) {
+                    const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
+                        chunk_data,
+                        to_normal_grid_direction(dir),
+                        assembled.localSliceIndex,
+                        assembled.binarySlice);
+                    assembled.anyNonZero = assembled.anyNonZero || any_nonzero;
+                }
+            }
 
-                    if (!assembled.anyNonZero) {
-                        std::ofstream ofs(task.outPath);
-                        ++local_stats.emptyBinary;
-                        ++local_stats.processed;
-                        continue;
-                    }
+            std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));
 
-                    scratch.traces.clear();
-                    const auto thinning_start = std::chrono::steady_clock::now();
-                    ThinningStats thinning_stats;
-                    customThinningTraceOnly(assembled.binarySlice, scratch.traces, &thinning_stats);
-                    local_stats.timingTotals["thinning"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - thinning_start).count();
-                    local_stats.timingCounts["thinning"] += 1;
-                    local_stats.thinningStats.accumulate(thinning_stats);
-                    ++local_stats.thinningCalls;
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t batch_index = 0; batch_index < assembled_slices.size(); ++batch_index) {
+                const int tid = omp_get_thread_num();
+                ThreadSliceStats& local_stats = thread_stats[static_cast<size_t>(tid)];
+                ThreadScratch& scratch = thread_scratch[static_cast<size_t>(tid)];
+                const auto& assembled = assembled_slices[batch_index];
+                const SliceTask& task = assembled.task;
 
-                    if (scratch.traces.empty()) {
-                        std::ofstream ofs(task.outPath);
-                        ++local_stats.emptyTrace;
-                        ++local_stats.processed;
-                        continue;
-                    }
-
-                    vc::core::util::GridStore grid_store(
-                        cv::Rect(0, 0, assembled.binarySlice.cols, assembled.binarySlice.rows),
-                        grid_step);
-
-                    const auto populate_start = std::chrono::steady_clock::now();
-                    populate_normal_grid(scratch.traces, grid_store, spiral_step);
-                    local_stats.timingTotals["populate_grid"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - populate_start).count();
-                    local_stats.timingCounts["populate_grid"] += 1;
-
-                    const auto save_start = std::chrono::steady_clock::now();
-                    grid_store.save(task.tmpPath.string(), vc::core::util::GridStore::SaveOptions{
-                        .verify_reload = verify_grid_save,
-                    });
-                    fs::rename(task.tmpPath, task.outPath);
-                    local_stats.timingTotals["save_grid"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - save_start).count();
-                    local_stats.timingCounts["save_grid"] += 1;
-
-                    const size_t written_index = written_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (preview_every > 0 && (written_index % static_cast<size_t>(preview_every)) == 0) {
-                        const auto preview_start = std::chrono::steady_clock::now();
-                        cv::imwrite(task.previewPath.string(), assembled.binarySlice);
-                        local_stats.timingTotals["preview_image"] += std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - preview_start).count();
-                        local_stats.timingCounts["preview_image"] += 1;
-                        ++local_stats.previewWrites;
-                    }
-
-                    local_stats.totalSize += fs::file_size(task.outPath);
-                    local_stats.totalSegments += grid_store.numSegments();
-                    local_stats.totalBuckets += grid_store.numNonEmptyBuckets();
-                    ++local_stats.written;
+                if (!assembled.anyNonZero) {
+                    std::ofstream ofs(task.outPath);
+                    ++local_stats.emptyBinary;
                     ++local_stats.processed;
+                    continue;
                 }
 
-                processed += batch_existing;
-                skipped_existing += batch_existing;
-                run_metrics.totalProcessedAllDirs += batch_size;
-                run_metrics.totalSkippedAllDirs += batch_existing;
+                scratch.traces.clear();
+                const auto thinning_start = std::chrono::steady_clock::now();
+                ThinningStats thinning_stats;
+                customThinningTraceOnly(assembled.binarySlice, scratch.traces, &thinning_stats);
+                local_stats.timingTotals["thinning"] += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - thinning_start).count();
+                local_stats.timingCounts["thinning"] += 1;
+                local_stats.thinningStats.accumulate(thinning_stats);
+                ++local_stats.thinningCalls;
 
-                for (const auto& local_stats : thread_stats) {
-                    processed += local_stats.processed;
-                    dir_metrics.emptyBinary += local_stats.emptyBinary;
-                    dir_metrics.emptyTrace += local_stats.emptyTrace;
-                    dir_metrics.written += local_stats.written;
-                    dir_metrics.previewWrites += local_stats.previewWrites;
-                    total_size += local_stats.totalSize;
-                    total_segments += local_stats.totalSegments;
-                    total_buckets += local_stats.totalBuckets;
-
-                    for (const auto& [name, total] : local_stats.timingTotals) {
-                        dir_metrics.timingTotals[name] += total;
-                        dir_metrics.timingCounts[name] += local_stats.timingCounts.at(name);
-                    }
-                    dir_metrics.thinningStats.accumulate(local_stats.thinningStats);
-                    dir_metrics.thinningCalls += local_stats.thinningCalls;
+                if (scratch.traces.empty()) {
+                    std::ofstream ofs(task.outPath);
+                    ++local_stats.emptyTrace;
+                    ++local_stats.processed;
+                    continue;
                 }
+
+                vc::core::util::GridStore grid_store(
+                    cv::Rect(0, 0, assembled.binarySlice.cols, assembled.binarySlice.rows),
+                    grid_step);
+
+                const auto populate_start = std::chrono::steady_clock::now();
+                populate_normal_grid(scratch.traces, grid_store, spiral_step);
+                local_stats.timingTotals["populate_grid"] += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - populate_start).count();
+                local_stats.timingCounts["populate_grid"] += 1;
+
+                const auto save_start = std::chrono::steady_clock::now();
+                grid_store.save(task.tmpPath.string(), vc::core::util::GridStore::SaveOptions{
+                    .verify_reload = verify_grid_save,
+                });
+                fs::rename(task.tmpPath, task.outPath);
+                local_stats.timingTotals["save_grid"] += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - save_start).count();
+                local_stats.timingCounts["save_grid"] += 1;
+
+                const size_t written_index = written_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (preview_every > 0 && (written_index % static_cast<size_t>(preview_every)) == 0) {
+                    const auto preview_start = std::chrono::steady_clock::now();
+                    cv::imwrite(task.previewPath.string(), assembled.binarySlice);
+                    local_stats.timingTotals["preview_image"] += std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - preview_start).count();
+                    local_stats.timingCounts["preview_image"] += 1;
+                    ++local_stats.previewWrites;
+                }
+
+                local_stats.totalSize += fs::file_size(task.outPath);
+                local_stats.totalSegments += grid_store.numSegments();
+                local_stats.totalBuckets += grid_store.numNonEmptyBuckets();
+                ++local_stats.written;
+                ++local_stats.processed;
+            }
+
+            processed += chunk_existing;
+            skipped_existing += chunk_existing;
+            run_metrics.totalProcessedAllDirs += chunk_sample_count;
+            run_metrics.totalSkippedAllDirs += chunk_existing;
+
+            for (const auto& local_stats : thread_stats) {
+                processed += local_stats.processed;
+                dir_metrics.emptyBinary += local_stats.emptyBinary;
+                dir_metrics.emptyTrace += local_stats.emptyTrace;
+                dir_metrics.written += local_stats.written;
+                dir_metrics.previewWrites += local_stats.previewWrites;
+                total_size += local_stats.totalSize;
+                total_segments += local_stats.totalSegments;
+                total_buckets += local_stats.totalBuckets;
+
+                for (const auto& [name, total] : local_stats.timingTotals) {
+                    dir_metrics.timingTotals[name] += total;
+                    dir_metrics.timingCounts[name] += local_stats.timingCounts.at(name);
+                }
+                dir_metrics.thinningStats.accumulate(local_stats.thinningStats);
+                dir_metrics.thinningCalls += local_stats.thinningCalls;
             }
 
             auto now = std::chrono::steady_clock::now();
