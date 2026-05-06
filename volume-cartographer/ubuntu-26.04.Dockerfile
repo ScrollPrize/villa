@@ -27,7 +27,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         liblz4-dev libtiff-dev \
         zlib1g-dev gfortran libopenblas-dev liblapack-dev \
         file bzip2 wget jq \
-        gcovr lcov
+        gcovr lcov \
+        python3 python3-venv
 
 RUN arch="$(uname -m)" \
  && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" -o /tmp/awscli.zip \
