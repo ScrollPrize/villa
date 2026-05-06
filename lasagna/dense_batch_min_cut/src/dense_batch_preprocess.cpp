@@ -2378,18 +2378,115 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
     graph.nodes.push_back(cv::Point2f(-1.0f, -1.0f));
     graph.skeleton_pixels = cv::countNonZero(skel);
 
+    const std::array<cv::Point, 8> kSortedDirs = {
+        {{-1, -1}, {0, -1}, {1, -1}, {-1, 0},
+         {1, 0},   {-1, 1}, {0, 1},  {1, 1}}};
+    constexpr std::array<std::uint8_t, 8> kTopologyBits = {
+        {1U << 1U, 1U << 2U, 1U << 4U, 1U << 7U,
+         1U << 6U, 1U << 5U, 1U << 3U, 1U << 0U}};
+    const int rows = skel.rows;
+    const int cols = skel.cols;
+    const auto linear_index = [cols](const cv::Point pixel) {
+        return static_cast<std::size_t>(pixel.y * cols + pixel.x);
+    };
+    const auto in_bounds = [rows, cols](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < cols && pixel.y >= 0 &&
+               pixel.y < rows;
+    };
+    std::vector<std::uint8_t> neighbor_masks(
+        static_cast<std::size_t>(rows * cols), 0);
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const std::uint8_t* prev_row =
+                y > 0 ? skel.ptr<std::uint8_t>(y - 1) : nullptr;
+            const std::uint8_t* skel_row = skel.ptr<std::uint8_t>(y);
+            const std::uint8_t* next_row =
+                y + 1 < rows ? skel.ptr<std::uint8_t>(y + 1) : nullptr;
+            for (int x = 0; x < cols; ++x) {
+                if (skel_row[x] == 0) {
+                    continue;
+                }
+                std::uint8_t mask = 0;
+                if (prev_row != nullptr) {
+                    if (x > 0 && prev_row[x - 1] != 0) {
+                        mask |= static_cast<std::uint8_t>(1U << 0U);
+                    }
+                    if (prev_row[x] != 0) {
+                        mask |= static_cast<std::uint8_t>(1U << 1U);
+                    }
+                    if (x + 1 < cols && prev_row[x + 1] != 0) {
+                        mask |= static_cast<std::uint8_t>(1U << 2U);
+                    }
+                }
+                if (x > 0 && skel_row[x - 1] != 0) {
+                    mask |= static_cast<std::uint8_t>(1U << 3U);
+                }
+                if (x + 1 < cols && skel_row[x + 1] != 0) {
+                    mask |= static_cast<std::uint8_t>(1U << 4U);
+                }
+                if (next_row != nullptr) {
+                    if (x > 0 && next_row[x - 1] != 0) {
+                        mask |= static_cast<std::uint8_t>(1U << 5U);
+                    }
+                    if (next_row[x] != 0) {
+                        mask |= static_cast<std::uint8_t>(1U << 6U);
+                    }
+                    if (x + 1 < cols && next_row[x + 1] != 0) {
+                        mask |= static_cast<std::uint8_t>(1U << 7U);
+                    }
+                }
+                neighbor_masks[static_cast<std::size_t>(y * cols + x)] = mask;
+            }
+        }
+    });
+    const auto neighbor_mask_at = [&](const cv::Point pixel) {
+        return neighbor_masks[linear_index(pixel)];
+    };
+    const auto neighbor_count = [](std::uint8_t mask) {
+        int count = 0;
+        while (mask != 0) {
+            count += static_cast<int>(mask & 1U);
+            mask >>= 1U;
+        }
+        return count;
+    };
+    const auto branch_count_from_mask = [&](const std::uint8_t mask) {
+        int count = 0;
+        for (int i = 0; i < static_cast<int>(kTopologyBits.size()); ++i) {
+            const bool current = (mask & kTopologyBits[i]) != 0;
+            const bool next =
+                (mask & kTopologyBits[(i + 1) % kTopologyBits.size()]) != 0;
+            if (!current && next) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    const auto for_sorted_neighbors = [&](const cv::Point pixel,
+                                          const auto& fn) {
+        const std::uint8_t mask = neighbor_mask_at(pixel);
+        for (int i = 0; i < static_cast<int>(kSortedDirs.size()); ++i) {
+            if ((mask & (1U << i)) == 0) {
+                continue;
+            }
+            fn(pixel + kSortedDirs[i]);
+        }
+    };
+
     cv::Mat node_seed = cv::Mat::zeros(skel.size(), CV_8U);
-    for (int y = 0; y < skel.rows; ++y) {
-        for (int x = 0; x < skel.cols; ++x) {
-            if (skel.at<std::uint8_t>(y, x) == 0) {
+    for (int y = 0; y < rows; ++y) {
+        const std::uint8_t* skel_row = skel.ptr<std::uint8_t>(y);
+        std::uint8_t* node_row = node_seed.ptr<std::uint8_t>(y);
+        for (int x = 0; x < cols; ++x) {
+            if (skel_row[x] == 0) {
                 continue;
             }
             const cv::Point pixel(x, y);
-            const int degree =
-                static_cast<int>(skeleton_neighbors(skel, pixel).size());
-            const int branches = skeleton_topological_branch_count(skel, pixel);
+            const std::uint8_t mask = neighbor_mask_at(pixel);
+            const int degree = neighbor_count(mask);
+            const int branches = branch_count_from_mask(mask);
             if (degree <= 1 || branches >= 3) {
-                node_seed.at<std::uint8_t>(y, x) = 255;
+                node_row[x] = 255;
             }
         }
     }
@@ -2403,9 +2500,10 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
         static_cast<std::size_t>(initial_node_count), 0);
     std::vector<std::vector<cv::Point>> node_pixels(
         static_cast<std::size_t>(initial_node_count));
-    for (int y = 0; y < node_labels.rows; ++y) {
-        for (int x = 0; x < node_labels.cols; ++x) {
-            const int label = node_labels.at<int>(y, x);
+    for (int y = 0; y < rows; ++y) {
+        const int* labels = node_labels.ptr<int>(y);
+        for (int x = 0; x < cols; ++x) {
+            const int label = labels[x];
             if (label <= 0) {
                 continue;
             }
@@ -2424,8 +2522,7 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
     cv::compare(node_labels, 0, graph.node_mask, cv::CMP_GT);
 
     const auto is_skeleton = [&](const cv::Point pixel) {
-        return pixel.x >= 0 && pixel.x < skel.cols && pixel.y >= 0 &&
-               pixel.y < skel.rows &&
+        return in_bounds(pixel) &&
                skel.at<std::uint8_t>(pixel.y, pixel.x) != 0;
     };
     const auto is_node = [&](const cv::Point pixel) {
@@ -2451,27 +2548,78 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
         graph.node_mask.at<std::uint8_t>(pixel.y, pixel.x) = 255;
         return label;
     };
-    const auto adjacent_nodes = [&](const cv::Point pixel) {
-        std::vector<int> nodes;
-        for (const cv::Point neighbor : sorted_skeleton_neighbors(skel, pixel)) {
-            add_unique_label(nodes, node_labels.at<int>(neighbor.y, neighbor.x));
+    struct LabelList {
+        std::array<int, 8> values{};
+        int count = 0;
+
+        void add_unique(int label) {
+            if (label <= 0) {
+                return;
+            }
+            for (int i = 0; i < count; ++i) {
+                if (values[i] == label) {
+                    return;
+                }
+            }
+            values[count++] = label;
         }
-        std::sort(nodes.begin(), nodes.end());
+
+        void sort_values() {
+            std::sort(values.begin(), values.begin() + count);
+        }
+
+        void erase(int label) {
+            int write = 0;
+            for (int read = 0; read < count; ++read) {
+                if (values[read] != label) {
+                    values[write++] = values[read];
+                }
+            }
+            count = write;
+        }
+
+        bool contains(int label) const {
+            for (int i = 0; i < count; ++i) {
+                if (values[i] == label) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool empty() const {
+            return count == 0;
+        }
+
+        int front() const {
+            return values[0];
+        }
+    };
+    const auto adjacent_nodes = [&](const cv::Point pixel) {
+        LabelList nodes;
+        for_sorted_neighbors(pixel, [&](const cv::Point neighbor) {
+            nodes.add_unique(node_labels.at<int>(neighbor.y, neighbor.x));
+        });
+        nodes.sort_values();
         return nodes;
     };
     const auto choose_next = [&](const cv::Point current,
-                                 const std::vector<cv::Point>& candidates) {
-        std::vector<cv::Point> four_candidates;
-        for (const cv::Point candidate : candidates) {
+                                 const std::array<cv::Point, 8>& candidates,
+                                 const int candidate_count) {
+        cv::Point four_candidate(-1, -1);
+        int four_count = 0;
+        for (int i = 0; i < candidate_count; ++i) {
+            const cv::Point candidate = candidates[i];
             if (four_connected(current, candidate)) {
-                four_candidates.push_back(candidate);
+                four_candidate = candidate;
+                ++four_count;
             }
         }
-        if (four_candidates.size() == 1) {
-            return four_candidates.front();
+        if (four_count == 1) {
+            return four_candidate;
         }
-        if (candidates.size() == 1) {
-            return candidates.front();
+        if (candidate_count == 1) {
+            return candidates[0];
         }
         return cv::Point(-1, -1);
     };
@@ -2496,28 +2644,28 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
                 break;
             }
 
-            std::vector<int> nodes = adjacent_nodes(current);
-            nodes.erase(std::remove(nodes.begin(), nodes.end(), start_node),
-                        nodes.end());
+            LabelList nodes = adjacent_nodes(current);
+            nodes.erase(start_node);
             if (!nodes.empty() && !edge.pixels.empty()) {
                 edge.b = nodes.front();
                 break;
             }
 
-            std::vector<cv::Point> candidates;
-            for (const cv::Point neighbor :
-                 sorted_skeleton_neighbors(skel, current)) {
+            std::array<cv::Point, 8> candidates;
+            int candidate_count = 0;
+            for_sorted_neighbors(current, [&](const cv::Point neighbor) {
                 if (neighbor == previous || is_node(neighbor) ||
                     !is_edge_pixel(neighbor) ||
                     visited_edges.at<std::uint8_t>(neighbor.y, neighbor.x) !=
                         0) {
-                    continue;
+                    return;
                 }
-                candidates.push_back(neighbor);
-            }
+                candidates[candidate_count++] = neighbor;
+            });
 
-            const cv::Point next = choose_next(current, candidates);
-            if (next.x < 0 && !candidates.empty()) {
+            const cv::Point next =
+                choose_next(current, candidates, candidate_count);
+            if (next.x < 0 && candidate_count > 0) {
                 edge.b = make_node(current);
                 break;
             }
@@ -2531,8 +2679,7 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
             if (next.x < 0) {
                 nodes = adjacent_nodes(current);
                 if (edge.pixels.size() > 1 &&
-                    std::find(nodes.begin(), nodes.end(), start_node) !=
-                        nodes.end()) {
+                    nodes.contains(start_node)) {
                     edge.b = start_node;
                 } else {
                     edge.b = make_node(current);
@@ -2556,19 +2703,18 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
 
     for (std::size_t node = 1; node < graph.nodes.size(); ++node) {
         for (const cv::Point node_pixel : node_pixels[node]) {
-            for (const cv::Point neighbor :
-                 sorted_skeleton_neighbors(skel, node_pixel)) {
+            for_sorted_neighbors(node_pixel, [&](const cv::Point neighbor) {
                 if (is_edge_pixel(neighbor) &&
                     visited_edges.at<std::uint8_t>(neighbor.y, neighbor.x) ==
                         0) {
                     trace_edge(static_cast<int>(node), node_pixel, neighbor);
                 }
-            }
+            });
         }
     }
 
-    for (int y = 0; y < skel.rows; ++y) {
-        for (int x = 0; x < skel.cols; ++x) {
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < cols; ++x) {
             const cv::Point start(x, y);
             if (!is_edge_pixel(start) ||
                 visited_edges.at<std::uint8_t>(y, x) != 0) {
@@ -2576,21 +2722,22 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
             }
             const int node = make_node(start);
             visited_edges.at<std::uint8_t>(y, x) = 255;
-            std::vector<cv::Point> candidates;
-            for (const cv::Point neighbor :
-                 sorted_skeleton_neighbors(skel, start)) {
+            std::array<cv::Point, 8> candidates;
+            int candidate_count = 0;
+            for_sorted_neighbors(start, [&](const cv::Point neighbor) {
                 if (is_edge_pixel(neighbor) &&
                     visited_edges.at<std::uint8_t>(neighbor.y, neighbor.x) ==
                         0) {
-                    candidates.push_back(neighbor);
+                    candidates[candidate_count++] = neighbor;
                 }
-            }
-            if (candidates.empty()) {
+            });
+            if (candidate_count == 0) {
                 continue;
             }
-            const cv::Point first = choose_next(start, candidates);
+            const cv::Point first = choose_next(start, candidates,
+                                               candidate_count);
             trace_edge(node, start,
-                       first.x >= 0 ? first : candidates.front());
+                       first.x >= 0 ? first : candidates[0]);
         }
     }
 
