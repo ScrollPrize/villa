@@ -196,12 +196,8 @@ endif()
 
 if(VC_PROFILE_COMPILE)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        # Per-TU JSON traces alongside each .o (chrome://tracing format).
-        # 200us granularity is a reasonable signal/noise default.
         add_compile_options(-ftime-trace -ftime-trace-granularity=200)
     else()
-        # gcc has no -ftime-trace; -ftime-report dumps a text summary at
-        # the end of every compile (noisy, but useful for one-off probes).
         add_compile_options(-ftime-report)
     endif()
 endif()
