@@ -2836,13 +2836,29 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
     if (!surf)
         return;
     if (modifiers & Qt::ShiftModifier) {
-        _zOff += static_cast<float>(steps) * _zScrollSensitivity;
-        _genCacheDirty = true;
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-            const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
-            prefetchPlaneNormalNeighbors(*plane, renderStartLevel(false), options);
+            const cv::Vec3f normal = plane->normal({0, 0, 0});
+            if (std::isfinite(normal[0]) && std::isfinite(normal[1]) &&
+                std::isfinite(normal[2]) && cv::norm(normal) > 0.0f) {
+                const float delta = static_cast<float>(steps) * _zScrollSensitivity;
+                plane->setOrigin(plane->origin() + normal * (delta + _zOff));
+                _zOff = 0.0f;
+                _zOffWorldDir = {0, 0, 0};
+                if (_state) {
+                    _state->setSurface(_surfName, surf, false, true);
+                } else {
+                    updateContentBounds();
+                    _genCacheDirty = true;
+                    _stableFramebufferValid = false;
+                    scheduleRender("plane slice mouse wheel");
+                    renderIntersections("plane slice mouse wheel");
+                }
+            }
+        } else {
+            _zOff += static_cast<float>(steps) * _zScrollSensitivity;
+            _genCacheDirty = true;
+            scheduleRender("z offset mouse wheel");
         }
-        scheduleRender("z offset mouse wheel");
     } else if (modifiers & Qt::ControlModifier) {
         emit sendSegmentationRadiusWheel(steps, scenePoint, sceneToVolume(scenePoint));
     } else {
