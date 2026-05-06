@@ -749,6 +749,9 @@ void CChunkedVolumeViewer::reloadPerfSettings()
 
 void CChunkedVolumeViewer::setSurface(const std::string& name)
 {
+    if (_closing) {
+        return;
+    }
     _surfName = name;
     if (_state)
         onSurfaceChanged(name, _state->surface(name));
@@ -791,7 +794,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
             if (!guard)
                 return;
             auto volume = volumeWeak.lock();
-            if (!volume || guard->_volume != volume)
+            if (!volume || guard->_volume != volume || guard->_closing)
                 return;
             if (guard->_interactivePreview) {
                 if (guard->_settleRenderTimer)
@@ -805,6 +808,9 @@ void CChunkedVolumeViewer::rebuildChunkArray()
 
 void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 {
+    if (_closing) {
+        return;
+    }
     invalidateIntersect();
     if (_surfWeak.lock() == _defaultSurface) {
         _surfWeak.reset();
@@ -892,6 +898,9 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                             const std::shared_ptr<Surface>& surf,
                                             bool isEditUpdate)
 {
+    if (_closing) {
+        return;
+    }
     const bool isCurrentSurface = (_surfName == name);
     const auto previousSurface = _surfWeak.lock();
     const bool isSameCurrentSurface = isCurrentSurface && previousSurface && previousSurface == surf;
@@ -965,6 +974,9 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
 
 void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std::shared_ptr<Surface>& surf)
 {
+    if (_closing) {
+        return;
+    }
     auto current = _surfWeak.lock();
     if (current && current == surf)
         _surfWeak.reset();
@@ -972,6 +984,9 @@ void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std:
 
 void CChunkedVolumeViewer::onVolumeClosing()
 {
+    if (_closing) {
+        return;
+    }
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -984,6 +999,9 @@ void CChunkedVolumeViewer::onVolumeClosing()
 
 void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
 {
+    if (_closing) {
+        return;
+    }
     if (name != "focus" || !poi)
         return;
 
@@ -2663,6 +2681,9 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
 
 void CChunkedVolumeViewer::setVolumeWindow(float low, float high)
 {
+    if (_closing) {
+        return;
+    }
     const float clampedLow = std::clamp(low, 0.0f, 255.0f);
     float clampedHigh = std::clamp(high, 0.0f, 255.0f);
     if (clampedHigh <= clampedLow)
@@ -2677,6 +2698,9 @@ void CChunkedVolumeViewer::setVolumeWindow(float low, float high)
 
 void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
 {
+    if (_closing) {
+        return;
+    }
     if (_overlayChunkCbId != 0 && _overlayChunkArray) {
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;
@@ -2697,7 +2721,7 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                     if (!guard)
                         return;
                     auto volume = overlayVolumeWeak.lock();
-                    if (!volume || guard->_overlayVolume != volume)
+                    if (!volume || guard->_overlayVolume != volume || guard->_closing)
                         return;
                     if (guard->_interactivePreview) {
                         if (guard->_settleRenderTimer)
@@ -2714,23 +2738,35 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
 
 void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
 {
+    if (_closing) {
+        return;
+    }
     _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
     scheduleRender("overlay opacity changed");
 }
 
 void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
 {
+    if (_closing) {
+        return;
+    }
     _overlayColormapId = colormapId;
     scheduleRender("overlay colormap changed");
 }
 
 void CChunkedVolumeViewer::setOverlayThreshold(float threshold)
 {
+    if (_closing) {
+        return;
+    }
     setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
 }
 
 void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
 {
+    if (_closing) {
+        return;
+    }
     _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
     _overlayWindowHigh = std::clamp(high, _overlayWindowLow + 1.0f, 255.0f);
     scheduleRender("overlay window changed");
@@ -2938,6 +2974,9 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
 
 void CChunkedVolumeViewer::onResized()
 {
+    if (_closing) {
+        return;
+    }
     resizeFramebuffer();
     _genCacheDirty = true;
     if (_renderTimer && _renderTimer->isActive())
@@ -4325,6 +4364,9 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
 
 void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
 {
+    if (_closing) {
+        return;
+    }
     _highlightedSurfaceIds.clear();
     for (const auto& id : ids)
         _highlightedSurfaceIds.insert(id);
