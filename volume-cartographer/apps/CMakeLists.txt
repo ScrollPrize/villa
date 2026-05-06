@@ -53,6 +53,9 @@ target_link_libraries(vc_flatten vc_core vc_flattening Boost::program_options)
 add_executable(vc_tifxyz_inp_mask src/vc_tifxyz_inp_mask.cpp)
 target_link_libraries(vc_tifxyz_inp_mask vc_core)
 
+add_executable(vc_tifxyz_trim src/vc_tifxyz_trim.cpp)
+target_link_libraries(vc_tifxyz_trim vc_core opencv_core opencv_imgcodecs TIFF::TIFF)
+
 add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
@@ -160,6 +163,7 @@ if(VC_USE_PCH)
         vc_obj2tifxyz_legacy
         vc_flatten
         vc_tifxyz_inp_mask
+        vc_tifxyz_trim
         vc_tifxyz_winding
         vc_tifxyz2zarr_sparse
         vc_add_ignore_label

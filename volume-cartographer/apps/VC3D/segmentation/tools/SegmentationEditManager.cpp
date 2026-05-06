@@ -41,6 +41,16 @@ SegmentationEditManager::SegmentationEditManager(QObject* parent)
 {
 }
 
+cv::Mat_<cv::Vec3f>* SegmentationEditManager::previewPointsPtr()
+{
+    return _baseSurface ? _baseSurface->rawPointsPtr() : nullptr;
+}
+
+const cv::Mat_<cv::Vec3f>* SegmentationEditManager::previewPointsPtr() const
+{
+    return _baseSurface ? _baseSurface->rawPointsPtr() : nullptr;
+}
+
 bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurface)
 {
     if (!baseSurface) {
@@ -59,7 +69,6 @@ bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurf
     resetPointerSeed();
 
     _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(basePoints->clone());
-    _previewPoints = basePoints;
 
     _editedVertices.clear();
     _recentTouched.clear();
@@ -77,7 +86,6 @@ void SegmentationEditManager::endSession()
     _recentTouched.clear();
     clearActiveDrag();
 
-    _previewPoints = nullptr;
     _originalPoints.reset();
     _baseSurface.reset();
     resetPointerSeed();
@@ -112,8 +120,9 @@ void SegmentationEditManager::setEditScale(float scale)
 const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
 {
     static const cv::Mat_<cv::Vec3f> kEmpty;
-    if (_previewPoints) {
-        return *_previewPoints;
+    const auto* preview = previewPointsPtr();
+    if (preview) {
+        return *preview;
     }
     return kEmpty;
 }
@@ -121,8 +130,9 @@ const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
 cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPointsMutable()
 {
     static cv::Mat_<cv::Vec3f> kEmpty;
-    if (_previewPoints) {
-        return *_previewPoints;
+    auto* preview = previewPointsPtr();
+    if (preview) {
+        return *preview;
     }
     return kEmpty;
 }
@@ -134,10 +144,11 @@ bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points
     if (outDiffBounds) {
         outDiffBounds->reset();
     }
-    if (!_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview) {
         return false;
     }
-    if (points.rows != _previewPoints->rows || points.cols != _previewPoints->cols) {
+    if (points.rows != preview->rows || points.cols != preview->cols) {
         return false;
     }
 
@@ -151,7 +162,7 @@ bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points
     const int cols = points.cols;
     for (int r = 0; r < rows; ++r) {
         const cv::Vec3f* srcRow = points.ptr<cv::Vec3f>(r);
-        const cv::Vec3f* dstRow = _previewPoints->ptr<cv::Vec3f>(r);
+        const cv::Vec3f* dstRow = preview->ptr<cv::Vec3f>(r);
         for (int c = 0; c < cols; ++c) {
             const cv::Vec3f& next = srcRow[c];
             const cv::Vec3f& current = dstRow[c];
@@ -173,7 +184,7 @@ bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points
         }
     }
 
-    points.copyTo(*_previewPoints);
+    points.copyTo(*preview);
     if (_originalPoints) {
         points.copyTo(*_originalPoints);
     }
@@ -202,15 +213,16 @@ bool SegmentationEditManager::setPreviewPointsOnly(const cv::Mat_<cv::Vec3f>& po
     if (outDiffBounds) {
         outDiffBounds->reset();
     }
-    if (!_previewPoints || !_originalPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview || !_originalPoints) {
         return false;
     }
-    if (points.rows != _previewPoints->rows || points.cols != _previewPoints->cols ||
+    if (points.rows != preview->rows || points.cols != preview->cols ||
         points.rows != _originalPoints->rows || points.cols != _originalPoints->cols) {
         return false;
     }
 
-    points.copyTo(*_previewPoints);
+    points.copyTo(*preview);
     _editedVertices.clear();
     _recentTouched.clear();
     _recentTouched.reserve(editedVertices.size());
@@ -268,15 +280,16 @@ bool SegmentationEditManager::setPreviewPointsOnly(const cv::Mat_<cv::Vec3f>& po
 
 bool SegmentationEditManager::restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points)
 {
-    if (!_previewPoints || !_originalPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview || !_originalPoints) {
         return false;
     }
-    if (points.rows != _previewPoints->rows || points.cols != _previewPoints->cols ||
+    if (points.rows != preview->rows || points.cols != preview->cols ||
         points.rows != _originalPoints->rows || points.cols != _originalPoints->cols) {
         return false;
     }
 
-    points.copyTo(*_previewPoints);
+    points.copyTo(*preview);
     points.copyTo(*_originalPoints);
     _editedVertices.clear();
     _recentTouched.clear();
@@ -301,12 +314,13 @@ void SegmentationEditManager::resetPreview()
 
 void SegmentationEditManager::applyPreview()
 {
-    if (!_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview) {
         return;
     }
 
     if (_originalPoints) {
-        _previewPoints->copyTo(*_originalPoints);
+        preview->copyTo(*_originalPoints);
     }
 
     _editedVertices.clear();
@@ -330,8 +344,7 @@ void SegmentationEditManager::refreshFromBaseSurface()
         current.copyTo(*_originalPoints);
     }
 
-    _previewPoints = _baseSurface->rawPointsPtr();
-    if (!_previewPoints) {
+    if (!_baseSurface->rawPointsPtr()) {
         _hasPendingEdits = !_editedVertices.empty();
         return;
     }
@@ -361,11 +374,7 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
     cv::Mat originalRegion(*_originalPoints, clipped);
     baseRegion.copyTo(originalRegion);
 
-    cv::Mat_<cv::Vec3f>* previewMatrix = _previewPoints;
-    if (!previewMatrix && _baseSurface) {
-        previewMatrix = _baseSurface->rawPointsPtr();
-        _previewPoints = previewMatrix;
-    }
+    auto* previewMatrix = previewPointsPtr();
     if (!previewMatrix) {
         return false;
     }
@@ -424,10 +433,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
         return std::nullopt;
     }
 
-    const cv::Mat_<cv::Vec3f>* points = _previewPoints;
-    if (!points) {
-        points = _baseSurface->rawPointsPtr();
-    }
+    const cv::Mat_<cv::Vec3f>* points = previewPointsPtr();
     if (!points) {
         return std::nullopt;
     }
@@ -484,13 +490,14 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
 
 std::optional<cv::Vec3f> SegmentationEditManager::vertexWorldPosition(int row, int col) const
 {
-    if (!_previewPoints) {
+    const auto* preview = previewPointsPtr();
+    if (!preview) {
         return std::nullopt;
     }
-    if (row < 0 || row >= _previewPoints->rows || col < 0 || col >= _previewPoints->cols) {
+    if (row < 0 || row >= preview->rows || col < 0 || col >= preview->cols) {
         return std::nullopt;
     }
-    const cv::Vec3f& world = (*_previewPoints)(row, col);
+    const cv::Vec3f& world = (*preview)(row, col);
     if (isInvalidPoint(world)) {
         return std::nullopt;
     }
@@ -499,7 +506,8 @@ std::optional<cv::Vec3f> SegmentationEditManager::vertexWorldPosition(int row, i
 
 bool SegmentationEditManager::beginActiveDrag(const std::pair<int, int>& gridIndex)
 {
-    if (!_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview) {
         return false;
     }
     clearActiveDrag();
@@ -508,14 +516,14 @@ bool SegmentationEditManager::beginActiveDrag(const std::pair<int, int>& gridInd
     }
     _activeDrag.active = true;
     _activeDrag.center = GridKey{gridIndex.first, gridIndex.second};
-    _activeDrag.baseWorld = (*_previewPoints)(gridIndex.first, gridIndex.second);
+    _activeDrag.baseWorld = (*preview)(gridIndex.first, gridIndex.second);
     _activeDrag.targetWorld = _activeDrag.baseWorld;
     return true;
 }
 
 bool SegmentationEditManager::updateActiveDrag(const cv::Vec3f& newCenterWorld)
 {
-    if (!_activeDrag.active || !_previewPoints) {
+    if (!_activeDrag.active || !previewPointsPtr()) {
         return false;
     }
 
@@ -527,7 +535,8 @@ bool SegmentationEditManager::updateActiveDrag(const cv::Vec3f& newCenterWorld)
 
 bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3f>& newWorldPositions)
 {
-    if (!_activeDrag.active || !_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!_activeDrag.active || !preview) {
         return false;
     }
     const std::size_t sampleCount = _activeDrag.samples.size();
@@ -553,7 +562,7 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
         }
 
         const cv::Vec3f scaledWorld = sample.baseWorld + (rawTarget - sample.baseWorld) * _editScale;
-        (*_previewPoints)(sample.row, sample.col) = scaledWorld;
+        (*preview)(sample.row, sample.col) = scaledWorld;
         recordVertexEdit(sample.row, sample.col, scaledWorld, false);
         _recentTouched.push_back(GridKey{sample.row, sample.col});
         minRow = std::min(minRow, sample.row);
@@ -583,15 +592,16 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
 
 bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations)
 {
-    if (!_previewPoints || _recentTouched.empty()) {
+    auto* preview = previewPointsPtr();
+    if (!preview || _recentTouched.empty()) {
         return false;
     }
     if (!std::isfinite(strength) || strength <= 0.0f) {
         return false;
     }
 
-    const int rows = _previewPoints->rows;
-    const int cols = _previewPoints->cols;
+    const int rows = preview->rows;
+    const int cols = preview->cols;
     if (rows <= 0 || cols <= 0) {
         return false;
     }
@@ -606,7 +616,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
         if (r < 0 || r >= rows || c < 0 || c >= cols) {
             return;
         }
-        const cv::Vec3f& candidate = (*_previewPoints)(r, c);
+        const cv::Vec3f& candidate = (*preview)(r, c);
         if (isInvalidPoint(candidate)) {
             return;
         }
@@ -641,7 +651,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
     std::unordered_map<GridKey, cv::Vec3f, GridKeyHash> currentValues;
     currentValues.reserve(regionVec.size());
     for (const auto& key : regionVec) {
-        currentValues[key] = (*_previewPoints)(key.row, key.col);
+        currentValues[key] = (*preview)(key.row, key.col);
     }
 
     bool anyChange = false;
@@ -677,7 +687,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
                 if (regionIt != currentValues.end()) {
                     neighbour = regionIt->second;
                 } else {
-                    neighbour = (*_previewPoints)(nr, nc);
+                    neighbour = (*preview)(nr, nc);
                 }
 
                 if (isInvalidPoint(neighbour)) {
@@ -710,7 +720,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
             const GridKey& key = entry.first;
             const cv::Vec3f& newWorld = entry.second;
 
-            (*_previewPoints)(key.row, key.col) = newWorld;
+            (*preview)(key.row, key.col) = newWorld;
             currentValues[key] = newWorld;
             recordVertexEdit(key.row, key.col, newWorld);
             anyChange = true;
@@ -738,12 +748,13 @@ void SegmentationEditManager::commitActiveDrag()
 
 void SegmentationEditManager::cancelActiveDrag()
 {
-    if (!_activeDrag.active || !_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!_activeDrag.active || !preview) {
         return;
     }
 
     for (const auto& sample : _activeDrag.samples) {
-        (*_previewPoints)(sample.row, sample.col) = sample.baseWorld;
+        (*preview)(sample.row, sample.col) = sample.baseWorld;
         recordVertexEdit(sample.row, sample.col, sample.baseWorld);
     }
 
@@ -753,20 +764,18 @@ void SegmentationEditManager::cancelActiveDrag()
 
 void SegmentationEditManager::refreshActiveDragBasePositions()
 {
-    if (!_activeDrag.active || !_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!_activeDrag.active || !preview) {
         return;
     }
 
-    // Update each sample's baseWorld to current preview position
-    // This allows reusing samples across continuous push/pull ticks
     for (auto& sample : _activeDrag.samples) {
-        sample.baseWorld = (*_previewPoints)(sample.row, sample.col);
+        sample.baseWorld = (*preview)(sample.row, sample.col);
     }
 
-    // Also update the center baseWorld
     if (!_activeDrag.samples.empty()) {
         const auto& center = _activeDrag.center;
-        _activeDrag.baseWorld = (*_previewPoints)(center.row, center.col);
+        _activeDrag.baseWorld = (*preview)(center.row, center.col);
     }
 }
 
@@ -809,11 +818,12 @@ void SegmentationEditManager::markNextEditsAsGrowth()
 
 void SegmentationEditManager::bakePreviewToOriginal()
 {
-    if (!_previewPoints || !_originalPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview || !_originalPoints) {
         return;
     }
 
-    _previewPoints->copyTo(*_originalPoints);
+    preview->copyTo(*_originalPoints);
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
@@ -822,15 +832,16 @@ void SegmentationEditManager::bakePreviewToOriginal()
 
 bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int radius)
 {
-    if (!_originalPoints || !_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!_originalPoints || !preview) {
         return false;
     }
     if (radius <= 0) {
         return false;
     }
 
-    const int rows = _previewPoints->rows;
-    const int cols = _previewPoints->cols;
+    const int rows = preview->rows;
+    const int cols = preview->cols;
     const int rowStart = std::max(0, centerRow - radius);
     const int rowEnd = std::min(rows - 1, centerRow + radius);
     const int colStart = std::max(0, centerCol - radius);
@@ -844,7 +855,7 @@ bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int
             if (isInvalidPoint(original)) {
                 continue;
             }
-            (*_previewPoints)(r, c) = original;
+            (*preview)(r, c) = original;
             recordVertexEdit(r, c, original);
             changed = true;
         }
@@ -859,12 +870,13 @@ bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int
 
 bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, float radiusSteps)
 {
-    if (!_previewPoints) {
+    auto* previewMat = previewPointsPtr();
+    if (!previewMat) {
         return false;
     }
 
-    const int rows = _previewPoints->rows;
-    const int cols = _previewPoints->cols;
+    const int rows = previewMat->rows;
+    const int cols = previewMat->cols;
     if (rows <= 0 || cols <= 0) {
         return false;
     }
@@ -897,12 +909,12 @@ bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, fl
                 continue;
             }
 
-            cv::Vec3f& preview = (*_previewPoints)(r, c);
-            if (isInvalidPoint(preview)) {
+            cv::Vec3f& cell = (*previewMat)(r, c);
+            if (isInvalidPoint(cell)) {
                 continue;
             }
 
-            preview = invalid;
+            cell = invalid;
             recordVertexEdit(r, c, invalid);
             touched.push_back(GridKey{r, c});
             changed = true;
@@ -948,29 +960,31 @@ bool SegmentationEditManager::isInvalidPoint(const cv::Vec3f& value)
 
 void SegmentationEditManager::rebuildPreviewFromOriginal()
 {
-    if (!_originalPoints || !_previewPoints) {
+    auto* preview = previewPointsPtr();
+    if (!_originalPoints || !preview) {
         return;
     }
 
-    _originalPoints->copyTo(*_previewPoints);
+    _originalPoints->copyTo(*preview);
 
     for (const auto& [key, edit] : _editedVertices) {
         if (key.row < 0 || key.col < 0 ||
-            key.row >= _previewPoints->rows || key.col >= _previewPoints->cols) {
+            key.row >= preview->rows || key.col >= preview->cols) {
             continue;
         }
-        (*_previewPoints)(key.row, key.col) = edit.currentWorld;
+        (*preview)(key.row, key.col) = edit.currentWorld;
     }
 }
 
 bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& gridIndex)
 {
-    if (!_previewPoints || !_originalPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview || !_originalPoints) {
         return false;
     }
 
-    const int rows = _previewPoints->rows;
-    const int cols = _previewPoints->cols;
+    const int rows = preview->rows;
+    const int cols = preview->cols;
     const int centerRow = gridIndex.first;
     const int centerCol = gridIndex.second;
 
@@ -978,7 +992,7 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
         return false;
     }
 
-    const cv::Vec3f& centerWorld = (*_previewPoints)(centerRow, centerCol);
+    const cv::Vec3f& centerWorld = (*preview)(centerRow, centerCol);
     if (isInvalidPoint(centerWorld)) {
         return false;
     }
@@ -1016,7 +1030,7 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
     for (int r = rowStart; r <= rowEnd; ++r) {
         for (int c = colStart; c <= colEnd; ++c) {
             const cv::Vec3f& original = (*_originalPoints)(r, c);
-            const cv::Vec3f& baseWorld = (*_previewPoints)(r, c);
+            const cv::Vec3f& baseWorld = (*preview)(r, c);
             if (isInvalidPoint(original) || isInvalidPoint(baseWorld)) {
                 continue;
             }
@@ -1045,7 +1059,8 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
 
 void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
 {
-    if (!_previewPoints || !_originalPoints) {
+    auto* preview = previewPointsPtr();
+    if (!preview || !_originalPoints) {
         return;
     }
     if (_activeDrag.samples.empty()) {
@@ -1064,7 +1079,7 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
 
     for (const auto& sample : _activeDrag.samples) {
         cv::Vec3f newWorld = sample.baseWorld + scaledDelta * sample.gaussianWeight;
-        (*_previewPoints)(sample.row, sample.col) = newWorld;
+        (*preview)(sample.row, sample.col) = newWorld;
         recordVertexEdit(sample.row, sample.col, newWorld, false);
         _recentTouched.push_back(GridKey{sample.row, sample.col});
 

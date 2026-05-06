@@ -5,6 +5,7 @@ _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 del _os
 
 import argparse
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
@@ -837,13 +838,20 @@ def _get_libc():
 
 
 def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
-	"""Release memmap pages for z-slice range [z0, z1) via madvise(DONTNEED).
+	"""Release memmap pages for z-slice range [z0, z1).
 
 	For a 4D array (C, Z, Y, X), z is axis 1. For the wsum arrays (1, Z, Y, X)
-	same layout. This frees both RAM and disk backing.
+	same layout.
+
+	madvise(DONTNEED) drops resident pages.  On Linux, if the memmap backing file
+	is still linked, fallocate(PUNCH_HOLE|KEEP_SIZE) also releases disk blocks for
+	completed bands on sparse-file-capable filesystems such as btrfs.
 	"""
 	if z1 <= z0 or not hasattr(arr, 'ctypes'):
 		return
+	page = 4096
+	aligned_offset = 0
+	aligned_length = 0
 	try:
 		libc = _get_libc()
 		# Bytes per z-slice: product of dims after z * itemsize
@@ -851,7 +859,6 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 		bytes_per_z = int(np.prod(arr.shape[2:])) * arr.shape[0] * arr.itemsize
 		offset = z0 * bytes_per_z
 		length = (z1 - z0) * bytes_per_z
-		page = 4096
 		aligned_offset = (offset // page) * page
 		aligned_end = ((offset + length + page - 1) // page) * page
 		aligned_length = aligned_end - aligned_offset
@@ -860,6 +867,28 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 		addr = ctypes.c_void_p(arr.ctypes.data + aligned_offset)
 		MADV_DONTNEED = 4
 		libc.madvise(addr, ctypes.c_size_t(aligned_length), ctypes.c_int(MADV_DONTNEED))
+	except Exception:
+		pass  # best effort — non-critical
+	try:
+		path = getattr(arr, "_lasagna_tmp_path", None)
+		if path and aligned_length > 0 and os.path.exists(path):
+			fd = os.open(path, os.O_RDWR)
+			try:
+				libc = _get_libc()
+				FALLOC_FL_KEEP_SIZE = 0x01
+				FALLOC_FL_PUNCH_HOLE = 0x02
+				ret = libc.fallocate(
+					ctypes.c_int(fd),
+					ctypes.c_int(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE),
+					ctypes.c_longlong(aligned_offset),
+					ctypes.c_longlong(aligned_length),
+				)
+				if ret != 0:
+					err = ctypes.get_errno()
+					if err not in (0, 38, 45, 95):  # ENOSYS, EOPNOTSUPP, ENOTSUP
+						print(f"[predict3d] warning: hole punch failed for {path}: errno={err}", flush=True)
+			finally:
+				os.close(fd)
 	except Exception:
 		pass  # best effort — non-critical
 
@@ -1806,16 +1835,30 @@ def _infer_tiled_3d(
 
 	# Memmap accumulators — place next to output to avoid /tmp overflow
 	def _make_memmap(suffix, shape):
-		if tmp_dir:
-			p = os.path.join(tmp_dir, f".predict3d_{suffix}.tmp")
-		else:
-			p = tempfile.mktemp(suffix=f".{suffix}")
+		fd, p = tempfile.mkstemp(
+			prefix=f".predict3d_{suffix}_",
+			suffix=".tmp",
+			dir=tmp_dir if tmp_dir else None,
+		)
+		os.close(fd)
 		mm = np.memmap(p, dtype=np.float32, mode="w+", shape=shape)
-		try:
-			os.unlink(p)
-		except OSError:
-			pass
+		mm._lasagna_tmp_path = p
+		atexit.register(lambda path=p: os.path.exists(path) and os.unlink(path))
 		return mm
+
+	def _cleanup_memmap(mm):
+		path = getattr(mm, "_lasagna_tmp_path", None)
+		try:
+			mm.flush()
+		except Exception:
+			pass
+		if path:
+			try:
+				os.unlink(path)
+			except FileNotFoundError:
+				pass
+			except OSError:
+				pass
 
 	n_other = out_channels - 1
 	acc_fine = _make_memmap("acc_fine", (1, Zo_f, Yo_f, Xo_f))
@@ -1963,6 +2006,10 @@ def _infer_tiled_3d(
 
 	# If streaming mode (callback), output was consumed incrementally
 	if on_z_complete is not None:
+		_cleanup_memmap(acc_fine)
+		_cleanup_memmap(wsum_fine)
+		_cleanup_memmap(acc_coarse)
+		_cleanup_memmap(wsum_coarse)
 		del acc_fine, wsum_fine, acc_coarse, wsum_coarse
 		return None
 

@@ -19,6 +19,14 @@ import opt_loss_dir
 import optimizer
 
 
+def _stage_start(label: str) -> float:
+	return 0.0
+
+
+def _stage_done(label: str, t0: float) -> None:
+	return None
+
+
 def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	"""Bilinear center of the model grid — matches (Hm-1)/2, (Wm-1)/2 in station loss."""
 	xyz = mdl._grid_xyz()  # (D, Hm, Wm, 3)
@@ -234,6 +242,8 @@ def main(argv: list[str] | None = None) -> int:
 	if argv is None:
 		argv = sys.argv[1:]
 
+	_t_fit_total = _stage_start("total")
+	_t = _stage_start("parse_config")
 	parser = _build_parser()
 	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv)
 	cfg_paths = [str(x) for x in cfg_paths]
@@ -260,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
 		print("[fit] skipping optional channel 'cos': data/data_plain losses are disabled", flush=True)
 	if "pred_dt" in skip_channels:
 		print("[fit] skipping optional channel 'pred_dt': pred_dt loss is disabled", flush=True)
+	_stage_done("parse_config", _t)
 
 	print("data:", data_cfg)
 	print("model:", model_cfg)
@@ -268,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
 	device = torch.device(data_cfg.device)
 
 	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
+	_t = _stage_start("probe_preprocessed_data")
 	prep_params = fit_data.get_preprocessed_params(str(data_cfg.input), skip_channels=skip_channels)
 	source_to_base = float(prep_params.get("source_to_base", 1.0))
 	# Model scaledown in base coords = channel_scaledown * source_to_base
@@ -275,8 +287,10 @@ def main(argv: list[str] | None = None) -> int:
 	volume_extent_fullres = prep_params.get("volume_extent_fullres")
 	print(f"[fit] scaledown={scaledown} (source_sd={prep_params['scaledown']} "
 		  f"source_to_base={source_to_base}) volume_extent={volume_extent_fullres}", flush=True)
+	_stage_done("probe_preprocessed_data", _t)
 
 	# --- Init from seed (new model only) ---
+	_t = _stage_start("derive_initial_model_params")
 	is_new_model = model_cfg.model_input is None
 	if is_new_model and data_cfg.seed is not None and data_cfg.model_w is not None:
 		if model_cfg.init_mode == "straight":
@@ -300,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
 
 		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
 		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
+	_stage_done("derive_initial_model_params", _t)
 
 	# --- Windowed tifxyz mode ---
 	tifxyz_init = getattr(args, "tifxyz_init", None)
@@ -379,11 +394,25 @@ def main(argv: list[str] | None = None) -> int:
 			mdl._ext_conn_offsets[ext_idx][1] = float(ew0 - w0)
 
 			# Streaming data loader for this window
-			def _load_streaming_win() -> fit_data.FitData3D:
+			def _streaming_skip_channels(needed_channels: set[str]) -> set[str]:
+				optional = {"cos", "pred_dt"}
+				return optional - set(needed_channels)
+
+			def _streaming_loaded_channels(d: fit_data.FitData3D) -> set[str]:
+				if not d.sparse_caches:
+					return set()
+				return {
+					ch
+					for cache in d.sparse_caches.values()
+					for ch in cache.channels
+				}
+
+			def _load_streaming_win(needed_channels: set[str]) -> fit_data.FitData3D:
 				d = fit_data.load_3d_streaming(
 					path=str(data_cfg.input),
 					device=device,
-					skip_channels=skip_channels,
+					sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
+					skip_channels=skip_channels | _streaming_skip_channels(needed_channels),
 				)
 				Z, Y, X = d.size
 				sx, sy, sz = d.spacing
@@ -398,7 +427,11 @@ def main(argv: list[str] | None = None) -> int:
 
 			def _ensure_data_win(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
 				if data is None:
-					return _load_streaming_win()
+					return _load_streaming_win(needed_channels)
+				loaded = _streaming_loaded_channels(data)
+				required = {"grad_mag", "nx", "ny"} | set(needed_channels)
+				if not required.issubset(loaded) or (loaded & {"cos", "pred_dt"}) != (required & {"cos", "pred_dt"}):
+					return _load_streaming_win(needed_channels)
 				return data
 
 			data = _ensure_data_win(None, set())
@@ -431,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
 				progress_fn=_make_progress(),
 				ensure_data_fn=_ensure_data_win,
 				seed_xyz=win_seed,
+				out_dir=str(Path(output_dir) / f"window_{wi:04d}"),
 			)
 
 			# Export this window's tifxyz
@@ -478,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
 		return 0
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
+	_t = _stage_start("construct_model")
 	if tifxyz_init:
 		mdl = model.Model3D.from_tifxyz(
 			tifxyz_init, device=device,
@@ -519,8 +554,10 @@ def main(argv: list[str] | None = None) -> int:
 
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"arc_enabled={mdl.arc_enabled}")
+	_stage_done("construct_model", _t)
 
 	# Load external reference surfaces
+	_t = _stage_start("load_external_surfaces")
 	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
 	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
 		from tifxyz_io import load_tifxyz
@@ -531,21 +568,38 @@ def main(argv: list[str] | None = None) -> int:
 			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
 			print(f"[fit] external surface {idx}: path={es_path} offset={es_offset} "
 				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()}", flush=True)
+	_stage_done("load_external_surfaces", _t)
 
 	# Parse correction points from config (injected by VC3D)
+	_t = _stage_start("parse_corr_points")
 	corr_points_obj = cfg.pop("corr_points", None)
 	corr_points_3d: fit_data.CorrPoints3D | None = None
 	if isinstance(corr_points_obj, dict):
 		corr_points_3d = _parse_corr_points(corr_points_obj, device)
 	else:
 		print(f"[fit] corr_points: not found in config (type={type(corr_points_obj).__name__})", flush=True)
+	_stage_done("parse_corr_points", _t)
 
 	# --- Streaming data loader ---
-	def _load_streaming() -> fit_data.FitData3D:
+	def _streaming_skip_channels(needed_channels: set[str]) -> set[str]:
+		optional = {"cos", "pred_dt"}
+		return optional - set(needed_channels)
+
+	def _streaming_loaded_channels(d: fit_data.FitData3D) -> set[str]:
+		if not d.sparse_caches:
+			return set()
+		return {
+			ch
+			for cache in d.sparse_caches.values()
+			for ch in cache.channels
+		}
+
+	def _load_streaming(needed_channels: set[str]) -> fit_data.FitData3D:
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
-			skip_channels=skip_channels,
+			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
+			skip_channels=skip_channels | _streaming_skip_channels(needed_channels),
 		)
 		Z, Y, X = d.size
 		# Volume extent covers the full zarr volume
@@ -571,11 +625,27 @@ def main(argv: list[str] | None = None) -> int:
 
 	def _ensure_data(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
 		if data is None:
-			return _load_streaming()
-		# Streaming covers full volume — no border checks or channel loading needed
+			return _load_streaming(needed_channels)
+		loaded = _streaming_loaded_channels(data)
+		required = {"grad_mag", "nx", "ny"} | set(needed_channels)
+		if not required.issubset(loaded) or (loaded & {"cos", "pred_dt"}) != (required & {"cos", "pred_dt"}):
+			d = _load_streaming(needed_channels)
+			if data.corr_points is not None:
+				d = dataclasses.replace(d, corr_points=data.corr_points)
+			if data.winding_volume is not None:
+				d = dataclasses.replace(
+					d,
+					winding_volume=data.winding_volume,
+					winding_min=data.winding_min,
+					winding_max=data.winding_max,
+				)
+			return d
+		# Streaming covers full volume — no border checks needed
 		return data
 
+	_t = _stage_start("load_data")
 	data = _ensure_data(None, set())
+	_stage_done("load_data", _t)
 
 	# Print loaded data summary
 	Z, Y, X = data.size
@@ -596,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
 			  f"mem={_data_bytes / 2**30:.2f} GiB", flush=True)
 
 	# Print initial mesh stats
+	_t = _stage_start("initial_mesh_stats")
 	with torch.no_grad():
 		xyz = mdl._grid_xyz()
 		mn = xyz.amin(dim=(0, 1, 2)).cpu().numpy().tolist()
@@ -603,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
 		mean = xyz.mean(dim=(0, 1, 2)).cpu().numpy().tolist()
 		print(f"initial mesh: mean={[round(v, 1) for v in mean]} "
 			  f"min={[round(v, 1) for v in mn]} max={[round(v, 1) for v in mx]}")
+	_stage_done("initial_mesh_stats", _t)
 
 	def _save_model(path: str) -> None:
 		if mdl.arc_enabled:
@@ -643,6 +715,7 @@ def main(argv: list[str] | None = None) -> int:
 	opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
 
 	# Run optimization
+	_t = _stage_start("prepare_optimization")
 	seed_xyz = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
 	# tifxyz init: always use model grid center as seed (overrides CLI seed)
 	if tifxyz_init:
@@ -656,6 +729,8 @@ def main(argv: list[str] | None = None) -> int:
 		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] checkpoint seed (grid center): ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
+	_stage_done("prepare_optimization", _t)
+	_t = _stage_start("optimizer")
 	optimizer.optimize(
 		model=mdl,
 		data=data,
@@ -665,7 +740,9 @@ def main(argv: list[str] | None = None) -> int:
 		progress_fn=_progress,
 		ensure_data_fn=_ensure_data,
 		seed_xyz=seed_xyz,
+		out_dir=_out_dir,
 	)
+	_stage_done("optimizer", _t)
 
 	if device.type == "cuda":
 		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
@@ -673,20 +750,25 @@ def main(argv: list[str] | None = None) -> int:
 
 	# Save final model
 	if model_cfg.model_output is not None:
+		_t = _stage_start("save_model_output")
 		_save_model(str(model_cfg.model_output))
 		print(f"[fit] saved model to {model_cfg.model_output}")
+		_stage_done("save_model_output", _t)
 
 	# Save snapshot
 	if _out_dir is not None:
+		_t = _stage_start("save_final_snapshot")
 		out = Path(_out_dir)
 		out.mkdir(parents=True, exist_ok=True)
 		_save_model(str(out / "model_final.pt"))
+		_stage_done("save_final_snapshot", _t)
 
 	# Export tifxyz
 	model_out = model_cfg.model_output
 	if model_out is None and _out_dir is not None:
 		model_out = str(Path(_out_dir) / "model_final.pt")
 	if model_out is not None and _out_dir is not None:
+		_t = _stage_start("export_tifxyz")
 		import fit2tifxyz
 		export_dir = str(Path(_out_dir) / "tifxyz")
 		tifxyz_argv = ["--input", str(model_out), "--output", export_dir]
@@ -694,7 +776,9 @@ def main(argv: list[str] | None = None) -> int:
 		if voxel_size_um is not None:
 			tifxyz_argv += ["--voxel-size-um", str(float(voxel_size_um))]
 		fit2tifxyz.main(tifxyz_argv)
+		_stage_done("export_tifxyz", _t)
 
+	_stage_done("total", _t_fit_total)
 	return 0
 
 

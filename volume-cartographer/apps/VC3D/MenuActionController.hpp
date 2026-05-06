@@ -29,7 +29,6 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
-    void loadAttachedRemoteVolumesForCurrentPackage();
 
 private slots:
     void newProject();
@@ -64,7 +63,7 @@ private:
     QStringList loadRecentRemoteUrls() const;
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
-    void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
+    void attachRemoteZarrUrl(const QString& url);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
                               bool allowPrompt,
@@ -76,10 +75,6 @@ private:
     QString remoteCacheDirectory(bool allowPrompt);
     QString configuredRemoteCacheDirectory() const;
     QString suggestedRemoteCacheDirectory() const;
-    QString remoteVolumeRegistryCacheRoot() const;
-    void persistRemoteVolumeRegistryCacheRoot(const QString& cacheRoot);
-    QString remoteVolumeRegistryPath() const;
-    void persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume);
     QString promptLocation(const QString& title,
                            const QString& hint,
                            const QString& defaultDir,

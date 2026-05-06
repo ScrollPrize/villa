@@ -72,7 +72,7 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 
 		# Flatten strip into W for grid_sample
 		strip_flat = strip.reshape(D_, H_, W_ * strip_samples, 3)
-		sampled = res.data.grid_sample_fullres(strip_flat)
+		sampled = res.data.grid_sample_fullres(strip_flat, channels={"grad_mag"})
 		mag = sampled.grad_mag.squeeze(0).squeeze(0)  # (D, H, W*S)
 		mag = mag.reshape(D_, H_, W_, strip_samples)
 
@@ -240,7 +240,7 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
 			strip = ext_P_up.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
 			strip_flat = strip.reshape(D, He, We * strip_samples, 3)
-			sampled = res.data.grid_sample_fullres(strip_flat)
+			sampled = res.data.grid_sample_fullres(strip_flat, channels={"grad_mag"})
 			mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, He, We, strip_samples)
 			mean_mag = mag.mean(dim=-1).clamp(min=1e-4)
 
@@ -263,7 +263,7 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 
 			# Proxy normal: GT sampled at upsampled ext positions, or ext_N
 			if EXT_OFFSET_USE_GT_NORMALS:
-				gt_n = res.data.grid_sample_fullres(ext_P_up).normal_3d
+				gt_n = res.data.grid_sample_fullres(ext_P_up, channels={"nx", "ny"}).normal_3d
 				dot = (gt_n * ext_N_up).sum(dim=-1, keepdim=True)
 				proxy_n = torch.where(dot >= 0, gt_n, -gt_n)
 			else:
