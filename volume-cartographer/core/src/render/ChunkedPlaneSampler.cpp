@@ -266,6 +266,46 @@ bool collectPointDependencies(IChunkedArray& array,
     return ok;
 }
 
+bool collectLevelPointDependencies(IChunkedArray& array,
+                                   const LevelAccess& access,
+                                   int level,
+                                   const cv::Vec3f& p,
+                                   vc::Sampling sampling,
+                                   std::unordered_set<ChunkKey, ChunkKeyHash>& keys)
+{
+    if (!finiteCoord(p))
+        return true;
+
+    const auto& shape = access.shape;
+    const float x = p[0], y = p[1], z = p[2];
+    if (!inLevelBounds(shape, z, y, x))
+        return true;
+
+    if (sampling == vc::Sampling::Nearest) {
+        int ix = int(x + 0.5f);
+        int iy = int(y + 0.5f);
+        int iz = int(z + 0.5f);
+        ix = std::clamp(ix, 0, shape[2] - 1);
+        iy = std::clamp(iy, 0, shape[1] - 1);
+        iz = std::clamp(iz, 0, shape[0] - 1);
+        return addVoxelDependency(array, access, level, iz, iy, ix, keys);
+    }
+
+    const int ix = int(std::floor(x));
+    const int iy = int(std::floor(y));
+    const int iz = int(std::floor(z));
+    bool ok = true;
+    ok = addVoxelDependency(array, access, level, iz,     iy,     ix,     keys) && ok;
+    ok = addVoxelDependency(array, access, level, iz,     iy,     ix + 1, keys) && ok;
+    ok = addVoxelDependency(array, access, level, iz,     iy + 1, ix,     keys) && ok;
+    ok = addVoxelDependency(array, access, level, iz,     iy + 1, ix + 1, keys) && ok;
+    ok = addVoxelDependency(array, access, level, iz + 1, iy,     ix,     keys) && ok;
+    ok = addVoxelDependency(array, access, level, iz + 1, iy,     ix + 1, keys) && ok;
+    ok = addVoxelDependency(array, access, level, iz + 1, iy + 1, ix,     keys) && ok;
+    ok = addVoxelDependency(array, access, level, iz + 1, iy + 1, ix + 1, keys) && ok;
+    return ok;
+}
+
 void requestDependencies(LocalChunkCache& cache,
                          const std::unordered_set<ChunkKey, ChunkKeyHash>& keys,
                          ChunkedPlaneSampler::Stats& stats)
@@ -498,6 +538,7 @@ std::vector<ChunkKey> ChunkedPlaneSampler::collectPlaneDependencies(
         return result;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     const int tile = std::max(1, options.tileSize);
     std::unordered_set<ChunkKey, ChunkKeyHash> keys;
     keys.reserve(std::size_t(coverage.rows / tile + 2) *
@@ -508,12 +549,13 @@ std::vector<ChunkKey> ChunkedPlaneSampler::collectPlaneDependencies(
             const int xEnd = std::min(tx + tile, coverage.cols);
             for (int y = ty; y < yEnd; ++y) {
                 const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                const cv::Vec3f rowBase = origin + vyStep * float(y);
+                const cv::Vec3f rowBase = levelPlane.origin + levelPlane.vyStep * float(y);
                 for (int x = tx; x < xEnd; ++x) {
                     if (coverageRow[x])
                         continue;
-                    (void)collectPointDependencies(array, access, level, rowBase + vxStep * float(x),
-                                                   options.sampling, false, keys);
+                    (void)collectLevelPointDependencies(
+                        array, access, level, rowBase + levelPlane.vxStep * float(x),
+                        options.sampling, keys);
                 }
             }
         }
@@ -579,6 +621,7 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     LocalChunkCache chunkCache(array, 64);
     const int tile = std::max(1, options.tileSize);
     std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
@@ -590,12 +633,13 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
             tileKeys.clear();
             for (int y = ty; y < yEnd; ++y) {
                 const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                const cv::Vec3f rowBase = origin + vyStep * float(y);
+                const cv::Vec3f rowBase = levelPlane.origin + levelPlane.vyStep * float(y);
                 for (int x = tx; x < xEnd; ++x) {
                     if (coverageRow[x])
                         continue;
-                    (void)collectPointDependencies(array, access, level, rowBase + vxStep * float(x),
-                                                   options.sampling, false, tileKeys);
+                    (void)collectLevelPointDependencies(
+                        array, access, level, rowBase + levelPlane.vxStep * float(x),
+                        options.sampling, tileKeys);
                 }
             }
             requestDependencies(chunkCache, tileKeys, stats);
