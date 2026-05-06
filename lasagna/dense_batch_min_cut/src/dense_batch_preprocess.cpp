@@ -2864,15 +2864,43 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
 
         {
             const TimingMark grid_carrier_seed_timing = start_timing();
+            struct GridCarrierCandidate {
+                float capacity = 0.0f;
+                float source_flow = 0.0f;
+            };
+            std::vector<GridCarrierCandidate> grid_candidates(
+                static_cast<std::size_t>(grid_cols * grid_rows));
+            cv::parallel_for_(cv::Range(0, grid_rows),
+                              [&](const cv::Range& range) {
+                for (int gy = range.start; gy < range.end; ++gy) {
+                    for (int gx = 0; gx < grid_cols; ++gx) {
+                        const cv::Point pixel(grid_xs[gx], grid_ys[gy]);
+                        const std::size_t index =
+                            static_cast<std::size_t>(gy * grid_cols + gx);
+                        if (!in_white_domain(pixel)) {
+                            continue;
+                        }
+                        const float grid_capacity =
+                            capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
+                        if (grid_capacity <= 0.0f) {
+                            continue;
+                        }
+                        const float source_flow = std::min(
+                            graph_seed_near_grid_point(pixel), grid_capacity);
+                        grid_candidates[index] = {grid_capacity, source_flow};
+                    }
+                }
+            });
             for (int gy = 0; gy < grid_rows; ++gy) {
                 for (int gx = 0; gx < grid_cols; ++gx) {
                     const cv::Point pixel(grid_xs[gx], grid_ys[gy]);
-                    const float grid_capacity =
-                        capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
-                    const float source_flow = std::min(
-                        graph_seed_near_grid_point(pixel), grid_capacity);
-                    const int id = add_carrier(pixel, grid_capacity, source_flow,
-                                               true, source_flow > 0.0f);
+                    const GridCarrierCandidate candidate =
+                        grid_candidates[static_cast<std::size_t>(
+                            gy * grid_cols + gx)];
+                    const int id = add_carrier(pixel, candidate.capacity,
+                                               candidate.source_flow,
+                                               true,
+                                               candidate.source_flow > 0.0f);
                     grid_node_ids[static_cast<std::size_t>(gy * grid_cols + gx)] =
                         id;
                 }
@@ -2887,15 +2915,12 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
 
         std::vector<std::vector<CarrierNeighbor>> carrier_edges(
             carriers.size());
-        const auto add_carrier_edge = [&](const int a, const int b) {
+        const auto append_carrier_edge = [&](const int a, const int b) {
             if (a < 0 || b < 0 || a == b) {
                 return;
             }
             const cv::Point pa = carriers[a].pixel;
             const cv::Point pb = carriers[b].pixel;
-            if (!line_in_white(pa, pb)) {
-                return;
-            }
             const float distance = step_distance(pa, pb) *
                                    cv::norm(cv::Point2f(
                                        static_cast<float>(pa.x - pb.x),
@@ -2916,23 +2941,38 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 carrier_edges[b].push_back({a, distance});
             }
         };
+        const auto add_carrier_edge = [&](const int a, const int b) {
+            if (a < 0 || b < 0 || a == b) {
+                return;
+            }
+            if (!line_in_white(carriers[a].pixel, carriers[b].pixel)) {
+                return;
+            }
+            append_carrier_edge(a, b);
+        };
 
         {
             const TimingMark grid_edges_timing = start_timing();
-            for (int gy = 0; gy < grid_rows; ++gy) {
-                for (int gx = 0; gx < grid_cols; ++gx) {
-                    const int a = grid_node_ids[static_cast<std::size_t>(
-                        gy * grid_cols + gx)];
-                    if (a < 0) {
-                        continue;
-                    }
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            if (dx == 0 && dy == 0) {
-                                continue;
-                            }
-                            const int nx = gx + dx;
-                            const int ny = gy + dy;
+            const std::array<cv::Point, 4> kForwardGridDirs = {
+                cv::Point(1, -1), cv::Point(1, 0), cv::Point(1, 1),
+                cv::Point(0, 1)};
+            std::vector<std::vector<std::pair<int, int>>> row_edge_pairs(
+                static_cast<std::size_t>(grid_rows));
+            cv::parallel_for_(cv::Range(0, grid_rows),
+                              [&](const cv::Range& range) {
+                for (int gy = range.start; gy < range.end; ++gy) {
+                    std::vector<std::pair<int, int>>& pairs =
+                        row_edge_pairs[static_cast<std::size_t>(gy)];
+                    pairs.reserve(static_cast<std::size_t>(grid_cols * 4));
+                    for (int gx = 0; gx < grid_cols; ++gx) {
+                        const int a = grid_node_ids[static_cast<std::size_t>(
+                            gy * grid_cols + gx)];
+                        if (a < 0) {
+                            continue;
+                        }
+                        for (const cv::Point dir : kForwardGridDirs) {
+                            const int nx = gx + dir.x;
+                            const int ny = gy + dir.y;
                             if (nx < 0 || nx >= grid_cols || ny < 0 ||
                                 ny >= grid_rows) {
                                 continue;
@@ -2940,11 +2980,21 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                             const int b =
                                 grid_node_ids[static_cast<std::size_t>(
                                     ny * grid_cols + nx)];
-                            if (b >= 0) {
-                                add_carrier_edge(a, b);
+                            if (b < 0) {
+                                continue;
+                            }
+                            if (line_in_white(carriers[a].pixel,
+                                              carriers[b].pixel)) {
+                                pairs.push_back({a, b});
                             }
                         }
                     }
+                }
+            });
+            for (const std::vector<std::pair<int, int>>& pairs :
+                 row_edge_pairs) {
+                for (const auto [a, b] : pairs) {
+                    append_carrier_edge(a, b);
                 }
             }
             result.timings.push_back(
