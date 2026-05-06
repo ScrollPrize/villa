@@ -340,19 +340,19 @@ void SurfaceRotationOverlayController::attachViewer(VolumeViewerBase* viewer)
 
 void SurfaceRotationOverlayController::detachViewer(VolumeViewerBase* viewer)
 {
-    auto it = std::remove_if(_viewers.begin(), _viewers.end(), [viewer](ViewerEntry& entry) {
-        if (entry.viewer != viewer) {
-            return false;
+    for (auto it = _viewers.begin(); it != _viewers.end();) {
+        if (it->viewer != viewer) {
+            ++it;
+            continue;
         }
-        QObject::disconnect(entry.overlaysUpdatedConn);
-        QObject::disconnect(entry.destroyedConn);
-        if (entry.viewer) {
-            entry.viewer->clearOverlayGroup(kOverlayGroupKey);
+        QObject::disconnect(it->overlaysUpdatedConn);
+        QObject::disconnect(it->destroyedConn);
+        if (it->viewer) {
+            it->viewer->clearOverlayGroup(kOverlayGroupKey);
         }
-        entry.proxy = nullptr;
-        return true;
-    });
-    _viewers.erase(it, _viewers.end());
+        it->proxy = nullptr;
+        it = _viewers.erase(it);
+    }
 }
 
 VolumeViewerBase* SurfaceRotationOverlayController::targetViewer() const
