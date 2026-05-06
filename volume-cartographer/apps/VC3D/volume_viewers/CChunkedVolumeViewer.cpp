@@ -17,6 +17,7 @@
 #include <QApplication>
 #include <QCursor>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QGraphicsEllipseItem>
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
@@ -679,6 +680,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
 {
+    quiesceForClose();
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -688,6 +690,50 @@ CChunkedVolumeViewer::~CChunkedVolumeViewer()
         _overlayChunkCbId = 0;
     }
     clearIntersectionItems();
+}
+
+bool CChunkedVolumeViewer::eventFilter(QObject* watched, QEvent* event)
+{
+    if (event && event->type() == QEvent::Close && watched == parentWidget()) {
+        quiesceForClose();
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void CChunkedVolumeViewer::quiesceForClose()
+{
+    if (_closing) {
+        return;
+    }
+    _closing = true;
+
+    if (_viewerManager) {
+        _viewerManager->unregisterViewer(this);
+    }
+
+    if (_renderTimer)
+        _renderTimer->stop();
+    if (_settleRenderTimer)
+        _settleRenderTimer->stop();
+    if (_intersectionRenderTimer)
+        _intersectionRenderTimer->stop();
+    if (_resizeRenderTimer)
+        _resizeRenderTimer->stop();
+    if (_statusTimer)
+        _statusTimer->stop();
+
+    _renderPending = false;
+    _renderPendingAfterWorker = false;
+    ++_renderSerial;
+
+    if (_chunkCbId != 0 && _chunkArray) {
+        _chunkArray->removeChunkReadyListener(_chunkCbId);
+        _chunkCbId = 0;
+    }
+    if (_overlayChunkCbId != 0 && _overlayChunkArray) {
+        _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
+        _overlayChunkCbId = 0;
+    }
 }
 
 void CChunkedVolumeViewer::reloadPerfSettings()
@@ -703,6 +749,9 @@ void CChunkedVolumeViewer::reloadPerfSettings()
 
 void CChunkedVolumeViewer::setSurface(const std::string& name)
 {
+    if (_closing) {
+        return;
+    }
     _surfName = name;
     if (_state)
         onSurfaceChanged(name, _state->surface(name));
@@ -745,7 +794,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
             if (!guard)
                 return;
             auto volume = volumeWeak.lock();
-            if (!volume || guard->_volume != volume)
+            if (!volume || guard->_volume != volume || guard->_closing)
                 return;
             if (guard->_interactivePreview) {
                 if (guard->_settleRenderTimer)
@@ -759,6 +808,9 @@ void CChunkedVolumeViewer::rebuildChunkArray()
 
 void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 {
+    if (_closing) {
+        return;
+    }
     invalidateIntersect();
     if (_surfWeak.lock() == _defaultSurface) {
         _surfWeak.reset();
@@ -801,6 +853,9 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
 void CChunkedVolumeViewer::invalidateVis()
 {
+    if (_closing) {
+        return;
+    }
     _genCacheDirty = true;
     _stableFramebufferValid = false;
     _surfaceChunkPrefetchCache = {};
@@ -843,6 +898,9 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                             const std::shared_ptr<Surface>& surf,
                                             bool isEditUpdate)
 {
+    if (_closing) {
+        return;
+    }
     const bool isCurrentSurface = (_surfName == name);
     const auto previousSurface = _surfWeak.lock();
     const bool isSameCurrentSurface = isCurrentSurface && previousSurface && previousSurface == surf;
@@ -916,6 +974,9 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
 
 void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std::shared_ptr<Surface>& surf)
 {
+    if (_closing) {
+        return;
+    }
     auto current = _surfWeak.lock();
     if (current && current == surf)
         _surfWeak.reset();
@@ -923,6 +984,9 @@ void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std:
 
 void CChunkedVolumeViewer::onVolumeClosing()
 {
+    if (_closing) {
+        return;
+    }
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -935,6 +999,9 @@ void CChunkedVolumeViewer::onVolumeClosing()
 
 void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
 {
+    if (_closing) {
+        return;
+    }
     if (name != "focus" || !poi)
         return;
 
@@ -1032,6 +1099,9 @@ void CChunkedVolumeViewer::resizeFramebuffer()
 
 void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_location caller)
 {
+    if (_closing) {
+        return;
+    }
     if (ProfileLoggingEnabled()) {
         _pendingRenderReason = reason ? reason : "";
         _pendingRenderCaller = profileCaller(caller);
@@ -1068,6 +1138,9 @@ void CChunkedVolumeViewer::requestRender(const char* reason, std::source_locatio
 
 void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::source_location caller)
 {
+    if (_closing) {
+        return;
+    }
     if (ProfileLoggingEnabled()) {
         _pendingIntersectionReason = reason ? reason : "";
         _pendingIntersectionCaller = profileCaller(caller);
@@ -1478,163 +1551,6 @@ bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
            _compositeSettings.postRakingEnabled ||
            _compositeSettings.postRemoveSmallComponents ||
            _compositeSettings.useVolumeGradients;
-}
-
-void CChunkedVolumeViewer::samplePlaneIntoValues(
-    const cv::Vec3f& origin,
-    const cv::Vec3f& vxStep,
-    const cv::Vec3f& vyStep,
-    const cv::Vec3f& normal,
-    int startLevel,
-    const vc::render::ChunkedPlaneSampler::Options& options,
-    cv::Mat_<uint8_t>& values,
-    cv::Mat_<uint8_t>& coverage)
-{
-    const bool wantComposite = _compositeSettings.planeEnabled && !streamingCompositeUnsupported();
-    if (!wantComposite) {
-        if (_interactivePreview) {
-            vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
-                *_chunkArray, startLevel, origin, vxStep, vyStep, values, coverage, options);
-        } else {
-            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                *_chunkArray, startLevel, origin, vxStep, vyStep, values, coverage, options);
-        }
-        return;
-    }
-
-    const int front = std::max(0, _compositeSettings.planeLayersFront);
-    const int behind = std::max(0, _compositeSettings.planeLayersBehind);
-    const int numLayers = front + behind + 1;
-    const int zStart = -behind;
-    const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
-    const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
-
-    std::vector<cv::Mat_<uint8_t>> layerValues;
-    std::vector<cv::Mat_<uint8_t>> layerCoverage;
-    layerValues.reserve(numLayers);
-    layerCoverage.reserve(numLayers);
-    for (int i = 0; i < numLayers; ++i) {
-        layerValues.emplace_back(values.rows, values.cols, uint8_t(0));
-        layerCoverage.emplace_back(values.rows, values.cols, uint8_t(0));
-        const cv::Vec3f layerOrigin = origin + normal * (float(zStart + i) * zStep);
-        if (_interactivePreview) {
-            vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
-                *_chunkArray, startLevel, layerOrigin, vxStep, vyStep,
-                layerValues.back(), layerCoverage.back(), compositeOptions);
-        } else {
-            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                *_chunkArray, startLevel, layerOrigin, vxStep, vyStep,
-                layerValues.back(), layerCoverage.back(), compositeOptions);
-        }
-    }
-
-    LayerStack stack;
-    stack.values.resize(numLayers);
-    for (int y = 0; y < values.rows; ++y) {
-        auto* dst = values.ptr<uint8_t>(y);
-        auto* cov = coverage.ptr<uint8_t>(y);
-        for (int x = 0; x < values.cols; ++x) {
-            stack.validCount = 0;
-            for (int i = 0; i < numLayers; ++i) {
-                if (!layerCoverage[i](y, x))
-                    continue;
-                const float value = static_cast<float>(layerValues[i](y, x));
-                if (value < static_cast<float>(_compositeSettings.params.isoCutoff))
-                    continue;
-                stack.values[stack.validCount++] = value;
-            }
-            if (stack.validCount > 0) {
-                dst[x] = static_cast<uint8_t>(std::clamp(
-                    compositeLayerStack(stack, _compositeSettings.params), 0.0f, 255.0f));
-                cov[x] = 1;
-            }
-        }
-    }
-}
-
-void CChunkedVolumeViewer::sampleCoordsIntoValues(
-    const cv::Mat_<cv::Vec3f>& coords,
-    const cv::Mat_<cv::Vec3f>& normals,
-    int startLevel,
-    const vc::render::ChunkedPlaneSampler::Options& options,
-    cv::Mat_<uint8_t>& values,
-    cv::Mat_<uint8_t>& coverage)
-{
-    const bool wantComposite = _compositeSettings.enabled &&
-                               !streamingCompositeUnsupported() &&
-                               !normals.empty();
-    if (!wantComposite) {
-        if (_interactivePreview) {
-            vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-                *_chunkArray, startLevel, coords, values, coverage, options);
-        } else {
-            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                *_chunkArray, startLevel, coords, values, coverage, options);
-        }
-        return;
-    }
-
-    const int front = std::max(0, _compositeSettings.layersFront);
-    const int behind = std::max(0, _compositeSettings.layersBehind);
-    const int numLayers = front + behind + 1;
-    const int zStart = -behind;
-    const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
-    const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
-
-    std::vector<cv::Mat_<uint8_t>> layerValues;
-    std::vector<cv::Mat_<uint8_t>> layerCoverage;
-    layerValues.reserve(numLayers);
-    layerCoverage.reserve(numLayers);
-    cv::Mat_<cv::Vec3f> layerCoords(coords.rows, coords.cols);
-    for (int i = 0; i < numLayers; ++i) {
-        const float offset = float(zStart + i) * zStep;
-        for (int y = 0; y < coords.rows; ++y) {
-            const auto* src = coords.ptr<cv::Vec3f>(y);
-            const auto* nrow = normals.ptr<cv::Vec3f>(y);
-            auto* dst = layerCoords.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < coords.cols; ++x) {
-                if (!std::isfinite(src[x][0]) || src[x][0] == -1.0f) {
-                    dst[x] = src[x];
-                } else {
-                    dst[x] = src[x] + nrow[x] * offset;
-                }
-            }
-        }
-        layerValues.emplace_back(values.rows, values.cols, uint8_t(0));
-        layerCoverage.emplace_back(values.rows, values.cols, uint8_t(0));
-        if (_interactivePreview) {
-            vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-                *_chunkArray, startLevel, layerCoords,
-                layerValues.back(), layerCoverage.back(), compositeOptions);
-        } else {
-            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                *_chunkArray, startLevel, layerCoords,
-                layerValues.back(), layerCoverage.back(), compositeOptions);
-        }
-    }
-
-    LayerStack stack;
-    stack.values.resize(numLayers);
-    for (int y = 0; y < values.rows; ++y) {
-        auto* dst = values.ptr<uint8_t>(y);
-        auto* cov = coverage.ptr<uint8_t>(y);
-        for (int x = 0; x < values.cols; ++x) {
-            stack.validCount = 0;
-            for (int i = 0; i < numLayers; ++i) {
-                if (!layerCoverage[i](y, x))
-                    continue;
-                const float value = static_cast<float>(layerValues[i](y, x));
-                if (value < static_cast<float>(_compositeSettings.params.isoCutoff))
-                    continue;
-                stack.values[stack.validCount++] = value;
-            }
-            if (stack.validCount > 0) {
-                dst[x] = static_cast<uint8_t>(std::clamp(
-                    compositeLayerStack(stack, _compositeSettings.params), 0.0f, 255.0f));
-                cov[x] = 1;
-            }
-        }
-    }
 }
 
 void CChunkedVolumeViewer::prefetchPlaneHalo(
@@ -2347,6 +2263,11 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
             _surfName, bool(_volume), bool(_chunkArray),
             _renderWorkerBusy.load(std::memory_order_acquire)));
     }
+    if (_closing) {
+        profile.setDetails("action=skip closing");
+        return;
+    }
+
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_chunkArray) {
         profile.setDetails("action=skip missing_input");
@@ -2430,6 +2351,10 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             _renderPendingAfterWorker));
     }
     _renderWorkerBusy.store(false, std::memory_order_release);
+    if (_closing) {
+        profile.setDetails("action=drop_closing");
+        return;
+    }
     if (!result || result->serial != _renderSerial) {
         if (_renderPendingAfterWorker) {
             _renderPendingAfterWorker = false;
@@ -2488,90 +2413,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     }
 }
 
-void CChunkedVolumeViewer::renderOverlayVolumeForPlane(
-    const cv::Vec3f& origin,
-    const cv::Vec3f& vxStep,
-    const cv::Vec3f& vyStep,
-    int startLevel,
-    const vc::render::ChunkedPlaneSampler::Options& options,
-    cv::Mat_<uint8_t>& overlayValues,
-    cv::Mat_<uint8_t>& overlayCoverage)
-{
-    ProfileScope profile("renderOverlayVolumeForPlane",
-                         "overlay plane render",
-                         std::source_location::current());
-    if (profile.enabled()) {
-        profile.setDetails(std::format(
-            "surf='{}' startLevel={} origin={} vxStep={} vyStep={}",
-            _surfName, startLevel, profileVec3(origin),
-            profileVec3(vxStep), profileVec3(vyStep)));
-    }
-    if (!_overlayVolume || !_overlayChunkArray || _overlayOpacity <= 0.0f ||
-        _coverage.empty() || _overlayChunkArray->numLevels() <= 0) {
-        profile.setDetails("action=skip missing_overlay");
-        return;
-    }
-
-    overlayValues.create(_coverage.rows, _coverage.cols);
-    overlayCoverage.create(_coverage.rows, _coverage.cols);
-    overlayValues.setTo(0);
-    overlayCoverage.setTo(0);
-    const int level = std::clamp(startLevel, 0, _overlayChunkArray->numLevels() - 1);
-    if (_interactivePreview) {
-        vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
-            *_overlayChunkArray, level, origin, vxStep, vyStep,
-            overlayValues, overlayCoverage, options);
-    } else {
-        vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-            *_overlayChunkArray, level, origin, vxStep, vyStep,
-            overlayValues, overlayCoverage, options);
-    }
-    if (profile.enabled()) {
-        profile.setDetails(std::format("action=rendered level={} size={}x{} interactive={}",
-                                       level, overlayValues.cols, overlayValues.rows,
-                                       _interactivePreview));
-    }
-}
-
-void CChunkedVolumeViewer::renderOverlayVolumeForCoords(
-    const cv::Mat_<cv::Vec3f>& coords,
-    int startLevel,
-    const vc::render::ChunkedPlaneSampler::Options& options,
-    cv::Mat_<uint8_t>& overlayValues,
-    cv::Mat_<uint8_t>& overlayCoverage)
-{
-    ProfileScope profile("renderOverlayVolumeForCoords",
-                         "overlay coords render",
-                         std::source_location::current());
-    if (profile.enabled()) {
-        profile.setDetails(std::format("surf='{}' startLevel={} coords={}x{}",
-                                       _surfName, startLevel, coords.cols, coords.rows));
-    }
-    if (!_overlayVolume || !_overlayChunkArray || _overlayOpacity <= 0.0f ||
-        _coverage.empty() || coords.empty() || _overlayChunkArray->numLevels() <= 0) {
-        profile.setDetails("action=skip missing_overlay_or_coords");
-        return;
-    }
-
-    overlayValues.create(_coverage.rows, _coverage.cols);
-    overlayCoverage.create(_coverage.rows, _coverage.cols);
-    overlayValues.setTo(0);
-    overlayCoverage.setTo(0);
-    const int level = std::clamp(startLevel, 0, _overlayChunkArray->numLevels() - 1);
-    if (_interactivePreview) {
-        vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-            *_overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
-    } else {
-        vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-            *_overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
-    }
-    if (profile.enabled()) {
-        profile.setDetails(std::format("action=rendered level={} size={}x{} interactive={}",
-                                       level, overlayValues.cols, overlayValues.rows,
-                                       _interactivePreview));
-    }
-}
-
 void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::source_location caller)
 {
     ProfileScope profile("renderVisible", reason, caller);
@@ -2579,6 +2420,10 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
         profile.setDetails(std::format(
             "surf='{}' force={} pending={} interactive={} scale={:.4f} zOff={:.3f}",
             _surfName, force, _renderPending, _interactivePreview, _scale, _zOff));
+    }
+    if (_closing) {
+        profile.setDetails("action=skip closing");
+        return;
     }
     if (!force) {
         scheduleRender("renderVisible non-force", caller);
@@ -2595,6 +2440,9 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
 
 void CChunkedVolumeViewer::setVolumeWindow(float low, float high)
 {
+    if (_closing) {
+        return;
+    }
     const float clampedLow = std::clamp(low, 0.0f, 255.0f);
     float clampedHigh = std::clamp(high, 0.0f, 255.0f);
     if (clampedHigh <= clampedLow)
@@ -2609,6 +2457,9 @@ void CChunkedVolumeViewer::setVolumeWindow(float low, float high)
 
 void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
 {
+    if (_closing) {
+        return;
+    }
     if (_overlayChunkCbId != 0 && _overlayChunkArray) {
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;
@@ -2629,7 +2480,7 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                     if (!guard)
                         return;
                     auto volume = overlayVolumeWeak.lock();
-                    if (!volume || guard->_overlayVolume != volume)
+                    if (!volume || guard->_overlayVolume != volume || guard->_closing)
                         return;
                     if (guard->_interactivePreview) {
                         if (guard->_settleRenderTimer)
@@ -2646,23 +2497,35 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
 
 void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
 {
+    if (_closing) {
+        return;
+    }
     _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
     scheduleRender("overlay opacity changed");
 }
 
 void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
 {
+    if (_closing) {
+        return;
+    }
     _overlayColormapId = colormapId;
     scheduleRender("overlay colormap changed");
 }
 
 void CChunkedVolumeViewer::setOverlayThreshold(float threshold)
 {
+    if (_closing) {
+        return;
+    }
     setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
 }
 
 void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
 {
+    if (_closing) {
+        return;
+    }
     _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
     _overlayWindowHigh = std::clamp(high, _overlayWindowLow + 1.0f, 255.0f);
     scheduleRender("overlay window changed");
@@ -2870,6 +2733,9 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
 
 void CChunkedVolumeViewer::onResized()
 {
+    if (_closing) {
+        return;
+    }
     resizeFramebuffer();
     _genCacheDirty = true;
     if (_renderTimer && _renderTimer->isActive())
@@ -3383,6 +3249,9 @@ void CChunkedVolumeViewer::clearSelections()
 
 void CChunkedVolumeViewer::invalidateIntersect(const std::string& name)
 {
+    if (_closing) {
+        return;
+    }
     if (_segmentationEditActive && name == "segmentation" &&
         dynamic_cast<PlaneSurface*>(currentSurface())) {
         _lastIntersectFp = {};
@@ -3934,6 +3803,11 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                   : std::string("[]"),
             _scale, _zOff));
     }
+    if (_closing) {
+        profile.setDetails("action=skip closing");
+        return;
+    }
+
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
     if (!surf || !_state || !_viewerManager || !_scene || !_view) {
@@ -4249,6 +4123,9 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
 
 void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
 {
+    if (_closing) {
+        return;
+    }
     _highlightedSurfaceIds.clear();
     for (const auto& id : ids)
         _highlightedSurfaceIds.insert(id);
