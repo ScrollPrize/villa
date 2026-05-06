@@ -1009,81 +1009,51 @@ void run_generate(const po::variables_map& vm) {
                 }
 
                 if (!assembled_slices.empty()) {
-                    std::array<size_t, 3> slab_shape;
-                    std::array<int, 3> slab_offset;
-                    switch (dir) {
-                    case SliceDirection::XY:
-                        slab_shape = {source_chunk_shape[0], shape[1], shape[2]};
-                        slab_offset = {
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[0]),
-                            0,
-                            0,
-                        };
-                        break;
-                    case SliceDirection::XZ:
-                        slab_shape = {shape[0], source_chunk_shape[1], shape[2]};
-                        slab_offset = {
-                            0,
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[1]),
-                            0,
-                        };
-                        break;
-                    case SliceDirection::YZ:
-                        slab_shape = {shape[0], shape[1], source_chunk_shape[2]};
-                        slab_offset = {
-                            0,
-                            0,
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[2]),
-                        };
-                        break;
-                    }
-                    // Clip slab to actual volume extents so we do not read past the end.
-                    for (int axis = 0; axis < 3; ++axis) {
-                        const size_t end = static_cast<size_t>(slab_offset[axis]) + slab_shape[axis];
-                        if (end > shape[axis]) {
-                            slab_shape[axis] = shape[axis] - static_cast<size_t>(slab_offset[axis]);
-                        }
+                    std::vector<vc::core::util::BinarySliceTarget> targets;
+                    targets.reserve(assembled_slices.size());
+                    for (auto& assembled : assembled_slices) {
+                        targets.push_back(vc::core::util::BinarySliceTarget{
+                            &assembled.binarySlice,
+                            static_cast<int>(assembled.localSliceIndex),
+                            false});
                     }
 
+                    const std::array<int, 3> volume_shape_i = {
+                        static_cast<int>(shape[0]),
+                        static_cast<int>(shape[1]),
+                        static_cast<int>(shape[2]),
+                    };
+                    const std::array<int, 3> source_chunk_shape_i = {
+                        static_cast<int>(source_chunk_shape[0]),
+                        static_cast<int>(source_chunk_shape[1]),
+                        static_cast<int>(source_chunk_shape[2]),
+                    };
+
                     const auto read_start = std::chrono::steady_clock::now();
-                    Array3D<uint8_t> chunk_data(slab_shape);
-                    input_volume.readZYX(chunk_data, slab_offset, input_level);
+                    vc::core::util::fillBinarySliceBatchFromVolume(
+                        input_volume,
+                        input_level,
+                        to_normal_grid_direction(dir),
+                        static_cast<int>(source_chunk_plan.sourceChunkIndex),
+                        volume_shape_i,
+                        source_chunk_shape_i,
+                        std::span<vc::core::util::BinarySliceTarget>(targets));
                     const double read_seconds = seconds_since(read_start);
                     record_timing(dir_metrics, "read_chunk", read_seconds);
 
-                    const size_t slab_voxels = slab_shape[0] * slab_shape[1] * slab_shape[2];
-                    const size_t slab_bytes = slab_voxels * sizeof(uint8_t);
+                    for (size_t i = 0; i < targets.size(); ++i) {
+                        assembled_slices[i].anyNonZero = targets[i].anyNonZero;
+                        assembled_slices[i].extractSeconds = 0.0;
+                    }
 
                     if (debug_per_slice) {
-                        const double mib = static_cast<double>(slab_bytes) / (1024.0 * 1024.0);
-                        const double mibps = read_seconds > 0.0 ? mib / read_seconds : 0.0;
                         log_chunk_io(dir_metrics.direction, chunk_index,
                                      sampled_chunk_plans.size(),
                                      source_chunk_plan.sourceChunkIndex,
                                      assembled_slices.size(),
-                                     slab_shape[0], slab_shape[1], slab_shape[2],
-                                     mib, read_seconds, mibps,
+                                     0, 0, 0,
+                                     0.0, read_seconds, 0.0,
                                      seconds_since(start_time));
-                    }
-
-                    const auto extract_loop_start = std::chrono::steady_clock::now();
-                    for (auto& assembled : assembled_slices) {
-                        const auto extract_start = std::chrono::steady_clock::now();
-                        const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
-                            chunk_data,
-                            to_normal_grid_direction(dir),
-                            assembled.localSliceIndex,
-                            assembled.binarySlice);
-                        assembled.extractSeconds = seconds_since(extract_start);
-                        assembled.anyNonZero = assembled.anyNonZero || any_nonzero;
-                    }
-                    const double extract_loop_seconds = seconds_since(extract_loop_start);
-
-                    if (debug_per_slice) {
-                        log_chunk_extract(dir_metrics.direction, chunk_index,
-                                          sampled_chunk_plans.size(),
-                                          extract_loop_seconds,
-                                          assembled_slices.size());
                     }
                 }
 
