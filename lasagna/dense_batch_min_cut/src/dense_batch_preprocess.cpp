@@ -1174,14 +1174,136 @@ cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
 cv::Mat source_distance_filtered_label_ridges(
     const cv::Mat& white_domain, const cv::Mat& source_pixel_labels,
     const std::vector<cv::Point>& source_points,
-    const float min_source_distance_px) {
+    const float min_source_distance_px,
+    cv::Mat* rim_distance_debug_out = nullptr) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(source_pixel_labels.type() == CV_32S);
 
-    constexpr float kRightAngleSourceDistancePx = 2.0f;
-    const float opposing_source_distance_px = min_source_distance_px;
-    const cv::Point debug_pixel(177, 371);
+    struct RimPosition {
+        int contour = -1;
+        float arc = 0.0f;
+        float total = 0.0f;
+    };
+
+    const int rows = white_domain.rows;
+    const int cols = white_domain.cols;
+    const cv::Point debug_pixel(129, 218);
+
+    cv::Mat source_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
+    for (int y = 0; y < rows; ++y) {
+        const std::uint8_t* src = white_domain.ptr<std::uint8_t>(y);
+        std::uint8_t* dst = source_mask.ptr<std::uint8_t>(y);
+        for (int x = 0; x < cols; ++x) {
+            dst[x] = src[x] == 0 ? 255 : 0;
+        }
+    }
+    for (int x = 0; x < cols; ++x) {
+        source_mask.at<std::uint8_t>(0, x) = 255;
+        source_mask.at<std::uint8_t>(rows - 1, x) = 255;
+    }
+    for (int y = 0; y < rows; ++y) {
+        source_mask.at<std::uint8_t>(y, 0) = 255;
+        source_mask.at<std::uint8_t>(y, cols - 1) = 255;
+    }
+
+    cv::Mat source_components;
+    cv::Mat source_stats;
+    cv::Mat source_centroids;
+    const int source_component_count = cv::connectedComponentsWithStats(
+        source_mask, source_components, source_stats, source_centroids, 4,
+        CV_32S);
+
+    cv::Mat cleaned_source = cv::Mat::zeros(source_mask.size(), CV_8U);
+    constexpr int kMinSourceComponentArea = 8;
+    for (int y = 0; y < rows; ++y) {
+        const int* labels = source_components.ptr<int>(y);
+        std::uint8_t* dst = cleaned_source.ptr<std::uint8_t>(y);
+        for (int x = 0; x < cols; ++x) {
+            const int label = labels[x];
+            if (label > 0 && label < source_component_count &&
+                source_stats.at<int>(label, cv::CC_STAT_AREA) >=
+                    kMinSourceComponentArea) {
+                dst[x] = 255;
+            }
+        }
+    }
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(cleaned_source.clone(), contours, cv::RETR_LIST,
+                     cv::CHAIN_APPROX_NONE);
+
+    std::vector<RimPosition> rim_lookup(
+        static_cast<std::size_t>(rows * cols));
+    const auto linear_index = [cols](const cv::Point pixel) {
+        return static_cast<std::size_t>(pixel.y * cols + pixel.x);
+    };
+    const auto in_bounds = [rows, cols](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < cols && pixel.y >= 0 &&
+               pixel.y < rows;
+    };
+    const auto segment_length = [](const cv::Point a, const cv::Point b) {
+        const float dx = static_cast<float>(a.x - b.x);
+        const float dy = static_cast<float>(a.y - b.y);
+        return std::sqrt(dx * dx + dy * dy);
+    };
+    const auto assign_rim_position = [&](const cv::Point pixel,
+                                         const RimPosition position) {
+        if (!in_bounds(pixel)) {
+            return;
+        }
+        RimPosition& current = rim_lookup[linear_index(pixel)];
+        if (current.contour < 0) {
+            current = position;
+        }
+    };
+
+    for (int contour_id = 0; contour_id < static_cast<int>(contours.size());
+         ++contour_id) {
+        const std::vector<cv::Point>& contour = contours[contour_id];
+        if (contour.size() < 4) {
+            continue;
+        }
+
+        std::vector<float> arc(contour.size(), 0.0f);
+        for (std::size_t i = 1; i < contour.size(); ++i) {
+            arc[i] = arc[i - 1] + segment_length(contour[i], contour[i - 1]);
+        }
+        const float total_length =
+            arc.back() + segment_length(contour.front(), contour.back());
+        if (total_length <= 0.0f) {
+            continue;
+        }
+
+        for (std::size_t i = 0; i < contour.size(); ++i) {
+            assign_rim_position(
+                contour[i],
+                {contour_id, arc[i], total_length});
+        }
+        for (std::size_t i = 0; i < contour.size(); ++i) {
+            const RimPosition position{contour_id, arc[i], total_length};
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const cv::Point pixel = contour[i] + cv::Point(dx, dy);
+                    if (!in_bounds(pixel) ||
+                        cleaned_source.at<std::uint8_t>(pixel.y, pixel.x) ==
+                            0) {
+                        continue;
+                    }
+                    assign_rim_position(pixel, position);
+                }
+            }
+        }
+    }
+
+    const auto rim_position = [&](const cv::Point pixel) {
+        if (!in_bounds(pixel)) {
+            return RimPosition{};
+        }
+        return rim_lookup[linear_index(pixel)];
+    };
+
     cv::Mat ridges = cv::Mat::zeros(white_domain.size(), CV_8U);
+    cv::Mat rim_distance_debug = cv::Mat::zeros(white_domain.size(), CV_8U);
     cv::parallel_for_(cv::Range(0, white_domain.rows),
                       [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
@@ -1223,11 +1345,18 @@ cv::Mat source_distance_filtered_label_ridges(
                 if (debug_this_pixel) {
                     debug << "  center_label=" << center
                           << " center_source=(" << center_source.x << ","
-                          << center_source.y << ")\n";
+                          << center_source.y << ")";
+                }
+                const RimPosition center_rim = rim_position(center_source);
+                if (debug_this_pixel) {
+                    debug << " center_contour=" << center_rim.contour
+                          << " center_arc=" << center_rim.arc
+                          << " center_total=" << center_rim.total << "\n";
                 }
 
                 bool keep = false;
-                for (int dy = -1; dy <= 1 && !keep; ++dy) {
+                float max_neighbor_rim_distance = 0.0f;
+                for (int dy = -1; dy <= 1; ++dy) {
                     for (int dx = -1; dx <= 1; ++dx) {
                         if (dx == 0 && dy == 0) {
                             continue;
@@ -1258,62 +1387,64 @@ cv::Mat source_distance_filtered_label_ridges(
                         const float source_pair_distance_sq =
                             source_pair_dx * source_pair_dx +
                             source_pair_dy * source_pair_dy;
+                        const float source_pair_distance =
+                            std::sqrt(source_pair_distance_sq);
 
-                        const float center_vx =
-                            static_cast<float>(center_source.x - x);
-                        const float center_vy =
-                            static_cast<float>(center_source.y - y);
-                        const float other_vx =
-                            static_cast<float>(other_source.x - x);
-                        const float other_vy =
-                            static_cast<float>(other_source.y - y);
-                        const float center_len_sq =
-                            center_vx * center_vx + center_vy * center_vy;
-                        const float other_len_sq =
-                            other_vx * other_vx + other_vy * other_vy;
-                        if (center_len_sq <= 0.0f || other_len_sq <= 0.0f) {
-                            continue;
+                        const RimPosition other_rim =
+                            rim_position(other_source);
+                        bool pair_keep = false;
+                        float rim_distance = -1.0f;
+                        const char* reason = "missing_rim";
+                        if (center_rim.contour >= 0 &&
+                            other_rim.contour >= 0) {
+                            if (center_rim.contour != other_rim.contour) {
+                                pair_keep = true;
+                                rim_distance = 255.0f;
+                                reason = "different_contour";
+                            } else {
+                                const float arc_delta =
+                                    std::abs(center_rim.arc - other_rim.arc);
+                                rim_distance =
+                                    std::min(arc_delta,
+                                             center_rim.total - arc_delta);
+                                if (source_pair_distance >
+                                    min_source_distance_px) {
+                                    reason = "euclidean_gt_threshold";
+                                } else if (rim_distance >
+                                           min_source_distance_px) {
+                                    pair_keep = true;
+                                    reason = "rim_gt_threshold";
+                                } else {
+                                    reason = "rim_le_threshold";
+                                }
+                            }
+                            if (rim_distance > 0.0f) {
+                                max_neighbor_rim_distance = std::max(
+                                    max_neighbor_rim_distance, rim_distance);
+                            }
                         }
 
-                        const float dot = center_vx * other_vx +
-                                          center_vy * other_vy;
-                        const float denom =
-                            std::sqrt(center_len_sq * other_len_sq);
-                        const float cos_angle =
-                            std::max(-1.0f,
-                                     std::min(1.0f, dot / denom));
-                        const float angle_degrees =
-                            std::acos(cos_angle) * 180.0f /
-                            static_cast<float>(CV_PI);
-                        const float angle_t_linear = std::max(
-                            0.0f,
-                            std::min(1.0f,
-                                     (angle_degrees - 90.0f) / 90.0f));
-                        const float angle_t = angle_t_linear * angle_t_linear;
-                        const float dynamic_threshold_px =
-                            kRightAngleSourceDistancePx +
-                            (opposing_source_distance_px -
-                             kRightAngleSourceDistancePx) *
-                                angle_t;
-                        const float dynamic_threshold_sq =
-                            dynamic_threshold_px * dynamic_threshold_px;
-                        const bool pair_keep =
-                            source_pair_distance_sq >= dynamic_threshold_sq;
                         if (debug_this_pixel) {
                             debug << "  neighbor=(" << nx << "," << ny
                                   << ") other_label=" << other
                                   << " other_source=(" << other_source.x
                                   << "," << other_source.y << ")"
-                                  << " source_dist="
-                                  << std::sqrt(source_pair_distance_sq)
-                                  << " angle_deg=" << angle_degrees
-                                  << " threshold=" << dynamic_threshold_px
+                                  << " source_dist=" << source_pair_distance
+                                  << " center_contour="
+                                  << center_rim.contour
+                                  << " center_arc=" << center_rim.arc
+                                  << " center_total=" << center_rim.total
+                                  << " other_contour=" << other_rim.contour
+                                  << " other_arc=" << other_rim.arc
+                                  << " other_total=" << other_rim.total
+                                  << " rim_dist=" << rim_distance
+                                  << " threshold=" << min_source_distance_px
+                                  << " reason=" << reason
                                   << " keep=" << (pair_keep ? 1 : 0)
                                   << "\n";
                         }
                         if (pair_keep) {
                             keep = true;
-                            break;
                         }
                     }
                 }
@@ -1321,14 +1452,22 @@ cv::Mat source_distance_filtered_label_ridges(
                 if (keep) {
                     ridges.at<std::uint8_t>(y, x) = 255;
                 }
+                rim_distance_debug.at<std::uint8_t>(y, x) =
+                    static_cast<std::uint8_t>(
+                        std::min(255.0f, max_neighbor_rim_distance));
                 if (debug_this_pixel) {
-                    debug << "  final_keep=" << (keep ? 1 : 0) << "\n";
+                    debug << "  max_neighbor_rim_dist="
+                          << max_neighbor_rim_distance
+                          << " final_keep=" << (keep ? 1 : 0) << "\n";
                     std::cout << debug.str();
                 }
             }
         }
     });
 
+    if (rim_distance_debug_out != nullptr) {
+        *rim_distance_debug_out = rim_distance_debug;
+    }
     return ridges;
 }
 
@@ -2084,6 +2223,7 @@ struct ComponentVoronoiResult {
     cv::Mat boundary_skeleton_pruned;
     cv::Mat source_pixel_ridges;
     cv::Mat source_distance_filtered_ridges;
+    cv::Mat source_rim_distance;
     cv::Mat source_pixel_ridge_skeleton;
     cv::Mat boundary_skeleton_hybrid;
     cv::Mat cell_loops;
@@ -6508,11 +6648,13 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
     }
 
     cv::Mat source_distance_filtered_ridges;
+    cv::Mat source_rim_distance;
     {
         const TimingMark timing = start_timing();
         source_distance_filtered_ridges =
             source_distance_filtered_label_ridges(
-                source_mask, source_pixel_labels, source_points, 8.0f);
+                source_mask, source_pixel_labels, source_points, 8.0f,
+                &source_rim_distance);
         timings.push_back(finish_timing(
             "component.source_distance_filtered_ridges", timing));
     }
@@ -6558,6 +6700,7 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
             boundary_skeleton_pruned,
             source_pixel_ridges,
             source_distance_filtered_ridges,
+            source_rim_distance,
             source_pixel_ridge_skeleton,
             connected_skeleton,
             cell_loops,
@@ -7141,6 +7284,8 @@ int main(int argc, char** argv) {
                             (stem + "_source_distance_filtered_ridges.tif"),
                         component_voronoi_result
                             .source_distance_filtered_ridges);
+            write_image(workdir / (stem + "_source_rim_distance.tif"),
+                        component_voronoi_result.source_rim_distance);
             write_image(workdir /
                             (stem + "_source_pixel_voronoi_ridge_skeleton.tif"),
                         component_voronoi_result.source_pixel_ridge_skeleton);
@@ -7227,6 +7372,8 @@ int main(int argc, char** argv) {
             {"source_distance_filtered_ridges",
              to_float_layer(
                  component_voronoi_result.source_distance_filtered_ridges)},
+            {"source_rim_distance",
+             to_float_layer(component_voronoi_result.source_rim_distance)},
             {"graph_random_edges", to_float_layer(graph_random_colors)},
             {"graph_edges_random", to_float_layer(graph_edges_random_colors)},
             {"graph_nodes", to_float_layer(graph_nodes)},
