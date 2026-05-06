@@ -116,6 +116,24 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
                timing.name == "dense_backtrack_stall_diagnostics" ||
                timing.name == "tree_path_debug_render";
     };
+    auto child_parent_name = [](const std::string& name) -> std::string {
+        if (name.rfind("component.", 0) == 0) {
+            return "component_voronoi";
+        }
+        if (name.rfind("dense_grid.", 0) == 0) {
+            return "dense_backtrack_grid_carrier";
+        }
+        return {};
+    };
+    auto display_stage_name = [&](const std::string& name) -> std::string {
+        if (name.rfind("component.", 0) == 0) {
+            return "    " + name.substr(std::string("component.").size());
+        }
+        if (name.rfind("dense_grid.", 0) == 0) {
+            return "    " + name.substr(std::string("dense_grid.").size());
+        }
+        return name;
+    };
 
     double total_elapsed_ms = 0.0;
     double total_cpu_ms = 0.0;
@@ -180,10 +198,17 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
                                      kSpeedupWidth,
                                  '-')
                   << "\n";
-        for (const StageTiming& timing : aggregated) {
-            if (is_total(timing) || is_io_stage(timing) != want_io) {
-                continue;
-            }
+        std::vector<std::uint8_t> printed(aggregated.size(), 0);
+        const auto stage_in_table = [&](const std::string& name) {
+            return std::find_if(aggregated.begin(), aggregated.end(),
+                                [&](const StageTiming& timing) {
+                                    return timing.name == name &&
+                                           !is_total(timing) &&
+                                           is_io_stage(timing) == want_io;
+                                }) != aggregated.end();
+        };
+        const auto print_row = [&](const StageTiming& timing,
+                                   const std::string& name) {
             const double runtime_fraction =
                 denom_ms > 0.0 ? timing.elapsed_ms / denom_ms : 0.0;
             const double runtime_percent =
@@ -198,7 +223,7 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
             const double perfect_parallel_gain_percent =
                 100.0 * (perfect_parallel_speedup - 1.0);
             std::cout << "  " << std::left << std::setw(kStageWidth)
-                      << timing.name
+                      << name
                       << std::right << std::fixed << std::setprecision(2)
                       << std::setw(kNumericWidth) << runtime_percent
                       << std::setw(kNumericWidth) << timing.elapsed_ms
@@ -207,6 +232,32 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
                       << std::setw(kSpeedupWidth)
                       << perfect_parallel_gain_percent
                       << "\n";
+        };
+        for (std::size_t i = 0; i < aggregated.size(); ++i) {
+            const StageTiming& timing = aggregated[i];
+            if (printed[i] || is_total(timing) ||
+                is_io_stage(timing) != want_io) {
+                continue;
+            }
+            const std::string parent = child_parent_name(timing.name);
+            if (!parent.empty() && stage_in_table(parent)) {
+                continue;
+            }
+            print_row(timing, display_stage_name(timing.name));
+            printed[i] = 1;
+
+            for (std::size_t child_i = 0; child_i < aggregated.size();
+                 ++child_i) {
+                if (printed[child_i] ||
+                    is_io_stage(aggregated[child_i]) != want_io ||
+                    child_parent_name(aggregated[child_i].name) !=
+                        timing.name) {
+                    continue;
+                }
+                print_row(aggregated[child_i],
+                          display_stage_name(aggregated[child_i].name));
+                printed[child_i] = 1;
+            }
         }
         print_summary(want_io ? "io_debug_total" : "compute_total",
                       denom_ms, summary_cpu_ms);
