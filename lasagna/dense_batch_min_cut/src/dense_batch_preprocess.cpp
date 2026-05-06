@@ -886,19 +886,30 @@ std::vector<cv::Point> label_source_points(const cv::Mat& zero_source_mask,
     cv::minMaxLoc(labels, nullptr, &max_label_value);
     const int max_label = static_cast<int>(max_label_value);
 
+    const int cols = zero_source_mask.cols;
     std::vector<cv::Point> source_points(static_cast<std::size_t>(max_label + 1),
                                          cv::Point(-1, -1));
-    for (int y = 0; y < zero_source_mask.rows; ++y) {
-        for (int x = 0; x < zero_source_mask.cols; ++x) {
-            if (zero_source_mask.at<std::uint8_t>(y, x) != 0) {
-                continue;
-            }
-            const int label = labels.at<int>(y, x);
-            if (label > 0 && source_points[label].x < 0) {
-                source_points[label] = cv::Point(x, y);
+
+    // All callers build labels with DIST_LABEL_PIXEL, where each zero source
+    // pixel owns one unique label. That makes the per-label writes independent.
+    cv::parallel_for_(cv::Range(0, zero_source_mask.rows),
+                      [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const std::uint8_t* mask_row =
+                zero_source_mask.ptr<std::uint8_t>(y);
+            const int* label_row = labels.ptr<int>(y);
+            for (int x = 0; x < cols; ++x) {
+                if (mask_row[x] != 0) {
+                    continue;
+                }
+                const int label = label_row[x];
+                if (label > 0) {
+                    source_points[static_cast<std::size_t>(label)] =
+                        cv::Point(x, y);
+                }
             }
         }
-    }
+    });
     return source_points;
 }
 
@@ -3760,25 +3771,36 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
 
     {
         const TimingMark timing = start_timing();
-        for (int y = 0; y < rows; ++y) {
-            for (int x = 0; x < cols; ++x) {
-                if (white_domain.at<std::uint8_t>(y, x) == 0) {
-                    continue;
+        std::vector<int> seeded_by_row(static_cast<std::size_t>(rows), 0);
+        cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                int row_seeded = 0;
+                const std::uint8_t* white_row =
+                    white_domain.ptr<std::uint8_t>(y);
+                const float* dt_row = dt.ptr<float>(y);
+                for (int x = 0; x < cols; ++x) {
+                    if (white_row[x] == 0) {
+                        continue;
+                    }
+                    const int index = y * cols + x;
+                    const float seed =
+                        graph_seed_flow[static_cast<std::size_t>(index)];
+                    if (seed <= 0.0f) {
+                        continue;
+                    }
+                    const float flow =
+                        std::min(seed, capacity_from_dt(dt_row[x]));
+                    if (flow <= 0.0f) {
+                        continue;
+                    }
+                    routed_flow[static_cast<std::size_t>(index)] = flow;
+                    ++row_seeded;
                 }
-                const float seed = graph_seed_flow[y * cols + x];
-                if (seed <= 0.0f) {
-                    continue;
-                }
-                const float flow =
-                    std::min(seed, capacity_from_dt(dt.at<float>(y, x)));
-                if (flow <= 0.0f) {
-                    continue;
-                }
-                const int index = y * cols + x;
-                routed_flow[index] = flow;
-                ++result.seeded_pixels;
+                seeded_by_row[static_cast<std::size_t>(y)] = row_seeded;
             }
-        }
+        });
+        result.seeded_pixels +=
+            std::accumulate(seeded_by_row.begin(), seeded_by_row.end(), 0);
         result.timings.push_back(finish_timing("dense_backtrack_seed", timing));
     }
 
@@ -4132,58 +4154,67 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             }
             for (int bucket = 1; bucket < kCarrierRouteBuckets; ++bucket) {
                 const float budget = bucket * kCarrierRouteBucketPx;
-                for (int node = 0; node < carrier_count; ++node) {
-                    float best_flow = carrier_value[node];
-                    float best_distance = 0.0f;
-                    int best_next = -1;
-                    for (const CarrierNeighbor neighbor : carrier_edges[node]) {
-                        float candidate_flow = carrier_value[neighbor.node];
-                        float candidate_distance =
-                            std::min(neighbor.distance, budget);
-                        if (neighbor.distance >= budget - kFlowEpsilon) {
-                            const float t = neighbor.distance > 0.0f
-                                                ? std::clamp(
-                                                      budget / neighbor.distance,
-                                                      0.0f, 1.0f)
-                                                : 1.0f;
-                            candidate_flow =
-                                carrier_value[node] * (1.0f - t) +
-                                carrier_value[neighbor.node] * t;
-                        } else {
-                            const int next_bucket = std::clamp(
-                                static_cast<int>(
-                                    std::floor((budget - neighbor.distance) /
-                                               kCarrierRouteBucketPx)),
-                                0, bucket - 1);
-                            candidate_flow =
-                                route_flow(neighbor.node, next_bucket);
-                            candidate_distance =
-                                neighbor.distance +
-                                route_distance(neighbor.node, next_bucket);
+                cv::parallel_for_(cv::Range(0, carrier_count),
+                                  [&](const cv::Range& range) {
+                    for (int node = range.start; node < range.end; ++node) {
+                        float best_flow = carrier_value[node];
+                        float best_distance = 0.0f;
+                        int best_next = -1;
+                        for (const CarrierNeighbor neighbor :
+                             carrier_edges[node]) {
+                            float candidate_flow =
+                                carrier_value[neighbor.node];
+                            float candidate_distance =
+                                std::min(neighbor.distance, budget);
+                            if (neighbor.distance >= budget - kFlowEpsilon) {
+                                const float t =
+                                    neighbor.distance > 0.0f
+                                        ? std::clamp(
+                                              budget / neighbor.distance,
+                                              0.0f, 1.0f)
+                                        : 1.0f;
+                                candidate_flow =
+                                    carrier_value[node] * (1.0f - t) +
+                                    carrier_value[neighbor.node] * t;
+                            } else {
+                                const int next_bucket = std::clamp(
+                                    static_cast<int>(
+                                        std::floor(
+                                            (budget - neighbor.distance) /
+                                            kCarrierRouteBucketPx)),
+                                    0, bucket - 1);
+                                candidate_flow =
+                                    route_flow(neighbor.node, next_bucket);
+                                candidate_distance =
+                                    neighbor.distance +
+                                    route_distance(neighbor.node,
+                                                   next_bucket);
+                            }
+                            const bool better_flow =
+                                candidate_flow > best_flow + kFlowEpsilon;
+                            const bool same_flow_longer =
+                                std::abs(candidate_flow - best_flow) <=
+                                    kFlowEpsilon &&
+                                candidate_distance >
+                                    best_distance + kFlowEpsilon;
+                            const bool same_flow_same_distance_stable =
+                                std::abs(candidate_flow - best_flow) <=
+                                    kFlowEpsilon &&
+                                std::abs(candidate_distance - best_distance) <=
+                                    kFlowEpsilon &&
+                                (best_next < 0 || neighbor.node < best_next);
+                            if (better_flow || same_flow_longer ||
+                                same_flow_same_distance_stable) {
+                                best_flow = candidate_flow;
+                                best_distance = candidate_distance;
+                                best_next = neighbor.node;
+                            }
                         }
-                        const bool better_flow =
-                            candidate_flow > best_flow + kFlowEpsilon;
-                        const bool same_flow_longer =
-                            std::abs(candidate_flow - best_flow) <=
-                                kFlowEpsilon &&
-                            candidate_distance > best_distance + kFlowEpsilon;
-                        const bool same_flow_same_distance_stable =
-                            std::abs(candidate_flow - best_flow) <=
-                                kFlowEpsilon &&
-                            std::abs(candidate_distance - best_distance) <=
-                                kFlowEpsilon &&
-                            (best_next < 0 || neighbor.node < best_next);
-                        if (better_flow || same_flow_longer ||
-                            same_flow_same_distance_stable) {
-                            best_flow = candidate_flow;
-                            best_distance = candidate_distance;
-                            best_next = neighbor.node;
-                        }
+                        route_flow(node, bucket) = best_flow;
+                        route_distance(node, bucket) = best_distance;
+                        route_next(node, bucket) = best_next;
                     }
-                    route_flow(node, bucket) = best_flow;
-                    route_distance(node, bucket) = best_distance;
-                    route_next(node, bucket) = best_next;
-                }
+                });
             }
             result.timings.push_back(
                 finish_timing("dense_grid.route_dp", route_dp_timing));
@@ -5035,78 +5066,111 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
 
     {
         const TimingMark timing = start_timing();
-        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
-             ++edge_index) {
-            const GraphEdge& edge = graph.edges[edge_index];
-            std::vector<cv::Point> ordered = order_edge_pixels(edge, graph);
-            if (ordered.empty()) {
-                continue;
-            }
+        struct PixelFlowUpdate {
+            int linear_index = 0;
+            float value = 0.0f;
+        };
+        std::vector<std::vector<PixelFlowUpdate>> pixel_updates(
+            graph.edges.size());
+        cv::parallel_for_(
+            cv::Range(0, static_cast<int>(graph.edges.size())),
+            [&](const cv::Range& range) {
+                for (int edge_index = range.start; edge_index < range.end;
+                     ++edge_index) {
+                    const GraphEdge& edge = graph.edges[edge_index];
+                    std::vector<cv::Point> ordered =
+                        order_edge_pixels(edge, graph);
+                    if (ordered.empty()) {
+                        continue;
+                    }
 
-            std::vector<float> cap_a(ordered.size(), 0.0f);
-            std::vector<float> cap_b(ordered.size(), 0.0f);
-            std::vector<double> dist_a(ordered.size(), 0.0);
-            std::vector<double> dist_b(ordered.size(), 0.0);
-            const float node_a_flow =
-                edge.a > 0 && edge.a < node_count
-                    ? static_cast<float>(std::min(
-                          static_cast<double>(kDenseFlowInf),
-                          std::max(0.0, node_flow[edge.a])))
-                    : 0.0f;
-            const float node_b_flow =
-                edge.b > 0 && edge.b < node_count
-                    ? static_cast<float>(std::min(
-                          static_cast<double>(kDenseFlowInf),
-                          std::max(0.0, node_flow[edge.b])))
-                    : node_a_flow;
+                    std::vector<float> cap_a(ordered.size(), 0.0f);
+                    std::vector<float> cap_b(ordered.size(), 0.0f);
+                    std::vector<double> dist_a(ordered.size(), 0.0);
+                    std::vector<double> dist_b(ordered.size(), 0.0);
+                    const float node_a_flow =
+                        edge.a > 0 && edge.a < node_count
+                            ? static_cast<float>(std::min(
+                                  static_cast<double>(kDenseFlowInf),
+                                  std::max(0.0, node_flow[edge.a])))
+                            : 0.0f;
+                    const float node_b_flow =
+                        edge.b > 0 && edge.b < node_count
+                            ? static_cast<float>(std::min(
+                                  static_cast<double>(kDenseFlowInf),
+                                  std::max(0.0, node_flow[edge.b])))
+                            : node_a_flow;
 
-            float min_capacity = node_a_flow;
-            for (std::size_t i = 0; i < ordered.size(); ++i) {
-                if (i > 0) {
-                    const int dx = std::abs(ordered[i].x - ordered[i - 1].x);
-                    const int dy = std::abs(ordered[i].y - ordered[i - 1].y);
-                    dist_a[i] = dist_a[i - 1] +
+                    float min_capacity = node_a_flow;
+                    for (std::size_t i = 0; i < ordered.size(); ++i) {
+                        if (i > 0) {
+                            const int dx =
+                                std::abs(ordered[i].x - ordered[i - 1].x);
+                            const int dy =
+                                std::abs(ordered[i].y - ordered[i - 1].y);
+                            dist_a[i] =
+                                dist_a[i - 1] +
                                 (dx + dy == 2 ? std::sqrt(2.0) : 1.0);
-                }
-                min_capacity = std::min(
-                    min_capacity,
-                    capacity_from_dt(dt.at<float>(ordered[i].y, ordered[i].x)));
-                cap_a[i] = min_capacity;
-            }
-            min_capacity = node_b_flow;
-            for (std::size_t i = ordered.size(); i-- > 0;) {
-                if (i + 1 < ordered.size()) {
-                    const int dx = std::abs(ordered[i].x - ordered[i + 1].x);
-                    const int dy = std::abs(ordered[i].y - ordered[i + 1].y);
-                    dist_b[i] = dist_b[i + 1] +
+                        }
+                        min_capacity = std::min(
+                            min_capacity,
+                            capacity_from_dt(
+                                dt.at<float>(ordered[i].y, ordered[i].x)));
+                        cap_a[i] = min_capacity;
+                    }
+                    min_capacity = node_b_flow;
+                    for (std::size_t i = ordered.size(); i-- > 0;) {
+                        if (i + 1 < ordered.size()) {
+                            const int dx =
+                                std::abs(ordered[i].x - ordered[i + 1].x);
+                            const int dy =
+                                std::abs(ordered[i].y - ordered[i + 1].y);
+                            dist_b[i] =
+                                dist_b[i + 1] +
                                 (dx + dy == 2 ? std::sqrt(2.0) : 1.0);
-                }
-                min_capacity = std::min(
-                    min_capacity,
-                    capacity_from_dt(dt.at<float>(ordered[i].y, ordered[i].x)));
-                cap_b[i] = min_capacity;
-            }
+                        }
+                        min_capacity = std::min(
+                            min_capacity,
+                            capacity_from_dt(
+                                dt.at<float>(ordered[i].y, ordered[i].x)));
+                        cap_b[i] = min_capacity;
+                    }
 
-            double edge_sum = 0.0;
-            for (std::size_t i = 0; i < ordered.size(); ++i) {
-                const double total_dist = dist_a[i] + dist_b[i];
-                const double weight_a =
-                    total_dist > 0.0 ? dist_b[i] / total_dist : 0.5;
-                const double weight_b =
-                    total_dist > 0.0 ? dist_a[i] / total_dist : 0.5;
-                const float value = static_cast<float>(std::min(
-                    static_cast<double>(kDenseFlowInf),
-                    weight_a * cap_a[i] + weight_b * cap_b[i]));
-                const cv::Point pixel = ordered[i];
-                graph_pixel_flow.at<float>(pixel.y, pixel.x) =
-                    std::max(graph_pixel_flow.at<float>(pixel.y, pixel.x),
-                             value);
-                edge_sum += value;
-            }
-            if (!ordered.empty()) {
-                edge_flow[edge_index] = static_cast<float>(
-                    std::min(static_cast<double>(kDenseFlowInf),
-                             edge_sum / static_cast<double>(ordered.size())));
+                    double edge_sum = 0.0;
+                    std::vector<PixelFlowUpdate>& updates =
+                        pixel_updates[static_cast<std::size_t>(edge_index)];
+                    updates.reserve(ordered.size());
+                    for (std::size_t i = 0; i < ordered.size(); ++i) {
+                        const double total_dist = dist_a[i] + dist_b[i];
+                        const double weight_a =
+                            total_dist > 0.0 ? dist_b[i] / total_dist : 0.5;
+                        const double weight_b =
+                            total_dist > 0.0 ? dist_a[i] / total_dist : 0.5;
+                        const float value = static_cast<float>(std::min(
+                            static_cast<double>(kDenseFlowInf),
+                            weight_a * cap_a[i] + weight_b * cap_b[i]));
+                        const cv::Point pixel = ordered[i];
+                        updates.push_back({pixel.y * graph_pixel_flow.cols +
+                                               pixel.x,
+                                           value});
+                        edge_sum += value;
+                    }
+                    if (!ordered.empty()) {
+                        edge_flow[static_cast<std::size_t>(edge_index)] =
+                            static_cast<float>(std::min(
+                                static_cast<double>(kDenseFlowInf),
+                                edge_sum /
+                                    static_cast<double>(ordered.size())));
+                    }
+                }
+            });
+
+        for (const std::vector<PixelFlowUpdate>& updates : pixel_updates) {
+            for (const PixelFlowUpdate update : updates) {
+                float& value = graph_pixel_flow.at<float>(
+                    update.linear_index / graph_pixel_flow.cols,
+                    update.linear_index % graph_pixel_flow.cols);
+                value = std::max(value, update.value);
             }
         }
         timings.push_back(finish_timing("graph_edge_point_flow", timing));
