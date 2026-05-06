@@ -447,7 +447,7 @@ private:
     float _autoApprovalThreshold{0.0f};
     float _autoApprovalMaxDistance{0.0f};
 
-    float _approvalMaskBrushRadius{50.0f};  // Cylinder radius
+    float _approvalMaskBrushRadius{50.0f};  // Mask pixels in flattened view; native voxels in plane views
     float _approvalBrushDepth{15.0f};       // Cylinder depth
     QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting
 

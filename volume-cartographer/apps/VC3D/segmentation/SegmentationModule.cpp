@@ -173,6 +173,11 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _autoApprovalRadius = _widget->autoApprovalRadius();
         _autoApprovalThreshold = _widget->autoApprovalThreshold();
         _autoApprovalMaxDistance = _widget->autoApprovalMaxDistance();
+        _approvalMaskBrushRadius = std::max(1.0f, _widget->approvalBrushRadius());
+        _approvalBrushDepth = std::clamp(_widget->approvalBrushDepth(), 1.0f, 500.0f);
+        if (_widget->approvalBrushColor().isValid()) {
+            _approvalBrushColor = _widget->approvalBrushColor();
+        }
         _drawMaskEnabled = _widget->drawMaskEnabled();
     }
 

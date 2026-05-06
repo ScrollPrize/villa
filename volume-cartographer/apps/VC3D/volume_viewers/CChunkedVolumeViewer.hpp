@@ -54,7 +54,7 @@ public:
 
     void setPointCollection(VCCollection* pc) { _pointCollection = pc; }
     void setSurface(const std::string& name) override;
-    void setIntersects(const std::set<std::string>& names) override { _intersectTgts = names; renderIntersections("setIntersects"); }
+    void setIntersects(const std::set<std::string>& names) override;
     void renderVisible(
         bool force = false,
         const char* reason = "external caller",
@@ -135,10 +135,10 @@ public:
     float intersectionOpacity() const override { return _intersectionOpacity; }
     float intersectionThickness() const override { return _intersectionThickness; }
     int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
-    void setIntersectionOpacity(float v) override { if (_closing) return; _intersectionOpacity = v; renderIntersections("setIntersectionOpacity"); }
-    void setIntersectionThickness(float v) override { if (_closing) return; _intersectionThickness = v; renderIntersections("setIntersectionThickness"); }
+    void setIntersectionOpacity(float v) override;
+    void setIntersectionThickness(float v) override;
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
-    void setSurfacePatchSamplingStride(int s) override { if (_closing) return; _surfacePatchSamplingStride = s; invalidateIntersect(); renderIntersections("setSurfacePatchSamplingStride"); }
+    void setSurfacePatchSamplingStride(int s) override;
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;

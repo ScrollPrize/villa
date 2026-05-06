@@ -106,7 +106,7 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     _spinApprovalBrushRadius->setDecimals(0);
     _spinApprovalBrushRadius->setRange(1.0, 1000.0);
     _spinApprovalBrushRadius->setSingleStep(10.0);
-    _spinApprovalBrushRadius->setToolTip(tr("Cylinder radius: circle size in plane views, rectangle width in flattened view (native voxels)."));
+    _spinApprovalBrushRadius->setToolTip(tr("Brush radius. In the flattened segmentation view this is measured in approval-mask pixels; in plane views it is the cylinder radius in native voxels."));
     approvalBrushRow->addWidget(brushRadiusLabel);
     approvalBrushRow->addWidget(_spinApprovalBrushRadius);
 
@@ -522,11 +522,23 @@ void SegmentationApprovalMaskPanel::syncUiState()
         const QSignalBlocker blocker(_spinAutoApprovalMaxDistance);
         _spinAutoApprovalMaxDistance->setValue(static_cast<double>(_autoApprovalMaxDistance));
     }
+    if (_spinApprovalBrushRadius) {
+        const QSignalBlocker blocker(_spinApprovalBrushRadius);
+        _spinApprovalBrushRadius->setValue(static_cast<double>(_approvalBrushRadius));
+    }
+    if (_spinApprovalBrushDepth) {
+        const QSignalBlocker blocker(_spinApprovalBrushDepth);
+        _spinApprovalBrushDepth->setValue(static_cast<double>(_approvalBrushDepth));
+    }
     if (_sliderApprovalMaskOpacity) {
         const QSignalBlocker blocker(_sliderApprovalMaskOpacity);
         _sliderApprovalMaskOpacity->setValue(_approvalMaskOpacity);
     }
     if (_lblApprovalMaskOpacity) {
         _lblApprovalMaskOpacity->setText(QString::number(_approvalMaskOpacity) + QStringLiteral("%"));
+    }
+    if (_btnApprovalColor) {
+        _btnApprovalColor->setStyleSheet(
+            QStringLiteral("background-color: %1; border: 1px solid #888;").arg(_approvalBrushColor.name()));
     }
 }

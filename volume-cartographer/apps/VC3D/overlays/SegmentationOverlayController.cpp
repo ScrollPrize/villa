@@ -1423,7 +1423,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     // Flat cylinder model: circle in XY/XZ/YZ planes and flattened view
     if (state.approvalHoverWorld) {
         const cv::Vec3f& hoverWorld = *state.approvalHoverWorld;
-        const float brushRadiusNative = state.approvalBrushRadius;
+        const float brushRadius = state.approvalBrushRadius;
 
         if (isPlaneViewer) {
             // For plane viewers: use volumeToScene which is fast (O(1) for PlaneSurface)
@@ -1432,8 +1432,8 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
             // Convert brush radius from native voxels to scene pixels
             // Use both X and Y offsets to handle different plane orientations
-            const cv::Vec3f offsetPosX = hoverWorld + cv::Vec3f(brushRadiusNative, 0, 0);
-            const cv::Vec3f offsetPosY = hoverWorld + cv::Vec3f(0, brushRadiusNative, 0);
+            const cv::Vec3f offsetPosX = hoverWorld + cv::Vec3f(brushRadius, 0, 0);
+            const cv::Vec3f offsetPosY = hoverWorld + cv::Vec3f(0, brushRadius, 0);
             const QPointF sceneOffsetX = viewer->volumeToScene(offsetPosX);
             const QPointF sceneOffsetY = viewer->volumeToScene(offsetPosY);
             const qreal radiusPixelsX = std::hypot(sceneOffsetX.x() - sceneCenter.x(),
@@ -1471,20 +1471,21 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
                 sceneCenter = viewer->volumeToScene(hoverWorld);
             }
 
-            // Convert from native voxels to grid units
+            // Flattened-view approval painting is stamped in approval-mask image
+            // coordinates, so draw the reticle with the same mask-pixel radius.
             float surfaceScale = 1.0f;
             if (state.surface) {
                 const cv::Vec2f scale = state.surface->scale();
-                surfaceScale = (scale[0] + scale[1]) * 0.5f;
+                const float avgScale = (std::abs(scale[0]) + std::abs(scale[1])) * 0.5f;
+                if (avgScale > 1.0e-6f) {
+                    surfaceScale = avgScale;
+                }
             }
-            const float gridRadius = brushRadiusNative * surfaceScale;
-
-            // Convert grid units to scene pixels using viewer scale
             const qreal gridToScene = thisViewerScale / surfaceScale;
 
             // Add a small offset to account for painting extending to cell edges
             constexpr float gridOffset = 0.5f;
-            const qreal radiusPixels = (gridRadius + gridOffset) * gridToScene;
+            const qreal radiusPixels = (brushRadius + gridOffset) * gridToScene;
 
             if (radiusPixels > 1.0) {
                 ViewerOverlayControllerBase::OverlayStyle style;
