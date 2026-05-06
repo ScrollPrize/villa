@@ -117,6 +117,9 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
                timing.name == "tree_path_debug_render";
     };
     auto child_parent_name = [](const std::string& name) -> std::string {
+        if (name.rfind("component.connect_ridges.", 0) == 0) {
+            return "component.connect_ridges";
+        }
         if (name.rfind("component.", 0) == 0) {
             return "component_voronoi";
         }
@@ -126,6 +129,10 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
         return {};
     };
     auto display_stage_name = [&](const std::string& name) -> std::string {
+        if (name.rfind("component.connect_ridges.", 0) == 0) {
+            return "        " +
+                   name.substr(std::string("component.connect_ridges.").size());
+        }
         if (name.rfind("component.", 0) == 0) {
             return "    " + name.substr(std::string("component.").size());
         }
@@ -257,6 +264,20 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
                 print_row(aggregated[child_i],
                           display_stage_name(aggregated[child_i].name));
                 printed[child_i] = 1;
+
+                for (std::size_t grandchild_i = 0;
+                     grandchild_i < aggregated.size(); ++grandchild_i) {
+                    if (printed[grandchild_i] ||
+                        is_io_stage(aggregated[grandchild_i]) != want_io ||
+                        child_parent_name(aggregated[grandchild_i].name) !=
+                            aggregated[child_i].name) {
+                        continue;
+                    }
+                    print_row(aggregated[grandchild_i],
+                              display_stage_name(
+                                  aggregated[grandchild_i].name));
+                    printed[grandchild_i] = 1;
+                }
             }
         }
         print_summary(want_io ? "io_debug_total" : "compute_total",
@@ -842,12 +863,9 @@ cv::Mat voronoi_label_ridges(const cv::Mat& binary,
 
 std::vector<cv::Point> label_source_points(const cv::Mat& zero_source_mask,
                                            const cv::Mat& labels) {
-    int max_label = 0;
-    for (int y = 0; y < labels.rows; ++y) {
-        for (int x = 0; x < labels.cols; ++x) {
-            max_label = std::max(max_label, labels.at<int>(y, x));
-        }
-    }
+    double max_label_value = 0.0;
+    cv::minMaxLoc(labels, nullptr, &max_label_value);
+    const int max_label = static_cast<int>(max_label_value);
 
     std::vector<cv::Point> source_points(static_cast<std::size_t>(max_label + 1),
                                          cv::Point(-1, -1));
@@ -1153,9 +1171,11 @@ cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
     return ridges;
 }
 
-cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
-                                                  const cv::Mat& source_skeleton,
-                                                  const cv::Mat& dt) {
+cv::Mat connect_clean_skeleton_with_source_ridges(
+    const cv::Mat& clean_skeleton,
+    const cv::Mat& source_skeleton,
+    const cv::Mat& dt,
+    std::vector<StageTiming>* timings = nullptr) {
     CV_Assert(clean_skeleton.type() == CV_8U);
     CV_Assert(source_skeleton.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
@@ -1164,8 +1184,16 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
     cv::threshold(clean_skeleton, clean, 0, 255, cv::THRESH_BINARY);
 
     cv::Mat clean_labels;
-    const int num_clean_components =
-        cv::connectedComponents(clean, clean_labels, 8, CV_32S);
+    int num_clean_components = 0;
+    {
+        const TimingMark timing = start_timing();
+        num_clean_components =
+            cv::connectedComponents(clean, clean_labels, 8, CV_32S);
+        if (timings != nullptr) {
+            timings->push_back(finish_timing(
+                "component.connect_ridges.clean_components", timing));
+        }
+    }
     if (num_clean_components <= 2) {
         return clean.clone();
     }
@@ -1178,9 +1206,17 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
     cv::Mat candidate_labels;
     cv::Mat candidate_stats;
     cv::Mat candidate_centroids;
-    const int num_candidates = cv::connectedComponentsWithStats(
-        connector_candidates, candidate_labels, candidate_stats,
-        candidate_centroids, 8, CV_32S);
+    int num_candidates = 0;
+    {
+        const TimingMark timing = start_timing();
+        num_candidates = cv::connectedComponentsWithStats(
+            connector_candidates, candidate_labels, candidate_stats,
+            candidate_centroids, 8, CV_32S);
+        if (timings != nullptr) {
+            timings->push_back(finish_timing(
+                "component.connect_ridges.candidate_components", timing));
+        }
+    }
     if (num_candidates <= 1) {
         return clean.clone();
     }
@@ -1193,32 +1229,39 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
 
     std::vector<CandidateWorkspace> candidate_workspaces(
         static_cast<std::size_t>(num_candidates));
-    for (int label = 1; label < num_candidates; ++label) {
-        const int left = candidate_stats.at<int>(label, cv::CC_STAT_LEFT);
-        const int top = candidate_stats.at<int>(label, cv::CC_STAT_TOP);
-        const int width = candidate_stats.at<int>(label, cv::CC_STAT_WIDTH);
-        const int height = candidate_stats.at<int>(label, cv::CC_STAT_HEIGHT);
-        CandidateWorkspace& workspace = candidate_workspaces[label];
-        workspace.bounds = cv::Rect(left, top, width, height);
-        workspace.pixels.reserve(
-            static_cast<std::size_t>(
-                candidate_stats.at<int>(label, cv::CC_STAT_AREA)));
-        workspace.local_index =
-            cv::Mat(height, width, CV_32S, cv::Scalar(-1));
-    }
-
-    for (int y = 0; y < candidate_labels.rows; ++y) {
-        for (int x = 0; x < candidate_labels.cols; ++x) {
-            const int label = candidate_labels.at<int>(y, x);
-            if (label <= 0) {
-                continue;
-            }
+    {
+        const TimingMark timing = start_timing();
+        for (int label = 1; label < num_candidates; ++label) {
+            const int left = candidate_stats.at<int>(label, cv::CC_STAT_LEFT);
+            const int top = candidate_stats.at<int>(label, cv::CC_STAT_TOP);
+            const int width = candidate_stats.at<int>(label, cv::CC_STAT_WIDTH);
+            const int height =
+                candidate_stats.at<int>(label, cv::CC_STAT_HEIGHT);
             CandidateWorkspace& workspace = candidate_workspaces[label];
-            const int local =
-                static_cast<int>(workspace.pixels.size());
-            workspace.pixels.push_back(cv::Point(x, y));
-            workspace.local_index.at<int>(y - workspace.bounds.y,
-                                          x - workspace.bounds.x) = local;
+            workspace.bounds = cv::Rect(left, top, width, height);
+            workspace.pixels.reserve(
+                static_cast<std::size_t>(
+                    candidate_stats.at<int>(label, cv::CC_STAT_AREA)));
+            workspace.local_index =
+                cv::Mat(height, width, CV_32S, cv::Scalar(-1));
+        }
+
+        for (int y = 0; y < candidate_labels.rows; ++y) {
+            for (int x = 0; x < candidate_labels.cols; ++x) {
+                const int label = candidate_labels.at<int>(y, x);
+                if (label <= 0) {
+                    continue;
+                }
+                CandidateWorkspace& workspace = candidate_workspaces[label];
+                const int local = static_cast<int>(workspace.pixels.size());
+                workspace.pixels.push_back(cv::Point(x, y));
+                workspace.local_index.at<int>(y - workspace.bounds.y,
+                                              x - workspace.bounds.x) = local;
+            }
+        }
+        if (timings != nullptr) {
+            timings->push_back(finish_timing(
+                "component.connect_ridges.workspace_build", timing));
         }
     }
 
@@ -1227,11 +1270,19 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
 
     cv::Mat distance_to_clean;
     cv::Mat nearest_clean_pixel;
-    cv::distanceTransform(clean_source_mask, distance_to_clean,
-                          nearest_clean_pixel, cv::DIST_L2, cv::DIST_MASK_5,
-                          cv::DIST_LABEL_PIXEL);
-    const std::vector<cv::Point> clean_source_points =
-        label_source_points(clean_source_mask, nearest_clean_pixel);
+    std::vector<cv::Point> clean_source_points;
+    {
+        const TimingMark timing = start_timing();
+        cv::distanceTransform(clean_source_mask, distance_to_clean,
+                              nearest_clean_pixel, cv::DIST_L2,
+                              cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+        clean_source_points =
+            label_source_points(clean_source_mask, nearest_clean_pixel);
+        if (timings != nullptr) {
+            timings->push_back(finish_timing(
+                "component.connect_ridges.clean_distance_transform", timing));
+        }
+    }
 
     struct Attachment {
         int component = 0;
@@ -1279,42 +1330,71 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
          {1, 0},   {-1, 1}, {0, 1},  {1, 1}}};
     std::vector<std::vector<Attachment>> attachments(
         static_cast<std::size_t>(num_candidates));
+    {
+        const TimingMark timing = start_timing();
+        std::vector<std::vector<Attachment>> row_attachments(
+            static_cast<std::size_t>(candidate_labels.rows));
+        cv::parallel_for_(cv::Range(0, candidate_labels.rows),
+                          [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                std::vector<Attachment>& row = row_attachments[y];
+                for (int x = 0; x < candidate_labels.cols; ++x) {
+                    const int candidate_label =
+                        candidate_labels.at<int>(y, x);
+                    if (candidate_label <= 0) {
+                        continue;
+                    }
 
-    for (int y = 0; y < candidate_labels.rows; ++y) {
-        for (int x = 0; x < candidate_labels.cols; ++x) {
-            const int candidate_label = candidate_labels.at<int>(y, x);
-            if (candidate_label <= 0) {
-                continue;
-            }
+                    if (distance_to_clean.at<float>(y, x) >
+                        kMaxAttachDistance) {
+                        continue;
+                    }
 
-            if (distance_to_clean.at<float>(y, x) > kMaxAttachDistance) {
-                continue;
-            }
+                    const int source_label =
+                        nearest_clean_pixel.at<int>(y, x);
+                    if (source_label <= 0 ||
+                        source_label >=
+                            static_cast<int>(clean_source_points.size())) {
+                        continue;
+                    }
+                    const cv::Point source =
+                        clean_source_points[source_label];
+                    if (source.x < 0) {
+                        continue;
+                    }
 
-            const int source_label = nearest_clean_pixel.at<int>(y, x);
-            if (source_label <= 0 ||
-                source_label >= static_cast<int>(clean_source_points.size())) {
-                continue;
-            }
-            const cv::Point source = clean_source_points[source_label];
-            if (source.x < 0) {
-                continue;
-            }
+                    const int clean_label =
+                        clean_labels.at<int>(source.y, source.x);
+                    if (clean_label <= 0) {
+                        continue;
+                    }
 
-            const int clean_label = clean_labels.at<int>(source.y, source.x);
-            if (clean_label <= 0) {
-                continue;
+                    row.push_back(
+                        {clean_label, cv::Point(x, y), source});
+                }
             }
-
-            attachments[candidate_label].push_back(
-                {clean_label, cv::Point(x, y), source});
+        });
+        for (const std::vector<Attachment>& row : row_attachments) {
+            for (const Attachment& attachment : row) {
+                const int label =
+                    candidate_labels.at<int>(attachment.pixel.y,
+                                             attachment.pixel.x);
+                attachments[label].push_back(attachment);
+            }
+        }
+        if (timings != nullptr) {
+            timings->push_back(finish_timing(
+                "component.connect_ridges.attachment_collect", timing));
         }
     }
 
     std::vector<std::vector<CandidateEdge>> edges_by_candidate(
         static_cast<std::size_t>(num_candidates));
-    cv::parallel_for_(cv::Range(1, num_candidates), [&](const cv::Range& range) {
-        for (int label = range.start; label < range.end; ++label) {
+    {
+        const TimingMark timing = start_timing();
+        cv::parallel_for_(cv::Range(1, num_candidates),
+                          [&](const cv::Range& range) {
+            for (int label = range.start; label < range.end; ++label) {
             struct State {
                 int idx = 0;
                 int owner = 0;
@@ -1331,6 +1411,18 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                     }
                     return a.owner > b.owner;
                 }
+            };
+
+            struct LocalEdgeCandidate {
+                int label = 0;
+                int a = 0;
+                int b = 0;
+                float bottleneck_dt = 0.0f;
+                int length = 0;
+                int a_idx = -1;
+                int b_idx = -1;
+                cv::Point clean_a{-1, -1};
+                cv::Point clean_b{-1, -1};
             };
 
             const CandidateWorkspace& workspace = candidate_workspaces[label];
@@ -1386,6 +1478,7 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                 return path;
             };
 
+            std::vector<LocalEdgeCandidate> local_candidates;
             while (!queue.empty()) {
                 const State state = queue.top();
                 queue.pop();
@@ -1411,7 +1504,7 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
 
                     if (owner[next_idx] > 0 &&
                         owner[next_idx] != state.owner) {
-                        CandidateEdge edge;
+                        LocalEdgeCandidate edge;
                         edge.label = label;
                         edge.a = state.owner;
                         edge.b = owner[next_idx];
@@ -1419,17 +1512,11 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                         edge.clean_b = owner_clean[next_idx];
                         edge.bottleneck_dt =
                             std::min(state.bottleneck, best[next_idx]);
-
-                        std::vector<cv::Point> b_path =
-                            path_to_root(next_idx);
-                        std::reverse(b_path.begin(), b_path.end());
-                        edge.path = std::move(b_path);
-                        std::vector<cv::Point> a_path =
-                            path_to_root(state.idx);
-                        edge.path.insert(edge.path.end(), a_path.begin(),
-                                         a_path.end());
-                        edge.length = static_cast<int>(edge.path.size());
-                        local_edges.push_back(std::move(edge));
+                        edge.length =
+                            best_length[next_idx] + best_length[state.idx];
+                        edge.a_idx = state.idx;
+                        edge.b_idx = next_idx;
+                        local_candidates.push_back(edge);
                         continue;
                     }
 
@@ -1453,8 +1540,9 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                 }
             }
 
-            std::sort(local_edges.begin(), local_edges.end(),
-                      [](const CandidateEdge& a, const CandidateEdge& b) {
+            std::sort(local_candidates.begin(), local_candidates.end(),
+                      [](const LocalEdgeCandidate& a,
+                         const LocalEdgeCandidate& b) {
                 const int a0 = std::min(a.a, a.b);
                 const int a1 = std::max(a.a, a.b);
                 const int b0 = std::min(b.a, b.b);
@@ -1471,57 +1559,103 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                 return a.length < b.length;
             });
 
-            std::vector<CandidateEdge> deduped_edges;
-            for (CandidateEdge& edge : local_edges) {
-                if (!deduped_edges.empty()) {
-                    const CandidateEdge& prev = deduped_edges.back();
-                    if (std::min(prev.a, prev.b) == std::min(edge.a, edge.b) &&
-                        std::max(prev.a, prev.b) == std::max(edge.a, edge.b)) {
+            std::vector<LocalEdgeCandidate> deduped_candidates;
+            for (LocalEdgeCandidate& edge : local_candidates) {
+                if (!deduped_candidates.empty()) {
+                    const LocalEdgeCandidate& prev =
+                        deduped_candidates.back();
+                    if (std::min(prev.a, prev.b) ==
+                            std::min(edge.a, edge.b) &&
+                        std::max(prev.a, prev.b) ==
+                            std::max(edge.a, edge.b)) {
                         continue;
                     }
                 }
+                deduped_candidates.push_back(std::move(edge));
+            }
+
+            std::vector<CandidateEdge> deduped_edges;
+            deduped_edges.reserve(deduped_candidates.size());
+            for (const LocalEdgeCandidate& candidate : deduped_candidates) {
+                CandidateEdge edge;
+                edge.label = candidate.label;
+                edge.a = candidate.a;
+                edge.b = candidate.b;
+                edge.bottleneck_dt = candidate.bottleneck_dt;
+                edge.length = candidate.length;
+                edge.clean_a = candidate.clean_a;
+                edge.clean_b = candidate.clean_b;
+
+                std::vector<cv::Point> b_path =
+                    path_to_root(candidate.b_idx);
+                std::reverse(b_path.begin(), b_path.end());
+                edge.path = std::move(b_path);
+                std::vector<cv::Point> a_path =
+                    path_to_root(candidate.a_idx);
+                edge.path.insert(edge.path.end(), a_path.begin(),
+                                 a_path.end());
+                edge.length = static_cast<int>(edge.path.size());
                 deduped_edges.push_back(std::move(edge));
             }
             edges_by_candidate[label] = std::move(deduped_edges);
         }
     });
-
-    std::vector<CandidateEdge> edges;
-    for (int label = 1; label < num_candidates; ++label) {
-        for (CandidateEdge& edge : edges_by_candidate[label]) {
-            edges.push_back(std::move(edge));
+        if (timings != nullptr) {
+            timings->push_back(finish_timing(
+                "component.connect_ridges.candidate_search", timing));
         }
     }
 
-    std::sort(edges.begin(), edges.end(), [](const CandidateEdge& a,
-                                             const CandidateEdge& b) {
-        if (a.bottleneck_dt != b.bottleneck_dt) {
-            return a.bottleneck_dt > b.bottleneck_dt;
+    std::vector<CandidateEdge> edges;
+    {
+        const TimingMark timing = start_timing();
+        for (int label = 1; label < num_candidates; ++label) {
+            for (CandidateEdge& edge : edges_by_candidate[label]) {
+                edges.push_back(std::move(edge));
+            }
         }
-        if (a.length != b.length) {
-            return a.length < b.length;
+
+        std::sort(edges.begin(), edges.end(), [](const CandidateEdge& a,
+                                                 const CandidateEdge& b) {
+            if (a.bottleneck_dt != b.bottleneck_dt) {
+                return a.bottleneck_dt > b.bottleneck_dt;
+            }
+            if (a.length != b.length) {
+                return a.length < b.length;
+            }
+            return a.label < b.label;
+        });
+        if (timings != nullptr) {
+            timings->push_back(
+                finish_timing("component.connect_ridges.edge_sort", timing));
         }
-        return a.label < b.label;
-    });
+    }
 
     cv::Mat out = clean.clone();
-    DisjointSet sets(num_clean_components);
-    for (const CandidateEdge& edge : edges) {
-        if (!sets.unite(edge.a, edge.b)) {
-            continue;
-        }
-        for (const cv::Point pixel : edge.path) {
-            out.at<std::uint8_t>(pixel.y, pixel.x) = 255;
-        }
-        if (!edge.path.empty()) {
-            if (edge.clean_a.x >= 0) {
-                cv::line(out, edge.clean_a, edge.path.back(), cv::Scalar(255),
-                         1, cv::LINE_8);
+    {
+        const TimingMark timing = start_timing();
+        DisjointSet sets(num_clean_components);
+        for (const CandidateEdge& edge : edges) {
+            if (!sets.unite(edge.a, edge.b)) {
+                continue;
             }
-            if (edge.clean_b.x >= 0) {
-                cv::line(out, edge.clean_b, edge.path.front(), cv::Scalar(255),
-                         1, cv::LINE_8);
+            for (const cv::Point pixel : edge.path) {
+                out.at<std::uint8_t>(pixel.y, pixel.x) = 255;
             }
+            if (!edge.path.empty()) {
+                if (edge.clean_a.x >= 0) {
+                    cv::line(out, edge.clean_a, edge.path.back(),
+                             cv::Scalar(255), 1, cv::LINE_8);
+                }
+                if (edge.clean_b.x >= 0) {
+                    cv::line(out, edge.clean_b, edge.path.front(),
+                             cv::Scalar(255), 1, cv::LINE_8);
+                }
+            }
+        }
+        if (timings != nullptr) {
+            timings->push_back(
+                finish_timing("component.connect_ridges.mst_emit", timing));
         }
     }
 
@@ -5978,7 +6112,8 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
     {
         const TimingMark timing = start_timing();
         connected_skeleton = connect_clean_skeleton_with_source_ridges(
-            boundary_skeleton_pruned, source_pixel_ridges, dt_to_component);
+            boundary_skeleton_pruned, source_pixel_ridges, dt_to_component,
+            &timings);
         timings.push_back(finish_timing("component.connect_ridges", timing));
     }
     cv::Mat cell_loops_connected;
