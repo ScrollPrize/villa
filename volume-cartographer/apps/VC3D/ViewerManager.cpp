@@ -104,7 +104,11 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
 
     auto* win = mdiArea->addSubWindow(widget);
     win->setWindowTitle(title);
-    win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
+    win->setWindowFlags(Qt::SubWindow |
+                        Qt::WindowTitleHint |
+                        Qt::WindowSystemMenuHint |
+                        Qt::WindowMinMaxButtonsHint |
+                        Qt::WindowCloseButtonHint);
     win->setAttribute(Qt::WA_DeleteOnClose);
     win->installEventFilter(widget);
 
