@@ -105,7 +105,7 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     _spinApprovalBrushRadius = new QDoubleSpinBox(approvalParent);
     _spinApprovalBrushRadius->setDecimals(0);
     _spinApprovalBrushRadius->setRange(1.0, 1000.0);
-    _spinApprovalBrushRadius->setSingleStep(10.0);
+    _spinApprovalBrushRadius->setSingleStep(1.0);
     _spinApprovalBrushRadius->setToolTip(tr("Brush radius. In the flattened segmentation view this is measured in approval-mask pixels; in plane views it is the cylinder radius in native voxels."));
     approvalBrushRow->addWidget(brushRadiusLabel);
     approvalBrushRow->addWidget(_spinApprovalBrushRadius);
@@ -114,7 +114,7 @@ SegmentationApprovalMaskPanel::SegmentationApprovalMaskPanel(const QString& sett
     _spinApprovalBrushDepth = new QDoubleSpinBox(approvalParent);
     _spinApprovalBrushDepth->setDecimals(0);
     _spinApprovalBrushDepth->setRange(1.0, 500.0);
-    _spinApprovalBrushDepth->setSingleStep(5.0);
+    _spinApprovalBrushDepth->setSingleStep(1.0);
     _spinApprovalBrushDepth->setToolTip(tr("Cylinder depth: rectangle height in flattened view, painting thickness from plane views (native voxels)."));
     approvalBrushRow->addWidget(brushDepthLabel);
     approvalBrushRow->addWidget(_spinApprovalBrushDepth);
