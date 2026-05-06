@@ -296,11 +296,12 @@ void ViewerOverlayControllerBase::scheduleRebuild(VolumeViewerBase* viewer)
 
 void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
 {
-    auto it = std::remove_if(_viewers.begin(), _viewers.end(), [viewer](const ViewerEntry& entry) {
-        return entry.viewer == viewer;
-    });
+    for (auto iter = _viewers.begin(); iter != _viewers.end();) {
+        if (iter->viewer != viewer) {
+            ++iter;
+            continue;
+        }
 
-    for (auto iter = it; iter != _viewers.end(); ++iter) {
         QObject::disconnect(iter->overlaysUpdatedConn);
         QObject::disconnect(iter->destroyedConn);
         if (iter->rebuildTimer) {
@@ -311,9 +312,8 @@ void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
         if (iter->viewer) {
             iter->viewer->clearOverlayGroup(_overlayGroupKey);
         }
+        iter = _viewers.erase(iter);
     }
-
-    _viewers.erase(it, _viewers.end());
 }
 
 void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
