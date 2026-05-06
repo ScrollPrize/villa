@@ -12,6 +12,7 @@ import zarr
 from tqdm import tqdm
 
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
 from vesuvius.neural_tracing.inference.extrap_lookup import ExtrapLookupArrays
 from vesuvius.neural_tracing.inference.common import (
     _bbox_to_min_corner_and_bounds_array,
@@ -22,7 +23,6 @@ from vesuvius.neural_tracing.inference.common import (
     _flat_index_dtype_for_shape,
     _get_growth_context,
     _initialize_window_state,
-    _points_to_voxels,
     _print_agg_extrap_sampling_debug,
     _print_bbox_crop_debug_table,
     _print_iteration_summary,
@@ -80,7 +80,7 @@ def parse_args(argv=None):
         choices=[*_ALL_GROW_DIRECTION_ORDER, "all"],
     )
     parser.add_argument("--cond-pct", type=float, default=0.50)
-    parser.add_argument("--crop-size", type=int, nargs=3, default=[128, 128, 128])
+    parser.add_argument("--crop-size", type=int, nargs=3, default=None)
     parser.add_argument("--window-pad", type=int, default=20)
     parser.add_argument("--bbox-overlap-frac", type=float, default=0.0)
     parser.add_argument("--checkpoint-path", type=str, default=None)
@@ -269,6 +269,8 @@ def parse_args(argv=None):
         parser.error("--rbf-max-points must be >= 1 when provided")
     if args.bbox_overlap_frac < 0.0 or args.bbox_overlap_frac >= 1.0:
         parser.error("--bbox-overlap-frac must be in [0, 1)")
+    if args.crop_size is not None and len(args.crop_size) != 3:
+        parser.error("--crop-size must have exactly 3 values")
     if args.batch_size < 1:
         parser.error("--batch-size must be >= 1")
     if args.iterations < 1:
@@ -389,6 +391,24 @@ def _dense_args_to_argv(dense_args):
     if "tta" in dense_args and (dense_args.get("tta") is False):
         argv.append("--no-tta")
     return argv
+
+
+def _resolve_crop_size(args, model_config):
+    crop_size = getattr(args, "crop_size", None)
+    if crop_size is None:
+        crop_cfg = None if model_config is None else model_config.get("crop_size")
+        if crop_cfg is None:
+            return (128, 128, 128)
+        if isinstance(crop_cfg, (list, tuple)):
+            if len(crop_cfg) != 3:
+                raise RuntimeError(f"Checkpoint crop_size must be an int or 3-element list, got {crop_cfg!r}")
+            return tuple(int(v) for v in crop_cfg)
+        size = int(crop_cfg)
+        return (size, size, size)
+
+    if isinstance(crop_size, (list, tuple)) and len(crop_size) == 3:
+        return tuple(int(v) for v in crop_size)
+    raise RuntimeError(f"--crop-size must be an int triplet, got {crop_size!r}")
 
 
 def _empty_uv(dtype=np.int64):
@@ -625,6 +645,84 @@ def _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup):
     return extrap_uv, extrap_world
 
 
+def _voxelize_masked_surface_for_crop(surface_zyxs, surface_valid, min_corner, crop_size):
+    crop_size = tuple(int(v) for v in crop_size)
+    surface_zyxs = np.asarray(surface_zyxs, dtype=np.float32)
+    surface_valid = np.asarray(surface_valid, dtype=bool)
+    if (
+        surface_zyxs.ndim != 3
+        or surface_zyxs.shape[-1] != 3
+        or surface_valid.shape != surface_zyxs.shape[:2]
+        or surface_zyxs.shape[0] == 0
+        or surface_zyxs.shape[1] == 0
+    ):
+        return np.zeros(crop_size, dtype=np.float32)
+
+    min_corner32 = np.asarray(min_corner, dtype=np.float32)
+    crop_size32 = np.asarray(crop_size, dtype=np.float32)
+    finite_valid = surface_valid & np.isfinite(surface_zyxs).all(axis=2)
+    if not bool(finite_valid.any()):
+        return np.zeros(crop_size, dtype=np.float32)
+
+    # Restrict rasterization to the relevant UV neighborhood while keeping a
+    # one-cell margin, so line segments crossing the crop boundary are preserved.
+    max_corner32 = min_corner32 + crop_size32
+    near_crop = (
+        finite_valid
+        & (surface_zyxs[..., 0] >= (min_corner32[0] - 1.0))
+        & (surface_zyxs[..., 0] <= max_corner32[0])
+        & (surface_zyxs[..., 1] >= (min_corner32[1] - 1.0))
+        & (surface_zyxs[..., 1] <= max_corner32[1])
+        & (surface_zyxs[..., 2] >= (min_corner32[2] - 1.0))
+        & (surface_zyxs[..., 2] <= max_corner32[2])
+    )
+    rows, cols = np.where(near_crop)
+    if rows.size == 0:
+        return np.zeros(crop_size, dtype=np.float32)
+
+    r0 = max(0, int(rows.min()) - 1)
+    r1 = min(surface_zyxs.shape[0], int(rows.max()) + 2)
+    c0 = max(0, int(cols.min()) - 1)
+    c1 = min(surface_zyxs.shape[1], int(cols.max()) + 2)
+    local_grid = (surface_zyxs[r0:r1, c0:c1] - min_corner32[None, None, :]).astype(np.float32, copy=False)
+    local_valid = finite_valid[r0:r1, c0:c1]
+    return voxelize_surface_grid_masked(local_grid, crop_size, local_valid).astype(np.float32, copy=False)
+
+
+def _voxelize_uv_world_samples_for_crop(uv, world, min_corner, crop_size):
+    uv_int, world32 = _coerce_uv_world(
+        uv,
+        world,
+        uv_dtype=np.int64,
+        world_dtype=np.float32,
+    )
+    if uv_int.shape[0] == 0:
+        return np.zeros(tuple(int(v) for v in crop_size), dtype=np.float32)
+
+    finite = np.isfinite(world32).all(axis=1)
+    if not bool(finite.any()):
+        return np.zeros(tuple(int(v) for v in crop_size), dtype=np.float32)
+    uv_int = uv_int[finite].astype(np.int64, copy=False)
+    world32 = world32[finite].astype(np.float32, copy=False)
+
+    r_min = int(uv_int[:, 0].min())
+    r_max = int(uv_int[:, 0].max())
+    c_min = int(uv_int[:, 1].min())
+    c_max = int(uv_int[:, 1].max())
+    h = r_max - r_min + 1
+    w = c_max - c_min + 1
+    if h < 1 or w < 1:
+        return np.zeros(tuple(int(v) for v in crop_size), dtype=np.float32)
+
+    grid = np.zeros((h, w, 3), dtype=np.float32)
+    valid = np.zeros((h, w), dtype=bool)
+    rr = uv_int[:, 0] - r_min
+    cc = uv_int[:, 1] - c_min
+    grid[rr, cc] = world32
+    valid[rr, cc] = True
+    return _voxelize_masked_surface_for_crop(grid, valid, min_corner, crop_size)
+
+
 def _build_bbox_crops(
     bboxes,
     tgt_segment,
@@ -677,12 +775,15 @@ def _build_bbox_crops(
         if not bool(cond_in_bounds.any()):
             cond_uv = np.zeros((0, 2), dtype=cond_uv_all.dtype)
             cond_world = np.zeros((0, 3), dtype=np.float32)
-            cond_local = np.zeros((0, 3), dtype=np.float32)
         else:
             cond_uv = cond_uv_all[cond_in_bounds].astype(cond_uv_all.dtype, copy=False)
             cond_world = cond_world_all[cond_in_bounds].astype(np.float32, copy=False)
-            cond_local = (cond_world - min_corner32[None, :]).astype(np.float32, copy=False)
-        cond_vox = _points_to_voxels(cond_local, crop_size)
+        cond_vox = _voxelize_masked_surface_for_crop(
+            cond_zyxs32,
+            cond_valid_base,
+            min_corner32,
+            crop_size,
+        )
         uv_query = _build_uv_query_from_edge_band(cond_uv, grow_direction, cond_pct)
         uv_query_flat = _coerce_uv_int_array(
             uv_query.reshape(-1, 2),
@@ -691,13 +792,15 @@ def _build_bbox_crops(
         )
 
         extrap_uv, extrap_world = _lookup_extrap_for_uv_query_flat(uv_query_flat, extrap_lookup)
-        if extrap_world.shape[0] > 0:
-            extrap_local = extrap_world - min_corner32[None, :]
-        else:
+        if extrap_world.shape[0] == 0:
             extrap_uv = np.zeros((0, 2), dtype=np.int64)
             extrap_world = np.zeros((0, 3), dtype=np.float32)
-            extrap_local = np.zeros((0, 3), dtype=np.float32)
-        extrap_vox = _points_to_voxels(extrap_local, crop_size)
+        extrap_vox = _voxelize_uv_world_samples_for_crop(
+            extrap_uv,
+            extrap_world,
+            min_corner32,
+            crop_size,
+        )
         cond_world_out = cond_world if keep_debug_points else np.zeros((0, 3), dtype=np.float32)
         extrap_world_out = extrap_world if keep_debug_points else np.zeros((0, 3), dtype=np.float32)
 
@@ -2453,8 +2556,6 @@ def _run_growth_direction_step(
 
 
 def _run_with_args(args, parse_done):
-    call_args = _serialize_args(args)
-    crop_size = tuple(int(v) for v in args.crop_size)
     profiler = _RuntimeProfiler(enabled=args.profile, device=args.device)
     run_start = None
     if args.profile:
@@ -2499,6 +2600,9 @@ def _run_with_args(args, parse_done):
             model_config=model_config,
             load_checkpoint_config_fn=load_checkpoint_config,
         )
+    crop_size = _resolve_crop_size(args, model_config)
+    args.crop_size = list(crop_size)
+    call_args = _serialize_args(args)
 
     with profiler.section("setup_segment"):
         if str(args.volume_path).startswith("s3://"):
