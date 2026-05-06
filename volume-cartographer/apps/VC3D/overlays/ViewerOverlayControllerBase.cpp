@@ -241,6 +241,7 @@ ViewerOverlayControllerBase::~ViewerOverlayControllerBase()
     detachAllViewers();
     if (_manager) {
         QObject::disconnect(_managerCreatedConn);
+        QObject::disconnect(_managerClosingConn);
         QObject::disconnect(_managerDestroyedConn);
     }
 }
@@ -324,6 +325,7 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
 
     if (_manager) {
         QObject::disconnect(_managerCreatedConn);
+        QObject::disconnect(_managerClosingConn);
         QObject::disconnect(_managerDestroyedConn);
     }
 
@@ -335,6 +337,10 @@ void ViewerOverlayControllerBase::bindToViewerManager(ViewerManager* manager)
     _managerCreatedConn = QObject::connect(_manager, &ViewerManager::baseViewerCreated,
                                            this, [this](VolumeViewerBase* viewer) {
                                                attachViewer(viewer);
+                                           });
+    _managerClosingConn = QObject::connect(_manager, &ViewerManager::baseViewerClosing,
+                                           this, [this](VolumeViewerBase* viewer) {
+                                               detachViewer(viewer);
                                            });
 
     QObject::disconnect(_managerDestroyedConn);

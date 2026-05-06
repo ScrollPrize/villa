@@ -81,24 +81,24 @@ public:
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
-    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { _compositeSettings = s; scheduleRender("setCompositeRenderSettings"); }
+    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { if (_closing) return; _compositeSettings = s; scheduleRender("setCompositeRenderSettings"); }
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
     bool isCompositeEnabled() const override { return _compositeSettings.enabled && !streamingCompositeUnsupported(); }
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
     void setVolumeWindow(float low, float high) override;
-    void setBaseColormap(const std::string& id) override { _baseColormapId = id; scheduleRender("setBaseColormap"); }
-    void setStretchValues(bool) { scheduleRender("setStretchValues"); }
+    void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; scheduleRender("setBaseColormap"); }
+    void setStretchValues(bool) { if (_closing) return; scheduleRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
 
-    void setShowDirectionHints(bool on) override { _showDirectionHints = on; emit overlaysUpdated(); }
+    void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
-    void setShowSurfaceNormals(bool on) override { _showSurfaceNormals = on; emit overlaysUpdated(); }
+    void setShowSurfaceNormals(bool on) override { if (_closing) return; _showSurfaceNormals = on; emit overlaysUpdated(); }
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
     float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
     int normalMaxArrows() const override { return _normalMaxArrows; }
-    void setNormalArrowLengthScale(float scale) override { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
-    void setNormalMaxArrows(int maxArrows) override { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
+    void setNormalArrowLengthScale(float scale) override { if (_closing) return; _normalArrowLengthScale = scale; emit overlaysUpdated(); }
+    void setNormalMaxArrows(int maxArrows) override { if (_closing) return; _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
     void setOverlayOpacity(float opacity) override;
@@ -106,7 +106,7 @@ public:
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
 
-    void setSegmentationEditActive(bool active) override { _segmentationEditActive = active; }
+    void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
     void setSegmentationCursorMirroring(bool) override {}
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
@@ -135,17 +135,17 @@ public:
     float intersectionOpacity() const override { return _intersectionOpacity; }
     float intersectionThickness() const override { return _intersectionThickness; }
     int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
-    void setIntersectionOpacity(float v) override { _intersectionOpacity = v; renderIntersections("setIntersectionOpacity"); }
-    void setIntersectionThickness(float v) override { _intersectionThickness = v; renderIntersections("setIntersectionThickness"); }
+    void setIntersectionOpacity(float v) override { if (_closing) return; _intersectionOpacity = v; renderIntersections("setIntersectionOpacity"); }
+    void setIntersectionThickness(float v) override { if (_closing) return; _intersectionThickness = v; renderIntersections("setIntersectionThickness"); }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
-    void setSurfacePatchSamplingStride(int s) override { _surfacePatchSamplingStride = s; invalidateIntersect(); renderIntersections("setSurfacePatchSamplingStride"); }
+    void setSurfacePatchSamplingStride(int s) override { if (_closing) return; _surfacePatchSamplingStride = s; invalidateIntersect(); renderIntersections("setSurfacePatchSamplingStride"); }
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;
     float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
-    void setSurfaceOverlayEnabled(bool enabled) override { _surfaceOverlayEnabled = enabled; emit overlaysUpdated(); }
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { _surfaceOverlays = overlays; emit overlaysUpdated(); }
-    void setSurfaceOverlapThreshold(float threshold) override { _surfaceOverlapThreshold = std::max(0.0f, threshold); emit overlaysUpdated(); }
+    void setSurfaceOverlayEnabled(bool enabled) override { if (_closing) return; _surfaceOverlayEnabled = enabled; emit overlaysUpdated(); }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { if (_closing) return; _surfaceOverlays = overlays; emit overlaysUpdated(); }
+    void setSurfaceOverlapThreshold(float threshold) override { if (_closing) return; _surfaceOverlapThreshold = std::max(0.0f, threshold); emit overlaysUpdated(); }
 
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;

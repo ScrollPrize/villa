@@ -228,6 +228,7 @@ SurfaceRotationOverlayController::~SurfaceRotationOverlayController()
     clearWidgets();
     if (_viewerManager) {
         QObject::disconnect(_viewerCreatedConn);
+        QObject::disconnect(_viewerClosingConn);
         QObject::disconnect(_managerDestroyedConn);
     }
 }
@@ -240,6 +241,7 @@ void SurfaceRotationOverlayController::setViewerManager(ViewerManager* manager)
     clearWidgets();
     if (_viewerManager) {
         QObject::disconnect(_viewerCreatedConn);
+        QObject::disconnect(_viewerClosingConn);
         QObject::disconnect(_managerDestroyedConn);
     }
 
@@ -250,6 +252,8 @@ void SurfaceRotationOverlayController::setViewerManager(ViewerManager* manager)
 
     _viewerCreatedConn = QObject::connect(_viewerManager, &ViewerManager::baseViewerCreated,
                                           this, [this](auto* viewer) { attachViewer(viewer); });
+    _viewerClosingConn = QObject::connect(_viewerManager, &ViewerManager::baseViewerClosing,
+                                          this, [this](auto* viewer) { detachViewer(viewer); });
     _managerDestroyedConn = QObject::connect(_viewerManager, &QObject::destroyed,
                                              this, [this]() {
                                                  clearWidgets();

@@ -146,10 +146,9 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
 
     _baseViewers.push_back(baseViewer);
 
-    // Clean up when viewer is destroyed (e.g. MDI sub-window closed)
+    // Clean up when viewer is destroyed without an earlier close event.
     connect(widget, &QObject::destroyed, this, [this, baseViewer]() {
-        _resetDefaults.erase(baseViewer);
-        _baseViewers.erase(std::remove(_baseViewers.begin(), _baseViewers.end(), baseViewer), _baseViewers.end());
+        unregisterViewer(baseViewer);
     });
 
     for (auto* overlay : _allOverlays) {
@@ -170,6 +169,27 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     }
     emit baseViewerCreated(baseViewer);
     return baseViewer;
+}
+
+void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
+{
+    if (!viewer) {
+        return;
+    }
+
+    const auto viewerIt = std::find(_baseViewers.begin(), _baseViewers.end(), viewer);
+    const bool knownViewer = viewerIt != _baseViewers.end() ||
+                             _resetDefaults.find(viewer) != _resetDefaults.end();
+    if (!knownViewer) {
+        return;
+    }
+
+    emit baseViewerClosing(viewer);
+    if (_segmentationModule) {
+        _segmentationModule->detachViewer(viewer);
+    }
+    _resetDefaults.erase(viewer);
+    _baseViewers.erase(std::remove(_baseViewers.begin(), _baseViewers.end(), viewer), _baseViewers.end());
 }
 
 void ViewerManager::registerOverlay(ViewerOverlayControllerBase* overlay)

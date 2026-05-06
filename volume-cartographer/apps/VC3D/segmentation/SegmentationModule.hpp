@@ -138,6 +138,7 @@ public:
     void saveCorrectionPoints(const std::filesystem::path& segmentPath);
 
     void attachViewer(VolumeViewerBase* viewer);
+    void detachViewer(VolumeViewerBase* viewer);
     void updateViewerCursors();
 
     bool handleKeyPress(QKeyEvent* event);

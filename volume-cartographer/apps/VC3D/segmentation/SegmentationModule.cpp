@@ -489,20 +489,7 @@ void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
     viewer->setSegmentationEditActive(_editingEnabled);
     _attachedViewers.insert(viewer);
     connect(viewerObject, &QObject::destroyed, this, [this, viewer]() {
-        _attachedViewers.remove(viewer);
-        if (_hover.viewer == viewer) {
-            _hover.clear();
-        }
-        if (_drag.viewer == viewer) {
-            _drag.viewer = nullptr;
-        }
-        if (_correctionDrag.viewer == viewer) {
-            _correctionDrag.viewer = nullptr;
-        }
-        if (_hoverPointer.viewer == viewer) {
-            _hoverPointer.valid = false;
-            _hoverPointer.viewer = nullptr;
-        }
+        detachViewer(viewer);
     });
 }
 
@@ -510,6 +497,27 @@ void SegmentationModule::attachViewer(VolumeViewerBase* viewer)
 {
     bindViewerSignals(viewer);
     updateViewerCursors();
+}
+
+void SegmentationModule::detachViewer(VolumeViewerBase* viewer)
+{
+    if (!viewer) {
+        return;
+    }
+    _attachedViewers.remove(viewer);
+    if (_hover.viewer == viewer) {
+        _hover.clear();
+    }
+    if (_drag.viewer == viewer) {
+        _drag.viewer = nullptr;
+    }
+    if (_correctionDrag.viewer == viewer) {
+        _correctionDrag.viewer = nullptr;
+    }
+    if (_hoverPointer.viewer == viewer) {
+        _hoverPointer.valid = false;
+        _hoverPointer.viewer = nullptr;
+    }
 }
 
 void SegmentationModule::updateViewerCursors()
