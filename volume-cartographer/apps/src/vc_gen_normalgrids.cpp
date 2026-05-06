@@ -803,9 +803,8 @@ void run_generate(const po::variables_map& vm) {
     for (SliceDirection dir : directions_to_run) {
         const auto batch_plan = vc::core::util::planNormalGridBatch(
             shape,
+            source_chunk_shape,
             to_normal_grid_direction(dir),
-            num_threads,
-            sparse_volume,
             chunk_budget_mib,
             dtype_size);
         max_estimated_batch_bytes = std::max(max_estimated_batch_bytes, batch_plan.estimatedBatchBytes);
@@ -887,9 +886,8 @@ void run_generate(const po::variables_map& vm) {
 
         const auto batch_plan = vc::core::util::planNormalGridBatch(
             shape,
+            source_chunk_shape,
             to_normal_grid_direction(dir),
-            num_threads,
-            sparse_volume,
             chunk_budget_mib,
             dtype_size);
         const size_t chunk_size_tgt = std::max<size_t>(1, batch_plan.chunkSizeTarget);

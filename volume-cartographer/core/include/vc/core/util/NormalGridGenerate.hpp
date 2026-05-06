@@ -114,22 +114,21 @@ inline std::vector<NormalGridSampledChunkPlan> planNormalGridSampledChunks(
 
 inline NormalGridBatchPlan planNormalGridBatch(
     const std::vector<size_t>& shape,
+    const std::vector<size_t>& sourceChunkShape,
     NormalGridSliceDirection direction,
-    int numThreads,
-    int sparseVolume,
     size_t chunkBudgetMiB,
     size_t bytesPerVoxel = 1)
 {
-    if (shape.size() != 3) {
-        throw std::runtime_error("planNormalGridBatch expects 3D ZYX shape");
+    if (shape.size() != 3 || sourceChunkShape.size() != 3) {
+        throw std::runtime_error("planNormalGridBatch expects 3D ZYX shape/chunkShape");
     }
     if (bytesPerVoxel == 0) {
         throw std::runtime_error("bytesPerVoxel must be > 0");
     }
 
     const size_t budgetBytes = chunkBudgetMiB * 1024ull * 1024ull;
-    const size_t threadSlices = static_cast<size_t>(std::max(1, numThreads)) *
-                                static_cast<size_t>(std::max(1, sparseVolume));
+    const size_t sliceAxis = normalGridSliceAxis(direction);
+    const size_t sourceChunkSliceAxisLen = sourceChunkShape[sliceAxis];
 
     size_t bytesPerSlice = 0;
     switch (direction) {
@@ -144,11 +143,16 @@ inline NormalGridBatchPlan planNormalGridBatch(
         break;
     }
 
-    size_t chunkSizeTarget = threadSlices;
+    // N = clamp(1, sourceChunkSliceAxisLen, floor(budget / bytesPerSlice)).
+    // Capping at sourceChunkSliceAxisLen means at most one chunk-walk per
+    // source chunk; raising budget above (sourceChunkSliceAxisLen *
+    // bytesPerSlice) buys nothing beyond that.
+    size_t chunkSizeTarget = 1;
     if (bytesPerSlice > 0 && budgetBytes > 0) {
-        chunkSizeTarget = std::max<size_t>(1, std::min(threadSlices, budgetBytes / bytesPerSlice));
-    } else if (budgetBytes == 0) {
-        chunkSizeTarget = 1;
+        chunkSizeTarget = std::max<size_t>(1, budgetBytes / bytesPerSlice);
+    }
+    if (sourceChunkSliceAxisLen > 0) {
+        chunkSizeTarget = std::min(chunkSizeTarget, sourceChunkSliceAxisLen);
     }
 
     return NormalGridBatchPlan{
