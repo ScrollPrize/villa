@@ -44,3 +44,7 @@ volume-cartographer/AGENTS.md
 *.gcno
 /volume-cartographer/coverage/
 /coverage/
+
+# Dead-code analysis outputs
+/volume-cartographer/dead-code/
+/dead-code/

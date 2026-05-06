@@ -104,7 +104,12 @@
     { "name": "ci-strict-warnings-gcc",  "displayName": "CI Strict warnings + -Werror (gcc)",
       "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
     { "name": "ci-strict-warnings-clang","displayName": "CI Strict warnings + -Werror (clang)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } }
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
+
+    { "name": "ci-dead-code-gcc",        "displayName": "CI Dead-code report (gcc, Debug, no LTO)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
+    { "name": "ci-dead-code-clang",      "displayName": "CI Dead-code report (clang, Debug, no LTO)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } }
   ],
 
   "buildPresets": [
@@ -128,7 +133,9 @@
     { "name": "ci-coverage-gcc",          "configurePreset": "ci-coverage-gcc" },
     { "name": "ci-coverage-clang",        "configurePreset": "ci-coverage-clang" },
     { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc" },
-    { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" }
+    { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" },
+    { "name": "ci-dead-code-gcc",         "configurePreset": "ci-dead-code-gcc" },
+    { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" }
   ],
 
   "testPresets": [

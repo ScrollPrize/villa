@@ -94,3 +94,28 @@ jobs:
       - name: Total coverage non-regression vs base branch
         if: github.event_name == 'pull_request'
         run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }}
+
+  dead-code:
+    name: Dead-code report (clang, --print-gc-sections)
+    needs: changes
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build builder image
+        run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
+      - name: Run dead-code analysis
+        run: volume-cartographer/scripts/ci.sh dead-code ubuntu-24.04 clang
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dead-code
+          path: volume-cartographer/dead-code/
+      - name: Step summary
+        run: |
+          {
+            echo "## Dead-code report"
+            echo '```'
+            cat volume-cartographer/dead-code/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
