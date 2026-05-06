@@ -674,14 +674,21 @@ void run_generate(const po::variables_map& vm) {
                     std::chrono::steady_clock::now() - read_start).count();
                 dir_metrics.timingCounts["read_chunk"] += 1;
 
-                for (auto& assembled : assembled_slices) {
+                const auto extract_start = std::chrono::steady_clock::now();
+                const auto normal_grid_dir = to_normal_grid_direction(dir);
+                #pragma omp parallel for schedule(static)
+                for (size_t assembled_index = 0; assembled_index < assembled_slices.size(); ++assembled_index) {
+                    auto& assembled = assembled_slices[assembled_index];
                     const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
                         chunk_data,
-                        to_normal_grid_direction(dir),
+                        normal_grid_dir,
                         assembled.localSliceIndex,
                         assembled.binarySlice);
                     assembled.anyNonZero = assembled.anyNonZero || any_nonzero;
                 }
+                dir_metrics.timingTotals["extract_slices"] += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - extract_start).count();
+                dir_metrics.timingCounts["extract_slices"] += 1;
             }
 
             std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));
