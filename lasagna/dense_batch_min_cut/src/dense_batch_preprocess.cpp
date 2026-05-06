@@ -133,6 +133,9 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
         if (name.rfind("dense_grid.", 0) == 0) {
             return "dense_backtrack_grid_carrier";
         }
+        if (name.rfind("dense_graph_route.", 0) == 0) {
+            return "dense_backtrack_graph_route";
+        }
         return {};
     };
     auto display_stage_name = [&](const std::string& name) -> std::string {
@@ -153,6 +156,10 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
         }
         if (name.rfind("dense_grid.", 0) == 0) {
             return "    " + name.substr(std::string("dense_grid.").size());
+        }
+        if (name.rfind("dense_graph_route.", 0) == 0) {
+            return "    " +
+                   name.substr(std::string("dense_graph_route.").size());
         }
         return name;
     };
@@ -2276,6 +2283,7 @@ struct GraphEdge {
 struct SkeletonGraph {
     std::vector<cv::Point2f> nodes;
     std::vector<GraphEdge> edges;
+    std::vector<std::vector<cv::Point>> node_pixel_groups;
     cv::Mat node_mask;
     cv::Mat edge_mask;
     int skeleton_pixels = 0;
@@ -2758,6 +2766,7 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
     cv::Mat missing;
     cv::bitwise_and(skel, ~covered, missing);
     graph.missing_pixels = cv::countNonZero(missing);
+    graph.node_pixel_groups = std::move(node_pixels);
 
     return graph;
 }
@@ -3356,9 +3365,11 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                                                   const cv::Mat& dt,
                                                   const cv::Mat& graph_pixel_flow,
                                                   const cv::Mat& graph_node_flow,
-                                                  const cv::Mat& source_edge_mask,
-                                                  const cv::Mat& graph_node_mask,
                                                   const SkeletonGraph& graph,
+                                                  const std::vector<double>& node_flow,
+                                                  const std::vector<float>& edge_flow,
+                                                  int source_seed_node,
+                                                  const std::vector<char>& source_edges,
                                                   int grid_step,
                                                   float backtrack_distance,
                                                   bool enable_debug_outputs) {
@@ -3366,8 +3377,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
     CV_Assert(dt.type() == CV_32F);
     CV_Assert(graph_pixel_flow.type() == CV_32F);
     CV_Assert(graph_node_flow.type() == CV_32F);
-    CV_Assert(source_edge_mask.type() == CV_8U);
-    CV_Assert(graph_node_mask.type() == CV_8U);
+    CV_Assert(node_flow.size() == graph.nodes.size());
+    CV_Assert(edge_flow.size() == graph.edges.size());
 
     DenseBacktrackResult result;
     result.nn_flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
@@ -3433,120 +3444,334 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
 
     {
         const TimingMark timing = start_timing();
-        std::vector<float> graph_route_flow(
-            static_cast<std::size_t>(pixel_count), 0.0f);
-        std::vector<float> graph_route_distance(
-            static_cast<std::size_t>(pixel_count),
-            std::numeric_limits<float>::infinity());
-        struct GraphRouteItem {
-            float distance = 0.0f;
-            int index = -1;
-            bool operator<(const GraphRouteItem& other) const {
-                return distance > other.distance;
-            }
+        const int node_count = static_cast<int>(graph.nodes.size());
+        const auto valid_node = [&](const int node) {
+            return node > 0 && node < node_count;
         };
-        std::priority_queue<GraphRouteItem> graph_queue;
-        int graph_edge_pixels = 0;
-        int graph_node_pixels = 0;
+        const auto in_bounds = [&](const cv::Point pixel) {
+            return pixel.x >= 0 && pixel.x < cols && pixel.y >= 0 &&
+                   pixel.y < rows;
+        };
+
+        struct RouteNeighbor {
+            int node = -1;
+            int edge = -1;
+            double distance = 0.0;
+        };
+
+        std::vector<std::vector<RouteNeighbor>> route_graph(
+            static_cast<std::size_t>(node_count));
+        std::vector<std::vector<float>> edge_prefix(
+            static_cast<std::size_t>(graph.edges.size()));
+        std::vector<float> edge_length(
+            static_cast<std::size_t>(graph.edges.size()), 0.0f);
+        {
+            const TimingMark sub_timing = start_timing();
+            for (int edge_index = 0;
+                 edge_index < static_cast<int>(graph.edges.size());
+                 ++edge_index) {
+                const GraphEdge& edge = graph.edges[edge_index];
+                std::vector<float>& prefix =
+                    edge_prefix[static_cast<std::size_t>(edge_index)];
+                prefix.resize(edge.pixels.size(), 0.0f);
+                for (std::size_t i = 1; i < edge.pixels.size(); ++i) {
+                    prefix[i] = prefix[i - 1] +
+                                step_distance(edge.pixels[i - 1],
+                                              edge.pixels[i]);
+                }
+                edge_length[static_cast<std::size_t>(edge_index)] =
+                    prefix.empty() ? 0.0f : prefix.back();
+
+                if (!valid_node(edge.a) || !valid_node(edge.b) ||
+                    edge.a == edge.b) {
+                    continue;
+                }
+                const double distance =
+                    std::max<double>(edge_length[edge_index], 1.0);
+                route_graph[edge.a].push_back(
+                    {edge.b, edge_index, distance});
+                route_graph[edge.b].push_back(
+                    {edge.a, edge_index, distance});
+            }
+            result.timings.push_back(
+                finish_timing("dense_graph_route.adjacency", sub_timing));
+        }
+
+        std::vector<double> node_route_distance(
+            static_cast<std::size_t>(node_count),
+            std::numeric_limits<double>::infinity());
+        std::vector<int> node_route_prev_edge(
+            static_cast<std::size_t>(node_count), -1);
+        {
+            const TimingMark sub_timing = start_timing();
+            struct NodeRouteItem {
+                double distance = 0.0;
+                int node = -1;
+                bool operator<(const NodeRouteItem& other) const {
+                    return distance > other.distance;
+                }
+            };
+            std::priority_queue<NodeRouteItem> node_queue;
+            if (valid_node(source_seed_node)) {
+                node_route_distance[source_seed_node] = 0.0;
+                node_queue.push({0.0, source_seed_node});
+            }
+
+            while (!node_queue.empty()) {
+                const NodeRouteItem item = node_queue.top();
+                node_queue.pop();
+                if (item.distance >
+                    node_route_distance[item.node] + kFlowEpsilon) {
+                    continue;
+                }
+                for (const RouteNeighbor neighbor : route_graph[item.node]) {
+                    const double candidate =
+                        item.distance + neighbor.distance;
+                    if (candidate + kFlowEpsilon >=
+                        node_route_distance[neighbor.node]) {
+                        continue;
+                    }
+                    node_route_distance[neighbor.node] = candidate;
+                    node_route_prev_edge[neighbor.node] = neighbor.edge;
+                    node_queue.push({candidate, neighbor.node});
+                }
+            }
+            result.timings.push_back(
+                finish_timing("dense_graph_route.dijkstra", sub_timing));
+        }
+
         int graph_root_pixels = 0;
-        const auto graph_route_capacity = [&](const cv::Point pixel) {
-            const float node_flow =
-                graph_node_flow.at<float>(pixel.y, pixel.x);
-            if (node_flow > 0.0f) {
-                return node_flow;
-            }
-            const float edge_flow =
-                graph_pixel_flow.at<float>(pixel.y, pixel.x);
-            if (edge_flow > 0.0f) {
-                return capacity_from_dt(dt.at<float>(pixel.y, pixel.x));
-            }
-            return 0.0f;
-        };
-        const auto is_graph_route_pixel = [&](const cv::Point pixel) {
-            return graph_pixel_flow.at<float>(pixel.y, pixel.x) > 0.0f ||
-                   graph_node_flow.at<float>(pixel.y, pixel.x) > 0.0f;
-        };
-        const auto graph_scalar_seed = [&](const cv::Point pixel) {
-            if (graph_node_mask.at<std::uint8_t>(pixel.y, pixel.x) == 0) {
-                return 0.0f;
-            }
-            return graph_node_flow.at<float>(pixel.y, pixel.x);
-        };
-
-        for (int y = 0; y < rows; ++y) {
-            for (int x = 0; x < cols; ++x) {
-                if (graph_pixel_flow.at<float>(y, x) > 0.0f) {
-                    ++graph_edge_pixels;
-                }
-                if (graph_node_flow.at<float>(y, x) > 0.0f) {
-                    ++graph_node_pixels;
-                }
-                if (!is_graph_route_pixel(cv::Point(x, y))) {
-                    continue;
-                }
-                if (source_edge_mask.at<std::uint8_t>(y, x) == 0) {
-                    continue;
-                }
-                const int index = y * cols + x;
-                graph_route_flow[index] =
-                    std::max(graph_route_capacity(cv::Point(x, y)),
-                             capacity_from_dt(dt.at<float>(y, x)));
-                graph_route_distance[index] = 0.0f;
-                graph_queue.push({0.0f, index});
-                ++graph_root_pixels;
-            }
-        }
-
-        const std::array<cv::Point, 8> kDirs = {
-            cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
-            cv::Point(-1, 0),                    cv::Point(1, 0),
-            cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
-        while (!graph_queue.empty()) {
-            const GraphRouteItem item = graph_queue.top();
-            graph_queue.pop();
-            if (item.distance >
-                graph_route_distance[item.index] + kFlowEpsilon) {
-                continue;
-            }
-            const cv::Point pixel = point_from_index(item.index);
-            for (const cv::Point dir : kDirs) {
-                const cv::Point next = pixel + dir;
-                if (next.x < 0 || next.x >= cols || next.y < 0 ||
-                    next.y >= rows || !is_graph_route_pixel(next)) {
-                    continue;
-                }
-                const int next_index = linear_index(next);
-                const float candidate_distance =
-                    item.distance + step_distance(next, pixel);
-                if (candidate_distance + kFlowEpsilon >=
-                    graph_route_distance[next_index]) {
-                    continue;
-                }
-                graph_route_flow[next_index] = graph_route_capacity(next);
-                graph_route_distance[next_index] = candidate_distance;
-                graph_next_pixel[next_index] = item.index;
-                graph_next_distance[next_index] = step_distance(next, pixel);
-                graph_queue.push({candidate_distance, next_index});
-            }
-        }
-
         int graph_routed_pixels = 0;
         int graph_routed_route_pixels = 0;
-        for (int y = 0; y < rows; ++y) {
-            for (int x = 0; x < cols; ++x) {
-                const int index = y * cols + x;
-                if (graph_route_flow[index] > 0.0f) {
-                    ++graph_routed_route_pixels;
-                    graph_route_pixel[index] = 1;
-                    graph_seed_flow[index] = graph_scalar_seed(cv::Point(x, y));
+        {
+            const TimingMark sub_timing = start_timing();
+            std::vector<char> root_seen(static_cast<std::size_t>(pixel_count),
+                                        0);
+            std::vector<char> edge_route_seen(
+                static_cast<std::size_t>(pixel_count), 0);
+            const auto mark_root_pixel = [&](const cv::Point pixel) {
+                if (!in_bounds(pixel)) {
+                    return;
                 }
-                if (graph_pixel_flow.at<float>(y, x) <= 0.0f) {
-                    continue;
+                const int index = linear_index(pixel);
+                if (root_seen[static_cast<std::size_t>(index)] == 0) {
+                    root_seen[static_cast<std::size_t>(index)] = 1;
+                    ++graph_root_pixels;
                 }
-                if (graph_route_flow[index] > 0.0f) {
-                    ++graph_routed_pixels;
+            };
+            if (source_edges.size() == graph.edges.size()) {
+                for (int edge_index = 0;
+                     edge_index < static_cast<int>(graph.edges.size());
+                     ++edge_index) {
+                    if (source_edges[static_cast<std::size_t>(edge_index)] ==
+                        0) {
+                        continue;
+                    }
+                    for (const cv::Point pixel : graph.edges[edge_index].pixels) {
+                        mark_root_pixel(pixel);
+                    }
                 }
             }
+
+            const auto node_anchor = [&](const int node) {
+                if (!valid_node(node)) {
+                    return cv::Point(-1, -1);
+                }
+                return cv::Point(cvRound(graph.nodes[node].x),
+                                 cvRound(graph.nodes[node].y));
+            };
+            const auto for_node_pixels = [&](const int node,
+                                             const auto& callback) {
+                if (node > 0 &&
+                    node < static_cast<int>(graph.node_pixel_groups.size()) &&
+                    !graph.node_pixel_groups[static_cast<std::size_t>(node)].empty()) {
+                    for (const cv::Point pixel :
+                         graph.node_pixel_groups[static_cast<std::size_t>(node)]) {
+                        callback(pixel);
+                    }
+                    return;
+                }
+                const cv::Point anchor = node_anchor(node);
+                if (anchor.x >= 0) {
+                    callback(anchor);
+                }
+            };
+            for_node_pixels(source_seed_node, mark_root_pixel);
+
+            constexpr double kRouteGraphFlowInf = 1.0e12;
+            constexpr double kRouteDenseFlowInf = 1.0e9;
+            const auto node_value = [&](const int node) {
+                if (!valid_node(node) ||
+                    node >= static_cast<int>(node_flow.size())) {
+                    return 0.0f;
+                }
+                const cv::Point anchor = node_anchor(node);
+                if (node_flow[static_cast<std::size_t>(node)] >=
+                        kRouteGraphFlowInf * 0.5 &&
+                    in_bounds(anchor)) {
+                    return capacity_from_dt(dt.at<float>(anchor.y, anchor.x));
+                }
+                return static_cast<float>(std::min(
+                    kRouteDenseFlowInf,
+                    std::max(0.0,
+                             node_flow[static_cast<std::size_t>(node)])));
+            };
+            const auto closest_node_pixel = [&](const int node,
+                                                const cv::Point target) {
+                cv::Point best = node_anchor(node);
+                double best_distance = std::numeric_limits<double>::max();
+                for_node_pixels(node, [&](const cv::Point pixel) {
+                    const double dx = pixel.x - target.x;
+                    const double dy = pixel.y - target.y;
+                    const double distance = dx * dx + dy * dy;
+                    if (distance < best_distance) {
+                        best_distance = distance;
+                        best = pixel;
+                    }
+                });
+                return best;
+            };
+            const auto write_next_pixel = [&](const cv::Point pixel,
+                                              const cv::Point next) {
+                if (!in_bounds(pixel) || !in_bounds(next) || next == pixel) {
+                    return;
+                }
+                const int index = linear_index(pixel);
+                graph_next_pixel[static_cast<std::size_t>(index)] =
+                    linear_index(next);
+                graph_next_distance[static_cast<std::size_t>(index)] =
+                    step_distance(pixel, next);
+            };
+            const auto edge_endpoint_pixel = [&](const GraphEdge& edge,
+                                                 const int node) {
+                if (edge.pixels.empty()) {
+                    return node_anchor(node);
+                }
+                if (edge.a == node) {
+                    return edge.pixels.front();
+                }
+                if (edge.b == node) {
+                    return edge.pixels.back();
+                }
+                return closest_node_pixel(node, edge.pixels.front());
+            };
+            const auto node_next_pixel = [&](const int node) {
+                if (!valid_node(node)) {
+                    return cv::Point(-1, -1);
+                }
+                const int edge_index =
+                    node_route_prev_edge[static_cast<std::size_t>(node)];
+                if (edge_index < 0 ||
+                    edge_index >= static_cast<int>(graph.edges.size())) {
+                    return cv::Point(-1, -1);
+                }
+                return edge_endpoint_pixel(graph.edges[edge_index], node);
+            };
+
+            for (int edge_index = 0;
+                 edge_index < static_cast<int>(graph.edges.size());
+                 ++edge_index) {
+                const GraphEdge& edge = graph.edges[edge_index];
+                if (edge.pixels.empty()) {
+                    continue;
+                }
+                const std::vector<float>& prefix =
+                    edge_prefix[static_cast<std::size_t>(edge_index)];
+                const float length =
+                    edge_length[static_cast<std::size_t>(edge_index)];
+                const bool route_a =
+                    valid_node(edge.a) &&
+                    std::isfinite(
+                        node_route_distance[static_cast<std::size_t>(edge.a)]);
+                const bool route_b =
+                    valid_node(edge.b) &&
+                    std::isfinite(
+                        node_route_distance[static_cast<std::size_t>(edge.b)]);
+                if (!route_a && !route_b) {
+                    continue;
+                }
+
+                for (std::size_t i = 0; i < edge.pixels.size(); ++i) {
+                    const cv::Point pixel = edge.pixels[i];
+                    if (!in_bounds(pixel)) {
+                        continue;
+                    }
+                    const double distance_to_a =
+                        route_a
+                            ? node_route_distance
+                                      [static_cast<std::size_t>(edge.a)] +
+                                  (prefix.empty() ? 0.0 : prefix[i])
+                            : std::numeric_limits<double>::infinity();
+                    const double distance_to_b =
+                        route_b
+                            ? node_route_distance
+                                      [static_cast<std::size_t>(edge.b)] +
+                                  static_cast<double>(
+                                      length -
+                                      (prefix.empty() ? 0.0f : prefix[i]))
+                            : std::numeric_limits<double>::infinity();
+                    const bool toward_a = distance_to_a <= distance_to_b;
+
+                    const int index = linear_index(pixel);
+                    if (edge_route_seen[static_cast<std::size_t>(index)] == 0) {
+                        edge_route_seen[static_cast<std::size_t>(index)] = 1;
+                        ++graph_routed_pixels;
+                    }
+                    if (graph_route_pixel[static_cast<std::size_t>(index)] ==
+                        0) {
+                        graph_route_pixel[static_cast<std::size_t>(index)] = 1;
+                        ++graph_routed_route_pixels;
+                    }
+                    if (toward_a) {
+                        const cv::Point next =
+                            i > 0 ? edge.pixels[i - 1]
+                                  : closest_node_pixel(edge.a, pixel);
+                        write_next_pixel(pixel, next);
+                    } else {
+                        const cv::Point next =
+                            i + 1 < edge.pixels.size()
+                                ? edge.pixels[i + 1]
+                                : closest_node_pixel(edge.b, pixel);
+                        write_next_pixel(pixel, next);
+                    }
+                }
+            }
+
+            for (int node = 1; node < node_count; ++node) {
+                if (!std::isfinite(
+                        node_route_distance[static_cast<std::size_t>(node)])) {
+                    continue;
+                }
+                const float value = node_value(node);
+                const cv::Point next = node_next_pixel(node);
+                for_node_pixels(node, [&](const cv::Point pixel) {
+                    if (!in_bounds(pixel)) {
+                        return;
+                    }
+                    const int index = linear_index(pixel);
+                    if (graph_route_pixel[static_cast<std::size_t>(index)] ==
+                        0) {
+                        graph_route_pixel[static_cast<std::size_t>(index)] = 1;
+                        ++graph_routed_route_pixels;
+                    }
+                    if (value > 0.0f) {
+                        graph_seed_flow[static_cast<std::size_t>(index)] =
+                            value;
+                    }
+                    write_next_pixel(pixel, next);
+                });
+            }
+            result.timings.push_back(
+                finish_timing("dense_graph_route.pixel_project", sub_timing));
+        }
+
+        int graph_edge_pixels = graph.unique_edge_pixels;
+        int graph_node_pixels = 0;
+        {
+            const TimingMark sub_timing = start_timing();
+            graph_node_pixels = cv::countNonZero(graph_node_flow > 0.0f);
+            result.timings.push_back(
+                finish_timing("dense_graph_route.stats", sub_timing));
         }
         std::cout << "Dense graph backtrack:\n"
                   << "  graph_edge_pixels: " << graph_edge_pixels << "\n"
@@ -5305,6 +5530,10 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                 graph.nodes.push_back(cv::Point2f(
                     static_cast<float>(split_pixel.x),
                     static_cast<float>(split_pixel.y)));
+                if (graph.node_pixel_groups.size() < graph.nodes.size()) {
+                    graph.node_pixel_groups.resize(graph.nodes.size());
+                }
+                graph.node_pixel_groups[source_seed_node].push_back(split_pixel);
                 if (graph.node_mask.empty()) {
                     graph.node_mask =
                         cv::Mat::zeros(white_domain.size(), CV_8U);
@@ -6136,8 +6365,9 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     {
         const DenseBacktrackResult dense_backtrack =
             compute_dense_backtrack_flow(white_domain, dt, graph_pixel_flow,
-                                         graph_node_flow, source_edge_mask,
-                                         graph.node_mask, graph, grid_step,
+                                         graph_node_flow, graph, node_flow,
+                                         edge_flow, source_seed_node,
+                                         source_edges, grid_step,
                                          backtrack_distance,
                                          enable_debug_outputs);
         // Reference dense flood: useful for later experiments, but its TIFF is
