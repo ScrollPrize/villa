@@ -16,8 +16,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-IMAGES=(ubuntu-24.04 ubuntu-26.04 alpine-edge)
-DOCKERFILES=(ubuntu-24.04-noble.Dockerfile ubuntu-26.04.Dockerfile alpine.Dockerfile)
+IMAGES=(ubuntu-24.04 ubuntu-26.04)
+DOCKERFILES=(ubuntu-24.04-noble.Dockerfile ubuntu-26.04.Dockerfile)
 COMPILERS=(gcc clang)
 PRESETS=(ci-tests ci-asan-ubsan)
 

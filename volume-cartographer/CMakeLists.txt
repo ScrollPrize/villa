@@ -55,7 +55,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-add_compile_options(-pipe -march=native -mcpu=native)
+add_compile_options(-pipe -march=native)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(_dbg -g3 -fno-omit-frame-pointer -fasynchronous-unwind-tables -fstandalone-debug)
@@ -233,7 +233,7 @@ add_subdirectory(core)
 add_subdirectory(apps)
 
 if(VC_TESTING)
-    include(CTest)
+    enable_testing()
     add_subdirectory(core/test)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure

@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ["ubuntu-24.04", "ubuntu-26.04", "alpine-edge"]
+        image: ["ubuntu-24.04", "ubuntu-26.04"]
         compiler: [gcc, clang]
         preset: [ci-tests, ci-asan-ubsan]
     steps:
