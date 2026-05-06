@@ -4,6 +4,7 @@
 #include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "overlays/SegmentationOverlayController.hpp"
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
 #include "render/ChunkCache.hpp"
@@ -73,6 +74,7 @@ constexpr int kActiveIntersectionZ = 120;
 constexpr float kActiveIntersectionOpacityScale = 1.2f;
 constexpr float kActiveIntersectionWidthScale = 1.3f;
 constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
+constexpr float kApprovalPlaneIntersectionScale = 1.5f;
 
 struct IntersectionStyle {
     QRgb color = 0;
@@ -3296,6 +3298,56 @@ void CChunkedVolumeViewer::invalidateIntersectRegion(const std::string& name,
     scheduleIntersectionRender("segmentation intersection region invalidated");
 }
 
+void CChunkedVolumeViewer::setIntersects(const std::set<std::string>& names)
+{
+    if (_closing || _intersectTgts == names) {
+        return;
+    }
+    _intersectTgts = names;
+    invalidateIntersect();
+    renderIntersections("setIntersects");
+}
+
+void CChunkedVolumeViewer::setIntersectionOpacity(float v)
+{
+    if (_closing) {
+        return;
+    }
+    const float clamped = std::clamp(v, 0.0f, 1.0f);
+    if (std::abs(_intersectionOpacity - clamped) < 1e-6f) {
+        return;
+    }
+    _intersectionOpacity = clamped;
+    renderIntersections("setIntersectionOpacity");
+}
+
+void CChunkedVolumeViewer::setIntersectionThickness(float v)
+{
+    if (_closing) {
+        return;
+    }
+    const float clamped = std::max(0.0f, v);
+    if (std::abs(_intersectionThickness - clamped) < 1e-6f) {
+        return;
+    }
+    _intersectionThickness = clamped;
+    renderIntersections("setIntersectionThickness");
+}
+
+void CChunkedVolumeViewer::setSurfacePatchSamplingStride(int s)
+{
+    if (_closing) {
+        return;
+    }
+    const int stride = std::max(1, s);
+    if (_surfacePatchSamplingStride == stride) {
+        return;
+    }
+    _surfacePatchSamplingStride = stride;
+    invalidateIntersect();
+    renderIntersections("setSurfacePatchSamplingStride");
+}
+
 void CChunkedVolumeViewer::clearIntersectionItems()
 {
     for (auto* item : _intersectionItems) {
@@ -3922,6 +3974,8 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     for (const auto& id : _highlightedSurfaceIds)
         hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
     fp.highlightedSurfaceHash = hh;
+    fp.cameraHash = (std::hash<int>{}(_framebuffer.width()) + 0x9e3779b9u) ^
+                    (std::hash<int>{}(_framebuffer.height()) << 1);
     fp.valid = true;
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         updateIntersectionPreviewTransform();
@@ -3932,8 +3986,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         }
         return;
     }
-
-    _lastIntersectFp = fp;
 
     auto rectContains = [](const cv::Rect& outer, const cv::Rect& inner) {
         return inner.x >= outer.x &&
@@ -3953,6 +4005,39 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         _intersectionGeometryCache.surfaceCount == fp.surfaceCount &&
         _intersectionGeometryCache.targetHash == fp.targetHash &&
         _intersectionGeometryCache.targetGenerationHash == fp.targetGenerationHash;
+
+    auto samePlaneRenderInputsExceptRoi = [](const IntersectFingerprint& a,
+                                             const IntersectFingerprint& b) {
+        return a.valid && b.valid &&
+               a.planeOriginQ == b.planeOriginQ &&
+               a.planeNormalQ == b.planeNormalQ &&
+               a.planeBasisXQ == b.planeBasisXQ &&
+               a.planeBasisYQ == b.planeBasisYQ &&
+               a.opacityQ == b.opacityQ &&
+               a.thicknessQ == b.thicknessQ &&
+               a.indexSamplingStride == b.indexSamplingStride &&
+               a.patchCount == b.patchCount &&
+               a.surfaceCount == b.surfaceCount &&
+               a.targetHash == b.targetHash &&
+               a.targetGenerationHash == b.targetGenerationHash &&
+               a.activeSegHash == b.activeSegHash &&
+               a.highlightedSurfaceHash == b.highlightedSurfaceHash &&
+               a.cameraHash == b.cameraHash;
+    };
+    if (geometryCacheValid && !_intersectionItems.empty() &&
+        samePlaneRenderInputsExceptRoi(_lastIntersectFp, fp)) {
+        _lastIntersectFp = fp;
+        updateIntersectionPreviewTransform();
+        if (profile.enabled()) {
+            profile.setDetails(std::format(
+                "action=camera_cache_hit targetSurfaces={} items={} roi={} cacheRoi={}",
+                targets.size(), _intersectionItems.size(), profileRect(planeRoi),
+                profileRect(_intersectionGeometryCache.roi)));
+        }
+        return;
+    }
+
+    _lastIntersectFp = fp;
 
     if (!geometryCacheValid) {
         constexpr int kMinPanCachePadding = 256;
@@ -4011,6 +4096,79 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
         return surfaceToScene(proj[0], proj[1]);
     };
+    auto* approvalOverlay = _viewerManager ? _viewerManager->segmentationOverlay() : nullptr;
+    const bool showApprovalMaskIntersections =
+        approvalOverlay && activeSeg && approvalOverlay->hasApprovalMaskData();
+    auto paramToApprovalGrid = [&](const cv::Vec3f& param) {
+        if (!activeSeg) {
+            return QPointF();
+        }
+        const cv::Vec2f grid = activeSeg->ptrToGrid(param);
+        return QPointF(grid[0], grid[1]);
+    };
+    auto addApprovalMaskIntersection = [&](const SurfacePatchIndex::TriangleSegment& seg,
+                                           float renderedOpacity,
+                                           float renderedPenWidth) {
+        if (!showApprovalMaskIntersections) {
+            return;
+        }
+
+        const QPointF gridA = paramToApprovalGrid(seg.surfaceParams[0]);
+        const QPointF gridB = paramToApprovalGrid(seg.surfaceParams[1]);
+        if (!isFinitePoint(gridA) || !isFinitePoint(gridB)) {
+            return;
+        }
+
+        const int steps = std::max(1, int(std::ceil(std::max(std::abs(gridB.x() - gridA.x()),
+                                                             std::abs(gridB.y() - gridA.y())))));
+        const float opacity = std::clamp(renderedOpacity * kApprovalPlaneIntersectionScale,
+                                         0.0f, 1.0f);
+        const float penWidth = std::max(0.0f, renderedPenWidth) *
+                               kApprovalPlaneIntersectionScale;
+
+        for (int step = 0; step < steps; ++step) {
+            const float t0 = static_cast<float>(step) / static_cast<float>(steps);
+            const float t1 = static_cast<float>(step + 1) / static_cast<float>(steps);
+            const float tm = (t0 + t1) * 0.5f;
+
+            const float row = static_cast<float>(gridA.y() + (gridB.y() - gridA.y()) * tm);
+            const float col = static_cast<float>(gridA.x() + (gridB.x() - gridA.x()) * tm);
+            int approvalStatus = 0;
+            if (approvalOverlay->queryApprovalBilinear(row, col, &approvalStatus) <= 0.0f ||
+                approvalStatus == 0) {
+                continue;
+            }
+
+            QColor approvalColor = approvalOverlay->queryApprovalColor(
+                static_cast<int>(std::round(row)),
+                static_cast<int>(std::round(col)));
+            if (!approvalColor.isValid()) {
+                approvalColor = QColor(0, 255, 0);
+            }
+            approvalColor.setAlphaF(opacity);
+            if (approvalColor.alpha() <= 0) {
+                continue;
+            }
+
+            const cv::Vec3f world0 = seg.world[0] + (seg.world[1] - seg.world[0]) * t0;
+            const cv::Vec3f world1 = seg.world[0] + (seg.world[1] - seg.world[0]) * t1;
+            const QPointF a = planeToScene(world0);
+            const QPointF b = planeToScene(world1);
+            if (!isFinitePoint(a) || !isFinitePoint(b)) {
+                continue;
+            }
+
+            const IntersectionStyle approvalStyle{
+                approvalColor.rgba(),
+                kActiveIntersectionZ + 1,
+                int(std::lround(penWidth * 1000.0f)),
+            };
+            QPainterPath& approvalPath = groupedPaths[approvalStyle];
+            groupedColors[approvalStyle] = approvalColor;
+            approvalPath.moveTo(a);
+            approvalPath.lineTo(b);
+        }
+    };
 
     for (const auto& [target, segments] : intersections) {
         if (!target || segments.empty())
@@ -4051,15 +4209,17 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             zValue,
             int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
         };
-        QPainterPath& path = groupedPaths[style];
         groupedColors[style] = baseColor;
         for (const auto& seg : segments) {
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
             if (!isFinitePoint(a) || !isFinitePoint(b))
                 continue;
-            path.moveTo(a);
-            path.lineTo(b);
+            groupedPaths[style].moveTo(a);
+            groupedPaths[style].lineTo(b);
+            if (target == activeSeg) {
+                addApprovalMaskIntersection(seg, opacity, penWidth);
+            }
         }
     }
 
@@ -4126,9 +4286,16 @@ void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::strin
     if (_closing) {
         return;
     }
+    std::unordered_set<std::string> next;
+    next.reserve(ids.size());
+    for (const auto& id : ids) {
+        next.insert(id);
+    }
+    if (_highlightedSurfaceIds == next) {
+        return;
+    }
     _highlightedSurfaceIds.clear();
-    for (const auto& id : ids)
-        _highlightedSurfaceIds.insert(id);
+    _highlightedSurfaceIds = std::move(next);
     renderIntersections("highlighted surface ids changed");
 }
 
