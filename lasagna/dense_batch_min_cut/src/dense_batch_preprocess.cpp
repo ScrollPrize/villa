@@ -49,6 +49,45 @@ struct StageTiming {
     double cpu_ms = 0.0;
 };
 
+struct RimPosition {
+    int contour = -1;
+    float arc = 0.0f;
+    float total = 0.0f;
+};
+
+struct DenseBatchScratch {
+    cv::Mat rim_source_mask;
+    cv::Mat rim_cleaned_source;
+    cv::Mat rim_contour_input;
+    std::vector<RimPosition> rim_lookup;
+
+    std::vector<float> dense_routed_flow;
+    std::vector<int> dense_graph_next_pixel;
+    std::vector<float> dense_graph_next_distance;
+    std::vector<float> dense_graph_seed_flow;
+    std::vector<char> dense_graph_route_pixel;
+    std::vector<char> dense_graph_root_seen;
+    std::vector<char> dense_graph_edge_route_seen;
+    std::vector<int> dense_seeded_by_row;
+    std::vector<int> dense_grid_node_ids;
+    std::vector<float> dense_carrier_value;
+    std::vector<float> dense_carrier_route_dp;
+    std::vector<float> dense_carrier_route_distance_dp;
+    std::vector<int> dense_carrier_route_next;
+};
+
+DenseBatchScratch& dense_batch_scratch() {
+    thread_local DenseBatchScratch scratch;
+    return scratch;
+}
+
+template <typename T>
+void resize_fill(std::vector<T>& values, const std::size_t size,
+                 const T& value) {
+    values.resize(size);
+    std::fill(values.begin(), values.end(), value);
+}
+
 struct CoutSilencer {
     std::streambuf* old = nullptr;
     std::ostringstream sink;
@@ -1210,12 +1249,7 @@ cv::Mat source_rim_distance_label_ridges(
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(source_pixel_labels.type() == CV_32S);
 
-    struct RimPosition {
-        int contour = -1;
-        float arc = 0.0f;
-        float total = 0.0f;
-    };
-
+    DenseBatchScratch& scratch = dense_batch_scratch();
     const int rows = white_domain.rows;
     const int cols = white_domain.cols;
     constexpr bool kDebugSourceRimPixel = false;
@@ -1228,10 +1262,10 @@ cv::Mat source_rim_distance_label_ridges(
         }
     };
 
-    cv::Mat source_mask;
+    cv::Mat& source_mask = scratch.rim_source_mask;
     {
         const TimingMark timing = start_timing();
-        source_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
+        source_mask.create(white_domain.size(), CV_8U);
         for (int y = 0; y < rows; ++y) {
             const std::uint8_t* src = white_domain.ptr<std::uint8_t>(y);
             std::uint8_t* dst = source_mask.ptr<std::uint8_t>(y);
@@ -1262,11 +1296,12 @@ cv::Mat source_rim_distance_label_ridges(
         record_timing("connected_components", timing);
     }
 
-    cv::Mat cleaned_source;
+    cv::Mat& cleaned_source = scratch.rim_cleaned_source;
     constexpr int kMinSourceComponentArea = 8;
     {
         const TimingMark timing = start_timing();
-        cleaned_source = cv::Mat::zeros(source_mask.size(), CV_8U);
+        cleaned_source.create(source_mask.size(), CV_8U);
+        cleaned_source.setTo(cv::Scalar(0));
         for (int y = 0; y < rows; ++y) {
             const int* labels = source_components.ptr<int>(y);
             std::uint8_t* dst = cleaned_source.ptr<std::uint8_t>(y);
@@ -1285,15 +1320,17 @@ cv::Mat source_rim_distance_label_ridges(
     std::vector<std::vector<cv::Point>> contours;
     {
         const TimingMark timing = start_timing();
-        cv::findContours(cleaned_source.clone(), contours, cv::RETR_LIST,
+        cleaned_source.copyTo(scratch.rim_contour_input);
+        cv::findContours(scratch.rim_contour_input, contours, cv::RETR_LIST,
                          cv::CHAIN_APPROX_NONE);
         record_timing("find_contours", timing);
     }
 
-    std::vector<RimPosition> rim_lookup;
+    std::vector<RimPosition>& rim_lookup = scratch.rim_lookup;
     {
         const TimingMark timing = start_timing();
-        rim_lookup.resize(static_cast<std::size_t>(rows * cols));
+        resize_fill(rim_lookup, static_cast<std::size_t>(rows * cols),
+                    RimPosition{});
         record_timing("rim_lookup_alloc", timing);
     }
     const auto linear_index = [cols](const cv::Point pixel) {
@@ -3388,6 +3425,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
     CV_Assert(node_flow.size() == graph.nodes.size());
     CV_Assert(edge_flow.size() == graph.edges.size());
 
+    DenseBatchScratch& scratch = dense_batch_scratch();
     DenseBacktrackResult result;
     result.nn_flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
     result.smooth_grid_flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
@@ -3416,14 +3454,19 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                white_domain.at<std::uint8_t>(pixel.y, pixel.x) != 0;
     };
 
-    std::vector<float> routed_flow(static_cast<std::size_t>(pixel_count), 0.0f);
-    std::vector<int> graph_next_pixel(static_cast<std::size_t>(pixel_count), -1);
-    std::vector<float> graph_next_distance(static_cast<std::size_t>(pixel_count),
-                                           0.0f);
-    std::vector<float> graph_seed_flow(static_cast<std::size_t>(pixel_count),
-                                       0.0f);
-    std::vector<char> graph_route_pixel(static_cast<std::size_t>(pixel_count),
-                                        0);
+    std::vector<float>& routed_flow = scratch.dense_routed_flow;
+    std::vector<int>& graph_next_pixel = scratch.dense_graph_next_pixel;
+    std::vector<float>& graph_next_distance =
+        scratch.dense_graph_next_distance;
+    std::vector<float>& graph_seed_flow = scratch.dense_graph_seed_flow;
+    std::vector<char>& graph_route_pixel = scratch.dense_graph_route_pixel;
+    resize_fill(routed_flow, static_cast<std::size_t>(pixel_count), 0.0f);
+    resize_fill(graph_next_pixel, static_cast<std::size_t>(pixel_count), -1);
+    resize_fill(graph_next_distance, static_cast<std::size_t>(pixel_count),
+                0.0f);
+    resize_fill(graph_seed_flow, static_cast<std::size_t>(pixel_count), 0.0f);
+    resize_fill(graph_route_pixel, static_cast<std::size_t>(pixel_count),
+                static_cast<char>(0));
 
     {
         const TimingMark timing = start_timing();
@@ -3528,10 +3571,13 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         int graph_routed_route_pixels = 0;
         {
             const TimingMark sub_timing = start_timing();
-            std::vector<char> root_seen(static_cast<std::size_t>(pixel_count),
-                                        0);
-            std::vector<char> edge_route_seen(
-                static_cast<std::size_t>(pixel_count), 0);
+            std::vector<char>& root_seen = scratch.dense_graph_root_seen;
+            std::vector<char>& edge_route_seen =
+                scratch.dense_graph_edge_route_seen;
+            resize_fill(root_seen, static_cast<std::size_t>(pixel_count),
+                        static_cast<char>(0));
+            resize_fill(edge_route_seen, static_cast<std::size_t>(pixel_count),
+                        static_cast<char>(0));
             const auto mark_root_pixel = [&](const cv::Point pixel) {
                 if (!in_bounds(pixel)) {
                     return;
@@ -3771,7 +3817,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
 
     {
         const TimingMark timing = start_timing();
-        std::vector<int> seeded_by_row(static_cast<std::size_t>(rows), 0);
+        std::vector<int>& seeded_by_row = scratch.dense_seeded_by_row;
+        resize_fill(seeded_by_row, static_cast<std::size_t>(rows), 0);
         cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
             for (int y = range.start; y < range.end; ++y) {
                 int row_seeded = 0;
@@ -3847,8 +3894,9 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         const std::vector<int> grid_ys = add_axis(rows);
         const int grid_cols = static_cast<int>(grid_xs.size());
         const int grid_rows = static_cast<int>(grid_ys.size());
-        std::vector<int> grid_node_ids(
-            static_cast<std::size_t>(grid_cols * grid_rows), -1);
+        std::vector<int>& grid_node_ids = scratch.dense_grid_node_ids;
+        resize_fill(grid_node_ids,
+                    static_cast<std::size_t>(grid_cols * grid_rows), -1);
         std::vector<CarrierNode> carriers;
         carriers.reserve(static_cast<std::size_t>(grid_cols * grid_rows + 4096));
         result.timings.push_back(
@@ -4068,7 +4116,8 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 finish_timing("dense_grid.graph_edges", graph_edges_timing));
         }
 
-        std::vector<float> carrier_value(carriers.size(), 0.0f);
+        std::vector<float>& carrier_value = scratch.dense_carrier_value;
+        resize_fill(carrier_value, carriers.size(), 0.0f);
         struct CarrierFlowItem {
             float flow = 0.0f;
             int node = -1;
@@ -4123,15 +4172,17 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         const int kCarrierRouteBuckets =
             static_cast<int>(kBacktrackRadius / kCarrierRouteBucketPx) + 1;
         const int carrier_count = static_cast<int>(carriers.size());
-        std::vector<float> carrier_route_dp(
-            static_cast<std::size_t>(carrier_count) * kCarrierRouteBuckets,
-            0.0f);
-        std::vector<float> carrier_route_distance_dp(
-            static_cast<std::size_t>(carrier_count) * kCarrierRouteBuckets,
-            0.0f);
-        std::vector<int> carrier_route_next(
-            static_cast<std::size_t>(carrier_count) * kCarrierRouteBuckets,
-            -1);
+        const std::size_t carrier_route_size =
+            static_cast<std::size_t>(carrier_count) * kCarrierRouteBuckets;
+        std::vector<float>& carrier_route_dp =
+            scratch.dense_carrier_route_dp;
+        std::vector<float>& carrier_route_distance_dp =
+            scratch.dense_carrier_route_distance_dp;
+        std::vector<int>& carrier_route_next =
+            scratch.dense_carrier_route_next;
+        resize_fill(carrier_route_dp, carrier_route_size, 0.0f);
+        resize_fill(carrier_route_distance_dp, carrier_route_size, 0.0f);
+        resize_fill(carrier_route_next, carrier_route_size, -1);
         const auto route_index = [&](const int node, const int bucket) {
             return static_cast<std::size_t>(node) * kCarrierRouteBuckets +
                    static_cast<std::size_t>(bucket);
