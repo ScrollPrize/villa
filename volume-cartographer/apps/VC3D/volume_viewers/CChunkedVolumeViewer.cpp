@@ -2841,17 +2841,19 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
             if (std::isfinite(normal[0]) && std::isfinite(normal[1]) &&
                 std::isfinite(normal[2]) && cv::norm(normal) > 0.0f) {
                 const float delta = static_cast<float>(steps) * _zScrollSensitivity;
-                plane->setOrigin(plane->origin() + normal * (delta + _zOff));
+                auto shiftedPlane = std::make_shared<PlaneSurface>(*plane);
+                shiftedPlane->setOrigin(plane->origin() + normal * (delta + _zOff));
                 _zOff = 0.0f;
                 _zOffWorldDir = {0, 0, 0};
                 if (_state) {
-                    _state->setSurface(_surfName, surf, false, true);
+                    _state->setSurface(_surfName, shiftedPlane, false, true);
                 } else {
+                    _defaultSurface = shiftedPlane;
+                    _surfWeak = _defaultSurface;
                     updateContentBounds();
                     _genCacheDirty = true;
                     _stableFramebufferValid = false;
                     scheduleRender("plane slice mouse wheel");
-                    renderIntersections("plane slice mouse wheel");
                 }
             }
         } else {
