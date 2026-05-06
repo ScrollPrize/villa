@@ -232,6 +232,11 @@ else()
 endif()
 
 include(ExternalProject)
+include(ProcessorCount)
+ProcessorCount(_nproc)
+if(_nproc EQUAL 0)
+    set(_nproc 1)
+endif()
 set(_libbt_install ${CMAKE_BINARY_DIR}/_deps/libbacktrace-install)
 set(_libbt_lib ${_libbt_install}/lib/libbacktrace.a)
 file(MAKE_DIRECTORY ${_libbt_install}/include)
@@ -241,7 +246,7 @@ ExternalProject_Add(libbacktrace_build
     GIT_SHALLOW TRUE
     PREFIX ${CMAKE_BINARY_DIR}/_deps/libbacktrace
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${_libbt_install} --enable-static --disable-shared --with-pic
-    BUILD_COMMAND make -j
+    BUILD_COMMAND make -j${_nproc}
     INSTALL_COMMAND make install
     BUILD_BYPRODUCTS ${_libbt_lib})
 add_library(libbacktrace_static STATIC IMPORTED GLOBAL)
