@@ -36,8 +36,8 @@ jobs:
     steps:
       - run: echo "No volume-cartographer changes — skipping build."
 
-  build-test:
-    name: ${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
+  builder:
+    name: Builder image (${{ matrix.image }})
     needs: changes
     if: needs.changes.outputs.vc == 'true'
     runs-on: ubuntu-24.04
@@ -45,27 +45,61 @@ jobs:
       fail-fast: false
       matrix:
         image: ["ubuntu-24.04", "ubuntu-26.04"]
-        compiler: [gcc, clang]
-        preset: [ci-tests, ci-asan-ubsan]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Build builder image
+      - name: Build builder image (pushes layers to GHA cache)
+        run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
+
+  build-test:
+    name: ${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
+    needs: builder
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      # Full matrix on ubuntu-24.04 (tests + sanitizers, gcc + clang).
+      # ubuntu-26.04 is just a compile/test smoke for both compilers — the
+      # heavier sanitizer cells only run on 24.04.
+      matrix:
+        include:
+          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-tests }
+          - { image: "ubuntu-24.04", compiler: clang, preset: ci-tests }
+          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-asan-ubsan }
+          - { image: "ubuntu-24.04", compiler: clang, preset: ci-asan-ubsan }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/cache@v4
+        with:
+          path: volume-cartographer/.ccache/${{ matrix.image }}
+          key: ccache-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-
+            ccache-${{ matrix.image }}-${{ matrix.compiler }}-
+      - name: Pull builder from GHA cache
         run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
       - name: Test
         run: volume-cartographer/scripts/ci.sh test ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
 
   coverage:
     name: Coverage (gcc, gcov)
-    needs: changes
-    if: needs.changes.outputs.vc == 'true'
+    needs: builder
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: docker/setup-buildx-action@v3
-      - name: Build builder image
+      - uses: actions/cache@v4
+        with:
+          path: volume-cartographer/.ccache/ubuntu-24.04
+          key: ccache-ubuntu-24.04-coverage-${{ github.run_id }}
+          restore-keys: |
+            ccache-ubuntu-24.04-coverage-
+            ccache-ubuntu-24.04-gcc-
+      - name: Pull builder from GHA cache
         run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
       - name: Run coverage
         run: volume-cartographer/scripts/ci.sh coverage ubuntu-24.04
@@ -96,14 +130,20 @@ jobs:
         run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }}
 
   dead-code:
-    name: Dead-code report (clang, --print-gc-sections)
-    needs: changes
-    if: needs.changes.outputs.vc == 'true'
+    name: Dead-code report (clang, nm + --print-gc-sections)
+    needs: builder
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Build builder image
+      - uses: actions/cache@v4
+        with:
+          path: volume-cartographer/.ccache/ubuntu-24.04
+          key: ccache-ubuntu-24.04-dead-code-${{ github.run_id }}
+          restore-keys: |
+            ccache-ubuntu-24.04-dead-code-
+            ccache-ubuntu-24.04-clang-
+      - name: Pull builder from GHA cache
         run: volume-cartographer/scripts/ci.sh builder ubuntu-24.04
       - name: Run dead-code analysis
         run: volume-cartographer/scripts/ci.sh dead-code ubuntu-24.04 clang

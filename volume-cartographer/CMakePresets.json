@@ -17,7 +17,7 @@
       "hidden": true,
       "inherits": "_base",
       "cacheVariables": {
-        "VC_USE_CCACHE": "OFF"
+        "VC_USE_CCACHE": "ON"
       }
     },
     {

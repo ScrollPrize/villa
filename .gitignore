@@ -48,3 +48,7 @@ volume-cartographer/AGENTS.md
 # Dead-code analysis outputs
 /volume-cartographer/dead-code/
 /dead-code/
+
+# ccache (mounted into builder docker)
+/volume-cartographer/.ccache/
+/.ccache/
