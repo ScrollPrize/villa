@@ -235,32 +235,6 @@ private:
     void updateContentBounds();
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
-    void renderOverlayVolumeForPlane(const cv::Vec3f& origin,
-                                     const cv::Vec3f& vxStep,
-                                     const cv::Vec3f& vyStep,
-                                     int startLevel,
-                                     const vc::render::ChunkedPlaneSampler::Options& options,
-                                     cv::Mat_<uint8_t>& overlayValues,
-                                     cv::Mat_<uint8_t>& overlayCoverage);
-    void renderOverlayVolumeForCoords(const cv::Mat_<cv::Vec3f>& coords,
-                                      int startLevel,
-                                      const vc::render::ChunkedPlaneSampler::Options& options,
-                                      cv::Mat_<uint8_t>& overlayValues,
-                                      cv::Mat_<uint8_t>& overlayCoverage);
-    void samplePlaneIntoValues(const cv::Vec3f& origin,
-                               const cv::Vec3f& vxStep,
-                               const cv::Vec3f& vyStep,
-                               const cv::Vec3f& normal,
-                               int startLevel,
-                               const vc::render::ChunkedPlaneSampler::Options& options,
-                               cv::Mat_<uint8_t>& values,
-                               cv::Mat_<uint8_t>& coverage);
-    void sampleCoordsIntoValues(const cv::Mat_<cv::Vec3f>& coords,
-                                const cv::Mat_<cv::Vec3f>& normals,
-                                int startLevel,
-                                const vc::render::ChunkedPlaneSampler::Options& options,
-                                cv::Mat_<uint8_t>& values,
-                                cv::Mat_<uint8_t>& coverage);
     void prefetchPlaneHalo(const cv::Vec3f& origin,
                            const cv::Vec3f& vxStep,
                            const cv::Vec3f& vyStep,
