@@ -78,6 +78,8 @@ jobs:
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests,      action: test }
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-asan-ubsan, action: test }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-asan-ubsan, action: test }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tsan,       action: test }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tsan,       action: test }
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
