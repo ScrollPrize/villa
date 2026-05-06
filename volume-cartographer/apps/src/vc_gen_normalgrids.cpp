@@ -133,6 +133,204 @@ static vc::core::util::NormalGridSliceDirection to_normal_grid_direction(SliceDi
     return vc::core::util::NormalGridSliceDirection::XY;
 }
 
+static void fill_binary_slice_region(
+    SliceDirection dir,
+    size_t validRows,
+    size_t validCols,
+    int dstRowOffset,
+    int dstColOffset,
+    uint8_t fillBinary,
+    cv::Mat& binarySlice,
+    bool& anyNonZero)
+{
+    (void)dir;
+    if (validRows == 0 || validCols == 0 || fillBinary == 0) {
+        return;
+    }
+
+    cv::Mat roi(binarySlice, cv::Rect(
+        dstColOffset,
+        dstRowOffset,
+        static_cast<int>(validCols),
+        static_cast<int>(validRows)));
+    roi.setTo(fillBinary);
+    anyNonZero = true;
+}
+
+static void read_binary_slices_direct(
+    vc::render::IChunkedArray& chunks,
+    int level,
+    const std::vector<size_t>& shape,
+    const std::vector<size_t>& sourceChunkShape,
+    SliceDirection dir,
+    const vc::core::util::NormalGridSampledChunkPlan& sourceChunkPlan,
+    std::vector<AssembledSlice>& assembledSlices)
+{
+    using vc::render::ChunkKey;
+    using vc::render::ChunkStatus;
+    using vc::render::ChunkDtype;
+
+    if (assembledSlices.empty()) {
+        return;
+    }
+    if (chunks.dtype() != ChunkDtype::UInt8) {
+        throw std::runtime_error("vc_gen_normalgrids currently expects an uint8 input volume");
+    }
+
+    std::vector<std::atomic_bool> anyNonZero(assembledSlices.size());
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < assembledSlices.size(); ++i) {
+        assembledSlices[i].binarySlice.setTo(0);
+        assembledSlices[i].anyNonZero = false;
+        anyNonZero[i].store(false, std::memory_order_relaxed);
+    }
+
+    const auto chunkShapeInt = chunks.chunkShape(level);
+    const std::array<int, 3> chunkShape = {
+        chunkShapeInt[0],
+        chunkShapeInt[1],
+        chunkShapeInt[2],
+    };
+    const size_t chunkCountZ = (shape[0] + sourceChunkShape[0] - 1) / sourceChunkShape[0];
+    const size_t chunkCountY = (shape[1] + sourceChunkShape[1] - 1) / sourceChunkShape[1];
+    const size_t chunkCountX = (shape[2] + sourceChunkShape[2] - 1) / sourceChunkShape[2];
+
+    const uint8_t fillBinary = chunks.fillValue() > 0.0 ? 255 : 0;
+
+    std::vector<ChunkKey> keys;
+    switch (dir) {
+    case SliceDirection::XY:
+        keys.reserve(chunkCountY * chunkCountX);
+        for (size_t cy = 0; cy < chunkCountY; ++cy) {
+            for (size_t cx = 0; cx < chunkCountX; ++cx) {
+                keys.push_back({level, static_cast<int>(sourceChunkPlan.sourceChunkIndex), static_cast<int>(cy), static_cast<int>(cx)});
+            }
+        }
+        break;
+    case SliceDirection::XZ:
+        keys.reserve(chunkCountZ * chunkCountX);
+        for (size_t cz = 0; cz < chunkCountZ; ++cz) {
+            for (size_t cx = 0; cx < chunkCountX; ++cx) {
+                keys.push_back({level, static_cast<int>(cz), static_cast<int>(sourceChunkPlan.sourceChunkIndex), static_cast<int>(cx)});
+            }
+        }
+        break;
+    case SliceDirection::YZ:
+        keys.reserve(chunkCountZ * chunkCountY);
+        for (size_t cz = 0; cz < chunkCountZ; ++cz) {
+            for (size_t cy = 0; cy < chunkCountY; ++cy) {
+                keys.push_back({level, static_cast<int>(cz), static_cast<int>(cy), static_cast<int>(sourceChunkPlan.sourceChunkIndex)});
+            }
+        }
+        break;
+    }
+
+    chunks.prefetchChunks(keys, false);
+
+    std::exception_ptr firstException;
+    std::mutex exceptionMutex;
+
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t keyIndex = 0; keyIndex < keys.size(); ++keyIndex) {
+        try {
+            const ChunkKey key = keys[keyIndex];
+            const auto result = chunks.getChunkBlocking(level, key.iz, key.iy, key.ix);
+            if (result.status == ChunkStatus::Error) {
+                throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
+            }
+            if (result.status != ChunkStatus::Data &&
+                result.status != ChunkStatus::AllFill &&
+                result.status != ChunkStatus::Missing) {
+                throw std::runtime_error("unexpected chunk status while generating normal grids");
+            }
+
+        const size_t chunkZ0 = static_cast<size_t>(key.iz) * sourceChunkShape[0];
+        const size_t chunkY0 = static_cast<size_t>(key.iy) * sourceChunkShape[1];
+        const size_t chunkX0 = static_cast<size_t>(key.ix) * sourceChunkShape[2];
+        const size_t chunkZ1 = std::min(shape[0], chunkZ0 + sourceChunkShape[0]);
+        const size_t chunkY1 = std::min(shape[1], chunkY0 + sourceChunkShape[1]);
+        const size_t chunkX1 = std::min(shape[2], chunkX0 + sourceChunkShape[2]);
+
+        size_t validRows = 0;
+        size_t validCols = 0;
+        int dstRowOffset = 0;
+        int dstColOffset = 0;
+        switch (dir) {
+        case SliceDirection::XY:
+            validRows = chunkY1 - chunkY0;
+            validCols = chunkX1 - chunkX0;
+            dstRowOffset = static_cast<int>(chunkY0);
+            dstColOffset = static_cast<int>(chunkX0);
+            break;
+        case SliceDirection::XZ:
+            validRows = chunkZ1 - chunkZ0;
+            validCols = chunkX1 - chunkX0;
+            dstRowOffset = static_cast<int>(chunkZ0);
+            dstColOffset = static_cast<int>(chunkX0);
+            break;
+        case SliceDirection::YZ:
+            validRows = chunkZ1 - chunkZ0;
+            validCols = chunkY1 - chunkY0;
+            dstRowOffset = static_cast<int>(chunkZ0);
+            dstColOffset = static_cast<int>(chunkY0);
+            break;
+        }
+
+        const uint8_t* chunkData = nullptr;
+        std::shared_ptr<const std::vector<std::byte>> chunkBytes;
+        if (result.status == ChunkStatus::Data && result.bytes) {
+            chunkBytes = result.bytes;
+            chunkData = reinterpret_cast<const uint8_t*>(chunkBytes->data());
+        }
+
+        for (size_t assembledIndex = 0; assembledIndex < assembledSlices.size(); ++assembledIndex) {
+            auto& assembled = assembledSlices[assembledIndex];
+            bool localAnyNonZero = false;
+            if (chunkData != nullptr) {
+                vc::core::util::copyBinarySliceRegionFromChunk(
+                    chunkData,
+                    chunkShape,
+                    to_normal_grid_direction(dir),
+                    assembled.localSliceIndex,
+                    validRows,
+                    validCols,
+                    dstRowOffset,
+                    dstColOffset,
+                    assembled.binarySlice,
+                    localAnyNonZero);
+            } else {
+                fill_binary_slice_region(
+                    dir,
+                    validRows,
+                    validCols,
+                    dstRowOffset,
+                    dstColOffset,
+                    fillBinary,
+                    assembled.binarySlice,
+                    localAnyNonZero);
+            }
+            if (localAnyNonZero) {
+                anyNonZero[assembledIndex].store(true, std::memory_order_relaxed);
+            }
+        }
+        } catch (...) {
+            std::lock_guard lock(exceptionMutex);
+            if (!firstException) {
+                firstException = std::current_exception();
+            }
+        }
+    }
+
+    if (firstException) {
+        std::rethrow_exception(firstException);
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < assembledSlices.size(); ++i) {
+        assembledSlices[i].anyNonZero = anyNonZero[i].load(std::memory_order_relaxed);
+    }
+}
+
 static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) {
     Json out;
     out["mode"] = "generate";
@@ -481,7 +679,10 @@ void run_generate(const po::variables_map& vm) {
     std::cout << "Input level: " << input_level << std::endl;
     std::cout << "Output directory: " << output_path << std::endl;
 
+    const size_t cache_budget_bytes = 10ull * 1024ull * 1024ull * 1024ull;
     Volume input_volume{fs::path(input_path)};
+    input_volume.setCacheBudget(cache_budget_bytes);
+
     auto* input_chunks = input_volume.chunkedCache();
     const auto level_shape = input_chunks->shape(input_level);
     const auto level_chunk_shape = input_chunks->chunkShape(input_level);
@@ -513,10 +714,6 @@ void run_generate(const po::variables_map& vm) {
 
     int num_threads = omp_get_max_threads();
     if (num_threads == 0) num_threads = 1;
-
-    const size_t cache_budget_bytes = 10ull * 1024ull * 1024ull * 1024ull;
-
-    input_volume.setCacheBudget(cache_budget_bytes);
 
     RunMetrics run_metrics;
     run_metrics.inputPath = input_path;
@@ -632,63 +829,18 @@ void run_generate(const po::variables_map& vm) {
             }
 
             if (!assembled_slices.empty()) {
-                std::array<size_t, 3> slab_shape;
-                std::array<int, 3> slab_offset;
-                switch (dir) {
-                case SliceDirection::XY:
-                    slab_shape = {source_chunk_shape[0], shape[1], shape[2]};
-                    slab_offset = {
-                        static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[0]),
-                        0,
-                        0,
-                    };
-                    break;
-                case SliceDirection::XZ:
-                    slab_shape = {shape[0], source_chunk_shape[1], shape[2]};
-                    slab_offset = {
-                        0,
-                        static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[1]),
-                        0,
-                    };
-                    break;
-                case SliceDirection::YZ:
-                    slab_shape = {shape[0], shape[1], source_chunk_shape[2]};
-                    slab_offset = {
-                        0,
-                        0,
-                        static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[2]),
-                    };
-                    break;
-                }
-                for (int axis = 0; axis < 3; ++axis) {
-                    const size_t end = static_cast<size_t>(slab_offset[axis]) + slab_shape[axis];
-                    if (end > shape[axis]) {
-                        slab_shape[axis] = shape[axis] - static_cast<size_t>(slab_offset[axis]);
-                    }
-                }
-
                 const auto read_start = std::chrono::steady_clock::now();
-                Array3D<uint8_t> chunk_data(slab_shape);
-                input_volume.readZYX(chunk_data, slab_offset, input_level);
-                dir_metrics.timingTotals["read_chunk"] += std::chrono::duration<double>(
+                read_binary_slices_direct(
+                    *input_chunks,
+                    input_level,
+                    shape,
+                    source_chunk_shape,
+                    dir,
+                    source_chunk_plan,
+                    assembled_slices);
+                dir_metrics.timingTotals["read_slices_direct"] += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - read_start).count();
-                dir_metrics.timingCounts["read_chunk"] += 1;
-
-                const auto extract_start = std::chrono::steady_clock::now();
-                const auto normal_grid_dir = to_normal_grid_direction(dir);
-                #pragma omp parallel for schedule(static)
-                for (size_t assembled_index = 0; assembled_index < assembled_slices.size(); ++assembled_index) {
-                    auto& assembled = assembled_slices[assembled_index];
-                    const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
-                        chunk_data,
-                        normal_grid_dir,
-                        assembled.localSliceIndex,
-                        assembled.binarySlice);
-                    assembled.anyNonZero = assembled.anyNonZero || any_nonzero;
-                }
-                dir_metrics.timingTotals["extract_slices"] += std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - extract_start).count();
-                dir_metrics.timingCounts["extract_slices"] += 1;
+                dir_metrics.timingCounts["read_slices_direct"] += 1;
             }
 
             std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));
