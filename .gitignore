@@ -37,3 +37,10 @@ vesuvius/AGENTS.md
 
 build/
 volume-cartographer/AGENTS.md
+
+# Coverage outputs
+*.gcov
+*.gcda
+*.gcno
+/volume-cartographer/coverage/
+/coverage/

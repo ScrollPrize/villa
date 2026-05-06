@@ -21,7 +21,7 @@
 #include <iostream>
 #include <thread>
 #include <omp.h>
-#include <blosc.h>
+#include <blosc2.h>
 #include <cstdlib>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -112,7 +112,7 @@ auto main(int argc, char* argv[]) -> int
 
     omp_set_num_threads(1);  // All parallelism is explicit (QThreadPool, IOPool); OMP threads just spin-wait
     cv::setNumThreads(1);
-    blosc_set_nthreads(1);  // We parallelize at tile level; blosc internal threads just spin-wait
+    blosc2_set_nthreads(1);  // We parallelize at tile level; blosc internal threads just spin-wait
 
     // VC3D's interactive renderer performs better without BlockPipeline's
     // per-frame fetchInteractive dedup. Keep this app default scoped to VC3D,
