@@ -211,5 +211,5 @@ target_link_libraries(VC3D
     Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
-    PkgConfig::BLOSC2
+    Blosc2::blosc2_shared
 )

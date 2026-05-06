@@ -7,8 +7,8 @@ target_compile_features(utils PUBLIC cxx_std_23)
 target_link_libraries(utils PUBLIC
     nlohmann_json::nlohmann_json
     CURL::libcurl
-    PkgConfig::ZSTD
-    PkgConfig::LZ4
+    zstd::libzstd
+    LZ4::lz4
     ZLIB::ZLIB
 )
 target_compile_definitions(utils PUBLIC UTILS_HAS_CURL=1)

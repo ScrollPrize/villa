@@ -57,7 +57,7 @@ target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,utils_c3d_codec>>
 )
 target_link_libraries(vc_core PRIVATE
-    $<BUILD_INTERFACE:PkgConfig::BLOSC2>
+    $<BUILD_INTERFACE:Blosc2::blosc2_shared>
     ${VC_LIBBACKTRACE}
 )
 

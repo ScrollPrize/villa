@@ -17,7 +17,6 @@
       "hidden": true,
       "inherits": "_base",
       "cacheVariables": {
-        "VC_NATIVE_ARCH": "OFF",
         "VC_USE_CCACHE": "OFF"
       }
     },
@@ -26,7 +25,6 @@
       "hidden": true,
       "inherits": "_base",
       "cacheVariables": {
-        "VC_NATIVE_ARCH": "ON",
         "VC_TESTING": "ON",
         "CMAKE_C_COMPILER_LAUNCHER": "ccache",
         "CMAKE_CXX_COMPILER_LAUNCHER": "ccache"
@@ -68,9 +66,9 @@
     { "name": "ci-debug-clang",          "displayName": "CI Debug (clang)",
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "OFF" } },
 
-    { "name": "ci-release-gcc",          "displayName": "CI Release (gcc, portable)",
+    { "name": "ci-release-gcc",          "displayName": "CI Release (gcc)",
       "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "OFF" } },
-    { "name": "ci-release-clang",        "displayName": "CI Release (clang, portable)",
+    { "name": "ci-release-clang",        "displayName": "CI Release (clang)",
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "OFF" } },
 
     { "name": "ci-relwithdebinfo-gcc",   "displayName": "CI RelWithDebInfo (gcc)",
