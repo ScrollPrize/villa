@@ -31,6 +31,9 @@ public:
     Json(int v);
     Json(int64_t v);
     Json(uint64_t v);
+#if defined(__APPLE__)
+    Json(size_t v);
+#endif
     Json(double v);
     Json(const char* v);
     Json(const std::string& v);
@@ -116,6 +119,9 @@ public:
     Json& operator=(int v);
     Json& operator=(int64_t v);
     Json& operator=(uint64_t v);
+#if defined(__APPLE__)
+    Json& operator=(size_t v);
+#endif
     Json& operator=(double v);
     Json& operator=(const char* v);
     Json& operator=(const std::string& v);

@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <system_error>
 #include <tiffio.h>
+
+#include <opencv2/imgcodecs.hpp>
 
 namespace {
 
@@ -363,4 +367,42 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
     }
     std::cout << "Merge complete.\n";
     return true;
+}
+
+void atomicImwriteMulti(const std::filesystem::path& outPath,
+                        const std::vector<cv::Mat>& pages)
+{
+    if (pages.empty()) {
+        throw std::runtime_error("atomicImwriteMulti: no pages to write to " +
+                                 outPath.string());
+    }
+
+    // Write the .tmp inside the same directory as the final path so the
+    // rename never crosses a filesystem boundary (EXDEV). Keep the
+    // original extension on the tail so cv::imwritemulti still picks
+    // the TIFF codec from the filename — `.tif.tmp` would dispatch as
+    // an unknown extension and the write would fail. Result: for
+    // `mask.tif` we write to `mask.tmp.tif`, then rename to `mask.tif`.
+    const std::filesystem::path parent = outPath.parent_path();
+    const std::string stem = outPath.stem().string();
+    const std::string ext = outPath.extension().string();  // includes the dot, may be empty
+    std::filesystem::path tmpPath =
+        parent / (stem + ".tmp" + (ext.empty() ? std::string{".tif"} : ext));
+
+    std::error_code ec;
+    std::filesystem::remove(tmpPath, ec);  // best effort
+
+    if (!cv::imwritemulti(tmpPath.string(), pages)) {
+        std::filesystem::remove(tmpPath, ec);
+        throw std::runtime_error("atomicImwriteMulti: cv::imwritemulti failed for " +
+                                 tmpPath.string());
+    }
+
+    std::filesystem::rename(tmpPath, outPath, ec);
+    if (ec) {
+        std::filesystem::remove(tmpPath);
+        throw std::runtime_error("atomicImwriteMulti: rename " + tmpPath.string() +
+                                 " -> " + outPath.string() + " failed: " +
+                                 ec.message());
+    }
 }

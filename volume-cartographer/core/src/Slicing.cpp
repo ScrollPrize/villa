@@ -429,6 +429,13 @@ void readVolumeImpl(cv::Mat_<T>& out, IChunkedArray& cache, int level,
 
     const int h = coords.rows;
     const int w = coords.cols;
+    // Bottom-of-stack contract enforcer: the inner loop relies on out.ptr<T>(y)
+    // returning a valid row pointer, which is only true after create(). Higher
+    // layers (Volume::sample, Render.cpp helpers, callers) also size `out`, but
+    // this guard keeps the invariant local to where it's depended on.
+    if (out.size() != coords.size()) {
+        out.create(coords.size());
+    }
     #pragma omp parallel
     {
         ChunkSampler<T> s(cache, level);
@@ -492,43 +499,7 @@ void readInterpolated3D(cv::Mat_<uint16_t>& out, IChunkedArray* cache, int level
 
 namespace {
 
-template<typename T>
-void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset,
-                    IChunkedArray* cache, int level) {
-    int d = int(out.shape()[0]), h = int(out.shape()[1]), w = int(out.shape()[2]);
-    // Prefetch
-    prefetchRegion(*cache, level,
-                   float(offset[0]), float(offset[1]), float(offset[2]),
-                   float(offset[0] + w - 1), float(offset[1] + h - 1), float(offset[2] + d - 1));
-
-    #pragma omp parallel
-    {
-        ChunkSampler<T> s(*cache, level);
-        #pragma omp for schedule(dynamic, 4) collapse(2)
-        for (int z = 0; z < d; z++) {
-            for (int y = 0; y < h; y++) {
-                int iz = offset[2] + z;
-                int iy = offset[1] + y;
-                for (int x = 0; x < w; x++) {
-                    int ix = offset[0] + x;
-                    out(z, y, x) = s.sampleInt(iz, iy, ix);
-                }
-            }
-        }
-    }
-}
-
 } // namespace
-
-void readArea3D(Array3D<uint8_t>& out, const cv::Vec3i& offset,
-                IChunkedArray* cache, int level) {
-    readArea3DImpl(out, offset, cache, level);
-}
-
-void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset,
-                IChunkedArray* cache, int level) {
-    readArea3DImpl(out, offset, cache, level);
-}
 
 // ----------------------------------------------------------------------------
 // Plane sampling (uint8 + ARGB32 variants)

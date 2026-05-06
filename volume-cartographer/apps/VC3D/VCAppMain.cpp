@@ -172,7 +172,7 @@ auto main(int argc, char* argv[]) -> int
 
     QCommandLineOption debugOption(
         "debug",
-        "Enable verbose diagnostic logging while loading and trimming surfaces.");
+        "Enable verbose diagnostic logging while loading surfaces.");
     parser.addOption(debugOption);
 
     QCommandLineOption profileOption(

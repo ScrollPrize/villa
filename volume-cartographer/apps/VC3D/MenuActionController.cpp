@@ -66,7 +66,6 @@
 
 namespace
 {
-constexpr auto kRemoteVolumeRegistryFile = "remote_volumes.json";
 constexpr int kMaxStoredRemoteUrls = 10;
 QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
@@ -343,7 +342,6 @@ void MenuActionController::openVolpkg()
     }
     _window->CloseVolume();
     _window->OpenVolume(file);
-    loadAttachedRemoteVolumesForCurrentPackage();
     _window->UpdateView();
 }
 
@@ -358,7 +356,6 @@ void MenuActionController::openRecentVolpkg()
         if (!path.isEmpty()) {
             _window->CloseVolume();
             _window->OpenVolume(path);
-            loadAttachedRemoteVolumesForCurrentPackage();
             _window->UpdateView();
         }
     }
@@ -372,7 +369,6 @@ void MenuActionController::openVolpkgAt(const QString& path)
 
     _window->CloseVolume();
     _window->OpenVolume(path);
-    loadAttachedRemoteVolumesForCurrentPackage();
     _window->UpdateView();
 }
 
@@ -428,7 +424,7 @@ void MenuActionController::attachRemoteZarr()
         return;
     }
 
-    attachRemoteZarrUrl(url.trimmed(), true);
+    attachRemoteZarrUrl(url.trimmed());
 }
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
@@ -488,78 +484,13 @@ QString MenuActionController::suggestedRemoteCacheDirectory() const
     return vc3d::defaultCacheBase() + "/remote_cache";
 }
 
-QString MenuActionController::remoteVolumeRegistryCacheRoot() const
-{
-    const QString registryPath = remoteVolumeRegistryPath();
-    if (registryPath.isEmpty() || !QFileInfo::exists(registryPath)) {
-        return {};
-    }
-
-    try {
-        auto root = utils::Json::parse_file(registryPath.toStdString());
-        if (root.is_object() && root.contains("cache_root")) {
-            return QString::fromStdString(root.value("cache_root", std::string{})).trimmed();
-        }
-    } catch (const std::exception& e) {
-        Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
-    }
-
-    return {};
-}
-
 QString MenuActionController::configuredRemoteCacheDirectory() const
 {
     if (_window && _window->_state && _window->_state->vpkg()) {
-        const QString projectCache =
-            QString::fromStdString(_window->_state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
-        if (!projectCache.isEmpty()) {
-            return projectCache;
-        }
+        return QString::fromStdString(
+            _window->_state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
     }
-
-    const QString registryCache = remoteVolumeRegistryCacheRoot();
-    if (!registryCache.isEmpty()) {
-        return registryCache;
-    }
-
     return {};
-}
-
-void MenuActionController::persistRemoteVolumeRegistryCacheRoot(const QString& cacheRoot)
-{
-    const QString registryPath = remoteVolumeRegistryPath();
-    if (registryPath.isEmpty() || cacheRoot.trimmed().isEmpty()) {
-        return;
-    }
-
-    utils::Json root = {
-        {"version", utils::Json(1)},
-        {"volumes", utils::Json::array()}
-    };
-
-    try {
-        if (QFileInfo::exists(registryPath)) {
-            root = utils::Json::parse_file(registryPath.toStdString());
-        }
-    } catch (const std::exception& e) {
-        Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
-        root = {
-            {"version", utils::Json(1)},
-            {"volumes", utils::Json::array()}
-        };
-    }
-
-    if (!root.is_object()) {
-        root = utils::Json::object();
-    }
-    if (!root.contains("volumes") || !root["volumes"].is_array()) {
-        root["volumes"] = utils::Json::array();
-    }
-    root["version"] = 1;
-    root["cache_root"] = cacheRoot.trimmed().toStdString();
-
-    std::ofstream output(registryPath.toStdString(), std::ofstream::out | std::ofstream::trunc);
-    output << root.dump(2) << '\n';
 }
 
 QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
@@ -583,8 +514,8 @@ QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
     }
 
     if (cacheDir.isEmpty()) {
-        // Legacy fallback for projects opened before a project/registry cache root existed.
-        // This path is non-prompting so startup and persisted remote loading stay quiet.
+        // Fallback for projects with no persisted cache root yet. Non-prompting
+        // so startup and persisted remote loading stay quiet.
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
         cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
@@ -595,190 +526,19 @@ QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
     }
 
     if (shouldPersistCacheRoot && _window && _window->_state && _window->_state->vpkg()) {
+        // VolumePkg::setRemoteCacheRoot persists to the volpkg JSON
+        // automatically via persistProjectState().
         auto pkg = _window->_state->vpkg();
         if (!pkg->hasRemoteCacheRoot()) {
             pkg->setRemoteCacheRoot(cacheDir.toStdString());
         }
-    }
-    if (shouldPersistCacheRoot) {
-        persistRemoteVolumeRegistryCacheRoot(cacheDir);
     }
 
     QDir().mkpath(cacheDir);
     return cacheDir;
 }
 
-QString MenuActionController::remoteVolumeRegistryPath() const
-{
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        return {};
-    }
-    return QDir(_window->_state->vpkgPath()).filePath(QString::fromLatin1(kRemoteVolumeRegistryFile));
-}
-
-void MenuActionController::persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume)
-{
-    const QString registryPath = remoteVolumeRegistryPath();
-    if (registryPath.isEmpty() || !volume) {
-        return;
-    }
-
-    utils::Json root = {
-        {"version", utils::Json(1)},
-        {"volumes", utils::Json::array()}
-    };
-
-    try {
-        if (QFileInfo::exists(registryPath)) {
-            root = utils::Json::parse_file(registryPath.toStdString());
-        }
-    } catch (const std::exception& e) {
-        Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
-        root = {
-            {"version", utils::Json(1)},
-            {"volumes", utils::Json::array()}
-        };
-    }
-
-    if (!root.is_object()) {
-        root = utils::Json::object();
-    }
-    if (!root.contains("volumes") || !root["volumes"].is_array()) {
-        root["volumes"] = utils::Json::array();
-    }
-    root["version"] = 1;
-    const QString cacheRoot = configuredRemoteCacheDirectory();
-    if (!cacheRoot.isEmpty()) {
-        root["cache_root"] = cacheRoot.toStdString();
-    }
-
-    const std::string urlStd = url.trimmed().toStdString();
-    const std::string idStd = volume->id();
-    utils::Json updated = utils::Json::array();
-    bool replaced = false;
-
-    for (const auto& entry : root["volumes"]) {
-        if (!entry.is_object()) {
-            continue;
-        }
-        const std::string existingUrl = entry.value("url", std::string{});
-        const std::string existingId = entry.value("id", std::string{});
-        if (existingUrl == urlStd || (!idStd.empty() && existingId == idStd)) {
-            if (!replaced) {
-                updated.push_back({
-                    {"url", urlStd},
-                    {"id", idStd},
-                    {"name", volume->name()}
-                });
-                replaced = true;
-            }
-            continue;
-        }
-        updated.push_back(entry);
-    }
-
-    if (!replaced) {
-        updated.push_back({
-            {"url", urlStd},
-            {"id", idStd},
-            {"name", volume->name()}
-        });
-    }
-
-    root["volumes"] = std::move(updated);
-
-    std::ofstream output(registryPath.toStdString(), std::ofstream::out | std::ofstream::trunc);
-    output << root.dump(2) << '\n';
-}
-
-void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
-{
-    const QString registryPath = remoteVolumeRegistryPath();
-    if (registryPath.isEmpty() || !QFileInfo::exists(registryPath) || !_window || !_window->_state || !_window->_state->vpkg()) {
-        return;
-    }
-
-    utils::Json root;
-    try {
-        root = utils::Json::parse_file(registryPath.toStdString());
-    } catch (const std::exception& e) {
-        Logger()->warn("Failed to parse remote volume registry '{}': {}", registryPath.toStdString(), e.what());
-        if (_window->statusBar()) {
-            _window->statusBar()->showMessage(QObject::tr("Failed to read remote_volumes.json"), 5000);
-        }
-        return;
-    }
-
-    if (root.contains("cache_root") && _window && _window->_state && _window->_state->vpkg()) {
-        const QString registryCacheRoot =
-            QString::fromStdString(root.value("cache_root", std::string{})).trimmed();
-        if (!registryCacheRoot.isEmpty() && !_window->_state->vpkg()->hasRemoteCacheRoot()) {
-            _window->_state->vpkg()->setRemoteCacheRoot(registryCacheRoot.toStdString());
-        }
-    }
-
-    if (!root.contains("volumes") || !root["volumes"].is_array() || root["volumes"].empty()) {
-        return;
-    }
-
-    const QString currentId = QString::fromStdString(_window->_state->currentVolumeId());
-    const QString cacheDir = remoteCacheDirectory(false);
-    int attachedCount = 0;
-    int skippedCount = 0;
-    QString firstAttachedId;
-
-    for (const auto& entry : root["volumes"]) {
-        if (!entry.is_object()) {
-            continue;
-        }
-
-        const QString url = QString::fromStdString(entry.value("url", std::string{})).trimmed();
-        if (url.isEmpty()) {
-            continue;
-        }
-
-        vc::HttpAuth auth;
-        QString authError;
-        if (!tryResolveRemoteAuth(url, &auth, false, &authError)) {
-            Logger()->warn("Skipping persisted remote volume '{}': {}", url.toStdString(), authError.toStdString());
-            skippedCount++;
-            continue;
-        }
-
-        try {
-            auto volume = Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
-            if (_window->_state->vpkg()->hasVolume(volume->id())) {
-                continue;
-            }
-            if (_window->_state->vpkg()->addVolume(volume)) {
-                if (firstAttachedId.isEmpty()) {
-                    firstAttachedId = QString::fromStdString(volume->id());
-                }
-                attachedCount++;
-            } else {
-                skippedCount++;
-            }
-        } catch (const std::exception& e) {
-            Logger()->warn("Failed to attach persisted remote volume '{}': {}", url.toStdString(), e.what());
-            skippedCount++;
-        }
-    }
-
-    if (attachedCount > 0) {
-        _window->refreshCurrentVolumePackageUi(firstAttachedId.isEmpty() ? currentId : firstAttachedId, false);
-        _window->UpdateView();
-    }
-
-    if (_window->statusBar() && (attachedCount > 0 || skippedCount > 0)) {
-        _window->statusBar()->showMessage(
-            QObject::tr("Attached %1 persisted remote volume(s), skipped %2.")
-                .arg(attachedCount)
-                .arg(skippedCount),
-            5000);
-    }
-}
-
-void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistEntry)
+void MenuActionController::attachRemoteZarrUrl(const QString& url)
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         QMessageBox::warning(_window,
@@ -823,7 +583,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
     connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-            [this, watcher, url, persistEntry]() {
+            [this, watcher, url]() {
                 watcher->deleteLater();
                 if (_attachRemoteZarrAct) {
                     _attachRemoteZarrAct->setEnabled(true);
@@ -853,11 +613,9 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
                             return;
                         }
 
+                        // VolumePkg::addVolumeEntry persists to the volpkg
+                        // JSON automatically via persistProjectState().
                         _window->_state->vpkg()->addVolumeEntry(url.trimmed().toStdString());
-
-                        if (persistEntry) {
-                            persistAttachedRemoteVolume(url, volume);
-                        }
 
                         if (_window->statusBar()) {
                             _window->statusBar()->showMessage(
@@ -898,8 +656,8 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
                             .arg(errorMsg),
                         QMessageBox::Yes | QMessageBox::No);
                     if (reply == QMessageBox::Yes) {
-                        QTimer::singleShot(0, this, [this, url, persistEntry]() {
-                            attachRemoteZarrUrl(url, persistEntry);
+                        QTimer::singleShot(0, this, [this, url]() {
+                            attachRemoteZarrUrl(url);
                         });
                         return;
                     }
@@ -1498,6 +1256,7 @@ void MenuActionController::setOutputSegments()
         QObject::tr("Where new segments will land:"), items, currentIdx, false, &ok);
     if (!ok || chosen.isEmpty()) return;
     pkg->setOutputSegments(chosen.toStdString());
+    _window->refreshCurrentVolumePackageUi(QString(), true);
 }
 
 bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut)

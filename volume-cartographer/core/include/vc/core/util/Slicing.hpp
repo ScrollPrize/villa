@@ -6,10 +6,6 @@
 #include <vc/core/render/IChunkedArray.hpp>
 #include <vc/core/util/Compositing.hpp>
 #include <vc/core/types/Sampling.hpp>
-#include <vc/core/types/Array3D.hpp>
-
-// Forward declaration
-namespace vc { class VcDataset; }
 
 // Read interpolated 3D data from a chunked zarr source.
 void readInterpolated3D(cv::Mat_<uint8_t> &out, vc::render::IChunkedArray* cache, int level, const cv::Mat_<cv::Vec3f> &coords, bool nearest_neighbor=false);
@@ -18,10 +14,6 @@ void readInterpolated3D(cv::Mat_<uint16_t> &out, vc::render::IChunkedArray* cach
 // Overloads accepting vc::Sampling enum (supports Nearest, Trilinear, Tricubic)
 void readInterpolated3D(cv::Mat_<uint8_t> &out, vc::render::IChunkedArray* cache, int level, const cv::Mat_<cv::Vec3f> &coords, vc::Sampling method);
 void readInterpolated3D(cv::Mat_<uint16_t> &out, vc::render::IChunkedArray* cache, int level, const cv::Mat_<cv::Vec3f> &coords, vc::Sampling method);
-
-// Read a 3D area from a chunked zarr source.
-void readArea3D(Array3D<uint8_t> &out, const cv::Vec3i& offset, vc::render::IChunkedArray* cache, int level);
-void readArea3D(Array3D<uint16_t> &out, const cv::Vec3i& offset, vc::render::IChunkedArray* cache, int level);
 
 // Composite rendering with configurable interpolation.
 void readCompositeFast(

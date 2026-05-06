@@ -91,6 +91,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
+#include "vc/core/util/Tiff.hpp"
 #include <utils/zarr.hpp>
 
 
@@ -810,6 +811,10 @@ CWindow::CWindow(size_t cacheSizeGB) :
 // Destructor
 CWindow::~CWindow()
 {
+    if (qApp) {
+        qApp->removeEventFilter(this);
+    }
+
     // Backstop in case ~CWindow is reached without closeEvent firing (e.g.
     // if the app is torn down programmatically). Same rationale as the
     // closeEvent hook — skip SurfacePatchIndex removal during teardown.
@@ -995,7 +1000,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     updateNormalGridAvailability();
 
     if (_state->currentVolume() && _state) {
-        auto [w, h, d] = _state->currentVolume()->shape();
+        auto [w, h, d] = _state->currentVolume()->shapeXyz();
         float x0 = 0, y0 = 0, z0 = 0;
         float x1 = static_cast<float>(w - 1), y1 = static_cast<float>(h - 1), z1 = static_cast<float>(d - 1);
 
@@ -1050,6 +1055,8 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     if (_segmentationWidget) {
         _segmentationWidget->setVolumePackagePath(_state->vpkgPath());
     }
+
+    updateNormalGridAvailability();
 
     refreshVolumeSelectionUi(preferredVolumeId);
     if (!_state->vpkg()->hasVolumes()) {
@@ -1182,6 +1189,7 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
         focus->surfaceId = "segmentation";
     }
 
+    focus->suppressTransientPlaneIntersections = true;
     _state->setPOI("focus", focus);
     recenterSegmentationViewerNear(position);
 
@@ -1506,7 +1514,7 @@ void CWindow::CreateWidgets(void)
                     normal = cv::Vec3f(0, 0, 1);
                 }
                 if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shape();
+                    auto [w, h, d] = vol->shapeXyz();
                     cv::Vec3f clamped = worldCenter;
                     clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
                     clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
@@ -2805,7 +2813,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
                 && worldCenter[0] >= 0.0f;
             if (centerValid) {
                 if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shape();
+                    auto [w, h, d] = vol->shapeXyz();
                     cv::Vec3f clamped = worldCenter;
                     clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
                     clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
@@ -3056,12 +3064,13 @@ void CWindow::onAppendMaskPressed(void)
                 float surfScale = surf->scale()[0];
                 cv::Mat_<cv::Vec3f> coords;
                 surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
+                img.create(coords.size());
                 render_image_from_coords(coords, img, volume.get());
             }
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
             existing_layers.push_back(img);
-            imwritemulti(path.string(), existing_layers);
+            atomicImwriteMulti(path, existing_layers);
 
             QString msg = QString("Appended surface image to existing mask (now %1 layers)")
                               .arg(existing_layers.size());
@@ -3077,7 +3086,7 @@ void CWindow::onAppendMaskPressed(void)
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
             std::vector<cv::Mat> layers = {mask, img};
-            imwritemulti(path.string(), layers);
+            atomicImwriteMulti(path, layers);
 
             surf->meta["date_last_modified"] = get_surface_time_str();
             surf->save_meta();
@@ -3088,10 +3097,14 @@ void CWindow::onAppendMaskPressed(void)
 
 QString CWindow::getCurrentVolumePath() const
 {
-    if (_state->currentVolume() == nullptr) {
+    auto volume = _state->currentVolume();
+    if (volume == nullptr) {
         return QString();
     }
-    return QString::fromStdString(_state->currentVolume()->path().string());
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl());
+    }
+    return QString::fromStdString(volume->path().string());
 }
 
 void CWindow::onSegmentationDirChanged(int index)
@@ -3123,7 +3136,7 @@ void CWindow::onSegmentationDirChanged(int index)
             _viewerManager->resetStrideUserOverride();
         }
         if (_surfacePanel) {
-            _surfacePanel->loadSurfaces(false);
+            _surfacePanel->loadSurfaces(true);
         }
 
         // Update the status bar to show the change
@@ -3176,7 +3189,7 @@ void CWindow::onManualLocationChanged()
     }
 
     // Clamp values to physical volume bounds
-    auto [w, h, d] = _state->currentVolume()->shape();
+    auto [w, h, d] = _state->currentVolume()->shapeXyz();
     int cx0 = 0, cy0 = 0, cz0 = 0;
     int cx1 = w - 1, cy1 = h - 1, cz1 = d - 1;
 

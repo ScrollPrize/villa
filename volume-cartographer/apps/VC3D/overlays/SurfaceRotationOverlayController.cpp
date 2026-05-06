@@ -9,6 +9,7 @@
 
 #include <QApplication>
 #include <QDoubleSpinBox>
+#include <QFutureWatcher>
 #include <QGraphicsProxyWidget>
 #include <QGraphicsScene>
 #include <QHBoxLayout>
@@ -16,11 +17,13 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointer>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QtConcurrent>
 
 #include <algorithm>
 #include <cmath>
@@ -276,13 +279,34 @@ void SurfaceRotationOverlayController::beginRotate()
 
 void SurfaceRotationOverlayController::cancelRotate()
 {
-    if (_rotateActive && _state && _sourceSurface) {
+    // Restore the un-previewed source surface — but only if no save
+    // worker is currently mutating it. Publishing _sourceSurface
+    // while applyRotation()'s background rotate() / saveOverwrite()
+    // is running would point surfaceChanged consumers at a cv::Mat
+    // the worker is concurrently writing, racing on _points and the
+    // ancillary channels. Whatever was previously active (typically
+    // the last _previewSurface from a dial drag) stays in place; the
+    // worker's finished slot already drops its own setSurface via
+    // the stale-completion guard, so the UI never sees the
+    // cancelled-session's post-rotate output either. A user who
+    // wants the on-disk post-rotate state can reopen the segment.
+    if (_rotateActive && _state && _sourceSurface && !_saveInFlight) {
         _state->setSurface("segmentation", _sourceSurface, false, true);
     }
     _rotateActive = false;
     _angleDeg = 0.0;
     _sourceSurface.reset();
     _previewSurface.reset();
+    // Invalidate any in-flight save worker — the session it was
+    // started for is over, so its completion callback will see a
+    // mismatched session id and drop its state changes. We do NOT
+    // clear _saveInFlight here: the worker is still running and a
+    // new Apply on a freshly begun session must wait for it to
+    // finish, otherwise two workers could race rotate()/saveOverwrite()
+    // on the same QuadSurface (the new session may target the very
+    // same segment). The finished slot clears _saveInFlight whether
+    // it applies or drops the result.
+    ++_saveSessionId;
     clearWidgets();
 }
 
@@ -438,6 +462,14 @@ void SurfaceRotationOverlayController::updatePreview()
     if (!_rotateActive || !_state || !_sourceSurface) {
         return;
     }
+    // While a save worker is running, _sourceSurface is being mutated
+    // (rotate + saveOverwrite) on the worker thread. Cloning it here on
+    // the UI thread would race the worker's writes — read while another
+    // thread mutates the same cv::Mat data. Skip the preview update; the
+    // worker will tear the controller down via its finished slot anyway.
+    if (_saveInFlight) {
+        return;
+    }
 
     if (std::abs(_angleDeg) < 0.01) {
         _previewSurface.reset();
@@ -460,33 +492,102 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
-    try {
-        if (std::abs(_angleDeg) >= 0.01) {
-            _sourceSurface->saveSnapshot();
-            _sourceSurface->rotate(static_cast<float>(_angleDeg));
-            _sourceSurface->saveOverwrite();
-            if (_viewerManager) {
-                _viewerManager->refreshSurfacePatchIndex(_sourceSurface);
-            }
-        }
-        _state->setSurface("segmentation", _sourceSurface, false, true);
-    } catch (const std::exception&) {
-        _state->setSurface("segmentation", _sourceSurface, false, true);
-        clearWidgets();
-        _rotateActive = false;
-        _previewSurface.reset();
-        _sourceSurface.reset();
-        QMessageBox::warning(nullptr,
-                             tr("Rotation Failed"),
-                             tr("Failed to save the rotated surface."));
+    // Reentrancy guard: another save is already running for this
+    // surface. A second rotate()/saveOverwrite() racing the first
+    // would mutate _points and the on-disk files concurrently.
+    // Just ignore the duplicate Apply.
+    if (_saveInFlight) {
         return;
     }
 
-    _rotateActive = false;
-    _angleDeg = 0.0;
-    _previewSurface.reset();
-    _sourceSurface.reset();
-    clearWidgets();
+    // Trivial rotation: no I/O, nothing to do off-thread.
+    if (std::abs(_angleDeg) < 0.01) {
+        _state->setSurface("segmentation", _sourceSurface, false, true);
+        _rotateActive = false;
+        _angleDeg = 0.0;
+        _previewSurface.reset();
+        _sourceSurface.reset();
+        clearWidgets();
+        return;
+    }
+
+    // Pre-fix this method ran rotate() + saveOverwrite() on the GUI
+    // thread, freezing the UI for several seconds on large surfaces.
+    // Move both into a worker (mirrors SegmentationModule::performAutosave),
+    // then post UI work back on completion.
+    auto surface = _sourceSurface;
+    const float angleDeg = static_cast<float>(_angleDeg);
+    const int session = ++_saveSessionId;
+    _saveInFlight = true;
+    QPointer<SurfaceRotationOverlayController> self(this);
+
+    auto* watcher = new QFutureWatcher<void>(this);
+    connect(watcher, &QFutureWatcher<void>::finished, this,
+            [self, watcher, surface, session]() {
+                watcher->deleteLater();
+                if (!self) {
+                    return;
+                }
+                // Always clear the in-flight flag once the worker is
+                // done, even on stale/cancelled completion. The
+                // reentrancy guard relies on this — leaving it set
+                // would lock out future Applies after a cancel.
+                self->_saveInFlight = false;
+                if (!self->_state) {
+                    return;
+                }
+                // Stale completion: cancelRotate() or another Apply
+                // bumped the session id. The user's current rotation
+                // session (if any) belongs to a different surface or
+                // was cancelled — applying our results would
+                // overwrite live state with state from an old session.
+                if (session != self->_saveSessionId) {
+                    return;
+                }
+
+                bool failed = false;
+                try {
+                    watcher->waitForFinished();  // surface exception if any
+                } catch (const std::exception&) {
+                    failed = true;
+                } catch (...) {
+                    failed = true;
+                }
+
+                if (failed) {
+                    self->_state->setSurface("segmentation", surface, false, true);
+                    self->clearWidgets();
+                    self->_rotateActive = false;
+                    self->_previewSurface.reset();
+                    self->_sourceSurface.reset();
+                    QMessageBox::warning(nullptr,
+                                         tr("Rotation Failed"),
+                                         tr("Failed to save the rotated surface."));
+                    return;
+                }
+
+                if (self->_viewerManager) {
+                    self->_viewerManager->refreshSurfacePatchIndex(surface);
+                }
+                self->_state->setSurface("segmentation", surface, false, true);
+
+                self->_rotateActive = false;
+                self->_angleDeg = 0.0;
+                self->_previewSurface.reset();
+                self->_sourceSurface.reset();
+                self->clearWidgets();
+            });
+
+    auto future = QtConcurrent::run([surface, angleDeg]() {
+        // saveOverwrite() snapshots the on-disk state before
+        // overwriting it. rotate() only mutates _points in memory,
+        // so the on-disk x/y/z.tif are still pre-rotate when the
+        // snapshot is taken — the backup ring captures the
+        // pre-rotation files automatically.
+        surface->rotate(angleDeg);
+        surface->saveOverwrite();
+    });
+    watcher->setFuture(future);
 }
 
 std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::cloneSurface(const std::shared_ptr<QuadSurface>& surface)

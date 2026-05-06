@@ -315,7 +315,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             }
         }
 
-        _state->setSurface(planeName, planeShared);
+        _state->setSurface(planeName, planeShared, false, true);
         return planeShared;
     };
 
@@ -365,8 +365,8 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         segXZShared->setInPlaneRotation(0.0f);
         segYZShared->setInPlaneRotation(0.0f);
 
-        _state->setSurface("seg xz", segXZShared);
-        _state->setSurface("seg yz", segYZShared);
+        _state->setSurface("seg xz", segXZShared, false, true);
+        _state->setSurface("seg yz", segYZShared, false, true);
     }
 
     if (_planeSlicingOverlay) {

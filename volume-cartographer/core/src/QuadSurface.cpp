@@ -12,6 +12,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <system_error>
@@ -449,8 +450,6 @@ void QuadSurface::ensureLoaded()
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
 
-    trimToValidBbox();
-
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
         _bbox = loaded->_bbox;
@@ -609,58 +608,6 @@ int QuadSurface::countValidQuads() const
     if (!_points) return 0;
     auto range = validQuads();
     return static_cast<int>(std::distance(range.begin(), range.end()));
-}
-
-bool QuadSurface::trimToValidBbox()
-{
-    if (!_points || _points->empty()) return false;
-    const int rows = _points->rows;
-    const int cols = _points->cols;
-    int r0 = rows, r1 = -1, c0 = cols, c1 = -1;
-    for (int r = 0; r < rows; r++) {
-        const cv::Vec3f* row = (*_points)[r];
-        int rc0 = cols, rc1 = -1;
-        for (int c = 0; c < cols; c++) {
-            if (row[c][0] != -1.f) {
-                if (c < rc0) rc0 = c;
-                rc1 = c;
-            }
-        }
-        if (rc1 >= 0) {
-            if (r < r0) r0 = r;
-            r1 = r;
-            if (rc0 < c0) c0 = rc0;
-            if (rc1 > c1) c1 = rc1;
-        }
-    }
-    if (r1 < 0 || c1 < 0) return false;
-    const int bbH = r1 - r0 + 1;
-    const int bbW = c1 - c0 + 1;
-    // Skip only if nothing to trim (bbox already matches grid exactly).
-    if (bbH == rows && bbW == cols) return false;
-    const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
-    const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
-    const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
-    auto trimmed = std::make_unique<cv::Mat_<cv::Vec3f>>(
-        (*_points)(cv::Rect(c0, r0, bbW, bbH)).clone());
-    _points = std::move(trimmed);
-    // Shift center: after cropping by (c0, r0), the new grid index 0
-    // corresponds to the old index (c0, r0), so we must subtract.
-    _center[0] -= float(c0) / _scale[0];
-    _center[1] -= float(r0) / _scale[1];
-    _bounds = {0, 0, bbW - 1, bbH - 1};
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};  // World bbox cached, needs recompute.
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
-    if (DebugLoggingEnabled()) {
-        std::fprintf(stderr,
-            "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
-            id.c_str(), cols, rows, bbW, bbH,
-            (origBytes - trimBytes) / (1024 * 1024),
-            pctSaved * 100.0);
-    }
-    return true;
 }
 
 void QuadSurface::unloadPoints()
@@ -1248,6 +1195,18 @@ void QuadSurface::saveOverwrite()
         throw std::runtime_error("QuadSurface::saveOverwrite() requires a non-empty uuid");
     }
 
+    // Snapshot the on-disk state before overwriting. saveSnapshot() writes
+    // a rotating backup at <volpkg>/backups/<segname>/{0..N-1}/ so a
+    // destructive save (e.g. corrupted in-memory _points) is recoverable.
+    // Failures (disk full, permissions) are logged but never block the
+    // user's edit — the backup is best-effort.
+    try {
+        saveSnapshot(8);
+    } catch (const std::exception& e) {
+        Logger()->warn("saveOverwrite: snapshot failed for {}: {}",
+                       final_path.string(), e.what());
+    }
+
     save(final_path.string(), uuid, true);
     path = final_path;
     id = uuid;
@@ -1270,10 +1229,6 @@ void QuadSurface::invalidateMask()
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
 {
-    // Trim padding before serializing so the on-disk grid matches the in-RAM
-    // one. No-op if already trimmed or saving would save <25%.
-    trimToValidBbox();
-
     // Split the points matrix into x, y, z channels
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);
@@ -1315,6 +1270,15 @@ void QuadSurface::saveSnapshot(int maxBackups)
 {
     if (path.empty()) {
         throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
+    }
+
+    // No on-disk state to back up yet — the first save will populate
+    // the directory; subsequent saveOverwrite calls will pick up the
+    // rolling history from then on. Treat this as a no-op rather than
+    // an error so the saveOverwrite call site doesn't have to special
+    // case it.
+    if (!std::filesystem::exists(path / "x.tif")) {
+        return;
     }
 
     // Path is expected to be: /path/to/scroll.volpkg/paths/segment_name
@@ -1385,47 +1349,37 @@ void QuadSurface::saveSnapshot(int maxBackups)
         throw std::runtime_error("Failed to create snapshot directory: " + ec.message());
     }
 
-    // Write surface data (skip mask - we'll copy it from disk instead)
-    writeDataToDirectory(snapshot_dest, "mask");
-
-    // Write metadata - create a copy so we don't modify the original
-    utils::Json snapshotMeta = meta;
-    {
-        auto lo = utils::Json::array();
-        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
-        auto hi = utils::Json::array();
-        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
-        auto bb = utils::Json::array();
-        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
-        snapshotMeta["bbox"] = std::move(bb);
+    // Capture the LAST PERSISTED state — copy every regular file in
+    // path/ verbatim into the snapshot slot. This preserves x/y/z.tif,
+    // mask.tif, ancillary channels, meta.json, corrections.json, etc.
+    // without re-serializing in-memory data.
+    //
+    // The previous implementation called writeDataToDirectory(...)
+    // which serialized the current in-memory _points. That broke
+    // recovery for the saveOverwrite case: when the in-memory state
+    // is what we're trying to roll back FROM, persisting it as the
+    // backup snapshot leaves no good state to recover.
+    //
+    // Subdirectories (e.g. .tmp_* from in-flight saves) are skipped.
+    for (const auto& entry : std::filesystem::directory_iterator(path, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::error_code copyEc;
+        std::filesystem::copy_file(
+            entry.path(),
+            snapshot_dest / entry.path().filename(),
+            std::filesystem::copy_options::overwrite_existing,
+            copyEc);
+        if (copyEc) {
+            Logger()->warn("saveSnapshot: copy failed for {}: {}",
+                           entry.path().string(), copyEc.message());
+        }
     }
-    snapshotMeta["type"] = "seg";
-    snapshotMeta["uuid"] = id;
-    snapshotMeta["format"] = "tifxyz";
-    {
-        auto sc = utils::Json::array();
-        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
-        snapshotMeta["scale"] = std::move(sc);
-    }
-
-    std::ofstream o(snapshot_dest / "meta.json");
-    o << snapshotMeta.dump(4) << std::endl;
-    o.close();
-
-    // Copy mask.tif and generations.tif if they exist on disk
-    std::filesystem::path maskFile = path / "mask.tif";
-    std::filesystem::path generationsFile = path / "generations.tif";
-
-    if (std::filesystem::exists(maskFile)) {
-        std::filesystem::path destMask = snapshot_dest / "mask.tif";
-        std::filesystem::copy_file(maskFile, destMask,
-            std::filesystem::copy_options::overwrite_existing, ec);
-    }
-
-    if (std::filesystem::exists(generationsFile)) {
-        std::filesystem::path destGenerations = snapshot_dest / "generations.tif";
-        std::filesystem::copy_file(generationsFile, destGenerations,
-            std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        Logger()->warn("saveSnapshot: directory iteration failed for {}: {}",
+                       path.string(), ec.message());
     }
 }
 

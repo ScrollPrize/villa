@@ -11,6 +11,7 @@
 #include <QPointF>
 #include <QRectF>
 #include <QString>
+#include <QTransform>
 
 #include <opencv2/core.hpp>
 
@@ -118,7 +119,7 @@ public:
     struct ImagePrimitive {
         QImage image;
         QPointF offset{0.0, 0.0};  // Scene-space offset (like setOffset)
-        qreal scale{1.0};           // Uniform scale factor (like setScale)
+        QTransform transform{};
         qreal opacity{1.0};
         qreal z{0.0};
     };
@@ -204,6 +205,18 @@ protected:
         void addImage(const QImage& image,
                       const QPointF& offset,
                       qreal scale,
+                      qreal opacity,
+                      qreal z);
+
+        void addImage(const QImage& image,
+                      const QPointF& offset,
+                      qreal scaleX,
+                      qreal scaleY,
+                      qreal opacity,
+                      qreal z);
+
+        void addImage(const QImage& image,
+                      const QTransform& transform,
                       qreal opacity,
                       qreal z);
 

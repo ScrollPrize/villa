@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 
@@ -18,6 +19,16 @@ import opt_loss_corr
 import opt_loss_winding_volume
 import opt_loss_station
 import opt_loss_bend
+
+
+def _debug_cuda_sync(label: str) -> None:
+	if os.environ.get("LASAGNA_SYNC_DEBUG", "0") == "0":
+		return
+	if torch.cuda.is_available():
+		try:
+			torch.cuda.synchronize()
+		except RuntimeError as exc:
+			raise RuntimeError(f"CUDA failure after {label}") from exc
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -272,8 +283,15 @@ def optimize(
 	progress_fn=None,
 	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
+	out_dir: str | None = None,
 ) -> fit_data.FitData3D:
 	opt_loss_corr.reset_state()
+
+	def _stage_start(name: str) -> float:
+		return 0.0
+
+	def _stage_done(name: str, t0: float) -> None:
+		return None
 
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
@@ -293,16 +311,34 @@ def optimize(
 	_corr_start_printed = [False]
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
+		_t_stage_total = _stage_start(f"{label}.total")
 		print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
 			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0:
 			return data
+		stage_args = opt_cfg.args or {}
+		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
+		status_interval = max(0, int(status_interval_raw))
 
 		# Configure corr Phase D Gaussian-splat σ (default 1.0; 7×7 vertex neighborhood).
+		_t = _stage_start(f"{label}.configure_losses")
 		corr_splat_sigma = float(opt_cfg.args.get("corr_splat_sigma", 1.0)) if opt_cfg.args else 1.0
 		opt_loss_corr.set_splat_sigma(corr_splat_sigma)
+		pred_dt_flow_gate_cfg = opt_cfg.args.get("pred_dt_flow_gate") if opt_cfg.args else None
+		pred_dt_normal_source = (opt_cfg.args or {}).get("pred_dt_normal_source", None)
+		if pred_dt_normal_source is None and isinstance(pred_dt_flow_gate_cfg, dict):
+			pred_dt_normal_source = pred_dt_flow_gate_cfg.get("normal_source", None)
+		opt_loss_pred_dt.configure_pred_dt(normal_source=pred_dt_normal_source)
+		opt_loss_pred_dt.configure_flow_gate(
+			cfg=pred_dt_flow_gate_cfg if _need_term("pred_dt", opt_cfg.eff) > 0 else None,
+			stage_name=stage.name or label,
+			seed_xyz=seed_xyz,
+			out_dir=out_dir,
+		)
+		_stage_done(f"{label}.configure_losses", _t)
 
 		# If arc/straight params not in optimized set, bake into mesh
+		_t = _stage_start(f"{label}.prepare_model_params")
 		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
 		if not arc_params_set.intersection(opt_cfg.params):
 			if hasattr(model, "arc_enabled") and model.arc_enabled:
@@ -311,7 +347,9 @@ def optimize(
 		if not straight_params_set.intersection(opt_cfg.params):
 			if hasattr(model, "straight_enabled") and model.straight_enabled:
 				model.bake_straight_into_mesh()
+		_stage_done(f"{label}.prepare_model_params", _t)
 
+		_t = _stage_start(f"{label}.build_optimizer")
 		all_params = model.opt_params()
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:
@@ -329,9 +367,11 @@ def optimize(
 		if not param_groups:
 			return data
 		opt = torch.optim.Adam(param_groups)
+		_stage_done(f"{label}.build_optimizer", _t)
 
 		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
 		if opt_cfg.args and opt_cfg.args.get("winding_offset_autocrop") and _need_term("winding_vol", opt_cfg.eff) > 0:
+			_t = _stage_start(f"{label}.winding_offset_autocrop")
 			with torch.no_grad():
 				res_ao = model(data)
 			ao_offset, ao_dir = opt_loss_winding_volume.compute_auto_offset(res=res_ao)
@@ -363,27 +403,69 @@ def optimize(
 				if not param_groups:
 					return data
 				opt = torch.optim.Adam(param_groups)
+			_stage_done(f"{label}.winding_offset_autocrop", _t)
 
 		_status_rows = 0
 
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
 						  its: float | None = None) -> None:
 			nonlocal _status_rows
-			tv_keys = sorted(tv.keys())
+			label_map = {
+				"pred_dt_gate_gt0": "g>0",
+				"pred_dt_gate_gt01": "g>.1",
+				"pred_dt_gate_gt05": "g>.5",
+				"pred_dt_gate_eq1": "g=1",
+				"pred_dt_gate_n_gt0": "n>0",
+				"pred_dt_gate_n_gt01": "n>.1",
+				"pred_dt_gate_n_gt05": "n>.5",
+				"pred_dt_pull_active_frac": "pull%",
+				"pred_dt_pull_prefix_mean": "pullpre",
+				"pred_dt_pull_weight_mean": "pullw",
+			}
+			key_order = {
+				"pred_dt_gate_gt0": 100,
+				"pred_dt_gate_gt01": 101,
+				"pred_dt_gate_gt05": 102,
+				"pred_dt_gate_eq1": 103,
+				"pred_dt_gate_n_gt0": 104,
+				"pred_dt_gate_n_gt01": 105,
+				"pred_dt_gate_n_gt05": 106,
+				"pred_dt_pull_active_frac": 107,
+				"pred_dt_pull_prefix_mean": 108,
+				"pred_dt_pull_weight_mean": 109,
+			}
+			def _sort_key(k: str) -> tuple[int, str]:
+				return (key_order.get(k, 0), k)
+			def _display_key(k: str) -> str:
+				return label_map.get(k, k)
+			def _fmt_val(k: str, v: float) -> str:
+				av = abs(v)
+				if av != 0.0 and (av >= 1000.0 or av < 1.0e-3):
+					return f"{v:.1e}"
+				if av < 10.0:
+					return f"{v:.4f}"
+				if av < 100.0:
+					return f"{v:.3f}"
+				return f"{v:.1f}"
+			tv_keys = sorted(tv.keys(), key=_sort_key)
 			pv_keys = sorted(pv.keys())
 			cols = tv_keys + [f"p:{k}" for k in pv_keys]
+			values = {k: _fmt_val(k, tv[k]) for k in tv_keys}
+			values.update({f"p:{k}": _fmt_val(f"p:{k}", pv[k]) for k in pv_keys})
+			widths = {k: max(len(_display_key(k)), len(values[k]), 5) for k in cols}
 			if _status_rows % 20 == 0:
-				hdr = f"{'step':>20s}  {'loss':>8s}  {'it/s':>6s}"
+				hdr = f"{'step':>16s} {'loss':>8s} {'it/s':>5s}"
 				for c in cols:
-					hdr += f"  {c:>10s}"
+					hdr += f" {_display_key(c):>{widths[c]}s}"
 				print(hdr)
 			_status_rows += 1
-			its_str = f"{its:6.1f}" if its is not None else f"{'':>6s}"
-			row = f"{step_label:>20s}  {loss_val:8.4f}  {its_str}"
+			its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
+			row = f"{step_label:>16s} {loss_val:8.4f} {its_str}"
 			for k in tv_keys:
-				row += f"  {tv[k]:10.4f}"
+				row += f" {values[k]:>{widths[k]}s}"
 			for k in pv_keys:
-				row += f"  {pv[k]:10.4f}"
+				pk = f"p:{k}"
+				row += f" {values[pk]:>{widths[pk]}s}"
 			print(row)
 
 		# Ensure data covers mesh and has all channels needed by this stage
@@ -393,10 +475,36 @@ def optimize(
 		if _need_term("data", opt_cfg.eff) > 0 or _need_term("data_plain", opt_cfg.eff) > 0:
 			_needed_channels.add("cos")
 		if ensure_data_fn is not None:
+			_t = _stage_start(f"{label}.ensure_data")
 			data = ensure_data_fn(data, _needed_channels)
+			_stage_done(f"{label}.ensure_data", _t)
+
+		def _prefetch_loss_points_for_result(res_) -> None:
+			if not _active_caches:
+				return
+			with torch.no_grad():
+				_loss_prefetch_items = opt_loss_pred_dt.flow_gate_prefetch_items_for_result(
+					res=res_,
+					cfg=pred_dt_flow_gate_cfg,
+				)
+			if not _loss_prefetch_items:
+				return
+			for _cache in _active_caches:
+				points = [
+					_loss_prefetch_items[ch].reshape(1, 1, -1, 3)
+					for ch in _cache.channels
+					if ch in _loss_prefetch_items
+				]
+				if points:
+					_pf = torch.cat(points, dim=2) if len(points) > 1 else points[0]
+					_sp = data._spacing_for(_cache.channels[0])
+					_cache.prefetch(_pf, data.origin_fullres, _sp)
+			for _cache in _active_caches:
+				if any(ch in _loss_prefetch_items for ch in _cache.channels):
+					_cache.sync()
 
 		# Initial evaluation
-		def _eval_terms(res_, eff_):
+		def _eval_terms(res_, eff_, *, profile_label: str | None = None):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
@@ -413,7 +521,11 @@ def optimize(
 				else:
 					if _need_term(name, eff_) == 0.0:
 						continue
+				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				result = t["loss"](res=res_)
+				_debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
+				if _t_loss is not None:
+					_stage_done(f"{profile_label}.{name}", _t_loss)
 				if isinstance(result, dict):
 					for sub_name, (lv, lms, masks) in result.items():
 						w = _need_term(sub_name, eff_)
@@ -425,6 +537,8 @@ def optimize(
 					lv, lms, masks = result
 					w = _need_term(name, eff_)
 					tv[name] = float(lv.detach().cpu())
+					if name == "pred_dt":
+						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					total = total + w * lv
 			return total, tv
 
@@ -437,15 +551,35 @@ def optimize(
 			for _cache in data.sparse_caches.values():
 				if _stage_channels & set(_cache.channels):
 					_active_caches.append(_cache)
+			_active_channels = {
+				ch
+				for _cache in _active_caches
+				for ch in _cache.channels
+			}
+			_unwanted_optional = (_active_channels & {"cos", "pred_dt"}) - _needed_channels
+			if _unwanted_optional:
+				raise RuntimeError(
+					f"{label}: streaming cache has optional channel(s) not needed by this stage: "
+					f"{sorted(_unwanted_optional)}; needed={sorted(_needed_channels)}"
+				)
 
 		# Initial prefetch for streaming mode
 		if _active_caches:
+			_t = _stage_start(f"{label}.initial_prefetch")
 			with torch.no_grad():
 				_xyz_lr_pf = model._grid_xyz()
 				_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
+				_pred_dt_extra_pf = opt_loss_pred_dt.flow_gate_prefetch_points(
+					data=data,
+					xyz_hr=_xyz_hr_pf,
+					xyz_lr=_xyz_lr_pf,
+					cfg=pred_dt_flow_gate_cfg,
+				)
 			for _cache in _active_caches:
 				_sp = data._spacing_for(_cache.channels[0])
 				_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+				if _pred_dt_extra_pf is not None and "pred_dt" in _cache.channels:
+					_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
 			# Also prefetch chunks for corr points (static positions, loaded once)
 			if data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0:
 				_corr_xyz = data.corr_points.points_xyz_winda[:, :3].to(
@@ -455,29 +589,50 @@ def optimize(
 					_cache.prefetch(_corr_xyz, data.origin_fullres, _sp)
 			for _cache in _active_caches:
 				_cache.sync()
+			_stage_done(f"{label}.initial_prefetch", _t)
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
 		# Must be AFTER prefetch+sync so grid_sample_fullres can read loaded chunks.
 		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
+			_t = _stage_start(f"{label}.station_seed")
 			dev = next(model.parameters()).device
 			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
 			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
+			_stage_done(f"{label}.station_seed", _t)
 
+		_t = _stage_start(f"{label}.initial_eval")
 		with torch.no_grad():
+			_t_forward = _stage_start(f"{label}.initial_eval.model_forward")
 			res0 = model(data)
-			loss0, term_vals0 = _eval_terms(res0, opt_cfg.eff)
+			_debug_cuda_sync(f"{label}.initial_eval.model_forward")
+			_stage_done(f"{label}.initial_eval.model_forward", _t_forward)
+			_t_loss_prefetch = _stage_start(f"{label}.initial_eval.loss_prefetch")
+			_prefetch_loss_points_for_result(res0)
+			_debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
+			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
+			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
+			loss0, term_vals0 = _eval_terms(
+				res0, opt_cfg.eff, profile_label=f"{label}.initial_eval.loss")
+			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
+			_t_params = _stage_start(f"{label}.initial_eval.param_values")
 			param_vals0: dict[str, float] = {}
 			for k, vs in all_params.items():
 				if len(vs) == 1 and vs[0].numel() == 1:
 					param_vals0[k] = float(vs[0].detach().cpu())
+			_stage_done(f"{label}.initial_eval.param_values", _t_params)
+			_t_status = _stage_start(f"{label}.initial_eval.status_print")
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
+			_stage_done(f"{label}.initial_eval.status_print", _t_status)
 			# Print corr detail after initial eval (first stage only)
 			if not _corr_start_printed[0] and "corr" in term_vals0:
 				opt_loss_corr.print_detail("START")
 				_corr_start_printed[0] = True
+		_stage_done(f"{label}.initial_eval", _t)
+		_t = _stage_start(f"{label}.initial_snapshot")
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
+		_stage_done(f"{label}.initial_snapshot", _t)
 
 		max_steps = opt_cfg.steps
 		_t_wall_start = time.perf_counter()
@@ -493,6 +648,9 @@ def optimize(
 			if fit_data.CHUNK_STATS_ENABLED:
 				fit_data._chunk_stats.begin_iteration()
 			res = model(data)
+			_debug_cuda_sync(f"{label}.{step + 1}.model_forward")
+			_prefetch_loss_points_for_result(res)
+			_debug_cuda_sync(f"{label}.{step + 1}.loss_prefetch")
 			loss, term_vals = _eval_terms(res, opt_cfg.eff)
 			if fit_data.CHUNK_STATS_ENABLED:
 				fit_data._chunk_stats.end_iteration()
@@ -508,9 +666,17 @@ def optimize(
 				with torch.no_grad():
 					_xyz_lr_pf = model._grid_xyz()
 					_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
+					_pred_dt_extra_pf = opt_loss_pred_dt.flow_gate_prefetch_points(
+						data=data,
+						xyz_hr=_xyz_hr_pf,
+						xyz_lr=_xyz_lr_pf,
+						cfg=pred_dt_flow_gate_cfg,
+					)
 				for _cache in _active_caches:
 					_sp = data._spacing_for(_cache.channels[0])
 					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+					if _pred_dt_extra_pf is not None and "pred_dt" in _cache.channels:
+						_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
 				for _cache in _active_caches:
 					_cache.end_iteration()
 			_t_steps_acc += 1
@@ -527,7 +693,7 @@ def optimize(
 					stage_name=stage.name,
 				)
 
-			if step == 0 or step1 == max_steps or (step1 % 100) == 0:
+			if step == 0 or step1 == max_steps or (status_interval > 0 and (step1 % status_interval) == 0):
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
@@ -548,7 +714,10 @@ def optimize(
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res)
 
+		_t = _stage_start(f"{label}.final_snapshot")
 		snapshot_fn(stage=label, step=max_steps, loss=float(loss.detach().cpu()), data=data, res=res)
+		_stage_done(f"{label}.final_snapshot", _t)
+		_stage_done(f"{label}.total", _t_stage_total)
 		return data
 
 	snap_int = int(snapshot_interval)

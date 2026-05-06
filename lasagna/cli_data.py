@@ -21,6 +21,7 @@ class DataConfig:
 	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 	erode_valid_mask: int                                # erode grad_mag validity mask by N voxels
+	sparse_prefetch_backend: str                         # "tensorstore" or "python-zarr" streaming prefetcher
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -46,6 +47,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Use custom CUDA uint8 grid_sample kernel (1=yes, 0=fallback to PyTorch F.grid_sample)")
 	g.add_argument("--erode-valid-mask", type=int, default=0,
 		help="Erode grad_mag validity mask inward by N voxels (excludes noisy borders from all losses)")
+	g.add_argument("--sparse-prefetch-backend", choices=("tensorstore", "python-zarr"), default="tensorstore",
+		help="Sparse streaming prefetch backend: tensorstore uses TensorStore Python, python-zarr uses the zarr fallback")
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:
@@ -79,6 +82,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		winding_volume=winding_volume,
 		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
 		erode_valid_mask=int(getattr(args, "erode_valid_mask", 0)),
+		sparse_prefetch_backend=str(getattr(args, "sparse_prefetch_backend", "tensorstore")),
 	)
 
 
@@ -86,4 +90,5 @@ def load_fit_data(cfg: DataConfig) -> fit_data.FitData3D:
 	return fit_data.load_3d_streaming(
 		path=cfg.input,
 		device=torch.device(cfg.device),
+		sparse_prefetch_backend=cfg.sparse_prefetch_backend,
 	)

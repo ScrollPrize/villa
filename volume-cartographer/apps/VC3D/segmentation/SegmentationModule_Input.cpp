@@ -21,6 +21,43 @@
 #include <QtGlobal>
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
+
+namespace
+{
+std::optional<std::pair<int, int>> flattenedApprovalGridIndex(VolumeViewerBase* viewer,
+                                                              const QPointF& scenePos,
+                                                              const std::pair<int, int>& maskDims)
+{
+    const auto [rows, cols] = maskDims;
+    if (!viewer || rows <= 0 || cols <= 0) {
+        return std::nullopt;
+    }
+
+    const cv::Vec2f surfaceCoords = viewer->sceneToSurfaceCoords(scenePos);
+    int row = 0;
+    int col = 0;
+
+    if (auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface())) {
+        const cv::Vec2f scale = quad->scale();
+        const cv::Vec3f center = quad->center();
+        if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
+            return std::nullopt;
+        }
+        col = static_cast<int>(std::lround((surfaceCoords[0] + center[0]) * scale[0]));
+        row = static_cast<int>(std::lround((surfaceCoords[1] + center[1]) * scale[1]));
+    } else {
+        col = static_cast<int>(std::lround(surfaceCoords[0]));
+        row = static_cast<int>(std::lround(surfaceCoords[1]));
+    }
+
+    if (row < 0 || row >= rows || col < 0 || col >= cols) {
+        return std::nullopt;
+    }
+    return std::make_pair(row, col);
+}
+}
 
 bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 {
@@ -211,6 +248,8 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
                                                  ~(Qt::ControlModifier | Qt::KeypadModifier);
     if (pushPullKey && disallowedMods == Qt::NoModifier) {
         if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+            emit statusMessageRequested(tr("Enable segmentation editing before using push/pull."), kStatusMedium);
+            event->ignore();
             return false;
         }
 
@@ -220,6 +259,9 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             event->accept();
             return true;
         }
+        emit statusMessageRequested(tr("Move the cursor over the segmentation view before using push/pull."),
+                                    kStatusMedium);
+        event->ignore();
         return false;
     }
 
@@ -412,7 +454,10 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
             } else {
                 // Flattened view - convert scene coordinates to surface coordinates
                 const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
-                _approvalTool->startStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]));
+                const auto gridIdx = _overlay
+                    ? flattenedApprovalGridIndex(viewer, scenePos, _overlay->approvalMaskDimensions())
+                    : std::nullopt;
+                _approvalTool->startStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), gridIdx);
             }
         }
         return;
@@ -542,7 +587,10 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
                 } else {
                     // Convert scene coordinates to surface coordinates for grid mapping
                     const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
-                    _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), false);
+                    const auto gridIdx = _overlay
+                        ? flattenedApprovalGridIndex(viewer, scenePos, _overlay->approvalMaskDimensions())
+                        : std::nullopt;
+                    _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), false, gridIdx);
                 }
             }
         } else {
@@ -672,7 +720,10 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
             } else {
                 // Convert scene coordinates to surface coordinates for grid mapping
                 const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
-                _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), true);
+                const auto gridIdx = _overlay
+                    ? flattenedApprovalGridIndex(viewer, scenePos, _overlay->approvalMaskDimensions())
+                    : std::nullopt;
+                _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), true, gridIdx);
                 _approvalTool->finishStroke();
             }
             // Don't apply immediately - wait for user to press Apply button

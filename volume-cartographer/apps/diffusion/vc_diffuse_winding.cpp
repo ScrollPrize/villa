@@ -22,11 +22,9 @@
 
 #include <ceres/ceres.h>
 
-#include "vc/core/types/VcDataset.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include "vc/ui/VCCollection.hpp"
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/GridStore.hpp"
 
 #include "discrete.hpp"
@@ -39,7 +37,44 @@
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
 
+namespace {
 
+std::optional<int> parseScaleLevelDatasetName(const std::string& datasetName,
+                                              size_t numScales,
+                                              std::ostream& err)
+{
+    if (datasetName.empty()) {
+        err << "Error: --dataset must be a numeric zarr scale-level dataset name, e.g. 0 or 1." << std::endl;
+        return std::nullopt;
+    }
+
+    size_t pos = 0;
+    int level = 0;
+    try {
+        level = std::stoi(datasetName, &pos);
+    } catch (const std::exception&) {
+        err << "Error: --dataset must be a numeric zarr scale-level dataset name, got '"
+            << datasetName << "'." << std::endl;
+        return std::nullopt;
+    }
+
+    if (pos != datasetName.size() || level < 0) {
+        err << "Error: --dataset must be a non-negative numeric zarr scale-level dataset name, got '"
+            << datasetName << "'." << std::endl;
+        return std::nullopt;
+    }
+
+    if (static_cast<size_t>(level) >= numScales) {
+        err << "Error: zarr scale level " << level << " is not available; volume has "
+            << numScales << " scale level" << (numScales == 1 ? "" : "s")
+            << ". For a root-array zarr without level datasets, use --dataset 0." << std::endl;
+        return std::nullopt;
+    }
+
+    return level;
+}
+
+} // namespace
 
 
 class VideoCallback : public ceres::IterationCallback {
@@ -84,7 +119,7 @@ int main(int argc, char** argv) {
         ("help,h", "Print help")
         ("points", po::value<std::string>(), "Input JSON point sets file (VCCollection format)")
         ("volume", po::value<std::string>(), "Input zarr volume path")
-        ("dataset", po::value<std::string>()->default_value("0"), "Dataset within the zarr file (e.g., '0' for scale level)")
+        ("dataset", po::value<std::string>()->default_value("0"), "Numeric zarr scale-level dataset name (e.g., 0 or 1; use 0 for root-array zarrs)")
         ("output", po::value<std::string>(), "Output image file for visualization")
         ("video-out", po::value<std::string>(), "Output path for the video visualization")
         ("json-out", po::value<std::string>(), "Path to write the spiral wraps to a JSON file.")
@@ -174,13 +209,19 @@ int main(int argc, char** argv) {
     }
     std::cout << "Found umbilicus point at: " << *umbilicus_point << std::endl;
 
-    // Load volume data using VcDataset
-    auto ds = std::make_unique<vc::VcDataset>(volume_path / dataset_name);
-    if (!ds) {
-        std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;
+    Volume volume(volume_path);
+    volume.setCacheBudget(4llu * 1024 * 1024 * 1024);
+    const auto parsedLevel = parseScaleLevelDatasetName(dataset_name, volume.numScales(), std::cerr);
+    if (!parsedLevel) {
         return 1;
     }
-    auto shape = ds->shape();
+    const int level = *parsedLevel;
+    auto shapeArray = volume.shape(level);
+    std::vector<size_t> shape = {
+        static_cast<size_t>(shapeArray[0]),
+        static_cast<size_t>(shapeArray[1]),
+        static_cast<size_t>(shapeArray[2]),
+    };
     std::cout << "Volume shape: (" << shape[0] << ", " << shape[1] << ", " << shape[2] << ")" << std::endl;
 
     // Extract XY slice
@@ -192,11 +233,7 @@ int main(int argc, char** argv) {
 
     cv::Mat slice_mat(shape[1], shape[2], CV_8U);
     Array3D<uint8_t> slice_data({1, shape[1], shape[2]});
-    cv::Vec3i offset = {z_slice, 0, 0};
-    auto cache = vc::render::createChunkCache(
-        vc::render::openLocalZarrPyramid(ds->path()),
-        4llu*1024*1024*1024);
-    readArea3D(slice_data, offset, cache.get(), 0);
+    volume.readZYX(slice_data, {z_slice, 0, 0}, level);
     
     for (int y = 0; y < shape[1]; ++y) {
         for (int x = 0; x < shape[2]; ++x) {

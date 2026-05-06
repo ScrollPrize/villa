@@ -3,19 +3,16 @@
 // N-surface global tifxyz merge. Only required input is
 // --merge <path/to/volpkg/merge.json>: surfaces and edges come from the
 // row-major grid in that file (cells are full tifxyz directory names under
-// <volpkg>/paths/, null/"" = empty). Output dirs are auto-named under
-// <volpkg>/paths/: <alpha_first>_merged for the final tifxyz and
-// <alpha_first>_merged_prestraightened for the intermediate, where
-// <alpha_first> is the alphabetically smallest surface name in the grid.
-// Tunables: --ref, --strength-u/-v, --ransac-* are flags; the remaining
-// stage params (ridge_lambda, consensus_*, idw_k, step_size, anchor_bin_size)
-// are hard-coded. For each edge: SurfacePatchIndex::locate-based overlap,
-// real-overlap mask, stratified anchors, RANSAC similarity. Across all
-// edges: joint per-surface affine bundle adjustment, per-surface TPS RBF,
-// N-way EDT blend, OBJ emit, and rasterization via vc_obj2tifxyz_legacy.
-// Final stage: gentle UV re-parameterization (umbilicus theta unwrap +
-// global affine) and a second rasterization pass for a clean iso-theta /
-// iso-z grid.
+// <volpkg>/paths/, null/"" = empty). Output dir is auto-named under
+// <volpkg>/paths/ as <alpha_first>_merged (with a _v<n> suffix bumped from
+// any prior runs), where <alpha_first> is the alphabetically smallest
+// surface name in the grid. Tunables: --ref and --ransac-* are flags; the
+// remaining stage params (ridge_lambda, consensus_*, idw_k, step_size,
+// anchor_bin_size) are hard-coded. For each edge: SurfacePatchIndex::locate-
+// based overlap, real-overlap mask, stratified anchors, RANSAC similarity.
+// Across all edges: joint per-surface affine bundle adjustment, per-surface
+// TPS RBF, N-way EDT blend, OBJ emit, and rasterization via
+// vc_obj2tifxyz_legacy.
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -360,9 +357,12 @@ struct GMConfig {
     double   ransac_max_thresh{10.0};
     double   ransac_mad_k{3.0};
     uint32_t ransac_seed{0};
-    // Straighten stage (gentle UV re-parameterization).
-    double   straighten_strength_u{0.3};
-    double   straighten_strength_v{0.5};
+    // Per-surface RBF anchor count cap. 0 = no cap (current behavior). When
+    // set, surfaces whose union-of-incident-edge anchor count exceeds the cap
+    // are spatially decimated by keeping one original anchor per coarse cell
+    // (no averaging) so the dense (N+3)x(N+3) LU in gmBuildSurfaceWarp stays
+    // tractable on wide overlap regions. Surfaces below the cap are untouched.
+    int      anchor_cap{0};
     std::vector<GMSurfaceSpec> surfaces;
     std::vector<GMEdgeSpec>    edges;
 };
@@ -1109,10 +1109,59 @@ GMSimRBF gmBuildSurfaceWarp(const cv::Matx23d& M,
     return S;
 }
 
+// Spatial decimation: when raw anchor count > cap, partition the surface's
+// anchor bbox into ~cap coarse cells and keep one ORIGINAL anchor per cell
+// (no averaging — every kept anchor stays a clean per-cell measurement). Bin
+// size starts at sqrt(bbox_area / cap) and grows ~25% per round if rounding
+// leaves more than cap unique cells. Surfaces below the cap are untouched.
+// Returns the count after decimation (== src.size() if no decimation).
+int gmDecimateAnchors(std::vector<cv::Vec2d>& src,
+                      std::vector<cv::Vec2d>& resid,
+                      int cap)
+{
+    if (cap <= 0 || (int)src.size() <= cap) return (int)src.size();
+    double cmin = 1e18, cmax = -1e18, rmin = 1e18, rmax = -1e18;
+    for (const auto& s : src) {
+        if (s[0] < cmin) cmin = s[0];
+        if (s[0] > cmax) cmax = s[0];
+        if (s[1] < rmin) rmin = s[1];
+        if (s[1] > rmax) rmax = s[1];
+    }
+    const double bw = std::max(1.0, cmax - cmin + 1.0);
+    const double bh = std::max(1.0, rmax - rmin + 1.0);
+    double B = std::sqrt(bw * bh / std::max(1, cap));
+    if (B < 1.0) B = 1.0;
+    for (int it = 0; it < 8; ++it) {
+        std::unordered_map<int64_t, size_t> first_in_cell;
+        first_in_cell.reserve(src.size());
+        for (size_t i = 0; i < src.size(); ++i) {
+            const int64_t qc = (int64_t)std::floor((src[i][0] - cmin) / B);
+            const int64_t qr = (int64_t)std::floor((src[i][1] - rmin) / B);
+            const int64_t key = (qc << 32) ^ (qr & 0xffffffff);
+            first_in_cell.emplace(key, i);
+        }
+        if ((int)first_in_cell.size() <= cap) {
+            std::vector<cv::Vec2d> ns, nr;
+            ns.reserve(first_in_cell.size());
+            nr.reserve(first_in_cell.size());
+            for (const auto& kv : first_in_cell) {
+                ns.push_back(src[kv.second]);
+                nr.push_back(resid[kv.second]);
+            }
+            src.swap(ns);
+            resid.swap(nr);
+            return (int)src.size();
+        }
+        B *= 1.25;
+    }
+    return (int)src.size();
+}
+
 std::unordered_map<std::string, GMSimRBF>
 gmBuildSurfaceWarps(const std::vector<std::string>& names,
                     const std::vector<GMEdgeRun>& edges,
-                    const std::unordered_map<std::string, cv::Matx23d>& M_dict)
+                    const std::unordered_map<std::string, cv::Matx23d>& M_dict,
+                    int anchor_cap)
 {
     std::unordered_map<std::string, std::vector<cv::Vec2d>> anchors_per, resid_per;
     for (const auto& n : names) {
@@ -1130,6 +1179,15 @@ gmBuildSurfaceWarps(const std::vector<std::string>& names,
             resid_per [e.a].push_back(mid - Ta_pA);
             anchors_per[e.b].push_back(e.pB[i]);
             resid_per [e.b].push_back(mid - Tb_pB);
+        }
+    }
+    if (anchor_cap > 0) {
+        for (const auto& n : names) {
+            const int raw = (int)anchors_per[n].size();
+            const int kept = gmDecimateAnchors(anchors_per[n], resid_per[n], anchor_cap);
+            if (kept != raw)
+                std::cout << "  " << n << ": decimated " << raw
+                          << " -> " << kept << " anchors (cap=" << anchor_cap << ")\n";
         }
     }
     std::unordered_map<std::string, GMSimRBF> warps;
@@ -1502,314 +1560,9 @@ gmEdtBlend(const std::vector<std::string>& names,
     return out;
 }
 
-// -----------------------------------------------------------------------------
-// Straighten stage: re-parameterize a freshly-merged tifxyz toward iso-theta
-// columns + iso-z rows around the patch's umbilicus, blending the new UV with
-// the current one per axis. Operates on the rasterized merge output, writes a
-// new OBJ + invokes vc_obj2tifxyz_legacy a second time for the final tifxyz.
-// -----------------------------------------------------------------------------
-
-constexpr double kStnRapidThreshDeg = 30.0;
-constexpr double kStnZRes           = 1.0;
-constexpr double kStnSmoothSigma    = 20.0;
-
-struct StnSurface {
-    Mat1f x, y, z;
-    Mat1b mask;
-    int   H{0}, W{0}, valid{0};
-};
-
-StnSurface stnLoadTifxyz(const fs::path& p)
-{
-    auto qs = load_quad_from_tifxyz(p.string());
-    if (!qs) throw std::runtime_error("failed to load tifxyz: " + p.string());
-    const cv::Mat_<cv::Vec3f> pts = qs->rawPoints();
-    StnSurface s;
-    s.H = pts.rows;
-    s.W = pts.cols;
-    s.x.create(s.H, s.W);
-    s.y.create(s.H, s.W);
-    s.z.create(s.H, s.W);
-    s.mask = Mat1b::zeros(s.H, s.W);
-    int valid = 0;
-    for (int r = 0; r < s.H; ++r) {
-        const cv::Vec3f* pr = pts.ptr<cv::Vec3f>(r);
-        for (int c = 0; c < s.W; ++c) {
-            s.x(r, c) = pr[c][0];
-            s.y(r, c) = pr[c][1];
-            s.z(r, c) = pr[c][2];
-            const bool ok = !(pr[c][0] == -1.0f && pr[c][1] == -1.0f && pr[c][2] == -1.0f);
-            s.mask(r, c) = ok ? 1 : 0;
-            if (ok) ++valid;
-        }
-    }
-    s.valid = valid;
-    return s;
-}
-
-// 1-D Gaussian filter, mode = "nearest", truncate = 4 (matches scipy).
-void stnGaussianFilter1D(std::vector<double>& v, double sigma)
-{
-    if (sigma <= 0.0 || v.size() < 2) return;
-    const int radius = (int)std::ceil(4.0 * sigma);
-    std::vector<double> kernel((size_t)(2 * radius + 1));
-    double s = 0.0;
-    for (int i = -radius; i <= radius; ++i) {
-        const double w = std::exp(-0.5 * double(i * i) / (sigma * sigma));
-        kernel[i + radius] = w;
-        s += w;
-    }
-    for (double& w : kernel) w /= s;
-    const int n = (int)v.size();
-    std::vector<double> out((size_t)n);
-    for (int i = 0; i < n; ++i) {
-        double acc = 0.0;
-        for (int k = -radius; k <= radius; ++k) {
-            int j = i + k;
-            if (j < 0) j = 0;
-            else if (j >= n) j = n - 1;
-            acc += kernel[(size_t)(k + radius)] * v[(size_t)j];
-        }
-        out[(size_t)i] = acc;
-    }
-    v = std::move(out);
-}
-
-// Compute U(z) = mean (x, y) per z bin (z_res=1.0), linear-extrapolate empty
-// bins, gaussian-smooth with sigma=20 along z.
-void stnComputeUmbilicus(const StnSurface& s,
-                         std::vector<double>& z_grid,
-                         std::vector<double>& U_x,
-                         std::vector<double>& U_y)
-{
-    double z_min = std::numeric_limits<double>::infinity();
-    double z_max = -std::numeric_limits<double>::infinity();
-    for (int r = 0; r < s.H; ++r) {
-        for (int c = 0; c < s.W; ++c) {
-            if (!s.mask(r, c)) continue;
-            const double zv = s.z(r, c);
-            if (zv < z_min) z_min = zv;
-            if (zv > z_max) z_max = zv;
-        }
-    }
-    if (!std::isfinite(z_min) || !std::isfinite(z_max))
-        throw std::runtime_error("straighten: no valid cells in input");
-    const int n = (int)std::ceil((z_max - z_min) / kStnZRes) + 1;
-    U_x.assign((size_t)n, 0.0);
-    U_y.assign((size_t)n, 0.0);
-    std::vector<double> W((size_t)n, 0.0);
-    for (int r = 0; r < s.H; ++r) {
-        for (int c = 0; c < s.W; ++c) {
-            if (!s.mask(r, c)) continue;
-            int idx = (int)((s.z(r, c) - z_min) / kStnZRes);
-            if (idx < 0) idx = 0;
-            if (idx >= n) idx = n - 1;
-            U_x[(size_t)idx] += s.x(r, c);
-            U_y[(size_t)idx] += s.y(r, c);
-            W  [(size_t)idx] += 1.0;
-        }
-    }
-    for (int i = 0; i < n; ++i) {
-        if (W[(size_t)i] > 0) {
-            U_x[(size_t)i] /= W[(size_t)i];
-            U_y[(size_t)i] /= W[(size_t)i];
-        }
-    }
-    auto findNext = [&](int from) {
-        for (int i = from; i < n; ++i) if (W[(size_t)i] > 0) return i;
-        return -1;
-    };
-    auto findPrev = [&](int from) {
-        for (int i = from; i >= 0; --i) if (W[(size_t)i] > 0) return i;
-        return -1;
-    };
-    for (int i = 0; i < n; ++i) {
-        if (W[(size_t)i] > 0) continue;
-        const int prev = findPrev(i - 1);
-        const int next = findNext(i + 1);
-        if (prev >= 0 && next >= 0) {
-            const double t = double(i - prev) / double(next - prev);
-            U_x[(size_t)i] = (1 - t) * U_x[(size_t)prev] + t * U_x[(size_t)next];
-            U_y[(size_t)i] = (1 - t) * U_y[(size_t)prev] + t * U_y[(size_t)next];
-        } else if (prev >= 0) {
-            const int prev2 = findPrev(prev - 1);
-            if (prev2 >= 0) {
-                const double inv = 1.0 / double(prev - prev2);
-                const double dx = (U_x[(size_t)prev] - U_x[(size_t)prev2]) * inv;
-                const double dy = (U_y[(size_t)prev] - U_y[(size_t)prev2]) * inv;
-                U_x[(size_t)i] = U_x[(size_t)prev] + dx * double(i - prev);
-                U_y[(size_t)i] = U_y[(size_t)prev] + dy * double(i - prev);
-            } else {
-                U_x[(size_t)i] = U_x[(size_t)prev];
-                U_y[(size_t)i] = U_y[(size_t)prev];
-            }
-        } else if (next >= 0) {
-            const int next2 = findNext(next + 1);
-            if (next2 >= 0) {
-                const double inv = 1.0 / double(next2 - next);
-                const double dx = (U_x[(size_t)next2] - U_x[(size_t)next]) * inv;
-                const double dy = (U_y[(size_t)next2] - U_y[(size_t)next]) * inv;
-                U_x[(size_t)i] = U_x[(size_t)next] + dx * double(i - next);
-                U_y[(size_t)i] = U_y[(size_t)next] + dy * double(i - next);
-            } else {
-                U_x[(size_t)i] = U_x[(size_t)next];
-                U_y[(size_t)i] = U_y[(size_t)next];
-            }
-        }
-    }
-    stnGaussianFilter1D(U_x, kStnSmoothSigma);
-    stnGaussianFilter1D(U_y, kStnSmoothSigma);
-    z_grid.resize((size_t)n);
-    for (int i = 0; i < n; ++i) z_grid[(size_t)i] = z_min + i * kStnZRes;
-}
-
-double stnInterpLinear(const std::vector<double>& xg,
-                       const std::vector<double>& yv,
-                       double x)
-{
-    if (xg.empty()) return 0.0;
-    if (x <= xg.front()) return yv.front();
-    if (x >= xg.back())  return yv.back();
-    auto it = std::upper_bound(xg.begin(), xg.end(), x);
-    const int hi = (int)(it - xg.begin());
-    const int lo = hi - 1;
-    const double t = (x - xg[(size_t)lo]) / (xg[(size_t)hi] - xg[(size_t)lo]);
-    return (1.0 - t) * yv[(size_t)lo] + t * yv[(size_t)hi];
-}
-
-double stnShortAngDiff(double a, double b)
-{
-    double d = std::fmod(b - a + M_PI, 2.0 * M_PI);
-    if (d < 0) d += 2.0 * M_PI;
-    return d - M_PI;
-}
-
-cv::Mat_<double> stnBfsUnwrap(const cv::Mat_<double>& theta,
-                              const Mat1b& mask,
-                              double thresholdRad,
-                              int& numRejected,
-                              std::pair<int, int>& seedOut)
-{
-    const int H = theta.rows, W = theta.cols;
-    cv::Mat_<double> th_cont(H, W, std::numeric_limits<double>::quiet_NaN());
-    std::vector<int> vr, vc;
-    vr.reserve((size_t)H * (size_t)W / 4u);
-    vc.reserve((size_t)H * (size_t)W / 4u);
-    for (int r = 0; r < H; ++r)
-        for (int c = 0; c < W; ++c)
-            if (mask(r, c)) { vr.push_back(r); vc.push_back(c); }
-    if (vr.empty()) {
-        numRejected = 0;
-        seedOut = {-1, -1};
-        return th_cont;
-    }
-    std::vector<int> vrs = vr, vcs = vc;
-    std::sort(vrs.begin(), vrs.end());
-    std::sort(vcs.begin(), vcs.end());
-    int mid_r = vrs[vrs.size() / 2];
-    int mid_c = vcs[vcs.size() / 2];
-    if (!mask(mid_r, mid_c)) {
-        long long bestD = std::numeric_limits<long long>::max();
-        int bR = mid_r, bC = mid_c;
-        for (size_t i = 0; i < vr.size(); ++i) {
-            const long long dr = vr[i] - mid_r;
-            const long long dc = vc[i] - mid_c;
-            const long long d  = dr * dr + dc * dc;
-            if (d < bestD) { bestD = d; bR = vr[i]; bC = vc[i]; }
-        }
-        mid_r = bR; mid_c = bC;
-    }
-    th_cont(mid_r, mid_c) = theta(mid_r, mid_c);
-    std::deque<std::pair<int, int>> q;
-    q.emplace_back(mid_r, mid_c);
-    int rej = 0;
-    static const int dr[4] = {-1,  1,  0, 0};
-    static const int dc[4] = { 0,  0, -1, 1};
-    while (!q.empty()) {
-        const auto [r, c] = q.front(); q.pop_front();
-        const double tr_c = th_cont(r, c);
-        for (int k = 0; k < 4; ++k) {
-            const int nr = r + dr[k], nc = c + dc[k];
-            if (nr < 0 || nr >= H || nc < 0 || nc >= W) continue;
-            if (!mask(nr, nc) || !std::isnan(th_cont(nr, nc))) continue;
-            const double d = stnShortAngDiff(theta(r, c), theta(nr, nc));
-            if (std::abs(d) > thresholdRad) { ++rej; continue; }
-            th_cont(nr, nc) = tr_c + d;
-            q.emplace_back(nr, nc);
-        }
-    }
-    numRejected = rej;
-    seedOut = {mid_r, mid_c};
-    return th_cont;
-}
-
-double stnPercentile(std::vector<double>& v, double p)
-{
-    if (v.empty()) return 0.0;
-    const size_t k = (size_t)std::floor(p / 100.0 * double(v.size() - 1));
-    std::nth_element(v.begin(), v.begin() + (long)k, v.end());
-    return v[k];
-}
-
-double stnMaxAbs(const std::vector<double>& v)
-{
-    double m = 0;
-    for (double x : v) { const double a = std::abs(x); if (a > m) m = a; }
-    return m;
-}
-
-void stnWriteObj(const fs::path& path,
-                 const StnSurface& s,
-                 const cv::Mat_<double>& u_new,
-                 const cv::Mat_<double>& v_new,
-                 double strengthU, double strengthV)
-{
-    std::ofstream f(path);
-    if (!f) throw std::runtime_error("cannot write OBJ: " + path.string());
-    f << "# vc_merge_tifxyz straighten (alpha_u=" << strengthU
-      << ", alpha_v=" << strengthV
-      << ", rapid-reject=" << kStnRapidThreshDeg << " deg)\n";
-
-    const int H = s.H, W = s.W;
-    cv::Mat_<int> idx(H, W, -1);
-    int n_v = 0;
-    for (int r = 0; r < H; ++r)
-        for (int c = 0; c < W; ++c)
-            if (s.mask(r, c)) idx(r, c) = n_v++;
-
-    std::ostringstream vbuf, vtbuf, fbuf;
-    vbuf  << std::fixed << std::setprecision(4);
-    vtbuf << std::fixed << std::setprecision(4);
-    for (int r = 0; r < H; ++r) {
-        for (int c = 0; c < W; ++c) {
-            if (idx(r, c) < 0) continue;
-            vbuf  << "v "  << s.x(r, c) << " " << s.y(r, c) << " " << s.z(r, c) << "\n";
-            vtbuf << "vt " << u_new(r, c) << " " << v_new(r, c) << "\n";
-        }
-    }
-    int n_q = 0;
-    for (int r = 0; r < H - 1; ++r) {
-        for (int c = 0; c < W - 1; ++c) {
-            const int a = idx(r,     c);
-            const int b = idx(r,     c + 1);
-            const int cc= idx(r + 1, c);
-            const int d = idx(r + 1, c + 1);
-            if (a < 0 || b < 0 || cc < 0 || d < 0) continue;
-            fbuf << "f " << (a + 1)  << "/" << (a + 1)
-                 << " "  << (b + 1)  << "/" << (b + 1)
-                 << " "  << (d + 1)  << "/" << (d + 1) << "\n";
-            fbuf << "f " << (a + 1)  << "/" << (a + 1)
-                 << " "  << (d + 1)  << "/" << (d + 1)
-                 << " "  << (cc + 1) << "/" << (cc + 1) << "\n";
-            ++n_q;
-        }
-    }
-    f << vbuf.str() << vtbuf.str() << fbuf.str();
-    std::cout << "writing OBJ: " << n_v << " verts, " << (2 * n_q)
-              << " tris -> " << path << "\n";
-}
-
-void stnPatchMetaUuid(const fs::path& tifxyz_dir)
+// vc_obj2tifxyz_legacy writes meta.json with its own uuid; rewrite it to match
+// the output dir name so downstream tools (which key on dir == uuid) are happy.
+void patchMetaUuid(const fs::path& tifxyz_dir)
 {
     fs::path meta_p = tifxyz_dir / "meta.json";
     if (!fs::exists(meta_p)) return;
@@ -1844,7 +1597,7 @@ int rasterizeObjToTifxyz(const fs::path& obj2tifxyz,
         std::cerr << "vc_obj2tifxyz_legacy failed (rc=" << rc << ")\n";
         return 1;
     }
-    stnPatchMetaUuid(output);
+    patchMetaUuid(output);
     return 0;
 }
 
@@ -1870,185 +1623,6 @@ fs::path resolveObj2Tifxyz(const std::string& override_path, const char* argv0)
         if (fs::exists(adj)) return adj;
     } catch (...) { /* fall through to PATH lookup */ }
     return fs::path("vc_obj2tifxyz_legacy");
-}
-
-int stnRun(const fs::path& surf_in,
-           const fs::path& output,
-           const fs::path& obj_out,
-           const fs::path& obj2tifxyz,
-           int step_size,
-           double strengthU,
-           double strengthV)
-{
-    std::cout << "loading " << surf_in << "\n";
-    const StnSurface s = stnLoadTifxyz(surf_in);
-    std::cout << "  " << s.H << "x" << s.W << ", valid=" << s.valid << "\n";
-
-    std::cout << "umbilicus\n";
-    std::vector<double> z_grid, U_x, U_y;
-    stnComputeUmbilicus(s, z_grid, U_x, U_y);
-
-    cv::Mat_<double> theta(s.H, s.W);
-    std::vector<double> r_valid;
-    r_valid.reserve((size_t)s.valid);
-    for (int r = 0; r < s.H; ++r) {
-        for (int c = 0; c < s.W; ++c) {
-            const double zv = s.z(r, c);
-            const double ux = stnInterpLinear(z_grid, U_x, zv);
-            const double uy = stnInterpLinear(z_grid, U_y, zv);
-            const double dx = s.x(r, c) - ux;
-            const double dy = s.y(r, c) - uy;
-            theta(r, c) = std::atan2(dy, dx);
-            if (s.mask(r, c)) r_valid.push_back(std::hypot(dx, dy));
-        }
-    }
-    {
-        std::vector<double> tmp = r_valid;
-        std::cout << "  r_med=" << std::fixed << std::setprecision(1)
-                  << stnPercentile(tmp, 50) << "\n";
-        std::cout.unsetf(std::ios::fixed);
-    }
-
-    std::cout << "BFS unwrap (reject edges > "
-              << std::fixed << std::setprecision(1) << kStnRapidThreshDeg
-              << " deg)\n";
-    std::cout.unsetf(std::ios::fixed);
-    int rej = 0;
-    std::pair<int, int> seed{-1, -1};
-    cv::Mat_<double> th_cont = stnBfsUnwrap(theta, s.mask,
-                                            kStnRapidThreshDeg * M_PI / 180.0,
-                                            rej, seed);
-    Mat1b reachable(s.H, s.W, (uint8_t)0);
-    int reachableCount = 0;
-    double tmin =  std::numeric_limits<double>::infinity();
-    double tmax = -std::numeric_limits<double>::infinity();
-    for (int r = 0; r < s.H; ++r) {
-        for (int c = 0; c < s.W; ++c) {
-            if (!s.mask(r, c) || !std::isfinite(th_cont(r, c))) continue;
-            reachable(r, c) = 1;
-            ++reachableCount;
-            const double t = th_cont(r, c) * 180.0 / M_PI;
-            if (t < tmin) tmin = t;
-            if (t > tmax) tmax = t;
-        }
-    }
-    std::cout << "  seed=(" << seed.first << ", " << seed.second
-              << "), reachable=" << reachableCount << "/" << s.valid
-              << ", rejected=" << rej << "\n"
-              << "  theta_cont (deg): min=" << std::fixed << std::setprecision(1)
-              << tmin << ", max=" << tmax << ", span=" << (tmax - tmin) << "\n";
-    std::cout.unsetf(std::ios::fixed);
-
-    Eigen::MatrixXd A((Eigen::Index)reachableCount, 3);
-    Eigen::VectorXd Bu((Eigen::Index)reachableCount);
-    Eigen::VectorXd Bv((Eigen::Index)reachableCount);
-    {
-        Eigen::Index i = 0;
-        for (int r = 0; r < s.H; ++r) {
-            for (int c = 0; c < s.W; ++c) {
-                if (!reachable(r, c)) continue;
-                A(i, 0) = th_cont(r, c);
-                A(i, 1) = s.z(r, c);
-                A(i, 2) = 1.0;
-                Bu(i) = double(c) * step_size;
-                Bv(i) = double(r) * step_size;
-                ++i;
-            }
-        }
-    }
-    const Eigen::Vector3d ucoef = A.colPivHouseholderQr().solve(Bu);
-    const Eigen::Vector3d vcoef = A.colPivHouseholderQr().solve(Bv);
-    const double a = ucoef(0), b = ucoef(1), cc = ucoef(2);
-    const double d = vcoef(0), e = vcoef(1), fcoef = vcoef(2);
-    std::cout << "  affine (theta,z)->(u,v): "
-              << "u = " << std::showpos << std::fixed << std::setprecision(2) << a
-              << "*theta_rad " << std::setprecision(3) << b
-              << "*z " << std::setprecision(1) << cc << " | "
-              << "v = " << std::setprecision(2) << d
-              << "*theta_rad " << std::setprecision(3) << e
-              << "*z " << std::setprecision(1) << fcoef
-              << std::noshowpos << "\n";
-    std::cout.unsetf(std::ios::fixed);
-
-    {
-        std::vector<double> resu, resv;
-        resu.reserve((size_t)reachableCount);
-        resv.reserve((size_t)reachableCount);
-        for (int r = 0; r < s.H; ++r) {
-            for (int c = 0; c < s.W; ++c) {
-                if (!reachable(r, c)) continue;
-                const double pu = a * th_cont(r, c) + b * s.z(r, c) + cc;
-                const double pv = d * th_cont(r, c) + e * s.z(r, c) + fcoef;
-                resu.push_back(std::abs(double(c) * step_size - pu));
-                resv.push_back(std::abs(double(r) * step_size - pv));
-            }
-        }
-        std::vector<double> cu = resu, cv2 = resv;
-        const double u50 = stnPercentile(cu,  50);
-        const double u95 = stnPercentile(cu,  95);
-        const double umax = stnMaxAbs(resu);
-        const double v50 = stnPercentile(cv2, 50);
-        const double v95 = stnPercentile(cv2, 95);
-        const double vmax = stnMaxAbs(resv);
-        std::cout << "  affine residual (vox): u p50=" << std::fixed << std::setprecision(1) << u50
-                  << " p95=" << u95 << " max=" << umax << "\n"
-                  << "  affine residual (vox): v p50=" << v50
-                  << " p95=" << v95 << " max=" << vmax << "\n";
-        std::cout.unsetf(std::ios::fixed);
-    }
-
-    cv::Mat_<double> u_new(s.H, s.W), v_new(s.H, s.W);
-    std::vector<double> du_abs, dv_abs;
-    du_abs.reserve((size_t)s.valid);
-    dv_abs.reserve((size_t)s.valid);
-    for (int r = 0; r < s.H; ++r) {
-        for (int c = 0; c < s.W; ++c) {
-            const double u_cur = double(c) * step_size;
-            const double v_cur = double(r) * step_size;
-            if (reachable(r, c)) {
-                const double u_tgt = a * th_cont(r, c) + b * s.z(r, c) + cc;
-                const double v_tgt = d * th_cont(r, c) + e * s.z(r, c) + fcoef;
-                u_new(r, c) = (1.0 - strengthU) * u_cur + strengthU * u_tgt;
-                v_new(r, c) = (1.0 - strengthV) * v_cur + strengthV * v_tgt;
-            } else {
-                u_new(r, c) = u_cur;
-                v_new(r, c) = v_cur;
-            }
-            if (s.mask(r, c)) {
-                du_abs.push_back(std::abs(u_new(r, c) - u_cur));
-                dv_abs.push_back(std::abs(v_new(r, c) - v_cur));
-            }
-        }
-    }
-    {
-        std::vector<double> cu = du_abs, cv2 = dv_abs;
-        const double u50 = stnPercentile(cu,  50);
-        const double u95 = stnPercentile(cu,  95);
-        const double umax = stnMaxAbs(du_abs);
-        const double v50 = stnPercentile(cv2, 50);
-        const double v95 = stnPercentile(cv2, 95);
-        const double vmax = stnMaxAbs(dv_abs);
-        std::cout << "UV shift (vox): u p50=" << std::fixed << std::setprecision(1) << u50
-                  << " p95=" << u95 << " max=" << umax << "\n"
-                  << "UV shift (vox): v p50=" << v50
-                  << " p95=" << v95 << " max=" << vmax << "\n";
-        std::cout.unsetf(std::ios::fixed);
-    }
-
-    // obj_out is the FINAL destination (inside `output`). We have to write the
-    // OBJ to a sibling temp first, because vc_obj2tifxyz_legacy refuses an
-    // existing `output` dir — then move the OBJ inside once rasterization
-    // succeeds.
-    const fs::path obj_tmp = output.parent_path() / obj_out.filename();
-    stnWriteObj(obj_tmp, s, u_new, v_new, strengthU, strengthV);
-
-    std::cout << "rasterizing -> " << output << "\n";
-    if (const int rc = rasterizeObjToTifxyz(obj2tifxyz, obj_tmp, output, step_size); rc != 0)
-        return rc;
-    fs::rename(obj_tmp, obj_out);
-    reportTifxyzShape(output, "output");
-    std::cout << "wrote: " << output << "\n";
-    return 0;
 }
 
 std::pair<int,int> gmEmitMesh(const Mat1f& X, const Mat1f& Y, const Mat1f& Z,
@@ -2114,37 +1688,33 @@ std::pair<int,int> gmEmitMesh(const Mat1f& X, const Mat1f& Y, const Mat1f& Z,
     return {n_v, 2 * n_q};
 }
 
-// Scan paths_dir for any directory whose name is <base_final>, <base_pre>, or
-// either base followed by "_v<digits>". Returns "" if nothing matches, else
-// "_v<max+1>" (bare names count as v0). Used to bump both output dirs to the
-// same version when either side already exists from a prior run.
+// Scan paths_dir for any directory whose name is <base> or <base>_v<digits>.
+// Returns "" if nothing matches, else "_v<max+1>" (bare base counts as v0).
 std::string gmPickVersionSuffix(const fs::path& paths_dir,
-                                const std::string& base_final,
-                                const std::string& base_pre)
+                                const std::string& base)
 {
     if (!fs::is_directory(paths_dir)) return "";
     int max_v = -1;
-    auto consider = [&](const std::string& name, const std::string& base) {
+    for (const auto& entry : fs::directory_iterator(paths_dir)) {
+        if (!entry.is_directory()) continue;
+        const std::string name = entry.path().filename().string();
         if (name == base) {
             if (max_v < 0) max_v = 0;
-            return;
+            continue;
         }
         const std::string prefix = base + "_v";
-        if (name.size() <= prefix.size()) return;
-        if (name.compare(0, prefix.size(), prefix) != 0) return;
+        if (name.size() <= prefix.size()) continue;
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
         const std::string tail = name.substr(prefix.size());
-        for (char c : tail)
-            if (!std::isdigit(static_cast<unsigned char>(c))) return;
+        bool all_digits = true;
+        for (char c : tail) {
+            if (!std::isdigit(static_cast<unsigned char>(c))) { all_digits = false; break; }
+        }
+        if (!all_digits) continue;
         try {
             int v = std::stoi(tail);
             if (v > max_v) max_v = v;
         } catch (...) {}
-    };
-    for (const auto& entry : fs::directory_iterator(paths_dir)) {
-        if (!entry.is_directory()) continue;
-        const std::string name = entry.path().filename().string();
-        consider(name, base_final);
-        consider(name, base_pre);
     }
     if (max_v < 0) return "";
     return "_v" + std::to_string(max_v + 1);
@@ -2156,75 +1726,118 @@ std::string gmPickVersionSuffix(const fs::path& paths_dir,
 // JSON. Returns 0 on success.
 // -----------------------------------------------------------------------------
 
+// Output of the alignment phase. Owns every per-surface artifact the blend +
+// rasterize phase needs, so that splitting the pipeline keeps a single source
+// of truth: alignment runs once, produces a GMAlignState, and downstream
+// phases (blend, strip-rasterize) read from it without re-deriving anything.
+struct GMAlignState {
+    fs::path     merge_path;
+    GMConfig     cfg;
+
+    fs::path     output_dir;
+    fs::path     obj_out;
+    fs::path     summary_path;
+    std::string  final_name;
+
+    std::unordered_map<std::string, GMSurface>    surfs;
+    std::vector<std::string>                       names;
+    std::string                                    ref;
+
+    std::unordered_map<std::string, cv::Matx23d>   M_dict;
+    std::unordered_map<std::string, GMSimRBF>      warps;
+    std::unordered_map<std::string, GMUV>          uv_map;
+    std::unordered_map<std::string, Mat1b>         real_overlap_native;
+
+    int u_min{0}, u_max{0}, v_min{0}, v_max{0};
+
+    json edges_json = json::array();
+    json joint_json = json::array();
+    json rbf_json   = json::array();
+    int  total_inliers{0};
+};
+
+GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg);
+int gmBlendAndRasterize(GMAlignState& state, const fs::path& obj2tifxyz,
+                        int strip_cols);
+
+// strip_cols controls phase 2 only. 0 (default) blends every surface in a
+// single shared raster (canonical single-pass behavior). >=1 splits the merge
+// grid into vertical column-blocks of that width and runs an independent EDT
+// blend per block (surfaces touching the strip's columns), accumulating each
+// strip's mesh into one master OBJ. Phase 1 (alignment) always runs once over
+// the full grid, so all strips share the same reference frame and stitch
+// without further transforms.
 int gmRunGlobalMerge(const fs::path& merge_path,
                      const fs::path& obj2tifxyz,
-                     GMConfig cfg)
+                     GMConfig cfg,
+                     int strip_cols)
 {
-    cfg.paths_dir = merge_path.parent_path() / "paths";
-    if (!fs::is_directory(cfg.paths_dir))
-        throw std::runtime_error("expected " + cfg.paths_dir.string() +
+    GMAlignState state = gmAlignAll(merge_path, std::move(cfg));
+    return gmBlendAndRasterize(state, obj2tifxyz, strip_cols);
+}
+
+// Phase 1: resolve grid → load surfaces → build patch index → per-edge anchors
+// + RANSAC → joint affine → per-surface RBF → UV remap → global ref-frame
+// bbox. Produces every artifact the blend phase needs and nothing it doesn't.
+GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
+{
+    GMAlignState st;
+    st.merge_path = merge_path;
+    st.cfg        = std::move(cfg);
+    st.cfg.paths_dir = merge_path.parent_path() / "paths";
+    if (!fs::is_directory(st.cfg.paths_dir))
+        throw std::runtime_error("expected " + st.cfg.paths_dir.string() +
             " (sibling of " + merge_path.string() + ") to be a directory");
 
-    std::cout << "[0/7] grid -> surfaces+edges from " << merge_path << "\n";
-    gmResolveGrid(merge_path, cfg.paths_dir, cfg.surfaces, cfg.edges);
-    std::cout << "  " << cfg.surfaces.size() << " surfaces, "
-              << cfg.edges.size() << " auto-derived edges\n";
-    gmCheckConnected(cfg.surfaces, cfg.edges);
+    std::cout << "[0/6] grid -> surfaces+edges from " << merge_path << "\n";
+    gmResolveGrid(merge_path, st.cfg.paths_dir, st.cfg.surfaces, st.cfg.edges);
+    std::cout << "  " << st.cfg.surfaces.size() << " surfaces, "
+              << st.cfg.edges.size() << " auto-derived edges\n";
+    gmCheckConnected(st.cfg.surfaces, st.cfg.edges);
 
     // Output dir name is derived from the alphabetically-first surface in the
-    // resolved grid. <alpha_first>_merged is the final tifxyz; the pre-
-    // straighten intermediate is <alpha_first>_merged_prestraightened. Both
-    // land under paths_dir alongside the input surfaces. If either of those
-    // bases (or any prior _vN of either) already exists, both dirs are bumped
-    // to the same _v(max+1) suffix so the lineage stays paired.
-    std::string alpha_first = cfg.surfaces.front().name;
-    for (const auto& s : cfg.surfaces)
+    // resolved grid: <alpha_first>_merged lands under paths_dir alongside the
+    // input surfaces. If that base (or any prior _vN of it) already exists,
+    // the new run is bumped to _v(max+1).
+    std::string alpha_first = st.cfg.surfaces.front().name;
+    for (const auto& s : st.cfg.surfaces)
         if (s.name < alpha_first) alpha_first = s.name;
     const std::string base_final = alpha_first + "_merged";
-    const std::string base_pre   = alpha_first + "_merged_prestraightened";
-    const std::string vsuffix    = gmPickVersionSuffix(cfg.paths_dir, base_final, base_pre);
-    const std::string final_name = base_final + vsuffix;
-    const std::string pre_name   = base_pre   + vsuffix;
-    const fs::path output_dir = cfg.paths_dir / final_name;
-    const fs::path pre_dir    = cfg.paths_dir / pre_name;
-    // OBJ + summary live INSIDE their respective tifxyz dirs.
-    const fs::path obj_out      = output_dir / (final_name + ".obj");
-    const fs::path pre_obj      = pre_dir    / (pre_name + ".obj");
-    const fs::path summary_path = output_dir / (final_name + "_summary.json");
-    std::cout << "  output: " << output_dir << "\n"
-              << "  pre-straighten: " << pre_dir << "\n";
+    const std::string vsuffix    = gmPickVersionSuffix(st.cfg.paths_dir, base_final);
+    st.output_dir   = st.cfg.paths_dir / (base_final + vsuffix);
+    st.final_name   = st.output_dir.filename().string();
+    st.obj_out      = st.output_dir / (st.final_name + ".obj");
+    st.summary_path = st.output_dir / (st.final_name + "_summary.json");
+    std::cout << "  output: " << st.output_dir << "\n";
 
     std::cout << "[1/6] loading surfaces" << std::endl;
-    std::unordered_map<std::string, GMSurface> surfs;
-    std::vector<std::string> names;
-    names.reserve(cfg.surfaces.size());
-    for (const auto& spec : cfg.surfaces) {
+    st.names.reserve(st.cfg.surfaces.size());
+    for (const auto& spec : st.cfg.surfaces) {
         GMSurface s = gmLoadSurface(spec);
         std::cout << "  " << s.name << ": shape=(" << s.H << "," << s.W
                   << "), valid=" << s.valid << "\n";
-        names.push_back(s.name);
-        surfs.emplace(s.name, std::move(s));
+        st.names.push_back(s.name);
+        st.surfs.emplace(s.name, std::move(s));
     }
 
-    std::string ref = cfg.ref;
-    if (ref.empty()) {
+    st.ref = st.cfg.ref;
+    if (st.ref.empty()) {
         int best = -1;
-        for (const auto& n : names)
-            if (surfs.at(n).valid > best) { best = surfs.at(n).valid; ref = n; }
-    } else if (!surfs.count(ref)) {
-        std::cerr << "ref '" << ref << "' is not in surfaces list\n";
-        return 2;
+        for (const auto& n : st.names)
+            if (st.surfs.at(n).valid > best) { best = st.surfs.at(n).valid; st.ref = n; }
+    } else if (!st.surfs.count(st.ref)) {
+        throw std::runtime_error("ref '" + st.ref + "' is not in surfaces list");
     }
-    std::cout << "  reference surface: " << ref
-              << " (valid=" << surfs.at(ref).valid << ")\n";
+    std::cout << "  reference surface: " << st.ref
+              << " (valid=" << st.surfs.at(st.ref).valid << ")\n";
 
     // Build a single SurfacePatchIndex over all surfaces — this lets each
     // edge's pairwise pass query overlaps without rebuilding.
     SurfacePatchIndex patchIndex;
     {
         std::vector<SurfacePatchIndex::SurfacePtr> all;
-        all.reserve(names.size());
-        for (const auto& n : names) all.push_back(surfs.at(n).qs);
+        all.reserve(st.names.size());
+        for (const auto& n : st.names) all.push_back(st.surfs.at(n).qs);
         std::cout << "Building SurfacePatchIndex over " << all.size()
                   << " surfaces..." << std::endl;
         patchIndex.rebuild(all);
@@ -2232,22 +1845,19 @@ int gmRunGlobalMerge(const fs::path& merge_path,
 
     std::cout << "[2/6] per-edge overlap+anchors+RANSAC similarity\n";
     std::vector<GMEdgeRun> edge_runs;
-    edge_runs.reserve(cfg.edges.size());
-    json edges_json = json::array();
-    std::unordered_map<std::string, Mat1b> real_overlap_native;
-    for (const auto& n : names)
-        real_overlap_native[n] = Mat1b::zeros(surfs.at(n).H, surfs.at(n).W);
-    int total_inliers = 0;
+    edge_runs.reserve(st.cfg.edges.size());
+    for (const auto& n : st.names)
+        st.real_overlap_native[n] = Mat1b::zeros(st.surfs.at(n).H, st.surfs.at(n).W);
     std::vector<GMEdgeSpec> dropped_edges;
-    for (const auto& e : cfg.edges) {
-        if (!surfs.count(e.a) || !surfs.count(e.b))
+    for (const auto& e : st.cfg.edges) {
+        if (!st.surfs.count(e.a) || !st.surfs.count(e.b))
             throw std::runtime_error("global mode: unknown surface in edge "
                                      + e.a + "<->" + e.b);
         std::cout << "  " << e.a << "<->" << e.b << ":\n";
         try {
-            EdgeAnchors pr = gmComputeEdgeAnchors(surfs.at(e.a).qs,
-                                                  surfs.at(e.b).qs,
-                                                  e.a, e.b, patchIndex, cfg);
+            EdgeAnchors pr = gmComputeEdgeAnchors(st.surfs.at(e.a).qs,
+                                                  st.surfs.at(e.b).qs,
+                                                  e.a, e.b, patchIndex, st.cfg);
 
             // Convert Anchor list → cv::Vec2d (col, row) pairs in cell coords.
             std::vector<cv::Vec2d> pA, pB;
@@ -2259,8 +1869,8 @@ int gmRunGlobalMerge(const fs::path& merge_path,
             }
 
             GMRansac R = gmRansacSimilarity(pA, pB,
-                cfg.ransac_iters, cfg.ransac_min_thresh, cfg.ransac_max_thresh,
-                cfg.ransac_mad_k, cfg.ransac_seed);
+                st.cfg.ransac_iters, st.cfg.ransac_min_thresh, st.cfg.ransac_max_thresh,
+                st.cfg.ransac_mad_k, st.cfg.ransac_seed);
 
             GMEdgeRun er;
             er.a = e.a; er.b = e.b;
@@ -2271,17 +1881,17 @@ int gmRunGlobalMerge(const fs::path& merge_path,
                 if (R.inlier[i]) { er.pA.push_back(pA[i]); er.pB.push_back(pB[i]); }
 
             // Accumulate real-overlap masks per surface.
-            if (!pr.realA.empty() && pr.realA.size() == real_overlap_native[e.a].size()) {
+            if (!pr.realA.empty() && pr.realA.size() == st.real_overlap_native[e.a].size()) {
                 int oA = 0;
-                Mat1b& dst = real_overlap_native[e.a];
+                Mat1b& dst = st.real_overlap_native[e.a];
                 for (int r = 0; r < pr.realA.rows; ++r)
                     for (int c = 0; c < pr.realA.cols; ++c)
                         if (pr.realA(r,c)) { dst(r,c) = 1; ++oA; }
                 er.real_overlap_a = oA;
             }
-            if (!pr.realB.empty() && pr.realB.size() == real_overlap_native[e.b].size()) {
+            if (!pr.realB.empty() && pr.realB.size() == st.real_overlap_native[e.b].size()) {
                 int oB = 0;
-                Mat1b& dst = real_overlap_native[e.b];
+                Mat1b& dst = st.real_overlap_native[e.b];
                 for (int r = 0; r < pr.realB.rows; ++r)
                     for (int c = 0; c < pr.realB.cols; ++c)
                         if (pr.realB(r,c)) { dst(r,c) = 1; ++oB; }
@@ -2296,7 +1906,7 @@ int gmRunGlobalMerge(const fs::path& merge_path,
                       << "  real-overlap A=" << er.real_overlap_a
                       << " B=" << er.real_overlap_b << "\n";
             std::cout.unsetf(std::ios::fixed);
-            total_inliers += er.n_in;
+            st.total_inliers += er.n_in;
 
             json ej = pr.edge_json;
             ej["ransac_inliers"] = er.n_in;
@@ -2306,7 +1916,7 @@ int gmRunGlobalMerge(const fs::path& merge_path,
             ej["pair_scale"]     = pair_sc;
             ej["real_overlap_A"] = er.real_overlap_a;
             ej["real_overlap_B"] = er.real_overlap_b;
-            edges_json.push_back(std::move(ej));
+            st.edges_json.push_back(std::move(ej));
             edge_runs.push_back(std::move(er));
         } catch (const std::exception& ex) {
             std::cout << "    WARN: " << ex.what() << " — dropping edge\n";
@@ -2321,16 +1931,14 @@ int gmRunGlobalMerge(const fs::path& merge_path,
         std::vector<GMEdgeSpec> kept;
         kept.reserve(edge_runs.size());
         for (const auto& er : edge_runs) kept.push_back({er.a, er.b});
-        gmCheckConnected(cfg.surfaces, kept);
+        gmCheckConnected(st.cfg.surfaces, kept);
     }
 
-    std::cout << "[3/6] joint affine fit (ref=" << ref
-              << ", " << total_inliers << " inlier anchors)\n";
-    std::unordered_map<std::string, cv::Matx23d> M_dict =
-        gmJointAffine(names, edge_runs, ref, kRidgeLambda);
-    json joint_json = json::array();
-    for (const auto& n : names) {
-        const auto& M = M_dict.at(n);
+    std::cout << "[3/6] joint affine fit (ref=" << st.ref
+              << ", " << st.total_inliers << " inlier anchors)\n";
+    st.M_dict = gmJointAffine(st.names, edge_runs, st.ref, kRidgeLambda);
+    for (const auto& n : st.names) {
+        const auto& M = st.M_dict.at(n);
         auto [sx, sy] = gmAffineScales(M);
         const double aniso = std::max(sx, sy) / std::max(std::min(sx, sy), 1e-9);
         std::cout << "  " << n
@@ -2340,23 +1948,24 @@ int gmRunGlobalMerge(const fs::path& merge_path,
                   << "  t=[" << std::showpos << std::fixed << std::setprecision(2)
                   << M(0,2) << ", " << M(1,2) << "]" << std::noshowpos << "\n";
         std::cout.unsetf(std::ios::fixed);
-        joint_json.push_back({
+        st.joint_json.push_back({
             {"surface", n}, {"sx", sx}, {"sy", sy}, {"aniso", aniso},
             {"t", {M(0,2), M(1,2)}},
             {"M", {{M(0,0), M(0,1), M(0,2)}, {M(1,0), M(1,1), M(1,2)}}},
         });
     }
 
-    std::cout << "[4/6] per-surface RBF on union of incident midpoint residuals\n";
-    auto warps = gmBuildSurfaceWarps(names, edge_runs, M_dict);
-    json rbf_json = json::array();
-    for (const auto& n : names) {
-        const auto& w = warps[n];
+    std::cout << "[4/6] per-surface RBF on union of incident midpoint residuals"
+              << (st.cfg.anchor_cap > 0 ? " (anchor_cap=" + std::to_string(st.cfg.anchor_cap) + ")" : "")
+              << "\n";
+    st.warps = gmBuildSurfaceWarps(st.names, edge_runs, st.M_dict, st.cfg.anchor_cap);
+    for (const auto& n : st.names) {
+        const auto& w = st.warps[n];
         std::cout << "  " << n << ": " << w.n_anchors << " anchors  "
                   << "residual rms=" << std::fixed << std::setprecision(2) << w.resid_rms
                   << "  max=" << w.resid_max << "\n";
         std::cout.unsetf(std::ios::fixed);
-        rbf_json.push_back({
+        st.rbf_json.push_back({
             {"surface", n},
             {"n_anchors", w.n_anchors},
             {"resid_rms", w.resid_rms},
@@ -2365,11 +1974,10 @@ int gmRunGlobalMerge(const fs::path& merge_path,
     }
 
     std::cout << "[4.5] remapping UVs into reference frame\n";
-    std::unordered_map<std::string, GMUV> uv_map;
-    for (const auto& n : names) {
-        const GMSurface& s = surfs.at(n);
+    for (const auto& n : st.names) {
+        const GMSurface& s = st.surfs.at(n);
         GMUV uv;
-        warps[n].evalGrid(s.H, s.W, uv.uc, uv.ur);
+        st.warps[n].evalGrid(s.H, s.W, uv.uc, uv.ur);
         double cmin=1e18, cmax=-1e18, rmin=1e18, rmax=-1e18;
         for (int r = 0; r < s.H; ++r) {
             const uint8_t* mp = s.mask.ptr<uint8_t>(r);
@@ -2388,13 +1996,13 @@ int gmRunGlobalMerge(const fs::path& merge_path,
                   << std::fixed << std::setprecision(1) << cmin << ", " << cmax << "]"
                   << "  row [" << rmin << ", " << rmax << "]\n";
         std::cout.unsetf(std::ios::fixed);
-        uv_map[n] = std::move(uv);
+        st.uv_map[n] = std::move(uv);
     }
 
     double all_cmin=1e18, all_cmax=-1e18, all_rmin=1e18, all_rmax=-1e18;
-    for (const auto& n : names) {
-        const GMSurface& s = surfs.at(n);
-        const GMUV& uv = uv_map[n];
+    for (const auto& n : st.names) {
+        const GMSurface& s = st.surfs.at(n);
+        const GMUV& uv = st.uv_map[n];
         for (int r = 0; r < s.H; ++r) {
             const uint8_t* mp = s.mask.ptr<uint8_t>(r);
             const float* uu = uv.uc.ptr<float>(r);
@@ -2408,77 +2016,182 @@ int gmRunGlobalMerge(const fs::path& merge_path,
             }
         }
     }
-    const int u_min = (int)std::floor(all_cmin);
-    const int u_max = (int)std::ceil (all_cmax);
-    const int v_min = (int)std::floor(all_rmin);
-    const int v_max = (int)std::ceil (all_rmax);
-    std::cout << "[5/6] N-way EDT blend  shared raster "
-              << (v_max - v_min + 1) << "x" << (u_max - u_min + 1)
-              << "  (U:[" << u_min << "," << u_max
-              << "] V:[" << v_min << "," << v_max << "])\n";
-    for (const auto& n : names) {
-        const GMSurface& s = surfs.at(n);
-        int ov = cv::countNonZero(real_overlap_native.at(n));
-        std::cout << "  " << n << ": valid=" << s.valid
-                  << "  real-overlap=" << ov
-                  << "  private=" << (s.valid - ov) << "\n";
-    }
-    auto xyz_blended = gmEdtBlend(names, surfs, uv_map,
-                                  u_min, u_max, v_min, v_max,
-                                  real_overlap_native,
-                                  kConsensusC, kConsensusMinActive,
-                                  kIdwK);
+    st.u_min = (int)std::floor(all_cmin);
+    st.u_max = (int)std::ceil (all_cmax);
+    st.v_min = (int)std::floor(all_rmin);
+    st.v_max = (int)std::ceil (all_rmax);
 
-    // Same pattern as stnRun: write OBJ to a sibling temp, rasterize (which
-    // creates pre_dir), then move OBJ inside.
-    const fs::path pre_obj_tmp = cfg.paths_dir / pre_obj.filename();
-    std::cout << "[6/7] writing pre-straighten OBJ to " << pre_obj << "\n";
+    return st;
+}
+
+// Group surface names into contiguous column-strips of width `strip_cols`.
+// Returns one vector per non-empty strip; each surface lands in the strip
+// containing its leftmost grid column. Surfaces missing from the raw grid
+// (shouldn't happen, since gmAlignAll resolves names from the same file) fall
+// into strip 0 as a defensive default. With strip_cols<=0 or num_cols<=
+// strip_cols the result is a single strip containing every name in input order.
+std::vector<std::vector<std::string>> gmReadRawGrid(const fs::path& merge_path);
+
+std::vector<std::vector<std::string>>
+gmGroupSurfacesByStrip(const fs::path& merge_path,
+                       const std::vector<std::string>& names,
+                       int strip_cols)
+{
+    if (strip_cols <= 0) return { names };
+    const auto raw_grid = gmReadRawGrid(merge_path);
+    size_t num_cols = 0;
+    for (const auto& row : raw_grid) num_cols = std::max(num_cols, row.size());
+    if (static_cast<int>(num_cols) <= strip_cols) return { names };
+
+    std::unordered_map<std::string, int> name_col;
+    for (size_t r = 0; r < raw_grid.size(); ++r) {
+        for (size_t c = 0; c < raw_grid[r].size(); ++c) {
+            const std::string& nm = raw_grid[r][c];
+            if (nm.empty()) continue;
+            auto [it, ins] = name_col.emplace(nm, static_cast<int>(c));
+            if (!ins) it->second = std::min(it->second, static_cast<int>(c));
+        }
+    }
+    const int num_strips = (static_cast<int>(num_cols) + strip_cols - 1) / strip_cols;
+    std::vector<std::vector<std::string>> strips(num_strips);
+    for (const auto& nm : names) {
+        auto it = name_col.find(nm);
+        const int c = (it != name_col.end()) ? it->second : 0;
+        strips[c / strip_cols].push_back(nm);
+    }
+    strips.erase(std::remove_if(strips.begin(), strips.end(),
+                                [](const auto& v){ return v.empty(); }),
+                 strips.end());
+    return strips;
+}
+
+// Phase 2: blend per-surface XYZ into the shared ref-frame raster (or one
+// raster per column-strip when strip_cols>=1), emit OBJ, shell out to
+// vc_obj2tifxyz_legacy to produce the final tifxyz, and write the summary
+// JSON. Striping splits the EDT-blend cost (W*H*N pixels) into smaller per-
+// strip rasters with a smaller surface count, but reuses the single global
+// alignment so neighboring strips fit together without further
+// transformation.
+int gmBlendAndRasterize(GMAlignState& st, const fs::path& obj2tifxyz,
+                        int strip_cols)
+{
+    const GMConfig& cfg = st.cfg;
+
+    std::vector<std::vector<std::string>> strips =
+        gmGroupSurfacesByStrip(st.merge_path, st.names, strip_cols);
+    const bool striped = (strips.size() > 1);
+
+    if (striped) {
+        std::cout << "[5/6] N-way EDT blend  " << strips.size()
+                  << " strips (strip_cols=" << strip_cols << ")\n";
+    } else {
+        std::cout << "[5/6] N-way EDT blend  shared raster "
+                  << (st.v_max - st.v_min + 1) << "x" << (st.u_max - st.u_min + 1)
+                  << "  (U:[" << st.u_min << "," << st.u_max
+                  << "] V:[" << st.v_min << "," << st.v_max << "])\n";
+    }
+
+    const fs::path target_dir = st.output_dir;
+    const fs::path target_obj = st.obj_out;
+    const fs::path obj_tmp    = cfg.paths_dir / target_obj.filename();
+    std::cout << "[6/6] writing OBJ to " << target_obj << "\n";
     {
-        std::ofstream obj(pre_obj_tmp);
+        std::ofstream obj(obj_tmp);
         if (!obj) {
-            std::cerr << "cannot open OBJ for writing: " << pre_obj_tmp << "\n";
+            std::cerr << "cannot open OBJ for writing: " << obj_tmp << "\n";
             return 1;
         }
-        obj << "# Global merge: " << names.size() << " surfaces, ref=" << ref << "\n";
+        obj << "# Global merge: " << st.names.size() << " surfaces, "
+            << strips.size() << " strip(s), ref=" << st.ref << "\n";
+
         int v_off=0, vt_off=0, total_v=0, total_f=0;
-        for (const auto& n : names) {
-            const GMSurface& s = surfs.at(n);
-            const auto& bo = xyz_blended.at(n);
-            const GMUV& uv = uv_map[n];
-            auto [nv, nf] = gmEmitMesh(bo.X, bo.Y, bo.Z, s.mask, uv.uc, uv.ur,
-                                       obj, v_off, vt_off, kStepSize);
-            std::cout << "  " << n << ": " << nv << " verts, " << nf << " tris\n";
-            v_off += nv; vt_off += nv;
-            total_v += nv; total_f += nf;
+        for (size_t si = 0; si < strips.size(); ++si) {
+            const auto& strip_names = strips[si];
+
+            // Per-strip ref-frame UV bbox: only the surfaces emitting into
+            // this strip define the EDT raster, which is what cuts cost vs.
+            // single-pass.
+            int u_lo, u_hi, v_lo, v_hi;
+            if (striped) {
+                double cmin=1e18, cmax=-1e18, rmin=1e18, rmax=-1e18;
+                for (const auto& n : strip_names) {
+                    const GMSurface& s = st.surfs.at(n);
+                    const GMUV& uv = st.uv_map.at(n);
+                    for (int r = 0; r < s.H; ++r) {
+                        const uint8_t* mp = s.mask.ptr<uint8_t>(r);
+                        const float* uu = uv.uc.ptr<float>(r);
+                        const float* vv = uv.ur.ptr<float>(r);
+                        for (int c = 0; c < s.W; ++c) {
+                            if (!mp[c]) continue;
+                            if (!std::isfinite(uu[c]) || !std::isfinite(vv[c])) continue;
+                            if (uu[c] < cmin) cmin = uu[c];
+                            if (uu[c] > cmax) cmax = uu[c];
+                            if (vv[c] < rmin) rmin = vv[c];
+                            if (vv[c] > rmax) rmax = vv[c];
+                        }
+                    }
+                }
+                u_lo = (int)std::floor(cmin);
+                u_hi = (int)std::ceil (cmax);
+                v_lo = (int)std::floor(rmin);
+                v_hi = (int)std::ceil (rmax);
+                std::cout << "  strip " << si << " (" << strip_names.size()
+                          << " surfaces) raster "
+                          << (v_hi-v_lo+1) << "x" << (u_hi-u_lo+1)
+                          << "  (U:[" << u_lo << "," << u_hi
+                          << "] V:[" << v_lo << "," << v_hi << "])\n";
+            } else {
+                u_lo = st.u_min; u_hi = st.u_max;
+                v_lo = st.v_min; v_hi = st.v_max;
+            }
+
+            for (const auto& n : strip_names) {
+                const GMSurface& s = st.surfs.at(n);
+                int ov = cv::countNonZero(st.real_overlap_native.at(n));
+                std::cout << "  " << n << ": valid=" << s.valid
+                          << "  real-overlap=" << ov
+                          << "  private=" << (s.valid - ov) << "\n";
+            }
+
+            auto xyz_blended = gmEdtBlend(strip_names, st.surfs, st.uv_map,
+                                          u_lo, u_hi, v_lo, v_hi,
+                                          st.real_overlap_native,
+                                          kConsensusC, kConsensusMinActive,
+                                          kIdwK);
+
+            for (const auto& n : strip_names) {
+                const GMSurface& s = st.surfs.at(n);
+                const auto& bo = xyz_blended.at(n);
+                const GMUV& uv = st.uv_map.at(n);
+                auto [nv, nf] = gmEmitMesh(bo.X, bo.Y, bo.Z, s.mask, uv.uc, uv.ur,
+                                           obj, v_off, vt_off, kStepSize);
+                std::cout << "  " << n << ": " << nv << " verts, " << nf << " tris\n";
+                v_off += nv; vt_off += nv;
+                total_v += nv; total_f += nf;
+            }
         }
         std::cout << "  total: " << total_v << " verts, " << total_f << " tris\n";
     }
 
-    std::cout << "rasterizing pre-straighten OBJ -> " << pre_dir
+    std::cout << "rasterizing OBJ -> " << target_dir
               << " (step=" << kStepSize << ")\n";
-    if (const int rc = rasterizeObjToTifxyz(obj2tifxyz, pre_obj_tmp, pre_dir,
+    if (const int rc = rasterizeObjToTifxyz(obj2tifxyz, obj_tmp, target_dir,
                                             kStepSize); rc != 0)
         return rc;
-    fs::rename(pre_obj_tmp, pre_obj);
-    reportTifxyzShape(pre_dir, "pre-straighten output");
-
-    std::cout << "[7/7] straighten (alpha_u=" << cfg.straighten_strength_u
-              << ", alpha_v=" << cfg.straighten_strength_v << ")\n";
-    const int rrc = stnRun(pre_dir, output_dir, obj_out, obj2tifxyz,
-                           kStepSize,
-                           cfg.straighten_strength_u,
-                           cfg.straighten_strength_v);
-    if (rrc != 0) return rrc;
+    fs::rename(obj_tmp, target_obj);
+    reportTifxyzShape(target_dir, "output");
 
     json summary = {
-        {"merge_json", merge_path.string()},
-        {"output", output_dir.string()},
-        {"obj_out", obj_out.string()},
-        {"ref_surface", ref},
+        {"merge_json", st.merge_path.string()},
+        {"output", st.output_dir.string()},
+        {"obj_out", st.obj_out.string()},
+        {"ref_surface", st.ref},
+        {"strip_cols", strip_cols},
+        {"strip_count", static_cast<int>(strips.size())},
         {"surfaces", json::array()},
-        {"edges", edges_json},
-        {"joint_affine", joint_json},
-        {"surface_rbf", rbf_json},
+        {"edges", st.edges_json},
+        {"joint_affine", st.joint_json},
+        {"surface_rbf", st.rbf_json},
         {"params", {
             {"ridge_lambda", kRidgeLambda},
             {"consensus_c", kConsensusC},
@@ -2490,24 +2203,72 @@ int gmRunGlobalMerge(const fs::path& merge_path,
             {"ransac_seed", cfg.ransac_seed},
             {"idw_k", kIdwK},
             {"step_size", kStepSize},
-            {"straighten_strength_u", cfg.straighten_strength_u},
-            {"straighten_strength_v", cfg.straighten_strength_v},
             {"anchor_bin_size", kAnchorBinSize},
+            {"anchor_cap", cfg.anchor_cap},
         }},
     };
-    for (const auto& n : names) {
-        const GMSurface& s = surfs.at(n);
+    for (const auto& n : st.names) {
+        const GMSurface& s = st.surfs.at(n);
         summary["surfaces"].push_back({
             {"name", n}, {"path", s.path.string()},
             {"H", s.H}, {"W", s.W}, {"valid", s.valid},
         });
     }
     {
-        std::ofstream f(summary_path);
+        std::ofstream f(st.summary_path);
         f << summary.dump(2) << std::endl;
-        std::cout << "wrote summary to " << summary_path << "\n";
+        std::cout << "wrote summary to " << st.summary_path << "\n";
     }
     return 0;
+}
+
+// gmReadRawGrid: reload the raw merge.json grid (no surface resolution) so
+// the strip dispatcher in gmBlendAndRasterize can map each surface back to
+// its leftmost grid column. Accepts either a per-row whitespace-delimited
+// string or a JSON array of strings/nulls.
+std::vector<std::vector<std::string>> gmReadRawGrid(const fs::path& merge_path)
+{
+    std::ifstream f(merge_path);
+    if (!f) throw std::runtime_error("cannot open " + merge_path.string());
+    json j; f >> j;
+    if (j.size() != 1 || !j.contains("rows"))
+        throw std::runtime_error(merge_path.string() +
+            ": only the 'rows' key is accepted");
+    const auto& rows_j = j.at("rows");
+    if (!rows_j.is_array() || rows_j.empty())
+        throw std::runtime_error(merge_path.string() +
+            ": 'rows' must be a non-empty array");
+
+    auto splitWhitespace = [](const std::string& s) {
+        std::vector<std::string> out;
+        std::istringstream iss(s);
+        std::string tok;
+        while (iss >> tok) out.push_back(std::move(tok));
+        return out;
+    };
+
+    std::vector<std::vector<std::string>> grid(rows_j.size());
+    for (size_t r = 0; r < rows_j.size(); ++r) {
+        const auto& row_j = rows_j[r];
+        if (row_j.is_array()) {
+            grid[r].reserve(row_j.size());
+            for (size_t c = 0; c < row_j.size(); ++c) {
+                const auto& cell = row_j[c];
+                if (cell.is_null()) grid[r].emplace_back();
+                else if (cell.is_string()) grid[r].push_back(cell.get<std::string>());
+                else throw std::runtime_error(merge_path.string() + ": rows[" +
+                    std::to_string(r) + "][" + std::to_string(c) +
+                    "] must be a string or null");
+            }
+        } else if (row_j.is_string()) {
+            grid[r] = splitWhitespace(row_j.get<std::string>());
+        } else {
+            throw std::runtime_error(merge_path.string() + ": rows[" +
+                std::to_string(r) +
+                "] must be an array or a whitespace-delimited string");
+        }
+    }
+    return grid;
 }
 
 }  // namespace
@@ -2520,13 +2281,12 @@ int main(int argc, char** argv)
         "input is --merge <path/to/merge.json>; the surface list and edge "
         "graph come from that file (row-major grid of full tifxyz directory "
         "names), and <volpkg>/paths/ is the sibling directory holding the "
-        "input tifxyz dirs. Output dirs are auto-named under <volpkg>/paths/: "
-        "<alpha_first>_merged for the final tifxyz and "
-        "<alpha_first>_merged_prestraightened for the intermediate, where "
-        "<alpha_first> is the alphabetically smallest surface name in the "
-        "grid. Runs per-edge overlap+anchor passes in-memory, RANSAC "
-        "similarity, joint affine, per-surface TPS RBF, EDT blend, OBJ emit, "
-        "vc_obj2tifxyz_legacy rasterization, and a final straighten pass.");
+        "input tifxyz dirs. Output dir is auto-named under <volpkg>/paths/ "
+        "as <alpha_first>_merged (with a _v<n> suffix bumped from any prior "
+        "runs), where <alpha_first> is the alphabetically smallest surface "
+        "name in the grid. Runs per-edge overlap+anchor passes in-memory, "
+        "RANSAC similarity, joint affine, per-surface TPS RBF, EDT blend, "
+        "OBJ emit, and vc_obj2tifxyz_legacy rasterization.");
     desc.add_options()
         ("help,h", "print help")
         ("merge,m", po::value<std::string>(),
@@ -2538,10 +2298,6 @@ int main(int argc, char** argv)
         ("ref", po::value<std::string>()->default_value(""),
          "Reference surface name. Empty (default) = pick the surface with "
          "the largest valid-cell count.")
-        ("strength-u", po::value<double>()->default_value(defaults.straighten_strength_u),
-         "Straighten theta-axis UV blend factor in [0, 1].")
-        ("strength-v", po::value<double>()->default_value(defaults.straighten_strength_v),
-         "Straighten z-axis UV blend factor in [0, 1].")
         ("ransac-iters", po::value<int>()->default_value(defaults.ransac_iters),
          "Per-edge RANSAC trial count.")
         ("ransac-min-thresh", po::value<double>()->default_value(defaults.ransac_min_thresh),
@@ -2551,7 +2307,22 @@ int main(int argc, char** argv)
         ("ransac-mad-k", po::value<double>()->default_value(defaults.ransac_mad_k),
          "Per-edge RANSAC MAD multiplier (clamped to [min, max] threshold).")
         ("ransac-seed", po::value<uint32_t>()->default_value(defaults.ransac_seed),
-         "Per-edge RANSAC RNG seed (0 = nondeterministic).");
+         "Per-edge RANSAC RNG seed (0 = nondeterministic).")
+        ("anchor-cap", po::value<int>()->default_value(defaults.anchor_cap),
+         "Per-surface RBF anchor count cap. If >0 and a surface's union of "
+         "incident-edge anchors exceeds this count, spatially decimate them by "
+         "keeping one ORIGINAL anchor per coarse cell (no averaging). Caps the "
+         "(N+3)x(N+3) dense LU memory in [4/6] without the anchor-averaging "
+         "bias of a coarser fixed bin size. 0 = no cap (default).")
+        ("strip-cols", po::value<int>()->default_value(0),
+         "If >=1, split the [5/6] EDT blend into per-column-block strips of "
+         "this width. Phase 1 (alignment) still runs once over the full grid, "
+         "so all strips share one reference frame and emit a single combined "
+         "OBJ that rasterizes as a single tifxyz -- no tile stitching. "
+         "Reduces the EDT raster size and surface count per blend, so the "
+         "blend cost scales with strip width instead of full grid width. "
+         "0 = single-pass blend (default); >= num_grid_cols also collapses "
+         "to single-pass.");
 
     po::variables_map vm;
     try {
@@ -2573,18 +2344,19 @@ int main(int argc, char** argv)
 
     GMConfig cfg;
     cfg.ref                   = vm["ref"].as<std::string>();
-    cfg.straighten_strength_u = vm["strength-u"].as<double>();
-    cfg.straighten_strength_v = vm["strength-v"].as<double>();
     cfg.ransac_iters          = vm["ransac-iters"].as<int>();
     cfg.ransac_min_thresh     = vm["ransac-min-thresh"].as<double>();
     cfg.ransac_max_thresh     = vm["ransac-max-thresh"].as<double>();
     cfg.ransac_mad_k          = vm["ransac-mad-k"].as<double>();
     cfg.ransac_seed           = vm["ransac-seed"].as<uint32_t>();
+    cfg.anchor_cap            = vm["anchor-cap"].as<int>();
+    const int strip_cols      = vm["strip-cols"].as<int>();
 
     try {
-        return gmRunGlobalMerge(merge_path, obj2tifxyz, std::move(cfg));
+        return gmRunGlobalMerge(merge_path, obj2tifxyz, std::move(cfg), strip_cols);
     } catch (const std::exception& e) {
         std::cerr << "global merge failed: " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
 }
+

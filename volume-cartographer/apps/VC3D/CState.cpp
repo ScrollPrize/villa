@@ -226,11 +226,13 @@ void CState::setPOI(const std::string& name, POI* poi)
         // Same pointer re-submitted (caller mutated in place) - just signal
         emit poiChanged(name, poi);
         poi->suppressViewerRecenter = false;
+        poi->suppressTransientPlaneIntersections = false;
         return;
     }
     _pois[name] = std::unique_ptr<POI>(poi);
     emit poiChanged(name, poi);
     poi->suppressViewerRecenter = false;
+    poi->suppressTransientPlaneIntersections = false;
 }
 
 POI* CState::poi(const std::string& name)

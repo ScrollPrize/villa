@@ -77,6 +77,7 @@ public:
 private:
     enum class EntryStatus {
         InFlight,
+        Missing,
         AllFill,
         Data,
         Error

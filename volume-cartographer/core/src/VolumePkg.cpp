@@ -124,6 +124,85 @@ bool anyImmediateSubdir(const fs::path& dir, bool (*test)(const fs::path&))
     return false;
 }
 
+std::string trimTrailingSeparators(std::string value)
+{
+    while (value.size() > 1 && (value.back() == '/' || value.back() == '\\')) {
+        value.pop_back();
+    }
+    return value;
+}
+
+fs::path normalizedLocalPath(const std::string& location, const fs::path& base)
+{
+    return vc::project::resolveLocalPath(trimTrailingSeparators(location), base).lexically_normal();
+}
+
+std::string normalizedPathName(std::string value)
+{
+    value = trimTrailingSeparators(std::move(value));
+    fs::path path(value);
+    std::string name = path.filename().string();
+    if (name.empty() && path.has_parent_path()) {
+        name = path.parent_path().filename().string();
+    }
+    return name;
+}
+
+bool sameLocalSegmentsLocation(const vc::project::Entry& entry,
+                               const std::string& location,
+                               const fs::path& base)
+{
+    if (entry.location == location) return true;
+    if (vc::project::isLocationRemote(entry.location) || vc::project::isLocationRemote(location)) {
+        return false;
+    }
+    return normalizedLocalPath(entry.location, base) == normalizedLocalPath(location, base);
+}
+
+bool matchesSegmentsDirectoryName(const vc::project::Entry& entry,
+                                  const std::string& dirName,
+                                  const fs::path& base)
+{
+    if (vc::project::isLocationRemote(entry.location)) return false;
+    const auto requested = asciiLower(trimTrailingSeparators(dirName));
+    const auto requestedName = asciiLower(normalizedPathName(dirName));
+    const auto entryPath = normalizedLocalPath(entry.location, base);
+    return asciiLower(entryPath.filename().string()) == requested
+        || (!requestedName.empty() && asciiLower(entryPath.filename().string()) == requestedName)
+        || asciiLower(entryPath.string()) == requested
+        || asciiLower(trimTrailingSeparators(entry.location)) == requested;
+}
+
+const vc::project::Entry* findSegmentsEntryByLocation(const std::vector<vc::project::Entry>& entries,
+                                                      const std::string& location,
+                                                      const fs::path& base)
+{
+    if (location.empty()) return nullptr;
+    for (const auto& entry : entries) {
+        if (sameLocalSegmentsLocation(entry, location, base)) return &entry;
+    }
+    return nullptr;
+}
+
+const vc::project::Entry* findSegmentsEntryByDirectoryName(const std::vector<vc::project::Entry>& entries,
+                                                           const std::string& dirName,
+                                                           const fs::path& base)
+{
+    if (dirName.empty()) return nullptr;
+    for (const auto& entry : entries) {
+        if (matchesSegmentsDirectoryName(entry, dirName, base)) return &entry;
+    }
+    return nullptr;
+}
+
+const vc::project::Entry* firstLocalSegmentsEntry(const std::vector<vc::project::Entry>& entries)
+{
+    for (const auto& entry : entries) {
+        if (!vc::project::isLocationRemote(entry.location)) return &entry;
+    }
+    return nullptr;
+}
+
 fs::path defaultAutosaveRoot()
 {
     if (!VolumePkg::autosaveRoot().empty()) return VolumePkg::autosaveRoot();
@@ -315,7 +394,10 @@ bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::s
     if (location.empty()) return false;
     for (const auto& e : segments_) if (e.location == location) return false;
     segments_.push_back({location, std::move(tags)});
-    resolveSegmentsEntry(segments_.back());
+    if (!outputSegments_) {
+        outputSegments_ = location;
+    }
+    refreshSegmentations();
     persistProjectState();
     return true;
 }
@@ -354,6 +436,7 @@ bool VolumePkg::removeEntry(const std::string& location)
 void VolumePkg::setOutputSegments(const std::string& location)
 {
     outputSegments_ = location;
+    refreshSegmentations();
     persistProjectState();
 }
 
@@ -711,24 +794,25 @@ void VolumePkg::resolveAll()
     }
     resolvedNormalGridPaths_.clear();
     for (const auto& e : volumes_) resolveVolumeEntry(e);
-    bool loadedPreferredSegments = false;
+
+    const vc::project::Entry* selectedSegments = nullptr;
     if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
-        const auto requested = asciiLower(*loadFirstSegmentationDir_);
-        for (const auto& e : segments_) {
-            if (vc::project::isLocationRemote(e.location)) continue;
-            const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
-            if (asciiLower(path.filename().string()) != requested) continue;
-            resolveSegmentsEntry(e);
-            loadedPreferredSegments = true;
-            break;
-        }
-        if (!loadedPreferredSegments) {
-            Logger()->warn("Requested load-first segmentation directory '{}' not available; loading all segmentations.",
+        selectedSegments = findSegmentsEntryByDirectoryName(
+            segments_, *loadFirstSegmentationDir_, path_.parent_path());
+        if (!selectedSegments) {
+            Logger()->warn("Requested load-first segmentation directory '{}' not available; using the selected segmentation directory.",
                            *loadFirstSegmentationDir_);
         }
     }
-    if (!loadFirstSegmentationDir_ || !loadedPreferredSegments) {
-        for (const auto& e : segments_) resolveSegmentsEntry(e);
+    if (!selectedSegments && outputSegments_) {
+        selectedSegments = findSegmentsEntryByLocation(segments_, *outputSegments_, path_.parent_path());
+    }
+    if (!selectedSegments) {
+        selectedSegments = firstLocalSegmentsEntry(segments_);
+    }
+    if (selectedSegments) {
+        outputSegments_ = selectedSegments->location;
+        resolveSegmentsEntry(*selectedSegments);
     }
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
 }
@@ -944,11 +1028,9 @@ fs::path VolumePkg::findSegmentPathByName(const std::string& dirName) const
 
 void VolumePkg::setSegmentationDirectory(const std::string& dirName)
 {
-    for (const auto& e : segments_) {
-        if (vc::project::resolveLocalPath(e.location, path_.parent_path()).filename().string() == dirName) {
-            setOutputSegments(e.location);
-            return;
-        }
+    if (const auto* entry = findSegmentsEntryByDirectoryName(segments_, dirName, path_.parent_path())) {
+        setOutputSegments(entry->location);
+        return;
     }
     Logger()->warn("setSegmentationDirectory('{}'): no matching segments entry", dirName);
 }
@@ -960,24 +1042,25 @@ void VolumePkg::refreshSegmentations()
         loadedSegmentations_.clear();
         segmentationTagsByID_.clear();
     }
-    bool loadedPreferredSegments = false;
-    if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
-        const auto requested = asciiLower(*loadFirstSegmentationDir_);
-        for (const auto& e : segments_) {
-            if (vc::project::isLocationRemote(e.location)) continue;
-            const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
-            if (asciiLower(path.filename().string()) != requested) continue;
-            resolveSegmentsEntry(e);
-            loadedPreferredSegments = true;
-            break;
-        }
-        if (!loadedPreferredSegments) {
-            Logger()->warn("Requested load-first segmentation directory '{}' not available; loading all segmentations.",
+
+    const vc::project::Entry* selectedSegments = nullptr;
+    if (outputSegments_) {
+        selectedSegments = findSegmentsEntryByLocation(segments_, *outputSegments_, path_.parent_path());
+    }
+    if (!selectedSegments && loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
+        selectedSegments = findSegmentsEntryByDirectoryName(
+            segments_, *loadFirstSegmentationDir_, path_.parent_path());
+        if (!selectedSegments) {
+            Logger()->warn("Requested load-first segmentation directory '{}' not available; using the selected segmentation directory.",
                            *loadFirstSegmentationDir_);
         }
     }
-    if (!loadFirstSegmentationDir_ || !loadedPreferredSegments) {
-        for (const auto& e : segments_) resolveSegmentsEntry(e);
+    if (!selectedSegments) {
+        selectedSegments = firstLocalSegmentsEntry(segments_);
+    }
+    if (selectedSegments) {
+        outputSegments_ = selectedSegments->location;
+        resolveSegmentsEntry(*selectedSegments);
     }
 }
 
