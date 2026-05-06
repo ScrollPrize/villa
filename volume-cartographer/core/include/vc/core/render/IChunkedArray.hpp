@@ -14,6 +14,7 @@ namespace vc::render {
 
 enum class ChunkStatus {
     MissQueued,
+    Missing,
     AllFill,
     Data,
     Error

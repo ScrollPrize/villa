@@ -307,6 +307,10 @@ ChunkResult ChunkCache::resultFromEntryLocked(State& state, const ChunkKey& key,
     case EntryStatus::InFlight:
         result.status = ChunkStatus::MissQueued;
         break;
+    case EntryStatus::Missing:
+        result.status = ChunkStatus::Missing;
+        touchLocked(state, key, entry);
+        break;
     case EntryStatus::AllFill:
         result.status = ChunkStatus::AllFill;
         touchLocked(state, key, entry);
@@ -451,7 +455,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
             queuePersistentWrite(state, key, entry.bytes);
         break;
     case ChunkFetchStatus::Missing:
-        entry.status = EntryStatus::AllFill;
+        entry.status = EntryStatus::Missing;
         entry.persisted = loadedFromPersistentCache ||
             queuePersistentEmptyWrite(state, key);
         break;
