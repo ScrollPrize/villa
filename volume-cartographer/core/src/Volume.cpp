@@ -213,75 +213,123 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
         }
     }
 
+    if (readZ0 > readZ1 || readY0 > readY1 || readX0 > readX1) {
+        return;
+    }
+
+    struct ChunkCopyPlan {
+        int cz = 0;
+        int cy = 0;
+        int cx = 0;
+        int zBegin = 0;
+        int zEnd = 0;
+        int yBegin = 0;
+        int yEnd = 0;
+        int xBegin = 0;
+        int xEnd = 0;
+    };
+
+    const int cZ0 = readZ0 / chunkShape[0];
+    const int cY0 = readY0 / chunkShape[1];
+    const int cX0 = readX0 / chunkShape[2];
+    const int cZ1 = readZ1 / chunkShape[0];
+    const int cY1 = readY1 / chunkShape[1];
+    const int cX1 = readX1 / chunkShape[2];
+
+    std::vector<ChunkCopyPlan> plans;
+    plans.reserve(static_cast<size_t>(cZ1 - cZ0 + 1) *
+                  static_cast<size_t>(cY1 - cY0 + 1) *
+                  static_cast<size_t>(cX1 - cX0 + 1));
+    for (int cz = cZ0; cz <= cZ1; ++cz) {
+        const int chunkZ0 = cz * chunkShape[0];
+        const int chunkZ1 = std::min(volumeShape[0], chunkZ0 + chunkShape[0]);
+        for (int cy = cY0; cy <= cY1; ++cy) {
+            const int chunkY0 = cy * chunkShape[1];
+            const int chunkY1 = std::min(volumeShape[1], chunkY0 + chunkShape[1]);
+            for (int cx = cX0; cx <= cX1; ++cx) {
+                const int chunkX0 = cx * chunkShape[2];
+                const int chunkX1 = std::min(volumeShape[2], chunkX0 + chunkShape[2]);
+                plans.push_back(ChunkCopyPlan{
+                    cz,
+                    cy,
+                    cx,
+                    std::max(readZ0, chunkZ0),
+                    std::min(readZ1 + 1, chunkZ1),
+                    std::max(readY0, chunkY0),
+                    std::min(readY1 + 1, chunkY1),
+                    std::max(readX0, chunkX0),
+                    std::min(readX1 + 1, chunkX1),
+                });
+            }
+        }
+    }
+
     const T fill = typedFillValue<T>(array);
     const size_t chunkStrideY = static_cast<size_t>(chunkShape[2]);
     const size_t chunkStrideZ = static_cast<size_t>(chunkShape[1]) * chunkStrideY;
+    const size_t outStrideY = outShape[0];
+    const size_t outStrideX = outShape[0] * outShape[1];
+    T* outData = out.data();
+    std::exception_ptr firstException;
+    std::mutex exceptionMutex;
 
-    #pragma omp parallel
-    {
-        struct CachedChunk {
-            int cz = std::numeric_limits<int>::min();
-            int cy = std::numeric_limits<int>::min();
-            int cx = std::numeric_limits<int>::min();
-            bool allFill = false;
-            const T* data = nullptr;
-            std::shared_ptr<const std::vector<std::byte>> bytes;
-        } cached;
-
-        auto loadChunk = [&](int cz, int cy, int cx) {
-            if (cached.cz == cz && cached.cy == cy && cached.cx == cx) {
-                return;
-            }
-            cached = {};
-            cached.cz = cz;
-            cached.cy = cy;
-            cached.cx = cx;
-
-            const auto result = array.getChunkBlocking(level, cz, cy, cx);
-            if (result.status == ChunkStatus::AllFill) {
-                cached.allFill = true;
-            } else if (result.status == ChunkStatus::Data && result.bytes) {
-                cached.bytes = result.bytes;
-                cached.data = reinterpret_cast<const T*>(cached.bytes->data());
-            } else if (result.status == ChunkStatus::Error) {
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t planIndex = 0; planIndex < plans.size(); ++planIndex) {
+        try {
+            const auto& plan = plans[planIndex];
+            const auto result = array.getChunkBlocking(level, plan.cz, plan.cy, plan.cx);
+            if (result.status == ChunkStatus::Error) {
                 throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
-            } else {
-                cached.allFill = true;
             }
-        };
 
-        #pragma omp for schedule(dynamic, 4) collapse(2)
-        for (size_t z = 0; z < outShape[0]; ++z) {
-            for (size_t y = 0; y < outShape[1]; ++y) {
-                const int iz = z0 + static_cast<int>(z);
-                const int iy = y0 + static_cast<int>(y);
-                if (iz < 0 || iz >= volumeShape[0] ||
-                    iy < 0 || iy >= volumeShape[1]) {
-                    continue;
-                }
-                const int cz = iz / chunkShape[0];
-                const int cy = iy / chunkShape[1];
-                const int lz = iz - cz * chunkShape[0];
-                const int ly = iy - cy * chunkShape[1];
-                for (size_t x = 0; x < outShape[2]; ++x) {
-                    const int ix = x0 + static_cast<int>(x);
-                    if (ix < 0 || ix >= volumeShape[2]) {
+            const T* chunkData = nullptr;
+            std::shared_ptr<const std::vector<std::byte>> chunkBytes;
+            if (result.status == ChunkStatus::Data && result.bytes) {
+                chunkBytes = result.bytes;
+                chunkData = reinterpret_cast<const T*>(chunkBytes->data());
+            }
+
+            const int chunkZ0 = plan.cz * chunkShape[0];
+            const int chunkY0 = plan.cy * chunkShape[1];
+            const int chunkX0 = plan.cx * chunkShape[2];
+
+            for (int x = plan.xBegin; x < plan.xEnd; ++x) {
+                const size_t outX = static_cast<size_t>(x - x0);
+                const int lx = x - chunkX0;
+                for (int y = plan.yBegin; y < plan.yEnd; ++y) {
+                    const size_t outY = static_cast<size_t>(y - y0);
+                    const int ly = y - chunkY0;
+                    T* dst = outData + outX * outStrideX + outY * outStrideY +
+                             static_cast<size_t>(plan.zBegin - z0);
+
+                    if (chunkData == nullptr ||
+                        result.status == ChunkStatus::AllFill ||
+                        result.status == ChunkStatus::Missing) {
+                        std::fill(dst, dst + (plan.zEnd - plan.zBegin), fill);
                         continue;
                     }
-                    const int cx = ix / chunkShape[2];
-                    const int lx = ix - cx * chunkShape[2];
-                    loadChunk(cz, cy, cx);
-                    if (cached.allFill || !cached.data) {
-                        out(z, y, x) = fill;
-                    } else {
-                        const size_t offset = static_cast<size_t>(lz) * chunkStrideZ +
-                                              static_cast<size_t>(ly) * chunkStrideY +
-                                              static_cast<size_t>(lx);
-                        out(z, y, x) = cached.data[offset];
+
+                    const int lzBegin = plan.zBegin - chunkZ0;
+                    for (int z = plan.zBegin; z < plan.zEnd; ++z) {
+                        const int lz = lzBegin + (z - plan.zBegin);
+                        const size_t srcOffset =
+                            static_cast<size_t>(lz) * chunkStrideZ +
+                            static_cast<size_t>(ly) * chunkStrideY +
+                            static_cast<size_t>(lx);
+                        dst[z - plan.zBegin] = chunkData[srcOffset];
                     }
                 }
             }
+        } catch (...) {
+            std::lock_guard lock(exceptionMutex);
+            if (!firstException) {
+                firstException = std::current_exception();
+            }
         }
+    }
+
+    if (firstException) {
+        std::rethrow_exception(firstException);
     }
 }
 
