@@ -15,7 +15,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libboost-system-dev libboost-program-options-dev \
         libceres-dev libsuitesparse-dev \
         libopencv-dev libopencv-contrib-dev \
-        libblosc2-dev libcurl4-openssl-dev \
+        libcgal-dev libmpfr-dev libgmp-dev \
+        libblosc2-dev libzstd-dev libcurl4-openssl-dev \
         nlohmann-json3-dev libavahi-client-dev \
         liblz4-dev libtiff-dev \
         zlib1g-dev gfortran libopenblas-dev liblapack-dev \

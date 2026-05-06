@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM alpine:3.21 AS builder
+FROM alpine:edge AS builder
 
 RUN --mount=type=cache,target=/var/cache/apk \
     apk add --no-cache \
@@ -8,9 +8,10 @@ RUN --mount=type=cache,target=/var/cache/apk \
         build-base clang lld git cmake ninja-build pkgconfig \
         qt6-qtbase-dev \
         boost-dev \
-        ceres-solver-dev suitesparse-dev \
+        ceres-dev suitesparse-dev \
         opencv-dev \
-        blosc2-dev curl-dev \
+        cgal-dev mpfr-dev gmp-dev \
+        blosc2-dev zstd-dev curl-dev \
         nlohmann-json avahi-dev \
         lz4-dev tiff-dev \
         zlib-dev gfortran \
