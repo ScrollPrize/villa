@@ -1,215 +1,49 @@
-name: Build & Push Docker Image (ghcr.io)
+name: Publish builder images (ghcr.io)
+
+# Publishes the volume-cartographer CI builder images (Ubuntu base +
+# all apt deps) to ghcr.io so PR CI can `docker pull` them instead of
+# rebuilding from scratch each time. Triggered only when the relevant
+# Dockerfile / ci.sh changes land on main.
+#
+# Image:  ghcr.io/<owner>/villa/volume-cartographer
+# Tags:   builder-ubuntu-24.04, builder-ubuntu-26.04
+#         (plus a sha suffix for traceability)
 
 on:
   push:
-    branches: [ "main", "latest" ]
+    branches: [main]
     paths:
-      - 'volume-cartographer/**'
+      - 'volume-cartographer/*.Dockerfile'
+      - 'volume-cartographer/.dockerignore'
+      - 'volume-cartographer/scripts/ci.sh'
       - '.github/workflows/vc3d-publish-ghcr.yml'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
-  id-token: write  # for provenance/attestations if enabled
 
-env:
-  # Keep the nested path if intentional; otherwise consider ghcr.io/${{ github.repository }}
-  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/villa/volume-cartographer
+concurrency:
+  group: ${{ github.workflow }}-${{ matrix.image }}
+  cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Preparation
-    runs-on: ubuntu-latest
-    outputs:
-      registry_image_lc: ${{ steps.lowercase.outputs.registry_image_lc }}
-    steps:
-      - name: Convert image name to lower-case
-        id: lowercase
-        run: |
-          echo "registry_image_lc=$(echo '${{ env.REGISTRY_IMAGE }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-  build_x64:
-    name: Build & Push Image (amd64)
+  publish:
+    name: Publish ${{ matrix.image }} builder
     runs-on: ubuntu-24.04
-    needs: prepare
-    env:
-      REGISTRY_IMAGE_LC: ${{ needs.prepare.outputs.registry_image_lc }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: ubuntu-24.04, dockerfile: ubuntu-24.04-noble.Dockerfile }
+          - { image: ubuntu-26.04, dockerfile: ubuntu-26.04.Dockerfile }
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Docker meta (labels only)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY_IMAGE_LC }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix=sha-
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/latest' }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build & push (by digest only)
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: ./volume-cartographer
-          file: ./volume-cartographer/ubuntu-24.04-noble.Dockerfile
-          platforms: linux/amd64
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: |
-            type=gha,scope=vc3d-${{ github.ref_name }}
-            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
-          cache-to: |
-            type=gha,mode=max,scope=vc3d-${{ github.ref_name }}
-            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache,mode=max
-          provenance: true
-          outputs: |
-            type=image,name=${{ env.REGISTRY_IMAGE_LC }},push-by-digest=true,name-canonical=true,push=true
-
-      - name: Export digest
-        run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-linux-amd64
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  build_arm64:
-    name: Build & Push Image (arm64)
-    runs-on: ubuntu-24.04-arm
-    needs: [prepare, build_x64]
-    env:
-      REGISTRY_IMAGE_LC: ${{ needs.prepare.outputs.registry_image_lc }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Docker meta (labels only)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY_IMAGE_LC }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix=sha-
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/latest' }}
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build & push (by digest only)
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: ./volume-cartographer
-          file: ./volume-cartographer/ubuntu-24.04-noble.Dockerfile
-          platforms: linux/arm64
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: |
-            type=gha,scope=vc3d-${{ github.ref_name }}
-            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache
-          cache-to: |
-            type=gha,mode=max,scope=vc3d-${{ github.ref_name }}
-            type=registry,ref=${{ env.REGISTRY_IMAGE_LC }}:buildcache,mode=max
-          provenance: true
-          outputs: |
-            type=image,name=${{ env.REGISTRY_IMAGE_LC }},push-by-digest=true,name-canonical=true,push=true
-
-      - name: Export digest
-        run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-linux-arm64
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    name: Merge & Publish Multi-Platform Image
-    runs-on: ubuntu-latest
-    needs: [prepare, build_x64, build_arm64]
-    env:
-      REGISTRY_IMAGE: ${{ needs.prepare.outputs.registry_image_lc }}
-    steps:
-      - name: Install jq
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-      - name: Login to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Docker meta (manifest tags)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY_IMAGE }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=edge,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/latest' }}
-
-      - name: Create manifest list & push tags
-        working-directory: ${{ runner.temp }}/digests
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
-
-      - name: Inspect resulting image
-        run: |
-          docker buildx imagetools inspect "${{ env.REGISTRY_IMAGE }}:${DOCKER_METADATA_OUTPUT_VERSION}"
+      - name: Build and push builder image
+        run: volume-cartographer/scripts/ci.sh publish ${{ matrix.image }}

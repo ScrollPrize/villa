@@ -90,7 +90,7 @@ cmd_builder() {
     if [[ "${VC_BUILDER_FORCE_LOCAL:-0}" != "1" ]]; then
         local owner
         owner=$(echo "${VC_BUILDER_REGISTRY_OWNER:-${GITHUB_REPOSITORY_OWNER:-scrollprize}}" | tr 'A-Z' 'a-z')
-        local remote="ghcr.io/$owner/vc-builder:$image"
+        local remote="ghcr.io/$owner/villa/volume-cartographer:builder-$image"
         if docker pull "$remote" 2>/dev/null; then
             docker tag "$remote" "$local_tag"
             return 0
@@ -124,13 +124,13 @@ cmd_publish() {
     owner=$(echo "${VC_BUILDER_REGISTRY_OWNER:-${GITHUB_REPOSITORY_OWNER:-scrollprize}}" | tr 'A-Z' 'a-z')
     local dockerfile
     dockerfile="$(dockerfile_for "$image")"
-    local remote="ghcr.io/$owner/vc-builder:$image"
+    local repo="ghcr.io/$owner/villa/volume-cartographer"
     local sha=${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}
 
     docker buildx build \
         --target builder \
-        --tag "$remote" \
-        --tag "$remote-$sha" \
+        --tag "$repo:builder-$image" \
+        --tag "$repo:builder-$image-$sha" \
         --file "$dockerfile" \
         --push \
         .
