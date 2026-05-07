@@ -541,9 +541,24 @@ class Model3D(nn.Module):
 			N = int(self.cyl_params.shape[0])
 			if target is None or sampled.grad_mag is None:
 				return torch.full((N,), float("inf"), device=xyz.device, dtype=xyz.dtype)
-			dot = (normals * target).sum(dim=-1).clamp(min=-1.0, max=1.0)
-			lm = 1.0 - dot * dot
+			cyl_xy = normals[..., :2]
+			cyl_xy = cyl_xy / cyl_xy.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
+			target_xy_raw = target[..., :2]
+			target_xy_len = target_xy_raw.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
+			target_xy = target_xy_raw / target_xy_len
+			umb_xy = data.umbilicus_xy_at_z(xyz[..., 2])
+			radial_xy = xyz[..., :2] - umb_xy
+			radial_len = radial_xy.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
+			radial_xy = radial_xy / radial_len
+			target_dot_radial = (target_xy * radial_xy).sum(dim=-1)
+			target_xy = torch.where(target_dot_radial.unsqueeze(-1) < 0.0, -target_xy, target_xy)
+			dot = (cyl_xy * target_xy).sum(dim=-1).clamp(min=-1.0, max=1.0)
+			lm = 1.0 - dot
+			radial_weight = (target_xy * radial_xy).sum(dim=-1).clamp(min=0.0, max=1.0)
+			in_plane_weight = target_xy_raw.norm(dim=-1).clamp(min=0.0, max=1.0)
+			valid_normal = ((target_xy_len.squeeze(-1) > 1.0e-7) & (radial_len.squeeze(-1) > 1.0e-7)).to(dtype=lm.dtype)
 			mask = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=lm.dtype)
+			mask = mask * radial_weight * in_plane_weight * valid_normal
 			lm_c = lm.reshape(N, self.depth, self.mesh_h, self.mesh_w)
 			mask_c = mask.reshape(N, self.depth, self.mesh_h, self.mesh_w)
 			wsum = mask_c.sum(dim=(1, 2, 3))

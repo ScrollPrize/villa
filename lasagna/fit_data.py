@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -250,6 +251,10 @@ class FitData3D:
 	cuda_gridsample: bool = True                  # use custom CUDA uint8 kernel vs PyTorch F.grid_sample
 	sparse_caches: dict | None = None            # group_name -> SparseChunkGroupCache (streaming mode)
 	_vol_size: tuple[int, int, int] | None = None  # fallback size when grad_mag is None
+	umbilicus_points: torch.Tensor | None = None   # (K, 3) x/y/z control points in fullres coords
+	umbilicus_xy_lookup: torch.Tensor | None = None  # (M, 2) x/y sampled every umbilicus_z_step
+	umbilicus_z0: float = 0.0
+	umbilicus_z_step: float = 1000.0
 
 	@property
 	def size(self) -> tuple[int, int, int]:
@@ -271,6 +276,29 @@ class FitData3D:
 		nz = torch.sqrt(torch.clamp(1.0 - nx * nx - ny * ny, min=1e-8))
 		n = torch.stack([nx, ny, nz], dim=-1)  # (D, H, W, 3)
 		return n / (n.norm(dim=-1, keepdim=True) + 1e-8)
+
+	def umbilicus_xy_at_z(self, z_fullres: torch.Tensor) -> torch.Tensor:
+		"""Interpolate required umbilicus xy for arbitrary fullres z coordinates."""
+		if self.umbilicus_xy_lookup is None:
+			raise ValueError("FitData3D missing required umbilicus lookup")
+		with torch.no_grad():
+			z = z_fullres.detach()
+			table = self.umbilicus_xy_lookup.to(device=z.device, dtype=z.dtype)
+			M = int(table.shape[0])
+			if M <= 0:
+				raise ValueError("FitData3D umbilicus lookup is empty")
+			if M == 1:
+				return table[0].expand(*z.shape, 2)
+			step = float(self.umbilicus_z_step)
+			if not math.isfinite(step) or step <= 0.0:
+				raise ValueError(f"invalid umbilicus_z_step={step}")
+			t = ((z - float(self.umbilicus_z0)) / step).clamp(min=0.0, max=float(M - 1))
+			i0 = torch.floor(t).to(dtype=torch.long).clamp(min=0, max=M - 1)
+			i1 = (i0 + 1).clamp(max=M - 1)
+			frac = (t - i0.to(dtype=z.dtype)).unsqueeze(-1)
+			xy0 = table.index_select(0, i0.reshape(-1)).reshape(*z.shape, 2)
+			xy1 = table.index_select(0, i1.reshape(-1)).reshape(*z.shape, 2)
+			return xy0 + frac * (xy1 - xy0)
 
 	def _spacing_for(self, channel: str) -> tuple[float, float, float]:
 		"""Return spacing for a specific channel."""
@@ -380,6 +408,10 @@ class FitData3D:
 			winding_max=self.winding_max,
 			grad_mag_scale=self.grad_mag_scale,
 			cuda_gridsample=self.cuda_gridsample,
+			umbilicus_points=self.umbilicus_points,
+			umbilicus_xy_lookup=self.umbilicus_xy_lookup,
+			umbilicus_z0=self.umbilicus_z0,
+			umbilicus_z_step=self.umbilicus_z_step,
 		)
 
 	def _grid_sample_sparse(
@@ -452,6 +484,10 @@ class FitData3D:
 			winding_max=self.winding_max,
 			grad_mag_scale=self.grad_mag_scale,
 			cuda_gridsample=self.cuda_gridsample,
+			umbilicus_points=self.umbilicus_points,
+			umbilicus_xy_lookup=self.umbilicus_xy_lookup,
+			umbilicus_z0=self.umbilicus_z0,
+			umbilicus_z_step=self.umbilicus_z_step,
 		)
 
 	def _grid_sample_torch(
@@ -498,6 +534,10 @@ class FitData3D:
 			winding_max=self.winding_max,
 			grad_mag_scale=self.grad_mag_scale,
 			cuda_gridsample=self.cuda_gridsample,
+			umbilicus_points=self.umbilicus_points,
+			umbilicus_xy_lookup=self.umbilicus_xy_lookup,
+			umbilicus_z0=self.umbilicus_z0,
+			umbilicus_z_step=self.umbilicus_z_step,
 		)
 
 
@@ -642,6 +682,68 @@ def load_single_channel(
 	t = torch.from_numpy(a).to(device=device, dtype=torch.uint8)
 	sd = float(group.sd_fac) * s2b
 	return t.unsqueeze(0).unsqueeze(0), (sd, sd, sd)
+
+
+def _load_umbilicus_lookup(
+	vol: LasagnaVolume,
+	*,
+	device: torch.device,
+	z_step: float = 1000.0,
+) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+	"""Load umbilicus control points and a fixed-z xy lookup table."""
+	path = vol.umbilicus_abs_path()
+	try:
+		raw = json.loads(path.read_text(encoding="utf-8"))
+	except FileNotFoundError as exc:
+		raise ValueError(f"umbilicus_json not found: {path}") from exc
+	points_raw = raw.get("control_points")
+	if not isinstance(points_raw, list) or not points_raw:
+		raise ValueError(f"umbilicus_json {path} must contain non-empty 'control_points'")
+
+	rows: list[tuple[float, float, float]] = []
+	for i, p in enumerate(points_raw):
+		if not isinstance(p, dict):
+			raise ValueError(f"umbilicus control point {i} must be an object")
+		try:
+			x = float(p["x"])
+			y = float(p["y"])
+			z = float(p["z"])
+		except KeyError as exc:
+			raise ValueError(f"umbilicus control point {i} missing {exc.args[0]!r}") from exc
+		if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+			raise ValueError(f"umbilicus control point {i} has non-finite coordinates")
+		rows.append((x, y, z))
+
+	pts_np = np.asarray(rows, dtype=np.float64)
+	order = np.argsort(pts_np[:, 2], kind="mergesort")
+	pts_np = pts_np[order]
+
+	z_vals = pts_np[:, 2]
+	uniq_z, inv = np.unique(z_vals, return_inverse=True)
+	if uniq_z.shape[0] != z_vals.shape[0]:
+		xy_sum = np.zeros((uniq_z.shape[0], 2), dtype=np.float64)
+		count = np.zeros((uniq_z.shape[0], 1), dtype=np.float64)
+		np.add.at(xy_sum, inv, pts_np[:, :2])
+		np.add.at(count, inv, 1.0)
+		xy_vals = xy_sum / np.maximum(count, 1.0)
+		pts_np = np.concatenate([xy_vals, uniq_z[:, None]], axis=1)
+		z_vals = uniq_z
+
+	if z_step <= 0.0 or not math.isfinite(z_step):
+		raise ValueError(f"invalid umbilicus z_step={z_step}")
+	z0 = math.floor(float(z_vals[0]) / z_step) * z_step
+	z1 = math.ceil(float(z_vals[-1]) / z_step) * z_step
+	count = max(1, int(round((z1 - z0) / z_step)) + 1)
+	z_lookup = z0 + np.arange(count, dtype=np.float64) * z_step
+	x_lookup = np.interp(z_lookup, z_vals, pts_np[:, 0])
+	y_lookup = np.interp(z_lookup, z_vals, pts_np[:, 1])
+	lookup_np = np.stack([x_lookup, y_lookup], axis=1).astype(np.float32)
+
+	points = torch.from_numpy(pts_np.astype(np.float32)).to(device=device)
+	lookup = torch.from_numpy(lookup_np).to(device=device)
+	print(f"[fit_data] umbilicus: {path.name} control_points={points.shape[0]} "
+		  f"lookup={lookup.shape[0]} z0={z0:.0f} step={z_step:.0f}", flush=True)
+	return points, lookup, float(z0), float(z_step)
 
 
 def load_3d_for_model(
@@ -858,6 +960,7 @@ def load_3d(
 	# Higher factor → larger decoded grad_mag values
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
+	umb_pts, umb_lookup, umb_z0, umb_z_step = _load_umbilicus_lookup(vol, device=device)
 
 	# Resolve which channels are available
 	all_ch = vol.all_channels()
@@ -963,6 +1066,10 @@ def load_3d(
 		source_to_base=vol.source_to_base,
 		grad_mag_scale=gmag_enc,
 		cuda_gridsample=cuda_gridsample,
+		umbilicus_points=umb_pts,
+		umbilicus_xy_lookup=umb_lookup,
+		umbilicus_z0=umb_z0,
+		umbilicus_z_step=umb_z_step,
 	)
 
 
@@ -983,6 +1090,7 @@ def load_3d_streaming(
 	vol = LasagnaVolume.load(path)
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
+	umb_pts, umb_lookup, umb_z0, umb_z_step = _load_umbilicus_lookup(vol, device=device)
 	_skip = skip_channels or set()
 	_backend = str(sparse_prefetch_backend)
 	if _backend not in {"tensorstore", "python-zarr"}:
@@ -1084,4 +1192,8 @@ def load_3d_streaming(
 		cuda_gridsample=True,
 		sparse_caches=sparse_caches,
 		_vol_size=vol_size,
+		umbilicus_points=umb_pts,
+		umbilicus_xy_lookup=umb_lookup,
+		umbilicus_z0=umb_z0,
+		umbilicus_z_step=umb_z_step,
 	)
