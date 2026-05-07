@@ -5,17 +5,11 @@ import numpy as np
 
 def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Populate default config values for the row/col conditioning dataset."""
-    config.setdefault("dilation_radius", 1)  # voxels
     config.setdefault("cond_percent", [0.1, 0.5])
-    config.setdefault("use_dense_displacement", True)
     config.setdefault("use_trace_ode_targets", True)
     config.setdefault("lambda_velocity_dir", 0.1)
-    config.setdefault("velocity_target_mode", "away_from_conditioning")
-    config.setdefault("velocity_target_region", "full")
-    config.setdefault("trace_target_mode", "away_from_conditioning")
-    config.setdefault("trace_target_region", "full")
     config.setdefault("trace_target_dilation_radius", 1.0)
-    config.setdefault("surface_attract_target_mode", "dense_edt")
+    config.setdefault("surface_attract_target_mode", "trace_band")
     config.setdefault("trace_surface_attract_radius", 0.0)
     config.setdefault("use_neighbor_sheet_context", False)
     config.setdefault("neighbor_sheet_required", False)
@@ -91,25 +85,13 @@ def _require_finite_range(
 def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Validate row/col conditioning dataset config invariants."""
     sample_mode = str(config.get("sample_mode", "wrap")).lower()
-    _require_choice("sample_mode", sample_mode, {"wrap", "chunk"})
-
-    velocity_target_mode = str(config.get("velocity_target_mode", "away_from_conditioning")).lower()
-    _require_choice("velocity_target_mode", velocity_target_mode, {"away_from_conditioning"})
-
-    velocity_target_region = str(config.get("velocity_target_region", "full")).lower()
-    _require_choice("velocity_target_region", velocity_target_region, {"full", "conditioning", "hidden"})
-
-    trace_target_mode = str(config.get("trace_target_mode", "away_from_conditioning")).lower()
-    _require_choice("trace_target_mode", trace_target_mode, {"away_from_conditioning"})
-
-    trace_target_region = str(config.get("trace_target_region", "full")).lower()
-    _require_choice("trace_target_region", trace_target_region, {"full", "conditioning", "hidden"})
+    _require_choice("sample_mode", sample_mode, {"wrap"})
 
     trace_target_dilation_radius = float(config.get("trace_target_dilation_radius", 1.0))
     _require_finite_range("trace_target_dilation_radius", trace_target_dilation_radius, min_value=0.0)
 
-    surface_attract_target_mode = str(config.get("surface_attract_target_mode", "dense_edt")).lower()
-    _require_choice("surface_attract_target_mode", surface_attract_target_mode, {"dense_edt", "trace_band"})
+    surface_attract_target_mode = str(config.get("surface_attract_target_mode", "trace_band")).lower()
+    _require_choice("surface_attract_target_mode", surface_attract_target_mode, {"trace_band"})
 
     trace_surface_attract_radius = float(config.get("trace_surface_attract_radius", 0.0))
     _require_finite_range("trace_surface_attract_radius", trace_surface_attract_radius, min_value=0.0)
@@ -129,14 +111,8 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
     trace_validity_pos_weight = float(config.get("trace_validity_pos_weight", 1.0))
     _require_finite_range("trace_validity_pos_weight", trace_validity_pos_weight, min_value=0.0)
 
-    use_dense_displacement = bool(config.get("use_dense_displacement", False))
     use_trace_ode_targets = bool(config.get("use_trace_ode_targets", False))
 
-    if not use_dense_displacement:
-        raise ValueError(
-            "Regular split no longer supports sparse supervision; "
-            "set use_dense_displacement=True."
-        )
     if not use_trace_ode_targets:
         raise ValueError("rowcol_cond requires use_trace_ode_targets=True")
 
@@ -151,5 +127,3 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
             "rowcol_cond has been consolidated to the active dense trace-ODE split path; "
             f"unsupported options enabled: {enabled_unsupported}"
         )
-    if sample_mode != "wrap":
-        raise ValueError("rowcol_cond requires sample_mode='wrap'")

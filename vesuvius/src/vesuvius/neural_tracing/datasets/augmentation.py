@@ -65,7 +65,6 @@ def augment_split_payload(
     crop_size,
     vol_crop: torch.Tensor,
     masked_seg: torch.Tensor,
-    other_wraps_tensor: torch.Tensor,
     cond_seg_gt: torch.Tensor,
     cond_surface_local,
     cond_surface_keypoints: torch.Tensor | None,
@@ -81,15 +80,14 @@ def augment_split_payload(
         return {
             "vol_crop": vol_crop,
             "masked_seg": masked_seg,
-            "other_wraps_tensor": other_wraps_tensor,
             "cond_seg_gt": cond_seg_gt,
             "cond_surface_local": cond_surface_local,
             "masked_surface_local": masked_surface_local,
             "neighbor_seg_tensor": neighbor_seg_tensor,
         }
 
-    seg_tensors = [masked_seg, other_wraps_tensor, cond_seg_gt]
-    seg_keys = ["masked_seg", "other_wraps_tensor", "cond_seg_gt"]
+    seg_tensors = [masked_seg, cond_seg_gt]
+    seg_keys = ["masked_seg", "cond_seg_gt"]
     if neighbor_seg_tensor is not None:
         seg_tensors.append(neighbor_seg_tensor)
         seg_keys.append("neighbor_seg_tensor")
@@ -143,7 +141,6 @@ def augment_split_payload(
     return {
         "vol_crop": vol_crop,
         "masked_seg": unpacked["masked_seg"],
-        "other_wraps_tensor": unpacked["other_wraps_tensor"],
         "cond_seg_gt": unpacked["cond_seg_gt"],
         "cond_surface_local": cond_surface_local,
         "masked_surface_local": masked_surface_local,

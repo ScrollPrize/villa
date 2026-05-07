@@ -1,4 +1,3 @@
-import zarr
 import vesuvius.tifxyz as tifxyz
 import numpy as np
 import torch
@@ -18,7 +17,6 @@ from vesuvius.neural_tracing.datasets.common import (
     _triplet_wraps_compatible,
     _upsample_world_triplet,
     _validate_result_tensors,
-    edt_dilate_binary_mask,
     open_zarr_group,
     voxelize_surface_grid,
 )
@@ -209,10 +207,6 @@ class EdtSegDataset(Dataset):
         return len(self.sample_index)
 
     def _build_sample_index(self):
-        if self.sample_mode == 'chunk':
-            return [(patch_idx, None) for patch_idx in range(len(self.patches))]
-
-        # wrap mode: each (chunk, wrap) pair is a unique dataset sample
         sample_index = []
         for patch_idx, patch in enumerate(self.patches):
             for wrap_idx in range(len(patch.wraps)):
@@ -420,13 +414,6 @@ class EdtSegDataset(Dataset):
         conditioning = create_split_conditioning(self, idx, patch_idx, wrap_idx, patch)
         if conditioning is None:
             return None
-        wrap = conditioning["wrap"]
-        seg = conditioning["seg"]
-        r_min = conditioning["r_min"]
-        r_max = conditioning["r_max"]
-        c_min = conditioning["c_min"]
-        c_max = conditioning["c_max"]
-        conditioning_percent = conditioning["conditioning_percent"]
         cond_direction = conditioning["cond_direction"]
         cond_zyxs_unperturbed = conditioning["cond_zyxs_unperturbed"]
         masked_zyxs = conditioning["masked_zyxs"]
@@ -456,19 +443,6 @@ class EdtSegDataset(Dataset):
 
         cond_segmentation_gt_raw = cond_segmentation_gt.copy()
 
-        # add thickness to conditioning segmentation via dilation
-        use_dilation = self.config.get('use_dilation', False)
-        if use_dilation:
-            dilation_radius = self.config['dilation_radius']
-            cond_segmentation = edt_dilate_binary_mask(
-                cond_segmentation_gt > 0.5,
-                dilation_radius,
-            ).astype(np.float32, copy=False)
-        else:
-            cond_segmentation = cond_segmentation_gt
-
-        other_wraps_vox = np.zeros(crop_shape, dtype=np.float32)
-
         neighbor_segmentation = None
         if self.use_neighbor_sheet_context:
             neighbor_segmentation = self._build_neighbor_sheet_mask(
@@ -484,7 +458,6 @@ class EdtSegDataset(Dataset):
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
             "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
             "cond_gt": torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32),
-            "other_wraps": torch.from_numpy(other_wraps_vox).to(torch.float32),
             "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float).to(torch.float32),
             "masked_surface_local": torch.from_numpy(masked_zyxs_local_float).to(torch.float32),
             "cond_direction": cond_direction,
@@ -574,7 +547,6 @@ class EdtSegDataset(Dataset):
         masked_seg = mask_bundle["masked_seg"]
         cond_seg_gt = mask_bundle["cond_gt"]
         cond_direction = mask_bundle["cond_direction"]
-        other_wraps_tensor = mask_bundle["other_wraps"]
         neighbor_seg_tensor = mask_bundle.get("neighbor_seg", None)
         cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
             _prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
@@ -604,7 +576,6 @@ class EdtSegDataset(Dataset):
             crop_size=self.crop_size,
             vol_crop=vol_crop,
             masked_seg=masked_seg,
-            other_wraps_tensor=other_wraps_tensor,
             cond_seg_gt=cond_seg_gt,
             cond_surface_local=cond_surface_local,
             cond_surface_keypoints=cond_surface_keypoints,

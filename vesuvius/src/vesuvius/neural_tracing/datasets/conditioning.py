@@ -38,8 +38,7 @@ def create_centered_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: in
 def create_split_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, patch):
     _ = idx
     crop_size = dataset.crop_size
-    # in wrap mode, use the indexed wrap; in chunk mode, choose randomly (legacy behavior)
-    wrap = patch.wraps[wrap_idx] if wrap_idx is not None else random.choice(patch.wraps)
+    wrap = patch.wraps[wrap_idx]
     seg = wrap["segment"]
     r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
@@ -124,12 +123,6 @@ def create_split_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, 
 
     return {
         "wrap": wrap,
-        "seg": seg,
-        "r_min": r_min,
-        "r_max": r_max,
-        "c_min": c_min,
-        "c_max": c_max,
-        "conditioning_percent": conditioning_percent,
         "cond_direction": cond_direction,
         "cond_zyxs_unperturbed": cond_zyxs_unperturbed,
         "masked_zyxs": masked_zyxs,
