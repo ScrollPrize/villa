@@ -144,8 +144,8 @@ def _parse_opt_settings(
 	if "cyl_params" in params:
 		if params != ["cyl_params"]:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
-		if float(eff.get("cyl_normal", 0.0)) == 0.0:
-			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires nonzero cyl_normal")
+		if float(eff.get("cyl_normal", 0.0)) == 0.0 and float(eff.get("cyl_center", 0.0)) == 0.0:
+			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	return OptSettings(
 		steps=steps,
 		lr=lr,
