@@ -118,6 +118,7 @@ struct ThreadSliceStats {
 
 struct ThreadScratch {
     std::vector<std::vector<cv::Point>> traces;
+    ThinningScratch thinning;
 };
 
 // Anonymous-mmap'd buffer. Linux guarantees fresh pages read as zero (the
@@ -1150,7 +1151,7 @@ void run_generate(const po::variables_map& vm) {
                     scratch.traces.clear();
                     const auto thinning_start = std::chrono::steady_clock::now();
                     ThinningStats thinning_stats;
-                    customThinningTraceOnly(assembled.binarySlice, scratch.traces, &thinning_stats);
+                    customThinningTraceOnly(assembled.binarySlice, scratch.traces, &thinning_stats, scratch.thinning);
                     const double thinning_seconds = seconds_since(thinning_start);
                     record_timing(local_stats, "thinning", thinning_seconds);
                     local_stats.thinningStats.accumulate(thinning_stats);

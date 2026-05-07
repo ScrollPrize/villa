@@ -58,9 +58,12 @@ struct TraceResult {
     uint64_t candidateEvaluations = 0;
 };
 
-static void nonMaximumSuppression(const cv::Mat& src, cv::Mat& dst, int size)
+// Reuses `dilated` as scratch so callers can keep the buffer across
+// calls; avoids the per-call slice-sized cv::Mat allocation that NMS
+// would otherwise do on every customThinning invocation.
+static void nonMaximumSuppression(const cv::Mat& src, cv::Mat& dst,
+                                  cv::Mat& dilated, int size)
 {
-    cv::Mat dilated;
     cv::dilate(src, dilated, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(size, size)));
     cv::compare(src, dilated, dst, cv::CMP_EQ);
 }
@@ -161,7 +164,8 @@ static void customThinningImpl(
     const cv::Mat& inputImage,
     cv::Mat* outputImage,
     std::vector<std::vector<cv::Point>>* traces,
-    ThinningStats* stats)
+    ThinningStats* stats,
+    ThinningScratch& scratch)
 {
     if (inputImage.empty() || inputImage.type() != CV_8UC1) {
         if (outputImage != nullptr) {
@@ -176,43 +180,44 @@ static void customThinningImpl(
     ThinningStats localStats;
 
     const auto dtStart = std::chrono::steady_clock::now();
-    cv::Mat distTransform;
-    cv::distanceTransform(inputImage, distTransform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
-    CV_Assert(distTransform.type() == CV_8U);
+    // Mat::create is a no-op when the existing buffer already matches
+    // size+type, so passing scratch.* as out-params keeps the same
+    // backing storage across calls — opencv writes into it instead of
+    // mmapping a fresh slice-sized buffer per call.
+    cv::distanceTransform(inputImage, scratch.distTransform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
+    CV_Assert(scratch.distTransform.type() == CV_8U);
     localStats.distanceTransformSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - dtStart).count();
 
     const auto seedStart = std::chrono::steady_clock::now();
-    cv::Mat localMaxima;
-    nonMaximumSuppression(distTransform, localMaxima, 3);
+    nonMaximumSuppression(scratch.distTransform, scratch.localMaxima, scratch.dilated, 3);
 
-    cv::Mat seeds;
-    cv::bitwise_and(localMaxima, inputImage, seeds);
+    cv::bitwise_and(scratch.localMaxima, inputImage, scratch.seeds);
 
-    std::vector<cv::Point> seedPoints;
-    cv::findNonZero(seeds, seedPoints);
-    localStats.seedCount = seedPoints.size();
+    cv::findNonZero(scratch.seeds, scratch.seedPoints);
+    localStats.seedCount = scratch.seedPoints.size();
     localStats.seedDetectionSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - seedStart).count();
 
     cv::Mat visited;
     if (outputImage != nullptr) {
-        *outputImage = cv::Mat::zeros(inputImage.size(), CV_8UC1);
+        outputImage->create(inputImage.size(), CV_8UC1);
+        outputImage->setTo(0);
         visited = *outputImage;
     } else {
-        visited = cv::Mat::zeros(inputImage.size(), CV_8UC1);
+        scratch.visited.create(inputImage.size(), CV_8UC1);
+        scratch.visited.setTo(0);
+        visited = scratch.visited;
     }
 
     if (traces != nullptr) {
         traces->clear();
-        traces->reserve(seedPoints.size());
+        traces->reserve(scratch.seedPoints.size());
     }
 
     const auto traceStart = std::chrono::steady_clock::now();
-    std::vector<cv::Point> firstPath;
-    std::vector<cv::Point> secondPath;
 
-    for (const auto& seed : seedPoints) {
+    for (const auto& seed : scratch.seedPoints) {
         auto* visitedRow = visited.ptr<uint8_t>(seed.y);
         if (visitedRow[seed.x] != 0) {
             continue;
@@ -223,7 +228,7 @@ static void customThinningImpl(
 
         if (traces != nullptr) {
             const auto firstResult = tracePath<true>(
-                seed, distTransform, visited, outputImage, initialHistory, seed, &firstPath);
+                seed, scratch.distTransform, visited, outputImage, initialHistory, seed, &scratch.firstPath);
             localStats.traceSteps += firstResult.steps;
             localStats.candidateEvaluations += firstResult.candidateEvaluations;
 
@@ -232,23 +237,26 @@ static void customThinningImpl(
                 secondHistory.push_back(firstResult.secondPoint);
             }
             const auto secondResult = tracePath<true>(
-                seed, distTransform, visited, outputImage, secondHistory, seed, &secondPath);
+                seed, scratch.distTransform, visited, outputImage, secondHistory, seed, &scratch.secondPath);
             localStats.traceSteps += secondResult.steps;
             localStats.candidateEvaluations += secondResult.candidateEvaluations;
 
-            std::vector<cv::Point> fullTrace;
-            fullTrace.reserve(secondPath.size() + firstPath.size() - (firstPath.empty() ? 0 : 1));
-            fullTrace.insert(fullTrace.end(), secondPath.rbegin(), secondPath.rend());
-            if (!firstPath.empty()) {
-                fullTrace.insert(fullTrace.end(), firstPath.begin() + 1, firstPath.end());
+            // Build fullTrace directly inside traces' next slot to skip
+            // the fullTrace→traces move/copy step entirely.
+            auto& dst = traces->emplace_back();
+            dst.reserve(scratch.secondPath.size() + scratch.firstPath.size() - (scratch.firstPath.empty() ? 0 : 1));
+            dst.insert(dst.end(), scratch.secondPath.rbegin(), scratch.secondPath.rend());
+            if (!scratch.firstPath.empty()) {
+                dst.insert(dst.end(), scratch.firstPath.begin() + 1, scratch.firstPath.end());
             }
-            if (!fullTrace.empty()) {
-                traces->push_back(std::move(fullTrace));
+            if (dst.empty()) {
+                traces->pop_back();
+            } else {
                 ++localStats.traceCount;
             }
         } else {
             const auto firstResult = tracePath<false>(
-                seed, distTransform, visited, outputImage, initialHistory, seed, nullptr);
+                seed, scratch.distTransform, visited, outputImage, initialHistory, seed, nullptr);
             localStats.traceSteps += firstResult.steps;
             localStats.candidateEvaluations += firstResult.candidateEvaluations;
 
@@ -257,7 +265,7 @@ static void customThinningImpl(
                 secondHistory.push_back(firstResult.secondPoint);
             }
             const auto secondResult = tracePath<false>(
-                seed, distTransform, visited, outputImage, secondHistory, seed, nullptr);
+                seed, scratch.distTransform, visited, outputImage, secondHistory, seed, nullptr);
             localStats.traceSteps += secondResult.steps;
             localStats.candidateEvaluations += secondResult.candidateEvaluations;
         }
@@ -285,12 +293,22 @@ void customThinning(const cv::Mat& inputImage,
                     std::vector<std::vector<cv::Point>>* traces,
                     ThinningStats* stats)
 {
-    customThinningImpl(inputImage, &outputImage, traces, stats);
+    ThinningScratch scratch;
+    customThinningImpl(inputImage, &outputImage, traces, stats, scratch);
 }
 
 void customThinningTraceOnly(const cv::Mat& inputImage,
                              std::vector<std::vector<cv::Point>>& traces,
                              ThinningStats* stats)
 {
-    customThinningImpl(inputImage, nullptr, &traces, stats);
+    ThinningScratch scratch;
+    customThinningImpl(inputImage, nullptr, &traces, stats, scratch);
+}
+
+void customThinningTraceOnly(const cv::Mat& inputImage,
+                             std::vector<std::vector<cv::Point>>& traces,
+                             ThinningStats* stats,
+                             ThinningScratch& scratch)
+{
+    customThinningImpl(inputImage, nullptr, &traces, stats, scratch);
 }
