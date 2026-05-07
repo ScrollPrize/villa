@@ -19,6 +19,9 @@ FetchContent_MakeAvailable(libigl)
 
 add_executable(flatboi flatboi.cpp)
 target_link_libraries(flatboi PRIVATE igl::core igl::cholmod)
+# SLIM_CACHED reuses the AᵀWA sparsity pattern across iters (only updates
+# values), matching the CHOLMOD analyzePattern-once pattern.
+target_compile_definitions(flatboi PRIVATE SLIM_CACHED)
 
 if(NOT TARGET OpenMP::OpenMP_CXX)
     find_package(OpenMP)

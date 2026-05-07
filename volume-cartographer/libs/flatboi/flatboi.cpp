@@ -34,6 +34,11 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <thread>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace fs = std::filesystem;
 
 // ------------------------------
@@ -311,6 +316,8 @@ private:
 struct Flatboi {
   std::string input_obj;
   int max_iter = 50;
+  // Relative-energy convergence tolerance; <=0 disables early-stop.
+  double conv_tol = 1e-5;
   igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
   Eigen::MatrixXd V;          // #V x 3
   Eigen::MatrixXi F;          // #F x 3
@@ -482,7 +489,9 @@ struct Flatboi {
 
     std::cout << "PROGRESS 0/" << max_iter << std::endl;
 
+    int iters_run = max_iter;
     for (int it = 0; it < max_iter; ++it) {
+      const double E_prev = energies.back();
       igl::slim_solve(data, 1);
       energies.push_back(data.energy);
       std::cout << "[it " << (it+1) << "] E = " << data.energy << std::endl; // flush
@@ -497,6 +506,19 @@ struct Flatboi {
                   << ", AreaErr=" << area << "\n";
         if (wblog) wblog->log_stretch(l2m,l2med,linf,area, /*step=*/it+1);
       }
+
+      // Relative-energy convergence stop. Skip iter 0 (E_prev is the
+      // pre-solve energy and the first iter usually drops a lot).
+      if (conv_tol > 0.0 && it >= 1 && E_prev > 0.0) {
+        const double rel = (E_prev - data.energy) / E_prev;
+        if (rel >= 0.0 && rel < conv_tol) {
+          std::cout << "Converged: ΔE/E = " << rel
+                    << " < tol=" << conv_tol
+                    << " at iter " << (it+1) << "/" << max_iter << "\n";
+          iters_run = it + 1;
+          break;
+        }
+      }
     }
 
     auto [l2m_f, l2med_f, linf_f, area_f] = stretch_metrics(data.V_o.leftCols<2>());
@@ -504,8 +526,8 @@ struct Flatboi {
               << ", L2(median): " << l2med_f
               << ", Linf: " << linf_f
               << ", Area Error: " << area_f << "\n";
-    if (wblog && (max_iter % 20) != 0) {
-      wblog->log_stretch(l2m_f, l2med_f, linf_f, area_f, /*step=*/max_iter);
+    if (wblog && (iters_run % 20) != 0) {
+      wblog->log_stretch(l2m_f, l2med_f, linf_f, area_f, /*step=*/iters_run);
     }
 
     return { data.V_o.leftCols<2>(), energies };
@@ -862,29 +884,45 @@ static void save_energies(const fs::path& input, const std::vector<double>& E) {
 // main
 // ------------------------------
 int main(int argc, char** argv) {
-  if (argc < 3 || argc > 4) {
-    std::cerr << "Usage: " << argv[0] << " <mesh.obj> <iters> [energy]\n"
-              << "  energy (optional): symmetric_dirichlet (default) or conformal\n";
-    return 1;
+  // Usage: flatboi <mesh.obj> [iters] [energy] [--tol=<x>]
+  // - iters defaults to 50 (early-stop usually halts well before that)
+  // - --tol relative-energy convergence threshold (default 1e-5; pass 0 to disable)
+  std::string obj_path;
+  int iters = 50;
+  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
+  std::string energy_label = "symmetric_dirichlet";
+  double conv_tol = 1e-5;
+
+  auto print_usage = [&]() {
+    std::cerr << "Usage: " << argv[0] << " <mesh.obj> [iters=50] [energy] [--tol=<x>]\n"
+              << "  energy (optional): symmetric_dirichlet (default) or conformal\n"
+              << "  --tol=<x>         relative-energy early-stop threshold (default 1e-5; 0 disables)\n";
+  };
+
+  std::vector<std::string> positional;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a.rfind("--tol=", 0) == 0) {
+      conv_tol = std::atof(a.c_str() + 6);
+    } else if (a == "--help" || a == "-h") {
+      print_usage();
+      return 0;
+    } else {
+      positional.push_back(std::move(a));
+    }
   }
 
-  const std::string obj_path = argv[1];
-  const int iters = std::atoi(argv[2]);
+  if (positional.empty() || positional.size() > 3) { print_usage(); return 1; }
+  obj_path = positional[0];
+  if (positional.size() >= 2) iters = std::atoi(positional[1].c_str());
   if (iters <= 0) { std::cerr << "iters must be > 0\n"; return 1; }
   if (!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
   if (fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
 
-  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
-  std::string energy_label = "symmetric_dirichlet";
-
-  if (argc == 4) {
-    std::string e = argv[3];
-    std::string e_lower = e;
-    std::transform(
-      e_lower.begin(), e_lower.end(), e_lower.begin(),
-      [](unsigned char c){ return static_cast<char>(std::tolower(c)); }
-    );
-
+  if (positional.size() == 3) {
+    std::string e_lower = positional[2];
+    std::transform(e_lower.begin(), e_lower.end(), e_lower.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
     if (e_lower == "symmetric_dirichlet" || e_lower == "symmetric-dirichlet" || e_lower == "sd") {
       energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
       energy_label = "symmetric_dirichlet";
@@ -892,19 +930,33 @@ int main(int argc, char** argv) {
       energy = igl::MappingEnergyType::CONFORMAL;
       energy_label = "conformal";
     } else {
-      std::cerr << "Unknown energy type '" << e
+      std::cerr << "Unknown energy type '" << positional[2]
                 << "'. Supported: symmetric_dirichlet, conformal\n";
       return 1;
     }
   }
 
-  std::cout << "Using SLIM energy: " << energy_label << "\n";
+  std::cout << "Using SLIM energy: " << energy_label
+            << "  (max_iter=" << iters
+            << ", tol=" << conv_tol << ")\n";
 
   std::ios::sync_with_stdio(false);
   std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
-  
+
+  // BLAS thread budget. OpenBLAS on tiny problems is faster single-threaded
+  // (thread spawn/join dominates), and on huge ones starts contending with
+  // the OS scheduler past hardware-concurrency. Use hardware_concurrency as
+  // the upper bound; let users override via OMP_NUM_THREADS / OPENBLAS_NUM_THREADS.
+#ifdef _OPENMP
+  if (!std::getenv("OMP_NUM_THREADS")) {
+    const unsigned n = std::max(1u, std::thread::hardware_concurrency());
+    omp_set_num_threads(static_cast<int>(n));
+  }
+#endif
+
   try {
     Flatboi fb(obj_path, iters, energy);
+    fb.conv_tol = conv_tol;
 
     WBLogger wblog(obj_path, iters); // optional; becomes no-op if unavailable
 
