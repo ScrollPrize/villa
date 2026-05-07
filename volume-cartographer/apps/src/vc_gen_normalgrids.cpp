@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <limits>
 #include <cstdio>
+#include <new>
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <arpa/inet.h>
+#include <sys/mman.h>
 
 #include <omp.h>
 
@@ -118,10 +120,61 @@ struct ThreadScratch {
     std::vector<std::vector<cv::Point>> traces;
 };
 
+// Anonymous-mmap'd buffer. Linux guarantees fresh pages read as zero (the
+// kernel maps a single shared read-only zero page COW until first write),
+// so the buffer is zero-initialised without an eager memset/touch pass.
+// Pages only become resident on first write — for partly-populated slices
+// the unwritten regions never cost a page-fault or a physical page.
+struct AnonMmap {
+    AnonMmap() = default;
+    explicit AnonMmap(size_t bytes) : bytes_(bytes) {
+        if (bytes_ == 0) return;
+        ptr_ = ::mmap(nullptr, bytes_, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr_ == MAP_FAILED) {
+            ptr_ = nullptr;
+            bytes_ = 0;
+            throw std::bad_alloc();
+        }
+    }
+    AnonMmap(const AnonMmap&) = delete;
+    AnonMmap& operator=(const AnonMmap&) = delete;
+    AnonMmap(AnonMmap&& other) noexcept
+        : ptr_(other.ptr_), bytes_(other.bytes_)
+    {
+        other.ptr_ = nullptr;
+        other.bytes_ = 0;
+    }
+    AnonMmap& operator=(AnonMmap&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ptr_ = other.ptr_;
+            bytes_ = other.bytes_;
+            other.ptr_ = nullptr;
+            other.bytes_ = 0;
+        }
+        return *this;
+    }
+    ~AnonMmap() { reset(); }
+    void reset() {
+        if (ptr_) {
+            ::munmap(ptr_, bytes_);
+        }
+        ptr_ = nullptr;
+        bytes_ = 0;
+    }
+    void* data() const { return ptr_; }
+    size_t bytes() const { return bytes_; }
+private:
+    void* ptr_ = nullptr;
+    size_t bytes_ = 0;
+};
+
 struct AssembledSlice {
     SliceTask task;
     size_t localSliceIndex = 0;
-    cv::Mat binarySlice;
+    AnonMmap binaryBuffer;     // owns the mmap; lifetime ≥ binarySlice
+    cv::Mat binarySlice;       // non-owning view over binaryBuffer.data()
     bool anyNonZero = false;
 };
 
@@ -1008,7 +1061,11 @@ void run_generate(const po::variables_map& vm) {
                     auto& assembled = assembled_slices.emplace_back();
                     assembled.task = task;
                     assembled.localSliceIndex = sampled.localSliceIndex;
-                    assembled.binarySlice = cv::Mat::zeros(slice_size, CV_8U);
+                    const size_t slice_bytes = static_cast<size_t>(slice_size.width) *
+                                               static_cast<size_t>(slice_size.height);
+                    assembled.binaryBuffer = AnonMmap(slice_bytes);
+                    assembled.binarySlice = cv::Mat(slice_size, CV_8U,
+                                                    assembled.binaryBuffer.data());
                 }
                 const double prep_seconds = seconds_since(prep_start);
 
