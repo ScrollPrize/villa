@@ -18,7 +18,7 @@ def create_split_conditioning(dataset, patch_idx: int, wrap_idx: int, patch):
     if r_max < r_min or c_max < c_min:
         return None
 
-    surface_zyx = dataset._extract_wrap_world_surface(patch, wrap, require_all_valid=True)
+    surface_zyx = dataset._extract_wrap_world_surface(patch, wrap)
     if surface_zyx is None:
         return None
 

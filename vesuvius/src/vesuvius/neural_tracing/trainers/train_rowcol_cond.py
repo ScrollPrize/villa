@@ -16,7 +16,6 @@ import accelerate
 import numpy as np
 import torch.nn.functional as F
 from tqdm import tqdm
-import time
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.datasets.dataset_defaults import (
@@ -38,7 +37,6 @@ from vesuvius.neural_tracing.nets.models import make_model
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
     make_dense_visualization,
 )
-from accelerate.utils import TorchDynamoPlugin
 
 import multiprocessing
 
@@ -331,13 +329,8 @@ def train(config_path):
     config.setdefault('val_batches_per_log', 4)
     config.setdefault('log_at_step_zero', False)
     config.setdefault('ckpt_at_step_zero', False)
-    config.setdefault('use_accelerate_dynamo', False)
     config.setdefault('wandb_resume', False)
     config.setdefault('wandb_resume_mode', 'allow')
-    config.setdefault('profile_data_time', False)
-    config.setdefault('profile_step_time', False)
-    config.setdefault('profile_first_iteration', True)
-    config.setdefault('profile_log_every', 100)
     config.setdefault('compile_model', True)
     config.setdefault('separate_eager_eval_for_logging', True)
 
@@ -355,16 +348,6 @@ def train(config_path):
     torch.manual_seed(config['seed'])
     torch.cuda.manual_seed_all(config['seed'])
 
-    dynamo_plugin = None
-    if config.get('use_accelerate_dynamo', False):
-        dynamo_plugin = TorchDynamoPlugin(
-            backend="inductor",
-            mode="default",
-            fullgraph=False,
-            dynamic=False,
-            use_regional_compilation=False,
-        )
-
     dataloader_config = accelerate.DataLoaderConfiguration(
         non_blocking=bool(config.get('non_blocking', True))
     )
@@ -372,7 +355,6 @@ def train(config_path):
     accelerator = accelerate.Accelerator(
         mixed_precision=config.get('mixed_precision', 'no'),
         gradient_accumulation_steps=config.get('grad_acc_steps', 1),
-        dynamo_plugin=dynamo_plugin,
         dataloader_config=dataloader_config,
     )
 
@@ -723,11 +705,7 @@ def train(config_path):
         accelerator.print("\n=== Trace ODE Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
         accelerator.print("Growth direction channels: True")
-        output_heads = []
-        output_heads.append("velocity_dir (3ch)")
-        output_heads.append("surface_attract (3ch)")
-        output_heads.append("trace_validity (1ch)")
-        accelerator.print("Output: " + " + ".join(output_heads))
+        accelerator.print("Output: velocity_dir (3ch) + surface_attract (3ch) + trace_validity (1ch)")
         accelerator.print(
             f"Velocity direction loss: lambda={lambda_velocity_dir}, "
             f"dilation={config.get('trace_target_dilation_radius')}"
@@ -765,10 +743,6 @@ def train(config_path):
     val_iterator = iter(val_dataloader)
     train_iterator = iter(train_dataloader)
     grad_clip = config['grad_clip']
-    profile_data_time = bool(config.get('profile_data_time', False))
-    profile_step_time = bool(config.get('profile_step_time', False))
-    profile_first_iteration = bool(config.get('profile_first_iteration', True))
-    profile_log_every = max(1, int(config.get('profile_log_every', 100)))
 
     progress_bar = tqdm(
         total=config['num_iterations'],
@@ -779,53 +753,27 @@ def train(config_path):
     for iteration in range(start_iteration, config['num_iterations']):
         if config['verbose']:
             accelerator.print(f"starting iteration {iteration}")
-        first_iter_profile = profile_first_iteration and iteration == start_iteration
-        iter_profile_t0 = time.perf_counter()
-        last_profile_t = iter_profile_t0
-
-        def _mark_first_iter(stage):
-            nonlocal last_profile_t
-            if not first_iter_profile:
-                return
-            if accelerator.device.type == 'cuda':
-                torch.cuda.synchronize(accelerator.device)
-            now = time.perf_counter()
-            print(
-                f"[rank {accelerator.process_index}/{accelerator.num_processes} "
-                f"device={accelerator.device}] "
-                f"[iter {iteration} timing] {stage}: "
-                f"+{now - last_profile_t:.3f}s, total={now - iter_profile_t0:.3f}s",
-                flush=True,
-            )
-            last_profile_t = now
-
         should_log_this_iteration = (
             (iteration > 0 or config.get('log_at_step_zero', False))
             and iteration % config['log_frequency'] == 0
         )
-        data_wait_start = time.perf_counter()
         try:
             batch = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_dataloader)
             batch = next(train_iterator)
-        data_wait_time = time.perf_counter() - data_wait_start
-        _mark_first_iter("data batch ready")
-        step_start_time = time.perf_counter()
 
         if config['verbose']:
             accelerator.print(f"got batch, keys: {batch.keys()}")
 
         build_velocity_targets_on_device(batch)
         inputs, velocity_dir_target, velocity_loss_weight, trace_loss_weight, trace_validity_target, trace_validity_weight, surface_attract_target, surface_attract_weight = prepare_batch(batch)
-        _mark_first_iter("batch prepared")
 
         wandb_log = {}
 
         with accelerator.accumulate(model):
             # Forward pass
             output = model(inputs)
-            _mark_first_iter("forward complete")
             grad_norm = None
             total_loss = _zero_loss_from_output(output)
 
@@ -889,7 +837,6 @@ def train(config_path):
 
             do_optimizer_step = True
             accelerator.backward(total_loss)
-            _mark_first_iter("backward complete")
             if accelerator.sync_gradients:
                 grad_norm = accelerator.clip_grad_norm_(model.parameters(), grad_clip)
                 grad_norm_value = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
@@ -904,18 +851,11 @@ def train(config_path):
                 optimizer.step()
                 lr_scheduler.step()
             optimizer.zero_grad()
-            _mark_first_iter("optimizer step complete")
-        step_compute_time = time.perf_counter() - step_start_time
 
         wandb_log['loss'] = total_loss.detach().item()
         wandb_log['current_lr'] = optimizer.param_groups[0]['lr']
         if grad_norm is not None:
             wandb_log['grad_norm'] = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
-        if (iteration % profile_log_every) == 0:
-            if profile_data_time:
-                wandb_log['data_wait_time'] = data_wait_time
-            if profile_step_time:
-                wandb_log['step_compute_time'] = step_compute_time
 
         postfix = {
             'loss': f"{wandb_log['loss']:.4f}",
@@ -1043,11 +983,6 @@ def train(config_path):
                             'surface_attract_pred': val_output.get('surface_attract'),
                             'surface_attract_target': val_surface_attract_target,
                             'surface_attract_weight': val_surface_attract_weight,
-                            'can_visualize_trace': (
-                                val_velocity_dir_target is not None
-                                or val_trace_validity_target is not None
-                                or val_surface_attract_target is not None
-                            ),
                         }
 
                 for key, value in val_metric_sums.items():
@@ -1060,16 +995,7 @@ def train(config_path):
                 train_velocity_dir_pred = output.get('velocity_dir')
                 train_trace_validity_pred = output.get('trace_validity')
                 train_surface_attract_pred = output.get('surface_attract')
-                train_can_visualize_trace = (
-                    velocity_dir_target is not None
-                    or trace_validity_target is not None
-                    or surface_attract_target is not None
-                )
-                if (
-                    first_val_vis is not None
-                    and train_can_visualize_trace
-                    and first_val_vis.get('can_visualize_trace', False)
-                ):
+                if first_val_vis is not None:
                     make_dense_visualization(
                         inputs, None, None, None,
                         velocity_dir_pred=train_velocity_dir_pred,

@@ -82,8 +82,6 @@ class EdtSegDataset(Dataset):
             apply_perturbation=bool(self.apply_perturbation),
         )
 
-        self._triplet_neighbor_lookup = {}
-
         if patch_metadata is None:
             patches = []
             for dataset_idx, dataset in enumerate(config['datasets']):
@@ -277,7 +275,7 @@ class EdtSegDataset(Dataset):
                 }
         return lookup
 
-    def _extract_wrap_world_surface(self, patch: ChunkPatch, wrap: dict, require_all_valid: bool = True):
+    def _extract_wrap_world_surface(self, patch: ChunkPatch, wrap: dict):
         """Extract one wrap as upsampled world-coordinate [H, W, 3] (ZYX)."""
         seg = wrap["segment"]
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
@@ -296,9 +294,7 @@ class EdtSegDataset(Dataset):
         if x_s.size == 0:
             return None
         if valid_s is not None:
-            if require_all_valid and not valid_s.all():
-                return None
-            if not require_all_valid and not valid_s.any():
+            if not valid_s.all():
                 return None
 
         x_full, y_full, z_full = _upsample_world_triplet(x_s, y_s, z_s, scale_y, scale_x)
@@ -420,7 +416,6 @@ class EdtSegDataset(Dataset):
             neighbor_surface = self._extract_wrap_world_surface(
                 patch,
                 patch.wraps[neighbor_wrap_idx],
-                require_all_valid=True,
             )
             if neighbor_surface is None:
                 return None

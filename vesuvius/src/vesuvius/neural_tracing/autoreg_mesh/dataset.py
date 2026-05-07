@@ -493,7 +493,7 @@ class AutoregMeshDataset(Dataset):
                 wrap,
                 require_all_valid=True,
             )
-        return self._base_dataset._extract_wrap_world_surface(patch, wrap, require_all_valid=True)
+        return self._base_dataset._extract_wrap_world_surface(patch, wrap)
 
     def _serialize_candidate_plan(
         self,
