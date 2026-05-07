@@ -389,9 +389,9 @@ def optimize(
 		_t_stage_total = _stage_start(f"{label}.total")
 		print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
 			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
-		if opt_cfg.steps <= 0:
-			return data
 		is_cyl_stage = "cyl_params" in opt_cfg.params
+		if opt_cfg.steps <= 0 and not is_cyl_stage:
+			return data
 		stage_eff = (
 			{
 				"cyl_normal": float(opt_cfg.eff.get("cyl_normal", 0.0)),
@@ -431,21 +431,25 @@ def optimize(
 			model.bake_cylinder_into_mesh(data)
 		_stage_done(f"{label}.prepare_model_params", _t)
 
+		def _make_param_groups() -> tuple[dict[str, list], list[dict]]:
+			all_params_ = model.opt_params()
+			param_groups_: list[dict] = []
+			for name in opt_cfg.params:
+				group = all_params_.get(name, [])
+				if name in {"mesh_ms"}:
+					k0 = max(0, int(opt_cfg.min_scaledown))
+					for pi, p in enumerate(group):
+						if pi < k0:
+							continue
+						param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
+				else:
+					lr_last = _lr_last(opt_cfg.lr)
+					for p in group:
+						param_groups_.append({"params": [p], "lr": lr_last})
+			return all_params_, param_groups_
+
 		_t = _stage_start(f"{label}.build_optimizer")
-		all_params = model.opt_params()
-		param_groups: list[dict] = []
-		for name in opt_cfg.params:
-			group = all_params.get(name, [])
-			if name in {"mesh_ms"}:
-				k0 = max(0, int(opt_cfg.min_scaledown))
-				for pi, p in enumerate(group):
-					if pi < k0:
-						continue
-					param_groups.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
-			else:
-				lr_last = _lr_last(opt_cfg.lr)
-				for p in group:
-					param_groups.append({"params": [p], "lr": lr_last})
+		all_params, param_groups = _make_param_groups()
 		if not param_groups:
 			return data
 		opt = torch.optim.Adam(param_groups)
@@ -468,20 +472,7 @@ def optimize(
 				opt_loss_winding_volume._winding_offset = ao_offset + d_lo * ao_dir
 				print(f"[optimizer] adjusted offset after crop: {opt_loss_winding_volume._winding_offset}", flush=True)
 				# Rebuild optimizer param groups since model shape changed
-				all_params = model.opt_params()
-				param_groups = []
-				for name in opt_cfg.params:
-					group = all_params.get(name, [])
-					if name in {"mesh_ms"}:
-						k0 = max(0, int(opt_cfg.min_scaledown))
-						for pi, p in enumerate(group):
-							if pi < k0:
-								continue
-							param_groups.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
-					else:
-						lr_last = _lr_last(opt_cfg.lr)
-						for p in group:
-							param_groups.append({"params": [p], "lr": lr_last})
+				all_params, param_groups = _make_param_groups()
 				if not param_groups:
 					return data
 				opt = torch.optim.Adam(param_groups)
@@ -549,6 +540,53 @@ def optimize(
 				pk = f"p:{k}"
 				row += f" {values[pk]:>{widths[pk]}s}"
 			print(row)
+
+		def _print_cylinder_rough_top(rows: list[dict[str, float | int]], *, keep_n: int) -> None:
+			before = int(getattr(model, "cyl_params").shape[0])
+			print(f"[optimizer] {label}: rough cylinder candidates={before}, keep={keep_n}", flush=True)
+			if not rows:
+				print(f"[optimizer] {label}: no finite rough cylinder candidates", flush=True)
+				return
+			params = model.cyl_params.detach().cpu()
+			show_center = any("cyl_center" in row for row in rows)
+			header = (
+				f"{'rank':>4s} {'idx':>5s} {'score':>10s} {'normal':>10s}"
+				+ (f" {'center':>10s}" if show_center else "")
+				+ f" {'n_avg':>8s} {'n_max':>8s} {'r':>9s} {'ratio':>7s} {'seed_q':>8s} {'roll':>8s}"
+			)
+			print(header, flush=True)
+			for row in rows:
+				idx = int(row["idx"])
+				p = params[idx]
+				k = float(p[1])
+				den = max(1.0e-6, 1.0 - k)
+				ratio = (1.0 + k) / den
+				line = (
+					f"{int(row['rank']):4d} {idx:5d} {float(row['cyl_min']):10.4g} "
+					f"{float(row.get('cyl_normal', float('nan'))):10.4g} "
+				)
+				if show_center:
+					line += f"{float(row.get('cyl_center', float('nan'))):10.4g} "
+				line += (
+					f"{float(row.get('cyl_nerr_avg', float('nan'))):8.3f} "
+					f"{float(row.get('cyl_nerr_max', float('nan'))):8.3f} "
+					f"{float(p[0]):9.2f} {ratio:7.3f} {float(p[2]):8.3f} {float(p[5]):8.3f}"
+				)
+				print(line, flush=True)
+
+		def _prune_cylinder_candidates_after_initial_eval() -> bool:
+			if not (stage_uses_cyl_loss and is_cyl_stage and getattr(model, "cylinder_enabled", False)):
+				return False
+			keep_n = 16
+			top_rows = opt_loss_cyl.top_candidates(stage_eff, limit=10)
+			_print_cylinder_rough_top(top_rows, keep_n=keep_n)
+			top_indices = opt_loss_cyl.top_candidate_indices(stage_eff, limit=keep_n)
+			before = int(model.cyl_params.shape[0])
+			if not top_indices or before <= len(top_indices):
+				return False
+			kept = model.keep_cylinder_candidates(top_indices)
+			print(f"[optimizer] {label}: pruned rough cylinder candidates {before} -> {kept}", flush=True)
+			return True
 
 		# Ensure data covers mesh and has all channels needed by this stage
 		_needed_channels: set[str] = set()
@@ -731,6 +769,13 @@ def optimize(
 			loss0, term_vals0, display_loss0 = _eval_terms(
 				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
+			_t_prune = _stage_start(f"{label}.initial_eval.cylinder_prune")
+			if _prune_cylinder_candidates_after_initial_eval():
+				all_params, param_groups = _make_param_groups()
+				if not param_groups:
+					return data
+				opt = torch.optim.Adam(param_groups)
+			_stage_done(f"{label}.initial_eval.cylinder_prune", _t_prune)
 			_t_params = _stage_start(f"{label}.initial_eval.param_values")
 			param_vals0: dict[str, float] = {}
 			for k, vs in all_params.items():
@@ -761,6 +806,7 @@ def optimize(
 		_t_steps_acc = 0
 		loss = loss0
 		display_loss = display_loss0
+		res = res0
 		_flow_timing = None
 		if (
 			pred_dt_flow_gate_cfg is not None
@@ -914,7 +960,8 @@ def optimize(
 			print(f"[optimizer] WARNING: corr points loaded but no corr weight > 0 in any stage!", flush=True)
 
 	for si, stage in enumerate(stages):
-		if stage.global_opt.steps > 0:
+		run_zero_step_cyl = "cyl_params" in stage.global_opt.params
+		if stage.global_opt.steps > 0 or run_zero_step_cyl:
 			data = _run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt, data=data)
 			if active_corr:
 				opt_loss_corr.print_detail(f"stage{si} END")

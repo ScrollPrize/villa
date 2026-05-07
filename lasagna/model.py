@@ -47,7 +47,7 @@ class FitResult3D:
 	cyl_normals: torch.Tensor | None = None  # (N*D, Hm, Wm, 3) analytic cylinder normals
 	cyl_centers: torch.Tensor | None = None  # (N, 3) cylinder axis anchor [cx, cy, zc]
 	cyl_axes: torch.Tensor | None = None     # (N, 3) unit cylinder axis direction
-	cyl_params: torch.Tensor | None = None   # (N, 5) [radius, ellipse_k, seed_phase, tilt_x, tilt_y]
+	cyl_params: torch.Tensor | None = None   # (N, 6) [radius, ellipse_k, seed_phase, tilt_x, tilt_y, roll]
 	cyl_count: int = 0
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
@@ -119,7 +119,7 @@ class Model3D(nn.Module):
 		self.straight_half_w = nn.Parameter(torch.tensor(float(straight_half_w), device=device, dtype=torch.float32))
 
 		# Multi-start analytic cylinder seed params:
-		# [radius, ellipse_k, seed_phase, tilt_x, tilt_y]. The center is
+		# [radius, ellipse_k, seed_phase, tilt_x, tilt_y, roll]. The center is
 		# derived so q=0 stays on the seed point, and height is centered
 		# at the seed along the optimized cylinder axis.
 		self.cyl_params = nn.Parameter(self._default_cylinder_params(device=device))
@@ -166,7 +166,7 @@ class Model3D(nn.Module):
 
 	@staticmethod
 	def _default_cylinder_params(*, device: torch.device) -> torch.Tensor:
-		return torch.zeros(40, 5, device=device, dtype=torch.float32)
+		return torch.zeros(1, 6, device=device, dtype=torch.float32)
 
 	# --- 3D pyramid operations ---
 
@@ -287,7 +287,7 @@ class Model3D(nn.Module):
 		model_h: float,
 		volume_extent_fullres: tuple[int, int, int] | None,
 	) -> None:
-		"""Initialize the 40-way cylinder multi-start from a user seed."""
+		"""Initialize the 960-way cylinder rough search from a user seed."""
 		device = self.cyl_params.device
 		seed_x, seed_y, seed_z = (float(seed[0]), float(seed[1]), float(seed[2]))
 		if volume_extent_fullres is not None:
@@ -304,12 +304,18 @@ class Model3D(nn.Module):
 		base_r = max(base_r, 1.0)
 		seed_angle = math.atan2(dy, dx) if base_r > 0.0 else 0.0
 
-		angles = [seed_angle + (2.0 * math.pi * i / 8.0) for i in range(8)]
+		angle_count = 16
+		roll_angles = [seed_angle + (2.0 * math.pi * i / float(angle_count)) for i in range(angle_count)]
 		size_factors = [0.70, 0.85, 1.00, 1.20, 1.45]
+		anisotropy_ratios = [4.0, 3.0, 2.0, 1.0]
+		seed_phases = [0.0, math.pi * 0.5, math.pi * 0.25]
 		rows: list[list[float]] = []
-		for angle in angles:
+		for roll in roll_angles:
 			for fac in size_factors:
-				rows.append([base_r * fac, 0.0, angle, 0.0, 0.0])
+				for ratio in anisotropy_ratios:
+					k = (ratio - 1.0) / (ratio + 1.0)
+					for seed_phase in seed_phases:
+						rows.append([base_r * fac, k, seed_phase, 0.0, 0.0, roll])
 		with torch.no_grad():
 			self.cyl_params = nn.Parameter(torch.tensor(rows, device=device, dtype=torch.float32))
 			self.cyl_seed_xyz = torch.tensor([seed_x, seed_y, seed_z], device=device, dtype=torch.float32)
@@ -322,8 +328,8 @@ class Model3D(nn.Module):
 
 	@staticmethod
 	def _validate_cyl_params(params: torch.Tensor) -> None:
-		if params.ndim != 2 or params.shape[1] != 5:
-			raise ValueError(f"cyl_params must have shape (N, 5), got {tuple(params.shape)}")
+		if params.ndim != 2 or params.shape[1] != 6:
+			raise ValueError(f"cyl_params must have shape (N, 6), got {tuple(params.shape)}")
 
 	@staticmethod
 	def _cylinder_frame(params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -331,6 +337,7 @@ class Model3D(nn.Module):
 		Model3D._validate_cyl_params(params)
 		tilt_x = params[:, 3]
 		tilt_y = params[:, 4]
+		roll = params[:, 5]
 		axis = torch.stack([tilt_x, tilt_y, torch.ones_like(tilt_x)], dim=-1)
 		axis = F.normalize(axis, dim=-1, eps=1.0e-8)
 
@@ -343,6 +350,12 @@ class Model3D(nn.Module):
 		u = F.normalize(u, dim=-1, eps=1.0e-8)
 		v = torch.cross(axis, u, dim=-1)
 		v = F.normalize(v, dim=-1, eps=1.0e-8)
+		cos_r = torch.cos(roll).view(-1, 1)
+		sin_r = torch.sin(roll).view(-1, 1)
+		u0 = u
+		v0 = v
+		u = cos_r * u0 + sin_r * v0
+		v = -sin_r * u0 + cos_r * v0
 		return axis, u, v
 
 	def _cylinder_h_values(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -363,7 +376,7 @@ class Model3D(nn.Module):
 		return q + 0.5 * k * torch.sin(2.0 * q) + 0.0625 * k * k * torch.sin(4.0 * q)
 
 	def _cylinder_samples_for_params(self, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Return analytic cylinder samples/normals for params shaped (N, 5)."""
+		"""Return analytic cylinder samples/normals for params shaped (N, 6)."""
 		self._validate_cyl_params(params)
 		device = params.device
 		dtype = params.dtype
@@ -500,6 +513,17 @@ class Model3D(nn.Module):
 
 	def set_best_cylinder_index(self, idx: int) -> None:
 		self.cyl_best_idx = max(0, min(int(idx), int(self.cyl_params.shape[0]) - 1))
+
+	def keep_cylinder_candidates(self, indices: list[int]) -> int:
+		if not indices:
+			return int(self.cyl_params.shape[0])
+		with torch.no_grad():
+			idx = torch.tensor(indices, device=self.cyl_params.device, dtype=torch.long)
+			idx = idx.clamp(min=0, max=int(self.cyl_params.shape[0]) - 1)
+			kept = self.cyl_params.detach().index_select(0, idx).clone()
+			self.cyl_params = nn.Parameter(kept)
+		self.cyl_best_idx = 0
+		return int(self.cyl_params.shape[0])
 
 	def cylinder_mesh_flat(self, *, candidate_idx: int) -> torch.Tensor:
 		idx = max(0, min(int(candidate_idx), int(self.cyl_params.shape[0]) - 1))
