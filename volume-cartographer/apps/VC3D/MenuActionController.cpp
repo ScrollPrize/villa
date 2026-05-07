@@ -477,18 +477,23 @@ QString MenuActionController::suggestedRemoteCacheDirectory() const
     if (_window && _window->_state && _window->_state->vpkg()) {
         const QString projectDir = QString::fromStdString(_window->_state->vpkg()->getVolpkgDirectory());
         if (!projectDir.isEmpty()) {
-            return QDir(projectDir).filePath("remote_cache");
+            // remoteCachePath() will ignore this suggestion if /volpkgs or
+            // /ephemeral is mounted.
+            return vc3d::remoteCachePath(QDir(projectDir).filePath("remote_cache"));
         }
     }
 
-    return vc3d::defaultCacheBase() + "/remote_cache";
+    return vc3d::remoteCachePath();
 }
 
 QString MenuActionController::configuredRemoteCacheDirectory() const
 {
     if (_window && _window->_state && _window->_state->vpkg()) {
-        return QString::fromStdString(
+        const QString persisted = QString::fromStdString(
             _window->_state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
+        // Run the persisted value through remoteCachePath() so /volpkgs and
+        // /ephemeral win even if the project JSON points somewhere else.
+        return vc3d::remoteCachePath(persisted);
     }
     return {};
 }
@@ -510,15 +515,20 @@ QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
         if (!ok) {
             return {};
         }
+        // Send the prompted value through the resolver too — keeps the host
+        // mount authoritative even if the user typed something else.
+        cacheDir = vc3d::remoteCachePath(cacheDir);
         shouldPersistCacheRoot = !cacheDir.isEmpty();
     }
 
     if (cacheDir.isEmpty()) {
-        // Fallback for projects with no persisted cache root yet. Non-prompting
-        // so startup and persisted remote loading stay quiet.
+        // No project- or prompt-supplied path: honor the persisted user
+        // setting (or fall back to ~/.VC3D/remote_cache) — unless host
+        // mounts override.
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
-        cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
+        const QString stored =
+            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR).toString();
+        cacheDir = vc3d::remoteCachePath(stored);
     }
 
     if (QDir::isRelativePath(cacheDir)) {

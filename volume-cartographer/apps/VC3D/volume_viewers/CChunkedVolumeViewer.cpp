@@ -480,18 +480,20 @@ float scaleForCoarsestPlaneRenderLevel(int numLevels)
 
 std::filesystem::path remoteCacheRootForState(const CState* state)
 {
+    // Suggestion order: per-volpkg setting first (so projects with an
+    // explicit cache stay co-located when no host mount is present), then
+    // the user's persisted setting. remoteCachePath() ignores both when
+    // /volpkgs or /ephemeral is mounted.
+    QString suggestion;
     if (state && state->vpkg()) {
-        const auto projectCache = state->vpkg()->remoteCacheRootOrEmpty();
-        if (!projectCache.empty()) {
-            return projectCache;
-        }
+        suggestion = QString::fromStdString(state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
     }
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
-    return settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache)
-        .toString()
-        .toStdString();
+    if (suggestion.isEmpty()) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        suggestion =
+            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR).toString();
+    }
+    return vc3d::remoteCachePath(suggestion).toStdString();
 }
 
 std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
