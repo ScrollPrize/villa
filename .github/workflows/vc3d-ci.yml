@@ -87,13 +87,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - uses: actions/cache@v4
-        with:
-          path: volume-cartographer/.ccache/${{ matrix.image }}
-          key: ccache-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ matrix.image }}-${{ matrix.compiler }}-${{ matrix.preset }}-
-            ccache-${{ matrix.image }}-${{ matrix.compiler }}-
       - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
       - name: ${{ matrix.action }}
@@ -110,13 +103,6 @@ jobs:
         with:
           fetch-depth: 0
       - uses: docker/setup-buildx-action@v3
-      - uses: actions/cache@v4
-        with:
-          path: volume-cartographer/.ccache/ubuntu-26.04
-          key: ccache-ubuntu-26.04-coverage-${{ github.run_id }}
-          restore-keys: |
-            ccache-ubuntu-26.04-coverage-
-            ccache-ubuntu-26.04-gcc-
       - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ubuntu-26.04
       - name: Run coverage
@@ -156,13 +142,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - uses: actions/cache@v4
-        with:
-          path: volume-cartographer/.ccache/ubuntu-26.04
-          key: ccache-ubuntu-26.04-dead-code-${{ github.run_id }}
-          restore-keys: |
-            ccache-ubuntu-26.04-dead-code-
-            ccache-ubuntu-26.04-clang-
       - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ubuntu-26.04
       - name: Run dead-code analysis

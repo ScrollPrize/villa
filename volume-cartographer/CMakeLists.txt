@@ -5,7 +5,6 @@ project(VC3D)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(VC_USE_CCACHE      "Use ccache for compilation"                   ON)
 option(VC_WARNINGS        "Enable curated warning set"                   OFF)
 option(VC_WERROR          "Treat compiler warnings as errors"            OFF)
 option(VC_ENABLE_ASAN     "AddressSanitizer"                             OFF)
@@ -25,14 +24,6 @@ foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
         list(APPEND CMAKE_IGNORE_PREFIX_PATH "${_path}")
     endif()
 endforeach()
-
-if(VC_USE_CCACHE)
-    find_program(CCACHE_PROGRAM ccache)
-    if(CCACHE_PROGRAM)
-        set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-    endif()
-endif()
 
 # ---- Git revision (used for ProjectInfo::VersionString) ---------------------
 find_package(Git QUIET)

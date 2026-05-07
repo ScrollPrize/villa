@@ -22,7 +22,7 @@ apt-get install -y --no-install-recommends tzdata
 dpkg-reconfigure -f noninteractive tzdata
 
 apt-get install -y \
-    build-essential git clang llvm ccache ninja-build lld cmake pkg-config \
+    build-essential git clang llvm ninja-build lld cmake pkg-config \
     qt6-base-dev libboost-system-dev libboost-program-options-dev \
     libceres-dev libsuitesparse-dev \
     libopencv-dev libopencv-contrib-dev \

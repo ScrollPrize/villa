@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
  && add-apt-repository -y universe \
  && apt-get update -y \
  && apt-get install -y --no-install-recommends \
-        build-essential clang lld libclang-rt-18-dev mold ccache git cmake ninja-build pkg-config \
+        build-essential clang lld libclang-rt-18-dev mold git cmake ninja-build pkg-config \
         qt6-base-dev \
         libboost-system-dev libboost-program-options-dev \
         libceres-dev libsuitesparse-dev \

@@ -41,17 +41,8 @@ dockerfile_for() {
 
 run_in_builder() {
     local image=$1 src=$2; shift 2
-    # Mount a per-image ccache dir so warm-cache hits work both locally
-    # (across runs) and in CI (when the host dir is restored from
-    # actions/cache before this step). CCACHE_MAXSIZE keeps a single
-    # cell's cache under GHA's per-entry sweet spot.
-    local ccache_host="$REPO_ROOT/.ccache/$image"
-    mkdir -p "$ccache_host"
     docker run --rm \
         -v "$src:/src" \
-        -v "$ccache_host:/root/.ccache" \
-        -e CCACHE_DIR=/root/.ccache \
-        -e CCACHE_MAXSIZE=500M \
         -w /src \
         "vc-builder:$image" bash -c "$*"
 }

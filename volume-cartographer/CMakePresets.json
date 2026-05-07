@@ -15,19 +15,14 @@
     {
       "name": "_ci-base",
       "hidden": true,
-      "inherits": "_base",
-      "cacheVariables": {
-        "VC_USE_CCACHE": "ON"
-      }
+      "inherits": "_base"
     },
     {
       "name": "_dev-base",
       "hidden": true,
       "inherits": "_base",
       "cacheVariables": {
-        "VC_TESTING": "ON",
-        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
-        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache"
+        "VC_TESTING": "ON"
       }
     },
 
