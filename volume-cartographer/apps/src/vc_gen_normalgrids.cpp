@@ -72,6 +72,7 @@ struct RunMetrics {
     int previewEvery = 100;
     bool verifyGridSave = false;
     int ompThreads = 1;
+    int ioThreads = 0;
     int numParts = 1;
     int partId = 0;
     size_t cacheBudgetBytes = 0;
@@ -210,6 +211,7 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
     out["preview_every"] = metrics.previewEvery;
     out["verify_grid_save"] = metrics.verifyGridSave;
     out["omp_threads"] = metrics.ompThreads;
+    out["io_threads"] = metrics.ioThreads;
     out["num_parts"] = metrics.numParts;
     out["part_id"] = metrics.partId;
     out["cache_budget_bytes"] = metrics.cacheBudgetBytes;
@@ -439,6 +441,7 @@ static void print_usage() {
               << "  --part-id           This shard's index in [0, num-parts) (default: 0)\n"
               << "  --sparse-volume     Process every N-th slice, 1 = all (default: 1)\n"
               << "  --chunk-budget-mib  Max chunk batch budget per direction (default: 512)\n"
+              << "  --io-threads        OMP team size for the chunk-read loop, 0 = OMP default (default: 0)\n"
               << "  --preview-every     Write preview image every N written slices, 0 disables (default: 100)\n"
               << "  --verify-grid-save  Verify GridStore save by reloading each file (default: false)\n"
               << "  --debug-per-slice   Emit a stdout log line for every slice (existing/empty/written) (default: false)\n"
@@ -508,6 +511,7 @@ int main(int argc, char* argv[]) {
             ("part-id", po::value<int>()->default_value(0), "Index of this shard in [0, num-parts)")
             ("sparse-volume", po::value<int>()->default_value(1), "Process every N-th slice (1 = all slices)")
             ("chunk-budget-mib", po::value<size_t>()->default_value(512), "Maximum chunk batch budget in MiB")
+            ("io-threads", po::value<int>()->default_value(0), "OMP team size for the chunk-read loop (0 = OMP default; raise above core count when IO-bound)")
             ("preview-every", po::value<int>()->default_value(100), "Write preview image every N written slices, 0 disables")
             ("verify-grid-save", po::bool_switch()->default_value(false), "Verify GridStore files by reloading after save")
             ("debug-per-slice", po::bool_switch()->default_value(false), "Emit a stdout log line for every slice processed (existing/empty_binary/empty_trace/written)")
@@ -686,6 +690,10 @@ void run_generate(const po::variables_map& vm) {
     int sparse_volume = vm["sparse-volume"].as<int>();
     if (sparse_volume < 1) sparse_volume = 1;
     const size_t chunk_budget_mib = vm["chunk-budget-mib"].as<size_t>();
+    const int io_threads = vm["io-threads"].as<int>();
+    if (io_threads < 0) {
+        throw std::runtime_error("--io-threads must be >= 0");
+    }
     const int preview_every = vm["preview-every"].as<int>();
     if (preview_every < 0) {
         throw std::runtime_error("--preview-every must be >= 0");
@@ -850,6 +858,7 @@ void run_generate(const po::variables_map& vm) {
         metadata["sparse-volume"] = sparse_volume;
         metadata["input-level"] = input_level;
         metadata["chunk-budget-mib"] = chunk_budget_mib;
+        metadata["io-threads"] = io_threads;
         metadata["preview-every"] = preview_every;
         metadata["verify-grid-save"] = verify_grid_save;
         metadata["debug-per-slice"] = debug_per_slice;
@@ -923,6 +932,7 @@ void run_generate(const po::variables_map& vm) {
     run_metrics.previewEvery = preview_every;
     run_metrics.verifyGridSave = verify_grid_save;
     run_metrics.ompThreads = num_threads;
+    run_metrics.ioThreads = io_threads;
     run_metrics.numParts = num_parts;
     run_metrics.partId = part_id;
     run_metrics.cacheBudgetBytes = cache_budget_bytes;
@@ -1106,7 +1116,8 @@ void run_generate(const po::variables_map& vm) {
                         static_cast<int>(source_chunk_plan.sourceChunkIndex),
                         volume_shape_i,
                         source_chunk_shape_i,
-                        std::span<vc::core::util::BinarySliceTarget>(targets));
+                        std::span<vc::core::util::BinarySliceTarget>(targets),
+                        io_threads);
                     const double read_seconds = seconds_since(read_start);
                     record_timing(dir_metrics, "read_chunk", read_seconds);
 

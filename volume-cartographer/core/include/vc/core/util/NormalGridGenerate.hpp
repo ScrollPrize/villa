@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include <omp.h>
 #include <opencv2/core.hpp>
 #include <vc/core/types/Array3D.hpp>
 #include <vc/core/types/Volume.hpp>
@@ -221,6 +222,12 @@ inline void distributeChunk(
 // extent given by normalGridSliceSize(volumeShape, direction); the helper
 // writes 255 where voxel != 0, 0 otherwise, and toggles anyNonZero.
 //
+// `ioThreads` overrides the OMP team size for the chunk-read loop. Pass 0
+// to keep the OMP default (omp_get_max_threads()). Useful as an IO-bound
+// lever — read syscalls block, so oversubscribing cores lets the kernel
+// keep more concurrent reads in flight without starving compute on the
+// critical path.
+//
 // Sequential implementation; no global slab buffer.
 inline void fillBinarySliceBatchFromVolume(
     Volume& volume,
@@ -229,7 +236,8 @@ inline void fillBinarySliceBatchFromVolume(
     int sliceAxisChunkIndex,
     const std::array<int, 3>& volumeShape,
     const std::array<int, 3>& sourceChunkShape,
-    std::span<BinarySliceTarget> targets)
+    std::span<BinarySliceTarget> targets,
+    int ioThreads = 0)
 {
     if (targets.empty()) {
         return;
@@ -291,7 +299,8 @@ inline void fillBinarySliceBatchFromVolume(
     // buffer for the lifetime of the parallel region, so blosc decompress
     // writes into a hot, already-resident allocation instead of mmap/munmap-ing
     // a fresh page-aligned vector for every chunk.
-    #pragma omp parallel
+    const int teamSize = ioThreads > 0 ? ioThreads : omp_get_max_threads();
+    #pragma omp parallel num_threads(teamSize)
     {
         std::vector<std::byte> scratch(chunkBytes);
 
