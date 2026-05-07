@@ -9,8 +9,34 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("dilation_radius", 1)  # voxels
     config.setdefault("cond_percent", [0.1, 0.5])
     config.setdefault("use_dense_displacement", True)
+    config.setdefault("use_flow_refinement_targets", False)
+    config.setdefault("use_velocity_targets", False)
+    config.setdefault("use_trace_ode_targets", False)
+    config.setdefault("lambda_velocity_dir", 0.1)
+    config.setdefault("velocity_target_mode", "away_from_conditioning")
+    config.setdefault("velocity_target_dilation_radius", 1.0)
+    config.setdefault("velocity_target_region", "full")
+    config.setdefault("trace_target_mode", "away_from_conditioning")
+    config.setdefault("trace_target_region", "full")
+    config.setdefault("trace_target_dilation_radius", config.get("velocity_target_dilation_radius", 1.0))
+    config.setdefault("trace_stop_radius", 1.0)
+    config.setdefault("surface_attract_target_mode", "dense_edt")
+    config.setdefault("trace_surface_attract_radius", 0.0)
+    config.setdefault("use_neighbor_sheet_context", False)
+    config.setdefault("neighbor_sheet_required", False)
+    config.setdefault("use_trace_validity_targets", False)
+    config.setdefault("lambda_trace_validity", 0.0)
+    config.setdefault("trace_validity_positive_radius", 2.0)
+    config.setdefault("trace_validity_negative_radius", 3.0)
+    config.setdefault("trace_validity_margin", 3.0)
+    config.setdefault("trace_validity_background_weight", 0.25)
+    config.setdefault("trace_validity_pos_weight", 1.0)
+    config.setdefault("defer_velocity_dilation_to_trainer", False)
+    config.setdefault("defer_trace_dilation_to_trainer", False)
+    config.setdefault("defer_trace_validity_to_trainer", False)
     config.setdefault("supervise_conditioning", False)
     config.setdefault("cond_supervision_weight", 0.1)
+    config.setdefault("use_growth_direction_channels", False)
     config.setdefault("force_recompute_patches", False)
     config.setdefault("use_heatmap_targets", False)
     config.setdefault("heatmap_step_size", 10)
@@ -112,6 +138,48 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
     triplet_direction_prior_mask = str(config.get("triplet_direction_prior_mask", "cond")).lower()
     _require_choice("triplet_direction_prior_mask", triplet_direction_prior_mask, {"cond", "full"})
 
+    velocity_target_mode = str(config.get("velocity_target_mode", "away_from_conditioning")).lower()
+    _require_choice("velocity_target_mode", velocity_target_mode, {"away_from_conditioning"})
+
+    velocity_target_region = str(config.get("velocity_target_region", "full")).lower()
+    _require_choice("velocity_target_region", velocity_target_region, {"full", "conditioning", "hidden"})
+
+    velocity_target_dilation_radius = float(config.get("velocity_target_dilation_radius", 1.0))
+    _require_finite_range("velocity_target_dilation_radius", velocity_target_dilation_radius, min_value=0.0)
+
+    trace_target_mode = str(config.get("trace_target_mode", "away_from_conditioning")).lower()
+    _require_choice("trace_target_mode", trace_target_mode, {"away_from_conditioning"})
+
+    trace_target_region = str(config.get("trace_target_region", "full")).lower()
+    _require_choice("trace_target_region", trace_target_region, {"full", "conditioning", "hidden"})
+
+    trace_target_dilation_radius = float(config.get("trace_target_dilation_radius", 1.0))
+    _require_finite_range("trace_target_dilation_radius", trace_target_dilation_radius, min_value=0.0)
+
+    trace_stop_radius = float(config.get("trace_stop_radius", 1.0))
+    _require_finite_range("trace_stop_radius", trace_stop_radius, min_value=0.0)
+
+    surface_attract_target_mode = str(config.get("surface_attract_target_mode", "dense_edt")).lower()
+    _require_choice("surface_attract_target_mode", surface_attract_target_mode, {"dense_edt", "trace_band"})
+
+    trace_surface_attract_radius = float(config.get("trace_surface_attract_radius", 0.0))
+    _require_finite_range("trace_surface_attract_radius", trace_surface_attract_radius, min_value=0.0)
+
+    trace_validity_positive_radius = float(config.get("trace_validity_positive_radius", 2.0))
+    _require_finite_range("trace_validity_positive_radius", trace_validity_positive_radius, min_value=0.0)
+
+    trace_validity_negative_radius = float(config.get("trace_validity_negative_radius", 3.0))
+    _require_finite_range("trace_validity_negative_radius", trace_validity_negative_radius, min_value=0.0)
+
+    trace_validity_margin = float(config.get("trace_validity_margin", 3.0))
+    _require_finite_range("trace_validity_margin", trace_validity_margin, min_value=0.0)
+
+    trace_validity_background_weight = float(config.get("trace_validity_background_weight", 0.25))
+    _require_finite_range("trace_validity_background_weight", trace_validity_background_weight, min_value=0.0)
+
+    trace_validity_pos_weight = float(config.get("trace_validity_pos_weight", 1.0))
+    _require_finite_range("trace_validity_pos_weight", trace_validity_pos_weight, min_value=0.0)
+
     triplet_random_channel_swap_prob = float(config.get("triplet_random_channel_swap_prob", 0.5))
     _require_finite_range(
         "triplet_random_channel_swap_prob",
@@ -151,6 +219,10 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     use_dense_displacement = bool(config.get("use_dense_displacement", False))
     use_triplet_wrap_displacement = bool(config.get("use_triplet_wrap_displacement", False))
+    use_flow_refinement_targets = bool(config.get("use_flow_refinement_targets", False))
+    use_velocity_targets = bool(config.get("use_velocity_targets", False))
+    use_trace_ode_targets = bool(config.get("use_trace_ode_targets", False))
+    use_growth_direction_channels = bool(config.get("use_growth_direction_channels", False))
 
     if not use_triplet_wrap_displacement and not use_dense_displacement:
         raise ValueError(
@@ -162,6 +234,18 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
         raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
 
     if use_triplet_wrap_displacement:
+        if use_growth_direction_channels:
+            raise ValueError(
+                "use_growth_direction_channels=True is currently supported only for regular row/col split mode"
+            )
+        if use_velocity_targets or use_trace_ode_targets:
+            raise ValueError(
+                "velocity/trace targets are currently supported only for regular row/col split mode"
+            )
+        if use_flow_refinement_targets:
+            raise ValueError(
+                "use_flow_refinement_targets=True is currently supported only for regular single-wrap dense mode"
+            )
         if not use_dense_displacement:
             raise ValueError("use_triplet_wrap_displacement=True requires use_dense_displacement=True")
         if config.get("use_other_wrap_cond", False):

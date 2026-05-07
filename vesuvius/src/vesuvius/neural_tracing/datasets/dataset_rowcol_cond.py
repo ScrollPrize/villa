@@ -28,11 +28,14 @@ from vesuvius.neural_tracing.datasets.common import (
     create_band_mask,
     compute_heatmap_targets,
     edt_dilate_binary_mask,
+    open_zarr_group,
     voxelize_surface_grid,
 )
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.neural_tracing.datasets.direction_helpers import (
     align_triplet_branch_channels_to_priors,
+    build_away_from_conditioning_trace_targets,
+    build_away_from_conditioning_velocity_target,
     build_triplet_direction_priors_from_conditioning_surface,
     maybe_swap_triplet_branch_channels,
 )
@@ -230,6 +233,39 @@ class EdtSegDataset(Dataset):
         validate_rowcol_cond_dataset_config(config)
         self.displacement_supervision = str(config['displacement_supervision']).lower()
         self.use_dense_displacement = bool(config['use_dense_displacement'])
+        self.defer_dense_targets_to_trainer = bool(config.get('defer_dense_targets_to_trainer', False))
+        self.use_velocity_targets = bool(config.get('use_velocity_targets', False))
+        self.velocity_target_mode = str(config.get('velocity_target_mode', 'away_from_conditioning')).lower()
+        self.velocity_target_region = str(config.get('velocity_target_region', 'full')).lower()
+        self.velocity_target_dilation_radius = float(config.get('velocity_target_dilation_radius', 1.0))
+        self.use_trace_ode_targets = bool(config.get('use_trace_ode_targets', False))
+        self.trace_target_mode = str(config.get('trace_target_mode', 'away_from_conditioning')).lower()
+        self.trace_target_region = str(config.get('trace_target_region', 'full')).lower()
+        self.trace_target_dilation_radius = float(
+            config.get('trace_target_dilation_radius', self.velocity_target_dilation_radius)
+        )
+        self.trace_stop_radius = float(config.get('trace_stop_radius', 1.0))
+        self.surface_attract_target_mode = str(config.get('surface_attract_target_mode', 'dense_edt')).lower()
+        self.trace_surface_attract_radius = float(config.get('trace_surface_attract_radius', 0.0))
+        self.use_trace_dist_targets = self.use_trace_ode_targets and float(config.get('lambda_trace_dist', 0.0)) > 0.0
+        self.use_trace_stop_targets = self.use_trace_ode_targets and float(config.get('lambda_trace_stop', 0.0)) > 0.0
+        self.use_surface_attract_targets = (
+            self.use_trace_ode_targets and float(config.get('lambda_surface_attract', 0.0)) > 0.0
+        )
+        self.use_trace_validity_targets = bool(config.get('use_trace_validity_targets', False)) or (
+            float(config.get('lambda_trace_validity', 0.0)) > 0.0
+        )
+        self.use_neighbor_sheet_context = bool(config.get('use_neighbor_sheet_context', False))
+        self.neighbor_sheet_required = bool(config.get('neighbor_sheet_required', False))
+        if self.neighbor_sheet_required:
+            self.use_neighbor_sheet_context = True
+        self.trace_validity_positive_radius = float(config.get('trace_validity_positive_radius', 2.0))
+        self.trace_validity_negative_radius = float(config.get('trace_validity_negative_radius', 3.0))
+        self.trace_validity_margin = float(config.get('trace_validity_margin', 3.0))
+        self.trace_validity_background_weight = float(config.get('trace_validity_background_weight', 0.25))
+        self.defer_velocity_dilation_to_trainer = bool(config.get('defer_velocity_dilation_to_trainer', False))
+        self.defer_trace_dilation_to_trainer = bool(config.get('defer_trace_dilation_to_trainer', False))
+        self.defer_trace_validity_to_trainer = bool(config.get('defer_trace_validity_to_trainer', False))
         self.use_triplet_wrap_displacement = bool(config['use_triplet_wrap_displacement'])
         if not self.use_triplet_wrap_displacement:
             # Regular split is dense-supervision only.
@@ -270,7 +306,11 @@ class EdtSegDataset(Dataset):
             for dataset_idx, dataset in enumerate(config['datasets']):
                 volume_path = dataset['volume_path']
                 volume_scale = dataset['volume_scale']
-                volume = zarr.open_group(volume_path, mode='r')
+                volume = open_zarr_group(
+                    volume_path,
+                    auth_json_path=dataset.get('volume_auth_json'),
+                    config=config,
+                )
                 segments_path = dataset['segments_path']
                 z_range = _parse_z_range(dataset.get('z_range', None))
                 dataset_segments = list(tifxyz.load_folder(segments_path))
@@ -280,7 +320,7 @@ class EdtSegDataset(Dataset):
                 scaled_segments = []
                 dropped_by_z_range = 0
                 for i, seg in enumerate(dataset_segments):
-                    seg_scaled = seg.retarget(retarget_factor)
+                    seg_scaled = seg if retarget_factor == 1 else seg.retarget(retarget_factor)
                     if not _segment_overlaps_z_range(seg_scaled, z_range):
                         dropped_by_z_range += 1
                         continue
@@ -357,16 +397,18 @@ class EdtSegDataset(Dataset):
 
             self.patches = patches
             self.sample_index = self._build_sample_index()
-            if self.use_triplet_wrap_displacement:
+            if self.use_triplet_wrap_displacement or self.use_neighbor_sheet_context:
                 self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
+            if self.use_triplet_wrap_displacement or self.neighbor_sheet_required:
                 self.sample_index = [
                     (patch_idx, wrap_idx)
                     for patch_idx, wrap_idx in self.sample_index
                     if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
                 ]
                 if not self.sample_index:
+                    mode = "Triplet mode" if self.use_triplet_wrap_displacement else "neighbor_sheet_required"
                     raise ValueError(
-                        "Triplet mode enabled but no wraps have same/adjacent neighbors on both sides."
+                        f"{mode} enabled but no wraps have same/adjacent neighbors on both sides."
                     )
             spec = self.config['cond_percent']
             low, high = float(spec[0]), float(spec[1])
@@ -1144,13 +1186,28 @@ class EdtSegDataset(Dataset):
                     other_vox = voxelize_surface_grid(other_zyxs_local, crop_shape)
                     other_wraps_vox = np.maximum(other_wraps_vox, other_vox)
 
+        neighbor_segmentation = None
+        if self.use_neighbor_sheet_context:
+            neighbor_segmentation = self._build_neighbor_sheet_mask(
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                min_corner=min_corner,
+                crop_shape=crop_shape,
+            )
+            if neighbor_segmentation is None and self.neighbor_sheet_required:
+                return None
+
         result = {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
             "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
             "cond_gt": torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32),
             "other_wraps": torch.from_numpy(other_wraps_vox).to(torch.float32),
             "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float).to(torch.float32),
+            "masked_surface_local": torch.from_numpy(masked_zyxs_local_float).to(torch.float32),
+            "cond_direction": cond_direction,
         }
+        if neighbor_segmentation is not None:
+            result["neighbor_seg"] = torch.from_numpy(neighbor_segmentation).to(torch.float32)
         if use_segmentation:
             result["segmentation"] = torch.from_numpy(seg_dilated).to(torch.float32)
             result["segmentation_skel"] = torch.from_numpy(seg_skel).to(torch.float32)
@@ -1160,6 +1217,81 @@ class EdtSegDataset(Dataset):
             result["heatmap_target"] = heatmap_tensor.to(torch.float32)
         return result
 
+    def _build_neighbor_sheet_mask(self, *, patch_idx: int, wrap_idx: int, min_corner, crop_shape):
+        triplet_meta = self._triplet_neighbor_lookup.get((patch_idx, wrap_idx))
+        if triplet_meta is None:
+            return None
+
+        neighbor_vox = np.zeros(crop_shape, dtype=np.float32)
+        for key in ("behind_wrap_idx", "front_wrap_idx"):
+            neighbor_surface = self._extract_wrap_world_surface_by_index(
+                patch_idx,
+                int(triplet_meta[key]),
+                require_all_valid=True,
+            )
+            if neighbor_surface is None:
+                return None
+            neighbor_local = (neighbor_surface - min_corner).astype(np.float32, copy=False)
+            neighbor_vox = np.maximum(neighbor_vox, voxelize_surface_grid(neighbor_local, crop_shape))
+
+        if not bool(neighbor_vox.any()):
+            return None
+        return neighbor_vox.astype(np.float32, copy=False)
+
+    def build_trace_validity_targets(self, cond_seg_gt: torch.Tensor, masked_seg: torch.Tensor, neighbor_seg=None):
+        target_np = np.maximum(
+            cond_seg_gt.detach().cpu().numpy(),
+            masked_seg.detach().cpu().numpy(),
+        ) > 0.5
+        if not bool(target_np.any()):
+            return None
+
+        d_target = _distance_transform_edt(
+            ~target_np,
+            return_distances=True,
+            return_indices=False,
+        ).astype(np.float32, copy=False)
+
+        label = np.zeros_like(d_target, dtype=np.float32)
+        weight = np.zeros_like(d_target, dtype=np.float32)
+        pos = d_target <= self.trace_validity_positive_radius
+
+        neighbor_present = neighbor_seg is not None and bool((neighbor_seg > 0.5).any().item())
+        if neighbor_present:
+            neighbor_np = neighbor_seg.detach().cpu().numpy() > 0.5
+            d_neighbor = _distance_transform_edt(
+                ~neighbor_np,
+                return_distances=True,
+                return_indices=False,
+            ).astype(np.float32, copy=False)
+            margin = d_neighbor - d_target
+            pos &= margin >= self.trace_validity_margin
+            neg = (d_neighbor <= self.trace_validity_negative_radius) & (margin < self.trace_validity_margin)
+            far_neg = d_target >= self.trace_validity_negative_radius
+
+            label[pos] = 1.0
+            weight[pos] = 1.0
+            hard_neg = neg & ~pos
+            weight[hard_neg] = 1.0
+            background_neg = far_neg & ~pos & ~hard_neg
+            if self.trace_validity_background_weight > 0.0:
+                weight[background_neg] = self.trace_validity_background_weight
+        else:
+            neg = d_target >= self.trace_validity_negative_radius
+            label[pos] = 1.0
+            weight[pos] = 1.0
+            if self.trace_validity_background_weight > 0.0:
+                weight[neg & ~pos] = self.trace_validity_background_weight
+
+        if float(weight.sum()) <= 0.0:
+            return None
+
+        return {
+            "trace_validity": torch.from_numpy(label[None]).to(torch.float32),
+            "trace_validity_weight": torch.from_numpy(weight[None]).to(torch.float32),
+            "neighbor_sheet_present": torch.tensor(float(neighbor_present), dtype=torch.float32),
+        }
+
     def create_split_targets(
         self,
         *,
@@ -1167,17 +1299,32 @@ class EdtSegDataset(Dataset):
         masked_seg: torch.Tensor,
     ):
         full_dense_surface = torch.maximum(masked_seg, cond_seg_gt)
-        dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
-            full_dense_surface.detach().cpu().numpy()
-        )
+        use_flow_refinement_targets = bool(self.config.get("use_flow_refinement_targets", False))
+        if use_flow_refinement_targets:
+            dense_disp_np, dense_weight_np, dense_dist_np = self._compute_dense_displacement_field(
+                full_dense_surface.detach().cpu().numpy(),
+                return_distances=True,
+            )
+        else:
+            dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
+                full_dense_surface.detach().cpu().numpy()
+            )
+            dense_dist_np = None
         if dense_disp_np is None:
             return None
         dense_gt_disp = torch.from_numpy(dense_disp_np).to(torch.float32)
         dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
-        return {
+        result = {
             "dense_gt_displacement": dense_gt_disp,  # (3, D, H, W)
             "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
         }
+        if use_flow_refinement_targets:
+            disp_norm_np = np.linalg.norm(dense_disp_np, axis=0, keepdims=True)
+            flow_dir_np = dense_disp_np / np.maximum(disp_norm_np, 1e-6)
+            flow_dist_np = dense_dist_np[None].astype(np.float32, copy=False)
+            result["flow_dir"] = torch.from_numpy(flow_dir_np).to(torch.float32)
+            result["flow_dist"] = torch.from_numpy(flow_dist_np).to(torch.float32)
+        return result
 
     def _format_triplet_target_unavailable_reason(self):
         reason = "triplet target payload unavailable"
@@ -1215,10 +1362,11 @@ class EdtSegDataset(Dataset):
             )
         patch_str = f" patch={patch_idx}" if patch_idx is not None else ""
         wrap_str = f" wrap={wrap_idx}" if wrap_idx is not None else ""
-        print(
-            f"[EdtSegDataset] Resampling item idx={idx}{patch_str}{wrap_str} "
-            f"reason={reason} replacement_idx={new_idx}"
-        )
+        if bool(self.config.get("verbose", False)):
+            print(
+                f"[EdtSegDataset] Resampling item idx={idx}{patch_str}{wrap_str} "
+                f"reason={reason} replacement_idx={new_idx}"
+            )
         return self.__getitem__(new_idx, _attempted_indices=attempted)
 
     def __getitem__(self, idx, _attempted_indices=None):
@@ -1303,29 +1451,74 @@ class EdtSegDataset(Dataset):
                     attempted_indices=_attempted_indices,
                 )
 
-            target_payload = self.create_neighbor_targets(
-                cond_seg_gt=cond_seg_gt,
-                behind_seg=behind_seg,
-                front_seg=front_seg,
-                cond_surface_local=cond_surface_local,
-                idx=idx,
-                patch_idx=patch_idx,
-                wrap_idx=wrap_idx,
-            )
-            if target_payload is None:
-                return self._resample_item(
-                    idx,
-                    self._format_triplet_target_unavailable_reason(),
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-
             result = {
                 "vol": vol_crop,
                 "cond": cond_seg,
             }
-            result.update(target_payload)
+            if self.defer_dense_targets_to_trainer:
+                behind_np = behind_seg.detach().cpu().numpy() > 0.5
+                front_np = front_seg.detach().cpu().numpy() > 0.5
+                triplet_gt_vector_dilation_radius = max(
+                    0.0,
+                    float(self.config["triplet_gt_vector_dilation_radius"]),
+                )
+                if triplet_gt_vector_dilation_radius > 0.0:
+                    behind_np = edt_dilate_binary_mask(
+                        behind_np,
+                        triplet_gt_vector_dilation_radius,
+                    )
+                    front_np = edt_dilate_binary_mask(
+                        front_np,
+                        triplet_gt_vector_dilation_radius,
+                    )
+                if not behind_np.any() or not front_np.any():
+                    return self._resample_item(
+                        idx,
+                        "empty neighbor mask after dilation",
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                result["cond_gt"] = cond_seg_gt
+                result["behind_seg"] = torch.from_numpy(behind_np.astype(np.float32, copy=False)).to(torch.float32)
+                result["front_seg"] = torch.from_numpy(front_np.astype(np.float32, copy=False)).to(torch.float32)
+                if self.use_triplet_direction_priors:
+                    cond_np = cond_seg_gt.detach().cpu().numpy() > 0.5
+                    cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+                    dir_priors_np = build_triplet_direction_priors_from_conditioning_surface(
+                        self.crop_size,
+                        cond_np,
+                        cond_surface_np,
+                        mask_mode=self.triplet_direction_prior_mask,
+                    )
+                    if dir_priors_np is None:
+                        return self._resample_item(
+                            idx,
+                            "triplet direction priors unavailable",
+                            patch_idx=patch_idx,
+                            wrap_idx=wrap_idx,
+                            attempted_indices=_attempted_indices,
+                        )
+                    result["dir_priors"] = torch.from_numpy(dir_priors_np).to(torch.float32)
+            else:
+                target_payload = self.create_neighbor_targets(
+                    cond_seg_gt=cond_seg_gt,
+                    behind_seg=behind_seg,
+                    front_seg=front_seg,
+                    cond_surface_local=cond_surface_local,
+                    idx=idx,
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                )
+                if target_payload is None:
+                    return self._resample_item(
+                        idx,
+                        self._format_triplet_target_unavailable_reason(),
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                result.update(target_payload)
         else:
             use_other_wrap_cond = self.config['use_other_wrap_cond']
             use_sdt = self.config['use_sdt']
@@ -1345,7 +1538,9 @@ class EdtSegDataset(Dataset):
             vol_crop = mask_bundle["vol"]
             masked_seg = mask_bundle["masked_seg"]
             cond_seg_gt = mask_bundle["cond_gt"]
+            cond_direction = mask_bundle["cond_direction"]
             other_wraps_tensor = mask_bundle["other_wraps"]
+            neighbor_seg_tensor = mask_bundle.get("neighbor_seg", None)
             cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
                 _prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
             )
@@ -1353,6 +1548,17 @@ class EdtSegDataset(Dataset):
                 return self._resample_item(
                     idx,
                     "split conditioning surface invalid",
+                    patch_idx=patch_idx,
+                    wrap_idx=wrap_idx,
+                    attempted_indices=_attempted_indices,
+                )
+            masked_surface_local, masked_surface_shape, masked_surface_keypoints, valid_masked_surface = (
+                _prepare_cond_surface_keypoints(mask_bundle.get("masked_surface_local"))
+            )
+            if not valid_masked_surface:
+                return self._resample_item(
+                    idx,
+                    "split masked surface invalid",
                     patch_idx=patch_idx,
                     wrap_idx=wrap_idx,
                     attempted_indices=_attempted_indices,
@@ -1376,6 +1582,9 @@ class EdtSegDataset(Dataset):
                 cond_surface_keypoints=cond_surface_keypoints,
                 cond_surface_shape=cond_surface_shape,
                 restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
+                masked_surface_local=masked_surface_local,
+                masked_surface_keypoints=masked_surface_keypoints,
+                masked_surface_shape=masked_surface_shape,
                 use_segmentation=use_segmentation,
                 use_sdt=use_sdt,
                 use_heatmap=use_heatmap,
@@ -1383,12 +1592,15 @@ class EdtSegDataset(Dataset):
                 seg_skel=seg_skel if use_segmentation else None,
                 sdt_tensor=sdt_tensor if use_sdt else None,
                 heatmap_tensor=heatmap_tensor if use_heatmap else None,
+                neighbor_seg_tensor=neighbor_seg_tensor,
             )
             vol_crop = split_augmented["vol_crop"]
             masked_seg = split_augmented["masked_seg"]
             other_wraps_tensor = split_augmented["other_wraps_tensor"]
             cond_seg_gt = split_augmented["cond_seg_gt"]
             cond_surface_local = split_augmented["cond_surface_local"]
+            masked_surface_local = split_augmented["masked_surface_local"]
+            neighbor_seg_tensor = split_augmented.get("neighbor_seg_tensor", neighbor_seg_tensor)
             if use_segmentation:
                 full_seg = split_augmented["full_seg"]
                 seg_skel = split_augmented["seg_skel"]
@@ -1411,23 +1623,12 @@ class EdtSegDataset(Dataset):
                     attempted_indices=_attempted_indices,
                 )
 
-            target_payload = self.create_split_targets(
-                cond_seg_gt=cond_seg_gt,
-                masked_seg=masked_seg,
-            )
-            if target_payload is None:
-                return self._resample_item(
-                    idx,
-                    "split target payload unavailable",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-
             result = {
                 "vol": vol_crop,                 # raw volume crop
                 "cond": cond_seg,                # conditioning segmentation
                 "masked_seg": masked_seg,        # masked (target) segmentation
+                "cond_gt": cond_seg_gt,          # unperturbed conditioning surface for dense targets
+                "cond_direction": cond_direction,
             }
 
             if use_other_wrap_cond:
@@ -1439,7 +1640,182 @@ class EdtSegDataset(Dataset):
             if use_segmentation:
                 result["segmentation"] = full_seg  # full segmentation (cond + masked)
                 result["segmentation_skel"] = seg_skel  # skeleton for medial surface recall loss
-            result.update(target_payload)
+            if self.use_trace_validity_targets and self.defer_trace_validity_to_trainer:
+                if neighbor_seg_tensor is not None:
+                    result["neighbor_seg"] = neighbor_seg_tensor
+            elif self.use_trace_validity_targets:
+                validity_payload = self.build_trace_validity_targets(
+                    cond_seg_gt,
+                    masked_seg,
+                    neighbor_seg=neighbor_seg_tensor,
+                )
+                if validity_payload is None:
+                    return self._resample_item(
+                        idx,
+                        "trace validity target unavailable",
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                result.update(validity_payload)
+            if self.use_velocity_targets and not self.use_trace_ode_targets:
+                if self.velocity_target_mode != "away_from_conditioning":
+                    return self._resample_item(
+                        idx,
+                        f"unsupported velocity target mode {self.velocity_target_mode!r}",
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+                masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+                velocity_dilation_radius = (
+                    0.0 if self.defer_velocity_dilation_to_trainer else self.velocity_target_dilation_radius
+                )
+                if self.velocity_target_region == "full":
+                    if cond_direction == "left":
+                        velocity_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=1)
+                    elif cond_direction == "right":
+                        velocity_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=1)
+                    elif cond_direction == "up":
+                        velocity_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=0)
+                    elif cond_direction == "down":
+                        velocity_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=0)
+                    else:
+                        velocity_surface_np = None
+                    velocity_payload = build_away_from_conditioning_velocity_target(
+                        self.crop_size,
+                        cond_direction,
+                        cond_surface_local=velocity_surface_np,
+                        masked_surface_local=None,
+                        include_conditioning=True,
+                        include_masked=False,
+                        dilation_radius=velocity_dilation_radius,
+                    )
+                else:
+                    velocity_payload = build_away_from_conditioning_velocity_target(
+                        self.crop_size,
+                        cond_direction,
+                        cond_surface_local=cond_surface_np,
+                        masked_surface_local=masked_surface_np,
+                        include_conditioning=self.velocity_target_region == "conditioning",
+                        include_masked=self.velocity_target_region == "hidden",
+                        dilation_radius=velocity_dilation_radius,
+                    )
+                if velocity_payload is None:
+                    return self._resample_item(
+                        idx,
+                        "split velocity target unavailable",
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                velocity_dir_np, velocity_weight_np = velocity_payload
+                result["velocity_dir"] = torch.from_numpy(velocity_dir_np).to(torch.float32)
+                result["velocity_loss_weight"] = torch.from_numpy(velocity_weight_np).to(torch.float32)
+            if self.use_trace_ode_targets:
+                if self.trace_target_mode != "away_from_conditioning":
+                    return self._resample_item(
+                        idx,
+                        f"unsupported trace target mode {self.trace_target_mode!r}",
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+                masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+                trace_dilation_radius = (
+                    0.0 if self.defer_trace_dilation_to_trainer else self.trace_target_dilation_radius
+                )
+                trace_surface_attract_radius = (
+                    0.0
+                    if self.defer_trace_dilation_to_trainer
+                    and self.surface_attract_target_mode == "trace_band"
+                    else self.trace_surface_attract_radius
+                )
+                if self.trace_target_region == "full":
+                    if cond_direction == "left":
+                        trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=1)
+                    elif cond_direction == "right":
+                        trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=1)
+                    elif cond_direction == "up":
+                        trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=0)
+                    elif cond_direction == "down":
+                        trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=0)
+                    else:
+                        trace_surface_np = None
+                    trace_payload = build_away_from_conditioning_trace_targets(
+                        self.crop_size,
+                        cond_direction,
+                        cond_surface_local=trace_surface_np,
+                        masked_surface_local=None,
+                        include_conditioning=True,
+                        include_masked=False,
+                        dilation_radius=trace_dilation_radius,
+                        stop_radius=self.trace_stop_radius,
+                        surface_attract_radius=(
+                            trace_surface_attract_radius
+                            if self.use_surface_attract_targets
+                            and self.surface_attract_target_mode == "trace_band"
+                            else 0.0
+                        ),
+                        include_trace_dist=self.use_trace_dist_targets,
+                        include_trace_stop=self.use_trace_stop_targets,
+                    )
+                else:
+                    trace_payload = build_away_from_conditioning_trace_targets(
+                        self.crop_size,
+                        cond_direction,
+                        cond_surface_local=cond_surface_np,
+                        masked_surface_local=masked_surface_np,
+                        include_conditioning=self.trace_target_region == "conditioning",
+                        include_masked=self.trace_target_region == "hidden",
+                        dilation_radius=trace_dilation_radius,
+                        stop_radius=self.trace_stop_radius,
+                        surface_attract_radius=(
+                            trace_surface_attract_radius
+                            if self.use_surface_attract_targets
+                            and self.surface_attract_target_mode == "trace_band"
+                            else 0.0
+                        ),
+                        include_trace_dist=self.use_trace_dist_targets,
+                        include_trace_stop=self.use_trace_stop_targets,
+                    )
+                if trace_payload is None:
+                    return self._resample_item(
+                        idx,
+                        "split trace target unavailable",
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                result["velocity_dir"] = torch.from_numpy(trace_payload["velocity_dir"]).to(torch.float32)
+                result["velocity_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
+                if "trace_dist" in trace_payload:
+                    result["trace_dist"] = torch.from_numpy(trace_payload["trace_dist"]).to(torch.float32)
+                if "trace_stop" in trace_payload:
+                    result["trace_stop"] = torch.from_numpy(trace_payload["trace_stop"]).to(torch.float32)
+                if "trace_dist" in trace_payload or "trace_stop" in trace_payload:
+                    result["trace_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
+                if "surface_attract" in trace_payload:
+                    result["surface_attract"] = torch.from_numpy(trace_payload["surface_attract"]).to(torch.float32)
+                    result["surface_attract_weight"] = torch.from_numpy(
+                        trace_payload["surface_attract_weight"]
+                    ).to(torch.float32)
+            if not self.defer_dense_targets_to_trainer:
+                target_payload = self.create_split_targets(
+                    cond_seg_gt=cond_seg_gt,
+                    masked_seg=masked_seg,
+                )
+                if target_payload is None:
+                    return self._resample_item(
+                        idx,
+                        "split target payload unavailable",
+                        patch_idx=patch_idx,
+                        wrap_idx=wrap_idx,
+                        attempted_indices=_attempted_indices,
+                    )
+                result.update(target_payload)
 
         if not _validate_result_tensors(
             result,

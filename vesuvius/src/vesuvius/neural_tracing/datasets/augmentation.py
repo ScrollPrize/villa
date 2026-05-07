@@ -74,10 +74,14 @@ def augment_split_payload(
     use_segmentation: bool,
     use_sdt: bool,
     use_heatmap: bool,
+    masked_surface_local=None,
+    masked_surface_keypoints: torch.Tensor | None = None,
+    masked_surface_shape=None,
     full_seg: torch.Tensor | None = None,
     seg_skel: torch.Tensor | None = None,
     sdt_tensor: torch.Tensor | None = None,
     heatmap_tensor: torch.Tensor | None = None,
+    neighbor_seg_tensor: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Apply split-mode augmentations and unpack outputs."""
     if augmentations is None:
@@ -87,10 +91,12 @@ def augment_split_payload(
             "other_wraps_tensor": other_wraps_tensor,
             "cond_seg_gt": cond_seg_gt,
             "cond_surface_local": cond_surface_local,
+            "masked_surface_local": masked_surface_local,
             "full_seg": full_seg,
             "seg_skel": seg_skel,
             "sdt_tensor": sdt_tensor,
             "heatmap_tensor": heatmap_tensor,
+            "neighbor_seg_tensor": neighbor_seg_tensor,
         }
 
     seg_tensors = [masked_seg, other_wraps_tensor, cond_seg_gt]
@@ -100,6 +106,9 @@ def augment_split_payload(
             raise ValueError("full_seg and seg_skel are required when use_segmentation=True")
         seg_tensors.extend([full_seg, seg_skel])
         seg_keys.extend(["full_seg", "seg_skel"])
+    if neighbor_seg_tensor is not None:
+        seg_tensors.append(neighbor_seg_tensor)
+        seg_keys.append("neighbor_seg_tensor")
 
     dist_tensors = []
     dist_keys = []
@@ -114,8 +123,15 @@ def augment_split_payload(
         "segmentation": torch.stack(seg_tensors, dim=0),
         "crop_shape": crop_size,
     }
+    keypoint_parts = []
+    cond_keypoint_count = 0
     if cond_surface_keypoints is not None:
-        aug_kwargs["keypoints"] = cond_surface_keypoints
+        keypoint_parts.append(cond_surface_keypoints)
+        cond_keypoint_count = int(cond_surface_keypoints.shape[0])
+    if masked_surface_keypoints is not None:
+        keypoint_parts.append(masked_surface_keypoints)
+    if keypoint_parts:
+        aug_kwargs["keypoints"] = torch.cat(keypoint_parts, dim=0)
     if dist_tensors:
         aug_kwargs["dist_map"] = torch.stack(dist_tensors, dim=0)
     if use_heatmap:
@@ -138,11 +154,27 @@ def augment_split_payload(
     if use_heatmap:
         heatmap_tensor = augmented["heatmap_target"].squeeze(0)
 
+    if keypoint_parts:
+        augmented_keypoints = augmented.get("keypoints")
+        if augmented_keypoints is None:
+            raise RuntimeError("split augmentation did not return keypoints")
+
     if cond_surface_keypoints is not None:
+        cond_augmented = dict(augmented)
+        cond_augmented["keypoints"] = augmented_keypoints[:cond_keypoint_count]
         cond_surface_local = restore_cond_surface_fn(
-            augmented=augmented,
+            augmented=cond_augmented,
             cond_surface_keypoints=cond_surface_keypoints,
             cond_surface_shape=cond_surface_shape,
+            mode="split",
+        )
+    if masked_surface_keypoints is not None:
+        masked_augmented = dict(augmented)
+        masked_augmented["keypoints"] = augmented_keypoints[cond_keypoint_count:]
+        masked_surface_local = restore_cond_surface_fn(
+            augmented=masked_augmented,
+            cond_surface_keypoints=masked_surface_keypoints,
+            cond_surface_shape=masked_surface_shape,
             mode="split",
         )
 
@@ -152,8 +184,10 @@ def augment_split_payload(
         "other_wraps_tensor": unpacked["other_wraps_tensor"],
         "cond_seg_gt": unpacked["cond_seg_gt"],
         "cond_surface_local": cond_surface_local,
+        "masked_surface_local": masked_surface_local,
         "full_seg": unpacked.get("full_seg", full_seg),
         "seg_skel": unpacked.get("seg_skel", seg_skel),
         "sdt_tensor": unpacked.get("sdt_tensor", sdt_tensor),
         "heatmap_tensor": heatmap_tensor,
+        "neighbor_seg_tensor": unpacked.get("neighbor_seg_tensor", neighbor_seg_tensor),
     }
