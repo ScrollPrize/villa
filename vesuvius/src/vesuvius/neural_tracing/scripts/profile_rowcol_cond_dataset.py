@@ -92,6 +92,11 @@ def _parse_args() -> argparse.Namespace:
         help="Include dataset construction in the cProfile output.",
     )
     parser.add_argument(
+        "--profile-create-split-masks",
+        action="store_true",
+        help="Collect and print aggregate stage timings inside EdtSegDataset.create_split_masks.",
+    )
+    parser.add_argument(
         "--disable-force-recompute-patches",
         action="store_true",
         help="Set force_recompute_patches=False before constructing the dataset.",
@@ -128,6 +133,24 @@ def _load_config(config_path: Path, *, disable_force_recompute_patches: bool) ->
         config["force_recompute_patches"] = False
     validate_rowcol_cond_dataset_config(config)
     return config
+
+
+def _print_create_split_masks_profile(dataset: EdtSegDataset) -> None:
+    summary = dataset.create_split_masks_profile_summary()
+    attempts = int(summary["attempts"])
+    successes = int(summary["successes"])
+    if attempts <= 0:
+        return
+
+    print("=== create_split_masks Stage Timings ===")
+    print(f"attempts: {attempts}")
+    print(f"successes: {successes}")
+    print(f"success rate: {summary['success_rate']:.3f}")
+    print(f"mean total seconds/success: {summary['mean_total']:.6f}")
+    print("mean stage seconds/success:")
+    for name, seconds in summary["mean_by_stage"].items():
+        print(f"  {name}: {seconds:.6f}")
+    print()
 
 
 def _seed_everything(seed: int) -> None:
@@ -254,6 +277,8 @@ def main() -> None:
         args.config_path,
         disable_force_recompute_patches=args.disable_force_recompute_patches,
     )
+    if args.profile_create_split_masks:
+        config["profile_create_split_masks"] = True
     seed = int(args.seed if args.seed is not None else config.get("seed", 0))
     _seed_everything(seed)
 
@@ -328,6 +353,8 @@ def main() -> None:
     if args.output is not None:
         print(f"raw profile: {args.output}")
     print()
+    if args.profile_create_split_masks:
+        _print_create_split_masks_profile(dataset)
     _print_stats(profiler, sort=args.sort, limit=args.limit, focus=args.focus)
 
 

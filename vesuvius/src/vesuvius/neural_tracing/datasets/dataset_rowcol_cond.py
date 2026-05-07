@@ -1,6 +1,7 @@
 import vesuvius.tifxyz as tifxyz
 import numpy as np
 import torch
+import time
 from torch.utils.data import Dataset
 from pathlib import Path
 from vesuvius.neural_tracing.datasets.common import (
@@ -66,6 +67,8 @@ class EdtSegDataset(Dataset):
         setdefault_rowcol_cond_dataset_config(config)
         validate_rowcol_cond_dataset_config(config)
         self._validate_result_tensors_enabled = bool(config['validate_result_tensors'])
+        self._profile_create_split_masks_enabled = bool(config.get("profile_create_split_masks", False))
+        self._profile_create_split_masks = self._new_create_split_masks_profile()
 
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
@@ -209,6 +212,49 @@ class EdtSegDataset(Dataset):
             'cond_percent': (self._cond_percent_min, self._cond_percent_max),
         }
 
+    @staticmethod
+    def _new_create_split_masks_profile():
+        return {
+            "attempts": 0,
+            "successes": 0,
+            "total": 0.0,
+            "conditioning": 0.0,
+            "volume_read": 0.0,
+            "coord_convert": 0.0,
+            "cond_voxelize": 0.0,
+            "masked_voxelize": 0.0,
+            "neighbor_total": 0.0,
+            "neighbor_extract": 0.0,
+            "neighbor_voxelize": 0.0,
+            "tensor_convert": 0.0,
+        }
+
+    def reset_create_split_masks_profile(self) -> None:
+        self._profile_create_split_masks = self._new_create_split_masks_profile()
+
+    def create_split_masks_profile_summary(self) -> dict:
+        profile = dict(self._profile_create_split_masks)
+        successes = int(profile.get("successes", 0))
+        attempts = int(profile.get("attempts", 0))
+        denom = max(successes, 1)
+        profile["mean_total"] = float(profile["total"]) / denom
+        profile["mean_by_stage"] = {
+            key: float(profile[key]) / denom
+            for key in (
+                "conditioning",
+                "volume_read",
+                "coord_convert",
+                "cond_voxelize",
+                "masked_voxelize",
+                "neighbor_total",
+                "neighbor_extract",
+                "neighbor_voxelize",
+                "tensor_convert",
+            )
+        }
+        profile["success_rate"] = float(successes) / max(attempts, 1)
+        return profile
+
     def _build_triplet_neighbor_lookup(self):
         """Build (patch_idx, wrap_idx) -> neighbor-wrap metadata for triplet mode.
 
@@ -350,11 +396,38 @@ class EdtSegDataset(Dataset):
         return augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
 
     def create_split_masks(self, patch_idx: int, wrap_idx: int):
+        profile_enabled = self._profile_create_split_masks_enabled
+        profile_start = time.perf_counter() if profile_enabled else 0.0
+        last = profile_start
+        stage_times = None
+        if profile_enabled:
+            self._profile_create_split_masks["attempts"] += 1
+            stage_times = {
+                "conditioning": 0.0,
+                "volume_read": 0.0,
+                "coord_convert": 0.0,
+                "cond_voxelize": 0.0,
+                "masked_voxelize": 0.0,
+                "neighbor_total": 0.0,
+                "neighbor_extract": 0.0,
+                "neighbor_voxelize": 0.0,
+                "tensor_convert": 0.0,
+            }
+
+        def record_stage(name: str) -> None:
+            nonlocal last
+            if stage_times is None:
+                return
+            now = time.perf_counter()
+            stage_times[name] += now - last
+            last = now
+
         patch = self.patches[patch_idx]
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
 
         conditioning = create_split_conditioning(self, patch_idx, wrap_idx, patch)
+        record_stage("conditioning")
         if conditioning is None:
             return None
         cond_direction = conditioning["cond_direction"]
@@ -369,27 +442,37 @@ class EdtSegDataset(Dataset):
             min_corner,
             max_corner,
         )
+        record_stage("volume_read")
 
         # convert cond and masked coords to crop-local coords (float for line interpolation)
         cond_zyxs_unperturbed_local_float = (cond_zyxs_unperturbed - min_corner).astype(np.float32)
         masked_zyxs_local_float = (masked_zyxs - min_corner).astype(np.float32)
+        record_stage("coord_convert")
 
         crop_shape = target_shape
 
         # voxelize with line interpolation between adjacent grid points
         cond_segmentation_gt = voxelize_surface_grid(cond_zyxs_unperturbed_local_float, crop_shape)
+        record_stage("cond_voxelize")
         masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
+        record_stage("masked_voxelize")
 
         # make sure we actually have some conditioning
         if not cond_segmentation_gt.any():
             return None
 
+        neighbor_start = time.perf_counter() if stage_times is not None else 0.0
         neighbor_segmentation = self._build_neighbor_sheet_mask(
             patch_idx=patch_idx,
             wrap_idx=wrap_idx,
             min_corner=min_corner,
             crop_shape=crop_shape,
+            stage_times=stage_times,
         )
+        if stage_times is not None:
+            now = time.perf_counter()
+            stage_times["neighbor_total"] += now - neighbor_start
+            last = now
         if neighbor_segmentation is None:
             return None
 
@@ -402,29 +485,43 @@ class EdtSegDataset(Dataset):
             "cond_direction": cond_direction,
         }
         result["neighbor_seg"] = torch.from_numpy(neighbor_segmentation).to(torch.float32)
+        record_stage("tensor_convert")
+        if stage_times is not None:
+            profile = self._profile_create_split_masks
+            profile["successes"] += 1
+            profile["total"] += time.perf_counter() - profile_start
+            for name, seconds in stage_times.items():
+                profile[name] += seconds
         return result
 
-    def _build_neighbor_sheet_mask(self, *, patch_idx: int, wrap_idx: int, min_corner, crop_shape):
+    def _build_neighbor_sheet_mask(self, *, patch_idx: int, wrap_idx: int, min_corner, crop_shape, stage_times=None):
         triplet_meta = self._triplet_neighbor_lookup.get((patch_idx, wrap_idx))
         if triplet_meta is None:
             return None
 
         patch = self.patches[patch_idx]
-        neighbor_vox = np.zeros(crop_shape, dtype=np.float32)
+        neighbor_vox = np.zeros(crop_shape, dtype=np.uint8)
         for key in ("behind_wrap_idx", "front_wrap_idx"):
             neighbor_wrap_idx = int(triplet_meta[key])
+            extract_start = time.perf_counter() if stage_times is not None else 0.0
             neighbor_surface = self._extract_wrap_world_surface(
                 patch,
                 patch.wraps[neighbor_wrap_idx],
             )
+            extract_done = time.perf_counter() if stage_times is not None else 0.0
+            if stage_times is not None:
+                stage_times["neighbor_extract"] += extract_done - extract_start
             if neighbor_surface is None:
                 return None
             neighbor_local = (neighbor_surface - min_corner).astype(np.float32, copy=False)
             neighbor_vox = np.maximum(neighbor_vox, voxelize_surface_grid(neighbor_local, crop_shape))
+            if stage_times is not None:
+                voxel_done = time.perf_counter()
+                stage_times["neighbor_voxelize"] += voxel_done - extract_done
 
         if not bool(neighbor_vox.any()):
             return None
-        return neighbor_vox.astype(np.float32, copy=False)
+        return neighbor_vox
 
     def _resample_item(self, idx, reason, patch_idx=None, wrap_idx=None, attempted_indices=None):
         attempted = set(int(i) for i in (attempted_indices or ()))
@@ -549,19 +646,25 @@ class EdtSegDataset(Dataset):
         cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
         masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
         if cond_direction == "left":
-            trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=1)
+            trace_surfaces_np = (cond_surface_np, masked_surface_np)
+            trace_concat_axis = 1
         elif cond_direction == "right":
-            trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=1)
+            trace_surfaces_np = (masked_surface_np, cond_surface_np)
+            trace_concat_axis = 1
         elif cond_direction == "up":
-            trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=0)
+            trace_surfaces_np = (cond_surface_np, masked_surface_np)
+            trace_concat_axis = 0
         elif cond_direction == "down":
-            trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=0)
+            trace_surfaces_np = (masked_surface_np, cond_surface_np)
+            trace_concat_axis = 0
         else:
-            trace_surface_np = None
+            trace_surfaces_np = None
+            trace_concat_axis = None
         trace_payload = build_away_from_conditioning_trace_targets(
             self.crop_size,
             cond_direction,
-            cond_surface_local=trace_surface_np,
+            trace_surfaces_local=trace_surfaces_np,
+            trace_concat_axis=trace_concat_axis,
             # RowColTargets.from_batch applies trace dilation and surface-attract
             # EDT on-device after collation. The dataset only needs to emit the
             # sparse source trace mask/direction.

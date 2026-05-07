@@ -1,5 +1,3 @@
-import random
-
 import numpy as np
 from numba import njit
 from scipy import ndimage
@@ -97,67 +95,6 @@ def _compute_surface_tangent_axis(surface_grid: np.ndarray, surface_valid: np.nd
     return tangent, tangent_valid
 
 
-def _scatter_vector_line(accum: np.ndarray, weights: np.ndarray, p0: np.ndarray, p1: np.ndarray, v0: np.ndarray, v1: np.ndarray) -> None:
-    delta = p1 - p0
-    steps = int(np.ceil(float(np.max(np.abs(delta)))))
-    steps = max(steps, 1)
-    d, h, w = weights.shape
-    for i in range(steps + 1):
-        t = i / steps
-        p = p0 * (1.0 - t) + p1 * t
-        z, y, x = np.rint(p).astype(np.int64)
-        if z < 0 or z >= d or y < 0 or y >= h or x < 0 or x >= w:
-            continue
-        v = v0 * (1.0 - t) + v1 * t
-        norm = float(np.linalg.norm(v))
-        if not np.isfinite(norm) or norm <= 1e-6:
-            continue
-        accum[:, z, y, x] += (v / norm).astype(np.float32, copy=False)
-        weights[z, y, x] += 1.0
-
-
-def _scatter_velocity_surface(accum: np.ndarray, weights: np.ndarray, surface_grid: np.ndarray, vectors: np.ndarray, valid: np.ndarray) -> None:
-    rows, cols = valid.shape
-    for r in range(rows):
-        for c in range(cols):
-            if not valid[r, c]:
-                continue
-            _scatter_vector_line(
-                accum,
-                weights,
-                surface_grid[r, c],
-                surface_grid[r, c],
-                vectors[r, c],
-                vectors[r, c],
-            )
-
-    for r in range(rows):
-        for c in range(cols - 1):
-            if not (valid[r, c] and valid[r, c + 1]):
-                continue
-            _scatter_vector_line(
-                accum,
-                weights,
-                surface_grid[r, c],
-                surface_grid[r, c + 1],
-                vectors[r, c],
-                vectors[r, c + 1],
-            )
-
-    for r in range(rows - 1):
-        for c in range(cols):
-            if not (valid[r, c] and valid[r + 1, c]):
-                continue
-            _scatter_vector_line(
-                accum,
-                weights,
-                surface_grid[r, c],
-                surface_grid[r + 1, c],
-                vectors[r, c],
-                vectors[r + 1, c],
-            )
-
-
 def _velocity_axis_and_sign(cond_direction: str) -> tuple[int, float]:
     direction = str(cond_direction).lower()
     if direction == "up":
@@ -172,22 +109,6 @@ def _velocity_axis_and_sign(cond_direction: str) -> tuple[int, float]:
         "cond_direction must be one of {'up', 'down', 'left', 'right'}, "
         f"got {cond_direction!r}"
     )
-
-
-def _surface_velocity_vectors(surface_grid: np.ndarray, cond_direction: str):
-    grid = np.asarray(surface_grid, dtype=np.float32)
-    if grid.ndim != 3 or grid.shape[2] != 3:
-        raise ValueError(f"surface_grid must have shape (H, W, 3), got {tuple(grid.shape)}")
-
-    finite = np.isfinite(grid).all(axis=2)
-    axis, sign = _velocity_axis_and_sign(cond_direction)
-    tangent, tangent_valid = _compute_surface_tangent_axis(grid, finite, axis=axis)
-    vectors = tangent * np.float32(sign)
-    norms = np.linalg.norm(vectors, axis=2)
-    valid = finite & tangent_valid & np.isfinite(norms) & (norms > 1e-6)
-    vectors_out = np.zeros_like(vectors, dtype=np.float32)
-    vectors_out[valid] = vectors[valid] / norms[valid, None]
-    return vectors_out, valid
 
 
 @njit
@@ -231,7 +152,7 @@ def _stamp_trace_surface_attract_numba(
 
 
 @njit
-def _scatter_trace_line_numba(
+def _scatter_trace_point_values_numba(
     velocity_accum: np.ndarray,
     weights: np.ndarray,
     surface_attract: np.ndarray,
@@ -239,32 +160,139 @@ def _scatter_trace_line_numba(
     surface_attract_best_dist_sq: np.ndarray,
     enable_surface_attract: bool,
     surface_attract_radius: float,
-    p0: np.ndarray,
-    p1: np.ndarray,
-    v0: np.ndarray,
-    v1: np.ndarray,
+    pz_in: float,
+    py_in: float,
+    px_in: float,
+    vz_in: float,
+    vy_in: float,
+    vx_in: float,
 ) -> None:
-    dz_line = float(p1[0] - p0[0])
-    dy_line = float(p1[1] - p0[1])
-    dx_line = float(p1[2] - p0[2])
+    depth, height, width = weights.shape
+    pz = float(pz_in)
+    py = float(py_in)
+    px = float(px_in)
+    z = int(np.rint(pz))
+    y = int(np.rint(py))
+    x = int(np.rint(px))
+    if z < 0 or z >= depth or y < 0 or y >= height or x < 0 or x >= width:
+        return
+
+    # The previous zero-length line path used steps=1 and visited the same
+    # point twice. Keep the t=0 and t=1 arithmetic so accumulated float32
+    # values and weights remain bit-for-bit compatible with the old path.
+    for i in range(2):
+        t = i / 1
+        vz = float(vz_in * (1.0 - t) + vz_in * t)
+        vy = float(vy_in * (1.0 - t) + vy_in * t)
+        vx = float(vx_in * (1.0 - t) + vx_in * t)
+        norm = np.sqrt(vz * vz + vy * vy + vx * vx)
+        if not np.isfinite(norm) or norm <= 1e-6:
+            continue
+
+        velocity_accum[0, z, y, x] += np.float32(vz / norm)
+        velocity_accum[1, z, y, x] += np.float32(vy / norm)
+        velocity_accum[2, z, y, x] += np.float32(vx / norm)
+        weights[z, y, x] += 1.0
+
+    if enable_surface_attract:
+        pz = float(pz_in * (1.0 - 0.0) + pz_in * 0.0)
+        py = float(py_in * (1.0 - 0.0) + py_in * 0.0)
+        px = float(px_in * (1.0 - 0.0) + px_in * 0.0)
+        _stamp_trace_surface_attract_numba(
+            surface_attract,
+            surface_attract_weight,
+            surface_attract_best_dist_sq,
+            pz,
+            py,
+            px,
+            surface_attract_radius,
+        )
+        pz = float(pz_in * (1.0 - 1.0) + pz_in * 1.0)
+        py = float(py_in * (1.0 - 1.0) + py_in * 1.0)
+        px = float(px_in * (1.0 - 1.0) + px_in * 1.0)
+        _stamp_trace_surface_attract_numba(
+            surface_attract,
+            surface_attract_weight,
+            surface_attract_best_dist_sq,
+            pz,
+            py,
+            px,
+            surface_attract_radius,
+        )
+
+
+@njit
+def _scatter_trace_point_numba(
+    velocity_accum: np.ndarray,
+    weights: np.ndarray,
+    surface_attract: np.ndarray,
+    surface_attract_weight: np.ndarray,
+    surface_attract_best_dist_sq: np.ndarray,
+    enable_surface_attract: bool,
+    surface_attract_radius: float,
+    p: np.ndarray,
+    v: np.ndarray,
+) -> None:
+    _scatter_trace_point_values_numba(
+        velocity_accum,
+        weights,
+        surface_attract,
+        surface_attract_weight,
+        surface_attract_best_dist_sq,
+        enable_surface_attract,
+        surface_attract_radius,
+        float(p[0]),
+        float(p[1]),
+        float(p[2]),
+        float(v[0]),
+        float(v[1]),
+        float(v[2]),
+    )
+
+
+@njit
+def _scatter_trace_line_values_numba(
+    velocity_accum: np.ndarray,
+    weights: np.ndarray,
+    surface_attract: np.ndarray,
+    surface_attract_weight: np.ndarray,
+    surface_attract_best_dist_sq: np.ndarray,
+    enable_surface_attract: bool,
+    surface_attract_radius: float,
+    p0z: float,
+    p0y: float,
+    p0x: float,
+    p1z: float,
+    p1y: float,
+    p1x: float,
+    v0z: float,
+    v0y: float,
+    v0x: float,
+    v1z: float,
+    v1y: float,
+    v1x: float,
+) -> None:
+    dz_line = float(p1z - p0z)
+    dy_line = float(p1y - p0y)
+    dx_line = float(p1x - p0x)
     max_delta = max(abs(dz_line), abs(dy_line), abs(dx_line))
     steps = int(np.ceil(max_delta))
     steps = max(steps, 1)
     depth, height, width = weights.shape
     for i in range(steps + 1):
         t = i / steps
-        pz = float(p0[0] * (1.0 - t) + p1[0] * t)
-        py = float(p0[1] * (1.0 - t) + p1[1] * t)
-        px = float(p0[2] * (1.0 - t) + p1[2] * t)
+        pz = float(p0z * (1.0 - t) + p1z * t)
+        py = float(p0y * (1.0 - t) + p1y * t)
+        px = float(p0x * (1.0 - t) + p1x * t)
         z = int(np.rint(pz))
         y = int(np.rint(py))
         x = int(np.rint(px))
         if z < 0 or z >= depth or y < 0 or y >= height or x < 0 or x >= width:
             continue
 
-        vz = float(v0[0] * (1.0 - t) + v1[0] * t)
-        vy = float(v0[1] * (1.0 - t) + v1[1] * t)
-        vx = float(v0[2] * (1.0 - t) + v1[2] * t)
+        vz = float(v0z * (1.0 - t) + v1z * t)
+        vy = float(v0y * (1.0 - t) + v1y * t)
+        vx = float(v0x * (1.0 - t) + v1x * t)
         norm = np.sqrt(vz * vz + vy * vy + vx * vx)
         if not np.isfinite(norm) or norm <= 1e-6:
             continue
@@ -287,10 +315,232 @@ def _scatter_trace_line_numba(
 
 
 @njit
-def _scatter_trace_surface_numba(
+def _scatter_trace_line_numba(
     velocity_accum: np.ndarray,
     weights: np.ndarray,
-    surface_grid: np.ndarray,
+    surface_attract: np.ndarray,
+    surface_attract_weight: np.ndarray,
+    surface_attract_best_dist_sq: np.ndarray,
+    enable_surface_attract: bool,
+    surface_attract_radius: float,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    v0: np.ndarray,
+    v1: np.ndarray,
+) -> None:
+    _scatter_trace_line_values_numba(
+        velocity_accum,
+        weights,
+        surface_attract,
+        surface_attract_weight,
+        surface_attract_best_dist_sq,
+        enable_surface_attract,
+        surface_attract_radius,
+        float(p0[0]),
+        float(p0[1]),
+        float(p0[2]),
+        float(p1[0]),
+        float(p1[1]),
+        float(p1[2]),
+        float(v0[0]),
+        float(v0[1]),
+        float(v0[2]),
+        float(v1[0]),
+        float(v1[1]),
+        float(v1[2]),
+    )
+
+
+@njit
+def _logical_surface_shape(surface_a: np.ndarray, surface_b: np.ndarray, has_b: bool, concat_axis: int):
+    if not has_b:
+        return surface_a.shape[0], surface_a.shape[1]
+    if concat_axis == 0:
+        return surface_a.shape[0] + surface_b.shape[0], surface_a.shape[1]
+    return surface_a.shape[0], surface_a.shape[1] + surface_b.shape[1]
+
+
+@njit
+def _logical_surface_value(
+    surface_a: np.ndarray,
+    surface_b: np.ndarray,
+    has_b: bool,
+    concat_axis: int,
+    r: int,
+    c: int,
+    k: int,
+) -> float:
+    if not has_b:
+        return float(surface_a[r, c, k])
+    if concat_axis == 0:
+        rows_a = surface_a.shape[0]
+        if r < rows_a:
+            return float(surface_a[r, c, k])
+        return float(surface_b[r - rows_a, c, k])
+    cols_a = surface_a.shape[1]
+    if c < cols_a:
+        return float(surface_a[r, c, k])
+    return float(surface_b[r, c - cols_a, k])
+
+
+@njit
+def _logical_surface_point_finite(
+    surface_a: np.ndarray,
+    surface_b: np.ndarray,
+    has_b: bool,
+    concat_axis: int,
+    r: int,
+    c: int,
+) -> bool:
+    z = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0)
+    y = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1)
+    x = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2)
+    return np.isfinite(z) and np.isfinite(y) and np.isfinite(x)
+
+
+@njit
+def _logical_surface_vector(
+    surface_a: np.ndarray,
+    surface_b: np.ndarray,
+    has_b: bool,
+    concat_axis: int,
+    axis: int,
+    sign: float,
+    r: int,
+    c: int,
+):
+    rows, cols = _logical_surface_shape(surface_a, surface_b, has_b, concat_axis)
+    if not _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r, c):
+        return False, 0.0, 0.0, 0.0
+
+    tangent_valid = False
+    tz = 0.0
+    ty = 0.0
+    tx = 0.0
+    if axis == 0:
+        if (
+            rows >= 3
+            and r > 0
+            and r < rows - 1
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r - 1, c)
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r + 1, c)
+        ):
+            tz = np.float32(0.5) * (
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 0)
+                - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r - 1, c, 0)
+            )
+            ty = np.float32(0.5) * (
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 1)
+                - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r - 1, c, 1)
+            )
+            tx = np.float32(0.5) * (
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 2)
+                - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r - 1, c, 2)
+            )
+            tangent_valid = True
+        elif (
+            rows >= 2
+            and r < rows - 1
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r + 1, c)
+        ):
+            tz = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 0) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0)
+            ty = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 1) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1)
+            tx = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 2) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2)
+            tangent_valid = True
+        elif (
+            rows >= 2
+            and r > 0
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r - 1, c)
+        ):
+            tz = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r - 1, c, 0)
+            ty = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r - 1, c, 1)
+            tx = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r - 1, c, 2)
+            tangent_valid = True
+    else:
+        if (
+            cols >= 3
+            and c > 0
+            and c < cols - 1
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r, c - 1)
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r, c + 1)
+        ):
+            tz = np.float32(0.5) * (
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 0)
+                - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c - 1, 0)
+            )
+            ty = np.float32(0.5) * (
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 1)
+                - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c - 1, 1)
+            )
+            tx = np.float32(0.5) * (
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 2)
+                - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c - 1, 2)
+            )
+            tangent_valid = True
+        elif (
+            cols >= 2
+            and c < cols - 1
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r, c + 1)
+        ):
+            tz = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 0) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0)
+            ty = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 1) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1)
+            tx = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 2) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2)
+            tangent_valid = True
+        elif (
+            cols >= 2
+            and c > 0
+            and _logical_surface_point_finite(surface_a, surface_b, has_b, concat_axis, r, c - 1)
+        ):
+            tz = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c - 1, 0)
+            ty = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c - 1, 1)
+            tx = _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2) - _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c - 1, 2)
+            tangent_valid = True
+
+    if not tangent_valid:
+        return False, 0.0, 0.0, 0.0
+
+    vz = np.float32(tz) * np.float32(sign)
+    vy = np.float32(ty) * np.float32(sign)
+    vx = np.float32(tx) * np.float32(sign)
+    norm = np.float32(np.sqrt(np.float32(vz * vz + vy * vy + vx * vx)))
+    if not np.isfinite(norm) or norm <= 1e-6:
+        return False, 0.0, 0.0, 0.0
+    return True, np.float32(vz / norm), np.float32(vy / norm), np.float32(vx / norm)
+
+
+@njit
+def _fill_logical_surface_vectors_numba(
+    vectors: np.ndarray,
+    valid: np.ndarray,
+    surface_a: np.ndarray,
+    surface_b: np.ndarray,
+    has_b: bool,
+    concat_axis: int,
+    tangent_axis: int,
+    tangent_sign: float,
+) -> None:
+    rows, cols = _logical_surface_shape(surface_a, surface_b, has_b, concat_axis)
+    for r in range(rows):
+        for c in range(cols):
+            point_valid, vz, vy, vx = _logical_surface_vector(
+                surface_a, surface_b, has_b, concat_axis, tangent_axis, tangent_sign, r, c
+            )
+            if not point_valid:
+                continue
+            vectors[r, c, 0] = np.float32(vz)
+            vectors[r, c, 1] = np.float32(vy)
+            vectors[r, c, 2] = np.float32(vx)
+            valid[r, c] = True
+
+
+@njit
+def _scatter_logical_trace_surface_numba(
+    velocity_accum: np.ndarray,
+    weights: np.ndarray,
+    surface_a: np.ndarray,
+    surface_b: np.ndarray,
+    has_b: bool,
+    concat_axis: int,
     vectors: np.ndarray,
     valid: np.ndarray,
     surface_attract: np.ndarray,
@@ -305,7 +555,7 @@ def _scatter_trace_surface_numba(
         for c in range(cols):
             if not valid[r, c]:
                 continue
-            _scatter_trace_line_numba(
+            _scatter_trace_point_values_numba(
                 velocity_accum,
                 weights,
                 surface_attract,
@@ -313,17 +563,19 @@ def _scatter_trace_surface_numba(
                 surface_attract_best_dist_sq,
                 enable_surface_attract,
                 surface_attract_radius,
-                surface_grid[r, c],
-                surface_grid[r, c],
-                vectors[r, c],
-                vectors[r, c],
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2),
+                float(vectors[r, c, 0]),
+                float(vectors[r, c, 1]),
+                float(vectors[r, c, 2]),
             )
 
     for r in range(rows):
         for c in range(cols - 1):
             if not (valid[r, c] and valid[r, c + 1]):
                 continue
-            _scatter_trace_line_numba(
+            _scatter_trace_line_values_numba(
                 velocity_accum,
                 weights,
                 surface_attract,
@@ -331,17 +583,25 @@ def _scatter_trace_surface_numba(
                 surface_attract_best_dist_sq,
                 enable_surface_attract,
                 surface_attract_radius,
-                surface_grid[r, c],
-                surface_grid[r, c + 1],
-                vectors[r, c],
-                vectors[r, c + 1],
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 0),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 1),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c + 1, 2),
+                float(vectors[r, c, 0]),
+                float(vectors[r, c, 1]),
+                float(vectors[r, c, 2]),
+                float(vectors[r, c + 1, 0]),
+                float(vectors[r, c + 1, 1]),
+                float(vectors[r, c + 1, 2]),
             )
 
     for r in range(rows - 1):
         for c in range(cols):
             if not (valid[r, c] and valid[r + 1, c]):
                 continue
-            _scatter_trace_line_numba(
+            _scatter_trace_line_values_numba(
                 velocity_accum,
                 weights,
                 surface_attract,
@@ -349,19 +609,30 @@ def _scatter_trace_surface_numba(
                 surface_attract_best_dist_sq,
                 enable_surface_attract,
                 surface_attract_radius,
-                surface_grid[r, c],
-                surface_grid[r + 1, c],
-                vectors[r, c],
-                vectors[r + 1, c],
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 0),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 1),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r, c, 2),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 0),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 1),
+                _logical_surface_value(surface_a, surface_b, has_b, concat_axis, r + 1, c, 2),
+                float(vectors[r, c, 0]),
+                float(vectors[r, c, 1]),
+                float(vectors[r, c, 2]),
+                float(vectors[r + 1, c, 0]),
+                float(vectors[r + 1, c, 1]),
+                float(vectors[r + 1, c, 2]),
             )
 
 
-def _scatter_trace_surface(
+def _scatter_logical_trace_surface(
     velocity_accum: np.ndarray,
     weights: np.ndarray,
-    surface_grid: np.ndarray,
-    vectors: np.ndarray,
-    valid: np.ndarray,
+    surface_a: np.ndarray,
+    *,
+    surface_b: np.ndarray | None = None,
+    concat_axis: int = 0,
+    tangent_axis: int,
+    tangent_sign: float,
     surface_attract: np.ndarray | None = None,
     surface_attract_weight: np.ndarray | None = None,
     surface_attract_best_dist_sq: np.ndarray | None = None,
@@ -377,10 +648,40 @@ def _scatter_trace_surface(
         surface_attract = np.zeros((3, 1, 1, 1), dtype=np.float32)
         surface_attract_weight = np.zeros((1, 1, 1), dtype=np.float32)
         surface_attract_best_dist_sq = np.zeros((1, 1, 1), dtype=np.float32)
-    _scatter_trace_surface_numba(
+    has_b = surface_b is not None
+    if surface_b is None:
+        surface_b = np.zeros((1, 1, 3), dtype=np.float32)
+    if has_b:
+        if int(concat_axis) == 0:
+            rows = int(surface_a.shape[0] + surface_b.shape[0])
+            cols = int(surface_a.shape[1])
+        else:
+            rows = int(surface_a.shape[0])
+            cols = int(surface_a.shape[1] + surface_b.shape[1])
+    else:
+        rows = int(surface_a.shape[0])
+        cols = int(surface_a.shape[1])
+    vectors = np.zeros((rows, cols, 3), dtype=np.float32)
+    valid = np.zeros((rows, cols), dtype=np.bool_)
+    _fill_logical_surface_vectors_numba(
+        vectors,
+        valid,
+        surface_a,
+        surface_b,
+        has_b,
+        int(concat_axis),
+        int(tangent_axis),
+        float(tangent_sign),
+    )
+    if not bool(valid.any()):
+        return
+    _scatter_logical_trace_surface_numba(
         velocity_accum,
         weights,
-        surface_grid,
+        surface_a,
+        surface_b,
+        has_b,
+        int(concat_axis),
         vectors,
         valid,
         surface_attract,
@@ -401,6 +702,8 @@ def build_away_from_conditioning_trace_targets(
     include_masked: bool = True,
     dilation_radius: float = 0.0,
     surface_attract_radius: float = 0.0,
+    trace_surfaces_local: tuple[np.ndarray, ...] | None = None,
+    trace_concat_axis: int | None = None,
 ) -> dict[str, np.ndarray] | None:
     """Build ODE-style trace supervision from ordered surface-grid coordinates.
 
@@ -422,30 +725,69 @@ def build_away_from_conditioning_trace_targets(
         surface_attract_weight = np.zeros(crop_size, dtype=np.float32)
         surface_attract_best_dist_sq = np.full(crop_size, np.inf, dtype=np.float32)
 
-    surfaces = []
-    if include_conditioning and cond_surface_local is not None:
-        surfaces.append(np.asarray(cond_surface_local, dtype=np.float32))
-    if include_masked and masked_surface_local is not None:
-        surfaces.append(np.asarray(masked_surface_local, dtype=np.float32))
+    tangent_axis, tangent_sign = _velocity_axis_and_sign(cond_direction)
+    if trace_surfaces_local is not None:
+        surfaces = tuple(np.asarray(surface, dtype=np.float32) for surface in trace_surfaces_local)
+        if len(surfaces) == 0:
+            surfaces = ()
+        elif len(surfaces) == 1:
+            _scatter_logical_trace_surface(
+                velocity_accum,
+                weights,
+                surfaces[0],
+                tangent_axis=tangent_axis,
+                tangent_sign=tangent_sign,
+                surface_attract=surface_attract,
+                surface_attract_weight=surface_attract_weight,
+                surface_attract_best_dist_sq=surface_attract_best_dist_sq,
+                surface_attract_radius=attract_radius,
+            )
+        elif len(surfaces) == 2 and trace_concat_axis is not None:
+            _scatter_logical_trace_surface(
+                velocity_accum,
+                weights,
+                surfaces[0],
+                surface_b=surfaces[1],
+                concat_axis=int(trace_concat_axis),
+                tangent_axis=tangent_axis,
+                tangent_sign=tangent_sign,
+                surface_attract=surface_attract,
+                surface_attract_weight=surface_attract_weight,
+                surface_attract_best_dist_sq=surface_attract_best_dist_sq,
+                surface_attract_radius=attract_radius,
+            )
+        else:
+            for surface in surfaces:
+                _scatter_logical_trace_surface(
+                    velocity_accum,
+                    weights,
+                    surface,
+                    tangent_axis=tangent_axis,
+                    tangent_sign=tangent_sign,
+                    surface_attract=surface_attract,
+                    surface_attract_weight=surface_attract_weight,
+                    surface_attract_best_dist_sq=surface_attract_best_dist_sq,
+                    surface_attract_radius=attract_radius,
+                )
+    else:
+        surfaces = []
+        if include_conditioning and cond_surface_local is not None:
+            surfaces.append(np.asarray(cond_surface_local, dtype=np.float32))
+        if include_masked and masked_surface_local is not None:
+            surfaces.append(np.asarray(masked_surface_local, dtype=np.float32))
 
-    for surface in surfaces:
-        grid = np.asarray(surface, dtype=np.float32)
-        finite = np.isfinite(grid).all(axis=2)
-        vectors, tangent_valid = _surface_velocity_vectors(grid, cond_direction)
-        valid = finite & tangent_valid
-        if not bool(valid.any()):
-            continue
-        _scatter_trace_surface(
-            velocity_accum,
-            weights,
-            grid,
-            vectors,
-            valid,
-            surface_attract=surface_attract,
-            surface_attract_weight=surface_attract_weight,
-            surface_attract_best_dist_sq=surface_attract_best_dist_sq,
-            surface_attract_radius=attract_radius,
-        )
+        for surface in surfaces:
+            _scatter_logical_trace_surface(
+                velocity_accum,
+                weights,
+                surface,
+                tangent_axis=tangent_axis,
+                tangent_sign=tangent_sign,
+                surface_attract=surface_attract,
+                surface_attract_weight=surface_attract_weight,
+                surface_attract_best_dist_sq=surface_attract_best_dist_sq,
+                surface_attract_radius=attract_radius,
+            )
 
     valid_vox = weights > 0.0
     if not bool(valid_vox.any()):

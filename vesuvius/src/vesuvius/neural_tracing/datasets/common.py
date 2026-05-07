@@ -1124,9 +1124,9 @@ def voxelize_surface_grid(
         crop_size: (D, H, W) shape of output volume
 
     Returns:
-        (D, H, W) binary volume with lines connecting adjacent grid points
+        (D, H, W) uint8 binary volume with lines connecting adjacent grid points
     """
-    volume = np.zeros(crop_size, dtype=np.float32)
+    volume = np.zeros(crop_size, dtype=np.uint8)
     n_rows, n_cols = zyx_grid.shape[0], zyx_grid.shape[1]
 
     # Draw horizontal lines (between adjacent columns)

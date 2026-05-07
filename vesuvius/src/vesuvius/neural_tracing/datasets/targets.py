@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Mapping
 
 import torch
@@ -50,29 +51,153 @@ def _cupyx_edt(
         )
 
 
-def _indices_to_displacement(nearest_idx_cp, shape):
+def _distance_transform_distances_cupy(surface_mask: torch.Tensor):
     import cupy as cp
 
-    d, h, w = shape
-    disp_cp = nearest_idx_cp.astype(cp.float32, copy=False)
-    disp_cp[0] -= cp.arange(d, dtype=cp.float32)[:, None, None]
-    disp_cp[1] -= cp.arange(h, dtype=cp.float32)[None, :, None]
-    disp_cp[2] -= cp.arange(w, dtype=cp.float32)[None, None, :]
-    return cp.ascontiguousarray(disp_cp)
-
-
-def _distance_transform_distances_torch(surface_mask: torch.Tensor):
     surface_bool = (surface_mask > 0.5).contiguous()
     if surface_bool.ndim != 3:
         raise ValueError(f"surface mask must be 3D, got shape {tuple(surface_bool.shape)}")
     if not bool(surface_bool.any().item()):
         return None
     with _cupy_device(surface_bool):
-        import cupy as cp
-
         distances_cp = _cupyx_edt(surface_bool, return_distances=True, return_indices=False)
-        distances_cp = cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
-        return _cupy_to_torch(distances_cp).to(dtype=torch.float32)
+        return cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
+
+
+@lru_cache(maxsize=None)
+def _trace_validity_from_edt_kernel():
+    import cupy as cp
+
+    return cp.ElementwiseKernel(
+        (
+            "float32 d_target, float32 d_neighbor, float32 positive_radius, "
+            "float32 negative_radius, float32 margin_threshold, float32 background_weight"
+        ),
+        "float32 label, float32 weight",
+        """
+        const float margin = d_neighbor - d_target;
+        const bool pos = (d_target <= positive_radius) && (margin >= margin_threshold);
+        const bool neg = (d_neighbor <= negative_radius) && (margin < margin_threshold);
+        const bool far_neg = d_target >= negative_radius;
+        const bool hard_neg = neg && !pos;
+        const bool background_neg = far_neg && !pos && !hard_neg;
+        label = pos ? 1.0f : 0.0f;
+        if (pos || hard_neg) {
+            weight = 1.0f;
+        } else if (background_weight > 0.0f && background_neg) {
+            weight = background_weight;
+        } else {
+            weight = 0.0f;
+        }
+        """,
+        "trace_validity_from_edt",
+    )
+
+
+def _trace_validity_from_edt(
+    d_target_cp,
+    d_neighbor_cp,
+    *,
+    positive_radius: float,
+    negative_radius: float,
+    margin_threshold: float,
+    background_weight: float,
+):
+    import cupy as cp
+
+    label_cp = cp.empty_like(d_target_cp, dtype=cp.float32)
+    weight_cp = cp.empty_like(d_target_cp, dtype=cp.float32)
+    _trace_validity_from_edt_kernel()(
+        d_target_cp,
+        d_neighbor_cp,
+        float(positive_radius),
+        float(negative_radius),
+        float(margin_threshold),
+        float(background_weight),
+        label_cp,
+        weight_cp,
+    )
+    return label_cp, weight_cp
+
+
+@lru_cache(maxsize=None)
+def _dilate_and_attract_from_edt_kernel():
+    import cupy as cp
+
+    return cp.ElementwiseKernel(
+        (
+            "raw float32 vel_z, raw float32 vel_y, raw float32 vel_x, "
+            "float32 dist, I nearest_z, I nearest_y, I nearest_x, "
+            "int64 h, int64 w, float32 dilation_radius, float32 attract_radius"
+        ),
+        (
+            "float32 out_vel_z, float32 out_vel_y, float32 out_vel_x, float32 dilated_weight, "
+            "float32 attract_z, float32 attract_y, float32 attract_x, float32 attract_weight"
+        ),
+        """
+        const long long linear = i;
+        const long long x = linear % w;
+        const long long y = (linear / w) % h;
+        const long long z = linear / (w * h);
+        const long long src_linear =
+            static_cast<long long>(nearest_z) * h * w +
+            static_cast<long long>(nearest_y) * w +
+            static_cast<long long>(nearest_x);
+        const bool finite = isfinite(dist);
+        const bool in_dilation_band = finite && dist <= dilation_radius;
+        const bool in_attract_band = finite && dist <= attract_radius;
+
+        dilated_weight = in_dilation_band ? 1.0f : 0.0f;
+        out_vel_z = in_dilation_band ? vel_z[src_linear] : vel_z[linear];
+        out_vel_y = in_dilation_band ? vel_y[src_linear] : vel_y[linear];
+        out_vel_x = in_dilation_band ? vel_x[src_linear] : vel_x[linear];
+
+        attract_weight = in_attract_band ? 1.0f : 0.0f;
+        attract_z = in_attract_band ? static_cast<float>(nearest_z) - static_cast<float>(z) : 0.0f;
+        attract_y = in_attract_band ? static_cast<float>(nearest_y) - static_cast<float>(y) : 0.0f;
+        attract_x = in_attract_band ? static_cast<float>(nearest_x) - static_cast<float>(x) : 0.0f;
+        """,
+        "dilate_and_attract_from_edt",
+    )
+
+
+def _dilate_and_attract_from_edt(
+    velocity_cp,
+    nearest_dist_cp,
+    nearest_idx_cp,
+    shape,
+    dilation_radius: float,
+    attract_radius: float,
+):
+    import cupy as cp
+
+    _, h, w = shape
+    dilated_velocity_cp = cp.empty_like(velocity_cp, dtype=cp.float32)
+    dilated_weight_cp = cp.empty((1, *shape), dtype=cp.float32)
+    attract_cp = cp.empty((3, *shape), dtype=cp.float32)
+    attract_weight_cp = cp.empty((1, *shape), dtype=cp.float32)
+    _dilate_and_attract_from_edt_kernel()(
+        velocity_cp[0],
+        velocity_cp[1],
+        velocity_cp[2],
+        nearest_dist_cp,
+        nearest_idx_cp[0],
+        nearest_idx_cp[1],
+        nearest_idx_cp[2],
+        int(h),
+        int(w),
+        float(dilation_radius),
+        float(attract_radius),
+        dilated_velocity_cp[0],
+        dilated_velocity_cp[1],
+        dilated_velocity_cp[2],
+        dilated_weight_cp[0],
+        attract_cp[0],
+        attract_cp[1],
+        attract_cp[2],
+        attract_weight_cp[0],
+    )
+    return dilated_velocity_cp, dilated_weight_cp, attract_cp, attract_weight_cp
 
 
 def _dilate_trace_targets_torch(
@@ -98,8 +223,6 @@ def _dilate_trace_targets_torch(
     surface_attracts = [] if float(surface_attract_radius) > 0.0 else None
     surface_attract_weights = [] if float(surface_attract_radius) > 0.0 else None
 
-    import cupy as cp
-
     for b in range(velocity_dir.shape[0]):
         if not bool((source_weight[b, 0] > 0.5).any().item()):
             dilated_dirs.append(velocity_dir[b])
@@ -117,28 +240,39 @@ def _dilate_trace_targets_torch(
                 return_distances=True,
                 return_indices=True,
             )
-            band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= float(radius_voxels))
-            if bool(cp.any(band_cp).item()):
-                src_z = nearest_idx_cp[0][band_cp]
-                src_y = nearest_idx_cp[1][band_cp]
-                src_x = nearest_idx_cp[2][band_cp]
-                velocity_cp[:, band_cp] = velocity_cp[:, src_z, src_y, src_x]
-
-            dilated_dir = velocity_b
-            dilated_weight = _cupy_to_torch(
-                cp.ascontiguousarray(band_cp[None].astype(cp.float32, copy=False))
-            )
 
             attract_b = None
             attract_weight_b = None
             attract_radius = float(surface_attract_radius)
             if attract_radius > 0.0:
-                attract_band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= attract_radius)
-                attract_cp = _indices_to_displacement(nearest_idx_cp, source_weight.shape[2:])
-                attract_cp[:, ~attract_band_cp] = 0.0
+                (
+                    dilated_velocity_cp,
+                    dilated_weight_cp,
+                    attract_cp,
+                    attract_weight_cp,
+                ) = _dilate_and_attract_from_edt(
+                    velocity_cp,
+                    nearest_dist_cp,
+                    nearest_idx_cp,
+                    source_weight.shape[2:],
+                    float(radius_voxels),
+                    attract_radius,
+                )
+                dilated_dir = _cupy_to_torch(dilated_velocity_cp)
+                dilated_weight = _cupy_to_torch(dilated_weight_cp)
                 attract_b = _cupy_to_torch(attract_cp)
-                attract_weight_b = _cupy_to_torch(
-                    cp.ascontiguousarray(attract_band_cp[None].astype(cp.float32, copy=False))
+                attract_weight_b = _cupy_to_torch(attract_weight_cp)
+            else:
+                import cupy as cp
+
+                band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= float(radius_voxels))
+                src_z = nearest_idx_cp[0][band_cp]
+                src_y = nearest_idx_cp[1][band_cp]
+                src_x = nearest_idx_cp[2][band_cp]
+                velocity_cp[:, band_cp] = velocity_cp[:, src_z, src_y, src_x]
+                dilated_dir = velocity_b
+                dilated_weight = _cupy_to_torch(
+                    cp.ascontiguousarray(band_cp[None].astype(cp.float32, copy=False))
                 )
         dilated_dirs.append(dilated_dir)
         dilated_weights.append(dilated_weight)
@@ -240,30 +374,23 @@ class RowColTargets:
         background_weight = float(config.get("trace_validity_background_weight", 0.25))
 
         for b in range(target_mask.shape[0]):
-            d_target = _distance_transform_distances_torch(target_mask[b])
-            d_neighbor = _distance_transform_distances_torch(batch["neighbor_seg"][b])
-            if d_target is None or d_neighbor is None:
+            d_target_cp = _distance_transform_distances_cupy(target_mask[b])
+            d_neighbor_cp = _distance_transform_distances_cupy(batch["neighbor_seg"][b])
+            if d_target_cp is None or d_neighbor_cp is None:
                 labels.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
                 weights.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
                 continue
 
-            label = torch.zeros_like(d_target, dtype=torch.float32)
-            weight = torch.zeros_like(d_target, dtype=torch.float32)
-            margin = d_neighbor - d_target
-            pos = (d_target <= positive_radius) & (margin >= margin_threshold)
-            neg = (d_neighbor <= negative_radius) & (margin < margin_threshold)
-            far_neg = d_target >= negative_radius
-
-            label[pos] = 1.0
-            weight[pos] = 1.0
-            hard_neg = neg & ~pos
-            weight[hard_neg] = 1.0
-            background_neg = far_neg & ~pos & ~hard_neg
-            if background_weight > 0.0:
-                weight[background_neg] = background_weight
-
-            labels.append(label)
-            weights.append(weight)
+            label_cp, weight_cp = _trace_validity_from_edt(
+                d_target_cp,
+                d_neighbor_cp,
+                positive_radius=positive_radius,
+                negative_radius=negative_radius,
+                margin_threshold=margin_threshold,
+                background_weight=background_weight,
+            )
+            labels.append(_cupy_to_torch(label_cp))
+            weights.append(_cupy_to_torch(weight_cp))
 
         return torch.stack(labels, dim=0).unsqueeze(1), torch.stack(weights, dim=0).unsqueeze(1)
 

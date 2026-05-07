@@ -779,8 +779,14 @@ def _occupancy_metric(outputs: dict, batch: dict) -> Tensor:
         pred_grid = pred_grid.reshape(grid_shape[0], grid_shape[1], 3)
         target_grid = batch["target_grid_local"][batch_idx].detach().cpu().numpy()
         crop_shape = tuple(int(v) for v in volume.shape[-3:])
-        pred_vox = torch.from_numpy(voxelize_surface_grid(pred_grid.astype("float32"), crop_shape)).to(device=device)
-        target_vox = torch.from_numpy(voxelize_surface_grid(target_grid.astype("float32"), crop_shape)).to(device=device)
+        pred_vox = torch.from_numpy(voxelize_surface_grid(pred_grid.astype("float32"), crop_shape)).to(
+            device=device,
+            dtype=torch.float32,
+        )
+        target_vox = torch.from_numpy(voxelize_surface_grid(target_grid.astype("float32"), crop_shape)).to(
+            device=device,
+            dtype=torch.float32,
+        )
         losses.append(F.binary_cross_entropy(pred_vox.clamp(1e-6, 1.0 - 1e-6), target_vox))
     if not losses:
         return torch.zeros((), device=device)

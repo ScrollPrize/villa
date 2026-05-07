@@ -22,6 +22,7 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("force_recompute_patches", False)
 
     config.setdefault("validate_result_tensors", False)
+    config.setdefault("profile_create_split_masks", False)
 
     # Patch-finding defaults.
     config.setdefault("overlap_fraction", 0.0)
