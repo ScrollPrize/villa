@@ -30,6 +30,7 @@ from vesuvius.neural_tracing.nets.models import (
     load_checkpoint,
     load_checkpoint_payload,
     make_model,
+    strip_state,
 )
 from vesuvius.neural_tracing.trainers.loss_config import TraceLossConfig
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
@@ -64,6 +65,12 @@ def collate_with_padding(batch):
 def prepare_batch(batch, config):
     """Prepare batch tensors for training."""
     return RowColTargets.from_batch(batch, config)
+
+
+def checkpoint_model_state_dict(accelerator, model):
+    """Return a wrapper-free model state dict for portable checkpoints."""
+    unwrapped_model = accelerator.unwrap_model(model)
+    return strip_state(unwrapped_model.state_dict())
 
 
 @click.command()
@@ -254,8 +261,12 @@ def train(config_path):
                 else:
                     accelerator.print('Resume enabled but checkpoint missing lr_scheduler state; using fresh scheduler')
 
-    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+    # Keep the scheduler out of accelerator.prepare. Accelerate wraps prepared
+    # schedulers and, with sharded dataloaders, advances them once per process.
+    # This trainer defines num_iterations as optimizer-update iterations, so the
+    # LR schedule should advance once per real optimizer step.
+    model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader
     )
 
     if accelerator.is_main_process:
@@ -368,7 +379,8 @@ def train(config_path):
                     wandb_log['skipped_step_nonfinite_grad'] = 1.0
             if do_optimizer_step:
                 optimizer.step()
-                lr_scheduler.step()
+                if accelerator.sync_gradients and not getattr(optimizer, "step_was_skipped", False):
+                    lr_scheduler.step()
             optimizer.zero_grad()
 
         wandb_log['loss'] = total_loss.detach().item()
@@ -485,7 +497,7 @@ def train(config_path):
             and accelerator.is_main_process
         ):
             torch.save({
-                'model': model.state_dict(),
+                'model': checkpoint_model_state_dict(accelerator, model),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'config': config,
@@ -500,7 +512,7 @@ def train(config_path):
 
     if accelerator.is_main_process:
         torch.save({
-            'model': model.state_dict(),
+            'model': checkpoint_model_state_dict(accelerator, model),
             'optimizer': optimizer.state_dict(),
             'lr_scheduler': lr_scheduler.state_dict(),
             'config': config,
