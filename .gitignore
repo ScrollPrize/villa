@@ -37,3 +37,4 @@ vesuvius/AGENTS.md
 
 build/
 volume-cartographer/AGENTS.md
+/vesuvius/src/vesuvius/neural_tracing/scratch
