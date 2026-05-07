@@ -27,7 +27,7 @@ from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import make_model
 from vesuvius.neural_tracing.trainers.loss_config import TraceLossConfig
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
-    make_dense_visualization,
+    make_trace_visualization,
 )
 
 import multiprocessing
@@ -531,38 +531,22 @@ def train(config_path):
                 train_img_path = f'{out_dir}/{iteration:06}_train.png'
                 val_img_path = f'{out_dir}/{iteration:06}_val.png'
 
-                train_velocity_dir_pred = output.get('velocity_dir')
-                train_trace_validity_pred = output.get('trace_validity')
-                train_surface_attract_pred = output.get('surface_attract')
+                train_vis = {
+                    'inputs': inputs,
+                    'velocity_dir_pred': output.get('velocity_dir'),
+                    'velocity_dir_target': velocity_dir_target,
+                    'velocity_loss_weight': velocity_loss_weight,
+                    'trace_loss_weight': trace_loss_weight,
+                    'trace_validity_pred': output.get('trace_validity'),
+                    'trace_validity_target': trace_validity_target,
+                    'trace_validity_weight': trace_validity_weight,
+                    'surface_attract_pred': output.get('surface_attract'),
+                    'surface_attract_target': surface_attract_target,
+                    'surface_attract_weight': surface_attract_weight,
+                }
                 if first_val_vis is not None:
-                    make_dense_visualization(
-                        inputs, None, None, None,
-                        velocity_dir_pred=train_velocity_dir_pred,
-                        velocity_dir_target=velocity_dir_target,
-                        velocity_loss_weight=velocity_loss_weight,
-                        trace_loss_weight=trace_loss_weight,
-                        trace_validity_pred=train_trace_validity_pred,
-                        trace_validity_target=trace_validity_target,
-                        trace_validity_weight=trace_validity_weight,
-                        surface_attract_pred=train_surface_attract_pred,
-                        surface_attract_target=surface_attract_target,
-                        surface_attract_weight=surface_attract_weight,
-                        save_path=train_img_path
-                    )
-                    make_dense_visualization(
-                        first_val_vis['inputs'], None, None, None,
-                        velocity_dir_pred=first_val_vis['velocity_dir_pred'],
-                        velocity_dir_target=first_val_vis['velocity_dir_target'],
-                        velocity_loss_weight=first_val_vis['velocity_loss_weight'],
-                        trace_loss_weight=first_val_vis['trace_loss_weight'],
-                        trace_validity_pred=first_val_vis['trace_validity_pred'],
-                        trace_validity_target=first_val_vis['trace_validity_target'],
-                        trace_validity_weight=first_val_vis['trace_validity_weight'],
-                        surface_attract_pred=first_val_vis['surface_attract_pred'],
-                        surface_attract_target=first_val_vis['surface_attract_target'],
-                        surface_attract_weight=first_val_vis['surface_attract_weight'],
-                        save_path=val_img_path
-                    )
+                    make_trace_visualization(train_vis, train_img_path)
+                    make_trace_visualization(first_val_vis, val_img_path)
 
                     if wandb.run is not None:
                         wandb_log['train_image'] = wandb.Image(train_img_path)

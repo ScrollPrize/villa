@@ -714,6 +714,24 @@ def _make_dense_triplet_visualization(
     plt.close(fig)
 
 
+def make_trace_visualization(vis_data, save_path):
+    """Create a dense trace-only visualization from a trainer payload."""
+    make_dense_visualization(
+        vis_data['inputs'], None, None, None,
+        velocity_dir_pred=vis_data.get('velocity_dir_pred'),
+        velocity_dir_target=vis_data.get('velocity_dir_target'),
+        velocity_loss_weight=vis_data.get('velocity_loss_weight'),
+        trace_loss_weight=vis_data.get('trace_loss_weight'),
+        trace_validity_pred=vis_data.get('trace_validity_pred'),
+        trace_validity_target=vis_data.get('trace_validity_target'),
+        trace_validity_weight=vis_data.get('trace_validity_weight'),
+        surface_attract_pred=vis_data.get('surface_attract_pred'),
+        surface_attract_target=vis_data.get('surface_attract_target'),
+        surface_attract_weight=vis_data.get('surface_attract_weight'),
+        save_path=save_path,
+    )
+
+
 def make_dense_visualization(
     inputs,
     disp_pred,
