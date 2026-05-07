@@ -42,33 +42,18 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            build-essential git cmake ninja-build ccache pkg-config \
+            build-essential git cmake ninja-build pkg-config \
             qt6-base-dev libboost-system-dev libboost-program-options-dev \
             libceres-dev libcgal-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
             libgsl-dev libsdl2-dev libcurl4-openssl-dev \
             libde265-dev libx265-dev liblz4-dev nlohmann-json3-dev
 
-      - name: Restore ccache
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-vc3d-ci-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-ci.yml') }}
-          restore-keys: |
-            ccache-${{ runner.os }}-vc3d-ci-
-
-      - name: Enable ccache
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        run: |
-          mkdir -p ~/.ccache
-          echo 'max_size = 5G' >> ~/.ccache/ccache.conf || true
-          echo 'hash_dir = true' >> ~/.ccache/ccache.conf || true
-          echo 'compiler_check = content' >> ~/.ccache/ccache.conf || true
-          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE/volume-cartographer" >> $GITHUB_ENV
-
-      - name: Reset ccache stats
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        run: ccache -z || true
+      # ccache was previously wired up here, but in practice every PR ran with
+      # 0% hit rate (Cache not found for input keys: ...). GitHub-hosted runners
+      # scope caches per-branch, the primary key hashes every CMakeLists.txt,
+      # and main never saves a cache for PRs to restore from — so the only
+      # effect was the ~30s of upload/download + apt overhead, with no win on
+      # compile time. Remove until we can fix the caching strategy properly.
 
       - name: Configure smoke build
         if: ${{ steps.changes.outputs.vc == 'true' }}
@@ -81,22 +66,9 @@ jobs:
                 -DBUILD_TESTING=OFF \
                 -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_C_COMPILER=gcc \
-                -DCMAKE_CXX_COMPILER=g++ \
-                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+                -DCMAKE_CXX_COMPILER=g++
 
       - name: Build smoke target set
         if: ${{ steps.changes.outputs.vc == 'true' }}
         working-directory: ./volume-cartographer
         run: cmake --build build --parallel
-
-      - name: Show ccache stats
-        if: ${{ always() && steps.changes.outputs.vc == 'true' }}
-        run: ccache -s || true
-
-      - name: Save ccache
-        if: ${{ always() && steps.changes.outputs.vc == 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-vc3d-ci-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-ci.yml') }}
