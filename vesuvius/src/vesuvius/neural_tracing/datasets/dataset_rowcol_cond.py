@@ -308,12 +308,6 @@ class EdtSegDataset(Dataset):
         x_full, y_full, z_full = trimmed
         return np.stack([z_full, y_full, x_full], axis=-1)
 
-    def _extract_wrap_world_surface_by_index(self, patch_idx: int, wrap_idx: int, require_all_valid: bool = True):
-        """Extract one wrap surface by (patch_idx, wrap_idx)."""
-        patch = self.patches[patch_idx]
-        wrap = patch.wraps[wrap_idx]
-        return self._extract_wrap_world_surface(patch, wrap, require_all_valid=require_all_valid)
-
     def _conditioning_from_surface(
         self,
         *,
@@ -419,11 +413,13 @@ class EdtSegDataset(Dataset):
         if triplet_meta is None:
             return None
 
+        patch = self.patches[patch_idx]
         neighbor_vox = np.zeros(crop_shape, dtype=np.float32)
         for key in ("behind_wrap_idx", "front_wrap_idx"):
-            neighbor_surface = self._extract_wrap_world_surface_by_index(
-                patch_idx,
-                int(triplet_meta[key]),
+            neighbor_wrap_idx = int(triplet_meta[key])
+            neighbor_surface = self._extract_wrap_world_surface(
+                patch,
+                patch.wraps[neighbor_wrap_idx],
                 require_all_valid=True,
             )
             if neighbor_surface is None:
@@ -571,11 +567,6 @@ class EdtSegDataset(Dataset):
             self.crop_size,
             cond_direction,
             cond_surface_local=trace_surface_np,
-            masked_surface_local=None,
-            include_conditioning=True,
-            include_masked=False,
-            dilation_radius=0.0,
-            surface_attract_radius=0.0,
         )
         if trace_payload is None:
             return self._resample_item(

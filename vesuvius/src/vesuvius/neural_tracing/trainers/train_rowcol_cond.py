@@ -248,27 +248,26 @@ def collate_with_padding(batch):
     }
 
 
-def prepare_batch(
-    batch,
-    use_growth_direction_channels=False,
-):
+def prepare_batch(batch):
     """Prepare batch tensors for training."""
     vol = batch['vol'].unsqueeze(1)  # [B, 1, D, H, W]
     cond = batch['cond'].unsqueeze(1)  # [B, 1, D, H, W]
 
-    input_list = [vol, cond]
-    if use_growth_direction_channels:
-        if 'cond_direction' not in batch:
-            raise ValueError("use_growth_direction_channels=True but batch is missing cond_direction")
-        input_list.append(
+    if 'cond_direction' not in batch:
+        raise ValueError("Batch is missing cond_direction")
+    inputs = torch.cat(
+        [
+            vol,
+            cond,
             make_growth_direction_tensor(
                 batch['cond_direction'],
                 vol.shape[2:],
                 device=vol.device,
                 dtype=vol.dtype,
-            )
-        )
-    inputs = torch.cat(input_list, dim=1)
+            ),
+        ],
+        dim=1,
+    )
 
     velocity_dir_target = batch['velocity_dir']  # [B, 3, D, H, W]
     velocity_loss_weight = batch['velocity_loss_weight']  # [B, 1, D, H, W]
@@ -302,15 +301,7 @@ def train(config_path):
 
     validate_rowcol_cond_dataset_config(config)
 
-    default_in_channels = (
-        2
-        + (
-            growth_direction_channel_count()
-            if bool(config.get('use_growth_direction_channels', False))
-            else 0
-        )
-    )
-    config['in_channels'] = default_in_channels
+    config['in_channels'] = 2 + growth_direction_channel_count()
     config.setdefault('step_count', 1)  # Required by make_model
     config.setdefault('num_iterations', 250000)
     config.setdefault('log_frequency', 100)
@@ -731,7 +722,7 @@ def train(config_path):
     if accelerator.is_main_process:
         accelerator.print("\n=== Trace ODE Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
-        accelerator.print(f"Growth direction channels: {config.get('use_growth_direction_channels', False)}")
+        accelerator.print("Growth direction channels: True")
         output_heads = []
         output_heads.append("velocity_dir (3ch)")
         output_heads.append("surface_attract (3ch)")
@@ -826,10 +817,7 @@ def train(config_path):
             accelerator.print(f"got batch, keys: {batch.keys()}")
 
         build_velocity_targets_on_device(batch)
-        inputs, velocity_dir_target, velocity_loss_weight, trace_loss_weight, trace_validity_target, trace_validity_weight, surface_attract_target, surface_attract_weight = prepare_batch(
-            batch,
-            use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-        )
+        inputs, velocity_dir_target, velocity_loss_weight, trace_loss_weight, trace_validity_target, trace_validity_weight, surface_attract_target, surface_attract_weight = prepare_batch(batch)
         _mark_first_iter("batch prepared")
 
         wandb_log = {}
@@ -979,10 +967,7 @@ def train(config_path):
                         val_batch = next(val_iterator)
 
                     build_velocity_targets_on_device(val_batch)
-                    val_inputs, val_velocity_dir_target, val_velocity_loss_weight, val_trace_loss_weight, val_trace_validity_target, val_trace_validity_weight, val_surface_attract_target, val_surface_attract_weight = prepare_batch(
-                        val_batch,
-                        use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-                    )
+                    val_inputs, val_velocity_dir_target, val_velocity_loss_weight, val_trace_loss_weight, val_trace_validity_target, val_trace_validity_weight, val_surface_attract_target, val_surface_attract_weight = prepare_batch(val_batch)
 
                     with accelerator.autocast():
                         val_output = eval_forward_model(val_inputs)
