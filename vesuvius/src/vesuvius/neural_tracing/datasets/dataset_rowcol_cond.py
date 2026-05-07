@@ -66,32 +66,8 @@ class EdtSegDataset(Dataset):
             self.crop_size = (size, size, size)
 
         target_size = self.crop_size
-        self._heatmap_axes = [torch.arange(s, dtype=torch.float32) for s in self.crop_size]
-
         setdefault_rowcol_cond_dataset_config(config)
         validate_rowcol_cond_dataset_config(config)
-        self.displacement_supervision = str(config['displacement_supervision']).lower()
-        self.use_dense_displacement = bool(config['use_dense_displacement'])
-        self.defer_dense_targets_to_trainer = bool(config.get('defer_dense_targets_to_trainer', False))
-        if not self.defer_dense_targets_to_trainer:
-            raise ValueError(
-                "defer_dense_targets_to_trainer=False is no longer supported; "
-                "dense EDT targets are built in the trainer."
-            )
-        self.use_velocity_targets = bool(config.get('use_velocity_targets', False))
-        self.velocity_target_mode = str(config.get('velocity_target_mode', 'away_from_conditioning')).lower()
-        self.velocity_target_region = str(config.get('velocity_target_region', 'full')).lower()
-        self.use_trace_ode_targets = bool(config.get('use_trace_ode_targets', False))
-        self.trace_target_mode = str(config.get('trace_target_mode', 'away_from_conditioning')).lower()
-        self.trace_target_region = str(config.get('trace_target_region', 'full')).lower()
-        self.trace_target_dilation_radius = float(
-            config.get('trace_target_dilation_radius', 1.0)
-        )
-        self.surface_attract_target_mode = str(config.get('surface_attract_target_mode', 'dense_edt')).lower()
-        self.trace_surface_attract_radius = float(config.get('trace_surface_attract_radius', 0.0))
-        self.use_surface_attract_targets = (
-            self.use_trace_ode_targets and float(config.get('lambda_surface_attract', 0.0)) > 0.0
-        )
         self.use_trace_validity_targets = bool(config.get('use_trace_validity_targets', False)) or (
             float(config.get('lambda_trace_validity', 0.0)) > 0.0
         )
@@ -99,14 +75,6 @@ class EdtSegDataset(Dataset):
         self.neighbor_sheet_required = bool(config.get('neighbor_sheet_required', False))
         if self.neighbor_sheet_required:
             self.use_neighbor_sheet_context = True
-        self.defer_trace_dilation_to_trainer = bool(config.get('defer_trace_dilation_to_trainer', False))
-        self.defer_trace_validity_to_trainer = bool(config.get('defer_trace_validity_to_trainer', False))
-        if self.use_trace_validity_targets and not self.defer_trace_validity_to_trainer:
-            raise ValueError(
-                "defer_trace_validity_to_trainer=False is no longer supported; "
-                "trace-validity EDT targets are built in the trainer."
-            )
-        self.use_dense_displacement = True
         self._validate_result_tensors_enabled = bool(config['validate_result_tensors'])
 
         aug_config = config.get('augmentation', {})
@@ -645,9 +613,6 @@ class EdtSegDataset(Dataset):
             masked_surface_local=masked_surface_local,
             masked_surface_keypoints=masked_surface_keypoints,
             masked_surface_shape=masked_surface_shape,
-            use_segmentation=False,
-            use_sdt=False,
-            use_heatmap=False,
             neighbor_seg_tensor=neighbor_seg_tensor,
         )
         vol_crop = split_augmented["vol_crop"]
@@ -681,59 +646,44 @@ class EdtSegDataset(Dataset):
 
         if self.use_trace_validity_targets and neighbor_seg_tensor is not None:
             result["neighbor_seg"] = neighbor_seg_tensor
-        if self.use_trace_ode_targets:
-            cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
-            masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
-            trace_dilation_radius = (
-                0.0 if self.defer_trace_dilation_to_trainer else self.trace_target_dilation_radius
+        cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+        masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+        if cond_direction == "left":
+            trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=1)
+        elif cond_direction == "right":
+            trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=1)
+        elif cond_direction == "up":
+            trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=0)
+        elif cond_direction == "down":
+            trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=0)
+        else:
+            trace_surface_np = None
+        trace_payload = build_away_from_conditioning_trace_targets(
+            self.crop_size,
+            cond_direction,
+            cond_surface_local=trace_surface_np,
+            masked_surface_local=None,
+            include_conditioning=True,
+            include_masked=False,
+            dilation_radius=0.0,
+            surface_attract_radius=0.0,
+        )
+        if trace_payload is None:
+            return self._resample_item(
+                idx,
+                "split trace target unavailable",
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
             )
-            trace_surface_attract_radius = (
-                0.0
-                if self.defer_trace_dilation_to_trainer
-                and self.surface_attract_target_mode == "trace_band"
-                else self.trace_surface_attract_radius
-            )
-            if cond_direction == "left":
-                trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=1)
-            elif cond_direction == "right":
-                trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=1)
-            elif cond_direction == "up":
-                trace_surface_np = np.concatenate([cond_surface_np, masked_surface_np], axis=0)
-            elif cond_direction == "down":
-                trace_surface_np = np.concatenate([masked_surface_np, cond_surface_np], axis=0)
-            else:
-                trace_surface_np = None
-            trace_payload = build_away_from_conditioning_trace_targets(
-                self.crop_size,
-                cond_direction,
-                cond_surface_local=trace_surface_np,
-                masked_surface_local=None,
-                include_conditioning=True,
-                include_masked=False,
-                dilation_radius=trace_dilation_radius,
-                surface_attract_radius=(
-                    trace_surface_attract_radius
-                    if self.use_surface_attract_targets
-                    and self.surface_attract_target_mode == "trace_band"
-                    else 0.0
-                ),
-            )
-            if trace_payload is None:
-                return self._resample_item(
-                    idx,
-                    "split trace target unavailable",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-            result["velocity_dir"] = torch.from_numpy(trace_payload["velocity_dir"]).to(torch.float32)
-            result["velocity_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
-            result["trace_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
-            if "surface_attract" in trace_payload:
-                result["surface_attract"] = torch.from_numpy(trace_payload["surface_attract"]).to(torch.float32)
-                result["surface_attract_weight"] = torch.from_numpy(
-                    trace_payload["surface_attract_weight"]
-                ).to(torch.float32)
+        result["velocity_dir"] = torch.from_numpy(trace_payload["velocity_dir"]).to(torch.float32)
+        result["velocity_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
+        result["trace_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
+        if "surface_attract" in trace_payload:
+            result["surface_attract"] = torch.from_numpy(trace_payload["surface_attract"]).to(torch.float32)
+            result["surface_attract_weight"] = torch.from_numpy(
+                trace_payload["surface_attract_weight"]
+            ).to(torch.float32)
 
         if not _validate_result_tensors(
             result,

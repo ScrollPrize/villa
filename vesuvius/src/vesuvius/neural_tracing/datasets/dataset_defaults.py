@@ -5,13 +5,10 @@ import numpy as np
 
 def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Populate default config values for the row/col conditioning dataset."""
-    config.setdefault("use_sdt", False)
     config.setdefault("dilation_radius", 1)  # voxels
     config.setdefault("cond_percent", [0.1, 0.5])
     config.setdefault("use_dense_displacement", True)
-    config.setdefault("use_velocity_targets", False)
-    config.setdefault("use_trace_ode_targets", False)
-    config.setdefault("defer_dense_targets_to_trainer", True)
+    config.setdefault("use_trace_ode_targets", True)
     config.setdefault("lambda_velocity_dir", 0.1)
     config.setdefault("velocity_target_mode", "away_from_conditioning")
     config.setdefault("velocity_target_region", "full")
@@ -29,23 +26,13 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("trace_validity_margin", 3.0)
     config.setdefault("trace_validity_background_weight", 0.25)
     config.setdefault("trace_validity_pos_weight", 1.0)
-    config.setdefault("defer_trace_dilation_to_trainer", False)
-    config.setdefault("defer_trace_validity_to_trainer", True)
     config.setdefault("supervise_conditioning", False)
     config.setdefault("cond_supervision_weight", 0.1)
     config.setdefault("use_growth_direction_channels", False)
     config.setdefault("force_recompute_patches", False)
-    config.setdefault("use_heatmap_targets", False)
-    config.setdefault("heatmap_step_size", 10)
-    config.setdefault("heatmap_step_count", 5)
-    config.setdefault("heatmap_sigma", 2.0)
-    config.setdefault("use_segmentation", False)
     config.setdefault("sample_mode", "wrap")
     config.setdefault("val_num_workers", 0)
     config.setdefault("persistent_workers", False)
-
-    config.setdefault("use_other_wrap_cond", False)
-    config.setdefault("use_triplet_wrap_displacement", False)
 
     config.setdefault("validate_result_tensors", False)
     
@@ -75,8 +62,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     cond_local_perturb.setdefault("max_total_displacement", 6.0)
     config["cond_local_perturb"] = cond_local_perturb
 
-    config.setdefault("displacement_supervision", "vector")
-
 
 def _require_choice(name: str, value: str, allowed: set[str]) -> None:
     if value not in allowed:
@@ -105,9 +90,6 @@ def _require_finite_range(
 
 def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Validate row/col conditioning dataset config invariants."""
-    displacement_supervision = str(config.get("displacement_supervision", "vector")).lower()
-    _require_choice("displacement_supervision", displacement_supervision, {"vector", "normal_scalar"})
-
     sample_mode = str(config.get("sample_mode", "wrap")).lower()
     _require_choice("sample_mode", sample_mode, {"wrap", "chunk"})
 
@@ -147,41 +129,21 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
     trace_validity_pos_weight = float(config.get("trace_validity_pos_weight", 1.0))
     _require_finite_range("trace_validity_pos_weight", trace_validity_pos_weight, min_value=0.0)
 
-    if not bool(config.get("defer_dense_targets_to_trainer", True)):
-        raise ValueError(
-            "defer_dense_targets_to_trainer=False is no longer supported; "
-            "dense EDT targets are built in the trainer."
-        )
-    if (
-        bool(config.get("use_trace_validity_targets", False))
-        or float(config.get("lambda_trace_validity", 0.0)) > 0.0
-    ) and not bool(config.get("defer_trace_validity_to_trainer", True)):
-        raise ValueError(
-            "defer_trace_validity_to_trainer=False is no longer supported; "
-            "trace-validity EDT targets are built in the trainer."
-        )
-
     use_dense_displacement = bool(config.get("use_dense_displacement", False))
-    use_triplet_wrap_displacement = bool(config.get("use_triplet_wrap_displacement", False))
-    use_velocity_targets = bool(config.get("use_velocity_targets", False))
     use_trace_ode_targets = bool(config.get("use_trace_ode_targets", False))
-    use_growth_direction_channels = bool(config.get("use_growth_direction_channels", False))
 
-    if not use_triplet_wrap_displacement and not use_dense_displacement:
+    if not use_dense_displacement:
         raise ValueError(
             "Regular split no longer supports sparse supervision; "
             "set use_dense_displacement=True."
         )
-
-    if displacement_supervision == "normal_scalar" and use_dense_displacement:
-        raise ValueError("displacement_supervision='normal_scalar' is not supported with use_dense_displacement=True")
+    if not use_trace_ode_targets:
+        raise ValueError("rowcol_cond requires use_trace_ode_targets=True")
 
     unsupported_flags = {
-        "use_triplet_wrap_displacement": use_triplet_wrap_displacement,
+        "displacement_supervision=normal_scalar": str(config.get("displacement_supervision", "vector")).lower() == "normal_scalar",
+        "use_triplet_wrap_displacement": bool(config.get("use_triplet_wrap_displacement", False)),
         "use_other_wrap_cond": bool(config.get("use_other_wrap_cond", False)),
-        "use_sdt": bool(config.get("use_sdt", False)),
-        "use_heatmap_targets": bool(config.get("use_heatmap_targets", False)),
-        "use_segmentation": bool(config.get("use_segmentation", False)),
     }
     enabled_unsupported = [name for name, enabled in unsupported_flags.items() if enabled]
     if enabled_unsupported:

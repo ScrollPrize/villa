@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Trainer for row/col conditioned displacement field prediction.
+Trainer for row/col conditioned trace-ODE target prediction.
 
-Trains a model to predict dense 3D displacement fields from conditioned surfaces,
-with optional SDT (Signed Distance Transform) prediction.
+Trains velocity, trace validity, and trace-band surface attraction heads from
+conditioned surfaces.
 """
 import os
 import json
@@ -18,7 +18,6 @@ import numpy as np
 import torch.nn.functional as F
 from tqdm import tqdm
 import time
-from scipy import ndimage
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.datasets.dataset_defaults import (
@@ -31,7 +30,6 @@ from vesuvius.neural_tracing.datasets.growth_direction import (
 )
 from vesuvius.neural_tracing.loss.displacement_losses import (
     dense_displacement_loss,
-    smoothness_loss,
     velocity_streamline_integration_loss,
     weighted_vector_smoothness_loss,
 )
@@ -40,7 +38,6 @@ from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import make_model
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
     make_dense_visualization,
-    make_visualization,
 )
 from accelerate.utils import TorchDynamoPlugin
 
@@ -70,133 +67,49 @@ def _cupy_to_torch(array):
     return torch.utils.dlpack.from_dlpack(array)
 
 
-def _cupyx_distance_transform_edt(surface_bool: torch.Tensor, return_distances: bool):
-    """Run cupyx EDT on the CUDA device backing ``surface_bool``."""
+def _cupy_device(tensor: torch.Tensor):
+    import cupy as cp
+
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return cp.cuda.Device(int(device_index))
+
+
+def _cupyx_edt(
+    surface_bool: torch.Tensor,
+    *,
+    return_distances: bool,
+    return_indices: bool,
+):
+    """Run the single supported EDT implementation on a 3D CUDA mask."""
     import cupy as cp
     from cupyx.scipy import ndimage as cndimage
 
-    device_index = surface_bool.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-
-    with cp.cuda.Device(int(device_index)):
-        surface_cp = _torch_to_cupy(surface_bool)
-        out = cndimage.distance_transform_edt(
-            ~surface_cp,
-            return_distances=bool(return_distances),
-            return_indices=True,
-            float64_distances=False,
-        )
-        if return_distances:
-            distances_cp, nearest_idx_cp = out
-            distances_cp = cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
-        else:
-            nearest_idx_cp = out
-            distances_cp = None
-
-        disp_cp = nearest_idx_cp.astype(cp.float32, copy=False)
-        d, h, w = surface_bool.shape
-        disp_cp[0] -= cp.arange(d, dtype=cp.float32)[:, None, None]
-        disp_cp[1] -= cp.arange(h, dtype=cp.float32)[None, :, None]
-        disp_cp[2] -= cp.arange(w, dtype=cp.float32)[None, None, :]
-        disp_cp = cp.ascontiguousarray(disp_cp)
-
-        disp = _cupy_to_torch(disp_cp)
-        if return_distances:
-            distances = _cupy_to_torch(distances_cp)
-            return disp, distances
-        return disp, None
-
-
-def _scipy_distance_transform_edt(surface_bool: torch.Tensor, return_distances: bool):
-    surface_np = surface_bool.detach().cpu().numpy().astype(bool, copy=False)
-    if return_distances:
-        distances_np, nearest_idx_np = ndimage.distance_transform_edt(
-            ~surface_np,
-            return_distances=True,
-            return_indices=True,
-        )
-        distances = torch.from_numpy(distances_np.astype(np.float32, copy=False))
-    else:
-        nearest_idx_np = ndimage.distance_transform_edt(
-            ~surface_np,
-            return_distances=False,
-            return_indices=True,
-        )
-        distances = None
-
-    disp_np = nearest_idx_np.astype(np.float32, copy=False)
-    d, h, w = surface_np.shape
-    disp_np[0] -= np.arange(d, dtype=np.float32)[:, None, None]
-    disp_np[1] -= np.arange(h, dtype=np.float32)[None, :, None]
-    disp_np[2] -= np.arange(w, dtype=np.float32)[None, None, :]
-    return torch.from_numpy(disp_np), distances
-
-
-def _compute_dense_displacement_field_torch(
-    surface_mask: torch.Tensor,
-    *,
-    return_weights: bool = True,
-    return_distances: bool = False,
-):
-    surface_bool = (surface_mask > 0.5).contiguous()
     if surface_bool.ndim != 3:
         raise ValueError(f"surface mask must be 3D, got shape {tuple(surface_bool.shape)}")
-    if not bool(surface_bool.any().item()):
-        if return_distances:
-            return None, None, None
-        return None, None
+    if not surface_bool.is_cuda:
+        raise RuntimeError("rowcol_cond EDT targets require CUDA tensors and cupyx.scipy.ndimage")
 
-    if surface_bool.is_cuda:
-        disp, distances = _cupyx_distance_transform_edt(surface_bool, return_distances=return_distances)
-    else:
-        disp, distances = _scipy_distance_transform_edt(surface_bool, return_distances=return_distances)
-        disp = disp.to(device=surface_mask.device, non_blocking=True)
-        if distances is not None:
-            distances = distances.to(device=surface_mask.device, non_blocking=True)
-
-    disp = disp.to(dtype=torch.float32)
-    weights = (
-        torch.ones((1, *surface_bool.shape), device=surface_mask.device, dtype=torch.float32)
-        if return_weights else None
-    )
-    if return_distances:
-        return disp, weights, distances.to(dtype=torch.float32)
-    return disp, weights
-
-
-def _cupyx_distance_transform_distances(surface_bool: torch.Tensor):
-    """Run cupyx EDT distances on the CUDA device backing ``surface_bool``."""
-    import cupy as cp
-    from cupyx.scipy import ndimage as cndimage
-
-    device_index = surface_bool.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-
-    with cp.cuda.Device(int(device_index)):
+    with _cupy_device(surface_bool):
         surface_cp = _torch_to_cupy(surface_bool)
-        distances_cp = cndimage.distance_transform_edt(
+        return cndimage.distance_transform_edt(
             ~surface_cp,
-            return_distances=True,
-            return_indices=False,
+            return_distances=bool(return_distances),
+            return_indices=bool(return_indices),
             float64_distances=False,
         )
-        distances_cp = cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
-        return _cupy_to_torch(distances_cp)
 
 
-def _scipy_distance_transform_distances(surface_bool: torch.Tensor):
-    surface_np = surface_bool.detach().cpu().numpy().astype(bool, copy=False)
-    distances_np = ndimage.distance_transform_edt(
-        ~surface_np,
-        return_distances=True,
-        return_indices=False,
-    )
-    return torch.from_numpy(distances_np.astype(np.float32, copy=False)).to(
-        device=surface_bool.device,
-        non_blocking=True,
-    )
+def _indices_to_displacement(nearest_idx_cp, shape):
+    import cupy as cp
+
+    d, h, w = shape
+    disp_cp = nearest_idx_cp.astype(cp.float32, copy=False)
+    disp_cp[0] -= cp.arange(d, dtype=cp.float32)[:, None, None]
+    disp_cp[1] -= cp.arange(h, dtype=cp.float32)[None, :, None]
+    disp_cp[2] -= cp.arange(w, dtype=cp.float32)[None, None, :]
+    return cp.ascontiguousarray(disp_cp)
 
 
 def _distance_transform_distances_torch(surface_mask: torch.Tensor):
@@ -205,109 +118,12 @@ def _distance_transform_distances_torch(surface_mask: torch.Tensor):
         raise ValueError(f"surface mask must be 3D, got shape {tuple(surface_bool.shape)}")
     if not bool(surface_bool.any().item()):
         return None
-    if surface_bool.is_cuda:
-        distances = _cupyx_distance_transform_distances(surface_bool)
-    else:
-        distances = _scipy_distance_transform_distances(surface_bool)
-    return distances.to(dtype=torch.float32)
+    with _cupy_device(surface_bool):
+        import cupy as cp
 
-
-def _cupyx_dilate_trace_targets(
-    velocity_dir: torch.Tensor,
-    source_weight: torch.Tensor,
-    radius_voxels: float,
-    surface_attract_radius: float = 0.0,
-):
-    import cupy as cp
-    from cupyx.scipy import ndimage as cndimage
-
-    device_index = velocity_dir.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-
-    with cp.cuda.Device(int(device_index)):
-        velocity_cp = _torch_to_cupy(velocity_dir)
-        valid_cp = _torch_to_cupy((source_weight[0] > 0.5).contiguous())
-        nearest_dist_cp, nearest_idx_cp = cndimage.distance_transform_edt(
-            ~valid_cp,
-            return_distances=True,
-            return_indices=True,
-            float64_distances=False,
-        )
-        band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= float(radius_voxels))
-        if bool(cp.any(band_cp).item()):
-            src_z = nearest_idx_cp[0][band_cp]
-            src_y = nearest_idx_cp[1][band_cp]
-            src_x = nearest_idx_cp[2][band_cp]
-            velocity_cp[:, band_cp] = velocity_cp[:, src_z, src_y, src_x]
-
-        surface_attract = None
-        surface_attract_weight = None
-        attract_radius = float(surface_attract_radius)
-        if attract_radius > 0.0:
-            attract_band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= attract_radius)
-            d, h, w = source_weight.shape[1:]
-            attract_cp = cp.zeros((3, d, h, w), dtype=cp.float32)
-            if bool(cp.any(attract_band_cp).item()):
-                z, y, x = cp.nonzero(attract_band_cp)
-                attract_cp[0, z, y, x] = nearest_idx_cp[0, z, y, x].astype(cp.float32, copy=False) - z.astype(cp.float32)
-                attract_cp[1, z, y, x] = nearest_idx_cp[1, z, y, x].astype(cp.float32, copy=False) - y.astype(cp.float32)
-                attract_cp[2, z, y, x] = nearest_idx_cp[2, z, y, x].astype(cp.float32, copy=False) - x.astype(cp.float32)
-            surface_attract = _cupy_to_torch(cp.ascontiguousarray(attract_cp))
-            surface_attract_weight = _cupy_to_torch(
-                cp.ascontiguousarray(attract_band_cp[None].astype(cp.float32, copy=False))
-            )
-
-        dilated_weight = _cupy_to_torch(cp.ascontiguousarray(band_cp[None].astype(cp.float32, copy=False)))
-        return velocity_dir, dilated_weight, surface_attract, surface_attract_weight
-
-
-def _scipy_dilate_trace_targets(
-    velocity_dir: torch.Tensor,
-    source_weight: torch.Tensor,
-    radius_voxels: float,
-    surface_attract_radius: float = 0.0,
-):
-    velocity_np = velocity_dir.detach().cpu().numpy().astype(np.float32, copy=True)
-    valid_np = source_weight[0].detach().cpu().numpy() > 0.5
-    nearest_dist_np, nearest_idx_np = ndimage.distance_transform_edt(
-        ~valid_np,
-        return_distances=True,
-        return_indices=True,
-    )
-    band_np = np.isfinite(nearest_dist_np) & (nearest_dist_np <= float(radius_voxels))
-    if band_np.any():
-        src = (
-            nearest_idx_np[0][band_np],
-            nearest_idx_np[1][band_np],
-            nearest_idx_np[2][band_np],
-        )
-        velocity_np[:, band_np] = velocity_np[:, src[0], src[1], src[2]]
-
-    velocity = torch.from_numpy(velocity_np).to(device=velocity_dir.device, non_blocking=True)
-    weight = torch.from_numpy(band_np[None].astype(np.float32, copy=False)).to(
-        device=source_weight.device,
-        non_blocking=True,
-    )
-
-    surface_attract = None
-    surface_attract_weight = None
-    attract_radius = float(surface_attract_radius)
-    if attract_radius > 0.0:
-        attract_band_np = np.isfinite(nearest_dist_np) & (nearest_dist_np <= attract_radius)
-        attract_np = np.zeros_like(velocity_np, dtype=np.float32)
-        if attract_band_np.any():
-            z, y, x = np.nonzero(attract_band_np)
-            attract_np[0, z, y, x] = nearest_idx_np[0, z, y, x].astype(np.float32, copy=False) - z.astype(np.float32)
-            attract_np[1, z, y, x] = nearest_idx_np[1, z, y, x].astype(np.float32, copy=False) - y.astype(np.float32)
-            attract_np[2, z, y, x] = nearest_idx_np[2, z, y, x].astype(np.float32, copy=False) - x.astype(np.float32)
-        surface_attract = torch.from_numpy(attract_np).to(device=velocity_dir.device, non_blocking=True)
-        surface_attract_weight = torch.from_numpy(attract_band_np[None].astype(np.float32, copy=False)).to(
-            device=source_weight.device,
-            non_blocking=True,
-        )
-
-    return velocity, weight, surface_attract, surface_attract_weight
+        distances_cp = _cupyx_edt(surface_bool, return_distances=True, return_indices=False)
+        distances_cp = cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
+        return _cupy_to_torch(distances_cp).to(dtype=torch.float32)
 
 
 def _dilate_trace_targets_torch(
@@ -333,6 +149,8 @@ def _dilate_trace_targets_torch(
     surface_attracts = [] if float(surface_attract_radius) > 0.0 else None
     surface_attract_weights = [] if float(surface_attract_radius) > 0.0 else None
 
+    import cupy as cp
+
     for b in range(velocity_dir.shape[0]):
         if not bool((source_weight[b, 0] > 0.5).any().item()):
             dilated_dirs.append(velocity_dir[b])
@@ -342,30 +160,37 @@ def _dilate_trace_targets_torch(
                 surface_attract_weights.append(torch.zeros_like(velocity_weight[b]))
             continue
 
-        if velocity_dir.is_cuda:
-            (
-                dilated_dir,
-                dilated_weight,
-                attract_b,
-                attract_weight_b,
-            ) = _cupyx_dilate_trace_targets(
-                velocity_dir[b].contiguous(),
-                source_weight[b].contiguous(),
-                radius_voxels,
-                surface_attract_radius=surface_attract_radius,
+        with _cupy_device(velocity_dir):
+            velocity_b = velocity_dir[b].contiguous()
+            velocity_cp = _torch_to_cupy(velocity_b)
+            nearest_dist_cp, nearest_idx_cp = _cupyx_edt(
+                (source_weight[b, 0] > 0.5).contiguous(),
+                return_distances=True,
+                return_indices=True,
             )
-        else:
-            (
-                dilated_dir,
-                dilated_weight,
-                attract_b,
-                attract_weight_b,
-            ) = _scipy_dilate_trace_targets(
-                velocity_dir[b],
-                source_weight[b],
-                radius_voxels,
-                surface_attract_radius=surface_attract_radius,
+            band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= float(radius_voxels))
+            if bool(cp.any(band_cp).item()):
+                src_z = nearest_idx_cp[0][band_cp]
+                src_y = nearest_idx_cp[1][band_cp]
+                src_x = nearest_idx_cp[2][band_cp]
+                velocity_cp[:, band_cp] = velocity_cp[:, src_z, src_y, src_x]
+
+            dilated_dir = velocity_b
+            dilated_weight = _cupy_to_torch(
+                cp.ascontiguousarray(band_cp[None].astype(cp.float32, copy=False))
             )
+
+            attract_b = None
+            attract_weight_b = None
+            attract_radius = float(surface_attract_radius)
+            if attract_radius > 0.0:
+                attract_band_cp = cp.isfinite(nearest_dist_cp) & (nearest_dist_cp <= attract_radius)
+                attract_cp = _indices_to_displacement(nearest_idx_cp, source_weight.shape[2:])
+                attract_cp[:, ~attract_band_cp] = 0.0
+                attract_b = _cupy_to_torch(attract_cp)
+                attract_weight_b = _cupy_to_torch(
+                    cp.ascontiguousarray(attract_band_cp[None].astype(cp.float32, copy=False))
+                )
         dilated_dirs.append(dilated_dir)
         dilated_weights.append(dilated_weight)
         if surface_attracts is not None:
@@ -408,7 +233,7 @@ def resolve_dataloader_context(config):
 
 
 def collate_with_padding(batch):
-    """Collate batch with optional sparse point padding and dense targets."""
+    """Collate batch tensors for the active trace-ODE training path."""
     # Stack fixed-size tensors normally
     vol = torch.stack([b['vol'] for b in batch])
     cond = torch.stack([b['cond'] for b in batch])
@@ -419,48 +244,6 @@ def collate_with_padding(batch):
     if 'cond_direction' in batch[0]:
         result['cond_direction'] = [b['cond_direction'] for b in batch]
 
-    has_extrap_surface = 'extrap_surface' in batch[0]
-    if has_extrap_surface:
-        result['extrap_surface'] = torch.stack([b['extrap_surface'] for b in batch])
-
-    has_sparse_supervision = 'extrap_coords' in batch[0] and 'gt_displacement' in batch[0]
-    if has_sparse_supervision:
-        coords_list = [b['extrap_coords'] for b in batch]
-        disp_list = [b['gt_displacement'] for b in batch]
-        weight_list = [
-            b['point_weights'] if 'point_weights' in b else torch.ones(len(b['extrap_coords']), dtype=torch.float32)
-            for b in batch
-        ]
-        max_points = max(len(c) for c in coords_list)
-
-        B = len(batch)
-        padded_coords = torch.zeros(B, max_points, 3)
-        padded_disp = torch.zeros(B, max_points, 3)
-        valid_mask = torch.zeros(B, max_points)
-        padded_point_weights = torch.zeros(B, max_points)
-        padded_point_normals = torch.zeros(B, max_points, 3)
-        has_point_normals = 'point_normals' in batch[0]
-
-        for i, (c, d, w) in enumerate(zip(coords_list, disp_list, weight_list)):
-            n = len(c)
-            padded_coords[i, :n] = c
-            padded_disp[i, :n] = d
-            valid_mask[i, :n] = 1.0
-            padded_point_weights[i, :n] = w
-            if has_point_normals:
-                padded_point_normals[i, :n] = batch[i]['point_normals']
-
-        result['extrap_coords'] = padded_coords
-        result['gt_displacement'] = padded_disp
-        result['valid_mask'] = valid_mask
-        result['point_weights'] = padded_point_weights
-        if has_point_normals:
-            result['point_normals'] = padded_point_normals
-
-    if 'dense_gt_displacement' in batch[0]:
-        result['dense_gt_displacement'] = torch.stack([b['dense_gt_displacement'] for b in batch])
-        if 'dense_loss_weight' in batch[0]:
-            result['dense_loss_weight'] = torch.stack([b['dense_loss_weight'] for b in batch])
     if 'velocity_dir' in batch[0]:
         result['velocity_dir'] = torch.stack([b['velocity_dir'] for b in batch])
     if 'velocity_loss_weight' in batch[0]:
@@ -482,24 +265,11 @@ def collate_with_padding(batch):
     if 'triplet_channel_order' in batch[0]:
         result['triplet_channel_order'] = torch.stack([b['triplet_channel_order'] for b in batch])
 
-    # Source masks used by trainer-side dense target generation. Keeping dense
-    # EDT out of dataloader workers avoids cupyx defaulting every worker to GPU 0.
-    for key in ('cond_gt', 'masked_seg', 'behind_seg', 'front_seg', 'neighbor_seg'):
+    # Source masks used by trainer-side EDT target generation. Keeping EDT out
+    # of dataloader workers avoids cupyx defaulting every worker to GPU 0.
+    for key in ('cond_gt', 'masked_seg', 'neighbor_seg'):
         if key in batch[0]:
             result[key] = torch.stack([b[key] for b in batch])
-
-    # Optional SDT
-    if 'sdt' in batch[0]:
-        result['sdt'] = torch.stack([b['sdt'] for b in batch])
-
-    # Optional heatmap target
-    if 'heatmap_target' in batch[0]:
-        result['heatmap_target'] = torch.stack([b['heatmap_target'] for b in batch])
-
-    # Optional segmentation target (full segmentation + skeleton)
-    if 'segmentation' in batch[0]:
-        result['segmentation'] = torch.stack([b['segmentation'] for b in batch])
-        result['segmentation_skel'] = torch.stack([b['segmentation_skel'] for b in batch])
 
     # Optional other_wraps
     if 'other_wraps' in batch[0]:
@@ -510,16 +280,10 @@ def collate_with_padding(batch):
 
 def prepare_batch(
     batch,
-    use_sdt=False,
-    use_heatmap=False,
-    use_segmentation=False,
     use_growth_direction_channels=False,
-    dense_target_builder=None,
     velocity_target_builder=None,
 ):
     """Prepare batch tensors for training."""
-    if dense_target_builder is not None:
-        dense_target_builder(batch)
     if velocity_target_builder is not None:
         velocity_target_builder(batch)
 
@@ -538,27 +302,12 @@ def prepare_batch(
                 dtype=vol.dtype,
             )
         )
-    if 'dir_priors' in batch:
-        input_list.append(batch['dir_priors'])  # [B, 6, D, H, W]
-    if 'extrap_surface' in batch:
-        extrap_surf = batch['extrap_surface'].unsqueeze(1)  # [B, 1, D, H, W]
-        input_list.append(extrap_surf)
     if 'other_wraps' in batch:
         other_wraps = batch['other_wraps'].unsqueeze(1)  # [B, 1, D, H, W]
         input_list.append(other_wraps)
 
     inputs = torch.cat(input_list, dim=1)
 
-    extrap_coords = batch.get('extrap_coords', None)
-    gt_displacement = batch.get('gt_displacement', None)
-    valid_mask = batch.get('valid_mask', None)
-    point_weights = None
-    if valid_mask is not None:
-        point_weights = batch['point_weights'] if 'point_weights' in batch else torch.ones_like(valid_mask)
-    point_normals = batch.get('point_normals', None)
-
-    dense_gt_displacement = batch.get('dense_gt_displacement', None)  # [B, C, D, H, W]
-    dense_loss_weight = batch.get('dense_loss_weight', None)  # [B, 1, D, H, W]
     velocity_dir_target = batch.get('velocity_dir', None)  # [B, 3, D, H, W]
     velocity_loss_weight = batch.get('velocity_loss_weight', None)  # [B, 1, D, H, W]
     trace_loss_weight = batch.get('trace_loss_weight', None)  # [B, 1, D, H, W]
@@ -567,24 +316,8 @@ def prepare_batch(
     surface_attract_target = batch.get('surface_attract', None)  # [B, 3, D, H, W]
     surface_attract_weight = batch.get('surface_attract_weight', None)  # [B, 1, D, H, W]
 
-    sdt_target = batch['sdt'].unsqueeze(1) if use_sdt and 'sdt' in batch else None  # [B, 1, D, H, W]
-    heatmap_target = batch['heatmap_target'].unsqueeze(1) if use_heatmap and 'heatmap_target' in batch else None  # [B, 1, D, H, W]
-
-    seg_target = None
-    seg_skel = None
-    if use_segmentation and 'segmentation' in batch:
-        seg_target = batch['segmentation'].unsqueeze(1)  # [B, 1, D, H, W]
-        seg_skel = batch['segmentation_skel'].unsqueeze(1)  # [B, 1, D, H, W]
-
     return (
         inputs,
-        extrap_coords,
-        gt_displacement,
-        valid_mask,
-        point_weights,
-        point_normals,
-        dense_gt_displacement,
-        dense_loss_weight,
         velocity_dir_target,
         velocity_loss_weight,
         trace_loss_weight,
@@ -592,29 +325,18 @@ def prepare_batch(
         trace_validity_weight,
         surface_attract_target,
         surface_attract_weight,
-        sdt_target,
-        heatmap_target,
-        seg_target,
-        seg_skel,
     )
 
 
 @click.command()
 @click.argument('config_path', type=click.Path(exists=True))
 def train(config_path):
-    """Train a displacement field prediction model with optional SDT."""
+    """Train a row/col conditioned trace-ODE model."""
 
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    user_set_defer_trace_dilation = 'defer_trace_dilation_to_trainer' in config
-    user_set_defer_trace_validity = 'defer_trace_validity_to_trainer' in config
     setdefault_rowcol_cond_dataset_config(config)
-    config.setdefault('defer_dense_targets_to_trainer', True)
-    if not user_set_defer_trace_dilation:
-        config['defer_trace_dilation_to_trainer'] = True
-    if not user_set_defer_trace_validity:
-        config['defer_trace_validity_to_trainer'] = True
 
     validate_rowcol_cond_dataset_config(config)
 
@@ -650,22 +372,13 @@ def train(config_path):
     config.setdefault('val_prefetch_factor', 1)
     config.setdefault('dataloader_multiprocessing_context', 'auto')
     config.setdefault('seed', 0)
-    config.setdefault('use_sdt', False)
-    config.setdefault('lambda_sdt', 1.0)
-    config.setdefault('use_heatmap_targets', False)
-    config.setdefault('lambda_heatmap', 1.0)
-    config.setdefault('use_segmentation', False)
-    config.setdefault('lambda_segmentation', 1.0)
-    config.setdefault('segmentation_loss', {})
     config.setdefault('supervise_conditioning', False)
     config.setdefault('cond_supervision_weight', 0.1)
-    config.setdefault('lambda_cond_disp', 0.0)
-    config.setdefault('use_velocity_targets', False)
     config.setdefault('lambda_velocity_dir', 0.1)
     config.setdefault('velocity_target_mode', 'away_from_conditioning')
     config.setdefault('velocity_target_region', 'full')
-    config.setdefault('use_trace_ode_targets', False)
-    config.setdefault('lambda_displacement', 1.0)
+    config.setdefault('use_trace_ode_targets', True)
+    config.setdefault('lambda_displacement', 0.0)
     config.setdefault('lambda_surface_attract', 0.1)
     config.setdefault('use_trace_validity_targets', False)
     config.setdefault('lambda_trace_validity', 0.0)
@@ -678,18 +391,10 @@ def train(config_path):
     config.setdefault('trace_integration_max_points', 2048)
     config.setdefault('trace_integration_min_weight', 0.5)
     config.setdefault('trace_integration_detach_steps', False)
-    config.setdefault('surface_attract_huber_beta', config.get('displacement_huber_beta', 5.0))
+    config.setdefault('surface_attract_huber_beta', 5.0)
     config.setdefault('trace_target_mode', 'away_from_conditioning')
     config.setdefault('trace_target_region', 'full')
     config.setdefault('trace_target_dilation_radius', 1.0)
-    config.setdefault('defer_trace_dilation_to_trainer', True)
-    config.setdefault('defer_trace_validity_to_trainer', True)
-    config.setdefault('displacement_supervision', 'vector')  # 'vector' or 'normal_scalar'
-    config.setdefault('displacement_loss_type', 'vector_l2')
-    config.setdefault('displacement_huber_beta', 5.0)
-    config.setdefault('normal_loss_type', 'normal_huber')
-    config.setdefault('normal_loss_beta', config.get('displacement_huber_beta', 5.0))
-    config.setdefault('lambda_smooth', 0.0)
     config.setdefault('eval_perturbed_val', False)
     config.setdefault('log_perturbed_val_images', False)
     config.setdefault('val_batches_per_log', 4)
@@ -705,43 +410,18 @@ def train(config_path):
     config.setdefault('compile_model', True)
     config.setdefault('separate_eager_eval_for_logging', True)
 
-    displacement_out_channels = 3
-    use_displacement_head = (
-        float(config.get('lambda_displacement', 1.0)) > 0.0
-        or float(config.get('lambda_smooth', 0.0)) > 0.0
-        or float(config.get('lambda_cond_disp', 0.0)) > 0.0
-    )
-
-    # Build targets dict based on config. The displacement head is omitted for
-    # trace/aux-only runs where no configured loss consumes it.
-    targets = {}
-    if use_displacement_head:
-        targets['displacement'] = {'out_channels': displacement_out_channels, 'activation': 'none'}
-    use_trace_ode_targets = bool(config.get('use_trace_ode_targets', False))
-    use_velocity_targets = bool(config.get('use_velocity_targets', False)) or use_trace_ode_targets
-    use_surface_attract_head = use_trace_ode_targets and float(config.get('lambda_surface_attract', 0.0)) > 0.0
+    use_trace_ode_targets = True
+    use_velocity_targets = True
+    use_surface_attract_head = float(config.get('lambda_surface_attract', 0.0)) > 0.0
     use_trace_validity_head = (
-        use_trace_ode_targets
-        and (
-            bool(config.get('use_trace_validity_targets', False))
-            or float(config.get('lambda_trace_validity', 0.0)) > 0.0
-        )
+        bool(config.get('use_trace_validity_targets', False))
+        or float(config.get('lambda_trace_validity', 0.0)) > 0.0
     )
-    if use_velocity_targets:
-        targets['velocity_dir'] = {'out_channels': 3, 'activation': 'none'}
+    targets = {'velocity_dir': {'out_channels': 3, 'activation': 'none'}}
     if use_surface_attract_head:
         targets['surface_attract'] = {'out_channels': 3, 'activation': 'none'}
     if use_trace_validity_head:
         targets['trace_validity'] = {'out_channels': 1, 'activation': 'none'}
-    use_sdt = config.get('use_sdt', False)
-    if use_sdt:
-        targets['sdt'] = {'out_channels': 1, 'activation': 'none'}
-    use_heatmap = config.get('use_heatmap_targets', False)
-    if use_heatmap:
-        targets['heatmap'] = {'out_channels': 1, 'activation': 'none'}
-    use_segmentation = config.get('use_segmentation', False)
-    if use_segmentation:
-        targets['segmentation'] = {'out_channels': 2, 'activation': 'none'}
     if not targets:
         raise ValueError("No model output heads are enabled; set at least one supervised target/loss")
     config['targets'] = targets
@@ -802,28 +482,20 @@ def train(config_path):
         if wandb.run is not None:
             config['wandb_run_id'] = wandb.run.id
 
-    # Setup SDT loss if enabled
-    sdt_loss_fn = None
-    if use_sdt:
-        from vesuvius.models.training.loss.losses import SignedDistanceLoss
-        sdt_loss_fn = SignedDistanceLoss(
-            beta=config.get('sdt_beta', 1.0),
-            eikonal=config.get('sdt_eikonal', True),
-            eikonal_weight=config.get('sdt_eikonal_weight', 0.01),
-            laplacian=config.get('sdt_laplacian', True),
-            laplacian_weight=config.get('sdt_laplacian_weight', 0.01),
-            surface_sigma=config.get('sdt_surface_sigma', 3.0),
-            reduction='mean',
+    unsupported_displacement_losses = {
+        'lambda_displacement': float(config.get('lambda_displacement', 0.0)),
+        'lambda_smooth': float(config.get('lambda_smooth', 0.0)),
+        'lambda_cond_disp': float(config.get('lambda_cond_disp', 0.0)),
+    }
+    enabled_displacement_losses = [
+        name for name, value in unsupported_displacement_losses.items() if value > 0.0
+    ]
+    if enabled_displacement_losses:
+        raise ValueError(
+            "train_rowcol_cond is trace-ODE-only; displacement-head losses are no longer supported: "
+            f"{enabled_displacement_losses}"
         )
-
-    lambda_sdt = config.get('lambda_sdt', 1.0)
-    lambda_heatmap = config.get('lambda_heatmap', 1.0)
-    lambda_segmentation = config.get('lambda_segmentation', 1.0)
-    lambda_cond_disp = config.get('lambda_cond_disp', 0.0)
-    lambda_triplet_min_disp = 0.0
-    triplet_min_disp_vox = 0.0
     lambda_velocity_dir = float(config.get('lambda_velocity_dir', 0.0))
-    lambda_displacement = float(config.get('lambda_displacement', 1.0))
     lambda_surface_attract = float(config.get('lambda_surface_attract', 0.0))
     lambda_trace_validity = float(config.get('lambda_trace_validity', 0.0))
     trace_validity_pos_weight = float(config.get('trace_validity_pos_weight', 1.0))
@@ -836,31 +508,16 @@ def train(config_path):
     trace_integration_detach_steps = bool(config.get('trace_integration_detach_steps', False))
     surface_attract_target_mode = str(config.get('surface_attract_target_mode', 'dense_edt')).lower()
     trace_surface_attract_radius = float(config.get('trace_surface_attract_radius', 0.0))
-    needs_dense_targets = (
-        lambda_displacement > 0.0
-        or (
-            use_trace_ode_targets
-            and lambda_surface_attract > 0.0
-            and surface_attract_target_mode == 'dense_edt'
+    if surface_attract_target_mode != 'trace_band':
+        raise ValueError(
+            "train_rowcol_cond now only supports surface_attract_target_mode='trace_band'"
         )
-    )
     trace_target_dilation_radius = float(config.get('trace_target_dilation_radius', 0.0))
-    defer_trace_dilation_to_trainer = bool(config.get('defer_trace_dilation_to_trainer', False))
-    defer_trace_validity_to_trainer = bool(config.get('defer_trace_validity_to_trainer', False))
     trace_validity_positive_radius = float(config.get('trace_validity_positive_radius', 2.0))
     trace_validity_negative_radius = float(config.get('trace_validity_negative_radius', 3.0))
     trace_validity_margin = float(config.get('trace_validity_margin', 3.0))
     trace_validity_background_weight = float(config.get('trace_validity_background_weight', 0.25))
-    surface_attract_huber_beta = float(config.get('surface_attract_huber_beta', config.get('displacement_huber_beta', 5.0)))
-    lambda_smooth = config.get('lambda_smooth', 0.0)
-    if config.get('supervise_conditioning', False) and lambda_cond_disp > 0.0:
-        raise ValueError(
-            "supervise_conditioning=True adds nonzero conditioning displacement targets, "
-            "which conflicts with lambda_cond_disp > 0 (zero-displacement penalty on conditioning voxels). "
-            "Set lambda_cond_disp to 0 when supervise_conditioning is enabled."
-        )
-    mask_cond_from_seg_loss = config.get('mask_cond_from_seg_loss', False)
-    use_dense_displacement = bool(config.get('use_dense_displacement', False))
+    surface_attract_huber_beta = float(config.get('surface_attract_huber_beta', 5.0))
     if lambda_velocity_smooth > 0.0 and not use_velocity_targets:
         raise ValueError("lambda_velocity_smooth > 0 requires velocity/trace targets")
     if lambda_trace_integration > 0.0 and not use_velocity_targets:
@@ -871,56 +528,11 @@ def train(config_path):
         raise ValueError(f"trace_integration_step_size must be >= 0, got {trace_integration_step_size}")
     if trace_integration_max_points < 0:
         raise ValueError(f"trace_integration_max_points must be >= 0, got {trace_integration_max_points}")
-    disp_supervision = str(config.get('displacement_supervision', 'vector')).lower()
-    if not use_dense_displacement:
-        raise ValueError(
-            "rowcol_cond training now requires use_dense_displacement=True."
-        )
-    if disp_supervision == 'normal_scalar':
-        raise ValueError("displacement_supervision='normal_scalar' is not supported in dense-only rowcol_cond training")
-    disp_loss_type = config.get('displacement_loss_type', 'vector_l2')
-    disp_huber_beta = config.get('displacement_huber_beta', 5.0)
-    normal_loss_type = str(config.get('normal_loss_type', 'normal_huber')).lower()
-    normal_loss_beta = float(config.get('normal_loss_beta', disp_huber_beta))
-    if normal_loss_type in {'huber', 'l2', 'l1'}:
-        normal_loss_type = f'normal_{normal_loss_type}'
-
-    def build_dense_targets_on_device(batch):
-        """Create dense displacement targets on the current batch device."""
-        if 'dense_gt_displacement' in batch:
-            if use_trace_ode_targets and 'surface_attract' not in batch:
-                batch['surface_attract'] = batch['dense_gt_displacement']
-            return
-
-        if 'cond_gt' not in batch or 'masked_seg' not in batch:
-            raise ValueError("Missing deferred split target source masks: ['cond_gt', 'masked_seg']")
-
-        full_dense_surface = torch.maximum(batch['masked_seg'], batch['cond_gt'])
-        dense_fields = []
-        dense_weights = []
-        for b in range(full_dense_surface.shape[0]):
-            dense_disp, dense_weight = _compute_dense_displacement_field_torch(
-                full_dense_surface[b],
-                return_weights=False,
-            )
-            if dense_disp is None:
-                raise RuntimeError("Deferred split dense displacement field unavailable")
-            dense_fields.append(dense_disp)
-            if dense_weight is not None:
-                dense_weights.append(dense_weight)
-
-        dense_gt = torch.stack(dense_fields, dim=0)
-        batch['dense_gt_displacement'] = dense_gt
-        if dense_weights:
-            batch['dense_loss_weight'] = torch.stack(dense_weights, dim=0)
-        if use_trace_ode_targets:
-            batch['surface_attract'] = dense_gt
 
     def build_velocity_targets_on_device(batch):
         """Build EDT-derived velocity/trace targets on the current batch device."""
         if (
             use_trace_validity_head
-            and defer_trace_validity_to_trainer
             and 'trace_validity' not in batch
         ):
             if 'cond_gt' not in batch or 'masked_seg' not in batch:
@@ -997,8 +609,8 @@ def train(config_path):
                 else 0.0
             )
             if (
-                not defer_trace_dilation_to_trainer
-                or (trace_target_dilation_radius <= 0.0 and trace_band_attract_radius <= 0.0)
+                trace_target_dilation_radius <= 0.0
+                and trace_band_attract_radius <= 0.0
             ):
                 return
             (
@@ -1024,63 +636,6 @@ def train(config_path):
             return
 
         return
-
-    # Setup heatmap loss if enabled (BCE + Dice)
-    heatmap_loss_fn = None
-    if use_heatmap:
-        heatmap_loss_fn = DC_and_BCE_loss(
-            bce_kwargs={},
-            soft_dice_kwargs={'batch_dice': False, 'ddp': False},
-            weight_ce=1.0,
-            weight_dice=1.0
-        )
-
-    # Setup segmentation loss if enabled (MedialSurfaceRecall)
-    seg_loss_fn = None
-    if use_segmentation:
-        seg_loss_cfg = config.get('segmentation_loss', {})
-        soft_dice_kwargs = {
-            'batch_dice': seg_loss_cfg.get('batch_dice', False),
-            'smooth': seg_loss_cfg.get('smooth', 1e-5),
-            'do_bg': seg_loss_cfg.get('do_bg', False),
-            'ddp': seg_loss_cfg.get('ddp', False),
-        }
-        if 'soft_dice_kwargs' in seg_loss_cfg:
-            soft_dice_kwargs.update(seg_loss_cfg['soft_dice_kwargs'])
-        seg_loss_fn = DC_SkelREC_and_CE_loss(
-            soft_dice_kwargs=soft_dice_kwargs,
-            soft_skelrec_kwargs={
-                'batch_dice': soft_dice_kwargs.get('batch_dice'),
-                'smooth': soft_dice_kwargs.get('smooth'),
-                'do_bg': soft_dice_kwargs.get('do_bg'),
-                'ddp': soft_dice_kwargs.get('ddp'),
-            },
-            ce_kwargs=seg_loss_cfg.get('ce_kwargs', {}),
-            weight_ce=seg_loss_cfg.get('weight_ce', 1),
-            weight_dice=seg_loss_cfg.get('weight_dice', 1),
-            weight_srec=seg_loss_cfg.get('weight_srec', 1),
-            ignore_label=seg_loss_cfg.get('ignore_label', None),
-        )
-
-    def compute_displacement_loss(
-        disp_pred,
-        extrap_coords,
-        gt_displacement,
-        valid_mask,
-        point_weights,
-        point_normals,
-        dense_gt_displacement,
-        dense_loss_weight,
-    ):
-        if dense_gt_displacement is None:
-            raise ValueError("Dense displacement supervision is enabled but dense targets are missing")
-        return dense_displacement_loss(
-            disp_pred,
-            dense_gt_displacement,
-            sample_weights=dense_loss_weight,
-            loss_type=disp_loss_type,
-            beta=disp_huber_beta,
-        )
 
     def compute_velocity_dir_loss(velocity_dir_pred, velocity_dir_target, velocity_loss_weight):
         if velocity_dir_target is None or velocity_loss_weight is None:
@@ -1347,39 +902,17 @@ def train(config_path):
         eval_model.load_state_dict(_state_dict_for_eager_eval())
 
     if accelerator.is_main_process:
-        accelerator.print("\n=== Displacement Field Training Configuration ===")
+        accelerator.print("\n=== Trace ODE Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
         accelerator.print(f"Growth direction channels: {config.get('use_growth_direction_channels', False)}")
-        if not use_displacement_head:
-            accelerator.print("Displacement head: disabled (no displacement-consuming loss is enabled)")
-        elif use_dense_displacement:
-            accelerator.print(f"Displacement supervision: dense ({disp_loss_type}, beta={disp_huber_beta})")
-        else:
-            accelerator.print(f"Displacement supervision: dense ({disp_loss_type}, beta={disp_huber_beta})")
         output_heads = []
-        if use_displacement_head:
-            output_heads.append(f"displacement ({displacement_out_channels}ch)")
         if use_velocity_targets:
             output_heads.append("velocity_dir (3ch)")
         if use_surface_attract_head:
             output_heads.append("surface_attract (3ch)")
         if use_trace_validity_head:
             output_heads.append("trace_validity (1ch)")
-        if use_sdt:
-            output_heads.append("SDT (1ch)")
-        if use_heatmap:
-            output_heads.append("heatmap (1ch)")
-        if use_segmentation:
-            output_heads.append("segmentation (2ch)")
         accelerator.print("Output: " + " + ".join(output_heads))
-        if use_sdt:
-            accelerator.print(f"Lambda SDT: {lambda_sdt}")
-        if use_heatmap:
-            accelerator.print(f"Lambda heatmap: {lambda_heatmap}")
-        if use_segmentation:
-            accelerator.print(f"Lambda segmentation: {lambda_segmentation}")
-        if lambda_cond_disp > 0.0:
-            accelerator.print(f"Lambda cond disp: {lambda_cond_disp}")
         if use_velocity_targets:
             accelerator.print(
                 f"Velocity direction loss: lambda={lambda_velocity_dir}, "
@@ -1405,13 +938,11 @@ def train(config_path):
                 f"lambda_validity={lambda_trace_validity}, "
                 f"region={config.get('trace_target_region')}, "
                 f"dilation={config.get('trace_target_dilation_radius')}, "
-                f"defer_dilation_to_trainer={defer_trace_dilation_to_trainer}, "
                 f"attract_mode={surface_attract_target_mode}, "
                 f"attract_radius={config.get('trace_surface_attract_radius')}"
             )
             if use_trace_validity_head:
-                accelerator.print(f"Trace validity EDT in trainer: {defer_trace_validity_to_trainer}")
-        accelerator.print(f"Build dense EDT targets: {needs_dense_targets}")
+                accelerator.print("Trace validity EDT in trainer: True")
         accelerator.print(f"Supervise conditioning: {config.get('supervise_conditioning', False)}")
         if config.get('supervise_conditioning', False):
             accelerator.print(f"Cond supervision weight: {config.get('cond_supervision_weight', 0.1)}")
@@ -1481,13 +1012,9 @@ def train(config_path):
         if config['verbose']:
             accelerator.print(f"got batch, keys: {batch.keys()}")
 
-        inputs, extrap_coords, gt_displacement, valid_mask, point_weights, point_normals, dense_gt_displacement, dense_loss_weight, velocity_dir_target, velocity_loss_weight, trace_loss_weight, trace_validity_target, trace_validity_weight, surface_attract_target, surface_attract_weight, sdt_target, heatmap_target, seg_target, seg_skel = prepare_batch(
+        inputs, velocity_dir_target, velocity_loss_weight, trace_loss_weight, trace_validity_target, trace_validity_weight, surface_attract_target, surface_attract_weight = prepare_batch(
             batch,
-            use_sdt,
-            use_heatmap,
-            use_segmentation,
             use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-            dense_target_builder=build_dense_targets_on_device if needs_dense_targets else None,
             velocity_target_builder=build_velocity_targets_on_device,
         )
         _mark_first_iter("batch prepared")
@@ -1498,31 +1025,8 @@ def train(config_path):
             # Forward pass
             output = model(inputs)
             _mark_first_iter("forward complete")
-            disp_pred = output.get('displacement')  # [B, C, D, H, W]
-            if use_displacement_head and disp_pred is None:
-                raise ValueError("Displacement head is enabled but missing from model outputs")
             grad_norm = None
-
-            if lambda_displacement > 0.0:
-                surf_loss = compute_displacement_loss(
-                    disp_pred,
-                    extrap_coords,
-                    gt_displacement,
-                    valid_mask,
-                    point_weights,
-                    point_normals,
-                    dense_gt_displacement,
-                    dense_loss_weight,
-                )
-                weighted_surf_loss = lambda_displacement * surf_loss
-            else:
-                surf_loss = _zero_loss_from_output(output)
-                weighted_surf_loss = surf_loss
-            total_loss = weighted_surf_loss
-
-            wandb_log['surf_loss'] = surf_loss.detach().item()
-            if lambda_displacement != 1.0:
-                wandb_log['weighted_surf_loss'] = weighted_surf_loss.detach().item()
+            total_loss = _zero_loss_from_output(output)
 
             if use_velocity_targets and lambda_velocity_dir > 0.0:
                 velocity_dir_loss = compute_velocity_dir_loss(
@@ -1581,72 +1085,6 @@ def train(config_path):
                 if 'neighbor_sheet_present' in batch:
                     wandb_log['neighbor_context_fraction'] = batch['neighbor_sheet_present'].float().mean().detach().item()
 
-            # Smoothness loss on displacement field
-            if lambda_smooth > 0:
-                if disp_pred is None:
-                    raise ValueError("lambda_smooth > 0 requires the displacement output head")
-                smooth_loss = smoothness_loss(disp_pred)
-                weighted_smooth_loss = lambda_smooth * smooth_loss
-                total_loss = total_loss + weighted_smooth_loss
-                wandb_log['smooth_loss'] = weighted_smooth_loss.detach().item()
-
-            # Optional SDT loss
-            if use_sdt:
-                sdt_pred = output['sdt']  # [B, 1, D, H, W]
-                sdt_loss = sdt_loss_fn(sdt_pred, sdt_target)
-                weighted_sdt_loss = lambda_sdt * sdt_loss
-                total_loss = total_loss + weighted_sdt_loss
-                wandb_log['sdt_loss'] = weighted_sdt_loss.detach().item()
-
-            # Optional heatmap loss (BCE + Dice)
-            heatmap_pred = None
-            if use_heatmap:
-                heatmap_pred = output['heatmap']  # [B, 1, D, H, W]
-                heatmap_target_binary = (heatmap_target > 0.5).float()
-                heatmap_loss = heatmap_loss_fn(heatmap_pred, heatmap_target_binary)
-                weighted_heatmap_loss = lambda_heatmap * heatmap_loss
-                total_loss = total_loss + weighted_heatmap_loss
-                wandb_log['heatmap_loss'] = weighted_heatmap_loss.detach().item()
-
-            # Optional segmentation loss (MedialSurfaceRecall)
-            if use_segmentation:
-                seg_pred = output['segmentation']  # [B, 2, D, H, W]
-
-                # Optionally mask out conditioning region from seg loss
-                seg_loss_mask = None
-                if mask_cond_from_seg_loss:
-                    cond_mask_seg = (inputs[:, 1:2] > 0.5).float()  # [B, 1, D, H, W]
-                    seg_loss_mask = (cond_mask_seg < 0.5).float()   # 1 everywhere except cond
-
-                seg_loss = seg_loss_fn(seg_pred, seg_target.long(), seg_skel.long(), loss_mask=seg_loss_mask)
-                weighted_seg_loss = lambda_segmentation * seg_loss
-                total_loss = total_loss + weighted_seg_loss
-                wandb_log['seg_loss'] = weighted_seg_loss.detach().item()
-
-            if lambda_cond_disp > 0.0:
-                if disp_pred is None:
-                    raise ValueError("lambda_cond_disp > 0 requires the displacement output head")
-                cond_mask = (inputs[:, 1:2] > 0.5).float()
-                disp_mag_sq = (disp_pred ** 2).sum(dim=1, keepdim=True)
-                cond_loss = (disp_mag_sq * cond_mask).sum() / cond_mask.sum().clamp(min=1.0)
-                weighted_cond_loss = lambda_cond_disp * cond_loss
-                total_loss = total_loss + weighted_cond_loss
-                wandb_log['cond_disp_loss'] = weighted_cond_loss.detach().item()
-
-            if lambda_triplet_min_disp > 0.0:
-                if disp_pred is None:
-                    raise ValueError("lambda_triplet_min_disp > 0 requires the displacement output head")
-                cond_mask = (inputs[:, 1:2] > 0.5).float()
-                triplet_min_loss = triplet_min_displacement_loss(
-                    disp_pred,
-                    cond_mask,
-                    min_magnitude=triplet_min_disp_vox,
-                    loss_type='squared_hinge',
-                )
-                weighted_triplet_min_loss = lambda_triplet_min_disp * triplet_min_loss
-                total_loss = total_loss + weighted_triplet_min_loss
-                wandb_log['triplet_min_disp_loss'] = weighted_triplet_min_loss.detach().item()
-
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
 
@@ -1682,16 +1120,7 @@ def train(config_path):
 
         postfix = {
             'loss': f"{wandb_log['loss']:.4f}",
-            'surf': f"{wandb_log['surf_loss']:.4f}",
         }
-        if lambda_smooth > 0:
-            postfix['smooth'] = f"{wandb_log['smooth_loss']:.4f}"
-        if use_sdt:
-            postfix['sdt'] = f"{wandb_log['sdt_loss']:.4f}"
-        if use_heatmap:
-            postfix['hm'] = f"{wandb_log['heatmap_loss']:.4f}"
-        if use_segmentation:
-            postfix['seg'] = f"{wandb_log['seg_loss']:.4f}"
         if use_velocity_targets and lambda_velocity_dir > 0.0:
             postfix['vel_dir'] = f"{wandb_log['velocity_dir_loss']:.4f}"
         if use_velocity_targets and lambda_velocity_smooth > 0.0:
@@ -1702,10 +1131,6 @@ def train(config_path):
             postfix['attract'] = f"{wandb_log['surface_attract_loss']:.4f}"
         if use_trace_ode_targets and lambda_trace_validity > 0.0:
             postfix['valid'] = f"{wandb_log['trace_validity_loss']:.4f}"
-        if lambda_cond_disp > 0.0:
-            postfix['cond'] = f"{wandb_log['cond_disp_loss']:.4f}"
-        if lambda_triplet_min_disp > 0.0:
-            postfix['min1vx'] = f"{wandb_log['triplet_min_disp_loss']:.4f}"
         progress_bar.set_postfix(postfix)
         progress_bar.update(1)
 
@@ -1721,21 +1146,8 @@ def train(config_path):
 
                 val_batches_per_log = max(1, int(config.get('val_batches_per_log', 4)))
                 val_metric_sums = {
-                    'val_surf_loss': 0.0,
                     'val_loss': 0.0,
                 }
-                if lambda_smooth > 0:
-                    val_metric_sums['val_smooth_loss'] = 0.0
-                if use_sdt:
-                    val_metric_sums['val_sdt_loss'] = 0.0
-                if use_heatmap:
-                    val_metric_sums['val_heatmap_loss'] = 0.0
-                if use_segmentation:
-                    val_metric_sums['val_seg_loss'] = 0.0
-                if lambda_cond_disp > 0.0:
-                    val_metric_sums['val_cond_disp_loss'] = 0.0
-                if lambda_triplet_min_disp > 0.0:
-                    val_metric_sums['val_triplet_min_disp_loss'] = 0.0
                 if use_velocity_targets and lambda_velocity_dir > 0.0:
                     val_metric_sums['val_velocity_dir_loss'] = 0.0
                 if use_velocity_targets and lambda_velocity_smooth > 0.0:
@@ -1756,41 +1168,16 @@ def train(config_path):
                         val_iterator = iter(val_dataloader)
                         val_batch = next(val_iterator)
 
-                    val_inputs, val_extrap_coords, val_gt_displacement, val_valid_mask, val_point_weights, val_point_normals, val_dense_gt_displacement, val_dense_loss_weight, val_velocity_dir_target, val_velocity_loss_weight, val_trace_loss_weight, val_trace_validity_target, val_trace_validity_weight, val_surface_attract_target, val_surface_attract_weight, val_sdt_target, val_heatmap_target, val_seg_target, val_seg_skel = prepare_batch(
+                    val_inputs, val_velocity_dir_target, val_velocity_loss_weight, val_trace_loss_weight, val_trace_validity_target, val_trace_validity_weight, val_surface_attract_target, val_surface_attract_weight = prepare_batch(
                         val_batch,
-                        use_sdt,
-                        use_heatmap,
-                        use_segmentation,
                         use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-                        dense_target_builder=build_dense_targets_on_device if needs_dense_targets else None,
                         velocity_target_builder=build_velocity_targets_on_device,
                     )
 
                     with accelerator.autocast():
                         val_output = eval_forward_model(val_inputs)
-                    val_disp_pred = val_output.get('displacement')
-                    if use_displacement_head and val_disp_pred is None:
-                        raise ValueError("Displacement head is enabled but missing from validation model outputs")
+                    val_total_loss = _zero_loss_from_output(val_output)
 
-                    if lambda_displacement > 0.0:
-                        val_surf_loss = compute_displacement_loss(
-                            val_disp_pred,
-                            val_extrap_coords,
-                            val_gt_displacement,
-                            val_valid_mask,
-                            val_point_weights,
-                            val_point_normals,
-                            val_dense_gt_displacement,
-                            val_dense_loss_weight,
-                        )
-                        val_weighted_surf_loss = lambda_displacement * val_surf_loss
-                    else:
-                        val_surf_loss = _zero_loss_from_output(val_output)
-                        val_weighted_surf_loss = val_surf_loss
-                    val_total_loss = val_weighted_surf_loss
-                    val_metric_sums['val_surf_loss'] += val_surf_loss.item()
-
-                    val_sdt_pred = None
                     if use_velocity_targets and lambda_velocity_dir > 0.0:
                         val_velocity_dir_loss = compute_velocity_dir_loss(
                             val_output['velocity_dir'],
@@ -1846,85 +1233,12 @@ def train(config_path):
                         val_total_loss = val_total_loss + val_weighted_trace_validity_loss
                         val_metric_sums['val_trace_validity_loss'] += val_weighted_trace_validity_loss.item()
 
-                    if lambda_smooth > 0:
-                        if val_disp_pred is None:
-                            raise ValueError("lambda_smooth > 0 requires the displacement output head")
-                        val_smooth_loss = smoothness_loss(val_disp_pred)
-                        val_weighted_smooth_loss = lambda_smooth * val_smooth_loss
-                        val_total_loss = val_total_loss + val_weighted_smooth_loss
-                        val_metric_sums['val_smooth_loss'] += val_weighted_smooth_loss.item()
-
-                    if use_sdt:
-                        val_sdt_pred = val_output['sdt']
-                        val_sdt_loss = sdt_loss_fn(val_sdt_pred, val_sdt_target)
-                        val_weighted_sdt_loss = lambda_sdt * val_sdt_loss
-                        val_total_loss = val_total_loss + val_weighted_sdt_loss
-                        val_metric_sums['val_sdt_loss'] += val_weighted_sdt_loss.item()
-
-                    val_heatmap_pred = None
-                    if use_heatmap:
-                        val_heatmap_pred = val_output['heatmap']
-                        val_heatmap_target_binary = (val_heatmap_target > 0.5).float()
-                        val_heatmap_loss = heatmap_loss_fn(val_heatmap_pred, val_heatmap_target_binary)
-                        val_weighted_heatmap_loss = lambda_heatmap * val_heatmap_loss
-                        val_total_loss = val_total_loss + val_weighted_heatmap_loss
-                        val_metric_sums['val_heatmap_loss'] += val_weighted_heatmap_loss.item()
-
-                    if use_segmentation:
-                        val_seg_pred = val_output['segmentation']
-                        val_seg_loss_mask = None
-                        if mask_cond_from_seg_loss:
-                            val_cond_mask_seg = (val_inputs[:, 1:2] > 0.5).float()
-                            val_seg_loss_mask = (val_cond_mask_seg < 0.5).float()
-                        val_seg_loss = seg_loss_fn(
-                            val_seg_pred, val_seg_target.long(), val_seg_skel.long(), loss_mask=val_seg_loss_mask
-                        )
-                        val_weighted_seg_loss = lambda_segmentation * val_seg_loss
-                        val_total_loss = val_total_loss + val_weighted_seg_loss
-                        val_metric_sums['val_seg_loss'] += val_weighted_seg_loss.item()
-
-                    if lambda_cond_disp > 0.0:
-                        if val_disp_pred is None:
-                            raise ValueError("lambda_cond_disp > 0 requires the displacement output head")
-                        val_cond_mask = (val_inputs[:, 1:2] > 0.5).float()
-                        val_disp_mag_sq = (val_disp_pred ** 2).sum(dim=1, keepdim=True)
-                        val_cond_loss = (val_disp_mag_sq * val_cond_mask).sum() / val_cond_mask.sum().clamp(min=1.0)
-                        val_weighted_cond_loss = lambda_cond_disp * val_cond_loss
-                        val_total_loss = val_total_loss + val_weighted_cond_loss
-                        val_metric_sums['val_cond_disp_loss'] += val_weighted_cond_loss.item()
-
-                    if lambda_triplet_min_disp > 0.0:
-                        if val_disp_pred is None:
-                            raise ValueError("lambda_triplet_min_disp > 0 requires the displacement output head")
-                        val_cond_mask = (val_inputs[:, 1:2] > 0.5).float()
-                        val_triplet_min_loss = triplet_min_displacement_loss(
-                            val_disp_pred,
-                            val_cond_mask,
-                            min_magnitude=triplet_min_disp_vox,
-                            loss_type='squared_hinge',
-                        )
-                        val_weighted_triplet_min_loss = lambda_triplet_min_disp * val_triplet_min_loss
-                        val_total_loss = val_total_loss + val_weighted_triplet_min_loss
-                        val_metric_sums['val_triplet_min_disp_loss'] += val_weighted_triplet_min_loss.item()
-
                     val_metric_sums['val_loss'] += val_total_loss.item()
 
                     if val_batch_idx == 0:
                         first_val_vis = {
                             'inputs': val_inputs,
-                            'disp_pred': val_disp_pred,
-                            'extrap_coords': val_extrap_coords,
-                            'gt_displacement': val_gt_displacement,
-                            'valid_mask': val_valid_mask,
-                            'dense_gt_displacement': val_dense_gt_displacement,
-                            'dense_loss_weight': val_dense_loss_weight,
                             'triplet_channel_order': val_batch.get('triplet_channel_order', None),
-                            'sdt_pred': val_sdt_pred,
-                            'sdt_target': val_sdt_target,
-                            'heatmap_pred': val_heatmap_pred,
-                            'heatmap_target': val_heatmap_target,
-                            'seg_pred': val_output.get('segmentation') if use_segmentation else None,
-                            'seg_target': val_seg_target if use_segmentation else None,
                             'velocity_dir_pred': val_output.get('velocity_dir') if use_velocity_targets else None,
                             'velocity_dir_target': val_velocity_dir_target,
                             'velocity_loss_weight': val_velocity_loss_weight,
@@ -1935,15 +1249,6 @@ def train(config_path):
                             'surface_attract_pred': val_output.get('surface_attract') if use_trace_ode_targets else None,
                             'surface_attract_target': val_surface_attract_target,
                             'surface_attract_weight': val_surface_attract_weight,
-                            'can_visualize_sparse': (
-                                val_disp_pred is not None and
-                                val_extrap_coords is not None and
-                                val_gt_displacement is not None and
-                                val_valid_mask is not None
-                            ),
-                            'can_visualize_dense': (
-                                val_disp_pred is not None and val_dense_gt_displacement is not None
-                            ),
                             'can_visualize_trace': (
                                 use_trace_ode_targets and (
                                     val_velocity_dir_target is not None
@@ -1960,57 +1265,22 @@ def train(config_path):
                 train_img_path = f'{out_dir}/{iteration:06}_train.png'
                 val_img_path = f'{out_dir}/{iteration:06}_val.png'
 
-                train_sdt_pred = output.get('sdt') if use_sdt else None
-                train_heatmap_pred = heatmap_pred if use_heatmap else None
-                train_seg_pred = output.get('segmentation') if use_segmentation else None
                 train_velocity_dir_pred = output.get('velocity_dir') if use_velocity_targets else None
                 train_trace_validity_pred = output.get('trace_validity') if use_trace_ode_targets else None
                 train_surface_attract_pred = output.get('surface_attract') if use_trace_ode_targets else None
-                train_can_visualize_sparse = (
-                    disp_pred is not None
-                    and extrap_coords is not None and gt_displacement is not None and valid_mask is not None
-                )
-                train_can_visualize_dense = disp_pred is not None and dense_gt_displacement is not None
                 train_can_visualize_trace = use_trace_ode_targets and (
                     velocity_dir_target is not None
                     or trace_validity_target is not None
                     or surface_attract_target is not None
                 )
-                if train_can_visualize_sparse and first_val_vis is not None and first_val_vis.get('can_visualize_sparse', False):
-                    make_visualization(
-                        inputs, disp_pred, extrap_coords, gt_displacement, valid_mask,
-                        sdt_pred=train_sdt_pred, sdt_target=sdt_target,
-                        heatmap_pred=train_heatmap_pred, heatmap_target=heatmap_target,
-                        seg_pred=train_seg_pred, seg_target=seg_target if use_segmentation else None,
-                        save_path=train_img_path
-                    )
-                    make_visualization(
-                        first_val_vis['inputs'], first_val_vis['disp_pred'],
-                        first_val_vis['extrap_coords'], first_val_vis['gt_displacement'],
-                        first_val_vis['valid_mask'],
-                        sdt_pred=first_val_vis['sdt_pred'], sdt_target=first_val_vis['sdt_target'],
-                        heatmap_pred=first_val_vis['heatmap_pred'], heatmap_target=first_val_vis['heatmap_target'],
-                        seg_pred=first_val_vis['seg_pred'],
-                        seg_target=first_val_vis['seg_target'],
-                        save_path=val_img_path
-                    )
-
-                    if wandb.run is not None:
-                        wandb_log['train_image'] = wandb.Image(train_img_path)
-                        wandb_log['val_image'] = wandb.Image(val_img_path)
-                elif (
+                if (
                     first_val_vis is not None
-                    and (
-                        (train_can_visualize_dense and first_val_vis.get('can_visualize_dense', False))
-                        or (train_can_visualize_trace and first_val_vis.get('can_visualize_trace', False))
-                    )
+                    and train_can_visualize_trace
+                    and first_val_vis.get('can_visualize_trace', False)
                 ):
                     make_dense_visualization(
-                        inputs, disp_pred, dense_gt_displacement, dense_loss_weight,
+                        inputs, None, None, None,
                         triplet_channel_order=batch.get('triplet_channel_order', None),
-                        sdt_pred=train_sdt_pred, sdt_target=sdt_target,
-                        heatmap_pred=train_heatmap_pred, heatmap_target=heatmap_target,
-                        seg_pred=train_seg_pred, seg_target=seg_target if use_segmentation else None,
                         velocity_dir_pred=train_velocity_dir_pred,
                         velocity_dir_target=velocity_dir_target,
                         velocity_loss_weight=velocity_loss_weight,
@@ -2024,13 +1294,8 @@ def train(config_path):
                         save_path=train_img_path
                     )
                     make_dense_visualization(
-                        first_val_vis['inputs'], first_val_vis['disp_pred'],
-                        first_val_vis['dense_gt_displacement'], first_val_vis['dense_loss_weight'],
+                        first_val_vis['inputs'], None, None, None,
                         triplet_channel_order=first_val_vis['triplet_channel_order'],
-                        sdt_pred=first_val_vis['sdt_pred'], sdt_target=first_val_vis['sdt_target'],
-                        heatmap_pred=first_val_vis['heatmap_pred'], heatmap_target=first_val_vis['heatmap_target'],
-                        seg_pred=first_val_vis['seg_pred'],
-                        seg_target=first_val_vis['seg_target'],
                         velocity_dir_pred=first_val_vis['velocity_dir_pred'],
                         velocity_dir_target=first_val_vis['velocity_dir_target'],
                         velocity_loss_weight=first_val_vis['velocity_loss_weight'],
@@ -2055,41 +1320,16 @@ def train(config_path):
                         val_pert_iterator = iter(val_pert_dataloader)
                         val_pert_batch = next(val_pert_iterator)
 
-                    val_pert_inputs, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask, val_pert_point_weights, val_pert_point_normals, val_pert_dense_gt_displacement, val_pert_dense_loss_weight, val_pert_velocity_dir_target, val_pert_velocity_loss_weight, val_pert_trace_loss_weight, val_pert_trace_validity_target, val_pert_trace_validity_weight, val_pert_surface_attract_target, val_pert_surface_attract_weight, val_pert_sdt_target, val_pert_heatmap_target, val_pert_seg_target, val_pert_seg_skel = prepare_batch(
+                    val_pert_inputs, val_pert_velocity_dir_target, val_pert_velocity_loss_weight, val_pert_trace_loss_weight, val_pert_trace_validity_target, val_pert_trace_validity_weight, val_pert_surface_attract_target, val_pert_surface_attract_weight = prepare_batch(
                         val_pert_batch,
-                        use_sdt,
-                        use_heatmap,
-                        use_segmentation,
                         use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-                        dense_target_builder=build_dense_targets_on_device if needs_dense_targets else None,
                         velocity_target_builder=build_velocity_targets_on_device,
                     )
 
                     with accelerator.autocast():
                         val_pert_output = eval_forward_model(val_pert_inputs)
-                    val_pert_disp_pred = val_pert_output.get('displacement')
-                    if use_displacement_head and val_pert_disp_pred is None:
-                        raise ValueError("Displacement head is enabled but missing from perturbed validation outputs")
+                    val_pert_total_loss = _zero_loss_from_output(val_pert_output)
 
-                    if lambda_displacement > 0.0:
-                        val_pert_surf_loss = compute_displacement_loss(
-                            val_pert_disp_pred,
-                            val_pert_extrap_coords,
-                            val_pert_gt_displacement,
-                            val_pert_valid_mask,
-                            val_pert_point_weights,
-                            val_pert_point_normals,
-                            val_pert_dense_gt_displacement,
-                            val_pert_dense_loss_weight,
-                        )
-                        val_pert_weighted_surf_loss = lambda_displacement * val_pert_surf_loss
-                    else:
-                        val_pert_surf_loss = _zero_loss_from_output(val_pert_output)
-                        val_pert_weighted_surf_loss = val_pert_surf_loss
-                    val_pert_total_loss = val_pert_weighted_surf_loss
-                    wandb_log['val_pert_surf_loss'] = val_pert_surf_loss.item()
-
-                    val_pert_sdt_pred = None
                     if use_velocity_targets and lambda_velocity_dir > 0.0:
                         val_pert_velocity_dir_loss = compute_velocity_dir_loss(
                             val_pert_output['velocity_dir'],
@@ -2157,109 +1397,18 @@ def train(config_path):
                         val_pert_total_loss = val_pert_total_loss + val_pert_weighted_trace_validity_loss
                         wandb_log['val_pert_trace_validity_loss'] = val_pert_weighted_trace_validity_loss.item()
 
-                    if lambda_smooth > 0:
-                        if val_pert_disp_pred is None:
-                            raise ValueError("lambda_smooth > 0 requires the displacement output head")
-                        val_pert_smooth_loss = smoothness_loss(val_pert_disp_pred)
-                        val_pert_weighted_smooth_loss = lambda_smooth * val_pert_smooth_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_smooth_loss
-                        wandb_log['val_pert_smooth_loss'] = val_pert_weighted_smooth_loss.item()
-
-                    if use_sdt:
-                        val_pert_sdt_pred = val_pert_output['sdt']
-                        val_pert_sdt_loss = sdt_loss_fn(val_pert_sdt_pred, val_pert_sdt_target)
-                        val_pert_weighted_sdt_loss = lambda_sdt * val_pert_sdt_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_sdt_loss
-                        wandb_log['val_pert_sdt_loss'] = val_pert_weighted_sdt_loss.item()
-
-                    val_pert_heatmap_pred = None
-                    if use_heatmap:
-                        val_pert_heatmap_pred = val_pert_output['heatmap']
-                        val_pert_heatmap_target_binary = (val_pert_heatmap_target > 0.5).float()
-                        val_pert_heatmap_loss = heatmap_loss_fn(val_pert_heatmap_pred, val_pert_heatmap_target_binary)
-                        val_pert_weighted_heatmap_loss = lambda_heatmap * val_pert_heatmap_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_heatmap_loss
-                        wandb_log['val_pert_heatmap_loss'] = val_pert_weighted_heatmap_loss.item()
-
-                    if use_segmentation:
-                        val_pert_seg_pred = val_pert_output['segmentation']
-                        val_pert_seg_loss_mask = None
-                        if mask_cond_from_seg_loss:
-                            val_pert_cond_mask_seg = (val_pert_inputs[:, 1:2] > 0.5).float()
-                            val_pert_seg_loss_mask = (val_pert_cond_mask_seg < 0.5).float()
-                        val_pert_seg_loss = seg_loss_fn(
-                            val_pert_seg_pred, val_pert_seg_target.long(), val_pert_seg_skel.long(), loss_mask=val_pert_seg_loss_mask
-                        )
-                        val_pert_weighted_seg_loss = lambda_segmentation * val_pert_seg_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_seg_loss
-                        wandb_log['val_pert_seg_loss'] = val_pert_weighted_seg_loss.item()
-
-                    if lambda_cond_disp > 0.0:
-                        if val_pert_disp_pred is None:
-                            raise ValueError("lambda_cond_disp > 0 requires the displacement output head")
-                        val_pert_cond_mask = (val_pert_inputs[:, 1:2] > 0.5).float()
-                        val_pert_disp_mag_sq = (val_pert_disp_pred ** 2).sum(dim=1, keepdim=True)
-                        val_pert_cond_loss = (val_pert_disp_mag_sq * val_pert_cond_mask).sum() / val_pert_cond_mask.sum().clamp(min=1.0)
-                        val_pert_weighted_cond_loss = lambda_cond_disp * val_pert_cond_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_cond_loss
-                        wandb_log['val_pert_cond_disp_loss'] = val_pert_weighted_cond_loss.item()
-
-                    if lambda_triplet_min_disp > 0.0:
-                        if val_pert_disp_pred is None:
-                            raise ValueError("lambda_triplet_min_disp > 0 requires the displacement output head")
-                        val_pert_cond_mask = (val_pert_inputs[:, 1:2] > 0.5).float()
-                        val_pert_triplet_min_loss = triplet_min_displacement_loss(
-                            val_pert_disp_pred,
-                            val_pert_cond_mask,
-                            min_magnitude=triplet_min_disp_vox,
-                            loss_type='squared_hinge',
-                        )
-                        val_pert_weighted_triplet_min_loss = lambda_triplet_min_disp * val_pert_triplet_min_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_triplet_min_loss
-                        wandb_log['val_pert_triplet_min_disp_loss'] = val_pert_weighted_triplet_min_loss.item()
-
                     wandb_log['val_pert_loss'] = val_pert_total_loss.item()
 
                     if config.get('log_perturbed_val_images', False):
-                        if (
-                            val_pert_disp_pred is not None and
-                            val_pert_extrap_coords is not None and
-                            val_pert_gt_displacement is not None and
-                            val_pert_valid_mask is not None
-                        ):
-                            val_pert_img_path = f'{out_dir}/{iteration:06}_val_pert.png'
-                            make_visualization(
-                                val_pert_inputs, val_pert_disp_pred, val_pert_extrap_coords, val_pert_gt_displacement, val_pert_valid_mask,
-                                sdt_pred=val_pert_sdt_pred, sdt_target=val_pert_sdt_target,
-                                heatmap_pred=val_pert_heatmap_pred, heatmap_target=val_pert_heatmap_target,
-                                seg_pred=val_pert_output.get('segmentation') if use_segmentation else None,
-                                seg_target=val_pert_seg_target if use_segmentation else None,
-                                velocity_dir_pred=val_pert_output.get('velocity_dir') if use_velocity_targets else None,
-                                velocity_dir_target=val_pert_velocity_dir_target,
-                                trace_validity_pred=val_pert_output.get('trace_validity') if use_trace_ode_targets else None,
-                                trace_validity_target=val_pert_trace_validity_target,
-                                trace_validity_weight=val_pert_trace_validity_weight,
-                                surface_attract_pred=val_pert_output.get('surface_attract') if use_trace_ode_targets else None,
-                                surface_attract_target=val_pert_surface_attract_target,
-                                save_path=val_pert_img_path
-                            )
-                            if wandb.run is not None:
-                                wandb_log['val_pert_image'] = wandb.Image(val_pert_img_path)
-                        elif val_pert_dense_gt_displacement is not None or (
-                            use_trace_ode_targets and (
-                                val_pert_velocity_dir_target is not None
-                                or val_pert_trace_validity_target is not None
-                                or val_pert_surface_attract_target is not None
-                            )
+                        if use_trace_ode_targets and (
+                            val_pert_velocity_dir_target is not None
+                            or val_pert_trace_validity_target is not None
+                            or val_pert_surface_attract_target is not None
                         ):
                             val_pert_img_path = f'{out_dir}/{iteration:06}_val_pert.png'
                             make_dense_visualization(
-                                val_pert_inputs, val_pert_disp_pred, val_pert_dense_gt_displacement, val_pert_dense_loss_weight,
+                                val_pert_inputs, None, None, None,
                                 triplet_channel_order=val_pert_batch.get('triplet_channel_order', None),
-                                sdt_pred=val_pert_sdt_pred, sdt_target=val_pert_sdt_target,
-                                heatmap_pred=val_pert_heatmap_pred, heatmap_target=val_pert_heatmap_target,
-                                seg_pred=val_pert_output.get('segmentation') if use_segmentation else None,
-                                seg_target=val_pert_seg_target if use_segmentation else None,
                                 velocity_dir_pred=val_pert_output.get('velocity_dir') if use_velocity_targets else None,
                                 velocity_dir_target=val_pert_velocity_dir_target,
                                 velocity_loss_weight=val_pert_velocity_loss_weight,

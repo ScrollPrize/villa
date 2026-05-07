@@ -71,16 +71,9 @@ def augment_split_payload(
     cond_surface_keypoints: torch.Tensor | None,
     cond_surface_shape,
     restore_cond_surface_fn: Callable[..., torch.Tensor],
-    use_segmentation: bool,
-    use_sdt: bool,
-    use_heatmap: bool,
     masked_surface_local=None,
     masked_surface_keypoints: torch.Tensor | None = None,
     masked_surface_shape=None,
-    full_seg: torch.Tensor | None = None,
-    seg_skel: torch.Tensor | None = None,
-    sdt_tensor: torch.Tensor | None = None,
-    heatmap_tensor: torch.Tensor | None = None,
     neighbor_seg_tensor: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Apply split-mode augmentations and unpack outputs."""
@@ -92,31 +85,14 @@ def augment_split_payload(
             "cond_seg_gt": cond_seg_gt,
             "cond_surface_local": cond_surface_local,
             "masked_surface_local": masked_surface_local,
-            "full_seg": full_seg,
-            "seg_skel": seg_skel,
-            "sdt_tensor": sdt_tensor,
-            "heatmap_tensor": heatmap_tensor,
             "neighbor_seg_tensor": neighbor_seg_tensor,
         }
 
     seg_tensors = [masked_seg, other_wraps_tensor, cond_seg_gt]
     seg_keys = ["masked_seg", "other_wraps_tensor", "cond_seg_gt"]
-    if use_segmentation:
-        if full_seg is None or seg_skel is None:
-            raise ValueError("full_seg and seg_skel are required when use_segmentation=True")
-        seg_tensors.extend([full_seg, seg_skel])
-        seg_keys.extend(["full_seg", "seg_skel"])
     if neighbor_seg_tensor is not None:
         seg_tensors.append(neighbor_seg_tensor)
         seg_keys.append("neighbor_seg_tensor")
-
-    dist_tensors = []
-    dist_keys = []
-    if use_sdt:
-        if sdt_tensor is None:
-            raise ValueError("sdt_tensor is required when use_sdt=True")
-        dist_tensors.append(sdt_tensor)
-        dist_keys.append("sdt_tensor")
 
     aug_kwargs = {
         "image": vol_crop[None],
@@ -132,13 +108,6 @@ def augment_split_payload(
         keypoint_parts.append(masked_surface_keypoints)
     if keypoint_parts:
         aug_kwargs["keypoints"] = torch.cat(keypoint_parts, dim=0)
-    if dist_tensors:
-        aug_kwargs["dist_map"] = torch.stack(dist_tensors, dim=0)
-    if use_heatmap:
-        if heatmap_tensor is None:
-            raise ValueError("heatmap_tensor is required when use_heatmap=True")
-        aug_kwargs["heatmap_target"] = heatmap_tensor[None]
-        aug_kwargs["regression_keys"] = ["heatmap_target"]
 
     augmented = augmentations(**aug_kwargs)
     vol_crop = augmented["image"].squeeze(0)
@@ -146,13 +115,6 @@ def augment_split_payload(
     unpacked = {}
     for i, key in enumerate(seg_keys):
         unpacked[key] = augmented["segmentation"][i]
-
-    if dist_tensors:
-        for i, key in enumerate(dist_keys):
-            unpacked[key] = augmented["dist_map"][i]
-
-    if use_heatmap:
-        heatmap_tensor = augmented["heatmap_target"].squeeze(0)
 
     if keypoint_parts:
         augmented_keypoints = augmented.get("keypoints")
@@ -185,9 +147,5 @@ def augment_split_payload(
         "cond_seg_gt": unpacked["cond_seg_gt"],
         "cond_surface_local": cond_surface_local,
         "masked_surface_local": masked_surface_local,
-        "full_seg": unpacked.get("full_seg", full_seg),
-        "seg_skel": unpacked.get("seg_skel", seg_skel),
-        "sdt_tensor": unpacked.get("sdt_tensor", sdt_tensor),
-        "heatmap_tensor": heatmap_tensor,
         "neighbor_seg_tensor": unpacked.get("neighbor_seg_tensor", neighbor_seg_tensor),
     }
