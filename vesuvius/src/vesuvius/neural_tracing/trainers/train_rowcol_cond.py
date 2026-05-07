@@ -18,6 +18,8 @@ from tqdm import tqdm
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     prepare_rowcol_cond_train_config,
+    resolve_rowcol_cond_optimizer_config,
+    resolve_rowcol_cond_scheduler_config,
 )
 from vesuvius.neural_tracing.datasets.targets import RowColTargets
 from vesuvius.neural_tracing.loss.trace_losses import compute_trace_losses
@@ -83,17 +85,17 @@ def train(config_path):
     torch.cuda.manual_seed_all(config['seed'])
 
     dataloader_config = accelerate.DataLoaderConfiguration(
-        non_blocking=bool(config.get('non_blocking', True))
+        non_blocking=bool(config['non_blocking'])
     )
 
     accelerator = accelerate.Accelerator(
-        mixed_precision=config.get('mixed_precision', 'no'),
-        gradient_accumulation_steps=config.get('grad_acc_steps', 1),
+        mixed_precision=config['mixed_precision'],
+        gradient_accumulation_steps=config['grad_acc_steps'],
         dataloader_config=dataloader_config,
     )
 
     preloaded_ckpt = None
-    wandb_resume = bool(config.get('wandb_resume', False))
+    wandb_resume = bool(config['wandb_resume'])
     wandb_run_id = config.get('wandb_run_id')
     if wandb_resume and wandb_run_id is None and 'load_ckpt' in config:
         preloaded_ckpt = load_checkpoint_payload(config['load_ckpt'], map_location='cpu', weights_only=False)
@@ -108,7 +110,7 @@ def train(config_path):
             'config': config,
         }
         if wandb_resume:
-            wandb_kwargs['resume'] = config.get('wandb_resume_mode', 'allow')
+            wandb_kwargs['resume'] = config['wandb_resume_mode']
             if wandb_run_id is not None:
                 wandb_kwargs['id'] = wandb_run_id
         wandb.init(**wandb_kwargs)
@@ -124,7 +126,7 @@ def train(config_path):
 
     # If requested, recompute patch caches exactly once on the main process.
     # Then disable force_recompute so train/val dataset construction just reads cache.
-    if config.get('force_recompute_patches', False):
+    if config['force_recompute_patches']:
         if accelerator.is_main_process:
             accelerator.print("force_recompute_patches=True: recomputing patch cache once on main process...")
             _recompute_ds = EdtSegDataset(config, apply_augmentation=False, apply_perturbation=False)
@@ -146,7 +148,7 @@ def train(config_path):
 
     # Train/val split by indices
     num_patches = len(train_dataset)
-    num_val = max(1, int(num_patches * config.get('val_fraction', 0.1)))
+    num_val = max(1, int(num_patches * config['val_fraction']))
     num_train = num_patches - num_val
 
     indices = torch.randperm(num_patches, generator=torch.Generator().manual_seed(config['seed'])).tolist()
@@ -162,13 +164,13 @@ def train(config_path):
     train_dataset = _restrict_dataset_samples(train_dataset, train_indices)
     val_dataset = _restrict_dataset_samples(val_dataset, val_indices)
 
-    train_num_workers = max(0, int(config.get('num_workers', 0)))
-    val_num_workers = max(0, int(config.get('val_num_workers', 1)))
-    pin_memory = bool(config.get('pin_memory', True))
-    train_prefetch_factor = max(1, int(config.get('prefetch_factor', 1)))
-    val_prefetch_factor = max(1, int(config.get('val_prefetch_factor', train_prefetch_factor)))
-    train_persistent_workers = bool(config.get('persistent_workers', True)) and train_num_workers > 0
-    val_persistent_workers = bool(config.get('persistent_workers', True)) and val_num_workers > 0
+    train_num_workers = max(0, int(config['num_workers']))
+    val_num_workers = max(0, int(config['val_num_workers']))
+    pin_memory = bool(config['pin_memory'])
+    train_prefetch_factor = max(1, int(config['prefetch_factor']))
+    val_prefetch_factor = max(1, int(config['val_prefetch_factor']))
+    train_persistent_workers = bool(config['persistent_workers']) and train_num_workers > 0
+    val_persistent_workers = bool(config['persistent_workers']) and val_num_workers > 0
 
     train_dataloader_kwargs = dict(
         batch_size=config['batch_size'],
@@ -203,29 +205,13 @@ def train(config_path):
 
     model = make_model(config)
 
-    if config.get('compile_model', True):
+    if config['compile_model']:
         model = torch.compile(model)
         if accelerator.is_main_process:
             accelerator.print("Model compiled with torch.compile")
 
-    scheduler_type = config.setdefault('scheduler', 'diffusers_cosine_warmup')
-    scheduler_kwargs = dict(config.setdefault('scheduler_kwargs', {}) or {})
-    if scheduler_type in {'diffusers_cosine_warmup', 'warmup_poly', 'cosine_warmup'}:
-        scheduler_kwargs.setdefault('warmup_steps', config.get('warmup_steps', 5000))
-    config['scheduler_kwargs'] = scheduler_kwargs
-
-    optimizer_config = config.setdefault('optimizer', 'adamw')
-    # Handle optimizer being either a string or a dict
-    if isinstance(optimizer_config, dict):
-        optimizer_type = optimizer_config.get('name', 'adamw')
-        optimizer_kwargs = dict(optimizer_config)
-        optimizer_kwargs.pop('name', None)
-    else:
-        optimizer_type = optimizer_config
-        optimizer_kwargs = dict(config.setdefault('optimizer_kwargs', {}) or {})
-    optimizer_kwargs.setdefault('learning_rate', config.get('learning_rate', 1e-3))
-    optimizer_kwargs.setdefault('weight_decay', config.get('weight_decay', 1e-4))
-    config['optimizer_kwargs'] = optimizer_kwargs
+    scheduler_type, scheduler_kwargs = resolve_rowcol_cond_scheduler_config(config)
+    optimizer_type, optimizer_kwargs = resolve_rowcol_cond_optimizer_config(config)
     optimizer = create_optimizer({'name': optimizer_type, **optimizer_kwargs}, model)
 
     lr_scheduler = get_scheduler(
@@ -243,14 +229,14 @@ def train(config_path):
             config['load_ckpt'],
             model=model,
             checkpoint=preloaded_ckpt,
-            allow_partial_weight_load=config.get('allow_partial_weight_load', False),
+            allow_partial_weight_load=config['allow_partial_weight_load'],
             map_location='cpu',
             weights_only=False,
             print_fn=accelerator.print,
             return_checkpoint=True,
         )
 
-        if not config.get('load_weights_only', False):
+        if not config['load_weights_only']:
             start_iteration = ckpt.get('step', 0)
             # Load optimizer state if optimizer type matches (SGD vs Adam check via betas)
             ckpt_optim_type = type(ckpt['optimizer']['param_groups'][0].get('betas', None))
@@ -278,7 +264,7 @@ def train(config_path):
             state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
         return state_dict
 
-    use_separate_eager_eval_for_logging = bool(config.get('separate_eager_eval_for_logging', False))
+    use_separate_eager_eval_for_logging = bool(config['separate_eager_eval_for_logging'])
     eval_model = None
     if use_separate_eager_eval_for_logging and accelerator.is_main_process:
         eval_model = make_model(config).to(accelerator.device)
@@ -339,7 +325,7 @@ def train(config_path):
         if config['verbose']:
             accelerator.print(f"starting iteration {iteration}")
         should_log_this_iteration = (
-            (iteration > 0 or config.get('log_at_step_zero', False))
+            (iteration > 0 or config['log_at_step_zero'])
             and iteration % config['log_frequency'] == 0
         )
         try:
@@ -429,7 +415,7 @@ def train(config_path):
                 else:
                     model.eval()
 
-                val_batches_per_log = max(1, int(config.get('val_batches_per_log', 4)))
+                val_batches_per_log = max(1, int(config['val_batches_per_log']))
                 val_metric_sums = {
                     'val_loss': 0.0,
                 }
@@ -514,7 +500,7 @@ def train(config_path):
                     model.train()
 
         if (
-            (iteration > 0 or config.get('ckpt_at_step_zero', False))
+            (iteration > 0 or config['ckpt_at_step_zero'])
             and iteration % config['ckpt_frequency'] == 0
             and accelerator.is_main_process
         ):

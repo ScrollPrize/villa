@@ -65,6 +65,9 @@ def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("persistent_workers", False)
     config.setdefault("prefetch_factor", 1)
     config.setdefault("val_prefetch_factor", 1)
+    config.setdefault("mixed_precision", "no")
+    config.setdefault("grad_acc_steps", 1)
+    config.setdefault("val_fraction", 0.1)
     config.setdefault("seed", 0)
     config.setdefault("lambda_velocity_smooth", 0.0)
     config.setdefault("velocity_smooth_normalize", True)
@@ -82,6 +85,9 @@ def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("wandb_resume_mode", "allow")
     config.setdefault("compile_model", True)
     config.setdefault("separate_eager_eval_for_logging", True)
+    config.setdefault("load_weights_only", False)
+    config.setdefault("allow_partial_weight_load", False)
+    config.setdefault("verbose", False)
 
 
 def setdefault_rowcol_cond_model_config(config: MutableMapping[str, Any]) -> None:
@@ -100,8 +106,40 @@ def prepare_rowcol_cond_train_config(config: MutableMapping[str, Any]) -> Mutabl
     setdefault_rowcol_cond_dataset_config(config)
     setdefault_rowcol_cond_trainer_config(config)
     setdefault_rowcol_cond_model_config(config)
+    resolve_rowcol_cond_scheduler_config(config)
+    resolve_rowcol_cond_optimizer_config(config)
     validate_rowcol_cond_dataset_config(config)
     return config
+
+
+def resolve_rowcol_cond_scheduler_config(
+    config: MutableMapping[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Normalize scheduler config without constructing scheduler objects."""
+    scheduler_type = config.setdefault("scheduler", "diffusers_cosine_warmup")
+    scheduler_kwargs = dict(config.setdefault("scheduler_kwargs", {}) or {})
+    if scheduler_type in {"diffusers_cosine_warmup", "warmup_poly", "cosine_warmup"}:
+        scheduler_kwargs.setdefault("warmup_steps", config.get("warmup_steps", 5000))
+    config["scheduler_kwargs"] = scheduler_kwargs
+    return scheduler_type, scheduler_kwargs
+
+
+def resolve_rowcol_cond_optimizer_config(
+    config: MutableMapping[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Normalize optimizer config without constructing optimizer objects."""
+    optimizer_config = config.setdefault("optimizer", "adamw")
+    if isinstance(optimizer_config, dict):
+        optimizer_type = optimizer_config.get("name", "adamw")
+        optimizer_kwargs = dict(optimizer_config)
+        optimizer_kwargs.pop("name", None)
+    else:
+        optimizer_type = optimizer_config
+        optimizer_kwargs = dict(config.setdefault("optimizer_kwargs", {}) or {})
+    optimizer_kwargs.setdefault("learning_rate", config.get("learning_rate", 1e-3))
+    optimizer_kwargs.setdefault("weight_decay", config.get("weight_decay", 1e-4))
+    config["optimizer_kwargs"] = optimizer_kwargs
+    return optimizer_type, optimizer_kwargs
 
 
 def _require_finite(name: str, value: float) -> None:
