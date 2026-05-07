@@ -891,9 +891,10 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     if (!segPath.empty()) {
         outputDir = QString::fromStdString(segPath.parent_path().string());
     } else if (state && state->vpkg()) {
-        auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
-        auto segDir = vpkgRoot / state->vpkg()->getSegmentationDirectory();
-        outputDir = QString::fromStdString(segDir.string());
+        const auto segDir = state->vpkg()->outputSegmentsPath();
+        if (!segDir.empty()) {
+            outputDir = QString::fromStdString(segDir.string());
+        }
     }
 
     const std::string tifxyzSuffix = ".tifxyz";

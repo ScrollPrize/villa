@@ -1,6 +1,7 @@
 import argparse
 import copy
 import dataclasses
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -207,12 +208,8 @@ def main(argv: list[str] | None = None) -> int:
 		missing_seed = []
 		if data_cfg.seed is None:
 			missing_seed.append("--seed")
-		if data_cfg.model_w is None:
-			missing_seed.append("--model-w")
 		if data_cfg.model_h is None:
 			missing_seed.append("--model-h")
-		if data_cfg.windings is None:
-			missing_seed.append("--windings")
 		if missing_seed:
 			raise ValueError(f"model-init=seed requires {', '.join(missing_seed)}")
 	elif model_init == "ext":
@@ -232,14 +229,18 @@ def main(argv: list[str] | None = None) -> int:
 			  f"y={float(data_cfg.seed[1]):.1f} z={float(data_cfg.seed[2]):.1f}",
 			  flush=True)
 
-	# --- Size mesh from model_w, model_h, windings (new model only) ---
-	if model_init == "seed" and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
-		auto_mesh_w = max(2, int(float(data_cfg.model_w) / model_cfg.mesh_step) + 1)
-		auto_mesh_h = max(2, int(data_cfg.model_h / model_cfg.mesh_step) + 1)
-		auto_depth = max(1, data_cfg.windings)
+	# --- Size mesh from model_h only for the umbilicus tube experiment ---
+	if model_init == "seed" and data_cfg.model_h is not None:
+		tube_z_step = 1000.0
+		auto_mesh_w = 20
+		auto_mesh_h = max(2, int(math.ceil(float(data_cfg.model_h) / tube_z_step)) + 1)
+		auto_depth = 1
+		actual_z_step = float(data_cfg.model_h) / float(max(1, auto_mesh_h - 1))
 
 		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
-		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
+		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w} "
+			  f"z_step={actual_z_step:.1f} z_step_target={tube_z_step:.1f} "
+			  f"(umbilicus tube init ignores model-w/windings/mesh-step)", flush=True)
 	_stage_done("derive_initial_model_params", _t)
 
 	# --- Windowed tifxyz mode ---
@@ -471,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
 		)
 		mdl.init_cylinder_seed(
 			seed=tuple(float(v) for v in data_cfg.seed),
-			model_w=float(data_cfg.model_w),
+			model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
 			model_h=float(data_cfg.model_h),
 			volume_extent_fullres=volume_extent_fullres,
 		)
@@ -585,6 +586,11 @@ def main(argv: list[str] | None = None) -> int:
 	data = _ensure_data(None, set())
 	_stage_done("load_data", _t)
 
+	if getattr(mdl, "cylinder_enabled", False) and hasattr(mdl, "prepare_umbilicus_tube_init"):
+		_t = _stage_start("prepare_umbilicus_tube_init")
+		mdl.prepare_umbilicus_tube_init(data)
+		_stage_done("prepare_umbilicus_tube_init", _t)
+
 	# Print loaded data summary
 	Z, Y, X = data.size
 	if data.sparse_caches:
@@ -621,7 +627,11 @@ def main(argv: list[str] | None = None) -> int:
 		for k in ms_keys:
 			del st[k]
 		st.pop("cyl_params", None)
-		if getattr(mdl, "cylinder_enabled", False) and "conn_offsets" in st:
+		if getattr(mdl, "cylinder_enabled", False) and getattr(mdl, "cyl_shell_mode", False):
+			st.pop("conn_offsets", None)
+			st.pop("amp", None)
+			st.pop("bias", None)
+		elif getattr(mdl, "cylinder_enabled", False) and "conn_offsets" in st:
 			st["conn_offsets"] = torch.zeros_like(st["conn_offsets"])
 		with torch.no_grad():
 			st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
@@ -709,6 +719,8 @@ def main(argv: list[str] | None = None) -> int:
 		import fit2tifxyz
 		export_dir = str(Path(_out_dir) / "tifxyz")
 		tifxyz_argv = ["--input", str(model_out), "--output", export_dir]
+		if getattr(mdl, "cyl_shell_completed", None):
+			tifxyz_argv.append("--single-segment")
 		voxel_size_um = cfg.get("voxel_size_um")
 		if voxel_size_um is not None:
 			tifxyz_argv += ["--voxel-size-um", str(float(voxel_size_um))]

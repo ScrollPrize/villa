@@ -222,7 +222,8 @@ def load_stages(path: str) -> list[Stage]:
 def total_steps_for_stages(stages: list[Stage]) -> int:
 	total = 0
 	for stage in stages:
-		total += max(0, stage.global_opt.steps)
+		mul = 3 if "cyl_params" in stage.global_opt.params else 1
+		total += max(0, stage.global_opt.steps) * mul
 	return total
 
 
@@ -711,6 +712,126 @@ def optimize(
 					f"{label}: streaming cache has optional channel(s) not needed by this stage: "
 					f"{sorted(_unwanted_optional)}; needed={sorted(_needed_channels)}"
 				)
+
+		if is_cyl_stage and bool(getattr(model, "cyl_shell_mode", False)):
+			if hasattr(model, "prepare_umbilicus_tube_init"):
+				model.prepare_umbilicus_tube_init(data)
+			shell_count = int(getattr(model, "cyl_shell_target_count", 3))
+			max_steps = int(opt_cfg.steps)
+
+			def _prefetch_shell_model_points() -> None:
+				if not _active_caches:
+					return
+				with torch.no_grad():
+					_xyz_lr_pf = model._grid_xyz()
+					_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
+				for _cache in _active_caches:
+					_sp = data._spacing_for(_cache.channels[0])
+					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+					_cache.prefetch(_xyz_lr_pf, data.origin_fullres, _sp)
+				for _cache in _active_caches:
+					_cache.sync()
+
+			def _shell_param_values() -> dict[str, float]:
+				if not hasattr(model, "_shell_offset_stats"):
+					return {}
+				avg, mn, mx = model._shell_offset_stats()
+				return {"off_avg": avg, "off_min": mn, "off_max": mx}
+
+			for shell_i in range(shell_count):
+				if hasattr(model, "begin_cylinder_shell"):
+					model.begin_cylinder_shell(shell_i, data)
+				all_params, param_groups = _make_param_groups()
+				if not param_groups:
+					return data
+				opt = torch.optim.Adam(param_groups)
+				shell_label = f"{label}.shell{shell_i + 1}"
+
+				_t = _stage_start(f"{shell_label}.initial_eval")
+				_prefetch_shell_model_points()
+				with torch.no_grad():
+					res0 = model(data)
+					_prefetch_loss_points_for_result(res0)
+					loss0, term_vals0, display_loss0 = _eval_terms(
+						res0, stage_eff, profile_label=f"{shell_label}.initial_eval.loss")
+				term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
+				_print_status(
+					step_label=f"{shell_label} 0/{max_steps}",
+					loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
+					tv=term_vals0,
+					pv=_shell_param_values(),
+				)
+				snapshot_fn(stage=shell_label.replace(".", "_"), step=0,
+							loss=float(loss0.detach().cpu()), data=data, res=res0)
+				_stage_done(f"{shell_label}.initial_eval", _t)
+
+				loss = loss0
+				display_loss = display_loss0
+				res = res0
+				_t_wall_start = time.perf_counter()
+				_t_steps_acc = 0
+				for step in range(max_steps):
+					if _active_caches:
+						for _cache in _active_caches:
+							_cache.sync()
+					if fit_data.CHUNK_STATS_ENABLED:
+						fit_data._chunk_stats.begin_iteration()
+					_prefetch_shell_model_points()
+					res = model(data)
+					_prefetch_loss_points_for_result(res)
+					loss, term_vals, display_loss = _eval_terms(res, stage_eff)
+					if fit_data.CHUNK_STATS_ENABLED:
+						fit_data._chunk_stats.end_iteration()
+
+					opt.zero_grad(set_to_none=True)
+					loss.backward()
+					opt.step()
+
+					if _active_caches:
+						_prefetch_shell_model_points()
+						for _cache in _active_caches:
+							_cache.end_iteration()
+
+					step1 = step + 1
+					_t_steps_acc += 1
+					_done_steps[0] += 1
+					_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
+					_overall_progress = (
+						(si + (shell_i + _stage_progress) / max(1, shell_count)) / _num_stages
+						if _num_stages > 0 else 1.0
+					)
+					if progress_fn is not None:
+						progress_fn(
+							step=_done_steps[0], total=_total_steps,
+							loss=float(display_loss) if display_loss is not None else float(loss.detach().cpu()),
+							stage_progress=_stage_progress, overall_progress=_overall_progress,
+							stage_name=stage.name,
+						)
+					if step == 0 or step1 == max_steps or (status_interval > 0 and (step1 % status_interval) == 0):
+						term_vals = {k: round(v, 4) for k, v in term_vals.items()}
+						_t_wall_now = time.perf_counter()
+						_t_wall_elapsed = _t_wall_now - _t_wall_start
+						_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
+						_print_status(
+							step_label=f"{shell_label} {step1}/{max_steps}",
+							loss_val=float(display_loss) if display_loss is not None else loss.item(),
+							tv=term_vals,
+							pv=_shell_param_values(),
+							its=_its,
+						)
+						_t_steps_acc = 0
+						_t_wall_start = _t_wall_now
+					if snap_int > 0 and (step1 % snap_int) == 0:
+						snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
+									loss=float(loss.detach().cpu()), data=data, res=res)
+
+				if hasattr(model, "complete_current_cylinder_shell"):
+					model.complete_current_cylinder_shell(data)
+				snapshot_fn(stage=shell_label.replace(".", "_"), step=max_steps,
+							loss=float(loss.detach().cpu()), data=data, res=res)
+
+			_stage_done(f"{label}.total", _t_stage_total)
+			return data
 
 		# Initial prefetch for streaming mode
 		if _active_caches:

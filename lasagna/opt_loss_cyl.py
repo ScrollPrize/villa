@@ -143,18 +143,35 @@ def _cyl_dims(res: fit_model.FitResult3D) -> tuple[int, int, int, int, int]:
 def _candidate_mean(lm: torch.Tensor, mask: torch.Tensor, *, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	N, S, D, H, W = _cyl_dims(res)
 	lm_c = lm.reshape(N, S, D, H, W)
-	mask_c = mask.reshape(N, S, D, H, W)
+	mask_c = mask.reshape(N, S, D, H, W) * _mesh_distance_falloff(res=res, dtype=lm.dtype, device=lm.device)
 	wsum = mask_c.sum(dim=(1, 2, 3, 4))
 	err = (lm_c * mask_c).sum(dim=(1, 2, 3, 4)) / wsum.clamp(min=1.0)
 	err = torch.where(wsum > 0.0, err, torch.full_like(err, float("inf")))
 	return err, lm_c, mask_c
 
 
+def _mesh_distance_falloff(*, res: fit_model.FitResult3D, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+	N, S, D, H, W = _cyl_dims(res)
+	with torch.no_grad():
+		h_idx = torch.arange(H, device=device, dtype=dtype)
+		w_idx = torch.arange(W, device=device, dtype=dtype)
+		h_center = float(H // 2)
+		w_center = float(W // 2)
+		h_edge = max(h_center, float(H - 1) - h_center, 1.0)
+		w_edge = max(w_center, float(W - 1) - w_center, 1.0)
+		h_dist = ((h_idx - h_center).abs() / h_edge).clamp(max=1.0)
+		w_dist = ((w_idx - w_center).abs() / w_edge).clamp(max=1.0)
+		grid_dist = torch.maximum(h_dist.view(1, H, 1), w_dist.view(1, 1, W))
+		floor = 0.1
+		falloff = floor + (1.0 - floor) * (1.0 - grid_dist).pow(2.0)
+		return falloff.view(1, 1, 1, H, W).expand(N, S, D, H, W)
+
+
 def _register_normal_angle_stats(dot: torch.Tensor, mask: torch.Tensor, *, res: fit_model.FitResult3D) -> None:
 	N, S, D, H, W = _cyl_dims(res)
 	with torch.no_grad():
 		dot_c = dot.detach().reshape(N, S, D, H, W).clamp(min=-1.0, max=1.0)
-		mask_f = mask.detach().reshape(N, S, D, H, W)
+		mask_f = mask.detach().reshape(N, S, D, H, W) * _mesh_distance_falloff(res=res, dtype=dot_c.dtype, device=dot_c.device)
 		mask_c = mask_f > 0.0
 		angle = torch.acos(dot_c) * (180.0 / math.pi)
 		wsum = mask_f.sum(dim=(1, 2, 3, 4))
@@ -176,6 +193,25 @@ def _register_candidate_term(name: str, err: torch.Tensor) -> torch.Tensor:
 	if bool(valid.any().detach().cpu()):
 		return err[valid].mean()
 	return err.new_zeros(()) + err[~valid].new_zeros(()).sum() * 0.0
+
+
+def _register_shell_normal_angle_stats(dot_abs: torch.Tensor, mask: torch.Tensor) -> None:
+	with torch.no_grad():
+		dot_abs = dot_abs.detach().clamp(min=0.0, max=1.0)
+		mask_f = mask.detach().to(dtype=dot_abs.dtype)
+		mask_c = mask_f > 0.0
+		angle = torch.acos(dot_abs) * (180.0 / math.pi)
+		wsum = mask_f.sum()
+		avg = (angle * mask_f).sum() / wsum.clamp(min=1.0)
+		avg = torch.where(wsum > 0.0, avg, torch.full_like(avg, float("inf")))
+		inf = torch.full_like(angle, float("inf"))
+		ninf = torch.full_like(angle, float("-inf"))
+		min_v = torch.where(mask_c, angle, inf).amin()
+		max_v = torch.where(mask_c, angle, ninf).amax()
+		max_v = torch.where(wsum > 0.0, max_v, torch.full_like(max_v, float("inf")))
+		_candidate_normal_stats["cyl_nerr_avg"] = avg.detach().view(1)
+		_candidate_normal_stats["cyl_nerr_min"] = min_v.detach().view(1)
+		_candidate_normal_stats["cyl_nerr_max"] = max_v.detach().view(1)
 
 
 def _unit_xy(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -219,6 +255,20 @@ def cyl_normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	target, grad_mag = _sample_gt(res)
 	if target is None or grad_mag is None:
 		return _zero_loss(res)
+
+	if bool(getattr(res, "cyl_shell_mode", False)):
+		normal = res.cyl_normals
+		normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
+		dot = (normal * target).sum(dim=-1).clamp(min=-1.0, max=1.0)
+		dot_abs = dot.abs()
+		lm = 1.0 - dot_abs * dot_abs
+		mask = (grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=lm.dtype)
+		wsum = mask.sum()
+		err = (lm * mask).sum() / wsum.clamp(min=1.0)
+		err = torch.where(wsum > 0.0, err, torch.full_like(err, float("inf")))
+		_register_shell_normal_angle_stats(dot_abs, mask)
+		loss = _register_candidate_term("cyl_normal", err.view(1))
+		return loss, (lm.unsqueeze(0).unsqueeze(0),), (mask.unsqueeze(0).unsqueeze(0),)
 
 	dot, normal_weight = _signed_xy_normal_alignment(res=res, target=target)
 	lm = 1.0 - dot

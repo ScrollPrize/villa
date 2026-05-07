@@ -49,6 +49,7 @@ class FitResult3D:
 	cyl_axes: torch.Tensor | None = None     # (N, 3) unit cylinder axis direction
 	cyl_params: torch.Tensor | None = None   # (N, 6) [radius, ellipse_k, seed_phase, tilt_x, tilt_y, roll]
 	cyl_count: int = 0
+	cyl_shell_mode: bool = False
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
@@ -124,6 +125,20 @@ class Model3D(nn.Module):
 		# at the seed along the optimized cylinder axis.
 		self.cyl_params = nn.Parameter(self._default_cylinder_params(device=device))
 		self.cyl_seed_xyz = torch.zeros(3, device=device, dtype=torch.float32)
+		self.cyl_shell_mode = False
+		self.cyl_shell_target_count = 3
+		self.cyl_shell_step = 500.0
+		self.cyl_shell_z_step = 1000.0
+		self.cyl_shell_width_target_step = 1000.0
+		self.cyl_shell_min_width = 20
+		self.cyl_shell_seed_z = float(z_center)
+		self.cyl_shell_model_h: float | None = None
+		self.cyl_shell_z: torch.Tensor | None = None
+		self.cyl_shell_base: torch.Tensor | None = None
+		self.cyl_shell_dirs: torch.Tensor | None = None
+		self.cyl_shell_completed: list[torch.Tensor] = []
+		self.cyl_shell_current_index = 0
+		self.cyl_shell_active = False
 
 		# Residual mesh pyramid: (3, D, H, W) per scale, 5 levels
 		n_scales = 5
@@ -287,44 +302,269 @@ class Model3D(nn.Module):
 		model_h: float,
 		volume_extent_fullres: tuple[int, int, int] | None,
 	) -> None:
-		"""Initialize the 960-way cylinder rough search from a user seed."""
-		device = self.cyl_params.device
-		seed_x, seed_y, seed_z = (float(seed[0]), float(seed[1]), float(seed[2]))
-		if volume_extent_fullres is not None:
-			cx = float(volume_extent_fullres[0]) / 2.0
-			cy = float(volume_extent_fullres[1]) / 2.0
-		else:
-			cx = seed_x
-			cy = seed_y
-		dx = seed_x - cx
-		dy = seed_y - cy
-		base_r = math.sqrt(dx * dx + dy * dy)
-		if not math.isfinite(base_r) or base_r < 1.0:
-			base_r = max(float(model_w), float(model_h), float(self.params.mesh_step)) / (2.0 * math.pi)
-		base_r = max(base_r, 1.0)
-		seed_angle = math.atan2(dy, dx) if base_r > 0.0 else 0.0
+		"""Initialize the experimental umbilicus tube grower from seed z.
 
-		angle_count = 16
-		roll_angles = [seed_angle + (2.0 * math.pi * i / float(angle_count)) for i in range(angle_count)]
-		size_factors = [0.70, 0.85, 1.00, 1.20, 1.45]
-		anisotropy_ratios = [4.0, 3.0, 2.0, 1.0]
-		seed_phases = [0.0, math.pi * 0.5, math.pi * 0.25]
-		rows: list[list[float]] = []
-		for roll in roll_angles:
-			for fac in size_factors:
-				for ratio in anisotropy_ratios:
-					k = (ratio - 1.0) / (ratio + 1.0)
-					for seed_phase in seed_phases:
-						rows.append([base_r * fac, k, seed_phase, 0.0, 0.0, roll])
+		The current experiment keeps the public cylinder_seed trigger, but the
+		actual geometry is built lazily once FitData3D has supplied the
+		umbilicus lookup. Seed x/y and model_w are intentionally ignored.
+		"""
+		device = self.cyl_params.device
 		with torch.no_grad():
-			self.cyl_params = nn.Parameter(torch.tensor(rows, device=device, dtype=torch.float32))
-			self.cyl_seed_xyz = torch.tensor([seed_x, seed_y, seed_z], device=device, dtype=torch.float32)
-		self.params = replace(self.params, model_w=float(model_w), model_h=float(model_h))
+			self.cyl_seed_xyz = torch.tensor([float(seed[0]), float(seed[1]), float(seed[2])],
+											 device=device, dtype=torch.float32)
+			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
+		self.params = replace(self.params, model_w=None, model_h=float(model_h))
+		self.cyl_shell_mode = True
+		self.cyl_shell_seed_z = float(seed[2])
+		self.cyl_shell_model_h = float(model_h)
+		self.cyl_shell_z = None
+		self.cyl_shell_base = None
+		self.cyl_shell_dirs = None
+		self.cyl_shell_completed = []
+		self.cyl_shell_current_index = 0
+		self.cyl_shell_active = False
 		self.cylinder_enabled = True
 		self.cyl_best_idx = 0
 		self.arc_enabled = False
 		self.straight_enabled = False
 		self.init_mode = "cylinder_seed"
+
+	def _set_shell_grid_shape(self, *, h: int, w: int) -> None:
+		h = max(2, int(h))
+		w = max(3, int(w))
+		device = self.cyl_params.device
+		self.depth = 1
+		self.mesh_h = h
+		self.mesh_w = w
+		self.conn_offsets = torch.zeros(4, 1, h, w, device=device, dtype=torch.float32)
+		self.amp = nn.Parameter(torch.ones(1, 1, h, w, device=device, dtype=torch.float32))
+		self.bias = nn.Parameter(torch.full((1, 1, h, w), 0.5, device=device, dtype=torch.float32))
+
+	def _set_fused_grid_shape(self, *, d: int, h: int, w: int) -> None:
+		d = max(1, int(d))
+		h = max(2, int(h))
+		w = max(3, int(w))
+		device = self.cyl_params.device
+		self.depth = d
+		self.mesh_h = h
+		self.mesh_w = w
+		self.conn_offsets = torch.zeros(4, d, h, w, device=device, dtype=torch.float32)
+		self.amp = nn.Parameter(torch.ones(d, 1, h, w, device=device, dtype=torch.float32))
+		self.bias = nn.Parameter(torch.full((d, 1, h, w), 0.5, device=device, dtype=torch.float32))
+
+	def prepare_umbilicus_tube_init(self, data: fit_data.FitData3D) -> None:
+		"""Build the first pending shell from the umbilicus lookup."""
+		if not self.cyl_shell_mode or self.cyl_shell_base is not None:
+			return
+		if self.cyl_shell_model_h is None:
+			raise ValueError("cylinder shell init missing model_h")
+		device = self.cyl_params.device
+		dtype = self.cyl_params.dtype
+		z_step = max(1.0, float(self.cyl_shell_z_step))
+		model_h = max(float(self.cyl_shell_model_h), z_step)
+		H = max(2, int(math.ceil(model_h / z_step)) + 1)
+		actual_z_step = model_h / float(max(1, H - 1))
+		radius0 = float(self.cyl_shell_step)
+		W = self._shell_width_for_radius(radius0)
+		self._set_shell_grid_shape(h=H, w=W)
+		z = self._shell_z_values(device=device, dtype=dtype, h=H)
+		base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
+		self.cyl_shell_z = z.detach()
+		self.cyl_shell_base = base.detach()
+		self.cyl_shell_dirs = dirs.detach()
+		self.cyl_params = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
+		print(f"[model] umbilicus tube init: shells={self.cyl_shell_target_count} "
+			  f"H={H} W={W} z_center={self.cyl_shell_seed_z:.1f} "
+			  f"model_h={model_h:.1f} z_step={actual_z_step:.1f} "
+			  f"z_step_target={z_step:.1f} shell_step={self.cyl_shell_step:.1f}",
+			  flush=True)
+
+	def _shell_z_values(self, *, device: torch.device, dtype: torch.dtype, h: int) -> torch.Tensor:
+		model_h = (
+			float(self.cyl_shell_model_h)
+			if self.cyl_shell_model_h is not None
+			else float(self.params.mesh_step) * float(max(1, h - 1))
+		)
+		if h <= 1:
+			return torch.full((1,), float(self.cyl_shell_seed_z), device=device, dtype=dtype)
+		t = torch.linspace(-0.5, 0.5, h, device=device, dtype=dtype)
+		return float(self.cyl_shell_seed_z) + t * float(model_h)
+
+	def _shell_width_for_radius(self, radius: float) -> int:
+		step = max(1.0, float(self.cyl_shell_width_target_step))
+		circ = max(0.0, 2.0 * math.pi * float(radius))
+		return max(int(self.cyl_shell_min_width), int(math.ceil(circ / step)))
+
+	def _umbilicus_base_shell(
+		self,
+		*,
+		data: fit_data.FitData3D,
+		z: torch.Tensor,
+		w: int,
+	) -> tuple[torch.Tensor, torch.Tensor]:
+		device = z.device
+		dtype = z.dtype
+		angles = torch.arange(w, device=device, dtype=dtype) * (2.0 * math.pi / float(w))
+		dir_xy = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+		umb_xy = data.umbilicus_xy_at_z(z).to(device=device, dtype=dtype)
+		base_xy = umb_xy[:, None, :].expand(int(z.shape[0]), w, 2)
+		base_z = z[:, None, None].expand(int(z.shape[0]), w, 1)
+		base = torch.cat([base_xy, base_z], dim=-1)
+		dirs = torch.cat([
+			dir_xy[None, :, :].expand(int(z.shape[0]), w, 2),
+			torch.zeros(int(z.shape[0]), w, 1, device=device, dtype=dtype),
+		], dim=-1)
+		return base, dirs
+
+	@staticmethod
+	def _unit_vertex_normals_for_shell(xyz: torch.Tensor) -> torch.Tensor:
+		if xyz.ndim == 3:
+			xyz_b = xyz.unsqueeze(0)
+			squeeze = True
+		else:
+			xyz_b = xyz
+			squeeze = False
+		dh = torch.zeros_like(xyz_b)
+		dh[:, 1:-1] = xyz_b[:, 2:] - xyz_b[:, :-2]
+		dh[:, 0] = xyz_b[:, 1] - xyz_b[:, 0]
+		dh[:, -1] = xyz_b[:, -1] - xyz_b[:, -2]
+		dw = torch.roll(xyz_b, shifts=-1, dims=2) - torch.roll(xyz_b, shifts=1, dims=2)
+		n = torch.cross(dh, dw, dim=-1)
+		n = F.normalize(n, dim=-1, eps=1.0e-8)
+		return n.squeeze(0) if squeeze else n
+
+	def _outward_xy_dirs_for_shell(self, shell: torch.Tensor, data: fit_data.FitData3D) -> torch.Tensor:
+		with torch.no_grad():
+			n = self._unit_vertex_normals_for_shell(shell)
+			n_xy = n[..., :2]
+			n_xy_len = n_xy.norm(dim=-1, keepdim=True)
+			z = shell[..., 2]
+			umb_xy = data.umbilicus_xy_at_z(z)
+			radial_xy = shell[..., :2] - umb_xy
+			radial_xy = radial_xy / radial_xy.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
+			n_xy = torch.where(n_xy_len > 1.0e-8, n_xy / n_xy_len.clamp(min=1.0e-8), radial_xy)
+			n_xy = torch.where(((n_xy * radial_xy).sum(dim=-1, keepdim=True) < 0.0), -n_xy, n_xy)
+			dirs = torch.cat([n_xy, torch.zeros_like(n_xy[..., :1])], dim=-1)
+			return dirs.detach()
+
+	def _shell_offset_distance(self) -> torch.Tensor:
+		raw = F.softplus(self.cyl_params) + 1.0e-6
+		scale = float(self.cyl_shell_step) / raw.mean().detach().clamp(min=1.0e-6)
+		return raw * scale
+
+	def _shell_offset_stats(self) -> tuple[float, float, float]:
+		with torch.no_grad():
+			dist = self._shell_offset_distance()
+			return (
+				float(dist.mean().detach().cpu()),
+				float(dist.amin().detach().cpu()),
+				float(dist.amax().detach().cpu()),
+			)
+
+	def current_cylinder_shell_xyz(self) -> torch.Tensor:
+		if self.cyl_shell_base is None or self.cyl_shell_dirs is None:
+			raise ValueError("umbilicus tube shell has not been prepared")
+		dist = self._shell_offset_distance().unsqueeze(-1)
+		return self.cyl_shell_base.to(device=dist.device, dtype=dist.dtype) + dist * self.cyl_shell_dirs.to(device=dist.device, dtype=dist.dtype)
+
+	def current_cylinder_shell_normals(self) -> torch.Tensor:
+		return self._unit_vertex_normals_for_shell(self.current_cylinder_shell_xyz())
+
+	def begin_cylinder_shell(self, idx: int, data: fit_data.FitData3D) -> None:
+		self.prepare_umbilicus_tube_init(data)
+		idx = int(idx)
+		if idx < 0 or idx >= int(self.cyl_shell_target_count):
+			raise ValueError(f"invalid shell index {idx}")
+		device = self.cyl_params.device
+		dtype = self.cyl_params.dtype
+		if idx == 0:
+			if self.cyl_shell_z is None:
+				raise ValueError("missing initial shell z values")
+			W = self._shell_width_for_radius(float(self.cyl_shell_step))
+			base, dirs = self._umbilicus_base_shell(data=data, z=self.cyl_shell_z.to(device=device, dtype=dtype), w=W)
+		else:
+			if len(self.cyl_shell_completed) < idx:
+				raise ValueError(f"cannot start shell {idx}: previous shell is missing")
+			prev = self.cyl_shell_completed[idx - 1].to(device=device, dtype=dtype)
+			base = prev
+			dirs = self._outward_xy_dirs_for_shell(prev, data).to(device=device, dtype=dtype)
+			W = int(prev.shape[1])
+		H = int(base.shape[0])
+		self._set_shell_grid_shape(h=H, w=W)
+		self.cyl_shell_base = base.detach()
+		self.cyl_shell_dirs = dirs.detach()
+		self.cyl_params = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
+		self.cyl_shell_current_index = idx
+		self.cyl_shell_active = True
+		self.cylinder_enabled = True
+		self.cyl_shell_mode = True
+		step_avg, step_min, step_max = self._shell_offset_stats()
+		print(f"[model] shell {idx + 1}/{self.cyl_shell_target_count}: H={H} W={W} "
+			  f"base={'umbilicus' if idx == 0 else 'previous'} "
+			  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f}", flush=True)
+
+	def _resample_shell_width(self, shell: torch.Tensor, target_w: int) -> torch.Tensor:
+		target_w = max(3, int(target_w))
+		src_w = int(shell.shape[1])
+		if src_w == target_w:
+			return shell.detach().clone()
+		device = shell.device
+		dtype = shell.dtype
+		phase = torch.arange(target_w, device=device, dtype=dtype) * (float(src_w) / float(target_w))
+		i0 = torch.floor(phase).to(dtype=torch.long)
+		frac = (phase - i0.to(dtype=dtype)).view(1, target_w, 1)
+		i0 = torch.remainder(i0, src_w)
+		i1 = torch.remainder(i0 + 1, src_w)
+		p0 = shell.index_select(1, i0)
+		p1 = shell.index_select(1, i1)
+		return (p0 + frac * (p1 - p0)).contiguous().detach()
+
+	def _target_width_for_shell(self, shell: torch.Tensor, data: fit_data.FitData3D) -> int:
+		with torch.no_grad():
+			umb_xy = data.umbilicus_xy_at_z(shell[..., 2])
+			radius = (shell[..., :2] - umb_xy).norm(dim=-1).mean()
+			return self._shell_width_for_radius(float(radius.detach().cpu()))
+
+	def complete_current_cylinder_shell(self, data: fit_data.FitData3D) -> None:
+		with torch.no_grad():
+			shell = self.current_cylinder_shell_xyz().detach()
+			target_w = self._target_width_for_shell(shell, data)
+			shell = self._resample_shell_width(shell, target_w)
+			idx = int(self.cyl_shell_current_index)
+			if len(self.cyl_shell_completed) > idx:
+				self.cyl_shell_completed[idx] = shell
+			elif len(self.cyl_shell_completed) == idx:
+				self.cyl_shell_completed.append(shell)
+			else:
+				raise ValueError(f"cannot store shell {idx}: shell list has gap")
+			self.cyl_shell_base = shell.detach()
+			self.cyl_shell_dirs = self._outward_xy_dirs_for_shell(shell, data).detach()
+			self._set_shell_grid_shape(h=int(shell.shape[0]), w=int(shell.shape[1]))
+			step_avg, step_min, step_max = self._shell_offset_stats()
+			self.cyl_params = nn.Parameter(torch.zeros(int(shell.shape[0]), int(shell.shape[1]),
+													  device=shell.device, dtype=shell.dtype))
+			self.cyl_shell_active = False
+			print(f"[model] completed shell {idx + 1}/{self.cyl_shell_target_count}: "
+				  f"H={int(shell.shape[0])} W={int(shell.shape[1])} "
+				  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f}", flush=True)
+
+	def cylinder_shells_done(self) -> bool:
+		return self.cyl_shell_mode and len(self.cyl_shell_completed) >= int(self.cyl_shell_target_count)
+
+	def fused_cylinder_shell_mesh_flat(self) -> torch.Tensor:
+		shells = [s.detach() for s in self.cyl_shell_completed]
+		if not shells and self.cyl_shell_base is not None and self.cyl_shell_active:
+			shells = [self.current_cylinder_shell_xyz().detach()]
+		elif self.cyl_shell_base is not None and self.cyl_shell_active:
+			shells = shells + [self.current_cylinder_shell_xyz().detach()]
+		if not shells:
+			raise ValueError("no umbilicus tube shells available to fuse")
+		max_w = max(int(s.shape[1]) for s in shells)
+		shells = [self._resample_shell_width(s, max_w) if int(s.shape[1]) != max_w else s.detach().clone()
+				  for s in shells]
+		shells = [torch.cat([s, s[:, :1]], dim=1).contiguous() for s in shells]
+		stack = torch.stack(shells, dim=0)
+		return stack.permute(3, 0, 1, 2).contiguous()
 
 	@staticmethod
 	def _validate_cyl_params(params: torch.Tensor) -> None:
@@ -496,9 +736,15 @@ class Model3D(nn.Module):
 		return xyz.reshape(N * D, H, W, 3), normal.reshape(N * D, H, W, 3)
 
 	def cylinder_samples(self) -> tuple[torch.Tensor, torch.Tensor]:
+		if self.cyl_shell_mode:
+			xyz = self.current_cylinder_shell_xyz()
+			normal = self.current_cylinder_shell_normals()
+			return xyz.unsqueeze(0), normal.unsqueeze(0)
 		return self._cylinder_samples_for_params(self.cyl_params)
 
 	def cylinder_centers(self) -> torch.Tensor:
+		if self.cyl_shell_mode:
+			return torch.empty(0, 3, device=self.cyl_params.device, dtype=self.cyl_params.dtype)
 		params = self.cyl_params
 		self._validate_cyl_params(params)
 		device = params.device
@@ -515,6 +761,8 @@ class Model3D(nn.Module):
 		return seed.view(1, 3) - seed_radial
 
 	def cylinder_axes(self) -> torch.Tensor:
+		if self.cyl_shell_mode:
+			return torch.empty(0, 3, device=self.cyl_params.device, dtype=self.cyl_params.dtype)
 		axis, _u, _v = self._cylinder_frame(self.cyl_params)
 		return axis
 
@@ -533,6 +781,8 @@ class Model3D(nn.Module):
 
 	def cylinder_candidate_errors(self, data: fit_data.FitData3D) -> torch.Tensor:
 		"""Detached per-candidate cyl_normal errors used for status and baking."""
+		if self.cyl_shell_mode:
+			return torch.zeros(1, device=self.cyl_params.device, dtype=self.cyl_params.dtype)
 		with torch.no_grad():
 			xyz, normals = self.cylinder_samples()
 			self._prefetch_cylinder_samples(data, xyz)
@@ -566,6 +816,8 @@ class Model3D(nn.Module):
 			return torch.where(wsum > 0.0, err, torch.full_like(err, float("inf")))
 
 	def best_cylinder_index(self, data: fit_data.FitData3D | None = None) -> int:
+		if self.cyl_shell_mode:
+			return 0
 		if getattr(self, "cyl_best_idx", None) is not None:
 			return max(0, min(int(self.cyl_best_idx), int(self.cyl_params.shape[0]) - 1))
 		if data is None:
@@ -590,6 +842,8 @@ class Model3D(nn.Module):
 		return int(self.cyl_params.shape[0])
 
 	def cylinder_mesh_flat(self, *, candidate_idx: int) -> torch.Tensor:
+		if self.cyl_shell_mode:
+			return self.fused_cylinder_shell_mesh_flat()
 		idx = max(0, min(int(candidate_idx), int(self.cyl_params.shape[0]) - 1))
 		xyz, _normal = self._cylinder_samples_for_params(self.cyl_params[idx:idx + 1])
 		return xyz.reshape(self.depth, self.mesh_h, self.mesh_w, 3).permute(3, 0, 1, 2).contiguous()
@@ -597,6 +851,17 @@ class Model3D(nn.Module):
 	def bake_cylinder_into_mesh(self, data: fit_data.FitData3D | None = None) -> None:
 		"""Absorb the lowest-error analytic cylinder candidate into mesh_ms."""
 		if not self.cylinder_enabled:
+			return
+		if self.cyl_shell_mode:
+			with torch.no_grad():
+				final = self.fused_cylinder_shell_mesh_flat()
+				self._set_fused_grid_shape(d=int(final.shape[1]), h=int(final.shape[2]), w=int(final.shape[3]))
+				self.mesh_ms = self._construct_pyramid_from_flat_3d(final, len(self.mesh_ms), pyramid_d=self.pyramid_d)
+				self.conn_offsets.zero_()
+				for ext_off in self._ext_conn_offsets:
+					ext_off.zero_()
+			self.cylinder_enabled = False
+			self.cyl_shell_mode = False
 			return
 		idx = self.best_cylinder_index(data)
 		with torch.no_grad():
@@ -609,6 +874,8 @@ class Model3D(nn.Module):
 
 	def mesh_flat_for_save(self, *, data: fit_data.FitData3D | None = None) -> torch.Tensor:
 		if self.cylinder_enabled:
+			if self.cyl_shell_mode:
+				return self.fused_cylinder_shell_mesh_flat().detach().clone()
 			idx = self.best_cylinder_index(data)
 			return self.cylinder_mesh_flat(candidate_idx=idx).detach().clone()
 		return self.mesh_coarse().detach().clone()
@@ -702,6 +969,8 @@ class Model3D(nn.Module):
 	def _grid_xyz(self) -> torch.Tensor:
 		"""(D, Hm, Wm, 3) mesh positions in fullres voxel coords."""
 		if self.cylinder_enabled:
+			if self.cyl_shell_mode:
+				return self.current_cylinder_shell_xyz().unsqueeze(0)
 			idx = self.best_cylinder_index(None)
 			xyz, _normal = self._cylinder_samples_for_params(self.cyl_params[idx:idx + 1])
 			return xyz.reshape(self.depth, self.mesh_h, self.mesh_w, 3)
@@ -1404,10 +1673,17 @@ class Model3D(nn.Module):
 		cyl_axes = None
 		cyl_count = 0
 		if self.cylinder_enabled:
-			cyl_xyz, cyl_normals = self.cylinder_samples()
-			cyl_centers = self.cylinder_centers()
-			cyl_axes = self.cylinder_axes()
-			cyl_count = int(self.cyl_params.shape[0])
+			if self.cyl_shell_mode:
+				cyl_xyz = xyz_lr
+				cyl_normals = self.current_cylinder_shell_normals().unsqueeze(0)
+				cyl_centers = None
+				cyl_axes = None
+				cyl_count = 1
+			else:
+				cyl_xyz, cyl_normals = self.cylinder_samples()
+				cyl_centers = self.cylinder_centers()
+				cyl_axes = self.cylinder_axes()
+				cyl_count = int(self.cyl_params.shape[0])
 		else:
 			cyl_centers = None
 
@@ -1435,6 +1711,7 @@ class Model3D(nn.Module):
 			cyl_axes=cyl_axes,
 			cyl_params=self.cyl_params if self.cylinder_enabled else None,
 			cyl_count=cyl_count,
+			cyl_shell_mode=bool(self.cyl_shell_mode and self.cylinder_enabled),
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
