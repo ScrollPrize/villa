@@ -1992,6 +1992,7 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
     };
     std::vector<CroppedChannel> croppedChannels;
     croppedChannels.reserve(surface->channelNames().size());
+    bool droppedGenerationsChannel = false;
 
     const auto channelNames = surface->channelNames();
     for (const auto& name : channelNames) {
@@ -2000,6 +2001,10 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
             continue;
         }
         if (channelData.cols % origCols != 0 || channelData.rows % origRows != 0) {
+            if (name == "generations") {
+                droppedGenerationsChannel = true;
+                continue;
+            }
             QMessageBox::warning(_parentWidget,
                                  tr("Crop failed"),
                                  tr("Channel '%1' has size %2x%3, which is not divisible by the surface grid %4x%5.")
@@ -2057,6 +2062,11 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
     for (const auto& ch : croppedChannels) {
         surface->setChannel(ch.name, ch.data);
     }
+    if (droppedGenerationsChannel) {
+        surface->setChannel("generations", cv::Mat());
+        std::error_code ec;
+        std::filesystem::remove(surface->path / "generations.tif", ec);
+    }
     surface->invalidateCache();
 
     if (tempSurface && !tempSurface->meta.is_null()) {
@@ -2078,7 +2088,9 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
 
     const QString segLabel = QString::fromStdString(segmentId);
     emit statusMessage(
-        tr("Cropped %1 to %2x%3 (offset %4,%5)")
+        (droppedGenerationsChannel
+             ? tr("Cropped %1 to %2x%3 (offset %4,%5); removed mismatched generations.tif")
+             : tr("Cropped %1 to %2x%3 (offset %4,%5)"))
             .arg(segLabel)
             .arg(roi.width)
             .arg(roi.height)
