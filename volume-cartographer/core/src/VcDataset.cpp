@@ -174,8 +174,8 @@ void lz4DecompressInto(std::span<const std::byte> input, std::span<std::byte> ou
 
     uint32_t originalSize = 0;
     std::memcpy(&originalSize, input.data(), sizeof(originalSize));
-    if (originalSize > output.size()) {
-        throw std::runtime_error("LZ4 original size exceeds output buffer");
+    if (originalSize != output.size()) {
+        throw std::runtime_error("LZ4 original size does not match output buffer");
     }
 
     const int rc = LZ4_decompress_safe(
@@ -185,6 +185,9 @@ void lz4DecompressInto(std::span<const std::byte> input, std::span<std::byte> ou
         checkedInt(originalSize, "LZ4 output"));
     if (rc < 0) {
         throw std::runtime_error("LZ4_decompress_safe failed");
+    }
+    if (static_cast<size_t>(rc) != output.size()) {
+        throw std::runtime_error("LZ4_decompress_safe produced unexpected byte count");
     }
 }
 
