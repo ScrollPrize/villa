@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from vesuvius.tifxyz import read_tifxyz
+from vesuvius.tifxyz import discover_labels, read_tifxyz
 
 
 def _write_segment(path: Path, shape: tuple[int, int], scale: tuple[float, float] = (1.0, 1.0)) -> Path:
@@ -42,7 +42,7 @@ def test_list_labels_discovers_paths_shapes_and_status(tmp_path: Path) -> None:
     _write_label(segment_dir / "b_surface.png", np.full((6, 8), 9, dtype=np.uint8))
     _write_label(segment_dir / "c_ink.jpg", np.full((5, 8), 3, dtype=np.uint8))
 
-    segment = read_tifxyz(segment_dir)
+    segment = read_tifxyz(segment_dir, discover_label_shapes=True)
     labels = segment.list_labels()
 
     assert [label["filename"] for label in labels] == [
@@ -57,6 +57,69 @@ def test_list_labels_discovers_paths_shapes_and_status(tmp_path: Path) -> None:
     assert c_ink["shape"] == (5, 8)
     assert c_ink["matches_stored_shape"] is False
     assert "Shape mismatch" in str(c_ink["error"])
+
+
+def test_read_tifxyz_discovers_labels_without_loading_shapes_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segment_dir = _write_segment(tmp_path / "segment", (6, 8))
+    _write_label(segment_dir / "a_ink.tif", np.full((6, 8), 7, dtype=np.uint8))
+
+    def fail_imread(*args, **kwargs):
+        raise AssertionError("cv2.imread should not run during label discovery")
+
+    monkeypatch.setattr(cv2, "imread", fail_imread)
+
+    segment = read_tifxyz(segment_dir)
+    labels = segment.list_labels()
+
+    assert [label["filename"] for label in labels] == ["a_ink.tif"]
+    assert labels[0]["shape"] is None
+    assert labels[0]["matches_stored_shape"] is None
+    assert labels[0]["error"] is None
+
+
+def test_read_tifxyz_rewrites_non_mmapable_coordinates(tmp_path: Path) -> None:
+    segment_dir = _write_segment(tmp_path / "segment", (32, 32))
+    original_x = tifffile.imread(str(segment_dir / "x.tif"))
+    tifffile.imwrite(
+        str(segment_dir / "x.tif"),
+        original_x,
+        tile=(16, 16),
+        compression="zlib",
+        photometric="minisblack",
+    )
+
+    with pytest.raises(ValueError):
+        tifffile.memmap(str(segment_dir / "x.tif"), mode="c")
+
+    segment = read_tifxyz(segment_dir)
+
+    assert isinstance(segment._x, np.memmap)
+    np.testing.assert_array_equal(segment._x, original_x)
+    tifffile.memmap(str(segment_dir / "x.tif"), mode="c")
+    with tifffile.TiffFile(str(segment_dir / "x.tif")) as tif:
+        page = tif.pages[0]
+        assert not page.is_tiled
+        assert page.compression.name == "NONE"
+
+
+def test_discover_labels_can_validate_shapes_without_loading_surface(tmp_path: Path) -> None:
+    segment_dir = _write_segment(tmp_path / "segment", (6, 8))
+    _write_label(segment_dir / "a_ink.tif", np.full((6, 8), 7, dtype=np.uint8))
+    _write_label(segment_dir / "b_surface.png", np.full((5, 8), 9, dtype=np.uint8))
+
+    labels = discover_labels(
+        segment_dir,
+        expected_shape=(6, 8),
+        validate_shapes=True,
+    )
+
+    assert [label["filename"] for label in labels] == ["a_ink.tif", "b_surface.png"]
+    assert labels[0]["matches_stored_shape"] is True
+    assert labels[1]["shape"] == (5, 8)
+    assert labels[1]["matches_stored_shape"] is False
 
 
 def test_load_label_by_index_filename_and_suffix(tmp_path: Path) -> None:
@@ -102,7 +165,7 @@ def test_load_label_uses_stored_shape_even_in_full_resolution_mode(tmp_path: Pat
     loaded = segment.load_label("ink")
     assert loaded.shape == (6, 7)
 
-    with pytest.raises(ValueError, match="Shape mismatch"):
+    with pytest.raises(ValueError, match="shape"):
         segment.load_label("surface")
 
 

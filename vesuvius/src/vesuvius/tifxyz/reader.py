@@ -184,12 +184,31 @@ def load_folder(
             continue
 
 
+def discover_labels(
+    path: Union[str, Path],
+    *,
+    expected_shape: Optional[Tuple[int, int]] = None,
+    validate_shapes: bool = False,
+) -> List[Dict[str, Any]]:
+    """Discover label images in a tifxyz directory without loading label pixels.
+
+    By default this only inspects directory entries and returns path/name
+    metadata. Set ``validate_shapes=True`` to read each candidate label image
+    and populate shape/status fields.
+    """
+    return TifxyzReader(path).discover_labels(
+        expected_shape=expected_shape,
+        validate_shapes=validate_shapes,
+    )
+
+
 def read_tifxyz(
     path: Union[str, Path],
     *,
     load_mask: bool = True,
     validate: bool = True,
     volume_path: Optional[Union[str, Path]] = None,
+    discover_label_shapes: bool = False,
 ) -> Tifxyz:
     """Read a tifxyz directory into a Tifxyz object.
 
@@ -204,6 +223,9 @@ def read_tifxyz(
     volume_path : Union[str, Path], optional
         Path to an OME-zarr volume to associate with the surface.
         If provided, opens the zarr and attaches it to tifxyz.volume.
+    discover_label_shapes : bool
+        If True, read candidate label images during discovery to validate their
+        shapes. Default False keeps label discovery metadata-only.
 
     Returns
     -------
@@ -219,7 +241,11 @@ def read_tifxyz(
         If validation fails (shape mismatch, invalid data).
     """
     reader = TifxyzReader(path)
-    tifxyz = reader.read(load_mask=load_mask, validate=validate)
+    tifxyz = reader.read(
+        load_mask=load_mask,
+        validate=validate,
+        discover_label_shapes=discover_label_shapes,
+    )
 
     if volume_path is not None:
         import zarr
@@ -320,6 +346,26 @@ class TifxyzReader:
             "extra": extra,
         }
 
+    def _mmap_coordinate(self, tif_path: Path) -> np.ndarray:
+        """Memory-map a coordinate TIFF without persisting in-place edits."""
+        return tifffile.memmap(str(tif_path), mode="c")
+
+    def _rewrite_mmapable_coordinate(self, tif_path: Path) -> None:
+        """Rewrite a coordinate TIFF as uncompressed, untiled float32 data."""
+        data = tifffile.imread(str(tif_path)).astype(np.float32, copy=False)
+        tmp_path = tif_path.with_name(f".{tif_path.name}.mmap.tmp")
+        try:
+            tifffile.imwrite(
+                str(tmp_path),
+                data,
+                compression=None,
+                photometric="minisblack",
+            )
+            os.replace(tmp_path, tif_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
     def read_coordinate(self, component: str) -> np.ndarray:
         """Read a single coordinate component ('x', 'y', or 'z').
 
@@ -340,8 +386,27 @@ class TifxyzReader:
         if not tif_path.exists():
             raise FileNotFoundError(f"Coordinate file not found: {tif_path}")
 
-        data = tifffile.imread(str(tif_path))
-        return data.astype(np.float32)
+        try:
+            data = self._mmap_coordinate(tif_path)
+        except ValueError as exc:
+            logger.info(
+                "Rewriting %s as uncompressed, untiled TIFF for mmap: %s",
+                tif_path,
+                exc,
+            )
+            self._rewrite_mmapable_coordinate(tif_path)
+            data = self._mmap_coordinate(tif_path)
+
+        if data.dtype != np.float32:
+            logger.info(
+                "Rewriting %s as float32 TIFF for mmap; found dtype %s",
+                tif_path,
+                data.dtype,
+            )
+            self._rewrite_mmapable_coordinate(tif_path)
+            data = self._mmap_coordinate(tif_path)
+
+        return data
 
     def read_mask(self) -> Optional[np.ndarray]:
         """Read the mask if present, otherwise return None.
@@ -381,9 +446,19 @@ class TifxyzReader:
 
     def discover_labels(
         self,
-        expected_shape: Tuple[int, int],
+        expected_shape: Optional[Tuple[int, int]] = None,
+        *,
+        validate_shapes: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Discover label images in this segment directory."""
+        """Discover label images in this segment directory.
+
+        By default this does not read label image data. Shape validation is
+        opt-in because large label files are expensive to load and most callers
+        only need to know which labels are present.
+        """
+        if validate_shapes and expected_shape is None:
+            raise ValueError("expected_shape is required when validate_shapes=True")
+
         labels: List[Dict[str, Any]] = []
         for path in self.path.iterdir():
             if not path.is_file():
@@ -397,17 +472,18 @@ class TifxyzReader:
                 continue
 
             shape: Optional[Tuple[int, int]] = None
-            matches_stored_shape = False
+            matches_stored_shape: Optional[bool] = None
             error: Optional[str] = None
-            try:
-                shape = self._read_label_shape(path)
-                matches_stored_shape = shape == expected_shape
-                if not matches_stored_shape:
-                    error = (
-                        f"Shape mismatch: expected {expected_shape}, got {shape}"
-                    )
-            except Exception as exc:
-                error = str(exc)
+            if validate_shapes:
+                try:
+                    shape = self._read_label_shape(path)
+                    matches_stored_shape = shape == expected_shape
+                    if not matches_stored_shape:
+                        error = (
+                            f"Shape mismatch: expected {expected_shape}, got {shape}"
+                        )
+                except Exception as exc:
+                    error = str(exc)
 
             labels.append(
                 {
@@ -431,6 +507,7 @@ class TifxyzReader:
         *,
         load_mask: bool = True,
         validate: bool = True,
+        discover_label_shapes: bool = False,
     ) -> Tifxyz:
         """Read the complete surface.
 
@@ -440,6 +517,9 @@ class TifxyzReader:
             If True, load mask.tif if present.
         validate : bool
             If True, validate the loaded data.
+        discover_label_shapes : bool
+            If True, read candidate label images during discovery to validate
+            their shapes. Default False keeps label discovery metadata-only.
 
         Returns
         -------
@@ -486,7 +566,10 @@ class TifxyzReader:
         y[invalid] = -1.0
         z[invalid] = -1.0
 
-        labels = self.discover_labels(expected_shape=x.shape)
+        labels = self.discover_labels(
+            expected_shape=x.shape,
+            validate_shapes=discover_label_shapes,
+        )
 
         return Tifxyz(
             _x=x,

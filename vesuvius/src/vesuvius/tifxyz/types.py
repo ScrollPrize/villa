@@ -289,7 +289,7 @@ class Tifxyz:
 
         expected_shape = self._stored_shape
         discovered_shape = label.get("shape")
-        if discovered_shape != expected_shape:
+        if discovered_shape is not None and discovered_shape != expected_shape:
             raise ValueError(
                 f"Cannot load label {filename!r}: "
                 f"expected shape {expected_shape}, got {discovered_shape}"
