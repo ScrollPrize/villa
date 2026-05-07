@@ -95,7 +95,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--focus",
         default=None,
-        help="Optional pstats restriction string, e.g. 'neural_tracing' or 'dataset_rowcol_cond'.",
+        help=(
+            "Optional printed-output filter regex, e.g. 'neural_tracing' or "
+            "'dataset_rowcol_cond'. Profiling still records all functions."
+        ),
     )
     return parser.parse_args()
 
@@ -156,10 +159,12 @@ def _print_stats(
     focus: str | None,
 ) -> None:
     stream = io.StringIO()
-    stats = pstats.Stats(profiler, stream=stream).strip_dirs().sort_stats(sort)
+    stats = pstats.Stats(profiler, stream=stream).sort_stats(sort)
     if focus:
+        # Keep full paths so package filters such as "neural_tracing" can match.
         stats.print_stats(focus, limit)
     else:
+        stats.strip_dirs()
         stats.print_stats(limit)
     print(stream.getvalue())
 
