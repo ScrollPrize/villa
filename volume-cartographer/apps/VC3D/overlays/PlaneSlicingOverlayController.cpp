@@ -99,6 +99,12 @@ void PlaneSlicingOverlayController::clearViewerState(VolumeViewerBase* viewer)
     _viewerStates.erase(it);
 }
 
+void PlaneSlicingOverlayController::detachViewer(VolumeViewerBase* viewer)
+{
+    clearViewerState(viewer);
+    ViewerOverlayControllerBase::detachViewer(viewer);
+}
+
 void PlaneSlicingOverlayController::installInteractions(VolumeViewerBase* viewer, ViewerState& state)
 {
     if (state.interactionsInstalled || !viewer) {

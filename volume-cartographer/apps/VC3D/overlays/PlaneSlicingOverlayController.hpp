@@ -29,6 +29,7 @@ public:
     bool isScenePointNearRotationHandle(VolumeViewerBase* viewer,
                                         const QPointF& scenePoint,
                                         qreal radiusScale = 1.5) const;
+    void detachViewer(VolumeViewerBase* viewer) override;
 
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
