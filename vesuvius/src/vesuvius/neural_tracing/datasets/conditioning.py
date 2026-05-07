@@ -3,38 +3,6 @@ import random
 import numpy as np
 
 
-def create_centered_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, patch):
-    _ = idx
-    triplet_meta = dataset._triplet_neighbor_lookup.get((patch_idx, wrap_idx))
-    if triplet_meta is None:
-        return None
-
-    center_zyxs = dataset._extract_wrap_world_surface_by_index(patch_idx, wrap_idx, require_all_valid=True)
-    behind_zyxs = dataset._extract_wrap_world_surface_by_index(
-        patch_idx, triplet_meta["behind_wrap_idx"], require_all_valid=True
-    )
-    front_zyxs = dataset._extract_wrap_world_surface_by_index(
-        patch_idx, triplet_meta["front_wrap_idx"], require_all_valid=True
-    )
-    if center_zyxs is None or behind_zyxs is None or front_zyxs is None:
-        return None
-
-    center_zyxs_unperturbed = center_zyxs
-
-    crop_size = dataset.crop_size
-    z_min, _, y_min, _, x_min, _ = patch.world_bbox
-    min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
-    max_corner = min_corner + np.array(crop_size)
-
-    return {
-        "center_zyxs_unperturbed": center_zyxs_unperturbed,
-        "behind_zyxs": behind_zyxs,
-        "front_zyxs": front_zyxs,
-        "min_corner": min_corner,
-        "max_corner": max_corner,
-    }
-
-
 def create_split_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, patch):
     _ = idx
     crop_size = dataset.crop_size

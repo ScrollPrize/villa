@@ -6,10 +6,8 @@ import numpy as np
 def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Populate default config values for the row/col conditioning dataset."""
     config.setdefault("cond_percent", [0.1, 0.5])
-    config.setdefault("use_trace_ode_targets", True)
     config.setdefault("lambda_velocity_dir", 0.1)
     config.setdefault("trace_target_dilation_radius", 1.0)
-    config.setdefault("surface_attract_target_mode", "trace_band")
     config.setdefault("trace_surface_attract_radius", 0.0)
     config.setdefault("use_neighbor_sheet_context", False)
     config.setdefault("neighbor_sheet_required", False)
@@ -22,7 +20,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("trace_validity_pos_weight", 1.0)
     config.setdefault("use_growth_direction_channels", False)
     config.setdefault("force_recompute_patches", False)
-    config.setdefault("sample_mode", "wrap")
     config.setdefault("val_num_workers", 0)
     config.setdefault("persistent_workers", False)
 
@@ -55,12 +52,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config["cond_local_perturb"] = cond_local_perturb
 
 
-def _require_choice(name: str, value: str, allowed: set[str]) -> None:
-    if value not in allowed:
-        options = "', '".join(sorted(allowed))
-        raise ValueError(f"{name} must be '{options}', got {value!r}")
-
-
 def _require_finite(name: str, value: float) -> None:
     if not np.isfinite(value):
         raise ValueError(f"{name} must be finite, got {value!r}")
@@ -82,14 +73,8 @@ def _require_finite_range(
 
 def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Validate row/col conditioning dataset config invariants."""
-    sample_mode = str(config.get("sample_mode", "wrap")).lower()
-    _require_choice("sample_mode", sample_mode, {"wrap"})
-
     trace_target_dilation_radius = float(config.get("trace_target_dilation_radius", 1.0))
     _require_finite_range("trace_target_dilation_radius", trace_target_dilation_radius, min_value=0.0)
-
-    surface_attract_target_mode = str(config.get("surface_attract_target_mode", "trace_band")).lower()
-    _require_choice("surface_attract_target_mode", surface_attract_target_mode, {"trace_band"})
 
     trace_surface_attract_radius = float(config.get("trace_surface_attract_radius", 0.0))
     _require_finite_range("trace_surface_attract_radius", trace_surface_attract_radius, min_value=0.0)
@@ -108,11 +93,6 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     trace_validity_pos_weight = float(config.get("trace_validity_pos_weight", 1.0))
     _require_finite_range("trace_validity_pos_weight", trace_validity_pos_weight, min_value=0.0)
-
-    use_trace_ode_targets = bool(config.get("use_trace_ode_targets", False))
-
-    if not use_trace_ode_targets:
-        raise ValueError("rowcol_cond requires use_trace_ode_targets=True")
 
     unsupported_flags = {
         "displacement_supervision=normal_scalar": str(config.get("displacement_supervision", "vector")).lower() == "normal_scalar",
