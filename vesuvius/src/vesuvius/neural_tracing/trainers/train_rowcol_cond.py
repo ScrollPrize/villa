@@ -18,6 +18,7 @@ from tqdm import tqdm
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
 from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     prepare_rowcol_cond_train_config,
+    print_rowcol_cond_training_summary,
     resolve_rowcol_cond_optimizer_config,
     resolve_rowcol_cond_scheduler_config,
 )
@@ -270,42 +271,17 @@ def train(config_path):
     )
 
     if accelerator.is_main_process:
-        accelerator.print("\n=== Trace ODE Training Configuration ===")
-        accelerator.print(f"Input channels: {config['in_channels']}")
-        accelerator.print("Growth direction channels: True")
-        accelerator.print("Output: velocity_dir (3ch) + surface_attract (3ch) + trace_validity (1ch)")
-        accelerator.print(
-            f"Velocity direction loss: lambda={loss_config.lambda_velocity_dir}, "
-            f"dilation={config.get('trace_target_dilation_radius')}"
+        print_rowcol_cond_training_summary(
+            accelerator.print,
+            config,
+            loss_config=loss_config,
+            optimizer_type=optimizer_type,
+            optimizer_kwargs=optimizer_kwargs,
+            scheduler_type=scheduler_type,
+            scheduler_kwargs=scheduler_kwargs,
+            num_train=num_train,
+            num_val=num_val,
         )
-        if loss_config.lambda_velocity_smooth > 0.0:
-            accelerator.print(
-                f"Velocity smoothness loss: lambda={loss_config.lambda_velocity_smooth}, "
-                f"normalize={loss_config.velocity_smooth_normalize}"
-            )
-        if loss_config.lambda_trace_integration > 0.0:
-            accelerator.print(
-                f"Trace integration loss: lambda={loss_config.lambda_trace_integration}, "
-                f"steps={loss_config.trace_integration_steps}, "
-                f"step_size={loss_config.trace_integration_step_size}, "
-                f"max_points={loss_config.trace_integration_max_points}, "
-                f"detach_steps={loss_config.trace_integration_detach_steps}"
-            )
-        accelerator.print(
-            f"Trace ODE losses: lambda_attract={loss_config.lambda_surface_attract}, "
-            f"lambda_validity={loss_config.lambda_trace_validity}, "
-            f"dilation={config.get('trace_target_dilation_radius')}, "
-            f"attract_mode=trace_band, "
-            f"attract_radius={config.get('trace_surface_attract_radius')}"
-        )
-        accelerator.print("Trace validity EDT in trainer: True")
-        optimizer_summary = f"Optimizer: {optimizer_type} (lr={optimizer_kwargs['learning_rate']}, weight_decay={optimizer_kwargs.get('weight_decay', 0)})"
-        scheduler_details = ", ".join(f"{k}={v}" for k, v in scheduler_kwargs.items())
-        scheduler_summary = f"Scheduler: {scheduler_type}" + (f" ({scheduler_details})" if scheduler_details else "")
-        accelerator.print(optimizer_summary)
-        accelerator.print(scheduler_summary)
-        accelerator.print(f"Train samples: {num_train}, Val samples: {num_val}")
-        accelerator.print("=================================================\n")
 
     if config['verbose']:
         accelerator.print("creating iterators...")

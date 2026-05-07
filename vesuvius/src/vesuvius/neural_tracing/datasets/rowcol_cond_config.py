@@ -141,6 +141,82 @@ def resolve_rowcol_cond_optimizer_config(
     return optimizer_type, optimizer_kwargs
 
 
+def rowcol_cond_training_summary_lines(
+    config: MutableMapping[str, Any],
+    *,
+    loss_config: Any,
+    optimizer_type: Any,
+    optimizer_kwargs: dict[str, Any],
+    scheduler_type: Any,
+    scheduler_kwargs: dict[str, Any],
+    num_train: int,
+    num_val: int,
+) -> list[str]:
+    """Return the row/col conditioned trace-ODE training configuration summary."""
+    lines = [
+        "\n=== Trace ODE Training Configuration ===",
+        f"Input channels: {config['in_channels']}",
+        "Growth direction channels: True",
+        "Output: velocity_dir (3ch) + surface_attract (3ch) + trace_validity (1ch)",
+        (
+            f"Velocity direction loss: lambda={loss_config.lambda_velocity_dir}, "
+            f"dilation={config.get('trace_target_dilation_radius')}"
+        ),
+    ]
+
+    if loss_config.lambda_velocity_smooth > 0.0:
+        lines.append(
+            f"Velocity smoothness loss: lambda={loss_config.lambda_velocity_smooth}, "
+            f"normalize={loss_config.velocity_smooth_normalize}"
+        )
+
+    if loss_config.lambda_trace_integration > 0.0:
+        lines.append(
+            f"Trace integration loss: lambda={loss_config.lambda_trace_integration}, "
+            f"steps={loss_config.trace_integration_steps}, "
+            f"step_size={loss_config.trace_integration_step_size}, "
+            f"max_points={loss_config.trace_integration_max_points}, "
+            f"detach_steps={loss_config.trace_integration_detach_steps}"
+        )
+
+    lines.extend(
+        [
+            (
+                f"Trace ODE losses: lambda_attract={loss_config.lambda_surface_attract}, "
+                f"lambda_validity={loss_config.lambda_trace_validity}, "
+                f"dilation={config.get('trace_target_dilation_radius')}, "
+                f"attract_mode=trace_band, "
+                f"attract_radius={config.get('trace_surface_attract_radius')}"
+            ),
+            "Trace validity EDT in trainer: True",
+            (
+                f"Optimizer: {optimizer_type} "
+                f"(lr={optimizer_kwargs['learning_rate']}, "
+                f"weight_decay={optimizer_kwargs.get('weight_decay', 0)})"
+            ),
+        ]
+    )
+
+    scheduler_details = ", ".join(f"{k}={v}" for k, v in scheduler_kwargs.items())
+    scheduler_summary = f"Scheduler: {scheduler_type}"
+    if scheduler_details:
+        scheduler_summary = f"{scheduler_summary} ({scheduler_details})"
+    lines.extend(
+        [
+            scheduler_summary,
+            f"Train samples: {num_train}, Val samples: {num_val}",
+            "=================================================\n",
+        ]
+    )
+    return lines
+
+
+def print_rowcol_cond_training_summary(print_fn, *args, **kwargs) -> None:
+    """Print the row/col conditioned trace-ODE training configuration summary."""
+    for line in rowcol_cond_training_summary_lines(*args, **kwargs):
+        print_fn(line)
+
+
 def _require_finite(name: str, value: float) -> None:
     if not np.isfinite(value):
         raise ValueError(f"{name} must be finite, got {value!r}")
