@@ -562,6 +562,8 @@ class EdtSegDataset(Dataset):
             self.crop_size,
             cond_direction,
             cond_surface_local=trace_surface_np,
+            dilation_radius=float(self.config.get("trace_target_dilation_radius", 0.0)),
+            surface_attract_radius=float(self.config.get("trace_surface_attract_radius", 0.0)),
         )
         if trace_payload is None:
             return self._resample_item(
@@ -574,6 +576,10 @@ class EdtSegDataset(Dataset):
         result["velocity_dir"] = torch.from_numpy(trace_payload["velocity_dir"]).to(torch.float32)
         result["velocity_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
         result["trace_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
+        if "surface_attract" in trace_payload:
+            result["surface_attract"] = torch.from_numpy(trace_payload["surface_attract"]).to(torch.float32)
+        if "surface_attract_weight" in trace_payload:
+            result["surface_attract_weight"] = torch.from_numpy(trace_payload["surface_attract_weight"]).to(torch.float32)
 
         if not _validate_result_tensors(
             result,
