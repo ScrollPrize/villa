@@ -20,8 +20,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("trace_validity_margin", 3.0)
     config.setdefault("trace_validity_background_weight", 0.25)
     config.setdefault("trace_validity_pos_weight", 1.0)
-    config.setdefault("supervise_conditioning", False)
-    config.setdefault("cond_supervision_weight", 0.1)
     config.setdefault("use_growth_direction_channels", False)
     config.setdefault("force_recompute_patches", False)
     config.setdefault("sample_mode", "wrap")

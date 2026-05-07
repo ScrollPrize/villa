@@ -90,7 +90,6 @@ class EdtSegDataset(Dataset):
             apply_perturbation=bool(self.apply_perturbation),
         )
 
-        self.sample_mode = str(config['sample_mode']).lower()
         self._triplet_neighbor_lookup = {}
         self._triplet_lookup_stats = {}
 
@@ -197,9 +196,7 @@ class EdtSegDataset(Dataset):
                         "neighbor_sheet_required enabled but no wraps have same/adjacent neighbors on both sides."
                     )
             spec = self.config['cond_percent']
-            low, high = float(spec[0]), float(spec[1])
-
-            self._cond_percent_min, self._cond_percent_max = low, high
+            self._cond_percent_min, self._cond_percent_max = float(spec[0]), float(spec[1])
         else:
             self._load_patch_metadata(patch_metadata)
 
@@ -214,7 +211,6 @@ class EdtSegDataset(Dataset):
         return sample_index
 
     def _load_patch_metadata(self, patch_metadata):
-        self.sample_mode = patch_metadata.get('sample_mode', self.sample_mode)
         self.patches = patch_metadata['patches']
         self.sample_index = list(patch_metadata['sample_index'])
         self._triplet_neighbor_lookup = patch_metadata.get('triplet_neighbor_lookup', {})
@@ -223,7 +219,6 @@ class EdtSegDataset(Dataset):
 
     def export_patch_metadata(self):
         return {
-            'sample_mode': self.sample_mode,
             'patches': self.patches,
             'sample_index': tuple(self.sample_index),
             'triplet_neighbor_lookup': self._triplet_neighbor_lookup,
@@ -388,24 +383,6 @@ class EdtSegDataset(Dataset):
         )
         return augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
 
-    def _resolve_conditioning_segmentation(
-        self,
-        *,
-        mask_bundle: dict,
-        cond_seg_gt: torch.Tensor,
-        cond_surface_local,
-        cond_local_perturb_active: bool,
-    ):
-        if cond_local_perturb_active and cond_surface_local is not None:
-            return self._conditioning_from_surface(
-                cond_surface_local=cond_surface_local,
-                cond_seg_gt=cond_seg_gt,
-            )
-        cond_seg = mask_bundle.get("cond")
-        if cond_seg is None:
-            cond_seg = cond_seg_gt.clone()
-        return cond_seg
-
     def create_split_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         crop_size = self.crop_size  # tuple (D, H, W)
@@ -441,8 +418,6 @@ class EdtSegDataset(Dataset):
         if not cond_segmentation_gt.any():
             return None
 
-        cond_segmentation_gt_raw = cond_segmentation_gt.copy()
-
         neighbor_segmentation = None
         if self.use_neighbor_sheet_context:
             neighbor_segmentation = self._build_neighbor_sheet_mask(
@@ -457,7 +432,7 @@ class EdtSegDataset(Dataset):
         result = {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
             "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
-            "cond_gt": torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32),
+            "cond_gt": torch.from_numpy(cond_segmentation_gt).to(torch.float32),
             "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float).to(torch.float32),
             "masked_surface_local": torch.from_numpy(masked_zyxs_local_float).to(torch.float32),
             "cond_direction": cond_direction,
@@ -523,16 +498,6 @@ class EdtSegDataset(Dataset):
         _attempted_indices.add(idx)
 
         patch_idx, wrap_idx = self.sample_index[idx]
-        cond_local_perturb_active = bool(
-            getattr(
-                self,
-                "_cond_local_perturb_active",
-                _should_attempt_cond_local_perturb(
-                    config=self.config,
-                    apply_perturbation=bool(self.apply_perturbation),
-                ),
-            )
-        )
         mask_bundle = self.create_split_masks(idx, patch_idx, wrap_idx)
         if mask_bundle is None:
             return self._resample_item(
@@ -592,12 +557,13 @@ class EdtSegDataset(Dataset):
         cond_surface_local = split_augmented["cond_surface_local"]
         masked_surface_local = split_augmented["masked_surface_local"]
         neighbor_seg_tensor = split_augmented.get("neighbor_seg_tensor", neighbor_seg_tensor)
-        cond_seg = self._resolve_conditioning_segmentation(
-            mask_bundle=mask_bundle,
-            cond_seg_gt=cond_seg_gt,
-            cond_surface_local=cond_surface_local,
-            cond_local_perturb_active=cond_local_perturb_active,
-        )
+        if self._cond_local_perturb_active and cond_surface_local is not None:
+            cond_seg = self._conditioning_from_surface(
+                cond_surface_local=cond_surface_local,
+                cond_seg_gt=cond_seg_gt,
+            )
+        else:
+            cond_seg = cond_seg_gt.clone()
         if cond_seg is None:
             return self._resample_item(
                 idx,
@@ -650,11 +616,6 @@ class EdtSegDataset(Dataset):
         result["velocity_dir"] = torch.from_numpy(trace_payload["velocity_dir"]).to(torch.float32)
         result["velocity_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
         result["trace_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
-        if "surface_attract" in trace_payload:
-            result["surface_attract"] = torch.from_numpy(trace_payload["surface_attract"]).to(torch.float32)
-            result["surface_attract_weight"] = torch.from_numpy(
-                trace_payload["surface_attract_weight"]
-            ).to(torch.float32)
 
         if not _validate_result_tensors(
             result,

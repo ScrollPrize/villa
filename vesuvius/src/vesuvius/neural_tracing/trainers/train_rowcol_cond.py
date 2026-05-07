@@ -254,12 +254,6 @@ def collate_with_padding(batch):
         result['trace_validity'] = torch.stack([b['trace_validity'] for b in batch])
     if 'trace_validity_weight' in batch[0]:
         result['trace_validity_weight'] = torch.stack([b['trace_validity_weight'] for b in batch])
-    if 'neighbor_sheet_present' in batch[0]:
-        result['neighbor_sheet_present'] = torch.stack([b['neighbor_sheet_present'] for b in batch])
-    if 'surface_attract' in batch[0]:
-        result['surface_attract'] = torch.stack([b['surface_attract'] for b in batch])
-    if 'surface_attract_weight' in batch[0]:
-        result['surface_attract_weight'] = torch.stack([b['surface_attract_weight'] for b in batch])
     # Source masks used by trainer-side EDT target generation. Keeping EDT out
     # of dataloader workers avoids cupyx defaulting every worker to GPU 0.
     for key in ('cond_gt', 'masked_seg', 'neighbor_seg'):
@@ -359,11 +353,8 @@ def train(config_path):
     config.setdefault('val_prefetch_factor', 1)
     config.setdefault('dataloader_multiprocessing_context', 'auto')
     config.setdefault('seed', 0)
-    config.setdefault('supervise_conditioning', False)
-    config.setdefault('cond_supervision_weight', 0.1)
     config.setdefault('lambda_velocity_dir', 0.1)
     config.setdefault('use_trace_ode_targets', True)
-    config.setdefault('lambda_displacement', 0.0)
     config.setdefault('lambda_surface_attract', 0.1)
     config.setdefault('use_trace_validity_targets', False)
     config.setdefault('lambda_trace_validity', 0.0)
@@ -900,9 +891,6 @@ def train(config_path):
         )
         if use_trace_validity_head:
             accelerator.print("Trace validity EDT in trainer: True")
-        accelerator.print(f"Supervise conditioning: {config.get('supervise_conditioning', False)}")
-        if config.get('supervise_conditioning', False):
-            accelerator.print(f"Cond supervision weight: {config.get('cond_supervision_weight', 0.1)}")
         optimizer_summary = f"Optimizer: {optimizer_type} (lr={optimizer_kwargs['learning_rate']}, weight_decay={optimizer_kwargs.get('weight_decay', 0)})"
         scheduler_details = ", ".join(f"{k}={v}" for k, v in scheduler_kwargs.items())
         scheduler_summary = f"Scheduler: {scheduler_type}" + (f" ({scheduler_details})" if scheduler_details else "")
