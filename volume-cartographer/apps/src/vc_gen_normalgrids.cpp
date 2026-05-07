@@ -76,6 +76,12 @@ struct RunMetrics {
     size_t totalSlicesAllDirs = 0;
     size_t totalProcessedAllDirs = 0;
     size_t totalSkippedAllDirs = 0;
+    // Unsampled (sparse-skipped) slices across the whole shard. Each direction
+    // pre-counts its unsampled into totalProcessedAllDirs at start, so they
+    // contribute to the "Total" counter at zero wall-clock cost. Tracking them
+    // separately lets the rate / ETA exclude this instant bump.
+    size_t totalUnsampledAllDirs = 0;          // precomputed across all directions
+    size_t totalUnsampledAccountedAllDirs = 0; // running: already added at dir start
     double totalSeconds = 0.0;
     std::vector<size_t> levelShape;
     std::vector<DirectionMetrics> directions;
@@ -161,6 +167,7 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
     out["total_slices_all_dirs"] = metrics.totalSlicesAllDirs;
     out["total_processed_all_dirs"] = metrics.totalProcessedAllDirs;
     out["total_skipped_all_dirs"] = metrics.totalSkippedAllDirs;
+    out["total_unsampled_all_dirs"] = metrics.totalUnsampledAllDirs;
     out["total_seconds"] = metrics.totalSeconds;
     out["directions"] = Json::array();
 
@@ -867,14 +874,25 @@ void run_generate(const po::variables_map& vm) {
     run_metrics.cacheBudgetBytes = cache_budget_bytes;
     run_metrics.levelShape = shape;
     run_metrics.totalSlicesAllDirs = 0;
+    run_metrics.totalUnsampledAllDirs = 0;
     for (const auto& dp : direction_plans) {
         run_metrics.totalSlicesAllDirs += dp.shardSliceTotal;
+        run_metrics.totalUnsampledAllDirs += (dp.shardSliceTotal - dp.shardSampledTotal);
     }
 
     std::vector<ThreadScratch> thread_scratch(static_cast<size_t>(num_threads));
     for (auto& scratch : thread_scratch) {
         scratch.traces.reserve(256);
     }
+
+    // Run-level rate state. We report the rate over the most recent reporting
+    // interval (not cumulative since start), so the displayed rate and ETA
+    // track the steady-state speed instead of being skewed by an early burst
+    // (e.g. the first chunks finishing fast because they're empty).
+    const auto run_start_time = std::chrono::steady_clock::now();
+    auto last_sample_time = run_start_time;
+    size_t last_sample_effort_done = 0;
+    size_t last_sample_active_done = 0;
 
     for (const auto& dir_plan : direction_plans) {
         const SliceDirection dir = dir_plan.dir;
@@ -912,6 +930,7 @@ void run_generate(const po::variables_map& vm) {
         std::atomic<size_t> slice_done_counter{0};
         const size_t slice_progress_total = sampled_slices_total;
         run_metrics.totalProcessedAllDirs += unsampled;
+        run_metrics.totalUnsampledAccountedAllDirs += unsampled;
 
         const cv::Size slice_size = vc::core::util::normalGridSliceSize(
             shape,
@@ -1162,14 +1181,50 @@ void run_generate(const po::variables_map& vm) {
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= 5) {
                 last_report_time = now;
-                const auto elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
                 const size_t active_processed = processed > (skipped_existing + unsampled)
                     ? (processed - skipped_existing - unsampled)
                     : 0;
-                double slices_per_second = active_processed > 0 ? active_processed / elapsed_seconds : 0.0;
-                if (slices_per_second == 0.0) slices_per_second = 1.0;
-                const double remaining_seconds =
-                    (run_metrics.totalSlicesAllDirs - run_metrics.totalProcessedAllDirs) / slices_per_second;
+
+                // Effort = slices that consumed wall-clock (skip-check + actual work).
+                // Excludes the instant unsampled pre-count so the rate isn't inflated.
+                // Active = slices we actually processed (excludes existing files too).
+                // Both are tracked at run scope so ETA spans all directions consistently.
+                const size_t total_effort_universe =
+                    run_metrics.totalSlicesAllDirs > run_metrics.totalUnsampledAllDirs
+                        ? run_metrics.totalSlicesAllDirs - run_metrics.totalUnsampledAllDirs
+                        : 0;
+                const size_t total_effort_done =
+                    run_metrics.totalProcessedAllDirs > run_metrics.totalUnsampledAccountedAllDirs
+                        ? run_metrics.totalProcessedAllDirs - run_metrics.totalUnsampledAccountedAllDirs
+                        : 0;
+                const size_t total_active_done =
+                    total_effort_done > run_metrics.totalSkippedAllDirs
+                        ? total_effort_done - run_metrics.totalSkippedAllDirs
+                        : 0;
+
+                // Rate is over the most recent reporting interval. The first sample
+                // (last_sample_time == run_start_time, last_sample_*_done == 0)
+                // collapses to cumulative-from-run-start, which is the only honest
+                // option until we have a window to diff against.
+                const auto interval_seconds =
+                    std::chrono::duration_cast<std::chrono::duration<double>>(
+                        now - last_sample_time).count();
+                double effort_rate = 0.0;
+                double active_rate = 0.0;
+                if (interval_seconds > 0.0) {
+                    effort_rate = (total_effort_done - last_sample_effort_done) / interval_seconds;
+                    active_rate = (total_active_done - last_sample_active_done) / interval_seconds;
+                }
+
+                last_sample_time = now;
+                last_sample_effort_done = total_effort_done;
+                last_sample_active_done = total_active_done;
+
+                const double eta_rate = effort_rate > 0.0 ? effort_rate : 1.0;
+                const size_t remaining_effort = total_effort_universe > total_effort_done
+                    ? total_effort_universe - total_effort_done
+                    : 0;
+                const double remaining_seconds = remaining_effort / eta_rate;
 
                 int rem_min = static_cast<int>(remaining_seconds) / 60;
                 int rem_sec = static_cast<int>(remaining_seconds) % 60;
@@ -1178,6 +1233,8 @@ void run_generate(const po::variables_map& vm) {
                           << " | Total " << run_metrics.totalProcessedAllDirs << "/" << run_metrics.totalSlicesAllDirs
                           << " (" << std::fixed << std::setprecision(1)
                           << (100.0 * run_metrics.totalProcessedAllDirs / run_metrics.totalSlicesAllDirs) << "%)"
+                          << " @ " << std::setprecision(2) << effort_rate << " sl/s"
+                          << " (active " << std::setprecision(2) << active_rate << " sl/s)"
                           << ", skipped_existing: " << skipped_existing
                           << ", unsampled: " << unsampled
                           << ", ETA: " << rem_min << "m " << rem_sec << "s";
