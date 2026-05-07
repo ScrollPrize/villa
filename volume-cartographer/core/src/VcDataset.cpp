@@ -99,13 +99,14 @@ std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t 
     ensureBloscInitialized();
 
     std::vector<std::byte> output(outputSize);
-    const int rc = blosc_decompress(input.data(), output.data(), outputSize);
+    const int rc = blosc_decompress_ctx(input.data(), output.data(), outputSize,
+                                        /*nthreads=*/1);
     if (rc < 0) {
         if (input.size() == outputSize) {
             std::memcpy(output.data(), input.data(), outputSize);
             return output;
         }
-        throw std::runtime_error("blosc_decompress failed with code " + std::to_string(rc));
+        throw std::runtime_error("blosc_decompress_ctx failed with code " + std::to_string(rc));
     }
     return output;
 }
@@ -542,13 +543,14 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
         case CompressorId::Blosc: {
             ensureBloscInitialized();
-            int ret = blosc_decompress(compressed.data(), output, outBytes);
+            int ret = blosc_decompress_ctx(compressed.data(), output, outBytes,
+                                           /*nthreads=*/1);
             if (ret < 0) {
                 if (compressed.size() == outBytes) {
                     std::memcpy(output, compressed.data(), outBytes);
                     break;
                 }
-                throw std::runtime_error("blosc_decompress failed with code " +
+                throw std::runtime_error("blosc_decompress_ctx failed with code " +
                                           std::to_string(ret));
             }
             break;
