@@ -435,9 +435,6 @@ def build_away_from_conditioning_trace_targets(
         valid = finite & tangent_valid
         if not bool(valid.any()):
             continue
-        if attract_radius <= 0.0:
-            _scatter_velocity_surface(velocity_accum, weights, grid, vectors, valid)
-            continue
         _scatter_trace_surface(
             velocity_accum,
             weights,
