@@ -487,6 +487,16 @@ def optimize(
 					res=res_,
 					cfg=pred_dt_flow_gate_cfg,
 				)
+				if _need_term("ext_offset", opt_cfg.eff) > 0:
+					_ext_offset_items = opt_loss_winding_density.ext_offset_prefetch_items_for_result(res=res_)
+					for _ch, _pts in _ext_offset_items.items():
+						if _ch in _loss_prefetch_items:
+							_loss_prefetch_items[_ch] = torch.cat(
+								[_loss_prefetch_items[_ch].reshape(1, 1, -1, 3), _pts.reshape(1, 1, -1, 3)],
+								dim=2,
+							)
+						else:
+							_loss_prefetch_items[_ch] = _pts
 			if not _loss_prefetch_items:
 				return
 			for _cache in _active_caches:

@@ -796,8 +796,11 @@ class Model3D(nn.Module):
 					ext_P, ext_N, M00, M10, M01, M11, frac_h, frac_w)
 
 				# Update idx: shift quad based on pass-1 result, clamp to valid range
-				new_model_h = (row.float() + u1).clamp(0, Hm - 2)
-				new_model_w = (col.float() + v1).clamp(0, Wm - 2)
+				pass1_valid = ext_corner_valid & torch.isfinite(u1) & torch.isfinite(v1)
+				new_model_h_raw = row.float() + u1
+				new_model_w_raw = col.float() + v1
+				new_model_h = torch.where(pass1_valid, new_model_h_raw, torch.zeros_like(new_model_h_raw)).clamp(0, Hm - 2)
+				new_model_w = torch.where(pass1_valid, new_model_w_raw, torch.zeros_like(new_model_w_raw)).clamp(0, Wm - 2)
 				new_row = new_model_h.floor().clamp(0, Hm - 2).long()
 				new_col = new_model_w.floor().clamp(0, Wm - 2).long()
 				new_frac_h = new_model_h - new_row.float()
@@ -819,7 +822,7 @@ class Model3D(nn.Module):
 				# Clamp so model_h stays in valid quad range [0, Hm-2]
 				new_h_off = (r_idx + new_h_off).clamp(0, Hm - 2) - r_idx
 				new_w_off = (c_idx + new_w_off).clamp(0, Wm - 2) - c_idx
-				update_valid = ext_corner_valid & torch.isfinite(new_h_off) & torch.isfinite(new_w_off)
+				update_valid = pass1_valid & torch.isfinite(new_h_off) & torch.isfinite(new_w_off)
 				zeros = torch.zeros_like(new_h_off)
 				self._ext_conn_offsets[i][0] = torch.where(update_valid, new_h_off, zeros)
 				self._ext_conn_offsets[i][1] = torch.where(update_valid, new_w_off, zeros)

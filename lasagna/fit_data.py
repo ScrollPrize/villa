@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,6 +171,39 @@ class ChunkStats:
 _chunk_stats = ChunkStats()
 
 
+def _debug_check_sample_coords(
+	xyz_fullres: torch.Tensor,
+	*,
+	context: str,
+	origin_fullres: tuple[float, float, float],
+	spacing: tuple[float, float, float],
+	size_zyx: tuple[int, int, int],
+) -> None:
+	"""Fail early on NaN/Inf sample coordinates when debug guards are enabled."""
+	if os.environ.get("LASAGNA_CHECK_SPARSE_CACHE", "0") == "0":
+		return
+	with torch.no_grad():
+		flat = xyz_fullres.reshape(-1, 3)
+		finite = torch.isfinite(flat).all(dim=1)
+		if bool(finite.all().detach().cpu()):
+			return
+		bad = (~finite).nonzero(as_tuple=False).flatten()
+		first = bad[:8]
+		first_full = flat[first].detach().cpu().tolist()
+		origin = torch.tensor(origin_fullres, dtype=torch.float32, device=flat.device)
+		sp = torch.tensor(spacing, dtype=torch.float32, device=flat.device)
+		local = (flat[first] - origin.view(1, 3)) / sp.view(1, 3)
+		raise RuntimeError(
+			"non-finite coordinates before grid_sample_fullres: "
+			f"context={context} bad={int(bad.numel())}/{int(flat.shape[0])} "
+			f"size_zyx={tuple(int(v) for v in size_zyx)} "
+			f"origin={tuple(float(v) for v in origin_fullres)} "
+			f"spacing={tuple(float(v) for v in spacing)} "
+			f"first_full_xyz={first_full} "
+			f"first_local_xyz={local.detach().cpu().tolist()}"
+		)
+
+
 def _record_chunks(data: "FitData3D", xyz_fullres: torch.Tensor) -> None:
     """Record which 32-voxel chunks are touched by this sampling call."""
     dev = xyz_fullres.device
@@ -274,6 +308,14 @@ class FitData3D:
 		"""
 		if CHUNK_STATS_ENABLED:
 			_record_chunks(self, xyz_fullres)
+		first_channel = next(iter(channels)) if channels else "grad_mag"
+		_debug_check_sample_coords(
+			xyz_fullres,
+			context=f"FitData3D.grid_sample_fullres(channels={sorted(channels) if channels else 'all'}, diff={diff})",
+			origin_fullres=self.origin_fullres,
+			spacing=self._spacing_for(first_channel),
+			size_zyx=self._size_of(getattr(self, first_channel, None)),
+		)
 		if self.sparse_caches:
 			return self._grid_sample_sparse(xyz_fullres, diff=diff, channels=channels)
 		if self.cuda_gridsample:

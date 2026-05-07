@@ -34,6 +34,10 @@ _data_dir: str | None = None  # Set via --data-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
 
+# One debug switch for sparse coverage and coordinate sanity guards. The service
+# enables it by default so optimizer jobs fail before CUDA indexing asserts.
+os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
+
 
 def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
     stages = cfg.get("stages")
