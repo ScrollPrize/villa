@@ -11,7 +11,6 @@ import sys
 import click
 import torch
 import wandb
-import copy
 import random
 import accelerate
 import numpy as np
@@ -353,12 +352,6 @@ def train(config_path):
     config.setdefault('val_prefetch_factor', 1)
     config.setdefault('dataloader_multiprocessing_context', 'auto')
     config.setdefault('seed', 0)
-    config.setdefault('lambda_velocity_dir', 0.1)
-    config.setdefault('use_trace_ode_targets', True)
-    config.setdefault('lambda_surface_attract', 0.1)
-    config.setdefault('use_trace_validity_targets', False)
-    config.setdefault('lambda_trace_validity', 0.0)
-    config.setdefault('trace_validity_pos_weight', 1.0)
     config.setdefault('lambda_velocity_smooth', 0.0)
     config.setdefault('velocity_smooth_normalize', True)
     config.setdefault('lambda_trace_integration', 0.0)
@@ -368,9 +361,6 @@ def train(config_path):
     config.setdefault('trace_integration_min_weight', 0.5)
     config.setdefault('trace_integration_detach_steps', False)
     config.setdefault('surface_attract_huber_beta', 5.0)
-    config.setdefault('trace_target_dilation_radius', 1.0)
-    config.setdefault('eval_perturbed_val', False)
-    config.setdefault('log_perturbed_val_images', False)
     config.setdefault('val_batches_per_log', 4)
     config.setdefault('log_at_step_zero', False)
     config.setdefault('ckpt_at_step_zero', False)
@@ -655,18 +645,6 @@ def train(config_path):
         apply_perturbation=False,
         patch_metadata=patch_metadata,
     )
-    val_pert_dataset = None
-    if config.get('eval_perturbed_val', False):
-        val_pert_config = copy.deepcopy(config)
-        val_pert_cfg = dict(val_pert_config.get('cond_local_perturb') or {})
-        val_pert_cfg['enabled'] = True
-        val_pert_config['cond_local_perturb'] = val_pert_cfg
-        val_pert_dataset = EdtSegDataset(
-            val_pert_config,
-            apply_augmentation=False,
-            apply_perturbation=True,
-            patch_metadata=patch_metadata,
-        )
 
     # Train/val split by indices
     num_patches = len(train_dataset)
@@ -685,8 +663,6 @@ def train(config_path):
 
     train_dataset = _restrict_dataset_samples(train_dataset, train_indices)
     val_dataset = _restrict_dataset_samples(val_dataset, val_indices)
-    if val_pert_dataset is not None:
-        val_pert_dataset = _restrict_dataset_samples(val_pert_dataset, val_indices)
 
     train_num_workers = max(0, int(config.get('num_workers', 0)))
     val_num_workers = max(0, int(config.get('val_num_workers', 1)))
@@ -730,23 +706,6 @@ def train(config_path):
         val_dataloader_kwargs['prefetch_factor'] = val_prefetch_factor
         val_dataloader_kwargs['multiprocessing_context'] = dataloader_context
     val_dataloader = torch.utils.data.DataLoader(val_dataset, **val_dataloader_kwargs)
-
-    val_pert_dataloader = None
-    if val_pert_dataset is not None:
-        val_pert_dataloader_kwargs = dict(
-            batch_size=config['batch_size'],
-            shuffle=False,
-            num_workers=val_num_workers,
-            worker_init_fn=seed_worker,
-            generator=make_generator(2),
-            collate_fn=collate_with_padding,
-            pin_memory=pin_memory,
-        )
-        if val_num_workers > 0:
-            val_pert_dataloader_kwargs['persistent_workers'] = val_persistent_workers
-            val_pert_dataloader_kwargs['prefetch_factor'] = val_prefetch_factor
-            val_pert_dataloader_kwargs['multiprocessing_context'] = dataloader_context
-        val_pert_dataloader = torch.utils.data.DataLoader(val_pert_dataset, **val_pert_dataloader_kwargs)
 
     model = make_model(config)
 
@@ -833,14 +792,9 @@ def train(config_path):
                 else:
                     accelerator.print('Resume enabled but checkpoint missing lr_scheduler state; using fresh scheduler')
 
-    if val_pert_dataloader is not None:
-        model, optimizer, train_dataloader, val_dataloader, val_pert_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, val_dataloader, val_pert_dataloader, lr_scheduler
-        )
-    else:
-        model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, val_dataloader, lr_scheduler
-        )
+    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+    )
 
     def _state_dict_for_eager_eval():
         state_dict = accelerator.unwrap_model(model).state_dict()
@@ -897,13 +851,11 @@ def train(config_path):
         accelerator.print(optimizer_summary)
         accelerator.print(scheduler_summary)
         accelerator.print(f"Train samples: {num_train}, Val samples: {num_val}")
-        accelerator.print(f"Eval perturbed val: {config.get('eval_perturbed_val', False)}")
         accelerator.print("=================================================\n")
 
     if config['verbose']:
         accelerator.print("creating iterators...")
     val_iterator = iter(val_dataloader)
-    val_pert_iterator = iter(val_pert_dataloader) if val_pert_dataloader is not None else None
     train_iterator = iter(train_dataloader)
     grad_clip = config['grad_clip']
     profile_data_time = bool(config.get('profile_data_time', False))
@@ -1251,116 +1203,6 @@ def train(config_path):
                     if wandb.run is not None:
                         wandb_log['train_image'] = wandb.Image(train_img_path)
                         wandb_log['val_image'] = wandb.Image(val_img_path)
-
-                if val_pert_dataloader is not None:
-                    try:
-                        val_pert_batch = next(val_pert_iterator)
-                    except StopIteration:
-                        val_pert_iterator = iter(val_pert_dataloader)
-                        val_pert_batch = next(val_pert_iterator)
-
-                    val_pert_inputs, val_pert_velocity_dir_target, val_pert_velocity_loss_weight, val_pert_trace_loss_weight, val_pert_trace_validity_target, val_pert_trace_validity_weight, val_pert_surface_attract_target, val_pert_surface_attract_weight = prepare_batch(
-                        val_pert_batch,
-                        use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-                        velocity_target_builder=build_velocity_targets_on_device,
-                    )
-
-                    with accelerator.autocast():
-                        val_pert_output = eval_forward_model(val_pert_inputs)
-                    val_pert_total_loss = _zero_loss_from_output(val_pert_output)
-
-                    if lambda_velocity_dir > 0.0:
-                        val_pert_velocity_dir_loss = compute_velocity_dir_loss(
-                            val_pert_output['velocity_dir'],
-                            val_pert_velocity_dir_target,
-                            val_pert_velocity_loss_weight,
-                        )
-                        val_pert_weighted_velocity_dir_loss = lambda_velocity_dir * val_pert_velocity_dir_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_velocity_dir_loss
-                        wandb_log['val_pert_velocity_dir_loss'] = val_pert_weighted_velocity_dir_loss.item()
-
-                    if lambda_velocity_smooth > 0.0:
-                        val_pert_velocity_smooth_loss = weighted_vector_smoothness_loss(
-                            val_pert_output['velocity_dir'],
-                            sample_weights=val_pert_velocity_loss_weight,
-                            normalize_vectors=bool(config.get('velocity_smooth_normalize', True)),
-                        )
-                        val_pert_weighted_velocity_smooth_loss = (
-                            lambda_velocity_smooth * val_pert_velocity_smooth_loss
-                        )
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_velocity_smooth_loss
-                        wandb_log['val_pert_velocity_smooth_loss'] = (
-                            val_pert_weighted_velocity_smooth_loss.item()
-                        )
-
-                    if lambda_trace_integration > 0.0:
-                        val_pert_trace_integration_loss = velocity_streamline_integration_loss(
-                            val_pert_output['velocity_dir'],
-                            val_pert_velocity_dir_target,
-                            val_pert_velocity_loss_weight,
-                            steps=trace_integration_steps,
-                            step_size=trace_integration_step_size,
-                            max_points=trace_integration_max_points,
-                            min_weight=trace_integration_min_weight,
-                            detach_steps=trace_integration_detach_steps,
-                            random_sample=False,
-                        )
-                        val_pert_weighted_trace_integration_loss = (
-                            lambda_trace_integration * val_pert_trace_integration_loss
-                        )
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_trace_integration_loss
-                        wandb_log['val_pert_trace_integration_loss'] = (
-                            val_pert_weighted_trace_integration_loss.item()
-                        )
-
-                    if lambda_surface_attract > 0.0:
-                        val_pert_surface_attract_loss = compute_surface_attract_loss(
-                            val_pert_output.get('surface_attract'),
-                            val_pert_surface_attract_target,
-                            val_pert_surface_attract_weight,
-                        )
-                        val_pert_weighted_surface_attract_loss = (
-                            lambda_surface_attract * val_pert_surface_attract_loss
-                        )
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_surface_attract_loss
-                        wandb_log['val_pert_surface_attract_loss'] = (
-                            val_pert_weighted_surface_attract_loss.item()
-                        )
-                    if lambda_trace_validity > 0.0:
-                        val_pert_trace_validity_loss = compute_trace_validity_loss(
-                            val_pert_output.get('trace_validity'),
-                            val_pert_trace_validity_target,
-                            val_pert_trace_validity_weight,
-                        )
-                        val_pert_weighted_trace_validity_loss = lambda_trace_validity * val_pert_trace_validity_loss
-                        val_pert_total_loss = val_pert_total_loss + val_pert_weighted_trace_validity_loss
-                        wandb_log['val_pert_trace_validity_loss'] = val_pert_weighted_trace_validity_loss.item()
-
-                    wandb_log['val_pert_loss'] = val_pert_total_loss.item()
-
-                    if config.get('log_perturbed_val_images', False):
-                        if (
-                            val_pert_velocity_dir_target is not None
-                            or val_pert_trace_validity_target is not None
-                            or val_pert_surface_attract_target is not None
-                        ):
-                            val_pert_img_path = f'{out_dir}/{iteration:06}_val_pert.png'
-                            make_dense_visualization(
-                                val_pert_inputs, None, None, None,
-                                velocity_dir_pred=val_pert_output.get('velocity_dir'),
-                                velocity_dir_target=val_pert_velocity_dir_target,
-                                velocity_loss_weight=val_pert_velocity_loss_weight,
-                                trace_loss_weight=val_pert_trace_loss_weight,
-                                trace_validity_pred=val_pert_output.get('trace_validity'),
-                                trace_validity_target=val_pert_trace_validity_target,
-                                trace_validity_weight=val_pert_trace_validity_weight,
-                                surface_attract_pred=val_pert_output.get('surface_attract'),
-                                surface_attract_target=val_pert_surface_attract_target,
-                                surface_attract_weight=val_pert_surface_attract_weight,
-                                save_path=val_pert_img_path
-                            )
-                            if wandb.run is not None:
-                                wandb_log['val_pert_image'] = wandb.Image(val_pert_img_path)
 
                 if eval_model is None:
                     model.train()

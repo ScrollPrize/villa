@@ -63,16 +63,16 @@ class EdtSegDataset(Dataset):
             size = int(crop_size_cfg)
             self.crop_size = (size, size, size)
 
-        target_size = self.crop_size
         setdefault_rowcol_cond_dataset_config(config)
         validate_rowcol_cond_dataset_config(config)
         self.use_trace_validity_targets = bool(config.get('use_trace_validity_targets', False)) or (
             float(config.get('lambda_trace_validity', 0.0)) > 0.0
         )
-        self.use_neighbor_sheet_context = bool(config.get('use_neighbor_sheet_context', False))
         self.neighbor_sheet_required = bool(config.get('neighbor_sheet_required', False))
-        if self.neighbor_sheet_required:
-            self.use_neighbor_sheet_context = True
+        self.use_neighbor_sheet_context = (
+            bool(config.get('use_neighbor_sheet_context', False))
+            or self.neighbor_sheet_required
+        )
         self._validate_result_tensors_enabled = bool(config['validate_result_tensors'])
 
         aug_config = config.get('augmentation', {})
@@ -144,7 +144,7 @@ class EdtSegDataset(Dataset):
                 cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
                 chunk_results = find_world_chunk_patches(
                     segments=scaled_segments,
-                    target_size=target_size,
+                    target_size=self.crop_size,
                     overlap_fraction=config['overlap_fraction'],
                     min_span_ratio=config['min_span_ratio'],
                     edge_touch_frac=config['edge_touch_frac'],
