@@ -273,6 +273,7 @@ private:
 
     ViewerManager* _manager{nullptr};
     QMetaObject::Connection _managerCreatedConn;
+    QMetaObject::Connection _managerClosingConn;
     QMetaObject::Connection _managerDestroyedConn;
 };
 

@@ -80,7 +80,7 @@ public:
         bool approvalStrokeActive{false};
         std::vector<std::vector<cv::Vec3f>> approvalStrokeSegments;  // Completed segments
         std::vector<cv::Vec3f> approvalCurrentStroke;  // Current active stroke
-        float approvalBrushRadius{50.0f};     // Cylinder radius (native voxels)
+        float approvalBrushRadius{50.0f};     // Mask pixels in flattened view; native voxels in plane views
         float approvalBrushDepth{15.0f};      // Cylinder depth (native voxels)
         float approvalEffectiveRadius{0.0f};  // For plane viewers: brush radius adjusted for distance
         bool paintingApproval{true};

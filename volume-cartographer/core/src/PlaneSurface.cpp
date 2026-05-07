@@ -369,9 +369,10 @@ cv::Vec3f PlaneSurface::loc(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 
 cv::Vec3f PlaneSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) const
 {
-    cv::Mat_<cv::Vec3f> coords;
-    gen(&coords, nullptr, {1,1}, ptr, 1.0, offset);
-    return coords(0,0);
+    cv::Vec3f total_offset = internal_loc(offset, ptr, {1,1});
+    cv::Vec3f use_origin = _origin + _normal*total_offset[2];
+    cv::Vec3f x_start = _vx * total_offset[0] + use_origin;
+    return _vy * total_offset[1] + x_start;
 }
 
 cv::Vec3f PlaneSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
@@ -450,4 +451,3 @@ float min_loc(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f &loc, cv::Vec3f &out,
     // std::cout << "best" << best << out << "\n" <<  std::endl;
     return best;
 }
-
