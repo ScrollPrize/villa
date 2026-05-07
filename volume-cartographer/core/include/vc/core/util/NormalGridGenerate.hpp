@@ -285,57 +285,67 @@ inline void fillBinarySliceBatchFromVolume(
         f.store(0, std::memory_order_relaxed);
     }
 
-    #pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int ca = 0; ca < Ca; ++ca) {
-        for (int cb = 0; cb < Cb; ++cb) {
-            std::array<size_t, 3> chunkKey{};
-            chunkKey[static_cast<size_t>(sliceAxis)] = static_cast<size_t>(sliceAxisChunkIndex);
-            chunkKey[static_cast<size_t>(axisA)] = static_cast<size_t>(ca);
-            chunkKey[static_cast<size_t>(axisB)] = static_cast<size_t>(cb);
+    const size_t chunkBytes = volume.chunkByteSize(level);
 
-            auto bytes = volume.readChunk(level, chunkKey);
-            if (!bytes) {
-                continue;  // missing or AllFill
-            }
+    // Per-thread reusable decode scratch: each thread owns one chunk-sized
+    // buffer for the lifetime of the parallel region, so blosc decompress
+    // writes into a hot, already-resident allocation instead of mmap/munmap-ing
+    // a fresh page-aligned vector for every chunk.
+    #pragma omp parallel
+    {
+        std::vector<std::byte> scratch(chunkBytes);
 
-            const int rowOffset = ca * chunkSizeA;
-            const int colOffset = cb * chunkSizeB;
+        #pragma omp for collapse(2) schedule(dynamic)
+        for (int ca = 0; ca < Ca; ++ca) {
+            for (int cb = 0; cb < Cb; ++cb) {
+                std::array<size_t, 3> chunkKey{};
+                chunkKey[static_cast<size_t>(sliceAxis)] = static_cast<size_t>(sliceAxisChunkIndex);
+                chunkKey[static_cast<size_t>(axisA)] = static_cast<size_t>(ca);
+                chunkKey[static_cast<size_t>(axisB)] = static_cast<size_t>(cb);
 
-            int validD = D;
-            int validH = H;
-            int validW = W;
+                if (!volume.readChunkInto(level, chunkKey, scratch)) {
+                    continue;  // missing or AllFill
+                }
 
-            switch (direction) {
-            case NormalGridSliceDirection::XY:
-                validD = std::min(D, std::max(0, volZ - sliceAxisChunkIndex * D));
-                validH = std::min(H, std::max(0, volY - rowOffset));
-                validW = std::min(W, std::max(0, volX - colOffset));
-                detail::distributeChunk<NormalGridSliceDirection::XY>(
-                    bytes->data(), sourceChunkShape, validD, validH, validW,
-                    rowOffset, colOffset,
-                    std::span<const int>(sliceForLocal), targets,
-                    std::span<std::atomic<uint8_t>>(anyFlags));
-                break;
-            case NormalGridSliceDirection::XZ:
-                validD = std::min(D, std::max(0, volZ - rowOffset));
-                validH = std::min(H, std::max(0, volY - sliceAxisChunkIndex * H));
-                validW = std::min(W, std::max(0, volX - colOffset));
-                detail::distributeChunk<NormalGridSliceDirection::XZ>(
-                    bytes->data(), sourceChunkShape, validD, validH, validW,
-                    rowOffset, colOffset,
-                    std::span<const int>(sliceForLocal), targets,
-                    std::span<std::atomic<uint8_t>>(anyFlags));
-                break;
-            case NormalGridSliceDirection::YZ:
-                validD = std::min(D, std::max(0, volZ - rowOffset));
-                validH = std::min(H, std::max(0, volY - colOffset));
-                validW = std::min(W, std::max(0, volX - sliceAxisChunkIndex * W));
-                detail::distributeChunk<NormalGridSliceDirection::YZ>(
-                    bytes->data(), sourceChunkShape, validD, validH, validW,
-                    rowOffset, colOffset,
-                    std::span<const int>(sliceForLocal), targets,
-                    std::span<std::atomic<uint8_t>>(anyFlags));
-                break;
+                const int rowOffset = ca * chunkSizeA;
+                const int colOffset = cb * chunkSizeB;
+
+                int validD = D;
+                int validH = H;
+                int validW = W;
+
+                switch (direction) {
+                case NormalGridSliceDirection::XY:
+                    validD = std::min(D, std::max(0, volZ - sliceAxisChunkIndex * D));
+                    validH = std::min(H, std::max(0, volY - rowOffset));
+                    validW = std::min(W, std::max(0, volX - colOffset));
+                    detail::distributeChunk<NormalGridSliceDirection::XY>(
+                        scratch.data(), sourceChunkShape, validD, validH, validW,
+                        rowOffset, colOffset,
+                        std::span<const int>(sliceForLocal), targets,
+                        std::span<std::atomic<uint8_t>>(anyFlags));
+                    break;
+                case NormalGridSliceDirection::XZ:
+                    validD = std::min(D, std::max(0, volZ - rowOffset));
+                    validH = std::min(H, std::max(0, volY - sliceAxisChunkIndex * H));
+                    validW = std::min(W, std::max(0, volX - colOffset));
+                    detail::distributeChunk<NormalGridSliceDirection::XZ>(
+                        scratch.data(), sourceChunkShape, validD, validH, validW,
+                        rowOffset, colOffset,
+                        std::span<const int>(sliceForLocal), targets,
+                        std::span<std::atomic<uint8_t>>(anyFlags));
+                    break;
+                case NormalGridSliceDirection::YZ:
+                    validD = std::min(D, std::max(0, volZ - rowOffset));
+                    validH = std::min(H, std::max(0, volY - colOffset));
+                    validW = std::min(W, std::max(0, volX - sliceAxisChunkIndex * W));
+                    detail::distributeChunk<NormalGridSliceDirection::YZ>(
+                        scratch.data(), sourceChunkShape, validD, validH, validW,
+                        rowOffset, colOffset,
+                        std::span<const int>(sliceForLocal), targets,
+                        std::span<std::atomic<uint8_t>>(anyFlags));
+                    break;
+                }
             }
         }
     }
