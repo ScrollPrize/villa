@@ -20,6 +20,7 @@ _flow_gate_seed_xyz: tuple[float, float, float] | None = None
 _flow_gate_out_dir: Path | None = None
 _flow_gate_debug_counts: dict[str, int] = {}
 _flow_gate_last_stats: dict[str, float] = {}
+_flow_gate_last_timing: dict[str, float] = {}
 _flow_gate_seed_hw_cache: tuple[int, int, float, float] | None = None
 _flow_gate_jpg_warned: bool = False
 _pred_dt_normal_source: str = "model"
@@ -883,6 +884,10 @@ def flow_gate_last_stats() -> dict[str, float]:
 	return dict(_flow_gate_last_stats)
 
 
+def flow_gate_last_timing() -> dict[str, float]:
+	return dict(_flow_gate_last_timing)
+
+
 def _write_flow_gate_debug(
 	*,
 	stage_name: str,
@@ -1006,8 +1011,9 @@ def _write_flow_gate_weight_jpg(
 
 
 def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.Tensor, dict | None] | None:
-	global _flow_gate_last_stats, _flow_gate_seed_hw_cache
+	global _flow_gate_last_stats, _flow_gate_last_timing, _flow_gate_seed_hw_cache
 	_flow_gate_last_stats = {}
+	_flow_gate_last_timing = {}
 	cfg = _flow_gate_cfg
 	if cfg is None:
 		return None
@@ -1035,15 +1041,20 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 		debug_index = _flow_gate_debug_counts.get(_flow_gate_stage, 0)
 		_flow_gate_debug_counts[_flow_gate_stage] = debug_index + 1
 	write_layer_debug = debug and (debug_index % 10) == 0
+	timing: dict[str, float] = {}
 	def mark(label: str) -> float:
 		return time.perf_counter()
 
 	def done(label: str, t0: float) -> None:
-		return None
+		timing[label] = timing.get(label, 0.0) + (time.perf_counter() - t0)
+
+	def publish_timing() -> None:
+		global _flow_gate_last_timing
+		_flow_gate_last_timing = dict(timing)
 
 	with torch.no_grad():
 		xyz_hr = res.xyz_hr[0].detach()
-		_t = mark("sample_pred_dt_max3d")
+		_t = mark("flow_sampling")
 		pred_hr = _sample_pred_dt_max3d(
 			res=res,
 			xyz_hr=xyz_hr,
@@ -1051,10 +1062,10 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			step_scale=pred_dt_pool_step_scale,
 		)
 		pred_img = pred_hr.detach().clamp(0, 255).round().to(torch.uint8).cpu().numpy()
-		done("sample_pred_dt_max3d", _t)
+		done("flow_sampling", _t)
 		He, We = pred_img.shape
 
-		_t = mark("project_seed")
+		_t = mark("flow_sampling")
 		seed = torch.tensor(_flow_gate_seed_xyz, device=xyz_hr.device, dtype=xyz_hr.dtype)
 		n_gt = _seed_gt_normal(seed_xyz=seed, res=res)
 		source_xy = None
@@ -1086,9 +1097,9 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			source_y = int(round(source_xy[1]))
 			source_x = max(0, min(We - 1, source_x))
 			source_y = max(0, min(He - 1, source_y))
-		done("project_seed", _t)
+		done("flow_sampling", _t)
 
-		_t = mark("build_query_grid")
+		_t = mark("flow_sampling")
 		Hm = int(res.xyz_lr.shape[1])
 		Wm = int(res.xyz_lr.shape[2])
 		sub_h = int(res.params.subsample_mesh)
@@ -1110,7 +1121,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 		seed_area = (
 			(grid_y - source_grid_y).square() + (grid_x - source_grid_x).square()
 		).le(4.0).view(1, 1, Hm, Wm)
-		done("build_query_grid", _t)
+		done("flow_sampling", _t)
 
 		if write_layer_debug:
 			_t = mark("write_initial_debug")
@@ -1126,7 +1137,9 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			)
 			done("write_initial_debug", _t)
 		def _compute_flow_outputs():
-			return dense_batch_flow.compute_flow_grid(
+			_t_flow = mark("flow_calc")
+			try:
+				return dense_batch_flow.compute_flow_grid(
 					pred_img,
 					source_xy=(source_x, source_y),
 					query_xy=query_xy,
@@ -1136,10 +1149,11 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					grid_step=grid_step,
 					backtrack_distance=backtrack_distance,
 				)
+			finally:
+				done("flow_calc", _t_flow)
 
 		pull_candidates = None
 		try:
-			_t = mark("compute_flow_grid")
 			if pull_cfg is not None:
 				with ThreadPoolExecutor(max_workers=1) as executor:
 					flow_future = executor.submit(_compute_flow_outputs)
@@ -1147,7 +1161,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					flow_outputs = flow_future.result()
 			else:
 				flow_outputs = _compute_flow_outputs()
-			done("compute_flow_grid", _t)
+			publish_timing()
 			if write_layer_debug:
 				query_flow, dense_flow, smooth_grid_flow, graph_edge_flow_rgb, flow_metadata = flow_outputs
 			else:
@@ -1212,6 +1226,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						used_weight_hr=used_weight_hr,
 						out_dir=_flow_gate_out_dir,
 					)
+				publish_timing()
 				return weight, None
 			raise
 		flow_lr = torch.as_tensor(
@@ -1344,6 +1359,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				out_dir=_flow_gate_out_dir,
 			)
 			done("write_weight_jpg", _t)
+		publish_timing()
 		return weight, pull
 
 
