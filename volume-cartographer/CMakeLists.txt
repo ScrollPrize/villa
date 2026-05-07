@@ -5,6 +5,7 @@ project(VC3D)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(VC_MARCH_NATIVE     "Tune for the host CPU (-march=native)"        OFF)
 option(VC_WARNINGS        "Enable curated warning set"                   OFF)
 option(VC_WERROR          "Treat compiler warnings as errors"            OFF)
 option(VC_ENABLE_ASAN     "AddressSanitizer"                             OFF)
@@ -53,7 +54,18 @@ if(VC_DEAD_CODE_REPORT)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
 endif()
 
-add_compile_options(-pipe -march=native)
+# Portable shippable defaults; VC_MARCH_NATIVE=ON (set by dev-* presets) opts
+# into host tuning. armv8.2-a floor avoids SVE so Apple M1-M3 + Qualcomm Oryon
+# work alongside Graviton.
+if(VC_MARCH_NATIVE)
+    add_compile_options(-pipe -march=native)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    add_compile_options(-pipe -march=x86-64-v3)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    add_compile_options(-pipe -march=armv8.2-a)
+else()
+    add_compile_options(-pipe)
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(_dbg -g3 -fno-omit-frame-pointer -fasynchronous-unwind-tables -fstandalone-debug)

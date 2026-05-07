@@ -22,7 +22,8 @@
       "hidden": true,
       "inherits": "_base",
       "cacheVariables": {
-        "VC_TESTING": "ON"
+        "VC_TESTING": "ON",
+        "VC_MARCH_NATIVE": "ON"
       }
     },
 
