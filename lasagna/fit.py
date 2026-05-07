@@ -173,6 +173,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_opt.add_args(p)
 	p.add_argument("--out-dir", default=None, help="Output directory for snapshots and debug")
 	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
+	p.add_argument("--model-init", choices=("seed", "ext", "model"), default="seed",
+		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input")
 	p.add_argument("--window-size", type=int, default=None,
 		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
 	p.add_argument("--window-overlap", type=int, default=0,
@@ -241,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
 	print("opt:", opt_cfg)
 
 	device = torch.device(data_cfg.device)
+	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
+	if model_init not in {"seed", "ext", "model"}:
+		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, or model)")
 
 	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
 	_t = _stage_start("probe_preprocessed_data")
@@ -255,8 +260,34 @@ def main(argv: list[str] | None = None) -> int:
 
 	# --- Init from seed (new model only) ---
 	_t = _stage_start("derive_initial_model_params")
-	is_new_model = model_cfg.model_input is None
-	if is_new_model and data_cfg.seed is not None and data_cfg.model_w is not None:
+	if model_init == "seed":
+		if getattr(args, "tifxyz_init", None):
+			raise ValueError("model-init=seed must not set --tifxyz-init; tifxyz can only be used as external_surfaces")
+		if model_cfg.model_input is not None:
+			raise ValueError("model-init=seed must not set --model-input")
+		missing_seed = []
+		if data_cfg.seed is None:
+			missing_seed.append("--seed")
+		if data_cfg.model_w is None:
+			missing_seed.append("--model-w")
+		if data_cfg.model_h is None:
+			missing_seed.append("--model-h")
+		if data_cfg.windings is None:
+			missing_seed.append("--windings")
+		if missing_seed:
+			raise ValueError(f"model-init=seed requires {', '.join(missing_seed)}")
+	elif model_init == "ext":
+		if not getattr(args, "tifxyz_init", None):
+			raise ValueError("model-init=ext requires --tifxyz-init")
+		if model_cfg.model_input is not None:
+			raise ValueError("model-init=ext must not set --model-input")
+	elif model_init == "model":
+		if model_cfg.model_input is None:
+			raise ValueError("model-init=model requires --model-input")
+		if getattr(args, "tifxyz_init", None):
+			raise ValueError("model-init=model must not set --tifxyz-init; tifxyz can only be used as external_surfaces")
+
+	if model_init == "seed" and data_cfg.seed is not None and data_cfg.model_w is not None:
 		if model_cfg.init_mode == "straight":
 			sp = _straight_params_from_seed(data_cfg.seed, data_cfg.model_w)
 			model_cfg = dataclasses.replace(model_cfg, **sp)
@@ -271,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
 				  f"z={arc['z_center']:.1f}", flush=True)
 
 	# --- Size mesh from model_w, model_h, windings (new model only) ---
-	if is_new_model and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
+	if model_init == "seed" and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
 		auto_mesh_w = max(2, int(data_cfg.model_w / model_cfg.mesh_step) + 1)
 		auto_mesh_h = max(2, int(data_cfg.model_h / model_cfg.mesh_step) + 1)
 		auto_depth = max(1, data_cfg.windings)
@@ -284,8 +315,10 @@ def main(argv: list[str] | None = None) -> int:
 	tifxyz_init = getattr(args, "tifxyz_init", None)
 	window_size = getattr(args, "window_size", None) or 0
 	window_overlap = getattr(args, "window_overlap", 0)
+	if model_init != "ext" and window_size > 0:
+		raise ValueError("windowed optimization currently requires model-init=ext")
 
-	if tifxyz_init and window_size > 0:
+	if model_init == "ext" and tifxyz_init and window_size > 0:
 		from tifxyz_io import load_tifxyz
 		import fit2tifxyz as _f2t
 		import json as _json
@@ -478,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
 	_t = _stage_start("construct_model")
-	if tifxyz_init:
+	if model_init == "ext":
 		mdl = model.Model3D.from_tifxyz(
 			tifxyz_init, device=device,
 			mesh_step=model_cfg.mesh_step,
@@ -487,7 +520,8 @@ def main(argv: list[str] | None = None) -> int:
 			subsample_winding=model_cfg.subsample_winding,
 		)
 		print(f"[fit] initialized from tifxyz: {tifxyz_init}", flush=True)
-	elif is_new_model:
+	elif model_init == "seed":
+		print(f"[fit] model-init=seed: constructing model from seed", flush=True)
 		mdl = model.Model3D(
 			device=device,
 			depth=model_cfg.depth,
@@ -514,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
 			pyramid_d=model_cfg.pyramid_d,
 		)
 	else:
+		print(f"[fit] model-init=model: loading checkpoint {model_cfg.model_input}", flush=True)
 		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)
 		mdl = model.Model3D.from_checkpoint(st, device=device)
 
@@ -693,13 +728,13 @@ def main(argv: list[str] | None = None) -> int:
 	_t = _stage_start("prepare_optimization")
 	seed_xyz = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
 	# tifxyz init: always use model grid center as seed (overrides CLI seed)
-	if tifxyz_init:
+	if model_init == "ext":
 		center_pt = _grid_center(mdl)
 		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] tifxyz seed: ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
 	# Re-optimize from checkpoint: derive seed from model grid center
-	if seed_xyz is None and not is_new_model:
+	if seed_xyz is None and model_init == "model":
 		center_pt = _grid_center(mdl)
 		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] checkpoint seed (grid center): ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
