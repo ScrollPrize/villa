@@ -19,6 +19,7 @@ import opt_loss_corr
 import opt_loss_winding_volume
 import opt_loss_station
 import opt_loss_bend
+import opt_loss_cyl
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -108,9 +109,7 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	valid = {"mesh_ms", "amp", "bias",
-			 "arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1",
-			 "straight_cx", "straight_cy", "straight_angle", "straight_half_w"}
+	valid = {"mesh_ms", "amp", "bias", "cyl_params"}
 	bad_params = sorted(set(params) - valid)
 	if bad_params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
@@ -142,6 +141,11 @@ def _parse_opt_settings(
 		if bad_terms:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.w_fac: unknown term(s): {bad_terms}")
 	eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, w_fac)
+	if "cyl_params" in params:
+		if params != ["cyl_params"]:
+			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
+		if float(eff.get("cyl_normal", 0.0)) == 0.0:
+			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires nonzero cyl_normal")
 	return OptSettings(
 		steps=steps,
 		lr=lr,
@@ -168,6 +172,7 @@ lambda_global: dict[str, float] = {
 	"station_t": 0.0,
 	"bend": 0.0,
 	"ext_offset": 0.0,
+	"cyl_normal": 0.0,
 }
 
 
@@ -373,6 +378,7 @@ def optimize(
 		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
 		"bend": {"loss": opt_loss_bend.bend_loss},
 		"ext_offset": {"loss": opt_loss_winding_density.ext_offset_loss},
+		"cyl_normal": {"loss": opt_loss_cyl.cyl_normal_loss},
 	}
 
 	_corr_start_printed = [False]
@@ -383,6 +389,11 @@ def optimize(
 			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0:
 			return data
+		is_cyl_stage = "cyl_params" in opt_cfg.params
+		stage_eff = (
+			{"cyl_normal": float(opt_cfg.eff.get("cyl_normal", 0.0))}
+			if is_cyl_stage else opt_cfg.eff
+		)
 		stage_args = opt_cfg.args or {}
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
 		status_interval = max(0, int(status_interval_raw))
@@ -397,23 +408,18 @@ def optimize(
 			pred_dt_normal_source = pred_dt_flow_gate_cfg.get("normal_source", None)
 		opt_loss_pred_dt.configure_pred_dt(normal_source=pred_dt_normal_source)
 		opt_loss_pred_dt.configure_flow_gate(
-			cfg=pred_dt_flow_gate_cfg if _need_term("pred_dt", opt_cfg.eff) > 0 else None,
+			cfg=pred_dt_flow_gate_cfg if _need_term("pred_dt", stage_eff) > 0 else None,
 			stage_name=stage.name or label,
 			seed_xyz=seed_xyz,
 			out_dir=out_dir,
 		)
 		_stage_done(f"{label}.configure_losses", _t)
 
-		# If arc/straight params not in optimized set, bake into mesh
+		# Once cylinder initialization is done, convert only the best candidate
+		# to the regular mesh before any mesh-space optimization.
 		_t = _stage_start(f"{label}.prepare_model_params")
-		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
-		if not arc_params_set.intersection(opt_cfg.params):
-			if hasattr(model, "arc_enabled") and model.arc_enabled:
-				model.bake_arc_into_mesh()
-		straight_params_set = {"straight_cx", "straight_cy", "straight_angle", "straight_half_w"}
-		if not straight_params_set.intersection(opt_cfg.params):
-			if hasattr(model, "straight_enabled") and model.straight_enabled:
-				model.bake_straight_into_mesh()
+		if not is_cyl_stage and getattr(model, "cylinder_enabled", False):
+			model.bake_cylinder_into_mesh(data)
 		_stage_done(f"{label}.prepare_model_params", _t)
 
 		_t = _stage_start(f"{label}.build_optimizer")
@@ -437,7 +443,7 @@ def optimize(
 		_stage_done(f"{label}.build_optimizer", _t)
 
 		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
-		if opt_cfg.args and opt_cfg.args.get("winding_offset_autocrop") and _need_term("winding_vol", opt_cfg.eff) > 0:
+		if opt_cfg.args and opt_cfg.args.get("winding_offset_autocrop") and _need_term("winding_vol", stage_eff) > 0:
 			_t = _stage_start(f"{label}.winding_offset_autocrop")
 			with torch.no_grad():
 				res_ao = model(data)
@@ -537,9 +543,9 @@ def optimize(
 
 		# Ensure data covers mesh and has all channels needed by this stage
 		_needed_channels: set[str] = set()
-		if _need_term("pred_dt", opt_cfg.eff) > 0:
+		if _need_term("pred_dt", stage_eff) > 0:
 			_needed_channels.add("pred_dt")
-		if _need_term("data", opt_cfg.eff) > 0 or _need_term("data_plain", opt_cfg.eff) > 0:
+		if _need_term("data", stage_eff) > 0 or _need_term("data_plain", stage_eff) > 0:
 			_needed_channels.add("cos")
 		if ensure_data_fn is not None:
 			_t = _stage_start(f"{label}.ensure_data")
@@ -554,7 +560,17 @@ def optimize(
 					res=res_,
 					cfg=pred_dt_flow_gate_cfg,
 				)
-				if _need_term("ext_offset", opt_cfg.eff) > 0:
+				if _need_term("cyl_normal", stage_eff) > 0:
+					_cyl_items = opt_loss_cyl.cyl_normal_prefetch_items_for_result(res=res_)
+					for _ch, _pts in _cyl_items.items():
+						if _ch in _loss_prefetch_items:
+							_loss_prefetch_items[_ch] = torch.cat(
+								[_loss_prefetch_items[_ch].reshape(1, 1, -1, 3), _pts.reshape(1, 1, -1, 3)],
+								dim=2,
+							)
+						else:
+							_loss_prefetch_items[_ch] = _pts
+				if _need_term("ext_offset", stage_eff) > 0:
 					_ext_offset_items = opt_loss_winding_density.ext_offset_prefetch_items_for_result(res=res_)
 					for _ch, _pts in _ext_offset_items.items():
 						if _ch in _loss_prefetch_items:
@@ -616,6 +632,8 @@ def optimize(
 					tv[name] = float(lv.detach().cpu())
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
+					if name == "cyl_normal":
+						tv.update(opt_loss_cyl.last_stats())
 					total = total + w * lv
 			return total, tv
 
@@ -652,11 +670,17 @@ def optimize(
 					xyz_lr=_xyz_lr_pf,
 					cfg=pred_dt_flow_gate_cfg,
 				)
+				_cyl_pf = None
+				if _need_term("cyl_normal", stage_eff) > 0 and getattr(model, "cylinder_enabled", False):
+					_cyl_pf, _ = model.cylinder_samples()
+					_cyl_pf = _cyl_pf.detach()
 			for _cache in _active_caches:
 				_sp = data._spacing_for(_cache.channels[0])
 				_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
 				if _pred_dt_extra_pf is not None and "pred_dt" in _cache.channels:
 					_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
+				if _cyl_pf is not None and {"grad_mag", "nx", "ny"} & set(_cache.channels):
+					_cache.prefetch(_cyl_pf, data.origin_fullres, _sp)
 			# Also prefetch chunks for corr points (static positions, loaded once)
 			if data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0:
 				_corr_xyz = data.corr_points.points_xyz_winda[:, :3].to(
@@ -670,7 +694,7 @@ def optimize(
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
 		# Must be AFTER prefetch+sync so grid_sample_fullres can read loaded chunks.
-		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
+		if (_need_term("station_n", stage_eff) > 0 or _need_term("station_t", stage_eff) > 0) and seed_xyz is not None:
 			_t = _stage_start(f"{label}.station_seed")
 			dev = next(model.parameters()).device
 			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
@@ -689,7 +713,7 @@ def optimize(
 			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
 			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
 			loss0, term_vals0 = _eval_terms(
-				res0, opt_cfg.eff, profile_label=f"{label}.initial_eval.loss")
+				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
 			_t_params = _stage_start(f"{label}.initial_eval.param_values")
 			param_vals0: dict[str, float] = {}
@@ -719,7 +743,7 @@ def optimize(
 		if (
 			pred_dt_flow_gate_cfg is not None
 			and bool(pred_dt_flow_gate_cfg.get("enabled", False))
-			and _need_term("pred_dt", opt_cfg.eff) > 0
+			and _need_term("pred_dt", stage_eff) > 0
 			and _flow_timing_enabled(pred_dt_flow_gate_cfg)
 		):
 			_flow_timing = _FlowTimingWindow(interval=100)
@@ -748,7 +772,7 @@ def optimize(
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			_t_loss_eval = time.perf_counter()
-			loss, term_vals = _eval_terms(res, opt_cfg.eff)
+			loss, term_vals = _eval_terms(res, stage_eff)
 			if _flow_timing is not None:
 				_timing_cuda_sync()
 				_flow_timing.add("loss_eval", time.perf_counter() - _t_loss_eval)
@@ -780,11 +804,17 @@ def optimize(
 						xyz_lr=_xyz_lr_pf,
 						cfg=pred_dt_flow_gate_cfg,
 					)
+					_cyl_pf = None
+					if _need_term("cyl_normal", stage_eff) > 0 and getattr(model, "cylinder_enabled", False):
+						_cyl_pf, _ = model.cylinder_samples()
+						_cyl_pf = _cyl_pf.detach()
 				for _cache in _active_caches:
 					_sp = data._spacing_for(_cache.channels[0])
 					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
 					if _pred_dt_extra_pf is not None and "pred_dt" in _cache.channels:
 						_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
+					if _cyl_pf is not None and {"grad_mag", "nx", "ny"} & set(_cache.channels):
+						_cache.prefetch(_cyl_pf, data.origin_fullres, _sp)
 				for _cache in _active_caches:
 					_cache.end_iteration()
 			if _flow_timing is not None:

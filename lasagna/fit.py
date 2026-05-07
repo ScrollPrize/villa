@@ -1,7 +1,6 @@
 import argparse
 import copy
 import dataclasses
-import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -39,66 +38,6 @@ def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	      + fh * (1 - fw) * xyz[0, h1, w0]
 	      + (1 - fh) * fw * xyz[0, h0, w1]
 	      + fh * fw * xyz[0, h1, w1])
-
-
-def _arc_params_from_seed(
-	seed: tuple[int, int, int],
-	model_w: int,
-	volume_extent_fullres: tuple[int, int, int],
-) -> dict:
-	"""Derive arc params from seed point and model width.
-
-	seed: (cx, cy, cz) in fullres voxels
-	model_w: model width in fullres voxels (circumferential extent)
-	volume_extent_fullres: (X_total, Y_total, Z_total) in fullres voxels
-	Returns dict with keys matching ModelConfig arc fields.
-	"""
-	seed_cx, seed_cy, seed_cz = float(seed[0]), float(seed[1]), float(seed[2])
-	vol_x, vol_y, _vol_z = volume_extent_fullres
-
-	# Volume center XY = estimate of scroll axis
-	arc_cx = vol_x / 2.0
-	arc_cy = vol_y / 2.0
-
-	# Arc radius = distance from volume center to seed point
-	dx = seed_cx - arc_cx
-	dy = seed_cy - arc_cy
-	arc_radius = math.sqrt(dx * dx + dy * dy)
-	arc_radius = max(arc_radius, 100.0)
-
-	# Seed angle
-	seed_angle = math.atan2(dy, dx)
-
-	# Angular half-extent from model width
-	half_angle = float(model_w) / (2.0 * arc_radius)
-	half_angle = max(half_angle, 0.05)
-
-	return {
-		"arc_cx": arc_cx,
-		"arc_cy": arc_cy,
-		"arc_radius": arc_radius,
-		"arc_angle0": seed_angle - half_angle,
-		"arc_angle1": seed_angle + half_angle,
-		"z_center": seed_cz,
-	}
-
-
-def _straight_params_from_seed(
-	seed: tuple[int, int, int],
-	model_w: int,
-) -> dict:
-	"""Derive straight params from seed point and model width.
-
-	The line is centered at the seed XY, oriented at angle 0 (along X),
-	with half-width = model_w / 2. The optimizer will adjust angle.
-	"""
-	return {
-		"straight_cx": float(seed[0]),
-		"straight_cy": float(seed[1]),
-		"straight_angle": 0.0,
-		"straight_half_w": float(model_w) / 2.0,
-		"z_center": float(seed[2]),
-	}
 
 
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
@@ -287,23 +226,16 @@ def main(argv: list[str] | None = None) -> int:
 		if getattr(args, "tifxyz_init", None):
 			raise ValueError("model-init=model must not set --tifxyz-init; tifxyz can only be used as external_surfaces")
 
-	if model_init == "seed" and data_cfg.seed is not None and data_cfg.model_w is not None:
-		if model_cfg.init_mode == "straight":
-			sp = _straight_params_from_seed(data_cfg.seed, data_cfg.model_w)
-			model_cfg = dataclasses.replace(model_cfg, **sp)
-			print(f"[fit] straight from seed: cx={sp['straight_cx']:.1f} cy={sp['straight_cy']:.1f} "
-				  f"angle={sp['straight_angle']:.3f} half_w={sp['straight_half_w']:.1f} "
-				  f"z={sp['z_center']:.1f}", flush=True)
-		elif volume_extent_fullres is not None:
-			arc = _arc_params_from_seed(data_cfg.seed, data_cfg.model_w, volume_extent_fullres)
-			model_cfg = dataclasses.replace(model_cfg, **arc)
-			print(f"[fit] arc from seed: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
-				  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
-				  f"z={arc['z_center']:.1f}", flush=True)
+	if model_init == "seed" and data_cfg.seed is not None:
+		model_cfg = dataclasses.replace(model_cfg, z_center=float(data_cfg.seed[2]))
+		print(f"[fit] cylinder_seed from seed: x={float(data_cfg.seed[0]):.1f} "
+			  f"y={float(data_cfg.seed[1]):.1f} z={float(data_cfg.seed[2]):.1f}",
+			  flush=True)
 
 	# --- Size mesh from model_w, model_h, windings (new model only) ---
 	if model_init == "seed" and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
-		auto_mesh_w = max(2, int(data_cfg.model_w / model_cfg.mesh_step) + 1)
+		circ_extent = max(float(data_cfg.model_w), float(data_cfg.model_h))
+		auto_mesh_w = max(2, int(circ_extent / model_cfg.mesh_step) + 1)
 		auto_mesh_h = max(2, int(data_cfg.model_h / model_cfg.mesh_step) + 1)
 		auto_depth = max(1, data_cfg.windings)
 
@@ -534,18 +466,15 @@ def main(argv: list[str] | None = None) -> int:
 			scaledown=scaledown,
 			z_step_eff=int(round(scaledown)),
 			z_center=model_cfg.z_center,
-			arc_cx=model_cfg.arc_cx,
-			arc_cy=model_cfg.arc_cy,
-			arc_radius=model_cfg.arc_radius,
-			arc_angle0=model_cfg.arc_angle0,
-			arc_angle1=model_cfg.arc_angle1,
-			straight_cx=model_cfg.straight_cx,
-			straight_cy=model_cfg.straight_cy,
-			straight_angle=model_cfg.straight_angle,
-			straight_half_w=model_cfg.straight_half_w,
 			init_mode=model_cfg.init_mode,
 			volume_extent=None,
 			pyramid_d=model_cfg.pyramid_d,
+		)
+		mdl.init_cylinder_seed(
+			seed=tuple(float(v) for v in data_cfg.seed),
+			model_w=float(data_cfg.model_w),
+			model_h=float(data_cfg.model_h),
+			volume_extent_fullres=volume_extent_fullres,
 		)
 	else:
 		print(f"[fit] model-init=model: loading checkpoint {model_cfg.model_input}", flush=True)
@@ -553,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
 		mdl = model.Model3D.from_checkpoint(st, device=device)
 
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
-		  f"arc_enabled={mdl.arc_enabled}")
+		  f"cylinder_enabled={getattr(mdl, 'cylinder_enabled', False)}")
 	_stage_done("construct_model", _t)
 
 	# Load external reference surfaces
@@ -687,17 +616,16 @@ def main(argv: list[str] | None = None) -> int:
 	_stage_done("initial_mesh_stats", _t)
 
 	def _save_model(path: str) -> None:
-		if mdl.arc_enabled:
-			mdl.bake_arc_into_mesh()
-		if mdl.straight_enabled:
-			mdl.bake_straight_into_mesh()
 		st = dict(mdl.state_dict())
 		# Store flat mesh instead of pyramid levels
 		ms_keys = [k for k in st if k.startswith("mesh_ms.")]
 		for k in ms_keys:
 			del st[k]
+		st.pop("cyl_params", None)
+		if getattr(mdl, "cylinder_enabled", False) and "conn_offsets" in st:
+			st["conn_offsets"] = torch.zeros_like(st["conn_offsets"])
 		with torch.no_grad():
-			st["mesh_flat"] = mdl.mesh_coarse().detach().clone()
+			st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
 		st["_model_params_"] = asdict(mdl.params)
 		st["_fit_config_"] = fit_config
 		corr_results = opt_loss_corr.get_last_results()
