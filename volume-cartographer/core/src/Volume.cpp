@@ -1769,6 +1769,30 @@ std::optional<std::vector<std::byte>> Volume::readChunk(
     return array.read_chunk(chunkZYX);
 }
 
+bool Volume::readChunkInto(
+    int level,
+    const std::array<size_t, 3>& chunkZYX,
+    std::span<std::byte> output) const
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::readChunkInto is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::readChunkInto level must be non-negative");
+    if (!hasScaleLevel(level))
+        throw std::out_of_range("Volume::readChunkInto requested missing zarr scale level " + std::to_string(level));
+
+    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
+                                           static_cast<int>(dtypeSize()));
+    return array.read_chunk_into(chunkZYX, output);
+}
+
+size_t Volume::chunkByteSize(int level) const
+{
+    const auto cs = chunkShape(level);
+    return static_cast<size_t>(cs[0]) * static_cast<size_t>(cs[1]) *
+           static_cast<size_t>(cs[2]) * dtypeSize();
+}
+
 std::vector<std::byte> Volume::readChunkOrFill(
     int level,
     const std::array<size_t, 3>& chunkZYX) const
