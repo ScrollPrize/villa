@@ -173,6 +173,7 @@ lambda_global: dict[str, float] = {
 	"bend": 0.0,
 	"ext_offset": 0.0,
 	"cyl_normal": 0.0,
+	"cyl_center": 0.0,
 }
 
 
@@ -379,6 +380,7 @@ def optimize(
 		"bend": {"loss": opt_loss_bend.bend_loss},
 		"ext_offset": {"loss": opt_loss_winding_density.ext_offset_loss},
 		"cyl_normal": {"loss": opt_loss_cyl.cyl_normal_loss},
+		"cyl_center": {"loss": opt_loss_cyl.cyl_center_loss},
 	}
 
 	_corr_start_printed = [False]
@@ -391,8 +393,15 @@ def optimize(
 			return data
 		is_cyl_stage = "cyl_params" in opt_cfg.params
 		stage_eff = (
-			{"cyl_normal": float(opt_cfg.eff.get("cyl_normal", 0.0))}
+			{
+				"cyl_normal": float(opt_cfg.eff.get("cyl_normal", 0.0)),
+				"cyl_center": float(opt_cfg.eff.get("cyl_center", 0.0)),
+			}
 			if is_cyl_stage else opt_cfg.eff
+		)
+		stage_uses_cyl_loss = (
+			_need_term("cyl_normal", stage_eff) > 0 or
+			_need_term("cyl_center", stage_eff) > 0
 		)
 		stage_args = opt_cfg.args or {}
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
@@ -560,7 +569,7 @@ def optimize(
 					res=res_,
 					cfg=pred_dt_flow_gate_cfg,
 				)
-				if _need_term("cyl_normal", stage_eff) > 0:
+				if stage_uses_cyl_loss:
 					_cyl_items = opt_loss_cyl.cyl_normal_prefetch_items_for_result(res=res_)
 					for _ch, _pts in _cyl_items.items():
 						if _ch in _loss_prefetch_items:
@@ -601,6 +610,8 @@ def optimize(
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
+			if stage_uses_cyl_loss:
+				opt_loss_cyl.reset_candidate_terms()
 			D = res_.xyz_lr.shape[0]
 			for name, t in terms.items():
 				min_d = t.get("min_depth", 1)
@@ -632,10 +643,15 @@ def optimize(
 					tv[name] = float(lv.detach().cpu())
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
-					if name == "cyl_normal":
-						tv.update(opt_loss_cyl.last_stats())
 					total = total + w * lv
-			return total, tv
+			display_loss: float | None = None
+			if stage_uses_cyl_loss:
+				best_idx, display_loss, display_tv = opt_loss_cyl.display_stats(eff_)
+				if best_idx is not None and hasattr(model, "set_best_cylinder_index"):
+					model.set_best_cylinder_index(best_idx)
+				if display_tv:
+					tv.update(display_tv)
+			return total, tv, display_loss
 
 		# Streaming mode: filter caches to only those needed by this stage
 		# grad_mag/nx/ny are always needed; cos and pred_dt are conditional
@@ -671,7 +687,7 @@ def optimize(
 					cfg=pred_dt_flow_gate_cfg,
 				)
 				_cyl_pf = None
-				if _need_term("cyl_normal", stage_eff) > 0 and getattr(model, "cylinder_enabled", False):
+				if stage_uses_cyl_loss and getattr(model, "cylinder_enabled", False):
 					_cyl_pf, _ = model.cylinder_samples()
 					_cyl_pf = _cyl_pf.detach()
 			for _cache in _active_caches:
@@ -712,7 +728,7 @@ def optimize(
 			_debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
 			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
 			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
-			loss0, term_vals0 = _eval_terms(
+			loss0, term_vals0, display_loss0 = _eval_terms(
 				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
 			_t_params = _stage_start(f"{label}.initial_eval.param_values")
@@ -724,7 +740,12 @@ def optimize(
 			_t_status = _stage_start(f"{label}.initial_eval.status_print")
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
-			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
+			_print_status(
+				step_label=f"{label} 0/{opt_cfg.steps}",
+				loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
+				tv=term_vals0,
+				pv=param_vals0,
+			)
 			_stage_done(f"{label}.initial_eval.status_print", _t_status)
 			# Print corr detail after initial eval (first stage only)
 			if not _corr_start_printed[0] and "corr" in term_vals0:
@@ -739,6 +760,7 @@ def optimize(
 		_t_wall_start = time.perf_counter()
 		_t_steps_acc = 0
 		loss = loss0
+		display_loss = display_loss0
 		_flow_timing = None
 		if (
 			pred_dt_flow_gate_cfg is not None
@@ -772,7 +794,7 @@ def optimize(
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			_t_loss_eval = time.perf_counter()
-			loss, term_vals = _eval_terms(res, stage_eff)
+			loss, term_vals, display_loss = _eval_terms(res, stage_eff)
 			if _flow_timing is not None:
 				_timing_cuda_sync()
 				_flow_timing.add("loss_eval", time.perf_counter() - _t_loss_eval)
@@ -805,7 +827,7 @@ def optimize(
 						cfg=pred_dt_flow_gate_cfg,
 					)
 					_cyl_pf = None
-					if _need_term("cyl_normal", stage_eff) > 0 and getattr(model, "cylinder_enabled", False):
+					if stage_uses_cyl_loss and getattr(model, "cylinder_enabled", False):
 						_cyl_pf, _ = model.cylinder_samples()
 						_cyl_pf = _cyl_pf.detach()
 				for _cache in _active_caches:
@@ -828,7 +850,8 @@ def optimize(
 
 			if progress_fn is not None:
 				progress_fn(
-					step=_done_steps[0], total=_total_steps, loss=float(loss.detach().cpu()),
+					step=_done_steps[0], total=_total_steps,
+					loss=float(display_loss) if display_loss is not None else float(loss.detach().cpu()),
 					stage_progress=_stage_progress, overall_progress=_overall_progress,
 					stage_name=stage.name,
 				)
@@ -844,7 +867,8 @@ def optimize(
 				_t_wall_elapsed = _t_wall_now - _t_wall_start
 				_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
 				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps}",
-							  loss_val=loss.item(), tv=term_vals, pv=param_vals, its=_its)
+							  loss_val=float(display_loss) if display_loss is not None else loss.item(),
+							  tv=term_vals, pv=param_vals, its=_its)
 				_t_steps_acc = 0
 				_t_wall_start = _t_wall_now
 
