@@ -44,8 +44,8 @@
 #include "sparse_cached.h"
 #include "AtA_cached.h"
 
-#ifdef CHOLMOD
-#  include <Eigen/CholmodSupport>
+#ifdef PASTIX6
+#  include <igl/pastix6_solver.h>
 #endif
 
 namespace igl
@@ -124,49 +124,17 @@ namespace igl
       //t.start();
       // solve
       Eigen::VectorXd Uc;
-#ifdef CHOLMOD
-        // Supernodal (vs Simplicial) — CHOLMOD's supernodal factorization
-        // dispatches dense block ops to BLAS, so OpenBLAS gives us actual
-        // multithreading on SLIM-sized matrices. SPD-only, which matches
-        // L = AᵀWA + λI. Persistent solver + analyzePattern-once mirrors what
-        // the old PaStiX path did: the mesh topology is fixed across SLIM
-        // iters so the sparsity pattern is constant; only the values change.
-        // Skipping the symbolic analysis after iter 1 saves a substantial
-        // chunk of per-iter time.
-        static Eigen::CholmodSupernodalLLT<Eigen::SparseMatrix<double>> solver;
-        static bool analyzed = false;
-        if (!analyzed) {
-          // Pin the fill-reducing ordering instead of letting CHOLMOD try
-          // every method on the first analyze (default nmethods=2 with AMD
-          // and METIS, then it picks the best). For SLIM the matrix
-          // structure is the same FE Laplacian-like pattern every run, so
-          // committing to METIS up front skips ~30-50% of the symbolic
-          // cost on iter 1 and changes nothing thereafter.
-          cholmod_common& cc = solver.cholmod();
-          cc.nmethods = 1;
-          cc.method[0].ordering = CHOLMOD_METIS;
-          cc.postorder = 1;
-          solver.analyzePattern(L);
-          analyzed = true;
-        }
-        solver.factorize(L);
-        Uc = solver.solve(s.rhs);
-#else
-      if (s.dim == 2)
-      {
-        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
-        Uc = solver.compute(L).solve(s.rhs);
+      // PaStiX 6 multifrontal direct solver, persistent across SLIM iters.
+      // analyzePattern() captures the sparsity once; factorize() refreshes
+      // values each iter. Pairs with SLIM_CACHED on the libigl side.
+      static igl::Pastix6LLT solver;
+      static bool analyzed = false;
+      if (!analyzed) {
+        solver.analyzePattern(L);
+        analyzed = true;
       }
-      else
-      { // seems like CG performs much worse for 2D and way better for 3D
-        Eigen::VectorXd guess(uv.rows() * s.dim);
-        for (int i = 0; i < s.v_num; i++) for (int j = 0; j < s.dim; j++) guess(uv.rows() * j + i) = uv(i, j); // flatten vector
-        Eigen::ConjugateGradient<Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper> cg;
-        cg.setTolerance(1e-8);
-        cg.compute(L);
-        Uc = cg.solveWithGuess(s.rhs, guess);
-      }
-#endif
+      solver.factorize(L);
+      Uc = solver.solve(s.rhs);
       for (int i = 0; i < s.dim; i++)
         uv.col(i) = Uc.block(i * s.v_n, 0, s.v_n, 1);
 

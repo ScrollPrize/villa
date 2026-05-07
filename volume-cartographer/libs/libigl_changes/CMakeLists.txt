@@ -87,82 +87,6 @@ if(LIBIGL_TOPLEVEL_PROJECT AND (NOT APPLE) AND UNIX)
     endif()
 endif()
 
-# ====================== CHOLMOD (SuiteSparse) support =======================
-# Turn on CHOLMOD (multithreaded via OpenMP + threaded BLAS) for SLIM, etc.
-option(LIBIGL_WITH_CHOLMOD "Enable CHOLMOD (SuiteSparse) support" ON)
-if(LIBIGL_WITH_CHOLMOD)
-  # Ensure all compilation units see CHOLMOD (slim.cpp uses #ifdef CHOLMOD)
-  add_compile_definitions(CHOLMOD)
-  # Try pkg-config first (some distros ship cholmod.pc), then fall back.
-  find_package(PkgConfig QUIET)
-  if(PKG_CONFIG_FOUND)
-    pkg_check_modules(CHOLMOD_PC QUIET cholmod)
-  endif()
-
-  add_library(igl_cholmod INTERFACE)
-  add_library(igl::cholmod ALIAS igl_cholmod)
-  # compile def also added globally above; keep it here for consumers outside this tree
-  target_compile_definitions(igl_cholmod INTERFACE CHOLMOD)
-
-  if(CHOLMOD_PC_FOUND)
-    target_include_directories(igl_cholmod INTERFACE ${CHOLMOD_PC_INCLUDE_DIRS})
-    target_link_libraries(igl_cholmod INTERFACE ${CHOLMOD_PC_LIBRARIES})
-    message(STATUS "CHOLMOD enabled (via pkg-config)")
-    # expose include dirs to all later targets in this directory (e.g., tutorials)
-    set(_CHOLMOD_INCS ${CHOLMOD_PC_INCLUDE_DIRS})
-  else()
-    # Fallback for Ubuntu/Debian: find headers and libs manually
-    find_path(CHOLMOD_INCLUDE_DIR NAMES cholmod.h PATH_SUFFIXES suitesparse)
-    find_library(CHOLMOD_LIB            NAMES cholmod)
-    find_library(SUITESPARSECONFIG_LIB  NAMES suitesparseconfig)
-    find_library(AMD_LIB                NAMES amd)
-    find_library(COLAMD_LIB             NAMES colamd)
-    find_library(CAMD_LIB               NAMES camd)
-    find_library(CCOLAMD_LIB            NAMES ccolamd)
-    set(CHOLMOD_FALLBACK_LIBS
-      ${CHOLMON_LIB} ${CHOLMOD_LIB}      # keep ${CHOLMON_LIB} typo-safe
-      ${SUITESPARSECONFIG_LIB}
-      ${AMD_LIB} ${COLAMD_LIB} ${CAMD_LIB} ${CCOLAMD_LIB})
-
-    if(NOT CHOLMOD_INCLUDE_DIR OR NOT CHOLMOD_LIB)
-      message(FATAL_ERROR
-        "CHOLMOD not found. Install 'libsuitesparse-dev' or provide paths via CMAKE_PREFIX_PATH.")
-    endif()
-    target_include_directories(igl_cholmod INTERFACE ${CHOLMOD_INCLUDE_DIR})
-    target_link_libraries(igl_cholmod INTERFACE ${CHOLMOD_FALLBACK_LIBS})
-
-    # Also link BLAS/LAPACK if available
-    find_package(BLAS)
-    find_package(LAPACK)
-    if (TARGET LAPACK::LAPACK)
-      target_link_libraries(igl_cholmod INTERFACE LAPACK::LAPACK)
-    endif()
-    if (TARGET BLAS::BLAS)
-      target_link_libraries(igl_cholmod INTERFACE BLAS::BLAS)
-    endif()
-    message(STATUS "CHOLMOD enabled (manual find):")
-    message(STATUS "  include: ${CHOLMOD_INCLUDE_DIR}")
-    message(STATUS "  libs   : ${CHOLMOD_FALLBACK_LIBS}")
-  endif()
-  
-  # Make sure every target created afterwards inherits CHOLMOD includes & libs
-  include_directories(SYSTEM ${_CHOLMOD_INCS})
-  #link_libraries(igl::cholmod)
-
-  # Try to enable OpenMP for CHOLMOD parallelism
-  if(NOT TARGET OpenMP::OpenMP_CXX)
-    find_package(OpenMP)
-  endif()
-  if (TARGET OpenMP::OpenMP_CXX)
-    target_link_libraries(igl_cholmod INTERFACE OpenMP::OpenMP_CXX)
-  endif()
-  # If we install, export the interface target too (harmless no-op otherwise)
-  if(LIBIGL_INSTALL)
-    install(TARGETS igl_cholmod EXPORT LibiglTargets)
-  endif()
-endif()
-# ===========================================================================
-
 # Build tests and tutorials
 option(LIBIGL_BUILD_TESTS      "Build libigl unit test"                ${LIBIGL_TOPLEVEL_PROJECT})
 option(LIBIGL_BUILD_TUTORIALS  "Build libigl tutorial"                 ${LIBIGL_TOPLEVEL_PROJECT})
@@ -225,16 +149,6 @@ endif()
 
 # Defines CMake targets for selected libigl modules
 include(libigl)
-
-# Attach solver interfaces to libigl’s core (use the real target, not the ALIAS)
-if (TARGET igl_core)
-  if(LIBIGL_WITH_CHOLMOD)
-    target_link_libraries(igl_core INTERFACE igl::cholmod)
-  endif()
-  if(LIBIGL_WITH_PASTIX)
-    target_link_libraries(igl_core INTERFACE igl::pastix)
-  endif()
-endif()
 
 if(LIBIGL_BUILD_TUTORIALS)
     add_subdirectory(tutorial)

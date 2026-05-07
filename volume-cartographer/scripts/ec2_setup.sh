@@ -29,7 +29,8 @@ apt-get install -y \
     libblosc2-dev libcurl4-openssl-dev \
     libavahi-client-dev nlohmann-json3-dev \
     liblz4-dev libtiff-dev \
-    zlib1g-dev gfortran libopenblas-dev liblapack-dev libomp-dev \
+    zlib1g-dev gfortran libopenblas-dev liblapack-dev liblapacke-dev libomp-dev \
+    libscotch-dev libhwloc-dev \
     file curl unzip ca-certificates bzip2 wget jq rclone fuse gimp \
     desktop-file-utils \
     mdadm nvme-cli
