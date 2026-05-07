@@ -451,14 +451,23 @@ def build_away_from_conditioning_trace_targets(
     if not bool(valid_vox.any()):
         return None
 
-    velocity = np.zeros_like(velocity_accum, dtype=np.float32)
-    velocity[:, valid_vox] = velocity_accum[:, valid_vox] / weights[valid_vox][None]
+    active_coords = np.nonzero(valid_vox)
+    active_velocity = velocity_accum[:, valid_vox] / weights[valid_vox][None]
+    norms = np.linalg.norm(active_velocity, axis=0)
+    active_finite = (
+        np.isfinite(active_velocity).all(axis=0)
+        & np.isfinite(norms)
+        & (norms > 1e-6)
+    )
 
-    norms = np.linalg.norm(velocity, axis=0)
-    finite = np.isfinite(velocity).all(axis=0) & np.isfinite(norms) & (norms > 1e-6)
-    velocity[:, finite] = velocity[:, finite] / norms[finite][None]
-    velocity[:, ~finite] = 0.0
-    valid_vox = finite
+    velocity = np.zeros_like(velocity_accum, dtype=np.float32)
+    valid_vox = np.zeros(crop_size, dtype=bool)
+    if bool(active_finite.any()):
+        finite_coords = tuple(coord[active_finite] for coord in active_coords)
+        velocity[(slice(None), *finite_coords)] = (
+            active_velocity[:, active_finite] / norms[active_finite][None]
+        )
+        valid_vox[finite_coords] = True
 
     radius = float(dilation_radius)
     if radius > 0.0:
