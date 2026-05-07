@@ -234,8 +234,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	# --- Size mesh from model_w, model_h, windings (new model only) ---
 	if model_init == "seed" and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
-		circ_extent = max(float(data_cfg.model_w), float(data_cfg.model_h))
-		auto_mesh_w = max(2, int(circ_extent / model_cfg.mesh_step) + 1)
+		auto_mesh_w = max(2, int(float(data_cfg.model_w) / model_cfg.mesh_step) + 1)
 		auto_mesh_h = max(2, int(data_cfg.model_h / model_cfg.mesh_step) + 1)
 		auto_depth = max(1, data_cfg.windings)
 

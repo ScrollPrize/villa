@@ -335,9 +335,9 @@ class Model3D(nn.Module):
 		a = (r * (1.0 + k)).clamp(min=1.0)
 		b = (r * (1.0 - k)).clamp(min=1.0)
 
-		q = torch.linspace(0.0, 2.0 * math.pi, W, device=device, dtype=dtype)
-		phi = q.view(1, W) + 0.5 * k.view(N, 1) * torch.sin(2.0 * q).view(1, W)
-		phi = phi + 0.0625 * (k * k).view(N, 1) * torch.sin(4.0 * q).view(1, W)
+		q = self._cylinder_q_values(params=params)
+		phi = q + 0.5 * k.view(N, 1) * torch.sin(2.0 * q)
+		phi = phi + 0.0625 * (k * k).view(N, 1) * torch.sin(4.0 * q)
 
 		cos_p = torch.cos(phi)
 		sin_p = torch.sin(phi)
@@ -362,7 +362,11 @@ class Model3D(nn.Module):
 		nx = nx_local * cos_r - ny_local * sin_r
 		ny = nx_local * sin_r + ny_local * cos_r
 
-		h_extent = float(self.params.mesh_step) * float(max(0, H - 1))
+		h_extent = (
+			float(self.params.model_h)
+			if self.params.model_h is not None
+			else float(self.params.mesh_step) * float(max(0, H - 1))
+		)
 		z_line = seed_z + torch.linspace(
 			-h_extent / 2.0, h_extent / 2.0, H, device=device, dtype=dtype,
 		).view(1, H)
@@ -381,6 +385,18 @@ class Model3D(nn.Module):
 
 	def cylinder_samples(self) -> tuple[torch.Tensor, torch.Tensor]:
 		return self._cylinder_samples_for_params(self.cyl_params)
+
+	def _cylinder_q_values(self, *, params: torch.Tensor) -> torch.Tensor:
+		device = params.device
+		dtype = params.dtype
+		N = int(params.shape[0])
+		W = self.mesh_w
+		base = torch.linspace(-0.5, 0.5, W, device=device, dtype=dtype).view(1, W)
+		if self.params.model_w is None:
+			return base.expand(N, W) * (2.0 * math.pi)
+		r = params[:, 0].to(device=device, dtype=dtype).clamp(min=1.0)
+		q_span = float(self.params.model_w) / r
+		return base * q_span.view(N, 1)
 
 	def cylinder_centers(self) -> torch.Tensor:
 		params = self.cyl_params
