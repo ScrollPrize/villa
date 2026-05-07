@@ -84,7 +84,6 @@ def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("wandb_resume", False)
     config.setdefault("wandb_resume_mode", "allow")
     config.setdefault("compile_model", True)
-    config.setdefault("separate_eager_eval_for_logging", True)
     config.setdefault("load_weights_only", False)
     config.setdefault("allow_partial_weight_load", False)
     config.setdefault("verbose", False)

@@ -258,19 +258,6 @@ def train(config_path):
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
 
-    def _state_dict_for_eager_eval():
-        state_dict = accelerator.unwrap_model(model).state_dict()
-        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-            state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
-        return state_dict
-
-    use_separate_eager_eval_for_logging = bool(config['separate_eager_eval_for_logging'])
-    eval_model = None
-    if use_separate_eager_eval_for_logging and accelerator.is_main_process:
-        eval_model = make_model(config).to(accelerator.device)
-        eval_model.eval()
-        eval_model.load_state_dict(_state_dict_for_eager_eval())
-
     if accelerator.is_main_process:
         accelerator.print("\n=== Trace ODE Training Configuration ===")
         accelerator.print(f"Input channels: {config['in_channels']}")
@@ -407,13 +394,7 @@ def train(config_path):
 
         if should_log_this_iteration and accelerator.is_main_process:
             with torch.no_grad():
-                eval_forward_model = model
-                if eval_model is not None:
-                    eval_model.load_state_dict(_state_dict_for_eager_eval())
-                    eval_model.eval()
-                    eval_forward_model = eval_model
-                else:
-                    model.eval()
+                model.eval()
 
                 val_batches_per_log = max(1, int(config['val_batches_per_log']))
                 val_metric_sums = {
@@ -441,7 +422,7 @@ def train(config_path):
                     val_prepared = prepare_batch(val_batch, config)
 
                     with accelerator.autocast():
-                        val_output = eval_forward_model(val_prepared.inputs)
+                        val_output = model(val_prepared.inputs)
                     val_total_loss, val_metrics = compute_trace_losses(
                         val_output,
                         val_prepared,
@@ -496,8 +477,7 @@ def train(config_path):
                         wandb_log['train_image'] = wandb.Image(train_img_path)
                         wandb_log['val_image'] = wandb.Image(val_img_path)
 
-                if eval_model is None:
-                    model.train()
+                model.train()
 
         if (
             (iteration > 0 or config['ckpt_at_step_zero'])
