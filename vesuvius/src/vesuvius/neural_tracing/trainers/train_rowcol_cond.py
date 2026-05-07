@@ -310,13 +310,7 @@ def train(config_path):
             else 0
         )
     )
-    config.setdefault('in_channels', default_in_channels)
-    if int(config['in_channels']) != default_in_channels:
-        raise ValueError(
-            f"in_channels={config['in_channels']} does not match configured inputs "
-            f"(expected {default_in_channels} from "
-            f"use_growth_direction_channels={config.get('use_growth_direction_channels', False)})"
-        )
+    config['in_channels'] = default_in_channels
     config.setdefault('step_count', 1)  # Required by make_model
     config.setdefault('num_iterations', 250000)
     config.setdefault('log_frequency', 100)
@@ -479,13 +473,9 @@ def train(config_path):
         batch['trace_validity'] = torch.stack(labels, dim=0).unsqueeze(1)
         batch['trace_validity_weight'] = torch.stack(weights, dim=0).unsqueeze(1)
 
-        if 'velocity_dir' not in batch or 'velocity_loss_weight' not in batch:
-            raise ValueError("Velocity targets are enabled but missing from the batch")
-
-        trace_band_attract_radius = trace_surface_attract_radius
         if (
             trace_target_dilation_radius <= 0.0
-            and trace_band_attract_radius <= 0.0
+            and trace_surface_attract_radius <= 0.0
         ):
             return
         (
@@ -499,7 +489,7 @@ def train(config_path):
             batch['velocity_loss_weight'],
             trace_target_dilation_radius,
             trace_loss_weight=batch.get('trace_loss_weight', None),
-            surface_attract_radius=trace_band_attract_radius,
+            surface_attract_radius=trace_surface_attract_radius,
         )
         batch['velocity_dir'] = velocity_dir
         batch['velocity_loss_weight'] = velocity_weight
