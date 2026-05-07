@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -177,7 +178,8 @@ inline void distributeChunk(
     int validD, int validH, int validW,
     int rowOffset, int colOffset,
     std::span<const int> sliceForLocal,             // size = sourceSliceAxisLen, -1 for none
-    std::span<BinarySliceTarget> targets)
+    std::span<BinarySliceTarget> targets,
+    std::span<std::atomic<uint8_t>> anyFlags)
 {
     const int H = chunkShape[1];
     const int W = chunkShape[2];
@@ -202,7 +204,9 @@ inline void distributeChunk(
                 const uint8_t v = row[lx];
                 targets[slot].binarySlice->ptr<uint8_t>(dr)[dc] =
                     v ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
-                if (v) targets[slot].anyNonZero = true;
+                if (v) {
+                    anyFlags[slot].store(1, std::memory_order_relaxed);
+                }
             }
         }
     }
@@ -273,6 +277,15 @@ inline void fillBinarySliceBatchFromVolume(
     const int volY = volumeShape[1];
     const int volX = volumeShape[2];
 
+    // Concurrent any-non-zero accumulators. Each (ca, cb) chunk maps to a
+    // disjoint slice region, so voxel writes don't race; the flag is the
+    // only cross-thread write.
+    std::vector<std::atomic<uint8_t>> anyFlags(targets.size());
+    for (auto& f : anyFlags) {
+        f.store(0, std::memory_order_relaxed);
+    }
+
+    #pragma omp parallel for collapse(2) schedule(dynamic)
     for (int ca = 0; ca < Ca; ++ca) {
         for (int cb = 0; cb < Cb; ++cb) {
             std::array<size_t, 3> chunkKey{};
@@ -300,7 +313,8 @@ inline void fillBinarySliceBatchFromVolume(
                 detail::distributeChunk<NormalGridSliceDirection::XY>(
                     bytes->data(), sourceChunkShape, validD, validH, validW,
                     rowOffset, colOffset,
-                    std::span<const int>(sliceForLocal), targets);
+                    std::span<const int>(sliceForLocal), targets,
+                    std::span<std::atomic<uint8_t>>(anyFlags));
                 break;
             case NormalGridSliceDirection::XZ:
                 validD = std::min(D, std::max(0, volZ - rowOffset));
@@ -309,7 +323,8 @@ inline void fillBinarySliceBatchFromVolume(
                 detail::distributeChunk<NormalGridSliceDirection::XZ>(
                     bytes->data(), sourceChunkShape, validD, validH, validW,
                     rowOffset, colOffset,
-                    std::span<const int>(sliceForLocal), targets);
+                    std::span<const int>(sliceForLocal), targets,
+                    std::span<std::atomic<uint8_t>>(anyFlags));
                 break;
             case NormalGridSliceDirection::YZ:
                 validD = std::min(D, std::max(0, volZ - rowOffset));
@@ -318,9 +333,16 @@ inline void fillBinarySliceBatchFromVolume(
                 detail::distributeChunk<NormalGridSliceDirection::YZ>(
                     bytes->data(), sourceChunkShape, validD, validH, validW,
                     rowOffset, colOffset,
-                    std::span<const int>(sliceForLocal), targets);
+                    std::span<const int>(sliceForLocal), targets,
+                    std::span<std::atomic<uint8_t>>(anyFlags));
                 break;
             }
+        }
+    }
+
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (anyFlags[i].load(std::memory_order_relaxed) != 0) {
+            targets[i].anyNonZero = true;
         }
     }
 }
