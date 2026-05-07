@@ -562,8 +562,11 @@ class EdtSegDataset(Dataset):
             self.crop_size,
             cond_direction,
             cond_surface_local=trace_surface_np,
-            dilation_radius=float(self.config.get("trace_target_dilation_radius", 0.0)),
-            surface_attract_radius=float(self.config.get("trace_surface_attract_radius", 0.0)),
+            # RowColTargets.from_batch applies trace dilation and surface-attract
+            # EDT on-device after collation. The dataset only needs to emit the
+            # sparse source trace mask/direction.
+            dilation_radius=0.0,
+            surface_attract_radius=0.0,
         )
         if trace_payload is None:
             return self._resample_item(

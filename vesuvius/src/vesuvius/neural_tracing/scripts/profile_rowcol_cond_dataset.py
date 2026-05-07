@@ -40,6 +40,7 @@ from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
 )
+from vesuvius.neural_tracing.datasets.targets import RowColTargets
 
 
 def _parse_args() -> argparse.Namespace:
@@ -51,6 +52,22 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("config_path", type=Path, help="Path to row/col conditioning JSON config.")
     parser.add_argument("--samples", type=int, default=100, help="Number of samples to profile.")
+    parser.add_argument(
+        "--include-prepare-batch",
+        action="store_true",
+        help="Also collate samples and run RowColTargets.from_batch, matching trainer target preparation.",
+    )
+    parser.add_argument(
+        "--prepare-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for --include-prepare-batch. Defaults to config batch_size.",
+    )
+    parser.add_argument(
+        "--prepare-device",
+        default=None,
+        help="Device for --include-prepare-batch. Defaults to cuda when available, otherwise cpu.",
+    )
     parser.add_argument("--start-index", type=int, default=0, help="First dataset index for sequential mode.")
     parser.add_argument(
         "--index-mode",
@@ -135,8 +152,40 @@ def _build_indices(dataset_len: int, args: argparse.Namespace, seed: int) -> lis
     return [(start + i) % dataset_len for i in range(args.samples)]
 
 
-def _profile_samples(dataset: EdtSegDataset, indices: list[int]) -> tuple[float, float]:
+def _collate_with_padding(batch: list[dict]) -> dict:
+    """Mirror trainers.train_rowcol_cond.collate_with_padding without importing trainer deps."""
+    return {
+        "vol": torch.stack([b["vol"] for b in batch]),
+        "cond": torch.stack([b["cond"] for b in batch]),
+        "cond_direction": [b["cond_direction"] for b in batch],
+        "velocity_dir": torch.stack([b["velocity_dir"] for b in batch]),
+        "velocity_loss_weight": torch.stack([b["velocity_loss_weight"] for b in batch]),
+        "trace_loss_weight": torch.stack([b["trace_loss_weight"] for b in batch]),
+        "cond_gt": torch.stack([b["cond_gt"] for b in batch]),
+        "masked_seg": torch.stack([b["masked_seg"] for b in batch]),
+        "neighbor_seg": torch.stack([b["neighbor_seg"] for b in batch]),
+    }
+
+
+def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
+    return {
+        key: value.to(device, non_blocking=False) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+
+
+def _profile_samples(
+    dataset: EdtSegDataset,
+    indices: list[int],
+    *,
+    config: dict,
+    include_prepare_batch: bool,
+    prepare_batch_size: int,
+    prepare_device: torch.device,
+) -> tuple[float, float, float, float, int]:
     sample_times = []
+    prepare_times = []
+    pending_batch = []
     for idx in indices:
         start = time.perf_counter()
         sample = dataset[idx]
@@ -145,10 +194,40 @@ def _profile_samples(dataset: EdtSegDataset, indices: list[int]) -> tuple[float,
             if torch.is_tensor(value):
                 _ = value.shape
         sample_times.append(time.perf_counter() - start)
+        if not include_prepare_batch:
+            continue
 
-    total = float(sum(sample_times))
-    mean = total / len(sample_times)
-    return total, mean
+        pending_batch.append(sample)
+        if len(pending_batch) < prepare_batch_size:
+            continue
+
+        start = time.perf_counter()
+        batch = _move_batch_to_device(_collate_with_padding(pending_batch), prepare_device)
+        prepared = RowColTargets.from_batch(batch, config)
+        for value in prepared.__dict__.values():
+            if torch.is_tensor(value):
+                _ = value.shape
+        if prepare_device.type == "cuda":
+            torch.cuda.synchronize(prepare_device)
+        prepare_times.append(time.perf_counter() - start)
+        pending_batch = []
+
+    if include_prepare_batch and pending_batch:
+        start = time.perf_counter()
+        batch = _move_batch_to_device(_collate_with_padding(pending_batch), prepare_device)
+        prepared = RowColTargets.from_batch(batch, config)
+        for value in prepared.__dict__.values():
+            if torch.is_tensor(value):
+                _ = value.shape
+        if prepare_device.type == "cuda":
+            torch.cuda.synchronize(prepare_device)
+        prepare_times.append(time.perf_counter() - start)
+
+    sample_total = float(sum(sample_times))
+    sample_mean = sample_total / len(sample_times)
+    prepare_total = float(sum(prepare_times))
+    prepare_mean = prepare_total / len(prepare_times) if prepare_times else 0.0
+    return sample_total, sample_mean, prepare_total, prepare_mean, len(prepare_times)
 
 
 def _print_stats(
@@ -195,9 +274,32 @@ def main() -> None:
         profiler.disable()
 
     indices = _build_indices(len(dataset), args, seed)
+    prepare_batch_size = int(args.prepare_batch_size or config.get("batch_size", 1))
+    if prepare_batch_size <= 0:
+        raise ValueError("--prepare-batch-size must be positive.")
+    prepare_device = torch.device(
+        args.prepare_device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    if args.include_prepare_batch and prepare_device.type != "cuda":
+        raise RuntimeError(
+            "--include-prepare-batch requires a CUDA device because RowColTargets uses cupyx EDT."
+        )
 
     profiler.enable()
-    total_seconds, mean_seconds = _profile_samples(dataset, indices)
+    (
+        total_seconds,
+        mean_seconds,
+        prepare_seconds,
+        mean_prepare_seconds,
+        prepared_batches,
+    ) = _profile_samples(
+        dataset,
+        indices,
+        config=config,
+        include_prepare_batch=bool(args.include_prepare_batch),
+        prepare_batch_size=prepare_batch_size,
+        prepare_device=prepare_device,
+    )
     profiler.disable()
 
     if args.output is not None:
@@ -211,9 +313,18 @@ def main() -> None:
     print(f"index mode: {args.index_mode}")
     print(f"augmentation: {apply_augmentation}")
     print(f"perturbation: {apply_perturbation}")
+    print(f"prepare batch: {args.include_prepare_batch}")
+    if args.include_prepare_batch:
+        print(f"prepare device: {prepare_device}")
+        print(f"prepare batch size: {prepare_batch_size}")
+        print(f"prepared batches: {prepared_batches}")
     print(f"dataset init seconds: {init_seconds:.3f}")
     print(f"sample loop seconds: {total_seconds:.3f}")
     print(f"mean seconds/sample: {mean_seconds:.6f}")
+    if args.include_prepare_batch:
+        print(f"prepare loop seconds: {prepare_seconds:.3f}")
+        print(f"mean seconds/prepared batch: {mean_prepare_seconds:.6f}")
+        print(f"combined sample+prepare seconds: {total_seconds + prepare_seconds:.3f}")
     if args.output is not None:
         print(f"raw profile: {args.output}")
     print()
