@@ -401,18 +401,9 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
 
     const uint8_t paintValue = (_paintMode == PaintMode::Approve) ? 255 : 0;
 
-    // Cylinder brush model:
-    // - Radius = circle in plane views and flattened view
-    // - Depth = cylinder thickness for plane-view hit testing
-    const float brushRadiusNative = _module.approvalMaskBrushRadius();
-
-    // Convert from native voxels to grid units for painting into the QImage
-    float avgScale = 1.0f;
-    if (_surface) {
-        const cv::Vec2f scale = _surface->scale();
-        avgScale = (scale[0] + scale[1]) * 0.5f;
-    }
-    const float gridRadius = brushRadiusNative * avgScale;
+    // Flattened-view strokes are already accumulated in approval-mask image
+    // coordinates, so the radius is also interpreted in mask pixels here.
+    const float brushRadiusMaskPixels = _module.approvalMaskBrushRadius();
 
     float paintRadius;
     float paintWidth = 0.0f;
@@ -427,7 +418,7 @@ void ApprovalMaskBrushTool::paintAccumulatedPointsToImage()
     } else {
         // For segmentation/flattened view strokes: paint a circular 2D brush
         // directly in approval-mask image coordinates.
-        paintRadius = gridRadius;
+        paintRadius = brushRadiusMaskPixels;
         useRectangle = false;
     }
     const float clampedRadius = std::clamp(paintRadius, 0.5f, 500.0f);

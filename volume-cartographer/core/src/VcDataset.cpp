@@ -102,13 +102,17 @@ std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t 
     ensureBloscInitialized();
 
     std::vector<std::byte> output(outputSize);
-    const int rc = blosc2_decompress(input.data(), input.size(), output.data(), outputSize);
+    blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
+    dparams.nthreads = 1;
+    blosc2_context* dctx = blosc2_create_dctx(dparams);
+    const int rc = blosc2_decompress_ctx(dctx, input.data(), input.size(), output.data(), outputSize);
+    blosc2_free_ctx(dctx);
     if (rc < 0) {
         if (input.size() == outputSize) {
             std::memcpy(output.data(), input.data(), outputSize);
             return output;
         }
-        throw std::runtime_error("blosc2_decompress failed with code " + std::to_string(rc));
+        throw std::runtime_error("blosc2_decompress_ctx failed with code " + std::to_string(rc));
     }
     return output;
 }
@@ -545,13 +549,17 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
         case CompressorId::Blosc: {
             ensureBloscInitialized();
-            int ret = blosc2_decompress(compressed.data(), compressed.size(), output, outBytes);
+            blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
+            dparams.nthreads = 1;
+            blosc2_context* dctx = blosc2_create_dctx(dparams);
+            int ret = blosc2_decompress_ctx(dctx, compressed.data(), compressed.size(), output, outBytes);
+            blosc2_free_ctx(dctx);
             if (ret < 0) {
                 if (compressed.size() == outBytes) {
                     std::memcpy(output, compressed.data(), outBytes);
                     break;
                 }
-                throw std::runtime_error("blosc2_decompress failed with code " +
+                throw std::runtime_error("blosc2_decompress_ctx failed with code " +
                                           std::to_string(ret));
             }
             break;

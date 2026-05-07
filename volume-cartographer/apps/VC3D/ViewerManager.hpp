@@ -45,6 +45,7 @@ public:
     VolumeViewerBase* createViewer(const std::string& surfaceName,
                                    const QString& title,
                                    QMdiArea* mdiArea);
+    void unregisterViewer(VolumeViewerBase* viewer);
 
     const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }
 
@@ -118,6 +119,7 @@ public:
 
 signals:
     void baseViewerCreated(VolumeViewerBase* viewer);
+    void baseViewerClosing(VolumeViewerBase* viewer);
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);

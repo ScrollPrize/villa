@@ -47,6 +47,7 @@ private:
     CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
     QMetaObject::Connection _viewerCreatedConn;
+    QMetaObject::Connection _viewerClosingConn;
     QMetaObject::Connection _managerDestroyedConn;
     std::vector<ViewerEntry> _viewers;
 

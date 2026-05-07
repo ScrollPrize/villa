@@ -1775,25 +1775,22 @@ bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
         return false;
     }
 
-    const cv::Vec3f p00 = points.at(row, col);
-    const cv::Vec3f p10 = points.at(row, col + effectiveColStride);
-    const cv::Vec3f p01 = points.at(row + effectiveRowStride, col);
-    const cv::Vec3f p11 = points.at(row + effectiveRowStride, col + effectiveColStride);
-    if (!isValidMappedSurfacePoint(p00) || !isValidMappedSurfacePoint(p10)
-        || !isValidMappedSurfacePoint(p01) || !isValidMappedSurfacePoint(p11)) {
-        return false;
-    }
-
     PatchRecord rec;
     rec.surface = surface;
     rec.mapped = &points;
     rec.i = col;
     rec.j = row;
 
-    cv::Vec3f low{p00};
-    cv::Vec3f high{p00};
+    cv::Vec3f low{std::numeric_limits<float>::max(),
+                  std::numeric_limits<float>::max(),
+                  std::numeric_limits<float>::max()};
+    cv::Vec3f high{std::numeric_limits<float>::lowest(),
+                   std::numeric_limits<float>::lowest(),
+                   std::numeric_limits<float>::lowest()};
+    bool hasValidPoint = false;
     auto extend = [&](const cv::Vec3f& p) {
         if (!isValidMappedSurfacePoint(p)) return;
+        hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
         low[2] = std::min(low[2], p[2]);
@@ -1806,7 +1803,7 @@ bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
             extend(points.at(row + dr, col + dc));
         }
     }
-    if (!isValidBounds(low, high)) {
+    if (!hasValidPoint || !isValidBounds(low, high)) {
         return false;
     }
 
@@ -3075,18 +3072,6 @@ bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
         return false;
     }
 
-    // Tile corners must be valid — that's the contract for visitors that
-    // load corners at tile-stride (e.g. evaluatePatch). Skip the tile
-    // entirely if any corner is the -1.0f sentinel.
-    const cv::Vec3f& p00 = points(row, col);
-    const cv::Vec3f& p10 = points(row, col + effectiveColStride);
-    const cv::Vec3f& p01 = points(row + effectiveRowStride, col);
-    const cv::Vec3f& p11 = points(row + effectiveRowStride, col + effectiveColStride);
-    if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p10)
-        || !isValidSurfacePoint(p01) || !isValidSurfacePoint(p11)) {
-        return false;
-    }
-
     PatchRecord rec;
     rec.surface = surface;
     rec.mapped = nullptr;
@@ -3101,10 +3086,16 @@ bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
     // tiles whose interior actually crosses the plane. Scanning all
     // (effectiveStride+1)² points (≤81 reads per tile at tileStride 8)
     // is paid once at index-build time on the background thread.
-    cv::Vec3f low{p00};
-    cv::Vec3f high{p00};
+    cv::Vec3f low{std::numeric_limits<float>::max(),
+                  std::numeric_limits<float>::max(),
+                  std::numeric_limits<float>::max()};
+    cv::Vec3f high{std::numeric_limits<float>::lowest(),
+                   std::numeric_limits<float>::lowest(),
+                   std::numeric_limits<float>::lowest()};
+    bool hasValidPoint = false;
     auto extend = [&](const cv::Vec3f& p) {
         if (!isValidSurfacePoint(p)) return;
+        hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
         low[2] = std::min(low[2], p[2]);
@@ -3118,7 +3109,7 @@ bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
             extend(rowPtr[dc]);
         }
     }
-    if (!isValidBounds(low, high)) {
+    if (!hasValidPoint || !isValidBounds(low, high)) {
         return false;
     }
 

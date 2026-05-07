@@ -58,8 +58,9 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     // Cache settings
     spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
     {
-        QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
-        edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
+        const QString stored =
+            settings.value(viewer::REMOTE_CACHE_DIR).toString();
+        edtRemoteCachePath->setText(vc3d::remoteCachePath(stored));
     }
 
     // IO threads is no longer user-configurable (tracks hardware_concurrency).
