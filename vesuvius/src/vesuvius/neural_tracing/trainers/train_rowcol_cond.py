@@ -14,7 +14,6 @@ import wandb
 import random
 import accelerate
 import numpy as np
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
@@ -26,14 +25,11 @@ from vesuvius.neural_tracing.datasets.growth_direction import (
     growth_direction_channel_count,
 )
 from vesuvius.neural_tracing.datasets.targets import RowColTargets
-from vesuvius.neural_tracing.loss.displacement_losses import (
-    dense_displacement_loss,
-    velocity_streamline_integration_loss,
-    weighted_vector_smoothness_loss,
-)
+from vesuvius.neural_tracing.loss.trace_losses import compute_trace_losses
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import make_model
+from vesuvius.neural_tracing.trainers.loss_config import TraceLossConfig
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
     make_dense_visualization,
 )
@@ -46,12 +42,6 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
-
-def _zero_loss_from_output(output):
-    for tensor in output.values():
-        return tensor.new_zeros(())
-    raise ValueError("Model returned no output tensors")
 
 
 def resolve_dataloader_context(config):
@@ -192,62 +182,7 @@ def train(config_path):
         if wandb.run is not None:
             config['wandb_run_id'] = wandb.run.id
 
-    lambda_velocity_dir = float(config.get('lambda_velocity_dir', 0.0))
-    lambda_surface_attract = float(config.get('lambda_surface_attract', 0.0))
-    lambda_trace_validity = float(config.get('lambda_trace_validity', 0.0))
-    trace_validity_pos_weight = float(config.get('trace_validity_pos_weight', 1.0))
-    lambda_velocity_smooth = float(config.get('lambda_velocity_smooth', 0.0))
-    lambda_trace_integration = float(config.get('lambda_trace_integration', 0.0))
-    trace_integration_steps = int(config.get('trace_integration_steps', 2))
-    trace_integration_step_size = float(config.get('trace_integration_step_size', 1.0))
-    trace_integration_max_points = int(config.get('trace_integration_max_points', 2048))
-    trace_integration_min_weight = float(config.get('trace_integration_min_weight', 0.5))
-    trace_integration_detach_steps = bool(config.get('trace_integration_detach_steps', False))
-    surface_attract_huber_beta = float(config.get('surface_attract_huber_beta', 5.0))
-    if trace_integration_steps < 0:
-        raise ValueError(f"trace_integration_steps must be >= 0, got {trace_integration_steps}")
-    if trace_integration_step_size < 0.0:
-        raise ValueError(f"trace_integration_step_size must be >= 0, got {trace_integration_step_size}")
-    if trace_integration_max_points < 0:
-        raise ValueError(f"trace_integration_max_points must be >= 0, got {trace_integration_max_points}")
-
-    def compute_velocity_dir_loss(velocity_dir_pred, velocity_dir_target, velocity_loss_weight):
-        if velocity_dir_target is None or velocity_loss_weight is None:
-            raise ValueError("Velocity targets are enabled but missing from the batch")
-        pred = F.normalize(velocity_dir_pred.float(), dim=1, eps=1e-6)
-        target = F.normalize(velocity_dir_target.float(), dim=1, eps=1e-6)
-        dir_diff = 1.0 - (pred * target).sum(dim=1, keepdim=True).clamp(min=-1.0, max=1.0)
-        weight = velocity_loss_weight.float()
-        return (dir_diff * weight).sum() / weight.sum().clamp(min=1.0)
-
-    def compute_surface_attract_loss(surface_attract_pred, surface_attract_target, surface_attract_weight):
-        if surface_attract_pred is None or surface_attract_target is None:
-            raise ValueError("Surface attraction loss is enabled but surface attraction tensors are missing")
-        return dense_displacement_loss(
-            surface_attract_pred,
-            surface_attract_target,
-            sample_weights=surface_attract_weight,
-            loss_type='vector_huber',
-            beta=surface_attract_huber_beta,
-        )
-
-    def compute_trace_validity_loss(trace_validity_pred, trace_validity_target, trace_validity_weight):
-        if trace_validity_pred is None or trace_validity_target is None or trace_validity_weight is None:
-            raise ValueError("Trace validity loss is enabled but validity tensors are missing")
-        target = trace_validity_target.float().clamp(min=0.0, max=1.0)
-        weight = trace_validity_weight.float()
-        pos_weight = torch.tensor(
-            max(trace_validity_pos_weight, 1e-6),
-            device=trace_validity_pred.device,
-            dtype=torch.float32,
-        )
-        diff = F.binary_cross_entropy_with_logits(
-            trace_validity_pred.float(),
-            target,
-            pos_weight=pos_weight,
-            reduction='none',
-        )
-        return (diff * weight).sum() / weight.sum().clamp(min=1.0)
+    loss_config = TraceLossConfig.from_config(config)
 
     def make_generator(offset=0):
         gen = torch.Generator()
@@ -445,24 +380,25 @@ def train(config_path):
         accelerator.print("Growth direction channels: True")
         accelerator.print("Output: velocity_dir (3ch) + surface_attract (3ch) + trace_validity (1ch)")
         accelerator.print(
-            f"Velocity direction loss: lambda={lambda_velocity_dir}, "
+            f"Velocity direction loss: lambda={loss_config.lambda_velocity_dir}, "
             f"dilation={config.get('trace_target_dilation_radius')}"
         )
-        if lambda_velocity_smooth > 0.0:
+        if loss_config.lambda_velocity_smooth > 0.0:
             accelerator.print(
-                f"Velocity smoothness loss: lambda={lambda_velocity_smooth}, "
-                f"normalize={config.get('velocity_smooth_normalize')}"
+                f"Velocity smoothness loss: lambda={loss_config.lambda_velocity_smooth}, "
+                f"normalize={loss_config.velocity_smooth_normalize}"
             )
-        if lambda_trace_integration > 0.0:
+        if loss_config.lambda_trace_integration > 0.0:
             accelerator.print(
-                f"Trace integration loss: lambda={lambda_trace_integration}, "
-                f"steps={trace_integration_steps}, step_size={trace_integration_step_size}, "
-                f"max_points={trace_integration_max_points}, "
-                f"detach_steps={trace_integration_detach_steps}"
+                f"Trace integration loss: lambda={loss_config.lambda_trace_integration}, "
+                f"steps={loss_config.trace_integration_steps}, "
+                f"step_size={loss_config.trace_integration_step_size}, "
+                f"max_points={loss_config.trace_integration_max_points}, "
+                f"detach_steps={loss_config.trace_integration_detach_steps}"
             )
         accelerator.print(
-            f"Trace ODE losses: lambda_attract={lambda_surface_attract}, "
-            f"lambda_validity={lambda_trace_validity}, "
+            f"Trace ODE losses: lambda_attract={loss_config.lambda_surface_attract}, "
+            f"lambda_validity={loss_config.lambda_trace_validity}, "
             f"dilation={config.get('trace_target_dilation_radius')}, "
             f"attract_mode=trace_band, "
             f"attract_radius={config.get('trace_surface_attract_radius')}"
@@ -520,62 +456,16 @@ def train(config_path):
             # Forward pass
             output = model(inputs)
             grad_norm = None
-            total_loss = _zero_loss_from_output(output)
-
-            if lambda_velocity_dir > 0.0:
-                velocity_dir_loss = compute_velocity_dir_loss(
-                    output['velocity_dir'],
-                    velocity_dir_target,
-                    velocity_loss_weight,
-                )
-                weighted_velocity_dir_loss = lambda_velocity_dir * velocity_dir_loss
-                total_loss = total_loss + weighted_velocity_dir_loss
-                wandb_log['velocity_dir_loss'] = weighted_velocity_dir_loss.detach().item()
-
-            if lambda_velocity_smooth > 0.0:
-                velocity_smooth_loss = weighted_vector_smoothness_loss(
-                    output['velocity_dir'],
-                    sample_weights=velocity_loss_weight,
-                    normalize_vectors=bool(config.get('velocity_smooth_normalize', True)),
-                )
-                weighted_velocity_smooth_loss = lambda_velocity_smooth * velocity_smooth_loss
-                total_loss = total_loss + weighted_velocity_smooth_loss
-                wandb_log['velocity_smooth_loss'] = weighted_velocity_smooth_loss.detach().item()
-
-            if lambda_trace_integration > 0.0:
-                trace_integration_loss = velocity_streamline_integration_loss(
-                    output['velocity_dir'],
-                    velocity_dir_target,
-                    velocity_loss_weight,
-                    steps=trace_integration_steps,
-                    step_size=trace_integration_step_size,
-                    max_points=trace_integration_max_points,
-                    min_weight=trace_integration_min_weight,
-                    detach_steps=trace_integration_detach_steps,
-                    random_sample=True,
-                )
-                weighted_trace_integration_loss = lambda_trace_integration * trace_integration_loss
-                total_loss = total_loss + weighted_trace_integration_loss
-                wandb_log['trace_integration_loss'] = weighted_trace_integration_loss.detach().item()
-
-            if lambda_surface_attract > 0.0:
-                surface_attract_loss = compute_surface_attract_loss(
-                    output.get('surface_attract'),
-                    surface_attract_target,
-                    surface_attract_weight,
-                )
-                weighted_surface_attract_loss = lambda_surface_attract * surface_attract_loss
-                total_loss = total_loss + weighted_surface_attract_loss
-                wandb_log['surface_attract_loss'] = weighted_surface_attract_loss.detach().item()
-            if lambda_trace_validity > 0.0:
-                trace_validity_loss = compute_trace_validity_loss(
-                    output.get('trace_validity'),
-                    trace_validity_target,
-                    trace_validity_weight,
-                )
-                weighted_trace_validity_loss = lambda_trace_validity * trace_validity_loss
-                total_loss = total_loss + weighted_trace_validity_loss
-                wandb_log['trace_validity_loss'] = weighted_trace_validity_loss.detach().item()
+            total_loss, loss_metrics = compute_trace_losses(
+                output,
+                prepared,
+                loss_config,
+                random_trace_sample=True,
+            )
+            wandb_log.update({
+                key: value.detach().item()
+                for key, value in loss_metrics.items()
+            })
 
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
@@ -605,15 +495,15 @@ def train(config_path):
         postfix = {
             'loss': f"{wandb_log['loss']:.4f}",
         }
-        if lambda_velocity_dir > 0.0:
+        if loss_config.lambda_velocity_dir > 0.0:
             postfix['vel_dir'] = f"{wandb_log['velocity_dir_loss']:.4f}"
-        if lambda_velocity_smooth > 0.0:
+        if loss_config.lambda_velocity_smooth > 0.0:
             postfix['vel_smooth'] = f"{wandb_log['velocity_smooth_loss']:.4f}"
-        if lambda_trace_integration > 0.0:
+        if loss_config.lambda_trace_integration > 0.0:
             postfix['trace_int'] = f"{wandb_log['trace_integration_loss']:.4f}"
-        if lambda_surface_attract > 0.0:
+        if loss_config.lambda_surface_attract > 0.0:
             postfix['attract'] = f"{wandb_log['surface_attract_loss']:.4f}"
-        if lambda_trace_validity > 0.0:
+        if loss_config.lambda_trace_validity > 0.0:
             postfix['valid'] = f"{wandb_log['trace_validity_loss']:.4f}"
         progress_bar.set_postfix(postfix)
         progress_bar.update(1)
@@ -632,15 +522,15 @@ def train(config_path):
                 val_metric_sums = {
                     'val_loss': 0.0,
                 }
-                if lambda_velocity_dir > 0.0:
+                if loss_config.lambda_velocity_dir > 0.0:
                     val_metric_sums['val_velocity_dir_loss'] = 0.0
-                if lambda_velocity_smooth > 0.0:
+                if loss_config.lambda_velocity_smooth > 0.0:
                     val_metric_sums['val_velocity_smooth_loss'] = 0.0
-                if lambda_trace_integration > 0.0:
+                if loss_config.lambda_trace_integration > 0.0:
                     val_metric_sums['val_trace_integration_loss'] = 0.0
-                if lambda_surface_attract > 0.0:
+                if loss_config.lambda_surface_attract > 0.0:
                     val_metric_sums['val_surface_attract_loss'] = 0.0
-                if lambda_trace_validity > 0.0:
+                if loss_config.lambda_trace_validity > 0.0:
                     val_metric_sums['val_trace_validity_loss'] = 0.0
 
                 first_val_vis = None
@@ -655,62 +545,14 @@ def train(config_path):
 
                     with accelerator.autocast():
                         val_output = eval_forward_model(val_prepared.inputs)
-                    val_total_loss = _zero_loss_from_output(val_output)
-
-                    if lambda_velocity_dir > 0.0:
-                        val_velocity_dir_loss = compute_velocity_dir_loss(
-                            val_output['velocity_dir'],
-                            val_prepared.velocity_dir,
-                            val_prepared.velocity_loss_weight,
-                        )
-                        val_weighted_velocity_dir_loss = lambda_velocity_dir * val_velocity_dir_loss
-                        val_total_loss = val_total_loss + val_weighted_velocity_dir_loss
-                        val_metric_sums['val_velocity_dir_loss'] += val_weighted_velocity_dir_loss.item()
-
-                    if lambda_velocity_smooth > 0.0:
-                        val_velocity_smooth_loss = weighted_vector_smoothness_loss(
-                            val_output['velocity_dir'],
-                            sample_weights=val_prepared.velocity_loss_weight,
-                            normalize_vectors=bool(config.get('velocity_smooth_normalize', True)),
-                        )
-                        val_weighted_velocity_smooth_loss = lambda_velocity_smooth * val_velocity_smooth_loss
-                        val_total_loss = val_total_loss + val_weighted_velocity_smooth_loss
-                        val_metric_sums['val_velocity_smooth_loss'] += val_weighted_velocity_smooth_loss.item()
-
-                    if lambda_trace_integration > 0.0:
-                        val_trace_integration_loss = velocity_streamline_integration_loss(
-                            val_output['velocity_dir'],
-                            val_prepared.velocity_dir,
-                            val_prepared.velocity_loss_weight,
-                            steps=trace_integration_steps,
-                            step_size=trace_integration_step_size,
-                            max_points=trace_integration_max_points,
-                            min_weight=trace_integration_min_weight,
-                            detach_steps=trace_integration_detach_steps,
-                            random_sample=False,
-                        )
-                        val_weighted_trace_integration_loss = lambda_trace_integration * val_trace_integration_loss
-                        val_total_loss = val_total_loss + val_weighted_trace_integration_loss
-                        val_metric_sums['val_trace_integration_loss'] += val_weighted_trace_integration_loss.item()
-
-                    if lambda_surface_attract > 0.0:
-                        val_surface_attract_loss = compute_surface_attract_loss(
-                            val_output.get('surface_attract'),
-                            val_prepared.surface_attract,
-                            val_prepared.surface_attract_weight,
-                        )
-                        val_weighted_surface_attract_loss = lambda_surface_attract * val_surface_attract_loss
-                        val_total_loss = val_total_loss + val_weighted_surface_attract_loss
-                        val_metric_sums['val_surface_attract_loss'] += val_weighted_surface_attract_loss.item()
-                    if lambda_trace_validity > 0.0:
-                        val_trace_validity_loss = compute_trace_validity_loss(
-                            val_output.get('trace_validity'),
-                            val_prepared.trace_validity,
-                            val_prepared.trace_validity_weight,
-                        )
-                        val_weighted_trace_validity_loss = lambda_trace_validity * val_trace_validity_loss
-                        val_total_loss = val_total_loss + val_weighted_trace_validity_loss
-                        val_metric_sums['val_trace_validity_loss'] += val_weighted_trace_validity_loss.item()
+                    val_total_loss, val_metrics = compute_trace_losses(
+                        val_output,
+                        val_prepared,
+                        loss_config,
+                        random_trace_sample=False,
+                    )
+                    for key, value in val_metrics.items():
+                        val_metric_sums[f'val_{key}'] += value.item()
 
                     val_metric_sums['val_loss'] += val_total_loss.item()
 
