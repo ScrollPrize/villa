@@ -2,12 +2,13 @@ import numpy as np
 from scipy import ndimage
 
 from vesuvius.neural_tracing.datasets.direction_helpers import (
-    build_away_from_conditioning_trace_targets,
+    build_split_surface_masks_and_trace_targets,
     _compute_surface_tangent_axis,
     _scatter_trace_line_numba,
     _scatter_trace_point_numba,
     _velocity_axis_and_sign,
 )
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
 
 
 def _reference_surface_velocity_vectors(surface_grid: np.ndarray, cond_direction: str):
@@ -226,141 +227,57 @@ def test_scatter_trace_point_matches_zero_length_line_with_surface_attract():
     np.testing.assert_array_equal(point_best_dist, line_best_dist)
 
 
-def test_logical_trace_surfaces_match_concatenated_surface():
-    rng = np.random.default_rng(456)
-    crop_size = (19, 20, 21)
-    rows, cols_a, cols_b = 9, 4, 5
+def test_split_surface_masks_and_trace_targets_match_reference():
+    rng = np.random.default_rng(2468)
+    crop_size = (23, 24, 25)
+    rows_a, rows_b, cols_a, cols_b = 4, 5, 5, 6
+    rows = rows_a + rows_b
+    cols = cols_a + cols_b
     rr, cc = np.meshgrid(
         np.arange(rows, dtype=np.float32),
-        np.arange(cols_a + cols_b, dtype=np.float32),
-        indexing="ij",
-    )
-    surface = np.stack(
-        [
-            4.0 + 0.2 * rr,
-            5.0 + 0.5 * rr,
-            6.0 + 0.5 * cc,
-        ],
-        axis=-1,
-    ).astype(np.float32)
-    surface += rng.normal(scale=0.05, size=surface.shape).astype(np.float32)
-    surface[3, 2] = np.nan
-    surface[6, 5] = np.inf
-    surface_a = surface[:, :cols_a]
-    surface_b = surface[:, cols_a:]
-
-    concatenated = build_away_from_conditioning_trace_targets(
-        crop_size,
-        "left",
-        cond_surface_local=surface,
-        dilation_radius=0.0,
-        surface_attract_radius=0.0,
-    )
-    logical = build_away_from_conditioning_trace_targets(
-        crop_size,
-        "left",
-        trace_surfaces_local=(surface_a, surface_b),
-        trace_concat_axis=1,
-        dilation_radius=0.0,
-        surface_attract_radius=0.0,
-    )
-
-    assert concatenated is not None
-    assert logical is not None
-    np.testing.assert_array_equal(logical["velocity_dir"], concatenated["velocity_dir"])
-    np.testing.assert_array_equal(logical["trace_loss_weight"], concatenated["trace_loss_weight"])
-
-
-def test_logical_trace_surfaces_match_concatenated_surface_axis0():
-    rng = np.random.default_rng(789)
-    crop_size = (23, 24, 25)
-    rows_a, rows_b, cols = 4, 6, 8
-    rr, cc = np.meshgrid(
-        np.arange(rows_a + rows_b, dtype=np.float32),
         np.arange(cols, dtype=np.float32),
         indexing="ij",
     )
     surface = np.stack(
         [
-            6.0 + 0.4 * rr,
-            7.0 + 0.3 * rr,
-            8.0 + 0.5 * cc,
+            6.0 + 0.25 * rr + 0.08 * cc,
+            7.0 + 0.35 * rr,
+            8.0 + 0.45 * cc,
         ],
         axis=-1,
     ).astype(np.float32)
-    surface += rng.normal(scale=0.05, size=surface.shape).astype(np.float32)
-    surface[2, 3] = np.nan
-    surface[7, 4] = np.inf
-    surface_a = surface[:rows_a]
-    surface_b = surface[rows_a:]
+    surface += rng.normal(scale=0.025, size=surface.shape).astype(np.float32)
 
-    concatenated = build_away_from_conditioning_trace_targets(
-        crop_size,
-        "up",
-        cond_surface_local=surface,
-        dilation_radius=0.0,
-        surface_attract_radius=0.0,
-    )
-    logical = build_away_from_conditioning_trace_targets(
-        crop_size,
-        "up",
-        trace_surfaces_local=(surface_a, surface_b),
-        trace_concat_axis=0,
-        dilation_radius=0.0,
-        surface_attract_radius=0.0,
+    col_cond_surface = surface[:, :cols_a]
+    col_masked_surface = surface[:, cols_a:]
+    row_cond_surface = surface[:rows_a]
+    row_masked_surface = surface[rows_a:]
+
+    cases = (
+        ("left", col_cond_surface, col_masked_surface, np.concatenate([col_cond_surface, col_masked_surface], axis=1)),
+        ("right", col_cond_surface, col_masked_surface, np.concatenate([col_masked_surface, col_cond_surface], axis=1)),
+        ("up", row_cond_surface, row_masked_surface, np.concatenate([row_cond_surface, row_masked_surface], axis=0)),
+        ("down", row_cond_surface, row_masked_surface, np.concatenate([row_masked_surface, row_cond_surface], axis=0)),
     )
 
-    assert concatenated is not None
-    assert logical is not None
-    np.testing.assert_array_equal(logical["velocity_dir"], concatenated["velocity_dir"])
-    np.testing.assert_array_equal(logical["trace_loss_weight"], concatenated["trace_loss_weight"])
+    for cond_direction, cond_surface, masked_surface, reference_surface in cases:
+        reference = _reference_build_trace_targets(
+            crop_size,
+            cond_direction,
+            reference_surface,
+            dilation_radius=0.0,
+            surface_attract_radius=0.0,
+        )
+        fused = build_split_surface_masks_and_trace_targets(
+            crop_size,
+            cond_direction,
+            cond_surface_local=cond_surface,
+            masked_surface_local=masked_surface,
+        )
 
-
-def test_logical_trace_surfaces_match_reference_with_dilation_and_surface_attract():
-    rng = np.random.default_rng(987)
-    crop_size = (24, 25, 26)
-    rows, cols_a, cols_b = 8, 5, 6
-    rr, cc = np.meshgrid(
-        np.arange(rows, dtype=np.float32),
-        np.arange(cols_a + cols_b, dtype=np.float32),
-        indexing="ij",
-    )
-    surface = np.stack(
-        [
-            7.0 + 0.25 * rr + 0.10 * cc,
-            8.0 + 0.45 * rr,
-            9.0 + 0.55 * cc,
-        ],
-        axis=-1,
-    ).astype(np.float32)
-    surface += rng.normal(scale=0.03, size=surface.shape).astype(np.float32)
-    surface[2, 4] = np.nan
-    surface[6, 7] = np.inf
-    surface_a = surface[:, :cols_a]
-    surface_b = surface[:, cols_a:]
-
-    reference = _reference_build_trace_targets(
-        crop_size,
-        "left",
-        surface,
-        dilation_radius=2.0,
-        surface_attract_radius=1.5,
-    )
-    logical = build_away_from_conditioning_trace_targets(
-        crop_size,
-        "left",
-        trace_surfaces_local=(surface_a, surface_b),
-        trace_concat_axis=1,
-        dilation_radius=2.0,
-        surface_attract_radius=1.5,
-    )
-
-    assert reference is not None
-    assert logical is not None
-    for key in (
-        "velocity_dir",
-        "trace_loss_weight",
-        "surface_attract",
-        "surface_attract_weight",
-    ):
-        np.testing.assert_array_equal(logical[key], reference[key])
+        assert reference is not None
+        assert fused is not None
+        np.testing.assert_array_equal(fused["cond_gt"], voxelize_surface_grid(cond_surface, crop_size))
+        np.testing.assert_array_equal(fused["masked_seg"], voxelize_surface_grid(masked_surface, crop_size))
+        np.testing.assert_array_equal(fused["velocity_dir"], reference["velocity_dir"])
+        np.testing.assert_array_equal(fused["trace_loss_weight"], reference["trace_loss_weight"])

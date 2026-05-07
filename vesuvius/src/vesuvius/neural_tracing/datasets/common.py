@@ -1112,21 +1112,17 @@ def _draw_line_3d(volume: np.ndarray, z0: int, y0: int, x0: int, z1: int, y1: in
 
 
 @njit
-def voxelize_surface_grid(
+def voxelize_surface_grid_into(
+    volume: np.ndarray,
     zyx_grid: np.ndarray,
-    crop_size: tuple,
-) -> np.ndarray:
+):
     """
-    Voxelize a 2D grid of 3D points by drawing lines between adjacent points.
+    Voxelize a 2D grid of 3D points into an existing volume.
 
     Args:
+        volume: (D, H, W) output volume to mutate in-place
         zyx_grid: (H, W, 3) array of ZYX coordinates in local crop space
-        crop_size: (D, H, W) shape of output volume
-
-    Returns:
-        (D, H, W) uint8 binary volume with lines connecting adjacent grid points
     """
-    volume = np.zeros(crop_size, dtype=np.uint8)
     n_rows, n_cols = zyx_grid.shape[0], zyx_grid.shape[1]
 
     # Draw horizontal lines (between adjacent columns)
@@ -1151,6 +1147,24 @@ def voxelize_surface_grid(
             x1 = int(round(zyx_grid[r + 1, c, 2]))
             _draw_line_3d(volume, z0, y0, x0, z1, y1, x1)
 
+
+@njit
+def voxelize_surface_grid(
+    zyx_grid: np.ndarray,
+    crop_size: tuple,
+) -> np.ndarray:
+    """
+    Voxelize a 2D grid of 3D points by drawing lines between adjacent points.
+
+    Args:
+        zyx_grid: (H, W, 3) array of ZYX coordinates in local crop space
+        crop_size: (D, H, W) shape of output volume
+
+    Returns:
+        (D, H, W) uint8 binary volume with lines connecting adjacent grid points
+    """
+    volume = np.zeros(crop_size, dtype=np.uint8)
+    voxelize_surface_grid_into(volume, zyx_grid)
     return volume
 
 @njit

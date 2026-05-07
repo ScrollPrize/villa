@@ -20,10 +20,11 @@ from vesuvius.neural_tracing.datasets.common import (
     _validate_result_tensors,
     open_zarr_group,
     voxelize_surface_grid,
+    voxelize_surface_grid_into,
 )
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.neural_tracing.datasets.direction_helpers import (
-    build_away_from_conditioning_trace_targets,
+    build_split_surface_masks_and_trace_targets,
 )
 from vesuvius.neural_tracing.datasets.augmentation import (
     augment_split_payload,
@@ -451,15 +452,10 @@ class EdtSegDataset(Dataset):
 
         crop_shape = target_shape
 
-        # voxelize with line interpolation between adjacent grid points
-        cond_segmentation_gt = voxelize_surface_grid(cond_zyxs_unperturbed_local_float, crop_shape)
+        # Split masks are generated after spatial augmentation from the same
+        # ordered surfaces used for trace targets.
         record_stage("cond_voxelize")
-        masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
         record_stage("masked_voxelize")
-
-        # make sure we actually have some conditioning
-        if not cond_segmentation_gt.any():
-            return None
 
         neighbor_start = time.perf_counter() if stage_times is not None else 0.0
         neighbor_segmentation = self._build_neighbor_sheet_mask(
@@ -478,10 +474,8 @@ class EdtSegDataset(Dataset):
 
         result = {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
-            "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
-            "cond_gt": torch.from_numpy(cond_segmentation_gt).to(torch.float32),
-            "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float).to(torch.float32),
-            "masked_surface_local": torch.from_numpy(masked_zyxs_local_float).to(torch.float32),
+            "cond_surface_local": cond_zyxs_unperturbed_local_float,
+            "masked_surface_local": masked_zyxs_local_float,
             "cond_direction": cond_direction,
         }
         result["neighbor_seg"] = torch.from_numpy(neighbor_segmentation).to(torch.float32)
@@ -514,7 +508,7 @@ class EdtSegDataset(Dataset):
             if neighbor_surface is None:
                 return None
             neighbor_local = (neighbor_surface - min_corner).astype(np.float32, copy=False)
-            neighbor_vox = np.maximum(neighbor_vox, voxelize_surface_grid(neighbor_local, crop_shape))
+            voxelize_surface_grid_into(neighbor_vox, neighbor_local)
             if stage_times is not None:
                 voxel_done = time.perf_counter()
                 stage_times["neighbor_voxelize"] += voxel_done - extract_done
@@ -570,12 +564,16 @@ class EdtSegDataset(Dataset):
             )
 
         vol_crop = mask_bundle["vol"]
-        masked_seg = mask_bundle["masked_seg"]
-        cond_seg_gt = mask_bundle["cond_gt"]
         cond_direction = mask_bundle["cond_direction"]
         neighbor_seg_tensor = mask_bundle["neighbor_seg"]
+        cond_surface_source = mask_bundle.get("cond_surface_local")
+        masked_surface_source = mask_bundle.get("masked_surface_local")
+        if isinstance(cond_surface_source, np.ndarray):
+            cond_surface_source = torch.from_numpy(cond_surface_source).to(torch.float32)
+        if isinstance(masked_surface_source, np.ndarray):
+            masked_surface_source = torch.from_numpy(masked_surface_source).to(torch.float32)
         cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
-            _prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
+            _prepare_cond_surface_keypoints(cond_surface_source)
         )
         if not valid_cond_surface:
             return self._resample_item(
@@ -586,7 +584,7 @@ class EdtSegDataset(Dataset):
                 attempted_indices=_attempted_indices,
             )
         masked_surface_local, masked_surface_shape, masked_surface_keypoints, valid_masked_surface = (
-            _prepare_cond_surface_keypoints(mask_bundle.get("masked_surface_local"))
+            _prepare_cond_surface_keypoints(masked_surface_source)
         )
         if not valid_masked_surface:
             return self._resample_item(
@@ -601,8 +599,8 @@ class EdtSegDataset(Dataset):
             augmentations=self._augmentations,
             crop_size=self.crop_size,
             vol_crop=vol_crop,
-            masked_seg=masked_seg,
-            cond_seg_gt=cond_seg_gt,
+            masked_seg=None,
+            cond_seg_gt=None,
             cond_surface_local=cond_surface_local,
             cond_surface_keypoints=cond_surface_keypoints,
             cond_surface_shape=cond_surface_shape,
@@ -613,11 +611,27 @@ class EdtSegDataset(Dataset):
             neighbor_seg_tensor=neighbor_seg_tensor,
         )
         vol_crop = split_augmented["vol_crop"]
-        masked_seg = split_augmented["masked_seg"]
-        cond_seg_gt = split_augmented["cond_seg_gt"]
         cond_surface_local = split_augmented["cond_surface_local"]
         masked_surface_local = split_augmented["masked_surface_local"]
         neighbor_seg_tensor = split_augmented.get("neighbor_seg_tensor", neighbor_seg_tensor)
+        cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+        masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+        fused_payload = build_split_surface_masks_and_trace_targets(
+            self.crop_size,
+            cond_direction,
+            cond_surface_local=cond_surface_np,
+            masked_surface_local=masked_surface_np,
+        )
+        if fused_payload is None or not bool(fused_payload["cond_gt"].any()):
+            return self._resample_item(
+                idx,
+                "split surface targets unavailable",
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+        masked_seg = torch.from_numpy(fused_payload["masked_seg"]).to(torch.float32)
+        cond_seg_gt = torch.from_numpy(fused_payload["cond_gt"]).to(torch.float32)
         if self._cond_local_perturb_active and cond_surface_local is not None:
             cond_seg = self._conditioning_from_surface(
                 cond_surface_local=cond_surface_local,
@@ -643,49 +657,9 @@ class EdtSegDataset(Dataset):
         }
 
         result["neighbor_seg"] = neighbor_seg_tensor
-        cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
-        masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
-        if cond_direction == "left":
-            trace_surfaces_np = (cond_surface_np, masked_surface_np)
-            trace_concat_axis = 1
-        elif cond_direction == "right":
-            trace_surfaces_np = (masked_surface_np, cond_surface_np)
-            trace_concat_axis = 1
-        elif cond_direction == "up":
-            trace_surfaces_np = (cond_surface_np, masked_surface_np)
-            trace_concat_axis = 0
-        elif cond_direction == "down":
-            trace_surfaces_np = (masked_surface_np, cond_surface_np)
-            trace_concat_axis = 0
-        else:
-            trace_surfaces_np = None
-            trace_concat_axis = None
-        trace_payload = build_away_from_conditioning_trace_targets(
-            self.crop_size,
-            cond_direction,
-            trace_surfaces_local=trace_surfaces_np,
-            trace_concat_axis=trace_concat_axis,
-            # RowColTargets.from_batch applies trace dilation and surface-attract
-            # EDT on-device after collation. The dataset only needs to emit the
-            # sparse source trace mask/direction.
-            dilation_radius=0.0,
-            surface_attract_radius=0.0,
-        )
-        if trace_payload is None:
-            return self._resample_item(
-                idx,
-                "split trace target unavailable",
-                patch_idx=patch_idx,
-                wrap_idx=wrap_idx,
-                attempted_indices=_attempted_indices,
-            )
-        result["velocity_dir"] = torch.from_numpy(trace_payload["velocity_dir"]).to(torch.float32)
-        result["velocity_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
-        result["trace_loss_weight"] = torch.from_numpy(trace_payload["trace_loss_weight"]).to(torch.float32)
-        if "surface_attract" in trace_payload:
-            result["surface_attract"] = torch.from_numpy(trace_payload["surface_attract"]).to(torch.float32)
-        if "surface_attract_weight" in trace_payload:
-            result["surface_attract_weight"] = torch.from_numpy(trace_payload["surface_attract_weight"]).to(torch.float32)
+        result["velocity_dir"] = torch.from_numpy(fused_payload["velocity_dir"]).to(torch.float32)
+        result["velocity_loss_weight"] = torch.from_numpy(fused_payload["trace_loss_weight"]).to(torch.float32)
+        result["trace_loss_weight"] = torch.from_numpy(fused_payload["trace_loss_weight"]).to(torch.float32)
 
         if not _validate_result_tensors(
             result,

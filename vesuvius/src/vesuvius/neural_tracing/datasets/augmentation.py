@@ -86,17 +86,24 @@ def augment_split_payload(
             "neighbor_seg_tensor": neighbor_seg_tensor,
         }
 
-    seg_tensors = [masked_seg, cond_seg_gt]
-    seg_keys = ["masked_seg", "cond_seg_gt"]
+    seg_tensors = []
+    seg_keys = []
+    if masked_seg is not None:
+        seg_tensors.append(masked_seg)
+        seg_keys.append("masked_seg")
+    if cond_seg_gt is not None:
+        seg_tensors.append(cond_seg_gt)
+        seg_keys.append("cond_seg_gt")
     if neighbor_seg_tensor is not None:
         seg_tensors.append(neighbor_seg_tensor)
         seg_keys.append("neighbor_seg_tensor")
 
     aug_kwargs = {
         "image": vol_crop[None],
-        "segmentation": torch.stack(seg_tensors, dim=0),
         "crop_shape": crop_size,
     }
+    if seg_tensors:
+        aug_kwargs["segmentation"] = torch.stack(seg_tensors, dim=0)
     keypoint_parts = []
     cond_keypoint_count = 0
     if cond_surface_keypoints is not None:
@@ -111,8 +118,9 @@ def augment_split_payload(
     vol_crop = augmented["image"].squeeze(0)
 
     unpacked = {}
-    for i, key in enumerate(seg_keys):
-        unpacked[key] = augmented["segmentation"][i]
+    if seg_tensors:
+        for i, key in enumerate(seg_keys):
+            unpacked[key] = augmented["segmentation"][i]
 
     if keypoint_parts:
         augmented_keypoints = augmented.get("keypoints")
@@ -140,8 +148,8 @@ def augment_split_payload(
 
     return {
         "vol_crop": vol_crop,
-        "masked_seg": unpacked["masked_seg"],
-        "cond_seg_gt": unpacked["cond_seg_gt"],
+        "masked_seg": unpacked.get("masked_seg", masked_seg),
+        "cond_seg_gt": unpacked.get("cond_seg_gt", cond_seg_gt),
         "cond_surface_local": cond_surface_local,
         "masked_surface_local": masked_surface_local,
         "neighbor_seg_tensor": unpacked.get("neighbor_seg_tensor", neighbor_seg_tensor),

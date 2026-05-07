@@ -1,6 +1,7 @@
 import numpy as np
 from numba import njit
-from scipy import ndimage
+
+from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_into
 
 
 def _estimate_mean_unit_direction_from_field(disp_np: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
@@ -624,43 +625,30 @@ def _scatter_logical_trace_surface_numba(
             )
 
 
-def _scatter_logical_trace_surface(
+@njit
+def _voxelize_split_surfaces_and_scatter_trace_numba(
+    cond_mask: np.ndarray,
+    masked_mask: np.ndarray,
     velocity_accum: np.ndarray,
     weights: np.ndarray,
+    cond_surface: np.ndarray,
+    masked_surface: np.ndarray,
     surface_a: np.ndarray,
-    *,
-    surface_b: np.ndarray | None = None,
-    concat_axis: int = 0,
+    surface_b: np.ndarray,
+    concat_axis: int,
     tangent_axis: int,
     tangent_sign: float,
-    surface_attract: np.ndarray | None = None,
-    surface_attract_weight: np.ndarray | None = None,
-    surface_attract_best_dist_sq: np.ndarray | None = None,
-    surface_attract_radius: float = 0.0,
-) -> None:
-    enable_surface_attract = (
-        surface_attract is not None
-        and surface_attract_weight is not None
-        and surface_attract_best_dist_sq is not None
-        and surface_attract_radius > 0.0
-    )
-    if not enable_surface_attract:
-        surface_attract = np.zeros((3, 1, 1, 1), dtype=np.float32)
-        surface_attract_weight = np.zeros((1, 1, 1), dtype=np.float32)
-        surface_attract_best_dist_sq = np.zeros((1, 1, 1), dtype=np.float32)
-    has_b = surface_b is not None
-    if surface_b is None:
-        surface_b = np.zeros((1, 1, 3), dtype=np.float32)
-    if has_b:
-        if int(concat_axis) == 0:
-            rows = int(surface_a.shape[0] + surface_b.shape[0])
-            cols = int(surface_a.shape[1])
-        else:
-            rows = int(surface_a.shape[0])
-            cols = int(surface_a.shape[1] + surface_b.shape[1])
+):
+    voxelize_surface_grid_into(cond_mask, cond_surface)
+    voxelize_surface_grid_into(masked_mask, masked_surface)
+
+    if int(concat_axis) == 0:
+        rows = int(surface_a.shape[0] + surface_b.shape[0])
+        cols = int(surface_a.shape[1])
     else:
         rows = int(surface_a.shape[0])
-        cols = int(surface_a.shape[1])
+        cols = int(surface_a.shape[1] + surface_b.shape[1])
+
     vectors = np.zeros((rows, cols, 3), dtype=np.float32)
     valid = np.zeros((rows, cols), dtype=np.bool_)
     _fill_logical_surface_vectors_numba(
@@ -668,126 +656,102 @@ def _scatter_logical_trace_surface(
         valid,
         surface_a,
         surface_b,
-        has_b,
+        True,
         int(concat_axis),
         int(tangent_axis),
         float(tangent_sign),
     )
     if not bool(valid.any()):
-        return
+        return False
+
+    surface_attract = np.zeros((3, 1, 1, 1), dtype=np.float32)
+    surface_attract_weight = np.zeros((1, 1, 1), dtype=np.float32)
+    surface_attract_best_dist_sq = np.zeros((1, 1, 1), dtype=np.float32)
     _scatter_logical_trace_surface_numba(
         velocity_accum,
         weights,
         surface_a,
         surface_b,
-        has_b,
+        True,
         int(concat_axis),
         vectors,
         valid,
         surface_attract,
         surface_attract_weight,
         surface_attract_best_dist_sq,
-        enable_surface_attract,
-        surface_attract_radius,
+        False,
+        0.0,
     )
+    return True
 
 
-def build_away_from_conditioning_trace_targets(
+def build_split_surface_masks_and_trace_targets(
     crop_size,
     cond_direction: str,
     *,
-    cond_surface_local: np.ndarray | None = None,
-    masked_surface_local: np.ndarray | None = None,
-    include_conditioning: bool = True,
-    include_masked: bool = True,
-    dilation_radius: float = 0.0,
-    surface_attract_radius: float = 0.0,
-    trace_surfaces_local: tuple[np.ndarray, ...] | None = None,
-    trace_concat_axis: int | None = None,
+    cond_surface_local: np.ndarray,
+    masked_surface_local: np.ndarray,
 ) -> dict[str, np.ndarray] | None:
-    """Build ODE-style trace supervision from ordered surface-grid coordinates.
+    """Build split masks and sparse trace targets from split ordered surfaces.
 
-    The velocity is the unit away-from-conditioning tangent. Optional surface
-    attraction stores nearest-surface vectors in a trace-local band.
+    This matches separately voxelizing the two split masks and then scattering
+    sparse trace targets over their logical concatenation, while avoiding
+    separate full-volume temporaries for the split masks.
     """
     crop_size = tuple(int(v) for v in crop_size)
     if len(crop_size) != 3:
         raise ValueError(f"crop_size must have length 3, got {crop_size!r}")
 
+    cond_surface = np.asarray(cond_surface_local, dtype=np.float32)
+    masked_surface = np.asarray(masked_surface_local, dtype=np.float32)
+    if cond_surface.ndim != 3 or cond_surface.shape[2] != 3:
+        raise ValueError(f"cond_surface_local must have shape (H, W, 3), got {tuple(cond_surface.shape)}")
+    if masked_surface.ndim != 3 or masked_surface.shape[2] != 3:
+        raise ValueError(f"masked_surface_local must have shape (H, W, 3), got {tuple(masked_surface.shape)}")
+
+    direction = str(cond_direction).lower()
+    if direction == "left":
+        surface_a = cond_surface
+        surface_b = masked_surface
+        concat_axis = 1
+    elif direction == "right":
+        surface_a = masked_surface
+        surface_b = cond_surface
+        concat_axis = 1
+    elif direction == "up":
+        surface_a = cond_surface
+        surface_b = masked_surface
+        concat_axis = 0
+    elif direction == "down":
+        surface_a = masked_surface
+        surface_b = cond_surface
+        concat_axis = 0
+    else:
+        raise ValueError(
+            "cond_direction must be one of {'up', 'down', 'left', 'right'}, "
+            f"got {cond_direction!r}"
+        )
+
+    cond_mask = np.zeros(crop_size, dtype=np.uint8)
+    masked_mask = np.zeros(crop_size, dtype=np.uint8)
     velocity_accum = np.zeros((3, *crop_size), dtype=np.float32)
     weights = np.zeros(crop_size, dtype=np.float32)
-    attract_radius = max(float(surface_attract_radius), 0.0)
-    surface_attract = None
-    surface_attract_weight = None
-    surface_attract_best_dist_sq = None
-    if attract_radius > 0.0:
-        surface_attract = np.zeros((3, *crop_size), dtype=np.float32)
-        surface_attract_weight = np.zeros(crop_size, dtype=np.float32)
-        surface_attract_best_dist_sq = np.full(crop_size, np.inf, dtype=np.float32)
-
-    tangent_axis, tangent_sign = _velocity_axis_and_sign(cond_direction)
-    if trace_surfaces_local is not None:
-        surfaces = tuple(np.asarray(surface, dtype=np.float32) for surface in trace_surfaces_local)
-        if len(surfaces) == 0:
-            surfaces = ()
-        elif len(surfaces) == 1:
-            _scatter_logical_trace_surface(
-                velocity_accum,
-                weights,
-                surfaces[0],
-                tangent_axis=tangent_axis,
-                tangent_sign=tangent_sign,
-                surface_attract=surface_attract,
-                surface_attract_weight=surface_attract_weight,
-                surface_attract_best_dist_sq=surface_attract_best_dist_sq,
-                surface_attract_radius=attract_radius,
-            )
-        elif len(surfaces) == 2 and trace_concat_axis is not None:
-            _scatter_logical_trace_surface(
-                velocity_accum,
-                weights,
-                surfaces[0],
-                surface_b=surfaces[1],
-                concat_axis=int(trace_concat_axis),
-                tangent_axis=tangent_axis,
-                tangent_sign=tangent_sign,
-                surface_attract=surface_attract,
-                surface_attract_weight=surface_attract_weight,
-                surface_attract_best_dist_sq=surface_attract_best_dist_sq,
-                surface_attract_radius=attract_radius,
-            )
-        else:
-            for surface in surfaces:
-                _scatter_logical_trace_surface(
-                    velocity_accum,
-                    weights,
-                    surface,
-                    tangent_axis=tangent_axis,
-                    tangent_sign=tangent_sign,
-                    surface_attract=surface_attract,
-                    surface_attract_weight=surface_attract_weight,
-                    surface_attract_best_dist_sq=surface_attract_best_dist_sq,
-                    surface_attract_radius=attract_radius,
-                )
-    else:
-        surfaces = []
-        if include_conditioning and cond_surface_local is not None:
-            surfaces.append(np.asarray(cond_surface_local, dtype=np.float32))
-        if include_masked and masked_surface_local is not None:
-            surfaces.append(np.asarray(masked_surface_local, dtype=np.float32))
-
-        for surface in surfaces:
-            _scatter_logical_trace_surface(
-                velocity_accum,
-                weights,
-                surface,
-                tangent_axis=tangent_axis,
-                tangent_sign=tangent_sign,
-                surface_attract=surface_attract,
-                surface_attract_weight=surface_attract_weight,
-                surface_attract_best_dist_sq=surface_attract_best_dist_sq,
-                surface_attract_radius=attract_radius,
-            )
+    tangent_axis, tangent_sign = _velocity_axis_and_sign(direction)
+    ok = _voxelize_split_surfaces_and_scatter_trace_numba(
+        cond_mask,
+        masked_mask,
+        velocity_accum,
+        weights,
+        cond_surface,
+        masked_surface,
+        surface_a,
+        surface_b,
+        int(concat_axis),
+        int(tangent_axis),
+        float(tangent_sign),
+    )
+    if not ok:
+        return None
 
     valid_vox = weights > 0.0
     if not bool(valid_vox.any()):
@@ -811,32 +775,12 @@ def build_away_from_conditioning_trace_targets(
         )
         valid_vox[finite_coords] = True
 
-    radius = float(dilation_radius)
-    if radius > 0.0:
-        nearest_dist, nearest_idx = ndimage.distance_transform_edt(
-            ~valid_vox,
-            return_distances=True,
-            return_indices=True,
-        )
-        band = np.isfinite(nearest_dist) & (nearest_dist <= radius)
-        if bool(band.any()):
-            velocity[:, band] = velocity[
-                :,
-                nearest_idx[0][band],
-                nearest_idx[1][band],
-                nearest_idx[2][band],
-            ]
-            valid_vox = band
-
-    result = {
+    return {
+        "cond_gt": cond_mask,
+        "masked_seg": masked_mask,
         "velocity_dir": velocity.astype(np.float32, copy=False),
         "trace_loss_weight": valid_vox[None].astype(np.float32, copy=False),
     }
-    if surface_attract is not None and surface_attract_weight is not None:
-        result["surface_attract"] = surface_attract.astype(np.float32, copy=False)
-        result["surface_attract_weight"] = surface_attract_weight[None].astype(np.float32, copy=False)
-    return result
-
 
 def estimate_global_unit_normal_from_surface_grid(surface_grid: np.ndarray) -> np.ndarray:
     """Estimate a global unit normal from one ordered surface grid.
