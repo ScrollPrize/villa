@@ -133,9 +133,9 @@ class Model3D(nn.Module):
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.cyl_seed_xyz = torch.zeros(3, device=device, dtype=torch.float32)
 		self.cyl_shell_mode = False
-		self.cyl_shell_target_count = 6
+		self.cyl_shell_target_count = 2
 		self.cyl_shell_initial_radius = 1000.0
-		self.cyl_shell_step = 1000.0
+		self.cyl_shell_step = 500.0
 		self.cyl_shell_initial_step = 10.0
 		self.cyl_shell_z_step = 200.0
 		self.cyl_shell_width_target_step = 200.0
@@ -382,13 +382,15 @@ class Model3D(nn.Module):
 		self.cyl_shell_z = z.detach()
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self.cyl_params = nn.Parameter(self._initial_shell_delta_xy(dirs).to(device=device, dtype=dtype))
+		self.cyl_params = nn.Parameter(
+			self._initial_shell_delta_xy(dirs, target_step=self._shell_target_offset_for_index(0)).to(device=device, dtype=dtype)
+		)
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		print(f"[model] umbilicus tube init: shells={self.cyl_shell_target_count} "
 			  f"H={H} W={W} z_center={self.cyl_shell_seed_z:.1f} "
 			  f"model_h={model_h:.1f} z_step={actual_z_step:.1f} "
 			  f"z_step_target={z_step:.1f} initial_radius={radius0:.1f} "
-			  f"free_xy_init_step={self.cyl_shell_initial_step:.1f}",
+			  f"shell_step={self.cyl_shell_step:.1f}",
 			  flush=True)
 
 	def _shell_z_values(self, *, device: torch.device, dtype: torch.dtype, h: int) -> torch.Tensor:
@@ -410,11 +412,14 @@ class Model3D(nn.Module):
 	def _first_shell_radius(self) -> float:
 		return max(1.0, float(getattr(self, "cyl_shell_initial_radius", self.cyl_shell_step)))
 
-	def _current_shell_target_offset(self) -> float:
-		idx = int(getattr(self, "cyl_shell_current_index", 0))
+	def _shell_target_offset_for_index(self, idx: int) -> float:
+		idx = int(idx)
 		if idx == 0:
 			return self._first_shell_radius()
 		return max(1.0, float(self.cyl_shell_step))
+
+	def _current_shell_target_offset(self) -> float:
+		return self._shell_target_offset_for_index(int(getattr(self, "cyl_shell_current_index", 0)))
 
 	def _umbilicus_base_shell(
 		self,
@@ -500,17 +505,13 @@ class Model3D(nn.Module):
 			gt_xy = torch.where(((gt_xy * surf_xy).sum(dim=-1, keepdim=True) > 0.5), gt_xy, surf_xy)
 			return torch.cat([gt_xy, torch.zeros_like(gt_xy[..., :1])], dim=-1).detach()
 
-	def _initial_shell_delta_xy(self, dirs: torch.Tensor) -> torch.Tensor:
-		step = max(0.0, float(getattr(self, "cyl_shell_initial_step", 10.0)))
+	def _initial_shell_delta_xy(self, dirs: torch.Tensor, *, target_step: float) -> torch.Tensor:
+		step = max(0.0, float(target_step))
 		return dirs[..., :2] * step
 
 	def _shell_delta_xy_params(self) -> torch.Tensor:
 		if self.cyl_params.ndim == 3 and int(self.cyl_params.shape[-1]) == 2:
-			delta_xy = self.cyl_params
-			length = delta_xy.norm(dim=-1)
-			target = delta_xy.new_tensor(float(self._current_shell_target_offset()))
-			scale = target / length.mean().clamp(min=1.0e-6)
-			return delta_xy * scale
+			return self.cyl_params
 		raise ValueError(f"invalid cylinder shell params shape: {tuple(self.cyl_params.shape)}")
 
 	def _shell_w_offset_values(self) -> torch.Tensor:
@@ -642,7 +643,8 @@ class Model3D(nn.Module):
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self.cyl_params = nn.Parameter(self._initial_shell_delta_xy(dirs).to(device=device, dtype=dtype))
+		target_offset = self._shell_target_offset_for_index(idx)
+		self.cyl_params = nn.Parameter(self._initial_shell_delta_xy(dirs, target_step=target_offset).to(device=device, dtype=dtype))
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		self.cyl_shell_current_index = idx
 		self.cyl_shell_active = True
@@ -650,10 +652,9 @@ class Model3D(nn.Module):
 		self.cyl_shell_mode = True
 		step_avg, step_min, step_max = self._shell_offset_stats()
 		wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
-		init_step = max(0.0, float(getattr(self, "cyl_shell_initial_step", 10.0)))
 		print(f"[model] shell {idx + 1}/{self.cyl_shell_target_count}: H={H} W={W} "
 			  f"base={'umbilicus' if idx == 0 else 'previous'} "
-			  f"free_xy_init_step={init_step:.1f} "
+			  f"target_step={target_offset:.1f} "
 			  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
 			  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}", flush=True)
 

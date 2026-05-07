@@ -38,6 +38,7 @@ def _active_terms(weights: dict[str, float]) -> dict[str, float]:
 			"cyl_smooth",
 			"cyl_z_smooth",
 			"cyl_step",
+			"cyl_radial_mean",
 			"cyl_bend",
 			"cyl_conn_mesh",
 			"cyl_conn_gt",
@@ -576,6 +577,18 @@ def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[to
 	target = w_len.mean().clamp(min=1.0e-6)
 	lm = ((w_len - target) / target).square()
 	return _register_shell_term("cyl_step", lm, res=res)
+
+
+def cyl_radial_mean_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Keep only the mean base-to-shell vector length near the shell target."""
+	delta_xy = getattr(res, "cyl_shell_delta_xy", None)
+	if delta_xy is None:
+		return _zero_loss(res)
+	length = delta_xy.norm(dim=-1)
+	target = length.new_tensor(max(1.0, float(getattr(res, "cyl_shell_step", 1.0))))
+	mean_len = length.mean()
+	lm = ((mean_len - target) / target).square().view(1)
+	return _register_shell_term("cyl_radial_mean", lm, res=res)
 
 
 def cyl_bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
