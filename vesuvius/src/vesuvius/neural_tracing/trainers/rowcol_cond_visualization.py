@@ -729,10 +729,6 @@ def make_dense_visualization(
     velocity_dir_pred=None,
     velocity_dir_target=None,
     velocity_loss_weight=None,
-    trace_dist_pred=None,
-    trace_dist_target=None,
-    trace_stop_pred=None,
-    trace_stop_target=None,
     trace_loss_weight=None,
     trace_validity_pred=None,
     trace_validity_target=None,
@@ -864,8 +860,6 @@ def make_dense_visualization(
 
     has_trace = (
         velocity_dir_pred is not None
-        or trace_dist_pred is not None
-        or trace_stop_pred is not None
         or trace_validity_pred is not None
         or surface_attract_pred is not None
     )
@@ -885,16 +879,6 @@ def make_dense_visualization(
         vel_align_3d = _tensor_to_numpy((pred_vel * target_vel).sum(dim=1)[0].clamp(-1.0, 1.0))
         if velocity_mask_3d is not None:
             vel_align_3d = np.where(velocity_mask_3d, vel_align_3d, np.nan)
-    trace_dist_pred_3d = (
-        _tensor_to_numpy(F.softplus(trace_dist_pred[b, 0].float()))
-        if trace_dist_pred is not None else None
-    )
-    trace_dist_gt_3d = _tensor_to_numpy(trace_dist_target[b, 0]) if trace_dist_target is not None else None
-    trace_stop_pred_3d = (
-        _tensor_to_numpy(torch.sigmoid(trace_stop_pred[b, 0].float()))
-        if trace_stop_pred is not None else None
-    )
-    trace_stop_gt_3d = _tensor_to_numpy(trace_stop_target[b, 0]) if trace_stop_target is not None else None
     trace_validity_pred_3d = (
         _tensor_to_numpy(torch.sigmoid(trace_validity_pred[b, 0].float()))
         if trace_validity_pred is not None else None
@@ -926,16 +910,6 @@ def make_dense_visualization(
             attract_gt_mag_3d = np.where(attract_mask_3d, attract_gt_mag_3d, np.nan)
         if attract_err_mag_3d is not None:
             attract_err_mag_3d = np.where(attract_mask_3d, attract_err_mag_3d, np.nan)
-    trace_dist_vmax = 1.0
-    if trace_dist_pred_3d is not None or trace_dist_gt_3d is not None:
-        trace_dist_vals = [
-            (arr[trace_mask_3d] if trace_mask_3d is not None and np.any(trace_mask_3d) else arr.reshape(-1))
-            for arr in (trace_dist_pred_3d, trace_dist_gt_3d)
-            if arr is not None
-        ]
-        trace_dist_vals = [vals[np.isfinite(vals)] for vals in trace_dist_vals]
-        trace_dist_vals = [vals for vals in trace_dist_vals if vals.size > 0]
-        trace_dist_vmax = _safe_percentile(np.concatenate(trace_dist_vals), 99, fallback=1.0) if trace_dist_vals else 1.0
     attract_vmax = 1.0
     if attract_pred_mag_3d is not None or attract_gt_mag_3d is not None:
         attract_vals = [
@@ -954,10 +928,6 @@ def make_dense_visualization(
     n_trace_cols += int(trace_validity_pred_3d is not None)
     n_trace_cols += int(trace_validity_gt_3d is not None)
     n_trace_cols += int(trace_validity_weight_3d is not None)
-    n_trace_cols += int(trace_dist_pred_3d is not None)
-    n_trace_cols += int(trace_dist_gt_3d is not None)
-    n_trace_cols += int(trace_stop_pred_3d is not None)
-    n_trace_cols += int(trace_stop_gt_3d is not None)
     n_trace_cols += int(trace_mask_3d is not None)
     n_trace_cols += int(attract_pred_mag_3d is not None)
     n_trace_cols += int(attract_gt_mag_3d is not None)
@@ -1111,30 +1081,6 @@ def make_dense_visualization(
             axes[row, col].set_yticks([])
             col += 1
 
-        if trace_dist_pred_3d is not None:
-            axes[row, col].imshow(_slice(trace_dist_pred_3d, axis, idx), cmap="viridis", vmin=0, vmax=trace_dist_vmax, extent=extent)
-            axes[row, col].set_title("Trace Dist Pred")
-            axes[row, col].set_yticks([])
-            col += 1
-
-        if trace_dist_gt_3d is not None:
-            axes[row, col].imshow(_slice(trace_dist_gt_3d, axis, idx), cmap="viridis", vmin=0, vmax=trace_dist_vmax, extent=extent)
-            axes[row, col].set_title("Trace Dist GT")
-            axes[row, col].set_yticks([])
-            col += 1
-
-        if trace_stop_pred_3d is not None:
-            axes[row, col].imshow(_slice(trace_stop_pred_3d, axis, idx), cmap="magma", vmin=0, vmax=1, extent=extent)
-            axes[row, col].set_title("Stop Pred")
-            axes[row, col].set_yticks([])
-            col += 1
-
-        if trace_stop_gt_3d is not None:
-            axes[row, col].imshow(_slice(trace_stop_gt_3d, axis, idx), cmap="magma", vmin=0, vmax=1, extent=extent)
-            axes[row, col].set_title("Stop GT")
-            axes[row, col].set_yticks([])
-            col += 1
-
         if trace_mask_3d is not None:
             axes[row, col].imshow(_slice(trace_mask_3d.astype(np.float32), axis, idx), cmap="gray", vmin=0, vmax=1, extent=extent)
             axes[row, col].set_title("Trace Sup Mask")
@@ -1263,10 +1209,6 @@ def make_dense_visualization(
             f"Attract band voxels:        {int(attract_mask_3d.sum()) if attract_mask_3d is not None else 0}",
             f"Velocity cosine mean: {_finite_mean(vel_align_3d, velocity_mask_3d):.4f}",
             f"Validity pred mean:   {_finite_mean(trace_validity_pred_3d, trace_validity_mask_3d):.4f}",
-            f"Trace dist pred mean: {_finite_mean(trace_dist_pred_3d, trace_mask_3d):.4f}",
-            f"Trace dist GT mean:   {_finite_mean(trace_dist_gt_3d, trace_mask_3d):.4f}",
-            f"Stop pred mean:       {_finite_mean(trace_stop_pred_3d, trace_mask_3d):.4f}",
-            f"Stop GT mean:         {_finite_mean(trace_stop_gt_3d, trace_mask_3d):.4f}",
             f"Attract pred mean:    {_finite_mean(attract_pred_mag_3d, attract_mask_3d):.4f}",
             f"Attract GT mean:      {_finite_mean(attract_gt_mag_3d, attract_mask_3d):.4f}",
             f"Attract error mean:   {_finite_mean(attract_err_mag_3d, attract_mask_3d):.4f}",
