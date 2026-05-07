@@ -9,9 +9,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("lambda_velocity_dir", 0.1)
     config.setdefault("trace_target_dilation_radius", 1.0)
     config.setdefault("trace_surface_attract_radius", 0.0)
-    config.setdefault("use_neighbor_sheet_context", False)
-    config.setdefault("neighbor_sheet_required", False)
-    config.setdefault("use_trace_validity_targets", False)
     config.setdefault("lambda_trace_validity", 0.0)
     config.setdefault("trace_validity_positive_radius", 2.0)
     config.setdefault("trace_validity_negative_radius", 3.0)
@@ -93,15 +90,3 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     trace_validity_pos_weight = float(config.get("trace_validity_pos_weight", 1.0))
     _require_finite_range("trace_validity_pos_weight", trace_validity_pos_weight, min_value=0.0)
-
-    unsupported_flags = {
-        "displacement_supervision=normal_scalar": str(config.get("displacement_supervision", "vector")).lower() == "normal_scalar",
-        "use_triplet_wrap_displacement": bool(config.get("use_triplet_wrap_displacement", False)),
-        "use_other_wrap_cond": bool(config.get("use_other_wrap_cond", False)),
-    }
-    enabled_unsupported = [name for name, enabled in unsupported_flags.items() if enabled]
-    if enabled_unsupported:
-        raise ValueError(
-            "rowcol_cond has been consolidated to the active dense trace-ODE split path; "
-            f"unsupported options enabled: {enabled_unsupported}"
-        )

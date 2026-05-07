@@ -3,8 +3,7 @@ import random
 import numpy as np
 
 
-def create_split_conditioning(dataset, idx: int, patch_idx: int, wrap_idx: int, patch):
-    _ = idx
+def create_split_conditioning(dataset, patch_idx: int, wrap_idx: int, patch):
     crop_size = dataset.crop_size
     wrap = patch.wraps[wrap_idx]
     seg = wrap["segment"]

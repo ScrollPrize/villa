@@ -65,14 +65,6 @@ class EdtSegDataset(Dataset):
 
         setdefault_rowcol_cond_dataset_config(config)
         validate_rowcol_cond_dataset_config(config)
-        self.use_trace_validity_targets = bool(config.get('use_trace_validity_targets', False)) or (
-            float(config.get('lambda_trace_validity', 0.0)) > 0.0
-        )
-        self.neighbor_sheet_required = bool(config.get('neighbor_sheet_required', False))
-        self.use_neighbor_sheet_context = (
-            bool(config.get('use_neighbor_sheet_context', False))
-            or self.neighbor_sheet_required
-        )
         self._validate_result_tensors_enabled = bool(config['validate_result_tensors'])
 
         aug_config = config.get('augmentation', {})
@@ -91,7 +83,6 @@ class EdtSegDataset(Dataset):
         )
 
         self._triplet_neighbor_lookup = {}
-        self._triplet_lookup_stats = {}
 
         if patch_metadata is None:
             patches = []
@@ -183,18 +174,14 @@ class EdtSegDataset(Dataset):
 
             self.patches = patches
             self.sample_index = self._build_sample_index()
-            if self.use_neighbor_sheet_context:
-                self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
-            if self.neighbor_sheet_required:
-                self.sample_index = [
-                    (patch_idx, wrap_idx)
-                    for patch_idx, wrap_idx in self.sample_index
-                    if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
-                ]
-                if not self.sample_index:
-                    raise ValueError(
-                        "neighbor_sheet_required enabled but no wraps have same/adjacent neighbors on both sides."
-                    )
+            self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
+            self.sample_index = [
+                (patch_idx, wrap_idx)
+                for patch_idx, wrap_idx in self.sample_index
+                if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
+            ]
+            if not self.sample_index:
+                raise ValueError("No wraps have same/adjacent neighbors on both sides.")
             spec = self.config['cond_percent']
             self._cond_percent_min, self._cond_percent_max = float(spec[0]), float(spec[1])
         else:
@@ -214,7 +201,6 @@ class EdtSegDataset(Dataset):
         self.patches = patch_metadata['patches']
         self.sample_index = list(patch_metadata['sample_index'])
         self._triplet_neighbor_lookup = patch_metadata.get('triplet_neighbor_lookup', {})
-        self._triplet_lookup_stats = patch_metadata.get('triplet_lookup_stats', {})
         self._cond_percent_min, self._cond_percent_max = patch_metadata['cond_percent']
 
     def export_patch_metadata(self):
@@ -222,7 +208,6 @@ class EdtSegDataset(Dataset):
             'patches': self.patches,
             'sample_index': tuple(self.sample_index),
             'triplet_neighbor_lookup': self._triplet_neighbor_lookup,
-            'triplet_lookup_stats': self._triplet_lookup_stats,
             'cond_percent': (self._cond_percent_min, self._cond_percent_max),
         }
 
@@ -234,11 +219,6 @@ class EdtSegDataset(Dataset):
         for trace-validity targets.
         """
         lookup = {}
-        order_stats = {
-            "candidate_triplets": 0,
-            "kept_triplets": 0,
-            "dropped_missing_neighbors": 0,
-        }
         for patch_idx, patch in enumerate(self.patches):
             wrap_stats = []
             for wrap_idx, wrap in enumerate(patch.wraps):
@@ -289,16 +269,12 @@ class EdtSegDataset(Dataset):
                         break
 
                 if prev_neighbor is None or next_neighbor is None:
-                    order_stats["dropped_missing_neighbors"] += 1
                     continue
 
-                order_stats["candidate_triplets"] += 1
                 lookup[(patch_idx, target["wrap_idx"])] = {
                     "behind_wrap_idx": int(prev_neighbor["wrap_idx"]),
                     "front_wrap_idx": int(next_neighbor["wrap_idx"]),
                 }
-                order_stats["kept_triplets"] += 1
-        self._triplet_lookup_stats = order_stats
         return lookup
 
     def _extract_wrap_world_surface(self, patch: ChunkPatch, wrap: dict, require_all_valid: bool = True):
@@ -383,12 +359,12 @@ class EdtSegDataset(Dataset):
         )
         return augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
 
-    def create_split_masks(self, idx: int, patch_idx: int, wrap_idx: int):
+    def create_split_masks(self, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
 
-        conditioning = create_split_conditioning(self, idx, patch_idx, wrap_idx, patch)
+        conditioning = create_split_conditioning(self, patch_idx, wrap_idx, patch)
         if conditioning is None:
             return None
         cond_direction = conditioning["cond_direction"]
@@ -418,16 +394,14 @@ class EdtSegDataset(Dataset):
         if not cond_segmentation_gt.any():
             return None
 
-        neighbor_segmentation = None
-        if self.use_neighbor_sheet_context:
-            neighbor_segmentation = self._build_neighbor_sheet_mask(
-                patch_idx=patch_idx,
-                wrap_idx=wrap_idx,
-                min_corner=min_corner,
-                crop_shape=crop_shape,
-            )
-            if neighbor_segmentation is None and self.neighbor_sheet_required:
-                return None
+        neighbor_segmentation = self._build_neighbor_sheet_mask(
+            patch_idx=patch_idx,
+            wrap_idx=wrap_idx,
+            min_corner=min_corner,
+            crop_shape=crop_shape,
+        )
+        if neighbor_segmentation is None:
+            return None
 
         result = {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
@@ -437,8 +411,7 @@ class EdtSegDataset(Dataset):
             "masked_surface_local": torch.from_numpy(masked_zyxs_local_float).to(torch.float32),
             "cond_direction": cond_direction,
         }
-        if neighbor_segmentation is not None:
-            result["neighbor_seg"] = torch.from_numpy(neighbor_segmentation).to(torch.float32)
+        result["neighbor_seg"] = torch.from_numpy(neighbor_segmentation).to(torch.float32)
         return result
 
     def _build_neighbor_sheet_mask(self, *, patch_idx: int, wrap_idx: int, min_corner, crop_shape):
@@ -498,7 +471,7 @@ class EdtSegDataset(Dataset):
         _attempted_indices.add(idx)
 
         patch_idx, wrap_idx = self.sample_index[idx]
-        mask_bundle = self.create_split_masks(idx, patch_idx, wrap_idx)
+        mask_bundle = self.create_split_masks(patch_idx, wrap_idx)
         if mask_bundle is None:
             return self._resample_item(
                 idx,
@@ -512,7 +485,7 @@ class EdtSegDataset(Dataset):
         masked_seg = mask_bundle["masked_seg"]
         cond_seg_gt = mask_bundle["cond_gt"]
         cond_direction = mask_bundle["cond_direction"]
-        neighbor_seg_tensor = mask_bundle.get("neighbor_seg", None)
+        neighbor_seg_tensor = mask_bundle["neighbor_seg"]
         cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
             _prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
         )
@@ -581,8 +554,7 @@ class EdtSegDataset(Dataset):
             "cond_direction": cond_direction,
         }
 
-        if self.use_trace_validity_targets and neighbor_seg_tensor is not None:
-            result["neighbor_seg"] = neighbor_seg_tensor
+        result["neighbor_seg"] = neighbor_seg_tensor
         cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
         masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
         if cond_direction == "left":

@@ -233,44 +233,26 @@ def resolve_dataloader_context(config):
 
 def collate_with_padding(batch):
     """Collate batch tensors for the active trace-ODE training path."""
-    # Stack fixed-size tensors normally
-    vol = torch.stack([b['vol'] for b in batch])
-    cond = torch.stack([b['cond'] for b in batch])
-    result = {
-        'vol': vol,
-        'cond': cond,
+    # Source masks are used by trainer-side EDT target generation. Keeping EDT
+    # out of dataloader workers avoids cupyx defaulting every worker to GPU 0.
+    return {
+        'vol': torch.stack([b['vol'] for b in batch]),
+        'cond': torch.stack([b['cond'] for b in batch]),
+        'cond_direction': [b['cond_direction'] for b in batch],
+        'velocity_dir': torch.stack([b['velocity_dir'] for b in batch]),
+        'velocity_loss_weight': torch.stack([b['velocity_loss_weight'] for b in batch]),
+        'trace_loss_weight': torch.stack([b['trace_loss_weight'] for b in batch]),
+        'cond_gt': torch.stack([b['cond_gt'] for b in batch]),
+        'masked_seg': torch.stack([b['masked_seg'] for b in batch]),
+        'neighbor_seg': torch.stack([b['neighbor_seg'] for b in batch]),
     }
-    if 'cond_direction' in batch[0]:
-        result['cond_direction'] = [b['cond_direction'] for b in batch]
-
-    if 'velocity_dir' in batch[0]:
-        result['velocity_dir'] = torch.stack([b['velocity_dir'] for b in batch])
-    if 'velocity_loss_weight' in batch[0]:
-        result['velocity_loss_weight'] = torch.stack([b['velocity_loss_weight'] for b in batch])
-    if 'trace_loss_weight' in batch[0]:
-        result['trace_loss_weight'] = torch.stack([b['trace_loss_weight'] for b in batch])
-    if 'trace_validity' in batch[0]:
-        result['trace_validity'] = torch.stack([b['trace_validity'] for b in batch])
-    if 'trace_validity_weight' in batch[0]:
-        result['trace_validity_weight'] = torch.stack([b['trace_validity_weight'] for b in batch])
-    # Source masks used by trainer-side EDT target generation. Keeping EDT out
-    # of dataloader workers avoids cupyx defaulting every worker to GPU 0.
-    for key in ('cond_gt', 'masked_seg', 'neighbor_seg'):
-        if key in batch[0]:
-            result[key] = torch.stack([b[key] for b in batch])
-
-    return result
 
 
 def prepare_batch(
     batch,
     use_growth_direction_channels=False,
-    velocity_target_builder=None,
 ):
     """Prepare batch tensors for training."""
-    if velocity_target_builder is not None:
-        velocity_target_builder(batch)
-
     vol = batch['vol'].unsqueeze(1)  # [B, 1, D, H, W]
     cond = batch['cond'].unsqueeze(1)  # [B, 1, D, H, W]
 
@@ -288,13 +270,13 @@ def prepare_batch(
         )
     inputs = torch.cat(input_list, dim=1)
 
-    velocity_dir_target = batch.get('velocity_dir', None)  # [B, 3, D, H, W]
-    velocity_loss_weight = batch.get('velocity_loss_weight', None)  # [B, 1, D, H, W]
-    trace_loss_weight = batch.get('trace_loss_weight', None)  # [B, 1, D, H, W]
-    trace_validity_target = batch.get('trace_validity', None)  # [B, 1, D, H, W]
-    trace_validity_weight = batch.get('trace_validity_weight', None)  # [B, 1, D, H, W]
-    surface_attract_target = batch.get('surface_attract', None)  # [B, 3, D, H, W]
-    surface_attract_weight = batch.get('surface_attract_weight', None)  # [B, 1, D, H, W]
+    velocity_dir_target = batch['velocity_dir']  # [B, 3, D, H, W]
+    velocity_loss_weight = batch['velocity_loss_weight']  # [B, 1, D, H, W]
+    trace_loss_weight = batch['trace_loss_weight']  # [B, 1, D, H, W]
+    trace_validity_target = batch['trace_validity']  # [B, 1, D, H, W]
+    trace_validity_weight = batch['trace_validity_weight']  # [B, 1, D, H, W]
+    surface_attract_target = batch['surface_attract']  # [B, 3, D, H, W]
+    surface_attract_weight = batch['surface_attract_weight']  # [B, 1, D, H, W]
 
     return (
         inputs,
@@ -374,19 +356,11 @@ def train(config_path):
     config.setdefault('compile_model', True)
     config.setdefault('separate_eager_eval_for_logging', True)
 
-    use_surface_attract_head = float(config.get('lambda_surface_attract', 0.0)) > 0.0
-    use_trace_validity_head = (
-        bool(config.get('use_trace_validity_targets', False))
-        or float(config.get('lambda_trace_validity', 0.0)) > 0.0
-    )
-    targets = {'velocity_dir': {'out_channels': 3, 'activation': 'none'}}
-    if use_surface_attract_head:
-        targets['surface_attract'] = {'out_channels': 3, 'activation': 'none'}
-    if use_trace_validity_head:
-        targets['trace_validity'] = {'out_channels': 1, 'activation': 'none'}
-    if not targets:
-        raise ValueError("No model output heads are enabled; set at least one supervised target/loss")
-    config['targets'] = targets
+    config['targets'] = {
+        'velocity_dir': {'out_channels': 3, 'activation': 'none'},
+        'surface_attract': {'out_channels': 3, 'activation': 'none'},
+        'trace_validity': {'out_channels': 1, 'activation': 'none'},
+    }
 
     out_dir = config['out_dir']
     os.makedirs(out_dir, exist_ok=True)
@@ -444,19 +418,6 @@ def train(config_path):
         if wandb.run is not None:
             config['wandb_run_id'] = wandb.run.id
 
-    unsupported_displacement_losses = {
-        'lambda_displacement': float(config.get('lambda_displacement', 0.0)),
-        'lambda_smooth': float(config.get('lambda_smooth', 0.0)),
-        'lambda_cond_disp': float(config.get('lambda_cond_disp', 0.0)),
-    }
-    enabled_displacement_losses = [
-        name for name, value in unsupported_displacement_losses.items() if value > 0.0
-    ]
-    if enabled_displacement_losses:
-        raise ValueError(
-            "train_rowcol_cond is trace-ODE-only; displacement-head losses are no longer supported: "
-            f"{enabled_displacement_losses}"
-        )
     lambda_velocity_dir = float(config.get('lambda_velocity_dir', 0.0))
     lambda_surface_attract = float(config.get('lambda_surface_attract', 0.0))
     lambda_trace_validity = float(config.get('lambda_trace_validity', 0.0))
@@ -484,76 +445,44 @@ def train(config_path):
 
     def build_velocity_targets_on_device(batch):
         """Build EDT-derived velocity/trace targets on the current batch device."""
-        if (
-            use_trace_validity_head
-            and 'trace_validity' not in batch
-        ):
-            if 'cond_gt' not in batch or 'masked_seg' not in batch:
-                raise ValueError("Trace validity deferral requires cond_gt and masked_seg in the batch")
-            labels = []
-            weights = []
-            neighbor_present_values = []
-            neighbor_seg = batch.get('neighbor_seg', None)
-            target_mask = torch.maximum(batch['cond_gt'], batch['masked_seg']) > 0.5
-            for b in range(target_mask.shape[0]):
-                d_target = _distance_transform_distances_torch(target_mask[b])
-                if d_target is None:
-                    labels.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
-                    weights.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
-                    neighbor_present_values.append(torch.tensor(0.0, device=target_mask.device, dtype=torch.float32))
-                    continue
+        if 'cond_gt' not in batch or 'masked_seg' not in batch or 'neighbor_seg' not in batch:
+            raise ValueError("Trace validity targets require cond_gt, masked_seg, and neighbor_seg in the batch")
+        labels = []
+        weights = []
+        target_mask = torch.maximum(batch['cond_gt'], batch['masked_seg']) > 0.5
+        for b in range(target_mask.shape[0]):
+            d_target = _distance_transform_distances_torch(target_mask[b])
+            d_neighbor = _distance_transform_distances_torch(batch['neighbor_seg'][b])
+            if d_target is None or d_neighbor is None:
+                labels.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
+                weights.append(torch.zeros_like(target_mask[b], dtype=torch.float32))
+                continue
 
-                label = torch.zeros_like(d_target, dtype=torch.float32)
-                weight = torch.zeros_like(d_target, dtype=torch.float32)
-                pos = d_target <= trace_validity_positive_radius
+            label = torch.zeros_like(d_target, dtype=torch.float32)
+            weight = torch.zeros_like(d_target, dtype=torch.float32)
+            margin = d_neighbor - d_target
+            pos = (d_target <= trace_validity_positive_radius) & (margin >= trace_validity_margin)
+            neg = (d_neighbor <= trace_validity_negative_radius) & (margin < trace_validity_margin)
+            far_neg = d_target >= trace_validity_negative_radius
 
-                has_neighbor = (
-                    neighbor_seg is not None
-                    and bool((neighbor_seg[b] > 0.5).any().item())
-                )
-                if has_neighbor:
-                    d_neighbor = _distance_transform_distances_torch(neighbor_seg[b])
-                    if d_neighbor is None:
-                        has_neighbor = False
+            label[pos] = 1.0
+            weight[pos] = 1.0
+            hard_neg = neg & ~pos
+            weight[hard_neg] = 1.0
+            background_neg = far_neg & ~pos & ~hard_neg
+            if trace_validity_background_weight > 0.0:
+                weight[background_neg] = trace_validity_background_weight
 
-                if has_neighbor:
-                    margin = d_neighbor - d_target
-                    pos = pos & (margin >= trace_validity_margin)
-                    neg = (d_neighbor <= trace_validity_negative_radius) & (margin < trace_validity_margin)
-                    far_neg = d_target >= trace_validity_negative_radius
+            labels.append(label)
+            weights.append(weight)
 
-                    label[pos] = 1.0
-                    weight[pos] = 1.0
-                    hard_neg = neg & ~pos
-                    weight[hard_neg] = 1.0
-                    background_neg = far_neg & ~pos & ~hard_neg
-                    if trace_validity_background_weight > 0.0:
-                        weight[background_neg] = trace_validity_background_weight
-                else:
-                    neg = d_target >= trace_validity_negative_radius
-                    label[pos] = 1.0
-                    weight[pos] = 1.0
-                    if trace_validity_background_weight > 0.0:
-                        weight[neg & ~pos] = trace_validity_background_weight
-
-                labels.append(label)
-                weights.append(weight)
-                neighbor_present_values.append(
-                    torch.tensor(float(has_neighbor), device=target_mask.device, dtype=torch.float32)
-                )
-
-            batch['trace_validity'] = torch.stack(labels, dim=0).unsqueeze(1)
-            batch['trace_validity_weight'] = torch.stack(weights, dim=0).unsqueeze(1)
-            batch['neighbor_sheet_present'] = torch.stack(neighbor_present_values, dim=0)
+        batch['trace_validity'] = torch.stack(labels, dim=0).unsqueeze(1)
+        batch['trace_validity_weight'] = torch.stack(weights, dim=0).unsqueeze(1)
 
         if 'velocity_dir' not in batch or 'velocity_loss_weight' not in batch:
             raise ValueError("Velocity targets are enabled but missing from the batch")
 
-        trace_band_attract_radius = (
-            trace_surface_attract_radius
-            if use_surface_attract_head and 'surface_attract' not in batch
-            else 0.0
-        )
+        trace_band_attract_radius = trace_surface_attract_radius
         if (
             trace_target_dilation_radius <= 0.0
             and trace_band_attract_radius <= 0.0
@@ -815,10 +744,8 @@ def train(config_path):
         accelerator.print(f"Growth direction channels: {config.get('use_growth_direction_channels', False)}")
         output_heads = []
         output_heads.append("velocity_dir (3ch)")
-        if use_surface_attract_head:
-            output_heads.append("surface_attract (3ch)")
-        if use_trace_validity_head:
-            output_heads.append("trace_validity (1ch)")
+        output_heads.append("surface_attract (3ch)")
+        output_heads.append("trace_validity (1ch)")
         accelerator.print("Output: " + " + ".join(output_heads))
         accelerator.print(
             f"Velocity direction loss: lambda={lambda_velocity_dir}, "
@@ -843,8 +770,7 @@ def train(config_path):
             f"attract_mode=trace_band, "
             f"attract_radius={config.get('trace_surface_attract_radius')}"
         )
-        if use_trace_validity_head:
-            accelerator.print("Trace validity EDT in trainer: True")
+        accelerator.print("Trace validity EDT in trainer: True")
         optimizer_summary = f"Optimizer: {optimizer_type} (lr={optimizer_kwargs['learning_rate']}, weight_decay={optimizer_kwargs.get('weight_decay', 0)})"
         scheduler_details = ", ".join(f"{k}={v}" for k, v in scheduler_kwargs.items())
         scheduler_summary = f"Scheduler: {scheduler_type}" + (f" ({scheduler_details})" if scheduler_details else "")
@@ -909,10 +835,10 @@ def train(config_path):
         if config['verbose']:
             accelerator.print(f"got batch, keys: {batch.keys()}")
 
+        build_velocity_targets_on_device(batch)
         inputs, velocity_dir_target, velocity_loss_weight, trace_loss_weight, trace_validity_target, trace_validity_weight, surface_attract_target, surface_attract_weight = prepare_batch(
             batch,
             use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-            velocity_target_builder=build_velocity_targets_on_device,
         )
         _mark_first_iter("batch prepared")
 
@@ -979,8 +905,6 @@ def train(config_path):
                 weighted_trace_validity_loss = lambda_trace_validity * trace_validity_loss
                 total_loss = total_loss + weighted_trace_validity_loss
                 wandb_log['trace_validity_loss'] = weighted_trace_validity_loss.detach().item()
-                if 'neighbor_sheet_present' in batch:
-                    wandb_log['neighbor_context_fraction'] = batch['neighbor_sheet_present'].float().mean().detach().item()
 
             if torch.isnan(total_loss).any():
                 raise ValueError('loss is NaN')
@@ -1064,10 +988,10 @@ def train(config_path):
                         val_iterator = iter(val_dataloader)
                         val_batch = next(val_iterator)
 
+                    build_velocity_targets_on_device(val_batch)
                     val_inputs, val_velocity_dir_target, val_velocity_loss_weight, val_trace_loss_weight, val_trace_validity_target, val_trace_validity_weight, val_surface_attract_target, val_surface_attract_weight = prepare_batch(
                         val_batch,
                         use_growth_direction_channels=bool(config.get('use_growth_direction_channels', False)),
-                        velocity_target_builder=build_velocity_targets_on_device,
                     )
 
                     with accelerator.autocast():
