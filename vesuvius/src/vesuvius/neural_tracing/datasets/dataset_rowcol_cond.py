@@ -103,11 +103,9 @@ class EdtSegDataset(Dataset):
                 # retarget to the proper scale
                 retarget_factor = 2 ** volume_scale
                 scaled_segments = []
-                dropped_by_z_range = 0
                 for i, seg in enumerate(dataset_segments):
                     seg_scaled = seg if retarget_factor == 1 else seg.retarget(retarget_factor)
                     if not _segment_overlaps_z_range(seg_scaled, z_range):
-                        dropped_by_z_range += 1
                         continue
                     seg_scaled.volume = volume
                     scaled_segments.append(seg_scaled)
@@ -222,16 +220,11 @@ class EdtSegDataset(Dataset):
             "conditioning": 0.0,
             "volume_read": 0.0,
             "coord_convert": 0.0,
-            "cond_voxelize": 0.0,
-            "masked_voxelize": 0.0,
             "neighbor_total": 0.0,
             "neighbor_extract": 0.0,
             "neighbor_voxelize": 0.0,
             "tensor_convert": 0.0,
         }
-
-    def reset_create_split_masks_profile(self) -> None:
-        self._profile_create_split_masks = self._new_create_split_masks_profile()
 
     def create_split_masks_profile_summary(self) -> dict:
         profile = dict(self._profile_create_split_masks)
@@ -245,8 +238,6 @@ class EdtSegDataset(Dataset):
                 "conditioning",
                 "volume_read",
                 "coord_convert",
-                "cond_voxelize",
-                "masked_voxelize",
                 "neighbor_total",
                 "neighbor_extract",
                 "neighbor_voxelize",
@@ -407,8 +398,6 @@ class EdtSegDataset(Dataset):
                 "conditioning": 0.0,
                 "volume_read": 0.0,
                 "coord_convert": 0.0,
-                "cond_voxelize": 0.0,
-                "masked_voxelize": 0.0,
                 "neighbor_total": 0.0,
                 "neighbor_extract": 0.0,
                 "neighbor_voxelize": 0.0,
@@ -451,11 +440,6 @@ class EdtSegDataset(Dataset):
         record_stage("coord_convert")
 
         crop_shape = target_shape
-
-        # Split masks are generated after spatial augmentation from the same
-        # ordered surfaces used for trace targets.
-        record_stage("cond_voxelize")
-        record_stage("masked_voxelize")
 
         neighbor_start = time.perf_counter() if stage_times is not None else 0.0
         neighbor_segmentation = self._build_neighbor_sheet_mask(
