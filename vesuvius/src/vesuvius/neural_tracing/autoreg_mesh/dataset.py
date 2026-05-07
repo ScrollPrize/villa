@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     serialize_split_conditioning_example,
 )
 from vesuvius.neural_tracing.datasets.common import _read_volume_crop_from_patch, _trim_to_world_bbox
-from vesuvius.neural_tracing.datasets.dataset_defaults import (
+from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
 )

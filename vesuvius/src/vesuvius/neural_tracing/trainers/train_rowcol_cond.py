@@ -17,12 +17,8 @@ import numpy as np
 from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.dataset_rowcol_cond import EdtSegDataset
-from vesuvius.neural_tracing.datasets.dataset_defaults import (
-    setdefault_rowcol_cond_dataset_config,
-    validate_rowcol_cond_dataset_config,
-)
-from vesuvius.neural_tracing.datasets.growth_direction import (
-    growth_direction_channel_count,
+from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
+    prepare_rowcol_cond_train_config,
 )
 from vesuvius.neural_tracing.datasets.targets import RowColTargets
 from vesuvius.neural_tracing.loss.trace_losses import compute_trace_losses
@@ -92,50 +88,7 @@ def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    setdefault_rowcol_cond_dataset_config(config)
-
-    validate_rowcol_cond_dataset_config(config)
-
-    config['in_channels'] = 2 + growth_direction_channel_count()
-    config.setdefault('step_count', 1)  # Required by make_model
-    config.setdefault('num_iterations', 250000)
-    config.setdefault('log_frequency', 100)
-    config.setdefault('ckpt_frequency', 5000)
-    config.setdefault('grad_clip', 5)
-    config.setdefault('learning_rate', 0.01)
-    config.setdefault('weight_decay', 3e-5)
-    config.setdefault('batch_size', 4)
-    config.setdefault('num_workers', 4)
-    config.setdefault('val_num_workers', 1)
-    config.setdefault('pin_memory', True)
-    config.setdefault('non_blocking', True)
-    config.setdefault('persistent_workers', True)
-    config.setdefault('prefetch_factor', 1)
-    config.setdefault('val_prefetch_factor', 1)
-    config.setdefault('dataloader_multiprocessing_context', 'auto')
-    config.setdefault('seed', 0)
-    config.setdefault('lambda_velocity_smooth', 0.0)
-    config.setdefault('velocity_smooth_normalize', True)
-    config.setdefault('lambda_trace_integration', 0.0)
-    config.setdefault('trace_integration_steps', 2)
-    config.setdefault('trace_integration_step_size', 1.0)
-    config.setdefault('trace_integration_max_points', 2048)
-    config.setdefault('trace_integration_min_weight', 0.5)
-    config.setdefault('trace_integration_detach_steps', False)
-    config.setdefault('surface_attract_huber_beta', 5.0)
-    config.setdefault('val_batches_per_log', 4)
-    config.setdefault('log_at_step_zero', False)
-    config.setdefault('ckpt_at_step_zero', False)
-    config.setdefault('wandb_resume', False)
-    config.setdefault('wandb_resume_mode', 'allow')
-    config.setdefault('compile_model', True)
-    config.setdefault('separate_eager_eval_for_logging', True)
-
-    config['targets'] = {
-        'velocity_dir': {'out_channels': 3, 'activation': 'none'},
-        'surface_attract': {'out_channels': 3, 'activation': 'none'},
-        'trace_validity': {'out_channels': 1, 'activation': 'none'},
-    }
+    prepare_rowcol_cond_train_config(config)
 
     out_dir = config['out_dir']
     os.makedirs(out_dir, exist_ok=True)

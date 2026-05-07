@@ -30,7 +30,7 @@ from vesuvius.neural_tracing.datasets.augmentation import (
 from vesuvius.neural_tracing.datasets.triplet_resampling import (
     choose_replacement_index,
 )
-from vesuvius.neural_tracing.datasets.dataset_defaults import (
+from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
 )

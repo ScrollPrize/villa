@@ -2,6 +2,10 @@ from typing import Any, MutableMapping
 
 import numpy as np
 
+from vesuvius.neural_tracing.datasets.growth_direction import (
+    growth_direction_channel_count,
+)
+
 
 def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Populate default config values for the row/col conditioning dataset."""
@@ -16,11 +20,9 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("trace_validity_background_weight", 0.25)
     config.setdefault("trace_validity_pos_weight", 1.0)
     config.setdefault("force_recompute_patches", False)
-    config.setdefault("val_num_workers", 0)
-    config.setdefault("persistent_workers", False)
 
     config.setdefault("validate_result_tensors", False)
-    
+
     # Patch-finding defaults.
     config.setdefault("overlap_fraction", 0.0)
     config.setdefault("min_span_ratio", 1.0)
@@ -35,7 +37,6 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("skip_chunk_if_any_invalid", False)
     config.setdefault("inner_bbox_fraction", 0.7)
 
-    # conditioning perturbation defaults
     cond_local_perturb = dict(config.get("cond_local_perturb") or {})
     cond_local_perturb.setdefault("enabled", True)
     cond_local_perturb.setdefault("probability", 0.35)
@@ -46,6 +47,62 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     cond_local_perturb.setdefault("radius_sigma_mult", 2.5)
     cond_local_perturb.setdefault("max_total_displacement", 6.0)
     config["cond_local_perturb"] = cond_local_perturb
+
+
+def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> None:
+    """Populate default config values owned by the training loop."""
+    config.setdefault("num_iterations", 250000)
+    config.setdefault("log_frequency", 100)
+    config.setdefault("ckpt_frequency", 5000)
+    config.setdefault("grad_clip", 5)
+    config.setdefault("learning_rate", 0.01)
+    config.setdefault("weight_decay", 3e-5)
+    config.setdefault("batch_size", 4)
+    config.setdefault("num_workers", 4)
+    config.setdefault("val_num_workers", 0)
+    config.setdefault("pin_memory", True)
+    config.setdefault("non_blocking", True)
+    config.setdefault("persistent_workers", False)
+    config.setdefault("prefetch_factor", 1)
+    config.setdefault("val_prefetch_factor", 1)
+    config.setdefault("dataloader_multiprocessing_context", "auto")
+    config.setdefault("seed", 0)
+    config.setdefault("lambda_velocity_smooth", 0.0)
+    config.setdefault("velocity_smooth_normalize", True)
+    config.setdefault("lambda_trace_integration", 0.0)
+    config.setdefault("trace_integration_steps", 2)
+    config.setdefault("trace_integration_step_size", 1.0)
+    config.setdefault("trace_integration_max_points", 2048)
+    config.setdefault("trace_integration_min_weight", 0.5)
+    config.setdefault("trace_integration_detach_steps", False)
+    config.setdefault("surface_attract_huber_beta", 5.0)
+    config.setdefault("val_batches_per_log", 4)
+    config.setdefault("log_at_step_zero", False)
+    config.setdefault("ckpt_at_step_zero", False)
+    config.setdefault("wandb_resume", False)
+    config.setdefault("wandb_resume_mode", "allow")
+    config.setdefault("compile_model", True)
+    config.setdefault("separate_eager_eval_for_logging", True)
+
+
+def setdefault_rowcol_cond_model_config(config: MutableMapping[str, Any]) -> None:
+    """Populate model input and output defaults for trace-ODE training."""
+    config["in_channels"] = 2 + growth_direction_channel_count()
+    config.setdefault("step_count", 1)  # Required by make_model.
+    config["targets"] = {
+        "velocity_dir": {"out_channels": 3, "activation": "none"},
+        "surface_attract": {"out_channels": 3, "activation": "none"},
+        "trace_validity": {"out_channels": 1, "activation": "none"},
+    }
+
+
+def prepare_rowcol_cond_train_config(config: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
+    """Apply defaults and validation for the row/col conditioned trainer path."""
+    setdefault_rowcol_cond_dataset_config(config)
+    setdefault_rowcol_cond_trainer_config(config)
+    setdefault_rowcol_cond_model_config(config)
+    validate_rowcol_cond_dataset_config(config)
+    return config
 
 
 def _require_finite(name: str, value: float) -> None:
