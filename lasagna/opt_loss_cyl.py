@@ -12,6 +12,8 @@ _candidate_terms: dict[str, torch.Tensor] = {}
 _candidate_normal_stats: dict[str, torch.Tensor] = {}
 _sample_cache_key: int | None = None
 _sample_cache_value: tuple[torch.Tensor | None, torch.Tensor | None] | None = None
+_BEND_THRESHOLD_RAD = math.radians(60.0)
+_BEND_COS_THRESHOLD = math.cos(math.pi - _BEND_THRESHOLD_RAD)
 
 
 def last_stats() -> dict[str, float]:
@@ -30,7 +32,18 @@ def reset_candidate_terms() -> None:
 def _active_terms(weights: dict[str, float]) -> dict[str, float]:
 	return {
 		name: float(weights.get(name, 0.0))
-		for name in ("cyl_normal", "cyl_center", "cyl_smooth", "cyl_step")
+		for name in (
+			"cyl_normal",
+			"cyl_center",
+			"cyl_smooth",
+			"cyl_z_smooth",
+			"cyl_step",
+			"cyl_bend",
+			"cyl_conn_mesh",
+			"cyl_conn_gt",
+			"cyl_base_mesh",
+			"cyl_base_gt",
+		)
 		if float(weights.get(name, 0.0)) != 0.0 and name in _candidate_terms
 	}
 
@@ -107,10 +120,13 @@ def cyl_normal_prefetch_items_for_result(*, res: fit_model.FitResult3D) -> dict[
 	if res.cyl_xyz is None or res.cyl_count <= 0:
 		return {}
 	if bool(getattr(res, "cyl_shell_mode", False)):
-		xyz = _shell_xyz(res)
-		if xyz is None:
+		geom = _shell_geometry(res=res, factor=4)
+		if geom is None:
 			return {}
-		pts = _shell_supersampled_xyz(xyz, factor=4).unsqueeze(0).detach()
+		pts = geom["xyz"].unsqueeze(0).detach()
+		base = geom.get("base")
+		if base is not None and bool(geom.get("has_base", False)):
+			pts = torch.cat([pts.reshape(1, 1, -1, 3), base.unsqueeze(0).detach().reshape(1, 1, -1, 3)], dim=2)
 	else:
 		pts = res.cyl_xyz.detach()
 	return {"grad_mag": pts, "nx": pts, "ny": pts}
@@ -162,6 +178,54 @@ def _periodic_interp_width(xyz: torch.Tensor, target_w: int) -> torch.Tensor:
 	return p0 + frac * (p1 - p0)
 
 
+def _shell_supersampled_field(field: torch.Tensor, *, factor: int = 4) -> torch.Tensor:
+	factor = max(1, int(factor))
+	if factor <= 1:
+		return field
+	if field.ndim == 2:
+		field_in = field.unsqueeze(-1)
+		squeeze = True
+	else:
+		field_in = field
+		squeeze = False
+	H, W = int(field_in.shape[0]), int(field_in.shape[1])
+	target_h = max(2, (H - 1) * factor + 1)
+	t = field_in.permute(2, 1, 0).unsqueeze(0)
+	t = F.interpolate(t, size=(W, target_h), mode="bilinear", align_corners=True)
+	field_h = t.squeeze(0).permute(2, 1, 0).contiguous()
+	out = _periodic_interp_width(field_h, W * factor)
+	return out.squeeze(-1) if squeeze else out
+
+
+def _interp_width_at_offsets(field: torch.Tensor, offsets: torch.Tensor, *, offset_scale: float = 1.0) -> torch.Tensor:
+	if field.ndim == 2:
+		field_in = field.unsqueeze(-1)
+		squeeze = True
+	else:
+		field_in = field
+		squeeze = False
+	H = int(field_in.shape[0])
+	W = int(field_in.shape[1])
+	C = int(field_in.shape[2])
+	if W <= 1:
+		out = field_in.expand(H, max(1, W), C)
+		return out.squeeze(-1) if squeeze else out
+	device = field_in.device
+	dtype = field_in.dtype
+	base_w = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
+	phase = base_w + offsets.to(device=device, dtype=dtype) * float(offset_scale)
+	i0_floor = torch.floor(phase)
+	frac = (phase - i0_floor).unsqueeze(-1)
+	i0 = torch.remainder(i0_floor.to(dtype=torch.long), W)
+	i1 = torch.remainder(i0 + 1, W)
+	i0e = i0.unsqueeze(-1).expand(H, W, C)
+	i1e = i1.unsqueeze(-1).expand(H, W, C)
+	p0 = torch.gather(field_in, 1, i0e)
+	p1 = torch.gather(field_in, 1, i1e)
+	out = p0 + frac * (p1 - p0)
+	return out.squeeze(-1) if squeeze else out
+
+
 def _shell_supersampled_xyz(xyz: torch.Tensor, *, factor: int = 4) -> torch.Tensor:
 	factor = max(1, int(factor))
 	if factor <= 1:
@@ -172,6 +236,30 @@ def _shell_supersampled_xyz(xyz: torch.Tensor, *, factor: int = 4) -> torch.Tens
 	t = F.interpolate(t, size=(W, target_h), mode="bilinear", align_corners=True)
 	xyz_h = t.squeeze(0).permute(2, 1, 0).contiguous()
 	return _periodic_interp_width(xyz_h, W * factor)
+
+
+def _shell_geometry(*, res: fit_model.FitResult3D, factor: int = 4) -> dict[str, torch.Tensor | bool] | None:
+	xyz_lr = _shell_xyz(res)
+	if xyz_lr is None:
+		return None
+	base = getattr(res, "cyl_shell_base_xyz", None)
+	offsets = getattr(res, "cyl_shell_w_offsets", None)
+	delta_xy = getattr(res, "cyl_shell_delta_xy", None)
+	if base is None or offsets is None or delta_xy is None:
+		xyz = _shell_supersampled_xyz(xyz_lr, factor=factor)
+		return {"xyz": xyz, "base": None, "conn": None, "has_base": False}
+
+	base_s = _shell_supersampled_field(base.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
+	offsets_s = _shell_supersampled_field(offsets.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
+	delta_s = _shell_supersampled_field(delta_xy.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
+	has_base = int(getattr(res, "cyl_shell_index", 0)) > 0
+	if has_base:
+		base_conn = _interp_width_at_offsets(base_s, offsets_s, offset_scale=float(factor))
+	else:
+		base_conn = base_s
+	delta_xyz = torch.cat([delta_s, torch.zeros_like(delta_s[..., :1])], dim=-1)
+	xyz = base_conn + delta_xyz
+	return {"xyz": xyz, "base": base_conn, "conn": xyz - base_conn, "has_base": has_base}
 
 
 def _unit_normals_for_shell_xyz(xyz: torch.Tensor) -> torch.Tensor:
@@ -199,6 +287,49 @@ def _register_shell_term(
 		lm_out = lm_out.unsqueeze(0)
 		mask_out = mask_out.unsqueeze(0)
 	return loss, (lm_out.unsqueeze(0).unsqueeze(0),), (mask_out.unsqueeze(0).unsqueeze(0),)
+
+
+def _register_shell_masked_term(
+	name: str,
+	lm: torch.Tensor,
+	mask: torch.Tensor,
+	*,
+	res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	mask = mask.to(device=lm.device, dtype=lm.dtype)
+	wsum = mask.sum()
+	err = (lm * mask).sum() / wsum.clamp(min=1.0)
+	err = torch.where(wsum > 0.0, err, torch.full_like(err, float("inf")))
+	loss = _register_candidate_term(name, err.view(1))
+	lm_out = lm
+	mask_out = mask
+	while lm_out.ndim < 2:
+		lm_out = lm_out.unsqueeze(0)
+		mask_out = mask_out.unsqueeze(0)
+	return loss, (lm_out.unsqueeze(0).unsqueeze(0),), (mask_out.unsqueeze(0).unsqueeze(0),)
+
+
+def _normal_align_lm(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	a = F.normalize(a, dim=-1, eps=1.0e-8)
+	b = F.normalize(b, dim=-1, eps=1.0e-8)
+	dot_abs = (a * b).sum(dim=-1).clamp(min=-1.0, max=1.0).abs()
+	return 1.0 - dot_abs * dot_abs, dot_abs
+
+
+def _sample_shell_gt(
+	*,
+	res: fit_model.FitResult3D,
+	xyz: torch.Tensor,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+	sampled = res.data.grid_sample_fullres(
+		xyz.unsqueeze(0).detach(),
+		channels={"grad_mag", "nx", "ny"},
+	)
+	target = sampled.normal_3d
+	grad_mag = sampled.grad_mag
+	if target is None or grad_mag is None:
+		return None, None
+	return target.squeeze(0), (grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz.dtype)
 
 
 def _sample_gt(res: fit_model.FitResult3D) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -340,25 +471,18 @@ def cyl_normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		return _zero_loss(res)
 
 	if bool(getattr(res, "cyl_shell_mode", False)):
-		xyz_lr = _shell_xyz(res)
-		if xyz_lr is None:
+		geom = _shell_geometry(res=res, factor=4)
+		if geom is None:
 			return _zero_loss(res)
-		xyz = _shell_supersampled_xyz(xyz_lr, factor=4)
+		xyz = geom["xyz"]
 		normal = _unit_normals_for_shell_xyz(xyz)
-		sampled = res.data.grid_sample_fullres(
-			xyz.unsqueeze(0).detach(),
-			channels={"grad_mag", "nx", "ny"},
-		)
-		target = sampled.normal_3d
-		grad_mag = sampled.grad_mag
-		if target is None or grad_mag is None:
+		target, mask = _sample_shell_gt(res=res, xyz=xyz)
+		if target is None or mask is None:
 			return _zero_loss(res)
-		target = target.squeeze(0)
 		normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
 		dot = (normal * target).sum(dim=-1).clamp(min=-1.0, max=1.0)
 		dot_abs = dot.abs()
 		lm = 1.0 - dot_abs * dot_abs
-		mask = (grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=lm.dtype)
 		wsum = mask.sum()
 		err = (lm * mask).sum() / wsum.clamp(min=1.0)
 		err = torch.where(wsum > 0.0, err, torch.full_like(err, float("inf")))
@@ -430,6 +554,18 @@ def cyl_smooth_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	return _register_shell_term("cyl_smooth", lm, res=res)
 
 
+def cyl_z_smooth_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Shell Laplacian loss along the height/z index only."""
+	xyz = _shell_xyz(res)
+	if xyz is None or int(xyz.shape[0]) <= 2:
+		return _zero_loss(res)
+	h_scale, _w_scale = _shell_spacing_scales(xyz)
+	h_mid = xyz[1:-1]
+	h_avg = 0.5 * (xyz[:-2] + xyz[2:])
+	lm = ((h_mid - h_avg).norm(dim=-1) / h_scale).square()
+	return _register_shell_term("cyl_z_smooth", lm, res=res)
+
+
 def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Equalize consecutive shell edge lengths to one global differentiable target."""
 	xyz = _shell_xyz(res)
@@ -440,3 +576,110 @@ def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[to
 	target = w_len.mean().clamp(min=1.0e-6)
 	lm = ((w_len - target) / target).square()
 	return _register_shell_term("cyl_step", lm, res=res)
+
+
+def cyl_bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Penalize sharp shell bends using the same angle threshold as mesh bend."""
+	xyz = _shell_xyz(res)
+	if xyz is None:
+		return _zero_loss(res)
+
+	def _bend_penalty(e1: torch.Tensor, e2: torch.Tensor) -> torch.Tensor:
+		e1n = F.normalize(e1, dim=-1, eps=1.0e-12)
+		e2n = F.normalize(e2, dim=-1, eps=1.0e-12)
+		cos_angle = (-e1n * e2n).sum(dim=-1)
+		excess = (cos_angle - _BEND_COS_THRESHOLD).clamp(min=0.0)
+		return excess * excess
+
+	terms: list[torch.Tensor] = []
+	if int(xyz.shape[0]) > 2:
+		e1_h = xyz[1:-1] - xyz[:-2]
+		e2_h = xyz[2:] - xyz[1:-1]
+		terms.append(_bend_penalty(e1_h, e2_h).reshape(-1))
+	if int(xyz.shape[1]) > 2:
+		e1_w = xyz - torch.roll(xyz, shifts=1, dims=1)
+		e2_w = torch.roll(xyz, shifts=-1, dims=1) - xyz
+		terms.append(_bend_penalty(e1_w, e2_w).reshape(-1))
+	if not terms:
+		return _zero_loss(res)
+	lm = torch.cat(terms, dim=0)
+	return _register_shell_term("cyl_bend", lm, res=res)
+
+
+def _shell_offset_geometry_for_loss(res: fit_model.FitResult3D) -> dict[str, torch.Tensor | bool] | None:
+	geom = _shell_geometry(res=res, factor=4)
+	if geom is None or not bool(geom.get("has_base", False)):
+		return None
+	if geom.get("base") is None or geom.get("conn") is None:
+		return None
+	return geom
+
+
+def cyl_conn_mesh_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Align the base-to-shell connection vector with both shells' mesh normals."""
+	geom = _shell_offset_geometry_for_loss(res)
+	if geom is None:
+		return _zero_loss(res)
+	xyz = geom["xyz"]
+	base = geom["base"]
+	conn = geom["conn"]
+	if not isinstance(xyz, torch.Tensor) or not isinstance(base, torch.Tensor) or not isinstance(conn, torch.Tensor):
+		return _zero_loss(res)
+	conn_n = F.normalize(conn, dim=-1, eps=1.0e-8)
+	new_mesh_n = _unit_normals_for_shell_xyz(xyz)
+	base_mesh_n = _unit_normals_for_shell_xyz(base)
+	lm_new, _dot_new = _normal_align_lm(conn_n, new_mesh_n)
+	lm_base, _dot_base = _normal_align_lm(conn_n, base_mesh_n)
+	lm = torch.cat([lm_new.reshape(-1), lm_base.reshape(-1)], dim=0)
+	return _register_shell_term("cyl_conn_mesh", lm, res=res)
+
+
+def cyl_conn_gt_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Align the base-to-shell connection vector with GT normals at both shell positions."""
+	geom = _shell_offset_geometry_for_loss(res)
+	if geom is None:
+		return _zero_loss(res)
+	xyz = geom["xyz"]
+	base = geom["base"]
+	conn = geom["conn"]
+	if not isinstance(xyz, torch.Tensor) or not isinstance(base, torch.Tensor) or not isinstance(conn, torch.Tensor):
+		return _zero_loss(res)
+	conn_n = F.normalize(conn, dim=-1, eps=1.0e-8)
+	new_gt, new_mask = _sample_shell_gt(res=res, xyz=xyz)
+	base_gt, base_mask = _sample_shell_gt(res=res, xyz=base)
+	if new_gt is None or new_mask is None or base_gt is None or base_mask is None:
+		return _zero_loss(res)
+	lm_new, _dot_new = _normal_align_lm(conn_n, new_gt)
+	lm_base, _dot_base = _normal_align_lm(conn_n, base_gt)
+	lm = torch.cat([lm_new.reshape(-1), lm_base.reshape(-1)], dim=0)
+	mask = torch.cat([new_mask.reshape(-1), base_mask.reshape(-1)], dim=0)
+	return _register_shell_masked_term("cyl_conn_gt", lm, mask, res=res)
+
+
+def cyl_base_mesh_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Align the offset-sampled base shell mesh normal with the new shell mesh normal."""
+	geom = _shell_offset_geometry_for_loss(res)
+	if geom is None:
+		return _zero_loss(res)
+	xyz = geom["xyz"]
+	base = geom["base"]
+	if not isinstance(xyz, torch.Tensor) or not isinstance(base, torch.Tensor):
+		return _zero_loss(res)
+	lm, _dot = _normal_align_lm(_unit_normals_for_shell_xyz(base), _unit_normals_for_shell_xyz(xyz))
+	return _register_shell_term("cyl_base_mesh", lm, res=res)
+
+
+def cyl_base_gt_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Align the offset-sampled base GT normal with the new shell mesh normal."""
+	geom = _shell_offset_geometry_for_loss(res)
+	if geom is None:
+		return _zero_loss(res)
+	xyz = geom["xyz"]
+	base = geom["base"]
+	if not isinstance(xyz, torch.Tensor) or not isinstance(base, torch.Tensor):
+		return _zero_loss(res)
+	base_gt, base_mask = _sample_shell_gt(res=res, xyz=base)
+	if base_gt is None or base_mask is None:
+		return _zero_loss(res)
+	lm, _dot = _normal_align_lm(_unit_normals_for_shell_xyz(xyz), base_gt)
+	return _register_shell_masked_term("cyl_base_gt", lm, base_mask, res=res)

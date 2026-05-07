@@ -47,10 +47,15 @@ class FitResult3D:
 	cyl_normals: torch.Tensor | None = None  # (N*D, Hm, Wm, 3) analytic cylinder normals
 	cyl_centers: torch.Tensor | None = None  # (N, 3) cylinder axis anchor [cx, cy, zc]
 	cyl_axes: torch.Tensor | None = None     # (N, 3) unit cylinder axis direction
-	cyl_params: torch.Tensor | None = None   # analytic: (N, 6); shell: (H, W) normal_raw
+	cyl_params: torch.Tensor | None = None   # analytic: (N, 6); shell: (H, W, 2) free xy delta
 	cyl_count: int = 0
 	cyl_shell_mode: bool = False
 	cyl_shell_step: float = 500.0
+	cyl_shell_base_xyz: torch.Tensor | None = None
+	cyl_shell_dirs: torch.Tensor | None = None
+	cyl_shell_w_offsets: torch.Tensor | None = None
+	cyl_shell_delta_xy: torch.Tensor | None = None
+	cyl_shell_index: int = 0
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
@@ -125,12 +130,14 @@ class Model3D(nn.Module):
 		# derived so q=0 stays on the seed point, and height is centered
 		# at the seed along the optimized cylinder axis.
 		self.cyl_params = nn.Parameter(self._default_cylinder_params(device=device))
+		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.cyl_seed_xyz = torch.zeros(3, device=device, dtype=torch.float32)
 		self.cyl_shell_mode = False
-		self.cyl_shell_target_count = 3
+		self.cyl_shell_target_count = 6
 		self.cyl_shell_initial_radius = 1000.0
-		self.cyl_shell_step = 500.0
-		self.cyl_shell_z_step = 1000.0
+		self.cyl_shell_step = 1000.0
+		self.cyl_shell_initial_step = 10.0
+		self.cyl_shell_z_step = 200.0
 		self.cyl_shell_width_target_step = 200.0
 		self.cyl_shell_min_width = 20
 		self.cyl_shell_seed_z = float(z_center)
@@ -314,7 +321,8 @@ class Model3D(nn.Module):
 		with torch.no_grad():
 			self.cyl_seed_xyz = torch.tensor([float(seed[0]), float(seed[1]), float(seed[2])],
 											 device=device, dtype=torch.float32)
-			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
+			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, 2, device=device, dtype=torch.float32))
+			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.params = replace(self.params, model_w=None, model_h=float(model_h))
 		self.cyl_shell_mode = True
 		self.cyl_shell_seed_z = float(seed[2])
@@ -374,12 +382,13 @@ class Model3D(nn.Module):
 		self.cyl_shell_z = z.detach()
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self.cyl_params = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
+		self.cyl_params = nn.Parameter(self._initial_shell_delta_xy(dirs).to(device=device, dtype=dtype))
+		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		print(f"[model] umbilicus tube init: shells={self.cyl_shell_target_count} "
 			  f"H={H} W={W} z_center={self.cyl_shell_seed_z:.1f} "
 			  f"model_h={model_h:.1f} z_step={actual_z_step:.1f} "
 			  f"z_step_target={z_step:.1f} initial_radius={radius0:.1f} "
-			  f"shell_step={self.cyl_shell_step:.1f}",
+			  f"free_xy_init_step={self.cyl_shell_initial_step:.1f}",
 			  flush=True)
 
 	def _shell_z_values(self, *, device: torch.device, dtype: torch.dtype, h: int) -> torch.Tensor:
@@ -491,20 +500,75 @@ class Model3D(nn.Module):
 			gt_xy = torch.where(((gt_xy * surf_xy).sum(dim=-1, keepdim=True) > 0.5), gt_xy, surf_xy)
 			return torch.cat([gt_xy, torch.zeros_like(gt_xy[..., :1])], dim=-1).detach()
 
-	def _shell_raw_normal(self) -> torch.Tensor:
-		if self.cyl_params.ndim == 2:
-			return self.cyl_params
+	def _initial_shell_delta_xy(self, dirs: torch.Tensor) -> torch.Tensor:
+		step = max(0.0, float(getattr(self, "cyl_shell_initial_step", 10.0)))
+		return dirs[..., :2] * step
+
+	def _shell_delta_xy_params(self) -> torch.Tensor:
+		if self.cyl_params.ndim == 3 and int(self.cyl_params.shape[-1]) == 2:
+			delta_xy = self.cyl_params
+			length = delta_xy.norm(dim=-1)
+			target = delta_xy.new_tensor(float(self._current_shell_target_offset()))
+			scale = target / length.mean().clamp(min=1.0e-6)
+			return delta_xy * scale
 		raise ValueError(f"invalid cylinder shell params shape: {tuple(self.cyl_params.shape)}")
 
-	def _shell_offset_distance(self) -> torch.Tensor:
-		normal_raw = self._shell_raw_normal()
-		raw = F.softplus(normal_raw) + 1.0e-6
-		scale = self._current_shell_target_offset() / raw.mean().clamp(min=1.0e-6)
-		return raw * scale
+	def _shell_w_offset_values(self) -> torch.Tensor:
+		delta_xy = self._shell_delta_xy_params()
+		if int(getattr(self, "cyl_shell_current_index", 0)) <= 0:
+			return torch.zeros_like(delta_xy[..., 0])
+		if self.cyl_shell_w_offsets.shape != delta_xy.shape[:2]:
+			return torch.zeros_like(delta_xy[..., 0])
+		return self.cyl_shell_w_offsets
+
+	@staticmethod
+	def _interp_width_at_offsets(field: torch.Tensor, offsets: torch.Tensor, *, offset_scale: float = 1.0) -> torch.Tensor:
+		if field.ndim == 2:
+			field_in = field.unsqueeze(-1)
+			squeeze = True
+		else:
+			field_in = field
+			squeeze = False
+		H = int(field_in.shape[0])
+		W = int(field_in.shape[1])
+		C = int(field_in.shape[2])
+		if W <= 1:
+			out = field_in.expand(H, max(1, W), C)
+			return out.squeeze(-1) if squeeze else out
+		device = field_in.device
+		dtype = field_in.dtype
+		base_w = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
+		phase = base_w + offsets.to(device=device, dtype=dtype) * float(offset_scale)
+		i0_floor = torch.floor(phase)
+		frac = (phase - i0_floor).unsqueeze(-1)
+		i0 = torch.remainder(i0_floor.to(dtype=torch.long), W)
+		i1 = torch.remainder(i0 + 1, W)
+		i0e = i0.unsqueeze(-1).expand(H, W, C)
+		i1e = i1.unsqueeze(-1).expand(H, W, C)
+		p0 = torch.gather(field_in, 1, i0e)
+		p1 = torch.gather(field_in, 1, i1e)
+		out = p0 + frac * (p1 - p0)
+		return out.squeeze(-1) if squeeze else out
+
+	def _current_base_conn_and_dirs(self) -> tuple[torch.Tensor, torch.Tensor]:
+		if self.cyl_shell_base is None or self.cyl_shell_dirs is None:
+			raise ValueError("umbilicus tube shell has not been prepared")
+		base = self.cyl_shell_base
+		dirs = self.cyl_shell_dirs
+		offsets = self._shell_w_offset_values()
+		if int(getattr(self, "cyl_shell_current_index", 0)) <= 0:
+			return base, F.normalize(dirs, dim=-1, eps=1.0e-8)
+		base_conn = self._interp_width_at_offsets(base, offsets)
+		dirs_conn = self._interp_width_at_offsets(dirs, offsets)
+		return base_conn, F.normalize(dirs_conn, dim=-1, eps=1.0e-8)
+
+	def _shell_delta_xyz(self) -> torch.Tensor:
+		delta_xy = self._shell_delta_xy_params()
+		return torch.cat([delta_xy, torch.zeros_like(delta_xy[..., :1])], dim=-1)
 
 	def _shell_offset_stats(self) -> tuple[float, float, float]:
 		with torch.no_grad():
-			dist = self._shell_offset_distance()
+			dist = self._shell_delta_xy_params().norm(dim=-1)
 			return (
 				float(dist.mean().detach().cpu()),
 				float(dist.amin().detach().cpu()),
@@ -547,10 +611,10 @@ class Model3D(nn.Module):
 	def current_cylinder_shell_xyz(self) -> torch.Tensor:
 		if self.cyl_shell_base is None or self.cyl_shell_dirs is None:
 			raise ValueError("umbilicus tube shell has not been prepared")
-		normal_dist = self._shell_offset_distance()
-		normal_dirs = self.cyl_shell_dirs.to(device=normal_dist.device, dtype=normal_dist.dtype)
-		base = self.cyl_shell_base.to(device=normal_dist.device, dtype=normal_dist.dtype)
-		return base + normal_dist.unsqueeze(-1) * normal_dirs
+		delta = self._shell_delta_xyz()
+		base, _normal_dirs = self._current_base_conn_and_dirs()
+		base = base.to(device=delta.device, dtype=delta.dtype)
+		return base + delta
 
 	def current_cylinder_shell_normals(self) -> torch.Tensor:
 		return self._unit_vertex_normals_for_shell(self.current_cylinder_shell_xyz())
@@ -578,17 +642,18 @@ class Model3D(nn.Module):
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self.cyl_params = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
+		self.cyl_params = nn.Parameter(self._initial_shell_delta_xy(dirs).to(device=device, dtype=dtype))
+		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		self.cyl_shell_current_index = idx
 		self.cyl_shell_active = True
 		self.cylinder_enabled = True
 		self.cyl_shell_mode = True
 		step_avg, step_min, step_max = self._shell_offset_stats()
 		wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
-		target_offset = self._current_shell_target_offset()
+		init_step = max(0.0, float(getattr(self, "cyl_shell_initial_step", 10.0)))
 		print(f"[model] shell {idx + 1}/{self.cyl_shell_target_count}: H={H} W={W} "
 			  f"base={'umbilicus' if idx == 0 else 'previous'} "
-			  f"target_offset={target_offset:.1f} "
+			  f"free_xy_init_step={init_step:.1f} "
 			  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
 			  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}", flush=True)
 
@@ -1771,13 +1836,28 @@ class Model3D(nn.Module):
 				cyl_centers = None
 				cyl_axes = None
 				cyl_count = 1
+				cyl_shell_base_xyz = self.cyl_shell_base
+				cyl_shell_dirs = self.cyl_shell_dirs
+				cyl_shell_w_offsets = self._shell_w_offset_values()
+				cyl_shell_delta_xy = self._shell_delta_xy_params()
+				cyl_shell_index = int(self.cyl_shell_current_index)
 			else:
 				cyl_xyz, cyl_normals = self.cylinder_samples()
 				cyl_centers = self.cylinder_centers()
 				cyl_axes = self.cylinder_axes()
 				cyl_count = int(self.cyl_params.shape[0])
+				cyl_shell_base_xyz = None
+				cyl_shell_dirs = None
+				cyl_shell_w_offsets = None
+				cyl_shell_delta_xy = None
+				cyl_shell_index = 0
 		else:
 			cyl_centers = None
+			cyl_shell_base_xyz = None
+			cyl_shell_dirs = None
+			cyl_shell_w_offsets = None
+			cyl_shell_delta_xy = None
+			cyl_shell_index = 0
 
 		return FitResult3D(
 			xyz_lr=xyz_lr,
@@ -1805,6 +1885,11 @@ class Model3D(nn.Module):
 			cyl_count=cyl_count,
 			cyl_shell_mode=bool(self.cyl_shell_mode and self.cylinder_enabled),
 			cyl_shell_step=float(self._current_shell_target_offset()),
+			cyl_shell_base_xyz=cyl_shell_base_xyz,
+			cyl_shell_dirs=cyl_shell_dirs,
+			cyl_shell_w_offsets=cyl_shell_w_offsets,
+			cyl_shell_delta_xy=cyl_shell_delta_xy,
+			cyl_shell_index=cyl_shell_index,
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
@@ -1826,6 +1911,8 @@ class Model3D(nn.Module):
 			out["straight_half_w"] = [self.straight_half_w]
 		if self.cylinder_enabled:
 			out["cyl_params"] = [self.cyl_params]
+			if self.cyl_shell_mode and int(getattr(self, "cyl_shell_current_index", 0)) > 0:
+				out["cyl_params"].append(self.cyl_shell_w_offsets)
 		return out
 
 	def crop_depth(self, d_lo: int, d_hi: int) -> None:
@@ -1883,6 +1970,7 @@ class Model3D(nn.Module):
 			if k.startswith("conn_offset_ms."):
 				st.pop(k)
 		st.pop("cyl_params", None)
+		st.pop("cyl_shell_w_offsets", None)
 		incompat = super().load_state_dict(st, strict=bool(strict))
 		return list(incompat.missing_keys), list(incompat.unexpected_keys)
 

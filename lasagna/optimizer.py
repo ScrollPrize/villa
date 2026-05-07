@@ -144,7 +144,10 @@ def _parse_opt_settings(
 	if "cyl_params" in params:
 		if params != ["cyl_params"]:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
-		cyl_loss_names = ("cyl_normal", "cyl_center", "cyl_smooth", "cyl_step")
+		cyl_loss_names = (
+			"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
+			"cyl_bend", "cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt",
+		)
 		if not any(float(eff.get(name, 0.0)) != 0.0 for name in cyl_loss_names):
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	return OptSettings(
@@ -176,7 +179,13 @@ lambda_global: dict[str, float] = {
 	"cyl_normal": 0.0,
 	"cyl_center": 0.0,
 	"cyl_smooth": 0.0,
+	"cyl_z_smooth": 0.0,
 	"cyl_step": 0.0,
+	"cyl_bend": 0.0,
+	"cyl_conn_mesh": 0.0,
+	"cyl_conn_gt": 0.0,
+	"cyl_base_mesh": 0.0,
+	"cyl_base_gt": 0.0,
 }
 
 
@@ -385,7 +394,13 @@ def optimize(
 		"cyl_normal": {"loss": opt_loss_cyl.cyl_normal_loss},
 		"cyl_center": {"loss": opt_loss_cyl.cyl_center_loss},
 		"cyl_smooth": {"loss": opt_loss_cyl.cyl_smooth_loss},
+		"cyl_z_smooth": {"loss": opt_loss_cyl.cyl_z_smooth_loss},
 		"cyl_step": {"loss": opt_loss_cyl.cyl_step_loss},
+		"cyl_bend": {"loss": opt_loss_cyl.cyl_bend_loss},
+		"cyl_conn_mesh": {"loss": opt_loss_cyl.cyl_conn_mesh_loss},
+		"cyl_conn_gt": {"loss": opt_loss_cyl.cyl_conn_gt_loss},
+		"cyl_base_mesh": {"loss": opt_loss_cyl.cyl_base_mesh_loss},
+		"cyl_base_gt": {"loss": opt_loss_cyl.cyl_base_gt_loss},
 	}
 
 	_corr_start_printed = [False]
@@ -402,7 +417,13 @@ def optimize(
 				"cyl_normal": float(opt_cfg.eff.get("cyl_normal", 0.0)),
 				"cyl_center": float(opt_cfg.eff.get("cyl_center", 0.0)),
 				"cyl_smooth": float(opt_cfg.eff.get("cyl_smooth", 0.0)),
+				"cyl_z_smooth": float(opt_cfg.eff.get("cyl_z_smooth", 0.0)),
 				"cyl_step": float(opt_cfg.eff.get("cyl_step", 0.0)),
+				"cyl_bend": float(opt_cfg.eff.get("cyl_bend", 0.0)),
+				"cyl_conn_mesh": float(opt_cfg.eff.get("cyl_conn_mesh", 0.0)),
+				"cyl_conn_gt": float(opt_cfg.eff.get("cyl_conn_gt", 0.0)),
+				"cyl_base_mesh": float(opt_cfg.eff.get("cyl_base_mesh", 0.0)),
+				"cyl_base_gt": float(opt_cfg.eff.get("cyl_base_gt", 0.0)),
 			}
 			if is_cyl_stage else opt_cfg.eff
 		)
@@ -410,7 +431,13 @@ def optimize(
 			_need_term("cyl_normal", stage_eff) > 0 or
 			_need_term("cyl_center", stage_eff) > 0 or
 			_need_term("cyl_smooth", stage_eff) > 0 or
-			_need_term("cyl_step", stage_eff) > 0
+			_need_term("cyl_z_smooth", stage_eff) > 0 or
+			_need_term("cyl_step", stage_eff) > 0 or
+			_need_term("cyl_bend", stage_eff) > 0 or
+			_need_term("cyl_conn_mesh", stage_eff) > 0 or
+			_need_term("cyl_conn_gt", stage_eff) > 0 or
+			_need_term("cyl_base_mesh", stage_eff) > 0 or
+			_need_term("cyl_base_gt", stage_eff) > 0
 		)
 		stage_args = opt_cfg.args or {}
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
@@ -485,9 +512,10 @@ def optimize(
 				if not param_groups:
 					return data
 				opt = torch.optim.Adam(param_groups)
-			_stage_done(f"{label}.winding_offset_autocrop", _t)
+		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
 		_status_rows = 0
+		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
 
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
 						  its: float | None = None) -> None:
@@ -536,13 +564,13 @@ def optimize(
 			values.update({f"p:{k}": _fmt_val(f"p:{k}", pv[k]) for k in pv_keys})
 			widths = {k: max(len(_display_key(k)), len(values[k]), 5) for k in cols}
 			if _status_rows % 20 == 0:
-				hdr = f"{'step':>16s} {'loss':>8s} {'it/s':>5s}"
+				hdr = f"{'step':>{_status_step_width}s} {'loss':>8s} {'it/s':>5s}"
 				for c in cols:
 					hdr += f" {_display_key(c):>{widths[c]}s}"
 				print(hdr)
 			_status_rows += 1
 			its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
-			row = f"{step_label:>16s} {loss_val:8.4f} {its_str}"
+			row = f"{step_label:>{_status_step_width}s} {loss_val:8.4f} {its_str}"
 			for k in tv_keys:
 				row += f" {values[k]:>{widths[k]}s}"
 			for k in pv_keys:
@@ -726,6 +754,13 @@ def optimize(
 				model.prepare_umbilicus_tube_init(data)
 			shell_count = int(getattr(model, "cyl_shell_target_count", 3))
 			max_steps = int(opt_cfg.steps)
+			_status_step_width = max(
+				_status_step_width,
+				max(
+					len(f"{label}.shell{shell_i + 1} {max_steps}/{max_steps}") + 2
+					for shell_i in range(max(1, shell_count))
+				),
+			)
 
 			def _prefetch_shell_model_points() -> None:
 				if not _active_caches:
@@ -749,6 +784,10 @@ def optimize(
 			for shell_i in range(shell_count):
 				if hasattr(model, "begin_cylinder_shell"):
 					model.begin_cylinder_shell(shell_i, data)
+				shell_eff = dict(stage_eff)
+				if shell_i == 0:
+					for _first_shell_base_term in ("cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt"):
+						shell_eff[_first_shell_base_term] = 0.0
 				all_params, param_groups = _make_param_groups()
 				if not param_groups:
 					return data
@@ -761,7 +800,7 @@ def optimize(
 					res0 = model(data)
 					_prefetch_loss_points_for_result(res0)
 					loss0, term_vals0, display_loss0 = _eval_terms(
-						res0, stage_eff, profile_label=f"{shell_label}.initial_eval.loss")
+						res0, shell_eff, profile_label=f"{shell_label}.initial_eval.loss")
 				term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 				_print_status(
 					step_label=f"{shell_label} 0/{max_steps}",
@@ -787,7 +826,7 @@ def optimize(
 					_prefetch_shell_model_points()
 					res = model(data)
 					_prefetch_loss_points_for_result(res)
-					loss, term_vals, display_loss = _eval_terms(res, stage_eff)
+					loss, term_vals, display_loss = _eval_terms(res, shell_eff)
 					if fit_data.CHUNK_STATS_ENABLED:
 						fit_data._chunk_stats.end_iteration()
 

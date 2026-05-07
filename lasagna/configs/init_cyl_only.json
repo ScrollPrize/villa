@@ -6,8 +6,14 @@
 	},
 	"base": {
 		"cyl_normal": 1.0,
-		"cyl_smooth": 0.0,
-		"cyl_step": 0.0,
+		"cyl_smooth": 0.01,
+		"cyl_z_smooth": 0.01,
+		"cyl_step": 10.0,
+		"cyl_bend": 100.0,
+		"cyl_conn_mesh": 0.1,
+		"cyl_conn_gt": 0.1,
+		"cyl_base_mesh": 0.1,
+		"cyl_base_gt": 0.1,
 		"normal": 1.0,
 		"step": 10.0,
 		"smooth": 0.0001,
@@ -24,7 +30,7 @@
 	"stages": [
 		{
 			"name": "cylinder_seed",
-			"steps": 1000,
+			"steps": 500,
 			"lr": 0.1,
 			"params": ["cyl_params"]
 		}
