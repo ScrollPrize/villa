@@ -297,6 +297,22 @@ def optimize(
 		if torch.cuda.is_available():
 			torch.cuda.synchronize()
 
+	def _truthy(value) -> bool:
+		if isinstance(value, bool):
+			return value
+		if value is None:
+			return False
+		if isinstance(value, (int, float)):
+			return value != 0
+		return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+	def _flow_timing_enabled(cfg) -> bool:
+		if _truthy(os.environ.get("LASAGNA_FLOW_TIMING")):
+			return True
+		if not isinstance(cfg, dict):
+			return False
+		return _truthy(cfg.get("profile_cuda_timing", False))
+
 	class _FlowTimingWindow:
 		def __init__(self, *, interval: int = 100) -> None:
 			self.interval = max(1, int(interval))
@@ -690,7 +706,12 @@ def optimize(
 		_t_steps_acc = 0
 		loss = loss0
 		_flow_timing = None
-		if pred_dt_flow_gate_cfg is not None and bool(pred_dt_flow_gate_cfg.get("enabled", False)) and _need_term("pred_dt", opt_cfg.eff) > 0:
+		if (
+			pred_dt_flow_gate_cfg is not None
+			and bool(pred_dt_flow_gate_cfg.get("enabled", False))
+			and _need_term("pred_dt", opt_cfg.eff) > 0
+			and _flow_timing_enabled(pred_dt_flow_gate_cfg)
+		):
 			_flow_timing = _FlowTimingWindow(interval=100)
 
 		for step in range(max_steps):
