@@ -552,7 +552,7 @@ def optimize(
 			header = (
 				f"{'rank':>4s} {'idx':>5s} {'score':>10s} {'normal':>10s}"
 				+ (f" {'center':>10s}" if show_center else "")
-				+ f" {'n_avg':>8s} {'n_max':>8s} {'r':>9s} {'ratio':>7s} {'seed_q':>8s} {'roll':>8s}"
+				+ f" {'n_avg':>8s} {'n_max':>8s} {'r':>9s} {'ratio':>7s} {'seed':>8s} {'roll':>8s}"
 			)
 			print(header, flush=True)
 			for row in rows:

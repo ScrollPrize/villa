@@ -371,9 +371,68 @@ class Model3D(nn.Module):
 		step = h_extent / float(max(1, H - 1))
 		return idx * step
 
+	def _cylinder_width_offsets(self, *, params: torch.Tensor) -> torch.Tensor:
+		device = params.device
+		dtype = params.dtype
+		W = self.mesh_w
+		idx = torch.arange(W, device=device, dtype=dtype) - float(W // 2)
+		width = (
+			float(self.params.model_w)
+			if self.params.model_w is not None
+			else float(self.params.mesh_step) * float(max(0, W - 1))
+		)
+		step = width / float(max(1, W - 1))
+		return idx.view(1, W) * step
+
 	@staticmethod
-	def _ellipse_angle_from_q(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-		return q + 0.5 * k * torch.sin(2.0 * q) + 0.0625 * k * k * torch.sin(4.0 * q)
+	def _ellipse_theta_from_arc_offsets(
+		*,
+		seed_theta: torch.Tensor,
+		offsets: torch.Tensor,
+		a: torch.Tensor,
+		b: torch.Tensor,
+		samples: int = 2049,
+	) -> torch.Tensor:
+		device = seed_theta.device
+		dtype = seed_theta.dtype
+		N = int(seed_theta.shape[0])
+		S = max(17, int(samples))
+		if S % 2 == 0:
+			S += 1
+		theta_grid = torch.linspace(0.0, 2.0 * math.pi, S, device=device, dtype=dtype)
+		sin_t = torch.sin(theta_grid).view(1, S)
+		cos_t = torch.cos(theta_grid).view(1, S)
+		speed = torch.sqrt(
+			(a.view(N, 1) * sin_t) ** 2 +
+			(b.view(N, 1) * cos_t) ** 2
+		).clamp(min=1.0e-8)
+		dtheta = (2.0 * math.pi) / float(S - 1)
+		seg = 0.5 * (speed[:, 1:] + speed[:, :-1]) * dtheta
+		cum = torch.cat([torch.zeros(N, 1, device=device, dtype=dtype), seg.cumsum(dim=1)], dim=1)
+		circ = cum[:, -1].clamp(min=1.0e-8)
+
+		def _interp_arc(theta: torch.Tensor) -> torch.Tensor:
+			t = torch.remainder(theta, 2.0 * math.pi)
+			pos = t * (float(S - 1) / (2.0 * math.pi))
+			i0 = torch.floor(pos).to(dtype=torch.long).clamp(min=0, max=S - 2)
+			frac = (pos - i0.to(dtype=dtype)).clamp(min=0.0, max=1.0)
+			c0 = cum.gather(1, i0.view(N, 1)).squeeze(1)
+			c1 = cum.gather(1, (i0 + 1).view(N, 1)).squeeze(1)
+			return c0 + frac * (c1 - c0)
+
+		seed_arc = _interp_arc(seed_theta)
+		target_arc = seed_arc.view(N, 1) + offsets.to(device=device, dtype=dtype)
+		turns = torch.floor(target_arc / circ.view(N, 1))
+		target_mod = torch.remainder(target_arc, circ.view(N, 1))
+		idx_hi = torch.searchsorted(cum.contiguous(), target_mod.contiguous(), right=False)
+		idx_hi = idx_hi.clamp(min=1, max=S - 1)
+		idx_lo = idx_hi - 1
+		c0 = cum.gather(1, idx_lo)
+		c1 = cum.gather(1, idx_hi)
+		t0 = theta_grid.gather(0, idx_lo.reshape(-1)).reshape_as(target_mod)
+		t1 = theta_grid.gather(0, idx_hi.reshape(-1)).reshape_as(target_mod)
+		frac = ((target_mod - c0) / (c1 - c0).clamp(min=1.0e-8)).clamp(min=0.0, max=1.0)
+		return t0 + frac * (t1 - t0) + turns * (2.0 * math.pi)
 
 	def _cylinder_samples_for_params(self, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Return analytic cylinder samples/normals for params shaped (N, 6)."""
@@ -387,13 +446,18 @@ class Model3D(nn.Module):
 
 		r = params[:, 0].clamp(min=1.0)
 		k = params[:, 1].clamp(min=-0.80, max=0.80)
-		seed_q = params[:, 2]
+		seed_theta = params[:, 2]
 		axis, u, v = self._cylinder_frame(params)
 		a = (r * (1.0 + k)).clamp(min=1.0)
 		b = (r * (1.0 - k)).clamp(min=1.0)
 
-		q = self._cylinder_q_values(params=params)
-		theta = self._ellipse_angle_from_q(seed_q.view(N, 1) + q, k.view(N, 1))
+		offsets = self._cylinder_width_offsets(params=params).expand(N, W)
+		theta = self._ellipse_theta_from_arc_offsets(
+			seed_theta=seed_theta,
+			offsets=offsets,
+			a=a,
+			b=b,
+		)
 
 		cos_p = torch.cos(theta)
 		sin_p = torch.sin(theta)
@@ -407,7 +471,6 @@ class Model3D(nn.Module):
 		ny_local = ny_local / n_len
 
 		seed = self.cyl_seed_xyz.to(device=device, dtype=dtype)
-		seed_theta = self._ellipse_angle_from_q(seed_q, k)
 		seed_cos = torch.cos(seed_theta)
 		seed_sin = torch.sin(seed_theta)
 		seed_radial = a.view(N, 1) * seed_cos.view(N, 1) * u
@@ -435,19 +498,6 @@ class Model3D(nn.Module):
 	def cylinder_samples(self) -> tuple[torch.Tensor, torch.Tensor]:
 		return self._cylinder_samples_for_params(self.cyl_params)
 
-	def _cylinder_q_values(self, *, params: torch.Tensor) -> torch.Tensor:
-		device = params.device
-		dtype = params.dtype
-		N = int(params.shape[0])
-		W = self.mesh_w
-		idx = torch.arange(W, device=device, dtype=dtype) - float(W // 2)
-		idx = idx.view(1, W)
-		if self.params.model_w is None:
-			return idx.expand(N, W) * (2.0 * math.pi / float(max(1, W - 1)))
-		r = params[:, 0].to(device=device, dtype=dtype).clamp(min=1.0)
-		q_step = (float(self.params.model_w) / r) / float(max(1, W - 1))
-		return idx * q_step.view(N, 1)
-
 	def cylinder_centers(self) -> torch.Tensor:
 		params = self.cyl_params
 		self._validate_cyl_params(params)
@@ -455,12 +505,11 @@ class Model3D(nn.Module):
 		dtype = params.dtype
 		r = params[:, 0].clamp(min=1.0)
 		k = params[:, 1].clamp(min=-0.80, max=0.80)
-		seed_q = params[:, 2]
+		seed_theta = params[:, 2]
 		_axis, u, v = self._cylinder_frame(params)
 		a = (r * (1.0 + k)).clamp(min=1.0)
 		b = (r * (1.0 - k)).clamp(min=1.0)
 		seed = self.cyl_seed_xyz.to(device=device, dtype=dtype)
-		seed_theta = self._ellipse_angle_from_q(seed_q, k)
 		seed_radial = a.view(-1, 1) * torch.cos(seed_theta).view(-1, 1) * u
 		seed_radial = seed_radial + b.view(-1, 1) * torch.sin(seed_theta).view(-1, 1) * v
 		return seed.view(1, 3) - seed_radial
