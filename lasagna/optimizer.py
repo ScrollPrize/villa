@@ -144,7 +144,8 @@ def _parse_opt_settings(
 	if "cyl_params" in params:
 		if params != ["cyl_params"]:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
-		if float(eff.get("cyl_normal", 0.0)) == 0.0 and float(eff.get("cyl_center", 0.0)) == 0.0:
+		cyl_loss_names = ("cyl_normal", "cyl_center", "cyl_smooth", "cyl_step")
+		if not any(float(eff.get(name, 0.0)) != 0.0 for name in cyl_loss_names):
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	return OptSettings(
 		steps=steps,
@@ -174,6 +175,8 @@ lambda_global: dict[str, float] = {
 	"ext_offset": 0.0,
 	"cyl_normal": 0.0,
 	"cyl_center": 0.0,
+	"cyl_smooth": 0.0,
+	"cyl_step": 0.0,
 }
 
 
@@ -222,8 +225,7 @@ def load_stages(path: str) -> list[Stage]:
 def total_steps_for_stages(stages: list[Stage]) -> int:
 	total = 0
 	for stage in stages:
-		mul = 3 if "cyl_params" in stage.global_opt.params else 1
-		total += max(0, stage.global_opt.steps) * mul
+		total += max(0, stage.global_opt.steps)
 	return total
 
 
@@ -382,6 +384,8 @@ def optimize(
 		"ext_offset": {"loss": opt_loss_winding_density.ext_offset_loss},
 		"cyl_normal": {"loss": opt_loss_cyl.cyl_normal_loss},
 		"cyl_center": {"loss": opt_loss_cyl.cyl_center_loss},
+		"cyl_smooth": {"loss": opt_loss_cyl.cyl_smooth_loss},
+		"cyl_step": {"loss": opt_loss_cyl.cyl_step_loss},
 	}
 
 	_corr_start_printed = [False]
@@ -397,12 +401,16 @@ def optimize(
 			{
 				"cyl_normal": float(opt_cfg.eff.get("cyl_normal", 0.0)),
 				"cyl_center": float(opt_cfg.eff.get("cyl_center", 0.0)),
+				"cyl_smooth": float(opt_cfg.eff.get("cyl_smooth", 0.0)),
+				"cyl_step": float(opt_cfg.eff.get("cyl_step", 0.0)),
 			}
 			if is_cyl_stage else opt_cfg.eff
 		)
 		stage_uses_cyl_loss = (
 			_need_term("cyl_normal", stage_eff) > 0 or
-			_need_term("cyl_center", stage_eff) > 0
+			_need_term("cyl_center", stage_eff) > 0 or
+			_need_term("cyl_smooth", stage_eff) > 0 or
+			_need_term("cyl_step", stage_eff) > 0
 		)
 		stage_args = opt_cfg.args or {}
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
@@ -684,7 +692,7 @@ def optimize(
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
-			if stage_uses_cyl_loss:
+			if stage_uses_cyl_loss and not bool(getattr(res_, "cyl_shell_mode", False)):
 				best_idx, display_loss, display_tv = opt_loss_cyl.display_stats(eff_)
 				if best_idx is not None and hasattr(model, "set_best_cylinder_index"):
 					model.set_best_cylinder_index(best_idx)
@@ -732,11 +740,11 @@ def optimize(
 				for _cache in _active_caches:
 					_cache.sync()
 
-			def _shell_param_values() -> dict[str, float]:
-				if not hasattr(model, "_shell_offset_stats"):
+			def _shell_dbg_values() -> dict[str, float]:
+				if not hasattr(model, "_shell_width_step_stats"):
 					return {}
-				avg, mn, mx = model._shell_offset_stats()
-				return {"off_avg": avg, "off_min": mn, "off_max": mx}
+				_avg, mn, mx = model._shell_width_step_stats()
+				return {"wstep_min_vx": mn, "wstep_max_vx": mx}
 
 			for shell_i in range(shell_count):
 				if hasattr(model, "begin_cylinder_shell"):
@@ -759,7 +767,7 @@ def optimize(
 					step_label=f"{shell_label} 0/{max_steps}",
 					loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
 					tv=term_vals0,
-					pv=_shell_param_values(),
+					pv=_shell_dbg_values(),
 				)
 				snapshot_fn(stage=shell_label.replace(".", "_"), step=0,
 							loss=float(loss0.detach().cpu()), data=data, res=res0)
@@ -816,7 +824,7 @@ def optimize(
 							step_label=f"{shell_label} {step1}/{max_steps}",
 							loss_val=float(display_loss) if display_loss is not None else loss.item(),
 							tv=term_vals,
-							pv=_shell_param_values(),
+							pv=_shell_dbg_values(),
 							its=_its,
 						)
 						_t_steps_acc = 0
