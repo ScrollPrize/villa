@@ -6,8 +6,6 @@
     "val_num_workers": 0,
     "persistent_workers": false,
 
-    "dataloader_multiprocessing_context": "spawn",
-
     "datasets": [
         {
             "volume_path": "/mnt/raid_nvme/volpkgs/PHerc0139_ds2.volpkg/volumes/0139_2um_ds2_raw.zarr",

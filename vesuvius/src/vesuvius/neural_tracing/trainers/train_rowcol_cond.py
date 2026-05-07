@@ -7,7 +7,6 @@ conditioned surfaces.
 """
 import os
 import json
-import sys
 import click
 import torch
 import wandb
@@ -24,13 +23,16 @@ from vesuvius.neural_tracing.datasets.targets import RowColTargets
 from vesuvius.neural_tracing.loss.trace_losses import compute_trace_losses
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
-from vesuvius.neural_tracing.nets.models import make_model
+from vesuvius.neural_tracing.nets.models import (
+    checkpoint_wandb_run_id,
+    load_checkpoint,
+    load_checkpoint_payload,
+    make_model,
+)
 from vesuvius.neural_tracing.trainers.loss_config import TraceLossConfig
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
     make_trace_visualization,
 )
-
-import multiprocessing
 
 
 def seed_worker(worker_id):
@@ -38,24 +40,6 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
-
-def resolve_dataloader_context(config):
-    """Resolve multiprocessing context for DataLoader workers."""
-    context_name = str(config.get('dataloader_multiprocessing_context', 'auto')).lower()
-    if context_name == 'auto':
-        context_name = 'fork' if sys.platform.startswith('linux') else 'spawn'
-    if context_name not in {'fork', 'spawn', 'forkserver'}:
-        raise ValueError(
-            "dataloader_multiprocessing_context must be one of "
-            "'auto', 'fork', 'spawn', 'forkserver'"
-        )
-    try:
-        return multiprocessing.get_context(context_name)
-    except ValueError as exc:
-        raise ValueError(
-            f"Multiprocessing context {context_name!r} is not available on this platform"
-        ) from exc
 
 
 def collate_with_padding(batch):
@@ -112,12 +96,8 @@ def train(config_path):
     wandb_resume = bool(config.get('wandb_resume', False))
     wandb_run_id = config.get('wandb_run_id')
     if wandb_resume and wandb_run_id is None and 'load_ckpt' in config:
-        preloaded_ckpt = torch.load(config['load_ckpt'], map_location='cpu', weights_only=False)
-        wandb_run_id = preloaded_ckpt.get('wandb_run_id')
-        if wandb_run_id is None:
-            ckpt_config = preloaded_ckpt.get('config', {})
-            if isinstance(ckpt_config, dict):
-                wandb_run_id = ckpt_config.get('wandb_run_id')
+        preloaded_ckpt = load_checkpoint_payload(config['load_ckpt'], map_location='cpu', weights_only=False)
+        wandb_run_id = checkpoint_wandb_run_id(preloaded_ckpt)
         if wandb_run_id is not None:
             config['wandb_run_id'] = wandb_run_id
 
@@ -190,10 +170,6 @@ def train(config_path):
     train_persistent_workers = bool(config.get('persistent_workers', True)) and train_num_workers > 0
     val_persistent_workers = bool(config.get('persistent_workers', True)) and val_num_workers > 0
 
-    dataloader_context = None
-    if max(train_num_workers, val_num_workers) > 0:
-        dataloader_context = resolve_dataloader_context(config)
-
     train_dataloader_kwargs = dict(
         batch_size=config['batch_size'],
         shuffle=True,
@@ -207,7 +183,7 @@ def train(config_path):
     if train_num_workers > 0:
         train_dataloader_kwargs['persistent_workers'] = train_persistent_workers
         train_dataloader_kwargs['prefetch_factor'] = train_prefetch_factor
-        train_dataloader_kwargs['multiprocessing_context'] = dataloader_context
+        train_dataloader_kwargs['multiprocessing_context'] = 'spawn'
     train_dataloader = torch.utils.data.DataLoader(train_dataset, **train_dataloader_kwargs)
 
     val_dataloader_kwargs = dict(
@@ -222,7 +198,7 @@ def train(config_path):
     if val_num_workers > 0:
         val_dataloader_kwargs['persistent_workers'] = val_persistent_workers
         val_dataloader_kwargs['prefetch_factor'] = val_prefetch_factor
-        val_dataloader_kwargs['multiprocessing_context'] = dataloader_context
+        val_dataloader_kwargs['multiprocessing_context'] = 'spawn'
     val_dataloader = torch.utils.data.DataLoader(val_dataset, **val_dataloader_kwargs)
 
     model = make_model(config)
@@ -263,34 +239,16 @@ def train(config_path):
     start_iteration = 0
     if 'load_ckpt' in config:
         accelerator.print(f'Loading checkpoint {config["load_ckpt"]}')
-        ckpt = preloaded_ckpt if preloaded_ckpt is not None else torch.load(
-            config['load_ckpt'], map_location='cpu', weights_only=False
+        model, _, ckpt, _ = load_checkpoint(
+            config['load_ckpt'],
+            model=model,
+            checkpoint=preloaded_ckpt,
+            allow_partial_weight_load=config.get('allow_partial_weight_load', False),
+            map_location='cpu',
+            weights_only=False,
+            print_fn=accelerator.print,
+            return_checkpoint=True,
         )
-        state_dict = ckpt['model']
-        # Handle compiled model state dict
-        model_keys = set(model.state_dict().keys())
-        ckpt_has_compile_prefix = any(k.startswith('_orig_mod.') for k in state_dict.keys())
-        model_has_compile_prefix = any(k.startswith('_orig_mod.') for k in model_keys)
-        if ckpt_has_compile_prefix and not model_has_compile_prefix:
-            state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
-            accelerator.print('Stripped _orig_mod. prefix from checkpoint state dict')
-        elif model_has_compile_prefix and not ckpt_has_compile_prefix:
-            state_dict = {f'_orig_mod.{k}': v for k, v in state_dict.items()}
-            accelerator.print('Added _orig_mod. prefix to checkpoint state dict')
-        if config.get('allow_partial_weight_load', False):
-            current_state = model.state_dict()
-            compatible_state = {
-                k: v for k, v in state_dict.items()
-                if k in current_state and tuple(v.shape) == tuple(current_state[k].shape)
-            }
-            skipped = sorted(set(state_dict.keys()) - set(compatible_state.keys()))
-            missing, unexpected = model.load_state_dict(compatible_state, strict=False)
-            accelerator.print(
-                f"Loaded {len(compatible_state)}/{len(current_state)} compatible checkpoint tensors "
-                f"(missing={len(missing)}, unexpected={len(unexpected)}, skipped={len(skipped)})"
-            )
-        else:
-            model.load_state_dict(state_dict)
 
         if not config.get('load_weights_only', False):
             start_iteration = ckpt.get('step', 0)

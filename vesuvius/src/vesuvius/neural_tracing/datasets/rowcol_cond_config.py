@@ -65,7 +65,6 @@ def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("persistent_workers", False)
     config.setdefault("prefetch_factor", 1)
     config.setdefault("val_prefetch_factor", 1)
-    config.setdefault("dataloader_multiprocessing_context", "auto")
     config.setdefault("seed", 0)
     config.setdefault("lambda_velocity_smooth", 0.0)
     config.setdefault("velocity_smooth_normalize", True)
