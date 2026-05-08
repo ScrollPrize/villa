@@ -159,14 +159,14 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
     if (it != state->entries_.end()) {
         if (it->second.status == EntryStatus::InFlight) {
             if (key.level < it->second.priority)
-                queueFetchLocked(state, key, state->generation_, state->foregroundRequestEpoch_, 0);
+                queueFetchLocked(state, key, state->generation_, 0);
             return ChunkResult{ChunkStatus::MissQueued, state->dtype_, state->levels_[level].chunkShape, {}, {}};
         }
         return resultFromEntryLocked(*state, key, it->second);
     }
 
     state->entries_.emplace(key, Entry{});
-    queueFetchLocked(state, key, state->generation_, state->foregroundRequestEpoch_, 0);
+    queueFetchLocked(state, key, state->generation_, 0);
     return ChunkResult{ChunkStatus::MissQueued, state->dtype_, state->levels_[level].chunkShape, {}, {}};
 }
 
@@ -189,7 +189,7 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     std::unique_lock lock(state->mutex_);
     auto [it, inserted] = state->entries_.emplace(key, Entry{});
     if (inserted)
-        queueFetchLocked(state, key, state->generation_, state->foregroundRequestEpoch_, 0);
+        queueFetchLocked(state, key, state->generation_, 0);
     waitForResolvedLocked(*state, lock, key);
     it = state->entries_.find(key);
     if (it == state->entries_.end())
@@ -197,30 +197,19 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     return resultFromEntryLocked(*state, key, it->second);
 }
 
-void ChunkCache::beginForegroundRequestEpoch()
-{
-    auto state = state_;
-    std::lock_guard lock(state->mutex_);
-    ++state->foregroundRequestEpoch_;
-}
-
 void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset)
 {
     auto state = state_;
     std::unique_lock lock(state->mutex_);
-    const bool foreground = priorityOffset <= 0;
-    if (foreground)
-        ++state->foregroundRequestEpoch_;
-    const std::uint64_t foregroundRequestEpoch = state->foregroundRequestEpoch_;
     for (const auto& key : keys) {
         if (!isValidKey(*state, key))
             continue;
         auto [it, inserted] = state->entries_.emplace(key, Entry{});
         if (inserted) {
-            queueFetchLocked(state, key, state->generation_, foregroundRequestEpoch, priorityOffset);
+            queueFetchLocked(state, key, state->generation_, priorityOffset);
         } else if (it->second.status == EntryStatus::InFlight &&
                    key.level + priorityOffset < it->second.priority) {
-            queueFetchLocked(state, key, state->generation_, foregroundRequestEpoch, priorityOffset);
+            queueFetchLocked(state, key, state->generation_, priorityOffset);
         }
     }
     if (!wait)
@@ -343,7 +332,6 @@ ChunkResult ChunkCache::resultFromEntryLocked(State& state, const ChunkKey& key,
 void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
                                   const ChunkKey& key,
                                   std::uint64_t generation,
-                                  std::uint64_t foregroundRequestEpoch,
                                   int priorityOffset)
 {
     auto it = state->entries_.find(key);
@@ -357,24 +345,20 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
 
     const auto priority = static_cast<utils::PriorityThreadPool::Priority>(entry.priority);
     std::weak_ptr<State> weakState = state;
-    const bool foreground = priorityOffset <= 0;
-    chunkWorkerPool(state->options_.maxConcurrentReads).submit(priority, [weakState, key, generation, foregroundRequestEpoch, foreground, fetchSerial] {
+    chunkWorkerPool(state->options_.maxConcurrentReads).submit(priority, [weakState, key, generation, fetchSerial] {
         if (auto state = weakState.lock())
-            fetchAndStore(state, key, generation, foreground ? foregroundRequestEpoch : 0, fetchSerial);
+            fetchAndStore(state, key, generation, fetchSerial);
     });
 }
 
 void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
                                ChunkKey key,
                                std::uint64_t generation,
-                               std::uint64_t foregroundRequestEpoch,
                                std::uint64_t fetchSerial)
 {
     {
         std::lock_guard lock(state->mutex_);
         if (generation != state->generation_)
-            return;
-        if (foregroundRequestEpoch != 0 && foregroundRequestEpoch != state->foregroundRequestEpoch_)
             return;
         auto it = state->entries_.find(key);
         if (it == state->entries_.end() || it->second.fetchSerial != fetchSerial)
@@ -418,8 +402,6 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
             pruneDownloadHistoryLocked(*state, now);
         }
         if (generation != state->generation_)
-            return;
-        if (foregroundRequestEpoch != 0 && foregroundRequestEpoch != state->foregroundRequestEpoch_)
             return;
         auto it = state->entries_.find(key);
         if (it == state->entries_.end() || it->second.fetchSerial != fetchSerial)
