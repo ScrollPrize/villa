@@ -10,22 +10,17 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <numeric>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 
-struct RowCrossings {
-    int row = -1;
-    std::vector<double> cols;
-};
-
 static void usage(const char* prog)
 {
     std::cerr
-        << "usage: " << prog << " --input <src tifxyz dir> [--output <dir>] [--band-height 8] [--start-winding 0]\n"
+        << "usage: " << prog << " --input <src tifxyz dir> [--output <dir>] [--start-winding 0]\n"
         << "  Cuts a rolled tifxyz surface into separate winding tifxyz folders.\n"
         << "  Outputs are named wNN_ddmmyyhhmm under <output dir>, or beside the\n"
         << "  source segment when <output dir> is omitted. Boundary columns are\n"
@@ -53,207 +48,140 @@ static bool valid_point(const cv::Vec3f& p)
     return p[0] != -1.f && p[2] > 0.f;
 }
 
-static bool longest_valid_segment(const cv::Mat_<cv::Vec3f>& points, int row, int& out_c0, int& out_c1)
+static bool valid_col_range(const cv::Mat_<cv::Vec3f>& points, int& out_c0, int& out_c1);
+
+struct GridPoint {
+    int row = -1;
+    int col = -1;
+};
+
+static bool middle_valid_row(const cv::Mat_<cv::Vec3f>& points, int col, int& out_row)
 {
-    int best_c0 = -1;
-    int best_c1 = -1;
-    int cur_c0 = -1;
-
-    for (int c = 0; c < points.cols; ++c) {
-        if (valid_point(points(row, c))) {
-            if (cur_c0 < 0) cur_c0 = c;
-        } else if (cur_c0 >= 0) {
-            const int cur_c1 = c - 1;
-            if (best_c0 < 0 || cur_c1 - cur_c0 > best_c1 - best_c0) {
-                best_c0 = cur_c0;
-                best_c1 = cur_c1;
-            }
-            cur_c0 = -1;
+    std::vector<int> rows;
+    rows.reserve(static_cast<size_t>(points.rows));
+    for (int r = 0; r < points.rows; ++r) {
+        if (valid_point(points(r, col))) {
+            rows.push_back(r);
         }
     }
 
-    if (cur_c0 >= 0) {
-        const int cur_c1 = points.cols - 1;
-        if (best_c0 < 0 || cur_c1 - cur_c0 > best_c1 - best_c0) {
-            best_c0 = cur_c0;
-            best_c1 = cur_c1;
-        }
-    }
-
-    if (best_c0 < 0) return false;
-    out_c0 = best_c0;
-    out_c1 = best_c1;
+    if (rows.empty()) return false;
+    out_row = rows[rows.size() / 2];
     return true;
 }
 
-static RowCrossings detect_row_crossings(
-    const cv::Mat_<cv::Vec3f>& points,
-    int row,
-    double center_x,
-    double center_y)
+static double point_distance(const cv::Vec3f& a, const cv::Vec3f& b)
 {
-    RowCrossings out;
-    out.row = row;
+    const double dx = double(a[0]) - double(b[0]);
+    const double dy = double(a[1]) - double(b[1]);
+    const double dz = double(a[2]) - double(b[2]);
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
 
-    int c0 = -1;
-    int c1 = -1;
-    if (!longest_valid_segment(points, row, c0, c1) || c1 - c0 < 2) {
-        return out;
+static std::vector<GridPoint> shortest_valid_path(
+    const cv::Mat_<cv::Vec3f>& points,
+    GridPoint start,
+    GridPoint end)
+{
+    struct QueueItem {
+        double dist = 0.0;
+        int idx = -1;
+    };
+    struct QueueItemGreater {
+        bool operator()(const QueueItem& a, const QueueItem& b) const
+        {
+            return a.dist > b.dist;
+        }
+    };
+
+    const int rows = points.rows;
+    const int cols = points.cols;
+    const auto idx_of = [cols](int r, int c) { return r * cols + c; };
+    const int start_idx = idx_of(start.row, start.col);
+    const int end_idx = idx_of(end.row, end.col);
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+
+    std::vector<double> dist(total, std::numeric_limits<double>::infinity());
+    std::vector<int> prev(total, -1);
+    std::priority_queue<QueueItem, std::vector<QueueItem>, QueueItemGreater> queue;
+
+    dist[static_cast<size_t>(start_idx)] = 0.0;
+    queue.push({0.0, start_idx});
+
+    constexpr int dr[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+    constexpr int dc[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+
+    while (!queue.empty()) {
+        const QueueItem cur = queue.top();
+        queue.pop();
+
+        if (cur.dist != dist[static_cast<size_t>(cur.idx)]) continue;
+        if (cur.idx == end_idx) break;
+
+        const int r = cur.idx / cols;
+        const int c = cur.idx % cols;
+        const cv::Vec3f& p = points(r, c);
+        for (int n = 0; n < 8; ++n) {
+            const int nr = r + dr[n];
+            const int nc = c + dc[n];
+            if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+            const cv::Vec3f& q = points(nr, nc);
+            if (!valid_point(q)) continue;
+
+            const int next_idx = idx_of(nr, nc);
+            const double next_dist = cur.dist + point_distance(p, q);
+            if (next_dist < dist[static_cast<size_t>(next_idx)]) {
+                dist[static_cast<size_t>(next_idx)] = next_dist;
+                prev[static_cast<size_t>(next_idx)] = cur.idx;
+                queue.push({next_dist, next_idx});
+            }
+        }
     }
 
-    std::vector<double> theta;
-    theta.reserve(static_cast<size_t>(c1 - c0 + 1));
-    for (int c = c0; c <= c1; ++c) {
-        const cv::Vec3f& p = points(row, c);
-        theta.push_back(std::atan2(double(p[1]) - center_y, double(p[0]) - center_x));
+    if (!std::isfinite(dist[static_cast<size_t>(end_idx)])) {
+        throw std::runtime_error("no valid shortest path from first valid column to last valid column");
     }
+
+    std::vector<GridPoint> path;
+    for (int idx = end_idx; idx >= 0; idx = prev[static_cast<size_t>(idx)]) {
+        path.push_back({idx / cols, idx % cols});
+        if (idx == start_idx) break;
+    }
+    std::reverse(path.begin(), path.end());
+    return path;
+}
+
+static std::vector<int> choose_shortest_path_cut_columns(
+    const cv::Mat_<cv::Vec3f>& points,
+    const cv::Vec2d& center,
+    GridPoint& out_start,
+    GridPoint& out_end)
+{
+    int valid_c0 = 0;
+    int valid_c1 = points.cols - 1;
+    if (!valid_col_range(points, valid_c0, valid_c1)) {
+        throw std::runtime_error("no valid points in tifxyz");
+    }
+
+    if (!middle_valid_row(points, valid_c0, out_start.row) ||
+        !middle_valid_row(points, valid_c1, out_end.row)) {
+        throw std::runtime_error("failed to choose middle rows in first and last valid columns");
+    }
+    out_start.col = valid_c0;
+    out_end.col = valid_c1;
+
+    const std::vector<GridPoint> path = shortest_valid_path(points, out_start, out_end);
+    if (path.size() < 3) return {};
 
     constexpr double pi = 3.1415926535897932384626433832795;
     constexpr double two_pi = 2.0 * pi;
-    for (size_t i = 1; i < theta.size(); ++i) {
-        double delta = theta[i] - theta[i - 1];
-        if (delta > pi) {
-            theta[i] -= two_pi * std::ceil((delta - pi) / two_pi);
-        } else if (delta < -pi) {
-            theta[i] += two_pi * std::ceil((-pi - delta) / two_pi);
-        }
-    }
-
-    const double sign = (theta.back() >= theta.front()) ? 1.0 : -1.0;
-    std::vector<double> turns(theta.size());
-    for (size_t i = 0; i < theta.size(); ++i) {
-        turns[i] = sign * (theta[i] - theta.front()) / two_pi;
-    }
-
-    const int crossing_count = static_cast<int>(std::floor(turns.back()));
-    for (int k = 1; k <= crossing_count; ++k) {
-        const auto it = std::lower_bound(turns.begin(), turns.end(), double(k));
-        if (it == turns.begin() || it == turns.end()) continue;
-
-        const size_t idx = static_cast<size_t>(it - turns.begin());
-        const double prev = turns[idx - 1];
-        const double next = turns[idx];
-        if (next == prev) continue;
-
-        const double t = (double(k) - prev) / (next - prev);
-        const double col = double(c0 + int(idx) - 1) * (1.0 - t) + double(c0 + int(idx)) * t;
-        out.cols.push_back(col);
-    }
-
-    return out;
-}
-
-static std::vector<int> choose_cut_columns(
-    const cv::Mat_<cv::Vec3f>& points,
-    const cv::Vec2d& center,
-    int band_height,
-    int& out_band_start,
-    int& out_band_end)
-{
-    std::vector<RowCrossings> rows;
-    rows.reserve(static_cast<size_t>(points.rows));
-    int max_crossings = 0;
-    for (int r = 0; r < points.rows; ++r) {
-        RowCrossings crossings = detect_row_crossings(points, r, center[0], center[1]);
-        max_crossings = std::max<int>(max_crossings, crossings.cols.size());
-        rows.push_back(std::move(crossings));
-    }
-
-    if (max_crossings <= 0) {
-        throw std::runtime_error("no winding crossings detected");
-    }
-
-    int best_start = -1;
-    int best_end = -1;
-    int cur_start = -1;
-    for (int r = 0; r < points.rows; ++r) {
-        if (static_cast<int>(rows[r].cols.size()) == max_crossings) {
-            if (cur_start < 0) cur_start = r;
-        } else if (cur_start >= 0) {
-            const int cur_end = r - 1;
-            if (best_start < 0 || cur_end - cur_start > best_end - best_start) {
-                best_start = cur_start;
-                best_end = cur_end;
-            }
-            cur_start = -1;
-        }
-    }
-    if (cur_start >= 0) {
-        const int cur_end = points.rows - 1;
-        if (best_start < 0 || cur_end - cur_start > best_end - best_start) {
-            best_start = cur_start;
-            best_end = cur_end;
-        }
-    }
-
-    if (best_start < 0) {
-        throw std::runtime_error("failed to locate a full winding row band");
-    }
-
-    const int full_run_height = best_end - best_start + 1;
-    if (band_height > full_run_height) {
-        std::cerr << "warning: requested band height " << band_height
-                  << " exceeds full-width row run height " << full_run_height
-                  << "; clamping to " << full_run_height << "\n";
-        band_height = full_run_height;
-    }
-    band_height = std::max(1, band_height);
-    const int mid = (best_start + best_end) / 2;
-    out_band_start = std::clamp(mid - band_height / 2, best_start, best_end - band_height + 1);
-    out_band_end = out_band_start + band_height - 1;
-
-    std::vector<int> cuts;
-    cuts.reserve(static_cast<size_t>(max_crossings));
-    for (int k = 0; k < max_crossings; ++k) {
-        std::vector<double> vals;
-        vals.reserve(static_cast<size_t>(band_height));
-        for (int r = out_band_start; r <= out_band_end; ++r) {
-            vals.push_back(rows[r].cols[static_cast<size_t>(k)]);
-        }
-        std::sort(vals.begin(), vals.end());
-        const double med = vals[vals.size() / 2];
-        const int cut = static_cast<int>(std::lround(med));
-        if (cuts.empty() || cut > cuts.back()) {
-            cuts.push_back(cut);
-        }
-    }
-
-    return cuts;
-}
-
-static std::vector<int> choose_centerline_cut_columns(
-    const cv::Mat_<cv::Vec3f>& points,
-    const cv::Vec2d& center)
-{
-    std::vector<int> cols;
     std::vector<double> theta;
-    cols.reserve(static_cast<size_t>(points.cols));
-    theta.reserve(static_cast<size_t>(points.cols));
-
-    for (int c = 0; c < points.cols; ++c) {
-        std::vector<int> rows;
-        rows.reserve(static_cast<size_t>(points.rows));
-        for (int r = 0; r < points.rows; ++r) {
-            if (valid_point(points(r, c))) {
-                rows.push_back(r);
-            }
-        }
-        if (rows.size() < 3) {
-            continue;
-        }
-
-        const int r = rows[rows.size() / 2];
-        const cv::Vec3f& p = points(r, c);
-        cols.push_back(c);
+    theta.reserve(path.size());
+    for (const GridPoint& gp : path) {
+        const cv::Vec3f& p = points(gp.row, gp.col);
         theta.push_back(std::atan2(double(p[1]) - center[1], double(p[0]) - center[0]));
     }
 
-    if (cols.size() < 3) {
-        return {};
-    }
-
-    constexpr double pi = 3.1415926535897932384626433832795;
-    constexpr double two_pi = 2.0 * pi;
     for (size_t i = 1; i < theta.size(); ++i) {
         double delta = theta[i] - theta[i - 1];
         if (delta > pi) {
@@ -263,31 +191,31 @@ static std::vector<int> choose_centerline_cut_columns(
         }
     }
 
-    const double sign = (theta.back() >= theta.front()) ? 1.0 : -1.0;
-    std::vector<double> turns(theta.size());
-    for (size_t i = 0; i < theta.size(); ++i) {
-        turns[i] = sign * (theta[i] - theta.front()) / two_pi;
-    }
+    const double total_turns = (theta.back() - theta.front()) / two_pi;
+    const double sign = total_turns >= 0.0 ? 1.0 : -1.0;
+    const int crossing_count = static_cast<int>(std::floor(std::abs(total_turns)));
 
     std::vector<int> cuts;
-    const int crossing_count = static_cast<int>(std::floor(turns.back()));
+    cuts.reserve(static_cast<size_t>(crossing_count));
     for (int k = 1; k <= crossing_count; ++k) {
-        const auto it = std::lower_bound(turns.begin(), turns.end(), double(k));
-        if (it == turns.begin() || it == turns.end()) continue;
+        const double target = theta.front() + sign * two_pi * double(k);
+        for (size_t i = 1; i < path.size(); ++i) {
+            const double prev = theta[i - 1];
+            const double next = theta[i];
+            const bool crosses = sign > 0.0
+                ? prev <= target && target <= next
+                : next <= target && target <= prev;
+            if (!crosses || next == prev) continue;
 
-        const size_t idx = static_cast<size_t>(it - turns.begin());
-        const double prev = turns[idx - 1];
-        const double next = turns[idx];
-        if (next == prev) continue;
-
-        const double t = (double(k) - prev) / (next - prev);
-        const double col = double(cols[idx - 1]) * (1.0 - t) + double(cols[idx]) * t;
-        const int cut = std::clamp(static_cast<int>(std::lround(col)), 0, points.cols - 1);
-        if (cuts.empty() || cut > cuts.back()) {
-            cuts.push_back(cut);
+            const double t = (target - prev) / (next - prev);
+            const double col = double(path[i - 1].col) * (1.0 - t) + double(path[i].col) * t;
+            cuts.push_back(std::clamp(static_cast<int>(std::lround(col)), 0, points.cols - 1));
+            break;
         }
     }
 
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
     return cuts;
 }
 
@@ -306,39 +234,6 @@ struct WindingSlice {
     int c1 = 0;
     double radius = std::numeric_limits<double>::infinity();
 };
-
-static double mean_band_radius(
-    const cv::Mat_<cv::Vec3f>& points,
-    const cv::Vec2d& center,
-    int row0,
-    int row1,
-    int c0,
-    int c1)
-{
-    double sum = 0.0;
-    int count = 0;
-    row0 = std::clamp(row0, 0, points.rows - 1);
-    row1 = std::clamp(row1, 0, points.rows - 1);
-    c0 = std::clamp(c0, 0, points.cols - 1);
-    c1 = std::clamp(c1, 0, points.cols - 1);
-
-    for (int r = row0; r <= row1; ++r) {
-        for (int c = c0; c <= c1; ++c) {
-            const cv::Vec3f& p = points(r, c);
-            if (!valid_point(p)) continue;
-
-            const double dx = double(p[0]) - center[0];
-            const double dy = double(p[1]) - center[1];
-            sum += std::sqrt(dx * dx + dy * dy);
-            ++count;
-        }
-    }
-
-    if (count == 0) {
-        return std::numeric_limits<double>::infinity();
-    }
-    return sum / double(count);
-}
 
 static double mean_slice_radius(
     const cv::Mat_<cv::Vec3f>& points,
@@ -371,22 +266,42 @@ static double mean_slice_radius(
 
 static bool valid_col_range(const cv::Mat_<cv::Vec3f>& points, int& out_c0, int& out_c1)
 {
-    out_c0 = points.cols;
-    out_c1 = -1;
+    std::vector<int> valid_counts(static_cast<size_t>(points.cols), 0);
     for (int c = 0; c < points.cols; ++c) {
-        bool any = false;
         for (int r = 0; r < points.rows; ++r) {
             if (valid_point(points(r, c))) {
-                any = true;
-                break;
+                ++valid_counts[static_cast<size_t>(c)];
             }
         }
-        if (any) {
-            out_c0 = std::min(out_c0, c);
-            out_c1 = c;
+    }
+
+    int best_c0 = -1;
+    int best_c1 = -1;
+    int cur_c0 = -1;
+    for (int c = 0; c < points.cols; ++c) {
+        if (valid_counts[static_cast<size_t>(c)] > 0) {
+            if (cur_c0 < 0) cur_c0 = c;
+        } else if (cur_c0 >= 0) {
+            const int cur_c1 = c - 1;
+            if (best_c0 < 0 || cur_c1 - cur_c0 > best_c1 - best_c0) {
+                best_c0 = cur_c0;
+                best_c1 = cur_c1;
+            }
+            cur_c0 = -1;
         }
     }
-    return out_c1 >= out_c0;
+    if (cur_c0 >= 0) {
+        const int cur_c1 = points.cols - 1;
+        if (best_c0 < 0 || cur_c1 - cur_c0 > best_c1 - best_c0) {
+            best_c0 = cur_c0;
+            best_c1 = cur_c1;
+        }
+    }
+
+    if (best_c0 < 0) return false;
+    out_c0 = best_c0;
+    out_c1 = best_c1;
+    return true;
 }
 
 int main(int argc, char* argv[])
@@ -394,7 +309,6 @@ int main(int argc, char* argv[])
     vc::cli::ArgParser parser;
     parser.add_option("input", {"i"}, true, "Input tifxyz directory");
     parser.add_option("output", {"o"}, false, "Output directory");
-    parser.add_option("band-height", {"b"}, false, "Row band height used to estimate cut columns");
     parser.add_option("start-winding", {"s"}, false, "First winding number to use in output names");
     parser.add_flag("help", {"h"}, "Show this help text");
 
@@ -424,20 +338,6 @@ int main(int argc, char* argv[])
     fs::path out_root = src.parent_path();
     if (args.has("output")) {
         out_root = fs::absolute(fs::path(args.value("output"))).lexically_normal();
-    }
-
-    int band_height = 8;
-    if (args.has("band-height")) {
-        try {
-            band_height = std::stoi(args.value("band-height"));
-        } catch (const std::exception&) {
-            std::cerr << "error: --band-height must be an integer\n";
-            return EXIT_FAILURE;
-        }
-        if (band_height <= 0) {
-            std::cerr << "error: --band-height must be positive\n";
-            return EXIT_FAILURE;
-        }
     }
 
     int start_winding = 0;
@@ -473,21 +373,14 @@ int main(int argc, char* argv[])
         (double(bbox.low[0]) + double(bbox.high[0])) * 0.5,
         (double(bbox.low[1]) + double(bbox.high[1])) * 0.5);
 
-    int band_start = -1;
-    int band_end = -1;
+    GridPoint path_start;
+    GridPoint path_end;
     std::vector<int> cuts;
     try {
-        cuts = choose_cut_columns(*points, center, band_height, band_start, band_end);
+        cuts = choose_shortest_path_cut_columns(*points, center, path_start, path_end);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return EXIT_FAILURE;
-    }
-
-    std::string cut_method = "row-band";
-    const std::vector<int> centerline_cuts = choose_centerline_cut_columns(*points, center);
-    if (centerline_cuts.size() > cuts.size()) {
-        cuts = centerline_cuts;
-        cut_method = "centerline";
     }
 
     if (cuts.empty()) {
@@ -503,6 +396,17 @@ int main(int argc, char* argv[])
     int valid_c1 = points->cols - 1;
     if (!valid_col_range(*points, valid_c0, valid_c1)) {
         std::cerr << "error: no valid points in tifxyz\n";
+        return EXIT_FAILURE;
+    }
+
+    cuts.erase(
+        std::remove_if(cuts.begin(), cuts.end(), [&](int cut) {
+            return cut <= valid_c0 || cut >= valid_c1;
+        }),
+        cuts.end());
+    if (cuts.empty()) {
+        std::cerr << "error: no cut columns inside main valid column run "
+                  << valid_c0 << ".." << valid_c1 << "\n";
         return EXIT_FAILURE;
     }
 
@@ -527,17 +431,16 @@ int main(int argc, char* argv[])
         slices.push_back({
             c0,
             c1,
-            cut_method == "centerline"
-                ? mean_slice_radius(*points, center, c0, c1)
-                : mean_band_radius(*points, center, band_start, band_end, c0, c1)
+            mean_slice_radius(*points, center, c0, c1)
         });
     }
 
     const bool number_right_to_left =
         !slices.empty() && slices.back().radius < slices.front().radius;
 
-    std::cout << "selected row band " << band_start << ".." << band_end << "\n";
-    std::cout << "cut method: " << cut_method << "\n";
+    std::cout << "shortest path: (" << path_start.col << "," << path_start.row << ") -> ("
+              << path_end.col << "," << path_end.row << ")\n";
+    std::cout << "cut method: shortest-path revolutions\n";
     std::cout << "cut columns:";
     for (int cut : cuts) std::cout << " " << cut;
     std::cout << "\n";
@@ -572,7 +475,7 @@ int main(int argc, char* argv[])
         }
 
         std::cout << name.str() << ": cols " << c0 << ".." << c1
-                  << " mean_band_radius " << slice.radius
+                  << " mean_radius " << slice.radius
                   << " -> " << out_path << "\n";
         ++written;
     }
