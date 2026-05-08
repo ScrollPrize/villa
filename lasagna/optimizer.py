@@ -351,11 +351,7 @@ def optimize(
 					continue
 				run_shells_ = 1 if _next_stage_is_cyl(si_) else shell_count_ - next_shell_
 				run_shells_ = max(0, min(run_shells_, shell_count_ - next_shell_))
-				pass_count_ = sum(
-					2 if shell_i_ > 0 else 1
-					for shell_i_ in range(next_shell_, next_shell_ + run_shells_)
-				)
-				total += steps_ * pass_count_
+				total += steps_ * run_shells_
 				next_shell_ += run_shells_
 			else:
 				total += steps_
@@ -798,10 +794,7 @@ def optimize(
 			_status_step_width = max(
 				_status_step_width,
 				max(
-					max(
-						len(f"{label}.shell{shell_i + 1} {max_steps}/{max_steps}"),
-						len(f"{label}.shell{shell_i + 1}.refine {max_steps}/{max_steps}") if shell_i > 0 else 0,
-					) + 2
+					len(f"{label}.shell{shell_i + 1} {max_steps}/{max_steps}") + 2
 					for shell_i in shell_indices
 				),
 			)
@@ -825,10 +818,6 @@ def optimize(
 				_avg, mn, mx = model._shell_width_step_stats()
 				return {"wstep_min_vx": mn, "wstep_max_vx": mx}
 
-			def _shell_refine_eff(eff_: dict[str, float]) -> dict[str, float]:
-				keep = {"cyl_normal", "cyl_step", "cyl_bend", "cyl_smooth", "cyl_z_smooth"}
-				return {k: (v if k in keep else 0.0) for k, v in eff_.items()}
-
 			for shell_i in shell_indices:
 				if hasattr(model, "begin_cylinder_shell"):
 					model.begin_cylinder_shell(shell_i, data)
@@ -837,8 +826,6 @@ def optimize(
 					for _first_shell_term in ("cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt"):
 						shell_eff[_first_shell_term] = 0.0
 				shell_passes = [(f"{label}.shell{shell_i + 1}", shell_eff)]
-				if shell_i > 0:
-					shell_passes.append((f"{label}.shell{shell_i + 1}.refine", _shell_refine_eff(shell_eff)))
 
 				for shell_label, pass_eff in shell_passes:
 					all_params, param_groups = _make_param_groups()

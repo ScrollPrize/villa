@@ -133,7 +133,7 @@ class Model3D(nn.Module):
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.cyl_seed_xyz = torch.zeros(3, device=device, dtype=torch.float32)
 		self.cyl_shell_mode = False
-		self.cyl_shell_target_count = 6
+		self.cyl_shell_target_count = 15
 		self.cyl_shell_initial_radius = 1000.0
 		self.cyl_shell_step = 500.0
 		self.cyl_shell_initial_step = 10.0
