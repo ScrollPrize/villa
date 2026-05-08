@@ -34,6 +34,11 @@ namespace
 constexpr const char* kOverlayGroupKey = "surface_transform_rotate";
 constexpr double kPi = 3.14159265358979323846;
 
+struct RotationSaveResult {
+    std::shared_ptr<QuadSurface> surface;
+    QString error;
+};
+
 class RotationDial final : public QWidget
 {
 public:
@@ -515,19 +520,32 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
-    // Pre-fix this method ran rotate() + saveOverwrite() on the GUI
-    // thread, freezing the UI for several seconds on large surfaces.
-    // Move both into a worker (mirrors SegmentationModule::performAutosave),
-    // then post UI work back on completion.
-    auto surface = _sourceSurface;
+    if (_sourceSurface->path.empty() || _sourceSurface->id.empty()) {
+        QMessageBox::warning(nullptr,
+                             tr("Rotation Failed"),
+                             tr("Failed to save the rotated surface: the selected surface is missing file metadata."));
+        return;
+    }
+
+    // Clone the source before dispatching the worker. The worker can then
+    // rotate/save without racing the live surface used by the preview, and a
+    // failed save leaves the in-memory source unchanged.
+    auto surface = cloneSurface(_sourceSurface);
+    if (!surface) {
+        QMessageBox::warning(nullptr,
+                             tr("Rotation Failed"),
+                             tr("Failed to save the rotated surface: could not copy the selected surface."));
+        return;
+    }
+
     const float angleDeg = static_cast<float>(_angleDeg);
     const int session = ++_saveSessionId;
     _saveInFlight = true;
     QPointer<SurfaceRotationOverlayController> self(this);
 
-    auto* watcher = new QFutureWatcher<void>(this);
-    connect(watcher, &QFutureWatcher<void>::finished, this,
-            [self, watcher, surface, session]() {
+    auto* watcher = new QFutureWatcher<RotationSaveResult>(this);
+    connect(watcher, &QFutureWatcher<RotationSaveResult>::finished, this,
+            [self, watcher, session]() {
                 watcher->deleteLater();
                 if (!self) {
                     return;
@@ -549,31 +567,34 @@ void SurfaceRotationOverlayController::applyRotation()
                     return;
                 }
 
-                bool failed = false;
+                RotationSaveResult result;
                 try {
-                    watcher->waitForFinished();  // surface exception if any
-                } catch (const std::exception&) {
-                    failed = true;
+                    result = watcher->result();
+                } catch (const std::exception& e) {
+                    result.error = QString::fromUtf8(e.what());
                 } catch (...) {
-                    failed = true;
+                    result.error = tr("Unknown error");
                 }
 
-                if (failed) {
-                    self->_state->setSurface("segmentation", surface, false, true);
+                if (!result.error.isEmpty() || !result.surface) {
+                    if (self->_sourceSurface) {
+                        self->_state->setSurface("segmentation", self->_sourceSurface, false, true);
+                    }
                     self->clearWidgets();
                     self->_rotateActive = false;
                     self->_previewSurface.reset();
                     self->_sourceSurface.reset();
                     QMessageBox::warning(nullptr,
                                          tr("Rotation Failed"),
-                                         tr("Failed to save the rotated surface."));
+                                         tr("Failed to save the rotated surface: %1").arg(
+                                             result.error.isEmpty() ? tr("no surface was written") : result.error));
                     return;
                 }
 
                 if (self->_viewerManager) {
-                    self->_viewerManager->refreshSurfacePatchIndex(surface);
+                    self->_viewerManager->refreshSurfacePatchIndex(result.surface);
                 }
-                self->_state->setSurface("segmentation", surface, false, true);
+                self->_state->setSurface("segmentation", result.surface, false, true);
 
                 self->_rotateActive = false;
                 self->_angleDeg = 0.0;
@@ -582,14 +603,21 @@ void SurfaceRotationOverlayController::applyRotation()
                 self->clearWidgets();
             });
 
-    auto future = QtConcurrent::run([surface, angleDeg]() {
+    auto future = QtConcurrent::run([surface, angleDeg]() -> RotationSaveResult {
         // saveOverwrite() snapshots the on-disk state before
         // overwriting it. rotate() only mutates _points in memory,
         // so the on-disk x/y/z.tif are still pre-rotate when the
         // snapshot is taken — the backup ring captures the
         // pre-rotation files automatically.
-        surface->rotate(angleDeg);
-        surface->saveOverwrite();
+        try {
+            surface->rotate(angleDeg);
+            surface->saveOverwrite();
+        } catch (const std::exception& e) {
+            return RotationSaveResult{nullptr, QString::fromUtf8(e.what())};
+        } catch (...) {
+            return RotationSaveResult{nullptr, QObject::tr("Unknown error")};
+        }
+        return RotationSaveResult{surface, {}};
     });
     watcher->setFuture(future);
 }
