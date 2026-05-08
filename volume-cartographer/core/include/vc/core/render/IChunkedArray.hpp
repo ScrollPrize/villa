@@ -60,6 +60,7 @@ public:
     // Blocking access is for CLI, batch, optimization, and prefetch callers.
     // Viewer rendering paths must not call this on the Qt/main thread.
     virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) = 0;
+    virtual void beginForegroundRequestEpoch() = 0;
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) = 0;
 
     virtual ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) = 0;

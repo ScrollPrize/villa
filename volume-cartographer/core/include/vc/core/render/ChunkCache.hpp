@@ -68,6 +68,7 @@ public:
 
     ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override;
     ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override;
+    void beginForegroundRequestEpoch() override;
     void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) override;
 
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
@@ -122,6 +123,7 @@ private:
         std::list<ChunkKey> lru_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t generation_ = 0;
+        std::uint64_t foregroundRequestEpoch_ = 0;
         std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
@@ -135,10 +137,12 @@ private:
     static void queueFetchLocked(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  std::uint64_t generation,
+                                 std::uint64_t foregroundRequestEpoch,
                                  int priorityOffset);
     static void fetchAndStore(const std::shared_ptr<State>& state,
                               ChunkKey key,
                               std::uint64_t generation,
+                              std::uint64_t foregroundRequestEpoch,
                               std::uint64_t fetchSerial);
     static void storeFetchResultLocked(const std::shared_ptr<State>& state,
                                        const ChunkKey& key,

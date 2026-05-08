@@ -2340,6 +2340,7 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
 
+    _chunkArray->beginForegroundRequestEpoch();
     prefetchVisibleSurfaceChunks();
 
     RenderContext ctx;
