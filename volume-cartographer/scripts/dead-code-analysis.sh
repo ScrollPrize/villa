@@ -1,21 +1,35 @@
 #!/usr/bin/env bash
-# Dead-code analysis using nm + ninja depfiles. Five reports:
+# Dead-code analysis using nm + ninja depfiles + linker --print-gc-sections.
+# Six reports:
 #
 #   1. dead-symbols.txt   — symbols defined in our .o files but absent
 #                           from every final binary (after a noise filter
-#                           for compiler-emitted boilerplate).
-#   2. dead-objects.txt   — .cpp files that compiled to .o but contributed
+#                           for compiler-emitted boilerplate). Symbol-name
+#                           granularity only: TU-local statics with the
+#                           same mangled name across TUs collapse here, so
+#                           a dead-in-foo.o static masks itself if bar.o
+#                           has a live same-named static. See report 2 for
+#                           the per-TU view.
+#   2. dead-symbols-per-file.tsv — (object, demangled symbol) pairs the
+#                           linker actually GC'd, parsed from
+#                           `--print-gc-sections` output in build.log.
+#                           This is the authoritative per-TU view: it
+#                           handles cross-file dependencies correctly,
+#                           since each TU's section is tracked separately.
+#                           A symbol appears here iff every binary that
+#                           candidate-linked this .o discarded its section.
+#   3. dead-objects.txt   — .cpp files that compiled to .o but contributed
 #                           zero defined symbols to any final binary.
 #                           Whole TU is unreachable.
-#   3. uncompiled-cpps.txt— .cpp files in the source tree that the build
+#   4. uncompiled-cpps.txt— .cpp files in the source tree that the build
 #                           didn't compile. Any symbol referenced only
 #                           from such a file would show up as a false
 #                           positive in dead-symbols, so this is the
 #                           soundness check for that report.
-#   4. dead-headers.txt   — .h / .hpp files in the source tree that no
+#   5. dead-headers.txt   — .h / .hpp files in the source tree that no
 #                           compiled .cpp transitively #include's,
 #                           determined from ninja .d depfiles.
-#   5. compile-warnings.txt — -Wunused-* / -Wunreachable-* compile hits.
+#   6. compile-warnings.txt — -Wunused-* / -Wunreachable-* compile hits.
 #
 # Runs inside the builder image (binutils + c++filt available).
 
@@ -137,9 +151,9 @@ c++filt < "$out/dead-symbols-mangled.txt" > "$out/dead-symbols-raw.txt"
 grep -vE '^(GCC_except_table|DW\.ref\.|__|\.L|guard variable for |vtable for |typeinfo (name )?for |construction vtable for |VTT for |non-virtual thunk |virtual thunk )' \
     "$out/dead-symbols-raw.txt" > "$out/dead-symbols.txt" || true
 
-# Per-.o liveness: an object is "fully dead" iff none of its defined
-# symbols appear in any binary. nm with --print-file-name emits each
-# symbol as `path:type:name` so we can group by file.
+# Per-(file, symbol) map: nm with --print-file-name emits each symbol
+# as `path:type:name` so we can group by file. Used both for "fully
+# dead .o" detection and for the per-TU dead-symbols view below.
 nm --defined-only --print-file-name --no-sort "${src_objs[@]}" 2>/dev/null \
     | awk -v RS='\n' '$2 ~ /^[TtDdBbRrWwVv]$/ {
         n = split($1, a, ":"); file = a[1];
@@ -148,6 +162,44 @@ nm --defined-only --print-file-name --no-sort "${src_objs[@]}" 2>/dev/null \
         print file "\t" sym
     }' > "$out/object-symbols.tsv"
 
+# ------------------------------------------------------------------
+# 1b. Per-TU dead symbols (cross-file-dependency-aware attribution)
+#
+# Same dead set as report 1, but attributed to the source .o that
+# defines each symbol. Joins object-symbols.tsv against the binary-
+# set-difference dead set.
+#
+# Cross-file deps are handled correctly: if foo.o defines `bar()`
+# (extern linkage) and baz.o calls it, the linker keeps `bar` in the
+# final binary; `bar` is NOT in dead-symbols-mangled, so this report
+# correctly omits it. Conversely, an extern symbol that no binary
+# keeps is attributed back to whichever .o(s) defined it — including
+# .o's living inside static libs that the linker never pulls in
+# (those leave no `--print-gc-sections` trail in build.log).
+#
+# Caveat: TU-local statics with the same mangled name across two TUs
+# (one dead, one live) cannot be split apart at this layer — both
+# share one row in source-syms / binary-syms. In practice this is rare
+# because compilers elide unused statics before linking; the
+# `-Wunused-function` warnings in compile-warnings.txt cover that case.
+# ------------------------------------------------------------------
+awk -F'\t' '
+    NR == FNR { dead[$1] = 1; next }
+    ($2 in dead) { print }
+' "$out/dead-symbols-mangled.txt" "$out/object-symbols.tsv" \
+    | sort -u > "$out/dead-symbols-per-file-mangled.tsv"
+
+awk -F'\t' '{ print $2 }' "$out/dead-symbols-per-file-mangled.tsv" \
+    | c++filt > "$out/.demangled.tmp"
+paste \
+    <(awk -F'\t' '{ print $1 }' "$out/dead-symbols-per-file-mangled.tsv") \
+    "$out/.demangled.tmp" \
+    | grep -vE $'\t(GCC_except_table|DW\\.ref\\.|__|\\.L|guard variable for |vtable for |typeinfo (name )?for |construction vtable for |VTT for |non-virtual thunk |virtual thunk )' \
+    | sort -u > "$out/dead-symbols-per-file.tsv"
+rm -f "$out/.demangled.tmp"
+
+# Per-.o liveness: an object is "fully dead" iff none of its defined
+# symbols appear in any binary.
 awk -F'\t' 'NR==FNR { live[$1]=1; next } { obj_syms[$1] = obj_syms[$1] "\n" $2 }
     END { for (o in obj_syms) {
             split(obj_syms[o], syms, "\n");
@@ -171,6 +223,7 @@ n_src=$(wc -l < "$out/source-syms.txt")
 n_bin=$(wc -l < "$out/binary-syms.txt")
 n_dead_sym_raw=$(wc -l < "$out/dead-symbols-raw.txt")
 n_dead_sym=$(wc -l < "$out/dead-symbols.txt")
+n_dead_sym_per_file=$(wc -l < "$out/dead-symbols-per-file.tsv")
 n_warn=$(wc -l < "$out/compile-warnings.txt")
 
 {
@@ -191,6 +244,7 @@ n_warn=$(wc -l < "$out/compile-warnings.txt")
     echo "  Present in any final binary:          $n_bin"
     echo "  Dead (raw):                           $n_dead_sym_raw"
     echo "  Dead (after compiler-noise filter):   $n_dead_sym"
+    echo "  Dead per-TU (gc-sections, cross-file aware): $n_dead_sym_per_file"
     echo
     echo "Compile-time -Wunused* / -Wunreachable* warnings: $n_warn"
     echo
@@ -207,6 +261,10 @@ n_warn=$(wc -l < "$out/compile-warnings.txt")
     echo
     echo "Top 30 dead symbols (demangled, noise-filtered):"
     head -30 "$out/dead-symbols.txt"
+    echo
+    echo "Top 30 dead symbols per-TU (object<TAB>symbol; gc-sections):"
+    head -30 "$out/dead-symbols-per-file.tsv" \
+        | sed -E 's|^[^/]+/CMakeFiles/[^/]+\.dir/||; s|\.cpp\.o\t|\.cpp\t|'
     echo
     echo "Top 20 compile warnings:"
     head -20 "$out/compile-warnings.txt"
