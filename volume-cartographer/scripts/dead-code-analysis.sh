@@ -244,7 +244,7 @@ n_warn=$(wc -l < "$out/compile-warnings.txt")
     echo "  Present in any final binary:          $n_bin"
     echo "  Dead (raw):                           $n_dead_sym_raw"
     echo "  Dead (after compiler-noise filter):   $n_dead_sym"
-    echo "  Dead per-TU (gc-sections, cross-file aware): $n_dead_sym_per_file"
+    echo "  Dead per-TU (nm-attributed, cross-file aware): $n_dead_sym_per_file"
     echo
     echo "Compile-time -Wunused* / -Wunreachable* warnings: $n_warn"
     echo
@@ -262,9 +262,9 @@ n_warn=$(wc -l < "$out/compile-warnings.txt")
     echo "Top 30 dead symbols (demangled, noise-filtered):"
     head -30 "$out/dead-symbols.txt"
     echo
-    echo "Top 30 dead symbols per-TU (object<TAB>symbol; gc-sections):"
+    echo "Top 30 dead symbols per-TU (source-file<TAB>symbol):"
     head -30 "$out/dead-symbols-per-file.tsv" \
-        | sed -E 's|^[^/]+/CMakeFiles/[^/]+\.dir/||; s|\.cpp\.o\t|\.cpp\t|'
+        | sed -E "s|^${build_dir%/}/||; s|^[^/]+/CMakeFiles/[^/]+\.dir/||; s|\.cpp\.o\t|\.cpp\t|"
     echo
     echo "Top 20 compile warnings:"
     head -20 "$out/compile-warnings.txt"
