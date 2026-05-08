@@ -1,6 +1,7 @@
 #include "SurfaceMaskBrushTool.hpp"
 
 #include "../SegmentationModule.hpp"
+#include "../SegmentationUndoHistory.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../../ViewerManager.hpp"
 
@@ -261,7 +262,11 @@ void SurfaceMaskBrushTool::finishStroke()
     _strokeActive = false;
     _lastGridPosition.reset();
     fillEnclosedStrokeArea();
-    const cv::Rect changedRegion = applyPendingCells();
+    std::vector<segmentation::VertexDelta> undoDeltas;
+    const cv::Rect changedRegion = applyPendingCells(&undoDeltas);
+    if (!changedRegion.empty() && !undoDeltas.empty()) {
+        (void)_module.captureUndoDelta(undoDeltas);
+    }
     if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
         _module._editManager->applyExternalSurfaceUpdate(changedRegion);
     }
@@ -509,7 +514,7 @@ void SurfaceMaskBrushTool::persistSurface()
     }
 }
 
-cv::Rect SurfaceMaskBrushTool::applyPendingCells()
+cv::Rect SurfaceMaskBrushTool::applyPendingCells(std::vector<segmentation::VertexDelta>* undoDeltas)
 {
     if (!_surface || _mask.empty()) {
         return {};
@@ -529,6 +534,13 @@ cv::Rect SurfaceMaskBrushTool::applyPendingCells()
     for (const auto& [row, col] : _pendingCells) {
         if (row < 0 || row >= _mask.rows || col < 0 || col >= _mask.cols) {
             continue;
+        }
+        const cv::Vec3f previousWorld = (*points)(row, col);
+        if (previousWorld == invalid) {
+            continue;
+        }
+        if (undoDeltas) {
+            undoDeltas->push_back({row, col, previousWorld});
         }
         _mask(row, col) = 0;
         (*points)(row, col) = invalid;

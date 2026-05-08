@@ -3,6 +3,7 @@
 #include "../CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/SurfaceMaskBrushTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
@@ -43,6 +44,10 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     if (isEditingApprovalMask() && _approvalTool) {
         _approvalTool->setSurface(_editManager->baseSurface().get());
     }
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setSurface(_editManager->baseSurface().get());
+        _surfaceMaskTool->setActive(_editingEnabled && _drawMaskEnabled);
+    }
 
     // Reload approval mask image if showing OR editing approval mask
     // Ensures dimensions match the session's surface
@@ -81,6 +86,9 @@ void SegmentationModule::endEditingSession()
     clearUndoStack();
     cancelDrag();
     clearLineDragStroke();
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setActive(false);
+    }
     _lineDrawKeyActive = false;
     resetHoverLookupDetail();
     _hoverPointer.valid = false;
@@ -185,6 +193,18 @@ bool SegmentationModule::captureUndoDelta()
     deltas.reserve(editedVerts.size());
     for (const auto& edit : editedVerts) {
         deltas.push_back({edit.row, edit.col, edit.originalWorld});
+    }
+
+    return _undoHistory.captureDelta(deltas);
+}
+
+bool SegmentationModule::captureUndoDelta(const std::vector<segmentation::VertexDelta>& deltas)
+{
+    if (_suppressUndoCapture) {
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        return false;
     }
 
     return _undoHistory.captureDelta(deltas);

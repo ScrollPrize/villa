@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../SegmentationUndoHistory.hpp"
+
 #include <QPointF>
 #include <opencv2/core.hpp>
 
@@ -36,7 +38,7 @@ private:
     void queueVertex(int row, int col);
     void fillEnclosedStrokeArea();
     void persistSurface();
-    [[nodiscard]] cv::Rect applyPendingCells();
+    [[nodiscard]] cv::Rect applyPendingCells(std::vector<segmentation::VertexDelta>* undoDeltas);
     void refreshSurfacePatchIndex(const cv::Rect& changedRegion);
     void invalidateOverlay();
     void invalidateViewers(bool surfaceChanged);

@@ -356,6 +356,7 @@ private:
 
     [[nodiscard]] bool captureUndoSnapshot();
     [[nodiscard]] bool captureUndoDelta();  // Capture delta from current edited vertices
+    [[nodiscard]] bool captureUndoDelta(const std::vector<segmentation::VertexDelta>& deltas);
     void discardLastUndoSnapshot();
     bool restoreUndoSnapshot();
     void clearUndoStack();
