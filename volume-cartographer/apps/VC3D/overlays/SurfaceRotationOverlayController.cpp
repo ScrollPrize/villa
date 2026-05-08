@@ -39,6 +39,11 @@ struct RotationSaveResult {
     QString error;
 };
 
+bool hasFileMetadata(const std::shared_ptr<QuadSurface>& surface)
+{
+    return surface && !surface->path.empty() && !surface->id.empty();
+}
+
 class RotationDial final : public QWidget
 {
 public:
@@ -390,11 +395,26 @@ std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::currentSourceSurf
     if (!_state) {
         return nullptr;
     }
+
+    const std::string activeId = _state->activeSurfaceId();
+    if (!activeId.empty()) {
+        if (auto vpkg = _state->vpkg()) {
+            if (auto selected = vpkg->getSurface(activeId); hasFileMetadata(selected)) {
+                return selected;
+            }
+        }
+    }
+
+    auto segmentation = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    if (hasFileMetadata(segmentation)) {
+        return segmentation;
+    }
+
     auto active = _state->activeSurface().lock();
-    if (active) {
+    if (hasFileMetadata(active)) {
         return active;
     }
-    return std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    return nullptr;
 }
 
 void SurfaceRotationOverlayController::ensureWidgetForTarget()
@@ -520,7 +540,7 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
-    if (_sourceSurface->path.empty() || _sourceSurface->id.empty()) {
+    if (!hasFileMetadata(_sourceSurface)) {
         QMessageBox::warning(nullptr,
                              tr("Rotation Failed"),
                              tr("Failed to save the rotated surface: the selected surface is missing file metadata."));
