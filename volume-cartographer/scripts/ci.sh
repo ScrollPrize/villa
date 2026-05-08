@@ -149,23 +149,50 @@ cmd_coverage() {
 
 cmd_patch_coverage() {
     local base_ref=$1
-    local image=${2:-ubuntu-24.04}
+    # Second positional ("image") is accepted for backwards compat but ignored:
+    # diff-cover only needs Python + git history, so we run it on the host.
+    # When volume-cartographer lives as a subdir of a larger repo the .git is
+    # outside the docker mount and diff-cover dies with "not a git repository".
     local min_pct=${PATCH_COVERAGE_MIN:-0}
     local cobertura="$REPO_ROOT/coverage/cobertura.xml"
     if [[ ! -f "$cobertura" ]]; then
         echo "patch-coverage: $cobertura missing — run 'ci.sh coverage' first" >&2
         return 1
     fi
-    git -C "$REPO_ROOT" fetch --quiet origin "${base_ref#origin/}" || true
-    run_in_builder "$image" "$REPO_ROOT" "
-        cd /src &&
-        python3 -m venv /tmp/diffcov &&
-        /tmp/diffcov/bin/pip install --quiet diff-cover &&
-        /tmp/diffcov/bin/diff-cover coverage/cobertura.xml \
-            --compare-branch=$base_ref \
-            --fail-under=$min_pct \
-            --format markdown:coverage/patch.md \
-            --format html:coverage/patch.html"
+
+    local git_root
+    git_root=$(git -C "$REPO_ROOT" rev-parse --show-toplevel)
+    git -C "$git_root" fetch --quiet origin "${base_ref#origin/}" || true
+
+    # gcovr ran inside docker as root, so coverage/ is root-owned on the host.
+    # We need to write patch.md / patch.html into it from the host runner.
+    if [[ ! -w "$REPO_ROOT/coverage" ]]; then
+        sudo chown -R "$(id -u):$(id -g)" "$REPO_ROOT/coverage" 2>/dev/null || true
+    fi
+
+    # gcovr emits paths relative to volume-cartographer with <source>.</source>.
+    # When the git root is a parent dir, prepend the subdir so diff-cover's
+    # path lookup matches what git reports as changed.
+    local src_in_git fixed
+    src_in_git=$(realpath --relative-to="$git_root" "$REPO_ROOT")
+    fixed=$(mktemp -t cobertura-diffcov.XXXXXX.xml)
+    trap 'rm -f "$fixed"' RETURN
+    if [[ "$src_in_git" == "." ]]; then
+        cp "$cobertura" "$fixed"
+    else
+        sed "s|<source>\.</source>|<source>${src_in_git}</source>|" "$cobertura" > "$fixed"
+    fi
+
+    python3 -m venv /tmp/diffcov >/dev/null
+    /tmp/diffcov/bin/pip install --quiet diff-cover
+    (
+        cd "$git_root"
+        /tmp/diffcov/bin/diff-cover "$fixed" \
+            --compare-branch="$base_ref" \
+            --fail-under="$min_pct" \
+            --markdown-report "$REPO_ROOT/coverage/patch.md" \
+            --html-report "$REPO_ROOT/coverage/patch.html"
+    )
 }
 
 cmd_coverage_regression() {
