@@ -94,20 +94,24 @@ std::vector<std::byte> bloscCompress(std::span<const std::byte> input,
     return output;
 }
 
-std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t outputSize)
+void bloscDecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
     ensureBloscInitialized();
-
-    std::vector<std::byte> output(outputSize);
-    const int rc = blosc_decompress_ctx(input.data(), output.data(), outputSize,
+    const int rc = blosc_decompress_ctx(input.data(), output.data(), output.size(),
                                         /*nthreads=*/1);
     if (rc < 0) {
-        if (input.size() == outputSize) {
-            std::memcpy(output.data(), input.data(), outputSize);
-            return output;
+        if (input.size() == output.size()) {
+            std::memcpy(output.data(), input.data(), output.size());
+            return;
         }
         throw std::runtime_error("blosc_decompress_ctx failed with code " + std::to_string(rc));
     }
+}
+
+std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    std::vector<std::byte> output(outputSize);
+    bloscDecompressInto(input, output);
     return output;
 }
 
@@ -123,16 +127,21 @@ std::vector<std::byte> zstdCompress(std::span<const std::byte> input, const Comp
     return output;
 }
 
-std::vector<std::byte> zstdDecompress(std::span<const std::byte> input, size_t outputSize)
+void zstdDecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
-    std::vector<std::byte> output(outputSize);
-    const size_t rc = ZSTD_decompress(output.data(), outputSize, input.data(), input.size());
+    const size_t rc = ZSTD_decompress(output.data(), output.size(), input.data(), input.size());
     if (ZSTD_isError(rc)) {
         throw std::runtime_error(std::string("ZSTD_decompress failed: ") + ZSTD_getErrorName(rc));
     }
-    if (rc != outputSize) {
+    if (rc != output.size()) {
         throw std::runtime_error("ZSTD_decompress returned unexpected byte count");
     }
+}
+
+std::vector<std::byte> zstdDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    std::vector<std::byte> output(outputSize);
+    zstdDecompressInto(input, output);
     return output;
 }
 
@@ -157,7 +166,7 @@ std::vector<std::byte> lz4Compress(std::span<const std::byte> input, const Compr
     return output;
 }
 
-std::vector<std::byte> lz4Decompress(std::span<const std::byte> input, size_t outputSize)
+void lz4DecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
     if (input.size() < sizeof(uint32_t)) {
         throw std::runtime_error("LZ4 compressed data too short");
@@ -165,11 +174,10 @@ std::vector<std::byte> lz4Decompress(std::span<const std::byte> input, size_t ou
 
     uint32_t originalSize = 0;
     std::memcpy(&originalSize, input.data(), sizeof(originalSize));
-    if (originalSize > outputSize) {
-        throw std::runtime_error("LZ4 original size exceeds output buffer");
+    if (originalSize != output.size()) {
+        throw std::runtime_error("LZ4 original size does not match output buffer");
     }
 
-    std::vector<std::byte> output(outputSize);
     const int rc = LZ4_decompress_safe(
         reinterpret_cast<const char*>(input.data() + sizeof(uint32_t)),
         reinterpret_cast<char*>(output.data()),
@@ -178,6 +186,15 @@ std::vector<std::byte> lz4Decompress(std::span<const std::byte> input, size_t ou
     if (rc < 0) {
         throw std::runtime_error("LZ4_decompress_safe failed");
     }
+    if (static_cast<size_t>(rc) != output.size()) {
+        throw std::runtime_error("LZ4_decompress_safe produced unexpected byte count");
+    }
+}
+
+std::vector<std::byte> lz4Decompress(std::span<const std::byte> input, size_t outputSize)
+{
+    std::vector<std::byte> output(outputSize);
+    lz4DecompressInto(input, output);
     return output;
 }
 
@@ -218,14 +235,13 @@ std::vector<std::byte> c3dCompress(std::span<const std::byte> input,
     return utils::c3d_encode(input, p);
 }
 
-std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t outputSize)
+void gzipDecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
     z_stream stream{};
     if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) {
         throw std::runtime_error("inflateInit2 failed");
     }
 
-    std::vector<std::byte> output(outputSize);
     stream.avail_in = checkedUInt(input.size(), "gzip input");
     stream.next_in = reinterpret_cast<Bytef*>(const_cast<std::byte*>(input.data()));
     stream.avail_out = checkedUInt(output.size(), "gzip output");
@@ -236,6 +252,12 @@ std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t o
     if (rc != Z_STREAM_END && rc != Z_OK) {
         throw std::runtime_error("gzip inflate failed with code " + std::to_string(rc));
     }
+}
+
+std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    std::vector<std::byte> output(outputSize);
+    gzipDecompressInto(input, output);
     return output;
 }
 
@@ -259,6 +281,38 @@ std::vector<std::byte> decompressBytes(const CompressorConfig& cfg,
     }
 
     throw std::runtime_error("unsupported zarr compressor");
+}
+
+// Direct-into-buffer dispatcher. Returns false when the codec has no
+// scratch-friendly path (currently c3d) so callers fall back to the
+// allocating decompressBytes() variant.
+bool decompressBytesInto(const CompressorConfig& cfg,
+                         std::span<const std::byte> input,
+                         std::span<std::byte> output)
+{
+    switch (cfg.id) {
+    case CompressorId::None:
+        if (input.size() < output.size()) {
+            throw std::runtime_error("uncompressed zarr chunk shorter than expected");
+        }
+        std::memcpy(output.data(), input.data(), output.size());
+        return true;
+    case CompressorId::Blosc:
+        bloscDecompressInto(input, output);
+        return true;
+    case CompressorId::Zstd:
+        zstdDecompressInto(input, output);
+        return true;
+    case CompressorId::Lz4:
+        lz4DecompressInto(input, output);
+        return true;
+    case CompressorId::Gzip:
+        gzipDecompressInto(input, output);
+        return true;
+    case CompressorId::C3d:
+        return false;
+    }
+    return false;
 }
 
 std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
@@ -368,6 +422,12 @@ static utils::ZarrArray::Codec codecFromConfig(const CompressorConfig& cfg)
     codec.decompress = [cfg](std::span<const std::byte> data, std::size_t outSize) {
         return decompressBytes(cfg, data, outSize);
     };
+    if (cfg.id != CompressorId::C3d) {
+        codec.decompress_into = [cfg](std::span<const std::byte> data,
+                                      std::span<std::byte> out) {
+            decompressBytesInto(cfg, data, out);
+        };
+    }
     return codec;
 }
 

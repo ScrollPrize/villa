@@ -22,6 +22,7 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/types/VcDataset.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
@@ -416,6 +417,15 @@ utils::ZarrArray openLocalZarrArrayForWrite(const std::filesystem::path& path)
     if (!meta.compressor_id.empty() || !meta.codecs.empty())
         throw std::runtime_error("cannot write compressed zarr without compression codec support: " + path.string());
     return array;
+}
+
+// Read-side opener: uses the same codec registry that backs the chunked
+// read cache (ZarrChunkFetcher / VcDataset), so it works in builds where
+// `compression.hpp` is unavailable and `zarrCodecRegistry()` is empty.
+utils::ZarrArray openLocalZarrArrayForRead(const std::filesystem::path& path,
+                                           int dtypeSize)
+{
+    return utils::ZarrArray::open(path, vc::buildZarrCodecRegistry(dtypeSize));
 }
 
 std::vector<size_t> toVector(const std::array<size_t, 3>& value)
@@ -1754,8 +1764,33 @@ std::optional<std::vector<std::byte>> Volume::readChunk(
     if (!hasScaleLevel(level))
         throw std::out_of_range("Volume::readChunk requested missing zarr scale level " + std::to_string(level));
 
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
+                                           static_cast<int>(dtypeSize()));
     return array.read_chunk(chunkZYX);
+}
+
+bool Volume::readChunkInto(
+    int level,
+    const std::array<size_t, 3>& chunkZYX,
+    std::span<std::byte> output) const
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::readChunkInto is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::readChunkInto level must be non-negative");
+    if (!hasScaleLevel(level))
+        throw std::out_of_range("Volume::readChunkInto requested missing zarr scale level " + std::to_string(level));
+
+    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
+                                           static_cast<int>(dtypeSize()));
+    return array.read_chunk_into(chunkZYX, output);
+}
+
+size_t Volume::chunkByteSize(int level) const
+{
+    const auto cs = chunkShape(level);
+    return static_cast<size_t>(cs[0]) * static_cast<size_t>(cs[1]) *
+           static_cast<size_t>(cs[2]) * dtypeSize();
 }
 
 std::vector<std::byte> Volume::readChunkOrFill(
@@ -1765,7 +1800,8 @@ std::vector<std::byte> Volume::readChunkOrFill(
     if (auto chunk = readChunk(level, chunkZYX))
         return std::move(*chunk);
 
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
+                                           static_cast<int>(dtypeSize()));
     return filledChunkBytes(array);
 }
 
@@ -1780,7 +1816,8 @@ bool Volume::chunkExists(
     if (!hasScaleLevel(level))
         throw std::out_of_range("Volume::chunkExists requested missing zarr scale level " + std::to_string(level));
 
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
+    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
+                                           static_cast<int>(dtypeSize()));
     if (array.is_sharded())
         return array.inner_chunk_exists(chunkZYX);
     return array.chunk_exists(chunkZYX);

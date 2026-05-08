@@ -212,6 +212,18 @@ public:
     [[nodiscard]] std::optional<std::vector<std::byte>> readChunk(
         int level,
         const std::array<size_t, 3>& chunkZYX) const;
+    // Decompress directly into a caller-owned scratch buffer (must be
+    // sized to chunkByteSize(level)). Returns false when the chunk is
+    // missing on disk; otherwise writes exactly chunkByteSize(level)
+    // bytes into `output` and returns true. Avoids the per-call heap
+    // allocation that readChunk() performs.
+    [[nodiscard]] bool readChunkInto(
+        int level,
+        const std::array<size_t, 3>& chunkZYX,
+        std::span<std::byte> output) const;
+    // Byte size of one decompressed chunk at the given level (matches
+    // what readChunk returns and what readChunkInto requires).
+    [[nodiscard]] size_t chunkByteSize(int level) const;
     [[nodiscard]] std::vector<std::byte> readChunkOrFill(
         int level,
         const std::array<size_t, 3>& chunkZYX) const;
