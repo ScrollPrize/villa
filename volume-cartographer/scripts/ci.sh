@@ -41,14 +41,23 @@ dockerfile_for() {
 
 run_in_builder() {
     local image=$1 src=$2; shift 2
+    # --user host UID/GID: files written under /src land owned by the
+    #   runner user (no `sudo chown` afterward, locally or on GHA).
+    # -e VC_BUILD_SUFFIX: per-image build-dir suffix that the _base
+    #   preset bakes into binaryDir. Different images writing to the
+    #   same bind-mounted /src don't clobber each other's CMake cache,
+    #   and parallel `ci.sh` invocations across images can coexist.
     docker run --rm \
+        --user "$(id -u):$(id -g)" \
         -v "$src:/src" \
         -w /src \
+        -e "VC_BUILD_SUFFIX=-$image" \
         "vc-builder:$image" bash -c "$*"
 }
 
 coverage_in_dir() {
     local image=$1 src=$2
+    local build_dir="build/ci-coverage-gcc-$image"
     run_in_builder "$image" "$src" "
         cmake --preset ci-coverage-gcc &&
         cmake --build --preset ci-coverage-gcc &&
@@ -62,7 +71,7 @@ coverage_in_dir() {
           --html-details coverage/index.html \
           --cobertura coverage/cobertura.xml \
           --txt coverage/summary.txt \
-          build/ci-coverage-gcc &&
+          $build_dir &&
         find . -name '*.gcov' -not -path './coverage/*' -delete"
 }
 
@@ -164,12 +173,6 @@ cmd_patch_coverage() {
     git_root=$(git -C "$REPO_ROOT" rev-parse --show-toplevel)
     git -C "$git_root" fetch --quiet origin "${base_ref#origin/}" || true
 
-    # gcovr ran inside docker as root, so coverage/ is root-owned on the host.
-    # We need to write patch.md / patch.html into it from the host runner.
-    if [[ ! -w "$REPO_ROOT/coverage" ]]; then
-        sudo chown -R "$(id -u):$(id -g)" "$REPO_ROOT/coverage" 2>/dev/null || true
-    fi
-
     # gcovr emits paths relative to volume-cartographer with <source>.</source>.
     # When the git root is a parent dir, prepend the subdir so diff-cover's
     # path lookup matches what git reports as changed.
@@ -234,16 +237,16 @@ cmd_coverage_regression() {
 cmd_dead_code() {
     local image=${1:-ubuntu-24.04}
     local compiler=${2:-clang}
+    local build_dir="build/ci-dead-code-$compiler-$image"
     mkdir -p "$REPO_ROOT/dead-code"
 
     # Build inside the container; capture full build log for compile-warning
     # extraction. Then run nm-based analysis (approach B): symbols defined
     # somewhere in our source .o files but absent from every final binary.
     run_in_builder "$image" "$REPO_ROOT" "
-        rm -rf build/ci-dead-code-$compiler &&
         cmake --preset ci-dead-code-$compiler &&
         cmake --build --preset ci-dead-code-$compiler 2>&1 | tee dead-code/build.log
-        scripts/dead-code-analysis.sh build/ci-dead-code-$compiler"
+        scripts/dead-code-analysis.sh $build_dir"
 }
 
 cmd_all() {
