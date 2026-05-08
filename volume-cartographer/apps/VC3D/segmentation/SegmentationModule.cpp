@@ -559,6 +559,9 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_overlay) {
         _overlay->setEditingEnabled(enabled);
     }
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setActive(enabled && hasActiveSession() && _drawMaskEnabled);
+    }
     updateViewerCursors();
     if (!enabled) {
         resetManualAddState(true);
@@ -626,7 +629,7 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     }
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setSurface(newSurface);
-        _surfaceMaskTool->setActive(_drawMaskEnabled);
+        _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
     }
 
     // Turn off any approval mask editing when switching segments
@@ -847,7 +850,7 @@ void SegmentationModule::setDrawMaskEnabled(bool enabled)
     _shiftDrawMaskActive = false;
 
     if (_surfaceMaskTool) {
-        _surfaceMaskTool->setActive(_drawMaskEnabled);
+        _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
 
         QuadSurface* surface = nullptr;
         std::shared_ptr<Surface> surfaceHolder;

@@ -56,6 +56,9 @@ target_link_libraries(vc_tifxyz_inp_mask vc_core)
 add_executable(vc_tifxyz_trim src/vc_tifxyz_trim.cpp)
 target_link_libraries(vc_tifxyz_trim vc_core opencv_core opencv_imgcodecs TIFF::TIFF)
 
+add_executable(vc_cut_windings src/vc_cut_windings.cpp)
+target_link_libraries(vc_cut_windings vc_core opencv_core)
+
 add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
@@ -164,6 +167,7 @@ if(VC_USE_PCH)
         vc_flatten
         vc_tifxyz_inp_mask
         vc_tifxyz_trim
+        vc_cut_windings
         vc_tifxyz_winding
         vc_tifxyz2zarr_sparse
         vc_add_ignore_label

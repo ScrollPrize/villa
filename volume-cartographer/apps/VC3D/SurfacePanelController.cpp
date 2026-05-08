@@ -777,17 +777,17 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     QMenu* flipMenu = contextMenu.addMenu(tr("Flip Surface"));
-    QAction* flipUAction = flipMenu->addAction(tr("Flip over U axis (reverse V)"));
+    QAction* flipUAction = flipMenu->addAction(tr("V Flip"));
     connect(flipUAction, &QAction::triggered, this, [this, segmentId]() {
         emit flipURequested(segmentId);
     });
-    QAction* flipVAction = flipMenu->addAction(tr("Flip over V axis (reverse U)"));
+    QAction* flipVAction = flipMenu->addAction(tr("H Flip"));
     connect(flipVAction, &QAction::triggered, this, [this, segmentId]() {
         emit flipVRequested(segmentId);
     });
-    QAction* flipNormalsAction = flipMenu->addAction(tr("Normals"));
+    QAction* flipNormalsAction = flipMenu->addAction(tr("Normals (H Flip)"));
     connect(flipNormalsAction, &QAction::triggered, this, [this, segmentId]() {
-        emit flipURequested(segmentId);
+        emit flipVRequested(segmentId);
     });
 
     QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface 90° CW"));

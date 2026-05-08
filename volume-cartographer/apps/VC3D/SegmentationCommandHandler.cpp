@@ -2130,11 +2130,11 @@ void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, boo
         }
     }
 
-    const QString axisLabel = flipU ? tr("U") : tr("V");
+    const QString directionLabel = flipU ? tr("vertically") : tr("horizontally");
     emit statusMessage(
-        tr("Flipped %1 over %2 axis")
+        tr("Flipped %1 %2")
             .arg(QString::fromStdString(segmentId))
-            .arg(axisLabel),
+            .arg(directionLabel),
         5000);
 }
 
