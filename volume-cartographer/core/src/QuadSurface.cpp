@@ -2281,8 +2281,8 @@ void QuadSurface::flipU()
         flipSingleTiff(path / "approval.tif", flipCode);
     }
 
-    // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    // Invalidate derived geometry caches.
+    invalidateCache();
 }
 
 void QuadSurface::flipV()
@@ -2310,8 +2310,8 @@ void QuadSurface::flipV()
         flipSingleTiff(path / "approval.tif", flipCode);
     }
 
-    // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    // Invalidate derived geometry caches.
+    invalidateCache();
 }
 
 // Overlapping JSON file utilities
