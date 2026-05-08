@@ -1,7 +1,6 @@
 #include "SurfaceMaskBrushTool.hpp"
 
 #include "../SegmentationModule.hpp"
-#include "../SegmentationUndoHistory.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../../ViewerManager.hpp"
 
@@ -153,6 +152,7 @@ void SurfaceMaskBrushTool::setSurface(QuadSurface* surface)
     _surface = surface;
     _mask.release();
     _lastGridPosition.reset();
+    _undoSnapshotCaptured = false;
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -184,6 +184,7 @@ void SurfaceMaskBrushTool::startStroke(const QPointF& surfacePos)
     const int col = static_cast<int>(std::lround(gridPos->second));
 
     ensureMask();
+    _undoSnapshotCaptured = _module.captureUndoSnapshot();
     _strokeActive = true;
     _paintedCells.clear();
     _pendingCells.clear();
@@ -262,11 +263,11 @@ void SurfaceMaskBrushTool::finishStroke()
     _strokeActive = false;
     _lastGridPosition.reset();
     fillEnclosedStrokeArea();
-    std::vector<segmentation::VertexDelta> undoDeltas;
-    const cv::Rect changedRegion = applyPendingCells(&undoDeltas);
-    if (!changedRegion.empty() && !undoDeltas.empty()) {
-        (void)_module.captureUndoDelta(undoDeltas);
+    const cv::Rect changedRegion = applyPendingCells();
+    if (changedRegion.empty() && _undoSnapshotCaptured) {
+        _module.discardLastUndoSnapshot();
     }
+    _undoSnapshotCaptured = false;
     if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
         _module._editManager->applyExternalSurfaceUpdate(changedRegion);
     }
@@ -283,6 +284,10 @@ void SurfaceMaskBrushTool::cancelStroke()
 {
     _strokeActive = false;
     _lastGridPosition.reset();
+    if (_undoSnapshotCaptured) {
+        _module.discardLastUndoSnapshot();
+        _undoSnapshotCaptured = false;
+    }
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -293,6 +298,25 @@ void SurfaceMaskBrushTool::cancelStroke()
         _mask.release();
     }
     invalidateViewers(false);
+}
+
+void SurfaceMaskBrushTool::refreshFromSurface()
+{
+    if (_strokeActive || hasPendingStroke()) {
+        cancelStroke();
+    }
+    _lastGridPosition.reset();
+    _paintedCells.clear();
+    _pendingCells.clear();
+    _strokeGridPoints.clear();
+    _overlaySurfacePoints.clear();
+    if (_surface) {
+        _surface->invalidateCache();
+        _mask = _surface->validMask();
+    } else {
+        _mask.release();
+    }
+    invalidateViewers(true);
 }
 
 std::optional<std::pair<float, float>> SurfaceMaskBrushTool::surfaceToGridPosition(const QPointF& surfacePos) const
@@ -514,7 +538,7 @@ void SurfaceMaskBrushTool::persistSurface()
     }
 }
 
-cv::Rect SurfaceMaskBrushTool::applyPendingCells(std::vector<segmentation::VertexDelta>* undoDeltas)
+cv::Rect SurfaceMaskBrushTool::applyPendingCells()
 {
     if (!_surface || _mask.empty()) {
         return {};
@@ -538,9 +562,6 @@ cv::Rect SurfaceMaskBrushTool::applyPendingCells(std::vector<segmentation::Verte
         const cv::Vec3f previousWorld = (*points)(row, col);
         if (previousWorld == invalid) {
             continue;
-        }
-        if (undoDeltas) {
-            undoDeltas->push_back({row, col, previousWorld});
         }
         _mask(row, col) = 0;
         (*points)(row, col) = invalid;

@@ -1949,7 +1949,7 @@
         <string>Move viewers to the selected surface when the active surface changes</string>
        </property>
        <property name="text">
-        <string>move on srf changed</string>
+        <string>Move on surface change</string>
        </property>
        <property name="checked">
         <bool>true</bool>

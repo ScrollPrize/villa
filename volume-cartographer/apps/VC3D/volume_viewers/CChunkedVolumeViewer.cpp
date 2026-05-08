@@ -918,6 +918,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         if (isIntersectionTarget) {
             if (!isEditUpdate) {
                 invalidateIntersect(name);
+                renderIntersections("intersection target surface changed");
             } else {
                 _lastIntersectFp = {};
                 if (_deferSegmentationIntersections && name == "segmentation" &&
@@ -926,10 +927,18 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                     _deferredSegmentationIntersectionsDirty = true;
                     return;
                 }
+                scheduleIntersectionRender("intersection target surface changed");
             }
-            scheduleIntersectionRender("intersection target surface changed");
         }
         return;
+    }
+
+    std::optional<cv::Vec3f> preservedViewCenter;
+    if (!isEditUpdate && !_resetViewOnSurfaceChange && _surfName == "segmentation" &&
+        surf && previousSurface && _view && !_framebuffer.isNull()) {
+        const QPointF sceneCenter(static_cast<qreal>(_framebuffer.width()) * 0.5,
+                                  static_cast<qreal>(_framebuffer.height()) * 0.5);
+        preservedViewCenter = cursorVolumePosition(sceneCenter);
     }
 
     _surfWeak = surf;
@@ -971,10 +980,28 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
         recalcPyramidLevel();
+    } else if (preservedViewCenter) {
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+            const cv::Vec3f projected = plane->project(*preservedViewCenter, 1.0, 1.0);
+            if (std::isfinite(projected[0]) && std::isfinite(projected[1])) {
+                _surfacePtrX = projected[0];
+                _surfacePtrY = projected[1];
+            }
+        } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+            cv::Vec3f ptr = quad->pointer();
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            if (quad->pointTo(ptr, *preservedViewCenter, 4.0f, 100, patchIndex) >= 0.0f) {
+                const cv::Vec3f loc = quad->loc(ptr);
+                if (std::isfinite(loc[0]) && std::isfinite(loc[1])) {
+                    _surfacePtrX = loc[0];
+                    _surfacePtrY = loc[1];
+                }
+            }
+        }
     }
     updateFocusMarker();
     scheduleRender("current surface changed");
-    scheduleIntersectionRender("current surface changed");
+    renderIntersections("current surface changed");
 }
 
 void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std::shared_ptr<Surface>& surf)

@@ -1,6 +1,7 @@
 #include "SegmentationModule.hpp"
 
 #include "../CState.hpp"
+#include "SegmentationWidget.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
@@ -198,18 +199,6 @@ bool SegmentationModule::captureUndoDelta()
     return _undoHistory.captureDelta(deltas);
 }
 
-bool SegmentationModule::captureUndoDelta(const std::vector<segmentation::VertexDelta>& deltas)
-{
-    if (_suppressUndoCapture) {
-        return false;
-    }
-    if (!_editManager || !_editManager->hasSession()) {
-        return false;
-    }
-
-    return _undoHistory.captureDelta(deltas);
-}
-
 void SegmentationModule::discardLastUndoSnapshot()
 {
     _undoHistory.discardLast();
@@ -231,6 +220,7 @@ bool SegmentationModule::restoreUndoSnapshot()
     _suppressUndoCapture = true;
     bool applied = false;
     std::optional<cv::Rect> undoBounds;
+    const bool editingWasEnabled = _editingEnabled;
 
     // Check if this is a delta-based entry or full snapshot
     if (_undoHistory.lastIsDelta()) {
@@ -257,6 +247,9 @@ bool SegmentationModule::restoreUndoSnapshot()
             }
 
             _editManager->applyPreview();
+            if (auto surface = _editManager->previewSurface()) {
+                surface->invalidateCache();
+            }
             applied = true;
         }
     } else {
@@ -273,6 +266,21 @@ bool SegmentationModule::restoreUndoSnapshot()
     }
 
     if (applied) {
+        auto restoredSurface = _editManager->previewSurface();
+        if (restoredSurface) {
+            restoredSurface->invalidateCache();
+        }
+
+        if (_editManager) {
+            _editManager->refreshFromBaseSurface();
+        }
+
+        if (_surfaceMaskTool) {
+            _surfaceMaskTool->setSurface(restoredSurface.get());
+            _surfaceMaskTool->refreshFromSurface();
+            _surfaceMaskTool->setActive(editingWasEnabled && _drawMaskEnabled && hasActiveSession());
+        }
+
         if (_state) {
             auto preview = _editManager->previewSurface();
 
@@ -288,6 +296,13 @@ bool SegmentationModule::restoreUndoSnapshot()
             }
 
             _state->setSurface("segmentation", preview, false, true);
+        }
+
+        if (editingWasEnabled && !_editingEnabled) {
+            setEditingEnabled(true);
+            if (_widget) {
+                _widget->setEditingEnabled(true);
+            }
         }
 
         // Also undo the corresponding auto-approval if approval mask is active

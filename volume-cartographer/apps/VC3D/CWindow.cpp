@@ -2804,31 +2804,38 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         _axisAlignedSliceController->resetAll();
     }
 
-    if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-        try {
-            quadSurf->ensureLoaded();
-            const cv::Vec3f worldCenter = quadSurf->coord({0, 0, 0}, {0, 0, 0});
-            const bool centerValid = std::isfinite(worldCenter[0])
-                && std::isfinite(worldCenter[1])
-                && std::isfinite(worldCenter[2])
-                && worldCenter[0] >= 0.0f;
-            if (centerValid) {
-                if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shapeXyz();
-                    cv::Vec3f clamped = worldCenter;
-                    clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
-                    clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
-                    clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
-                    POI* poi = new POI;
-                    poi->p = clamped;
-                    poi->n = cv::Vec3f(0, 0, 0);
-                    poi->surfaceId = newSurfId;
-                    _state->setPOI("focus", poi);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const bool moveOnSurfaceChange =
+        settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                       vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
+
+    if (moveOnSurfaceChange) {
+        if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
+            try {
+                quadSurf->ensureLoaded();
+                const cv::Vec3f worldCenter = quadSurf->coord({0, 0, 0}, {0, 0, 0});
+                const bool centerValid = std::isfinite(worldCenter[0])
+                    && std::isfinite(worldCenter[1])
+                    && std::isfinite(worldCenter[2])
+                    && worldCenter[0] >= 0.0f;
+                if (centerValid) {
+                    if (auto vol = _state->currentVolume()) {
+                        auto [w, h, d] = vol->shapeXyz();
+                        cv::Vec3f clamped = worldCenter;
+                        clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+                        clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+                        clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+                        POI* poi = new POI;
+                        poi->p = clamped;
+                        poi->n = cv::Vec3f(0, 0, 0);
+                        poi->surfaceId = newSurfId;
+                        _state->setPOI("focus", poi);
+                    }
                 }
+            } catch (const std::exception& e) {
+                qWarning() << "Could not compute world center for"
+                           << surfaceId << ":" << e.what();
             }
-        } catch (const std::exception& e) {
-            qWarning() << "Could not compute world center for"
-                       << surfaceId << ":" << e.what();
         }
     }
 
