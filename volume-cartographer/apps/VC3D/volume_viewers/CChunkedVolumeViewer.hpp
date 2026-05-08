@@ -357,6 +357,7 @@ private:
     float _normalArrowLengthScale = 1.0f;
     int _normalMaxArrows = 32;
     bool _surfaceOverlayEnabled = false;
+    bool _initializedFirstSegmentationSurface = false;
     std::map<std::string, cv::Vec3b> _surfaceOverlays;
     float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;

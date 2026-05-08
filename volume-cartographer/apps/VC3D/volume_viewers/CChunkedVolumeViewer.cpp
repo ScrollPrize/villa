@@ -478,6 +478,13 @@ float scaleForCoarsestPlaneRenderLevel(int numLevels)
     return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
 }
 
+float scaleForCoarsestSegmentationRenderLevel(int numLevels)
+{
+    const int coarsestLevel = std::max(0, numLevels - 1);
+    const float dsScale = static_cast<float>(std::uint64_t{1} << coarsestLevel);
+    return std::clamp(0.75f / (dsScale * kSegmentationResolutionLodZoomBias), kMinScale, kMaxScale);
+}
+
 std::filesystem::path remoteCacheRootForState(const CState* state)
 {
     // Suggestion order: per-volpkg setting first (so projects with an
@@ -971,8 +978,18 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         return;
     }
     updateContentBounds();
-    if (!isEditUpdate && _resetViewOnSurfaceChange && _surfName == "segmentation" &&
-        dynamic_cast<QuadSurface*>(surf.get())) {
+    const bool isSegmentationQuadSurface =
+        _surfName == "segmentation" && dynamic_cast<QuadSurface*>(surf.get());
+    if (!isEditUpdate && isSegmentationQuadSurface && !_initializedFirstSegmentationSurface) {
+        _surfacePtrX = 0.0f;
+        _surfacePtrY = 0.0f;
+        _zOff = 0.0f;
+        const int n = _chunkArray ? _chunkArray->numLevels()
+                                  : (_volume ? static_cast<int>(_volume->numScales()) : 1);
+        _scale = scaleForCoarsestSegmentationRenderLevel(n);
+        recalcPyramidLevel();
+        _initializedFirstSegmentationSurface = true;
+    } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         _surfacePtrX = 0.0f;
         _surfacePtrY = 0.0f;
         _zOff = 0.0f;
