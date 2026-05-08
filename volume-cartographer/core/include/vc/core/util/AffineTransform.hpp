@@ -34,6 +34,10 @@ cv::Vec3f applyPreAffineScale(const cv::Vec3f& point, int scale);
 void transformSurfacePoints(QuadSurface* surface,
                             int scale,
                             const std::optional<cv::Matx44d>& matrix);
+void transformSurfacePoints(QuadSurface* surface,
+                            double scaleBeforeAffine,
+                            const std::optional<cv::Matx44d>& matrix,
+                            double scaleAfterAffine);
 void refreshTransformedSurfaceState(QuadSurface* surface);
 std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<QuadSurface>& source);
 
