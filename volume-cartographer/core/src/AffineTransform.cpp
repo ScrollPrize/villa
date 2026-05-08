@@ -29,6 +29,25 @@ bool isValidSurfacePoint(const cv::Vec3f& point)
         && std::isfinite(point[2]);
 }
 
+bool isRepresentableFloat(double value)
+{
+    return std::isfinite(value)
+        && value >= -static_cast<double>(std::numeric_limits<float>::max())
+        && value <= static_cast<double>(std::numeric_limits<float>::max());
+}
+
+bool isRepresentableVec3f(const cv::Vec3d& point)
+{
+    return isRepresentableFloat(point[0])
+        && isRepresentableFloat(point[1])
+        && isRepresentableFloat(point[2]);
+}
+
+cv::Vec3f invalidSurfacePoint()
+{
+    return cv::Vec3f(-1.0f, -1.0f, -1.0f);
+}
+
 double medianValue(std::vector<double>& values)
 {
     if (values.empty()) {
@@ -248,8 +267,11 @@ cv::Vec3f applyAffineTransform(const cv::Vec3f& point,
         return point;
     }
 
-    const cv::Vec4d homogeneous(point[0], point[1], point[2], 1.0);
-    const cv::Vec4d transformed = matrix * homogeneous;
+    cv::Vec3d transformed;
+    if (!applyAffineTransform(cv::Vec3d(point), matrix, transformed) || !isRepresentableVec3f(transformed)) {
+        return invalidSurfacePoint();
+    }
+
     return cv::Vec3f(static_cast<float>(transformed[0]),
                      static_cast<float>(transformed[1]),
                      static_cast<float>(transformed[2]));
@@ -362,11 +384,22 @@ void transformSurfacePoints(QuadSurface* surface,
                 }
 
                 point *= static_cast<float>(scaleBeforeAffine);
+                if (!isValidSurfacePoint(point)) {
+                    point = invalidSurfacePoint();
+                    continue;
+                }
+
                 if (matrix) {
                     point = applyAffineTransform(point, *matrix);
                 }
-                if (isValidSurfacePoint(point)) {
-                    point *= static_cast<float>(scaleAfterAffine);
+                if (!isValidSurfacePoint(point)) {
+                    point = invalidSurfacePoint();
+                    continue;
+                }
+
+                point *= static_cast<float>(scaleAfterAffine);
+                if (!isValidSurfacePoint(point)) {
+                    point = invalidSurfacePoint();
                 }
             }
         }
