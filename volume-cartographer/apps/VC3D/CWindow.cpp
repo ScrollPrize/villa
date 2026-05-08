@@ -2195,6 +2195,13 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
+    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
+        bool moveOnSurfaceChanged = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
+        QSignalBlocker blocker(chkMoveOnSurfaceChanged);
+        chkMoveOnSurfaceChanged->setChecked(moveOnSurfaceChanged);
+        connect(chkMoveOnSurfaceChanged, &QCheckBox::toggled, this, &CWindow::onMoveOnSurfaceChangedToggled);
+    }
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                                            spinAxisOverlayOpacity->value()).toInt();
@@ -2229,14 +2236,8 @@ void CWindow::CreateWidgets(void)
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-
-    bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
-                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
-    if (_viewerManager) {
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            viewer->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
-            _viewerManager->setResetDefaultFor(viewer, resetViewOnSurfaceChange);
-        }
+    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
+        onMoveOnSurfaceChangedToggled(chkMoveOnSurfaceChanged->isChecked());
     }
 
 }
@@ -3340,6 +3341,29 @@ void CWindow::onAxisAlignedSlicesToggled(bool enabled)
     _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays, ui.spinAxisOverlayOpacity);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
+}
+
+void CWindow::onMoveOnSurfaceChangedToggled(bool enabled)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE, enabled ? "1" : "0");
+
+    if (!_viewerManager) {
+        return;
+    }
+
+    const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
+    _viewerManager->forEachBaseViewer([this, enabled, editingActive](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        _viewerManager->setResetDefaultFor(viewer, enabled);
+        if (editingActive && viewer->surfName() == "segmentation") {
+            viewer->setResetViewOnSurfaceChange(false);
+            return;
+        }
+        viewer->setResetViewOnSurfaceChange(enabled);
+    });
 }
 
 void CWindow::onSegmentationEditingModeChanged(bool enabled)

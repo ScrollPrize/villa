@@ -815,6 +815,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     if (_closing) {
         return;
     }
+    const bool hadVolume = static_cast<bool>(_volume);
     invalidateIntersect();
     if (_surfWeak.lock() == _defaultSurface) {
         _surfWeak.reset();
@@ -838,7 +839,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     _volume = std::move(vol);
     rebuildChunkArray();
     ensureDefaultSurface();
-    if (_volume && isAxisAlignedView()) {
+    if (_volume && isAxisAlignedView() && !hadVolume) {
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : static_cast<int>(_volume->numScales());
         _scale = scaleForCoarsestPlaneRenderLevel(n);
