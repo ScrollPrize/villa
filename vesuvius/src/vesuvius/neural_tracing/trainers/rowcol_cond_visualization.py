@@ -732,6 +732,222 @@ def make_trace_visualization(vis_data, save_path):
     )
 
 
+def make_copy_neighbor_visualization(vis_data, save_path):
+    """Create a copy-neighbor trace/ODE visualization from a trainer payload."""
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    inputs = vis_data["inputs"]
+    b = 0
+    _, _, D, H, W = inputs.shape
+
+    vol = _tensor_to_numpy(inputs[b, 0])
+    cond = _tensor_to_numpy(inputs[b, 1])
+    side_hint = _tensor_to_numpy(inputs[b, 2:5])
+    target_seg = _tensor_to_numpy(vis_data["target_seg"][b]) if vis_data.get("target_seg") is not None else None
+    domain = _tensor_to_numpy(vis_data["domain"][b]) if vis_data.get("domain") is not None else None
+    if domain is None and vis_data.get("progress_phi_weight") is not None:
+        domain = _tensor_to_numpy(vis_data["progress_phi_weight"][b, 0])
+
+    progress_target = (
+        _tensor_to_numpy(vis_data["progress_phi_target"][b, 0])
+        if vis_data.get("progress_phi_target") is not None else None
+    )
+    progress_pred = (
+        _tensor_to_numpy(vis_data["progress_phi_pred"][b, 0].float())
+        if vis_data.get("progress_phi_pred") is not None else None
+    )
+    stop_target = _tensor_to_numpy(vis_data["stop_target"][b, 0]) if vis_data.get("stop_target") is not None else None
+    stop_pred = (
+        _tensor_to_numpy(torch.sigmoid(vis_data["stop_pred"][b, 0].float()))
+        if vis_data.get("stop_pred") is not None else None
+    )
+    target_edt = _tensor_to_numpy(vis_data["target_edt"][b, 0]) if vis_data.get("target_edt") is not None else None
+
+    velocity_align = None
+    if vis_data.get("velocity_dir_pred") is not None and vis_data.get("velocity_dir_target") is not None:
+        pred_vel = F.normalize(vis_data["velocity_dir_pred"][b:b + 1].float(), dim=1, eps=1e-6)
+        target_vel = F.normalize(vis_data["velocity_dir_target"][b:b + 1].float(), dim=1, eps=1e-6)
+        velocity_align = _tensor_to_numpy((pred_vel * target_vel).sum(dim=1)[0].clamp(-1.0, 1.0))
+        if vis_data.get("velocity_loss_weight") is not None:
+            vel_mask = _tensor_to_numpy(vis_data["velocity_loss_weight"][b, 0]) > 0.0
+            velocity_align = np.where(vel_mask, velocity_align, np.nan)
+
+    attract_err = None
+    if vis_data.get("surface_attract_pred") is not None and vis_data.get("surface_attract_target") is not None:
+        pred = _tensor_to_numpy(vis_data["surface_attract_pred"][b])
+        target = _tensor_to_numpy(vis_data["surface_attract_target"][b])
+        attract_err = np.linalg.norm(pred - target, axis=0)
+        if vis_data.get("surface_attract_weight") is not None:
+            attract_mask = _tensor_to_numpy(vis_data["surface_attract_weight"][b, 0]) > 0.0
+            attract_err = np.where(attract_mask, attract_err, np.nan)
+
+    seeds = _tensor_to_numpy(vis_data["endpoint_seed_points"][b]) if vis_data.get("endpoint_seed_points") is not None else None
+    seed_mask = _tensor_to_numpy(vis_data["endpoint_seed_mask"][b]) > 0.0 if vis_data.get("endpoint_seed_mask") is not None else None
+
+    focus_mask = domain > 0.0 if domain is not None else cond > 0.0
+    if np.any(focus_mask):
+        z0, y0, x0 = np.median(np.argwhere(focus_mask), axis=0).astype(int).tolist()
+    else:
+        z0, y0, x0 = D // 2, H // 2, W // 2
+    slices = [("z", z0), ("y", y0), ("x", x0)]
+
+    def _slice(arr, axis, idx):
+        if arr is None:
+            return None
+        if axis == "z":
+            return arr[idx]
+        if axis == "y":
+            return arr[:, idx, :]
+        return arr[:, :, idx]
+
+    def _finite_vmax(arr, fallback=1.0, percentile=99):
+        if arr is None:
+            return fallback
+        vals = arr[np.isfinite(arr)]
+        if vals.size == 0:
+            return fallback
+        value = float(np.percentile(np.abs(vals), percentile))
+        return value if np.isfinite(value) and value > 1e-8 else fallback
+
+    progress_error = None
+    if progress_pred is not None and progress_target is not None:
+        progress_error = np.abs(progress_pred - progress_target)
+        if domain is not None:
+            progress_error = np.where(domain > 0.0, progress_error, np.nan)
+    progress_pred_vmin = 0.0
+    progress_pred_vmax = 1.0
+    if progress_pred is not None:
+        vals = progress_pred[np.isfinite(progress_pred)]
+        if vals.size > 0:
+            progress_pred_vmin = min(0.0, float(np.percentile(vals, 1)))
+            progress_pred_vmax = max(1.0, float(np.percentile(vals, 99)))
+
+    cols = [
+        "Source/Target",
+        "Domain",
+        "Velocity Cos",
+        "Phi Target",
+        "Phi Pred",
+        "Phi |Err|",
+        "Stop Target",
+        "Stop Pred",
+        "Target EDT + Seeds",
+        "Attract |Err|",
+    ]
+    fig = plt.figure(figsize=(3.4 * len(cols), 11))
+    gs = GridSpec(3, len(cols) + 1, figure=fig, width_ratios=[1] * len(cols) + [1.25], wspace=0.28)
+    axes = np.empty((3, len(cols)), dtype=object)
+    for r in range(3):
+        for c in range(len(cols)):
+            axes[r, c] = fig.add_subplot(gs[r, c])
+    ax_text = fig.add_subplot(gs[:, len(cols)])
+    ax_text.axis("off")
+
+    edt_vmax = _finite_vmax(target_edt, fallback=8.0)
+    attract_vmax = _finite_vmax(attract_err, fallback=1.0)
+    phi_err_vmax = _finite_vmax(progress_error, fallback=0.25)
+
+    for row, (axis, idx) in enumerate(slices):
+        vol_slice = _slice(vol, axis, idx)
+        cond_slice = _slice(cond, axis, idx) > 0.5
+        target_slice = _slice(target_seg, axis, idx) > 0.5 if target_seg is not None else np.zeros_like(cond_slice)
+        overlay = np.stack([vol_slice, vol_slice, vol_slice], axis=-1)
+        overlay = (overlay - np.nanmin(overlay)) / max(float(np.nanmax(overlay) - np.nanmin(overlay)), 1e-6)
+        overlay[..., 1] = np.maximum(overlay[..., 1], cond_slice.astype(np.float32))
+        overlay[..., 0] = np.maximum(overlay[..., 0], target_slice.astype(np.float32))
+
+        panels = [
+            (overlay, None, None, None),
+            (_slice(domain, axis, idx), "gray", 0, 1),
+            (_slice(velocity_align, axis, idx), "coolwarm", -1, 1),
+            (_slice(progress_target, axis, idx), "viridis", 0, 1),
+            (_slice(progress_pred, axis, idx), "viridis", progress_pred_vmin, progress_pred_vmax),
+            (_slice(progress_error, axis, idx), "magma", 0, phi_err_vmax),
+            (_slice(stop_target, axis, idx), "viridis", 0, 1),
+            (_slice(stop_pred, axis, idx), "viridis", 0, 1),
+            (_slice(target_edt, axis, idx), "magma", 0, edt_vmax),
+            (_slice(attract_err, axis, idx), "magma", 0, attract_vmax),
+        ]
+        for col, (panel, cmap, vmin, vmax) in enumerate(panels):
+            ax = axes[row, col]
+            if panel is None:
+                panel = np.zeros_like(vol_slice)
+            ax.imshow(panel, cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(f"{cols[col]} ({axis}={idx})")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        if seeds is not None and seed_mask is not None:
+            active = seeds[seed_mask]
+            if active.size > 0:
+                if axis == "z":
+                    near = np.abs(active[:, 0] - idx) <= 1.5
+                    xy = active[near][:, [2, 1]]
+                elif axis == "y":
+                    near = np.abs(active[:, 1] - idx) <= 1.5
+                    xy = active[near][:, [2, 0]]
+                else:
+                    near = np.abs(active[:, 2] - idx) <= 1.5
+                    xy = active[near][:, [1, 0]]
+                if xy.size > 0:
+                    axes[row, 8].scatter(xy[:, 0], xy[:, 1], s=8, c="cyan", edgecolors="black", linewidths=0.2)
+
+    def _finite_mean(arr, mask=None):
+        if arr is None:
+            return 0.0
+        vals = arr[mask] if mask is not None and np.any(mask) else arr.reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        return float(vals.mean()) if vals.size else 0.0
+
+    domain_mask = domain > 0.0 if domain is not None else None
+    side = np.nanmean(side_hint.reshape(3, -1), axis=1)
+    stats_lines = [
+        "=" * 40,
+        "COPY NEIGHBOR TRACE SUMMARY",
+        "=" * 40,
+        f"Input shape: {D}x{H}x{W}",
+        f"Conditioning voxels: {int((cond > 0.5).sum())}",
+        f"Target voxels: {int((target_seg > 0.5).sum()) if target_seg is not None else 0}",
+        f"Domain voxels: {int(domain_mask.sum()) if domain_mask is not None else 0}",
+        f"Side hint mean ZYX: {side[0]:.3f}, {side[1]:.3f}, {side[2]:.3f}",
+        "",
+        "--- Velocity ---",
+        f"Cosine mean: {_finite_mean(velocity_align, domain_mask):.4f}",
+        "",
+        "--- Progress ---",
+        f"Phi target mean: {_finite_mean(progress_target, domain_mask):.4f}",
+        f"Phi pred mean:   {_finite_mean(progress_pred, domain_mask):.4f}",
+        f"Phi abs err:     {_finite_mean(progress_error, domain_mask):.4f}",
+        "",
+        "--- Stop / Attract ---",
+        f"Stop target voxels: {int((stop_target > 0.5).sum()) if stop_target is not None else 0}",
+        f"Stop pred mean:     {_finite_mean(stop_pred, domain_mask):.4f}",
+        f"Attract err mean:   {_finite_mean(attract_err):.4f}",
+    ]
+    if vis_data.get("endpoint_step_count") is not None:
+        steps = _tensor_to_numpy(vis_data["endpoint_step_count"])
+        stats_lines.append(f"Endpoint steps:     {int(steps[b])}")
+    if seed_mask is not None:
+        stats_lines.append(f"Endpoint seeds:     {int(seed_mask.sum())}")
+    stats_lines.append("=" * 40)
+    ax_text.text(
+        0.04,
+        0.96,
+        "\n".join(stats_lines),
+        transform=ax_text.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor="gray"),
+    )
+
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
 def make_dense_visualization(
     inputs,
     disp_pred,

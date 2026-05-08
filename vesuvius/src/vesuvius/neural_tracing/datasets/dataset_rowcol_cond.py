@@ -1,4 +1,5 @@
 import vesuvius.tifxyz as tifxyz
+import hashlib
 import numpy as np
 import torch
 import time
@@ -25,6 +26,9 @@ from vesuvius.neural_tracing.datasets.common import (
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
 from vesuvius.neural_tracing.datasets.direction_helpers import (
     build_split_surface_masks_and_trace_targets,
+)
+from vesuvius.neural_tracing.datasets.copy_neighbor_targets import (
+    build_copy_neighbor_targets,
 )
 from vesuvius.neural_tracing.datasets.augmentation import (
     augment_split_payload,
@@ -182,6 +186,10 @@ class EdtSegDataset(Dataset):
             ]
             if not self.sample_index:
                 raise ValueError("No wraps have same/adjacent neighbors on both sides.")
+            if str(self.config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
+                self.sample_index = self._build_copy_neighbor_pair_records(self.sample_index)
+                if not self.sample_index:
+                    raise ValueError("No copy_neighbors source-target pair records remain after filtering.")
             spec = self.config['cond_percent']
             self._cond_percent_min, self._cond_percent_max = float(spec[0]), float(spec[1])
         else:
@@ -210,6 +218,60 @@ class EdtSegDataset(Dataset):
             'triplet_neighbor_lookup': self._triplet_neighbor_lookup,
             'cond_percent': (self._cond_percent_min, self._cond_percent_max),
         }
+
+    def _build_copy_neighbor_pair_records(self, triplet_middle_index):
+        source_filter = str(self.config.get("copy_neighbor_source_position", "random"))
+        target_filter = str(self.config.get("copy_neighbor_target_side", "random"))
+        record_mode = str(self.config.get("copy_neighbor_pair_record_mode", "all_directed"))
+        seed = int(self.config.get("seed", 0)) + int(self.config.get("copy_neighbor_pair_seed_offset", 0))
+
+        records = []
+        for patch_idx, middle_wrap_idx in triplet_middle_index:
+            triplet_meta = self._triplet_neighbor_lookup[(patch_idx, middle_wrap_idx)]
+            behind_wrap_idx = int(triplet_meta["behind_wrap_idx"])
+            middle_wrap_idx = int(middle_wrap_idx)
+            front_wrap_idx = int(triplet_meta["front_wrap_idx"])
+            position_to_wrap = {
+                "behind": behind_wrap_idx,
+                "middle": middle_wrap_idx,
+                "front": front_wrap_idx,
+            }
+            candidates = [
+                ("behind", "middle", "front"),
+                ("middle", "behind", "behind"),
+                ("middle", "front", "front"),
+                ("front", "middle", "behind"),
+            ]
+            triplet_records = []
+            for source_pos, target_pos, target_side in candidates:
+                if source_filter != "random" and source_pos != source_filter:
+                    continue
+                if target_filter != "random" and target_side != target_filter:
+                    continue
+                if source_pos == target_pos:
+                    continue
+                triplet_records.append({
+                    "patch_idx": int(patch_idx),
+                    "middle_wrap_idx": int(middle_wrap_idx),
+                    "source_wrap_idx": int(position_to_wrap[source_pos]),
+                    "target_wrap_idx": int(position_to_wrap[target_pos]),
+                    "source_triplet_pos": source_pos,
+                    "target_side": target_side,
+                    "triplet_wrap_indices": (
+                        int(behind_wrap_idx),
+                        int(middle_wrap_idx),
+                        int(front_wrap_idx),
+                    ),
+                })
+
+            if record_mode == "one_per_triplet" and triplet_records:
+                key = f"{seed}:{patch_idx}:{middle_wrap_idx}".encode("utf8")
+                digest = hashlib.sha256(key).digest()
+                chosen = int.from_bytes(digest[:8], "little") % len(triplet_records)
+                records.append(triplet_records[chosen])
+            else:
+                records.extend(triplet_records)
+        return records
 
     @staticmethod
     def _new_create_split_masks_profile():
@@ -372,6 +434,85 @@ class EdtSegDataset(Dataset):
             return None
         return cond_seg
 
+    def _surface_crop_support_ok(self, surface_local, *, allow_partial: bool = False):
+        if bool(allow_partial):
+            return True, "partial surface allowed"
+        surface = np.asarray(surface_local, dtype=np.float32)
+        if surface.ndim != 3 or int(surface.shape[-1]) != 3:
+            return False, "surface shape invalid"
+        finite = np.isfinite(surface).all(axis=-1)
+        in_crop = (
+            finite
+            & (surface[..., 0] >= 0.0)
+            & (surface[..., 1] >= 0.0)
+            & (surface[..., 2] >= 0.0)
+            & (surface[..., 0] <= self.crop_size[0] - 1)
+            & (surface[..., 1] <= self.crop_size[1] - 1)
+            & (surface[..., 2] <= self.crop_size[2] - 1)
+        )
+        min_valid_fraction = float(self.config.get("copy_neighbor_min_in_crop_valid_fraction", 0.25))
+        valid_fraction = float(in_crop.mean()) if in_crop.size else 0.0
+        if valid_fraction < min_valid_fraction:
+            return False, f"in-crop fraction {valid_fraction:.3f} below {min_valid_fraction:.3f}"
+
+        strip_width = max(1, int(self.config.get("copy_neighbor_surface_edge_strip_width", 2)))
+        edge_valid_frac = float(self.config.get("copy_neighbor_surface_edge_valid_frac", 0.10))
+        row_strip = min(strip_width, in_crop.shape[0])
+        col_strip = min(strip_width, in_crop.shape[1])
+        row_low = float(in_crop[:row_strip].mean()) if row_strip > 0 else 0.0
+        row_high = float(in_crop[-row_strip:].mean()) if row_strip > 0 else 0.0
+        col_low = float(in_crop[:, :col_strip].mean()) if col_strip > 0 else 0.0
+        col_high = float(in_crop[:, -col_strip:].mean()) if col_strip > 0 else 0.0
+        row_spans = min(row_low, row_high) >= edge_valid_frac
+        col_spans = min(col_low, col_high) >= edge_valid_frac
+        if not (row_spans or col_spans):
+            return False, "surface does not span row or column edge strips"
+        return True, "ok"
+
+    def create_copy_neighbor_masks(self, record: dict):
+        patch_idx = int(record["patch_idx"])
+        patch = self.patches[patch_idx]
+        source_wrap_idx = int(record["source_wrap_idx"])
+        target_wrap_idx = int(record["target_wrap_idx"])
+        source_world = self._extract_wrap_world_surface(patch, patch.wraps[source_wrap_idx])
+        target_world = self._extract_wrap_world_surface(patch, patch.wraps[target_wrap_idx])
+        if source_world is None or target_world is None:
+            return None
+
+        finite_source = np.isfinite(source_world).all(axis=-1)
+        if not bool(finite_source.any()):
+            return None
+        source_points = source_world[finite_source]
+        center = np.median(source_points, axis=0)
+        min_corner = np.round(center - 0.5 * np.asarray(self.crop_size, dtype=np.float32)).astype(np.int64)
+        max_corner = min_corner + np.asarray(self.crop_size, dtype=np.int64)
+
+        source_local = (source_world - min_corner).astype(np.float32, copy=False)
+        target_local = (target_world - min_corner).astype(np.float32, copy=False)
+        ok, _ = self._surface_crop_support_ok(source_local)
+        if not ok:
+            return None
+        target_ok, _ = self._surface_crop_support_ok(
+            target_local,
+            allow_partial=bool(self.config.get("copy_neighbor_allow_partial_target", False)),
+        )
+        if not target_ok:
+            return None
+
+        vol_crop = _read_volume_crop_from_patch(
+            patch,
+            self.crop_size,
+            min_corner,
+            max_corner,
+        )
+        return {
+            "vol": torch.from_numpy(vol_crop).to(torch.float32),
+            "source_surface_local": source_local,
+            "target_surface_local": target_local,
+            "min_corner": min_corner,
+            "record": record,
+        }
+
     def _restore_cond_surface_from_augmented(
         self,
         *,
@@ -524,6 +665,172 @@ class EdtSegDataset(Dataset):
             )
         return self.__getitem__(new_idx, _attempted_indices=attempted)
 
+    def _getitem_copy_neighbors(self, idx: int, _attempted_indices):
+        record = self.sample_index[idx]
+        patch_idx = int(record["patch_idx"])
+        source_wrap_idx = int(record["source_wrap_idx"])
+        target_wrap_idx = int(record["target_wrap_idx"])
+        mask_bundle = self.create_copy_neighbor_masks(record)
+        if mask_bundle is None:
+            return self._resample_item(
+                idx,
+                "copy-neighbor mask bundle missing",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        vol_crop = mask_bundle["vol"]
+        source_surface_source = torch.from_numpy(mask_bundle["source_surface_local"]).to(torch.float32)
+        target_surface_source = torch.from_numpy(mask_bundle["target_surface_local"]).to(torch.float32)
+        source_surface_local, source_surface_shape, source_keypoints, valid_source = (
+            _prepare_cond_surface_keypoints(source_surface_source)
+        )
+        target_surface_local, target_surface_shape, target_keypoints, valid_target = (
+            _prepare_cond_surface_keypoints(target_surface_source)
+        )
+        if not valid_source or not valid_target:
+            return self._resample_item(
+                idx,
+                "copy-neighbor source/target surface invalid",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        augmented = augment_split_payload(
+            augmentations=self._augmentations,
+            crop_size=self.crop_size,
+            vol_crop=vol_crop,
+            masked_seg=None,
+            cond_seg_gt=None,
+            cond_surface_local=source_surface_local,
+            cond_surface_keypoints=source_keypoints,
+            cond_surface_shape=source_surface_shape,
+            restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
+            masked_surface_local=target_surface_local,
+            masked_surface_keypoints=target_keypoints,
+            masked_surface_shape=target_surface_shape,
+            neighbor_seg_tensor=None,
+        )
+        vol_crop = augmented["vol_crop"]
+        source_surface_local = augmented["cond_surface_local"]
+        target_surface_local = augmented["masked_surface_local"]
+        source_np = source_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+        target_np = target_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+
+        ok, _ = self._surface_crop_support_ok(source_np)
+        target_ok, _ = self._surface_crop_support_ok(
+            target_np,
+            allow_partial=bool(self.config.get("copy_neighbor_allow_partial_target", False)),
+        )
+        if not ok or not target_ok:
+            return self._resample_item(
+                idx,
+                "copy-neighbor augmented surface support failed",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        source_valid = np.isfinite(source_np).all(axis=-1)
+        target_valid = np.isfinite(target_np).all(axis=-1)
+        if not bool(source_valid.any()) or not bool(target_valid.any()):
+            return self._resample_item(
+                idx,
+                "copy-neighbor side hint centers unavailable",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+        source_center = np.median(source_np[source_valid], axis=0)
+        target_center = np.median(target_np[target_valid], axis=0)
+        side_hint_vector = (target_center - source_center).astype(np.float32)
+        side_norm = float(np.linalg.norm(side_hint_vector))
+        if not np.isfinite(side_norm) or side_norm <= 1e-6:
+            return self._resample_item(
+                idx,
+                "copy-neighbor side hint vector invalid",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+        side_hint_vector /= np.float32(side_norm)
+
+        payload = build_copy_neighbor_targets(
+            self.crop_size,
+            source_np,
+            target_np,
+            side_hint_vector,
+            self.config,
+        )
+        if payload is None:
+            return self._resample_item(
+                idx,
+                "copy-neighbor targets unavailable",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        cond_gt = torch.from_numpy(payload.cond_gt).to(torch.float32)
+        if self._cond_local_perturb_active:
+            cond_seg = self._conditioning_from_surface(
+                cond_surface_local=source_surface_local,
+                cond_seg_gt=cond_gt,
+            )
+        else:
+            cond_seg = cond_gt.clone()
+        if cond_seg is None:
+            return self._resample_item(
+                idx,
+                "copy-neighbor conditioning segmentation unresolved",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        side_hint = np.broadcast_to(
+            side_hint_vector[:, None, None, None],
+            (3, *self.crop_size),
+        ).astype(np.float32, copy=True)
+        result = {
+            "vol": vol_crop,
+            "cond": cond_seg,
+            "side_hint": torch.from_numpy(side_hint).to(torch.float32),
+            "target_seg": torch.from_numpy(payload.target_seg).to(torch.float32),
+            "domain": torch.from_numpy(payload.domain).to(torch.float32),
+            "velocity_dir": torch.from_numpy(payload.velocity_dir).to(torch.float32),
+            "velocity_loss_weight": torch.from_numpy(payload.velocity_loss_weight).to(torch.float32),
+            "progress_phi": torch.from_numpy(payload.progress_phi).to(torch.float32),
+            "progress_phi_weight": torch.from_numpy(payload.progress_phi_weight).to(torch.float32),
+            "surface_attract": torch.from_numpy(payload.surface_attract).to(torch.float32),
+            "surface_attract_weight": torch.from_numpy(payload.surface_attract_weight).to(torch.float32),
+            "stop": torch.from_numpy(payload.stop).to(torch.float32),
+            "stop_weight": torch.from_numpy(payload.stop_weight).to(torch.float32),
+            "target_edt": torch.from_numpy(payload.target_edt).to(torch.float32),
+            "endpoint_seed_points": torch.from_numpy(payload.endpoint_seed_points).to(torch.float32),
+            "endpoint_seed_mask": torch.from_numpy(payload.endpoint_seed_mask).to(torch.float32),
+            "endpoint_step_count": torch.tensor(
+                int(payload.debug.get("endpoint_step_count", self.config.get("copy_neighbor_endpoint_steps", 8))),
+                dtype=torch.long,
+            ),
+        }
+
+        if not _validate_result_tensors(
+            result,
+            idx,
+            enabled=self._validate_result_tensors_enabled,
+        ):
+            return self._resample_item(
+                idx,
+                "copy-neighbor result tensor validation failed",
+                patch_idx=patch_idx,
+                wrap_idx=target_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+        return result
+
     def __getitem__(self, idx, _attempted_indices=None):
         idx = int(idx)
         if _attempted_indices is None:
@@ -535,6 +842,9 @@ class EdtSegDataset(Dataset):
                 attempted_indices=_attempted_indices,
             )
         _attempted_indices.add(idx)
+
+        if str(self.config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
+            return self._getitem_copy_neighbors(idx, _attempted_indices)
 
         patch_idx, wrap_idx = self.sample_index[idx]
         mask_bundle = self.create_split_masks(patch_idx, wrap_idx)

@@ -198,24 +198,74 @@ def get_chunks_containing_point(
 
 
 @njit
-def _find_containing_chunks_1d(
+def _searchsorted_right(arr: np.ndarray, value: float) -> int:
+    """Numba-compatible searchsorted(..., side="right")."""
+    lo = 0
+    hi = len(arr)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if value < arr[mid]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+@njit
+def _find_containing_chunk_bounds_1d(
     coord: float,
     chunk_starts: np.ndarray,
     chunk_size: int,
     pad: float = 0.0,
-) -> np.ndarray:
-    """Find all chunk indices along one axis that contain the coordinate.
+) -> Tuple[int, int]:
+    """Return [start, stop) chunk-index bounds containing coord on one axis."""
+    lower_exclusive = coord - chunk_size - pad
+    upper_inclusive = coord + pad
+    start = _searchsorted_right(chunk_starts, lower_exclusive)
+    stop = _searchsorted_right(chunk_starts, upper_inclusive)
+    return start, stop
 
-    With pad > 0, the effective range is [start - pad, start + size + pad).
-    """
-    n_chunks = len(chunk_starts)
-    result = np.empty(n_chunks, dtype=np.int32)
-    count = 0
-    for i in range(n_chunks):
-        if chunk_starts[i] - pad <= coord < chunk_starts[i] + chunk_size + pad:
-            result[count] = i
-            count += 1
-    return result[:count]
+
+@njit
+def _count_chunk_indices_for_points(
+    z_flat: np.ndarray,
+    y_flat: np.ndarray,
+    x_flat: np.ndarray,
+    chunk_starts_z: np.ndarray,
+    chunk_starts_y: np.ndarray,
+    chunk_starts_x: np.ndarray,
+    chunk_d: int,
+    chunk_h: int,
+    chunk_w: int,
+    chunk_pad: float = 0.0,
+) -> int:
+    pair_count = 0
+
+    for pt_idx in range(len(z_flat)):
+        z = z_flat[pt_idx]
+        y = y_flat[pt_idx]
+        x = x_flat[pt_idx]
+
+        if not (np.isfinite(z) and np.isfinite(y) and np.isfinite(x)):
+            continue
+
+        iz_start, iz_stop = _find_containing_chunk_bounds_1d(
+            z, chunk_starts_z, chunk_d, chunk_pad
+        )
+        iy_start, iy_stop = _find_containing_chunk_bounds_1d(
+            y, chunk_starts_y, chunk_h, chunk_pad
+        )
+        ix_start, ix_stop = _find_containing_chunk_bounds_1d(
+            x, chunk_starts_x, chunk_w, chunk_pad
+        )
+
+        pair_count += (
+            (iz_stop - iz_start) *
+            (iy_stop - iy_start) *
+            (ix_stop - ix_start)
+        )
+
+    return pair_count
 
 
 @njit
@@ -240,9 +290,12 @@ def _get_chunk_indices_for_points(
     With chunk_pad > 0, points within `pad` distance of chunk boundaries
     are also assigned to that chunk.
     """
-    # Pre-allocate with upper bound estimate
-    # Worst case: each point in ~8 chunks (2x2x2 overlap)
-    max_pairs = len(z_flat) * 8
+    max_pairs = _count_chunk_indices_for_points(
+        z_flat, y_flat, x_flat,
+        chunk_starts_z, chunk_starts_y, chunk_starts_x,
+        chunk_d, chunk_h, chunk_w,
+        chunk_pad,
+    )
     point_indices = np.empty(max_pairs, dtype=np.int64)
     iz_arr = np.empty(max_pairs, dtype=np.int32)
     iy_arr = np.empty(max_pairs, dtype=np.int32)
@@ -259,36 +312,24 @@ def _get_chunk_indices_for_points(
         if not (np.isfinite(z) and np.isfinite(y) and np.isfinite(x)):
             continue
 
-        # Find containing chunks along each axis (with padding)
-        iz_valid = _find_containing_chunks_1d(z, chunk_starts_z, chunk_d, chunk_pad)
-        iy_valid = _find_containing_chunks_1d(y, chunk_starts_y, chunk_h, chunk_pad)
-        ix_valid = _find_containing_chunks_1d(x, chunk_starts_x, chunk_w, chunk_pad)
+        iz_start, iz_stop = _find_containing_chunk_bounds_1d(
+            z, chunk_starts_z, chunk_d, chunk_pad
+        )
+        iy_start, iy_stop = _find_containing_chunk_bounds_1d(
+            y, chunk_starts_y, chunk_h, chunk_pad
+        )
+        ix_start, ix_stop = _find_containing_chunk_bounds_1d(
+            x, chunk_starts_x, chunk_w, chunk_pad
+        )
 
         # Generate all combinations (cartesian product)
-        for i in range(len(iz_valid)):
-            for j in range(len(iy_valid)):
-                for k in range(len(ix_valid)):
-                    if pair_count >= max_pairs:
-                        # Reallocate (shouldn't happen often)
-                        new_size = max_pairs * 2
-                        new_point_indices = np.empty(new_size, dtype=np.int64)
-                        new_iz = np.empty(new_size, dtype=np.int32)
-                        new_iy = np.empty(new_size, dtype=np.int32)
-                        new_ix = np.empty(new_size, dtype=np.int32)
-                        new_point_indices[:pair_count] = point_indices[:pair_count]
-                        new_iz[:pair_count] = iz_arr[:pair_count]
-                        new_iy[:pair_count] = iy_arr[:pair_count]
-                        new_ix[:pair_count] = ix_arr[:pair_count]
-                        point_indices = new_point_indices
-                        iz_arr = new_iz
-                        iy_arr = new_iy
-                        ix_arr = new_ix
-                        max_pairs = new_size
-
+        for iz in range(iz_start, iz_stop):
+            for iy in range(iy_start, iy_stop):
+                for ix in range(ix_start, ix_stop):
                     point_indices[pair_count] = pt_idx
-                    iz_arr[pair_count] = iz_valid[i]
-                    iy_arr[pair_count] = iy_valid[j]
-                    ix_arr[pair_count] = ix_valid[k]
+                    iz_arr[pair_count] = iz
+                    iy_arr[pair_count] = iy
+                    ix_arr[pair_count] = ix
                     pair_count += 1
 
     return (
@@ -297,6 +338,95 @@ def _get_chunk_indices_for_points(
         iy_arr[:pair_count],
         ix_arr[:pair_count],
     )
+
+
+def _linear_chunk_ids(
+    iz_arr: np.ndarray,
+    iy_arr: np.ndarray,
+    ix_arr: np.ndarray,
+    n_y: int,
+    n_x: int,
+) -> np.ndarray:
+    return (
+        (iz_arr.astype(np.int64, copy=False) * int(n_y) +
+         iy_arr.astype(np.int64, copy=False)) * int(n_x) +
+        ix_arr.astype(np.int64, copy=False)
+    )
+
+
+def _chunk_id_from_linear(linear_id: int, n_y: int, n_x: int) -> Tuple[int, int, int]:
+    yz = int(n_y) * int(n_x)
+    iz = int(linear_id // yz)
+    rem = int(linear_id - iz * yz)
+    iy = int(rem // int(n_x))
+    ix = int(rem - iy * int(n_x))
+    return iz, iy, ix
+
+
+def _store_valid_point_indices_by_chunk(
+    chunk_to_valid_points: Dict[Tuple[int, int, int], Dict[int, np.ndarray]],
+    *,
+    seg_idx: int,
+    point_indices: np.ndarray,
+    iz_arr: np.ndarray,
+    iy_arr: np.ndarray,
+    ix_arr: np.ndarray,
+    valid_pair_mask: np.ndarray,
+    n_y: int,
+    n_x: int,
+) -> None:
+    if not np.any(valid_pair_mask):
+        return
+
+    linear_ids = _linear_chunk_ids(
+        iz_arr[valid_pair_mask],
+        iy_arr[valid_pair_mask],
+        ix_arr[valid_pair_mask],
+        n_y,
+        n_x,
+    )
+    valid_point_indices = point_indices[valid_pair_mask]
+    order = np.argsort(linear_ids, kind="mergesort")
+    linear_sorted = linear_ids[order]
+    point_sorted = np.asarray(valid_point_indices[order], dtype=np.int64)
+
+    boundaries = np.flatnonzero(linear_sorted[1:] != linear_sorted[:-1]) + 1
+    starts = np.concatenate((np.array([0], dtype=np.int64), boundaries))
+    stops = np.concatenate((boundaries, np.array([len(linear_sorted)], dtype=np.int64)))
+
+    for start, stop in zip(starts, stops):
+        chunk_id = _chunk_id_from_linear(int(linear_sorted[start]), n_y, n_x)
+        if chunk_id not in chunk_to_valid_points:
+            chunk_to_valid_points[chunk_id] = {}
+        chunk_to_valid_points[chunk_id][seg_idx] = point_sorted[start:stop]
+
+
+def _store_invalid_chunk_memberships(
+    chunk_to_invalid_segments: Dict[Tuple[int, int, int], set],
+    *,
+    seg_idx: int,
+    iz_arr: np.ndarray,
+    iy_arr: np.ndarray,
+    ix_arr: np.ndarray,
+    invalid_pair_mask: np.ndarray,
+    n_y: int,
+    n_x: int,
+) -> None:
+    if not np.any(invalid_pair_mask):
+        return
+
+    linear_ids = _linear_chunk_ids(
+        iz_arr[invalid_pair_mask],
+        iy_arr[invalid_pair_mask],
+        ix_arr[invalid_pair_mask],
+        n_y,
+        n_x,
+    )
+    for linear_id in np.unique(linear_ids):
+        chunk_id = _chunk_id_from_linear(int(linear_id), n_y, n_x)
+        if chunk_id not in chunk_to_invalid_segments:
+            chunk_to_invalid_segments[chunk_id] = set()
+        chunk_to_invalid_segments[chunk_id].add(seg_idx)
 
 
 def assign_points_to_chunks(
@@ -331,12 +461,14 @@ def assign_points_to_chunks(
     Returns
     -------
     Tuple[Dict, Dict]
-        - chunk_to_valid_points: {chunk_id: {seg_idx: [(r, c, z, y, x), ...]}}
-        - chunk_to_invalid_points: {chunk_id: {seg_idx: [(r, c, z, y, x), ...]}}
+        - chunk_to_valid_points: {chunk_id: {seg_idx: flat_point_indices}}
+        - chunk_to_invalid_segments: {chunk_id: {seg_idx, ...}}
     """
     chunk_d, chunk_h, chunk_w = target_size
-    chunk_to_valid_points: Dict[Tuple[int, int, int], Dict[int, List]] = {}
-    chunk_to_invalid_points: Dict[Tuple[int, int, int], Dict[int, List]] = {}
+    chunk_to_valid_points: Dict[Tuple[int, int, int], Dict[int, np.ndarray]] = {}
+    chunk_to_invalid_segments: Dict[Tuple[int, int, int], set] = {}
+    n_y = len(chunk_starts_y)
+    n_x = len(chunk_starts_x)
 
     # Ensure chunk_starts are float64 for numba compatibility
     chunk_starts_z = np.asarray(chunk_starts_z, dtype=np.float64)
@@ -355,18 +487,6 @@ def assign_points_to_chunks(
         y_arr = seg._y
         x_arr = seg._x
         valid_mask = seg._valid_mask
-        H, W = z_arr.shape
-
-        # DEBUG: print segment info once
-        if seg_idx == 0 and not hasattr(assign_points_to_chunks, '_debug_printed'):
-            assign_points_to_chunks._debug_printed = True
-            print(f"  [DEBUG] seg._scale={seg._scale}, array shape=({H}, {W})")
-            valid_z = z_arr[valid_mask]
-            valid_y = y_arr[valid_mask]
-            valid_x = x_arr[valid_mask]
-            print(f"  [DEBUG] z range: {valid_z.min():.2f} to {valid_z.max():.2f}, span={valid_z.max()-valid_z.min():.2f}")
-            print(f"  [DEBUG] y range: {valid_y.min():.2f} to {valid_y.max():.2f}, span={valid_y.max()-valid_y.min():.2f}")
-            print(f"  [DEBUG] x range: {valid_x.min():.2f} to {valid_x.max():.2f}, span={valid_x.max()-valid_x.min():.2f}")
 
         # Flatten arrays
         z_flat = z_arr.ravel().astype(np.float64)
@@ -382,27 +502,33 @@ def assign_points_to_chunks(
             chunk_pad,
         )
 
-        # Group results into dicts (Python loop but over much smaller result set)
-        for i in range(len(point_indices)):
-            pt_idx = point_indices[i]
-            chunk_id = (int(iz_arr[i]), int(iy_arr[i]), int(ix_arr[i]))
+        if len(point_indices) == 0:
+            continue
 
-            # Convert flat index back to (r, c)
-            r = int(pt_idx // W)
-            c = int(pt_idx % W)
-            z_val = z_flat[pt_idx]
-            y_val = y_flat[pt_idx]
-            x_val = x_flat[pt_idx]
-            is_valid = valid_flat[pt_idx]
+        valid_pair_mask = valid_flat[point_indices]
+        _store_valid_point_indices_by_chunk(
+            chunk_to_valid_points,
+            seg_idx=seg_idx,
+            point_indices=point_indices,
+            iz_arr=iz_arr,
+            iy_arr=iy_arr,
+            ix_arr=ix_arr,
+            valid_pair_mask=valid_pair_mask,
+            n_y=n_y,
+            n_x=n_x,
+        )
+        _store_invalid_chunk_memberships(
+            chunk_to_invalid_segments,
+            seg_idx=seg_idx,
+            iz_arr=iz_arr,
+            iy_arr=iy_arr,
+            ix_arr=ix_arr,
+            invalid_pair_mask=~valid_pair_mask,
+            n_y=n_y,
+            n_x=n_x,
+        )
 
-            target_dict = chunk_to_valid_points if is_valid else chunk_to_invalid_points
-            if chunk_id not in target_dict:
-                target_dict[chunk_id] = {}
-            if seg_idx not in target_dict[chunk_id]:
-                target_dict[chunk_id][seg_idx] = []
-            target_dict[chunk_id][seg_idx].append((r, c, z_val, y_val, x_val))
-
-    return chunk_to_valid_points, chunk_to_invalid_points
+    return chunk_to_valid_points, chunk_to_invalid_segments
 
 
 @njit
@@ -423,55 +549,118 @@ def _build_local_mask(
     return mask
 
 
-@njit
-def _collect_points_for_component(
-    comp_indices_r: np.ndarray,
-    comp_indices_c: np.ndarray,
-    r_min_all: int,
-    c_min_all: int,
-    rows: np.ndarray,
-    cols: np.ndarray,
-    z_arr: np.ndarray,
-    y_arr: np.ndarray,
-    x_arr: np.ndarray,
-) -> np.ndarray:
-    """JIT-compiled collection of 3D coordinates for a component."""
-    # Build lookup: create a mapping from (local_r, local_c) to point index
-    # First pass: count matches
-    n_comp = len(comp_indices_r)
-    result = np.empty((n_comp, 3), dtype=np.float32)
-    count = 0
+def _passes_span_check_arrays(
+    z: np.ndarray,
+    y: np.ndarray,
+    x: np.ndarray,
+    chunk_bbox: Tuple[float, ...],
+    target_size: Tuple[int, int, int],
+    min_span_ratio: float,
+    edge_touch_frac: float,
+    edge_touch_min_count: int,
+    edge_touch_pad: int = 0,
+) -> bool:
+    if len(z) == 0:
+        return False
 
-    for i in range(n_comp):
-        target_r = comp_indices_r[i] + r_min_all
-        target_c = comp_indices_c[i] + c_min_all
+    z_min, z_max, y_min, y_max, x_min, x_max = chunk_bbox
+    chunk_d, chunk_h, chunk_w = target_size
 
-        # Find matching point
-        for j in range(len(rows)):
-            if rows[j] == target_r and cols[j] == target_c:
-                result[count, 0] = z_arr[j]
-                result[count, 1] = y_arr[j]
-                result[count, 2] = x_arr[j]
-                count += 1
-                break
+    z_min_t = z_min - edge_touch_pad
+    z_max_t = z_max + edge_touch_pad
+    y_min_t = y_min - edge_touch_pad
+    y_max_t = y_max + edge_touch_pad
+    x_min_t = x_min - edge_touch_pad
+    x_max_t = x_max + edge_touch_pad
 
-    return result[:count]
+    z_span = z.max() - z.min()
+    y_span = y.max() - y.min()
+    x_span = x.max() - x.min()
+
+    if z_span < min_span_ratio * chunk_d:
+        return False
+
+    if y_span >= x_span:
+        second_span = y_span
+        second_chunk_size = chunk_h
+        second_coords = y
+        second_min = y_min_t
+        second_max = y_max_t
+    else:
+        second_span = x_span
+        second_chunk_size = chunk_w
+        second_coords = x
+        second_min = x_min_t
+        second_max = x_max_t
+
+    if second_span < min_span_ratio * second_chunk_size:
+        return False
+
+    def edge_touch_ok(
+        coords: np.ndarray,
+        bbox_min: float,
+        bbox_max: float,
+        chunk_size: int,
+    ) -> bool:
+        band = edge_touch_frac * chunk_size
+        low_count = np.count_nonzero(coords <= bbox_min + band)
+        high_count = np.count_nonzero(coords >= bbox_max - band)
+        return low_count >= edge_touch_min_count and high_count >= edge_touch_min_count
+
+    return (
+        edge_touch_ok(z, z_min_t, z_max_t, chunk_d) and
+        edge_touch_ok(second_coords, second_min, second_max, second_chunk_size)
+    )
+
+
+def _passes_inner_bbox_check_arrays(
+    y: np.ndarray,
+    x: np.ndarray,
+    chunk_bbox: Tuple[float, ...],
+    inner_bbox_fraction: float,
+) -> bool:
+    if len(y) == 0:
+        return False
+    if inner_bbox_fraction >= 1.0:
+        return True
+    if inner_bbox_fraction <= 0.0:
+        return False
+
+    _, _, y_min, y_max, x_min, x_max = chunk_bbox
+    margin_frac = (1.0 - inner_bbox_fraction) / 2.0
+    y_margin = (y_max - y_min) * margin_frac
+    x_margin = (x_max - x_min) * margin_frac
+
+    center_y = float(y.mean())
+    center_x = float(x.mean())
+
+    return (
+        center_y >= y_min + y_margin and center_y <= y_max - y_margin and
+        center_x >= x_min + x_margin and center_x <= x_max - x_margin
+    )
 
 
 def find_wraps_in_chunk(
-    points: List[Tuple],
+    point_indices: np.ndarray,
     seg: Tifxyz,
     min_points_per_wrap: int,
     bbox_pad_2d: int,
     require_all_valid_in_bbox: bool,
-) -> List[Dict]:
+    chunk_bbox: Tuple[float, ...],
+    target_size: Tuple[int, int, int],
+    min_span_ratio: float,
+    edge_touch_frac: float,
+    edge_touch_min_count: int,
+    edge_touch_pad: int,
+    inner_bbox_fraction: float,
+) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Find connected components (wraps) from the given points for a single segment.
 
     Parameters
     ----------
-    points : List[Tuple]
-        List of (r, c, z, y, x) tuples for this segment in this chunk
+    point_indices : np.ndarray
+        Flat segment-grid indices for this segment in this chunk
     seg : Tifxyz
         The segment
     min_points_per_wrap : int
@@ -483,21 +672,25 @@ def find_wraps_in_chunk(
 
     Returns
     -------
-    List[Dict]
-        List of wrap dicts: {"wrap_id": int, "bbox_2d": tuple, "points_zyx": array}
+    Tuple[List[Dict], Dict[str, int]]
+        Wrap dicts and rejection counts for span/inner-bbox filters.
     """
-    if len(points) < min_points_per_wrap:
-        return []
+    reject_stats = {"span": 0, "inner_bbox": 0}
+    if len(point_indices) < min_points_per_wrap:
+        return [], reject_stats
 
-    # Extract arrays for numba processing
-    rows = np.array([p[0] for p in points], dtype=np.int32)
-    cols = np.array([p[1] for p in points], dtype=np.int32)
-    z_arr = np.array([p[2] for p in points], dtype=np.float32)
-    y_arr = np.array([p[3] for p in points], dtype=np.float32)
-    x_arr = np.array([p[4] for p in points], dtype=np.float32)
+    flat_indices = np.asarray(point_indices, dtype=np.int64)
+    seg_h, seg_w = seg._valid_mask.shape
+    rows = (flat_indices // seg_w).astype(np.int32)
+    cols = (flat_indices % seg_w).astype(np.int32)
+    z_arr = seg._z.ravel()[flat_indices].astype(np.float32)
+    y_arr = seg._y.ravel()[flat_indices].astype(np.float32)
+    x_arr = seg._x.ravel()[flat_indices].astype(np.float32)
 
     r_min_all, r_max_all = rows.min(), rows.max()
     c_min_all, c_max_all = cols.min(), cols.max()
+    local_rows = rows - r_min_all
+    local_cols = cols - c_min_all
 
     # Create local mask using numba helper
     local_h = r_max_all - r_min_all + 1
@@ -506,29 +699,41 @@ def find_wraps_in_chunk(
 
     # Find connected components
     labeled, num_components = ndimage.label(mask)
+    if num_components <= 0:
+        return [], reject_stats
+
+    labels_for_points = labeled[local_rows, local_cols]
+    order = np.argsort(labels_for_points, kind="mergesort")
+    labels_sorted = labels_for_points[order]
+    boundaries = np.flatnonzero(labels_sorted[1:] != labels_sorted[:-1]) + 1
+    starts = np.concatenate((np.array([0], dtype=np.int64), boundaries))
+    stops = np.concatenate((boundaries, np.array([len(labels_sorted)], dtype=np.int64)))
 
     wraps = []
     valid_mask = seg._valid_mask
-    seg_h, seg_w = valid_mask.shape
+    next_wrap_id = 0
 
-    for comp_id in range(1, num_components + 1):
-        comp_mask = labeled == comp_id
-        comp_indices = np.argwhere(comp_mask)
+    for start, stop in zip(starts, stops):
+        comp_id = int(labels_sorted[start])
+        if comp_id <= 0:
+            continue
 
-        if len(comp_indices) < min_points_per_wrap:
+        comp_point_idx = order[start:stop]
+
+        if len(comp_point_idx) < min_points_per_wrap:
             continue
 
         # Get bbox in local coordinates
-        local_r_min = comp_indices[:, 0].min()
-        local_r_max = comp_indices[:, 0].max()
-        local_c_min = comp_indices[:, 1].min()
-        local_c_max = comp_indices[:, 1].max()
+        comp_rows = rows[comp_point_idx]
+        comp_cols = cols[comp_point_idx]
+        r_min = int(comp_rows.min())
+        r_max = int(comp_rows.max())
+        c_min = int(comp_cols.min())
+        c_max = int(comp_cols.max())
 
-        # Convert to global segment coordinates
-        r_min = local_r_min + r_min_all
-        r_max = local_r_max + r_min_all
-        c_min = local_c_min + c_min_all
-        c_max = local_c_max + c_min_all
+        comp_z = z_arr[comp_point_idx]
+        comp_y = y_arr[comp_point_idx]
+        comp_x = x_arr[comp_point_idx]
 
         # Apply padding
         r_min_p = r_min - bbox_pad_2d
@@ -546,22 +751,38 @@ def find_wraps_in_chunk(
             if not valid_mask[r0:r1 + 1, c0:c1 + 1].all():
                 continue
 
-        # Collect 3D coordinates for this wrap using numba helper
-        comp_indices_r = comp_indices[:, 0].astype(np.int32)
-        comp_indices_c = comp_indices[:, 1].astype(np.int32)
-        points_zyx = _collect_points_for_component(
-            comp_indices_r, comp_indices_c,
-            r_min_all, c_min_all,
-            rows, cols, z_arr, y_arr, x_arr,
-        )
+        wrap_id = next_wrap_id
+        next_wrap_id += 1
+
+        if not _passes_span_check_arrays(
+            comp_z,
+            comp_y,
+            comp_x,
+            chunk_bbox,
+            target_size,
+            min_span_ratio,
+            edge_touch_frac,
+            edge_touch_min_count,
+            edge_touch_pad,
+        ):
+            reject_stats["span"] += 1
+            continue
+
+        if not _passes_inner_bbox_check_arrays(
+            comp_y,
+            comp_x,
+            chunk_bbox,
+            inner_bbox_fraction,
+        ):
+            reject_stats["inner_bbox"] += 1
+            continue
 
         wraps.append({
-            "wrap_id": len(wraps),
+            "wrap_id": wrap_id,
             "bbox_2d": (r_min_p, r_max_p, c_min_p, c_max_p),
-            "points_zyx": points_zyx,
         })
 
-    return wraps
+    return wraps, reject_stats
 
 
 def get_required_axes(points_zyx: np.ndarray) -> Tuple[str, str]:
@@ -627,62 +848,17 @@ def passes_span_check_axis_aligned(
     """
     if len(points_zyx) == 0:
         return False
-
-    z_min, z_max, y_min, y_max, x_min, x_max = chunk_bbox
-    chunk_d, chunk_h, chunk_w = target_size
-
-    # Expand bbox by edge_touch_pad
-    z_min_t = z_min - edge_touch_pad
-    z_max_t = z_max + edge_touch_pad
-    y_min_t = y_min - edge_touch_pad
-    y_max_t = y_max + edge_touch_pad
-    x_min_t = x_min - edge_touch_pad
-    x_max_t = x_max + edge_touch_pad
-
-    # Get required axes: Z (always) + larger of X/Y
-    tangent_axes = get_required_axes(points_zyx)
-
-    z = points_zyx[:, 0]
-    y = points_zyx[:, 1]
-    x = points_zyx[:, 2]
-
-    # Compute spans
-    z_span = z.max() - z.min()
-    y_span = y.max() - y.min()
-    x_span = x.max() - x.min()
-
-    # Check span ratio for tangent axes
-    axis_info = {
-        "z": (z_span, chunk_d, z, z_min_t, z_max_t),
-        "y": (y_span, chunk_h, y, y_min_t, y_max_t),
-        "x": (x_span, chunk_w, x, x_min_t, x_max_t),
-    }
-
-    for ax in tangent_axes:
-        span, chunk_size, coords, bbox_min, bbox_max = axis_info[ax]
-        if span < min_span_ratio * chunk_size:
-            # DEBUG
-            if not hasattr(passes_span_check_axis_aligned, '_debug_count'):
-                passes_span_check_axis_aligned._debug_count = 0
-            if passes_span_check_axis_aligned._debug_count < 10:
-                print(f"  [DEBUG] axis={ax}, span={span:.2f}, chunk_size={chunk_size}, threshold={min_span_ratio * chunk_size:.2f}")
-                passes_span_check_axis_aligned._debug_count += 1
-            return False
-
-    # Edge-touch check for tangent axes
-    for ax in tangent_axes:
-        span, chunk_size, coords, bbox_min, bbox_max = axis_info[ax]
-        band = edge_touch_frac * chunk_size
-
-        # Count points near low edge
-        low_count = (coords <= bbox_min + band).sum()
-        # Count points near high edge
-        high_count = (coords >= bbox_max - band).sum()
-
-        if low_count < edge_touch_min_count or high_count < edge_touch_min_count:
-            return False
-
-    return True
+    return _passes_span_check_arrays(
+        points_zyx[:, 0],
+        points_zyx[:, 1],
+        points_zyx[:, 2],
+        chunk_bbox,
+        target_size,
+        min_span_ratio,
+        edge_touch_frac,
+        edge_touch_min_count,
+        edge_touch_pad,
+    )
 
 
 def passes_inner_bbox_check(
@@ -714,21 +890,11 @@ def passes_inner_bbox_check(
     if inner_bbox_fraction <= 0.0:
         return False
 
-    _, _, y_min, y_max, x_min, x_max = chunk_bbox
-    margin_frac = (1.0 - inner_bbox_fraction) / 2.0
-    y_margin = (y_max - y_min) * margin_frac
-    x_margin = (x_max - x_min) * margin_frac
-
-    inner_y_min = y_min + y_margin
-    inner_y_max = y_max - y_margin
-    inner_x_min = x_min + x_margin
-    inner_x_max = x_max - x_margin
-
-    center = points_zyx.mean(axis=0)
-
-    return (
-        center[1] >= inner_y_min and center[1] <= inner_y_max and
-        center[2] >= inner_x_min and center[2] <= inner_x_max
+    return _passes_inner_bbox_check_arrays(
+        points_zyx[:, 1],
+        points_zyx[:, 2],
+        chunk_bbox,
+        inner_bbox_fraction,
     )
 
 
@@ -889,7 +1055,7 @@ def find_world_chunk_patches(
         print(f"  Strides: {strides}")
 
     # Assign points to chunks (with tqdm progress bar when verbose)
-    chunk_to_valid_points, chunk_to_invalid_points = assign_points_to_chunks(
+    chunk_to_valid_points, chunk_to_invalid_segments = assign_points_to_chunks(
         segments, chunk_starts_z, chunk_starts_y, chunk_starts_x, target_size,
         verbose=verbose,
         chunk_pad=chunk_pad,
@@ -937,13 +1103,7 @@ def find_world_chunk_patches(
         # Check for invalid cells in chunk
         if skip_chunk_if_any_invalid:
             # Reject entire chunk if ANY segment has invalid cells
-            has_invalid = False
-            if chunk_id in chunk_to_invalid_points:
-                for seg_idx in chunk_to_invalid_points[chunk_id]:
-                    if len(chunk_to_invalid_points[chunk_id][seg_idx]) > 0:
-                        has_invalid = True
-                        break
-            if has_invalid:
+            if chunk_id in chunk_to_invalid_segments:
                 stats["chunks_rejected_all_invalid"] += 1
                 continue
 
@@ -956,40 +1116,29 @@ def find_world_chunk_patches(
 
             # Per-segment invalid check (when not skip_chunk_if_any_invalid)
             if not skip_chunk_if_any_invalid:
-                if chunk_id in chunk_to_invalid_points:
-                    if seg_idx in chunk_to_invalid_points[chunk_id]:
-                        if len(chunk_to_invalid_points[chunk_id][seg_idx]) > 0:
-                            # Skip this segment's wraps for this chunk
-                            continue
+                if seg_idx in chunk_to_invalid_segments.get(chunk_id, set()):
+                    # Skip this segment's wraps for this chunk.
+                    continue
 
             # Find wraps in this segment
-            segment_wraps = find_wraps_in_chunk(
-                points, seg,
-                min_points_per_wrap, bbox_pad_2d, require_all_valid_in_bbox
+            segment_wraps, reject_counts = find_wraps_in_chunk(
+                points,
+                seg,
+                min_points_per_wrap,
+                bbox_pad_2d,
+                require_all_valid_in_bbox,
+                chunk_bbox,
+                target_size,
+                min_span_ratio,
+                edge_touch_frac,
+                edge_touch_min_count,
+                edge_touch_pad,
+                inner_bbox_fraction,
             )
+            stats["wraps_rejected_span"] += reject_counts["span"]
+            stats["wraps_rejected_inner_bbox"] += reject_counts["inner_bbox"]
 
             for wrap in segment_wraps:
-                # Apply span check
-                if not passes_span_check_axis_aligned(
-                    wrap["points_zyx"],
-                    chunk_bbox,
-                    target_size,
-                    min_span_ratio,
-                    edge_touch_frac,
-                    edge_touch_min_count,
-                    edge_touch_pad,
-                ):
-                    stats["wraps_rejected_span"] += 1
-                    continue
-
-                if not passes_inner_bbox_check(
-                    wrap["points_zyx"],
-                    chunk_bbox,
-                    inner_bbox_fraction,
-                ):
-                    stats["wraps_rejected_inner_bbox"] += 1
-                    continue
-
                 # Wrap is valid
                 stats["wraps_accepted"] += 1
                 segment_ids.add(seg.uuid)

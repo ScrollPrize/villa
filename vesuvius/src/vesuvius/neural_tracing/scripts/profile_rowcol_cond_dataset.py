@@ -40,7 +40,7 @@ from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
 )
-from vesuvius.neural_tracing.datasets.targets import RowColTargets
+from vesuvius.neural_tracing.datasets.targets import CopyNeighborTargets, RowColTargets
 
 
 def _parse_args() -> argparse.Namespace:
@@ -55,7 +55,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-prepare-batch",
         action="store_true",
-        help="Also collate samples and run RowColTargets.from_batch, matching trainer target preparation.",
+        help="Also collate samples and run the active target preparation path.",
     )
     parser.add_argument(
         "--prepare-batch-size",
@@ -106,6 +106,21 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional raw .prof output path for snakeviz/tuna/pstats.",
+    )
+    parser.add_argument(
+        "--image-output",
+        type=Path,
+        default=None,
+        help=(
+            "Optional PNG path for a target-inspection image. For copy_neighbors, "
+            "this shows all model input channels and target tensors for one sample."
+        ),
+    )
+    parser.add_argument(
+        "--image-index",
+        type=int,
+        default=None,
+        help="Dataset index to render for --image-output. Defaults to the first profiled index.",
     )
     parser.add_argument(
         "--sort",
@@ -177,6 +192,32 @@ def _build_indices(dataset_len: int, args: argparse.Namespace, seed: int) -> lis
 
 def _collate_with_padding(batch: list[dict]) -> dict:
     """Mirror trainers.train_rowcol_cond.collate_with_padding without importing trainer deps."""
+    if "side_hint" in batch[0]:
+        result = {
+            "vol": torch.stack([b["vol"] for b in batch]),
+            "cond": torch.stack([b["cond"] for b in batch]),
+            "side_hint": torch.stack([b["side_hint"] for b in batch]),
+            "target_seg": torch.stack([b["target_seg"] for b in batch]),
+            "domain": torch.stack([b["domain"] for b in batch]),
+            "velocity_dir": torch.stack([b["velocity_dir"] for b in batch]),
+            "velocity_loss_weight": torch.stack([b["velocity_loss_weight"] for b in batch]),
+            "progress_phi": torch.stack([b["progress_phi"] for b in batch]),
+            "progress_phi_weight": torch.stack([b["progress_phi_weight"] for b in batch]),
+            "surface_attract": torch.stack([b["surface_attract"] for b in batch]),
+            "surface_attract_weight": torch.stack([b["surface_attract_weight"] for b in batch]),
+            "stop": torch.stack([b["stop"] for b in batch]),
+            "stop_weight": torch.stack([b["stop_weight"] for b in batch]),
+            "target_edt": torch.stack([b["target_edt"] for b in batch]),
+            "endpoint_seed_points": torch.stack([b["endpoint_seed_points"] for b in batch]),
+            "endpoint_seed_mask": torch.stack([b["endpoint_seed_mask"] for b in batch]),
+        }
+        if "endpoint_step_count" in batch[0]:
+            result["endpoint_step_count"] = torch.as_tensor(
+                [int(b["endpoint_step_count"]) for b in batch],
+                dtype=torch.long,
+            )
+        return result
+
     return {
         "vol": torch.stack([b["vol"] for b in batch]),
         "cond": torch.stack([b["cond"] for b in batch]),
@@ -206,6 +247,7 @@ def _profile_samples(
     prepare_batch_size: int,
     prepare_device: torch.device,
 ) -> tuple[float, float, float, float, int]:
+    training_mode = str(config.get("training_mode", "rowcol_hidden"))
     sample_times = []
     prepare_times = []
     pending_batch = []
@@ -226,7 +268,10 @@ def _profile_samples(
 
         start = time.perf_counter()
         batch = _move_batch_to_device(_collate_with_padding(pending_batch), prepare_device)
-        prepared = RowColTargets.from_batch(batch, config)
+        if training_mode == "copy_neighbors":
+            prepared = CopyNeighborTargets.from_batch(batch, config)
+        else:
+            prepared = RowColTargets.from_batch(batch, config)
         for value in prepared.__dict__.values():
             if torch.is_tensor(value):
                 _ = value.shape
@@ -238,7 +283,10 @@ def _profile_samples(
     if include_prepare_batch and pending_batch:
         start = time.perf_counter()
         batch = _move_batch_to_device(_collate_with_padding(pending_batch), prepare_device)
-        prepared = RowColTargets.from_batch(batch, config)
+        if training_mode == "copy_neighbors":
+            prepared = CopyNeighborTargets.from_batch(batch, config)
+        else:
+            prepared = RowColTargets.from_batch(batch, config)
         for value in prepared.__dict__.values():
             if torch.is_tensor(value):
                 _ = value.shape
@@ -269,6 +317,155 @@ def _print_stats(
         stats.strip_dirs()
         stats.print_stats(limit)
     print(stream.getvalue())
+
+
+def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    tensor = tensor.detach().cpu()
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.float()
+    return tensor.numpy()
+
+
+def _as_3d(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    while arr.ndim > 3:
+        arr = arr[0]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 3D array after squeezing leading dims, got shape {arr.shape}")
+    return arr
+
+
+def _finite_percentile(arr: np.ndarray, percentile: float, fallback: float = 1.0) -> float:
+    vals = np.asarray(arr)[np.isfinite(arr)]
+    if vals.size == 0:
+        return fallback
+    value = float(np.percentile(np.abs(vals), percentile))
+    return value if np.isfinite(value) and value > 1e-8 else fallback
+
+
+def _save_copy_neighbor_target_image(
+    *,
+    dataset: EdtSegDataset,
+    index: int,
+    config: dict,
+    device: torch.device,
+    image_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    sample = dataset[index]
+    batch = _move_batch_to_device(_collate_with_padding([sample]), device)
+    prepared = CopyNeighborTargets.from_batch(batch, config)
+
+    inputs = _tensor_to_numpy(prepared.inputs[0])
+    target_seg = _as_3d(_tensor_to_numpy(prepared.target_seg[0]))
+    domain = _as_3d(_tensor_to_numpy(prepared.domain[0]))
+    velocity = _tensor_to_numpy(prepared.velocity_dir[0])
+    velocity_weight = _as_3d(_tensor_to_numpy(prepared.velocity_loss_weight[0]))
+    progress_phi = _as_3d(_tensor_to_numpy(prepared.progress_phi[0]))
+    progress_weight = _as_3d(_tensor_to_numpy(prepared.progress_phi_weight[0]))
+    attract = _tensor_to_numpy(prepared.surface_attract[0])
+    attract_weight = _as_3d(_tensor_to_numpy(prepared.surface_attract_weight[0]))
+    stop = _as_3d(_tensor_to_numpy(prepared.stop[0]))
+    stop_weight = _as_3d(_tensor_to_numpy(prepared.stop_weight[0]))
+    target_edt = _as_3d(_tensor_to_numpy(prepared.target_edt[0]))
+    seeds = _tensor_to_numpy(prepared.endpoint_seed_points[0])
+    seed_mask = _tensor_to_numpy(prepared.endpoint_seed_mask[0]) > 0.0
+    endpoint_step_count = (
+        int(_tensor_to_numpy(prepared.endpoint_step_count)[0])
+        if prepared.endpoint_step_count is not None else None
+    )
+
+    velocity_mag = np.linalg.norm(velocity, axis=0)
+    attract_mag = np.linalg.norm(attract, axis=0)
+    focus = (domain > 0.0) | (target_seg > 0.0) | (inputs[1] > 0.0)
+    d, h, w = inputs.shape[1:]
+    if np.any(focus):
+        z0, y0, x0 = np.median(np.argwhere(focus), axis=0).astype(int).tolist()
+    else:
+        z0, y0, x0 = d // 2, h // 2, w // 2
+    slices = (("z", z0), ("y", y0), ("x", x0))
+
+    attract_vmax = _finite_percentile(attract_mag, 99, fallback=1.0)
+    attract_component_vmax = _finite_percentile(attract, 99, fallback=1.0)
+    edt_vmax = _finite_percentile(target_edt, 95, fallback=8.0)
+    volume_vmax = _finite_percentile(inputs[0], 99, fallback=1.0)
+    volume_vmin = float(np.percentile(inputs[0][np.isfinite(inputs[0])], 1)) if np.isfinite(inputs[0]).any() else 0.0
+
+    panels: list[tuple[str, np.ndarray, str, float | None, float | None]] = [
+        ("input: volume", inputs[0], "gray", volume_vmin, volume_vmax),
+        ("input: source cond", inputs[1], "gray", 0.0, 1.0),
+        ("input: side z", inputs[2], "coolwarm", -1.0, 1.0),
+        ("input: side y", inputs[3], "coolwarm", -1.0, 1.0),
+        ("input: side x", inputs[4], "coolwarm", -1.0, 1.0),
+        ("target_seg", target_seg, "gray", 0.0, 1.0),
+        ("domain", domain, "gray", 0.0, 1.0),
+        ("velocity z", velocity[0], "coolwarm", -1.0, 1.0),
+        ("velocity y", velocity[1], "coolwarm", -1.0, 1.0),
+        ("velocity x", velocity[2], "coolwarm", -1.0, 1.0),
+        ("velocity |v|", velocity_mag, "magma", 0.0, 1.0),
+        ("velocity weight", velocity_weight, "gray", 0.0, 1.0),
+        ("progress_phi", progress_phi, "viridis", 0.0, 1.0),
+        ("progress weight", progress_weight, "gray", 0.0, 1.0),
+        ("surface_attr z", attract[0], "coolwarm", -attract_component_vmax, attract_component_vmax),
+        ("surface_attr y", attract[1], "coolwarm", -attract_component_vmax, attract_component_vmax),
+        ("surface_attr x", attract[2], "coolwarm", -attract_component_vmax, attract_component_vmax),
+        ("surface_attr |v|", attract_mag, "magma", 0.0, attract_vmax),
+        ("surface_attr weight", attract_weight, "gray", 0.0, 1.0),
+        ("stop", stop, "viridis", 0.0, 1.0),
+        ("stop weight", stop_weight, "gray", 0.0, 1.0),
+        ("target EDT + seeds", target_edt, "magma", 0.0, edt_vmax),
+    ]
+
+    def slice_2d(arr: np.ndarray, axis: str, idx: int) -> np.ndarray:
+        if axis == "z":
+            return arr[idx]
+        if axis == "y":
+            return arr[:, idx, :]
+        if axis == "x":
+            return arr[:, :, idx]
+        raise ValueError(axis)
+
+    n_cols = len(panels)
+    fig, axes = plt.subplots(
+        len(slices),
+        n_cols,
+        figsize=(2.4 * n_cols, 7.6),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for row, (axis, idx) in enumerate(slices):
+        for col, (title, arr, cmap, vmin, vmax) in enumerate(panels):
+            ax = axes[row, col]
+            ax.imshow(slice_2d(arr, axis, idx), cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(f"{title}\n{axis}={idx}", fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if title == "target EDT + seeds":
+                active = seeds[seed_mask]
+                if active.size > 0:
+                    if axis == "z":
+                        near = np.abs(active[:, 0] - idx) <= 1.5
+                        xy = active[near][:, [2, 1]]
+                    elif axis == "y":
+                        near = np.abs(active[:, 1] - idx) <= 1.5
+                        xy = active[near][:, [2, 0]]
+                    else:
+                        near = np.abs(active[:, 2] - idx) <= 1.5
+                        xy = active[near][:, [1, 0]]
+                    if xy.size > 0:
+                        ax.scatter(xy[:, 0], xy[:, 1], s=7, c="cyan", edgecolors="black", linewidths=0.2)
+
+    title = (
+        f"copy_neighbors sample index={index} | shape={d}x{h}x{w} | "
+        f"seeds={int(seed_mask.sum())}"
+    )
+    if endpoint_step_count is not None:
+        title = f"{title} | endpoint_steps={endpoint_step_count}"
+    fig.suptitle(title, fontsize=12)
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(image_path, dpi=120)
+    plt.close(fig)
 
 
 def main() -> None:
@@ -305,7 +502,8 @@ def main() -> None:
     prepare_device = torch.device(
         args.prepare_device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    if args.include_prepare_batch and prepare_device.type != "cuda":
+    training_mode = str(config.get("training_mode", "rowcol_hidden"))
+    if args.include_prepare_batch and training_mode != "copy_neighbors" and prepare_device.type != "cuda":
         raise RuntimeError(
             "--include-prepare-batch requires a CUDA device because RowColTargets uses cupyx EDT."
         )
@@ -331,8 +529,21 @@ def main() -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         profiler.dump_stats(str(args.output))
 
-    print("=== Row/Col Dataset Profile ===")
+    if args.image_output is not None:
+        if training_mode != "copy_neighbors":
+            raise RuntimeError("--image-output is currently implemented for training_mode='copy_neighbors'.")
+        image_index = int(args.image_index if args.image_index is not None else indices[0])
+        _save_copy_neighbor_target_image(
+            dataset=dataset,
+            index=image_index,
+            config=config,
+            device=prepare_device,
+            image_path=args.image_output,
+        )
+
+    print("=== Trace ODE Dataset Profile ===")
     print(f"config: {args.config_path}")
+    print(f"training mode: {training_mode}")
     print(f"dataset samples: {len(dataset)}")
     print(f"profiled samples: {len(indices)}")
     print(f"index mode: {args.index_mode}")
@@ -352,6 +563,8 @@ def main() -> None:
         print(f"combined sample+prepare seconds: {total_seconds + prepare_seconds:.3f}")
     if args.output is not None:
         print(f"raw profile: {args.output}")
+    if args.image_output is not None:
+        print(f"target image: {args.image_output}")
     print()
     if args.profile_create_split_masks:
         _print_create_split_masks_profile(dataset)

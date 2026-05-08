@@ -417,3 +417,75 @@ class RowColTargets:
                 "set trace_surface_attract_radius > 0 for the active trace-ODE path"
             )
         return velocity_dir, velocity_loss_weight, trace_loss_weight, surface_attract, surface_attract_weight
+
+
+@dataclass(frozen=True)
+class CopyNeighborTargets:
+    """Model inputs and supervised targets for one copy-neighbor batch."""
+
+    inputs: torch.Tensor
+    target_seg: torch.Tensor | None
+    domain: torch.Tensor | None
+    velocity_dir: torch.Tensor
+    velocity_loss_weight: torch.Tensor
+    progress_phi: torch.Tensor
+    progress_phi_weight: torch.Tensor
+    surface_attract: torch.Tensor
+    surface_attract_weight: torch.Tensor
+    stop: torch.Tensor
+    stop_weight: torch.Tensor
+    target_edt: torch.Tensor
+    endpoint_seed_points: torch.Tensor
+    endpoint_seed_mask: torch.Tensor
+    endpoint_step_count: torch.Tensor | None = None
+
+    @classmethod
+    def from_batch(cls, batch: Mapping[str, object], config: Mapping[str, object]) -> "CopyNeighborTargets":
+        required_keys = (
+            "vol",
+            "cond",
+            "side_hint",
+            "velocity_dir",
+            "velocity_loss_weight",
+            "progress_phi",
+            "progress_phi_weight",
+            "surface_attract",
+            "surface_attract_weight",
+            "stop",
+            "stop_weight",
+            "target_edt",
+            "endpoint_seed_points",
+            "endpoint_seed_mask",
+        )
+        missing = [key for key in required_keys if key not in batch]
+        if missing:
+            raise ValueError(f"Batch is missing required copy-neighbor target keys: {missing}")
+
+        vol = batch["vol"].unsqueeze(1)
+        cond = batch["cond"].unsqueeze(1)
+        side_hint = batch["side_hint"]
+        if side_hint.ndim != 5 or side_hint.shape[1] != 3:
+            raise ValueError(f"side_hint must have shape [B, 3, D, H, W], got {tuple(side_hint.shape)}")
+        inputs = torch.cat([vol, cond, side_hint.to(device=vol.device, dtype=vol.dtype)], dim=1)
+
+        endpoint_step_count = batch.get("endpoint_step_count", None)
+        if endpoint_step_count is not None:
+            endpoint_step_count = endpoint_step_count.to(device=vol.device)
+
+        return cls(
+            inputs=inputs,
+            target_seg=batch.get("target_seg", None),
+            domain=batch.get("domain", None),
+            velocity_dir=batch["velocity_dir"],
+            velocity_loss_weight=batch["velocity_loss_weight"],
+            progress_phi=batch["progress_phi"],
+            progress_phi_weight=batch["progress_phi_weight"],
+            surface_attract=batch["surface_attract"],
+            surface_attract_weight=batch["surface_attract_weight"],
+            stop=batch["stop"],
+            stop_weight=batch["stop_weight"],
+            target_edt=batch["target_edt"],
+            endpoint_seed_points=batch["endpoint_seed_points"],
+            endpoint_seed_mask=batch["endpoint_seed_mask"],
+            endpoint_step_count=endpoint_step_count,
+        )

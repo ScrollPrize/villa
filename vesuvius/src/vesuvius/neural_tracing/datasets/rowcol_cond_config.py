@@ -9,6 +9,7 @@ from vesuvius.neural_tracing.datasets.growth_direction import (
 
 def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Populate default config values for the row/col conditioning dataset."""
+    config.setdefault("training_mode", "rowcol_hidden")
     config.setdefault("cond_percent", [0.1, 0.5])
     config.setdefault("lambda_velocity_dir", 0.1)
     config.setdefault("trace_target_dilation_radius", 1.0)
@@ -23,6 +24,49 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
 
     config.setdefault("validate_result_tensors", False)
     config.setdefault("profile_create_split_masks", False)
+
+    # copy_neighbors target-builder defaults. These are inert for the existing
+    # row/col path but live here so train/dataset setup normalizes one config.
+    config.setdefault("copy_neighbor_domain_builder", "connectors")
+    config.setdefault("copy_neighbor_connector_sample_stride", 4)
+    config.setdefault("copy_neighbor_bridge_dilation_radius", 2.0)
+    config.setdefault("copy_neighbor_bridge_closing_radius", 2.0)
+    config.setdefault("copy_neighbor_fill_domain_holes", True)
+    config.setdefault("copy_neighbor_keep_touching_components", True)
+    config.setdefault("copy_neighbor_side_tolerance", 1.0)
+    config.setdefault("copy_neighbor_max_source_distance", 16.0)
+    config.setdefault("copy_neighbor_max_target_distance", 16.0)
+    config.setdefault("copy_neighbor_bridge_score_threshold", 32.0)
+    config.setdefault("copy_neighbor_min_domain_voxels", 16)
+    config.setdefault("copy_neighbor_min_source_voxels", 8)
+    config.setdefault("copy_neighbor_min_target_voxels", 8)
+    config.setdefault("copy_neighbor_progress_builder", "harmonic")
+    config.setdefault("copy_neighbor_harmonic_max_iters", 250)
+    config.setdefault("copy_neighbor_harmonic_tolerance", 1e-3)
+    config.setdefault("copy_neighbor_harmonic_min_unknown_voxels", 1)
+    config.setdefault("copy_neighbor_harmonic_required_converged", False)
+    config.setdefault("copy_neighbor_harmonic_profile", True)
+    config.setdefault("copy_neighbor_surface_attract_radius", 4.0)
+    config.setdefault("copy_neighbor_stop_radius", 1.5)
+    config.setdefault("copy_neighbor_endpoint_num_seeds", 256)
+    config.setdefault("copy_neighbor_endpoint_steps", 8)
+    config.setdefault("copy_neighbor_endpoint_steps_mode", "adaptive")
+    config.setdefault("copy_neighbor_endpoint_step_size", 1.0)
+    config.setdefault("copy_neighbor_endpoint_distance_percentile", 75.0)
+    config.setdefault("copy_neighbor_endpoint_step_margin", 2)
+    config.setdefault("copy_neighbor_endpoint_max_steps", 64)
+    config.setdefault("copy_neighbor_endpoint_huber_beta", 2.0)
+    config.setdefault("copy_neighbor_endpoint_max_distance", 32.0)
+    config.setdefault("copy_neighbor_endpoint_detach_steps", False)
+    config.setdefault("copy_neighbor_source_position", "random")
+    config.setdefault("copy_neighbor_target_side", "random")
+    config.setdefault("copy_neighbor_pair_seed_offset", 0)
+    config.setdefault("copy_neighbor_pair_record_mode", "all_directed")
+    config.setdefault("copy_neighbor_source_center_mode", "bbox_center")
+    config.setdefault("copy_neighbor_min_in_crop_valid_fraction", 0.25)
+    config.setdefault("copy_neighbor_surface_edge_strip_width", 2)
+    config.setdefault("copy_neighbor_surface_edge_valid_frac", 0.10)
+    config.setdefault("copy_neighbor_allow_partial_target", False)
 
     # Patch-finding defaults.
     config.setdefault("overlap_fraction", 0.0)
@@ -79,6 +123,16 @@ def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("trace_integration_min_weight", 0.5)
     config.setdefault("trace_integration_detach_steps", False)
     config.setdefault("surface_attract_huber_beta", 5.0)
+    config.setdefault("lambda_copy_neighbor_velocity_dir", 1.0)
+    config.setdefault("lambda_copy_neighbor_progress_phi", 0.25)
+    config.setdefault("lambda_copy_neighbor_progress_gradient", 0.25)
+    config.setdefault("lambda_copy_neighbor_stop", 0.25)
+    config.setdefault("lambda_copy_neighbor_surface_attract", 0.1)
+    config.setdefault("lambda_copy_neighbor_endpoint", 0.25)
+    config.setdefault("lambda_copy_neighbor_velocity_smooth", 0.0)
+    config.setdefault("copy_neighbor_velocity_smooth_normalize", True)
+    config.setdefault("copy_neighbor_stop_pos_weight", 1.0)
+    config.setdefault("copy_neighbor_surface_attract_huber_beta", 5.0)
     config.setdefault("val_batches_per_log", 4)
     config.setdefault("log_at_step_zero", False)
     config.setdefault("ckpt_at_step_zero", False)
@@ -92,13 +146,23 @@ def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> N
 
 def setdefault_rowcol_cond_model_config(config: MutableMapping[str, Any]) -> None:
     """Populate model input and output defaults for trace-ODE training."""
-    config["in_channels"] = 2 + growth_direction_channel_count()
     config.setdefault("step_count", 1)  # Required by make_model.
-    config["targets"] = {
-        "velocity_dir": {"out_channels": 3, "activation": "none"},
-        "surface_attract": {"out_channels": 3, "activation": "none"},
-        "trace_validity": {"out_channels": 1, "activation": "none"},
-    }
+    training_mode = str(config.get("training_mode", "rowcol_hidden"))
+    if training_mode == "copy_neighbors":
+        config["in_channels"] = 5
+        config["targets"] = {
+            "velocity_dir": {"out_channels": 3, "activation": "none"},
+            "progress_phi": {"out_channels": 1, "activation": "none"},
+            "surface_attract": {"out_channels": 3, "activation": "none"},
+            "stop": {"out_channels": 1, "activation": "none"},
+        }
+    else:
+        config["in_channels"] = 2 + growth_direction_channel_count()
+        config["targets"] = {
+            "velocity_dir": {"out_channels": 3, "activation": "none"},
+            "surface_attract": {"out_channels": 3, "activation": "none"},
+            "trace_validity": {"out_channels": 1, "activation": "none"},
+        }
 
 
 def prepare_rowcol_cond_train_config(config: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
@@ -153,7 +217,33 @@ def rowcol_cond_training_summary_lines(
     num_train: int,
     num_val: int,
 ) -> list[str]:
-    """Return the row/col conditioned trace-ODE training configuration summary."""
+    """Return the active trace-ODE training configuration summary."""
+    if str(config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
+        lines = [
+            "\n=== Copy Neighbor Trace ODE Training Configuration ===",
+            f"Input channels: {config['in_channels']}",
+            "Output: velocity_dir (3ch) + progress_phi (1ch) + surface_attract (3ch) + stop (1ch)",
+            f"Progress builder: {config.get('copy_neighbor_progress_builder')}",
+            f"Domain builder: {config.get('copy_neighbor_domain_builder')}",
+            (
+                f"Optimizer: {optimizer_type} "
+                f"(lr={optimizer_kwargs['learning_rate']}, "
+                f"weight_decay={optimizer_kwargs.get('weight_decay', 0)})"
+            ),
+        ]
+        scheduler_details = ", ".join(f"{k}={v}" for k, v in scheduler_kwargs.items())
+        scheduler_summary = f"Scheduler: {scheduler_type}"
+        if scheduler_details:
+            scheduler_summary = f"{scheduler_summary} ({scheduler_details})"
+        lines.extend(
+            [
+                scheduler_summary,
+                f"Train samples: {num_train}, Val samples: {num_val}",
+                "=====================================================\n",
+            ]
+        )
+        return lines
+
     lines = [
         "\n=== Trace ODE Training Configuration ===",
         f"Input channels: {config['in_channels']}",
@@ -239,6 +329,10 @@ def _require_finite_range(
 
 def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> None:
     """Validate row/col conditioning dataset config invariants."""
+    training_mode = str(config.get("training_mode", "rowcol_hidden"))
+    if training_mode not in {"rowcol_hidden", "copy_neighbors"}:
+        raise ValueError(f"training_mode must be 'rowcol_hidden' or 'copy_neighbors', got {training_mode!r}")
+
     trace_target_dilation_radius = float(config.get("trace_target_dilation_radius", 1.0))
     _require_finite_range("trace_target_dilation_radius", trace_target_dilation_radius, min_value=0.0)
 
@@ -259,3 +353,39 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
 
     trace_validity_pos_weight = float(config.get("trace_validity_pos_weight", 1.0))
     _require_finite_range("trace_validity_pos_weight", trace_validity_pos_weight, min_value=0.0)
+
+    copy_neighbor_progress_builder = str(config.get("copy_neighbor_progress_builder", "harmonic"))
+    if copy_neighbor_progress_builder not in {"edt", "harmonic"}:
+        raise ValueError(
+            "copy_neighbor_progress_builder must be 'edt' or 'harmonic', "
+            f"got {copy_neighbor_progress_builder!r}"
+        )
+
+    copy_neighbor_domain_builder = str(config.get("copy_neighbor_domain_builder", "connectors"))
+    if copy_neighbor_domain_builder not in {"connectors", "distance_score"}:
+        raise ValueError(
+            "copy_neighbor_domain_builder must be 'connectors' or 'distance_score', "
+            f"got {copy_neighbor_domain_builder!r}"
+        )
+
+    if str(config.get("copy_neighbor_pair_record_mode", "all_directed")) not in {"all_directed", "one_per_triplet"}:
+        raise ValueError("copy_neighbor_pair_record_mode must be 'all_directed' or 'one_per_triplet'")
+    if str(config.get("copy_neighbor_source_position", "random")) not in {"random", "behind", "middle", "front"}:
+        raise ValueError("copy_neighbor_source_position must be random, behind, middle, or front")
+    if str(config.get("copy_neighbor_target_side", "random")) not in {"random", "behind", "front"}:
+        raise ValueError("copy_neighbor_target_side must be random, behind, or front")
+
+    for key in (
+        "copy_neighbor_bridge_dilation_radius",
+        "copy_neighbor_bridge_closing_radius",
+        "copy_neighbor_side_tolerance",
+        "copy_neighbor_min_domain_voxels",
+        "copy_neighbor_min_source_voxels",
+        "copy_neighbor_min_target_voxels",
+        "copy_neighbor_surface_attract_radius",
+        "copy_neighbor_stop_radius",
+        "copy_neighbor_endpoint_num_seeds",
+        "copy_neighbor_endpoint_step_size",
+        "copy_neighbor_endpoint_max_distance",
+    ):
+        _require_finite_range(key, float(config.get(key, 0.0)), min_value=0.0)

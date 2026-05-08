@@ -22,8 +22,8 @@ from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     resolve_rowcol_cond_optimizer_config,
     resolve_rowcol_cond_scheduler_config,
 )
-from vesuvius.neural_tracing.datasets.targets import RowColTargets
-from vesuvius.neural_tracing.loss.trace_losses import compute_trace_losses
+from vesuvius.neural_tracing.datasets.targets import CopyNeighborTargets, RowColTargets
+from vesuvius.neural_tracing.loss.trace_losses import compute_copy_neighbor_losses, compute_trace_losses
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import (
@@ -33,8 +33,9 @@ from vesuvius.neural_tracing.nets.models import (
     make_model,
     strip_state,
 )
-from vesuvius.neural_tracing.trainers.loss_config import TraceLossConfig
+from vesuvius.neural_tracing.trainers.loss_config import CopyNeighborLossConfig, TraceLossConfig
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
+    make_copy_neighbor_visualization,
     make_trace_visualization,
 )
 
@@ -48,6 +49,32 @@ def seed_worker(worker_id):
 
 def collate_with_padding(batch):
     """Collate batch tensors for the active trace-ODE training path."""
+    if "side_hint" in batch[0]:
+        result = {
+            'vol': torch.stack([b['vol'] for b in batch]),
+            'cond': torch.stack([b['cond'] for b in batch]),
+            'side_hint': torch.stack([b['side_hint'] for b in batch]),
+            'target_seg': torch.stack([b['target_seg'] for b in batch]),
+            'domain': torch.stack([b['domain'] for b in batch]),
+            'velocity_dir': torch.stack([b['velocity_dir'] for b in batch]),
+            'velocity_loss_weight': torch.stack([b['velocity_loss_weight'] for b in batch]),
+            'progress_phi': torch.stack([b['progress_phi'] for b in batch]),
+            'progress_phi_weight': torch.stack([b['progress_phi_weight'] for b in batch]),
+            'surface_attract': torch.stack([b['surface_attract'] for b in batch]),
+            'surface_attract_weight': torch.stack([b['surface_attract_weight'] for b in batch]),
+            'stop': torch.stack([b['stop'] for b in batch]),
+            'stop_weight': torch.stack([b['stop_weight'] for b in batch]),
+            'target_edt': torch.stack([b['target_edt'] for b in batch]),
+            'endpoint_seed_points': torch.stack([b['endpoint_seed_points'] for b in batch]),
+            'endpoint_seed_mask': torch.stack([b['endpoint_seed_mask'] for b in batch]),
+        }
+        if "endpoint_step_count" in batch[0]:
+            result["endpoint_step_count"] = torch.as_tensor(
+                [int(b["endpoint_step_count"]) for b in batch],
+                dtype=torch.long,
+            )
+        return result
+
     # Source masks are used by on-device EDT target generation. Keeping EDT
     # out of dataloader workers avoids cupyx defaulting every worker to GPU 0.
     return {
@@ -65,6 +92,8 @@ def collate_with_padding(batch):
 
 def prepare_batch(batch, config):
     """Prepare batch tensors for training."""
+    if str(config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
+        return CopyNeighborTargets.from_batch(batch, config)
     return RowColTargets.from_batch(batch, config)
 
 
@@ -125,7 +154,23 @@ def train(config_path):
         if wandb.run is not None:
             config['wandb_run_id'] = wandb.run.id
 
-    loss_config = TraceLossConfig.from_config(config)
+    training_mode = str(config.get("training_mode", "rowcol_hidden"))
+    copy_neighbor_mode = training_mode == "copy_neighbors"
+    loss_config = (
+        CopyNeighborLossConfig.from_config(config)
+        if copy_neighbor_mode
+        else TraceLossConfig.from_config(config)
+    )
+
+    def compute_losses(output, prepared, *, random_trace_sample):
+        if copy_neighbor_mode:
+            return compute_copy_neighbor_losses(output, prepared, loss_config)
+        return compute_trace_losses(
+            output,
+            prepared,
+            loss_config,
+            random_trace_sample=random_trace_sample,
+        )
 
     def make_generator(offset=0):
         gen = torch.Generator()
@@ -313,13 +358,6 @@ def train(config_path):
 
         prepared = prepare_batch(batch, config)
         inputs = prepared.inputs
-        velocity_dir_target = prepared.velocity_dir
-        velocity_loss_weight = prepared.velocity_loss_weight
-        trace_loss_weight = prepared.trace_loss_weight
-        trace_validity_target = prepared.trace_validity
-        trace_validity_weight = prepared.trace_validity_weight
-        surface_attract_target = prepared.surface_attract
-        surface_attract_weight = prepared.surface_attract_weight
 
         wandb_log = {}
 
@@ -327,10 +365,9 @@ def train(config_path):
             # Forward pass
             output = model(inputs)
             grad_norm = None
-            total_loss, loss_metrics = compute_trace_losses(
+            total_loss, loss_metrics = compute_losses(
                 output,
                 prepared,
-                loss_config,
                 random_trace_sample=True,
             )
             wandb_log.update({
@@ -367,16 +404,10 @@ def train(config_path):
         postfix = {
             'loss': f"{wandb_log['loss']:.4f}",
         }
-        if loss_config.lambda_velocity_dir > 0.0:
-            postfix['vel_dir'] = f"{wandb_log['velocity_dir_loss']:.4f}"
-        if loss_config.lambda_velocity_smooth > 0.0:
-            postfix['vel_smooth'] = f"{wandb_log['velocity_smooth_loss']:.4f}"
-        if loss_config.lambda_trace_integration > 0.0:
-            postfix['trace_int'] = f"{wandb_log['trace_integration_loss']:.4f}"
-        if loss_config.lambda_surface_attract > 0.0:
-            postfix['attract'] = f"{wandb_log['surface_attract_loss']:.4f}"
-        if loss_config.lambda_trace_validity > 0.0:
-            postfix['valid'] = f"{wandb_log['trace_validity_loss']:.4f}"
+        for metric_name, metric_value in list(wandb_log.items()):
+            if metric_name.endswith("_loss") and metric_name != "loss":
+                short_name = metric_name.replace("copy_neighbor_", "").replace("_loss", "")
+                postfix[short_name[:12]] = f"{metric_value:.4f}"
         progress_bar.set_postfix(postfix)
         progress_bar.update(1)
 
@@ -388,16 +419,6 @@ def train(config_path):
                 val_metric_sums = {
                     'val_loss': 0.0,
                 }
-                if loss_config.lambda_velocity_dir > 0.0:
-                    val_metric_sums['val_velocity_dir_loss'] = 0.0
-                if loss_config.lambda_velocity_smooth > 0.0:
-                    val_metric_sums['val_velocity_smooth_loss'] = 0.0
-                if loss_config.lambda_trace_integration > 0.0:
-                    val_metric_sums['val_trace_integration_loss'] = 0.0
-                if loss_config.lambda_surface_attract > 0.0:
-                    val_metric_sums['val_surface_attract_loss'] = 0.0
-                if loss_config.lambda_trace_validity > 0.0:
-                    val_metric_sums['val_trace_validity_loss'] = 0.0
 
                 first_val_vis = None
                 for val_batch_idx in range(val_batches_per_log):
@@ -411,31 +432,54 @@ def train(config_path):
 
                     with accelerator.autocast():
                         val_output = model(val_prepared.inputs)
-                    val_total_loss, val_metrics = compute_trace_losses(
+                    val_total_loss, val_metrics = compute_losses(
                         val_output,
                         val_prepared,
-                        loss_config,
                         random_trace_sample=False,
                     )
                     for key, value in val_metrics.items():
+                        val_metric_sums.setdefault(f'val_{key}', 0.0)
                         val_metric_sums[f'val_{key}'] += value.item()
 
                     val_metric_sums['val_loss'] += val_total_loss.item()
 
                     if val_batch_idx == 0:
-                        first_val_vis = {
-                            'inputs': val_prepared.inputs,
-                            'velocity_dir_pred': val_output.get('velocity_dir'),
-                            'velocity_dir_target': val_prepared.velocity_dir,
-                            'velocity_loss_weight': val_prepared.velocity_loss_weight,
-                            'trace_loss_weight': val_prepared.trace_loss_weight,
-                            'trace_validity_pred': val_output.get('trace_validity'),
-                            'trace_validity_target': val_prepared.trace_validity,
-                            'trace_validity_weight': val_prepared.trace_validity_weight,
-                            'surface_attract_pred': val_output.get('surface_attract'),
-                            'surface_attract_target': val_prepared.surface_attract,
-                            'surface_attract_weight': val_prepared.surface_attract_weight,
-                        }
+                        if copy_neighbor_mode:
+                            first_val_vis = {
+                                'inputs': val_prepared.inputs,
+                                'target_seg': val_prepared.target_seg,
+                                'domain': val_prepared.domain,
+                                'velocity_dir_pred': val_output.get('velocity_dir'),
+                                'velocity_dir_target': val_prepared.velocity_dir,
+                                'velocity_loss_weight': val_prepared.velocity_loss_weight,
+                                'progress_phi_pred': val_output.get('progress_phi'),
+                                'progress_phi_target': val_prepared.progress_phi,
+                                'progress_phi_weight': val_prepared.progress_phi_weight,
+                                'stop_pred': val_output.get('stop'),
+                                'stop_target': val_prepared.stop,
+                                'stop_weight': val_prepared.stop_weight,
+                                'surface_attract_pred': val_output.get('surface_attract'),
+                                'surface_attract_target': val_prepared.surface_attract,
+                                'surface_attract_weight': val_prepared.surface_attract_weight,
+                                'target_edt': val_prepared.target_edt,
+                                'endpoint_seed_points': val_prepared.endpoint_seed_points,
+                                'endpoint_seed_mask': val_prepared.endpoint_seed_mask,
+                                'endpoint_step_count': val_prepared.endpoint_step_count,
+                            }
+                        else:
+                            first_val_vis = {
+                                'inputs': val_prepared.inputs,
+                                'velocity_dir_pred': val_output.get('velocity_dir'),
+                                'velocity_dir_target': val_prepared.velocity_dir,
+                                'velocity_loss_weight': val_prepared.velocity_loss_weight,
+                                'trace_loss_weight': val_prepared.trace_loss_weight,
+                                'trace_validity_pred': val_output.get('trace_validity'),
+                                'trace_validity_target': val_prepared.trace_validity,
+                                'trace_validity_weight': val_prepared.trace_validity_weight,
+                                'surface_attract_pred': val_output.get('surface_attract'),
+                                'surface_attract_target': val_prepared.surface_attract,
+                                'surface_attract_weight': val_prepared.surface_attract_weight,
+                            }
 
                 for key, value in val_metric_sums.items():
                     wandb_log[key] = value / val_batches_per_log
@@ -444,22 +488,47 @@ def train(config_path):
                 train_img_path = f'{out_dir}/{iteration:06}_train.png'
                 val_img_path = f'{out_dir}/{iteration:06}_val.png'
 
-                train_vis = {
-                    'inputs': inputs,
-                    'velocity_dir_pred': output.get('velocity_dir'),
-                    'velocity_dir_target': velocity_dir_target,
-                    'velocity_loss_weight': velocity_loss_weight,
-                    'trace_loss_weight': trace_loss_weight,
-                    'trace_validity_pred': output.get('trace_validity'),
-                    'trace_validity_target': trace_validity_target,
-                    'trace_validity_weight': trace_validity_weight,
-                    'surface_attract_pred': output.get('surface_attract'),
-                    'surface_attract_target': surface_attract_target,
-                    'surface_attract_weight': surface_attract_weight,
-                }
                 if first_val_vis is not None:
-                    make_trace_visualization(train_vis, train_img_path)
-                    make_trace_visualization(first_val_vis, val_img_path)
+                    if copy_neighbor_mode:
+                        train_vis = {
+                            'inputs': inputs,
+                            'target_seg': prepared.target_seg,
+                            'domain': prepared.domain,
+                            'velocity_dir_pred': output.get('velocity_dir'),
+                            'velocity_dir_target': prepared.velocity_dir,
+                            'velocity_loss_weight': prepared.velocity_loss_weight,
+                            'progress_phi_pred': output.get('progress_phi'),
+                            'progress_phi_target': prepared.progress_phi,
+                            'progress_phi_weight': prepared.progress_phi_weight,
+                            'stop_pred': output.get('stop'),
+                            'stop_target': prepared.stop,
+                            'stop_weight': prepared.stop_weight,
+                            'surface_attract_pred': output.get('surface_attract'),
+                            'surface_attract_target': prepared.surface_attract,
+                            'surface_attract_weight': prepared.surface_attract_weight,
+                            'target_edt': prepared.target_edt,
+                            'endpoint_seed_points': prepared.endpoint_seed_points,
+                            'endpoint_seed_mask': prepared.endpoint_seed_mask,
+                            'endpoint_step_count': prepared.endpoint_step_count,
+                        }
+                        make_copy_neighbor_visualization(train_vis, train_img_path)
+                        make_copy_neighbor_visualization(first_val_vis, val_img_path)
+                    else:
+                        train_vis = {
+                            'inputs': inputs,
+                            'velocity_dir_pred': output.get('velocity_dir'),
+                            'velocity_dir_target': prepared.velocity_dir,
+                            'velocity_loss_weight': prepared.velocity_loss_weight,
+                            'trace_loss_weight': prepared.trace_loss_weight,
+                            'trace_validity_pred': output.get('trace_validity'),
+                            'trace_validity_target': prepared.trace_validity,
+                            'trace_validity_weight': prepared.trace_validity_weight,
+                            'surface_attract_pred': output.get('surface_attract'),
+                            'surface_attract_target': prepared.surface_attract,
+                            'surface_attract_weight': prepared.surface_attract_weight,
+                        }
+                        make_trace_visualization(train_vis, train_img_path)
+                        make_trace_visualization(first_val_vis, val_img_path)
 
                     if wandb.run is not None:
                         wandb_log['train_image'] = wandb.Image(train_img_path)

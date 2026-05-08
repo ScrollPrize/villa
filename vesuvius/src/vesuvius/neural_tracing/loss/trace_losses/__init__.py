@@ -1,4 +1,5 @@
 from vesuvius.neural_tracing.loss.trace_losses.losses import (
+    compute_copy_neighbor_losses,
     compute_surface_attract_loss,
     compute_trace_losses,
     compute_trace_validity_loss,
@@ -6,6 +7,7 @@ from vesuvius.neural_tracing.loss.trace_losses.losses import (
 )
 
 __all__ = [
+    'compute_copy_neighbor_losses',
     'compute_surface_attract_loss',
     'compute_trace_losses',
     'compute_trace_validity_loss',
