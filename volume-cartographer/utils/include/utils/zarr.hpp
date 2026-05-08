@@ -986,9 +986,13 @@ private:
 class ZarrArray final {
 public:
     /// Codec callback struct: compress and decompress functions.
+    /// `decompress_into` is optional; when provided, callers can avoid the
+    /// per-call decompressed-buffer heap allocation by passing a reusable
+    /// scratch span sized to the (sub-)chunk byte count.
     struct Codec {
         std::function<std::vector<std::byte>(std::span<const std::byte>)> compress;
         std::function<std::vector<std::byte>(std::span<const std::byte>, std::size_t)> decompress;
+        std::function<void(std::span<const std::byte>, std::span<std::byte>)> decompress_into;
     };
 
     /// Named codec registry: maps codec name to Codec.
@@ -1199,6 +1203,61 @@ public:
         }
 
         return data;
+    }
+
+    /// Read a chunk and decompress it directly into the caller-provided
+    /// `output` buffer. `output` must be at least sub_chunk_byte_size().
+    /// Returns false if the chunk is missing on disk; otherwise writes
+    /// exactly sub_chunk_byte_size() bytes into `output` and returns true.
+    ///
+    /// When the codec exposes `decompress_into`, decompression skips the
+    /// per-call heap allocation that `read_chunk` performs. v2 filters and
+    /// host-byte-order mismatches force a fallback to the allocating path
+    /// (and a final memcpy into `output`).
+    [[nodiscard]] bool
+    read_chunk_into(std::span<const std::size_t> chunk_indices,
+                    std::span<std::byte> output) const {
+        const std::size_t expected = meta_.sub_chunk_byte_size();
+        if (output.size() < expected) {
+            throw std::runtime_error("zarr: read_chunk_into output buffer too small");
+        }
+        auto out = output.subspan(0, expected);
+
+        std::optional<std::vector<std::byte>> raw_opt;
+        if (is_sharded()) {
+            raw_opt = read_inner_chunk_from_shard(chunk_indices);
+        } else {
+            raw_opt = read_chunk_raw(chunk_indices);
+        }
+        if (!raw_opt) return false;
+
+        const bool has_v2_filters =
+            (meta_.version == ZarrVersion::v2 && !meta_.filters.empty());
+        const bool needs_decode = needs_decompression();
+
+        if (needs_decode && codec_.decompress_into && !has_v2_filters && !needs_byteswap()) {
+            codec_.decompress_into(*raw_opt, out);
+            return true;
+        }
+
+        std::vector<std::byte> data;
+        if (needs_decode) {
+            if (!codec_.decompress) return false;
+            data = codec_.decompress(*raw_opt, expected);
+        } else {
+            data = std::move(*raw_opt);
+        }
+
+        if (has_v2_filters) {
+            for (auto it = meta_.filters.rbegin(); it != meta_.filters.rend(); ++it)
+                data = it->decode(data);
+        }
+        if (needs_byteswap()) {
+            detail::byteswap_inplace(data, dtype_size(meta_.dtype));
+        }
+        if (data.size() < expected) return false;
+        std::memcpy(out.data(), data.data(), expected);
+        return true;
     }
 
     void write_chunk(std::span<const std::size_t> chunk_indices,
