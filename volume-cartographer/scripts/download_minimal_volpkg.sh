@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download a minimal local copy of s3://volpkgs/s1_ds2.volpkg/ for vc3d testing.
 # Zarr volumes are streamed via VC3D's remote-cache code path; only metadata
-# files, the normalgrids_2um_ds folder, and a handful of tifxyz directories
+# files, the normalgrids_2um_ds2 folder, and a handful of tifxyz directories
 # from paths_2um_ds2/ and traces/ are pulled.
 #
 # Usage:
@@ -102,15 +102,15 @@ if (( USE_RCLONE )); then
   rclone copy "${SRC}" "$DEST" \
     --s3-provider AWS --s3-env-auth \
     --transfers 8 --size-only --fast-list \
-    --include "*.json" --max-depth 1 \
+    --filter "+ *.json" --filter "- *" --max-depth 1 \
     $( (( DRY_RUN )) && echo --dry-run )
 else
   aws_sync "" "$DEST" --exclude "*" --include "*.json" --no-progress
 fi
 
-# --- 2) normalgrids_2um_ds (full) -------------------------------------------
-echo "== normalgrids_2um_ds (full) =="
-pull_dir "normalgrids_2um_ds/"
+# --- 2) normalgrids_2um_ds2 (full) -------------------------------------------
+echo "== normalgrids_2um_ds2 (full) =="
+pull_dir "normalgrids_2um_ds2/"
 
 # --- 3) volumes/<vol>/ metadata only ----------------------------------------
 echo "== volumes (metadata only, chunks excluded) =="
@@ -122,9 +122,13 @@ if (( USE_RCLONE )); then
     v="${v%/}"
     [[ -z "$v" ]] && continue
     echo "  -> volumes/$v"
+    # --max-depth 2 caps the walk at <vol>.zarr/<level>/<file>, where
+    # the .zarray + meta.json live. Without it, rclone walks every chunk
+    # subdir under each level just to discover tiny metadata files.
     rclone_copy "volumes/${v}/" "$DEST/volumes/${v}/" \
-      --include "*.json" --include "*.zarray" --include "*.zgroup" --include "*.zattrs" \
-      --exclude "*"
+      --filter "+ *.json" --filter "+ *.zarray" --filter "+ *.zgroup" \
+      --filter "+ *.zattrs" --filter "- *" \
+      --max-depth 2
   done
 else
   aws_sync "volumes/" "$DEST/volumes/" \
@@ -133,54 +137,36 @@ else
     --no-progress
 fi
 
-# --- 4) Smallest N tifxyz dirs from paths_2um_ds2/ and traces/ --------------
-pull_smallest_tifxyz() {
+# --- 4) First N tifxyz dirs (alphabetically) from paths_2um_ds2/ and traces/
+# Note: we take the first N alphabetically rather than the smallest by size.
+# Per-dir `rclone size --json` calls were too slow on volpkgs with hundreds
+# of tifxyz dirs (one S3 listing per call); a single `rclone lsf --dirs-only`
+# is sub-second. Real tifxyz dirs at this resolution are uniformly small
+# enough that picking by name is fine for testing/benchmarking.
+pull_first_tifxyz() {
   local sub="$1"
-  echo "== ${sub} (${KEEP} smallest tifxyz dirs) =="
-  if ! (( USE_RCLONE )); then
-    # aws CLI cannot easily sort by size; fall back to alphabetical first N.
-    local names
+  echo "== ${sub} (${KEEP} first dirs alphabetically) =="
+  local names
+  if (( USE_RCLONE )); then
+    names=$(rclone lsf --dirs-only --max-depth 1 "${SRC}/${sub}/" \
+            --s3-provider AWS --s3-env-auth 2>/dev/null \
+            | sed 's:/$::' | sort | head -n "$KEEP" || true)
+  else
     names=$(aws s3 ls "s3://${SRC_BUCKET}/${SRC_KEY}/${sub}/" \
-            | awk '$1=="PRE"{print $2}' | sort | head -n "$KEEP")
-    for n in $names; do
-      n="${n%/}"
-      pull_dir "${sub}/${n}/"
-    done
-    return
+            | awk '$1=="PRE"{print $2}' | sed 's:/$::' | sort | head -n "$KEEP" || true)
   fi
-  # rclone path: enumerate dir sizes and take the smallest N.
-  local sizes
-  sizes=$(rclone size --json "${SRC}/${sub}/" \
-          --s3-provider AWS --s3-env-auth 2>/dev/null || true)
-  local children
-  children=$(rclone lsf --dirs-only --max-depth 1 "${SRC}/${sub}/" \
-             --s3-provider AWS --s3-env-auth 2>/dev/null || true)
-  if [[ -z "$children" ]]; then
+  if [[ -z "$names" ]]; then
     echo "  (no children under ${sub}/, skipping)"
     return
   fi
-  # For each child, query its size; sort ascending; take N.
-  local picks=()
-  while read -r name; do
-    name="${name%/}"
-    [[ -z "$name" ]] && continue
-    local b
-    b=$(rclone size "${SRC}/${sub}/${name}/" \
-        --s3-provider AWS --s3-env-auth --json 2>/dev/null \
-        | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p' | head -n1)
-    [[ -z "$b" ]] && b=0
-    picks+=("$b $name")
-  done <<<"$children"
-  printf '  candidates: %d\n' "${#picks[@]}"
-  local chosen
-  chosen=$(printf '%s\n' "${picks[@]}" | sort -n | head -n "$KEEP" | awk '{print $2}')
-  for n in $chosen; do
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
     echo "  -> ${sub}/${n}"
     pull_dir "${sub}/${n}/"
-  done
+  done <<<"$names"
 }
-pull_smallest_tifxyz "paths_2um_ds2"
-pull_smallest_tifxyz "traces"
+pull_first_tifxyz "paths_2um_ds2"
+pull_first_tifxyz "traces"
 
 # --- 5) Verifier -------------------------------------------------------------
 if (( DRY_RUN )); then
@@ -199,9 +185,9 @@ top_jsons=("$DEST"/*.json)
 shopt -u nullglob
 (( ${#top_jsons[@]} >= 1 )) || { echo "MISS: no top-level *.json under $DEST"; fail=1; }
 
-# normalgrids_2um_ds populated.
-ng_count=$(find "$DEST/normalgrids_2um_ds" -type f 2>/dev/null | wc -l | tr -d ' ')
-(( ng_count >= 1 )) || { echo "MISS: normalgrids_2um_ds empty"; fail=1; }
+# normalgrids_2um_ds2 populated.
+ng_count=$(find "$DEST/normalgrids_2um_ds2" -type f 2>/dev/null | wc -l | tr -d ' ')
+(( ng_count >= 1 )) || { echo "MISS: normalgrids_2um_ds2 empty"; fail=1; }
 
 # At least one .zarray under volumes/ (some Zarr volume metadata).
 zarray_count=$(find "$DEST/volumes" -name '.zarray' -o -name 'zarr.json' 2>/dev/null | wc -l | tr -d ' ')
@@ -229,3 +215,38 @@ if (( fail )); then
   exit 5
 fi
 echo "Verification OK: ${tifxyz_ok} tifxyz dirs, ${ng_count} normalgrid files, ${zarray_count} zarr metadata files."
+
+# --- 6) Convert legacy volpkg to .volpkg.json so VC3D can open it directly --
+# s1_ds2.volpkg ships as a legacy directory layout (config.json + folders);
+# vc_volpkg_convert writes a project JSON next to it that VolumePkg::load
+# accepts. Skip if a .volpkg.json already exists, or the binary is missing.
+shopt -s nullglob
+existing=("$DEST"/*.volpkg.json)
+shopt -u nullglob
+if (( ${#existing[@]} > 0 )); then
+  echo "(.volpkg.json already present; skipping convert)"
+else
+  vc_convert_bin=""
+  if command -v vc_volpkg_convert >/dev/null 2>&1; then
+    vc_convert_bin="$(command -v vc_volpkg_convert)"
+  else
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    for cand in "$here/../build-macos/bin/vc_volpkg_convert" \
+                "$here/../build/bin/vc_volpkg_convert" \
+                "$here/../build-macos-rel/bin/vc_volpkg_convert"; do
+      if [[ -x "$cand" ]]; then vc_convert_bin="$cand"; break; fi
+    done
+  fi
+  if [[ -n "$vc_convert_bin" ]]; then
+    out_name="$(basename "$DEST")"
+    case "$out_name" in
+      *.volpkg) out_name="${out_name%.volpkg}.volpkg.json" ;;
+      *)        out_name="${out_name}.volpkg.json" ;;
+    esac
+    echo "== converting legacy volpkg via $vc_convert_bin =="
+    "$vc_convert_bin" "$DEST" "$DEST/$out_name"
+  else
+    warn "vc_volpkg_convert not found on PATH or in build-macos/bin; "
+    warn "build VC3D first, then run: vc_volpkg_convert $DEST $DEST/<name>.volpkg.json"
+  fi
+fi
