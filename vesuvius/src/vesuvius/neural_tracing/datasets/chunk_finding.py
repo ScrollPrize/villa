@@ -14,7 +14,7 @@ from tqdm import tqdm
 from vesuvius.tifxyz import Tifxyz
 
 
-PATCH_FINDER_VERSION = 2
+PATCH_FINDER_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -196,7 +196,14 @@ def _assign_segment_to_chunks(
     valid = np.asarray(seg._valid_mask, dtype=bool)
     rows, cols = np.nonzero(valid)
     if rows.size == 0:
-        return [], {"empty": 1, "terminal_start": 0, "terminal_end": 0, "terminal_both": 0, "terminal_chunk_ids": set()}
+        return [], {
+            "empty": 1,
+            "terminal_start": 0,
+            "terminal_end": 0,
+            "terminal_both": 0,
+            "invalid_bbox": 0,
+            "terminal_chunk_ids": set(),
+        }
 
     z = np.asarray(seg._z[rows, cols], dtype=np.float64)
     y = np.asarray(seg._y[rows, cols], dtype=np.float64)
@@ -204,7 +211,14 @@ def _assign_segment_to_chunks(
     finite = np.isfinite(z) & np.isfinite(y) & np.isfinite(x)
     rows, cols, z, y, x = rows[finite], cols[finite], z[finite], y[finite], x[finite]
     if rows.size == 0:
-        return [], {"empty": 1, "terminal_start": 0, "terminal_end": 0, "terminal_both": 0, "terminal_chunk_ids": set()}
+        return [], {
+            "empty": 1,
+            "terminal_start": 0,
+            "terminal_end": 0,
+            "terminal_both": 0,
+            "invalid_bbox": 0,
+            "terminal_chunk_ids": set(),
+        }
 
     ranges_by_axis = [
         _chunk_id_ranges_for_points(
@@ -237,7 +251,14 @@ def _assign_segment_to_chunks(
         ]
 
     records = []
-    stats = {"empty": 0, "terminal_start": 0, "terminal_end": 0, "terminal_both": 0, "terminal_chunk_ids": set()}
+    stats = {
+        "empty": 0,
+        "terminal_start": 0,
+        "terminal_end": 0,
+        "terminal_both": 0,
+        "invalid_bbox": 0,
+        "terminal_chunk_ids": set(),
+    }
     for chunk_id, idx in grouped_items:
         exclusion = terminal_exclusions.get(chunk_id)
         if exclusion is not None:
@@ -251,15 +272,22 @@ def _assign_segment_to_chunks(
         zz = z[idx]
         yy = y[idx]
         xx = x[idx]
+        r_min = int(rr.min()) - int(bbox_pad_2d)
+        r_max = int(rr.max()) + int(bbox_pad_2d)
+        c_min = int(cc.min()) - int(bbox_pad_2d)
+        c_max = int(cc.max()) + int(bbox_pad_2d)
+        seg_h, seg_w = valid.shape
+        r0 = max(0, r_min)
+        r1 = min(seg_h - 1, r_max)
+        c0 = max(0, c_min)
+        c1 = min(seg_w - 1, c_max)
+        if r1 < r0 or c1 < c0 or not bool(valid[r0:r1 + 1, c0:c1 + 1].all()):
+            stats["invalid_bbox"] += 1
+            continue
         records.append({
             "chunk_id": tuple(int(v) for v in chunk_id),
             "segment_idx": int(segment_idx),
-            "bbox_2d": (
-                int(rr.min()) - int(bbox_pad_2d),
-                int(rr.max()) + int(bbox_pad_2d),
-                int(cc.min()) - int(bbox_pad_2d),
-                int(cc.max()) + int(bbox_pad_2d),
-            ),
+            "bbox_2d": (r_min, r_max, c_min, c_max),
             "world_bbox": (
                 float(zz.min()), float(zz.max()),
                 float(yy.min()), float(yy.max()),
@@ -364,6 +392,7 @@ def find_training_chunks(
         "wraps_dropped_terminal_start": 0,
         "wraps_dropped_terminal_end": 0,
         "wraps_dropped_terminal_both": 0,
+        "wraps_dropped_invalid_bbox": 0,
         "chunks_dropped_after_terminal_filter": 0,
         "chunks_without_neighboring_wraps": 0,
     }
@@ -393,6 +422,7 @@ def find_training_chunks(
         stats["wraps_dropped_terminal_start"] += segment_stats["terminal_start"]
         stats["wraps_dropped_terminal_end"] += segment_stats["terminal_end"]
         stats["wraps_dropped_terminal_both"] += segment_stats["terminal_both"]
+        stats["wraps_dropped_invalid_bbox"] += segment_stats["invalid_bbox"]
         terminal_dropped_chunk_ids.update(segment_stats.get("terminal_chunk_ids", set()))
         for wrap in wraps:
             wrap["wrap_label"] = int(record.wrap_label)
