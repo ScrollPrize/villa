@@ -2668,10 +2668,23 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     }
 
     auto vpkg = _state->vpkg();
-    const QString volpkgDir = QString::fromStdString(vpkg->getVolpkgDirectory());
+    // Use the volpkg's resolved output-segments path so it works for
+    // both the `<volpkg-dir>/<segdir>` layout and the freshly-introduced
+    // .volpkg.json form where the project file lives outside the data
+    // directory and segment locations are relative.
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("No active segmentation directory; pick one "
+                                "before running merge."));
+        return;
+    }
+    const QString pathsDir = QString::fromStdString(resolvedSeg.string());
+    // The merge.json + output dir live alongside the resolved segments
+    // dir (the actual volpkg data root), not the .volpkg.json directory.
+    const QString volpkgDir = QString::fromStdString(
+        resolvedSeg.parent_path().string());
     const std::string segDirName = vpkg->getSegmentationDirectory();
-    const QString pathsDir = QString::fromStdString(
-        (std::filesystem::path(vpkg->getVolpkgDirectory()) / segDirName).string());
 
     QStringList availableSegments;
     {
@@ -2695,6 +2708,7 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     }
 
     _cmdRunner->setMergeParams(dlg.mergeJsonPath(),
+                               pathsDir,
                                dlg.refSurface(),
                                dlg.ransacIters(),
                                dlg.ransacMinThresh(),

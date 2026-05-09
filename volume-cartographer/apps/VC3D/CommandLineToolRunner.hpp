@@ -75,8 +75,12 @@ public:
                                const QString& outputDir,
                                const QString& resumeOpt);
     // vc_merge_tifxyz: only --merge is required; the remaining args are
-    // RANSAC + blend tunables that all have working defaults.
+    // RANSAC + blend tunables that all have working defaults. pathsDir
+    // is forwarded as --paths-dir so the volpkg's actual segments
+    // directory (e.g. paths_2um_ds2/, traces/) is used instead of the
+    // tool's `<merge.parent>/paths` default.
     void setMergeParams(const QString& mergeJsonPath,
+                        const QString& pathsDir,
                         const QString& refSurface,
                         int ransacIters,
                         double ransacMinThresh,
@@ -182,6 +186,7 @@ private:
 
     // vc_merge_tifxyz parameters
     QString _mergeJsonPath;
+    QString _mergePathsDir;
     QString _mergeRefSurface;
     int     _mergeRansacIters{3000};
     double  _mergeRansacMinThresh{5.0};

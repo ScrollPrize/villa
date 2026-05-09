@@ -652,6 +652,12 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             break;
         case Tool::MergeTifxyz:
             args << "--merge" << _mergeJsonPath;
+            // The tool defaults paths-dir to <merge.parent>/paths; pass
+            // the resolved segments dir (e.g. paths_2um_ds2/) explicitly
+            // so this works regardless of the volpkg's directory layout.
+            if (!_mergePathsDir.isEmpty()) {
+                args << "--paths-dir" << _mergePathsDir;
+            }
             // Empty refSurface -> let vc_merge_tifxyz auto-pick the
             // surface with the largest valid-cell count. Otherwise pass
             // the user's pick straight through.
@@ -729,6 +735,7 @@ QString CommandLineToolRunner::getOutputPath() const
 }
 
 void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
+                                           const QString& pathsDir,
                                            const QString& refSurface,
                                            int ransacIters,
                                            double ransacMinThresh,
@@ -739,6 +746,7 @@ void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
                                            int stripCols)
 {
     _mergeJsonPath        = mergeJsonPath;
+    _mergePathsDir        = pathsDir;
     _mergeRefSurface      = refSurface;
     _mergeRansacIters     = ransacIters;
     _mergeRansacMinThresh = ransacMinThresh;

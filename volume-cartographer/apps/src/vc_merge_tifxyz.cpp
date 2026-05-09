@@ -1642,10 +1642,15 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
     GMAlignState st;
     st.merge_path = merge_path;
     st.cfg        = std::move(cfg);
-    st.cfg.paths_dir = merge_path.parent_path() / "paths";
+    // Preserve a caller-supplied paths_dir (e.g. --paths-dir from the CLI
+    // or the GUI handler); fall back to <merge.parent>/paths only when
+    // unset, matching the legacy default.
+    if (st.cfg.paths_dir.empty())
+        st.cfg.paths_dir = merge_path.parent_path() / "paths";
     if (!fs::is_directory(st.cfg.paths_dir))
-        throw std::runtime_error("expected " + st.cfg.paths_dir.string() +
-            " (sibling of " + merge_path.string() + ") to be a directory");
+        throw std::runtime_error("expected paths_dir " +
+            st.cfg.paths_dir.string() + " to be a directory (override "
+            "with --paths-dir, default is <merge.parent>/paths)");
 
     std::cout << "[0/6] grid -> surfaces+edges from " << merge_path << "\n";
     gmResolveGrid(merge_path, st.cfg.paths_dir, st.cfg.surfaces, st.cfg.edges);
@@ -2148,8 +2153,14 @@ int main(int argc, char** argv)
     desc.add_options()
         ("help,h", "print help")
         ("merge,m", po::value<std::string>(),
-         "Path to <volpkg>/merge.json (required). The volpkg dir is its "
-         "parent and paths_dir is <volpkg>/paths.")
+         "Path to <volpkg>/merge.json (required). By default the volpkg "
+         "dir is its parent and paths_dir is <volpkg>/paths; pass "
+         "--paths-dir to override.")
+        ("paths-dir", po::value<std::string>()->default_value(""),
+         "Override the directory holding the input tifxyz subdirs. "
+         "Defaults to <merge.json parent>/paths. Useful when the volpkg "
+         "stores segments under a non-default name like paths_2um_ds2/ "
+         "or traces/, or when the merge.json lives outside the data dir.")
         ("obj2tifxyz", po::value<std::string>()->default_value(""),
          "Path to vc_obj2tifxyz_legacy. Default: sibling binary next to "
          "vc_merge_tifxyz, falling back to PATH lookup.")
@@ -2208,6 +2219,10 @@ int main(int argc, char** argv)
     cfg.ransac_mad_k          = vm["ransac-mad-k"].as<double>();
     cfg.ransac_seed           = vm["ransac-seed"].as<uint32_t>();
     cfg.anchor_cap            = vm["anchor-cap"].as<int>();
+    {
+        const std::string pd = vm["paths-dir"].as<std::string>();
+        if (!pd.empty()) cfg.paths_dir = fs::path(pd);
+    }
     const int strip_cols      = vm["strip-cols"].as<int>();
 
     try {
