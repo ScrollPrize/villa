@@ -39,6 +39,19 @@ add_executable(test_merge_grid_resolve test_merge_grid_resolve.cpp)
 target_link_libraries(test_merge_grid_resolve PRIVATE doctest::doctest vc_merge_grid)
 add_test(NAME test_merge_grid_resolve COMMAND test_merge_grid_resolve)
 
+# End-to-end test that spawns the built vc_merge_tifxyz binary on two
+# synthetic 16x16 tifxyz dirs. Opt-in via VC_RUN_E2E=1; the test skips
+# itself if unset, so the default ctest run stays fast.
+add_executable(test_merge_e2e_small test_merge_e2e_small.cpp)
+target_link_libraries(test_merge_e2e_small PRIVATE doctest::doctest vc_core nlohmann_json::nlohmann_json)
+if(VC_RUN_E2E)
+    add_test(NAME test_merge_e2e_small COMMAND test_merge_e2e_small)
+    # The binary path probe in the test prefers VC_MERGE_TIFXYZ_BIN, so
+    # CTest runs reliably regardless of the working directory.
+    set_tests_properties(test_merge_e2e_small PROPERTIES
+        ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>")
+endif()
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 # Bench has a generous wall-clock assertion; not part of default ctest
