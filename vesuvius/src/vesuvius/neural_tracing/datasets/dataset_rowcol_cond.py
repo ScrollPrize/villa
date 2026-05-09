@@ -5,10 +5,9 @@ import torch
 import time
 from torch.utils.data import Dataset
 from pathlib import Path
+from tqdm import tqdm
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
-    _compute_wrap_order_stats,
-    _extract_wrap_ids,
     _prepare_cond_surface_keypoints,
     _parse_z_range,
     _read_volume_crop_from_patch,
@@ -16,14 +15,13 @@ from vesuvius.neural_tracing.datasets.common import (
     _segment_overlaps_z_range,
     _should_attempt_cond_local_perturb,
     _trim_to_world_bbox,
-    _triplet_wraps_compatible,
-    _upsample_world_triplet,
+    _upsample_world_surface,
     _validate_result_tensors,
     open_zarr_group,
     voxelize_surface_grid,
     voxelize_surface_grid_into,
 )
-from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
+from vesuvius.neural_tracing.datasets.chunk_finding import find_training_chunks
 from vesuvius.neural_tracing.datasets.direction_helpers import (
     build_split_surface_masks_and_trace_targets,
 )
@@ -33,7 +31,7 @@ from vesuvius.neural_tracing.datasets.copy_neighbor_targets import (
 from vesuvius.neural_tracing.datasets.augmentation import (
     augment_split_payload,
 )
-from vesuvius.neural_tracing.datasets.triplet_resampling import (
+from vesuvius.neural_tracing.datasets.neighbor_resampling import (
     choose_replacement_index,
 )
 from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
@@ -92,9 +90,14 @@ class EdtSegDataset(Dataset):
 
         if patch_metadata is None:
             patches = []
-            for dataset_idx, dataset in enumerate(config['datasets']):
+            dataset_iter = tqdm(
+                list(enumerate(config['datasets'])),
+                desc="Patch finding datasets",
+            )
+            for dataset_idx, dataset in dataset_iter:
                 volume_path = dataset['volume_path']
                 volume_scale = dataset['volume_scale']
+                dataset_iter.set_postfix_str(f"dataset_idx={dataset_idx}")
                 volume = open_zarr_group(
                     volume_path,
                     auth_json_path=dataset.get('volume_auth_json'),
@@ -102,12 +105,21 @@ class EdtSegDataset(Dataset):
                 )
                 segments_path = dataset['segments_path']
                 z_range = _parse_z_range(dataset.get('z_range', None))
-                dataset_segments = list(tifxyz.load_folder(segments_path))
+                dataset_segments = list(tqdm(
+                    tifxyz.load_folder(segments_path),
+                    desc=f"Loading segments dataset {dataset_idx}",
+                    unit="segment",
+                ))
 
                 # retarget to the proper scale
                 retarget_factor = 2 ** volume_scale
                 scaled_segments = []
-                for i, seg in enumerate(dataset_segments):
+                segment_iter = tqdm(
+                    dataset_segments,
+                    desc=f"Retarget/filter segments dataset {dataset_idx}",
+                    unit="segment",
+                )
+                for seg in segment_iter:
                     seg_scaled = seg if retarget_factor == 1 else seg.retarget(retarget_factor)
                     if not _segment_overlaps_z_range(seg_scaled, z_range):
                         continue
@@ -131,65 +143,79 @@ class EdtSegDataset(Dataset):
                 min_points_per_wrap = max(1, int(round(
                     float(config['min_points_per_wrap']) * count_scale_sq
                 )))
-                edge_touch_min_count = max(1, int(round(
-                    float(config['edge_touch_min_count']) * count_scale_sq
-                )))
-
 
                 cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
-                chunk_results = find_world_chunk_patches(
+                chunk_results = find_training_chunks(
                     segments=scaled_segments,
+                    volume=volume,
+                    scale=volume_scale,
                     target_size=self.crop_size,
                     overlap_fraction=config['overlap_fraction'],
-                    min_span_ratio=config['min_span_ratio'],
-                    edge_touch_frac=config['edge_touch_frac'],
-                    edge_touch_min_count=edge_touch_min_count,
-                    edge_touch_pad=config['edge_touch_pad'],
                     min_points_per_wrap=min_points_per_wrap,
                     bbox_pad_2d=config['bbox_pad_2d'],
-                    require_all_valid_in_bbox=config['require_all_valid_in_bbox'],
-                    skip_chunk_if_any_invalid=config['skip_chunk_if_any_invalid'],
-                    inner_bbox_fraction=config['inner_bbox_fraction'],
                     cache_dir=cache_dir,
                     force_recompute=config['force_recompute_patches'],
                     verbose=config.get('verbose', False),
                     chunk_pad=config.get('chunk_pad', 0.0),
+                    terminal_chunk_guard_voxels=config.get('terminal_chunk_guard_voxels', None),
+                    training_mode=config.get('training_mode', 'rowcol_hidden'),
                 )
 
-                for chunk in chunk_results:
+                for chunk in tqdm(
+                    chunk_results,
+                    desc=f"Materializing chunk metadata dataset {dataset_idx}",
+                    unit="chunk",
+                ):
+                    if bool(chunk.get("no_neighboring_wraps", False)):
+                        continue
+                    neighbor_sets = {
+                        int(k): tuple(int(v) for v in values)
+                        for k, values in chunk.get("neighbor_sets", {}).items()
+                    }
                     wraps_in_chunk = []
                     for w in chunk["wraps"]:
                         seg_idx = w["segment_idx"]
+                        wrap_idx = int(w.get("wrap_idx", len(wraps_in_chunk)))
                         wraps_in_chunk.append({
                             "segment": scaled_segments[seg_idx],
                             "bbox_2d": tuple(w["bbox_2d"]),
                             "wrap_id": w["wrap_id"],
+                            "wrap_label": int(w.get("wrap_label", w["wrap_id"])),
+                            "wrap_idx": wrap_idx,
                             "segment_idx": seg_idx,
+                            "neighbor_wrap_indices": neighbor_sets.get(wrap_idx, tuple()),
                         })
 
-                    patches.append(ChunkPatch(
+                    patch = ChunkPatch(
                         chunk_id=tuple(chunk["chunk_id"]),
                         volume=volume,
                         scale=volume_scale,
                         world_bbox=tuple(chunk["bbox_3d"]),
                         wraps=wraps_in_chunk,
                         segments=scaled_segments,
-                    ))
+                        dataset_idx=dataset_idx,
+                    )
+                    patch.neighbor_sets = neighbor_sets
+                    patch.eligible_source_wrap_indices = tuple(
+                        int(v) for v in chunk.get("eligible_source_wrap_indices", ())
+                    )
+                    patches.append(patch)
 
             self.patches = patches
             self.sample_index = self._build_sample_index()
-            self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
-            self.sample_index = [
-                (patch_idx, wrap_idx)
-                for patch_idx, wrap_idx in self.sample_index
-                if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
-            ]
-            if not self.sample_index:
-                raise ValueError("No wraps have same/adjacent neighbors on both sides.")
+            self._neighbor_lookup = self._build_neighbor_lookup()
             if str(self.config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
                 self.sample_index = self._build_copy_neighbor_pair_records(self.sample_index)
                 if not self.sample_index:
                     raise ValueError("No copy_neighbors source-target pair records remain after filtering.")
+            else:
+                self.sample_index = [
+                    (patch_idx, wrap_idx)
+                    for patch_idx, wrap_idx in self.sample_index
+                    if self._has_lower_and_upper_neighbors(patch_idx, wrap_idx)
+                ]
+                if not self.sample_index:
+                    raise ValueError("No wraps have adjacent neighbors on both sides.")
             spec = self.config['cond_percent']
             self._cond_percent_min, self._cond_percent_max = float(spec[0]), float(spec[1])
         else:
@@ -201,76 +227,60 @@ class EdtSegDataset(Dataset):
     def _build_sample_index(self):
         sample_index = []
         for patch_idx, patch in enumerate(self.patches):
-            for wrap_idx in range(len(patch.wraps)):
+            eligible = getattr(patch, "eligible_source_wrap_indices", None)
+            wrap_indices = eligible if eligible is not None else range(len(patch.wraps))
+            for wrap_idx in wrap_indices:
                 sample_index.append((patch_idx, wrap_idx))
         return sample_index
 
     def _load_patch_metadata(self, patch_metadata):
         self.patches = patch_metadata['patches']
         self.sample_index = list(patch_metadata['sample_index'])
-        self._triplet_neighbor_lookup = patch_metadata.get('triplet_neighbor_lookup', {})
+        self._neighbor_lookup = patch_metadata.get('neighbor_lookup', {})
         self._cond_percent_min, self._cond_percent_max = patch_metadata['cond_percent']
 
     def export_patch_metadata(self):
         return {
             'patches': self.patches,
             'sample_index': tuple(self.sample_index),
-            'triplet_neighbor_lookup': self._triplet_neighbor_lookup,
+            'neighbor_lookup': self._neighbor_lookup,
             'cond_percent': (self._cond_percent_min, self._cond_percent_max),
         }
 
-    def _build_copy_neighbor_pair_records(self, triplet_middle_index):
-        source_filter = str(self.config.get("copy_neighbor_source_position", "random"))
+    def _build_copy_neighbor_pair_records(self, source_index):
         target_filter = str(self.config.get("copy_neighbor_target_side", "random"))
         record_mode = str(self.config.get("copy_neighbor_pair_record_mode", "all_directed"))
         seed = int(self.config.get("seed", 0)) + int(self.config.get("copy_neighbor_pair_seed_offset", 0))
 
         records = []
-        for patch_idx, middle_wrap_idx in triplet_middle_index:
-            triplet_meta = self._triplet_neighbor_lookup[(patch_idx, middle_wrap_idx)]
-            behind_wrap_idx = int(triplet_meta["behind_wrap_idx"])
-            middle_wrap_idx = int(middle_wrap_idx)
-            front_wrap_idx = int(triplet_meta["front_wrap_idx"])
-            position_to_wrap = {
-                "behind": behind_wrap_idx,
-                "middle": middle_wrap_idx,
-                "front": front_wrap_idx,
-            }
-            candidates = [
-                ("behind", "middle", "front"),
-                ("middle", "behind", "behind"),
-                ("middle", "front", "front"),
-                ("front", "middle", "behind"),
-            ]
-            triplet_records = []
-            for source_pos, target_pos, target_side in candidates:
-                if source_filter != "random" and source_pos != source_filter:
+        for patch_idx, source_wrap_idx in source_index:
+            neighbor_meta = self._neighbor_lookup.get((patch_idx, source_wrap_idx))
+            if neighbor_meta is None:
+                continue
+            source_wrap_idx = int(source_wrap_idx)
+            pair_records = []
+            for target_wrap_idx in neighbor_meta["neighbor_wrap_indices"]:
+                target_wrap_idx = int(target_wrap_idx)
+                if target_wrap_idx == source_wrap_idx:
                     continue
+                target_side = self._neighbor_side(patch_idx, source_wrap_idx, target_wrap_idx)
                 if target_filter != "random" and target_side != target_filter:
                     continue
-                if source_pos == target_pos:
-                    continue
-                triplet_records.append({
+                pair_records.append({
                     "patch_idx": int(patch_idx),
-                    "middle_wrap_idx": int(middle_wrap_idx),
-                    "source_wrap_idx": int(position_to_wrap[source_pos]),
-                    "target_wrap_idx": int(position_to_wrap[target_pos]),
-                    "source_triplet_pos": source_pos,
+                    "source_wrap_idx": int(source_wrap_idx),
+                    "target_wrap_idx": int(target_wrap_idx),
                     "target_side": target_side,
-                    "triplet_wrap_indices": (
-                        int(behind_wrap_idx),
-                        int(middle_wrap_idx),
-                        int(front_wrap_idx),
-                    ),
+                    "neighbor_wrap_indices": tuple(int(v) for v in neighbor_meta["neighbor_wrap_indices"]),
                 })
 
-            if record_mode == "one_per_triplet" and triplet_records:
-                key = f"{seed}:{patch_idx}:{middle_wrap_idx}".encode("utf8")
+            if record_mode == "one_per_source" and pair_records:
+                key = f"{seed}:{patch_idx}:{source_wrap_idx}".encode("utf8")
                 digest = hashlib.sha256(key).digest()
-                chosen = int.from_bytes(digest[:8], "little") % len(triplet_records)
-                records.append(triplet_records[chosen])
+                chosen = int.from_bytes(digest[:8], "little") % len(pair_records)
+                records.append(pair_records[chosen])
             else:
-                records.extend(triplet_records)
+                records.extend(pair_records)
         return records
 
     @staticmethod
@@ -309,71 +319,45 @@ class EdtSegDataset(Dataset):
         profile["success_rate"] = float(successes) / max(attempts, 1)
         return profile
 
-    def _build_triplet_neighbor_lookup(self):
-        """Build (patch_idx, wrap_idx) -> neighbor-wrap metadata for triplet mode.
-
-        A wrap is kept only when it has one compatible neighbor on each side in
-        local wrap ordering. The same lookup also provides neighbor-sheet context
-        for trace-validity targets.
-        """
+    def _build_neighbor_lookup(self):
+        """Build (patch_idx, wrap_idx) -> precomputed neighbor-wrap metadata."""
         lookup = {}
         for patch_idx, patch in enumerate(self.patches):
-            wrap_stats = []
             for wrap_idx, wrap in enumerate(patch.wraps):
-                s = _compute_wrap_order_stats(wrap)
-                if s is None:
+                neighbor_indices = tuple(int(v) for v in wrap.get("neighbor_wrap_indices", ()))
+                if not neighbor_indices:
                     continue
-                seg = wrap.get("segment")
-                seg_path = getattr(seg, "path", None)
-                seg_name = Path(seg_path).name if seg_path is not None else ""
-                wrap_ids = _extract_wrap_ids(seg_name)
-                if not wrap_ids:
-                    wrap_ids = _extract_wrap_ids(getattr(seg, "uuid", ""))
-                wrap_stats.append({
-                    "wrap_idx": wrap_idx,
-                    "segment_idx": int(wrap["segment_idx"]),
-                    "wrap_ids": wrap_ids,
-                    "x_median": s["x_median"],
-                    "y_median": s["y_median"],
-                })
-
-            if len(wrap_stats) < 3:
-                continue
-
-            x_medians = np.array([s["x_median"] for s in wrap_stats], dtype=np.float32)
-            y_medians = np.array([s["y_median"] for s in wrap_stats], dtype=np.float32)
-            x_spread = float(np.max(x_medians) - np.min(x_medians))
-            y_spread = float(np.max(y_medians) - np.min(y_medians))
-            order_axis = "x" if x_spread >= y_spread else "y"
-
-            if order_axis == "x":
-                ordered = sorted(wrap_stats, key=lambda s: (s["x_median"], s["wrap_idx"]))
-            else:
-                ordered = sorted(wrap_stats, key=lambda s: (s["y_median"], s["wrap_idx"]))
-
-            for pos, target in enumerate(ordered):
-                prev_neighbor = None
-                for left_pos in range(pos - 1, -1, -1):
-                    candidate = ordered[left_pos]
-                    if _triplet_wraps_compatible(target, candidate):
-                        prev_neighbor = candidate
-                        break
-
-                next_neighbor = None
-                for right_pos in range(pos + 1, len(ordered)):
-                    candidate = ordered[right_pos]
-                    if _triplet_wraps_compatible(target, candidate):
-                        next_neighbor = candidate
-                        break
-
-                if prev_neighbor is None or next_neighbor is None:
-                    continue
-
-                lookup[(patch_idx, target["wrap_idx"])] = {
-                    "behind_wrap_idx": int(prev_neighbor["wrap_idx"]),
-                    "front_wrap_idx": int(next_neighbor["wrap_idx"]),
+                source_label = int(wrap.get("wrap_label", wrap.get("wrap_id", -1)))
+                lower = [
+                    idx for idx in neighbor_indices
+                    if int(patch.wraps[idx].get("wrap_label", patch.wraps[idx].get("wrap_id", -1))) < source_label
+                ]
+                upper = [
+                    idx for idx in neighbor_indices
+                    if int(patch.wraps[idx].get("wrap_label", patch.wraps[idx].get("wrap_id", -1))) > source_label
+                ]
+                selected = tuple([int(lower[0])] if lower else []) + tuple([int(upper[0])] if upper else [])
+                lookup[(patch_idx, wrap_idx)] = {
+                    "neighbor_wrap_indices": tuple(int(v) for v in neighbor_indices),
+                    "lower_neighbor_wrap_indices": tuple(int(v) for v in lower),
+                    "upper_neighbor_wrap_indices": tuple(int(v) for v in upper),
+                    "rowcol_neighbor_wrap_indices": selected,
                 }
         return lookup
+
+    def _has_lower_and_upper_neighbors(self, patch_idx: int, wrap_idx: int) -> bool:
+        neighbor_meta = self._neighbor_lookup.get((int(patch_idx), int(wrap_idx)))
+        if neighbor_meta is None:
+            return False
+        return bool(neighbor_meta["lower_neighbor_wrap_indices"]) and bool(neighbor_meta["upper_neighbor_wrap_indices"])
+
+    def _neighbor_side(self, patch_idx: int, source_wrap_idx: int, target_wrap_idx: int) -> str:
+        patch = self.patches[int(patch_idx)]
+        source = patch.wraps[int(source_wrap_idx)]
+        target = patch.wraps[int(target_wrap_idx)]
+        source_label = int(source.get("wrap_label", source.get("wrap_id", -1)))
+        target_label = int(target.get("wrap_label", target.get("wrap_id", -1)))
+        return "lower" if target_label < source_label else "upper"
 
     def _extract_wrap_world_surface(self, patch: ChunkPatch, wrap: dict):
         """Extract one wrap as upsampled world-coordinate [H, W, 3] (ZYX)."""
@@ -397,7 +381,7 @@ class EdtSegDataset(Dataset):
             if not valid_s.all():
                 return None
 
-        x_full, y_full, z_full = _upsample_world_triplet(x_s, y_s, z_s, scale_y, scale_x)
+        x_full, y_full, z_full = _upsample_world_surface(x_s, y_s, z_s, scale_y, scale_x)
         trimmed = _trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
         if trimmed is None:
             return None
@@ -434,41 +418,6 @@ class EdtSegDataset(Dataset):
             return None
         return cond_seg
 
-    def _surface_crop_support_ok(self, surface_local, *, allow_partial: bool = False):
-        if bool(allow_partial):
-            return True, "partial surface allowed"
-        surface = np.asarray(surface_local, dtype=np.float32)
-        if surface.ndim != 3 or int(surface.shape[-1]) != 3:
-            return False, "surface shape invalid"
-        finite = np.isfinite(surface).all(axis=-1)
-        in_crop = (
-            finite
-            & (surface[..., 0] >= 0.0)
-            & (surface[..., 1] >= 0.0)
-            & (surface[..., 2] >= 0.0)
-            & (surface[..., 0] <= self.crop_size[0] - 1)
-            & (surface[..., 1] <= self.crop_size[1] - 1)
-            & (surface[..., 2] <= self.crop_size[2] - 1)
-        )
-        min_valid_fraction = float(self.config.get("copy_neighbor_min_in_crop_valid_fraction", 0.25))
-        valid_fraction = float(in_crop.mean()) if in_crop.size else 0.0
-        if valid_fraction < min_valid_fraction:
-            return False, f"in-crop fraction {valid_fraction:.3f} below {min_valid_fraction:.3f}"
-
-        strip_width = max(1, int(self.config.get("copy_neighbor_surface_edge_strip_width", 2)))
-        edge_valid_frac = float(self.config.get("copy_neighbor_surface_edge_valid_frac", 0.10))
-        row_strip = min(strip_width, in_crop.shape[0])
-        col_strip = min(strip_width, in_crop.shape[1])
-        row_low = float(in_crop[:row_strip].mean()) if row_strip > 0 else 0.0
-        row_high = float(in_crop[-row_strip:].mean()) if row_strip > 0 else 0.0
-        col_low = float(in_crop[:, :col_strip].mean()) if col_strip > 0 else 0.0
-        col_high = float(in_crop[:, -col_strip:].mean()) if col_strip > 0 else 0.0
-        row_spans = min(row_low, row_high) >= edge_valid_frac
-        col_spans = min(col_low, col_high) >= edge_valid_frac
-        if not (row_spans or col_spans):
-            return False, "surface does not span row or column edge strips"
-        return True, "ok"
-
     def create_copy_neighbor_masks(self, record: dict):
         patch_idx = int(record["patch_idx"])
         patch = self.patches[patch_idx]
@@ -479,25 +428,12 @@ class EdtSegDataset(Dataset):
         if source_world is None or target_world is None:
             return None
 
-        finite_source = np.isfinite(source_world).all(axis=-1)
-        if not bool(finite_source.any()):
-            return None
-        source_points = source_world[finite_source]
-        center = np.median(source_points, axis=0)
-        min_corner = np.round(center - 0.5 * np.asarray(self.crop_size, dtype=np.float32)).astype(np.int64)
+        z_min, _, y_min, _, x_min, _ = patch.world_bbox
+        min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
         max_corner = min_corner + np.asarray(self.crop_size, dtype=np.int64)
 
         source_local = (source_world - min_corner).astype(np.float32, copy=False)
         target_local = (target_world - min_corner).astype(np.float32, copy=False)
-        ok, _ = self._surface_crop_support_ok(source_local)
-        if not ok:
-            return None
-        target_ok, _ = self._surface_crop_support_ok(
-            target_local,
-            allow_partial=bool(self.config.get("copy_neighbor_allow_partial_target", False)),
-        )
-        if not target_ok:
-            return None
 
         vol_crop = _read_volume_crop_from_patch(
             patch,
@@ -614,14 +550,16 @@ class EdtSegDataset(Dataset):
         return result
 
     def _build_neighbor_sheet_mask(self, *, patch_idx: int, wrap_idx: int, min_corner, crop_shape, stage_times=None):
-        triplet_meta = self._triplet_neighbor_lookup.get((patch_idx, wrap_idx))
-        if triplet_meta is None:
+        neighbor_meta = self._neighbor_lookup.get((patch_idx, wrap_idx))
+        if neighbor_meta is None:
+            return None
+        neighbor_indices = tuple(int(v) for v in neighbor_meta.get("rowcol_neighbor_wrap_indices", ()))
+        if len(neighbor_indices) != 2:
             return None
 
         patch = self.patches[patch_idx]
         neighbor_vox = np.zeros(crop_shape, dtype=np.uint8)
-        for key in ("behind_wrap_idx", "front_wrap_idx"):
-            neighbor_wrap_idx = int(triplet_meta[key])
+        for neighbor_wrap_idx in neighbor_indices:
             extract_start = time.perf_counter() if stage_times is not None else 0.0
             neighbor_surface = self._extract_wrap_world_surface(
                 patch,
@@ -718,20 +656,6 @@ class EdtSegDataset(Dataset):
         target_surface_local = augmented["masked_surface_local"]
         source_np = source_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
         target_np = target_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
-
-        ok, _ = self._surface_crop_support_ok(source_np)
-        target_ok, _ = self._surface_crop_support_ok(
-            target_np,
-            allow_partial=bool(self.config.get("copy_neighbor_allow_partial_target", False)),
-        )
-        if not ok or not target_ok:
-            return self._resample_item(
-                idx,
-                "copy-neighbor augmented surface support failed",
-                patch_idx=patch_idx,
-                wrap_idx=source_wrap_idx,
-                attempted_indices=_attempted_indices,
-            )
 
         source_valid = np.isfinite(source_np).all(axis=-1)
         target_valid = np.isfinite(target_np).all(axis=-1)

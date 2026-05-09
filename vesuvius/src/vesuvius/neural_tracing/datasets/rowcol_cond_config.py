@@ -58,29 +58,18 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("copy_neighbor_endpoint_huber_beta", 2.0)
     config.setdefault("copy_neighbor_endpoint_max_distance", 32.0)
     config.setdefault("copy_neighbor_endpoint_detach_steps", False)
-    config.setdefault("copy_neighbor_source_position", "random")
     config.setdefault("copy_neighbor_target_side", "random")
     config.setdefault("copy_neighbor_pair_seed_offset", 0)
     config.setdefault("copy_neighbor_pair_record_mode", "all_directed")
     config.setdefault("copy_neighbor_source_center_mode", "bbox_center")
-    config.setdefault("copy_neighbor_min_in_crop_valid_fraction", 0.25)
-    config.setdefault("copy_neighbor_surface_edge_strip_width", 2)
-    config.setdefault("copy_neighbor_surface_edge_valid_frac", 0.10)
-    config.setdefault("copy_neighbor_allow_partial_target", False)
 
-    # Patch-finding defaults.
+    # Chunk-first patch-finding defaults.
     config.setdefault("overlap_fraction", 0.0)
-    config.setdefault("min_span_ratio", 1.0)
-    config.setdefault("edge_touch_frac", 0.1)
-    config.setdefault("edge_touch_min_count", 10)
-    config.setdefault("edge_touch_pad", 0)
     config.setdefault("min_points_per_wrap", 100)
     config.setdefault("scale_normalize_patch_counts", True)
     config.setdefault("patch_count_reference_scale", 0)
     config.setdefault("bbox_pad_2d", 0)
-    config.setdefault("require_all_valid_in_bbox", True)
-    config.setdefault("skip_chunk_if_any_invalid", False)
-    config.setdefault("inner_bbox_fraction", 0.7)
+    config.setdefault("terminal_chunk_guard_voxels", 20.0)
 
     cond_local_perturb = dict(config.get("cond_local_perturb") or {})
     cond_local_perturb.setdefault("enabled", True)
@@ -368,12 +357,10 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
             f"got {copy_neighbor_domain_builder!r}"
         )
 
-    if str(config.get("copy_neighbor_pair_record_mode", "all_directed")) not in {"all_directed", "one_per_triplet"}:
-        raise ValueError("copy_neighbor_pair_record_mode must be 'all_directed' or 'one_per_triplet'")
-    if str(config.get("copy_neighbor_source_position", "random")) not in {"random", "behind", "middle", "front"}:
-        raise ValueError("copy_neighbor_source_position must be random, behind, middle, or front")
-    if str(config.get("copy_neighbor_target_side", "random")) not in {"random", "behind", "front"}:
-        raise ValueError("copy_neighbor_target_side must be random, behind, or front")
+    if str(config.get("copy_neighbor_pair_record_mode", "all_directed")) not in {"all_directed", "one_per_source"}:
+        raise ValueError("copy_neighbor_pair_record_mode must be 'all_directed' or 'one_per_source'")
+    if str(config.get("copy_neighbor_target_side", "random")) not in {"random", "lower", "upper"}:
+        raise ValueError("copy_neighbor_target_side must be random, lower, or upper")
 
     for key in (
         "copy_neighbor_bridge_dilation_radius",

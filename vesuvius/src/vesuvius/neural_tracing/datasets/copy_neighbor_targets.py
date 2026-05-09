@@ -58,13 +58,17 @@ def _ball_structure(radius: float) -> np.ndarray:
 def _finite_in_crop(surface: np.ndarray, crop_size: tuple[int, int, int]) -> np.ndarray:
     surface = np.asarray(surface, dtype=np.float32)
     finite = np.isfinite(surface).all(axis=-1)
-    lower = (surface >= 0.0).all(axis=-1)
-    upper = (
-        (surface[..., 0] <= crop_size[0] - 1)
-        & (surface[..., 1] <= crop_size[1] - 1)
-        & (surface[..., 2] <= crop_size[2] - 1)
+    finite_surface = np.where(np.isfinite(surface), surface, 0.0)
+    rounded = np.rint(finite_surface).astype(np.int64)
+    in_bounds = (
+        (rounded[..., 0] >= 0)
+        & (rounded[..., 0] < crop_size[0])
+        & (rounded[..., 1] >= 0)
+        & (rounded[..., 1] < crop_size[1])
+        & (rounded[..., 2] >= 0)
+        & (rounded[..., 2] < crop_size[2])
     )
-    return finite & lower & upper
+    return finite & in_bounds
 
 
 def _voxelize(surface: np.ndarray, crop_size: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray]:

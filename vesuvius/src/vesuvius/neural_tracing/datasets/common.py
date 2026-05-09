@@ -983,7 +983,7 @@ def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
     return (dist_inside - dist_outside).astype(np.float32, copy=False)
 
 
-def _upsample_world_triplet(x_s, y_s, z_s, scale_y: float, scale_x: float):
+def _upsample_world_surface(x_s, y_s, z_s, scale_y: float, scale_x: float):
     """Upsample (x, y, z) sampled grids using tifxyz interpolation."""
     h_s, w_s = x_s.shape
     h_up = int(round(h_s / scale_y))
