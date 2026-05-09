@@ -32,6 +32,13 @@ add_executable(test_atomic_imwrite_multi test_atomic_imwrite_multi.cpp)
 target_link_libraries(test_atomic_imwrite_multi PRIVATE doctest::doctest vc_core)
 add_test(NAME test_atomic_imwrite_multi COMMAND test_atomic_imwrite_multi)
 
+# Parser-only regression tests for vc_merge_tifxyz: link the small static
+# lib that holds gmResolveGrid + gmCheckConnected so the failure-message
+# assertions are exact, without spawning the binary.
+add_executable(test_merge_grid_resolve test_merge_grid_resolve.cpp)
+target_link_libraries(test_merge_grid_resolve PRIVATE doctest::doctest vc_merge_grid)
+add_test(NAME test_merge_grid_resolve COMMAND test_merge_grid_resolve)
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 # Bench has a generous wall-clock assertion; not part of default ctest
