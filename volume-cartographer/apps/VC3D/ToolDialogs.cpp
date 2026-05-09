@@ -1615,3 +1615,594 @@ void VisLasagnaObjDialog::updateSessionFromUI()
     s_mesh = chkMesh_->isChecked();
     s_conn = chkConn_->isChecked();
 }
+
+// ============================================================================
+// MergeTifxyzDialog
+//
+// Edits a 2D grid of tifxyz directory names plus the RANSAC tunables for
+// vc_merge_tifxyz, writes a merge.json into <volpkg>/, and exposes the
+// path + tunables to the caller. Each cell holds a name resolved against
+// <volpkg>/<paths_dir>/. Empty cells are allowed; adjacency in the grid
+// drives RANSAC alignment.
+// ============================================================================
+
+#include <QHeaderView>
+#include <QInputDialog>
+#include <QListWidget>
+#include <QSet>
+#include <QTableWidget>
+
+#include <algorithm>
+#include <fstream>
+
+bool   MergeTifxyzDialog::s_haveSession = false;
+int    MergeTifxyzDialog::s_iters       = 3000;
+double MergeTifxyzDialog::s_min         = 5.0;
+double MergeTifxyzDialog::s_max         = 10.0;
+double MergeTifxyzDialog::s_madK        = 3.0;
+int    MergeTifxyzDialog::s_seed        = 0;
+int    MergeTifxyzDialog::s_anchorCap   = 0;
+int    MergeTifxyzDialog::s_stripCols   = 0;
+int    MergeTifxyzDialog::s_lastRows    = 0;
+int    MergeTifxyzDialog::s_lastCols    = 0;
+int    MergeTifxyzDialog::s_ompThreads  = -1;
+
+namespace {
+
+// Layout: row-major, take ceil(sqrt(N)) columns so the seed selection
+// fits a roughly-square block (matches typical scroll segment topology
+// where the user picks adjacent overlapping patches).
+QPair<int, int> defaultGridShape(int n)
+{
+    if (n <= 0) return {1, 1};
+    int cols = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(n))));
+    int rows = (n + cols - 1) / cols;
+    return {std::max(1, rows), std::max(1, cols)};
+}
+
+QString alphaFirst(const QStringList& names)
+{
+    QString out;
+    for (const auto& n : names) {
+        if (n.isEmpty()) continue;
+        if (out.isEmpty() || n < out) out = n;
+    }
+    return out;
+}
+
+QString resolveOutputName(const QString& volpkgDir, const QString& base)
+{
+    if (volpkgDir.isEmpty() || base.isEmpty()) return base;
+    namespace fs = std::filesystem;
+    const fs::path paths = fs::path(volpkgDir.toStdString()) / "paths";
+    auto exists = [&](const std::string& name) {
+        return fs::exists(paths / name);
+    };
+    if (!exists(base.toStdString())) return base;
+    for (int v = 2; v < 1000; ++v) {
+        QString candidate = base + QStringLiteral("_v%1").arg(v);
+        if (!exists(candidate.toStdString())) return candidate;
+    }
+    return base + QStringLiteral("_v?");
+}
+
+}
+
+MergeTifxyzDialog::MergeTifxyzDialog(QWidget* parent,
+                                     const QStringList& seedSegmentIds,
+                                     const QStringList& availableSegments,
+                                     const QString& volpkgDir,
+                                     const QString& pathsDir)
+    : QDialog(parent),
+      _availableSegments(availableSegments),
+      _volpkgDir(volpkgDir),
+      _pathsDir(pathsDir)
+{
+    setWindowTitle("Merge TIFXYZ Surfaces");
+    auto main = new QVBoxLayout(this);
+
+    // --- Grid editor -------------------------------------------------------
+    auto grpGrid = new QGroupBox("Layout (row-major; adjacency drives RANSAC alignment)", this);
+    auto gridLay = new QVBoxLayout(grpGrid);
+
+    tblGrid_ = new QTableWidget(grpGrid);
+    tblGrid_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    tblGrid_->verticalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    tblGrid_->setSelectionMode(QAbstractItemView::SingleSelection);
+
+    auto gridButtons = new QHBoxLayout();
+    btnAddRow_     = new QPushButton(tr("+ Row"), grpGrid);
+    btnAddCol_     = new QPushButton(tr("+ Col"), grpGrid);
+    btnRemoveRow_  = new QPushButton(tr("− Row"), grpGrid);
+    btnRemoveCol_  = new QPushButton(tr("− Col"), grpGrid);
+    btnAddSegments_ = new QPushButton(tr("Add segments..."), grpGrid);
+    gridButtons->addWidget(btnAddRow_);
+    gridButtons->addWidget(btnAddCol_);
+    gridButtons->addWidget(btnRemoveRow_);
+    gridButtons->addWidget(btnRemoveCol_);
+    gridButtons->addStretch(1);
+    gridButtons->addWidget(btnAddSegments_);
+
+    gridLay->addLayout(gridButtons);
+    gridLay->addWidget(tblGrid_);
+    main->addWidget(grpGrid, 1);
+
+    // --- Output / reference ------------------------------------------------
+    auto formTop = new QFormLayout();
+    cmbRef_ = new QComboBox(this);
+    cmbRef_->setEditable(false);
+    lblOutName_ = new QLabel(this);
+    lblOutName_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    formTop->addRow(tr("Reference surface:"), cmbRef_);
+    formTop->addRow(tr("Output:"), lblOutName_);
+    main->addLayout(formTop);
+
+    // --- Advanced ----------------------------------------------------------
+    auto grpAdv = new QGroupBox(tr("Advanced"), this);
+    grpAdv->setCheckable(true);
+    grpAdv->setChecked(false);
+    auto advForm = new QFormLayout(grpAdv);
+
+    spIters_ = new QSpinBox(grpAdv);
+    spIters_->setRange(1, 1'000'000);
+    spIters_->setValue(s_iters);
+    spIters_->setSingleStep(100);
+
+    spMin_ = new QDoubleSpinBox(grpAdv);
+    spMin_->setRange(0.1, 1000.0); spMin_->setDecimals(2); spMin_->setSingleStep(0.5);
+    spMin_->setValue(s_min);
+
+    spMax_ = new QDoubleSpinBox(grpAdv);
+    spMax_->setRange(0.1, 1000.0); spMax_->setDecimals(2); spMax_->setSingleStep(0.5);
+    spMax_->setValue(s_max);
+
+    spMadK_ = new QDoubleSpinBox(grpAdv);
+    spMadK_->setRange(0.1, 20.0); spMadK_->setDecimals(2); spMadK_->setSingleStep(0.1);
+    spMadK_->setValue(s_madK);
+
+    spSeed_ = new QSpinBox(grpAdv);
+    spSeed_->setRange(0, std::numeric_limits<int>::max());
+    spSeed_->setValue(s_seed);
+
+    spAnchorCap_ = new QSpinBox(grpAdv);
+    spAnchorCap_->setRange(0, 1'000'000);
+    spAnchorCap_->setValue(s_anchorCap);
+    spAnchorCap_->setToolTip(tr("0 = no cap"));
+
+    spStripCols_ = new QSpinBox(grpAdv);
+    spStripCols_->setRange(0, 1024);
+    spStripCols_->setValue(s_stripCols);
+    spStripCols_->setToolTip(tr("0 = single-pass blend"));
+
+    edtThreads_ = new QLineEdit(grpAdv);
+    edtThreads_->setPlaceholderText(tr("optional"));
+    edtThreads_->setValidator(new QRegularExpressionValidator(
+        QRegularExpression("^\\s*\\d*\\s*$"), edtThreads_));
+    if (s_ompThreads > 0) edtThreads_->setText(QString::number(s_ompThreads));
+
+    advForm->addRow(tr("RANSAC iterations:"), spIters_);
+    advForm->addRow(tr("RANSAC min threshold (vox):"), spMin_);
+    advForm->addRow(tr("RANSAC max threshold (vox):"), spMax_);
+    advForm->addRow(tr("RANSAC MAD k:"), spMadK_);
+    advForm->addRow(tr("RANSAC seed (0 = random):"), spSeed_);
+    advForm->addRow(tr("Anchor cap:"), spAnchorCap_);
+    advForm->addRow(tr("Strip cols:"), spStripCols_);
+    advForm->addRow(tr("OMP threads:"), edtThreads_);
+    main->addWidget(grpAdv);
+
+    // --- merge.json preview -----------------------------------------------
+    auto grpPrev = new QGroupBox(tr("merge.json preview"), this);
+    auto prevLay = new QVBoxLayout(grpPrev);
+    lblPreview_ = new QLabel(grpPrev);
+    lblPreview_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lblPreview_->setStyleSheet("font-family: monospace;");
+    lblPreview_->setWordWrap(true);
+    prevLay->addWidget(lblPreview_);
+    main->addWidget(grpPrev);
+
+    // --- Buttons -----------------------------------------------------------
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    auto btnReset = btns->addButton(tr("Reset to Defaults"), QDialogButtonBox::ResetRole);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(btnReset, &QPushButton::clicked, this, [this]() { applyCodeDefaults(); });
+    main->addWidget(btns);
+
+    // --- Wiring ------------------------------------------------------------
+    connect(btnAddRow_,    &QPushButton::clicked, this, [this]() {
+        resizeGrid(tblGrid_->rowCount() + 1, tblGrid_->columnCount());
+    });
+    connect(btnAddCol_,    &QPushButton::clicked, this, [this]() {
+        resizeGrid(tblGrid_->rowCount(), tblGrid_->columnCount() + 1);
+    });
+    connect(btnRemoveRow_, &QPushButton::clicked, this, [this]() {
+        resizeGrid(std::max(1, tblGrid_->rowCount() - 1), tblGrid_->columnCount());
+    });
+    connect(btnRemoveCol_, &QPushButton::clicked, this, [this]() {
+        resizeGrid(tblGrid_->rowCount(), std::max(1, tblGrid_->columnCount() - 1));
+    });
+    connect(btnAddSegments_, &QPushButton::clicked, this, [this]() {
+        promptAddSegments();
+    });
+    connect(tblGrid_, &QTableWidget::itemChanged, this, [this](QTableWidgetItem*) {
+        rebuildPreview();
+        updateRefCombo();
+    });
+
+    // --- Initial population ----------------------------------------------
+    seedGrid(seedSegmentIds);
+    applySessionDefaults();
+    rebuildPreview();
+    updateRefCombo();
+
+    // Reasonable initial sizing.
+    resize(720, 600);
+}
+
+void MergeTifxyzDialog::applyCodeDefaults()
+{
+    spIters_->setValue(3000);
+    spMin_->setValue(5.0);
+    spMax_->setValue(10.0);
+    spMadK_->setValue(3.0);
+    spSeed_->setValue(0);
+    spAnchorCap_->setValue(0);
+    spStripCols_->setValue(0);
+    edtThreads_->setText(QString());
+}
+
+void MergeTifxyzDialog::applySessionDefaults()
+{
+    if (!s_haveSession) return;
+    spIters_->setValue(s_iters);
+    spMin_->setValue(s_min);
+    spMax_->setValue(s_max);
+    spMadK_->setValue(s_madK);
+    spSeed_->setValue(s_seed);
+    spAnchorCap_->setValue(s_anchorCap);
+    spStripCols_->setValue(s_stripCols);
+    edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : QString());
+}
+
+void MergeTifxyzDialog::updateSessionFromUI()
+{
+    s_haveSession = true;
+    s_iters       = spIters_->value();
+    s_min         = spMin_->value();
+    s_max         = spMax_->value();
+    s_madK        = spMadK_->value();
+    s_seed        = spSeed_->value();
+    s_anchorCap   = spAnchorCap_->value();
+    s_stripCols   = spStripCols_->value();
+    s_lastRows    = tblGrid_->rowCount();
+    s_lastCols    = tblGrid_->columnCount();
+    s_ompThreads  = ompThreads();
+}
+
+void MergeTifxyzDialog::resizeGrid(int newRows, int newCols)
+{
+    newRows = std::max(1, newRows);
+    newCols = std::max(1, newCols);
+    tblGrid_->setRowCount(newRows);
+    tblGrid_->setColumnCount(newCols);
+    for (int r = 0; r < newRows; ++r) {
+        for (int c = 0; c < newCols; ++c) {
+            if (!tblGrid_->item(r, c)) {
+                tblGrid_->setItem(r, c, new QTableWidgetItem(QString()));
+            }
+        }
+    }
+    rebuildPreview();
+    updateRefCombo();
+}
+
+void MergeTifxyzDialog::seedGrid(const QStringList& seedSegmentIds)
+{
+    QStringList seeds;
+    for (const auto& s : seedSegmentIds) if (!s.isEmpty()) seeds << s;
+
+    int rows, cols;
+    if (s_haveSession && s_lastRows > 0 && s_lastCols > 0 &&
+        s_lastRows * s_lastCols >= seeds.size())
+    {
+        rows = s_lastRows;
+        cols = s_lastCols;
+    } else {
+        const auto rc = defaultGridShape(std::max(1, static_cast<int>(seeds.size())));
+        rows = rc.first;
+        cols = rc.second;
+    }
+
+    resizeGrid(rows, cols);
+
+    int idx = 0;
+    for (int r = 0; r < rows && idx < seeds.size(); ++r) {
+        for (int c = 0; c < cols && idx < seeds.size(); ++c) {
+            tblGrid_->item(r, c)->setText(seeds[idx++]);
+        }
+    }
+    rebuildPreview();
+    updateRefCombo();
+}
+
+void MergeTifxyzDialog::promptAddSegments()
+{
+    // Open a small modal that lists every available segment; chosen
+    // names are appended into the first empty cells (row-major).
+    // Segments already in the grid are NOT filtered out -- the merge
+    // tool's parser treats duplicate cells as the same surface and
+    // wires neighbors through them, which is what you want when a tall
+    // segment (e.g. wrap31) borders two stacked half-height neighbors
+    // (wrap32a / wrap32b) and needs to sit at the start of both rows.
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Add segments to grid"));
+    auto lay = new QVBoxLayout(&dlg);
+    auto list = new QListWidget(&dlg);
+    list->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    QSet<QString> alreadyInGrid;
+    for (const auto& n : collectGridNames()) if (!n.isEmpty()) alreadyInGrid.insert(n);
+    for (const auto& s : _availableSegments) {
+        auto* item = new QListWidgetItem(list);
+        item->setData(Qt::UserRole, s);
+        if (alreadyInGrid.contains(s)) {
+            item->setText(s + tr("  (already in grid)"));
+            QFont f = item->font();
+            f.setItalic(true);
+            item->setFont(f);
+        } else {
+            item->setText(s);
+        }
+    }
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(btns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    lay->addWidget(list);
+    lay->addWidget(btns);
+    dlg.resize(380, 460);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    QStringList chosen;
+    for (auto* item : list->selectedItems()) {
+        chosen << item->data(Qt::UserRole).toString();
+    }
+    if (chosen.isEmpty()) return;
+
+    // Drop chosen names into empty cells. If we run out, grow the grid
+    // by one column at a time (keeps row count stable).
+    int idx = 0;
+    auto fillNext = [&]() {
+        for (int r = 0; r < tblGrid_->rowCount(); ++r) {
+            for (int c = 0; c < tblGrid_->columnCount(); ++c) {
+                auto* it = tblGrid_->item(r, c);
+                if (it && it->text().isEmpty()) {
+                    it->setText(chosen[idx++]);
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    while (idx < chosen.size()) {
+        if (!fillNext()) {
+            resizeGrid(tblGrid_->rowCount(), tblGrid_->columnCount() + 1);
+        }
+    }
+    rebuildPreview();
+    updateRefCombo();
+}
+
+QStringList MergeTifxyzDialog::collectGridNames() const
+{
+    QStringList out;
+    for (int r = 0; r < tblGrid_->rowCount(); ++r) {
+        for (int c = 0; c < tblGrid_->columnCount(); ++c) {
+            auto* it = tblGrid_->item(r, c);
+            out << (it ? it->text().trimmed() : QString());
+        }
+    }
+    return out;
+}
+
+QString MergeTifxyzDialog::buildMergeJsonText() const
+{
+    const int rows = tblGrid_->rowCount();
+    const int cols = tblGrid_->columnCount();
+
+    // Whitespace-delimited string rows can't represent interior empty
+    // cells -- the parser splits the row on whitespace and looks each
+    // token up as a directory under <paths_dir>, so a literal "" token
+    // would be searched for as the directory `""` and the run would
+    // fail. Switch to JSON array rows (with `null` for empty cells)
+    // whenever the grid has any blank, which is the form gmResolveGrid
+    // already handles. Solid grids keep the more compact string form.
+    bool hasEmpty = false;
+    for (int r = 0; r < rows && !hasEmpty; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            auto* it = tblGrid_->item(r, c);
+            if (!it || it->text().trimmed().isEmpty()) {
+                hasEmpty = true;
+                break;
+            }
+        }
+    }
+
+    QString out;
+    out += QStringLiteral("{\n  \"rows\": [\n");
+
+    if (hasEmpty) {
+        for (int r = 0; r < rows; ++r) {
+            QStringList cells;
+            cells.reserve(cols);
+            for (int c = 0; c < cols; ++c) {
+                auto* it = tblGrid_->item(r, c);
+                const QString name = it ? it->text().trimmed() : QString();
+                if (name.isEmpty()) {
+                    cells << QStringLiteral("null");
+                } else {
+                    cells << QStringLiteral("\"") + name + QLatin1Char('"');
+                }
+            }
+            out += QStringLiteral("    [")
+                 + cells.join(QStringLiteral(", "))
+                 + QLatin1Char(']');
+            if (r + 1 < rows) out += QLatin1Char(',');
+            out += QLatin1Char('\n');
+        }
+    } else {
+        // Pad each cell so visual columns line up in the preview.
+        QVector<int> widths(cols, 0);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                auto* it = tblGrid_->item(r, c);
+                int w = it ? static_cast<int>(it->text().trimmed().size()) : 0;
+                if (w > widths[c]) widths[c] = w;
+            }
+        }
+        for (int r = 0; r < rows; ++r) {
+            QStringList tokens;
+            tokens.reserve(cols);
+            for (int c = 0; c < cols; ++c) {
+                auto* it = tblGrid_->item(r, c);
+                const QString name = it ? it->text().trimmed() : QString();
+                tokens << name.leftJustified(std::max(widths[c], 1), ' ');
+            }
+            out += QStringLiteral("    \"")
+                 + tokens.join(' ').trimmed()
+                 + QLatin1Char('"');
+            if (r + 1 < rows) out += QLatin1Char(',');
+            out += QLatin1Char('\n');
+        }
+    }
+
+    out += QStringLiteral("  ]\n}\n");
+    return out;
+}
+
+void MergeTifxyzDialog::rebuildPreview()
+{
+    lblPreview_->setText(buildMergeJsonText());
+    QStringList names = collectGridNames();
+    QString af = alphaFirst(names);
+    if (af.isEmpty()) {
+        lblOutName_->setText(tr("(grid is empty)"));
+    } else {
+        const QString base = af + QStringLiteral("_merged");
+        const QString name = resolveOutputName(_volpkgDir, base);
+        lblOutName_->setText(QStringLiteral("%1/paths/%2/")
+            .arg(_volpkgDir, name));
+    }
+}
+
+void MergeTifxyzDialog::updateRefCombo()
+{
+    QString prev = cmbRef_->currentText();
+    QStringList names = collectGridNames();
+    QStringList unique;
+    for (const auto& n : names) {
+        if (!n.isEmpty() && !unique.contains(n)) unique << n;
+    }
+    cmbRef_->blockSignals(true);
+    cmbRef_->clear();
+    cmbRef_->addItem(tr("<auto: largest valid-cell count>"), QString());
+    for (const auto& n : unique) cmbRef_->addItem(n, n);
+    if (!prev.isEmpty()) {
+        const int idx = cmbRef_->findData(prev);
+        if (idx >= 0) cmbRef_->setCurrentIndex(idx);
+    }
+    cmbRef_->blockSignals(false);
+}
+
+QString MergeTifxyzDialog::mergeJsonPath() const { return _mergeJsonPath; }
+QString MergeTifxyzDialog::refSurface()    const { return cmbRef_->currentData().toString(); }
+int     MergeTifxyzDialog::ransacIters()   const { return spIters_->value(); }
+double  MergeTifxyzDialog::ransacMinThresh() const { return spMin_->value(); }
+double  MergeTifxyzDialog::ransacMaxThresh() const { return spMax_->value(); }
+double  MergeTifxyzDialog::ransacMadK()    const { return spMadK_->value(); }
+int     MergeTifxyzDialog::ransacSeed()    const { return spSeed_->value(); }
+int     MergeTifxyzDialog::anchorCap()     const { return spAnchorCap_->value(); }
+int     MergeTifxyzDialog::stripCols()     const { return spStripCols_->value(); }
+int     MergeTifxyzDialog::ompThreads() const {
+    const QString t = edtThreads_->text().trimmed();
+    if (t.isEmpty()) return -1;
+    bool ok = false; int v = t.toInt(&ok); return (ok && v > 0) ? v : -1;
+}
+
+void MergeTifxyzDialog::accept()
+{
+    // --- validate grid -----------------------------------------------------
+    QStringList names = collectGridNames();
+    QStringList unique;
+    int nonEmpty = 0;
+    for (const auto& n : names) {
+        if (n.isEmpty()) continue;
+        ++nonEmpty;
+        if (!unique.contains(n)) unique << n;
+    }
+    if (unique.size() < 2) {
+        QMessageBox::warning(this, tr("Merge TIFXYZ"),
+            tr("Merge requires at least 2 distinct surfaces in the grid; "
+               "currently %1.").arg(unique.size()));
+        return;
+    }
+    QSet<QString> avail(_availableSegments.begin(), _availableSegments.end());
+    QStringList missing;
+    for (const auto& n : unique) {
+        if (!avail.contains(n)) missing << n;
+    }
+    if (!missing.isEmpty()) {
+        QMessageBox::warning(this, tr("Merge TIFXYZ"),
+            tr("These names are not present under %1:\n  %2")
+                .arg(_pathsDir, missing.join(QLatin1String(", "))));
+        return;
+    }
+    for (const auto& n : unique) {
+        if (n.contains(QRegularExpression("\\s"))) {
+            QMessageBox::warning(this, tr("Merge TIFXYZ"),
+                tr("Surface name '%1' contains whitespace; the merge.json "
+                   "format does not support that. Rename the surface first.")
+                    .arg(n));
+            return;
+        }
+    }
+    if (spMin_->value() >= spMax_->value()) {
+        QMessageBox::warning(this, tr("Merge TIFXYZ"),
+            tr("RANSAC min threshold must be strictly less than max."));
+        return;
+    }
+    const QString ref = refSurface();
+    if (!ref.isEmpty() && !unique.contains(ref)) {
+        QMessageBox::warning(this, tr("Merge TIFXYZ"),
+            tr("Reference '%1' is not in the grid.").arg(ref));
+        return;
+    }
+    (void)nonEmpty;
+
+    // --- write merge.json --------------------------------------------------
+    if (_volpkgDir.isEmpty()) {
+        QMessageBox::critical(this, tr("Merge TIFXYZ"),
+            tr("No volpkg directory available; cannot write merge.json."));
+        return;
+    }
+    namespace fs = std::filesystem;
+    const fs::path af   = fs::path(alphaFirst(names).toStdString());
+    const QString stem  = QString::fromStdString(af.string()) + QStringLiteral("_merged");
+    const QString outName = resolveOutputName(_volpkgDir, stem);
+    const fs::path mj   = fs::path(_volpkgDir.toStdString()) /
+                          (outName.toStdString() + ".merge.json");
+    try {
+        std::ofstream f(mj);
+        if (!f) throw std::runtime_error("ofstream failed to open " + mj.string());
+        const QString text = buildMergeJsonText();
+        const std::string s = text.toStdString();
+        f.write(s.data(), static_cast<std::streamsize>(s.size()));
+        if (!f) throw std::runtime_error("ofstream write failed for " + mj.string());
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, tr("Merge TIFXYZ"),
+            tr("Failed to write merge.json: %1").arg(QString::fromUtf8(e.what())));
+        return;
+    }
+    _mergeJsonPath = QString::fromStdString(mj.string());
+
+    updateSessionFromUI();
+    QDialog::accept();
+}

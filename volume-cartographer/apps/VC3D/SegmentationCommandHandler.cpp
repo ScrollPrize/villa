@@ -2649,6 +2649,66 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         tr("Rasterization started for %1 segment(s)...").arg(validIds.size()), 0);
 }
 
+void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("Open a volpkg first."));
+        return;
+    }
+    if (!_cmdRunner) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("Command runner is not initialized."));
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("A command-line tool is already running."));
+        return;
+    }
+
+    auto vpkg = _state->vpkg();
+    const QString volpkgDir = QString::fromStdString(vpkg->getVolpkgDirectory());
+    const std::string segDirName = vpkg->getSegmentationDirectory();
+    const QString pathsDir = QString::fromStdString(
+        (std::filesystem::path(vpkg->getVolpkgDirectory()) / segDirName).string());
+
+    QStringList availableSegments;
+    {
+        const auto ids = vpkg->segmentationIDs();
+        availableSegments.reserve(static_cast<int>(ids.size()));
+        for (const auto& s : ids) availableSegments << QString::fromStdString(s);
+    }
+    if (availableSegments.size() < 2) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("This volpkg has fewer than 2 segments in '%1'; "
+                                "merge needs at least 2.")
+                                 .arg(QString::fromStdString(segDirName)));
+        return;
+    }
+
+    MergeTifxyzDialog dlg(_parentWidget, segmentIds, availableSegments,
+                          volpkgDir, pathsDir);
+    if (dlg.exec() != QDialog::Accepted) {
+        emit statusMessage(tr("Merge cancelled"), 3000);
+        return;
+    }
+
+    _cmdRunner->setMergeParams(dlg.mergeJsonPath(),
+                               dlg.refSurface(),
+                               dlg.ransacIters(),
+                               dlg.ransacMinThresh(),
+                               dlg.ransacMaxThresh(),
+                               dlg.ransacMadK(),
+                               dlg.ransacSeed(),
+                               dlg.anchorCap(),
+                               dlg.stripCols());
+    if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+    _cmdRunner->showConsoleOutput();
+    _cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz);
+    emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
+}
+
 void SegmentationCommandHandler::onAddIgnoreLabel()
 {
     if (!_state || !_state->vpkg()) {

@@ -36,6 +36,7 @@ public:
         obj2tifxyz,
         AlphaCompRefine,
         NeighborCopy,
+        MergeTifxyz,
         CustomCommand
     };
 
@@ -73,6 +74,17 @@ public:
                                const QString& resumeSurface,
                                const QString& outputDir,
                                const QString& resumeOpt);
+    // vc_merge_tifxyz: only --merge is required; the remaining args are
+    // RANSAC + blend tunables that all have working defaults.
+    void setMergeParams(const QString& mergeJsonPath,
+                        const QString& refSurface,
+                        int ransacIters,
+                        double ransacMinThresh,
+                        double ransacMaxThresh,
+                        double ransacMadK,
+                        int ransacSeed,
+                        int anchorCap,
+                        int stripCols);
     bool execute(Tool tool);
     void cancel();
     bool isRunning() const;
@@ -167,4 +179,15 @@ private:
     int _objStepSize = 20;
     QString _refineDst;
     bool _preserveConsoleOutput{false};
+
+    // vc_merge_tifxyz parameters
+    QString _mergeJsonPath;
+    QString _mergeRefSurface;
+    int     _mergeRansacIters{3000};
+    double  _mergeRansacMinThresh{5.0};
+    double  _mergeRansacMaxThresh{10.0};
+    double  _mergeRansacMadK{3.0};
+    int     _mergeRansacSeed{0};
+    int     _mergeAnchorCap{0};
+    int     _mergeStripCols{0};
 };

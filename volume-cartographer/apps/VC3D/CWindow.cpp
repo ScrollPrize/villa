@@ -452,6 +452,13 @@ CWindow::CWindow(size_t cacheSizeGB) :
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
+    // Wire the Actions -> Merge tifxyz... menu entry to the handler.
+    // Has to happen here (not inside CreateWidgets) because
+    // _menuController is created after CreateWidgets() returns.
+    connect(_menuController.get(), &MenuActionController::mergeTifxyzFromMenuRequested,
+            this, [this]() {
+                _segmentationCommandHandler->onMergeTifxyz(QStringList{});
+            });
 
     if (isDarkMode()) {
         applyDarkPalette();
@@ -1480,6 +1487,13 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::mergeTifxyzRequested,
+            this, [this](const QStringList& segmentIds) {
+                _segmentationCommandHandler->onMergeTifxyz(segmentIds);
+            });
+    // Note: the Actions -> Merge tifxyz... menu wiring lives in the
+    // constructor after _menuController is initialized -- _menuController
+    // is null inside CreateWidgets().
     connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
             this, [this](const QString& segmentId) {
                 onVisLasagnaObj(segmentId.toStdString());
