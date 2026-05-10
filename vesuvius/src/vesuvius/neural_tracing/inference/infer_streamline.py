@@ -3,6 +3,7 @@ import tempfile
 from datetime import datetime
 import hashlib
 import re
+import shutil
 
 import numpy as np
 import torch
@@ -606,11 +607,25 @@ class _SparseChunkOutputMerger:
             return avg_group
         finally:
             if self._tmpdir is not None:
+                self._close_memmap_chunks()
                 self.sum_chunks.clear()
                 self.count_chunks.clear()
                 self.counted_regions.clear()
                 self._tmpdir.cleanup()
                 self._tmpdir = None
+
+    def _close_memmap_chunks(self):
+        seen = set()
+        for chunk in list(self.sum_chunks.values()) + list(self.count_chunks.values()):
+            chunk_id = id(chunk)
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            if hasattr(chunk, "flush"):
+                chunk.flush()
+            mmap_obj = getattr(chunk, "_mmap", None)
+            if mmap_obj is not None:
+                mmap_obj.close()
 
 
 def _require_avg_field(avg_group, name, channels):
@@ -1154,6 +1169,15 @@ def save_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction, 
     return output_dir / output_uuid
 
 
+def _cleanup_temp_output_zarr(output_path):
+    if OUTPUT_ZARR_PATH is not None:
+        return
+    output_path = Path(output_path)
+    if not output_path.exists():
+        return
+    shutil.rmtree(output_path)
+
+
 def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxes, crop_size, cond_direction, zarr_root):
     window_min, window_shape = _merged_window_from_bboxes([item["bbox"] for item in voxelized_bboxes])
     zarr_root.attrs["window_min_zyx"] = [int(v) for v in window_min]
@@ -1229,61 +1253,64 @@ def main():
     )
     volume_array = _open_volume_array(VOLUME_PATH, VOLUME_SCALE)
     output_path = _output_zarr_path()
-    output_root = zarr.open_group(str(output_path), mode="w")
-    output_group = run_rowcol_bbox_inference(
-        model,
-        model_config,
-        volume_array,
-        voxelized_bboxes,
-        crop_size,
-        cond_direction,
-        output_root,
-    )
-    integration_result = integrate_streamlines_from_edge(
-        output_group,
-        edge,
-        np.asarray(output_root.attrs["window_min_zyx"], dtype=np.float32),
-        output_root,
-    )
-    output_tifxyz_path = save_merged_streamline_tifxyz(
-        stored_zyxs,
-        valid,
-        edge,
-        cond_direction,
-        integration_result["group"],
-    )
-
-    print(f"tifxyz_path: {TIFXYZ_PATH}")
-    print(f"volume_path: {VOLUME_PATH}")
-    print(f"volume_scale: {int(VOLUME_SCALE)}")
-    print(f"checkpoint_path: {CHECKPOINT_PATH}")
-    print(f"output_zarr_path: {output_path}")
-    print(f"output_tifxyz_path: {output_tifxyz_path}")
-    print(f"grow_direction: {GROW_DIRECTION}")
-    print(f"cond_direction: {cond_direction}")
-    print(f"crop_size: {tuple(crop_size)}")
-    print(f"overlap_frac: {float(OVERLAP_FRAC)}")
-    print(f"valid_points: {int(points_zyx.shape[0])}")
-    print(f"bboxes: {len(bboxes)}")
-    print(f"voxelized_bbox_voxels: {sum(int(item['voxels'].sum()) for item in voxelized_bboxes)}")
-    print(f"tifxyz_voxel_step: {float(TIFXYZ_VOXEL_STEP)}")
-    print(f"tifxyz_steps: {int(TIFXYZ_STEPS)}")
-    print(f"integration_steps: {len(integration_result['step_sizes'])}")
-    print(f"integration_step_size: {float(INTEGRATION_STEP_SIZE)}")
-    print(f"integration_requested_distance: {integration_result['requested_distance']}")
-    print(f"integration_target_distance: {integration_result['target_distance']}")
-    print(f"integration_actual_steps: {integration_result['step_sizes']}")
-    print(f"integration_seed_count: {integration_result['seed_count']}")
-    print(f"integration_active_endpoints: {integration_result['active_endpoints']}")
-
-    if SHOW_NAPARI:
-        show_streamline_geometry_napari(
-            points_zyx,
-            edge,
-            bboxes,
-            voxelized_bboxes=voxelized_bboxes,
-            integration_group=integration_result["group"],
+    try:
+        output_root = zarr.open_group(str(output_path), mode="w")
+        output_group = run_rowcol_bbox_inference(
+            model,
+            model_config,
+            volume_array,
+            voxelized_bboxes,
+            crop_size,
+            cond_direction,
+            output_root,
         )
+        integration_result = integrate_streamlines_from_edge(
+            output_group,
+            edge,
+            np.asarray(output_root.attrs["window_min_zyx"], dtype=np.float32),
+            output_root,
+        )
+        output_tifxyz_path = save_merged_streamline_tifxyz(
+            stored_zyxs,
+            valid,
+            edge,
+            cond_direction,
+            integration_result["group"],
+        )
+
+        print(f"tifxyz_path: {TIFXYZ_PATH}")
+        print(f"volume_path: {VOLUME_PATH}")
+        print(f"volume_scale: {int(VOLUME_SCALE)}")
+        print(f"checkpoint_path: {CHECKPOINT_PATH}")
+        print(f"output_zarr_path: {output_path}")
+        print(f"output_tifxyz_path: {output_tifxyz_path}")
+        print(f"grow_direction: {GROW_DIRECTION}")
+        print(f"cond_direction: {cond_direction}")
+        print(f"crop_size: {tuple(crop_size)}")
+        print(f"overlap_frac: {float(OVERLAP_FRAC)}")
+        print(f"valid_points: {int(points_zyx.shape[0])}")
+        print(f"bboxes: {len(bboxes)}")
+        print(f"voxelized_bbox_voxels: {sum(int(item['voxels'].sum()) for item in voxelized_bboxes)}")
+        print(f"tifxyz_voxel_step: {float(TIFXYZ_VOXEL_STEP)}")
+        print(f"tifxyz_steps: {int(TIFXYZ_STEPS)}")
+        print(f"integration_steps: {len(integration_result['step_sizes'])}")
+        print(f"integration_step_size: {float(INTEGRATION_STEP_SIZE)}")
+        print(f"integration_requested_distance: {integration_result['requested_distance']}")
+        print(f"integration_target_distance: {integration_result['target_distance']}")
+        print(f"integration_actual_steps: {integration_result['step_sizes']}")
+        print(f"integration_seed_count: {integration_result['seed_count']}")
+        print(f"integration_active_endpoints: {integration_result['active_endpoints']}")
+
+        if SHOW_NAPARI:
+            show_streamline_geometry_napari(
+                points_zyx,
+                edge,
+                bboxes,
+                voxelized_bboxes=voxelized_bboxes,
+                integration_group=integration_result["group"],
+            )
+    finally:
+        _cleanup_temp_output_zarr(output_path)
 
 
 if __name__ == "__main__":
