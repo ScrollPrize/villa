@@ -25,7 +25,7 @@ from vesuvius.neural_tracing.nets.models import load_checkpoint
 from vesuvius.tifxyz import read_tifxyz
 
 
-TIFXYZ_PATH = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces/test_in_small"
+TIFXYZ_PATH = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces/test_in_smaller"
 VOLUME_PATH = "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/"
 VOLUME_SCALE = 0
 VOLUME_CACHE_DIR = "/tmp/vesuvius-volume-cache"
@@ -34,26 +34,31 @@ CHECKPOINT_PATH = "/home/sean/Downloads/ckpt_090000.pth"
 # Keep None unless intentionally debugging shape mismatches. The default reads
 # the checkpoint crop size so inference matches the model patch size.
 CROP_SIZE = None
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 DEVICE = "cuda"
 
-OVERLAP_FRAC = 0.50
+OVERLAP_FRAC = 0.25
 OUTPUT_ZARR_PATH = None
 OUTPUT_TIFXYZ_DIR = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces"
 OUTPUT_TIFXYZ_VOXEL_SIZE_UM = "2.24"
 MERGE_OUTPUTS_CHUNK_SIZE = 256
 MERGE_OUTPUTS_MMAP_DIR = "/tmp/streamline_tmp_outputs/"
+GEOMEDIAN_VECTOR_OUTPUTS = ("velocity_dir", "surface_attract")
+GEOMEDIAN_MAX_ITER = 8
+GEOMEDIAN_EPS = 1e-6
+USE_TTA = False
+TTA_FLIP_AXES = ((2,), (3,), (4,), (2, 3), (2, 4), (3, 4), (2, 3, 4))
 SHOW_NAPARI = False
 
 GROW_DIRECTION = "left"
 
 TIFXYZ_VOXEL_STEP = 20.0
-TIFXYZ_STEPS = 3
-NUM_ITERATIONS = 10
+TIFXYZ_STEPS = 4
+NUM_ITERATIONS = 5
 # If false, intermediate iterations are written to a temporary tifxyz directory
 # only long enough to feed the next iteration; the final iteration is saved.
 SAVE_EACH_ITERATION_TIFXYZ = True
-INTEGRATION_STEP_SIZE = 2.0
+INTEGRATION_STEP_SIZE = 4.0
 TRACE_VALIDITY_THRESHOLD = 0.5
 USE_SURFACE_ATTRACT = True
 SURFACE_ATTRACT_WEIGHT = 1.0
@@ -453,6 +458,75 @@ def _prepare_rowcol_inputs(volume_array, voxelized_batch, crop_size, cond_direct
     return torch.cat([inputs, direction], dim=1)
 
 
+def _tta_variants():
+    variants = [()]
+    if bool(USE_TTA):
+        variants.extend(tuple(int(axis) for axis in axes) for axes in TTA_FLIP_AXES)
+    return variants
+
+
+def _run_model_once(model, inputs, amp_enabled, amp_dtype):
+    if amp_enabled:
+        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            outputs = model(inputs)
+    else:
+        outputs = model(inputs)
+    if not isinstance(outputs, dict):
+        outputs = {"output": outputs}
+    return outputs
+
+
+def _flip_tta_inputs(inputs, flip_axes):
+    if not flip_axes:
+        return inputs
+    flipped = torch.flip(inputs, dims=tuple(int(axis) for axis in flip_axes)).clone()
+    if flipped.shape[1] >= 6:
+        if 4 in flip_axes:
+            flipped[:, [2, 3]] = flipped[:, [3, 2]]
+        if 3 in flip_axes:
+            flipped[:, [4, 5]] = flipped[:, [5, 4]]
+    return flipped
+
+
+def _restore_tta_output(output_name, output_value, flip_axes):
+    output_value = _collapse_output(output_value)
+    if output_value is None:
+        return None
+    if not flip_axes:
+        return output_value
+    restored = torch.flip(output_value, dims=tuple(int(axis) for axis in flip_axes))
+    if restored.ndim == 5 and restored.shape[1] == 3 and str(output_name) in set(GEOMEDIAN_VECTOR_OUTPUTS):
+        for axis in flip_axes:
+            component = int(axis) - 2
+            if 0 <= component < 3:
+                restored[:, component] = -restored[:, component]
+    return restored
+
+
+def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
+    variants = _tta_variants()
+    accum = {}
+    counts = {}
+    for flip_axes in variants:
+        model_inputs = _flip_tta_inputs(inputs, flip_axes)
+        outputs = _run_model_once(model, model_inputs, amp_enabled, amp_dtype)
+        for output_name, output_value in outputs.items():
+            restored = _restore_tta_output(output_name, output_value, flip_axes)
+            if restored is None:
+                continue
+            restored = restored.float()
+            if output_name in accum:
+                accum[output_name] = accum[output_name] + restored
+                counts[output_name] += 1
+            else:
+                accum[output_name] = restored
+                counts[output_name] = 1
+    return {
+        output_name: output_sum / float(counts[output_name])
+        for output_name, output_sum in accum.items()
+    }
+
+
 def _slice_len(s):
     return int(s.stop) - int(s.start)
 
@@ -468,6 +542,37 @@ def _chunk_slices_for_region(start, end, chunks):
             for xx in range(x0 // cx, (x1 - 1) // cx + 1):
                 xs = slice(max(x0, xx * cx), min(x1, (xx + 1) * cx))
                 yield (zz, yy, xx), (zs, ys, xs)
+
+
+def _is_geomedian_vector_output(output_name, channels):
+    return int(channels) == 3 and str(output_name) in set(GEOMEDIAN_VECTOR_OUTPUTS)
+
+
+def _geometric_median_vectors(samples, valid, max_iter=GEOMEDIAN_MAX_ITER, eps=GEOMEDIAN_EPS):
+    samples = np.asarray(samples, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+    if samples.ndim != 3 or samples.shape[1] != 3:
+        raise ValueError(f"samples must be [K, 3, N], got {samples.shape}")
+    counts = valid.sum(axis=0)
+    out = np.zeros((3, samples.shape[2]), dtype=np.float32)
+    active = counts > 0
+    if not bool(active.any()):
+        return out
+
+    weights0 = valid.astype(np.float32, copy=False)
+    current = (samples * weights0[:, None, :]).sum(axis=0)
+    current[:, active] /= counts[active].astype(np.float32, copy=False)[None, :]
+    for _ in range(int(max_iter)):
+        diff = samples - current[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=1, dtype=np.float32), dtype=np.float32)
+        weights = np.where(valid, 1.0 / np.maximum(dist, float(eps)), 0.0).astype(np.float32, copy=False)
+        denom = weights.sum(axis=0)
+        update = (samples * weights[:, None, :]).sum(axis=0)
+        can_update = denom > 0.0
+        update[:, can_update] /= denom[can_update][None, :]
+        current[:, can_update] = update[:, can_update]
+    out[:, active] = current[:, active]
+    return out
 
 
 class _SparseChunkOutputMerger:
@@ -486,6 +591,8 @@ class _SparseChunkOutputMerger:
         self.sum_chunks = {}
         self.count_chunks = {}
         self.counted_regions = set()
+        self.vector_sample_chunks = {}
+        self.vector_count_chunks = {}
 
     def _reserve_bytes(self, n_bytes):
         self.current_bytes += int(n_bytes)
@@ -541,6 +648,41 @@ class _SparseChunkOutputMerger:
         self.sum_chunks[sum_key] = sum_chunk
         return sum_chunk, count_chunk
 
+    def _ensure_count_chunk(self, chunk_key):
+        region = self._chunk_region(chunk_key)
+        chunk_shape = tuple(_slice_len(s) for s in region)
+        count_chunk = self.count_chunks.get(chunk_key)
+        if count_chunk is None:
+            count_chunk = self._zeros_chunk("count", ("count", *chunk_key), chunk_shape, np.uint32)
+            self.count_chunks[chunk_key] = count_chunk
+            self._reserve_bytes(int(np.prod(chunk_shape, dtype=np.int64)) * np.dtype(np.uint32).itemsize)
+        return count_chunk
+
+    def _ensure_vector_chunks(self, output_name, chunk_key):
+        sample_key = (output_name, *chunk_key)
+        count_chunk = self.vector_count_chunks.get(sample_key)
+        if count_chunk is None:
+            region = self._chunk_region(chunk_key)
+            chunk_shape = tuple(_slice_len(s) for s in region)
+            count_chunk = self._zeros_chunk("vector_count", sample_key, chunk_shape, np.uint16)
+            self.vector_count_chunks[sample_key] = count_chunk
+            self.vector_sample_chunks[sample_key] = []
+            self._reserve_bytes(int(np.prod(chunk_shape, dtype=np.int64)) * np.dtype(np.uint16).itemsize)
+        return self.vector_sample_chunks[sample_key], count_chunk
+
+    def _ensure_vector_slot(self, output_name, chunk_key, slot_idx):
+        sample_key = (output_name, *chunk_key)
+        slots, _ = self._ensure_vector_chunks(output_name, chunk_key)
+        while len(slots) <= int(slot_idx):
+            channels = self.channels[output_name]
+            region = self._chunk_region(chunk_key)
+            chunk_shape = tuple(_slice_len(s) for s in region)
+            slot_shape = (channels, *chunk_shape)
+            slot = self._zeros_chunk(f"vector_sample_{len(slots)}", sample_key, slot_shape, np.float32)
+            slots.append(slot)
+            self._reserve_bytes(int(np.prod(slot_shape, dtype=np.int64)) * np.dtype(np.float32).itemsize)
+        return slots[int(slot_idx)]
+
     def accumulate(self, output_name, output_batch, voxelized_batch):
         output_batch = np.asarray(output_batch, dtype=np.float32)
         if output_batch.ndim != 5:
@@ -551,12 +693,12 @@ class _SparseChunkOutputMerger:
                 f"does not match crop_size {tuple(self.crop_size_arr.tolist())}"
             )
         self._ensure_output(output_name, output_batch.shape[1])
+        use_geomedian = _is_geomedian_vector_output(output_name, output_batch.shape[1])
 
         for batch_idx, item in enumerate(voxelized_batch):
             start = _bbox_min_corner(item["bbox"]) - self.window_min
             end = start + self.crop_size_arr
             for chunk_key, region in _chunk_slices_for_region(start, end, self.chunks_3d):
-                sum_chunk, count_chunk = self._ensure_chunk(output_name, chunk_key)
                 crop_region = tuple(
                     slice(int(region_axis.start) - int(start_axis), int(region_axis.stop) - int(start_axis))
                     for region_axis, start_axis in zip(region, start)
@@ -566,11 +708,57 @@ class _SparseChunkOutputMerger:
                     slice(int(region_axis.start) - int(chunk_axis.start), int(region_axis.stop) - int(chunk_axis.start))
                     for region_axis, chunk_axis in zip(region, chunk_region)
                 )
-                sum_chunk[(slice(None), *local_region)] += output_batch[batch_idx][(slice(None), *crop_region)]
+                output_region = output_batch[batch_idx][(slice(None), *crop_region)]
+                if use_geomedian:
+                    count_chunk = self._ensure_count_chunk(chunk_key)
+                    slots, vector_count_chunk = self._ensure_vector_chunks(output_name, chunk_key)
+                    local_counts = np.asarray(vector_count_chunk[local_region], dtype=np.uint16)
+                    for slot_idx in np.unique(local_counts):
+                        slot_idx = int(slot_idx)
+                        slot = self._ensure_vector_slot(output_name, chunk_key, slot_idx)
+                        mask = local_counts == slot_idx
+                        slot_view = slot[(slice(None), *local_region)]
+                        slot_view[:, mask] = output_region[:, mask]
+                    vector_count_chunk[local_region] += np.uint16(1)
+                else:
+                    sum_chunk, count_chunk = self._ensure_chunk(output_name, chunk_key)
+                    sum_chunk[(slice(None), *local_region)] += output_region
                 count_key = (tuple(int(v) for v in item["bbox"]), *chunk_key)
                 if count_key not in self.counted_regions:
                     count_chunk[local_region] += np.uint32(1)
                     self.counted_regions.add(count_key)
+
+    def _finalize_geomedian_output(self, avg, output_name):
+        sample_keys = sorted(
+            key for key in self.vector_sample_chunks
+            if key[0] == output_name
+        )
+        block_voxels = 262144
+        for key in tqdm(sample_keys, desc=f"Finalizing {output_name} geomedian", unit="chunk"):
+            _, zz, yy, xx = key
+            slots = self.vector_sample_chunks[key]
+            count_chunk = self.vector_count_chunks[key]
+            region = self._chunk_region((zz, yy, xx))
+            counts_flat = np.asarray(count_chunk).reshape(-1)
+            valid_flat = counts_flat > 0
+            if not bool(valid_flat.any()):
+                continue
+
+            out_flat = np.zeros((3, counts_flat.shape[0]), dtype=np.float32)
+            max_count = int(counts_flat.max())
+            for block_start in range(0, counts_flat.shape[0], block_voxels):
+                block_end = min(block_start + block_voxels, counts_flat.shape[0])
+                block_counts = counts_flat[block_start:block_end]
+                if not bool((block_counts > 0).any()):
+                    continue
+                block_k = min(max_count, len(slots))
+                samples = np.empty((block_k, 3, block_end - block_start), dtype=np.float32)
+                for slot_idx in range(block_k):
+                    samples[slot_idx] = np.asarray(slots[slot_idx]).reshape(3, -1)[:, block_start:block_end]
+                valid = np.arange(block_k, dtype=np.uint16)[:, None] < block_counts[None, :]
+                out_flat[:, block_start:block_end] = _geometric_median_vectors(samples, valid)
+
+            avg[(slice(None), *region)] = out_flat.reshape((3, *count_chunk.shape))
 
     def finalize(self):
         try:
@@ -592,6 +780,11 @@ class _SparseChunkOutputMerger:
                     dtype="f4",
                     fill_value=0.0,
                 )
+                if _is_geomedian_vector_output(output_name, channels):
+                    avg.attrs[f"{output_name}_merge_method"] = "vector_geometric_median"
+                    self._finalize_geomedian_output(avg, output_name)
+                    continue
+                avg.attrs[f"{output_name}_merge_method"] = "mean"
                 output_chunk_keys = sorted(
                     key for key in self.sum_chunks
                     if key[0] == output_name
@@ -620,12 +813,24 @@ class _SparseChunkOutputMerger:
                 self.sum_chunks.clear()
                 self.count_chunks.clear()
                 self.counted_regions.clear()
+                self.vector_sample_chunks.clear()
+                self.vector_count_chunks.clear()
                 self._tmpdir.cleanup()
                 self._tmpdir = None
 
     def _close_memmap_chunks(self):
         seen = set()
-        for chunk in list(self.sum_chunks.values()) + list(self.count_chunks.values()):
+        vector_slots = [
+            slot
+            for slots in self.vector_sample_chunks.values()
+            for slot in slots
+        ]
+        for chunk in (
+            list(self.sum_chunks.values())
+            + list(self.count_chunks.values())
+            + list(self.vector_count_chunks.values())
+            + vector_slots
+        ):
             chunk_id = id(chunk)
             if chunk_id in seen:
                 continue
@@ -1112,13 +1317,7 @@ def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxe
         batch = voxelized_bboxes[start:start + int(BATCH_SIZE)]
         inputs = _prepare_rowcol_inputs(volume_array, batch, crop_size, cond_direction)
         with torch.inference_mode():
-            if amp_enabled:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    outputs = model(inputs)
-            else:
-                outputs = model(inputs)
-        if not isinstance(outputs, dict):
-            outputs = {"output": outputs}
+            outputs = _run_model_tta(model, inputs, amp_enabled, amp_dtype)
         for output_name, output_value in outputs.items():
             output_value = _collapse_output(output_value)
             if output_value is None:
