@@ -49,6 +49,10 @@ GROW_DIRECTION = "left"
 
 TIFXYZ_VOXEL_STEP = 20.0
 TIFXYZ_STEPS = 4
+NUM_ITERATIONS = 1
+# If false, intermediate iterations are written to a temporary tifxyz directory
+# only long enough to feed the next iteration; the final iteration is saved.
+SAVE_EACH_ITERATION_TIFXYZ = False
 INTEGRATION_STEP_SIZE = 2.0
 TRACE_VALIDITY_THRESHOLD = 0.5
 USE_SURFACE_ATTRACT = True
@@ -389,11 +393,14 @@ def _output_tifxyz_dir():
     return Path(TIFXYZ_PATH).parent
 
 
-def _output_tifxyz_uuid(timestamp=None):
+def _output_tifxyz_uuid(timestamp=None, iteration_idx=None, total_iterations=None):
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     input_name = Path(TIFXYZ_PATH).name
-    return f"{input_name}_{timestamp}_{GROW_DIRECTION}_{int(TIFXYZ_STEPS)}steps"
+    suffix = ""
+    if total_iterations is not None and int(total_iterations) > 1:
+        suffix = f"_iter{int(iteration_idx):02d}of{int(total_iterations):02d}"
+    return f"{input_name}_{timestamp}_{GROW_DIRECTION}_{int(TIFXYZ_STEPS)}steps{suffix}"
 
 
 def _output_tifxyz_voxel_size_um():
@@ -1024,7 +1031,18 @@ def _build_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction
     return np.concatenate([base, strip], axis=0)
 
 
-def save_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction, integration_group):
+def save_merged_streamline_tifxyz(
+    stored_zyxs,
+    valid,
+    edge_zyx,
+    cond_direction,
+    integration_group,
+    *,
+    input_tifxyz_path=None,
+    output_dir=None,
+    iteration_idx=None,
+    total_iterations=None,
+):
     merged_zyxs = _build_merged_streamline_tifxyz(
         stored_zyxs,
         valid,
@@ -1032,8 +1050,11 @@ def save_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction, 
         cond_direction,
         integration_group,
     )
-    output_dir = _output_tifxyz_dir()
-    output_uuid = _output_tifxyz_uuid()
+    output_dir = _output_tifxyz_dir() if output_dir is None else Path(output_dir)
+    output_uuid = _output_tifxyz_uuid(
+        iteration_idx=iteration_idx,
+        total_iterations=total_iterations,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     save_tifxyz(
         merged_zyxs,
@@ -1043,11 +1064,14 @@ def save_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction, 
         voxel_size_um=_output_tifxyz_voxel_size_um(),
         source="vesuvius.neural_tracing.inference.infer_streamline",
         additional_metadata={
-            "input_tifxyz_path": str(TIFXYZ_PATH),
+            "input_tifxyz_path": str(TIFXYZ_PATH if input_tifxyz_path is None else input_tifxyz_path),
             "grow_direction": str(GROW_DIRECTION),
             "cond_direction": str(cond_direction),
             "tifxyz_voxel_step": float(TIFXYZ_VOXEL_STEP),
             "tifxyz_steps": int(TIFXYZ_STEPS),
+            "num_iterations": int(NUM_ITERATIONS),
+            "iteration": None if iteration_idx is None else int(iteration_idx),
+            "save_each_iteration_tifxyz": bool(SAVE_EACH_ITERATION_TIFXYZ),
             "integration_step_size": float(INTEGRATION_STEP_SIZE),
             "trace_validity_threshold": float(TRACE_VALIDITY_THRESHOLD),
         },
@@ -1107,16 +1131,17 @@ def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxe
     return merger.finalize()
 
 
-def main():
-    if DEVICE != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("infer_streamline.py is configured for CUDA-only inference.")
-
-    model, model_config = load_checkpoint(CHECKPOINT_PATH)
-    model.to(DEVICE)
-    model = torch.compile(model)
-    crop_size = _crop_size_from_config(model_config)
-
-    stored_zyxs, valid = _load_surface_zyx(TIFXYZ_PATH)
+def _run_streamline_iteration(
+    model,
+    model_config,
+    volume_array,
+    crop_size,
+    input_tifxyz_path,
+    iteration_idx,
+    total_iterations,
+    output_tifxyz_dir,
+):
+    stored_zyxs, valid = _load_surface_zyx(input_tifxyz_path)
     points_zyx = stored_zyxs[valid]
     if points_zyx.size == 0:
         raise RuntimeError("No valid tifxyz points found.")
@@ -1129,7 +1154,7 @@ def main():
         overlap_frac=OVERLAP_FRAC,
         cond_valid=valid,
     )
-    surface = read_tifxyz(TIFXYZ_PATH)
+    surface = read_tifxyz(input_tifxyz_path)
     voxelized_bboxes = upsample_voxelize_tifxyz_surface_in_bboxes(
         surface,
         bboxes,
@@ -1137,7 +1162,6 @@ def main():
         stored_zyxs=stored_zyxs,
         valid=valid,
     )
-    volume_array = _open_volume_array(VOLUME_PATH, VOLUME_SCALE)
     output_path = _output_zarr_path()
     try:
         output_root = zarr.open_group(str(output_path), mode="w")
@@ -1162,9 +1186,14 @@ def main():
             edge,
             cond_direction,
             integration_result["group"],
+            input_tifxyz_path=input_tifxyz_path,
+            output_dir=output_tifxyz_dir,
+            iteration_idx=iteration_idx,
+            total_iterations=total_iterations,
         )
 
-        print(f"tifxyz_path: {TIFXYZ_PATH}")
+        print(f"iteration: {int(iteration_idx)}/{int(total_iterations)}")
+        print(f"tifxyz_path: {input_tifxyz_path}")
         print(f"volume_path: {VOLUME_PATH}")
         print(f"volume_scale: {int(VOLUME_SCALE)}")
         print(f"checkpoint_path: {CHECKPOINT_PATH}")
@@ -1195,8 +1224,61 @@ def main():
                 voxelized_bboxes=voxelized_bboxes,
                 integration_group=integration_result["group"],
             )
+        return {
+            "input_tifxyz_path": Path(input_tifxyz_path),
+            "output_tifxyz_path": Path(output_tifxyz_path),
+            "output_zarr_path": Path(output_path),
+            "integration_result": integration_result,
+        }
     finally:
         _cleanup_temp_output_zarr(output_path)
+
+
+def main():
+    if DEVICE != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("infer_streamline.py is configured for CUDA-only inference.")
+
+    num_iterations = int(NUM_ITERATIONS)
+    if num_iterations <= 0:
+        raise ValueError("NUM_ITERATIONS must be >= 1.")
+
+    model, model_config = load_checkpoint(CHECKPOINT_PATH)
+    model.to(DEVICE)
+    model = torch.compile(model)
+    crop_size = _crop_size_from_config(model_config)
+    volume_array = _open_volume_array(VOLUME_PATH, VOLUME_SCALE)
+
+    current_tifxyz_path = Path(TIFXYZ_PATH)
+    iteration_results = []
+    temp_tifxyz_dir = None
+    try:
+        if num_iterations > 1 and not SAVE_EACH_ITERATION_TIFXYZ:
+            temp_tifxyz_dir = tempfile.TemporaryDirectory(prefix="infer_streamline_tifxyz_")
+        for iteration_idx in range(1, num_iterations + 1):
+            is_final_iteration = iteration_idx == num_iterations
+            if is_final_iteration or SAVE_EACH_ITERATION_TIFXYZ:
+                output_tifxyz_dir = _output_tifxyz_dir()
+            else:
+                output_tifxyz_dir = Path(temp_tifxyz_dir.name)
+            result = _run_streamline_iteration(
+                model,
+                model_config,
+                volume_array,
+                crop_size,
+                current_tifxyz_path,
+                iteration_idx,
+                num_iterations,
+                output_tifxyz_dir,
+            )
+            iteration_results.append(result)
+            current_tifxyz_path = result["output_tifxyz_path"]
+
+        print(f"num_iterations: {num_iterations}")
+        print(f"save_each_iteration_tifxyz: {bool(SAVE_EACH_ITERATION_TIFXYZ)}")
+        print(f"final_output_tifxyz_path: {iteration_results[-1]['output_tifxyz_path']}")
+    finally:
+        if temp_tifxyz_dir is not None:
+            temp_tifxyz_dir.cleanup()
 
 
 if __name__ == "__main__":
