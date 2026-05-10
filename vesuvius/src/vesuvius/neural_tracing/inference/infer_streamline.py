@@ -41,11 +41,12 @@ OUTPUT_TIFXYZ_DIR = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces"
 OUTPUT_TIFXYZ_VOXEL_SIZE_UM = "2.24"
 MERGE_OUTPUTS_CHUNK_SIZE = 256
 MERGE_OUTPUTS_MMAP_DIR = "/tmp/streamline_tmp_outputs/"
+SHOW_NAPARI = False
 
 GROW_DIRECTION = "left"
 
 TIFXYZ_VOXEL_STEP = 20.0
-TIFXYZ_STEPS = 4
+TIFXYZ_STEPS = 6
 INTEGRATION_STEP_SIZE = 4.0
 TRACE_VALIDITY_THRESHOLD = 0.5
 USE_SURFACE_ATTRACT = True
@@ -473,6 +474,7 @@ class _SparseChunkOutputMerger:
         self.channels = {}
         self.sum_chunks = {}
         self.count_chunks = {}
+        self.counted_regions = set()
 
     def _reserve_bytes(self, n_bytes):
         self.current_bytes += int(n_bytes)
@@ -510,23 +512,22 @@ class _SparseChunkOutputMerger:
         )
 
     def _ensure_chunk(self, output_name, chunk_key):
-        key = (output_name, *chunk_key)
-        if key in self.sum_chunks:
-            return self.sum_chunks[key], self.count_chunks[key]
+        sum_key = (output_name, *chunk_key)
+        if sum_key in self.sum_chunks:
+            return self.sum_chunks[sum_key], self.count_chunks[chunk_key]
 
         channels = self.channels[output_name]
         region = self._chunk_region(chunk_key)
         chunk_shape = tuple(_slice_len(s) for s in region)
         sum_shape = (channels, *chunk_shape)
-        n_bytes = (
-            int(np.prod(sum_shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
-            + int(np.prod(chunk_shape, dtype=np.int64)) * np.dtype(np.uint32).itemsize
-        )
-        self._reserve_bytes(n_bytes)
-        sum_chunk = self._zeros_chunk("sum", key, sum_shape, np.float32)
-        count_chunk = self._zeros_chunk("count", key, chunk_shape, np.uint32)
-        self.sum_chunks[key] = sum_chunk
-        self.count_chunks[key] = count_chunk
+        sum_chunk = self._zeros_chunk("sum", sum_key, sum_shape, np.float32)
+        self._reserve_bytes(int(np.prod(sum_shape, dtype=np.int64)) * np.dtype(np.float32).itemsize)
+        count_chunk = self.count_chunks.get(chunk_key)
+        if count_chunk is None:
+            count_chunk = self._zeros_chunk("count", ("count", *chunk_key), chunk_shape, np.uint32)
+            self.count_chunks[chunk_key] = count_chunk
+            self._reserve_bytes(int(np.prod(chunk_shape, dtype=np.int64)) * np.dtype(np.uint32).itemsize)
+        self.sum_chunks[sum_key] = sum_chunk
         return sum_chunk, count_chunk
 
     def accumulate(self, output_name, output_batch, voxelized_batch):
@@ -555,7 +556,10 @@ class _SparseChunkOutputMerger:
                     for region_axis, chunk_axis in zip(region, chunk_region)
                 )
                 sum_chunk[(slice(None), *local_region)] += output_batch[batch_idx][(slice(None), *crop_region)]
-                count_chunk[local_region] += np.uint32(1)
+                count_key = (tuple(int(v) for v in item["bbox"]), *chunk_key)
+                if count_key not in self.counted_regions:
+                    count_chunk[local_region] += np.uint32(1)
+                    self.counted_regions.add(count_key)
 
     def finalize(self):
         try:
@@ -581,28 +585,29 @@ class _SparseChunkOutputMerger:
                     key for key in self.sum_chunks
                     if key[0] == output_name
                 )
-                for key in output_chunk_keys:
+                for key in tqdm(output_chunk_keys, desc=f"Finalizing {output_name}", unit="chunk"):
                     _, zz, yy, xx = key
                     sum_chunk = self.sum_chunks[key]
-                    count_chunk = self.count_chunks[key]
-                    if isinstance(sum_chunk, np.memmap):
-                        sum_chunk.flush()
-                    if isinstance(count_chunk, np.memmap):
-                        count_chunk.flush()
+                    count_chunk = self.count_chunks[(zz, yy, xx)]
                     region = self._chunk_region((zz, yy, xx))
 
                     count = count_chunk.astype(np.float32, copy=False)
                     valid = count > 0
                     if not bool(valid.any()):
                         continue
-                    avg_chunk = np.zeros(sum_chunk.shape, dtype=np.float32)
-                    np.divide(sum_chunk, count[None, ...], out=avg_chunk, where=valid[None, ...])
+                    avg_chunk = np.empty(sum_chunk.shape, dtype=np.float32)
+                    if bool(valid.all()):
+                        np.divide(sum_chunk, count[None, ...], out=avg_chunk)
+                    else:
+                        avg_chunk.fill(0.0)
+                        np.divide(sum_chunk, count[None, ...], out=avg_chunk, where=valid[None, ...])
                     avg[(slice(None), *region)] = avg_chunk
             return avg_group
         finally:
             if self._tmpdir is not None:
                 self.sum_chunks.clear()
                 self.count_chunks.clear()
+                self.counted_regions.clear()
                 self._tmpdir.cleanup()
                 self._tmpdir = None
 
@@ -774,9 +779,11 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
     active &= seed_in_bounds
     active_mask[0] = active
 
-    for step_idx, step_size in enumerate(step_sizes, start=1):
+    step_iter = tqdm(step_sizes, desc="Integrating streamlines", unit="step")
+    for step_idx, step_size in enumerate(step_iter, start=1):
         next_points = points_local.copy()
         active_idx = np.flatnonzero(active)
+        step_iter.set_postfix(active=int(active_idx.size))
         if active_idx.size > 0:
             velocity_samples, velocity_in_bounds = _sample_field_zyx(velocity, points_local[active_idx])
             speed = np.linalg.norm(velocity_samples, axis=1)
@@ -1165,13 +1172,14 @@ def main():
     print(f"integration_seed_count: {integration_result['seed_count']}")
     print(f"integration_active_endpoints: {integration_result['active_endpoints']}")
 
-    show_streamline_geometry_napari(
-        points_zyx,
-        edge,
-        bboxes,
-        voxelized_bboxes=voxelized_bboxes,
-        integration_group=integration_result["group"],
-    )
+    if SHOW_NAPARI:
+        show_streamline_geometry_napari(
+            points_zyx,
+            edge,
+            bboxes,
+            voxelized_bboxes=voxelized_bboxes,
+            integration_group=integration_result["group"],
+        )
 
 
 if __name__ == "__main__":
