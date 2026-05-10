@@ -6,6 +6,7 @@ import re
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import zarr
 from tqdm import tqdm
 
@@ -46,8 +47,8 @@ SHOW_NAPARI = False
 GROW_DIRECTION = "left"
 
 TIFXYZ_VOXEL_STEP = 20.0
-TIFXYZ_STEPS = 6
-INTEGRATION_STEP_SIZE = 4.0
+TIFXYZ_STEPS = 4
+INTEGRATION_STEP_SIZE = 2.0
 TRACE_VALIDITY_THRESHOLD = 0.5
 USE_SURFACE_ATTRACT = True
 SURFACE_ATTRACT_WEIGHT = 1.0
@@ -756,6 +757,70 @@ def _sigmoid_np(x):
     return out
 
 
+class _TorchStreamlineFieldSampler:
+    def __init__(self, velocity, attract, validity, device):
+        self.device = torch.device(device)
+        fields = np.concatenate(
+            [
+                np.asarray(velocity, dtype=np.float32),
+                np.asarray(attract, dtype=np.float32),
+                np.asarray(validity, dtype=np.float32),
+            ],
+            axis=0,
+        )
+        self.field = torch.from_numpy(fields).to(device=self.device, dtype=torch.float32).unsqueeze(0)
+        _, channels, depth, height, width = self.field.shape
+        if channels != 7:
+            raise RuntimeError(f"Expected 7 streamline field channels, got {channels}")
+        self.depth = int(depth)
+        self.height = int(height)
+        self.width = int(width)
+
+    def sample(self, points_zyx, channel_start, channel_count):
+        if points_zyx.ndim != 2 or points_zyx.shape[1] != 3:
+            raise ValueError(f"points_zyx must be [N, 3], got {tuple(points_zyx.shape)}")
+
+        points = points_zyx.to(device=self.device, dtype=torch.float32)
+        finite = torch.isfinite(points).all(dim=1)
+        safe_points = torch.where(finite[:, None], points, torch.zeros_like(points))
+        in_bounds = (
+            finite
+            & (safe_points[:, 0] >= 0.0) & (safe_points[:, 0] <= self.depth - 1)
+            & (safe_points[:, 1] >= 0.0) & (safe_points[:, 1] <= self.height - 1)
+            & (safe_points[:, 2] >= 0.0) & (safe_points[:, 2] <= self.width - 1)
+        )
+        if points.shape[0] == 0:
+            return points.new_zeros((0, int(channel_count))), in_bounds
+
+        grid = points.new_empty((1, points.shape[0], 1, 1, 3))
+        if self.width > 1:
+            grid[0, :, 0, 0, 0] = 2.0 * safe_points[:, 2] / float(self.width - 1) - 1.0
+        else:
+            grid[0, :, 0, 0, 0] = 0.0
+        if self.height > 1:
+            grid[0, :, 0, 0, 1] = 2.0 * safe_points[:, 1] / float(self.height - 1) - 1.0
+        else:
+            grid[0, :, 0, 0, 1] = 0.0
+        if self.depth > 1:
+            grid[0, :, 0, 0, 2] = 2.0 * safe_points[:, 0] / float(self.depth - 1) - 1.0
+        else:
+            grid[0, :, 0, 0, 2] = 0.0
+
+        field = self.field[:, int(channel_start):int(channel_start) + int(channel_count)]
+        sampled = F.grid_sample(field, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        sampled = sampled.view(int(channel_count), -1).T.contiguous()
+        return sampled, in_bounds
+
+    def sample_velocity(self, points_zyx):
+        return self.sample(points_zyx, 0, 3)
+
+    def sample_attract(self, points_zyx):
+        return self.sample(points_zyx, 3, 3)
+
+    def sample_validity(self, points_zyx):
+        return self.sample(points_zyx, 6, 1)
+
+
 def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
     velocity = _require_avg_field(avg_group, "velocity_dir", 3)
     attract = _require_avg_field(avg_group, "surface_attract", 3)
@@ -772,65 +837,78 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
     points_local = seeds_world - window_min[None, :]
 
     traces_local = np.zeros((len(step_sizes) + 1, seeds_world.shape[0], 3), dtype=np.float32)
+    cumulative_distance = np.zeros((len(step_sizes) + 1, seeds_world.shape[0]), dtype=np.float32)
     active_mask = np.zeros((len(step_sizes) + 1, seeds_world.shape[0]), dtype=bool)
     traces_local[0] = points_local
-    active = np.ones((seeds_world.shape[0],), dtype=bool)
-    _, seed_in_bounds = _sample_field_zyx(validity, points_local)
+    sampler = _TorchStreamlineFieldSampler(velocity, attract, validity, DEVICE)
+    points_t = torch.from_numpy(points_local).to(device=sampler.device, dtype=torch.float32)
+    distance_t = torch.zeros((seeds_world.shape[0],), device=sampler.device, dtype=torch.float32)
+    active = torch.ones((seeds_world.shape[0],), device=sampler.device, dtype=torch.bool)
+    _, seed_in_bounds = sampler.sample_validity(points_t)
     active &= seed_in_bounds
-    active_mask[0] = active
+    active_mask[0] = active.detach().cpu().numpy()
 
     step_iter = tqdm(step_sizes, desc="Integrating streamlines", unit="step")
     for step_idx, step_size in enumerate(step_iter, start=1):
-        next_points = points_local.copy()
-        active_idx = np.flatnonzero(active)
-        step_iter.set_postfix(active=int(active_idx.size))
-        if active_idx.size > 0:
-            velocity_samples, velocity_in_bounds = _sample_field_zyx(velocity, points_local[active_idx])
-            speed = np.linalg.norm(velocity_samples, axis=1)
-            usable = velocity_in_bounds & np.isfinite(speed) & (speed > 1e-6)
-            if usable.any():
+        next_points_t = points_t.clone()
+        next_distance_t = distance_t.clone()
+        active_idx = torch.nonzero(active, as_tuple=False).flatten()
+        step_iter.set_postfix(active=int(active_idx.numel()))
+        if active_idx.numel() > 0:
+            current_points = points_t[active_idx]
+            velocity_samples, velocity_in_bounds = sampler.sample_velocity(current_points)
+            speed = torch.linalg.norm(velocity_samples, dim=1)
+            usable = velocity_in_bounds & torch.isfinite(speed) & (speed > 1e-6)
+            if bool(usable.any().item()):
                 candidate_idx = active_idx[usable]
                 unit_velocity = velocity_samples[usable] / speed[usable, None]
-                candidate = points_local[candidate_idx] + float(step_size) * unit_velocity
+                candidate = points_t[candidate_idx] + float(step_size) * unit_velocity
                 if USE_SURFACE_ATTRACT:
-                    attract_samples, attract_in_bounds = _sample_field_zyx(attract, candidate)
-                    attract_norm = np.linalg.norm(attract_samples, axis=1)
+                    attract_samples, attract_in_bounds = sampler.sample_attract(candidate)
+                    attract_norm = torch.linalg.norm(attract_samples, dim=1)
                     if SURFACE_ATTRACT_MAX_CORRECTION is not None:
                         max_corr = float(SURFACE_ATTRACT_MAX_CORRECTION)
                         if max_corr >= 0.0:
-                            scale = np.minimum(1.0, max_corr / np.maximum(attract_norm, 1e-6))
+                            scale = torch.clamp(max_corr / torch.clamp(attract_norm, min=1e-6), max=1.0)
                             attract_samples = attract_samples * scale[:, None]
                     candidate = candidate + float(SURFACE_ATTRACT_WEIGHT) * attract_samples
                     usable_candidate = attract_in_bounds
                 else:
-                    usable_candidate = np.ones((candidate.shape[0],), dtype=bool)
+                    usable_candidate = torch.ones((candidate.shape[0],), device=sampler.device, dtype=torch.bool)
 
-                validity_logits, valid_in_bounds = _sample_field_zyx(validity, candidate)
-                validity_prob = _sigmoid_np(validity_logits[:, 0])
+                validity_logits, validity_in_bounds = sampler.sample_validity(candidate)
+                validity_prob = torch.sigmoid(validity_logits[:, 0])
                 candidate_active = (
                     usable_candidate
-                    & valid_in_bounds
-                    & np.isfinite(candidate).all(axis=1)
+                    & validity_in_bounds
+                    & torch.isfinite(candidate).all(dim=1)
                     & (validity_prob >= float(TRACE_VALIDITY_THRESHOLD))
                 )
-                next_points[candidate_idx[candidate_active]] = candidate[candidate_active]
+                accepted_idx = candidate_idx[candidate_active]
+                accepted_candidate = candidate[candidate_active]
+                next_points_t[accepted_idx] = accepted_candidate
+                segment_lengths = torch.linalg.norm(accepted_candidate - points_t[accepted_idx], dim=1)
+                next_distance_t[accepted_idx] = distance_t[accepted_idx] + segment_lengths
                 active[candidate_idx] = candidate_active
             active[active_idx[~usable]] = False
 
-        points_local = next_points
-        traces_local[step_idx] = points_local
-        active_mask[step_idx] = active
+        points_t = next_points_t
+        distance_t = next_distance_t
+        traces_local[step_idx] = points_t.detach().cpu().numpy()
+        cumulative_distance[step_idx] = distance_t.detach().cpu().numpy()
+        active_mask[step_idx] = active.detach().cpu().numpy()
 
     traces_world = traces_local + window_min[None, None, :]
     integration = zarr_root.require_group("streamline_integration")
-    for name in ("seed_zyx", "points_zyx", "active_mask", "endpoint_zyx", "endpoint_active"):
+    for name in ("seed_zyx", "points_zyx", "active_mask", "cumulative_distance", "endpoint_zyx", "endpoint_active"):
         if name in integration:
             del integration[name]
     integration.create_dataset("seed_zyx", data=seeds_world.astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
     integration.create_dataset("points_zyx", data=traces_world.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096), 3))
     integration.create_dataset("active_mask", data=active_mask.astype(np.uint8), chunks=(1, min(seeds_world.shape[0], 4096)))
+    integration.create_dataset("cumulative_distance", data=cumulative_distance.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096)))
     integration.create_dataset("endpoint_zyx", data=traces_world[-1].astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("endpoint_active", data=active.astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
+    integration.create_dataset("endpoint_active", data=active.detach().cpu().numpy().astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
     integration.attrs["tifxyz_voxel_step"] = float(TIFXYZ_VOXEL_STEP)
     integration.attrs["tifxyz_steps"] = int(TIFXYZ_STEPS)
     integration.attrs["integration_steps"] = int(len(step_sizes))
@@ -844,12 +922,13 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
     integration.attrs["surface_attract_max_correction"] = (
         None if SURFACE_ATTRACT_MAX_CORRECTION is None else float(SURFACE_ATTRACT_MAX_CORRECTION)
     )
-    integration.attrs["active_endpoints"] = int(active.sum())
+    integration.attrs["distance_sampling"] = "actual_arclength"
+    integration.attrs["active_endpoints"] = int(active.sum().item())
     integration.attrs["seed_count"] = int(seeds_world.shape[0])
     return {
         "group": integration,
         "seed_count": int(seeds_world.shape[0]),
-        "active_endpoints": int(active.sum()),
+        "active_endpoints": int(active.sum().item()),
         "requested_distance": requested_distance,
         "target_distance": target_distance,
         "step_sizes": step_sizes,
@@ -864,8 +943,6 @@ def _streamline_points_at_tifxyz_steps(integration_group):
     if active_mask.shape != traces.shape[:2]:
         raise RuntimeError(f"Unexpected streamline active mask shape: {active_mask.shape}")
 
-    step_sizes = np.asarray(integration_group.attrs["actual_step_sizes"], dtype=np.float32)
-    cumulative = np.concatenate([np.zeros((1,), dtype=np.float32), np.cumsum(step_sizes)])
     tifxyz_step = float(integration_group.attrs.get("tifxyz_voxel_step", TIFXYZ_VOXEL_STEP))
     tifxyz_steps = int(integration_group.attrs.get("tifxyz_steps", TIFXYZ_STEPS))
     if tifxyz_step <= 0.0:
@@ -876,20 +953,47 @@ def _streamline_points_at_tifxyz_steps(integration_group):
 
     sampled_points = np.full((tifxyz_steps, traces.shape[1], 3), -1.0, dtype=np.float32)
     sampled_active = np.zeros((tifxyz_steps, traces.shape[1]), dtype=bool)
-    for out_idx, target_distance in enumerate(target_distances):
-        right = int(np.searchsorted(cumulative, target_distance, side="left"))
-        if right >= cumulative.shape[0]:
-            right = cumulative.shape[0] - 1
-        left = max(0, right - 1)
-        if np.isclose(cumulative[right], target_distance) or right == left:
-            sampled_points[out_idx] = traces[right]
-            sampled_active[out_idx] = active_mask[right]
+
+    if "cumulative_distance" not in integration_group:
+        raise RuntimeError("Missing required streamline cumulative_distance dataset.")
+    cumulative_distance = np.asarray(integration_group["cumulative_distance"], dtype=np.float32)
+    if cumulative_distance.shape != traces.shape[:2]:
+        raise RuntimeError(
+            "Unexpected streamline cumulative distance shape: "
+            f"{cumulative_distance.shape}, expected {traces.shape[:2]}"
+        )
+
+    for seed_idx in range(traces.shape[1]):
+        active_steps = np.flatnonzero(active_mask[:, seed_idx])
+        if active_steps.size == 0:
+            continue
+        distances = cumulative_distance[active_steps, seed_idx]
+        points = traces[active_steps, seed_idx]
+        positive = np.concatenate([[True], np.diff(distances) > 1e-6])
+        distances = distances[positive]
+        points = points[positive]
+        if distances.shape[0] == 0:
             continue
 
-        denom = float(cumulative[right] - cumulative[left])
-        frac = 0.0 if denom <= 0.0 else float((target_distance - cumulative[left]) / denom)
-        sampled_points[out_idx] = traces[left] + frac * (traces[right] - traces[left])
-        sampled_active[out_idx] = active_mask[left] & active_mask[right]
+        for out_idx, target_distance in enumerate(target_distances):
+            if target_distance > distances[-1]:
+                continue
+            right = int(np.searchsorted(distances, target_distance, side="left"))
+            if right >= distances.shape[0]:
+                continue
+            if np.isclose(distances[right], target_distance):
+                sampled_points[out_idx, seed_idx] = points[right]
+                sampled_active[out_idx, seed_idx] = True
+                continue
+            left = right - 1
+            if left < 0:
+                continue
+            denom = float(distances[right] - distances[left])
+            if denom <= 1e-6:
+                continue
+            frac = float((target_distance - distances[left]) / denom)
+            sampled_points[out_idx, seed_idx] = points[left] + frac * (points[right] - points[left])
+            sampled_active[out_idx, seed_idx] = True
 
     sampled_points[~sampled_active] = -1.0
     return sampled_points, sampled_active
