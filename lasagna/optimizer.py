@@ -338,6 +338,11 @@ def optimize(
 	def _next_stage_is_cyl(si_: int) -> bool:
 		return si_ + 1 < len(stages) and _is_cyl_stage(stages[si_ + 1])
 
+	def _shell_pass_count(shell_i_: int) -> int:
+		if hasattr(model, "cylinder_shell_pass_count"):
+			return max(1, int(model.cylinder_shell_pass_count(int(shell_i_))))
+		return 1
+
 	def _scheduled_total_steps() -> int:
 		if not bool(getattr(model, "cyl_shell_mode", False)):
 			return total_steps_for_stages(stages)
@@ -351,7 +356,7 @@ def optimize(
 					continue
 				run_shells_ = 1 if _next_stage_is_cyl(si_) else shell_count_ - next_shell_
 				run_shells_ = max(0, min(run_shells_, shell_count_ - next_shell_))
-				total += steps_ * run_shells_
+				total += steps_ * sum(_shell_pass_count(shell_i_) for shell_i_ in range(next_shell_, next_shell_ + run_shells_))
 				next_shell_ += run_shells_
 			else:
 				total += steps_
@@ -791,11 +796,32 @@ def optimize(
 			else:
 				shell_indices = range(start_shell, shell_count)
 			max_steps = int(opt_cfg.steps)
+			_shell_status_labels: list[str] = []
+			for shell_i in shell_indices:
+				if shell_i <= 0:
+					_shell_status_labels.append(f"{label}.shell{shell_i + 1}")
+				else:
+					_shell_status_labels.append(f"{label}.shell{shell_i + 1}.grow")
+					_shell_status_labels.append(f"{label}.shell{shell_i + 1}.resampled")
+			shell_start = start_shell + 1
+			shell_end = start_shell + len(shell_indices)
+			pass_mode = (
+				"zero-step generate/evaluate only"
+				if max_steps <= 0
+				else f"optimize {max_steps} steps per pass"
+			)
+			print(
+				f"[optimizer] {label}: shell schedule shells={shell_start}-{shell_end}/{shell_count} "
+				f"passes={len(_shell_status_labels)} mode={pass_mode}",
+				flush=True,
+			)
+			for _shell_label in _shell_status_labels:
+				print(f"[optimizer] {label}: queued {_shell_label}", flush=True)
 			_status_step_width = max(
 				_status_step_width,
 				max(
-					len(f"{label}.shell{shell_i + 1} {max_steps}/{max_steps}") + 2
-					for shell_i in shell_indices
+					len(f"{shell_label} {max_steps}/{max_steps}") + 2
+					for shell_label in _shell_status_labels
 				),
 			)
 
@@ -816,18 +842,40 @@ def optimize(
 				if not hasattr(model, "_shell_width_step_stats"):
 					return {}
 				_avg, mn, mx = model._shell_width_step_stats()
-				return {"wstep_min_vx": mn, "wstep_max_vx": mx}
+				return {
+					"wstep_tgt_vx": float(getattr(model, "cyl_shell_current_width_step", 0.0)),
+					"wstep_min_vx": mn,
+					"wstep_max_vx": mx,
+				}
 
 			for shell_i in shell_indices:
 				if hasattr(model, "begin_cylinder_shell"):
 					model.begin_cylinder_shell(shell_i, data)
 				shell_eff = dict(stage_eff)
-				if shell_i == 0:
-					for _first_shell_term in ("cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt"):
-						shell_eff[_first_shell_term] = 0.0
-				shell_passes = [(f"{label}.shell{shell_i + 1}", shell_eff)]
+				for _conn_term in ("cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt"):
+					shell_eff[_conn_term] = 0.0
+				_base_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
+				_grow_wstep = _base_wstep * max(1.0, float(getattr(model, "cyl_shell_growth_factor", 1.5)))
+				if shell_i <= 0:
+					shell_passes = [(f"{label}.shell{shell_i + 1}", shell_eff, False, _base_wstep, _base_wstep)]
+				else:
+					shell_passes = [
+						(f"{label}.shell{shell_i + 1}.grow", shell_eff, False, _base_wstep, _grow_wstep),
+						(f"{label}.shell{shell_i + 1}.resampled", shell_eff, True, _base_wstep, _base_wstep),
+					]
 
-				for shell_label, pass_eff in shell_passes:
+				for shell_label, pass_eff, needs_resample, wstep_start, wstep_end in shell_passes:
+					if needs_resample:
+						if not hasattr(model, "resample_current_cylinder_shell_width_for_growth"):
+							raise RuntimeError("shell grow pass requested, but model cannot resample cylinder shell width")
+						model.resample_current_cylinder_shell_width_for_growth(data)
+					model.cyl_shell_current_width_step = float(wstep_start)
+					action = "evaluate only" if max_steps <= 0 else f"optimize {max_steps} steps"
+					if abs(float(wstep_end) - float(wstep_start)) > 1.0e-6 and max_steps > 0:
+						action = f"{action}, ramp wstep {float(wstep_start):.1f}->{float(wstep_end):.1f}"
+					else:
+						action = f"{action}, wstep {float(wstep_start):.1f}"
+					print(f"[optimizer] {shell_label}: {action}", flush=True)
 					all_params, param_groups = _make_param_groups()
 					if not param_groups:
 						return data
@@ -858,6 +906,9 @@ def optimize(
 					_t_wall_start = time.perf_counter()
 					_t_steps_acc = 0
 					for step in range(max_steps):
+						if max_steps > 0:
+							_alpha = float(step + 1) / float(max_steps)
+							model.cyl_shell_current_width_step = float(wstep_start) + _alpha * (float(wstep_end) - float(wstep_start))
 						if _active_caches:
 							for _cache in _active_caches:
 								_cache.sync()
@@ -917,6 +968,11 @@ def optimize(
 
 				if hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
+					print(
+						f"[optimizer] {label}: completed shells="
+						f"{len(getattr(model, 'cyl_shell_completed', []))}/{shell_count}",
+						flush=True,
+					)
 
 			_stage_done(f"{label}.total", _t_stage_total)
 			return data

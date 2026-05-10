@@ -51,6 +51,7 @@ class FitResult3D:
 	cyl_count: int = 0
 	cyl_shell_mode: bool = False
 	cyl_shell_step: float = 500.0
+	cyl_shell_width_step: float = 0.0
 	cyl_shell_base_xyz: torch.Tensor | None = None
 	cyl_shell_dirs: torch.Tensor | None = None
 	cyl_shell_w_offsets: torch.Tensor | None = None
@@ -133,12 +134,15 @@ class Model3D(nn.Module):
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.cyl_seed_xyz = torch.zeros(3, device=device, dtype=torch.float32)
 		self.cyl_shell_mode = False
-		self.cyl_shell_target_count = 15
+		self.cyl_shell_target_count = 8
 		self.cyl_shell_initial_radius = 1000.0
 		self.cyl_shell_step = 500.0
 		self.cyl_shell_initial_step = 10.0
+		self.cyl_shell_growth_factor = 1.5
+		self.cyl_shell_use_conn_offsets = False
 		self.cyl_shell_z_step = 200.0
 		self.cyl_shell_width_target_step = 200.0
+		self.cyl_shell_current_width_step = self.cyl_shell_width_target_step
 		self.cyl_shell_min_width = 20
 		self.cyl_shell_seed_z = float(z_center)
 		self.cyl_shell_model_h: float | None = None
@@ -390,7 +394,8 @@ class Model3D(nn.Module):
 			  f"H={H} W={W} z_center={self.cyl_shell_seed_z:.1f} "
 			  f"model_h={model_h:.1f} z_step={actual_z_step:.1f} "
 			  f"z_step_target={z_step:.1f} initial_radius={radius0:.1f} "
-			  f"shell_step={self.cyl_shell_step:.1f}",
+			  f"step_growth={float(getattr(self, 'cyl_shell_growth_factor', 1.5)):.3g} "
+			  f"width_target_step={self.cyl_shell_width_target_step:.1f}",
 			  flush=True)
 
 	def _shell_z_values(self, *, device: torch.device, dtype: torch.dtype, h: int) -> torch.Tensor:
@@ -414,9 +419,7 @@ class Model3D(nn.Module):
 
 	def _shell_target_offset_for_index(self, idx: int) -> float:
 		idx = int(idx)
-		if idx == 0:
-			return self._first_shell_radius()
-		return max(1.0, float(self.cyl_shell_step))
+		return self._first_shell_radius()
 
 	def _current_shell_target_offset(self) -> float:
 		return self._shell_target_offset_for_index(int(getattr(self, "cyl_shell_current_index", 0)))
@@ -516,6 +519,8 @@ class Model3D(nn.Module):
 
 	def _shell_w_offset_values(self) -> torch.Tensor:
 		delta_xy = self._shell_delta_xy_params()
+		if not bool(getattr(self, "cyl_shell_use_conn_offsets", False)):
+			return torch.zeros_like(delta_xy[..., 0])
 		if int(getattr(self, "cyl_shell_current_index", 0)) <= 0:
 			return torch.zeros_like(delta_xy[..., 0])
 		if self.cyl_shell_w_offsets.shape != delta_xy.shape[:2]:
@@ -632,31 +637,74 @@ class Model3D(nn.Module):
 				raise ValueError("missing initial shell z values")
 			W = self._shell_width_for_radius(self._first_shell_radius())
 			base, dirs = self._umbilicus_base_shell(data=data, z=self.cyl_shell_z.to(device=device, dtype=dtype), w=W)
+			target_offset = self._shell_target_offset_for_index(idx)
+			delta_xy = self._initial_shell_delta_xy(dirs, target_step=target_offset).to(device=device, dtype=dtype)
+			base_kind = "umbilicus"
+			target_text = f"target_radius={target_offset:.1f} "
 		else:
 			if len(self.cyl_shell_completed) < idx:
 				raise ValueError(f"cannot start shell {idx}: previous shell is missing")
 			prev = self.cyl_shell_completed[idx - 1].to(device=device, dtype=dtype)
-			base = prev
-			dirs = self._gt_xy_dirs_for_reference_shell(prev, data).to(device=device, dtype=dtype)
 			W = int(prev.shape[1])
+			z = prev[:, 0, 2].detach()
+			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
+			delta_xy = prev[..., :2] - base[..., :2]
+			base_kind = "prev_duplicate"
+			target_text = ""
 		H = int(base.shape[0])
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
 		target_offset = self._shell_target_offset_for_index(idx)
-		self.cyl_params = nn.Parameter(self._initial_shell_delta_xy(dirs, target_step=target_offset).to(device=device, dtype=dtype))
+		self.cyl_params = nn.Parameter(delta_xy.to(device=device, dtype=dtype))
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		self.cyl_shell_current_index = idx
+		self.cyl_shell_current_width_step = float(self.cyl_shell_width_target_step)
 		self.cyl_shell_active = True
 		self.cylinder_enabled = True
 		self.cyl_shell_mode = True
 		step_avg, step_min, step_max = self._shell_offset_stats()
 		wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
 		print(f"[model] shell {idx + 1}/{self.cyl_shell_target_count}: H={H} W={W} "
-			  f"base={'umbilicus' if idx == 0 else 'previous'} "
-			  f"target_step={target_offset:.1f} "
+			  f"base={base_kind} "
+			  f"{target_text}"
+			  f"wstep_target={self.cyl_shell_current_width_step:.1f} "
 			  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
 			  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}", flush=True)
+
+	def cylinder_shell_pass_count(self, idx: int) -> int:
+		return 1 if int(idx) <= 0 else 2
+
+	def resample_current_cylinder_shell_width_for_growth(self, data: fit_data.FitData3D) -> None:
+		with torch.no_grad():
+			shell_opt = self.current_cylinder_shell_xyz().detach()
+			old_h = int(shell_opt.shape[0])
+			old_w = int(shell_opt.shape[1])
+			growth = max(1.0, float(getattr(self, "cyl_shell_growth_factor", 1.5)))
+			target_w = max(old_w + 1, int(math.ceil(float(old_w) * growth)))
+			shell = self._resample_shell_width(shell_opt, target_w)
+			device = self.cyl_params.device
+			dtype = self.cyl_params.dtype
+			z = shell[:, 0, 2].to(device=device, dtype=dtype)
+			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=target_w)
+			delta_xy = shell[..., :2].to(device=device, dtype=dtype) - base[..., :2]
+			self._set_shell_grid_shape(h=old_h, w=target_w)
+			self.cyl_shell_base = base.detach()
+			self.cyl_shell_dirs = dirs.detach()
+			self.cyl_params = nn.Parameter(delta_xy.contiguous())
+			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(old_h, target_w, device=device, dtype=dtype))
+			self.cyl_shell_current_width_step = float(self.cyl_shell_width_target_step)
+			self.cyl_shell_active = True
+			self.cylinder_enabled = True
+			self.cyl_shell_mode = True
+			step_avg, step_min, step_max = self._shell_offset_stats()
+			wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
+			print(f"[model] shell {int(self.cyl_shell_current_index) + 1}/{self.cyl_shell_target_count}: "
+				  f"resampled width {old_w} -> {target_w} "
+				  f"wstep_target={self.cyl_shell_current_width_step:.1f} "
+				  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
+				  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}",
+				  flush=True)
 
 	def _resample_shell_width(self, shell: torch.Tensor, target_w: int) -> torch.Tensor:
 		target_w = max(3, int(target_w))
@@ -685,8 +733,7 @@ class Model3D(nn.Module):
 			step_avg, step_min, step_max = self._shell_offset_stats()
 			shell_opt = self.current_cylinder_shell_xyz().detach()
 			min_edge_str, max_edge_str = self._shell_width_edge_extrema_str(shell_opt)
-			target_w = self._target_width_for_shell(shell_opt, data)
-			shell = self._resample_shell_width(shell_opt, target_w)
+			shell = shell_opt.contiguous()
 			idx = int(self.cyl_shell_current_index)
 			if len(self.cyl_shell_completed) > idx:
 				self.cyl_shell_completed[idx] = shell
@@ -1886,6 +1933,7 @@ class Model3D(nn.Module):
 			cyl_count=cyl_count,
 			cyl_shell_mode=bool(self.cyl_shell_mode and self.cylinder_enabled),
 			cyl_shell_step=float(self._current_shell_target_offset()),
+			cyl_shell_width_step=float(getattr(self, "cyl_shell_current_width_step", self.cyl_shell_width_target_step)),
 			cyl_shell_base_xyz=cyl_shell_base_xyz,
 			cyl_shell_dirs=cyl_shell_dirs,
 			cyl_shell_w_offsets=cyl_shell_w_offsets,
@@ -1912,7 +1960,11 @@ class Model3D(nn.Module):
 			out["straight_half_w"] = [self.straight_half_w]
 		if self.cylinder_enabled:
 			out["cyl_params"] = [self.cyl_params]
-			if self.cyl_shell_mode and int(getattr(self, "cyl_shell_current_index", 0)) > 0:
+			if (
+				self.cyl_shell_mode
+				and bool(getattr(self, "cyl_shell_use_conn_offsets", False))
+				and int(getattr(self, "cyl_shell_current_index", 0)) > 0
+			):
 				out["cyl_params"].append(self.cyl_shell_w_offsets)
 		return out
 

@@ -568,21 +568,27 @@ def cyl_z_smooth_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tupl
 
 
 def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Equalize consecutive shell edge lengths to one global differentiable target."""
+	"""Match consecutive shell width edge lengths to the current shell target."""
 	xyz = _shell_xyz(res)
 	if xyz is None:
 		return _zero_loss(res)
 	w_step = torch.roll(xyz, shifts=-1, dims=1) - xyz
 	w_len = w_step.norm(dim=-1)
-	target = w_len.mean().clamp(min=1.0e-6)
+	target_value = float(getattr(res, "cyl_shell_width_step", 0.0))
+	if target_value > 0.0:
+		target = w_len.new_tensor(target_value).clamp(min=1.0e-6)
+	else:
+		target = w_len.mean().clamp(min=1.0e-6)
 	lm = ((w_len - target) / target).square()
 	return _register_shell_term("cyl_step", lm, res=res)
 
 
 def cyl_radial_mean_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Keep only the mean base-to-shell vector length near the shell target."""
+	"""Keep the initial shell near its configured umbilicus radius."""
 	delta_xy = getattr(res, "cyl_shell_delta_xy", None)
 	if delta_xy is None:
+		return _zero_loss(res)
+	if bool(getattr(res, "cyl_shell_mode", False)) and int(getattr(res, "cyl_shell_index", 0)) > 0:
 		return _zero_loss(res)
 	length = delta_xy.norm(dim=-1)
 	target = length.new_tensor(max(1.0, float(getattr(res, "cyl_shell_step", 1.0))))
