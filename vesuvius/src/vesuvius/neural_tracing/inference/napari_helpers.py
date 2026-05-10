@@ -38,6 +38,29 @@ def show_cond_edge_bboxes_napari(
     edge_point_size=4.0,
     voxel_point_size=1.0,
 ):
+    show_streamline_geometry_napari(
+        points_zyx,
+        edge_zyx,
+        bboxes,
+        voxelized_bboxes=voxelized_bboxes,
+        point_downsample=point_downsample,
+        point_size=point_size,
+        edge_point_size=edge_point_size,
+        voxel_point_size=voxel_point_size,
+    )
+
+
+def show_streamline_geometry_napari(
+    points_zyx,
+    edge_zyx,
+    bboxes,
+    voxelized_bboxes=None,
+    integration_group=None,
+    point_downsample=2,
+    point_size=2.0,
+    edge_point_size=4.0,
+    voxel_point_size=1.0,
+):
     try:
         import napari
     except Exception as exc:
@@ -100,5 +123,28 @@ def show_cond_edge_bboxes_napari(
             name="cond_edge_bboxes",
             opacity=0.9,
         )
+
+    if integration_group is not None and "points_zyx" in integration_group:
+        traces = np.asarray(integration_group["points_zyx"], dtype=np.float32)
+        active_mask = np.asarray(integration_group["active_mask"], dtype=bool)
+        path_segments = []
+        if traces.ndim == 3 and traces.shape[0] > 1:
+            for point_idx in range(traces.shape[1]):
+                valid_steps = np.flatnonzero(active_mask[:, point_idx])
+                if valid_steps.size < 2:
+                    continue
+                path = traces[valid_steps, point_idx, :]
+                if np.isfinite(path).all():
+                    path_segments.append(path)
+        if path_segments:
+            viewer.add_shapes(
+                path_segments,
+                shape_type="path",
+                edge_color=[1.0, 0.0, 0.8, 0.9],
+                edge_width=1,
+                face_color="transparent",
+                name="integrated_streamlines",
+                opacity=0.9,
+            )
 
     napari.run()

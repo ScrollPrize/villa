@@ -1,6 +1,8 @@
 from pathlib import Path
 import tempfile
 from datetime import datetime
+import hashlib
+import re
 
 import numpy as np
 import torch
@@ -15,12 +17,13 @@ from vesuvius.neural_tracing.datasets.common import (
     voxelize_surface_grid_into,
 )
 from vesuvius.neural_tracing.datasets.growth_direction import make_growth_direction_tensor
-from vesuvius.neural_tracing.inference.napari_helpers import bbox_wireframe_segments
+from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
+from vesuvius.neural_tracing.inference.napari_helpers import show_streamline_geometry_napari
 from vesuvius.neural_tracing.nets.models import load_checkpoint
 from vesuvius.tifxyz import read_tifxyz
 
 
-TIFXYZ_PATH = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces/w21_0805261025_sel_20260509_110821_1"
+TIFXYZ_PATH = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces/test_in_small"
 VOLUME_PATH = "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/"
 VOLUME_SCALE = 0
 VOLUME_CACHE_DIR = "/tmp/vesuvius-volume-cache"
@@ -34,16 +37,15 @@ DEVICE = "cuda"
 
 OVERLAP_FRAC = 0.50
 OUTPUT_ZARR_PATH = None
-SHOW_NAPARI_GEOMETRY = True
+OUTPUT_TIFXYZ_DIR = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces"
+OUTPUT_TIFXYZ_VOXEL_SIZE_UM = "2.24"
+MERGE_OUTPUTS_CHUNK_SIZE = 256
+MERGE_OUTPUTS_MMAP_DIR = "/tmp/streamline_tmp_outputs/"
 
 GROW_DIRECTION = "left"
 
-POINT_DOWNSAMPLE = 2
-POINT_SIZE = 2.0
-EDGE_POINT_SIZE = 4.0
-
 TIFXYZ_VOXEL_STEP = 20.0
-TIFXYZ_STEPS = 2
+TIFXYZ_STEPS = 4
 INTEGRATION_STEP_SIZE = 4.0
 TRACE_VALIDITY_THRESHOLD = 0.5
 USE_SURFACE_ATTRACT = True
@@ -378,6 +380,28 @@ def _output_zarr_path():
     return Path(tempfile.gettempdir()) / f"infer_streamline_rowcol_{timestamp}.zarr"
 
 
+def _output_tifxyz_dir():
+    if OUTPUT_TIFXYZ_DIR is not None:
+        return Path(OUTPUT_TIFXYZ_DIR)
+    return Path(TIFXYZ_PATH).parent
+
+
+def _output_tifxyz_uuid(timestamp=None):
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    input_name = Path(TIFXYZ_PATH).name
+    return f"{input_name}_{timestamp}_{GROW_DIRECTION}_{int(TIFXYZ_STEPS)}steps"
+
+
+def _output_tifxyz_voxel_size_um():
+    if OUTPUT_TIFXYZ_VOXEL_SIZE_UM is not None:
+        return float(OUTPUT_TIFXYZ_VOXEL_SIZE_UM)
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)um", str(VOLUME_PATH))
+    if match is not None:
+        return float(match.group(1))
+    return 8.24
+
+
 def _merged_window_from_bboxes(bboxes):
     if not bboxes:
         raise ValueError("No bboxes to merge.")
@@ -417,108 +441,177 @@ def _prepare_rowcol_inputs(volume_array, voxelized_batch, crop_size, cond_direct
     return torch.cat([vol, cond, direction], dim=1)
 
 
-def _ensure_output_accumulators(root, output_name, channels, window_shape):
-    outputs = root.require_group("outputs")
-    sums = outputs.require_group("sum")
-    counts = outputs.require_group("count")
-    sum_shape = (int(channels), *tuple(int(v) for v in window_shape))
-    count_shape = tuple(int(v) for v in window_shape)
-    chunks_3d = tuple(min(int(v), 64) for v in window_shape)
-    if output_name not in sums:
-        sums.create_dataset(
-            output_name,
-            shape=sum_shape,
-            chunks=(int(channels), *chunks_3d),
-            dtype="f4",
-            fill_value=0.0,
+def _slice_len(s):
+    return int(s.stop) - int(s.start)
+
+
+def _chunk_slices_for_region(start, end, chunks):
+    z0, y0, x0 = (int(v) for v in start)
+    z1, y1, x1 = (int(v) for v in end)
+    cz, cy, cx = (int(v) for v in chunks)
+    for zz in range(z0 // cz, (z1 - 1) // cz + 1):
+        zs = slice(max(z0, zz * cz), min(z1, (zz + 1) * cz))
+        for yy in range(y0 // cy, (y1 - 1) // cy + 1):
+            ys = slice(max(y0, yy * cy), min(y1, (yy + 1) * cy))
+            for xx in range(x0 // cx, (x1 - 1) // cx + 1):
+                xs = slice(max(x0, xx * cx), min(x1, (xx + 1) * cx))
+                yield (zz, yy, xx), (zs, ys, xs)
+
+
+class _SparseChunkOutputMerger:
+    def __init__(self, root, window_min, window_shape, crop_size, mmap_dir=None):
+        self.root = root
+        self.window_min = np.asarray(window_min, dtype=np.int64)
+        self.window_shape = tuple(int(v) for v in window_shape)
+        self.crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+        self.chunks_3d = tuple(min(int(MERGE_OUTPUTS_CHUNK_SIZE), int(v)) for v in self.window_shape)
+        self.current_bytes = 0
+        if mmap_dir is not None:
+            Path(mmap_dir).mkdir(parents=True, exist_ok=True)
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="infer_streamline_merge_", dir=mmap_dir)
+        self._tmpdir_path = Path(self._tmpdir.name)
+        self.channels = {}
+        self.sum_chunks = {}
+        self.count_chunks = {}
+
+    def _reserve_bytes(self, n_bytes):
+        self.current_bytes += int(n_bytes)
+
+    def _chunk_path(self, kind, key):
+        output_name, zz, yy, xx = key
+        safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(output_name))
+        digest = hashlib.blake2b(str(output_name).encode("utf-8"), digest_size=6).hexdigest()
+        return self._tmpdir_path / f"{safe_name}_{digest}_{int(zz)}_{int(yy)}_{int(xx)}_{kind}.npy"
+
+    def _zeros_chunk(self, kind, key, shape, dtype):
+        path = self._chunk_path(kind, key)
+        arr = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+        arr[...] = 0
+        return arr
+
+    def _ensure_output(self, output_name, channels):
+        channels = int(channels)
+        previous_channels = self.channels.get(output_name)
+        if previous_channels is not None and previous_channels != channels:
+            raise ValueError(
+                f"Output {output_name!r} channel count changed from {previous_channels} to {channels}."
+            )
+        self.channels[output_name] = channels
+
+    def _chunk_region(self, chunk_key):
+        zz, yy, xx = (int(v) for v in chunk_key)
+        z0 = zz * self.chunks_3d[0]
+        y0 = yy * self.chunks_3d[1]
+        x0 = xx * self.chunks_3d[2]
+        return (
+            slice(z0, min(z0 + self.chunks_3d[0], self.window_shape[0])),
+            slice(y0, min(y0 + self.chunks_3d[1], self.window_shape[1])),
+            slice(x0, min(x0 + self.chunks_3d[2], self.window_shape[2])),
         )
-    if output_name not in counts:
-        counts.create_dataset(
-            output_name,
-            shape=count_shape,
-            chunks=chunks_3d,
-            dtype="u4",
-            fill_value=0,
+
+    def _ensure_chunk(self, output_name, chunk_key):
+        key = (output_name, *chunk_key)
+        if key in self.sum_chunks:
+            return self.sum_chunks[key], self.count_chunks[key]
+
+        channels = self.channels[output_name]
+        region = self._chunk_region(chunk_key)
+        chunk_shape = tuple(_slice_len(s) for s in region)
+        sum_shape = (channels, *chunk_shape)
+        n_bytes = (
+            int(np.prod(sum_shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
+            + int(np.prod(chunk_shape, dtype=np.int64)) * np.dtype(np.uint32).itemsize
         )
-    return sums[output_name], counts[output_name]
+        self._reserve_bytes(n_bytes)
+        sum_chunk = self._zeros_chunk("sum", key, sum_shape, np.float32)
+        count_chunk = self._zeros_chunk("count", key, chunk_shape, np.uint32)
+        self.sum_chunks[key] = sum_chunk
+        self.count_chunks[key] = count_chunk
+        return sum_chunk, count_chunk
 
+    def accumulate(self, output_name, output_batch, voxelized_batch):
+        output_batch = np.asarray(output_batch, dtype=np.float32)
+        if output_batch.ndim != 5:
+            raise ValueError(f"Output {output_name!r} must be [B, C, D, H, W], got {output_batch.shape}")
+        if tuple(output_batch.shape[2:]) != tuple(self.crop_size_arr.tolist()):
+            raise ValueError(
+                f"Output {output_name!r} spatial shape {output_batch.shape[2:]} "
+                f"does not match crop_size {tuple(self.crop_size_arr.tolist())}"
+            )
+        self._ensure_output(output_name, output_batch.shape[1])
 
-def _accumulate_output(root, output_name, output_batch, voxelized_batch, window_min, window_shape, crop_size):
-    output_batch = np.asarray(output_batch, dtype=np.float32)
-    if output_batch.ndim != 5:
-        raise ValueError(f"Output {output_name!r} must be [B, C, D, H, W], got {output_batch.shape}")
-    if tuple(output_batch.shape[2:]) != tuple(crop_size):
-        raise ValueError(
-            f"Output {output_name!r} spatial shape {output_batch.shape[2:]} "
-            f"does not match crop_size {tuple(crop_size)}"
-        )
-
-    sum_arr, count_arr = _ensure_output_accumulators(
-        root,
-        output_name,
-        channels=output_batch.shape[1],
-        window_shape=window_shape,
-    )
-
-    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
-    for batch_idx, item in enumerate(voxelized_batch):
-        start = _bbox_min_corner(item["bbox"]) - window_min
-        end = start + crop_size_arr
-        z0, y0, x0 = start.astype(int).tolist()
-        z1, y1, x1 = end.astype(int).tolist()
-        region = (slice(z0, z1), slice(y0, y1), slice(x0, x1))
-        sum_arr[(slice(None), *region)] = sum_arr[(slice(None), *region)] + output_batch[batch_idx]
-        count_arr[region] = count_arr[region] + np.uint32(1)
-
-
-def _iter_3d_chunks(shape, chunks):
-    z_chunk, y_chunk, x_chunk = (int(v) for v in chunks)
-    z_size, y_size, x_size = (int(v) for v in shape)
-    for z0 in range(0, z_size, z_chunk):
-        for y0 in range(0, y_size, y_chunk):
-            for x0 in range(0, x_size, x_chunk):
-                yield (
-                    slice(z0, min(z0 + z_chunk, z_size)),
-                    slice(y0, min(y0 + y_chunk, y_size)),
-                    slice(x0, min(x0 + x_chunk, x_size)),
+        for batch_idx, item in enumerate(voxelized_batch):
+            start = _bbox_min_corner(item["bbox"]) - self.window_min
+            end = start + self.crop_size_arr
+            for chunk_key, region in _chunk_slices_for_region(start, end, self.chunks_3d):
+                sum_chunk, count_chunk = self._ensure_chunk(output_name, chunk_key)
+                crop_region = tuple(
+                    slice(int(region_axis.start) - int(start_axis), int(region_axis.stop) - int(start_axis))
+                    for region_axis, start_axis in zip(region, start)
                 )
+                chunk_region = self._chunk_region(chunk_key)
+                local_region = tuple(
+                    slice(int(region_axis.start) - int(chunk_axis.start), int(region_axis.stop) - int(chunk_axis.start))
+                    for region_axis, chunk_axis in zip(region, chunk_region)
+                )
+                sum_chunk[(slice(None), *local_region)] += output_batch[batch_idx][(slice(None), *crop_region)]
+                count_chunk[local_region] += np.uint32(1)
 
+    def finalize(self):
+        try:
+            outputs = self.root.require_group("outputs")
+            avg_group = outputs.require_group("avg")
+            avg_group.attrs["window_min_zyx"] = self.root.attrs.get("window_min_zyx", [0, 0, 0])
+            avg_group.attrs["window_shape_zyx"] = self.root.attrs.get("window_shape_zyx", None)
+            avg_group.attrs["merge_backing"] = "mmap"
+            avg_group.attrs["merge_sparse_bytes"] = int(self.current_bytes)
 
-def _finalize_averages(root):
-    outputs = root["outputs"]
-    avg_group = outputs.require_group("avg")
-    avg_group.attrs["window_min_zyx"] = root.attrs.get("window_min_zyx", [0, 0, 0])
-    avg_group.attrs["window_shape_zyx"] = root.attrs.get("window_shape_zyx", None)
-    for output_name in outputs["sum"].array_keys():
-        sum_arr = outputs["sum"][output_name]
-        count_arr = outputs["count"][output_name]
-        if output_name in avg_group:
-            del avg_group[output_name]
-        avg = avg_group.create_dataset(
-            output_name,
-            shape=sum_arr.shape,
-            chunks=sum_arr.chunks,
-            dtype="f4",
-            fill_value=0.0,
-        )
-        for region in _iter_3d_chunks(count_arr.shape, count_arr.chunks):
-            count = count_arr[region].astype(np.float32, copy=False)
-            valid = count > 0
-            if not bool(valid.any()):
-                continue
-            for channel_idx in range(sum_arr.shape[0]):
-                chunk = np.zeros(count.shape, dtype=np.float32)
-                values = sum_arr[(channel_idx, *region)]
-                chunk[valid] = values[valid] / count[valid]
-                avg[(channel_idx, *region)] = chunk
-    return avg_group
+            for output_name, channels in self.channels.items():
+                if output_name in avg_group:
+                    del avg_group[output_name]
+
+                avg = avg_group.create_dataset(
+                    output_name,
+                    shape=(int(channels), *self.window_shape),
+                    chunks=(int(channels), *self.chunks_3d),
+                    dtype="f4",
+                    fill_value=0.0,
+                )
+                output_chunk_keys = sorted(
+                    key for key in self.sum_chunks
+                    if key[0] == output_name
+                )
+                for key in output_chunk_keys:
+                    _, zz, yy, xx = key
+                    sum_chunk = self.sum_chunks[key]
+                    count_chunk = self.count_chunks[key]
+                    if isinstance(sum_chunk, np.memmap):
+                        sum_chunk.flush()
+                    if isinstance(count_chunk, np.memmap):
+                        count_chunk.flush()
+                    region = self._chunk_region((zz, yy, xx))
+
+                    count = count_chunk.astype(np.float32, copy=False)
+                    valid = count > 0
+                    if not bool(valid.any()):
+                        continue
+                    avg_chunk = np.zeros(sum_chunk.shape, dtype=np.float32)
+                    np.divide(sum_chunk, count[None, ...], out=avg_chunk, where=valid[None, ...])
+                    avg[(slice(None), *region)] = avg_chunk
+            return avg_group
+        finally:
+            if self._tmpdir is not None:
+                self.sum_chunks.clear()
+                self.count_chunks.clear()
+                self._tmpdir.cleanup()
+                self._tmpdir = None
 
 
 def _require_avg_field(avg_group, name, channels):
     if name not in avg_group:
         raise KeyError(f"Missing required averaged output field {name!r}.")
-    field = np.asarray(avg_group[name], dtype=np.float32)
-    if field.ndim != 4 or field.shape[0] != int(channels):
+    field = avg_group[name]
+    if len(field.shape) != 4 or field.shape[0] != int(channels):
         raise ValueError(f"Field {name!r} must have shape ({channels}, D, H, W), got {field.shape}")
     return field
 
@@ -545,9 +638,8 @@ def _integration_step_sizes():
 
 
 def _sample_field_zyx(field, points_zyx):
-    field = np.asarray(field, dtype=np.float32)
     points = np.asarray(points_zyx, dtype=np.float32)
-    if field.ndim != 4:
+    if len(field.shape) != 4:
         raise ValueError(f"field must be [C, D, H, W], got {field.shape}")
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"points_zyx must be [N, 3], got {points.shape}")
@@ -577,14 +669,14 @@ def _sample_field_zyx(field, points_zyx):
     dy = (p[:, 1] - y0).astype(np.float32)
     dx = (p[:, 2] - x0).astype(np.float32)
 
-    c000 = field[:, z0, y0, x0].T
-    c001 = field[:, z0, y0, x1].T
-    c010 = field[:, z0, y1, x0].T
-    c011 = field[:, z0, y1, x1].T
-    c100 = field[:, z1, y0, x0].T
-    c101 = field[:, z1, y0, x1].T
-    c110 = field[:, z1, y1, x0].T
-    c111 = field[:, z1, y1, x1].T
+    c000 = _field_values_at_indices(field, z0, y0, x0)
+    c001 = _field_values_at_indices(field, z0, y0, x1)
+    c010 = _field_values_at_indices(field, z0, y1, x0)
+    c011 = _field_values_at_indices(field, z0, y1, x1)
+    c100 = _field_values_at_indices(field, z1, y0, x0)
+    c101 = _field_values_at_indices(field, z1, y0, x1)
+    c110 = _field_values_at_indices(field, z1, y1, x0)
+    c111 = _field_values_at_indices(field, z1, y1, x1)
 
     wx0 = (1.0 - dx)[:, None]
     wx1 = dx[:, None]
@@ -601,6 +693,52 @@ def _sample_field_zyx(field, points_zyx):
     c1 = c10 * wy0 + c11 * wy1
     out[idx] = c0 * wz0 + c1 * wz1
     return out, in_bounds
+
+
+def _field_values_at_indices(field, z, y, x):
+    z = np.asarray(z, dtype=np.int64)
+    y = np.asarray(y, dtype=np.int64)
+    x = np.asarray(x, dtype=np.int64)
+    if isinstance(field, np.ndarray):
+        return field[:, z, y, x].T
+
+    channels = int(field.shape[0])
+    values = np.zeros((z.shape[0], channels), dtype=np.float32)
+    chunks = getattr(field, "chunks", None)
+    if chunks is None or len(chunks) != 4:
+        for idx in range(z.shape[0]):
+            values[idx] = np.asarray(field[:, int(z[idx]), int(y[idx]), int(x[idx])], dtype=np.float32)
+        return values
+
+    _, z_chunk, y_chunk, x_chunk = (int(v) for v in chunks)
+    chunk_keys = np.stack([z // z_chunk, y // y_chunk, x // x_chunk], axis=1)
+    unique_keys = np.unique(chunk_keys, axis=0)
+    for zz, yy, xx in unique_keys:
+        mask = (
+            (chunk_keys[:, 0] == zz)
+            & (chunk_keys[:, 1] == yy)
+            & (chunk_keys[:, 2] == xx)
+        )
+        point_idx = np.flatnonzero(mask)
+        z0 = int(zz) * z_chunk
+        y0 = int(yy) * y_chunk
+        x0 = int(xx) * x_chunk
+        chunk = np.asarray(
+            field[
+                :,
+                slice(z0, min(z0 + z_chunk, int(field.shape[1]))),
+                slice(y0, min(y0 + y_chunk, int(field.shape[2]))),
+                slice(x0, min(x0 + x_chunk, int(field.shape[3]))),
+            ],
+            dtype=np.float32,
+        )
+        values[point_idx] = chunk[
+            :,
+            z[point_idx] - z0,
+            y[point_idx] - y0,
+            x[point_idx] - x0,
+        ].T
+    return values
 
 
 def _sigmoid_np(x):
@@ -711,6 +849,200 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
     }
 
 
+def _streamline_points_at_tifxyz_steps(integration_group):
+    traces = np.asarray(integration_group["points_zyx"], dtype=np.float32)
+    active_mask = np.asarray(integration_group["active_mask"], dtype=bool)
+    if traces.ndim != 3 or traces.shape[-1] != 3:
+        raise RuntimeError(f"Unexpected streamline points shape: {traces.shape}")
+    if active_mask.shape != traces.shape[:2]:
+        raise RuntimeError(f"Unexpected streamline active mask shape: {active_mask.shape}")
+
+    step_sizes = np.asarray(integration_group.attrs["actual_step_sizes"], dtype=np.float32)
+    cumulative = np.concatenate([np.zeros((1,), dtype=np.float32), np.cumsum(step_sizes)])
+    tifxyz_step = float(integration_group.attrs.get("tifxyz_voxel_step", TIFXYZ_VOXEL_STEP))
+    tifxyz_steps = int(integration_group.attrs.get("tifxyz_steps", TIFXYZ_STEPS))
+    if tifxyz_step <= 0.0:
+        raise ValueError("tifxyz_voxel_step must be > 0.")
+    if tifxyz_steps <= 0:
+        raise ValueError("tifxyz_steps must be > 0.")
+    target_distances = tifxyz_step * np.arange(1, tifxyz_steps + 1, dtype=np.float32)
+
+    sampled_points = np.full((tifxyz_steps, traces.shape[1], 3), -1.0, dtype=np.float32)
+    sampled_active = np.zeros((tifxyz_steps, traces.shape[1]), dtype=bool)
+    for out_idx, target_distance in enumerate(target_distances):
+        right = int(np.searchsorted(cumulative, target_distance, side="left"))
+        if right >= cumulative.shape[0]:
+            right = cumulative.shape[0] - 1
+        left = max(0, right - 1)
+        if np.isclose(cumulative[right], target_distance) or right == left:
+            sampled_points[out_idx] = traces[right]
+            sampled_active[out_idx] = active_mask[right]
+            continue
+
+        denom = float(cumulative[right] - cumulative[left])
+        frac = 0.0 if denom <= 0.0 else float((target_distance - cumulative[left]) / denom)
+        sampled_points[out_idx] = traces[left] + frac * (traces[right] - traces[left])
+        sampled_active[out_idx] = active_mask[left] & active_mask[right]
+
+    sampled_points[~sampled_active] = -1.0
+    return sampled_points, sampled_active
+
+
+def _interp_polyline_at_distances(points, distances):
+    points = np.asarray(points, dtype=np.float32)
+    distances = np.asarray(distances, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must be [N, 3], got {points.shape}")
+    if points.shape[0] == 0:
+        return np.zeros((distances.shape[0], 3), dtype=np.float32)
+    if points.shape[0] == 1:
+        return np.repeat(points, distances.shape[0], axis=0)
+
+    segment_vecs = points[1:] - points[:-1]
+    segment_lengths = np.linalg.norm(segment_vecs, axis=1).astype(np.float32)
+    cumulative = np.concatenate([np.zeros((1,), dtype=np.float32), np.cumsum(segment_lengths)])
+    positive = segment_lengths > 1e-6
+    if not bool(positive.any()):
+        return np.repeat(points[:1], distances.shape[0], axis=0)
+
+    out = np.empty((distances.shape[0], 3), dtype=np.float32)
+    first_idx = int(np.flatnonzero(positive)[0])
+    last_idx = int(np.flatnonzero(positive)[-1])
+    for out_idx, distance in enumerate(distances):
+        if distance <= cumulative[first_idx]:
+            seg_idx = first_idx
+        elif distance >= cumulative[last_idx + 1]:
+            seg_idx = last_idx
+        else:
+            seg_idx = int(np.searchsorted(cumulative, distance, side="right") - 1)
+            while seg_idx < segment_lengths.shape[0] - 1 and segment_lengths[seg_idx] <= 1e-6:
+                seg_idx += 1
+            if segment_lengths[seg_idx] <= 1e-6:
+                seg_idx = last_idx
+        frac = (float(distance) - float(cumulative[seg_idx])) / float(segment_lengths[seg_idx])
+        out[out_idx] = points[seg_idx] + frac * segment_vecs[seg_idx]
+    return out
+
+
+def _regularize_tifxyz_front_spacing(sampled_points, sampled_active, tifxyz_step):
+    sampled_points = np.asarray(sampled_points, dtype=np.float32).copy()
+    sampled_active = np.asarray(sampled_active, dtype=bool).copy()
+    tifxyz_step = float(tifxyz_step)
+    if tifxyz_step <= 0.0:
+        raise ValueError("tifxyz_step must be > 0.")
+    if sampled_points.ndim != 3 or sampled_points.shape[-1] != 3:
+        raise ValueError(f"sampled_points must be [S, N, 3], got {sampled_points.shape}")
+    if sampled_active.shape != sampled_points.shape[:2]:
+        raise ValueError(f"sampled_active must match sampled_points[:2], got {sampled_active.shape}")
+
+    for step_idx in range(sampled_points.shape[0]):
+        active_indices = np.flatnonzero(sampled_active[step_idx])
+        if active_indices.size <= 1:
+            continue
+        run_start = 0
+        while run_start < active_indices.size:
+            run_end = run_start + 1
+            while (
+                run_end < active_indices.size
+                and active_indices[run_end] == active_indices[run_end - 1] + 1
+            ):
+                run_end += 1
+
+            run_indices = active_indices[run_start:run_end]
+            if run_indices.size > 1:
+                points = sampled_points[step_idx, run_indices]
+                if np.isfinite(points).all():
+                    distances = tifxyz_step * np.arange(run_indices.size, dtype=np.float32)
+                    sampled_points[step_idx, run_indices] = _interp_polyline_at_distances(points, distances)
+
+            run_start = run_end
+
+    sampled_points[~sampled_active] = -1.0
+    return sampled_points, sampled_active
+
+
+def _build_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction, integration_group):
+    base = np.asarray(stored_zyxs, dtype=np.float32).copy()
+    valid = np.asarray(valid, dtype=bool)
+    if base.ndim != 3 or base.shape[-1] != 3:
+        raise RuntimeError(f"Unexpected input tifxyz shape: {base.shape}")
+    if valid.shape != base.shape[:2]:
+        raise RuntimeError(f"Unexpected input tifxyz valid mask shape: {valid.shape}")
+    base[~valid] = -1.0
+
+    edge = np.asarray(edge_zyx, dtype=np.float32)
+    edge_valid = np.isfinite(edge).all(axis=1) & ~(edge == -1).all(axis=1)
+    sampled_points, sampled_active = _streamline_points_at_tifxyz_steps(integration_group)
+    sampled_points, sampled_active = _regularize_tifxyz_front_spacing(
+        sampled_points,
+        sampled_active,
+        float(integration_group.attrs.get("tifxyz_voxel_step", TIFXYZ_VOXEL_STEP)),
+    )
+    if sampled_points.shape[1] != int(edge_valid.sum()):
+        raise RuntimeError(
+            "Streamline seed count does not match conditioning edge valid count: "
+            f"{sampled_points.shape[1]} vs {int(edge_valid.sum())}"
+        )
+
+    spec = _get_direction_spec(cond_direction)
+    n_steps = int(sampled_points.shape[0])
+    if spec["axis"] == "col":
+        if edge.shape[0] != base.shape[0]:
+            raise RuntimeError(f"Conditioning edge length {edge.shape[0]} does not match tifxyz rows {base.shape[0]}.")
+        strip = np.full((base.shape[0], n_steps, 3), -1.0, dtype=np.float32)
+        strip_active = np.zeros((base.shape[0], n_steps), dtype=bool)
+        strip[edge_valid, :, :] = np.moveaxis(sampled_points, 0, 1)
+        strip_active[edge_valid, :] = np.moveaxis(sampled_active, 0, 1)
+        strip[~strip_active] = -1.0
+        if spec["edge_idx"] == 0:
+            strip = strip[:, ::-1, :]
+            return np.concatenate([strip, base], axis=1)
+        return np.concatenate([base, strip], axis=1)
+
+    if edge.shape[0] != base.shape[1]:
+        raise RuntimeError(f"Conditioning edge length {edge.shape[0]} does not match tifxyz columns {base.shape[1]}.")
+    strip = np.full((n_steps, base.shape[1], 3), -1.0, dtype=np.float32)
+    strip_active = np.zeros((n_steps, base.shape[1]), dtype=bool)
+    strip[:, edge_valid, :] = sampled_points
+    strip_active[:, edge_valid] = sampled_active
+    strip[~strip_active] = -1.0
+    if spec["edge_idx"] == 0:
+        strip = strip[::-1, :, :]
+        return np.concatenate([strip, base], axis=0)
+    return np.concatenate([base, strip], axis=0)
+
+
+def save_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction, integration_group):
+    merged_zyxs = _build_merged_streamline_tifxyz(
+        stored_zyxs,
+        valid,
+        edge_zyx,
+        cond_direction,
+        integration_group,
+    )
+    output_dir = _output_tifxyz_dir()
+    output_uuid = _output_tifxyz_uuid()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_tifxyz(
+        merged_zyxs,
+        str(output_dir),
+        output_uuid,
+        step_size=int(round(float(TIFXYZ_VOXEL_STEP))),
+        voxel_size_um=_output_tifxyz_voxel_size_um(),
+        source="vesuvius.neural_tracing.inference.infer_streamline",
+        additional_metadata={
+            "input_tifxyz_path": str(TIFXYZ_PATH),
+            "grow_direction": str(GROW_DIRECTION),
+            "cond_direction": str(cond_direction),
+            "tifxyz_voxel_step": float(TIFXYZ_VOXEL_STEP),
+            "tifxyz_steps": int(TIFXYZ_STEPS),
+            "integration_step_size": float(INTEGRATION_STEP_SIZE),
+            "trace_validity_threshold": float(TRACE_VALIDITY_THRESHOLD),
+        },
+    )
+    return output_dir / output_uuid
+
+
 def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxes, crop_size, cond_direction, zarr_root):
     window_min, window_shape = _merged_window_from_bboxes([item["bbox"] for item in voxelized_bboxes])
     zarr_root.attrs["window_min_zyx"] = [int(v) for v in window_min]
@@ -724,6 +1056,14 @@ def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxe
     amp_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
     model.eval()
+    merger = _SparseChunkOutputMerger(
+        zarr_root,
+        window_min,
+        window_shape,
+        crop_size,
+        mmap_dir=MERGE_OUTPUTS_MMAP_DIR,
+    )
+
     batch_starts = range(0, len(voxelized_bboxes), int(BATCH_SIZE))
     for start in tqdm(batch_starts, desc="Row/col bbox inference", unit="batch"):
         batch = voxelized_bboxes[start:start + int(BATCH_SIZE)]
@@ -740,107 +1080,10 @@ def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxe
             output_value = _collapse_output(output_value)
             if output_value is None:
                 continue
-            _accumulate_output(
-                zarr_root,
-                output_name,
-                output_value.detach().float().cpu().numpy(),
-                batch,
-                window_min,
-                window_shape,
-                crop_size,
-            )
+            output_np = output_value.detach().float().cpu().numpy()
+            merger.accumulate(output_name, output_np, batch)
 
-    return _finalize_averages(zarr_root)
-
-
-def show_streamline_geometry_napari(points_zyx, edge_zyx, bboxes, voxelized_bboxes, integration_group=None):
-    try:
-        import napari
-    except Exception as exc:
-        raise RuntimeError("napari is not available.") from exc
-
-    viewer = napari.Viewer(ndisplay=3)
-
-    points = np.asarray(points_zyx, dtype=np.float32)
-    downsample = max(1, int(POINT_DOWNSAMPLE))
-    if downsample > 1:
-        points = points[::downsample]
-    if points.shape[0] > 0:
-        viewer.add_points(
-            points,
-            name="tifxyz_points",
-            size=float(POINT_SIZE),
-            face_color=[0.0, 0.8, 0.2, 0.8],
-        )
-
-    edge = np.asarray(edge_zyx, dtype=np.float32)
-    edge_valid = np.isfinite(edge).all(axis=1) & ~(edge == -1).all(axis=1)
-    edge = edge[edge_valid]
-    if edge.shape[0] > 0:
-        viewer.add_points(
-            edge,
-            name="conditioning_edge",
-            size=float(EDGE_POINT_SIZE),
-            face_color=[1.0, 0.2, 0.0, 1.0],
-        )
-
-    voxel_points = []
-    for item in voxelized_bboxes or ():
-        voxels = np.asarray(item.get("voxels"))
-        if voxels.ndim != 3 or not voxels.any():
-            continue
-        z_min, _, y_min, _, x_min, _ = item["bbox"]
-        coords = np.argwhere(voxels > 0).astype(np.float32, copy=False)
-        coords += np.asarray([z_min, y_min, x_min], dtype=np.float32)
-        voxel_points.append(coords)
-    if voxel_points:
-        merged_voxel_points = np.concatenate(voxel_points, axis=0)
-        merged_voxel_points = np.unique(merged_voxel_points, axis=0)
-        viewer.add_points(
-            merged_voxel_points,
-            name="upsampled_voxelized_surface",
-            size=1.0,
-            face_color=[1.0, 0.85, 0.05, 0.65],
-        )
-
-    segments = []
-    for bbox in bboxes:
-        segments.extend(bbox_wireframe_segments(bbox))
-    if segments:
-        viewer.add_shapes(
-            segments,
-            shape_type="path",
-            edge_color=[0.0, 0.45, 1.0, 0.9],
-            edge_width=1,
-            face_color="transparent",
-            name="cond_edge_bboxes",
-            opacity=0.9,
-        )
-
-    if integration_group is not None and "points_zyx" in integration_group:
-        traces = np.asarray(integration_group["points_zyx"], dtype=np.float32)
-        active_mask = np.asarray(integration_group["active_mask"], dtype=bool)
-        path_segments = []
-        if traces.ndim == 3 and traces.shape[0] > 1:
-            for point_idx in range(traces.shape[1]):
-                valid_steps = np.flatnonzero(active_mask[:, point_idx])
-                if valid_steps.size < 2:
-                    continue
-                path = traces[valid_steps, point_idx, :]
-                if np.isfinite(path).all():
-                    path_segments.append(path)
-        if path_segments:
-            viewer.add_shapes(
-                path_segments,
-                shape_type="path",
-                edge_color=[1.0, 0.0, 0.8, 0.9],
-                edge_width=1,
-                face_color="transparent",
-                name="integrated_streamlines",
-                opacity=0.9,
-            )
-
-    napari.run()
+    return merger.finalize()
 
 
 def main():
@@ -891,12 +1134,20 @@ def main():
         np.asarray(output_root.attrs["window_min_zyx"], dtype=np.float32),
         output_root,
     )
+    output_tifxyz_path = save_merged_streamline_tifxyz(
+        stored_zyxs,
+        valid,
+        edge,
+        cond_direction,
+        integration_result["group"],
+    )
 
     print(f"tifxyz_path: {TIFXYZ_PATH}")
     print(f"volume_path: {VOLUME_PATH}")
     print(f"volume_scale: {int(VOLUME_SCALE)}")
     print(f"checkpoint_path: {CHECKPOINT_PATH}")
     print(f"output_zarr_path: {output_path}")
+    print(f"output_tifxyz_path: {output_tifxyz_path}")
     print(f"grow_direction: {GROW_DIRECTION}")
     print(f"cond_direction: {cond_direction}")
     print(f"crop_size: {tuple(crop_size)}")
@@ -914,14 +1165,13 @@ def main():
     print(f"integration_seed_count: {integration_result['seed_count']}")
     print(f"integration_active_endpoints: {integration_result['active_endpoints']}")
 
-    if SHOW_NAPARI_GEOMETRY:
-        show_streamline_geometry_napari(
-            points_zyx,
-            edge,
-            bboxes,
-            voxelized_bboxes=voxelized_bboxes,
-            integration_group=integration_result["group"],
-        )
+    show_streamline_geometry_napari(
+        points_zyx,
+        edge,
+        bboxes,
+        voxelized_bboxes=voxelized_bboxes,
+        integration_group=integration_result["group"],
+    )
 
 
 if __name__ == "__main__":
