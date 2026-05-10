@@ -48,11 +48,11 @@ SHOW_NAPARI = False
 GROW_DIRECTION = "left"
 
 TIFXYZ_VOXEL_STEP = 20.0
-TIFXYZ_STEPS = 4
-NUM_ITERATIONS = 1
+TIFXYZ_STEPS = 3
+NUM_ITERATIONS = 10
 # If false, intermediate iterations are written to a temporary tifxyz directory
 # only long enough to feed the next iteration; the final iteration is saved.
-SAVE_EACH_ITERATION_TIFXYZ = False
+SAVE_EACH_ITERATION_TIFXYZ = True
 INTEGRATION_STEP_SIZE = 2.0
 TRACE_VALIDITY_THRESHOLD = 0.5
 USE_SURFACE_ATTRACT = True
@@ -431,24 +431,26 @@ def _collapse_output(value):
 
 
 def _prepare_rowcol_inputs(volume_array, voxelized_batch, crop_size, cond_direction):
-    vols = []
-    conds = []
-    for item in voxelized_batch:
+    batch_size = len(voxelized_batch)
+    crop_shape = tuple(int(v) for v in crop_size)
+    inputs_np = np.empty((batch_size, 2, *crop_shape), dtype=np.float32)
+    crop_size_arr = np.asarray(crop_size, dtype=np.int64)
+
+    for batch_idx, item in enumerate(voxelized_batch):
         bbox = item["bbox"]
         min_corner = _bbox_min_corner(bbox)
-        max_corner = min_corner + np.asarray(crop_size, dtype=np.int64)
-        vols.append(_read_volume_crop(volume_array, crop_size, min_corner, max_corner))
-        conds.append(np.asarray(item["voxels"], dtype=np.float32))
+        max_corner = min_corner + crop_size_arr
+        inputs_np[batch_idx, 0] = _read_volume_crop(volume_array, crop_size, min_corner, max_corner)
+        inputs_np[batch_idx, 1] = np.asarray(item["voxels"], dtype=np.float32)
 
-    vol = torch.from_numpy(np.stack(vols, axis=0)).to(device=DEVICE, dtype=torch.float32).unsqueeze(1)
-    cond = torch.from_numpy(np.stack(conds, axis=0)).to(device=DEVICE, dtype=torch.float32).unsqueeze(1)
+    inputs = torch.from_numpy(inputs_np).to(device=DEVICE, dtype=torch.float32)
     direction = make_growth_direction_tensor(
-        [cond_direction] * len(voxelized_batch),
+        [cond_direction] * batch_size,
         crop_size,
-        device=vol.device,
-        dtype=vol.dtype,
+        device=inputs.device,
+        dtype=inputs.dtype,
     )
-    return torch.cat([vol, cond, direction], dim=1)
+    return torch.cat([inputs, direction], dim=1)
 
 
 def _slice_len(s):
@@ -758,8 +760,6 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
 
     step_iter = tqdm(step_sizes, desc="Integrating streamlines", unit="step")
     for step_idx, step_size in enumerate(step_iter, start=1):
-        next_points_t = points_t.clone()
-        next_distance_t = distance_t.clone()
         active_idx = torch.nonzero(active, as_tuple=False).flatten()
         step_iter.set_postfix(active=int(active_idx.numel()))
         if active_idx.numel() > 0:
@@ -794,14 +794,12 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
                 )
                 accepted_idx = candidate_idx[candidate_active]
                 accepted_candidate = candidate[candidate_active]
-                next_points_t[accepted_idx] = accepted_candidate
                 segment_lengths = torch.linalg.norm(accepted_candidate - points_t[accepted_idx], dim=1)
-                next_distance_t[accepted_idx] = distance_t[accepted_idx] + segment_lengths
+                distance_t[accepted_idx] = distance_t[accepted_idx] + segment_lengths
+                points_t[accepted_idx] = accepted_candidate
                 active[candidate_idx] = candidate_active
             active[active_idx[~usable]] = False
 
-        points_t = next_points_t
-        distance_t = next_distance_t
         traces_local[step_idx] = points_t.detach().cpu().numpy()
         cumulative_distance[step_idx] = distance_t.detach().cpu().numpy()
         active_mask[step_idx] = active.detach().cpu().numpy()
