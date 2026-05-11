@@ -26,6 +26,7 @@
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
 #include "support.hpp"
+#include "thinning_debug.hpp"
 #include "vc/core/util/LifeTime.hpp"
 
 namespace fs = std::filesystem;
@@ -261,6 +262,7 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
                 {"distance_transform_seconds", dir.thinningStats.distanceTransformSeconds},
                 {"seed_detection_seconds", dir.thinningStats.seedDetectionSeconds},
                 {"trace_paths_seconds", dir.thinningStats.tracePathsSeconds},
+                {"prune_seconds", dir.thinningStats.pruneSeconds},
                 {"avg_distance_transform_seconds", dir.thinningStats.distanceTransformSeconds / static_cast<double>(dir.thinningCalls)},
                 {"avg_seed_detection_seconds", dir.thinningStats.seedDetectionSeconds / static_cast<double>(dir.thinningCalls)},
                 {"avg_trace_paths_seconds", dir.thinningStats.tracePathsSeconds / static_cast<double>(dir.thinningCalls)},
@@ -268,6 +270,8 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
                 {"trace_count", dir.thinningStats.traceCount},
                 {"trace_steps", dir.thinningStats.traceSteps},
                 {"candidate_evaluations", dir.thinningStats.candidateEvaluations},
+                {"traces_pruned", dir.thinningStats.tracesPruned},
+                {"traces_kept", dir.thinningStats.tracesKept},
             };
         }
         out["directions"].push_back(std::move(d));
@@ -516,6 +520,12 @@ int main(int argc, char* argv[]) {
             ("verify-grid-save", po::bool_switch()->default_value(false), "Verify GridStore files by reloading after save")
             ("debug-per-slice", po::bool_switch()->default_value(false), "Emit a stdout log line for every slice processed (existing/empty_binary/empty_trace/written)")
             ("metrics-json", po::value<std::string>(), "Write structured metrics json")
+            ("prune-scale", po::value<double>()->default_value(2.0), "TEASAR pruning: drop traces shorter than scale*DBF(tip)+const")
+            ("prune-const", po::value<double>()->default_value(10.0), "TEASAR pruning: additive constant in pixels")
+            ("prune-min-length", po::value<double>()->default_value(4.0), "TEASAR pruning: absolute floor on trace length in pixels")
+            ("prune-disable", po::bool_switch()->default_value(false), "Disable TEASAR pruning entirely (keep all raw traces)")
+            ("debug-thinning-slice", po::value<int>(), "Dump multi-panel thinning debug PNG for this slice index")
+            ("debug-thinning-dir", po::value<std::string>()->default_value("xy"), "Direction for --debug-thinning-slice: xy, xz, or yz")
             ("print-plan", po::bool_switch()->default_value(false), "Print partition plan as JSON to stdout and exit (no work done)");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
@@ -704,6 +714,30 @@ void run_generate(const po::variables_map& vm) {
         ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
         : std::nullopt;
 
+    ThinningPruneParams prune_params;
+    prune_params.enabled = !vm["prune-disable"].as<bool>();
+    prune_params.scale = vm["prune-scale"].as<double>();
+    prune_params.constant = vm["prune-const"].as<double>();
+    prune_params.minLength = vm["prune-min-length"].as<double>();
+    if (prune_params.scale < 0.0 || prune_params.constant < 0.0 || prune_params.minLength < 0.0) {
+        throw std::runtime_error("--prune-scale, --prune-const, and --prune-min-length must be >= 0");
+    }
+
+    const std::optional<int> debug_thinning_slice = vm.count("debug-thinning-slice")
+        ? std::optional<int>(vm["debug-thinning-slice"].as<int>())
+        : std::nullopt;
+    if (debug_thinning_slice.has_value() && *debug_thinning_slice < 0) {
+        throw std::runtime_error("--debug-thinning-slice must be >= 0");
+    }
+    const std::string debug_thinning_dir_str = vm["debug-thinning-dir"].as<std::string>();
+    SliceDirection debug_thinning_direction = SliceDirection::XY;
+    if (debug_thinning_dir_str == "xy") debug_thinning_direction = SliceDirection::XY;
+    else if (debug_thinning_dir_str == "xz") debug_thinning_direction = SliceDirection::XZ;
+    else if (debug_thinning_dir_str == "yz") debug_thinning_direction = SliceDirection::YZ;
+    else if (debug_thinning_slice.has_value()) {
+        throw std::runtime_error("--debug-thinning-dir must be one of: xy, xz, yz");
+    }
+
     std::vector<SliceDirection> directions_to_run;
     if (vm.count("direction")) {
         const std::string& d = vm["direction"].as<std::string>();
@@ -862,6 +896,10 @@ void run_generate(const po::variables_map& vm) {
         metadata["preview-every"] = preview_every;
         metadata["verify-grid-save"] = verify_grid_save;
         metadata["debug-per-slice"] = debug_per_slice;
+        metadata["prune-enabled"] = prune_params.enabled;
+        metadata["prune-scale"] = prune_params.scale;
+        metadata["prune-const"] = prune_params.constant;
+        metadata["prune-min-length"] = prune_params.minLength;
         std::ofstream o(output_fs_path / "metadata.json");
         o << metadata.dump(4) << std::endl;
     }
@@ -1160,9 +1198,54 @@ void run_generate(const po::variables_map& vm) {
                     }
 
                     scratch.traces.clear();
+                    const bool dump_thinning_debug =
+                        debug_thinning_slice.has_value()
+                        && task.sliceIndex == static_cast<size_t>(*debug_thinning_slice)
+                        && dir == debug_thinning_direction;
+
                     const auto thinning_start = std::chrono::steady_clock::now();
                     ThinningStats thinning_stats;
-                    customThinningTraceOnly(assembled.binarySlice, scratch.traces, &thinning_stats, scratch.thinning);
+                    if (dump_thinning_debug) {
+                        // Capture raw + pruned for the panel dump. We re-run pruning
+                        // explicitly so the panel labels are honest about params.
+                        ThinningPruneParams no_prune;
+                        customThinningTraceOnly(assembled.binarySlice, scratch.traces,
+                            &thinning_stats, scratch.thinning, no_prune);
+
+                        std::vector<std::vector<cv::Point>> raw_traces = scratch.traces;
+                        if (prune_params.enabled) {
+                            pruneThinningTraces(scratch.traces, scratch.thinning.distTransform,
+                                prune_params, &thinning_stats);
+                        } else {
+                            thinning_stats.tracesKept += scratch.traces.size();
+                        }
+
+                        const fs::path debug_dir = output_fs_path / (dir_metrics.direction + "_thinning_debug");
+                        fs::create_directories(debug_dir);
+                        const std::string base = std::to_string(task.sliceIndex);
+                        cv::Mat normal_grid_pruned = vc::apps::thinning_debug::renderNormalGridVis(
+                            scratch.traces, assembled.binarySlice.size(), spiral_step,
+                            assembled.binarySlice);
+                        cv::Mat normal_grid_raw = vc::apps::thinning_debug::renderNormalGridVis(
+                            raw_traces, assembled.binarySlice.size(), spiral_step,
+                            assembled.binarySlice);
+                        cv::Mat panel = vc::apps::thinning_debug::renderDebugPanel(
+                            assembled.binarySlice, raw_traces, scratch.traces,
+                            scratch.thinning.distTransform, prune_params,
+                            normal_grid_pruned, normal_grid_raw);
+                        cv::imwrite((debug_dir / (base + ".png")).string(), panel);
+                        vc::apps::thinning_debug::dumpTraceCsv(
+                            raw_traces, scratch.thinning.distTransform,
+                            prune_params, debug_dir / (base + ".csv"));
+                        std::cout << "[thinning-debug] dir=" << dir_metrics.direction
+                                  << " slice=" << task.sliceIndex
+                                  << " raw_traces=" << raw_traces.size()
+                                  << " kept=" << scratch.traces.size()
+                                  << " -> " << (debug_dir / (base + ".png")).string() << std::endl;
+                    } else {
+                        customThinningTraceOnly(assembled.binarySlice, scratch.traces,
+                            &thinning_stats, scratch.thinning, prune_params);
+                    }
                     const double thinning_seconds = seconds_since(thinning_start);
                     record_timing(local_stats, "thinning", thinning_seconds);
                     local_stats.thinningStats.accumulate(thinning_stats);
