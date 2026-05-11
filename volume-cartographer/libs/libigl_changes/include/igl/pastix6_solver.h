@@ -37,8 +37,10 @@ public:
         iparm_[IPARM_FACTORIZATION] = PastixFactPOTRF;
         // Quiet by default; bump to PastixVerboseNo / Yes for debugging.
         iparm_[IPARM_VERBOSE]       = PastixVerboseNot;
-        // Threading: leave at 0 here (auto = number of OMP threads / cores)
-        // unless the caller pins via setThreads().
+        // Threading: 0 = PaStiX auto via hwloc, which sizes to physical cores
+        // (not logical / nproc / hardware_concurrency — that would oversubscribe
+        // SMT). Users can override with the PASTIX_NUM_THREADS env var or by
+        // calling setThreads(); PaStiX does not read OMP_NUM_THREADS.
         iparm_[IPARM_THREAD_NBR]    = 0;
         pastixInit(&data_, /*comm=*/0, iparm_, dparm_);
     }

@@ -34,11 +34,6 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-#include <thread>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 namespace fs = std::filesystem;
 
 // ------------------------------
@@ -942,17 +937,6 @@ int main(int argc, char** argv) {
 
   std::ios::sync_with_stdio(false);
   std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
-
-  // BLAS thread budget. OpenBLAS on tiny problems is faster single-threaded
-  // (thread spawn/join dominates), and on huge ones starts contending with
-  // the OS scheduler past hardware-concurrency. Use hardware_concurrency as
-  // the upper bound; let users override via OMP_NUM_THREADS / OPENBLAS_NUM_THREADS.
-#ifdef _OPENMP
-  if (!std::getenv("OMP_NUM_THREADS")) {
-    const unsigned n = std::max(1u, std::thread::hardware_concurrency());
-    omp_set_num_threads(static_cast<int>(n));
-  }
-#endif
 
   try {
     Flatboi fb(obj_path, iters, energy);
