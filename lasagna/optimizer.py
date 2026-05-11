@@ -57,6 +57,13 @@ class Stage:
 	global_opt: OptSettings
 
 
+CYLINDER_SEED_STAGE_ROLES = ("cyl_init", "cyl_grow", "cyl_refine")
+CYLINDER_LOSS_NAMES = (
+	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
+	"cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt",
+)
+
+
 def _stage_to_modifiers(
 	base: dict[str, float],
 	prev_eff: dict[str, float] | None,
@@ -145,11 +152,7 @@ def _parse_opt_settings(
 	if "cyl_params" in params:
 		if params != ["cyl_params"]:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
-		cyl_loss_names = (
-			"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
-			"cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt",
-		)
-		if not any(float(eff.get(name, 0.0)) != 0.0 for name in cyl_loss_names):
+		if not any(float(eff.get(name, 0.0)) != 0.0 for name in CYLINDER_LOSS_NAMES):
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	return OptSettings(
 		steps=steps,
@@ -191,8 +194,52 @@ lambda_global: dict[str, float] = {
 }
 
 
-def load_stages_cfg(cfg: dict) -> list[Stage]:
+def _init_mode_from_args(args_cfg: object) -> str | None:
+	if not isinstance(args_cfg, dict):
+		return None
+	model_init = str(args_cfg.get("model-init", args_cfg.get("model_init", "seed"))).strip().lower()
+	if model_init and model_init != "seed":
+		return None
+	init_mode = args_cfg.get("init-mode", args_cfg.get("init_mode", None))
+	return None if init_mode is None else str(init_mode).strip().lower()
+
+
+def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
+	role_positions: dict[str, int] = {}
+	for i, stage in enumerate(stages):
+		has_cyl = "cyl_params" in stage.global_opt.params
+		is_role = stage.name in CYLINDER_SEED_STAGE_ROLES
+		if has_cyl and not is_role:
+			raise ValueError(
+				"stages_json: cylinder_seed cyl_params stages must be named "
+				f"{list(CYLINDER_SEED_STAGE_ROLES)}, got '{stage.name}'"
+			)
+		if is_role:
+			if stage.name in role_positions:
+				raise ValueError(f"stages_json: cylinder_seed stage '{stage.name}' is duplicated")
+			role_positions[stage.name] = i
+			if stage.global_opt.params != ["cyl_params"]:
+				raise ValueError(
+					f"stages_json: cylinder_seed stage '{stage.name}' must have params ['cyl_params']"
+				)
+	missing = [name for name in CYLINDER_SEED_STAGE_ROLES if name not in role_positions]
+	if missing:
+		raise ValueError(f"stages_json: cylinder_seed missing required stage role(s): {missing}")
+	positions = [role_positions[name] for name in CYLINDER_SEED_STAGE_ROLES]
+	if positions != sorted(positions):
+		raise ValueError(
+			"stages_json: cylinder_seed stages must appear in order "
+			"cyl_init, cyl_grow, cyl_refine"
+		)
+
+
+def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 	cfg = dict(cfg)
+	args_cfg = cfg.pop("args", None)
+	if init_mode is None:
+		init_mode = _init_mode_from_args(args_cfg)
+	else:
+		init_mode = str(init_mode).strip().lower()
 	base = dict(lambda_global)
 	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
@@ -222,6 +269,8 @@ def load_stages_cfg(cfg: dict) -> list[Stage]:
 			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
 		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base, prev_eff=None)
 		out.append(Stage(name=name, global_opt=global_opt))
+	if init_mode == "cylinder_seed":
+		_validate_cylinder_seed_stage_roles(out)
 	return out
 
 
@@ -368,18 +417,17 @@ def optimize(
 	def _scheduled_total_steps() -> int:
 		if not bool(getattr(model, "cyl_shell_mode", False)):
 			return total_steps_for_stages(stages)
-		shell_count_ = max(0, int(getattr(model, "cyl_shell_target_count", 0)))
-		next_shell_ = 0
+		max_search_shells_ = max(1, int(getattr(model, "cyl_shell_search_max_shells", 16)))
 		total = 0
-		for si_, stage_ in enumerate(stages):
+		for stage_ in stages:
 			steps_ = max(0, int(stage_.global_opt.steps))
 			if _is_cyl_stage(stage_):
-				if next_shell_ >= shell_count_:
-					continue
-				run_shells_ = 1 if _next_stage_is_cyl(si_) else shell_count_ - next_shell_
-				run_shells_ = max(0, min(run_shells_, shell_count_ - next_shell_))
-				total += steps_ * sum(_shell_pass_count(shell_i_) for shell_i_ in range(next_shell_, next_shell_ + run_shells_))
-				next_shell_ += run_shells_
+				if stage_.name == "cyl_grow":
+					total += steps_ * max(0, max_search_shells_ - 1)
+				elif stage_.name in {"cyl_init", "cyl_refine"}:
+					total += steps_
+				else:
+					total += steps_
 			else:
 				total += steps_
 		return total
@@ -1224,45 +1272,15 @@ def optimize(
 		if is_cyl_stage and bool(getattr(model, "cyl_shell_mode", False)):
 			if hasattr(model, "prepare_umbilicus_tube_init"):
 				model.prepare_umbilicus_tube_init(data)
-			shell_count = int(getattr(model, "cyl_shell_target_count", 3))
-			start_shell = min(max(0, len(getattr(model, "cyl_shell_completed", []))), shell_count)
-			if start_shell >= shell_count:
-				_stage_done(f"{label}.total", _t_stage_total)
-				return data
-			if _next_stage_is_cyl(si):
-				shell_indices = range(start_shell, min(start_shell + 1, shell_count))
-			else:
-				shell_indices = range(start_shell, shell_count)
+			role = str(stage.name)
+			if role not in CYLINDER_SEED_STAGE_ROLES:
+				raise RuntimeError(
+					f"{label}: cylinder shell stage must be one of {list(CYLINDER_SEED_STAGE_ROLES)}, got '{role}'"
+				)
 			max_steps = int(opt_cfg.steps)
-			_shell_status_labels: list[str] = []
-			for shell_i in shell_indices:
-				if shell_i <= 0:
-					_shell_status_labels.append(f"{label}.shell{shell_i + 1}")
-				else:
-					_shell_status_labels.append(f"{label}.shell{shell_i + 1}.grow")
-					if bool(getattr(model, "cyl_shell_optimize_resampled", False)):
-						_shell_status_labels.append(f"{label}.shell{shell_i + 1}.resampled")
-			shell_start = start_shell + 1
-			shell_end = start_shell + len(shell_indices)
-			pass_mode = (
-				"zero-step generate/evaluate only"
-				if max_steps <= 0
-				else f"optimize {max_steps} steps per pass"
-			)
-			print(
-				f"[optimizer] {label}: shell schedule shells={shell_start}-{shell_end}/{shell_count} "
-				f"passes={len(_shell_status_labels)} mode={pass_mode}",
-				flush=True,
-			)
-			for _shell_label in _shell_status_labels:
-				print(f"[optimizer] {label}: queued {_shell_label}", flush=True)
-			_status_step_width = max(
-				_status_step_width,
-				max(
-					len(f"{shell_label} {max_steps}/{max_steps}") + 2
-					for shell_label in _shell_status_labels
-				),
-			)
+			max_search_shells = max(1, int(getattr(model, "cyl_shell_search_max_shells", 16)))
+			_base_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
+			_growth = max(1.0, float(getattr(model, "cyl_shell_growth_factor", 1.5)))
 
 			def _prefetch_shell_model_points(needs_: fit_model.ModelForwardNeeds) -> None:
 				_prefetch_model_points(needs_)
@@ -1277,220 +1295,328 @@ def optimize(
 					"wstep_max_vx": mx,
 				}
 
-			for shell_i in shell_indices:
-				if hasattr(model, "begin_cylinder_shell"):
-					model.begin_cylinder_shell(shell_i, data)
-				shell_eff = dict(stage_eff)
+			def _pass_eff_for_role() -> dict[str, float]:
+				pass_eff = dict(stage_eff)
 				for _conn_term in ("cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt"):
-					shell_eff[_conn_term] = 0.0
-				_base_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
-				_grow_wstep = _base_wstep * max(1.0, float(getattr(model, "cyl_shell_growth_factor", 1.5)))
-				if shell_i <= 0:
-					shell_passes = [(f"{label}.shell{shell_i + 1}", shell_eff, False, _base_wstep, _base_wstep)]
+					pass_eff[_conn_term] = 0.0
+				return pass_eff
+
+			def _run_shell_pass(shell_label: str, pass_eff: dict[str, float], *,
+								wstep_start: float, wstep_end: float) -> None:
+				nonlocal data, all_params, param_groups, opt, _status_step_width
+				_status_step_width = max(_status_step_width, len(f"{shell_label} {max_steps}/{max_steps}") + 2)
+				pass_needs = _needs_for_eff(
+					pass_eff,
+					pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
+					pred_dt_normal_source_=pred_dt_normal_source,
+				)
+				print(
+					f"[optimizer] {shell_label}: forward_needs={pass_needs.summary()} "
+					f"{_prefetch_grad_summary(pass_needs)}",
+					flush=True,
+				)
+				model.cyl_shell_current_width_step = float(wstep_start)
+				action = "evaluate only" if max_steps <= 0 else f"optimize {max_steps} steps"
+				if abs(float(wstep_end) - float(wstep_start)) > 1.0e-6 and max_steps > 0:
+					action = f"{action}, ramp wstep {float(wstep_start):.1f}->{float(wstep_end):.1f}"
 				else:
-					shell_passes = [
-						(f"{label}.shell{shell_i + 1}.grow", shell_eff, False, _base_wstep, _grow_wstep),
-					]
-					if bool(getattr(model, "cyl_shell_optimize_resampled", False)):
-						shell_passes.append(
-							(f"{label}.shell{shell_i + 1}.resampled", shell_eff, True, _base_wstep, _base_wstep)
+					action = f"{action}, wstep {float(wstep_start):.1f}"
+				print(f"[optimizer] {shell_label}: {action}", flush=True)
+				all_params, param_groups = _make_param_groups()
+				if not param_groups:
+					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
+				opt = torch.optim.Adam(param_groups)
+
+				_t = _stage_start(f"{shell_label}.initial_eval")
+				_prefetch_shell_model_points(pass_needs)
+				with torch.no_grad():
+					res0 = model(data, needs=pass_needs)
+					_prefetch_loss_points_for_result(res0, pass_needs)
+					loss0, term_vals0, display_loss0 = _eval_terms(
+						res0, pass_eff, profile_label=f"{shell_label}.initial_eval.loss")
+				term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
+				_print_status(
+					step_label=f"{shell_label} 0/{max_steps}",
+					loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
+					tv=term_vals0,
+					pv=_shell_dbg_values(),
+					force_header=True,
+				)
+				snapshot_fn(stage=shell_label.replace(".", "_"), step=0,
+							loss=float(loss0.detach().cpu()), data=data, res=res0)
+				_stage_done(f"{shell_label}.initial_eval", _t)
+
+				loss = loss0
+				display_loss = display_loss0
+				res = res0
+				_t_wall_start = time.perf_counter()
+				_t_steps_acc = 0
+				step1 = 0
+				_opt_timing = (
+					_OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
+					if opt_timing_enabled else None
+				)
+				for step in range(max_steps):
+					_t_iter = time.perf_counter()
+					if max_steps > 0:
+						_alpha = float(step + 1) / float(max_steps)
+						model.cyl_shell_current_width_step = (
+							float(wstep_start) + _alpha * (float(wstep_end) - float(wstep_start))
 						)
 
-				for shell_label, pass_eff, needs_resample, wstep_start, wstep_end in shell_passes:
-					pass_needs = _needs_for_eff(
-						pass_eff,
-						pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
-						pred_dt_normal_source_=pred_dt_normal_source,
-					)
-					print(
-						f"[optimizer] {shell_label}: forward_needs={pass_needs.summary()} "
-						f"{_prefetch_grad_summary(pass_needs)}",
-						flush=True,
-					)
-					if needs_resample:
-						if not hasattr(model, "resample_current_cylinder_shell_width_for_growth"):
-							raise RuntimeError("shell grow pass requested, but model cannot resample cylinder shell width")
-						model.resample_current_cylinder_shell_width_for_growth(data)
-					model.cyl_shell_current_width_step = float(wstep_start)
-					action = "evaluate only" if max_steps <= 0 else f"optimize {max_steps} steps"
-					if abs(float(wstep_end) - float(wstep_start)) > 1.0e-6 and max_steps > 0:
-						action = f"{action}, ramp wstep {float(wstep_start):.1f}->{float(wstep_end):.1f}"
-					else:
-						action = f"{action}, wstep {float(wstep_start):.1f}"
-					print(f"[optimizer] {shell_label}: {action}", flush=True)
-					all_params, param_groups = _make_param_groups()
-					if not param_groups:
-						return data
-					opt = torch.optim.Adam(param_groups)
+					_t_part = time.perf_counter()
+					if _active_caches:
+						for _cache in _active_caches:
+							_cache.sync()
+					if _opt_timing is not None:
+						_opt_timing.add("cache_sync", time.perf_counter() - _t_part)
 
-					_t = _stage_start(f"{shell_label}.initial_eval")
+					_t_part = time.perf_counter()
+					if fit_data.CHUNK_STATS_ENABLED:
+						fit_data._chunk_stats.begin_iteration()
+					if _opt_timing is not None:
+						_opt_timing.add("chunk_stats", time.perf_counter() - _t_part)
+
+					_t_part = time.perf_counter()
 					_prefetch_shell_model_points(pass_needs)
-					with torch.no_grad():
-						res0 = model(data, needs=pass_needs)
-						_prefetch_loss_points_for_result(res0, pass_needs)
-						loss0, term_vals0, display_loss0 = _eval_terms(
-							res0, pass_eff, profile_label=f"{shell_label}.initial_eval.loss")
-					term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
-					_print_status(
-						step_label=f"{shell_label} 0/{max_steps}",
-						loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
-						tv=term_vals0,
-						pv=_shell_dbg_values(),
-						force_header=True,
-					)
-					snapshot_fn(stage=shell_label.replace(".", "_"), step=0,
-								loss=float(loss0.detach().cpu()), data=data, res=res0)
-					_stage_done(f"{shell_label}.initial_eval", _t)
+					if _opt_timing is not None:
+						_opt_timing.sync()
+						_opt_timing.add("model_point_prefetch", time.perf_counter() - _t_part)
 
-					loss = loss0
-					display_loss = display_loss0
-					res = res0
-					_t_wall_start = time.perf_counter()
-					_t_steps_acc = 0
-					step1 = 0
-					_opt_timing = (
-						_OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
-						if opt_timing_enabled else None
-					)
-					for step in range(max_steps):
-						_t_iter = time.perf_counter()
-						if max_steps > 0:
-							_alpha = float(step + 1) / float(max_steps)
-							model.cyl_shell_current_width_step = float(wstep_start) + _alpha * (float(wstep_end) - float(wstep_start))
+					_t_part = time.perf_counter()
+					res = model(data, needs=pass_needs)
+					if _opt_timing is not None:
+						_opt_timing.sync()
+						_opt_timing.add("model_forward", time.perf_counter() - _t_part)
 
-						_t_part = time.perf_counter()
-						if _active_caches:
-							for _cache in _active_caches:
-								_cache.sync()
-						if _opt_timing is not None:
-							_opt_timing.add("cache_sync", time.perf_counter() - _t_part)
+					_t_part = time.perf_counter()
+					_prefetch_loss_points_for_result(res, pass_needs)
+					if _opt_timing is not None:
+						_opt_timing.sync()
+						_opt_timing.add("loss_prefetch", time.perf_counter() - _t_part)
 
-						_t_part = time.perf_counter()
-						if fit_data.CHUNK_STATS_ENABLED:
-							fit_data._chunk_stats.begin_iteration()
-						if _opt_timing is not None:
-							_opt_timing.add("chunk_stats", time.perf_counter() - _t_part)
+					_t_part = time.perf_counter()
+					loss, term_vals, display_loss = _eval_terms(res, pass_eff, timing=_opt_timing)
+					if _opt_timing is not None:
+						_opt_timing.sync()
+						_opt_timing.add("loss_eval", time.perf_counter() - _t_part)
 
-						_t_part = time.perf_counter()
+					_t_part = time.perf_counter()
+					if fit_data.CHUNK_STATS_ENABLED:
+						fit_data._chunk_stats.end_iteration()
+					if _opt_timing is not None:
+						_opt_timing.add("chunk_stats", time.perf_counter() - _t_part)
+
+					_t_part = time.perf_counter()
+					opt.zero_grad(set_to_none=True)
+					if _opt_timing is not None:
+						_opt_timing.add("zero_grad", time.perf_counter() - _t_part)
+
+					_t_part = time.perf_counter()
+					loss.backward()
+					if _opt_timing is not None:
+						_opt_timing.sync()
+						_opt_timing.add("backward", time.perf_counter() - _t_part)
+
+					_t_part = time.perf_counter()
+					opt.step()
+					if _opt_timing is not None:
+						_opt_timing.sync()
+						_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
+
+					_t_part = time.perf_counter()
+					if _active_caches:
 						_prefetch_shell_model_points(pass_needs)
-						if _opt_timing is not None:
-							_opt_timing.sync()
-							_opt_timing.add("model_point_prefetch", time.perf_counter() - _t_part)
+						for _cache in _active_caches:
+							_cache.end_iteration()
+					if _opt_timing is not None:
+						_opt_timing.add("next_prefetch", time.perf_counter() - _t_part)
 
-						_t_part = time.perf_counter()
-						res = model(data, needs=pass_needs)
-						if _opt_timing is not None:
-							_opt_timing.sync()
-							_opt_timing.add("model_forward", time.perf_counter() - _t_part)
+					step1 = step + 1
+					_t_steps_acc += 1
+					_done_steps[0] += 1
+					_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
+					_overall_progress = (
+						min(1.0, _done_steps[0] / max(1, _total_steps))
+						if _total_steps > 0 else 1.0
+					)
 
-						_t_part = time.perf_counter()
-						_prefetch_loss_points_for_result(res, pass_needs)
-						if _opt_timing is not None:
-							_opt_timing.sync()
-							_opt_timing.add("loss_prefetch", time.perf_counter() - _t_part)
-
-						_t_part = time.perf_counter()
-						loss, term_vals, display_loss = _eval_terms(res, pass_eff, timing=_opt_timing)
-						if _opt_timing is not None:
-							_opt_timing.sync()
-							_opt_timing.add("loss_eval", time.perf_counter() - _t_part)
-
-						_t_part = time.perf_counter()
-						if fit_data.CHUNK_STATS_ENABLED:
-							fit_data._chunk_stats.end_iteration()
-						if _opt_timing is not None:
-							_opt_timing.add("chunk_stats", time.perf_counter() - _t_part)
-
-						_t_part = time.perf_counter()
-						opt.zero_grad(set_to_none=True)
-						if _opt_timing is not None:
-							_opt_timing.add("zero_grad", time.perf_counter() - _t_part)
-
-						_t_part = time.perf_counter()
-						loss.backward()
-						if _opt_timing is not None:
-							_opt_timing.sync()
-							_opt_timing.add("backward", time.perf_counter() - _t_part)
-
-						_t_part = time.perf_counter()
-						opt.step()
-						if _opt_timing is not None:
-							_opt_timing.sync()
-							_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
-
-						_t_part = time.perf_counter()
-						if _active_caches:
-							_prefetch_shell_model_points(pass_needs)
-							for _cache in _active_caches:
-								_cache.end_iteration()
-						if _opt_timing is not None:
-							_opt_timing.add("next_prefetch", time.perf_counter() - _t_part)
-
-						step1 = step + 1
-						_t_steps_acc += 1
-						_done_steps[0] += 1
-						_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
-						_overall_progress = (
-							min(1.0, _done_steps[0] / max(1, _total_steps))
-							if _total_steps > 0 else 1.0
+					_t_part = time.perf_counter()
+					if progress_fn is not None:
+						progress_fn(
+							step=_done_steps[0], total=_total_steps,
+							loss=float(display_loss) if display_loss is not None else float(loss.detach().cpu()),
+							stage_progress=_stage_progress, overall_progress=_overall_progress,
+							stage_name=stage.name,
 						)
+					if _opt_timing is not None:
+						_opt_timing.add("progress", time.perf_counter() - _t_part)
 
-						_t_part = time.perf_counter()
-						if progress_fn is not None:
-							progress_fn(
-								step=_done_steps[0], total=_total_steps,
-								loss=float(display_loss) if display_loss is not None else float(loss.detach().cpu()),
-								stage_progress=_stage_progress, overall_progress=_overall_progress,
-								stage_name=stage.name,
-							)
-						if _opt_timing is not None:
-							_opt_timing.add("progress", time.perf_counter() - _t_part)
-
-						_t_part = time.perf_counter()
-						if step == 0 or step1 == max_steps or (status_interval > 0 and (step1 % status_interval) == 0):
-							term_vals = {k: round(v, 4) for k, v in term_vals.items()}
-							_t_wall_now = time.perf_counter()
-							_t_wall_elapsed = _t_wall_now - _t_wall_start
-							_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
-							_print_status(
-								step_label=f"{shell_label} {step1}/{max_steps}",
-								loss_val=float(display_loss) if display_loss is not None else loss.item(),
-								tv=term_vals,
-								pv=_shell_dbg_values(),
-								its=_its,
-							)
-							_t_steps_acc = 0
-							_t_wall_start = _t_wall_now
-						if _opt_timing is not None:
-							_opt_timing.add("status", time.perf_counter() - _t_part)
-							_opt_timing.add("total", time.perf_counter() - _t_iter)
-							_opt_timing.finish_iter(label=shell_label, step1=step1, max_steps=max_steps)
-					if snap_int > 0 and (step1 % snap_int) == 0:
-						snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
-									loss=float(loss.detach().cpu()), data=data, res=res)
-
-					snapshot_fn(stage=shell_label.replace(".", "_"), step=max_steps,
+					_t_part = time.perf_counter()
+					if step == 0 or step1 == max_steps or (status_interval > 0 and (step1 % status_interval) == 0):
+						term_vals = {k: round(v, 4) for k, v in term_vals.items()}
+						_t_wall_now = time.perf_counter()
+						_t_wall_elapsed = _t_wall_now - _t_wall_start
+						_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
+						_print_status(
+							step_label=f"{shell_label} {step1}/{max_steps}",
+							loss_val=float(display_loss) if display_loss is not None else loss.item(),
+							tv=term_vals,
+							pv=_shell_dbg_values(),
+							its=_its,
+						)
+						_t_steps_acc = 0
+						_t_wall_start = _t_wall_now
+					if _opt_timing is not None:
+						_opt_timing.add("status", time.perf_counter() - _t_part)
+						_opt_timing.add("total", time.perf_counter() - _t_iter)
+						_opt_timing.finish_iter(label=shell_label, step1=step1, max_steps=max_steps)
+				if snap_int > 0 and (step1 % snap_int) == 0:
+					snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
 								loss=float(loss.detach().cpu()), data=data, res=res)
-					if (
-						shell_i > 0
-						and not needs_resample
-						and not bool(getattr(model, "cyl_shell_optimize_resampled", False))
-					):
-						if not hasattr(model, "resample_current_cylinder_shell_width_for_growth"):
-							raise RuntimeError("shell grow pass requested, but model cannot resample cylinder shell width")
-						model.resample_current_cylinder_shell_width_for_growth(data)
-						print(f"[optimizer] {shell_label}: resampled without reopt", flush=True)
 
+				snapshot_fn(stage=shell_label.replace(".", "_"), step=max_steps,
+							loss=float(loss.detach().cpu()), data=data, res=res)
+
+			def _classify_seed(shell_label: str) -> str:
+				if not hasattr(model, "classify_seed_vs_current_cylinder_shell"):
+					raise RuntimeError(f"{shell_label}: model does not support seed-vs-shell classification")
+				cls = str(model.classify_seed_vs_current_cylinder_shell(seed=seed_xyz))
+				if cls not in {"inside", "outside", "edge"}:
+					raise RuntimeError(f"{shell_label}: invalid seed-vs-shell classification '{cls}'")
+				model.cyl_shell_search_last_class = cls
+				print(f"[optimizer] {shell_label}: seed_vs_shell={cls}", flush=True)
+				return cls
+
+			def _crossed(cls: str) -> bool:
+				if cls == "edge":
+					return True
+				direction = int(getattr(model, "cyl_shell_search_direction", 1))
+				return (direction > 0 and cls == "inside") or (direction < 0 and cls == "outside")
+
+			if role == "cyl_init":
+				if bool(getattr(model, "cyl_shell_search_done", False)):
+					print(f"[optimizer] {label}: cylinder shell search already complete; skipping cyl_init", flush=True)
+					_stage_done(f"{label}.total", _t_stage_total)
+					return data
+				if hasattr(model, "begin_cylinder_shell"):
+					model.begin_cylinder_shell(0, data, direction=1)
+				_run_shell_pass(f"{label}.cyl_init", _pass_eff_for_role(),
+								wstep_start=_base_wstep, wstep_end=_base_wstep)
 				if hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
-					print(
-						f"[optimizer] {label}: completed shells="
-						f"{len(getattr(model, 'cyl_shell_completed', []))}/{shell_count}",
-						flush=True,
-					)
+				cls = _classify_seed(f"{label}.cyl_init")
+				model.cyl_shell_search_initial_class = cls
+				if cls == "edge":
+					model.cyl_shell_search_direction = 0
+					model.cyl_shell_search_crossed = True
+					print(f"[optimizer] {label}: initial shell touches seed; queued final refine", flush=True)
+				elif cls == "outside":
+					model.cyl_shell_search_direction = 1
+					model.cyl_shell_search_crossed = False
+					print(f"[optimizer] {label}: seed outside initial shell; growing outward", flush=True)
+				else:
+					model.cyl_shell_search_direction = -1
+					model.cyl_shell_search_crossed = False
+					print(f"[optimizer] {label}: seed inside initial shell; growing inward", flush=True)
+				_stage_done(f"{label}.total", _t_stage_total)
+				return data
 
-			_stage_done(f"{label}.total", _t_stage_total)
-			return data
+			if role == "cyl_grow":
+				if bool(getattr(model, "cyl_shell_search_done", False)):
+					print(f"[optimizer] {label}: cylinder shell search already complete; skipping cyl_grow", flush=True)
+					_stage_done(f"{label}.total", _t_stage_total)
+					return data
+				if bool(getattr(model, "cyl_shell_search_crossed", False)):
+					print(f"[optimizer] {label}: crossing already found; skipping cyl_grow", flush=True)
+					_stage_done(f"{label}.total", _t_stage_total)
+					return data
+				if not getattr(model, "cyl_shell_completed", None):
+					raise RuntimeError(f"{label}: cyl_grow requires cyl_init to complete a first shell")
+				direction = int(getattr(model, "cyl_shell_search_direction", 1))
+				if direction == 0:
+					model.cyl_shell_search_crossed = True
+					_stage_done(f"{label}.total", _t_stage_total)
+					return data
+				while not bool(getattr(model, "cyl_shell_search_crossed", False)):
+					shell_i = len(getattr(model, "cyl_shell_completed", []))
+					if shell_i >= max_search_shells:
+						print(
+							f"[optimizer] ERROR {label}: cylinder shell search did not cross seed "
+							f"after {max_search_shells} shell(s); outputting completed shells. "
+							f"last_class={getattr(model, 'cyl_shell_search_last_class', None)} "
+							f"direction={direction:+d}",
+							flush=True,
+						)
+						model.cyl_shell_search_done = True
+						break
+					if direction < 0 and hasattr(model, "cylinder_shell_search_target_radius"):
+						target_radius = float(model.cylinder_shell_search_target_radius(shell_i, direction=direction))
+						if target_radius < 1.0:
+							print(
+								f"[optimizer] ERROR {label}: reverse cylinder shell search would shrink "
+								f"below a valid radius at shell {shell_i + 1}: "
+								f"target_radius={target_radius:.3f}; outputting completed shells.",
+								flush=True,
+							)
+							model.cyl_shell_search_done = True
+							break
+					if bool(getattr(model, "cyl_shell_search_done", False)):
+						break
+					if hasattr(model, "begin_cylinder_shell"):
+						model.begin_cylinder_shell(shell_i, data, direction=direction)
+					grow_wstep = _base_wstep * _growth if direction > 0 else max(1.0, _base_wstep / _growth)
+					_run_shell_pass(f"{label}.cyl_grow_shell{shell_i + 1}", _pass_eff_for_role(),
+									wstep_start=_base_wstep, wstep_end=grow_wstep)
+					if not hasattr(model, "resample_current_cylinder_shell_width_for_growth"):
+						raise RuntimeError("shell grow pass requested, but model cannot resample cylinder shell width")
+					model.resample_current_cylinder_shell_width_for_growth(data, direction=direction)
+					if bool(getattr(model, "cyl_shell_optimize_resampled", False)):
+						_run_shell_pass(
+							f"{label}.cyl_grow_shell{shell_i + 1}.resampled",
+							_pass_eff_for_role(),
+							wstep_start=_base_wstep,
+							wstep_end=_base_wstep,
+						)
+					else:
+						print(
+							f"[optimizer] {label}.cyl_grow_shell{shell_i + 1}: resampled without reopt",
+							flush=True,
+						)
+					if hasattr(model, "complete_current_cylinder_shell"):
+						model.complete_current_cylinder_shell(data)
+					cls = _classify_seed(f"{label}.cyl_grow_shell{shell_i + 1}")
+					if _crossed(cls):
+						model.cyl_shell_search_crossed = True
+						print(
+							f"[optimizer] {label}: crossing found at shell {shell_i + 1} "
+							f"class={cls} direction={direction:+d}",
+							flush=True,
+						)
+				_stage_done(f"{label}.total", _t_stage_total)
+				return data
+
+			if role == "cyl_refine":
+				if bool(getattr(model, "cyl_shell_search_done", False)):
+					print(f"[optimizer] {label}: cylinder shell search already complete; skipping cyl_refine", flush=True)
+					_stage_done(f"{label}.total", _t_stage_total)
+					return data
+				if not bool(getattr(model, "cyl_shell_search_crossed", False)):
+					raise RuntimeError(f"{label}: cyl_refine requires cyl_init/cyl_grow to find a crossing first")
+				if not getattr(model, "cyl_shell_completed", None):
+					raise RuntimeError(f"{label}: cyl_refine requires a completed cylinder shell")
+				if not hasattr(model, "begin_cylinder_shell_refine"):
+					raise RuntimeError(f"{label}: model does not support cylinder shell refine")
+				refine_i = len(getattr(model, "cyl_shell_completed", []))
+				model.begin_cylinder_shell_refine(data)
+				_run_shell_pass(f"{label}.cyl_refine_shell{refine_i}", _pass_eff_for_role(),
+								wstep_start=_base_wstep, wstep_end=_base_wstep)
+				if hasattr(model, "complete_current_cylinder_shell"):
+					model.complete_current_cylinder_shell(data)
+				model.cyl_shell_search_done = True
+				print(f"[optimizer] {label}: final cylinder shell refine complete", flush=True)
+				_stage_done(f"{label}.total", _t_stage_total)
+				return data
 
 		# Initial prefetch for streaming mode
 		if _active_caches:

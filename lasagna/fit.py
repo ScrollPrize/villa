@@ -277,7 +277,10 @@ def main(argv: list[str] | None = None) -> int:
 		cfg.pop("external_surfaces", None)
 		cfg.pop("tifxyz_data", None)
 		cfg.pop("offset_value", None)
-		stages = optimizer.load_stages_cfg(cfg)
+		stages = optimizer.load_stages_cfg(
+			cfg,
+			init_mode=model_cfg.init_mode if model_init == "seed" else None,
+		)
 
 		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
 		n_windows = len(windows)
@@ -516,7 +519,10 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("external_surfaces", None)
 	cfg.pop("tifxyz_data", None)
 	cfg.pop("offset_value", None)
-	stages = optimizer.load_stages_cfg(cfg)
+	stages = optimizer.load_stages_cfg(
+		cfg,
+		init_mode=model_cfg.init_mode if model_init == "seed" else None,
+	)
 	_stage_done("load_optimizer_stages", _t)
 
 	# --- Streaming data loader ---
