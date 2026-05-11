@@ -12,8 +12,6 @@
 		"cyl_step": 10.0,
 		"cyl_radial_mean": 0.1,
 		"cyl_bend": 100.0,
-		"cyl_spheres": 1.0,
-		"cyl_spheres_outside": 1.0,
 		"cyl_conn_mesh": 0.0,
 		"cyl_conn_gt": 0.0,
 		"cyl_base_mesh": 0.0,
@@ -33,30 +31,10 @@
 	},
 	"stages": [
 		{
-			"name": "cyl_pre_init",
-			"steps": 250,
-			"lr": 10.0,
-			"params": ["cyl_params"],
-			"w_fac": {
-				"cyl_normal": 0.0,
-				"cyl_spheres": 10.0,
-				"cyl_spheres_outside": 100.0
-			},
-			"args": {
-				"model-step": 1000.0,
-				"compile_cyl_normal": true,
-				"profile_opt": false
-			}
-		},
-		{
 			"name": "cyl_init",
 			"steps": 500,
 			"lr": 10.0,
 			"params": ["cyl_params"],
-			"w_fac": {
-				"cyl_spheres": 0.0,
-				"cyl_spheres_outside": 0.0
-			},
 			"args": {
 				"model-step": 1000.0,
 				"compile_cyl_normal": true,
@@ -68,9 +46,7 @@
 			"lr": 10.0,
 			"params": ["cyl_params"],
 			"w_fac": {
-				"cyl_step": 10.0,
-				"cyl_spheres": 0.0,
-				"cyl_spheres_outside": 0.0
+				"cyl_step": 10.0
 			},
 			"args": {
 				"model-step": 1000.0,
@@ -84,9 +60,7 @@
 			"lr": 1.0,
 			"params": ["cyl_params"],
 			"w_fac": {
-				"cyl_step": 10.0,
-				"cyl_spheres": 0.0,
-				"cyl_spheres_outside": 0.0
+				"cyl_step": 10.0
 			},
 			"args": {
 				"model-step": 1000.0,
@@ -100,9 +74,7 @@
 			"lr": 1.0,
 			"params": ["cyl_params"],
 			"w_fac": {
-				"cyl_step": 10.0,
-				"cyl_spheres": 0.0,
-				"cyl_spheres_outside": 0.0
+				"cyl_step": 10.0
 			},
 			"args": {
 				"model-step": 200.0,

@@ -621,15 +621,9 @@ def main(argv: list[str] | None = None) -> int:
 
 	if getattr(mdl, "cylinder_enabled", False) and hasattr(mdl, "prepare_umbilicus_tube_init"):
 		_apply_cylinder_prepare_model_step(mdl, _first_cylinder_stage_model_step(stages))
-		_use_pre_init = any(getattr(stage, "name", "") == "cyl_pre_init" for stage in stages)
-		if _use_pre_init and hasattr(mdl, "prepare_umbilicus_tube_pre_init"):
-			_t = _stage_start("prepare_umbilicus_tube_pre_init")
-			mdl.prepare_umbilicus_tube_pre_init(data)
-			_stage_done("prepare_umbilicus_tube_pre_init", _t)
-		else:
-			_t = _stage_start("prepare_umbilicus_tube_init")
-			mdl.prepare_umbilicus_tube_init(data)
-			_stage_done("prepare_umbilicus_tube_init", _t)
+		_t = _stage_start("prepare_umbilicus_tube_init")
+		mdl.prepare_umbilicus_tube_init(data)
+		_stage_done("prepare_umbilicus_tube_init", _t)
 
 	# Print loaded data summary
 	Z, Y, X = data.size

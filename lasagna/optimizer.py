@@ -68,13 +68,13 @@ class Stage:
 	global_opt: OptSettings
 
 
-CYLINDER_SEED_INIT_STAGE_ROLES = ("cyl_pre_init", "cyl_init", "cyl_grow")
+CYLINDER_SEED_INIT_STAGE_ROLES = ("cyl_init", "cyl_grow")
 CYLINDER_STAGE_STEP_ARG = "model-step"
 OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_step_size", "wstep_target")
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
-	"cyl_z_center", "cyl_radial_mean", "cyl_bend", "cyl_spheres", "cyl_spheres_outside",
-	"cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt",
+	"cyl_z_center", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
+	"cyl_base_mesh", "cyl_base_gt",
 )
 
 
@@ -212,8 +212,6 @@ lambda_global: dict[str, float] = {
 	"cyl_step": 0.0,
 	"cyl_radial_mean": 0.0,
 	"cyl_bend": 0.0,
-	"cyl_spheres": 0.0,
-	"cyl_spheres_outside": 0.0,
 	"cyl_conn_mesh": 0.0,
 	"cyl_conn_gt": 0.0,
 	"cyl_base_mesh": 0.0,
@@ -251,25 +249,23 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 	if positions != sorted(positions):
 		raise ValueError(
 			"stages_json: cylinder_seed stages must appear in order "
-			"cyl_pre_init, cyl_init, cyl_grow"
+			"cyl_init, cyl_grow"
 		)
 	if "cyl_grow" not in role_positions:
 		init_pos = role_positions["cyl_init"]
 		for stage in stages[:init_pos]:
-			if stage.name == "cyl_pre_init":
-				continue
 			raise ValueError(
 				"stages_json: cylinder_seed stages before cyl_init "
-				"must be only cyl_pre_init/cyl_init; later stages are skipped when cyl_grow is absent"
+				"must be only cyl_init; later stages are skipped when cyl_grow is absent"
 			)
 		return
 	grow_pos = role_positions["cyl_grow"]
 	for stage in stages[:grow_pos + 1]:
 		if stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES:
-				raise ValueError(
-					"stages_json: cylinder_seed stages before cyl_grow "
-					"must be only cyl_pre_init/cyl_init/cyl_grow; later stages run normally"
-				)
+			raise ValueError(
+				"stages_json: cylinder_seed stages before cyl_grow "
+				"must be only cyl_init/cyl_grow; later stages run normally"
+			)
 
 
 def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
@@ -709,8 +705,6 @@ def optimize(
 			"needs": Needs(cyl_samples=True, cyl_shell_fields=True),
 		},
 		"cyl_bend": {"loss": opt_loss_cyl.cyl_bend_loss, "needs": Needs(cyl_samples=True)},
-		"cyl_spheres": {"loss": opt_loss_cyl.cyl_spheres_loss, "needs": Needs(cyl_samples=True)},
-		"cyl_spheres_outside": {"loss": opt_loss_cyl.cyl_spheres_outside_loss, "needs": Needs(cyl_samples=True)},
 		"cyl_conn_mesh": {
 			"loss": opt_loss_cyl.cyl_conn_mesh_loss,
 			"needs": Needs(cyl_samples=True, cyl_shell_fields=True),
@@ -860,8 +854,6 @@ def optimize(
 				"cyl_step": float(opt_cfg.eff.get("cyl_step", 0.0)),
 				"cyl_radial_mean": float(opt_cfg.eff.get("cyl_radial_mean", 0.0)),
 				"cyl_bend": float(opt_cfg.eff.get("cyl_bend", 0.0)),
-				"cyl_spheres": float(opt_cfg.eff.get("cyl_spheres", 0.0)),
-				"cyl_spheres_outside": float(opt_cfg.eff.get("cyl_spheres_outside", 0.0)),
 				"cyl_conn_mesh": float(opt_cfg.eff.get("cyl_conn_mesh", 0.0)),
 				"cyl_conn_gt": float(opt_cfg.eff.get("cyl_conn_gt", 0.0)),
 				"cyl_base_mesh": float(opt_cfg.eff.get("cyl_base_mesh", 0.0)),
@@ -869,9 +861,6 @@ def optimize(
 			}
 			if is_cyl_stage else opt_cfg.eff
 		)
-		if is_cyl_stage and stage.name != "cyl_pre_init":
-			stage_eff["cyl_spheres"] = 0.0
-			stage_eff["cyl_spheres_outside"] = 0.0
 		stage_uses_cyl_loss = (
 			_need_term("cyl_normal", stage_eff) > 0 or
 			_need_term("cyl_center", stage_eff) > 0 or
@@ -881,8 +870,6 @@ def optimize(
 			_need_term("cyl_step", stage_eff) > 0 or
 			_need_term("cyl_radial_mean", stage_eff) > 0 or
 			_need_term("cyl_bend", stage_eff) > 0 or
-			_need_term("cyl_spheres", stage_eff) > 0 or
-			_need_term("cyl_spheres_outside", stage_eff) > 0 or
 			_need_term("cyl_conn_mesh", stage_eff) > 0 or
 			_need_term("cyl_conn_gt", stage_eff) > 0 or
 			_need_term("cyl_base_mesh", stage_eff) > 0 or
@@ -1067,8 +1054,6 @@ def optimize(
 				"cyl_normal": "c_norm",
 				"cyl_radial_mean": "c_rad",
 				"cyl_smooth": "c_sm",
-				"cyl_spheres": "c_sph",
-				"cyl_spheres_outside": "c_spho",
 				"cyl_step": "c_step",
 				"cyl_z_center": "c_zctr",
 				"cyl_z_smooth": "c_zsm",
@@ -1396,9 +1381,7 @@ def optimize(
 				model.cyl_shell_z_step = _base_wstep
 			if _base_wstep > 0.0 and hasattr(model, "cyl_shell_current_height_step"):
 				model.cyl_shell_current_height_step = _base_wstep
-			if role == "cyl_pre_init" and hasattr(model, "prepare_umbilicus_tube_pre_init"):
-				model.prepare_umbilicus_tube_pre_init(data)
-			elif hasattr(model, "prepare_umbilicus_tube_init"):
+			if hasattr(model, "prepare_umbilicus_tube_init"):
 				model.prepare_umbilicus_tube_init(data)
 
 			def _prefetch_shell_model_points(needs_: fit_model.ModelForwardNeeds) -> None:
@@ -1817,24 +1800,6 @@ def optimize(
 					"resamples": resample_count,
 					"resampled": resampled_this_pass,
 				}
-
-			if role == "cyl_pre_init":
-				if bool(getattr(model, "cyl_shell_search_done", False)):
-					_stage_done(f"{label}.total", _t_stage_total)
-					return data
-				if hasattr(model, "prepare_umbilicus_tube_pre_init"):
-					model.prepare_umbilicus_tube_pre_init(data)
-				_run_shell_pass(
-					f"{label}.cyl_pre_init",
-					_pass_eff_for_role(),
-					wstep_start=_base_wstep,
-					wstep_end=_base_wstep,
-					shell_no=1,
-				)
-				if hasattr(model, "complete_current_cylinder_shell"):
-					model.complete_current_cylinder_shell(data)
-				_stage_done(f"{label}.total", _t_stage_total)
-				return data
 
 			if role == "cyl_init":
 				if bool(getattr(model, "cyl_shell_search_done", False)):

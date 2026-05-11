@@ -84,8 +84,6 @@ def _active_terms(weights: dict[str, float]) -> dict[str, float]:
 			"cyl_step",
 			"cyl_radial_mean",
 			"cyl_bend",
-			"cyl_spheres",
-			"cyl_spheres_outside",
 			"cyl_conn_mesh",
 			"cyl_conn_gt",
 			"cyl_base_mesh",
@@ -859,45 +857,6 @@ def cyl_radial_mean_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 	mean_len = length.mean()
 	lm = ((mean_len - target) / target).square().view(1)
 	return _register_shell_term("cyl_radial_mean", lm, res=res)
-
-
-def _umbilicus_sphere_distances(res: fit_model.FitResult3D, xyz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-	z = xyz[..., 2].detach()
-	z0 = float(z.amin().detach().cpu())
-	z1 = float(z.amax().detach().cpu())
-	if not math.isfinite(z0) or not math.isfinite(z1):
-		raise ValueError("invalid cylinder shell z range for sphere loss")
-	if z1 < z0:
-		z0, z1 = z1, z0
-	H = int(xyz.shape[0])
-	sample_count = max(8, min(257, max(1, H - 1) * 4 + 1))
-	z_samples = torch.linspace(z0, z1, sample_count, device=xyz.device, dtype=xyz.dtype)
-	umb_xy = res.data.umbilicus_xy_at_z(z_samples).to(device=xyz.device, dtype=xyz.dtype)
-	centers = torch.cat([umb_xy, z_samples[:, None]], dim=-1)
-	dist = torch.cdist(xyz.reshape(-1, 3), centers).amin(dim=1)
-	target_radius = getattr(res, "cyl_shell_sphere_radius", getattr(res, "cyl_shell_step", 1.0))
-	target = dist.new_tensor(max(1.0, float(target_radius)))
-	return dist, target
-
-
-def cyl_spheres_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Keep the shell near the surface of the closest umbilicus-centered sphere."""
-	xyz = _shell_xyz(res)
-	if xyz is None:
-		return _zero_loss(res)
-	dist, target = _umbilicus_sphere_distances(res, xyz)
-	lm = ((dist - target) / target).square()
-	return _register_shell_term("cyl_spheres", lm, res=res)
-
-
-def cyl_spheres_outside_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Prevent the shell from entering any sampled umbilicus-centered sphere."""
-	xyz = _shell_xyz(res)
-	if xyz is None:
-		return _zero_loss(res)
-	dist, target = _umbilicus_sphere_distances(res, xyz)
-	lm = ((target - dist).clamp(min=0.0) / target).square()
-	return _register_shell_term("cyl_spheres_outside", lm, res=res)
 
 
 def cyl_bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:

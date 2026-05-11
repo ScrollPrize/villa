@@ -233,7 +233,6 @@ class FitResult3D:
 	cyl_count: int = 0
 	cyl_shell_mode: bool = False
 	cyl_shell_step: float = 500.0
-	cyl_shell_sphere_radius: float = 500.0
 	cyl_shell_width_step: float = 0.0
 	cyl_shell_height_step: float = 0.0
 	cyl_seed_z: float = 0.0
@@ -661,45 +660,6 @@ class Model3D(nn.Module):
 			  f"z_step_target={z_step:.1f} target_radius={radius_target:.1f} "
 			  f"initial_radius={radius0:.1f} "
 			  f"step_growth={float(getattr(self, 'cyl_shell_growth_factor', 1.5)):.3g} "
-			  f"width_target_step={self.cyl_shell_width_target_step:.1f}",
-			  flush=True)
-
-	def prepare_umbilicus_tube_pre_init(self, data: fit_data.FitData3D) -> None:
-		"""Build the pre-init shell as offset XY circles following the umbilicus."""
-		if not self.cyl_shell_mode or self.cyl_shell_base is not None:
-			return
-		if self.cyl_shell_model_h is None:
-			raise ValueError("cylinder shell pre-init missing model_h")
-		device = self.cyl_params.device
-		dtype = self.cyl_params.dtype
-		z_step = max(1.0, float(self.cyl_shell_z_step))
-		model_h = max(1.0, float(self.cyl_shell_model_h))
-		H = max(2, int(math.ceil(model_h / z_step)) + 1)
-		radius_target = self._first_shell_radius()
-		self.cyl_shell_target_radius = float(radius_target)
-		W = self._shell_width_for_radius(radius_target)
-		radius0 = radius_target
-		self.cyl_shell_current_radius = float(radius0)
-		self._set_shell_grid_shape(h=H, w=W)
-		z = self._shell_z_values(device=device, dtype=dtype, h=H)
-		base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
-		delta_xyz = self._initial_shell_delta_xyz(dirs, target_step=radius0).to(device=device, dtype=dtype)
-		shell = base + delta_xyz
-		if H > 1:
-			self.cyl_shell_current_height_step = float((shell[1:] - shell[:-1]).norm(dim=-1).mean().detach().cpu())
-		self.cyl_shell_z = z.detach()
-		self.cyl_shell_base = base.detach()
-		self.cyl_shell_dirs = dirs.detach()
-		self._set_shell_delta_xyz_params(delta_xyz)
-		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
-		self.cyl_shell_current_index = 0
-		self.cyl_shell_active = True
-		print(f"[model] umbilicus tube pre-init: search_max_shells={self.cyl_shell_search_max_shells} "
-			  f"H={H} W={W} seed_z={self.cyl_shell_seed_z:.1f} "
-			  f"z_center_target={self.cyl_shell_z_center_target:.1f} "
-			  f"model_h={model_h:.1f} h_step={self.cyl_shell_current_height_step:.1f} "
-			  f"z_step_target={z_step:.1f} target_radius={radius_target:.1f} "
-			  f"initial_radius={radius0:.1f} "
 			  f"width_target_step={self.cyl_shell_width_target_step:.1f}",
 			  flush=True)
 
@@ -2884,7 +2844,6 @@ class Model3D(nn.Module):
 			cyl_count=cyl_count,
 			cyl_shell_mode=bool(self.cyl_shell_mode and self.cylinder_enabled),
 			cyl_shell_step=float(getattr(self, "cyl_shell_current_radius", self._current_shell_target_offset())),
-			cyl_shell_sphere_radius=float(getattr(self, "cyl_shell_target_radius", getattr(self, "cyl_shell_current_radius", self._current_shell_target_offset()))),
 			cyl_shell_width_step=float(getattr(self, "cyl_shell_current_width_step", self.cyl_shell_width_target_step)),
 			cyl_shell_height_step=float(getattr(self, "cyl_shell_current_height_step", getattr(self, "cyl_shell_z_step", self.params.mesh_step))),
 			cyl_seed_z=float(self.cyl_seed_xyz[2].detach().cpu()) if self.cyl_seed_xyz.numel() >= 3 else 0.0,
