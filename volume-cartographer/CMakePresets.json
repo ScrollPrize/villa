@@ -116,7 +116,28 @@
     { "name": "ci-dead-code-gcc",        "displayName": "CI Dead-code report (gcc, Debug, no LTO)",
       "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
     { "name": "ci-dead-code-clang",      "displayName": "CI Dead-code report (clang, Debug, no LTO)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } }
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
+
+    {
+      "name": "macos-homebrew-llvm",
+      "displayName": "macOS Homebrew LLVM",
+      "description": "Native macOS build using Homebrew LLVM/Clang and Homebrew dependencies.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-macos",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang++",
+        "CMAKE_AR": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",
+        "CMAKE_RANLIB": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_C_COMPILER_AR": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",
+        "CMAKE_C_COMPILER_RANLIB": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_CXX_COMPILER_AR": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",
+        "CMAKE_CXX_COMPILER_RANLIB": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
+        "VC_TESTING": "OFF"
+      }
+    }
   ],
 
   "buildPresets": [

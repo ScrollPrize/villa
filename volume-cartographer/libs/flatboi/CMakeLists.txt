@@ -58,22 +58,31 @@ if(NOT pastix_POPULATED)
     #    binaries (analyze, compress, simple, ...) would otherwise land in
     #    the shared bin/ next to vc tools and get picked up by the
     #    Dockerfile's bulk copy.
-    execute_process(
-        COMMAND sed -i
-            -e "s|\${CMAKE_SOURCE_DIR}|\${CMAKE_CURRENT_SOURCE_DIR}|g"
-            -e "/add_subdirectory(test)/d"
-            -e "/add_subdirectory(example)/d"
-            -e "/add_subdirectory(wrappers)/d"
-            -e "/enable_testing()/d"
-            "${pastix_SOURCE_DIR}/CMakeLists.txt"
-    )
-    execute_process(
-        COMMAND sed -i
-            -e "/add_subdirectory(tests)/d"
-            -e "/add_subdirectory(examples)/d"
-            -e "/add_subdirectory(wrappers)/d"
-            "${pastix_SOURCE_DIR}/spm/CMakeLists.txt"
-    )
+    # Patch PaStiX's top-level CMakeLists.txt. We do this in CMake (rather
+    # than calling sed) because BSD sed (macOS) and GNU sed disagree on the
+    # syntax of `-i` with multiple `-e` scripts.
+    file(READ "${pastix_SOURCE_DIR}/CMakeLists.txt" _pastix_top_cml)
+    string(REPLACE "\${CMAKE_SOURCE_DIR}" "\${CMAKE_CURRENT_SOURCE_DIR}"
+        _pastix_top_cml "${_pastix_top_cml}")
+    foreach(_pat
+        "add_subdirectory(test)"
+        "add_subdirectory(example)"
+        "add_subdirectory(wrappers)"
+        "enable_testing()")
+        string(REPLACE "${_pat}" "# stripped: ${_pat}" _pastix_top_cml "${_pastix_top_cml}")
+    endforeach()
+    file(WRITE "${pastix_SOURCE_DIR}/CMakeLists.txt" "${_pastix_top_cml}")
+
+    # spm (the matrix description sublib) ships its own tests/, examples/,
+    # and wrappers/ — same reasoning as above, only the library is needed.
+    file(READ "${pastix_SOURCE_DIR}/spm/CMakeLists.txt" _pastix_spm_cml)
+    foreach(_pat
+        "add_subdirectory(tests)"
+        "add_subdirectory(examples)"
+        "add_subdirectory(wrappers)")
+        string(REPLACE "${_pat}" "# stripped: ${_pat}" _pastix_spm_cml "${_pastix_spm_cml}")
+    endforeach()
+    file(WRITE "${pastix_SOURCE_DIR}/spm/CMakeLists.txt" "${_pastix_spm_cml}")
     add_subdirectory(${pastix_SOURCE_DIR} ${pastix_BINARY_DIR})
 endif()
 

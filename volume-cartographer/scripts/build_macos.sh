@@ -72,6 +72,10 @@ required_formulae=(
   libtiff
   curl
   nlohmann-json
+  lapack
+  scotch
+  hwloc
+  gcc
 )
 
 missing=()
@@ -105,6 +109,14 @@ if [[ -d "$brew_prefix/Cellar/eigen/3.4.0_1/share/eigen3/cmake" ]]; then
 fi
 if [[ -d "$brew_prefix/opt/nlohmann-json/share/cmake/nlohmann_json" ]]; then
   extra_cmake_args+=("-Dnlohmann_json_DIR=$brew_prefix/opt/nlohmann-json/share/cmake/nlohmann_json")
+fi
+
+# lapack is keg-only on macOS (Accelerate ships LAPACK but not LAPACKE, which
+# PaStiX requires). Make Homebrew's lapack discoverable by pkg-config and
+# cmake's find_package.
+if [[ -d "$brew_prefix/opt/lapack" ]]; then
+  export PKG_CONFIG_PATH="$brew_prefix/opt/lapack/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  export CMAKE_PREFIX_PATH="$brew_prefix/opt/lapack${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 fi
 
 cmake --preset macos-homebrew-llvm \

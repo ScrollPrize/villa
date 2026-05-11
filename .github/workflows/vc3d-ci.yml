@@ -142,6 +142,45 @@ jobs:
         if: github.event_name == 'pull_request'
         run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }} ubuntu-26.04
 
+  macos-build:
+    name: macOS build (${{ matrix.os }}, Homebrew LLVM)
+    needs: changes
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache the Homebrew downloads (bottle tarballs + API index). The
+      # install of qt/opencv/ceres/llvm/etc. is the dominant cost — caching
+      # downloads keeps the second run under ~10 min.
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            ~/Library/Caches/Homebrew/api
+          key: brew-${{ matrix.os }}-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}
+          restore-keys: |
+            brew-${{ matrix.os }}-
+
+      - name: brew update
+        run: brew update
+
+      - name: Configure + build (installs Homebrew deps as needed)
+        run: volume-cartographer/scripts/build_macos.sh --install-deps
+
+      - name: Smoke-test built binaries
+        run: |
+          cd volume-cartographer/build-macos
+          file bin/VC3D bin/vc_tifxyz bin/flatboi
+          ./bin/vc_tifxyz --help | head -5 || true
+
   dead-code:
     name: Dead-code report (clang, nm + --print-gc-sections)
     needs: [changes, builder]
