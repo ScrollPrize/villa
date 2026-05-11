@@ -30,13 +30,20 @@ FetchContent_Declare(pastix
     GIT_TAG        ${FLATBOI_PASTIX_TAG}
     GIT_SUBMODULES_RECURSE TRUE
 )
-set(PASTIX_INT64        OFF CACHE BOOL "" FORCE)
-set(PASTIX_WITH_PARSEC  OFF CACHE BOOL "" FORCE)
-set(PASTIX_WITH_STARPU  OFF CACHE BOOL "" FORCE)
-set(PASTIX_WITH_MPI     OFF CACHE BOOL "" FORCE)
-set(PASTIX_WITH_CUDA    OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING       OFF CACHE BOOL "" FORCE)
-set(PASTIX_WITH_FORTRAN OFF CACHE BOOL "" FORCE)
+set(PASTIX_INT64           OFF CACHE BOOL "" FORCE)
+set(PASTIX_WITH_PARSEC     OFF CACHE BOOL "" FORCE)
+set(PASTIX_WITH_STARPU     OFF CACHE BOOL "" FORCE)
+set(PASTIX_WITH_MPI        OFF CACHE BOOL "" FORCE)
+set(PASTIX_WITH_CUDA       OFF CACHE BOOL "" FORCE)
+set(PASTIX_WITH_FORTRAN    OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING          OFF CACHE BOOL "" FORCE)
+# flatboi only ever solves double-precision real systems (Pastix6LLT<double>,
+# SpmDouble). Drop the other three precisions and the pattern-only build —
+# PaStiX otherwise auto-generates and compiles s/c/z variants of every
+# precision-templated TU, which is ~80% of its compile time under sanitizer
+# instrumentation.
+set(PASTIX_PRECISIONS      "d" CACHE STRING "" FORCE)
+set(SPM_PRECISIONS         "d" CACHE STRING "" FORCE)
 # Build PaStiX as a static lib so flatboi doesn't need libpastix.so at runtime
 # and so the static parent-tree archives (vc_core/utils) don't have to be PIC.
 # Scope this to PaStiX's add_subdirectory; restore after so it doesn't leak
@@ -59,7 +66,7 @@ if(NOT pastix_POPULATED)
         "${pastix_SOURCE_DIR}/cmake_modules/local_subs.py"
         CACHE INTERNAL "")
     set(_rp_prec "RP_${CMAKE_PROJECT_NAME}_PRECISIONS")
-    set(${_rp_prec} "p;s;d;c;z" CACHE INTERNAL "")
+    set(${_rp_prec} "d" CACHE INTERNAL "")
 
     # PaStiX 6.4 upstream quirks when consumed as a subproject:
     # 1. Uses ${CMAKE_SOURCE_DIR} where it means ${CMAKE_CURRENT_SOURCE_DIR}.
