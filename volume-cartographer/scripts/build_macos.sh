@@ -124,6 +124,21 @@ if [[ -d "$brew_prefix/opt/lapack" ]]; then
   export CMAKE_PREFIX_PATH="$brew_prefix/opt/lapack${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 fi
 
+# PaStiX requires a Fortran compiler. Homebrew's gcc installs a versioned
+# `gfortran-N` and (usually) an unsuffixed `gfortran` symlink, but on some
+# CI images (notably GitHub Actions macos-15) the unsuffixed symlink is
+# missing. Locate any gfortran-N under brew's gcc keg and pass it to cmake.
+if ! command -v gfortran >/dev/null 2>&1; then
+  gcc_prefix="$(brew --prefix gcc 2>/dev/null || true)"
+  if [[ -n "$gcc_prefix" ]]; then
+    gfortran_bin="$(ls "$gcc_prefix"/bin/gfortran-* 2>/dev/null | sort -V | tail -1 || true)"
+    if [[ -n "$gfortran_bin" && -x "$gfortran_bin" ]]; then
+      export FC="$gfortran_bin"
+      extra_cmake_args+=("-DCMAKE_Fortran_COMPILER=$gfortran_bin")
+    fi
+  fi
+fi
+
 cmake --preset macos-homebrew-llvm \
   -B "$build_dir" \
   "${extra_cmake_args[@]}"
