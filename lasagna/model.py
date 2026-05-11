@@ -220,7 +220,7 @@ class FitResult3D:
 	cyl_normals: torch.Tensor | None = None  # (N*D, Hm, Wm, 3) analytic cylinder normals
 	cyl_centers: torch.Tensor | None = None  # (N, 3) cylinder axis anchor [cx, cy, zc]
 	cyl_axes: torch.Tensor | None = None     # (N, 3) unit cylinder axis direction
-	cyl_params: torch.Tensor | None = None   # analytic: (N, 6); shell: (H, W, 2) free xy delta
+	cyl_params: torch.Tensor | None = None   # analytic: (N, 6); shell losses use cyl_shell_delta_xy
 	cyl_count: int = 0
 	cyl_shell_mode: bool = False
 	cyl_shell_step: float = 500.0
@@ -304,9 +304,11 @@ class Model3D(nn.Module):
 		# derived so q=0 stays on the seed point, and height is centered
 		# at the seed along the optimized cylinder axis.
 		self.cyl_params = nn.Parameter(self._default_cylinder_params(device=device))
+		self.cyl_shell_delta_ms = nn.ParameterList()
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.cyl_seed_xyz = torch.zeros(3, device=device, dtype=torch.float32)
 		self.cyl_shell_mode = False
+		self.cyl_shell_n_scales = 5
 		self.cyl_shell_target_count = 4
 		self.cyl_shell_initial_radius = 1000.0
 		self.cyl_shell_step = 500.0
@@ -328,7 +330,7 @@ class Model3D(nn.Module):
 		self.cyl_shell_active = False
 
 		# Residual mesh pyramid: (3, D, H, W) per scale, 5 levels
-		n_scales = 5
+		n_scales = int(self.cyl_shell_n_scales)
 		self.mesh_ms = self._build_zero_pyramid(
 			n_scales=n_scales, channels=3, d=self.depth, h=self.mesh_h, w=self.mesh_w, device=device,
 			pyramid_d=self.pyramid_d,
@@ -415,6 +417,39 @@ class Model3D(nn.Module):
 			recon = up + residuals[i]
 		return nn.ParameterList([nn.Parameter(r) for r in residuals])
 
+	def _shell_delta_scale_count(self) -> int:
+		return max(1, int(getattr(self, "cyl_shell_n_scales", 5)))
+
+	@staticmethod
+	def _shell_delta_to_pyramid_flat(delta_xy: torch.Tensor) -> torch.Tensor:
+		if delta_xy.ndim != 3 or int(delta_xy.shape[-1]) != 2:
+			raise ValueError(f"shell delta must have shape (H, W, 2), got {tuple(delta_xy.shape)}")
+		return delta_xy.permute(2, 0, 1).unsqueeze(1).contiguous()
+
+	@staticmethod
+	def _shell_delta_from_pyramid_flat(flat: torch.Tensor) -> torch.Tensor:
+		if flat.ndim != 4 or int(flat.shape[0]) != 2 or int(flat.shape[1]) != 1:
+			raise ValueError(f"shell delta pyramid must integrate to shape (2, 1, H, W), got {tuple(flat.shape)}")
+		return flat[:, 0].permute(1, 2, 0).contiguous()
+
+	def _construct_shell_delta_pyramid(self, delta_xy: torch.Tensor) -> nn.ParameterList:
+		flat = self._shell_delta_to_pyramid_flat(delta_xy)
+		return self._construct_pyramid_from_flat_3d(
+			flat,
+			self._shell_delta_scale_count(),
+			pyramid_d=False,
+		)
+
+	def _set_shell_delta_xy_params(self, delta_xy: torch.Tensor) -> None:
+		delta_xy = delta_xy.detach().contiguous()
+		self.cyl_shell_delta_ms = self._construct_shell_delta_pyramid(delta_xy)
+		self.cyl_params = nn.Parameter(delta_xy.clone(), requires_grad=False)
+
+	def cyl_param_scale_count(self) -> int:
+		if self.cyl_shell_mode and len(self.cyl_shell_delta_ms) > 0:
+			return len(self.cyl_shell_delta_ms)
+		return 0
+
 	@staticmethod
 	def _construct_pyramid_from_flat_3d_masked(
 		flat: torch.Tensor, valid: torch.Tensor, n_scales: int, *, pyramid_d: bool,
@@ -500,6 +535,7 @@ class Model3D(nn.Module):
 			self.cyl_seed_xyz = torch.tensor([float(seed[0]), float(seed[1]), float(seed[2])],
 											 device=device, dtype=torch.float32)
 			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, 2, device=device, dtype=torch.float32))
+			self.cyl_shell_delta_ms = nn.ParameterList()
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		self.params = replace(self.params, model_w=None, model_h=float(model_h))
 		self.cyl_shell_mode = True
@@ -560,7 +596,7 @@ class Model3D(nn.Module):
 		self.cyl_shell_z = z.detach()
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self.cyl_params = nn.Parameter(
+		self._set_shell_delta_xy_params(
 			self._initial_shell_delta_xy(dirs, target_step=self._shell_target_offset_for_index(0)).to(device=device, dtype=dtype)
 		)
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
@@ -687,6 +723,9 @@ class Model3D(nn.Module):
 		return dirs[..., :2] * step
 
 	def _shell_delta_xy_params(self) -> torch.Tensor:
+		if bool(getattr(self, "cyl_shell_mode", False)) and len(self.cyl_shell_delta_ms) > 0:
+			flat = self._integrate_pyramid_3d(self.cyl_shell_delta_ms, pyramid_d=False)
+			return self._shell_delta_from_pyramid_flat(flat)
 		if self.cyl_params.ndim == 3 and int(self.cyl_params.shape[-1]) == 2:
 			return self.cyl_params
 		raise ValueError(f"invalid cylinder shell params shape: {tuple(self.cyl_params.shape)}")
@@ -830,7 +869,7 @@ class Model3D(nn.Module):
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
 		target_offset = self._shell_target_offset_for_index(idx)
-		self.cyl_params = nn.Parameter(delta_xy.to(device=device, dtype=dtype))
+		self._set_shell_delta_xy_params(delta_xy.to(device=device, dtype=dtype))
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		self.cyl_shell_current_index = idx
 		self.cyl_shell_current_width_step = float(self.cyl_shell_width_target_step)
@@ -867,7 +906,7 @@ class Model3D(nn.Module):
 			self._set_shell_grid_shape(h=old_h, w=target_w)
 			self.cyl_shell_base = base.detach()
 			self.cyl_shell_dirs = dirs.detach()
-			self.cyl_params = nn.Parameter(delta_xy.contiguous())
+			self._set_shell_delta_xy_params(delta_xy.contiguous())
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(old_h, target_w, device=device, dtype=dtype))
 			self.cyl_shell_current_width_step = float(self.cyl_shell_width_target_step)
 			self.cyl_shell_active = True
@@ -1243,6 +1282,7 @@ class Model3D(nn.Module):
 					ext_off.zero_()
 			self.cylinder_enabled = False
 			self.cyl_shell_mode = False
+			self.cyl_shell_delta_ms = nn.ParameterList()
 			return
 		idx = self.best_cylinder_index(data)
 		with torch.no_grad():
@@ -2211,7 +2251,10 @@ class Model3D(nn.Module):
 			out["straight_angle"] = [self.straight_angle]
 			out["straight_half_w"] = [self.straight_half_w]
 		if self.cylinder_enabled:
-			out["cyl_params"] = [self.cyl_params]
+			if self.cyl_shell_mode and len(self.cyl_shell_delta_ms) > 0:
+				out["cyl_params"] = list(self.cyl_shell_delta_ms)
+			else:
+				out["cyl_params"] = [self.cyl_params]
 			if (
 				self.cyl_shell_mode
 				and bool(getattr(self, "cyl_shell_use_conn_offsets", False))
@@ -2273,6 +2316,8 @@ class Model3D(nn.Module):
 		# Drop legacy conn_offset_ms pyramid keys
 		for k in list(st.keys()):
 			if k.startswith("conn_offset_ms."):
+				st.pop(k)
+			if k.startswith("cyl_shell_delta_ms."):
 				st.pop(k)
 		st.pop("cyl_params", None)
 		st.pop("cyl_shell_w_offsets", None)

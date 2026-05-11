@@ -874,6 +874,18 @@ def optimize(
 						if pi < k0:
 							continue
 						param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
+				elif name == "cyl_params" and bool(getattr(model, "cyl_shell_mode", False)):
+					scale_count = 0
+					if hasattr(model, "cyl_param_scale_count"):
+						scale_count = max(0, int(model.cyl_param_scale_count()))
+					k0 = max(0, int(opt_cfg.min_scaledown))
+					for pi, p in enumerate(group):
+						if pi < scale_count:
+							if pi < k0:
+								continue
+							param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
+						else:
+							param_groups_.append({"params": [p], "lr": _lr_last(opt_cfg.lr)})
 				else:
 					lr_last = _lr_last(opt_cfg.lr)
 					for p in group:

@@ -33,19 +33,13 @@
 			"name": "cylinder_seed",
 			"steps": 500,
 			"lr": 10.0,
-			"params": ["cyl_params"],
-			"args": {
-				"compile_cyl_normal": true
-			}
+			"params": ["cyl_params"]
 		},
 		{
 			"name": "cylinder_seed",
-			"steps": 2000,
+			"steps": 100,
 			"lr": 10.0,
-			"params": ["cyl_params"],
-			"args": {
-				"compile_cyl_normal": true
-			}
+			"params": ["cyl_params"]
 		}
 	]
 }
