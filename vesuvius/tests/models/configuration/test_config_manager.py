@@ -183,6 +183,60 @@ class TestTargetNameValidation:
         finally:
             Path(temp_path).unlink()
 
+    def test_cross_frame_config_loads(self):
+        """Loading the shipped ps128_fibers.yaml exposes the cross-frame attrs."""
+        import vesuvius
+
+        config_path = (
+            Path(vesuvius.__file__).parent
+            / "models"
+            / "configuration"
+            / "single_task"
+            / "ps128_fibers.yaml"
+        )
+        assert config_path.exists()
+
+        mgr = ConfigManager(verbose=False)
+        mgr.load_config(str(config_path))
+        assert mgr.dataset_type == "cross_frame"
+        assert mgr.dataset_config["image_zarr_url"].startswith("s3://")
+        assert mgr.dataset_config["labels_zarr_url"].startswith("https://")
+        assert mgr.dataset_config["transform_json_url"].startswith("s3://")
+        assert "fibers" in mgr.targets
+        assert mgr.targets["fibers"]["out_channels"] == 2
+
+    def test_cross_frame_requires_urls(self):
+        """dataset_type=cross_frame without URLs must fail."""
+        config = {
+            "dataset_config": {
+                "dataset_type": "cross_frame",
+                "targets": {"fibers": {"out_channels": 2}},
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="image_zarr_url"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_unknown_dataset_type_raises(self):
+        config = {
+            "dataset_config": {"dataset_type": "bogus", "targets": {"ink": {"out_channels": 2}}}
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="dataset_type"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
     def test_explicit_single_label_volume_does_not_force_allow_unlabeled(self):
         config = {
             "dataset_config": {
