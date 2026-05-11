@@ -334,21 +334,22 @@ class FitData3D:
 		diff=True: use differentiable CUDA kernel (gradients flow through xyz).
 		channels: optional channel names to sample; omitted channels are returned as None.
 		"""
+		xyz_sample = xyz_fullres if diff else xyz_fullres.detach()
 		if CHUNK_STATS_ENABLED:
-			_record_chunks(self, xyz_fullres)
+			_record_chunks(self, xyz_sample)
 		first_channel = next(iter(channels)) if channels else "grad_mag"
 		_debug_check_sample_coords(
-			xyz_fullres,
+			xyz_sample,
 			context=f"FitData3D.grid_sample_fullres(channels={sorted(channels) if channels else 'all'}, diff={diff})",
 			origin_fullres=self.origin_fullres,
 			spacing=self._spacing_for(first_channel),
 			size_zyx=self._size_of(getattr(self, first_channel, None)),
 		)
 		if self.sparse_caches:
-			return self._grid_sample_sparse(xyz_fullres, diff=diff, channels=channels)
+			return self._grid_sample_sparse(xyz_sample, diff=diff, channels=channels)
 		if self.cuda_gridsample:
-			return self._grid_sample_cuda(xyz_fullres, diff=diff, channels=channels)
-		return self._grid_sample_torch(xyz_fullres, channels=channels)
+			return self._grid_sample_cuda(xyz_sample, diff=diff, channels=channels)
+		return self._grid_sample_torch(xyz_sample, channels=channels)
 
 	def _grid_sample_cuda(
 		self,

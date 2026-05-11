@@ -346,6 +346,11 @@ def flow_gate_prefetch_points_for_result(
 	return items.get("pred_dt")
 
 
+def pred_dt_prefetch_items_for_result(*, res: fit_model.FitResult3D) -> dict[str, torch.Tensor]:
+	"""Exact pred-dt sample positions used by `pred_dt_loss`."""
+	return {"pred_dt": _pred_dt_loss_sample_xyz(res).detach().reshape(1, 1, -1, 3)}
+
+
 def flow_gate_prefetch_items_for_result(
 	*,
 	res: fit_model.FitResult3D,

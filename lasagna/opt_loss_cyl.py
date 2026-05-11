@@ -12,6 +12,18 @@ _candidate_terms: dict[str, torch.Tensor] = {}
 _candidate_normal_stats: dict[str, torch.Tensor] = {}
 _sample_cache_key: int | None = None
 _sample_cache_value: tuple[torch.Tensor | None, torch.Tensor | None] | None = None
+_shell_geometry_cache_key: tuple[int, int, bool] | None = None
+_shell_geometry_cache_value: dict[str, torch.Tensor | bool | None] | None = None
+_shell_sample_cache_key: int | None = None
+_shell_sample_cache_value: dict[tuple[int, tuple[int, ...]], tuple[torch.Tensor | None, torch.Tensor | None]] = {}
+_compile_shell_normal = False
+_compile_shell_normal_backend: str | None = None
+_compile_shell_normal_mode: str | None = None
+_compile_shell_normal_dynamic = False
+_compile_shell_normal_fullgraph = False
+_compile_shell_normal_key: tuple[bool, str | None, str | None, bool, bool] | None = None
+_compiled_shell_normal_core = None
+_compile_shell_normal_disabled_reason: str | None = None
 _BEND_THRESHOLD_RAD = math.radians(60.0)
 _BEND_COS_THRESHOLD = math.cos(math.pi - _BEND_THRESHOLD_RAD)
 
@@ -22,11 +34,42 @@ def last_stats() -> dict[str, float]:
 
 def reset_candidate_terms() -> None:
 	global _candidate_terms, _candidate_normal_stats, _sample_cache_key, _sample_cache_value, _last_stats
+	global _shell_geometry_cache_key, _shell_geometry_cache_value, _shell_sample_cache_key, _shell_sample_cache_value
 	_candidate_terms = {}
 	_candidate_normal_stats = {}
 	_sample_cache_key = None
 	_sample_cache_value = None
+	_shell_geometry_cache_key = None
+	_shell_geometry_cache_value = None
+	_shell_sample_cache_key = None
+	_shell_sample_cache_value = {}
 	_last_stats = {}
+
+
+def configure_compile(
+	*,
+	shell_normal: bool = False,
+	backend: str | None = None,
+	mode: str | None = None,
+	dynamic: bool = False,
+	fullgraph: bool = False,
+) -> None:
+	"""Configure opt-in torch.compile use for isolated cylinder loss kernels."""
+	global _compile_shell_normal, _compile_shell_normal_backend, _compile_shell_normal_mode
+	global _compile_shell_normal_dynamic, _compile_shell_normal_fullgraph, _compile_shell_normal_key
+	global _compiled_shell_normal_core, _compile_shell_normal_disabled_reason
+	backend = str(backend).strip() if backend is not None and str(backend).strip() else None
+	mode = str(mode).strip() if mode is not None and str(mode).strip() else None
+	key = (bool(shell_normal), backend, mode, bool(dynamic), bool(fullgraph))
+	if key != _compile_shell_normal_key:
+		_compiled_shell_normal_core = None
+		_compile_shell_normal_disabled_reason = None
+		_compile_shell_normal_key = key
+	_compile_shell_normal = bool(shell_normal)
+	_compile_shell_normal_backend = backend
+	_compile_shell_normal_mode = mode
+	_compile_shell_normal_dynamic = bool(dynamic)
+	_compile_shell_normal_fullgraph = bool(fullgraph)
 
 
 def _active_terms(weights: dict[str, float]) -> dict[str, float]:
@@ -239,28 +282,66 @@ def _shell_supersampled_xyz(xyz: torch.Tensor, *, factor: int = 4) -> torch.Tens
 	return _periodic_interp_width(xyz_h, W * factor)
 
 
-def _shell_geometry(*, res: fit_model.FitResult3D, factor: int = 4) -> dict[str, torch.Tensor | bool] | None:
-	xyz_lr = _shell_xyz(res)
-	if xyz_lr is None:
-		return None
-	base = getattr(res, "cyl_shell_base_xyz", None)
-	offsets = getattr(res, "cyl_shell_w_offsets", None)
-	delta_xy = getattr(res, "cyl_shell_delta_xy", None)
+def _shell_geometry_tensors(
+	xyz_lr: torch.Tensor,
+	base: torch.Tensor | None,
+	offsets: torch.Tensor | None,
+	delta_xy: torch.Tensor | None,
+	*,
+	factor: int = 4,
+	has_base: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
 	if base is None or offsets is None or delta_xy is None:
 		xyz = _shell_supersampled_xyz(xyz_lr, factor=factor)
-		return {"xyz": xyz, "base": None, "conn": None, "has_base": False}
+		return xyz, None, None
 
 	base_s = _shell_supersampled_field(base.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
 	offsets_s = _shell_supersampled_field(offsets.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
 	delta_s = _shell_supersampled_field(delta_xy.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
-	has_base = int(getattr(res, "cyl_shell_index", 0)) > 0
-	if has_base:
+	if bool(has_base):
 		base_conn = _interp_width_at_offsets(base_s, offsets_s, offset_scale=float(factor))
 	else:
 		base_conn = base_s
 	delta_xyz = torch.cat([delta_s, torch.zeros_like(delta_s[..., :1])], dim=-1)
 	xyz = base_conn + delta_xyz
-	return {"xyz": xyz, "base": base_conn, "conn": xyz - base_conn, "has_base": has_base}
+	return xyz, base_conn, xyz - base_conn
+
+
+def _shell_fields_for_result(
+	res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, bool] | None:
+	xyz_lr = _shell_xyz(res)
+	if xyz_lr is None:
+		return None
+	return (
+		xyz_lr,
+		getattr(res, "cyl_shell_base_xyz", None),
+		getattr(res, "cyl_shell_w_offsets", None),
+		getattr(res, "cyl_shell_delta_xy", None),
+		int(getattr(res, "cyl_shell_index", 0)) > 0,
+	)
+
+
+def _shell_geometry(*, res: fit_model.FitResult3D, factor: int = 4) -> dict[str, torch.Tensor | bool | None] | None:
+	global _shell_geometry_cache_key, _shell_geometry_cache_value
+	cache_key = (id(res), int(factor), bool(torch.is_grad_enabled()))
+	if _shell_geometry_cache_key == cache_key and _shell_geometry_cache_value is not None:
+		return _shell_geometry_cache_value
+	fields = _shell_fields_for_result(res)
+	if fields is None:
+		return None
+	xyz_lr, base, offsets, delta_xy, has_base = fields
+	xyz, base_conn, conn = _shell_geometry_tensors(
+		xyz_lr,
+		base,
+		offsets,
+		delta_xy,
+		factor=factor,
+		has_base=has_base,
+	)
+	_shell_geometry_cache_key = cache_key
+	_shell_geometry_cache_value = {"xyz": xyz, "base": base_conn, "conn": conn, "has_base": has_base}
+	return _shell_geometry_cache_value
 
 
 def _unit_normals_for_shell_xyz(xyz: torch.Tensor) -> torch.Tensor:
@@ -317,11 +398,140 @@ def _normal_align_lm(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, to
 	return 1.0 - dot_abs * dot_abs, dot_abs
 
 
+def _shell_normal_geometry_core(
+	xyz_lr: torch.Tensor,
+	base: torch.Tensor | None,
+	offsets: torch.Tensor | None,
+	delta_xy: torch.Tensor | None,
+	*,
+	factor: int = 4,
+	has_base: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+	xyz, base_conn, _conn = _shell_geometry_tensors(
+		xyz_lr,
+		base,
+		offsets,
+		delta_xy,
+		factor=factor,
+		has_base=has_base,
+	)
+	return xyz, base_conn
+
+
+def _shell_normal_compute_core(
+	xyz_lr: torch.Tensor,
+	base: torch.Tensor | None,
+	offsets: torch.Tensor | None,
+	delta_xy: torch.Tensor | None,
+	target: torch.Tensor,
+	mask: torch.Tensor,
+	factor: int = 4,
+	has_base: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	xyz, _base_conn = _shell_normal_geometry_core(
+		xyz_lr,
+		base,
+		offsets,
+		delta_xy,
+		factor=factor,
+		has_base=has_base,
+	)
+	normal = _unit_normals_for_shell_xyz(xyz)
+	normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
+	dot = (normal * target).sum(dim=-1).clamp(min=-1.0, max=1.0)
+	dot_abs = dot.abs()
+	lm = 1.0 - dot_abs * dot_abs
+	wsum = mask.sum()
+	err = (lm * mask).sum() / wsum.clamp(min=1.0)
+	err = torch.where(wsum > 0.0, err, torch.full_like(err, float("inf")))
+	return err, lm, dot_abs
+
+
+def _compiled_shell_normal_compute_core():
+	global _compiled_shell_normal_core, _compile_shell_normal, _compile_shell_normal_disabled_reason
+	if not _compile_shell_normal:
+		return _shell_normal_compute_core
+	if _compile_shell_normal_disabled_reason is not None:
+		return _shell_normal_compute_core
+	if not hasattr(torch, "compile"):
+		_compile_shell_normal_disabled_reason = "torch.compile is unavailable"
+		print(f"[opt_loss_cyl] compile_cyl_normal disabled: {_compile_shell_normal_disabled_reason}", flush=True)
+		return _shell_normal_compute_core
+	if _compiled_shell_normal_core is None:
+		kwargs = {
+			"dynamic": _compile_shell_normal_dynamic,
+			"fullgraph": _compile_shell_normal_fullgraph,
+		}
+		if _compile_shell_normal_backend is not None:
+			kwargs["backend"] = _compile_shell_normal_backend
+		if _compile_shell_normal_mode is not None:
+			kwargs["mode"] = _compile_shell_normal_mode
+		try:
+			_compiled_shell_normal_core = torch.compile(_shell_normal_compute_core, **kwargs)
+		except Exception as exc:
+			_compile_shell_normal_disabled_reason = f"{type(exc).__name__}: {exc}"
+			print(f"[opt_loss_cyl] compile_cyl_normal disabled: {_compile_shell_normal_disabled_reason}", flush=True)
+			return _shell_normal_compute_core
+	return _compiled_shell_normal_core
+
+
+def _run_shell_normal_compute_core(
+	xyz_lr: torch.Tensor,
+	base: torch.Tensor | None,
+	offsets: torch.Tensor | None,
+	delta_xy: torch.Tensor | None,
+	target: torch.Tensor,
+	mask: torch.Tensor,
+	*,
+	factor: int = 4,
+	has_base: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	global _compile_shell_normal_disabled_reason
+	fn = _compiled_shell_normal_compute_core()
+	if fn is _shell_normal_compute_core:
+		return fn(xyz_lr, base, offsets, delta_xy, target, mask, factor, has_base)
+	try:
+		return fn(xyz_lr, base, offsets, delta_xy, target, mask, factor, has_base)
+	except Exception as exc:
+		_compile_shell_normal_disabled_reason = f"{type(exc).__name__}: {exc}"
+		print(f"[opt_loss_cyl] compile_cyl_normal disabled after failure: {_compile_shell_normal_disabled_reason}", flush=True)
+		return _shell_normal_compute_core(xyz_lr, base, offsets, delta_xy, target, mask, factor, has_base)
+
+
+def _shell_normal_sample_xyz(
+	xyz_lr: torch.Tensor,
+	base: torch.Tensor | None,
+	offsets: torch.Tensor | None,
+	delta_xy: torch.Tensor | None,
+	*,
+	factor: int = 4,
+	has_base: bool = False,
+) -> torch.Tensor:
+	with torch.no_grad():
+		xyz, _base_conn = _shell_normal_geometry_core(
+			xyz_lr,
+			base,
+			offsets,
+			delta_xy,
+			factor=factor,
+			has_base=has_base,
+		)
+	return xyz
+
+
 def _sample_shell_gt(
 	*,
 	res: fit_model.FitResult3D,
 	xyz: torch.Tensor,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+	global _shell_sample_cache_key, _shell_sample_cache_value
+	res_key = id(res)
+	if _shell_sample_cache_key != res_key:
+		_shell_sample_cache_key = res_key
+		_shell_sample_cache_value = {}
+	cache_key = (int(xyz.data_ptr()), tuple(int(v) for v in xyz.shape))
+	if cache_key in _shell_sample_cache_value:
+		return _shell_sample_cache_value[cache_key]
 	sampled = res.data.grid_sample_fullres(
 		xyz.unsqueeze(0).detach(),
 		channels={"grad_mag", "nx", "ny"},
@@ -329,8 +539,13 @@ def _sample_shell_gt(
 	target = sampled.normal_3d
 	grad_mag = sampled.grad_mag
 	if target is None or grad_mag is None:
-		return None, None
-	return target.squeeze(0), (grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz.dtype)
+		_shell_sample_cache_value[cache_key] = (None, None)
+		return _shell_sample_cache_value[cache_key]
+	_shell_sample_cache_value[cache_key] = (
+		target.squeeze(0),
+		(grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz.dtype),
+	)
+	return _shell_sample_cache_value[cache_key]
 
 
 def _sample_gt(res: fit_model.FitResult3D) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -462,34 +677,47 @@ def _signed_xy_normal_alignment(
 
 
 def cyl_normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Signed xy normal alignment for analytic cylinder candidates.
+	"""GT normal alignment for analytic cylinders and optimized shells.
 
 	GT normal samples are intentionally non-differentiable; gradients flow only
-	through the analytic cylinder normals. The GT normal is oriented away from
-	the umbilicus in the local xy slice before comparison.
+	through the cylinder/shell geometry. Analytic candidates orient GT normals
+	away from the umbilicus in the local xy slice before comparison.
 	"""
-	if res.cyl_xyz is None or res.cyl_normals is None or res.cyl_count <= 0:
+	if res.cyl_xyz is None or res.cyl_count <= 0:
 		return _zero_loss(res)
 
 	if bool(getattr(res, "cyl_shell_mode", False)):
-		geom = _shell_geometry(res=res, factor=4)
-		if geom is None:
+		fields = _shell_fields_for_result(res)
+		if fields is None:
 			return _zero_loss(res)
-		xyz = geom["xyz"]
-		normal = _unit_normals_for_shell_xyz(xyz)
+		xyz_lr, base, offsets, delta_xy, has_base = fields
+		xyz = _shell_normal_sample_xyz(
+			xyz_lr,
+			base,
+			offsets,
+			delta_xy,
+			factor=4,
+			has_base=has_base,
+		)
 		target, mask = _sample_shell_gt(res=res, xyz=xyz)
 		if target is None or mask is None:
 			return _zero_loss(res)
-		normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1.0e-8)
-		dot = (normal * target).sum(dim=-1).clamp(min=-1.0, max=1.0)
-		dot_abs = dot.abs()
-		lm = 1.0 - dot_abs * dot_abs
-		wsum = mask.sum()
-		err = (lm * mask).sum() / wsum.clamp(min=1.0)
-		err = torch.where(wsum > 0.0, err, torch.full_like(err, float("inf")))
+		err, lm, dot_abs = _run_shell_normal_compute_core(
+			xyz_lr,
+			base,
+			offsets,
+			delta_xy,
+			target,
+			mask,
+			factor=4,
+			has_base=has_base,
+		)
 		_register_shell_normal_angle_stats(dot_abs, mask)
 		loss = _register_candidate_term("cyl_normal", err.view(1))
 		return loss, (lm.unsqueeze(0).unsqueeze(0),), (mask.unsqueeze(0).unsqueeze(0),)
+
+	if res.cyl_normals is None:
+		return _zero_loss(res)
 
 	target, grad_mag = _sample_gt(res)
 	if target is None or grad_mag is None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 
 import torch
@@ -24,22 +24,195 @@ class ModelParams3D:
 	model_h: float | None = None
 
 
+def _frozen_channels(channels: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None) -> frozenset[str]:
+	return frozenset(str(ch) for ch in (channels or ()))
+
+
+@dataclass(frozen=True)
+class ModelForwardNeeds:
+	"""Request object for optional `Model3D.forward` artifacts.
+
+	`xyz_lr`, `data`, and `params` are always produced.  Everything else is
+	requested by optimizer-owned callers from the active loss set.  Channel
+	sets ending in `_grad_channels` require position gradients; other channel
+	requests are sampled from detached positions.
+	"""
+	xyz_hr: bool = False
+	xyz_hr_grad: bool = False
+	hr_data_channels: frozenset[str] = field(default_factory=frozenset)
+	hr_data_grad_channels: frozenset[str] = field(default_factory=frozenset)
+	hr_prefetch_channels: frozenset[str] = field(default_factory=frozenset)
+	hr_prefetch_grad_channels: frozenset[str] = field(default_factory=frozenset)
+	lr_data_channels: frozenset[str] = field(default_factory=frozenset)
+	lr_data_grad_channels: frozenset[str] = field(default_factory=frozenset)
+	lr_prefetch_channels: frozenset[str] = field(default_factory=frozenset)
+	lr_prefetch_grad_channels: frozenset[str] = field(default_factory=frozenset)
+	target: bool = False
+	mesh_conn: bool = False
+	mesh_normals: bool = False
+	ext_conn: bool = False
+	cyl_samples: bool = False
+	cyl_normals: bool = False
+	cyl_centers_axes: bool = False
+	cyl_shell_fields: bool = False
+	prefetch_pred_dt_loss: bool = False
+	prefetch_pred_dt_flow: bool = False
+	prefetch_cyl_gt_normals: bool = False
+	prefetch_ext_offset: bool = False
+	prefetch_corr_points: bool = False
+
+	def __post_init__(self) -> None:
+		hr_data_grad = _frozen_channels(self.hr_data_grad_channels)
+		hr_prefetch_grad = _frozen_channels(self.hr_prefetch_grad_channels)
+		lr_data_grad = _frozen_channels(self.lr_data_grad_channels)
+		lr_prefetch_grad = _frozen_channels(self.lr_prefetch_grad_channels)
+		object.__setattr__(self, "hr_data_grad_channels", hr_data_grad)
+		object.__setattr__(self, "hr_prefetch_grad_channels", hr_prefetch_grad)
+		object.__setattr__(self, "lr_data_grad_channels", lr_data_grad)
+		object.__setattr__(self, "lr_prefetch_grad_channels", lr_prefetch_grad)
+		object.__setattr__(self, "hr_data_channels", _frozen_channels(self.hr_data_channels) | hr_data_grad)
+		object.__setattr__(self, "hr_prefetch_channels", _frozen_channels(self.hr_prefetch_channels) | hr_prefetch_grad)
+		object.__setattr__(self, "lr_data_channels", _frozen_channels(self.lr_data_channels) | lr_data_grad)
+		object.__setattr__(self, "lr_prefetch_channels", _frozen_channels(self.lr_prefetch_channels) | lr_prefetch_grad)
+		if self.xyz_hr_grad or hr_data_grad or hr_prefetch_grad:
+			object.__setattr__(self, "xyz_hr_grad", True)
+			object.__setattr__(self, "xyz_hr", True)
+
+	@classmethod
+	def full(cls, data: fit_data.FitData3D) -> "ModelForwardNeeds":
+		hr_channels = {"grad_mag"}
+		if data.has_channel("pred_dt"):
+			hr_channels.add("pred_dt")
+		return cls(
+			xyz_hr=True,
+			xyz_hr_grad=True,
+			hr_data_channels=frozenset(hr_channels),
+			lr_data_channels=frozenset({"grad_mag", "nx", "ny"}),
+			target=True,
+			mesh_conn=True,
+			mesh_normals=True,
+			ext_conn=True,
+			cyl_samples=True,
+			cyl_normals=True,
+			cyl_centers_axes=True,
+			cyl_shell_fields=True,
+		)
+
+	def merged(self, *others: "ModelForwardNeeds") -> "ModelForwardNeeds":
+		out = self
+		for other in others:
+			out = ModelForwardNeeds(
+				xyz_hr=out.xyz_hr or other.xyz_hr,
+				xyz_hr_grad=out.xyz_hr_grad or other.xyz_hr_grad,
+				hr_data_channels=out.hr_data_channels | other.hr_data_channels,
+				hr_data_grad_channels=out.hr_data_grad_channels | other.hr_data_grad_channels,
+				hr_prefetch_channels=out.hr_prefetch_channels | other.hr_prefetch_channels,
+				hr_prefetch_grad_channels=out.hr_prefetch_grad_channels | other.hr_prefetch_grad_channels,
+				lr_data_channels=out.lr_data_channels | other.lr_data_channels,
+				lr_data_grad_channels=out.lr_data_grad_channels | other.lr_data_grad_channels,
+				lr_prefetch_channels=out.lr_prefetch_channels | other.lr_prefetch_channels,
+				lr_prefetch_grad_channels=out.lr_prefetch_grad_channels | other.lr_prefetch_grad_channels,
+				target=out.target or other.target,
+				mesh_conn=out.mesh_conn or other.mesh_conn,
+				mesh_normals=out.mesh_normals or other.mesh_normals,
+				ext_conn=out.ext_conn or other.ext_conn,
+				cyl_samples=out.cyl_samples or other.cyl_samples,
+				cyl_normals=out.cyl_normals or other.cyl_normals,
+				cyl_centers_axes=out.cyl_centers_axes or other.cyl_centers_axes,
+				cyl_shell_fields=out.cyl_shell_fields or other.cyl_shell_fields,
+				prefetch_pred_dt_loss=out.prefetch_pred_dt_loss or other.prefetch_pred_dt_loss,
+				prefetch_pred_dt_flow=out.prefetch_pred_dt_flow or other.prefetch_pred_dt_flow,
+				prefetch_cyl_gt_normals=out.prefetch_cyl_gt_normals or other.prefetch_cyl_gt_normals,
+				prefetch_ext_offset=out.prefetch_ext_offset or other.prefetch_ext_offset,
+				prefetch_corr_points=out.prefetch_corr_points or other.prefetch_corr_points,
+			)
+		return out
+
+	def prefetch_channels_by_position_grad(self) -> tuple[frozenset[str], frozenset[str]]:
+		grad_channels = set(self.hr_data_grad_channels)
+		grad_channels.update(self.hr_prefetch_grad_channels)
+		grad_channels.update(self.lr_data_grad_channels)
+		grad_channels.update(self.lr_prefetch_grad_channels)
+		nograd_channels = set(self.hr_data_channels - self.hr_data_grad_channels)
+		nograd_channels.update(self.hr_prefetch_channels - self.hr_prefetch_grad_channels)
+		nograd_channels.update(self.lr_data_channels - self.lr_data_grad_channels)
+		nograd_channels.update(self.lr_prefetch_channels - self.lr_prefetch_grad_channels)
+		if self.mesh_conn or self.prefetch_ext_offset:
+			nograd_channels.add("grad_mag")
+		if self.prefetch_pred_dt_loss:
+			grad_channels.add("pred_dt")
+		if self.prefetch_pred_dt_flow:
+			nograd_channels.add("pred_dt")
+			nograd_channels.update({"nx", "ny"})
+		if self.prefetch_cyl_gt_normals:
+			nograd_channels.update({"grad_mag", "nx", "ny"})
+		if self.prefetch_corr_points:
+			nograd_channels.update({"grad_mag", "nx", "ny"})
+		return frozenset(grad_channels), frozenset(nograd_channels)
+
+	def prefetch_channels(self) -> frozenset[str]:
+		grad_channels, nograd_channels = self.prefetch_channels_by_position_grad()
+		return frozenset(set(grad_channels) | set(nograd_channels))
+
+	def summary(self) -> str:
+		parts: list[str] = []
+		if self.xyz_hr:
+			parts.append("xyz_hr_grad" if self.xyz_hr_grad else "xyz_hr_nograd")
+		hr_data_nograd = self.hr_data_channels - self.hr_data_grad_channels
+		hr_prefetch_nograd = self.hr_prefetch_channels - self.hr_prefetch_grad_channels
+		lr_data_nograd = self.lr_data_channels - self.lr_data_grad_channels
+		lr_prefetch_nograd = self.lr_prefetch_channels - self.lr_prefetch_grad_channels
+		for label, channels in (
+			("hr_grad", self.hr_data_grad_channels),
+			("hr_nograd", hr_data_nograd),
+			("hr_pf_grad", self.hr_prefetch_grad_channels),
+			("hr_pf_nograd", hr_prefetch_nograd),
+			("lr_grad", self.lr_data_grad_channels),
+			("lr_nograd", lr_data_nograd),
+			("lr_pf_grad", self.lr_prefetch_grad_channels),
+			("lr_pf_nograd", lr_prefetch_nograd),
+		):
+			if channels:
+				parts.append(f"{label}={','.join(sorted(channels))}")
+		for name, enabled in (
+			("target", self.target),
+			("mesh_conn", self.mesh_conn),
+			("mesh_normals", self.mesh_normals),
+			("ext_conn", self.ext_conn),
+			("cyl", self.cyl_samples),
+			("cyl_normals", self.cyl_normals),
+			("cyl_axes", self.cyl_centers_axes),
+			("cyl_shell", self.cyl_shell_fields),
+			("pred_dt_loss_pf", self.prefetch_pred_dt_loss),
+			("pred_dt_flow_pf", self.prefetch_pred_dt_flow),
+			("cyl_gt_pf", self.prefetch_cyl_gt_normals),
+			("ext_pf", self.prefetch_ext_offset),
+			("corr_pf", self.prefetch_corr_points),
+		):
+			if enabled:
+				parts.append(name)
+		if not parts:
+			return "xyz_lr,data,params"
+		return "xyz_lr,data,params+" + "+".join(parts)
+
+
 @dataclass(frozen=True)
 class FitResult3D:
 	xyz_lr: torch.Tensor        # (D, Hm, Wm, 3) LR mesh in fullres voxels
-	xyz_hr: torch.Tensor        # (D, He, We, 3) HR mesh
+	xyz_hr: torch.Tensor | None # (D, He, We, 3) HR mesh
 	data: fit_data.FitData3D    # full volume data
-	data_s: fit_data.FitData3D  # sampled at HR positions
-	target_plain: torch.Tensor  # (D, 1, He, We)
-	target_mod: torch.Tensor    # (D, 1, He, We)
+	data_s: fit_data.FitData3D | None  # sampled at HR positions
+	data_lr: fit_data.FitData3D | None # sampled at LR positions
+	target_plain: torch.Tensor | None  # (D, 1, He, We)
+	target_mod: torch.Tensor | None    # (D, 1, He, We)
 	amp_lr: torch.Tensor        # (D, 1, Hm, Wm)
 	bias_lr: torch.Tensor       # (D, 1, Hm, Wm)
-	mask_hr: torch.Tensor       # (D, 1, He, We)
-	mask_lr: torch.Tensor       # (D, 1, Hm, Wm)
-	normals: torch.Tensor       # (D, Hm, Wm, 3) detached unit normals
-	xy_conn: torch.Tensor       # (D, Hm, Wm, 3, 3) — [prev, self, next], each 3D fullres
-	mask_conn: torch.Tensor     # (D, 1, Hm, Wm, 3) — validity per connection point
-	sign_conn: torch.Tensor     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
+	mask_hr: torch.Tensor | None       # (D, 1, He, We)
+	mask_lr: torch.Tensor | None       # (D, 1, Hm, Wm)
+	normals: torch.Tensor | None       # (D, Hm, Wm, 3) detached unit normals
+	xy_conn: torch.Tensor | None       # (D, Hm, Wm, 3, 3) — [prev, self, next], each 3D fullres
+	mask_conn: torch.Tensor | None     # (D, 1, Hm, Wm, 3) — validity per connection point
+	sign_conn: torch.Tensor | None     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
 	params: ModelParams3D
 	gt_normal_lr: torch.Tensor | None = None  # (D, Hm, Wm, 3) GT unit normals at LR mesh positions
 	ext_conn: list | None = None
@@ -141,8 +314,8 @@ class Model3D(nn.Module):
 		self.cyl_shell_growth_factor = 1.5
 		self.cyl_shell_optimize_resampled = False
 		self.cyl_shell_use_conn_offsets = False
-		self.cyl_shell_z_step = 200.0
-		self.cyl_shell_width_target_step = 200.0
+		self.cyl_shell_z_step = 1000.0
+		self.cyl_shell_width_target_step = 1000.0
 		self.cyl_shell_current_width_step = self.cyl_shell_width_target_step
 		self.cyl_shell_min_width = 20
 		self.cyl_shell_seed_z = float(z_center)
@@ -1835,86 +2008,162 @@ class Model3D(nn.Module):
 
 		return results
 
-	def forward(self, data: fit_data.FitData3D) -> FitResult3D:
+	def forward(self, data: fit_data.FitData3D, needs: ModelForwardNeeds | None = None) -> FitResult3D:
+		if needs is None:
+			needs = ModelForwardNeeds.full(data)
 		xyz_lr = self._grid_xyz()  # (D, Hm, Wm, 3)
-		xyz_hr = self._grid_xyz_hr(xyz_lr)  # (D, He, We, 3)
-		hr_channels = {"grad_mag"}
-		if data.has_channel("pred_dt"):
-			hr_channels.add("pred_dt")
-		data_s = data.grid_sample_fullres(xyz_hr, channels=hr_channels)
-		xy_conn, mask_conn, sign_conn, normals = self._xyz_conn(xyz_lr, data)
+		need_xyz_hr = bool(needs.xyz_hr or needs.hr_data_channels or needs.target)
+		if need_xyz_hr:
+			if needs.xyz_hr_grad:
+				xyz_hr = self._grid_xyz_hr(xyz_lr)  # (D, He, We, 3)
+			else:
+				with torch.no_grad():
+					xyz_hr = self._grid_xyz_hr(xyz_lr.detach())
+		else:
+			xyz_hr = None
+
+		def _merge_sampled(parts: list[fit_data.FitData3D]) -> fit_data.FitData3D | None:
+			if not parts:
+				return None
+			base = parts[0]
+			def _first_channel(name: str) -> torch.Tensor | None:
+				for part in parts:
+					value = getattr(part, name)
+					if value is not None:
+						return value
+				return None
+			return replace(
+				base,
+				cos=_first_channel("cos"),
+				grad_mag=_first_channel("grad_mag"),
+				nx=_first_channel("nx"),
+				ny=_first_channel("ny"),
+				pred_dt=_first_channel("pred_dt"),
+			)
+
+		def _sample_channels(
+			xyz: torch.Tensor,
+			*,
+			channels: frozenset[str],
+			grad_channels: frozenset[str],
+		) -> fit_data.FitData3D | None:
+			grad = set(grad_channels)
+			nograd = set(channels - grad_channels)
+			parts: list[fit_data.FitData3D] = []
+			if grad:
+				parts.append(data.grid_sample_fullres(xyz, diff=True, channels=grad))
+			if nograd:
+				with torch.no_grad():
+					parts.append(data.grid_sample_fullres(xyz.detach(), diff=False, channels=nograd))
+			return _merge_sampled(parts)
+
+		data_s = (
+			_sample_channels(
+				xyz_hr,
+				channels=needs.hr_data_channels,
+				grad_channels=needs.hr_data_grad_channels,
+			)
+			if xyz_hr is not None and needs.hr_data_channels else None
+		)
+
+		xy_conn = None
+		mask_conn = None
+		sign_conn = None
+		normals = None
+		if needs.mesh_conn:
+			xy_conn, mask_conn, sign_conn, normals = self._xyz_conn(xyz_lr, data)
+		elif needs.mesh_normals:
+			normals = self._vertex_normals(xyz_lr).detach()
 
 		D = self.depth
-		He = int(xyz_hr.shape[1])
-		We = int(xyz_hr.shape[2])
 		Hm = self.mesh_h
 		Wm = self.mesh_w
+		amp_lr = self.amp.clamp(0.1, 1.0)
+		bias_lr = self.bias.clamp(0.0, 0.45)
 
 		# Target: cosine pattern along width (only meaningful when cos channel is loaded)
-		if data.cos is not None:
-			periods = max(1, Wm - 1)
-			xs = torch.linspace(0.0, float(periods), We, device=xyz_lr.device, dtype=torch.float32)
-			phase = (2.0 * torch.pi) * xs.view(1, 1, 1, We)
-			target_plain = 0.5 + 0.5 * torch.cos(phase).expand(D, 1, He, We)
+		target_plain = None
+		target_mod = None
+		if needs.target:
+			if xyz_hr is None:
+				raise RuntimeError("ModelForwardNeeds.target requires xyz_hr")
+			He = int(xyz_hr.shape[1])
+			We = int(xyz_hr.shape[2])
+			if data.has_channel("cos"):
+				periods = max(1, Wm - 1)
+				xs = torch.linspace(0.0, float(periods), We, device=xyz_lr.device, dtype=torch.float32)
+				phase = (2.0 * torch.pi) * xs.view(1, 1, 1, We)
+				target_plain = 0.5 + 0.5 * torch.cos(phase).expand(D, 1, He, We)
 
-			amp_lr = self.amp.clamp(0.1, 1.0)
-			bias_lr = self.bias.clamp(0.0, 0.45)
-			amp_hr = F.interpolate(amp_lr, size=(He, We), mode="bilinear", align_corners=True)
-			bias_hr = F.interpolate(bias_lr, size=(He, We), mode="bilinear", align_corners=True)
-			target_mod = (bias_hr + amp_hr * (target_plain - 0.5)).clamp(0.0, 1.0)
+				amp_hr = F.interpolate(amp_lr, size=(He, We), mode="bilinear", align_corners=True)
+				bias_hr = F.interpolate(bias_lr, size=(He, We), mode="bilinear", align_corners=True)
+				target_mod = (bias_hr + amp_hr * (target_plain - 0.5)).clamp(0.0, 1.0)
+			else:
+				target_plain = torch.zeros(D, 1, He, We, device=xyz_lr.device)
+				target_mod = torch.zeros(D, 1, He, We, device=xyz_lr.device)
+
+		# Masking via grad_mag > 0 + GT normals at LR positions, only when requested.
+		data_lr = (
+			_sample_channels(
+				xyz_lr,
+				channels=needs.lr_data_channels,
+				grad_channels=needs.lr_data_grad_channels,
+			)
+			if needs.lr_data_channels else None
+		)
+		if data_s is not None and data_s.grad_mag is not None:
+			mask_hr = (data_s.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 		else:
-			target_plain = torch.zeros(D, 1, He, We, device=xyz_lr.device)
-			target_mod = torch.zeros(D, 1, He, We, device=xyz_lr.device)
-			amp_lr = self.amp.clamp(0.1, 1.0)
-			bias_lr = self.bias.clamp(0.0, 0.45)
-
-		# Masking via grad_mag > 0 + GT normals at LR positions
-		data_lr = data.grid_sample_fullres(xyz_lr.detach(), channels={"grad_mag", "nx", "ny"})
-		mask_hr = (data_s.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
-		mask_lr = (data_lr.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
-		gt_normal_lr = data_lr.normal_3d  # (D, Hm, Wm, 3) or None
+			mask_hr = None
+		if data_lr is not None and data_lr.grad_mag is not None:
+			mask_lr = (data_lr.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
+		else:
+			mask_lr = None
+		gt_normal_lr = data_lr.normal_3d if data_lr is not None else None  # (D, Hm, Wm, 3) or None
 
 		# External surface intersections
-		ext_conn = self._intersect_ext_surfaces(xyz_lr, data)
+		ext_conn = self._intersect_ext_surfaces(xyz_lr, data) if needs.ext_conn else None
 		cyl_xyz = None
 		cyl_normals = None
 		cyl_axes = None
+		cyl_centers = None
+		cyl_shell_base_xyz = None
+		cyl_shell_dirs = None
+		cyl_shell_w_offsets = None
+		cyl_shell_delta_xy = None
+		cyl_shell_index = 0
 		cyl_count = 0
-		if self.cylinder_enabled:
+		if self.cylinder_enabled and (
+			needs.cyl_samples or needs.cyl_normals or needs.cyl_centers_axes or needs.cyl_shell_fields
+		):
 			if self.cyl_shell_mode:
-				cyl_xyz = xyz_lr
-				cyl_normals = self.current_cylinder_shell_normals().unsqueeze(0)
-				cyl_centers = None
-				cyl_axes = None
+				if needs.cyl_samples or needs.cyl_normals or needs.cyl_shell_fields:
+					cyl_xyz = xyz_lr
+				if needs.cyl_normals:
+					cyl_normals = self.current_cylinder_shell_normals().unsqueeze(0)
 				cyl_count = 1
-				cyl_shell_base_xyz = self.cyl_shell_base
-				cyl_shell_dirs = self.cyl_shell_dirs
-				cyl_shell_w_offsets = self._shell_w_offset_values()
-				cyl_shell_delta_xy = self._shell_delta_xy_params()
-				cyl_shell_index = int(self.cyl_shell_current_index)
+				if needs.cyl_shell_fields:
+					cyl_shell_base_xyz = self.cyl_shell_base
+					cyl_shell_dirs = self.cyl_shell_dirs
+					cyl_shell_w_offsets = self._shell_w_offset_values()
+					cyl_shell_delta_xy = self._shell_delta_xy_params()
+					cyl_shell_index = int(self.cyl_shell_current_index)
 			else:
-				cyl_xyz, cyl_normals = self.cylinder_samples()
-				cyl_centers = self.cylinder_centers()
-				cyl_axes = self.cylinder_axes()
+				if needs.cyl_samples or needs.cyl_normals:
+					cyl_xyz, cyl_normals_full = self.cylinder_samples()
+					if needs.cyl_normals:
+						cyl_normals = cyl_normals_full
+				if needs.cyl_centers_axes:
+					cyl_centers = self.cylinder_centers()
+					cyl_axes = self.cylinder_axes()
 				cyl_count = int(self.cyl_params.shape[0])
-				cyl_shell_base_xyz = None
-				cyl_shell_dirs = None
-				cyl_shell_w_offsets = None
-				cyl_shell_delta_xy = None
-				cyl_shell_index = 0
-		else:
-			cyl_centers = None
-			cyl_shell_base_xyz = None
-			cyl_shell_dirs = None
-			cyl_shell_w_offsets = None
-			cyl_shell_delta_xy = None
-			cyl_shell_index = 0
 
 		return FitResult3D(
 			xyz_lr=xyz_lr,
 			xyz_hr=xyz_hr,
 			data=data,
 			data_s=data_s,
+			data_lr=data_lr,
 			target_plain=target_plain,
 			target_mod=target_mod,
 			amp_lr=amp_lr,

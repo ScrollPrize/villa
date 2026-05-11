@@ -33,13 +33,21 @@
 			"name": "cylinder_seed",
 			"steps": 500,
 			"lr": 10.0,
-			"params": ["cyl_params"]
+			"params": ["cyl_params"],
+			"args": {
+				"profile_opt": true,
+				"profile_interval": 100
+			}
 		},
 		{
 			"name": "cylinder_seed",
 			"steps": 2000,
 			"lr": 10.0,
-			"params": ["cyl_params"]
+			"params": ["cyl_params"],
+			"args": {
+				"profile_opt": true,
+				"profile_interval": 100
+			}
 		}
 	]
 }
