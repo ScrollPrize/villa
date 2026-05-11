@@ -1051,6 +1051,9 @@ def optimize(
 				"cyl_smooth": "c_sm",
 				"cyl_step": "c_step",
 				"cyl_z_smooth": "c_zsm",
+				"p:bend_max_deg": "benddeg",
+				"p:hstep_avg_vx": "havg",
+				"p:hstep_tgt_vx": "htgt",
 				"pred_dt_gate_gt0": "g>0",
 				"pred_dt_gate_gt01": "g>.1",
 				"pred_dt_gate_gt05": "g>.5",
@@ -1357,8 +1360,6 @@ def optimize(
 				)
 
 		if is_cyl_stage and bool(getattr(model, "cyl_shell_mode", False)):
-			if hasattr(model, "prepare_umbilicus_tube_init"):
-				model.prepare_umbilicus_tube_init(data)
 			role = str(stage.name)
 			max_steps = int(opt_cfg.steps)
 			max_search_shells = max(1, int(getattr(model, "cyl_shell_search_max_shells", 16)))
@@ -1370,6 +1371,10 @@ def optimize(
 			)
 			if hasattr(model, "cyl_shell_width_target_step"):
 				model.cyl_shell_width_target_step = _base_wstep
+			if _base_wstep > 0.0 and hasattr(model, "cyl_shell_z_step"):
+				model.cyl_shell_z_step = _base_wstep
+			if hasattr(model, "prepare_umbilicus_tube_init"):
+				model.prepare_umbilicus_tube_init(data)
 
 			def _prefetch_shell_model_points(needs_: fit_model.ModelForwardNeeds) -> None:
 				_prefetch_model_points(needs_)
@@ -1389,9 +1394,18 @@ def optimize(
 				if not hasattr(model, "_shell_width_step_stats"):
 					return {}
 				_avg = model._shell_width_step_stats()[0]
+				_havg = (
+					model._shell_height_step_stats()[0]
+					if hasattr(model, "_shell_height_step_stats") else 0.0
+				)
 				w_count = max(0, _shell_width_count())
 				tgt = float(getattr(model, "cyl_shell_current_width_step", 0.0))
+				h_tgt = float(getattr(model, "cyl_shell_z_step", tgt))
 				out = {
+					"bend_max_deg": float(model._shell_bend_max_degrees())
+						if hasattr(model, "_shell_bend_max_degrees") else 0.0,
+					"hstep_avg_vx": float(_havg),
+					"hstep_tgt_vx": h_tgt,
 					"wstep_avg_vx": float(_avg),
 					"wstep_tgt_vx": tgt,
 				}
@@ -1901,6 +1915,8 @@ def optimize(
 				raise RuntimeError(f"{label}: model does not support seed-locked cylinder shell stage")
 			model.begin_cylinder_shell_refine(data)
 			if abs(float(stage_model_step) - float(prev_model_step)) > 1.0e-6:
+				if hasattr(model, "resample_current_cylinder_shell_height_to_step"):
+					model.resample_current_cylinder_shell_height_to_step(data, float(stage_model_step))
 				if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
 					raise RuntimeError(f"{label}: model cannot resample cylinder shell width to model-step")
 				model.resample_current_cylinder_shell_width_to_step(data, float(stage_model_step))

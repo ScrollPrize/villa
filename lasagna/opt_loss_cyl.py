@@ -795,18 +795,41 @@ def cyl_z_smooth_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tupl
 
 
 def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Match consecutive shell width edge lengths to the current shell target."""
+	"""Match shell H/W edges and wrapped quad diagonals to the current target."""
 	xyz = _shell_xyz(res)
 	if xyz is None:
 		return _zero_loss(res)
 	w_step = torch.roll(xyz, shifts=-1, dims=1) - xyz
 	w_len = w_step.norm(dim=-1)
-	target_value = float(getattr(res, "cyl_shell_width_step", 0.0))
-	if target_value > 0.0:
-		target = w_len.new_tensor(target_value).clamp(min=1.0e-6)
+	h_len = (xyz[1:] - xyz[:-1]).norm(dim=-1) if int(xyz.shape[0]) > 1 else None
+	w_target_value = float(getattr(res, "cyl_shell_width_step", 0.0))
+	if w_target_value > 0.0:
+		w_target = w_len.new_tensor(w_target_value).clamp(min=1.0e-6)
 	else:
-		target = w_len.mean().clamp(min=1.0e-6)
-	lm = ((w_len - target) / target).square()
+		target_terms = [w_len.reshape(-1)]
+		if h_len is not None:
+			target_terms.append(h_len.reshape(-1))
+		w_target = torch.cat(target_terms, dim=0).mean().clamp(min=1.0e-6)
+	h_target_value = float(getattr(res, "cyl_shell_height_step", 0.0))
+	if h_target_value > 0.0:
+		h_target = w_len.new_tensor(h_target_value).clamp(min=1.0e-6)
+	elif h_len is not None:
+		h_target = h_len.mean().clamp(min=1.0e-6)
+	else:
+		h_target = w_target
+	terms = [((w_len - w_target) / w_target).square().reshape(-1)]
+	if h_len is not None:
+		terms.append(((h_len - h_target) / h_target).square().reshape(-1))
+		p00 = xyz[:-1]
+		p10 = xyz[1:]
+		p01 = torch.roll(p00, shifts=-1, dims=1)
+		p11 = torch.roll(p10, shifts=-1, dims=1)
+		diag_target = torch.sqrt(h_target.square() + w_target.square()).clamp(min=1.0e-6)
+		diag_fwd = (p11 - p00).norm(dim=-1)
+		diag_back = (p10 - p01).norm(dim=-1)
+		terms.append(((diag_fwd - diag_target) / diag_target).square().reshape(-1))
+		terms.append(((diag_back - diag_target) / diag_target).square().reshape(-1))
+	lm = torch.cat(terms, dim=0)
 	return _register_shell_term("cyl_step", lm, res=res)
 
 
@@ -846,6 +869,14 @@ def cyl_bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[to
 		e1_w = xyz - torch.roll(xyz, shifts=1, dims=1)
 		e2_w = torch.roll(xyz, shifts=-1, dims=1) - xyz
 		terms.append(_bend_penalty(e1_w, e2_w).reshape(-1))
+	if int(xyz.shape[0]) > 2 and int(xyz.shape[1]) > 2:
+		mid = xyz[1:-1]
+		e1_d0 = mid - torch.roll(xyz[:-2], shifts=1, dims=1)
+		e2_d0 = torch.roll(xyz[2:], shifts=-1, dims=1) - mid
+		e1_d1 = mid - torch.roll(xyz[:-2], shifts=-1, dims=1)
+		e2_d1 = torch.roll(xyz[2:], shifts=1, dims=1) - mid
+		terms.append(_bend_penalty(e1_d0, e2_d0).reshape(-1))
+		terms.append(_bend_penalty(e1_d1, e2_d1).reshape(-1))
 	if not terms:
 		return _zero_loss(res)
 	lm = torch.cat(terms, dim=0)

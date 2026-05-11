@@ -234,6 +234,7 @@ class FitResult3D:
 	cyl_shell_mode: bool = False
 	cyl_shell_step: float = 500.0
 	cyl_shell_width_step: float = 0.0
+	cyl_shell_height_step: float = 0.0
 	cyl_shell_base_xyz: torch.Tensor | None = None
 	cyl_shell_dirs: torch.Tensor | None = None
 	cyl_shell_w_offsets: torch.Tensor | None = None
@@ -840,6 +841,50 @@ class Model3D(nn.Module):
 				float(w_len.amax().detach().cpu()),
 			)
 
+	def _shell_height_step_stats(self) -> tuple[float, float, float]:
+		with torch.no_grad():
+			xyz = self.current_cylinder_shell_xyz().detach()
+			if int(xyz.shape[0]) <= 1:
+				return 0.0, 0.0, 0.0
+			h_len = (xyz[1:] - xyz[:-1]).norm(dim=-1)
+			return (
+				float(h_len.mean().detach().cpu()),
+				float(h_len.amin().detach().cpu()),
+				float(h_len.amax().detach().cpu()),
+			)
+
+	def _shell_bend_max_degrees(self) -> float:
+		with torch.no_grad():
+			xyz = self.current_cylinder_shell_xyz().detach()
+			terms: list[torch.Tensor] = []
+
+			def _bend_degrees(e1: torch.Tensor, e2: torch.Tensor) -> torch.Tensor:
+				e1n = F.normalize(e1, dim=-1, eps=1.0e-12)
+				e2n = F.normalize(e2, dim=-1, eps=1.0e-12)
+				cos_angle = (e1n * e2n).sum(dim=-1).clamp(min=-1.0, max=1.0)
+				return torch.acos(cos_angle) * (180.0 / math.pi)
+
+			if int(xyz.shape[0]) > 2:
+				terms.append(_bend_degrees(xyz[1:-1] - xyz[:-2], xyz[2:] - xyz[1:-1]).reshape(-1))
+			if int(xyz.shape[1]) > 2:
+				terms.append(_bend_degrees(
+					xyz - torch.roll(xyz, shifts=1, dims=1),
+					torch.roll(xyz, shifts=-1, dims=1) - xyz,
+				).reshape(-1))
+			if int(xyz.shape[0]) > 2 and int(xyz.shape[1]) > 2:
+				mid = xyz[1:-1]
+				terms.append(_bend_degrees(
+					mid - torch.roll(xyz[:-2], shifts=1, dims=1),
+					torch.roll(xyz[2:], shifts=-1, dims=1) - mid,
+				).reshape(-1))
+				terms.append(_bend_degrees(
+					mid - torch.roll(xyz[:-2], shifts=-1, dims=1),
+					torch.roll(xyz[2:], shifts=1, dims=1) - mid,
+				).reshape(-1))
+			if not terms:
+				return 0.0
+			return float(torch.cat(terms, dim=0).amax().detach().cpu())
+
 	@staticmethod
 	def _fmt_xyz(p: torch.Tensor) -> str:
 		p = p.detach().cpu()
@@ -1117,6 +1162,42 @@ class Model3D(nn.Module):
 			self.cylinder_enabled = True
 			self.cyl_shell_mode = True
 
+	def resample_current_cylinder_shell_height_to_step(
+		self,
+		data: fit_data.FitData3D,
+		target_step: float,
+	) -> None:
+		target_step = float(target_step)
+		if target_step <= 0.0:
+			raise ValueError(f"target cylinder shell height step must be > 0, got {target_step}")
+		with torch.no_grad():
+			shell_opt = self.current_cylinder_shell_xyz().detach()
+			old_h = int(shell_opt.shape[0])
+			old_w = int(shell_opt.shape[1])
+			if old_h <= 1:
+				target_h = old_h
+			else:
+				row_z = shell_opt[..., 2].mean(dim=1)
+				height = float((row_z[-1] - row_z[0]).abs().detach().cpu())
+				if height <= 0.0 and self.params.model_h is not None:
+					height = float(self.params.model_h)
+				target_h = max(2, int(math.ceil(max(target_step, height) / target_step)) + 1)
+			shell = self._resample_shell_height(shell_opt, target_h)
+			device = self.cyl_params.device
+			dtype = self.cyl_params.dtype
+			z = shell[:, 0, 2].to(device=device, dtype=dtype)
+			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=old_w)
+			delta_xyz = shell.to(device=device, dtype=dtype) - base
+			self._set_shell_grid_shape(h=target_h, w=old_w)
+			self.cyl_shell_base = base.detach()
+			self.cyl_shell_dirs = dirs.detach()
+			self._set_shell_delta_xyz_params(delta_xyz.contiguous())
+			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(target_h, old_w, device=device, dtype=dtype))
+			self.cyl_shell_z_step = target_step
+			self.cyl_shell_active = True
+			self.cylinder_enabled = True
+			self.cyl_shell_mode = True
+
 	def _resample_shell_width(self, shell: torch.Tensor, target_w: int) -> torch.Tensor:
 		target_w = max(3, int(target_w))
 		src_w = int(shell.shape[1])
@@ -1131,6 +1212,21 @@ class Model3D(nn.Module):
 		i1 = torch.remainder(i0 + 1, src_w)
 		p0 = shell.index_select(1, i0)
 		p1 = shell.index_select(1, i1)
+		return (p0 + frac * (p1 - p0)).contiguous().detach()
+
+	def _resample_shell_height(self, shell: torch.Tensor, target_h: int) -> torch.Tensor:
+		target_h = max(2, int(target_h))
+		src_h = int(shell.shape[0])
+		if src_h == target_h:
+			return shell.detach().clone()
+		device = shell.device
+		dtype = shell.dtype
+		phase = torch.linspace(0.0, float(src_h - 1), target_h, device=device, dtype=dtype)
+		i0 = torch.floor(phase).to(dtype=torch.long).clamp(min=0, max=src_h - 1)
+		i1 = (i0 + 1).clamp(max=src_h - 1)
+		frac = (phase - i0.to(dtype=dtype)).view(target_h, 1, 1)
+		p0 = shell.index_select(0, i0)
+		p1 = shell.index_select(0, i1)
 		return (p0 + frac * (p1 - p0)).contiguous().detach()
 
 	def _target_width_for_shell(self, shell: torch.Tensor, data: fit_data.FitData3D) -> int:
@@ -2553,6 +2649,7 @@ class Model3D(nn.Module):
 			cyl_shell_mode=bool(self.cyl_shell_mode and self.cylinder_enabled),
 			cyl_shell_step=float(self._current_shell_target_offset()),
 			cyl_shell_width_step=float(getattr(self, "cyl_shell_current_width_step", self.cyl_shell_width_target_step)),
+			cyl_shell_height_step=float(getattr(self, "cyl_shell_z_step", self.params.mesh_step)),
 			cyl_shell_base_xyz=cyl_shell_base_xyz,
 			cyl_shell_dirs=cyl_shell_dirs,
 			cyl_shell_w_offsets=cyl_shell_w_offsets,
