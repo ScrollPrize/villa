@@ -286,24 +286,23 @@ def _shell_geometry_tensors(
 	xyz_lr: torch.Tensor,
 	base: torch.Tensor | None,
 	offsets: torch.Tensor | None,
-	delta_xy: torch.Tensor | None,
+	delta_xyz: torch.Tensor | None,
 	*,
 	factor: int = 4,
 	has_base: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-	if base is None or offsets is None or delta_xy is None:
+	if base is None or offsets is None or delta_xyz is None:
 		xyz = _shell_supersampled_xyz(xyz_lr, factor=factor)
 		return xyz, None, None
 
 	base_s = _shell_supersampled_field(base.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
 	offsets_s = _shell_supersampled_field(offsets.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
-	delta_s = _shell_supersampled_field(delta_xy.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
+	delta_s = _shell_supersampled_field(delta_xyz.to(device=xyz_lr.device, dtype=xyz_lr.dtype), factor=factor)
 	if bool(has_base):
 		base_conn = _interp_width_at_offsets(base_s, offsets_s, offset_scale=float(factor))
 	else:
 		base_conn = base_s
-	delta_xyz = torch.cat([delta_s, torch.zeros_like(delta_s[..., :1])], dim=-1)
-	xyz = base_conn + delta_xyz
+	xyz = base_conn + delta_s
 	return xyz, base_conn, xyz - base_conn
 
 
@@ -317,7 +316,7 @@ def _shell_fields_for_result(
 		xyz_lr,
 		getattr(res, "cyl_shell_base_xyz", None),
 		getattr(res, "cyl_shell_w_offsets", None),
-		getattr(res, "cyl_shell_delta_xy", None),
+		getattr(res, "cyl_shell_delta_xyz", None),
 		int(getattr(res, "cyl_shell_index", 0)) > 0,
 	)
 
@@ -330,12 +329,12 @@ def _shell_geometry(*, res: fit_model.FitResult3D, factor: int = 4) -> dict[str,
 	fields = _shell_fields_for_result(res)
 	if fields is None:
 		return None
-	xyz_lr, base, offsets, delta_xy, has_base = fields
+	xyz_lr, base, offsets, delta_xyz, has_base = fields
 	xyz, base_conn, conn = _shell_geometry_tensors(
 		xyz_lr,
 		base,
 		offsets,
-		delta_xy,
+		delta_xyz,
 		factor=factor,
 		has_base=has_base,
 	)
@@ -402,7 +401,7 @@ def _shell_normal_geometry_core(
 	xyz_lr: torch.Tensor,
 	base: torch.Tensor | None,
 	offsets: torch.Tensor | None,
-	delta_xy: torch.Tensor | None,
+	delta_xyz: torch.Tensor | None,
 	*,
 	factor: int = 4,
 	has_base: bool = False,
@@ -411,7 +410,7 @@ def _shell_normal_geometry_core(
 		xyz_lr,
 		base,
 		offsets,
-		delta_xy,
+		delta_xyz,
 		factor=factor,
 		has_base=has_base,
 	)
@@ -422,7 +421,7 @@ def _shell_normal_compute_core(
 	xyz_lr: torch.Tensor,
 	base: torch.Tensor | None,
 	offsets: torch.Tensor | None,
-	delta_xy: torch.Tensor | None,
+	delta_xyz: torch.Tensor | None,
 	target: torch.Tensor,
 	mask: torch.Tensor,
 	factor: int = 4,
@@ -432,7 +431,7 @@ def _shell_normal_compute_core(
 		xyz_lr,
 		base,
 		offsets,
-		delta_xy,
+		delta_xyz,
 		factor=factor,
 		has_base=has_base,
 	)
@@ -479,7 +478,7 @@ def _run_shell_normal_compute_core(
 	xyz_lr: torch.Tensor,
 	base: torch.Tensor | None,
 	offsets: torch.Tensor | None,
-	delta_xy: torch.Tensor | None,
+	delta_xyz: torch.Tensor | None,
 	target: torch.Tensor,
 	mask: torch.Tensor,
 	*,
@@ -489,20 +488,20 @@ def _run_shell_normal_compute_core(
 	global _compile_shell_normal_disabled_reason
 	fn = _compiled_shell_normal_compute_core()
 	if fn is _shell_normal_compute_core:
-		return fn(xyz_lr, base, offsets, delta_xy, target, mask, factor, has_base)
+		return fn(xyz_lr, base, offsets, delta_xyz, target, mask, factor, has_base)
 	try:
-		return fn(xyz_lr, base, offsets, delta_xy, target, mask, factor, has_base)
+		return fn(xyz_lr, base, offsets, delta_xyz, target, mask, factor, has_base)
 	except Exception as exc:
 		_compile_shell_normal_disabled_reason = f"{type(exc).__name__}: {exc}"
 		print(f"[opt_loss_cyl] compile_cyl_normal disabled after failure: {_compile_shell_normal_disabled_reason}", flush=True)
-		return _shell_normal_compute_core(xyz_lr, base, offsets, delta_xy, target, mask, factor, has_base)
+		return _shell_normal_compute_core(xyz_lr, base, offsets, delta_xyz, target, mask, factor, has_base)
 
 
 def _shell_normal_sample_xyz(
 	xyz_lr: torch.Tensor,
 	base: torch.Tensor | None,
 	offsets: torch.Tensor | None,
-	delta_xy: torch.Tensor | None,
+	delta_xyz: torch.Tensor | None,
 	*,
 	factor: int = 4,
 	has_base: bool = False,
@@ -512,7 +511,7 @@ def _shell_normal_sample_xyz(
 			xyz_lr,
 			base,
 			offsets,
-			delta_xy,
+			delta_xyz,
 			factor=factor,
 			has_base=has_base,
 		)
@@ -690,12 +689,12 @@ def cyl_normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		fields = _shell_fields_for_result(res)
 		if fields is None:
 			return _zero_loss(res)
-		xyz_lr, base, offsets, delta_xy, has_base = fields
+		xyz_lr, base, offsets, delta_xyz, has_base = fields
 		xyz = _shell_normal_sample_xyz(
 			xyz_lr,
 			base,
 			offsets,
-			delta_xy,
+			delta_xyz,
 			factor=4,
 			has_base=has_base,
 		)
@@ -706,7 +705,7 @@ def cyl_normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			xyz_lr,
 			base,
 			offsets,
-			delta_xy,
+			delta_xyz,
 			target,
 			mask,
 			factor=4,
@@ -813,12 +812,12 @@ def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[to
 
 def cyl_radial_mean_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Keep the initial shell near its configured umbilicus radius."""
-	delta_xy = getattr(res, "cyl_shell_delta_xy", None)
-	if delta_xy is None:
+	delta_xyz = getattr(res, "cyl_shell_delta_xyz", None)
+	if delta_xyz is None:
 		return _zero_loss(res)
 	if bool(getattr(res, "cyl_shell_mode", False)) and int(getattr(res, "cyl_shell_index", 0)) > 0:
 		return _zero_loss(res)
-	length = delta_xy.norm(dim=-1)
+	length = delta_xyz[..., :2].norm(dim=-1)
 	target = length.new_tensor(max(1.0, float(getattr(res, "cyl_shell_step", 1.0))))
 	mean_len = length.mean()
 	lm = ((mean_len - target) / target).square().view(1)

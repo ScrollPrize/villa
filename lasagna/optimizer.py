@@ -239,15 +239,24 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 				raise ValueError(
 					f"stages_json: cylinder_seed stage '{stage.name}' must have params ['cyl_params']"
 				)
-	missing = [name for name in CYLINDER_SEED_INIT_STAGE_ROLES if name not in role_positions]
+	missing = [name for name in ("cyl_init",) if name not in role_positions]
 	if missing:
 		raise ValueError(f"stages_json: cylinder_seed missing required stage role(s): {missing}")
-	positions = [role_positions[name] for name in CYLINDER_SEED_INIT_STAGE_ROLES]
+	role_order = [name for name in CYLINDER_SEED_INIT_STAGE_ROLES if name in role_positions]
+	positions = [role_positions[name] for name in role_order]
 	if positions != sorted(positions):
 		raise ValueError(
 			"stages_json: cylinder_seed stages must appear in order "
 			"cyl_init, cyl_grow"
 		)
+	if "cyl_grow" not in role_positions:
+		init_pos = role_positions["cyl_init"]
+		for stage in stages[:init_pos]:
+			raise ValueError(
+				"stages_json: cylinder_seed stages before cyl_init "
+				"must be only cyl_init; later stages are skipped when cyl_grow is absent"
+			)
+		return
 	grow_pos = role_positions["cyl_grow"]
 	for stage in stages[:grow_pos + 1]:
 		if stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES:
@@ -802,8 +811,8 @@ def optimize(
 				if res_.cyl_axes is None:
 					missing.append("cyl_axes")
 			if required.cyl_shell_fields and bool(getattr(res_, "cyl_shell_mode", False)):
-				if res_.cyl_shell_delta_xy is None:
-					missing.append("cyl_shell_delta_xy")
+				if res_.cyl_shell_delta_xyz is None:
+					missing.append("cyl_shell_delta_xyz")
 		if missing:
 			return [f"{name}: {field}" for field in missing]
 		return missing
@@ -1452,10 +1461,10 @@ def optimize(
 				current_avg = _actual_width_step_avg(fallback=model_step)
 				if int(search_direction) > 0:
 					step_ref[0] = max(float(step_ref[0]), current_avg)
-					return max(1.0, float(step_ref[0]) * 1.01)
+					return max(1.0, float(step_ref[0]) * 1.10)
 				if int(search_direction) < 0:
 					step_ref[0] = min(float(step_ref[0]), current_avg)
-					return max(1.0, float(step_ref[0]) * 0.99)
+					return max(1.0, float(step_ref[0]) * 0.90)
 				return current_avg
 
 			def _seed_refine_next_wstep(metrics, *, model_step: float) -> float:
@@ -2158,6 +2167,11 @@ def optimize(
 	_total_steps = _scheduled_total_steps()
 	_done_steps = [0]
 	_num_stages = len(stages)
+	_cyl_init_only = (
+		bool(getattr(model, "cyl_shell_mode", False))
+		and any(stage.name == "cyl_init" for stage in stages)
+		and not any(stage.name == "cyl_grow" for stage in stages)
+	)
 
 	# Debug: show corr status
 	_corr_terms = ("corr",)
@@ -2191,6 +2205,14 @@ def optimize(
 					f"{_fmt_duration(time.perf_counter() - _stage_wall_t0)}",
 					flush=True,
 				)
+			if _cyl_init_only and stage.name == "cyl_init":
+				if hasattr(model, "cyl_shell_search_done"):
+					model.cyl_shell_search_done = True
+				print(
+					"[optimizer] cylinder_seed: no cyl_grow stage; outputting cyl_init shell only",
+					flush=True,
+				)
+				break
 
 	# Print sparse cache summary
 	if data.sparse_caches:

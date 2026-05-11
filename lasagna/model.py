@@ -229,7 +229,7 @@ class FitResult3D:
 	cyl_normals: torch.Tensor | None = None  # (N*D, Hm, Wm, 3) analytic cylinder normals
 	cyl_centers: torch.Tensor | None = None  # (N, 3) cylinder axis anchor [cx, cy, zc]
 	cyl_axes: torch.Tensor | None = None     # (N, 3) unit cylinder axis direction
-	cyl_params: torch.Tensor | None = None   # analytic: (N, 6); shell losses use cyl_shell_delta_xy
+	cyl_params: torch.Tensor | None = None   # analytic: (N, 6); shell losses use cyl_shell_delta_xyz
 	cyl_count: int = 0
 	cyl_shell_mode: bool = False
 	cyl_shell_step: float = 500.0
@@ -237,7 +237,7 @@ class FitResult3D:
 	cyl_shell_base_xyz: torch.Tensor | None = None
 	cyl_shell_dirs: torch.Tensor | None = None
 	cyl_shell_w_offsets: torch.Tensor | None = None
-	cyl_shell_delta_xy: torch.Tensor | None = None
+	cyl_shell_delta_xyz: torch.Tensor | None = None
 	cyl_shell_index: int = 0
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
@@ -319,7 +319,7 @@ class Model3D(nn.Module):
 		self.cyl_shell_mode = False
 		self.cyl_shell_n_scales = 5
 		self.cyl_shell_target_count = 4
-		self.cyl_shell_initial_radius = 1000.0
+		self.cyl_shell_initial_radius = 2000.0
 		self.cyl_shell_step = 500.0
 		self.cyl_shell_initial_step = 10.0
 		self.cyl_shell_growth_factor = 1.5
@@ -438,29 +438,29 @@ class Model3D(nn.Module):
 		return max(1, int(getattr(self, "cyl_shell_n_scales", 5)))
 
 	@staticmethod
-	def _shell_delta_to_pyramid_flat(delta_xy: torch.Tensor) -> torch.Tensor:
-		if delta_xy.ndim != 3 or int(delta_xy.shape[-1]) != 2:
-			raise ValueError(f"shell delta must have shape (H, W, 2), got {tuple(delta_xy.shape)}")
-		return delta_xy.permute(2, 0, 1).unsqueeze(1).contiguous()
+	def _shell_delta_to_pyramid_flat(delta_xyz: torch.Tensor) -> torch.Tensor:
+		if delta_xyz.ndim != 3 or int(delta_xyz.shape[-1]) != 3:
+			raise ValueError(f"shell delta must have shape (H, W, 3), got {tuple(delta_xyz.shape)}")
+		return delta_xyz.permute(2, 0, 1).unsqueeze(1).contiguous()
 
 	@staticmethod
 	def _shell_delta_from_pyramid_flat(flat: torch.Tensor) -> torch.Tensor:
-		if flat.ndim != 4 or int(flat.shape[0]) != 2 or int(flat.shape[1]) != 1:
-			raise ValueError(f"shell delta pyramid must integrate to shape (2, 1, H, W), got {tuple(flat.shape)}")
+		if flat.ndim != 4 or int(flat.shape[0]) != 3 or int(flat.shape[1]) != 1:
+			raise ValueError(f"shell delta pyramid must integrate to shape (3, 1, H, W), got {tuple(flat.shape)}")
 		return flat[:, 0].permute(1, 2, 0).contiguous()
 
-	def _construct_shell_delta_pyramid(self, delta_xy: torch.Tensor) -> nn.ParameterList:
-		flat = self._shell_delta_to_pyramid_flat(delta_xy)
+	def _construct_shell_delta_pyramid(self, delta_xyz: torch.Tensor) -> nn.ParameterList:
+		flat = self._shell_delta_to_pyramid_flat(delta_xyz)
 		return self._construct_pyramid_from_flat_3d(
 			flat,
 			self._shell_delta_scale_count(),
 			pyramid_d=False,
 		)
 
-	def _set_shell_delta_xy_params(self, delta_xy: torch.Tensor) -> None:
-		delta_xy = delta_xy.detach().contiguous()
-		self.cyl_shell_delta_ms = self._construct_shell_delta_pyramid(delta_xy)
-		self.cyl_params = nn.Parameter(delta_xy.clone(), requires_grad=False)
+	def _set_shell_delta_xyz_params(self, delta_xyz: torch.Tensor) -> None:
+		delta_xyz = delta_xyz.detach().contiguous()
+		self.cyl_shell_delta_ms = self._construct_shell_delta_pyramid(delta_xyz)
+		self.cyl_params = nn.Parameter(delta_xyz.clone(), requires_grad=False)
 
 	def cyl_param_scale_count(self) -> int:
 		if self.cyl_shell_mode and len(self.cyl_shell_delta_ms) > 0:
@@ -551,7 +551,7 @@ class Model3D(nn.Module):
 		with torch.no_grad():
 			self.cyl_seed_xyz = torch.tensor([float(seed[0]), float(seed[1]), float(seed[2])],
 											 device=device, dtype=torch.float32)
-			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, 2, device=device, dtype=torch.float32))
+			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, 3, device=device, dtype=torch.float32))
 			self.cyl_shell_delta_ms = nn.ParameterList()
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		model_w_value = float(model_w)
@@ -625,8 +625,8 @@ class Model3D(nn.Module):
 		self.cyl_shell_z = z.detach()
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self._set_shell_delta_xy_params(
-			self._initial_shell_delta_xy(dirs, target_step=self._shell_target_offset_for_index(0)).to(device=device, dtype=dtype)
+		self._set_shell_delta_xyz_params(
+			self._initial_shell_delta_xyz(dirs, target_step=self._shell_target_offset_for_index(0)).to(device=device, dtype=dtype)
 		)
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		print(f"[model] umbilicus tube init: search_max_shells={self.cyl_shell_search_max_shells} "
@@ -758,26 +758,26 @@ class Model3D(nn.Module):
 			gt_xy = torch.where(((gt_xy * surf_xy).sum(dim=-1, keepdim=True) > 0.5), gt_xy, surf_xy)
 			return torch.cat([gt_xy, torch.zeros_like(gt_xy[..., :1])], dim=-1).detach()
 
-	def _initial_shell_delta_xy(self, dirs: torch.Tensor, *, target_step: float) -> torch.Tensor:
+	def _initial_shell_delta_xyz(self, dirs: torch.Tensor, *, target_step: float) -> torch.Tensor:
 		step = max(0.0, float(target_step))
-		return dirs[..., :2] * step
+		return dirs * step
 
-	def _shell_delta_xy_params(self) -> torch.Tensor:
+	def _shell_delta_xyz_params(self) -> torch.Tensor:
 		if bool(getattr(self, "cyl_shell_mode", False)) and len(self.cyl_shell_delta_ms) > 0:
 			flat = self._integrate_pyramid_3d(self.cyl_shell_delta_ms, pyramid_d=False)
 			return self._shell_delta_from_pyramid_flat(flat)
-		if self.cyl_params.ndim == 3 and int(self.cyl_params.shape[-1]) == 2:
+		if self.cyl_params.ndim == 3 and int(self.cyl_params.shape[-1]) == 3:
 			return self.cyl_params
 		raise ValueError(f"invalid cylinder shell params shape: {tuple(self.cyl_params.shape)}")
 
 	def _shell_w_offset_values(self) -> torch.Tensor:
-		delta_xy = self._shell_delta_xy_params()
+		delta_xyz = self._shell_delta_xyz_params()
 		if not bool(getattr(self, "cyl_shell_use_conn_offsets", False)):
-			return torch.zeros_like(delta_xy[..., 0])
+			return torch.zeros_like(delta_xyz[..., 0])
 		if int(getattr(self, "cyl_shell_current_index", 0)) <= 0:
-			return torch.zeros_like(delta_xy[..., 0])
-		if self.cyl_shell_w_offsets.shape != delta_xy.shape[:2]:
-			return torch.zeros_like(delta_xy[..., 0])
+			return torch.zeros_like(delta_xyz[..., 0])
+		if self.cyl_shell_w_offsets.shape != delta_xyz.shape[:2]:
+			return torch.zeros_like(delta_xyz[..., 0])
 		return self.cyl_shell_w_offsets
 
 	@staticmethod
@@ -821,13 +821,9 @@ class Model3D(nn.Module):
 		dirs_conn = self._interp_width_at_offsets(dirs, offsets)
 		return base_conn, F.normalize(dirs_conn, dim=-1, eps=1.0e-8)
 
-	def _shell_delta_xyz(self) -> torch.Tensor:
-		delta_xy = self._shell_delta_xy_params()
-		return torch.cat([delta_xy, torch.zeros_like(delta_xy[..., :1])], dim=-1)
-
 	def _shell_offset_stats(self) -> tuple[float, float, float]:
 		with torch.no_grad():
-			dist = self._shell_delta_xy_params().norm(dim=-1)
+			dist = self._shell_delta_xyz_params()[..., :2].norm(dim=-1)
 			return (
 				float(dist.mean().detach().cpu()),
 				float(dist.amin().detach().cpu()),
@@ -870,7 +866,7 @@ class Model3D(nn.Module):
 	def current_cylinder_shell_xyz(self) -> torch.Tensor:
 		if self.cyl_shell_base is None or self.cyl_shell_dirs is None:
 			raise ValueError("umbilicus tube shell has not been prepared")
-		delta = self._shell_delta_xyz()
+		delta = self._shell_delta_xyz_params()
 		base, _normal_dirs = self._current_base_conn_and_dirs()
 		base = base.to(device=delta.device, dtype=delta.dtype)
 		return base + delta
@@ -1004,7 +1000,7 @@ class Model3D(nn.Module):
 				raise ValueError("missing initial shell z values")
 			W = self._shell_width_for_radius(self._first_shell_radius())
 			base, dirs = self._umbilicus_base_shell(data=data, z=self.cyl_shell_z.to(device=device, dtype=dtype), w=W)
-			delta_xy = self._initial_shell_delta_xy(dirs, target_step=target_offset).to(device=device, dtype=dtype)
+			delta_xyz = self._initial_shell_delta_xyz(dirs, target_step=target_offset).to(device=device, dtype=dtype)
 		else:
 			if len(self.cyl_shell_completed) < idx:
 				raise ValueError(f"cannot start shell {idx}: previous shell is missing")
@@ -1012,12 +1008,12 @@ class Model3D(nn.Module):
 			W = int(prev.shape[1])
 			z = prev[:, 0, 2].detach()
 			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
-			delta_xy = prev[..., :2] - base[..., :2]
+			delta_xyz = prev - base
 		H = int(base.shape[0])
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self._set_shell_delta_xy_params(delta_xy.to(device=device, dtype=dtype))
+		self._set_shell_delta_xyz_params(delta_xyz.to(device=device, dtype=dtype))
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		self.cyl_shell_current_index = idx
 		self.cyl_shell_search_direction = direction
@@ -1038,11 +1034,11 @@ class Model3D(nn.Module):
 		W = int(shell.shape[1])
 		z = shell[:, 0, 2].detach()
 		base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
-		delta_xy = shell[..., :2] - base[..., :2]
+		delta_xyz = shell - base
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
-		self._set_shell_delta_xy_params(delta_xy.contiguous())
+		self._set_shell_delta_xyz_params(delta_xyz.contiguous())
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		self.cyl_shell_current_index = idx
 		self.cyl_shell_current_width_step = float(self.cyl_shell_width_target_step)
@@ -1075,11 +1071,11 @@ class Model3D(nn.Module):
 			dtype = self.cyl_params.dtype
 			z = shell[:, 0, 2].to(device=device, dtype=dtype)
 			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=target_w)
-			delta_xy = shell[..., :2].to(device=device, dtype=dtype) - base[..., :2]
+			delta_xyz = shell.to(device=device, dtype=dtype) - base
 			self._set_shell_grid_shape(h=old_h, w=target_w)
 			self.cyl_shell_base = base.detach()
 			self.cyl_shell_dirs = dirs.detach()
-			self._set_shell_delta_xy_params(delta_xy.contiguous())
+			self._set_shell_delta_xyz_params(delta_xyz.contiguous())
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(old_h, target_w, device=device, dtype=dtype))
 			self.cyl_shell_current_width_step = float(self.cyl_shell_width_target_step)
 			self.cyl_shell_active = True
@@ -1109,11 +1105,11 @@ class Model3D(nn.Module):
 			dtype = self.cyl_params.dtype
 			z = shell[:, 0, 2].to(device=device, dtype=dtype)
 			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=target_w)
-			delta_xy = shell[..., :2].to(device=device, dtype=dtype) - base[..., :2]
+			delta_xyz = shell.to(device=device, dtype=dtype) - base
 			self._set_shell_grid_shape(h=old_h, w=target_w)
 			self.cyl_shell_base = base.detach()
 			self.cyl_shell_dirs = dirs.detach()
-			self._set_shell_delta_xy_params(delta_xy.contiguous())
+			self._set_shell_delta_xyz_params(delta_xyz.contiguous())
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(old_h, target_w, device=device, dtype=dtype))
 			self.cyl_shell_width_target_step = target_step
 			self.cyl_shell_current_width_step = target_step
@@ -2501,7 +2497,7 @@ class Model3D(nn.Module):
 		cyl_shell_base_xyz = None
 		cyl_shell_dirs = None
 		cyl_shell_w_offsets = None
-		cyl_shell_delta_xy = None
+		cyl_shell_delta_xyz = None
 		cyl_shell_index = 0
 		cyl_count = 0
 		if self.cylinder_enabled and (
@@ -2517,7 +2513,7 @@ class Model3D(nn.Module):
 					cyl_shell_base_xyz = self.cyl_shell_base
 					cyl_shell_dirs = self.cyl_shell_dirs
 					cyl_shell_w_offsets = self._shell_w_offset_values()
-					cyl_shell_delta_xy = self._shell_delta_xy_params()
+					cyl_shell_delta_xyz = self._shell_delta_xyz_params()
 					cyl_shell_index = int(self.cyl_shell_current_index)
 			else:
 				if needs.cyl_samples or needs.cyl_normals:
@@ -2560,7 +2556,7 @@ class Model3D(nn.Module):
 			cyl_shell_base_xyz=cyl_shell_base_xyz,
 			cyl_shell_dirs=cyl_shell_dirs,
 			cyl_shell_w_offsets=cyl_shell_w_offsets,
-			cyl_shell_delta_xy=cyl_shell_delta_xy,
+			cyl_shell_delta_xyz=cyl_shell_delta_xyz,
 			cyl_shell_index=cyl_shell_index,
 		)
 
