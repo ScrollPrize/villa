@@ -35,8 +35,7 @@
 			"lr": 10.0,
 			"params": ["cyl_params"],
 			"args": {
-				"profile_opt": true,
-				"profile_interval": 100
+				"compile_cyl_normal": true
 			}
 		},
 		{
@@ -45,8 +44,7 @@
 			"lr": 10.0,
 			"params": ["cyl_params"],
 			"args": {
-				"profile_opt": true,
-				"profile_interval": 100
+				"compile_cyl_normal": true
 			}
 		}
 	]
