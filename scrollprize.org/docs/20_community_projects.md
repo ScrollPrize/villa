@@ -175,6 +175,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Scroll 1, and 3 Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/p2_submission/) by Sean Johnson
 - [Scroll 4 Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/Fiber-and-Surface-Models/Predictions/s4/) by Sean Johnson
 - [Scroll Surface Prediction Repository and Writeup](https://github.com/bruniss/VC-Surface-Models) by Sean Johnson 
+- [Spec 1.5: MedNeXt-L + SkeletonRecall surface predictor](https://github.com/ciscoriordan/mednext-vs-umamba-scroll) by Francisco Riordan. Beats d058 by +0.27 high_compressed IoU absolute (+66% relative) on held-out Scroll-1 cubes, addressing [#191](https://github.com/ScrollPrize/villa/issues/191). Drop-in compatible with d058's inference contract, accepts OME-Zarr or Zarr volumes. Weights at [HuggingFace](https://huggingface.co/ciscoriordan/mednext-l-scroll-surface).
 
 #### 📜 Segments
 -[Large Autosegmentation of Scroll5](https://dl.ash2txt.org/community-uploads/bruniss/p2_submission/s5_initial_trace/) by Hendrik Schilling and Sean Johnson -- Unsupervised, many switches -- check readme.md
