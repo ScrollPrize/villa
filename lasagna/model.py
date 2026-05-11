@@ -1000,8 +1000,6 @@ class Model3D(nn.Module):
 			W = self._shell_width_for_radius(self._first_shell_radius())
 			base, dirs = self._umbilicus_base_shell(data=data, z=self.cyl_shell_z.to(device=device, dtype=dtype), w=W)
 			delta_xy = self._initial_shell_delta_xy(dirs, target_step=target_offset).to(device=device, dtype=dtype)
-			base_kind = "umbilicus"
-			target_text = f"target_radius={target_offset:.1f} "
 		else:
 			if len(self.cyl_shell_completed) < idx:
 				raise ValueError(f"cannot start shell {idx}: previous shell is missing")
@@ -1010,8 +1008,6 @@ class Model3D(nn.Module):
 			z = prev[:, 0, 2].detach()
 			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
 			delta_xy = prev[..., :2] - base[..., :2]
-			base_kind = "prev_duplicate"
-			target_text = ""
 		H = int(base.shape[0])
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
@@ -1024,15 +1020,6 @@ class Model3D(nn.Module):
 		self.cyl_shell_active = True
 		self.cylinder_enabled = True
 		self.cyl_shell_mode = True
-		step_avg, step_min, step_max = self._shell_offset_stats()
-		wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
-		print(f"[model] shell {idx + 1}: H={H} W={W} "
-			  f"base={base_kind} "
-			  f"direction={direction:+d} "
-			  f"{target_text}"
-			  f"wstep_target={self.cyl_shell_current_width_step:.1f} "
-			  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
-			  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}", flush=True)
 
 	def begin_cylinder_shell_refine(self, data: fit_data.FitData3D) -> None:
 		if not self.cyl_shell_completed:
@@ -1057,13 +1044,6 @@ class Model3D(nn.Module):
 		self.cyl_shell_active = True
 		self.cylinder_enabled = True
 		self.cyl_shell_mode = True
-		step_avg, step_min, step_max = self._shell_offset_stats()
-		wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
-		print(f"[model] refining shell {idx + 1}: H={H} W={W} "
-			  f"wstep_target={self.cyl_shell_current_width_step:.1f} "
-			  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
-			  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}",
-			  flush=True)
 
 	def cylinder_shell_pass_count(self, idx: int) -> int:
 		if int(idx) <= 0:
@@ -1100,14 +1080,6 @@ class Model3D(nn.Module):
 			self.cyl_shell_active = True
 			self.cylinder_enabled = True
 			self.cyl_shell_mode = True
-			step_avg, step_min, step_max = self._shell_offset_stats()
-			wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
-			print(f"[model] shell {int(self.cyl_shell_current_index) + 1}: "
-				  f"resampled width {old_w} -> {target_w} "
-				  f"wstep_target={self.cyl_shell_current_width_step:.1f} "
-				  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
-				  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}",
-				  flush=True)
 
 	def resample_current_cylinder_shell_width_to_step(
 		self,
@@ -1143,14 +1115,6 @@ class Model3D(nn.Module):
 			self.cyl_shell_active = True
 			self.cylinder_enabled = True
 			self.cyl_shell_mode = True
-			step_avg, step_min, step_max = self._shell_offset_stats()
-			wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
-			print(f"[model] shell {int(self.cyl_shell_current_index) + 1}: "
-				  f"resampled width {old_w} -> {target_w} "
-				  f"wstep_target={self.cyl_shell_current_width_step:.1f} "
-				  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
-				  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}",
-				  flush=True)
 
 	def _resample_shell_width(self, shell: torch.Tensor, target_w: int) -> torch.Tensor:
 		target_w = max(3, int(target_w))
@@ -1176,9 +1140,7 @@ class Model3D(nn.Module):
 
 	def complete_current_cylinder_shell(self, data: fit_data.FitData3D) -> None:
 		with torch.no_grad():
-			step_avg, step_min, step_max = self._shell_offset_stats()
 			shell_opt = self.current_cylinder_shell_xyz().detach()
-			min_edge_str, max_edge_str = self._shell_width_edge_extrema_str(shell_opt)
 			shell = shell_opt.contiguous()
 			idx = int(self.cyl_shell_current_index)
 			if len(self.cyl_shell_completed) > idx:
@@ -1188,16 +1150,6 @@ class Model3D(nn.Module):
 			else:
 				raise ValueError(f"cannot store shell {idx}: shell list has gap")
 			self.cyl_shell_active = False
-			w_len = (torch.roll(shell, shifts=-1, dims=1) - shell).norm(dim=-1)
-			wstep_avg = float(w_len.mean().detach().cpu())
-			wstep_min = float(w_len.amin().detach().cpu())
-			wstep_max = float(w_len.amax().detach().cpu())
-			print(f"[model] completed shell {idx + 1}: "
-				  f"H={int(shell.shape[0])} W={int(shell.shape[1])} "
-				  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
-				  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}", flush=True)
-			print(f"[model] shell {idx + 1} optimized edge extrema: {min_edge_str}; {max_edge_str}",
-				  flush=True)
 
 	def cylinder_shells_done(self) -> bool:
 		return self.cyl_shell_mode and bool(getattr(self, "cyl_shell_search_done", False))

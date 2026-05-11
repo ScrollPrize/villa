@@ -825,9 +825,11 @@ def optimize(
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
 		_t_stage_total = _stage_start(f"{label}.total")
-		print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
-			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		is_cyl_stage = "cyl_params" in opt_cfg.params
+		is_cyl_shelling_stage = is_cyl_stage and stage.name in CYLINDER_SEED_INIT_STAGE_ROLES
+		if not is_cyl_shelling_stage:
+			print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
+				  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0 and not is_cyl_stage:
 			return data
 		stage_eff = (
@@ -865,7 +867,7 @@ def optimize(
 		opt_timing_enabled = _opt_timing_enabled(stage_args)
 		opt_timing_interval = _opt_timing_interval(stage_args, fallback=max(1, status_interval or 100))
 		opt_timing_sync = _opt_timing_sync_cuda(stage_args)
-		if opt_timing_enabled:
+		if opt_timing_enabled and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: opt timing enabled interval={opt_timing_interval} "
 				f"sync_cuda={int(opt_timing_sync)}",
@@ -915,7 +917,7 @@ def optimize(
 			dynamic=_compile_cyl_normal_dynamic,
 			fullgraph=_compile_cyl_normal_fullgraph,
 		)
-		if _compile_cyl_normal:
+		if _compile_cyl_normal and not is_cyl_shelling_stage:
 			_details = []
 			if _compile_cyl_normal_backend:
 				_details.append(f"backend={_compile_cyl_normal_backend}")
@@ -947,10 +949,6 @@ def optimize(
 				model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
 				model.cyl_shell_current_index = 0
 				model.cyl_shell_search_done = True
-				print(
-					f"[optimizer] {label}: cylinder shell search complete; keeping final shell only",
-					flush=True,
-				)
 
 		# Once cylinder initialization is done, convert only the best candidate
 		# to the regular mesh before any mesh-space optimization.
@@ -964,11 +962,12 @@ def optimize(
 			pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
 			pred_dt_normal_source_=pred_dt_normal_source,
 		)
-		print(
-			f"[optimizer] {label}: forward_needs={stage_needs.summary()} "
-			f"{_prefetch_grad_summary(stage_needs)}",
-			flush=True,
-		)
+		if not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: forward_needs={stage_needs.summary()} "
+				f"{_prefetch_grad_summary(stage_needs)}",
+				flush=True,
+			)
 
 		def _make_param_groups() -> tuple[dict[str, list], list[dict]]:
 			all_params_ = model.opt_params()
@@ -1033,7 +1032,8 @@ def optimize(
 		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
 
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
-						  its: float | None = None, force_header: bool = False) -> None:
+						  its: float | None = None, force_header: bool = False,
+						  shell_no: int | None = None) -> None:
 			nonlocal _status_rows
 			label_map = {
 				"cyl_bend": "c_bend",
@@ -1056,8 +1056,6 @@ def optimize(
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
 				"p:wstep_avg_vx": "wavg",
-				"p:wstep_max_vx": "wmax",
-				"p:wstep_min_vx": "wmin",
 				"p:wstep_tgt_vx": "wtgt",
 			}
 			key_order = {
@@ -1091,14 +1089,20 @@ def optimize(
 			values = {k: _fmt_val(k, tv[k]) for k in tv_keys}
 			values.update({f"p:{k}": _fmt_val(f"p:{k}", pv[k]) for k in pv_keys})
 			widths = {k: max(len(_display_key(k)), len(values[k]), 5) for k in cols}
-			if force_header or _status_rows % 20 == 0:
-				hdr = f"{'step':>{_status_step_width}s} {'loss':>8s} {'it/s':>5s}"
+			if force_header or (shell_no is not None and _status_rows == 0) or (shell_no is None and _status_rows % 20 == 0):
+				hdr = ""
+				if shell_no is not None:
+					hdr += f"{'shell':>5s} "
+				hdr += f"{'step':>{_status_step_width}s} {'loss':>8s} {'it/s':>5s}"
 				for c in cols:
 					hdr += f" {_display_key(c):>{widths[c]}s}"
 				print(hdr)
 			_status_rows += 1
 			its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
-			row = f"{step_label:>{_status_step_width}s} {loss_val:8.4f} {its_str}"
+			row = ""
+			if shell_no is not None:
+				row += f"{int(shell_no):5d} "
+			row += f"{step_label:>{_status_step_width}s} {loss_val:8.4f} {its_str}"
 			for k in tv_keys:
 				row += f" {values[k]:>{widths[k]}s}"
 			for k in pv_keys:
@@ -1375,14 +1379,12 @@ def optimize(
 			def _shell_dbg_values() -> dict[str, float]:
 				if not hasattr(model, "_shell_width_step_stats"):
 					return {}
-				_avg, mn, mx = model._shell_width_step_stats()
+				_avg = model._shell_width_step_stats()[0]
 				w_count = max(0, _shell_width_count())
 				tgt = float(getattr(model, "cyl_shell_current_width_step", 0.0))
 				out = {
 					"wstep_avg_vx": float(_avg),
 					"wstep_tgt_vx": tgt,
-					"wstep_min_vx": mn,
-					"wstep_max_vx": mx,
 				}
 				if w_count > 0:
 					out["wcirc_avg_vx"] = float(w_count) * float(_avg)
@@ -1476,33 +1478,25 @@ def optimize(
 								stop_after_resample: bool = False,
 								search_direction: int = 0,
 								seed_target_mode: str = "search",
-								allow_resample: bool = True) -> dict[str, object]:
+								allow_resample: bool = True,
+								status_label: str | None = None,
+								shell_no: int | None = None,
+								suppress_initial_status: bool = False) -> dict[str, object]:
 				nonlocal data, all_params, param_groups, opt, _status_step_width
+				display_label = status_label or shell_label
 				pass_max_steps = max(0, int(max_steps))
-				if search_until_seed:
-					_status_step_width = max(_status_step_width, len(f"{shell_label} 1000000") + 2)
+				if shell_no is not None:
+					_status_step_width = max(_status_step_width, len("1000000") + 2)
+				elif search_until_seed:
+					_status_step_width = max(_status_step_width, len(f"{display_label} 1000000") + 2)
 				else:
-					_status_step_width = max(_status_step_width, len(f"{shell_label} {pass_max_steps}/{pass_max_steps}") + 2)
+					_status_step_width = max(_status_step_width, len(f"{display_label} {pass_max_steps}/{pass_max_steps}") + 2)
 				pass_needs = _needs_for_eff(
 					pass_eff,
 					pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
 					pred_dt_normal_source_=pred_dt_normal_source,
 				)
-				print(
-					f"[optimizer] {shell_label}: forward_needs={pass_needs.summary()} "
-					f"{_prefetch_grad_summary(pass_needs)}",
-					flush=True,
-				)
 				model.cyl_shell_current_width_step = float(wstep_start)
-				if search_until_seed:
-					action = "optimize until seed/resample cap"
-				else:
-					action = "evaluate only" if pass_max_steps <= 0 else f"optimize {pass_max_steps} steps"
-				if abs(float(wstep_end) - float(wstep_start)) > 1.0e-6 and (pass_max_steps > 0 or search_until_seed):
-					action = f"{action}, ramp wstep {float(wstep_start):.1f}->{float(wstep_end):.1f}"
-				else:
-					action = f"{action}, wstep {float(wstep_start):.1f}"
-				print(f"[optimizer] {shell_label}: {action}", flush=True)
 				all_params, param_groups = _make_param_groups()
 				if not param_groups:
 					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
@@ -1552,11 +1546,6 @@ def optimize(
 					resample_count += 1
 					resampled_this_pass = True
 					_reset_shell_optimizer()
-					print(
-						f"[optimizer] {shell_label}: adaptive resample {resample_count} "
-						f"actual_avg_step={actual_avg:.1f} reset wstep to model-step {model_step_ref:.1f}",
-						flush=True,
-					)
 					return True
 
 				def _apply_seed_target(metrics) -> None:
@@ -1585,13 +1574,18 @@ def optimize(
 					loss0, term_vals0, display_loss0 = _eval_terms(
 						res0, pass_eff, profile_label=f"{shell_label}.initial_eval.loss")
 				term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
-				_print_status(
-					step_label=f"{shell_label} 0" if search_until_seed else f"{shell_label} 0/{pass_max_steps}",
-					loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
-					tv=term_vals0,
-					pv=_shell_dbg_values(),
-					force_header=True,
-				)
+				if not suppress_initial_status:
+					_print_status(
+						step_label=(
+							"0" if shell_no is not None
+							else (f"{display_label} 0" if search_until_seed else f"{display_label} 0/{pass_max_steps}")
+						),
+						loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
+						tv=term_vals0,
+						pv=_shell_dbg_values(),
+						force_header=True,
+						shell_no=shell_no,
+					)
 				snapshot_fn(stage=shell_label.replace(".", "_"), step=0,
 							loss=float(loss0.detach().cpu()), data=data, res=res0)
 				_stage_done(f"{shell_label}.initial_eval", _t)
@@ -1716,17 +1710,29 @@ def optimize(
 						_opt_timing.add("progress", time.perf_counter() - _t_part)
 
 					_t_part = time.perf_counter()
-					if step == 0 or (not search_until_seed and step1 == pass_max_steps) or (status_interval > 0 and (step1 % status_interval) == 0):
+					if shell_no is not None:
+						_status_due = status_interval > 0 and step1 > 0 and (step1 % status_interval) == 0
+					else:
+						_status_due = (
+							step == 0 or
+							(not search_until_seed and step1 == pass_max_steps) or
+							(status_interval > 0 and (step1 % status_interval) == 0)
+						)
+					if _status_due:
 						term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 						_t_wall_now = time.perf_counter()
 						_t_wall_elapsed = _t_wall_now - _t_wall_start
 						_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
 						_print_status(
-							step_label=f"{shell_label} {step1}" if search_until_seed else f"{shell_label} {step1}/{pass_max_steps}",
+							step_label=(
+								str(step1) if shell_no is not None
+								else (f"{display_label} {step1}" if search_until_seed else f"{display_label} {step1}/{pass_max_steps}")
+							),
 							loss_val=float(display_loss) if display_loss is not None else loss.item(),
 							tv=term_vals,
 							pv=_shell_dbg_values(),
 							its=_its,
+							shell_no=shell_no,
 						)
 						_t_steps_acc = 0
 						_t_wall_start = _t_wall_now
@@ -1746,7 +1752,7 @@ def optimize(
 				snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
 							loss=float(loss.detach().cpu()), data=data, res=res)
 				if seed_lock:
-					last_metrics = _measure_seed(shell_label, log=True)
+					last_metrics = _measure_seed(shell_label, log=False)
 					if stop_on_seed_hit and _seed_hit(last_metrics):
 						seed_hit = True
 					return {
@@ -1764,37 +1770,33 @@ def optimize(
 
 			if role == "cyl_init":
 				if bool(getattr(model, "cyl_shell_search_done", False)):
-					print(f"[optimizer] {label}: cylinder shell search already complete; skipping cyl_init", flush=True)
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
 				if hasattr(model, "begin_cylinder_shell"):
 					model.begin_cylinder_shell(0, data, direction=1)
 				_run_shell_pass(f"{label}.cyl_init", _pass_eff_for_role(),
-								wstep_start=_base_wstep, wstep_end=_base_wstep)
+								wstep_start=_base_wstep, wstep_end=_base_wstep,
+								shell_no=1, suppress_initial_status=True)
 				if hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
-				metrics = _measure_seed(f"{label}.cyl_init")
+				metrics = _measure_seed(f"{label}.cyl_init", log=False)
 				cls = str(metrics.classification)
 				model.cyl_shell_search_initial_class = cls
 				model.cyl_shell_search_initial_signed_distance = float(metrics.signed_distance)
 				if cls == "edge":
 					model.cyl_shell_search_direction = 0
 					model.cyl_shell_search_crossed = True
-					print(f"[optimizer] {label}: initial shell touches seed; queued seed-locked refinement", flush=True)
 				elif cls == "outside":
 					model.cyl_shell_search_direction = 1
 					model.cyl_shell_search_crossed = False
-					print(f"[optimizer] {label}: seed outside initial shell; adaptive target will grow shell", flush=True)
 				else:
 					model.cyl_shell_search_direction = -1
 					model.cyl_shell_search_crossed = False
-					print(f"[optimizer] {label}: seed inside initial shell; adaptive target will shrink shell", flush=True)
 				_stage_done(f"{label}.total", _t_stage_total)
 				return data
 
 			if role == "cyl_grow":
 				if bool(getattr(model, "cyl_shell_search_done", False)):
-					print(f"[optimizer] {label}: cylinder shell search already complete; skipping cyl_grow", flush=True)
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
 				if bool(getattr(model, "cyl_shell_search_crossed", False)):
@@ -1802,10 +1804,6 @@ def optimize(
 						model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
 						model.cyl_shell_current_index = 0
 					model.cyl_shell_search_done = True
-					print(
-						f"[optimizer] {label}: crossing already found; search complete, keeping final shell only",
-						flush=True,
-					)
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
 				if not getattr(model, "cyl_shell_completed", None):
@@ -1854,6 +1852,8 @@ def optimize(
 						search_direction=direction,
 						seed_target_mode="search",
 						allow_resample=True,
+						shell_no=shell_i + 1,
+						suppress_initial_status=True,
 					)
 					if hasattr(model, "complete_current_cylinder_shell"):
 						model.complete_current_cylinder_shell(data)
@@ -1867,7 +1867,6 @@ def optimize(
 						model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
 						model.cyl_shell_current_index = 0
 					model.cyl_shell_search_done = True
-					print(f"[optimizer] {label}: cylinder shell search complete; keeping final shell only", flush=True)
 				else:
 					metrics = result.get("metrics")
 					print(
@@ -1895,15 +1894,7 @@ def optimize(
 			if abs(float(stage_model_step) - float(prev_model_step)) > 1.0e-6:
 				if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
 					raise RuntimeError(f"{label}: model cannot resample cylinder shell width to model-step")
-				before_avg = _actual_width_step_avg(fallback=prev_model_step)
 				model.resample_current_cylinder_shell_width_to_step(data, float(stage_model_step))
-				after_avg = _actual_width_step_avg(fallback=stage_model_step)
-				print(
-					f"[optimizer] {label}: model-step changed "
-					f"{prev_model_step:.1f}->{float(stage_model_step):.1f}; "
-					f"resampled width step avg {before_avg:.1f}->{after_avg:.1f}",
-					flush=True,
-				)
 			seed_locked_eff = dict(stage_eff)
 			seed_locked_eff["cyl_radial_mean"] = 0.0
 			_run_shell_pass(
@@ -1922,7 +1913,6 @@ def optimize(
 			if getattr(model, "cyl_shell_completed", None):
 				model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
 				model.cyl_shell_current_index = 0
-			print(f"[optimizer] {label}: seed-locked cylinder shell stage complete; keeping final shell only", flush=True)
 			_stage_done(f"{label}.total", _t_stage_total)
 			return data
 
@@ -2191,11 +2181,16 @@ def optimize(
 			if active_corr:
 				opt_loss_corr.print_detail(f"stage{si} END")
 				opt_loss_corr.print_summary()
-			print(
-				f"[optimizer] stage{si} '{stage.name}' complete in "
-				f"{_fmt_duration(time.perf_counter() - _stage_wall_t0)}",
-				flush=True,
+			quiet_shell_stage = (
+				"cyl_params" in stage.global_opt.params and
+				stage.name in CYLINDER_SEED_INIT_STAGE_ROLES
 			)
+			if not quiet_shell_stage:
+				print(
+					f"[optimizer] stage{si} '{stage.name}' complete in "
+					f"{_fmt_duration(time.perf_counter() - _stage_wall_t0)}",
+					flush=True,
+				)
 
 	# Print sparse cache summary
 	if data.sparse_caches:
