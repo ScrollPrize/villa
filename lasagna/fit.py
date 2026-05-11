@@ -240,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
 		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
 		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w} "
 			  f"z_step={actual_z_step:.1f} z_step_target={tube_z_step:.1f} "
-			  f"(umbilicus tube init ignores model-w/windings/mesh-step)", flush=True)
+			  f"(umbilicus tube search grid; final mesh bake uses model-w/model-h/mesh-step)", flush=True)
 	_stage_done("derive_initial_model_params", _t)
 
 	# --- Windowed tifxyz mode ---

@@ -543,9 +543,9 @@ class Model3D(nn.Module):
 	) -> None:
 		"""Initialize the experimental umbilicus tube grower from seed z.
 
-		The current experiment keeps the public cylinder_seed trigger, but the
-		actual geometry is built lazily once FitData3D has supplied the
-		umbilicus lookup. Seed x/y and model_w are intentionally ignored.
+		The shell geometry is built lazily once FitData3D has supplied the
+		umbilicus lookup. The final regular mesh bake uses model_w/model_h as a
+		seed-centered patch size.
 		"""
 		device = self.cyl_params.device
 		with torch.no_grad():
@@ -554,7 +554,12 @@ class Model3D(nn.Module):
 			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, 2, device=device, dtype=torch.float32))
 			self.cyl_shell_delta_ms = nn.ParameterList()
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
-		self.params = replace(self.params, model_w=None, model_h=float(model_h))
+		model_w_value = float(model_w)
+		self.params = replace(
+			self.params,
+			model_w=(model_w_value if model_w_value > 0.0 else None),
+			model_h=float(model_h),
+		)
 		self.cyl_shell_mode = True
 		self.cyl_shell_seed_z = float(seed[2])
 		self.cyl_shell_model_h = float(model_h)
@@ -1170,6 +1175,149 @@ class Model3D(nn.Module):
 		return stack.permute(3, 0, 1, 2).contiguous()
 
 	@staticmethod
+	def _periodic_row_cumulative_lengths(row: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		edges = (torch.roll(row, shifts=-1, dims=0) - row).norm(dim=-1)
+		cumulative = torch.cat([
+			torch.zeros(1, device=row.device, dtype=row.dtype),
+			edges.cumsum(dim=0),
+		], dim=0)
+		circumference = cumulative[-1].clamp(min=1.0e-8)
+		return cumulative, edges, circumference
+
+	@staticmethod
+	def _sample_periodic_row_by_arclength(row: torch.Tensor, distances: torch.Tensor) -> torch.Tensor:
+		cumulative, edges, circumference = Model3D._periodic_row_cumulative_lengths(row)
+		s = torch.remainder(distances.to(device=row.device, dtype=row.dtype), circumference)
+		idx_hi = torch.searchsorted(cumulative.contiguous(), s.contiguous(), right=True)
+		idx_hi = idx_hi.clamp(min=1, max=int(row.shape[0]))
+		idx0 = idx_hi - 1
+		idx1 = torch.remainder(idx0 + 1, int(row.shape[0]))
+		seg_len = edges.index_select(0, idx0.reshape(-1)).reshape_as(s).clamp(min=1.0e-8)
+		s0 = cumulative.index_select(0, idx0.reshape(-1)).reshape_as(s)
+		frac = ((s - s0) / seg_len).clamp(min=0.0, max=1.0).unsqueeze(-1)
+		p0 = row.index_select(0, idx0.reshape(-1)).reshape(*s.shape, int(row.shape[-1]))
+		p1 = row.index_select(0, idx1.reshape(-1)).reshape(*s.shape, int(row.shape[-1]))
+		return p0 + frac * (p1 - p0)
+
+	def _seed_phase_on_shell(self, shell: torch.Tensor) -> float:
+		seed = self.cyl_seed_xyz.to(device=shell.device, dtype=shell.dtype)
+		metrics = self.measure_seed_against_shell(shell, seed)
+		row = shell[int(metrics.row_index)]
+		p = seed[:2]
+		seg0 = row[:, :2]
+		seg1 = torch.roll(row[:, :2], shifts=-1, dims=0)
+		seg = seg1 - seg0
+		seg_len_sq = (seg * seg).sum(dim=-1).clamp(min=1.0e-12)
+		t = (((p - seg0) * seg).sum(dim=-1) / seg_len_sq).clamp(min=0.0, max=1.0)
+		proj = seg0 + t.unsqueeze(-1) * seg
+		best = int((proj - p).norm(dim=-1).argmin().detach().cpu())
+		cumulative, edges, circumference = self._periodic_row_cumulative_lengths(row)
+		seed_s = cumulative[best] + t[best] * edges[best]
+		return float((seed_s / circumference).detach().cpu())
+
+	def seed_patch_from_cylinder_shell(self, shell: torch.Tensor) -> torch.Tensor:
+		"""Sample a seed-centered regular mesh patch from a cylinder shell.
+
+		Returns a flat mesh tensor shaped (3, 1, H, W), sampled at the model's
+		regular mesh-step over model_h/model_w.
+		"""
+		if shell.ndim != 3 or int(shell.shape[-1]) != 3:
+			raise ValueError(f"shell must have shape (H, W, 3), got {tuple(shell.shape)}")
+		if int(shell.shape[0]) < 2 or int(shell.shape[1]) < 3:
+			raise ValueError(f"shell patch extraction requires H>=2 and W>=3, got {tuple(shell.shape)}")
+		shell = shell.detach()
+		if float(shell[-1, :, 2].mean().detach().cpu()) < float(shell[0, :, 2].mean().detach().cpu()):
+			shell = torch.flip(shell, dims=(0,))
+		device = shell.device
+		dtype = shell.dtype
+		step = max(1.0, float(self.params.mesh_step))
+		model_h = (
+			float(self.params.model_h)
+			if self.params.model_h is not None and float(self.params.model_h) > 0.0
+			else float((shell[-1, :, 2].mean() - shell[0, :, 2].mean()).abs().detach().cpu())
+		)
+		model_h = max(step, model_h)
+		out_h = max(2, int(math.ceil(model_h / step)) + 1)
+
+		seed_phase = self._seed_phase_on_shell(shell)
+		row_z = shell[..., 2].mean(dim=1)
+		seed_z = self.cyl_seed_xyz.to(device=device, dtype=dtype)[2]
+		target_z = seed_z + torch.linspace(
+			-0.5 * model_h,
+			0.5 * model_h,
+			out_h,
+			device=device,
+			dtype=dtype,
+		)
+		target_z = target_z.clamp(min=row_z[0], max=row_z[-1])
+		idx_hi = torch.searchsorted(row_z.contiguous(), target_z.contiguous(), right=False)
+		idx_hi = idx_hi.clamp(min=1, max=int(shell.shape[0]) - 1)
+		idx0 = idx_hi - 1
+		idx1 = idx_hi
+		z0 = row_z.index_select(0, idx0)
+		z1 = row_z.index_select(0, idx1)
+		z_frac = ((target_z - z0) / (z1 - z0).clamp(min=1.0e-8)).clamp(min=0.0, max=1.0)
+
+		model_w = float(self.params.model_w) if self.params.model_w is not None else 0.0
+		if model_w > 0.0:
+			out_w = max(2, int(math.ceil(model_w / step)) + 1)
+			width_offsets = torch.linspace(
+				-0.5 * model_w,
+				0.5 * model_w,
+				out_w,
+				device=device,
+				dtype=dtype,
+			)
+		else:
+			seed_row = shell[int(torch.argmin((row_z - seed_z).abs()).detach().cpu())]
+			_, _edges, circumference = self._periodic_row_cumulative_lengths(seed_row)
+			out_w = max(3, int(math.ceil(float(circumference.detach().cpu()) / step)))
+			width_offsets = (torch.arange(out_w, device=device, dtype=dtype) - float(out_w - 1) * 0.5) * step
+
+		rows = []
+		for h_i in range(out_h):
+			r0 = int(idx0[h_i].detach().cpu())
+			r1 = int(idx1[h_i].detach().cpu())
+			row0 = shell[r0]
+			row1 = shell[r1]
+			_, _, circ0 = self._periodic_row_cumulative_lengths(row0)
+			_, _, circ1 = self._periodic_row_cumulative_lengths(row1)
+			s0 = width_offsets + float(seed_phase) * circ0
+			s1 = width_offsets + float(seed_phase) * circ1
+			p0 = self._sample_periodic_row_by_arclength(row0, s0)
+			p1 = self._sample_periodic_row_by_arclength(row1, s1)
+			f = z_frac[h_i].view(1, 1)
+			rows.append(p0 + f * (p1 - p0))
+		patch = torch.stack(rows, dim=0).contiguous()
+		h_mid = float(out_h - 1) * 0.5
+		w_mid = float(out_w - 1) * 0.5
+		h0 = int(math.floor(h_mid))
+		w0 = int(math.floor(w_mid))
+		h1 = min(h0 + 1, out_h - 1)
+		w1 = min(w0 + 1, out_w - 1)
+		fh = torch.tensor(h_mid - float(h0), device=device, dtype=dtype)
+		fw = torch.tensor(w_mid - float(w0), device=device, dtype=dtype)
+		center = (
+			(1.0 - fh) * (1.0 - fw) * patch[h0, w0]
+			+ fh * (1.0 - fw) * patch[h1, w0]
+			+ (1.0 - fh) * fw * patch[h0, w1]
+			+ fh * fw * patch[h1, w1]
+		)
+		seed = self.cyl_seed_xyz.to(device=device, dtype=dtype)
+		patch = patch + (seed - center).view(1, 1, 3)
+		return patch.unsqueeze(0).permute(3, 0, 1, 2).contiguous()
+
+	def cylinder_shell_seed_patch_mesh_flat(self) -> torch.Tensor:
+		shells = [s.detach() for s in self.cyl_shell_completed]
+		if not shells and self.cyl_shell_base is not None and self.cyl_shell_active:
+			shells = [self.current_cylinder_shell_xyz().detach()]
+		elif self.cyl_shell_base is not None and self.cyl_shell_active:
+			shells = shells + [self.current_cylinder_shell_xyz().detach()]
+		if not shells:
+			raise ValueError("no umbilicus tube shells available for seed patch extraction")
+		return self.seed_patch_from_cylinder_shell(shells[-1])
+
+	@staticmethod
 	def _validate_cyl_params(params: torch.Tensor) -> None:
 		if params.ndim != 2 or params.shape[1] != 6:
 			raise ValueError(f"cyl_params must have shape (N, 6), got {tuple(params.shape)}")
@@ -1452,12 +1600,12 @@ class Model3D(nn.Module):
 		return xyz.reshape(self.depth, self.mesh_h, self.mesh_w, 3).permute(3, 0, 1, 2).contiguous()
 
 	def bake_cylinder_into_mesh(self, data: fit_data.FitData3D | None = None) -> None:
-		"""Absorb the lowest-error analytic cylinder candidate into mesh_ms."""
+		"""Absorb the selected cylinder/shell surface into mesh_ms."""
 		if not self.cylinder_enabled:
 			return
 		if self.cyl_shell_mode:
 			with torch.no_grad():
-				final = self.fused_cylinder_shell_mesh_flat()
+				final = self.cylinder_shell_seed_patch_mesh_flat()
 				self._set_fused_grid_shape(d=int(final.shape[1]), h=int(final.shape[2]), w=int(final.shape[3]))
 				self.mesh_ms = self._construct_pyramid_from_flat_3d(final, len(self.mesh_ms), pyramid_d=self.pyramid_d)
 				self.conn_offsets.zero_()
