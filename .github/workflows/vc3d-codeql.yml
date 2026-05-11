@@ -68,6 +68,7 @@ jobs:
           languages: c-cpp
           build-mode: none
           queries: security-extended
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Analyze
         if: needs.changes.outputs.vc == 'true'
@@ -122,6 +123,7 @@ jobs:
           languages: c-cpp
           build-mode: manual
           queries: security-extended,security-and-quality
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Configure (Ninja, fast flags)
         if: needs.changes.outputs.vc == 'true'
