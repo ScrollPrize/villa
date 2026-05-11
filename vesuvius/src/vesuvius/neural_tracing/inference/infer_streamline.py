@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 from datetime import datetime
+import gc
 import hashlib
 import re
 import shutil
@@ -25,44 +26,51 @@ from vesuvius.neural_tracing.nets.models import load_checkpoint
 from vesuvius.tifxyz import read_tifxyz
 
 
-TIFXYZ_PATH = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces/test_in_smaller"
+TIFXYZ_PATH = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces/test3"
 VOLUME_PATH = "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/"
 VOLUME_SCALE = 0
 VOLUME_CACHE_DIR = "/tmp/vesuvius-volume-cache"
-CHECKPOINT_PATH = "/home/sean/Downloads/ckpt_090000.pth"
+CHECKPOINT_PATH = "/home/sean/Downloads/ckpt_150000.pth"
 
 # Keep None unless intentionally debugging shape mismatches. The default reads
 # the checkpoint crop size so inference matches the model patch size.
 CROP_SIZE = None
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 DEVICE = "cuda"
 
-OVERLAP_FRAC = 0.25
+OVERLAP_FRAC = 0.5
 OUTPUT_ZARR_PATH = None
 OUTPUT_TIFXYZ_DIR = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces"
 OUTPUT_TIFXYZ_VOXEL_SIZE_UM = "2.24"
 MERGE_OUTPUTS_CHUNK_SIZE = 256
 MERGE_OUTPUTS_MMAP_DIR = "/tmp/streamline_tmp_outputs/"
 GEOMEDIAN_VECTOR_OUTPUTS = ("velocity_dir", "surface_attract")
+VECTOR_MERGE_METHOD = "mean"  # "geomedian" or "mean"
 GEOMEDIAN_MAX_ITER = 8
 GEOMEDIAN_EPS = 1e-6
-USE_TTA = False
-TTA_FLIP_AXES = ((2,), (3,), (4,), (2, 3), (2, 4), (3, 4), (2, 3, 4))
+USE_TTA = True
+TTA_FLIP_AXES = ((2,), (3,), (4,)) #, (2, 3), (2, 4), (3, 4), (2, 3, 4))
 SHOW_NAPARI = False
 
 GROW_DIRECTION = "left"
 
 TIFXYZ_VOXEL_STEP = 20.0
-TIFXYZ_STEPS = 4
-NUM_ITERATIONS = 5
+TIFXYZ_STEPS = 2
+NUM_ITERATIONS = 10
 # If false, intermediate iterations are written to a temporary tifxyz directory
 # only long enough to feed the next iteration; the final iteration is saved.
 SAVE_EACH_ITERATION_TIFXYZ = True
-INTEGRATION_STEP_SIZE = 4.0
+INTEGRATION_STEP_SIZE = 6.0
+INTEGRATION_METHOD = "huen"  # "euler", "rk2", or "heun"
 TRACE_VALIDITY_THRESHOLD = 0.5
 USE_SURFACE_ATTRACT = True
+SURFACE_ATTRACT_MODE = "normal"  # "full" or "normal"
 SURFACE_ATTRACT_WEIGHT = 1.0
 SURFACE_ATTRACT_MAX_CORRECTION = 8.0
+USE_EDGE_SUPPORT_SEEDS = True
+EDGE_SUPPORT_OFFSETS_FULL_RES = (-1.0, 0.0, 1.0)
+EDGE_SUPPORT_WEIGHTS = (0.25, 0.5, 0.25)
+EDGE_SUPPORT_REQUIRE_CENTER_ACTIVE = True
 
 
 _DIRECTION_SPECS = {
@@ -146,7 +154,14 @@ def _get_cond_edge(cond_zyxs, cond_direction, cond_valid=None):
     return out
 
 
-def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15, cond_valid=None):
+def get_cond_edge_bboxes(
+    cond_zyxs,
+    cond_direction,
+    crop_size,
+    overlap_frac=0.15,
+    cond_valid=None,
+    integration_margin=0.0,
+):
     # Build center-out crop anchors along the conditioning edge. Each chunk grows
     # while its XYZ span still fits in one crop-sized bbox.
     edge = _get_cond_edge(cond_zyxs, cond_direction, cond_valid=cond_valid)
@@ -164,7 +179,9 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
     overlap_frac = float(overlap_frac)
     overlap_frac = max(0.0, min(overlap_frac, 0.99))
 
-    span_limit = crop_size_arr - 1
+    integration_margin = max(0.0, float(integration_margin))
+    margin_arr = np.ceil(integration_margin).astype(np.int64)
+    span_limit = np.maximum(1, crop_size_arr - 1 - (2 * margin_arr))
 
     def _chunk_ordered_indices(ordered_indices):
         chunks = []
@@ -548,6 +565,31 @@ def _is_geomedian_vector_output(output_name, channels):
     return int(channels) == 3 and str(output_name) in set(GEOMEDIAN_VECTOR_OUTPUTS)
 
 
+def _vector_merge_method(method=None):
+    method = VECTOR_MERGE_METHOD if method is None else method
+    method = str(method).strip().lower()
+    aliases = {
+        "average": "mean",
+        "avg": "mean",
+        "vector_geomedian": "geomedian",
+        "geometric_median": "geomedian",
+        "vector_geometric_median": "geomedian",
+    }
+    method = aliases.get(method, method)
+    if method not in ("geomedian", "mean"):
+        raise ValueError(
+            f"Unknown VECTOR_MERGE_METHOD {method!r}; expected 'geomedian' or 'mean'."
+        )
+    return method
+
+
+def _use_geomedian_vector_merge(output_name, channels, merge_method):
+    return (
+        _vector_merge_method(merge_method) == "geomedian"
+        and _is_geomedian_vector_output(output_name, channels)
+    )
+
+
 def _geometric_median_vectors(samples, valid, max_iter=GEOMEDIAN_MAX_ITER, eps=GEOMEDIAN_EPS):
     samples = np.asarray(samples, dtype=np.float32)
     valid = np.asarray(valid, dtype=bool)
@@ -576,12 +618,13 @@ def _geometric_median_vectors(samples, valid, max_iter=GEOMEDIAN_MAX_ITER, eps=G
 
 
 class _SparseChunkOutputMerger:
-    def __init__(self, root, window_min, window_shape, crop_size, mmap_dir=None):
+    def __init__(self, root, window_min, window_shape, crop_size, mmap_dir=None, vector_merge_method=None):
         self.root = root
         self.window_min = np.asarray(window_min, dtype=np.int64)
         self.window_shape = tuple(int(v) for v in window_shape)
         self.crop_size_arr = np.asarray(crop_size, dtype=np.int64)
         self.chunks_3d = tuple(min(int(MERGE_OUTPUTS_CHUNK_SIZE), int(v)) for v in self.window_shape)
+        self.vector_merge_method = _vector_merge_method(vector_merge_method)
         self.current_bytes = 0
         if mmap_dir is not None:
             Path(mmap_dir).mkdir(parents=True, exist_ok=True)
@@ -693,7 +736,11 @@ class _SparseChunkOutputMerger:
                 f"does not match crop_size {tuple(self.crop_size_arr.tolist())}"
             )
         self._ensure_output(output_name, output_batch.shape[1])
-        use_geomedian = _is_geomedian_vector_output(output_name, output_batch.shape[1])
+        use_geomedian = _use_geomedian_vector_merge(
+            output_name,
+            output_batch.shape[1],
+            self.vector_merge_method,
+        )
 
         for batch_idx, item in enumerate(voxelized_batch):
             start = _bbox_min_corner(item["bbox"]) - self.window_min
@@ -745,18 +792,36 @@ class _SparseChunkOutputMerger:
                 continue
 
             out_flat = np.zeros((3, counts_flat.shape[0]), dtype=np.float32)
-            max_count = int(counts_flat.max())
             for block_start in range(0, counts_flat.shape[0], block_voxels):
                 block_end = min(block_start + block_voxels, counts_flat.shape[0])
                 block_counts = counts_flat[block_start:block_end]
                 if not bool((block_counts > 0).any()):
                     continue
-                block_k = min(max_count, len(slots))
-                samples = np.empty((block_k, 3, block_end - block_start), dtype=np.float32)
+                out_block = out_flat[:, block_start:block_end]
+                slot0 = np.asarray(slots[0]).reshape(3, -1)[:, block_start:block_end]
+
+                count1 = block_counts == 1
+                if bool(count1.any()):
+                    out_block[:, count1] = slot0[:, count1]
+
+                count2 = block_counts == 2
+                if bool(count2.any()):
+                    slot1 = np.asarray(slots[1]).reshape(3, -1)[:, block_start:block_end]
+                    out_block[:, count2] = (slot0[:, count2] + slot1[:, count2]) * np.float32(0.5)
+
+                needs_iter = block_counts > 2
+                if not bool(needs_iter.any()):
+                    continue
+
+                iter_counts = block_counts[needs_iter]
+                block_k = min(int(iter_counts.max()), len(slots))
+                iter_cols = np.flatnonzero(needs_iter)
+                samples = np.empty((block_k, 3, iter_cols.size), dtype=np.float32)
                 for slot_idx in range(block_k):
-                    samples[slot_idx] = np.asarray(slots[slot_idx]).reshape(3, -1)[:, block_start:block_end]
-                valid = np.arange(block_k, dtype=np.uint16)[:, None] < block_counts[None, :]
-                out_flat[:, block_start:block_end] = _geometric_median_vectors(samples, valid)
+                    slot_flat = np.asarray(slots[slot_idx]).reshape(3, -1)[:, block_start:block_end]
+                    samples[slot_idx] = slot_flat[:, iter_cols]
+                valid = np.arange(block_k, dtype=np.uint16)[:, None] < iter_counts[None, :]
+                out_block[:, needs_iter] = _geometric_median_vectors(samples, valid)
 
             avg[(slice(None), *region)] = out_flat.reshape((3, *count_chunk.shape))
 
@@ -768,6 +833,7 @@ class _SparseChunkOutputMerger:
             avg_group.attrs["window_shape_zyx"] = self.root.attrs.get("window_shape_zyx", None)
             avg_group.attrs["merge_backing"] = "mmap"
             avg_group.attrs["merge_sparse_bytes"] = int(self.current_bytes)
+            avg_group.attrs["vector_merge_method"] = str(self.vector_merge_method)
 
             for output_name, channels in self.channels.items():
                 if output_name in avg_group:
@@ -780,7 +846,7 @@ class _SparseChunkOutputMerger:
                     dtype="f4",
                     fill_value=0.0,
                 )
-                if _is_geomedian_vector_output(output_name, channels):
+                if _use_geomedian_vector_merge(output_name, channels, self.vector_merge_method):
                     avg.attrs[f"{output_name}_merge_method"] = "vector_geometric_median"
                     self._finalize_geomedian_output(avg, output_name)
                     continue
@@ -872,6 +938,154 @@ def _integration_step_sizes():
     return steps, float(target_distance), float(target_distance)
 
 
+def _integration_method():
+    method = str(INTEGRATION_METHOD).strip().lower()
+    aliases = {
+        "midpoint": "rk2",
+        "rk2_midpoint": "rk2",
+        "predictor_corrector": "heun",
+        "huen": "heun",
+    }
+    method = aliases.get(method, method)
+    if method not in ("euler", "rk2", "heun"):
+        raise ValueError(
+            f"Unknown INTEGRATION_METHOD {INTEGRATION_METHOD!r}; "
+            "expected 'euler', 'rk2', or 'heun'."
+        )
+    return method
+
+
+def _surface_attract_mode():
+    mode = str(SURFACE_ATTRACT_MODE).strip().lower()
+    aliases = {
+        "project": "full",
+        "projection": "full",
+        "normal_only": "normal",
+        "perpendicular": "normal",
+        "perp": "normal",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in ("full", "normal"):
+        raise ValueError(
+            f"Unknown SURFACE_ATTRACT_MODE {SURFACE_ATTRACT_MODE!r}; "
+            "expected 'full' or 'normal'."
+        )
+    return mode
+
+
+def _bbox_integration_margin():
+    step_sizes, _, target_distance = _integration_step_sizes()
+    if not step_sizes:
+        return 0.0
+    return float(target_distance) + float(max(step_sizes))
+
+
+def _edge_support_offsets_and_weights():
+    if not bool(USE_EDGE_SUPPORT_SEEDS):
+        return np.asarray([0.0], dtype=np.float32), np.asarray([1.0], dtype=np.float32)
+
+    offsets = np.asarray(EDGE_SUPPORT_OFFSETS_FULL_RES, dtype=np.float32).reshape(-1)
+    weights = np.asarray(EDGE_SUPPORT_WEIGHTS, dtype=np.float32).reshape(-1)
+    if offsets.size == 0:
+        raise ValueError("EDGE_SUPPORT_OFFSETS_FULL_RES must contain at least one offset.")
+    if weights.shape != offsets.shape:
+        raise ValueError(
+            "EDGE_SUPPORT_WEIGHTS must have the same length as "
+            "EDGE_SUPPORT_OFFSETS_FULL_RES."
+        )
+    if not np.isfinite(offsets).all():
+        raise ValueError("EDGE_SUPPORT_OFFSETS_FULL_RES must be finite.")
+    if not np.isfinite(weights).all() or np.any(weights < 0.0):
+        raise ValueError("EDGE_SUPPORT_WEIGHTS must be finite and non-negative.")
+    if not np.any(np.isclose(offsets, 0.0)):
+        raise ValueError("EDGE_SUPPORT_OFFSETS_FULL_RES must include 0.0 for the center seed.")
+    if float(weights.sum()) <= 0.0:
+        raise ValueError("EDGE_SUPPORT_WEIGHTS must contain at least one positive weight.")
+    return offsets, weights
+
+
+def _interp_edge_run_at(edge, run_start, run_end, query_index):
+    query_index = float(query_index)
+    if query_index < float(run_start) - 1e-6 or query_index > float(run_end) + 1e-6:
+        return None
+    if query_index <= float(run_start):
+        return edge[run_start].astype(np.float32, copy=True)
+    if query_index >= float(run_end):
+        return edge[run_end].astype(np.float32, copy=True)
+
+    left = int(np.floor(query_index))
+    right = left + 1
+    if right > run_end:
+        return edge[run_end].astype(np.float32, copy=True)
+    frac = np.float32(query_index - float(left))
+    return (edge[left] + frac * (edge[right] - edge[left])).astype(np.float32, copy=False)
+
+
+def _make_edge_support_seeds(edge_zyx, edge_axis_scale):
+    edge = np.asarray(edge_zyx, dtype=np.float32)
+    edge_valid = np.isfinite(edge).all(axis=1) & ~(edge == -1).all(axis=1)
+    sparse_edge_indices = np.flatnonzero(edge_valid).astype(np.int64)
+    if sparse_edge_indices.size == 0:
+        raise RuntimeError("No valid edge points available for streamline integration.")
+
+    offsets, weights = _edge_support_offsets_and_weights()
+    center_offset_indices = np.flatnonzero(np.isclose(offsets, 0.0))
+    center_offset = int(center_offset_indices[0])
+    edge_axis_scale = float(edge_axis_scale)
+    if edge_axis_scale <= 0.0:
+        raise ValueError(f"edge_axis_scale must be > 0, got {edge_axis_scale!r}")
+
+    seed_points = []
+    source_sparse_indices = []
+    support_offsets = []
+    support_weights = []
+    support_is_center = []
+
+    valid_to_sparse = {
+        int(edge_idx): int(sparse_idx)
+        for sparse_idx, edge_idx in enumerate(sparse_edge_indices)
+    }
+
+    run_start_pos = 0
+    while run_start_pos < sparse_edge_indices.size:
+        run_end_pos = run_start_pos + 1
+        while (
+            run_end_pos < sparse_edge_indices.size
+            and sparse_edge_indices[run_end_pos] == sparse_edge_indices[run_end_pos - 1] + 1
+        ):
+            run_end_pos += 1
+
+        run_start = int(sparse_edge_indices[run_start_pos])
+        run_end = int(sparse_edge_indices[run_end_pos - 1])
+        for edge_idx in sparse_edge_indices[run_start_pos:run_end_pos]:
+            sparse_idx = valid_to_sparse[int(edge_idx)]
+            for offset_idx, offset in enumerate(offsets):
+                query_index = float(edge_idx) + float(offset) * edge_axis_scale
+                point = _interp_edge_run_at(edge, run_start, run_end, query_index)
+                if point is None:
+                    continue
+                seed_points.append(point)
+                source_sparse_indices.append(sparse_idx)
+                support_offsets.append(float(offset))
+                support_weights.append(float(weights[offset_idx]))
+                support_is_center.append(offset_idx == center_offset)
+
+        run_start_pos = run_end_pos
+
+    if not seed_points:
+        raise RuntimeError("No edge support seeds available for streamline integration.")
+
+    return {
+        "seed_zyx": np.asarray(seed_points, dtype=np.float32),
+        "source_sparse_index": np.asarray(source_sparse_indices, dtype=np.int64),
+        "support_offset_full_res": np.asarray(support_offsets, dtype=np.float32),
+        "support_weight": np.asarray(support_weights, dtype=np.float32),
+        "support_is_center": np.asarray(support_is_center, dtype=bool),
+        "sparse_edge_indices": sparse_edge_indices,
+        "sparse_seed_count": int(sparse_edge_indices.size),
+    }
+
+
 class _TorchStreamlineFieldSampler:
     def __init__(self, velocity, attract, validity, device):
         self.device = torch.device(device)
@@ -936,82 +1150,226 @@ class _TorchStreamlineFieldSampler:
         return self.sample(points_zyx, 6, 1)
 
 
-def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
+def _sample_unit_velocity(sampler, points_zyx):
+    velocity_samples, velocity_in_bounds = sampler.sample_velocity(points_zyx)
+    speed = torch.linalg.norm(velocity_samples, dim=1)
+    finite_speed = torch.isfinite(speed)
+    nonzero_speed = speed > 1e-6
+    usable = velocity_in_bounds & finite_speed & nonzero_speed
+    unit_velocity = torch.zeros_like(velocity_samples)
+    unit_velocity[usable] = velocity_samples[usable] / speed[usable, None]
+    return unit_velocity, usable, velocity_in_bounds, finite_speed, nonzero_speed
+
+
+def _integrate_velocity_candidate(sampler, points_zyx, step_size, method):
+    step_size = float(step_size)
+    unit0, usable0, in_bounds0, finite0, nonzero0 = _sample_unit_velocity(sampler, points_zyx)
+    if method == "euler":
+        candidate = points_zyx + step_size * unit0
+        usable = usable0
+        in_bounds = in_bounds0
+        finite = finite0
+        nonzero = nonzero0
+        return candidate, usable, in_bounds, finite, nonzero
+
+    if method == "rk2":
+        midpoint = points_zyx + (0.5 * step_size) * unit0
+        unit_mid, usable_mid, in_bounds_mid, finite_mid, nonzero_mid = _sample_unit_velocity(sampler, midpoint)
+        candidate = points_zyx + step_size * unit_mid
+        usable = usable0 & usable_mid
+        in_bounds = in_bounds0 & in_bounds_mid
+        finite = finite0 & finite_mid
+        nonzero = nonzero0 & nonzero_mid
+        return candidate, usable, in_bounds, finite, nonzero
+
+    predictor = points_zyx + step_size * unit0
+    unit1, usable1, in_bounds1, finite1, nonzero1 = _sample_unit_velocity(sampler, predictor)
+    avg_unit = unit0 + unit1
+    avg_norm = torch.linalg.norm(avg_unit, dim=1)
+    avg_finite = torch.isfinite(avg_norm)
+    avg_nonzero = avg_norm > 1e-6
+    usable_avg = avg_finite & avg_nonzero
+    step_unit = torch.zeros_like(avg_unit)
+    step_unit[usable_avg] = avg_unit[usable_avg] / avg_norm[usable_avg, None]
+    candidate = points_zyx + step_size * step_unit
+    usable = usable0 & usable1 & usable_avg
+    in_bounds = in_bounds0 & in_bounds1
+    finite = finite0 & finite1 & avg_finite
+    nonzero = nonzero0 & nonzero1 & avg_nonzero
+    return candidate, usable, in_bounds, finite, nonzero
+
+
+def _clamp_vector_norm(vectors, max_norm):
+    if max_norm is None:
+        return vectors
+    max_norm = float(max_norm)
+    if max_norm < 0.0:
+        return vectors
+    norm = torch.linalg.norm(vectors, dim=1)
+    scale = torch.clamp(max_norm / torch.clamp(norm, min=1e-6), max=1.0)
+    return vectors * scale[:, None]
+
+
+def _apply_surface_attract_correction(sampler, candidate):
+    attract_samples, attract_in_bounds = sampler.sample_attract(candidate)
+    attract_samples = _clamp_vector_norm(attract_samples, SURFACE_ATTRACT_MAX_CORRECTION)
+    mode = _surface_attract_mode()
+
+    if mode == "full":
+        correction = attract_samples
+        usable = attract_in_bounds
+    else:
+        velocity_unit, velocity_usable, _, _, _ = _sample_unit_velocity(sampler, candidate)
+        parallel = (attract_samples * velocity_unit).sum(dim=1, keepdim=True) * velocity_unit
+        correction = attract_samples - parallel
+        correction = _clamp_vector_norm(correction, SURFACE_ATTRACT_MAX_CORRECTION)
+        usable = attract_in_bounds & velocity_usable
+
+    corrected = candidate + float(SURFACE_ATTRACT_WEIGHT) * correction
+    return corrected, usable
+
+
+def integrate_streamlines_from_edge(avg_group, edge_zyx, edge_axis_scale, window_min, zarr_root):
     velocity = _require_avg_field(avg_group, "velocity_dir", 3)
     attract = _require_avg_field(avg_group, "surface_attract", 3)
     validity = _require_avg_field(avg_group, "trace_validity", 1)
 
-    edge = np.asarray(edge_zyx, dtype=np.float32)
-    edge_valid = np.isfinite(edge).all(axis=1) & ~(edge == -1).all(axis=1)
-    seeds_world = edge[edge_valid]
-    if seeds_world.shape[0] == 0:
-        raise RuntimeError("No valid edge points available for streamline integration.")
+    seed_bundle = _make_edge_support_seeds(edge_zyx, edge_axis_scale)
+    seeds_world = seed_bundle["seed_zyx"]
 
     step_sizes, requested_distance, target_distance = _integration_step_sizes()
     window_min = np.asarray(window_min, dtype=np.float32)
     points_local = seeds_world - window_min[None, :]
 
-    traces_local = np.zeros((len(step_sizes) + 1, seeds_world.shape[0], 3), dtype=np.float32)
-    cumulative_distance = np.zeros((len(step_sizes) + 1, seeds_world.shape[0]), dtype=np.float32)
-    active_mask = np.zeros((len(step_sizes) + 1, seeds_world.shape[0]), dtype=bool)
-    traces_local[0] = points_local
     sampler = _TorchStreamlineFieldSampler(velocity, attract, validity, DEVICE)
+    method = _integration_method()
+    n_steps = len(step_sizes)
+    n_seeds = int(seeds_world.shape[0])
     points_t = torch.from_numpy(points_local).to(device=sampler.device, dtype=torch.float32)
-    distance_t = torch.zeros((seeds_world.shape[0],), device=sampler.device, dtype=torch.float32)
-    active = torch.ones((seeds_world.shape[0],), device=sampler.device, dtype=torch.bool)
+    traces_t = torch.zeros((n_steps + 1, n_seeds, 3), device=sampler.device, dtype=torch.float32)
+    cumulative_distance_t = torch.zeros((n_steps + 1, n_seeds), device=sampler.device, dtype=torch.float32)
+    active_mask_t = torch.zeros((n_steps + 1, n_seeds), device=sampler.device, dtype=torch.bool)
+    traces_t[0] = points_t
+    distance_t = torch.zeros((n_seeds,), device=sampler.device, dtype=torch.float32)
+    active = torch.ones((n_seeds,), device=sampler.device, dtype=torch.bool)
     _, seed_in_bounds = sampler.sample_validity(points_t)
     active &= seed_in_bounds
-    active_mask[0] = active.detach().cpu().numpy()
+    active_mask_t[0] = active
+
+    diag_active_before_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_accepted_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_velocity_oob_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_velocity_nonfinite_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_velocity_zero_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_attract_oob_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_candidate_nonfinite_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_validity_oob_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_validity_nonfinite_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
+    diag_low_validity_t = torch.zeros((n_steps,), device=sampler.device, dtype=torch.int32)
 
     step_iter = tqdm(step_sizes, desc="Integrating streamlines", unit="step")
     for step_idx, step_size in enumerate(step_iter, start=1):
         active_idx = torch.nonzero(active, as_tuple=False).flatten()
+        diag_idx = step_idx - 1
+        diag_active_before_t[diag_idx] = active_idx.numel()
         step_iter.set_postfix(active=int(active_idx.numel()))
         if active_idx.numel() > 0:
             current_points = points_t[active_idx]
-            velocity_samples, velocity_in_bounds = sampler.sample_velocity(current_points)
-            speed = torch.linalg.norm(velocity_samples, dim=1)
-            usable = velocity_in_bounds & torch.isfinite(speed) & (speed > 1e-6)
-            if bool(usable.any().item()):
-                candidate_idx = active_idx[usable]
-                unit_velocity = velocity_samples[usable] / speed[usable, None]
-                candidate = points_t[candidate_idx] + float(step_size) * unit_velocity
-                if USE_SURFACE_ATTRACT:
-                    attract_samples, attract_in_bounds = sampler.sample_attract(candidate)
-                    attract_norm = torch.linalg.norm(attract_samples, dim=1)
-                    if SURFACE_ATTRACT_MAX_CORRECTION is not None:
-                        max_corr = float(SURFACE_ATTRACT_MAX_CORRECTION)
-                        if max_corr >= 0.0:
-                            scale = torch.clamp(max_corr / torch.clamp(attract_norm, min=1e-6), max=1.0)
-                            attract_samples = attract_samples * scale[:, None]
-                    candidate = candidate + float(SURFACE_ATTRACT_WEIGHT) * attract_samples
-                    usable_candidate = attract_in_bounds
-                else:
-                    usable_candidate = torch.ones((candidate.shape[0],), device=sampler.device, dtype=torch.bool)
+            candidate, usable, velocity_in_bounds, finite_speed, nonzero_speed = _integrate_velocity_candidate(
+                sampler,
+                current_points,
+                step_size,
+                method,
+            )
+            diag_velocity_oob_t[diag_idx] = (~velocity_in_bounds).sum()
+            diag_velocity_nonfinite_t[diag_idx] = (velocity_in_bounds & ~finite_speed).sum()
+            diag_velocity_zero_t[diag_idx] = (velocity_in_bounds & finite_speed & ~nonzero_speed).sum()
 
-                validity_logits, validity_in_bounds = sampler.sample_validity(candidate)
-                validity_prob = torch.sigmoid(validity_logits[:, 0])
-                candidate_active = (
-                    usable_candidate
-                    & validity_in_bounds
-                    & torch.isfinite(candidate).all(dim=1)
-                    & (validity_prob >= float(TRACE_VALIDITY_THRESHOLD))
-                )
-                accepted_idx = candidate_idx[candidate_active]
-                accepted_candidate = candidate[candidate_active]
-                segment_lengths = torch.linalg.norm(accepted_candidate - points_t[accepted_idx], dim=1)
-                distance_t[accepted_idx] = distance_t[accepted_idx] + segment_lengths
-                points_t[accepted_idx] = accepted_candidate
-                active[candidate_idx] = candidate_active
+            candidate_idx = active_idx[usable]
+            candidate = candidate[usable]
+            if USE_SURFACE_ATTRACT:
+                candidate, usable_candidate = _apply_surface_attract_correction(sampler, candidate)
+            else:
+                usable_candidate = torch.ones((candidate.shape[0],), device=sampler.device, dtype=torch.bool)
+
+            validity_logits, validity_in_bounds = sampler.sample_validity(candidate)
+            validity_prob = torch.sigmoid(validity_logits[:, 0])
+            candidate_finite = torch.isfinite(candidate).all(dim=1)
+            validity_finite = torch.isfinite(validity_prob)
+            candidate_active = (
+                usable_candidate
+                & validity_in_bounds
+                & candidate_finite
+                & validity_finite
+                & (validity_prob >= float(TRACE_VALIDITY_THRESHOLD))
+            )
+            diag_attract_oob_t[diag_idx] = (~usable_candidate).sum()
+            diag_candidate_nonfinite_t[diag_idx] = (usable_candidate & ~candidate_finite).sum()
+            diag_validity_oob_t[diag_idx] = (usable_candidate & candidate_finite & ~validity_in_bounds).sum()
+            diag_validity_nonfinite_t[diag_idx] = (
+                usable_candidate & candidate_finite & validity_in_bounds & ~validity_finite
+            ).sum()
+            diag_low_validity_t[diag_idx] = (
+                usable_candidate
+                & candidate_finite
+                & validity_in_bounds
+                & validity_finite
+                & (validity_prob < float(TRACE_VALIDITY_THRESHOLD))
+            ).sum()
+            accepted_idx = candidate_idx[candidate_active]
+            accepted_candidate = candidate[candidate_active]
+            diag_accepted_t[diag_idx] = accepted_idx.numel()
+            segment_lengths = torch.linalg.norm(accepted_candidate - points_t[accepted_idx], dim=1)
+            distance_t[accepted_idx] = distance_t[accepted_idx] + segment_lengths
+            points_t[accepted_idx] = accepted_candidate
+            active[candidate_idx] = candidate_active
             active[active_idx[~usable]] = False
 
-        traces_local[step_idx] = points_t.detach().cpu().numpy()
-        cumulative_distance[step_idx] = distance_t.detach().cpu().numpy()
-        active_mask[step_idx] = active.detach().cpu().numpy()
+        traces_t[step_idx] = points_t
+        cumulative_distance_t[step_idx] = distance_t
+        active_mask_t[step_idx] = active
 
-    traces_world = traces_local + window_min[None, None, :]
+    traces_world = traces_t.detach().cpu().numpy()
+    traces_world += window_min[None, None, :]
+    cumulative_distance = cumulative_distance_t.detach().cpu().numpy()
+    active_mask = active_mask_t.detach().cpu().numpy()
+    endpoint_active = active.detach().cpu().numpy()
+    seed_in_bounds_np = seed_in_bounds.detach().cpu().numpy()
+    diag_active_before = diag_active_before_t.detach().cpu().numpy()
+    diag_accepted = diag_accepted_t.detach().cpu().numpy()
+    diag_velocity_oob = diag_velocity_oob_t.detach().cpu().numpy()
+    diag_velocity_nonfinite = diag_velocity_nonfinite_t.detach().cpu().numpy()
+    diag_velocity_zero = diag_velocity_zero_t.detach().cpu().numpy()
+    diag_attract_oob = diag_attract_oob_t.detach().cpu().numpy()
+    diag_candidate_nonfinite = diag_candidate_nonfinite_t.detach().cpu().numpy()
+    diag_validity_oob = diag_validity_oob_t.detach().cpu().numpy()
+    diag_validity_nonfinite = diag_validity_nonfinite_t.detach().cpu().numpy()
+    diag_low_validity = diag_low_validity_t.detach().cpu().numpy()
     integration = zarr_root.require_group("streamline_integration")
-    for name in ("seed_zyx", "points_zyx", "active_mask", "cumulative_distance", "endpoint_zyx", "endpoint_active"):
+    for name in (
+        "seed_zyx",
+        "points_zyx",
+        "active_mask",
+        "cumulative_distance",
+        "endpoint_zyx",
+        "endpoint_active",
+        "support_source_sparse_index",
+        "support_offset_full_res",
+        "support_weight",
+        "support_is_center",
+        "sparse_edge_index",
+        "diagnostic_step_index",
+        "diagnostic_active_before",
+        "diagnostic_accepted",
+        "diagnostic_velocity_oob",
+        "diagnostic_velocity_nonfinite",
+        "diagnostic_velocity_zero",
+        "diagnostic_attract_oob",
+        "diagnostic_candidate_nonfinite",
+        "diagnostic_validity_oob",
+        "diagnostic_validity_nonfinite",
+        "diagnostic_low_validity",
+    ):
         if name in integration:
             del integration[name]
     integration.create_dataset("seed_zyx", data=seeds_world.astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
@@ -1019,30 +1377,93 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, window_min, zarr_root):
     integration.create_dataset("active_mask", data=active_mask.astype(np.uint8), chunks=(1, min(seeds_world.shape[0], 4096)))
     integration.create_dataset("cumulative_distance", data=cumulative_distance.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096)))
     integration.create_dataset("endpoint_zyx", data=traces_world[-1].astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("endpoint_active", data=active.detach().cpu().numpy().astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
+    integration.create_dataset("endpoint_active", data=endpoint_active.astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
+    integration.create_dataset(
+        "support_source_sparse_index",
+        data=seed_bundle["source_sparse_index"].astype(np.int64),
+        chunks=(min(seeds_world.shape[0], 4096),),
+    )
+    integration.create_dataset(
+        "support_offset_full_res",
+        data=seed_bundle["support_offset_full_res"].astype(np.float32),
+        chunks=(min(seeds_world.shape[0], 4096),),
+    )
+    integration.create_dataset(
+        "support_weight",
+        data=seed_bundle["support_weight"].astype(np.float32),
+        chunks=(min(seeds_world.shape[0], 4096),),
+    )
+    integration.create_dataset(
+        "support_is_center",
+        data=seed_bundle["support_is_center"].astype(np.uint8),
+        chunks=(min(seeds_world.shape[0], 4096),),
+    )
+    integration.create_dataset(
+        "sparse_edge_index",
+        data=seed_bundle["sparse_edge_indices"].astype(np.int64),
+        chunks=(min(seed_bundle["sparse_seed_count"], 4096),),
+    )
+    integration.create_dataset("diagnostic_step_index", data=np.arange(1, n_steps + 1, dtype=np.int32), chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_active_before", data=diag_active_before, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_accepted", data=diag_accepted, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_velocity_oob", data=diag_velocity_oob, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_velocity_nonfinite", data=diag_velocity_nonfinite, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_velocity_zero", data=diag_velocity_zero, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_attract_oob", data=diag_attract_oob, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_candidate_nonfinite", data=diag_candidate_nonfinite, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_validity_oob", data=diag_validity_oob, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_validity_nonfinite", data=diag_validity_nonfinite, chunks=(min(n_steps, 4096),))
+    integration.create_dataset("diagnostic_low_validity", data=diag_low_validity, chunks=(min(n_steps, 4096),))
     integration.attrs["tifxyz_voxel_step"] = float(TIFXYZ_VOXEL_STEP)
     integration.attrs["tifxyz_steps"] = int(TIFXYZ_STEPS)
     integration.attrs["integration_steps"] = int(len(step_sizes))
     integration.attrs["integration_step_size"] = float(INTEGRATION_STEP_SIZE)
+    integration.attrs["integration_method"] = method
     integration.attrs["requested_distance"] = requested_distance
     integration.attrs["target_distance"] = target_distance
     integration.attrs["actual_step_sizes"] = [float(v) for v in step_sizes]
     integration.attrs["trace_validity_threshold"] = float(TRACE_VALIDITY_THRESHOLD)
     integration.attrs["use_surface_attract"] = bool(USE_SURFACE_ATTRACT)
+    integration.attrs["surface_attract_mode"] = _surface_attract_mode()
     integration.attrs["surface_attract_weight"] = float(SURFACE_ATTRACT_WEIGHT)
     integration.attrs["surface_attract_max_correction"] = (
         None if SURFACE_ATTRACT_MAX_CORRECTION is None else float(SURFACE_ATTRACT_MAX_CORRECTION)
     )
     integration.attrs["distance_sampling"] = "actual_arclength"
-    integration.attrs["active_endpoints"] = int(active.sum().item())
+    integration.attrs["active_endpoints"] = int(endpoint_active.sum())
     integration.attrs["seed_count"] = int(seeds_world.shape[0])
+    integration.attrs["dense_seed_count"] = int(seeds_world.shape[0])
+    integration.attrs["sparse_seed_count"] = int(seed_bundle["sparse_seed_count"])
+    integration.attrs["use_edge_support_seeds"] = bool(USE_EDGE_SUPPORT_SEEDS)
+    integration.attrs["edge_axis_scale"] = float(edge_axis_scale)
+    support_offsets_config, support_weights_config = _edge_support_offsets_and_weights()
+    integration.attrs["edge_support_config_offsets_full_res"] = [float(v) for v in support_offsets_config]
+    integration.attrs["edge_support_config_weights"] = [float(v) for v in support_weights_config]
+    integration.attrs["edge_support_require_center_active"] = bool(EDGE_SUPPORT_REQUIRE_CENTER_ACTIVE)
+    integration.attrs["seed_out_of_bounds"] = int((~seed_in_bounds_np).sum())
+    diagnostics = {
+        "seed_out_of_bounds": int((~seed_in_bounds_np).sum()),
+        "velocity_oob": int(diag_velocity_oob.sum()),
+        "velocity_nonfinite": int(diag_velocity_nonfinite.sum()),
+        "velocity_zero": int(diag_velocity_zero.sum()),
+        "attract_oob": int(diag_attract_oob.sum()),
+        "candidate_nonfinite": int(diag_candidate_nonfinite.sum()),
+        "validity_oob": int(diag_validity_oob.sum()),
+        "validity_nonfinite": int(diag_validity_nonfinite.sum()),
+        "low_validity": int(diag_low_validity.sum()),
+    }
+    for key, value in diagnostics.items():
+        integration.attrs[f"diagnostic_total_{key}"] = int(value)
     return {
         "group": integration,
         "seed_count": int(seeds_world.shape[0]),
-        "active_endpoints": int(active.sum().item()),
+        "dense_seed_count": int(seeds_world.shape[0]),
+        "sparse_seed_count": int(seed_bundle["sparse_seed_count"]),
+        "active_endpoints": int(endpoint_active.sum()),
         "requested_distance": requested_distance,
         "target_distance": target_distance,
         "step_sizes": step_sizes,
+        "diagnostics": diagnostics,
     }
 
 
@@ -1108,6 +1529,73 @@ def _streamline_points_at_tifxyz_steps(integration_group):
 
     sampled_points[~sampled_active] = -1.0
     return sampled_points, sampled_active
+
+
+def _collapse_edge_support_samples(integration_group, sampled_points, sampled_active):
+    if "support_source_sparse_index" not in integration_group:
+        return sampled_points, sampled_active
+
+    sampled_points = np.asarray(sampled_points, dtype=np.float32)
+    sampled_active = np.asarray(sampled_active, dtype=bool)
+    source_sparse_index = np.asarray(integration_group["support_source_sparse_index"], dtype=np.int64)
+    support_weight = np.asarray(integration_group["support_weight"], dtype=np.float32)
+    support_is_center = np.asarray(integration_group["support_is_center"], dtype=bool)
+    sparse_seed_count = int(integration_group.attrs.get(
+        "sparse_seed_count",
+        int(source_sparse_index.max()) + 1 if source_sparse_index.size else 0,
+    ))
+
+    if sampled_points.shape[1] != source_sparse_index.shape[0]:
+        raise RuntimeError(
+            "Support seed metadata does not match sampled streamline count: "
+            f"{source_sparse_index.shape[0]} vs {sampled_points.shape[1]}"
+        )
+    if support_weight.shape[0] != source_sparse_index.shape[0]:
+        raise RuntimeError("support_weight length does not match support_source_sparse_index.")
+    if support_is_center.shape[0] != source_sparse_index.shape[0]:
+        raise RuntimeError("support_is_center length does not match support_source_sparse_index.")
+
+    sparse_points = np.full((sampled_points.shape[0], sparse_seed_count, 3), -1.0, dtype=np.float32)
+    sparse_active = np.zeros((sampled_points.shape[0], sparse_seed_count), dtype=bool)
+    require_center = bool(integration_group.attrs.get(
+        "edge_support_require_center_active",
+        EDGE_SUPPORT_REQUIRE_CENTER_ACTIVE,
+    ))
+
+    for sparse_idx in range(sparse_seed_count):
+        support_indices = np.flatnonzero(source_sparse_index == sparse_idx)
+        if support_indices.size == 0:
+            continue
+        center_indices = support_indices[support_is_center[support_indices]]
+        for step_idx in range(sampled_points.shape[0]):
+            active_support = support_indices[sampled_active[step_idx, support_indices]]
+            if active_support.size == 0:
+                continue
+            if require_center and (
+                center_indices.size == 0
+                or not bool(sampled_active[step_idx, center_indices].any())
+            ):
+                continue
+            points = sampled_points[step_idx, active_support]
+            finite = np.isfinite(points).all(axis=1)
+            if not bool(finite.any()):
+                continue
+            active_support = active_support[finite]
+            points = points[finite]
+            weights = support_weight[active_support].astype(np.float32, copy=True)
+            positive = weights > 0.0
+            if not bool(positive.any()):
+                continue
+            points = points[positive]
+            weights = weights[positive]
+            weight_sum = float(weights.sum())
+            if weight_sum <= 0.0:
+                continue
+            sparse_points[step_idx, sparse_idx] = (points * weights[:, None]).sum(axis=0) / weight_sum
+            sparse_active[step_idx, sparse_idx] = True
+
+    sparse_points[~sparse_active] = -1.0
+    return sparse_points, sparse_active
 
 
 def _interp_polyline_at_distances(points, distances):
@@ -1195,6 +1683,11 @@ def _build_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction
     edge = np.asarray(edge_zyx, dtype=np.float32)
     edge_valid = np.isfinite(edge).all(axis=1) & ~(edge == -1).all(axis=1)
     sampled_points, sampled_active = _streamline_points_at_tifxyz_steps(integration_group)
+    sampled_points, sampled_active = _collapse_edge_support_samples(
+        integration_group,
+        sampled_points,
+        sampled_active,
+    )
     sampled_points, sampled_active = _regularize_tifxyz_front_spacing(
         sampled_points,
         sampled_active,
@@ -1276,7 +1769,10 @@ def save_merged_streamline_tifxyz(
             "iteration": None if iteration_idx is None else int(iteration_idx),
             "save_each_iteration_tifxyz": bool(SAVE_EACH_ITERATION_TIFXYZ),
             "integration_step_size": float(INTEGRATION_STEP_SIZE),
+            "integration_method": _integration_method(),
             "trace_validity_threshold": float(TRACE_VALIDITY_THRESHOLD),
+            "surface_attract_mode": _surface_attract_mode(),
+            "vector_merge_method": _vector_merge_method(),
         },
     )
     return output_dir / output_uuid
@@ -1298,6 +1794,7 @@ def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxe
     zarr_root.attrs["crop_size_zyx"] = [int(v) for v in crop_size]
     zarr_root.attrs["cond_direction"] = str(cond_direction)
     zarr_root.attrs["grow_direction"] = str(GROW_DIRECTION)
+    zarr_root.attrs["vector_merge_method"] = _vector_merge_method()
 
     mixed_precision = str(model_config.get("mixed_precision", "no")).lower()
     amp_enabled = mixed_precision in ("bf16", "fp16", "float16")
@@ -1310,6 +1807,7 @@ def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxe
         window_shape,
         crop_size,
         mmap_dir=MERGE_OUTPUTS_MMAP_DIR,
+        vector_merge_method=VECTOR_MERGE_METHOD,
     )
 
     batch_starts = range(0, len(voxelized_bboxes), int(BATCH_SIZE))
@@ -1344,14 +1842,17 @@ def _run_streamline_iteration(
         raise RuntimeError("No valid tifxyz points found.")
 
     cond_direction, _ = _get_growth_context(GROW_DIRECTION)
+    bbox_integration_margin = _bbox_integration_margin()
     bboxes, edge = get_cond_edge_bboxes(
         stored_zyxs,
         cond_direction,
         crop_size,
         overlap_frac=OVERLAP_FRAC,
         cond_valid=valid,
+        integration_margin=bbox_integration_margin,
     )
     surface = read_tifxyz(input_tifxyz_path)
+    edge_axis_scale = surface._scale[0] if _get_direction_spec(cond_direction)["axis"] == "col" else surface._scale[1]
     voxelized_bboxes = upsample_voxelize_tifxyz_surface_in_bboxes(
         surface,
         bboxes,
@@ -1374,6 +1875,7 @@ def _run_streamline_iteration(
         integration_result = integrate_streamlines_from_edge(
             output_group,
             edge,
+            edge_axis_scale,
             np.asarray(output_root.attrs["window_min_zyx"], dtype=np.float32),
             output_root,
         )
@@ -1400,6 +1902,8 @@ def _run_streamline_iteration(
         print(f"cond_direction: {cond_direction}")
         print(f"crop_size: {tuple(crop_size)}")
         print(f"overlap_frac: {float(OVERLAP_FRAC)}")
+        print(f"bbox_integration_margin: {float(bbox_integration_margin)}")
+        print(f"vector_merge_method: {_vector_merge_method()}")
         print(f"valid_points: {int(points_zyx.shape[0])}")
         print(f"bboxes: {len(bboxes)}")
         print(f"voxelized_bbox_voxels: {sum(int(item['voxels'].sum()) for item in voxelized_bboxes)}")
@@ -1407,11 +1911,19 @@ def _run_streamline_iteration(
         print(f"tifxyz_steps: {int(TIFXYZ_STEPS)}")
         print(f"integration_steps: {len(integration_result['step_sizes'])}")
         print(f"integration_step_size: {float(INTEGRATION_STEP_SIZE)}")
+        print(f"integration_method: {_integration_method()}")
+        print(f"surface_attract_mode: {_surface_attract_mode()}")
         print(f"integration_requested_distance: {integration_result['requested_distance']}")
         print(f"integration_target_distance: {integration_result['target_distance']}")
         print(f"integration_actual_steps: {integration_result['step_sizes']}")
         print(f"integration_seed_count: {integration_result['seed_count']}")
+        print(f"integration_dense_seed_count: {integration_result['dense_seed_count']}")
+        print(f"integration_sparse_seed_count: {integration_result['sparse_seed_count']}")
+        print(f"edge_support_offsets_full_res: {list(EDGE_SUPPORT_OFFSETS_FULL_RES)}")
+        print(f"edge_support_weights: {list(EDGE_SUPPORT_WEIGHTS)}")
+        print(f"edge_support_require_center_active: {bool(EDGE_SUPPORT_REQUIRE_CENTER_ACTIVE)}")
         print(f"integration_active_endpoints: {integration_result['active_endpoints']}")
+        print(f"integration_failure_diagnostics: {integration_result['diagnostics']}")
 
         if SHOW_NAPARI:
             show_streamline_geometry_napari(
@@ -1425,7 +1937,11 @@ def _run_streamline_iteration(
             "input_tifxyz_path": Path(input_tifxyz_path),
             "output_tifxyz_path": Path(output_tifxyz_path),
             "output_zarr_path": Path(output_path),
-            "integration_result": integration_result,
+            "integration_summary": {
+                key: value
+                for key, value in integration_result.items()
+                if key != "group"
+            },
         }
     finally:
         _cleanup_temp_output_zarr(output_path)
@@ -1446,7 +1962,7 @@ def main():
     volume_array = _open_volume_array(VOLUME_PATH, VOLUME_SCALE)
 
     current_tifxyz_path = Path(TIFXYZ_PATH)
-    iteration_results = []
+    final_output_tifxyz_path = None
     temp_tifxyz_dir = None
     try:
         if num_iterations > 1 and not SAVE_EACH_ITERATION_TIFXYZ:
@@ -1467,12 +1983,16 @@ def main():
                 num_iterations,
                 output_tifxyz_dir,
             )
-            iteration_results.append(result)
             current_tifxyz_path = result["output_tifxyz_path"]
+            final_output_tifxyz_path = current_tifxyz_path
+            del result
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         print(f"num_iterations: {num_iterations}")
         print(f"save_each_iteration_tifxyz: {bool(SAVE_EACH_ITERATION_TIFXYZ)}")
-        print(f"final_output_tifxyz_path: {iteration_results[-1]['output_tifxyz_path']}")
+        print(f"final_output_tifxyz_path: {final_output_tifxyz_path}")
     finally:
         if temp_tifxyz_dir is not None:
             temp_tifxyz_dir.cleanup()
