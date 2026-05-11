@@ -55,6 +55,15 @@ struct GridPoint {
     int col = -1;
 };
 
+struct CutSelection {
+    std::vector<int> cuts;
+    std::string method;
+    GridPoint seed;
+    std::vector<int> hit_cols;
+    GridPoint fallback_start;
+    GridPoint fallback_end;
+};
+
 static bool middle_valid_row(const cv::Mat_<cv::Vec3f>& points, int col, int& out_row)
 {
     std::vector<int> rows;
@@ -219,6 +228,238 @@ static std::vector<int> choose_shortest_path_cut_columns(
     return cuts;
 }
 
+static int valid_count_in_col(const cv::Mat_<cv::Vec3f>& points, int col)
+{
+    int count = 0;
+    for (int r = 0; r < points.rows; ++r) {
+        if (valid_point(points(r, col))) ++count;
+    }
+    return count;
+}
+
+static bool nearest_valid_in_direction(
+    const cv::Mat_<cv::Vec3f>& points,
+    int row,
+    int col,
+    int dr,
+    int dc,
+    cv::Vec3d& out)
+{
+    constexpr int max_step = 30;
+    for (int step = 1; step <= max_step; ++step) {
+        const int r = row + dr * step;
+        const int c = col + dc * step;
+        if (r < 0 || r >= points.rows || c < 0 || c >= points.cols) continue;
+        const cv::Vec3f& p = points(r, c);
+        if (!valid_point(p)) continue;
+        out = cv::Vec3d(double(p[0]), double(p[1]), double(p[2]));
+        return true;
+    }
+    return false;
+}
+
+static bool normal_at_grid_point(
+    const cv::Mat_<cv::Vec3f>& points,
+    int row,
+    int col,
+    cv::Vec3d& out_normal)
+{
+    cv::Vec3d left;
+    cv::Vec3d right;
+    cv::Vec3d up;
+    cv::Vec3d down;
+    if (!nearest_valid_in_direction(points, row, col, 0, -1, left) ||
+        !nearest_valid_in_direction(points, row, col, 0, 1, right) ||
+        !nearest_valid_in_direction(points, row, col, -1, 0, up) ||
+        !nearest_valid_in_direction(points, row, col, 1, 0, down)) {
+        return false;
+    }
+
+    out_normal = (right - left).cross(down - up);
+    const double len = cv::norm(out_normal);
+    if (len == 0.0 || !std::isfinite(len)) return false;
+    out_normal *= 1.0 / len;
+    return true;
+}
+
+struct RayHit {
+    int col = -1;
+    int row = -1;
+    double dist = std::numeric_limits<double>::infinity();
+};
+
+static std::vector<RayHit> nearest_columns_to_normal_ray(
+    const cv::Mat_<cv::Vec3f>& points,
+    GridPoint seed,
+    const cv::Vec3d& normal,
+    int valid_c0,
+    int valid_c1)
+{
+    const cv::Vec3f& seed_f = points(seed.row, seed.col);
+    const cv::Vec3d origin{double(seed_f[0]), double(seed_f[1]), double(seed_f[2])};
+    constexpr double max_dist_to_ray = 18.0;
+
+    std::vector<RayHit> raw_hits;
+    raw_hits.reserve(static_cast<size_t>(valid_c1 - valid_c0 + 1));
+    for (int c = valid_c0; c <= valid_c1; ++c) {
+        RayHit best;
+        best.col = c;
+        for (int r = 0; r < points.rows; ++r) {
+            const cv::Vec3f& p_f = points(r, c);
+            if (!valid_point(p_f)) continue;
+
+            const cv::Vec3d p{double(p_f[0]), double(p_f[1]), double(p_f[2])};
+            const cv::Vec3d rel = p - origin;
+            const cv::Vec3d closest = rel - normal * rel.dot(normal);
+            const double dist = cv::norm(closest);
+            if (dist < best.dist) {
+                best.row = r;
+                best.dist = dist;
+            }
+        }
+        if (best.row >= 0 && best.dist <= max_dist_to_ray) {
+            raw_hits.push_back(best);
+        }
+    }
+
+    std::vector<RayHit> hits;
+    for (const RayHit& hit : raw_hits) {
+        if (!hits.empty() && hit.col <= hits.back().col + 2) {
+            if (hit.dist < hits.back().dist) {
+                hits.back() = hit;
+            }
+        } else {
+            hits.push_back(hit);
+        }
+    }
+    return hits;
+}
+
+static std::vector<int> best_consistent_hit_run(
+    const std::vector<RayHit>& hits,
+    int seed_col,
+    int valid_c0,
+    int valid_c1)
+{
+    if (hits.size() < 4) return {};
+
+    const int span = std::max(1, valid_c1 - valid_c0);
+    const int min_gap = std::max(20, span / 9);
+    const int max_gap = std::max(min_gap + 1, span / 3);
+
+    std::vector<int> best;
+    bool best_contains_seed = false;
+    double best_gap_error = std::numeric_limits<double>::infinity();
+
+    for (size_t start = 0; start < hits.size(); ++start) {
+        std::vector<int> run;
+        run.push_back(hits[start].col);
+        for (size_t i = start + 1; i < hits.size(); ++i) {
+            const int gap = hits[i].col - run.back();
+            if (gap < min_gap) continue;
+            if (gap > max_gap) break;
+            run.push_back(hits[i].col);
+        }
+
+        if (run.size() < 4) continue;
+
+        const bool contains_seed = std::any_of(run.begin(), run.end(), [&](int col) {
+            return std::abs(col - seed_col) <= 2;
+        });
+
+        double mean_gap = 0.0;
+        for (size_t i = 1; i < run.size(); ++i) {
+            mean_gap += double(run[i] - run[i - 1]);
+        }
+        mean_gap /= double(run.size() - 1);
+
+        double gap_error = 0.0;
+        for (size_t i = 1; i < run.size(); ++i) {
+            const double diff = double(run[i] - run[i - 1]) - mean_gap;
+            gap_error += diff * diff;
+        }
+        gap_error /= double(run.size() - 1);
+
+        const bool better =
+            (contains_seed != best_contains_seed && contains_seed) ||
+            (contains_seed == best_contains_seed && run.size() > best.size()) ||
+            (contains_seed == best_contains_seed && run.size() == best.size() && gap_error < best_gap_error);
+        if (better) {
+            best = std::move(run);
+            best_contains_seed = contains_seed;
+            best_gap_error = gap_error;
+        }
+    }
+
+    return best;
+}
+
+static CutSelection choose_normal_ray_cut_columns(
+    const cv::Mat_<cv::Vec3f>& points,
+    const cv::Vec2d& center)
+{
+    int valid_c0 = 0;
+    int valid_c1 = points.cols - 1;
+    if (!valid_col_range(points, valid_c0, valid_c1)) {
+        throw std::runtime_error("no valid points in tifxyz");
+    }
+
+    int seed_col = valid_c0;
+    int best_count = -1;
+    for (int c = valid_c0; c <= valid_c1; ++c) {
+        const int count = valid_count_in_col(points, c);
+        if (count > best_count) {
+            best_count = count;
+            seed_col = c;
+        }
+    }
+
+    std::vector<int> seed_rows;
+    seed_rows.reserve(static_cast<size_t>(best_count));
+    for (int r = 0; r < points.rows; ++r) {
+        if (valid_point(points(r, seed_col))) seed_rows.push_back(r);
+    }
+
+    std::vector<double> fractions = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9};
+    std::vector<int> best_run;
+    GridPoint best_seed;
+    for (double fraction : fractions) {
+        if (seed_rows.empty()) break;
+        const size_t idx = std::min(
+            seed_rows.size() - 1,
+            static_cast<size_t>(std::lround(fraction * double(seed_rows.size() - 1))));
+        const GridPoint seed{seed_rows[idx], seed_col};
+
+        cv::Vec3d normal;
+        if (!normal_at_grid_point(points, seed.row, seed.col, normal)) continue;
+
+        const std::vector<RayHit> hits =
+            nearest_columns_to_normal_ray(points, seed, normal, valid_c0, valid_c1);
+        std::vector<int> run = best_consistent_hit_run(hits, seed.col, valid_c0, valid_c1);
+        if (run.size() > best_run.size()) {
+            best_run = std::move(run);
+            best_seed = seed;
+        }
+    }
+
+    CutSelection selection;
+    if (best_run.size() >= 4) {
+        selection.seed = best_seed;
+        selection.hit_cols = best_run;
+        selection.cuts.assign(best_run.begin() + 1, best_run.end() - 1);
+        selection.method = "normal-ray radial bands";
+        return selection;
+    }
+
+    selection.cuts = choose_shortest_path_cut_columns(
+        points,
+        center,
+        selection.fallback_start,
+        selection.fallback_end);
+    selection.method = "shortest-path revolutions fallback";
+    return selection;
+}
+
 static bool has_valid_point(const cv::Mat_<cv::Vec3f>& points)
 {
     for (int r = 0; r < points.rows; ++r) {
@@ -373,16 +614,15 @@ int main(int argc, char* argv[])
         (double(bbox.low[0]) + double(bbox.high[0])) * 0.5,
         (double(bbox.low[1]) + double(bbox.high[1])) * 0.5);
 
-    GridPoint path_start;
-    GridPoint path_end;
-    std::vector<int> cuts;
+    CutSelection cut_selection;
     try {
-        cuts = choose_shortest_path_cut_columns(*points, center, path_start, path_end);
+        cut_selection = choose_normal_ray_cut_columns(*points, center);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return EXIT_FAILURE;
     }
 
+    std::vector<int> cuts = cut_selection.cuts;
     if (cuts.empty()) {
         std::cerr << "error: no cut columns selected\n";
         return EXIT_FAILURE;
@@ -438,9 +678,19 @@ int main(int argc, char* argv[])
     const bool number_right_to_left =
         !slices.empty() && slices.back().radius < slices.front().radius;
 
-    std::cout << "shortest path: (" << path_start.col << "," << path_start.row << ") -> ("
-              << path_end.col << "," << path_end.row << ")\n";
-    std::cout << "cut method: shortest-path revolutions\n";
+    if (cut_selection.method == "normal-ray radial bands") {
+        std::cout << "normal ray seed: (" << cut_selection.seed.col << ","
+                  << cut_selection.seed.row << ")\n";
+        std::cout << "normal ray hit columns:";
+        for (int col : cut_selection.hit_cols) std::cout << " " << col;
+        std::cout << "\n";
+    } else {
+        std::cout << "shortest path: (" << cut_selection.fallback_start.col << ","
+                  << cut_selection.fallback_start.row << ") -> ("
+                  << cut_selection.fallback_end.col << ","
+                  << cut_selection.fallback_end.row << ")\n";
+    }
+    std::cout << "cut method: " << cut_selection.method << "\n";
     std::cout << "cut columns:";
     for (int cut : cuts) std::cout << " " << cut;
     std::cout << "\n";
