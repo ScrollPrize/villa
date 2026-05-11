@@ -80,6 +80,7 @@ def _active_terms(weights: dict[str, float]) -> dict[str, float]:
 			"cyl_center",
 			"cyl_smooth",
 			"cyl_z_smooth",
+			"cyl_z_center",
 			"cyl_step",
 			"cyl_radial_mean",
 			"cyl_bend",
@@ -792,6 +793,17 @@ def cyl_z_smooth_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tupl
 	h_avg = 0.5 * (xyz[:-2] + xyz[2:])
 	lm = ((h_mid - h_avg).norm(dim=-1) / h_scale).square()
 	return _register_shell_term("cyl_z_smooth", lm, res=res)
+
+
+def cyl_z_center_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Keep the shell's average z near the prepared init z center."""
+	xyz = _shell_xyz(res)
+	if xyz is None:
+		return _zero_loss(res)
+	target = xyz.new_tensor(float(getattr(res, "cyl_z_center_target", getattr(res, "cyl_seed_z", 0.0))))
+	scale = xyz.new_tensor(max(1.0, float(getattr(res, "cyl_shell_height_step", 1.0))))
+	lm = ((xyz[..., 2].mean() - target) / scale).square().view(1)
+	return _register_shell_term("cyl_z_center", lm, res=res)
 
 
 def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:

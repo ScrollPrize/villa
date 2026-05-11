@@ -235,6 +235,8 @@ class FitResult3D:
 	cyl_shell_step: float = 500.0
 	cyl_shell_width_step: float = 0.0
 	cyl_shell_height_step: float = 0.0
+	cyl_seed_z: float = 0.0
+	cyl_z_center_target: float = 0.0
 	cyl_shell_base_xyz: torch.Tensor | None = None
 	cyl_shell_dirs: torch.Tensor | None = None
 	cyl_shell_w_offsets: torch.Tensor | None = None
@@ -331,6 +333,7 @@ class Model3D(nn.Module):
 		self.cyl_shell_current_width_step = self.cyl_shell_width_target_step
 		self.cyl_shell_min_width = 20
 		self.cyl_shell_seed_z = float(z_center)
+		self.cyl_shell_z_center_target = float(z_center)
 		self.cyl_shell_model_h: float | None = None
 		self.cyl_shell_z: torch.Tensor | None = None
 		self.cyl_shell_base: torch.Tensor | None = None
@@ -556,6 +559,18 @@ class Model3D(nn.Module):
 			self.cyl_shell_delta_ms = nn.ParameterList()
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		model_w_value = float(model_w)
+		requested_model_h = max(1.0, float(model_h))
+		init_z0 = float(seed[2]) - requested_model_h
+		init_z1 = float(seed[2]) + requested_model_h
+		if volume_extent_fullres is not None and len(volume_extent_fullres) >= 3:
+			z_max = max(0.0, float(volume_extent_fullres[2]) - 1.0)
+			init_z0 = max(0.0, init_z0)
+			init_z1 = min(z_max, init_z1)
+		if init_z1 <= init_z0:
+			raise ValueError(
+				f"invalid cylinder seed z extent after volume clamp: "
+				f"z0={init_z0:.3f} z1={init_z1:.3f} seed_z={float(seed[2]):.3f}"
+			)
 		self.params = replace(
 			self.params,
 			model_w=(model_w_value if model_w_value > 0.0 else None),
@@ -563,7 +578,8 @@ class Model3D(nn.Module):
 		)
 		self.cyl_shell_mode = True
 		self.cyl_shell_seed_z = float(seed[2])
-		self.cyl_shell_model_h = float(model_h)
+		self.cyl_shell_z_center_target = 0.5 * (init_z0 + init_z1)
+		self.cyl_shell_model_h = float(init_z1 - init_z0)
 		self.cyl_shell_z = None
 		self.cyl_shell_base = None
 		self.cyl_shell_dirs = None
@@ -615,7 +631,7 @@ class Model3D(nn.Module):
 		device = self.cyl_params.device
 		dtype = self.cyl_params.dtype
 		z_step = max(1.0, float(self.cyl_shell_z_step))
-		model_h = max(float(self.cyl_shell_model_h), z_step)
+		model_h = max(1.0, float(self.cyl_shell_model_h))
 		H = max(2, int(math.ceil(model_h / z_step)) + 1)
 		actual_z_step = model_h / float(max(1, H - 1))
 		radius0 = self._first_shell_radius()
@@ -631,7 +647,8 @@ class Model3D(nn.Module):
 		)
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		print(f"[model] umbilicus tube init: search_max_shells={self.cyl_shell_search_max_shells} "
-			  f"H={H} W={W} z_center={self.cyl_shell_seed_z:.1f} "
+			  f"H={H} W={W} seed_z={self.cyl_shell_seed_z:.1f} "
+			  f"z_center_target={self.cyl_shell_z_center_target:.1f} "
 			  f"model_h={model_h:.1f} z_step={actual_z_step:.1f} "
 			  f"z_step_target={z_step:.1f} initial_radius={radius0:.1f} "
 			  f"step_growth={float(getattr(self, 'cyl_shell_growth_factor', 1.5)):.3g} "
@@ -645,9 +662,9 @@ class Model3D(nn.Module):
 			else float(self.params.mesh_step) * float(max(1, h - 1))
 		)
 		if h <= 1:
-			return torch.full((1,), float(self.cyl_shell_seed_z), device=device, dtype=dtype)
+			return torch.full((1,), float(self.cyl_shell_z_center_target), device=device, dtype=dtype)
 		t = torch.linspace(-0.5, 0.5, h, device=device, dtype=dtype)
-		return float(self.cyl_shell_seed_z) + t * float(model_h)
+		return float(self.cyl_shell_z_center_target) + t * float(model_h)
 
 	def _shell_width_for_radius(self, radius: float) -> int:
 		step = max(1.0, float(self.cyl_shell_width_target_step))
@@ -908,6 +925,38 @@ class Model3D(nn.Module):
 
 		return _edge_str("min_edge", torch.argmin(w_len)), _edge_str("max_edge", torch.argmax(w_len))
 
+	@staticmethod
+	def _shell_oriented_low_to_high_z(shell: torch.Tensor) -> torch.Tensor:
+		if float(shell[-1, :, 2].mean().detach().cpu()) < float(shell[0, :, 2].mean().detach().cpu()):
+			return torch.flip(shell, dims=(0,))
+		return shell
+
+	def assert_cylinder_shell_brackets_seed(
+		self,
+		shell: torch.Tensor | None = None,
+		*,
+		label: str = "cylinder shell",
+	) -> None:
+		if shell is None:
+			shell = self.current_cylinder_shell_xyz().detach()
+		if shell.ndim != 3 or int(shell.shape[-1]) < 3:
+			raise ValueError(f"{label}: shell must have shape (H, W, 3), got {tuple(shell.shape)}")
+		if int(shell.shape[0]) < 2 or int(shell.shape[1]) < 3:
+			raise ValueError(f"{label}: seed bracketing requires H>=2 and W>=3, got {tuple(shell.shape)}")
+		shell = self._shell_oriented_low_to_high_z(shell.detach())
+		seed_z = float(self.cyl_seed_xyz.to(device=shell.device, dtype=shell.dtype)[2].detach().cpu())
+		lower_max = float(shell[0, :, 2].amax().detach().cpu())
+		upper_min = float(shell[-1, :, 2].amin().detach().cpu())
+		height = max(1.0, abs(float(shell[-1, :, 2].mean().detach().cpu()) - float(shell[0, :, 2].mean().detach().cpu())))
+		tol = max(1.0e-4, height * 1.0e-7)
+		if lower_max <= seed_z + tol and seed_z <= upper_min + tol:
+			return
+		raise ValueError(
+			f"{label}: cylinder shell no longer brackets seed z: "
+			f"lower_max={lower_max:.3f} seed_z={seed_z:.3f} upper_min={upper_min:.3f} "
+			f"shape={tuple(shell.shape)}"
+		)
+
 	def current_cylinder_shell_xyz(self) -> torch.Tensor:
 		if self.cyl_shell_base is None or self.cyl_shell_dirs is None:
 			raise ValueError("umbilicus tube shell has not been prepared")
@@ -920,13 +969,61 @@ class Model3D(nn.Module):
 		return self._unit_vertex_normals_for_shell(self.current_cylinder_shell_xyz())
 
 	@staticmethod
+	def _seed_z_slice_polygon(
+		shell_xyz: torch.Tensor,
+		seed_t: torch.Tensor,
+		*,
+		edge_tolerance: float = 1.0e-4,
+	) -> tuple[torch.Tensor, int]:
+		shell_xyz = Model3D._shell_oriented_low_to_high_z(shell_xyz)
+		H = int(shell_xyz.shape[0])
+		W = int(shell_xyz.shape[1])
+		row_z = shell_xyz[..., 2].mean(dim=1)
+		row_i = int(torch.argmin((row_z - seed_t[2]).abs()).detach().cpu())
+		if H == 1:
+			return shell_xyz[0, :, :2].detach().to(device=seed_t.device, dtype=seed_t.dtype), row_i
+
+		seed_z = seed_t[2]
+		height = (shell_xyz[..., 2].amax() - shell_xyz[..., 2].amin()).abs()
+		tol = max(float(edge_tolerance), float(height.detach().cpu()) * 1.0e-7)
+		points: list[torch.Tensor] = []
+		for w in range(W):
+			col = shell_xyz[:, w].to(device=seed_t.device, dtype=seed_t.dtype)
+			diff = col[:, 2] - seed_z
+			exact = diff.abs() <= tol
+			exact_count = int(exact.sum().detach().cpu())
+			if exact_count == 1:
+				points.append(col[int(torch.nonzero(exact, as_tuple=False)[0, 0].detach().cpu()), :2])
+				continue
+			if exact_count > 1:
+				raise ValueError(
+					f"seed z slice is ambiguous for column w={w}: "
+					f"multiple vertices lie on seed_z={float(seed_z.detach().cpu()):.3f}"
+				)
+			d0 = diff[:-1]
+			d1 = diff[1:]
+			cross = ((d0 < -tol) & (d1 > tol)) | ((d0 > tol) & (d1 < -tol))
+			cross_count = int(cross.sum().detach().cpu())
+			if cross_count != 1:
+				raise ValueError(
+					f"seed z slice requires exactly one crossing per column, got {cross_count} "
+					f"for w={w} seed_z={float(seed_z.detach().cpu()):.3f}"
+				)
+			h = int(torch.nonzero(cross, as_tuple=False)[0, 0].detach().cpu())
+			p0 = col[h]
+			p1 = col[h + 1]
+			t = ((seed_z - p0[2]) / (p1[2] - p0[2])).clamp(min=0.0, max=1.0)
+			points.append((p0 + t * (p1 - p0))[:2])
+		return torch.stack(points, dim=0).detach(), row_i
+
+	@staticmethod
 	def measure_seed_against_shell(
 		shell_xyz: torch.Tensor,
 		seed_xyz: torch.Tensor | tuple[float, float, float] | list[float],
 		*,
 		edge_tolerance: float = 1.0e-4,
 	) -> SeedShellMetrics:
-		"""Measure seed XY against the periodic shell row nearest seed z."""
+		"""Measure seed XY against the shell slice at seed z."""
 		if shell_xyz.ndim == 4 and int(shell_xyz.shape[0]) == 1:
 			shell_xyz = shell_xyz[0]
 		if shell_xyz.ndim != 3 or int(shell_xyz.shape[-1]) < 3:
@@ -943,9 +1040,11 @@ class Model3D(nn.Module):
 			raise ValueError("seed_xyz must contain x, y, z")
 		seed_t = seed_t.reshape(-1)[:3]
 		with torch.no_grad():
-			row_z = shell_xyz[..., 2].mean(dim=1)
-			row_i = int(torch.argmin((row_z - seed_t[2]).abs()).detach().cpu())
-			poly = shell_xyz[row_i, :, :2].detach().to(device=seed_t.device, dtype=seed_t.dtype)
+			poly, row_i = Model3D._seed_z_slice_polygon(
+				shell_xyz,
+				seed_t,
+				edge_tolerance=edge_tolerance,
+			)
 			p = seed_t[:2]
 			seg0 = poly
 			seg1 = torch.roll(poly, shifts=-1, dims=0)
@@ -1293,8 +1392,8 @@ class Model3D(nn.Module):
 
 	def _seed_phase_on_shell(self, shell: torch.Tensor) -> float:
 		seed = self.cyl_seed_xyz.to(device=shell.device, dtype=shell.dtype)
-		metrics = self.measure_seed_against_shell(shell, seed)
-		row = shell[int(metrics.row_index)]
+		row_xy, _row_index = self._seed_z_slice_polygon(shell, seed)
+		row = torch.cat([row_xy, torch.full_like(row_xy[..., :1], seed[2])], dim=-1)
 		p = seed[:2]
 		seg0 = row[:, :2]
 		seg1 = torch.roll(row[:, :2], shifts=-1, dims=0)
@@ -1318,8 +1417,8 @@ class Model3D(nn.Module):
 		if int(shell.shape[0]) < 2 or int(shell.shape[1]) < 3:
 			raise ValueError(f"shell patch extraction requires H>=2 and W>=3, got {tuple(shell.shape)}")
 		shell = shell.detach()
-		if float(shell[-1, :, 2].mean().detach().cpu()) < float(shell[0, :, 2].mean().detach().cpu()):
-			shell = torch.flip(shell, dims=(0,))
+		shell = self._shell_oriented_low_to_high_z(shell)
+		self.assert_cylinder_shell_brackets_seed(shell, label="seed patch extraction")
 		device = shell.device
 		dtype = shell.dtype
 		step = max(1.0, float(self.params.mesh_step))
@@ -2650,6 +2749,8 @@ class Model3D(nn.Module):
 			cyl_shell_step=float(self._current_shell_target_offset()),
 			cyl_shell_width_step=float(getattr(self, "cyl_shell_current_width_step", self.cyl_shell_width_target_step)),
 			cyl_shell_height_step=float(getattr(self, "cyl_shell_z_step", self.params.mesh_step)),
+			cyl_seed_z=float(self.cyl_seed_xyz[2].detach().cpu()) if self.cyl_seed_xyz.numel() >= 3 else 0.0,
+			cyl_z_center_target=float(getattr(self, "cyl_shell_z_center_target", self.cyl_shell_seed_z)),
 			cyl_shell_base_xyz=cyl_shell_base_xyz,
 			cyl_shell_dirs=cyl_shell_dirs,
 			cyl_shell_w_offsets=cyl_shell_w_offsets,

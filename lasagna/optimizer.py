@@ -73,7 +73,7 @@ CYLINDER_STAGE_STEP_ARG = "model-step"
 OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_step_size", "wstep_target")
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
-	"cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt",
+	"cyl_z_center", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt",
 )
 
 
@@ -207,6 +207,7 @@ lambda_global: dict[str, float] = {
 	"cyl_center": 0.0,
 	"cyl_smooth": 0.0,
 	"cyl_z_smooth": 0.0,
+	"cyl_z_center": 0.0,
 	"cyl_step": 0.0,
 	"cyl_radial_mean": 0.0,
 	"cyl_bend": 0.0,
@@ -696,6 +697,7 @@ def optimize(
 		},
 		"cyl_smooth": {"loss": opt_loss_cyl.cyl_smooth_loss, "needs": Needs(cyl_samples=True)},
 		"cyl_z_smooth": {"loss": opt_loss_cyl.cyl_z_smooth_loss, "needs": Needs(cyl_samples=True)},
+		"cyl_z_center": {"loss": opt_loss_cyl.cyl_z_center_loss, "needs": Needs(cyl_samples=True)},
 		"cyl_step": {"loss": opt_loss_cyl.cyl_step_loss, "needs": Needs(cyl_samples=True)},
 		"cyl_radial_mean": {
 			"loss": opt_loss_cyl.cyl_radial_mean_loss,
@@ -847,6 +849,7 @@ def optimize(
 				"cyl_center": float(opt_cfg.eff.get("cyl_center", 0.0)),
 				"cyl_smooth": float(opt_cfg.eff.get("cyl_smooth", 0.0)),
 				"cyl_z_smooth": float(opt_cfg.eff.get("cyl_z_smooth", 0.0)),
+				"cyl_z_center": float(opt_cfg.eff.get("cyl_z_center", 0.0)),
 				"cyl_step": float(opt_cfg.eff.get("cyl_step", 0.0)),
 				"cyl_radial_mean": float(opt_cfg.eff.get("cyl_radial_mean", 0.0)),
 				"cyl_bend": float(opt_cfg.eff.get("cyl_bend", 0.0)),
@@ -862,6 +865,7 @@ def optimize(
 			_need_term("cyl_center", stage_eff) > 0 or
 			_need_term("cyl_smooth", stage_eff) > 0 or
 			_need_term("cyl_z_smooth", stage_eff) > 0 or
+			_need_term("cyl_z_center", stage_eff) > 0 or
 			_need_term("cyl_step", stage_eff) > 0 or
 			_need_term("cyl_radial_mean", stage_eff) > 0 or
 			_need_term("cyl_bend", stage_eff) > 0 or
@@ -1050,6 +1054,7 @@ def optimize(
 				"cyl_radial_mean": "c_rad",
 				"cyl_smooth": "c_sm",
 				"cyl_step": "c_step",
+				"cyl_z_center": "c_zctr",
 				"cyl_z_smooth": "c_zsm",
 				"p:bend_max_deg": "benddeg",
 				"p:hstep_avg_vx": "havg",
@@ -1426,6 +1431,8 @@ def optimize(
 				return pass_eff
 
 			def _measure_seed(shell_label: str, *, log: bool = True):
+				if hasattr(model, "assert_cylinder_shell_brackets_seed"):
+					model.assert_cylinder_shell_brackets_seed(label=f"{shell_label} seed distance")
 				if hasattr(model, "measure_seed_vs_current_cylinder_shell"):
 					metrics = model.measure_seed_vs_current_cylinder_shell(seed=seed_xyz)
 					cls = str(metrics.classification)
@@ -1799,9 +1806,12 @@ def optimize(
 					model.begin_cylinder_shell(0, data, direction=1)
 				_run_shell_pass(f"{label}.cyl_init", _pass_eff_for_role(),
 								wstep_start=_base_wstep, wstep_end=_base_wstep,
-								shell_no=1, suppress_initial_status=True)
+								shell_no=1)
 				if hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
+				if _cyl_init_only:
+					_stage_done(f"{label}.total", _t_stage_total)
+					return data
 				metrics = _measure_seed(f"{label}.cyl_init", log=False)
 				cls = str(metrics.classification)
 				model.cyl_shell_search_initial_class = cls
