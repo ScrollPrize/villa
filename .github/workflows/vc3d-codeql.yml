@@ -103,14 +103,17 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            build-essential git cmake ninja-build \
-            qt6-base-dev libboost-system-dev libboost-program-options-dev \
-            libceres-dev libcgal-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
-            libgsl-dev libsdl2-dev libcurl4-openssl-dev
-
-      # ccache was wired up here previously, removed after profiling showed
-      # 0% hit rate in practice (per-branch cache scoping + CMakeLists hash
-      # invalidation made every PR a cache miss; see PR #886 on main).
+            build-essential git cmake ninja-build pkg-config \
+            qt6-base-dev \
+            libboost-system-dev libboost-program-options-dev \
+            libceres-dev libsuitesparse-dev \
+            libopencv-dev libopencv-contrib-dev \
+            libcgal-dev libmpfr-dev libgmp-dev \
+            libblosc2-dev libzstd-dev libcurl4-openssl-dev \
+            nlohmann-json3-dev libavahi-client-dev \
+            liblz4-dev libtiff-dev \
+            zlib1g-dev gfortran libopenblas-dev liblapack-dev liblapacke-dev \
+            libscotch-dev libhwloc-dev
 
       - name: Initialize CodeQL
         if: needs.changes.outputs.vc == 'true'
@@ -125,10 +128,8 @@ jobs:
         working-directory: ./volume-cartographer
         run: |
           cmake -S . -B build -G Ninja \
-                -DVC_WITH_CUDA_SPARSE=off \
-                -DVC_WITH_PASTIX=OFF \
-                -DVC_BUILD_TESTS=OFF \
-                -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Debug \
+                -DVC_TESTING=OFF \
+                -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_C_COMPILER=gcc \
                 -DCMAKE_CXX_COMPILER=g++
 

@@ -879,19 +879,18 @@ static void save_energies(const fs::path& input, const std::vector<double>& E) {
 // main
 // ------------------------------
 int main(int argc, char** argv) {
-  // Usage: flatboi <mesh.obj> [iters] [energy] [--tol=<x>]
-  // - iters defaults to 50 (early-stop usually halts well before that)
-  // - --tol relative-energy convergence threshold (default 1e-5; pass 0 to disable)
   std::string obj_path;
   int iters = 50;
   igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
   std::string energy_label = "symmetric_dirichlet";
-  double conv_tol = 1e-5;
+  // Default 0 (disabled) keeps reproducible iteration counts for VC3D and
+  // script callers that pass only <obj> <iters>. Pass --tol=1e-5 to opt in.
+  double conv_tol = 0.0;
 
   auto print_usage = [&]() {
     std::cerr << "Usage: " << argv[0] << " <mesh.obj> [iters=50] [energy] [--tol=<x>]\n"
               << "  energy (optional): symmetric_dirichlet (default) or conformal\n"
-              << "  --tol=<x>         relative-energy early-stop threshold (default 1e-5; 0 disables)\n";
+              << "  --tol=<x>         relative-energy early-stop threshold (0 disables, default)\n";
   };
 
   std::vector<std::string> positional;
