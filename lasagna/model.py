@@ -206,6 +206,14 @@ class SeedShellMetrics:
 
 
 @dataclass(frozen=True)
+class _SeedCrossSection:
+	xy_segments: torch.Tensor
+	param_segments: torch.Tensor
+	row_index: int
+	tolerance: float
+
+
+@dataclass(frozen=True)
 class FitResult3D:
 	xyz_lr: torch.Tensor        # (D, Hm, Wm, 3) LR mesh in fullres voxels
 	xyz_hr: torch.Tensor | None # (D, He, We, 3) HR mesh
@@ -1051,52 +1059,205 @@ class Model3D(nn.Module):
 		return self._unit_vertex_normals_for_shell(self.current_cylinder_shell_xyz())
 
 	@staticmethod
-	def _seed_z_slice_polygon(
+	def _row_cross_section(row_xyz: torch.Tensor, *, row_index: int, tolerance: float) -> _SeedCrossSection:
+		W = int(row_xyz.shape[0])
+		device = row_xyz.device
+		dtype = row_xyz.dtype
+		w0 = torch.arange(W, device=device, dtype=dtype)
+		w1 = w0 + 1.0
+		h = torch.full_like(w0, float(row_index))
+		xy_segments = torch.stack([row_xyz[:, :2], torch.roll(row_xyz[:, :2], shifts=-1, dims=0)], dim=1)
+		param_segments = torch.stack([
+			torch.stack([h, w0], dim=-1),
+			torch.stack([h, w1], dim=-1),
+		], dim=1)
+		return _SeedCrossSection(
+			xy_segments=xy_segments.detach(),
+			param_segments=param_segments.detach(),
+			row_index=int(row_index),
+			tolerance=float(tolerance),
+		)
+
+	@staticmethod
+	def _dedupe_seed_cross_section_segments(
+		xy_segments: torch.Tensor,
+		param_segments: torch.Tensor,
+		*,
+		tolerance: float,
+	) -> tuple[torch.Tensor, torch.Tensor]:
+		if xy_segments.numel() == 0:
+			return xy_segments, param_segments
+		seg_len = (xy_segments[:, 1] - xy_segments[:, 0]).norm(dim=-1)
+		keep_len = seg_len > max(float(tolerance), 1.0e-12)
+		xy_segments = xy_segments[keep_len]
+		param_segments = param_segments[keep_len]
+		if xy_segments.numel() == 0:
+			return xy_segments, param_segments
+		a = xy_segments[:, 0]
+		b = xy_segments[:, 1]
+		swap = (a[:, 0] > b[:, 0]) | ((a[:, 0] == b[:, 0]) & (a[:, 1] > b[:, 1]))
+		lo = torch.where(swap.unsqueeze(-1), b, a)
+		hi = torch.where(swap.unsqueeze(-1), a, b)
+		points = xy_segments.reshape(-1, 2)
+		span = (points.amax(dim=0) - points.amin(dim=0)).norm()
+		quant = max(float(tolerance), float(span.detach().cpu()) * 1.0e-8, 1.0e-8)
+		keys = torch.round(torch.cat([lo, hi], dim=-1) / quant).to(torch.int64).detach().cpu()
+		seen: set[tuple[int, int, int, int]] = set()
+		keep: list[int] = []
+		for i, key in enumerate(keys.tolist()):
+			t_key = tuple(int(v) for v in key)
+			if t_key in seen:
+				continue
+			seen.add(t_key)
+			keep.append(i)
+		if len(keep) == int(xy_segments.shape[0]):
+			return xy_segments, param_segments
+		idx = torch.tensor(keep, device=xy_segments.device, dtype=torch.long)
+		return xy_segments.index_select(0, idx), param_segments.index_select(0, idx)
+
+	@staticmethod
+	def _seed_z_cross_section(
 		shell_xyz: torch.Tensor,
 		seed_t: torch.Tensor,
 		*,
 		edge_tolerance: float = 1.0e-4,
-	) -> tuple[torch.Tensor, int]:
+	) -> _SeedCrossSection:
 		shell_xyz = Model3D._shell_oriented_low_to_high_z(shell_xyz)
 		H = int(shell_xyz.shape[0])
 		W = int(shell_xyz.shape[1])
+		shell_xyz = shell_xyz.to(device=seed_t.device, dtype=seed_t.dtype)
 		row_z = shell_xyz[..., 2].mean(dim=1)
 		row_i = int(torch.argmin((row_z - seed_t[2]).abs()).detach().cpu())
-		if H == 1:
-			return shell_xyz[0, :, :2].detach().to(device=seed_t.device, dtype=seed_t.dtype), row_i
-
-		seed_z = seed_t[2]
 		height = (shell_xyz[..., 2].amax() - shell_xyz[..., 2].amin()).abs()
 		tol = max(float(edge_tolerance), float(height.detach().cpu()) * 1.0e-7)
-		points: list[torch.Tensor] = []
-		for w in range(W):
-			col = shell_xyz[:, w].to(device=seed_t.device, dtype=seed_t.dtype)
-			diff = col[:, 2] - seed_z
-			exact = diff.abs() <= tol
-			exact_count = int(exact.sum().detach().cpu())
-			if exact_count == 1:
-				points.append(col[int(torch.nonzero(exact, as_tuple=False)[0, 0].detach().cpu()), :2])
-				continue
-			if exact_count > 1:
-				raise ValueError(
-					f"seed z slice is ambiguous for column w={w}: "
-					f"multiple vertices lie on seed_z={float(seed_z.detach().cpu()):.3f}"
-				)
-			d0 = diff[:-1]
-			d1 = diff[1:]
-			cross = ((d0 < -tol) & (d1 > tol)) | ((d0 > tol) & (d1 < -tol))
-			cross_count = int(cross.sum().detach().cpu())
-			if cross_count != 1:
-				raise ValueError(
-					f"seed z slice requires exactly one crossing per column, got {cross_count} "
-					f"for w={w} seed_z={float(seed_z.detach().cpu()):.3f}"
-				)
-			h = int(torch.nonzero(cross, as_tuple=False)[0, 0].detach().cpu())
-			p0 = col[h]
-			p1 = col[h + 1]
-			t = ((seed_z - p0[2]) / (p1[2] - p0[2])).clamp(min=0.0, max=1.0)
-			points.append((p0 + t * (p1 - p0))[:2])
-		return torch.stack(points, dim=0).detach(), row_i
+		if H == 1:
+			return Model3D._row_cross_section(shell_xyz[0], row_index=0, tolerance=tol)
+
+		seed_z = seed_t[2]
+		exact_rows = (shell_xyz[..., 2] - seed_z).abs().amax(dim=1) <= tol
+		if bool(exact_rows.any().detach().cpu()):
+			rows = torch.nonzero(exact_rows, as_tuple=False).reshape(-1)
+			closest = int(torch.argmin((rows - row_i).abs()).detach().cpu())
+			row_i = int(rows[closest].detach().cpu())
+			return Model3D._row_cross_section(shell_xyz[row_i], row_index=row_i, tolerance=tol)
+
+		p00 = shell_xyz[:-1]
+		p10 = shell_xyz[1:]
+		p01 = torch.roll(shell_xyz[:-1], shifts=-1, dims=1)
+		p11 = torch.roll(shell_xyz[1:], shifts=-1, dims=1)
+		h = torch.arange(H - 1, device=seed_t.device, dtype=seed_t.dtype).view(H - 1, 1).expand(H - 1, W)
+		w = torch.arange(W, device=seed_t.device, dtype=seed_t.dtype).view(1, W).expand(H - 1, W)
+		q00 = torch.stack([h, w], dim=-1)
+		q10 = torch.stack([h + 1.0, w], dim=-1)
+		q01 = torch.stack([h, w + 1.0], dim=-1)
+		q11 = torch.stack([h + 1.0, w + 1.0], dim=-1)
+		tris = torch.stack([
+			torch.stack([p00, p10, p11], dim=2),
+			torch.stack([p00, p11, p01], dim=2),
+		], dim=2).reshape(-1, 3, 3)
+		tri_params = torch.stack([
+			torch.stack([q00, q10, q11], dim=2),
+			torch.stack([q00, q11, q01], dim=2),
+		], dim=2).reshape(-1, 3, 2)
+		if tris.numel() == 0:
+			raise ValueError(f"seed z cross-section has no triangles for shell shape={tuple(shell_xyz.shape)}")
+
+		def _gather(vals: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+			return vals.gather(1, idx.reshape(-1, 1, 1).expand(-1, 1, int(vals.shape[-1]))).squeeze(1)
+
+		d = tris[..., 2] - seed_z
+		on = d.abs() <= tol
+		on_count = on.sum(dim=1)
+		a = tris
+		b = torch.roll(tris, shifts=-1, dims=1)
+		da = d
+		db = torch.roll(d, shifts=-1, dims=1)
+		denom = b[..., 2] - a[..., 2]
+		denom_safe = torch.where(denom.abs() > 1.0e-20, denom, torch.ones_like(denom))
+		t = ((seed_z - a[..., 2]) / denom_safe).clamp(min=0.0, max=1.0)
+		edge_pts = a[..., :2] + t.unsqueeze(-1) * (b[..., :2] - a[..., :2])
+		param_a = tri_params
+		param_b = torch.roll(tri_params, shifts=-1, dims=1)
+		edge_params = param_a + t.unsqueeze(-1) * (param_b - param_a)
+		edge_cross = ((da < -tol) & (db > tol)) | ((da > tol) & (db < -tol))
+
+		xy_segments: list[torch.Tensor] = []
+		param_segments: list[torch.Tensor] = []
+		mask0 = (on_count == 0) & (edge_cross.sum(dim=1) == 2)
+		if bool(mask0.any().detach().cpu()):
+			vals, idx = torch.topk(edge_cross[mask0].to(torch.int64), k=2, dim=1)
+			valid = vals[:, 1] > 0
+			if bool(valid.any().detach().cpu()):
+				pts = edge_pts[mask0].gather(1, idx.unsqueeze(-1).expand(-1, -1, 2))
+				params = edge_params[mask0].gather(1, idx.unsqueeze(-1).expand(-1, -1, 2))
+				xy_segments.append(pts[valid])
+				param_segments.append(params[valid])
+
+		mask1 = on_count == 1
+		if bool(mask1.any().detach().cpu()):
+			tris1 = tris[mask1]
+			params1 = tri_params[mask1]
+			d1 = d[mask1]
+			on1 = on[mask1]
+			on_idx = on1.to(torch.int64).argmax(dim=1)
+			i1 = torch.remainder(on_idx + 1, 3)
+			i2 = torch.remainder(on_idx + 2, 3)
+			p_on = _gather(tris1[..., :2], on_idx)
+			param_on = _gather(params1, on_idx)
+			p1 = _gather(tris1, i1)
+			p2 = _gather(tris1, i2)
+			param1 = _gather(params1, i1)
+			param2 = _gather(params1, i2)
+			dv1 = _gather(d1.unsqueeze(-1), i1).squeeze(-1)
+			dv2 = _gather(d1.unsqueeze(-1), i2).squeeze(-1)
+			cross = ((dv1 < -tol) & (dv2 > tol)) | ((dv1 > tol) & (dv2 < -tol))
+			if bool(cross.any().detach().cpu()):
+				den = (p2[:, 2] - p1[:, 2])
+				den_safe = torch.where(den.abs() > 1.0e-20, den, torch.ones_like(den))
+				tc = ((seed_z - p1[:, 2]) / den_safe).clamp(min=0.0, max=1.0)
+				p_cross = p1[:, :2] + tc.unsqueeze(-1) * (p2[:, :2] - p1[:, :2])
+				param_cross = param1 + tc.unsqueeze(-1) * (param2 - param1)
+				xy_segments.append(torch.stack([p_on, p_cross], dim=1)[cross])
+				param_segments.append(torch.stack([param_on, param_cross], dim=1)[cross])
+
+		mask2 = on_count == 2
+		if bool(mask2.any().detach().cpu()):
+			vals, idx = torch.topk(on[mask2].to(torch.int64), k=2, dim=1)
+			valid = vals[:, 1] > 0
+			if bool(valid.any().detach().cpu()):
+				pts = tris[mask2][..., :2].gather(1, idx.unsqueeze(-1).expand(-1, -1, 2))
+				params = tri_params[mask2].gather(1, idx.unsqueeze(-1).expand(-1, -1, 2))
+				xy_segments.append(pts[valid])
+				param_segments.append(params[valid])
+
+		mask3 = on_count == 3
+		if bool(mask3.any().detach().cpu()):
+			tri_xy = tris[mask3][..., :2]
+			tri_param = tri_params[mask3]
+			xy_segments.append(torch.stack([tri_xy, torch.roll(tri_xy, shifts=-1, dims=1)], dim=2).reshape(-1, 2, 2))
+			param_segments.append(
+				torch.stack([tri_param, torch.roll(tri_param, shifts=-1, dims=1)], dim=2).reshape(-1, 2, 2)
+			)
+
+		if not xy_segments:
+			raise ValueError(
+				f"seed z cross-section has no shell-plane intersections for seed_z={float(seed_z.detach().cpu()):.3f} "
+				f"shape={tuple(shell_xyz.shape)}"
+			)
+		xy = torch.cat(xy_segments, dim=0)
+		params = torch.cat(param_segments, dim=0)
+		xy, params = Model3D._dedupe_seed_cross_section_segments(xy, params, tolerance=tol)
+		if xy.numel() == 0:
+			raise ValueError(
+				f"seed z cross-section has only degenerate shell-plane intersections for "
+				f"seed_z={float(seed_z.detach().cpu()):.3f} shape={tuple(shell_xyz.shape)}"
+			)
+		return _SeedCrossSection(
+			xy_segments=xy.detach(),
+			param_segments=params.detach(),
+			row_index=row_i,
+			tolerance=tol,
+		)
 
 	@staticmethod
 	def measure_seed_against_shell(
@@ -1105,7 +1266,7 @@ class Model3D(nn.Module):
 		*,
 		edge_tolerance: float = 1.0e-4,
 	) -> SeedShellMetrics:
-		"""Measure seed XY against the shell slice at seed z."""
+		"""Measure seed XY against the shell cross-section at seed z."""
 		if shell_xyz.ndim == 4 and int(shell_xyz.shape[0]) == 1:
 			shell_xyz = shell_xyz[0]
 		if shell_xyz.ndim != 3 or int(shell_xyz.shape[-1]) < 3:
@@ -1122,36 +1283,38 @@ class Model3D(nn.Module):
 			raise ValueError("seed_xyz must contain x, y, z")
 		seed_t = seed_t.reshape(-1)[:3]
 		with torch.no_grad():
-			poly, row_i = Model3D._seed_z_slice_polygon(
+			cross_section = Model3D._seed_z_cross_section(
 				shell_xyz,
 				seed_t,
 				edge_tolerance=edge_tolerance,
 			)
+			segments = cross_section.xy_segments
 			p = seed_t[:2]
-			seg0 = poly
-			seg1 = torch.roll(poly, shifts=-1, dims=0)
+			seg0 = segments[:, 0]
+			seg1 = segments[:, 1]
 			seg = seg1 - seg0
 			seg_len_sq = (seg * seg).sum(dim=-1).clamp(min=1.0e-12)
 			t = (((p - seg0) * seg).sum(dim=-1) / seg_len_sq).clamp(min=0.0, max=1.0)
 			proj = seg0 + t.unsqueeze(-1) * seg
 			min_dist = float((proj - p).norm(dim=-1).amin().detach().cpu())
-			bbox_span = (poly.amax(dim=0) - poly.amin(dim=0)).norm()
-			tol = max(float(edge_tolerance), float(bbox_span.detach().cpu()) * 1.0e-7)
-			x = float(p[0].detach().cpu())
-			y = float(p[1].detach().cpu())
-			inside = False
-			points = poly.detach().cpu()
-			for i in range(W):
-				j = (i + 1) % W
-				xi = float(points[i, 0])
-				yi = float(points[i, 1])
-				xj = float(points[j, 0])
-				yj = float(points[j, 1])
-				if (yi > y) == (yj > y):
-					continue
-				x_cross = (xj - xi) * (y - yi) / ((yj - yi) if abs(yj - yi) > 1.0e-20 else 1.0e-20) + xi
-				if x < x_cross:
-					inside = not inside
+			seg_points = segments.reshape(-1, 2)
+			bbox_span = (seg_points.amax(dim=0) - seg_points.amin(dim=0)).norm()
+			tol = max(float(cross_section.tolerance), float(bbox_span.detach().cpu()) * 1.0e-7)
+			x0 = seg0[:, 0]
+			y0 = seg0[:, 1]
+			x1 = seg1[:, 0]
+			y1 = seg1[:, 1]
+			cross = (y0 > p[1]) != (y1 > p[1])
+			den = y1 - y0
+			den_safe = torch.where(den.abs() > 1.0e-20, den, torch.full_like(den, 1.0e-20))
+			x_cross = (x1 - x0) * (p[1] - y0) / den_safe + x0
+			ray_hits = x_cross[cross & (p[0] < x_cross)]
+			if ray_hits.numel() > 0:
+				hit_quant = max(tol, 1.0e-8)
+				hit_keys = torch.unique(torch.round(ray_hits / hit_quant).to(torch.int64))
+				inside = bool((int(hit_keys.numel()) % 2) == 1)
+			else:
+				inside = False
 			if min_dist <= tol:
 				cls = "edge"
 				signed = 0.0
@@ -1163,7 +1326,7 @@ class Model3D(nn.Module):
 				signed_distance=float(signed),
 				abs_distance=float(min_dist),
 				tolerance=float(tol),
-				row_index=row_i,
+				row_index=cross_section.row_index,
 			)
 
 	@staticmethod
@@ -1489,19 +1652,21 @@ class Model3D(nn.Module):
 
 	def _seed_phase_on_shell(self, shell: torch.Tensor) -> float:
 		seed = self.cyl_seed_xyz.to(device=shell.device, dtype=shell.dtype)
-		row_xy, _row_index = self._seed_z_slice_polygon(shell, seed)
-		row = torch.cat([row_xy, torch.full_like(row_xy[..., :1], seed[2])], dim=-1)
+		cross_section = self._seed_z_cross_section(shell, seed)
 		p = seed[:2]
-		seg0 = row[:, :2]
-		seg1 = torch.roll(row[:, :2], shifts=-1, dims=0)
+		seg0 = cross_section.xy_segments[:, 0]
+		seg1 = cross_section.xy_segments[:, 1]
 		seg = seg1 - seg0
 		seg_len_sq = (seg * seg).sum(dim=-1).clamp(min=1.0e-12)
 		t = (((p - seg0) * seg).sum(dim=-1) / seg_len_sq).clamp(min=0.0, max=1.0)
 		proj = seg0 + t.unsqueeze(-1) * seg
 		best = int((proj - p).norm(dim=-1).argmin().detach().cpu())
-		cumulative, edges, circumference = self._periodic_row_cumulative_lengths(row)
-		seed_s = cumulative[best] + t[best] * edges[best]
-		return float((seed_s / circumference).detach().cpu())
+		param0 = cross_section.param_segments[:, 0]
+		param1 = cross_section.param_segments[:, 1]
+		param = param0[best] + t[best] * (param1[best] - param0[best])
+		W = max(1, int(shell.shape[1]))
+		phase = torch.remainder(param[1], float(W)) / float(W)
+		return float(phase.detach().cpu())
 
 	def seed_patch_from_cylinder_shell(self, shell: torch.Tensor) -> torch.Tensor:
 		"""Sample a seed-centered regular mesh patch from a cylinder shell.
