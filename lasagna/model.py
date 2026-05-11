@@ -197,6 +197,15 @@ class ModelForwardNeeds:
 
 
 @dataclass(frozen=True)
+class SeedShellMetrics:
+	classification: str
+	signed_distance: float
+	abs_distance: float
+	tolerance: float
+	row_index: int
+
+
+@dataclass(frozen=True)
 class FitResult3D:
 	xyz_lr: torch.Tensor        # (D, Hm, Wm, 3) LR mesh in fullres voxels
 	xyz_hr: torch.Tensor | None # (D, He, We, 3) HR mesh
@@ -332,6 +341,8 @@ class Model3D(nn.Module):
 		self.cyl_shell_search_direction = 1
 		self.cyl_shell_search_initial_class: str | None = None
 		self.cyl_shell_search_last_class: str | None = None
+		self.cyl_shell_search_initial_signed_distance: float | None = None
+		self.cyl_shell_search_last_signed_distance: float | None = None
 		self.cyl_shell_search_crossed = False
 		self.cyl_shell_search_done = False
 
@@ -556,6 +567,8 @@ class Model3D(nn.Module):
 		self.cyl_shell_search_direction = 1
 		self.cyl_shell_search_initial_class = None
 		self.cyl_shell_search_last_class = None
+		self.cyl_shell_search_initial_signed_distance = None
+		self.cyl_shell_search_last_signed_distance = None
 		self.cyl_shell_search_crossed = False
 		self.cyl_shell_search_done = False
 		self.cylinder_enabled = True
@@ -861,13 +874,13 @@ class Model3D(nn.Module):
 		return self._unit_vertex_normals_for_shell(self.current_cylinder_shell_xyz())
 
 	@staticmethod
-	def classify_seed_against_shell(
+	def measure_seed_against_shell(
 		shell_xyz: torch.Tensor,
 		seed_xyz: torch.Tensor | tuple[float, float, float] | list[float],
 		*,
 		edge_tolerance: float = 1.0e-4,
-	) -> str:
-		"""Classify seed XY against the periodic shell row nearest seed z."""
+	) -> SeedShellMetrics:
+		"""Measure seed XY against the periodic shell row nearest seed z."""
 		if shell_xyz.ndim == 4 and int(shell_xyz.shape[0]) == 1:
 			shell_xyz = shell_xyz[0]
 		if shell_xyz.ndim != 3 or int(shell_xyz.shape[-1]) < 3:
@@ -897,9 +910,6 @@ class Model3D(nn.Module):
 			min_dist = float((proj - p).norm(dim=-1).amin().detach().cpu())
 			bbox_span = (poly.amax(dim=0) - poly.amin(dim=0)).norm()
 			tol = max(float(edge_tolerance), float(bbox_span.detach().cpu()) * 1.0e-7)
-			if min_dist <= tol:
-				return "edge"
-
 			x = float(p[0].detach().cpu())
 			y = float(p[1].detach().cpu())
 			inside = False
@@ -915,7 +925,32 @@ class Model3D(nn.Module):
 				x_cross = (xj - xi) * (y - yi) / ((yj - yi) if abs(yj - yi) > 1.0e-20 else 1.0e-20) + xi
 				if x < x_cross:
 					inside = not inside
-			return "inside" if inside else "outside"
+			if min_dist <= tol:
+				cls = "edge"
+				signed = 0.0
+			else:
+				cls = "inside" if inside else "outside"
+				signed = -min_dist if inside else min_dist
+			return SeedShellMetrics(
+				classification=cls,
+				signed_distance=float(signed),
+				abs_distance=float(min_dist),
+				tolerance=float(tol),
+				row_index=row_i,
+			)
+
+	@staticmethod
+	def classify_seed_against_shell(
+		shell_xyz: torch.Tensor,
+		seed_xyz: torch.Tensor | tuple[float, float, float] | list[float],
+		*,
+		edge_tolerance: float = 1.0e-4,
+	) -> str:
+		return Model3D.measure_seed_against_shell(
+			shell_xyz,
+			seed_xyz,
+			edge_tolerance=edge_tolerance,
+		).classification
 
 	def classify_seed_vs_current_cylinder_shell(
 		self,
@@ -926,6 +961,20 @@ class Model3D(nn.Module):
 		if seed is None:
 			seed = self.cyl_seed_xyz
 		return self.classify_seed_against_shell(
+			self.current_cylinder_shell_xyz().detach(),
+			seed,
+			edge_tolerance=edge_tolerance,
+		)
+
+	def measure_seed_vs_current_cylinder_shell(
+		self,
+		seed: torch.Tensor | tuple[float, float, float] | list[float] | None = None,
+		*,
+		edge_tolerance: float = 1.0e-4,
+	) -> SeedShellMetrics:
+		if seed is None:
+			seed = self.cyl_seed_xyz
+		return self.measure_seed_against_shell(
 			self.current_cylinder_shell_xyz().detach(),
 			seed,
 			edge_tolerance=edge_tolerance,
@@ -1048,6 +1097,49 @@ class Model3D(nn.Module):
 			self._set_shell_delta_xy_params(delta_xy.contiguous())
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(old_h, target_w, device=device, dtype=dtype))
 			self.cyl_shell_current_width_step = float(self.cyl_shell_width_target_step)
+			self.cyl_shell_active = True
+			self.cylinder_enabled = True
+			self.cyl_shell_mode = True
+			step_avg, step_min, step_max = self._shell_offset_stats()
+			wstep_avg, wstep_min, wstep_max = self._shell_width_step_stats()
+			print(f"[model] shell {int(self.cyl_shell_current_index) + 1}: "
+				  f"resampled width {old_w} -> {target_w} "
+				  f"wstep_target={self.cyl_shell_current_width_step:.1f} "
+				  f"offset_avg={step_avg:.1f} min={step_min:.1f} max={step_max:.1f} "
+				  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}",
+				  flush=True)
+
+	def resample_current_cylinder_shell_width_to_step(
+		self,
+		data: fit_data.FitData3D,
+		target_step: float,
+	) -> None:
+		target_step = float(target_step)
+		if target_step <= 0.0:
+			raise ValueError(f"target cylinder shell width step must be > 0, got {target_step}")
+		with torch.no_grad():
+			shell_opt = self.current_cylinder_shell_xyz().detach()
+			old_h = int(shell_opt.shape[0])
+			old_w = int(shell_opt.shape[1])
+			w_len = (torch.roll(shell_opt, shifts=-1, dims=1) - shell_opt).norm(dim=-1)
+			current_step = float(w_len.mean().detach().cpu())
+			if current_step <= 0.0:
+				target_w = old_w
+			else:
+				target_w = max(3, int(round(float(old_w) * current_step / target_step)))
+			shell = self._resample_shell_width(shell_opt, target_w)
+			device = self.cyl_params.device
+			dtype = self.cyl_params.dtype
+			z = shell[:, 0, 2].to(device=device, dtype=dtype)
+			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=target_w)
+			delta_xy = shell[..., :2].to(device=device, dtype=dtype) - base[..., :2]
+			self._set_shell_grid_shape(h=old_h, w=target_w)
+			self.cyl_shell_base = base.detach()
+			self.cyl_shell_dirs = dirs.detach()
+			self._set_shell_delta_xy_params(delta_xy.contiguous())
+			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(old_h, target_w, device=device, dtype=dtype))
+			self.cyl_shell_width_target_step = target_step
+			self.cyl_shell_current_width_step = target_step
 			self.cyl_shell_active = True
 			self.cylinder_enabled = True
 			self.cyl_shell_mode = True

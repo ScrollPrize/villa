@@ -35,26 +35,48 @@
 			"lr": 10.0,
 			"params": ["cyl_params"],
 			"args": {
+				"model-step": 1000.0,
 				"compile_cyl_normal": true,
 				"profile_opt": false
 			}
 		},
 		{
 			"name": "cyl_grow",
-			"steps": 100,
 			"lr": 10.0,
 			"params": ["cyl_params"],
+			"w_fac": {
+				"cyl_step": 10.0
+			},
 			"args": {
+				"model-step": 1000.0,
 				"compile_cyl_normal": true,
 				"profile_opt": false
 			}
 		},
 		{
 			"name": "cyl_refine",
-			"steps": 100,
-			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"steps": 500,
+			"lr": 10.0,
 			"params": ["cyl_params"],
+			"w_fac": {
+				"cyl_step": 10.0
+			},
 			"args": {
+				"model-step": 1000.0,
+				"compile_cyl_normal": true,
+				"profile_opt": false
+			}
+		},
+		{
+			"name": "cyl_polish",
+			"steps": 500,
+			"lr": 10.0,
+			"params": ["cyl_params"],
+			"w_fac": {
+				"cyl_step": 10.0
+			},
+			"args": {
+				"model-step": 200.0,
 				"compile_cyl_normal": true,
 				"profile_opt": false
 			}
