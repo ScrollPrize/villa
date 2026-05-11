@@ -32,6 +32,13 @@ add_executable(test_atomic_imwrite_multi test_atomic_imwrite_multi.cpp)
 target_link_libraries(test_atomic_imwrite_multi PRIVATE doctest::doctest vc_core)
 add_test(NAME test_atomic_imwrite_multi COMMAND test_atomic_imwrite_multi)
 
+# Opt-in smoke test that opens the minimal s1_ds2 volpkg pulled by
+# scripts/download_minimal_volpkg.sh. Skips at runtime when VC_TEST_VOLPKG
+# is unset, so the default ctest run remains hermetic.
+add_executable(test_volpkg_minimal_load test_volpkg_minimal_load.cpp)
+target_link_libraries(test_volpkg_minimal_load PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volpkg_minimal_load COMMAND test_volpkg_minimal_load)
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 # Bench has a generous wall-clock assertion; not part of default ctest
