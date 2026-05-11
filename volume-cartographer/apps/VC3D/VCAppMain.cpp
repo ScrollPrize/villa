@@ -122,13 +122,13 @@ auto main(int argc, char* argv[]) -> int
         qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
     }
 
-    // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
+    // Workaround for Qt dock widget issues on Wayland (QTBUG-87332).
     // Floating dock widgets become unmovable after initial drag on Wayland.
-    // Force XCB (X11/XWayland) platform to restore full functionality.
-    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
-        if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
-            qputenv("QT_QPA_PLATFORM", "xcb");
-        }
+    // Default Wayland sessions to XCB, but preserve explicit user choices such
+    // as QT_QPA_PLATFORM=wayland;xcb so Qt can try Wayland first.
+    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")
+        && !qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
+        qputenv("QT_QPA_PLATFORM", "xcb");
     }
 
     // VC3D uses traditional QWidget painting for the shell UI. Avoid Qt's
