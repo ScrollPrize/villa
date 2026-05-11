@@ -32,6 +32,10 @@ add_executable(test_atomic_imwrite_multi test_atomic_imwrite_multi.cpp)
 target_link_libraries(test_atomic_imwrite_multi PRIVATE doctest::doctest vc_core)
 add_test(NAME test_atomic_imwrite_multi COMMAND test_atomic_imwrite_multi)
 
+add_executable(test_post_process test_post_process.cpp)
+target_link_libraries(test_post_process PRIVATE doctest::doctest vc_core)
+add_test(NAME test_post_process COMMAND test_post_process)
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 # Bench has a generous wall-clock assertion; not part of default ctest

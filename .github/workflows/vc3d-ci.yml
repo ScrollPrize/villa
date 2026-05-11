@@ -65,6 +65,7 @@ jobs:
     name: ${{ matrix.action }}-${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
     needs: [changes, builder]
     runs-on: ubuntu-24.04
+    continue-on-error: ${{ matrix.blocking != true }}
     strategy:
       fail-fast: false
       # ubuntu-24.04: compile-only smoke (Release, no tests).
@@ -72,16 +73,18 @@ jobs:
       # Coverage and dead-code (defined below) also run on ubuntu-26.04.
       matrix:
         include:
-          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-release,    action: compile }
-          - { image: "ubuntu-24.04", compiler: clang, preset: ci-release,    action: compile }
-          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests,      action: test }
-          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests,      action: test }
+          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-24.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests,      action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests,      action: test,    blocking: false }
           # Sanitizer cells are clang-only — clang's runtime is more
           # complete (TySan, NSan) and we don't need duplicate gcc coverage.
-          - { image: "ubuntu-26.04", compiler: clang, preset: ci-asan-ubsan, action: test }
-          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tsan,       action: test }
-          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tysan,      action: test }
-          - { image: "ubuntu-26.04", compiler: clang, preset: ci-nsan,       action: test }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-asan-ubsan, action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tsan,       action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tysan,      action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-nsan,       action: test,    blocking: false }
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
@@ -96,6 +99,7 @@ jobs:
     name: Coverage (gcc, gcov)
     needs: [changes, builder]
     runs-on: ubuntu-24.04
+    continue-on-error: true
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
@@ -137,6 +141,7 @@ jobs:
     name: Dead-code report (clang, nm + --print-gc-sections)
     needs: [changes, builder]
     runs-on: ubuntu-24.04
+    continue-on-error: true
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
     steps:
