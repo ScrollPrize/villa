@@ -246,6 +246,14 @@ inline void fillBinarySliceBatchFromVolume(
         throw std::runtime_error(
             "fillBinarySliceBatchFromVolume currently supports uint8 volumes only");
     }
+    if (volume.fillValue() != 0.0) {
+        throw std::runtime_error(
+            "input volume has non-zero zarr fill_value (" +
+            std::to_string(volume.fillValue()) +
+            "); vc_gen_normalgrids requires fill_value=0 so that missing or "
+            "all-fill chunks can be treated as background. Re-export the "
+            "volume with fill_value=0 and retry.");
+    }
 
     const int sliceAxis = static_cast<int>(normalGridSliceAxis(direction));
     const int sourceSliceAxisLen = sourceChunkShape[sliceAxis];
