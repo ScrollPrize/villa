@@ -470,7 +470,15 @@ void QuadSurface::move(cv::Vec3f &ptr, const cv::Vec3f &offset)
 
 bool QuadSurface::valid(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
-    ensureLoaded();
+    try {
+        ensureLoaded();
+    } catch (const std::exception& e) {
+        Logger()->warn("Cannot validate surface '{}': {}", id, e.what());
+        return false;
+    }
+    if (!_points || _points->empty()) {
+        return false;
+    }
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
     return loc_valid_xy(*_points, {p[0], p[1]});
 }
@@ -478,7 +486,15 @@ bool QuadSurface::valid(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 
 cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) const
 {
-    const_cast<QuadSurface*>(this)->ensureLoaded();
+    try {
+        const_cast<QuadSurface*>(this)->ensureLoaded();
+    } catch (const std::exception& e) {
+        Logger()->warn("Cannot read surface coordinate '{}': {}", id, e.what());
+        return {-1, -1, -1};
+    }
+    if (!_points || _points->empty()) {
+        return {-1, -1, -1};
+    }
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
     cv::Rect bounds = {0,0,_points->cols-2,_points->rows-2};
@@ -500,7 +516,15 @@ cv::Vec3f QuadSurface::loc_raw(const cv::Vec3f &ptr)
 
 cv::Size QuadSurface::size()
 {
-    ensureLoaded();
+    try {
+        ensureLoaded();
+    } catch (const std::exception& e) {
+        Logger()->warn("Cannot read surface size '{}': {}", id, e.what());
+        return {};
+    }
+    if (!_points || _points->empty()) {
+        return {};
+    }
     return {static_cast<int>(_points->cols / _scale[0]), static_cast<int>(_points->rows / _scale[1])};
 }
 
@@ -522,7 +546,15 @@ cv::Vec2f QuadSurface::ptrToGrid(const cv::Vec3f& ptr) const
 
 cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
-    ensureLoaded();
+    try {
+        ensureLoaded();
+    } catch (const std::exception& e) {
+        Logger()->warn("Cannot read surface normal '{}': {}", id, e.what());
+        return {NAN, NAN, NAN};
+    }
+    if (!_points || _points->empty()) {
+        return {NAN, NAN, NAN};
+    }
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
     return grid_normal((*_points), p);
 }
@@ -553,7 +585,12 @@ void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
 
 cv::Mat QuadSurface::channel(const std::string& name, int flags)
 {
-    ensureLoaded();
+    try {
+        ensureLoaded();
+    } catch (const std::exception& e) {
+        Logger()->warn("Cannot read channel '{}' for surface '{}': {}", name, id, e.what());
+        return {};
+    }
     if (_channels.count(name)) {
         cv::Mat& channel = _channels[name];
         if (channel.empty()) {
@@ -1073,7 +1110,15 @@ float lookupDepthIndex(QuadSurface* surface, int row, int col)
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
-    ensureLoaded();
+    try {
+        ensureLoaded();
+    } catch (const std::exception& e) {
+        Logger()->warn("Cannot project onto surface '{}': {}", id, e.what());
+        return -1.0f;
+    }
+    if (!_points || _points->empty()) {
+        return -1.0f;
+    }
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
 

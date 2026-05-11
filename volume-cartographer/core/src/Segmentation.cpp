@@ -99,8 +99,17 @@ bool Segmentation::isSurfaceLoaded() const
 
 bool Segmentation::canLoadSurface() const
 {
-    return metadata_.contains("format") &&
-           metadata_["format"].get_string() == "tifxyz";
+    if (!metadata_.contains("format") ||
+        metadata_["format"].get_string() != "tifxyz") {
+        return false;
+    }
+    for (const auto* name : {"x.tif", "y.tif", "z.tif"}) {
+        if (!std::filesystem::is_regular_file(path_ / name)) {
+            Logger()->warn("Cannot load segment '{}': missing {}", id(), (path_ / name).string());
+            return false;
+        }
+    }
+    return true;
 }
 
 std::shared_ptr<QuadSurface> Segmentation::loadSurface()

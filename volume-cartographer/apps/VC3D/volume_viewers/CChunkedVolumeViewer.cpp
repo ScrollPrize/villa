@@ -2703,12 +2703,16 @@ void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forc
         surfacePoint = {projected[0], projected[1]};
         haveSurfacePoint = true;
     } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
-        cv::Vec3f ptr = quad->pointer();
-        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        if (quad->pointTo(ptr, point, 4.0f, 100, patchIndex) >= 0.0f) {
-            const cv::Vec3f loc = quad->loc(ptr);
-            surfacePoint = {loc[0], loc[1]};
-            haveSurfacePoint = true;
+        try {
+            cv::Vec3f ptr = quad->pointer();
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            if (quad->pointTo(ptr, point, 4.0f, 100, patchIndex) >= 0.0f) {
+                const cv::Vec3f loc = quad->loc(ptr);
+                surfacePoint = {loc[0], loc[1]};
+                haveSurfacePoint = true;
+            }
+        } catch (const std::exception& e) {
+            Logger()->warn("Skipping focus projection for surface '{}': {}", quad->id, e.what());
         }
     }
 
@@ -3925,7 +3929,14 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
     if (!plane) {
-        renderFlattenedIntersections(surf, reason, caller);
+        try {
+            renderFlattenedIntersections(surf, reason, caller);
+        } catch (const std::exception& e) {
+            Logger()->warn("Skipping flattened intersections for surface '{}': {}",
+                           surf ? surf->id : std::string{}, e.what());
+            invalidateIntersect();
+            _lastIntersectFp = {};
+        }
         profile.setDetails("action=delegated_flattened");
         return;
     }
@@ -4116,8 +4127,16 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
         _intersectionGeometryCache.targetHash = fp.targetHash;
         _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
-        _intersectionGeometryCache.intersections =
-            patchIndex->computePlaneIntersections(*plane, cacheRoi, targets);
+        try {
+            _intersectionGeometryCache.intersections =
+                patchIndex->computePlaneIntersections(*plane, cacheRoi, targets);
+        } catch (const std::exception& e) {
+            Logger()->warn("Skipping plane intersections: {}", e.what());
+            invalidateIntersect();
+            _lastIntersectFp = {};
+            _intersectionGeometryCache = {};
+            return;
+        }
         _intersectionGeometryCache.valid = true;
     }
 
