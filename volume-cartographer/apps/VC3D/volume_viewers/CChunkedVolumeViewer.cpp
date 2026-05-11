@@ -1005,14 +1005,18 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                 _surfacePtrY = projected[1];
             }
         } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
-            cv::Vec3f ptr = quad->pointer();
-            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-            if (quad->pointTo(ptr, *preservedViewCenter, 4.0f, 100, patchIndex) >= 0.0f) {
-                const cv::Vec3f loc = quad->loc(ptr);
-                if (std::isfinite(loc[0]) && std::isfinite(loc[1])) {
-                    _surfacePtrX = loc[0];
-                    _surfacePtrY = loc[1];
+            try {
+                cv::Vec3f ptr = quad->pointer();
+                auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+                if (quad->pointTo(ptr, *preservedViewCenter, 4.0f, 100, patchIndex) >= 0.0f) {
+                    const cv::Vec3f loc = quad->loc(ptr);
+                    if (std::isfinite(loc[0]) && std::isfinite(loc[1])) {
+                        _surfacePtrX = loc[0];
+                        _surfacePtrY = loc[1];
+                    }
                 }
+            } catch (const std::exception& e) {
+                Logger()->warn("Skipping preserved view projection for surface '{}': {}", quad->id, e.what());
             }
         }
     }
@@ -3009,12 +3013,17 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
         return surfaceToScene(proj[0], proj[1]);
     }
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
-        cv::Vec3f ptr = quad->pointer();
-        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        if (quad->pointTo(ptr, volPoint, 4.0f, 100, patchIndex) < 0.0f)
+        try {
+            cv::Vec3f ptr = quad->pointer();
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            if (quad->pointTo(ptr, volPoint, 4.0f, 100, patchIndex) < 0.0f)
+                return {};
+            const cv::Vec3f loc = quad->loc(ptr);
+            return surfaceToScene(loc[0], loc[1]);
+        } catch (const std::exception& e) {
+            Logger()->warn("Skipping volume-to-surface projection for surface '{}': {}", quad->id, e.what());
             return {};
-        const cv::Vec3f loc = quad->loc(ptr);
-        return surfaceToScene(loc[0], loc[1]);
+        }
     }
     return {};
 }

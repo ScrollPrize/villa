@@ -229,6 +229,10 @@ void SurfacePanelController::loadSurfacesIncremental()
         for (const auto& id : reloadedIds) {
             auto reloadedSurface = _volumePkg->getSurface(id);
             if (!reloadedSurface) {
+                const QString message = tr("Could not reload segment '%1'. Check that meta.json exists, then reload surfaces.")
+                                            .arg(QString::fromStdString(id));
+                std::cout << "[SurfacePanel] " << message.toStdString() << std::endl;
+                emit statusMessageRequested(message, 5000);
                 continue;
             }
 
@@ -456,6 +460,10 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
         }
         auto surf = _volumePkg->loadSurface(segId);
         if (!surf) {
+            const QString message = tr("Could not load segment '%1'. Check that meta.json exists, then reload surfaces.")
+                                        .arg(QString::fromStdString(segId));
+            std::cout << "[SurfacePanel] " << message.toStdString() << std::endl;
+            emit statusMessageRequested(message, 5000);
             return;
         }
         if (_state) {

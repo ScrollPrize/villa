@@ -450,7 +450,9 @@ private:
     mutable std::mutex _loadMutex;
 };
 
-std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags = 0);
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path,
+                                                   int flags = 0,
+                                                   const utils::Json* metadataOverride = nullptr);
 
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);

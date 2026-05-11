@@ -437,7 +437,7 @@ void QuadSurface::ensureLoaded()
         std::fprintf(stderr, "[SURF] load %s (from %s)\n",
                      id.c_str(), path.string().c_str());
     }
-    auto loaded = load_quad_from_tifxyz(path.string());
+    auto loaded = load_quad_from_tifxyz(path.string(), 0, meta.is_null() ? nullptr : &meta);
     if (!loaded) {
         throw std::runtime_error("Failed to load surface from: " + path.string());
     }
@@ -1579,7 +1579,9 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags)
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path,
+                                                   int flags,
+                                                   const utils::Json* metadataOverride)
 {
     auto read_band_into = [](const std::filesystem::path& fpath,
                              cv::Mat_<cv::Vec3f>& points,
@@ -1703,8 +1705,12 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int 
         TIFFClose(tif);
     };
 
-    // Read meta first (scale, uuid, etc.)
-    auto metadata = utils::Json::parse_file(std::filesystem::path(path)/"meta.json");
+    // Read meta first (scale, uuid, etc.). Lazy-loaded QuadSurface instances
+    // may already have metadata from construction; use it so a disappearing
+    // meta.json does not abort later viewer projection/render paths.
+    utils::Json metadata = (metadataOverride && !metadataOverride->is_null())
+        ? *metadataOverride
+        : utils::Json::parse_file(std::filesystem::path(path)/"meta.json");
     cv::Vec2f scale = {metadata["scale"][0].get_float(), metadata["scale"][1].get_float()};
 
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>();

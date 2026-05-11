@@ -80,6 +80,14 @@ bool isSegmentDir(const fs::path& dir)
     return Segmentation::checkDir(dir);
 }
 
+bool looksLikeTifxyzDir(const fs::path& dir)
+{
+    if (!fs::is_directory(dir)) return false;
+    return fs::exists(dir / "x.tif")
+        && fs::exists(dir / "y.tif")
+        && fs::exists(dir / "z.tif");
+}
+
 bool isNormalGridDir(const fs::path& dir)
 {
     if (!fs::is_directory(dir)) return false;
@@ -653,7 +661,14 @@ std::shared_ptr<QuadSurface> VolumePkg::loadSurface(const std::string& id)
         }
         seg = it->second;
     }
-    return seg->loadSurface();
+    try {
+        return seg->loadSurface();
+    } catch (const std::exception& e) {
+        Logger()->error("Failed to load surface for {}: {}", id, e.what());
+    } catch (...) {
+        Logger()->error("Failed to load surface for {}: unknown error", id);
+    }
+    return nullptr;
 }
 
 std::shared_ptr<QuadSurface> VolumePkg::getSurface(const std::string& id)
@@ -899,7 +914,11 @@ void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e)
         loadOne(path);
     } else {
         for (const auto& child : immediateSubdirs(path)) {
-            if (isSegmentDir(child)) loadOne(child);
+            if (isSegmentDir(child)) {
+                loadOne(child);
+            } else if (looksLikeTifxyzDir(child)) {
+                Logger()->warn("Skipping segment '{}': missing meta.json", child.string());
+            }
         }
     }
 }
@@ -1074,6 +1093,12 @@ bool VolumePkg::addSingleSegmentation(const std::string& id)
     if (outDir.empty()) return false;
     const auto segPath = outDir / id;
     if (!fs::is_directory(segPath)) return false;
+    if (!fs::exists(segPath / "meta.json")) {
+        if (looksLikeTifxyzDir(segPath)) {
+            Logger()->warn("Skipping segment '{}': missing meta.json", segPath.string());
+        }
+        return false;
+    }
     try {
         auto s = Segmentation::New(segPath);
         std::lock_guard<std::mutex> lk(segmentsMutex_);
