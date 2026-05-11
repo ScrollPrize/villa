@@ -44,3 +44,41 @@ target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 if(VC_RUN_BENCHES)
     add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
 endif()
+
+# Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
+# triggers a violation that the matching sanitizer must report; ctest
+# expects the abort and matches the report text via PASS_REGULAR_EXPRESSION.
+# A miss (sanitizer not actually instrumenting) makes the canary exit 0,
+# which fails the test — that's the whole point.
+set(_canary_srcs sanitizer_canary.cpp)
+if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN OR VC_ENABLE_LSAN
+   OR VC_ENABLE_TYSAN OR VC_ENABLE_NSAN)
+    list(APPEND _canary_srcs "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.c")
+endif()
+add_executable(sanitizer_canary ${_canary_srcs})
+set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+# ctest: PASS_REGULAR_EXPRESSION matched anywhere in stdout/stderr passes the
+# test regardless of exit code. If the sanitizer fires and prints its name
+# the test passes; if it doesn't fire (sanitizer not actually instrumenting)
+# the canary exits 0 without the regex match and the test fails.
+function(_add_canary name arg regex)
+    add_test(NAME ${name} COMMAND sanitizer_canary ${arg})
+    set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
+endfunction()
+
+if(VC_ENABLE_ASAN)
+    _add_canary(sanitizer_canary_asan  asan  "AddressSanitizer")
+endif()
+if(VC_ENABLE_UBSAN)
+    _add_canary(sanitizer_canary_ubsan ubsan "runtime error|UndefinedBehaviorSanitizer")
+endif()
+if(VC_ENABLE_TSAN)
+    _add_canary(sanitizer_canary_tsan  tsan  "ThreadSanitizer")
+endif()
+if(VC_ENABLE_TYSAN)
+    _add_canary(sanitizer_canary_tysan tysan "TypeSanitizer")
+endif()
+if(VC_ENABLE_NSAN)
+    _add_canary(sanitizer_canary_nsan  nsan  "NumericalStabilitySanitizer")
+endif()
