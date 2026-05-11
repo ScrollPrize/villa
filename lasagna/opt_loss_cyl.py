@@ -857,10 +857,13 @@ def cyl_z_center_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tupl
 
 
 def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Move shell vertices along outward GT normals by the current signed seed distance."""
-	xyz = _shell_xyz(res)
+	"""Move supersampled shell points along outward GT normals by the current signed seed distance."""
+	geom = _shell_geometry(res=res, factor=4)
 	signed_raw = getattr(res, "cyl_seed_signed_distance", None)
-	if xyz is None or signed_raw is None:
+	if geom is None or signed_raw is None:
+		return _zero_loss(res)
+	xyz = geom["xyz"]
+	if not isinstance(xyz, torch.Tensor):
 		return _zero_loss(res)
 	signed = xyz.new_tensor(float(signed_raw))
 	if not bool(torch.isfinite(signed).detach().cpu()) or abs(float(signed.detach().cpu())) <= 1.0e-6:
@@ -869,11 +872,7 @@ def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tup
 	if target is None or mask is None:
 		return _zero_loss(res)
 	normal = _outward_oriented_shell_gt_normal(res=res, xyz=xyz, target=target)
-	scale_value = max(
-		1.0,
-		float(getattr(res, "cyl_shell_width_step", 0.0)),
-		float(getattr(res, "cyl_shell_height_step", 0.0)),
-	)
+	scale_value = max(1.0, float(getattr(res.params, "mesh_step", 1.0)))
 	scale = xyz.new_tensor(scale_value)
 	proxy = xyz.detach() + normal * signed.detach()
 	lm = ((xyz - proxy).norm(dim=-1) / scale).square()
