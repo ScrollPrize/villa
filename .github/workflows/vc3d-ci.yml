@@ -16,6 +16,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
       dockerfile: ${{ steps.filter.outputs.dockerfile }}
@@ -38,6 +39,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.vc != 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - run: echo "No volume-cartographer changes — skipping build."
 
@@ -46,6 +48,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.vc == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +68,7 @@ jobs:
     name: ${{ matrix.action }}-${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
     needs: [changes, builder]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     continue-on-error: ${{ matrix.blocking != true }}
     strategy:
       fail-fast: false
@@ -99,6 +103,7 @@ jobs:
     name: Coverage (gcc, gcov)
     needs: [changes, builder]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     continue-on-error: true
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
@@ -141,6 +146,7 @@ jobs:
     name: Dead-code report (clang, nm + --print-gc-sections)
     needs: [changes, builder]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     continue-on-error: true
     env:
       VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
