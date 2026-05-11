@@ -139,6 +139,7 @@ class Model3D(nn.Module):
 		self.cyl_shell_step = 500.0
 		self.cyl_shell_initial_step = 10.0
 		self.cyl_shell_growth_factor = 1.5
+		self.cyl_shell_optimize_resampled = False
 		self.cyl_shell_use_conn_offsets = False
 		self.cyl_shell_z_step = 200.0
 		self.cyl_shell_width_target_step = 200.0
@@ -673,7 +674,9 @@ class Model3D(nn.Module):
 			  f"wstep_avg={wstep_avg:.1f} min={wstep_min:.1f} max={wstep_max:.1f}", flush=True)
 
 	def cylinder_shell_pass_count(self, idx: int) -> int:
-		return 1 if int(idx) <= 0 else 2
+		if int(idx) <= 0:
+			return 1
+		return 2 if bool(getattr(self, "cyl_shell_optimize_resampled", False)) else 1
 
 	def resample_current_cylinder_shell_width_for_growth(self, data: fit_data.FitData3D) -> None:
 		with torch.no_grad():

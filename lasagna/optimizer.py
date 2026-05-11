@@ -802,7 +802,8 @@ def optimize(
 					_shell_status_labels.append(f"{label}.shell{shell_i + 1}")
 				else:
 					_shell_status_labels.append(f"{label}.shell{shell_i + 1}.grow")
-					_shell_status_labels.append(f"{label}.shell{shell_i + 1}.resampled")
+					if bool(getattr(model, "cyl_shell_optimize_resampled", False)):
+						_shell_status_labels.append(f"{label}.shell{shell_i + 1}.resampled")
 			shell_start = start_shell + 1
 			shell_end = start_shell + len(shell_indices)
 			pass_mode = (
@@ -861,8 +862,11 @@ def optimize(
 				else:
 					shell_passes = [
 						(f"{label}.shell{shell_i + 1}.grow", shell_eff, False, _base_wstep, _grow_wstep),
-						(f"{label}.shell{shell_i + 1}.resampled", shell_eff, True, _base_wstep, _base_wstep),
 					]
+					if bool(getattr(model, "cyl_shell_optimize_resampled", False)):
+						shell_passes.append(
+							(f"{label}.shell{shell_i + 1}.resampled", shell_eff, True, _base_wstep, _base_wstep)
+						)
 
 				for shell_label, pass_eff, needs_resample, wstep_start, wstep_end in shell_passes:
 					if needs_resample:
@@ -959,12 +963,21 @@ def optimize(
 							)
 							_t_steps_acc = 0
 							_t_wall_start = _t_wall_now
-						if snap_int > 0 and (step1 % snap_int) == 0:
-							snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
-										loss=float(loss.detach().cpu()), data=data, res=res)
+					if snap_int > 0 and (step1 % snap_int) == 0:
+						snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
+									loss=float(loss.detach().cpu()), data=data, res=res)
 
 					snapshot_fn(stage=shell_label.replace(".", "_"), step=max_steps,
 								loss=float(loss.detach().cpu()), data=data, res=res)
+					if (
+						shell_i > 0
+						and not needs_resample
+						and not bool(getattr(model, "cyl_shell_optimize_resampled", False))
+					):
+						if not hasattr(model, "resample_current_cylinder_shell_width_for_growth"):
+							raise RuntimeError("shell grow pass requested, but model cannot resample cylinder shell width")
+						model.resample_current_cylinder_shell_width_for_growth(data)
+						print(f"[optimizer] {shell_label}: resampled without reopt", flush=True)
 
 				if hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)

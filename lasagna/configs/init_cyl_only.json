@@ -37,7 +37,7 @@
 		},
 		{
 			"name": "cylinder_seed",
-			"steps": 1000,
+			"steps": 2000,
 			"lr": 10.0,
 			"params": ["cyl_params"]
 		}
