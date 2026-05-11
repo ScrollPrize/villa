@@ -108,6 +108,13 @@ if [[ ! -x "$llvm_bin/clang++" ]]; then
   exit 1
 fi
 
+# Homebrew LLVM's clang++ needs SDKROOT pointing at the active Xcode/CLT SDK
+# so its libc++ headers compose correctly with the C SDK headers (otherwise
+# Xcode 16's _string.h sees `size_t` in std:: only and fails to compile).
+if command -v xcrun >/dev/null 2>&1; then
+  export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
+fi
+
 extra_cmake_args=()
 if [[ -d "$brew_prefix/Cellar/eigen/3.4.0_1/share/eigen3/cmake" ]]; then
   extra_cmake_args+=("-DEigen3_DIR=$brew_prefix/Cellar/eigen/3.4.0_1/share/eigen3/cmake")
