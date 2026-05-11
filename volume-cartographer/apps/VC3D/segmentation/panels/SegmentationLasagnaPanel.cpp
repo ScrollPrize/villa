@@ -792,11 +792,28 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         }
     }
 
+    std::filesystem::path outputSegmentsPath;
+    if (state && state->vpkg()) {
+        outputSegmentsPath = state->vpkg()->outputSegmentsPath();
+        if (outputSegmentsPath.empty()) {
+            outputSegmentsPath = state->vpkg()->findSegmentPathByName(
+                state->vpkg()->getSegmentationDirectory());
+        }
+        if (outputSegmentsPath.empty()) {
+            auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
+            outputSegmentsPath = vpkgRoot / "paths";
+        }
+        outputSegmentsPath = std::filesystem::absolute(outputSegmentsPath).lexically_normal();
+    }
+
     std::filesystem::path segPath;
     if (state) {
         auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
         if (activeSurface && !activeSurface->path.empty()) {
             segPath = activeSurface->path;
+            if (segPath.is_relative() && !outputSegmentsPath.empty()) {
+                segPath = outputSegmentsPath / segPath.filename();
+            }
         }
     }
 
@@ -830,12 +847,11 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     }
 
     QString outputDir;
-    if (!segPath.empty()) {
-        outputDir = QString::fromStdString(segPath.parent_path().string());
-    } else if (state && state->vpkg()) {
-        auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
-        auto segDir = vpkgRoot / state->vpkg()->getSegmentationDirectory();
-        outputDir = QString::fromStdString(segDir.string());
+    if (!outputSegmentsPath.empty()) {
+        outputDir = QString::fromStdString(outputSegmentsPath.string());
+    } else if (!segPath.empty()) {
+        outputDir = QString::fromStdString(
+            std::filesystem::absolute(segPath.parent_path()).lexically_normal().string());
     }
 
     const std::string tifxyzSuffix = ".tifxyz";
