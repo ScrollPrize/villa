@@ -244,6 +244,7 @@ class FitResult3D:
 	cyl_shell_width_step: float = 0.0
 	cyl_shell_height_step: float = 0.0
 	cyl_seed_z: float = 0.0
+	cyl_seed_signed_distance: float | None = None
 	cyl_z_center_target: float = 0.0
 	cyl_shell_base_xyz: torch.Tensor | None = None
 	cyl_shell_dirs: torch.Tensor | None = None
@@ -3010,8 +3011,12 @@ class Model3D(nn.Module):
 			cyl_shell_mode=bool(self.cyl_shell_mode and self.cylinder_enabled),
 			cyl_shell_step=float(getattr(self, "cyl_shell_current_radius", self._current_shell_target_offset())),
 			cyl_shell_width_step=float(getattr(self, "cyl_shell_current_width_step", self.cyl_shell_width_target_step)),
-			cyl_shell_height_step=float(getattr(self, "cyl_shell_current_height_step", getattr(self, "cyl_shell_z_step", self.params.mesh_step))),
+			cyl_shell_height_step=float(getattr(self, "cyl_shell_z_step", getattr(self, "cyl_shell_current_height_step", self.params.mesh_step))),
 			cyl_seed_z=float(self.cyl_seed_xyz[2].detach().cpu()) if self.cyl_seed_xyz.numel() >= 3 else 0.0,
+			cyl_seed_signed_distance=(
+				None if getattr(self, "cyl_shell_search_last_signed_distance", None) is None
+				else float(getattr(self, "cyl_shell_search_last_signed_distance"))
+			),
 			cyl_z_center_target=float(getattr(self, "cyl_shell_z_center_target", self.cyl_shell_seed_z)),
 			cyl_shell_base_xyz=cyl_shell_base_xyz,
 			cyl_shell_dirs=cyl_shell_dirs,

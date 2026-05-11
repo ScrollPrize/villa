@@ -81,6 +81,7 @@ def _active_terms(weights: dict[str, float]) -> dict[str, float]:
 			"cyl_smooth",
 			"cyl_z_smooth",
 			"cyl_z_center",
+			"cyl_seed_push",
 			"cyl_step",
 			"cyl_radial_mean",
 			"cyl_bend",
@@ -204,6 +205,29 @@ def _shell_spacing_scales(xyz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 			h_scale = xyz.new_tensor(1.0)
 		w_scale = (torch.roll(xyz, shifts=-1, dims=1) - xyz).norm(dim=-1).mean().clamp(min=1.0)
 	return h_scale, w_scale
+
+
+def _shell_height_tangent_dirs(xyz: torch.Tensor) -> torch.Tensor | None:
+	H = int(xyz.shape[0])
+	if H <= 1:
+		return None
+	with torch.no_grad():
+		h_vec = torch.empty_like(xyz)
+		if H == 2:
+			edge = xyz[1] - xyz[0]
+			h_vec[0] = edge
+			h_vec[1] = edge
+		else:
+			h_vec[0] = xyz[1] - xyz[0]
+			h_vec[1:-1] = 0.5 * (xyz[2:] - xyz[:-2])
+			h_vec[-1] = xyz[-1] - xyz[-2]
+		orient = torch.where(
+			h_vec[..., 2].mean() < 0.0,
+			h_vec.new_tensor(-1.0),
+			h_vec.new_tensor(1.0),
+		)
+		h_dir = F.normalize(h_vec, dim=-1, eps=1.0e-8) * orient
+	return h_dir
 
 
 def _periodic_interp_width(xyz: torch.Tensor, target_w: int) -> torch.Tensor:
@@ -396,6 +420,26 @@ def _normal_align_lm(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, to
 	b = F.normalize(b, dim=-1, eps=1.0e-8)
 	dot_abs = (a * b).sum(dim=-1).clamp(min=-1.0, max=1.0).abs()
 	return 1.0 - dot_abs * dot_abs, dot_abs
+
+
+def _outward_oriented_shell_gt_normal(
+	*,
+	res: fit_model.FitResult3D,
+	xyz: torch.Tensor,
+	target: torch.Tensor,
+) -> torch.Tensor:
+	target_n = F.normalize(target, dim=-1, eps=1.0e-8)
+	with torch.no_grad():
+		umb_xy = res.data.umbilicus_xy_at_z(xyz.detach()[..., 2])
+		radial_xy = xyz.detach()[..., :2] - umb_xy
+		radial_len = radial_xy.norm(dim=-1)
+		target_xy_len = target_n.detach()[..., :2].norm(dim=-1)
+		radial_dot = (target_n.detach()[..., :2] * radial_xy).sum(dim=-1)
+		shell_n = _unit_normals_for_shell_xyz(xyz.detach())
+		shell_dot = (target_n.detach() * shell_n).sum(dim=-1)
+		use_radial = (radial_len > 1.0e-7) & (target_xy_len > 1.0e-7)
+		flip = torch.where(use_radial, radial_dot < 0.0, shell_dot < 0.0)
+	return torch.where(flip.unsqueeze(-1), -target_n, target_n)
 
 
 def _shell_normal_geometry_core(
@@ -796,14 +840,44 @@ def cyl_z_smooth_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tupl
 
 
 def cyl_z_center_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Keep the shell's average z near the prepared init z center."""
+	"""Keep the shell's average z near the init center by moving along shell H."""
 	xyz = _shell_xyz(res)
 	if xyz is None:
 		return _zero_loss(res)
 	target = xyz.new_tensor(float(getattr(res, "cyl_z_center_target", getattr(res, "cyl_seed_z", 0.0))))
 	scale = xyz.new_tensor(max(1.0, float(getattr(res, "cyl_shell_height_step", 1.0))))
-	lm = ((xyz[..., 2].mean() - target) / scale).square().view(1)
+	z_error = xyz[..., 2].mean() - target
+	h_dir = _shell_height_tangent_dirs(xyz)
+	if h_dir is None:
+		lm = (z_error / scale).square().view(1)
+	else:
+		proxy = xyz.detach() - h_dir * z_error.detach()
+		lm = ((xyz - proxy).norm(dim=-1) / scale).square()
 	return _register_shell_term("cyl_z_center", lm, res=res)
+
+
+def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Move shell vertices along outward GT normals by the current signed seed distance."""
+	xyz = _shell_xyz(res)
+	signed_raw = getattr(res, "cyl_seed_signed_distance", None)
+	if xyz is None or signed_raw is None:
+		return _zero_loss(res)
+	signed = xyz.new_tensor(float(signed_raw))
+	if not bool(torch.isfinite(signed).detach().cpu()) or abs(float(signed.detach().cpu())) <= 1.0e-6:
+		return _zero_loss(res)
+	target, mask = _sample_shell_gt(res=res, xyz=xyz)
+	if target is None or mask is None:
+		return _zero_loss(res)
+	normal = _outward_oriented_shell_gt_normal(res=res, xyz=xyz, target=target)
+	scale_value = max(
+		1.0,
+		float(getattr(res, "cyl_shell_width_step", 0.0)),
+		float(getattr(res, "cyl_shell_height_step", 0.0)),
+	)
+	scale = xyz.new_tensor(scale_value)
+	proxy = xyz.detach() + normal * signed.detach()
+	lm = ((xyz - proxy).norm(dim=-1) / scale).square()
+	return _register_shell_masked_term("cyl_seed_push", lm, mask, res=res)
 
 
 def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
