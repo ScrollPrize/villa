@@ -233,6 +233,7 @@ class FitResult3D:
 	cyl_count: int = 0
 	cyl_shell_mode: bool = False
 	cyl_shell_step: float = 500.0
+	cyl_shell_sphere_radius: float = 500.0
 	cyl_shell_width_step: float = 0.0
 	cyl_shell_height_step: float = 0.0
 	cyl_seed_z: float = 0.0
@@ -323,15 +324,17 @@ class Model3D(nn.Module):
 		self.cyl_shell_n_scales = 5
 		self.cyl_shell_target_count = 4
 		self.cyl_shell_initial_radius = 2000.0
+		self.cyl_shell_target_radius = self.cyl_shell_initial_radius
 		self.cyl_shell_step = 500.0
 		self.cyl_shell_initial_step = 10.0
 		self.cyl_shell_growth_factor = 1.5
 		self.cyl_shell_optimize_resampled = False
 		self.cyl_shell_use_conn_offsets = False
 		self.cyl_shell_z_step = 1000.0
+		self.cyl_shell_current_height_step = self.cyl_shell_z_step
 		self.cyl_shell_width_target_step = 1000.0
 		self.cyl_shell_current_width_step = self.cyl_shell_width_target_step
-		self.cyl_shell_min_width = 20
+		self.cyl_shell_current_radius = self.cyl_shell_initial_radius
 		self.cyl_shell_seed_z = float(z_center)
 		self.cyl_shell_z_center_target = float(z_center)
 		self.cyl_shell_model_h: float | None = None
@@ -558,7 +561,6 @@ class Model3D(nn.Module):
 			self.cyl_params = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, 3, device=device, dtype=torch.float32))
 			self.cyl_shell_delta_ms = nn.ParameterList()
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
-		model_w_value = float(model_w)
 		requested_model_h = max(1.0, float(model_h))
 		init_z0 = float(seed[2]) - requested_model_h
 		init_z1 = float(seed[2]) + requested_model_h
@@ -573,7 +575,7 @@ class Model3D(nn.Module):
 			)
 		self.params = replace(
 			self.params,
-			model_w=(model_w_value if model_w_value > 0.0 else None),
+			model_w=(float(model_w) if float(model_w) > 0.0 else None),
 			model_h=float(model_h),
 		)
 		self.cyl_shell_mode = True
@@ -632,26 +634,72 @@ class Model3D(nn.Module):
 		dtype = self.cyl_params.dtype
 		z_step = max(1.0, float(self.cyl_shell_z_step))
 		model_h = max(1.0, float(self.cyl_shell_model_h))
-		H = max(2, int(math.ceil(model_h / z_step)) + 1)
-		actual_z_step = model_h / float(max(1, H - 1))
-		radius0 = self._first_shell_radius()
-		W = self._shell_width_for_radius(radius0)
+		z0 = float(self.cyl_shell_z_center_target) - 0.5 * model_h
+		z1 = float(self.cyl_shell_z_center_target) + 0.5 * model_h
+		axis_len = self._straight_umbilicus_axis_length(data=data, z0=z0, z1=z1, device=device, dtype=dtype)
+		H = max(2, int(math.ceil(axis_len / z_step)) + 1)
+		radius_target = self._first_shell_radius()
+		self.cyl_shell_target_radius = float(radius_target)
+		W = self._shell_width_for_radius(radius_target)
+		radius0 = radius_target
+		self.cyl_shell_current_radius = float(radius0)
 		self._set_shell_grid_shape(h=H, w=W)
 		z = self._shell_z_values(device=device, dtype=dtype, h=H)
-		base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
+		base, dirs, actual_h_step = self._straight_umbilicus_base_shell(data=data, z=z, w=W)
+		self.cyl_shell_current_height_step = float(actual_h_step)
 		self.cyl_shell_z = z.detach()
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
 		self._set_shell_delta_xyz_params(
-			self._initial_shell_delta_xyz(dirs, target_step=self._shell_target_offset_for_index(0)).to(device=device, dtype=dtype)
+			self._initial_shell_delta_xyz(dirs, target_step=radius0).to(device=device, dtype=dtype)
 		)
 		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
 		print(f"[model] umbilicus tube init: search_max_shells={self.cyl_shell_search_max_shells} "
 			  f"H={H} W={W} seed_z={self.cyl_shell_seed_z:.1f} "
 			  f"z_center_target={self.cyl_shell_z_center_target:.1f} "
-			  f"model_h={model_h:.1f} z_step={actual_z_step:.1f} "
-			  f"z_step_target={z_step:.1f} initial_radius={radius0:.1f} "
+			  f"model_h={model_h:.1f} h_step={float(actual_h_step):.1f} "
+			  f"z_step_target={z_step:.1f} target_radius={radius_target:.1f} "
+			  f"initial_radius={radius0:.1f} "
 			  f"step_growth={float(getattr(self, 'cyl_shell_growth_factor', 1.5)):.3g} "
+			  f"width_target_step={self.cyl_shell_width_target_step:.1f}",
+			  flush=True)
+
+	def prepare_umbilicus_tube_pre_init(self, data: fit_data.FitData3D) -> None:
+		"""Build the pre-init shell as offset XY circles following the umbilicus."""
+		if not self.cyl_shell_mode or self.cyl_shell_base is not None:
+			return
+		if self.cyl_shell_model_h is None:
+			raise ValueError("cylinder shell pre-init missing model_h")
+		device = self.cyl_params.device
+		dtype = self.cyl_params.dtype
+		z_step = max(1.0, float(self.cyl_shell_z_step))
+		model_h = max(1.0, float(self.cyl_shell_model_h))
+		H = max(2, int(math.ceil(model_h / z_step)) + 1)
+		radius_target = self._first_shell_radius()
+		self.cyl_shell_target_radius = float(radius_target)
+		W = self._shell_width_for_radius(radius_target)
+		radius0 = radius_target
+		self.cyl_shell_current_radius = float(radius0)
+		self._set_shell_grid_shape(h=H, w=W)
+		z = self._shell_z_values(device=device, dtype=dtype, h=H)
+		base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
+		delta_xyz = self._initial_shell_delta_xyz(dirs, target_step=radius0).to(device=device, dtype=dtype)
+		shell = base + delta_xyz
+		if H > 1:
+			self.cyl_shell_current_height_step = float((shell[1:] - shell[:-1]).norm(dim=-1).mean().detach().cpu())
+		self.cyl_shell_z = z.detach()
+		self.cyl_shell_base = base.detach()
+		self.cyl_shell_dirs = dirs.detach()
+		self._set_shell_delta_xyz_params(delta_xyz)
+		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(H, W, device=device, dtype=dtype))
+		self.cyl_shell_current_index = 0
+		self.cyl_shell_active = True
+		print(f"[model] umbilicus tube pre-init: search_max_shells={self.cyl_shell_search_max_shells} "
+			  f"H={H} W={W} seed_z={self.cyl_shell_seed_z:.1f} "
+			  f"z_center_target={self.cyl_shell_z_center_target:.1f} "
+			  f"model_h={model_h:.1f} h_step={self.cyl_shell_current_height_step:.1f} "
+			  f"z_step_target={z_step:.1f} target_radius={radius_target:.1f} "
+			  f"initial_radius={radius0:.1f} "
 			  f"width_target_step={self.cyl_shell_width_target_step:.1f}",
 			  flush=True)
 
@@ -667,9 +715,23 @@ class Model3D(nn.Module):
 		return float(self.cyl_shell_z_center_target) + t * float(model_h)
 
 	def _shell_width_for_radius(self, radius: float) -> int:
-		step = max(1.0, float(self.cyl_shell_width_target_step))
-		circ = max(0.0, 2.0 * math.pi * float(radius))
-		return max(int(self.cyl_shell_min_width), int(math.ceil(circ / step)))
+		radius = max(1.0, float(radius))
+		target_step = max(1.0, float(self.cyl_shell_width_target_step))
+		max_step = 2.0 * radius * math.sin(math.pi / 3.0)
+		if target_step >= max_step:
+			return 3
+		ratio = min(max(target_step / (2.0 * radius), 1.0e-12), math.sin(math.pi / 3.0))
+		continuous_w = math.pi / math.asin(ratio)
+		near = int(round(continuous_w))
+		candidates = {3}
+		for w in range(max(3, near - 3), max(3, near + 3) + 1):
+			candidates.add(w)
+
+		def _err(w: int) -> tuple[float, int]:
+			chord = 2.0 * radius * math.sin(math.pi / float(w))
+			return abs(chord - target_step), w
+
+		return min(candidates, key=_err)
 
 	def _first_shell_radius(self) -> float:
 		return max(1.0, float(getattr(self, "cyl_shell_initial_radius", self.cyl_shell_step)))
@@ -712,6 +774,66 @@ class Model3D(nn.Module):
 			torch.zeros(int(z.shape[0]), w, 1, device=device, dtype=dtype),
 		], dim=-1)
 		return base, dirs
+
+	def _straight_umbilicus_axis_length(
+		self,
+		*,
+		data: fit_data.FitData3D,
+		z0: float,
+		z1: float,
+		device: torch.device,
+		dtype: torch.dtype,
+	) -> float:
+		z_pair = torch.tensor([float(z0), float(z1)], device=device, dtype=dtype)
+		umb_xy = data.umbilicus_xy_at_z(z_pair).to(device=device, dtype=dtype)
+		p0 = torch.cat([umb_xy[0], z_pair[:1]], dim=0)
+		p1 = torch.cat([umb_xy[1], z_pair[1:]], dim=0)
+		length = (p1 - p0).norm().clamp(min=1.0)
+		return float(length.detach().cpu())
+
+	def _straight_umbilicus_base_shell(
+		self,
+		*,
+		data: fit_data.FitData3D,
+		z: torch.Tensor,
+		w: int,
+	) -> tuple[torch.Tensor, torch.Tensor, float]:
+		device = z.device
+		dtype = z.dtype
+		H = int(z.shape[0])
+		angles = torch.arange(w, device=device, dtype=dtype) * (2.0 * math.pi / float(w))
+		dir_xy = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+		if H <= 1:
+			center_xy = data.umbilicus_xy_at_z(z).to(device=device, dtype=dtype)
+			center = torch.cat([center_xy, z[:, None]], dim=-1)
+			dirs = torch.cat([
+				dir_xy[None, :, :].expand(H, w, 2),
+				torch.zeros(H, w, 1, device=device, dtype=dtype),
+			], dim=-1)
+			axis_step = 1.0
+		else:
+			z_pair = torch.stack([z[0], z[-1]])
+			umb_xy = data.umbilicus_xy_at_z(z_pair).to(device=device, dtype=dtype)
+			denom = (z_pair[1] - z_pair[0]).clamp(min=1.0e-8)
+			t = ((z - z_pair[0]) / denom).view(H, 1)
+			p0 = torch.cat([umb_xy[0], z_pair[:1]], dim=0)
+			p1 = torch.cat([umb_xy[1], z_pair[1:]], dim=0)
+			axis_vec = p1 - p0
+			axis_len = axis_vec.norm().clamp(min=1.0e-8)
+			axis = axis_vec / axis_len
+			ref_z = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+			ref_x = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+			ref = torch.where(axis[2].abs() > 0.95, ref_x, ref_z)
+			u = F.normalize(torch.cross(ref, axis, dim=0), dim=0, eps=1.0e-8)
+			v = F.normalize(torch.cross(axis, u, dim=0), dim=0, eps=1.0e-8)
+			center = p0.view(1, 3) + t * axis_vec.view(1, 3)
+			dirs = (
+				torch.cos(angles).view(1, w, 1) * u.view(1, 1, 3)
+				+ torch.sin(angles).view(1, w, 1) * v.view(1, 1, 3)
+			).expand(H, w, 3)
+			axis_step = float((axis_len / float(max(1, H - 1))).detach().cpu())
+		base = center[:, None, :].expand(H, w, 3)
+		return base, dirs, max(1.0, float(axis_step))
 
 	@staticmethod
 	def _unit_vertex_normals_for_shell(xyz: torch.Tensor) -> torch.Tensor:
@@ -841,7 +963,7 @@ class Model3D(nn.Module):
 
 	def _shell_offset_stats(self) -> tuple[float, float, float]:
 		with torch.no_grad():
-			dist = self._shell_delta_xyz_params()[..., :2].norm(dim=-1)
+			dist = self._shell_delta_xyz_params().norm(dim=-1)
 			return (
 				float(dist.mean().detach().cpu()),
 				float(dist.amin().detach().cpu()),
@@ -1142,8 +1264,17 @@ class Model3D(nn.Module):
 		if idx == 0:
 			if self.cyl_shell_z is None:
 				raise ValueError("missing initial shell z values")
-			W = self._shell_width_for_radius(self._first_shell_radius())
-			base, dirs = self._umbilicus_base_shell(data=data, z=self.cyl_shell_z.to(device=device, dtype=dtype), w=W)
+			radius_target = self._first_shell_radius()
+			self.cyl_shell_target_radius = float(radius_target)
+			W = self._shell_width_for_radius(radius_target)
+			target_offset = radius_target
+			self.cyl_shell_current_radius = float(target_offset)
+			base, dirs, actual_h_step = self._straight_umbilicus_base_shell(
+				data=data,
+				z=self.cyl_shell_z.to(device=device, dtype=dtype),
+				w=W,
+			)
+			self.cyl_shell_current_height_step = float(actual_h_step)
 			delta_xyz = self._initial_shell_delta_xyz(dirs, target_step=target_offset).to(device=device, dtype=dtype)
 		else:
 			if len(self.cyl_shell_completed) < idx:
@@ -1153,6 +1284,8 @@ class Model3D(nn.Module):
 			z = prev[:, 0, 2].detach()
 			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
 			delta_xyz = prev - base
+			if int(prev.shape[0]) > 1:
+				self.cyl_shell_current_height_step = float((prev[1:] - prev[:-1]).norm(dim=-1).mean().detach().cpu())
 		H = int(base.shape[0])
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
@@ -1179,6 +1312,8 @@ class Model3D(nn.Module):
 		z = shell[:, 0, 2].detach()
 		base, dirs = self._umbilicus_base_shell(data=data, z=z, w=W)
 		delta_xyz = shell - base
+		if H > 1:
+			self.cyl_shell_current_height_step = float((shell[1:] - shell[:-1]).norm(dim=-1).mean().detach().cpu())
 		self._set_shell_grid_shape(h=H, w=W)
 		self.cyl_shell_base = base.detach()
 		self.cyl_shell_dirs = dirs.detach()
@@ -1287,6 +1422,8 @@ class Model3D(nn.Module):
 			z = shell[:, 0, 2].to(device=device, dtype=dtype)
 			base, dirs = self._umbilicus_base_shell(data=data, z=z, w=old_w)
 			delta_xyz = shell.to(device=device, dtype=dtype) - base
+			if target_h > 1:
+				self.cyl_shell_current_height_step = float((shell[1:] - shell[:-1]).norm(dim=-1).mean().detach().cpu())
 			self._set_shell_grid_shape(h=target_h, w=old_w)
 			self.cyl_shell_base = base.detach()
 			self.cyl_shell_dirs = dirs.detach()
@@ -2746,9 +2883,10 @@ class Model3D(nn.Module):
 			cyl_params=self.cyl_params if self.cylinder_enabled else None,
 			cyl_count=cyl_count,
 			cyl_shell_mode=bool(self.cyl_shell_mode and self.cylinder_enabled),
-			cyl_shell_step=float(self._current_shell_target_offset()),
+			cyl_shell_step=float(getattr(self, "cyl_shell_current_radius", self._current_shell_target_offset())),
+			cyl_shell_sphere_radius=float(getattr(self, "cyl_shell_target_radius", getattr(self, "cyl_shell_current_radius", self._current_shell_target_offset()))),
 			cyl_shell_width_step=float(getattr(self, "cyl_shell_current_width_step", self.cyl_shell_width_target_step)),
-			cyl_shell_height_step=float(getattr(self, "cyl_shell_z_step", self.params.mesh_step)),
+			cyl_shell_height_step=float(getattr(self, "cyl_shell_current_height_step", getattr(self, "cyl_shell_z_step", self.params.mesh_step))),
 			cyl_seed_z=float(self.cyl_seed_xyz[2].detach().cpu()) if self.cyl_seed_xyz.numel() >= 3 else 0.0,
 			cyl_z_center_target=float(getattr(self, "cyl_shell_z_center_target", self.cyl_shell_seed_z)),
 			cyl_shell_base_xyz=cyl_shell_base_xyz,

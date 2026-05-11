@@ -41,6 +41,33 @@ def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	      + fh * fw * xyz[0, h1, w1])
 
 
+def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | None:
+	for stage in stages:
+		if "cyl_params" not in stage.global_opt.params:
+			continue
+		args = stage.global_opt.args or {}
+		value = args.get(optimizer.CYLINDER_STAGE_STEP_ARG)
+		if value is None:
+			return None
+		value_f = float(value)
+		return value_f if value_f > 0.0 else None
+	return None
+
+
+def _apply_cylinder_prepare_model_step(mdl: "model.Model3D", model_step: float | None) -> None:
+	if model_step is None:
+		return
+	step = float(model_step)
+	if hasattr(mdl, "cyl_shell_width_target_step"):
+		mdl.cyl_shell_width_target_step = step
+	if hasattr(mdl, "cyl_shell_current_width_step"):
+		mdl.cyl_shell_current_width_step = step
+	if hasattr(mdl, "cyl_shell_z_step"):
+		mdl.cyl_shell_z_step = step
+	if hasattr(mdl, "cyl_shell_current_height_step"):
+		mdl.cyl_shell_current_height_step = step
+
+
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
 	"""Parse a VC3D corr_points collections dict into CorrPoints3D."""
 	cols = obj.get("collections", {})
@@ -593,9 +620,16 @@ def main(argv: list[str] | None = None) -> int:
 	_stage_done("load_data", _t)
 
 	if getattr(mdl, "cylinder_enabled", False) and hasattr(mdl, "prepare_umbilicus_tube_init"):
-		_t = _stage_start("prepare_umbilicus_tube_init")
-		mdl.prepare_umbilicus_tube_init(data)
-		_stage_done("prepare_umbilicus_tube_init", _t)
+		_apply_cylinder_prepare_model_step(mdl, _first_cylinder_stage_model_step(stages))
+		_use_pre_init = any(getattr(stage, "name", "") == "cyl_pre_init" for stage in stages)
+		if _use_pre_init and hasattr(mdl, "prepare_umbilicus_tube_pre_init"):
+			_t = _stage_start("prepare_umbilicus_tube_pre_init")
+			mdl.prepare_umbilicus_tube_pre_init(data)
+			_stage_done("prepare_umbilicus_tube_pre_init", _t)
+		else:
+			_t = _stage_start("prepare_umbilicus_tube_init")
+			mdl.prepare_umbilicus_tube_init(data)
+			_stage_done("prepare_umbilicus_tube_init", _t)
 
 	# Print loaded data summary
 	Z, Y, X = data.size
