@@ -88,8 +88,9 @@ class LasagnaVolume:
 
 	def save(self) -> None:
 		"""Write JSON to self.path."""
+		self.version = LASAGNA_VOLUME_VERSION
 		d: dict = {
-			"version": self.version,
+			"version": LASAGNA_VOLUME_VERSION,
 			"source_to_base": self.source_to_base,
 			"grad_mag_encode_scale": self.grad_mag_encode_scale,
 			"grad_mag_factor": self.grad_mag_factor,
@@ -113,18 +114,7 @@ class LasagnaVolume:
 				"Lasagna volumes must be described by a .lasagna.json manifest."
 			)
 		d = json.loads(p.read_text(encoding="utf-8"))
-		version_raw = d.get("version")
-		if version_raw is None:
-			raise ValueError(
-				f"lasagna volume {p} missing required 'version'; "
-				f"expected {LASAGNA_VOLUME_VERSION}"
-			)
-		version = int(version_raw)
-		if version != LASAGNA_VOLUME_VERSION:
-			raise ValueError(
-				f"unsupported lasagna volume version: {version}; "
-				f"expected {LASAGNA_VOLUME_VERSION}"
-			)
+		version = int(d.get("version", 1))
 		umbilicus_json = str(d.get("umbilicus_json", "")).strip()
 		if not umbilicus_json:
 			raise ValueError(f"lasagna volume {p} missing required 'umbilicus_json'")

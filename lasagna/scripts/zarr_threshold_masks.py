@@ -22,8 +22,9 @@ _LASAGNA_DIR = Path(__file__).resolve().parents[1]
 if str(_LASAGNA_DIR) not in sys.path:
     sys.path.insert(0, str(_LASAGNA_DIR))
 
-from lasagna_volume import LasagnaVolume
+from lasagna_volume import LASAGNA_VOLUME_VERSION, LasagnaVolume
 from omezarr_pyramid import (
+    build_normal_omezarr_pyramid,
     build_scalar_omezarr_pyramid,
     clear_coarser_levels,
     omezarr_chunk_exists,
@@ -505,9 +506,8 @@ def _write_layered_tif(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     layers = [
         ("original", _gray_to_rgb(original_slice)),
-        ("masked_out", _mask_to_rgb(masked_out_slice)),
-        ("keep_mask", _mask_to_rgb(keep_slice)),
-        ("masked_out_overlay", _overlay_rgb(original_slice, masked_out_slice, alpha=overlay_alpha)),
+        ("mask", _mask_to_rgb(keep_slice)),
+        ("overlay", _overlay_rgb(original_slice, masked_out_slice, alpha=overlay_alpha)),
     ]
     with tifffile.TiffWriter(str(out_path)) as tw:
         for name, image in layers:
@@ -530,9 +530,8 @@ def _overlay_mask_on_slice(
     overlay = _overlay_rgb(image, masked_out, alpha=alpha)
     if not include_mask_panel:
         return np.concatenate([original, overlay], axis=1)
-    masked_panel = _mask_to_rgb(masked_out)
     keep_panel = _mask_to_rgb(keep_mask)
-    return np.concatenate([original, masked_panel, keep_panel, overlay], axis=1)
+    return np.concatenate([original, keep_panel, overlay], axis=1)
 
 
 def _preview_full_z_values(z_range_full: tuple[int, int], step: int) -> list[int]:
@@ -659,7 +658,7 @@ def _write_mask_zarr(
         "z_range_full": [int(v) for v in z_range_full],
         "z_range_array": [int(v) for v in z_range_array],
         "mask_values": {"masked_out": 0, "keep": 255},
-        "lasagna_mask_semantics": "uint8 keep mask: 255=keep, 0=mask_out",
+        "lasagna_mask_semantics": "uint8 mask: 255=keep, 0=mask_out",
     }
     (out_path / ".zarray").write_text(json.dumps(zarray, indent=2) + "\n")
     (out_path / ".zattrs").write_text(json.dumps(zattrs, indent=2) + "\n")
@@ -754,9 +753,7 @@ def _read_mask_block_resampled(
     return out
 
 
-def _grad_mag_omezarr_paths(lasagna_json: Path) -> tuple[LasagnaVolume, Path, Path, int]:
-    vol = LasagnaVolume.load(lasagna_json)
-    group, _ch_idx = vol.channel_group("grad_mag")
+def _omezarr_paths_for_group(vol: LasagnaVolume, group) -> tuple[Path, Path, int]:
     grad_path = (vol.path.parent / group.zarr_path).resolve()
     data_level = int(group.scaledown)
     if grad_path.name.isdigit():
@@ -766,6 +763,13 @@ def _grad_mag_omezarr_paths(lasagna_json: Path) -> tuple[LasagnaVolume, Path, Pa
     else:
         root_path = grad_path
         level_path = root_path / str(data_level)
+    return root_path, level_path, data_level
+
+
+def _grad_mag_omezarr_paths(lasagna_json: Path) -> tuple[LasagnaVolume, Path, Path, int]:
+    vol = LasagnaVolume.load(lasagna_json)
+    group, _ch_idx = vol.channel_group("grad_mag")
+    root_path, level_path, data_level = _omezarr_paths_for_group(vol, group)
     return vol, root_path, level_path, data_level
 
 
@@ -776,6 +780,35 @@ def _numeric_omezarr_levels(root_path: Path) -> list[int]:
     if not levels:
         raise ValueError(f"OME-Zarr root has no numeric levels: {root_path}")
     return levels
+
+
+def _infer_rebuild_chunk(level_path: Path) -> int:
+    arr = zarr.open(str(level_path), mode="r")
+    chunks = tuple(int(v) for v in arr.chunks[-3:])
+    if not chunks:
+        raise ValueError(f"cannot infer chunk size from {level_path}: chunks={arr.chunks}")
+    if len(set(chunks)) == 1:
+        return chunks[0]
+    chunk = max(chunks)
+    print(
+        f"[maskout] data-level chunks are non-cubic {chunks}; "
+        f"using rebuild work tile {chunk}",
+        flush=True,
+    )
+    return chunk
+
+
+def _mark_manifest_v2(vol: LasagnaVolume, *, label: str) -> None:
+    if vol.version != LASAGNA_VOLUME_VERSION:
+        old_version = vol.version
+        vol.version = LASAGNA_VOLUME_VERSION
+        vol.save()
+        print(
+            f"[{label}] upgraded lasagna manifest version {old_version} -> {LASAGNA_VOLUME_VERSION}",
+            flush=True,
+        )
+    else:
+        vol.save()
 
 
 def _apply_external_keep_mask(
@@ -857,9 +890,11 @@ def run_maskout(args: argparse.Namespace) -> None:
     _vol, grad_root, grad_level, data_level = _grad_mag_omezarr_paths(lasagna_json)
     levels = _numeric_omezarr_levels(grad_root)
     n_levels = max(levels) + 1
+    rebuild_chunk = int(args.chunk) if args.chunk is not None and int(args.chunk) > 0 else _infer_rebuild_chunk(grad_level)
     print(
         f"[maskout] lasagna={lasagna_json} grad_mag={grad_level} "
-        f"data_level={data_level} n_levels={n_levels} mask={mask_array_path}",
+        f"data_level={data_level} n_levels={n_levels} chunk={rebuild_chunk} "
+        f"mask={mask_array_path}",
         flush=True,
     )
     t0 = time.perf_counter()
@@ -882,7 +917,7 @@ def run_maskout(args: argparse.Namespace) -> None:
         grad_root,
         data_level,
         n_levels,
-        int(args.chunk),
+        rebuild_chunk,
         label="grad_mag",
         workers=int(args.workers),
         force=True,
@@ -892,6 +927,7 @@ def run_maskout(args: argparse.Namespace) -> None:
         f"[maskout] rebuilt grad_mag lower scales in {pyr_ms:.1f}ms",
         flush=True,
     )
+    _mark_manifest_v2(_vol, label="maskout")
 
 
 def add_create_args(parser: argparse.ArgumentParser) -> None:
@@ -907,7 +943,7 @@ def add_create_args(parser: argparse.ArgumentParser) -> None:
         "--zarr-output",
         type=Path,
         default=None,
-        help="Optional plain single-scale zarr output for the uint8 mask volume.",
+        help="Optional plain single-scale zarr output for the uint8 mask volume (255=keep, 0=mask_out).",
     )
     parser.add_argument(
         "--array",
@@ -1126,7 +1162,11 @@ def run_create(args: argparse.Namespace) -> None:
         flush=True,
     )
     if args.zarr_output is not None:
-        print(f"[mask] wrote zarr mask to {args.zarr_output}", flush=True)
+        print(
+            f"[mask] wrote zarr mask to {args.zarr_output} "
+            "(255=keep, 0=mask_out)",
+            flush=True,
+        )
     print(f"[mask] wrote {jpg_count} JPG previews to {jpg_dir}", flush=True)
     print(
         f"[mask] wrote {preview_tif_count} layered TIFF previews to {preview_tif_dir}",
@@ -1136,33 +1176,123 @@ def run_create(args: argparse.Namespace) -> None:
 
 def add_maskout_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lasagna-json", required=True, type=Path, help="Lasagna .lasagna.json manifest to update in place.")
-    parser.add_argument("--mask-zarr", required=True, type=Path, help="3D uint8 keep-mask zarr; 0 masks out, nonzero keeps.")
+    parser.add_argument("--mask-zarr", required=True, type=Path, help="3D uint8 mask zarr; 0 masks out, nonzero keeps.")
     parser.add_argument("--mask-array", default=None, help="Array key when --mask-zarr is a group (default: 0, else first entry).")
     parser.add_argument("--mask-channel", type=int, default=0, help="Channel index for 4D CZYX mask arrays.")
-    parser.add_argument("--chunk", type=int, default=32, help="OME-Zarr output chunk size for regenerated lower scales.")
+    parser.add_argument("--chunk", type=int, default=0, help="Rebuild work tile size for lower scales (default: infer from data-level zarr chunks).")
+    parser.add_argument("--workers", type=int, default=0, help="Pyramid rebuild workers (default: CPU count).")
+
+
+def _normal_pair_info(vol: LasagnaVolume) -> tuple[Path, Path, Path, Path, int] | None:
+    channels = set(vol.all_channels())
+    if "nx" not in channels and "ny" not in channels:
+        return None
+    if "nx" not in channels or "ny" not in channels:
+        raise ValueError("normal pyramid rebuild requires both nx and ny channels")
+    nx_group, _ = vol.channel_group("nx")
+    ny_group, _ = vol.channel_group("ny")
+    nx_root, nx_level, nx_data_level = _omezarr_paths_for_group(vol, nx_group)
+    ny_root, ny_level, ny_data_level = _omezarr_paths_for_group(vol, ny_group)
+    if nx_data_level != ny_data_level:
+        raise ValueError(f"nx/ny data levels differ: nx={nx_data_level} ny={ny_data_level}")
+    if nx_root.resolve() == ny_root.resolve():
+        raise ValueError("nx/ny normal rebuild expects separate OME-Zarr roots")
+    return nx_root, ny_root, nx_level, ny_level, nx_data_level
+
+
+def run_rebuild_scales(args: argparse.Namespace) -> None:
+    lasagna_json = Path(args.lasagna_json)
+    vol = LasagnaVolume.load(lasagna_json)
+    workers = int(args.workers)
+    chunk_override = int(args.chunk)
+    processed_roots: set[Path] = set()
+
+    normal_info = _normal_pair_info(vol)
+    if normal_info is not None:
+        nx_root, ny_root, nx_level, _ny_level, data_level = normal_info
+        nx_levels = _numeric_omezarr_levels(nx_root)
+        ny_levels = _numeric_omezarr_levels(ny_root)
+        n_levels = max(max(nx_levels), max(ny_levels)) + 1
+        rebuild_chunk = chunk_override if chunk_override > 0 else _infer_rebuild_chunk(nx_level)
+        print(
+            f"[rebuild-scales] normal nx={nx_root} ny={ny_root} "
+            f"data_level={data_level} n_levels={n_levels} chunk={rebuild_chunk}",
+            flush=True,
+        )
+        build_normal_omezarr_pyramid(
+            nx_root,
+            ny_root,
+            data_level,
+            n_levels,
+            rebuild_chunk,
+            label="normal",
+            workers=workers,
+            force=True,
+        )
+        processed_roots.add(nx_root.resolve())
+        processed_roots.add(ny_root.resolve())
+
+    for group_name, group in vol.groups.items():
+        root, level_path, data_level = _omezarr_paths_for_group(vol, group)
+        root_key = root.resolve()
+        if root_key in processed_roots:
+            continue
+        if any(ch in {"nx", "ny"} for ch in group.channels):
+            raise ValueError(
+                f"normal channel group {group_name!r} was not handled as an nx/ny pair"
+            )
+        levels = _numeric_omezarr_levels(root)
+        n_levels = max(levels) + 1
+        rebuild_chunk = chunk_override if chunk_override > 0 else _infer_rebuild_chunk(level_path)
+        label = ",".join(group.channels) if group.channels else group_name
+        print(
+            f"[rebuild-scales] scalar {label} root={root} "
+            f"data_level={data_level} n_levels={n_levels} chunk={rebuild_chunk}",
+            flush=True,
+        )
+        build_scalar_omezarr_pyramid(
+            root,
+            data_level,
+            n_levels,
+            rebuild_chunk,
+            label=label,
+            workers=workers,
+            force=True,
+        )
+        processed_roots.add(root_key)
+
+    _mark_manifest_v2(vol, label="rebuild-scales")
+
+
+def add_rebuild_scales_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--lasagna-json", required=True, type=Path, help="Lasagna .lasagna.json manifest to upgrade and rebuild.")
+    parser.add_argument("--chunk", type=int, default=0, help="Rebuild work tile size for lower scales (default: infer from each data-level zarr chunk).")
     parser.add_argument("--workers", type=int, default=0, help="Pyramid rebuild workers (default: CPU count).")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create threshold-derived zarr keep masks and apply them to Lasagna grad_mag data.",
+        description="Create threshold-derived zarr masks and apply them to Lasagna grad_mag data.",
+        epilog=(
+            "commands:\n"
+            "  create   Create a mask zarr and previews from an input zarr.\n"
+            "  maskout  Apply a mask zarr to grad_mag in a Lasagna manifest.\n"
+            "  rebuild-scales  Rebuild lower OME-Zarr scales for every zarr in a Lasagna manifest."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="cmd")
-    p_create = sub.add_parser("create", help="Create a keep-mask zarr and previews from an input zarr.")
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="{create,maskout,rebuild-scales}")
+    p_create = sub.add_parser("create", help="Create a mask zarr and previews from an input zarr.")
     add_create_args(p_create)
     p_create.set_defaults(func=run_create)
-    p_maskout = sub.add_parser("maskout", help="Apply a keep-mask zarr to grad_mag in a Lasagna manifest.")
+    p_maskout = sub.add_parser("maskout", help="Apply a mask zarr to grad_mag in a Lasagna manifest.")
     add_maskout_args(p_maskout)
     p_maskout.set_defaults(func=run_maskout)
+    p_rebuild = sub.add_parser("rebuild-scales", help="Rebuild lower OME-Zarr scales for every zarr in a Lasagna manifest.")
+    add_rebuild_scales_args(p_rebuild)
+    p_rebuild.set_defaults(func=run_rebuild_scales)
 
-    # Backward-compatible default: no subcommand means "create".
-    argv = sys.argv[1:]
-    if argv and argv[0] not in {"create", "maskout", "-h", "--help"}:
-        argv = ["create"] + argv
-    args = parser.parse_args(argv)
-    if not hasattr(args, "func"):
-        parser.print_help()
-        raise SystemExit(2)
+    args = parser.parse_args()
     args.func(args)
 
 
