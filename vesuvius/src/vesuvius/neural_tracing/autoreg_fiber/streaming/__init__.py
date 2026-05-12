@@ -21,12 +21,28 @@ from vesuvius.neural_tracing.autoreg_fiber.streaming.tracer import (
     TraceResult,
 )
 from vesuvius.neural_tracing.autoreg_fiber.streaming.window import WindowedVolumeReader
+from vesuvius.neural_tracing.autoreg_fiber.streaming.wk_io import (
+    PromptPayload,
+    build_annotation,
+    build_skeleton,
+    load_prompt_npz,
+    load_wk_token,
+    save_annotation,
+    upload_annotation,
+)
 
 __all__ = [
     "BidirectionalResult",
     "ChunkLRUCache",
     "FiberTracer",
+    "PromptPayload",
     "TraceResult",
     "WindowedVolumeReader",
+    "build_annotation",
+    "build_skeleton",
+    "load_prompt_npz",
+    "load_wk_token",
     "open_streaming_volume",
+    "save_annotation",
+    "upload_annotation",
 ]
