@@ -712,8 +712,9 @@ def _build_omezarr_pyramid(
 	workers: int = 0,
 	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
 	label: str = "",
+	zero_overrides: bool = False,
 ) -> None:
-	"""Build coarser scalar pyramid levels by chunked 2x mean pooling."""
+	"""Build coarser scalar pyramid levels by chunked 2x pooling."""
 	build_scalar_omezarr_pyramid(
 		omezarr_path,
 		data_level,
@@ -722,6 +723,7 @@ def _build_omezarr_pyramid(
 		workers=workers,
 		crop_zyx=crop_zyx,
 		label=label,
+		zero_overrides=zero_overrides,
 	)
 
 
@@ -2724,7 +2726,7 @@ def run_preprocess_3d(
 		(cos_omezarr_path, cos_level, "cos", cos_crop_zyx),
 		(gm_omezarr_path, other_level, "grad_mag", other_crop_zyx),
 	]:
-		_build_omezarr_pyramid(path, data_lv, n_levels, oc, crop_zyx=crop, label=name)
+		_build_omezarr_pyramid(path, data_lv, n_levels, oc, crop_zyx=crop, label=name, zero_overrides=(name == "grad_mag"))
 	build_normal_omezarr_pyramid(
 		nx_omezarr_path,
 		ny_omezarr_path,

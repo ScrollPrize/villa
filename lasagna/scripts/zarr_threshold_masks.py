@@ -782,20 +782,12 @@ def _numeric_omezarr_levels(root_path: Path) -> list[int]:
     return levels
 
 
-def _infer_rebuild_chunk(level_path: Path) -> int:
+def _level_chunks_zyx(level_path: Path) -> tuple[int, int, int]:
     arr = zarr.open(str(level_path), mode="r")
     chunks = tuple(int(v) for v in arr.chunks[-3:])
     if not chunks:
-        raise ValueError(f"cannot infer chunk size from {level_path}: chunks={arr.chunks}")
-    if len(set(chunks)) == 1:
-        return chunks[0]
-    chunk = max(chunks)
-    print(
-        f"[maskout] data-level chunks are non-cubic {chunks}; "
-        f"using rebuild work tile {chunk}",
-        flush=True,
-    )
-    return chunk
+        raise ValueError(f"cannot read chunk size from {level_path}: chunks={arr.chunks}")
+    return chunks
 
 
 def _mark_manifest_v2(vol: LasagnaVolume, *, label: str) -> None:
@@ -890,10 +882,10 @@ def run_maskout(args: argparse.Namespace) -> None:
     _vol, grad_root, grad_level, data_level = _grad_mag_omezarr_paths(lasagna_json)
     levels = _numeric_omezarr_levels(grad_root)
     n_levels = max(levels) + 1
-    rebuild_chunk = int(args.chunk) if args.chunk is not None and int(args.chunk) > 0 else _infer_rebuild_chunk(grad_level)
+    data_chunks = _level_chunks_zyx(grad_level)
     print(
         f"[maskout] lasagna={lasagna_json} grad_mag={grad_level} "
-        f"data_level={data_level} n_levels={n_levels} chunk={rebuild_chunk} "
+        f"data_level={data_level} n_levels={n_levels} data_chunks={data_chunks} "
         f"mask={mask_array_path}",
         flush=True,
     )
@@ -917,10 +909,10 @@ def run_maskout(args: argparse.Namespace) -> None:
         grad_root,
         data_level,
         n_levels,
-        rebuild_chunk,
         label="grad_mag",
         workers=int(args.workers),
         force=True,
+        zero_overrides=True,
     )
     pyr_ms = (time.perf_counter() - pyr_t0) * 1000.0
     print(
@@ -1179,7 +1171,6 @@ def add_maskout_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mask-zarr", required=True, type=Path, help="3D uint8 mask zarr; 0 masks out, nonzero keeps.")
     parser.add_argument("--mask-array", default=None, help="Array key when --mask-zarr is a group (default: 0, else first entry).")
     parser.add_argument("--mask-channel", type=int, default=0, help="Channel index for 4D CZYX mask arrays.")
-    parser.add_argument("--chunk", type=int, default=0, help="Rebuild work tile size for lower scales (default: infer from data-level zarr chunks).")
     parser.add_argument("--workers", type=int, default=0, help="Pyramid rebuild workers (default: CPU count).")
 
 
@@ -1204,7 +1195,6 @@ def run_rebuild_scales(args: argparse.Namespace) -> None:
     lasagna_json = Path(args.lasagna_json)
     vol = LasagnaVolume.load(lasagna_json)
     workers = int(args.workers)
-    chunk_override = int(args.chunk)
     processed_roots: set[Path] = set()
 
     normal_info = _normal_pair_info(vol)
@@ -1213,10 +1203,10 @@ def run_rebuild_scales(args: argparse.Namespace) -> None:
         nx_levels = _numeric_omezarr_levels(nx_root)
         ny_levels = _numeric_omezarr_levels(ny_root)
         n_levels = max(max(nx_levels), max(ny_levels)) + 1
-        rebuild_chunk = chunk_override if chunk_override > 0 else _infer_rebuild_chunk(nx_level)
+        data_chunks = _level_chunks_zyx(nx_level)
         print(
             f"[rebuild-scales] normal nx={nx_root} ny={ny_root} "
-            f"data_level={data_level} n_levels={n_levels} chunk={rebuild_chunk}",
+            f"data_level={data_level} n_levels={n_levels} data_chunks={data_chunks}",
             flush=True,
         )
         build_normal_omezarr_pyramid(
@@ -1224,7 +1214,6 @@ def run_rebuild_scales(args: argparse.Namespace) -> None:
             ny_root,
             data_level,
             n_levels,
-            rebuild_chunk,
             label="normal",
             workers=workers,
             force=True,
@@ -1243,21 +1232,21 @@ def run_rebuild_scales(args: argparse.Namespace) -> None:
             )
         levels = _numeric_omezarr_levels(root)
         n_levels = max(levels) + 1
-        rebuild_chunk = chunk_override if chunk_override > 0 else _infer_rebuild_chunk(level_path)
+        data_chunks = _level_chunks_zyx(level_path)
         label = ",".join(group.channels) if group.channels else group_name
         print(
             f"[rebuild-scales] scalar {label} root={root} "
-            f"data_level={data_level} n_levels={n_levels} chunk={rebuild_chunk}",
+            f"data_level={data_level} n_levels={n_levels} data_chunks={data_chunks}",
             flush=True,
         )
         build_scalar_omezarr_pyramid(
             root,
             data_level,
             n_levels,
-            rebuild_chunk,
             label=label,
             workers=workers,
             force=True,
+            zero_overrides=("grad_mag" in group.channels),
         )
         processed_roots.add(root_key)
 
@@ -1266,7 +1255,6 @@ def run_rebuild_scales(args: argparse.Namespace) -> None:
 
 def add_rebuild_scales_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lasagna-json", required=True, type=Path, help="Lasagna .lasagna.json manifest to upgrade and rebuild.")
-    parser.add_argument("--chunk", type=int, default=0, help="Rebuild work tile size for lower scales (default: infer from each data-level zarr chunk).")
     parser.add_argument("--workers", type=int, default=0, help="Pyramid rebuild workers (default: CPU count).")
 
 

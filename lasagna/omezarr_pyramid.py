@@ -63,13 +63,14 @@ def omezarr_chunk_exists(
 	z: int,
 	y: int,
 	x: int,
-	chunk_size: int,
+	chunk_size: int | tuple[int, int, int],
 ) -> bool:
 	key = (str(omezarr_path), int(level))
 	if key not in _dim_sep_cache:
 		_dim_sep_cache[key] = omezarr_dim_sep(omezarr_path, level)
 	sep = _dim_sep_cache[key]
-	iz, iy, ix = int(z) // int(chunk_size), int(y) // int(chunk_size), int(x) // int(chunk_size)
+	cz, cy, cx = _normalize_chunk_zyx(chunk_size)
+	iz, iy, ix = int(z) // cz, int(y) // cy, int(x) // cx
 	return zarr_chunk_path(Path(omezarr_path) / str(level), sep, iz, iy, ix).is_file()
 
 
@@ -77,13 +78,28 @@ def set_pyramid_metadata(group: zarr.Group, *, method: str) -> None:
 	group.attrs["lasagna_pyramid_downsample"] = method
 
 
-def _mean_pool2x_u8(slab: np.ndarray) -> np.ndarray:
+def _normalize_chunk_zyx(chunk: int | tuple[int, int, int]) -> tuple[int, int, int]:
+	if isinstance(chunk, tuple):
+		cz, cy, cx = (int(v) for v in chunk)
+	else:
+		cz = cy = cx = int(chunk)
+	if cz <= 0 or cy <= 0 or cx <= 0:
+		raise ValueError(f"invalid chunk size: {(cz, cy, cx)}")
+	return cz, cy, cx
+
+
+def _level_chunks_zyx(group: zarr.Group, level: int) -> tuple[int, int, int]:
+	return tuple(int(v) for v in group[str(level)].chunks[-3:])
+
+
+def _mean_pool2x_u8(slab: np.ndarray, *, zero_overrides: bool = False) -> np.ndarray:
 	if slab.ndim != 3:
 		raise ValueError(f"expected 3D slab, got shape={slab.shape}")
 	z, y, x = (int(v) for v in slab.shape)
 	out_shape = ((z + 1) // 2, (y + 1) // 2, (x + 1) // 2)
 	acc = np.zeros(out_shape, dtype=np.float32)
 	cnt = np.zeros(out_shape, dtype=np.float32)
+	zero = np.zeros(out_shape, dtype=bool) if zero_overrides else None
 	for dz in (0, 1):
 		for dy in (0, 1):
 			for dx in (0, 1):
@@ -93,7 +109,12 @@ def _mean_pool2x_u8(slab: np.ndarray) -> np.ndarray:
 				sz, sy, sx = part.shape
 				acc[:sz, :sy, :sx] += part.astype(np.float32, copy=False)
 				cnt[:sz, :sy, :sx] += 1.0
-	return np.rint(acc / np.maximum(cnt, 1.0)).clip(0.0, 255.0).astype(np.uint8)
+				if zero is not None:
+					zero[:sz, :sy, :sx] |= part == 0
+	out = np.rint(acc / np.maximum(cnt, 1.0)).clip(0.0, 255.0).astype(np.uint8)
+	if zero is not None:
+		out[zero] = 0
+	return out
 
 
 def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
@@ -192,13 +213,17 @@ def _write_level_block(
 
 
 def downsample_scalar_chunk_worker(args_tuple) -> None:
-	(out_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1) = args_tuple
+	if len(args_tuple) == 9:
+		(out_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1) = args_tuple
+		zero_overrides = False
+	else:
+		(out_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1, zero_overrides) = args_tuple
 	g = zarr.open_group(str(out_path_str), mode="r+")
 	src = g[str(src_level)]
 	slab = np.asarray(src[z0:z1, y0:y1, x0:x1], dtype=np.uint8)
 	if slab.size == 0:
 		return
-	down = _mean_pool2x_u8(slab)
+	down = _mean_pool2x_u8(slab, zero_overrides=bool(zero_overrides))
 	_write_level_block(
 		omezarr_path=str(out_path_str),
 		level=int(dst_level),
@@ -228,13 +253,15 @@ def _make_downsample_work(
 	omezarr_path: str | Path,
 	src_level: int,
 	dst_level: int,
-	chunk: int,
+	chunk: int | tuple[int, int, int] | None,
 	crop_zyx: tuple[int, int, int, int, int, int] | None,
 	skip_existing: bool,
+	zero_overrides: bool = False,
 ) -> tuple[list[tuple], int]:
 	g = zarr.open_group(str(omezarr_path), mode="r+")
 	src_shape = tuple(int(v) for v in g[str(src_level)].shape)
-	cz2 = int(chunk) * 2
+	chunk_zyx = _level_chunks_zyx(g, dst_level) if chunk is None else _normalize_chunk_zyx(chunk)
+	cz2, cy2, cx2 = (2 * v for v in chunk_zyx)
 	if crop_zyx is not None:
 		cz0_base, cy0_base, cx0_base, cz1_base, cy1_base, cx1_base = (int(v) for v in crop_zyx)
 		# crop_zyx is always expressed in data-level coordinates by callers.
@@ -244,24 +271,24 @@ def _make_downsample_work(
 		sz0 = sy0 = sx0 = 0
 		sz1, sy1, sx1 = src_shape
 	sz0 = max(0, min(src_shape[0], (sz0 // cz2) * cz2))
-	sy0 = max(0, min(src_shape[1], (sy0 // cz2) * cz2))
-	sx0 = max(0, min(src_shape[2], (sx0 // cz2) * cz2))
+	sy0 = max(0, min(src_shape[1], (sy0 // cy2) * cy2))
+	sx0 = max(0, min(src_shape[2], (sx0 // cx2) * cx2))
 	sz1 = max(sz0, min(src_shape[0], ((sz1 + cz2 - 1) // cz2) * cz2))
-	sy1 = max(sy0, min(src_shape[1], ((sy1 + cz2 - 1) // cz2) * cz2))
-	sx1 = max(sx0, min(src_shape[2], ((sx1 + cz2 - 1) // cz2) * cz2))
+	sy1 = max(sy0, min(src_shape[1], ((sy1 + cy2 - 1) // cy2) * cy2))
+	sx1 = max(sx0, min(src_shape[2], ((sx1 + cx2 - 1) // cx2) * cx2))
 
 	work: list[tuple] = []
 	skipped = 0
 	for z0 in range(sz0, sz1, cz2):
 		z1 = min(sz1, z0 + cz2)
-		for y0 in range(sy0, sy1, cz2):
-			y1 = min(sy1, y0 + cz2)
-			for x0 in range(sx0, sx1, cz2):
-				x1 = min(sx1, x0 + cz2)
-				if skip_existing and omezarr_chunk_exists(omezarr_path, dst_level, z0 // 2, y0 // 2, x0 // 2, chunk):
+		for y0 in range(sy0, sy1, cy2):
+			y1 = min(sy1, y0 + cy2)
+			for x0 in range(sx0, sx1, cx2):
+				x1 = min(sx1, x0 + cx2)
+				if skip_existing and omezarr_chunk_exists(omezarr_path, dst_level, z0 // 2, y0 // 2, x0 // 2, chunk_zyx):
 					skipped += 1
 					continue
-				work.append((str(omezarr_path), int(src_level), int(dst_level), z0, z1, y0, y1, x0, x1))
+				work.append((str(omezarr_path), int(src_level), int(dst_level), z0, z1, y0, y1, x0, x1, bool(zero_overrides)))
 	return work, skipped
 
 
@@ -315,12 +342,13 @@ def build_scalar_omezarr_pyramid(
 	omezarr_path: str | Path,
 	data_level: int,
 	n_levels: int,
-	chunk: int,
+	chunk: int | tuple[int, int, int] | None = None,
 	*,
 	workers: int = 0,
 	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
 	label: str = "",
 	force: bool = False,
+	zero_overrides: bool = False,
 ) -> None:
 	if workers <= 0:
 		workers = max(1, multiprocessing.cpu_count())
@@ -337,12 +365,13 @@ def build_scalar_omezarr_pyramid(
 			chunk=chunk,
 			crop_zyx=src_crop,
 			skip_existing=not force,
+			zero_overrides=zero_overrides,
 		)
 		tag = f"[pyramid {label} L{lv}]" if label else f"[pyramid L{lv}]"
 		if skipped > 0:
 			print(f"{tag} skipped {skipped} existing chunks", flush=True)
 		_run_pool(work, downsample_scalar_chunk_worker, workers=workers, tag=tag)
-	set_pyramid_metadata(g, method="mean_pool2x")
+	set_pyramid_metadata(g, method="mean_pool2x_zero_overrides" if zero_overrides else "mean_pool2x")
 
 
 def build_normal_omezarr_pyramid(
@@ -350,7 +379,7 @@ def build_normal_omezarr_pyramid(
 	ny_omezarr_path: str | Path,
 	data_level: int,
 	n_levels: int,
-	chunk: int,
+	chunk: int | tuple[int, int, int] | None = None,
 	*,
 	workers: int = 0,
 	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
@@ -377,7 +406,7 @@ def build_normal_omezarr_pyramid(
 		)
 		work = [
 			(str(nx_omezarr_path), str(ny_omezarr_path), src_lv, lv, z0, z1, y0, y1, x0, x1)
-			for _path, _src, _dst, z0, z1, y0, y1, x0, x1 in work_base
+			for _path, _src, _dst, z0, z1, y0, y1, x0, x1, *_rest in work_base
 		]
 		tag = f"[pyramid {label} L{lv}]"
 		if skipped > 0:

@@ -347,6 +347,7 @@ def run(
 		if normal_pair_channels and ch in {"nx", "ny"}:
 			print(f"{TAG} {ch}: delaying coarser levels for paired normal pyramid", flush=True)
 		else:
+			zero_overrides = ch == "grad_mag"
 			# Each level reads from the previous level and writes chunk-aligned
 			# regions. No contention: each worker writes to a unique chunk.
 			for lv in range(first_filled_level + 1, levels):
@@ -366,6 +367,7 @@ def run(
 							ds_work.append((
 								str(out_path), src_lv, lv,
 								z0, z1, y0, y1, x0, x1,
+								zero_overrides,
 							))
 				n_ds = len(ds_work)
 				t_lv = time.time()
@@ -453,7 +455,7 @@ def run(
 			],
 			"datasets": datasets,
 		}]
-		set_pyramid_metadata(g, method="mean_pool2x")
+		set_pyramid_metadata(g, method="mean_pool2x_zero_overrides" if ch == "grad_mag" else "mean_pool2x")
 		g.attrs["source_preprocess_params"] = params
 		g.attrs["vc3d_convert"] = {
 			"channel": str(ch),
