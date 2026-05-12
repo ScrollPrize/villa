@@ -46,6 +46,7 @@ from vesuvius.neural_tracing.autoreg_fiber.streaming.wk_io import (
     load_prompt_npz,
     save_annotation,
     upload_annotation,
+    upload_polyline_via_update_actions,
 )
 from vesuvius.neural_tracing.autoreg_fiber.train import (
     load_autoreg_fiber_model_from_checkpoint,
@@ -139,6 +140,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--upload-to-wk",
         action="store_true",
         help="Upload the trace as a new WK annotation in addition to writing locally.",
+    )
+    parser.add_argument(
+        "--upload-mode",
+        choices=("update-actions", "annotation-upload"),
+        default="update-actions",
+        help=(
+            "Which upload path to use when --upload-to-wk is set. 'update-actions' creates a "
+            "fresh annotation and pushes the trace via the tracing-store update API (works "
+            "around servers whose /annotations/upload mergedFromContents endpoint is broken). "
+            "'annotation-upload' uses the legacy /api/annotations/upload + zip path."
+        ),
+    )
+    parser.add_argument(
+        "--upload-batch-size",
+        type=int,
+        default=2000,
+        help="Nodes per update-action transaction group (update-actions mode only).",
     )
     parser.add_argument(
         "--wk-server",
@@ -314,7 +332,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {saved['zip']}", file=sys.stderr)
 
     if args.upload_to_wk:
-        url = upload_annotation(annotation, server_url=str(args.wk_server))
+        if str(args.upload_mode) == "update-actions":
+            url = upload_polyline_via_update_actions(
+                polyline,
+                dataset_slug=str(args.wk_dataset),
+                tree_name=str(args.tree_name),
+                server_url=str(args.wk_server),
+                batch_size=int(args.upload_batch_size),
+            )
+        else:
+            url = upload_annotation(annotation, server_url=str(args.wk_server))
         print(f"Uploaded annotation: {url}")
 
     cache.shutdown()

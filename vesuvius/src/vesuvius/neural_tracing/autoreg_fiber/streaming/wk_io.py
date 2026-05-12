@@ -17,6 +17,10 @@ Public surface
   bundle) and a sibling ``.nml`` for quick visual inspection.
 * :func:`upload_annotation`   — opens a token-scoped ``webknossos_context``
   and uploads, returning the new annotation URL.
+* :func:`upload_polyline_via_update_actions` — alternative upload path that
+  creates an empty annotation server-side and pushes the polyline as update
+  actions to the tracing store, bypassing servers whose
+  ``mergedFromContents`` endpoint is unavailable.
 * :func:`load_wk_token`       — locates and reads the project's
   ``webknossos-api-token.txt`` (or the ``WK_TOKEN`` env override). Never
   logged.
@@ -223,6 +227,165 @@ def upload_annotation(
     return str(url)
 
 
+def upload_polyline_via_update_actions(
+    polyline_world_zyx: "np.ndarray",
+    *,
+    dataset_slug: str,
+    tree_name: str = "autoreg_fiber_prediction",
+    server_url: str = DEFAULT_WK_SERVER_URL,
+    token: str | None = None,
+    batch_size: int = 2000,
+    timeout: int = 120,
+) -> str:
+    """Upload a polyline as a new annotation via the tracing-store update-actions API.
+
+    Workaround for WK servers whose ``/annotations/upload`` endpoint fails inside
+    ``mergedFromContents``. Flow:
+
+      1. ``POST /api/datasets/{dataset_slug}/createExplorational`` creates an empty
+         skeleton annotation server-side.
+      2. ``POST /tracings/annotation/{annotationId}/update`` pushes a single tree
+         with one node per polyline point and edges chaining consecutive nodes,
+         using the same update-action format the WK frontend uses for interactive
+         edits. The payload is split into transaction *groups* of ``batch_size``
+         nodes so very long traces do not exceed the JSON / version budget per
+         request.
+
+    ``polyline_world_zyx`` is expected in the zarr's native ``(z, y, x)`` voxel
+    frame; it is swapped to WK's ``(x, y, z)`` order on the way out (same
+    convention as :func:`build_skeleton`). Returns the new annotation URL.
+    """
+
+    import time
+    import uuid
+
+    import numpy as np
+    import requests
+
+    arr = np.asarray(polyline_world_zyx, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"polyline must have shape (N, 3); got {tuple(arr.shape)}")
+    if arr.shape[0] < 2:
+        raise ValueError("polyline must contain at least 2 nodes")
+    positions_xyz = np.rint(arr[:, ::-1]).astype(np.int64)  # (N, 3) in xyz voxel order
+
+    resolved_token = token if token is not None else load_wk_token()
+    if not resolved_token:
+        raise RuntimeError("no WK token available (env WK_TOKEN unset and token file missing)")
+    base = str(server_url).rstrip("/")
+    headers = {"X-Auth-Token": resolved_token, "Content-Type": "application/json"}
+
+    # 1. Create empty annotation.
+    create_resp = requests.post(
+        f"{base}/api/datasets/{dataset_slug}/createExplorational",
+        headers=headers,
+        json=[{"typ": "Skeleton"}],
+        timeout=timeout,
+    )
+    create_resp.raise_for_status()
+    ann = create_resp.json()
+    annotation_id = str(ann["id"])
+    skeleton_layer = ann["annotationLayers"][0]
+    tracing_id = str(skeleton_layer["tracingId"])
+    typ = str(ann.get("typ", "Explorational"))
+
+    # 2. Build update-action groups. Node IDs are 1-based; edges chain consecutive ids.
+    now_ms = int(time.time() * 1000)
+    transaction_id = str(uuid.uuid4())
+    total_nodes = int(positions_xyz.shape[0])
+    if int(batch_size) <= 0:
+        raise ValueError(f"batch_size must be positive; got {batch_size!r}")
+    chunks: list[tuple[int, int]] = []  # (start_idx, end_idx_exclusive)
+    for start in range(0, total_nodes, int(batch_size)):
+        chunks.append((start, min(start + int(batch_size), total_nodes)))
+    transaction_group_count = len(chunks)
+
+    # All groups of one transaction share the same target version (the new state
+    # after the transaction lands) and the same transactionId; transactionGroupIndex
+    # orders them. The server reassembles them into one logical version increment.
+    # We post them as one JSON array so the server treats them as one transaction.
+    next_version = 1
+    groups: list[dict[str, object]] = []
+    for group_idx, (start, end) in enumerate(chunks):
+        actions: list[dict[str, object]] = []
+        if group_idx == 0:
+            actions.append(
+                {
+                    "name": "createTree",
+                    "value": {
+                        "id": 1,
+                        "name": str(tree_name),
+                        "branchPoints": [],
+                        "comments": [],
+                        "groupId": None,
+                        "isVisible": True,
+                        "edgesAreVisible": True,
+                        "timestamp": now_ms,
+                        "actionTracingId": tracing_id,
+                    },
+                }
+            )
+        for i in range(start, end):
+            x, y, z = (int(v) for v in positions_xyz[i])
+            actions.append(
+                {
+                    "name": "createNode",
+                    "value": {
+                        "id": i + 1,
+                        "position": [x, y, z],
+                        "rotation": [0.0, 0.0, 0.0],
+                        "radius": 1.0,
+                        "viewport": 0,
+                        "resolution": 0,
+                        "bitDepth": 8,
+                        "interpolation": False,
+                        "treeId": 1,
+                        "timestamp": now_ms,
+                        "actionTracingId": tracing_id,
+                    },
+                }
+            )
+            if i > 0:
+                actions.append(
+                    {
+                        "name": "createEdge",
+                        "value": {
+                            "source": i,
+                            "target": i + 1,
+                            "treeId": 1,
+                            "actionTracingId": tracing_id,
+                        },
+                    }
+                )
+        groups.append(
+            {
+                "version": next_version,
+                "timestamp": now_ms,
+                "authorId": None,
+                "actions": actions,
+                "stats": None,
+                "info": f"autoreg_fiber trace ({total_nodes} nodes)",
+                "transactionId": transaction_id,
+                "transactionGroupCount": transaction_group_count,
+                "transactionGroupIndex": group_idx,
+            }
+        )
+
+    update_resp = requests.post(
+        f"{base}/tracings/annotation/{annotation_id}/update",
+        headers=headers,
+        json=groups,
+        timeout=timeout,
+    )
+    if update_resp.status_code != 200:
+        body = update_resp.text[:500].replace("\n", " ")
+        raise RuntimeError(
+            f"tracing-store update failed ({transaction_group_count} groups, "
+            f"{total_nodes} nodes): {update_resp.status_code} {body}"
+        )
+    return f"{base}/annotations/{typ}/{annotation_id}"
+
+
 __all__ = [
     "DEFAULT_WK_SERVER_URL",
     "PromptPayload",
@@ -232,4 +395,5 @@ __all__ = [
     "load_wk_token",
     "save_annotation",
     "upload_annotation",
+    "upload_polyline_via_update_actions",
 ]
