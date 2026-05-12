@@ -141,6 +141,18 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "scheduled_sampling_max_prob": 0.10,
     "scheduled_sampling_start_step": 0,
     "scheduled_sampling_ramp_steps": 0,
+    # Periodic rollout-in-loop training step. On every
+    # rollout_in_loop_frequency steps (after rollout_in_loop_start_step),
+    # the training step runs `rollout_in_loop_iterations` no-grad warmup
+    # forwards that chain predictions as inputs, then a final
+    # gradient-enabled forward using those chained predictions. This
+    # provides multi-step self-feeding exposure that one-step scheduled
+    # sampling cannot reach. Cost: (iters + 1) forward passes per
+    # rollout-in-loop step. With iters=5 and freq=1000, overhead is ~0.5%.
+    "rollout_in_loop_enabled": False,
+    "rollout_in_loop_frequency": 1000,
+    "rollout_in_loop_start_step": 20000,
+    "rollout_in_loop_iterations": 5,
     "position_refine_enabled": True,
     "position_refine_loss": "huber",
     "position_refine_weight": 0.05,
@@ -368,6 +380,14 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("scheduled_sampling_start_step must be >= 0")
     if int(cfg["scheduled_sampling_ramp_steps"]) < 0:
         raise ValueError("scheduled_sampling_ramp_steps must be >= 0")
+    if not isinstance(cfg["rollout_in_loop_enabled"], bool):
+        raise ValueError("rollout_in_loop_enabled must be a boolean")
+    if int(cfg["rollout_in_loop_frequency"]) <= 0:
+        raise ValueError("rollout_in_loop_frequency must be positive")
+    if int(cfg["rollout_in_loop_start_step"]) < 0:
+        raise ValueError("rollout_in_loop_start_step must be >= 0")
+    if int(cfg["rollout_in_loop_iterations"]) < 0:
+        raise ValueError("rollout_in_loop_iterations must be >= 0")
     if str(cfg["position_refine_loss"]) != "huber":
         raise ValueError("position_refine_loss must currently be 'huber'")
     if float(cfg["position_refine_weight"]) < 0.0:

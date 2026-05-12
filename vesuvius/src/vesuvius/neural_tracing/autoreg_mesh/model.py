@@ -1224,7 +1224,19 @@ class AutoregMeshModel(nn.Module):
         scheduled_sampling_pattern: str = "stripwise_full_strip_greedy",
         scheduled_sampling_offset_feedback_enabled: bool = True,
         scheduled_sampling_refine_feedback_enabled: bool = True,
+        rollout_in_loop_iterations: int = 0,
     ) -> dict[str, Tensor]:
+        # Periodic rollout-in-loop step: dispatch to the chained-warmup path
+        # so the DDP wrapper sees a normal forward() call (its hooks fire on
+        # backward() regardless of which internal forward we run).
+        if self.training and int(rollout_in_loop_iterations) > 0:
+            return self.forward_with_rollout_iterations(
+                batch,
+                iterations=int(rollout_in_loop_iterations),
+                scheduled_sampling_pattern=str(scheduled_sampling_pattern),
+                offset_feedback_enabled=bool(scheduled_sampling_offset_feedback_enabled),
+                refine_feedback_enabled=bool(scheduled_sampling_refine_feedback_enabled),
+            )
         encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
         generation_inputs = None
         if self.training and float(scheduled_sampling_prob) > 0.0:
@@ -1247,6 +1259,82 @@ class AutoregMeshModel(nn.Module):
             memory_tokens=encoded["memory_tokens"],
             memory_patch_centers=encoded["memory_patch_centers"],
             generation_inputs=generation_inputs,
+        )
+        outputs["coarse_grid_shape"] = encoded["coarse_grid_shape"]
+        return outputs
+
+    def forward_with_rollout_iterations(
+        self,
+        batch: dict,
+        *,
+        iterations: int,
+        scheduled_sampling_pattern: str = "stripwise_full_strip_greedy",
+        offset_feedback_enabled: bool = True,
+        refine_feedback_enabled: bool = True,
+    ) -> dict[str, Tensor]:
+        """Run K no-grad warmup forwards that chain the model's own predictions
+        as previous-token inputs, then a final gradient-enabled forward using
+        those chained predictions.
+
+        Each warmup uses scheduled_sampling_prob=1.0, meaning every target
+        strip's "previous token" comes from the prior pass's predictions.
+        Iterating K times propagates predictions K levels deep, giving the
+        model exposure to multi-step self-feeding drift that 1-step scheduled
+        sampling alone cannot reach. The final pass has gradient flow, so the
+        loss directly pulls the model toward correcting drift-induced errors.
+
+        Cost: (iterations + 1) forward passes per call. With iterations=5 and
+        rollout_in_loop_frequency=1000, the wall-clock overhead is ~0.5% of
+        total training time, far cheaper than a true autoregressive rollout
+        (which would be ~N x teacher-forced per sample, where N is the
+        sequence length, typically 100-200).
+        """
+        iterations = int(iterations)
+        if iterations < 0:
+            raise ValueError(f"iterations must be non-negative, got {iterations}")
+        encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
+        memory_tokens = encoded["memory_tokens"]
+        memory_patch_centers = encoded["memory_patch_centers"]
+        teacher_outputs: dict[str, Tensor] | None = None
+        if iterations > 0:
+            with torch.no_grad():
+                for _ in range(iterations):
+                    if teacher_outputs is None:
+                        teacher_outputs = self.forward_from_encoded(
+                            batch,
+                            memory_tokens=memory_tokens,
+                            memory_patch_centers=memory_patch_centers,
+                        )
+                    else:
+                        gen_inputs = self._build_scheduled_generation_inputs(
+                            batch,
+                            teacher_outputs=teacher_outputs,
+                            scheduled_sampling_prob=1.0,
+                            scheduled_sampling_pattern=str(scheduled_sampling_pattern),
+                            offset_feedback_enabled=bool(offset_feedback_enabled),
+                            refine_feedback_enabled=bool(refine_feedback_enabled),
+                        )
+                        teacher_outputs = self.forward_from_encoded(
+                            batch,
+                            memory_tokens=memory_tokens,
+                            memory_patch_centers=memory_patch_centers,
+                            generation_inputs=gen_inputs,
+                        )
+        final_gen_inputs = None
+        if teacher_outputs is not None:
+            final_gen_inputs = self._build_scheduled_generation_inputs(
+                batch,
+                teacher_outputs=teacher_outputs,
+                scheduled_sampling_prob=1.0,
+                scheduled_sampling_pattern=str(scheduled_sampling_pattern),
+                offset_feedback_enabled=bool(offset_feedback_enabled),
+                refine_feedback_enabled=bool(refine_feedback_enabled),
+            )
+        outputs = self.forward_from_encoded(
+            batch,
+            memory_tokens=memory_tokens,
+            memory_patch_centers=memory_patch_centers,
+            generation_inputs=final_gen_inputs,
         )
         outputs["coarse_grid_shape"] = encoded["coarse_grid_shape"]
         return outputs

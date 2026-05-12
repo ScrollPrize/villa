@@ -885,6 +885,24 @@ def _scheduled_sampling_feedback_state(cfg: dict, *, global_step: int) -> tuple[
     return bool(offset_feedback_enabled), bool(offset_feedback_enabled and refine_feedback_enabled)
 
 
+def _rollout_in_loop_active(cfg: dict, *, global_step: int) -> bool:
+    """Return True when this training step should run a rollout-in-loop
+    forward (K chained no-grad warmups + 1 final gradient-enabled forward,
+    all with scheduled_sampling_prob=1.0). See model.AutoregMeshModel.
+    forward_with_rollout_iterations for what that means.
+    """
+    if not bool(cfg.get("rollout_in_loop_enabled", False)):
+        return False
+    start_step = int(cfg.get("rollout_in_loop_start_step", 0))
+    if int(global_step) < start_step:
+        return False
+    frequency = int(cfg.get("rollout_in_loop_frequency", 0))
+    if frequency <= 0:
+        return False
+    # The first eligible step is `start_step`; subsequent ones are spaced by frequency.
+    return ((int(global_step) - start_step) % frequency) == 0
+
+
 def _as_numpy_grid(grid) -> np.ndarray:
     if torch.is_tensor(grid):
         return grid.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -1574,6 +1592,13 @@ def run_autoreg_mesh_training(
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             geometry_sd_weight_active = _geometry_sd_weight_active(cfg, global_step=global_step)
             offset_feedback_enabled, refine_feedback_enabled = _scheduled_sampling_feedback_state(cfg, global_step=global_step)
+            rollout_in_loop_active = _rollout_in_loop_active(cfg, global_step=global_step)
+            # Route both regular and rollout-in-loop forwards through the
+            # DDP-wrapped train_model() so the reducer is correctly notified
+            # on backward.
+            rollout_iterations_active = (
+                int(cfg.get("rollout_in_loop_iterations", 5)) if rollout_in_loop_active else 0
+            )
             with torch.autocast(device_type=runtime.device.type, dtype=amp_dtype, enabled=amp_enabled):
                 outputs = train_model(
                     batch,
@@ -1581,6 +1606,7 @@ def run_autoreg_mesh_training(
                     scheduled_sampling_pattern=str(cfg.get("scheduled_sampling_pattern", "stripwise_full_strip_greedy")),
                     scheduled_sampling_offset_feedback_enabled=offset_feedback_enabled,
                     scheduled_sampling_refine_feedback_enabled=refine_feedback_enabled,
+                    rollout_in_loop_iterations=int(rollout_iterations_active),
                 )
                 loss_dict = compute_autoreg_mesh_losses(
                     outputs,
@@ -1628,6 +1654,7 @@ def run_autoreg_mesh_training(
             metrics["current_lr"] = float(optimizer.param_groups[0]["lr"])
             metrics["grad_norm"] = grad_norm_value
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
+            metrics["rollout_in_loop_active"] = float(rollout_in_loop_active)
             metrics["offset_loss_weight_active"] = float(offset_loss_weight_active)
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)
             metrics["xyz_soft_loss_weight_active"] = float(xyz_soft_loss_weight_active)
