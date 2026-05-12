@@ -466,33 +466,58 @@ def _to_u8_image(image: np.ndarray) -> np.ndarray:
     return np.clip(image, 0, 255).astype(np.uint8)
 
 
+def _gray_to_rgb(image: np.ndarray) -> np.ndarray:
+    gray = _to_u8_image(image)
+    return np.repeat(gray[:, :, None], 3, axis=2)
+
+
+def _mask_to_rgb(mask: np.ndarray) -> np.ndarray:
+    return np.repeat((mask.astype(bool).astype(np.uint8) * 255)[:, :, None], 3, axis=2)
+
+
+def _overlay_rgb(image: np.ndarray, mask: np.ndarray, *, alpha: float) -> np.ndarray:
+    rgb = _gray_to_rgb(image).astype(np.float32)
+    m = mask.astype(bool)
+    if np.any(m):
+        rgb[m] = rgb[m] * (1.0 - alpha) + 255.0 * alpha
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
 def _write_layered_tif(
     *,
     out_path: Path,
     original_slice: np.ndarray,
     mask_slice: np.ndarray,
+    overlay_alpha: float,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     layers = [
-        ("original", _to_u8_image(original_slice)),
-        ("mask", (mask_slice.astype(np.uint8) * 255)),
+        ("original", _gray_to_rgb(original_slice)),
+        ("mask", _mask_to_rgb(mask_slice)),
+        ("overlay", _overlay_rgb(original_slice, mask_slice, alpha=overlay_alpha)),
     ]
     with tifffile.TiffWriter(str(out_path)) as tw:
         for name, image in layers:
             tw.write(
                 image,
-                photometric="minisblack",
+                photometric="rgb",
                 extratags=[(285, "s", 0, name, False)],
             )
 
 
-def _overlay_mask_on_slice(image: np.ndarray, mask: np.ndarray, *, alpha: float) -> np.ndarray:
-    gray = _to_u8_image(image)
-    rgb = np.repeat(gray[:, :, None], 3, axis=2).astype(np.float32)
-    m = mask.astype(bool)
-    if np.any(m):
-        rgb[m] = rgb[m] * (1.0 - alpha) + 255.0 * alpha
-    return np.clip(rgb, 0, 255).astype(np.uint8)
+def _overlay_mask_on_slice(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    alpha: float,
+    include_mask_panel: bool,
+) -> np.ndarray:
+    original = _gray_to_rgb(image)
+    overlay = _overlay_rgb(image, mask, alpha=alpha)
+    if not include_mask_panel:
+        return np.concatenate([original, overlay], axis=1)
+    mask_panel = _mask_to_rgb(mask)
+    return np.concatenate([original, mask_panel, overlay], axis=1)
 
 
 def _preview_full_z_values(z_range_full: tuple[int, int], step: int) -> list[int]:
@@ -531,13 +556,24 @@ def _write_overlay_jpgs(
     mask: np.ndarray,
     previews: list[tuple[int, int, int]],
     alpha: float,
+    include_mask_panel: bool,
+    quality: int,
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for actual_full, z_arr, local_z in previews:
-        overlay = _overlay_mask_on_slice(volume[local_z], mask[local_z], alpha=alpha)
+        overlay = _overlay_mask_on_slice(
+            volume[local_z],
+            mask[local_z],
+            alpha=alpha,
+            include_mask_panel=include_mask_panel,
+        )
         path = out_dir / f"mask_overlay_z{actual_full:06d}_levelz{z_arr:06d}.jpg"
-        if not cv2.imwrite(str(path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)):
+        if not cv2.imwrite(
+            str(path),
+            cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
+            [cv2.IMWRITE_JPEG_QUALITY, int(quality)],
+        ):
             raise RuntimeError(f"failed to write JPG preview: {path}")
         written += 1
     return written
@@ -549,6 +585,7 @@ def _write_preview_layered_tifs(
     volume: np.ndarray,
     mask: np.ndarray,
     previews: list[tuple[int, int, int]],
+    overlay_alpha: float,
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -558,6 +595,7 @@ def _write_preview_layered_tifs(
             out_path=path,
             original_slice=volume[local_z],
             mask_slice=mask[local_z],
+            overlay_alpha=overlay_alpha,
         )
         written += 1
     return written
@@ -670,6 +708,17 @@ def main() -> None:
         default=0.15,
         help="White mask overlay opacity for JPG previews (default: 0.15).",
     )
+    parser.add_argument(
+        "--no-jpg-mask-panel",
+        action="store_true",
+        help="Disable the exact binary mask panel in JPG previews.",
+    )
+    parser.add_argument(
+        "--jpg-quality",
+        type=int,
+        default=100,
+        help="JPEG quality for preview overlays (default: 100).",
+    )
     args = parser.parse_args()
 
     t0 = time.perf_counter()
@@ -746,6 +795,7 @@ def main() -> None:
         out_path=args.output,
         original_slice=volume[mid],
         mask_slice=mask[mid],
+        overlay_alpha=args.jpg_mask_alpha,
     )
     write_ms = (time.perf_counter() - write_t0) * 1000.0
     jpg_dir = args.jpg_dir
@@ -769,12 +819,15 @@ def main() -> None:
         mask=mask,
         previews=previews,
         alpha=args.jpg_mask_alpha,
+        include_mask_panel=not args.no_jpg_mask_panel,
+        quality=max(1, min(100, args.jpg_quality)),
     )
     preview_tif_count = _write_preview_layered_tifs(
         out_dir=preview_tif_dir,
         volume=volume,
         mask=mask,
         previews=previews,
+        overlay_alpha=args.jpg_mask_alpha,
     )
     preview_ms = (time.perf_counter() - preview_t0) * 1000.0
 
