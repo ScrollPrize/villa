@@ -438,6 +438,76 @@ def _mesh_oriented_shell_gt_normal(
 	return torch.where(flip.unsqueeze(-1), -target_n, target_n)
 
 
+def _prepare_shell_normal_targets(
+	*,
+	xyz: torch.Tensor,
+	target: torch.Tensor,
+	mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Fill invalid shell GT normals from mesh-aligned neighbors on the shell grid."""
+	target = _mesh_oriented_shell_gt_normal(xyz=xyz, target=target)
+	valid = mask > 0.0
+
+	H = int(target.shape[0])
+	W = int(target.shape[1])
+	dtype = target.dtype
+	device = target.device
+	fill_sum = torch.zeros_like(target)
+	conf_sum = torch.zeros((H, W), device=device, dtype=dtype)
+
+	if H > 1:
+		h_idx = torch.arange(H, device=device).view(H, 1).expand(H, W)
+		w_idx = torch.arange(W, device=device).view(1, W).expand(H, W)
+		prev_h = torch.where(valid, h_idx, torch.full_like(h_idx, -1)).cummax(dim=0).values
+		next_h = torch.where(valid, h_idx, torch.full_like(h_idx, H)).flip(0).cummin(dim=0).values.flip(0)
+		h_fill = (~valid) & (prev_h >= 0) & (next_h < H)
+		prev_h_c = prev_h.clamp(min=0, max=H - 1)
+		next_h_c = next_h.clamp(min=0, max=H - 1)
+		prev_t = target[prev_h_c, w_idx]
+		next_t = target[next_h_c, w_idx]
+		dist_total = (next_h - prev_h).to(dtype=dtype).clamp(min=1.0)
+		dist_prev = (h_idx - prev_h).to(dtype=dtype).clamp(min=0.0)
+		t = (dist_prev / dist_total).unsqueeze(-1)
+		h_target = F.normalize(prev_t * (1.0 - t) + next_t * t, dim=-1, eps=1.0e-8)
+		h_conf = torch.where(h_fill, 1.0 / dist_total, torch.zeros_like(dist_total))
+		fill_sum = fill_sum + h_target * h_conf.unsqueeze(-1)
+		conf_sum = conf_sum + h_conf
+
+	if W > 1:
+		row_has_valid = valid.any(dim=1, keepdim=True)
+		valid3 = valid.repeat(1, 3)
+		idx3 = torch.arange(W * 3, device=device).view(1, W * 3).expand(H, W * 3)
+		prev_w3 = torch.where(valid3, idx3, torch.full_like(idx3, -W * 3)).cummax(dim=1).values
+		next_w3 = torch.where(valid3, idx3, torch.full_like(idx3, W * 3)).flip(1).cummin(dim=1).values.flip(1)
+		center = torch.arange(W, W * 2, device=device).view(1, W).expand(H, W)
+		prev_w = prev_w3[:, W:W * 2]
+		next_w = next_w3[:, W:W * 2]
+		w_fill = (~valid) & row_has_valid.expand(H, W)
+		row_idx = torch.arange(H, device=device).view(H, 1).expand(H, W)
+		prev_mod = prev_w.remainder(W)
+		next_mod = next_w.remainder(W)
+		prev_t = target[row_idx, prev_mod]
+		next_t = target[row_idx, next_mod]
+		dist_prev = (center - prev_w).to(dtype=dtype).clamp(min=0.0)
+		dist_next = (next_w - center).to(dtype=dtype).clamp(min=0.0)
+		dist_total = (dist_prev + dist_next).clamp(min=1.0)
+		t = (dist_prev / dist_total).unsqueeze(-1)
+		w_target = F.normalize(prev_t * (1.0 - t) + next_t * t, dim=-1, eps=1.0e-8)
+		w_conf = torch.where(w_fill, 1.0 / dist_total, torch.zeros_like(dist_total))
+		fill_sum = fill_sum + w_target * w_conf.unsqueeze(-1)
+		conf_sum = conf_sum + w_conf
+
+	interp_valid = (~valid) & (conf_sum > 0.0)
+	fill_target = F.normalize(fill_sum / conf_sum.clamp(min=1.0e-8).unsqueeze(-1), dim=-1, eps=1.0e-8)
+	target_out = torch.where(valid.unsqueeze(-1), target, fill_target)
+	mask_out = torch.where(
+		valid,
+		torch.ones_like(mask, dtype=dtype),
+		torch.where(interp_valid, torch.full_like(mask, 0.5, dtype=dtype), torch.zeros_like(mask, dtype=dtype)),
+	)
+	return target_out, mask_out
+
+
 def _shell_normal_geometry_core(
 	xyz_lr: torch.Tensor,
 	base: torch.Tensor | None,
@@ -581,9 +651,12 @@ def _sample_shell_gt(
 	if target is None or grad_mag is None:
 		_shell_sample_cache_value[cache_key] = (None, None)
 		return _shell_sample_cache_value[cache_key]
+	target = target.squeeze(0) if int(target.shape[0]) == 1 and tuple(target.shape[1:-1]) == tuple(xyz.shape[:-1]) else target
+	mask = grad_mag.squeeze(0).squeeze(0)
+	mask = mask.squeeze(0) if int(mask.shape[0]) == 1 and tuple(mask.shape[1:]) == tuple(xyz.shape[:-1]) else mask
 	_shell_sample_cache_value[cache_key] = (
-		target.squeeze(0),
-		(grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz.dtype),
+		target,
+		(mask > 0.0).to(dtype=xyz.dtype),
 	)
 	return _shell_sample_cache_value[cache_key]
 
@@ -742,6 +815,7 @@ def cyl_normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		target, mask = _sample_shell_gt(res=res, xyz=xyz)
 		if target is None or mask is None:
 			return _zero_loss(res)
+		target, mask = _prepare_shell_normal_targets(xyz=xyz, target=target, mask=mask)
 		err, lm, dot_abs = _run_shell_normal_compute_core(
 			xyz_lr,
 			base,
