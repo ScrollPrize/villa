@@ -965,8 +965,8 @@ def add_create_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--grow-xy-iterations",
         type=int,
-        default=50,
-        help="Threshold-gated growth iterations in X/Y after the initial mask (default: 50).",
+        default=150,
+        help="Threshold-gated growth iterations in X/Y after the initial mask (default: 150).",
     )
     parser.add_argument(
         "--image-close-iterations",
