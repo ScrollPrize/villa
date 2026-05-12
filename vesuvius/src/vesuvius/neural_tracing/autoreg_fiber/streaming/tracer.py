@@ -140,10 +140,16 @@ class FiberTracer:
                 f"prompt_length={self.prompt_length} to prime the cache"
             )
 
-        # Anchor on the median of the prompt so the prompt is centered in the window.
+        # The trainer anchors each 128^3 window on the AABB midpoint of the
+        # 8 prompt + 32 target points, so the prompt sits at *one edge* of the
+        # window with empty space ahead for the predicted trajectory. Inference
+        # has to mimic that or the model loses its sense of direction. We
+        # estimate the prompt's tangent from the last two prompt points and
+        # push the anchor forward by half the crop along that tangent.
         prompt_tail = prompt_world_zyx[-self.prompt_length :]
-        self.reader.anchor_on(prompt_tail.mean(axis=0))
-        prefetch and self.reader.prefetch_anchor(prompt_tail[-1])
+        anchor_offset_world = self._anchor_offset_along_prompt(prompt_tail)
+        self.reader.anchor_on(prompt_tail[-1] + anchor_offset_world)
+        prefetch and self.reader.prefetch_anchor(prompt_tail[-1] + anchor_offset_world)
 
         # Prime KV-cache.
         outputs, cache, step_position = self._init_at_current_anchor(prompt_tail)
@@ -204,15 +210,16 @@ class FiberTracer:
                 force_reanchor = steps_in_window >= self.max_steps_per_window
                 if force_reanchor or self.reader.needs_reanchor(local_xyz):
                     last_k_world = np.asarray(polyline[-self.prompt_length :], dtype=np.float32)
-                    self.reader.anchor_on(world_xyz)
+                    # Same edge-anchor strategy as the initial prompt: push the
+                    # window forward of the leading point so the rebuilt prompt
+                    # sits at one edge of the new crop, matching training.
+                    anchor_offset = self._anchor_offset_along_prompt(last_k_world)
+                    self.reader.anchor_on(world_xyz + anchor_offset)
                     outputs, cache, step_position = self._init_at_current_anchor(last_k_world)
                     reanchors += 1
                     if prefetch:
-                        # Eagerly prefetch the *next* probable window along the trajectory.
-                        tangent = self._tangent_estimate(polyline)
-                        if tangent is not None:
-                            forecast = world_xyz + tangent * (self.reader.crop_size[0] * 0.5)
-                            self.reader.prefetch_anchor(forecast)
+                        forecast = world_xyz + anchor_offset * 2.0
+                        self.reader.prefetch_anchor(forecast)
                     continue
 
                 # 4) one cached step.
@@ -412,6 +419,36 @@ class FiberTracer:
         if norm < 1e-6:
             return None
         return diff / norm
+
+    def _anchor_offset_along_prompt(self, prompt_world_zyx: np.ndarray) -> np.ndarray:
+        """Offset from the prompt's leading point to the desired window anchor.
+
+        The trainer anchors the 128^3 crop on the AABB midpoint of the 8 prompt
+        + 32 target points; the prompt thus sits at one edge of the crop with
+        empty space ahead for the predicted trajectory. We mimic that here by
+        pushing the anchor forward of the prompt's leading point by half the
+        crop's smallest axis along the prompt's tangent direction. Returns a
+        ``(3,)`` float32 vector in the same (z, y, x) frame as the prompt.
+        """
+
+        arr = np.asarray(prompt_world_zyx, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] < 2:
+            return np.zeros(3, dtype=np.float32)
+        # Average of the last-segment tangents in the prompt: robust to a single
+        # noisy point and matches the smooth tangent the trainer's
+        # `_tangent_vectors` averages over the whole prompt.
+        diffs = np.diff(arr, axis=0).astype(np.float32)
+        norms = np.linalg.norm(diffs, axis=1, keepdims=True)
+        unit = diffs / np.clip(norms, 1e-6, None)
+        tangent = unit.mean(axis=0)
+        tnorm = float(np.linalg.norm(tangent))
+        if tnorm < 1e-6:
+            return np.zeros(3, dtype=np.float32)
+        tangent = tangent / tnorm
+        # Half the smallest crop axis: prompt at one edge, ~target_length steps
+        # worth of room (at ~4-voxel stride, target_length=32 -> 128 voxels).
+        push = float(min(self.reader.crop_size)) * 0.5
+        return (tangent * push).astype(np.float32)
 
 
 __all__ = ["BidirectionalResult", "FiberTracer", "TraceResult"]
