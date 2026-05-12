@@ -826,6 +826,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit rasterizeSegmentsRequested(rasterizeTargets);
     });
 
+    // Merge tifxyz only makes sense for >=2 surfaces; gate on selection
+    // so it doesn't appear when the user right-clicks a single segment.
+    if (selectedSegmentIds.size() >= 2) {
+        QAction* mergeAction = contextMenu.addAction(tr("Merge tifxyz..."));
+        connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
+            emit mergeTifxyzRequested(selectedSegmentIds);
+        });
+    }
+
     QAction* addIgnoreLabelAction = contextMenu.addAction(tr("Add ignore label"));
     connect(addIgnoreLabelAction, &QAction::triggered, this, [this]() {
         emit addIgnoreLabelRequested();

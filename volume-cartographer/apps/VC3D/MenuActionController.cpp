@@ -160,6 +160,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
+    _mergeTifxyzAct = new QAction(QObject::tr("Merge tifxyz..."), this);
+    connect(_mergeTifxyzAct, &QAction::triggered,
+            this, &MenuActionController::mergeTifxyzFromMenuRequested);
+
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -209,6 +213,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
     _actionsMenu->addAction(_drawBBoxAct);
+    _actionsMenu->addSeparator();
+    _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);
