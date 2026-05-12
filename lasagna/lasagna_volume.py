@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+LASAGNA_VOLUME_VERSION = 2
+
+
 @dataclass
 class ChannelGroup:
 	"""One zarr array containing one or more channels at a common resolution."""
@@ -44,7 +47,7 @@ class ChannelGroup:
 class LasagnaVolume:
 	"""In-memory representation of a .lasagna.json manifest."""
 	path: Path
-	version: int = 1
+	version: int = LASAGNA_VOLUME_VERSION
 	source_to_base: float = 1.0
 	crops: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
 	base_shape_zyx: tuple[int, int, int] | None = None
@@ -110,9 +113,18 @@ class LasagnaVolume:
 				"Lasagna volumes must be described by a .lasagna.json manifest."
 			)
 		d = json.loads(p.read_text(encoding="utf-8"))
-		version = int(d.get("version", 1))
-		if version != 1:
-			raise ValueError(f"unsupported lasagna volume version: {version}")
+		version_raw = d.get("version")
+		if version_raw is None:
+			raise ValueError(
+				f"lasagna volume {p} missing required 'version'; "
+				f"expected {LASAGNA_VOLUME_VERSION}"
+			)
+		version = int(version_raw)
+		if version != LASAGNA_VOLUME_VERSION:
+			raise ValueError(
+				f"unsupported lasagna volume version: {version}; "
+				f"expected {LASAGNA_VOLUME_VERSION}"
+			)
 		umbilicus_json = str(d.get("umbilicus_json", "")).strip()
 		if not umbilicus_json:
 			raise ValueError(f"lasagna volume {p} missing required 'umbilicus_json'")

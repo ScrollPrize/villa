@@ -11,9 +11,6 @@ import numpy as np
 import zarr
 
 
-LASAGNA_PYRAMID_VERSION = 2
-
-
 def shape_div2(shape: tuple[int, int, int], n: int) -> tuple[int, int, int]:
 	z, y, x = (int(v) for v in shape)
 	for _ in range(max(0, int(n))):
@@ -77,7 +74,6 @@ def omezarr_chunk_exists(
 
 
 def set_pyramid_metadata(group: zarr.Group, *, method: str) -> None:
-	group.attrs["lasagna_pyramid_version"] = int(LASAGNA_PYRAMID_VERSION)
 	group.attrs["lasagna_pyramid_downsample"] = method
 
 

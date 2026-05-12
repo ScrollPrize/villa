@@ -39,14 +39,12 @@ import zarr
 
 try:
 	from omezarr_pyramid import (
-		LASAGNA_PYRAMID_VERSION,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
 		set_pyramid_metadata,
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
-		LASAGNA_PYRAMID_VERSION,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
 		set_pyramid_metadata,

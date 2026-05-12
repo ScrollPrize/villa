@@ -24,7 +24,6 @@ if str(_LASAGNA_DIR) not in sys.path:
 
 from lasagna_volume import LasagnaVolume
 from omezarr_pyramid import (
-    LASAGNA_PYRAMID_VERSION,
     build_scalar_omezarr_pyramid,
     clear_coarser_levels,
     omezarr_chunk_exists,
@@ -890,8 +889,7 @@ def run_maskout(args: argparse.Namespace) -> None:
     )
     pyr_ms = (time.perf_counter() - pyr_t0) * 1000.0
     print(
-        f"[maskout] rebuilt grad_mag lower scales with pyramid_version={LASAGNA_PYRAMID_VERSION} "
-        f"in {pyr_ms:.1f}ms",
+        f"[maskout] rebuilt grad_mag lower scales in {pyr_ms:.1f}ms",
         flush=True,
     )
 

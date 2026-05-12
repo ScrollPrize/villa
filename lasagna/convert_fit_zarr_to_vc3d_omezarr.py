@@ -12,14 +12,12 @@ import zarr
 
 try:
 	from omezarr_pyramid import (
-		LASAGNA_PYRAMID_VERSION,
 		build_normal_omezarr_pyramid,
 		downsample_scalar_chunk_worker,
 		set_pyramid_metadata,
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
-		LASAGNA_PYRAMID_VERSION,
 		build_normal_omezarr_pyramid,
 		downsample_scalar_chunk_worker,
 		set_pyramid_metadata,
@@ -467,7 +465,6 @@ def run(
 			"base_full_shape": list(base_full_shape),
 			"levels": levels,
 			"first_filled_level": first_filled_level,
-			"lasagna_pyramid_version": LASAGNA_PYRAMID_VERSION,
 		}
 
 		elapsed_ch = time.time() - t0
