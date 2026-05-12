@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import Any
 
@@ -8,12 +9,16 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from vesuvius.models.build.pretrained_backbones.dinov2 import build_dinov2_backbone
-from vesuvius.models.build.pretrained_backbones.rope import MixedRopePositionEmbedding
+from vesuvius.models.build.pretrained_backbones.rope import (
+    MixedRopePositionEmbedding,
+    apply_rotary_embedding,
+)
 from vesuvius.neural_tracing.autoreg_fiber.config import validate_autoreg_fiber_config
 from vesuvius.neural_tracing.autoreg_fiber.serialization import IGNORE_INDEX
 from vesuvius.neural_tracing.autoreg_mesh.model import (
     ATTENTION_SCALING_STANDARD,
     DecoderBlock,
+    _batched_rope_from_coords,
     _normalize_attention_scaling_mode,
     _resolve_rope_dtype,
 )
@@ -22,6 +27,31 @@ from vesuvius.neural_tracing.autoreg_mesh.model import (
 PROMPT_TOKEN_TYPE = 0
 GENERATED_TOKEN_TYPE = 1
 START_TOKEN_TYPE = 2
+
+
+@dataclasses.dataclass
+class FiberKVCache:
+    """Per-layer KV cache for streaming autoregressive inference on the fiber decoder.
+
+    `self_attn_kv[i]` is the cumulative `(k, v)` for block `i`'s self-attention,
+    shape `(B, num_heads, seq_len, head_dim)` after the embedding chain of
+    `prompt + START + N stepped tokens`. `cross_attn_kv[i]` holds the K/V over
+    the (static, per-window) memory tokens for blocks that have cross-attention;
+    it is `None` for blocks without.
+
+    The cache also stores the last input token's `xyz` and `valid` so that the
+    tangent-conditioning input on the next step is identical to what
+    `forward_from_encoded` would produce on a length-(t+1) generation buffer.
+    Optionally caches the pointer-head key projections (constant per window).
+    """
+
+    self_attn_kv: list[tuple[Tensor, Tensor]]
+    cross_attn_kv: list[tuple[Tensor, Tensor] | None]
+    seq_len: int
+    last_input_xyz: Tensor
+    last_input_valid: Tensor
+    pointer_key_norm: Tensor | None = None
+    axis_pointer_keys: dict[str, Tensor] | None = None
 
 
 class AutoregFiberModel(nn.Module):
@@ -653,6 +683,327 @@ class AutoregFiberModel(nn.Module):
         coords = torch.maximum(coords, torch.zeros_like(coords))
         return torch.minimum(coords, max_coord.view(1, 1, 3))
 
+    # --- KV-cache fast inference -------------------------------------------- #
+
+    def _precompute_pointer_key_cache(self, memory_tokens: Tensor) -> tuple[Tensor | None, dict[str, Tensor] | None]:
+        """Precompute the per-window pointer-key tensors used by the coarse head.
+
+        Returns ``(pointer_key_norm, axis_pointer_keys)`` where exactly one is non-None
+        depending on ``coarse_prediction_mode``. The values are constant across all
+        generation steps that share the same memory tokens, so callers can reuse them.
+        """
+
+        if self.coarse_prediction_mode == "joint_pointer":
+            with torch.autocast(device_type=memory_tokens.device.type, enabled=False):
+                mem_f = memory_tokens.float()
+                return F.normalize(self.pointer_key(mem_f), dim=-1), None
+        z_memory, y_memory, x_memory = self._factorized_axis_memory(memory_tokens)
+        with torch.autocast(device_type=memory_tokens.device.type, enabled=False):
+            axis_keys = {
+                "z": F.normalize(self.pointer_key_z(z_memory), dim=-1),
+                "y": F.normalize(self.pointer_key_y(y_memory), dim=-1),
+                "x": F.normalize(self.pointer_key_x(x_memory), dim=-1),
+            }
+        return None, axis_keys
+
+    def _compute_outputs_from_hidden(
+        self,
+        hidden: Tensor,
+        memory_tokens: Tensor,
+        *,
+        pointer_key_norm: Tensor | None = None,
+        axis_pointer_keys: dict[str, Tensor] | None = None,
+    ) -> dict[str, Any]:
+        """Run the prediction heads on a hidden slice. Mirrors the head section of
+        ``forward_from_encoded`` but supports optional cached pointer keys so that the
+        constant per-window projections are not redone on every step."""
+
+        if self.coarse_prediction_mode == "joint_pointer":
+            with torch.autocast(device_type=hidden.device.type, enabled=False):
+                hidden_f = hidden.float()
+                if pointer_key_norm is None:
+                    mem_f = memory_tokens.float()
+                    pointer_k = F.normalize(self.pointer_key(mem_f), dim=-1)
+                else:
+                    pointer_k = pointer_key_norm
+                pointer_q = F.normalize(self.pointer_query(hidden_f), dim=-1)
+                coarse_logits = torch.einsum("btd,bnd->btn", pointer_q, pointer_k) / self.pointer_temperature
+            pred_coarse_ids = coarse_logits.argmax(dim=-1)
+            z_ids, y_ids, x_ids = self._unflatten_coarse_ids(pred_coarse_ids)
+            coarse_outputs: dict[str, Any] = {
+                "coarse_logits": coarse_logits,
+                "coarse_axis_logits": None,
+                "pred_coarse_ids": pred_coarse_ids,
+                "pred_coarse_axis_ids": {"z": z_ids, "y": y_ids, "x": x_ids},
+            }
+        else:
+            if axis_pointer_keys is None:
+                _, axis_pointer_keys = self._precompute_pointer_key_cache(memory_tokens)
+            assert axis_pointer_keys is not None
+            with torch.autocast(device_type=hidden.device.type, enabled=False):
+                hidden_f = hidden.float()
+                z_query = F.normalize(self.pointer_query_z(hidden_f), dim=-1)
+                y_query = F.normalize(self.pointer_query_y(hidden_f), dim=-1)
+                x_query = F.normalize(self.pointer_query_x(hidden_f), dim=-1)
+                z_logits = torch.einsum("btd,bzd->btz", z_query, axis_pointer_keys["z"]) / self.pointer_temperature
+                y_logits = torch.einsum("btd,byd->bty", y_query, axis_pointer_keys["y"]) / self.pointer_temperature
+                x_logits = torch.einsum("btd,bxd->btx", x_query, axis_pointer_keys["x"]) / self.pointer_temperature
+            z_ids = z_logits.argmax(dim=-1)
+            y_ids = y_logits.argmax(dim=-1)
+            x_ids = x_logits.argmax(dim=-1)
+            pred_coarse_ids = self._flatten_coarse_axis_ids(z_ids, y_ids, x_ids)
+            coarse_outputs = {
+                "coarse_logits": None,
+                "coarse_axis_logits": {"z": z_logits, "y": y_logits, "x": x_logits},
+                "pred_coarse_ids": pred_coarse_ids,
+                "pred_coarse_axis_ids": {"z": z_ids, "y": y_ids, "x": x_ids},
+            }
+
+        max_bins = max(self.offset_num_bins)
+        offset_logits = self.offset_head(hidden).reshape(hidden.shape[0], hidden.shape[1], 3, max_bins)
+        stop_logits = self.stop_head(hidden).squeeze(-1)
+        pred_offset_bins = []
+        for axis, bins in enumerate(self.offset_num_bins):
+            pred_offset_bins.append(offset_logits[:, :, axis, :bins].argmax(dim=-1))
+        pred_offset_bins_tensor = torch.stack(pred_offset_bins, dim=-1)
+        pred_refine_residual = self.position_refine_head(hidden)
+        return {
+            "coarse_logits": coarse_outputs["coarse_logits"],
+            "coarse_axis_logits": coarse_outputs["coarse_axis_logits"],
+            "offset_logits": offset_logits,
+            "stop_logits": stop_logits,
+            "pred_coarse_ids": coarse_outputs["pred_coarse_ids"],
+            "pred_coarse_axis_ids": coarse_outputs["pred_coarse_axis_ids"],
+            "pred_offset_bins": pred_offset_bins_tensor,
+            "pred_refine_residual": pred_refine_residual,
+            "coarse_prediction_mode": self.coarse_prediction_mode,
+        }
+
+    @torch.inference_mode()
+    def init_kv_cache(
+        self,
+        *,
+        prompt_tokens: dict[str, Tensor],
+        prompt_anchor_xyz: Tensor,
+        prompt_anchor_valid: Tensor,
+        target_start_position: int | Tensor,
+        memory_tokens: Tensor,
+        memory_patch_centers: Tensor,
+    ) -> tuple[dict[str, Any], FiberKVCache]:
+        """Prime the KV cache with ``prompt + START`` and return the head outputs
+        for the START position (i.e. the model's prediction for the first generated
+        point).
+
+        After this call, ``cache.seq_len == prompt_len + 1``, and a single call to
+        :meth:`step_from_encoded_cached` advances by one step.
+
+        Equivalent (up to floating-point ordering) to a call to
+        :meth:`forward_from_encoded` with a teacher-forced generation buffer of
+        length 1.
+        """
+
+        device = memory_tokens.device
+        batch_size = int(memory_tokens.shape[0])
+
+        # Embed the prompt by itself so prompt-internal tangents match training.
+        prompt_token_type = torch.full_like(prompt_tokens["coarse_ids"], PROMPT_TOKEN_TYPE)
+        prompt_embeddings, prompt_coords = self._build_input_embeddings(
+            coarse_ids=prompt_tokens["coarse_ids"],
+            offset_bins=prompt_tokens["offset_bins"],
+            xyz=prompt_tokens["xyz"],
+            positions=prompt_tokens["positions"],
+            token_type=prompt_token_type,
+            sequence_mask=prompt_tokens["mask"],
+            geometry_valid_mask=prompt_tokens["valid_mask"],
+            memory_tokens=memory_tokens,
+        )
+
+        # Build a single START token that consumes the prompt anchor xyz.
+        start_coarse_ids = torch.full((batch_size, 1), IGNORE_INDEX, dtype=torch.long, device=device)
+        start_offset_bins = torch.full((batch_size, 1, 3), IGNORE_INDEX, dtype=torch.long, device=device)
+        anchor = prompt_anchor_xyz
+        if anchor.ndim == 2:
+            start_xyz = anchor.unsqueeze(1)
+        elif anchor.ndim == 3:
+            start_xyz = anchor
+        else:
+            raise ValueError(f"prompt_anchor_xyz must be (B,3) or (B,1,3); got {tuple(anchor.shape)}")
+        if isinstance(target_start_position, int):
+            start_positions = torch.full((batch_size, 1), int(target_start_position), dtype=torch.long, device=device)
+        else:
+            start_positions = target_start_position.to(device=device, dtype=torch.long).view(batch_size, 1)
+        start_token_type = torch.full((batch_size, 1), START_TOKEN_TYPE, dtype=torch.long, device=device)
+        start_seq_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+        if prompt_anchor_valid.ndim == 1:
+            start_geom_valid = prompt_anchor_valid.view(batch_size, 1)
+        else:
+            start_geom_valid = prompt_anchor_valid.view(batch_size, 1)
+        start_embeddings, start_coords = self._build_input_embeddings(
+            coarse_ids=start_coarse_ids,
+            offset_bins=start_offset_bins,
+            xyz=start_xyz,
+            positions=start_positions,
+            token_type=start_token_type,
+            sequence_mask=start_seq_mask,
+            geometry_valid_mask=start_geom_valid,
+            memory_tokens=memory_tokens,
+        )
+
+        seq_embeddings = torch.cat([prompt_embeddings, start_embeddings], dim=1)
+        seq_coords = torch.cat([prompt_coords, start_coords], dim=1)
+        seq_mask = torch.cat([prompt_tokens["mask"], start_seq_mask], dim=1)
+        attn_mask = self._build_attention_mask(seq_mask, dtype=seq_embeddings.dtype)
+
+        self_attn_kv: list[tuple[Tensor, Tensor]] = []
+        cross_attn_kv: list[tuple[Tensor, Tensor] | None] = []
+        x = seq_embeddings
+        for block in self.blocks:
+            batch_size_b, seq_len_b, dim_b = x.shape
+            qkv = block.self_attn.qkv(block.norm1(x)).reshape(
+                batch_size_b, seq_len_b, 3, block.self_attn.num_heads, block.self_attn.head_dim
+            )
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            sin, cos = _batched_rope_from_coords(block.self_attn.rope, seq_coords)
+            q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
+            k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
+            self_attn_kv.append((k, v))
+            q = block.self_attn._scale_queries(q)
+            sa_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+            )
+            sa_out = sa_out.transpose(1, 2).reshape(batch_size_b, seq_len_b, dim_b)
+            x = x + block.self_attn.proj(sa_out)
+            if block.cross_attn is not None:
+                ca_k, ca_v = block.cross_attn.precompute_kv(memory_tokens, memory_coords=memory_patch_centers)
+                cross_attn_kv.append((ca_k, ca_v))
+                x = x + block.cross_attn.forward_cached(
+                    block.norm2(x), ca_k, ca_v, query_coords=seq_coords
+                )
+            else:
+                cross_attn_kv.append(None)
+            x = x + block.ffn(block.norm3(x))
+            x = x * seq_mask.unsqueeze(-1).to(dtype=x.dtype)
+        x = self.final_norm(x)
+
+        hidden_last = x[:, -1:, :]
+        pointer_key_norm, axis_pointer_keys = self._precompute_pointer_key_cache(memory_tokens)
+        outputs = self._compute_outputs_from_hidden(
+            hidden_last,
+            memory_tokens,
+            pointer_key_norm=pointer_key_norm,
+            axis_pointer_keys=axis_pointer_keys,
+        )
+
+        cache = FiberKVCache(
+            self_attn_kv=self_attn_kv,
+            cross_attn_kv=cross_attn_kv,
+            seq_len=int(seq_mask.shape[1]),
+            last_input_xyz=start_xyz.squeeze(1),
+            last_input_valid=start_geom_valid.squeeze(1),
+            pointer_key_norm=pointer_key_norm,
+            axis_pointer_keys=axis_pointer_keys,
+        )
+        return outputs, cache
+
+    @torch.inference_mode()
+    def step_from_encoded_cached(
+        self,
+        *,
+        next_coarse_ids: Tensor,
+        next_offset_bins: Tensor,
+        next_xyz: Tensor,
+        next_position: Tensor,
+        cache: FiberKVCache,
+        memory_tokens: Tensor,
+    ) -> tuple[dict[str, Any], FiberKVCache]:
+        """Advance the cache by exactly one generated token.
+
+        ``next_coarse_ids``, ``next_offset_bins``, ``next_xyz`` describe the *input*
+        for the new generation step (typically the previous step's prediction).
+        Shapes: ``(B, 1)``, ``(B, 1, 3)``, ``(B, 1, 3)``. ``next_position`` is
+        ``(B, 1)`` (long).
+
+        The new token's tangent-conditioning input is computed from
+        ``cache.last_input_xyz`` and the new ``next_xyz`` so the embedding is
+        bit-equivalent to what :meth:`forward_from_encoded` would produce on the
+        full generation buffer.
+        """
+
+        device = memory_tokens.device
+        batch_size = int(memory_tokens.shape[0])
+        if next_coarse_ids.shape != (batch_size, 1):
+            raise ValueError(f"next_coarse_ids must be (B,1); got {tuple(next_coarse_ids.shape)}")
+        if next_offset_bins.shape != (batch_size, 1, 3):
+            raise ValueError(f"next_offset_bins must be (B,1,3); got {tuple(next_offset_bins.shape)}")
+        if next_xyz.shape != (batch_size, 1, 3):
+            raise ValueError(f"next_xyz must be (B,1,3); got {tuple(next_xyz.shape)}")
+
+        # Build a (B, 2, *) input where index 0 is the *previous* input and index 1
+        # is the new one. We only keep the new token's embedding; the previous-token
+        # slot exists solely so that ``_build_input_embeddings`` computes the tangent
+        # exactly as the non-cached forward path would.
+        prev_coarse = torch.full((batch_size, 1), IGNORE_INDEX, dtype=torch.long, device=device)
+        prev_offset = torch.full((batch_size, 1, 3), IGNORE_INDEX, dtype=torch.long, device=device)
+        prev_xyz = cache.last_input_xyz.view(batch_size, 1, 3).to(device=device, dtype=next_xyz.dtype)
+        prev_valid = cache.last_input_valid.view(batch_size, 1).to(device=device, dtype=torch.bool)
+        # The previous position number is only used by the position embedding for the
+        # previous slot, whose final embedding we discard, so any in-range value works.
+        prev_position = (next_position.to(device=device, dtype=torch.long) - 1).clamp(min=0)
+        prev_token_type = torch.full((batch_size, 1), GENERATED_TOKEN_TYPE, dtype=torch.long, device=device)
+        new_token_type = torch.full((batch_size, 1), GENERATED_TOKEN_TYPE, dtype=torch.long, device=device)
+
+        combined_coarse = torch.cat([prev_coarse, next_coarse_ids.to(device=device, dtype=torch.long)], dim=1)
+        combined_offset = torch.cat([prev_offset, next_offset_bins.to(device=device, dtype=torch.long)], dim=1)
+        combined_xyz = torch.cat([prev_xyz, next_xyz.to(device=device, dtype=prev_xyz.dtype)], dim=1)
+        combined_positions = torch.cat([prev_position, next_position.to(device=device, dtype=torch.long).view(batch_size, 1)], dim=1)
+        combined_token_type = torch.cat([prev_token_type, new_token_type], dim=1)
+        combined_seq_mask = torch.ones((batch_size, 2), dtype=torch.bool, device=device)
+        new_valid = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+        combined_geom_valid = torch.cat([prev_valid, new_valid], dim=1)
+
+        combined_embeddings, combined_coords = self._build_input_embeddings(
+            coarse_ids=combined_coarse,
+            offset_bins=combined_offset,
+            xyz=combined_xyz,
+            positions=combined_positions,
+            token_type=combined_token_type,
+            sequence_mask=combined_seq_mask,
+            geometry_valid_mask=combined_geom_valid,
+            memory_tokens=memory_tokens,
+        )
+        new_embedding = combined_embeddings[:, 1:2, :]
+        new_coords = combined_coords[:, 1:2, :]
+
+        new_self_attn_kv: list[tuple[Tensor, Tensor]] = []
+        x = new_embedding
+        for layer_idx, block in enumerate(self.blocks):
+            x, (full_k, full_v) = block.forward_cached(
+                x,
+                new_coords,
+                cache.self_attn_kv[layer_idx],
+                cache.cross_attn_kv[layer_idx],
+            )
+            new_self_attn_kv.append((full_k, full_v))
+        x = self.final_norm(x)
+
+        outputs = self._compute_outputs_from_hidden(
+            x,
+            memory_tokens,
+            pointer_key_norm=cache.pointer_key_norm,
+            axis_pointer_keys=cache.axis_pointer_keys,
+        )
+        new_cache = FiberKVCache(
+            self_attn_kv=new_self_attn_kv,
+            cross_attn_kv=cache.cross_attn_kv,
+            seq_len=cache.seq_len + 1,
+            last_input_xyz=combined_xyz[:, 1, :].to(dtype=cache.last_input_xyz.dtype),
+            last_input_valid=new_valid.squeeze(1),
+            pointer_key_norm=cache.pointer_key_norm,
+            axis_pointer_keys=cache.axis_pointer_keys,
+        )
+        return outputs, new_cache
+
 
 def build_pseudo_inference_batch(
     *,
@@ -692,6 +1043,7 @@ __all__ = [
     "PROMPT_TOKEN_TYPE",
     "START_TOKEN_TYPE",
     "AutoregFiberModel",
+    "FiberKVCache",
     "build_pseudo_inference_batch",
     "count_trainable_parameters",
 ]
