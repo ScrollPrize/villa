@@ -37,6 +37,21 @@ import torch
 import torch.nn.functional as F
 import zarr
 
+try:
+	from omezarr_pyramid import (
+		LASAGNA_PYRAMID_VERSION,
+		build_normal_omezarr_pyramid,
+		build_scalar_omezarr_pyramid,
+		set_pyramid_metadata,
+	)
+except ImportError:
+	from lasagna.omezarr_pyramid import (
+		LASAGNA_PYRAMID_VERSION,
+		build_normal_omezarr_pyramid,
+		build_scalar_omezarr_pyramid,
+		set_pyramid_metadata,
+	)
+
 from common import load_unet, unet_infer_tiled
 from train_unet_3d import build_model as build_model_3d
 
@@ -646,6 +661,7 @@ def _create_omezarr(
 		],
 		"datasets": datasets,
 	}]
+	set_pyramid_metadata(g, method="mean_pool2x")
 	return g
 
 
@@ -699,91 +715,16 @@ def _build_omezarr_pyramid(
 	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
 	label: str = "",
 ) -> None:
-	"""Build coarser pyramid levels by parallel 2x downsampling.
-
-	Uses the same chunk-aligned multiprocessing approach as the VC3D
-	converter: each worker reads a 2×chunk region from level N and writes
-	one chunk to level N+1.  No write contention.
-	"""
-	import multiprocessing as _mp
-
-	from convert_fit_zarr_to_vc3d_omezarr import (
-		_downsample_chunk_worker, _print_progress,
+	"""Build coarser scalar pyramid levels by chunked 2x mean pooling."""
+	build_scalar_omezarr_pyramid(
+		omezarr_path,
+		data_level,
+		n_levels,
+		chunk,
+		workers=workers,
+		crop_zyx=crop_zyx,
+		label=label,
 	)
-
-	if workers <= 0:
-		workers = max(1, _mp.cpu_count())
-
-	g = zarr.open_group(str(omezarr_path), mode="r+")
-
-	# Crop region at the data level (if given), halved for each coarser level
-	if crop_zyx is not None:
-		cz0_base, cy0_base, cx0_base, cz1_base, cy1_base, cx1_base = crop_zyx
-	else:
-		cz0_base = cy0_base = cx0_base = 0
-		cz1_base = cy1_base = cx1_base = None  # full extent
-
-	for lv in range(data_level + 1, n_levels):
-		src_shape = tuple(int(v) for v in g[str(lv - 1)].shape)
-		dst_shape = tuple(int(v) for v in g[str(lv)].shape)
-		cz2 = chunk * 2
-
-		# Scale crop to source level (halve per level above data_level)
-		levels_above = lv - 1 - data_level
-		scale = 2 ** levels_above
-		sz0 = (cz0_base // scale // cz2) * cz2 if cz1_base is not None else 0
-		sy0 = (cy0_base // scale // cz2) * cz2 if cy1_base is not None else 0
-		sx0 = (cx0_base // scale // cz2) * cz2 if cx1_base is not None else 0
-		sz1 = min(src_shape[0], ((cz1_base // scale + cz2 - 1) // cz2) * cz2) if cz1_base is not None else src_shape[0]
-		sy1 = min(src_shape[1], ((cy1_base // scale + cz2 - 1) // cz2) * cz2) if cy1_base is not None else src_shape[1]
-		sx1 = min(src_shape[2], ((cx1_base // scale + cz2 - 1) // cz2) * cz2) if cx1_base is not None else src_shape[2]
-
-		ds_work = []
-		skipped_ds = 0
-		for z0 in range(sz0, sz1, cz2):
-			z1 = min(sz1, z0 + cz2)
-			for y0 in range(sy0, sy1, cz2):
-				y1 = min(sy1, y0 + cz2)
-				for x0 in range(sx0, sx1, cz2):
-					x1 = min(sx1, x0 + cz2)
-					# Skip if dest chunk already exists
-					if _omezarr_chunk_exists(omezarr_path, lv, z0 // 2, y0 // 2, x0 // 2, chunk):
-						skipped_ds += 1
-						continue
-					ds_work.append((
-						str(omezarr_path), lv - 1, lv,
-						z0, z1, y0, y1, x0, x1,
-					))
-
-		n_ds = len(ds_work)
-		tag = f"[pyramid {label} L{lv}]" if label else f"[pyramid L{lv}]"
-		if skipped_ds > 0:
-			print(f"{tag} skipped {skipped_ds} existing chunks", flush=True)
-		if n_ds == 0:
-			continue
-
-		t_lv = time.time()
-		done_count = [0]
-		lock = threading.Lock()
-		_stop = threading.Event()
-		def _prog():
-			while not _stop.is_set():
-				with lock:
-					d = done_count[0]
-				_print_progress(prefix=tag, done=d, total=n_ds, t0=t_lv)
-				_stop.wait(0.5)
-		prog_thread = threading.Thread(target=_prog, daemon=True)
-		prog_thread.start()
-
-		with _mp.Pool(processes=min(workers, n_ds)) as pool:
-			for _ in pool.imap_unordered(_downsample_chunk_worker, ds_work):
-				with lock:
-					done_count[0] += 1
-
-		_stop.set()
-		prog_thread.join(timeout=2)
-		_print_progress(prefix=tag, done=n_ds, total=n_ds, t0=t_lv)
-		print("", flush=True)
 
 
 def _find_resume_z(omezarr_path: str, level: int) -> int:
@@ -2784,10 +2725,17 @@ def run_preprocess_3d(
 	for path, data_lv, name, crop in [
 		(cos_omezarr_path, cos_level, "cos", cos_crop_zyx),
 		(gm_omezarr_path, other_level, "grad_mag", other_crop_zyx),
-		(nx_omezarr_path, other_level, "nx", other_crop_zyx),
-		(ny_omezarr_path, other_level, "ny", other_crop_zyx),
 	]:
 		_build_omezarr_pyramid(path, data_lv, n_levels, oc, crop_zyx=crop, label=name)
+	build_normal_omezarr_pyramid(
+		nx_omezarr_path,
+		ny_omezarr_path,
+		other_level,
+		n_levels,
+		oc,
+		crop_zyx=other_crop_zyx,
+		label="normal",
+	)
 	if dt_omezarr_path:
 		_build_omezarr_pyramid(dt_omezarr_path, cos_level, n_levels, oc, crop_zyx=cos_crop_zyx, label="pred_dt")
 

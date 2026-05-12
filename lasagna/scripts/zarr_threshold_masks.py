@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""Create a debug mask for empty/low-value regions in a zarr volume slab.
-
-The script is intentionally slab-local for initial testing: it reads a z-range
-from a 3D zarr array, builds the mask in 3D, and writes a layered TIFF for the
-middle z slice containing the original image and the computed mask.
-"""
+"""Create threshold-derived zarr masks and apply them to Lasagna grad_mag data."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
+import sys
 import time
 import zlib
 from pathlib import Path
@@ -21,6 +17,18 @@ import numpy as np
 import tifffile
 import torch
 import zarr
+
+_LASAGNA_DIR = Path(__file__).resolve().parents[1]
+if str(_LASAGNA_DIR) not in sys.path:
+    sys.path.insert(0, str(_LASAGNA_DIR))
+
+from lasagna_volume import LasagnaVolume
+from omezarr_pyramid import (
+    LASAGNA_PYRAMID_VERSION,
+    build_scalar_omezarr_pyramid,
+    clear_coarser_levels,
+    omezarr_chunk_exists,
+)
 
 zarr.config.set({"async.concurrency": 1, "threading.max_workers": 1})
 
@@ -491,14 +499,16 @@ def _write_layered_tif(
     *,
     out_path: Path,
     original_slice: np.ndarray,
-    mask_slice: np.ndarray,
+    masked_out_slice: np.ndarray,
+    keep_slice: np.ndarray,
     overlay_alpha: float,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     layers = [
         ("original", _gray_to_rgb(original_slice)),
-        ("mask", _mask_to_rgb(mask_slice)),
-        ("overlay", _overlay_rgb(original_slice, mask_slice, alpha=overlay_alpha)),
+        ("masked_out", _mask_to_rgb(masked_out_slice)),
+        ("keep_mask", _mask_to_rgb(keep_slice)),
+        ("masked_out_overlay", _overlay_rgb(original_slice, masked_out_slice, alpha=overlay_alpha)),
     ]
     with tifffile.TiffWriter(str(out_path)) as tw:
         for name, image in layers:
@@ -511,17 +521,19 @@ def _write_layered_tif(
 
 def _overlay_mask_on_slice(
     image: np.ndarray,
-    mask: np.ndarray,
+    masked_out: np.ndarray,
+    keep_mask: np.ndarray,
     *,
     alpha: float,
     include_mask_panel: bool,
 ) -> np.ndarray:
     original = _gray_to_rgb(image)
-    overlay = _overlay_rgb(image, mask, alpha=alpha)
+    overlay = _overlay_rgb(image, masked_out, alpha=alpha)
     if not include_mask_panel:
         return np.concatenate([original, overlay], axis=1)
-    mask_panel = _mask_to_rgb(mask)
-    return np.concatenate([original, mask_panel, overlay], axis=1)
+    masked_panel = _mask_to_rgb(masked_out)
+    keep_panel = _mask_to_rgb(keep_mask)
+    return np.concatenate([original, masked_panel, keep_panel, overlay], axis=1)
 
 
 def _preview_full_z_values(z_range_full: tuple[int, int], step: int) -> list[int]:
@@ -557,7 +569,8 @@ def _write_overlay_jpgs(
     *,
     out_dir: Path,
     volume: np.ndarray,
-    mask: np.ndarray,
+    masked_out: np.ndarray,
+    keep_mask: np.ndarray,
     previews: list[tuple[int, int, int]],
     alpha: float,
     include_mask_panel: bool,
@@ -568,7 +581,8 @@ def _write_overlay_jpgs(
     for actual_full, z_arr, local_z in previews:
         overlay = _overlay_mask_on_slice(
             volume[local_z],
-            mask[local_z],
+            masked_out[local_z],
+            keep_mask[local_z],
             alpha=alpha,
             include_mask_panel=include_mask_panel,
         )
@@ -587,7 +601,8 @@ def _write_preview_layered_tifs(
     *,
     out_dir: Path,
     volume: np.ndarray,
-    mask: np.ndarray,
+    masked_out: np.ndarray,
+    keep_mask: np.ndarray,
     previews: list[tuple[int, int, int]],
     overlay_alpha: float,
 ) -> int:
@@ -598,7 +613,8 @@ def _write_preview_layered_tifs(
         _write_layered_tif(
             out_path=path,
             original_slice=volume[local_z],
-            mask_slice=mask[local_z],
+            masked_out_slice=masked_out[local_z],
+            keep_slice=keep_mask[local_z],
             overlay_alpha=overlay_alpha,
         )
         written += 1
@@ -608,14 +624,14 @@ def _write_preview_layered_tifs(
 def _write_mask_zarr(
     *,
     out_path: Path,
-    mask: np.ndarray,
+    keep_mask: np.ndarray,
     source_path: Path,
     scale_zyx: tuple[float, float, float],
     z_range_full: tuple[int, int],
     z_range_array: tuple[int, int],
 ) -> None:
-    if mask.ndim != 3:
-        raise ValueError(f"expected 3D mask, got shape={mask.shape}")
+    if keep_mask.ndim != 3:
+        raise ValueError(f"expected 3D mask, got shape={keep_mask.shape}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
@@ -625,7 +641,7 @@ def _write_mask_zarr(
             out_path.unlink()
     out_path.mkdir(parents=True)
 
-    shape = tuple(int(v) for v in mask.shape)
+    shape = tuple(int(v) for v in keep_mask.shape)
     chunks = tuple(min(32, int(v)) for v in shape)
     zarray = {
         "zarr_format": 2,
@@ -643,7 +659,8 @@ def _write_mask_zarr(
         "scale_zyx": [float(v) for v in scale_zyx],
         "z_range_full": [int(v) for v in z_range_full],
         "z_range_array": [int(v) for v in z_range_array],
-        "mask_values": {"background": 0, "masked": 255},
+        "mask_values": {"masked_out": 0, "keep": 255},
+        "lasagna_mask_semantics": "uint8 keep mask: 255=keep, 0=mask_out",
     }
     (out_path / ".zarray").write_text(json.dumps(zarray, indent=2) + "\n")
     (out_path / ".zattrs").write_text(json.dumps(zattrs, indent=2) + "\n")
@@ -659,7 +676,7 @@ def _write_mask_zarr(
             for x0 in range(0, X, cX):
                 x1 = min(X, x0 + cX)
                 ix = x0 // cX
-                src = mask[z0:z1, y0:y1, x0:x1]
+                src = keep_mask[z0:z1, y0:y1, x0:x1]
                 if not np.any(src):
                     continue
                 chunk = np.zeros(chunks, dtype=np.uint8)
@@ -669,10 +686,217 @@ def _write_mask_zarr(
                 chunk_path.write_bytes(zlib.compress(chunk.tobytes(order="C"), level=1))
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Debug empty-region mask creation on a zarr volume z-range.",
+def _axis_power2_mapping(src_dim: int, dst_dim: int) -> tuple[str, int]:
+    src_dim = int(src_dim)
+    dst_dim = int(dst_dim)
+    if src_dim <= 0 or dst_dim <= 0:
+        raise ValueError(f"invalid shape mapping src={src_dim} dst={dst_dim}")
+    if src_dim == dst_dim:
+        return "same", 1
+    for k in range(1, 31):
+        f = 1 << k
+        if src_dim < dst_dim and abs(src_dim * f - dst_dim) < f:
+            return "up", f
+        if src_dim > dst_dim and abs(dst_dim * f - src_dim) < f:
+            return "down", f
+    raise ValueError(f"shape ratio is not a power-of-two zarr scale: src={src_dim} dst={dst_dim}")
+
+
+def _mapped_axis_indices(src_dim: int, dst_dim: int, start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+    mode, factor = _axis_power2_mapping(src_dim, dst_dim)
+    dst_idx = np.arange(int(start), int(end), dtype=np.int64)
+    if mode == "same":
+        src_idx = dst_idx
+    elif mode == "up":
+        src_idx = dst_idx // factor
+    else:
+        src_idx = dst_idx * factor
+    valid = (src_idx >= 0) & (src_idx < int(src_dim))
+    return src_idx, valid
+
+
+def _read_mask_block_resampled(
+    mask_arr,
+    *,
+    channel: int | None,
+    target_shape: tuple[int, int, int],
+    z0: int,
+    z1: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+) -> np.ndarray:
+    src_shape = tuple(int(v) for v in mask_arr.shape[-3:])
+    zi, zv = _mapped_axis_indices(src_shape[0], target_shape[0], z0, z1)
+    yi, yv = _mapped_axis_indices(src_shape[1], target_shape[1], y0, y1)
+    xi, xv = _mapped_axis_indices(src_shape[2], target_shape[2], x0, x1)
+    out = np.zeros((z1 - z0, y1 - y0, x1 - x0), dtype=bool)
+    if not (np.any(zv) and np.any(yv) and np.any(xv)):
+        return out
+
+    z_valid = zi[zv]
+    y_valid = yi[yv]
+    x_valid = xi[xv]
+    rz0, rz1 = int(z_valid.min()), int(z_valid.max()) + 1
+    ry0, ry1 = int(y_valid.min()), int(y_valid.max()) + 1
+    rx0, rx1 = int(x_valid.min()), int(x_valid.max()) + 1
+    if len(mask_arr.shape) == 3:
+        slab = np.asarray(mask_arr[rz0:rz1, ry0:ry1, rx0:rx1])
+    elif len(mask_arr.shape) == 4:
+        ch = 0 if channel is None else int(channel)
+        slab = np.asarray(mask_arr[ch, rz0:rz1, ry0:ry1, rx0:rx1])
+    else:
+        raise ValueError(f"mask zarr must be 3D ZYX or 4D CZYX, got shape={mask_arr.shape}")
+    if slab.dtype != np.uint8:
+        slab = slab.astype(np.uint8, copy=False)
+    values = slab[np.ix_(z_valid - rz0, y_valid - ry0, x_valid - rx0)] != 0
+    out[np.ix_(zv, yv, xv)] = values
+    return out
+
+
+def _grad_mag_omezarr_paths(lasagna_json: Path) -> tuple[LasagnaVolume, Path, Path, int]:
+    vol = LasagnaVolume.load(lasagna_json)
+    group, _ch_idx = vol.channel_group("grad_mag")
+    grad_path = (vol.path.parent / group.zarr_path).resolve()
+    data_level = int(group.scaledown)
+    if grad_path.name.isdigit():
+        level_path = grad_path
+        root_path = grad_path.parent
+        data_level = int(grad_path.name)
+    else:
+        root_path = grad_path
+        level_path = root_path / str(data_level)
+    return vol, root_path, level_path, data_level
+
+
+def _numeric_omezarr_levels(root_path: Path) -> list[int]:
+    if not root_path.exists():
+        raise ValueError(f"OME-Zarr root does not exist: {root_path}")
+    levels = sorted(int(p.name) for p in root_path.iterdir() if p.is_dir() and p.name.isdigit())
+    if not levels:
+        raise ValueError(f"OME-Zarr root has no numeric levels: {root_path}")
+    return levels
+
+
+def _apply_external_keep_mask(
+    *,
+    grad_level_path: Path,
+    grad_root_path: Path,
+    data_level: int,
+    mask_arr,
+    mask_channel: int | None,
+) -> tuple[int, int, int]:
+    grad_arr = zarr.open(str(grad_level_path), mode="r+")
+    if len(grad_arr.shape) != 3:
+        raise ValueError(f"grad_mag level must be 3D ZYX, got shape={grad_arr.shape}")
+    if str(grad_arr.dtype) != "uint8":
+        raise ValueError(f"grad_mag dtype must be uint8, got {grad_arr.dtype}")
+    if len(mask_arr.shape) not in {3, 4}:
+        raise ValueError(f"mask zarr must be 3D ZYX or 4D CZYX, got shape={mask_arr.shape}")
+    if len(mask_arr.shape) == 4 and mask_channel is not None:
+        if mask_channel < 0 or mask_channel >= int(mask_arr.shape[0]):
+            raise ValueError(f"--mask-channel {mask_channel} out of range for mask shape={mask_arr.shape}")
+
+    target_shape = tuple(int(v) for v in grad_arr.shape)
+    source_shape = tuple(int(v) for v in mask_arr.shape[-3:])
+    mappings = [_axis_power2_mapping(s, d) for s, d in zip(source_shape, target_shape)]
+    print(
+        f"[maskout] grad_mag_shape={target_shape} mask_shape={source_shape} "
+        f"mapping_zyx={mappings}",
+        flush=True,
     )
+
+    chunks = tuple(int(v) for v in grad_arr.chunks)
+    metadata = _read_metadata(grad_level_path)
+    changed = 0
+    skipped_missing = 0
+    total = 0
+    Z, Y, X = target_shape
+    cZ, cY, cX = chunks
+    for z0 in range(0, Z, cZ):
+        z1 = min(Z, z0 + cZ)
+        iz = z0 // cZ
+        for y0 in range(0, Y, cY):
+            y1 = min(Y, y0 + cY)
+            iy = y0 // cY
+            for x0 in range(0, X, cX):
+                x1 = min(X, x0 + cX)
+                ix = x0 // cX
+                total += 1
+                if metadata and not _chunk_exists(grad_level_path, (iz, iy, ix), metadata):
+                    skipped_missing += 1
+                    continue
+                if not metadata and not omezarr_chunk_exists(grad_root_path, data_level, z0, y0, x0, cZ):
+                    skipped_missing += 1
+                    continue
+                gm = np.asarray(grad_arr[z0:z1, y0:y1, x0:x1], dtype=np.uint8)
+                keep = _read_mask_block_resampled(
+                    mask_arr,
+                    channel=mask_channel,
+                    target_shape=target_shape,
+                    z0=z0,
+                    z1=z1,
+                    y0=y0,
+                    y1=y1,
+                    x0=x0,
+                    x1=x1,
+                )
+                out = np.where((gm != 0) & keep, gm, 0).astype(np.uint8, copy=False)
+                if not np.array_equal(out, gm):
+                    grad_arr[z0:z1, y0:y1, x0:x1] = out
+                    changed += 1
+    return total, skipped_missing, changed
+
+
+def run_maskout(args: argparse.Namespace) -> None:
+    lasagna_json = Path(args.lasagna_json)
+    mask_arr, mask_array_path = _open_zarr_array(Path(args.mask_zarr), args.mask_array)
+    mask_channel = None
+    if len(mask_arr.shape) == 4:
+        mask_channel = int(args.mask_channel)
+    _vol, grad_root, grad_level, data_level = _grad_mag_omezarr_paths(lasagna_json)
+    levels = _numeric_omezarr_levels(grad_root)
+    n_levels = max(levels) + 1
+    print(
+        f"[maskout] lasagna={lasagna_json} grad_mag={grad_level} "
+        f"data_level={data_level} n_levels={n_levels} mask={mask_array_path}",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    total, skipped, changed = _apply_external_keep_mask(
+        grad_level_path=grad_level,
+        grad_root_path=grad_root,
+        data_level=data_level,
+        mask_arr=mask_arr,
+        mask_channel=mask_channel,
+    )
+    mask_ms = (time.perf_counter() - t0) * 1000.0
+    print(
+        f"[maskout] masked grad_mag chunks changed={changed} skipped_missing={skipped} "
+        f"total_chunks={total} in {mask_ms:.1f}ms",
+        flush=True,
+    )
+    pyr_t0 = time.perf_counter()
+    clear_coarser_levels(grad_root, data_level, n_levels)
+    build_scalar_omezarr_pyramid(
+        grad_root,
+        data_level,
+        n_levels,
+        int(args.chunk),
+        label="grad_mag",
+        workers=int(args.workers),
+        force=True,
+    )
+    pyr_ms = (time.perf_counter() - pyr_t0) * 1000.0
+    print(
+        f"[maskout] rebuilt grad_mag lower scales with pyramid_version={LASAGNA_PYRAMID_VERSION} "
+        f"in {pyr_ms:.1f}ms",
+        flush=True,
+    )
+
+
+def add_create_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("zarr_path", type=Path, help="Path to a zarr array or group.")
     parser.add_argument(
         "-o",
@@ -781,7 +1005,9 @@ def main() -> None:
         default=100,
         help="JPEG quality for preview overlays (default: 100).",
     )
-    args = parser.parse_args()
+
+
+def run_create(args: argparse.Namespace) -> None:
 
     t0 = time.perf_counter()
     arr, array_path = _open_zarr_array(args.zarr_path, args.array)
@@ -832,7 +1058,7 @@ def main() -> None:
         grow_z_iterations = args.grow_iterations
         grow_xy_iterations = args.grow_iterations
     mask_t0 = time.perf_counter()
-    mask = _build_mask(
+    masked_out = _build_mask(
         volume,
         missing,
         device=dev,
@@ -847,13 +1073,14 @@ def main() -> None:
     if dev.type == "cuda":
         torch.cuda.synchronize(dev)
     mask_ms = (time.perf_counter() - mask_t0) * 1000.0
+    keep_mask = ~masked_out
 
     zarr_write_ms = 0.0
     if args.zarr_output is not None:
         zarr_t0 = time.perf_counter()
         _write_mask_zarr(
             out_path=args.zarr_output,
-            mask=mask,
+            keep_mask=keep_mask,
             source_path=array_path,
             scale_zyx=scale_zyx,
             z_range_full=z_range_full,
@@ -873,7 +1100,8 @@ def main() -> None:
     jpg_count = _write_overlay_jpgs(
         out_dir=jpg_dir,
         volume=volume,
-        mask=mask,
+        masked_out=masked_out,
+        keep_mask=keep_mask,
         previews=previews,
         alpha=args.jpg_mask_alpha,
         include_mask_panel=not args.no_jpg_mask_panel,
@@ -882,16 +1110,18 @@ def main() -> None:
     preview_tif_count = _write_preview_layered_tifs(
         out_dir=preview_tif_dir,
         volume=volume,
-        mask=mask,
+        masked_out=masked_out,
+        keep_mask=keep_mask,
         previews=previews,
         overlay_alpha=args.jpg_mask_alpha,
     )
     preview_ms = (time.perf_counter() - preview_t0) * 1000.0
 
-    mask_frac = float(mask.mean()) if mask.size else 0.0
+    masked_out_frac = float(masked_out.mean()) if masked_out.size else 0.0
+    keep_frac = float(keep_mask.mean()) if keep_mask.size else 0.0
     total_ms = (time.perf_counter() - t0) * 1000.0
     print(
-        f"[mask] mask_frac={mask_frac:.4f} "
+        f"[mask] masked_out_frac={masked_out_frac:.4f} keep_frac={keep_frac:.4f} "
         f"read={read_ms:.1f}ms mask={mask_ms:.1f}ms "
         f"zarr={zarr_write_ms:.1f}ms previews={preview_ms:.1f}ms "
         f"total={total_ms:.1f}ms",
@@ -904,6 +1134,38 @@ def main() -> None:
         f"[mask] wrote {preview_tif_count} layered TIFF previews to {preview_tif_dir}",
         flush=True,
     )
+
+
+def add_maskout_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--lasagna-json", required=True, type=Path, help="Lasagna .lasagna.json manifest to update in place.")
+    parser.add_argument("--mask-zarr", required=True, type=Path, help="3D uint8 keep-mask zarr; 0 masks out, nonzero keeps.")
+    parser.add_argument("--mask-array", default=None, help="Array key when --mask-zarr is a group (default: 0, else first entry).")
+    parser.add_argument("--mask-channel", type=int, default=0, help="Channel index for 4D CZYX mask arrays.")
+    parser.add_argument("--chunk", type=int, default=32, help="OME-Zarr output chunk size for regenerated lower scales.")
+    parser.add_argument("--workers", type=int, default=0, help="Pyramid rebuild workers (default: CPU count).")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Create threshold-derived zarr keep masks and apply them to Lasagna grad_mag data.",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    p_create = sub.add_parser("create", help="Create a keep-mask zarr and previews from an input zarr.")
+    add_create_args(p_create)
+    p_create.set_defaults(func=run_create)
+    p_maskout = sub.add_parser("maskout", help="Apply a keep-mask zarr to grad_mag in a Lasagna manifest.")
+    add_maskout_args(p_maskout)
+    p_maskout.set_defaults(func=run_maskout)
+
+    # Backward-compatible default: no subcommand means "create".
+    argv = sys.argv[1:]
+    if argv and argv[0] not in {"create", "maskout", "-h", "--help"}:
+        argv = ["create"] + argv
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        raise SystemExit(2)
+    args.func(args)
 
 
 if __name__ == "__main__":

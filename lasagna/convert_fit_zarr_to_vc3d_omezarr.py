@@ -10,6 +10,21 @@ import time
 import numpy as np
 import zarr
 
+try:
+	from omezarr_pyramid import (
+		LASAGNA_PYRAMID_VERSION,
+		build_normal_omezarr_pyramid,
+		downsample_scalar_chunk_worker,
+		set_pyramid_metadata,
+	)
+except ImportError:
+	from lasagna.omezarr_pyramid import (
+		LASAGNA_PYRAMID_VERSION,
+		build_normal_omezarr_pyramid,
+		downsample_scalar_chunk_worker,
+		set_pyramid_metadata,
+	)
+
 
 def _down2(a: np.ndarray) -> np.ndarray:
 	return a[::2, ::2, ::2]
@@ -174,64 +189,8 @@ def _process_slab_worker(args_tuple):
 
 def _downsample_chunk_worker(args_tuple):
 	"""Multiprocessing worker: read one chunk-aligned region from level N,
-	downsample 2x, write to level N+1.  Atomic: writes to a temp dir
-	then os.replace() each chunk file into the real output.
-	Uses tensorstore for I/O (no zarr-python async overhead)."""
-	import json, shutil, tensorstore as ts
-	(out_path_str, src_level, dst_level,
-	 z0, z1, y0, y1, x0, x1) = args_tuple
-
-	# Read via tensorstore (data_copy=1, file_io=4)
-	ctx = ts.Context({
-		'data_copy_concurrency': {'limit': 1},
-		'file_io_concurrency': {'limit': 4},
-	})
-	src_path = os.path.normpath(os.path.join(out_path_str, str(src_level)))
-	src_spec = {'driver': 'zarr', 'kvstore': {'driver': 'file', 'path': src_path}}
-	src_arr = ts.open(src_spec, read=True, open=True, context=ctx).result()
-	slab = src_arr[z0:z1, y0:y1, x0:x1].read().result()
-	down = np.asarray(slab)[::2, ::2, ::2]
-	if down.size == 0:
-		return
-	dz0, dy0, dx0 = z0 // 2, y0 // 2, x0 // 2
-
-	# Read chunk size and dimension separator from .zarray
-	dst_level_path = os.path.normpath(os.path.join(out_path_str, str(dst_level)))
-	zarray_path = os.path.join(dst_level_path, ".zarray")
-	with open(zarray_path) as f:
-		meta = json.load(f)
-	chunk_size = meta["chunks"][0]
-	sep = meta.get("dimension_separator", ".")
-
-	# Write to temp level dir via tensorstore, then rename atomically
-	# Temp dir outside the OME-Zarr, in the parent output directory
-	_conv_out_dir = os.path.dirname(os.path.normpath(out_path_str))
-	_conv_zarr_name = os.path.basename(os.path.normpath(out_path_str))
-	tmp_path = os.path.join(_conv_out_dir, f".tmp.{_conv_zarr_name}.{dst_level}.{os.getpid()}")
-	os.makedirs(tmp_path, exist_ok=True)
-	tmp_zarray = os.path.join(tmp_path, ".zarray")
-	if not os.path.isfile(tmp_zarray):
-		shutil.copy2(zarray_path, tmp_zarray)
-	tmp_spec = {'driver': 'zarr', 'kvstore': {'driver': 'file', 'path': tmp_path}}
-	tmp_arr = ts.open(tmp_spec, read=True, write=True, open=True, context=ctx).result()
-	tmp_arr[dz0:dz0 + down.shape[0],
-			dy0:dy0 + down.shape[1],
-			dx0:dx0 + down.shape[2]].write(down).result()
-
-	# Rename each chunk file atomically
-	for cz in range(dz0, dz0 + down.shape[0], chunk_size):
-		for cy in range(dy0, dy0 + down.shape[1], chunk_size):
-			for cx in range(dx0, dx0 + down.shape[2], chunk_size):
-				iz, iy, ix = cz // chunk_size, cy // chunk_size, cx // chunk_size
-				if sep == "/":
-					rel = os.path.join(str(iz), str(iy), str(ix))
-				else:
-					rel = f"{iz}{sep}{iy}{sep}{ix}"
-				src_file = os.path.join(tmp_path, rel)
-				dst_file = os.path.join(dst_level_path, rel)
-				if os.path.isfile(src_file):
-					os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-					os.replace(src_file, dst_file)
+	downsample 2x with mean pooling, write to level N+1."""
+	return downsample_scalar_chunk_worker(args_tuple)
 
 
 def _upsample_chunk_worker(args_tuple):
@@ -296,6 +255,8 @@ def run(
 
 	channels = _channels_from_src(c_in=c_in, params=params)
 	ch_n = len(channels)
+	normal_pair_channels = {"nx", "ny"}.issubset(set(channels))
+	normal_pair_paths: dict[str, Path] = {}
 
 	# Base shape: explicit override, from zarr attrs, or from input zarr
 	if base_shape is not None:
@@ -313,6 +274,8 @@ def run(
 
 	for ci, ch in enumerate(channels):
 		out_path = Path(f"{output_prefix}_{ch}.ome.zarr")
+		if normal_pair_channels and ch in {"nx", "ny"}:
+			normal_pair_paths[ch] = out_path
 		g = zarr.open_group(str(out_path), mode="w", zarr_format=2)
 
 		# Create all pyramid level arrays upfront.
@@ -381,49 +344,54 @@ def run(
 		print("", flush=True)
 
 		# --- Phase 2: Build coarser pyramid levels, one level at a time ---
-		# Each level reads from the previous level and writes chunk-aligned
-		# regions. No contention: each worker writes to a unique chunk.
-		for lv in range(first_filled_level + 1, levels):
-			src_lv = lv - 1
-			src_shape = arrs_shapes[src_lv]
-			dst_shape = arrs_shapes[lv]
-			# Chunk-aligned work items at the SOURCE level (2× chunk so
-			# each worker produces exactly one chunk at the dest level).
-			cz2 = chunk * 2
-			ds_work = []
-			for z0 in range(0, src_shape[0], cz2):
-				z1 = min(src_shape[0], z0 + cz2)
-				for y0 in range(0, src_shape[1], cz2):
-					y1 = min(src_shape[1], y0 + cz2)
-					for x0 in range(0, src_shape[2], cz2):
-						x1 = min(src_shape[2], x0 + cz2)
-						ds_work.append((
-							str(out_path), src_lv, lv,
-							z0, z1, y0, y1, x0, x1,
-						))
-			n_ds = len(ds_work)
-			t_lv = time.time()
-			done_count[0] = 0
+		# nx/ny are delayed until both base channels exist so their pyramid can
+		# be built through the second-order normal moment representation.
+		if normal_pair_channels and ch in {"nx", "ny"}:
+			print(f"{TAG} {ch}: delaying coarser levels for paired normal pyramid", flush=True)
+		else:
+			# Each level reads from the previous level and writes chunk-aligned
+			# regions. No contention: each worker writes to a unique chunk.
+			for lv in range(first_filled_level + 1, levels):
+				src_lv = lv - 1
+				src_shape = arrs_shapes[src_lv]
+				dst_shape = arrs_shapes[lv]
+				# Chunk-aligned work items at the SOURCE level (2× chunk so
+				# each worker produces exactly one chunk at the dest level).
+				cz2 = chunk * 2
+				ds_work = []
+				for z0 in range(0, src_shape[0], cz2):
+					z1 = min(src_shape[0], z0 + cz2)
+					for y0 in range(0, src_shape[1], cz2):
+						y1 = min(src_shape[1], y0 + cz2)
+						for x0 in range(0, src_shape[2], cz2):
+							x1 = min(src_shape[2], x0 + cz2)
+							ds_work.append((
+								str(out_path), src_lv, lv,
+								z0, z1, y0, y1, x0, x1,
+							))
+				n_ds = len(ds_work)
+				t_lv = time.time()
+				done_count[0] = 0
 
-			_stop2 = threading.Event()
-			def _prog2():
-				while not _stop2.is_set():
-					with lock:
-						d = done_count[0]
-					_print_progress(prefix=f"{TAG} {ch} L{lv}", done=d, total=n_ds, t0=t_lv)
-					_stop2.wait(0.5)
-			prog2 = threading.Thread(target=_prog2, daemon=True)
-			prog2.start()
+				_stop2 = threading.Event()
+				def _prog2():
+					while not _stop2.is_set():
+						with lock:
+							d = done_count[0]
+						_print_progress(prefix=f"{TAG} {ch} L{lv}", done=d, total=n_ds, t0=t_lv)
+						_stop2.wait(0.5)
+				prog2 = threading.Thread(target=_prog2, daemon=True)
+				prog2.start()
 
-			with multiprocessing.Pool(processes=workers) as pool:
-				for _ in pool.imap_unordered(_downsample_chunk_worker, ds_work):
-					with lock:
-						done_count[0] += 1
+				with multiprocessing.Pool(processes=workers) as pool:
+					for _ in pool.imap_unordered(_downsample_chunk_worker, ds_work):
+						with lock:
+							done_count[0] += 1
 
-			_stop2.set()
-			prog2.join(timeout=2)
-			_print_progress(prefix=f"{TAG} {ch} L{lv}", done=n_ds, total=n_ds, t0=t_lv)
-			print("", flush=True)
+				_stop2.set()
+				prog2.join(timeout=2)
+				_print_progress(prefix=f"{TAG} {ch} L{lv}", done=n_ds, total=n_ds, t0=t_lv)
+				print("", flush=True)
 
 		# --- Phase 3: Upsample to fill levels below first_filled_level ---
 		for lv in range(first_filled_level - 1, -1, -1):
@@ -487,6 +455,7 @@ def run(
 			],
 			"datasets": datasets,
 		}]
+		set_pyramid_metadata(g, method="mean_pool2x")
 		g.attrs["source_preprocess_params"] = params
 		g.attrs["vc3d_convert"] = {
 			"channel": str(ch),
@@ -498,6 +467,7 @@ def run(
 			"base_full_shape": list(base_full_shape),
 			"levels": levels,
 			"first_filled_level": first_filled_level,
+			"lasagna_pyramid_version": LASAGNA_PYRAMID_VERSION,
 		}
 
 		elapsed_ch = time.time() - t0
@@ -520,6 +490,17 @@ def run(
 		)
 
 	print("", flush=True)
+	if normal_pair_channels and {"nx", "ny"}.issubset(normal_pair_paths):
+		print(f"{TAG} building paired nx/ny normal pyramid", flush=True)
+		build_normal_omezarr_pyramid(
+			normal_pair_paths["nx"],
+			normal_pair_paths["ny"],
+			first_filled_level,
+			levels,
+			chunk,
+			workers=workers,
+			label="normal",
+		)
 
 
 def run_from_manifest(
