@@ -1607,7 +1607,6 @@ def optimize(
 				seed_hit = False
 				resampled_this_pass = False
 				step1 = 0
-				step_ref = [_actual_width_step_avg(fallback=float(model_step or wstep_start))]
 
 				def _error_result(err: Exception) -> dict[str, object]:
 					return {
@@ -1620,12 +1619,30 @@ def optimize(
 					}
 
 				def _reset_shell_optimizer() -> None:
-					nonlocal all_params, param_groups, opt, step_ref
+					nonlocal all_params, param_groups, opt
 					all_params, param_groups = _make_param_groups(pass_settings)
 					if not param_groups:
 						raise RuntimeError(f"{shell_label}: no cylinder parameters available after resampling")
 					opt = torch.optim.Adam(param_groups)
-					step_ref[0] = _actual_width_step_avg(fallback=float(model_step or wstep_start))
+
+				def _resample_shell_width_to_model_step() -> bool:
+					nonlocal resample_count, resampled_this_pass
+					if model_step is None or not allow_resample:
+						return True
+					model_step_ref = max(1.0, float(model_step))
+					if max_resamples is not None and resample_count >= max_resamples:
+						print(
+							f"[optimizer] ERROR {shell_label}: adaptive cylinder shell search hit "
+							f"resample cap {max_resamples}; outputting completed shells.",
+							flush=True,
+						)
+						return False
+					if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
+						raise RuntimeError(f"{shell_label}: model cannot resample cylinder shell width to model-step")
+					model.resample_current_cylinder_shell_width_to_step(data, model_step_ref)
+					resample_count += 1
+					resampled_this_pass = True
+					return True
 
 				def _maybe_resample_for_step_target() -> bool:
 					nonlocal resample_count, resampled_this_pass
@@ -1645,23 +1662,15 @@ def optimize(
 							return True
 					else:
 						return True
-					if max_resamples is not None and resample_count >= max_resamples:
-						print(
-							f"[optimizer] ERROR {shell_label}: adaptive cylinder shell search hit "
-							f"resample cap {max_resamples}; outputting completed shells.",
-							flush=True,
-						)
+					if not _resample_shell_width_to_model_step():
 						return False
-					if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
-						raise RuntimeError(f"{shell_label}: model cannot resample cylinder shell width to model-step")
-					model.resample_current_cylinder_shell_width_to_step(data, model_step_ref)
-					resample_count += 1
-					resampled_this_pass = True
 					_reset_shell_optimizer()
 					return True
 
 				def _apply_seed_target(metrics) -> None:
 					if seed_target_mode == "fixed":
+						return
+					if seed_target_mode == "linear_grow":
 						return
 					if seed_target_mode == "refine":
 						model.cyl_shell_current_width_step = _seed_refine_next_wstep(
@@ -1669,10 +1678,8 @@ def optimize(
 							model_step=float(model_step),
 						)
 					else:
-						model.cyl_shell_current_width_step = _seed_search_next_wstep(
-							model_step=float(model_step),
-							search_direction=int(search_direction),
-							step_ref=step_ref,
+						model.cyl_shell_current_width_step = _actual_width_step_avg(
+							fallback=float(model_step),
 						)
 
 				if seed_lock and model_step is not None:
@@ -1728,7 +1735,13 @@ def optimize(
 						if stop_on_seed_hit and _seed_hit(last_metrics):
 							seed_hit = True
 							break
-						_apply_seed_target(last_metrics)
+						if seed_target_mode == "linear_grow" and pass_max_steps > 0:
+							_alpha = float(step + 1) / float(pass_max_steps)
+							model.cyl_shell_current_width_step = (
+								float(wstep_start) + _alpha * (float(wstep_end) - float(wstep_start))
+							)
+						else:
+							_apply_seed_target(last_metrics)
 					elif pass_max_steps > 0:
 						_alpha = float(step + 1) / float(pass_max_steps)
 						model.cyl_shell_current_width_step = (
@@ -1794,7 +1807,12 @@ def optimize(
 					if _opt_timing is not None:
 						_opt_timing.sync()
 						_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
-					if seed_lock and model_step is not None and not _maybe_resample_for_step_target():
+					if (
+						seed_lock
+						and model_step is not None
+						and seed_target_mode != "linear_grow"
+						and not _maybe_resample_for_step_target()
+					):
 						break
 					if stop_after_resample and resampled_this_pass:
 						step1 = step + 1
@@ -1864,6 +1882,15 @@ def optimize(
 							max_steps=pass_max_steps,
 						)
 					step += 1
+				if (
+					seed_lock
+					and model_step is not None
+					and seed_target_mode == "linear_grow"
+					and step1 > 0
+					and not resampled_this_pass
+					and not _resample_shell_width_to_model_step()
+				):
+					return _error_result(RuntimeError(f"{shell_label}: failed to resample cylinder shell width to model-step"))
 				if snap_int > 0 and (step1 % snap_int) == 0:
 					snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
 								loss=float(loss.detach().cpu()), data=data, res=res)
@@ -1997,6 +2024,10 @@ def optimize(
 					if si + 1 < len(stages) and stages[si + 1].name == "cyl_grow_refine"
 					else None
 				)
+				grow_factor = _cyl_grow_factor()
+				if hasattr(model, "cyl_shell_growth_factor"):
+					model.cyl_shell_growth_factor = float(grow_factor)
+				grow_wstep_end = _base_wstep * grow_factor if direction > 0 else _base_wstep / grow_factor
 				result: dict[str, object] = {"seed_hit": False, "metrics": None, "resamples": 0, "resampled": False, "error": None}
 				while not bool(getattr(model, "cyl_shell_search_crossed", False)):
 					shell_i = len(getattr(model, "cyl_shell_completed", []))
@@ -2032,15 +2063,15 @@ def optimize(
 						f"{label}.cyl_grow_shell{shell_i + 1}",
 						_pass_eff_for_role(),
 						wstep_start=_base_wstep,
-						wstep_end=_base_wstep,
+						wstep_end=grow_wstep_end,
 						seed_lock=True,
 						model_step=_base_wstep,
 						stop_on_seed_hit=True,
 						max_resamples=1,
 						search_until_seed=True,
-						stop_after_resample=True,
+						stop_after_resample=False,
 						search_direction=direction,
-						seed_target_mode="search",
+						seed_target_mode="linear_grow",
 						allow_resample=True,
 						shell_no=shell_i + 1,
 						suppress_initial_status=False,
