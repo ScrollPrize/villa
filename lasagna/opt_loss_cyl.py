@@ -429,8 +429,11 @@ def _mesh_oriented_shell_gt_normal(
 ) -> torch.Tensor:
 	target_n = F.normalize(target, dim=-1, eps=1.0e-8)
 	with torch.no_grad():
-		shell_n = _unit_normals_for_shell_xyz(xyz.detach())
-		shell_dot = (target_n.detach() * shell_n).sum(dim=-1)
+		# Current cylinder init orders H upward and W around (cos, sin), so
+		# cross(dh, dw) points inward.  Use the outward mesh normal as the
+		# sign reference for ambiguous GT normals.
+		mesh_n = -_unit_normals_for_shell_xyz(xyz.detach())
+		shell_dot = (target_n.detach() * mesh_n).sum(dim=-1)
 		flip = shell_dot < 0.0
 	return torch.where(flip.unsqueeze(-1), -target_n, target_n)
 
@@ -850,7 +853,7 @@ def cyl_z_center_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tupl
 
 
 def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Move supersampled shell points along outward GT normals by the current signed seed distance."""
+	"""Move supersampled shell points along mesh-oriented GT normals by the current signed seed distance."""
 	geom = _shell_geometry(res=res, factor=4)
 	signed_raw = getattr(res, "cyl_seed_signed_distance", None)
 	if geom is None or signed_raw is None:

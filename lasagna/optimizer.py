@@ -1556,8 +1556,12 @@ def optimize(
 					return max(1.0, float(model._shell_width_step_stats()[0]))
 				return max(1.0, float(fallback))
 
-			def _seed_search_next_wstep(*, model_step: float, search_direction: int, step_ref: list[float]) -> float:
-				return _actual_width_step_avg(fallback=model_step)
+			def _cyl_grow_factor() -> float:
+				args = opt_cfg.args or {}
+				for key in ("cyl_grow_factor", "grow_factor", "cyl_shell_growth_factor"):
+					if key in args:
+						return max(1.0, float(args[key]))
+				return 1.5
 
 			def _seed_refine_next_wstep(metrics, *, model_step: float) -> float:
 				return _actual_width_step_avg(fallback=max(1.0, float(model_step)))
