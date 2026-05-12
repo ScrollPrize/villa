@@ -1147,7 +1147,17 @@ void run_generate(const po::variables_map& vm) {
 
                 std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));
 
-                #pragma omp parallel for schedule(dynamic)
+                // Cap the team size to the batch — each ThinningScratch slot
+                // holds 5 slice-sized CV_8U mats once a thread touches it,
+                // and slots are never freed. Letting OMP scatter 4 work items
+                // across 15 tids leaks ~5 GiB of resident scratch per fresh
+                // tid that happens to grab a slice.
+                const int slice_team_threads = std::max<int>(
+                    1,
+                    std::min<int>(num_threads,
+                                  static_cast<int>(assembled_slices.size())));
+
+                #pragma omp parallel for schedule(dynamic) num_threads(slice_team_threads)
                 for (size_t batch_index = 0; batch_index < assembled_slices.size(); ++batch_index) {
                     const int tid = omp_get_thread_num();
                     ThreadSliceStats& local_stats = thread_stats[static_cast<size_t>(tid)];
