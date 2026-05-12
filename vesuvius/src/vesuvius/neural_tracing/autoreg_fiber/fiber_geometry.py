@@ -19,7 +19,18 @@ from vesuvius.neural_tracing.autoreg_fiber.webknossos_annotations import (
 )
 
 
-TRANSFORM_URL_BY_MARKER: dict[str, str] = {}
+S3_TRANSFORM_URL = (
+    "s3://vesuvius-challenge-open-data/PHerc0332/volumes/"
+    "20251211183505-2.399um-0.2m-78keV-masked.zarr/transform.json"
+)
+S1A_TRANSFORM_URL = (
+    "s3://vesuvius-challenge-open-data/PHercParis4/volumes/"
+    "20260411134726-2.400um-0.2m-78keV-masked.zarr/transform.json"
+)
+TRANSFORM_URL_BY_MARKER = {
+    "fibers_s3": S3_TRANSFORM_URL,
+    "fibers_s1a": S1A_TRANSFORM_URL,
+}
 
 
 class FiberGeometryError(ValueError):
@@ -255,6 +266,8 @@ __all__ = [
     "FiberGeometryError",
     "FiberPath",
     "OrderedTreePath",
+    "S1A_TRANSFORM_URL",
+    "S3_TRANSFORM_URL",
     "TRANSFORM_URL_BY_MARKER",
     "apply_affine_xyz",
     "densify_polyline",

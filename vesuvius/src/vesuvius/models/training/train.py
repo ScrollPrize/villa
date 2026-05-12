@@ -393,9 +393,19 @@ class BaseTrainer:
         print(f"Using ZarrDataset ({'training' if is_training else 'validation'})")
         return dataset
 
-    def _build_dataset_for_mgr(self, mgr, *, is_training: bool) -> ZarrDataset:
-        """Build a ZarrDataset for the given config manager."""
-        return ZarrDataset(mgr=mgr, is_training=is_training)
+    def _build_dataset_for_mgr(self, mgr, *, is_training: bool):
+        """Build a dataset for the given config manager."""
+        ds_cfg = getattr(mgr, "dataset_config", {}) or {}
+        dataset_type = str(ds_cfg.get("dataset_type", "zarr")).strip().lower()
+        if dataset_type == "cross_frame":
+            from vesuvius.models.datasets.cross_frame_dataset import CrossFrameZarrDataset
+
+            return CrossFrameZarrDataset(mgr=mgr, is_training=is_training)
+        if dataset_type == "zarr":
+            return ZarrDataset(mgr=mgr, is_training=is_training)
+        raise ValueError(
+            f"Unknown dataset_type {dataset_type!r}. Supported: 'zarr', 'cross_frame'."
+        )
 
     # --- hooks for subclasses --------------------------------------------------------------- #
 

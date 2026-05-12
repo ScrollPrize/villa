@@ -69,11 +69,11 @@ models = [
     "tqdm>=4.67.1",
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
-    "psutil>=7.1.0",
+    "psutil>=6.0.0,<8",
     "nest-asyncio>=1.6.0",
 
     # Data pipeline / I/O and compression
-    "aiohttp>=3.12.15",
+    "aiohttp>=3.10.5,<4",
     "blosc2>=2.5.1",
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",
@@ -116,6 +116,7 @@ blending = [
 ]
 
 tests = ["pytest>=8.4.2"]
+webknossos = ["webknossos>=2.4.12,<3"]
 
 # Convenience alias to install everything
 all = [
@@ -141,7 +142,7 @@ all = [
     "tqdm>=4.67.1",
     "typed-argument-parser>=1.11.0",
     "wandb[media]>=0.22.0",
-    "psutil>=7.1.0",
+    "psutil>=6.0.0,<8",
 
     # Rendering and geometry utilities
     "open3d>=0.18,<0.19",
@@ -172,7 +173,7 @@ all = [
     "pytest>=8.4.2",
 
     # Data pipeline / I/O and compression
-    "aiohttp>=3.12.15",
+    "aiohttp>=3.10.5,<4",
     "blosc2>=2.5.1",
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",

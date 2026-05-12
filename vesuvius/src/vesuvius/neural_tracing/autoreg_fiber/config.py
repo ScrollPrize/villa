@@ -17,6 +17,9 @@ _ROPE_DTYPE_ALIASES = {
 }
 
 
+LOCAL_DINOVOL_CHECKPOINT = "/home/giorgio/Projects/dinovol/checkpoint_step_352500.pt"
+
+
 DEFAULT_AUTOREG_FIBER_CONFIG: dict = {
     "seed": 0,
     "crop_size": [128, 128, 128],
@@ -32,7 +35,7 @@ DEFAULT_AUTOREG_FIBER_CONFIG: dict = {
     "storage_options": {},
     "volume_shape": None,
     "volumes": {},
-    "dinov2_backbone": None,
+    "dinov2_backbone": LOCAL_DINOVOL_CHECKPOINT,
     "dinov2_config_path": None,
     "input_channels": 1,
     "decoder_dim": 192,
@@ -289,6 +292,7 @@ def load_autoreg_fiber_config(path: str | Path) -> dict:
 
 __all__ = [
     "DEFAULT_AUTOREG_FIBER_CONFIG",
+    "LOCAL_DINOVOL_CHECKPOINT",
     "load_autoreg_fiber_config",
     "setdefault_autoreg_fiber_config",
     "validate_autoreg_fiber_config",

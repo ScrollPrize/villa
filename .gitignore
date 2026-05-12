@@ -4,15 +4,23 @@
 *.pyc
 node_modules/.yarn-integrity
 **/*.egg-info*/
+webknossos-api-token.txt
 
 # Vesuvius outputs & metadata
 /vesuvius/outputs/
 /vesuvius/sandbox/
 /vesuvius/utils/tests/s5_test.zarr
+/vesuvius/autoreg_fiber_cache/
+/vesuvius/autoreg_fiber_runs/
+/vesuvius/webknossos_annotations/
+/autoreg_fiber_cache/
+/autoreg_fiber_runs/
+/webknossos_annotations/
 
 *.DS_Store
 
 **/checkpoints/
+*.ckpt
 
 # WandB (allow general wandb but ignore this one)
 !**/wandb/**
@@ -36,3 +44,11 @@ vesuvius/AGENTS.md
 /vesuvius/src/vesuvius/neural_tracing/tests/test_band_filtering
 
 build/
+
+# Local-machine artefacts (checkpoints, dino weights, configs not under source control)
+/_data/
+# Local wandb runs and harness state
+/vesuvius/wandb/
+/.claude/
+# Stray python caches
+**/__pycache__/

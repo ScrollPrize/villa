@@ -14,8 +14,9 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-DEFAULT_WEBKNOSSOS_URL = ""
+DEFAULT_WEBKNOSSOS_URL = "https://wk.aws.ash2txt.org/"
 DEFAULT_CACHE_DIR = Path("webknossos_annotations")
+LEGACY_TOKEN_PATH = Path("/home/giorgio/Projects/villa/webknossos-api-token.txt")
 FIBER_NAME_MARKERS: dict[str, str] = {
     "fibers_s3": "PHerc0332",
     "fibers_s1a": "PHercParis4",
@@ -125,6 +126,7 @@ def resolve_token_path(token_file: str | Path | None = None, *, start_dir: str |
     candidates: list[Path] = []
     for parent in (start, *start.parents):
         candidates.append(parent / "webknossos-api-token.txt")
+    candidates.append(LEGACY_TOKEN_PATH)
 
     seen: set[Path] = set()
     for candidate in candidates:
@@ -134,7 +136,7 @@ def resolve_token_path(token_file: str | Path | None = None, *, start_dir: str |
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
-        "Could not find webknossos-api-token.txt walking up from the current directory"
+        "Could not find webknossos-api-token.txt in the current tree or legacy villa checkout"
     )
 
 
