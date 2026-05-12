@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from vesuvius.neural_tracing.autoreg_fiber.fiber_geometry import resample_polyline_uniform
 from vesuvius.neural_tracing.autoreg_fiber.model import AutoregFiberModel, FiberKVCache
 from vesuvius.neural_tracing.autoreg_fiber.serialization import IGNORE_INDEX
 from vesuvius.neural_tracing.autoreg_fiber.streaming.window import WindowedVolumeReader
@@ -81,6 +82,7 @@ class FiberTracer:
         min_steps: int = 8,
         dtype: torch.dtype = torch.bfloat16,
         max_steps_per_window: int | None = None,
+        snap_stride: float | None = None,
     ) -> None:
         model.eval()
         self.model = model
@@ -109,6 +111,19 @@ class FiberTracer:
         self.max_steps_per_window = (
             int(max_steps_per_window) if max_steps_per_window is not None else default_window
         )
+        # Cache stride (training distribution): the fiber-cache pipeline resamples
+        # every fiber to exact `densify_step` voxels of arc length between
+        # consecutive points (typically 4.0 — see
+        # `coordinate_convention: wk_xyz_to_new_zyx_resampled_4` in the cache
+        # metadata). The model only ever saw inputs at this stride during
+        # training, so when ``snap_stride`` is set we project each prediction
+        # onto the sphere of radius ``snap_stride`` centred at the previous
+        # input. This keeps the autoregressive feedback on the training manifold
+        # and prevents the loop from degenerating into a sub-stride fixed point.
+        self.snap_stride = None if snap_stride is None else float(snap_stride)
+        # Step tangent estimate used as a fallback for the snap when the model's
+        # raw direction is degenerate (norm < 1 voxel).
+        self._fallback_tangent: np.ndarray | None = None
 
     # --- public API ---------------------------------------------------- #
 
@@ -169,12 +184,39 @@ class FiberTracer:
             disable=not progress,
         )
 
+        # Seed the fallback tangent from the prompt's own stride direction
+        # so the very first step has something sensible to snap onto when
+        # the model's raw output is degenerate.
+        self._fallback_tangent = self._unit_tangent(prompt_tail)
+
         try:
             for step_idx in range(self.max_steps):
                 coarse_id, offset_bins, local_xyz = self._sample_step(outputs)
                 stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, 0].float()).item())
                 stop_probabilities.append(stop_prob)
                 world_xyz = self.reader.local_to_world(local_xyz)
+                # In-distribution snap: force the next polyline point to be
+                # exactly `snap_stride` voxels of arc length from the previous
+                # input, along the direction the model emitted. This matches
+                # the training cache's uniform 4-voxel spacing.
+                if self.snap_stride is not None and self.snap_stride > 0.0:
+                    prev_input = np.asarray(polyline[-1], dtype=np.float32)
+                    delta = world_xyz.astype(np.float32, copy=False) - prev_input
+                    norm = float(np.linalg.norm(delta))
+                    if norm >= 1.0:
+                        unit = delta / norm
+                    elif self._fallback_tangent is not None:
+                        unit = self._fallback_tangent
+                    else:
+                        unit = None
+                    if unit is not None:
+                        world_xyz = (prev_input + unit * float(self.snap_stride)).astype(np.float32)
+                        local_xyz = self.reader.world_to_local(world_xyz)
+                        # Re-quantise so the model gets coarse/offset bins
+                        # that match the snapped world position exactly.
+                        coarse_id, offset_bins = self._quantize_local_xyz(local_xyz)
+                        # Update the fallback tangent for the next step.
+                        self._fallback_tangent = unit.astype(np.float32, copy=False)
                 polyline.append(world_xyz.astype(np.float32, copy=False))
 
                 bar.update(1)
@@ -210,6 +252,11 @@ class FiberTracer:
                 force_reanchor = steps_in_window >= self.max_steps_per_window
                 if force_reanchor or self.reader.needs_reanchor(local_xyz):
                     last_k_world = np.asarray(polyline[-self.prompt_length :], dtype=np.float32)
+                    # Bring the prompt back into the training distribution:
+                    # resample to uniform `snap_stride` arc length, matching
+                    # the cache's `wk_xyz_to_new_zyx_resampled_4` convention.
+                    if self.snap_stride is not None and self.snap_stride > 0.0:
+                        last_k_world = self._resample_prompt(last_k_world, self.snap_stride)
                     # Same edge-anchor strategy as the initial prompt: push the
                     # window forward of the leading point so the rebuilt prompt
                     # sits at one edge of the new crop, matching training.
@@ -217,6 +264,7 @@ class FiberTracer:
                     self.reader.anchor_on(world_xyz + anchor_offset)
                     outputs, cache, step_position = self._init_at_current_anchor(last_k_world)
                     reanchors += 1
+                    self._fallback_tangent = self._unit_tangent(last_k_world)
                     if prefetch:
                         forecast = world_xyz + anchor_offset * 2.0
                         self.reader.prefetch_anchor(forecast)
@@ -420,22 +468,70 @@ class FiberTracer:
             return None
         return diff / norm
 
+    def _quantize_local_xyz(self, local_xyz: np.ndarray) -> tuple[int, list[int]]:
+        """Re-quantise a (3,) local xyz back to (coarse_id, [bin_z, bin_y, bin_x]).
+
+        Used after the per-step snap so the model's next-step input has
+        coarse/offset tokens that agree with the snapped world position.
+        """
+
+        coarse_ids, offset_bins, _valid = quantize_local_xyz(
+            local_xyz.reshape(1, 3).astype(np.float32, copy=False),
+            volume_shape=tuple(self.input_shape),
+            patch_size=tuple(self.model.patch_size),
+            offset_num_bins=tuple(self.model.offset_num_bins),
+        )
+        return int(coarse_ids[0]), [int(v) for v in offset_bins[0]]
+
+    @staticmethod
+    def _unit_tangent(polyline_world_zyx: np.ndarray) -> np.ndarray | None:
+        """Mean unit-tangent across the polyline's consecutive segments."""
+
+        arr = np.asarray(polyline_world_zyx, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] < 2:
+            return None
+        diffs = np.diff(arr, axis=0)
+        norms = np.linalg.norm(diffs, axis=1, keepdims=True)
+        unit = diffs / np.clip(norms, 1e-6, None)
+        tangent = unit.mean(axis=0)
+        n = float(np.linalg.norm(tangent))
+        if n < 1e-6:
+            return None
+        return (tangent / n).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _resample_prompt(prompt_world_zyx: np.ndarray, target_spacing: float) -> np.ndarray:
+        """Resample the prompt to exact ``target_spacing`` arc-length spacing.
+
+        Mirrors what ``fiber_geometry.resample_polyline_uniform`` does on the
+        cache: produces a polyline where every consecutive pair is exactly
+        ``target_spacing`` voxels apart in 3D arc length. Returns the LAST
+        ``prompt_length`` resampled points (or the full resample if shorter).
+        """
+
+        resampled = resample_polyline_uniform(prompt_world_zyx, target_spacing=float(target_spacing))
+        return np.asarray(resampled[-prompt_world_zyx.shape[0] :], dtype=np.float32)
+
     def _anchor_offset_along_prompt(self, prompt_world_zyx: np.ndarray) -> np.ndarray:
         """Offset from the prompt's leading point to the desired window anchor.
 
-        The trainer anchors the 128^3 crop on the AABB midpoint of the 8 prompt
-        + 32 target points; the prompt thus sits at one edge of the crop with
-        empty space ahead for the predicted trajectory. We mimic that here by
-        pushing the anchor forward of the prompt's leading point by half the
-        crop's smallest axis along the prompt's tangent direction. Returns a
-        ``(3,)`` float32 vector in the same (z, y, x) frame as the prompt.
+        Reproduces the trainer's window placement. ``AutoregFiberDataset``
+        picks ``min_corner`` so the AABB midpoint of all 40 points (8 prompt
+        + 32 target) lands at the crop's centre. For a roughly straight
+        fiber at the cache's uniform ``stride`` arc-length spacing, that
+        AABB midpoint sits exactly ``(target_length - prompt_length + 1) *
+        stride / 2`` voxels *forward* of ``prompt[-1]`` along the prompt's
+        tangent — which for the standard config (8 prompt, 32 target, 4-voxel
+        stride) is 50 voxels. We push the window anchor by that amount along
+        the prompt's mean unit-tangent so the rebuilt prompt lands at the
+        same in-distribution position the model saw at training time.
         """
 
         arr = np.asarray(prompt_world_zyx, dtype=np.float32)
         if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] < 2:
             return np.zeros(3, dtype=np.float32)
-        # Average of the last-segment tangents in the prompt: robust to a single
-        # noisy point and matches the smooth tangent the trainer's
+        # Mean of the per-segment unit tangents — robust to a single noisy
+        # point and matches the smoothed tangent the trainer's
         # `_tangent_vectors` averages over the whole prompt.
         diffs = np.diff(arr, axis=0).astype(np.float32)
         norms = np.linalg.norm(diffs, axis=1, keepdims=True)
@@ -445,9 +541,21 @@ class FiberTracer:
         if tnorm < 1e-6:
             return np.zeros(3, dtype=np.float32)
         tangent = tangent / tnorm
-        # Half the smallest crop axis: prompt at one edge, ~target_length steps
-        # worth of room (at ~4-voxel stride, target_length=32 -> 128 voxels).
-        push = float(min(self.reader.crop_size)) * 0.5
+        target_length = int(self.model.config["target_length"])
+        # Use the actual cache stride if known (snap_stride matches the
+        # cache's densify_step); otherwise estimate from the prompt itself
+        # so the formula still holds for non-uniform-cache inputs.
+        if self.snap_stride is not None and self.snap_stride > 0.0:
+            stride = float(self.snap_stride)
+        else:
+            stride = float(np.mean(norms.flatten()))
+            if stride < 1e-3:
+                stride = float(min(self.reader.crop_size)) / float(target_length + self.prompt_length)
+        # AABB midpoint distance forward of prompt[-1].
+        push = (target_length - self.prompt_length + 1) * stride * 0.5
+        # Never push so far that the prompt would land outside the window.
+        max_push = float(min(self.reader.crop_size)) * 0.5
+        push = float(min(push, max_push))
         return (tangent * push).astype(np.float32)
 
 

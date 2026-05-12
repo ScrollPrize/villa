@@ -121,6 +121,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--snap-stride",
+        type=float,
+        default=4.0,
+        help=(
+            "Force every predicted point onto the sphere of radius `snap_stride` voxels centred "
+            "at the previous input, so the autoregressive feedback stays on the same uniform "
+            "arc-length manifold the model trained on. Set to 0 (or negative) to disable. "
+            "Default matches the cache's densify_step (4.0 voxels for the uniform-4 cache)."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable the tqdm progress bar (default: bar shown on stderr).",
@@ -296,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         min_steps=int(args.min_steps),
         dtype=_resolve_dtype(args.dtype),
         max_steps_per_window=args.max_steps_per_window,
+        snap_stride=None if float(args.snap_stride) <= 0.0 else float(args.snap_stride),
     )
 
     prompt = load_prompt_npz(args.prompt)
