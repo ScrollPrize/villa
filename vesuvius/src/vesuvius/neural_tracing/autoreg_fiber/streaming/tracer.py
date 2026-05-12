@@ -19,6 +19,7 @@ from typing import Iterable
 import numpy as np
 import torch
 from torch import Tensor
+from tqdm.auto import tqdm
 
 from vesuvius.neural_tracing.autoreg_fiber.model import AutoregFiberModel, FiberKVCache
 from vesuvius.neural_tracing.autoreg_fiber.serialization import IGNORE_INDEX
@@ -79,6 +80,7 @@ class FiberTracer:
         stop_prob_threshold: float | None = 0.5,
         min_steps: int = 8,
         dtype: torch.dtype = torch.bfloat16,
+        max_steps_per_window: int | None = None,
     ) -> None:
         model.eval()
         self.model = model
@@ -96,6 +98,17 @@ class FiberTracer:
                 f"({self.reader.crop_size}) must match for streaming inference"
             )
         self.max_fiber_position_embeddings = int(model.config["max_fiber_position_embeddings"])
+        # The model was trained with target_length steps after the prompt; beyond that
+        # the stop head saturates to 1.0 and the position embedding leaves its trained
+        # range. To extend a trace past target_length we force a re-anchor (rebuilds
+        # the prompt from the last prompt_length predicted points, resets positions).
+        # Default to target_length - prompt_length so the model always operates inside
+        # its trained range.
+        target_length = int(model.config["target_length"])
+        default_window = max(1, target_length - self.prompt_length)
+        self.max_steps_per_window = (
+            int(max_steps_per_window) if max_steps_per_window is not None else default_window
+        )
 
     # --- public API ---------------------------------------------------- #
 
@@ -104,12 +117,17 @@ class FiberTracer:
         prompt_world_zyx: np.ndarray,
         *,
         prefetch: bool = True,
+        progress: bool | str = False,
     ) -> TraceResult:
         """Extend ``prompt_world_zyx`` (an `(N, 3)` array of world ``zyx``) forward.
 
         The prompt's last :attr:`prompt_length` points are used as the model's
         input; the tracer then yields one new point per step until a stop
         condition fires. The returned polyline includes the prompt at its head.
+
+        ``progress``: pass ``True`` to draw a tqdm progress bar, or a string to
+        use as the bar's description (defaults off so the function remains
+        silent for library use).
         """
 
         if prompt_world_zyx.ndim != 2 or prompt_world_zyx.shape[1] != 3:
@@ -135,57 +153,83 @@ class FiberTracer:
         stop_reason = "max_steps"
         reanchors = 0
 
-        for step_idx in range(self.max_steps):
-            coarse_id, offset_bins, local_xyz = self._sample_step(outputs)
-            stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, 0].float()).item())
-            stop_probabilities.append(stop_prob)
-            world_xyz = self.reader.local_to_world(local_xyz)
-            polyline.append(world_xyz.astype(np.float32, copy=False))
+        bar_desc = progress if isinstance(progress, str) else "trace"
+        bar = tqdm(
+            total=self.max_steps,
+            desc=bar_desc,
+            unit="step",
+            leave=True,
+            dynamic_ncols=True,
+            disable=not progress,
+        )
 
-            actual_steps = step_idx + 1
-            # 1) explicit stop signal
-            if (
-                self.stop_prob_threshold is not None
-                and actual_steps >= self.min_steps
-                and stop_prob >= self.stop_prob_threshold
-            ):
-                stop_reason = "stop_probability"
-                break
-            # 2) leading point exited the volume
-            if not self.reader.in_volume_bounds(world_xyz):
-                stop_reason = "out_of_volume"
-                break
-            if actual_steps >= self.max_steps:
+        try:
+            for step_idx in range(self.max_steps):
+                coarse_id, offset_bins, local_xyz = self._sample_step(outputs)
+                stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, 0].float()).item())
+                stop_probabilities.append(stop_prob)
+                world_xyz = self.reader.local_to_world(local_xyz)
+                polyline.append(world_xyz.astype(np.float32, copy=False))
+
+                bar.update(1)
+                bar.set_postfix(
+                    reanchors=reanchors,
+                    stop_p=f"{stop_prob:.2f}",
+                    z=int(world_xyz[0]),
+                    y=int(world_xyz[1]),
+                    x=int(world_xyz[2]),
+                )
+
+                actual_steps = step_idx + 1
+                # 1) explicit stop signal
+                if (
+                    self.stop_prob_threshold is not None
+                    and actual_steps >= self.min_steps
+                    and stop_prob >= self.stop_prob_threshold
+                ):
+                    stop_reason = "stop_probability"
+                    break
+                # 2) leading point exited the volume
+                if not self.reader.in_volume_bounds(world_xyz):
+                    stop_reason = "out_of_volume"
+                    break
+                if actual_steps >= self.max_steps:
+                    stop_reason = "max_steps"
+                    break
+
+                # 3) re-anchor if the leading point is near a face, OR if we've taken
+                # too many steps inside the current window (so the position embedding
+                # never leaves the model's trained range).
+                steps_in_window = step_position - self.prompt_length
+                force_reanchor = steps_in_window >= self.max_steps_per_window
+                if force_reanchor or self.reader.needs_reanchor(local_xyz):
+                    last_k_world = np.asarray(polyline[-self.prompt_length :], dtype=np.float32)
+                    self.reader.anchor_on(world_xyz)
+                    outputs, cache, step_position = self._init_at_current_anchor(last_k_world)
+                    reanchors += 1
+                    if prefetch:
+                        # Eagerly prefetch the *next* probable window along the trajectory.
+                        tangent = self._tangent_estimate(polyline)
+                        if tangent is not None:
+                            forecast = world_xyz + tangent * (self.reader.crop_size[0] * 0.5)
+                            self.reader.prefetch_anchor(forecast)
+                    continue
+
+                # 4) one cached step.
+                next_position = step_position
+                step_position = min(step_position + 1, self.max_fiber_position_embeddings - 1)
+                outputs, cache = self._cached_step(
+                    coarse_id=coarse_id,
+                    offset_bins=offset_bins,
+                    local_xyz=local_xyz,
+                    position=next_position,
+                    cache=cache,
+                )
+            else:
+                # for-else fires when the loop completes without break.
                 stop_reason = "max_steps"
-                break
-
-            # 3) re-anchor if the leading point is near a face.
-            if self.reader.needs_reanchor(local_xyz):
-                last_k_world = np.asarray(polyline[-self.prompt_length :], dtype=np.float32)
-                self.reader.anchor_on(world_xyz)
-                outputs, cache, step_position = self._init_at_current_anchor(last_k_world)
-                reanchors += 1
-                if prefetch:
-                    # Eagerly prefetch the *next* probable window along the trajectory.
-                    tangent = self._tangent_estimate(polyline)
-                    if tangent is not None:
-                        forecast = world_xyz + tangent * (self.reader.crop_size[0] * 0.5)
-                        self.reader.prefetch_anchor(forecast)
-                continue
-
-            # 4) one cached step.
-            next_position = step_position
-            step_position = min(step_position + 1, self.max_fiber_position_embeddings - 1)
-            outputs, cache = self._cached_step(
-                coarse_id=coarse_id,
-                offset_bins=offset_bins,
-                local_xyz=local_xyz,
-                position=next_position,
-                cache=cache,
-            )
-        else:
-            # for-else fires when the loop completes without break.
-            stop_reason = "max_steps"
+        finally:
+            bar.close()
 
         polyline_arr = np.asarray(polyline, dtype=np.float32)
         return TraceResult(
@@ -201,6 +245,7 @@ class FiberTracer:
         fiber_world_zyx: np.ndarray,
         *,
         prefetch: bool = True,
+        progress: bool = False,
     ) -> BidirectionalResult:
         """Trace forward from the fiber's last `prompt_length` points and
         backward from its first `prompt_length` points (reversed); concatenate
@@ -219,10 +264,14 @@ class FiberTracer:
                 f"fiber has {fiber.shape[0]} points but prompt_length={self.prompt_length} is required"
             )
 
-        forward = self.trace_one_direction(fiber, prefetch=prefetch)
+        forward = self.trace_one_direction(
+            fiber, prefetch=prefetch, progress="forward" if progress else False
+        )
 
         backward_prompt = fiber[: self.prompt_length][::-1].copy()
-        backward = self.trace_one_direction(backward_prompt, prefetch=prefetch)
+        backward = self.trace_one_direction(
+            backward_prompt, prefetch=prefetch, progress="backward" if progress else False
+        )
 
         # The forward trace polyline is [..fiber, fwd_1, fwd_2, ...]. The backward
         # trace polyline is [reversed_prompt, back_1, back_2, ...] (the reversed

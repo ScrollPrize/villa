@@ -109,6 +109,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="How close (voxels) to a face the leading point may get before re-anchoring.",
     )
     parser.add_argument(
+        "--max-steps-per-window",
+        type=int,
+        default=None,
+        help=(
+            "Force a re-anchor after this many steps inside a single window even if the leading "
+            "point is still in the interior. Defaults to (target_length - prompt_length) from the "
+            "config so the position embedding never leaves the model's trained range and the stop "
+            "head does not saturate."
+        ),
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable the tqdm progress bar (default: bar shown on stderr).",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Inference device. Defaults to cuda when available, else cpu.",
@@ -131,19 +147,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--wk-dataset",
-        default=None,
+        default="PHercParis4-69da9fa9010000c20022c400",
         help=(
-            "Target WK dataset name for uploads. Defaults to PHercParis4-69da9fa9010000c20022c400 "
-            "(only meaningful with --upload-to-wk)."
+            "Target WK dataset slug for uploads (the {name}-{id} form used in the WK URL). "
+            "Defaults to the user's PHercParis4 dataset; override with the slug of any other "
+            "dataset on the same server."
         ),
     )
     parser.add_argument(
         "--wk-voxel-size",
         nargs=3,
         type=float,
-        default=(1.0, 1.0, 1.0),
+        default=(2400.0, 2400.0, 2400.0),
         metavar=("X", "Y", "Z"),
-        help="Voxel size (xyz) recorded on the uploaded skeleton. Defaults to (1,1,1).",
+        help=(
+            "Voxel size (xyz) recorded on the uploaded skeleton, in nanometers. Defaults to "
+            "(2400, 2400, 2400) for PHercParis4's 2.4um voxels."
+        ),
+    )
+    parser.add_argument(
+        "--wk-organization",
+        default="Scroll_Prize",
+        help="WK owning organization id for the uploaded skeleton. Defaults to 'Scroll_Prize'.",
     )
     parser.add_argument(
         "--annotation-name",
@@ -215,9 +240,22 @@ def main(argv: list[str] | None = None) -> int:
     config = load_autoreg_fiber_config(args.config)
     volume_spec = _resolve_volume_spec(config, args.volume)
 
+    # The checkpoint stores its own config snapshot, which may reference paths
+    # from the training machine (e.g. /ephemeral/dinov2_ckpts/...). Honour the
+    # JSON config's dinov2_backbone (and any other host-specific path) as an
+    # override so the model can be re-loaded on this host.
+    overrides: dict[str, Any] = {}
+    backbone_path = config.get("dinov2_backbone")
+    if backbone_path:
+        overrides["dinov2_backbone"] = backbone_path
+    dinov2_config_path = config.get("dinov2_config_path")
+    if dinov2_config_path:
+        overrides["dinov2_config_path"] = dinov2_config_path
+
     model = load_autoreg_fiber_model_from_checkpoint(
         args.ckpt,
         map_location=args.device,
+        config_overrides=overrides,
     ).to(args.device)
     model.eval()
 
@@ -239,17 +277,23 @@ def main(argv: list[str] | None = None) -> int:
         stop_prob_threshold=None if float(args.stop_prob_threshold) <= 0.0 else float(args.stop_prob_threshold),
         min_steps=int(args.min_steps),
         dtype=_resolve_dtype(args.dtype),
+        max_steps_per_window=args.max_steps_per_window,
     )
 
     prompt = load_prompt_npz(args.prompt)
     fiber_zyx = prompt.points_zyx
 
+    show_progress = not bool(args.quiet)
     if args.direction == "forward":
-        result: TraceResult | BidirectionalResult = tracer.trace_one_direction(fiber_zyx)
+        result: TraceResult | BidirectionalResult = tracer.trace_one_direction(
+            fiber_zyx, progress="forward" if show_progress else False
+        )
     elif args.direction == "backward":
-        result = tracer.trace_one_direction(fiber_zyx[::-1].copy())
+        result = tracer.trace_one_direction(
+            fiber_zyx[::-1].copy(), progress="backward" if show_progress else False
+        )
     else:
-        result = tracer.trace_bidirectional(fiber_zyx)
+        result = tracer.trace_bidirectional(fiber_zyx, progress=show_progress)
 
     payload = _trace_dict(result)
     polyline = payload["polyline_world_zyx"]
@@ -257,12 +301,12 @@ def main(argv: list[str] | None = None) -> int:
     npz_path = _write_npz(args.out, payload)
     print(f"Wrote {npz_path}", file=sys.stderr)
 
-    dataset_name = args.wk_dataset or "PHercParis4-69da9fa9010000c20022c400"
     skeleton = build_skeleton(
         polyline,
-        dataset_name=dataset_name,
+        dataset_name=str(args.wk_dataset),
         voxel_size=tuple(float(v) for v in args.wk_voxel_size),
         tree_name=str(args.tree_name),
+        organization_id=str(args.wk_organization) if args.wk_organization else None,
     )
     annotation = build_annotation(skeleton, name=str(args.annotation_name))
     saved = save_annotation(annotation, args.out, basename="trace")
