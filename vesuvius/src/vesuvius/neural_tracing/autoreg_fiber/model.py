@@ -665,6 +665,155 @@ class AutoregFiberModel(nn.Module):
         outputs["coarse_grid_shape"] = encoded["coarse_grid_shape"]
         return outputs
 
+    def forward_rollout(
+        self,
+        batch: dict,
+        *,
+        rollout_steps: int,
+    ) -> dict[str, Any]:
+        """Run a differentiable K-step autoregressive rollout.
+
+        Each step ``k`` calls :meth:`forward_from_encoded` with a generation
+        buffer that has been extended with the previous step's predictions
+        (rather than teacher-forced ground-truth values). Gradients flow
+        through the soft-decoded :attr:`pred_xyz_soft` feedback into
+        ``self.xyz_mlp`` and the tangent path on the next iteration. Discrete
+        ``coarse_ids`` / ``offset_bins`` indices are fed back from argmax
+        (non-differentiable for the index, but the gradient still propagates
+        through the continuous xyz path) so the next step's embedding chain
+        sees realistic inputs.
+
+        Returned dict has the same keys as
+        :meth:`forward_from_encoded`'s output but with a sequence dimension of
+        exactly ``rollout_steps`` instead of ``target_length`` — so the
+        existing :func:`compute_autoreg_fiber_losses` can be applied directly
+        against ``batch["target_*"][:, :rollout_steps]``.
+
+        ``rollout_steps`` must be ≥ 1 and ≤ ``target_length``.
+        """
+
+        K = int(rollout_steps)
+        if K < 1:
+            raise ValueError(f"rollout_steps must be >= 1; got {K}")
+        target_length = int(self.config["target_length"])
+        if K > target_length:
+            raise ValueError(
+                f"rollout_steps={K} exceeds config.target_length={target_length}; "
+                "the model has no position embeddings beyond that range"
+            )
+
+        encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
+        memory_tokens = encoded["memory_tokens"]
+        memory_patch_centers = encoded["memory_patch_centers"]
+        batch_size = int(memory_tokens.shape[0])
+        device = memory_tokens.device
+
+        target_positions = batch["target_positions"]
+        prompt_anchor_xyz = batch["prompt_anchor_xyz"]
+        prompt_anchor_valid = batch.get(
+            "prompt_anchor_valid",
+            torch.ones((batch_size,), dtype=torch.bool, device=device),
+        )
+
+        # Initial generation buffer: only the START token at position 0.
+        coarse_ids = torch.full((batch_size, 1), IGNORE_INDEX, dtype=torch.long, device=device)
+        offset_bins = torch.full((batch_size, 1, 3), IGNORE_INDEX, dtype=torch.long, device=device)
+        xyz = prompt_anchor_xyz.unsqueeze(1).clone()
+        positions = target_positions[:, :1].clone()
+        token_type = torch.full((batch_size, 1), START_TOKEN_TYPE, dtype=torch.long, device=device)
+        sequence_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+        geom_valid = prompt_anchor_valid.unsqueeze(1).clone()
+
+        # Per-step collectors. ``coarse_axis_logits`` is a dict; we collect
+        # each axis separately and concatenate at the end.
+        coarse_logits_list: list[Tensor] = []
+        axis_logits_list: dict[str, list[Tensor]] = {"z": [], "y": [], "x": []}
+        offset_logits_list: list[Tensor] = []
+        stop_logits_list: list[Tensor] = []
+        refine_residual_list: list[Tensor] = []
+        pred_xyz_soft_list: list[Tensor] = []
+        pred_xyz_list: list[Tensor] = []
+        pred_xyz_refined_list: list[Tensor] = []
+        pred_coarse_ids_list: list[Tensor] = []
+        pred_offset_bins_list: list[Tensor] = []
+        coarse_prediction_mode: str | None = None
+
+        for k in range(K):
+            generation_inputs = {
+                "coarse_ids": coarse_ids,
+                "offset_bins": offset_bins,
+                "xyz": xyz,
+                "positions": positions,
+                "token_type": token_type,
+                "sequence_mask": sequence_mask,
+                "geometry_valid_mask": geom_valid,
+            }
+            outputs = self.forward_from_encoded(
+                batch,
+                memory_tokens=memory_tokens,
+                memory_patch_centers=memory_patch_centers,
+                generation_inputs=generation_inputs,
+            )
+            if coarse_prediction_mode is None:
+                coarse_prediction_mode = outputs["coarse_prediction_mode"]
+            if outputs.get("coarse_logits") is not None:
+                coarse_logits_list.append(outputs["coarse_logits"][:, k : k + 1, :])
+            axis_logits = outputs.get("coarse_axis_logits")
+            if axis_logits is not None:
+                for axis in ("z", "y", "x"):
+                    axis_logits_list[axis].append(axis_logits[axis][:, k : k + 1, :])
+            offset_logits_list.append(outputs["offset_logits"][:, k : k + 1, :, :])
+            stop_logits_list.append(outputs["stop_logits"][:, k : k + 1])
+            refine_residual_list.append(outputs["pred_refine_residual"][:, k : k + 1, :])
+            pred_xyz_soft_list.append(outputs["pred_xyz_soft"][:, k : k + 1, :])
+            pred_xyz_list.append(outputs["pred_xyz"][:, k : k + 1, :])
+            pred_xyz_refined_list.append(outputs["pred_xyz_refined"][:, k : k + 1, :])
+            pred_coarse_ids_list.append(outputs["pred_coarse_ids"][:, k : k + 1])
+            pred_offset_bins_list.append(outputs["pred_offset_bins"][:, k : k + 1, :])
+
+            if k + 1 < K:
+                # Feedback: append the latest prediction as the next-step input.
+                # xyz uses the *differentiable* soft-decoded position; the
+                # coarse_id / offset_bins indices come from argmax (non-diff
+                # for the index, but gradient still flows through xyz_mlp).
+                next_xyz = outputs["pred_xyz_soft"][:, k : k + 1, :]
+                next_coarse = outputs["pred_coarse_ids"][:, k : k + 1].long()
+                next_offset = outputs["pred_offset_bins"][:, k : k + 1, :].long()
+                next_position = target_positions[:, k + 1 : k + 2]
+                next_token_type = torch.full(
+                    (batch_size, 1), GENERATED_TOKEN_TYPE, dtype=torch.long, device=device
+                )
+                next_seq_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+                next_geom_valid = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+                coarse_ids = torch.cat([coarse_ids, next_coarse], dim=1)
+                offset_bins = torch.cat([offset_bins, next_offset], dim=1)
+                xyz = torch.cat([xyz, next_xyz], dim=1)
+                positions = torch.cat([positions, next_position], dim=1)
+                token_type = torch.cat([token_type, next_token_type], dim=1)
+                sequence_mask = torch.cat([sequence_mask, next_seq_mask], dim=1)
+                geom_valid = torch.cat([geom_valid, next_geom_valid], dim=1)
+
+        result: dict[str, Any] = {
+            "coarse_logits": torch.cat(coarse_logits_list, dim=1) if coarse_logits_list else None,
+            "coarse_axis_logits": (
+                {axis: torch.cat(axis_logits_list[axis], dim=1) for axis in ("z", "y", "x")}
+                if axis_logits_list["z"]
+                else None
+            ),
+            "offset_logits": torch.cat(offset_logits_list, dim=1),
+            "stop_logits": torch.cat(stop_logits_list, dim=1),
+            "pred_coarse_ids": torch.cat(pred_coarse_ids_list, dim=1),
+            "pred_offset_bins": torch.cat(pred_offset_bins_list, dim=1),
+            "pred_refine_residual": torch.cat(refine_residual_list, dim=1),
+            "pred_xyz": torch.cat(pred_xyz_list, dim=1),
+            "pred_xyz_soft": torch.cat(pred_xyz_soft_list, dim=1),
+            "pred_xyz_refined": torch.cat(pred_xyz_refined_list, dim=1),
+            "memory_tokens": memory_tokens,
+            "coarse_grid_shape": self.coarse_grid_shape,
+            "coarse_prediction_mode": coarse_prediction_mode,
+        }
+        return result
+
     def decode_local_xyz(self, coarse_ids: Tensor, offset_bins: Tensor) -> Tensor:
         gyx = self.coarse_grid_shape[1] * self.coarse_grid_shape[2]
         coarse = coarse_ids.clamp(min=0)
