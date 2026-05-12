@@ -875,7 +875,7 @@ def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tup
 	scale_value = max(1.0, float(getattr(res.params, "mesh_step", 1.0)))
 	scale = xyz.new_tensor(scale_value)
 	proxy = xyz.detach() + normal * signed.detach()
-	lm = ((xyz - proxy).norm(dim=-1) / scale).square()
+	lm = (xyz - proxy).norm(dim=-1) / scale
 	return _register_shell_masked_term("cyl_seed_push", lm, mask, res=res)
 
 
