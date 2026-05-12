@@ -1622,7 +1622,18 @@ def run_autoreg_fiber_training(
                     scheduled_sampling_refine_feedback_enabled=refine_feedback_enabled,
                 )
                 loss_dict = _compute_losses_for_step(outputs, batch, cfg, global_step=global_step)
-            loss = loss_dict["loss"]
+            # Two-step backward: free the teacher-forced autograd graph
+            # *before* running the rollout's K-deep forward. Holding both
+            # graphs simultaneously OOMs on 80 GB H100s at 4/GPU; backwarding
+            # the teacher loss first releases its activations, and the rollout
+            # gradients then accumulate into the same param .grad tensors
+            # without zero_grad in between.
+            teacher_loss = loss_dict["loss"]
+            if not torch.isfinite(teacher_loss):
+                raise RuntimeError(
+                    f"Encountered non-finite teacher training loss at step {global_step}: {teacher_loss.item()}"
+                )
+            teacher_loss.backward()
             rollout_fired = False
             rollout_loss_value: float | None = None
             if (
@@ -1656,7 +1667,12 @@ def run_autoreg_fiber_training(
                             rollout_outputs, rollout_batch, cfg, global_step=global_step
                         )
                     weight = float(cfg.get("rollout_in_loop_loss_weight", 1.0))
-                    loss = loss + weight * rollout_loss_dict["loss"]
+                    weighted_rollout_loss = weight * rollout_loss_dict["loss"]
+                    if not torch.isfinite(weighted_rollout_loss):
+                        raise RuntimeError(
+                            f"Encountered non-finite rollout training loss at step {global_step}: {weighted_rollout_loss.item()}"
+                        )
+                    weighted_rollout_loss.backward()
                     rollout_loss_value = float(rollout_loss_dict["loss"].detach().item())
                     # Surface every per-loss metric under a ``rollout_loss_*``
                     # namespace so the dashboard can plot them next to the
@@ -1665,9 +1681,6 @@ def run_autoreg_fiber_training(
                         if isinstance(v, torch.Tensor):
                             v = float(v.detach().item())
                         loss_dict[f"rollout_loss_{k}"] = torch.as_tensor(v)
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Encountered non-finite training loss at step {global_step}: {loss.item()}")
-            loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=float(cfg["grad_clip"]))
             grad_norm_value = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
             skipped_step = 0.0
