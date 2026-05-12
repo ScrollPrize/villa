@@ -1525,14 +1525,7 @@ def optimize(
 				return max(1.0, float(fallback))
 
 			def _seed_search_next_wstep(*, model_step: float, search_direction: int, step_ref: list[float]) -> float:
-				current_avg = _actual_width_step_avg(fallback=model_step)
-				if int(search_direction) > 0:
-					step_ref[0] = max(float(step_ref[0]), current_avg)
-					return max(1.0, float(step_ref[0]) * 1.01)
-				if int(search_direction) < 0:
-					step_ref[0] = min(float(step_ref[0]), current_avg)
-					return max(1.0, float(step_ref[0]) * 0.99)
-				return current_avg
+				return _actual_width_step_avg(fallback=model_step)
 
 			def _seed_refine_next_wstep(metrics, *, model_step: float) -> float:
 				model_step = max(1.0, float(model_step))
