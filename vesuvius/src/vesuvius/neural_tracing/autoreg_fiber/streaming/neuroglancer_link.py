@@ -89,12 +89,9 @@ def build_state(
     # the dimension space as voxel-indexed, so we use the same unitless space
     # for `position` and the inline annotations. (Setting dimensions to
     # micrometres would force a unit conversion that misplaces the polyline.)
+    dimensions = {"x": [1, ""], "y": [1, ""], "z": [1, ""]}
     state: dict[str, Any] = {
-        "dimensions": {
-            "x": [1, ""],
-            "y": [1, ""],
-            "z": [1, ""],
-        },
+        "dimensions": dimensions,
         "position": [float(v) for v in centroid],
         "crossSectionScale": float(cross_section_scale),
         "projectionScale": float(cross_section_scale) * 64.0,
@@ -103,11 +100,14 @@ def build_state(
                 "type": "image",
                 "source": f"zarr://{zarr_url}",
                 "name": str(image_name),
-                "tab": "rendering",
-                "shader": "void main() { emitGrayscale(toNormalized(getDataValue())); }",
             },
             {
                 "type": "annotation",
+                "source": {
+                    "url": "local://annotations",
+                    "transform": {"outputDimensions": dimensions},
+                },
+                "tab": "source",
                 "name": str(annotation_name),
                 "annotationColor": str(annotation_color),
                 "annotations": annotations,
@@ -134,7 +134,7 @@ def emit(
     stride: int = 1,
     max_url_bytes: int = 16_000,
     annotation_name: str = "autoreg_fiber_trace",
-) -> tuple[str, Path | None]:
+) -> tuple[str, Path | None, bool]:
     """Build the Neuroglancer state for ``polyline_world_zyx`` and return
     ``(url, state_json_path)``.
 
@@ -159,11 +159,12 @@ def emit(
         json_path = target / "trace_neuroglancer_state.json"
         json_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     url = state_to_url(state)
-    if len(url) > int(max_url_bytes):
+    truncated = len(url) > int(max_url_bytes)
+    if truncated:
         empty_state = dict(state)
         empty_state["layers"] = [state["layers"][0]]
         url = state_to_url(empty_state)
-    return url, json_path
+    return url, json_path, truncated
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -207,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"{args.trace_npz}: missing 'polyline_world_zyx' (this should be a trace.npz from vesuvius.trace_fiber)")
     polyline = np.asarray(npz["polyline_world_zyx"], dtype=np.float64)
     out_dir = args.out if args.out is not None else args.trace_npz.parent
-    url, json_path = emit(
+    url, json_path, truncated = emit(
         polyline,
         out_dir=out_dir,
         zarr_url=args.zarr_url,
@@ -217,14 +218,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(url)
     if json_path is not None:
-        embedded = "fits in the URL above" if len(url) <= int(args.max_url_bytes) else "is too long to embed in a URL"
+        if truncated:
+            blurb = (
+                f"State ({polyline.shape[0]} nodes, stride={int(args.stride)}) is too long "
+                f"to embed in a URL — the URL above shows the volume only. The full state with "
+                f"every annotation segment is on disk:\n  {json_path}"
+            )
+        else:
+            blurb = (
+                f"State ({polyline.shape[0]} nodes, stride={int(args.stride)}) fits in the URL "
+                f"above; the same state is also written to disk:\n  {json_path}"
+            )
         print(
-            f"\nState ({polyline.shape[0]} nodes, stride={int(args.stride)}) {embedded}; "
-            f"the full state is also written to:\n  {json_path}\n\n"
-            "To load the trace into Neuroglancer (works regardless of URL length):\n"
-            "  1) Open the URL above.\n"
-            "  2) In the Neuroglancer window, press the '{' '}' button on the top-right\n"
-            "     toolbar to open the JSON state editor.\n"
+            f"\n{blurb}\n\n"
+            "To load the full trace into Neuroglancer (works regardless of URL length):\n"
+            "  1) Open the URL above (volume only) or any blank Neuroglancer tab.\n"
+            "  2) Click the '{' '}' icon in Neuroglancer's top-right toolbar to open the\n"
+            "     'Edit JSON state' panel.\n"
             f"  3) Paste the contents of {json_path.name} and click 'Format'.\n"
             "  4) The trace appears as orange line segments overlaid on the volume.",
             file=sys.stderr,
