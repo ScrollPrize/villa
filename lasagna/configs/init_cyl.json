@@ -6,7 +6,7 @@
 	},
 	"base": {
 		"cyl_normal": 10.0,
-		"cyl_smooth": 100.0,
+		"cyl_smooth": 10.0,
 		"cyl_z_smooth": 1.0,
 		"cyl_z_center": 1.0,
 		"cyl_step": 100.0,
