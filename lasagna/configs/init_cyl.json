@@ -11,7 +11,7 @@
 		"cyl_z_center": 1.0,
 		"cyl_step": 100.0,
 		"cyl_radial_mean": 0.0,
-		"cyl_seed_push": 0.01,
+		"cyl_seed_push": 0.0,
 		"cyl_bend": 100.0,
 		"cyl_conn_mesh": 0.0,
 		"cyl_conn_gt": 0.0,
@@ -46,7 +46,7 @@
 		},
 			{
 				"name": "cyl_grow",
-				"steps": 500,
+				"steps": 1000,
 				"lr" : 1.0,
 			"params": ["cyl_params"],
 			"w_fac": {
