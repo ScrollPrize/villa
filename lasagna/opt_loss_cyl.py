@@ -422,23 +422,16 @@ def _normal_align_lm(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, to
 	return 1.0 - dot_abs * dot_abs, dot_abs
 
 
-def _outward_oriented_shell_gt_normal(
+def _mesh_oriented_shell_gt_normal(
 	*,
-	res: fit_model.FitResult3D,
 	xyz: torch.Tensor,
 	target: torch.Tensor,
 ) -> torch.Tensor:
 	target_n = F.normalize(target, dim=-1, eps=1.0e-8)
 	with torch.no_grad():
-		umb_xy = res.data.umbilicus_xy_at_z(xyz.detach()[..., 2])
-		radial_xy = xyz.detach()[..., :2] - umb_xy
-		radial_len = radial_xy.norm(dim=-1)
-		target_xy_len = target_n.detach()[..., :2].norm(dim=-1)
-		radial_dot = (target_n.detach()[..., :2] * radial_xy).sum(dim=-1)
 		shell_n = _unit_normals_for_shell_xyz(xyz.detach())
 		shell_dot = (target_n.detach() * shell_n).sum(dim=-1)
-		use_radial = (radial_len > 1.0e-7) & (target_xy_len > 1.0e-7)
-		flip = torch.where(use_radial, radial_dot < 0.0, shell_dot < 0.0)
+		flip = shell_dot < 0.0
 	return torch.where(flip.unsqueeze(-1), -target_n, target_n)
 
 
@@ -871,7 +864,7 @@ def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tup
 	target, mask = _sample_shell_gt(res=res, xyz=xyz)
 	if target is None or mask is None:
 		return _zero_loss(res)
-	normal = _outward_oriented_shell_gt_normal(res=res, xyz=xyz, target=target)
+	normal = _mesh_oriented_shell_gt_normal(xyz=xyz, target=target)
 	scale_value = max(1.0, float(getattr(res.params, "mesh_step", 1.0)))
 	scale = xyz.new_tensor(scale_value)
 	proxy = xyz.detach() + normal * signed.detach()

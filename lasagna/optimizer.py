@@ -71,6 +71,8 @@ class Stage:
 CYLINDER_SEED_INIT_STAGE_ROLES = ("cyl_init", "cyl_grow", "cyl_grow_refine")
 CYLINDER_STAGE_STEP_ARG = "model-step"
 OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_step_size", "wstep_target")
+CYLINDER_OUTPUT_ALL_SHELLS_ARGS = ("cyl_output_all_shells", "cyl_shell_output_all")
+CYLINDER_MAX_SEARCH_SHELLS_ARGS = ("cyl_max_shells", "cyl_shell_max_shells", "cyl_shell_search_max_shells")
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
 	"cyl_z_center", "cyl_seed_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
@@ -479,6 +481,26 @@ def optimize(
 			raise ValueError(f"cylinder stage arg '{CYLINDER_STAGE_STEP_ARG}' must be > 0, got {value}")
 		return value
 
+	def _cyl_stage_output_all_shells() -> bool:
+		for stage_ in stages:
+			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
+			for key in CYLINDER_OUTPUT_ALL_SHELLS_ARGS:
+				if key in args and _truthy(args.get(key)):
+					return True
+		return False
+
+	def _cyl_stage_max_search_shells(default: int) -> int:
+		for stage_ in stages:
+			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
+			for key in CYLINDER_MAX_SEARCH_SHELLS_ARGS:
+				if key not in args or args.get(key) is None:
+					continue
+				value = int(args.get(key))
+				if value <= 0:
+					raise ValueError(f"cylinder stage arg '{key}' must be > 0, got {value}")
+				return value
+		return int(default)
+
 	def _next_stage_is_cyl(si_: int) -> bool:
 		return si_ + 1 < len(stages) and _is_cyl_stage(stages[si_ + 1])
 
@@ -495,6 +517,17 @@ def optimize(
 			steps_ = max(0, int(stage_.global_opt.steps))
 			total += steps_
 		return total
+
+	_cyl_output_all_shells = _cyl_stage_output_all_shells()
+	if _cyl_output_all_shells:
+		setattr(model, "cyl_shell_output_all_shells", True)
+
+	def _collapse_cylinder_shells_to_last() -> None:
+		if _cyl_output_all_shells:
+			return
+		if getattr(model, "cyl_shell_completed", None):
+			model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
+			model.cyl_shell_current_index = 0
 
 	class _FlowTimingWindow:
 		def __init__(self, *, interval: int = 100) -> None:
@@ -988,8 +1021,7 @@ def optimize(
 			if not bool(getattr(model, "cyl_shell_search_done", False)):
 				if not getattr(model, "cyl_shell_completed", None):
 					raise RuntimeError(f"{label}: cylinder shell search crossed, but no completed shell is available")
-				model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
-				model.cyl_shell_current_index = 0
+				_collapse_cylinder_shells_to_last()
 				model.cyl_shell_search_done = True
 
 		# Once cylinder initialization is done, convert only the best candidate
@@ -1399,7 +1431,7 @@ def optimize(
 			role = str(stage.name)
 			max_steps = int(opt_cfg.steps)
 			default_max_search_shells = max(1, int(getattr(model, "cyl_shell_search_max_shells", 16)))
-			max_search_shells = default_max_search_shells
+			max_search_shells = max(1, _cyl_stage_max_search_shells(default_max_search_shells))
 			_stage_wstep = _cyl_stage_width_target_step(opt_cfg)
 			_prev_stage_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
 			_base_wstep = float(
@@ -1944,9 +1976,7 @@ def optimize(
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
 				if bool(getattr(model, "cyl_shell_search_crossed", False)):
-					if getattr(model, "cyl_shell_completed", None):
-						model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
-						model.cyl_shell_current_index = 0
+					_collapse_cylinder_shells_to_last()
 					model.cyl_shell_search_done = True
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
@@ -2058,9 +2088,7 @@ def optimize(
 					return data
 				if bool(result.get("seed_hit", False)):
 					model.cyl_shell_search_crossed = True
-					if getattr(model, "cyl_shell_completed", None):
-						model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
-						model.cyl_shell_current_index = 0
+					_collapse_cylinder_shells_to_last()
 					model.cyl_shell_search_done = True
 				else:
 					metrics = result.get("metrics")
@@ -2113,9 +2141,7 @@ def optimize(
 			)
 			if hasattr(model, "complete_current_cylinder_shell"):
 				model.complete_current_cylinder_shell(data)
-			if getattr(model, "cyl_shell_completed", None):
-				model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
-				model.cyl_shell_current_index = 0
+			_collapse_cylinder_shells_to_last()
 			_stage_done(f"{label}.total", _t_stage_total)
 			return data
 
