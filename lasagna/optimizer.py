@@ -1511,7 +1511,7 @@ def optimize(
 				cls = str(metrics.classification)
 				signed = float(metrics.signed_distance)
 				tol = float(getattr(metrics, "tolerance", 0.0))
-				if cls == "edge" or abs(signed) <= max(tol, 1.0e-6):
+				if cls == "edge" or abs(signed) <= max(tol, 1.0):
 					return True
 				initial = getattr(model, "cyl_shell_search_initial_signed_distance", None)
 				if initial is None:
@@ -1528,14 +1528,7 @@ def optimize(
 				return _actual_width_step_avg(fallback=model_step)
 
 			def _seed_refine_next_wstep(metrics, *, model_step: float) -> float:
-				model_step = max(1.0, float(model_step))
-				current_avg = _actual_width_step_avg(fallback=model_step)
-				signed = float(metrics.signed_distance)
-				tol = float(getattr(metrics, "tolerance", 0.0))
-				if abs(signed) <= max(tol, 1.0e-6):
-					return current_avg
-				frac = signed / model_step
-				return max(1.0, current_avg * (1.0 + frac))
+				return _actual_width_step_avg(fallback=max(1.0, float(model_step)))
 
 			def _run_shell_pass(shell_label: str, pass_eff: dict[str, float], *,
 								wstep_start: float, wstep_end: float,
@@ -1876,6 +1869,7 @@ def optimize(
 				refine_label: str,
 				refine_opt: OptSettings,
 				shell_no: int | None,
+				stop_on_seed_hit: bool = True,
 			) -> dict[str, object]:
 				if int(refine_opt.steps) <= 0:
 					return {"seed_hit": False, "metrics": None, "resamples": 0, "resampled": False, "error": None}
@@ -1896,7 +1890,7 @@ def optimize(
 					pass_steps=int(refine_opt.steps),
 					seed_lock=True,
 					model_step=refine_wstep,
-					stop_on_seed_hit=True,
+					stop_on_seed_hit=bool(stop_on_seed_hit),
 					seed_target_mode="fixed",
 					allow_resample=False,
 					shell_no=shell_no,
@@ -2027,6 +2021,22 @@ def optimize(
 					if hasattr(model, "complete_current_cylinder_shell"):
 						model.complete_current_cylinder_shell(data)
 					if bool(result.get("seed_hit", False)):
+						if grow_refine_opt is not None:
+							refine_result = _run_grow_refine_pass(
+								refine_label=f"{label}.cyl_grow_refine_shell{shell_i + 1}",
+								refine_opt=grow_refine_opt,
+								shell_no=shell_i + 1,
+								stop_on_seed_hit=False,
+							)
+							if refine_result.get("error") is not None:
+								result = refine_result
+								_abort_after_shell_error(
+									f"{label}.cyl_grow_refine_shell{shell_i + 1}",
+									refine_result["error"],
+									keep_active=bool(refine_result.get("keep_active", False)),
+								)
+								break
+							result["seed_hit"] = True
 						break
 					if grow_refine_opt is not None:
 						result = _run_grow_refine_pass(
