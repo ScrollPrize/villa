@@ -7,17 +7,39 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
+
+# Reduce S3 thrash from 8 ranks * 4 workers * 5 zarrs at DataLoader spawn.
+# Adaptive retry mode + capped retries avoid AWS-API storm cascades.
+os.environ.setdefault("AWS_MAX_ATTEMPTS", "3")
+os.environ.setdefault("AWS_RETRY_MODE", "adaptive")
+# NCCL safety on a single multi-GPU box. IB is not present; async error
+# handling lets one rank's failure unwind the rest instead of hanging.
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
 
 import click
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as torch_mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
+
+# Tensor sharing via the file_system strategy avoids /dev/shm pressure when
+# 32+ DataLoader workers pass tensors via shared memory. With 8 H100 ranks
+# * 4 workers, the default file_descriptor strategy can exhaust /dev/shm
+# during the spawn-IPC phase (this is the load-bearing fix together with
+# lazy zarr opens in datasets/common.py).
+try:
+    torch_mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.neural_tracing.autoreg_mesh.config import load_autoreg_mesh_config, validate_autoreg_mesh_config
@@ -91,7 +113,17 @@ def _initialize_distributed_runtime(device: str | torch.device | None = None) ->
     if not dist.is_available():
         raise RuntimeError("torch.distributed is required when WORLD_SIZE > 1")
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, init_method="env://")
+        # 30-min NCCL timeout (default 10) — covers the long dataset-build
+        # phase on rank 0 plus the dataloader-spawn IPC window without
+        # firing spurious collective-op timeouts before training even starts.
+        init_kwargs: dict[str, Any] = {
+            "backend": backend,
+            "init_method": "env://",
+            "timeout": timedelta(seconds=1800),
+        }
+        if backend == "nccl":
+            init_kwargs["device_id"] = runtime_device
+        dist.init_process_group(**init_kwargs)
         initialized = True
     return _DistributedRuntime(
         is_distributed=True,
@@ -125,6 +157,22 @@ def _seed_worker(worker_id: int, *, base_seed: int, rank: int) -> None:
     random.seed(worker_seed)
     np.random.seed(worker_seed % (2**32))
     torch.manual_seed(worker_seed)
+    # Pre-touch zarr in this worker AFTER spawn handshake — opens the
+    # per-PID zarr cache so the first batch isn't penalized by a first-touch
+    # S3 open. Best-effort: a failure here is fine, the dataset will retry
+    # on first __getitem__. The whole point of the lazy-open refactor is to
+    # avoid pickling zarr handles into spawn workers (that wedged the
+    # kernel) — this just warms them once we're safely in-worker.
+    try:
+        info = torch.utils.data.get_worker_info()
+        if info is not None and info.dataset is not None:
+            ds = info.dataset
+            base_ds = getattr(ds, "_base_dataset", None) or ds
+            patches = getattr(base_ds, "patches", None)
+            if patches:
+                _ = patches[0].get_volume()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[worker {worker_id}] zarr pre-touch skipped: {exc!r}", flush=True)
 
 
 def _metric_dict_mean_across_ranks(
@@ -150,7 +198,11 @@ def _distributed_all_finite(value: float, *, device: torch.device, runtime: _Dis
 
 
 def _maybe_barrier(runtime: _DistributedRuntime) -> None:
-    if runtime.is_distributed:
+    if not runtime.is_distributed:
+        return
+    if runtime.backend == "nccl":
+        dist.barrier(device_ids=[runtime.local_rank])
+    else:
         dist.barrier()
 
 
@@ -233,6 +285,7 @@ def _expanded_bboxes_overlap(
 
 
 def _build_spatial_split_records(dataset: AutoregMeshDataset) -> list[_SpatialSplitRecord]:
+    _t = time.perf_counter()
     records: list[_SpatialSplitRecord] = []
     for sample_idx, sample_key in enumerate(dataset.sample_index):
         patch_idx, wrap_idx = sample_key
@@ -245,6 +298,10 @@ def _build_spatial_split_records(dataset: AutoregMeshDataset) -> list[_SpatialSp
                 chunk_id=tuple(int(v) for v in patch.chunk_id) if getattr(patch, "chunk_id", None) is not None else None,
             )
         )
+    print(
+        f"[autoreg_mesh split] _build_spatial_split_records {len(records)} samples in {time.perf_counter() - _t:.1f}s",
+        flush=True,
+    )
     return records
 
 
@@ -253,6 +310,7 @@ def _build_spatial_split_groups(
     *,
     margin_voxels: float,
 ) -> list[list[int]]:
+    _t_total = time.perf_counter()
     records = _build_spatial_split_records(dataset)
     if not records:
         return []
@@ -273,11 +331,32 @@ def _build_spatial_split_groups(
     grouped_by_source: dict[tuple[Any, ...], list[_SpatialSplitRecord]] = {}
     for record in records:
         grouped_by_source.setdefault(record.source_key, []).append(record)
+    print(
+        f"[autoreg_mesh split] grouped {len(records)} records into {len(grouped_by_source)} sources; "
+        f"running per-source sweep-line (margin={margin_voxels})...",
+        flush=True,
+    )
 
-    for source_records in grouped_by_source.values():
+    per_source_iterator: Any = grouped_by_source.values()
+    if len(records) >= 1024 and tqdm is not None:
+        per_source_iterator = tqdm(
+            list(grouped_by_source.values()),
+            desc="autoreg_mesh sweep-line",
+            unit="source",
+            leave=False,
+        )
+    for source_records in per_source_iterator:
         ordered = sorted(source_records, key=lambda record: record.world_bbox[0])
         active: list[_SpatialSplitRecord] = []
-        for record in ordered:
+        inner_iterator: Any = ordered
+        if len(ordered) >= 50000 and tqdm is not None:
+            inner_iterator = tqdm(
+                ordered,
+                desc=f"sweep-line src({len(ordered)})",
+                unit="rec",
+                leave=False,
+            )
+        for record in inner_iterator:
             current_z_min = float(record.world_bbox[0])
             active = [
                 other for other in active
@@ -291,7 +370,13 @@ def _build_spatial_split_groups(
     groups: dict[int, list[int]] = {}
     for record in records:
         groups.setdefault(_find(record.sample_index), []).append(int(record.sample_index))
-    return [sorted(indices) for _, indices in sorted(groups.items(), key=lambda item: min(item[1]))]
+    result = [sorted(indices) for _, indices in sorted(groups.items(), key=lambda item: min(item[1]))]
+    print(
+        f"[autoreg_mesh split] spatial split groups: {len(result)} groups in "
+        f"{time.perf_counter() - _t_total:.1f}s total",
+        flush=True,
+    )
+    return result
 
 
 def _split_spatial_groups(
@@ -342,16 +427,26 @@ def _find_cross_split_bbox_overlap(
     *,
     margin_voxels: float,
 ) -> tuple[int, int] | None:
+    _t = time.perf_counter()
     records = _build_spatial_split_records(dataset)
     train_records = [records[int(idx)] for idx in train_indices]
     val_records = [records[int(idx)] for idx in val_indices]
     val_by_source: dict[tuple[Any, ...], list[_SpatialSplitRecord]] = {}
     for record in val_records:
         val_by_source.setdefault(record.source_key, []).append(record)
+    print(
+        f"[autoreg_mesh split] cross-split bbox check: {len(train_records)} train vs "
+        f"{len(val_records)} val (over {len(val_by_source)} sources)...",
+        flush=True,
+    )
     for train_record in train_records:
         for val_record in val_by_source.get(train_record.source_key, ()):
             if _expanded_bboxes_overlap(train_record.world_bbox, val_record.world_bbox, margin_voxels=margin_voxels):
                 return train_record.sample_index, val_record.sample_index
+    print(
+        f"[autoreg_mesh split] cross-split bbox check OK in {time.perf_counter() - _t:.1f}s",
+        flush=True,
+    )
     return None
 
 
@@ -380,12 +475,19 @@ def _clone_autoreg_mesh_dataset(
 
 
 def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: float) -> tuple[Dataset, Dataset | None, dict[str, float]]:
+    _t_split = time.perf_counter()
     total = len(dataset)
     split_diagnostics: dict[str, float] = {}
     train_indices, val_indices = _split_indices(total, seed=seed, val_fraction=val_fraction)
+    val_split_mode = str(cfg.get("val_split_mode", "spatial_groups"))
+    print(
+        f"[autoreg_mesh split] _split_dataset: total={total} val_fraction={val_fraction} "
+        f"mode={val_split_mode}",
+        flush=True,
+    )
 
     if isinstance(dataset, AutoregMeshDataset):
-        if str(cfg.get("val_split_mode", "spatial_groups")) == "spatial_groups":
+        if val_split_mode == "spatial_groups":
             groups = _build_spatial_split_groups(
                 dataset,
                 margin_voxels=float(cfg.get("validation_leakage_margin_voxels", 0.0)),
@@ -408,6 +510,7 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
                     "autoreg_mesh spatial validation split still has leakage between train and val; "
                     f"overlapping sample indices={overlap_pair}"
                 )
+        _t_clone = time.perf_counter()
         patch_metadata = dataset.export_patch_metadata()
         train_dataset = _restrict_dataset_samples(
             _clone_autoreg_mesh_dataset(
@@ -419,6 +522,11 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
             train_indices,
         )
         if not val_indices:
+            print(
+                f"[autoreg_mesh split] clone+restrict (train only) in {time.perf_counter() - _t_clone:.1f}s; "
+                f"_split_dataset total {time.perf_counter() - _t_split:.1f}s",
+                flush=True,
+            )
             return train_dataset, None, split_diagnostics
         val_dataset = _restrict_dataset_samples(
             _clone_autoreg_mesh_dataset(
@@ -428,6 +536,11 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
                 apply_volume_only_augmentation=False,
             ),
             val_indices,
+        )
+        print(
+            f"[autoreg_mesh split] clone+restrict (train+val) in {time.perf_counter() - _t_clone:.1f}s; "
+            f"_split_dataset total {time.perf_counter() - _t_split:.1f}s",
+            flush=True,
         )
         return train_dataset, val_dataset, split_diagnostics
 
@@ -445,11 +558,12 @@ def _make_dataloader(
     seed: int,
     sampler=None,
     worker_init_fn=None,
+    multiprocessing_context=None,
+    prefetch_factor: int | None = None,
 ) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(int(seed))
-    return DataLoader(
-        dataset,
+    kwargs = dict(
         batch_size=int(batch_size),
         shuffle=bool(shuffle and sampler is None),
         sampler=sampler,
@@ -459,6 +573,13 @@ def _make_dataloader(
         generator=generator,
         worker_init_fn=worker_init_fn,
     )
+    # multiprocessing_context only applies when num_workers > 0; passing it with
+    # num_workers=0 raises in PyTorch.
+    if num_workers > 0 and multiprocessing_context:
+        kwargs["multiprocessing_context"] = str(multiprocessing_context)
+    if num_workers > 0 and prefetch_factor is not None:
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+    return DataLoader(dataset, **kwargs)
 
 
 def _maybe_import_wandb(cfg: dict):
@@ -1266,7 +1387,12 @@ def run_autoreg_mesh_training(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if dataset is None:
+        _t_phase = time.perf_counter()
         dataset = AutoregMeshDataset(cfg)
+        print(
+            f"[rank {runtime.rank}] dataset constructed in {time.perf_counter() - _t_phase:.1f}s",
+            flush=True,
+        )
     train_dataset, val_dataset, split_diagnostics = _split_dataset(
         dataset,
         cfg=cfg,
@@ -1285,6 +1411,8 @@ def run_autoreg_mesh_training(
             drop_last=False,
             seed=int(cfg["seed"]),
         )
+    mp_ctx = cfg.get("dataloader_multiprocessing_context")
+    prefetch_factor = cfg.get("dataloader_prefetch_factor")
     train_dataloader = _make_dataloader(
         train_dataset,
         batch_size=int(cfg["batch_size"]),
@@ -1293,6 +1421,8 @@ def run_autoreg_mesh_training(
         seed=int(cfg["seed"]),
         sampler=train_sampler,
         worker_init_fn=train_worker_init,
+        multiprocessing_context=mp_ctx,
+        prefetch_factor=prefetch_factor,
     )
     val_dataloader = None
     if val_dataset is not None and runtime.is_main_process:
@@ -1303,12 +1433,24 @@ def run_autoreg_mesh_training(
             shuffle=False,
             seed=int(cfg["seed"]) + 1,
             worker_init_fn=val_worker_init,
+            multiprocessing_context=mp_ctx,
+            prefetch_factor=prefetch_factor,
         )
 
     if model is None:
+        _t_phase = time.perf_counter()
         model = AutoregMeshModel(cfg)
+        print(
+            f"[rank {runtime.rank}] model constructed in {time.perf_counter() - _t_phase:.1f}s",
+            flush=True,
+        )
+    _t_phase = time.perf_counter()
     raw_model = model.to(runtime.device)
     raw_model.train()
+    print(
+        f"[rank {runtime.rank}] model on device {runtime.device} in {time.perf_counter() - _t_phase:.1f}s",
+        flush=True,
+    )
 
     optimizer = create_optimizer(dict(cfg["optimizer"]), raw_model)
     scheduler = None
@@ -1341,7 +1483,13 @@ def run_autoreg_mesh_training(
             if scheduler is not None and "lr_scheduler" in preloaded_ckpt:
                 scheduler.load_state_dict(preloaded_ckpt["lr_scheduler"])
 
+    _t_phase = time.perf_counter()
     train_model = _wrap_model_for_ddp(raw_model, runtime)
+    print(
+        f"[rank {runtime.rank}] DDP wrap in {time.perf_counter() - _t_phase:.1f}s "
+        f"(world_size={runtime.world_size})",
+        flush=True,
+    )
     wandb = _maybe_import_wandb(cfg) if runtime.is_main_process else None
     wandb_run = None
     saved_checkpoints: list[str] = []
@@ -1398,6 +1546,11 @@ def run_autoreg_mesh_training(
         global_step = int(start_step)
         progress_bar = tqdm(total=max(0, total_steps - global_step), desc="autoreg_mesh", leave=False) if runtime.is_main_process else None
         startup_ms = 1000.0 * (time.perf_counter() - startup_started)
+        print(
+            f"[rank {runtime.rank}] starting training loop at step {global_step}/{total_steps} "
+            f"(startup {startup_ms / 1000.0:.1f}s)",
+            flush=True,
+        )
         amp_enabled = str(cfg.get("mixed_precision", "no")).lower() != "no" and runtime.device.type == "cuda"
         amp_dtype = torch.bfloat16 if amp_enabled else torch.float32
 

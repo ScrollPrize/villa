@@ -2837,7 +2837,10 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["spatial_augmentation"]["mirror_prob"] == pytest.approx(0.5)
     assert validated["spatial_augmentation"]["transpose_prob"] == pytest.approx(0.25)
     assert validated["spatial_augmentation"]["mirror_axes"] == [0, 1, 2]
-    assert validated["spatial_augmentation"]["transpose_axes"] == [0, 1, 2]
+    # Default restricted to Y<->X (axes 1, 2) only. Z-axis volume transpose
+    # is now rejected by the config validator because it permutes the
+    # world-coord channel order, which downstream serialization assumes is ZYX.
+    assert validated["spatial_augmentation"]["transpose_axes"] == [1, 2]
     assert validated["volume_only_augmentation"]["enabled"] is True
     assert validated["volume_only_augmentation"]["gamma_prob"] == pytest.approx(0.4)
     assert validated["frontier_band_width_choices"] is None

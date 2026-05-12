@@ -1,12 +1,13 @@
 import torch
 import numpy as np
 from numba import njit
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import os
 from vesuvius.tifxyz import Tifxyz
 from vesuvius.tifxyz.upsampling import interpolate_at_points
 import zarr
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import re
 from functools import lru_cache
 from scipy import ndimage
@@ -27,6 +28,53 @@ def _parse_z_range(z_range):
     if z_min > z_max:
         z_min, z_max = z_max, z_min
     return z_min, z_max
+
+
+def _zarr_store_from_path(path, mode: str = "r"):
+    path_str = str(path)
+    # Cap connection pool + use a larger default block size so each worker
+    # holds at most a handful of TCP sockets to S3 (default is ~10). With 8
+    # DDP ranks * 4 workers * 5 zarrs, the default would race 200+ sockets.
+    s3_kwargs = {"config_kwargs": {"max_pool_connections": 4},
+                 "default_block_size": 8 * 1024 * 1024}
+    if path_str.startswith("s3://"):
+        return zarr.storage.FSStore(path_str, mode=mode, anon=True, **s3_kwargs)
+    if path_str.startswith(("http://", "https://")):
+        return zarr.storage.FSStore(path_str, mode=mode)
+    return None
+
+
+def open_zarr_group_readonly(path):
+    store = _zarr_store_from_path(path, mode="r")
+    if store is not None:
+        return zarr.open_group(store=store, mode="r")
+    return zarr.open_group(path, mode="r")
+
+
+# Per-PID lazy zarr group cache. Zarr+s3fs handles are NOT safe to pickle/
+# share across processes (each spawn worker must open its own); pickling them
+# was the load-bearing cause of the 8-GPU autoreg_mesh node-nuke. We attach
+# only the volume_path string to ChunkPatch, then resolve lazily on first
+# access in the consuming process. The cache resets if the PID changes
+# (which happens when a spawn worker is created via fork from torch's
+# persistent_workers handshake).
+_ZARR_GROUP_CACHE: Dict[str, Any] = {}
+_ZARR_CACHE_PID: Optional[int] = None
+
+
+def get_or_open_zarr_group(path: str):
+    """Return a zarr group for `path`, cached per-process. Safe across forks."""
+    global _ZARR_CACHE_PID, _ZARR_GROUP_CACHE
+    pid = os.getpid()
+    if _ZARR_CACHE_PID != pid:
+        _ZARR_GROUP_CACHE = {}
+        _ZARR_CACHE_PID = pid
+    key = str(path)
+    cached = _ZARR_GROUP_CACHE.get(key)
+    if cached is None:
+        cached = open_zarr_group_readonly(key)
+        _ZARR_GROUP_CACHE[key] = cached
+    return cached
 
 
 def _segment_z_bounds(seg):
@@ -241,7 +289,7 @@ def _compute_wrap_order_stats(wrap):
 
 
 def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner):
-    volume = patch.volume
+    volume = patch.get_volume() if hasattr(patch, "get_volume") else patch.volume
     if isinstance(volume, zarr.Group):
         volume = volume[str(patch.scale)]
 
@@ -779,13 +827,25 @@ class ChunkPatch:
 
     This is the output of the world-chunk tiling method. Each chunk can contain
     multiple wraps from potentially multiple segments.
+
+    Provide EITHER `volume` (legacy direct zarr handle, used in tests) OR
+    `volume_path` (string for lazy per-PID open). Lazy open is required for
+    multi-worker DataLoader spawn safety; pickling a zarr.Group across spawned
+    workers caused the prior node-nuke.
     """
     chunk_id: Tuple[int, int, int]         # (cz, cy, cx) index in chunk grid
-    volume: Any                            # zarr.Array or zarr.Group
     scale: int                             # volume_scale from config
     world_bbox: Tuple[float, ...]          # (z_min, z_max, y_min, y_max, x_min, x_max)
     wraps: List[Dict]                      # [{"segment": Tifxyz, "bbox_2d": tuple, "wrap_id": int, "segment_idx": int}, ...]
     segments: List[Tifxyz]                 # All segments (for lookup by segment_idx)
+    volume: Any = None                     # legacy: zarr.Array / zarr.Group / np.ndarray; None when using volume_path
+    volume_path: Optional[str] = None      # preferred: opened lazily per-PID via get_or_open_zarr_group
+
+    def get_volume(self):
+        """Return the underlying volume, opening it lazily if volume_path is set."""
+        if self.volume_path is not None:
+            return get_or_open_zarr_group(self.volume_path)
+        return self.volume
 
     @property
     def wrap_count(self) -> int:

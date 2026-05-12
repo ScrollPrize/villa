@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
+import multiprocessing
+import os
+import pickle
 import random
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -565,6 +571,80 @@ def _apply_spatial_augmentation(
     return volume_out, cond_out, masked_out, metadata
 
 
+# Direction remap under a UV-grid (rows<->cols) transpose. Volume axes are
+# UNCHANGED by this augmentation; only the 2D UV parametrization layout
+# flips, which permutes how the model interprets the band edge in
+# extract_frontier_prompt_band (serialization.py):
+#   - "left"  reads cond[:, -band:, :] (rightmost UV cols)
+#   - "right" reads cond[:, :band, :]  (leftmost UV cols)
+#   - "up"    reads cond[-band:, :, :] (bottom UV rows)
+#   - "down"  reads cond[:band, :, :]  (top UV rows)
+# After a UV transpose (cond.swapaxes(0,1)), what were "cols" become "rows",
+# so left <-> up and right <-> down. This is a 4-cycle on the direction
+# token; left+up and right+down swap their roles bijectively.
+_UV_TRANSPOSE_DIRECTION_REMAP = {
+    "left": "up",
+    "right": "down",
+    "up": "left",
+    "down": "right",
+}
+
+
+def _apply_uv_grid_augmentation(
+    cond_local: np.ndarray,
+    masked_local: np.ndarray,
+    *,
+    direction: str,
+    augmentation_cfg: dict,
+    enabled: bool,
+) -> tuple[np.ndarray, np.ndarray, str, dict[str, object]]:
+    """UV-grid (2D parametrization) augmentation with consistent direction remap.
+
+    Currently supports a single UV operation: rows<->cols transpose. The
+    volume and the world-coord channels of `cond_local`/`masked_local` are
+    NOT touched here (those are handled in `_apply_spatial_augmentation`).
+    Only the UV layout flips, so we remap the direction token accordingly.
+
+    Skipped when the implied full UV grid (cond+masked stacked along the
+    split axis) is non-square, since the transpose would produce an
+    incompatible shape for the existing model code paths that consume the
+    band along a specific axis.
+    """
+    metadata: dict[str, object] = {"uv_transposed": False}
+    direction_in = str(direction).lower()
+    if not bool(enabled):
+        return cond_local, masked_local, direction_in, metadata
+    uv_transpose_prob = float(augmentation_cfg.get("uv_transpose_prob", 0.0))
+    if uv_transpose_prob <= 0.0 or torch.rand(1).item() >= uv_transpose_prob:
+        return cond_local, masked_local, direction_in, metadata
+    if direction_in not in _UV_TRANSPOSE_DIRECTION_REMAP:
+        return cond_local, masked_local, direction_in, metadata
+    cond_arr = np.asarray(cond_local)
+    masked_arr = np.asarray(masked_local)
+    if cond_arr.ndim != 3 or cond_arr.shape[-1] != 3:
+        return cond_local, masked_local, direction_in, metadata
+    if masked_arr.ndim != 3 or masked_arr.shape[-1] != 3:
+        return cond_local, masked_local, direction_in, metadata
+    # Reconstruct the full UV shape: cond and masked are split along the
+    # axis implied by direction. For left/right the split is on UV-W (cols);
+    # for up/down it is on UV-H (rows). We require the FULL surface
+    # (cond + masked along the split axis) to be square so swapaxes(0,1)
+    # produces a meaningful direction in the swapped frame.
+    if direction_in in {"left", "right"}:
+        full_h = int(cond_arr.shape[0])
+        full_w = int(cond_arr.shape[1]) + int(masked_arr.shape[1])
+    else:  # up / down
+        full_h = int(cond_arr.shape[0]) + int(masked_arr.shape[0])
+        full_w = int(cond_arr.shape[1])
+    if full_h != full_w:
+        return cond_local, masked_local, direction_in, metadata
+    new_cond = cond_arr.swapaxes(0, 1).copy()
+    new_masked = masked_arr.swapaxes(0, 1).copy()
+    new_direction = _UV_TRANSPOSE_DIRECTION_REMAP[direction_in]
+    metadata["uv_transposed"] = True
+    return new_cond, new_masked, new_direction, metadata
+
+
 def extract_wrap_world_surface_stored(patch, wrap: dict, *, require_all_valid: bool = True) -> np.ndarray | None:
     """Extract one wrap directly on the stored tifxyz lattice in world ZYX coordinates."""
     seg = wrap["segment"]
@@ -710,6 +790,60 @@ def create_split_conditioning_from_surface_grid(
     }
 
 
+_active_prefilter_dataset: "AutoregMeshDataset | None" = None
+
+
+def _prefilter_one_worker(sample_key):
+    """Worker entry: returns (sample_key, plan_list) for one sample.
+
+    Relies on `_active_prefilter_dataset` being set in the parent before fork
+    so each worker inherits the dataset's read-only state via copy-on-write.
+    """
+    return sample_key, _active_prefilter_dataset._compute_one_plan_list(sample_key)
+
+
+def _prefilter_stats_chunk_worker(keys_chunk):
+    """Worker: compute partial stats over a chunk of valid_plans keys.
+
+    Reads `_active_prefilter_dataset._valid_split_plans` (fork-inherited) and
+    returns a partial-aggregate dict the parent reduces into the global stats.
+    """
+    ds = _active_prefilter_dataset
+    plans_dict = ds._valid_split_plans
+    difficulty_bucket_counts = {"easy": 0, "medium": 0, "hard": 0}
+    clean_only_plan_count = 0
+    ragged_only_plan_count = 0
+    multi_width_plan_count = 0
+    total_valid_width_count = 0
+    total_plan_count = 0
+    for key in keys_chunk:
+        plans = plans_dict.get(key, ())
+        for plan in plans:
+            bucket = str(plan.get("difficulty_bucket", "medium"))
+            if bucket in difficulty_bucket_counts:
+                difficulty_bucket_counts[bucket] += 1
+            clean_widths = list(plan.get("valid_prompt_widths_clean", []))
+            ragged_widths = list(plan.get("valid_prompt_widths_ragged", []))
+            if clean_widths and not ragged_widths:
+                clean_only_plan_count += 1
+            if ragged_widths and not clean_widths:
+                ragged_only_plan_count += 1
+            valid_width_count = len(set(clean_widths + ragged_widths))
+            if valid_width_count > 1:
+                multi_width_plan_count += 1
+            total_valid_width_count += int(valid_width_count)
+            total_plan_count += 1
+    return {
+        "chunk_size": len(keys_chunk),
+        "difficulty_bucket_counts": difficulty_bucket_counts,
+        "clean_only_plan_count": clean_only_plan_count,
+        "ragged_only_plan_count": ragged_only_plan_count,
+        "multi_width_plan_count": multi_width_plan_count,
+        "total_valid_width_count": total_valid_width_count,
+        "total_plan_count": total_plan_count,
+    }
+
+
 class AutoregMeshDataset(Dataset):
     """Build autoregressive wrap-completion examples from split conditioning."""
 
@@ -742,6 +876,8 @@ class AutoregMeshDataset(Dataset):
         setdefault_rowcol_cond_dataset_config(base_config)
         validate_rowcol_cond_dataset_config(base_config)
 
+        _t_init_start = time.perf_counter()
+        _t = _t_init_start
         self._base_dataset = EdtSegDataset(
             base_config,
             apply_augmentation=bool(apply_augmentation),
@@ -751,68 +887,67 @@ class AutoregMeshDataset(Dataset):
         self.patches = self._base_dataset.patches
         self.sample_index = list(self._base_dataset.sample_index)
         self.crop_size = tuple(int(v) for v in self._base_dataset.crop_size)
+        print(
+            f"[autoreg_mesh dataset] base dataset ready in {time.perf_counter() - _t:.1f}s "
+            f"({len(self.sample_index)} pre-filter samples)",
+            flush=True,
+        )
+        _t = time.perf_counter()
         precomputed_plans = None
         if isinstance(patch_metadata, dict):
             precomputed_plans = patch_metadata.get("autoreg_mesh_valid_split_plans")
+        sidecar_cache_dir: Path | None = None
+        sidecar_cache_key: str | None = None
         if precomputed_plans is None:
+            sidecar_cache_dir = self._prefilter_cache_path()
+            sidecar_cache_key = self._prefilter_cache_key()
             self._valid_split_plans = self._build_valid_split_plans()
         else:
-            self._valid_split_plans = {
-                _sample_key(*sample_key): tuple(dict(plan) for plan in plans)
-                for sample_key, plans in dict(precomputed_plans).items()
-            }
+            self._valid_split_plans = precomputed_plans
+        print(
+            f"[autoreg_mesh dataset] valid_split_plans ready in {time.perf_counter() - _t:.1f}s "
+            f"({len(self._valid_split_plans)} keys)",
+            flush=True,
+        )
+        _t = time.perf_counter()
         self.sample_index = [
             _sample_key(*sample_key)
             for sample_key in self.sample_index
             if len(self._valid_split_plans.get(_sample_key(*sample_key), ())) > 0
         ]
-        difficulty_bucket_counts = {"easy": 0, "medium": 0, "hard": 0}
-        clean_only_plan_count = 0
-        ragged_only_plan_count = 0
-        multi_width_plan_count = 0
-        total_valid_width_count = 0
-        total_plan_count = 0
-        for plans in self._valid_split_plans.values():
-            for plan in plans:
-                bucket = str(plan.get("difficulty_bucket", "medium"))
-                if bucket in difficulty_bucket_counts:
-                    difficulty_bucket_counts[bucket] += 1
-                clean_widths = list(plan.get("valid_prompt_widths_clean", []))
-                ragged_widths = list(plan.get("valid_prompt_widths_ragged", []))
-                if clean_widths and not ragged_widths:
-                    clean_only_plan_count += 1
-                if ragged_widths and not clean_widths:
-                    ragged_only_plan_count += 1
-                valid_width_count = len(sorted(set(clean_widths + ragged_widths)))
-                if valid_width_count > 1:
-                    multi_width_plan_count += 1
-                total_valid_width_count += int(valid_width_count)
-                total_plan_count += 1
-        self._prefilter_stats = {
-            "num_samples_with_valid_plans": len(self.sample_index),
-            "num_total_valid_split_plans": int(total_plan_count),
-            "difficulty_bucket_counts": difficulty_bucket_counts,
-            "clean_only_plan_count": int(clean_only_plan_count),
-            "ragged_only_plan_count": int(ragged_only_plan_count),
-            "multi_width_plan_count": int(multi_width_plan_count),
-            "avg_valid_prompt_width_count": (
-                float(total_valid_width_count) / float(total_plan_count) if total_plan_count > 0 else 0.0
-            ),
-            "prefilter_wall_seconds": float(getattr(self, "_prefilter_wall_seconds", 0.0)),
-        }
+        print(
+            f"[autoreg_mesh dataset] sample_index post-filter in {time.perf_counter() - _t:.1f}s "
+            f"({len(self.sample_index)} kept)",
+            flush=True,
+        )
         if not self.sample_index:
             raise RuntimeError("autoreg_mesh dataset prefilter removed every sample; no valid wrap splits remain")
+        precomputed_stats: dict | None = None
+        if isinstance(patch_metadata, dict):
+            maybe_stats = patch_metadata.get("autoreg_mesh_prefilter_stats")
+            if isinstance(maybe_stats, dict):
+                precomputed_stats = dict(maybe_stats)
+        self._prefilter_stats = self._load_or_compute_prefilter_stats(
+            self._valid_split_plans,
+            n_post_filter_samples=len(self.sample_index),
+            cache_dir=sidecar_cache_dir,
+            cache_key=sidecar_cache_key,
+            precomputed_stats=precomputed_stats,
+        )
+        self._prefilter_stats["prefilter_wall_seconds"] = float(getattr(self, "_prefilter_wall_seconds", 0.0))
+        print(
+            f"[autoreg_mesh dataset] __init__ total {time.perf_counter() - _t_init_start:.1f}s "
+            f"({len(self.sample_index)} samples)",
+            flush=True,
+        )
 
     def __len__(self) -> int:
         return len(self.sample_index)
 
     def export_patch_metadata(self):
         metadata = self._base_dataset.export_patch_metadata()
-        metadata["autoreg_mesh_valid_split_plans"] = {
-            sample_key: tuple(dict(plan) for plan in plans)
-            for sample_key, plans in self._valid_split_plans.items()
-        }
-        metadata["autoreg_mesh_prefilter_stats"] = dict(self._prefilter_stats)
+        metadata["autoreg_mesh_valid_split_plans"] = self._valid_split_plans
+        metadata["autoreg_mesh_prefilter_stats"] = self._prefilter_stats
         return metadata
 
     def _extract_surface_for_plan(self, patch, wrap: dict, *, use_stored_surface: bool) -> np.ndarray | None:
@@ -824,169 +959,432 @@ class AutoregMeshDataset(Dataset):
             )
         return self._base_dataset._extract_wrap_world_surface(patch, wrap, require_all_valid=True)
 
-    def _build_valid_split_plans(self) -> dict[tuple[int, int], tuple[dict, ...]]:
-        valid_plans: dict[tuple[int, int], tuple[dict, ...]] = {}
-        prefilter_started = time.perf_counter()
-        iterator = self.sample_index
-        if bool(self.config.get("prefilter_show_progress", True)) and len(self.sample_index) > 0:
-            iterator = tqdm(
-                self.sample_index,
-                desc="autoreg_mesh prefilter",
-                unit="wrap",
-                leave=False,
-            )
-        for patch_idx, wrap_idx in iterator:
-            sample_key = _sample_key(patch_idx, wrap_idx)
-            patch = self.patches[int(patch_idx)]
-            wrap = patch.wraps[int(wrap_idx)]
-            use_stored_surface, effective_surface_downsample_factor = self._resolve_surface_sampling_plan(wrap)
-            surface_zyx = self._extract_surface_for_plan(patch, wrap, use_stored_surface=use_stored_surface)
-            if surface_zyx is None:
-                continue
-            min_corner = np.round([patch.world_bbox[0], patch.world_bbox[2], patch.world_bbox[4]]).astype(np.float32)
-            surface_local = np.asarray(surface_zyx, dtype=np.float32) - min_corner[None, None, :]
-            h_grid, w_grid = surface_zyx.shape[:2]
-            plan_list: list[dict] = []
-            tested_widths = _tested_frontier_band_widths(self.config)
-            directions = []
-            if w_grid >= 2:
-                directions.extend(["left", "right"])
-            if h_grid >= 2:
-                directions.extend(["up", "down"])
-            for direction in directions:
-                axis_size = w_grid if direction in {"left", "right"} else h_grid
-                for conditioning_count in _reachable_conditioning_counts(
-                    axis_size,
-                    self._base_dataset._cond_percent_min,
-                    self._base_dataset._cond_percent_max,
-                ):
-                    cond_local, masked_local = _split_surface_grid(
-                        surface_local,
-                        direction=str(direction),
-                        conditioning_count=int(conditioning_count),
-                    )
-                    if cond_local is None or masked_local is None or cond_local.size == 0 or masked_local.size == 0:
-                        continue
-                    cond_local = downsample_surface_grid(
+    def _compute_one_plan_list(self, sample_key) -> list[dict]:
+        patch_idx, wrap_idx = sample_key
+        patch = self.patches[int(patch_idx)]
+        wrap = patch.wraps[int(wrap_idx)]
+        use_stored_surface, effective_surface_downsample_factor = self._resolve_surface_sampling_plan(wrap)
+        surface_zyx = self._extract_surface_for_plan(patch, wrap, use_stored_surface=use_stored_surface)
+        if surface_zyx is None:
+            return []
+        min_corner = np.round([patch.world_bbox[0], patch.world_bbox[2], patch.world_bbox[4]]).astype(np.float32)
+        surface_local = np.asarray(surface_zyx, dtype=np.float32) - min_corner[None, None, :]
+        h_grid, w_grid = surface_zyx.shape[:2]
+        plan_list: list[dict] = []
+        tested_widths = _tested_frontier_band_widths(self.config)
+        directions: list[str] = []
+        if w_grid >= 2:
+            directions.extend(["left", "right"])
+        if h_grid >= 2:
+            directions.extend(["up", "down"])
+        max_frontier_invalid = float(self.config.get("prefilter_max_frontier_invalid_fraction", 0.5))
+        max_target_invalid = float(self.config.get("prefilter_max_target_invalid_fraction", 0.75))
+        ragged_trials = int(self.config.get("prefilter_ragged_trials", 0))
+        ragged_prob = float(self.config.get("ragged_frontier_prob", 0.0))
+        ragged_max_inset = int(self.config.get("ragged_frontier_max_inset", 0))
+        ragged_gap_choices = self.config.get("ragged_frontier_gap_length_choices")
+        ragged_lowfreq_sigma = float(self.config.get("ragged_frontier_lowfreq_sigma", 12.0))
+        for direction in directions:
+            axis_size = w_grid if direction in {"left", "right"} else h_grid
+            for conditioning_count in _reachable_conditioning_counts(
+                axis_size,
+                self._base_dataset._cond_percent_min,
+                self._base_dataset._cond_percent_max,
+            ):
+                cond_local, masked_local = _split_surface_grid(
+                    surface_local,
+                    direction=str(direction),
+                    conditioning_count=int(conditioning_count),
+                )
+                if cond_local is None or masked_local is None or cond_local.size == 0 or masked_local.size == 0:
+                    continue
+                cond_local = downsample_surface_grid(
+                    cond_local,
+                    direction=str(direction),
+                    surface_downsample_factor=effective_surface_downsample_factor,
+                )
+                masked_local = downsample_surface_grid(
+                    masked_local,
+                    direction=str(direction),
+                    surface_downsample_factor=effective_surface_downsample_factor,
+                )
+                if cond_local.size == 0 or masked_local.size == 0:
+                    continue
+
+                clean_frontier_values: list[float] = []
+                clean_target_values: list[float] = []
+                ragged_frontier_values: list[float] = []
+                ragged_target_values: list[float] = []
+                clean_reject_reason_counts: dict[str, int] = {}
+                ragged_reject_reason_counts: dict[str, int] = {}
+                valid_prompt_widths_clean: list[int] = []
+                valid_prompt_widths_ragged: list[int] = []
+                clean_valid_count = 0
+                ragged_valid_count = 0
+
+                for frontier_band_width in tested_widths:
+                    clean_valid, clean_stats, clean_reason = _evaluate_prefilter_trial(
                         cond_local,
-                        direction=str(direction),
-                        surface_downsample_factor=effective_surface_downsample_factor,
-                    )
-                    masked_local = downsample_surface_grid(
                         masked_local,
                         direction=str(direction),
-                        surface_downsample_factor=effective_surface_downsample_factor,
+                        frontier_band_width=int(frontier_band_width),
+                        volume_shape=self.crop_size,
+                        max_frontier_invalid_fraction=max_frontier_invalid,
+                        max_target_invalid_fraction=max_target_invalid,
                     )
-                    if cond_local.size == 0 or masked_local.size == 0:
-                        continue
+                    if clean_stats is not None:
+                        clean_frontier_values.append(float(clean_stats["frontier_invalid_fraction"]))
+                        clean_target_values.append(float(clean_stats["target_invalid_fraction"]))
+                    if clean_valid:
+                        valid_prompt_widths_clean.append(int(frontier_band_width))
+                        clean_valid_count += 1
+                    elif clean_reason is not None:
+                        clean_reject_reason_counts[str(clean_reason)] = clean_reject_reason_counts.get(str(clean_reason), 0) + 1
 
-                    clean_frontier_values: list[float] = []
-                    clean_target_values: list[float] = []
-                    ragged_frontier_values: list[float] = []
-                    ragged_target_values: list[float] = []
-                    clean_reject_reason_counts: dict[str, int] = {}
-                    ragged_reject_reason_counts: dict[str, int] = {}
-                    valid_prompt_widths_clean: list[int] = []
-                    valid_prompt_widths_ragged: list[int] = []
-                    clean_valid_count = 0
-                    ragged_valid_count = 0
+                    if ragged_prob > 0.0 and ragged_trials > 0:
+                        for _ in range(ragged_trials):
+                            ragged_cond_local, ragged_applied = _apply_ragged_frontier_augmentation(
+                                cond_local,
+                                direction=str(direction),
+                                frontier_band_width=int(frontier_band_width),
+                                ragged_frontier_prob=1.0,
+                                ragged_frontier_max_inset=ragged_max_inset,
+                                ragged_frontier_gap_length_choices=ragged_gap_choices,
+                                ragged_frontier_lowfreq_sigma=ragged_lowfreq_sigma,
+                            )
+                            if not bool(ragged_applied):
+                                continue
+                            ragged_valid, ragged_stats, ragged_reason = _evaluate_prefilter_trial(
+                                ragged_cond_local,
+                                masked_local,
+                                direction=str(direction),
+                                frontier_band_width=int(frontier_band_width),
+                                volume_shape=self.crop_size,
+                                max_frontier_invalid_fraction=max_frontier_invalid,
+                                max_target_invalid_fraction=max_target_invalid,
+                            )
+                            if ragged_stats is not None:
+                                ragged_frontier_values.append(float(ragged_stats["frontier_invalid_fraction"]))
+                                ragged_target_values.append(float(ragged_stats["target_invalid_fraction"]))
+                            if ragged_valid:
+                                valid_prompt_widths_ragged.append(int(frontier_band_width))
+                                ragged_valid_count += 1
+                            elif ragged_reason is not None:
+                                ragged_reject_reason_counts[str(ragged_reason)] = ragged_reject_reason_counts.get(str(ragged_reason), 0) + 1
 
-                    for frontier_band_width in tested_widths:
-                        clean_valid, clean_stats, clean_reason = _evaluate_prefilter_trial(
-                            cond_local,
-                            masked_local,
-                            direction=str(direction),
-                            frontier_band_width=int(frontier_band_width),
-                            volume_shape=self.crop_size,
-                            max_frontier_invalid_fraction=float(self.config.get("prefilter_max_frontier_invalid_fraction", 0.5)),
-                            max_target_invalid_fraction=float(self.config.get("prefilter_max_target_invalid_fraction", 0.75)),
-                        )
-                        if clean_stats is not None:
-                            clean_frontier_values.append(float(clean_stats["frontier_invalid_fraction"]))
-                            clean_target_values.append(float(clean_stats["target_invalid_fraction"]))
-                        if clean_valid:
-                            valid_prompt_widths_clean.append(int(frontier_band_width))
-                            clean_valid_count += 1
-                        elif clean_reason is not None:
-                            clean_reject_reason_counts[str(clean_reason)] = clean_reject_reason_counts.get(str(clean_reason), 0) + 1
-
-                        ragged_trials = int(self.config.get("prefilter_ragged_trials", 0))
-                        if float(self.config.get("ragged_frontier_prob", 0.0)) > 0.0 and ragged_trials > 0:
-                            for _ in range(ragged_trials):
-                                ragged_cond_local, ragged_applied = _apply_ragged_frontier_augmentation(
-                                    cond_local,
-                                    direction=str(direction),
-                                    frontier_band_width=int(frontier_band_width),
-                                    ragged_frontier_prob=1.0,
-                                    ragged_frontier_max_inset=int(self.config.get("ragged_frontier_max_inset", 0)),
-                                    ragged_frontier_gap_length_choices=self.config.get("ragged_frontier_gap_length_choices"),
-                                    ragged_frontier_lowfreq_sigma=float(self.config.get("ragged_frontier_lowfreq_sigma", 12.0)),
-                                )
-                                if not bool(ragged_applied):
-                                    continue
-                                ragged_valid, ragged_stats, ragged_reason = _evaluate_prefilter_trial(
-                                    ragged_cond_local,
-                                    masked_local,
-                                    direction=str(direction),
-                                    frontier_band_width=int(frontier_band_width),
-                                    volume_shape=self.crop_size,
-                                    max_frontier_invalid_fraction=float(self.config.get("prefilter_max_frontier_invalid_fraction", 0.5)),
-                                    max_target_invalid_fraction=float(self.config.get("prefilter_max_target_invalid_fraction", 0.75)),
-                                )
-                                if ragged_stats is not None:
-                                    ragged_frontier_values.append(float(ragged_stats["frontier_invalid_fraction"]))
-                                    ragged_target_values.append(float(ragged_stats["target_invalid_fraction"]))
-                                if ragged_valid:
-                                    valid_prompt_widths_ragged.append(int(frontier_band_width))
-                                    ragged_valid_count += 1
-                                elif ragged_reason is not None:
-                                    ragged_reject_reason_counts[str(ragged_reason)] = ragged_reject_reason_counts.get(str(ragged_reason), 0) + 1
-
-                    valid_prompt_widths_clean = sorted(set(valid_prompt_widths_clean))
-                    valid_prompt_widths_ragged = sorted(set(valid_prompt_widths_ragged))
-                    difficulty_bucket = _difficulty_bucket_from_stats(
-                        tested_widths=tested_widths,
-                        valid_prompt_widths_clean=valid_prompt_widths_clean,
-                        valid_prompt_widths_ragged=valid_prompt_widths_ragged,
-                        ragged_valid_count=int(ragged_valid_count),
-                        prefilter_ragged_trials=int(self.config.get("prefilter_ragged_trials", 0)),
-                    )
-                    if difficulty_bucket == "impossible":
-                        continue
-                    plan_list.append(
-                        {
-                            "direction": str(direction),
-                            "conditioning_count": int(conditioning_count),
-                            "conditioning_percent": float(conditioning_count) / float(max(axis_size, 1)),
-                            "use_stored_surface": bool(use_stored_surface),
-                            "effective_surface_downsample_factor": effective_surface_downsample_factor,
-                            "difficulty_bucket": str(difficulty_bucket),
-                            "clean_frontier_invalid_fraction": min(clean_frontier_values) if clean_frontier_values else 1.0,
-                            "clean_target_invalid_fraction": min(clean_target_values) if clean_target_values else 1.0,
-                            "ragged_trial_frontier_invalid_fraction": _mean_or_one(ragged_frontier_values),
-                            "ragged_trial_target_invalid_fraction": _mean_or_one(ragged_target_values),
-                            "valid_prompt_widths_clean": valid_prompt_widths_clean,
-                            "valid_prompt_widths_ragged": valid_prompt_widths_ragged,
-                            "valid_prompt_width_range": (
-                                [min(valid_prompt_widths_clean + valid_prompt_widths_ragged), max(valid_prompt_widths_clean + valid_prompt_widths_ragged)]
-                                if (valid_prompt_widths_clean or valid_prompt_widths_ragged) else []
-                            ),
-                            "clean_valid_count": int(clean_valid_count),
-                            "ragged_valid_count": int(ragged_valid_count),
-                            "clean_reject_reason_counts": clean_reject_reason_counts,
-                            "ragged_reject_reason_counts": ragged_reject_reason_counts,
-                        }
-                    )
-            if plan_list:
-                valid_plans[sample_key] = tuple(plan_list)
-            if hasattr(iterator, "set_postfix"):
-                iterator.set_postfix(
-                    kept=len(valid_plans),
-                    plans=int(sum(len(plans) for plans in valid_plans.values())),
+                valid_prompt_widths_clean = sorted(set(valid_prompt_widths_clean))
+                valid_prompt_widths_ragged = sorted(set(valid_prompt_widths_ragged))
+                difficulty_bucket = _difficulty_bucket_from_stats(
+                    tested_widths=tested_widths,
+                    valid_prompt_widths_clean=valid_prompt_widths_clean,
+                    valid_prompt_widths_ragged=valid_prompt_widths_ragged,
+                    ragged_valid_count=int(ragged_valid_count),
+                    prefilter_ragged_trials=ragged_trials,
                 )
-        if hasattr(iterator, "close"):
-            iterator.close()
+                if difficulty_bucket == "impossible":
+                    continue
+                plan_list.append(
+                    {
+                        "direction": str(direction),
+                        "conditioning_count": int(conditioning_count),
+                        "conditioning_percent": float(conditioning_count) / float(max(axis_size, 1)),
+                        "use_stored_surface": bool(use_stored_surface),
+                        "effective_surface_downsample_factor": effective_surface_downsample_factor,
+                        "difficulty_bucket": str(difficulty_bucket),
+                        "clean_frontier_invalid_fraction": min(clean_frontier_values) if clean_frontier_values else 1.0,
+                        "clean_target_invalid_fraction": min(clean_target_values) if clean_target_values else 1.0,
+                        "ragged_trial_frontier_invalid_fraction": _mean_or_one(ragged_frontier_values),
+                        "ragged_trial_target_invalid_fraction": _mean_or_one(ragged_target_values),
+                        "valid_prompt_widths_clean": valid_prompt_widths_clean,
+                        "valid_prompt_widths_ragged": valid_prompt_widths_ragged,
+                        "valid_prompt_width_range": (
+                            [min(valid_prompt_widths_clean + valid_prompt_widths_ragged), max(valid_prompt_widths_clean + valid_prompt_widths_ragged)]
+                            if (valid_prompt_widths_clean or valid_prompt_widths_ragged) else []
+                        ),
+                        "clean_valid_count": int(clean_valid_count),
+                        "ragged_valid_count": int(ragged_valid_count),
+                        "clean_reject_reason_counts": clean_reject_reason_counts,
+                        "ragged_reject_reason_counts": ragged_reject_reason_counts,
+                    }
+                )
+        return plan_list
+
+    def _prefilter_cache_path(self) -> Path:
+        first_segments_path = self.config["datasets"][0]["segments_path"]
+        return Path(first_segments_path) / ".patch_cache"
+
+    def _load_or_compute_prefilter_stats(
+        self,
+        valid_plans: dict,
+        *,
+        n_post_filter_samples: int,
+        cache_dir: Path | None,
+        cache_key: str | None,
+        precomputed_stats: dict | None = None,
+    ) -> dict:
+        if precomputed_stats is not None:
+            stats = dict(precomputed_stats)
+            stats["num_samples_with_valid_plans"] = int(n_post_filter_samples)
+            return stats
+        sidecar_path: Path | None = None
+        if cache_dir is not None and cache_key is not None:
+            sidecar_path = cache_dir / f"valid_plans_stats_{cache_key}.json"
+            if sidecar_path.exists():
+                try:
+                    with open(sidecar_path) as f:
+                        cached = json.load(f)
+                    if isinstance(cached, dict):
+                        cached["num_samples_with_valid_plans"] = int(n_post_filter_samples)
+                        print(
+                            f"[autoreg_mesh dataset] prefilter stats sidecar HIT key={cache_key}",
+                            flush=True,
+                        )
+                        return cached
+                except (json.JSONDecodeError, OSError) as e:
+                    print(
+                        f"[autoreg_mesh dataset] prefilter stats sidecar unreadable, recomputing: {e}",
+                        flush=True,
+                    )
+        n_workers_cfg = int(self.config.get("prefilter_num_workers", 0))
+        if n_workers_cfg <= 0:
+            n_workers_cfg = max(1, (os.cpu_count() or 4) // 2)
+        keys = list(valid_plans.keys())
+        n_workers = max(1, min(n_workers_cfg, len(keys)))
+        print(
+            f"[autoreg_mesh dataset] computing prefilter stats over {len(keys)} keys "
+            f"(n_workers={n_workers})...",
+            flush=True,
+        )
+        t_stats = time.perf_counter()
+        difficulty_bucket_counts = {"easy": 0, "medium": 0, "hard": 0}
+        clean_only_plan_count = 0
+        ragged_only_plan_count = 0
+        multi_width_plan_count = 0
+        total_valid_width_count = 0
+        total_plan_count = 0
+        show_progress = bool(self.config.get("prefilter_show_progress", True)) and len(keys) > 0
+        if n_workers <= 1 or len(keys) <= 1024:
+            iterator: Any = (
+                tqdm(keys, desc="autoreg_mesh prefilter stats", unit="sample", leave=False)
+                if show_progress
+                else keys
+            )
+            # The chunk worker reads `_active_prefilter_dataset._valid_split_plans`;
+            # set it for the single-process path too (the fork-pool branch below
+            # sets it inside its own block, so this is symmetric).
+            global _active_prefilter_dataset
+            previous_active_sp = _active_prefilter_dataset
+            _active_prefilter_dataset = self
+            try:
+                partials_iter = (_prefilter_stats_chunk_worker([key]) for key in iterator)
+                for partial in partials_iter:
+                    for k, v in partial["difficulty_bucket_counts"].items():
+                        difficulty_bucket_counts[k] += int(v)
+                    clean_only_plan_count += int(partial["clean_only_plan_count"])
+                    ragged_only_plan_count += int(partial["ragged_only_plan_count"])
+                    multi_width_plan_count += int(partial["multi_width_plan_count"])
+                    total_valid_width_count += int(partial["total_valid_width_count"])
+                    total_plan_count += int(partial["total_plan_count"])
+            finally:
+                _active_prefilter_dataset = previous_active_sp
+        else:
+            chunk_size = max(1, len(keys) // (n_workers * 8))
+            chunks = [keys[i : i + chunk_size] for i in range(0, len(keys), chunk_size)]
+            previous_active = _active_prefilter_dataset
+            _active_prefilter_dataset = self
+            try:
+                try:
+                    from threadpoolctl import threadpool_limits as _threadpool_limits
+                    _tpl_ctx = _threadpool_limits(limits=1)
+                except ImportError:
+                    _tpl_ctx = None
+                ctx = multiprocessing.get_context("fork")
+                with ctx.Pool(n_workers) as pool:
+                    iterator = pool.imap_unordered(_prefilter_stats_chunk_worker, chunks)
+                    if show_progress:
+                        pbar = tqdm(
+                            total=len(keys),
+                            desc=f"autoreg_mesh prefilter stats (n_workers={n_workers})",
+                            unit="sample",
+                            leave=False,
+                        )
+                    else:
+                        pbar = None
+                    for partial in iterator:
+                        for k, v in partial["difficulty_bucket_counts"].items():
+                            difficulty_bucket_counts[k] += int(v)
+                        clean_only_plan_count += int(partial["clean_only_plan_count"])
+                        ragged_only_plan_count += int(partial["ragged_only_plan_count"])
+                        multi_width_plan_count += int(partial["multi_width_plan_count"])
+                        total_valid_width_count += int(partial["total_valid_width_count"])
+                        total_plan_count += int(partial["total_plan_count"])
+                        if pbar is not None:
+                            pbar.update(int(partial["chunk_size"]))
+                            pbar.set_postfix(plans=total_plan_count)
+                    if pbar is not None:
+                        pbar.close()
+            finally:
+                _active_prefilter_dataset = previous_active
+                if _tpl_ctx is not None:
+                    _tpl_ctx.unregister()
+        stats = {
+            "num_samples_with_valid_plans": int(n_post_filter_samples),
+            "num_total_valid_split_plans": int(total_plan_count),
+            "difficulty_bucket_counts": difficulty_bucket_counts,
+            "clean_only_plan_count": int(clean_only_plan_count),
+            "ragged_only_plan_count": int(ragged_only_plan_count),
+            "multi_width_plan_count": int(multi_width_plan_count),
+            "avg_valid_prompt_width_count": (
+                float(total_valid_width_count) / float(total_plan_count) if total_plan_count > 0 else 0.0
+            ),
+        }
+        elapsed = time.perf_counter() - t_stats
+        print(
+            f"[autoreg_mesh dataset] prefilter stats computed in {elapsed:.1f}s",
+            flush=True,
+        )
+        if sidecar_path is not None:
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                tmp = sidecar_path.with_suffix(".json.tmp")
+                with open(tmp, "w") as f:
+                    json.dump(stats, f, indent=2)
+                os.replace(tmp, sidecar_path)
+                print(
+                    f"[autoreg_mesh dataset] prefilter stats sidecar saved: {sidecar_path}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[autoreg_mesh dataset] prefilter stats sidecar save FAILED: {e}",
+                    flush=True,
+                )
+        return stats
+
+    def _prefilter_cache_key(self) -> str:
+        tested_widths = _tested_frontier_band_widths(self.config)
+        sample_signature: list[tuple] = []
+        for patch_idx, wrap_idx in sorted(self.sample_index):
+            patch = self.patches[int(patch_idx)]
+            wrap = patch.wraps[int(wrap_idx)]
+            seg = wrap.get("segment")
+            seg_uuid = getattr(seg, "uuid", None) if seg is not None else None
+            sample_signature.append((int(patch_idx), int(wrap_idx), int(wrap.get("wrap_id", -1)), str(seg_uuid)))
+        samples_md5 = hashlib.md5(json.dumps(sample_signature, sort_keys=True).encode()).hexdigest()
+        cache_key_data = {
+            "method": "autoreg_mesh_valid_plans_v1",
+            "tested_widths": list(tested_widths),
+            "prefilter_max_frontier_invalid_fraction": float(self.config.get("prefilter_max_frontier_invalid_fraction", 0.5)),
+            "prefilter_max_target_invalid_fraction": float(self.config.get("prefilter_max_target_invalid_fraction", 0.75)),
+            "prefilter_ragged_trials": int(self.config.get("prefilter_ragged_trials", 0)),
+            "ragged_frontier_prob": float(self.config.get("ragged_frontier_prob", 0.0)),
+            "ragged_frontier_max_inset": int(self.config.get("ragged_frontier_max_inset", 0)),
+            "ragged_frontier_gap_length_choices": list(self.config.get("ragged_frontier_gap_length_choices") or []),
+            "ragged_frontier_lowfreq_sigma": float(self.config.get("ragged_frontier_lowfreq_sigma", 12.0)),
+            "cond_percent_min": float(self._base_dataset._cond_percent_min),
+            "cond_percent_max": float(self._base_dataset._cond_percent_max),
+            "crop_size": list(self.crop_size),
+            "surface_downsample_factor": self.config.get("surface_downsample_factor"),
+            "use_stored_resolution_only": bool(self.config.get("use_stored_resolution_only", True)),
+            "n_samples": len(self.sample_index),
+            "samples_md5": samples_md5,
+        }
+        return hashlib.md5(json.dumps(cache_key_data, sort_keys=True).encode()).hexdigest()
+
+    def _build_valid_split_plans(self) -> dict[tuple[int, int], tuple[dict, ...]]:
+        prefilter_started = time.perf_counter()
+        cache_dir = self._prefilter_cache_path()
+        cache_key = self._prefilter_cache_key()
+        cache_file = cache_dir / f"valid_plans_{cache_key}.pkl"
+        if cache_file.exists():
+            try:
+                with open(cache_file, "rb") as f:
+                    cached = pickle.load(f)
+                if isinstance(cached, dict):
+                    self._prefilter_wall_seconds = float(time.perf_counter() - prefilter_started)
+                    print(
+                        f"[autoreg_mesh prefilter] cache hit key={cache_key} "
+                        f"samples={len(cached)} path={cache_file}"
+                    )
+                    return cached
+            except (pickle.UnpicklingError, EOFError, OSError) as e:
+                print(f"[autoreg_mesh prefilter] cache unreadable, recomputing: {e}")
+        print(f"[autoreg_mesh prefilter] cache miss key={cache_key}; recomputing...")
+
+        valid_plans: dict[tuple[int, int], tuple[dict, ...]] = {}
+        show_progress = bool(self.config.get("prefilter_show_progress", True)) and len(self.sample_index) > 0
+        n_workers_cfg = int(self.config.get("prefilter_num_workers", 0))
+        if n_workers_cfg <= 0:
+            n_workers_cfg = max(1, (os.cpu_count() or 4) // 2)
+        n_workers = max(1, min(n_workers_cfg, len(self.sample_index)))
+
+        running_plan_count = 0
+        if n_workers <= 1:
+            iterator: Any = self.sample_index
+            if show_progress:
+                iterator = tqdm(self.sample_index, desc="autoreg_mesh prefilter", unit="wrap", leave=False)
+            for sample_key in iterator:
+                plan_list = self._compute_one_plan_list(sample_key)
+                if plan_list:
+                    valid_plans[sample_key] = tuple(plan_list)
+                    running_plan_count += len(plan_list)
+                if show_progress and hasattr(iterator, "set_postfix"):
+                    iterator.set_postfix(kept=len(valid_plans), plans=running_plan_count)
+            if show_progress and hasattr(iterator, "close"):
+                iterator.close()
+        else:
+            global _active_prefilter_dataset
+            _active_prefilter_dataset = self
+            try:
+                # Workers inherit the parent's BLAS thread-pool sizes via fork.
+                # Cap them to 1 so workers don't oversubscribe with N x BLAS threads.
+                try:
+                    from threadpoolctl import threadpool_limits as _threadpool_limits
+                    _tpl_ctx = _threadpool_limits(limits=1)
+                except ImportError:
+                    _tpl_ctx = None
+                chunksize = max(1, len(self.sample_index) // (n_workers * 32))
+                ctx = multiprocessing.get_context("fork")
+                with ctx.Pool(n_workers) as pool:
+                    iterator = pool.imap_unordered(
+                        _prefilter_one_worker,
+                        self.sample_index,
+                        chunksize=chunksize,
+                    )
+                    if show_progress:
+                        iterator = tqdm(
+                            iterator,
+                            total=len(self.sample_index),
+                            desc=f"autoreg_mesh prefilter (n_workers={n_workers})",
+                            unit="wrap",
+                            leave=False,
+                        )
+                    for sample_key, plan_list in iterator:
+                        if plan_list:
+                            valid_plans[sample_key] = tuple(plan_list)
+                            running_plan_count += len(plan_list)
+                        if show_progress and hasattr(iterator, "set_postfix"):
+                            iterator.set_postfix(kept=len(valid_plans), plans=running_plan_count)
+            finally:
+                _active_prefilter_dataset = None
+                if _tpl_ctx is not None:
+                    _tpl_ctx.unregister()
+
         self._prefilter_wall_seconds = float(time.perf_counter() - prefilter_started)
+
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp_file = cache_file.with_suffix(".pkl.tmp")
+            with open(tmp_file, "wb") as f:
+                pickle.dump(valid_plans, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_file, cache_file)
+            print(
+                f"[autoreg_mesh prefilter] cache saved key={cache_key} "
+                f"samples={len(valid_plans)} path={cache_file}"
+            )
+        except Exception as e:
+            print(f"[autoreg_mesh prefilter] cache save FAILED: {e}")
+
         return valid_plans
 
     def _resolve_surface_sampling_plan(self, wrap: dict) -> tuple[bool, int | tuple[int, int]]:
@@ -1070,13 +1468,26 @@ class AutoregMeshDataset(Dataset):
             augmentation_cfg=self.config.get("spatial_augmentation", {}),
             enabled=self.apply_spatial_augmentation,
         )
+        # UV-grid augmentation (rows<->cols) operates ONLY on the 2D UV
+        # parametrization layout; volume and world-coord channels are
+        # untouched. Direction token must be remapped consistently
+        # (left<->up, right<->down) since the frontier band semantics in
+        # serialization.extract_frontier_prompt_band index UV axes.
+        cond_local, masked_local, cond_direction, uv_aug_metadata = _apply_uv_grid_augmentation(
+            cond_local,
+            masked_local,
+            direction=str(conditioning["cond_direction"]).lower(),
+            augmentation_cfg=self.config.get("spatial_augmentation", {}),
+            enabled=self.apply_spatial_augmentation,
+        )
+        spatial_aug_metadata = {**spatial_aug_metadata, **uv_aug_metadata}
         valid_prompt_widths_clean = list(split_plan.get("valid_prompt_widths_clean", []))
         valid_prompt_widths_ragged = list(split_plan.get("valid_prompt_widths_ragged", []))
         width_candidates = valid_prompt_widths_clean if valid_prompt_widths_clean else valid_prompt_widths_ragged
         frontier_band_width = int(random.choice(width_candidates)) if width_candidates else _sample_frontier_band_width(self.config)
         cond_local, ragged_frontier_applied = _apply_ragged_frontier_augmentation(
             cond_local,
-            direction=str(conditioning["cond_direction"]).lower(),
+            direction=cond_direction,
             frontier_band_width=int(frontier_band_width),
             ragged_frontier_prob=float(self.config.get("ragged_frontier_prob", 0.0)),
             ragged_frontier_max_inset=int(self.config.get("ragged_frontier_max_inset", 0)),
@@ -1091,7 +1502,7 @@ class AutoregMeshDataset(Dataset):
         serialized = serialize_split_conditioning_example(
             cond_zyxs_local=cond_local,
             masked_zyxs_local=masked_local,
-            direction=str(conditioning["cond_direction"]).lower(),
+            direction=cond_direction,
             volume_shape=self.crop_size,
             patch_size=self.config["patch_size"],
             offset_num_bins=self.config["offset_num_bins"],
@@ -1160,6 +1571,7 @@ class AutoregMeshDataset(Dataset):
                 "spatial_augmented": bool(spatial_aug_metadata["spatial_augmented"]),
                 "spatial_mirror_axes": list(spatial_aug_metadata["spatial_mirror_axes"]),
                 "spatial_axis_order": list(spatial_aug_metadata["spatial_axis_order"]),
+                "uv_transposed": bool(spatial_aug_metadata.get("uv_transposed", False)),
             },
             "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
             "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),

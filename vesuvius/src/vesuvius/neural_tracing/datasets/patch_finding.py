@@ -820,22 +820,26 @@ def find_world_chunk_patches(
     if not segments:
         return []
 
-    # Build cache key
+    # Build cache key. Normalize numeric types to floats so a config
+    # round-tripped through jq (which collapses 20.0 -> 20) hashes to the
+    # same key as the originally-loaded float config. Without this, the
+    # smoke harness and the production launch produce different chunk-cache
+    # MD5s for what is logically the same input.
     cache_key_data = {
         "method": "world_chunks",
-        "target_size": list(target_size),
-        "overlap_fraction": overlap_fraction,
-        "min_span_ratio": min_span_ratio,
-        "edge_touch_frac": edge_touch_frac,
-        "edge_touch_min_count": edge_touch_min_count,
-        "edge_touch_pad": edge_touch_pad,
-        "min_points_per_wrap": min_points_per_wrap,
-        "bbox_pad_2d": bbox_pad_2d,
-        "require_all_valid_in_bbox": require_all_valid_in_bbox,
-        "skip_chunk_if_any_invalid": skip_chunk_if_any_invalid,
-        "inner_bbox_fraction": inner_bbox_fraction,
-        "chunk_pad": chunk_pad,
-        "segment_scales": [list(seg._scale) for seg in segments],
+        "target_size": [int(v) for v in target_size],
+        "overlap_fraction": float(overlap_fraction),
+        "min_span_ratio": float(min_span_ratio),
+        "edge_touch_frac": float(edge_touch_frac),
+        "edge_touch_min_count": int(edge_touch_min_count),
+        "edge_touch_pad": int(edge_touch_pad),
+        "min_points_per_wrap": int(min_points_per_wrap),
+        "bbox_pad_2d": int(bbox_pad_2d),
+        "require_all_valid_in_bbox": bool(require_all_valid_in_bbox),
+        "skip_chunk_if_any_invalid": bool(skip_chunk_if_any_invalid),
+        "inner_bbox_fraction": float(inner_bbox_fraction),
+        "chunk_pad": float(chunk_pad),
+        "segment_scales": [[float(s) for s in seg._scale] for seg in segments],
         "segment_uuids": [seg.uuid for seg in segments],
     }
     cache_key = hashlib.md5(

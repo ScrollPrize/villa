@@ -28,6 +28,7 @@ from vesuvius.neural_tracing.datasets.common import (
     create_band_mask,
     compute_heatmap_targets,
     edt_dilate_binary_mask,
+    open_zarr_group_readonly,
     voxelize_surface_grid,
 )
 from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
@@ -270,7 +271,13 @@ class EdtSegDataset(Dataset):
             for dataset_idx, dataset in enumerate(config['datasets']):
                 volume_path = dataset['volume_path']
                 volume_scale = dataset['volume_scale']
-                volume = zarr.open_group(volume_path, mode='r')
+                # Do NOT open the zarr here. Opening it now would attach a
+                # zarr.Group with FSStore+aiohttp/boto3 thread state to every
+                # segment and every ChunkPatch, which would then be pickled
+                # to every spawn worker -> /dev/shm + FD + S3-connection
+                # storm at DataLoader startup that wedges the kernel. Workers
+                # open the zarr lazily via `get_or_open_zarr_group` on first
+                # access in their own process.
                 segments_path = dataset['segments_path']
                 z_range = _parse_z_range(dataset.get('z_range', None))
                 dataset_segments = list(tifxyz.load_folder(segments_path))
@@ -284,7 +291,9 @@ class EdtSegDataset(Dataset):
                     if not _segment_overlaps_z_range(seg_scaled, z_range):
                         dropped_by_z_range += 1
                         continue
-                    seg_scaled.volume = volume
+                    # Attach only the path string; consumers that need the zarr
+                    # call get_or_open_zarr_group(seg.volume_path).
+                    seg_scaled.volume_path = volume_path
                     scaled_segments.append(seg_scaled)
 
                 if not scaled_segments:
@@ -342,7 +351,7 @@ class EdtSegDataset(Dataset):
 
                     patches.append(ChunkPatch(
                         chunk_id=tuple(chunk["chunk_id"]),
-                        volume=volume,
+                        volume_path=volume_path,  # lazy open per-PID
                         scale=volume_scale,
                         world_bbox=tuple(chunk["bbox_3d"]),
                         wraps=wraps_in_chunk,

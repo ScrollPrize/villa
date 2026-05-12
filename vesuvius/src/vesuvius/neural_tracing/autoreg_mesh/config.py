@@ -95,7 +95,13 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
         "mirror_prob": 0.5,
         "transpose_prob": 0.25,
         "mirror_axes": [0, 1, 2],
-        "transpose_axes": [0, 1, 2],
+        # volume transpose: only Y<->X (axes 1,2). Z permutations reorder
+        # world-coord channels, which downstream serialization assumes ZYX.
+        "transpose_axes": [1, 2],
+        # UV-grid (2D parametrization) transpose: independent of volume
+        # mirror/transpose. Remaps direction tokens: left<->up, right<->down.
+        # Only applied when the full UV grid (cond + masked) is square.
+        "uv_transpose_prob": 0.0,
     },
     "patch_size": [8, 8, 8],
     "offset_num_bins": [16, 16, 16],
@@ -436,14 +442,23 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         spatial_aug.setdefault(key, default)
     if not isinstance(spatial_aug.get("enabled"), bool):
         raise ValueError("spatial_augmentation.enabled must be a boolean")
-    for key in ("mirror_prob", "transpose_prob"):
+    for key in ("mirror_prob", "transpose_prob", "uv_transpose_prob"):
         value = float(spatial_aug[key])
         if value < 0.0 or value > 1.0:
             raise ValueError(f"spatial_augmentation.{key} must be within [0, 1]")
     spatial_aug["mirror_axes"] = _normalize_axis_list("spatial_augmentation.mirror_axes", spatial_aug["mirror_axes"])
     spatial_aug["transpose_axes"] = _normalize_axis_list("spatial_augmentation.transpose_axes", spatial_aug["transpose_axes"])
+    transpose_axes_set = set(spatial_aug["transpose_axes"])
+    if transpose_axes_set and not transpose_axes_set.issubset({1, 2}):
+        raise ValueError(
+            "spatial_augmentation.transpose_axes must be a subset of {1, 2} (Y<->X). "
+            "Z-axis volume transpose is disallowed because it permutes the "
+            "world-coord channel order; downstream serialization assumes ZYX. "
+            f"Got: {sorted(transpose_axes_set)!r}"
+        )
     if bool(cfg.get("cache_vol_tokens", False)) and bool(spatial_aug["enabled"]):
         raise ValueError("spatial_augmentation.enabled=true is incompatible with cache_vol_tokens=true")
+    spatial_aug["uv_transpose_prob"] = float(spatial_aug["uv_transpose_prob"])
     cfg["spatial_augmentation"] = spatial_aug
     if int(cfg["num_steps"]) <= 0:
         raise ValueError("num_steps must be positive")
