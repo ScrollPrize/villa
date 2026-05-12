@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
+import zlib
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +21,8 @@ import numpy as np
 import tifffile
 import torch
 import zarr
+
+zarr.config.set({"async.concurrency": 1, "threading.max_workers": 1})
 
 
 def _parse_z_range(value: str) -> tuple[int, int]:
@@ -601,6 +605,70 @@ def _write_preview_layered_tifs(
     return written
 
 
+def _write_mask_zarr(
+    *,
+    out_path: Path,
+    mask: np.ndarray,
+    source_path: Path,
+    scale_zyx: tuple[float, float, float],
+    z_range_full: tuple[int, int],
+    z_range_array: tuple[int, int],
+) -> None:
+    if mask.ndim != 3:
+        raise ValueError(f"expected 3D mask, got shape={mask.shape}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        if out_path.is_dir():
+            shutil.rmtree(out_path)
+        else:
+            out_path.unlink()
+    out_path.mkdir(parents=True)
+
+    shape = tuple(int(v) for v in mask.shape)
+    chunks = tuple(min(32, int(v)) for v in shape)
+    zarray = {
+        "zarr_format": 2,
+        "shape": list(shape),
+        "chunks": list(chunks),
+        "dtype": "|u1",
+        "compressor": {"id": "zlib", "level": 1},
+        "fill_value": 0,
+        "order": "C",
+        "filters": None,
+        "dimension_separator": "/",
+    }
+    zattrs = {
+        "source_zarr": str(source_path),
+        "scale_zyx": [float(v) for v in scale_zyx],
+        "z_range_full": [int(v) for v in z_range_full],
+        "z_range_array": [int(v) for v in z_range_array],
+        "mask_values": {"background": 0, "masked": 255},
+    }
+    (out_path / ".zarray").write_text(json.dumps(zarray, indent=2) + "\n")
+    (out_path / ".zattrs").write_text(json.dumps(zattrs, indent=2) + "\n")
+
+    Z, Y, X = shape
+    cZ, cY, cX = chunks
+    for z0 in range(0, Z, cZ):
+        z1 = min(Z, z0 + cZ)
+        iz = z0 // cZ
+        for y0 in range(0, Y, cY):
+            y1 = min(Y, y0 + cY)
+            iy = y0 // cY
+            for x0 in range(0, X, cX):
+                x1 = min(X, x0 + cX)
+                ix = x0 // cX
+                src = mask[z0:z1, y0:y1, x0:x1]
+                if not np.any(src):
+                    continue
+                chunk = np.zeros(chunks, dtype=np.uint8)
+                chunk[: z1 - z0, : y1 - y0, : x1 - x0] = src.astype(np.uint8) * 255
+                chunk_path = out_path / str(iz) / str(iy) / str(ix)
+                chunk_path.parent.mkdir(parents=True, exist_ok=True)
+                chunk_path.write_bytes(zlib.compress(chunk.tobytes(order="C"), level=1))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Debug empty-region mask creation on a zarr volume z-range.",
@@ -608,10 +676,16 @@ def main() -> None:
     parser.add_argument("zarr_path", type=Path, help="Path to a zarr array or group.")
     parser.add_argument(
         "-o",
-        "--output",
+        "--vis-dir",
         type=Path,
-        default=Path("empty_region_mask_debug.tif"),
-        help="Output layered TIFF path.",
+        default=Path("empty_region_mask_vis"),
+        help="Visualization output directory. Contains jpg/ and tif/ subdirs.",
+    )
+    parser.add_argument(
+        "--zarr-output",
+        type=Path,
+        default=None,
+        help="Optional plain single-scale zarr output for the uint8 mask volume.",
     )
     parser.add_argument(
         "--array",
@@ -683,18 +757,6 @@ def main() -> None:
         type=int,
         default=2,
         help="Final XY-only closing iterations: dilate N then erode N (default: 2).",
-    )
-    parser.add_argument(
-        "--jpg-dir",
-        type=Path,
-        default=None,
-        help="Directory for 1k-step JPG overlay previews (default: OUTPUT stem + _jpg).",
-    )
-    parser.add_argument(
-        "--preview-tif-dir",
-        type=Path,
-        default=None,
-        help="Directory for matching layered TIFF debug previews (default: OUTPUT stem + _preview_tif).",
     )
     parser.add_argument(
         "--jpg-step-full",
@@ -786,26 +848,21 @@ def main() -> None:
         torch.cuda.synchronize(dev)
     mask_ms = (time.perf_counter() - mask_t0) * 1000.0
 
-    z_mid_full = (z_range_full[0] + z_range_full[1]) // 2
-    mid = int(np.floor(float(z_mid_full) / scale_zyx[0])) - z_range_array[0]
-    mid = max(0, min(mid, volume.shape[0] - 1))
-    z_mid_array = z_range_array[0] + mid
-    write_t0 = time.perf_counter()
-    _write_layered_tif(
-        out_path=args.output,
-        original_slice=volume[mid],
-        mask_slice=mask[mid],
-        overlay_alpha=args.jpg_mask_alpha,
-    )
-    write_ms = (time.perf_counter() - write_t0) * 1000.0
-    jpg_dir = args.jpg_dir
-    if jpg_dir is None:
-        jpg_dir = args.output.with_suffix("")
-        jpg_dir = jpg_dir.parent / f"{jpg_dir.name}_jpg"
-    preview_tif_dir = args.preview_tif_dir
-    if preview_tif_dir is None:
-        preview_tif_dir = args.output.with_suffix("")
-        preview_tif_dir = preview_tif_dir.parent / f"{preview_tif_dir.name}_preview_tif"
+    zarr_write_ms = 0.0
+    if args.zarr_output is not None:
+        zarr_t0 = time.perf_counter()
+        _write_mask_zarr(
+            out_path=args.zarr_output,
+            mask=mask,
+            source_path=array_path,
+            scale_zyx=scale_zyx,
+            z_range_full=z_range_full,
+            z_range_array=z_range_array,
+        )
+        zarr_write_ms = (time.perf_counter() - zarr_t0) * 1000.0
+
+    jpg_dir = args.vis_dir / "jpg"
+    preview_tif_dir = args.vis_dir / "tif"
     previews = _preview_slices(
         z_range_array=z_range_array,
         z_range_full=z_range_full,
@@ -834,14 +891,14 @@ def main() -> None:
     mask_frac = float(mask.mean()) if mask.size else 0.0
     total_ms = (time.perf_counter() - t0) * 1000.0
     print(
-        f"[mask] z_mid_full={z_mid_full} z_mid_array={z_mid_array} "
-        f"mask_frac={mask_frac:.4f} "
+        f"[mask] mask_frac={mask_frac:.4f} "
         f"read={read_ms:.1f}ms mask={mask_ms:.1f}ms "
-        f"tif={write_ms:.1f}ms previews={preview_ms:.1f}ms "
+        f"zarr={zarr_write_ms:.1f}ms previews={preview_ms:.1f}ms "
         f"total={total_ms:.1f}ms",
         flush=True,
     )
-    print(f"[mask] wrote {args.output}", flush=True)
+    if args.zarr_output is not None:
+        print(f"[mask] wrote zarr mask to {args.zarr_output}", flush=True)
     print(f"[mask] wrote {jpg_count} JPG previews to {jpg_dir}", flush=True)
     print(
         f"[mask] wrote {preview_tif_count} layered TIFF previews to {preview_tif_dir}",
