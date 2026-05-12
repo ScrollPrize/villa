@@ -138,10 +138,13 @@ if(VC_ENABLE_COVERAGE)
         list(APPEND _san --coverage)
     endif()
 endif()
-if(_san)
-    add_compile_options(${_san} -Og)
-    add_link_options(${_san})
-endif()
+# Sanitizer / coverage flags are NOT applied here. They get applied (further
+# down) only after libs/ subdirectories have been added, so that PaStiX,
+# libigl, OpenABF, c3d, etc. — third-party code we don't ship test coverage
+# or sanitizer findings for — build at full speed without instrumentation.
+# Link-time mixing of instrumented + non-instrumented objects is supported
+# by every sanitizer we use (ASan/UBSan/TSan/TySan/NSan); the runtime is
+# linked in once and intercepts at the binary boundary.
 
 # ---- Optimization + LTO -----------------------------------------------------
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -299,6 +302,15 @@ include_directories(core/include)
 add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
 add_subdirectory(libs/flatboi)
+
+# Apply sanitizer / coverage flags only to *our* code (utils, core, apps,
+# tests) — not the libs/ tree above. PaStiX/SPM alone is ~1273 generated
+# TUs; instrumenting them under TySan/UBSan dominates build time and we
+# don't ship findings for third-party code anyway.
+if(_san)
+    add_compile_options(${_san} -Og)
+    add_link_options(${_san})
+endif()
 
 add_subdirectory(utils)
 add_subdirectory(core)
