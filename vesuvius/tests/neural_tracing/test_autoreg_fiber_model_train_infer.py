@@ -13,6 +13,8 @@ from vesuvius.neural_tracing.autoreg_fiber.losses import compute_autoreg_fiber_l
 from vesuvius.neural_tracing.autoreg_fiber.model import AutoregFiberModel
 from vesuvius.neural_tracing.autoreg_fiber.train import (
     _ddp_find_unused_parameters_enabled,
+    _make_inference_prediction_canvas,
+    _make_inference_xy_slice_canvas,
     _make_projection_canvas,
     _make_xy_slice_overlay_canvas,
     _wandb_dataset_summary,
@@ -260,6 +262,44 @@ def test_fiber_skeleton_projection_and_xy_canvases_are_rgb_images() -> None:
     assert xy.shape[-1] == 3
     assert xy.shape[0] >= 530
     assert xy.shape[1] >= 512
+    assert xy.dtype == np.uint8
+    assert int(xy.sum()) > 0
+
+
+def test_inference_canvas_renders_autoregressive_rollout(tmp_path) -> None:
+    """The autoregressive image helpers (used by the val/example wandb log)
+    must produce valid uint8 RGB images when fed an `infer_autoreg_fiber`
+    rollout — this is the backport from autoreg_mesh's val-image path."""
+
+    torch.manual_seed(7)
+    cfg, dataset, _batch = _dataset_and_batch(tmp_path)
+    cfg["coarse_prediction_mode"] = "axis_factorized"
+    model = AutoregFiberModel(cfg).eval()
+
+    raw_sample = dataset[0]
+    result = infer_autoreg_fiber(
+        model,
+        raw_sample,
+        max_steps=int(cfg["target_length"]),
+        stop_probability_threshold=None,
+        min_steps=1,
+        greedy=True,
+    )
+
+    projection = _make_inference_prediction_canvas(raw_sample, result, line_thickness=1)
+    xy = _make_inference_xy_slice_canvas(
+        raw_sample,
+        result,
+        line_thickness=1,
+        depth_tolerance=1.0,
+    )
+
+    assert projection.ndim == 3
+    assert projection.shape[-1] == 3
+    assert projection.dtype == np.uint8
+    assert int(projection.sum()) > 0
+    assert xy.ndim == 3
+    assert xy.shape[-1] == 3
     assert xy.dtype == np.uint8
     assert int(xy.sum()) > 0
 

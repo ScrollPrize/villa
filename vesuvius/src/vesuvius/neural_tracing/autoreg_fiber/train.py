@@ -1036,6 +1036,88 @@ def _make_teacher_forced_xy_slice_canvas(
     )
 
 
+def _extract_inference_polylines(raw_sample: dict, inference_result: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Mirror of :func:`_extract_teacher_forced_polylines` for an autoregressive
+    rollout. ``raw_sample`` is a single uncollated dataset item, and
+    ``inference_result`` is the return value of :func:`infer_autoreg_fiber`
+    on that sample. Pred points come from ``predicted_fiber_local_zyx``; if
+    the rollout stopped early (``stop_probability`` triggered) the trailing
+    positions are marked invalid so the rasteriser skips them."""
+
+    prompt_points, prompt_valid = _valid_polyline_points(
+        _as_numpy_array(raw_sample["prompt_tokens"]["xyz"]),
+        _as_numpy_mask(raw_sample["prompt_tokens"]["valid_mask"]),
+    )
+    target_points, target_valid = _valid_polyline_points(
+        _as_numpy_array(raw_sample["target_xyz"]),
+        _as_numpy_mask(raw_sample["target_valid_mask"]),
+    )
+    pred_local = np.asarray(inference_result["predicted_fiber_local_zyx"], dtype=np.float32)
+    target_len = int(target_points.shape[0])
+    pred_points = np.full((target_len, 3), np.nan, dtype=np.float32)
+    pred_valid = np.zeros((target_len,), dtype=bool)
+    n = min(int(pred_local.shape[0]), target_len)
+    if n > 0:
+        pred_points[:n] = pred_local[:n]
+        pred_valid[:n] = True
+    target_points, target_valid = _prepend_prompt_anchor(
+        target_points,
+        target_valid,
+        prompt_points_local=prompt_points,
+        prompt_valid_mask=prompt_valid,
+    )
+    pred_points, pred_valid = _prepend_prompt_anchor(
+        pred_points,
+        pred_valid,
+        prompt_points_local=prompt_points,
+        prompt_valid_mask=prompt_valid,
+    )
+    target_points[~target_valid] = np.nan
+    pred_points[~pred_valid] = np.nan
+    return prompt_points, target_points, pred_points
+
+
+def _make_inference_prediction_canvas(
+    raw_sample: dict,
+    inference_result: dict,
+    *,
+    line_thickness: int = 1,
+) -> np.ndarray:
+    """Projection canvas (ZY/ZX/YX triptych) of an autoregressive rollout
+    overlaid on the sample's volume. Same renderer as the teacher-forced
+    canvas — only the source of the prediction polyline differs."""
+
+    prompt_points, target_points, pred_points = _extract_inference_polylines(raw_sample, inference_result)
+    crop_shape = tuple(int(v) for v in _as_numpy_array(raw_sample["volume"]).shape[-3:])
+    return _make_projection_canvas(
+        prompt_points_local=prompt_points,
+        target_points_local=target_points,
+        pred_points_local=pred_points,
+        crop_shape=crop_shape,
+        line_thickness=int(line_thickness),
+        volume=_as_numpy_array(raw_sample["volume"]),
+    )
+
+
+def _make_inference_xy_slice_canvas(
+    raw_sample: dict,
+    inference_result: dict,
+    *,
+    line_thickness: int,
+    depth_tolerance: float,
+) -> np.ndarray:
+    prompt_points, target_points, pred_points = _extract_inference_polylines(raw_sample, inference_result)
+    volume = _as_numpy_array(raw_sample["volume"])
+    return _make_xy_slice_overlay_canvas(
+        volume=volume,
+        prompt_points_local=prompt_points,
+        target_points_local=target_points,
+        pred_points_local=pred_points,
+        line_thickness=int(line_thickness),
+        depth_tolerance=float(depth_tolerance),
+    )
+
+
 def _autoreg_fiber_base_dataset(dataset: Dataset) -> AutoregFiberDataset | None:
     current = dataset
     while isinstance(current, Subset):
@@ -1561,15 +1643,20 @@ def run_autoreg_fiber_training(
             should_log_projection_images = runtime.is_main_process and wandb is not None and should_log_projection_images_step
             should_log_xy_images = runtime.is_main_process and wandb is not None and should_log_xy_images_step
             if should_log_projection_images or should_log_xy_images:
-                val_visual_batch = None
-                val_visual_outputs = None
+                # Train side stays teacher-forced (the current batch's outputs).
+                # Val side switches to autoregressive rollout so engineers see
+                # the real model behaviour, not just teacher-forced predictions
+                # that hide exposure-bias drift. Backports the pattern from
+                # autoreg_mesh/train.py:1540-1582.
+                raw_val_sample = None
+                val_infer = None
                 if val_dataset is not None and len(val_dataset) > 0:
-                    val_visual_batch, val_visual_outputs = _make_validation_teacher_forced_batch(
-                        model=raw_model,
-                        dataset=val_dataset,
-                        cfg=cfg,
-                        device=runtime.device,
-                    )
+                    raw_val_sample = val_dataset[0]
+                    raw_model.eval()
+                    try:
+                        val_infer = infer_autoreg_fiber(raw_model, raw_val_sample, greedy=True)
+                    finally:
+                        raw_model.train()
                 if should_log_projection_images:
                     train_projection_image = wandb.Image(
                         _make_teacher_forced_prediction_canvas(
@@ -1581,15 +1668,14 @@ def run_autoreg_fiber_training(
                         caption=f"step={global_step} train teacher-forced fiber skeleton",
                     )
                     wandb_payload["train/example_projection"] = train_projection_image
-                    if val_visual_batch is not None and val_visual_outputs is not None:
+                    if raw_val_sample is not None and val_infer is not None:
                         val_projection_image = wandb.Image(
-                            _make_teacher_forced_prediction_canvas(
-                                val_visual_batch,
-                                val_visual_outputs,
-                                sample_idx=0,
+                            _make_inference_prediction_canvas(
+                                raw_val_sample,
+                                val_infer,
                                 line_thickness=int(cfg.get("wandb_xy_slice_line_thickness", 1)),
                             ),
-                            caption=f"step={global_step} val teacher-forced fiber skeleton",
+                            caption=f"step={global_step} val autoregressive fiber skeleton",
                         )
                         wandb_payload["val/example_projection"] = val_projection_image
                 if should_log_xy_images:
@@ -1603,16 +1689,15 @@ def run_autoreg_fiber_training(
                         ),
                         caption=f"step={global_step} train xy slice fiber skeleton",
                     )
-                    if val_visual_batch is not None and val_visual_outputs is not None:
+                    if raw_val_sample is not None and val_infer is not None:
                         wandb_payload["val/example_xy"] = wandb.Image(
-                            _make_teacher_forced_xy_slice_canvas(
-                                val_visual_batch,
-                                val_visual_outputs,
-                                sample_idx=0,
+                            _make_inference_xy_slice_canvas(
+                                raw_val_sample,
+                                val_infer,
                                 line_thickness=int(cfg.get("wandb_xy_slice_line_thickness", 1)),
                                 depth_tolerance=float(cfg.get("wandb_xy_slice_depth_tolerance", 0.75)),
                             ),
-                            caption=f"step={global_step} val xy slice fiber skeleton",
+                            caption=f"step={global_step} val autoregressive xy slice fiber skeleton",
                         )
 
             if runtime.is_main_process:
