@@ -1338,6 +1338,37 @@ def _wandb_metrics_payload(metrics: dict[str, float]) -> dict[str, float]:
     return payload
 
 
+def _slice_target_batch(batch: dict, *, max_length: int) -> dict:
+    """Return a shallow-copy view of ``batch`` whose ``target_*`` tensors are
+    sliced to at most ``max_length`` positions along the sequence dim.
+
+    Used by the rollout-in-the-loop branch so the trainer can apply
+    ``compute_autoreg_fiber_losses`` against the rollout's ``K``-step
+    output without padding/copying the full target_length tensor.
+    """
+
+    out = dict(batch)
+    K = int(max_length)
+    target_keys = (
+        "target_coarse_ids",
+        "target_offset_bins",
+        "target_xyz",
+        "target_bin_center_xyz",
+        "target_valid_mask",
+        "target_stop",
+        "target_supervision_mask",
+        "target_mask",
+        "target_positions",
+    )
+    for key in target_keys:
+        if key in batch and isinstance(batch[key], torch.Tensor) and batch[key].dim() >= 2:
+            out[key] = batch[key][:, :K]
+    if "target_lengths" in batch and torch.is_tensor(batch["target_lengths"]):
+        capped = torch.clamp(batch["target_lengths"], max=K)
+        out["target_lengths"] = capped
+    return out
+
+
 def _compute_losses_for_step(outputs: dict, batch: dict, cfg: dict, *, global_step: int) -> dict[str, torch.Tensor]:
     return compute_autoreg_fiber_losses(
         outputs,
@@ -1592,6 +1623,48 @@ def run_autoreg_fiber_training(
                 )
                 loss_dict = _compute_losses_for_step(outputs, batch, cfg, global_step=global_step)
             loss = loss_dict["loss"]
+            rollout_fired = False
+            rollout_loss_value: float | None = None
+            if (
+                bool(cfg.get("rollout_in_loop_enabled", False))
+                and global_step >= int(cfg.get("rollout_in_loop_start_step", 0))
+                and float(cfg.get("rollout_in_loop_prob", 0.0)) > 0.0
+            ):
+                rollout_prob = float(cfg["rollout_in_loop_prob"])
+                # Drive the per-step coin flip from the same RNG on every
+                # rank so DDP stays in sync (without an extra all_reduce).
+                rng_value = float(
+                    torch.rand(
+                        (),
+                        device=runtime.device,
+                        generator=None,
+                    ).item()
+                )
+                if runtime.world_size > 1:
+                    rng_tensor = torch.tensor([rng_value], device=runtime.device)
+                    torch.distributed.broadcast(rng_tensor, src=0)
+                    rng_value = float(rng_tensor.item())
+                if rng_value < rollout_prob:
+                    rollout_fired = True
+                    rollout_steps = int(cfg["rollout_in_loop_steps"])
+                    rollout_batch = _slice_target_batch(batch, max_length=rollout_steps)
+                    with torch.autocast(
+                        device_type=runtime.device.type, dtype=amp_dtype, enabled=amp_enabled
+                    ):
+                        rollout_outputs = train_model(rollout_batch, rollout_steps=rollout_steps)
+                        rollout_loss_dict = _compute_losses_for_step(
+                            rollout_outputs, rollout_batch, cfg, global_step=global_step
+                        )
+                    weight = float(cfg.get("rollout_in_loop_loss_weight", 1.0))
+                    loss = loss + weight * rollout_loss_dict["loss"]
+                    rollout_loss_value = float(rollout_loss_dict["loss"].detach().item())
+                    # Surface every per-loss metric under a ``rollout_loss_*``
+                    # namespace so the dashboard can plot them next to the
+                    # teacher-forced counterparts.
+                    for k, v in rollout_loss_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            v = float(v.detach().item())
+                        loss_dict[f"rollout_loss_{k}"] = torch.as_tensor(v)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Encountered non-finite training loss at step {global_step}: {loss.item()}")
             loss.backward()
@@ -1610,6 +1683,9 @@ def run_autoreg_fiber_training(
             metrics["current_lr"] = float(optimizer.param_groups[0]["lr"])
             metrics["grad_norm"] = grad_norm_value
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
+            metrics["rollout_in_loop_fired"] = 1.0 if rollout_fired else 0.0
+            if rollout_loss_value is not None:
+                metrics["rollout_loss"] = rollout_loss_value
             metrics["step"] = float(global_step)
             metrics.update(split_diagnostics)
             if skipped_step > 0.0:

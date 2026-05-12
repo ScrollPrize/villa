@@ -67,6 +67,20 @@ DEFAULT_AUTOREG_FIBER_CONFIG: dict = {
     "scheduled_sampling_max_prob": 0.10,
     "scheduled_sampling_start_step": 0,
     "scheduled_sampling_ramp_steps": 0,
+    # Optional multi-step autoregressive rollout with end-to-end gradient
+    # flow (see plan B in ../../../../.claude/plans/sprightly-wiggling-puffin.md).
+    # When ``rollout_in_loop_enabled`` is true, the trainer adds a
+    # rollout-in-the-loop loss on top of the teacher-forced loss with
+    # probability ``rollout_in_loop_prob`` per step, starting at
+    # ``rollout_in_loop_start_step``. The rollout has horizon
+    # ``rollout_in_loop_steps`` (must be ≤ target_length) and the resulting
+    # loss is multiplied by ``rollout_in_loop_loss_weight`` before being
+    # added to the teacher-forced loss.
+    "rollout_in_loop_enabled": False,
+    "rollout_in_loop_steps": 8,
+    "rollout_in_loop_prob": 0.25,
+    "rollout_in_loop_start_step": 0,
+    "rollout_in_loop_loss_weight": 1.0,
     "offset_loss_weight": 1.0,
     "offset_loss_start_step": 0,
     "position_refine_enabled": True,
@@ -234,10 +248,20 @@ def validate_autoreg_fiber_config(config: dict) -> dict:
     _resolve_rope_dtype(cfg.get("rope_dtype"))
     if str(cfg["scheduled_sampling_mode"]) != "linear_token_greedy":
         raise ValueError("scheduled_sampling_mode must currently be 'linear_token_greedy'")
-    for key in ("val_fraction", "scheduled_sampling_max_prob"):
+    for key in ("val_fraction", "scheduled_sampling_max_prob", "rollout_in_loop_prob"):
         value = float(cfg[key])
         if value < 0.0 or value > 1.0:
             raise ValueError(f"{key} must be within [0, 1]")
+    if bool(cfg.get("rollout_in_loop_enabled", False)):
+        rl_steps = int(cfg["rollout_in_loop_steps"])
+        if rl_steps < 1:
+            raise ValueError("rollout_in_loop_steps must be >= 1 when rollout_in_loop_enabled")
+        if rl_steps > int(cfg["target_length"]):
+            raise ValueError("rollout_in_loop_steps must be <= target_length")
+        if int(cfg["rollout_in_loop_start_step"]) < 0:
+            raise ValueError("rollout_in_loop_start_step must be >= 0")
+        if float(cfg["rollout_in_loop_loss_weight"]) < 0.0:
+            raise ValueError("rollout_in_loop_loss_weight must be non-negative")
     for key in ("offset_loss_weight", "position_refine_weight", "xyz_soft_loss_weight", "segment_vector_loss_weight", "straightness_loss_weight", "tube_radius_loss_weight"):
         if float(cfg[key]) < 0.0:
             raise ValueError(f"{key} must be non-negative")

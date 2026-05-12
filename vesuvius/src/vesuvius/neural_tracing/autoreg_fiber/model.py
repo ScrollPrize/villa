@@ -637,7 +637,15 @@ class AutoregFiberModel(nn.Module):
         scheduled_sampling_pattern: str = "linear_token_greedy",
         scheduled_sampling_offset_feedback_enabled: bool = True,
         scheduled_sampling_refine_feedback_enabled: bool = True,
+        rollout_steps: int | None = None,
     ) -> dict[str, Tensor]:
+        # The ``rollout_steps`` switch lets the DDP-wrapped trainer route a
+        # multi-step autoregressive rollout through ``model.forward`` (so DDP
+        # synchronises the gradients) rather than calling ``forward_rollout``
+        # on the raw module — which would silently bypass DDP and break
+        # cross-rank gradient sync.
+        if rollout_steps is not None and int(rollout_steps) > 0:
+            return self.forward_rollout(batch, rollout_steps=int(rollout_steps))
         if str(scheduled_sampling_pattern) != "linear_token_greedy":
             raise ValueError("autoreg_fiber scheduled_sampling_pattern must be 'linear_token_greedy'")
         encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
