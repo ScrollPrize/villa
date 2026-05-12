@@ -1753,6 +1753,22 @@ void Volume::writeXYZ(const Array3D<uint16_t>& data,
     writeZYX(data, xyzToZyx(offsetXYZ), level);
 }
 
+std::shared_ptr<utils::ZarrArray>
+Volume::cachedZarrArrayForRead(int level) const
+{
+    std::lock_guard<std::mutex> lk(readArrayCacheMutex_);
+    if (readArrayCache_.size() <= static_cast<size_t>(level)) {
+        readArrayCache_.resize(static_cast<size_t>(level) + 1);
+    }
+    auto& slot = readArrayCache_[static_cast<size_t>(level)];
+    if (!slot) {
+        slot = std::make_shared<utils::ZarrArray>(
+            openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
+                                      static_cast<int>(dtypeSize())));
+    }
+    return slot;
+}
+
 std::optional<std::vector<std::byte>> Volume::readChunk(
     int level,
     const std::array<size_t, 3>& chunkZYX) const
@@ -1764,9 +1780,8 @@ std::optional<std::vector<std::byte>> Volume::readChunk(
     if (!hasScaleLevel(level))
         throw std::out_of_range("Volume::readChunk requested missing zarr scale level " + std::to_string(level));
 
-    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
-                                           static_cast<int>(dtypeSize()));
-    return array.read_chunk(chunkZYX);
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    return arrayPtr->read_chunk(chunkZYX);
 }
 
 bool Volume::readChunkInto(
@@ -1781,9 +1796,8 @@ bool Volume::readChunkInto(
     if (!hasScaleLevel(level))
         throw std::out_of_range("Volume::readChunkInto requested missing zarr scale level " + std::to_string(level));
 
-    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
-                                           static_cast<int>(dtypeSize()));
-    return array.read_chunk_into(chunkZYX, output);
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    return arrayPtr->read_chunk_into(chunkZYX, output);
 }
 
 size_t Volume::chunkByteSize(int level) const
@@ -1800,9 +1814,8 @@ std::vector<std::byte> Volume::readChunkOrFill(
     if (auto chunk = readChunk(level, chunkZYX))
         return std::move(*chunk);
 
-    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
-                                           static_cast<int>(dtypeSize()));
-    return filledChunkBytes(array);
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    return filledChunkBytes(*arrayPtr);
 }
 
 bool Volume::chunkExists(
@@ -1816,11 +1829,10 @@ bool Volume::chunkExists(
     if (!hasScaleLevel(level))
         throw std::out_of_range("Volume::chunkExists requested missing zarr scale level " + std::to_string(level));
 
-    auto array = openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
-                                           static_cast<int>(dtypeSize()));
-    if (array.is_sharded())
-        return array.inner_chunk_exists(chunkZYX);
-    return array.chunk_exists(chunkZYX);
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    if (arrayPtr->is_sharded())
+        return arrayPtr->inner_chunk_exists(chunkZYX);
+    return arrayPtr->chunk_exists(chunkZYX);
 }
 
 void Volume::writeChunk(int level,

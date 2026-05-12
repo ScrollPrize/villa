@@ -20,6 +20,7 @@
 #include "vc/core/util/RemoteAuth.hpp"
 
 namespace vc::render { class IChunkedArray; }
+namespace utils { class ZarrArray; }
 
 struct CompositeParams;
 
@@ -268,6 +269,14 @@ protected:
     mutable std::mutex cacheMutex_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     int ioThreads_ = 0;  // 0 = use default
+
+    // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
+    // and rebuilding the codec registry on every chunk read. ZarrArray is
+    // read-only after open and serialises its own shard I/O internally, so a
+    // shared instance is safe to use concurrently from OMP workers.
+    mutable std::vector<std::shared_ptr<utils::ZarrArray>> readArrayCache_;
+    mutable std::mutex readArrayCacheMutex_;
+    std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
 
     void loadMetadata();
 
