@@ -15,10 +15,18 @@ from vesuvius.neural_tracing.autoreg_fiber.streaming.chunk_cache import (
     ChunkLRUCache,
     open_streaming_volume,
 )
+from vesuvius.neural_tracing.autoreg_fiber.streaming.tracer import (
+    BidirectionalResult,
+    FiberTracer,
+    TraceResult,
+)
 from vesuvius.neural_tracing.autoreg_fiber.streaming.window import WindowedVolumeReader
 
 __all__ = [
+    "BidirectionalResult",
     "ChunkLRUCache",
+    "FiberTracer",
+    "TraceResult",
     "WindowedVolumeReader",
     "open_streaming_volume",
 ]
