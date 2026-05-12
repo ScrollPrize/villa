@@ -68,7 +68,7 @@ class Stage:
 	global_opt: OptSettings
 
 
-CYLINDER_SEED_INIT_STAGE_ROLES = ("cyl_init", "cyl_grow")
+CYLINDER_SEED_INIT_STAGE_ROLES = ("cyl_init", "cyl_grow", "cyl_grow_refine")
 CYLINDER_STAGE_STEP_ARG = "model-step"
 OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_step_size", "wstep_target")
 CYLINDER_LOSS_NAMES = (
@@ -232,25 +232,41 @@ def _init_mode_from_args(args_cfg: object) -> str | None:
 
 def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 	role_positions: dict[str, int] = {}
+	seen_grow = False
+	seen_non_role = False
 	for i, stage in enumerate(stages):
 		is_role = stage.name in CYLINDER_SEED_INIT_STAGE_ROLES
 		if is_role:
+			if seen_non_role:
+				raise ValueError(
+					"stages_json: cylinder_seed stages must be contiguous before later cylinder stages"
+				)
 			if stage.name in role_positions:
 				raise ValueError(f"stages_json: cylinder_seed stage '{stage.name}' is duplicated")
-			role_positions[stage.name] = i
+			role_positions.setdefault(stage.name, i)
 			if stage.global_opt.params != ["cyl_params"]:
 				raise ValueError(
 					f"stages_json: cylinder_seed stage '{stage.name}' must have params ['cyl_params']"
 				)
+			if stage.name == "cyl_grow":
+				seen_grow = True
+			if stage.name == "cyl_grow_refine" and not seen_grow:
+				raise ValueError("stages_json: cylinder_seed stage 'cyl_grow_refine' must follow cyl_grow")
+		else:
+			if role_positions:
+				seen_non_role = True
 	missing = [name for name in ("cyl_init",) if name not in role_positions]
 	if missing:
 		raise ValueError(f"stages_json: cylinder_seed missing required stage role(s): {missing}")
-	role_order = [name for name in CYLINDER_SEED_INIT_STAGE_ROLES if name in role_positions]
-	positions = [role_positions[name] for name in role_order]
-	if positions != sorted(positions):
+	if role_positions["cyl_init"] != 0:
+		raise ValueError(
+			"stages_json: cylinder_seed stages before cyl_init "
+			"must be only cyl_init; later stages are skipped when cyl_grow is absent"
+		)
+	if role_positions["cyl_init"] != min(role_positions.values()):
 		raise ValueError(
 			"stages_json: cylinder_seed stages must appear in order "
-			"cyl_init, cyl_grow"
+			"cyl_init, cyl_grow, cyl_grow_refine"
 		)
 	if "cyl_grow" not in role_positions:
 		init_pos = role_positions["cyl_init"]
@@ -260,12 +276,12 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 				"must be only cyl_init; later stages are skipped when cyl_grow is absent"
 			)
 		return
-	grow_pos = role_positions["cyl_grow"]
-	for stage in stages[:grow_pos + 1]:
+	first_non_role = next((i for i, stage in enumerate(stages) if i > role_positions["cyl_init"] and stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES), len(stages))
+	for stage in stages[:first_non_role]:
 		if stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES:
 			raise ValueError(
-				"stages_json: cylinder_seed stages before cyl_grow "
-				"must be only cyl_init/cyl_grow; later stages run normally"
+				"stages_json: cylinder_seed stages before later stages "
+				"must be only cyl_init/cyl_grow/cyl_grow_refine; later stages run normally"
 			)
 
 
@@ -840,6 +856,25 @@ def optimize(
 			else:
 				dst[ch] = pts
 
+	def _stage_eff_for_opt(*, is_cyl_stage_: bool, opt_cfg_: OptSettings) -> dict[str, float]:
+		if not is_cyl_stage_:
+			return opt_cfg_.eff
+		return {
+			"cyl_normal": float(opt_cfg_.eff.get("cyl_normal", 0.0)),
+			"cyl_center": float(opt_cfg_.eff.get("cyl_center", 0.0)),
+			"cyl_smooth": float(opt_cfg_.eff.get("cyl_smooth", 0.0)),
+			"cyl_z_smooth": float(opt_cfg_.eff.get("cyl_z_smooth", 0.0)),
+			"cyl_z_center": float(opt_cfg_.eff.get("cyl_z_center", 0.0)),
+			"cyl_seed_push": float(opt_cfg_.eff.get("cyl_seed_push", 0.0)),
+			"cyl_step": float(opt_cfg_.eff.get("cyl_step", 0.0)),
+			"cyl_radial_mean": float(opt_cfg_.eff.get("cyl_radial_mean", 0.0)),
+			"cyl_bend": float(opt_cfg_.eff.get("cyl_bend", 0.0)),
+			"cyl_conn_mesh": float(opt_cfg_.eff.get("cyl_conn_mesh", 0.0)),
+			"cyl_conn_gt": float(opt_cfg_.eff.get("cyl_conn_gt", 0.0)),
+			"cyl_base_mesh": float(opt_cfg_.eff.get("cyl_base_mesh", 0.0)),
+			"cyl_base_gt": float(opt_cfg_.eff.get("cyl_base_gt", 0.0)),
+		}
+
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
 		_t_stage_total = _stage_start(f"{label}.total")
 		is_cyl_stage = "cyl_params" in opt_cfg.params
@@ -852,24 +887,7 @@ def optimize(
 				  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0 and not is_cyl_stage:
 			return data
-		stage_eff = (
-			{
-				"cyl_normal": float(opt_cfg.eff.get("cyl_normal", 0.0)),
-				"cyl_center": float(opt_cfg.eff.get("cyl_center", 0.0)),
-				"cyl_smooth": float(opt_cfg.eff.get("cyl_smooth", 0.0)),
-				"cyl_z_smooth": float(opt_cfg.eff.get("cyl_z_smooth", 0.0)),
-				"cyl_z_center": float(opt_cfg.eff.get("cyl_z_center", 0.0)),
-				"cyl_seed_push": float(opt_cfg.eff.get("cyl_seed_push", 0.0)),
-				"cyl_step": float(opt_cfg.eff.get("cyl_step", 0.0)),
-				"cyl_radial_mean": float(opt_cfg.eff.get("cyl_radial_mean", 0.0)),
-				"cyl_bend": float(opt_cfg.eff.get("cyl_bend", 0.0)),
-				"cyl_conn_mesh": float(opt_cfg.eff.get("cyl_conn_mesh", 0.0)),
-				"cyl_conn_gt": float(opt_cfg.eff.get("cyl_conn_gt", 0.0)),
-				"cyl_base_mesh": float(opt_cfg.eff.get("cyl_base_mesh", 0.0)),
-				"cyl_base_gt": float(opt_cfg.eff.get("cyl_base_gt", 0.0)),
-			}
-			if is_cyl_stage else opt_cfg.eff
-		)
+		stage_eff = _stage_eff_for_opt(is_cyl_stage_=is_cyl_stage, opt_cfg_=opt_cfg)
 		stage_uses_cyl_loss = (
 			_need_term("cyl_normal", stage_eff) > 0 or
 			_need_term("cyl_center", stage_eff) > 0 or
@@ -993,31 +1011,32 @@ def optimize(
 				flush=True,
 			)
 
-		def _make_param_groups() -> tuple[dict[str, list], list[dict]]:
+		def _make_param_groups(opt_settings: OptSettings | None = None) -> tuple[dict[str, list], list[dict]]:
+			settings = opt_settings if opt_settings is not None else opt_cfg
 			all_params_ = model.opt_params()
 			param_groups_: list[dict] = []
-			for name in opt_cfg.params:
+			for name in settings.params:
 				group = all_params_.get(name, [])
 				if name in {"mesh_ms"}:
-					k0 = max(0, int(opt_cfg.min_scaledown))
+					k0 = max(0, int(settings.min_scaledown))
 					for pi, p in enumerate(group):
 						if pi < k0:
 							continue
-						param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
+						param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)})
 				elif name == "cyl_params" and bool(getattr(model, "cyl_shell_mode", False)):
 					scale_count = 0
 					if hasattr(model, "cyl_param_scale_count"):
 						scale_count = max(0, int(model.cyl_param_scale_count()))
-					k0 = max(0, int(opt_cfg.min_scaledown))
+					k0 = max(0, int(settings.min_scaledown))
 					for pi, p in enumerate(group):
 						if pi < scale_count:
 							if pi < k0:
 								continue
-							param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=opt_cfg.lr, scale_i=pi)})
+							param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)})
 						else:
-							param_groups_.append({"params": [p], "lr": _lr_last(opt_cfg.lr)})
+							param_groups_.append({"params": [p], "lr": _lr_last(settings.lr)})
 				else:
-					lr_last = _lr_last(opt_cfg.lr)
+					lr_last = _lr_last(settings.lr)
 					for p in group:
 						param_groups_.append({"params": [p], "lr": lr_last})
 			return all_params_, param_groups_
@@ -1380,7 +1399,7 @@ def optimize(
 			role = str(stage.name)
 			max_steps = int(opt_cfg.steps)
 			default_max_search_shells = max(1, int(getattr(model, "cyl_shell_search_max_shells", 16)))
-			max_search_shells = max(1, max_steps) if role == "cyl_grow" else default_max_search_shells
+			max_search_shells = default_max_search_shells
 			_stage_wstep = _cyl_stage_width_target_step(opt_cfg)
 			_prev_stage_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
 			_base_wstep = float(
@@ -1437,8 +1456,9 @@ def optimize(
 					out["seed_dist_vx"] = float(last_dist)
 				return out
 
-			def _pass_eff_for_role(*, keep_radial_mean: bool = True) -> dict[str, float]:
-				pass_eff = dict(stage_eff)
+			def _pass_eff_for_role(*, keep_radial_mean: bool = True,
+								   eff: dict[str, float] | None = None) -> dict[str, float]:
+				pass_eff = dict(stage_eff if eff is None else eff)
 				for _conn_term in ("cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt"):
 					pass_eff[_conn_term] = 0.0
 				if not keep_radial_mean:
@@ -1526,6 +1546,8 @@ def optimize(
 
 			def _run_shell_pass(shell_label: str, pass_eff: dict[str, float], *,
 								wstep_start: float, wstep_end: float,
+								pass_opt_cfg: OptSettings | None = None,
+								pass_steps: int | None = None,
 								seed_lock: bool = False,
 								model_step: float | None = None,
 								stop_on_seed_hit: bool = False,
@@ -1540,7 +1562,8 @@ def optimize(
 								suppress_initial_status: bool = False) -> dict[str, object]:
 				nonlocal data, all_params, param_groups, opt, _status_step_width
 				display_label = status_label or shell_label
-				pass_max_steps = max(0, int(max_steps))
+				pass_settings = pass_opt_cfg if pass_opt_cfg is not None else opt_cfg
+				pass_max_steps = max(0, int(max_steps if pass_steps is None else pass_steps))
 				if shell_no is not None:
 					_status_step_width = max(_status_step_width, len("1000000") + 2)
 				elif search_until_seed:
@@ -1553,7 +1576,7 @@ def optimize(
 					pred_dt_normal_source_=pred_dt_normal_source,
 				)
 				model.cyl_shell_current_width_step = float(wstep_start)
-				all_params, param_groups = _make_param_groups()
+				all_params, param_groups = _make_param_groups(pass_settings)
 				if not param_groups:
 					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
 				opt = torch.optim.Adam(param_groups)
@@ -1576,7 +1599,7 @@ def optimize(
 
 				def _reset_shell_optimizer() -> None:
 					nonlocal all_params, param_groups, opt, step_ref
-					all_params, param_groups = _make_param_groups()
+					all_params, param_groups = _make_param_groups(pass_settings)
 					if not param_groups:
 						raise RuntimeError(f"{shell_label}: no cylinder parameters available after resampling")
 					opt = torch.optim.Adam(param_groups)
@@ -1616,6 +1639,8 @@ def optimize(
 					return True
 
 				def _apply_seed_target(metrics) -> None:
+					if seed_target_mode == "fixed":
+						return
 					if seed_target_mode == "refine":
 						model.cyl_shell_current_width_step = _seed_refine_next_wstep(
 							metrics,
@@ -1670,7 +1695,7 @@ def optimize(
 					if opt_timing_enabled else None
 				)
 				step = 0
-				while search_until_seed or step < pass_max_steps:
+				while step < pass_max_steps:
 					_t_iter = time.perf_counter()
 					if seed_lock and model_step is not None:
 						if not (step == 0 and last_metrics is not None):
@@ -1814,7 +1839,7 @@ def optimize(
 						_opt_timing.finish_iter(
 							label=shell_label,
 							step1=step1,
-							max_steps=(10**12 if search_until_seed else pass_max_steps),
+							max_steps=pass_max_steps,
 						)
 					step += 1
 				if snap_int > 0 and (step1 % snap_int) == 0:
@@ -1846,6 +1871,49 @@ def optimize(
 					"error": None,
 					"keep_active": False,
 				}
+
+			def _grow_refine_eff(refine_opt: OptSettings) -> dict[str, float]:
+				refine_eff = _stage_eff_for_opt(is_cyl_stage_=True, opt_cfg_=refine_opt)
+				refine_eff = _pass_eff_for_role(eff=refine_eff)
+				refine_eff["cyl_seed_push"] = 0.0
+				return refine_eff
+
+			def _run_grow_refine_pass(
+				*,
+				refine_label: str,
+				refine_opt: OptSettings,
+				shell_no: int | None,
+			) -> dict[str, object]:
+				if int(refine_opt.steps) <= 0:
+					return {"seed_hit": False, "metrics": None, "resamples": 0, "resampled": False, "error": None}
+				if not getattr(model, "cyl_shell_completed", None):
+					raise RuntimeError(f"{refine_label}: cyl_grow_refine requires a completed grow shell")
+				if not hasattr(model, "begin_cylinder_shell_refine"):
+					raise RuntimeError(f"{refine_label}: model does not support cylinder shell grow-refine")
+				model.begin_cylinder_shell_refine(data)
+				refine_wstep = _actual_width_step_avg(fallback=_base_wstep)
+				if hasattr(model, "cyl_shell_width_target_step"):
+					model.cyl_shell_width_target_step = float(refine_wstep)
+				result_ = _run_shell_pass(
+					refine_label,
+					_grow_refine_eff(refine_opt),
+					wstep_start=refine_wstep,
+					wstep_end=refine_wstep,
+					pass_opt_cfg=refine_opt,
+					pass_steps=int(refine_opt.steps),
+					seed_lock=True,
+					model_step=refine_wstep,
+					stop_on_seed_hit=True,
+					seed_target_mode="fixed",
+					allow_resample=False,
+					shell_no=shell_no,
+					suppress_initial_status=False,
+				)
+				if result_.get("error") is None and hasattr(model, "complete_current_cylinder_shell"):
+					model.complete_current_cylinder_shell(data)
+				if hasattr(model, "cyl_shell_width_target_step"):
+					model.cyl_shell_width_target_step = float(_base_wstep)
+				return result_
 
 			if role == "cyl_init":
 				if bool(getattr(model, "cyl_shell_search_done", False)):
@@ -1903,6 +1971,11 @@ def optimize(
 					model.cyl_shell_search_done = True
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
+				grow_refine_opt = (
+					stages[si + 1].global_opt
+					if si + 1 < len(stages) and stages[si + 1].name == "cyl_grow_refine"
+					else None
+				)
 				result: dict[str, object] = {"seed_hit": False, "metrics": None, "resamples": 0, "resampled": False, "error": None}
 				while not bool(getattr(model, "cyl_shell_search_crossed", False)):
 					shell_i = len(getattr(model, "cyl_shell_completed", []))
@@ -1962,8 +2035,21 @@ def optimize(
 						model.complete_current_cylinder_shell(data)
 					if bool(result.get("seed_hit", False)):
 						break
-					if not bool(result.get("resampled", False)):
-						break
+					if grow_refine_opt is not None:
+						result = _run_grow_refine_pass(
+							refine_label=f"{label}.cyl_grow_refine_shell{shell_i + 1}",
+							refine_opt=grow_refine_opt,
+							shell_no=shell_i + 1,
+						)
+						if result.get("error") is not None:
+							_abort_after_shell_error(
+								f"{label}.cyl_grow_refine_shell{shell_i + 1}",
+								result["error"],
+								keep_active=bool(result.get("keep_active", False)),
+							)
+							break
+						if bool(result.get("seed_hit", False)):
+							break
 				if bool(result.get("error") is not None):
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
@@ -1985,6 +2071,10 @@ def optimize(
 						)
 						setattr(model, "cyl_shell_abort", True)
 					model.cyl_shell_search_done = True
+				_stage_done(f"{label}.total", _t_stage_total)
+				return data
+
+			if role == "cyl_grow_refine":
 				_stage_done(f"{label}.total", _t_stage_total)
 				return data
 

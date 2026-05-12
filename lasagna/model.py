@@ -570,8 +570,9 @@ class Model3D(nn.Module):
 			self.cyl_shell_delta_ms = nn.ParameterList()
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		requested_model_h = max(1.0, float(model_h))
-		init_z0 = float(seed[2]) - requested_model_h
-		init_z1 = float(seed[2]) + requested_model_h
+		init_half_h = 2.0 * requested_model_h
+		init_z0 = float(seed[2]) - init_half_h
+		init_z1 = float(seed[2]) + init_half_h
 		if volume_extent_fullres is not None and len(volume_extent_fullres) >= 3:
 			z_max = max(0.0, float(volume_extent_fullres[2]) - 1.0)
 			init_z0 = max(0.0, init_z0)
