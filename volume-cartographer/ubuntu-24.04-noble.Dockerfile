@@ -57,7 +57,7 @@ RUN micromamba run -n py310 pip install --no-cache-dir numpy==1.26.4 tqdm wandb
 # Make this Python visible to subsequent steps
 ENV PATH="/opt/micromamba/envs/py310/bin:${PATH}"
 
-COPY . /src
+COPY libs /src/libs
 
 # --------------------------- Third-party libs -------------------------------
 WORKDIR /src/libs
@@ -110,6 +110,7 @@ RUN cmake --build build -j"$(nproc)"
 # Install the flatboi binary into PATH before removing /src
 RUN install -m 0755 /src/libs/flatboi/build/flatboi /usr/local/bin/flatboi
 
+COPY . /src
 # ------------------------- Build the main project ---------------------------
 RUN mkdir -p /src/build
 WORKDIR /src/build
