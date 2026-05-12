@@ -19,6 +19,7 @@ import torch
 from vesuvius.neural_tracing.autoreg_fiber.dataset import AutoregFiberDataset, autoreg_fiber_collate
 from vesuvius.neural_tracing.autoreg_fiber.fiber_geometry import FiberPath, write_fiber_cache
 from vesuvius.neural_tracing.autoreg_fiber.model import AutoregFiberModel
+from vesuvius.neural_tracing.autoreg_fiber.train import _slice_target_batch, run_autoreg_fiber_training
 
 
 def _tiny_config(tmp_path) -> dict:
@@ -200,3 +201,60 @@ def test_forward_rollout_rejects_out_of_range(tmp_path) -> None:
         assert "exceeds config.target_length" in str(exc)
     else:
         raise AssertionError("expected ValueError for rollout_steps > target_length")
+
+
+def test_slice_target_batch_truncates_seq_dim(tmp_path) -> None:
+    """``_slice_target_batch`` is the helper the trainer uses to cap the
+    rollout to ``rollout_in_loop_steps`` tokens. Verify it actually slices the
+    target-aligned tensors while leaving prompt/conditioning tensors untouched."""
+
+    cfg, _ds, batch = _dataset_and_batch(tmp_path)
+    K = 2
+    sliced = _slice_target_batch(batch, max_length=K)
+    # Target-aligned tensors get truncated to K.
+    for key in (
+        "target_xyz",
+        "target_coarse_ids",
+        "target_offset_bins",
+        "target_valid",
+        "target_stop",
+    ):
+        if key in batch and batch[key].dim() >= 2:
+            assert sliced[key].shape[1] == K, (key, sliced[key].shape)
+    # Prompt-side tensors are not target-aligned and must be left alone.
+    if "prompt_tokens" in batch and isinstance(batch["prompt_tokens"], dict):
+        prompt_xyz = batch["prompt_tokens"].get("xyz")
+        sliced_prompt_xyz = sliced["prompt_tokens"].get("xyz")
+        if prompt_xyz is not None and sliced_prompt_xyz is not None:
+            assert sliced_prompt_xyz.shape == prompt_xyz.shape
+
+
+def test_training_step_runs_with_rollout_flag(tmp_path) -> None:
+    """End-to-end smoke test: a 2-step training run with the rollout
+    branch firing on every step completes without NaNs and surfaces the new
+    ``rollout_in_loop_fired`` / ``rollout_loss`` metrics in the trainer's
+    history."""
+
+    torch.manual_seed(4)
+    cfg, dataset, _batch = _dataset_and_batch(tmp_path)
+    cfg.update(
+        {
+            "num_steps": 2,
+            "rollout_in_loop_enabled": True,
+            "rollout_in_loop_steps": 2,
+            "rollout_in_loop_prob": 1.0,
+            "rollout_in_loop_start_step": 0,
+            "rollout_in_loop_loss_weight": 1.0,
+            "save_final_checkpoint": False,
+        }
+    )
+
+    result = run_autoreg_fiber_training(cfg, dataset=dataset, device="cpu", max_steps=2)
+
+    history = result["history"]
+    assert len(history) == 2
+    for entry in history:
+        assert entry["rollout_in_loop_fired"] == 1.0
+        assert np.isfinite(entry["loss"]), entry
+        assert "rollout_loss" in entry, entry
+        assert np.isfinite(entry["rollout_loss"]), entry
