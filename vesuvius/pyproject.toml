@@ -196,6 +196,7 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.train" = "vesuvius.models.training.train:main"
 "vesuvius.zarr_tasks" = "vesuvius.image_proc.run.zarr_tasks.__main__:main"
 "vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
+"vesuvius.trace_fiber" = "vesuvius.neural_tracing.autoreg_fiber.streaming.cli:main"
 
 [tool.setuptools]
 include-package-data = true
