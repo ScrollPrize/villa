@@ -165,7 +165,8 @@ static void customThinningImpl(
     cv::Mat* outputImage,
     std::vector<std::vector<cv::Point>>* traces,
     ThinningStats* stats,
-    ThinningScratch& scratch)
+    ThinningScratch& scratch,
+    const ThinningPruneParams& pruneParams)
 {
     if (inputImage.empty() || inputImage.type() != CV_8UC1) {
         if (outputImage != nullptr) {
@@ -274,6 +275,25 @@ static void customThinningImpl(
     localStats.tracePathsSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - traceStart).count();
 
+    if (traces != nullptr) {
+        if (pruneParams.minLengthPx > 0.0) {
+            pruneThinningTraces(*traces, pruneParams, &localStats);
+
+            if (outputImage != nullptr) {
+                // Re-rasterise from kept traces. The visit-index encoding is
+                // sacrificed when pruning is enabled in image+trace mode.
+                outputImage->setTo(0);
+                for (const auto& trace : *traces) {
+                    for (const auto& p : trace) {
+                        outputImage->at<uint8_t>(p.y, p.x) = 255;
+                    }
+                }
+            }
+        } else {
+            localStats.tracesKept += traces->size();
+        }
+    }
+
     if (stats != nullptr) {
         stats->accumulate(localStats);
     }
@@ -291,24 +311,66 @@ void customThinning(const cv::Mat& inputImage,
 void customThinning(const cv::Mat& inputImage,
                     cv::Mat& outputImage,
                     std::vector<std::vector<cv::Point>>* traces,
-                    ThinningStats* stats)
+                    ThinningStats* stats,
+                    const ThinningPruneParams& pruneParams)
 {
     ThinningScratch scratch;
-    customThinningImpl(inputImage, &outputImage, traces, stats, scratch);
-}
-
-void customThinningTraceOnly(const cv::Mat& inputImage,
-                             std::vector<std::vector<cv::Point>>& traces,
-                             ThinningStats* stats)
-{
-    ThinningScratch scratch;
-    customThinningImpl(inputImage, nullptr, &traces, stats, scratch);
+    customThinningImpl(inputImage, &outputImage, traces, stats, scratch, pruneParams);
 }
 
 void customThinningTraceOnly(const cv::Mat& inputImage,
                              std::vector<std::vector<cv::Point>>& traces,
                              ThinningStats* stats,
-                             ThinningScratch& scratch)
+                             const ThinningPruneParams& pruneParams)
 {
-    customThinningImpl(inputImage, nullptr, &traces, stats, scratch);
+    ThinningScratch scratch;
+    customThinningImpl(inputImage, nullptr, &traces, stats, scratch, pruneParams);
+}
+
+void customThinningTraceOnly(const cv::Mat& inputImage,
+                             std::vector<std::vector<cv::Point>>& traces,
+                             ThinningStats* stats,
+                             ThinningScratch& scratch,
+                             const ThinningPruneParams& pruneParams)
+{
+    customThinningImpl(inputImage, nullptr, &traces, stats, scratch, pruneParams);
+}
+
+void pruneThinningTraces(std::vector<std::vector<cv::Point>>& traces,
+                         const ThinningPruneParams& params,
+                         ThinningStats* stats)
+{
+    uint64_t pruned = 0;
+    size_t out = 0;
+    for (size_t i = 0; i < traces.size(); ++i) {
+        auto& trace = traces[i];
+
+        if (trace.size() < 2) {
+            ++pruned;
+            continue;
+        }
+
+        double length = 0.0;
+        for (size_t k = 1; k < trace.size(); ++k) {
+            const int dx = trace[k].x - trace[k - 1].x;
+            const int dy = trace[k].y - trace[k - 1].y;
+            length += std::sqrt(static_cast<double>(dx * dx + dy * dy));
+        }
+
+        if (length < params.minLengthPx) {
+            ++pruned;
+            continue;
+        }
+
+        if (out != i) {
+            traces[out] = std::move(trace);
+        }
+        ++out;
+    }
+    traces.resize(out);
+
+    if (stats != nullptr) {
+        stats->tracesPruned += pruned;
+        stats->tracesKept += out;
+    }
 }

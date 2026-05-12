@@ -268,6 +268,8 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
                 {"trace_count", dir.thinningStats.traceCount},
                 {"trace_steps", dir.thinningStats.traceSteps},
                 {"candidate_evaluations", dir.thinningStats.candidateEvaluations},
+                {"traces_pruned", dir.thinningStats.tracesPruned},
+                {"traces_kept", dir.thinningStats.tracesKept},
             };
         }
         out["directions"].push_back(std::move(d));
@@ -516,6 +518,7 @@ int main(int argc, char* argv[]) {
             ("verify-grid-save", po::bool_switch()->default_value(false), "Verify GridStore files by reloading after save")
             ("debug-per-slice", po::bool_switch()->default_value(false), "Emit a stdout log line for every slice processed (existing/empty_binary/empty_trace/written)")
             ("metrics-json", po::value<std::string>(), "Write structured metrics json")
+            ("prune-min-length-px", po::value<double>()->default_value(0.0), "Drop thinning traces shorter than this many pixels (polyline length); 0 disables pruning (default)")
             ("print-plan", po::bool_switch()->default_value(false), "Print partition plan as JSON to stdout and exit (no work done)");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
@@ -704,6 +707,12 @@ void run_generate(const po::variables_map& vm) {
         ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
         : std::nullopt;
 
+    ThinningPruneParams prune_params;
+    prune_params.minLengthPx = vm["prune-min-length-px"].as<double>();
+    if (prune_params.minLengthPx < 0.0) {
+        throw std::runtime_error("--prune-min-length-px must be >= 0");
+    }
+
     std::vector<SliceDirection> directions_to_run;
     if (vm.count("direction")) {
         const std::string& d = vm["direction"].as<std::string>();
@@ -862,6 +871,7 @@ void run_generate(const po::variables_map& vm) {
         metadata["preview-every"] = preview_every;
         metadata["verify-grid-save"] = verify_grid_save;
         metadata["debug-per-slice"] = debug_per_slice;
+        metadata["prune-min-length-px"] = prune_params.minLengthPx;
         std::ofstream o(output_fs_path / "metadata.json");
         o << metadata.dump(4) << std::endl;
     }
@@ -1162,7 +1172,8 @@ void run_generate(const po::variables_map& vm) {
                     scratch.traces.clear();
                     const auto thinning_start = std::chrono::steady_clock::now();
                     ThinningStats thinning_stats;
-                    customThinningTraceOnly(assembled.binarySlice, scratch.traces, &thinning_stats, scratch.thinning);
+                    customThinningTraceOnly(assembled.binarySlice, scratch.traces,
+                        &thinning_stats, scratch.thinning, prune_params);
                     const double thinning_seconds = seconds_since(thinning_start);
                     record_timing(local_stats, "thinning", thinning_seconds);
                     local_stats.thinningStats.accumulate(thinning_stats);
