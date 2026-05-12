@@ -70,21 +70,25 @@ def build_state(
     if sampled.shape[0] < 2:
         sampled = np.vstack([arr[0], arr[-1]])
 
-    # Convert each zyx -> xyz (Neuroglancer's display order is x, y, z).
-    points_xyz = sampled[:, ::-1].astype(np.float64)
+    # Convert each zyx -> xyz (Neuroglancer's display order is x, y, z) and
+    # round to integer voxel coordinates. Some Neuroglancer versions' state
+    # parser rejects long decimal literals inside numeric arrays ("Expected
+    # ',' or ']' after array element"), and at PHercParis4's ~2.4 μm voxel
+    # the trace's sub-voxel residual isn't useful anyway.
+    points_xyz = np.rint(sampled[:, ::-1]).astype(np.int64)
     annotations: list[dict[str, Any]] = []
     for idx in range(int(points_xyz.shape[0]) - 1):
         annotations.append(
             {
                 "type": "line",
                 "id": f"seg_{idx}",
-                "pointA": [float(v) for v in points_xyz[idx]],
-                "pointB": [float(v) for v in points_xyz[idx + 1]],
+                "pointA": [int(v) for v in points_xyz[idx]],
+                "pointB": [int(v) for v in points_xyz[idx + 1]],
             }
         )
 
-    # Camera target: the polyline's centroid.
-    centroid = points_xyz.mean(axis=0)
+    # Camera target: the polyline's centroid (integer voxel for the same reason).
+    centroid = np.rint(points_xyz.mean(axis=0)).astype(np.int64)
     # The PHercParis4 OME-NGFF has no units on its axes — Neuroglancer treats
     # the dimension space as voxel-indexed, so we use the same unitless space
     # for `position` and the inline annotations. (Setting dimensions to
@@ -92,7 +96,7 @@ def build_state(
     dimensions = {"x": [1, ""], "y": [1, ""], "z": [1, ""]}
     state: dict[str, Any] = {
         "dimensions": dimensions,
-        "position": [float(v) for v in centroid],
+        "position": [int(v) for v in centroid],
         "crossSectionScale": float(cross_section_scale),
         "projectionScale": float(cross_section_scale) * 64.0,
         "layers": [
