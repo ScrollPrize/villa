@@ -46,17 +46,20 @@ MatrixXiR tensor_to_faces(torch::Tensor faces) {
 	return F;
 }
 
-double inside_depth_at(
-	const igl::AABB<MatrixXdR, 3>& tree,
-	const MatrixXdR& V,
-	const MatrixXiR& F,
+bool is_inside_at(
 	const igl::WindingNumberAABB<double, int>& hier,
 	const RowVector3d& q
 ) {
 	const double winding = hier.winding_number(q.transpose());
-	if (!(winding > 0.5)) {
-		return 0.0;
-	}
+	return winding > 0.5;
+}
+
+double surface_distance_at(
+	const igl::AABB<MatrixXdR, 3>& tree,
+	const MatrixXdR& V,
+	const MatrixXiR& F,
+	const RowVector3d& q
+) {
 	double sqrd = 0.0;
 	int face_i = -1;
 	RowVector3d closest;
@@ -316,14 +319,18 @@ pybind11::tuple build_inside_depth_volume(
 	float* depth_ptr = depth_tmp.data_ptr<float>();
 	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
 	std::vector<int64_t> thread_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<double> thread_pass_seconds(static_cast<size_t>(n_threads), 0.0);
+	std::vector<double> thread_distance_seconds(static_cast<size_t>(n_threads), 0.0);
 	std::atomic<int64_t> max_done(0);
 	const auto pass1_start = std::chrono::steady_clock::now();
 	{
 		ProgressPrinter progress(progress_label, "pass 1/2 winding+inside-distance", total, max_done, progress_enabled);
 		parallel_chunks(total, n_threads, 2048, cancel, [&](int64_t begin, int64_t end, int ti) {
+			const auto chunk_start = std::chrono::steady_clock::now();
 			double local_max = 0.0;
 			int64_t local_inside = 0;
 			int64_t processed = 0;
+			double local_distance_seconds = 0.0;
 			for (int64_t n = begin; n < end; ++n) {
 				if ((processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
 					break;
@@ -337,7 +344,14 @@ pybind11::tuple build_inside_depth_volume(
 					origin[1] + static_cast<double>(y) * spacing[1],
 					origin[2] + static_cast<double>(z) * spacing[2]
 				);
-				const double depth = inside_depth_at(tree, V, F, hier, q);
+				double depth = 0.0;
+				if (is_inside_at(hier, q)) {
+					const auto distance_start = std::chrono::steady_clock::now();
+					depth = surface_distance_at(tree, V, F, q);
+					local_distance_seconds += std::chrono::duration<double>(
+						std::chrono::steady_clock::now() - distance_start
+					).count();
+				}
 				const float depth_f = static_cast<float>(depth);
 				depth_ptr[n] = depth_f;
 				local_max = std::max(local_max, static_cast<double>(depth_f));
@@ -348,6 +362,10 @@ pybind11::tuple build_inside_depth_volume(
 			}
 			thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
 			thread_inside[static_cast<size_t>(ti)] += local_inside;
+			thread_distance_seconds[static_cast<size_t>(ti)] += local_distance_seconds;
+			thread_pass_seconds[static_cast<size_t>(ti)] += std::chrono::duration<double>(
+				std::chrono::steady_clock::now() - chunk_start
+			).count();
 			max_done.fetch_add(processed);
 		});
 	}
@@ -355,6 +373,8 @@ pybind11::tuple build_inside_depth_volume(
 	const double pass1_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - pass1_start).count();
 	double depth_max = 0.0;
 	int64_t inside_count = 0;
+	double pass_cpu_seconds = 0.0;
+	double distance_cpu_seconds = 0.0;
 	for (const double value : thread_max) {
 		if (value > depth_max) {
 			depth_max = value;
@@ -362,6 +382,12 @@ pybind11::tuple build_inside_depth_volume(
 	}
 	for (const int64_t value : thread_inside) {
 		inside_count += value;
+	}
+	for (const double value : thread_pass_seconds) {
+		pass_cpu_seconds += value;
+	}
+	for (const double value : thread_distance_seconds) {
+		distance_cpu_seconds += value;
 	}
 
 	auto out = torch::empty({1, Z, Y, X}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
@@ -389,10 +415,17 @@ pybind11::tuple build_inside_depth_volume(
 		const double pass1_rate = pass1_elapsed > 0.0 ? static_cast<double>(total) / pass1_elapsed : 0.0;
 		const double encode_rate = encode_elapsed > 0.0 ? static_cast<double>(total) / encode_elapsed : 0.0;
 		const int64_t skipped_distance = total - inside_count;
+		const double distance_share = pass_cpu_seconds > 0.0
+			? std::min(1.0, std::max(0.0, distance_cpu_seconds / pass_cpu_seconds))
+			: 0.0;
+		const double distance_wall_est = pass1_elapsed * distance_share;
+		const double winding_wall_est = pass1_elapsed - distance_wall_est;
 		std::cout
 			<< "[cyl_outside] " << progress_label
 			<< ": timing prep=" << std::fixed << std::setprecision(2) << prep_elapsed << "s"
-			<< " winding+inside_distance=" << pass1_elapsed << "s"
+			<< " winding_classify~=" << winding_wall_est << "s"
+			<< " inside_distance~=" << distance_wall_est << "s"
+			<< " pass1=" << pass1_elapsed << "s"
 			<< " (" << std::setprecision(0) << pass1_rate << " vox/s)"
 			<< " encode=" << std::setprecision(2) << encode_elapsed << "s"
 			<< " (" << std::setprecision(0) << encode_rate << " vox/s)"
@@ -404,6 +437,8 @@ pybind11::tuple build_inside_depth_volume(
 			<< " skipped_outside=" << skipped_distance
 			<< " inside_frac=" << std::fixed << std::setprecision(4)
 			<< (total > 0 ? static_cast<double>(inside_count) / static_cast<double>(total) : 0.0)
+			<< " distance_cpu=" << std::setprecision(2) << distance_cpu_seconds << "s"
+			<< " pass1_cpu=" << pass_cpu_seconds << "s"
 			<< " depth_max=" << std::setprecision(3) << depth_max
 			<< std::endl;
 	}
