@@ -64,6 +64,9 @@ brew_prefix="$(brew --prefix)"
 export HOMEBREW_PREFIX="$brew_prefix"
 required_formulae=(
   llvm
+  # As of Homebrew llvm 19+, ld64.lld no longer ships in the llvm formula;
+  # the Mach-O backend lives in a standalone `lld` keg.
+  lld
   cmake
   ninja
   pkgconf
@@ -103,21 +106,24 @@ if (( ${#missing[@]} > 0 )); then
 fi
 
 llvm_bin="$brew_prefix/opt/llvm/bin"
+lld_bin="$brew_prefix/opt/lld/bin"
 if [[ ! -x "$llvm_bin/clang++" ]]; then
   echo "Homebrew LLVM compiler not found at $llvm_bin/clang++." >&2
   exit 1
 fi
-# The macos-homebrew-llvm preset wires CMAKE_LINKER_TYPE=LLD, which selects
-# Homebrew lld's Mach-O backend instead of Apple's ld64. Fail fast if the
-# brew llvm formula didn't ship it (older brew builds sometimes omitted it).
-if [[ ! -x "$llvm_bin/ld64.lld" ]]; then
-  echo "Homebrew LLD (ld64.lld) not found at $llvm_bin/ld64.lld." >&2
-  echo "Reinstall Homebrew llvm: brew reinstall llvm" >&2
+# Homebrew llvm 19+ ships lld in a standalone keg (`brew install lld`).
+# The preset's -fuse-ld=lld asks clang's driver for ld64.lld; we need it
+# resolvable on PATH.
+if [[ ! -x "$lld_bin/ld64.lld" ]]; then
+  echo "Homebrew LLD (ld64.lld) not found at $lld_bin/ld64.lld." >&2
+  echo "Install with: brew install lld" >&2
   exit 1
 fi
-# Put llvm_bin first so clang's driver finds ld64.lld and llvm-strip/nm/etc
-# without falling back to /usr/bin/* (which would be Apple's toolchain).
-export PATH="$llvm_bin:$PATH"
+# Put lld_bin and llvm_bin first so clang's driver finds ld64.lld plus
+# llvm-strip / llvm-nm / llvm-install-name-tool without falling back to
+# Apple's /usr/bin/*. Order: lld_bin before llvm_bin (lld_bin only has
+# the linker binaries, doesn't shadow anything else).
+export PATH="$lld_bin:$llvm_bin:$PATH"
 
 # Homebrew LLVM's clang++ needs SDKROOT pointing at the active Xcode/CLT SDK
 # so its libc++ headers compose correctly with the C SDK headers (otherwise
