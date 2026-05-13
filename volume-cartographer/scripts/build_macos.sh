@@ -86,6 +86,10 @@ required_formulae=(
   curl
   nlohmann-json
   lapack
+  # OpenBLAS provides cblas_* with the legacy ILP32 symbol names PaStiX
+  # expects. Accelerate.framework's BLAS hides those symbols when linked
+  # with -fuse-ld=lld + thin LTO, so we force PaStiX onto OpenBLAS instead.
+  openblas
   scotch
   hwloc
   # gcc stays in the deps list: OpenBLAS/lapack carry a libgfortran runtime
@@ -153,13 +157,18 @@ if [[ -d "$brew_prefix/opt/nlohmann-json/share/cmake/nlohmann_json" ]]; then
   extra_cmake_args+=("-Dnlohmann_json_DIR=$brew_prefix/opt/nlohmann-json/share/cmake/nlohmann_json")
 fi
 
-# lapack is keg-only on macOS (Accelerate ships LAPACK but not LAPACKE, which
-# PaStiX requires). Make Homebrew's lapack discoverable by pkg-config and
-# cmake's find_package.
-if [[ -d "$brew_prefix/opt/lapack" ]]; then
-  export PKG_CONFIG_PATH="$brew_prefix/opt/lapack/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-  export CMAKE_PREFIX_PATH="$brew_prefix/opt/lapack${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
-fi
+# lapack and openblas are keg-only on macOS (Accelerate ships LAPACK but not
+# LAPACKE, which PaStiX requires; openblas would otherwise be masked by
+# Accelerate). Make both discoverable by pkg-config and cmake's find_package.
+for keg in lapack openblas; do
+  if [[ -d "$brew_prefix/opt/$keg" ]]; then
+    export PKG_CONFIG_PATH="$brew_prefix/opt/$keg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CMAKE_PREFIX_PATH="$brew_prefix/opt/$keg${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+  fi
+done
+# Force PaStiX onto OpenBLAS instead of letting morse_cmake fall back to
+# Accelerate.framework — see openblas note in required_formulae above.
+extra_cmake_args+=("-DBLA_VENDOR=OpenBLAS")
 
 # PaStiX enables Fortran at configure time even with PASTIX_WITH_FORTRAN=OFF.
 # Use LLVM's flang (from the Homebrew flang keg) so the toolchain stays
