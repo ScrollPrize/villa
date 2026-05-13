@@ -3330,7 +3330,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
         surf->setDpi(voxelSizeToDpi(voxelsize));
-        surf->setChannel("generations", generations_crop);
+        surf->setChannel("generations", generations_crop.clone());
 
         if (params.value("vis_losses", false)) {
             cv::Mat_<float> loss_dist(generations_crop.size(), 0.0f);
@@ -3717,7 +3717,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
 
             std::cout << "Resuming with " << trace_data.point_correction.all_grid_locs().size() << " correction points." << std::endl;
-            cv::Mat mask = resume_surf->channel("mask");
+            cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
             if (!mask.empty()) {
                 std::vector<std::vector<cv::Point2f>> all_hulls;
                 // For single-point collections (e.g., drag-and-drop), store center and radius
@@ -4059,7 +4059,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
         else if (params.value("inpaint", false)) {
-            cv::Mat mask = resume_surf->channel("mask");
+            cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
             cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
 
             cv::Mat active_area_mask(trace_params.state.size(), (uchar)0);
