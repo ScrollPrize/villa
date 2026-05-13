@@ -71,6 +71,15 @@ if(NOT pastix_POPULATED)
     file(READ "${pastix_SOURCE_DIR}/CMakeLists.txt" _pastix_top_cml)
     string(REPLACE "\${CMAKE_SOURCE_DIR}" "\${CMAKE_CURRENT_SOURCE_DIR}"
         _pastix_top_cml "${_pastix_top_cml}")
+    # PaStiX's project() hard-enables Fortran even though we set
+    # PASTIX_WITH_FORTRAN=OFF (every Fortran source is gated on that var,
+    # only the language enablement is not). On macOS Homebrew LLVM we use
+    # -fuse-ld=lld for C/C++; Homebrew gfortran inherits that linker flag
+    # via CMAKE_*_LINKER_FLAGS_INIT and ld64.lld rejects gfortran's
+    # invocation (missing -platform_version / -arch). Strip Fortran from
+    # the project() languages so the toolchain is never probed.
+    string(REPLACE "project (PASTIX C CXX Fortran)" "project (PASTIX C CXX)"
+        _pastix_top_cml "${_pastix_top_cml}")
     foreach(_pat
         "add_subdirectory(test)"
         "add_subdirectory(example)"
