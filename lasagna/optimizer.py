@@ -82,6 +82,8 @@ CYLINDER_OUTSIDE_THREADS_ARG = "cyl_outside_threads"
 CYLINDER_OUTSIDE_CHUNK_SIZE_ARG = "cyl_outside_chunk_size"
 CYLINDER_OUTSIDE_DEEP_INTERP_CHUNKS_ARG = "cyl_outside_deep_interp_chunks"
 CYLINDER_OUTSIDE_DEEP_BLEND_CHUNKS_ARG = "cyl_outside_deep_blend_chunks"
+CYLINDER_REFINE_MAX_IFRAC_ARGS = ("cyl_refine_max_ifrac", "cyl_grow_refine_max_ifrac")
+DEFAULT_CYLINDER_REFINE_MAX_IFRAC = 0.5
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
 	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
@@ -1705,6 +1707,20 @@ def optimize(
 						return max(1.0, float(args[key]))
 				return 1.5
 
+			def _cyl_refine_max_ifrac(refine_opt: OptSettings) -> float | None:
+				args = refine_opt.args or {}
+				raw = DEFAULT_CYLINDER_REFINE_MAX_IFRAC
+				for key in CYLINDER_REFINE_MAX_IFRAC_ARGS:
+					if key in args:
+						raw = args[key]
+						break
+				if raw is None:
+					return None
+				value = float(raw)
+				if value < 0.0:
+					return None
+				return value
+
 			def _run_shell_pass(shell_label: str, pass_eff: dict[str, float], *,
 								wstep_start: float, wstep_end: float,
 								pass_opt_cfg: OptSettings | None = None,
@@ -1951,13 +1967,15 @@ def optimize(
 
 				snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
 							loss=float(loss.detach().cpu()), data=data, res=res)
+				debug_values = _shell_dbg_values(res)
 				return {
 					"seed_hit": False,
-					"metrics": None,
+					"metrics": debug_values,
 					"resamples": resample_count,
 					"resampled": resampled_this_pass,
 					"error": None,
 					"keep_active": False,
+					"debug": debug_values,
 				}
 
 			def _grow_refine_eff(refine_opt: OptSettings) -> dict[str, float]:
@@ -2012,6 +2030,19 @@ def optimize(
 				if result_.get("error") is None and hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
 					_emit_cylinder_shell_callback(refine_label)
+					max_ifrac = _cyl_refine_max_ifrac(refine_opt)
+					debug_values = result_.get("debug")
+					if max_ifrac is not None and isinstance(debug_values, dict):
+						ifrac = float(debug_values.get("wstep_invalid_frac", 0.0))
+						if math.isfinite(ifrac) and ifrac > float(max_ifrac):
+							print(
+								f"[optimizer] {refine_label}: stopping cylinder shell growth because "
+								f"ifrac={ifrac:.4f} exceeds cyl_refine_max_ifrac={float(max_ifrac):.4f}; "
+								f"too many wrapped width edges have an endpoint outside the grad_mag mask.",
+								flush=True,
+							)
+							model.cyl_shell_search_done = True
+							setattr(model, "cyl_shell_abort", True)
 				if hasattr(model, "cyl_shell_width_target_step"):
 					model.cyl_shell_width_target_step = float(_base_wstep)
 				return result_
@@ -2129,6 +2160,8 @@ def optimize(
 								result["error"],
 								keep_active=bool(result.get("keep_active", False)),
 							)
+							break
+						if bool(getattr(model, "cyl_shell_abort", False)) or bool(getattr(model, "cyl_shell_search_done", False)):
 							break
 				if bool(result.get("error") is not None):
 					_stage_done(f"{label}.total", _t_stage_total)

@@ -54,7 +54,7 @@
 				"cyl_smooth": 1.0
 			},
 			"args": {
-				"grow_factor": 1.25,
+				"grow_factor": 1.1,
 				"cyl_grow_direction": "outward",
 				"model-step": 200.0,
 				"compile_cyl_normal": true,
