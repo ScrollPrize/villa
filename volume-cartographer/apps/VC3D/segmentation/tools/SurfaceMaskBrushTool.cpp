@@ -33,18 +33,6 @@ GridPointF toPoint(const std::pair<int, int>& p)
     return {static_cast<float>(p.first), static_cast<float>(p.second)};
 }
 
-float cross(const GridPointF& a, const GridPointF& b, const GridPointF& c)
-{
-    return (b.col - a.col) * (c.row - a.row) -
-           (b.row - a.row) * (c.col - a.col);
-}
-
-bool pointInRect(const GridPointF& p, float rowMin, float rowMax, float colMin, float colMax)
-{
-    return p.row >= rowMin && p.row <= rowMax &&
-           p.col >= colMin && p.col <= colMax;
-}
-
 bool pointInPolygon(const GridPointF& point, const std::vector<std::pair<int, int>>& polygon)
 {
     bool inside = false;
@@ -61,77 +49,28 @@ bool pointInPolygon(const GridPointF& point, const std::vector<std::pair<int, in
     return inside;
 }
 
-bool segmentsIntersect(GridPointF a, GridPointF b, GridPointF c, GridPointF d)
+bool pointOnPolygonBoundary(const GridPointF& point, const std::vector<std::pair<int, int>>& polygon)
 {
-    constexpr float eps = 1.0e-5f;
-    const float c1 = cross(a, b, c);
-    const float c2 = cross(a, b, d);
-    const float c3 = cross(c, d, a);
-    const float c4 = cross(c, d, b);
-
-    auto onSegment = [](const GridPointF& p, const GridPointF& q, const GridPointF& r) {
-        constexpr float eps = 1.0e-5f;
-        return std::abs(cross(p, q, r)) <= eps &&
-               q.row >= std::min(p.row, r.row) - eps &&
-               q.row <= std::max(p.row, r.row) + eps &&
-               q.col >= std::min(p.col, r.col) - eps &&
-               q.col <= std::max(p.col, r.col) + eps;
-    };
-
-    if (((c1 > eps && c2 < -eps) || (c1 < -eps && c2 > eps)) &&
-        ((c3 > eps && c4 < -eps) || (c3 < -eps && c4 > eps))) {
-        return true;
-    }
-
-    return onSegment(a, c, b) ||
-           onSegment(a, d, b) ||
-           onSegment(c, a, d) ||
-           onSegment(c, b, d);
-}
-
-bool polygonIntersectsCell(const std::vector<std::pair<int, int>>& polygon, int row, int col)
-{
-    const float rowMin = static_cast<float>(row);
-    const float rowMax = static_cast<float>(row + 1);
-    const float colMin = static_cast<float>(col);
-    const float colMax = static_cast<float>(col + 1);
-
-    const GridPointF center{rowMin + 0.5f, colMin + 0.5f};
-    if (pointInPolygon(center, polygon)) {
-        return true;
-    }
-
-    const GridPointF corners[] = {
-        {rowMin, colMin},
-        {rowMin, colMax},
-        {rowMax, colMax},
-        {rowMax, colMin}
-    };
-    for (const GridPointF& corner : corners) {
-        if (pointInPolygon(corner, polygon)) {
-            return true;
-        }
-    }
-
-    for (const auto& p : polygon) {
-        if (pointInRect(toPoint(p), rowMin, rowMax, colMin, colMax)) {
-            return true;
-        }
-    }
-
-    const std::pair<GridPointF, GridPointF> edges[] = {
-        {corners[0], corners[1]},
-        {corners[1], corners[2]},
-        {corners[2], corners[3]},
-        {corners[3], corners[0]}
-    };
+    constexpr float eps = 1.0e-4f;
     for (std::size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
         const GridPointF a = toPoint(polygon[j]);
         const GridPointF b = toPoint(polygon[i]);
-        for (const auto& edge : edges) {
-            if (segmentsIntersect(a, b, edge.first, edge.second)) {
-                return true;
-            }
+        const float abRow = b.row - a.row;
+        const float abCol = b.col - a.col;
+        const float abLenSq = abRow * abRow + abCol * abCol;
+        if (abLenSq <= eps) {
+            continue;
+        }
+
+        const float apRow = point.row - a.row;
+        const float apCol = point.col - a.col;
+        const float t = std::clamp((apRow * abRow + apCol * abCol) / abLenSq, 0.0f, 1.0f);
+        const float nearestRow = a.row + t * abRow;
+        const float nearestCol = a.col + t * abCol;
+        const float dRow = point.row - nearestRow;
+        const float dCol = point.col - nearestCol;
+        if (dRow * dRow + dCol * dCol <= eps) {
+            return true;
         }
     }
 
@@ -390,41 +329,18 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
         _strokeGridPoints.emplace_back(centerRow, centerCol);
     }
 
-    if (_mask.rows < 2 || _mask.cols < 2) {
-        for (int dr = -radius; dr <= radius; ++dr) {
-            for (int dc = -radius; dc <= radius; ++dc) {
-                if (static_cast<float>(dr * dr + dc * dc) > radiusSq) {
-                    continue;
-                }
-                queueVertex(centerRow + dr, centerCol + dc);
+    const int rowStart = std::max(0, centerRow - radius);
+    const int rowEnd = std::min(_mask.rows - 1, centerRow + radius);
+    const int colStart = std::max(0, centerCol - radius);
+    const int colEnd = std::min(_mask.cols - 1, centerCol + radius);
+
+    for (int row = rowStart; row <= rowEnd; ++row) {
+        const int dr = row - centerRow;
+        for (int col = colStart; col <= colEnd; ++col) {
+            const int dc = col - centerCol;
+            if (static_cast<float>(dr * dr + dc * dc) <= radiusSq) {
+                queueVertex(row, col);
             }
-        }
-        return;
-    }
-
-    const int rowStart = std::max(0, centerRow - radius - 1);
-    const int rowEnd = std::min(_mask.rows - 2, centerRow + radius);
-    const int colStart = std::max(0, centerCol - radius - 1);
-    const int colEnd = std::min(_mask.cols - 2, centerCol + radius);
-
-    for (int cellRow = rowStart; cellRow <= rowEnd; ++cellRow) {
-        const float nearestRow = std::clamp(static_cast<float>(centerRow),
-                                            static_cast<float>(cellRow),
-                                            static_cast<float>(cellRow + 1));
-        const float dr = nearestRow - static_cast<float>(centerRow);
-        for (int cellCol = colStart; cellCol <= colEnd; ++cellCol) {
-            const float nearestCol = std::clamp(static_cast<float>(centerCol),
-                                                static_cast<float>(cellCol),
-                                                static_cast<float>(cellCol + 1));
-            const float dc = nearestCol - static_cast<float>(centerCol);
-            if (dr * dr + dc * dc > radiusSq + 1.0e-4f) {
-                continue;
-            }
-
-            queueVertex(cellRow, cellCol);
-            queueVertex(cellRow + 1, cellCol);
-            queueVertex(cellRow, cellCol + 1);
-            queueVertex(cellRow + 1, cellCol + 1);
         }
     }
 }
@@ -485,21 +401,17 @@ void SurfaceMaskBrushTool::fillEnclosedStrokeArea()
         maxCol = std::max(maxCol, p.second);
     }
 
-    const int rowStart = std::max(0, minRow - 1);
-    const int rowEnd = std::min(_mask.rows - 2, maxRow);
-    const int colStart = std::max(0, minCol - 1);
-    const int colEnd = std::min(_mask.cols - 2, maxCol);
+    const int rowStart = std::max(0, minRow);
+    const int rowEnd = std::min(_mask.rows - 1, maxRow);
+    const int colStart = std::max(0, minCol);
+    const int colEnd = std::min(_mask.cols - 1, maxCol);
 
-    for (int cellRow = rowStart; cellRow <= rowEnd; ++cellRow) {
-        for (int cellCol = colStart; cellCol <= colEnd; ++cellCol) {
-            if (!polygonIntersectsCell(polygon, cellRow, cellCol)) {
-                continue;
+    for (int row = rowStart; row <= rowEnd; ++row) {
+        for (int col = colStart; col <= colEnd; ++col) {
+            const GridPointF point{static_cast<float>(row), static_cast<float>(col)};
+            if (pointInPolygon(point, polygon) || pointOnPolygonBoundary(point, polygon)) {
+                queueVertex(row, col);
             }
-
-            queueVertex(cellRow, cellCol);
-            queueVertex(cellRow + 1, cellCol);
-            queueVertex(cellRow, cellCol + 1);
-            queueVertex(cellRow + 1, cellCol + 1);
         }
     }
 }
