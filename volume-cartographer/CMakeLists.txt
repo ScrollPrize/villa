@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
 
 project(VC3D VERSION 1.0.0)
 
+# We don't use C++20/23 modules. CMake 3.28+ would otherwise invoke
+# clang-scan-deps on every C++ source to discover module imports, which
+# requires the `clang-tools-N` package that isn't part of Ubuntu 24.04's
+# default `clang` install. Skip the scan globally.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
