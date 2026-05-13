@@ -111,6 +111,10 @@ def _swap_triplet_torch(dense_gt: torch.Tensor, dir_priors: torch.Tensor | None)
     return dense_gt, dir_priors
 
 
+def _swap_triplet_scalar_torch(branch_values: torch.Tensor):
+    return torch.cat([branch_values[1:2], branch_values[0:1]], dim=0)
+
+
 def _align_triplet_to_priors_torch(
     dense_gt: torch.Tensor,
     dir_priors: torch.Tensor | None,
@@ -568,6 +572,7 @@ class CopyNeighborTargets:
     cond_gt: torch.Tensor | None = None
     behind_seg: torch.Tensor | None = None
     front_seg: torch.Tensor | None = None
+    branch_target_edt: torch.Tensor | None = None
     dir_priors: torch.Tensor | None = None
     triplet_channel_order: torch.Tensor | None = None
 
@@ -593,7 +598,13 @@ class CopyNeighborTargets:
             if dir_priors.ndim != 5 or dir_priors.shape[1] != 6:
                 raise ValueError(f"dir_priors must have shape [B, 6, D, H, W], got {tuple(dir_priors.shape)}")
 
-        dense_gt_displacement, dense_loss_weight, dir_priors, triplet_channel_order = cls._build_dense_targets(
+        (
+            dense_gt_displacement,
+            dense_loss_weight,
+            branch_target_edt,
+            dir_priors,
+            triplet_channel_order,
+        ) = cls._build_dense_targets(
             batch,
             config,
             dir_priors=dir_priors,
@@ -611,6 +622,7 @@ class CopyNeighborTargets:
             cond_gt=batch.get("cond_gt", None),
             behind_seg=batch.get("behind_seg", None),
             front_seg=batch.get("front_seg", None),
+            branch_target_edt=branch_target_edt,
             dir_priors=dir_priors,
             triplet_channel_order=triplet_channel_order,
         )
@@ -624,6 +636,7 @@ class CopyNeighborTargets:
     ):
         dense_targets = []
         dense_weights = []
+        branch_target_edts = []
         aligned_priors = [] if dir_priors is not None else None
         channel_orders = []
 
@@ -640,8 +653,10 @@ class CopyNeighborTargets:
                 shape = tuple(int(v) for v in batch["behind_seg"].shape[1:])
                 dense_gt = torch.zeros((6, *shape), device=batch["behind_seg"].device, dtype=torch.float32)
                 dense_weight = torch.zeros((1, *shape), device=batch["behind_seg"].device, dtype=torch.float32)
+                branch_edt = torch.zeros((2, *shape), device=batch["behind_seg"].device, dtype=torch.float32)
             else:
                 dense_gt = torch.cat([behind_disp, front_disp], dim=0).to(dtype=torch.float32)
+                branch_edt = torch.stack([behind_dist, front_dist], dim=0).to(dtype=torch.float32)
                 dense_weight = _copy_neighbor_dense_weight(
                     batch["cond_gt"][b],
                     front_dist,
@@ -657,6 +672,7 @@ class CopyNeighborTargets:
                 priors_b,
                 batch["cond_gt"][b],
             )
+            branch_edt = branch_edt.index_select(0, channel_order)
 
             if swap_enabled is None:
                 do_swap = False
@@ -667,17 +683,20 @@ class CopyNeighborTargets:
                     raise ValueError(f"triplet_random_channel_swap_prob must satisfy 0 <= p <= 1, got {swap_prob!r}")
                 if bool((torch.rand((), device=dense_gt.device) < swap_prob).item()):
                     dense_gt, priors_b = _swap_triplet_torch(dense_gt, priors_b)
+                    branch_edt = _swap_triplet_scalar_torch(branch_edt)
                     channel_order = channel_order.flip(0)
 
             dense_targets.append(dense_gt)
             dense_weights.append(dense_weight)
+            branch_target_edts.append(branch_edt)
             if aligned_priors is not None:
                 aligned_priors.append(priors_b)
             channel_orders.append(channel_order)
 
         dense_gt_displacement = torch.stack(dense_targets, dim=0)
         dense_loss_weight = torch.stack(dense_weights, dim=0)
+        branch_target_edt = torch.stack(branch_target_edts, dim=0)
         if aligned_priors is not None:
             dir_priors = torch.stack(aligned_priors, dim=0)
         triplet_channel_order = torch.stack(channel_orders, dim=0)
-        return dense_gt_displacement, dense_loss_weight, dir_priors, triplet_channel_order
+        return dense_gt_displacement, dense_loss_weight, branch_target_edt, dir_priors, triplet_channel_order

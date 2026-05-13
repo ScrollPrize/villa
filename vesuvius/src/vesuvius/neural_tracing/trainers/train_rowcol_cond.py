@@ -25,6 +25,7 @@ from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
 from vesuvius.neural_tracing.datasets.targets import CopyNeighborTargets, RowColTargets
 from vesuvius.neural_tracing.loss.displacement_losses import (
     dense_displacement_loss,
+    displaced_source_edt_loss,
     smoothness_loss,
     triplet_min_displacement_loss,
 )
@@ -154,6 +155,11 @@ def train(config_path):
     lambda_smooth = float(config.get("lambda_smooth", 0.0))
     triplet_min_disp_vox = float(config.get("triplet_min_disp_vox", 1.0))
     lambda_triplet_min_disp = float(config.get("lambda_triplet_min_disp", 0.0))
+    lambda_displaced_source_edt = float(config.get("lambda_displaced_source_edt", 0.0))
+    displaced_source_edt_beta = float(config.get("displaced_source_edt_beta", 1.0))
+    displaced_source_edt_max_points = int(config.get("displaced_source_edt_max_points", 4096))
+    displaced_source_edt_oob_weight = float(config.get("displaced_source_edt_oob_weight", 1.0))
+    displaced_source_edt_loss_type = str(config.get("displaced_source_edt_loss_type", "huber"))
 
     def compute_losses(output, prepared, *, random_trace_sample):
         if copy_neighbor_mode:
@@ -169,6 +175,22 @@ def train(config_path):
             )
             total = disp_loss
             metrics = {"displacement_loss": disp_loss}
+            if lambda_displaced_source_edt > 0.0:
+                if prepared.branch_target_edt is None:
+                    raise ValueError("lambda_displaced_source_edt > 0 requires branch_target_edt targets")
+                source_edt = displaced_source_edt_loss(
+                    disp_pred,
+                    prepared.cond,
+                    prepared.branch_target_edt,
+                    loss_type=displaced_source_edt_loss_type,
+                    beta=displaced_source_edt_beta,
+                    max_points=displaced_source_edt_max_points,
+                    random_sample=random_trace_sample,
+                    oob_weight=displaced_source_edt_oob_weight,
+                )
+                weighted_source_edt = float(lambda_displaced_source_edt) * source_edt
+                total = total + weighted_source_edt
+                metrics["displaced_source_edt_loss"] = weighted_source_edt
             if lambda_smooth > 0.0:
                 smooth = smoothness_loss(disp_pred)
                 weighted_smooth = float(lambda_smooth) * smooth

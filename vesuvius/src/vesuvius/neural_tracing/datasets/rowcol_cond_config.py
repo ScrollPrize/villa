@@ -40,6 +40,11 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("lambda_smooth", 0.0)
     config.setdefault("triplet_min_disp_vox", 1.0)
     config.setdefault("lambda_triplet_min_disp", 0.0)
+    config.setdefault("lambda_displaced_source_edt", 0.0)
+    config.setdefault("displaced_source_edt_loss_type", "huber")
+    config.setdefault("displaced_source_edt_beta", 1.0)
+    config.setdefault("displaced_source_edt_max_points", 4096)
+    config.setdefault("displaced_source_edt_oob_weight", 1.0)
 
     # Chunk-first patch-finding defaults.
     config.setdefault("overlap_fraction", 0.0)
@@ -182,6 +187,12 @@ def rowcol_cond_training_summary_lines(
             (
                 f"Displacement loss: {config.get('displacement_loss_type')} "
                 f"(beta={config.get('displacement_huber_beta')})"
+            ),
+            (
+                f"Displaced source EDT loss: lambda={config.get('lambda_displaced_source_edt')}, "
+                f"type={config.get('displaced_source_edt_loss_type')}, "
+                f"beta={config.get('displaced_source_edt_beta')}, "
+                f"max_points={config.get('displaced_source_edt_max_points')}"
             ),
             (
                 f"Optimizer: {optimizer_type} "
@@ -339,8 +350,16 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
             "lambda_smooth",
             "triplet_min_disp_vox",
             "lambda_triplet_min_disp",
+            "lambda_displaced_source_edt",
+            "displaced_source_edt_beta",
+            "displaced_source_edt_oob_weight",
         ):
             _require_finite_range(key, float(config.get(key, 0.0)), min_value=0.0)
+        if str(config.get("displaced_source_edt_loss_type", "huber")).lower() not in {"huber", "l1", "l2"}:
+            raise ValueError("displaced_source_edt_loss_type must be one of huber, l1, or l2")
+        max_points = int(config.get("displaced_source_edt_max_points", 4096))
+        if max_points < 0:
+            raise ValueError("displaced_source_edt_max_points must be >= 0")
         swap_prob = float(config.get("triplet_random_channel_swap_prob", 0.0))
         if swap_prob > 1.0:
             raise ValueError("triplet_random_channel_swap_prob must satisfy 0 <= p <= 1")

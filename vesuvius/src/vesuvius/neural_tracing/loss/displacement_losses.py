@@ -357,7 +357,7 @@ def _coords_to_grid(coords_zyx, spatial_shape):
     return coords[..., [2, 1, 0]]
 
 
-def _sample_field_at_zyx(field, coords_zyx):
+def _sample_field_at_zyx(field, coords_zyx, *, padding_mode='zeros'):
     """Sample a dense field at per-batch z/y/x coordinates.
 
     Args:
@@ -376,8 +376,131 @@ def _sample_field_at_zyx(field, coords_zyx):
         )
 
     grid = _coords_to_grid(coords_zyx, field.shape[2:]).view(field.shape[0], -1, 1, 1, 3)
-    sampled = F.grid_sample(field.float(), grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    sampled = F.grid_sample(field.float(), grid, mode='bilinear', padding_mode=padding_mode, align_corners=True)
     return sampled.view(field.shape[0], field.shape[1], -1).permute(0, 2, 1)
+
+
+def displaced_source_edt_loss(
+    pred_field,
+    source_mask,
+    branch_target_edt,
+    *,
+    loss_type='huber',
+    beta=1.0,
+    max_points=4096,
+    random_sample=True,
+    oob_weight=1.0,
+):
+    """Penalize source-surface points that do not land on branch target surfaces.
+
+    The predicted 6-channel copy-neighbor field is interpreted as two 3-vector
+    displacement branches. For source surface voxels, each branch is sampled,
+    added to the source coordinate, then scored by sampling the matching target
+    EDT at the landed coordinate. This avoids requiring source/target
+    vertex-to-vertex correspondences.
+    """
+    if pred_field.ndim != 5 or pred_field.shape[1] < 6 or pred_field.shape[1] % 3 != 0:
+        raise ValueError(
+            "pred_field must have shape [B, 6+, D, H, W] with dz/dy/dx branches, "
+            f"got {tuple(pred_field.shape)}"
+        )
+    if branch_target_edt.ndim != 5 or branch_target_edt.shape[1] < 2:
+        raise ValueError(
+            "branch_target_edt must have shape [B, 2+, D, H, W], "
+            f"got {tuple(branch_target_edt.shape)}"
+        )
+    if pred_field.shape[0] != branch_target_edt.shape[0] or pred_field.shape[2:] != branch_target_edt.shape[2:]:
+        raise ValueError(
+            "pred_field and branch_target_edt must share batch/spatial shape, got "
+            f"{tuple(pred_field.shape)} vs {tuple(branch_target_edt.shape)}"
+        )
+    if source_mask.ndim == 5:
+        if source_mask.shape[1] != 1:
+            raise ValueError(
+                "source_mask with 5 dims must have shape [B, 1, D, H, W], "
+                f"got {tuple(source_mask.shape)}"
+            )
+        mask = source_mask[:, 0]
+    elif source_mask.ndim == 4:
+        mask = source_mask
+    else:
+        raise ValueError(f"source_mask must have shape [B, 1, D, H, W] or [B, D, H, W], got {tuple(source_mask.shape)}")
+
+    if mask.shape[0] != pred_field.shape[0] or mask.shape[1:] != pred_field.shape[2:]:
+        raise ValueError(
+            "source_mask must share batch/spatial shape with pred_field, got "
+            f"{tuple(mask.shape)} vs {(pred_field.shape[0], *pred_field.shape[2:])}"
+        )
+
+    max_points = int(max_points)
+    if max_points <= 0:
+        return pred_field.new_zeros(())
+
+    _, _, depth, height, width = pred_field.shape
+    num_branches = min(pred_field.shape[1] // 3, branch_target_edt.shape[1])
+    losses = []
+    weights = []
+    mask = mask.to(device=pred_field.device)
+    branch_target_edt = branch_target_edt.to(device=pred_field.device, dtype=torch.float32)
+
+    for b in range(pred_field.shape[0]):
+        coords = torch.nonzero(mask[b] > 0.5, as_tuple=False)
+        if coords.numel() == 0:
+            continue
+        if coords.shape[0] > max_points:
+            if random_sample:
+                selected = torch.randperm(coords.shape[0], device=coords.device)[:max_points]
+            else:
+                selected = torch.linspace(
+                    0,
+                    coords.shape[0] - 1,
+                    steps=max_points,
+                    device=coords.device,
+                    dtype=torch.float32,
+                ).round().long()
+            coords = coords[selected]
+
+        coords = coords.to(dtype=torch.float32).unsqueeze(0)
+        pred_b = pred_field[b:b + 1]
+        edt_b = branch_target_edt[b:b + 1]
+
+        for branch_idx in range(num_branches):
+            disp = _sample_field_at_zyx(
+                pred_b[:, branch_idx * 3 : branch_idx * 3 + 3],
+                coords,
+                padding_mode='border',
+            )
+            landed = coords + disp
+            sampled_edt = _sample_field_at_zyx(
+                edt_b[:, branch_idx : branch_idx + 1],
+                landed,
+                padding_mode='border',
+            ).squeeze(-1)
+
+            z, y, x = landed[..., 0], landed[..., 1], landed[..., 2]
+            below = F.relu(-z) + F.relu(-y) + F.relu(-x)
+            above = F.relu(z - (depth - 1)) + F.relu(y - (height - 1)) + F.relu(x - (width - 1))
+            distance = sampled_edt + float(oob_weight) * (below + above)
+
+            if loss_type == 'l1':
+                diff = distance.abs()
+            elif loss_type == 'l2':
+                diff = distance ** 2
+            elif loss_type == 'huber':
+                diff = F.smooth_l1_loss(
+                    distance,
+                    torch.zeros_like(distance),
+                    beta=float(beta),
+                    reduction='none',
+                )
+            else:
+                raise ValueError(f"Unknown displaced source EDT loss_type: {loss_type}")
+            losses.append(diff.sum())
+            weights.append(torch.as_tensor(diff.numel(), device=pred_field.device, dtype=torch.float32))
+
+    if not losses:
+        return pred_field.new_zeros(())
+    return torch.stack(losses).sum() / torch.stack(weights).sum().clamp(min=1.0)
 
 
 def velocity_streamline_integration_loss(
