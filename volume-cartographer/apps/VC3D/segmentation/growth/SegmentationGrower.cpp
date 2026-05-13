@@ -1512,6 +1512,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
     const bool denseMode = neuralTracerEnabled &&
+        !inpaintOnly &&
         _context.widget->neuralModelType() == NeuralTracerModelType::DenseDisplacement &&
         !manualAddTracerMask;
 
@@ -1657,7 +1658,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
 
     // Heatmap neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
-    if (neuralTracerEnabled) {
+    if (neuralTracerEnabled && !inpaintOnly) {
         const QString checkpointPath = _context.widget->neuralCheckpointPath();
         const QString pythonPath = _context.widget->neuralPythonPath();
         const QString volumeZarr = _context.widget->volumeZarrPath();

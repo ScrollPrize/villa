@@ -613,12 +613,13 @@ void SegmentationPushPullTool::stopAll()
 
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _state) {
+        const auto editedVerts = _editManager->editedVertices();
+
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)_module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
-            const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 // Get drag center from the cached row/col if available
                 std::optional<std::pair<int, int>> dragCenter;
@@ -633,6 +634,8 @@ void SegmentationPushPullTool::stopAll()
         _editManager->applyPreview();
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         _module.emitPendingChanges();
+        _module.queueAutosaveVertexUpdates(editedVerts);
+        _module.markAutosaveNeeded();
     }
 
     if (wasActive) {
@@ -819,15 +822,12 @@ void SegmentationPushPullTool::launchAlphaCompute()
         return;
     }
 
-    // Capture all inputs needed by the background thread on the main thread
+    // Capture all inputs needed by the background thread on the main thread.
+    // Alpha push/pull is an editing interaction against the displayed volume,
+    // not the growth volume selected in the segmentation widget.
     std::shared_ptr<Volume> volume = hover.viewer->currentVolume();
-    if (_state && _state->vpkg()) {
-        const std::string selectedVolumeId = _state->segmentationGrowthVolumeId().empty()
-            ? _state->currentVolumeId()
-            : _state->segmentationGrowthVolumeId();
-        if (!selectedVolumeId.empty() && _state->vpkg()->hasVolume(selectedVolumeId)) {
-            volume = _state->vpkg()->volume(selectedVolumeId);
-        }
+    if (!volume && _state) {
+        volume = _state->currentVolume();
     }
     if (!volume) {
         failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active volume to sample."));
