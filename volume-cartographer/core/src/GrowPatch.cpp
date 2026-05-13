@@ -3460,6 +3460,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         surf->meta["max_gen"] = stop_gen;
         surf->meta["elapsed_time_s"] = f_timer.seconds();
 
+        delete timer;
         return surf;
     }
 
