@@ -760,6 +760,22 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             style.z = 110.0;
             builder.addLineStrip(points, false, style);
         };
+        if (flattened) {
+            ViewerOverlayControllerBase::OverlayStyle hoverFillStyle;
+            hoverFillStyle.penColor = Qt::transparent;
+            hoverFillStyle.brushColor = QColor(255, 220, 0, 55);
+            hoverFillStyle.penWidth = 0.0;
+            hoverFillStyle.z = 104.0;
+            for (const QPointF& grid : state.manualAddHoverFillVertices) {
+                const QPointF topLeft = gridToScene(QPointF(grid.x() - 0.5, grid.y() - 0.5));
+                const QPointF bottomRight = gridToScene(QPointF(grid.x() + 0.5, grid.y() + 0.5));
+                if (!std::isfinite(topLeft.x()) || !std::isfinite(topLeft.y()) ||
+                    !std::isfinite(bottomRight.x()) || !std::isfinite(bottomRight.y())) {
+                    continue;
+                }
+                builder.addRect(QRectF(topLeft, bottomRight).normalized(), true, hoverFillStyle);
+            }
+        }
         for (const auto& line : state.manualAddCommittedLines) {
             drawLine(line);
         }

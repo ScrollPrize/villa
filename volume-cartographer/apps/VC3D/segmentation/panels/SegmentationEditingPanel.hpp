@@ -98,7 +98,6 @@ private:
     QDoubleSpinBox* _spinAlphaStep{nullptr};
     QDoubleSpinBox* _spinAlphaLow{nullptr};
     QDoubleSpinBox* _spinAlphaHigh{nullptr};
-    QDoubleSpinBox* _spinAlphaBorder{nullptr};
     QSpinBox* _spinAlphaBlurRadius{nullptr};
     QDoubleSpinBox* _spinAlphaPerVertexLimit{nullptr};
     QLabel* _lblAlphaInfo{nullptr};

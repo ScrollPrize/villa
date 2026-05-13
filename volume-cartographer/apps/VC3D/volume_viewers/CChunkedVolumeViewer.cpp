@@ -153,6 +153,11 @@ std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
     return "local|" + path.string() + "|id=" + volume->id();
 }
 
+bool shouldSpeculativelyPrefetchVolume(const std::shared_ptr<Volume>& volume)
+{
+    return volume && volume->isRemote();
+}
+
 uint32_t alphaBlendArgb(uint32_t base, uint32_t overlay, float alpha)
 {
     const float a = std::clamp(alpha, 0.0f, 1.0f);
@@ -515,6 +520,7 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
         ? decodedByteCapacity
         : streamingCacheCapacityBytes(nullptr);
     options.maxConcurrentReads = 16;
+    options.detectAllFillChunks = volume->isRemote();
     if (volume->isRemote()) {
         const auto cacheRoot = remoteCacheRootForState(state);
         options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
@@ -1609,7 +1615,10 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
-    if (!_chunkArray || _interactivePreview || _framebuffer.isNull())
+    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
+    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    if (_interactivePreview || _framebuffer.isNull() ||
+        (!prefetchBase && !prefetchOverlay))
         return;
 
     const int fbW = _framebuffer.width();
@@ -1632,20 +1641,22 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
         uniqueKeys.insert(keys.begin(), keys.end());
     };
 
-    collect(*_chunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
-            expandedW, halo);
-    collect(*_chunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
-            expandedW, halo);
-    collect(*_chunkArray, origin - vxStep * float(halo), halo, fbH);
-    collect(*_chunkArray, origin + vxStep * float(fbW), halo, fbH);
-
     std::vector<vc::render::ChunkKey> keys;
-    keys.reserve(uniqueKeys.size());
-    for (const auto& key : uniqueKeys)
-        keys.push_back(key);
-    _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    if (prefetchBase && _chunkArray) {
+        collect(*_chunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
+                expandedW, halo);
+        collect(*_chunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
+                expandedW, halo);
+        collect(*_chunkArray, origin - vxStep * float(halo), halo, fbH);
+        collect(*_chunkArray, origin + vxStep * float(fbW), halo, fbH);
 
-    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+        keys.reserve(uniqueKeys.size());
+        for (const auto& key : uniqueKeys)
+            keys.push_back(key);
+        _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    }
+
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
         return;
     uniqueKeys.clear();
     collect(*_overlayChunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
@@ -1666,7 +1677,9 @@ void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
-    if (!_chunkArray || _framebuffer.isNull())
+    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
+    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    if (_framebuffer.isNull() || (!prefetchBase && !prefetchOverlay))
         return;
 
     const int fbW = _framebuffer.width();
@@ -1739,12 +1752,12 @@ void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
         array.prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
     };
 
-    if (_chunkArray->numLevels() <= 0)
-        return;
-    startLevel = std::clamp(startLevel, 0, _chunkArray->numLevels() - 1);
-    collect(*_chunkArray, startLevel, chunkDistance(*_chunkArray, startLevel));
+    if (prefetchBase && _chunkArray && _chunkArray->numLevels() > 0) {
+        startLevel = std::clamp(startLevel, 0, _chunkArray->numLevels() - 1);
+        collect(*_chunkArray, startLevel, chunkDistance(*_chunkArray, startLevel));
+    }
 
-    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
         return;
     if (_overlayChunkArray->numLevels() <= 0)
         return;
@@ -1759,7 +1772,10 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
     int fbW,
     int fbH)
 {
-    if (!_chunkArray || _interactivePreview || fbW <= 0 || fbH <= 0)
+    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
+    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    if (_interactivePreview || fbW <= 0 || fbH <= 0 ||
+        (!prefetchBase && !prefetchOverlay))
         return;
 
     const int halo = kChunkPrefetchHaloPx;
@@ -1790,18 +1806,20 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
         uniqueKeys.insert(keys.begin(), keys.end());
     };
 
-    collect(*_chunkArray, -halo, -halo, fbW + 2 * halo, halo);
-    collect(*_chunkArray, -halo, fbH, fbW + 2 * halo, halo);
-    collect(*_chunkArray, -halo, 0, halo, fbH);
-    collect(*_chunkArray, fbW, 0, halo, fbH);
-
     std::vector<vc::render::ChunkKey> keys;
-    keys.reserve(uniqueKeys.size());
-    for (const auto& key : uniqueKeys)
-        keys.push_back(key);
-    _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    if (prefetchBase && _chunkArray) {
+        collect(*_chunkArray, -halo, -halo, fbW + 2 * halo, halo);
+        collect(*_chunkArray, -halo, fbH, fbW + 2 * halo, halo);
+        collect(*_chunkArray, -halo, 0, halo, fbH);
+        collect(*_chunkArray, fbW, 0, halo, fbH);
 
-    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+        keys.reserve(uniqueKeys.size());
+        for (const auto& key : uniqueKeys)
+            keys.push_back(key);
+        _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    }
+
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
         return;
     uniqueKeys.clear();
     collect(*_overlayChunkArray, -halo, -halo, fbW + 2 * halo, halo);
@@ -1817,7 +1835,8 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
 
 void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
 {
-    if (!_chunkArray || _framebuffer.isNull() || _framebuffer.width() <= 0 ||
+    if (!shouldSpeculativelyPrefetchVolume(_volume) ||
+        !_chunkArray || _framebuffer.isNull() || _framebuffer.width() <= 0 ||
         _framebuffer.height() <= 0) {
         return;
     }
@@ -3355,6 +3374,27 @@ void CChunkedVolumeViewer::setIntersects(const std::set<std::string>& names)
     renderIntersections("setIntersects");
 }
 
+void CChunkedVolumeViewer::setPlaneIntersectionLinesVisible(bool visible)
+{
+    if (_closing || _planeIntersectionLinesVisible == visible) {
+        return;
+    }
+    _planeIntersectionLinesVisible = visible;
+    _lastIntersectFp = {};
+    auto surf = _surfWeak.lock();
+    const bool isPlaneViewer = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
+    if (!visible && !isPlaneViewer) {
+        clearIntersectionItems();
+        if (_view) {
+            _view->viewport()->update();
+        }
+        return;
+    }
+    if (visible && !isPlaneViewer) {
+        renderIntersections("setPlaneIntersectionLinesVisible");
+    }
+}
+
 void CChunkedVolumeViewer::setIntersectionOpacity(float v)
 {
     if (_closing) {
@@ -3916,6 +3956,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
     if (!plane) {
+        if (!_planeIntersectionLinesVisible) {
+            clearIntersectionItems();
+            _lastIntersectFp = {};
+            profile.setDetails("action=skip flattened_disabled");
+            return;
+        }
         renderFlattenedIntersections(surf, reason, caller);
         profile.setDetails("action=delegated_flattened");
         return;

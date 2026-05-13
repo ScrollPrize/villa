@@ -2237,6 +2237,14 @@ void CWindow::CreateWidgets(void)
         chkMoveOnSurfaceChanged->setChecked(moveOnSurfaceChanged);
         connect(chkMoveOnSurfaceChanged, &QCheckBox::toggled, this, &CWindow::onMoveOnSurfaceChangedToggled);
     }
+    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
+        bool showPlaneIntersectionLines = settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
+                                                         vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
+        QSignalBlocker blocker(chkPlaneIntersectionLines);
+        chkPlaneIntersectionLines->setChecked(showPlaneIntersectionLines);
+        connect(chkPlaneIntersectionLines, &QCheckBox::toggled,
+                this, &CWindow::onPlaneIntersectionLinesToggled);
+    }
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                                            spinAxisOverlayOpacity->value()).toInt();
@@ -2273,6 +2281,9 @@ void CWindow::CreateWidgets(void)
     }
     if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
         onMoveOnSurfaceChangedToggled(chkMoveOnSurfaceChanged->isChecked());
+    }
+    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
+        onPlaneIntersectionLinesToggled(chkPlaneIntersectionLines->isChecked());
     }
 
 }
@@ -3405,6 +3416,22 @@ void CWindow::onMoveOnSurfaceChangedToggled(bool enabled)
             return;
         }
         viewer->setResetViewOnSurfaceChange(enabled);
+    });
+}
+
+void CWindow::onPlaneIntersectionLinesToggled(bool enabled)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES, enabled ? "1" : "0");
+
+    if (!_viewerManager) {
+        return;
+    }
+
+    _viewerManager->forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setPlaneIntersectionLinesVisible(enabled);
+        }
     });
 }
 
