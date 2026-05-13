@@ -60,11 +60,9 @@ target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,utils_c3d_codec>>
 )
 target_link_libraries(vc_core PRIVATE
-    $<BUILD_INTERFACE:blosc_static>
+    Blosc::blosc
+    ${VC_LIBBACKTRACE}
 )
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_libraries(vc_core PRIVATE ${VC_LIBBACKTRACE})
-endif()
 
 
 
@@ -74,79 +72,9 @@ set_source_files_properties(src/Slicing.cpp PROPERTIES
     COMPILE_OPTIONS "-O3;-ffast-math"
 )
 
-# Precompiled headers for faster builds
-if(VC_USE_PCH)
-# Downstream targets (vc_ui, vc_tracer, VC3D) REUSE_FROM vc_core and link Qt6.
-# Qt6 injects compile flags via generator expressions (e.g. -mno-direct-extern-access
-# on GCC). The PCH must be compiled with the same flags or GCC ignores it.
-# Linking Qt6::Core PRIVATE makes CMake evaluate the genexps for the PCH build.
-target_link_libraries(vc_core PRIVATE Qt6::Core)
-target_precompile_headers(vc_core PRIVATE
-    # STL - containers
-    <array>
-    <deque>
-    <list>
-    <map>
-    <queue>
-    <set>
-    <stack>
-    <unordered_map>
-    <unordered_set>
-    <vector>
-    # STL - algorithms and utilities
-    <algorithm>
-    <chrono>
-    <cmath>
-    <cstdint>
-    <cstdlib>
-    <cstring>
-    <functional>
-    <iterator>
-    <limits>
-    <numeric>
-    <tuple>
-    <type_traits>
-    <utility>
-    # STL - I/O and strings
-    <filesystem>
-    <fstream>
-    <iomanip>
-    <iostream>
-    <sstream>
-    <string>
-    <string_view>
-    # STL - memory and smart pointers
-    <memory>
-    <new>
-    # STL - concurrency
-    <atomic>
-    <condition_variable>
-    <mutex>
-    <shared_mutex>
-    <thread>
-    # STL - other
-    <cassert>
-    <optional>
-    <stdexcept>
-    <variant>
-    # OpenCV
-    <opencv2/core.hpp>
-    <opencv2/core/mat.hpp>
-    <opencv2/imgproc.hpp>
-    <opencv2/imgcodecs.hpp>
-    # Boost (used by CLI apps)
-    <boost/program_options.hpp>
-    # JSON (heavy templates, used in ~70 TUs)
-    <nlohmann/json.hpp>
-)
-endif()
-
 qt6_wrap_cpp(metrics_moc include/vc/ui/VCCollection.hpp)
 add_library(vc_ui src/VCCollection.cpp src/UDataManipulateUtils.cpp src/surface_metrics.cpp ${metrics_moc})
 target_link_libraries(vc_ui PUBLIC vc_core Qt6::Core Qt6::Gui Qt6::Widgets)
-if(VC_USE_PCH)
-    target_precompile_headers(vc_ui REUSE_FROM vc_core)
-endif()
 
 add_library(vc_flattening src/ABFFlattening.cpp)
 target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
@@ -163,6 +91,3 @@ add_library(vc_tracer
 )
 target_link_libraries(vc_tracer PUBLIC vc_core vc_ui vc_flattening Ceres::ceres Qt6::Core)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
-if(VC_USE_PCH)
-    target_precompile_headers(vc_tracer REUSE_FROM vc_core)
-endif()

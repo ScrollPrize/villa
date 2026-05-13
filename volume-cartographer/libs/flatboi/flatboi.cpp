@@ -193,7 +193,14 @@ wandb.finish()
       " || exec cat >/dev/null)";
     // Hardening: ensure writes to a closed pipe don't kill the process.
     // (Linux lacks O_NOSIGPIPE for pipes; MSG_NOSIGNAL doesn't apply to stdio.)
-    std::signal(SIGPIPE, SIG_IGN);
+    // Scope the SIG_IGN to this object's lifetime so we don't perturb
+    // SIGPIPE handling for the rest of the binary (e.g. OpenCV plugins,
+    // future networking code) for the entire flatboi run.
+    struct sigaction sa_ign{};
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    sigaction(SIGPIPE, &sa_ign, &prev_sigpipe_);
+    sigpipe_saved_ = true;
 
     pipe_ = popen(cmd.c_str(), "w");
 #endif
@@ -260,11 +267,19 @@ private:
   void close_pipe(){ if(pipe_){ _pclose(pipe_); pipe_=nullptr; } }
 #else
   FILE* pipe_ = nullptr;
+  struct sigaction prev_sigpipe_{};
+  bool sigpipe_saved_ = false;
   static void setenv_var(const char* k, const char* v) { setenv(k, v, 1); }
   static void setenv_if_absent(const char* k, const char* v) {
     if (!std::getenv(k)) setenv(k, v, 1);
   }
-  void close_pipe(){ if(pipe_){ pclose(pipe_); pipe_=nullptr; } }
+  void close_pipe(){
+    if(pipe_){ pclose(pipe_); pipe_=nullptr; }
+    if (sigpipe_saved_) {
+      sigaction(SIGPIPE, &prev_sigpipe_, nullptr);
+      sigpipe_saved_ = false;
+    }
+  }
 #endif
 
   void cleanup_script(){
@@ -311,6 +326,8 @@ private:
 struct Flatboi {
   std::string input_obj;
   int max_iter = 50;
+  // Relative-energy convergence tolerance; <=0 disables early-stop.
+  double conv_tol = 1e-5;
   igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
   Eigen::MatrixXd V;          // #V x 3
   Eigen::MatrixXi F;          // #F x 3
@@ -482,7 +499,9 @@ struct Flatboi {
 
     std::cout << "PROGRESS 0/" << max_iter << std::endl;
 
+    int iters_run = max_iter;
     for (int it = 0; it < max_iter; ++it) {
+      const double E_prev = energies.back();
       igl::slim_solve(data, 1);
       energies.push_back(data.energy);
       std::cout << "[it " << (it+1) << "] E = " << data.energy << std::endl; // flush
@@ -497,6 +516,19 @@ struct Flatboi {
                   << ", AreaErr=" << area << "\n";
         if (wblog) wblog->log_stretch(l2m,l2med,linf,area, /*step=*/it+1);
       }
+
+      // Relative-energy convergence stop. Skip iter 0 (E_prev is the
+      // pre-solve energy and the first iter usually drops a lot).
+      if (conv_tol > 0.0 && it >= 1 && E_prev > 0.0) {
+        const double rel = (E_prev - data.energy) / E_prev;
+        if (rel >= 0.0 && rel < conv_tol) {
+          std::cout << "Converged: ΔE/E = " << rel
+                    << " < tol=" << conv_tol
+                    << " at iter " << (it+1) << "/" << max_iter << "\n";
+          iters_run = it + 1;
+          break;
+        }
+      }
     }
 
     auto [l2m_f, l2med_f, linf_f, area_f] = stretch_metrics(data.V_o.leftCols<2>());
@@ -504,8 +536,8 @@ struct Flatboi {
               << ", L2(median): " << l2med_f
               << ", Linf: " << linf_f
               << ", Area Error: " << area_f << "\n";
-    if (wblog && (max_iter % 20) != 0) {
-      wblog->log_stretch(l2m_f, l2med_f, linf_f, area_f, /*step=*/max_iter);
+    if (wblog && (iters_run % 20) != 0) {
+      wblog->log_stretch(l2m_f, l2med_f, linf_f, area_f, /*step=*/iters_run);
     }
 
     return { data.V_o.leftCols<2>(), energies };
@@ -862,29 +894,44 @@ static void save_energies(const fs::path& input, const std::vector<double>& E) {
 // main
 // ------------------------------
 int main(int argc, char** argv) {
-  if (argc < 3 || argc > 4) {
-    std::cerr << "Usage: " << argv[0] << " <mesh.obj> <iters> [energy]\n"
-              << "  energy (optional): symmetric_dirichlet (default) or conformal\n";
-    return 1;
+  std::string obj_path;
+  int iters = 50;
+  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
+  std::string energy_label = "symmetric_dirichlet";
+  // Default 0 (disabled) keeps reproducible iteration counts for VC3D and
+  // script callers that pass only <obj> <iters>. Pass --tol=1e-5 to opt in.
+  double conv_tol = 0.0;
+
+  auto print_usage = [&]() {
+    std::cerr << "Usage: " << argv[0] << " <mesh.obj> [iters=50] [energy] [--tol=<x>]\n"
+              << "  energy (optional): symmetric_dirichlet (default) or conformal\n"
+              << "  --tol=<x>         relative-energy early-stop threshold (0 disables, default)\n";
+  };
+
+  std::vector<std::string> positional;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a.rfind("--tol=", 0) == 0) {
+      conv_tol = std::atof(a.c_str() + 6);
+    } else if (a == "--help" || a == "-h") {
+      print_usage();
+      return 0;
+    } else {
+      positional.push_back(std::move(a));
+    }
   }
 
-  const std::string obj_path = argv[1];
-  const int iters = std::atoi(argv[2]);
+  if (positional.empty() || positional.size() > 3) { print_usage(); return 1; }
+  obj_path = positional[0];
+  if (positional.size() >= 2) iters = std::atoi(positional[1].c_str());
   if (iters <= 0) { std::cerr << "iters must be > 0\n"; return 1; }
   if (!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
   if (fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
 
-  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
-  std::string energy_label = "symmetric_dirichlet";
-
-  if (argc == 4) {
-    std::string e = argv[3];
-    std::string e_lower = e;
-    std::transform(
-      e_lower.begin(), e_lower.end(), e_lower.begin(),
-      [](unsigned char c){ return static_cast<char>(std::tolower(c)); }
-    );
-
+  if (positional.size() == 3) {
+    std::string e_lower = positional[2];
+    std::transform(e_lower.begin(), e_lower.end(), e_lower.begin(),
+                   [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
     if (e_lower == "symmetric_dirichlet" || e_lower == "symmetric-dirichlet" || e_lower == "sd") {
       energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
       energy_label = "symmetric_dirichlet";
@@ -892,19 +939,22 @@ int main(int argc, char** argv) {
       energy = igl::MappingEnergyType::CONFORMAL;
       energy_label = "conformal";
     } else {
-      std::cerr << "Unknown energy type '" << e
+      std::cerr << "Unknown energy type '" << positional[2]
                 << "'. Supported: symmetric_dirichlet, conformal\n";
       return 1;
     }
   }
 
-  std::cout << "Using SLIM energy: " << energy_label << "\n";
+  std::cout << "Using SLIM energy: " << energy_label
+            << "  (max_iter=" << iters
+            << ", tol=" << conv_tol << ")\n";
 
   std::ios::sync_with_stdio(false);
   std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
-  
+
   try {
     Flatboi fb(obj_path, iters, energy);
+    fb.conv_tol = conv_tol;
 
     WBLogger wblog(obj_path, iters); // optional; becomes no-op if unavailable
 

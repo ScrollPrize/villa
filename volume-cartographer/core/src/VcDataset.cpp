@@ -22,6 +22,16 @@
 
 namespace vc {
 
+// Test-only entry point. Exposes the exact Blosc1 compress call that
+// VcDataset writes to a chunk so test_blosc1_compat can assert wire
+// compatibility against the production code path rather than a hand-copied
+// mirror. Defined at the end of this TU below the anonymous namespace.
+namespace testing {
+std::vector<std::byte> bloscCompressForTest(
+    const void* src, std::size_t src_bytes,
+    const char* compname, int clevel, int shuffle, int typesize);
+}  // namespace testing
+
 // ============================================================================
 // Compressor configuration (parsed from .zarray JSON)
 // ============================================================================
@@ -48,10 +58,14 @@ constexpr int kCompressionThreads = 1;
 
 void ensureBloscInitialized()
 {
+    // blosc_init() spins up an internal thread pool. We deliberately do
+    // *not* register blosc_destroy() via std::atexit: any static-lifetime
+    // singleton that calls into bloscCompress / bloscDecompress from its
+    // destructor would otherwise run after blosc_destroy() and crash.
+    // The thread pool is process-lifetime; the OS reclaims it on exit.
     static std::once_flag once;
     std::call_once(once, []() {
         blosc_init();
-        std::atexit([]() { blosc_destroy(); });
     });
 }
 
@@ -97,13 +111,9 @@ std::vector<std::byte> bloscCompress(std::span<const std::byte> input,
 void bloscDecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
     ensureBloscInitialized();
-    const int rc = blosc_decompress_ctx(input.data(), output.data(), output.size(),
-                                        /*nthreads=*/1);
+    const int rc = blosc_decompress_ctx(input.data(), output.data(),
+                                        output.size(), /*nthreads=*/1);
     if (rc < 0) {
-        if (input.size() == output.size()) {
-            std::memcpy(output.data(), input.data(), output.size());
-            return;
-        }
         throw std::runtime_error("blosc_decompress_ctx failed with code " + std::to_string(rc));
     }
 }
@@ -603,13 +613,8 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
         case CompressorId::Blosc: {
             ensureBloscInitialized();
-            int ret = blosc_decompress_ctx(compressed.data(), output, outBytes,
-                                           /*nthreads=*/1);
+            int ret = blosc_decompress_ctx(compressed.data(), output, outBytes, /*nthreads=*/1);
             if (ret < 0) {
-                if (compressed.size() == outBytes) {
-                    std::memcpy(output, compressed.data(), outBytes);
-                    break;
-                }
                 throw std::runtime_error("blosc_decompress_ctx failed with code " +
                                           std::to_string(ret));
             }
@@ -1038,5 +1043,23 @@ std::unique_ptr<VcDataset> createZarrDataset(
 
     return std::make_unique<VcDataset>(dsPath);
 }
+
+namespace testing {
+std::vector<std::byte> bloscCompressForTest(
+    const void* src, std::size_t src_bytes,
+    const char* compname, int clevel, int shuffle, int typesize)
+{
+    CompressorConfig cfg;
+    cfg.id = CompressorId::Blosc;
+    cfg.blosc_cname = compname;
+    cfg.blosc_clevel = clevel;
+    cfg.blosc_shuffle = shuffle;
+    cfg.blosc_typesize = typesize;
+    cfg.blosc_blocksize = 0;
+    return bloscCompress(
+        std::span<const std::byte>(static_cast<const std::byte*>(src), src_bytes),
+        cfg);
+}
+}  // namespace testing
 
 }  // namespace vc
