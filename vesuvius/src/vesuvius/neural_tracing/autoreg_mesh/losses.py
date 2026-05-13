@@ -448,16 +448,22 @@ def _iter_geometry_examples(pred_xyz_sequence: Tensor, batch: dict):
             continue
         grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
         pred_grid = _sequence_to_grid_torch(pred_xyz_sequence[batch_idx, :target_len], grid_shape=grid_shape, direction=direction)
-        target_grid = _as_grid_tensor(
+        # Both `target_grid_local` and `conditioning_grid_local` carry NaN at
+        # invalid mesh cells. Downstream losses (seam, triangle barrier,
+        # geometry metric) form `full_pred = merge(cond_grid, pred_grid)`,
+        # so cond NaNs leak into the pred-side gradient. Sanitize at the
+        # iterator so every consumer sees finite values. target_valid_grid
+        # remains the source of truth for "this cell counts".
+        target_grid = _nan_safe_target(_as_grid_tensor(
             batch["target_grid_local"][batch_idx],
             device=pred_grid.device,
             dtype=pred_grid.dtype,
-        )
-        cond_grid = _as_grid_tensor(
+        ))
+        cond_grid = _nan_safe_target(_as_grid_tensor(
             batch["conditioning_grid_local"][batch_idx],
             device=pred_grid.device,
             dtype=pred_grid.dtype,
-        )
+        ))
         target_valid_grid = _sequence_to_grid_torch(
             batch["target_valid_mask"][batch_idx, :target_len],
             grid_shape=grid_shape,
