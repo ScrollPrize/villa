@@ -2,8 +2,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Mapping
 
+import numpy as np
 import torch
 
+from vesuvius.neural_tracing.datasets.common import create_band_mask
 from vesuvius.neural_tracing.datasets.growth_direction import make_growth_direction_tensor
 
 
@@ -62,6 +64,142 @@ def _distance_transform_distances_cupy(surface_mask: torch.Tensor):
     with _cupy_device(surface_bool):
         distances_cp = _cupyx_edt(surface_bool, return_distances=True, return_indices=False)
         return cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
+
+
+def _dilate_binary_mask_cupy(surface_mask: torch.Tensor, radius_voxels: float):
+    radius = float(radius_voxels)
+    surface_bool = (surface_mask > 0.5).contiguous()
+    if radius <= 0.0 or not bool(surface_bool.any().item()):
+        return surface_bool
+    with _cupy_device(surface_bool):
+        distances_cp = _cupyx_edt(surface_bool, return_distances=True, return_indices=False)
+        import cupy as cp
+
+        return _cupy_to_torch(cp.ascontiguousarray(distances_cp <= radius)).to(dtype=torch.bool)
+
+
+def _dense_displacement_from_mask_cupy(surface_mask: torch.Tensor):
+    import cupy as cp
+
+    surface_bool = (surface_mask > 0.5).contiguous()
+    if surface_bool.ndim != 3:
+        raise ValueError(f"surface mask must be 3D, got shape {tuple(surface_bool.shape)}")
+    if not bool(surface_bool.any().item()):
+        return None, None
+
+    with _cupy_device(surface_bool):
+        distances_cp, nearest_idx_cp = _cupyx_edt(
+            surface_bool,
+            return_distances=True,
+            return_indices=True,
+        )
+        if isinstance(nearest_idx_cp, (tuple, list)):
+            nearest_idx_cp = cp.stack(nearest_idx_cp, axis=0)
+        distances_cp = cp.ascontiguousarray(distances_cp.astype(cp.float32, copy=False))
+        disp_cp = cp.ascontiguousarray(nearest_idx_cp.astype(cp.float32, copy=False))
+        d, h, w = surface_bool.shape
+        disp_cp[0] -= cp.arange(d, dtype=cp.float32)[:, None, None]
+        disp_cp[1] -= cp.arange(h, dtype=cp.float32)[None, :, None]
+        disp_cp[2] -= cp.arange(w, dtype=cp.float32)[None, None, :]
+        return _cupy_to_torch(disp_cp), _cupy_to_torch(distances_cp)
+
+
+def _swap_triplet_torch(dense_gt: torch.Tensor, dir_priors: torch.Tensor | None):
+    dense_gt = torch.cat([dense_gt[3:6], dense_gt[0:3]], dim=0)
+    if dir_priors is not None:
+        dir_priors = torch.cat([dir_priors[3:6], dir_priors[0:3]], dim=0)
+    return dense_gt, dir_priors
+
+
+def _align_triplet_to_priors_torch(
+    dense_gt: torch.Tensor,
+    dir_priors: torch.Tensor | None,
+    cond_mask: torch.Tensor,
+):
+    order = torch.tensor([0, 1], device=dense_gt.device, dtype=torch.long)
+    if dir_priors is None:
+        return dense_gt, dir_priors, order
+
+    mask = cond_mask > 0.5
+    if not bool(mask.any().item()):
+        return dense_gt, dir_priors, order
+
+    prior_vecs = dir_priors[0:3, mask].transpose(0, 1)
+    finite = torch.isfinite(prior_vecs).all(dim=1)
+    prior_vecs = prior_vecs[finite]
+    if prior_vecs.numel() == 0:
+        return dense_gt, dir_priors, order
+    prior_norm = prior_vecs.norm(dim=1)
+    prior_vecs = prior_vecs[prior_norm > 1e-6]
+    if prior_vecs.numel() == 0:
+        return dense_gt, dir_priors, order
+    unit_prior = prior_vecs / prior_vecs.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    normal = unit_prior.mean(dim=0)
+    normal_norm = normal.norm()
+    if not bool(torch.isfinite(normal_norm).item()) or float(normal_norm.item()) <= 1e-6:
+        return dense_gt, dir_priors, order
+    normal = normal / normal_norm.clamp(min=1e-6)
+
+    def _median_signed_projection(field: torch.Tensor):
+        vecs = field[:, mask].transpose(0, 1)
+        finite_vecs = torch.isfinite(vecs).all(dim=1)
+        vecs = vecs[finite_vecs]
+        if vecs.numel() == 0:
+            return None
+        vecs = vecs[vecs.norm(dim=1) > 1e-6]
+        if vecs.numel() == 0:
+            return None
+        return torch.median(vecs @ normal)
+
+    s0 = _median_signed_projection(dense_gt[0:3])
+    s1 = _median_signed_projection(dense_gt[3:6])
+    if s0 is None or s1 is None:
+        return dense_gt, dir_priors, order
+    if bool((s1 > s0).item()):
+        dense_gt, dir_priors = _swap_triplet_torch(dense_gt, dir_priors)
+        order = torch.tensor([1, 0], device=dense_gt.device, dtype=torch.long)
+    return dense_gt, dir_priors, order
+
+
+def _copy_neighbor_dense_weight(
+    cond_mask: torch.Tensor,
+    front_dist: torch.Tensor,
+    behind_dist: torch.Tensor,
+    front_disp: torch.Tensor,
+    behind_disp: torch.Tensor,
+    config: Mapping[str, object],
+):
+    weight_mode = str(config["triplet_dense_weight_mode"]).lower()
+    if weight_mode == "all":
+        return torch.ones((1, *cond_mask.shape), device=cond_mask.device, dtype=torch.float32)
+
+    if weight_mode not in {"band", "all_band_boost"}:
+        raise ValueError(
+            "triplet_dense_weight_mode must be one of {'all', 'band', 'all_band_boost'}, "
+            f"got {weight_mode!r}"
+        )
+
+    dense_band = create_band_mask(
+        cond_bin_full=(cond_mask > 0.5).detach().cpu().numpy(),
+        d_front_work=front_dist.detach().cpu().numpy(),
+        d_behind_work=behind_dist.detach().cpu().numpy(),
+        front_disp_work=front_disp.detach().cpu().numpy(),
+        behind_disp_work=behind_disp.detach().cpu().numpy(),
+        band_pct=min(100.0, max(1.0, float(config["triplet_band_distance_percentile"]))),
+        band_padding=max(0.0, float(config["triplet_band_padding_voxels"])),
+        cc_structure_26=np.ones((3, 3, 3), dtype=np.uint8),
+        closing_structure_3=np.ones((3, 3, 3), dtype=bool),
+    )
+    if dense_band is None:
+        if weight_mode == "all_band_boost":
+            return torch.ones((1, *cond_mask.shape), device=cond_mask.device, dtype=torch.float32)
+        return torch.zeros((1, *cond_mask.shape), device=cond_mask.device, dtype=torch.float32)
+
+    dense_band_t = torch.as_tensor(dense_band, device=cond_mask.device, dtype=torch.float32).unsqueeze(0)
+    if weight_mode == "all_band_boost":
+        band_boost_weight = float(config.get("triplet_band_boost_weight", 2.0))
+        return torch.ones_like(dense_band_t) + (band_boost_weight - 1.0) * dense_band_t
+    return dense_band_t
 
 
 @lru_cache(maxsize=None)
@@ -421,41 +559,26 @@ class RowColTargets:
 
 @dataclass(frozen=True)
 class CopyNeighborTargets:
-    """Model inputs and supervised targets for one copy-neighbor batch."""
+    """Model inputs and dense displacement targets for one copy-neighbor batch."""
 
     inputs: torch.Tensor
-    target_seg: torch.Tensor | None
-    domain: torch.Tensor | None
-    velocity_dir: torch.Tensor
-    velocity_loss_weight: torch.Tensor
-    progress_phi: torch.Tensor
-    progress_phi_weight: torch.Tensor
-    surface_attract: torch.Tensor
-    surface_attract_weight: torch.Tensor
-    stop: torch.Tensor
-    stop_weight: torch.Tensor
-    target_edt: torch.Tensor
-    endpoint_seed_points: torch.Tensor
-    endpoint_seed_mask: torch.Tensor
-    endpoint_step_count: torch.Tensor | None = None
+    dense_gt_displacement: torch.Tensor
+    dense_loss_weight: torch.Tensor
+    cond: torch.Tensor
+    cond_gt: torch.Tensor | None = None
+    behind_seg: torch.Tensor | None = None
+    front_seg: torch.Tensor | None = None
+    dir_priors: torch.Tensor | None = None
+    triplet_channel_order: torch.Tensor | None = None
 
     @classmethod
     def from_batch(cls, batch: Mapping[str, object], config: Mapping[str, object]) -> "CopyNeighborTargets":
         required_keys = (
             "vol",
             "cond",
-            "side_hint",
-            "velocity_dir",
-            "velocity_loss_weight",
-            "progress_phi",
-            "progress_phi_weight",
-            "surface_attract",
-            "surface_attract_weight",
-            "stop",
-            "stop_weight",
-            "target_edt",
-            "endpoint_seed_points",
-            "endpoint_seed_mask",
+            "cond_gt",
+            "behind_seg",
+            "front_seg",
         )
         missing = [key for key in required_keys if key not in batch]
         if missing:
@@ -463,29 +586,98 @@ class CopyNeighborTargets:
 
         vol = batch["vol"].unsqueeze(1)
         cond = batch["cond"].unsqueeze(1)
-        side_hint = batch["side_hint"]
-        if side_hint.ndim != 5 or side_hint.shape[1] != 3:
-            raise ValueError(f"side_hint must have shape [B, 3, D, H, W], got {tuple(side_hint.shape)}")
-        inputs = torch.cat([vol, cond, side_hint.to(device=vol.device, dtype=vol.dtype)], dim=1)
+        dir_priors = batch.get("dir_priors", None)
+        if bool(config.get("use_triplet_direction_priors", False)):
+            if dir_priors is None:
+                raise ValueError("use_triplet_direction_priors=True but batch has no dir_priors")
+            if dir_priors.ndim != 5 or dir_priors.shape[1] != 6:
+                raise ValueError(f"dir_priors must have shape [B, 6, D, H, W], got {tuple(dir_priors.shape)}")
 
-        endpoint_step_count = batch.get("endpoint_step_count", None)
-        if endpoint_step_count is not None:
-            endpoint_step_count = endpoint_step_count.to(device=vol.device)
+        dense_gt_displacement, dense_loss_weight, dir_priors, triplet_channel_order = cls._build_dense_targets(
+            batch,
+            config,
+            dir_priors=dir_priors,
+        )
+        input_parts = [vol, cond]
+        if bool(config.get("use_triplet_direction_priors", False)):
+            input_parts.append(dir_priors.to(device=vol.device, dtype=vol.dtype))
+        inputs = torch.cat(input_parts, dim=1)
 
         return cls(
             inputs=inputs,
-            target_seg=batch.get("target_seg", None),
-            domain=batch.get("domain", None),
-            velocity_dir=batch["velocity_dir"],
-            velocity_loss_weight=batch["velocity_loss_weight"],
-            progress_phi=batch["progress_phi"],
-            progress_phi_weight=batch["progress_phi_weight"],
-            surface_attract=batch["surface_attract"],
-            surface_attract_weight=batch["surface_attract_weight"],
-            stop=batch["stop"],
-            stop_weight=batch["stop_weight"],
-            target_edt=batch["target_edt"],
-            endpoint_seed_points=batch["endpoint_seed_points"],
-            endpoint_seed_mask=batch["endpoint_seed_mask"],
-            endpoint_step_count=endpoint_step_count,
+            dense_gt_displacement=dense_gt_displacement,
+            dense_loss_weight=dense_loss_weight,
+            cond=cond,
+            cond_gt=batch.get("cond_gt", None),
+            behind_seg=batch.get("behind_seg", None),
+            front_seg=batch.get("front_seg", None),
+            dir_priors=dir_priors,
+            triplet_channel_order=triplet_channel_order,
         )
+
+    @staticmethod
+    def _build_dense_targets(
+        batch: Mapping[str, object],
+        config: Mapping[str, object],
+        *,
+        dir_priors: torch.Tensor | None,
+    ):
+        dense_targets = []
+        dense_weights = []
+        aligned_priors = [] if dir_priors is not None else None
+        channel_orders = []
+
+        dilation_radius = max(0.0, float(config["triplet_gt_vector_dilation_radius"]))
+        swap_prob = float(config.get("triplet_random_channel_swap_prob", 0.0))
+        swap_enabled = batch.get("triplet_swap_enabled", None)
+
+        for b in range(batch["behind_seg"].shape[0]):
+            behind_mask = _dilate_binary_mask_cupy(batch["behind_seg"][b], dilation_radius)
+            front_mask = _dilate_binary_mask_cupy(batch["front_seg"][b], dilation_radius)
+            behind_disp, behind_dist = _dense_displacement_from_mask_cupy(behind_mask)
+            front_disp, front_dist = _dense_displacement_from_mask_cupy(front_mask)
+            if behind_disp is None or front_disp is None:
+                shape = tuple(int(v) for v in batch["behind_seg"].shape[1:])
+                dense_gt = torch.zeros((6, *shape), device=batch["behind_seg"].device, dtype=torch.float32)
+                dense_weight = torch.zeros((1, *shape), device=batch["behind_seg"].device, dtype=torch.float32)
+            else:
+                dense_gt = torch.cat([behind_disp, front_disp], dim=0).to(dtype=torch.float32)
+                dense_weight = _copy_neighbor_dense_weight(
+                    batch["cond_gt"][b],
+                    front_dist,
+                    behind_dist,
+                    front_disp,
+                    behind_disp,
+                    config,
+                )
+
+            priors_b = dir_priors[b].to(device=dense_gt.device, dtype=dense_gt.dtype) if dir_priors is not None else None
+            dense_gt, priors_b, channel_order = _align_triplet_to_priors_torch(
+                dense_gt,
+                priors_b,
+                batch["cond_gt"][b],
+            )
+
+            if swap_enabled is None:
+                do_swap = False
+            else:
+                do_swap = bool(swap_enabled[b].item())
+            if do_swap and swap_prob > 0.0:
+                if not np.isfinite(swap_prob) or swap_prob < 0.0 or swap_prob > 1.0:
+                    raise ValueError(f"triplet_random_channel_swap_prob must satisfy 0 <= p <= 1, got {swap_prob!r}")
+                if bool((torch.rand((), device=dense_gt.device) < swap_prob).item()):
+                    dense_gt, priors_b = _swap_triplet_torch(dense_gt, priors_b)
+                    channel_order = channel_order.flip(0)
+
+            dense_targets.append(dense_gt)
+            dense_weights.append(dense_weight)
+            if aligned_priors is not None:
+                aligned_priors.append(priors_b)
+            channel_orders.append(channel_order)
+
+        dense_gt_displacement = torch.stack(dense_targets, dim=0)
+        dense_loss_weight = torch.stack(dense_weights, dim=0)
+        if aligned_priors is not None:
+            dir_priors = torch.stack(aligned_priors, dim=0)
+        triplet_channel_order = torch.stack(channel_orders, dim=0)
+        return dense_gt_displacement, dense_loss_weight, dir_priors, triplet_channel_order

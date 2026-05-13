@@ -192,30 +192,17 @@ def _build_indices(dataset_len: int, args: argparse.Namespace, seed: int) -> lis
 
 def _collate_with_padding(batch: list[dict]) -> dict:
     """Mirror trainers.train_rowcol_cond.collate_with_padding without importing trainer deps."""
-    if "side_hint" in batch[0]:
+    if "behind_seg" in batch[0] and "front_seg" in batch[0]:
         result = {
             "vol": torch.stack([b["vol"] for b in batch]),
             "cond": torch.stack([b["cond"] for b in batch]),
-            "side_hint": torch.stack([b["side_hint"] for b in batch]),
-            "target_seg": torch.stack([b["target_seg"] for b in batch]),
-            "domain": torch.stack([b["domain"] for b in batch]),
-            "velocity_dir": torch.stack([b["velocity_dir"] for b in batch]),
-            "velocity_loss_weight": torch.stack([b["velocity_loss_weight"] for b in batch]),
-            "progress_phi": torch.stack([b["progress_phi"] for b in batch]),
-            "progress_phi_weight": torch.stack([b["progress_phi_weight"] for b in batch]),
-            "surface_attract": torch.stack([b["surface_attract"] for b in batch]),
-            "surface_attract_weight": torch.stack([b["surface_attract_weight"] for b in batch]),
-            "stop": torch.stack([b["stop"] for b in batch]),
-            "stop_weight": torch.stack([b["stop_weight"] for b in batch]),
-            "target_edt": torch.stack([b["target_edt"] for b in batch]),
-            "endpoint_seed_points": torch.stack([b["endpoint_seed_points"] for b in batch]),
-            "endpoint_seed_mask": torch.stack([b["endpoint_seed_mask"] for b in batch]),
+            "cond_gt": torch.stack([b["cond_gt"] for b in batch]),
+            "behind_seg": torch.stack([b["behind_seg"] for b in batch]),
+            "front_seg": torch.stack([b["front_seg"] for b in batch]),
         }
-        if "endpoint_step_count" in batch[0]:
-            result["endpoint_step_count"] = torch.as_tensor(
-                [int(b["endpoint_step_count"]) for b in batch],
-                dtype=torch.long,
-            )
+        for key in ("dir_priors", "triplet_swap_enabled"):
+            if key in batch[0]:
+                result[key] = torch.stack([b[key] for b in batch])
         return result
 
     return {

@@ -23,7 +23,12 @@ from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     resolve_rowcol_cond_scheduler_config,
 )
 from vesuvius.neural_tracing.datasets.targets import CopyNeighborTargets, RowColTargets
-from vesuvius.neural_tracing.loss.trace_losses import compute_copy_neighbor_losses, compute_trace_losses
+from vesuvius.neural_tracing.loss.displacement_losses import (
+    dense_displacement_loss,
+    smoothness_loss,
+    triplet_min_displacement_loss,
+)
+from vesuvius.neural_tracing.loss.trace_losses import compute_trace_losses
 from vesuvius.models.training.optimizers import create_optimizer
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from vesuvius.neural_tracing.nets.models import (
@@ -33,9 +38,9 @@ from vesuvius.neural_tracing.nets.models import (
     make_model,
     strip_state,
 )
-from vesuvius.neural_tracing.trainers.loss_config import CopyNeighborLossConfig, TraceLossConfig
+from vesuvius.neural_tracing.trainers.loss_config import TraceLossConfig
 from vesuvius.neural_tracing.trainers.rowcol_cond_visualization import (
-    make_copy_neighbor_visualization,
+    make_dense_visualization,
     make_trace_visualization,
 )
 
@@ -48,31 +53,18 @@ def seed_worker(worker_id):
 
 
 def collate_with_padding(batch):
-    """Collate batch tensors for the active trace-ODE training path."""
-    if "side_hint" in batch[0]:
+    """Collate batch tensors for row/col trace or copy-neighbor displacement training."""
+    if "behind_seg" in batch[0] and "front_seg" in batch[0]:
         result = {
             'vol': torch.stack([b['vol'] for b in batch]),
             'cond': torch.stack([b['cond'] for b in batch]),
-            'side_hint': torch.stack([b['side_hint'] for b in batch]),
-            'target_seg': torch.stack([b['target_seg'] for b in batch]),
-            'domain': torch.stack([b['domain'] for b in batch]),
-            'velocity_dir': torch.stack([b['velocity_dir'] for b in batch]),
-            'velocity_loss_weight': torch.stack([b['velocity_loss_weight'] for b in batch]),
-            'progress_phi': torch.stack([b['progress_phi'] for b in batch]),
-            'progress_phi_weight': torch.stack([b['progress_phi_weight'] for b in batch]),
-            'surface_attract': torch.stack([b['surface_attract'] for b in batch]),
-            'surface_attract_weight': torch.stack([b['surface_attract_weight'] for b in batch]),
-            'stop': torch.stack([b['stop'] for b in batch]),
-            'stop_weight': torch.stack([b['stop_weight'] for b in batch]),
-            'target_edt': torch.stack([b['target_edt'] for b in batch]),
-            'endpoint_seed_points': torch.stack([b['endpoint_seed_points'] for b in batch]),
-            'endpoint_seed_mask': torch.stack([b['endpoint_seed_mask'] for b in batch]),
+            'cond_gt': torch.stack([b['cond_gt'] for b in batch]),
+            'behind_seg': torch.stack([b['behind_seg'] for b in batch]),
+            'front_seg': torch.stack([b['front_seg'] for b in batch]),
         }
-        if "endpoint_step_count" in batch[0]:
-            result["endpoint_step_count"] = torch.as_tensor(
-                [int(b["endpoint_step_count"]) for b in batch],
-                dtype=torch.long,
-            )
+        for key in ("dir_priors", "triplet_swap_enabled"):
+            if key in batch[0]:
+                result[key] = torch.stack([b[key] for b in batch])
         return result
 
     # Source masks are used by on-device EDT target generation. Keeping EDT
@@ -156,15 +148,42 @@ def train(config_path):
 
     training_mode = str(config.get("training_mode", "rowcol_hidden"))
     copy_neighbor_mode = training_mode == "copy_neighbors"
-    loss_config = (
-        CopyNeighborLossConfig.from_config(config)
-        if copy_neighbor_mode
-        else TraceLossConfig.from_config(config)
-    )
+    loss_config = None if copy_neighbor_mode else TraceLossConfig.from_config(config)
+    disp_loss_type = str(config.get("displacement_loss_type", "vector_huber_per_branch"))
+    disp_huber_beta = float(config.get("displacement_huber_beta", 3.0))
+    lambda_smooth = float(config.get("lambda_smooth", 0.0))
+    triplet_min_disp_vox = float(config.get("triplet_min_disp_vox", 1.0))
+    lambda_triplet_min_disp = float(config.get("lambda_triplet_min_disp", 0.0))
 
     def compute_losses(output, prepared, *, random_trace_sample):
         if copy_neighbor_mode:
-            return compute_copy_neighbor_losses(output, prepared, loss_config)
+            if "displacement" not in output:
+                raise ValueError("copy_neighbors requires model output key 'displacement'")
+            disp_pred = output["displacement"]
+            disp_loss = dense_displacement_loss(
+                disp_pred,
+                prepared.dense_gt_displacement,
+                sample_weights=prepared.dense_loss_weight,
+                loss_type=disp_loss_type,
+                beta=disp_huber_beta,
+            )
+            total = disp_loss
+            metrics = {"displacement_loss": disp_loss}
+            if lambda_smooth > 0.0:
+                smooth = smoothness_loss(disp_pred)
+                weighted_smooth = float(lambda_smooth) * smooth
+                total = total + weighted_smooth
+                metrics["smooth_loss"] = weighted_smooth
+            if lambda_triplet_min_disp > 0.0:
+                min_disp = triplet_min_displacement_loss(
+                    disp_pred,
+                    prepared.cond,
+                    min_magnitude=triplet_min_disp_vox,
+                )
+                weighted_min_disp = float(lambda_triplet_min_disp) * min_disp
+                total = total + weighted_min_disp
+                metrics["triplet_min_disp_loss"] = weighted_min_disp
+            return total, metrics
         return compute_trace_losses(
             output,
             prepared,
@@ -447,24 +466,10 @@ def train(config_path):
                         if copy_neighbor_mode:
                             first_val_vis = {
                                 'inputs': val_prepared.inputs,
-                                'target_seg': val_prepared.target_seg,
-                                'domain': val_prepared.domain,
-                                'velocity_dir_pred': val_output.get('velocity_dir'),
-                                'velocity_dir_target': val_prepared.velocity_dir,
-                                'velocity_loss_weight': val_prepared.velocity_loss_weight,
-                                'progress_phi_pred': val_output.get('progress_phi'),
-                                'progress_phi_target': val_prepared.progress_phi,
-                                'progress_phi_weight': val_prepared.progress_phi_weight,
-                                'stop_pred': val_output.get('stop'),
-                                'stop_target': val_prepared.stop,
-                                'stop_weight': val_prepared.stop_weight,
-                                'surface_attract_pred': val_output.get('surface_attract'),
-                                'surface_attract_target': val_prepared.surface_attract,
-                                'surface_attract_weight': val_prepared.surface_attract_weight,
-                                'target_edt': val_prepared.target_edt,
-                                'endpoint_seed_points': val_prepared.endpoint_seed_points,
-                                'endpoint_seed_mask': val_prepared.endpoint_seed_mask,
-                                'endpoint_step_count': val_prepared.endpoint_step_count,
+                                'displacement_pred': val_output.get('displacement'),
+                                'dense_gt_displacement': val_prepared.dense_gt_displacement,
+                                'dense_loss_weight': val_prepared.dense_loss_weight,
+                                'triplet_channel_order': val_prepared.triplet_channel_order,
                             }
                         else:
                             first_val_vis = {
@@ -492,27 +497,27 @@ def train(config_path):
                     if copy_neighbor_mode:
                         train_vis = {
                             'inputs': inputs,
-                            'target_seg': prepared.target_seg,
-                            'domain': prepared.domain,
-                            'velocity_dir_pred': output.get('velocity_dir'),
-                            'velocity_dir_target': prepared.velocity_dir,
-                            'velocity_loss_weight': prepared.velocity_loss_weight,
-                            'progress_phi_pred': output.get('progress_phi'),
-                            'progress_phi_target': prepared.progress_phi,
-                            'progress_phi_weight': prepared.progress_phi_weight,
-                            'stop_pred': output.get('stop'),
-                            'stop_target': prepared.stop,
-                            'stop_weight': prepared.stop_weight,
-                            'surface_attract_pred': output.get('surface_attract'),
-                            'surface_attract_target': prepared.surface_attract,
-                            'surface_attract_weight': prepared.surface_attract_weight,
-                            'target_edt': prepared.target_edt,
-                            'endpoint_seed_points': prepared.endpoint_seed_points,
-                            'endpoint_seed_mask': prepared.endpoint_seed_mask,
-                            'endpoint_step_count': prepared.endpoint_step_count,
+                            'displacement_pred': output.get('displacement'),
+                            'dense_gt_displacement': prepared.dense_gt_displacement,
+                            'dense_loss_weight': prepared.dense_loss_weight,
+                            'triplet_channel_order': prepared.triplet_channel_order,
                         }
-                        make_copy_neighbor_visualization(train_vis, train_img_path)
-                        make_copy_neighbor_visualization(first_val_vis, val_img_path)
+                        make_dense_visualization(
+                            train_vis['inputs'],
+                            train_vis['displacement_pred'],
+                            train_vis['dense_gt_displacement'],
+                            train_vis['dense_loss_weight'],
+                            triplet_channel_order=train_vis['triplet_channel_order'],
+                            save_path=train_img_path,
+                        )
+                        make_dense_visualization(
+                            first_val_vis['inputs'],
+                            first_val_vis['displacement_pred'],
+                            first_val_vis['dense_gt_displacement'],
+                            first_val_vis['dense_loss_weight'],
+                            triplet_channel_order=first_val_vis['triplet_channel_order'],
+                            save_path=val_img_path,
+                        )
                     else:
                         train_vis = {
                             'inputs': inputs,

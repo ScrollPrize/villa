@@ -1,8 +1,10 @@
 import vesuvius.tifxyz as tifxyz
 import hashlib
+import os
 import numpy as np
 import torch
 import time
+import random
 from torch.utils.data import Dataset
 from pathlib import Path
 from tqdm import tqdm
@@ -23,13 +25,12 @@ from vesuvius.neural_tracing.datasets.common import (
 )
 from vesuvius.neural_tracing.datasets.chunk_finding import find_training_chunks
 from vesuvius.neural_tracing.datasets.direction_helpers import (
+    build_triplet_direction_priors_from_conditioning_surface,
     build_split_surface_masks_and_trace_targets,
-)
-from vesuvius.neural_tracing.datasets.copy_neighbor_targets import (
-    build_copy_neighbor_targets,
 )
 from vesuvius.neural_tracing.datasets.augmentation import (
     augment_split_payload,
+    augment_triplet_payload,
 )
 from vesuvius.neural_tracing.datasets.neighbor_resampling import (
     choose_replacement_index,
@@ -87,6 +88,8 @@ class EdtSegDataset(Dataset):
             config=self.config,
             apply_perturbation=bool(self.apply_perturbation),
         )
+        self.use_triplet_direction_priors = bool(config['use_triplet_direction_priors'])
+        self.triplet_direction_prior_mask = str(config['triplet_direction_prior_mask']).lower()
 
         if patch_metadata is None:
             patches = []
@@ -205,9 +208,13 @@ class EdtSegDataset(Dataset):
             self.sample_index = self._build_sample_index()
             self._neighbor_lookup = self._build_neighbor_lookup()
             if str(self.config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
-                self.sample_index = self._build_copy_neighbor_pair_records(self.sample_index)
+                self.sample_index = [
+                    (patch_idx, wrap_idx)
+                    for patch_idx, wrap_idx in self.sample_index
+                    if self._has_lower_and_upper_neighbors(patch_idx, wrap_idx)
+                ]
                 if not self.sample_index:
-                    raise ValueError("No copy_neighbors source-target pair records remain after filtering.")
+                    raise ValueError("No copy_neighbors source wraps have adjacent neighbors on both sides.")
             else:
                 self.sample_index = [
                     (patch_idx, wrap_idx)
@@ -418,14 +425,24 @@ class EdtSegDataset(Dataset):
             return None
         return cond_seg
 
-    def create_copy_neighbor_masks(self, record: dict):
-        patch_idx = int(record["patch_idx"])
+    def create_copy_neighbor_masks(self, patch_idx: int, source_wrap_idx: int):
+        patch_idx = int(patch_idx)
         patch = self.patches[patch_idx]
-        source_wrap_idx = int(record["source_wrap_idx"])
-        target_wrap_idx = int(record["target_wrap_idx"])
+        source_wrap_idx = int(source_wrap_idx)
+        neighbor_meta = self._neighbor_lookup.get((patch_idx, source_wrap_idx))
+        if neighbor_meta is None:
+            return None
+        lower = tuple(int(v) for v in neighbor_meta.get("lower_neighbor_wrap_indices", ()))
+        upper = tuple(int(v) for v in neighbor_meta.get("upper_neighbor_wrap_indices", ()))
+        if not lower or not upper:
+            return None
+        lower_wrap_idx = int(lower[0])
+        upper_wrap_idx = int(upper[0])
+
         source_world = self._extract_wrap_world_surface(patch, patch.wraps[source_wrap_idx])
-        target_world = self._extract_wrap_world_surface(patch, patch.wraps[target_wrap_idx])
-        if source_world is None or target_world is None:
+        lower_world = self._extract_wrap_world_surface(patch, patch.wraps[lower_wrap_idx])
+        upper_world = self._extract_wrap_world_surface(patch, patch.wraps[upper_wrap_idx])
+        if source_world is None or lower_world is None or upper_world is None:
             return None
 
         z_min, _, y_min, _, x_min, _ = patch.world_bbox
@@ -433,7 +450,8 @@ class EdtSegDataset(Dataset):
         max_corner = min_corner + np.asarray(self.crop_size, dtype=np.int64)
 
         source_local = (source_world - min_corner).astype(np.float32, copy=False)
-        target_local = (target_world - min_corner).astype(np.float32, copy=False)
+        lower_local = (lower_world - min_corner).astype(np.float32, copy=False)
+        upper_local = (upper_world - min_corner).astype(np.float32, copy=False)
 
         vol_crop = _read_volume_crop_from_patch(
             patch,
@@ -441,13 +459,61 @@ class EdtSegDataset(Dataset):
             min_corner,
             max_corner,
         )
+        cond_gt = voxelize_surface_grid(source_local, self.crop_size).astype(np.float32, copy=False)
+        behind_seg = voxelize_surface_grid(lower_local, self.crop_size).astype(np.float32, copy=False)
+        front_seg = voxelize_surface_grid(upper_local, self.crop_size).astype(np.float32, copy=False)
+        if not cond_gt.any() or not behind_seg.any() or not front_seg.any():
+            return None
         return {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
+            "cond_gt": torch.from_numpy(cond_gt).to(torch.float32),
+            "behind_seg": torch.from_numpy(behind_seg).to(torch.float32),
+            "front_seg": torch.from_numpy(front_seg).to(torch.float32),
             "source_surface_local": source_local,
-            "target_surface_local": target_local,
+            "lower_surface_local": lower_local,
+            "upper_surface_local": upper_local,
             "min_corner": min_corner,
-            "record": record,
+            "lower_wrap_idx": lower_wrap_idx,
+            "upper_wrap_idx": upper_wrap_idx,
         }
+
+    def create_neighbor_targets(
+        self,
+        *,
+        cond_seg_gt: torch.Tensor,
+        behind_seg: torch.Tensor,
+        front_seg: torch.Tensor,
+        cond_surface_local: torch.Tensor | None = None,
+    ):
+        crop_size = self.crop_size
+        cond_np = cond_seg_gt.detach().cpu().numpy()
+        behind_np = behind_seg.detach().cpu().numpy()
+        front_np = front_seg.detach().cpu().numpy()
+
+        cond_bin_full = cond_np > 0.5
+        behind_bin_full = behind_np > 0.5
+        front_bin_full = front_np > 0.5
+        if not behind_bin_full.any() or not front_bin_full.any():
+            return None
+
+        dir_priors_np = None
+        if self.use_triplet_direction_priors:
+            if cond_surface_local is None:
+                return None
+            cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+            dir_priors_np = build_triplet_direction_priors_from_conditioning_surface(
+                crop_size,
+                cond_bin_full,
+                cond_surface_np,
+                mask_mode=self.triplet_direction_prior_mask,
+            )
+            if dir_priors_np is None:
+                return None
+
+        result = {}
+        if dir_priors_np is not None:
+            result["dir_priors"] = torch.from_numpy(dir_priors_np).to(torch.float32)
+        return result
 
     def _restore_cond_surface_from_augmented(
         self,
@@ -604,107 +670,76 @@ class EdtSegDataset(Dataset):
         return self.__getitem__(new_idx, _attempted_indices=attempted)
 
     def _getitem_copy_neighbors(self, idx: int, _attempted_indices):
-        record = self.sample_index[idx]
-        patch_idx = int(record["patch_idx"])
-        source_wrap_idx = int(record["source_wrap_idx"])
-        target_wrap_idx = int(record["target_wrap_idx"])
-        mask_bundle = self.create_copy_neighbor_masks(record)
+        patch_idx, source_wrap_idx = self.sample_index[idx]
+        patch_idx = int(patch_idx)
+        source_wrap_idx = int(source_wrap_idx)
+        mask_bundle = self.create_copy_neighbor_masks(patch_idx, source_wrap_idx)
         if mask_bundle is None:
             return self._resample_item(
                 idx,
-                "copy-neighbor mask bundle missing",
+                "copy-neighbor triplet mask bundle missing",
                 patch_idx=patch_idx,
                 wrap_idx=source_wrap_idx,
                 attempted_indices=_attempted_indices,
             )
 
         vol_crop = mask_bundle["vol"]
+        cond_seg_gt = mask_bundle["cond_gt"]
+        behind_seg = mask_bundle["behind_seg"]
+        front_seg = mask_bundle["front_seg"]
         source_surface_source = torch.from_numpy(mask_bundle["source_surface_local"]).to(torch.float32)
-        target_surface_source = torch.from_numpy(mask_bundle["target_surface_local"]).to(torch.float32)
         source_surface_local, source_surface_shape, source_keypoints, valid_source = (
             _prepare_cond_surface_keypoints(source_surface_source)
         )
-        target_surface_local, target_surface_shape, target_keypoints, valid_target = (
-            _prepare_cond_surface_keypoints(target_surface_source)
-        )
-        if not valid_source or not valid_target:
+        if not valid_source:
             return self._resample_item(
                 idx,
-                "copy-neighbor source/target surface invalid",
+                "copy-neighbor source surface invalid",
                 patch_idx=patch_idx,
                 wrap_idx=source_wrap_idx,
                 attempted_indices=_attempted_indices,
             )
 
-        augmented = augment_split_payload(
+        augmented = augment_triplet_payload(
             augmentations=self._augmentations,
             crop_size=self.crop_size,
             vol_crop=vol_crop,
-            masked_seg=None,
-            cond_seg_gt=None,
+            cond_seg_gt=cond_seg_gt,
+            behind_seg=behind_seg,
+            front_seg=front_seg,
             cond_surface_local=source_surface_local,
             cond_surface_keypoints=source_keypoints,
             cond_surface_shape=source_surface_shape,
             restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
-            masked_surface_local=target_surface_local,
-            masked_surface_keypoints=target_keypoints,
-            masked_surface_shape=target_surface_shape,
-            neighbor_seg_tensor=None,
         )
         vol_crop = augmented["vol_crop"]
+        cond_seg_gt = augmented["cond_seg_gt"]
+        behind_seg = augmented["behind_seg"]
+        front_seg = augmented["front_seg"]
         source_surface_local = augmented["cond_surface_local"]
-        target_surface_local = augmented["masked_surface_local"]
-        source_np = source_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
-        target_np = target_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
 
-        source_valid = np.isfinite(source_np).all(axis=-1)
-        target_valid = np.isfinite(target_np).all(axis=-1)
-        if not bool(source_valid.any()) or not bool(target_valid.any()):
-            return self._resample_item(
-                idx,
-                "copy-neighbor side hint centers unavailable",
-                patch_idx=patch_idx,
-                wrap_idx=source_wrap_idx,
-                attempted_indices=_attempted_indices,
-            )
-        source_center = np.median(source_np[source_valid], axis=0)
-        target_center = np.median(target_np[target_valid], axis=0)
-        side_hint_vector = (target_center - source_center).astype(np.float32)
-        side_norm = float(np.linalg.norm(side_hint_vector))
-        if not np.isfinite(side_norm) or side_norm <= 1e-6:
-            return self._resample_item(
-                idx,
-                "copy-neighbor side hint vector invalid",
-                patch_idx=patch_idx,
-                wrap_idx=source_wrap_idx,
-                attempted_indices=_attempted_indices,
-            )
-        side_hint_vector /= np.float32(side_norm)
-
-        payload = build_copy_neighbor_targets(
-            self.crop_size,
-            source_np,
-            target_np,
-            side_hint_vector,
-            self.config,
+        target_payload = self.create_neighbor_targets(
+            cond_seg_gt=cond_seg_gt,
+            behind_seg=behind_seg,
+            front_seg=front_seg,
+            cond_surface_local=source_surface_local,
         )
-        if payload is None:
+        if target_payload is None:
             return self._resample_item(
                 idx,
-                "copy-neighbor targets unavailable",
+                "copy-neighbor dense displacement targets unavailable",
                 patch_idx=patch_idx,
                 wrap_idx=source_wrap_idx,
                 attempted_indices=_attempted_indices,
             )
 
-        cond_gt = torch.from_numpy(payload.cond_gt).to(torch.float32)
         if self._cond_local_perturb_active:
             cond_seg = self._conditioning_from_surface(
                 cond_surface_local=source_surface_local,
-                cond_seg_gt=cond_gt,
+                cond_seg_gt=cond_seg_gt,
             )
         else:
-            cond_seg = cond_gt.clone()
+            cond_seg = cond_seg_gt.clone()
         if cond_seg is None:
             return self._resample_item(
                 idx,
@@ -714,32 +749,15 @@ class EdtSegDataset(Dataset):
                 attempted_indices=_attempted_indices,
             )
 
-        side_hint = np.broadcast_to(
-            side_hint_vector[:, None, None, None],
-            (3, *self.crop_size),
-        ).astype(np.float32, copy=True)
         result = {
             "vol": vol_crop,
             "cond": cond_seg,
-            "side_hint": torch.from_numpy(side_hint).to(torch.float32),
-            "target_seg": torch.from_numpy(payload.target_seg).to(torch.float32),
-            "domain": torch.from_numpy(payload.domain).to(torch.float32),
-            "velocity_dir": torch.from_numpy(payload.velocity_dir).to(torch.float32),
-            "velocity_loss_weight": torch.from_numpy(payload.velocity_loss_weight).to(torch.float32),
-            "progress_phi": torch.from_numpy(payload.progress_phi).to(torch.float32),
-            "progress_phi_weight": torch.from_numpy(payload.progress_phi_weight).to(torch.float32),
-            "surface_attract": torch.from_numpy(payload.surface_attract).to(torch.float32),
-            "surface_attract_weight": torch.from_numpy(payload.surface_attract_weight).to(torch.float32),
-            "stop": torch.from_numpy(payload.stop).to(torch.float32),
-            "stop_weight": torch.from_numpy(payload.stop_weight).to(torch.float32),
-            "target_edt": torch.from_numpy(payload.target_edt).to(torch.float32),
-            "endpoint_seed_points": torch.from_numpy(payload.endpoint_seed_points).to(torch.float32),
-            "endpoint_seed_mask": torch.from_numpy(payload.endpoint_seed_mask).to(torch.float32),
-            "endpoint_step_count": torch.tensor(
-                int(payload.debug.get("endpoint_step_count", self.config.get("copy_neighbor_endpoint_steps", 8))),
-                dtype=torch.long,
-            ),
+            "cond_gt": cond_seg_gt,
+            "behind_seg": behind_seg,
+            "front_seg": front_seg,
+            "triplet_swap_enabled": torch.tensor(float(bool(self.apply_augmentation)), dtype=torch.float32),
         }
+        result.update(target_payload)
 
         if not _validate_result_tensors(
             result,
@@ -750,7 +768,7 @@ class EdtSegDataset(Dataset):
                 idx,
                 "copy-neighbor result tensor validation failed",
                 patch_idx=patch_idx,
-                wrap_idx=target_wrap_idx,
+                wrap_idx=source_wrap_idx,
                 attempted_indices=_attempted_indices,
             )
         return result

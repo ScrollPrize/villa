@@ -25,43 +25,21 @@ def setdefault_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("validate_result_tensors", False)
     config.setdefault("profile_create_split_masks", False)
 
-    # copy_neighbors target-builder defaults. These are inert for the existing
-    # row/col path but live here so train/dataset setup normalizes one config.
-    config.setdefault("copy_neighbor_domain_builder", "connectors")
-    config.setdefault("copy_neighbor_connector_sample_stride", 4)
-    config.setdefault("copy_neighbor_bridge_dilation_radius", 2.0)
-    config.setdefault("copy_neighbor_bridge_closing_radius", 2.0)
-    config.setdefault("copy_neighbor_fill_domain_holes", True)
-    config.setdefault("copy_neighbor_keep_touching_components", True)
-    config.setdefault("copy_neighbor_side_tolerance", 1.0)
-    config.setdefault("copy_neighbor_max_source_distance", 16.0)
-    config.setdefault("copy_neighbor_max_target_distance", 16.0)
-    config.setdefault("copy_neighbor_bridge_score_threshold", 32.0)
-    config.setdefault("copy_neighbor_min_domain_voxels", 16)
-    config.setdefault("copy_neighbor_min_source_voxels", 8)
-    config.setdefault("copy_neighbor_min_target_voxels", 8)
-    config.setdefault("copy_neighbor_progress_builder", "harmonic")
-    config.setdefault("copy_neighbor_harmonic_max_iters", 250)
-    config.setdefault("copy_neighbor_harmonic_tolerance", 1e-3)
-    config.setdefault("copy_neighbor_harmonic_min_unknown_voxels", 1)
-    config.setdefault("copy_neighbor_harmonic_required_converged", False)
-    config.setdefault("copy_neighbor_harmonic_profile", True)
-    config.setdefault("copy_neighbor_surface_attract_radius", 4.0)
-    config.setdefault("copy_neighbor_stop_radius", 1.5)
-    config.setdefault("copy_neighbor_endpoint_num_seeds", 256)
-    config.setdefault("copy_neighbor_endpoint_steps", 8)
-    config.setdefault("copy_neighbor_endpoint_steps_mode", "adaptive")
-    config.setdefault("copy_neighbor_endpoint_step_size", 1.0)
-    config.setdefault("copy_neighbor_endpoint_distance_percentile", 75.0)
-    config.setdefault("copy_neighbor_endpoint_step_margin", 2)
-    config.setdefault("copy_neighbor_endpoint_max_steps", 64)
-    config.setdefault("copy_neighbor_endpoint_huber_beta", 2.0)
-    config.setdefault("copy_neighbor_endpoint_max_distance", 32.0)
-    config.setdefault("copy_neighbor_endpoint_detach_steps", False)
-    config.setdefault("copy_neighbor_target_side", "random")
-    config.setdefault("copy_neighbor_pair_seed_offset", 0)
-    config.setdefault("copy_neighbor_pair_record_mode", "all_directed")
-    config.setdefault("copy_neighbor_source_center_mode", "bbox_center")
+    # Dense front/back displacement defaults for training_mode="copy_neighbors".
+    config.setdefault("use_triplet_direction_priors", True)
+    config.setdefault("triplet_direction_prior_mask", "cond")
+    config.setdefault("triplet_random_channel_swap_prob", 0.5)
+    config.setdefault("triplet_dense_weight_mode", "all")
+    config.setdefault("triplet_gt_vector_dilation_radius", 1.0)
+    config.setdefault("triplet_band_padding_voxels", 0.0)
+    config.setdefault("triplet_band_distance_percentile", 100.0)
+    config.setdefault("triplet_band_boost_weight", 2.0)
+    config.setdefault("triplet_edt_bbox_padding_voxels", 16.0)
+    config.setdefault("displacement_loss_type", "vector_huber_per_branch")
+    config.setdefault("displacement_huber_beta", 3.0)
+    config.setdefault("lambda_smooth", 0.0)
+    config.setdefault("triplet_min_disp_vox", 1.0)
+    config.setdefault("lambda_triplet_min_disp", 0.0)
 
     # Chunk-first patch-finding defaults.
     config.setdefault("overlap_fraction", 0.0)
@@ -112,16 +90,6 @@ def setdefault_rowcol_cond_trainer_config(config: MutableMapping[str, Any]) -> N
     config.setdefault("trace_integration_min_weight", 0.5)
     config.setdefault("trace_integration_detach_steps", False)
     config.setdefault("surface_attract_huber_beta", 5.0)
-    config.setdefault("lambda_copy_neighbor_velocity_dir", 1.0)
-    config.setdefault("lambda_copy_neighbor_progress_phi", 0.25)
-    config.setdefault("lambda_copy_neighbor_progress_gradient", 0.25)
-    config.setdefault("lambda_copy_neighbor_stop", 0.25)
-    config.setdefault("lambda_copy_neighbor_surface_attract", 0.1)
-    config.setdefault("lambda_copy_neighbor_endpoint", 0.25)
-    config.setdefault("lambda_copy_neighbor_velocity_smooth", 0.0)
-    config.setdefault("copy_neighbor_velocity_smooth_normalize", True)
-    config.setdefault("copy_neighbor_stop_pos_weight", 1.0)
-    config.setdefault("copy_neighbor_surface_attract_huber_beta", 5.0)
     config.setdefault("val_batches_per_log", 4)
     config.setdefault("log_at_step_zero", False)
     config.setdefault("ckpt_at_step_zero", False)
@@ -138,12 +106,9 @@ def setdefault_rowcol_cond_model_config(config: MutableMapping[str, Any]) -> Non
     config.setdefault("step_count", 1)  # Required by make_model.
     training_mode = str(config.get("training_mode", "rowcol_hidden"))
     if training_mode == "copy_neighbors":
-        config["in_channels"] = 5
+        config["in_channels"] = 8 if bool(config.get("use_triplet_direction_priors", True)) else 2
         config["targets"] = {
-            "velocity_dir": {"out_channels": 3, "activation": "none"},
-            "progress_phi": {"out_channels": 1, "activation": "none"},
-            "surface_attract": {"out_channels": 3, "activation": "none"},
-            "stop": {"out_channels": 1, "activation": "none"},
+            "displacement": {"out_channels": 6, "activation": "none"},
         }
     else:
         config["in_channels"] = 2 + growth_direction_channel_count()
@@ -209,11 +174,15 @@ def rowcol_cond_training_summary_lines(
     """Return the active trace-ODE training configuration summary."""
     if str(config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
         lines = [
-            "\n=== Copy Neighbor Trace ODE Training Configuration ===",
+            "\n=== Copy Neighbor Dense Displacement Training Configuration ===",
             f"Input channels: {config['in_channels']}",
-            "Output: velocity_dir (3ch) + progress_phi (1ch) + surface_attract (3ch) + stop (1ch)",
-            f"Progress builder: {config.get('copy_neighbor_progress_builder')}",
-            f"Domain builder: {config.get('copy_neighbor_domain_builder')}",
+            "Output: displacement (6ch, lower/behind + upper/front)",
+            f"Direction priors: {bool(config.get('use_triplet_direction_priors', True))}",
+            f"Dense weight mode: {config.get('triplet_dense_weight_mode')}",
+            (
+                f"Displacement loss: {config.get('displacement_loss_type')} "
+                f"(beta={config.get('displacement_huber_beta')})"
+            ),
             (
                 f"Optimizer: {optimizer_type} "
                 f"(lr={optimizer_kwargs['learning_rate']}, "
@@ -228,7 +197,7 @@ def rowcol_cond_training_summary_lines(
             [
                 scheduler_summary,
                 f"Train samples: {num_train}, Val samples: {num_val}",
-                "=====================================================\n",
+                "=======================================================\n",
             ]
         )
         return lines
@@ -343,36 +312,37 @@ def validate_rowcol_cond_dataset_config(config: MutableMapping[str, Any]) -> Non
     trace_validity_pos_weight = float(config.get("trace_validity_pos_weight", 1.0))
     _require_finite_range("trace_validity_pos_weight", trace_validity_pos_weight, min_value=0.0)
 
-    copy_neighbor_progress_builder = str(config.get("copy_neighbor_progress_builder", "harmonic"))
-    if copy_neighbor_progress_builder not in {"edt", "harmonic"}:
-        raise ValueError(
-            "copy_neighbor_progress_builder must be 'edt' or 'harmonic', "
-            f"got {copy_neighbor_progress_builder!r}"
-        )
-
-    copy_neighbor_domain_builder = str(config.get("copy_neighbor_domain_builder", "connectors"))
-    if copy_neighbor_domain_builder not in {"connectors", "distance_score"}:
-        raise ValueError(
-            "copy_neighbor_domain_builder must be 'connectors' or 'distance_score', "
-            f"got {copy_neighbor_domain_builder!r}"
-        )
-
-    if str(config.get("copy_neighbor_pair_record_mode", "all_directed")) not in {"all_directed", "one_per_source"}:
-        raise ValueError("copy_neighbor_pair_record_mode must be 'all_directed' or 'one_per_source'")
-    if str(config.get("copy_neighbor_target_side", "random")) not in {"random", "lower", "upper"}:
-        raise ValueError("copy_neighbor_target_side must be random, lower, or upper")
-
-    for key in (
-        "copy_neighbor_bridge_dilation_radius",
-        "copy_neighbor_bridge_closing_radius",
-        "copy_neighbor_side_tolerance",
-        "copy_neighbor_min_domain_voxels",
-        "copy_neighbor_min_source_voxels",
-        "copy_neighbor_min_target_voxels",
-        "copy_neighbor_surface_attract_radius",
-        "copy_neighbor_stop_radius",
-        "copy_neighbor_endpoint_num_seeds",
-        "copy_neighbor_endpoint_step_size",
-        "copy_neighbor_endpoint_max_distance",
-    ):
-        _require_finite_range(key, float(config.get(key, 0.0)), min_value=0.0)
+    if training_mode == "copy_neighbors":
+        if str(config.get("triplet_dense_weight_mode", "all")).lower() not in {"all", "band", "all_band_boost"}:
+            raise ValueError("triplet_dense_weight_mode must be one of all, band, or all_band_boost")
+        if str(config.get("triplet_direction_prior_mask", "cond")).lower() not in {"cond", "full"}:
+            raise ValueError("triplet_direction_prior_mask must be 'cond' or 'full'")
+        allowed_displacement_losses = {
+            "vector_l2",
+            "vector_huber",
+            "vector_huber_per_branch",
+            "component_huber",
+        }
+        if str(config.get("displacement_loss_type", "vector_huber_per_branch")) not in allowed_displacement_losses:
+            raise ValueError(
+                "displacement_loss_type must be accepted by dense_displacement_loss, got "
+                f"{config.get('displacement_loss_type')!r}"
+            )
+        for key in (
+            "triplet_random_channel_swap_prob",
+            "triplet_gt_vector_dilation_radius",
+            "triplet_band_padding_voxels",
+            "triplet_band_distance_percentile",
+            "triplet_band_boost_weight",
+            "triplet_edt_bbox_padding_voxels",
+            "displacement_huber_beta",
+            "lambda_smooth",
+            "triplet_min_disp_vox",
+            "lambda_triplet_min_disp",
+        ):
+            _require_finite_range(key, float(config.get(key, 0.0)), min_value=0.0)
+        swap_prob = float(config.get("triplet_random_channel_swap_prob", 0.0))
+        if swap_prob > 1.0:
+            raise ValueError("triplet_random_channel_swap_prob must satisfy 0 <= p <= 1")
+        if float(config.get("triplet_band_distance_percentile", 100.0)) > 100.0:
+            raise ValueError("triplet_band_distance_percentile must be <= 100")
