@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
  && add-apt-repository -y universe \
  && apt-get update -y \
  && apt-get install -y --no-install-recommends \
-        build-essential clang lld libclang-rt-21-dev mold git cmake ninja-build pkg-config \
+        build-essential clang lld flang-21 libclang-rt-21-dev mold git cmake ninja-build pkg-config \
         qt6-base-dev \
         libboost-system-dev libboost-program-options-dev \
         libceres-dev libsuitesparse-dev \
@@ -29,7 +29,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libscotch-dev libhwloc-dev \
         file bzip2 wget jq \
         gcovr lcov \
-        python3 python3-venv
+        python3 python3-venv \
+ && ln -sf /usr/bin/flang-21 /usr/local/bin/flang
 
 RUN arch="$(uname -m)" \
  && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" -o /tmp/awscli.zip \

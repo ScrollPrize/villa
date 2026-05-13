@@ -40,7 +40,8 @@
       "hidden": true,
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++"
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_Fortran_COMPILER": "flang"
       }
     },
 
@@ -126,8 +127,9 @@
       "binaryDir": "${sourceDir}/build-macos",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_C_COMPILER":   "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang",
-        "CMAKE_CXX_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang++",
+        "CMAKE_C_COMPILER":       "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER":     "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang++",
+        "CMAKE_Fortran_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/flang",
         "CMAKE_AR":               "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",
         "CMAKE_RANLIB":           "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ranlib",
         "CMAKE_C_COMPILER_AR":     "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",

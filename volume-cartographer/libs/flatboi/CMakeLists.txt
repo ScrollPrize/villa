@@ -71,14 +71,6 @@ if(NOT pastix_POPULATED)
     file(READ "${pastix_SOURCE_DIR}/CMakeLists.txt" _pastix_top_cml)
     string(REPLACE "\${CMAKE_SOURCE_DIR}" "\${CMAKE_CURRENT_SOURCE_DIR}"
         _pastix_top_cml "${_pastix_top_cml}")
-    # PaStiX's project() hard-enables Fortran even though we set
-    # PASTIX_WITH_FORTRAN=OFF. Several morse_cmake find modules
-    # (FindBLASEXT, FindCBLAS) still call check_fortran_function_exists
-    # at configure time regardless of PASTIX_WITH_FORTRAN, so the
-    # language must stay enabled. The macOS lld problem is that
-    # CMAKE_*_LINKER_FLAGS_INIT="-fuse-ld=lld" leaks into Fortran link
-    # commands; clear those for Fortran only so gfortran links with the
-    # system linker while C/C++ still go through lld.
     foreach(_pat
         "add_subdirectory(test)"
         "add_subdirectory(example)"
@@ -98,22 +90,6 @@ if(NOT pastix_POPULATED)
         string(REPLACE "${_pat}" "# stripped: ${_pat}" _pastix_spm_cml "${_pastix_spm_cml}")
     endforeach()
     file(WRITE "${pastix_SOURCE_DIR}/spm/CMakeLists.txt" "${_pastix_spm_cml}")
-
-    # PaStiX's project() enables Fortran (project(PASTIX C CXX Fortran)),
-    # and several morse_cmake find modules call check_fortran_function_exists
-    # at configure time regardless of PASTIX_WITH_FORTRAN. On the macOS
-    # Homebrew LLVM preset we set CMAKE_*_LINKER_FLAGS_INIT="-fuse-ld=lld";
-    # those flags leak into gfortran link commands and ld64.lld then errors
-    # out with "must specify -platform_version" / "missing or unsupported
-    # -arch arm64" because gfortran doesn't forward those. Strip
-    # -fuse-ld=lld for the PaStiX subdirectory only — its C/CXX code will
-    # link with the default system linker, and the parent project's
-    # C/CXX targets keep using lld.
-    foreach(_lvar CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
-                  CMAKE_MODULE_LINKER_FLAGS)
-        string(REGEX REPLACE "(^| )-fuse-ld=lld($| )" " " ${_lvar} "${${_lvar}}")
-    endforeach()
-
     add_subdirectory(${pastix_SOURCE_DIR} ${pastix_BINARY_DIR})
 endif()
 
