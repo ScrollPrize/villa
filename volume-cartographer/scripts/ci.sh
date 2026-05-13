@@ -209,10 +209,22 @@ cmd_coverage_regression() {
 
     git -C "$REPO_ROOT" fetch --quiet origin "${base_ref#origin/}" || true
 
-    local base_tree
-    base_tree="$(mktemp -d)/base-tree"
-    git -C "$REPO_ROOT" worktree add --detach "$base_tree" "$base_ref"
-    trap "git -C '$REPO_ROOT' worktree remove --force '$base_tree' || true" RETURN
+    local worktree_root base_tree
+    worktree_root="$(mktemp -d)/base-tree"
+    git -C "$REPO_ROOT" worktree add --detach "$worktree_root" "$base_ref"
+    trap "git -C '$REPO_ROOT' worktree remove --force '$worktree_root' || true" RETURN
+
+    # $REPO_ROOT may be a subdirectory of the git root (e.g. volume-cartographer/
+    # inside the villa monorepo). The worktree is checked out at the git root,
+    # so resolve our subdir inside the worktree to find CMakePresets.json.
+    local git_root subdir
+    git_root=$(git -C "$REPO_ROOT" rev-parse --show-toplevel)
+    subdir=$(realpath --relative-to="$git_root" "$REPO_ROOT")
+    if [[ "$subdir" == "." ]]; then
+        base_tree="$worktree_root"
+    else
+        base_tree="$worktree_root/$subdir"
+    fi
 
     # Base branch may not have the ci-coverage-gcc preset (e.g. before this
     # CI lands). In that case, skip the regression gate with a warning rather
