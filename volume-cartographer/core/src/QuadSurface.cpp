@@ -724,6 +724,7 @@ void QuadSurface::invalidateCache()
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
+    _normalCache = cv::Mat_<cv::Vec3f>();
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -2059,7 +2060,7 @@ void QuadSurface::rotate(float angleDeg)
     }
 
     // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    invalidateCache();
 }
 
 void QuadSurface::resample(float factor, int interpolation)
@@ -2114,7 +2115,7 @@ void QuadSurface::resample(float factor_x, float factor_y, int interpolation)
     _scale[1] /= factor_y;
 
     // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    invalidateCache();
 }
 
 float QuadSurface::computeZOrientationAngle() const
@@ -2280,8 +2281,8 @@ void QuadSurface::flipU()
         flipSingleTiff(path / "approval.tif", flipCode);
     }
 
-    // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    // Invalidate derived geometry caches.
+    invalidateCache();
 }
 
 void QuadSurface::flipV()
@@ -2309,8 +2310,8 @@ void QuadSurface::flipV()
         flipSingleTiff(path / "approval.tif", flipCode);
     }
 
-    // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    // Invalidate derived geometry caches.
+    invalidateCache();
 }
 
 // Overlapping JSON file utilities

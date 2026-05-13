@@ -2130,11 +2130,11 @@ void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, boo
         }
     }
 
-    const QString axisLabel = flipU ? tr("U") : tr("V");
+    const QString directionLabel = flipU ? tr("vertically") : tr("horizontally");
     emit statusMessage(
-        tr("Flipped %1 over %2 axis")
+        tr("Flipped %1 %2")
             .arg(QString::fromStdString(segmentId))
-            .arg(axisLabel),
+            .arg(directionLabel),
         5000);
 }
 
@@ -2647,6 +2647,80 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
     emit statusMessage(
         tr("Rasterization started for %1 segment(s)...").arg(validIds.size()), 0);
+}
+
+void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("Open a volpkg first."));
+        return;
+    }
+    if (!_cmdRunner) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("Command runner is not initialized."));
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("A command-line tool is already running."));
+        return;
+    }
+
+    auto vpkg = _state->vpkg();
+    // Use the volpkg's resolved output-segments path so it works for
+    // both the `<volpkg-dir>/<segdir>` layout and the freshly-introduced
+    // .volpkg.json form where the project file lives outside the data
+    // directory and segment locations are relative.
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("No active segmentation directory; pick one "
+                                "before running merge."));
+        return;
+    }
+    const QString pathsDir = QString::fromStdString(resolvedSeg.string());
+    // The merge.json + output dir live alongside the resolved segments
+    // dir (the actual volpkg data root), not the .volpkg.json directory.
+    const QString volpkgDir = QString::fromStdString(
+        resolvedSeg.parent_path().string());
+    const std::string segDirName = vpkg->getSegmentationDirectory();
+
+    QStringList availableSegments;
+    {
+        const auto ids = vpkg->segmentationIDs();
+        availableSegments.reserve(static_cast<int>(ids.size()));
+        for (const auto& s : ids) availableSegments << QString::fromStdString(s);
+    }
+    if (availableSegments.size() < 2) {
+        QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
+                             tr("This volpkg has fewer than 2 segments in '%1'; "
+                                "merge needs at least 2.")
+                                 .arg(QString::fromStdString(segDirName)));
+        return;
+    }
+
+    MergeTifxyzDialog dlg(_parentWidget, segmentIds, availableSegments,
+                          volpkgDir, pathsDir);
+    if (dlg.exec() != QDialog::Accepted) {
+        emit statusMessage(tr("Merge cancelled"), 3000);
+        return;
+    }
+
+    _cmdRunner->setMergeParams(dlg.mergeJsonPath(),
+                               pathsDir,
+                               dlg.refSurface(),
+                               dlg.ransacIters(),
+                               dlg.ransacMinThresh(),
+                               dlg.ransacMaxThresh(),
+                               dlg.ransacMadK(),
+                               dlg.ransacSeed(),
+                               dlg.anchorCap(),
+                               dlg.stripCols());
+    if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+    _cmdRunner->showConsoleOutput();
+    _cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz);
+    emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
 }
 
 void SegmentationCommandHandler::onAddIgnoreLabel()

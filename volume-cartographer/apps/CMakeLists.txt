@@ -56,6 +56,9 @@ target_link_libraries(vc_tifxyz_inp_mask vc_core)
 add_executable(vc_tifxyz_trim src/vc_tifxyz_trim.cpp)
 target_link_libraries(vc_tifxyz_trim vc_core opencv_core opencv_imgcodecs TIFF::TIFF)
 
+add_executable(vc_cut_windings src/vc_cut_windings.cpp)
+target_link_libraries(vc_cut_windings vc_core opencv_core)
+
 add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
@@ -96,8 +99,15 @@ target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
 add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
 
+# Grid-resolution helpers split into a static lib so the unit tests can
+# link them without spawning the binary. No behavior change vs. having the
+# code inline in vc_merge_tifxyz.cpp.
+add_library(vc_merge_grid STATIC src/vc_merge_tifxyz_grid.cpp)
+target_link_libraries(vc_merge_grid PUBLIC vc_core)
+target_include_directories(vc_merge_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
-target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
+target_link_libraries(vc_merge_tifxyz vc_merge_grid Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
 
 add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
@@ -164,6 +174,7 @@ if(VC_USE_PCH)
         vc_flatten
         vc_tifxyz_inp_mask
         vc_tifxyz_trim
+        vc_cut_windings
         vc_tifxyz_winding
         vc_tifxyz2zarr_sparse
         vc_add_ignore_label

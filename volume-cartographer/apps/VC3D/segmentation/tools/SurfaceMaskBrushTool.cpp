@@ -152,6 +152,7 @@ void SurfaceMaskBrushTool::setSurface(QuadSurface* surface)
     _surface = surface;
     _mask.release();
     _lastGridPosition.reset();
+    _undoSnapshotCaptured = false;
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -183,6 +184,7 @@ void SurfaceMaskBrushTool::startStroke(const QPointF& surfacePos)
     const int col = static_cast<int>(std::lround(gridPos->second));
 
     ensureMask();
+    _undoSnapshotCaptured = _module.captureUndoSnapshot();
     _strokeActive = true;
     _paintedCells.clear();
     _pendingCells.clear();
@@ -262,6 +264,10 @@ void SurfaceMaskBrushTool::finishStroke()
     _lastGridPosition.reset();
     fillEnclosedStrokeArea();
     const cv::Rect changedRegion = applyPendingCells();
+    if (changedRegion.empty() && _undoSnapshotCaptured) {
+        _module.discardLastUndoSnapshot();
+    }
+    _undoSnapshotCaptured = false;
     if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
         _module._editManager->applyExternalSurfaceUpdate(changedRegion);
     }
@@ -278,6 +284,10 @@ void SurfaceMaskBrushTool::cancelStroke()
 {
     _strokeActive = false;
     _lastGridPosition.reset();
+    if (_undoSnapshotCaptured) {
+        _module.discardLastUndoSnapshot();
+        _undoSnapshotCaptured = false;
+    }
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -288,6 +298,25 @@ void SurfaceMaskBrushTool::cancelStroke()
         _mask.release();
     }
     invalidateViewers(false);
+}
+
+void SurfaceMaskBrushTool::refreshFromSurface()
+{
+    if (_strokeActive || hasPendingStroke()) {
+        cancelStroke();
+    }
+    _lastGridPosition.reset();
+    _paintedCells.clear();
+    _pendingCells.clear();
+    _strokeGridPoints.clear();
+    _overlaySurfacePoints.clear();
+    if (_surface) {
+        _surface->invalidateCache();
+        _mask = _surface->validMask();
+    } else {
+        _mask.release();
+    }
+    invalidateViewers(true);
 }
 
 std::optional<std::pair<float, float>> SurfaceMaskBrushTool::surfaceToGridPosition(const QPointF& surfacePos) const
@@ -528,6 +557,10 @@ cv::Rect SurfaceMaskBrushTool::applyPendingCells()
     const cv::Vec3f invalid(-1.0f, -1.0f, -1.0f);
     for (const auto& [row, col] : _pendingCells) {
         if (row < 0 || row >= _mask.rows || col < 0 || col >= _mask.cols) {
+            continue;
+        }
+        const cv::Vec3f previousWorld = (*points)(row, col);
+        if (previousWorld == invalid) {
             continue;
         }
         _mask(row, col) = 0;
