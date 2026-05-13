@@ -460,10 +460,12 @@ def main() -> None:
         args.prepare_device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     training_mode = str(config.get("training_mode", "rowcol_hidden"))
-    if args.include_prepare_batch and training_mode != "copy_neighbors" and prepare_device.type != "cuda":
+    if args.include_prepare_batch and prepare_device.type != "cuda":
         raise RuntimeError(
-            "--include-prepare-batch requires a CUDA device because RowColTargets uses cupyx EDT."
+            "--include-prepare-batch requires a CUDA device because target preparation uses cupyx EDT."
         )
+    if args.image_output is not None and prepare_device.type != "cuda":
+        raise RuntimeError("--image-output requires a CUDA prepare device for copy-neighbor EDT target preparation.")
 
     profiler.enable()
     (

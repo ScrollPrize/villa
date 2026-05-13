@@ -156,7 +156,7 @@ def _align_triplet_to_priors_torch(
     if s0 is None or s1 is None:
         return dense_gt, dir_priors, order
     if bool((s1 > s0).item()):
-        dense_gt, dir_priors = _swap_triplet_torch(dense_gt, dir_priors)
+        dense_gt = torch.cat([dense_gt[3:6], dense_gt[0:3]], dim=0)
         order = torch.tensor([1, 0], device=dense_gt.device, dtype=torch.long)
     return dense_gt, dir_priors, order
 
