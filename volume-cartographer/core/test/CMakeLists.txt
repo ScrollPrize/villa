@@ -40,8 +40,11 @@ add_test(NAME test_post_process COMMAND test_post_process)
 # VcDataset writes Zarr v2 metadata advertising compressor_id = "blosc".
 # This catches any future migration to Blosc2 that would silently produce
 # chunks numcodecs / zarr-python cannot decode.
+#
+# Links vc_core directly so it can call vc::testing::bloscCompressForTest,
+# which exercises the *real* compress path used by VcDataset.
 add_executable(test_blosc1_compat test_blosc1_compat.cpp)
-target_link_libraries(test_blosc1_compat PRIVATE doctest::doctest Blosc::blosc)
+target_link_libraries(test_blosc1_compat PRIVATE doctest::doctest vc_core Blosc::blosc)
 add_test(NAME test_blosc1_compat COMMAND test_blosc1_compat)
 
 # Parser-only regression tests for vc_merge_tifxyz: link the small static
@@ -86,27 +89,29 @@ endif()
 add_executable(sanitizer_canary ${_canary_srcs})
 set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
-# ctest: PASS_REGULAR_EXPRESSION matched anywhere in stdout/stderr passes the
-# test regardless of exit code. If the sanitizer fires and prints its name
-# the test passes; if it doesn't fire (sanitizer not actually instrumenting)
-# the canary exits 0 without the regex match and the test fails.
+# ctest: PASS_REGULAR_EXPRESSION must match in stdout/stderr for the test
+# to pass. The canary aborts via the sanitizer runtime on success, or
+# `exit(1)`s on the fall-through (sanitizer not actually instrumenting), so
+# both the regex and a non-zero exit are required for a meaningful signal.
+# Regexes are tight — generic substrings like "runtime error" can be emitted
+# by unrelated failures and would mask a regression.
 function(_add_canary name arg regex)
     add_test(NAME ${name} COMMAND sanitizer_canary ${arg})
     set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
 endfunction()
 
 if(VC_ENABLE_ASAN)
-    _add_canary(sanitizer_canary_asan  asan  "AddressSanitizer")
+    _add_canary(sanitizer_canary_asan  asan  "AddressSanitizer: heap-buffer-overflow")
 endif()
 if(VC_ENABLE_UBSAN)
-    _add_canary(sanitizer_canary_ubsan ubsan "runtime error|UndefinedBehaviorSanitizer")
+    _add_canary(sanitizer_canary_ubsan ubsan "runtime error: signed integer overflow")
 endif()
 if(VC_ENABLE_TSAN)
-    _add_canary(sanitizer_canary_tsan  tsan  "ThreadSanitizer")
+    _add_canary(sanitizer_canary_tsan  tsan  "ThreadSanitizer: data race")
 endif()
 if(VC_ENABLE_TYSAN)
-    _add_canary(sanitizer_canary_tysan tysan "TypeSanitizer")
+    _add_canary(sanitizer_canary_tysan tysan "TypeSanitizer: type-aliasing-violation")
 endif()
 if(VC_ENABLE_NSAN)
-    _add_canary(sanitizer_canary_nsan  nsan  "NumericalStabilitySanitizer")
+    _add_canary(sanitizer_canary_nsan  nsan  "NumericalStabilitySanitizer: inconsistent")
 endif()

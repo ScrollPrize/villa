@@ -129,8 +129,12 @@ if command -v xcrun >/dev/null 2>&1; then
 fi
 
 extra_cmake_args=()
-if [[ -d "$brew_prefix/Cellar/eigen/3.4.0_1/share/eigen3/cmake" ]]; then
-  extra_cmake_args+=("-DEigen3_DIR=$brew_prefix/Cellar/eigen/3.4.0_1/share/eigen3/cmake")
+# Eigen ships its CMake config under <prefix>/share/eigen3/cmake. Derive
+# the prefix via `brew --prefix eigen` so a Homebrew revision bump (eigen
+# 3.4.0_1 → 3.4.0_2 → 3.5.x …) doesn't rot the script.
+eigen_prefix="$(brew --prefix eigen 2>/dev/null || true)"
+if [[ -n "$eigen_prefix" && -d "$eigen_prefix/share/eigen3/cmake" ]]; then
+  extra_cmake_args+=("-DEigen3_DIR=$eigen_prefix/share/eigen3/cmake")
 fi
 if [[ -d "$brew_prefix/opt/nlohmann-json/share/cmake/nlohmann_json" ]]; then
   extra_cmake_args+=("-Dnlohmann_json_DIR=$brew_prefix/opt/nlohmann-json/share/cmake/nlohmann_json")

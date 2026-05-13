@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
 
-project(VC3D)
+project(VC3D VERSION 1.0.0)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -131,6 +131,13 @@ endif()
 if(VC_ENABLE_LSAN AND NOT VC_ENABLE_ASAN)
     list(APPEND _san -fsanitize=leak)
 endif()
+# Sanitizers default to "recover and continue" on most checks, which lets
+# CI silently pass on real UB / type confusion / numerical issues. Force
+# abort on first detection across every enabled sanitizer.
+if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN
+   OR VC_ENABLE_TYSAN OR VC_ENABLE_NSAN OR VC_ENABLE_LSAN)
+    list(APPEND _san -fno-sanitize-recover=all)
+endif()
 if(VC_ENABLE_COVERAGE)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         list(APPEND _san -fprofile-instr-generate -fcoverage-mapping)
@@ -248,8 +255,18 @@ find_package(PkgConfig REQUIRED)
 # Blosc1 (libblosc-dev on Debian/Ubuntu; c-blosc on Homebrew). No upstream
 # CMake config is shipped, so locate by header+lib and wrap in an imported
 # target consumers link as Blosc::blosc.
-find_path(BLOSC_INCLUDE_DIR NAMES blosc.h)
-find_library(BLOSC_LIBRARY NAMES blosc)
+#
+# Note on package collision: libblosc-dev installs <blosc.h>; libblosc2-dev
+# installs <blosc2.h> (a *different* header, not a compat shim). Searching
+# `NAMES blosc.h` therefore only matches Blosc1. The matching libraries
+# also have distinct SONAMEs (libblosc.so vs libblosc2.so), so a system
+# with both packages installed cannot accidentally hybridize.
+find_path(BLOSC_INCLUDE_DIR NAMES blosc.h
+    HINTS $ENV{HOMEBREW_PREFIX}/opt/c-blosc/include
+          $ENV{HOMEBREW_PREFIX}/include)
+find_library(BLOSC_LIBRARY NAMES blosc
+    HINTS $ENV{HOMEBREW_PREFIX}/opt/c-blosc/lib
+          $ENV{HOMEBREW_PREFIX}/lib)
 if(NOT BLOSC_INCLUDE_DIR OR NOT BLOSC_LIBRARY)
     message(FATAL_ERROR "Blosc1 (libblosc-dev / c-blosc) not found")
 endif()

@@ -193,7 +193,14 @@ wandb.finish()
       " || exec cat >/dev/null)";
     // Hardening: ensure writes to a closed pipe don't kill the process.
     // (Linux lacks O_NOSIGPIPE for pipes; MSG_NOSIGNAL doesn't apply to stdio.)
-    std::signal(SIGPIPE, SIG_IGN);
+    // Scope the SIG_IGN to this object's lifetime so we don't perturb
+    // SIGPIPE handling for the rest of the binary (e.g. OpenCV plugins,
+    // future networking code) for the entire flatboi run.
+    struct sigaction sa_ign{};
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    sigaction(SIGPIPE, &sa_ign, &prev_sigpipe_);
+    sigpipe_saved_ = true;
 
     pipe_ = popen(cmd.c_str(), "w");
 #endif
@@ -260,11 +267,19 @@ private:
   void close_pipe(){ if(pipe_){ _pclose(pipe_); pipe_=nullptr; } }
 #else
   FILE* pipe_ = nullptr;
+  struct sigaction prev_sigpipe_{};
+  bool sigpipe_saved_ = false;
   static void setenv_var(const char* k, const char* v) { setenv(k, v, 1); }
   static void setenv_if_absent(const char* k, const char* v) {
     if (!std::getenv(k)) setenv(k, v, 1);
   }
-  void close_pipe(){ if(pipe_){ pclose(pipe_); pipe_=nullptr; } }
+  void close_pipe(){
+    if(pipe_){ pclose(pipe_); pipe_=nullptr; }
+    if (sigpipe_saved_) {
+      sigaction(SIGPIPE, &prev_sigpipe_, nullptr);
+      sigpipe_saved_ = false;
+    }
+  }
 #endif
 
   void cleanup_script(){

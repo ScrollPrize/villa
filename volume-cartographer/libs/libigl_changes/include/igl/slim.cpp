@@ -7,6 +7,8 @@
 // obtain one at http://mozilla.org/MPL/2.0/.
 #include "slim.h"
 
+#include <unordered_map>
+
 #include "boundary_loop.h"
 #include "cotmatrix.h"
 #include "edge_lengths.h"
@@ -124,17 +126,31 @@ namespace igl
       //t.start();
       // solve
       Eigen::VectorXd Uc;
-      // PaStiX 6 multifrontal direct solver, persistent across SLIM iters.
-      // analyzePattern() captures the sparsity once; factorize() refreshes
-      // values each iter. Pairs with SLIM_CACHED on the libigl side.
-      static igl::Pastix6LLT solver;
-      static bool analyzed = false;
-      if (!analyzed) {
-        solver.analyzePattern(L);
-        analyzed = true;
+      // PaStiX 6 multifrontal direct solver. We cache one solver per
+      // (SLIMData*, sparsity-pattern signature). Caching by SLIMData* alone
+      // is unsafe because s.dim changing or the user re-invoking SLIM with
+      // a different mesh would reuse a stale symbolic factorization.
+      //
+      // Signature: (rows, cols, nnz). Cheap to compute, sufficient to
+      // detect any pattern change that would invalidate analyzePattern().
+      // factorize() refreshes numerical values each iter regardless.
+      struct PastixCache {
+        igl::Pastix6LLT solver;
+        Eigen::Index rows = -1;
+        Eigen::Index cols = -1;
+        Eigen::Index nnz  = -1;
+      };
+      static std::unordered_map<const igl::SLIMData*, PastixCache> cache;
+      PastixCache& entry = cache[&s];
+      const Eigen::Index L_nnz = L.nonZeros();
+      if (entry.rows != L.rows() || entry.cols != L.cols() || entry.nnz != L_nnz) {
+        entry.solver.analyzePattern(L);
+        entry.rows = L.rows();
+        entry.cols = L.cols();
+        entry.nnz  = L_nnz;
       }
-      solver.factorize(L);
-      Uc = solver.solve(s.rhs);
+      entry.solver.factorize(L);
+      Uc = entry.solver.solve(s.rhs);
       for (int i = 0; i < s.dim; i++)
         uv.col(i) = Uc.block(i * s.v_n, 0, s.v_n, 1);
 

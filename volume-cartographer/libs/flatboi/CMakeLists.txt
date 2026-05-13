@@ -28,11 +28,6 @@ set(PASTIX_WITH_MPI        OFF CACHE BOOL "" FORCE)
 set(PASTIX_WITH_CUDA       OFF CACHE BOOL "" FORCE)
 set(PASTIX_WITH_FORTRAN    OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING          OFF CACHE BOOL "" FORCE)
-# flatboi only ever solves double-precision real systems (Pastix6LLT<double>,
-# SpmDouble). PaStiX otherwise auto-generates and compiles s/c/z variants of
-# every precision-templated TU, ~5× the work.
-set(PASTIX_PRECISIONS      "d" CACHE STRING "" FORCE)
-set(SPM_PRECISIONS         "d" CACHE STRING "" FORCE)
 # Build PaStiX as a static lib so flatboi doesn't need libpastix.so at runtime
 # and so the static parent-tree archives don't have to be PIC. Scope to
 # PaStiX's add_subdirectory; restore after so it doesn't leak to siblings.
@@ -42,14 +37,6 @@ set(BUILD_SHARED_LIBS OFF)
 FetchContent_GetProperties(pastix)
 if(NOT pastix_POPULATED)
     FetchContent_Populate(pastix)
-
-    # PaStiX's RulesPrecisions.cmake keys its precision-codegen dictionary off
-    # ${CMAKE_PROJECT_NAME}; without it the python codegen runs with -D "" and
-    # silently produces missing *_spm.h / precision-templated sources.
-    set(RP_${CMAKE_PROJECT_NAME}_DICTIONNARY
-        "${pastix_SOURCE_DIR}/cmake_modules/local_subs.py"
-        CACHE INTERNAL "")
-    set(RP_${CMAKE_PROJECT_NAME}_PRECISIONS "d" CACHE INTERNAL "")
 
     # PaStiX 6.4 upstream quirks when consumed as a subproject:
     # 1. Uses ${CMAKE_SOURCE_DIR} where it means ${CMAKE_CURRENT_SOURCE_DIR}.

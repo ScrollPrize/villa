@@ -67,11 +67,14 @@ fi
 
 # ---- xpra (from xpra.org apt repo — matches distro Python) ------------------
 # We don't build from source because xpra master uses Python APIs newer than
-# noble's Python 3.12. xpra.org ships prebuilt packages per distro Python.
+# what noble's Python 3.12 ships. xpra.org publishes prebuilt packages per
+# distro/codename, so derive the codename from the running system instead of
+# hardcoding one.
 log "xpra: add xpra.org apt repo and install"
 install -d -m 0755 /usr/share/keyrings
 wget -qO- https://xpra.org/xpra.asc | gpg --dearmor > /usr/share/keyrings/xpra.gpg
-echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/ noble main" \
+codename="$(lsb_release -cs)"
+echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/ ${codename} main" \
   > /etc/apt/sources.list.d/xpra.list
 apt-get update
 apt-get install -y -o Dpkg::Options::="--force-confnew" xpra xpra-codecs xvfb

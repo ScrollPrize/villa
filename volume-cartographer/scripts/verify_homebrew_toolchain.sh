@@ -40,17 +40,12 @@ else
 fi
 
 echo
-echo "== Dynamic dependencies (otool -L) =="
-# Allowed dylib prefixes:
-#   /usr/lib/                                       — Apple's libSystem and friends
-#   /System/Library/Frameworks/                     — Apple system frameworks
-#   /System/Library/PrivateFrameworks/              — Apple private frameworks
-#   /opt/homebrew/                                  — Homebrew (Apple silicon)
-#   /usr/local/                                     — Homebrew (Intel)
-#   @rpath/ @loader_path/ @executable_path/         — relocatable refs
-# Anything else (notably /Applications/Xcode.app/, /Library/Developer/) is
-# the Apple developer toolchain leaking in, which we want to catch.
-disallowed_pattern='/Applications/Xcode\.app/|/Library/Developer/'
+echo "== Dynamic dependencies (otool -L, allowlist) =="
+# Allowed dylib prefixes — anything not on this list is treated as a
+# toolchain leak. otool -L reports direct deps only; transitive deps could
+# in principle still pull in Xcode-internal frameworks, but our final
+# binaries should not transitively depend on anything Apple-developer-tools.
+allowed_prefixes='^(\s+)?(/usr/lib/|/System/Library/Frameworks/|/System/Library/PrivateFrameworks/|/opt/homebrew/|/usr/local/|@rpath/|@loader_path/|@executable_path/)'
 
 for b in "${bins[@]}"; do
     bin_path="$build_dir/bin/$b"
@@ -58,30 +53,34 @@ for b in "${bins[@]}"; do
         echo "skip: $b not built"
         continue
     fi
-    bad=$(otool -L "$bin_path" | grep -E "$disallowed_pattern" || true)
+    # `otool -L` first line is the binary path itself; skip it. Each
+    # remaining line is "<path> (compatibility version …)" — match the path.
+    bad=$(otool -L "$bin_path" | tail -n +2 | grep -vE "$allowed_prefixes" || true)
     if [[ -n "$bad" ]]; then
-        echo "FAIL: $b links against the Apple developer toolchain:" >&2
+        echo "FAIL: $b depends on dylibs outside the allowlist:" >&2
         echo "$bad" >&2
         fail=1
     else
-        echo "ok: $b links only Apple system + Homebrew dylibs"
+        echo "ok: $b dylib deps are all on the allowlist"
     fi
 done
 
 echo
-echo "== Linker identity (LC_BUILD_VERSION / LC_LOAD_DYLIB on libc++) =="
-# Homebrew clang links its own libc++ from $HOMEBREW_PREFIX/opt/llvm/lib;
-# Apple clang would link /usr/lib/libc++.1.dylib. If we see the latter, the
+echo "== libc++ origin =="
+# Homebrew clang links its own libc++ from $HOMEBREW_PREFIX/opt/llvm/lib
+# (often via @rpath/libc++.1.dylib or similar). Apple clang would emit
+# /usr/lib/libc++.1.dylib directly. Match Homebrew's actual SONAME variants
+# (libc++.1.dylib, libc++.1.0.dylib, etc.). If we see /usr/lib/libc++ the
 # build slipped onto Apple clang.
 for b in "${bins[@]}"; do
     bin_path="$build_dir/bin/$b"
     [[ -x "$bin_path" ]] || continue
-    cxx_line=$(otool -L "$bin_path" | grep -E 'libc\+\+\.1?\.dylib' || true)
+    cxx_line=$(otool -L "$bin_path" | grep -E 'libc\+\+\.[0-9.]+\.dylib' || true)
     if [[ -z "$cxx_line" ]]; then
         continue  # Static libc++, also fine.
     fi
     if echo "$cxx_line" | grep -qE '^\s*/usr/lib/libc\+\+'; then
-        echo "FAIL: $b links Apple's /usr/lib/libc++.1.dylib (expected Homebrew LLVM's libc++):" >&2
+        echo "FAIL: $b links Apple's /usr/lib/libc++ (expected Homebrew LLVM libc++):" >&2
         echo "  $cxx_line" >&2
         fail=1
     else

@@ -16,12 +16,22 @@
 #include <string>
 #include <thread>
 
+// Each canary trips its sanitizer and aborts via the runtime. If the
+// sanitizer is NOT instrumenting (wrong build, recover=continue, optimizer
+// elided the trigger), the canary falls through and exits 1 so ctest sees
+// failure regardless of the PASS_REGULAR_EXPRESSION match.
+[[noreturn]] static void canary_missed(const char* name)
+{
+    std::fprintf(stderr, "%s canary did not fire\n", name);
+    std::exit(1);
+}
+
 [[gnu::noinline]]
 static void trip_asan_heap_oob()
 {
     volatile int* p = new int[4];
     p[64] = 0;
-    std::fprintf(stderr, "ASan canary did not fire\n");
+    canary_missed("ASan");
 }
 
 [[gnu::noinline]]
@@ -31,12 +41,15 @@ static void trip_ubsan_signed_overflow()
     volatile int y = 1;
     volatile int z = x + y;
     (void)z;
-    std::fprintf(stderr, "UBSan canary did not fire\n");
+    canary_missed("UBSan");
 }
 
 [[gnu::noinline]]
 static void trip_tsan_data_race()
 {
+    // Use a real, non-atomic shared int and READ it after the writers to
+    // prevent the optimizer from DCE'ing the writes (TSan instruments
+    // pre-DCE in practice, but volatile loads guarantee the writes stay).
     static int shared = 0;
     auto writer = [] {
         for (int i = 0; i < 1'000'000; ++i) shared = i;
@@ -45,7 +58,9 @@ static void trip_tsan_data_race()
     std::thread t2(writer);
     t1.join();
     t2.join();
-    std::fprintf(stderr, "TSan canary did not fire\n");
+    volatile int observed = shared;
+    (void)observed;
+    canary_missed("TSan");
 }
 
 [[gnu::noinline]]
@@ -56,7 +71,7 @@ static void trip_tysan_type_punning()
     int* ip = reinterpret_cast<int*>(dp);
     volatile int v = *ip;
     (void)v;
-    std::fprintf(stderr, "TySan canary did not fire\n");
+    canary_missed("TySan");
 }
 
 [[gnu::noinline, clang::optnone]]
@@ -78,7 +93,7 @@ static void trip_nsan_catastrophic_cancellation()
     volatile float seed = 1.0f;
     float r = nsan_loop_sum(seed);
     std::fprintf(stderr, "result=%g\n", static_cast<double>(r));
-    std::fprintf(stderr, "NSan canary did not fire\n");
+    canary_missed("NSan");
 }
 
 int main(int argc, char** argv)
@@ -97,5 +112,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "unknown canary: %s\n", argv[1]);
         return 2;
     }
-    return 0;
+    // Every trip_* exits or aborts; reaching here means the sanitizer was
+    // not instrumenting. canary_missed already exited; defensive return.
+    return 1;
 }

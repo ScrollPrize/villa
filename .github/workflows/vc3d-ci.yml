@@ -73,8 +73,7 @@ jobs:
     strategy:
       fail-fast: false
       # ubuntu-24.04: compile-only smoke (Release, no tests).
-      # ubuntu-26.04: full test + sanitizer matrix.
-      # Coverage and dead-code (defined below) also run on ubuntu-26.04.
+      # ubuntu-26.04: full test + sanitizer matrix + coverage + dead-code.
       matrix:
         include:
           - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }

@@ -55,7 +55,7 @@ cmd_report() {
         echo "ClangBuildAnalyzer (optional, https://github.com/aras-p/ClangBuildAnalyzer):"
         echo "  ClangBuildAnalyzer --all $build_dir capture.bin && ClangBuildAnalyzer --analyze capture.bin"
     else
-        echo "(no -ftime-trace .json files found — was VC_PROFILE_COMPILE=ON?)"
+        echo "(no -ftime-trace .json files found — was the build configured with -DVC_PROFILE_COMPILE=ON or via the dev-profile-clang preset?)"
     fi
 }
 

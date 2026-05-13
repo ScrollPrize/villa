@@ -22,6 +22,7 @@ extern "C" {
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace igl {
@@ -147,13 +148,18 @@ public:
         pastix_task_numfact(data_, &spm_);
     }
 
-    VectorXd solve(const VectorXd& rhs) const {
-        VectorXd x = rhs;
+    // Not const: mutates pastix internal state (factorization context).
+    VectorXd solve(const VectorXd& rhs) {
         const pastix_int_t n = spm_.n;
+        if (rhs.size() % n != 0) {
+            throw std::runtime_error(
+                "Pastix6LLT::solve: rhs size " + std::to_string(rhs.size()) +
+                " is not a multiple of system size " + std::to_string(n));
+        }
+        VectorXd x = rhs;
         const pastix_int_t nrhs = static_cast<pastix_int_t>(rhs.size() / n);
         // pastix_task_solve writes the answer in place over the rhs buffer.
-        pastix_task_solve(const_cast<pastix_data_t*>(data_), n, nrhs,
-                          x.data(), n);
+        pastix_task_solve(data_, n, nrhs, x.data(), n);
         return x;
     }
 

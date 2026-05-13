@@ -1,7 +1,6 @@
 add_library(utils STATIC src/zarr.cpp src/Json.cpp src/aws_auth.cpp)
 target_include_directories(utils PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_compile_features(utils PUBLIC cxx_std_23)
 target_link_libraries(utils PUBLIC
@@ -16,8 +15,7 @@ set_target_properties(utils PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
 
 add_library(utils_c3d_codec STATIC src/c3d_codec.cpp)
 target_include_directories(utils_c3d_codec PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_compile_features(utils_c3d_codec PUBLIC cxx_std_23)
 target_link_libraries(utils_c3d_codec PUBLIC c3d)

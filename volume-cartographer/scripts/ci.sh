@@ -6,7 +6,7 @@
 #   ci.sh all                                              # full matrix + coverage
 #   ci.sh builder <image>                                  # build a builder docker image
 #   ci.sh test <image> <compiler> <preset>                 # configure + build + test
-#   ci.sh coverage [image]                                 # coverage report (in CWD)
+#   ci.sh coverage [image]                                 # coverage report (in volume-cartographer/coverage/)
 #   ci.sh patch-coverage <base_ref> [image]                # diff-cover gate vs base_ref
 #   ci.sh coverage-regression <base_ref> [image]           # total-coverage non-regression vs base_ref
 #   ci.sh dead-code [image] [compiler]                     # unused-* warnings + linker --print-gc-sections report
@@ -25,7 +25,11 @@ cd "$REPO_ROOT"
 IMAGES=(ubuntu-24.04 ubuntu-26.04)
 DOCKERFILES=(ubuntu-24.04-noble.Dockerfile ubuntu-26.04.Dockerfile)
 COMPILERS=(gcc clang)
-PRESETS=(ci-tests ci-asan-ubsan)
+# Sanitizer presets are clang-only; ci-tests runs both gcc and clang. This
+# mirrors the cells in .github/workflows/vc3d-ci.yml so `ci.sh all` is the
+# same matrix on dev/EC2 as on GHA.
+TEST_PRESETS=(ci-tests)
+CLANG_SANITIZER_PRESETS=(ci-asan-ubsan ci-tsan ci-tysan ci-nsan)
 
 dockerfile_for() {
     local image=$1
@@ -152,7 +156,7 @@ cmd_compile() {
 }
 
 cmd_coverage() {
-    local image=${1:-ubuntu-24.04}
+    local image=${1:-ubuntu-26.04}
     coverage_in_dir "$image" "$REPO_ROOT"
 }
 
@@ -179,18 +183,22 @@ cmd_patch_coverage() {
     local src_in_git fixed
     src_in_git=$(realpath --relative-to="$git_root" "$REPO_ROOT")
     fixed=$(mktemp -t cobertura-diffcov.XXXXXX.xml)
-    trap 'rm -f "$fixed"' RETURN
     if [[ "$src_in_git" == "." ]]; then
         cp "$cobertura" "$fixed"
     else
         sed "s|<source>\.</source>|<source>${src_in_git}</source>|" "$cobertura" > "$fixed"
     fi
 
-    python3 -m venv /tmp/diffcov >/dev/null
-    /tmp/diffcov/bin/pip install --quiet diff-cover
+    # Per-invocation venv so concurrent ci.sh runs on the same host don't
+    # race on pip-install. Cleaned up via the RETURN trap below.
+    local venv
+    venv="$(mktemp -d -t diffcov.XXXXXX)"
+    trap "rm -rf '$venv'; rm -f '$fixed'" RETURN
+    python3 -m venv "$venv" >/dev/null
+    "$venv/bin/pip" install --quiet diff-cover
     (
         cd "$git_root"
-        /tmp/diffcov/bin/diff-cover "$fixed" \
+        "$venv/bin/diff-cover" "$fixed" \
             --compare-branch="$base_ref" \
             --fail-under="$min_pct" \
             --markdown-report "$REPO_ROOT/coverage/patch.md" \
@@ -200,7 +208,7 @@ cmd_patch_coverage() {
 
 cmd_coverage_regression() {
     local base_ref=$1
-    local image=${2:-ubuntu-24.04}
+    local image=${2:-ubuntu-26.04}
     local pr_summary="$REPO_ROOT/coverage/summary.txt"
     if [[ ! -f "$pr_summary" ]]; then
         echo "coverage-regression: $pr_summary missing — run 'ci.sh coverage' first" >&2
@@ -247,7 +255,7 @@ cmd_coverage_regression() {
 }
 
 cmd_dead_code() {
-    local image=${1:-ubuntu-24.04}
+    local image=${1:-ubuntu-26.04}
     local compiler=${2:-clang}
     local build_dir="build/ci-dead-code-$compiler-$image"
     mkdir -p "$REPO_ROOT/dead-code"
@@ -255,9 +263,11 @@ cmd_dead_code() {
     # Build inside the container; capture full build log for compile-warning
     # extraction. Then run nm-based analysis (approach B): symbols defined
     # somewhere in our source .o files but absent from every final binary.
+    # pipefail required so the `tee` doesn't mask a failed cmake --build.
     run_in_builder "$image" "$REPO_ROOT" "
+        set -o pipefail &&
         cmake --preset ci-dead-code-$compiler &&
-        cmake --build --preset ci-dead-code-$compiler 2>&1 | tee dead-code/build.log
+        cmake --build --preset ci-dead-code-$compiler 2>&1 | tee dead-code/build.log &&
         scripts/dead-code-analysis.sh $build_dir"
 }
 
@@ -266,16 +276,30 @@ cmd_all() {
         echo "=== Builder: $image ==="
         cmd_builder "$image"
     done
-    for image in "${IMAGES[@]}"; do
-        for compiler in "${COMPILERS[@]}"; do
-            for preset in "${PRESETS[@]}"; do
-                echo "=== $image: $preset-$compiler ==="
-                cmd_test "$image" "$compiler" "$preset"
-            done
+    # 24.04: compile-only Release smoke (matches the blocking cells).
+    for compiler in "${COMPILERS[@]}"; do
+        echo "=== ubuntu-24.04: ci-release-$compiler (compile) ==="
+        cmd_compile ubuntu-24.04 "$compiler" ci-release
+    done
+    # 26.04: same Release compile + full test matrix + sanitizers.
+    for compiler in "${COMPILERS[@]}"; do
+        echo "=== ubuntu-26.04: ci-release-$compiler (compile) ==="
+        cmd_compile ubuntu-26.04 "$compiler" ci-release
+    done
+    for compiler in "${COMPILERS[@]}"; do
+        for preset in "${TEST_PRESETS[@]}"; do
+            echo "=== ubuntu-26.04: $preset-$compiler ==="
+            cmd_test ubuntu-26.04 "$compiler" "$preset"
         done
     done
+    for preset in "${CLANG_SANITIZER_PRESETS[@]}"; do
+        echo "=== ubuntu-26.04: $preset-clang ==="
+        cmd_test ubuntu-26.04 clang "$preset"
+    done
     echo "=== Coverage (gcc, gcov) ==="
-    cmd_coverage ubuntu-24.04
+    cmd_coverage ubuntu-26.04
+    echo "=== Dead-code report ==="
+    cmd_dead_code ubuntu-26.04 clang
 
     echo
     echo "All CI passed."

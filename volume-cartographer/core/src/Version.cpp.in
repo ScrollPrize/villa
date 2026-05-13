@@ -8,12 +8,11 @@ auto ProjectInfo::Name() -> std::string
     return name;
 }
 
-// Version is a git revision string (<sha7>-<commit_date>) computed in the
-// top-level CMakeLists.txt as VC_VERSION_STRING; project() carries no numeric
-// VERSION so the M.m.p accessors are not meaningful and return 0.
-auto ProjectInfo::VersionMajor() -> std::uint32_t { return 0; }
-auto ProjectInfo::VersionMinor() -> std::uint32_t { return 0; }
-auto ProjectInfo::VersionPatch() -> std::uint32_t { return 0; }
+// The M.m.p accessors come from project(VC3D VERSION ...) in the top-level
+// CMakeLists.txt. VersionString() returns the git revision (<sha7>-<date>).
+auto ProjectInfo::VersionMajor() -> std::uint32_t { return @PROJECT_VERSION_MAJOR@u; }
+auto ProjectInfo::VersionMinor() -> std::uint32_t { return @PROJECT_VERSION_MINOR@u; }
+auto ProjectInfo::VersionPatch() -> std::uint32_t { return @PROJECT_VERSION_PATCH@u; }
 
 auto ProjectInfo::VersionString() -> std::string
 {
