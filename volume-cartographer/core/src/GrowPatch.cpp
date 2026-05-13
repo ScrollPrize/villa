@@ -3298,6 +3298,171 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     float T = step;
     // float Ts = step*scale;
 
+    if (resume_surf && params.value("inpaint", false)) {
+        cv::Mat_<cv::Vec3f>* resume_points_ptr = resume_surf->rawPointsPtr();
+        if (!resume_points_ptr || resume_points_ptr->empty()) {
+            throw std::runtime_error("Missing resume surface points for inpaint.");
+        }
+
+        cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
+        if (resume_generations.empty()) {
+            resume_generations = cv::Mat_<uint16_t>(resume_points_ptr->size(), static_cast<uint16_t>(0));
+            for (int y = 0; y < resume_points_ptr->rows; ++y) {
+                for (int x = 0; x < resume_points_ptr->cols; ++x) {
+                    if ((*resume_points_ptr)(y, x)[0] != -1.0f) {
+                        resume_generations(y, x) = 1;
+                    }
+                }
+            }
+            resume_surf->setChannel("generations", resume_generations);
+        }
+
+        auto result_points_storage = std::make_unique<cv::Mat_<cv::Vec3f>>(resume_points_ptr->clone());
+        cv::Mat_<cv::Vec3f>& result_points = *result_points_storage;
+
+        cv::Mat active_area_mask(result_points.size(), CV_8U, cv::Scalar(0));
+        for (int y = 0; y < result_points.rows; ++y) {
+            for (int x = 0; x < result_points.cols; ++x) {
+                if (result_points(y, x)[0] != -1.0f) {
+                    active_area_mask.at<uchar>(y, x) = 255;
+                }
+            }
+        }
+
+        cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
+        cv::Mat hole_mask;
+        if (!mask.empty()) {
+            if (mask.size() != result_points.size()) {
+                throw std::runtime_error("inpaint mask size does not match resume surface size.");
+            }
+            cv::bitwise_and(active_area_mask, mask, hole_mask);
+        } else {
+            hole_mask = active_area_mask;
+        }
+
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(hole_mask, contours, hierarchy, cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
+        std::cout << "performing ROI inpaint on " << contours.size() << " potential holes" << std::endl;
+
+        int inpaint_count = 0;
+        int inpaint_skip = 0;
+        constexpr int margin = 4;
+
+        for (int i = 0; i < static_cast<int>(contours.size()); ++i) {
+            if (hierarchy[i][3] == -1) {
+                ++inpaint_skip;
+                continue;
+            }
+
+            cv::Rect roi = cv::boundingRect(contours[i]);
+            roi.x = std::max(0, roi.x - margin);
+            roi.y = std::max(0, roi.y - margin);
+            roi.width = std::min(result_points.cols - roi.x, roi.width + 2 * margin);
+            roi.height = std::min(result_points.rows - roi.y, roi.height + 2 * margin);
+
+            if (roi.width <= 4 || roi.height <= 4 ||
+                roi.x < 2 || roi.y < 2 ||
+                roi.x + roi.width > result_points.cols - 2 ||
+                roi.y + roi.height > result_points.rows - 2) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: insufficient margin around roi " << roi << std::endl;
+                continue;
+            }
+
+            cv::Mat_<uchar> inpaint_mask(roi.size(), static_cast<uchar>(1));
+            std::vector<cv::Point> hole_contour_roi;
+            hole_contour_roi.reserve(contours[i].size());
+            for (const auto& p : contours[i]) {
+                hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
+            }
+            cv::fillPoly(inpaint_mask, std::vector<std::vector<cv::Point>>{hole_contour_roi}, cv::Scalar(0));
+
+            TraceParameters local_params;
+            local_params.unit = trace_params.unit;
+            local_params.dpoints = cv::Mat_<cv::Vec3d>(roi.size(), cv::Vec3d(-1.0, -1.0, -1.0));
+            local_params.state = cv::Mat_<uint8_t>(roi.size(), static_cast<uint8_t>(0));
+            for (int y = 0; y < roi.height; ++y) {
+                for (int x = 0; x < roi.width; ++x) {
+                    const cv::Vec3f& p = result_points(roi.y + y, roi.x + x);
+                    if (p[0] != -1.0f) {
+                        local_params.dpoints(y, x) = cv::Vec3d(p[0], p[1], p[2]);
+                        local_params.state(y, x) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    }
+                }
+            }
+
+            bool did_inpaint = false;
+            try {
+                did_inpaint = inpaint(cv::Rect(0, 0, roi.width, roi.height),
+                                      inpaint_mask,
+                                      local_params,
+                                      trace_data);
+            } catch (const cv::Exception& ex) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: OpenCV exception for roi " << roi << " => " << ex.what() << std::endl;
+                continue;
+            } catch (const std::exception& ex) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: exception for roi " << roi << " => " << ex.what() << std::endl;
+                continue;
+            } catch (...) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: unknown exception for roi " << roi << std::endl;
+                continue;
+            }
+
+            if (!did_inpaint) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: mask border check failed for roi " << roi << std::endl;
+                continue;
+            }
+
+            for (int y = 0; y < roi.height; ++y) {
+                for (int x = 0; x < roi.width; ++x) {
+                    if (inpaint_mask(y, x) != 0 || !(local_params.state(y, x) & STATE_LOC_VALID)) {
+                        continue;
+                    }
+                    const cv::Vec3d& p = local_params.dpoints(y, x);
+                    if (p[0] != -1.0) {
+                        result_points(roi.y + y, roi.x + x) =
+                            cv::Vec3f(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
+                    }
+                }
+            }
+            ++inpaint_count;
+        }
+
+        std::cout << "ROI inpaint completed: " << inpaint_count
+                  << " holes, " << inpaint_skip << " skipped" << std::endl;
+
+        auto surf = new QuadSurface(result_points_storage.release(), {1/T, 1/T});
+        surf->setDpi(voxelSizeToDpi(voxelsize));
+        surf->setChannel("generations", resume_generations.clone());
+
+        cv::Mat approval = resume_surf->channel("approval", SURF_CHANNEL_NORESIZE);
+        if (!approval.empty()) {
+            surf->setChannel("approval", approval);
+        }
+        if (!mask.empty()) {
+            surf->setChannel("mask", mask);
+        }
+
+        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+        const double voxel_size_d = static_cast<double>(voxelsize);
+        const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
+        surf->meta = utils::Json::parse(meta_params.dump());
+        if (resume_surf && !resume_surf->id.empty()) {
+            surf->meta["seed_surface_id"] = resume_surf->id;
+        }
+        surf->meta["area_vx2"] = area_est_vx2;
+        surf->meta["area_cm2"] = area_est_cm2;
+        surf->meta["max_gen"] = stop_gen;
+        surf->meta["elapsed_time_s"] = f_timer.seconds();
+
+        return surf;
+    }
+
     
     // The following track the state of the patch; they are each as big as the largest possible patch but initially empty
     // - locs defines the patch! It says for each 2D position, which 3D position it corresponds to
