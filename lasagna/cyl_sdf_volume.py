@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -192,9 +193,14 @@ def build_previous_shell_inside_depth_volume(
 			f"[cyl_outside] {progress_label}: loading libigl extension; first run may compile C++",
 			flush=True,
 		)
+	ext_start = time.perf_counter()
 	ext = _get_ext_module()
 	if progress_label:
-		print(f"[cyl_outside] {progress_label}: libigl extension ready", flush=True)
+		print(
+			f"[cyl_outside] {progress_label}: libigl extension ready "
+			f"elapsed={time.perf_counter() - ext_start:.2f}s",
+			flush=True,
+		)
 	volume_cpu, depth_max = ext.build_inside_depth_volume(
 		verts.contiguous(),
 		faces.contiguous(),

@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <ATen/Parallel.h>
+#include <Python.h>
 
 #include <Eigen/Core>
 #include <igl/AABB.h>
@@ -45,19 +46,22 @@ MatrixXiR tensor_to_faces(torch::Tensor faces) {
 	return F;
 }
 
-double signed_distance_at(
+double inside_depth_at(
 	const igl::AABB<MatrixXdR, 3>& tree,
 	const MatrixXdR& V,
 	const MatrixXiR& F,
 	const igl::WindingNumberAABB<double, int>& hier,
 	const RowVector3d& q
 ) {
-	double sign = 0.0;
+	const double winding = hier.winding_number(q.transpose());
+	if (!(winding > 0.5)) {
+		return 0.0;
+	}
 	double sqrd = 0.0;
 	int face_i = -1;
 	RowVector3d closest;
-	igl::signed_distance_winding_number(tree, V, F, hier, q, sign, sqrd, face_i, closest);
-	return sign * std::sqrt(std::max(0.0, sqrd));
+	sqrd = tree.squared_distance(V, F, q, face_i, closest);
+	return std::sqrt(std::max(0.0, sqrd));
 }
 
 uint8_t encode_depth(double depth, double depth_max) {
@@ -106,7 +110,7 @@ void print_progress_line(
 		<< done << "/" << total << " vox"
 		<< " elapsed=" << std::setprecision(1) << elapsed << "s"
 		<< " rate=" << std::setprecision(0) << rate << " vox/s"
-		<< (final ? " done" : "")
+		<< (final ? (done >= total ? " done" : " stopped") : "")
 		<< std::endl;
 }
 
@@ -170,15 +174,19 @@ private:
 };
 
 template <typename Fn>
-void parallel_chunks(int64_t total, int n_threads, int64_t grain, Fn fn) {
+bool parallel_chunks(int64_t total, int n_threads, int64_t grain, std::atomic<bool>& cancel, Fn fn) {
 	const int64_t chunk_count = std::max<int64_t>(1, (total + grain - 1) / grain);
 	n_threads = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(n_threads, chunk_count)));
 	std::atomic<int64_t> next(0);
+	std::atomic<int> active(n_threads);
 	std::vector<std::thread> workers;
 	workers.reserve(static_cast<size_t>(n_threads));
 	for (int ti = 0; ti < n_threads; ++ti) {
 		workers.emplace_back([&, ti]() {
 			while (true) {
+				if (cancel.load(std::memory_order_relaxed)) {
+					break;
+				}
 				const int64_t begin = next.fetch_add(grain);
 				if (begin >= total) {
 					break;
@@ -186,11 +194,43 @@ void parallel_chunks(int64_t total, int n_threads, int64_t grain, Fn fn) {
 				const int64_t end = std::min(total, begin + grain);
 				fn(begin, end, ti);
 			}
+			active.fetch_sub(1);
 		});
+	}
+	bool interrupted = false;
+	while (active.load() > 0) {
+		if (!interrupted && PyErr_CheckSignals() != 0) {
+			interrupted = true;
+			cancel.store(true);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
 	for (std::thread& worker : workers) {
 		worker.join();
 	}
+	return interrupted;
+}
+
+void throw_if_cancelled(
+	std::atomic<bool>& cancel,
+	const std::string& label,
+	const std::string& phase,
+	bool progress_enabled
+) {
+	if (!cancel.load(std::memory_order_relaxed) && PyErr_CheckSignals() == 0) {
+		return;
+	}
+	cancel.store(true);
+	if (progress_enabled) {
+		std::cout
+			<< "[cyl_outside] " << label
+			<< ": interrupted during " << phase << "; cancelling"
+			<< std::endl;
+	}
+	if (!PyErr_Occurred()) {
+		PyErr_SetNone(PyExc_KeyboardInterrupt);
+	}
+	throw pybind11::error_already_set();
 }
 
 } // namespace
@@ -224,14 +264,18 @@ pybind11::tuple build_inside_depth_volume(
 	TORCH_CHECK(Z > 0 && Y > 0 && X > 0, "shape values must be positive");
 	TORCH_CHECK(spacing[0] > 0.0 && spacing[1] > 0.0 && spacing[2] > 0.0, "spacing values must be positive");
 
+	const auto total_start = std::chrono::steady_clock::now();
 	const int64_t total = Z * Y * X;
 	const int n_threads = default_thread_count(requested_threads);
 	const bool progress_enabled = !progress_label.empty();
+	std::atomic<bool> cancel(false);
 	if (progress_enabled) {
 		std::cout
 			<< "[cyl_outside] " << progress_label
 			<< ": building field shape=(" << Z << "," << Y << "," << X << ")"
 			<< " voxels=" << total
+			<< " vertices=" << V.rows()
+			<< " faces=" << F.rows()
 			<< " depth_temp="
 			<< std::fixed << std::setprecision(2)
 			<< (static_cast<double>(total) * static_cast<double>(sizeof(float)) / (1024.0 * 1024.0 * 1024.0))
@@ -251,29 +295,39 @@ pybind11::tuple build_inside_depth_volume(
 			<< ": preparing libigl acceleration structures..."
 			<< std::endl;
 	}
+	throw_if_cancelled(cancel, progress_label, "startup", progress_enabled);
 	const auto prep_start = std::chrono::steady_clock::now();
 	igl::AABB<MatrixXdR, 3> tree;
 	tree.init(V, F);
 	igl::WindingNumberAABB<double, int> hier(V, F);
 	hier.grow();
+	const double prep_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - prep_start).count();
 	if (progress_enabled) {
 		std::cout
 			<< "[cyl_outside] " << progress_label
 			<< ": libigl acceleration ready elapsed="
 			<< std::fixed << std::setprecision(1)
-			<< std::chrono::duration<double>(std::chrono::steady_clock::now() - prep_start).count()
+			<< prep_elapsed
 			<< "s"
 			<< std::endl;
 	}
+	throw_if_cancelled(cancel, progress_label, "libigl acceleration setup", progress_enabled);
 	auto depth_tmp = torch::empty({total}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
 	float* depth_ptr = depth_tmp.data_ptr<float>();
 	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
+	std::vector<int64_t> thread_inside(static_cast<size_t>(n_threads), 0);
 	std::atomic<int64_t> max_done(0);
+	const auto pass1_start = std::chrono::steady_clock::now();
 	{
-		ProgressPrinter progress(progress_label, "pass 1/2 signed-distance", total, max_done, progress_enabled);
-		parallel_chunks(total, n_threads, 2048, [&](int64_t begin, int64_t end, int ti) {
+		ProgressPrinter progress(progress_label, "pass 1/2 winding+inside-distance", total, max_done, progress_enabled);
+		parallel_chunks(total, n_threads, 2048, cancel, [&](int64_t begin, int64_t end, int ti) {
 			double local_max = 0.0;
+			int64_t local_inside = 0;
+			int64_t processed = 0;
 			for (int64_t n = begin; n < end; ++n) {
+				if ((processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+					break;
+				}
 				const int64_t x = n % X;
 				const int64_t yz = n / X;
 				const int64_t y = yz % Y;
@@ -283,34 +337,75 @@ pybind11::tuple build_inside_depth_volume(
 					origin[1] + static_cast<double>(y) * spacing[1],
 					origin[2] + static_cast<double>(z) * spacing[2]
 				);
-				const double sd = signed_distance_at(tree, V, F, hier, q);
-				const double depth = sd < 0.0 ? -sd : 0.0;
+				const double depth = inside_depth_at(tree, V, F, hier, q);
 				const float depth_f = static_cast<float>(depth);
 				depth_ptr[n] = depth_f;
 				local_max = std::max(local_max, static_cast<double>(depth_f));
+				if (depth_f > 0.0f) {
+					++local_inside;
+				}
+				++processed;
 			}
 			thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
-			max_done.fetch_add(end - begin);
+			thread_inside[static_cast<size_t>(ti)] += local_inside;
+			max_done.fetch_add(processed);
 		});
 	}
+	throw_if_cancelled(cancel, progress_label, "winding+inside-distance pass", progress_enabled);
+	const double pass1_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - pass1_start).count();
 	double depth_max = 0.0;
+	int64_t inside_count = 0;
 	for (const double value : thread_max) {
 		if (value > depth_max) {
 			depth_max = value;
 		}
 	}
+	for (const int64_t value : thread_inside) {
+		inside_count += value;
+	}
 
 	auto out = torch::empty({1, Z, Y, X}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
 	uint8_t* out_ptr = out.data_ptr<uint8_t>();
 	std::atomic<int64_t> encode_done(0);
+	const auto encode_start = std::chrono::steady_clock::now();
 	{
 		ProgressPrinter progress(progress_label, "pass 2/2 encode", total, encode_done, progress_enabled);
-		parallel_chunks(total, n_threads, 2048, [&](int64_t begin, int64_t end, int /*ti*/) {
+		parallel_chunks(total, n_threads, 2048, cancel, [&](int64_t begin, int64_t end, int /*ti*/) {
+			int64_t processed = 0;
 			for (int64_t n = begin; n < end; ++n) {
+				if ((processed & 4095) == 0 && cancel.load(std::memory_order_relaxed)) {
+					break;
+				}
 				out_ptr[n] = encode_depth(static_cast<double>(depth_ptr[n]), depth_max);
+				++processed;
 			}
-			encode_done.fetch_add(end - begin);
+			encode_done.fetch_add(processed);
 		});
+	}
+	throw_if_cancelled(cancel, progress_label, "encode pass", progress_enabled);
+	const double encode_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - encode_start).count();
+	if (progress_enabled) {
+		const double total_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - total_start).count();
+		const double pass1_rate = pass1_elapsed > 0.0 ? static_cast<double>(total) / pass1_elapsed : 0.0;
+		const double encode_rate = encode_elapsed > 0.0 ? static_cast<double>(total) / encode_elapsed : 0.0;
+		const int64_t skipped_distance = total - inside_count;
+		std::cout
+			<< "[cyl_outside] " << progress_label
+			<< ": timing prep=" << std::fixed << std::setprecision(2) << prep_elapsed << "s"
+			<< " winding+inside_distance=" << pass1_elapsed << "s"
+			<< " (" << std::setprecision(0) << pass1_rate << " vox/s)"
+			<< " encode=" << std::setprecision(2) << encode_elapsed << "s"
+			<< " (" << std::setprecision(0) << encode_rate << " vox/s)"
+			<< " total=" << std::setprecision(2) << total_elapsed << "s"
+			<< std::endl;
+		std::cout
+			<< "[cyl_outside] " << progress_label
+			<< ": distance queries inside=" << inside_count
+			<< " skipped_outside=" << skipped_distance
+			<< " inside_frac=" << std::fixed << std::setprecision(4)
+			<< (total > 0 ? static_cast<double>(inside_count) / static_cast<double>(total) : 0.0)
+			<< " depth_max=" << std::setprecision(3) << depth_max
+			<< std::endl;
 	}
 
 	return pybind11::make_tuple(out, depth_max);
