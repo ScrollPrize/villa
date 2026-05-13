@@ -142,13 +142,15 @@ jobs:
         if: github.event_name == 'pull_request'
         run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }} ubuntu-26.04
 
+  # macOS compile is a hard gate (parity with the ubuntu ci-release cells).
+  # Smoke + toolchain-verifier run in a separate job that is non-blocking for
+  # now; promote that to a gate once it's been stable for a while.
   macos-build:
-    name: macOS build (${{ matrix.os }}, Homebrew LLVM)
+    name: macOS compile (${{ matrix.os }}, Homebrew LLVM)
     needs: changes
     if: needs.changes.outputs.vc == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -175,12 +177,32 @@ jobs:
       - name: Configure + build (installs Homebrew deps as needed)
         run: volume-cartographer/scripts/build_macos.sh --install-deps
 
+      - name: Upload build dir for downstream checks
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build-${{ matrix.os }}
+          path: volume-cartographer/build-macos/bin/
+          retention-days: 1
+
+  macos-checks:
+    name: macOS checks (smoke + toolchain verify)
+    needs: macos-build
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: macos-15
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-build-macos-15
+          path: volume-cartographer/build-macos/bin/
       - name: Smoke-test built binaries
         run: |
           cd volume-cartographer/build-macos
+          chmod +x bin/* || true
           file bin/VC3D bin/vc_tifxyz bin/flatboi
           ./bin/vc_tifxyz --help | head -5 || true
-
       - name: Verify Homebrew-only toolchain
         run: volume-cartographer/scripts/verify_homebrew_toolchain.sh volume-cartographer/build-macos
 
