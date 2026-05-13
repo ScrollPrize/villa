@@ -58,6 +58,7 @@ class ModelForwardNeeds:
 	prefetch_pred_dt_loss: bool = False
 	prefetch_pred_dt_flow: bool = False
 	prefetch_cyl_gt_normals: bool = False
+	prefetch_cyl_grad_mask: bool = False
 	prefetch_ext_offset: bool = False
 	prefetch_corr_points: bool = False
 
@@ -123,6 +124,7 @@ class ModelForwardNeeds:
 				prefetch_pred_dt_loss=out.prefetch_pred_dt_loss or other.prefetch_pred_dt_loss,
 				prefetch_pred_dt_flow=out.prefetch_pred_dt_flow or other.prefetch_pred_dt_flow,
 				prefetch_cyl_gt_normals=out.prefetch_cyl_gt_normals or other.prefetch_cyl_gt_normals,
+				prefetch_cyl_grad_mask=out.prefetch_cyl_grad_mask or other.prefetch_cyl_grad_mask,
 				prefetch_ext_offset=out.prefetch_ext_offset or other.prefetch_ext_offset,
 				prefetch_corr_points=out.prefetch_corr_points or other.prefetch_corr_points,
 			)
@@ -146,6 +148,8 @@ class ModelForwardNeeds:
 			nograd_channels.update({"nx", "ny"})
 		if self.prefetch_cyl_gt_normals:
 			nograd_channels.update({"grad_mag", "nx", "ny"})
+		if self.prefetch_cyl_grad_mask:
+			nograd_channels.add("grad_mag")
 		if self.prefetch_corr_points:
 			nograd_channels.update({"grad_mag", "nx", "ny"})
 		return frozenset(grad_channels), frozenset(nograd_channels)
@@ -186,6 +190,7 @@ class ModelForwardNeeds:
 			("pred_dt_loss_pf", self.prefetch_pred_dt_loss),
 			("pred_dt_flow_pf", self.prefetch_pred_dt_flow),
 			("cyl_gt_pf", self.prefetch_cyl_gt_normals),
+			("cyl_grad_pf", self.prefetch_cyl_grad_mask),
 			("ext_pf", self.prefetch_ext_offset),
 			("corr_pf", self.prefetch_corr_points),
 		):

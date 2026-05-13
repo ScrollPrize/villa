@@ -11,7 +11,7 @@
 		"cyl_z_center": 1.0,
 		"cyl_step": 100.0,
 		"cyl_radial_mean": 0.0,
-		"cyl_seed_push": 0.0,
+		"cyl_step_push": 0.1,
 		"cyl_bend": 100.0,
 		"cyl_conn_mesh": 0.0,
 		"cyl_conn_gt": 0.0,
@@ -38,7 +38,7 @@
 			"params": ["cyl_params"],
 			"args": {
 			    "cyl_output_all_shells": true,
-				"cyl_max_shells": 20,
+				"cyl_max_shells": 6,
 				"model-step": 200.0,
 				"compile_cyl_normal": true,
 				"profile_opt": false
@@ -53,7 +53,7 @@
 				"cyl_smooth": 1.0
 			},
 			"args": {
-				"grow_factor": 1.1,
+				"grow_factor": 1.5,
 				"model-step": 200.0,
 				"compile_cyl_normal": true,
 					"profile_opt": false

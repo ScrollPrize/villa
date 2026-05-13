@@ -75,7 +75,7 @@ CYLINDER_OUTPUT_ALL_SHELLS_ARGS = ("cyl_output_all_shells", "cyl_shell_output_al
 CYLINDER_MAX_SEARCH_SHELLS_ARGS = ("cyl_max_shells", "cyl_shell_max_shells", "cyl_shell_search_max_shells")
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
-	"cyl_z_center", "cyl_seed_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
+	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
 	"cyl_base_mesh", "cyl_base_gt",
 )
 
@@ -211,7 +211,7 @@ lambda_global: dict[str, float] = {
 	"cyl_smooth": 0.0,
 	"cyl_z_smooth": 0.0,
 	"cyl_z_center": 0.0,
-	"cyl_seed_push": 0.0,
+	"cyl_step_push": 0.0,
 	"cyl_step": 0.0,
 	"cyl_radial_mean": 0.0,
 	"cyl_bend": 0.0,
@@ -749,9 +749,9 @@ def optimize(
 		"cyl_smooth": {"loss": opt_loss_cyl.cyl_smooth_loss, "needs": Needs(cyl_samples=True)},
 		"cyl_z_smooth": {"loss": opt_loss_cyl.cyl_z_smooth_loss, "needs": Needs(cyl_samples=True)},
 		"cyl_z_center": {"loss": opt_loss_cyl.cyl_z_center_loss, "needs": Needs(cyl_samples=True)},
-		"cyl_seed_push": {
-			"loss": opt_loss_cyl.cyl_seed_push_loss,
-			"needs": Needs(cyl_samples=True, cyl_shell_fields=True, prefetch_cyl_gt_normals=True),
+		"cyl_step_push": {
+			"loss": opt_loss_cyl.cyl_step_push_loss,
+			"needs": Needs(cyl_samples=True, cyl_shell_fields=True, prefetch_cyl_grad_mask=True),
 		},
 		"cyl_step": {"loss": opt_loss_cyl.cyl_step_loss, "needs": Needs(cyl_samples=True)},
 		"cyl_radial_mean": {
@@ -898,7 +898,7 @@ def optimize(
 			"cyl_smooth": float(opt_cfg_.eff.get("cyl_smooth", 0.0)),
 			"cyl_z_smooth": float(opt_cfg_.eff.get("cyl_z_smooth", 0.0)),
 			"cyl_z_center": float(opt_cfg_.eff.get("cyl_z_center", 0.0)),
-			"cyl_seed_push": float(opt_cfg_.eff.get("cyl_seed_push", 0.0)),
+			"cyl_step_push": float(opt_cfg_.eff.get("cyl_step_push", 0.0)),
 			"cyl_step": float(opt_cfg_.eff.get("cyl_step", 0.0)),
 			"cyl_radial_mean": float(opt_cfg_.eff.get("cyl_radial_mean", 0.0)),
 			"cyl_bend": float(opt_cfg_.eff.get("cyl_bend", 0.0)),
@@ -921,13 +921,15 @@ def optimize(
 		if opt_cfg.steps <= 0 and not is_cyl_stage:
 			return data
 		stage_eff = _stage_eff_for_opt(is_cyl_stage_=is_cyl_stage, opt_cfg_=opt_cfg)
+		if is_cyl_stage and stage.name != "cyl_grow":
+			stage_eff["cyl_step_push"] = 0.0
 		stage_uses_cyl_loss = (
 			_need_term("cyl_normal", stage_eff) > 0 or
 			_need_term("cyl_center", stage_eff) > 0 or
 			_need_term("cyl_smooth", stage_eff) > 0 or
 			_need_term("cyl_z_smooth", stage_eff) > 0 or
 			_need_term("cyl_z_center", stage_eff) > 0 or
-			_need_term("cyl_seed_push", stage_eff) > 0 or
+			_need_term("cyl_step_push", stage_eff) > 0 or
 			_need_term("cyl_step", stage_eff) > 0 or
 			_need_term("cyl_radial_mean", stage_eff) > 0 or
 			_need_term("cyl_bend", stage_eff) > 0 or
@@ -1116,7 +1118,7 @@ def optimize(
 				"cyl_radial_mean": "c_rad",
 				"cyl_smooth": "c_sm",
 				"cyl_step": "c_step",
-				"cyl_seed_push": "c_spush",
+				"cyl_step_push": "c_spush",
 				"cyl_z_center": "c_zctr",
 				"cyl_z_smooth": "c_zsm",
 				"p:bend_max_deg": "benddeg",
@@ -1325,6 +1327,11 @@ def optimize(
 						_loss_prefetch_items,
 						opt_loss_cyl.cyl_normal_prefetch_items_for_result(res=res_),
 					)
+				if needs_.prefetch_cyl_grad_mask:
+					_add_prefetch_items(
+						_loss_prefetch_items,
+						opt_loss_cyl.cyl_step_push_prefetch_items_for_result(res=res_),
+					)
 				if needs_.prefetch_ext_offset:
 					_add_prefetch_items(
 						_loss_prefetch_items,
@@ -1493,6 +1500,8 @@ def optimize(
 				pass_eff = dict(stage_eff if eff is None else eff)
 				for _conn_term in ("cyl_conn_mesh", "cyl_conn_gt", "cyl_base_mesh", "cyl_base_gt"):
 					pass_eff[_conn_term] = 0.0
+				if role != "cyl_grow":
+					pass_eff["cyl_step_push"] = 0.0
 				if not keep_radial_mean:
 					pass_eff["cyl_radial_mean"] = 0.0
 				return pass_eff
@@ -1924,7 +1933,7 @@ def optimize(
 			def _grow_refine_eff(refine_opt: OptSettings) -> dict[str, float]:
 				refine_eff = _stage_eff_for_opt(is_cyl_stage_=True, opt_cfg_=refine_opt)
 				refine_eff = _pass_eff_for_role(eff=refine_eff)
-				refine_eff["cyl_seed_push"] = 0.0
+				refine_eff["cyl_step_push"] = 0.0
 				return refine_eff
 
 			def _run_grow_refine_pass(
@@ -2163,6 +2172,7 @@ def optimize(
 				model.resample_current_cylinder_shell_width_to_step(data, float(stage_model_step))
 			seed_locked_eff = dict(stage_eff)
 			seed_locked_eff["cyl_radial_mean"] = 0.0
+			seed_locked_eff["cyl_step_push"] = 0.0
 			_run_shell_pass(
 				f"{label}.{stage.name}",
 				seed_locked_eff,

@@ -81,7 +81,7 @@ def _active_terms(weights: dict[str, float]) -> dict[str, float]:
 			"cyl_smooth",
 			"cyl_z_smooth",
 			"cyl_z_center",
-			"cyl_seed_push",
+			"cyl_step_push",
 			"cyl_step",
 			"cyl_radial_mean",
 			"cyl_bend",
@@ -176,6 +176,16 @@ def cyl_normal_prefetch_items_for_result(*, res: fit_model.FitResult3D) -> dict[
 	else:
 		pts = res.cyl_xyz.detach()
 	return {"grad_mag": pts, "nx": pts, "ny": pts}
+
+
+def cyl_step_push_prefetch_items_for_result(*, res: fit_model.FitResult3D) -> dict[str, torch.Tensor]:
+	if res.cyl_xyz is None or res.cyl_count <= 0 or not bool(getattr(res, "cyl_shell_mode", False)):
+		return {}
+	geom = _shell_geometry(res=res, factor=4)
+	if geom is None:
+		return {}
+	pts = geom["xyz"].unsqueeze(0).detach()
+	return {"grad_mag": pts}
 
 
 def _zero_loss(res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
@@ -962,28 +972,52 @@ def cyl_z_center_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tupl
 	return _register_shell_term("cyl_z_center", lm, res=res)
 
 
-def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Move supersampled shell points along mesh-oriented GT normals by the current signed seed distance."""
-	geom = _shell_geometry(res=res, factor=4)
-	signed_raw = getattr(res, "cyl_seed_signed_distance", None)
-	if geom is None or signed_raw is None:
+def _valid_width_step_avg(
+	xyz: torch.Tensor,
+	mask: torch.Tensor,
+	*,
+	step_scale: float = 1.0,
+) -> torch.Tensor | None:
+	"""Average wrapped W edge length over edges whose two endpoints are valid."""
+	if int(xyz.shape[1]) <= 1:
+		return None
+	valid = mask > 0.0
+	edge_valid = valid & torch.roll(valid, shifts=-1, dims=1)
+	if not bool(edge_valid.any().detach().cpu()):
+		return None
+	w_len = (torch.roll(xyz, shifts=-1, dims=1) - xyz).norm(dim=-1)
+	return w_len[edge_valid].mean() * float(step_scale)
+
+
+def cyl_step_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Push valid shell samples along outward mesh normals from current W step error."""
+	factor = 4
+	geom = _shell_geometry(res=res, factor=factor)
+	if geom is None:
 		return _zero_loss(res)
 	xyz = geom["xyz"]
 	if not isinstance(xyz, torch.Tensor):
 		return _zero_loss(res)
-	signed = xyz.new_tensor(float(signed_raw))
-	if not bool(torch.isfinite(signed).detach().cpu()) or abs(float(signed.detach().cpu())) <= 1.0e-6:
+	w_target_value = float(getattr(res, "cyl_shell_width_step", 0.0))
+	if w_target_value <= 0.0:
 		return _zero_loss(res)
-	target, mask = _sample_shell_gt(res=res, xyz=xyz)
-	if target is None or mask is None:
+	mask = _sample_shell_grad_mask(res=res, xyz=xyz)
+	if mask is None:
 		return _zero_loss(res)
-	normal = _mesh_oriented_shell_gt_normal(xyz=xyz, target=target)
+	observed = _valid_width_step_avg(xyz, mask, step_scale=float(factor))
+	if observed is None:
+		return _zero_loss(res)
+	with torch.no_grad():
+		push = xyz.new_tensor(w_target_value) - observed.detach()
+		if not bool(torch.isfinite(push).detach().cpu()) or abs(float(push.detach().cpu())) <= 1.0e-6:
+			return _zero_loss(res)
+		normal = -_unit_normals_for_shell_xyz(xyz.detach())
 	scale_value = max(1.0, float(getattr(res.params, "mesh_step", 1.0)))
 	scale = xyz.new_tensor(scale_value)
-	proxy = xyz.detach() + normal * signed.detach()
+	proxy = xyz.detach() + normal * push
 	r = (xyz - proxy).norm(dim=-1) / scale
 	lm = torch.where(r <= 1.0, 0.5 * r.square(), r - 0.5)
-	return _register_shell_masked_term("cyl_seed_push", lm, mask, res=res)
+	return _register_shell_masked_term("cyl_step_push", lm, mask, res=res)
 
 
 def _shell_point_smooth_lm(xyz: torch.Tensor) -> torch.Tensor:
