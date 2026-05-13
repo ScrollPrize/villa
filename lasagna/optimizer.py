@@ -79,6 +79,7 @@ CYLINDER_GROW_DIRECTION_ARG = "cyl_grow_direction"
 CYLINDER_OUTSIDE_GRID_STEP_ARG = "cyl_outside_grid_step"
 CYLINDER_OUTSIDE_SAMPLE_FACTOR_ARG = "cyl_outside_sample_factor"
 CYLINDER_OUTSIDE_THREADS_ARG = "cyl_outside_threads"
+CYLINDER_OUTSIDE_CHUNK_SIZE_ARG = "cyl_outside_chunk_size"
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
 	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
@@ -561,6 +562,12 @@ def optimize(
 			raise ValueError(f"cylinder stage arg '{CYLINDER_OUTSIDE_THREADS_ARG}' must be >= 0, got {value}")
 		return value
 
+	def _cyl_outside_chunk_size(stage_args_: dict) -> int:
+		return int(stage_args_.get(
+			CYLINDER_OUTSIDE_CHUNK_SIZE_ARG,
+			cyl_sdf_volume.DEFAULT_CYL_OUTSIDE_CHUNK_SIZE,
+		))
+
 	def _clear_cyl_outside_field() -> None:
 		if hasattr(model, "clear_cyl_outside_volume"):
 			model.clear_cyl_outside_volume()
@@ -605,13 +612,15 @@ def optimize(
 		grid_step = _cyl_outside_grid_step(stage_args_)
 		sample_factor = _cyl_outside_sample_factor(stage_args_)
 		threads = _cyl_outside_threads(stage_args_)
+		chunk_size = _cyl_outside_chunk_size(stage_args_)
 		_bbox = cyl_sdf_volume.default_shell_bbox(shells[-1], grid_step=grid_step)
 		_origin, _shape = cyl_sdf_volume.shape_for_bbox(_bbox, grid_step=grid_step)
 		_voxels = int(_shape[0]) * int(_shape[1]) * int(_shape[2])
 		print(
 			f"[optimizer] {label_}: building cyl_outside previous-shell field "
 			f"shape={_shape} voxels={_voxels} grid_step={grid_step:.1f} "
-			f"threads={'auto' if threads == 0 else threads}; first run may compile the libigl extension",
+			f"threads={'auto' if threads == 0 else threads} chunk_size={chunk_size}; "
+			f"first run may compile the libigl extension",
 			flush=True,
 		)
 		field = cyl_sdf_volume.build_previous_shell_inside_depth_volume(
@@ -620,6 +629,7 @@ def optimize(
 			device=device,
 			progress_label=label_,
 			threads=threads,
+			chunk_size=chunk_size,
 		)
 		_set_cyl_outside_field(field, sample_factor=sample_factor, model_step=model_step)
 		print(

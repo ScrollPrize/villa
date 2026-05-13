@@ -94,7 +94,9 @@ void print_progress_line(
 	int64_t done,
 	int64_t total,
 	const std::chrono::steady_clock::time_point& start,
-	bool final
+	bool final,
+	bool final_complete,
+	const std::string& unit
 ) {
 	const double pct = total > 0 ? 100.0 * static_cast<double>(done) / static_cast<double>(total) : 100.0;
 	const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -110,10 +112,10 @@ void print_progress_line(
 	std::cout
 		<< "] "
 		<< std::fixed << std::setprecision(1) << pct << "% "
-		<< done << "/" << total << " vox"
+		<< done << "/" << total << " " << unit
 		<< " elapsed=" << std::setprecision(1) << elapsed << "s"
-		<< " rate=" << std::setprecision(0) << rate << " vox/s"
-		<< (final ? (done >= total ? " done" : " stopped") : "")
+		<< " rate=" << std::setprecision(0) << rate << " " << unit << "/s"
+		<< (final ? (final_complete ? " done" : " stopped") : "")
 		<< std::endl;
 }
 
@@ -124,18 +126,22 @@ public:
 		const std::string& pass,
 		int64_t total,
 		const std::atomic<int64_t>& done,
-		bool enabled
+		bool enabled,
+		const std::string& unit = "vox",
+		bool partial_ok = false
 	):
 		label_(label),
 		pass_(pass),
 		total_(total),
 		done_(done),
 		enabled_(enabled),
+		unit_(unit),
+		partial_ok_(partial_ok),
 		stop_(false),
 		start_(std::chrono::steady_clock::now())
 	{
 		if (enabled_) {
-			print_progress_line(label_, pass_, 0, total_, start_, false);
+			print_progress_line(label_, pass_, 0, total_, start_, false, false, unit_);
 			thread_ = std::thread([this]() {
 				auto last = std::chrono::steady_clock::now();
 				while (!stop_.load()) {
@@ -148,7 +154,7 @@ public:
 						continue;
 					}
 					last = now;
-					print_progress_line(label_, pass_, done_.load(), total_, start_, false);
+					print_progress_line(label_, pass_, done_.load(), total_, start_, false, false, unit_);
 				}
 			});
 		}
@@ -162,7 +168,8 @@ public:
 		if (thread_.joinable()) {
 			thread_.join();
 		}
-		print_progress_line(label_, pass_, done_.load(), total_, start_, true);
+		const int64_t done = done_.load();
+		print_progress_line(label_, pass_, done, total_, start_, true, partial_ok_ || done >= total_, unit_);
 	}
 
 private:
@@ -171,6 +178,8 @@ private:
 	int64_t total_;
 	const std::atomic<int64_t>& done_;
 	bool enabled_;
+	std::string unit_;
+	bool partial_ok_;
 	std::atomic<bool> stop_;
 	std::chrono::steady_clock::time_point start_;
 	std::thread thread_;
@@ -236,6 +245,506 @@ void throw_if_cancelled(
 	throw pybind11::error_already_set();
 }
 
+struct DepthScanStats {
+	double depth_max = 0.0;
+	int64_t inside_count = 0;
+	int64_t voxels_classified = 0;
+	int64_t voxels_skipped_by_chunk_mask = 0;
+	int64_t total_chunks = 0;
+	int64_t center_inside_chunks = 0;
+	int64_t surface_seed_chunks = 0;
+	int64_t initial_candidate_chunks = 0;
+	int64_t growth_iterations = 0;
+	int64_t processed_chunks = 0;
+	int64_t chunks_with_inside = 0;
+	double center_prepass_elapsed = 0.0;
+	double growth_elapsed = 0.0;
+	double pass_cpu_seconds = 0.0;
+	double distance_cpu_seconds = 0.0;
+	bool used_chunked = false;
+	bool used_fallback = false;
+};
+
+int64_t flat_voxel_index(int64_t x, int64_t y, int64_t z, int64_t X, int64_t Y) {
+	return (z * Y + y) * X + x;
+}
+
+int64_t flat_chunk_index(int64_t cx, int64_t cy, int64_t cz, int64_t CX, int64_t CY) {
+	return (cz * CY + cy) * CX + cx;
+}
+
+int64_t count_marked(const std::vector<uint8_t>& values) {
+	int64_t count = 0;
+	for (uint8_t value : values) {
+		if (value != 0) {
+			++count;
+		}
+	}
+	return count;
+}
+
+void dilate_marked_chunks(
+	const std::vector<uint8_t>& src,
+	std::vector<uint8_t>& dst,
+	int64_t CZ,
+	int64_t CY,
+	int64_t CX
+) {
+	for (int64_t cz = 0; cz < CZ; ++cz) {
+		for (int64_t cy = 0; cy < CY; ++cy) {
+			for (int64_t cx = 0; cx < CX; ++cx) {
+				const int64_t ci = flat_chunk_index(cx, cy, cz, CX, CY);
+				if (src[static_cast<size_t>(ci)] == 0) {
+					continue;
+				}
+				for (int dz = -1; dz <= 1; ++dz) {
+					const int64_t nz = cz + dz;
+					if (nz < 0 || nz >= CZ) {
+						continue;
+					}
+					for (int dy = -1; dy <= 1; ++dy) {
+						const int64_t ny = cy + dy;
+						if (ny < 0 || ny >= CY) {
+							continue;
+						}
+						for (int dx = -1; dx <= 1; ++dx) {
+							const int64_t nx = cx + dx;
+							if (nx < 0 || nx >= CX) {
+								continue;
+							}
+							dst[static_cast<size_t>(flat_chunk_index(nx, ny, nz, CX, CY))] = 1;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+void dilate_one_chunk_into(
+	int64_t ci,
+	std::vector<uint8_t>& dst,
+	int64_t CZ,
+	int64_t CY,
+	int64_t CX
+) {
+	const int64_t cx = ci % CX;
+	const int64_t yz = ci / CX;
+	const int64_t cy = yz % CY;
+	const int64_t cz = yz / CY;
+	for (int dz = -1; dz <= 1; ++dz) {
+		const int64_t nz = cz + dz;
+		if (nz < 0 || nz >= CZ) {
+			continue;
+		}
+		for (int dy = -1; dy <= 1; ++dy) {
+			const int64_t ny = cy + dy;
+			if (ny < 0 || ny >= CY) {
+				continue;
+			}
+			for (int dx = -1; dx <= 1; ++dx) {
+				const int64_t nx = cx + dx;
+				if (nx < 0 || nx >= CX) {
+					continue;
+				}
+				dst[static_cast<size_t>(flat_chunk_index(nx, ny, nz, CX, CY))] = 1;
+			}
+		}
+	}
+}
+
+bool voxel_range_for_coord_range(
+	double lo,
+	double hi,
+	double origin,
+	double spacing,
+	int64_t dim,
+	int64_t& out0,
+	int64_t& out1
+) {
+	const double v0 = (lo - origin) / spacing;
+	const double v1 = (hi - origin) / spacing;
+	int64_t i0 = static_cast<int64_t>(std::floor(v0));
+	int64_t i1 = static_cast<int64_t>(std::ceil(v1));
+	if (i1 < 0 || i0 >= dim) {
+		return false;
+	}
+	i0 = std::max<int64_t>(0, std::min<int64_t>(dim - 1, i0));
+	i1 = std::max<int64_t>(0, std::min<int64_t>(dim - 1, i1));
+	if (i1 < i0) {
+		return false;
+	}
+	out0 = i0;
+	out1 = i1;
+	return true;
+}
+
+DepthScanStats scan_full_volume(
+	const igl::WindingNumberAABB<double, int>& hier,
+	const igl::AABB<MatrixXdR, 3>& tree,
+	const MatrixXdR& V,
+	const MatrixXiR& F,
+	const double* origin,
+	const double* spacing,
+	int64_t Z,
+	int64_t Y,
+	int64_t X,
+	int n_threads,
+	float* depth_ptr,
+	std::atomic<bool>& cancel,
+	const std::string& progress_label,
+	const std::string& pass_label,
+	bool progress_enabled
+) {
+	const int64_t total = Z * Y * X;
+	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
+	std::vector<int64_t> thread_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_classified(static_cast<size_t>(n_threads), 0);
+	std::vector<double> thread_pass_seconds(static_cast<size_t>(n_threads), 0.0);
+	std::vector<double> thread_distance_seconds(static_cast<size_t>(n_threads), 0.0);
+	std::atomic<int64_t> max_done(0);
+	const auto pass_start = std::chrono::steady_clock::now();
+	{
+		ProgressPrinter progress(progress_label, pass_label, total, max_done, progress_enabled);
+		parallel_chunks(total, n_threads, 2048, cancel, [&](int64_t begin, int64_t end, int ti) {
+			const auto chunk_start = std::chrono::steady_clock::now();
+			double local_max = 0.0;
+			int64_t local_inside = 0;
+			int64_t processed = 0;
+			double local_distance_seconds = 0.0;
+			for (int64_t n = begin; n < end; ++n) {
+				if ((processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+					break;
+				}
+				const int64_t x = n % X;
+				const int64_t yz = n / X;
+				const int64_t y = yz % Y;
+				const int64_t z = yz / Y;
+				const RowVector3d q(
+					origin[0] + static_cast<double>(x) * spacing[0],
+					origin[1] + static_cast<double>(y) * spacing[1],
+					origin[2] + static_cast<double>(z) * spacing[2]
+				);
+				double depth = 0.0;
+				if (is_inside_at(hier, q)) {
+					const auto distance_start = std::chrono::steady_clock::now();
+					depth = surface_distance_at(tree, V, F, q);
+					local_distance_seconds += std::chrono::duration<double>(
+						std::chrono::steady_clock::now() - distance_start
+					).count();
+				}
+				const float depth_f = static_cast<float>(depth);
+				depth_ptr[n] = depth_f;
+				local_max = std::max(local_max, static_cast<double>(depth_f));
+				if (depth_f > 0.0f) {
+					++local_inside;
+				}
+				++processed;
+			}
+			thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
+			thread_inside[static_cast<size_t>(ti)] += local_inside;
+			thread_classified[static_cast<size_t>(ti)] += processed;
+			thread_distance_seconds[static_cast<size_t>(ti)] += local_distance_seconds;
+			thread_pass_seconds[static_cast<size_t>(ti)] += std::chrono::duration<double>(
+				std::chrono::steady_clock::now() - chunk_start
+			).count();
+			max_done.fetch_add(processed);
+		});
+	}
+	DepthScanStats stats;
+	stats.growth_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - pass_start).count();
+	for (const double value : thread_max) {
+		stats.depth_max = std::max(stats.depth_max, value);
+	}
+	for (const int64_t value : thread_inside) {
+		stats.inside_count += value;
+	}
+	for (const int64_t value : thread_classified) {
+		stats.voxels_classified += value;
+	}
+	for (const double value : thread_pass_seconds) {
+		stats.pass_cpu_seconds += value;
+	}
+	for (const double value : thread_distance_seconds) {
+		stats.distance_cpu_seconds += value;
+	}
+	return stats;
+}
+
+DepthScanStats scan_chunked_volume(
+	const igl::WindingNumberAABB<double, int>& hier,
+	const igl::AABB<MatrixXdR, 3>& tree,
+	const MatrixXdR& V,
+	const MatrixXiR& F,
+	const double* origin,
+	const double* spacing,
+	int64_t Z,
+	int64_t Y,
+	int64_t X,
+	int n_threads,
+	int chunk_size,
+	float* depth_ptr,
+	std::atomic<bool>& cancel,
+	const std::string& progress_label,
+	bool progress_enabled
+) {
+	const int64_t total = Z * Y * X;
+	const int64_t cs = static_cast<int64_t>(std::max(1, chunk_size));
+	const int64_t CX = (X + cs - 1) / cs;
+	const int64_t CY = (Y + cs - 1) / cs;
+	const int64_t CZ = (Z + cs - 1) / cs;
+	const int64_t total_chunks = CX * CY * CZ;
+	DepthScanStats stats;
+	stats.used_chunked = true;
+	stats.total_chunks = total_chunks;
+	stats.voxels_skipped_by_chunk_mask = total;
+
+	std::fill(depth_ptr, depth_ptr + total, 0.0f);
+
+	std::vector<uint8_t> center_inside(static_cast<size_t>(total_chunks), 0);
+	std::vector<int64_t> thread_center_inside(static_cast<size_t>(n_threads), 0);
+	std::atomic<int64_t> center_done(0);
+	const auto center_start = std::chrono::steady_clock::now();
+	{
+		ProgressPrinter progress(
+			progress_label,
+			"chunk center winding prepass",
+			total_chunks,
+			center_done,
+			progress_enabled,
+			"chunks"
+		);
+		parallel_chunks(total_chunks, n_threads, 64, cancel, [&](int64_t begin, int64_t end, int ti) {
+			int64_t local_inside = 0;
+			int64_t processed = 0;
+			for (int64_t ci = begin; ci < end; ++ci) {
+				if ((processed & 15) == 0 && cancel.load(std::memory_order_relaxed)) {
+					break;
+				}
+				const int64_t cx = ci % CX;
+				const int64_t yz = ci / CX;
+				const int64_t cy = yz % CY;
+				const int64_t cz = yz / CY;
+				const int64_t x0 = cx * cs;
+				const int64_t x1 = std::min<int64_t>(X, x0 + cs);
+				const int64_t y0 = cy * cs;
+				const int64_t y1 = std::min<int64_t>(Y, y0 + cs);
+				const int64_t z0 = cz * cs;
+				const int64_t z1 = std::min<int64_t>(Z, z0 + cs);
+				const RowVector3d q(
+					origin[0] + 0.5 * static_cast<double>(x0 + x1 - 1) * spacing[0],
+					origin[1] + 0.5 * static_cast<double>(y0 + y1 - 1) * spacing[1],
+					origin[2] + 0.5 * static_cast<double>(z0 + z1 - 1) * spacing[2]
+				);
+				if (is_inside_at(hier, q)) {
+					center_inside[static_cast<size_t>(ci)] = 1;
+					++local_inside;
+				}
+				++processed;
+			}
+			thread_center_inside[static_cast<size_t>(ti)] += local_inside;
+			center_done.fetch_add(processed);
+		});
+	}
+	stats.center_prepass_elapsed = std::chrono::duration<double>(
+		std::chrono::steady_clock::now() - center_start
+	).count();
+	for (const int64_t value : thread_center_inside) {
+		stats.center_inside_chunks += value;
+	}
+
+	throw_if_cancelled(cancel, progress_label, "chunk center prepass", progress_enabled);
+
+	std::vector<uint8_t> surface_seed(static_cast<size_t>(total_chunks), 0);
+	for (int64_t fi = 0; fi < F.rows(); ++fi) {
+		const int i0 = F(fi, 0);
+		const int i1 = F(fi, 1);
+		const int i2 = F(fi, 2);
+		const double xmin = std::min({V(i0, 0), V(i1, 0), V(i2, 0)});
+		const double xmax = std::max({V(i0, 0), V(i1, 0), V(i2, 0)});
+		const double ymin = std::min({V(i0, 1), V(i1, 1), V(i2, 1)});
+		const double ymax = std::max({V(i0, 1), V(i1, 1), V(i2, 1)});
+		const double zmin = std::min({V(i0, 2), V(i1, 2), V(i2, 2)});
+		const double zmax = std::max({V(i0, 2), V(i1, 2), V(i2, 2)});
+		int64_t vx0 = 0, vx1 = 0, vy0 = 0, vy1 = 0, vz0 = 0, vz1 = 0;
+		if (!voxel_range_for_coord_range(xmin, xmax, origin[0], spacing[0], X, vx0, vx1) ||
+			!voxel_range_for_coord_range(ymin, ymax, origin[1], spacing[1], Y, vy0, vy1) ||
+			!voxel_range_for_coord_range(zmin, zmax, origin[2], spacing[2], Z, vz0, vz1)) {
+			continue;
+		}
+		for (int64_t cz = vz0 / cs; cz <= vz1 / cs; ++cz) {
+			for (int64_t cy = vy0 / cs; cy <= vy1 / cs; ++cy) {
+				for (int64_t cx = vx0 / cs; cx <= vx1 / cs; ++cx) {
+					surface_seed[static_cast<size_t>(flat_chunk_index(cx, cy, cz, CX, CY))] = 1;
+				}
+			}
+		}
+		if ((fi & 255) == 0) {
+			throw_if_cancelled(cancel, progress_label, "surface chunk seeding", progress_enabled);
+		}
+	}
+	stats.surface_seed_chunks = count_marked(surface_seed);
+
+	std::vector<uint8_t> candidate(static_cast<size_t>(total_chunks), 0);
+	dilate_marked_chunks(center_inside, candidate, CZ, CY, CX);
+	dilate_marked_chunks(surface_seed, candidate, CZ, CY, CX);
+	stats.initial_candidate_chunks = count_marked(candidate);
+
+	std::vector<uint8_t> processed(static_cast<size_t>(total_chunks), 0);
+	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
+	std::vector<int64_t> thread_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_classified(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_processed_chunks(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_chunks_with_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<double> thread_pass_seconds(static_cast<size_t>(n_threads), 0.0);
+	std::vector<double> thread_distance_seconds(static_cast<size_t>(n_threads), 0.0);
+	std::vector<std::vector<int64_t>> thread_inside_chunks(static_cast<size_t>(n_threads));
+	std::atomic<int64_t> growth_done(0);
+	const auto growth_start = std::chrono::steady_clock::now();
+	{
+		ProgressPrinter progress(
+			progress_label,
+			"candidate/growth winding+inside-distance",
+			total,
+			growth_done,
+			progress_enabled,
+			"vox classified",
+			true
+		);
+		while (true) {
+			throw_if_cancelled(cancel, progress_label, "candidate/growth scheduling", progress_enabled);
+			std::vector<int64_t> scan_list;
+			scan_list.reserve(static_cast<size_t>(std::min<int64_t>(total_chunks, 4096)));
+			for (int64_t ci = 0; ci < total_chunks; ++ci) {
+				if (candidate[static_cast<size_t>(ci)] != 0 && processed[static_cast<size_t>(ci)] == 0) {
+					processed[static_cast<size_t>(ci)] = 1;
+					scan_list.push_back(ci);
+				}
+			}
+			if (scan_list.empty()) {
+				break;
+			}
+			++stats.growth_iterations;
+			for (std::vector<int64_t>& chunks : thread_inside_chunks) {
+				chunks.clear();
+			}
+			parallel_chunks(static_cast<int64_t>(scan_list.size()), n_threads, 1, cancel, [&](int64_t begin, int64_t end, int ti) {
+				const auto chunk_start = std::chrono::steady_clock::now();
+				double local_max = 0.0;
+				int64_t local_inside = 0;
+				int64_t local_classified = 0;
+				int64_t local_processed_chunks = 0;
+				int64_t local_chunks_with_inside = 0;
+				double local_distance_seconds = 0.0;
+				std::vector<int64_t>& local_inside_chunks = thread_inside_chunks[static_cast<size_t>(ti)];
+				for (int64_t si = begin; si < end; ++si) {
+					if (cancel.load(std::memory_order_relaxed)) {
+						break;
+					}
+					const int64_t ci = scan_list[static_cast<size_t>(si)];
+					const int64_t cx = ci % CX;
+					const int64_t yz = ci / CX;
+					const int64_t cy = yz % CY;
+					const int64_t cz = yz / CY;
+					const int64_t x0 = cx * cs;
+					const int64_t x1 = std::min<int64_t>(X, x0 + cs);
+					const int64_t y0 = cy * cs;
+					const int64_t y1 = std::min<int64_t>(Y, y0 + cs);
+					const int64_t z0 = cz * cs;
+					const int64_t z1 = std::min<int64_t>(Z, z0 + cs);
+					int64_t chunk_inside = 0;
+					int64_t chunk_processed = 0;
+					for (int64_t z = z0; z < z1; ++z) {
+						for (int64_t y = y0; y < y1; ++y) {
+							for (int64_t x = x0; x < x1; ++x) {
+								if ((chunk_processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+									break;
+								}
+								const int64_t n = flat_voxel_index(x, y, z, X, Y);
+								const RowVector3d q(
+									origin[0] + static_cast<double>(x) * spacing[0],
+									origin[1] + static_cast<double>(y) * spacing[1],
+									origin[2] + static_cast<double>(z) * spacing[2]
+								);
+								double depth = 0.0;
+								if (is_inside_at(hier, q)) {
+									const auto distance_start = std::chrono::steady_clock::now();
+									depth = surface_distance_at(tree, V, F, q);
+									local_distance_seconds += std::chrono::duration<double>(
+										std::chrono::steady_clock::now() - distance_start
+									).count();
+								}
+								const float depth_f = static_cast<float>(depth);
+								depth_ptr[n] = depth_f;
+								local_max = std::max(local_max, static_cast<double>(depth_f));
+								if (depth_f > 0.0f) {
+									++local_inside;
+									++chunk_inside;
+								}
+								++chunk_processed;
+							}
+							if (cancel.load(std::memory_order_relaxed)) {
+								break;
+							}
+						}
+						if (cancel.load(std::memory_order_relaxed)) {
+							break;
+						}
+					}
+					local_classified += chunk_processed;
+					growth_done.fetch_add(chunk_processed);
+					++local_processed_chunks;
+					if (chunk_inside > 0) {
+						++local_chunks_with_inside;
+						local_inside_chunks.push_back(ci);
+					}
+				}
+				thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
+				thread_inside[static_cast<size_t>(ti)] += local_inside;
+				thread_classified[static_cast<size_t>(ti)] += local_classified;
+				thread_processed_chunks[static_cast<size_t>(ti)] += local_processed_chunks;
+				thread_chunks_with_inside[static_cast<size_t>(ti)] += local_chunks_with_inside;
+				thread_distance_seconds[static_cast<size_t>(ti)] += local_distance_seconds;
+				thread_pass_seconds[static_cast<size_t>(ti)] += std::chrono::duration<double>(
+					std::chrono::steady_clock::now() - chunk_start
+				).count();
+			});
+			throw_if_cancelled(cancel, progress_label, "candidate/growth chunk processing", progress_enabled);
+			for (const std::vector<int64_t>& chunks : thread_inside_chunks) {
+				for (int64_t ci : chunks) {
+					dilate_one_chunk_into(ci, candidate, CZ, CY, CX);
+				}
+			}
+		}
+	}
+	stats.growth_elapsed = std::chrono::duration<double>(
+		std::chrono::steady_clock::now() - growth_start
+	).count();
+	for (const double value : thread_max) {
+		stats.depth_max = std::max(stats.depth_max, value);
+	}
+	for (const int64_t value : thread_inside) {
+		stats.inside_count += value;
+	}
+	for (const int64_t value : thread_classified) {
+		stats.voxels_classified += value;
+	}
+	for (const int64_t value : thread_processed_chunks) {
+		stats.processed_chunks += value;
+	}
+	for (const int64_t value : thread_chunks_with_inside) {
+		stats.chunks_with_inside += value;
+	}
+	for (const double value : thread_pass_seconds) {
+		stats.pass_cpu_seconds += value;
+	}
+	for (const double value : thread_distance_seconds) {
+		stats.distance_cpu_seconds += value;
+	}
+	stats.voxels_skipped_by_chunk_mask = std::max<int64_t>(0, total - stats.voxels_classified);
+	return stats;
+}
+
 } // namespace
 
 pybind11::tuple build_inside_depth_volume(
@@ -245,7 +754,8 @@ pybind11::tuple build_inside_depth_volume(
 	torch::Tensor spacing_xyz,
 	torch::Tensor shape_zyx,
 	const std::string& progress_label,
-	int requested_threads
+	int requested_threads,
+	int chunk_size
 ) {
 	MatrixXdR V = tensor_to_vertices(vertices);
 	MatrixXiR F = tensor_to_faces(faces);
@@ -317,78 +827,59 @@ pybind11::tuple build_inside_depth_volume(
 	throw_if_cancelled(cancel, progress_label, "libigl acceleration setup", progress_enabled);
 	auto depth_tmp = torch::empty({total}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
 	float* depth_ptr = depth_tmp.data_ptr<float>();
-	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
-	std::vector<int64_t> thread_inside(static_cast<size_t>(n_threads), 0);
-	std::vector<double> thread_pass_seconds(static_cast<size_t>(n_threads), 0.0);
-	std::vector<double> thread_distance_seconds(static_cast<size_t>(n_threads), 0.0);
-	std::atomic<int64_t> max_done(0);
-	const auto pass1_start = std::chrono::steady_clock::now();
-	{
-		ProgressPrinter progress(progress_label, "pass 1/2 winding+inside-distance", total, max_done, progress_enabled);
-		parallel_chunks(total, n_threads, 2048, cancel, [&](int64_t begin, int64_t end, int ti) {
-			const auto chunk_start = std::chrono::steady_clock::now();
-			double local_max = 0.0;
-			int64_t local_inside = 0;
-			int64_t processed = 0;
-			double local_distance_seconds = 0.0;
-			for (int64_t n = begin; n < end; ++n) {
-				if ((processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
-					break;
-				}
-				const int64_t x = n % X;
-				const int64_t yz = n / X;
-				const int64_t y = yz % Y;
-				const int64_t z = yz / Y;
-				const RowVector3d q(
-					origin[0] + static_cast<double>(x) * spacing[0],
-					origin[1] + static_cast<double>(y) * spacing[1],
-					origin[2] + static_cast<double>(z) * spacing[2]
-				);
-				double depth = 0.0;
-				if (is_inside_at(hier, q)) {
-					const auto distance_start = std::chrono::steady_clock::now();
-					depth = surface_distance_at(tree, V, F, q);
-					local_distance_seconds += std::chrono::duration<double>(
-						std::chrono::steady_clock::now() - distance_start
-					).count();
-				}
-				const float depth_f = static_cast<float>(depth);
-				depth_ptr[n] = depth_f;
-				local_max = std::max(local_max, static_cast<double>(depth_f));
-				if (depth_f > 0.0f) {
-					++local_inside;
-				}
-				++processed;
+	DepthScanStats scan_stats;
+	if (chunk_size <= 0) {
+		if (progress_enabled) {
+			std::cout
+				<< "[cyl_outside] " << progress_label
+				<< ": chunk_size=" << chunk_size << "; using full voxel scan"
+				<< std::endl;
+		}
+		scan_stats = scan_full_volume(
+			hier, tree, V, F, origin, spacing, Z, Y, X, n_threads,
+			depth_ptr, cancel, progress_label, "pass 1/2 full winding+inside-distance", progress_enabled
+		);
+		throw_if_cancelled(cancel, progress_label, "full winding+inside-distance pass", progress_enabled);
+	} else {
+		if (progress_enabled) {
+			std::cout
+				<< "[cyl_outside] " << progress_label
+				<< ": using chunked scan chunk_size=" << chunk_size
+				<< std::endl;
+		}
+		scan_stats = scan_chunked_volume(
+			hier, tree, V, F, origin, spacing, Z, Y, X, n_threads, chunk_size,
+			depth_ptr, cancel, progress_label, progress_enabled
+		);
+		throw_if_cancelled(cancel, progress_label, "chunked winding+inside-distance pass", progress_enabled);
+		if (scan_stats.inside_count == 0) {
+			if (progress_enabled) {
+				std::cout
+					<< "[cyl_outside] " << progress_label
+					<< ": WARNING chunked scan found zero inside voxels; rerunning full scan"
+					<< std::endl;
 			}
-			thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
-			thread_inside[static_cast<size_t>(ti)] += local_inside;
-			thread_distance_seconds[static_cast<size_t>(ti)] += local_distance_seconds;
-			thread_pass_seconds[static_cast<size_t>(ti)] += std::chrono::duration<double>(
-				std::chrono::steady_clock::now() - chunk_start
-			).count();
-			max_done.fetch_add(processed);
-		});
-	}
-	throw_if_cancelled(cancel, progress_label, "winding+inside-distance pass", progress_enabled);
-	const double pass1_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - pass1_start).count();
-	double depth_max = 0.0;
-	int64_t inside_count = 0;
-	double pass_cpu_seconds = 0.0;
-	double distance_cpu_seconds = 0.0;
-	for (const double value : thread_max) {
-		if (value > depth_max) {
-			depth_max = value;
+			DepthScanStats fallback_stats = scan_full_volume(
+				hier, tree, V, F, origin, spacing, Z, Y, X, n_threads,
+				depth_ptr, cancel, progress_label, "fallback full winding+inside-distance", progress_enabled
+			);
+			throw_if_cancelled(cancel, progress_label, "fallback full winding+inside-distance pass", progress_enabled);
+			fallback_stats.used_chunked = true;
+			fallback_stats.used_fallback = true;
+			fallback_stats.total_chunks = scan_stats.total_chunks;
+			fallback_stats.center_inside_chunks = scan_stats.center_inside_chunks;
+			fallback_stats.surface_seed_chunks = scan_stats.surface_seed_chunks;
+			fallback_stats.initial_candidate_chunks = scan_stats.initial_candidate_chunks;
+			fallback_stats.growth_iterations = scan_stats.growth_iterations;
+			fallback_stats.processed_chunks = scan_stats.processed_chunks;
+			fallback_stats.chunks_with_inside = scan_stats.chunks_with_inside;
+			fallback_stats.voxels_skipped_by_chunk_mask = scan_stats.voxels_skipped_by_chunk_mask;
+			fallback_stats.center_prepass_elapsed = scan_stats.center_prepass_elapsed;
+			scan_stats = fallback_stats;
 		}
 	}
-	for (const int64_t value : thread_inside) {
-		inside_count += value;
-	}
-	for (const double value : thread_pass_seconds) {
-		pass_cpu_seconds += value;
-	}
-	for (const double value : thread_distance_seconds) {
-		distance_cpu_seconds += value;
-	}
+	const double depth_max = scan_stats.depth_max;
+	const int64_t inside_count = scan_stats.inside_count;
 
 	auto out = torch::empty({1, Z, Y, X}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
 	uint8_t* out_ptr = out.data_ptr<uint8_t>();
@@ -412,20 +903,24 @@ pybind11::tuple build_inside_depth_volume(
 	const double encode_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - encode_start).count();
 	if (progress_enabled) {
 		const double total_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - total_start).count();
-		const double pass1_rate = pass1_elapsed > 0.0 ? static_cast<double>(total) / pass1_elapsed : 0.0;
+		const double pass1_elapsed = scan_stats.growth_elapsed;
+		const double pass1_rate = pass1_elapsed > 0.0 ? static_cast<double>(scan_stats.voxels_classified) / pass1_elapsed : 0.0;
 		const double encode_rate = encode_elapsed > 0.0 ? static_cast<double>(total) / encode_elapsed : 0.0;
 		const int64_t skipped_distance = total - inside_count;
-		const double distance_share = pass_cpu_seconds > 0.0
-			? std::min(1.0, std::max(0.0, distance_cpu_seconds / pass_cpu_seconds))
+		const double distance_share = scan_stats.pass_cpu_seconds > 0.0
+			? std::min(1.0, std::max(0.0, scan_stats.distance_cpu_seconds / scan_stats.pass_cpu_seconds))
 			: 0.0;
 		const double distance_wall_est = pass1_elapsed * distance_share;
 		const double winding_wall_est = pass1_elapsed - distance_wall_est;
 		std::cout
 			<< "[cyl_outside] " << progress_label
-			<< ": timing prep=" << std::fixed << std::setprecision(2) << prep_elapsed << "s"
-			<< " winding_classify~=" << winding_wall_est << "s"
+			<< ": timing mode="
+			<< (scan_stats.used_chunked ? (scan_stats.used_fallback ? "chunked+fallback" : "chunked") : "full")
+			<< " prep=" << std::fixed << std::setprecision(2) << prep_elapsed << "s"
+			<< " center_prepass_winding=" << scan_stats.center_prepass_elapsed << "s"
+			<< " candidate_growth_winding~=" << winding_wall_est << "s"
 			<< " inside_distance~=" << distance_wall_est << "s"
-			<< " pass1=" << pass1_elapsed << "s"
+			<< " scan=" << pass1_elapsed << "s"
 			<< " (" << std::setprecision(0) << pass1_rate << " vox/s)"
 			<< " encode=" << std::setprecision(2) << encode_elapsed << "s"
 			<< " (" << std::setprecision(0) << encode_rate << " vox/s)"
@@ -437,10 +932,29 @@ pybind11::tuple build_inside_depth_volume(
 			<< " skipped_outside=" << skipped_distance
 			<< " inside_frac=" << std::fixed << std::setprecision(4)
 			<< (total > 0 ? static_cast<double>(inside_count) / static_cast<double>(total) : 0.0)
-			<< " distance_cpu=" << std::setprecision(2) << distance_cpu_seconds << "s"
-			<< " pass1_cpu=" << pass_cpu_seconds << "s"
+			<< " distance_cpu=" << std::setprecision(2) << scan_stats.distance_cpu_seconds << "s"
+			<< " scan_cpu=" << scan_stats.pass_cpu_seconds << "s"
 			<< " depth_max=" << std::setprecision(3) << depth_max
 			<< std::endl;
+		if (scan_stats.used_chunked) {
+			std::cout
+				<< "[cyl_outside] " << progress_label
+				<< ": chunk stats total_chunks=" << scan_stats.total_chunks
+				<< " center_inside_chunks=" << scan_stats.center_inside_chunks
+				<< " surface_seed_chunks=" << scan_stats.surface_seed_chunks
+				<< " initial_candidate_chunks=" << scan_stats.initial_candidate_chunks
+				<< " growth_iterations=" << scan_stats.growth_iterations
+				<< " processed_chunks=" << scan_stats.processed_chunks
+				<< " chunks_with_inside=" << scan_stats.chunks_with_inside
+				<< " processed_chunk_frac=" << std::fixed << std::setprecision(4)
+				<< (scan_stats.total_chunks > 0
+					? static_cast<double>(scan_stats.processed_chunks) / static_cast<double>(scan_stats.total_chunks)
+					: 0.0)
+				<< " voxels_classified=" << scan_stats.voxels_classified
+				<< " voxels_skipped_by_chunk_mask=" << scan_stats.voxels_skipped_by_chunk_mask
+				<< " inside_voxels=" << scan_stats.inside_count
+				<< std::endl;
+		}
 	}
 
 	return pybind11::make_tuple(out, depth_max);
@@ -457,6 +971,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		pybind11::arg("shape_zyx"),
 		pybind11::arg("progress_label") = "",
 		pybind11::arg("requested_threads") = 0,
+		pybind11::arg("chunk_size") = 16,
 		"Build uint8 inside-depth volume from a capped shell mesh"
 	);
 }

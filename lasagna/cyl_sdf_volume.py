@@ -10,6 +10,7 @@ import torch
 
 
 DEFAULT_CYL_OUTSIDE_GRID_STEP = 64.0
+DEFAULT_CYL_OUTSIDE_CHUNK_SIZE = 16
 
 _ext_module = None
 
@@ -180,6 +181,7 @@ def build_previous_shell_inside_depth_volume(
 	device: torch.device | str | None = None,
 	progress_label: str | None = None,
 	threads: int = 0,
+	chunk_size: int = DEFAULT_CYL_OUTSIDE_CHUNK_SIZE,
 ) -> CylOutsideVolume:
 	"""Build a coarse uint8 inside-depth field for the completed previous shell."""
 	step = max(1.0e-6, float(grid_step))
@@ -209,6 +211,7 @@ def build_previous_shell_inside_depth_volume(
 		torch.tensor(shape, dtype=torch.int64),
 		"" if progress_label is None else str(progress_label),
 		int(threads),
+		int(chunk_size),
 	)
 	depth_max = float(depth_max)
 	if device is not None:
