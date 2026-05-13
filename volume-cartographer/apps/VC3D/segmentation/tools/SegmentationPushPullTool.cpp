@@ -822,15 +822,12 @@ void SegmentationPushPullTool::launchAlphaCompute()
         return;
     }
 
-    // Capture all inputs needed by the background thread on the main thread
+    // Capture all inputs needed by the background thread on the main thread.
+    // Alpha push/pull is an editing interaction against the displayed volume,
+    // not the growth volume selected in the segmentation widget.
     std::shared_ptr<Volume> volume = hover.viewer->currentVolume();
-    if (_state && _state->vpkg()) {
-        const std::string selectedVolumeId = _state->segmentationGrowthVolumeId().empty()
-            ? _state->currentVolumeId()
-            : _state->segmentationGrowthVolumeId();
-        if (!selectedVolumeId.empty() && _state->vpkg()->hasVolume(selectedVolumeId)) {
-            volume = _state->vpkg()->volume(selectedVolumeId);
-        }
+    if (!volume && _state) {
+        volume = _state->currentVolume();
     }
     if (!volume) {
         failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active volume to sample."));
