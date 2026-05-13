@@ -37,6 +37,7 @@ public:
         // pool is shared by caches with the same worker count and is not
         // destroyed when a viewer is closed.
         std::size_t maxConcurrentReads = 16;
+        bool detectAllFillChunks = true;
         std::optional<std::filesystem::path> persistentCachePath;
     };
 
