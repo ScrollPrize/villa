@@ -38,26 +38,25 @@ FetchContent_GetProperties(pastix)
 if(NOT pastix_POPULATED)
     FetchContent_Populate(pastix)
 
-    # PaStiX's RulesPrecisions.cmake invokes codegen.py with
-    #   -D ${RP_<project>_DICTIONNARY}
-    # to know which substitution dictionary maps p_/s_/d_/c_/z_ stems to the
-    # concrete-precision sources. PaStiX calls `project(PASTIX ...)` from
-    # its top-level CMakeLists, so once add_subdirectory() runs, the active
-    # project name is "pastix" — not our parent project's. We must set both
-    # the dictionary and the precision filter under that name; otherwise
-    # codegen.py is called with -D "" and fails:
+    # PaStiX's RulesPrecisions.cmake reads RP_${CMAKE_PROJECT_NAME}_*
+    # variables to drive codegen.py. CMAKE_PROJECT_NAME is the top-level
+    # project name (set once by the first project() call), which for us is
+    # "VC3D" — PaStiX's internal `project(PASTIX)` from add_subdirectory()
+    # does NOT change CMAKE_PROJECT_NAME, so we must set the cache vars
+    # under "VC3D". Without RP_VC3D_DICTIONNARY codegen.py runs with
+    # -D "" and fails:
     #   codegen.py: error: -D option requires 1 argument
     # and *_spm.h / precision-templated TUs never get generated.
-    set(RP_pastix_DICTIONNARY
+    set(RP_${CMAKE_PROJECT_NAME}_DICTIONNARY
         "${pastix_SOURCE_DIR}/cmake_modules/local_subs.py"
         CACHE INTERNAL "")
     # flatboi only ever solves double-precision real systems
     # (Pastix6LLT<double>, SpmDouble). Restrict codegen to "d" so PaStiX
     # doesn't auto-generate and compile s/c/z variants of every
     # precision-templated TU.
-    set(RP_pastix_PRECISIONS "d" CACHE INTERNAL "")
-    set(PASTIX_PRECISIONS    "d" CACHE STRING "" FORCE)
-    set(SPM_PRECISIONS       "d" CACHE STRING "" FORCE)
+    set(RP_${CMAKE_PROJECT_NAME}_PRECISIONS "d" CACHE INTERNAL "")
+    set(PASTIX_PRECISIONS "d" CACHE STRING "" FORCE)
+    set(SPM_PRECISIONS    "d" CACHE STRING "" FORCE)
 
     # PaStiX 6.4 upstream quirks when consumed as a subproject:
     # 1. Uses ${CMAKE_SOURCE_DIR} where it means ${CMAKE_CURRENT_SOURCE_DIR}.
