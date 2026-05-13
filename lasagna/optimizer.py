@@ -73,6 +73,7 @@ CYLINDER_STAGE_STEP_ARG = "model-step"
 OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_step_size", "wstep_target")
 CYLINDER_OUTPUT_ALL_SHELLS_ARGS = ("cyl_output_all_shells", "cyl_shell_output_all")
 CYLINDER_MAX_SEARCH_SHELLS_ARGS = ("cyl_max_shells", "cyl_shell_max_shells", "cyl_shell_search_max_shells")
+CYLINDER_GROW_DIRECTION_ARG = "cyl_grow_direction"
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
 	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
@@ -418,6 +419,7 @@ def optimize(
 	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
 	out_dir: str | None = None,
+	cylinder_shell_callback=None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
@@ -500,6 +502,35 @@ def optimize(
 					raise ValueError(f"cylinder stage arg '{key}' must be > 0, got {value}")
 				return value
 		return int(default)
+
+	def _cyl_stage_grow_direction() -> int:
+		for stage_ in stages:
+			if stage_.name != "cyl_grow":
+				continue
+			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
+			raw = args.get(CYLINDER_GROW_DIRECTION_ARG, "outward")
+			if raw is None:
+				raw = "outward"
+			if isinstance(raw, str):
+				value = raw.strip().lower()
+				if value in {"outward", "grow", "expand", "+", "+1", "1"}:
+					return 1
+				if value in {"inward", "shrink", "contract", "-", "-1"}:
+					return -1
+			else:
+				try:
+					value_f = float(raw)
+				except (TypeError, ValueError):
+					value_f = None
+				if value_f == 1.0:
+					return 1
+				if value_f == -1.0:
+					return -1
+			raise ValueError(
+				f"cylinder stage arg '{CYLINDER_GROW_DIRECTION_ARG}' must be "
+				f"'outward' or 'inward', got {raw!r}"
+			)
+		return 1
 
 	def _next_stage_is_cyl(si_: int) -> bool:
 		return si_ + 1 < len(stages) and _is_cyl_stage(stages[si_ + 1])
@@ -1009,20 +1040,9 @@ def optimize(
 		_stage_done(f"{label}.configure_losses", _t)
 
 		if bool(getattr(model, "cyl_shell_mode", False)) and stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES:
-			if bool(getattr(model, "cyl_shell_search_done", False)) and not bool(getattr(model, "cyl_shell_search_crossed", False)):
-				print(
-					f"[optimizer] {label}: skipping stage '{stage.name}' after failed cylinder shell search; "
-					"outputting completed shells",
-					flush=True,
-				)
-				return data
-			if not bool(getattr(model, "cyl_shell_search_crossed", False)):
-				raise RuntimeError(
-					f"{label}: stage '{stage.name}' cannot run before cylinder shell search crosses the seed"
-				)
 			if not bool(getattr(model, "cyl_shell_search_done", False)):
 				if not getattr(model, "cyl_shell_completed", None):
-					raise RuntimeError(f"{label}: cylinder shell search crossed, but no completed shell is available")
+					raise RuntimeError(f"{label}: cylinder shell progression has no completed shell")
 				_collapse_cylinder_shells_to_last()
 				model.cyl_shell_search_done = True
 
@@ -1134,7 +1154,6 @@ def optimize(
 				"pred_dt_pull_active_frac": "pull%",
 				"pred_dt_pull_prefix_mean": "pullpre",
 				"pred_dt_pull_weight_mean": "pullw",
-				"p:seed_dist_vx": "sdist",
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
 				"p:wstep_avg_vx": "wavg",
@@ -1439,6 +1458,7 @@ def optimize(
 			max_steps = int(opt_cfg.steps)
 			default_max_search_shells = max(1, int(getattr(model, "cyl_shell_search_max_shells", 16)))
 			max_search_shells = max(1, _cyl_stage_max_search_shells(default_max_search_shells))
+			grow_direction_arg = _cyl_stage_grow_direction()
 			_stage_wstep = _cyl_stage_width_target_step(opt_cfg)
 			_prev_stage_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
 			_base_wstep = float(
@@ -1490,9 +1510,6 @@ def optimize(
 				if w_count > 0:
 					out["wcirc_avg_vx"] = float(w_count) * float(_avg)
 					out["wcirc_tgt_vx"] = float(w_count) * tgt
-				last_dist = getattr(model, "cyl_shell_search_last_signed_distance", None)
-				if last_dist is not None:
-					out["seed_dist_vx"] = float(last_dist)
 				return out
 
 			def _pass_eff_for_role(*, keep_radial_mean: bool = True,
@@ -1506,37 +1523,6 @@ def optimize(
 					pass_eff["cyl_radial_mean"] = 0.0
 				return pass_eff
 
-			def _measure_seed(shell_label: str, *, log: bool = True):
-				if hasattr(model, "assert_cylinder_shell_brackets_seed"):
-					model.assert_cylinder_shell_brackets_seed(label=f"{shell_label} seed distance")
-				if hasattr(model, "measure_seed_vs_current_cylinder_shell"):
-					metrics = model.measure_seed_vs_current_cylinder_shell(seed=seed_xyz)
-					cls = str(metrics.classification)
-					signed = float(metrics.signed_distance)
-					tol = float(metrics.tolerance)
-				elif hasattr(model, "classify_seed_vs_current_cylinder_shell"):
-					cls = str(model.classify_seed_vs_current_cylinder_shell(seed=seed_xyz))
-					signed = 0.0 if cls == "edge" else (1.0 if cls == "outside" else -1.0)
-					tol = 0.0
-					metrics = type("_SeedMetrics", (), {
-						"classification": cls,
-						"signed_distance": signed,
-						"tolerance": tol,
-					})()
-				else:
-					raise RuntimeError(f"{shell_label}: model does not support seed-vs-shell measurement")
-				if cls not in {"inside", "outside", "edge"}:
-					raise RuntimeError(f"{shell_label}: invalid seed-vs-shell classification '{cls}'")
-				model.cyl_shell_search_last_class = cls
-				model.cyl_shell_search_last_signed_distance = signed
-				if log:
-					print(
-						f"[optimizer] {shell_label}: seed_vs_shell={cls} "
-						f"signed_dist={signed:.3f} tol={tol:.3g}",
-						flush=True,
-					)
-				return metrics
-
 			def _abort_after_shell_error(shell_label: str, err: Exception, *, keep_active: bool) -> None:
 				print(
 					f"[optimizer] ERROR {shell_label}: {err}; "
@@ -1547,18 +1533,6 @@ def optimize(
 				setattr(model, "cyl_shell_abort", True)
 				if not keep_active and hasattr(model, "cyl_shell_active"):
 					model.cyl_shell_active = False
-
-			def _seed_hit(metrics) -> bool:
-				cls = str(metrics.classification)
-				signed = float(metrics.signed_distance)
-				tol = float(getattr(metrics, "tolerance", 0.0))
-				if cls == "edge" or abs(signed) <= max(tol, 1.0):
-					return True
-				initial = getattr(model, "cyl_shell_search_initial_signed_distance", None)
-				if initial is None:
-					return False
-				initial = float(initial)
-				return (initial > 0.0 and signed <= 0.0) or (initial < 0.0 and signed >= 0.0)
 
 			def _actual_width_step_avg(*, fallback: float) -> float:
 				if hasattr(model, "_shell_width_step_stats"):
@@ -1572,22 +1546,14 @@ def optimize(
 						return max(1.0, float(args[key]))
 				return 1.5
 
-			def _seed_refine_next_wstep(metrics, *, model_step: float) -> float:
-				return _actual_width_step_avg(fallback=max(1.0, float(model_step)))
-
 			def _run_shell_pass(shell_label: str, pass_eff: dict[str, float], *,
 								wstep_start: float, wstep_end: float,
 								pass_opt_cfg: OptSettings | None = None,
 								pass_steps: int | None = None,
-								seed_lock: bool = False,
 								model_step: float | None = None,
-								stop_on_seed_hit: bool = False,
 								max_resamples: int | None = None,
-								search_until_seed: bool = False,
-								stop_after_resample: bool = False,
-								search_direction: int = 0,
-								seed_target_mode: str = "search",
 								allow_resample: bool = True,
+								resample_after_linear_grow: bool = False,
 								status_label: str | None = None,
 								shell_no: int | None = None,
 								suppress_initial_status: bool = False) -> dict[str, object]:
@@ -1597,8 +1563,6 @@ def optimize(
 				pass_max_steps = max(0, int(max_steps if pass_steps is None else pass_steps))
 				if shell_no is not None:
 					_status_step_width = max(_status_step_width, len("1000000") + 2)
-				elif search_until_seed:
-					_status_step_width = max(_status_step_width, len(f"{display_label} 1000000") + 2)
 				else:
 					_status_step_width = max(_status_step_width, len(f"{display_label} {pass_max_steps}/{pass_max_steps}") + 2)
 				pass_needs = _needs_for_eff(
@@ -1612,27 +1576,18 @@ def optimize(
 					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
 				opt = torch.optim.Adam(param_groups)
 				resample_count = 0
-				last_metrics = None
-				seed_hit = False
 				resampled_this_pass = False
 				step1 = 0
 
 				def _error_result(err: Exception) -> dict[str, object]:
 					return {
 						"seed_hit": False,
-						"metrics": last_metrics,
+						"metrics": None,
 						"resamples": resample_count,
 						"resampled": resampled_this_pass,
 						"error": err,
 						"keep_active": step1 > 0,
 					}
-
-				def _reset_shell_optimizer() -> None:
-					nonlocal all_params, param_groups, opt
-					all_params, param_groups = _make_param_groups(pass_settings)
-					if not param_groups:
-						raise RuntimeError(f"{shell_label}: no cylinder parameters available after resampling")
-					opt = torch.optim.Adam(param_groups)
 
 				def _resample_shell_width_to_model_step() -> bool:
 					nonlocal resample_count, resampled_this_pass
@@ -1641,7 +1596,7 @@ def optimize(
 					model_step_ref = max(1.0, float(model_step))
 					if max_resamples is not None and resample_count >= max_resamples:
 						print(
-							f"[optimizer] ERROR {shell_label}: adaptive cylinder shell search hit "
+							f"[optimizer] ERROR {shell_label}: cylinder shell pass hit "
 							f"resample cap {max_resamples}; outputting completed shells.",
 							flush=True,
 						)
@@ -1652,52 +1607,6 @@ def optimize(
 					resample_count += 1
 					resampled_this_pass = True
 					return True
-
-				def _maybe_resample_for_step_target() -> bool:
-					nonlocal resample_count, resampled_this_pass
-					if not seed_lock or model_step is None or not allow_resample:
-						return True
-					model_step_ref = max(1.0, float(model_step))
-					if not hasattr(model, "_shell_width_step_stats"):
-						raise RuntimeError(f"{shell_label}: model cannot report cylinder shell width step stats")
-					actual_avg = max(1.0, float(model._shell_width_step_stats()[0]))
-					lower = 0.7 * model_step_ref
-					upper = 1.5 * model_step_ref
-					if int(search_direction) > 0:
-						if actual_avg < upper:
-							return True
-					elif int(search_direction) < 0:
-						if actual_avg > lower:
-							return True
-					else:
-						return True
-					if not _resample_shell_width_to_model_step():
-						return False
-					_reset_shell_optimizer()
-					return True
-
-				def _apply_seed_target(metrics) -> None:
-					if seed_target_mode == "fixed":
-						return
-					if seed_target_mode == "linear_grow":
-						return
-					if seed_target_mode == "refine":
-						model.cyl_shell_current_width_step = _seed_refine_next_wstep(
-							metrics,
-							model_step=float(model_step),
-						)
-					else:
-						model.cyl_shell_current_width_step = _actual_width_step_avg(
-							fallback=float(model_step),
-						)
-
-				if seed_lock and model_step is not None:
-					try:
-						last_metrics = _measure_seed(shell_label, log=False)
-					except ValueError as exc:
-						return _error_result(exc)
-					if not (stop_on_seed_hit and _seed_hit(last_metrics)):
-						_apply_seed_target(last_metrics)
 
 				_t = _stage_start(f"{shell_label}.initial_eval")
 				_prefetch_shell_model_points(pass_needs)
@@ -1711,7 +1620,7 @@ def optimize(
 					_print_status(
 						step_label=(
 							"0" if shell_no is not None
-							else (f"{display_label} 0" if search_until_seed else f"{display_label} 0/{pass_max_steps}")
+							else f"{display_label} 0/{pass_max_steps}"
 						),
 						loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
 						tv=term_vals0,
@@ -1735,23 +1644,7 @@ def optimize(
 				step = 0
 				while step < pass_max_steps:
 					_t_iter = time.perf_counter()
-					if seed_lock and model_step is not None:
-						if not (step == 0 and last_metrics is not None):
-							try:
-								last_metrics = _measure_seed(shell_label, log=False)
-							except ValueError as exc:
-								return _error_result(exc)
-						if stop_on_seed_hit and _seed_hit(last_metrics):
-							seed_hit = True
-							break
-						if seed_target_mode == "linear_grow" and pass_max_steps > 0:
-							_alpha = float(step + 1) / float(pass_max_steps)
-							model.cyl_shell_current_width_step = (
-								float(wstep_start) + _alpha * (float(wstep_end) - float(wstep_start))
-							)
-						else:
-							_apply_seed_target(last_metrics)
-					elif pass_max_steps > 0:
+					if pass_max_steps > 0:
 						_alpha = float(step + 1) / float(pass_max_steps)
 						model.cyl_shell_current_width_step = (
 							float(wstep_start) + _alpha * (float(wstep_end) - float(wstep_start))
@@ -1816,17 +1709,6 @@ def optimize(
 					if _opt_timing is not None:
 						_opt_timing.sync()
 						_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
-					if (
-						seed_lock
-						and model_step is not None
-						and seed_target_mode != "linear_grow"
-						and not _maybe_resample_for_step_target()
-					):
-						break
-					if stop_after_resample and resampled_this_pass:
-						step1 = step + 1
-						break
-
 					_t_part = time.perf_counter()
 					if _active_caches:
 						_prefetch_shell_model_points(pass_needs)
@@ -1838,7 +1720,7 @@ def optimize(
 					step1 = step + 1
 					_t_steps_acc += 1
 					_done_steps[0] += 1
-					_stage_progress = 0.0 if search_until_seed else (step1 / pass_max_steps if pass_max_steps > 0 else 1.0)
+					_stage_progress = step1 / pass_max_steps if pass_max_steps > 0 else 1.0
 					_overall_progress = (
 						min(1.0, _done_steps[0] / max(1, _total_steps))
 						if _total_steps > 0 else 1.0
@@ -1861,7 +1743,7 @@ def optimize(
 					else:
 						_status_due = (
 							step == 0 or
-							(not search_until_seed and step1 == pass_max_steps) or
+							step1 == pass_max_steps or
 							(status_interval > 0 and (step1 % status_interval) == 0)
 						)
 					if _status_due:
@@ -1872,7 +1754,7 @@ def optimize(
 						_print_status(
 							step_label=(
 								str(step1) if shell_no is not None
-								else (f"{display_label} {step1}" if search_until_seed else f"{display_label} {step1}/{pass_max_steps}")
+								else f"{display_label} {step1}/{pass_max_steps}"
 							),
 							loss_val=float(display_loss) if display_loss is not None else loss.item(),
 							tv=term_vals,
@@ -1892,9 +1774,8 @@ def optimize(
 						)
 					step += 1
 				if (
-					seed_lock
+					resample_after_linear_grow
 					and model_step is not None
-					and seed_target_mode == "linear_grow"
 					and step1 > 0
 					and not resampled_this_pass
 					and not _resample_shell_width_to_model_step()
@@ -1906,21 +1787,6 @@ def optimize(
 
 				snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
 							loss=float(loss.detach().cpu()), data=data, res=res)
-				if seed_lock:
-					try:
-						last_metrics = _measure_seed(shell_label, log=False)
-					except ValueError as exc:
-						return _error_result(exc)
-					if stop_on_seed_hit and _seed_hit(last_metrics):
-						seed_hit = True
-					return {
-						"seed_hit": seed_hit,
-						"metrics": last_metrics,
-						"resamples": resample_count,
-						"resampled": resampled_this_pass,
-						"error": None,
-						"keep_active": False,
-					}
 				return {
 					"seed_hit": False,
 					"metrics": None,
@@ -1936,12 +1802,26 @@ def optimize(
 				refine_eff["cyl_step_push"] = 0.0
 				return refine_eff
 
+			def _emit_cylinder_shell_callback(stage_label: str) -> None:
+				if cylinder_shell_callback is None:
+					return
+				shells = getattr(model, "cyl_shell_completed", None)
+				if not shells:
+					return
+				shell_index = len(shells) - 1
+				shell_xyz = shells[-1].detach().clone()
+				cylinder_shell_callback(
+					shell_index=shell_index,
+					shell_xyz=shell_xyz,
+					stage_label=stage_label,
+					data=data,
+				)
+
 			def _run_grow_refine_pass(
 				*,
 				refine_label: str,
 				refine_opt: OptSettings,
 				shell_no: int | None,
-				stop_on_seed_hit: bool = True,
 			) -> dict[str, object]:
 				if int(refine_opt.steps) <= 0:
 					return {"seed_hit": False, "metrics": None, "resamples": 0, "resampled": False, "error": None}
@@ -1960,16 +1840,14 @@ def optimize(
 					wstep_end=refine_wstep,
 					pass_opt_cfg=refine_opt,
 					pass_steps=int(refine_opt.steps),
-					seed_lock=True,
 					model_step=refine_wstep,
-					stop_on_seed_hit=bool(stop_on_seed_hit),
-					seed_target_mode="fixed",
 					allow_resample=False,
 					shell_no=shell_no,
 					suppress_initial_status=False,
 				)
 				if result_.get("error") is None and hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
+					_emit_cylinder_shell_callback(refine_label)
 				if hasattr(model, "cyl_shell_width_target_step"):
 					model.cyl_shell_width_target_step = float(_base_wstep)
 				return result_
@@ -1987,27 +1865,11 @@ def optimize(
 								shell_no=1)
 				if hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
+					_emit_cylinder_shell_callback(f"{label}.cyl_init")
 				if _cyl_init_only:
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
-				try:
-					metrics = _measure_seed(f"{label}.cyl_init", log=False)
-				except ValueError as exc:
-					_abort_after_shell_error(f"{label}.cyl_init", exc, keep_active=False)
-					_stage_done(f"{label}.total", _t_stage_total)
-					return data
-				cls = str(metrics.classification)
-				model.cyl_shell_search_initial_class = cls
-				model.cyl_shell_search_initial_signed_distance = float(metrics.signed_distance)
-				if cls == "edge":
-					model.cyl_shell_search_direction = 0
-					model.cyl_shell_search_crossed = True
-				elif cls == "outside":
-					model.cyl_shell_search_direction = 1
-					model.cyl_shell_search_crossed = False
-				else:
-					model.cyl_shell_search_direction = -1
-					model.cyl_shell_search_crossed = False
+				model.cyl_shell_search_direction = int(grow_direction_arg)
 				_stage_done(f"{label}.total", _t_stage_total)
 				return data
 
@@ -2015,19 +1877,9 @@ def optimize(
 				if bool(getattr(model, "cyl_shell_search_done", False)):
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
-				if bool(getattr(model, "cyl_shell_search_crossed", False)):
-					_collapse_cylinder_shells_to_last()
-					model.cyl_shell_search_done = True
-					_stage_done(f"{label}.total", _t_stage_total)
-					return data
 				if not getattr(model, "cyl_shell_completed", None):
 					raise RuntimeError(f"{label}: cyl_grow requires cyl_init to complete a first shell")
 				direction = int(getattr(model, "cyl_shell_search_direction", 1))
-				if direction == 0:
-					model.cyl_shell_search_crossed = True
-					model.cyl_shell_search_done = True
-					_stage_done(f"{label}.total", _t_stage_total)
-					return data
 				grow_refine_opt = (
 					stages[si + 1].global_opt
 					if si + 1 < len(stages) and stages[si + 1].name == "cyl_grow_refine"
@@ -2038,22 +1890,20 @@ def optimize(
 					model.cyl_shell_growth_factor = float(grow_factor)
 				grow_wstep_end = _base_wstep * grow_factor if direction > 0 else _base_wstep / grow_factor
 				result: dict[str, object] = {"seed_hit": False, "metrics": None, "resamples": 0, "resampled": False, "error": None}
-				while not bool(getattr(model, "cyl_shell_search_crossed", False)):
+				while True:
 					shell_i = len(getattr(model, "cyl_shell_completed", []))
 					if shell_i >= max_search_shells:
 						print(
-							f"[optimizer] ERROR {label}: adaptive cylinder shell search hit "
+							f"[optimizer] {label}: cylinder shell growth reached "
 							f"shell cap {max_search_shells}; outputting completed shells.",
 							flush=True,
 						)
-						model.cyl_shell_search_done = True
-						setattr(model, "cyl_shell_abort", True)
 						break
 					if direction < 0 and hasattr(model, "cylinder_shell_search_target_radius"):
 						target_radius = float(model.cylinder_shell_search_target_radius(shell_i, direction=direction))
 						if target_radius < 1.0:
 							print(
-								f"[optimizer] ERROR {label}: reverse cylinder shell search would shrink "
+								f"[optimizer] ERROR {label}: reverse cylinder shell growth would shrink "
 								f"below a valid radius at shell {shell_i + 1}: "
 								f"target_radius={target_radius:.3f}; outputting completed shells.",
 								flush=True,
@@ -2073,15 +1923,10 @@ def optimize(
 						_pass_eff_for_role(),
 						wstep_start=_base_wstep,
 						wstep_end=grow_wstep_end,
-						seed_lock=True,
 						model_step=_base_wstep,
-						stop_on_seed_hit=True,
 						max_resamples=1,
-						search_until_seed=True,
-						stop_after_resample=False,
-						search_direction=direction,
-						seed_target_mode="linear_grow",
 						allow_resample=True,
+						resample_after_linear_grow=True,
 						shell_no=shell_i + 1,
 						suppress_initial_status=False,
 					)
@@ -2094,24 +1939,7 @@ def optimize(
 						break
 					if hasattr(model, "complete_current_cylinder_shell"):
 						model.complete_current_cylinder_shell(data)
-					if bool(result.get("seed_hit", False)):
-						if grow_refine_opt is not None:
-							refine_result = _run_grow_refine_pass(
-								refine_label=f"{label}.cyl_grow_refine_shell{shell_i + 1}",
-								refine_opt=grow_refine_opt,
-								shell_no=shell_i + 1,
-								stop_on_seed_hit=False,
-							)
-							if refine_result.get("error") is not None:
-								result = refine_result
-								_abort_after_shell_error(
-									f"{label}.cyl_grow_refine_shell{shell_i + 1}",
-									refine_result["error"],
-									keep_active=bool(refine_result.get("keep_active", False)),
-								)
-								break
-							result["seed_hit"] = True
-						break
+						_emit_cylinder_shell_callback(f"{label}.cyl_grow_shell{shell_i + 1}")
 					if grow_refine_opt is not None:
 						result = _run_grow_refine_pass(
 							refine_label=f"{label}.cyl_grow_refine_shell{shell_i + 1}",
@@ -2125,27 +1953,11 @@ def optimize(
 								keep_active=bool(result.get("keep_active", False)),
 							)
 							break
-						if bool(result.get("seed_hit", False)):
-							break
 				if bool(result.get("error") is not None):
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
-				if bool(result.get("seed_hit", False)):
-					model.cyl_shell_search_crossed = True
-					_collapse_cylinder_shells_to_last()
-					model.cyl_shell_search_done = True
-				else:
-					metrics = result.get("metrics")
-					if not bool(getattr(model, "cyl_shell_abort", False)):
-						print(
-							f"[optimizer] ERROR {label}: adaptive cylinder shell search did not reach seed; "
-							f"outputting completed shells. "
-							f"last_class={getattr(metrics, 'classification', getattr(model, 'cyl_shell_search_last_class', None))} "
-							f"signed_dist={getattr(metrics, 'signed_distance', getattr(model, 'cyl_shell_search_last_signed_distance', None))}",
-							flush=True,
-						)
-						setattr(model, "cyl_shell_abort", True)
-					model.cyl_shell_search_done = True
+				_collapse_cylinder_shells_to_last()
+				model.cyl_shell_search_done = True
 				_stage_done(f"{label}.total", _t_stage_total)
 				return data
 
@@ -2154,7 +1966,7 @@ def optimize(
 				return data
 
 			if not getattr(model, "cyl_shell_completed", None):
-				raise RuntimeError(f"{label}: cylinder shell stage requires a completed search shell")
+				raise RuntimeError(f"{label}: cylinder shell stage requires a completed progression shell")
 			stage_model_step = _base_wstep
 			if stage_model_step <= 0.0:
 				stage_model_step = float(getattr(model, "cyl_shell_width_target_step", 1.0))
@@ -2162,7 +1974,7 @@ def optimize(
 			if hasattr(model, "cyl_shell_width_target_step"):
 				model.cyl_shell_width_target_step = float(stage_model_step)
 			if not hasattr(model, "begin_cylinder_shell_refine"):
-				raise RuntimeError(f"{label}: model does not support seed-locked cylinder shell stage")
+				raise RuntimeError(f"{label}: model does not support cylinder shell stage")
 			model.begin_cylinder_shell_refine(data)
 			if abs(float(stage_model_step) - float(prev_model_step)) > 1.0e-6:
 				if hasattr(model, "resample_current_cylinder_shell_height_to_step"):
@@ -2170,22 +1982,20 @@ def optimize(
 				if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
 					raise RuntimeError(f"{label}: model cannot resample cylinder shell width to model-step")
 				model.resample_current_cylinder_shell_width_to_step(data, float(stage_model_step))
-			seed_locked_eff = dict(stage_eff)
-			seed_locked_eff["cyl_radial_mean"] = 0.0
-			seed_locked_eff["cyl_step_push"] = 0.0
+			shell_stage_eff = dict(stage_eff)
+			shell_stage_eff["cyl_radial_mean"] = 0.0
+			shell_stage_eff["cyl_step_push"] = 0.0
 			_run_shell_pass(
 				f"{label}.{stage.name}",
-				seed_locked_eff,
+				shell_stage_eff,
 				wstep_start=stage_model_step,
 				wstep_end=stage_model_step,
-				seed_lock=True,
 				model_step=stage_model_step,
-				stop_on_seed_hit=False,
-				seed_target_mode="refine",
 				allow_resample=False,
 			)
 			if hasattr(model, "complete_current_cylinder_shell"):
 				model.complete_current_cylinder_shell(data)
+				_emit_cylinder_shell_callback(f"{label}.{stage.name}")
 			_collapse_cylinder_shells_to_last()
 			_stage_done(f"{label}.total", _t_stage_total)
 			return data

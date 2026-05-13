@@ -560,6 +560,7 @@ class Model3D(nn.Module):
 		model_w: float,
 		model_h: float,
 		volume_extent_fullres: tuple[int, int, int] | None,
+		exact_z_range: tuple[float, float] | None = None,
 	) -> None:
 		"""Initialize the experimental umbilicus tube grower from seed z.
 
@@ -575,26 +576,33 @@ class Model3D(nn.Module):
 			self.cyl_shell_delta_ms = nn.ParameterList()
 			self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 		requested_model_h = max(1.0, float(model_h))
-		init_half_h = 2.0 * requested_model_h
-		init_z0 = float(seed[2]) - init_half_h
-		init_z1 = float(seed[2]) + init_half_h
-		if volume_extent_fullres is not None and len(volume_extent_fullres) >= 3:
-			z_max = max(0.0, float(volume_extent_fullres[2]) - 1.0)
-			init_z0 = max(0.0, init_z0)
-			init_z1 = min(z_max, init_z1)
+		if exact_z_range is None:
+			init_half_h = 2.0 * requested_model_h
+			init_z0 = float(seed[2]) - init_half_h
+			init_z1 = float(seed[2]) + init_half_h
+			if volume_extent_fullres is not None and len(volume_extent_fullres) >= 3:
+				z_max = max(0.0, float(volume_extent_fullres[2]) - 1.0)
+				init_z0 = max(0.0, init_z0)
+				init_z1 = min(z_max, init_z1)
+			params_model_h = float(model_h)
+		else:
+			init_z0 = float(exact_z_range[0])
+			init_z1 = float(exact_z_range[1])
+			params_model_h = float(init_z1 - init_z0)
 		if init_z1 <= init_z0:
 			raise ValueError(
-				f"invalid cylinder seed z extent after volume clamp: "
+				f"invalid cylinder seed z extent: "
 				f"z0={init_z0:.3f} z1={init_z1:.3f} seed_z={float(seed[2]):.3f}"
 			)
 		self.params = replace(
 			self.params,
 			model_w=(float(model_w) if float(model_w) > 0.0 else None),
-			model_h=float(model_h),
+			model_h=params_model_h,
 		)
 		self.cyl_shell_mode = True
 		self.cyl_shell_seed_z = float(seed[2])
 		self.cyl_shell_z_center_target = 0.5 * (init_z0 + init_z1)
+		self.z_center = float(self.cyl_shell_z_center_target)
 		self.cyl_shell_model_h = float(init_z1 - init_z0)
 		self.cyl_shell_z = None
 		self.cyl_shell_base = None

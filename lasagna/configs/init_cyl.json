@@ -54,6 +54,7 @@
 			},
 			"args": {
 				"grow_factor": 1.5,
+				"cyl_grow_direction": "outward",
 				"model-step": 200.0,
 				"compile_cyl_normal": true,
 					"profile_opt": false
