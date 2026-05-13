@@ -345,27 +345,22 @@ def _save_copy_neighbor_target_image(
     prepared = CopyNeighborTargets.from_batch(batch, config)
 
     inputs = _tensor_to_numpy(prepared.inputs[0])
-    target_seg = _as_3d(_tensor_to_numpy(prepared.target_seg[0]))
-    domain = _as_3d(_tensor_to_numpy(prepared.domain[0]))
-    velocity = _tensor_to_numpy(prepared.velocity_dir[0])
-    velocity_weight = _as_3d(_tensor_to_numpy(prepared.velocity_loss_weight[0]))
-    progress_phi = _as_3d(_tensor_to_numpy(prepared.progress_phi[0]))
-    progress_weight = _as_3d(_tensor_to_numpy(prepared.progress_phi_weight[0]))
-    attract = _tensor_to_numpy(prepared.surface_attract[0])
-    attract_weight = _as_3d(_tensor_to_numpy(prepared.surface_attract_weight[0]))
-    stop = _as_3d(_tensor_to_numpy(prepared.stop[0]))
-    stop_weight = _as_3d(_tensor_to_numpy(prepared.stop_weight[0]))
-    target_edt = _as_3d(_tensor_to_numpy(prepared.target_edt[0]))
-    seeds = _tensor_to_numpy(prepared.endpoint_seed_points[0])
-    seed_mask = _tensor_to_numpy(prepared.endpoint_seed_mask[0]) > 0.0
-    endpoint_step_count = (
-        int(_tensor_to_numpy(prepared.endpoint_step_count)[0])
-        if prepared.endpoint_step_count is not None else None
+    cond_gt = _as_3d(_tensor_to_numpy(prepared.cond_gt[0]))
+    behind_seg = _as_3d(_tensor_to_numpy(prepared.behind_seg[0]))
+    front_seg = _as_3d(_tensor_to_numpy(prepared.front_seg[0]))
+    dense_gt = _tensor_to_numpy(prepared.dense_gt_displacement[0])
+    dense_weight = _as_3d(_tensor_to_numpy(prepared.dense_loss_weight[0]))
+    behind_disp = dense_gt[0:3]
+    front_disp = dense_gt[3:6]
+    behind_mag = np.linalg.norm(behind_disp, axis=0)
+    front_mag = np.linalg.norm(front_disp, axis=0)
+    focus = (
+        (dense_weight > 0.0)
+        | (cond_gt > 0.0)
+        | (behind_seg > 0.0)
+        | (front_seg > 0.0)
+        | (inputs[1] > 0.0)
     )
-
-    velocity_mag = np.linalg.norm(velocity, axis=0)
-    attract_mag = np.linalg.norm(attract, axis=0)
-    focus = (domain > 0.0) | (target_seg > 0.0) | (inputs[1] > 0.0)
     d, h, w = inputs.shape[1:]
     if np.any(focus):
         z0, y0, x0 = np.median(np.argwhere(focus), axis=0).astype(int).tolist()
@@ -373,35 +368,26 @@ def _save_copy_neighbor_target_image(
         z0, y0, x0 = d // 2, h // 2, w // 2
     slices = (("z", z0), ("y", y0), ("x", x0))
 
-    attract_vmax = _finite_percentile(attract_mag, 99, fallback=1.0)
-    attract_component_vmax = _finite_percentile(attract, 99, fallback=1.0)
-    edt_vmax = _finite_percentile(target_edt, 95, fallback=8.0)
+    disp_vmax = _finite_percentile(dense_gt, 99, fallback=1.0)
+    mag_vmax = _finite_percentile(np.maximum(behind_mag, front_mag), 99, fallback=1.0)
     volume_vmax = _finite_percentile(inputs[0], 99, fallback=1.0)
     volume_vmin = float(np.percentile(inputs[0][np.isfinite(inputs[0])], 1)) if np.isfinite(inputs[0]).any() else 0.0
 
     panels: list[tuple[str, np.ndarray, str, float | None, float | None]] = [
         ("input: volume", inputs[0], "gray", volume_vmin, volume_vmax),
         ("input: source cond", inputs[1], "gray", 0.0, 1.0),
-        ("input: side z", inputs[2], "coolwarm", -1.0, 1.0),
-        ("input: side y", inputs[3], "coolwarm", -1.0, 1.0),
-        ("input: side x", inputs[4], "coolwarm", -1.0, 1.0),
-        ("target_seg", target_seg, "gray", 0.0, 1.0),
-        ("domain", domain, "gray", 0.0, 1.0),
-        ("velocity z", velocity[0], "coolwarm", -1.0, 1.0),
-        ("velocity y", velocity[1], "coolwarm", -1.0, 1.0),
-        ("velocity x", velocity[2], "coolwarm", -1.0, 1.0),
-        ("velocity |v|", velocity_mag, "magma", 0.0, 1.0),
-        ("velocity weight", velocity_weight, "gray", 0.0, 1.0),
-        ("progress_phi", progress_phi, "viridis", 0.0, 1.0),
-        ("progress weight", progress_weight, "gray", 0.0, 1.0),
-        ("surface_attr z", attract[0], "coolwarm", -attract_component_vmax, attract_component_vmax),
-        ("surface_attr y", attract[1], "coolwarm", -attract_component_vmax, attract_component_vmax),
-        ("surface_attr x", attract[2], "coolwarm", -attract_component_vmax, attract_component_vmax),
-        ("surface_attr |v|", attract_mag, "magma", 0.0, attract_vmax),
-        ("surface_attr weight", attract_weight, "gray", 0.0, 1.0),
-        ("stop", stop, "viridis", 0.0, 1.0),
-        ("stop weight", stop_weight, "gray", 0.0, 1.0),
-        ("target EDT + seeds", target_edt, "magma", 0.0, edt_vmax),
+        ("cond_gt", cond_gt, "gray", 0.0, 1.0),
+        ("behind_seg", behind_seg, "gray", 0.0, 1.0),
+        ("front_seg", front_seg, "gray", 0.0, 1.0),
+        ("dense weight", dense_weight, "gray", 0.0, max(1.0, float(np.nanmax(dense_weight)))),
+        ("behind dz", behind_disp[0], "coolwarm", -disp_vmax, disp_vmax),
+        ("behind dy", behind_disp[1], "coolwarm", -disp_vmax, disp_vmax),
+        ("behind dx", behind_disp[2], "coolwarm", -disp_vmax, disp_vmax),
+        ("behind |d|", behind_mag, "magma", 0.0, mag_vmax),
+        ("front dz", front_disp[0], "coolwarm", -disp_vmax, disp_vmax),
+        ("front dy", front_disp[1], "coolwarm", -disp_vmax, disp_vmax),
+        ("front dx", front_disp[2], "coolwarm", -disp_vmax, disp_vmax),
+        ("front |d|", front_mag, "magma", 0.0, mag_vmax),
     ]
 
     def slice_2d(arr: np.ndarray, axis: str, idx: int) -> np.ndarray:
@@ -428,27 +414,11 @@ def _save_copy_neighbor_target_image(
             ax.set_title(f"{title}\n{axis}={idx}", fontsize=8)
             ax.set_xticks([])
             ax.set_yticks([])
-            if title == "target EDT + seeds":
-                active = seeds[seed_mask]
-                if active.size > 0:
-                    if axis == "z":
-                        near = np.abs(active[:, 0] - idx) <= 1.5
-                        xy = active[near][:, [2, 1]]
-                    elif axis == "y":
-                        near = np.abs(active[:, 1] - idx) <= 1.5
-                        xy = active[near][:, [2, 0]]
-                    else:
-                        near = np.abs(active[:, 2] - idx) <= 1.5
-                        xy = active[near][:, [1, 0]]
-                    if xy.size > 0:
-                        ax.scatter(xy[:, 0], xy[:, 1], s=7, c="cyan", edgecolors="black", linewidths=0.2)
 
     title = (
         f"copy_neighbors sample index={index} | shape={d}x{h}x{w} | "
-        f"seeds={int(seed_mask.sum())}"
+        f"weight_sum={float(np.sum(dense_weight)):.1f}"
     )
-    if endpoint_step_count is not None:
-        title = f"{title} | endpoint_steps={endpoint_step_count}"
     fig.suptitle(title, fontsize=12)
     image_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(image_path, dpi=120)
