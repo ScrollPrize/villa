@@ -8,6 +8,7 @@
 #include <igl/signed_distance.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -98,21 +99,30 @@ void print_progress_line(
 	bool final_complete,
 	const std::string& unit
 ) {
-	const double pct = total > 0 ? 100.0 * static_cast<double>(done) / static_cast<double>(total) : 100.0;
 	const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 	const double rate = elapsed > 0.0 ? static_cast<double>(done) / elapsed : 0.0;
-	const int bar_width = 28;
-	const int filled = std::min(bar_width, std::max(0, static_cast<int>(std::round((pct / 100.0) * static_cast<double>(bar_width)))));
 	std::cout
-		<< "[cyl_outside] " << label << " " << pass << ": "
-		<< "[";
-	for (int i = 0; i < bar_width; ++i) {
-		std::cout << (i < filled ? "#" : "-");
+		<< "[cyl_outside] " << label << " " << pass << ": ";
+	if (total > 0) {
+		const double pct = 100.0 * static_cast<double>(done) / static_cast<double>(total);
+		const int bar_width = 28;
+		const int filled = std::min(
+			bar_width,
+			std::max(0, static_cast<int>(std::round((pct / 100.0) * static_cast<double>(bar_width))))
+		);
+		std::cout << "[";
+		for (int i = 0; i < bar_width; ++i) {
+			std::cout << (i < filled ? "#" : "-");
+		}
+		std::cout
+			<< "] "
+			<< std::fixed << std::setprecision(1) << pct << "% "
+			<< done << "/" << total << " " << unit;
+	} else {
+		std::cout
+			<< done << " " << unit;
 	}
 	std::cout
-		<< "] "
-		<< std::fixed << std::setprecision(1) << pct << "% "
-		<< done << "/" << total << " " << unit
 		<< " elapsed=" << std::setprecision(1) << elapsed << "s"
 		<< " rate=" << std::setprecision(0) << rate << " " << unit << "/s"
 		<< (final ? (final_complete ? " done" : " stopped") : "")
@@ -250,6 +260,13 @@ struct DepthScanStats {
 	int64_t inside_count = 0;
 	int64_t voxels_classified = 0;
 	int64_t voxels_skipped_by_chunk_mask = 0;
+	int64_t certified_inside_chunks = 0;
+	int64_t winding_chunks = 0;
+	int64_t exact_distance_chunks = 0;
+	int64_t blended_chunks = 0;
+	int64_t coarse_chunks = 0;
+	int64_t exact_distance_voxels = 0;
+	int64_t coarse_voxels = 0;
 	int64_t total_chunks = 0;
 	int64_t center_inside_chunks = 0;
 	int64_t surface_seed_chunks = 0;
@@ -261,8 +278,18 @@ struct DepthScanStats {
 	double growth_elapsed = 0.0;
 	double pass_cpu_seconds = 0.0;
 	double distance_cpu_seconds = 0.0;
+	double chunk_probe_distance_seconds = 0.0;
 	bool used_chunked = false;
 	bool used_fallback = false;
+};
+
+struct ChunkBounds {
+	int64_t x0 = 0;
+	int64_t x1 = 0;
+	int64_t y0 = 0;
+	int64_t y1 = 0;
+	int64_t z0 = 0;
+	int64_t z1 = 0;
 };
 
 int64_t flat_voxel_index(int64_t x, int64_t y, int64_t z, int64_t X, int64_t Y) {
@@ -271,6 +298,116 @@ int64_t flat_voxel_index(int64_t x, int64_t y, int64_t z, int64_t X, int64_t Y) 
 
 int64_t flat_chunk_index(int64_t cx, int64_t cy, int64_t cz, int64_t CX, int64_t CY) {
 	return (cz * CY + cy) * CX + cx;
+}
+
+ChunkBounds chunk_bounds_for_coords(
+	int64_t cx,
+	int64_t cy,
+	int64_t cz,
+	int64_t X,
+	int64_t Y,
+	int64_t Z,
+	int64_t cs
+) {
+	ChunkBounds b;
+	b.x0 = cx * cs;
+	b.x1 = std::min<int64_t>(X, b.x0 + cs);
+	b.y0 = cy * cs;
+	b.y1 = std::min<int64_t>(Y, b.y0 + cs);
+	b.z0 = cz * cs;
+	b.z1 = std::min<int64_t>(Z, b.z0 + cs);
+	return b;
+}
+
+RowVector3d grid_point(
+	const double* origin,
+	const double* spacing,
+	double x,
+	double y,
+	double z
+) {
+	return RowVector3d(
+		origin[0] + x * spacing[0],
+		origin[1] + y * spacing[1],
+		origin[2] + z * spacing[2]
+	);
+}
+
+RowVector3d voxel_point(
+	const double* origin,
+	const double* spacing,
+	int64_t x,
+	int64_t y,
+	int64_t z
+) {
+	return grid_point(
+		origin,
+		spacing,
+		static_cast<double>(x),
+		static_cast<double>(y),
+		static_cast<double>(z)
+	);
+}
+
+RowVector3d chunk_domain_center(
+	const ChunkBounds& b,
+	const double* origin,
+	const double* spacing
+) {
+	return grid_point(
+		origin,
+		spacing,
+		0.5 * static_cast<double>(b.x0 + b.x1),
+		0.5 * static_cast<double>(b.y0 + b.y1),
+		0.5 * static_cast<double>(b.z0 + b.z1)
+	);
+}
+
+double chunk_domain_half_diagonal(const ChunkBounds& b, const double* spacing) {
+	const double hx = 0.5 * static_cast<double>(b.x1 - b.x0) * spacing[0];
+	const double hy = 0.5 * static_cast<double>(b.y1 - b.y0) * spacing[1];
+	const double hz = 0.5 * static_cast<double>(b.z1 - b.z0) * spacing[2];
+	return std::sqrt(hx * hx + hy * hy + hz * hz);
+}
+
+int64_t chunk_voxel_count(const ChunkBounds& b) {
+	return (b.x1 - b.x0) * (b.y1 - b.y0) * (b.z1 - b.z0);
+}
+
+double smoothstep(double edge0, double edge1, double x) {
+	if (!(edge1 > edge0)) {
+		return x >= edge1 ? 1.0 : 0.0;
+	}
+	const double t = std::min(1.0, std::max(0.0, (x - edge0) / (edge1 - edge0)));
+	return t * t * (3.0 - 2.0 * t);
+}
+
+double trilinear_value(const std::array<double, 8>& values, double tx, double ty, double tz) {
+	tx = std::min(1.0, std::max(0.0, tx));
+	ty = std::min(1.0, std::max(0.0, ty));
+	tz = std::min(1.0, std::max(0.0, tz));
+	const double c00 = values[0] * (1.0 - tx) + values[1] * tx;
+	const double c10 = values[2] * (1.0 - tx) + values[3] * tx;
+	const double c01 = values[4] * (1.0 - tx) + values[5] * tx;
+	const double c11 = values[6] * (1.0 - tx) + values[7] * tx;
+	const double c0 = c00 * (1.0 - ty) + c10 * ty;
+	const double c1 = c01 * (1.0 - ty) + c11 * ty;
+	return c0 * (1.0 - tz) + c1 * tz;
+}
+
+double bubble_weight(double tx, double ty, double tz) {
+	auto axis = [](double t) {
+		t = std::min(1.0, std::max(0.0, t));
+		return 4.0 * t * (1.0 - t);
+	};
+	return axis(tx) * axis(ty) * axis(tz);
+}
+
+double positive_finite_depth(double depth) {
+	if (!(depth > 0.0) || !std::isfinite(depth)) {
+		return 0.0;
+	}
+	return depth;
 }
 
 int64_t count_marked(const std::vector<uint8_t>& values) {
@@ -483,6 +620,8 @@ DepthScanStats scan_chunked_volume(
 	int64_t X,
 	int n_threads,
 	int chunk_size,
+	double deep_interp_chunks,
+	double deep_blend_chunks,
 	float* depth_ptr,
 	std::atomic<bool>& cancel,
 	const std::string& progress_label,
@@ -494,6 +633,10 @@ DepthScanStats scan_chunked_volume(
 	const int64_t CY = (Y + cs - 1) / cs;
 	const int64_t CZ = (Z + cs - 1) / cs;
 	const int64_t total_chunks = CX * CY * CZ;
+	const double max_spacing = std::max({spacing[0], spacing[1], spacing[2]});
+	const double deep_threshold = std::max(0.0, deep_interp_chunks) * static_cast<double>(cs) * max_spacing;
+	const double deep_blend_width = std::max(0.0, deep_blend_chunks) * static_cast<double>(cs) * max_spacing;
+	const bool coarse_enabled = deep_interp_chunks > 0.0;
 	DepthScanStats stats;
 	stats.used_chunked = true;
 	stats.total_chunks = total_chunks;
@@ -525,17 +668,8 @@ DepthScanStats scan_chunked_volume(
 				const int64_t yz = ci / CX;
 				const int64_t cy = yz % CY;
 				const int64_t cz = yz / CY;
-				const int64_t x0 = cx * cs;
-				const int64_t x1 = std::min<int64_t>(X, x0 + cs);
-				const int64_t y0 = cy * cs;
-				const int64_t y1 = std::min<int64_t>(Y, y0 + cs);
-				const int64_t z0 = cz * cs;
-				const int64_t z1 = std::min<int64_t>(Z, z0 + cs);
-				const RowVector3d q(
-					origin[0] + 0.5 * static_cast<double>(x0 + x1 - 1) * spacing[0],
-					origin[1] + 0.5 * static_cast<double>(y0 + y1 - 1) * spacing[1],
-					origin[2] + 0.5 * static_cast<double>(z0 + z1 - 1) * spacing[2]
-				);
+				const ChunkBounds b = chunk_bounds_for_coords(cx, cy, cz, X, Y, Z, cs);
+				const RowVector3d q = chunk_domain_center(b, origin, spacing);
 				if (is_inside_at(hier, q)) {
 					center_inside[static_cast<size_t>(ci)] = 1;
 					++local_inside;
@@ -596,8 +730,16 @@ DepthScanStats scan_chunked_volume(
 	std::vector<int64_t> thread_classified(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_processed_chunks(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_chunks_with_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_certified_inside_chunks(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_winding_chunks(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_exact_distance_chunks(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_blended_chunks(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_coarse_chunks(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_exact_distance_voxels(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_coarse_voxels(static_cast<size_t>(n_threads), 0);
 	std::vector<double> thread_pass_seconds(static_cast<size_t>(n_threads), 0.0);
 	std::vector<double> thread_distance_seconds(static_cast<size_t>(n_threads), 0.0);
+	std::vector<double> thread_chunk_probe_distance_seconds(static_cast<size_t>(n_threads), 0.0);
 	std::vector<std::vector<int64_t>> thread_inside_chunks(static_cast<size_t>(n_threads));
 	std::atomic<int64_t> growth_done(0);
 	const auto growth_start = std::chrono::steady_clock::now();
@@ -605,7 +747,7 @@ DepthScanStats scan_chunked_volume(
 		ProgressPrinter progress(
 			progress_label,
 			"candidate/growth winding+inside-distance",
-			total,
+			0,
 			growth_done,
 			progress_enabled,
 			"vox classified",
@@ -635,8 +777,38 @@ DepthScanStats scan_chunked_volume(
 				int64_t local_classified = 0;
 				int64_t local_processed_chunks = 0;
 				int64_t local_chunks_with_inside = 0;
+				int64_t local_certified_inside_chunks = 0;
+				int64_t local_winding_chunks = 0;
+				int64_t local_exact_distance_chunks = 0;
+				int64_t local_blended_chunks = 0;
+				int64_t local_coarse_chunks = 0;
+				int64_t local_exact_distance_voxels = 0;
+				int64_t local_coarse_voxels = 0;
 				double local_distance_seconds = 0.0;
+				double local_probe_distance_seconds = 0.0;
 				std::vector<int64_t>& local_inside_chunks = thread_inside_chunks[static_cast<size_t>(ti)];
+				auto query_distance = [&](const RowVector3d& q, bool probe) {
+					const auto distance_start = std::chrono::steady_clock::now();
+					const double depth = surface_distance_at(tree, V, F, q);
+					const double elapsed = std::chrono::duration<double>(
+						std::chrono::steady_clock::now() - distance_start
+					).count();
+					if (probe) {
+						local_probe_distance_seconds += elapsed;
+					} else {
+						local_distance_seconds += elapsed;
+					}
+					return depth;
+				};
+				auto write_depth = [&](int64_t n, double depth, int64_t& chunk_inside) {
+					const float depth_f = static_cast<float>(positive_finite_depth(depth));
+					depth_ptr[n] = depth_f;
+					local_max = std::max(local_max, static_cast<double>(depth_f));
+					if (depth_f > 0.0f) {
+						++local_inside;
+						++chunk_inside;
+					}
+				};
 				for (int64_t si = begin; si < end; ++si) {
 					if (cancel.load(std::memory_order_relaxed)) {
 						break;
@@ -646,49 +818,160 @@ DepthScanStats scan_chunked_volume(
 					const int64_t yz = ci / CX;
 					const int64_t cy = yz % CY;
 					const int64_t cz = yz / CY;
-					const int64_t x0 = cx * cs;
-					const int64_t x1 = std::min<int64_t>(X, x0 + cs);
-					const int64_t y0 = cy * cs;
-					const int64_t y1 = std::min<int64_t>(Y, y0 + cs);
-					const int64_t z0 = cz * cs;
-					const int64_t z1 = std::min<int64_t>(Z, z0 + cs);
+					const ChunkBounds b = chunk_bounds_for_coords(cx, cy, cz, X, Y, Z, cs);
 					int64_t chunk_inside = 0;
 					int64_t chunk_processed = 0;
-					for (int64_t z = z0; z < z1; ++z) {
-						for (int64_t y = y0; y < y1; ++y) {
-							for (int64_t x = x0; x < x1; ++x) {
-								if ((chunk_processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+					bool used_certified = false;
+					bool used_blended = false;
+					bool used_coarse_only = false;
+					std::array<double, 8> corner_depths{};
+					double center_correction = 0.0;
+					const int64_t voxel_count = chunk_voxel_count(b);
+
+					if (center_inside[static_cast<size_t>(ci)] != 0) {
+						const RowVector3d center_q = chunk_domain_center(b, origin, spacing);
+						const double center_distance = positive_finite_depth(query_distance(center_q, true));
+						const double half_diag = chunk_domain_half_diagonal(b, spacing);
+						if (center_distance > half_diag) {
+							used_certified = true;
+							++local_certified_inside_chunks;
+							const double chunk_distance_lower = center_distance - half_diag;
+							const double chunk_distance_upper = center_distance + half_diag;
+							used_coarse_only = coarse_enabled &&
+								chunk_distance_lower >= deep_threshold + deep_blend_width;
+							used_blended = coarse_enabled && !used_coarse_only &&
+								chunk_distance_upper > deep_threshold;
+							if (used_coarse_only || used_blended) {
+								for (int zbit = 0; zbit <= 1; ++zbit) {
+									for (int ybit = 0; ybit <= 1; ++ybit) {
+										for (int xbit = 0; xbit <= 1; ++xbit) {
+											const int idx = xbit + 2 * ybit + 4 * zbit;
+											const RowVector3d q = grid_point(
+												origin,
+												spacing,
+												static_cast<double>(xbit ? b.x1 : b.x0),
+												static_cast<double>(ybit ? b.y1 : b.y0),
+												static_cast<double>(zbit ? b.z1 : b.z0)
+											);
+											corner_depths[static_cast<size_t>(idx)] =
+												positive_finite_depth(query_distance(q, true));
+										}
+									}
+								}
+								center_correction = center_distance -
+									trilinear_value(corner_depths, 0.5, 0.5, 0.5);
+							}
+						}
+					}
+
+					auto coarse_depth_at = [&](int64_t x, int64_t y, int64_t z) {
+						const double tx = static_cast<double>(x - b.x0) / static_cast<double>(b.x1 - b.x0);
+						const double ty = static_cast<double>(y - b.y0) / static_cast<double>(b.y1 - b.y0);
+						const double tz = static_cast<double>(z - b.z0) / static_cast<double>(b.z1 - b.z0);
+						const double depth = trilinear_value(corner_depths, tx, ty, tz) +
+							bubble_weight(tx, ty, tz) * center_correction;
+						return positive_finite_depth(depth);
+					};
+
+					if (used_certified && used_coarse_only) {
+						++local_coarse_chunks;
+						local_coarse_voxels += voxel_count;
+						for (int64_t z = b.z0; z < b.z1; ++z) {
+							for (int64_t y = b.y0; y < b.y1; ++y) {
+								for (int64_t x = b.x0; x < b.x1; ++x) {
+									if ((chunk_processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+										break;
+									}
+									const int64_t n = flat_voxel_index(x, y, z, X, Y);
+									write_depth(n, coarse_depth_at(x, y, z), chunk_inside);
+									++chunk_processed;
+								}
+								if (cancel.load(std::memory_order_relaxed)) {
 									break;
 								}
-								const int64_t n = flat_voxel_index(x, y, z, X, Y);
-								const RowVector3d q(
-									origin[0] + static_cast<double>(x) * spacing[0],
-									origin[1] + static_cast<double>(y) * spacing[1],
-									origin[2] + static_cast<double>(z) * spacing[2]
-								);
-								double depth = 0.0;
-								if (is_inside_at(hier, q)) {
-									const auto distance_start = std::chrono::steady_clock::now();
-									depth = surface_distance_at(tree, V, F, q);
-									local_distance_seconds += std::chrono::duration<double>(
-										std::chrono::steady_clock::now() - distance_start
-									).count();
-								}
-								const float depth_f = static_cast<float>(depth);
-								depth_ptr[n] = depth_f;
-								local_max = std::max(local_max, static_cast<double>(depth_f));
-								if (depth_f > 0.0f) {
-									++local_inside;
-									++chunk_inside;
-								}
-								++chunk_processed;
 							}
 							if (cancel.load(std::memory_order_relaxed)) {
 								break;
 							}
 						}
-						if (cancel.load(std::memory_order_relaxed)) {
-							break;
+					} else if (used_certified && used_blended) {
+						++local_blended_chunks;
+						local_coarse_voxels += voxel_count;
+						for (int64_t z = b.z0; z < b.z1; ++z) {
+							for (int64_t y = b.y0; y < b.y1; ++y) {
+								for (int64_t x = b.x0; x < b.x1; ++x) {
+									if ((chunk_processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+										break;
+									}
+									const int64_t n = flat_voxel_index(x, y, z, X, Y);
+									const double exact_depth = positive_finite_depth(query_distance(
+										voxel_point(origin, spacing, x, y, z),
+										false
+									));
+									++local_exact_distance_voxels;
+									const double coarse_depth = coarse_depth_at(x, y, z);
+									const double w = smoothstep(
+										deep_threshold,
+										deep_threshold + deep_blend_width,
+										exact_depth
+									);
+									write_depth(n, exact_depth * (1.0 - w) + coarse_depth * w, chunk_inside);
+									++chunk_processed;
+								}
+								if (cancel.load(std::memory_order_relaxed)) {
+									break;
+								}
+							}
+							if (cancel.load(std::memory_order_relaxed)) {
+								break;
+							}
+						}
+					} else if (used_certified) {
+						++local_exact_distance_chunks;
+						for (int64_t z = b.z0; z < b.z1; ++z) {
+							for (int64_t y = b.y0; y < b.y1; ++y) {
+								for (int64_t x = b.x0; x < b.x1; ++x) {
+									if ((chunk_processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+										break;
+									}
+									const int64_t n = flat_voxel_index(x, y, z, X, Y);
+									write_depth(n, query_distance(voxel_point(origin, spacing, x, y, z), false), chunk_inside);
+									++local_exact_distance_voxels;
+									++chunk_processed;
+								}
+								if (cancel.load(std::memory_order_relaxed)) {
+									break;
+								}
+							}
+							if (cancel.load(std::memory_order_relaxed)) {
+								break;
+							}
+						}
+					} else {
+						++local_winding_chunks;
+						for (int64_t z = b.z0; z < b.z1; ++z) {
+							for (int64_t y = b.y0; y < b.y1; ++y) {
+								for (int64_t x = b.x0; x < b.x1; ++x) {
+									if ((chunk_processed & 63) == 0 && cancel.load(std::memory_order_relaxed)) {
+										break;
+									}
+									const int64_t n = flat_voxel_index(x, y, z, X, Y);
+									double depth = 0.0;
+									const RowVector3d q = voxel_point(origin, spacing, x, y, z);
+									if (is_inside_at(hier, q)) {
+										depth = query_distance(q, false);
+										++local_exact_distance_voxels;
+									}
+									write_depth(n, depth, chunk_inside);
+									++chunk_processed;
+								}
+								if (cancel.load(std::memory_order_relaxed)) {
+									break;
+								}
+							}
+							if (cancel.load(std::memory_order_relaxed)) {
+								break;
+							}
 						}
 					}
 					local_classified += chunk_processed;
@@ -704,7 +987,15 @@ DepthScanStats scan_chunked_volume(
 				thread_classified[static_cast<size_t>(ti)] += local_classified;
 				thread_processed_chunks[static_cast<size_t>(ti)] += local_processed_chunks;
 				thread_chunks_with_inside[static_cast<size_t>(ti)] += local_chunks_with_inside;
+				thread_certified_inside_chunks[static_cast<size_t>(ti)] += local_certified_inside_chunks;
+				thread_winding_chunks[static_cast<size_t>(ti)] += local_winding_chunks;
+				thread_exact_distance_chunks[static_cast<size_t>(ti)] += local_exact_distance_chunks;
+				thread_blended_chunks[static_cast<size_t>(ti)] += local_blended_chunks;
+				thread_coarse_chunks[static_cast<size_t>(ti)] += local_coarse_chunks;
+				thread_exact_distance_voxels[static_cast<size_t>(ti)] += local_exact_distance_voxels;
+				thread_coarse_voxels[static_cast<size_t>(ti)] += local_coarse_voxels;
 				thread_distance_seconds[static_cast<size_t>(ti)] += local_distance_seconds;
+				thread_chunk_probe_distance_seconds[static_cast<size_t>(ti)] += local_probe_distance_seconds;
 				thread_pass_seconds[static_cast<size_t>(ti)] += std::chrono::duration<double>(
 					std::chrono::steady_clock::now() - chunk_start
 				).count();
@@ -735,11 +1026,35 @@ DepthScanStats scan_chunked_volume(
 	for (const int64_t value : thread_chunks_with_inside) {
 		stats.chunks_with_inside += value;
 	}
+	for (const int64_t value : thread_certified_inside_chunks) {
+		stats.certified_inside_chunks += value;
+	}
+	for (const int64_t value : thread_winding_chunks) {
+		stats.winding_chunks += value;
+	}
+	for (const int64_t value : thread_exact_distance_chunks) {
+		stats.exact_distance_chunks += value;
+	}
+	for (const int64_t value : thread_blended_chunks) {
+		stats.blended_chunks += value;
+	}
+	for (const int64_t value : thread_coarse_chunks) {
+		stats.coarse_chunks += value;
+	}
+	for (const int64_t value : thread_exact_distance_voxels) {
+		stats.exact_distance_voxels += value;
+	}
+	for (const int64_t value : thread_coarse_voxels) {
+		stats.coarse_voxels += value;
+	}
 	for (const double value : thread_pass_seconds) {
 		stats.pass_cpu_seconds += value;
 	}
 	for (const double value : thread_distance_seconds) {
 		stats.distance_cpu_seconds += value;
+	}
+	for (const double value : thread_chunk_probe_distance_seconds) {
+		stats.chunk_probe_distance_seconds += value;
 	}
 	stats.voxels_skipped_by_chunk_mask = std::max<int64_t>(0, total - stats.voxels_classified);
 	return stats;
@@ -755,7 +1070,9 @@ pybind11::tuple build_inside_depth_volume(
 	torch::Tensor shape_zyx,
 	const std::string& progress_label,
 	int requested_threads,
-	int chunk_size
+	int chunk_size,
+	double deep_interp_chunks,
+	double deep_blend_chunks
 ) {
 	MatrixXdR V = tensor_to_vertices(vertices);
 	MatrixXiR F = tensor_to_faces(faces);
@@ -845,10 +1162,13 @@ pybind11::tuple build_inside_depth_volume(
 			std::cout
 				<< "[cyl_outside] " << progress_label
 				<< ": using chunked scan chunk_size=" << chunk_size
+				<< " deep_interp_chunks=" << deep_interp_chunks
+				<< " deep_blend_chunks=" << deep_blend_chunks
 				<< std::endl;
 		}
 		scan_stats = scan_chunked_volume(
 			hier, tree, V, F, origin, spacing, Z, Y, X, n_threads, chunk_size,
+			deep_interp_chunks, deep_blend_chunks,
 			depth_ptr, cancel, progress_label, progress_enabled
 		);
 		throw_if_cancelled(cancel, progress_label, "chunked winding+inside-distance pass", progress_enabled);
@@ -873,8 +1193,16 @@ pybind11::tuple build_inside_depth_volume(
 			fallback_stats.growth_iterations = scan_stats.growth_iterations;
 			fallback_stats.processed_chunks = scan_stats.processed_chunks;
 			fallback_stats.chunks_with_inside = scan_stats.chunks_with_inside;
+			fallback_stats.certified_inside_chunks = scan_stats.certified_inside_chunks;
+			fallback_stats.winding_chunks = scan_stats.winding_chunks;
+			fallback_stats.exact_distance_chunks = scan_stats.exact_distance_chunks;
+			fallback_stats.blended_chunks = scan_stats.blended_chunks;
+			fallback_stats.coarse_chunks = scan_stats.coarse_chunks;
+			fallback_stats.exact_distance_voxels = scan_stats.exact_distance_voxels;
+			fallback_stats.coarse_voxels = scan_stats.coarse_voxels;
 			fallback_stats.voxels_skipped_by_chunk_mask = scan_stats.voxels_skipped_by_chunk_mask;
 			fallback_stats.center_prepass_elapsed = scan_stats.center_prepass_elapsed;
+			fallback_stats.chunk_probe_distance_seconds = scan_stats.chunk_probe_distance_seconds;
 			scan_stats = fallback_stats;
 		}
 	}
@@ -910,8 +1238,12 @@ pybind11::tuple build_inside_depth_volume(
 		const double distance_share = scan_stats.pass_cpu_seconds > 0.0
 			? std::min(1.0, std::max(0.0, scan_stats.distance_cpu_seconds / scan_stats.pass_cpu_seconds))
 			: 0.0;
+		const double chunk_probe_distance_share = scan_stats.pass_cpu_seconds > 0.0
+			? std::min(1.0, std::max(0.0, scan_stats.chunk_probe_distance_seconds / scan_stats.pass_cpu_seconds))
+			: 0.0;
 		const double distance_wall_est = pass1_elapsed * distance_share;
-		const double winding_wall_est = pass1_elapsed - distance_wall_est;
+		const double chunk_probe_distance_wall_est = pass1_elapsed * chunk_probe_distance_share;
+		const double winding_wall_est = std::max(0.0, pass1_elapsed - distance_wall_est - chunk_probe_distance_wall_est);
 		std::cout
 			<< "[cyl_outside] " << progress_label
 			<< ": timing mode="
@@ -920,6 +1252,7 @@ pybind11::tuple build_inside_depth_volume(
 			<< " center_prepass_winding=" << scan_stats.center_prepass_elapsed << "s"
 			<< " candidate_growth_winding~=" << winding_wall_est << "s"
 			<< " inside_distance~=" << distance_wall_est << "s"
+			<< " chunk_probe_distance~=" << chunk_probe_distance_wall_est << "s"
 			<< " scan=" << pass1_elapsed << "s"
 			<< " (" << std::setprecision(0) << pass1_rate << " vox/s)"
 			<< " encode=" << std::setprecision(2) << encode_elapsed << "s"
@@ -933,6 +1266,7 @@ pybind11::tuple build_inside_depth_volume(
 			<< " inside_frac=" << std::fixed << std::setprecision(4)
 			<< (total > 0 ? static_cast<double>(inside_count) / static_cast<double>(total) : 0.0)
 			<< " distance_cpu=" << std::setprecision(2) << scan_stats.distance_cpu_seconds << "s"
+			<< " chunk_probe_distance_cpu=" << scan_stats.chunk_probe_distance_seconds << "s"
 			<< " scan_cpu=" << scan_stats.pass_cpu_seconds << "s"
 			<< " depth_max=" << std::setprecision(3) << depth_max
 			<< std::endl;
@@ -950,9 +1284,16 @@ pybind11::tuple build_inside_depth_volume(
 				<< (scan_stats.total_chunks > 0
 					? static_cast<double>(scan_stats.processed_chunks) / static_cast<double>(scan_stats.total_chunks)
 					: 0.0)
+				<< " certified_inside_chunks=" << scan_stats.certified_inside_chunks
+				<< " winding_chunks=" << scan_stats.winding_chunks
+				<< " exact_distance_chunks=" << scan_stats.exact_distance_chunks
+				<< " blended_chunks=" << scan_stats.blended_chunks
+				<< " coarse_chunks=" << scan_stats.coarse_chunks
 				<< " voxels_classified=" << scan_stats.voxels_classified
 				<< " voxels_skipped_by_chunk_mask=" << scan_stats.voxels_skipped_by_chunk_mask
 				<< " inside_voxels=" << scan_stats.inside_count
+				<< " exact_distance_voxels=" << scan_stats.exact_distance_voxels
+				<< " coarse_voxels=" << scan_stats.coarse_voxels
 				<< std::endl;
 		}
 	}
@@ -971,7 +1312,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		pybind11::arg("shape_zyx"),
 		pybind11::arg("progress_label") = "",
 		pybind11::arg("requested_threads") = 0,
-		pybind11::arg("chunk_size") = 16,
+		pybind11::arg("chunk_size") = 8,
+		pybind11::arg("deep_interp_chunks") = 10.0,
+		pybind11::arg("deep_blend_chunks") = 2.0,
 		"Build uint8 inside-depth volume from a capped shell mesh"
 	);
 }
