@@ -181,6 +181,9 @@ jobs:
           file bin/VC3D bin/vc_tifxyz bin/flatboi
           ./bin/vc_tifxyz --help | head -5 || true
 
+      - name: Verify Homebrew-only toolchain
+        run: volume-cartographer/scripts/verify_homebrew_toolchain.sh volume-cartographer/build-macos
+
   dead-code:
     name: Dead-code report (clang, nm + --print-gc-sections)
     needs: [changes, builder]

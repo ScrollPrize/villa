@@ -107,10 +107,23 @@ if [[ ! -x "$llvm_bin/clang++" ]]; then
   echo "Homebrew LLVM compiler not found at $llvm_bin/clang++." >&2
   exit 1
 fi
+# The macos-homebrew-llvm preset wires CMAKE_LINKER_TYPE=LLD, which selects
+# Homebrew lld's Mach-O backend instead of Apple's ld64. Fail fast if the
+# brew llvm formula didn't ship it (older brew builds sometimes omitted it).
+if [[ ! -x "$llvm_bin/ld64.lld" ]]; then
+  echo "Homebrew LLD (ld64.lld) not found at $llvm_bin/ld64.lld." >&2
+  echo "Reinstall Homebrew llvm: brew reinstall llvm" >&2
+  exit 1
+fi
+# Put llvm_bin first so clang's driver finds ld64.lld and llvm-strip/nm/etc
+# without falling back to /usr/bin/* (which would be Apple's toolchain).
+export PATH="$llvm_bin:$PATH"
 
 # Homebrew LLVM's clang++ needs SDKROOT pointing at the active Xcode/CLT SDK
 # so its libc++ headers compose correctly with the C SDK headers (otherwise
 # Xcode 16's _string.h sees `size_t` in std:: only and fails to compile).
+# SDKROOT is the *only* Apple-toolchain dependency we keep — there is no
+# Homebrew replacement for the macOS system headers or libSystem.
 if command -v xcrun >/dev/null 2>&1; then
   export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
 fi
