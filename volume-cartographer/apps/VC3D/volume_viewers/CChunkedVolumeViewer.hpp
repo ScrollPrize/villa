@@ -90,6 +90,7 @@ public:
     void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; scheduleRender("setBaseColormap"); }
     void setStretchValues(bool) { if (_closing) return; scheduleRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
+    void setPlaneIntersectionLinesVisible(bool visible) override;
 
     void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
@@ -348,6 +349,7 @@ private:
 
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
+    bool _planeIntersectionLinesVisible = true;
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;

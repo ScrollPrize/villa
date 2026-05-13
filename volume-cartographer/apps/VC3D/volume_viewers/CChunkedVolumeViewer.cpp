@@ -3355,6 +3355,27 @@ void CChunkedVolumeViewer::setIntersects(const std::set<std::string>& names)
     renderIntersections("setIntersects");
 }
 
+void CChunkedVolumeViewer::setPlaneIntersectionLinesVisible(bool visible)
+{
+    if (_closing || _planeIntersectionLinesVisible == visible) {
+        return;
+    }
+    _planeIntersectionLinesVisible = visible;
+    _lastIntersectFp = {};
+    auto surf = _surfWeak.lock();
+    const bool isPlaneViewer = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
+    if (!visible && !isPlaneViewer) {
+        clearIntersectionItems();
+        if (_view) {
+            _view->viewport()->update();
+        }
+        return;
+    }
+    if (visible && !isPlaneViewer) {
+        renderIntersections("setPlaneIntersectionLinesVisible");
+    }
+}
+
 void CChunkedVolumeViewer::setIntersectionOpacity(float v)
 {
     if (_closing) {
@@ -3916,6 +3937,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
     if (!plane) {
+        if (!_planeIntersectionLinesVisible) {
+            clearIntersectionItems();
+            _lastIntersectFp = {};
+            profile.setDetails("action=skip flattened_disabled");
+            return;
+        }
         renderFlattenedIntersections(surf, reason, caller);
         profile.setDetails("action=delegated_flattened");
         return;
