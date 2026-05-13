@@ -15,7 +15,7 @@ _sample_cache_value: tuple[torch.Tensor | None, torch.Tensor | None] | None = No
 _shell_geometry_cache_key: tuple[int, int, bool] | None = None
 _shell_geometry_cache_value: dict[str, torch.Tensor | bool | None] | None = None
 _shell_sample_cache_key: int | None = None
-_shell_sample_cache_value: dict[tuple[int, tuple[int, ...]], tuple[torch.Tensor | None, torch.Tensor | None]] = {}
+_shell_sample_cache_value: dict[tuple[str, int, tuple[int, ...]], tuple[torch.Tensor | None, torch.Tensor | None]] = {}
 _compile_shell_normal = False
 _compile_shell_normal_backend: str | None = None
 _compile_shell_normal_mode: str | None = None
@@ -639,7 +639,7 @@ def _sample_shell_gt(
 	if _shell_sample_cache_key != res_key:
 		_shell_sample_cache_key = res_key
 		_shell_sample_cache_value = {}
-	cache_key = (int(xyz.data_ptr()), tuple(int(v) for v in xyz.shape))
+	cache_key = ("gt", int(xyz.data_ptr()), tuple(int(v) for v in xyz.shape))
 	if cache_key in _shell_sample_cache_value:
 		return _shell_sample_cache_value[cache_key]
 	sampled = res.data.grid_sample_fullres(
@@ -659,6 +659,42 @@ def _sample_shell_gt(
 		(mask > 0.0).to(dtype=xyz.dtype),
 	)
 	return _shell_sample_cache_value[cache_key]
+
+
+def _sample_shell_grad_mask(
+	*,
+	res: fit_model.FitResult3D,
+	xyz: torch.Tensor,
+) -> torch.Tensor | None:
+	global _shell_sample_cache_key, _shell_sample_cache_value
+	res_key = id(res)
+	if _shell_sample_cache_key != res_key:
+		_shell_sample_cache_key = res_key
+		_shell_sample_cache_value = {}
+	shape_key = tuple(int(v) for v in xyz.shape)
+	gt_key = ("gt", int(xyz.data_ptr()), shape_key)
+	cached_gt = _shell_sample_cache_value.get(gt_key)
+	if cached_gt is not None and cached_gt[1] is not None:
+		return cached_gt[1]
+	cache_key = ("grad_mag", int(xyz.data_ptr()), shape_key)
+	if cache_key in _shell_sample_cache_value:
+		return _shell_sample_cache_value[cache_key][1]
+	if not hasattr(res.data, "grid_sample_fullres"):
+		_shell_sample_cache_value[cache_key] = (None, None)
+		return None
+	sampled = res.data.grid_sample_fullres(
+		xyz.unsqueeze(0).detach(),
+		channels={"grad_mag"},
+	)
+	grad_mag = sampled.grad_mag
+	if grad_mag is None:
+		_shell_sample_cache_value[cache_key] = (None, None)
+		return None
+	mask = grad_mag.squeeze(0).squeeze(0)
+	mask = mask.squeeze(0) if int(mask.shape[0]) == 1 and tuple(mask.shape[1:]) == tuple(xyz.shape[:-1]) else mask
+	mask = (mask > 0.0).to(dtype=xyz.dtype)
+	_shell_sample_cache_value[cache_key] = (None, mask)
+	return mask
 
 
 def _sample_gt(res: fit_model.FitResult3D) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -950,6 +986,31 @@ def cyl_seed_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tup
 	return _register_shell_masked_term("cyl_seed_push", lm, mask, res=res)
 
 
+def _shell_point_smooth_lm(xyz: torch.Tensor) -> torch.Tensor:
+	"""Per-vertex shell smoothing penalty used to replace masked step losses."""
+	h_scale, w_scale = _shell_spacing_scales(xyz)
+	w_avg = 0.5 * (torch.roll(xyz, shifts=1, dims=1) + torch.roll(xyz, shifts=-1, dims=1))
+	lm = ((xyz - w_avg).norm(dim=-1) / w_scale).square()
+	if int(xyz.shape[0]) > 2:
+		h_lm = torch.zeros_like(lm)
+		h_avg = 0.5 * (xyz[:-2] + xyz[2:])
+		h_lm[1:-1] = ((xyz[1:-1] - h_avg).norm(dim=-1) / h_scale).square()
+		lm = lm + h_lm
+	return lm
+
+
+def _step_or_smooth_lm(
+	step_lm: torch.Tensor,
+	active: torch.Tensor,
+	endpoint_smooth: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+	"""Use step loss when both endpoints are valid, otherwise smooth both endpoints."""
+	smooth_sum = torch.zeros_like(step_lm)
+	for smooth in endpoint_smooth:
+		smooth_sum = smooth_sum + smooth
+	return torch.where(active, step_lm, smooth_sum)
+
+
 def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Match shell H/W edges and wrapped quad diagonals to the current target."""
 	xyz = _shell_xyz(res)
@@ -973,18 +1034,65 @@ def cyl_step_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[to
 		h_target = h_len.mean().clamp(min=1.0e-6)
 	else:
 		h_target = w_target
-	terms = [((w_len - w_target) / w_target).square().reshape(-1)]
+
+	sampled_mask = _sample_shell_grad_mask(res=res, xyz=xyz)
+	if sampled_mask is not None:
+		point_valid = sampled_mask > 0.0
+		point_smooth = _shell_point_smooth_lm(xyz)
+	else:
+		point_valid = torch.ones_like(w_len, dtype=torch.bool)
+		point_smooth = torch.zeros_like(w_len)
+
+	w_valid0 = point_valid
+	w_valid1 = torch.roll(point_valid, shifts=-1, dims=1)
+	w_step_lm = ((w_len - w_target) / w_target).square()
+	terms = [
+		_step_or_smooth_lm(
+			w_step_lm,
+			w_valid0 & w_valid1,
+			(point_smooth, torch.roll(point_smooth, shifts=-1, dims=1)),
+		).reshape(-1)
+	]
 	if h_len is not None:
-		terms.append(((h_len - h_target) / h_target).square().reshape(-1))
+		h_valid0 = point_valid[:-1]
+		h_valid1 = point_valid[1:]
+		h_step_lm = ((h_len - h_target) / h_target).square()
+		terms.append(
+			_step_or_smooth_lm(
+				h_step_lm,
+				h_valid0 & h_valid1,
+				(point_smooth[:-1], point_smooth[1:]),
+			).reshape(-1)
+		)
 		p00 = xyz[:-1]
 		p10 = xyz[1:]
 		p01 = torch.roll(p00, shifts=-1, dims=1)
 		p11 = torch.roll(p10, shifts=-1, dims=1)
+		v00 = point_valid[:-1]
+		v10 = point_valid[1:]
+		v01 = torch.roll(v00, shifts=-1, dims=1)
+		v11 = torch.roll(v10, shifts=-1, dims=1)
+		sm00 = point_smooth[:-1]
+		sm10 = point_smooth[1:]
+		sm01 = torch.roll(sm00, shifts=-1, dims=1)
+		sm11 = torch.roll(sm10, shifts=-1, dims=1)
 		diag_target = torch.sqrt(h_target.square() + w_target.square()).clamp(min=1.0e-6)
 		diag_fwd = (p11 - p00).norm(dim=-1)
 		diag_back = (p10 - p01).norm(dim=-1)
-		terms.append(((diag_fwd - diag_target) / diag_target).square().reshape(-1))
-		terms.append(((diag_back - diag_target) / diag_target).square().reshape(-1))
+		terms.append(
+			_step_or_smooth_lm(
+				((diag_fwd - diag_target) / diag_target).square(),
+				v00 & v11,
+				(sm00, sm11),
+			).reshape(-1)
+		)
+		terms.append(
+			_step_or_smooth_lm(
+				((diag_back - diag_target) / diag_target).square(),
+				v01 & v10,
+				(sm01, sm10),
+			).reshape(-1)
+		)
 	lm = torch.cat(terms, dim=0)
 	return _register_shell_term("cyl_step", lm, res=res)
 
