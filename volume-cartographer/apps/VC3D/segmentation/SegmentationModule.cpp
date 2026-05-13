@@ -431,6 +431,9 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::manualAddConfigChanged, this, [this]() {
         if (_manualAddTool && _widget) {
             _manualAddTool->setConfig(_widget->manualAddConfig());
+            if (_manualAddMode) {
+                refreshOverlay();
+            }
         }
     });
     connect(_widget, &SegmentationWidget::manualAddClearPendingRequested,
@@ -1309,6 +1312,10 @@ void SegmentationModule::refreshOverlay()
             state.manualAddHoverVertex = QPointF(hover->col, hover->row);
             state.manualAddHoverCrossFill =
                 _manualAddTool->config().linePreviewMode == ManualAddTool::LinePreviewMode::CrossFill;
+        }
+        state.manualAddHoverFillVertices.reserve(_manualAddTool->hoverFillVertices().size());
+        for (const auto& key : _manualAddTool->hoverFillVertices()) {
+            state.manualAddHoverFillVertices.push_back(QPointF(key.col, key.row));
         }
         for (const auto& key : _manualAddTool->fillVertices()) {
             if (key.row >= 0 && key.row < preview.rows && key.col >= 0 && key.col < preview.cols &&

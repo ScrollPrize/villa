@@ -94,6 +94,7 @@ public:
         std::vector<ManualAddLine> manualAddHoverLines;
         std::vector<ManualAddLine> manualAddCommittedLines;
         std::optional<QPointF> manualAddHoverVertex;
+        std::vector<QPointF> manualAddHoverFillVertices;
         bool manualAddHoverCrossFill{false};
         std::vector<cv::Vec3f> manualAddPreviewVertices;
         std::vector<std::array<cv::Vec3f, 4>> manualAddPreviewQuads;

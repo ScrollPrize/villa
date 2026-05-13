@@ -67,6 +67,7 @@ bool ManualAddTool::begin(const cv::Mat_<cv::Vec3f>& points, Config config)
     _previewPoints = points.clone();
     _hoverPolylines.clear();
     _hoverVertex.reset();
+    _hoverFillVertices.clear();
     _committedPolylines.clear();
     _fillVertices.clear();
     _borderSampleVertices.clear();
@@ -83,6 +84,7 @@ void ManualAddTool::clear()
     _previewPoints.release();
     _hoverPolylines.clear();
     _hoverVertex.reset();
+    _hoverFillVertices.clear();
     _committedPolylines.clear();
     _fillVertices.clear();
     _borderSampleVertices.clear();
@@ -101,6 +103,7 @@ bool ManualAddTool::clearPending(Config config)
     _previewPoints = _entrySnapshotPoints.clone();
     _hoverPolylines.clear();
     _hoverVertex.reset();
+    _hoverFillVertices.clear();
     _committedPolylines.clear();
     _fillVertices.clear();
     _borderSampleVertices.clear();
@@ -108,6 +111,14 @@ bool ManualAddTool::clearPending(Config config)
     _userPlaneConstraints.clear();
     touchRevision();
     return true;
+}
+
+void ManualAddTool::setConfig(Config config)
+{
+    _config = sanitize(config);
+    if (_hoverVertex) {
+        updateHover(_hoverVertex->row, _hoverVertex->col);
+    }
 }
 
 bool ManualAddTool::isInvalidPoint(const cv::Vec3f& value)
@@ -166,6 +177,7 @@ bool ManualAddTool::updateHover(int row, int col)
         if (!_hoverPolylines.empty() || _hoverVertex.has_value()) {
             _hoverPolylines.clear();
             _hoverVertex.reset();
+            _hoverFillVertices.clear();
             touchRevision();
             return true;
         }
@@ -176,6 +188,7 @@ bool ManualAddTool::updateHover(int row, int col)
         if (!_hoverPolylines.empty() || _hoverVertex.has_value()) {
             _hoverPolylines.clear();
             _hoverVertex.reset();
+            _hoverFillVertices.clear();
             touchRevision();
             return true;
         }
@@ -197,6 +210,9 @@ bool ManualAddTool::updateHover(int row, int col)
             next.push_back(*line);
         }
     }
+    const auto nextHoverFill = _config.linePreviewMode == LinePreviewMode::CrossFill
+        ? std::vector<GridKey>{}
+        : computeFillVerticesForLines(next, false);
 
     const bool vertexChanged = !_hoverVertex ||
                                _hoverVertex->row != row ||
@@ -205,10 +221,12 @@ bool ManualAddTool::updateHover(int row, int col)
                               !std::equal(next.begin(), next.end(), _hoverPolylines.begin(), [](const auto& a, const auto& b) {
                              return a.vertices == b.vertices && a.committed == b.committed;
                          });
-    const bool changed = vertexChanged || linesChanged;
+    const bool hoverFillChanged = nextHoverFill != _hoverFillVertices;
+    const bool changed = vertexChanged || linesChanged || hoverFillChanged;
     if (changed) {
         _hoverVertex = GridKey{row, col};
         _hoverPolylines = std::move(next);
+        _hoverFillVertices = std::move(nextHoverFill);
         touchRevision();
     }
     return changed;
@@ -243,6 +261,7 @@ bool ManualAddTool::commitHover(std::string* status)
     }
     _hoverPolylines.clear();
     _hoverVertex.reset();
+    _hoverFillVertices.clear();
     touchRevision();
     if (recompute(status)) {
         _initialFillCommitted = true;
@@ -253,6 +272,7 @@ bool ManualAddTool::commitHover(std::string* status)
     _committedPolylines = previousCommittedPolylines;
     _hoverPolylines = previousHoverPolylines;
     _hoverVertex = previousHoverVertex;
+    _hoverFillVertices = computeFillVerticesForLines(_hoverPolylines, false);
     _previewPoints = previousPreview;
     _fillVertices = previousFillVertices;
     _borderSampleVertices = previousBorderSampleVertices;
@@ -261,16 +281,17 @@ bool ManualAddTool::commitHover(std::string* status)
     return false;
 }
 
-void ManualAddTool::extractFillAndBorder()
+std::vector<ManualAddTool::GridKey> ManualAddTool::computeFillVerticesForLines(
+    const std::vector<GridPolyline>& lines,
+    bool includeUserConstraints) const
 {
-    _fillVertices.clear();
-    _borderSampleVertices.clear();
     if (_entrySnapshotPoints.empty()) {
-        return;
+        return {};
     }
 
     const int rows = _entrySnapshotPoints.rows;
     const int cols = _entrySnapshotPoints.cols;
+    std::vector<GridKey> fillVertices;
     std::set<std::pair<int, int>> seen;
     std::set<std::pair<int, int>> barriers;
     cv::Rect validBounds;
@@ -287,14 +308,14 @@ void ManualAddTool::extractFillAndBorder()
         }
     }
     if (!haveValidBounds) {
-        return;
+        return {};
     }
 
     auto fillAllowed = [&](int row, int col) {
         return validBounds.contains(cv::Point(col, row)) && isInvalid(row, col);
     };
 
-    for (const auto& line : _committedPolylines) {
+    for (const auto& line : lines) {
         for (const auto& p : line.vertices) {
             barriers.insert({rowOf(p), colOf(p)});
         }
@@ -305,7 +326,7 @@ void ManualAddTool::extractFillAndBorder()
             return;
         }
         seen.insert({row, col});
-        _fillVertices.push_back(GridKey{row, col});
+        fillVertices.push_back(GridKey{row, col});
     };
 
     auto collectSide = [&](const GridPolyline& line, int dRow, int dCol) {
@@ -356,14 +377,14 @@ void ManualAddTool::extractFillAndBorder()
         while (!queue.empty()) {
             const GridKey key = queue.front();
             queue.pop();
-            _fillVertices.push_back(key);
+            fillVertices.push_back(key);
             for (const auto& dir : kDirs) {
                 push(key.row + dir[0], key.col + dir[1]);
             }
         }
     };
 
-    for (const auto& line : _committedPolylines) {
+    for (const auto& line : lines) {
         if (line.floodFillComponent) {
             collectComponentFromLine(line);
             continue;
@@ -397,9 +418,25 @@ void ManualAddTool::extractFillAndBorder()
             }
         }
     }
-    for (const auto& constraint : _userPlaneConstraints) {
-        addFill(constraint.row, constraint.col);
+    if (includeUserConstraints) {
+        for (const auto& constraint : _userPlaneConstraints) {
+            addFill(constraint.row, constraint.col);
+        }
     }
+    return fillVertices;
+}
+
+void ManualAddTool::extractFillAndBorder()
+{
+    _fillVertices.clear();
+    _borderSampleVertices.clear();
+    if (_entrySnapshotPoints.empty()) {
+        return;
+    }
+
+    const int rows = _entrySnapshotPoints.rows;
+    const int cols = _entrySnapshotPoints.cols;
+    _fillVertices = computeFillVerticesForLines(_committedPolylines, true);
 
     std::set<std::pair<int, int>> border;
     auto addBorder = [&](int row, int col) {

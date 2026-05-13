@@ -66,6 +66,7 @@ public:
     [[nodiscard]] const cv::Mat_<cv::Vec3f>& previewPoints() const { return _previewPoints; }
     [[nodiscard]] const std::vector<GridPolyline>& hoverPolylines() const { return _hoverPolylines; }
     [[nodiscard]] std::optional<SegmentationEditManager::GridKey> hoverVertex() const { return _hoverVertex; }
+    [[nodiscard]] const std::vector<SegmentationEditManager::GridKey>& hoverFillVertices() const { return _hoverFillVertices; }
     [[nodiscard]] const std::vector<GridPolyline>& committedPolylines() const { return _committedPolylines; }
     [[nodiscard]] const std::vector<SegmentationEditManager::GridKey>& fillVertices() const { return _fillVertices; }
     [[nodiscard]] const std::vector<SegmentationEditManager::GridKey>& changedVertices() const { return _changedVertices; }
@@ -80,7 +81,7 @@ public:
     bool removeLastPlaneConstraint(std::string* status = nullptr);
     bool recompute(std::string* status = nullptr);
 
-    void setConfig(Config config) { _config = sanitize(config); }
+    void setConfig(Config config);
     [[nodiscard]] Config config() const { return _config; }
 
     static bool isInvalidPoint(const cv::Vec3f& value);
@@ -93,6 +94,8 @@ private:
     [[nodiscard]] bool isInvalid(int row, int col) const;
     [[nodiscard]] bool isValid(int row, int col) const;
     [[nodiscard]] std::optional<GridPolyline> discoverAxisLine(int row, int col, bool horizontal) const;
+    [[nodiscard]] std::vector<GridKey> computeFillVerticesForLines(const std::vector<GridPolyline>& lines,
+                                                                    bool includeUserConstraints) const;
     void extractFillAndBorder();
     std::vector<Constraint3d> buildFitSamples() const;
     std::vector<Constraint3d> downsampleSamples(std::vector<Constraint3d> samples) const;
@@ -103,6 +106,7 @@ private:
     cv::Mat_<cv::Vec3f> _previewPoints;
     std::vector<GridPolyline> _hoverPolylines;
     std::optional<GridKey> _hoverVertex;
+    std::vector<GridKey> _hoverFillVertices;
     std::vector<GridPolyline> _committedPolylines;
     std::vector<GridKey> _fillVertices;
     std::vector<GridKey> _borderSampleVertices;
