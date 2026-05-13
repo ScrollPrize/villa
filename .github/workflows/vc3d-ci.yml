@@ -232,3 +232,37 @@ jobs:
             cat volume-cartographer/dead-code/summary.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    name: CI
+    needs: [changes, skip, builder, build-test, coverage, macos-build, dead-code]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Aggregate required-check result
+        env:
+          R_CHANGES: ${{ needs.changes.result }}
+          R_SKIP: ${{ needs.skip.result }}
+          R_BUILDER: ${{ needs.builder.result }}
+          R_BUILD_TEST: ${{ needs.build-test.result }}
+          R_COVERAGE: ${{ needs.coverage.result }}
+          R_MACOS: ${{ needs.macos-build.result }}
+          R_DEAD_CODE: ${{ needs.dead-code.result }}
+        run: |
+          set -e
+          echo "changes=$R_CHANGES skip=$R_SKIP builder=$R_BUILDER build-test=$R_BUILD_TEST coverage=$R_COVERAGE macos=$R_MACOS dead-code=$R_DEAD_CODE"
+          # coverage and dead-code are continue-on-error, so accept any result.
+          # All other non-skipped jobs must succeed (or be skipped legitimately).
+          fail=0
+          for r in "$R_CHANGES" "$R_SKIP" "$R_BUILDER" "$R_BUILD_TEST" "$R_MACOS"; do
+            case "$r" in
+              success|skipped) ;;
+              *) fail=1 ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more required CI jobs failed or were cancelled."
+            exit 1
+          fi
+          echo "All required CI jobs passed."
