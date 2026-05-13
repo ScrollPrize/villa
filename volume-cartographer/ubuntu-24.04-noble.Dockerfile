@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         file bzip2 wget jq \
         gcovr lcov \
         python3 python3-venv \
- && ln -sf /usr/bin/flang-18 /usr/local/bin/flang
+ && ln -sf /usr/bin/flang-new-18 /usr/local/bin/flang
 
 RUN arch="$(uname -m)" \
  && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" -o /tmp/awscli.zip \

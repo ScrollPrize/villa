@@ -67,6 +67,11 @@ required_formulae=(
   # As of Homebrew llvm 19+, ld64.lld no longer ships in the llvm formula;
   # the Mach-O backend lives in a standalone `lld` keg.
   lld
+  # LLVM's Fortran frontend; lives in its own keg (Homebrew's llvm formula
+  # deliberately doesn't ship flang). PaStiX enables Fortran for a tiny
+  # configure-time check; flang+lld speaks the Mach-O linker correctly
+  # whereas gfortran does not.
+  flang
   cmake
   ninja
   pkgconf
@@ -83,6 +88,8 @@ required_formulae=(
   lapack
   scotch
   hwloc
+  # gcc stays in the deps list: OpenBLAS/lapack carry a libgfortran runtime
+  # dependency even though we no longer use gfortran as the compiler.
   gcc
 )
 
@@ -154,19 +161,18 @@ if [[ -d "$brew_prefix/opt/lapack" ]]; then
   export CMAKE_PREFIX_PATH="$brew_prefix/opt/lapack${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 fi
 
-# PaStiX requires a Fortran compiler. Homebrew's gcc installs a versioned
-# `gfortran-N` and (usually) an unsuffixed `gfortran` symlink, but on some
-# CI images (notably GitHub Actions macos-15) the unsuffixed symlink is
-# missing. Locate any gfortran-N under brew's gcc keg and pass it to cmake.
-if ! command -v gfortran >/dev/null 2>&1; then
-  gcc_prefix="$(brew --prefix gcc 2>/dev/null || true)"
-  if [[ -n "$gcc_prefix" ]]; then
-    gfortran_bin="$(ls "$gcc_prefix"/bin/gfortran-* 2>/dev/null | sort -V | tail -1 || true)"
-    if [[ -n "$gfortran_bin" && -x "$gfortran_bin" ]]; then
-      export FC="$gfortran_bin"
-      extra_cmake_args+=("-DCMAKE_Fortran_COMPILER=$gfortran_bin")
-    fi
-  fi
+# PaStiX enables Fortran at configure time even with PASTIX_WITH_FORTRAN=OFF.
+# Use LLVM's flang (from the Homebrew flang keg) so the toolchain stays
+# clang/flang + lld end-to-end; gfortran would inherit our -fuse-ld=lld
+# linker flags and ld64.lld would reject the link (gfortran doesn't pass
+# -platform_version / -arch).
+flang_bin="$(brew --prefix flang 2>/dev/null || true)/bin/flang"
+if [[ -x "$flang_bin" ]]; then
+  export FC="$flang_bin"
+  extra_cmake_args+=("-DCMAKE_Fortran_COMPILER=$flang_bin")
+else
+  echo "Homebrew flang not found at $flang_bin (run with --install-deps)" >&2
+  exit 1
 fi
 
 cmake --preset macos-homebrew-llvm \
