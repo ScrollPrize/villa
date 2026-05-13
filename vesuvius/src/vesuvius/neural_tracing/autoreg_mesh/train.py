@@ -1644,10 +1644,14 @@ def run_autoreg_mesh_training(
             skipped_step = 0.0
             if _distributed_all_finite(grad_norm_value, device=runtime.device, runtime=runtime):
                 optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
             else:
                 skipped_step = 1.0
+            # Always advance the schedule, regardless of whether the
+            # optimizer step was taken. Otherwise a long tail of NaN-grad
+            # steps stalls the LR schedule indefinitely (warmup never ends),
+            # which silently broke the prior 19h Muon and AdamW runs.
+            if scheduler is not None:
+                scheduler.step()
             global_step += 1
 
             metrics = _loss_dict_to_metrics(loss_dict)
@@ -1667,8 +1671,10 @@ def run_autoreg_mesh_training(
             metrics["step"] = float(global_step)
             metrics.update(_mean_batch_sample_metrics(batch, prefix="train_"))
             metrics.update(split_diagnostics)
-            if skipped_step > 0.0:
-                metrics["skipped_step_nonfinite_grad"] = skipped_step
+            # Always log so we can see skip rate over time (1.0 on skipped
+            # steps, 0.0 on successful steps); the prior conditional logging
+            # made it hard to measure the skip rate without a manual count.
+            metrics["skipped_step_nonfinite_grad"] = skipped_step
             metrics = _metric_dict_mean_across_ranks(metrics, device=runtime.device, runtime=runtime)
 
             should_run_validation_step = (

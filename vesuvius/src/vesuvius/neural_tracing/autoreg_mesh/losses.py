@@ -15,6 +15,24 @@ def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     return safe_values.sum() / denom
 
 
+def _nan_safe_target(target: Tensor) -> Tensor:
+    """Replace NaN/Inf in a (non-grad) target tensor with 0.0.
+
+    Targets like batch['target_xyz'] carry NaN at invalid mesh positions
+    (vertices outside the valid surface region). Feeding such a target into a
+    differentiable loss (e.g. F.smooth_l1_loss(pred, target)) produces a
+    NaN gradient via sign(pred - NaN) = NaN, which then propagates through
+    the chain rule even when supervision_mask zeros the forward contribution
+    (IEEE 0 * NaN = NaN). _masked_mean cannot fix this — it only sanitizes
+    the forward output, not the gradient of upstream tensors.
+
+    The fix is to replace target NaNs with 0 BEFORE the loss; predictions at
+    those positions get pushed toward 0 but supervision_mask discards that
+    contribution from the reduced loss anyway. Gradient becomes finite.
+    """
+    return torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _build_distance_aware_coarse_targets(
     target_coarse_ids: Tensor,
     supervision_mask: Tensor,
@@ -269,7 +287,9 @@ def _stop_loss(outputs: dict, batch: dict) -> Tensor:
 def _position_refine_loss(outputs: dict, batch: dict, *, loss_type: str) -> Tensor:
     if str(loss_type) != "huber":
         raise ValueError(f"Unsupported position_refine_loss={loss_type!r}")
-    target_residual = batch["target_xyz"] - batch["target_bin_center_xyz"]
+    target_xyz = _nan_safe_target(batch["target_xyz"])
+    target_bin_center_xyz = _nan_safe_target(batch["target_bin_center_xyz"])
+    target_residual = target_xyz - target_bin_center_xyz
     pred_residual = outputs["pred_refine_residual"]
     per_token = F.smooth_l1_loss(pred_residual, target_residual, reduction="none").mean(dim=-1)
     return _masked_mean(per_token, batch["target_supervision_mask"])
@@ -580,8 +600,8 @@ def _seam_edge_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, ban
     losses = []
     for example in _iter_geometry_examples(pred_xyz_sequence, batch):
         cond_band, pred_band, target_band, valid_band = _paired_seam_bands(example, band_width=int(band_width))
-        edge_pred = pred_band - cond_band
-        edge_target = target_band - cond_band
+        edge_pred = pred_band - _nan_safe_target(cond_band)
+        edge_target = _nan_safe_target(target_band) - _nan_safe_target(cond_band)
         per_vertex = F.smooth_l1_loss(edge_pred, edge_target, reduction="none").mean(dim=-1)
         if bool(valid_band.any()):
             losses.append(_masked_mean(per_vertex, valid_band))
@@ -600,7 +620,7 @@ def _seam_anchor_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, l
         cond_band, pred_band, target_band, valid_band = _paired_seam_bands(example, band_width=1)
         band_axis = 1 if str(example["direction"]) in {"left", "right"} else 0
         pred_seam = pred_band.select(dim=band_axis, index=0)
-        target_seam = target_band.select(dim=band_axis, index=0)
+        target_seam = _nan_safe_target(target_band.select(dim=band_axis, index=0))
         seam_valid = valid_band.select(dim=band_axis, index=0)
         per_vertex = F.smooth_l1_loss(pred_seam, target_seam, reduction="none").mean(dim=-1)
         if bool(seam_valid.any()):
@@ -620,6 +640,12 @@ def _triangle_det_ratio(
     *,
     eps: float = 1e-6,
 ) -> tuple[Tensor, Tensor]:
+    # NaN-safe target arithmetic. Target vertices carry NaN at invalid
+    # mesh positions; len1/len2 below would propagate that into the
+    # backward of pred_e1/pred_e2 via 0 * NaN.
+    target_p0 = _nan_safe_target(target_p0)
+    target_p1 = _nan_safe_target(target_p1)
+    target_p2 = _nan_safe_target(target_p2)
     target_e1 = target_p1 - target_p0
     target_e2 = target_p2 - target_p0
     pred_e1 = pred_p1 - pred_p0
@@ -739,7 +765,7 @@ def _geometry_metric_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, 
             continue
 
         pred_gram = _quad_gram_entries(pred_grid)
-        target_gram = _quad_gram_entries(target_grid)
+        target_gram = _quad_gram_entries(_nan_safe_target(target_grid))
         per_quad = F.smooth_l1_loss(pred_gram, target_gram, reduction="none").mean(dim=-1)
         losses.append(_masked_mean(per_quad, quad_mask))
 
@@ -944,7 +970,8 @@ def compute_autoreg_mesh_losses(
     if str(xyz_soft_loss_type) != "huber":
         raise ValueError(f"Unsupported xyz_soft_loss={xyz_soft_loss_type!r}")
     xyz_soft_mask = batch["target_supervision_mask"] & _prediction_finite_mask(soft_xyz_for_loss)
-    per_token_xyz_soft = F.smooth_l1_loss(soft_xyz_for_loss, batch["target_xyz"], reduction="none").mean(dim=-1)
+    target_xyz_safe = _nan_safe_target(batch["target_xyz"])
+    per_token_xyz_soft = F.smooth_l1_loss(soft_xyz_for_loss, target_xyz_safe, reduction="none").mean(dim=-1)
     xyz_soft_loss = _masked_mean(per_token_xyz_soft, xyz_soft_mask)
     refine_loss = total_loss.new_zeros(())
     if float(position_refine_weight_active) > 0.0:
