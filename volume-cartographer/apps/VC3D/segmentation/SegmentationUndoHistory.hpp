@@ -136,10 +136,9 @@ private:
         std::vector<VertexDelta> deltas;   // Delta-based (memory efficient)
     };
 
-    static constexpr std::size_t kMaxEntries = 1000;
+    static constexpr std::size_t kMaxEntries = 10;
 
     std::deque<Entry> _states;
 };
 
 } // namespace segmentation
-

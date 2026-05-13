@@ -165,13 +165,14 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
         return false;
     }
 
+    const auto editedVerts = _editManager->editedVertices();
+
     // Capture delta for undo before applyPreview() clears edited vertices
     (void)_module.captureUndoDelta();
 
     // Auto-approve edited regions before applyPreview() clears them
     auto* overlay = _module.overlay();
     if (_module.autoApprovalEnabled() && overlay && overlay->hasApprovalMaskData()) {
-        const auto editedVerts = _editManager->editedVertices();
         if (!editedVerts.empty()) {
             // Line tool has no single drag center - use nullopt
             const auto filteredVerts = _module.filterVerticesForAutoApproval(editedVerts, std::nullopt);
@@ -186,6 +187,7 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
 
     _module.refreshOverlay();
     _module.emitPendingChanges();
+    _module.queueAutosaveVertexUpdates(editedVerts);
     _module.markAutosaveNeeded();
     Q_EMIT _module.statusMessageRequested(QCoreApplication::translate("SegmentationModule",
                                                                      "Applied segmentation drag along path."),

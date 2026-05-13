@@ -613,12 +613,13 @@ void SegmentationPushPullTool::stopAll()
 
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _state) {
+        const auto editedVerts = _editManager->editedVertices();
+
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)_module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
-            const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 // Get drag center from the cached row/col if available
                 std::optional<std::pair<int, int>> dragCenter;
@@ -633,6 +634,8 @@ void SegmentationPushPullTool::stopAll()
         _editManager->applyPreview();
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         _module.emitPendingChanges();
+        _module.queueAutosaveVertexUpdates(editedVerts);
+        _module.markAutosaveNeeded();
     }
 
     if (wasActive) {

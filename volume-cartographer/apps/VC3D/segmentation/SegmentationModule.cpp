@@ -2221,12 +2221,13 @@ void SegmentationModule::finishDrag()
     _drag.reset();
 
     if (moved) {
+        const auto editedVerts = _editManager->editedVertices();
+
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData()) {
-            const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 // Get drag center from the active drag state
                 const auto& activeDrag = _editManager->activeDrag();
@@ -2243,6 +2244,7 @@ void SegmentationModule::finishDrag()
         if (_state) {
             _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
+        queueAutosaveVertexUpdates(editedVerts);
         markAutosaveNeeded();
     }
 
@@ -2517,10 +2519,6 @@ void SegmentationModule::markAutosaveNeeded(bool immediate)
         return;
     }
 
-    if (_editManager->hasPendingChanges()) {
-        queueAutosaveVertexUpdates(_editManager->editedVertices());
-    }
-
     _pendingAutosave = true;
     _autosaveNotifiedFailure = false;
 
@@ -2581,6 +2579,10 @@ void SegmentationModule::performAutosave()
     }
 
     ensureSurfaceMetaObject(surfacePtr.get());
+
+    if (_pendingAutosaveVertexUpdates.empty() && _editManager->hasPendingChanges()) {
+        queueAutosaveVertexUpdates(_editManager->editedVertices());
+    }
 
     auto vertexUpdates = std::move(_pendingAutosaveVertexUpdates);
     _pendingAutosaveVertexUpdates.clear();

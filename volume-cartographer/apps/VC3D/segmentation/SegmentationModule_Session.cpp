@@ -220,6 +220,7 @@ bool SegmentationModule::restoreUndoSnapshot()
     _suppressUndoCapture = true;
     bool applied = false;
     std::optional<cv::Rect> undoBounds;
+    std::vector<SegmentationEditManager::VertexEdit> autosaveEdits;
     const bool editingWasEnabled = _editingEnabled;
 
     // Check if this is a delta-based entry or full snapshot
@@ -235,6 +236,7 @@ bool SegmentationModule::restoreUndoSnapshot()
                 if (delta.row >= 0 && delta.row < previewPoints.rows &&
                     delta.col >= 0 && delta.col < previewPoints.cols) {
                     previewPoints(delta.row, delta.col) = delta.previousWorld;
+                    autosaveEdits.push_back({delta.row, delta.col, {}, delta.previousWorld, false});
                     minRow = std::min(minRow, delta.row);
                     maxRow = std::max(maxRow, delta.row);
                     minCol = std::min(minCol, delta.col);
@@ -316,6 +318,7 @@ bool SegmentationModule::restoreUndoSnapshot()
 
         refreshOverlay();
         emitPendingChanges();
+        queueAutosaveVertexUpdates(autosaveEdits);
         markAutosaveNeeded();
     }
 
