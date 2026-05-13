@@ -232,6 +232,10 @@ pybind11::tuple build_inside_depth_volume(
 			<< "[cyl_outside] " << progress_label
 			<< ": building field shape=(" << Z << "," << Y << "," << X << ")"
 			<< " voxels=" << total
+			<< " depth_temp="
+			<< std::fixed << std::setprecision(2)
+			<< (static_cast<double>(total) * static_cast<double>(sizeof(float)) / (1024.0 * 1024.0 * 1024.0))
+			<< "GiB"
 			<< " threads=" << n_threads
 			<< " torch_threads=" << at::get_num_threads()
 			<< std::endl;
@@ -261,11 +265,12 @@ pybind11::tuple build_inside_depth_volume(
 			<< "s"
 			<< std::endl;
 	}
-	double depth_max = 0.0;
+	auto depth_tmp = torch::empty({total}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+	float* depth_ptr = depth_tmp.data_ptr<float>();
 	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
 	std::atomic<int64_t> max_done(0);
 	{
-		ProgressPrinter progress(progress_label, "pass 1/2 max-depth", total, max_done, progress_enabled);
+		ProgressPrinter progress(progress_label, "pass 1/2 signed-distance", total, max_done, progress_enabled);
 		parallel_chunks(total, n_threads, 2048, [&](int64_t begin, int64_t end, int ti) {
 			double local_max = 0.0;
 			for (int64_t n = begin; n < end; ++n) {
@@ -279,14 +284,16 @@ pybind11::tuple build_inside_depth_volume(
 					origin[2] + static_cast<double>(z) * spacing[2]
 				);
 				const double sd = signed_distance_at(tree, V, F, hier, q);
-				if (sd < 0.0) {
-					local_max = std::max(local_max, -sd);
-				}
+				const double depth = sd < 0.0 ? -sd : 0.0;
+				const float depth_f = static_cast<float>(depth);
+				depth_ptr[n] = depth_f;
+				local_max = std::max(local_max, static_cast<double>(depth_f));
 			}
 			thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
 			max_done.fetch_add(end - begin);
 		});
 	}
+	double depth_max = 0.0;
 	for (const double value : thread_max) {
 		if (value > depth_max) {
 			depth_max = value;
@@ -300,18 +307,7 @@ pybind11::tuple build_inside_depth_volume(
 		ProgressPrinter progress(progress_label, "pass 2/2 encode", total, encode_done, progress_enabled);
 		parallel_chunks(total, n_threads, 2048, [&](int64_t begin, int64_t end, int /*ti*/) {
 			for (int64_t n = begin; n < end; ++n) {
-				const int64_t x = n % X;
-				const int64_t yz = n / X;
-				const int64_t y = yz % Y;
-				const int64_t z = yz / Y;
-				const RowVector3d q(
-					origin[0] + static_cast<double>(x) * spacing[0],
-					origin[1] + static_cast<double>(y) * spacing[1],
-					origin[2] + static_cast<double>(z) * spacing[2]
-				);
-				const double sd = signed_distance_at(tree, V, F, hier, q);
-				const double depth = sd < 0.0 ? -sd : 0.0;
-				out_ptr[n] = encode_depth(depth, depth_max);
+				out_ptr[n] = encode_depth(static_cast<double>(depth_ptr[n]), depth_max);
 			}
 			encode_done.fetch_add(end - begin);
 		});
