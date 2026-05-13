@@ -52,6 +52,7 @@
 #include <cctype>
 #include <utility>
 #include <filesystem>
+#include <system_error>
 #include <vector>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -192,6 +193,26 @@ QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>&
             : QObject::tr("%1 normal3d zarr(s) tagged").arg(candidates.size());
     }
     return candidates;
+}
+
+QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath,
+                                        const std::shared_ptr<VolumePkg>& pkg)
+{
+    auto path = segmentPath;
+    if (!path.is_absolute() && pkg) {
+        const auto projectPath = pkg->path();
+        const auto projectDir = projectPath.has_parent_path()
+            ? projectPath.parent_path()
+            : std::filesystem::current_path();
+        path = projectDir / path;
+    }
+
+    std::error_code ec;
+    const auto absolutePath = std::filesystem::absolute(path, ec);
+    if (!ec) {
+        path = absolutePath;
+    }
+    return QString::fromStdString(path.lexically_normal().string());
 }
 
 constexpr float kEpsilon = 1e-6f;
@@ -1459,7 +1480,7 @@ void CWindow::CreateWidgets(void)
                 if (!surf) {
                     return;
                 }
-                const QString path = QString::fromStdString(surf->path.string());
+                const QString path = absoluteSegmentPathForClipboard(surf->path, _state->vpkg());
                 QApplication::clipboard()->setText(path);
                 statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
