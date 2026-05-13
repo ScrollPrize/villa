@@ -72,7 +72,7 @@ required_formulae=(
   eigen
   opencv
   cgal
-  c-blosc2
+  c-blosc
   boost
   libtiff
   curl

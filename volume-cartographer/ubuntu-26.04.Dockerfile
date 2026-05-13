@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libceres-dev libsuitesparse-dev \
         libopencv-dev libopencv-contrib-dev \
         libcgal-dev libmpfr-dev libgmp-dev \
-        libblosc2-dev libzstd-dev libcurl4-openssl-dev \
+        libblosc-dev libzstd-dev libcurl4-openssl-dev \
         nlohmann-json3-dev libavahi-client-dev \
         liblz4-dev libtiff-dev \
         zlib1g-dev gfortran libopenblas-dev liblapack-dev liblapacke-dev \

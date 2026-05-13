@@ -14,7 +14,7 @@
 #include <numeric>
 #include <stdexcept>
 
-#include <blosc2.h>
+#include <blosc.h>
 #include <zstd.h>
 #include <lz4.h>
 #include <zlib.h>
@@ -50,8 +50,8 @@ void ensureBloscInitialized()
 {
     static std::once_flag once;
     std::call_once(once, []() {
-        blosc2_init();
-        std::atexit([]() { blosc2_destroy(); });
+        blosc_init();
+        std::atexit([]() { blosc_destroy(); });
     });
 }
 
@@ -76,22 +76,19 @@ std::vector<std::byte> bloscCompress(std::span<const std::byte> input,
 {
     ensureBloscInitialized();
 
-    blosc2_cparams cparams = BLOSC2_CPARAMS_DEFAULTS;
-    cparams.clevel = cfg.blosc_clevel;
-    cparams.typesize = cfg.blosc_typesize;
-    cparams.compcode = blosc2_compname_to_compcode(cfg.blosc_cname.c_str());
-    cparams.filters[BLOSC2_MAX_FILTERS - 1] = cfg.blosc_shuffle;
-    cparams.blocksize = cfg.blosc_blocksize;
-    cparams.nthreads = kCompressionThreads;
-
-    blosc2_context* ctx = blosc2_create_cctx(cparams);
-    std::vector<std::byte> output(input.size() + BLOSC2_MAX_OVERHEAD);
-    const int rc = blosc2_compress_ctx(ctx,
-                                       input.data(), input.size(),
-                                       output.data(), output.size());
-    blosc2_free_ctx(ctx);
+    std::vector<std::byte> output(input.size() + BLOSC_MAX_OVERHEAD);
+    const int rc = blosc_compress_ctx(cfg.blosc_clevel,
+                                      cfg.blosc_shuffle,
+                                      cfg.blosc_typesize,
+                                      input.size(),
+                                      input.data(),
+                                      output.data(),
+                                      output.size(),
+                                      cfg.blosc_cname.c_str(),
+                                      cfg.blosc_blocksize,
+                                      kCompressionThreads);
     if (rc <= 0) {
-        throw std::runtime_error("blosc2_compress_ctx failed with code " + std::to_string(rc));
+        throw std::runtime_error("blosc_compress_ctx failed with code " + std::to_string(rc));
     }
     output.resize(static_cast<size_t>(rc));
     return output;
@@ -100,18 +97,14 @@ std::vector<std::byte> bloscCompress(std::span<const std::byte> input,
 void bloscDecompressInto(std::span<const std::byte> input, std::span<std::byte> output)
 {
     ensureBloscInitialized();
-    blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
-    dparams.nthreads = 1;
-    blosc2_context* dctx = blosc2_create_dctx(dparams);
-    const int rc = blosc2_decompress_ctx(dctx, input.data(), input.size(),
-                                         output.data(), output.size());
-    blosc2_free_ctx(dctx);
+    const int rc = blosc_decompress_ctx(input.data(), output.data(),
+                                        output.size(), /*nthreads=*/1);
     if (rc < 0) {
         if (input.size() == output.size()) {
             std::memcpy(output.data(), input.data(), output.size());
             return;
         }
-        throw std::runtime_error("blosc2_decompress_ctx failed with code " + std::to_string(rc));
+        throw std::runtime_error("blosc_decompress_ctx failed with code " + std::to_string(rc));
     }
 }
 
@@ -610,17 +603,13 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
         case CompressorId::Blosc: {
             ensureBloscInitialized();
-            blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
-            dparams.nthreads = 1;
-            blosc2_context* dctx = blosc2_create_dctx(dparams);
-            int ret = blosc2_decompress_ctx(dctx, compressed.data(), compressed.size(), output, outBytes);
-            blosc2_free_ctx(dctx);
+            int ret = blosc_decompress_ctx(compressed.data(), output, outBytes, /*nthreads=*/1);
             if (ret < 0) {
                 if (compressed.size() == outBytes) {
                     std::memcpy(output, compressed.data(), outBytes);
                     break;
                 }
-                throw std::runtime_error("blosc2_decompress_ctx failed with code " +
+                throw std::runtime_error("blosc_decompress_ctx failed with code " +
                                           std::to_string(ret));
             }
             break;

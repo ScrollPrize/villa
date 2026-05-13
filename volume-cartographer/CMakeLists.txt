@@ -244,8 +244,21 @@ find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
-find_package(Blosc2 REQUIRED)
 find_package(PkgConfig REQUIRED)
+# Blosc1 (libblosc-dev on Debian/Ubuntu; c-blosc on Homebrew). No upstream
+# CMake config is shipped, so locate by header+lib and wrap in an imported
+# target consumers link as Blosc::blosc.
+find_path(BLOSC_INCLUDE_DIR NAMES blosc.h)
+find_library(BLOSC_LIBRARY NAMES blosc)
+if(NOT BLOSC_INCLUDE_DIR OR NOT BLOSC_LIBRARY)
+    message(FATAL_ERROR "Blosc1 (libblosc-dev / c-blosc) not found")
+endif()
+if(NOT TARGET Blosc::blosc)
+    add_library(Blosc::blosc UNKNOWN IMPORTED)
+    set_target_properties(Blosc::blosc PROPERTIES
+        IMPORTED_LOCATION "${BLOSC_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${BLOSC_INCLUDE_DIR}")
+endif()
 pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
 pkg_check_modules(lz4 REQUIRED IMPORTED_TARGET liblz4)
 if(NOT TARGET zstd::libzstd)

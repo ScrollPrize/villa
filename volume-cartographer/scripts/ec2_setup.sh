@@ -26,7 +26,7 @@ apt-get install -y \
     qt6-base-dev libboost-system-dev libboost-program-options-dev \
     libceres-dev libsuitesparse-dev \
     libopencv-dev libopencv-contrib-dev \
-    libblosc2-dev libcurl4-openssl-dev \
+    libblosc-dev libcurl4-openssl-dev \
     libavahi-client-dev nlohmann-json3-dev \
     liblz4-dev libtiff-dev \
     zlib1g-dev gfortran libopenblas-dev liblapack-dev liblapacke-dev libomp-dev \

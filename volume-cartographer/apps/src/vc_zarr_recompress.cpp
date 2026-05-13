@@ -61,7 +61,7 @@
 #include <chrono>
 
 #include "utils/Json.hpp"
-#include <blosc2.h>
+#include <blosc.h>
 
 #include "utils/c3d_codec.hpp"
 #include "utils/http_fetch.hpp"
@@ -358,13 +358,12 @@ static std::vector<std::byte> decompress_blosc(const std::vector<std::byte>& com
     std::memcpy(&nbytes, reinterpret_cast<const char*>(compressed.data()) + 4, 4);
 
     std::vector<std::byte> output(nbytes);
-    int ret = blosc2_decompress(
+    int ret = blosc_decompress(
         reinterpret_cast<const void*>(compressed.data()),
-        compressed.size(),
         reinterpret_cast<void*>(output.data()),
         nbytes);
     if (ret < 0) {
-        throw std::runtime_error("blosc2_decompress failed: " + std::to_string(ret));
+        throw std::runtime_error("blosc_decompress failed: " + std::to_string(ret));
     }
     output.resize(ret);
     return output;
@@ -688,7 +687,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    blosc2_init();
+    blosc_init();
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
@@ -1726,6 +1725,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    blosc2_destroy();
+    blosc_destroy();
     return 0;
 }

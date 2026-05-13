@@ -36,6 +36,14 @@ add_executable(test_post_process test_post_process.cpp)
 target_link_libraries(test_post_process PRIVATE doctest::doctest vc_core)
 add_test(NAME test_post_process COMMAND test_post_process)
 
+# Pin the on-disk wire format: chunks must remain Blosc1-readable because
+# VcDataset writes Zarr v2 metadata advertising compressor_id = "blosc".
+# This catches any future migration to Blosc2 that would silently produce
+# chunks numcodecs / zarr-python cannot decode.
+add_executable(test_blosc1_compat test_blosc1_compat.cpp)
+target_link_libraries(test_blosc1_compat PRIVATE doctest::doctest Blosc::blosc)
+add_test(NAME test_blosc1_compat COMMAND test_blosc1_compat)
+
 # Parser-only regression tests for vc_merge_tifxyz: link the small static
 # lib that holds gmResolveGrid + gmCheckConnected so the failure-message
 # assertions are exact, without spawning the binary.
