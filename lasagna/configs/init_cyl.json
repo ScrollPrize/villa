@@ -17,6 +17,7 @@
 		"cyl_conn_gt": 0.0,
 		"cyl_base_mesh": 0.0,
 		"cyl_base_gt": 0.0,
+		"cyl_outside": 100.0,
 		"normal": 1.0,
 		"step": 10.0,
 		"smooth": 0.0001,
@@ -53,7 +54,7 @@
 				"cyl_smooth": 1.0
 			},
 			"args": {
-				"grow_factor": 1.5,
+				"grow_factor": 1.1,
 				"cyl_grow_direction": "outward",
 				"model-step": 200.0,
 				"compile_cyl_normal": true,
@@ -62,7 +63,7 @@
 			},
 			{
 				"name": "cyl_grow_refine",
-				"steps": 500,
+				"steps": 2000,
 				"lr": 1.0,
 				"params": ["cyl_params"],
 				"w_fac": {
@@ -122,6 +123,7 @@
 				"cyl_conn_gt": 0.0,
 				"cyl_base_mesh": 0.0,
 				"cyl_base_gt": 0.0,
+				"cyl_outside": 0.0,
 				"pred_dt": 0.0
 			}
 		}

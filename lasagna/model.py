@@ -256,6 +256,13 @@ class FitResult3D:
 	cyl_shell_w_offsets: torch.Tensor | None = None
 	cyl_shell_delta_xyz: torch.Tensor | None = None
 	cyl_shell_index: int = 0
+	cyl_outside_volume: torch.Tensor | None = None  # (1, Z, Y, X) uint8 previous-shell inside depth
+	cyl_outside_origin: tuple[float, float, float] | None = None
+	cyl_outside_spacing: tuple[float, float, float] | None = None
+	cyl_outside_shape: tuple[int, int, int] | None = None  # (Z, Y, X)
+	cyl_outside_depth_max: float = 0.0
+	cyl_outside_sample_factor: int = 2
+	cyl_outside_model_step: float | None = None
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
@@ -365,6 +372,13 @@ class Model3D(nn.Module):
 		self.cyl_shell_search_last_signed_distance: float | None = None
 		self.cyl_shell_search_crossed = False
 		self.cyl_shell_search_done = False
+		self.cyl_outside_volume: torch.Tensor | None = None
+		self.cyl_outside_origin: tuple[float, float, float] | None = None
+		self.cyl_outside_spacing: tuple[float, float, float] | None = None
+		self.cyl_outside_shape: tuple[int, int, int] | None = None
+		self.cyl_outside_depth_max: float = 0.0
+		self.cyl_outside_sample_factor: int = 2
+		self.cyl_outside_model_step: float | None = None
 
 		# Residual mesh pyramid: (3, D, H, W) per scale, 5 levels
 		n_scales = int(self.cyl_shell_n_scales)
@@ -617,11 +631,38 @@ class Model3D(nn.Module):
 		self.cyl_shell_search_last_signed_distance = None
 		self.cyl_shell_search_crossed = False
 		self.cyl_shell_search_done = False
+		self.clear_cyl_outside_volume()
 		self.cylinder_enabled = True
 		self.cyl_best_idx = 0
 		self.arc_enabled = False
 		self.straight_enabled = False
 		self.init_mode = "cylinder_seed"
+
+	def clear_cyl_outside_volume(self) -> None:
+		self.cyl_outside_volume = None
+		self.cyl_outside_origin = None
+		self.cyl_outside_spacing = None
+		self.cyl_outside_shape = None
+		self.cyl_outside_depth_max = 0.0
+		self.cyl_outside_model_step = None
+
+	def set_cyl_outside_volume(self, field: object, *, sample_factor: int = 2, model_step: float | None = None) -> None:
+		volume = getattr(field, "volume", None)
+		origin = getattr(field, "origin", None)
+		spacing = getattr(field, "spacing", None)
+		shape = getattr(field, "shape", None)
+		depth_max = float(getattr(field, "depth_max", 0.0))
+		if volume is None or origin is None or spacing is None or shape is None:
+			raise ValueError("cyl_outside field must expose volume, origin, spacing, shape, and depth_max")
+		self.cyl_outside_volume = volume.detach().contiguous()
+		self.cyl_outside_origin = tuple(float(v) for v in origin)
+		self.cyl_outside_spacing = tuple(float(v) for v in spacing)
+		self.cyl_outside_shape = tuple(int(v) for v in shape)
+		self.cyl_outside_depth_max = depth_max
+		self.cyl_outside_sample_factor = max(1, int(sample_factor))
+		self.cyl_outside_model_step = (
+			None if model_step is None else max(1.0e-6, float(model_step))
+		)
 
 	def _set_shell_grid_shape(self, *, h: int, w: int) -> None:
 		h = max(2, int(h))
@@ -2135,6 +2176,7 @@ class Model3D(nn.Module):
 			self.cylinder_enabled = False
 			self.cyl_shell_mode = False
 			self.cyl_shell_delta_ms = nn.ParameterList()
+			self.clear_cyl_outside_volume()
 			return
 		idx = self.best_cylinder_index(data)
 		with torch.no_grad():
@@ -2144,6 +2186,7 @@ class Model3D(nn.Module):
 			for ext_off in self._ext_conn_offsets:
 				ext_off.zero_()
 		self.cylinder_enabled = False
+		self.clear_cyl_outside_volume()
 
 	def mesh_flat_for_save(self, *, data: fit_data.FitData3D | None = None) -> torch.Tensor:
 		if self.cylinder_enabled:
@@ -3090,6 +3133,13 @@ class Model3D(nn.Module):
 			cyl_shell_w_offsets=cyl_shell_w_offsets,
 			cyl_shell_delta_xyz=cyl_shell_delta_xyz,
 			cyl_shell_index=cyl_shell_index,
+			cyl_outside_volume=self.cyl_outside_volume,
+			cyl_outside_origin=self.cyl_outside_origin,
+			cyl_outside_spacing=self.cyl_outside_spacing,
+			cyl_outside_shape=self.cyl_outside_shape,
+			cyl_outside_depth_max=float(getattr(self, "cyl_outside_depth_max", 0.0)),
+			cyl_outside_sample_factor=int(getattr(self, "cyl_outside_sample_factor", 2)),
+			cyl_outside_model_step=getattr(self, "cyl_outside_model_step", None),
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:

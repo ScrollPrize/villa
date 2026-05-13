@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ import torch
 import cli_data
 import fit_data
 import model as fit_model
+import cyl_sdf_volume
 import opt_loss_data
 import opt_loss_dir
 import opt_loss_pred_dt
@@ -74,10 +76,13 @@ OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_s
 CYLINDER_OUTPUT_ALL_SHELLS_ARGS = ("cyl_output_all_shells", "cyl_shell_output_all")
 CYLINDER_MAX_SEARCH_SHELLS_ARGS = ("cyl_max_shells", "cyl_shell_max_shells", "cyl_shell_search_max_shells")
 CYLINDER_GROW_DIRECTION_ARG = "cyl_grow_direction"
+CYLINDER_OUTSIDE_GRID_STEP_ARG = "cyl_outside_grid_step"
+CYLINDER_OUTSIDE_SAMPLE_FACTOR_ARG = "cyl_outside_sample_factor"
+CYLINDER_OUTSIDE_THREADS_ARG = "cyl_outside_threads"
 CYLINDER_LOSS_NAMES = (
 	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
 	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
-	"cyl_base_mesh", "cyl_base_gt",
+	"cyl_base_mesh", "cyl_base_gt", "cyl_outside",
 )
 
 
@@ -220,6 +225,7 @@ lambda_global: dict[str, float] = {
 	"cyl_conn_gt": 0.0,
 	"cyl_base_mesh": 0.0,
 	"cyl_base_gt": 0.0,
+	"cyl_outside": 0.0,
 }
 
 
@@ -532,6 +538,97 @@ def optimize(
 			)
 		return 1
 
+	def _cyl_outside_enabled(eff_: dict[str, float]) -> bool:
+		return _need_term("cyl_outside", eff_) > 0.0
+
+	def _cyl_outside_grid_step(stage_args_: dict) -> float:
+		value = stage_args_.get(CYLINDER_OUTSIDE_GRID_STEP_ARG, cyl_sdf_volume.DEFAULT_CYL_OUTSIDE_GRID_STEP)
+		value = float(value)
+		if value <= 0.0:
+			raise ValueError(f"cylinder stage arg '{CYLINDER_OUTSIDE_GRID_STEP_ARG}' must be > 0, got {value}")
+		return value
+
+	def _cyl_outside_sample_factor(stage_args_: dict) -> int:
+		value = int(stage_args_.get(CYLINDER_OUTSIDE_SAMPLE_FACTOR_ARG, 2))
+		if value <= 0:
+			raise ValueError(f"cylinder stage arg '{CYLINDER_OUTSIDE_SAMPLE_FACTOR_ARG}' must be > 0, got {value}")
+		return value
+
+	def _cyl_outside_threads(stage_args_: dict) -> int:
+		raw = stage_args_.get(CYLINDER_OUTSIDE_THREADS_ARG, os.environ.get("LASAGNA_CYL_OUTSIDE_THREADS", 0))
+		value = int(raw)
+		if value < 0:
+			raise ValueError(f"cylinder stage arg '{CYLINDER_OUTSIDE_THREADS_ARG}' must be >= 0, got {value}")
+		return value
+
+	def _clear_cyl_outside_field() -> None:
+		if hasattr(model, "clear_cyl_outside_volume"):
+			model.clear_cyl_outside_volume()
+			return
+		setattr(model, "cyl_outside_volume", None)
+		setattr(model, "cyl_outside_origin", None)
+		setattr(model, "cyl_outside_spacing", None)
+		setattr(model, "cyl_outside_shape", None)
+		setattr(model, "cyl_outside_depth_max", 0.0)
+		setattr(model, "cyl_outside_model_step", None)
+
+	def _set_cyl_outside_field(field: cyl_sdf_volume.CylOutsideVolume, *, sample_factor: int, model_step: float) -> None:
+		if hasattr(model, "set_cyl_outside_volume"):
+			model.set_cyl_outside_volume(field, sample_factor=sample_factor, model_step=model_step)
+			return
+		setattr(model, "cyl_outside_volume", field.volume.detach().contiguous())
+		setattr(model, "cyl_outside_origin", tuple(float(v) for v in field.origin))
+		setattr(model, "cyl_outside_spacing", tuple(float(v) for v in field.spacing))
+		setattr(model, "cyl_outside_shape", tuple(int(v) for v in field.shape))
+		setattr(model, "cyl_outside_depth_max", float(field.depth_max))
+		setattr(model, "cyl_outside_sample_factor", max(1, int(sample_factor)))
+		setattr(model, "cyl_outside_model_step", max(1.0e-6, float(model_step)))
+
+	def _configure_cyl_outside_step(*, sample_factor: int, model_step: float) -> None:
+		setattr(model, "cyl_outside_sample_factor", max(1, int(sample_factor)))
+		setattr(model, "cyl_outside_model_step", max(1.0e-6, float(model_step)))
+
+	def _build_cyl_outside_from_completed(
+		*,
+		eff_: dict[str, float],
+		stage_args_: dict,
+		model_step: float,
+		label_: str,
+	) -> None:
+		if not _cyl_outside_enabled(eff_):
+			return
+		shells = getattr(model, "cyl_shell_completed", None)
+		if not shells:
+			_clear_cyl_outside_field()
+			return
+		device = next(model.parameters()).device
+		grid_step = _cyl_outside_grid_step(stage_args_)
+		sample_factor = _cyl_outside_sample_factor(stage_args_)
+		threads = _cyl_outside_threads(stage_args_)
+		_bbox = cyl_sdf_volume.default_shell_bbox(shells[-1], grid_step=grid_step)
+		_origin, _shape = cyl_sdf_volume.shape_for_bbox(_bbox, grid_step=grid_step)
+		_voxels = int(_shape[0]) * int(_shape[1]) * int(_shape[2])
+		print(
+			f"[optimizer] {label_}: building cyl_outside previous-shell field "
+			f"shape={_shape} voxels={_voxels} grid_step={grid_step:.1f} "
+			f"threads={'auto' if threads == 0 else threads}; first run may compile the libigl extension",
+			flush=True,
+		)
+		field = cyl_sdf_volume.build_previous_shell_inside_depth_volume(
+			shells[-1].detach(),
+			grid_step=grid_step,
+			device=device,
+			progress_label=label_,
+			threads=threads,
+		)
+		_set_cyl_outside_field(field, sample_factor=sample_factor, model_step=model_step)
+		print(
+			f"[optimizer] {label_}: cyl_outside field shape={field.shape} "
+			f"origin=({field.origin[0]:.1f},{field.origin[1]:.1f},{field.origin[2]:.1f}) "
+			f"grid_step={grid_step:.1f} depth_max={field.depth_max:.3f}",
+			flush=True,
+		)
+
 	def _next_stage_is_cyl(si_: int) -> bool:
 		return si_ + 1 < len(stages) and _is_cyl_stage(stages[si_ + 1])
 
@@ -806,6 +903,10 @@ def optimize(
 			"loss": opt_loss_cyl.cyl_base_gt_loss,
 			"needs": Needs(cyl_samples=True, cyl_shell_fields=True, prefetch_cyl_gt_normals=True),
 		},
+		"cyl_outside": {
+			"loss": opt_loss_cyl.cyl_outside_loss,
+			"needs": Needs(cyl_samples=True, cyl_shell_fields=True, prefetch_cyl_grad_mask=True),
+		},
 	}
 
 	_corr_start_printed = [False]
@@ -937,6 +1038,7 @@ def optimize(
 			"cyl_conn_gt": float(opt_cfg_.eff.get("cyl_conn_gt", 0.0)),
 			"cyl_base_mesh": float(opt_cfg_.eff.get("cyl_base_mesh", 0.0)),
 			"cyl_base_gt": float(opt_cfg_.eff.get("cyl_base_gt", 0.0)),
+			"cyl_outside": float(opt_cfg_.eff.get("cyl_outside", 0.0)),
 		}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
@@ -967,7 +1069,8 @@ def optimize(
 			_need_term("cyl_conn_mesh", stage_eff) > 0 or
 			_need_term("cyl_conn_gt", stage_eff) > 0 or
 			_need_term("cyl_base_mesh", stage_eff) > 0 or
-			_need_term("cyl_base_gt", stage_eff) > 0
+			_need_term("cyl_base_gt", stage_eff) > 0 or
+			_need_term("cyl_outside", stage_eff) > 0
 		)
 		stage_args = opt_cfg.args or {}
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
@@ -1135,6 +1238,7 @@ def optimize(
 			label_map = {
 				"cyl_bend": "c_bend",
 				"cyl_normal": "c_norm",
+				"cyl_outside": "c_out",
 				"cyl_radial_mean": "c_rad",
 				"cyl_smooth": "c_sm",
 				"cyl_step": "c_step",
@@ -1154,8 +1258,13 @@ def optimize(
 				"pred_dt_pull_active_frac": "pull%",
 				"pred_dt_pull_prefix_mean": "pullpre",
 				"pred_dt_pull_weight_mean": "pullw",
+				"cyl_outside_pen_frac": "out%",
+				"cyl_outside_depth_max": "outmax",
+				"cyl_outside_depth_avg": "outavg",
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
+				"p:wstep_invalid_avg_vx": "iavg",
+				"p:wstep_invalid_frac": "ifrac",
 				"p:wstep_avg_vx": "wavg",
 				"p:wstep_tgt_vx": "wtgt",
 			}
@@ -1170,6 +1279,9 @@ def optimize(
 				"pred_dt_pull_active_frac": 107,
 				"pred_dt_pull_prefix_mean": 108,
 				"pred_dt_pull_weight_mean": 109,
+				"cyl_outside_pen_frac": 120,
+				"cyl_outside_depth_max": 121,
+				"cyl_outside_depth_avg": 122,
 			}
 			def _sort_key(k: str) -> tuple[int, str]:
 				return (key_order.get(k, 0), k)
@@ -1424,6 +1536,8 @@ def optimize(
 					tv[name] = float(lv.detach().cpu())
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
+					if name == "cyl_outside":
+						tv.update(opt_loss_cyl.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
 			if stage_uses_cyl_loss and not bool(getattr(res_, "cyl_shell_mode", False)):
@@ -1488,10 +1602,21 @@ def optimize(
 					return int(offsets.shape[1])
 				return 0
 
-			def _shell_dbg_values() -> dict[str, float]:
+			def _shell_dbg_values(res_: fit_model.FitResult3D | None = None) -> dict[str, float]:
 				if not hasattr(model, "_shell_width_step_stats"):
 					return {}
-				_avg = model._shell_width_step_stats()[0]
+				_width_stats = (
+					opt_loss_cyl.cyl_shell_width_edge_stats(res=res_)
+					if res_ is not None else None
+				)
+				if _width_stats is None:
+					_avg = model._shell_width_step_stats()[0]
+					_iavg = math.nan
+					_ifrac = 0.0
+				else:
+					_avg = float(_width_stats["valid_avg_vx"])
+					_iavg = float(_width_stats["invalid_avg_vx"])
+					_ifrac = float(_width_stats["invalid_frac"])
 				_havg = (
 					model._shell_height_step_stats()[0]
 					if hasattr(model, "_shell_height_step_stats") else 0.0
@@ -1505,6 +1630,8 @@ def optimize(
 					"hstep_avg_vx": float(_havg),
 					"hstep_tgt_vx": h_tgt,
 					"wstep_avg_vx": float(_avg),
+					"wstep_invalid_avg_vx": float(_iavg),
+					"wstep_invalid_frac": float(_ifrac),
 					"wstep_tgt_vx": tgt,
 				}
 				if w_count > 0:
@@ -1570,6 +1697,11 @@ def optimize(
 					pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
 					pred_dt_normal_source_=pred_dt_normal_source,
 				)
+				if _cyl_outside_enabled(pass_eff):
+					_configure_cyl_outside_step(
+						sample_factor=_cyl_outside_sample_factor(pass_settings.args or {}),
+						model_step=float(model_step if model_step is not None else wstep_start),
+					)
 				model.cyl_shell_current_width_step = float(wstep_start)
 				all_params, param_groups = _make_param_groups(pass_settings)
 				if not param_groups:
@@ -1624,7 +1756,7 @@ def optimize(
 						),
 						loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
 						tv=term_vals0,
-						pv=_shell_dbg_values(),
+						pv=_shell_dbg_values(res0),
 						force_header=True,
 						shell_no=shell_no,
 					)
@@ -1758,7 +1890,7 @@ def optimize(
 							),
 							loss_val=float(display_loss) if display_loss is not None else loss.item(),
 							tv=term_vals,
-							pv=_shell_dbg_values(),
+							pv=_shell_dbg_values(res),
 							its=_its,
 							shell_no=shell_no,
 						)
@@ -1860,6 +1992,8 @@ def optimize(
 					model.begin_cylinder_shell_refine(data)
 				elif hasattr(model, "begin_cylinder_shell"):
 					model.begin_cylinder_shell(0, data, direction=1)
+				if _cyl_outside_enabled(stage_eff):
+					_clear_cyl_outside_field()
 				_run_shell_pass(f"{label}.cyl_init", _pass_eff_for_role(),
 								wstep_start=_base_wstep, wstep_end=_base_wstep,
 								shell_no=1)
@@ -1917,10 +2051,21 @@ def optimize(
 							f"{shell_i + 1}/{max_search_shells}",
 							flush=True,
 						)
+						grow_shell_label = f"{label}.cyl_grow_shell{shell_i + 1}"
+						grow_pass_eff = _pass_eff_for_role()
+						_build_cyl_outside_from_completed(
+							eff_=grow_pass_eff,
+							stage_args_=stage_args,
+							model_step=_base_wstep,
+							label_=grow_shell_label,
+						)
 						model.begin_cylinder_shell(shell_i, data, direction=direction)
+					else:
+						grow_shell_label = f"{label}.cyl_grow_shell{shell_i + 1}"
+						grow_pass_eff = _pass_eff_for_role()
 					result = _run_shell_pass(
-						f"{label}.cyl_grow_shell{shell_i + 1}",
-						_pass_eff_for_role(),
+						grow_shell_label,
+						grow_pass_eff,
 						wstep_start=_base_wstep,
 						wstep_end=grow_wstep_end,
 						model_step=_base_wstep,

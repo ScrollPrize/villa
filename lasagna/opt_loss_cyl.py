@@ -26,6 +26,15 @@ _compiled_shell_normal_core = None
 _compile_shell_normal_disabled_reason: str | None = None
 _BEND_THRESHOLD_RAD = math.radians(60.0)
 _BEND_COS_THRESHOLD = math.cos(math.pi - _BEND_THRESHOLD_RAD)
+grid_sample_3d_u8_diff = None
+
+
+def _grid_sample_3d_u8_diff(*args):
+	global grid_sample_3d_u8_diff
+	if grid_sample_3d_u8_diff is None:
+		from grid_sample_3d_u8_diff import grid_sample_3d_u8_diff as _fn
+		grid_sample_3d_u8_diff = _fn
+	return grid_sample_3d_u8_diff(*args)
 
 
 def last_stats() -> dict[str, float]:
@@ -89,6 +98,7 @@ def _active_terms(weights: dict[str, float]) -> dict[str, float]:
 			"cyl_conn_gt",
 			"cyl_base_mesh",
 			"cyl_base_gt",
+			"cyl_outside",
 		)
 		if float(weights.get(name, 0.0)) != 0.0 and name in _candidate_terms
 	}
@@ -989,6 +999,33 @@ def _valid_width_step_avg(
 	return w_len[edge_valid].mean() * float(step_scale)
 
 
+def cyl_shell_width_edge_stats(*, res: fit_model.FitResult3D) -> dict[str, float] | None:
+	"""Width-edge debug stats using the same endpoint-valid mask as cyl_step_loss."""
+	xyz = _shell_xyz(res)
+	if xyz is None or int(xyz.shape[1]) <= 1:
+		return None
+	w_len = (torch.roll(xyz, shifts=-1, dims=1) - xyz).norm(dim=-1)
+	mask = _sample_shell_grad_mask(res=res, xyz=xyz)
+	if mask is None:
+		edge_valid = torch.ones_like(w_len, dtype=torch.bool)
+	else:
+		point_valid = mask > 0.0
+		edge_valid = point_valid & torch.roll(point_valid, shifts=-1, dims=1)
+	edge_invalid = ~edge_valid
+	total = max(1, int(edge_valid.numel()))
+
+	def _masked_mean(edge_mask: torch.Tensor) -> float:
+		if not bool(edge_mask.any().detach().cpu()):
+			return math.nan
+		return float(w_len[edge_mask].mean().detach().cpu())
+
+	return {
+		"valid_avg_vx": _masked_mean(edge_valid),
+		"invalid_avg_vx": _masked_mean(edge_invalid),
+		"invalid_frac": float(edge_invalid.sum().detach().cpu()) / float(total),
+	}
+
+
 def cyl_step_push_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Push valid shell samples along outward mesh normals from current W step error."""
 	factor = 4
@@ -1179,6 +1216,73 @@ def cyl_bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[to
 		return _zero_loss(res)
 	lm = torch.cat(terms, dim=0)
 	return _register_shell_term("cyl_bend", lm, res=res)
+
+
+def cyl_outside_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Penalize current shell samples that lie inside the previous shell field."""
+	global _last_stats
+	if not bool(getattr(res, "cyl_shell_mode", False)) or int(getattr(res, "cyl_shell_index", 0)) <= 0:
+		_last_stats = {}
+		return _zero_loss(res)
+	volume = getattr(res, "cyl_outside_volume", None)
+	origin = getattr(res, "cyl_outside_origin", None)
+	spacing = getattr(res, "cyl_outside_spacing", None)
+	depth_max = float(getattr(res, "cyl_outside_depth_max", 0.0))
+	if volume is None or origin is None or spacing is None or depth_max <= 0.0:
+		_last_stats = {}
+		return _zero_loss(res)
+	if volume.ndim != 4 or int(volume.shape[0]) != 1:
+		raise RuntimeError(f"cyl_outside volume must have shape (1, Z, Y, X), got {tuple(volume.shape)}")
+	factor = max(1, int(getattr(res, "cyl_outside_sample_factor", 2)))
+	geom = _shell_geometry(res=res, factor=factor)
+	if geom is None or not isinstance(geom.get("xyz"), torch.Tensor):
+		_last_stats = {}
+		return _zero_loss(res)
+	xyz = geom["xyz"]
+	mask = _sample_shell_grad_mask(res=res, xyz=xyz)
+	if mask is None:
+		_last_stats = {}
+		return _zero_loss(res)
+	mask = mask.to(device=xyz.device, dtype=xyz.dtype)
+	active = mask > 0.0
+	if not bool(active.any().detach().cpu()):
+		_last_stats = {
+			"cyl_outside_pen_frac": 0.0,
+			"cyl_outside_depth_max": 0.0,
+			"cyl_outside_depth_avg": 0.0,
+		}
+		return _zero_loss(res)
+	volume = volume.to(device=xyz.device).contiguous()
+	offset = torch.tensor(tuple(float(v) for v in origin), device=xyz.device, dtype=torch.float32)
+	inv_scale = torch.tensor([1.0 / float(v) for v in spacing], device=xyz.device, dtype=torch.float32)
+	sampled_q = _grid_sample_3d_u8_diff(
+		volume,
+		xyz.unsqueeze(0),
+		offset,
+		inv_scale,
+	).squeeze(0).squeeze(0)
+	inside_depth = (sampled_q / 255.0).square() * depth_max
+	model_step = getattr(res, "cyl_outside_model_step", None)
+	if model_step is None or float(model_step) <= 0.0:
+		model_step = float(getattr(res.params, "mesh_step", 1.0))
+	model_step_t = xyz.new_tensor(max(1.0e-6, float(model_step)))
+	lm = (inside_depth / model_step_t).square()
+	with torch.no_grad():
+		inside_det = inside_depth.detach()
+		active_det = active.detach()
+		penetrating = active_det & (inside_det > 0.0)
+		active_count = max(1, int(active_det.sum().detach().cpu()))
+		if bool(penetrating.any().detach().cpu()):
+			depth_vals = inside_det[penetrating]
+			depth_avg = float(depth_vals.mean().detach().cpu())
+		else:
+			depth_avg = 0.0
+		_last_stats = {
+			"cyl_outside_pen_frac": float(penetrating.sum().detach().cpu()) / float(active_count),
+			"cyl_outside_depth_max": float(torch.where(active_det, inside_det, torch.zeros_like(inside_det)).amax().detach().cpu()),
+			"cyl_outside_depth_avg": depth_avg,
+		}
+	return _register_shell_masked_term("cyl_outside", lm, mask, res=res)
 
 
 def _shell_offset_geometry_for_loss(res: fit_model.FitResult3D) -> dict[str, torch.Tensor | bool] | None:
