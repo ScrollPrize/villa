@@ -6,6 +6,7 @@
 #include <limits>
 #include <cstdio>
 #include <new>
+#include <cmath>
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
@@ -421,17 +422,20 @@ static void log_chunk_io(
 
 void run_generate(const po::variables_map& vm);
 void run_convert(const po::variables_map& vm);
+void run_pyramid(const po::variables_map& vm);
 
 static void print_usage() {
     std::cout << "vc_gen_normalgrids: Generate and manage normal grids for volume data.\n\n"
               << "Usage: vc_gen_normalgrids [command] [options]\n\n"
               << "Commands:\n"
               << "  generate   Generate normal grids for all slices in a Zarr volume (default).\n"
-              << "  convert    Recursively find and convert GridStore files to the latest version.\n\n"
+              << "  convert    Recursively find and convert GridStore files to the latest version.\n"
+              << "  pyramid    Derive lower-resolution normal-grid levels from existing grids.\n\n"
               << "Examples:\n"
               << "  vc_gen_normalgrids -i /path/to/volume.zarr -o /path/to/output/\n"
               << "  vc_gen_normalgrids -i vol.zarr -o out/ --sparse-volume 4\n"
-              << "  vc_gen_normalgrids convert -i /path/to/grids/\n\n"
+              << "  vc_gen_normalgrids convert -i /path/to/grids/\n"
+              << "  vc_gen_normalgrids pyramid -i /path/to/normal_grids -o /path/to/normal_grids_ms\n\n"
               << "Generate options:\n"
               << "  -i, --input         Input Zarr volume path (required)\n"
               << "  -o, --output        Output directory path (required unless --print-plan)\n"
@@ -451,7 +455,14 @@ static void print_usage() {
               << "  --print-plan        Print partition plan as JSON to stdout and exit (no work done)\n\n"
               << "Convert options:\n"
               << "  -i, --input         Input directory to scan for .grid files (required)\n"
-              << "  --grid-step         New grid cell size (default: 64)\n";
+              << "  --grid-step         New grid cell size (default: 64)\n\n"
+              << "Pyramid options:\n"
+              << "  -i, --input         Source normal_grids root with xy/xz/yz .grid files (required)\n"
+              << "  -o, --output        Output root, containing xy/<level>, xz/<level>, yz/<level> (required)\n"
+              << "  --max-level         Highest derived level to write (default: 5)\n"
+              << "  --min-level         Lowest level to write (default: 0)\n"
+              << "  --overwrite         Replace existing derived files (default: false)\n"
+              << "  --no-images         Do not derive preview images from *_img folders\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -461,7 +472,7 @@ int main(int argc, char* argv[]) {
     po::options_description global("Global options");
     global.add_options()
         ("help,h", "Print usage message")
-        ("command", po::value<std::string>(), "Command to execute (generate, convert)")
+        ("command", po::value<std::string>(), "Command to execute (generate, convert, pyramid)")
         ("subargs", po::value<std::vector<std::string>>(), "Arguments for command");
 
     po::positional_options_description pos;
@@ -481,7 +492,7 @@ int main(int argc, char* argv[]) {
     bool explicit_command = false;
     if (vm.count("command")) {
         std::string maybe_cmd = vm["command"].as<std::string>();
-        if (maybe_cmd == "generate" || maybe_cmd == "convert") {
+        if (maybe_cmd == "generate" || maybe_cmd == "convert" || maybe_cmd == "pyramid") {
             cmd = maybe_cmd;
             explicit_command = true;
         }
@@ -580,6 +591,46 @@ int main(int argc, char* argv[]) {
         }
         run_convert(convert_vm);
 
+    } else if (cmd == "pyramid") {
+        po::options_description pyramid_desc(
+            "vc_gen_normalgrids pyramid: Derive lower-resolution normal-grid levels.\n\n"
+            "Reads an existing level-0 normal_grids directory and writes scaled GridStore\n"
+            "files under xy/<level>, xz/<level>, and yz/<level>. This reuses traced paths;\n"
+            "it does not read the volume or run thinning/tracing again.\n\n"
+            "Options");
+        pyramid_desc.add_options()
+            ("help,h", "Print this help message")
+            ("input,i", po::value<std::string>()->required(), "Input normal_grids root")
+            ("output,o", po::value<std::string>()->required(), "Output multiscale normal_grids root")
+            ("min-level", po::value<int>()->default_value(0), "Lowest level to write")
+            ("max-level", po::value<int>()->default_value(5), "Highest level to write")
+            ("overwrite", po::bool_switch()->default_value(false), "Overwrite existing output files")
+            ("no-images", po::bool_switch()->default_value(false), "Do not derive *_img preview images")
+            ("verify-grid-save", po::bool_switch()->default_value(false), "Verify each derived GridStore by reloading after save");
+
+        std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
+        if (explicit_command && !opts.empty()) {
+            opts.erase(opts.begin());
+        }
+
+        for (const auto& opt : opts) {
+            if (opt == "-h" || opt == "--help") {
+                std::cout << pyramid_desc << std::endl;
+                return 0;
+            }
+        }
+
+        po::variables_map pyramid_vm;
+        try {
+            po::store(po::command_line_parser(opts).options(pyramid_desc).run(), pyramid_vm);
+            po::notify(pyramid_vm);
+        } catch (const po::error& e) {
+            std::cerr << "Error: " << e.what() << "\n\n";
+            std::cout << pyramid_desc << std::endl;
+            return 1;
+        }
+        run_pyramid(pyramid_vm);
+
     } else {
         std::cerr << "Error: Unknown command '" << cmd << "'\n\n";
         print_usage();
@@ -587,6 +638,339 @@ int main(int argc, char* argv[]) {
     }
 
     return 0;
+}
+
+namespace {
+
+std::string six_digit_name(size_t index, const std::string& extension) {
+    char filename[64];
+    snprintf(filename, sizeof(filename), "%06zu%s", index, extension.c_str());
+    return std::string(filename);
+}
+
+std::optional<size_t> parse_indexed_stem(const fs::path& path) {
+    const std::string stem = path.stem().string();
+    if (stem.empty()) {
+        return std::nullopt;
+    }
+    size_t value = 0;
+    for (char c : stem) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        value = value * 10 + static_cast<size_t>(c - '0');
+    }
+    return value;
+}
+
+std::vector<fs::path> list_indexed_files(const fs::path& dir, const std::string& extension) {
+    std::vector<fs::path> files;
+    if (!fs::exists(dir) || !fs::is_directory(dir)) {
+        return files;
+    }
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() != extension) {
+            continue;
+        }
+        if (!parse_indexed_stem(entry.path())) {
+            continue;
+        }
+        files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+int scaled_extent(int value, int scale) {
+    if (value <= 0) {
+        return 0;
+    }
+    return std::max(1, (value + scale - 1) / scale);
+}
+
+std::vector<cv::Point> scale_path_points(const std::vector<cv::Point>& path, int scale) {
+    std::vector<cv::Point> scaled;
+    scaled.reserve(path.size());
+    for (const auto& p : path) {
+        cv::Point q(
+            static_cast<int>(std::lround(static_cast<double>(p.x) / scale)),
+            static_cast<int>(std::lround(static_cast<double>(p.y) / scale)));
+        if (scaled.empty() || scaled.back() != q) {
+            scaled.push_back(q);
+        }
+    }
+    return scaled;
+}
+
+void link_or_copy_file(const fs::path& src, const fs::path& dst, bool overwrite) {
+    if (fs::exists(dst)) {
+        if (!overwrite) {
+            return;
+        }
+        fs::remove(dst);
+    }
+    fs::create_directories(dst.parent_path());
+    std::error_code ec;
+    fs::create_hard_link(src, dst, ec);
+    if (!ec) {
+        return;
+    }
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+}
+
+void write_json_file(const fs::path& path, const Json& json) {
+    fs::create_directories(path.parent_path());
+    std::ofstream out(path);
+    out << json.dump(4) << std::endl;
+}
+
+} // namespace
+
+void run_pyramid(const po::variables_map& vm) {
+    const fs::path input_root = vm["input"].as<std::string>();
+    const fs::path output_root = vm["output"].as<std::string>();
+    const int min_level = vm["min-level"].as<int>();
+    const int max_level = vm["max-level"].as<int>();
+    const bool overwrite = vm["overwrite"].as<bool>();
+    const bool include_images = !vm["no-images"].as<bool>();
+    const bool verify_grid_save = vm["verify-grid-save"].as<bool>();
+
+    if (min_level < 0 || max_level < min_level) {
+        throw std::runtime_error("--min-level/--max-level must satisfy 0 <= min <= max");
+    }
+    if (!fs::exists(input_root / "metadata.json")) {
+        throw std::runtime_error("input normal_grids root is missing metadata.json: " + input_root.string());
+    }
+
+    const Json source_metadata = Json::parse_file(input_root / "metadata.json");
+    const int source_grid_step = source_metadata.value("grid-step", 64);
+    const int source_sparse_volume = std::max(1, source_metadata.value("sparse-volume", 1));
+    const double source_spiral_step = source_metadata.value("spiral-step", 20.0);
+    const std::array<std::string, 3> directions = {"xy", "xz", "yz"};
+
+    Json root_metadata;
+    root_metadata["format"] = "normal-grid-multiscale";
+    root_metadata["version"] = 1;
+    root_metadata["layout"] = "direction-level";
+    root_metadata["source"] = fs::absolute(input_root).string();
+    root_metadata["source-metadata"] = source_metadata;
+    root_metadata["min-level"] = min_level;
+    root_metadata["max-level"] = max_level;
+    Json levels_json = Json::array();
+
+    for (int level = min_level; level <= max_level; ++level) {
+        const int scale = 1 << level;
+        const int level_grid_step = std::max(1, (source_grid_step + scale - 1) / scale);
+        const int level_sparse_volume = std::max(1, (source_sparse_volume + scale - 1) / scale);
+        const double level_spiral_step = source_spiral_step / static_cast<double>(scale);
+
+        Json level_json;
+        level_json["level"] = level;
+        level_json["scale"] = scale;
+        level_json["grid-step"] = level_grid_step;
+        level_json["sparse-volume"] = level_sparse_volume;
+        level_json["spiral-step"] = level_spiral_step;
+        levels_json.push_back(level_json);
+
+        std::cout << "Deriving normal-grid level " << level
+                  << " (scale " << scale << ")" << std::endl;
+
+        Json level_metadata = source_metadata;
+        level_metadata["derived-from"] = fs::absolute(input_root).string();
+        level_metadata["derived-scale"] = scale;
+        level_metadata["derived-level"] = level;
+        level_metadata["grid-step"] = level_grid_step;
+        level_metadata["sparse-volume"] = level_sparse_volume;
+        level_metadata["spiral-step"] = level_spiral_step;
+
+        for (const std::string& direction : directions) {
+            const fs::path src_dir = input_root / direction;
+            const fs::path dst_dir = output_root / direction / std::to_string(level);
+            fs::create_directories(dst_dir);
+
+            size_t written = 0;
+            size_t skipped = 0;
+            size_t collapsed = 0;
+            const auto files = list_indexed_files(src_dir, ".grid");
+            std::cout << "  " << direction << ": processing " << files.size()
+                      << " source grid files" << std::endl;
+            std::atomic<size_t> processed_count{0};
+            std::mutex progress_mutex;
+            const size_t progress_interval = std::max<size_t>(1, files.size() / 20);
+            auto mark_progress = [&]() {
+                const size_t processed = processed_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (processed == files.size() || (processed % progress_interval) == 0) {
+                    std::lock_guard<std::mutex> lock(progress_mutex);
+                    const double pct = files.empty()
+                        ? 100.0
+                        : (100.0 * static_cast<double>(processed) / static_cast<double>(files.size()));
+                    std::cout << "    " << direction << " level " << level
+                              << ": " << processed << "/" << files.size()
+                              << " (" << std::fixed << std::setprecision(1) << pct << "%)"
+                              << std::defaultfloat << std::endl;
+                }
+            };
+            #pragma omp parallel for reduction(+:written, skipped, collapsed) schedule(dynamic)
+            for (size_t i = 0; i < files.size(); ++i) {
+                const fs::path& src_path = files[i];
+                const auto src_index = parse_indexed_stem(src_path);
+                if (!src_index || (*src_index % static_cast<size_t>(scale)) != 0) {
+                    ++skipped;
+                    mark_progress();
+                    continue;
+                }
+                const size_t dst_index = *src_index / static_cast<size_t>(scale);
+                const fs::path dst_path = dst_dir / six_digit_name(dst_index, ".grid");
+                if (fs::exists(dst_path) && !overwrite) {
+                    ++skipped;
+                    mark_progress();
+                    continue;
+                }
+
+                try {
+                    if (level == 0) {
+                        link_or_copy_file(src_path, dst_path, overwrite);
+                        ++written;
+                        mark_progress();
+                        continue;
+                    }
+
+                    vc::core::util::GridStore src_store(src_path.string());
+                    const cv::Size src_size = src_store.size();
+                    vc::core::util::GridStore dst_store(
+                        cv::Rect(0, 0,
+                                 scaled_extent(src_size.width, scale),
+                                 scaled_extent(src_size.height, scale)),
+                        level_grid_step);
+
+                    auto paths = src_store.get_all();
+                    for (const auto& path_ptr : paths) {
+                        auto scaled = scale_path_points(*path_ptr, scale);
+                        if (scaled.size() < 2) {
+                            ++collapsed;
+                            continue;
+                        }
+                        dst_store.add(scaled);
+                    }
+                    dst_store.meta = src_store.meta;
+                    dst_store.meta["derived-scale"] = scale;
+                    dst_store.meta["derived-level"] = level;
+                    dst_store.meta["source-slice"] = *src_index;
+
+                    const fs::path tmp_path = dst_path.string() + ".tmp";
+                    dst_store.save(tmp_path.string(), vc::core::util::GridStore::SaveOptions{
+                        .verify_reload = verify_grid_save,
+                    });
+                    if (fs::exists(dst_path) && overwrite) {
+                        fs::remove(dst_path);
+                    }
+                    fs::rename(tmp_path, dst_path);
+                    ++written;
+                } catch (const std::exception& e) {
+                    #pragma omp critical
+                    std::cerr << "Error deriving " << src_path << ": " << e.what() << std::endl;
+                }
+                mark_progress();
+            }
+
+            std::cout << "  " << direction << ": wrote " << written
+                      << ", skipped " << skipped
+                      << ", collapsed paths " << collapsed << std::endl;
+        }
+
+        if (include_images) {
+            for (const std::string& direction : directions) {
+                const fs::path src_dir = input_root / (direction + "_img");
+                if (!fs::exists(src_dir)) {
+                    continue;
+                }
+                const fs::path dst_dir = output_root / (direction + "_img") / std::to_string(level);
+                fs::create_directories(dst_dir);
+
+                size_t written = 0;
+                size_t skipped = 0;
+                const auto files = list_indexed_files(src_dir, ".jpg");
+                std::cout << "  " << direction << "_img: processing " << files.size()
+                          << " source preview files" << std::endl;
+                std::atomic<size_t> processed_count{0};
+                std::mutex progress_mutex;
+                const size_t progress_interval = std::max<size_t>(1, files.size() / 20);
+                auto mark_progress = [&]() {
+                    const size_t processed = processed_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (processed == files.size() || (processed % progress_interval) == 0) {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        const double pct = files.empty()
+                            ? 100.0
+                            : (100.0 * static_cast<double>(processed) / static_cast<double>(files.size()));
+                        std::cout << "    " << direction << "_img level " << level
+                                  << ": " << processed << "/" << files.size()
+                                  << " (" << std::fixed << std::setprecision(1) << pct << "%)"
+                                  << std::defaultfloat << std::endl;
+                    }
+                };
+                #pragma omp parallel for reduction(+:written, skipped) schedule(dynamic)
+                for (size_t i = 0; i < files.size(); ++i) {
+                    const fs::path& src_path = files[i];
+                    const auto src_index = parse_indexed_stem(src_path);
+                    if (!src_index || (*src_index % static_cast<size_t>(scale)) != 0) {
+                        ++skipped;
+                        mark_progress();
+                        continue;
+                    }
+                    const size_t dst_index = *src_index / static_cast<size_t>(scale);
+                    const fs::path dst_path = dst_dir / six_digit_name(dst_index, ".jpg");
+                    if (fs::exists(dst_path) && !overwrite) {
+                        ++skipped;
+                        mark_progress();
+                        continue;
+                    }
+
+                    try {
+                        if (level == 0) {
+                            link_or_copy_file(src_path, dst_path, overwrite);
+                        } else {
+                            cv::Mat img = cv::imread(src_path.string(), cv::IMREAD_UNCHANGED);
+                            if (img.empty()) {
+                                ++skipped;
+                                mark_progress();
+                                continue;
+                            }
+                            cv::Mat scaled;
+                            cv::resize(
+                                img,
+                                scaled,
+                                cv::Size(scaled_extent(img.cols, scale),
+                                         scaled_extent(img.rows, scale)),
+                                0.0,
+                                0.0,
+                                cv::INTER_NEAREST);
+                            if (fs::exists(dst_path) && overwrite) {
+                                fs::remove(dst_path);
+                            }
+                            cv::imwrite(dst_path.string(), scaled);
+                        }
+                        ++written;
+                    } catch (const std::exception& e) {
+                        #pragma omp critical
+                        std::cerr << "Error deriving preview " << src_path << ": " << e.what() << std::endl;
+                    }
+                    mark_progress();
+                }
+
+                std::cout << "  " << direction << "_img: wrote " << written
+                          << ", skipped " << skipped << std::endl;
+            }
+        }
+
+        write_json_file(output_root / ("metadata.level" + std::to_string(level) + ".json"), level_metadata);
+    }
+
+    root_metadata["levels"] = std::move(levels_json);
+    write_json_file(output_root / "metadata.json", root_metadata);
+    std::cout << "Pyramid complete: " << output_root << std::endl;
 }
 
 void run_convert(const po::variables_map& vm) {
