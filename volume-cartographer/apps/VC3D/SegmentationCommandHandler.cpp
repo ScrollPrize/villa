@@ -6,6 +6,7 @@
 #include <functional>
 #include <algorithm>
 #include <iostream>
+#include <thread>
 #include <cmath>
 #include <optional>
 #include <atomic>
@@ -653,7 +654,10 @@ public:
             const QString& segDir,
             const QString& segmentStem,
             const QString& flatboiExe,
-            SegmentationCommandHandler* handler)
+            SegmentationCommandHandler* handler,
+            int iters,
+            double tolerance,
+            const QString& energy)
     : QObject(handler)
     , parentWidget_(parentWidget)
     , handler_(handler)
@@ -665,14 +669,14 @@ public:
     , outTemp_ (segDir.endsWith("_flatboi") ? (segDir + "__rebuild_tmp__") : outFinal_)
     , flatboiExe_(flatboiExe)
     , inputIsAlreadyFlat_(segDir.endsWith("_flatboi"))
+    , tolerance_(tolerance)
+    , energy_(energy)
     , proc_(new QProcess(this))
     , progress_(new QProgressDialog(QObject::tr("Preparing SLIM..."), QObject::tr("Cancel"), 0, 0, parentWidget))
     , itRe_(R"(^\s*\[it\s+(\d+)\])", QRegularExpression::CaseInsensitiveOption)
     , progRe_(R"(^\s*PROGRESS\s+(\d+)\s*/\s*(\d+)\s*$)", QRegularExpression::CaseInsensitiveOption)
     {
-        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        iters_ = s.value("tools/flatboi_iters", 20).toInt();
-        if (iters_ <= 0) iters_ = 20;
+        iters_ = iters > 0 ? iters : 20;
 
         tifxyz2objExe_ = findVcTool("vc_tifxyz2obj");
         obj2tifxyzExe_ = findVcTool("vc_obj2tifxyz");
@@ -771,8 +775,14 @@ private:
         progress_->setLabelText(QObject::tr("Running SLIM (flatboi)..."));
         progress_->setValue(1);
         ioLog_.clear();
-        QStringList args; args << objPath_ << QString::number(iters_);
+        QStringList args;
+        args << objPath_ << QString::number(iters_) << energy_;
+        if (tolerance_ > 0.0) {
+            args << QStringLiteral("--tol=%1").arg(tolerance_, 0, 'g', 8);
+        }
         ioLog_ += QStringLiteral("Running: %1 %2\n").arg(flatboiExe_, args.join(' '));
+        std::cout << "[slim-flatten] launching: " << flatboiExe_.toStdString()
+                  << " " << args.join(' ').toStdString() << std::endl;
         proc_->start(flatboiExe_, args);
     }
 
@@ -883,6 +893,7 @@ private:
     void onStdout_() {
         const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
         ioLog_ += chunk;
+        std::cout << chunk.toStdString() << std::flush;
         const QStringList lines = chunk.split('\n', Qt::SkipEmptyParts);
         for (const QString& raw : lines) {
             const QString line = raw.trimmed();
@@ -1025,6 +1036,8 @@ private:
     QString outTemp_;
     QString flatboiExe_;
     bool    inputIsAlreadyFlat_ = false;
+    double  tolerance_ = 0.0;
+    QString energy_ = QStringLiteral("symmetric_dirichlet");
 
     // process & progress
     QProcess* proc_ = nullptr;
@@ -1497,7 +1510,27 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
         return;
     }
 
-    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this);
+    SlimFlattenDialog dlg(_parentWidget);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    const int iters = dlg.maxIterations();
+    const double tol = dlg.tolerance();
+    const QString energy = dlg.energyType();
+
+    const QByteArray pastixEnv = qgetenv("PASTIX_NUM_THREADS");
+    const unsigned hwConc = std::thread::hardware_concurrency();
+    std::cout << "[slim-flatten] segment=" << segmentId
+              << " dir=" << segDirFs.string()
+              << " flatboi=" << flatboiExe.toStdString()
+              << " iters=" << iters
+              << " tol=" << tol
+              << " energy=" << energy.toStdString()
+              << " PASTIX_NUM_THREADS=" << (pastixEnv.isEmpty() ? "<unset, PaStiX auto>" : pastixEnv.toStdString())
+              << " hardware_concurrency=" << hwConc
+              << std::endl;
+
+    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters, tol, energy);
 }
 
 void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)

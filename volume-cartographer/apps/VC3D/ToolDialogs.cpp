@@ -1471,6 +1471,73 @@ int ABFFlattenDialog::downsampleFactor() const
     return spDownsample_ ? spDownsample_->value() : 1;
 }
 
+// ================= SlimFlattenDialog =================
+bool SlimFlattenDialog::s_haveSession = false;
+int SlimFlattenDialog::s_iterations = 20;
+double SlimFlattenDialog::s_tolerance = 0.0;
+QString SlimFlattenDialog::s_energy = QStringLiteral("symmetric_dirichlet");
+
+SlimFlattenDialog::SlimFlattenDialog(QWidget* parent)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("SLIM Flatten"));
+    auto main = new QVBoxLayout(this);
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    spIterations_ = new QSpinBox(this);
+    spIterations_->setRange(1, 5000);
+    spIterations_->setValue(s_haveSession ? s_iterations : 20);
+    spIterations_->setToolTip(tr("Maximum SLIM iterations (also the cap when a tolerance is set)."));
+    form->addRow(tr("Max iterations:"), spIterations_);
+
+    spTolerance_ = new QDoubleSpinBox(this);
+    spTolerance_->setDecimals(8);
+    spTolerance_->setRange(0.0, 1.0);
+    spTolerance_->setSingleStep(1e-5);
+    spTolerance_->setValue(s_haveSession ? s_tolerance : 0.0);
+    spTolerance_->setToolTip(tr("Relative-energy early-stop threshold (ΔE/E). 0 disables early stop."));
+    form->addRow(tr("Convergence tolerance:"), spTolerance_);
+
+    cbEnergy_ = new QComboBox(this);
+    cbEnergy_->addItem(tr("Symmetric Dirichlet"), QStringLiteral("symmetric_dirichlet"));
+    cbEnergy_->addItem(tr("Conformal"), QStringLiteral("conformal"));
+    const QString initialEnergy = s_haveSession ? s_energy : QStringLiteral("symmetric_dirichlet");
+    {
+        int idx = cbEnergy_->findData(initialEnergy);
+        if (idx >= 0) cbEnergy_->setCurrentIndex(idx);
+    }
+    cbEnergy_->setToolTip(tr("SLIM energy formulation."));
+    form->addRow(tr("Energy:"), cbEnergy_);
+
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(btns);
+
+    connect(btns, &QDialogButtonBox::accepted, this, [this]() {
+        s_haveSession = true;
+        s_iterations = spIterations_->value();
+        s_tolerance = spTolerance_->value();
+        s_energy = cbEnergy_->currentData().toString();
+    });
+}
+
+int SlimFlattenDialog::maxIterations() const
+{
+    return spIterations_ ? spIterations_->value() : 20;
+}
+
+double SlimFlattenDialog::tolerance() const
+{
+    return spTolerance_ ? spTolerance_->value() : 0.0;
+}
+
+QString SlimFlattenDialog::energyType() const
+{
+    return cbEnergy_ ? cbEnergy_->currentData().toString() : QStringLiteral("symmetric_dirichlet");
+}
+
 // ================= VisLasagnaObjDialog =================
 // static session members
 bool VisLasagnaObjDialog::s_haveSession = false;
