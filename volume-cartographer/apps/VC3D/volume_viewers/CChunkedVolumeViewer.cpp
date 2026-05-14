@@ -58,6 +58,7 @@ constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr int kInitialSegmentationSurfaceLevel = 5;
 constexpr qint64 kInteractivePreviewMinIntervalMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
+constexpr bool kEnableRemoteVolumePrefetchHalo = false;
 constexpr int kChunkPrefetchHaloPx = 128;
 constexpr int kChunkPrefetchPriorityOffset = 1024;
 constexpr int kNormalPrefetchSampleStridePx = 32;
@@ -156,6 +157,12 @@ std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
 bool shouldSpeculativelyPrefetchVolume(const std::shared_ptr<Volume>& volume)
 {
     return volume && volume->isRemote();
+}
+
+bool shouldPrefetchRemoteVolumeHalo(const std::shared_ptr<Volume>& volume)
+{
+    return kEnableRemoteVolumePrefetchHalo &&
+           shouldSpeculativelyPrefetchVolume(volume);
 }
 
 uint32_t alphaBlendArgb(uint32_t base, uint32_t overlay, float alpha)
@@ -1615,8 +1622,8 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
-    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
-    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
+    const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
     if (_interactivePreview || _framebuffer.isNull() ||
         (!prefetchBase && !prefetchOverlay))
         return;
@@ -1772,8 +1779,8 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
     int fbW,
     int fbH)
 {
-    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
-    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
+    const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
     if (_interactivePreview || fbW <= 0 || fbH <= 0 ||
         (!prefetchBase && !prefetchOverlay))
         return;
