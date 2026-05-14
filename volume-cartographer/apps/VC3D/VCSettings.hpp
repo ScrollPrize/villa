@@ -348,6 +348,7 @@ namespace segmentation {
     constexpr auto PUSH_PULL_ALPHA_LOW = "push_pull_alpha_low";
     constexpr auto PUSH_PULL_ALPHA_HIGH = "push_pull_alpha_high";
     constexpr auto PUSH_PULL_ALPHA_RADIUS = "push_pull_alpha_radius";
+    constexpr auto PUSH_PULL_ALPHA_COMPUTE_SCALE = "push_pull_alpha_compute_scale";
     constexpr auto PUSH_PULL_ALPHA_LIMIT = "push_pull_alpha_limit";
     constexpr auto PUSH_PULL_ALPHA_PER_VERTEX = "push_pull_alpha_per_vertex";
 

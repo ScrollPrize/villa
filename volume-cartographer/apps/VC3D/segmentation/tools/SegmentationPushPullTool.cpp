@@ -462,6 +462,7 @@ AlphaPushPullConfig SegmentationPushPullTool::sanitizeConfig(const AlphaPushPull
     }
 
     sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, kAlphaBlurRadiusMax);
+    sanitized.computeScale = std::clamp(sanitized.computeScale, 0, 5);
     sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, kAlphaPerVertexLimitMax);
 
     return sanitized;
@@ -475,6 +476,7 @@ bool SegmentationPushPullTool::configsEqual(const AlphaPushPullConfig& lhs, cons
            nearlyEqual(lhs.low, rhs.low) &&
            nearlyEqual(lhs.high, rhs.high) &&
            lhs.blurRadius == rhs.blurRadius &&
+           lhs.computeScale == rhs.computeScale &&
            nearlyEqual(lhs.perVertexLimit, rhs.perVertexLimit) &&
            lhs.perVertex == rhs.perVertex;
 }
@@ -831,11 +833,9 @@ void SegmentationPushPullTool::launchAlphaCompute()
         return;
     }
 
-    // Alpha push/pull should follow the opacity boundary in the source data,
-    // independent of the viewer's current LOD. Sampling a coarser display level
-    // can move or blur the detected boundary, especially with remote chunked
-    // volumes where the viewer may be several pyramid levels down.
-    constexpr int datasetIndex = 0;
+    // Alpha push/pull samples the user-selected OME-Zarr scale, independent of
+    // the viewer's current display LOD.
+    const int datasetIndex = std::clamp(_alphaConfig.computeScale, 0, 5);
     constexpr float scale = 1.0f;
 
     const int direction = _ppState.direction;
@@ -1223,6 +1223,16 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     }
 
     AlphaPushPullConfig cfg = sanitizeConfig(config);
+    if (!volume->hasScaleLevel(datasetIndex)) {
+        if (outUnavailable) {
+            *outUnavailable = true;
+        }
+        if (outNoTargetReason && outNoTargetReason->empty()) {
+            *outNoTargetReason = "Alpha push/pull requested missing OME-Zarr scale " +
+                                 std::to_string(datasetIndex) + ".";
+        }
+        return std::nullopt;
+    }
 
     cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
     const float norm = cv::norm(orientedNormal);
