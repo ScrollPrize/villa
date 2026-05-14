@@ -218,6 +218,90 @@ private:
     QDoubleSpinBox* spCleanK_{nullptr};
 };
 
+class QTableWidget;
+class QPushButton;
+class QLabel;
+
+// MergeTifxyzDialog
+//
+// Edits a 2D grid of tifxyz directory names and the RANSAC tunables for
+// vc_merge_tifxyz, then writes a merge.json into the volpkg root and
+// returns its path. The grid layout encodes the surface adjacency that
+// the merge tool RANSAC-aligns; empty cells are allowed; selection in
+// the segment list is used as the seed but the user can edit / append.
+class MergeTifxyzDialog : public QDialog {
+    Q_OBJECT
+public:
+    MergeTifxyzDialog(QWidget* parent,
+                      const QStringList& seedSegmentIds,
+                      const QStringList& availableSegments,
+                      const QString& volpkgDir,
+                      const QString& pathsDir);
+
+    QString mergeJsonPath() const;     // populated by accept() on success
+    QString refSurface() const;        // empty -> auto (largest valid-cell count)
+    int ransacIters() const;
+    double ransacMinThresh() const;
+    double ransacMaxThresh() const;
+    double ransacMadK() const;
+    int ransacSeed() const;
+    int anchorCap() const;
+    int stripCols() const;
+    int ompThreads() const; // -1 if unset
+
+protected:
+    void accept() override;
+
+private:
+    QStringList collectGridNames() const;          // row-major, empties as ""
+    QString buildMergeJsonText() const;            // pretty JSON for preview + write
+    void rebuildPreview();
+    void updateRefCombo();
+    void resizeGrid(int newRows, int newCols);
+    void seedGrid(const QStringList& seedSegmentIds);
+    void promptAddSegments();
+
+    void applyCodeDefaults();
+    void applySessionDefaults();
+    void updateSessionFromUI();
+
+    QStringList _availableSegments;
+    QString _volpkgDir;
+    QString _pathsDir;
+    QString _mergeJsonPath;
+
+    QTableWidget* tblGrid_{nullptr};
+    QPushButton* btnAddRow_{nullptr};
+    QPushButton* btnAddCol_{nullptr};
+    QPushButton* btnRemoveRow_{nullptr};
+    QPushButton* btnRemoveCol_{nullptr};
+    QPushButton* btnAddSegments_{nullptr};
+    QComboBox* cmbRef_{nullptr};
+    QLabel* lblOutName_{nullptr};
+    QSpinBox* spIters_{nullptr};
+    QDoubleSpinBox* spMin_{nullptr};
+    QDoubleSpinBox* spMax_{nullptr};
+    QDoubleSpinBox* spMadK_{nullptr};
+    QSpinBox* spSeed_{nullptr};
+    QSpinBox* spAnchorCap_{nullptr};
+    QSpinBox* spStripCols_{nullptr};
+    QLineEdit* edtThreads_{nullptr};
+    QLabel* lblPreview_{nullptr};
+
+    // Session defaults (in-memory only; persist across one VC3D run).
+    static bool   s_haveSession;
+    static int    s_iters;
+    static double s_min;
+    static double s_max;
+    static double s_madK;
+    static int    s_seed;
+    static int    s_anchorCap;
+    static int    s_stripCols;
+    static int    s_lastRows;
+    static int    s_lastCols;
+    static int    s_ompThreads;
+};
+
 class AlphaCompRefineDialog : public QDialog {
     Q_OBJECT
 public:
@@ -367,6 +451,29 @@ private:
 
     QSpinBox* spIterations_{nullptr};
     QSpinBox* spDownsample_{nullptr};
+};
+
+class SlimFlattenDialog : public QDialog {
+    Q_OBJECT
+public:
+    SlimFlattenDialog(QWidget* parent, const QString& defaultOutputPath);
+
+    int maxIterations() const;
+    double tolerance() const;   // 0.0 = disabled (run all iterations)
+    QString energyType() const; // "symmetric_dirichlet" or "conformal"
+    QString outputPath() const;
+
+private:
+    static bool s_haveSession;
+    static int s_iterations;
+    static double s_tolerance;
+    static QString s_energy;
+
+    QSpinBox* spIterations_{nullptr};
+    QDoubleSpinBox* spTolerance_{nullptr};
+    QComboBox* cbEnergy_{nullptr};
+    QLineEdit* edtOutput_{nullptr};
+    QString defaultOutput_;
 };
 
 class VisLasagnaObjDialog : public QDialog {

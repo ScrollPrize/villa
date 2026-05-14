@@ -431,6 +431,9 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::manualAddConfigChanged, this, [this]() {
         if (_manualAddTool && _widget) {
             _manualAddTool->setConfig(_widget->manualAddConfig());
+            if (_manualAddMode) {
+                refreshOverlay();
+            }
         }
     });
     connect(_widget, &SegmentationWidget::manualAddClearPendingRequested,
@@ -559,6 +562,9 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_overlay) {
         _overlay->setEditingEnabled(enabled);
     }
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setActive(enabled && hasActiveSession() && _drawMaskEnabled);
+    }
     updateViewerCursors();
     if (!enabled) {
         resetManualAddState(true);
@@ -626,7 +632,7 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     }
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setSurface(newSurface);
-        _surfaceMaskTool->setActive(_drawMaskEnabled);
+        _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
     }
 
     // Turn off any approval mask editing when switching segments
@@ -847,7 +853,7 @@ void SegmentationModule::setDrawMaskEnabled(bool enabled)
     _shiftDrawMaskActive = false;
 
     if (_surfaceMaskTool) {
-        _surfaceMaskTool->setActive(_drawMaskEnabled);
+        _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
 
         QuadSurface* surface = nullptr;
         std::shared_ptr<Surface> surfaceHolder;
@@ -1306,6 +1312,10 @@ void SegmentationModule::refreshOverlay()
             state.manualAddHoverVertex = QPointF(hover->col, hover->row);
             state.manualAddHoverCrossFill =
                 _manualAddTool->config().linePreviewMode == ManualAddTool::LinePreviewMode::CrossFill;
+        }
+        state.manualAddHoverFillVertices.reserve(_manualAddTool->hoverFillVertices().size());
+        for (const auto& key : _manualAddTool->hoverFillVertices()) {
+            state.manualAddHoverFillVertices.push_back(QPointF(key.col, key.row));
         }
         for (const auto& key : _manualAddTool->fillVertices()) {
             if (key.row >= 0 && key.row < preview.rows && key.col >= 0 && key.col < preview.cols &&
@@ -2218,12 +2228,13 @@ void SegmentationModule::finishDrag()
     _drag.reset();
 
     if (moved) {
+        const auto editedVerts = _editManager->editedVertices();
+
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData()) {
-            const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 // Get drag center from the active drag state
                 const auto& activeDrag = _editManager->activeDrag();
@@ -2240,6 +2251,7 @@ void SegmentationModule::finishDrag()
         if (_state) {
             _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
+        queueAutosaveVertexUpdates(editedVerts);
         markAutosaveNeeded();
     }
 
@@ -2514,10 +2526,6 @@ void SegmentationModule::markAutosaveNeeded(bool immediate)
         return;
     }
 
-    if (_editManager->hasPendingChanges()) {
-        queueAutosaveVertexUpdates(_editManager->editedVertices());
-    }
-
     _pendingAutosave = true;
     _autosaveNotifiedFailure = false;
 
@@ -2578,6 +2586,10 @@ void SegmentationModule::performAutosave()
     }
 
     ensureSurfaceMetaObject(surfacePtr.get());
+
+    if (_pendingAutosaveVertexUpdates.empty() && _editManager->hasPendingChanges()) {
+        queueAutosaveVertexUpdates(_editManager->editedVertices());
+    }
 
     auto vertexUpdates = std::move(_pendingAutosaveVertexUpdates);
     _pendingAutosaveVertexUpdates.clear();

@@ -153,6 +153,8 @@ private slots:
     void onAxisAlignedSlicesToggled(bool enabled);
     void onAxisOverlayVisibilityToggled(bool enabled);
     void onAxisOverlayOpacityChanged(int value);
+    void onMoveOnSurfaceChangedToggled(bool enabled);
+    void onPlaneIntersectionLinesToggled(bool enabled);
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);

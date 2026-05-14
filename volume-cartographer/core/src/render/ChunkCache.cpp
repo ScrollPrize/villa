@@ -158,8 +158,6 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
     auto it = state->entries_.find(key);
     if (it != state->entries_.end()) {
         if (it->second.status == EntryStatus::InFlight) {
-            if (key.level < it->second.priority)
-                queueFetchLocked(state, key, state->generation_, 0);
             return ChunkResult{ChunkStatus::MissQueued, state->dtype_, state->levels_[level].chunkShape, {}, {}};
         }
         return resultFromEntryLocked(*state, key, it->second);
@@ -441,7 +439,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
             entry.error = "decoded chunk byte size does not match full chunk shape";
             break;
         }
-        if (isAllFill(*state, fetch.bytes)) {
+        if (state->options_.detectAllFillChunks && isAllFill(*state, fetch.bytes)) {
             entry.status = EntryStatus::AllFill;
             entry.persisted = loadedFromPersistentCache ||
                 queuePersistentEmptyWrite(state, key);

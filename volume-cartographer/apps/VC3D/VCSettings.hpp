@@ -1,30 +1,64 @@
 #pragma once
 
+#include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QString>
 
 namespace vc3d {
 
-// Prefer fast local storage when available — /ephemeral (NVMe instance store
-// set up by scripts/build_dependencies.sh) or /volpkgs (manually-mounted
-// scratch volume), whichever exists first. Fall back to ~/.VC3D.
-// Cached on first call because filesystem state doesn't change during a run.
-inline QString defaultCacheBase()
+// Single source of truth for where downloaded remote-volume chunks land.
+//
+// Priority — first match wins:
+//   1. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
+//   2. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
+//   3. `suggestion` if non-empty
+//   4. ~/.VC3D/remote_cache
+//
+// If /volpkgs or /ephemeral exists, the cache is forced there and any
+// `suggestion` is ignored: these mounts are the whole point of the host
+// being provisioned, and a stale per-volpkg or per-user setting pointing
+// elsewhere silently fills the root disk.
+//
+// Fail-fast: if /volpkgs or /ephemeral exists but isn't writable by the
+// running user (typical: directory owned by root, mode 0755), we abort
+// rather than fall through — that masks the real problem.
+//
+// The chosen path is created on disk before return.
+inline QString remoteCachePath(const QString& suggestion = {})
 {
-    static const QString base = []() {
-        for (const QString& root : {QStringLiteral("/ephemeral"),
-                                    QStringLiteral("/volpkgs")}) {
-            QFileInfo fi(root);
-            if (fi.isDir() && fi.isWritable()) {
-                QString p = root + "/VC3D";
-                QDir().mkpath(p);
-                return p;
-            }
+    for (const QString& root : {QStringLiteral("/volpkgs"),
+                                QStringLiteral("/ephemeral")}) {
+        QFileInfo fi(root);
+        if (!fi.exists()) {
+            continue;
         }
-        return QDir::homePath() + "/.VC3D";
-    }();
-    return base;
+        if (!fi.isDir()) {
+            qFatal("remoteCachePath: %s exists but is not a directory",
+                   qUtf8Printable(root));
+        }
+        // QFileInfo::isWritable() is unreliable on some FUSE/NFS mounts,
+        // so probe by trying to create the cache subtree.
+        const QString p = root + "/remote_cache";
+        if (!QDir().mkpath(p)) {
+            qFatal("remoteCachePath: %s exists but remote_cache/ cannot be "
+                   "created (check ownership/perms — must be writable by "
+                   "this user)",
+                   qUtf8Printable(root));
+        }
+        if (!QFileInfo(p).isWritable()) {
+            qFatal("remoteCachePath: %s is not writable by this user",
+                   qUtf8Printable(p));
+        }
+        return p;
+    }
+
+    QString p = suggestion.trimmed();
+    if (p.isEmpty()) {
+        p = QDir::homePath() + "/.VC3D/remote_cache";
+    }
+    QDir().mkpath(p);
+    return p;
 }
 
 inline QString settingsFilePath()
@@ -91,6 +125,7 @@ namespace viewer {
     constexpr auto USE_SEG_STEP_FOR_HINTS = "viewer/use_seg_step_for_hints";
     constexpr auto DIRECTION_STEP_POINTS = "viewer/direction_step_points";
     constexpr auto RESET_VIEW_ON_SURFACE_CHANGE = "viewer/reset_view_on_surface_change";
+    constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
     constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
 
     constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
@@ -102,6 +137,7 @@ namespace viewer {
     constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
     constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
     constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = true;
+    constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
 
     // Volume Window (Base Grayscale Window)
@@ -135,10 +171,9 @@ namespace viewer {
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
     constexpr int SLICE_STEP_SIZE_DEFAULT = 1;
 
-    // Remote volume chunk cache directory
+    // Remote volume chunk cache directory. Resolved through
+    // vc3d::remoteCachePath() — see that function for the priority rules.
     constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
-    // Default: vc3d::defaultCacheBase() + "/remote_cache" — uses /ephemeral
-    // when mounted, else ~/.VC3D.
 
     // Recent remote zarr URLs used to pre-fill attach dialog
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
@@ -312,7 +347,6 @@ namespace segmentation {
     constexpr auto PUSH_PULL_ALPHA_STEP = "push_pull_alpha_step";
     constexpr auto PUSH_PULL_ALPHA_LOW = "push_pull_alpha_low";
     constexpr auto PUSH_PULL_ALPHA_HIGH = "push_pull_alpha_high";
-    constexpr auto PUSH_PULL_ALPHA_BORDER = "push_pull_alpha_border";
     constexpr auto PUSH_PULL_ALPHA_RADIUS = "push_pull_alpha_radius";
     constexpr auto PUSH_PULL_ALPHA_LIMIT = "push_pull_alpha_limit";
     constexpr auto PUSH_PULL_ALPHA_PER_VERTEX = "push_pull_alpha_per_vertex";

@@ -1,8 +1,10 @@
 #include "SegmentationModule.hpp"
 
 #include "../CState.hpp"
+#include "SegmentationWidget.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/SurfaceMaskBrushTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
@@ -43,6 +45,10 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     if (isEditingApprovalMask() && _approvalTool) {
         _approvalTool->setSurface(_editManager->baseSurface().get());
     }
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setSurface(_editManager->baseSurface().get());
+        _surfaceMaskTool->setActive(_editingEnabled && _drawMaskEnabled);
+    }
 
     // Reload approval mask image if showing OR editing approval mask
     // Ensures dimensions match the session's surface
@@ -81,6 +87,9 @@ void SegmentationModule::endEditingSession()
     clearUndoStack();
     cancelDrag();
     clearLineDragStroke();
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setActive(false);
+    }
     _lineDrawKeyActive = false;
     resetHoverLookupDetail();
     _hoverPointer.valid = false;
@@ -211,6 +220,8 @@ bool SegmentationModule::restoreUndoSnapshot()
     _suppressUndoCapture = true;
     bool applied = false;
     std::optional<cv::Rect> undoBounds;
+    std::vector<SegmentationEditManager::VertexEdit> autosaveEdits;
+    const bool editingWasEnabled = _editingEnabled;
 
     // Check if this is a delta-based entry or full snapshot
     if (_undoHistory.lastIsDelta()) {
@@ -225,6 +236,7 @@ bool SegmentationModule::restoreUndoSnapshot()
                 if (delta.row >= 0 && delta.row < previewPoints.rows &&
                     delta.col >= 0 && delta.col < previewPoints.cols) {
                     previewPoints(delta.row, delta.col) = delta.previousWorld;
+                    autosaveEdits.push_back({delta.row, delta.col, {}, delta.previousWorld, false});
                     minRow = std::min(minRow, delta.row);
                     maxRow = std::max(maxRow, delta.row);
                     minCol = std::min(minCol, delta.col);
@@ -237,6 +249,9 @@ bool SegmentationModule::restoreUndoSnapshot()
             }
 
             _editManager->applyPreview();
+            if (auto surface = _editManager->previewSurface()) {
+                surface->invalidateCache();
+            }
             applied = true;
         }
     } else {
@@ -253,6 +268,21 @@ bool SegmentationModule::restoreUndoSnapshot()
     }
 
     if (applied) {
+        auto restoredSurface = _editManager->previewSurface();
+        if (restoredSurface) {
+            restoredSurface->invalidateCache();
+        }
+
+        if (_editManager) {
+            _editManager->refreshFromBaseSurface();
+        }
+
+        if (_surfaceMaskTool) {
+            _surfaceMaskTool->setSurface(restoredSurface.get());
+            _surfaceMaskTool->refreshFromSurface();
+            _surfaceMaskTool->setActive(editingWasEnabled && _drawMaskEnabled && hasActiveSession());
+        }
+
         if (_state) {
             auto preview = _editManager->previewSurface();
 
@@ -270,6 +300,13 @@ bool SegmentationModule::restoreUndoSnapshot()
             _state->setSurface("segmentation", preview, false, true);
         }
 
+        if (editingWasEnabled && !_editingEnabled) {
+            setEditingEnabled(true);
+            if (_widget) {
+                _widget->setEditingEnabled(true);
+            }
+        }
+
         // Also undo the corresponding auto-approval if approval mask is active
         if (_overlay && _overlay->hasApprovalMaskData() && _overlay->canUndoAutoApproval()) {
             _overlay->undoLastAutoApproval();
@@ -281,6 +318,7 @@ bool SegmentationModule::restoreUndoSnapshot()
 
         refreshOverlay();
         emitPendingChanges();
+        queueAutosaveVertexUpdates(autosaveEdits);
         markAutosaveNeeded();
     }
 

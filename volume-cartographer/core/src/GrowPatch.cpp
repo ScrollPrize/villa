@@ -1123,9 +1123,6 @@ struct LossSettings {
     int y_max = std::numeric_limits<int>::max();
     int x_min = -1;
     int x_max = std::numeric_limits<int>::max();
-    // Anti-flipback constraint settings
-    float flipback_threshold = 5.0f;  // Allow up to this much inward movement (voxels) before penalty
-    float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
 
     int space_line_steps = 8;
     float space_line_threshold = 170.0f;
@@ -2655,18 +2652,8 @@ struct LocalOptimizationConfig {
     bool use_dense_qr = false;
 };
 
-// Configuration for anti-flipback constraint
-// This prevents the surface from flipping back through itself during optimization
-struct AntiFlipbackConfig {
-    const cv::Mat_<cv::Vec3d>* anchors = nullptr;        // Positions before optimization
-    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr; // Consistently oriented surface normals
-    double threshold = 5.0;   // Allow up to this much inward movement (voxels) before penalty kicks in
-    double weight = 1.0;       // Weight of the anti-flipback loss when activated
-};
-
 struct LocalOptTimingAccumulator {
     std::atomic<double> problem_setup{0.0};
-    std::atomic<double> anti_flipback{0.0};
     std::atomic<double> cell_reopt{0.0};
     std::atomic<double> param_fixup{0.0};
     std::atomic<double> ceres_solve{0.0};
@@ -2678,9 +2665,8 @@ struct LocalOptTimingAccumulator {
                std::memory_order_relaxed, std::memory_order_relaxed)) {}
     }
 
-    void accumulate(double ps, double af, double cr, double pf, double cs) {
+    void accumulate(double ps, double cr, double pf, double cs) {
         atomic_add(problem_setup, ps);
-        atomic_add(anti_flipback, af);
         atomic_add(cell_reopt, cr);
         atomic_add(param_fixup, pf);
         atomic_add(ceres_solve, cs);
@@ -2690,14 +2676,12 @@ struct LocalOptTimingAccumulator {
     void print(double wall_time) const {
         int n = total_solves.load();
         double ps = problem_setup.load();
-        double af = anti_flipback.load();
         double cr = cell_reopt.load();
         double pf = param_fixup.load();
         double cs = ceres_solve.load();
-        double total_cpu = ps + af + cr + pf + cs;
+        double total_cpu = ps + cr + pf + cs;
         printf("\nresume opt local timing breakdown:\n");
         printf("  problem setup:          %8.3fs  (%5.1f%%)\n", ps, 100.0*ps/total_cpu);
-        printf("  anti-flipback losses:   %8.3fs  (%5.1f%%)\n", af, 100.0*af/total_cpu);
         printf("  cell reopt constraints: %8.3fs  (%5.1f%%)\n", cr, 100.0*cr/total_cpu);
         printf("  param block fixup:      %8.3fs  (%5.1f%%)\n", pf, 100.0*pf/total_cpu);
         printf("  ceres solve:            %8.3fs  (%5.1f%%)\n", cs, 100.0*cs/total_cpu);
@@ -2712,7 +2696,6 @@ struct LocalOptTimingAccumulator {
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false,
     const LocalOptimizationConfig* solver_config = nullptr,
-    const AntiFlipbackConfig* flipback_config = nullptr,
     LocalOptTimingAccumulator* timing = nullptr)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
@@ -2720,7 +2703,11 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     auto t0 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
     ceres::Problem problem;
-    cv::Mat_<uint16_t> loss_status(params.state.size());
+    static thread_local cv::Mat_<uint16_t> thread_loss_status;
+    if (thread_loss_status.size() != params.state.size()) {
+        thread_loss_status.create(params.state.size());
+    }
+    cv::Mat_<uint16_t>& loss_status = thread_loss_status;
 
     int r_outer = radius+3;
 
@@ -2737,26 +2724,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
         }
 
     auto t1 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-
-    // Add anti-flipback loss if configured
-    // This penalizes points that move too far in the inward (negative normal) direction
-    if (flipback_config && flipback_config->anchors && flipback_config->surface_normals) {
-        for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
-            for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
-                cv::Vec2i op = {oy, ox};
-                if (cv::norm(p-op) <= radius && (params.state(op) & STATE_LOC_VALID)) {
-                    cv::Vec3d anchor = (*flipback_config->anchors)(op);
-                    cv::Vec3d normal = (*flipback_config->surface_normals)(op);
-                    // Only add loss if we have valid anchor and normal
-                    if (cv::norm(normal) > 0.5 && anchor[0] >= 0) {
-                        problem.AddResidualBlock(
-                            AntiFlipbackLoss::Create(anchor, normal, flipback_config->threshold, flipback_config->weight),
-                            nullptr,
-                            &params.dpoints(op)[0]);
-                    }
-                }
-            }
-    }
 
     auto t2 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
@@ -2829,7 +2796,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     if (timing) {
         auto t5 = std::chrono::high_resolution_clock::now();
         auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
-        timing->accumulate(secs(t0, t1), secs(t1, t2), secs(t2, t3), secs(t3, t4), secs(t4, t5));
+        timing->accumulate(secs(t0, t1), secs(t2, t3), secs(t3, t4), secs(t4, t5));
     }
 
     if (!quiet)
@@ -3259,11 +3226,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     loss_settings.y_max = params.value("y_max", std::numeric_limits<int>::max());
     loss_settings.x_min = params.value("x_min", -1);
     loss_settings.x_max = params.value("x_max", std::numeric_limits<int>::max());
-    loss_settings.flipback_threshold = params.value("flipback_threshold", 5.0f);
-    loss_settings.flipback_weight = params.value("flipback_weight", 1.0f);
-    std::cout << "Anti-flipback: threshold=" << loss_settings.flipback_threshold
-              << " weight=" << loss_settings.flipback_weight
-              << (loss_settings.flipback_weight == 0 ? " (DISABLED)" : "") << std::endl;
     ALifeTime f_timer("empty space tracing\n");
 
 
@@ -3336,6 +3298,172 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     float T = step;
     // float Ts = step*scale;
 
+    if (resume_surf && params.value("inpaint", false)) {
+        cv::Mat_<cv::Vec3f>* resume_points_ptr = resume_surf->rawPointsPtr();
+        if (!resume_points_ptr || resume_points_ptr->empty()) {
+            throw std::runtime_error("Missing resume surface points for inpaint.");
+        }
+
+        cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
+        if (resume_generations.empty()) {
+            resume_generations = cv::Mat_<uint16_t>(resume_points_ptr->size(), static_cast<uint16_t>(0));
+            for (int y = 0; y < resume_points_ptr->rows; ++y) {
+                for (int x = 0; x < resume_points_ptr->cols; ++x) {
+                    if ((*resume_points_ptr)(y, x)[0] != -1.0f) {
+                        resume_generations(y, x) = 1;
+                    }
+                }
+            }
+            resume_surf->setChannel("generations", resume_generations);
+        }
+
+        auto result_points_storage = std::make_unique<cv::Mat_<cv::Vec3f>>(resume_points_ptr->clone());
+        cv::Mat_<cv::Vec3f>& result_points = *result_points_storage;
+
+        cv::Mat active_area_mask(result_points.size(), CV_8U, cv::Scalar(0));
+        for (int y = 0; y < result_points.rows; ++y) {
+            for (int x = 0; x < result_points.cols; ++x) {
+                if (result_points(y, x)[0] != -1.0f) {
+                    active_area_mask.at<uchar>(y, x) = 255;
+                }
+            }
+        }
+
+        cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
+        cv::Mat hole_mask;
+        if (!mask.empty()) {
+            if (mask.size() != result_points.size()) {
+                throw std::runtime_error("inpaint mask size does not match resume surface size.");
+            }
+            cv::bitwise_and(active_area_mask, mask, hole_mask);
+        } else {
+            hole_mask = active_area_mask;
+        }
+
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(hole_mask, contours, hierarchy, cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
+        std::cout << "performing ROI inpaint on " << contours.size() << " potential holes" << std::endl;
+
+        int inpaint_count = 0;
+        int inpaint_skip = 0;
+        constexpr int margin = 4;
+
+        for (int i = 0; i < static_cast<int>(contours.size()); ++i) {
+            if (hierarchy[i][3] == -1) {
+                ++inpaint_skip;
+                continue;
+            }
+
+            cv::Rect roi = cv::boundingRect(contours[i]);
+            roi.x = std::max(0, roi.x - margin);
+            roi.y = std::max(0, roi.y - margin);
+            roi.width = std::min(result_points.cols - roi.x, roi.width + 2 * margin);
+            roi.height = std::min(result_points.rows - roi.y, roi.height + 2 * margin);
+
+            if (roi.width <= 4 || roi.height <= 4 ||
+                roi.x < 2 || roi.y < 2 ||
+                roi.x + roi.width > result_points.cols - 2 ||
+                roi.y + roi.height > result_points.rows - 2) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: insufficient margin around roi " << roi << std::endl;
+                continue;
+            }
+
+            cv::Mat_<uchar> inpaint_mask(roi.size(), static_cast<uchar>(1));
+            std::vector<cv::Point> hole_contour_roi;
+            hole_contour_roi.reserve(contours[i].size());
+            for (const auto& p : contours[i]) {
+                hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
+            }
+            cv::fillPoly(inpaint_mask, std::vector<std::vector<cv::Point>>{hole_contour_roi}, cv::Scalar(0));
+
+            TraceParameters local_params;
+            local_params.unit = trace_params.unit;
+            local_params.dpoints = cv::Mat_<cv::Vec3d>(roi.size(), cv::Vec3d(-1.0, -1.0, -1.0));
+            local_params.state = cv::Mat_<uint8_t>(roi.size(), static_cast<uint8_t>(0));
+            for (int y = 0; y < roi.height; ++y) {
+                for (int x = 0; x < roi.width; ++x) {
+                    const cv::Vec3f& p = result_points(roi.y + y, roi.x + x);
+                    if (p[0] != -1.0f) {
+                        local_params.dpoints(y, x) = cv::Vec3d(p[0], p[1], p[2]);
+                        local_params.state(y, x) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    }
+                }
+            }
+
+            bool did_inpaint = false;
+            try {
+                did_inpaint = inpaint(cv::Rect(0, 0, roi.width, roi.height),
+                                      inpaint_mask,
+                                      local_params,
+                                      trace_data);
+            } catch (const cv::Exception& ex) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: OpenCV exception for roi " << roi << " => " << ex.what() << std::endl;
+                continue;
+            } catch (const std::exception& ex) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: exception for roi " << roi << " => " << ex.what() << std::endl;
+                continue;
+            } catch (...) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: unknown exception for roi " << roi << std::endl;
+                continue;
+            }
+
+            if (!did_inpaint) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: mask border check failed for roi " << roi << std::endl;
+                continue;
+            }
+
+            for (int y = 0; y < roi.height; ++y) {
+                for (int x = 0; x < roi.width; ++x) {
+                    if (inpaint_mask(y, x) != 0 || !(local_params.state(y, x) & STATE_LOC_VALID)) {
+                        continue;
+                    }
+                    const cv::Vec3d& p = local_params.dpoints(y, x);
+                    if (p[0] != -1.0) {
+                        result_points(roi.y + y, roi.x + x) =
+                            cv::Vec3f(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
+                    }
+                }
+            }
+            ++inpaint_count;
+        }
+
+        std::cout << "ROI inpaint completed: " << inpaint_count
+                  << " holes, " << inpaint_skip << " skipped" << std::endl;
+
+        auto surf = new QuadSurface(result_points_storage.release(), {1/T, 1/T});
+        surf->setDpi(voxelSizeToDpi(voxelsize));
+        surf->setChannel("generations", resume_generations.clone());
+
+        cv::Mat approval = resume_surf->channel("approval", SURF_CHANNEL_NORESIZE);
+        if (!approval.empty()) {
+            surf->setChannel("approval", approval);
+        }
+        if (!mask.empty()) {
+            surf->setChannel("mask", mask);
+        }
+
+        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+        const double voxel_size_d = static_cast<double>(voxelsize);
+        const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
+        surf->meta = utils::Json::parse(meta_params.dump());
+        if (resume_surf && !resume_surf->id.empty()) {
+            surf->meta["seed_surface_id"] = resume_surf->id;
+        }
+        surf->meta["area_vx2"] = area_est_vx2;
+        surf->meta["area_cm2"] = area_est_cm2;
+        surf->meta["max_gen"] = stop_gen;
+        surf->meta["elapsed_time_s"] = f_timer.seconds();
+
+        delete timer;
+        return surf;
+    }
+
     
     // The following track the state of the patch; they are each as big as the largest possible patch but initially empty
     // - locs defines the patch! It says for each 2D position, which 3D position it corresponds to
@@ -3368,7 +3496,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
         surf->setDpi(voxelSizeToDpi(voxelsize));
-        surf->setChannel("generations", generations_crop);
+        surf->setChannel("generations", generations_crop.clone());
 
         if (params.value("vis_losses", false)) {
             cv::Mat_<float> loss_dist(generations_crop.size(), 0.0f);
@@ -3755,7 +3883,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
 
             std::cout << "Resuming with " << trace_data.point_correction.all_grid_locs().size() << " correction points." << std::endl;
-            cv::Mat mask = resume_surf->channel("mask");
+            cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
             if (!mask.empty()) {
                 std::vector<std::vector<cv::Point2f>> all_hulls;
                 // For single-point collections (e.g., drag-and-drop), store center and radius
@@ -4077,7 +4205,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config, nullptr, &timing_accum);
+                    local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config, &timing_accum);
                     done++;
 #pragma omp critical
                     {
@@ -4097,7 +4225,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
         else if (params.value("inpaint", false)) {
-            cv::Mat mask = resume_surf->channel("mask");
+            cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
             cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
 
             cv::Mat active_area_mask(trace_params.state.size(), (uchar)0);
@@ -4376,17 +4504,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         } else {
 
-            // Snapshot positions before per-point optimization for flip detection
-            cv::Mat_<cv::Vec3d> positions_before_perpoint = trace_params.dpoints.clone();
-
-            // Configure anti-flipback constraint for per-point optimization
-            // Note: new points won't have surface normals yet, but the loss function handles this
-            AntiFlipbackConfig perpoint_flipback_config;
-            perpoint_flipback_config.anchors = &positions_before_perpoint;
-            perpoint_flipback_config.surface_normals = &surface_normals;
-            perpoint_flipback_config.threshold = loss_settings.flipback_threshold;
-            perpoint_flipback_config.weight = loss_settings.flipback_weight;
-
             // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
             // considering two points that are too close to each other...
             OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
@@ -4473,9 +4590,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     ceres::Solver::Summary summary;
                     ceres::Solve(options, &problem, &summary);
 
-                    local_optimization(1, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
+                    local_optimization(1, p, trace_params, trace_data, loss_settings, true, false);
                     if (local_opt_r > 1)
-                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
+                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false);
 
                     generations(p) = generation;
 
@@ -4523,16 +4640,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             int done = 0;
 
             if (!opt_local.empty()) {
-                // Snapshot positions before optimization for flip detection
-                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
-
-                // Configure anti-flipback constraint
-                AntiFlipbackConfig flipback_config;
-                flipback_config.anchors = &positions_before_opt;
-                flipback_config.surface_normals = &surface_normals;
-                flipback_config.threshold = loss_settings.flipback_threshold;
-                flipback_config.weight = loss_settings.flipback_weight;
-
                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
 
 #pragma omp parallel
@@ -4543,7 +4650,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(8, p, trace_params, trace_data, loss_settings, true, false, nullptr, &flipback_config);
+                    local_optimization(8, p, trace_params, trace_data, loss_settings, true, false);
 
 #pragma omp atomic
                     done++;
@@ -4553,17 +4660,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
             if (generation % 8 == 0) {
-                // Snapshot positions before global optimization
-                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
-
-                // Configure anti-flipback constraint
-                AntiFlipbackConfig flipback_config;
-                flipback_config.anchors = &positions_before_opt;
-                flipback_config.surface_normals = &surface_normals;
-                flipback_config.threshold = loss_settings.flipback_threshold;
-                flipback_config.weight = loss_settings.flipback_weight;
-
-                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true, nullptr, &flipback_config);
+                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
             }
         }
 

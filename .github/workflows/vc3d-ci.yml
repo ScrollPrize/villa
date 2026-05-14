@@ -13,90 +13,256 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
-    name: CI
+  changes:
+    name: Detect changes
     runs-on: ubuntu-24.04
-
+    timeout-minutes: 5
+    outputs:
+      vc: ${{ steps.filter.outputs.vc }}
+      dockerfile: ${{ steps.filter.outputs.dockerfile }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Detect changes
-        id: changes
+      - uses: actions/checkout@v4
+      - id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
             vc:
               - 'volume-cartographer/**'
+              - '.github/workflows/vc3d-ci.yml'
+            dockerfile:
+              - 'volume-cartographer/*.Dockerfile'
+              - 'volume-cartographer/.dockerignore'
+              - 'volume-cartographer/scripts/ci.sh'
 
-      # --- No-op success path when unrelated files changed ---
-      - name: Skip (no volume-cartographer changes)
-        if: ${{ steps.changes.outputs.vc == 'false' }}
-        run: |
-          echo "✅ No changes in volume-cartographer/ or the workflow file. Skipping build."
+  skip:
+    name: Skip (no volume-cartographer changes)
+    needs: changes
+    if: needs.changes.outputs.vc != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "No volume-cartographer changes — skipping build."
 
-      - name: Install build deps
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        run: |
-          set -euxo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            build-essential git cmake ninja-build ccache pkg-config \
-            qt6-base-dev libboost-system-dev libboost-program-options-dev \
-            libceres-dev libcgal-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
-            libgsl-dev libsdl2-dev libcurl4-openssl-dev \
-            libde265-dev libx265-dev liblz4-dev nlohmann-json3-dev
+  builder:
+    name: Builder image (${{ matrix.image }})
+    needs: changes
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu-24.04", "ubuntu-26.04"]
+    env:
+      # If the PR touched a Dockerfile (or ci.sh), the published ghcr image
+      # is stale for this PR. Force a local build with the GHA buildx cache.
+      # Otherwise ci.sh builder will docker pull the published image.
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Pull or build builder image
+        run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
 
-      - name: Restore ccache
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        uses: actions/cache/restore@v4
+  build-test:
+    name: ${{ matrix.action }}-${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
+    needs: [changes, builder]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.blocking != true }}
+    strategy:
+      fail-fast: false
+      # ubuntu-24.04: compile-only smoke (Release, no tests).
+      # ubuntu-26.04: full test + sanitizer matrix + coverage + dead-code.
+      matrix:
+        include:
+          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-24.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
+          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests,      action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tests,      action: test,    blocking: false }
+          # Sanitizer cells are clang-only — clang's runtime is more
+          # complete (TySan, NSan) and we don't need duplicate gcc coverage.
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-asan-ubsan, action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tsan,       action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-tysan,      action: test,    blocking: false }
+          - { image: "ubuntu-26.04", compiler: clang, preset: ci-nsan,       action: test,    blocking: false }
+    env:
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Pull or build builder image
+        run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
+      - name: ${{ matrix.action }}
+        run: volume-cartographer/scripts/ci.sh ${{ matrix.action }} ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
+
+  coverage:
+    name: Coverage (gcc, gcov)
+    needs: [changes, builder]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-vc3d-ci-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-ci.yml') }}
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - name: Pull or build builder image
+        run: volume-cartographer/scripts/ci.sh builder ubuntu-26.04
+      - name: Run coverage
+        run: volume-cartographer/scripts/ci.sh coverage ubuntu-26.04
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: volume-cartographer/coverage/
+      - name: Print coverage summary
+        run: |
+          {
+            echo "## Total coverage"
+            echo '```'
+            cat volume-cartographer/coverage/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Patch coverage gate (vs base branch)
+        if: github.event_name == 'pull_request'
+        env:
+          PATCH_COVERAGE_MIN: '0'
+        run: |
+          volume-cartographer/scripts/ci.sh patch-coverage origin/${{ github.base_ref }} ubuntu-26.04
+          {
+            echo "## Patch coverage (vs ${{ github.base_ref }}, gate ≥ ${PATCH_COVERAGE_MIN}%)"
+            cat volume-cartographer/coverage/patch.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Total coverage non-regression vs base branch
+        if: github.event_name == 'pull_request'
+        run: volume-cartographer/scripts/ci.sh coverage-regression origin/${{ github.base_ref }} ubuntu-26.04
+
+  # macOS compile is a hard gate (parity with the ubuntu ci-release cells).
+  # Smoke + toolchain-verifier run in a separate job that is non-blocking for
+  # now; promote that to a gate once it's been stable for a while.
+  macos-build:
+    name: macOS compile (${{ matrix.os }}, Homebrew LLVM)
+    needs: changes
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache the Homebrew downloads (bottle tarballs + API index). The
+      # install of qt/opencv/ceres/llvm/etc. is the dominant cost — caching
+      # downloads keeps the second run under ~10 min.
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            ~/Library/Caches/Homebrew/api
+          key: brew-${{ matrix.os }}-${{ hashFiles('volume-cartographer/scripts/build_macos.sh') }}
           restore-keys: |
-            ccache-${{ runner.os }}-vc3d-ci-
+            brew-${{ matrix.os }}-
 
-      - name: Enable ccache
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        run: |
-          mkdir -p ~/.ccache
-          echo 'max_size = 5G' >> ~/.ccache/ccache.conf || true
-          echo 'hash_dir = true' >> ~/.ccache/ccache.conf || true
-          echo 'compiler_check = content' >> ~/.ccache/ccache.conf || true
-          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE/volume-cartographer" >> $GITHUB_ENV
+      - name: brew update
+        run: brew update
 
-      - name: Reset ccache stats
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        run: ccache -z || true
+      - name: Configure + build (installs Homebrew deps as needed)
+        run: volume-cartographer/scripts/build_macos.sh --install-deps
 
-      - name: Configure smoke build
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        working-directory: ./volume-cartographer
-        run: |
-          cmake -S . -B build -G Ninja \
-                -DVC_WITH_CUDA_SPARSE=off \
-                -DVC_WITH_PASTIX=OFF \
-                -DVC_BUILD_TESTS=OFF \
-                -DBUILD_TESTING=OFF \
-                -DCMAKE_BUILD_TYPE=Debug \
-                -DCMAKE_C_COMPILER=gcc \
-                -DCMAKE_CXX_COMPILER=g++ \
-                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-
-      - name: Build smoke target set
-        if: ${{ steps.changes.outputs.vc == 'true' }}
-        working-directory: ./volume-cartographer
-        run: cmake --build build --parallel
-
-      - name: Show ccache stats
-        if: ${{ always() && steps.changes.outputs.vc == 'true' }}
-        run: ccache -s || true
-
-      - name: Save ccache
-        if: ${{ always() && steps.changes.outputs.vc == 'true' }}
-        uses: actions/cache/save@v4
+      - name: Upload build dir for downstream checks
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-vc3d-ci-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-ci.yml') }}
+          name: macos-build-${{ matrix.os }}
+          path: volume-cartographer/build-macos/bin/
+          retention-days: 1
+
+  macos-checks:
+    name: macOS checks (smoke + toolchain verify)
+    needs: macos-build
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: macos-15
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-build-macos-15
+          path: volume-cartographer/build-macos/bin/
+      - name: Smoke-test built binaries
+        run: |
+          cd volume-cartographer/build-macos
+          chmod +x bin/* || true
+          file bin/VC3D bin/vc_tifxyz bin/flatboi
+          ./bin/vc_tifxyz --help | head -5 || true
+      - name: Verify Homebrew-only toolchain
+        run: volume-cartographer/scripts/verify_homebrew_toolchain.sh volume-cartographer/build-macos
+
+  dead-code:
+    name: Dead-code report (clang, nm + --print-gc-sections)
+    needs: [changes, builder]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Pull or build builder image
+        run: volume-cartographer/scripts/ci.sh builder ubuntu-26.04
+      - name: Run dead-code analysis
+        run: volume-cartographer/scripts/ci.sh dead-code ubuntu-26.04 clang
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dead-code
+          path: volume-cartographer/dead-code/
+      - name: Step summary
+        run: |
+          {
+            echo "## Dead-code report"
+            echo '```'
+            cat volume-cartographer/dead-code/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    name: CI
+    needs: [changes, skip, builder, build-test, coverage, macos-build, dead-code]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Aggregate required-check result
+        env:
+          R_CHANGES: ${{ needs.changes.result }}
+          R_SKIP: ${{ needs.skip.result }}
+          R_BUILDER: ${{ needs.builder.result }}
+          R_BUILD_TEST: ${{ needs.build-test.result }}
+          R_COVERAGE: ${{ needs.coverage.result }}
+          R_MACOS: ${{ needs.macos-build.result }}
+          R_DEAD_CODE: ${{ needs.dead-code.result }}
+        run: |
+          set -e
+          echo "changes=$R_CHANGES skip=$R_SKIP builder=$R_BUILDER build-test=$R_BUILD_TEST coverage=$R_COVERAGE macos=$R_MACOS dead-code=$R_DEAD_CODE"
+          # coverage and dead-code are continue-on-error, so accept any result.
+          # All other non-skipped jobs must succeed (or be skipped legitimately).
+          fail=0
+          for r in "$R_CHANGES" "$R_SKIP" "$R_BUILDER" "$R_BUILD_TEST" "$R_MACOS"; do
+            case "$r" in
+              success|skipped) ;;
+              *) fail=1 ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more required CI jobs failed or were cancelled."
+            exit 1
+          fi
+          echo "All required CI jobs passed."

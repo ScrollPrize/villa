@@ -724,6 +724,7 @@ void QuadSurface::invalidateCache()
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
+    _normalCache = cv::Mat_<cv::Vec3f>();
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -1455,15 +1456,30 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     // Rename to make creation atomic
     std::filesystem::rename(path / "meta.json.tmp", path / "meta.json");
 
-    // Preserve auxiliary files from the existing directory before replacing
+    // Preserve auxiliary files from the existing directory before replacing.
+    // Lazy-loaded channels are tracked by name with an empty cv::Mat; if a
+    // geometry-only save skips serializing one of those channels, carry the
+    // existing file forward instead of dropping it from the replaced directory.
     if (force_overwrite && std::filesystem::exists(final_path)) {
-        // Copy corrections.json if it exists
-        std::filesystem::path correctionsFile = final_path / "corrections.json";
-        if (std::filesystem::exists(correctionsFile)) {
+        std::error_code iterEc;
+        for (const auto& entry : std::filesystem::directory_iterator(final_path, iterEc)) {
+            if (iterEc) {
+                break;
+            }
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+
+            const std::filesystem::path dst = temp_path / entry.path().filename();
+            if (std::filesystem::exists(dst)) {
+                continue;
+            }
+
             std::error_code copyEc;
-            std::filesystem::copy_file(correctionsFile, temp_path / "corrections.json",
+            std::filesystem::copy_file(entry.path(), dst,
                 std::filesystem::copy_options::overwrite_existing, copyEc);
-            // Ignore errors - corrections are not critical for surface integrity
+            // Ignore errors for auxiliary files; x/y/z/meta were just written
+            // and remain the integrity-critical parts of the surface save.
         }
     }
 
@@ -2059,7 +2075,7 @@ void QuadSurface::rotate(float angleDeg)
     }
 
     // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    invalidateCache();
 }
 
 void QuadSurface::resample(float factor, int interpolation)
@@ -2114,7 +2130,7 @@ void QuadSurface::resample(float factor_x, float factor_y, int interpolation)
     _scale[1] /= factor_y;
 
     // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    invalidateCache();
 }
 
 float QuadSurface::computeZOrientationAngle() const
@@ -2280,8 +2296,8 @@ void QuadSurface::flipU()
         flipSingleTiff(path / "approval.tif", flipCode);
     }
 
-    // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    // Invalidate derived geometry caches.
+    invalidateCache();
 }
 
 void QuadSurface::flipV()
@@ -2309,8 +2325,8 @@ void QuadSurface::flipV()
         flipSingleTiff(path / "approval.tif", flipCode);
     }
 
-    // Invalidate cached bbox
-    _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+    // Invalidate derived geometry caches.
+    invalidateCache();
 }
 
 // Overlapping JSON file utilities

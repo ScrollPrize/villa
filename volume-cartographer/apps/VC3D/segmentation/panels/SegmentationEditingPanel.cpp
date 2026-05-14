@@ -59,7 +59,6 @@ AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
         sanitized.high = std::min(1.0f, sanitized.low + 0.05f);
     }
 
-    sanitized.borderOffset = std::clamp(sanitized.borderOffset, -80.0f, 80.0f);
     sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, 63);
     sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, 512.0f);
 
@@ -193,8 +192,7 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
                     tr("Ending distance for alpha sampling; the search stops once this depth is reached."));
     addAlphaControl(tr("Sample step"), _spinAlphaStep, 0.05, 80.0, 0.05, alphaRow, 0,
                     tr("Spacing between alpha samples inside the start/stop range; smaller steps follow fine features."));
-    addAlphaControl(tr("Border offset"), _spinAlphaBorder, -80.0, 80.0, 0.1, alphaRow++, 1,
-                    tr("Extra offset applied after the alpha front is located, keeping a safety margin."));
+    ++alphaRow;
     addAlphaControl(tr("Opacity low"), _spinAlphaLow, 0.0, 255.0, 1.0, alphaRow, 0,
                     tr("Lower bound of the opacity window; voxels below this behave as transparent."));
     addAlphaControl(tr("Opacity high"), _spinAlphaHigh, 0.0, 255.0, 1.0, alphaRow++, 1,
@@ -382,11 +380,6 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     connect(_spinAlphaHigh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
         onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
             cfg.high = displayOpacityToNormalized(value);
-        });
-    });
-    connect(_spinAlphaBorder, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, onAlphaValueChanged](double value) {
-        onAlphaValueChanged([value](AlphaPushPullConfig& cfg) {
-            cfg.borderOffset = static_cast<float>(value);
         });
     });
     connect(_spinAlphaBlurRadius, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, onAlphaValueChanged](int value) {
@@ -590,7 +583,6 @@ void SegmentationEditingPanel::applyAlphaPushPullConfig(const AlphaPushPullConfi
                          !nearlyEqual(sanitized.step, _alphaPushPullConfig.step) ||
                          !nearlyEqual(sanitized.low, _alphaPushPullConfig.low) ||
                          !nearlyEqual(sanitized.high, _alphaPushPullConfig.high) ||
-                         !nearlyEqual(sanitized.borderOffset, _alphaPushPullConfig.borderOffset) ||
                          sanitized.blurRadius != _alphaPushPullConfig.blurRadius ||
                          !nearlyEqual(sanitized.perVertexLimit, _alphaPushPullConfig.perVertexLimit) ||
                          sanitized.perVertex != _alphaPushPullConfig.perVertex;
@@ -603,7 +595,6 @@ void SegmentationEditingPanel::applyAlphaPushPullConfig(const AlphaPushPullConfi
             writeSetting(QStringLiteral("push_pull_alpha_step"), _alphaPushPullConfig.step);
             writeSetting(QStringLiteral("push_pull_alpha_low"), _alphaPushPullConfig.low);
             writeSetting(QStringLiteral("push_pull_alpha_high"), _alphaPushPullConfig.high);
-            writeSetting(QStringLiteral("push_pull_alpha_border"), _alphaPushPullConfig.borderOffset);
             writeSetting(QStringLiteral("push_pull_alpha_radius"), _alphaPushPullConfig.blurRadius);
             writeSetting(QStringLiteral("push_pull_alpha_limit"), _alphaPushPullConfig.perVertexLimit);
             writeSetting(QStringLiteral("push_pull_alpha_per_vertex"), _alphaPushPullConfig.perVertex);
@@ -630,10 +621,6 @@ void SegmentationEditingPanel::applyAlphaPushPullConfig(const AlphaPushPullConfi
     if (_spinAlphaHigh) {
         const QSignalBlocker blocker(_spinAlphaHigh);
         _spinAlphaHigh->setValue(normalizedOpacityToDisplay(_alphaPushPullConfig.high));
-    }
-    if (_spinAlphaBorder) {
-        const QSignalBlocker blocker(_spinAlphaBorder);
-        _spinAlphaBorder->setValue(static_cast<double>(_alphaPushPullConfig.borderOffset));
     }
     if (_spinAlphaBlurRadius) {
         const QSignalBlocker blocker(_spinAlphaBlurRadius);
@@ -724,7 +711,6 @@ void SegmentationEditingPanel::restoreSettings(QSettings& settings)
     storedAlpha.step = settings.value(segmentation::PUSH_PULL_ALPHA_STEP, storedAlpha.step).toFloat();
     storedAlpha.low = settings.value(segmentation::PUSH_PULL_ALPHA_LOW, storedAlpha.low).toFloat();
     storedAlpha.high = settings.value(segmentation::PUSH_PULL_ALPHA_HIGH, storedAlpha.high).toFloat();
-    storedAlpha.borderOffset = settings.value(segmentation::PUSH_PULL_ALPHA_BORDER, storedAlpha.borderOffset).toFloat();
     storedAlpha.blurRadius = settings.value(segmentation::PUSH_PULL_ALPHA_RADIUS, storedAlpha.blurRadius).toInt();
     storedAlpha.perVertexLimit = settings.value(segmentation::PUSH_PULL_ALPHA_LIMIT, storedAlpha.perVertexLimit).toFloat();
     storedAlpha.perVertex = settings.value(segmentation::PUSH_PULL_ALPHA_PER_VERTEX, storedAlpha.perVertex).toBool();
@@ -826,7 +812,6 @@ void SegmentationEditingPanel::syncUiState(bool editingEnabled, bool growthInPro
     updateAlphaSpin(_spinAlphaStep, _alphaPushPullConfig.step);
     updateAlphaSpin(_spinAlphaLow, _alphaPushPullConfig.low, true);
     updateAlphaSpin(_spinAlphaHigh, _alphaPushPullConfig.high, true);
-    updateAlphaSpin(_spinAlphaBorder, _alphaPushPullConfig.borderOffset);
 
     if (_spinAlphaBlurRadius) {
         const QSignalBlocker blocker(_spinAlphaBlurRadius);

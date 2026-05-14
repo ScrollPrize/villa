@@ -37,3 +37,18 @@ vesuvius/AGENTS.md
 
 build/
 volume-cartographer/AGENTS.md
+
+# Coverage outputs
+*.gcov
+*.gcda
+*.gcno
+/volume-cartographer/coverage/
+/coverage/
+
+# Dead-code analysis outputs
+/volume-cartographer/dead-code/
+/dead-code/
+
+# ccache (mounted into builder docker)
+/volume-cartographer/.ccache/
+/.ccache/

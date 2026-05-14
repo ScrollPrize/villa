@@ -1,30 +1,205 @@
 {
   "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+
   "configurePresets": [
+    {
+      "name": "_base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}$penv{VC_BUILD_SUFFIX}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "_ci-base",
+      "hidden": true,
+      "inherits": "_base"
+    },
+    {
+      "name": "_dev-base",
+      "hidden": true,
+      "inherits": "_base",
+      "cacheVariables": {
+        "VC_TESTING": "ON",
+        "VC_MARCH_NATIVE": "ON"
+      }
+    },
+
+    {
+      "name": "_gcc",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "_clang",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_Fortran_COMPILER": "flang"
+      }
+    },
+
+    {
+      "name": "dev-gcc",
+      "displayName": "Local development (gcc, RelWithDebInfo, native arch)",
+      "inherits": ["_dev-base", "_gcc"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "dev-clang",
+      "displayName": "Local development (clang, RelWithDebInfo, native arch)",
+      "inherits": ["_dev-base", "_clang"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "dev-profile-clang",
+      "displayName": "Compile-time profile (clang, -ftime-trace)",
+      "inherits": ["_dev-base", "_clang"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_PROFILE_COMPILE": "ON" }
+    },
+
+    { "name": "ci-debug-gcc",            "displayName": "CI Debug (gcc)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "OFF" } },
+    { "name": "ci-debug-clang",          "displayName": "CI Debug (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "OFF" } },
+
+    { "name": "ci-release-gcc",          "displayName": "CI Release (gcc)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "OFF" } },
+    { "name": "ci-release-clang",        "displayName": "CI Release (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Release",        "VC_TESTING": "OFF" } },
+
+    { "name": "ci-relwithdebinfo-gcc",   "displayName": "CI RelWithDebInfo (gcc)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_TESTING": "OFF" } },
+    { "name": "ci-relwithdebinfo-clang", "displayName": "CI RelWithDebInfo (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_TESTING": "OFF" } },
+
+    { "name": "ci-profiling-gcc",        "displayName": "CI Profiling (gcc, MinSizeRel + debug info)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "MinSizeRel",     "VC_TESTING": "OFF" } },
+    { "name": "ci-profiling-clang",      "displayName": "CI Profiling (clang, MinSizeRel + debug info)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "MinSizeRel",     "VC_TESTING": "OFF" } },
+
+    { "name": "ci-tests-gcc",            "displayName": "CI Tests (gcc, Debug, tests on)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON" } },
+    { "name": "ci-tests-clang",          "displayName": "CI Tests (clang, Debug, tests on)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON" } },
+
+    { "name": "ci-asan-ubsan-gcc",       "displayName": "CI ASan + UBSan (gcc)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_ASAN": "ON", "VC_ENABLE_UBSAN": "ON" } },
+    { "name": "ci-asan-ubsan-clang",     "displayName": "CI ASan + UBSan (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_ASAN": "ON", "VC_ENABLE_UBSAN": "ON" } },
+
+    { "name": "ci-tsan-gcc",             "displayName": "CI ThreadSanitizer (gcc)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_TSAN": "ON" } },
+    { "name": "ci-tsan-clang",           "displayName": "CI ThreadSanitizer (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_TSAN": "ON" } },
+
+    { "name": "ci-tysan-clang",          "displayName": "CI TypeSanitizer (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_TYSAN": "ON" } },
+    { "name": "ci-nsan-clang",           "displayName": "CI NumericalStabilitySanitizer (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_NSAN": "ON" } },
+
+    { "name": "ci-coverage-gcc",         "displayName": "CI Coverage (gcc, gcov)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
+    { "name": "ci-coverage-clang",       "displayName": "CI Coverage (clang, source-based)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
+
+    { "name": "ci-strict-warnings-gcc",  "displayName": "CI Strict warnings + -Werror (gcc)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
+    { "name": "ci-strict-warnings-clang","displayName": "CI Strict warnings + -Werror (clang)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
+
+    { "name": "ci-dead-code-gcc",        "displayName": "CI Dead-code report (gcc, Debug, no LTO)",
+      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
+    { "name": "ci-dead-code-clang",      "displayName": "CI Dead-code report (clang, Debug, no LTO)",
+      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
+
     {
       "name": "macos-homebrew-llvm",
       "displayName": "macOS Homebrew LLVM",
-      "description": "Native macOS build using Homebrew LLVM/Clang and Homebrew dependencies.",
+      "description": "Native macOS build using Homebrew LLVM/Clang, lld, and Homebrew binutils. The only Apple-toolchain pieces in the loop are SDKROOT (system headers/frameworks) and libSystem, because there is no Homebrew alternative for those.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-macos",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "CMAKE_C_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang",
-        "CMAKE_CXX_COMPILER": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang++",
+        "CMAKE_C_COMPILER":       "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang",
+        "CMAKE_CXX_COMPILER":     "$env{HOMEBREW_PREFIX}/opt/llvm/bin/clang++",
+        "CMAKE_Fortran_COMPILER": "$env{HOMEBREW_PREFIX}/opt/flang/bin/flang",
+        "CMAKE_AR":               "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",
+        "CMAKE_RANLIB":           "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_C_COMPILER_AR":     "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",
+        "CMAKE_C_COMPILER_RANLIB": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_CXX_COMPILER_AR":     "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ar",
+        "CMAKE_CXX_COMPILER_RANLIB": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-ranlib",
+        "CMAKE_NM":      "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-nm",
+        "CMAKE_STRIP":   "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-strip",
+        "CMAKE_OBJCOPY": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-objcopy",
+        "CMAKE_OBJDUMP": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-objdump",
+        "CMAKE_READELF": "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-readobj",
+        "CMAKE_DSYMUTIL":            "$env{HOMEBREW_PREFIX}/opt/llvm/bin/dsymutil",
+        "CMAKE_INSTALL_NAME_TOOL":   "$env{HOMEBREW_PREFIX}/opt/llvm/bin/llvm-install-name-tool",
+        "CMAKE_EXE_LINKER_FLAGS_INIT":    "-fuse-ld=lld",
+        "CMAKE_SHARED_LINKER_FLAGS_INIT": "-fuse-ld=lld",
+        "CMAKE_MODULE_LINKER_FLAGS_INIT": "-fuse-ld=lld",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
-        "VC_WITH_CUDA_SPARSE": "OFF",
-        "VC_WITH_PASTIX": "OFF",
-        "VC_USE_OPENMP": "OFF",
-        "VC_BUILD_TESTS": "OFF"
+        "VC_TESTING": "OFF"
       }
     }
   ],
+
   "buildPresets": [
+    { "name": "dev-gcc",                  "configurePreset": "dev-gcc" },
+    { "name": "dev-clang",                "configurePreset": "dev-clang" },
+    { "name": "dev-profile-clang",        "configurePreset": "dev-profile-clang" },
+
+    { "name": "ci-debug-gcc",             "configurePreset": "ci-debug-gcc" },
+    { "name": "ci-debug-clang",           "configurePreset": "ci-debug-clang" },
+    { "name": "ci-release-gcc",           "configurePreset": "ci-release-gcc" },
+    { "name": "ci-release-clang",         "configurePreset": "ci-release-clang" },
+    { "name": "ci-relwithdebinfo-gcc",    "configurePreset": "ci-relwithdebinfo-gcc" },
+    { "name": "ci-relwithdebinfo-clang",  "configurePreset": "ci-relwithdebinfo-clang" },
+    { "name": "ci-profiling-gcc",         "configurePreset": "ci-profiling-gcc" },
+    { "name": "ci-profiling-clang",       "configurePreset": "ci-profiling-clang" },
+    { "name": "ci-tests-gcc",             "configurePreset": "ci-tests-gcc" },
+    { "name": "ci-tests-clang",           "configurePreset": "ci-tests-clang" },
+    { "name": "ci-asan-ubsan-gcc",        "configurePreset": "ci-asan-ubsan-gcc" },
+    { "name": "ci-asan-ubsan-clang",      "configurePreset": "ci-asan-ubsan-clang" },
+    { "name": "ci-tsan-gcc",              "configurePreset": "ci-tsan-gcc" },
+    { "name": "ci-tsan-clang",            "configurePreset": "ci-tsan-clang" },
+    { "name": "ci-tysan-clang",           "configurePreset": "ci-tysan-clang" },
+    { "name": "ci-nsan-clang",            "configurePreset": "ci-nsan-clang" },
+    { "name": "ci-coverage-gcc",          "configurePreset": "ci-coverage-gcc" },
+    { "name": "ci-coverage-clang",        "configurePreset": "ci-coverage-clang" },
+    { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc" },
+    { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" },
+    { "name": "ci-dead-code-gcc",         "configurePreset": "ci-dead-code-gcc" },
+    { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" }
+  ],
+
+  "testPresets": [
     {
-      "name": "macos-homebrew-llvm",
-      "displayName": "Build macOS Homebrew LLVM",
-      "configurePreset": "macos-homebrew-llvm",
-      "jobs": 8
-    }
+      "name": "_test-base",
+      "hidden": true,
+      "output": { "outputOnFailure": true, "verbosity": "default" },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    { "name": "ci-tests-gcc",             "configurePreset": "ci-tests-gcc",            "inherits": "_test-base" },
+    { "name": "ci-tests-clang",           "configurePreset": "ci-tests-clang",          "inherits": "_test-base" },
+    { "name": "ci-asan-ubsan-gcc",        "configurePreset": "ci-asan-ubsan-gcc",       "inherits": "_test-base" },
+    { "name": "ci-asan-ubsan-clang",      "configurePreset": "ci-asan-ubsan-clang",     "inherits": "_test-base" },
+    { "name": "ci-tsan-gcc",              "configurePreset": "ci-tsan-gcc",             "inherits": "_test-base" },
+    { "name": "ci-tsan-clang",            "configurePreset": "ci-tsan-clang",           "inherits": "_test-base" },
+    { "name": "ci-tysan-clang",           "configurePreset": "ci-tysan-clang",          "inherits": "_test-base" },
+    { "name": "ci-nsan-clang",            "configurePreset": "ci-nsan-clang",           "inherits": "_test-base",
+      "environment": { "NSAN_OPTIONS": "halt_on_error=0:print_stats_on_exit=1" } },
+    { "name": "ci-coverage-gcc",          "configurePreset": "ci-coverage-gcc",         "inherits": "_test-base" },
+    { "name": "ci-coverage-clang",        "configurePreset": "ci-coverage-clang",       "inherits": "_test-base" },
+    { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc",  "inherits": "_test-base" },
+    { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang","inherits": "_test-base" }
   ]
 }

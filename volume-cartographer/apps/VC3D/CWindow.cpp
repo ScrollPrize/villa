@@ -52,6 +52,7 @@
 #include <cctype>
 #include <utility>
 #include <filesystem>
+#include <system_error>
 #include <vector>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -192,6 +193,26 @@ QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>&
             : QObject::tr("%1 normal3d zarr(s) tagged").arg(candidates.size());
     }
     return candidates;
+}
+
+QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath,
+                                        const std::shared_ptr<VolumePkg>& pkg)
+{
+    auto path = segmentPath;
+    if (!path.is_absolute() && pkg) {
+        const auto projectPath = pkg->path();
+        const auto projectDir = projectPath.has_parent_path()
+            ? projectPath.parent_path()
+            : std::filesystem::current_path();
+        path = projectDir / path;
+    }
+
+    std::error_code ec;
+    const auto absolutePath = std::filesystem::absolute(path, ec);
+    if (!ec) {
+        path = absolutePath;
+    }
+    return QString::fromStdString(path.lexically_normal().string());
 }
 
 constexpr float kEpsilon = 1e-6f;
@@ -452,6 +473,13 @@ CWindow::CWindow(size_t cacheSizeGB) :
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
+    // Wire the Actions -> Merge tifxyz... menu entry to the handler.
+    // Has to happen here (not inside CreateWidgets) because
+    // _menuController is created after CreateWidgets() returns.
+    connect(_menuController.get(), &MenuActionController::mergeTifxyzFromMenuRequested,
+            this, [this]() {
+                _segmentationCommandHandler->onMergeTifxyz(QStringList{});
+            });
 
     if (isDarkMode()) {
         applyDarkPalette();
@@ -1452,7 +1480,7 @@ void CWindow::CreateWidgets(void)
                 if (!surf) {
                     return;
                 }
-                const QString path = QString::fromStdString(surf->path.string());
+                const QString path = absoluteSegmentPathForClipboard(surf->path, _state->vpkg());
                 QApplication::clipboard()->setText(path);
                 statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
@@ -1480,6 +1508,13 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::mergeTifxyzRequested,
+            this, [this](const QStringList& segmentIds) {
+                _segmentationCommandHandler->onMergeTifxyz(segmentIds);
+            });
+    // Note: the Actions -> Merge tifxyz... menu wiring lives in the
+    // constructor after _menuController is initialized -- _menuController
+    // is null inside CreateWidgets().
     connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
             this, [this](const QString& segmentId) {
                 onVisLasagnaObj(segmentId.toStdString());
@@ -2195,6 +2230,21 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
+    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
+        bool moveOnSurfaceChanged = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
+        QSignalBlocker blocker(chkMoveOnSurfaceChanged);
+        chkMoveOnSurfaceChanged->setChecked(moveOnSurfaceChanged);
+        connect(chkMoveOnSurfaceChanged, &QCheckBox::toggled, this, &CWindow::onMoveOnSurfaceChangedToggled);
+    }
+    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
+        bool showPlaneIntersectionLines = settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
+                                                         vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
+        QSignalBlocker blocker(chkPlaneIntersectionLines);
+        chkPlaneIntersectionLines->setChecked(showPlaneIntersectionLines);
+        connect(chkPlaneIntersectionLines, &QCheckBox::toggled,
+                this, &CWindow::onPlaneIntersectionLinesToggled);
+    }
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                                            spinAxisOverlayOpacity->value()).toInt();
@@ -2229,14 +2279,11 @@ void CWindow::CreateWidgets(void)
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-
-    bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
-                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
-    if (_viewerManager) {
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            viewer->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
-            _viewerManager->setResetDefaultFor(viewer, resetViewOnSurfaceChange);
-        }
+    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
+        onMoveOnSurfaceChangedToggled(chkMoveOnSurfaceChanged->isChecked());
+    }
+    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
+        onPlaneIntersectionLinesToggled(chkPlaneIntersectionLines->isChecked());
     }
 
 }
@@ -2803,31 +2850,38 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         _axisAlignedSliceController->resetAll();
     }
 
-    if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-        try {
-            quadSurf->ensureLoaded();
-            const cv::Vec3f worldCenter = quadSurf->coord({0, 0, 0}, {0, 0, 0});
-            const bool centerValid = std::isfinite(worldCenter[0])
-                && std::isfinite(worldCenter[1])
-                && std::isfinite(worldCenter[2])
-                && worldCenter[0] >= 0.0f;
-            if (centerValid) {
-                if (auto vol = _state->currentVolume()) {
-                    auto [w, h, d] = vol->shapeXyz();
-                    cv::Vec3f clamped = worldCenter;
-                    clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
-                    clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
-                    clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
-                    POI* poi = new POI;
-                    poi->p = clamped;
-                    poi->n = cv::Vec3f(0, 0, 0);
-                    poi->surfaceId = newSurfId;
-                    _state->setPOI("focus", poi);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const bool moveOnSurfaceChange =
+        settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                       vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
+
+    if (moveOnSurfaceChange) {
+        if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
+            try {
+                quadSurf->ensureLoaded();
+                const cv::Vec3f worldCenter = quadSurf->coord({0, 0, 0}, {0, 0, 0});
+                const bool centerValid = std::isfinite(worldCenter[0])
+                    && std::isfinite(worldCenter[1])
+                    && std::isfinite(worldCenter[2])
+                    && worldCenter[0] >= 0.0f;
+                if (centerValid) {
+                    if (auto vol = _state->currentVolume()) {
+                        auto [w, h, d] = vol->shapeXyz();
+                        cv::Vec3f clamped = worldCenter;
+                        clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+                        clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+                        clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+                        POI* poi = new POI;
+                        poi->p = clamped;
+                        poi->n = cv::Vec3f(0, 0, 0);
+                        poi->surfaceId = newSurfId;
+                        _state->setPOI("focus", poi);
+                    }
                 }
+            } catch (const std::exception& e) {
+                qWarning() << "Could not compute world center for"
+                           << surfaceId << ":" << e.what();
             }
-        } catch (const std::exception& e) {
-            qWarning() << "Could not compute world center for"
-                       << surfaceId << ":" << e.what();
         }
     }
 
@@ -3340,6 +3394,45 @@ void CWindow::onAxisAlignedSlicesToggled(bool enabled)
     _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays, ui.spinAxisOverlayOpacity);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
+}
+
+void CWindow::onMoveOnSurfaceChangedToggled(bool enabled)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE, enabled ? "1" : "0");
+
+    if (!_viewerManager) {
+        return;
+    }
+
+    const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
+    _viewerManager->forEachBaseViewer([this, enabled, editingActive](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        _viewerManager->setResetDefaultFor(viewer, enabled);
+        if (editingActive && viewer->surfName() == "segmentation") {
+            viewer->setResetViewOnSurfaceChange(false);
+            return;
+        }
+        viewer->setResetViewOnSurfaceChange(enabled);
+    });
+}
+
+void CWindow::onPlaneIntersectionLinesToggled(bool enabled)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES, enabled ? "1" : "0");
+
+    if (!_viewerManager) {
+        return;
+    }
+
+    _viewerManager->forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setPlaneIntersectionLinesVisible(enabled);
+        }
+    });
 }
 
 void CWindow::onSegmentationEditingModeChanged(bool enabled)

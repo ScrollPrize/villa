@@ -140,7 +140,7 @@ cv::Vec3d SurfTrackerData::lookup_int(QuadSurface *sm, const cv::Vec2i& p)
         return {-1, -1, -1};
     else {
         cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
-        cv::Vec2i li = {floor(l[0]), floor(l[1])};
+        cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
         if (bounds.contains(cv::Point(li)))
             return at_int_inv(sm->rawPoints(), l);
         else
@@ -158,7 +158,7 @@ bool SurfTrackerData::valid_int(QuadSurface *sm, const cv::Vec2i& p)
         return false;
     else {
         cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
-        cv::Vec2i li = {floor(l[0]), floor(l[1])};
+        cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
         if (bounds.contains(cv::Point(li)))
         {
             if (sm->rawPoints()(li[0], li[1])[0] == -1)

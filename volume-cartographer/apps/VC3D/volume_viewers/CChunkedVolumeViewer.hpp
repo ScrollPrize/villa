@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QPointF>
+#include <QPointer>
 #include <QWidget>
 
 #include <algorithm>
@@ -90,6 +91,7 @@ public:
     void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; scheduleRender("setBaseColormap"); }
     void setStretchValues(bool) { if (_closing) return; scheduleRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
+    void setPlaneIntersectionLinesVisible(bool visible) override;
 
     void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
@@ -268,7 +270,7 @@ private:
     QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
 
     CState* _state = nullptr;
-    ViewerManager* _viewerManager = nullptr;
+    QPointer<ViewerManager> _viewerManager;
     VCCollection* _pointCollection = nullptr;
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
@@ -348,6 +350,7 @@ private:
 
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
+    bool _planeIntersectionLinesVisible = true;
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
@@ -357,6 +360,7 @@ private:
     float _normalArrowLengthScale = 1.0f;
     int _normalMaxArrows = 32;
     bool _surfaceOverlayEnabled = false;
+    bool _initializedFirstSegmentationSurface = false;
     std::map<std::string, cv::Vec3b> _surfaceOverlays;
     float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;

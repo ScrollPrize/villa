@@ -358,12 +358,15 @@ static std::vector<std::byte> decompress_blosc(const std::vector<std::byte>& com
     std::memcpy(&nbytes, reinterpret_cast<const char*>(compressed.data()) + 4, 4);
 
     std::vector<std::byte> output(nbytes);
-    int ret = blosc_decompress(
+    // _ctx variant: lock-free, parallelizable. The non-ctx blosc_decompress
+    // takes a global lock that serializes every chunk in the program.
+    int ret = blosc_decompress_ctx(
         reinterpret_cast<const void*>(compressed.data()),
         reinterpret_cast<void*>(output.data()),
-        nbytes);
+        nbytes,
+        /*nthreads=*/1);
     if (ret < 0) {
-        throw std::runtime_error("blosc_decompress failed: " + std::to_string(ret));
+        throw std::runtime_error("blosc_decompress_ctx failed: " + std::to_string(ret));
     }
     output.resize(ret);
     return output;

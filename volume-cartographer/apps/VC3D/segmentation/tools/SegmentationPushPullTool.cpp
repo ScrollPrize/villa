@@ -41,7 +41,6 @@ constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
 constexpr float kAlphaDefaultHighDelta = 0.05f;
-constexpr float kAlphaBorderLimit = 20.0f;
 constexpr int kAlphaBlurRadiusMax = 15;
 constexpr float kAlphaPerVertexLimitMax = 128.0f;
 constexpr std::size_t kAlphaPerVertexMaxSamples = 512;
@@ -462,7 +461,6 @@ AlphaPushPullConfig SegmentationPushPullTool::sanitizeConfig(const AlphaPushPull
         sanitized.high = std::min(1.0f, sanitized.low + kAlphaDefaultHighDelta);
     }
 
-    sanitized.borderOffset = std::clamp(sanitized.borderOffset, -kAlphaBorderLimit, kAlphaBorderLimit);
     sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, kAlphaBlurRadiusMax);
     sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, kAlphaPerVertexLimitMax);
 
@@ -476,7 +474,6 @@ bool SegmentationPushPullTool::configsEqual(const AlphaPushPullConfig& lhs, cons
            nearlyEqual(lhs.step, rhs.step) &&
            nearlyEqual(lhs.low, rhs.low) &&
            nearlyEqual(lhs.high, rhs.high) &&
-           nearlyEqual(lhs.borderOffset, rhs.borderOffset) &&
            lhs.blurRadius == rhs.blurRadius &&
            nearlyEqual(lhs.perVertexLimit, rhs.perVertexLimit) &&
            lhs.perVertex == rhs.perVertex;
@@ -613,12 +610,13 @@ void SegmentationPushPullTool::stopAll()
 
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _state) {
+        const auto editedVerts = _editManager->editedVertices();
+
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)_module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
-            const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 // Get drag center from the cached row/col if available
                 std::optional<std::pair<int, int>> dragCenter;
@@ -633,6 +631,8 @@ void SegmentationPushPullTool::stopAll()
         _editManager->applyPreview();
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         _module.emitPendingChanges();
+        _module.queueAutosaveVertexUpdates(editedVerts);
+        _module.markAutosaveNeeded();
     }
 
     if (wasActive) {
@@ -819,15 +819,12 @@ void SegmentationPushPullTool::launchAlphaCompute()
         return;
     }
 
-    // Capture all inputs needed by the background thread on the main thread
+    // Capture all inputs needed by the background thread on the main thread.
+    // Alpha push/pull is an editing interaction against the displayed volume,
+    // not the growth volume selected in the segmentation widget.
     std::shared_ptr<Volume> volume = hover.viewer->currentVolume();
-    if (_state && _state->vpkg()) {
-        const std::string selectedVolumeId = _state->segmentationGrowthVolumeId().empty()
-            ? _state->currentVolumeId()
-            : _state->segmentationGrowthVolumeId();
-        if (!selectedVolumeId.empty() && _state->vpkg()->hasVolume(selectedVolumeId)) {
-            volume = _state->vpkg()->volume(selectedVolumeId);
-        }
+    if (!volume && _state) {
+        volume = _state->currentVolume();
     }
     if (!volume) {
         failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active volume to sample."));
@@ -1308,14 +1305,13 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
         return std::nullopt;
     }
 
-    const float totalOffset = expected + cfg.borderOffset;
-    if (!std::isfinite(totalOffset) || totalOffset <= 0.0f) {
+    if (expected <= 0.0f) {
         setAlphaNoTargetReason(outNoTargetReason,
                                "Alpha push/pull target is at or behind the current surface.");
         return std::nullopt;
     }
 
-    const cv::Vec3f targetWorld = centerWorld + orientedNormal * totalOffset;
+    const cv::Vec3f targetWorld = centerWorld + orientedNormal * expected;
     if (!std::isfinite(targetWorld[0]) || !std::isfinite(targetWorld[1]) || !std::isfinite(targetWorld[2])) {
         setAlphaNoTargetReason(outNoTargetReason,
                                "Alpha push/pull computed a non-finite target position.");

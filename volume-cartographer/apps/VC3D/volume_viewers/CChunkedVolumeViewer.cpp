@@ -153,6 +153,11 @@ std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
     return "local|" + path.string() + "|id=" + volume->id();
 }
 
+bool shouldSpeculativelyPrefetchVolume(const std::shared_ptr<Volume>& volume)
+{
+    return volume && volume->isRemote();
+}
+
 uint32_t alphaBlendArgb(uint32_t base, uint32_t overlay, float alpha)
 {
     const float a = std::clamp(alpha, 0.0f, 1.0f);
@@ -478,20 +483,29 @@ float scaleForCoarsestPlaneRenderLevel(int numLevels)
     return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
 }
 
+float scaleForCoarsestSegmentationRenderLevel(int numLevels)
+{
+    const int coarsestLevel = std::max(0, numLevels - 1);
+    const float dsScale = static_cast<float>(std::uint64_t{1} << coarsestLevel);
+    return std::clamp(0.75f / (dsScale * kSegmentationResolutionLodZoomBias), kMinScale, kMaxScale);
+}
+
 std::filesystem::path remoteCacheRootForState(const CState* state)
 {
+    // Suggestion order: per-volpkg setting first (so projects with an
+    // explicit cache stay co-located when no host mount is present), then
+    // the user's persisted setting. remoteCachePath() ignores both when
+    // /volpkgs or /ephemeral is mounted.
+    QString suggestion;
     if (state && state->vpkg()) {
-        const auto projectCache = state->vpkg()->remoteCacheRootOrEmpty();
-        if (!projectCache.empty()) {
-            return projectCache;
-        }
+        suggestion = QString::fromStdString(state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
     }
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
-    return settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache)
-        .toString()
-        .toStdString();
+    if (suggestion.isEmpty()) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        suggestion =
+            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR).toString();
+    }
+    return vc3d::remoteCachePath(suggestion).toStdString();
 }
 
 std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
@@ -506,6 +520,7 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
         ? decodedByteCapacity
         : streamingCacheCapacityBytes(nullptr);
     options.maxConcurrentReads = 16;
+    options.detectAllFillChunks = volume->isRemote();
     if (volume->isRemote()) {
         const auto cacheRoot = remoteCacheRootForState(state);
         options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
@@ -813,6 +828,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     if (_closing) {
         return;
     }
+    const bool hadVolume = static_cast<bool>(_volume);
     invalidateIntersect();
     if (_surfWeak.lock() == _defaultSurface) {
         _surfWeak.reset();
@@ -836,7 +852,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     _volume = std::move(vol);
     rebuildChunkArray();
     ensureDefaultSurface();
-    if (_volume && isAxisAlignedView()) {
+    if (_volume && isAxisAlignedView() && !hadVolume) {
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : static_cast<int>(_volume->numScales());
         _scale = scaleForCoarsestPlaneRenderLevel(n);
@@ -915,6 +931,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         if (isIntersectionTarget) {
             if (!isEditUpdate) {
                 invalidateIntersect(name);
+                renderIntersections("intersection target surface changed");
             } else {
                 _lastIntersectFp = {};
                 if (_deferSegmentationIntersections && name == "segmentation" &&
@@ -923,10 +940,18 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                     _deferredSegmentationIntersectionsDirty = true;
                     return;
                 }
+                scheduleIntersectionRender("intersection target surface changed");
             }
-            scheduleIntersectionRender("intersection target surface changed");
         }
         return;
+    }
+
+    std::optional<cv::Vec3f> preservedViewCenter;
+    if (!isEditUpdate && !_resetViewOnSurfaceChange && _surfName == "segmentation" &&
+        surf && previousSurface && _view && !_framebuffer.isNull()) {
+        const QPointF sceneCenter(static_cast<qreal>(_framebuffer.width()) * 0.5,
+                                  static_cast<qreal>(_framebuffer.height()) * 0.5);
+        preservedViewCenter = cursorVolumePosition(sceneCenter);
     }
 
     _surfWeak = surf;
@@ -959,8 +984,18 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         return;
     }
     updateContentBounds();
-    if (!isEditUpdate && _resetViewOnSurfaceChange && _surfName == "segmentation" &&
-        dynamic_cast<QuadSurface*>(surf.get())) {
+    const bool isSegmentationQuadSurface =
+        _surfName == "segmentation" && dynamic_cast<QuadSurface*>(surf.get());
+    if (!isEditUpdate && isSegmentationQuadSurface && !_initializedFirstSegmentationSurface) {
+        _surfacePtrX = 0.0f;
+        _surfacePtrY = 0.0f;
+        _zOff = 0.0f;
+        const int n = _chunkArray ? _chunkArray->numLevels()
+                                  : (_volume ? static_cast<int>(_volume->numScales()) : 1);
+        _scale = scaleForCoarsestSegmentationRenderLevel(n);
+        recalcPyramidLevel();
+        _initializedFirstSegmentationSurface = true;
+    } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         _surfacePtrX = 0.0f;
         _surfacePtrY = 0.0f;
         _zOff = 0.0f;
@@ -968,10 +1003,28 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
         recalcPyramidLevel();
+    } else if (preservedViewCenter) {
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+            const cv::Vec3f projected = plane->project(*preservedViewCenter, 1.0, 1.0);
+            if (std::isfinite(projected[0]) && std::isfinite(projected[1])) {
+                _surfacePtrX = projected[0];
+                _surfacePtrY = projected[1];
+            }
+        } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+            cv::Vec3f ptr = quad->pointer();
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            if (quad->pointTo(ptr, *preservedViewCenter, 4.0f, 100, patchIndex) >= 0.0f) {
+                const cv::Vec3f loc = quad->loc(ptr);
+                if (std::isfinite(loc[0]) && std::isfinite(loc[1])) {
+                    _surfacePtrX = loc[0];
+                    _surfacePtrY = loc[1];
+                }
+            }
+        }
     }
     updateFocusMarker();
     scheduleRender("current surface changed");
-    scheduleIntersectionRender("current surface changed");
+    renderIntersections("current surface changed");
 }
 
 void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std::shared_ptr<Surface>& surf)
@@ -1562,7 +1615,10 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
-    if (!_chunkArray || _interactivePreview || _framebuffer.isNull())
+    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
+    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    if (_interactivePreview || _framebuffer.isNull() ||
+        (!prefetchBase && !prefetchOverlay))
         return;
 
     const int fbW = _framebuffer.width();
@@ -1585,20 +1641,22 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
         uniqueKeys.insert(keys.begin(), keys.end());
     };
 
-    collect(*_chunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
-            expandedW, halo);
-    collect(*_chunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
-            expandedW, halo);
-    collect(*_chunkArray, origin - vxStep * float(halo), halo, fbH);
-    collect(*_chunkArray, origin + vxStep * float(fbW), halo, fbH);
-
     std::vector<vc::render::ChunkKey> keys;
-    keys.reserve(uniqueKeys.size());
-    for (const auto& key : uniqueKeys)
-        keys.push_back(key);
-    _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    if (prefetchBase && _chunkArray) {
+        collect(*_chunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
+                expandedW, halo);
+        collect(*_chunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
+                expandedW, halo);
+        collect(*_chunkArray, origin - vxStep * float(halo), halo, fbH);
+        collect(*_chunkArray, origin + vxStep * float(fbW), halo, fbH);
 
-    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+        keys.reserve(uniqueKeys.size());
+        for (const auto& key : uniqueKeys)
+            keys.push_back(key);
+        _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    }
+
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
         return;
     uniqueKeys.clear();
     collect(*_overlayChunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
@@ -1619,7 +1677,9 @@ void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
-    if (!_chunkArray || _framebuffer.isNull())
+    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
+    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    if (_framebuffer.isNull() || (!prefetchBase && !prefetchOverlay))
         return;
 
     const int fbW = _framebuffer.width();
@@ -1692,12 +1752,12 @@ void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
         array.prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
     };
 
-    if (_chunkArray->numLevels() <= 0)
-        return;
-    startLevel = std::clamp(startLevel, 0, _chunkArray->numLevels() - 1);
-    collect(*_chunkArray, startLevel, chunkDistance(*_chunkArray, startLevel));
+    if (prefetchBase && _chunkArray && _chunkArray->numLevels() > 0) {
+        startLevel = std::clamp(startLevel, 0, _chunkArray->numLevels() - 1);
+        collect(*_chunkArray, startLevel, chunkDistance(*_chunkArray, startLevel));
+    }
 
-    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
         return;
     if (_overlayChunkArray->numLevels() <= 0)
         return;
@@ -1712,7 +1772,10 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
     int fbW,
     int fbH)
 {
-    if (!_chunkArray || _interactivePreview || fbW <= 0 || fbH <= 0)
+    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
+    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    if (_interactivePreview || fbW <= 0 || fbH <= 0 ||
+        (!prefetchBase && !prefetchOverlay))
         return;
 
     const int halo = kChunkPrefetchHaloPx;
@@ -1743,18 +1806,20 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
         uniqueKeys.insert(keys.begin(), keys.end());
     };
 
-    collect(*_chunkArray, -halo, -halo, fbW + 2 * halo, halo);
-    collect(*_chunkArray, -halo, fbH, fbW + 2 * halo, halo);
-    collect(*_chunkArray, -halo, 0, halo, fbH);
-    collect(*_chunkArray, fbW, 0, halo, fbH);
-
     std::vector<vc::render::ChunkKey> keys;
-    keys.reserve(uniqueKeys.size());
-    for (const auto& key : uniqueKeys)
-        keys.push_back(key);
-    _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    if (prefetchBase && _chunkArray) {
+        collect(*_chunkArray, -halo, -halo, fbW + 2 * halo, halo);
+        collect(*_chunkArray, -halo, fbH, fbW + 2 * halo, halo);
+        collect(*_chunkArray, -halo, 0, halo, fbH);
+        collect(*_chunkArray, fbW, 0, halo, fbH);
 
-    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+        keys.reserve(uniqueKeys.size());
+        for (const auto& key : uniqueKeys)
+            keys.push_back(key);
+        _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+    }
+
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
         return;
     uniqueKeys.clear();
     collect(*_overlayChunkArray, -halo, -halo, fbW + 2 * halo, halo);
@@ -1770,7 +1835,8 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
 
 void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
 {
-    if (!_chunkArray || _framebuffer.isNull() || _framebuffer.width() <= 0 ||
+    if (!shouldSpeculativelyPrefetchVolume(_volume) ||
+        !_chunkArray || _framebuffer.isNull() || _framebuffer.width() <= 0 ||
         _framebuffer.height() <= 0) {
         return;
     }
@@ -3308,6 +3374,27 @@ void CChunkedVolumeViewer::setIntersects(const std::set<std::string>& names)
     renderIntersections("setIntersects");
 }
 
+void CChunkedVolumeViewer::setPlaneIntersectionLinesVisible(bool visible)
+{
+    if (_closing || _planeIntersectionLinesVisible == visible) {
+        return;
+    }
+    _planeIntersectionLinesVisible = visible;
+    _lastIntersectFp = {};
+    auto surf = _surfWeak.lock();
+    const bool isPlaneViewer = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
+    if (!visible && !isPlaneViewer) {
+        clearIntersectionItems();
+        if (_view) {
+            _view->viewport()->update();
+        }
+        return;
+    }
+    if (visible && !isPlaneViewer) {
+        renderIntersections("setPlaneIntersectionLinesVisible");
+    }
+}
+
 void CChunkedVolumeViewer::setIntersectionOpacity(float v)
 {
     if (_closing) {
@@ -3869,6 +3956,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
     if (!plane) {
+        if (!_planeIntersectionLinesVisible) {
+            clearIntersectionItems();
+            _lastIntersectFp = {};
+            profile.setDetails("action=skip flattened_disabled");
+            return;
+        }
         renderFlattenedIntersections(surf, reason, caller);
         profile.setDetails("action=delegated_flattened");
         return;

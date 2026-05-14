@@ -94,6 +94,7 @@ public:
         std::vector<ManualAddLine> manualAddHoverLines;
         std::vector<ManualAddLine> manualAddCommittedLines;
         std::optional<QPointF> manualAddHoverVertex;
+        std::vector<QPointF> manualAddHoverFillVertices;
         bool manualAddHoverCrossFill{false};
         std::vector<cv::Vec3f> manualAddPreviewVertices;
         std::vector<std::array<cv::Vec3f, 4>> manualAddPreviewQuads;
@@ -247,9 +248,8 @@ private:
         bool isAutoApproval{false};  // True if this was auto-approval from surface edit
     };
     std::deque<ApprovalMaskUndoEntry> _approvalMaskUndoStack;
-    // Match segmentation undo history size (SegmentationUndoHistory::kMaxEntries = 1000)
-    // to keep auto-approval undo in sync with surface edit undo
-    static constexpr size_t kMaxUndoEntries = 1000;
+    // Match segmentation undo history size to keep auto-approval undo in sync.
+    static constexpr size_t kMaxUndoEntries = 10;
 
     // Debounce timer for auto-saving approval mask after painting
     QTimer* _approvalSaveTimer{nullptr};
