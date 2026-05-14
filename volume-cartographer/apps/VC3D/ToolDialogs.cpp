@@ -1473,8 +1473,8 @@ int ABFFlattenDialog::downsampleFactor() const
 
 // ================= SlimFlattenDialog =================
 bool SlimFlattenDialog::s_haveSession = false;
-int SlimFlattenDialog::s_iterations = 20;
-double SlimFlattenDialog::s_tolerance = 0.0;
+int SlimFlattenDialog::s_iterations = 50;
+double SlimFlattenDialog::s_tolerance = 1e-5;
 QString SlimFlattenDialog::s_energy = QStringLiteral("symmetric_dirichlet");
 
 SlimFlattenDialog::SlimFlattenDialog(QWidget* parent)
@@ -1487,16 +1487,17 @@ SlimFlattenDialog::SlimFlattenDialog(QWidget* parent)
 
     spIterations_ = new QSpinBox(this);
     spIterations_->setRange(1, 5000);
-    spIterations_->setValue(s_haveSession ? s_iterations : 20);
-    spIterations_->setToolTip(tr("Maximum SLIM iterations (also the cap when a tolerance is set)."));
+    spIterations_->setValue(s_haveSession ? s_iterations : 50);
+    spIterations_->setToolTip(tr("Maximum SLIM iterations. Acts as a cap when tolerance > 0."));
     form->addRow(tr("Max iterations:"), spIterations_);
 
     spTolerance_ = new QDoubleSpinBox(this);
     spTolerance_->setDecimals(8);
     spTolerance_->setRange(0.0, 1.0);
     spTolerance_->setSingleStep(1e-5);
-    spTolerance_->setValue(s_haveSession ? s_tolerance : 0.0);
-    spTolerance_->setToolTip(tr("Relative-energy early-stop threshold (ΔE/E). 0 disables early stop."));
+    spTolerance_->setValue(s_haveSession ? s_tolerance : 1e-5);
+    spTolerance_->setToolTip(tr("Relative-energy early-stop threshold (ΔE/E). 0 disables early stop; "
+                                 "1e-5 is the default and typically stops after ~5–15 iters."));
     form->addRow(tr("Convergence tolerance:"), spTolerance_);
 
     cbEnergy_ = new QComboBox(this);
