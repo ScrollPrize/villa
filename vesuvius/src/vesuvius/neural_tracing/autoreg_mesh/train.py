@@ -796,6 +796,14 @@ def _evaluate_rollout_validation(
 
 
 def _scheduled_sampling_prob(cfg: dict, *, global_step: int) -> float:
+    """Two-phase linear schedule for scheduled sampling probability.
+
+    Phase 1: 0 -> max_prob over [start_step, start_step + ramp_steps].
+    Phase 2 (optional, when max_prob_late is set):
+        max_prob -> max_prob_late over [late_start_step, late_start_step + late_ramp_steps].
+    `late_start_step` defaults to the end of phase 1 (start_step + ramp_steps).
+    Without the late knobs the helper reduces to the original single ramp.
+    """
     if not bool(cfg.get("scheduled_sampling_enabled", False)):
         return 0.0
     start_step = int(cfg.get("scheduled_sampling_start_step", 0))
@@ -804,9 +812,23 @@ def _scheduled_sampling_prob(cfg: dict, *, global_step: int) -> float:
     max_prob = float(cfg.get("scheduled_sampling_max_prob", 0.0))
     ramp_steps = int(cfg.get("scheduled_sampling_ramp_steps", 0))
     if ramp_steps <= 0:
-        return max_prob
-    progress = min(1.0, max(0.0, float(global_step - start_step) / float(ramp_steps)))
-    return max_prob * progress
+        phase1_prob = max_prob
+    else:
+        phase1_prob = max_prob * min(1.0, max(0.0, float(global_step - start_step) / float(ramp_steps)))
+
+    late_max_raw = cfg.get("scheduled_sampling_max_prob_late")
+    if late_max_raw is None:
+        return phase1_prob
+    late_max = float(late_max_raw)
+    late_start_raw = cfg.get("scheduled_sampling_late_start_step")
+    late_start = int(late_start_raw) if late_start_raw is not None else start_step + max(ramp_steps, 0)
+    if global_step < late_start:
+        return phase1_prob
+    late_ramp = int(cfg.get("scheduled_sampling_late_ramp_steps", 0))
+    if late_ramp <= 0 or global_step >= late_start + late_ramp:
+        return late_max
+    progress = float(global_step - late_start) / float(late_ramp)
+    return max_prob + (late_max - max_prob) * progress
 
 
 def _position_refine_weight_active(cfg: dict, *, global_step: int) -> float:

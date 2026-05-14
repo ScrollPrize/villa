@@ -141,6 +141,14 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "scheduled_sampling_max_prob": 0.10,
     "scheduled_sampling_start_step": 0,
     "scheduled_sampling_ramp_steps": 0,
+    # Optional second phase: ramp from max_prob -> max_prob_late over
+    # late_ramp_steps starting at late_start_step. When max_prob_late is
+    # None the helper falls back to the single-ramp legacy behaviour.
+    # late_start_step=None means "right after the first ramp finishes"
+    # (start_step + ramp_steps).
+    "scheduled_sampling_max_prob_late": None,
+    "scheduled_sampling_late_start_step": None,
+    "scheduled_sampling_late_ramp_steps": 0,
     # Periodic rollout-in-loop training step. On every
     # rollout_in_loop_frequency steps (after rollout_in_loop_start_step),
     # the training step runs `rollout_in_loop_iterations` no-grad warmup
@@ -380,6 +388,32 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("scheduled_sampling_start_step must be >= 0")
     if int(cfg["scheduled_sampling_ramp_steps"]) < 0:
         raise ValueError("scheduled_sampling_ramp_steps must be >= 0")
+    # Optional late-phase ramp: validate consistency. When max_prob_late is
+    # set it must NOT regress the schedule (i.e. >= max_prob), and the late
+    # phase must START at or after the first phase finishes so we never
+    # retroactively boost an already-trained region.
+    late_max_raw = cfg.get("scheduled_sampling_max_prob_late")
+    if late_max_raw is not None:
+        late_max = float(late_max_raw)
+        if late_max < 0.0 or late_max > 1.0:
+            raise ValueError("scheduled_sampling_max_prob_late must be within [0, 1]")
+        if late_max < float(cfg["scheduled_sampling_max_prob"]):
+            raise ValueError(
+                "scheduled_sampling_max_prob_late must be >= scheduled_sampling_max_prob "
+                "(the second phase only boosts the curriculum, it does not regress it)"
+            )
+        cfg["scheduled_sampling_max_prob_late"] = late_max
+    late_start_raw = cfg.get("scheduled_sampling_late_start_step")
+    if late_start_raw is not None:
+        late_start = int(late_start_raw)
+        first_phase_end = int(cfg["scheduled_sampling_start_step"]) + int(cfg["scheduled_sampling_ramp_steps"])
+        if late_start < first_phase_end:
+            raise ValueError(
+                f"scheduled_sampling_late_start_step ({late_start}) must be >= start_step + ramp_steps ({first_phase_end})"
+            )
+        cfg["scheduled_sampling_late_start_step"] = late_start
+    if int(cfg["scheduled_sampling_late_ramp_steps"]) < 0:
+        raise ValueError("scheduled_sampling_late_ramp_steps must be >= 0")
     if not isinstance(cfg["rollout_in_loop_enabled"], bool):
         raise ValueError("rollout_in_loop_enabled must be a boolean")
     if int(cfg["rollout_in_loop_frequency"]) <= 0:
