@@ -364,7 +364,8 @@ def _height_map_splat(
 	sigma: float,
 	D: int, Hm: int, Wm: int,
 	H_map: torch.Tensor,          # (D, Hm, Wm) — accumulator (mutated in place)
-	W_map: torch.Tensor,          # (D, Hm, Wm) — accumulator (mutated in place)
+	W_map: torch.Tensor,          # (D, Hm, Wm) — sum-weight accumulator (mutated in place)
+	W_max_map: torch.Tensor,      # (D, Hm, Wm) — max single-point weight (mutated in place)
 ) -> None:
 	"""Splat per-corr-point scalar displacements onto (D, Hm, Wm) accumulators with a Gaussian
 	kernel in mesh-vertex coordinates. R = ceil(3σ) neighborhood; out-of-bounds neighbors
@@ -408,6 +409,7 @@ def _height_map_splat(
 
 	H_map.view(-1).scatter_add_(0, flat_idx, delta.reshape(-1))
 	W_map.view(-1).scatter_add_(0, flat_idx, weight.reshape(-1))
+	W_max_map.view(-1).scatter_reduce_(0, flat_idx, weight.reshape(-1), reduce="amax", include_self=True)
 
 
 def _wind_collection_average(
@@ -1024,10 +1026,13 @@ def _corr_winding_loss(
 	normal_align_wsum = torch.zeros(K, device=dev, dtype=dt)
 	target_normal_sum = torch.zeros(K, 3, device=dev, dtype=dt)
 
-	# Shared scalar height map and weight accumulator across both ci=2 and ci=3 splats.
-	# H_map carries signed-delta contributions; W_map carries Gaussian × soft-mask weights.
+	# Shared scalar height map and weight accumulators across both ci=2 and ci=3 splats.
+	# H_map/W_map average the signed correction value; W_max_map caps the loss
+	# strength to the strongest single point at each vertex so dense corr points
+	# refine the value without multiplying the gradient.
 	H_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
 	W_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
+	W_max_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
 
 	# Per-corr-point detached pipeline for each ci, then splat into the shared height map.
 	with torch.no_grad():
@@ -1101,7 +1106,7 @@ def _corr_winding_loss(
 				d_ci, h_ci, w_ci, h_cont, w_cont,
 				signed_delta, mask_p,
 				_corr_splat_sigma, D, Hm, Wm,
-				H_map, W_map,
+				H_map, W_map, W_max_map,
 			)
 
 	# Apply the height map: for each active vertex, target = M_det + gt_n_v · (H/W).
@@ -1117,7 +1122,8 @@ def _corr_winding_loss(
 		M_active = xyz_lr[d_idx, h_idx, w_idx]                       # live, (Na, 3)
 		M_det_active = xyz_det[d_idx, h_idx, w_idx]                  # detached, (Na, 3)
 		H_active = H_map[d_idx, h_idx, w_idx]                        # (Na,)
-		W_active = W_map[d_idx, h_idx, w_idx]                        # (Na,)
+		W_active = W_map[d_idx, h_idx, w_idx]                        # (Na,) summed weights for averaging
+		W_loss_active = W_max_map[d_idx, h_idx, w_idx]               # (Na,) max single-point force weight
 
 		# Sample GT normal at each active vertex's 3D position (detached)
 		Na = int(M_active.shape[0])
@@ -1132,10 +1138,10 @@ def _corr_winding_loss(
 		h_per_v = (H_active / W_active.clamp_min(1e-8)).unsqueeze(-1)
 		target_active = M_det_active + gt_n_v * h_per_v
 
-		# loss = Σ W_v · ||M_v - target_v||²  (gradient flows through M_active)
+		# loss = Σ Wmax_v · ||M_v - target_v||²  (gradient flows through M_active)
 		diff = M_active - target_active
-		total_loss = total_loss + (W_active * diff.square().sum(dim=-1)).sum()
-		total_wsum = float(W_active.sum().detach().cpu())
+		total_loss = total_loss + (W_loss_active * diff.square().sum(dim=-1)).sum()
+		total_wsum = float(W_loss_active.sum().detach().cpu())
 
 	if dbg:
 		n_valid = int(target_finite.sum().item())
