@@ -4,8 +4,8 @@ For each winding, finds the closest point on the current detached mesh surface.
 
 Two loss components:
   - Normal-offset: central winding's signed offset from the seed along the
-    closest point's detached model normal, applied along detached per-vertex
-    model normals to all windings.
+    closest point's detached model normal, applied jointly to all windings
+    along that same base point normal.
   - XY-centering: per-winding, how far the closest point is from the model
     center in grid-index space, pushing each winding along model tangents.
 """
@@ -14,7 +14,6 @@ from __future__ import annotations
 import torch
 
 import model as fit_model
-from opt_loss_dir import _vertex_normals
 
 
 # Module state - set once via set_seed(), persists across stages.
@@ -47,7 +46,7 @@ def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
     _printed_initial = False
 
     print(f"[station] seed=({seed_xyz[0]:.0f},{seed_xyz[1]:.0f},{seed_xyz[2]:.0f}) "
-          f"normal_source=model_vertex "
+          f"normal_source=model_closest "
           f"grid={Hm}x{Wm} D={D}", flush=True)
 
 
@@ -442,10 +441,7 @@ def station_loss(
         if center_hits:
             _, p_int_c, h_int_c, w_int_c, n_model_c = center_hits[0]
             offset = ((p_int_c - seed) * n_model_c).sum()  # signed scalar
-            normal_dirs = _vertex_normals(xyz_det)
-            align = (normal_dirs * n_model_c.view(1, 1, 1, 3)).sum(dim=-1, keepdim=True)
-            normal_dirs = torch.where(align < 0.0, -normal_dirs, normal_dirs)
-            target_n = xyz_det - offset * normal_dirs
+            target_n = xyz_det - offset * n_model_c
             normal_weights = _station_normal_weights(
                 D=D,
                 Hm=Hm,
@@ -462,7 +458,6 @@ def station_loss(
             n_model_c = None
             offset = None
             target_n = None
-            normal_dirs = None
             normal_weights = None
         if not _printed_initial:
             _print_initial_station_diagnostic(
@@ -477,7 +472,7 @@ def station_loss(
             _printed_initial = True
 
     if target_n is not None:
-        normal_distance_vx = ((res.xyz_lr - target_n) * normal_dirs).sum(dim=-1)
+        normal_distance_vx = ((res.xyz_lr - target_n) * n_model_c.view(1, 1, 1, 3)).sum(dim=-1)
         normal_lm = _huberized_loss_map(normal_distance_vx / mesh_scale, delta=huber_delta)
         loss_normal = (normal_lm * normal_weights).mean()
 
