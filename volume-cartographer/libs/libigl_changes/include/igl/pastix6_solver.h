@@ -20,10 +20,12 @@ extern "C" {
 #include <spm.h>
 }
 
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace igl {
@@ -39,12 +41,26 @@ public:
         iparm_[IPARM_FACTORIZATION] = PastixFactPOTRF;
         // Quiet by default; bump to PastixVerboseNo / Yes for debugging.
         iparm_[IPARM_VERBOSE]       = PastixVerboseNot;
-        // Threading: 0 = PaStiX auto via hwloc, which sizes to physical cores
-        // (not logical / nproc / hardware_concurrency — that would oversubscribe
-        // SMT). Users can override with the PASTIX_NUM_THREADS env var or by
-        // calling setThreads(); PaStiX does not read OMP_NUM_THREADS.
-        iparm_[IPARM_THREAD_NBR]    = 0;
-        pastixInit(&data_, /*comm=*/0, iparm_, dparm_);
+        // Threading: PaStiX's auto-detect (IPARM_THREAD_NBR=0) routes via
+        // hwloc and picks physical cores only (8 on a 16-logical box). The
+        // SLIM factorisation does not actually saturate physical cores in
+        // practice (observed ~50% per-core utilisation), so SMT threads
+        // contribute real wallclock speedup here. Default to
+        // hardware_concurrency() (logical cores). PASTIX_NUM_THREADS env var
+        // wins if set; setThreads() also overrides post-construction.
+        int nthreads = static_cast<int>(std::thread::hardware_concurrency());
+        if (const char* e = std::getenv("PASTIX_NUM_THREADS")) {
+            int v = std::atoi(e);
+            if (v > 0) nthreads = v;
+        }
+        if (nthreads <= 0) nthreads = 1;
+        iparm_[IPARM_THREAD_NBR]    = nthreads;
+        // When asking for more threads than physical cores, PaStiX's default
+        // hwloc-based core binding fails ("unable to get the core of index N"
+        // for N >= physical_cores). Pass a bindtab full of -1 to disable
+        // explicit binding so the OS scheduler can place SMT siblings freely.
+        bindtab_.assign(static_cast<std::size_t>(nthreads), -1);
+        pastixInitWithAffinity(&data_, /*comm=*/0, iparm_, dparm_, bindtab_.data());
     }
 
     ~Pastix6LLT() {
@@ -178,6 +194,7 @@ private:
     std::vector<int> value_src_idx_;
     bool           analyzed_ = false;
     bool           logged_threads_ = false;
+    std::vector<int> bindtab_;
 };
 
 } // namespace igl
