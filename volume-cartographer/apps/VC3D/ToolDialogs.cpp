@@ -1477,8 +1477,9 @@ int SlimFlattenDialog::s_iterations = 50;
 double SlimFlattenDialog::s_tolerance = 1e-5;
 QString SlimFlattenDialog::s_energy = QStringLiteral("symmetric_dirichlet");
 
-SlimFlattenDialog::SlimFlattenDialog(QWidget* parent)
+SlimFlattenDialog::SlimFlattenDialog(QWidget* parent, const QString& defaultOutputPath)
     : QDialog(parent)
+    , defaultOutput_(defaultOutputPath)
 {
     setWindowTitle(tr("SLIM Flatten"));
     auto main = new QVBoxLayout(this);
@@ -1511,6 +1512,31 @@ SlimFlattenDialog::SlimFlattenDialog(QWidget* parent)
     cbEnergy_->setToolTip(tr("SLIM energy formulation."));
     form->addRow(tr("Energy:"), cbEnergy_);
 
+    auto outputRow = new QHBoxLayout();
+    edtOutput_ = new QLineEdit(this);
+    edtOutput_->setText(defaultOutput_);
+    edtOutput_->setToolTip(tr("Output tifxyz directory. Defaults to <segment>_flatboi next to the input."));
+    auto btnBrowse = new QPushButton(tr("Browse..."), this);
+    auto btnReset = new QPushButton(tr("Default"), this);
+    outputRow->addWidget(edtOutput_, /*stretch=*/1);
+    outputRow->addWidget(btnBrowse);
+    outputRow->addWidget(btnReset);
+    form->addRow(tr("Output:"), outputRow);
+
+    connect(btnBrowse, &QPushButton::clicked, this, [this]() {
+        const QString start = edtOutput_->text().isEmpty()
+            ? QFileInfo(defaultOutput_).absolutePath()
+            : edtOutput_->text();
+        const QString chosen = QFileDialog::getSaveFileName(
+            this, tr("Choose output tifxyz directory"), start,
+            /*filter=*/QString(), /*selectedFilter=*/nullptr,
+            QFileDialog::DontConfirmOverwrite);
+        if (!chosen.isEmpty()) edtOutput_->setText(chosen);
+    });
+    connect(btnReset, &QPushButton::clicked, this, [this]() {
+        edtOutput_->setText(defaultOutput_);
+    });
+
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -1537,6 +1563,15 @@ double SlimFlattenDialog::tolerance() const
 QString SlimFlattenDialog::energyType() const
 {
     return cbEnergy_ ? cbEnergy_->currentData().toString() : QStringLiteral("symmetric_dirichlet");
+}
+
+QString SlimFlattenDialog::outputPath() const
+{
+    if (edtOutput_) {
+        const QString t = edtOutput_->text().trimmed();
+        if (!t.isEmpty()) return t;
+    }
+    return defaultOutput_;
 }
 
 // ================= VisLasagnaObjDialog =================

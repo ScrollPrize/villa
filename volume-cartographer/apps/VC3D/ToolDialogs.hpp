@@ -456,11 +456,12 @@ private:
 class SlimFlattenDialog : public QDialog {
     Q_OBJECT
 public:
-    SlimFlattenDialog(QWidget* parent);
+    SlimFlattenDialog(QWidget* parent, const QString& defaultOutputPath);
 
     int maxIterations() const;
     double tolerance() const;   // 0.0 = disabled (run all iterations)
     QString energyType() const; // "symmetric_dirichlet" or "conformal"
+    QString outputPath() const;
 
 private:
     static bool s_haveSession;
@@ -471,6 +472,8 @@ private:
     QSpinBox* spIterations_{nullptr};
     QDoubleSpinBox* spTolerance_{nullptr};
     QComboBox* cbEnergy_{nullptr};
+    QLineEdit* edtOutput_{nullptr};
+    QString defaultOutput_;
 };
 
 class VisLasagnaObjDialog : public QDialog {

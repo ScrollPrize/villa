@@ -657,7 +657,8 @@ public:
             SegmentationCommandHandler* handler,
             int iters,
             double tolerance,
-            const QString& energy)
+            const QString& energy,
+            const QString& outputDir)
     : QObject(handler)
     , parentWidget_(parentWidget)
     , handler_(handler)
@@ -665,10 +666,10 @@ public:
     , stem_(segmentStem)
     , objPath_(QDir(segDir).filePath(segmentStem + ".obj"))
     , flatObj_(QDir(segDir).filePath(segmentStem + "_flatboi.obj"))
-    , outFinal_(segDir.endsWith("_flatboi") ? segDir : (segDir + "_flatboi"))
-    , outTemp_ (segDir.endsWith("_flatboi") ? (segDir + "__rebuild_tmp__") : outFinal_)
+    , outFinal_(outputDir)
+    , outTemp_ (outputDir == segDir ? (segDir + "__rebuild_tmp__") : outputDir)
     , flatboiExe_(flatboiExe)
-    , inputIsAlreadyFlat_(segDir.endsWith("_flatboi"))
+    , inputIsAlreadyFlat_(outputDir == segDir)
     , tolerance_(tolerance)
     , energy_(energy)
     , proc_(new QProcess(this))
@@ -1510,18 +1511,21 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
         return;
     }
 
-    SlimFlattenDialog dlg(_parentWidget);
+    const QString defaultOutput = segDir.endsWith("_flatboi") ? segDir : (segDir + "_flatboi");
+    SlimFlattenDialog dlg(_parentWidget, defaultOutput);
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }
     const int iters = dlg.maxIterations();
     const double tol = dlg.tolerance();
     const QString energy = dlg.energyType();
+    const QString outputDir = dlg.outputPath();
 
     const QByteArray pastixEnv = qgetenv("PASTIX_NUM_THREADS");
     const unsigned hwConc = std::thread::hardware_concurrency();
     std::cout << "[slim-flatten] segment=" << segmentId
               << " dir=" << segDirFs.string()
+              << " out=" << outputDir.toStdString()
               << " flatboi=" << flatboiExe.toStdString()
               << " iters=" << iters
               << " tol=" << tol
@@ -1530,7 +1534,7 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
               << " hardware_concurrency=" << hwConc
               << std::endl;
 
-    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters, tol, energy);
+    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters, tol, energy, outputDir);
 }
 
 void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
