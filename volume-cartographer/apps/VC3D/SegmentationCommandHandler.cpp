@@ -6,6 +6,7 @@
 #include <functional>
 #include <algorithm>
 #include <iostream>
+#include <thread>
 #include <cmath>
 #include <optional>
 #include <atomic>
@@ -59,6 +60,7 @@
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
 #include "elements/VolumeSelector.hpp"
@@ -653,7 +655,12 @@ public:
             const QString& segDir,
             const QString& segmentStem,
             const QString& flatboiExe,
-            SegmentationCommandHandler* handler)
+            SegmentationCommandHandler* handler,
+            int iters,
+            double tolerance,
+            const QString& energy,
+            const QString& outputDir,
+            double voxelSize)
     : QObject(handler)
     , parentWidget_(parentWidget)
     , handler_(handler)
@@ -661,18 +668,19 @@ public:
     , stem_(segmentStem)
     , objPath_(QDir(segDir).filePath(segmentStem + ".obj"))
     , flatObj_(QDir(segDir).filePath(segmentStem + "_flatboi.obj"))
-    , outFinal_(segDir.endsWith("_flatboi") ? segDir : (segDir + "_flatboi"))
-    , outTemp_ (segDir.endsWith("_flatboi") ? (segDir + "__rebuild_tmp__") : outFinal_)
+    , outFinal_(outputDir)
+    , outTemp_ (outputDir == segDir ? (segDir + "__rebuild_tmp__") : outputDir)
     , flatboiExe_(flatboiExe)
-    , inputIsAlreadyFlat_(segDir.endsWith("_flatboi"))
+    , inputIsAlreadyFlat_(outputDir == segDir)
+    , tolerance_(tolerance)
+    , energy_(energy)
+    , voxelSize_(voxelSize)
     , proc_(new QProcess(this))
     , progress_(new QProgressDialog(QObject::tr("Preparing SLIM..."), QObject::tr("Cancel"), 0, 0, parentWidget))
     , itRe_(R"(^\s*\[it\s+(\d+)\])", QRegularExpression::CaseInsensitiveOption)
     , progRe_(R"(^\s*PROGRESS\s+(\d+)\s*/\s*(\d+)\s*$)", QRegularExpression::CaseInsensitiveOption)
     {
-        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        iters_ = s.value("tools/flatboi_iters", 20).toInt();
-        if (iters_ <= 0) iters_ = 20;
+        iters_ = iters > 0 ? iters : 20;
 
         tifxyz2objExe_ = findVcTool("vc_tifxyz2obj");
         obj2tifxyzExe_ = findVcTool("vc_obj2tifxyz");
@@ -750,6 +758,52 @@ private:
         return true;
     }
 
+    // Compute area_vx2 from the freshly-written tifxyz at 'dir' and write
+    // both area_vx2 and area_cm2 into its meta.json. voxelSize is in micrometers
+    // per voxel (same units as Volume::voxelSize()); area_cm2 = vx2 * vs^2 / 1e8
+    // matches SurfaceAreaCalculator's convention. Returns true on success;
+    // failures are non-fatal — caller may continue without updated area.
+    static bool updateAreaInMeta_(const QString& dir, double voxelSize) {
+        std::unique_ptr<QuadSurface> qs;
+        try {
+            qs = load_quad_from_tifxyz(dir.toStdString());
+        } catch (...) {
+            return false;
+        }
+        if (!qs) return false;
+
+        const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*qs);
+        if (!std::isfinite(area_vx2) || area_vx2 <= 0.0) return false;
+
+        double area_cm2 = std::numeric_limits<double>::quiet_NaN();
+        if (std::isfinite(voxelSize) && voxelSize > 0.0) {
+            area_cm2 = area_vx2 * voxelSize * voxelSize / 1e8;
+        }
+
+        const QString metaPath = QDir(dir).filePath(QStringLiteral("meta.json"));
+        QJsonObject root;
+        if (QFileInfo::exists(metaPath)) {
+            QFile in(metaPath);
+            if (in.open(QIODevice::ReadOnly)) {
+                const auto doc = QJsonDocument::fromJson(in.readAll());
+                if (doc.isObject()) root = doc.object();
+                in.close();
+            }
+        }
+        root.insert(QStringLiteral("area_vx2"), area_vx2);
+        if (std::isfinite(area_cm2)) {
+            root.insert(QStringLiteral("area_cm2"), area_cm2);
+        }
+
+        QFile out(metaPath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        out.close();
+        return true;
+    }
+
 private:
     enum class Phase { ToObj, Flatboi, ToTifxyz, Swap, Done };
 
@@ -771,8 +825,14 @@ private:
         progress_->setLabelText(QObject::tr("Running SLIM (flatboi)..."));
         progress_->setValue(1);
         ioLog_.clear();
-        QStringList args; args << objPath_ << QString::number(iters_);
+        QStringList args;
+        args << objPath_ << QString::number(iters_) << energy_;
+        if (tolerance_ > 0.0) {
+            args << QStringLiteral("--tol=%1").arg(tolerance_, 0, 'g', 8);
+        }
         ioLog_ += QStringLiteral("Running: %1 %2\n").arg(flatboiExe_, args.join(' '));
+        std::cout << "[slim-flatten] launching: " << flatboiExe_.toStdString()
+                  << " " << args.join(' ').toStdString() << std::endl;
         proc_->start(flatboiExe_, args);
     }
 
@@ -883,6 +943,7 @@ private:
     void onStdout_() {
         const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
         ioLog_ += chunk;
+        std::cout << chunk.toStdString() << std::flush;
         const QStringList lines = chunk.split('\n', Qt::SkipEmptyParts);
         for (const QString& raw : lines) {
             const QString line = raw.trimmed();
@@ -1002,6 +1063,14 @@ private:
                 warn->open();
             }
 
+            // Recompute area_vx2 / area_cm2 from the flattened tifxyz so the
+            // segment list area column reflects the new geometry. Non-fatal:
+            // if it fails, the meta.json keeps whatever area was already there.
+            if (!updateAreaInMeta_(outTemp_, voxelSize_)) {
+                std::cout << "[slim-flatten] warning: failed to compute area for "
+                          << outTemp_.toStdString() << std::endl;
+            }
+
             phase_ = Phase::Swap;
             finishSwapIfNeeded_();
             phase_ = Phase::Done;
@@ -1025,6 +1094,9 @@ private:
     QString outTemp_;
     QString flatboiExe_;
     bool    inputIsAlreadyFlat_ = false;
+    double  tolerance_ = 0.0;
+    QString energy_ = QStringLiteral("symmetric_dirichlet");
+    double  voxelSize_ = 0.0;
 
     // process & progress
     QProcess* proc_ = nullptr;
@@ -1497,7 +1569,38 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
         return;
     }
 
-    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this);
+    const QString defaultOutput = segDir.endsWith("_flatboi") ? segDir : (segDir + "_flatboi");
+    SlimFlattenDialog dlg(_parentWidget, defaultOutput);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    const int iters = dlg.maxIterations();
+    const double tol = dlg.tolerance();
+    const QString energy = dlg.energyType();
+    const QString outputDir = dlg.outputPath();
+
+    const QByteArray pastixEnv = qgetenv("PASTIX_NUM_THREADS");
+    const unsigned hwConc = std::thread::hardware_concurrency();
+    std::cout << "[slim-flatten] segment=" << segmentId
+              << " dir=" << segDirFs.string()
+              << " out=" << outputDir.toStdString()
+              << " flatboi=" << flatboiExe.toStdString()
+              << " iters=" << iters
+              << " tol=" << tol
+              << " energy=" << energy.toStdString()
+              << " PASTIX_NUM_THREADS=" << (pastixEnv.isEmpty() ? "<unset, PaStiX auto>" : pastixEnv.toStdString())
+              << " hardware_concurrency=" << hwConc
+              << std::endl;
+
+    double voxelSize = 0.0;
+    try {
+        if (auto volume = _state ? _state->currentVolume() : nullptr) {
+            voxelSize = volume->voxelSize();
+        }
+    } catch (...) {}
+    if (!std::isfinite(voxelSize) || voxelSize <= 0.0) voxelSize = 0.0;
+
+    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters, tol, energy, outputDir, voxelSize);
 }
 
 void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)

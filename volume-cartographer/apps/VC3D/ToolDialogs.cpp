@@ -1471,6 +1471,109 @@ int ABFFlattenDialog::downsampleFactor() const
     return spDownsample_ ? spDownsample_->value() : 1;
 }
 
+// ================= SlimFlattenDialog =================
+bool SlimFlattenDialog::s_haveSession = false;
+int SlimFlattenDialog::s_iterations = 50;
+double SlimFlattenDialog::s_tolerance = 1e-5;
+QString SlimFlattenDialog::s_energy = QStringLiteral("symmetric_dirichlet");
+
+SlimFlattenDialog::SlimFlattenDialog(QWidget* parent, const QString& defaultOutputPath)
+    : QDialog(parent)
+    , defaultOutput_(defaultOutputPath)
+{
+    setWindowTitle(tr("SLIM Flatten"));
+    auto main = new QVBoxLayout(this);
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    spIterations_ = new QSpinBox(this);
+    spIterations_->setRange(1, 5000);
+    spIterations_->setValue(s_haveSession ? s_iterations : 50);
+    spIterations_->setToolTip(tr("Maximum SLIM iterations. Acts as a cap when tolerance > 0."));
+    form->addRow(tr("Max iterations:"), spIterations_);
+
+    spTolerance_ = new QDoubleSpinBox(this);
+    spTolerance_->setDecimals(8);
+    spTolerance_->setRange(0.0, 1.0);
+    spTolerance_->setSingleStep(1e-5);
+    spTolerance_->setValue(s_haveSession ? s_tolerance : 1e-5);
+    spTolerance_->setToolTip(tr("Relative-energy early-stop threshold (ΔE/E). 0 disables early stop; "
+                                 "1e-5 is the default and typically stops after ~5–15 iters."));
+    form->addRow(tr("Convergence tolerance:"), spTolerance_);
+
+    cbEnergy_ = new QComboBox(this);
+    cbEnergy_->addItem(tr("Symmetric Dirichlet"), QStringLiteral("symmetric_dirichlet"));
+    cbEnergy_->addItem(tr("Conformal"), QStringLiteral("conformal"));
+    const QString initialEnergy = s_haveSession ? s_energy : QStringLiteral("symmetric_dirichlet");
+    {
+        int idx = cbEnergy_->findData(initialEnergy);
+        if (idx >= 0) cbEnergy_->setCurrentIndex(idx);
+    }
+    cbEnergy_->setToolTip(tr("SLIM energy formulation."));
+    form->addRow(tr("Energy:"), cbEnergy_);
+
+    auto outputRow = new QHBoxLayout();
+    edtOutput_ = new QLineEdit(this);
+    edtOutput_->setText(defaultOutput_);
+    edtOutput_->setToolTip(tr("Output tifxyz directory. Defaults to <segment>_flatboi next to the input."));
+    auto btnBrowse = new QPushButton(tr("Browse..."), this);
+    auto btnReset = new QPushButton(tr("Default"), this);
+    outputRow->addWidget(edtOutput_, /*stretch=*/1);
+    outputRow->addWidget(btnBrowse);
+    outputRow->addWidget(btnReset);
+    form->addRow(tr("Output:"), outputRow);
+
+    connect(btnBrowse, &QPushButton::clicked, this, [this]() {
+        const QString start = edtOutput_->text().isEmpty()
+            ? QFileInfo(defaultOutput_).absolutePath()
+            : edtOutput_->text();
+        const QString chosen = QFileDialog::getSaveFileName(
+            this, tr("Choose output tifxyz directory"), start,
+            /*filter=*/QString(), /*selectedFilter=*/nullptr,
+            QFileDialog::DontConfirmOverwrite);
+        if (!chosen.isEmpty()) edtOutput_->setText(chosen);
+    });
+    connect(btnReset, &QPushButton::clicked, this, [this]() {
+        edtOutput_->setText(defaultOutput_);
+    });
+
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(btns);
+
+    connect(btns, &QDialogButtonBox::accepted, this, [this]() {
+        s_haveSession = true;
+        s_iterations = spIterations_->value();
+        s_tolerance = spTolerance_->value();
+        s_energy = cbEnergy_->currentData().toString();
+    });
+}
+
+int SlimFlattenDialog::maxIterations() const
+{
+    return spIterations_ ? spIterations_->value() : 20;
+}
+
+double SlimFlattenDialog::tolerance() const
+{
+    return spTolerance_ ? spTolerance_->value() : 0.0;
+}
+
+QString SlimFlattenDialog::energyType() const
+{
+    return cbEnergy_ ? cbEnergy_->currentData().toString() : QStringLiteral("symmetric_dirichlet");
+}
+
+QString SlimFlattenDialog::outputPath() const
+{
+    if (edtOutput_) {
+        const QString t = edtOutput_->text().trimmed();
+        if (!t.isEmpty()) return t;
+    }
+    return defaultOutput_;
+}
+
 // ================= VisLasagnaObjDialog =================
 // static session members
 bool VisLasagnaObjDialog::s_haveSession = false;
