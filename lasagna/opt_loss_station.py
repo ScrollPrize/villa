@@ -5,9 +5,9 @@ winding, analytic solve) instead of brute-forcing all quads every step.
 
 Two loss components:
   - Normal-offset: central winding's offset from seed along the GT normal
-    → pushes all windings jointly along their per-vertex GT normals.
+    → pushes all windings jointly along the seed GT normal.
   - XY-centering: per-winding, how far the intersection is from the model
-    center in grid-index space → pushes each winding tangentially (GT tangent).
+    center in grid-index space → pushes each winding along model tangents.
 """
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ _h_frac: list[float] = []           # tracked h position per winding
 _w_frac: list[float] = []           # tracked w position per winding
 _printed_initial: bool = False
 
+_STATION_N_LOCAL_RADIUS_IDX = 8.0
+_STATION_N_OUTSIDE_WEIGHT = 0.1
+
 
 def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
              *, Hm: int, Wm: int, D: int = 1) -> None:
@@ -36,7 +39,7 @@ def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
     global _seed, _n_gt, _h_frac, _w_frac, _printed_initial
     _seed = seed_xyz.detach().clone()
 
-    # Sample GT normal at seed point
+    # Sample GT normal at seed point.
     query = seed_xyz.view(1, 1, 1, 3)  # (D=1, H=1, W=1, 3)
     sampled = data.grid_sample_fullres(query, channels={"nx", "ny"})
     nx = sampled.nx.squeeze().item()
@@ -70,13 +73,37 @@ def _station_mesh_scale(res: fit_model.FitResult3D) -> float:
     return max(1.0e-6, float(res.params.mesh_step))
 
 
-def _huberized_mse(residual: torch.Tensor, *, delta: float) -> torch.Tensor:
-    """MSE near zero, linear beyond delta."""
+def _huberized_loss_map(residual: torch.Tensor, *, delta: float) -> torch.Tensor:
     d = residual.new_tensor(max(1.0e-6, float(delta)))
     abs_r = residual.abs()
     quad = torch.minimum(abs_r, d)
     linear = abs_r - quad
-    return (quad.square() + 2.0 * d * linear).mean()
+    return quad.square() + 2.0 * d * linear
+
+
+def _huberized_mse(residual: torch.Tensor, *, delta: float) -> torch.Tensor:
+    """MSE near zero, linear beyond delta."""
+    return _huberized_loss_map(residual, delta=delta).mean()
+
+
+def _station_normal_weights(
+    *,
+    D: int,
+    Hm: int,
+    Wm: int,
+    h_center: float,
+    w_center: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    h = torch.arange(Hm, device=device, dtype=dtype).view(Hm, 1)
+    w = torch.arange(Wm, device=device, dtype=dtype).view(1, Wm)
+    dist_idx = torch.sqrt((h - float(h_center)).square() + (w - float(w_center)).square())
+    radius = max(1.0e-6, float(_STATION_N_LOCAL_RADIUS_IDX))
+    t = (1.0 - dist_idx / radius).clamp(min=0.0, max=1.0)
+    falloff = t * t * (3.0 - 2.0 * t)
+    weights = float(_STATION_N_OUTSIDE_WEIGHT) + (1.0 - float(_STATION_N_OUTSIDE_WEIGHT)) * falloff
+    return weights.view(1, Hm, Wm).expand(D, Hm, Wm)
 
 
 def _print_initial_station_diagnostic(
@@ -96,6 +123,8 @@ def _print_initial_station_diagnostic(
     step = max(1.0e-6, float(mesh_step))
     norm = dist / step
     n_off = float(normal_offset.detach().cpu()) if normal_offset is not None else float("nan")
+    if abs(n_off) < 5.0e-4:
+        n_off = 0.0
     p = p_int.detach().cpu().tolist()
     print(
         f"[station] initial: closest=({p[0]:.3f},{p[1]:.3f},{p[2]:.3f}) "
@@ -267,12 +296,22 @@ def station_loss(
             _, p_int_c, h_int_c, w_int_c = center_hits[0]
             offset = ((p_int_c - seed) * n_gt).sum()  # signed scalar
             target_n = xyz_det - offset * n_gt  # broadcast (D, Hm, Wm, 3)
+            normal_weights = _station_normal_weights(
+                D=D,
+                Hm=Hm,
+                Wm=Wm,
+                h_center=h_int_c,
+                w_center=w_int_c,
+                device=dev,
+                dtype=res.xyz_lr.dtype,
+            )
         else:
             p_int_c = None
             h_int_c = None
             w_int_c = None
             offset = None
             target_n = None
+            normal_weights = None
         if not _printed_initial:
             _print_initial_station_diagnostic(
                 seed=seed,
@@ -286,7 +325,8 @@ def station_loss(
 
     if target_n is not None:
         normal_distance_vx = ((res.xyz_lr - target_n) * n_gt.view(1, 1, 1, 3)).sum(dim=-1)
-        loss_normal = _huberized_mse(normal_distance_vx / mesh_scale, delta=huber_delta)
+        normal_lm = _huberized_loss_map(normal_distance_vx / mesh_scale, delta=huber_delta)
+        loss_normal = (normal_lm * normal_weights).mean()
 
     # --- XY-centering loss (per-winding, independent) ---
     loss_xy = zero
@@ -314,7 +354,10 @@ def station_loss(
         loss_xy = loss_xy / n_xy_hits
 
     mask = res.mask_lr
-    lm_n = loss_normal.detach().expand(D, 1, Hm, Wm)
+    if target_n is not None:
+        lm_n = (normal_lm * normal_weights).detach().unsqueeze(1)
+    else:
+        lm_n = loss_normal.detach().expand(D, 1, Hm, Wm)
     lm_t = loss_xy.detach().expand(D, 1, Hm, Wm)
     return {
         "station_n": (loss_normal, (lm_n,), (mask,)),
