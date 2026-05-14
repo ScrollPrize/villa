@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <cstring>
 #include <cctype>
 #include <string>
@@ -42,7 +43,19 @@ namespace fs = std::filesystem;
 class WBLogger {
 public:
   WBLogger(const std::string& obj_path, int n_iters) {
-    // Allow explicit opt-out. If WANDB_DISABLED is set and truthy, skip logger entirely.
+    // Off by default: only enable when explicitly opted in via WANDB_ENABLED or
+    // when a WANDB_API_KEY is available. Avoids spawning a Python subprocess
+    // (and the wandb import overhead) for users who don't use W&B.
+    bool opt_in = false;
+    if (const char* e = std::getenv("WANDB_ENABLED")) {
+      std::string v(e);
+      std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+      opt_in = (v=="1" || v=="true" || v=="yes");
+    }
+    if (!opt_in && std::getenv("WANDB_API_KEY") == nullptr) {
+      enabled_ = false; return;
+    }
+    // Explicit opt-out wins even if a key is present.
     if (const char* d = std::getenv("WANDB_DISABLED")) {
       std::string v(d);
       std::transform(v.begin(), v.end(), v.begin(), ::tolower);
@@ -52,13 +65,17 @@ public:
     std::string vol_or_parent = "flatboi";
     try {
       fs::path p = fs::absolute(obj_path);
-      for (auto parent = p.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+      fs::path parent = p.parent_path();
+      vol_or_parent = parent.filename().string();
+      while (!parent.empty()) {
         auto name = parent.filename().string();
         if (name.size() >= 7 && name.substr(name.size()-7) == ".volpkg") {
           vol_or_parent = parent.stem().string();
           break;
         }
-        if (parent.parent_path().empty()) vol_or_parent = p.parent_path().filename().string();
+        const fs::path next = parent.parent_path();
+        if (next == parent) break; // filesystem root: parent_path of "/" is "/"
+        parent = next;
       }
     } catch (...) {}
     fs::path pp(obj_path);
@@ -948,6 +965,15 @@ int main(int argc, char** argv) {
   std::cout << "Using SLIM energy: " << energy_label
             << "  (max_iter=" << iters
             << ", tol=" << conv_tol << ")\n";
+  {
+    const char* pn = std::getenv("PASTIX_NUM_THREADS");
+    const char* on = std::getenv("OMP_NUM_THREADS");
+    std::cout << "Threading env: PASTIX_NUM_THREADS="
+              << (pn ? pn : "<unset, PaStiX auto via hwloc>")
+              << ", OMP_NUM_THREADS=" << (on ? on : "<unset>")
+              << ", hardware_concurrency=" << std::thread::hardware_concurrency()
+              << std::endl;
+  }
 
   std::ios::sync_with_stdio(false);
   std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
