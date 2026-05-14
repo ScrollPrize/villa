@@ -925,6 +925,55 @@ def _rollout_in_loop_active(cfg: dict, *, global_step: int) -> bool:
     return ((int(global_step) - start_step) % frequency) == 0
 
 
+def _true_rollout_active(cfg: dict, *, global_step: int) -> bool:
+    """Return True when this training step should run a true sequential
+    autoregressive rollout-loss step (model.forward_with_true_rollout).
+    Mutex with rollout_in_loop: see the train loop -- when this is True,
+    rollout_in_loop is suppressed for that step (true rollout is strictly
+    stronger).
+    """
+    if not bool(cfg.get("true_rollout_loss_enabled", False)):
+        return False
+    start_step = int(cfg.get("true_rollout_loss_start_step", 0))
+    if int(global_step) < start_step:
+        return False
+    frequency = int(cfg.get("true_rollout_loss_frequency", 0))
+    if frequency <= 0:
+        return False
+    return ((int(global_step) - start_step) % frequency) == 0
+
+
+def _maybe_apply_xyz_jitter(batch: dict, cfg: dict, *, global_step: int) -> dict:
+    """If enabled, return a NEW batch dict whose previous-token xyz inputs
+    (`target_xyz` and `prompt_tokens["xyz"]`) have per-element uniform noise
+    in [-J, +J] added at supervised/valid positions. The ORIGINAL `batch`
+    is unchanged so the loss computation (which reads `batch[...]`) sees the
+    unjittered ground truth. Drift-recovery signal: the model learns to
+    predict the true position despite a noisy context.
+    """
+    if not bool(cfg.get("xyz_jitter_enabled", False)):
+        return batch
+    if int(global_step) < int(cfg.get("xyz_jitter_start_step", 0)):
+        return batch
+    jitter_max = float(cfg.get("xyz_jitter_max_voxels", 0.0))
+    if jitter_max <= 0.0:
+        return batch
+
+    target_xyz = batch["target_xyz"]
+    sup_mask = batch["target_supervision_mask"].to(dtype=target_xyz.dtype).unsqueeze(-1)
+    target_noise = (torch.rand_like(target_xyz) * 2.0 - 1.0) * jitter_max
+    target_xyz_jit = target_xyz + target_noise * sup_mask
+
+    prompt_tokens = batch["prompt_tokens"]
+    prompt_xyz = prompt_tokens["xyz"]
+    prompt_valid = prompt_tokens["valid_mask"].to(dtype=prompt_xyz.dtype).unsqueeze(-1)
+    prompt_noise = (torch.rand_like(prompt_xyz) * 2.0 - 1.0) * jitter_max
+    prompt_xyz_jit = prompt_xyz + prompt_noise * prompt_valid
+
+    new_prompt_tokens = {**prompt_tokens, "xyz": prompt_xyz_jit}
+    return {**batch, "target_xyz": target_xyz_jit, "prompt_tokens": new_prompt_tokens}
+
+
 def _as_numpy_grid(grid) -> np.ndarray:
     if torch.is_tensor(grid):
         return grid.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -1614,21 +1663,39 @@ def run_autoreg_mesh_training(
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             geometry_sd_weight_active = _geometry_sd_weight_active(cfg, global_step=global_step)
             offset_feedback_enabled, refine_feedback_enabled = _scheduled_sampling_feedback_state(cfg, global_step=global_step)
-            rollout_in_loop_active = _rollout_in_loop_active(cfg, global_step=global_step)
-            # Route both regular and rollout-in-loop forwards through the
-            # DDP-wrapped train_model() so the reducer is correctly notified
-            # on backward.
+            true_rollout_active = _true_rollout_active(cfg, global_step=global_step)
+            rollout_in_loop_active = (
+                _rollout_in_loop_active(cfg, global_step=global_step) and not true_rollout_active
+            )
+            # Mutex: when true_rollout fires we suppress rollout-in-loop on
+            # the same step (true_rollout is strictly stronger: depth = full
+            # horizon, fully sequential). When neither fires, the normal
+            # scheduled-sampling path runs.
             rollout_iterations_active = (
                 int(cfg.get("rollout_in_loop_iterations", 5)) if rollout_in_loop_active else 0
             )
+            # 0 = "fire with full target horizon" sentinel; positive int = cap;
+            # None = don't fire. Cleaner than overloading None three ways.
+            true_rollout_horizon_arg: int | None = None
+            if true_rollout_active:
+                horizon_cfg = cfg.get("true_rollout_loss_horizon")
+                true_rollout_horizon_arg = 0 if horizon_cfg is None else int(horizon_cfg)
+            # Drift-recovery jitter: returns a NEW batch dict with noisy
+            # previous-token xyz inputs; original `batch` (used by the loss
+            # computation below) is untouched.
+            batch_for_forward = _maybe_apply_xyz_jitter(batch, cfg, global_step=global_step)
+            # Route both regular and rollout-in-loop forwards through the
+            # DDP-wrapped train_model() so the reducer is correctly notified
+            # on backward.
             with torch.autocast(device_type=runtime.device.type, dtype=amp_dtype, enabled=amp_enabled):
                 outputs = train_model(
-                    batch,
+                    batch_for_forward,
                     scheduled_sampling_prob=scheduled_sampling_prob,
                     scheduled_sampling_pattern=str(cfg.get("scheduled_sampling_pattern", "stripwise_full_strip_greedy")),
                     scheduled_sampling_offset_feedback_enabled=offset_feedback_enabled,
                     scheduled_sampling_refine_feedback_enabled=refine_feedback_enabled,
                     rollout_in_loop_iterations=int(rollout_iterations_active),
+                    true_rollout_horizon=true_rollout_horizon_arg,
                 )
                 loss_dict = compute_autoreg_mesh_losses(
                     outputs,
@@ -1681,6 +1748,7 @@ def run_autoreg_mesh_training(
             metrics["grad_norm"] = grad_norm_value
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
             metrics["rollout_in_loop_active"] = float(rollout_in_loop_active)
+            metrics["true_rollout_active"] = float(true_rollout_active)
             metrics["offset_loss_weight_active"] = float(offset_loss_weight_active)
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)
             metrics["xyz_soft_loss_weight_active"] = float(xyz_soft_loss_weight_active)

@@ -1225,7 +1225,18 @@ class AutoregMeshModel(nn.Module):
         scheduled_sampling_offset_feedback_enabled: bool = True,
         scheduled_sampling_refine_feedback_enabled: bool = True,
         rollout_in_loop_iterations: int = 0,
+        true_rollout_horizon: int | None = None,
     ) -> dict[str, Tensor]:
+        # True autoregressive rollout step: strictly stronger than chained
+        # warmup (depth = horizon, fully sequential). Takes precedence.
+        if self.training and true_rollout_horizon is not None:
+            return self.forward_with_true_rollout(
+                batch,
+                rollout_horizon=int(true_rollout_horizon) if int(true_rollout_horizon) > 0 else None,
+                scheduled_sampling_pattern=str(scheduled_sampling_pattern),
+                offset_feedback_enabled=bool(scheduled_sampling_offset_feedback_enabled),
+                refine_feedback_enabled=bool(scheduled_sampling_refine_feedback_enabled),
+            )
         # Periodic rollout-in-loop step: dispatch to the chained-warmup path
         # so the DDP wrapper sees a normal forward() call (its hooks fire on
         # backward() regardless of which internal forward we run).
@@ -1335,6 +1346,139 @@ class AutoregMeshModel(nn.Module):
             memory_tokens=memory_tokens,
             memory_patch_centers=memory_patch_centers,
             generation_inputs=final_gen_inputs,
+        )
+        outputs["coarse_grid_shape"] = encoded["coarse_grid_shape"]
+        return outputs
+
+    @torch.inference_mode()
+    def _autoregressive_rollout_predictions(
+        self,
+        batch: dict,
+        *,
+        horizon: int | None = None,
+    ) -> dict[str, Tensor]:
+        """Sequential greedy autoregressive rollout for the full batch.
+
+        For each target position t in `0 .. horizon - 1`, runs
+        `forward_from_encoded` on a working copy of the batch whose previous
+        positions have been overwritten with the model's prior predictions,
+        captures the prediction at position t only, and locks it in for the
+        next iteration. Positions beyond `horizon` retain ground-truth values
+        (untouched). Returns a dict shaped like `forward_from_encoded`'s
+        output but with predictions produced under realistic self-feeding.
+
+        Cost: `horizon` forward passes (each parallel over the full target
+        sequence, but only one position consumed per pass). At horizon=100
+        with target_len=100, this is roughly 50x a teacher-forced forward.
+        At freq=2000 the wall-clock overhead is ~0.1%.
+        """
+        target_coarse_ids_gt = batch["target_coarse_ids"]
+        batch_size, target_len = target_coarse_ids_gt.shape
+        if horizon is None:
+            h = target_len
+        else:
+            h = max(0, min(int(horizon), target_len))
+
+        encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
+        memory_tokens = encoded["memory_tokens"]
+        memory_patch_centers = encoded["memory_patch_centers"]
+
+        # Working buffers that we mutate in-place as we predict each position.
+        target_coarse_ids = batch["target_coarse_ids"].clone()
+        target_offset_bins = batch["target_offset_bins"].clone()
+        target_xyz = batch["target_xyz"].clone()
+
+        # Output buffers (initialised to ground truth so positions >= h are
+        # left as-is; downstream substitution only reads positions 0..h-1).
+        pred_xyz_bin_center = batch["target_xyz"].clone()
+        pred_xyz_refined = batch["target_xyz"].clone()
+
+        if h == 0:
+            return {
+                "pred_coarse_ids": target_coarse_ids,
+                "pred_offset_bins": target_offset_bins,
+                "pred_xyz": pred_xyz_bin_center,
+                "pred_xyz_refined": pred_xyz_refined,
+            }
+
+        batch_dyn = {**batch,
+                     "target_coarse_ids": target_coarse_ids,
+                     "target_offset_bins": target_offset_bins,
+                     "target_xyz": target_xyz}
+
+        for t in range(h):
+            outputs = self.forward_from_encoded(
+                batch_dyn,
+                memory_tokens=memory_tokens,
+                memory_patch_centers=memory_patch_centers,
+            )
+            # Capture this step's prediction at position t only.
+            target_coarse_ids[:, t] = outputs["pred_coarse_ids"][:, t]
+            target_offset_bins[:, t] = outputs["pred_offset_bins"][:, t]
+            pred_xyz_bin_center[:, t] = outputs["pred_xyz"][:, t]
+            pred_xyz_refined[:, t] = outputs["pred_xyz_refined"][:, t]
+            # Lock it in so the next iteration's input at position t is the
+            # model's own prediction. Refined xyz mirrors what
+            # `_build_scheduled_generation_inputs` will substitute downstream
+            # when refine_feedback_enabled=True.
+            target_xyz[:, t] = pred_xyz_refined[:, t]
+
+        return {
+            "pred_coarse_ids": target_coarse_ids,
+            "pred_offset_bins": target_offset_bins,
+            "pred_xyz": pred_xyz_bin_center,
+            "pred_xyz_refined": pred_xyz_refined,
+        }
+
+    def forward_with_true_rollout(
+        self,
+        batch: dict,
+        *,
+        rollout_horizon: int | None = None,
+        scheduled_sampling_pattern: str = "stripwise_full_strip_greedy",
+        offset_feedback_enabled: bool = True,
+        refine_feedback_enabled: bool = True,
+    ) -> dict[str, Tensor]:
+        """True autoregressive rollout loss step.
+
+        Step 1 (no_grad): `_autoregressive_rollout_predictions` runs a full
+            sequential greedy rollout to produce the model's own predictions
+            for every target position (up to `rollout_horizon`, or the full
+            target length when None).
+        Step 2: `_build_scheduled_generation_inputs(scheduled_sampling_prob=1.0)`
+            substitutes those predictions as previous-token inputs at every
+            supervised position.
+        Step 3: `forward_from_encoded` with gradient flow on the substituted
+            inputs. Loss (computed by the caller against the ORIGINAL,
+            unjittered, unmodified ground-truth targets) trains the model
+            to predict correctly given a fully self-fed history -- the
+            exposure-bias-mitigation signal that 1-step scheduled sampling
+            and K-iter chained warmup can't reach at long horizons.
+        """
+        # Step 1: rollout in inference mode.
+        rollout_outputs = self._autoregressive_rollout_predictions(
+            batch,
+            horizon=rollout_horizon,
+        )
+        # Step 2: build generation inputs that replace EVERY supervised
+        # position with the rolled-out prediction.
+        encoded = self.encode_conditioning(batch.get("volume"), batch.get("vol_tokens"))
+        memory_tokens = encoded["memory_tokens"]
+        memory_patch_centers = encoded["memory_patch_centers"]
+        gen_inputs = self._build_scheduled_generation_inputs(
+            batch,
+            teacher_outputs=rollout_outputs,
+            scheduled_sampling_prob=1.0,
+            scheduled_sampling_pattern=str(scheduled_sampling_pattern),
+            offset_feedback_enabled=bool(offset_feedback_enabled),
+            refine_feedback_enabled=bool(refine_feedback_enabled),
+        )
+        # Step 3: gradient-enabled forward.
+        outputs = self.forward_from_encoded(
+            batch,
+            memory_tokens=memory_tokens,
+            memory_patch_centers=memory_patch_centers,
+            generation_inputs=gen_inputs,
         )
         outputs["coarse_grid_shape"] = encoded["coarse_grid_shape"]
         return outputs

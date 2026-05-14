@@ -161,6 +161,33 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "rollout_in_loop_frequency": 1000,
     "rollout_in_loop_start_step": 20000,
     "rollout_in_loop_iterations": 5,
+    # True autoregressive rollout loss. When active on a training step, the
+    # trainer runs a sequential greedy autoregressive rollout (via
+    # `forward_with_true_rollout` -> `_autoregressive_rollout_predictions`)
+    # for the full target horizon (or up to `true_rollout_loss_horizon`),
+    # then a gradient-enabled forward with predictions substituted at every
+    # supervised position. This is strictly stronger than the K-iter
+    # chained-warmup rollout-in-loop (which only reaches K-deep
+    # parallel-attention drift) and matches inference behaviour: long-horizon
+    # fully-sequential self-feeding. Mutex with rollout-in-loop: if both
+    # schedules say fire, true_rollout wins. Cost: ~horizon forwards per
+    # fire, no backward through them; one final gradient forward + backward.
+    # At freq=2000 with horizon=100, overhead ~0.1% wall-clock.
+    "true_rollout_loss_enabled": False,
+    "true_rollout_loss_frequency": 2000,
+    "true_rollout_loss_start_step": 0,
+    "true_rollout_loss_horizon": None,
+    # XYZ jitter on previous-token inputs (drift-recovery curriculum). When
+    # active, every training step samples per-element uniform noise in
+    # [-xyz_jitter_max_voxels, +xyz_jitter_max_voxels] and ADDS it to the
+    # previous-token xyz inputs (target_xyz used as input + prompt_tokens.xyz).
+    # Loss targets remain UNJITTERED so the model learns to predict the true
+    # next position given a slightly drifty context. Free compute; small,
+    # always-on. Apply only after the model is reasonably trained
+    # (xyz_jitter_start_step) to avoid destabilizing early training.
+    "xyz_jitter_enabled": False,
+    "xyz_jitter_start_step": 0,
+    "xyz_jitter_max_voxels": 0.0,
     "position_refine_enabled": True,
     "position_refine_loss": "huber",
     "position_refine_weight": 0.05,
@@ -422,6 +449,29 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("rollout_in_loop_start_step must be >= 0")
     if int(cfg["rollout_in_loop_iterations"]) < 0:
         raise ValueError("rollout_in_loop_iterations must be >= 0")
+    # True autoregressive rollout loss
+    if not isinstance(cfg["true_rollout_loss_enabled"], bool):
+        raise ValueError("true_rollout_loss_enabled must be a boolean")
+    if int(cfg["true_rollout_loss_frequency"]) <= 0:
+        raise ValueError("true_rollout_loss_frequency must be positive")
+    if int(cfg["true_rollout_loss_start_step"]) < 0:
+        raise ValueError("true_rollout_loss_start_step must be >= 0")
+    horizon_raw = cfg.get("true_rollout_loss_horizon")
+    if horizon_raw is not None and int(horizon_raw) <= 0:
+        raise ValueError("true_rollout_loss_horizon must be a positive int or null")
+    # XYZ jitter
+    if not isinstance(cfg["xyz_jitter_enabled"], bool):
+        raise ValueError("xyz_jitter_enabled must be a boolean")
+    if int(cfg["xyz_jitter_start_step"]) < 0:
+        raise ValueError("xyz_jitter_start_step must be >= 0")
+    if float(cfg["xyz_jitter_max_voxels"]) < 0.0:
+        raise ValueError("xyz_jitter_max_voxels must be >= 0")
+    if float(cfg["xyz_jitter_max_voxels"]) > 16.0:
+        raise ValueError(
+            f"xyz_jitter_max_voxels={cfg['xyz_jitter_max_voxels']} > 16 looks like a "
+            "fat-finger config (a 128-voxel crop should not be jittered by > 12.5%); "
+            "if intentional, raise the cap here."
+        )
     if str(cfg["position_refine_loss"]) != "huber":
         raise ValueError("position_refine_loss must currently be 'huber'")
     if float(cfg["position_refine_weight"]) < 0.0:

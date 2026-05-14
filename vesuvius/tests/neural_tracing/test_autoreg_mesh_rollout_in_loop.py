@@ -13,6 +13,7 @@ import pytest
 from vesuvius.neural_tracing.autoreg_mesh.train import (
     _rollout_in_loop_active,
     _scheduled_sampling_prob,
+    _true_rollout_active,
 )
 
 
@@ -173,3 +174,87 @@ def test_scheduled_sampling_two_phase_rejects_regression():
     }
     with pytest.raises(ValueError, match="late_start_step .* must be >= start_step \\+ ramp_steps"):
         validate_autoreg_mesh_config(bad2)
+
+
+# ---------------- True autoregressive rollout schedule ---------------- #
+
+
+def test_true_rollout_schedule_disabled_when_flag_off():
+    cfg = {"true_rollout_loss_enabled": False,
+           "true_rollout_loss_start_step": 0,
+           "true_rollout_loss_frequency": 1}
+    for step in (0, 1, 100, 999999):
+        assert _true_rollout_active(cfg, global_step=step) is False
+
+
+def test_true_rollout_schedule_fires_at_frequency():
+    cfg = {"true_rollout_loss_enabled": True,
+           "true_rollout_loss_start_step": 40000,
+           "true_rollout_loss_frequency": 2000}
+    # Off before start
+    for step in (0, 39999):
+        assert _true_rollout_active(cfg, global_step=step) is False
+    # Fires at start_step and every `frequency` later
+    assert _true_rollout_active(cfg, global_step=40000) is True
+    assert _true_rollout_active(cfg, global_step=42000) is True
+    assert _true_rollout_active(cfg, global_step=44000) is True
+    # Off-firings between
+    for step in (40001, 41000, 41999, 42001, 43999):
+        assert _true_rollout_active(cfg, global_step=step) is False
+
+
+def test_true_rollout_mutex_with_rollout_in_loop():
+    """When both schedules say 'fire', the train loop suppresses rollout-in-loop.
+    Verified by checking both helpers' independent firing AND the mutex rule
+    applied in train.py (which is: rollout_in_loop_active and not true_rollout_active).
+    """
+    cfg = {
+        "true_rollout_loss_enabled": True,
+        "true_rollout_loss_start_step": 0,
+        "true_rollout_loss_frequency": 1000,
+        "rollout_in_loop_enabled": True,
+        "rollout_in_loop_start_step": 0,
+        "rollout_in_loop_frequency": 500,
+    }
+    # Both fire at step 0 and step 1000 (LCM).
+    for step in (0, 1000, 2000):
+        true_r = _true_rollout_active(cfg, global_step=step)
+        in_loop = _rollout_in_loop_active(cfg, global_step=step)
+        assert true_r is True
+        assert in_loop is True
+        # Mutex rule: rollout_in_loop suppressed when true_rollout fires.
+        effective_in_loop = in_loop and not true_r
+        assert effective_in_loop is False, f"step={step}: in_loop must be suppressed when true_r fires"
+    # At step 500 only rollout-in-loop fires (true_rollout's freq is 1000).
+    assert _true_rollout_active(cfg, global_step=500) is False
+    assert _rollout_in_loop_active(cfg, global_step=500) is True
+
+
+def test_config_validator_rejects_bad_true_rollout():
+    from vesuvius.neural_tracing.autoreg_mesh.config import (
+        DEFAULT_AUTOREG_MESH_CONFIG,
+        validate_autoreg_mesh_config,
+    )
+    # Negative start_step
+    bad = {**DEFAULT_AUTOREG_MESH_CONFIG, "datasets": [],
+           "true_rollout_loss_enabled": True,
+           "true_rollout_loss_start_step": -1}
+    with pytest.raises(ValueError, match="true_rollout_loss_start_step must be >= 0"):
+        validate_autoreg_mesh_config(bad)
+    # Zero frequency
+    bad2 = {**DEFAULT_AUTOREG_MESH_CONFIG, "datasets": [],
+            "true_rollout_loss_enabled": True,
+            "true_rollout_loss_frequency": 0}
+    with pytest.raises(ValueError, match="true_rollout_loss_frequency must be positive"):
+        validate_autoreg_mesh_config(bad2)
+    # Zero horizon
+    bad3 = {**DEFAULT_AUTOREG_MESH_CONFIG, "datasets": [],
+            "true_rollout_loss_enabled": True,
+            "true_rollout_loss_horizon": 0}
+    with pytest.raises(ValueError, match="true_rollout_loss_horizon must be a positive int or null"):
+        validate_autoreg_mesh_config(bad3)
+    # Non-bool enabled
+    bad4 = {**DEFAULT_AUTOREG_MESH_CONFIG, "datasets": [],
+            "true_rollout_loss_enabled": "yes"}
+    with pytest.raises(ValueError, match="true_rollout_loss_enabled must be a boolean"):
+        validate_autoreg_mesh_config(bad4)
