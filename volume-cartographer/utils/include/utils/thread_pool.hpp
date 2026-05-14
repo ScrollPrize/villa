@@ -143,7 +143,7 @@ private:
 // ---------------------------------------------------------------------------
 class PriorityThreadPool final {
 public:
-    using Priority = std::int32_t;
+    using Priority = std::int64_t;
 
     explicit PriorityThreadPool(std::size_t num_workers = 0)
         : epoch_{0}, seq_{0}, active_{0}

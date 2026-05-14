@@ -8,6 +8,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QSettings>
+#include <QSpinBox>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -33,6 +34,35 @@ ViewerViewExtrasPanel::ViewerViewExtrasPanel(ViewerManager* viewerManager, QWidg
     connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
         QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
         s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
+        if (_viewerManager) {
+            _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
+                if (!viewer) {
+                    return;
+                }
+                viewer->reloadPerfSettings();
+                viewer->renderVisible(true);
+            });
+        }
+    });
+
+    auto* maxResolutionRow = new LabeledControlRow(tr("Max displayed resolution"), this);
+    auto* maxResolution = new QSpinBox(maxResolutionRow);
+    maxResolution->setRange(0, 5);
+    maxResolution->setValue(std::clamp(
+        settings.value(vc3d::settings::viewer::MAX_DISPLAYED_RESOLUTION,
+                       vc3d::settings::viewer::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
+        0,
+        5));
+    maxResolution->setToolTip(
+        tr("Clamp rendering and chunk fetches so pyramid levels finer than this scale are not requested."));
+    maxResolutionRow->setLabelToolTip(maxResolution->toolTip());
+    maxResolutionRow->addControl(maxResolution);
+    maxResolutionRow->addStretch(1);
+    layout->addWidget(maxResolutionRow);
+
+    connect(maxResolution, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+        s.setValue(vc3d::settings::viewer::MAX_DISPLAYED_RESOLUTION, std::clamp(value, 0, 5));
         if (_viewerManager) {
             _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
                 if (!viewer) {

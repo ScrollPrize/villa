@@ -99,6 +99,7 @@ private:
     QDoubleSpinBox* _spinAlphaLow{nullptr};
     QDoubleSpinBox* _spinAlphaHigh{nullptr};
     QSpinBox* _spinAlphaBlurRadius{nullptr};
+    QSpinBox* _spinAlphaComputeScale{nullptr};
     QDoubleSpinBox* _spinAlphaPerVertexLimit{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
     QDoubleSpinBox* _spinEditScale{nullptr};

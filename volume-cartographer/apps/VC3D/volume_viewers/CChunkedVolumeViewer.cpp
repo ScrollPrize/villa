@@ -58,6 +58,7 @@ constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr int kInitialSegmentationSurfaceLevel = 5;
 constexpr qint64 kInteractivePreviewMinIntervalMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
+constexpr bool kEnableRemoteVolumePrefetchHalo = false;
 constexpr int kChunkPrefetchHaloPx = 128;
 constexpr int kChunkPrefetchPriorityOffset = 1024;
 constexpr int kNormalPrefetchSampleStridePx = 32;
@@ -156,6 +157,12 @@ std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
 bool shouldSpeculativelyPrefetchVolume(const std::shared_ptr<Volume>& volume)
 {
     return volume && volume->isRemote();
+}
+
+bool shouldPrefetchRemoteVolumeHalo(const std::shared_ptr<Volume>& volume)
+{
+    return kEnableRemoteVolumePrefetchHalo &&
+           shouldSpeculativelyPrefetchVolume(volume);
 }
 
 uint32_t alphaBlendArgb(uint32_t base, uint32_t overlay, float alpha)
@@ -762,6 +769,10 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
+    _maxDisplayedResolution = std::clamp(
+        s.value(viewer::MAX_DISPLAYED_RESOLUTION, viewer::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
+        0,
+        5);
 }
 
 void CChunkedVolumeViewer::setSurface(const std::string& name)
@@ -1582,6 +1593,7 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     int level = _dsScaleIdx;
     if (preferSurfaceResolution && _chunkArray && level < _chunkArray->numLevels() - 1)
         level -= kSurfaceResolutionLevelBias;
+    level = std::max(level, _maxDisplayedResolution);
     return std::clamp(level, 0, _chunkArray->numLevels() - 1);
 }
 
@@ -1615,8 +1627,8 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
-    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
-    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
+    const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
     if (_interactivePreview || _framebuffer.isNull() ||
         (!prefetchBase && !prefetchOverlay))
         return;
@@ -1772,8 +1784,8 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
     int fbW,
     int fbH)
 {
-    const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
-    const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
+    const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
+    const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
     if (_interactivePreview || fbW <= 0 || fbH <= 0 ||
         (!prefetchBase && !prefetchOverlay))
         return;
@@ -2358,6 +2370,10 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         profile.setDetails("action=queued_after_worker");
         return;
     }
+
+    _chunkArray->beginViewRequest();
+    if (_overlayChunkArray)
+        _overlayChunkArray->beginViewRequest();
 
     prefetchVisibleSurfaceChunks();
 

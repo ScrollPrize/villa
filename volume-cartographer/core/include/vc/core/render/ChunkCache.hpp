@@ -76,6 +76,7 @@ public:
 
     Stats stats() const;
     void invalidate();
+    void beginViewRequest();
 
 private:
     enum class EntryStatus {
@@ -93,7 +94,8 @@ private:
         std::size_t decodedBytes = 0;
         bool persisted = false;
         bool inLru = false;
-        int priority = 0;
+        int basePriority = 0;
+        utils::PriorityThreadPool::Priority priority = 0;
         std::uint64_t fetchSerial = 0;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -123,6 +125,7 @@ private:
         std::list<ChunkKey> lru_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t generation_ = 0;
+        utils::PriorityThreadPool::Priority viewEpoch_ = 1;
         std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;

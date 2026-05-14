@@ -15,6 +15,7 @@ namespace {
 
 constexpr auto kDownloadStatsWindow = std::chrono::seconds{3};
 constexpr auto kPersistentCacheSizeScanInterval = std::chrono::seconds{2};
+constexpr int kViewEpochPriorityStride = 1024;
 
 std::size_t normalizedWorkerCount(std::size_t requested)
 {
@@ -206,7 +207,7 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
         if (inserted) {
             queueFetchLocked(state, key, state->generation_, priorityOffset);
         } else if (it->second.status == EntryStatus::InFlight &&
-                   key.level + priorityOffset < it->second.priority) {
+                   key.level + priorityOffset < it->second.basePriority) {
             queueFetchLocked(state, key, state->generation_, priorityOffset);
         }
     }
@@ -295,6 +296,16 @@ void ChunkCache::invalidate()
     state->cv_.notify_all();
 }
 
+void ChunkCache::beginViewRequest()
+{
+    auto state = state_;
+    std::lock_guard lock(state->mutex_);
+    if (state->viewEpoch_ == std::numeric_limits<utils::PriorityThreadPool::Priority>::max())
+        state->viewEpoch_ = 1;
+    else
+        ++state->viewEpoch_;
+}
+
 ChunkResult ChunkCache::resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry)
 {
     ChunkResult result;
@@ -337,11 +348,13 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
         return;
     Entry& entry = it->second;
     entry.status = EntryStatus::InFlight;
-    entry.priority = key.level + priorityOffset;
+    entry.basePriority = key.level + priorityOffset;
+    const auto epochBias = state->viewEpoch_;
+    entry.priority = entry.basePriority - epochBias * kViewEpochPriorityStride;
     const std::uint64_t fetchSerial = state->nextFetchSerial_++;
     entry.fetchSerial = fetchSerial;
 
-    const auto priority = static_cast<utils::PriorityThreadPool::Priority>(entry.priority);
+    const auto priority = entry.priority;
     std::weak_ptr<State> weakState = state;
     chunkWorkerPool(state->options_.maxConcurrentReads).submit(priority, [weakState, key, generation, fetchSerial] {
         if (auto state = weakState.lock())

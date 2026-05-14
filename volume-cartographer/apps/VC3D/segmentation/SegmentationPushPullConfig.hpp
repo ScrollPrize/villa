@@ -8,6 +8,7 @@ struct AlphaPushPullConfig
     float low{0.47f};
     float high{0.65f};
     int blurRadius{3};
+    int computeScale{0};
     float perVertexLimit{5.0f};
     bool perVertex{true};
 };

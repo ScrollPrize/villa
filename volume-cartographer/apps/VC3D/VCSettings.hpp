@@ -127,6 +127,7 @@ namespace viewer {
     constexpr auto RESET_VIEW_ON_SURFACE_CHANGE = "viewer/reset_view_on_surface_change";
     constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
     constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
+    constexpr auto MAX_DISPLAYED_RESOLUTION = "viewer/max_displayed_resolution";
 
     constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
     constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
@@ -139,6 +140,7 @@ namespace viewer {
     constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = true;
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
+    constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
 
     // Volume Window (Base Grayscale Window)
     constexpr auto BASE_WINDOW_LOW = "viewer/base_window_low";
@@ -348,6 +350,7 @@ namespace segmentation {
     constexpr auto PUSH_PULL_ALPHA_LOW = "push_pull_alpha_low";
     constexpr auto PUSH_PULL_ALPHA_HIGH = "push_pull_alpha_high";
     constexpr auto PUSH_PULL_ALPHA_RADIUS = "push_pull_alpha_radius";
+    constexpr auto PUSH_PULL_ALPHA_COMPUTE_SCALE = "push_pull_alpha_compute_scale";
     constexpr auto PUSH_PULL_ALPHA_LIMIT = "push_pull_alpha_limit";
     constexpr auto PUSH_PULL_ALPHA_PER_VERTEX = "push_pull_alpha_per_vertex";
 
