@@ -360,14 +360,16 @@ def _height_map_splat(
 	h_cont_p: torch.Tensor,       # (Kp,) float — continuous mesh-row position
 	w_cont_p: torch.Tensor,       # (Kp,) float — continuous mesh-col position
 	signed_delta_p: torch.Tensor, # (Kp,) float — scalar per-point displacement (sign baked in)
+	normal_p: torch.Tensor,       # (Kp, 3) float — corr point sampled GT normals
 	mask_p: torch.Tensor,         # (Kp,) float — soft per-point validity weight
 	sigma: float,
 	D: int, Hm: int, Wm: int,
 	H_map: torch.Tensor,          # (D, Hm, Wm) — accumulator (mutated in place)
+	V_map: torch.Tensor,          # (D, Hm, Wm, 3) — vector displacement accumulator
 	W_map: torch.Tensor,          # (D, Hm, Wm) — sum-weight accumulator (mutated in place)
 	W_max_map: torch.Tensor,      # (D, Hm, Wm) — max single-point weight (mutated in place)
 ) -> None:
-	"""Splat per-corr-point scalar displacements onto (D, Hm, Wm) accumulators with a Gaussian
+	"""Splat per-corr-point displacements onto (D, Hm, Wm) accumulators with a Gaussian
 	kernel in mesh-vertex coordinates. R = ceil(3σ) neighborhood; out-of-bounds neighbors
 	get weight 0 (no spillover). All inputs are detached scalars/tensors.
 	"""
@@ -402,12 +404,14 @@ def _height_map_splat(
 	base_weight = base_weight / base_weight.sum(dim=(1, 2), keepdim=True).clamp_min(1e-8)
 	weight = base_weight * mask_p.view(Kp, 1, 1)
 	delta = weight * signed_delta_p.view(Kp, 1, 1)
+	disp = delta.unsqueeze(-1) * normal_p.view(Kp, 1, 1, 3)
 
 	v_h_c = v_h.clamp(0, Hm - 1)
 	v_w_c = v_w.clamp(0, Wm - 1)
 	flat_idx = (d_p.view(Kp, 1, 1) * Hm * Wm + v_h_c * Wm + v_w_c).reshape(-1)
 
 	H_map.view(-1).scatter_add_(0, flat_idx, delta.reshape(-1))
+	V_map.view(-1, 3).scatter_add_(0, flat_idx.reshape(-1, 1).expand(-1, 3), disp.reshape(-1, 3))
 	W_map.view(-1).scatter_add_(0, flat_idx, weight.reshape(-1))
 	W_max_map.view(-1).scatter_reduce_(0, flat_idx, weight.reshape(-1), reduce="amax", include_self=True)
 
@@ -1026,11 +1030,11 @@ def _corr_winding_loss(
 	normal_align_wsum = torch.zeros(K, device=dev, dtype=dt)
 	target_normal_sum = torch.zeros(K, 3, device=dev, dtype=dt)
 
-	# Shared scalar height map and weight accumulators across both ci=2 and ci=3 splats.
-	# H_map/W_map average the signed correction value; W_max_map caps the loss
-	# strength to the strongest single point at each vertex so dense corr points
-	# refine the value without multiplying the gradient.
+	# Shared splat maps across both ci=2 and ci=3. H_map is kept for scalar
+	# diagnostics; V_map/W_map is the averaged displacement vector used by the
+	# proxy. W_max_map caps force strength to the strongest single point.
 	H_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
+	V_map = torch.zeros(D, Hm, Wm, 3, device=dev, dtype=dt)
 	W_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
 	W_max_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
 
@@ -1061,15 +1065,8 @@ def _corr_winding_loss(
 			layer_d = d_ci.to(dt)
 			tgt = layer_d - target[vi]
 			err = sw - tgt
-			gt_n_q_sampled = res.data.grid_sample_fullres(
-				Q_det.reshape(1, 1, int(Q_det.shape[0]), 3),
-				channels={"nx", "ny"},
-			)
-			gt_n_q = gt_n_q_sampled.normal_3d.reshape(int(Q_det.shape[0]), 3)
-			gt_n_q = gt_n_q / (gt_n_q.norm(dim=-1, keepdim=True) + 1e-8)
-			normal_align = (gt_n_q * gt_n[vi]).sum(dim=-1).clamp(-1.0, 1.0)
-			normal_sign = torch.where(normal_align >= 0.0, torch.ones_like(normal_align), -torch.ones_like(normal_align))
-			normal_weight = normal_align.abs()
+			corr_n = gt_n[vi]
+			normal_align = torch.ones_like(err)
 
 			# Keep the closest-pair bracket as a trust gate for applying force.
 			# Target-pair measurements are useful for reporting, but if the point
@@ -1088,15 +1085,12 @@ def _corr_winding_loss(
 			target_obs_wsum[vi] += fw_measure
 			normal_align_sum[vi] += normal_align * fw_measure
 			normal_align_wsum[vi] += fw_measure
-			target_normal_sum[vi] += gt_n_q * fw_measure.unsqueeze(-1)
+			target_normal_sum[vi] += corr_n * fw_measure.unsqueeze(-1)
 
-			# Scalar per-point displacement along the sampled target normals.  The error
-			# is measured in the correction-point normal frame, so flip it when the target
-			# intersection normal points the other way.
-			signed_delta = -err * normal_sign
-			# Fold ray-in-bounds and normal alignment into the soft mask: perpendicular
-			# normals contribute no correction; aligned/opposite normals contribute fully.
-			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci * ib.to(dt) * normal_weight
+			# The base point was found along the corr point sampled GT normal; use that
+			# same normal for the splatted proxy displacement.
+			signed_delta = -err
+			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci * ib.to(dt)
 
 			# Continuous mesh-space position of the corr point on the avg-pair quad.
 			h_cont = h_ci.to(dt) + u_ci
@@ -1104,13 +1098,12 @@ def _corr_winding_loss(
 
 			_height_map_splat(
 				d_ci, h_ci, w_ci, h_cont, w_cont,
-				signed_delta, mask_p,
+				signed_delta, corr_n, mask_p,
 				_corr_splat_sigma, D, Hm, Wm,
-				H_map, W_map, W_max_map,
+				H_map, V_map, W_map, W_max_map,
 			)
 
-	# Apply the height map: for each active vertex, target = M_det + gt_n_v · (H/W).
-	# Sample GT normal at the active vertex 3D positions (one extra grid_sample call).
+	# Apply the averaged vector displacement map.
 	active = W_map > 1e-8
 	n_active = int(active.sum().item())
 
@@ -1121,22 +1114,11 @@ def _corr_winding_loss(
 		d_idx, h_idx, w_idx = active.nonzero(as_tuple=True)
 		M_active = xyz_lr[d_idx, h_idx, w_idx]                       # live, (Na, 3)
 		M_det_active = xyz_det[d_idx, h_idx, w_idx]                  # detached, (Na, 3)
-		H_active = H_map[d_idx, h_idx, w_idx]                        # (Na,)
+		V_active = V_map[d_idx, h_idx, w_idx]                        # (Na, 3)
 		W_active = W_map[d_idx, h_idx, w_idx]                        # (Na,) summed weights for averaging
 		W_loss_active = W_max_map[d_idx, h_idx, w_idx]               # (Na,) max single-point force weight
 
-		# Sample GT normal at each active vertex's 3D position (detached)
-		Na = int(M_active.shape[0])
-		gt_n_v_sampled = res.data.grid_sample_fullres(
-			M_det_active.reshape(1, 1, Na, 3),
-			channels={"nx", "ny"},
-		)
-		gt_n_v = gt_n_v_sampled.normal_3d.reshape(Na, 3)
-		gt_n_v = gt_n_v / (gt_n_v.norm(dim=-1, keepdim=True) + 1e-8)
-
-		# target_v = M_det_v + gt_n_v · (H_v / W_v)  (3D)
-		h_per_v = (H_active / W_active.clamp_min(1e-8)).unsqueeze(-1)
-		target_active = M_det_active + gt_n_v * h_per_v
+		target_active = M_det_active + V_active / W_active.clamp_min(1e-8).unsqueeze(-1)
 
 		# loss = Σ Wmax_v · ||M_v - target_v||²  (gradient flows through M_active)
 		diff = M_active - target_active
