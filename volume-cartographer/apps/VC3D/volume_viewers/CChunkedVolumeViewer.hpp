@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QPointF>
+#include <QPointer>
 #include <QWidget>
 
 #include <algorithm>
@@ -269,7 +270,7 @@ private:
     QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
 
     CState* _state = nullptr;
-    ViewerManager* _viewerManager = nullptr;
+    QPointer<ViewerManager> _viewerManager;
     VCCollection* _pointCollection = nullptr;
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
