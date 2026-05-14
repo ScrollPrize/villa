@@ -21,6 +21,7 @@ extern "C" {
 }
 
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -131,6 +132,12 @@ public:
 
         pastix_task_analyze(data_, &spm_);
         analyzed_ = true;
+        if (!logged_threads_) {
+            std::cerr << "[pastix] IPARM_THREAD_NBR=" << iparm_[IPARM_THREAD_NBR]
+                      << " (matrix n=" << n << ", lower_nnz=" << lower_nnz << ")"
+                      << std::endl;
+            logged_threads_ = true;
+        }
     }
 
     void factorize(const SparseMatrix& L) {
@@ -170,6 +177,7 @@ private:
     spmatrix_t     spm_{};
     std::vector<int> value_src_idx_;
     bool           analyzed_ = false;
+    bool           logged_threads_ = false;
 };
 
 } // namespace igl
