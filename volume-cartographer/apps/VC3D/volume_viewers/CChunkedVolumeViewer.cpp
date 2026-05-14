@@ -769,6 +769,10 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
+    _maxDisplayedResolution = std::clamp(
+        s.value(viewer::MAX_DISPLAYED_RESOLUTION, viewer::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
+        0,
+        5);
 }
 
 void CChunkedVolumeViewer::setSurface(const std::string& name)
@@ -1589,6 +1593,7 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     int level = _dsScaleIdx;
     if (preferSurfaceResolution && _chunkArray && level < _chunkArray->numLevels() - 1)
         level -= kSurfaceResolutionLevelBias;
+    level = std::max(level, _maxDisplayedResolution);
     return std::clamp(level, 0, _chunkArray->numLevels() - 1);
 }
 

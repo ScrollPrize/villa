@@ -354,6 +354,7 @@ private:
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
+    int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;
     bool _showSurfaceNormals = false;
     float _normalArrowLengthScale = 1.0f;
