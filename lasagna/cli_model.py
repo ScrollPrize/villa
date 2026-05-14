@@ -13,7 +13,7 @@ class ModelConfig:
 	depth: int               # number of windings
 	mesh_h: int              # mesh grid height
 	mesh_w: int              # mesh grid width
-	init_mode: str           # "cylinder_seed"
+	init_mode: str           # "cylinder_seed" or "shell-dir-crop"
 	z_center: float          # scroll height center (fullres)
 	pyramid_d: bool
 	model_input: str | None
@@ -29,7 +29,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--depth", type=int, default=3)
 	g.add_argument("--mesh-h", type=int, default=32)
 	g.add_argument("--mesh-w", type=int, default=32)
-	g.add_argument("--init-mode", default="cylinder_seed", choices=["cylinder_seed"])
+	g.add_argument("--init-mode", default="cylinder_seed", choices=["cylinder_seed", "shell-dir-crop"])
 	g.add_argument("--z-center", type=float, default=0.0)
 	g.add_argument("--pyramid-d", action=argparse.BooleanOptionalAction, default=True)
 	g.add_argument("--model-input", default=None)

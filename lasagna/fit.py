@@ -68,6 +68,15 @@ def _apply_cylinder_prepare_model_step(mdl: "model.Model3D", model_step: float |
 		mdl.cyl_shell_current_height_step = step
 
 
+def _require_manifest_init_shell_dir(prep_params: dict) -> str:
+	value = prep_params.get("init_shell_dir", None)
+	if value is None:
+		raise ValueError("shell-dir-crop init requires .lasagna.json key 'init_shell_dir'")
+	if not isinstance(value, str) or not value.strip():
+		raise ValueError("shell-dir-crop init requires non-empty string .lasagna.json key 'init_shell_dir'")
+	return str(value)
+
+
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
 	"""Parse a VC3D corr_points collections dict into CorrPoints3D."""
 	cols = obj.get("collections", {})
@@ -213,6 +222,11 @@ def main(argv: list[str] | None = None) -> int:
 	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
 	if model_init not in {"seed", "ext", "model"}:
 		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, or model)")
+	init_mode = str(model_cfg.init_mode).strip().lower()
+	if init_mode == "shell-dir-crop" and model_init != "seed":
+		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")
+	if init_mode == "shell-dir-crop" and "init_shell_dir" in cfg:
+		raise ValueError("do not set top-level config key 'init_shell_dir'; shell-dir-crop reads it from --input .lasagna.json")
 
 	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
 	_t = _stage_start("probe_preprocessed_data")
@@ -252,12 +266,13 @@ def main(argv: list[str] | None = None) -> int:
 
 	if model_init == "seed" and data_cfg.seed is not None:
 		model_cfg = dataclasses.replace(model_cfg, z_center=float(data_cfg.seed[2]))
-		print(f"[fit] cylinder_seed from seed: x={float(data_cfg.seed[0]):.1f} "
+		label = "shell-dir-crop" if init_mode == "shell-dir-crop" else "cylinder_seed"
+		print(f"[fit] {label} from seed: x={float(data_cfg.seed[0]):.1f} "
 			  f"y={float(data_cfg.seed[1]):.1f} z={float(data_cfg.seed[2]):.1f}",
 			  flush=True)
 
 	# --- Size mesh from model_h only for the umbilicus tube experiment ---
-	if model_init == "seed" and data_cfg.model_h is not None:
+	if model_init == "seed" and init_mode == "cylinder_seed" and data_cfg.model_h is not None:
 		tube_z_step = 1000.0
 		auto_mesh_w = 20
 		auto_mesh_h = max(2, int(math.ceil(float(data_cfg.model_h) / tube_z_step)) + 1)
@@ -483,29 +498,73 @@ def main(argv: list[str] | None = None) -> int:
 		)
 		print(f"[fit] initialized from tifxyz: {tifxyz_init}", flush=True)
 	elif model_init == "seed":
-		print(f"[fit] model-init=seed: constructing model from seed", flush=True)
-		mdl = model.Model3D(
-			device=device,
-			depth=model_cfg.depth,
-			mesh_h=model_cfg.mesh_h,
-			mesh_w=model_cfg.mesh_w,
-			mesh_step=model_cfg.mesh_step,
-			winding_step=model_cfg.winding_step,
-			subsample_mesh=model_cfg.subsample_mesh,
-			subsample_winding=model_cfg.subsample_winding,
-			scaledown=scaledown,
-			z_step_eff=int(round(scaledown)),
-			z_center=model_cfg.z_center,
-			init_mode=model_cfg.init_mode,
-			volume_extent=None,
-			pyramid_d=model_cfg.pyramid_d,
-		)
-		mdl.init_cylinder_seed(
-			seed=tuple(float(v) for v in data_cfg.seed),
-			model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
-			model_h=float(data_cfg.model_h),
-			volume_extent_fullres=volume_extent_fullres,
-		)
+		if init_mode == "shell-dir-crop":
+			print("[fit] model-init=seed/init-mode=shell-dir-crop: constructing model from init shells", flush=True)
+			from init_shell_index import InitShellIndex, crop_shell_surface
+			init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+			shell_index = InitShellIndex.from_directory(init_shell_dir)
+			closest = shell_index.closest_point(tuple(float(v) for v in data_cfg.seed), device=device)
+			surface = shell_index.surfaces[closest.shell_index]
+			crop_xyz, crop_valid, crop_info = crop_shell_surface(
+				surface,
+				closest,
+				seed=tuple(float(v) for v in data_cfg.seed),
+				model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
+				model_h=float(data_cfg.model_h),
+				mesh_step=float(model_cfg.mesh_step),
+				device=device,
+			)
+			mdl = model.Model3D.from_tifxyz_crop(
+				crop_xyz,
+				crop_valid,
+				device=device,
+				mesh_step=model_cfg.mesh_step,
+				winding_step=model_cfg.winding_step,
+				subsample_mesh=model_cfg.subsample_mesh,
+				subsample_winding=model_cfg.subsample_winding,
+			)
+			mdl.params = dataclasses.replace(
+				mdl.params,
+				scaledown=scaledown,
+				z_step_eff=int(round(scaledown)),
+				volume_extent=None,
+				model_w=(None if data_cfg.model_w is None else float(data_cfg.model_w)),
+				model_h=float(data_cfg.model_h),
+			)
+			print(
+				f"[fit] shell-dir-crop selected {closest.shell_id}: "
+				f"quad=({closest.quad_row},{closest.quad_col}) tri={closest.triangle_id} "
+				f"h={closest.h:.3f} w={closest.w:.3f} "
+				f"dist={closest.distance:.3f} "
+				f"crop={crop_info.mesh_h}x{crop_info.mesh_w} full_width={crop_info.full_width}",
+				flush=True,
+			)
+		elif init_mode == "cylinder_seed":
+			print(f"[fit] model-init=seed: constructing model from seed", flush=True)
+			mdl = model.Model3D(
+				device=device,
+				depth=model_cfg.depth,
+				mesh_h=model_cfg.mesh_h,
+				mesh_w=model_cfg.mesh_w,
+				mesh_step=model_cfg.mesh_step,
+				winding_step=model_cfg.winding_step,
+				subsample_mesh=model_cfg.subsample_mesh,
+				subsample_winding=model_cfg.subsample_winding,
+				scaledown=scaledown,
+				z_step_eff=int(round(scaledown)),
+				z_center=model_cfg.z_center,
+				init_mode=model_cfg.init_mode,
+				volume_extent=None,
+				pyramid_d=model_cfg.pyramid_d,
+			)
+			mdl.init_cylinder_seed(
+				seed=tuple(float(v) for v in data_cfg.seed),
+				model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
+				model_h=float(data_cfg.model_h),
+				volume_extent_fullres=volume_extent_fullres,
+			)
+		else:
+			raise ValueError(f"unsupported init-mode for model-init=seed: {init_mode}")
 	else:
 		print(f"[fit] model-init=model: loading checkpoint {model_cfg.model_input}", flush=True)
 		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)

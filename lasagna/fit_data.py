@@ -939,6 +939,11 @@ def get_preprocessed_params(path: str) -> dict:
 				"scaledown": float(min_sd),
 				"volume_extent_fullres": volume_extent_fullres,
 				"source_to_base": s2b,
+				"init_shell_dir": (
+					str(vol.init_shell_dir_abs_path())
+					if vol.init_shell_dir
+					else None
+				),
 			}
 	raise ValueError(f"no groups in {path}")
 

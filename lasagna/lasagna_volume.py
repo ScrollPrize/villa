@@ -54,6 +54,7 @@ class LasagnaVolume:
 	grad_mag_encode_scale: float = 1000.0
 	grad_mag_factor: float = 1.0
 	umbilicus_json: str = ""
+	init_shell_dir: str = ""
 	groups: dict[str, ChannelGroup] = field(default_factory=dict)
 
 	# --- queries ---
@@ -84,6 +85,12 @@ class LasagnaVolume:
 			raise ValueError(f"lasagna volume {self.path} missing required 'umbilicus_json'")
 		return self.path.parent / self.umbilicus_json
 
+	def init_shell_dir_abs_path(self) -> Path:
+		"""Absolute path to the optional shell-dir-crop initialization directory."""
+		if not self.init_shell_dir:
+			raise ValueError(f"lasagna volume {self.path} missing required 'init_shell_dir'")
+		return self.path.parent / self.init_shell_dir
+
 	# --- persistence ---
 
 	def save(self) -> None:
@@ -97,6 +104,8 @@ class LasagnaVolume:
 			"umbilicus_json": self.umbilicus_json,
 			"groups": {name: g.to_dict() for name, g in self.groups.items()},
 		}
+		if self.init_shell_dir:
+			d["init_shell_dir"] = self.init_shell_dir
 		if self.crops:
 			d["crops"] = [list(c) for c in self.crops]
 		if self.base_shape_zyx is not None:
@@ -118,6 +127,7 @@ class LasagnaVolume:
 		umbilicus_json = str(d.get("umbilicus_json", "")).strip()
 		if not umbilicus_json:
 			raise ValueError(f"lasagna volume {p} missing required 'umbilicus_json'")
+		init_shell_dir = str(d.get("init_shell_dir", "")).strip()
 		# Load crops list (new format) or migrate from single crop_xyzwhd (old)
 		crops_raw = d.get("crops")
 		crops: list[tuple[int, int, int, int, int, int]] = []
@@ -151,6 +161,7 @@ class LasagnaVolume:
 			grad_mag_encode_scale=float(d.get("grad_mag_encode_scale", 1000.0)),
 			grad_mag_factor=float(d.get("grad_mag_factor", 1.0)),
 			umbilicus_json=umbilicus_json,
+			init_shell_dir=init_shell_dir,
 			groups=groups,
 		)
 
