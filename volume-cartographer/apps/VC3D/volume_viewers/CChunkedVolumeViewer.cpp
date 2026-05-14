@@ -2359,6 +2359,10 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
 
+    _chunkArray->beginViewRequest();
+    if (_overlayChunkArray)
+        _overlayChunkArray->beginViewRequest();
+
     if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
         ++_renderSerial;
         _renderPendingAfterWorker = true;

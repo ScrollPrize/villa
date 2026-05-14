@@ -15,6 +15,8 @@ namespace {
 
 constexpr auto kDownloadStatsWindow = std::chrono::seconds{3};
 constexpr auto kPersistentCacheSizeScanInterval = std::chrono::seconds{2};
+constexpr int kViewEpochPriorityStride = 1024;
+constexpr std::uint64_t kMaxPriorityEpochBias = 1'000'000;
 
 std::size_t normalizedWorkerCount(std::size_t requested)
 {
@@ -158,6 +160,8 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
     auto it = state->entries_.find(key);
     if (it != state->entries_.end()) {
         if (it->second.status == EntryStatus::InFlight) {
+            if (it->second.fetchViewEpoch < state->viewEpoch_)
+                queueFetchLocked(state, key, state->generation_, 0);
             return ChunkResult{ChunkStatus::MissQueued, state->dtype_, state->levels_[level].chunkShape, {}, {}};
         }
         return resultFromEntryLocked(*state, key, it->second);
@@ -206,7 +210,8 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
         if (inserted) {
             queueFetchLocked(state, key, state->generation_, priorityOffset);
         } else if (it->second.status == EntryStatus::InFlight &&
-                   key.level + priorityOffset < it->second.priority) {
+                   (it->second.fetchViewEpoch < state->viewEpoch_ ||
+                    key.level + priorityOffset < it->second.basePriority)) {
             queueFetchLocked(state, key, state->generation_, priorityOffset);
         }
     }
@@ -295,6 +300,16 @@ void ChunkCache::invalidate()
     state->cv_.notify_all();
 }
 
+void ChunkCache::beginViewRequest()
+{
+    auto state = state_;
+    std::lock_guard lock(state->mutex_);
+    if (state->viewEpoch_ == std::numeric_limits<std::uint64_t>::max())
+        state->viewEpoch_ = 1;
+    else
+        ++state->viewEpoch_;
+}
+
 ChunkResult ChunkCache::resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry)
 {
     ChunkResult result;
@@ -337,22 +352,28 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
         return;
     Entry& entry = it->second;
     entry.status = EntryStatus::InFlight;
-    entry.priority = key.level + priorityOffset;
+    entry.basePriority = key.level + priorityOffset;
+    const auto epochBias = static_cast<int>(
+        std::min<std::uint64_t>(state->viewEpoch_, kMaxPriorityEpochBias));
+    entry.priority = entry.basePriority - epochBias * kViewEpochPriorityStride;
     const std::uint64_t fetchSerial = state->nextFetchSerial_++;
     entry.fetchSerial = fetchSerial;
+    entry.fetchViewEpoch = state->viewEpoch_;
 
     const auto priority = static_cast<utils::PriorityThreadPool::Priority>(entry.priority);
     std::weak_ptr<State> weakState = state;
-    chunkWorkerPool(state->options_.maxConcurrentReads).submit(priority, [weakState, key, generation, fetchSerial] {
+    const std::uint64_t fetchViewEpoch = entry.fetchViewEpoch;
+    chunkWorkerPool(state->options_.maxConcurrentReads).submit(priority, [weakState, key, generation, fetchSerial, fetchViewEpoch] {
         if (auto state = weakState.lock())
-            fetchAndStore(state, key, generation, fetchSerial);
+            fetchAndStore(state, key, generation, fetchSerial, fetchViewEpoch);
     });
 }
 
 void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
                                ChunkKey key,
                                std::uint64_t generation,
-                               std::uint64_t fetchSerial)
+                               std::uint64_t fetchSerial,
+                               std::uint64_t fetchViewEpoch)
 {
     {
         std::lock_guard lock(state->mutex_);
@@ -361,6 +382,11 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
         auto it = state->entries_.find(key);
         if (it == state->entries_.end() || it->second.fetchSerial != fetchSerial)
             return;
+        if (fetchViewEpoch < state->viewEpoch_) {
+            state->entries_.erase(it);
+            state->cv_.notify_all();
+            return;
+        }
     }
 
     ChunkFetchResult fetch;
@@ -404,6 +430,10 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
         auto it = state->entries_.find(key);
         if (it == state->entries_.end() || it->second.fetchSerial != fetchSerial)
             return;
+        if (fetchViewEpoch < state->viewEpoch_) {
+            state->entries_.erase(it);
+            return;
+        }
         storeFetchResultLocked(state, key, std::move(fetch), loadedFromPersistentCache);
     }
     state->cv_.notify_all();
