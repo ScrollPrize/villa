@@ -24,6 +24,8 @@ option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
+option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
+option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
@@ -301,37 +303,49 @@ else()
     find_package(OpenMP REQUIRED)
 endif()
 
-include(ExternalProject)
-include(ProcessorCount)
-ProcessorCount(_nproc)
-if(_nproc EQUAL 0)
-    set(_nproc 1)
+set(VC_LIBBACKTRACE "")
+if(VC_USE_SYSTEM_LIBBACKTRACE)
+    pkg_check_modules(LIBBACKTRACE QUIET IMPORTED_TARGET libbacktrace)
+    if(TARGET PkgConfig::LIBBACKTRACE)
+        set(VC_LIBBACKTRACE PkgConfig::LIBBACKTRACE)
+        message(STATUS "Using system libbacktrace")
+    endif()
 endif()
-set(_libbt_install ${CMAKE_BINARY_DIR}/_deps/libbacktrace-install)
-set(_libbt_lib ${_libbt_install}/lib/libbacktrace.a)
-file(MAKE_DIRECTORY ${_libbt_install}/include)
-ExternalProject_Add(libbacktrace_build
-    GIT_REPOSITORY https://github.com/ianlancetaylor/libbacktrace.git
-    GIT_TAG master
-    GIT_SHALLOW TRUE
-    PREFIX ${CMAKE_BINARY_DIR}/_deps/libbacktrace
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${_libbt_install} --enable-static --disable-shared --with-pic
-    BUILD_COMMAND make -j${_nproc}
-    INSTALL_COMMAND make install
-    BUILD_BYPRODUCTS ${_libbt_lib})
-add_library(libbacktrace_static STATIC IMPORTED GLOBAL)
-set_target_properties(libbacktrace_static PROPERTIES
-    IMPORTED_LOCATION ${_libbt_lib}
-    INTERFACE_INCLUDE_DIRECTORIES ${_libbt_install}/include)
-add_dependencies(libbacktrace_static libbacktrace_build)
-set(VC_LIBBACKTRACE libbacktrace_static)
+if(NOT VC_LIBBACKTRACE)
+    include(ExternalProject)
+    include(ProcessorCount)
+    ProcessorCount(_nproc)
+    if(_nproc EQUAL 0)
+        set(_nproc 1)
+    endif()
+    set(_libbt_install ${CMAKE_BINARY_DIR}/_deps/libbacktrace-install)
+    set(_libbt_lib ${_libbt_install}/lib/libbacktrace.a)
+    file(MAKE_DIRECTORY ${_libbt_install}/include)
+    ExternalProject_Add(libbacktrace_build
+        GIT_REPOSITORY https://github.com/ianlancetaylor/libbacktrace.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE
+        PREFIX ${CMAKE_BINARY_DIR}/_deps/libbacktrace
+        CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${_libbt_install} --enable-static --disable-shared --with-pic
+        BUILD_COMMAND make -j${_nproc}
+        INSTALL_COMMAND make install
+        BUILD_BYPRODUCTS ${_libbt_lib})
+    add_library(libbacktrace_static STATIC IMPORTED GLOBAL)
+    set_target_properties(libbacktrace_static PROPERTIES
+        IMPORTED_LOCATION ${_libbt_lib}
+        INTERFACE_INCLUDE_DIRECTORIES ${_libbt_install}/include)
+    add_dependencies(libbacktrace_static libbacktrace_build)
+    set(VC_LIBBACKTRACE libbacktrace_static)
+endif()
 
 # ---- Subdirectories ---------------------------------------------------------
 include_directories(core/include)
 
 add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
-add_subdirectory(libs/flatboi)
+if(VC_BUILD_FLATBOI)
+    add_subdirectory(libs/flatboi)
+endif()
 
 # Sanitizers/coverage on our code only — libs/ (PaStiX, libigl, ...) builds
 # clean to keep sanitizer build times reasonable.
