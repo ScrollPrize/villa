@@ -20,6 +20,10 @@ class RuntimeContractsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runtime_contracts.normalize_model_type("resnet3d-101")
 
+    def test_normalize_model_type_accepts_primus(self):
+        self.assertEqual(runtime_contracts.normalize_model_type("Primus"), "primus")
+        self.assertIn("primus", runtime_contracts.SUPPORTED_MODEL_TYPES)
+
     def test_cpu_image_rejects_inference(self):
         with self.assertRaisesRegex(RuntimeError, "GPU image target"):
             runtime_contracts.validate_image_role_for_step("inference", "cpu")
