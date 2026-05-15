@@ -70,6 +70,13 @@ class Stage:
 	global_opt: OptSettings
 
 
+@dataclass(frozen=True)
+class CylinderGrowWidthTarget:
+	width_count: int
+	circumference: float
+	width_step: float
+
+
 CYLINDER_SEED_INIT_STAGE_ROLES = ("cyl_init", "cyl_grow", "cyl_grow_refine")
 CYLINDER_STAGE_STEP_ARG = "model-step"
 OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_step_size", "wstep_target")
@@ -89,6 +96,63 @@ CYLINDER_LOSS_NAMES = (
 	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
 	"cyl_base_mesh", "cyl_base_gt", "cyl_outside",
 )
+
+
+def normalize_cylinder_grow_direction(raw: object = "outward") -> int:
+	if raw is None:
+		raw = "outward"
+	if isinstance(raw, str):
+		value = raw.strip().lower()
+		if value in {"outward", "outwards", "grow", "expand", "+", "+1", "1"}:
+			return 1
+		if value in {"inward", "inwards", "shrink", "contract", "-", "-1"}:
+			return -1
+	else:
+		try:
+			value_f = float(raw)
+		except (TypeError, ValueError):
+			value_f = None
+		if value_f == 1.0:
+			return 1
+		if value_f == -1.0:
+			return -1
+	raise ValueError(
+		f"cylinder stage arg '{CYLINDER_GROW_DIRECTION_ARG}' must be "
+		f"'outward' or 'inward', got {raw!r}"
+	)
+
+
+def cylinder_grow_width_target(
+	*,
+	reference_width_count: int,
+	reference_circumference: float,
+	shell_index: int,
+	grow_factor: float,
+	direction: int,
+) -> CylinderGrowWidthTarget:
+	ref_w = max(3, int(reference_width_count))
+	ref_circ = max(1.0e-6, float(reference_circumference))
+	idx = max(0, int(shell_index))
+	factor = max(1.0, float(grow_factor))
+	scale = factor ** idx
+	if int(direction) < 0:
+		scale = 1.0 / scale
+	target_circ = ref_circ * scale
+	target_w_f = float(ref_w) * scale
+	target_w = max(3, int(math.floor(target_w_f + 0.5)))
+	return CylinderGrowWidthTarget(
+		width_count=target_w,
+		circumference=target_circ,
+		width_step=target_circ / float(target_w),
+	)
+
+
+def _cyl_outside_mode_for_direction(direction: int) -> str:
+	return (
+		cyl_sdf_volume.CYL_OUTSIDE_MODE_OUTSIDE
+		if int(direction) < 0
+		else cyl_sdf_volume.CYL_OUTSIDE_MODE_INSIDE
+	)
 
 
 def _stage_to_modifiers(
@@ -514,34 +578,9 @@ def optimize(
 				return value
 		return int(default)
 
-	def _cyl_stage_grow_direction() -> int:
-		for stage_ in stages:
-			if stage_.name != "cyl_grow":
-				continue
-			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
-			raw = args.get(CYLINDER_GROW_DIRECTION_ARG, "outward")
-			if raw is None:
-				raw = "outward"
-			if isinstance(raw, str):
-				value = raw.strip().lower()
-				if value in {"outward", "grow", "expand", "+", "+1", "1"}:
-					return 1
-				if value in {"inward", "shrink", "contract", "-", "-1"}:
-					return -1
-			else:
-				try:
-					value_f = float(raw)
-				except (TypeError, ValueError):
-					value_f = None
-				if value_f == 1.0:
-					return 1
-				if value_f == -1.0:
-					return -1
-			raise ValueError(
-				f"cylinder stage arg '{CYLINDER_GROW_DIRECTION_ARG}' must be "
-				f"'outward' or 'inward', got {raw!r}"
-			)
-		return 1
+	def _cyl_stage_grow_direction(opt_cfg_: OptSettings) -> int:
+		args = opt_cfg_.args if isinstance(opt_cfg_.args, dict) else {}
+		return normalize_cylinder_grow_direction(args.get(CYLINDER_GROW_DIRECTION_ARG, "outward"))
 
 	def _cyl_outside_enabled(eff_: dict[str, float]) -> bool:
 		return _need_term("cyl_outside", eff_) > 0.0
@@ -620,6 +659,7 @@ def optimize(
 		stage_args_: dict,
 		model_step: float,
 		label_: str,
+		direction: int,
 	) -> None:
 		if not _cyl_outside_enabled(eff_):
 			return
@@ -634,19 +674,23 @@ def optimize(
 		chunk_size = _cyl_outside_chunk_size(stage_args_)
 		deep_interp_chunks = _cyl_outside_deep_interp_chunks(stage_args_)
 		deep_blend_chunks = _cyl_outside_deep_blend_chunks(stage_args_)
+		mode = _cyl_outside_mode_for_direction(direction)
+		depth_cap = cyl_sdf_volume.CYL_OUTSIDE_BARRIER_DEPTH_MAX
 		_bbox = cyl_sdf_volume.default_shell_bbox(shells[-1], grid_step=grid_step)
 		_origin, _shape = cyl_sdf_volume.shape_for_bbox(_bbox, grid_step=grid_step)
 		_voxels = int(_shape[0]) * int(_shape[1]) * int(_shape[2])
 		print(
 			f"[optimizer] {label_}: building cyl_outside previous-shell field "
-			f"shape={_shape} voxels={_voxels} grid_step={grid_step:.1f} "
+			f"mode={mode} shape={_shape} voxels={_voxels} grid_step={grid_step:.1f} "
+			f"bbox_padding={depth_cap:.1f} depth_cap={depth_cap:.1f} "
 			f"threads={'auto' if threads == 0 else threads} chunk_size={chunk_size} "
 			f"deep_interp_chunks={deep_interp_chunks:g} deep_blend_chunks={deep_blend_chunks:g}; "
 			f"first run may compile the libigl extension",
 			flush=True,
 		)
-		field = cyl_sdf_volume.build_previous_shell_inside_depth_volume(
+		field = cyl_sdf_volume.build_previous_shell_violation_depth_volume(
 			shells[-1].detach(),
+			mode=mode,
 			grid_step=grid_step,
 			device=device,
 			progress_label=label_,
@@ -658,6 +702,7 @@ def optimize(
 		_set_cyl_outside_field(field, sample_factor=sample_factor, model_step=model_step)
 		print(
 			f"[optimizer] {label_}: cyl_outside field shape={field.shape} "
+			f"mode={mode} "
 			f"origin=({field.origin[0]:.1f},{field.origin[1]:.1f},{field.origin[2]:.1f}) "
 			f"grid_step={grid_step:.1f} depth_max={field.depth_max:.3f}",
 			flush=True,
@@ -1606,7 +1651,6 @@ def optimize(
 			max_steps = int(opt_cfg.steps)
 			default_max_search_shells = max(1, int(getattr(model, "cyl_shell_search_max_shells", 16)))
 			max_search_shells = max(1, _cyl_stage_max_search_shells(default_max_search_shells))
-			grow_direction_arg = _cyl_stage_grow_direction()
 			_stage_wstep = _cyl_stage_width_target_step(opt_cfg)
 			_prev_stage_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
 			_base_wstep = float(
@@ -1729,6 +1773,8 @@ def optimize(
 								max_resamples: int | None = None,
 								allow_resample: bool = True,
 								resample_after_linear_grow: bool = False,
+								resample_width_count: int | None = None,
+								resample_width_step: float | None = None,
 								status_label: str | None = None,
 								shell_no: int | None = None,
 								suppress_initial_status: bool = False) -> dict[str, object]:
@@ -1771,9 +1817,10 @@ def optimize(
 
 				def _resample_shell_width_to_model_step() -> bool:
 					nonlocal resample_count, resampled_this_pass
-					if model_step is None or not allow_resample:
+					if not allow_resample:
 						return True
-					model_step_ref = max(1.0, float(model_step))
+					if resample_width_count is None and model_step is None:
+						return True
 					if max_resamples is not None and resample_count >= max_resamples:
 						print(
 							f"[optimizer] ERROR {shell_label}: cylinder shell pass hit "
@@ -1781,9 +1828,19 @@ def optimize(
 							flush=True,
 						)
 						return False
-					if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
-						raise RuntimeError(f"{shell_label}: model cannot resample cylinder shell width to model-step")
-					model.resample_current_cylinder_shell_width_to_step(data, model_step_ref)
+					if resample_width_count is not None:
+						if not hasattr(model, "resample_current_cylinder_shell_width_to_count"):
+							raise RuntimeError(f"{shell_label}: model cannot resample cylinder shell width to target count")
+						model.resample_current_cylinder_shell_width_to_count(
+							data,
+							int(resample_width_count),
+							target_step=resample_width_step,
+						)
+					else:
+						model_step_ref = max(1.0, float(model_step))
+						if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
+							raise RuntimeError(f"{shell_label}: model cannot resample cylinder shell width to model-step")
+						model.resample_current_cylinder_shell_width_to_step(data, model_step_ref)
 					resample_count += 1
 					resampled_this_pass = True
 					return True
@@ -1955,12 +2012,11 @@ def optimize(
 					step += 1
 				if (
 					resample_after_linear_grow
-					and model_step is not None
 					and step1 > 0
 					and not resampled_this_pass
 					and not _resample_shell_width_to_model_step()
 				):
-					return _error_result(RuntimeError(f"{shell_label}: failed to resample cylinder shell width to model-step"))
+					return _error_result(RuntimeError(f"{shell_label}: failed to resample cylinder shell width after grow"))
 				if snap_int > 0 and (step1 % snap_int) == 0:
 					snapshot_fn(stage=shell_label.replace(".", "_"), step=step1,
 								loss=float(loss.detach().cpu()), data=data, res=res)
@@ -2012,7 +2068,9 @@ def optimize(
 				if not hasattr(model, "begin_cylinder_shell_refine"):
 					raise RuntimeError(f"{refine_label}: model does not support cylinder shell grow-refine")
 				model.begin_cylinder_shell_refine(data)
-				refine_wstep = _actual_width_step_avg(fallback=_base_wstep)
+				refine_wstep = float(getattr(model, "cyl_shell_width_target_step", 0.0))
+				if refine_wstep <= 0.0:
+					refine_wstep = _actual_width_step_avg(fallback=_base_wstep)
 				if hasattr(model, "cyl_shell_width_target_step"):
 					model.cyl_shell_width_target_step = float(refine_wstep)
 				result_ = _run_shell_pass(
@@ -2066,7 +2124,6 @@ def optimize(
 				if _cyl_init_only:
 					_stage_done(f"{label}.total", _t_stage_total)
 					return data
-				model.cyl_shell_search_direction = int(grow_direction_arg)
 				_stage_done(f"{label}.total", _t_stage_total)
 				return data
 
@@ -2076,7 +2133,8 @@ def optimize(
 					return data
 				if not getattr(model, "cyl_shell_completed", None):
 					raise RuntimeError(f"{label}: cyl_grow requires cyl_init to complete a first shell")
-				direction = int(getattr(model, "cyl_shell_search_direction", 1))
+				direction = _cyl_stage_grow_direction(opt_cfg)
+				model.cyl_shell_search_direction = int(direction)
 				grow_refine_opt = (
 					stages[si + 1].global_opt
 					if si + 1 < len(stages) and stages[si + 1].name == "cyl_grow_refine"
@@ -2085,7 +2143,28 @@ def optimize(
 				grow_factor = _cyl_grow_factor()
 				if hasattr(model, "cyl_shell_growth_factor"):
 					model.cyl_shell_growth_factor = float(grow_factor)
-				grow_wstep_end = _base_wstep * grow_factor if direction > 0 else _base_wstep / grow_factor
+				reference_width_raw = getattr(model, "cyl_grow_reference_width_count", None)
+				reference_circ_raw = getattr(model, "cyl_grow_reference_circumference", None)
+				if reference_width_raw is None or reference_circ_raw is None:
+					raise RuntimeError(
+						f"{label}: cyl_grow requires stored grow reference fields "
+						"cyl_grow_reference_width_count and cyl_grow_reference_circumference"
+					)
+				reference_width_count = int(reference_width_raw)
+				reference_circumference = float(reference_circ_raw)
+				if reference_width_count < 3 or not math.isfinite(reference_circumference) or reference_circumference <= 0.0:
+					raise RuntimeError(
+						f"{label}: invalid cylinder grow reference "
+						f"reference_w={reference_width_count} reference_circ={reference_circumference}"
+					)
+				reference_step = reference_circumference / float(reference_width_count)
+				print(
+					f"[optimizer] {label}: cylinder grow reference "
+					f"reference_w={reference_width_count} "
+					f"reference_step={reference_step:.6g} "
+					f"reference_circ={reference_circumference:.6g}",
+					flush=True,
+				)
 				result: dict[str, object] = {"seed_hit": False, "metrics": None, "resamples": 0, "resampled": False, "error": None}
 				while True:
 					shell_i = len(getattr(model, "cyl_shell_completed", []))
@@ -2096,22 +2175,31 @@ def optimize(
 							flush=True,
 						)
 						break
-					if direction < 0 and hasattr(model, "cylinder_shell_search_target_radius"):
-						target_radius = float(model.cylinder_shell_search_target_radius(shell_i, direction=direction))
-						if target_radius < 1.0:
-							print(
-								f"[optimizer] ERROR {label}: reverse cylinder shell growth would shrink "
-								f"below a valid radius at shell {shell_i + 1}: "
-								f"target_radius={target_radius:.3f}; outputting completed shells.",
-								flush=True,
-							)
-							model.cyl_shell_search_done = True
-							setattr(model, "cyl_shell_abort", True)
-							break
+					prev_width_target = cylinder_grow_width_target(
+						reference_width_count=reference_width_count,
+						reference_circumference=reference_circumference,
+						shell_index=shell_i - 1,
+						grow_factor=grow_factor,
+						direction=direction,
+					)
+					grow_width_target = cylinder_grow_width_target(
+						reference_width_count=reference_width_count,
+						reference_circumference=reference_circumference,
+						shell_index=shell_i,
+						grow_factor=grow_factor,
+						direction=direction,
+					)
 					if hasattr(model, "begin_cylinder_shell"):
+						direction_label = "inward" if direction < 0 else "outward"
 						print(
 							f"[optimizer] {label}: adding cylinder shell "
-							f"{shell_i + 1}/{max_search_shells}",
+							f"{shell_i + 1}/{max_search_shells} "
+							f"direction={direction_label} "
+							f"wstep_start={prev_width_target.width_step:.6g} "
+							f"wstep_end={grow_width_target.width_step:.6g} "
+							f"target_w={grow_width_target.width_count} "
+							f"target_circ={grow_width_target.circumference:.6g} "
+							f"grow_factor={grow_factor:.6g}",
 							flush=True,
 						)
 						grow_shell_label = f"{label}.cyl_grow_shell{shell_i + 1}"
@@ -2121,6 +2209,7 @@ def optimize(
 							stage_args_=stage_args,
 							model_step=_base_wstep,
 							label_=grow_shell_label,
+							direction=direction,
 						)
 						model.begin_cylinder_shell(shell_i, data, direction=direction)
 					else:
@@ -2129,12 +2218,14 @@ def optimize(
 					result = _run_shell_pass(
 						grow_shell_label,
 						grow_pass_eff,
-						wstep_start=_base_wstep,
-						wstep_end=grow_wstep_end,
+						wstep_start=prev_width_target.width_step,
+						wstep_end=grow_width_target.width_step,
 						model_step=_base_wstep,
 						max_resamples=1,
 						allow_resample=True,
 						resample_after_linear_grow=True,
+						resample_width_count=grow_width_target.width_count,
+						resample_width_step=grow_width_target.width_step,
 						shell_no=shell_i + 1,
 						suppress_initial_status=False,
 					)

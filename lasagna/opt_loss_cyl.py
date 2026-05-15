@@ -1219,7 +1219,7 @@ def cyl_bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[to
 
 
 def cyl_outside_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Penalize current shell samples that lie inside the previous shell field."""
+	"""Penalize current shell samples that violate the previous shell barrier."""
 	global _last_stats
 	if not bool(getattr(res, "cyl_shell_mode", False)) or int(getattr(res, "cyl_shell_index", 0)) <= 0:
 		_last_stats = {}
@@ -1261,25 +1261,34 @@ def cyl_outside_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple
 		offset,
 		inv_scale,
 	).squeeze(0).squeeze(0)
-	inside_depth = (sampled_q / 255.0).square() * depth_max
+	idx_x = (xyz[..., 0] - offset[0]) * inv_scale[0]
+	idx_y = (xyz[..., 1] - offset[1]) * inv_scale[1]
+	idx_z = (xyz[..., 2] - offset[2]) * inv_scale[2]
+	out_of_field = (
+		(idx_x < 0.0) | (idx_x > float(volume.shape[3] - 1)) |
+		(idx_y < 0.0) | (idx_y > float(volume.shape[2] - 1)) |
+		(idx_z < 0.0) | (idx_z > float(volume.shape[1] - 1))
+	)
+	sampled_q = torch.where(out_of_field, torch.full_like(sampled_q, 255.0), sampled_q)
+	violation_depth = (sampled_q / 255.0).square() * depth_max
 	model_step = getattr(res, "cyl_outside_model_step", None)
 	if model_step is None or float(model_step) <= 0.0:
 		model_step = float(getattr(res.params, "mesh_step", 1.0))
 	model_step_t = xyz.new_tensor(max(1.0e-6, float(model_step)))
-	lm = (inside_depth / model_step_t).square()
+	lm = (violation_depth / model_step_t).square()
 	with torch.no_grad():
-		inside_det = inside_depth.detach()
+		violation_det = violation_depth.detach()
 		active_det = active.detach()
-		penetrating = active_det & (inside_det > 0.0)
+		penetrating = active_det & (violation_det > 0.0)
 		active_count = max(1, int(active_det.sum().detach().cpu()))
 		if bool(penetrating.any().detach().cpu()):
-			depth_vals = inside_det[penetrating]
+			depth_vals = violation_det[penetrating]
 			depth_avg = float(depth_vals.mean().detach().cpu())
 		else:
 			depth_avg = 0.0
 		_last_stats = {
 			"cyl_outside_pen_frac": float(penetrating.sum().detach().cpu()) / float(active_count),
-			"cyl_outside_depth_max": float(torch.where(active_det, inside_det, torch.zeros_like(inside_det)).amax().detach().cpu()),
+			"cyl_outside_depth_max": float(torch.where(active_det, violation_det, torch.zeros_like(violation_det)).amax().detach().cpu()),
 			"cyl_outside_depth_avg": depth_avg,
 		}
 	return _register_shell_masked_term("cyl_outside", lm, mask, res=res)
