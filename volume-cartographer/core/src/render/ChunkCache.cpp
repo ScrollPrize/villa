@@ -392,7 +392,8 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
         if (auto cached = readPersistent(*state, key)) {
             fetch = state->fetchers_.at(static_cast<std::size_t>(key.level))
                         ->decodePersistentBytes(key, std::move(*cached));
-            if (fetch.status == ChunkFetchStatus::Found) {
+            if (fetch.status == ChunkFetchStatus::Found &&
+                fetch.bytes.size() == expectedChunkBytes(*state, key)) {
                 loadedFromPersistentCache = true;
             } else {
                 fetch = fetchRemote();
