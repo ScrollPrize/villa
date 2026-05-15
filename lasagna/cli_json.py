@@ -52,7 +52,12 @@ def merge_cfgs(paths: list[str]) -> dict:
 
 	merged: dict = {}
 	for pj in paths:
-		cfg = json.loads(Path(pj).read_text(encoding="utf-8"))
+		try:
+			cfg = json.loads(Path(pj).read_text(encoding="utf-8"))
+		except json.JSONDecodeError as exc:
+			raise ValueError(
+				f"invalid JSON in config {pj}: line {exc.lineno}, column {exc.colno}: {exc.msg}"
+			) from exc
 		if not isinstance(cfg, dict):
 			raise ValueError(f"json must contain an object at top-level: {pj}")
 		merged = _merge(merged, cfg)

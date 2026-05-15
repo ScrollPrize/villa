@@ -1,8 +1,11 @@
 {
+	"args": {
+		"model-init": "model"
+	},
 	"base": {
 		"normal": 1.0,
 		"step": 10.0,
-		"smooth": 0.0001,
+		"smooth": 10.0,
 		"station_n": 0.0,
 		"station_t": 0.0001,
 		"winding_density": 0.01,
@@ -15,30 +18,34 @@
 	},
 	"stages": [
 		{
-			"name": "init",
-			"steps": 500,
-			"min_scaledown": 3,
-			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
+			"name": "stage1",
+			"steps": 1000,
+			"lr": 0.1,
 			"params": ["mesh_ms"],
+			"min_scaledown": 0,
 			"w_fac": {
-				"pred_dt": 0.0
+				"pred_dt": 0.0,
+				"station_n": 10.0,
+				"station_t": 10.0
 			}
 		},
 		{
-			"name": "opt",
-			"steps": 1000,
-			"min_scaledown": 0,
-			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
+			"name": "stage2",
+			"steps": 500,
+			"lr": 0.01,
 			"params": ["mesh_ms"],
+			"min_scaledown": 0,
 			"w_fac": {
-				"pred_dt": 0.0
+				"pred_dt": 0.0,
+				"station_n": 10.0,
+				"station_t": 10.0
 			}
-		},
+		}
 		{
 			"name": "snap",
 			"steps": 1000,
 			"min_scaledown": 0,
-			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
+			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"w_fac": {
 				"ext_offset": 0.01

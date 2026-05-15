@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+LASAGNA_VOLUME_VERSION = 2
+
+
 @dataclass
 class ChannelGroup:
 	"""One zarr array containing one or more channels at a common resolution."""
@@ -44,12 +47,14 @@ class ChannelGroup:
 class LasagnaVolume:
 	"""In-memory representation of a .lasagna.json manifest."""
 	path: Path
-	version: int = 1
+	version: int = LASAGNA_VOLUME_VERSION
 	source_to_base: float = 1.0
 	crops: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
 	base_shape_zyx: tuple[int, int, int] | None = None
 	grad_mag_encode_scale: float = 1000.0
 	grad_mag_factor: float = 1.0
+	umbilicus_json: str = ""
+	init_shell_dir: str = ""
 	groups: dict[str, ChannelGroup] = field(default_factory=dict)
 
 	# --- queries ---
@@ -74,17 +79,33 @@ class LasagnaVolume:
 		g = self.groups[group_name]
 		return self.path.parent / g.zarr_path
 
+	def umbilicus_abs_path(self) -> Path:
+		"""Absolute path to the required umbilicus control-point JSON."""
+		if not self.umbilicus_json:
+			raise ValueError(f"lasagna volume {self.path} missing required 'umbilicus_json'")
+		return self.path.parent / self.umbilicus_json
+
+	def init_shell_dir_abs_path(self) -> Path:
+		"""Absolute path to the optional shell-dir-crop initialization directory."""
+		if not self.init_shell_dir:
+			raise ValueError(f"lasagna volume {self.path} missing required 'init_shell_dir'")
+		return self.path.parent / self.init_shell_dir
+
 	# --- persistence ---
 
 	def save(self) -> None:
 		"""Write JSON to self.path."""
+		self.version = LASAGNA_VOLUME_VERSION
 		d: dict = {
-			"version": self.version,
+			"version": LASAGNA_VOLUME_VERSION,
 			"source_to_base": self.source_to_base,
 			"grad_mag_encode_scale": self.grad_mag_encode_scale,
 			"grad_mag_factor": self.grad_mag_factor,
+			"umbilicus_json": self.umbilicus_json,
 			"groups": {name: g.to_dict() for name, g in self.groups.items()},
 		}
+		if self.init_shell_dir:
+			d["init_shell_dir"] = self.init_shell_dir
 		if self.crops:
 			d["crops"] = [list(c) for c in self.crops]
 		if self.base_shape_zyx is not None:
@@ -103,8 +124,10 @@ class LasagnaVolume:
 			)
 		d = json.loads(p.read_text(encoding="utf-8"))
 		version = int(d.get("version", 1))
-		if version != 1:
-			raise ValueError(f"unsupported lasagna volume version: {version}")
+		umbilicus_json = str(d.get("umbilicus_json", "")).strip()
+		if not umbilicus_json:
+			raise ValueError(f"lasagna volume {p} missing required 'umbilicus_json'")
+		init_shell_dir = str(d.get("init_shell_dir", "")).strip()
 		# Load crops list (new format) or migrate from single crop_xyzwhd (old)
 		crops_raw = d.get("crops")
 		crops: list[tuple[int, int, int, int, int, int]] = []
@@ -137,6 +160,8 @@ class LasagnaVolume:
 			base_shape_zyx=bshape,
 			grad_mag_encode_scale=float(d.get("grad_mag_encode_scale", 1000.0)),
 			grad_mag_factor=float(d.get("grad_mag_factor", 1.0)),
+			umbilicus_json=umbilicus_json,
+			init_shell_dir=init_shell_dir,
 			groups=groups,
 		)
 

@@ -41,64 +41,40 @@ def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	      + fh * fw * xyz[0, h1, w1])
 
 
-def _arc_params_from_seed(
-	seed: tuple[int, int, int],
-	model_w: int,
-	volume_extent_fullres: tuple[int, int, int],
-) -> dict:
-	"""Derive arc params from seed point and model width.
-
-	seed: (cx, cy, cz) in fullres voxels
-	model_w: model width in fullres voxels (circumferential extent)
-	volume_extent_fullres: (X_total, Y_total, Z_total) in fullres voxels
-	Returns dict with keys matching ModelConfig arc fields.
-	"""
-	seed_cx, seed_cy, seed_cz = float(seed[0]), float(seed[1]), float(seed[2])
-	vol_x, vol_y, _vol_z = volume_extent_fullres
-
-	# Volume center XY = estimate of scroll axis
-	arc_cx = vol_x / 2.0
-	arc_cy = vol_y / 2.0
-
-	# Arc radius = distance from volume center to seed point
-	dx = seed_cx - arc_cx
-	dy = seed_cy - arc_cy
-	arc_radius = math.sqrt(dx * dx + dy * dy)
-	arc_radius = max(arc_radius, 100.0)
-
-	# Seed angle
-	seed_angle = math.atan2(dy, dx)
-
-	# Angular half-extent from model width
-	half_angle = float(model_w) / (2.0 * arc_radius)
-	half_angle = max(half_angle, 0.05)
-
-	return {
-		"arc_cx": arc_cx,
-		"arc_cy": arc_cy,
-		"arc_radius": arc_radius,
-		"arc_angle0": seed_angle - half_angle,
-		"arc_angle1": seed_angle + half_angle,
-		"z_center": seed_cz,
-	}
+def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | None:
+	for stage in stages:
+		if "cyl_params" not in stage.global_opt.params:
+			continue
+		args = stage.global_opt.args or {}
+		value = args.get(optimizer.CYLINDER_STAGE_STEP_ARG)
+		if value is None:
+			return None
+		value_f = float(value)
+		return value_f if value_f > 0.0 else None
+	return None
 
 
-def _straight_params_from_seed(
-	seed: tuple[int, int, int],
-	model_w: int,
-) -> dict:
-	"""Derive straight params from seed point and model width.
+def _apply_cylinder_prepare_model_step(mdl: "model.Model3D", model_step: float | None) -> None:
+	if model_step is None:
+		return
+	step = float(model_step)
+	if hasattr(mdl, "cyl_shell_width_target_step"):
+		mdl.cyl_shell_width_target_step = step
+	if hasattr(mdl, "cyl_shell_current_width_step"):
+		mdl.cyl_shell_current_width_step = step
+	if hasattr(mdl, "cyl_shell_z_step"):
+		mdl.cyl_shell_z_step = step
+	if hasattr(mdl, "cyl_shell_current_height_step"):
+		mdl.cyl_shell_current_height_step = step
 
-	The line is centered at the seed XY, oriented at angle 0 (along X),
-	with half-width = model_w / 2. The optimizer will adjust angle.
-	"""
-	return {
-		"straight_cx": float(seed[0]),
-		"straight_cy": float(seed[1]),
-		"straight_angle": 0.0,
-		"straight_half_w": float(model_w) / 2.0,
-		"z_center": float(seed[2]),
-	}
+
+def _require_manifest_init_shell_dir(prep_params: dict) -> str:
+	value = prep_params.get("init_shell_dir", None)
+	if value is None:
+		raise ValueError("shell-dir-crop init requires .lasagna.json key 'init_shell_dir'")
+	if not isinstance(value, str) or not value.strip():
+		raise ValueError("shell-dir-crop init requires non-empty string .lasagna.json key 'init_shell_dir'")
+	return str(value)
 
 
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
@@ -173,6 +149,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_opt.add_args(p)
 	p.add_argument("--out-dir", default=None, help="Output directory for snapshots and debug")
 	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
+	p.add_argument("--model-init", choices=("seed", "ext", "model"), default="seed",
+		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input")
 	p.add_argument("--window-size", type=int, default=None,
 		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
 	p.add_argument("--window-overlap", type=int, default=0,
@@ -241,6 +219,14 @@ def main(argv: list[str] | None = None) -> int:
 	print("opt:", opt_cfg)
 
 	device = torch.device(data_cfg.device)
+	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
+	if model_init not in {"seed", "ext", "model"}:
+		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, or model)")
+	init_mode = str(model_cfg.init_mode).strip().lower()
+	if init_mode == "shell-dir-crop" and model_init != "seed":
+		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")
+	if init_mode == "shell-dir-crop" and "init_shell_dir" in cfg:
+		raise ValueError("do not set top-level config key 'init_shell_dir'; shell-dir-crop reads it from --input .lasagna.json")
 
 	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
 	_t = _stage_start("probe_preprocessed_data")
@@ -255,37 +241,58 @@ def main(argv: list[str] | None = None) -> int:
 
 	# --- Init from seed (new model only) ---
 	_t = _stage_start("derive_initial_model_params")
-	is_new_model = model_cfg.model_input is None
-	if is_new_model and data_cfg.seed is not None and data_cfg.model_w is not None:
-		if model_cfg.init_mode == "straight":
-			sp = _straight_params_from_seed(data_cfg.seed, data_cfg.model_w)
-			model_cfg = dataclasses.replace(model_cfg, **sp)
-			print(f"[fit] straight from seed: cx={sp['straight_cx']:.1f} cy={sp['straight_cy']:.1f} "
-				  f"angle={sp['straight_angle']:.3f} half_w={sp['straight_half_w']:.1f} "
-				  f"z={sp['z_center']:.1f}", flush=True)
-		elif volume_extent_fullres is not None:
-			arc = _arc_params_from_seed(data_cfg.seed, data_cfg.model_w, volume_extent_fullres)
-			model_cfg = dataclasses.replace(model_cfg, **arc)
-			print(f"[fit] arc from seed: cx={arc['arc_cx']:.1f} cy={arc['arc_cy']:.1f} "
-				  f"r={arc['arc_radius']:.1f} a0={arc['arc_angle0']:.3f} a1={arc['arc_angle1']:.3f} "
-				  f"z={arc['z_center']:.1f}", flush=True)
+	if model_init == "seed":
+		if getattr(args, "tifxyz_init", None):
+			raise ValueError("model-init=seed must not set --tifxyz-init; tifxyz can only be used as external_surfaces")
+		if model_cfg.model_input is not None:
+			raise ValueError("model-init=seed must not set --model-input")
+		missing_seed = []
+		if data_cfg.seed is None:
+			missing_seed.append("--seed")
+		if data_cfg.model_h is None:
+			missing_seed.append("--model-h")
+		if missing_seed:
+			raise ValueError(f"model-init=seed requires {', '.join(missing_seed)}")
+	elif model_init == "ext":
+		if not getattr(args, "tifxyz_init", None):
+			raise ValueError("model-init=ext requires --tifxyz-init")
+		if model_cfg.model_input is not None:
+			raise ValueError("model-init=ext must not set --model-input")
+	elif model_init == "model":
+		if model_cfg.model_input is None:
+			raise ValueError("model-init=model requires --model-input")
+		if getattr(args, "tifxyz_init", None):
+			raise ValueError("model-init=model must not set --tifxyz-init; tifxyz can only be used as external_surfaces")
 
-	# --- Size mesh from model_w, model_h, windings (new model only) ---
-	if is_new_model and data_cfg.model_w is not None and data_cfg.model_h is not None and data_cfg.windings is not None:
-		auto_mesh_w = max(2, int(data_cfg.model_w / model_cfg.mesh_step) + 1)
-		auto_mesh_h = max(2, int(data_cfg.model_h / model_cfg.mesh_step) + 1)
-		auto_depth = max(1, data_cfg.windings)
+	if model_init == "seed" and data_cfg.seed is not None:
+		model_cfg = dataclasses.replace(model_cfg, z_center=float(data_cfg.seed[2]))
+		label = "shell-dir-crop" if init_mode == "shell-dir-crop" else "cylinder_seed"
+		print(f"[fit] {label} from seed: x={float(data_cfg.seed[0]):.1f} "
+			  f"y={float(data_cfg.seed[1]):.1f} z={float(data_cfg.seed[2]):.1f}",
+			  flush=True)
+
+	# --- Size mesh from model_h only for the umbilicus tube experiment ---
+	if model_init == "seed" and init_mode == "cylinder_seed" and data_cfg.model_h is not None:
+		tube_z_step = 1000.0
+		auto_mesh_w = 20
+		auto_mesh_h = max(2, int(math.ceil(float(data_cfg.model_h) / tube_z_step)) + 1)
+		auto_depth = 1
+		actual_z_step = float(data_cfg.model_h) / float(max(1, auto_mesh_h - 1))
 
 		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
-		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
+		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w} "
+			  f"z_step={actual_z_step:.1f} z_step_target={tube_z_step:.1f} "
+			  f"(umbilicus tube search grid; final mesh bake uses model-w/model-h/mesh-step)", flush=True)
 	_stage_done("derive_initial_model_params", _t)
 
 	# --- Windowed tifxyz mode ---
 	tifxyz_init = getattr(args, "tifxyz_init", None)
 	window_size = getattr(args, "window_size", None) or 0
 	window_overlap = getattr(args, "window_overlap", 0)
+	if model_init != "ext" and window_size > 0:
+		raise ValueError("windowed optimization currently requires model-init=ext")
 
-	if tifxyz_init and window_size > 0:
+	if model_init == "ext" and tifxyz_init and window_size > 0:
 		from tifxyz_io import load_tifxyz
 		import fit2tifxyz as _f2t
 		import json as _json
@@ -312,7 +319,10 @@ def main(argv: list[str] | None = None) -> int:
 		cfg.pop("external_surfaces", None)
 		cfg.pop("tifxyz_data", None)
 		cfg.pop("offset_value", None)
-		stages = optimizer.load_stages_cfg(cfg)
+		stages = optimizer.load_stages_cfg(
+			cfg,
+			init_mode=model_cfg.init_mode if model_init == "seed" else None,
+		)
 
 		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
 		n_windows = len(windows)
@@ -478,7 +488,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
 	_t = _stage_start("construct_model")
-	if tifxyz_init:
+	if model_init == "ext":
 		mdl = model.Model3D.from_tifxyz(
 			tifxyz_init, device=device,
 			mesh_step=model_cfg.mesh_step,
@@ -487,38 +497,81 @@ def main(argv: list[str] | None = None) -> int:
 			subsample_winding=model_cfg.subsample_winding,
 		)
 		print(f"[fit] initialized from tifxyz: {tifxyz_init}", flush=True)
-	elif is_new_model:
-		mdl = model.Model3D(
-			device=device,
-			depth=model_cfg.depth,
-			mesh_h=model_cfg.mesh_h,
-			mesh_w=model_cfg.mesh_w,
-			mesh_step=model_cfg.mesh_step,
-			winding_step=model_cfg.winding_step,
-			subsample_mesh=model_cfg.subsample_mesh,
-			subsample_winding=model_cfg.subsample_winding,
-			scaledown=scaledown,
-			z_step_eff=int(round(scaledown)),
-			z_center=model_cfg.z_center,
-			arc_cx=model_cfg.arc_cx,
-			arc_cy=model_cfg.arc_cy,
-			arc_radius=model_cfg.arc_radius,
-			arc_angle0=model_cfg.arc_angle0,
-			arc_angle1=model_cfg.arc_angle1,
-			straight_cx=model_cfg.straight_cx,
-			straight_cy=model_cfg.straight_cy,
-			straight_angle=model_cfg.straight_angle,
-			straight_half_w=model_cfg.straight_half_w,
-			init_mode=model_cfg.init_mode,
-			volume_extent=None,
-			pyramid_d=model_cfg.pyramid_d,
-		)
+	elif model_init == "seed":
+		if init_mode == "shell-dir-crop":
+			print("[fit] model-init=seed/init-mode=shell-dir-crop: constructing model from init shells", flush=True)
+			from init_shell_index import InitShellIndex, crop_shell_surface
+			init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+			shell_index = InitShellIndex.from_directory(init_shell_dir)
+			closest = shell_index.closest_point(tuple(float(v) for v in data_cfg.seed), device=device)
+			surface = shell_index.surfaces[closest.shell_index]
+			crop_xyz, crop_valid, crop_info = crop_shell_surface(
+				surface,
+				closest,
+				seed=tuple(float(v) for v in data_cfg.seed),
+				model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
+				model_h=float(data_cfg.model_h),
+				mesh_step=float(model_cfg.mesh_step),
+				device=device,
+			)
+			mdl = model.Model3D.from_tifxyz_crop(
+				crop_xyz,
+				crop_valid,
+				device=device,
+				mesh_step=model_cfg.mesh_step,
+				winding_step=model_cfg.winding_step,
+				subsample_mesh=model_cfg.subsample_mesh,
+				subsample_winding=model_cfg.subsample_winding,
+			)
+			mdl.params = dataclasses.replace(
+				mdl.params,
+				scaledown=scaledown,
+				z_step_eff=int(round(scaledown)),
+				volume_extent=None,
+				model_w=(None if data_cfg.model_w is None else float(data_cfg.model_w)),
+				model_h=float(data_cfg.model_h),
+			)
+			print(
+				f"[fit] shell-dir-crop selected {closest.shell_id}: "
+				f"quad=({closest.quad_row},{closest.quad_col}) tri={closest.triangle_id} "
+				f"h={closest.h:.3f} w={closest.w:.3f} "
+				f"dist={closest.distance:.3f} "
+				f"crop={crop_info.mesh_h}x{crop_info.mesh_w} full_width={crop_info.full_width}",
+				flush=True,
+			)
+		elif init_mode == "cylinder_seed":
+			print(f"[fit] model-init=seed: constructing model from seed", flush=True)
+			mdl = model.Model3D(
+				device=device,
+				depth=model_cfg.depth,
+				mesh_h=model_cfg.mesh_h,
+				mesh_w=model_cfg.mesh_w,
+				mesh_step=model_cfg.mesh_step,
+				winding_step=model_cfg.winding_step,
+				subsample_mesh=model_cfg.subsample_mesh,
+				subsample_winding=model_cfg.subsample_winding,
+				scaledown=scaledown,
+				z_step_eff=int(round(scaledown)),
+				z_center=model_cfg.z_center,
+				init_mode=model_cfg.init_mode,
+				volume_extent=None,
+				pyramid_d=model_cfg.pyramid_d,
+			)
+			mdl.init_cylinder_seed(
+				seed=tuple(float(v) for v in data_cfg.seed),
+				model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
+				model_h=float(data_cfg.model_h),
+				volume_extent_fullres=volume_extent_fullres,
+			)
+		else:
+			raise ValueError(f"unsupported init-mode for model-init=seed: {init_mode}")
 	else:
+		print(f"[fit] model-init=model: loading checkpoint {model_cfg.model_input}", flush=True)
 		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)
 		mdl = model.Model3D.from_checkpoint(st, device=device)
 
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
-		  f"arc_enabled={mdl.arc_enabled}")
+		  f"cylinder_enabled={getattr(mdl, 'cylinder_enabled', False)}")
 	_stage_done("construct_model", _t)
 
 	# Load external reference surfaces
@@ -552,7 +605,10 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("external_surfaces", None)
 	cfg.pop("tifxyz_data", None)
 	cfg.pop("offset_value", None)
-	stages = optimizer.load_stages_cfg(cfg)
+	stages = optimizer.load_stages_cfg(
+		cfg,
+		init_mode=model_cfg.init_mode if model_init == "seed" else None,
+	)
 	_stage_done("load_optimizer_stages", _t)
 
 	# --- Streaming data loader ---
@@ -622,6 +678,12 @@ def main(argv: list[str] | None = None) -> int:
 	data = _ensure_data(None, set())
 	_stage_done("load_data", _t)
 
+	if getattr(mdl, "cylinder_enabled", False) and hasattr(mdl, "prepare_umbilicus_tube_init"):
+		_apply_cylinder_prepare_model_step(mdl, _first_cylinder_stage_model_step(stages))
+		_t = _stage_start("prepare_umbilicus_tube_init")
+		mdl.prepare_umbilicus_tube_init(data)
+		_stage_done("prepare_umbilicus_tube_init", _t)
+
 	# Print loaded data summary
 	Z, Y, X = data.size
 	if data.sparse_caches:
@@ -652,17 +714,20 @@ def main(argv: list[str] | None = None) -> int:
 	_stage_done("initial_mesh_stats", _t)
 
 	def _save_model(path: str) -> None:
-		if mdl.arc_enabled:
-			mdl.bake_arc_into_mesh()
-		if mdl.straight_enabled:
-			mdl.bake_straight_into_mesh()
 		st = dict(mdl.state_dict())
 		# Store flat mesh instead of pyramid levels
 		ms_keys = [k for k in st if k.startswith("mesh_ms.")]
 		for k in ms_keys:
 			del st[k]
+		st.pop("cyl_params", None)
+		if getattr(mdl, "cylinder_enabled", False) and getattr(mdl, "cyl_shell_mode", False):
+			st.pop("conn_offsets", None)
+			st.pop("amp", None)
+			st.pop("bias", None)
+		elif getattr(mdl, "cylinder_enabled", False) and "conn_offsets" in st:
+			st["conn_offsets"] = torch.zeros_like(st["conn_offsets"])
 		with torch.no_grad():
-			st["mesh_flat"] = mdl.mesh_coarse().detach().clone()
+			st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
 		st["_model_params_"] = asdict(mdl.params)
 		st["_fit_config_"] = fit_config
 		corr_results = opt_loss_corr.get_last_results()
@@ -693,13 +758,13 @@ def main(argv: list[str] | None = None) -> int:
 	_t = _stage_start("prepare_optimization")
 	seed_xyz = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
 	# tifxyz init: always use model grid center as seed (overrides CLI seed)
-	if tifxyz_init:
+	if model_init == "ext":
 		center_pt = _grid_center(mdl)
 		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] tifxyz seed: ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
 	# Re-optimize from checkpoint: derive seed from model grid center
-	if seed_xyz is None and not is_new_model:
+	if seed_xyz is None and model_init == "model":
 		center_pt = _grid_center(mdl)
 		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] checkpoint seed (grid center): ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
@@ -747,6 +812,8 @@ def main(argv: list[str] | None = None) -> int:
 		import fit2tifxyz
 		export_dir = str(Path(_out_dir) / "tifxyz")
 		tifxyz_argv = ["--input", str(model_out), "--output", export_dir]
+		if getattr(mdl, "cyl_shell_completed", None):
+			tifxyz_argv.append("--single-segment")
 		voxel_size_um = cfg.get("voxel_size_um")
 		if voxel_size_um is not None:
 			tifxyz_argv += ["--voxel-size-um", str(float(voxel_size_um))]

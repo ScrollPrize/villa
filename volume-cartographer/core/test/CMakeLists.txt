@@ -115,3 +115,137 @@ endif()
 if(VC_ENABLE_NSAN)
     _add_canary(sanitizer_canary_nsan  nsan  "NumericalStabilitySanitizer: inconsistent")
 endif()
+
+add_executable(test_gridstore test_gridstore.cpp)
+target_link_libraries(test_gridstore PRIVATE doctest::doctest vc_core)
+add_test(NAME test_gridstore COMMAND test_gridstore)
+
+add_executable(test_gridstore_branches test_gridstore_branches.cpp)
+target_link_libraries(test_gridstore_branches PRIVATE doctest::doctest vc_core)
+add_test(NAME test_gridstore_branches COMMAND test_gridstore_branches)
+
+# Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
+# Soft-skips on network failure so offline runs still pass; set
+# VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
+add_executable(test_pherc0172_live test_pherc0172_live.cpp)
+target_link_libraries(test_pherc0172_live PRIVATE doctest::doctest vc_core)
+add_test(NAME test_pherc0172_live COMMAND test_pherc0172_live)
+
+add_executable(test_tiff test_tiff.cpp)
+target_link_libraries(test_tiff PRIVATE doctest::doctest vc_core)
+add_test(NAME test_tiff COMMAND test_tiff)
+
+add_executable(test_normalgridtools test_normalgridtools.cpp)
+target_link_libraries(test_normalgridtools PRIVATE doctest::doctest vc_core)
+add_test(NAME test_normalgridtools COMMAND test_normalgridtools)
+
+# Live S3: opens the PHerc 0172 volume and reads small chunks.
+add_executable(test_volume_live_s3 test_volume_live_s3.cpp)
+target_link_libraries(test_volume_live_s3 PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_live_s3 COMMAND test_volume_live_s3)
+
+add_executable(test_normal_grid_volume test_normal_grid_volume.cpp)
+target_link_libraries(test_normal_grid_volume PRIVATE doctest::doctest vc_core)
+add_test(NAME test_normal_grid_volume COMMAND test_normal_grid_volume)
+
+add_executable(test_surface_patch_index test_surface_patch_index.cpp)
+target_link_libraries(test_surface_patch_index PRIVATE doctest::doctest vc_core)
+add_test(NAME test_surface_patch_index COMMAND test_surface_patch_index)
+
+add_executable(test_tiff_merge test_tiff_merge.cpp)
+target_link_libraries(test_tiff_merge PRIVATE doctest::doctest vc_core)
+add_test(NAME test_tiff_merge COMMAND test_tiff_merge)
+
+add_executable(test_http_fetch_errors test_http_fetch_errors.cpp)
+target_link_libraries(test_http_fetch_errors PRIVATE doctest::doctest vc_core)
+add_test(NAME test_http_fetch_errors COMMAND test_http_fetch_errors)
+
+# Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
+# the NormalGridGenerate library API against it. Soft-skips on network.
+add_executable(test_normal_grid_live test_normal_grid_live.cpp)
+target_link_libraries(test_normal_grid_live PRIVATE doctest::doctest vc_core)
+add_test(NAME test_normal_grid_live COMMAND test_normal_grid_live)
+
+add_executable(test_normalgridtools_real test_normalgridtools_real.cpp)
+target_link_libraries(test_normalgridtools_real PRIVATE doctest::doctest vc_core)
+add_test(NAME test_normalgridtools_real COMMAND test_normalgridtools_real)
+
+add_executable(test_tiff_more test_tiff_more.cpp)
+target_link_libraries(test_tiff_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_tiff_more COMMAND test_tiff_more)
+
+add_executable(test_geometry test_geometry.cpp)
+target_link_libraries(test_geometry PRIVATE doctest::doctest vc_core)
+add_test(NAME test_geometry COMMAND test_geometry)
+
+add_executable(test_affine_transform test_affine_transform.cpp)
+target_link_libraries(test_affine_transform PRIVATE doctest::doctest vc_core)
+add_test(NAME test_affine_transform COMMAND test_affine_transform)
+
+add_executable(test_point_index test_point_index.cpp)
+target_link_libraries(test_point_index PRIVATE doctest::doctest vc_core)
+add_test(NAME test_point_index COMMAND test_point_index)
+
+add_executable(test_plane_surface test_plane_surface.cpp)
+target_link_libraries(test_plane_surface PRIVATE doctest::doctest vc_core)
+add_test(NAME test_plane_surface COMMAND test_plane_surface)
+
+add_executable(test_compositing test_compositing.cpp)
+target_link_libraries(test_compositing PRIVATE doctest::doctest vc_core)
+add_test(NAME test_compositing COMMAND test_compositing)
+
+add_executable(test_quadsurface_basics test_quadsurface_basics.cpp)
+target_link_libraries(test_quadsurface_basics PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_basics COMMAND test_quadsurface_basics)
+
+add_executable(test_load_json test_load_json.cpp)
+target_link_libraries(test_load_json PRIVATE doctest::doctest vc_core)
+add_test(NAME test_load_json COMMAND test_load_json)
+
+add_executable(test_remote_url test_remote_url.cpp)
+target_link_libraries(test_remote_url PRIVATE doctest::doctest vc_core)
+add_test(NAME test_remote_url COMMAND test_remote_url)
+
+add_executable(test_logging test_logging.cpp)
+target_link_libraries(test_logging PRIVATE doctest::doctest vc_core)
+add_test(NAME test_logging COMMAND test_logging)
+
+add_executable(test_plane_surface_branches test_plane_surface_branches.cpp)
+target_link_libraries(test_plane_surface_branches PRIVATE doctest::doctest vc_core)
+add_test(NAME test_plane_surface_branches COMMAND test_plane_surface_branches)
+
+add_executable(test_affine_transform_surface test_affine_transform_surface.cpp)
+target_link_libraries(test_affine_transform_surface PRIVATE doctest::doctest vc_core)
+add_test(NAME test_affine_transform_surface COMMAND test_affine_transform_surface)
+
+add_executable(test_quadsurface_more test_quadsurface_more.cpp)
+target_link_libraries(test_quadsurface_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_more COMMAND test_quadsurface_more)
+
+add_executable(test_thinning test_thinning.cpp)
+target_link_libraries(test_thinning PRIVATE doctest::doctest vc_core)
+add_test(NAME test_thinning COMMAND test_thinning)
+
+add_executable(test_umbilicus test_umbilicus.cpp)
+target_link_libraries(test_umbilicus PRIVATE doctest::doctest vc_core)
+add_test(NAME test_umbilicus COMMAND test_umbilicus)
+
+add_executable(test_colormaps test_colormaps.cpp)
+target_link_libraries(test_colormaps PRIVATE doctest::doctest vc_core)
+add_test(NAME test_colormaps COMMAND test_colormaps)
+
+add_executable(test_quadsurface_io test_quadsurface_io.cpp)
+target_link_libraries(test_quadsurface_io PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_io COMMAND test_quadsurface_io)
+
+add_executable(test_quadsurface_pointto test_quadsurface_pointto.cpp)
+target_link_libraries(test_quadsurface_pointto PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_pointto COMMAND test_quadsurface_pointto)
+
+add_executable(test_quadsurface_snapshot test_quadsurface_snapshot.cpp)
+target_link_libraries(test_quadsurface_snapshot PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_snapshot COMMAND test_quadsurface_snapshot)
+
+add_executable(test_quadsurface_save_paths test_quadsurface_save_paths.cpp)
+target_link_libraries(test_quadsurface_save_paths PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_save_paths COMMAND test_quadsurface_save_paths)

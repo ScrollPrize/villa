@@ -1,3 +1,15 @@
+# Grid-resolution helpers split into a static lib so the unit tests can
+# link them without spawning the binary. Built unconditionally because
+# tests depend on it; the rest of this file's app executables are gated
+# behind VC_BUILD_APPS.
+add_library(vc_merge_grid STATIC src/vc_merge_tifxyz_grid.cpp)
+target_link_libraries(vc_merge_grid PUBLIC vc_core)
+target_include_directories(vc_merge_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if(NOT VC_BUILD_APPS)
+    return()
+endif()
+
 ############
 # GUI Apps #
 ############
@@ -98,13 +110,6 @@ target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
 
 add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
-
-# Grid-resolution helpers split into a static lib so the unit tests can
-# link them without spawning the binary. No behavior change vs. having the
-# code inline in vc_merge_tifxyz.cpp.
-add_library(vc_merge_grid STATIC src/vc_merge_tifxyz_grid.cpp)
-target_link_libraries(vc_merge_grid PUBLIC vc_core)
-target_include_directories(vc_merge_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
 target_link_libraries(vc_merge_tifxyz vc_merge_grid Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
