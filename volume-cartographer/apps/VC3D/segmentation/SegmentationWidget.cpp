@@ -368,6 +368,7 @@ void SegmentationWidget::setDrawMaskEnabled(bool enabled)
 SegmentationGrowthMethod SegmentationWidget::growthMethod() const { return _growthPanel->growthMethod(); }
 int SegmentationWidget::growthSteps() const { return _growthPanel->growthSteps(); }
 bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
+int SegmentationWidget::growthScale() const { return _growthPanel->growthScale(); }
 QString SegmentationWidget::normal3dZarrPath() const { return _growthPanel->normal3dZarrPath(); }
 QString SegmentationWidget::patchTracerSourcePath() const { return _growthPanel->patchTracerSourcePath(); }
 utils::Json SegmentationWidget::patchTracerParamsJson() const { return _growthPanel->patchTracerParamsJson(); }

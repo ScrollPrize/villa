@@ -5,6 +5,8 @@
  
  #include <filesystem>
  #include <fstream>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <unordered_map>
 #include <random>
@@ -26,6 +28,10 @@
          std::string base_path;
          int sparse_volume;
          utils::Json metadata;
+         double coordinate_scale = 1.0;
+         double output_spiral_step = 20.0;
+         int selected_level = 0;
+         bool multiscale = false;
          mutable std::shared_mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
          mutable uint64_t generation_counter = 0;
@@ -42,18 +48,46 @@
 
          std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
  
-         explicit pimpl(const std::string& path) : base_path(path) {
+         pimpl(const std::string& path, int requested_level) : base_path(path) {
             metadata = utils::Json::parse_file(fs::path(base_path) / "metadata.json");
-            sparse_volume = metadata.value("sparse-volume", 1);
+            multiscale = metadata.value("format", std::string()) == "normal-grid-multiscale";
+            if (multiscale) {
+                const int min_level = metadata.value("min-level", 0);
+                const int max_level = metadata.value("max-level", 0);
+                selected_level = std::clamp(requested_level, min_level, max_level);
+
+                utils::Json level_metadata;
+                const fs::path level_metadata_path =
+                    fs::path(base_path) / ("metadata.level" + std::to_string(selected_level) + ".json");
+                if (fs::exists(level_metadata_path)) {
+                    level_metadata = utils::Json::parse_file(level_metadata_path);
+                } else if (metadata.contains("source-metadata")) {
+                    level_metadata = metadata["source-metadata"];
+                } else {
+                    throw std::runtime_error("multiscale normal grids missing level metadata: " +
+                                             level_metadata_path.string());
+                }
+
+                metadata = std::move(level_metadata);
+                const int derived_scale = std::max(1, metadata.value("derived-scale", 1 << selected_level));
+                coordinate_scale = 1.0 / static_cast<double>(derived_scale);
+                sparse_volume = std::max(1, metadata.value("sparse-volume", 1));
+                const double level_step = metadata.value("spiral-step", 20.0);
+                output_spiral_step = level_step / coordinate_scale;
+            } else {
+                selected_level = 0;
+                sparse_volume = metadata.value("sparse-volume", 1);
+                output_spiral_step = metadata.value("spiral-step", 20.0);
+            }
         }
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const {
 
             float coord;
             switch (plane_idx) {
-                case 0: coord = point.z; break; // XY plane
-                case 1: coord = point.y; break; // XZ plane
-                case 2: coord = point.x; break; // YZ plane
+                case 0: coord = point.z * coordinate_scale; break; // XY plane
+                case 1: coord = point.y * coordinate_scale; break; // XZ plane
+                case 2: coord = point.x * coordinate_scale; break; // YZ plane
                 default: return std::nullopt;
             }
 
@@ -76,9 +110,9 @@
 
             float coord;
             switch (plane_idx) {
-                case 0: coord = point.z; break; // XY plane
-                case 1: coord = point.y; break; // XZ plane
-                case 2: coord = point.x; break; // YZ plane
+                case 0: coord = point.z * coordinate_scale; break; // XY plane
+                case 1: coord = point.y * coordinate_scale; break; // XZ plane
+                case 2: coord = point.x * coordinate_scale; break; // YZ plane
                 default: return nullptr;
             }
 
@@ -106,7 +140,11 @@
              const std::string& dir = plane_dirs[plane_idx];
             char filename[256];
             snprintf(filename, sizeof(filename), "%06d.grid", slice_idx);
-            std::string grid_path = (fs::path(base_path) / dir / filename).string();
+            fs::path grid_path_fs = fs::path(base_path) / dir;
+            if (multiscale) {
+                grid_path_fs /= std::to_string(selected_level);
+            }
+            std::string grid_path = (grid_path_fs / filename).string();
 
             if (!fs::exists(grid_path)) {
                 std::unique_lock<std::shared_mutex> lock(mutex);
@@ -226,7 +264,10 @@
     };
 
     NormalGridVolume::NormalGridVolume(const std::string& path)
-        : pimpl_(std::make_unique<pimpl>(path)) {}
+        : NormalGridVolume(path, 0) {}
+
+    NormalGridVolume::NormalGridVolume(const std::string& path, int level)
+        : pimpl_(std::make_unique<pimpl>(path, level)) {}
  
     std::optional<NormalGridVolume::GridQueryResult> NormalGridVolume::query(const cv::Point3f& point, int plane_idx) const {
         return pimpl_->query(point, plane_idx);
@@ -246,6 +287,18 @@
 
     void NormalGridVolume::resetCacheStats() const {
         pimpl_->resetCacheStats();
+    }
+
+    double NormalGridVolume::coordinateScale() const {
+        return pimpl_->coordinate_scale;
+    }
+
+    double NormalGridVolume::outputSpiralStep() const {
+        return pimpl_->output_spiral_step;
+    }
+
+    int NormalGridVolume::level() const {
+        return pimpl_->selected_level;
     }
 
     NormalGridVolume::~NormalGridVolume() = default;

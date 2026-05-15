@@ -1154,6 +1154,13 @@ struct NormalConstraintPlane {
             pA_2d[0] = pA[1]; pA_2d[1] = pA[2];
             pE_2d[0] = pE[1]; pE_2d[1] = pE[2];
         }
+        const double grid_coordinate_scale = normal_grid_volume.coordinateScale();
+        if (grid_coordinate_scale != 1.0) {
+            pA_2d[0] *= T(grid_coordinate_scale);
+            pA_2d[1] *= T(grid_coordinate_scale);
+            pE_2d[0] *= T(grid_coordinate_scale);
+            pE_2d[1] *= T(grid_coordinate_scale);
+        }
 
         // Query the normal grids.
         //FIXME query in middle!

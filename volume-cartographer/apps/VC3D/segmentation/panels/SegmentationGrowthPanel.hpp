@@ -35,6 +35,7 @@ public:
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const { return _growthMethod; }
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
+    [[nodiscard]] int growthScale() const { return _growthScale; }
     [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
     [[nodiscard]] QString patchTracerSourcePath() const { return _patchTracerSourcePath; }
     [[nodiscard]] utils::Json patchTracerParamsJson() const;
@@ -88,6 +89,7 @@ private:
     // UI widgets
     QGroupBox* _groupGrowth{nullptr};
     QSpinBox* _spinGrowthSteps{nullptr};
+    QSpinBox* _spinGrowthScale{nullptr};
     QComboBox* _comboGrowthMethod{nullptr};
     QPushButton* _btnGrow{nullptr};
     QPushButton* _btnInpaint{nullptr};
@@ -147,6 +149,7 @@ private:
     QString _normalGridHint;
     QString _normalGridDisplayPath;
     QString _normalGridPath;
+    int _growthScale{0};
 
     QStringList _normal3dCandidates;
     QString _normal3dHint;
