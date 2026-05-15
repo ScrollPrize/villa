@@ -27,6 +27,19 @@ option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on c
 option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 
+# Skip building app executables (vc_*, VC3D) when generating coverage:
+# the apps add ~3 GB of debug+coverage-instrumented binaries to the
+# build dir and aren't exercised by the unit tests, so they only inflate
+# the build without contributing coverage data. The static libs the
+# tests need (e.g. vc_merge_grid) are still built unconditionally.
+# Override with -DVC_BUILD_APPS=ON if you need the apps in a coverage
+# build (e.g. for end-to-end tests that spawn the binaries).
+if(VC_ENABLE_COVERAGE)
+    option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           OFF)
+else()
+    option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
+endif()
+
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
     if(EXISTS "${_path}")
@@ -152,6 +165,13 @@ if(VC_ENABLE_COVERAGE)
     else()
         list(APPEND _san --coverage)
     endif()
+    # Coverage doesn't need DWARF: gcov/llvm-cov read .gcno/.gcda (gcc) or
+    # .profraw + the binary's coverage-mapping section (clang), neither of
+    # which depends on debug info. Drop to -g1 (line tables only — keeps
+    # backtraces useful when an assertion fires) and split DWARF into .dwo
+    # files so the executables stay small. On a full build this trims the
+    # coverage build dir from ~12 GB to ~5 GB and avoids ENOSPC on CI.
+    list(APPEND _san -g1 -gsplit-dwarf)
 endif()
 # Sanitizer/coverage flags applied below, after libs/ — see that block.
 

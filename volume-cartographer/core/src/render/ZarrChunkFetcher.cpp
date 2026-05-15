@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -137,6 +138,7 @@ class ZarrChunkFetcher final : public IChunkFetcher {
 public:
     explicit ZarrChunkFetcher(utils::ZarrArray array)
         : array_(std::make_unique<utils::ZarrArray>(std::move(array)))
+        , persistEncodedC3d_(array_->stores_chunks_with_codec("c3d"))
     {
     }
 
@@ -149,6 +151,21 @@ public:
             static_cast<std::size_t>(key.ix)};
 
         try {
+            if (persistEncodedC3d_) {
+                auto encoded = array_->read_chunk_encoded(indices);
+                if (!encoded) {
+                    result.status = ChunkFetchStatus::Missing;
+                    return result;
+                }
+                result.status = ChunkFetchStatus::Found;
+                result.persistentBytes = std::move(*encoded);
+                result.hasPersistentBytes = true;
+                result.bytes = array_->decode_chunk_payload(
+                    std::span<const std::byte>(result.persistentBytes.data(),
+                                               result.persistentBytes.size()));
+                return result;
+            }
+
             auto bytes = array_->read_chunk(indices);
             if (!bytes) {
                 result.status = ChunkFetchStatus::Missing;
@@ -171,8 +188,37 @@ public:
         return result;
     }
 
+    std::string persistentCacheExtension(const ChunkKey&) const override
+    {
+        return persistEncodedC3d_ ? ".c3d" : ".bin";
+    }
+
+    ChunkFetchResult decodePersistentBytes(
+        const ChunkKey&,
+        std::vector<std::byte> bytes) const override
+    {
+        ChunkFetchResult result;
+        try {
+            result.status = ChunkFetchStatus::Found;
+            if (persistEncodedC3d_) {
+                result.hasPersistentBytes = true;
+                result.persistentBytes = std::move(bytes);
+                result.bytes = array_->decode_chunk_payload(
+                    std::span<const std::byte>(result.persistentBytes.data(),
+                                               result.persistentBytes.size()));
+            } else {
+                result.bytes = std::move(bytes);
+            }
+        } catch (const std::exception& e) {
+            result.status = ChunkFetchStatus::DecodeError;
+            result.message = e.what();
+        }
+        return result;
+    }
+
 private:
     std::unique_ptr<utils::ZarrArray> array_;
+    bool persistEncodedC3d_ = false;
 };
 
 std::array<int, 3> toArray3(const std::vector<std::size_t>& values, const char* name)
