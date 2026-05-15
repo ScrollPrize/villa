@@ -110,6 +110,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Coverage builds are huge: -O0 -g + libgcov instrumentation, every
+      # test executable linked statically against vc_core. The default
+      # ubuntu runner ships ~14 GB free, which is not enough — `ar` and
+      # the final link step hit ENOSPC intermittently. Free ~25-30 GB by
+      # purging preinstalled toolchains we don't use (Android SDK, .NET,
+      # Haskell, hosted-tool caches).
+      - name: Free disk space on runner
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /opt/hostedtoolcache \
+                      /usr/local/share/boost \
+                      /usr/local/share/powershell \
+                      /usr/local/lib/node_modules \
+                      /usr/share/swift
+          sudo apt-get -y clean
+          docker image prune -af || true
+          df -h /
       - uses: docker/setup-buildx-action@v3
       - name: Pull or build builder image
         run: volume-cartographer/scripts/ci.sh builder ubuntu-26.04
