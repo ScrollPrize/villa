@@ -1728,6 +1728,27 @@ public:
         }
 
         auto key = chunk_key(shard_idx);
+        if (store_) {
+            auto full_key = array_key_.empty() ? key : array_key_ + "/" + key;
+            auto entry = store_->get_partial(full_key, linear * 16, 16);
+            if (!entry || entry->size() < 16) return std::nullopt;
+
+            std::uint64_t offset = 0, nbytes = 0;
+            std::memcpy(&offset, entry->data(), 8);
+            std::memcpy(&nbytes, entry->data() + 8, 8);
+            if ((offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) ||
+                (offset == ~std::uint64_t(0) - 1 && nbytes == 0))
+                return std::nullopt;
+            if (nbytes == 0) return std::nullopt;
+
+            auto data = store_->get_partial(full_key,
+                                            static_cast<std::size_t>(offset),
+                                            static_cast<std::size_t>(nbytes));
+            if (!data || data->size() != static_cast<std::size_t>(nbytes))
+                return std::nullopt;
+            return data;
+        }
+
         auto p = root_ / key;
         // Lock to prevent reading while another thread is writing the
         // same shard (striped — reads against other shards don't block).

@@ -383,6 +383,8 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
         } else if (meta.compressor_id == "gzip" || meta.compressor_id == "zlib") {
             cfg.id = CompressorId::Gzip;
             cfg.level = meta.compression_level > 0 ? meta.compression_level : 5;
+        } else if (meta.compressor_id == "c3d") {
+            cfg.id = CompressorId::C3d;
         } else {
             throw std::runtime_error("Unsupported zarr compressor: " + meta.compressor_id);
         }
