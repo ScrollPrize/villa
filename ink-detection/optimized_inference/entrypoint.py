@@ -720,6 +720,9 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     elif inputs.model_type == "resnet3d-152-3d-decoder":
         from model_resnet3d_3d_decoder import load_model
         logger.info("Using ResNet3D-152 3D decoder model")
+    elif inputs.model_type == "primus":
+        from model_primus import load_model
+        logger.info("Using Primus (LeJEPA fine-tune) model")
     else:
         raise ValueError(f"Unknown model_type: {inputs.model_type}")
 

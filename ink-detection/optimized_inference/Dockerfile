@@ -32,6 +32,7 @@ COPY profiling.py /app
 COPY model_timesformer.py /app
 COPY model_resnet3d.py /app
 COPY model_resnet3d_3d_decoder.py /app
+COPY model_primus.py /app
 COPY k8s.py /app
 COPY runtime_contracts.py /app
 COPY vendored_cache_store.py /app
