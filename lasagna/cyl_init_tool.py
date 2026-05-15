@@ -50,6 +50,8 @@ def _build_parser() -> argparse.ArgumentParser:
 				   help="Existing wrapped .tifxyz shell to continue growing from")
 	p.add_argument("--shell-count", type=_positive_int, default=None,
 				   help="Override total cylinder shell count, including the initial/start shell")
+	p.add_argument("--inwards", action="store_true",
+				   help="Grow cylinder shells inward, overriding cyl_grow_direction in the config")
 	return p
 
 
@@ -101,6 +103,19 @@ def _apply_shell_count_override(stage_cfg: dict, shell_count: int | None) -> Non
 			args = {}
 			stage["args"] = args
 		args["cyl_max_shells"] = int(shell_count)
+
+
+def _apply_grow_direction_override(stage_cfg: dict, direction: str | None) -> None:
+	if direction is None:
+		return
+	for stage in stage_cfg.get("stages", []):
+		if not isinstance(stage, dict) or str(stage.get("name", "")) != "cyl_grow":
+			continue
+		args = stage.setdefault("args", {})
+		if not isinstance(args, dict):
+			args = {}
+			stage["args"] = args
+		args["cyl_grow_direction"] = str(direction)
 
 
 def _has_stage(stage_cfg: dict, name: str) -> bool:
@@ -377,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	stage_cfg = _filter_cylinder_config(cfg, start_shell=args.start_shell is not None)
 	_apply_shell_count_override(stage_cfg, args.shell_count)
+	_apply_grow_direction_override(stage_cfg, "inward" if args.inwards else None)
 	if args.start_shell is not None and not _has_stage(stage_cfg, "cyl_grow"):
 		stages: list[optimizer.Stage] = []
 	else:
