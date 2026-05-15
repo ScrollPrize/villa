@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vc::render {
@@ -43,6 +44,8 @@ enum class ChunkFetchStatus {
 struct ChunkFetchResult {
     ChunkFetchStatus status = ChunkFetchStatus::Missing;
     std::vector<std::byte> bytes;
+    std::vector<std::byte> persistentBytes;
+    bool hasPersistentBytes = false;
     int httpStatus = 0;
     std::string message;
 };
@@ -51,7 +54,21 @@ class IChunkFetcher {
 public:
     virtual ~IChunkFetcher() = default;
     virtual ChunkFetchResult fetch(const ChunkKey& key) = 0;
+
+    virtual std::string persistentCacheExtension(const ChunkKey&) const
+    {
+        return ".bin";
+    }
+
+    virtual ChunkFetchResult decodePersistentBytes(
+        const ChunkKey&,
+        std::vector<std::byte> bytes) const
+    {
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = std::move(bytes);
+        return result;
+    }
 };
 
 } // namespace vc::render
-

@@ -1205,6 +1205,51 @@ public:
         return data;
     }
 
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    read_chunk_encoded(std::span<const std::size_t> chunk_indices) const {
+        if (is_sharded())
+            return read_inner_chunk_from_shard(chunk_indices);
+        return read_chunk_raw(chunk_indices);
+    }
+
+    [[nodiscard]] std::vector<std::byte>
+    decode_chunk_payload(std::span<const std::byte> payload) const {
+        std::vector<std::byte> data(payload.begin(), payload.end());
+        const std::size_t expected = is_sharded()
+            ? meta_.sub_chunk_byte_size()
+            : meta_.chunk_byte_size();
+
+        if (codec_.decompress && needs_decompression()) {
+            data = codec_.decompress(data, expected);
+        }
+
+        if (meta_.version == ZarrVersion::v2) {
+            for (auto it = meta_.filters.rbegin(); it != meta_.filters.rend(); ++it)
+                data = it->decode(data);
+        }
+
+        if (needs_byteswap()) {
+            detail::byteswap_inplace(data, dtype_size(meta_.dtype));
+        }
+
+        return data;
+    }
+
+    [[nodiscard]] bool stores_chunks_with_codec(std::string_view codec_name) const noexcept {
+        auto has_codec = [codec_name](const std::vector<ZarrCodecConfig>& codecs) {
+            for (const auto& codec : codecs) {
+                if (codec.name == codec_name)
+                    return true;
+            }
+            return false;
+        };
+        if (meta_.version == ZarrVersion::v2)
+            return meta_.compressor_id == codec_name;
+        if (meta_.shard_config && has_codec(meta_.shard_config->sub_codecs))
+            return true;
+        return has_codec(meta_.codecs);
+    }
+
     /// Read a chunk and decompress it directly into the caller-provided
     /// `output` buffer. `output` must be at least sub_chunk_byte_size().
     /// Returns false if the chunk is missing on disk; otherwise writes
