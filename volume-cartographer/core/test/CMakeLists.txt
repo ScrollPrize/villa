@@ -173,3 +173,79 @@ add_test(NAME test_normalgridtools_real COMMAND test_normalgridtools_real)
 add_executable(test_tiff_more test_tiff_more.cpp)
 target_link_libraries(test_tiff_more PRIVATE doctest::doctest vc_core)
 add_test(NAME test_tiff_more COMMAND test_tiff_more)
+
+add_executable(test_geometry test_geometry.cpp)
+target_link_libraries(test_geometry PRIVATE doctest::doctest vc_core)
+add_test(NAME test_geometry COMMAND test_geometry)
+
+add_executable(test_affine_transform test_affine_transform.cpp)
+target_link_libraries(test_affine_transform PRIVATE doctest::doctest vc_core)
+add_test(NAME test_affine_transform COMMAND test_affine_transform)
+
+add_executable(test_point_index test_point_index.cpp)
+target_link_libraries(test_point_index PRIVATE doctest::doctest vc_core)
+add_test(NAME test_point_index COMMAND test_point_index)
+
+add_executable(test_plane_surface test_plane_surface.cpp)
+target_link_libraries(test_plane_surface PRIVATE doctest::doctest vc_core)
+add_test(NAME test_plane_surface COMMAND test_plane_surface)
+
+add_executable(test_compositing test_compositing.cpp)
+target_link_libraries(test_compositing PRIVATE doctest::doctest vc_core)
+add_test(NAME test_compositing COMMAND test_compositing)
+
+add_executable(test_quadsurface_basics test_quadsurface_basics.cpp)
+target_link_libraries(test_quadsurface_basics PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_basics COMMAND test_quadsurface_basics)
+
+add_executable(test_load_json test_load_json.cpp)
+target_link_libraries(test_load_json PRIVATE doctest::doctest vc_core)
+add_test(NAME test_load_json COMMAND test_load_json)
+
+add_executable(test_remote_url test_remote_url.cpp)
+target_link_libraries(test_remote_url PRIVATE doctest::doctest vc_core)
+add_test(NAME test_remote_url COMMAND test_remote_url)
+
+add_executable(test_logging test_logging.cpp)
+target_link_libraries(test_logging PRIVATE doctest::doctest vc_core)
+add_test(NAME test_logging COMMAND test_logging)
+
+add_executable(test_plane_surface_branches test_plane_surface_branches.cpp)
+target_link_libraries(test_plane_surface_branches PRIVATE doctest::doctest vc_core)
+add_test(NAME test_plane_surface_branches COMMAND test_plane_surface_branches)
+
+add_executable(test_affine_transform_surface test_affine_transform_surface.cpp)
+target_link_libraries(test_affine_transform_surface PRIVATE doctest::doctest vc_core)
+add_test(NAME test_affine_transform_surface COMMAND test_affine_transform_surface)
+
+add_executable(test_quadsurface_more test_quadsurface_more.cpp)
+target_link_libraries(test_quadsurface_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_more COMMAND test_quadsurface_more)
+
+add_executable(test_thinning test_thinning.cpp)
+target_link_libraries(test_thinning PRIVATE doctest::doctest vc_core)
+add_test(NAME test_thinning COMMAND test_thinning)
+
+add_executable(test_umbilicus test_umbilicus.cpp)
+target_link_libraries(test_umbilicus PRIVATE doctest::doctest vc_core)
+add_test(NAME test_umbilicus COMMAND test_umbilicus)
+
+add_executable(test_colormaps test_colormaps.cpp)
+target_link_libraries(test_colormaps PRIVATE doctest::doctest vc_core)
+add_test(NAME test_colormaps COMMAND test_colormaps)
+
+add_executable(test_quadsurface_io test_quadsurface_io.cpp)
+target_link_libraries(test_quadsurface_io PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_io COMMAND test_quadsurface_io)
+
+add_executable(test_quadsurface_pointto test_quadsurface_pointto.cpp)
+target_link_libraries(test_quadsurface_pointto PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_pointto COMMAND test_quadsurface_pointto)
+
+add_executable(test_quadsurface_snapshot test_quadsurface_snapshot.cpp)
+target_link_libraries(test_quadsurface_snapshot PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_snapshot COMMAND test_quadsurface_snapshot)
+
+add_executable(test_quadsurface_save_paths test_quadsurface_save_paths.cpp)
+target_link_libraries(test_quadsurface_save_paths PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_save_paths COMMAND test_quadsurface_save_paths)
