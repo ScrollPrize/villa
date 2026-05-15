@@ -105,9 +105,15 @@ def _apply_shell_count_override(stage_cfg: dict, shell_count: int | None) -> Non
 		args["cyl_max_shells"] = int(shell_count)
 
 
-def _apply_grow_direction_override(stage_cfg: dict, direction: str | None) -> None:
+def _apply_grow_direction_override(stage_cfg: dict, direction: str | None) -> bool:
 	if direction is None:
-		return
+		return False
+	direction_value = (
+		"inward"
+		if optimizer.normalize_cylinder_grow_direction(direction) < 0
+		else "outward"
+	)
+	applied = False
 	for stage in stage_cfg.get("stages", []):
 		if not isinstance(stage, dict) or str(stage.get("name", "")) != "cyl_grow":
 			continue
@@ -115,7 +121,9 @@ def _apply_grow_direction_override(stage_cfg: dict, direction: str | None) -> No
 		if not isinstance(args, dict):
 			args = {}
 			stage["args"] = args
-		args["cyl_grow_direction"] = str(direction)
+		args["cyl_grow_direction"] = direction_value
+		applied = True
+	return applied
 
 
 def _has_stage(stage_cfg: dict, name: str) -> bool:
@@ -270,9 +278,88 @@ def _load_start_shell(path: str | Path, *, device: torch.device) -> tuple[torch.
 	return _strip_wrapped_start_shell(xyz, valid), meta
 
 
+def _prefetch_grad_mag_points(data: fit_data.FitData3D, xyz: torch.Tensor) -> None:
+	if not getattr(data, "sparse_caches", None):
+		return
+	pts = xyz.detach()
+	for cache in data.sparse_caches.values():
+		if "grad_mag" not in set(cache.channels):
+			continue
+		cache.prefetch(pts, data.origin_fullres, data._spacing_for(cache.channels[0]))
+	for cache in data.sparse_caches.values():
+		if "grad_mag" in set(cache.channels):
+			cache.sync()
+
+
+def _squeeze_shell_grad_mag(grad_mag: torch.Tensor, shell_shape: torch.Size | tuple[int, int]) -> torch.Tensor:
+	mask = grad_mag.squeeze(0).squeeze(0)
+	if mask.ndim == 3 and int(mask.shape[0]) == 1 and tuple(mask.shape[1:]) == tuple(shell_shape):
+		mask = mask.squeeze(0)
+	if tuple(mask.shape) != tuple(shell_shape):
+		raise ValueError(
+			"sampled grad_mag shape does not match loaded start shell: "
+			f"grad_mag={tuple(grad_mag.shape)} shell={tuple(shell_shape)}"
+		)
+	return mask
+
+
+def _loaded_shell_grow_reference(
+	data: fit_data.FitData3D,
+	shell_xyz: torch.Tensor,
+) -> dict[str, float | int]:
+	shell = shell_xyz.detach()
+	if shell.ndim != 3 or int(shell.shape[-1]) != 3:
+		raise ValueError(f"loaded shell must have shape (H, W, 3), got {tuple(shell.shape)}")
+	h = int(shell.shape[0])
+	w = int(shell.shape[1])
+	if h < 1 or w < 3:
+		raise ValueError(f"loaded shell requires H>=1 and W>=3, got {(h, w)}")
+	_prefetch_grad_mag_points(data, shell)
+	sampled = data.grid_sample_fullres(shell.unsqueeze(0), channels={"grad_mag"})
+	grad_mag = getattr(sampled, "grad_mag", None)
+	if grad_mag is None:
+		raise RuntimeError("cannot seed loaded cylinder shell grow reference: grad_mag channel was not sampled")
+	mask = _squeeze_shell_grad_mag(grad_mag, shell.shape[:-1]) > 0.0
+	edge_valid = mask & torch.roll(mask, shifts=-1, dims=1)
+	valid_edge_count = int(edge_valid.sum().detach().cpu())
+	total_edge_count = h * w
+	if valid_edge_count <= 0:
+		raise ValueError(
+			"cannot seed loaded cylinder shell grow reference: "
+			"no valid grad_mag width edges were found on the start shell"
+		)
+	w_len = (torch.roll(shell, shifts=-1, dims=1) - shell).norm(dim=-1)
+	row_counts = edge_valid.sum(dim=1)
+	row_keep = row_counts > 0
+	if not bool(row_keep.any().detach().cpu()):
+		raise ValueError(
+			"cannot seed loaded cylinder shell grow reference: "
+			"no shell rows contain valid grad_mag width edges"
+		)
+	row_sums = (w_len * edge_valid.to(dtype=w_len.dtype)).sum(dim=1)
+	row_means = row_sums[row_keep] / row_counts[row_keep].to(dtype=w_len.dtype)
+	reference_step = float(torch.median(row_means).detach().cpu())
+	if not math.isfinite(reference_step) or reference_step <= 0.0:
+		raise ValueError(
+			"cannot seed loaded cylinder shell grow reference: "
+			f"invalid median valid edge step {reference_step}"
+		)
+	reference_circ = reference_step * float(w)
+	return {
+		"reference_width_count": w,
+		"reference_step": reference_step,
+		"reference_circumference": reference_circ,
+		"valid_edge_count": valid_edge_count,
+		"total_edge_count": total_edge_count,
+		"valid_edge_fraction": valid_edge_count / float(total_edge_count),
+		"valid_row_count": int(row_keep.sum().detach().cpu()),
+	}
+
+
 def _seed_model_from_completed_shell(
 	mdl: model.Model3D,
 	*,
+	initial_data: fit_data.FitData3D,
 	shell_xyz: torch.Tensor,
 	seed_xyz: tuple[float, float, float],
 	z_center: float,
@@ -284,6 +371,7 @@ def _seed_model_from_completed_shell(
 	model_h = max(1.0, z_max - z_min)
 	with torch.no_grad():
 		mdl.cyl_seed_xyz = torch.tensor(seed_xyz, device=device, dtype=torch.float32)
+	grow_ref = _loaded_shell_grow_reference(initial_data, shell)
 	mdl.params = dataclasses.replace(mdl.params, model_w=None, model_h=model_h)
 	mdl.cyl_shell_mode = True
 	mdl.cylinder_enabled = True
@@ -296,6 +384,8 @@ def _seed_model_from_completed_shell(
 	mdl.cyl_shell_base = None
 	mdl.cyl_shell_dirs = None
 	mdl.cyl_shell_completed = [shell]
+	mdl.cyl_grow_reference_width_count = int(grow_ref["reference_width_count"])
+	mdl.cyl_grow_reference_circumference = float(grow_ref["reference_circumference"])
 	mdl.cyl_shell_current_index = 0
 	mdl.cyl_shell_active = False
 	mdl.cyl_shell_search_direction = 1
@@ -305,6 +395,15 @@ def _seed_model_from_completed_shell(
 	mdl.cyl_shell_search_last_signed_distance = None
 	mdl.cyl_shell_search_crossed = False
 	mdl.cyl_shell_search_done = False
+	print(
+		"[cyl_init_tool] start-shell grow reference: "
+		f"reference_w={int(grow_ref['reference_width_count'])} "
+		f"reference_step={float(grow_ref['reference_step']):.6g} "
+		f"reference_circ={float(grow_ref['reference_circumference']):.6g} "
+		f"valid_grad_mag_edges={int(grow_ref['valid_edge_count'])}/{int(grow_ref['total_edge_count'])} "
+		f"({float(grow_ref['valid_edge_fraction']):.4f})",
+		flush=True,
+	)
 
 
 class _ShellExporter:
@@ -392,7 +491,8 @@ def main(argv: list[str] | None = None) -> int:
 
 	stage_cfg = _filter_cylinder_config(cfg, start_shell=args.start_shell is not None)
 	_apply_shell_count_override(stage_cfg, args.shell_count)
-	_apply_grow_direction_override(stage_cfg, "inward" if args.inwards else None)
+	if args.inwards and not _apply_grow_direction_override(stage_cfg, "inward"):
+		raise ValueError("--inwards was requested, but the filtered cylinder config contains no cyl_grow stage")
 	if args.start_shell is not None and not _has_stage(stage_cfg, "cyl_grow"):
 		stages: list[optimizer.Stage] = []
 	else:
@@ -470,7 +570,13 @@ def main(argv: list[str] | None = None) -> int:
 		seed_xyz = _umbilicus_seed_at_z(initial_data, z=z_center, device=device)
 		mdl = _construct_model(device=device, scaledown=scaledown, z_center=z_center, model_step=model_step)
 		_set_model_volume_extent(mdl, initial_data)
-		_seed_model_from_completed_shell(mdl, shell_xyz=shell_xyz, seed_xyz=seed_xyz, z_center=z_center)
+		_seed_model_from_completed_shell(
+			mdl,
+			initial_data=initial_data,
+			shell_xyz=shell_xyz,
+			seed_xyz=seed_xyz,
+			z_center=z_center,
+		)
 		scale = shell_meta.get("scale")
 		if scale is not None and isinstance(scale, list) and scale and float(scale[0]) > 0.0:
 			shell_step = max(1, int(round(1.0 / float(scale[0]))))
