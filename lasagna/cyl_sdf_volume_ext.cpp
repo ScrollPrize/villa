@@ -27,6 +27,13 @@ using MatrixXdR = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::R
 using MatrixXiR = Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 using RowVector3d = Eigen::Matrix<double, 1, 3>;
 
+constexpr double kDefaultBarrierDepthMax = 2000.0;
+
+enum class BarrierMode {
+	Inside,
+	Outside,
+};
+
 MatrixXdR tensor_to_vertices(torch::Tensor vertices) {
 	TORCH_CHECK(vertices.dim() == 2 && vertices.size(1) == 3, "vertices must be (N, 3)");
 	vertices = vertices.to(torch::kFloat64).cpu().contiguous();
@@ -53,6 +60,30 @@ bool is_inside_at(
 ) {
 	const double winding = hier.winding_number(q.transpose());
 	return winding > 0.5;
+}
+
+bool is_active_at(
+	const igl::WindingNumberAABB<double, int>& hier,
+	const RowVector3d& q,
+	BarrierMode mode
+) {
+	const bool inside = is_inside_at(hier, q);
+	return mode == BarrierMode::Inside ? inside : !inside;
+}
+
+BarrierMode parse_barrier_mode(const std::string& mode) {
+	if (mode == "inside") {
+		return BarrierMode::Inside;
+	}
+	if (mode == "outside") {
+		return BarrierMode::Outside;
+	}
+	TORCH_CHECK(false, "cyl_outside mode must be 'inside' or 'outside', got '", mode, "'");
+	return BarrierMode::Inside;
+}
+
+const char* barrier_mode_name(BarrierMode mode) {
+	return mode == BarrierMode::Inside ? "inside" : "outside";
 }
 
 double surface_distance_at(
@@ -257,10 +288,10 @@ void throw_if_cancelled(
 
 struct DepthScanStats {
 	double depth_max = 0.0;
-	int64_t inside_count = 0;
+	int64_t active_count = 0;
 	int64_t voxels_classified = 0;
 	int64_t voxels_skipped_by_chunk_mask = 0;
-	int64_t certified_inside_chunks = 0;
+	int64_t certified_active_chunks = 0;
 	int64_t winding_chunks = 0;
 	int64_t exact_distance_chunks = 0;
 	int64_t blended_chunks = 0;
@@ -268,12 +299,12 @@ struct DepthScanStats {
 	int64_t exact_distance_voxels = 0;
 	int64_t coarse_voxels = 0;
 	int64_t total_chunks = 0;
-	int64_t center_inside_chunks = 0;
+	int64_t center_active_chunks = 0;
 	int64_t surface_seed_chunks = 0;
 	int64_t initial_candidate_chunks = 0;
 	int64_t growth_iterations = 0;
 	int64_t processed_chunks = 0;
-	int64_t chunks_with_inside = 0;
+	int64_t chunks_with_active = 0;
 	double center_prepass_elapsed = 0.0;
 	double growth_elapsed = 0.0;
 	double pass_cpu_seconds = 0.0;
@@ -410,6 +441,14 @@ double positive_finite_depth(double depth) {
 	return depth;
 }
 
+double capped_positive_depth(double depth, double depth_max) {
+	const double positive = positive_finite_depth(depth);
+	if (!(depth_max > 0.0) || !std::isfinite(depth_max)) {
+		return positive;
+	}
+	return std::min(positive, depth_max);
+}
+
 int64_t count_marked(const std::vector<uint8_t>& values) {
 	int64_t count = 0;
 	for (uint8_t value : values) {
@@ -527,6 +566,8 @@ DepthScanStats scan_full_volume(
 	int64_t Y,
 	int64_t X,
 	int n_threads,
+	BarrierMode mode,
+	double depth_max,
 	float* depth_ptr,
 	std::atomic<bool>& cancel,
 	const std::string& progress_label,
@@ -535,7 +576,7 @@ DepthScanStats scan_full_volume(
 ) {
 	const int64_t total = Z * Y * X;
 	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
-	std::vector<int64_t> thread_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_active(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_classified(static_cast<size_t>(n_threads), 0);
 	std::vector<double> thread_pass_seconds(static_cast<size_t>(n_threads), 0.0);
 	std::vector<double> thread_distance_seconds(static_cast<size_t>(n_threads), 0.0);
@@ -546,7 +587,7 @@ DepthScanStats scan_full_volume(
 		parallel_chunks(total, n_threads, 2048, cancel, [&](int64_t begin, int64_t end, int ti) {
 			const auto chunk_start = std::chrono::steady_clock::now();
 			double local_max = 0.0;
-			int64_t local_inside = 0;
+			int64_t local_active = 0;
 			int64_t processed = 0;
 			double local_distance_seconds = 0.0;
 			for (int64_t n = begin; n < end; ++n) {
@@ -563,23 +604,23 @@ DepthScanStats scan_full_volume(
 					origin[2] + static_cast<double>(z) * spacing[2]
 				);
 				double depth = 0.0;
-				if (is_inside_at(hier, q)) {
+				if (is_active_at(hier, q, mode)) {
 					const auto distance_start = std::chrono::steady_clock::now();
 					depth = surface_distance_at(tree, V, F, q);
 					local_distance_seconds += std::chrono::duration<double>(
 						std::chrono::steady_clock::now() - distance_start
 					).count();
 				}
-				const float depth_f = static_cast<float>(depth);
+				const float depth_f = static_cast<float>(capped_positive_depth(depth, depth_max));
 				depth_ptr[n] = depth_f;
 				local_max = std::max(local_max, static_cast<double>(depth_f));
 				if (depth_f > 0.0f) {
-					++local_inside;
+					++local_active;
 				}
 				++processed;
 			}
 			thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
-			thread_inside[static_cast<size_t>(ti)] += local_inside;
+			thread_active[static_cast<size_t>(ti)] += local_active;
 			thread_classified[static_cast<size_t>(ti)] += processed;
 			thread_distance_seconds[static_cast<size_t>(ti)] += local_distance_seconds;
 			thread_pass_seconds[static_cast<size_t>(ti)] += std::chrono::duration<double>(
@@ -593,8 +634,8 @@ DepthScanStats scan_full_volume(
 	for (const double value : thread_max) {
 		stats.depth_max = std::max(stats.depth_max, value);
 	}
-	for (const int64_t value : thread_inside) {
-		stats.inside_count += value;
+	for (const int64_t value : thread_active) {
+		stats.active_count += value;
 	}
 	for (const int64_t value : thread_classified) {
 		stats.voxels_classified += value;
@@ -622,6 +663,8 @@ DepthScanStats scan_chunked_volume(
 	int chunk_size,
 	double deep_interp_chunks,
 	double deep_blend_chunks,
+	BarrierMode mode,
+	double depth_max,
 	float* depth_ptr,
 	std::atomic<bool>& cancel,
 	const std::string& progress_label,
@@ -644,8 +687,8 @@ DepthScanStats scan_chunked_volume(
 
 	std::fill(depth_ptr, depth_ptr + total, 0.0f);
 
-	std::vector<uint8_t> center_inside(static_cast<size_t>(total_chunks), 0);
-	std::vector<int64_t> thread_center_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<uint8_t> center_active(static_cast<size_t>(total_chunks), 0);
+	std::vector<int64_t> thread_center_active(static_cast<size_t>(n_threads), 0);
 	std::atomic<int64_t> center_done(0);
 	const auto center_start = std::chrono::steady_clock::now();
 	{
@@ -658,7 +701,7 @@ DepthScanStats scan_chunked_volume(
 			"chunks"
 		);
 		parallel_chunks(total_chunks, n_threads, 64, cancel, [&](int64_t begin, int64_t end, int ti) {
-			int64_t local_inside = 0;
+			int64_t local_active = 0;
 			int64_t processed = 0;
 			for (int64_t ci = begin; ci < end; ++ci) {
 				if ((processed & 15) == 0 && cancel.load(std::memory_order_relaxed)) {
@@ -670,21 +713,21 @@ DepthScanStats scan_chunked_volume(
 				const int64_t cz = yz / CY;
 				const ChunkBounds b = chunk_bounds_for_coords(cx, cy, cz, X, Y, Z, cs);
 				const RowVector3d q = chunk_domain_center(b, origin, spacing);
-				if (is_inside_at(hier, q)) {
-					center_inside[static_cast<size_t>(ci)] = 1;
-					++local_inside;
+				if (is_active_at(hier, q, mode)) {
+					center_active[static_cast<size_t>(ci)] = 1;
+					++local_active;
 				}
 				++processed;
 			}
-			thread_center_inside[static_cast<size_t>(ti)] += local_inside;
+			thread_center_active[static_cast<size_t>(ti)] += local_active;
 			center_done.fetch_add(processed);
 		});
 	}
 	stats.center_prepass_elapsed = std::chrono::duration<double>(
 		std::chrono::steady_clock::now() - center_start
 	).count();
-	for (const int64_t value : thread_center_inside) {
-		stats.center_inside_chunks += value;
+	for (const int64_t value : thread_center_active) {
+		stats.center_active_chunks += value;
 	}
 
 	throw_if_cancelled(cancel, progress_label, "chunk center prepass", progress_enabled);
@@ -720,17 +763,17 @@ DepthScanStats scan_chunked_volume(
 	stats.surface_seed_chunks = count_marked(surface_seed);
 
 	std::vector<uint8_t> candidate(static_cast<size_t>(total_chunks), 0);
-	dilate_marked_chunks(center_inside, candidate, CZ, CY, CX);
+	dilate_marked_chunks(center_active, candidate, CZ, CY, CX);
 	dilate_marked_chunks(surface_seed, candidate, CZ, CY, CX);
 	stats.initial_candidate_chunks = count_marked(candidate);
 
 	std::vector<uint8_t> processed(static_cast<size_t>(total_chunks), 0);
 	std::vector<double> thread_max(static_cast<size_t>(n_threads), 0.0);
-	std::vector<int64_t> thread_inside(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_active(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_classified(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_processed_chunks(static_cast<size_t>(n_threads), 0);
-	std::vector<int64_t> thread_chunks_with_inside(static_cast<size_t>(n_threads), 0);
-	std::vector<int64_t> thread_certified_inside_chunks(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_chunks_with_active(static_cast<size_t>(n_threads), 0);
+	std::vector<int64_t> thread_certified_active_chunks(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_winding_chunks(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_exact_distance_chunks(static_cast<size_t>(n_threads), 0);
 	std::vector<int64_t> thread_blended_chunks(static_cast<size_t>(n_threads), 0);
@@ -740,13 +783,13 @@ DepthScanStats scan_chunked_volume(
 	std::vector<double> thread_pass_seconds(static_cast<size_t>(n_threads), 0.0);
 	std::vector<double> thread_distance_seconds(static_cast<size_t>(n_threads), 0.0);
 	std::vector<double> thread_chunk_probe_distance_seconds(static_cast<size_t>(n_threads), 0.0);
-	std::vector<std::vector<int64_t>> thread_inside_chunks(static_cast<size_t>(n_threads));
+	std::vector<std::vector<int64_t>> thread_active_chunks(static_cast<size_t>(n_threads));
 	std::atomic<int64_t> growth_done(0);
 	const auto growth_start = std::chrono::steady_clock::now();
 	{
 		ProgressPrinter progress(
 			progress_label,
-			"candidate/growth winding+inside-distance",
+			"candidate/growth winding+violation-distance",
 			0,
 			growth_done,
 			progress_enabled,
@@ -767,17 +810,17 @@ DepthScanStats scan_chunked_volume(
 				break;
 			}
 			++stats.growth_iterations;
-			for (std::vector<int64_t>& chunks : thread_inside_chunks) {
+			for (std::vector<int64_t>& chunks : thread_active_chunks) {
 				chunks.clear();
 			}
 			parallel_chunks(static_cast<int64_t>(scan_list.size()), n_threads, 1, cancel, [&](int64_t begin, int64_t end, int ti) {
 				const auto chunk_start = std::chrono::steady_clock::now();
 				double local_max = 0.0;
-				int64_t local_inside = 0;
+				int64_t local_active = 0;
 				int64_t local_classified = 0;
 				int64_t local_processed_chunks = 0;
-				int64_t local_chunks_with_inside = 0;
-				int64_t local_certified_inside_chunks = 0;
+				int64_t local_chunks_with_active = 0;
+				int64_t local_certified_active_chunks = 0;
 				int64_t local_winding_chunks = 0;
 				int64_t local_exact_distance_chunks = 0;
 				int64_t local_blended_chunks = 0;
@@ -786,7 +829,7 @@ DepthScanStats scan_chunked_volume(
 				int64_t local_coarse_voxels = 0;
 				double local_distance_seconds = 0.0;
 				double local_probe_distance_seconds = 0.0;
-				std::vector<int64_t>& local_inside_chunks = thread_inside_chunks[static_cast<size_t>(ti)];
+				std::vector<int64_t>& local_active_chunks = thread_active_chunks[static_cast<size_t>(ti)];
 				auto query_distance = [&](const RowVector3d& q, bool probe) {
 					const auto distance_start = std::chrono::steady_clock::now();
 					const double depth = surface_distance_at(tree, V, F, q);
@@ -800,13 +843,13 @@ DepthScanStats scan_chunked_volume(
 					}
 					return depth;
 				};
-				auto write_depth = [&](int64_t n, double depth, int64_t& chunk_inside) {
-					const float depth_f = static_cast<float>(positive_finite_depth(depth));
+				auto write_depth = [&](int64_t n, double depth, int64_t& chunk_active) {
+					const float depth_f = static_cast<float>(capped_positive_depth(depth, depth_max));
 					depth_ptr[n] = depth_f;
 					local_max = std::max(local_max, static_cast<double>(depth_f));
 					if (depth_f > 0.0f) {
-						++local_inside;
-						++chunk_inside;
+						++local_active;
+						++chunk_active;
 					}
 				};
 				for (int64_t si = begin; si < end; ++si) {
@@ -819,7 +862,7 @@ DepthScanStats scan_chunked_volume(
 					const int64_t cy = yz % CY;
 					const int64_t cz = yz / CY;
 					const ChunkBounds b = chunk_bounds_for_coords(cx, cy, cz, X, Y, Z, cs);
-					int64_t chunk_inside = 0;
+					int64_t chunk_active = 0;
 					int64_t chunk_processed = 0;
 					bool used_certified = false;
 					bool used_blended = false;
@@ -828,13 +871,13 @@ DepthScanStats scan_chunked_volume(
 					double center_correction = 0.0;
 					const int64_t voxel_count = chunk_voxel_count(b);
 
-					if (center_inside[static_cast<size_t>(ci)] != 0) {
+					if (center_active[static_cast<size_t>(ci)] != 0) {
 						const RowVector3d center_q = chunk_domain_center(b, origin, spacing);
 						const double center_distance = positive_finite_depth(query_distance(center_q, true));
 						const double half_diag = chunk_domain_half_diagonal(b, spacing);
 						if (center_distance > half_diag) {
 							used_certified = true;
-							++local_certified_inside_chunks;
+							++local_certified_active_chunks;
 							const double chunk_distance_lower = center_distance - half_diag;
 							const double chunk_distance_upper = center_distance + half_diag;
 							used_coarse_only = coarse_enabled &&
@@ -883,7 +926,7 @@ DepthScanStats scan_chunked_volume(
 										break;
 									}
 									const int64_t n = flat_voxel_index(x, y, z, X, Y);
-									write_depth(n, coarse_depth_at(x, y, z), chunk_inside);
+									write_depth(n, coarse_depth_at(x, y, z), chunk_active);
 									++chunk_processed;
 								}
 								if (cancel.load(std::memory_order_relaxed)) {
@@ -915,7 +958,7 @@ DepthScanStats scan_chunked_volume(
 										deep_threshold + deep_blend_width,
 										exact_depth
 									);
-									write_depth(n, exact_depth * (1.0 - w) + coarse_depth * w, chunk_inside);
+									write_depth(n, exact_depth * (1.0 - w) + coarse_depth * w, chunk_active);
 									++chunk_processed;
 								}
 								if (cancel.load(std::memory_order_relaxed)) {
@@ -935,7 +978,7 @@ DepthScanStats scan_chunked_volume(
 										break;
 									}
 									const int64_t n = flat_voxel_index(x, y, z, X, Y);
-									write_depth(n, query_distance(voxel_point(origin, spacing, x, y, z), false), chunk_inside);
+									write_depth(n, query_distance(voxel_point(origin, spacing, x, y, z), false), chunk_active);
 									++local_exact_distance_voxels;
 									++chunk_processed;
 								}
@@ -958,11 +1001,11 @@ DepthScanStats scan_chunked_volume(
 									const int64_t n = flat_voxel_index(x, y, z, X, Y);
 									double depth = 0.0;
 									const RowVector3d q = voxel_point(origin, spacing, x, y, z);
-									if (is_inside_at(hier, q)) {
+									if (is_active_at(hier, q, mode)) {
 										depth = query_distance(q, false);
 										++local_exact_distance_voxels;
 									}
-									write_depth(n, depth, chunk_inside);
+									write_depth(n, depth, chunk_active);
 									++chunk_processed;
 								}
 								if (cancel.load(std::memory_order_relaxed)) {
@@ -977,17 +1020,17 @@ DepthScanStats scan_chunked_volume(
 					local_classified += chunk_processed;
 					growth_done.fetch_add(chunk_processed);
 					++local_processed_chunks;
-					if (chunk_inside > 0) {
-						++local_chunks_with_inside;
-						local_inside_chunks.push_back(ci);
+					if (chunk_active > 0) {
+						++local_chunks_with_active;
+						local_active_chunks.push_back(ci);
 					}
 				}
 				thread_max[static_cast<size_t>(ti)] = std::max(thread_max[static_cast<size_t>(ti)], local_max);
-				thread_inside[static_cast<size_t>(ti)] += local_inside;
+				thread_active[static_cast<size_t>(ti)] += local_active;
 				thread_classified[static_cast<size_t>(ti)] += local_classified;
 				thread_processed_chunks[static_cast<size_t>(ti)] += local_processed_chunks;
-				thread_chunks_with_inside[static_cast<size_t>(ti)] += local_chunks_with_inside;
-				thread_certified_inside_chunks[static_cast<size_t>(ti)] += local_certified_inside_chunks;
+				thread_chunks_with_active[static_cast<size_t>(ti)] += local_chunks_with_active;
+				thread_certified_active_chunks[static_cast<size_t>(ti)] += local_certified_active_chunks;
 				thread_winding_chunks[static_cast<size_t>(ti)] += local_winding_chunks;
 				thread_exact_distance_chunks[static_cast<size_t>(ti)] += local_exact_distance_chunks;
 				thread_blended_chunks[static_cast<size_t>(ti)] += local_blended_chunks;
@@ -1001,7 +1044,7 @@ DepthScanStats scan_chunked_volume(
 				).count();
 			});
 			throw_if_cancelled(cancel, progress_label, "candidate/growth chunk processing", progress_enabled);
-			for (const std::vector<int64_t>& chunks : thread_inside_chunks) {
+			for (const std::vector<int64_t>& chunks : thread_active_chunks) {
 				for (int64_t ci : chunks) {
 					dilate_one_chunk_into(ci, candidate, CZ, CY, CX);
 				}
@@ -1014,8 +1057,8 @@ DepthScanStats scan_chunked_volume(
 	for (const double value : thread_max) {
 		stats.depth_max = std::max(stats.depth_max, value);
 	}
-	for (const int64_t value : thread_inside) {
-		stats.inside_count += value;
+	for (const int64_t value : thread_active) {
+		stats.active_count += value;
 	}
 	for (const int64_t value : thread_classified) {
 		stats.voxels_classified += value;
@@ -1023,11 +1066,11 @@ DepthScanStats scan_chunked_volume(
 	for (const int64_t value : thread_processed_chunks) {
 		stats.processed_chunks += value;
 	}
-	for (const int64_t value : thread_chunks_with_inside) {
-		stats.chunks_with_inside += value;
+	for (const int64_t value : thread_chunks_with_active) {
+		stats.chunks_with_active += value;
 	}
-	for (const int64_t value : thread_certified_inside_chunks) {
-		stats.certified_inside_chunks += value;
+	for (const int64_t value : thread_certified_active_chunks) {
+		stats.certified_active_chunks += value;
 	}
 	for (const int64_t value : thread_winding_chunks) {
 		stats.winding_chunks += value;
@@ -1062,12 +1105,14 @@ DepthScanStats scan_chunked_volume(
 
 } // namespace
 
-pybind11::tuple build_inside_depth_volume(
+pybind11::tuple build_violation_depth_volume(
 	torch::Tensor vertices,
 	torch::Tensor faces,
 	torch::Tensor origin_xyz,
 	torch::Tensor spacing_xyz,
 	torch::Tensor shape_zyx,
+	double requested_depth_max,
+	const std::string& requested_mode,
 	const std::string& progress_label,
 	int requested_threads,
 	int chunk_size,
@@ -1093,6 +1138,9 @@ pybind11::tuple build_inside_depth_volume(
 	const int64_t X = shape_zyx.data_ptr<int64_t>()[2];
 	TORCH_CHECK(Z > 0 && Y > 0 && X > 0, "shape values must be positive");
 	TORCH_CHECK(spacing[0] > 0.0 && spacing[1] > 0.0 && spacing[2] > 0.0, "spacing values must be positive");
+	TORCH_CHECK(requested_depth_max > 0.0 && std::isfinite(requested_depth_max), "depth_max must be finite and positive");
+	const double depth_max = requested_depth_max;
+	const BarrierMode mode = parse_barrier_mode(requested_mode);
 
 	const auto total_start = std::chrono::steady_clock::now();
 	const int64_t total = Z * Y * X;
@@ -1106,6 +1154,8 @@ pybind11::tuple build_inside_depth_volume(
 			<< " voxels=" << total
 			<< " vertices=" << V.rows()
 			<< " faces=" << F.rows()
+			<< " barrier_mode=" << barrier_mode_name(mode)
+			<< " depth_max=" << requested_depth_max
 			<< " depth_temp="
 			<< std::fixed << std::setprecision(2)
 			<< (static_cast<double>(total) * static_cast<double>(sizeof(float)) / (1024.0 * 1024.0 * 1024.0))
@@ -1154,9 +1204,10 @@ pybind11::tuple build_inside_depth_volume(
 		}
 		scan_stats = scan_full_volume(
 			hier, tree, V, F, origin, spacing, Z, Y, X, n_threads,
-			depth_ptr, cancel, progress_label, "pass 1/2 full winding+inside-distance", progress_enabled
+			mode, depth_max,
+			depth_ptr, cancel, progress_label, "pass 1/2 full winding+violation-distance", progress_enabled
 		);
-		throw_if_cancelled(cancel, progress_label, "full winding+inside-distance pass", progress_enabled);
+		throw_if_cancelled(cancel, progress_label, "full winding+violation-distance pass", progress_enabled);
 	} else {
 		if (progress_enabled) {
 			std::cout
@@ -1169,31 +1220,33 @@ pybind11::tuple build_inside_depth_volume(
 		scan_stats = scan_chunked_volume(
 			hier, tree, V, F, origin, spacing, Z, Y, X, n_threads, chunk_size,
 			deep_interp_chunks, deep_blend_chunks,
+			mode, depth_max,
 			depth_ptr, cancel, progress_label, progress_enabled
 		);
-		throw_if_cancelled(cancel, progress_label, "chunked winding+inside-distance pass", progress_enabled);
-		if (scan_stats.inside_count == 0) {
+		throw_if_cancelled(cancel, progress_label, "chunked winding+violation-distance pass", progress_enabled);
+		if (scan_stats.active_count == 0) {
 			if (progress_enabled) {
 				std::cout
 					<< "[cyl_outside] " << progress_label
-					<< ": WARNING chunked scan found zero inside voxels; rerunning full scan"
+					<< ": WARNING chunked scan found zero active voxels; rerunning full scan"
 					<< std::endl;
 			}
 			DepthScanStats fallback_stats = scan_full_volume(
 				hier, tree, V, F, origin, spacing, Z, Y, X, n_threads,
-				depth_ptr, cancel, progress_label, "fallback full winding+inside-distance", progress_enabled
+				mode, depth_max,
+				depth_ptr, cancel, progress_label, "fallback full winding+violation-distance", progress_enabled
 			);
-			throw_if_cancelled(cancel, progress_label, "fallback full winding+inside-distance pass", progress_enabled);
+			throw_if_cancelled(cancel, progress_label, "fallback full winding+violation-distance pass", progress_enabled);
 			fallback_stats.used_chunked = true;
 			fallback_stats.used_fallback = true;
 			fallback_stats.total_chunks = scan_stats.total_chunks;
-			fallback_stats.center_inside_chunks = scan_stats.center_inside_chunks;
+			fallback_stats.center_active_chunks = scan_stats.center_active_chunks;
 			fallback_stats.surface_seed_chunks = scan_stats.surface_seed_chunks;
 			fallback_stats.initial_candidate_chunks = scan_stats.initial_candidate_chunks;
 			fallback_stats.growth_iterations = scan_stats.growth_iterations;
 			fallback_stats.processed_chunks = scan_stats.processed_chunks;
-			fallback_stats.chunks_with_inside = scan_stats.chunks_with_inside;
-			fallback_stats.certified_inside_chunks = scan_stats.certified_inside_chunks;
+			fallback_stats.chunks_with_active = scan_stats.chunks_with_active;
+			fallback_stats.certified_active_chunks = scan_stats.certified_active_chunks;
 			fallback_stats.winding_chunks = scan_stats.winding_chunks;
 			fallback_stats.exact_distance_chunks = scan_stats.exact_distance_chunks;
 			fallback_stats.blended_chunks = scan_stats.blended_chunks;
@@ -1206,8 +1259,7 @@ pybind11::tuple build_inside_depth_volume(
 			scan_stats = fallback_stats;
 		}
 	}
-	const double depth_max = scan_stats.depth_max;
-	const int64_t inside_count = scan_stats.inside_count;
+	const int64_t active_count = scan_stats.active_count;
 
 	auto out = torch::empty({1, Z, Y, X}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
 	uint8_t* out_ptr = out.data_ptr<uint8_t>();
@@ -1234,7 +1286,7 @@ pybind11::tuple build_inside_depth_volume(
 		const double pass1_elapsed = scan_stats.growth_elapsed;
 		const double pass1_rate = pass1_elapsed > 0.0 ? static_cast<double>(scan_stats.voxels_classified) / pass1_elapsed : 0.0;
 		const double encode_rate = encode_elapsed > 0.0 ? static_cast<double>(total) / encode_elapsed : 0.0;
-		const int64_t skipped_distance = total - inside_count;
+		const int64_t skipped_distance = total - active_count;
 		const double distance_share = scan_stats.pass_cpu_seconds > 0.0
 			? std::min(1.0, std::max(0.0, scan_stats.distance_cpu_seconds / scan_stats.pass_cpu_seconds))
 			: 0.0;
@@ -1246,12 +1298,13 @@ pybind11::tuple build_inside_depth_volume(
 		const double winding_wall_est = std::max(0.0, pass1_elapsed - distance_wall_est - chunk_probe_distance_wall_est);
 		std::cout
 			<< "[cyl_outside] " << progress_label
-			<< ": timing mode="
+			<< ": timing scan_mode="
 			<< (scan_stats.used_chunked ? (scan_stats.used_fallback ? "chunked+fallback" : "chunked") : "full")
+			<< " barrier_mode=" << barrier_mode_name(mode)
 			<< " prep=" << std::fixed << std::setprecision(2) << prep_elapsed << "s"
 			<< " center_prepass_winding=" << scan_stats.center_prepass_elapsed << "s"
 			<< " candidate_growth_winding~=" << winding_wall_est << "s"
-			<< " inside_distance~=" << distance_wall_est << "s"
+			<< " violation_distance~=" << distance_wall_est << "s"
 			<< " chunk_probe_distance~=" << chunk_probe_distance_wall_est << "s"
 			<< " scan=" << pass1_elapsed << "s"
 			<< " (" << std::setprecision(0) << pass1_rate << " vox/s)"
@@ -1261,10 +1314,10 @@ pybind11::tuple build_inside_depth_volume(
 			<< std::endl;
 		std::cout
 			<< "[cyl_outside] " << progress_label
-			<< ": distance queries inside=" << inside_count
-			<< " skipped_outside=" << skipped_distance
-			<< " inside_frac=" << std::fixed << std::setprecision(4)
-			<< (total > 0 ? static_cast<double>(inside_count) / static_cast<double>(total) : 0.0)
+			<< ": distance queries active=" << active_count
+			<< " skipped_inactive=" << skipped_distance
+			<< " active_frac=" << std::fixed << std::setprecision(4)
+			<< (total > 0 ? static_cast<double>(active_count) / static_cast<double>(total) : 0.0)
 			<< " distance_cpu=" << std::setprecision(2) << scan_stats.distance_cpu_seconds << "s"
 			<< " chunk_probe_distance_cpu=" << scan_stats.chunk_probe_distance_seconds << "s"
 			<< " scan_cpu=" << scan_stats.pass_cpu_seconds << "s"
@@ -1274,24 +1327,24 @@ pybind11::tuple build_inside_depth_volume(
 			std::cout
 				<< "[cyl_outside] " << progress_label
 				<< ": chunk stats total_chunks=" << scan_stats.total_chunks
-				<< " center_inside_chunks=" << scan_stats.center_inside_chunks
+				<< " center_active_chunks=" << scan_stats.center_active_chunks
 				<< " surface_seed_chunks=" << scan_stats.surface_seed_chunks
 				<< " initial_candidate_chunks=" << scan_stats.initial_candidate_chunks
 				<< " growth_iterations=" << scan_stats.growth_iterations
 				<< " processed_chunks=" << scan_stats.processed_chunks
-				<< " chunks_with_inside=" << scan_stats.chunks_with_inside
+				<< " chunks_with_active=" << scan_stats.chunks_with_active
 				<< " processed_chunk_frac=" << std::fixed << std::setprecision(4)
 				<< (scan_stats.total_chunks > 0
 					? static_cast<double>(scan_stats.processed_chunks) / static_cast<double>(scan_stats.total_chunks)
 					: 0.0)
-				<< " certified_inside_chunks=" << scan_stats.certified_inside_chunks
+				<< " certified_active_chunks=" << scan_stats.certified_active_chunks
 				<< " winding_chunks=" << scan_stats.winding_chunks
 				<< " exact_distance_chunks=" << scan_stats.exact_distance_chunks
 				<< " blended_chunks=" << scan_stats.blended_chunks
 				<< " coarse_chunks=" << scan_stats.coarse_chunks
 				<< " voxels_classified=" << scan_stats.voxels_classified
 				<< " voxels_skipped_by_chunk_mask=" << scan_stats.voxels_skipped_by_chunk_mask
-				<< " inside_voxels=" << scan_stats.inside_count
+				<< " active_voxels=" << scan_stats.active_count
 				<< " exact_distance_voxels=" << scan_stats.exact_distance_voxels
 				<< " coarse_voxels=" << scan_stats.coarse_voxels
 				<< std::endl;
@@ -1301,7 +1354,52 @@ pybind11::tuple build_inside_depth_volume(
 	return pybind11::make_tuple(out, depth_max);
 }
 
+pybind11::tuple build_inside_depth_volume(
+	torch::Tensor vertices,
+	torch::Tensor faces,
+	torch::Tensor origin_xyz,
+	torch::Tensor spacing_xyz,
+	torch::Tensor shape_zyx,
+	const std::string& progress_label,
+	int requested_threads,
+	int chunk_size,
+	double deep_interp_chunks,
+	double deep_blend_chunks
+) {
+	return build_violation_depth_volume(
+		vertices,
+		faces,
+		origin_xyz,
+		spacing_xyz,
+		shape_zyx,
+		kDefaultBarrierDepthMax,
+		"inside",
+		progress_label,
+		requested_threads,
+		chunk_size,
+		deep_interp_chunks,
+		deep_blend_chunks
+	);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+	m.def(
+		"build_violation_depth_volume",
+		&build_violation_depth_volume,
+		pybind11::arg("vertices"),
+		pybind11::arg("faces"),
+		pybind11::arg("origin_xyz"),
+		pybind11::arg("spacing_xyz"),
+		pybind11::arg("shape_zyx"),
+		pybind11::arg("depth_max") = kDefaultBarrierDepthMax,
+		pybind11::arg("mode") = "inside",
+		pybind11::arg("progress_label") = "",
+		pybind11::arg("requested_threads") = 0,
+		pybind11::arg("chunk_size") = 8,
+		pybind11::arg("deep_interp_chunks") = 10.0,
+		pybind11::arg("deep_blend_chunks") = 2.0,
+		"Build uint8 violation-depth volume from a capped shell mesh"
+	);
 	m.def(
 		"build_inside_depth_volume",
 		&build_inside_depth_volume,
@@ -1315,6 +1413,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		pybind11::arg("chunk_size") = 8,
 		pybind11::arg("deep_interp_chunks") = 10.0,
 		pybind11::arg("deep_blend_chunks") = 2.0,
-		"Build uint8 inside-depth volume from a capped shell mesh"
+		"Build uint8 violation-depth volume from a capped shell mesh"
 	);
 }

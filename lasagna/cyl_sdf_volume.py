@@ -13,6 +13,10 @@ DEFAULT_CYL_OUTSIDE_GRID_STEP = 64.0
 DEFAULT_CYL_OUTSIDE_CHUNK_SIZE = 8
 DEFAULT_CYL_OUTSIDE_DEEP_INTERP_CHUNKS = 10.0
 DEFAULT_CYL_OUTSIDE_DEEP_BLEND_CHUNKS = 2.0
+CYL_OUTSIDE_BARRIER_DEPTH_MAX = 2000.0
+CYL_OUTSIDE_MODE_INSIDE = "inside"
+CYL_OUTSIDE_MODE_OUTSIDE = "outside"
+CYL_OUTSIDE_MODES = (CYL_OUTSIDE_MODE_INSIDE, CYL_OUTSIDE_MODE_OUTSIDE)
 
 _ext_module = None
 
@@ -73,7 +77,7 @@ def _get_ext_module():
 	if not libigl_headers_available():
 		raise RuntimeError(
 			"cyl_outside requires libigl and Eigen headers to build the previous-shell "
-			"inside-depth field. Install libigl headers and Eigen, or set "
+			"violation-depth field. Install libigl headers and Eigen, or set "
 			"LIBIGL_INCLUDE_DIR and EIGEN_INCLUDE_DIR so igl/signed_distance.h and "
 			"Eigen/Dense are on the include path."
 		)
@@ -137,11 +141,13 @@ def default_shell_bbox(
 	shell_xyz: torch.Tensor,
 	*,
 	grid_step: float = DEFAULT_CYL_OUTSIDE_GRID_STEP,
+	padding: float | None = None,
 ) -> tuple[float, float, float, float, float, float]:
-	step = max(1.0e-6, float(grid_step))
+	_ = max(1.0e-6, float(grid_step))
+	pad = CYL_OUTSIDE_BARRIER_DEPTH_MAX if padding is None else max(0.0, float(padding))
 	shell_cpu = shell_xyz.detach().to(device="cpu", dtype=torch.float64)
-	lo = shell_cpu.reshape(-1, 3).amin(dim=0) - step
-	hi = shell_cpu.reshape(-1, 3).amax(dim=0) + step
+	lo = shell_cpu.reshape(-1, 3).amin(dim=0) - pad
+	hi = shell_cpu.reshape(-1, 3).amax(dim=0) + pad
 	return (
 		float(lo[0]), float(lo[1]), float(lo[2]),
 		float(hi[0]), float(hi[1]), float(hi[2]),
@@ -163,7 +169,14 @@ def shape_for_bbox(
 	return (x0, y0, z0), (Z, Y, X)
 
 
-def encode_inside_depth(depth: torch.Tensor, depth_max: float) -> torch.Tensor:
+def _normalize_barrier_mode(mode: str) -> str:
+	mode = str(mode).strip().lower()
+	if mode not in CYL_OUTSIDE_MODES:
+		raise ValueError(f"cyl_outside mode must be one of {CYL_OUTSIDE_MODES}, got {mode!r}")
+	return mode
+
+
+def encode_violation_depth(depth: torch.Tensor, depth_max: float = CYL_OUTSIDE_BARRIER_DEPTH_MAX) -> torch.Tensor:
 	depth_max = float(depth_max)
 	if depth_max <= 0.0 or not math.isfinite(depth_max):
 		return torch.zeros_like(depth, dtype=torch.uint8)
@@ -171,13 +184,22 @@ def encode_inside_depth(depth: torch.Tensor, depth_max: float) -> torch.Tensor:
 	return torch.round(q * 255.0).clamp(min=0.0, max=255.0).to(dtype=torch.uint8)
 
 
-def decode_inside_depth(encoded: torch.Tensor, depth_max: float) -> torch.Tensor:
+def decode_violation_depth(encoded: torch.Tensor, depth_max: float = CYL_OUTSIDE_BARRIER_DEPTH_MAX) -> torch.Tensor:
 	return (encoded.to(dtype=torch.float32) / 255.0).square() * float(depth_max)
 
 
-def build_previous_shell_inside_depth_volume(
+def encode_inside_depth(depth: torch.Tensor, depth_max: float = CYL_OUTSIDE_BARRIER_DEPTH_MAX) -> torch.Tensor:
+	return encode_violation_depth(depth, depth_max)
+
+
+def decode_inside_depth(encoded: torch.Tensor, depth_max: float = CYL_OUTSIDE_BARRIER_DEPTH_MAX) -> torch.Tensor:
+	return decode_violation_depth(encoded, depth_max)
+
+
+def build_previous_shell_violation_depth_volume(
 	shell_xyz: torch.Tensor,
 	*,
+	mode: str = CYL_OUTSIDE_MODE_INSIDE,
 	grid_step: float = DEFAULT_CYL_OUTSIDE_GRID_STEP,
 	bbox: tuple[float, float, float, float, float, float] | None = None,
 	device: torch.device | str | None = None,
@@ -187,7 +209,8 @@ def build_previous_shell_inside_depth_volume(
 	deep_interp_chunks: float = DEFAULT_CYL_OUTSIDE_DEEP_INTERP_CHUNKS,
 	deep_blend_chunks: float = DEFAULT_CYL_OUTSIDE_DEEP_BLEND_CHUNKS,
 ) -> CylOutsideVolume:
-	"""Build a coarse uint8 inside-depth field for the completed previous shell."""
+	"""Build a coarse uint8 violation-depth field for the completed previous shell."""
+	mode = _normalize_barrier_mode(mode)
 	step = max(1.0e-6, float(grid_step))
 	origin, shape = shape_for_bbox(
 		default_shell_bbox(shell_xyz, grid_step=step) if bbox is None else bbox,
@@ -207,12 +230,15 @@ def build_previous_shell_inside_depth_volume(
 			f"elapsed={time.perf_counter() - ext_start:.2f}s",
 			flush=True,
 		)
-	volume_cpu, depth_max = ext.build_inside_depth_volume(
+	depth_max = CYL_OUTSIDE_BARRIER_DEPTH_MAX
+	volume_cpu, depth_max = ext.build_violation_depth_volume(
 		verts.contiguous(),
 		faces.contiguous(),
 		torch.tensor(origin, dtype=torch.float64),
 		torch.tensor((step, step, step), dtype=torch.float64),
 		torch.tensor(shape, dtype=torch.int64),
+		float(depth_max),
+		mode,
 		"" if progress_label is None else str(progress_label),
 		int(threads),
 		int(chunk_size),
@@ -230,4 +256,31 @@ def build_previous_shell_inside_depth_volume(
 		spacing=(step, step, step),
 		shape=shape,
 		depth_max=depth_max,
+	)
+
+
+def build_previous_shell_inside_depth_volume(
+	shell_xyz: torch.Tensor,
+	*,
+	mode: str = CYL_OUTSIDE_MODE_INSIDE,
+	grid_step: float = DEFAULT_CYL_OUTSIDE_GRID_STEP,
+	bbox: tuple[float, float, float, float, float, float] | None = None,
+	device: torch.device | str | None = None,
+	progress_label: str | None = None,
+	threads: int = 0,
+	chunk_size: int = DEFAULT_CYL_OUTSIDE_CHUNK_SIZE,
+	deep_interp_chunks: float = DEFAULT_CYL_OUTSIDE_DEEP_INTERP_CHUNKS,
+	deep_blend_chunks: float = DEFAULT_CYL_OUTSIDE_DEEP_BLEND_CHUNKS,
+) -> CylOutsideVolume:
+	return build_previous_shell_violation_depth_volume(
+		shell_xyz,
+		mode=mode,
+		grid_step=grid_step,
+		bbox=bbox,
+		device=device,
+		progress_label=progress_label,
+		threads=threads,
+		chunk_size=chunk_size,
+		deep_interp_chunks=deep_interp_chunks,
+		deep_blend_chunks=deep_blend_chunks,
 	)

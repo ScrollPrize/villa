@@ -256,7 +256,7 @@ class FitResult3D:
 	cyl_shell_w_offsets: torch.Tensor | None = None
 	cyl_shell_delta_xyz: torch.Tensor | None = None
 	cyl_shell_index: int = 0
-	cyl_outside_volume: torch.Tensor | None = None  # (1, Z, Y, X) uint8 previous-shell inside depth
+	cyl_outside_volume: torch.Tensor | None = None  # (1, Z, Y, X) uint8 previous-shell violation depth
 	cyl_outside_origin: tuple[float, float, float] | None = None
 	cyl_outside_spacing: tuple[float, float, float] | None = None
 	cyl_outside_shape: tuple[int, int, int] | None = None  # (Z, Y, X)

@@ -91,6 +91,14 @@ CYLINDER_LOSS_NAMES = (
 )
 
 
+def _cyl_outside_mode_for_direction(direction: int) -> str:
+	return (
+		cyl_sdf_volume.CYL_OUTSIDE_MODE_OUTSIDE
+		if int(direction) < 0
+		else cyl_sdf_volume.CYL_OUTSIDE_MODE_INSIDE
+	)
+
+
 def _stage_to_modifiers(
 	base: dict[str, float],
 	prev_eff: dict[str, float] | None,
@@ -620,6 +628,7 @@ def optimize(
 		stage_args_: dict,
 		model_step: float,
 		label_: str,
+		direction: int,
 	) -> None:
 		if not _cyl_outside_enabled(eff_):
 			return
@@ -634,19 +643,23 @@ def optimize(
 		chunk_size = _cyl_outside_chunk_size(stage_args_)
 		deep_interp_chunks = _cyl_outside_deep_interp_chunks(stage_args_)
 		deep_blend_chunks = _cyl_outside_deep_blend_chunks(stage_args_)
+		mode = _cyl_outside_mode_for_direction(direction)
+		depth_cap = cyl_sdf_volume.CYL_OUTSIDE_BARRIER_DEPTH_MAX
 		_bbox = cyl_sdf_volume.default_shell_bbox(shells[-1], grid_step=grid_step)
 		_origin, _shape = cyl_sdf_volume.shape_for_bbox(_bbox, grid_step=grid_step)
 		_voxels = int(_shape[0]) * int(_shape[1]) * int(_shape[2])
 		print(
 			f"[optimizer] {label_}: building cyl_outside previous-shell field "
-			f"shape={_shape} voxels={_voxels} grid_step={grid_step:.1f} "
+			f"mode={mode} shape={_shape} voxels={_voxels} grid_step={grid_step:.1f} "
+			f"bbox_padding={depth_cap:.1f} depth_cap={depth_cap:.1f} "
 			f"threads={'auto' if threads == 0 else threads} chunk_size={chunk_size} "
 			f"deep_interp_chunks={deep_interp_chunks:g} deep_blend_chunks={deep_blend_chunks:g}; "
 			f"first run may compile the libigl extension",
 			flush=True,
 		)
-		field = cyl_sdf_volume.build_previous_shell_inside_depth_volume(
+		field = cyl_sdf_volume.build_previous_shell_violation_depth_volume(
 			shells[-1].detach(),
+			mode=mode,
 			grid_step=grid_step,
 			device=device,
 			progress_label=label_,
@@ -658,6 +671,7 @@ def optimize(
 		_set_cyl_outside_field(field, sample_factor=sample_factor, model_step=model_step)
 		print(
 			f"[optimizer] {label_}: cyl_outside field shape={field.shape} "
+			f"mode={mode} "
 			f"origin=({field.origin[0]:.1f},{field.origin[1]:.1f},{field.origin[2]:.1f}) "
 			f"grid_step={grid_step:.1f} depth_max={field.depth_max:.3f}",
 			flush=True,
@@ -2121,6 +2135,7 @@ def optimize(
 							stage_args_=stage_args,
 							model_step=_base_wstep,
 							label_=grow_shell_label,
+							direction=direction,
 						)
 						model.begin_cylinder_shell(shell_i, data, direction=direction)
 					else:
