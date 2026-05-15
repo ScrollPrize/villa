@@ -136,6 +136,10 @@ Pixel (row, col) → 3D point from (x.tif, y.tif, z.tif). Points with z <= 0 are
 
 ## Lasagna ↔ VC3D Integration
 
+Invariant: VC3D is transport only. Do not add Lasagna config-semantic branching in
+VC3D request assembly; config interpretation belongs in `fit_service.py` /
+`fit.py`.
+
 ```
 VC3D → lasagna:  tifxyz seed + corrections (JSON with wind_a)
 lasagna → VC3D:  optimized tifxyz (with updated d.tif channel)

@@ -44,72 +44,6 @@
 #include <iostream>
 #include <memory>
 
-namespace {
-
-double jsonNumber(const QJsonObject& obj, const QString& key, double fallback)
-{
-    const auto value = obj.value(key);
-    return value.isDouble() ? value.toDouble() : fallback;
-}
-
-QString lasagnaModelInit(const QJsonObject& config)
-{
-    const auto args = config.value(QStringLiteral("args")).toObject();
-    QString mode = args.value(QStringLiteral("model-init")).toString();
-    if (mode.isEmpty()) {
-        mode = args.value(QStringLiteral("model_init")).toString();
-    }
-    if (mode.isEmpty()) {
-        mode = QStringLiteral("seed");
-    }
-    return mode.trimmed().toLower();
-}
-
-bool lasagnaConfigEnablesExtOffset(const QJsonObject& config)
-{
-    double baseExt = 0.0;
-    const auto base = config.value(QStringLiteral("base")).toObject();
-    if (!base.isEmpty()) {
-        baseExt = jsonNumber(base, QStringLiteral("ext_offset"), 0.0);
-    }
-    if (baseExt != 0.0) {
-        return true;
-    }
-
-    const auto stages = config.value(QStringLiteral("stages")).toArray();
-    for (const auto& stageValue : stages) {
-        if (!stageValue.isObject()) {
-            continue;
-        }
-        const auto stage = stageValue.toObject();
-        QJsonObject opt = stage.value(QStringLiteral("global_opt")).toObject();
-        if (opt.isEmpty()) {
-            opt = stage;
-        }
-
-        const int steps = static_cast<int>(jsonNumber(opt, QStringLiteral("steps"), 0.0));
-        if (steps <= 0) {
-            continue;
-        }
-
-        double eff = baseExt;
-        const auto wFac = opt.value(QStringLiteral("w_fac")).toObject();
-        const bool hasExtWFac = wFac.contains(QStringLiteral("ext_offset"));
-        if (opt.contains(QStringLiteral("default_mul")) && !hasExtWFac) {
-            eff = baseExt * jsonNumber(opt, QStringLiteral("default_mul"), 0.0);
-        }
-        if (hasExtWFac && !wFac.value(QStringLiteral("ext_offset")).isNull()) {
-            eff = baseExt * jsonNumber(wFac, QStringLiteral("ext_offset"), 0.0);
-        }
-        if (eff != 0.0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-} // namespace
-
 SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     const QString& settingsGroup, QWidget* parent)
     : QWidget(parent)
@@ -1044,56 +978,19 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     const int overlap = windowOverlap();
 
     QJsonObject args = config[QStringLiteral("args")].toObject();
-    const QString modelInit = lasagnaModelInit(config);
-    if (modelInit != QStringLiteral("seed") &&
-        modelInit != QStringLiteral("ext") &&
-        modelInit != QStringLiteral("model")) {
-        auto msg = tr("Invalid Lasagna args.model-init: %1").arg(modelInit);
-        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-        showStatus(msg, 5000);
-        return;
-    }
-    if (modelInit != QStringLiteral("ext") &&
-        !args.value(QStringLiteral("tifxyz-init")).toString().isEmpty()) {
-        auto msg = tr("Lasagna args.tifxyz-init is only valid with model-init=ext.");
-        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-        showStatus(msg, 5000);
-        return;
-    }
-    if (modelInit != QStringLiteral("model") &&
-        !args.value(QStringLiteral("model-input")).toString().isEmpty()) {
-        auto msg = tr("Lasagna args.model-input is only valid with model-init=model.");
-        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-        showStatus(msg, 5000);
-        return;
-    }
-    if (modelInit != QStringLiteral("ext") &&
-        jsonNumber(args, QStringLiteral("window-size"), 0.0) > 0.0) {
-        auto msg = tr("Lasagna window-size currently requires model-init=ext.");
-        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-        showStatus(msg, 5000);
-        return;
-    }
-    args.remove(QStringLiteral("model_init"));
-    args[QStringLiteral("model-init")] = modelInit;
+    // VC3D is transport only. Do not add config-semantic branching here.
+    // Config interpretation belongs in fit_service.py / fit.py.
     args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
     args[QStringLiteral("model-w")] = nmW;
     args[QStringLiteral("model-h")] = nmH;
     args[QStringLiteral("windings")] = nmN;
-    if (modelInit == QStringLiteral("ext") && size > 0) {
-        args[QStringLiteral("window-size")] = size;
-        args[QStringLiteral("window-overlap")] = overlap;
-    }
     config[QStringLiteral("args")] = args;
     config[QStringLiteral("offset_value")] = offsetVal;
 
-    const bool extOffsetEnabled = lasagnaConfigEnablesExtOffset(config);
-
-    std::cerr << "[lasagna] request settings: model_init=" << modelInit.toStdString()
+    std::cerr << "[lasagna] request settings:"
               << " seed=(" << cx << "," << cy << "," << cz << ")"
               << " w=" << nmW << " h=" << nmH
               << " windings=" << nmN
-              << " ext_offset=" << (extOffsetEnabled ? "yes" : "no")
               << " offset=" << offsetVal
               << " window_size=" << size
               << " window_overlap=" << overlap << std::endl;
@@ -1164,14 +1061,17 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
     }
+    if (size > 0) {
+        request[QStringLiteral("window_size")] = size;
+        request[QStringLiteral("window_overlap")] = overlap;
+    }
     request[QStringLiteral("config")] = config;
 
-    const bool needModelData = (modelInit == QStringLiteral("model"));
+    const bool sendModelData = !modelPath.isEmpty();
     const bool sendTifxyz = !segPath.empty();
     std::cerr << "[lasagna] request payload: send_model="
-              << (needModelData ? "yes" : "no")
+              << (sendModelData ? "yes" : "no")
               << " send_tifxyz=" << (sendTifxyz ? "yes" : "no")
-              << " ext_offset=" << (extOffsetEnabled ? "yes" : "no")
               << std::endl;
 
     if (sendTifxyz) {
@@ -1218,13 +1118,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         request[QStringLiteral("tifxyz")] = tifxyzData;
     }
 
-    if (needModelData) {
-        if (modelPath.isEmpty()) {
-            auto msg = tr("No model.pt found in segment directory. Cannot run Lasagna with model-init=model.");
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 5000);
-            return;
-        }
+    if (sendModelData) {
         QFile modelFile(modelPath);
         if (!modelFile.open(QIODevice::ReadOnly)) {
             auto msg = tr("Cannot read model file: %1").arg(modelPath);
@@ -1239,8 +1133,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
 
     mgr.startOptimization(request, outputDir);
     showStatus(
-        tr("Lasagna optimization started (%1). Output: %2")
-            .arg(modelInit)
+        tr("Lasagna optimization started. Output: %1")
             .arg(outputName),
         3000);
 }
