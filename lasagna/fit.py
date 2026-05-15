@@ -27,6 +27,16 @@ def _stage_done(label: str, t0: float) -> None:
 	return None
 
 
+def _truthy_config_bool(value: object) -> bool:
+	if isinstance(value, bool):
+		return value
+	if isinstance(value, (int, float)):
+		return bool(value)
+	if isinstance(value, str):
+		return value.strip().lower() in {"1", "true", "yes", "on"}
+	return False
+
+
 def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	"""Bilinear center of the model grid — matches (Hm-1)/2, (Wm-1)/2 in station loss."""
 	xyz = mdl._grid_xyz()  # (D, Hm, Wm, 3)
@@ -155,6 +165,13 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
 	p.add_argument("--window-overlap", type=int, default=0,
 		help="Overlap between windows in fullres voxels")
+	p.add_argument("--approval-inpaint-seed", action=argparse.BooleanOptionalAction, default=False,
+		help="Use selected approval mask/tifxyz data to seed an inpaint solve")
+	p.add_argument("--approval-inpaint-corr-spacing", type=float, default=None,
+		help="Correction point spacing for approval inpaint (default: --mesh-step)")
+	p.add_argument("--approval-inpaint-padding-frac", type=float, default=0.25,
+		help="Per-side model extent padding for approval inpaint")
+	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
@@ -238,6 +255,55 @@ def main(argv: list[str] | None = None) -> int:
 	print(f"[fit] scaledown={scaledown} (source_sd={prep_params['scaledown']} "
 		  f"source_to_base={source_to_base}) volume_extent={volume_extent_fullres}", flush=True)
 	_stage_done("probe_preprocessed_data", _t)
+
+	# Approval inpaint is a seed-mode preprocessor: VC3D sends the selected
+	# tifxyz plus approval/d channels, then this step derives corr points,
+	# a centered effective seed, and extents before the configured init runs.
+	_t = _stage_start("approval_inpaint_seed")
+	approval_inpaint_enabled = _truthy_config_bool(getattr(args, "approval_inpaint_seed", False))
+	if approval_inpaint_enabled:
+		if model_init != "seed":
+			raise ValueError("approval-inpaint-seed requires args.model-init=seed")
+		if data_cfg.seed is None:
+			raise ValueError("approval-inpaint-seed requires args.seed")
+		approval_tifxyz = getattr(args, "approval_inpaint_tifxyz", None)
+		if not approval_tifxyz:
+			raise ValueError("approval-inpaint-seed requires service arg approval-inpaint-tifxyz")
+		from approval_inpaint import build_approval_inpaint
+
+		result = build_approval_inpaint(
+			tifxyz_path=str(approval_tifxyz),
+			seed=tuple(float(v) for v in data_cfg.seed),
+			mesh_step=float(model_cfg.mesh_step),
+			corr_spacing=getattr(args, "approval_inpaint_corr_spacing", None),
+			padding_frac=getattr(args, "approval_inpaint_padding_frac", 0.25),
+			existing_model_w=data_cfg.model_w,
+			existing_model_h=data_cfg.model_h,
+			existing_corr_points=cfg.get("corr_points") if isinstance(cfg.get("corr_points"), dict) else None,
+		)
+		data_cfg = dataclasses.replace(
+			data_cfg,
+			seed=result.seed,
+			model_w=result.model_w,
+			model_h=result.model_h,
+		)
+		cfg["corr_points"] = result.corr_points
+		fit_config["corr_points"] = copy.deepcopy(result.corr_points)
+		fit_config.setdefault("args", {}).update({
+			"seed": [float(v) for v in result.seed],
+			"model-w": int(result.model_w),
+			"model-h": int(result.model_h),
+			"approval-inpaint-seed": True,
+		})
+		print(
+			f"[fit] approval-inpaint: points={result.point_count} "
+			f"component={result.component_size} skeleton={result.skeleton_size} "
+			f"bounds={result.index_bounds} source_step={result.source_mesh_step:.3f} "
+			f"seed=({result.seed[0]:.1f},{result.seed[1]:.1f},{result.seed[2]:.1f}) "
+			f"model_w={result.model_w} model_h={result.model_h}",
+			flush=True,
+		)
+	_stage_done("approval_inpaint_seed", _t)
 
 	# --- Init from seed (new model only) ---
 	_t = _stage_start("derive_initial_model_params")
