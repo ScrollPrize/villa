@@ -63,6 +63,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
 
+- [vesuvius-c Python bindings](https://github.com/jonmarrs/vesuvius-autoresearch/tree/main/vesuvius_c_wrapper) by Jon Marrs. `ctypes` wrapper around villa's `vesuvius-c` library; parses `.zarray` JSON and reads Blosc2 chunks directly via C pointers, bypassing fsspec and the standard Zarr Python stack. Measured ≈31.77M voxels/sec on local storage. Drop-in compatible with autoresearch's `Volume` loader.
+
 - [vesuvius-gui](https://github.com/jrudolph/vesuvius-gui) is a single binary GUI to render volumes and segments on-the-fly. By Johannes Rudolph
 
 - [vesuvius-phalanx](https://github.com/mvrcii/phalanx): Python library / CLI for accessing Vesuvius data. Allows flexible access to volume and fragment scroll data. By Marcel Roth
