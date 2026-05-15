@@ -165,8 +165,8 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
 	p.add_argument("--window-overlap", type=int, default=0,
 		help="Overlap between windows in fullres voxels")
-	p.add_argument("--approval-inpaint-seed", action=argparse.BooleanOptionalAction, default=False,
-		help="Use selected approval mask/tifxyz data to seed an inpaint solve")
+	p.add_argument("--approval-inpaint", action=argparse.BooleanOptionalAction, default=False,
+		help="Use selected approval mask/tifxyz data to inpaint the seed-region setup")
 	p.add_argument("--approval-inpaint-corr-spacing", type=float, default=None,
 		help="Correction point spacing for approval inpaint (default: --mesh-step)")
 	p.add_argument("--approval-inpaint-padding-frac", type=float, default=0.25,
@@ -259,16 +259,16 @@ def main(argv: list[str] | None = None) -> int:
 	# Approval inpaint is a seed-mode preprocessor: VC3D sends the selected
 	# tifxyz plus approval/d channels, then this step derives corr points,
 	# a centered effective seed, and extents before the configured init runs.
-	_t = _stage_start("approval_inpaint_seed")
-	approval_inpaint_enabled = _truthy_config_bool(getattr(args, "approval_inpaint_seed", False))
+	_t = _stage_start("approval_inpaint")
+	approval_inpaint_enabled = _truthy_config_bool(getattr(args, "approval_inpaint", False))
 	if approval_inpaint_enabled:
 		if model_init != "seed":
-			raise ValueError("approval-inpaint-seed requires args.model-init=seed")
+			raise ValueError("approval-inpaint requires args.model-init=seed")
 		if data_cfg.seed is None:
-			raise ValueError("approval-inpaint-seed requires args.seed")
+			raise ValueError("approval-inpaint requires args.seed")
 		approval_tifxyz = getattr(args, "approval_inpaint_tifxyz", None)
 		if not approval_tifxyz:
-			raise ValueError("approval-inpaint-seed requires service arg approval-inpaint-tifxyz")
+			raise ValueError("approval-inpaint requires service arg approval-inpaint-tifxyz")
 		from approval_inpaint import build_approval_inpaint
 
 		result = build_approval_inpaint(
@@ -277,8 +277,6 @@ def main(argv: list[str] | None = None) -> int:
 			mesh_step=float(model_cfg.mesh_step),
 			corr_spacing=getattr(args, "approval_inpaint_corr_spacing", None),
 			padding_frac=getattr(args, "approval_inpaint_padding_frac", 0.25),
-			existing_model_w=data_cfg.model_w,
-			existing_model_h=data_cfg.model_h,
 			existing_corr_points=cfg.get("corr_points") if isinstance(cfg.get("corr_points"), dict) else None,
 		)
 		data_cfg = dataclasses.replace(
@@ -293,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
 			"seed": [float(v) for v in result.seed],
 			"model-w": int(result.model_w),
 			"model-h": int(result.model_h),
-			"approval-inpaint-seed": True,
+			"approval-inpaint": True,
 		})
 		print(
 			f"[fit] approval-inpaint: points={result.point_count} "
@@ -303,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
 			f"model_w={result.model_w} model_h={result.model_h}",
 			flush=True,
 		)
-	_stage_done("approval_inpaint_seed", _t)
+	_stage_done("approval_inpaint", _t)
 
 	# --- Init from seed (new model only) ---
 	_t = _stage_start("derive_initial_model_params")
@@ -383,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
 		cfg.pop("args", None)
 		cfg.pop("voxel_size_um", None)
 		cfg.pop("external_surfaces", None)
-		cfg.pop("tifxyz_data", None)
+		cfg.pop("tifxyz", None)
 		cfg.pop("offset_value", None)
 		stages = optimizer.load_stages_cfg(
 			cfg,
@@ -669,7 +667,7 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("args", None)
 	cfg.pop("voxel_size_um", None)
 	cfg.pop("external_surfaces", None)
-	cfg.pop("tifxyz_data", None)
+	cfg.pop("tifxyz", None)
 	cfg.pop("offset_value", None)
 	stages = optimizer.load_stages_cfg(
 		cfg,

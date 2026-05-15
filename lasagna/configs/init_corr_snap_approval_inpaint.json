@@ -3,7 +3,7 @@
 		"model-init": "seed",
 		"init-mode": "shell-dir-crop",
 		"mesh-step": 50.0,
-		"approval-inpaint-seed": true,
+		"approval-inpaint": true,
 		"approval-inpaint-corr-spacing": 50.0,
 		"approval-inpaint-padding-frac": 0.25
 	},

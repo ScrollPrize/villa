@@ -50,10 +50,7 @@ def _truthy_config_bool(value: Any) -> bool:
 
 
 def _approval_inpaint_enabled(args_section: dict[str, Any]) -> bool:
-    return _truthy_config_bool(
-        args_section.get("approval-inpaint-seed",
-                         args_section.get("approval_inpaint_seed", False))
-    )
+    return _truthy_config_bool(args_section.get("approval-inpaint", False))
 
 
 def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
@@ -93,7 +90,7 @@ def _set_pred_dt_flow_gate_debug_out_dir(cfg: dict[str, Any], out_dir: str) -> N
             gate.setdefault("debug_out_dir", out_dir)
 
 
-def _decode_tifxyz_data_for_request(
+def _decode_tifxyz_for_request(
     *,
     body: dict[str, Any],
     cfg: dict[str, Any],
@@ -102,26 +99,24 @@ def _decode_tifxyz_data_for_request(
     model_init: str,
     ext_offset_enabled: bool,
 ) -> str | None:
-    """Decode request tifxyz_data and attach the internal fit.py args/config."""
+    """Decode generic request tifxyz and attach it to configured consumers."""
     import base64
 
     approval_enabled = _approval_inpaint_enabled(args_section)
     if approval_enabled and model_init != "seed":
-        raise ValueError("args.approval-inpaint-seed is only valid with args.model-init=seed")
+        raise ValueError("args.approval-inpaint is only valid with args.model-init=seed")
 
-    tifxyz_data = body.get("tifxyz_data")
+    tifxyz_payload = body.get("tifxyz")
+    if "tifxyz" in body and not isinstance(tifxyz_payload, dict):
+        raise ValueError("request tifxyz must be an object mapping filenames to base64 data")
+
     tifxyz_dir: str | None = None
-    if isinstance(tifxyz_data, dict):
-        if model_init != "ext" and not ext_offset_enabled and not approval_enabled:
-            raise ValueError(
-                "request tifxyz_data is only valid with args.model-init=ext, "
-                "nonzero ext_offset, or args.approval-inpaint-seed=true"
-            )
+    if isinstance(tifxyz_payload, dict):
         tifxyz_dir = str(Path(tmp_dir) / "tifxyz_input")
         Path(tifxyz_dir).mkdir(parents=True, exist_ok=True)
-        for fname, b64 in tifxyz_data.items():
+        for fname, b64 in tifxyz_payload.items():
             (Path(tifxyz_dir) / fname).write_bytes(base64.b64decode(b64))
-        print(f"[fit-service] decoded tifxyz ({len(tifxyz_data)} files) to {tifxyz_dir}", flush=True)
+        print(f"[fit-service] decoded tifxyz ({len(tifxyz_payload)} files) to {tifxyz_dir}", flush=True)
         if model_init == "ext":
             args_section["tifxyz-init"] = tifxyz_dir
         if approval_enabled:
@@ -130,11 +125,11 @@ def _decode_tifxyz_data_for_request(
             offset_val = float(cfg.pop("offset_value", 1.0))
             cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
     elif model_init == "ext":
-        raise ValueError("model-init=ext requires request tifxyz_data")
+        raise ValueError("model-init=ext requires request tifxyz")
     elif ext_offset_enabled:
-        raise ValueError("ext_offset is enabled but request has no tifxyz_data")
+        raise ValueError("ext_offset is enabled but request has no tifxyz")
     elif approval_enabled:
-        raise ValueError("approval-inpaint-seed requires request tifxyz_data")
+        raise ValueError("approval-inpaint requires request tifxyz")
 
     return tifxyz_dir
 
@@ -479,7 +474,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
         cfg["args"] = args_section_pre
         ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
 
-        tifxyz_dir = _decode_tifxyz_data_for_request(
+        tifxyz_dir = _decode_tifxyz_for_request(
             body=body,
             cfg=cfg,
             args_section=args_section_pre,

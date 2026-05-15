@@ -420,6 +420,16 @@ def _merge_generated_corr_points(
 	return out
 
 
+def _snap_extent_to_mesh_step(raw_extent: float, mesh_step: float) -> int:
+	step = float(mesh_step)
+	if not math.isfinite(step) or step <= 0.0:
+		raise ValueError(f"approval inpaint mesh_step must be > 0, got {mesh_step}")
+	raw = max(0.0, float(raw_extent))
+	n_steps = int(math.ceil((raw / step) - 1.0e-9))
+	n_steps = max(1, n_steps)
+	return max(1, int(math.ceil(float(n_steps) * step - 1.0e-9)))
+
+
 def build_approval_inpaint(
 	*,
 	tifxyz_path: str | Path,
@@ -427,8 +437,6 @@ def build_approval_inpaint(
 	mesh_step: float,
 	corr_spacing: float | None = None,
 	padding_frac: float | None = 0.25,
-	existing_model_w: int | float | None = None,
-	existing_model_h: int | float | None = None,
 	existing_corr_points: dict | None = None,
 ) -> ApprovalInpaintResult:
 	xyz, valid, d, meta = _load_tifxyz_arrays(tifxyz_path)
@@ -466,18 +474,17 @@ def build_approval_inpaint(
 	center_c = 0.5 * (float(cmin) + float(cmax))
 	new_seed = _sample_xyz_at_index_center(xyz, valid, center_r, center_c)
 
+	corr_xyz = np.asarray([xyz[r, c] for r, c in coords], dtype=np.float64)
+	seed_xyz = np.asarray(new_seed, dtype=np.float64)
+	offsets = corr_xyz - seed_xyz.reshape(1, 3)
+	raw_w = 2.0 * float(np.max(np.abs(offsets[:, 0])))
+	raw_h = 2.0 * float(np.max(np.abs(offsets[:, 1])))
 	pad = 0.25 if padding_frac is None else float(padding_frac)
 	if not math.isfinite(pad) or pad < 0.0:
 		raise ValueError(f"approval inpaint padding fraction must be >= 0, got {padding_frac}")
 	pad_mul = 1.0 + 2.0 * pad
-	width = max(float(mesh_step), float(cmax - cmin) * source_step) * pad_mul
-	height = max(float(mesh_step), float(rmax - rmin) * source_step) * pad_mul
-	if existing_model_w is not None:
-		width = max(width, float(existing_model_w))
-	if existing_model_h is not None:
-		height = max(height, float(existing_model_h))
-	model_w = max(1, int(math.ceil(width)))
-	model_h = max(1, int(math.ceil(height)))
+	model_w = _snap_extent_to_mesh_step(raw_w * pad_mul, mesh_step)
+	model_h = _snap_extent_to_mesh_step(raw_h * pad_mul, mesh_step)
 	corr_points = _merge_generated_corr_points(existing_corr_points, coords, xyz, d)
 	return ApprovalInpaintResult(
 		seed=new_seed,
