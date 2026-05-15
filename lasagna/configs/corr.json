@@ -6,8 +6,8 @@
 		"normal": 1.0,
 		"step": 10.0,
 		"smooth": 10.0,
-		"station_n": 0.1,
-		"station_t": 0.1,
+		"station_n": 1.0,
+		"station_t": 1.0,
 		"winding_density": 0.01,
 		"data": 0.0,
 		"data_plain": 0.0,
@@ -24,9 +24,7 @@
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
-				"pred_dt": 0.0,
-				"station_n": 10.0,
-				"station_t": 10.0
+				"pred_dt": 0.0
 			}
 		},
 		{
@@ -36,10 +34,15 @@
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
-				"pred_dt": 0.0,
-				"station_n": 10.0,
-				"station_t": 10.0
+				"pred_dt": 0.0
 			}
+		},
+		{
+			"name": "snap",
+			"steps": 1000,
+			"min_scaledown": 0,
+			"lr": 0.1,
+			"params": ["mesh_ms"]
 		}
 	]
 }

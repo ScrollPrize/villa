@@ -314,6 +314,20 @@ def _wind_nearest_quad_on_layer(
 	return best_h, best_w, best_u, best_v
 
 
+def _prefetch_grad_mag_points(data: fit_data.FitData3D, xyz_fullres: torch.Tensor) -> None:
+	sparse_caches = getattr(data, "sparse_caches", None)
+	if not sparse_caches:
+		return
+	touched = []
+	for cache in sparse_caches.values():
+		if "grad_mag" not in cache.channels:
+			continue
+		cache.prefetch(xyz_fullres, data.origin_fullres, data._spacing_for(cache.channels[0]))
+		touched.append(cache)
+	for cache in touched:
+		cache.sync()
+
+
 def _wind_strip_integral(
 	P: torch.Tensor,              # (K, 3)
 	Q: torch.Tensor,              # (K, 3)
@@ -336,6 +350,7 @@ def _wind_strip_integral(
 	strip = P.unsqueeze(1) + t.view(1, -1, 1) * diff.unsqueeze(1)  # (K, S, 3)
 
 	strip_flat = strip.reshape(1, 1, K * strip_samples, 3)
+	_prefetch_grad_mag_points(data, strip_flat)
 	sampled = data.grid_sample_fullres(strip_flat, channels={"grad_mag"})
 	mag_raw = sampled.grad_mag  # (1, 1, 1, 1, K*S)
 	mag = mag_raw.reshape(K, strip_samples)
