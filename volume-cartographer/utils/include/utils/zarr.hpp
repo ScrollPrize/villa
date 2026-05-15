@@ -19,6 +19,7 @@
 #include <memory>
 #include <unordered_map>
 #include <variant>
+#include <limits>
 
 #if !defined(_WIN32)
 #  include <fcntl.h>
@@ -1771,20 +1772,28 @@ public:
             linear += inner_idx[d] * stride;
             stride *= meta_.sub_chunks_per_shard(d);
         }
+        if (linear > std::numeric_limits<std::size_t>::max() / 16)
+            return std::nullopt;
+        const std::size_t index_offset = linear * 16;
+        auto is_missing_or_empty = [](std::uint64_t offset, std::uint64_t nbytes) {
+            return (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) ||
+                   (offset == ~std::uint64_t(0) - 1 && nbytes == 0) ||
+                   nbytes == 0;
+        };
 
         auto key = chunk_key(shard_idx);
         if (store_) {
             auto full_key = array_key_.empty() ? key : array_key_ + "/" + key;
-            auto entry = store_->get_partial(full_key, linear * 16, 16);
+            auto entry = store_->get_partial(full_key, index_offset, 16);
             if (!entry || entry->size() < 16) return std::nullopt;
 
             std::uint64_t offset = 0, nbytes = 0;
             std::memcpy(&offset, entry->data(), 8);
             std::memcpy(&nbytes, entry->data() + 8, 8);
-            if ((offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) ||
-                (offset == ~std::uint64_t(0) - 1 && nbytes == 0))
+            if (is_missing_or_empty(offset, nbytes)) return std::nullopt;
+            if (offset > std::numeric_limits<std::size_t>::max() ||
+                nbytes > std::numeric_limits<std::size_t>::max())
                 return std::nullopt;
-            if (nbytes == 0) return std::nullopt;
 
             auto data = store_->get_partial(full_key,
                                             static_cast<std::size_t>(offset),
@@ -1802,12 +1811,16 @@ public:
         if (!f) return std::nullopt;
 
         // Read 16-byte index entry at position linear*16
-        f.seekg(static_cast<std::streamoff>(linear * 16));
+        if (index_offset > static_cast<std::size_t>(std::numeric_limits<std::streamoff>::max()))
+            return std::nullopt;
+        f.seekg(static_cast<std::streamoff>(index_offset));
         std::uint64_t offset = 0, nbytes = 0;
         f.read(reinterpret_cast<char*>(&offset), 8);
         f.read(reinterpret_cast<char*>(&nbytes), 8);
         if (!f) return std::nullopt;
-        if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0))
+        if (is_missing_or_empty(offset, nbytes)) return std::nullopt;
+        if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+            nbytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
             return std::nullopt;
 
         // Read chunk data
