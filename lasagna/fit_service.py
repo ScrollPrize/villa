@@ -34,6 +34,10 @@ _data_dir: str | None = None  # Set via --data-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
 
+# One debug switch for sparse coverage and coordinate sanity guards. The service
+# enables it by default so optimizer jobs fail before CUDA indexing asserts.
+os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
+
 
 def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
     stages = cfg.get("stages")
@@ -70,6 +74,52 @@ def _set_pred_dt_flow_gate_debug_out_dir(cfg: dict[str, Any], out_dir: str) -> N
         gate = args.get("pred_dt_flow_gate")
         if isinstance(gate, dict) and bool(gate.get("enabled", False)):
             gate.setdefault("debug_out_dir", out_dir)
+
+
+def _config_effective_ext_offset_enabled(cfg: dict[str, Any]) -> bool:
+    base_cfg = cfg.get("base")
+    base_ext = 0.0
+    if isinstance(base_cfg, dict):
+        try:
+            base_ext = float(base_cfg.get("ext_offset", 0.0))
+        except (TypeError, ValueError):
+            base_ext = 0.0
+    if abs(base_ext) > 0.0:
+        return True
+
+    stages = cfg.get("stages")
+    if not isinstance(stages, list):
+        return False
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage
+        try:
+            steps = int(opt_cfg.get("steps", 0))
+        except (TypeError, ValueError):
+            steps = 0
+        if steps <= 0:
+            continue
+
+        eff = base_ext
+        w_fac = opt_cfg.get("w_fac")
+        has_ext_wfac = isinstance(w_fac, dict) and "ext_offset" in w_fac
+        default_mul = opt_cfg.get("default_mul")
+        if default_mul is not None and not has_ext_wfac:
+            try:
+                eff = base_ext * float(default_mul)
+            except (TypeError, ValueError):
+                eff = 0.0
+        if has_ext_wfac and w_fac.get("ext_offset") is not None:
+            try:
+                eff = base_ext * float(w_fac.get("ext_offset"))
+            except (TypeError, ValueError):
+                eff = 0.0
+        if abs(eff) > 0.0:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -349,20 +399,49 @@ def _run_optimization(body: dict[str, Any]) -> None:
 
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
+        args_section_pre = cfg.get("args", {})
+        if not isinstance(args_section_pre, dict):
+            args_section_pre = {}
+        model_init = str(args_section_pre.get("model-init", args_section_pre.get("model_init", "seed"))).strip().lower()
+        if model_init not in {"seed", "ext", "model"}:
+            raise ValueError(f"invalid args.model-init '{model_init}' (expected seed, ext, or model)")
+        args_section_pre.pop("model_init", None)
+        args_section_pre["model-init"] = model_init
+        if model_init != "ext" and args_section_pre.get("tifxyz-init"):
+            raise ValueError("args.tifxyz-init is only valid with args.model-init=ext")
+        if model_init != "model" and args_section_pre.get("model-input"):
+            raise ValueError("args.model-input is only valid with args.model-init=model")
+        if model_init != "model" and model_input:
+            raise ValueError("request model_data/model_input is only valid with args.model-init=model")
+        cfg["args"] = args_section_pre
+        ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
 
-        # Decode tifxyz data if present (offset mode — files sent as base64)
+        # Decode tifxyz data if present. It can be used either as the initial
+        # model source (model-init=ext) or as the external ext_offset reference.
         tifxyz_data = body.get("tifxyz_data")
+        tifxyz_dir: str | None = None
         if isinstance(tifxyz_data, dict):
+            if model_init != "ext" and not ext_offset_enabled:
+                raise ValueError("request tifxyz_data is only valid with args.model-init=ext or nonzero ext_offset")
             tifxyz_dir = str(Path(tmp_dir) / "tifxyz_input")
             Path(tifxyz_dir).mkdir(parents=True, exist_ok=True)
             for fname, b64 in tifxyz_data.items():
                 (Path(tifxyz_dir) / fname).write_bytes(base64.b64decode(b64))
             print(f"[fit-service] decoded tifxyz ({len(tifxyz_data)} files) to {tifxyz_dir}", flush=True)
-            # Set up tifxyz-init and external_surfaces pointing to local copy
-            args_section_pre = cfg.get("args", {})
-            if isinstance(args_section_pre, dict):
+            if model_init == "ext":
                 args_section_pre["tifxyz-init"] = tifxyz_dir
-            cfg["args"] = args_section_pre
+            if ext_offset_enabled:
+                offset_val = float(cfg.pop("offset_value", 1.0))
+                cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
+        elif model_init == "ext":
+            raise ValueError("model-init=ext requires request tifxyz_data")
+        elif ext_offset_enabled:
+            raise ValueError("ext_offset is enabled but request has no tifxyz_data")
+
+        if model_init == "model" and not model_input:
+            raise ValueError("model-init=model requires request model_data or model_input")
+
+        if ext_offset_enabled and tifxyz_dir is not None and "external_surfaces" not in cfg:
             offset_val = float(cfg.pop("offset_value", 1.0))
             cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
 

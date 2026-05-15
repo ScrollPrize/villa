@@ -35,7 +35,8 @@ Each part provides `add_args(parser)` + `from_args(args)`:
 ## fit.py-specific arguments
 
 - `--out-dir` output directory for snapshots and debug
-- `--tifxyz-init` initialize model from tifxyz directory (offset mode)
+- `--model-init` (`seed`, `ext`, or `model`; default `seed`)
+- `--tifxyz-init` tifxyz directory used when `--model-init ext`
 - `--window-size` window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)
 - `--window-overlap` overlap between windows in fullres voxels (default 0)
 - `--progress` print machine-readable `PROGRESS` lines to stdout
@@ -64,3 +65,10 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `corr_points`: correction point collections from VC3D
 - `voxel_size_um`: voxel size for area calculations
 - `offset_value`: target offset (injected by VC3D offset mode)
+
+`args.model-init` selects the initial mesh source:
+- `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.windings`.
+- `ext` initializes from the selected tifxyz mesh sent by VC3D.
+- `model` initializes from the selected segment's `model.pt`.
+
+If any effective optimizer stage uses a nonzero `ext_offset` loss, VC3D also sends the selected tifxyz mesh as the external reference surface, independently of `model-init`.
