@@ -1167,41 +1167,55 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     request[QStringLiteral("config")] = config;
 
     const bool needModelData = (modelInit == QStringLiteral("model"));
-    const bool needTifxyzData = (modelInit == QStringLiteral("ext")) || extOffsetEnabled;
+    const bool sendTifxyz = !segPath.empty();
     std::cerr << "[lasagna] request payload: send_model="
               << (needModelData ? "yes" : "no")
-              << " send_tifxyz=" << (needTifxyzData ? "yes" : "no")
+              << " send_tifxyz=" << (sendTifxyz ? "yes" : "no")
               << " ext_offset=" << (extOffsetEnabled ? "yes" : "no")
               << std::endl;
 
-    if (needTifxyzData) {
-        if (segPath.empty()) {
-            auto msg = tr("Selected segment tifxyz is required by this Lasagna config.");
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 5000);
-            return;
-        }
+    if (sendTifxyz) {
         QJsonObject tifxyzData;
-        for (const auto* fname : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
-            auto filePath = segPath / fname;
+        QStringList coreTifxyzFiles{
+            QStringLiteral("x.tif"),
+            QStringLiteral("y.tif"),
+            QStringLiteral("z.tif"),
+            QStringLiteral("meta.json"),
+        };
+        QStringList extraTifxyzFiles{
+            QStringLiteral("approval.tif"),
+            QStringLiteral("d.tif"),
+        };
+        auto addTifxyzFile = [&](const QString& fname) -> bool {
+            auto filePath = segPath / fname.toStdString();
             if (!std::filesystem::exists(filePath)) {
-                auto msg = tr("Selected segment is missing tifxyz file: %1").arg(QString::fromLatin1(fname));
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                showStatus(msg, 5000);
-                return;
+                std::cerr << "[lasagna] selected segment has no optional tifxyz file: "
+                          << fname.toStdString() << std::endl;
+                return true;
             }
             QFile f(QString::fromStdString(filePath.string()));
             if (f.open(QIODevice::ReadOnly)) {
-                tifxyzData[QString::fromLatin1(fname)] =
+                tifxyzData[fname] =
                     QString::fromLatin1(f.readAll().toBase64());
             } else {
-                auto msg = tr("Cannot read selected segment tifxyz file: %1").arg(QString::fromLatin1(fname));
+                auto msg = tr("Cannot read selected segment tifxyz file: %1").arg(fname);
                 std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
                 showStatus(msg, 5000);
+                return false;
+            }
+            return true;
+        };
+        for (const QString& fname : coreTifxyzFiles) {
+            if (!addTifxyzFile(fname)) {
                 return;
             }
         }
-        request[QStringLiteral("tifxyz_data")] = tifxyzData;
+        for (const QString& fname : extraTifxyzFiles) {
+            if (!addTifxyzFile(fname)) {
+                return;
+            }
+        }
+        request[QStringLiteral("tifxyz")] = tifxyzData;
     }
 
     if (needModelData) {

@@ -39,6 +39,20 @@ _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backe
 os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
 
 
+def _truthy_config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _approval_inpaint_enabled(args_section: dict[str, Any]) -> bool:
+    return _truthy_config_bool(args_section.get("approval-inpaint", False))
+
+
 def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
     stages = cfg.get("stages")
     if not isinstance(stages, list):
@@ -74,6 +88,50 @@ def _set_pred_dt_flow_gate_debug_out_dir(cfg: dict[str, Any], out_dir: str) -> N
         gate = args.get("pred_dt_flow_gate")
         if isinstance(gate, dict) and bool(gate.get("enabled", False)):
             gate.setdefault("debug_out_dir", out_dir)
+
+
+def _decode_tifxyz_for_request(
+    *,
+    body: dict[str, Any],
+    cfg: dict[str, Any],
+    args_section: dict[str, Any],
+    tmp_dir: str,
+    model_init: str,
+    ext_offset_enabled: bool,
+) -> str | None:
+    """Decode generic request tifxyz and attach it to configured consumers."""
+    import base64
+
+    approval_enabled = _approval_inpaint_enabled(args_section)
+    if approval_enabled and model_init != "seed":
+        raise ValueError("args.approval-inpaint is only valid with args.model-init=seed")
+
+    tifxyz_payload = body.get("tifxyz")
+    if "tifxyz" in body and not isinstance(tifxyz_payload, dict):
+        raise ValueError("request tifxyz must be an object mapping filenames to base64 data")
+
+    tifxyz_dir: str | None = None
+    if isinstance(tifxyz_payload, dict):
+        tifxyz_dir = str(Path(tmp_dir) / "tifxyz_input")
+        Path(tifxyz_dir).mkdir(parents=True, exist_ok=True)
+        for fname, b64 in tifxyz_payload.items():
+            (Path(tifxyz_dir) / fname).write_bytes(base64.b64decode(b64))
+        print(f"[fit-service] decoded tifxyz ({len(tifxyz_payload)} files) to {tifxyz_dir}", flush=True)
+        if model_init == "ext":
+            args_section["tifxyz-init"] = tifxyz_dir
+        if approval_enabled:
+            args_section["approval-inpaint-tifxyz"] = tifxyz_dir
+        if ext_offset_enabled:
+            offset_val = float(cfg.pop("offset_value", 1.0))
+            cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
+    elif model_init == "ext":
+        raise ValueError("model-init=ext requires request tifxyz")
+    elif ext_offset_enabled:
+        raise ValueError("ext_offset is enabled but request has no tifxyz")
+    elif approval_enabled:
+        raise ValueError("approval-inpaint requires request tifxyz")
+
+    return tifxyz_dir
 
 
 def _config_effective_ext_offset_enabled(cfg: dict[str, Any]) -> bool:
@@ -416,27 +474,14 @@ def _run_optimization(body: dict[str, Any]) -> None:
         cfg["args"] = args_section_pre
         ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
 
-        # Decode tifxyz data if present. It can be used either as the initial
-        # model source (model-init=ext) or as the external ext_offset reference.
-        tifxyz_data = body.get("tifxyz_data")
-        tifxyz_dir: str | None = None
-        if isinstance(tifxyz_data, dict):
-            if model_init != "ext" and not ext_offset_enabled:
-                raise ValueError("request tifxyz_data is only valid with args.model-init=ext or nonzero ext_offset")
-            tifxyz_dir = str(Path(tmp_dir) / "tifxyz_input")
-            Path(tifxyz_dir).mkdir(parents=True, exist_ok=True)
-            for fname, b64 in tifxyz_data.items():
-                (Path(tifxyz_dir) / fname).write_bytes(base64.b64decode(b64))
-            print(f"[fit-service] decoded tifxyz ({len(tifxyz_data)} files) to {tifxyz_dir}", flush=True)
-            if model_init == "ext":
-                args_section_pre["tifxyz-init"] = tifxyz_dir
-            if ext_offset_enabled:
-                offset_val = float(cfg.pop("offset_value", 1.0))
-                cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
-        elif model_init == "ext":
-            raise ValueError("model-init=ext requires request tifxyz_data")
-        elif ext_offset_enabled:
-            raise ValueError("ext_offset is enabled but request has no tifxyz_data")
+        tifxyz_dir = _decode_tifxyz_for_request(
+            body=body,
+            cfg=cfg,
+            args_section=args_section_pre,
+            tmp_dir=tmp_dir,
+            model_init=model_init,
+            ext_offset_enabled=ext_offset_enabled,
+        )
 
         if model_init == "model" and not model_input:
             raise ValueError("model-init=model requires request model_data or model_input")
