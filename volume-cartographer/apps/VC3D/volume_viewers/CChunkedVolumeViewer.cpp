@@ -142,7 +142,8 @@ std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
     if (volume->isRemote()) {
         return "remote|" + volume->remoteUrl() +
                "|base=" + std::to_string(volume->baseScaleLevel()) +
-               "|id=" + volume->id();
+               "|id=" + volume->id() +
+               "|cache_schema=remote_sharded_ranges_v1";
     }
 
     std::error_code ec;
