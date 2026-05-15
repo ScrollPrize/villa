@@ -51,6 +51,19 @@ def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	      + fh * fw * xyz[0, h1, w1])
 
 
+def _optimization_seed_xyz(
+	*,
+	model_init: str,
+	config_seed: tuple[float, float, float] | None,
+	mdl: "model.Model3D",
+) -> tuple[float, float, float] | None:
+	"""Return the station seed used during optimization."""
+	if model_init in {"ext", "model"}:
+		center_pt = _grid_center(mdl)
+		return (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
+	return config_seed
+
+
 def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | None:
 	for stage in stages:
 		if "cyl_params" not in stage.global_opt.params:
@@ -820,17 +833,12 @@ def main(argv: list[str] | None = None) -> int:
 
 	# Run optimization
 	_t = _stage_start("prepare_optimization")
-	seed_xyz = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
-	# tifxyz init: always use model grid center as seed (overrides CLI seed)
+	config_seed = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
+	seed_xyz = _optimization_seed_xyz(model_init=model_init, config_seed=config_seed, mdl=mdl)
 	if model_init == "ext":
-		center_pt = _grid_center(mdl)
-		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] tifxyz seed: ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
-	# Re-optimize from checkpoint: derive seed from model grid center
-	if seed_xyz is None and model_init == "model":
-		center_pt = _grid_center(mdl)
-		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
+	elif model_init == "model":
 		print(f"[fit] checkpoint seed (grid center): ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
 	_stage_done("prepare_optimization", _t)
