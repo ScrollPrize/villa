@@ -249,6 +249,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Inkalyzer](https://github.com/younader/Inkalyzer) by Youssef Nader. XAI package for Ink models to explain predictions and generate volumetric labels.
 
+- [Vesuvius Autoresearch](https://github.com/jonmarrs/vesuvius-autoresearch) by Jon Marrs. Autonomous architecture-search loop plus one-command launchers for villa's prize-track trainers (LeJEPA fine-tune, mutex-affinity sheet segmentation, neural_tracing service, GP-2023 TimeSformer recipe). Includes an architecture-aware `submission_package` builder for Primus fine-tuned checkpoints; companion upstream PR [#899](https://github.com/ScrollPrize/villa/pull/899) adds the matching `model_primus.py` loader to `ink-detection/optimized_inference`.
+
 #### 📦 Materials
 
 - [3D Ink labels](https://discord.com/channels/1079907749569237093/1079907750265499772/1223357870762889308) by Sean Johnsonn
