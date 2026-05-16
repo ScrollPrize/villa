@@ -68,3 +68,18 @@ const char* __lsan_default_suppressions(void)
         "leak:pango_*\n"
         "leak:g_type_*\n";
 }
+
+// Suppress TSAN reports inside libtbb. The system libtbb is not built with
+// tsan instrumentation, so its internal acquire/release fences are invisible
+// to the runtime and any worker-vs-main handoff in the task scheduler is
+// flagged as a data race even though TBB's own atomics make it safe. OpenCV
+// uses TBB internally for parallel_for / cv::LUT / connected-components etc.,
+// so any test that touches OpenCV will trip these false positives.
+const char* __tsan_default_suppressions(void)
+{
+    return
+        "race:libtbb.so\n"
+        "race:libtbbmalloc.so\n"
+        "race:tbb::detail::\n"
+        "race:tbb::interface\n";
+}
