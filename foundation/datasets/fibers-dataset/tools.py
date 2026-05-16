@@ -2,8 +2,6 @@
 
 """Contains various filters and tools for handling papyrus analysis.
 
-TODO:  convert bottleneck code over to cupy for GPU speed up, along with other performance optimization.
-
 Brett Olsen, March 2024
 """
 
@@ -16,18 +14,29 @@ from scipy import ndimage
 from skimage.restoration import denoise_nl_means, estimate_sigma
 from skimage.exposure import equalize_adapthist
 
-# TODO: some cupy acceleration
-xp = np
-from numpy import linalg as LA
-xndimage = ndimage
+try:
+    import cupy as cp
+    import cupyx.scipy.ndimage as cpndimage
+    GPU_AVAILABLE = True
+    xp = cp
+    xndimage = cpndimage
+except ImportError:
+    GPU_AVAILABLE = False
+    xp = np
+    xndimage = ndimage
 
 def divide_nonzero(array1, array2, eps=1e-10):
     """
     Divides two arrays. Returns zero when dividing by zero.
     """
-    denominator = np.copy(array2)
-    denominator[denominator == 0] = eps
-    return np.divide(array1, denominator)
+    if GPU_AVAILABLE and isinstance(array1, cp.ndarray):
+        denominator = xp.copy(array2)
+        denominator[denominator == 0] = eps
+        return xp.divide(array1, denominator)
+    else:
+        denominator = np.copy(array2)
+        denominator[denominator == 0] = eps
+        return np.divide(array1, denominator)
 
 def normalize(volume):
     minim = xp.min(volume)
@@ -45,33 +54,33 @@ def nms_3d(magnitude, grad, precision):
     Applies Non-Maximum Suppression on a 3D volume using interpolation along gradient directions.
 
     Parameters:
-    - magnitude: 3D numpy array representing the magnitude of gradients.
-    - grad: 3D numpy array of shape (3, *magnitude.shape) representing gradient vectors.
+    - magnitude: 3D numpy/cupy array representing the magnitude of gradients.
+    - grad: 3D numpy/cupy array of shape (3, *magnitude.shape) representing gradient vectors.
 
     Returns:
-    - nms_volume: 3D numpy array after applying NMS.
+    - nms_volume: 3D numpy/cupy array after applying NMS.
     """
     # Initialize the output volume
-    nms_volume = np.zeros_like(magnitude)
+    nms_volume = xp.zeros_like(magnitude)
 
     # Get the shape of the volume
     z_dim, y_dim, x_dim = magnitude.shape
     
     # Create meshgrid of indices
-    Z, Y, X = np.meshgrid(np.arange(z_dim), np.arange(y_dim), np.arange(x_dim), indexing='ij')
+    Z, Y, X = xp.meshgrid(xp.arange(z_dim), xp.arange(y_dim), xp.arange(x_dim), indexing='ij')
 
     # Calculate continuous indices for forward and backward positions based on gradients
-    forward_indices = np.array([Z, Y, X]) + grad
-    backward_indices = np.array([Z, Y, X]) - grad
+    forward_indices = xp.array([Z, Y, X]) + grad
+    backward_indices = xp.array([Z, Y, X]) - grad
 
     # Interpolate the magnitude values at these continuous indices
-    forward_values = ndimage.map_coordinates(magnitude, forward_indices, order=1, mode='nearest')
-    backward_values = ndimage.map_coordinates(magnitude, backward_indices, order=1, mode='nearest')
+    forward_values = xndimage.map_coordinates(magnitude, forward_indices, order=1, mode='nearest')
+    backward_values = xndimage.map_coordinates(magnitude, backward_indices, order=1, mode='nearest')
 
-    # Apply conditions for NMS using NumPy logical functions
-    condition1 = np.logical_and(magnitude >= forward_values, magnitude > backward_values)
-    condition2 = np.logical_and(magnitude > forward_values, magnitude >= backward_values)
-    mask = np.logical_or(condition1, condition2)
+    # Apply conditions for NMS using logical functions
+    condition1 = xp.logical_and(magnitude >= forward_values, magnitude > backward_values)
+    condition2 = xp.logical_and(magnitude > forward_values, magnitude >= backward_values)
+    mask = xp.logical_or(condition1, condition2)
 
     # Apply mask to set NMS volume
     nms_volume[mask] = magnitude[mask]
@@ -83,33 +92,33 @@ def ms_3d(magnitude, grad, precision):
     Applies Maximum Suppression on a 3D volume using interpolation along gradient directions.
 
     Parameters:
-    - magnitude: 3D numpy array representing the magnitude of gradients.
-    - grad: 3D numpy array of shape (3, *magnitude.shape) representing gradient vectors.
+    - magnitude: 3D numpy/cupy array representing the magnitude of gradients.
+    - grad: 3D numpy/cupy array of shape (3, *magnitude.shape) representing gradient vectors.
 
     Returns:
-    - nms_volume: 3D numpy array after applying NMS.
+    - nms_volume: 3D numpy/cupy array after applying NMS.
     """
     # Initialize the output volume
-    nms_volume = np.zeros_like(magnitude)
+    nms_volume = xp.zeros_like(magnitude)
 
     # Get the shape of the volume
     z_dim, y_dim, x_dim = magnitude.shape
     
     # Create meshgrid of indices
-    Z, Y, X = np.meshgrid(np.arange(z_dim), np.arange(y_dim), np.arange(x_dim), indexing='ij')
+    Z, Y, X = xp.meshgrid(xp.arange(z_dim), xp.arange(y_dim), xp.arange(x_dim), indexing='ij')
 
     # Calculate continuous indices for forward and backward positions based on gradients
-    forward_indices = np.array([Z, Y, X]) + grad
-    backward_indices = np.array([Z, Y, X]) - grad
+    forward_indices = xp.array([Z, Y, X]) + grad
+    backward_indices = xp.array([Z, Y, X]) - grad
 
     # Interpolate the magnitude values at these continuous indices
-    forward_values = ndimage.map_coordinates(magnitude, forward_indices, order=1, mode='nearest')
-    backward_values = ndimage.map_coordinates(magnitude, backward_indices, order=1, mode='nearest')
+    forward_values = xndimage.map_coordinates(magnitude, forward_indices, order=1, mode='nearest')
+    backward_values = xndimage.map_coordinates(magnitude, backward_indices, order=1, mode='nearest')
 
-    # Apply conditions for NMS using NumPy logical functions
-    condition1 = np.logical_and(magnitude == forward_values, magnitude == backward_values)
-    condition2 = np.logical_and(magnitude > forward_values, magnitude > backward_values)
-    mask = np.logical_or(condition1, condition2)
+    # Apply conditions for NMS using logical functions
+    condition1 = xp.logical_and(magnitude == forward_values, magnitude == backward_values)
+    condition2 = xp.logical_and(magnitude > forward_values, magnitude > backward_values)
+    mask = xp.logical_or(condition1, condition2)
 
     # Apply mask to set NMS volume
     nms_volume[mask] = magnitude[mask]
@@ -160,27 +169,93 @@ def hessian(volume, gauss_sigma=2, sigma=6):
     
     return joint_hessian, zero_mask
 
+def _eigvalsh_sym3x3(matrices):
+    """Vectorised eigenvalues of batched real symmetric 3x3 matrices.
+
+    Closed-form via Smith's method (Deledalle et al. 2017, "Closed-form
+    expressions of the eigen decomposition of 2 x 2 and 3 x 3 Hermitian
+    matrices"). Operates elementwise over a leading batch shape, so it
+    avoids the cuSolver batched eigvalsh path that returns
+    CUSOLVER_STATUS_INVALID_VALUE on large batches (>~1M matrices).
+
+    Parameters
+    ----------
+    matrices : array of shape (..., 3, 3)
+        Each (3, 3) sub-array must be symmetric. Only the upper triangle
+        (positions 00, 11, 22, 01, 02, 12) is read.
+
+    Returns
+    -------
+    eigvals : array of shape (..., 3)
+        Eigenvalues in ascending order along the last axis.
+    """
+    a00 = matrices[..., 0, 0]
+    a11 = matrices[..., 1, 1]
+    a22 = matrices[..., 2, 2]
+    a01 = matrices[..., 0, 1]
+    a02 = matrices[..., 0, 2]
+    a12 = matrices[..., 1, 2]
+
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    q = (a00 + a11 + a22) / 3.0
+
+    da = a00 - q
+    db = a11 - q
+    dc = a22 - q
+    p2 = da * da + db * db + dc * dc + 2.0 * p1
+    p = xp.sqrt(p2 / 6.0)
+
+    # Substitute a safe denominator where p == 0 (matrix is a multiple of
+    # the identity); the diagonal-case branch below overwrites those
+    # entries with the correctly sorted diagonal values.
+    p_safe = xp.where(p == 0, 1.0, p)
+    b00 = da / p_safe
+    b11_ = db / p_safe
+    b22_ = dc / p_safe
+    b01 = a01 / p_safe
+    b02 = a02 / p_safe
+    b12 = a12 / p_safe
+
+    det_b = (
+        b00 * (b11_ * b22_ - b12 * b12)
+        - b01 * (b01 * b22_ - b12 * b02)
+        + b02 * (b01 * b12 - b11_ * b02)
+    )
+    r = xp.clip(det_b / 2.0, -1.0, 1.0)
+    phi = xp.arccos(r) / 3.0
+
+    eig3 = q + 2.0 * p * xp.cos(phi)
+    eig1 = q + 2.0 * p * xp.cos(phi + 2.0 * math.pi / 3.0)
+    eig2 = 3.0 * q - eig1 - eig3
+
+    diag_eigs = xp.sort(xp.stack([a00, a11, a22], axis=-1), axis=-1)
+    computed_eigs = xp.stack([eig1, eig2, eig3], axis=-1)
+
+    is_diag = (p1 == 0)[..., None]
+    return xp.where(is_diag, diag_eigs, computed_eigs)
+
+
 def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
     joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
-    eigvals = LA.eigvalsh(joint_hessian, "U")
+    eigvals = _eigvalsh_sym3x3(joint_hessian)
     # Sort in increasing size of the absolute value of the eigenvalues
-    idxs = np.argsort(np.abs(eigvals), axis=-1)
-    eigvals = np.take_along_axis(eigvals, idxs, axis=-1)
+    idxs = xp.argsort(xp.abs(eigvals), axis=-1)
+    eigvals = xp.take_along_axis(eigvals, idxs, axis=-1)
     eigvals[zero_mask, :] = 0
 
-    L1 = np.abs(eigvals[:, :, :, 0])
-    L2 = np.abs(eigvals[:, :, :, 1])
+    L1 = xp.abs(eigvals[:, :, :, 0])
+    L2 = xp.abs(eigvals[:, :, :, 1])
     L3 = eigvals[:, :, :, 2]
-    L3abs = np.abs(L3)
+    L3abs = xp.abs(L3)
     
-    S = np.sqrt(np.square(eigvals).sum(axis=-1))
-    background_term = 1 - np.exp(-(.5 * np.square(S / gamma)))
+    S = xp.sqrt(xp.square(eigvals).sum(axis=-1))
+    background_term = 1 - xp.exp(-(.5 * xp.square(S / gamma)))
     
     Ra = divide_nonzero(L2, L3abs)
-    planar_term = np.exp(-(0.5 * np.square(Ra / beta1)))
+    planar_term = xp.exp(-(0.5 * xp.square(Ra / beta1)))
     
-    Rb = divide_nonzero(L1, np.sqrt(np.multiply(L2, L3abs)))
-    blob_term = np.exp(-(0.5 * np.square(Rb / beta2)))
+    Rb = divide_nonzero(L1, xp.sqrt(xp.multiply(L2, L3abs)))
+    blob_term = xp.exp(-(0.5 * xp.square(Rb / beta2)))
     
     ridges = background_term * planar_term * blob_term
     ridges[L3 > 0] = 0
@@ -203,10 +278,10 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
     - vesselness: 3D array representing vesselness probability at each voxel.
     """
     joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
-    eigvals = LA.eigvalsh(joint_hessian, "U")
+    eigvals = _eigvalsh_sym3x3(joint_hessian)
     # Sort eigenvalues by magnitude (ascending order)
-    idxs = np.argsort(np.abs(eigvals), axis=-1)
-    eigvals = np.take_along_axis(eigvals, idxs, axis=-1)
+    idxs = xp.argsort(xp.abs(eigvals), axis=-1)
+    eigvals = xp.take_along_axis(eigvals, idxs, axis=-1)
     eigvals[zero_mask, :] = 0  # Ignore zero regions
 
     # Extract eigenvalues
@@ -215,14 +290,14 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
     L3 = eigvals[:, :, :, 2]
 
     # Compute terms for Frangi filter
-    Ra = divide_nonzero(np.abs(L2), np.abs(L3))  # Tubularity ratio
-    Rb = divide_nonzero(np.abs(L1), np.sqrt(np.abs(L2 * L3)))  # Blobness ratio
-    S = np.sqrt(np.square(eigvals).sum(axis=-1))  # Frobenius norm
+    Ra = divide_nonzero(xp.abs(L2), xp.abs(L3))  # Tubularity ratio
+    Rb = divide_nonzero(xp.abs(L1), xp.sqrt(xp.abs(L2 * L3)))  # Blobness ratio
+    S = xp.sqrt(xp.square(eigvals).sum(axis=-1))  # Frobenius norm
 
     # Frangi vesselness components
-    planar_term = 1 - np.exp(-0.5 * np.square(Ra / beta1))
-    blob_term = np.exp(-0.5 * np.square(Rb / beta2))
-    background_term = 1 - np.exp(-0.5 * np.square(S / gamma))
+    planar_term = 1 - xp.exp(-0.5 * xp.square(Ra / beta1))
+    blob_term = xp.exp(-0.5 * xp.square(Rb / beta2))
+    background_term = 1 - xp.exp(-0.5 * xp.square(S / gamma))
 
     # Combine terms
     vesselness = background_term * planar_term * blob_term
@@ -235,11 +310,11 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
 
 def proximity_boolean_filter(volume):
     # Define the 3x3x3 kernel
-    kernel = np.ones((3, 3, 3)) * -1/26  # Each neighbor contributes equally when it is zero
+    kernel = xp.ones((3, 3, 3)) * -1/26  # Each neighbor contributes equally when it is zero
     kernel[1, 1, 1] = 1        
     """Detect edges where the central voxel is 1 and at least three neighbors are 0."""
     # Apply the convolution
-    filtered = ndimage.convolve(volume, kernel, mode='constant', cval=1)  # Assume boundary is 1 to prevent false edges
+    filtered = xndimage.convolve(volume, kernel, mode='constant', cval=1)  # Assume boundary is 1 to prevent false edges
     # An edge is detected where the convolution result is 1 - 3*(-1/26) or less (i.e., 1 + 3/26)
     # We use a threshold of slightly more than three zeros (since 3/26 subtracted from 1)
     edges = filtered <= (1 - 3 * (1/26))
@@ -250,65 +325,65 @@ def detect_edges(volume, filter):
     # Define the 3D Scharr kernels for x, y, and z directions
     # Scharr operator values for derivative approximation and smoothing
     if filter == "scharr":
-        scharr_1d = np.array([-1, 0, 1], dtype=precision)  # Derivative approximation
-        scharr_1d_smooth = np.array([3, 10, 3], dtype=precision)  # Smoothing
+        scharr_1d = xp.array([-1, 0, 1], dtype=precision)  # Derivative approximation
+        scharr_1d_smooth = xp.array([3, 10, 3], dtype=precision)  # Smoothing
 
         # Create 3D kernels by outer products and normalization
-        kz = np.outer(np.outer(scharr_1d, scharr_1d_smooth), scharr_1d_smooth).reshape(3, 3, 3) / 32
-        ky = np.outer(np.outer(scharr_1d_smooth, scharr_1d), scharr_1d_smooth).reshape(3, 3, 3) / 32
-        kx = np.outer(scharr_1d_smooth, np.outer(scharr_1d_smooth, scharr_1d)).reshape(3, 3, 3) / 32
+        kz = xp.outer(xp.outer(scharr_1d, scharr_1d_smooth), scharr_1d_smooth).reshape(3, 3, 3) / 32
+        ky = xp.outer(xp.outer(scharr_1d_smooth, scharr_1d), scharr_1d_smooth).reshape(3, 3, 3) / 32
+        kx = xp.outer(scharr_1d_smooth, xp.outer(scharr_1d_smooth, scharr_1d)).reshape(3, 3, 3) / 32
     elif filter == "pavel":
-        pavel_1d = np.array([2,1,-16,-27,0,27,16,-1,-2], dtype=precision)  # Derivative approximation
-        pavel_1d_smooth = np.array([1, 4, 6, 4, 1], dtype=precision)  # Smoothing
-        pavel_1d_2nd = np.array([-7,12,52,-12,-90,-12,52,12,-7], dtype=precision)
+        pavel_1d = xp.array([2,1,-16,-27,0,27,16,-1,-2], dtype=precision)  # Derivative approximation
+        pavel_1d_smooth = xp.array([1, 4, 6, 4, 1], dtype=precision)  # Smoothing
+        pavel_1d_2nd = xp.array([-7,12,52,-12,-90,-12,52,12,-7], dtype=precision)
         # Create 3D kernels by outer products and normalization
-        kz = np.outer(np.outer(pavel_1d, pavel_1d_smooth), pavel_1d_smooth).reshape(9, 5, 5)/ (96*16*16)
-        ky = np.outer(np.outer(pavel_1d_smooth, pavel_1d), pavel_1d_smooth).reshape(5, 9, 5)/ (96*16*16)
-        kx = np.outer(pavel_1d_smooth, np.outer(pavel_1d_smooth, pavel_1d)).reshape(5, 5, 9)/ (96*16*16)
-        kzz = np.outer(np.outer(pavel_1d_2nd, pavel_1d_smooth), pavel_1d_smooth).reshape(9, 5, 5)/ (192*16*16)
-        kyy = np.outer(np.outer(pavel_1d_smooth, pavel_1d_2nd), pavel_1d_smooth).reshape(5, 9, 5)/ (192*16*16)
-        kxx = np.outer(pavel_1d_smooth, np.outer(pavel_1d_smooth, pavel_1d_2nd)).reshape(5, 5, 9)/ (192*16*16)
+        kz = xp.outer(xp.outer(pavel_1d, pavel_1d_smooth), pavel_1d_smooth).reshape(9, 5, 5)/ (96*16*16)
+        ky = xp.outer(xp.outer(pavel_1d_smooth, pavel_1d), pavel_1d_smooth).reshape(5, 9, 5)/ (96*16*16)
+        kx = xp.outer(xp.outer(pavel_1d_smooth, pavel_1d_smooth), pavel_1d).reshape(5, 5, 9)/ (96*16*16)
+        kzz = xp.outer(xp.outer(pavel_1d_2nd, pavel_1d_smooth), pavel_1d_smooth).reshape(9, 5, 5)/ (192*16*16)
+        kyy = xp.outer(xp.outer(pavel_1d_smooth, pavel_1d_2nd), pavel_1d_smooth).reshape(5, 9, 5)/ (192*16*16)
+        kxx = xp.outer(xp.outer(pavel_1d_smooth, pavel_1d_smooth), pavel_1d_2nd).reshape(5, 5, 9)/ (192*16*16)
 
-    gradient = np.zeros((3, volume.shape[0], volume.shape[1], volume.shape[2]), dtype=precision)
+    gradient = xp.zeros((3, volume.shape[0], volume.shape[1], volume.shape[2]), dtype=precision)
     # Apply the kernels to the volume
-    gradient[2] = ndimage.convolve(volume, kx)
-    gradient[1] = ndimage.convolve(volume, ky)
-    gradient[0] = ndimage.convolve(volume, kz)
-    
-    first_derivative = np.sqrt(gradient[2]**2 + gradient[1]**2 + gradient[0]**2)
+    gradient[2] = xndimage.convolve(volume, kx)
+    gradient[1] = xndimage.convolve(volume, ky)
+    gradient[0] = xndimage.convolve(volume, kz)
+
+    first_derivative = xp.sqrt(gradient[2]**2 + gradient[1]**2 + gradient[0]**2)
     gradient /= first_derivative
-    
+
     nms = nms_3d(first_derivative, gradient, precision)
 
     #normalization
     first_derivative = nms / nms.max()
-    
 
-    hessian = np.zeros((3,3,volume.shape[0], volume.shape[1], volume.shape[2]), dtype=precision)
+
+    hessian = xp.zeros((3,3,volume.shape[0], volume.shape[1], volume.shape[2]), dtype=precision)
 
     if filter == "scharr":
-        hessian[2,2] = ndimage.convolve(gradient[2], kx).astype(precision)
-        hessian[1,1] = ndimage.convolve(gradient[1], ky).astype(precision)
-        hessian[0,0] = ndimage.convolve(gradient[0], kz).astype(precision)
+        hessian[2,2] = xndimage.convolve(gradient[2], kx).astype(precision)
+        hessian[1,1] = xndimage.convolve(gradient[1], ky).astype(precision)
+        hessian[0,0] = xndimage.convolve(gradient[0], kz).astype(precision)
 
     elif filter == "pavel":
-        hessian[2,2] = ndimage.convolve(volume, kxx).astype(precision)
-        hessian[1,1] = ndimage.convolve(volume, kyy).astype(precision)
-        hessian[0,0] = ndimage.convolve(volume, kzz).astype(precision)
-        
-    hessian[1,2] = ndimage.convolve(gradient[2], ky).astype(precision)
-    hessian[0,2] = ndimage.convolve(gradient[2], kz).astype(precision)
+        hessian[2,2] = xndimage.convolve(volume, kxx).astype(precision)
+        hessian[1,1] = xndimage.convolve(volume, kyy).astype(precision)
+        hessian[0,0] = xndimage.convolve(volume, kzz).astype(precision)
+
+    hessian[1,2] = xndimage.convolve(gradient[2], ky).astype(precision)
+    hessian[0,2] = xndimage.convolve(gradient[2], kz).astype(precision)
 
     #print('Calculating Hessian 2')
-    hessian[2,1] = ndimage.convolve(gradient[1], kx).astype(precision)
-    hessian[0,1] = ndimage.convolve(gradient[1], kz).astype(precision)
+    hessian[2,1] = xndimage.convolve(gradient[1], kx).astype(precision)
+    hessian[0,1] = xndimage.convolve(gradient[1], kz).astype(precision)
 
     #print('Calculating Hessian 3')
-    hessian[2,0] = ndimage.convolve(gradient[0], kx).astype(precision)
-    hessian[1,0] = ndimage.convolve(gradient[0], ky).astype(precision)
+    hessian[2,0] = xndimage.convolve(gradient[0], kx).astype(precision)
+    hessian[1,0] = xndimage.convolve(gradient[0], ky).astype(precision)
 
     #print('Calculating Determinant')
-    det = np.abs(hessian[0,0]*(hessian[1,1]*hessian[2,2]-hessian[1,2]*hessian[2,1])-hessian[0,1]*(hessian[1,0]*hessian[2,2]-hessian[1,2]*hessian[2,0])+hessian[0,2]*(hessian[1,0]*hessian[2,1]-hessian[1,1]*hessian[2,0]))
+    det = xp.abs(hessian[0,0]*(hessian[1,1]*hessian[2,2]-hessian[1,2]*hessian[2,1])-hessian[0,1]*(hessian[1,0]*hessian[2,2]-hessian[1,2]*hessian[2,0])+hessian[0,2]*(hessian[1,0]*hessian[2,1]-hessian[1,1]*hessian[2,0]))
 
-    
+
     return first_derivative, det, gradient
