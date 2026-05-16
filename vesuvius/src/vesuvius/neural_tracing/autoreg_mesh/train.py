@@ -1596,7 +1596,19 @@ def run_autoreg_mesh_training(
             if "optimizer" in preloaded_ckpt:
                 optimizer.load_state_dict(preloaded_ckpt["optimizer"])
             if scheduler is not None and "lr_scheduler" in preloaded_ckpt:
-                scheduler.load_state_dict(preloaded_ckpt["lr_scheduler"])
+                # Restore ONLY the step counters from the saved state.
+                # PyTorch's `_LRScheduler.state_dict()` saves every instance
+                # attribute, so a naive `load_state_dict` would overwrite
+                # max_steps / exponent / warmup_steps / initial_lr with the
+                # values from the previous run's checkpoint -- silently
+                # ignoring any cfg-level LR changes on resume (e.g.,
+                # extending num_steps or lowering the poly exponent for a
+                # longer tail). We re-apply the cfg values constructively
+                # by reaching into the saved state for just the counters.
+                saved_state = preloaded_ckpt["lr_scheduler"]
+                for counter_key in ("ctr", "last_epoch", "_step_count"):
+                    if counter_key in saved_state:
+                        setattr(scheduler, counter_key, saved_state[counter_key])
 
     _t_phase = time.perf_counter()
     train_model = _wrap_model_for_ddp(raw_model, runtime)
