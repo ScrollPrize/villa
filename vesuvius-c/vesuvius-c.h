@@ -846,7 +846,8 @@ long vs_download(const char* url, void** out_buffer) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_easy_cleanup(curl);
 
-    if (http_code != 200) {
+    // file:// urls will have http_code == 0
+    if (http_code != 200 && http_code != 0) {
         free(chunk.buffer);
         return -1;
     }
