@@ -193,10 +193,17 @@ struct AwsAuth {
     }
 
     /// Full credential resolution. Tries in order:
-    ///   1. `aws configure export-credentials` (resolves SSO, assume-role, etc.)
-    ///   2. ~/.aws/credentials + ~/.aws/config INI files
-    ///   3. Environment variables
-    /// Respects AWS_PROFILE for methods 1 & 2.
+    ///   1. Explicit profile via `aws configure export-credentials`
+    ///      (only when AWS_PROFILE is set or a non-default profile is passed)
+    ///   2. EC2 instance role via IMDSv2 — queried directly (no subprocess)
+    ///      and cached in-process with refresh-before-expiry
+    ///   3. SSO profiles discovered in ~/.aws/config
+    ///   4. Default `aws configure export-credentials`
+    ///   5. ~/.aws/credentials + ~/.aws/config INI files
+    ///   6. Environment variables
+    /// Respects AWS_PROFILE. The IMDSv2 cache makes load() safe to call from
+    /// many threads on a long-running EC2 job without throttling the metadata
+    /// endpoint.
     [[nodiscard]] static AwsAuth load(const std::string& profile = "default");
 };
 

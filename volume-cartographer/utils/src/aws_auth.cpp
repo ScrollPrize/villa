@@ -4,15 +4,199 @@
 
 #include "utils/Json.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace utils {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// IMDSv2 (EC2 Instance Metadata Service v2)
+//
+// The previous implementation resolved instance-role credentials by forking
+// the `aws` CLI (`aws configure export-credentials`) on every AwsAuth::load().
+// Under high client concurrency (e.g. the recompress tool's 96 inner workers)
+// this spawns dozens of `aws` subprocesses simultaneously, each hammering the
+// link-local IMDS endpoint. IMDS rate-limits aggressively, so some calls get
+// an empty/throttled response and load() returned empty credentials, failing
+// the S3 op. Querying IMDSv2 directly (no subprocess) plus caching the
+// resolved credentials in-process until shortly before expiry eliminates the
+// fork-storm and survives the multi-hour STS rotation on long-running jobs.
+// ---------------------------------------------------------------------------
+
+constexpr const char* kImdsBase = "http://169.254.169.254";
+
+size_t imds_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+    auto* out = static_cast<std::string*>(userdata);
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+// Minimal libcurl GET/PUT against the link-local metadata endpoint. Kept
+// self-contained (not via HttpClient) because HttpClient::Config embeds an
+// AwsAuth and the metadata endpoint must never be SigV4-signed.
+std::optional<std::string> imds_request(const std::string& url,
+                                        bool put,
+                                        const std::string& token)
+{
+    CURL* curl = curl_easy_init();
+    if (!curl) return std::nullopt;
+
+    std::string body;
+    struct curl_slist* headers = nullptr;
+    if (put) {
+        headers = curl_slist_append(
+            headers, "X-aws-ec2-metadata-token-ttl-seconds: 21600");
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    } else if (!token.empty()) {
+        std::string h = "X-aws-ec2-metadata-token: " + token;
+        headers = curl_slist_append(headers, h.c_str());
+    }
+    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, imds_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    // Link-local: must be fast. A non-EC2 host has no 169.254.169.254 route,
+    // so keep the timeout tight to fail over to other methods quickly.
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000L);
+    curl_easy_setopt(curl, CURLOPT_NOPROXY, "169.254.169.254");
+
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK || status < 200 || status >= 300) return std::nullopt;
+    return body;
+}
+
+struct CachedCreds {
+    AwsAuth auth;
+    std::chrono::system_clock::time_point expiry{};
+    bool has_expiry = false;
+};
+
+std::mutex g_cred_mutex;
+std::optional<CachedCreds> g_cached;
+
+std::chrono::system_clock::time_point parse_iso8601(const std::string& s)
+{
+    // Expiration looks like "2026-05-16T18:42:00Z".
+    std::tm tm{};
+    if (sscanf(s.c_str(), "%d-%d-%dT%d:%d:%dZ",
+               &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+               &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) {
+        return {};
+    }
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+#if defined(_WIN32)
+    std::time_t t = _mkgmtime(&tm);
+#else
+    std::time_t t = timegm(&tm);
+#endif
+    return std::chrono::system_clock::from_time_t(t);
+}
+
+// Returns instance-role creds via IMDSv2, or nullopt if not on EC2 / no role.
+std::optional<CachedCreds> fetch_imds_creds()
+{
+    auto token = imds_request(std::string(kImdsBase) + "/latest/api/token",
+                              /*put=*/true, "");
+    if (!token || token->empty()) {
+        fprintf(stderr, "[AWS] IMDSv2: no token (not on EC2?)\n");
+        return std::nullopt;
+    }
+
+    auto role = imds_request(
+        std::string(kImdsBase) + "/latest/meta-data/iam/security-credentials/",
+        false, *token);
+    if (!role || role->empty()) {
+        fprintf(stderr, "[AWS] IMDSv2: no instance role attached\n");
+        return std::nullopt;
+    }
+    // The listing may contain a trailing newline; take the first line.
+    std::string role_name = *role;
+    if (auto nl = role_name.find('\n'); nl != std::string::npos)
+        role_name.resize(nl);
+
+    auto creds_json = imds_request(
+        std::string(kImdsBase) + "/latest/meta-data/iam/security-credentials/"
+            + role_name,
+        false, *token);
+    if (!creds_json || creds_json->empty()) {
+        fprintf(stderr, "[AWS] IMDSv2: role '%s' creds fetch failed\n",
+                role_name.c_str());
+        return std::nullopt;
+    }
+
+    try {
+        auto j = Json::parse(*creds_json);
+        if (!j.contains("AccessKeyId") || !j.contains("SecretAccessKey"))
+            return std::nullopt;
+        CachedCreds cc;
+        cc.auth.access_key = j["AccessKeyId"].get_string();
+        cc.auth.secret_key = j["SecretAccessKey"].get_string();
+        if (j.contains("Token"))
+            cc.auth.session_token = j["Token"].get_string();
+        if (j.contains("Expiration")) {
+            cc.expiry = parse_iso8601(j["Expiration"].get_string());
+            cc.has_expiry =
+                cc.expiry != std::chrono::system_clock::time_point{};
+        }
+        fprintf(stderr,
+                "[AWS] IMDSv2: got role '%s' creds (key=%s..., expires %s)\n",
+                role_name.c_str(), cc.auth.access_key.substr(0, 8).c_str(),
+                j.contains("Expiration")
+                    ? j["Expiration"].get_string().c_str() : "(none)");
+        return cc;
+    } catch (...) {
+        fprintf(stderr, "[AWS] IMDSv2: creds JSON parse failed\n");
+        return std::nullopt;
+    }
+}
+
+// Serve instance-role creds from an in-process cache, refreshing ~5 min
+// before expiry. Thread-safe; the network fetch happens at most once per
+// rotation window regardless of how many workers call load() concurrently.
+std::optional<AwsAuth> cached_imds_creds()
+{
+    std::lock_guard<std::mutex> lk(g_cred_mutex);
+    auto now = std::chrono::system_clock::now();
+
+    if (g_cached) {
+        if (!g_cached->has_expiry ||
+            now + std::chrono::minutes(5) < g_cached->expiry) {
+            return g_cached->auth;
+        }
+    }
+
+    auto fresh = fetch_imds_creds();
+    if (fresh) {
+        g_cached = std::move(*fresh);
+        return g_cached->auth;
+    }
+    // Refresh failed but a still-valid cached copy exists — keep using it.
+    if (g_cached && (!g_cached->has_expiry || now < g_cached->expiry))
+        return g_cached->auth;
+    return std::nullopt;
+}
+
+} // namespace
 
 AwsAuth AwsAuth::load(const std::string& profile)
 {
@@ -98,13 +282,27 @@ AwsAuth AwsAuth::load(const std::string& profile)
         fprintf(stderr, "[AWS] AwsAuth::load(profile=\"%s\") AWS_PROFILE=\"%s\"\n",
             profile.c_str(), envProfile.c_str());
 
-        // 1. Try explicit profile (env or argument)
+        // 1. Explicit profile (env or argument) wins — caller asked for a
+        //    specific named profile, honour it before instance role.
         if (!envProfile.empty())
             got = tryExportCreds(envProfile);
         else if (profile != "default")
             got = tryExportCreds(profile);
 
-        // 2. Try SSO profiles from ~/.aws/config
+        // 2. EC2 instance role via IMDSv2 (cached, no subprocess). This is
+        //    the hot path for the recompress tool running on EC2; serving it
+        //    from the in-process cache avoids the `aws` CLI fork-storm that
+        //    throttled IMDS and intermittently yielded empty credentials.
+        if (!got) {
+            if (auto imds = cached_imds_creds()) {
+                auth.access_key    = imds->access_key;
+                auth.secret_key    = imds->secret_key;
+                auth.session_token = imds->session_token;
+                got = true;
+            }
+        }
+
+        // 3. SSO profiles discovered in ~/.aws/config
         if (!got) {
             auto ssoProfiles = findSsoProfiles();
             fprintf(stderr, "[AWS] found %zu SSO profiles in config\n", ssoProfiles.size());
@@ -117,11 +315,11 @@ AwsAuth AwsAuth::load(const std::string& profile)
             }
         }
 
-        // 3. Try default (no --profile flag)
+        // 4. Default profile (no --profile flag)
         if (!got)
             got = tryExportCreds("");
 
-        fprintf(stderr, "[AWS] export-credentials result: %s (key=%s...)\n",
+        fprintf(stderr, "[AWS] credential resolution result: %s (key=%s...)\n",
             got ? "success" : "FAILED",
             auth.access_key.empty() ? "(empty)" : auth.access_key.substr(0, 8).c_str());
     }
