@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <new>
 #include <cmath>
+#include <numeric>
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
@@ -764,7 +765,7 @@ void run_pyramid(const po::variables_map& vm) {
     for (int level = min_level; level <= max_level; ++level) {
         const int scale = 1 << level;
         const int level_grid_step = std::max(1, (source_grid_step + scale - 1) / scale);
-        const int level_sparse_volume = std::max(1, (source_sparse_volume + scale - 1) / scale);
+        const int level_sparse_volume = std::max(1, source_sparse_volume / std::gcd(source_sparse_volume, scale));
         const double level_spiral_step = source_spiral_step / static_cast<double>(scale);
 
         Json level_json;
@@ -794,6 +795,7 @@ void run_pyramid(const po::variables_map& vm) {
             size_t written = 0;
             size_t skipped = 0;
             size_t collapsed = 0;
+            size_t errors = 0;
             const auto files = list_indexed_files(src_dir, ".grid");
             std::cout << "  " << direction << ": processing " << files.size()
                       << " source grid files" << std::endl;
@@ -813,7 +815,7 @@ void run_pyramid(const po::variables_map& vm) {
                               << std::defaultfloat << std::endl;
                 }
             };
-            #pragma omp parallel for reduction(+:written, skipped, collapsed) schedule(dynamic)
+            #pragma omp parallel for reduction(+:written, skipped, collapsed, errors) schedule(dynamic)
             for (size_t i = 0; i < files.size(); ++i) {
                 const fs::path& src_path = files[i];
                 const auto src_index = parse_indexed_stem(src_path);
@@ -870,6 +872,7 @@ void run_pyramid(const po::variables_map& vm) {
                     fs::rename(tmp_path, dst_path);
                     ++written;
                 } catch (const std::exception& e) {
+                    ++errors;
                     #pragma omp critical
                     std::cerr << "Error deriving " << src_path << ": " << e.what() << std::endl;
                 }
@@ -878,7 +881,13 @@ void run_pyramid(const po::variables_map& vm) {
 
             std::cout << "  " << direction << ": wrote " << written
                       << ", skipped " << skipped
-                      << ", collapsed paths " << collapsed << std::endl;
+                      << ", collapsed paths " << collapsed
+                      << ", errors " << errors << std::endl;
+            if (errors > 0) {
+                throw std::runtime_error("failed to derive " + std::to_string(errors) +
+                                         " normal-grid file(s) for " + direction +
+                                         " level " + std::to_string(level));
+            }
         }
 
         if (include_images) {
@@ -892,6 +901,7 @@ void run_pyramid(const po::variables_map& vm) {
 
                 size_t written = 0;
                 size_t skipped = 0;
+                size_t errors = 0;
                 const auto files = list_indexed_files(src_dir, ".jpg");
                 std::cout << "  " << direction << "_img: processing " << files.size()
                           << " source preview files" << std::endl;
@@ -911,7 +921,7 @@ void run_pyramid(const po::variables_map& vm) {
                                   << std::defaultfloat << std::endl;
                     }
                 };
-                #pragma omp parallel for reduction(+:written, skipped) schedule(dynamic)
+                #pragma omp parallel for reduction(+:written, skipped, errors) schedule(dynamic)
                 for (size_t i = 0; i < files.size(); ++i) {
                     const fs::path& src_path = files[i];
                     const auto src_index = parse_indexed_stem(src_path);
@@ -954,6 +964,7 @@ void run_pyramid(const po::variables_map& vm) {
                         }
                         ++written;
                     } catch (const std::exception& e) {
+                        ++errors;
                         #pragma omp critical
                         std::cerr << "Error deriving preview " << src_path << ": " << e.what() << std::endl;
                     }
@@ -961,7 +972,13 @@ void run_pyramid(const po::variables_map& vm) {
                 }
 
                 std::cout << "  " << direction << "_img: wrote " << written
-                          << ", skipped " << skipped << std::endl;
+                          << ", skipped " << skipped
+                          << ", errors " << errors << std::endl;
+                if (errors > 0) {
+                    throw std::runtime_error("failed to derive " + std::to_string(errors) +
+                                             " preview image(s) for " + direction +
+                                             " level " + std::to_string(level));
+                }
             }
         }
 
