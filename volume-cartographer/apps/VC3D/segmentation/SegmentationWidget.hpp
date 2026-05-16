@@ -57,6 +57,7 @@ public:
     [[nodiscard]] utils::Json customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
+    [[nodiscard]] int growthScale() const;
     [[nodiscard]] QString normal3dZarrPath() const;
     [[nodiscard]] QString patchTracerSourcePath() const;
     [[nodiscard]] utils::Json patchTracerParamsJson() const;

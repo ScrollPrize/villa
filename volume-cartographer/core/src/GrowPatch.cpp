@@ -130,6 +130,192 @@ static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
     return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
 }
 
+static cv::Size scaled_grid_size(const cv::Size& size, int factor)
+{
+    factor = std::max(1, factor);
+    return cv::Size(
+        std::max(1, (size.width + factor - 1) / factor),
+        std::max(1, (size.height + factor - 1) / factor));
+}
+
+static cv::Mat_<cv::Vec3f> downsample_surface_points_nearest(const cv::Mat_<cv::Vec3f>& points, int factor)
+{
+    const cv::Size dst_size = scaled_grid_size(points.size(), factor);
+    cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int r = 0; r < result.rows; ++r) {
+        const int src_r = std::min(points.rows - 1, r * factor);
+        for (int c = 0; c < result.cols; ++c) {
+            const int src_c = std::min(points.cols - 1, c * factor);
+            result(r, c) = points(src_r, src_c);
+        }
+    }
+    return result;
+}
+
+static cv::Mat resize_surface_points_weighted(const cv::Mat_<cv::Vec3f>& points,
+                                              const cv::Size& dst_size,
+                                              int interpolation)
+{
+    cv::Mat value(points.size(), CV_32FC3, cv::Scalar(0, 0, 0));
+    cv::Mat weight(points.size(), CV_32FC1, cv::Scalar(0));
+    for (int r = 0; r < points.rows; ++r) {
+        for (int c = 0; c < points.cols; ++c) {
+            const cv::Vec3f& p = points(r, c);
+            if (p[0] == -1.0f) {
+                continue;
+            }
+            value.at<cv::Vec3f>(r, c) = p;
+            weight.at<float>(r, c) = 1.0f;
+        }
+    }
+
+    cv::Mat value_resized;
+    cv::Mat weight_resized;
+    cv::resize(value, value_resized, dst_size, 0.0, 0.0, interpolation);
+    cv::resize(weight, weight_resized, dst_size, 0.0, 0.0, interpolation);
+
+    cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int r = 0; r < result.rows; ++r) {
+        for (int c = 0; c < result.cols; ++c) {
+            const float w = weight_resized.at<float>(r, c);
+            if (w <= 1e-5f) {
+                continue;
+            }
+            result(r, c) = value_resized.at<cv::Vec3f>(r, c) * (1.0f / w);
+        }
+    }
+    return result;
+}
+
+static cv::Mat downsample_channel_for_growth(const cv::Mat& channel, const cv::Size& dst_size, const std::string& name)
+{
+    if (channel.empty()) {
+        return {};
+    }
+    cv::Mat result;
+    const int interpolation = (name == "generations" || name == "mask" || name == "approval")
+        ? cv::INTER_NEAREST
+        : cv::INTER_AREA;
+    cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
+    return result;
+}
+
+static cv::Mat downsample_allowed_growth_mask_conservative(const cv::Mat& mask, int factor)
+{
+    if (mask.empty()) {
+        return {};
+    }
+    factor = std::max(1, factor);
+    const cv::Size dst_size = scaled_grid_size(mask.size(), factor);
+    cv::Mat normalized;
+    if (mask.type() == CV_8UC1) {
+        normalized = mask;
+    } else {
+        mask.convertTo(normalized, CV_8U);
+    }
+
+    cv::Mat_<uchar> result(dst_size, static_cast<uchar>(0));
+    for (int r = 0; r < result.rows; ++r) {
+        const int src_r0 = r * factor;
+        const int src_r1 = std::min(mask.rows, src_r0 + factor);
+        for (int c = 0; c < result.cols; ++c) {
+            const int src_c0 = c * factor;
+            const int src_c1 = std::min(mask.cols, src_c0 + factor);
+            bool all_allowed = true;
+            for (int sr = src_r0; sr < src_r1 && all_allowed; ++sr) {
+                for (int sc = src_c0; sc < src_c1; ++sc) {
+                    if (normalized.at<uchar>(sr, sc) == 0) {
+                        all_allowed = false;
+                        break;
+                    }
+                }
+            }
+            result(r, c) = static_cast<uchar>(all_allowed ? 255 : 0);
+        }
+    }
+    return result;
+}
+
+static cv::Mat upsample_channel_from_growth(const cv::Mat& channel, const cv::Size& dst_size, const std::string& name)
+{
+    if (channel.empty()) {
+        return {};
+    }
+    cv::Mat result;
+    const int interpolation = (name == "generations" || name == "mask" || name == "approval")
+        ? cv::INTER_NEAREST
+        : cv::INTER_LINEAR;
+    cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
+    return result;
+}
+
+static std::unique_ptr<QuadSurface> make_growth_scale_resume_surface(QuadSurface& source, int factor)
+{
+    auto source_points = source.rawPoints();
+    auto scaled_points = downsample_surface_points_nearest(source_points, factor);
+    const cv::Vec2f source_scale = source.scale();
+    auto scaled = std::make_unique<QuadSurface>(
+        scaled_points,
+        cv::Vec2f(source_scale[0] / static_cast<float>(factor),
+                  source_scale[1] / static_cast<float>(factor)));
+    scaled->id = source.id;
+    scaled->path = source.path;
+    scaled->meta = source.meta;
+    scaled->setDpi(source.dpi());
+
+    const cv::Size dst_size = scaled_points.size();
+    for (const std::string& name : source.channelNames()) {
+        cv::Mat channel = source.channel(name, SURF_CHANNEL_NORESIZE);
+        if (!channel.empty()) {
+            scaled->setChannel(name, downsample_channel_for_growth(channel, dst_size, name));
+        }
+    }
+    return scaled;
+}
+
+static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
+                                              const cv::Vec2f& output_scale,
+                                              int factor,
+                                              cv::Size exact_output_size = {})
+{
+    if (!coarse || factor <= 1) {
+        return coarse;
+    }
+
+    auto coarse_points = coarse->rawPoints();
+    cv::Size output_size(
+        std::max(1, coarse_points.cols * factor),
+        std::max(1, coarse_points.rows * factor));
+    if (exact_output_size.width > 0 && exact_output_size.height > 0) {
+        output_size = exact_output_size;
+    }
+    cv::Mat_<cv::Vec3f> output_points =
+        resize_surface_points_weighted(coarse_points, output_size, cv::INTER_LINEAR);
+
+    auto* output = new QuadSurface(output_points, output_scale);
+    output->id = coarse->id;
+    output->path = coarse->path;
+    output->meta = coarse->meta;
+    output->setDpi(coarse->dpi());
+    output->meta["growth_scale_factor"] = factor;
+
+    if (output->meta.contains("grid_offset") && output->meta["grid_offset"].is_array() &&
+        output->meta["grid_offset"].size() >= 2) {
+        output->meta["grid_offset"][0] = output->meta["grid_offset"][0].get_int() * factor;
+        output->meta["grid_offset"][1] = output->meta["grid_offset"][1].get_int() * factor;
+    }
+
+    for (const std::string& name : coarse->channelNames()) {
+        cv::Mat channel = coarse->channel(name, SURF_CHANNEL_NORESIZE);
+        if (!channel.empty()) {
+            output->setChannel(name, upsample_channel_from_growth(channel, output_size, name));
+        }
+    }
+
+    delete coarse;
+    return output;
+}
+
 static cv::Mat_<uchar> make_approved_mask(const cv::Mat& approval,
                                           const cv::Rect& resume_area,
                                           const cv::Size& trace_size)
@@ -355,7 +541,7 @@ public:
     };
 
     PointCorrection() = default;
-    PointCorrection(const VCCollection& corrections) {
+    explicit PointCorrection(const VCCollection& corrections, float anchor_grid_scale = 1.0f) {
         const auto& collections = corrections.getAllCollections();
         if (collections.empty()) return;
 
@@ -366,6 +552,9 @@ public:
 
             CorrectionCollection new_collection;
             new_collection.anchor2d_ = collection.anchor2d;
+            if (new_collection.anchor2d_.has_value() && anchor_grid_scale != 1.0f) {
+                new_collection.anchor2d_ = new_collection.anchor2d_.value() * anchor_grid_scale;
+            }
 
             std::vector<ColPoint> sorted_points;
             sorted_points.reserve(collection.points.size());
@@ -2908,6 +3097,51 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
 
+    const int growth_scale_level = std::clamp(params.value("growth_scale", 0), 0, 5);
+    const int growth_scale_factor = 1 << growth_scale_level;
+    const bool use_growth_scale = resume_surf && growth_scale_factor > 1;
+    const cv::Vec2f output_surface_scale = resume_surf ? resume_surf->scale() : cv::Vec2f(1.0f, 1.0f);
+    std::unique_ptr<QuadSurface> growth_scale_resume_surf;
+    cv::Mat growth_scale_allowed_mask;
+    const cv::Mat* effective_allowed_growth_mask = allowed_growth_mask;
+    if (use_growth_scale) {
+        const cv::Size source_resume_size = resume_surf->rawPoints().size();
+        growth_scale_resume_surf = make_growth_scale_resume_surface(*resume_surf, growth_scale_factor);
+        resume_surf = growth_scale_resume_surf.get();
+        resume_surf->meta["_growth_source_width"] = source_resume_size.width;
+        resume_surf->meta["_growth_source_height"] = source_resume_size.height;
+        if (allowed_growth_mask && !allowed_growth_mask->empty()) {
+            growth_scale_allowed_mask =
+                downsample_allowed_growth_mask_conservative(*allowed_growth_mask, growth_scale_factor);
+            effective_allowed_growth_mask = &growth_scale_allowed_mask;
+        }
+        std::cout << "GrowPatch growth scale level " << growth_scale_level
+                  << " (factor=" << growth_scale_factor
+                  << ", working surface scale=" << resume_surf->scale()
+                  << ", output surface scale=" << output_surface_scale
+                  << ")" << std::endl;
+        if (effective_allowed_growth_mask && !effective_allowed_growth_mask->empty()) {
+            std::cout << "Allowed growth mask downsampled conservatively: "
+                      << allowed_growth_mask->cols << "x" << allowed_growth_mask->rows
+                      << " -> " << effective_allowed_growth_mask->cols << "x"
+                      << effective_allowed_growth_mask->rows
+                      << ", cells=" << cv::countNonZero(*effective_allowed_growth_mask)
+                      << std::endl;
+        }
+    }
+
+    auto exact_growth_output_size_for_fill = [&]() -> cv::Size {
+        if (!use_growth_scale || !params.value("disable_grid_expansion", false) ||
+            !resume_surf ||
+            !resume_surf->meta.contains("_growth_source_width") ||
+            !resume_surf->meta.contains("_growth_source_height")) {
+            return {};
+        }
+        return cv::Size(
+            resume_surf->meta["_growth_source_width"].get_int(),
+            resume_surf->meta["_growth_source_height"].get_int());
+    };
+
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
     if (params.contains("neural_socket")) {
@@ -3181,18 +3415,27 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     // Load normal grid first if provided, so we can use its spiral-step
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
     if (params.contains("normal_grid_path")) {
-        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get_string());
+        const int normal_grid_level = std::clamp(
+            params.value("normal_grid_level", params.value("normal_grid_scale", growth_scale_level)),
+            0,
+            5);
+        ngv = std::make_unique<vc::core::util::NormalGridVolume>(
+            params["normal_grid_path"].get_string(),
+            normal_grid_level);
+        std::cout << "Loaded normal grid level " << ngv->level()
+                  << " (coordinate_scale=" << ngv->coordinateScale()
+                  << ", output_spiral_step=" << ngv->outputSpiralStep()
+                  << ")" << std::endl;
     }
 
     // Determine step size with priority: explicit param > normal_grid > resume_surf > default
     float step;
     if (params.contains("step_size")) {
         step = params.value("step_size", 20.0f);
-    } else if (ngv) {
-        // Use normal grid's spiral-step as authoritative (handles legacy surfaces with wrong scale)
-        step = ngv->metadata()["spiral-step"].get_float();
     } else if (resume_surf) {
         step = 1.0f / resume_surf->scale()[0];
+    } else if (ngv) {
+        step = static_cast<float>(ngv->outputSpiralStep());
     } else {
         step = 20.0f;
     }
@@ -3200,7 +3443,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     // Validate step matches normal grid if explicit step_size was provided
     if (ngv && params.contains("step_size")) {
-        float ngv_step = ngv->metadata()["spiral-step"].get_float();
+        float ngv_step = static_cast<float>(ngv->outputSpiralStep());
         if (std::abs(ngv_step - step) > 1e-6) {
             throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
         }
@@ -3250,8 +3493,22 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
         int gen_diff = std::max(0, stop_gen - start_gen);
-        w = resume_generations.cols + 2 * gen_diff + 50;
-        h = resume_generations.rows + 2 * gen_diff + 50;
+        const bool disable_grid_expansion = params.value("disable_grid_expansion", false);
+        const int grow_extra_cols = std::max(0, params.value("grow_extra_cols", 0));
+        const int grow_extra_rows = std::max(0, params.value("grow_extra_rows", 0));
+        const int grow_max_extra_cols = std::max(grow_extra_cols, params.value("grow_max_extra_cols", gen_diff));
+        const int grow_max_extra_rows = std::max(grow_extra_rows, params.value("grow_max_extra_rows", gen_diff));
+        const int extra_cols = disable_grid_expansion ? grow_extra_cols : grow_max_extra_cols;
+        const int extra_rows = disable_grid_expansion ? grow_extra_rows : grow_max_extra_rows;
+        constexpr int grid_margin_each_side = 25;
+        w = resume_generations.cols + 2 * extra_cols + 2 * grid_margin_each_side;
+        h = resume_generations.rows + 2 * extra_rows + 2 * grid_margin_each_side;
+        std::cout << "GrowPatch work grid " << w << "x" << h
+                  << " (resume=" << resume_generations.cols << "x" << resume_generations.rows
+                  << ", extra_cols=" << extra_cols
+                  << ", extra_rows=" << extra_rows
+                  << ", disable_grid_expansion=" << disable_grid_expansion
+                  << ")" << std::endl;
     } else {
         // Calculate the maximum possible size the patch might grow to
         //FIXME show and handle area edge!
@@ -3461,7 +3718,19 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         surf->meta["elapsed_time_s"] = f_timer.seconds();
 
         delete timer;
-        return surf;
+        cv::Size exact_output_size;
+        if (use_growth_scale &&
+            resume_surf->meta.contains("_growth_source_width") &&
+            resume_surf->meta.contains("_growth_source_height")) {
+            exact_output_size = cv::Size(
+                resume_surf->meta["_growth_source_width"].get_int(),
+                resume_surf->meta["_growth_source_height"].get_int());
+        }
+        return make_output_scale_surface(
+            surf,
+            output_surface_scale,
+            use_growth_scale ? growth_scale_factor : 1,
+            exact_output_size);
     }
 
     
@@ -3585,7 +3854,11 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             // Get raw points size (channels are stored at this resolution)
             const cv::Mat_<cv::Vec3f>* new_points = surf->rawPointsPtr();
             if (!new_points || new_points->empty()) {
-                return surf;
+                return make_output_scale_surface(
+                    surf,
+                    output_surface_scale,
+                    use_growth_scale ? growth_scale_factor : 1,
+                    exact_growth_output_size_for_fill());
             }
             const cv::Size raw_size = new_points->size();
 
@@ -3665,7 +3938,11 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
-        return surf;
+        return make_output_scale_surface(
+            surf,
+            output_surface_scale,
+            use_growth_scale ? growth_scale_factor : 1,
+            exact_growth_output_size_for_fill());
     };
 
     cv::Vec3f vx = {1,0,0};
@@ -3695,19 +3972,19 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
 
-        if (allowed_growth_mask && !allowed_growth_mask->empty()) {
-            if (allowed_growth_mask->rows != resume_points.rows || allowed_growth_mask->cols != resume_points.cols) {
+        if (effective_allowed_growth_mask && !effective_allowed_growth_mask->empty()) {
+            if (effective_allowed_growth_mask->rows != resume_points.rows || effective_allowed_growth_mask->cols != resume_points.cols) {
                 throw std::runtime_error("allowed growth mask size does not match resume surface size.");
             }
-            if (allowed_growth_mask->channels() != 1) {
+            if (effective_allowed_growth_mask->channels() != 1) {
                 throw std::runtime_error("allowed growth mask must be single-channel.");
             }
             trace_data.allowed_growth_mask = cv::Mat_<uchar>(trace_params.state.size(), static_cast<uchar>(0));
             cv::Mat normalized_mask;
-            if (allowed_growth_mask->type() == CV_8UC1) {
-                normalized_mask = *allowed_growth_mask;
+            if (effective_allowed_growth_mask->type() == CV_8UC1) {
+                normalized_mask = *effective_allowed_growth_mask;
             } else {
-                allowed_growth_mask->convertTo(normalized_mask, CV_8U);
+                effective_allowed_growth_mask->convertTo(normalized_mask, CV_8U);
             }
 
             cv::Mat nonzero_mask;
@@ -3772,7 +4049,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                       << " points newer than rewind generation " << start_gen << "." << std::endl;
         }
 
-        trace_data.point_correction = PointCorrection(corrections);
+        trace_data.point_correction = PointCorrection(
+            corrections,
+            use_growth_scale ? (1.0f / static_cast<float>(growth_scale_factor)) : 1.0f);
 
         if (trace_data.point_correction.isValid()) {
             trace_data.point_correction.init(trace_params.dpoints);

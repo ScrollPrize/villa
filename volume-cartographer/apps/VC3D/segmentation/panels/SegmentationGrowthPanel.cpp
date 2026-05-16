@@ -104,6 +104,15 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     dirRow->addWidget(_spinGrowthSteps);
     dirRow->addSpacing(16);
 
+    auto* scaleLabel = new QLabel(tr("Growth scale:"), _groupGrowth);
+    _spinGrowthScale = new QSpinBox(_groupGrowth);
+    _spinGrowthScale->setRange(0, 5);
+    _spinGrowthScale->setSingleStep(1);
+    _spinGrowthScale->setToolTip(tr("Tracer working scale. 0 uses the original tifxyz grid; higher values grow on coarser grids and return to the original scale."));
+    dirRow->addWidget(scaleLabel);
+    dirRow->addWidget(_spinGrowthScale);
+    dirRow->addSpacing(16);
+
     auto* dirLabel = new QLabel(tr("Allowed directions:"), _groupGrowth);
     dirRow->addWidget(dirLabel);
     auto addDirectionCheckbox = [&](const QString& text) {
@@ -179,7 +188,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         auto* normalGridRow = new QHBoxLayout();
         _lblNormalGrid = new QLabel(this);
         _lblNormalGrid->setTextFormat(Qt::RichText);
-        _lblNormalGrid->setToolTip(tr("Shows whether precomputed normal grids are available for push/pull tools."));
+        _lblNormalGrid->setToolTip(tr("Shows whether precomputed normal grids are available for tracer growth."));
         _lblNormalGrid->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         normalGridRow->addWidget(_lblNormalGrid, 0);
 
@@ -188,6 +197,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         _editNormalGridPath->setClearButtonEnabled(false);
         _editNormalGridPath->setVisible(false);
         normalGridRow->addWidget(_editNormalGridPath, 1);
+
         panelLayout->addLayout(normalGridRow);
     }
 
@@ -431,6 +441,14 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
 
     connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this](int value) { applyGrowthSteps(value, true, true); });
+
+    connect(_spinGrowthScale, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (_restoringSettings) return;
+        const int scale = std::clamp(value, 0, 5);
+        if (_growthScale == scale) return;
+        _growthScale = scale;
+        writeSetting(QStringLiteral("growth_scale"), _growthScale);
+    });
 
     connect(_comboGrowthMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int index) {
@@ -906,6 +924,9 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     if (_spinGrowthSteps) {
         _spinGrowthSteps->setVisible(!manual);
     }
+    if (_spinGrowthScale) {
+        _spinGrowthScale->setVisible(!manual && _growthMethod != SegmentationGrowthMethod::PatchTracer);
+    }
     if (_btnGrow) {
         _btnGrow->setVisible(!manual);
     }
@@ -970,6 +991,9 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     }
     if (_spinGrowthSteps) {
         _spinGrowthSteps->setEnabled(enableGrowth);
+    }
+    if (_spinGrowthScale) {
+        _spinGrowthScale->setEnabled(enableGrowth && _growthMethod != SegmentationGrowthMethod::PatchTracer);
     }
     if (_btnGrow) {
         _btnGrow->setEnabled(enableGrowth);
@@ -1285,6 +1309,7 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
     }
 
     _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
+    _growthScale = std::clamp(settings.value(QStringLiteral("growth_scale"), _growthScale).toInt(), 0, 5);
     _patchTracerSourcePath = settings.value(QStringLiteral("patch_tracer_source_path"), QString()).toString();
     _patchTracerUmbilicusPath = settings.value(QStringLiteral("patch_tracer_umbilicus_path"), QString()).toString();
     _patchTracerUmbilicusPathUserSet = settings.value(QStringLiteral("patch_tracer_umbilicus_path_user_set"), false).toBool();
@@ -1320,6 +1345,10 @@ void SegmentationGrowthPanel::syncUiState(bool editingEnabled, bool growthInProg
         const QSignalBlocker blocker(_spinGrowthSteps);
         _spinGrowthSteps->setMaximum(growthStepMaximumForMethod(_growthMethod));
         _spinGrowthSteps->setValue(_growthSteps);
+    }
+    if (_spinGrowthScale) {
+        const QSignalBlocker blocker(_spinGrowthScale);
+        _spinGrowthScale->setValue(_growthScale);
     }
 
     if (_comboGrowthMethod) {

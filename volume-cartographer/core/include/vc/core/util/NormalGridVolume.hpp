@@ -26,6 +26,7 @@ namespace vc::core::util {
         };
 
         explicit NormalGridVolume(const std::string& path);
+        NormalGridVolume(const std::string& path, int level);
         ~NormalGridVolume();
         NormalGridVolume(NormalGridVolume&&) noexcept;
         NormalGridVolume& operator=(NormalGridVolume&&) noexcept;
@@ -41,6 +42,9 @@ namespace vc::core::util {
         std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const;
         CacheStats cacheStats() const;
         void resetCacheStats() const;
+        double coordinateScale() const;
+        double outputSpiralStep() const;
+        int level() const;
 
     public:
         const utils::Json& metadata() const;
