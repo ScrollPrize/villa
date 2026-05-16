@@ -25,12 +25,13 @@ apt-get install -y \
     build-essential git clang llvm ninja-build lld cmake pkg-config \
     qt6-base-dev libboost-system-dev libboost-program-options-dev \
     libceres-dev libsuitesparse-dev \
+    libcgal-dev libmpfr-dev libgmp-dev \
     libopencv-dev libopencv-contrib-dev \
     libblosc-dev libcurl4-openssl-dev \
     libavahi-client-dev nlohmann-json3-dev \
     liblz4-dev libtiff-dev \
     zlib1g-dev gfortran libopenblas-dev liblapack-dev liblapacke-dev libomp-dev \
-    libscotch-dev libhwloc-dev \
+    libscotch-dev libscotchmetis-dev libhwloc-dev \
     file curl unzip ca-certificates bzip2 wget jq rclone fuse gimp \
     desktop-file-utils \
     mdadm nvme-cli
