@@ -169,9 +169,75 @@ def hessian(volume, gauss_sigma=2, sigma=6):
     
     return joint_hessian, zero_mask
 
+def _eigvalsh_sym3x3(matrices):
+    """Vectorised eigenvalues of batched real symmetric 3x3 matrices.
+
+    Closed-form via Smith's method (Deledalle et al. 2017, "Closed-form
+    expressions of the eigen decomposition of 2 x 2 and 3 x 3 Hermitian
+    matrices"). Operates elementwise over a leading batch shape, so it
+    avoids the cuSolver batched eigvalsh path that returns
+    CUSOLVER_STATUS_INVALID_VALUE on large batches (>~1M matrices).
+
+    Parameters
+    ----------
+    matrices : array of shape (..., 3, 3)
+        Each (3, 3) sub-array must be symmetric. Only the upper triangle
+        (positions 00, 11, 22, 01, 02, 12) is read.
+
+    Returns
+    -------
+    eigvals : array of shape (..., 3)
+        Eigenvalues in ascending order along the last axis.
+    """
+    a00 = matrices[..., 0, 0]
+    a11 = matrices[..., 1, 1]
+    a22 = matrices[..., 2, 2]
+    a01 = matrices[..., 0, 1]
+    a02 = matrices[..., 0, 2]
+    a12 = matrices[..., 1, 2]
+
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    q = (a00 + a11 + a22) / 3.0
+
+    da = a00 - q
+    db = a11 - q
+    dc = a22 - q
+    p2 = da * da + db * db + dc * dc + 2.0 * p1
+    p = xp.sqrt(p2 / 6.0)
+
+    # Substitute a safe denominator where p == 0 (matrix is a multiple of
+    # the identity); the diagonal-case branch below overwrites those
+    # entries with the correctly sorted diagonal values.
+    p_safe = xp.where(p == 0, 1.0, p)
+    b00 = da / p_safe
+    b11_ = db / p_safe
+    b22_ = dc / p_safe
+    b01 = a01 / p_safe
+    b02 = a02 / p_safe
+    b12 = a12 / p_safe
+
+    det_b = (
+        b00 * (b11_ * b22_ - b12 * b12)
+        - b01 * (b01 * b22_ - b12 * b02)
+        + b02 * (b01 * b12 - b11_ * b02)
+    )
+    r = xp.clip(det_b / 2.0, -1.0, 1.0)
+    phi = xp.arccos(r) / 3.0
+
+    eig3 = q + 2.0 * p * xp.cos(phi)
+    eig1 = q + 2.0 * p * xp.cos(phi + 2.0 * math.pi / 3.0)
+    eig2 = 3.0 * q - eig1 - eig3
+
+    diag_eigs = xp.sort(xp.stack([a00, a11, a22], axis=-1), axis=-1)
+    computed_eigs = xp.stack([eig1, eig2, eig3], axis=-1)
+
+    is_diag = (p1 == 0)[..., None]
+    return xp.where(is_diag, diag_eigs, computed_eigs)
+
+
 def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
     joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
-    eigvals = xp.linalg.eigvalsh(joint_hessian, "U")
+    eigvals = _eigvalsh_sym3x3(joint_hessian)
     # Sort in increasing size of the absolute value of the eigenvalues
     idxs = xp.argsort(xp.abs(eigvals), axis=-1)
     eigvals = xp.take_along_axis(eigvals, idxs, axis=-1)
@@ -212,7 +278,7 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
     - vesselness: 3D array representing vesselness probability at each voxel.
     """
     joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
-    eigvals = xp.linalg.eigvalsh(joint_hessian, "U")
+    eigvals = _eigvalsh_sym3x3(joint_hessian)
     # Sort eigenvalues by magnitude (ascending order)
     idxs = xp.argsort(xp.abs(eigvals), axis=-1)
     eigvals = xp.take_along_axis(eigvals, idxs, axis=-1)

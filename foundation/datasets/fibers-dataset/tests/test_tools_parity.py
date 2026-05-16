@@ -146,6 +146,48 @@ def test_nms_3d_parity(rng, monkeypatch):
     )
 
 
+def test_eigvalsh_sym3x3_matches_numpy(rng, force_numpy_backend):
+    """The closed-form 3x3 symmetric eigvals helper agrees with numpy.linalg.eigvalsh."""
+    matrices_raw = rng.standard_normal((50, 3, 3))
+    matrices_sym = 0.5 * (matrices_raw + matrices_raw.transpose(0, 2, 1))
+
+    closed_form = tools._eigvalsh_sym3x3(matrices_sym)
+    lapack = np.linalg.eigvalsh(matrices_sym)  # numpy returns ascending order
+
+    np.testing.assert_allclose(closed_form, lapack, rtol=1e-6, atol=1e-7)
+
+
+def test_eigvalsh_sym3x3_handles_diagonal_and_zero(force_numpy_backend):
+    """Diagonal and all-zero matrices are not handled by the closed-form division."""
+    matrices = np.stack(
+        [
+            np.diag([1.0, 2.0, 3.0]),
+            np.diag([-5.0, 0.0, 5.0]),
+            np.zeros((3, 3)),
+            np.eye(3) * 7.0,
+        ]
+    )
+    out = tools._eigvalsh_sym3x3(matrices)
+    expected = np.linalg.eigvalsh(matrices)
+    np.testing.assert_allclose(out, expected, rtol=1e-10, atol=1e-12)
+
+
+@requires_cupy
+def test_eigvalsh_sym3x3_parity(rng, monkeypatch):
+    matrices_raw = rng.standard_normal((50, 3, 3)).astype(np.float64)
+    matrices_sym = 0.5 * (matrices_raw + matrices_raw.transpose(0, 2, 1))
+
+    monkeypatch.setattr(tools, "xp", np)
+    monkeypatch.setattr(tools, "xndimage", scipy_ndimage)
+    np_out = tools._eigvalsh_sym3x3(matrices_sym)
+
+    monkeypatch.setattr(tools, "xp", cp)
+    monkeypatch.setattr(tools, "xndimage", cupy_ndimage)
+    cp_out = cp.asnumpy(tools._eigvalsh_sym3x3(cp.asarray(matrices_sym)))
+
+    np.testing.assert_allclose(np_out, cp_out, rtol=1e-6, atol=1e-7)
+
+
 @requires_cupy
 def test_hessian_parity(small_volume, monkeypatch):
     monkeypatch.setattr(tools, "xp", np)
