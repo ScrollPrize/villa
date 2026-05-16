@@ -126,9 +126,15 @@ class VesuviusVolume:
         try:
             actual_dims = tuple(chunk_ptr.contents.dims)
             size = actual_dims[0] * actual_dims[1] * actual_dims[2]
+            
+            # Dynamic dtype support
+            dtype_str = self.metadata.dtype.decode('utf-8').strip('\x00')
+            np_dtype = np.dtype(dtype_str)
+            itemsize = np_dtype.itemsize
+            
             data_addr = ctypes.addressof(chunk_ptr.contents) + ctypes.sizeof(ctypes.c_int * 3)
-            float_array = (ctypes.c_float * size).from_address(data_addr)
-            return np.ctypeslib.as_array(float_array).copy().reshape(actual_dims)
+            byte_array = (ctypes.c_char * (size * itemsize)).from_address(data_addr)
+            return np.frombuffer(byte_array, dtype=np_dtype).copy().reshape(actual_dims)
         finally:
             _lib.vs_chunk_free(chunk_ptr)
 
