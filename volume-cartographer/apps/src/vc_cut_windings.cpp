@@ -476,25 +476,15 @@ int main(int argc, char* argv[])
         std::vector<std::pair<int, int>> row_bounds(static_cast<size_t>(points->rows));
         int crop_c0 = valid_c1;
         int crop_c1 = valid_c0;
-        int crop_r0 = points->rows;
-        int crop_r1 = -1;
         for (int r = 0; r < points->rows; ++r) {
-            auto [row_c0, row_c1] = slice_row_bounds(
-                slice, row_cuts.curves, r, valid_c0, valid_c1);
             int valid_row_c0 = 0;
             int valid_row_c1 = points->cols - 1;
             if (!row_valid_col_range(*points, r, valid_row_c0, valid_row_c1)) {
                 row_bounds[static_cast<size_t>(r)] = {1, 0};
                 continue;
             }
-            row_c0 = std::max({row_c0, slice.c0, valid_row_c0});
-            row_c1 = std::min({row_c1, slice.c1, valid_row_c1});
-            if (row_c1 < row_c0) {
-                const int fallback_c0 = std::max(slice.c0, valid_row_c0);
-                const int fallback_c1 = std::min(slice.c1, valid_row_c1);
-                row_c0 = fallback_c0;
-                row_c1 = fallback_c1;
-            }
+            int row_c0 = std::max(slice.c0, valid_row_c0);
+            int row_c1 = std::min(slice.c1, valid_row_c1);
 
             int actual_row_c0 = 0;
             int actual_row_c1 = points->cols - 1;
@@ -510,16 +500,16 @@ int main(int argc, char* argv[])
             if (row_c1 >= row_c0) {
                 crop_c0 = std::min(crop_c0, row_c0);
                 crop_c1 = std::max(crop_c1, row_c1);
-                crop_r0 = std::min(crop_r0, r);
-                crop_r1 = std::max(crop_r1, r);
             }
         }
 
-        if (crop_c1 < crop_c0 || crop_r1 < crop_r0) {
+        if (crop_c1 < crop_c0) {
             std::cerr << "warning: skipping empty winding at cols " << slice.c0 << ".." << slice.c1 << "\n";
             continue;
         }
 
+        const int crop_r0 = 0;
+        const int crop_r1 = points->rows - 1;
         const cv::Rect rect(crop_c0, crop_r0, crop_c1 - crop_c0 + 1, crop_r1 - crop_r0 + 1);
         cv::Mat_<cv::Vec3f> crop = (*points)(rect).clone();
         for (int r = 0; r < crop.rows; ++r) {
@@ -551,6 +541,7 @@ int main(int argc, char* argv[])
         }
 
         std::cout << name.str() << ": cols " << crop_c0 << ".." << crop_c1
+                  << " rows " << crop_r0 << ".." << crop_r1
                   << " mean_radius " << slice.radius
                   << " -> " << out_path << "\n";
         ++written;
