@@ -1,3 +1,7 @@
+import argparse
+import json
+import os
+import pickle
 from pathlib import Path
 import tempfile
 from datetime import datetime
@@ -5,9 +9,11 @@ import gc
 import hashlib
 import re
 import shutil
+import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import zarr
 from tqdm import tqdm
@@ -26,22 +32,26 @@ from vesuvius.neural_tracing.nets.models import load_checkpoint
 from vesuvius.tifxyz import read_tifxyz
 
 
-TIFXYZ_PATH = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces/test3"
-VOLUME_PATH = "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/"
+TIFXYZ_PATH = None
+VOLUME_PATH = "auto"
 VOLUME_SCALE = 0
 VOLUME_CACHE_DIR = "/tmp/vesuvius-volume-cache"
-CHECKPOINT_PATH = "/home/sean/Downloads/ckpt_150000.pth"
+VOLUME_CACHE_RETRY_SECONDS = 0.0
+CHECKPOINT_PATH = None
 
 # Keep None unless intentionally debugging shape mismatches. The default reads
 # the checkpoint crop size so inference matches the model patch size.
 CROP_SIZE = None
 BATCH_SIZE = 1
 DEVICE = "cuda"
+COMPILE_MODEL = True
 
 OVERLAP_FRAC = 0.5
 OUTPUT_ZARR_PATH = None
-OUTPUT_TIFXYZ_DIR = "/home/sean/Documents/volpkgs/s1_2um.volpkg/traces"
-OUTPUT_TIFXYZ_VOXEL_SIZE_UM = "2.24"
+OUTPUT_TIFXYZ_DIR = None
+OUTPUT_TIFXYZ_VOXEL_SIZE_UM = None
+RUN_OUTPUT_DIR = None
+RUN_TIMESTAMP = None
 MERGE_OUTPUTS_CHUNK_SIZE = 256
 MERGE_OUTPUTS_MMAP_DIR = "/tmp/streamline_tmp_outputs/"
 GEOMEDIAN_VECTOR_OUTPUTS = ("velocity_dir", "surface_attract")
@@ -71,6 +81,238 @@ USE_EDGE_SUPPORT_SEEDS = True
 EDGE_SUPPORT_OFFSETS_FULL_RES = (-1.0, 0.0, 1.0)
 EDGE_SUPPORT_WEIGHTS = (0.25, 0.5, 0.25)
 EDGE_SUPPORT_REQUIRE_CENTER_ACTIVE = True
+STREAMLINE_DENSE_FIELD_MAX_BYTES = 2 * 1024**3
+
+
+class _DistributedContext:
+    def __init__(
+        self,
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        backend="none",
+        device=None,
+        initialized_here=False,
+    ):
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self.local_rank = int(local_rank)
+        self.backend = str(backend)
+        self.device = device
+        self.initialized_here = bool(initialized_here)
+
+    @property
+    def is_distributed(self):
+        return self.world_size > 1
+
+    @property
+    def is_rank0(self):
+        return self.rank == 0
+
+
+def _parse_int_env(env, name, default):
+    value = env.get(name)
+    if value is None or str(value).strip() == "":
+        return int(default)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got {value!r}") from exc
+
+
+def _distributed_context_from_env(env=None):
+    env = os.environ if env is None else env
+    world_size = _parse_int_env(env, "WORLD_SIZE", 1)
+    rank = _parse_int_env(env, "RANK", 0)
+    local_rank = _parse_int_env(env, "LOCAL_RANK", rank if world_size > 1 else 0)
+    if world_size < 1:
+        raise ValueError(f"WORLD_SIZE must be >= 1, got {world_size}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"RANK must be in [0, WORLD_SIZE), got rank={rank}, world_size={world_size}")
+    if local_rank < 0:
+        raise ValueError(f"LOCAL_RANK must be >= 0, got {local_rank}")
+    return _DistributedContext(world_size=world_size, rank=rank, local_rank=local_rank)
+
+
+def _distributed_device_for_args(args_device, context):
+    requested = str(args_device)
+    if context.is_distributed and requested.startswith("cuda"):
+        return f"cuda:{context.local_rank}"
+    return requested
+
+
+def _resolve_distributed_backend(requested_backend, device):
+    backend = str(requested_backend or "auto").strip().lower()
+    if backend == "auto":
+        return "nccl" if str(device).startswith("cuda") else "gloo"
+    if backend not in ("nccl", "gloo"):
+        raise ValueError(f"Unsupported distributed backend {requested_backend!r}; expected auto, nccl, or gloo.")
+    return backend
+
+
+def _validate_distributed_args(args, context):
+    if context.is_distributed and bool(args.show_napari):
+        raise ValueError("--show-napari is not supported with torchrun/distributed inference.")
+
+
+def _initialize_distributed(args):
+    context = _distributed_context_from_env()
+    device = _distributed_device_for_args(args.device, context)
+    backend = _resolve_distributed_backend(getattr(args, "distributed_backend", "auto"), device)
+    context.device = device
+    context.backend = backend if context.is_distributed else "none"
+    _validate_distributed_args(args, context)
+
+    if not context.is_distributed:
+        return context
+
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available, but WORLD_SIZE > 1.")
+    if str(device).startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"Requested distributed CUDA device {device!r}, but CUDA is not available.")
+        if context.local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={context.local_rank} is outside available CUDA devices "
+                f"({torch.cuda.device_count()})."
+            )
+        torch.cuda.set_device(torch.device(device))
+    if backend == "nccl" and not str(device).startswith("cuda"):
+        raise ValueError("NCCL distributed backend requires a CUDA device.")
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+        context.initialized_here = True
+    return context
+
+
+def _destroy_distributed(context):
+    if (
+        context is not None
+        and context.initialized_here
+        and dist.is_available()
+        and dist.is_initialized()
+    ):
+        dist.destroy_process_group()
+
+
+def _should_write_outputs(context):
+    return context is None or context.is_rank0
+
+
+def _broadcast_object_from_rank0(value, context):
+    if context is None or not context.is_distributed:
+        return value
+    values = [value if context.is_rank0 else None]
+    dist.broadcast_object_list(values, src=0)
+    return values[0]
+
+
+def _wait_for_tifxyz_output(tifxyz_path, timeout_seconds=24 * 60 * 60, poll_seconds=2.0):
+    tifxyz_path = Path(tifxyz_path)
+    required = [tifxyz_path / name for name in ("meta.json", "x.tif", "y.tif", "z.tif")]
+    deadline = time.monotonic() + float(timeout_seconds)
+    while True:
+        if all(path.exists() for path in required):
+            return tifxyz_path
+        if time.monotonic() > deadline:
+            missing = [str(path) for path in required if not path.exists()]
+            raise TimeoutError(f"Timed out waiting for tifxyz output {tifxyz_path}; missing: {missing}")
+        time.sleep(float(poll_seconds))
+
+
+def _gather_object_to_rank0(value, context):
+    if context is None or not context.is_distributed:
+        return [value]
+    gathered = [None for _ in range(context.world_size)] if context.is_rank0 else None
+    dist.gather_object(value, object_gather_list=gathered, dst=0)
+    return gathered
+
+
+def _distributed_payload_dir(payload_tag):
+    base_dir = Path(RUN_OUTPUT_DIR) if RUN_OUTPUT_DIR is not None else Path(tempfile.gettempdir())
+    tag = "default" if payload_tag is None else str(payload_tag)
+    safe_tag = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in tag)
+    return base_dir / ".infer_streamline_dist_payloads" / safe_tag
+
+
+def _prepare_distributed_payload_dir(context, payload_tag):
+    payload_dir = _distributed_payload_dir(payload_tag)
+    if context.is_rank0 and payload_dir.exists():
+        shutil.rmtree(payload_dir)
+    if context.is_distributed:
+        dist.barrier()
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    if context.is_distributed:
+        dist.barrier()
+    return payload_dir
+
+
+def _write_payload_ref(payload, payload_dir, context):
+    if payload is None:
+        return None
+    payload_path = payload_dir / (
+        f"batch_{int(payload['batch_index']):08d}_rank_{int(context.rank):04d}.pkl"
+    )
+    with open(payload_path, "wb") as fp:
+        pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
+    return {
+        "batch_index": int(payload["batch_index"]),
+        "path": str(payload_path),
+    }
+
+
+def _read_payload_ref(payload_ref):
+    with open(payload_ref["path"], "rb") as fp:
+        return pickle.load(fp)
+
+
+def _cleanup_payload_ref(payload_ref):
+    if payload_ref is None:
+        return
+    try:
+        Path(payload_ref["path"]).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _batch_specs_for_count(item_count, batch_size):
+    item_count = int(item_count)
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    return [
+        {
+            "batch_index": batch_index,
+            "start": start,
+            "stop": min(start + batch_size, item_count),
+        }
+        for batch_index, start in enumerate(range(0, item_count, batch_size))
+    ]
+
+
+def _assigned_batch_specs(batch_specs, rank, world_size):
+    rank = int(rank)
+    world_size = int(world_size)
+    if world_size <= 0:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank must be in [0, world_size), got rank={rank}, world_size={world_size}")
+    return [
+        spec
+        for spec in batch_specs
+        if int(spec["batch_index"]) % world_size == rank
+    ]
+
+
+def _rank_batch_assignment_summary(total_batches, world_size):
+    batch_specs = _batch_specs_for_count(total_batches, 1)
+    return {
+        str(rank): [
+            int(spec["batch_index"])
+            for spec in _assigned_batch_specs(batch_specs, rank, world_size)
+        ]
+        for rank in range(int(world_size))
+    }
 
 
 _DIRECTION_SPECS = {
@@ -116,6 +358,13 @@ def _get_growth_context(grow_direction):
 
 def _valid_surface_mask(zyx_grid):
     return np.isfinite(zyx_grid).all(axis=-1) & ~(zyx_grid == -1).all(axis=-1)
+
+
+def _sanitize_surface_validity(zyx_grid, reader_valid=None):
+    valid = _valid_surface_mask(np.asarray(zyx_grid))
+    if reader_valid is not None:
+        valid &= np.asarray(reader_valid, dtype=bool)
+    return valid
 
 
 def _get_cond_edge(cond_zyxs, cond_direction, cond_valid=None):
@@ -164,15 +413,15 @@ def get_cond_edge_bboxes(
 ):
     # Build center-out crop anchors along the conditioning edge. Each chunk grows
     # while its XYZ span still fits in one crop-sized bbox.
-    edge = _get_cond_edge(cond_zyxs, cond_direction, cond_valid=cond_valid)
+    full_edge = _get_cond_edge(cond_zyxs, cond_direction, cond_valid=cond_valid)
 
-    edge_valid = ~(edge == -1).all(axis=1)
+    edge_valid = ~(full_edge == -1).all(axis=1)
     if not edge_valid.any():
-        return [], edge
-    edge = edge[edge_valid]
+        return [], full_edge
+    edge = full_edge[edge_valid]
     n_edge = edge.shape[0]
     if n_edge == 0:
-        return [], edge
+        return [], full_edge
 
     crop_size_arr = np.asarray(crop_size, dtype=np.int64)
 
@@ -254,7 +503,7 @@ def get_cond_edge_bboxes(
     _append_chunks(first_chunks)
     _append_chunks(second_chunks)
 
-    return bboxes, edge
+    return bboxes, full_edge
 
 
 def _bbox_to_exclusive_world_bbox(bbox):
@@ -371,8 +620,108 @@ def _load_surface_zyx(tifxyz_path):
     surface.use_stored_resolution()
     x, y, z, valid = surface[:]
     stored_zyxs = np.stack([z, y, x], axis=-1)
-    valid = np.asarray(valid, dtype=bool)
+    valid = _sanitize_surface_validity(stored_zyxs, valid)
     return stored_zyxs, valid
+
+
+def _read_tifxyz_meta(tifxyz_path):
+    meta_path = Path(tifxyz_path) / "meta.json"
+    if not meta_path.exists():
+        return {}
+    with open(meta_path, "rt", encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+def _normalize_match_token(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def _path_match_text(tifxyz_path):
+    tifxyz_path = Path(tifxyz_path)
+    meta = _read_tifxyz_meta(tifxyz_path)
+    parts = list(tifxyz_path.parts[-6:])
+    parts.extend(
+        str(meta.get(key, ""))
+        for key in ("scroll_source", "volume", "uuid", "seed_surface_id")
+    )
+    return _normalize_match_token(" ".join(parts))
+
+
+def _dataset_match_tokens(dataset):
+    tokens = []
+    segments_path = dataset.get("segments_path")
+    if segments_path:
+        tokens.append(Path(str(segments_path).rstrip("/")).name)
+    volume_path = dataset.get("volume_path")
+    if volume_path:
+        for part in re.split(r"[/_:.-]+", str(volume_path).rstrip("/")):
+            normalized = _normalize_match_token(part)
+            if normalized.startswith("pherc") or normalized.startswith("man"):
+                tokens.append(part)
+    out = []
+    seen = set()
+    for token in tokens:
+        normalized = _normalize_match_token(token)
+        if len(normalized) < 4 or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def resolve_volume_path_from_config(tifxyz_path, model_config, requested_volume_path="auto", requested_volume_scale=None):
+    if requested_volume_path and str(requested_volume_path).strip().lower() != "auto":
+        volume_scale = VOLUME_SCALE if requested_volume_scale is None else int(requested_volume_scale)
+        return str(requested_volume_path), volume_scale, None
+
+    target_text = _path_match_text(tifxyz_path)
+    datasets = list((model_config or {}).get("datasets") or [])
+    matches = []
+    for dataset in datasets:
+        if not dataset.get("volume_path"):
+            continue
+        tokens = _dataset_match_tokens(dataset)
+        if any(token and token in target_text for token in tokens):
+            matches.append(dataset)
+
+    if len(matches) != 1:
+        candidates = [
+            {
+                "volume_path": dataset.get("volume_path"),
+                "volume_scale": dataset.get("volume_scale"),
+                "segments_path": dataset.get("segments_path"),
+            }
+            for dataset in datasets
+        ]
+        raise ValueError(
+            "Unable to resolve --volume-path auto for "
+            f"{tifxyz_path}. Matched {len(matches)} checkpoint datasets. "
+            f"Pass --volume-path explicitly. Candidates: {candidates}"
+        )
+
+    matched = matches[0]
+    volume_scale = matched.get("volume_scale", VOLUME_SCALE)
+    if requested_volume_scale is not None:
+        volume_scale = int(requested_volume_scale)
+    return str(matched["volume_path"]), int(volume_scale), dict(matched)
+
+
+def derive_tifxyz_voxel_step(tifxyz_path):
+    meta = _read_tifxyz_meta(tifxyz_path)
+    scale = meta.get("scale")
+    if not isinstance(scale, (list, tuple)) or len(scale) < 2:
+        raise ValueError(
+            f"Cannot derive tifxyz voxel step from missing/invalid scale in {Path(tifxyz_path) / 'meta.json'}"
+        )
+    scale_x = float(scale[0])
+    scale_y = float(scale[1])
+    if scale_x <= 0.0 or scale_y <= 0.0:
+        raise ValueError(f"Invalid tifxyz scale {scale!r}; values must be positive.")
+    step_x = int(round(1.0 / scale_x))
+    step_y = int(round(1.0 / scale_y))
+    if step_x != step_y:
+        raise ValueError(f"Expected isotropic tifxyz scale, got {scale!r}.")
+    return float(step_x)
 
 
 def _crop_size_from_config(config):
@@ -388,7 +737,13 @@ def _crop_size_from_config(config):
 
 
 def _open_volume_array(volume_path, volume_scale):
-    root = open_zarr_group(volume_path, config={"volume_cache_dir": VOLUME_CACHE_DIR})
+    root = open_zarr_group(
+        volume_path,
+        config={
+            "volume_cache_dir": VOLUME_CACHE_DIR,
+            "volume_cache_retry_seconds": VOLUME_CACHE_RETRY_SECONDS,
+        },
+    )
     if isinstance(root, zarr.hierarchy.Group):
         scale_key = str(int(volume_scale))
         if scale_key not in root:
@@ -402,9 +757,12 @@ def _bbox_min_corner(bbox):
     return np.asarray([z_min, y_min, x_min], dtype=np.int64)
 
 
-def _output_zarr_path():
+def _output_zarr_path(iteration_idx=None):
     if OUTPUT_ZARR_PATH is not None:
         return Path(OUTPUT_ZARR_PATH)
+    if RUN_OUTPUT_DIR is not None:
+        iteration_idx = 1 if iteration_idx is None else int(iteration_idx)
+        return Path(RUN_OUTPUT_DIR) / "zarr" / f"iter_{iteration_idx:02d}.zarr"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Path(tempfile.gettempdir()) / f"infer_streamline_rowcol_{timestamp}.zarr"
 
@@ -412,12 +770,14 @@ def _output_zarr_path():
 def _output_tifxyz_dir():
     if OUTPUT_TIFXYZ_DIR is not None:
         return Path(OUTPUT_TIFXYZ_DIR)
+    if RUN_OUTPUT_DIR is not None:
+        return Path(RUN_OUTPUT_DIR) / "tifxyz"
     return Path(TIFXYZ_PATH).parent
 
 
 def _output_tifxyz_uuid(timestamp=None, iteration_idx=None, total_iterations=None):
     if timestamp is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = RUN_TIMESTAMP or datetime.now().strftime("%Y%m%d_%H%M%S")
     input_name = Path(TIFXYZ_PATH).name
     suffix = ""
     if total_iterations is not None and int(total_iterations) > 1:
@@ -484,7 +844,8 @@ def _tta_variants():
 
 def _run_model_once(model, inputs, amp_enabled, amp_dtype):
     if amp_enabled:
-        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+        autocast_device = "cuda" if str(DEVICE).startswith("cuda") else "cpu"
+        with torch.autocast(device_type=autocast_device, dtype=amp_dtype):
             outputs = model(inputs)
     else:
         outputs = model(inputs)
@@ -542,6 +903,76 @@ def _run_model_tta(model, inputs, amp_enabled, amp_dtype):
         output_name: output_sum / float(counts[output_name])
         for output_name, output_sum in accum.items()
     }
+
+
+def _model_amp_settings(model_config):
+    mixed_precision = str(model_config.get("mixed_precision", "no")).lower()
+    amp_enabled = mixed_precision in ("bf16", "fp16", "float16")
+    amp_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
+    return amp_enabled, amp_dtype
+
+
+def _run_voxelized_model_batch(model, voxelized_batch, volume_array, crop_size, cond_direction, amp_enabled, amp_dtype):
+    inputs = _prepare_rowcol_inputs(volume_array, voxelized_batch, crop_size, cond_direction)
+    with torch.inference_mode():
+        outputs = _run_model_tta(model, inputs, amp_enabled, amp_dtype)
+
+    outputs_np = {}
+    for output_name, output_value in outputs.items():
+        output_value = _collapse_output(output_value)
+        if output_value is None:
+            continue
+        outputs_np[str(output_name)] = output_value.detach().float().cpu().numpy()
+    return outputs_np
+
+
+def _run_bbox_batch(
+    model,
+    volume_array,
+    surface,
+    bboxes,
+    crop_size,
+    cond_direction,
+    stored_zyxs,
+    valid,
+    amp_enabled,
+    amp_dtype,
+    batch_spec,
+):
+    batch_bboxes = bboxes[int(batch_spec["start"]):int(batch_spec["stop"])]
+    voxelized_batch = upsample_voxelize_tifxyz_surface_in_bboxes(
+        surface,
+        batch_bboxes,
+        crop_size,
+        stored_zyxs=stored_zyxs,
+        valid=valid,
+    )
+    outputs_np = _run_voxelized_model_batch(
+        model,
+        voxelized_batch,
+        volume_array,
+        crop_size,
+        cond_direction,
+        amp_enabled,
+        amp_dtype,
+    )
+    return {
+        "batch_index": int(batch_spec["batch_index"]),
+        "start": int(batch_spec["start"]),
+        "stop": int(batch_spec["stop"]),
+        "bboxes": [tuple(int(v) for v in item["bbox"]) for item in voxelized_batch],
+        "outputs": outputs_np,
+        "voxelized_bbox_voxels": sum(int(item["voxels"].sum()) for item in voxelized_batch),
+    }
+
+
+def _accumulate_batch_payload(merger, payload):
+    voxelized_metadata = [
+        {"bbox": tuple(int(v) for v in bbox)}
+        for bbox in payload["bboxes"]
+    ]
+    for output_name, output_np in payload["outputs"].items():
+        merger.accumulate(output_name, output_np, voxelized_metadata)
 
 
 def _slice_len(s):
@@ -1089,25 +1520,214 @@ def _make_edge_support_seeds(edge_zyx, edge_axis_scale):
 class _TorchStreamlineFieldSampler:
     def __init__(self, velocity, attract, validity, device):
         self.device = torch.device(device)
-        fields = np.concatenate(
-            [
-                np.asarray(velocity, dtype=np.float32),
-                np.asarray(attract, dtype=np.float32),
-                np.asarray(validity, dtype=np.float32),
-            ],
-            axis=0,
+        self.velocity = velocity
+        self.attract = attract
+        self.validity = validity
+        self.depth = int(velocity.shape[1])
+        self.height = int(velocity.shape[2])
+        self.width = int(velocity.shape[3])
+        for name, field, channels in (
+            ("velocity_dir", velocity, 3),
+            ("surface_attract", attract, 3),
+            ("trace_validity", validity, 1),
+        ):
+            if len(field.shape) != 4 or field.shape[0] != channels:
+                raise RuntimeError(f"Expected {name} shape ({channels}, D, H, W), got {field.shape}")
+            if tuple(field.shape[1:]) != (self.depth, self.height, self.width):
+                raise RuntimeError(f"Field {name} spatial shape {field.shape[1:]} does not match velocity field.")
+
+        dense_bytes = sum(
+            int(np.prod(field.shape, dtype=np.int64)) * np.dtype(field.dtype).itemsize
+            for field in (velocity, attract, validity)
         )
-        self.field = torch.from_numpy(fields).to(device=self.device, dtype=torch.float32).unsqueeze(0)
-        _, channels, depth, height, width = self.field.shape
-        if channels != 7:
-            raise RuntimeError(f"Expected 7 streamline field channels, got {channels}")
-        self.depth = int(depth)
-        self.height = int(height)
-        self.width = int(width)
+        self._use_dense = dense_bytes <= int(STREAMLINE_DENSE_FIELD_MAX_BYTES)
+        self.field = None
+        if self._use_dense:
+            fields = np.concatenate(
+                [
+                    np.asarray(velocity, dtype=np.float32),
+                    np.asarray(attract, dtype=np.float32),
+                    np.asarray(validity, dtype=np.float32),
+                ],
+                axis=0,
+            )
+            self.field = torch.from_numpy(fields).to(device=self.device, dtype=torch.float32).unsqueeze(0)
+            _, channels, depth, height, width = self.field.shape
+            if channels != 7:
+                raise RuntimeError(f"Expected 7 streamline field channels, got {channels}")
+            self.depth = int(depth)
+            self.height = int(height)
+            self.width = int(width)
+
+    def _combined_channel(self, channel):
+        channel = int(channel)
+        if 0 <= channel < 3:
+            return self.velocity, channel
+        if 3 <= channel < 6:
+            return self.attract, channel - 3
+        if channel == 6:
+            return self.validity, 0
+        raise ValueError(f"Unexpected streamline field channel {channel}.")
+
+    def _combined_channel_segments(self, channel_start, channel_count):
+        segments = []
+        out_start = 0
+        while out_start < int(channel_count):
+            field, source_start = self._combined_channel(int(channel_start) + out_start)
+            length = 1
+            while out_start + length < int(channel_count):
+                next_field, next_source = self._combined_channel(int(channel_start) + out_start + length)
+                if next_field is not field or next_source != source_start + length:
+                    break
+                length += 1
+            segments.append((field, int(source_start), int(length), int(out_start)))
+            out_start += length
+        return segments
+
+    def _sample_lazy_field_segment(
+        self,
+        field,
+        source_start,
+        channel_count,
+        flat_point_idx,
+        flat_z,
+        flat_y,
+        flat_x,
+        flat_weight,
+        out_values,
+        out_start,
+    ):
+        chunks = getattr(field, "chunks", None)
+        if chunks is None or len(chunks) != 4:
+            raise RuntimeError("Lazy streamline sampling requires Zarr-style chunked fields.")
+        chunk_z, chunk_y, chunk_x = (int(v) for v in chunks[1:])
+        n_chunk_y = (self.height + chunk_y - 1) // chunk_y
+        n_chunk_x = (self.width + chunk_x - 1) // chunk_x
+        chunk_key = ((flat_z // chunk_z) * n_chunk_y + (flat_y // chunk_y)) * n_chunk_x + (flat_x // chunk_x)
+        order = np.argsort(chunk_key, kind="stable")
+        channel_slice = slice(int(source_start), int(source_start) + int(channel_count))
+
+        run_start = 0
+        while run_start < order.size:
+            run_end = run_start + 1
+            key = chunk_key[order[run_start]]
+            while run_end < order.size and chunk_key[order[run_end]] == key:
+                run_end += 1
+            idx = order[run_start:run_end]
+            z = flat_z[idx]
+            y = flat_y[idx]
+            x = flat_x[idx]
+            z_min = int(z.min())
+            y_min = int(y.min())
+            x_min = int(x.min())
+            z_max = int(z.max()) + 1
+            y_max = int(y.max()) + 1
+            x_max = int(x.max()) + 1
+            block = np.asarray(
+                field[channel_slice, z_min:z_max, y_min:y_max, x_min:x_max],
+                dtype=np.float32,
+            )
+            if block.ndim != 4 or block.shape[0] != int(channel_count):
+                raise RuntimeError(
+                    "Unexpected lazy field block shape "
+                    f"{block.shape}; expected ({int(channel_count)}, D, H, W)."
+                )
+            corner_values = block[:, z - z_min, y - y_min, x - x_min].T
+            weighted_values = flat_weight[idx, None].astype(np.float32, copy=False) * corner_values
+            local_points = flat_point_idx[idx]
+            for channel_offset in range(int(channel_count)):
+                np.add.at(
+                    out_values[:, int(out_start) + channel_offset],
+                    local_points,
+                    weighted_values[:, channel_offset],
+                )
+            run_start = run_end
+
+    def _sample_lazy(self, points_zyx, channel_start, channel_count):
+        if points_zyx.ndim != 2 or points_zyx.shape[1] != 3:
+            raise ValueError(f"points_zyx must be [N, 3], got {tuple(points_zyx.shape)}")
+
+        points_np = points_zyx.detach().cpu().numpy().astype(np.float32, copy=False)
+        n_points = int(points_np.shape[0])
+        finite = np.isfinite(points_np).all(axis=1)
+        safe = np.where(finite[:, None], points_np, 0.0)
+        in_bounds_np = (
+            finite
+            & (safe[:, 0] >= 0.0) & (safe[:, 0] <= self.depth - 1)
+            & (safe[:, 1] >= 0.0) & (safe[:, 1] <= self.height - 1)
+            & (safe[:, 2] >= 0.0) & (safe[:, 2] <= self.width - 1)
+        )
+        sampled_np = np.zeros((n_points, int(channel_count)), dtype=np.float32)
+        valid_idx = np.flatnonzero(in_bounds_np)
+        if valid_idx.size > 0:
+            points_valid = safe[valid_idx]
+            z0 = np.floor(points_valid[:, 0]).astype(np.int64)
+            y0 = np.floor(points_valid[:, 1]).astype(np.int64)
+            x0 = np.floor(points_valid[:, 2]).astype(np.int64)
+            z1 = np.minimum(z0 + 1, self.depth - 1)
+            y1 = np.minimum(y0 + 1, self.height - 1)
+            x1 = np.minimum(x0 + 1, self.width - 1)
+            wz = (points_valid[:, 0] - z0.astype(np.float32)).astype(np.float32)
+            wy = (points_valid[:, 1] - y0.astype(np.float32)).astype(np.float32)
+            wx = (points_valid[:, 2] - x0.astype(np.float32)).astype(np.float32)
+            z_indices = (z0, z1)
+            y_indices = (y0, y1)
+            x_indices = (x0, x1)
+            z_weights = (1.0 - wz, wz)
+            y_weights = (1.0 - wy, wy)
+            x_weights = (1.0 - wx, wx)
+            flat_point_idx = []
+            flat_z = []
+            flat_y = []
+            flat_x = []
+            flat_weight = []
+            for zi in (0, 1):
+                for yi in (0, 1):
+                    for xi in (0, 1):
+                        weight = z_weights[zi] * y_weights[yi] * x_weights[xi]
+                        nonzero = weight != 0.0
+                        if not bool(nonzero.any()):
+                            continue
+                        flat_point_idx.append(np.flatnonzero(nonzero).astype(np.int64, copy=False))
+                        flat_z.append(z_indices[zi][nonzero])
+                        flat_y.append(y_indices[yi][nonzero])
+                        flat_x.append(x_indices[xi][nonzero])
+                        flat_weight.append(weight[nonzero].astype(np.float32, copy=False))
+
+            if flat_point_idx:
+                flat_point_idx = np.concatenate(flat_point_idx)
+                flat_z = np.concatenate(flat_z).astype(np.int64, copy=False)
+                flat_y = np.concatenate(flat_y).astype(np.int64, copy=False)
+                flat_x = np.concatenate(flat_x).astype(np.int64, copy=False)
+                flat_weight = np.concatenate(flat_weight).astype(np.float32, copy=False)
+                sampled_valid = np.zeros((valid_idx.size, int(channel_count)), dtype=np.float32)
+                for field, source_start, segment_count, out_start in self._combined_channel_segments(
+                    channel_start,
+                    channel_count,
+                ):
+                    self._sample_lazy_field_segment(
+                        field,
+                        source_start,
+                        segment_count,
+                        flat_point_idx,
+                        flat_z,
+                        flat_y,
+                        flat_x,
+                        flat_weight,
+                        sampled_valid,
+                        out_start,
+                    )
+                sampled_np[valid_idx, :] = sampled_valid
+
+        sampled = torch.from_numpy(sampled_np).to(device=self.device, dtype=torch.float32)
+        in_bounds = torch.from_numpy(in_bounds_np).to(device=self.device, dtype=torch.bool)
+        return sampled, in_bounds
 
     def sample(self, points_zyx, channel_start, channel_count):
         if points_zyx.ndim != 2 or points_zyx.shape[1] != 3:
             raise ValueError(f"points_zyx must be [N, 3], got {tuple(points_zyx.shape)}")
+        if not self._use_dense:
+            return self._sample_lazy(points_zyx, channel_start, channel_count)
 
         points = points_zyx.to(device=self.device, dtype=torch.float32)
         finite = torch.isfinite(points).all(dim=1)
@@ -1779,7 +2399,7 @@ def save_merged_streamline_tifxyz(
 
 
 def _cleanup_temp_output_zarr(output_path):
-    if OUTPUT_ZARR_PATH is not None:
+    if OUTPUT_ZARR_PATH is not None or RUN_OUTPUT_DIR is not None:
         return
     output_path = Path(output_path)
     if not output_path.exists():
@@ -1787,43 +2407,150 @@ def _cleanup_temp_output_zarr(output_path):
     shutil.rmtree(output_path)
 
 
-def run_rowcol_bbox_inference(model, model_config, volume_array, voxelized_bboxes, crop_size, cond_direction, zarr_root):
-    window_min, window_shape = _merged_window_from_bboxes([item["bbox"] for item in voxelized_bboxes])
-    zarr_root.attrs["window_min_zyx"] = [int(v) for v in window_min]
-    zarr_root.attrs["window_shape_zyx"] = [int(v) for v in window_shape]
-    zarr_root.attrs["crop_size_zyx"] = [int(v) for v in crop_size]
-    zarr_root.attrs["cond_direction"] = str(cond_direction)
-    zarr_root.attrs["grow_direction"] = str(GROW_DIRECTION)
-    zarr_root.attrs["vector_merge_method"] = _vector_merge_method()
+def _store_iteration_geometry(output_root, bboxes, edge):
+    geometry = output_root.require_group("geometry")
+    bboxes = np.asarray(bboxes, dtype=np.int64).reshape(-1, 6)
+    edge = np.asarray(edge, dtype=np.float32).reshape(-1, 3)
+    if bboxes.shape[0] > 0:
+        geometry.create_dataset(
+            "bboxes",
+            data=bboxes,
+            chunks=(min(int(bboxes.shape[0]), 4096), 6),
+        )
+    if edge.shape[0] > 0:
+        geometry.create_dataset(
+            "edge_zyx",
+            data=edge,
+            chunks=(min(int(edge.shape[0]), 4096), 3),
+        )
 
-    mixed_precision = str(model_config.get("mixed_precision", "no")).lower()
-    amp_enabled = mixed_precision in ("bf16", "fp16", "float16")
-    amp_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
+def run_rowcol_bbox_inference(
+    model,
+    model_config,
+    volume_array,
+    surface,
+    bboxes,
+    crop_size,
+    cond_direction,
+    zarr_root,
+    stored_zyxs,
+    valid,
+    distributed_context=None,
+    payload_tag=None,
+):
+    context = distributed_context or _DistributedContext()
+    batch_specs = _batch_specs_for_count(len(bboxes), int(BATCH_SIZE))
+    assignment = _rank_batch_assignment_summary(len(batch_specs), context.world_size)
+    window_min, window_shape = _merged_window_from_bboxes(bboxes)
+
+    if context.is_rank0 and zarr_root is None:
+        raise ValueError("zarr_root is required on rank 0.")
+    if context.is_rank0:
+        zarr_root.attrs["window_min_zyx"] = [int(v) for v in window_min]
+        zarr_root.attrs["window_shape_zyx"] = [int(v) for v in window_shape]
+        zarr_root.attrs["crop_size_zyx"] = [int(v) for v in crop_size]
+        zarr_root.attrs["cond_direction"] = str(cond_direction)
+        zarr_root.attrs["grow_direction"] = str(GROW_DIRECTION)
+        zarr_root.attrs["vector_merge_method"] = _vector_merge_method()
+        zarr_root.attrs["distributed_world_size"] = int(context.world_size)
+        zarr_root.attrs["distributed_backend"] = str(context.backend)
+
+    amp_enabled, amp_dtype = _model_amp_settings(model_config)
     model.eval()
-    merger = _SparseChunkOutputMerger(
-        zarr_root,
-        window_min,
-        window_shape,
-        crop_size,
-        mmap_dir=MERGE_OUTPUTS_MMAP_DIR,
-        vector_merge_method=VECTOR_MERGE_METHOD,
-    )
 
-    batch_starts = range(0, len(voxelized_bboxes), int(BATCH_SIZE))
-    for start in tqdm(batch_starts, desc="Row/col bbox inference", unit="batch"):
-        batch = voxelized_bboxes[start:start + int(BATCH_SIZE)]
-        inputs = _prepare_rowcol_inputs(volume_array, batch, crop_size, cond_direction)
-        with torch.inference_mode():
-            outputs = _run_model_tta(model, inputs, amp_enabled, amp_dtype)
-        for output_name, output_value in outputs.items():
-            output_value = _collapse_output(output_value)
-            if output_value is None:
-                continue
-            output_np = output_value.detach().float().cpu().numpy()
-            merger.accumulate(output_name, output_np, batch)
+    merger = None
+    if context.is_rank0:
+        merger = _SparseChunkOutputMerger(
+            zarr_root,
+            window_min,
+            window_shape,
+            crop_size,
+            mmap_dir=MERGE_OUTPUTS_MMAP_DIR,
+            vector_merge_method=VECTOR_MERGE_METHOD,
+        )
 
-    return merger.finalize()
+    total_voxelized_bbox_voxels = 0
+    if not context.is_distributed:
+        for batch_spec in tqdm(batch_specs, desc="Row/col bbox inference", unit="batch"):
+            payload = _run_bbox_batch(
+                model,
+                volume_array,
+                surface,
+                bboxes,
+                crop_size,
+                cond_direction,
+                stored_zyxs,
+                valid,
+                amp_enabled,
+                amp_dtype,
+                batch_spec,
+            )
+            _accumulate_batch_payload(merger, payload)
+            total_voxelized_bbox_voxels += int(payload["voxelized_bbox_voxels"])
+        return {
+            "avg_group": merger.finalize(),
+            "voxelized_bbox_voxels": int(total_voxelized_bbox_voxels),
+            "batch_assignment": assignment,
+            "rank_batch_count": len(batch_specs),
+        }
+
+    payload_dir = _prepare_distributed_payload_dir(context, payload_tag)
+    try:
+        rounds = (len(batch_specs) + context.world_size - 1) // context.world_size
+        round_iter = tqdm(
+            range(rounds),
+            desc="Distributed row/col bbox inference",
+            unit="round",
+            disable=not context.is_rank0,
+        )
+        rank_batch_count = 0
+        for round_idx in round_iter:
+            batch_index = int(round_idx) * context.world_size + context.rank
+            payload_ref = None
+            if batch_index < len(batch_specs):
+                rank_batch_count += 1
+                payload = _run_bbox_batch(
+                    model,
+                    volume_array,
+                    surface,
+                    bboxes,
+                    crop_size,
+                    cond_direction,
+                    stored_zyxs,
+                    valid,
+                    amp_enabled,
+                    amp_dtype,
+                    batch_specs[batch_index],
+                )
+                payload_ref = _write_payload_ref(payload, payload_dir, context)
+                del payload
+
+            gathered = _gather_object_to_rank0(payload_ref, context)
+            if context.is_rank0:
+                for item_ref in sorted((p for p in gathered if p is not None), key=lambda p: int(p["batch_index"])):
+                    item = _read_payload_ref(item_ref)
+                    _accumulate_batch_payload(merger, item)
+                    total_voxelized_bbox_voxels += int(item["voxelized_bbox_voxels"])
+                    _cleanup_payload_ref(item_ref)
+                    del item
+
+        if context.is_rank0:
+            return {
+                "avg_group": merger.finalize(),
+                "voxelized_bbox_voxels": int(total_voxelized_bbox_voxels),
+                "batch_assignment": assignment,
+                "rank_batch_count": rank_batch_count,
+            }
+        return {
+            "avg_group": None,
+            "voxelized_bbox_voxels": 0,
+            "batch_assignment": assignment,
+            "rank_batch_count": rank_batch_count,
+        }
+    finally:
+        if context.is_rank0:
+            shutil.rmtree(payload_dir, ignore_errors=True)
 
 
 def _run_streamline_iteration(
@@ -1835,7 +2562,9 @@ def _run_streamline_iteration(
     iteration_idx,
     total_iterations,
     output_tifxyz_dir,
+    distributed_context=None,
 ):
+    context = distributed_context or _DistributedContext()
     stored_zyxs, valid = _load_surface_zyx(input_tifxyz_path)
     points_zyx = stored_zyxs[valid]
     if points_zyx.size == 0:
@@ -1853,25 +2582,64 @@ def _run_streamline_iteration(
     )
     surface = read_tifxyz(input_tifxyz_path)
     edge_axis_scale = surface._scale[0] if _get_direction_spec(cond_direction)["axis"] == "col" else surface._scale[1]
-    voxelized_bboxes = upsample_voxelize_tifxyz_surface_in_bboxes(
-        surface,
-        bboxes,
-        crop_size,
-        stored_zyxs=stored_zyxs,
-        valid=valid,
+    output_path = _output_zarr_path(iteration_idx)
+    expected_output_tifxyz_path = None
+    if context.is_rank0:
+        expected_output_tifxyz_path = Path(output_tifxyz_dir) / _output_tifxyz_uuid(
+            iteration_idx=iteration_idx,
+            total_iterations=total_iterations,
+        )
+    expected_output_tifxyz_path = Path(
+        _broadcast_object_from_rank0(
+            None if expected_output_tifxyz_path is None else str(expected_output_tifxyz_path),
+            context,
+        )
     )
-    output_path = _output_zarr_path()
+    result = None
     try:
-        output_root = zarr.open_group(str(output_path), mode="w")
-        output_group = run_rowcol_bbox_inference(
+        output_root = None
+        if context.is_rank0:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_root = zarr.open_group(str(output_path), mode="w")
+            output_root.attrs["input_tifxyz_path"] = str(input_tifxyz_path)
+            output_root.attrs["iteration"] = int(iteration_idx)
+            output_root.attrs["total_iterations"] = int(total_iterations)
+            output_root.attrs["volume_path"] = str(VOLUME_PATH)
+            output_root.attrs["volume_scale"] = int(VOLUME_SCALE)
+            output_root.attrs["checkpoint_path"] = str(CHECKPOINT_PATH)
+            output_root.attrs["valid_points"] = int(points_zyx.shape[0])
+            output_root.attrs["bboxes"] = int(len(bboxes))
+            output_root.attrs["distributed_world_size"] = int(context.world_size)
+            output_root.attrs["distributed_backend"] = str(context.backend)
+            _store_iteration_geometry(output_root, bboxes, edge)
+
+        inference_result = run_rowcol_bbox_inference(
             model,
             model_config,
             volume_array,
-            voxelized_bboxes,
+            surface,
+            bboxes,
             crop_size,
             cond_direction,
             output_root,
+            stored_zyxs,
+            valid,
+            distributed_context=context,
+            payload_tag=f"iter_{int(iteration_idx):02d}",
         )
+
+        if not context.is_rank0:
+            output_tifxyz_path = _wait_for_tifxyz_output(expected_output_tifxyz_path)
+            return {
+                "input_tifxyz_path": Path(input_tifxyz_path),
+                "output_tifxyz_path": Path(output_tifxyz_path),
+                "output_zarr_path": Path(output_path),
+                "rank_batch_count": int(inference_result["rank_batch_count"]),
+            }
+
+        output_root.attrs["distributed_batch_assignment"] = inference_result["batch_assignment"]
+        output_root.attrs["distributed_rank0_batch_count"] = int(inference_result["rank_batch_count"])
+        output_group = inference_result["avg_group"]
         integration_result = integrate_streamlines_from_edge(
             output_group,
             edge,
@@ -1890,6 +2658,9 @@ def _run_streamline_iteration(
             iteration_idx=iteration_idx,
             total_iterations=total_iterations,
         )
+        voxelized_bbox_voxels = int(inference_result["voxelized_bbox_voxels"])
+        output_root.attrs["voxelized_bbox_voxels"] = int(voxelized_bbox_voxels)
+        output_root.attrs["output_tifxyz_path"] = str(output_tifxyz_path)
 
         print(f"iteration: {int(iteration_idx)}/{int(total_iterations)}")
         print(f"tifxyz_path: {input_tifxyz_path}")
@@ -1906,7 +2677,7 @@ def _run_streamline_iteration(
         print(f"vector_merge_method: {_vector_merge_method()}")
         print(f"valid_points: {int(points_zyx.shape[0])}")
         print(f"bboxes: {len(bboxes)}")
-        print(f"voxelized_bbox_voxels: {sum(int(item['voxels'].sum()) for item in voxelized_bboxes)}")
+        print(f"voxelized_bbox_voxels: {voxelized_bbox_voxels}")
         print(f"tifxyz_voxel_step: {float(TIFXYZ_VOXEL_STEP)}")
         print(f"tifxyz_steps: {int(TIFXYZ_STEPS)}")
         print(f"integration_steps: {len(integration_result['step_sizes'])}")
@@ -1926,6 +2697,13 @@ def _run_streamline_iteration(
         print(f"integration_failure_diagnostics: {integration_result['diagnostics']}")
 
         if SHOW_NAPARI:
+            voxelized_bboxes = upsample_voxelize_tifxyz_surface_in_bboxes(
+                surface,
+                bboxes,
+                crop_size,
+                stored_zyxs=stored_zyxs,
+                valid=valid,
+            )
             show_streamline_geometry_napari(
                 points_zyx,
                 edge,
@@ -1933,7 +2711,7 @@ def _run_streamline_iteration(
                 voxelized_bboxes=voxelized_bboxes,
                 integration_group=integration_result["group"],
             )
-        return {
+        result = {
             "input_tifxyz_path": Path(input_tifxyz_path),
             "output_tifxyz_path": Path(output_tifxyz_path),
             "output_zarr_path": Path(output_path),
@@ -1942,60 +2720,261 @@ def _run_streamline_iteration(
                 for key, value in integration_result.items()
                 if key != "group"
             },
+            "valid_points": int(points_zyx.shape[0]),
+            "bboxes": int(len(bboxes)),
+            "voxelized_bbox_voxels": int(voxelized_bbox_voxels),
+            "cond_direction": str(cond_direction),
+            "grow_direction": str(GROW_DIRECTION),
+            "distributed_world_size": int(context.world_size),
+            "distributed_backend": str(context.backend),
+            "distributed_batch_assignment": inference_result["batch_assignment"],
         }
+        return result
     finally:
-        _cleanup_temp_output_zarr(output_path)
+        if context.is_rank0:
+            _cleanup_temp_output_zarr(output_path)
 
 
-def main():
-    if DEVICE != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("infer_streamline.py is configured for CUDA-only inference.")
+def _json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
-    num_iterations = int(NUM_ITERATIONS)
-    if num_iterations <= 0:
-        raise ValueError("NUM_ITERATIONS must be >= 1.")
 
-    model, model_config = load_checkpoint(CHECKPOINT_PATH)
-    model.to(DEVICE)
-    model = torch.compile(model)
-    crop_size = _crop_size_from_config(model_config)
-    volume_array = _open_volume_array(VOLUME_PATH, VOLUME_SCALE)
+def _write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wt", encoding="utf-8") as fp:
+        json.dump(_json_safe(payload), fp, indent=2, sort_keys=True)
 
-    current_tifxyz_path = Path(TIFXYZ_PATH)
-    final_output_tifxyz_path = None
-    temp_tifxyz_dir = None
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Run row/column-conditioned neural streamline inference from a tifxyz surface."
+    )
+    parser.add_argument("--tifxyz-path", required=True, help="Input tifxyz surface directory.")
+    parser.add_argument("--checkpoint-path", required=True, help="Trained neural tracing checkpoint.")
+    parser.add_argument(
+        "--volume-path",
+        default="auto",
+        help="CT volume Zarr path, or 'auto' to resolve from checkpoint datasets.",
+    )
+    parser.add_argument(
+        "--volume-scale",
+        type=int,
+        default=None,
+        help="Volume pyramid scale. Defaults to the matched checkpoint dataset scale when --volume-path=auto.",
+    )
+    parser.add_argument("--volume-cache-dir", default="/tmp/vesuvius-volume-cache")
+    parser.add_argument("--volume-cache-retry-seconds", type=float, default=60.0)
+    parser.add_argument("--output-dir", required=True, help="Run output directory.")
+    parser.add_argument("--grow-direction", default="left", choices=sorted(_DIRECTION_SPECS))
+    parser.add_argument("--num-iterations", type=int, default=10)
+    parser.add_argument("--tifxyz-steps", type=int, default=2)
+    parser.add_argument(
+        "--tifxyz-voxel-step",
+        type=float,
+        default=None,
+        help="Full-resolution voxels between tifxyz samples. Defaults to 1 / meta.json scale.",
+    )
+    parser.add_argument(
+        "--tifxyz-voxel-size-um",
+        type=float,
+        default=None,
+        help="Physical voxel size written to output tifxyz metadata. Defaults to first '<N>um' in volume path.",
+    )
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--distributed-backend",
+        default="auto",
+        choices=("auto", "nccl", "gloo"),
+        help="torch.distributed backend for torchrun mode. Defaults to NCCL for CUDA, otherwise Gloo.",
+    )
+    parser.add_argument("--tta", dest="use_tta", action="store_true", default=True)
+    parser.add_argument("--no-tta", dest="use_tta", action="store_false")
+    parser.add_argument("--compile", dest="compile_model", action="store_true", default=True)
+    parser.add_argument("--no-compile", dest="compile_model", action="store_false")
+    parser.add_argument("--save-each-iteration", dest="save_each_iteration", action="store_true", default=True)
+    parser.add_argument("--final-only", dest="save_each_iteration", action="store_false")
+    parser.add_argument("--show-napari", action="store_true", help="Open the debug Napari overlay after each iteration.")
+    return parser.parse_args(argv)
+
+
+def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tifxyz_voxel_step, runtime_device=None):
+    global TIFXYZ_PATH, VOLUME_PATH, VOLUME_SCALE, VOLUME_CACHE_DIR, VOLUME_CACHE_RETRY_SECONDS
+    global CHECKPOINT_PATH, BATCH_SIZE, DEVICE, COMPILE_MODEL, OUTPUT_TIFXYZ_DIR
+    global OUTPUT_TIFXYZ_VOXEL_SIZE_UM, RUN_OUTPUT_DIR, RUN_TIMESTAMP, USE_TTA
+    global GROW_DIRECTION, TIFXYZ_VOXEL_STEP, TIFXYZ_STEPS, NUM_ITERATIONS
+    global SAVE_EACH_ITERATION_TIFXYZ, SHOW_NAPARI
+
+    TIFXYZ_PATH = str(Path(args.tifxyz_path).resolve())
+    CHECKPOINT_PATH = str(Path(args.checkpoint_path).resolve())
+    VOLUME_PATH = str(resolved_volume_path)
+    VOLUME_SCALE = int(resolved_volume_scale)
+    VOLUME_CACHE_DIR = str(args.volume_cache_dir)
+    VOLUME_CACHE_RETRY_SECONDS = float(args.volume_cache_retry_seconds)
+    BATCH_SIZE = int(args.batch_size)
+    DEVICE = str(args.device if runtime_device is None else runtime_device)
+    COMPILE_MODEL = bool(args.compile_model)
+    RUN_OUTPUT_DIR = Path(args.output_dir).resolve()
+    RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+    OUTPUT_TIFXYZ_DIR = str(RUN_OUTPUT_DIR / "tifxyz")
+    OUTPUT_TIFXYZ_VOXEL_SIZE_UM = args.tifxyz_voxel_size_um
+    USE_TTA = bool(args.use_tta)
+    GROW_DIRECTION = str(args.grow_direction)
+    TIFXYZ_VOXEL_STEP = float(tifxyz_voxel_step)
+    TIFXYZ_STEPS = int(args.tifxyz_steps)
+    NUM_ITERATIONS = int(args.num_iterations)
+    SAVE_EACH_ITERATION_TIFXYZ = bool(args.save_each_iteration)
+    SHOW_NAPARI = bool(args.show_napari)
+
+
+def run_from_args(args):
+    distributed_context = None
     try:
-        if num_iterations > 1 and not SAVE_EACH_ITERATION_TIFXYZ:
-            temp_tifxyz_dir = tempfile.TemporaryDirectory(prefix="infer_streamline_tifxyz_")
-        for iteration_idx in range(1, num_iterations + 1):
-            is_final_iteration = iteration_idx == num_iterations
-            if is_final_iteration or SAVE_EACH_ITERATION_TIFXYZ:
-                output_tifxyz_dir = _output_tifxyz_dir()
-            else:
-                output_tifxyz_dir = Path(temp_tifxyz_dir.name)
-            result = _run_streamline_iteration(
-                model,
-                model_config,
-                volume_array,
-                crop_size,
-                current_tifxyz_path,
-                iteration_idx,
-                num_iterations,
-                output_tifxyz_dir,
-            )
-            current_tifxyz_path = result["output_tifxyz_path"]
-            final_output_tifxyz_path = current_tifxyz_path
-            del result
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        distributed_context = _initialize_distributed(args)
+        effective_device = distributed_context.device or args.device
+        if str(effective_device).startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"Requested CUDA device {effective_device!r}, but torch.cuda.is_available() is false.")
 
-        print(f"num_iterations: {num_iterations}")
-        print(f"save_each_iteration_tifxyz: {bool(SAVE_EACH_ITERATION_TIFXYZ)}")
-        print(f"final_output_tifxyz_path: {final_output_tifxyz_path}")
+        num_iterations = int(args.num_iterations)
+        if num_iterations <= 0:
+            raise ValueError("--num-iterations must be >= 1.")
+        if int(args.batch_size) <= 0:
+            raise ValueError("--batch-size must be >= 1.")
+
+        model, model_config = load_checkpoint(args.checkpoint_path)
+        resolved_volume_path, resolved_volume_scale, matched_dataset = resolve_volume_path_from_config(
+            args.tifxyz_path,
+            model_config,
+            requested_volume_path=args.volume_path,
+            requested_volume_scale=args.volume_scale,
+        )
+        tifxyz_voxel_step = (
+            derive_tifxyz_voxel_step(args.tifxyz_path)
+            if args.tifxyz_voxel_step is None
+            else float(args.tifxyz_voxel_step)
+        )
+        _apply_runtime_config(
+            args,
+            resolved_volume_path,
+            resolved_volume_scale,
+            tifxyz_voxel_step,
+            runtime_device=effective_device,
+        )
+
+        run_output_dir = Path(RUN_OUTPUT_DIR)
+        if distributed_context.is_rank0:
+            run_output_dir.mkdir(parents=True, exist_ok=True)
+            (run_output_dir / "zarr").mkdir(parents=True, exist_ok=True)
+            (run_output_dir / "tifxyz").mkdir(parents=True, exist_ok=True)
+        if distributed_context.is_distributed:
+            dist.barrier()
+
+        crop_size = _crop_size_from_config(model_config)
+        summary = None
+        if distributed_context.is_rank0:
+            summary = {
+                "started_at": RUN_TIMESTAMP,
+                "input_tifxyz_path": TIFXYZ_PATH,
+                "checkpoint_path": CHECKPOINT_PATH,
+                "volume_path": VOLUME_PATH,
+                "volume_scale": VOLUME_SCALE,
+                "matched_dataset": matched_dataset,
+                "output_dir": str(run_output_dir),
+                "args": vars(args),
+                "crop_size": list(crop_size),
+                "batch_size": BATCH_SIZE,
+                "device": DEVICE,
+                "compile_model": COMPILE_MODEL,
+                "use_tta": USE_TTA,
+                "grow_direction": GROW_DIRECTION,
+                "num_iterations": NUM_ITERATIONS,
+                "tifxyz_steps": TIFXYZ_STEPS,
+                "tifxyz_voxel_step": TIFXYZ_VOXEL_STEP,
+                "tifxyz_voxel_size_um": _output_tifxyz_voxel_size_um(),
+                "save_each_iteration_tifxyz": SAVE_EACH_ITERATION_TIFXYZ,
+                "world_size": int(distributed_context.world_size),
+                "rank_mode": "torchrun" if distributed_context.is_distributed else "single",
+                "distributed_backend": str(distributed_context.backend),
+                "rank": int(distributed_context.rank),
+                "local_rank": int(distributed_context.local_rank),
+                "iterations": [],
+            }
+            _write_json(run_output_dir / "resolved_config.json", model_config)
+            _write_json(run_output_dir / "summary.json", summary)
+
+        model.to(DEVICE)
+        if COMPILE_MODEL:
+            model = torch.compile(model)
+        volume_array = _open_volume_array(VOLUME_PATH, VOLUME_SCALE)
+        if distributed_context.is_rank0:
+            summary["volume_shape"] = list(getattr(volume_array, "shape", ()))
+            summary["volume_dtype"] = str(getattr(volume_array, "dtype", "unknown"))
+            summary["volume_chunks"] = list(getattr(volume_array, "chunks", ()))
+            _write_json(run_output_dir / "summary.json", summary)
+
+        current_tifxyz_path = Path(TIFXYZ_PATH)
+        final_output_tifxyz_path = None
+        temp_tifxyz_dir = None
+        try:
+            if distributed_context.is_rank0 and num_iterations > 1 and not SAVE_EACH_ITERATION_TIFXYZ:
+                temp_tifxyz_dir = tempfile.TemporaryDirectory(prefix="infer_streamline_tifxyz_")
+            for iteration_idx in range(1, num_iterations + 1):
+                is_final_iteration = iteration_idx == num_iterations
+                if is_final_iteration or SAVE_EACH_ITERATION_TIFXYZ or not distributed_context.is_rank0:
+                    output_tifxyz_dir = _output_tifxyz_dir()
+                else:
+                    output_tifxyz_dir = Path(temp_tifxyz_dir.name)
+                result = _run_streamline_iteration(
+                    model,
+                    model_config,
+                    volume_array,
+                    crop_size,
+                    current_tifxyz_path,
+                    iteration_idx,
+                    num_iterations,
+                    output_tifxyz_dir,
+                    distributed_context=distributed_context,
+                )
+                current_tifxyz_path = result["output_tifxyz_path"]
+                final_output_tifxyz_path = current_tifxyz_path
+                if distributed_context.is_rank0:
+                    summary["iterations"].append(result)
+                    summary["final_output_tifxyz_path"] = str(final_output_tifxyz_path)
+                    summary["last_iteration_zarr_path"] = str(result["output_zarr_path"])
+                    _write_json(run_output_dir / "summary.json", summary)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if distributed_context.is_rank0:
+                summary["completed_at"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+                _write_json(run_output_dir / "summary.json", summary)
+                print(f"num_iterations: {num_iterations}")
+                print(f"save_each_iteration_tifxyz: {bool(SAVE_EACH_ITERATION_TIFXYZ)}")
+                print(f"final_output_tifxyz_path: {final_output_tifxyz_path}")
+                print(f"summary_path: {run_output_dir / 'summary.json'}")
+                return summary
+            return None
+        finally:
+            if temp_tifxyz_dir is not None:
+                temp_tifxyz_dir.cleanup()
     finally:
-        if temp_tifxyz_dir is not None:
-            temp_tifxyz_dir.cleanup()
+        _destroy_distributed(distributed_context)
+
+
+def main(argv=None):
+    return run_from_args(_parse_args(argv))
 
 
 if __name__ == "__main__":
