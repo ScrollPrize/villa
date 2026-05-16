@@ -1,6 +1,7 @@
 #include "vc/core/types/Volume.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -217,6 +218,21 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     const T fill = typedFillValue<T>(array);
     const size_t chunkStrideY = static_cast<size_t>(chunkShape[2]);
     const size_t chunkStrideZ = static_cast<size_t>(chunkShape[1]) * chunkStrideY;
+    std::atomic<bool> chunkReadFailed{false};
+    ChunkKey failedChunk{};
+    std::string chunkReadError;
+    std::mutex chunkReadErrorMutex;
+
+    auto recordChunkReadError = [&](int cz, int cy, int cx, const std::string& error) {
+        bool expected = false;
+        if (!chunkReadFailed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(chunkReadErrorMutex);
+        failedChunk = ChunkKey{level, cz, cy, cx};
+        chunkReadError = error.empty() ? "chunk fetch failed" : error;
+    };
 
     #pragma omp parallel
     {
@@ -229,9 +245,12 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
             std::shared_ptr<const std::vector<std::byte>> bytes;
         } cached;
 
-        auto loadChunk = [&](int cz, int cy, int cx) {
+        auto loadChunk = [&](int cz, int cy, int cx) -> bool {
+            if (chunkReadFailed.load(std::memory_order_acquire)) {
+                return false;
+            }
             if (cached.cz == cz && cached.cy == cy && cached.cx == cx) {
-                return;
+                return true;
             }
             cached = {};
             cached.cz = cz;
@@ -245,15 +264,20 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 cached.bytes = result.bytes;
                 cached.data = reinterpret_cast<const T*>(cached.bytes->data());
             } else if (result.status == ChunkStatus::Error) {
-                throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
+                recordChunkReadError(cz, cy, cx, result.error);
+                return false;
             } else {
                 cached.allFill = true;
             }
+            return true;
         };
 
         #pragma omp for schedule(dynamic, 4) collapse(2)
         for (size_t z = 0; z < outShape[0]; ++z) {
             for (size_t y = 0; y < outShape[1]; ++y) {
+                if (chunkReadFailed.load(std::memory_order_acquire)) {
+                    continue;
+                }
                 const int iz = z0 + static_cast<int>(z);
                 const int iy = y0 + static_cast<int>(y);
                 if (iz < 0 || iz >= volumeShape[0] ||
@@ -265,13 +289,18 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 const int lz = iz - cz * chunkShape[0];
                 const int ly = iy - cy * chunkShape[1];
                 for (size_t x = 0; x < outShape[2]; ++x) {
+                    if (chunkReadFailed.load(std::memory_order_acquire)) {
+                        break;
+                    }
                     const int ix = x0 + static_cast<int>(x);
                     if (ix < 0 || ix >= volumeShape[2]) {
                         continue;
                     }
                     const int cx = ix / chunkShape[2];
                     const int lx = ix - cx * chunkShape[2];
-                    loadChunk(cz, cy, cx);
+                    if (!loadChunk(cz, cy, cx)) {
+                        break;
+                    }
                     if (cached.allFill || !cached.data) {
                         out(z, y, x) = fill;
                     } else {
@@ -283,6 +312,15 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 }
             }
         }
+    }
+
+    if (chunkReadFailed.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(chunkReadErrorMutex);
+        std::ostringstream oss;
+        oss << "Volume::read failed fetching chunk "
+            << failedChunk.level << "/" << failedChunk.iz << "/" << failedChunk.iy << "/"
+            << failedChunk.ix << ": " << chunkReadError;
+        throw std::runtime_error(oss.str());
     }
 }
 
