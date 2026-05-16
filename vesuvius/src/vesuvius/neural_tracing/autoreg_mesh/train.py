@@ -925,6 +925,32 @@ def _rollout_in_loop_active(cfg: dict, *, global_step: int) -> bool:
     return ((int(global_step) - start_step) % frequency) == 0
 
 
+def _rollout_in_loop_iterations(cfg: dict, *, global_step: int) -> int:
+    """Linear ramp on rollout_in_loop_iterations (K). Returns the base value
+    (`rollout_in_loop_iterations`) when no ramp is configured, otherwise
+    linearly interpolates from base -> rollout_in_loop_iterations_max over
+    [rollout_in_loop_iterations_ramp_start_step, ramp_start_step + ramp_steps].
+
+    Legacy behaviour (no ramp config, or iterations_max <= base) returns the
+    constant base value at every step.
+    """
+    base = int(cfg.get("rollout_in_loop_iterations", 5))
+    iter_max_raw = cfg.get("rollout_in_loop_iterations_max")
+    if iter_max_raw is None:
+        return base
+    iter_max = int(iter_max_raw)
+    if iter_max <= base:
+        return base
+    ramp_start = int(cfg.get("rollout_in_loop_iterations_ramp_start_step", 0))
+    if int(global_step) < ramp_start:
+        return base
+    ramp_steps = int(cfg.get("rollout_in_loop_iterations_ramp_steps", 0))
+    if ramp_steps <= 0 or int(global_step) >= ramp_start + ramp_steps:
+        return iter_max
+    progress = float(int(global_step) - ramp_start) / float(ramp_steps)
+    return int(round(base + (iter_max - base) * progress))
+
+
 def _true_rollout_active(cfg: dict, *, global_step: int) -> bool:
     """Return True when this training step should run a true sequential
     autoregressive rollout-loss step (model.forward_with_true_rollout).
@@ -1671,9 +1697,11 @@ def run_autoreg_mesh_training(
             # the same step (true_rollout is strictly stronger: depth = full
             # horizon, fully sequential). When neither fires, the normal
             # scheduled-sampling path runs.
-            rollout_iterations_active = (
-                int(cfg.get("rollout_in_loop_iterations", 5)) if rollout_in_loop_active else 0
-            )
+            # K-ramp schedule: computed every step so wandb shows the curve
+            # continuously, not just at firing steps. The forward kwarg is
+            # still gated on rollout_in_loop_active.
+            rollout_iterations_scheduled = _rollout_in_loop_iterations(cfg, global_step=global_step)
+            rollout_iterations_active = rollout_iterations_scheduled if rollout_in_loop_active else 0
             # 0 = "fire with full target horizon" sentinel; positive int = cap;
             # None = don't fire. Cleaner than overloading None three ways.
             true_rollout_horizon_arg: int | None = None
@@ -1748,6 +1776,7 @@ def run_autoreg_mesh_training(
             metrics["grad_norm"] = grad_norm_value
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
             metrics["rollout_in_loop_active"] = float(rollout_in_loop_active)
+            metrics["rollout_in_loop_iterations_active"] = float(rollout_iterations_scheduled)
             metrics["true_rollout_active"] = float(true_rollout_active)
             metrics["offset_loss_weight_active"] = float(offset_loss_weight_active)
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)

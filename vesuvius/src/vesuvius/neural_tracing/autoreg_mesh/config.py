@@ -161,6 +161,13 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "rollout_in_loop_frequency": 1000,
     "rollout_in_loop_start_step": 20000,
     "rollout_in_loop_iterations": 5,
+    # Optional linear ramp on K (rollout_in_loop_iterations). When
+    # rollout_in_loop_iterations_max is set, K ramps from the base value to
+    # iterations_max over [ramp_start_step, ramp_start_step + ramp_steps].
+    # Legacy behaviour (iterations_max=None) returns the constant base.
+    "rollout_in_loop_iterations_max": None,
+    "rollout_in_loop_iterations_ramp_start_step": 0,
+    "rollout_in_loop_iterations_ramp_steps": 0,
     # True autoregressive rollout loss. When active on a training step, the
     # trainer runs a sequential greedy autoregressive rollout (via
     # `forward_with_true_rollout` -> `_autoregressive_rollout_predictions`)
@@ -449,6 +456,26 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("rollout_in_loop_start_step must be >= 0")
     if int(cfg["rollout_in_loop_iterations"]) < 0:
         raise ValueError("rollout_in_loop_iterations must be >= 0")
+    if int(cfg["rollout_in_loop_iterations_ramp_steps"]) < 0:
+        raise ValueError("rollout_in_loop_iterations_ramp_steps must be >= 0")
+    iter_max_raw = cfg.get("rollout_in_loop_iterations_max")
+    if iter_max_raw is not None:
+        iter_max_val = int(iter_max_raw)
+        if iter_max_val < int(cfg["rollout_in_loop_iterations"]):
+            raise ValueError(
+                f"rollout_in_loop_iterations_max ({iter_max_val}) must be >= "
+                f"rollout_in_loop_iterations ({int(cfg['rollout_in_loop_iterations'])})"
+            )
+        cfg["rollout_in_loop_iterations_max"] = iter_max_val
+        # Only enforce the ramp_start_step >= rollout_in_loop_start_step
+        # constraint when ramping is actually configured. Without this guard
+        # the default ramp_start_step=0 would conflict with any default
+        # rollout_in_loop_start_step > 0 even when iterations_max is None.
+        if int(cfg["rollout_in_loop_iterations_ramp_start_step"]) < int(cfg["rollout_in_loop_start_step"]):
+            raise ValueError(
+                f"rollout_in_loop_iterations_ramp_start_step ({int(cfg['rollout_in_loop_iterations_ramp_start_step'])}) "
+                f"must be >= rollout_in_loop_start_step ({int(cfg['rollout_in_loop_start_step'])})"
+            )
     # True autoregressive rollout loss
     if not isinstance(cfg["true_rollout_loss_enabled"], bool):
         raise ValueError("true_rollout_loss_enabled must be a boolean")

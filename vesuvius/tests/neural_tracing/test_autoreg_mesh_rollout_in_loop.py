@@ -12,6 +12,7 @@ import pytest
 
 from vesuvius.neural_tracing.autoreg_mesh.train import (
     _rollout_in_loop_active,
+    _rollout_in_loop_iterations,
     _scheduled_sampling_prob,
     _true_rollout_active,
 )
@@ -258,3 +259,134 @@ def test_config_validator_rejects_bad_true_rollout():
             "true_rollout_loss_enabled": "yes"}
     with pytest.raises(ValueError, match="true_rollout_loss_enabled must be a boolean"):
         validate_autoreg_mesh_config(bad4)
+
+
+# ---------------- K-ramp on rollout_in_loop_iterations ---------------- #
+
+
+def test_rollout_in_loop_iterations_default_legacy():
+    """When iterations_max is absent (legacy), the helper returns the base
+    value at every step. Catches accidental fall-through to a different code
+    path."""
+    cfg = {"rollout_in_loop_iterations": 7}
+    for step in (0, 1, 100, 100_000, 999_999):
+        assert _rollout_in_loop_iterations(cfg, global_step=step) == 7
+
+
+def test_rollout_in_loop_iterations_pre_ramp_returns_base():
+    cfg = {
+        "rollout_in_loop_iterations": 10,
+        "rollout_in_loop_iterations_max": 30,
+        "rollout_in_loop_iterations_ramp_start_step": 100_000,
+        "rollout_in_loop_iterations_ramp_steps": 20_000,
+    }
+    for step in (0, 50_000, 99_999):
+        assert _rollout_in_loop_iterations(cfg, global_step=step) == 10
+
+
+def test_rollout_in_loop_iterations_hits_endpoints():
+    cfg = {
+        "rollout_in_loop_iterations": 10,
+        "rollout_in_loop_iterations_max": 30,
+        "rollout_in_loop_iterations_ramp_start_step": 100_000,
+        "rollout_in_loop_iterations_ramp_steps": 20_000,
+    }
+    # Start of ramp
+    assert _rollout_in_loop_iterations(cfg, global_step=100_000) == 10
+    # Midpoint: 10 + (30-10) * 0.5 = 20
+    assert _rollout_in_loop_iterations(cfg, global_step=110_000) == 20
+    # End of ramp
+    assert _rollout_in_loop_iterations(cfg, global_step=120_000) == 30
+    # Past the ramp: still max
+    for step in (130_000, 200_000, 999_999):
+        assert _rollout_in_loop_iterations(cfg, global_step=step) == 30
+
+
+def test_rollout_in_loop_iterations_step_jump_when_ramp_steps_zero():
+    """ramp_steps=0 means a step jump from base to max at ramp_start_step."""
+    cfg = {
+        "rollout_in_loop_iterations": 10,
+        "rollout_in_loop_iterations_max": 30,
+        "rollout_in_loop_iterations_ramp_start_step": 100_000,
+        "rollout_in_loop_iterations_ramp_steps": 0,
+    }
+    assert _rollout_in_loop_iterations(cfg, global_step=99_999) == 10
+    assert _rollout_in_loop_iterations(cfg, global_step=100_000) == 30
+    assert _rollout_in_loop_iterations(cfg, global_step=200_000) == 30
+
+
+def test_rollout_in_loop_iterations_max_le_base_returns_base():
+    """Degenerate config (max <= base) is a no-op: always returns base. The
+    validator rejects this, but the helper must be robust if it slips
+    through (e.g., via direct dict construction in tests)."""
+    cfg = {
+        "rollout_in_loop_iterations": 10,
+        "rollout_in_loop_iterations_max": 5,  # degenerate
+        "rollout_in_loop_iterations_ramp_start_step": 100_000,
+        "rollout_in_loop_iterations_ramp_steps": 20_000,
+    }
+    for step in (0, 50_000, 110_000, 200_000):
+        assert _rollout_in_loop_iterations(cfg, global_step=step) == 10
+
+
+def test_config_validator_rejects_iter_max_lt_base():
+    from vesuvius.neural_tracing.autoreg_mesh.config import (
+        DEFAULT_AUTOREG_MESH_CONFIG,
+        validate_autoreg_mesh_config,
+    )
+    bad = {
+        **DEFAULT_AUTOREG_MESH_CONFIG,
+        "datasets": [],
+        "rollout_in_loop_iterations": 10,
+        "rollout_in_loop_iterations_max": 5,
+    }
+    with pytest.raises(ValueError, match=r"rollout_in_loop_iterations_max .* must be >= rollout_in_loop_iterations"):
+        validate_autoreg_mesh_config(bad)
+
+
+def test_config_validator_rejects_negative_ramp_steps():
+    from vesuvius.neural_tracing.autoreg_mesh.config import (
+        DEFAULT_AUTOREG_MESH_CONFIG,
+        validate_autoreg_mesh_config,
+    )
+    bad = {
+        **DEFAULT_AUTOREG_MESH_CONFIG,
+        "datasets": [],
+        "rollout_in_loop_iterations_ramp_steps": -1,
+    }
+    with pytest.raises(ValueError, match="rollout_in_loop_iterations_ramp_steps must be >= 0"):
+        validate_autoreg_mesh_config(bad)
+
+
+def test_config_validator_rejects_ramp_start_before_rollout_start():
+    """The ramp_start_step constraint only fires when iterations_max is set
+    (otherwise no ramp is active and the start step is irrelevant)."""
+    from vesuvius.neural_tracing.autoreg_mesh.config import (
+        DEFAULT_AUTOREG_MESH_CONFIG,
+        validate_autoreg_mesh_config,
+    )
+    bad = {
+        **DEFAULT_AUTOREG_MESH_CONFIG,
+        "datasets": [],
+        "rollout_in_loop_start_step": 20_000,
+        "rollout_in_loop_iterations": 10,
+        "rollout_in_loop_iterations_max": 30,  # enable ramping
+        "rollout_in_loop_iterations_ramp_start_step": 10_000,  # before rollout_in_loop_start_step
+    }
+    with pytest.raises(ValueError, match=r"rollout_in_loop_iterations_ramp_start_step .* must be >= rollout_in_loop_start_step"):
+        validate_autoreg_mesh_config(bad)
+
+
+def test_config_validator_skips_ramp_check_when_iterations_max_none():
+    """Default config has iterations_max=None and ramp_start_step=0
+    (< rollout_in_loop_start_step=20000). The validator must NOT reject this
+    because no ramp is configured."""
+    from vesuvius.neural_tracing.autoreg_mesh.config import (
+        DEFAULT_AUTOREG_MESH_CONFIG,
+        validate_autoreg_mesh_config,
+    )
+    ok = {**DEFAULT_AUTOREG_MESH_CONFIG, "datasets": []}
+    assert ok["rollout_in_loop_iterations_max"] is None
+    assert ok["rollout_in_loop_iterations_ramp_start_step"] < ok["rollout_in_loop_start_step"]
+    # Must not raise.
+    validate_autoreg_mesh_config(ok)
