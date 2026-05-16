@@ -249,3 +249,46 @@ add_test(NAME test_quadsurface_snapshot COMMAND test_quadsurface_snapshot)
 add_executable(test_quadsurface_save_paths test_quadsurface_save_paths.cpp)
 target_link_libraries(test_quadsurface_save_paths PRIVATE doctest::doctest vc_core)
 add_test(NAME test_quadsurface_save_paths COMMAND test_quadsurface_save_paths)
+
+# Real PHerc 0172 segments committed under core/test/data/segments/.
+add_executable(test_quadsurface_fixtures test_quadsurface_fixtures.cpp)
+target_compile_definitions(test_quadsurface_fixtures PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_quadsurface_fixtures PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_fixtures COMMAND test_quadsurface_fixtures)
+
+add_executable(test_volume_pkg_full test_volume_pkg_full.cpp)
+target_compile_definitions(test_volume_pkg_full PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_volume_pkg_full PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_pkg_full COMMAND test_volume_pkg_full)
+
+add_executable(test_load_quad_from_tifxyz test_load_quad_from_tifxyz.cpp)
+target_compile_definitions(test_load_quad_from_tifxyz PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_load_quad_from_tifxyz PRIVATE doctest::doctest vc_core)
+add_test(NAME test_load_quad_from_tifxyz COMMAND test_load_quad_from_tifxyz)
+
+add_executable(test_surface_patch_index_more test_surface_patch_index_more.cpp)
+target_compile_definitions(test_surface_patch_index_more PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_surface_patch_index_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_surface_patch_index_more COMMAND test_surface_patch_index_more)
+
+add_executable(test_quadsurface_extras test_quadsurface_extras.cpp)
+target_compile_definitions(test_quadsurface_extras PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_quadsurface_extras PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_extras COMMAND test_quadsurface_extras)
+
+add_executable(test_surface_patch_index_cache test_surface_patch_index_cache.cpp)
+target_compile_definitions(test_surface_patch_index_cache PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_surface_patch_index_cache PRIVATE doctest::doctest vc_core)
+add_test(NAME test_surface_patch_index_cache COMMAND test_surface_patch_index_cache)
+
+add_executable(test_volume_pkg_more test_volume_pkg_more.cpp)
+target_compile_definitions(test_volume_pkg_more PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_volume_pkg_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_pkg_more COMMAND test_volume_pkg_more)
