@@ -55,3 +55,41 @@ Convert to an ome-zarr (thanks chuck! more info here https://github.com/KhartesV
 ### train 
 Preprocess: `nnUNetv2_plan_and_preprocess -d 050 -pl nnUNetPlannerResEncL -c 3d_fullres --verify_dataset_integrity`
 Run training: `nnUNetv2_train 050 3d_fullres 0 -p nnUNetResEncUNetMPlans`
+
+### MedNeXt-L + SkeletonRecall trainer (for compressed / highly curved regions)
+
+The `nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5` trainer
+(`nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5.py`)
+swaps the default ResEnc U-Net for MedNeXt-L kernel5 while keeping the SkeletonRecall
+loss, transform pipeline, and data loaders untouched. It targets the failure mode
+described in [issue #191](https://github.com/ScrollPrize/villa/issues/191) (surface
+predictions in compressed / highly curved areas). On a held-out 7-cube benchmark
+over PHerc Paris 1 (S1), scored with the official Kaggle Vesuvius Surface
+Detection metric (0.30 × TopoScore + 0.35 × SurfaceDice@τ + 0.35 × VOI_score,
+threshold 0.5), it scores 0.4397 vs the d058 ResEnc-L production model's 0.3996
+(+0.040, +10.0% relative) and wins on all 7 cubes. The recommended deployment is
+a voxel-wise `max(d058, MN)` ensemble (0.4437). Full methodology, per-cube
+breakdown, and a downstream ink-AUC sanity check:
+[PR #975](https://github.com/ScrollPrize/villa/pull/975) and the
+[supporting writeup](https://github.com/ciscoriordan/mednext-vs-umamba-scroll/blob/main/docs/pr925_re_pitch.md).
+
+Install the extra dependency:
+
+```
+pip install -e ".[mednext]"
+```
+
+(The `mednext` extra installs [`mednextv1`](https://github.com/MIC-DKFZ/MedNeXt)
+from its GitHub source; it is not on PyPI and not vendored here.)
+
+Train:
+
+```
+nnUNetv2_train DATASET_ID 3d_fullres 0 -tr nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5
+```
+
+A kernel3 variant (`nnUNetTrainerSkeletonRecall_MedNeXtL_kernel3`) is in the
+same file as a memory-tight fallback.
+
+Pretrained weights on Hugging Face (best checkpoint: `kernel5_skelrec_dataset059_ep33/`):
+https://huggingface.co/ciscoriordan/mednext-l-scroll-surface

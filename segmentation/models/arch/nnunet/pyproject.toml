@@ -91,6 +91,14 @@ dev = [
     "ruff",
     "pre-commit"
 ]
+# Only needed for the MedNeXt trainers under
+# nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5.py
+# Install with: pip install -e ".[mednext]"
+# mednextv1 is not published to PyPI; install it from the upstream GitHub source
+# (MIC-DKFZ/MedNeXt documents `git clone` + `pip install -e .`).
+mednext = [
+    "mednextv1 @ git+https://github.com/MIC-DKFZ/MedNeXt.git"
+]
 
 [build-system]
 requires = ["setuptools>=67.8.0"]
