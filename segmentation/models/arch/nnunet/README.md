@@ -55,3 +55,37 @@ Convert to an ome-zarr (thanks chuck! more info here https://github.com/KhartesV
 ### train 
 Preprocess: `nnUNetv2_plan_and_preprocess -d 050 -pl nnUNetPlannerResEncL -c 3d_fullres --verify_dataset_integrity`
 Run training: `nnUNetv2_train 050 3d_fullres 0 -p nnUNetResEncUNetMPlans`
+
+### MedNeXt-L + SkeletonRecall trainer (for compressed / highly curved regions)
+
+The `nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5` trainer
+(`nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5.py`)
+swaps the default ResEnc U-Net for MedNeXt-L kernel5 while keeping the SkeletonRecall
+loss, transform pipeline, and data loaders untouched. It targets the failure mode
+described in [issue #191](https://github.com/ScrollPrize/villa/issues/191) (surface
+predictions in compressed / highly curved areas). On a held-out 5-cube benchmark
+over PHerc Paris 1 (S1) and PHerc 1667 (S4), it scores +0.267 absolute
+high_compressed IoU (+66% relative) over the d058 ResEnc-L production model;
+overall_macro IoU 0.534 → 0.685. Numbers and methodology:
+[issue #191 comment](https://github.com/ScrollPrize/villa/issues/191#issuecomment-4472801908).
+
+Install the extra dependency:
+
+```
+pip install -e ".[mednext]"
+```
+
+(This pulls in [`mednextv1`](https://github.com/MIC-DKFZ/MedNeXt), which provides
+the MedNeXt architecture; it is not vendored.)
+
+Train:
+
+```
+nnUNetv2_train DATASET_ID 3d_fullres 0 -tr nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5
+```
+
+A kernel3 variant (`nnUNetTrainerSkeletonRecall_MedNeXtL_kernel3`) is in the
+same file as a memory-tight fallback.
+
+Pretrained weights on Hugging Face (best checkpoint: `kernel5_skelrec_dataset059_ep33/`):
+https://huggingface.co/ciscoriordan/mednext-l-scroll-surface

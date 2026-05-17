@@ -91,6 +91,12 @@ dev = [
     "ruff",
     "pre-commit"
 ]
+# Only needed for the MedNeXt trainers under
+# nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5.py
+# Install with: pip install -e ".[mednext]"
+mednext = [
+    "mednextv1"
+]
 
 [build-system]
 requires = ["setuptools>=67.8.0"]
