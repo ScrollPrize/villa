@@ -53,7 +53,10 @@ OUTPUT_TIFXYZ_VOXEL_SIZE_UM = None
 RUN_OUTPUT_DIR = None
 RUN_TIMESTAMP = None
 MERGE_OUTPUTS_CHUNK_SIZE = 256
-MERGE_OUTPUTS_MMAP_DIR = "/tmp/streamline_tmp_outputs/"
+MERGE_OUTPUTS_MMAP_DIR = os.environ.get(
+    "VESUVIUS_MERGE_MMAP_DIR",
+    "/ephemeral/streamline_tmp_outputs/",
+)
 GEOMEDIAN_VECTOR_OUTPUTS = ("velocity_dir", "surface_attract")
 VECTOR_MERGE_METHOD = "mean"  # "geomedian" or "mean"
 GEOMEDIAN_MAX_ITER = 8
@@ -2291,6 +2294,64 @@ def _regularize_tifxyz_front_spacing(sampled_points, sampled_active, tifxyz_step
     return sampled_points, sampled_active
 
 
+def _component_diagnostic(tifxyz_path):
+    """Count 4-connected components of the saved tifxyz's valid mask.
+
+    Returns a small dict with `count`, `top_sizes`, `largest_fraction`. Used to
+    verify the fix that prevented disconnected floaters from appearing.
+    """
+    try:
+        import tifffile  # local import; only used on rank 0 once per iter
+        from scipy import ndimage
+        path = Path(tifxyz_path)
+        x = tifffile.imread(str(path / "x.tif")).astype(np.float32)
+        y = tifffile.imread(str(path / "y.tif")).astype(np.float32)
+        z = tifffile.imread(str(path / "z.tif")).astype(np.float32)
+        valid = (x != -1) & (y != -1) & (z != -1) & np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+        if not bool(valid.any()):
+            return {"count": 0, "top_sizes": [], "largest_fraction": 0.0, "total_valid": 0}
+        lab, n = ndimage.label(valid, structure=np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]]))
+        sizes = np.bincount(lab.ravel())[1:]
+        sizes_sorted = sorted(sizes.tolist(), reverse=True)
+        total = int(valid.sum())
+        return {
+            "count": int(n),
+            "top_sizes": [int(s) for s in sizes_sorted[:8]],
+            "largest_fraction": float(sizes_sorted[0]) / float(total) if total else 0.0,
+            "total_valid": total,
+        }
+    except Exception as exc:
+        return {"count": -1, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _per_line_edge_index(valid_2d, axis, edge_idx):
+    """Per-row (axis="col") or per-col (axis="row") edge index of the valid mask.
+
+    For axis="col" returns int64[rows] giving each row's leftmost (edge_idx==0)
+    or rightmost (edge_idx==-1) valid column index, or -1 for empty rows.
+    For axis="row" returns int64[cols] giving each col's topmost / bottommost
+    valid row index, or -1 for empty cols.
+    """
+    valid_2d = np.asarray(valid_2d, dtype=bool)
+    if axis == "col":
+        n_rows, n_cols = valid_2d.shape
+        any_along = valid_2d.any(axis=1)
+        idx = np.full(n_rows, -1, dtype=np.int64)
+        if edge_idx == 0 or n_cols == 1:
+            idx[any_along] = np.argmax(valid_2d[any_along], axis=1)
+        else:
+            idx[any_along] = n_cols - 1 - np.argmax(valid_2d[any_along, ::-1], axis=1)
+        return idx
+    n_rows, n_cols = valid_2d.shape
+    any_along = valid_2d.any(axis=0)
+    idx = np.full(n_cols, -1, dtype=np.int64)
+    if edge_idx == 0 or n_rows == 1:
+        idx[any_along] = np.argmax(valid_2d[:, any_along], axis=0)
+    else:
+        idx[any_along] = n_rows - 1 - np.argmax(valid_2d[::-1, any_along], axis=0)
+    return idx
+
+
 def _build_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction, integration_group):
     base = np.asarray(stored_zyxs, dtype=np.float32).copy()
     valid = np.asarray(valid, dtype=bool)
@@ -2321,30 +2382,87 @@ def _build_merged_streamline_tifxyz(stored_zyxs, valid, edge_zyx, cond_direction
 
     spec = _get_direction_spec(cond_direction)
     n_steps = int(sampled_points.shape[0])
+    sign = -1 if spec["edge_idx"] == 0 else +1
+    edge_valid_indices = np.flatnonzero(edge_valid)
+    valid_mask_base = _valid_surface_mask(base)
+
     if spec["axis"] == "col":
         if edge.shape[0] != base.shape[0]:
             raise RuntimeError(f"Conditioning edge length {edge.shape[0]} does not match tifxyz rows {base.shape[0]}.")
-        strip = np.full((base.shape[0], n_steps, 3), -1.0, dtype=np.float32)
-        strip_active = np.zeros((base.shape[0], n_steps), dtype=bool)
-        strip[edge_valid, :, :] = np.moveaxis(sampled_points, 0, 1)
-        strip_active[edge_valid, :] = np.moveaxis(sampled_active, 0, 1)
-        strip[~strip_active] = -1.0
-        if spec["edge_idx"] == 0:
-            strip = strip[:, ::-1, :]
-            return np.concatenate([strip, base], axis=1)
-        return np.concatenate([base, strip], axis=1)
+        per_line_idx = _per_line_edge_index(valid_mask_base, "col", spec["edge_idx"])
+        rows = int(base.shape[0])
+        cols = int(base.shape[1])
+        # Compute placement extents on the active samples only.
+        placements_max = -1
+        placements_min = 10 ** 18
+        for k, R in enumerate(edge_valid_indices):
+            E = int(per_line_idx[R])
+            if E < 0:
+                continue
+            for s in range(n_steps):
+                if not bool(sampled_active[s, k]):
+                    continue
+                c = E + sign * (s + 1)
+                if c > placements_max:
+                    placements_max = c
+                if c < placements_min:
+                    placements_min = c
+        shift = max(0, -placements_min) if placements_min != 10 ** 18 else 0
+        if placements_max == -1:
+            target_cols = cols + shift
+        else:
+            target_cols = max(cols + shift, placements_max + shift + 1)
+        output = np.full((rows, target_cols, 3), -1.0, dtype=np.float32)
+        output[:, shift:shift + cols, :] = base
+        for k, R in enumerate(edge_valid_indices):
+            E = int(per_line_idx[R])
+            if E < 0:
+                continue
+            for s in range(n_steps):
+                if not bool(sampled_active[s, k]):
+                    continue
+                c = E + shift + sign * (s + 1)
+                if 0 <= c < target_cols:
+                    output[R, c, :] = sampled_points[s, k, :]
+        return output
 
     if edge.shape[0] != base.shape[1]:
         raise RuntimeError(f"Conditioning edge length {edge.shape[0]} does not match tifxyz columns {base.shape[1]}.")
-    strip = np.full((n_steps, base.shape[1], 3), -1.0, dtype=np.float32)
-    strip_active = np.zeros((n_steps, base.shape[1]), dtype=bool)
-    strip[:, edge_valid, :] = sampled_points
-    strip_active[:, edge_valid] = sampled_active
-    strip[~strip_active] = -1.0
-    if spec["edge_idx"] == 0:
-        strip = strip[::-1, :, :]
-        return np.concatenate([strip, base], axis=0)
-    return np.concatenate([base, strip], axis=0)
+    per_line_idx = _per_line_edge_index(valid_mask_base, "row", spec["edge_idx"])
+    rows = int(base.shape[0])
+    cols = int(base.shape[1])
+    placements_max = -1
+    placements_min = 10 ** 18
+    for k, C in enumerate(edge_valid_indices):
+        E = int(per_line_idx[C])
+        if E < 0:
+            continue
+        for s in range(n_steps):
+            if not bool(sampled_active[s, k]):
+                continue
+            r = E + sign * (s + 1)
+            if r > placements_max:
+                placements_max = r
+            if r < placements_min:
+                placements_min = r
+    shift = max(0, -placements_min) if placements_min != 10 ** 18 else 0
+    if placements_max == -1:
+        target_rows = rows + shift
+    else:
+        target_rows = max(rows + shift, placements_max + shift + 1)
+    output = np.full((target_rows, cols, 3), -1.0, dtype=np.float32)
+    output[shift:shift + rows, :, :] = base
+    for k, C in enumerate(edge_valid_indices):
+        E = int(per_line_idx[C])
+        if E < 0:
+            continue
+        for s in range(n_steps):
+            if not bool(sampled_active[s, k]):
+                continue
+            r = E + shift + sign * (s + 1)
+            if 0 <= r < target_rows:
+                output[r, C, :] = sampled_points[s, k, :]
+    return output
 
 
 def save_merged_streamline_tifxyz(
@@ -2711,6 +2829,8 @@ def _run_streamline_iteration(
                 voxelized_bboxes=voxelized_bboxes,
                 integration_group=integration_result["group"],
             )
+        output_components = _component_diagnostic(output_tifxyz_path)
+        print(f"output_components: {output_components}")
         result = {
             "input_tifxyz_path": Path(input_tifxyz_path),
             "output_tifxyz_path": Path(output_tifxyz_path),
@@ -2728,6 +2848,7 @@ def _run_streamline_iteration(
             "distributed_world_size": int(context.world_size),
             "distributed_backend": str(context.backend),
             "distributed_batch_assignment": inference_result["batch_assignment"],
+            "output_components": output_components,
         }
         return result
     finally:
