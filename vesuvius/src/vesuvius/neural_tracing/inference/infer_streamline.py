@@ -1289,16 +1289,22 @@ class _SparseChunkOutputMerger:
                     key for key in self.sum_chunks
                     if key[0] == output_name
                 )
-                for key in tqdm(output_chunk_keys, desc=f"Finalizing {output_name}", unit="chunk"):
+                # Parallel mean-finalize: each chunk read/divide/write is independent and
+                # the underlying numpy + zarr-blosc operations release the GIL during their
+                # heavy work. With ~570 chunks/iter and ~1.6 GB chunk-sum bytes, this is
+                # dominated by I/O on the merger's mmap-backed temp files and the zarr
+                # output's blosc encode. Threading turns ~2 min/field → ~10-20 s/field.
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+                workers = max(1, int(os.environ.get("VESUVIUS_FINALIZE_WORKERS", "16")))
+                def _process_one(key):
                     _, zz, yy, xx = key
                     sum_chunk = self.sum_chunks[key]
                     count_chunk = self.count_chunks[(zz, yy, xx)]
                     region = self._chunk_region((zz, yy, xx))
-
                     count = count_chunk.astype(np.float32, copy=False)
                     valid = count > 0
                     if not bool(valid.any()):
-                        continue
+                        return
                     avg_chunk = np.empty(sum_chunk.shape, dtype=np.float32)
                     if bool(valid.all()):
                         np.divide(sum_chunk, count[None, ...], out=avg_chunk)
@@ -1306,6 +1312,13 @@ class _SparseChunkOutputMerger:
                         avg_chunk.fill(0.0)
                         np.divide(sum_chunk, count[None, ...], out=avg_chunk, where=valid[None, ...])
                     avg[(slice(None), *region)] = avg_chunk
+                with _TPE(max_workers=workers) as ex:
+                    list(tqdm(
+                        ex.map(_process_one, output_chunk_keys),
+                        total=len(output_chunk_keys),
+                        desc=f"Finalizing {output_name} (par={workers})",
+                        unit="chunk",
+                    ))
             return avg_group
         finally:
             if self._tmpdir is not None:
