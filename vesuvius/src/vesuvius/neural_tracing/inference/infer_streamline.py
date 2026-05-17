@@ -3107,6 +3107,11 @@ def _parse_args(argv=None):
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.add_argument("--save-each-iteration", dest="save_each_iteration", action="store_true", default=True)
     parser.add_argument("--final-only", dest="save_each_iteration", action="store_false")
+    parser.add_argument("--trace-validity-threshold", dest="trace_validity_threshold", type=float, default=None,
+                        help="Sigmoid threshold on the model's trace_validity logit for accepting an "
+                             "integrated candidate. Lower = more candidates accepted (faster growth, less "
+                             "conservative). Default unchanged at "
+                             f"{TRACE_VALIDITY_THRESHOLD} when not specified.")
     parser.add_argument("--rectangular-crop", dest="rectangular_crop", action="store_true", default=True,
                         help="Preprocess input mesh by cropping to the largest "
                              "rectangle with a uniform conditioning edge (smooth "
@@ -3121,7 +3126,10 @@ def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tif
     global CHECKPOINT_PATH, BATCH_SIZE, DEVICE, COMPILE_MODEL, OUTPUT_TIFXYZ_DIR
     global OUTPUT_TIFXYZ_VOXEL_SIZE_UM, RUN_OUTPUT_DIR, RUN_TIMESTAMP, USE_TTA
     global GROW_DIRECTION, TIFXYZ_VOXEL_STEP, TIFXYZ_STEPS, NUM_ITERATIONS
-    global SAVE_EACH_ITERATION_TIFXYZ, SHOW_NAPARI
+    global SAVE_EACH_ITERATION_TIFXYZ, SHOW_NAPARI, TRACE_VALIDITY_THRESHOLD
+
+    if getattr(args, "trace_validity_threshold", None) is not None:
+        TRACE_VALIDITY_THRESHOLD = float(args.trace_validity_threshold)
 
     TIFXYZ_PATH = str(Path(args.tifxyz_path).resolve())
     CHECKPOINT_PATH = str(Path(args.checkpoint_path).resolve())
