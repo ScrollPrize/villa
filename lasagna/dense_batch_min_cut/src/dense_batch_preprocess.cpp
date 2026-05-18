@@ -2473,6 +2473,11 @@ struct SkeletonGraph {
     int edge_path_pixels = 0;
     int unique_edge_pixels = 0;
     int missing_pixels = 0;
+    int adjacent_component_repairs = 0;
+    int adjacent_component_contacts = 0;
+    int pruned_graph_components = 0;
+    int pruned_graph_nodes = 0;
+    int pruned_graph_edges = 0;
 };
 
 struct GraphComponentStats {
@@ -2496,6 +2501,15 @@ struct GraphConnectivityStats {
     int edge_path_pixels = 0;
     int unique_edge_pixels = 0;
     int missing_pixels = 0;
+    int adjacent_component_repairs = 0;
+    int adjacent_component_contacts = 0;
+    cv::Point adjacent_component_a{-1, -1};
+    cv::Point adjacent_component_b{-1, -1};
+    int adjacent_component_a_id = -1;
+    int adjacent_component_b_id = -1;
+    int pruned_graph_components = 0;
+    int pruned_graph_nodes = 0;
+    int pruned_graph_edges = 0;
 };
 
 std::vector<cv::Point> skeleton_neighbors(const cv::Mat& skeleton,
@@ -2935,6 +2949,344 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
         }
     }
 
+    struct RasterComponentContact {
+        bool found = false;
+        cv::Point a{-1, -1};
+        cv::Point b{-1, -1};
+        int component_a = -1;
+        int component_b = -1;
+        int contacts = 0;
+    };
+
+    const auto edge_capacity_from_pixels =
+        [&](const std::vector<cv::Point>& pixels) {
+            float capacity = std::numeric_limits<float>::max();
+            for (const cv::Point pixel : pixels) {
+                if (!in_bounds(pixel)) {
+                    continue;
+                }
+                capacity = std::min(
+                    capacity, capacity_from_dt(dt.at<float>(pixel.y, pixel.x)));
+            }
+            return capacity == std::numeric_limits<float>::max() ? 0.0f
+                                                                 : capacity;
+        };
+
+    const auto node_component_ids = [&]() {
+        struct LocalDisjointSet {
+            std::vector<int> parent;
+            explicit LocalDisjointSet(int n)
+                : parent(static_cast<std::size_t>(n)) {
+                std::iota(parent.begin(), parent.end(), 0);
+            }
+            int find(int x) {
+                while (parent[x] != x) {
+                    parent[x] = parent[parent[x]];
+                    x = parent[x];
+                }
+                return x;
+            }
+            void unite(int a, int b) {
+                a = find(a);
+                b = find(b);
+                if (a != b) {
+                    parent[b] = a;
+                }
+            }
+        };
+
+        const int node_count = static_cast<int>(graph.nodes.size());
+        LocalDisjointSet sets(node_count);
+        const auto valid_node = [&](int node) {
+            return node > 0 && node < node_count;
+        };
+        for (const GraphEdge& edge : graph.edges) {
+            if (valid_node(edge.a) && valid_node(edge.b) &&
+                edge.a != edge.b) {
+                sets.unite(edge.a, edge.b);
+            }
+        }
+
+        std::vector<int> root_to_component(
+            static_cast<std::size_t>(node_count), -1);
+        std::vector<int> node_component(
+            static_cast<std::size_t>(node_count), -1);
+        int next_component = 0;
+        for (int node = 1; node < node_count; ++node) {
+            const int root = sets.find(node);
+            int& component =
+                root_to_component[static_cast<std::size_t>(root)];
+            if (component < 0) {
+                component = next_component++;
+            }
+            node_component[static_cast<std::size_t>(node)] = component;
+        }
+        return node_component;
+    };
+
+    const auto find_raster_component_contact = [&]() {
+        RasterComponentContact contact;
+        const std::vector<int> node_component = node_component_ids();
+        const int node_count = static_cast<int>(node_component.size());
+        const auto component_for_node = [&](int node) {
+            if (node <= 0 || node >= node_count) {
+                return -1;
+            }
+            return node_component[static_cast<std::size_t>(node)];
+        };
+
+        cv::Mat pixel_component(skel.size(), CV_32S, cv::Scalar(-1));
+        const auto set_pixel_component = [&](const cv::Point pixel,
+                                             int component) {
+            if (!in_bounds(pixel) || component < 0) {
+                return;
+            }
+            int& dst = pixel_component.at<int>(pixel.y, pixel.x);
+            if (dst < 0) {
+                dst = component;
+            }
+        };
+
+        const std::size_t node_group_count =
+            std::min(node_pixels.size(), node_component.size());
+        for (std::size_t node = 1; node < node_group_count; ++node) {
+            const int component = node_component[node];
+            for (const cv::Point pixel : node_pixels[node]) {
+                set_pixel_component(pixel, component);
+            }
+        }
+        for (const GraphEdge& edge : graph.edges) {
+            int component = component_for_node(edge.a);
+            if (component < 0) {
+                component = component_for_node(edge.b);
+            }
+            for (const cv::Point pixel : edge.pixels) {
+                set_pixel_component(pixel, component);
+            }
+        }
+
+        const std::array<cv::Point, 4> forward_dirs = {
+            {{1, 0}, {-1, 1}, {0, 1}, {1, 1}}};
+        for (int y = 0; y < rows; ++y) {
+            const int* component_row = pixel_component.ptr<int>(y);
+            for (int x = 0; x < cols; ++x) {
+                const int component = component_row[x];
+                if (component < 0) {
+                    continue;
+                }
+                const cv::Point pixel(x, y);
+                for (const cv::Point dir : forward_dirs) {
+                    const cv::Point neighbor = pixel + dir;
+                    if (!in_bounds(neighbor)) {
+                        continue;
+                    }
+                    const int other =
+                        pixel_component.at<int>(neighbor.y, neighbor.x);
+                    if (other < 0 || other == component) {
+                        continue;
+                    }
+                    ++contact.contacts;
+                    if (!contact.found) {
+                        contact.found = true;
+                        contact.a = pixel;
+                        contact.b = neighbor;
+                        contact.component_a = component;
+                        contact.component_b = other;
+                    }
+                }
+            }
+        }
+        return contact;
+    };
+
+    const auto split_edge_at_pixel = [&](int edge_index,
+                                         const cv::Point pixel) {
+        if (edge_index < 0 ||
+            edge_index >= static_cast<int>(graph.edges.size())) {
+            return make_node(pixel);
+        }
+
+        const GraphEdge edge = graph.edges[static_cast<std::size_t>(
+            edge_index)];
+        const auto it =
+            std::find(edge.pixels.begin(), edge.pixels.end(), pixel);
+        if (it == edge.pixels.end()) {
+            return make_node(pixel);
+        }
+
+        const int node = make_node(pixel);
+        const int split_index =
+            static_cast<int>(std::distance(edge.pixels.begin(), it));
+        std::vector<cv::Point> first(edge.pixels.begin(),
+                                     edge.pixels.begin() + split_index + 1);
+        std::vector<cv::Point> second(edge.pixels.begin() + split_index,
+                                      edge.pixels.end());
+
+        graph.edges[static_cast<std::size_t>(edge_index)] =
+            GraphEdge{edge.a, node, edge_capacity_from_pixels(first), first};
+        graph.edges.push_back(
+            GraphEdge{node, edge.b, edge_capacity_from_pixels(second), second});
+        return node;
+    };
+
+    const auto ensure_graph_node_at_pixel = [&](const cv::Point pixel) {
+        if (!in_bounds(pixel)) {
+            return 0;
+        }
+        const int existing = node_labels.at<int>(pixel.y, pixel.x);
+        if (existing > 0) {
+            return existing;
+        }
+        for (int edge_index = 0;
+             edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
+            const std::vector<cv::Point>& pixels =
+                graph.edges[static_cast<std::size_t>(edge_index)].pixels;
+            if (std::find(pixels.begin(), pixels.end(), pixel) !=
+                pixels.end()) {
+                return split_edge_at_pixel(edge_index, pixel);
+            }
+        }
+        return make_node(pixel);
+    };
+
+    int adjacent_component_repairs = 0;
+    const int max_adjacent_component_repairs =
+        std::max(1, graph.skeleton_pixels * 4);
+    while (true) {
+        const RasterComponentContact contact =
+            find_raster_component_contact();
+        if (!contact.found) {
+            graph.adjacent_component_contacts = contact.contacts;
+            break;
+        }
+        if (adjacent_component_repairs >= max_adjacent_component_repairs) {
+            graph.adjacent_component_contacts = contact.contacts;
+            break;
+        }
+
+        const int node_a = ensure_graph_node_at_pixel(contact.a);
+        const int node_b = ensure_graph_node_at_pixel(contact.b);
+        if (node_a > 0 && node_b > 0 && node_a != node_b) {
+            std::vector<cv::Point> connector_pixels{contact.a, contact.b};
+            graph.edges.push_back(
+                GraphEdge{node_a, node_b,
+                          edge_capacity_from_pixels(connector_pixels),
+                          connector_pixels});
+            ++adjacent_component_repairs;
+        } else {
+            break;
+        }
+    }
+    graph.adjacent_component_repairs = adjacent_component_repairs;
+
+    const auto prune_to_largest_graph_component = [&]() {
+        const std::vector<int> node_component = node_component_ids();
+        int component_count = 0;
+        for (int node = 1; node < static_cast<int>(node_component.size());
+             ++node) {
+            component_count =
+                std::max(component_count, node_component[node] + 1);
+        }
+        if (component_count <= 1) {
+            return;
+        }
+
+        std::vector<int> component_nodes(
+            static_cast<std::size_t>(component_count), 0);
+        std::vector<int> component_edges(
+            static_cast<std::size_t>(component_count), 0);
+        for (int node = 1; node < static_cast<int>(node_component.size());
+             ++node) {
+            const int component = node_component[node];
+            if (component >= 0) {
+                ++component_nodes[static_cast<std::size_t>(component)];
+            }
+        }
+        for (const GraphEdge& edge : graph.edges) {
+            if (edge.a <= 0 ||
+                edge.a >= static_cast<int>(node_component.size())) {
+                continue;
+            }
+            const int component = node_component[edge.a];
+            if (component >= 0) {
+                ++component_edges[static_cast<std::size_t>(component)];
+            }
+        }
+
+        int keep_component = 0;
+        for (int component = 1; component < component_count; ++component) {
+            if (component_nodes[component] > component_nodes[keep_component] ||
+                (component_nodes[component] == component_nodes[keep_component] &&
+                 component_edges[component] >
+                     component_edges[keep_component])) {
+                keep_component = component;
+            }
+        }
+
+        std::vector<int> node_remap(node_component.size(), -1);
+        node_remap[0] = 0;
+        std::vector<cv::Point2f> kept_nodes;
+        std::vector<std::vector<cv::Point>> kept_node_pixels;
+        kept_nodes.push_back(graph.nodes.front());
+        kept_node_pixels.emplace_back();
+        for (int node = 1; node < static_cast<int>(node_component.size());
+             ++node) {
+            if (node_component[node] != keep_component) {
+                continue;
+            }
+            node_remap[node] = static_cast<int>(kept_nodes.size());
+            kept_nodes.push_back(graph.nodes[static_cast<std::size_t>(node)]);
+            if (node < static_cast<int>(node_pixels.size())) {
+                kept_node_pixels.push_back(
+                    node_pixels[static_cast<std::size_t>(node)]);
+            } else {
+                kept_node_pixels.emplace_back();
+            }
+        }
+
+        std::vector<GraphEdge> kept_edges;
+        kept_edges.reserve(graph.edges.size());
+        for (GraphEdge edge : graph.edges) {
+            if (edge.a <= 0 || edge.b <= 0 ||
+                edge.a >= static_cast<int>(node_remap.size()) ||
+                edge.b >= static_cast<int>(node_remap.size())) {
+                continue;
+            }
+            const int a = node_remap[static_cast<std::size_t>(edge.a)];
+            const int b = node_remap[static_cast<std::size_t>(edge.b)];
+            if (a <= 0 || b <= 0) {
+                continue;
+            }
+            edge.a = a;
+            edge.b = b;
+            kept_edges.push_back(std::move(edge));
+        }
+
+        graph.pruned_graph_components = component_count - 1;
+        graph.pruned_graph_nodes =
+            static_cast<int>(graph.nodes.size()) -
+            static_cast<int>(kept_nodes.size());
+        graph.pruned_graph_edges =
+            static_cast<int>(graph.edges.size()) -
+            static_cast<int>(kept_edges.size());
+        graph.nodes = std::move(kept_nodes);
+        graph.edges = std::move(kept_edges);
+        node_pixels = std::move(kept_node_pixels);
+    };
+
+    prune_to_largest_graph_component();
+    graph.adjacent_component_contacts =
+        find_raster_component_contact().contacts;
+
+    graph.node_mask = cv::Mat::zeros(skel.size(), CV_8U);
+    for (std::size_t node = 1; node < node_pixels.size(); ++node) {
+        for (const cv::Point pixel : node_pixels[node]) {
+            if (in_bounds(pixel)) {
+                graph.node_mask.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+            }
+        }
+    }
+
     graph.node_pixels = cv::countNonZero(graph.node_mask);
     graph.edge_mask = cv::Mat::zeros(skel.size(), CV_8U);
     graph.edge_path_pixels = 0;
@@ -3114,6 +3466,98 @@ std::vector<int> graph_node_component_ids(const SkeletonGraph& graph) {
     return node_component;
 }
 
+struct GraphRasterAdjacencyStats {
+    int contacts = 0;
+    cv::Point a{-1, -1};
+    cv::Point b{-1, -1};
+    int component_a = -1;
+    int component_b = -1;
+};
+
+GraphRasterAdjacencyStats graph_raster_adjacency_stats(
+    const SkeletonGraph& graph) {
+    GraphRasterAdjacencyStats stats;
+    if (graph.node_mask.empty()) {
+        return stats;
+    }
+
+    const cv::Size size = graph.node_mask.size();
+    const std::vector<int> node_component = graph_node_component_ids(graph);
+    const int node_count = static_cast<int>(node_component.size());
+    const auto in_bounds = [size](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < size.width && pixel.y >= 0 &&
+               pixel.y < size.height;
+    };
+    const auto component_for_node = [&](int node) {
+        if (node <= 0 || node >= node_count) {
+            return -1;
+        }
+        return node_component[static_cast<std::size_t>(node)];
+    };
+
+    cv::Mat pixel_component(size, CV_32S, cv::Scalar(-1));
+    const auto set_pixel_component = [&](const cv::Point pixel,
+                                         int component) {
+        if (!in_bounds(pixel) || component < 0) {
+            return;
+        }
+        int& dst = pixel_component.at<int>(pixel.y, pixel.x);
+        if (dst < 0) {
+            dst = component;
+        }
+    };
+
+    const std::size_t node_group_count =
+        std::min(graph.node_pixel_groups.size(), node_component.size());
+    for (std::size_t node = 1; node < node_group_count; ++node) {
+        const int component = node_component[node];
+        for (const cv::Point pixel : graph.node_pixel_groups[node]) {
+            set_pixel_component(pixel, component);
+        }
+    }
+    for (const GraphEdge& edge : graph.edges) {
+        int component = component_for_node(edge.a);
+        if (component < 0) {
+            component = component_for_node(edge.b);
+        }
+        for (const cv::Point pixel : edge.pixels) {
+            set_pixel_component(pixel, component);
+        }
+    }
+
+    const std::array<cv::Point, 4> forward_dirs = {
+        {{1, 0}, {-1, 1}, {0, 1}, {1, 1}}};
+    for (int y = 0; y < size.height; ++y) {
+        const int* component_row = pixel_component.ptr<int>(y);
+        for (int x = 0; x < size.width; ++x) {
+            const int component = component_row[x];
+            if (component < 0) {
+                continue;
+            }
+            const cv::Point pixel(x, y);
+            for (const cv::Point dir : forward_dirs) {
+                const cv::Point neighbor = pixel + dir;
+                if (!in_bounds(neighbor)) {
+                    continue;
+                }
+                const int other =
+                    pixel_component.at<int>(neighbor.y, neighbor.x);
+                if (other < 0 || other == component) {
+                    continue;
+                }
+                ++stats.contacts;
+                if (stats.a.x < 0) {
+                    stats.a = pixel;
+                    stats.b = neighbor;
+                    stats.component_a = component;
+                    stats.component_b = other;
+                }
+            }
+        }
+    }
+    return stats;
+}
+
 cv::Mat render_graph_component_colors(const SkeletonGraph& graph, cv::Size size) {
     cv::Mat out(size, CV_8UC3, cv::Scalar(0, 0, 0));
     const std::vector<int> node_component = graph_node_component_ids(graph);
@@ -3205,6 +3649,17 @@ GraphConnectivityStats graph_connectivity_stats(const SkeletonGraph& graph) {
     stats.edge_path_pixels = graph.edge_path_pixels;
     stats.unique_edge_pixels = graph.unique_edge_pixels;
     stats.missing_pixels = graph.missing_pixels;
+    stats.adjacent_component_repairs = graph.adjacent_component_repairs;
+    const GraphRasterAdjacencyStats raster_adjacency =
+        graph_raster_adjacency_stats(graph);
+    stats.adjacent_component_contacts = raster_adjacency.contacts;
+    stats.adjacent_component_a = raster_adjacency.a;
+    stats.adjacent_component_b = raster_adjacency.b;
+    stats.adjacent_component_a_id = raster_adjacency.component_a;
+    stats.adjacent_component_b_id = raster_adjacency.component_b;
+    stats.pruned_graph_components = graph.pruned_graph_components;
+    stats.pruned_graph_nodes = graph.pruned_graph_nodes;
+    stats.pruned_graph_edges = graph.pruned_graph_edges;
 
     for (const GraphEdge& edge : graph.edges) {
         const bool valid_a = valid_node(edge.a);
@@ -3277,6 +3732,19 @@ GraphConnectivityStats graph_connectivity_stats(const SkeletonGraph& graph) {
 }
 
 std::string graph_connectivity_error(const GraphConnectivityStats& stats) {
+    if (stats.adjacent_component_contacts > 0) {
+        std::ostringstream out;
+        out << "graph extraction left raster-adjacent disconnected components:"
+            << " contacts=" << stats.adjacent_component_contacts
+            << " first=(" << stats.adjacent_component_a.x << ","
+            << stats.adjacent_component_a.y << ")-("
+            << stats.adjacent_component_b.x << ","
+            << stats.adjacent_component_b.y << ")"
+            << " components=" << stats.adjacent_component_a_id << ","
+            << stats.adjacent_component_b_id
+            << " repairs=" << stats.adjacent_component_repairs;
+        return out.str();
+    }
     if (stats.valid_nodes > 0 && stats.components.size() == 1) {
         return {};
     }
@@ -3314,6 +3782,22 @@ void write_graph_connectivity_report(const fs::path& path,
     out << "edge_path_pixels: " << stats.edge_path_pixels << "\n";
     out << "unique_edge_pixels: " << stats.unique_edge_pixels << "\n";
     out << "missing_pixels: " << stats.missing_pixels << "\n";
+    out << "adjacent_component_repairs: "
+        << stats.adjacent_component_repairs << "\n";
+    out << "adjacent_component_contacts: "
+        << stats.adjacent_component_contacts << "\n";
+    out << "pruned_graph_components: "
+        << stats.pruned_graph_components << "\n";
+    out << "pruned_graph_nodes: " << stats.pruned_graph_nodes << "\n";
+    out << "pruned_graph_edges: " << stats.pruned_graph_edges << "\n";
+    if (stats.adjacent_component_contacts > 0) {
+        out << "adjacent_component_first: " << stats.adjacent_component_a.x
+            << "," << stats.adjacent_component_a.y << " "
+            << stats.adjacent_component_b.x << ","
+            << stats.adjacent_component_b.y << " components="
+            << stats.adjacent_component_a_id << ","
+            << stats.adjacent_component_b_id << "\n";
+    }
     out << "\n";
     out << "component,nodes,edges,self_loop_edges,one_endpoint_edges,zero_endpoint_edges\n";
     for (const GraphComponentStats& component : stats.components) {
@@ -7523,7 +8007,17 @@ int main(int argc, char** argv) {
                   << "  edge_path_pixels: "
                   << graph_stats.edge_path_pixels << "\n"
                   << "  missing_pixels: "
-                  << graph_stats.missing_pixels << "\n";
+                  << graph_stats.missing_pixels << "\n"
+                  << "  adjacent_component_repairs: "
+                  << graph_stats.adjacent_component_repairs << "\n"
+                  << "  adjacent_component_contacts: "
+                  << graph_stats.adjacent_component_contacts << "\n"
+                  << "  pruned_graph_components: "
+                  << graph_stats.pruned_graph_components << "\n"
+                  << "  pruned_graph_nodes: "
+                  << graph_stats.pruned_graph_nodes << "\n"
+                  << "  pruned_graph_edges: "
+                  << graph_stats.pruned_graph_edges << "\n";
         const int components_to_print =
             std::min<int>(10, graph_stats.components.size());
         for (int i = 0; i < components_to_print; ++i) {

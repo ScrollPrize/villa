@@ -101,7 +101,8 @@ Outputs:
 - `<stem>_graph_components.txt`: graph connectivity report with component node
   and edge counts, plus counts for self-loop, one-endpoint, and zero-endpoint
   edges. It also reports skeleton coverage: total skeleton pixels, node pixels,
-  unique edge pixels, edge path pixels, and missing pixels.
+  unique edge pixels, edge path pixels, missing pixels, and whether any
+  extracted graph components still touch in the raster.
 - `<stem>_dense_flow.tif`: optional 32-bit float dense source-flow map, written
   only when `--source x,y` is provided.
 - `<stem>_dense_flow_u16.tif`: optional normalized 16-bit visualization of the
@@ -135,6 +136,13 @@ the component summary.
 The extracted graph is expected to be one connected component; disconnected
 graphs write the usual debug outputs and then exit non-zero with the component
 summary.
+As a regression check for graph extraction, raster-adjacent skeleton pixels
+must not belong to different extracted graph components. The extractor repairs
+those local misses by promoting the touched edge pixels to graph nodes and
+adding a local connector edge; any remaining adjacent-component contact is an
+error before the broader connectivity check. Detached non-largest graph
+components are pruned after that repair; these are isolated skeleton islands,
+not raster-adjacent graph extraction misses.
 
 `--source x,y` must point into the light/white distance domain, not into a dark
 foreground island. The graph edge(s) bordering the source region are seeded with
