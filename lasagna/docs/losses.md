@@ -130,9 +130,12 @@ flow evaluations (default `10`). The service JPG is written every
 normalized greedy-ascent flow layer that the local gate is based on, then the
 normalized no-backtrack dense flow. The layer TIFF also includes
 `island_obstacle_factor`, which labels enclosed obstacle islands and annotates
-the local loop score. The score is `min(full_island_dt / representative_point_dt)`
-over loop pixels associated with the island, so lower values mean the island is
-acting more like a real obstacle.
+the local loop score without coloring the associated loop pixels. The score is
+`min(full_island_dt / representative_point_dt)` over loop pixels associated with
+the island, so lower values mean the island is acting more like a real obstacle.
+The debug log prints the raw score ingredients for each island: area, bbox,
+sample counts, representative point, worst loop point, raw DT values, and
+min/mean/max sampled ratios.
 
 When `anticipatory_pull.debug_points` or `debug_roi_center_xyz` is set, every normal flow-gate layer-debug
 iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.jpg`.

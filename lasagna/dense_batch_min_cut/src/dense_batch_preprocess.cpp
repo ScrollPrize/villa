@@ -3984,6 +3984,7 @@ struct IslandObstacleDebugResult {
     cv::Mat label_factor;
     int islands = 0;
     int loop_sampled_islands = 0;
+    std::vector<std::string> score_logs;
 };
 
 IslandObstacleDebugResult render_island_obstacle_factors(
@@ -4134,6 +4135,7 @@ IslandObstacleDebugResult render_island_obstacle_factors(
         cv::Point representative_pixel = island_pixels.empty()
                                              ? cv::Point(left, top)
                                              : island_pixels.front();
+        float representative_loop_distance = 0.0f;
         cv::Mat loop_source_domain(roi.size(), CV_8U, cv::Scalar(255));
         for (const cv::Point pixel : loop_pixels) {
             loop_source_domain.at<std::uint8_t>(pixel.y - roi.y,
@@ -4156,6 +4158,7 @@ IslandObstacleDebugResult render_island_obstacle_factors(
                     representative_pixel = pixel;
                 }
             }
+            representative_loop_distance = std::max(best_loop_distance, 0.0f);
         }
 
         cv::Mat actual_island_dt;
@@ -4178,6 +4181,13 @@ IslandObstacleDebugResult render_island_obstacle_factors(
 
         double score = 1.0;
         bool has_loop_score = false;
+        int scored_loop_pixels = 0;
+        double ratio_sum = 0.0;
+        double ratio_min = 1.0;
+        double ratio_max = 0.0;
+        cv::Point worst_loop_pixel(-1, -1);
+        float worst_island_distance = 0.0f;
+        float worst_single_point_distance = 0.0f;
         for (const cv::Point pixel : loop_pixels) {
             const cv::Point local(pixel.x - roi.x, pixel.y - roi.y);
             const float single_point_distance =
@@ -4191,11 +4201,49 @@ IslandObstacleDebugResult render_island_obstacle_factors(
                 static_cast<double>(island_distance) /
                     static_cast<double>(single_point_distance),
                 0.0, 1.0);
+            ++scored_loop_pixels;
+            ratio_sum += point_score;
+            ratio_min = std::min(ratio_min, point_score);
+            ratio_max = std::max(ratio_max, point_score);
+            if (point_score <= score) {
+                worst_loop_pixel = pixel;
+                worst_island_distance = island_distance;
+                worst_single_point_distance = single_point_distance;
+            }
             score = std::min(score, point_score);
             has_loop_score = true;
         }
         if (has_loop_score) {
             ++result.loop_sampled_islands;
+        }
+        {
+            std::ostringstream log;
+            log << "  island " << label << ":"
+                << " score=" << std::fixed << std::setprecision(4) << score
+                << " area=" << area << " bbox=" << left << "," << top
+                << "," << width << "x" << height
+                << " loop_pixels=" << loop_pixels.size()
+                << " scored_loop_pixels=" << scored_loop_pixels
+                << " rep=" << representative_pixel.x << ","
+                << representative_pixel.y
+                << " rep_loop_dt=" << std::setprecision(3)
+                << representative_loop_distance;
+            if (has_loop_score) {
+                const double ratio_mean =
+                    scored_loop_pixels > 0
+                        ? ratio_sum / static_cast<double>(scored_loop_pixels)
+                        : 0.0;
+                log << " worst_loop=" << worst_loop_pixel.x << ","
+                    << worst_loop_pixel.y
+                    << " island_dt=" << worst_island_distance
+                    << " point_dt=" << worst_single_point_distance
+                    << " ratio_min=" << std::setprecision(4) << ratio_min
+                    << " ratio_mean=" << ratio_mean
+                    << " ratio_max=" << ratio_max;
+            } else {
+                log << " no_loop_score";
+            }
+            result.score_logs.push_back(log.str());
         }
 
         const cv::Scalar base_color = deterministic_edge_color(label);
@@ -4207,14 +4255,7 @@ IslandObstacleDebugResult render_island_obstacle_factors(
                 std::clamp(base_color[1] * scale, 0.0, 255.0)),
             static_cast<std::uint8_t>(
                 std::clamp(base_color[2] * scale, 0.0, 255.0)));
-        const cv::Vec3b graph_color(
-            static_cast<std::uint8_t>(std::clamp(base_color[0], 0.0, 255.0)),
-            static_cast<std::uint8_t>(std::clamp(base_color[1], 0.0, 255.0)),
-            static_cast<std::uint8_t>(std::clamp(base_color[2], 0.0, 255.0)));
 
-        for (const cv::Point pixel : loop_pixels) {
-            result.label_factor.at<cv::Vec3b>(pixel.y, pixel.x) = graph_color;
-        }
         for (const cv::Point pixel : island_pixels) {
             result.label_factor.at<cv::Vec3b>(pixel.y, pixel.x) = island_color;
         }
@@ -6145,6 +6186,9 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                   << "  islands: " << island_debug.islands << "\n"
                   << "  loop_sampled_islands: "
                   << island_debug.loop_sampled_islands << "\n";
+        for (const std::string& log : island_debug.score_logs) {
+            std::cout << log << "\n";
+        }
         timings.push_back(finish_timing("island_obstacle_factor", timing));
     }
 
