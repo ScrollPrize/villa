@@ -89,6 +89,7 @@ default_config = {
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
     'loss_start_patch_dt': 5000,
+    'working_set_mode': 'global',  # 'progressive' (grow from a seed) | 'global' (fit all patches at once)
     'working_set_check_interval': 10,
     'output_winding_range': (10, 80),
     'output_winding_margin': 4,
@@ -1517,12 +1518,18 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
     patch_ids = list(patches_dict.keys())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
-    if pass_seed_patch_id not in patches_dict:
-        raise KeyError(f'pass_seed_patch_id {pass_seed_patch_id!r} not found among loaded patches')
-    seed_patch_idx = patch_ids.index(pass_seed_patch_id)
-    print(f'pass {pass_idx}: building progressive patch ordering from seed {pass_seed_patch_id} ({len(patches_list)} patches in pool)')
-    progressive_patch_order = _build_progressive_patch_order(patches_list, seed_patch_idx)
     num_patches = len(patches_list)
+    is_global_mode = cfg['working_set_mode'] == 'global'
+
+    if is_global_mode:
+        progressive_patch_order = list(range(num_patches))
+        print(f'pass {pass_idx}: global mode — fitting all {num_patches} patches at once')
+    else:
+        if pass_seed_patch_id not in patches_dict:
+            raise KeyError(f'pass_seed_patch_id {pass_seed_patch_id!r} not found among loaded patches')
+        seed_patch_idx = patch_ids.index(pass_seed_patch_id)
+        print(f'pass {pass_idx}: building progressive patch ordering from seed {pass_seed_patch_id} ({num_patches} patches in pool)')
+        progressive_patch_order = _build_progressive_patch_order(patches_list, seed_patch_idx)
 
     num_slices_for_visualisation = 20
     rendering_slices_downsample_factor = 2  # stride the scroll by this along zyx for rendering
@@ -1663,15 +1670,20 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
-    working_set_size = 1
+    working_set_size = num_patches if is_global_mode else 1
     working_set_indices = progressive_patch_order[:working_set_size]
     working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
     working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
-    print(f'step {start_iteration}: working set initialised with {working_set_size}/{num_patches} patches (seed {patch_ids[working_set_indices[0]]})')
 
     working_set_log = open(f'{out_path}/working-set.txt', 'a', buffering=1)
-    working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, seed {pass_seed_patch_id} ===\n')
-    working_set_log.write(f'step {start_iteration}: initialised with seed patch {patch_ids[working_set_indices[0]]} (size {working_set_size}/{num_patches})\n')
+    if is_global_mode:
+        print(f'step {start_iteration}: working set initialised with all {num_patches} patches (global mode)')
+        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, global mode ===\n')
+        working_set_log.write(f'step {start_iteration}: initialised with all {num_patches} patches\n')
+    else:
+        print(f'step {start_iteration}: working set initialised with {working_set_size}/{num_patches} patches (seed {patch_ids[working_set_indices[0]]})')
+        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, seed {pass_seed_patch_id} ===\n')
+        working_set_log.write(f'step {start_iteration}: initialised with seed patch {patch_ids[working_set_indices[0]]} (size {working_set_size}/{num_patches})\n')
 
     # Snapshot of the most recent state at which the working set was fully satisfied —
     # i.e. the model state taken just before each successful expansion. If the pass
@@ -1909,6 +1921,18 @@ def main():
     if run_tag:
         out_path += f'_{run_tag}'
     os.makedirs(out_path, exist_ok=True)
+
+    if cfg['working_set_mode'] == 'global':
+        fit_spiral_3d(
+            scroll_zarr_array,
+            patches,
+            list(point_collections.values()),
+            umbilicus,
+            out_path,
+            pass_seed_patch_id=None,
+            pass_idx=1,
+        )
+        return
 
     pass_pool_patches = dict(patches)
     current_seed_patch_id = seed_patch_id
