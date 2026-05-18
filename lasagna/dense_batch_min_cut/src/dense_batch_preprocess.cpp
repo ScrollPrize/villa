@@ -501,14 +501,65 @@ cv::Mat keep_source_white_component(const cv::Mat& binary,
     return filtered;
 }
 
-cv::Mat make_padded_rim_label_domain(const cv::Mat& white_domain) {
+cv::Mat keep_source_component_white_domain(const cv::Mat& white_domain,
+                                           const cv::Point source,
+                                           const std::string& context) {
     CV_Assert(white_domain.type() == CV_8U);
-    cv::Mat domain(white_domain.rows + 2, white_domain.cols + 2, CV_8U,
-                   cv::Scalar(0));
-    if (!white_domain.empty()) {
-        white_domain.copyTo(
-            domain(cv::Rect(1, 1, white_domain.cols, white_domain.rows)));
+    if (source.x < 0 || source.x >= white_domain.cols || source.y < 0 ||
+        source.y >= white_domain.rows) {
+        throw std::runtime_error(context + " source is outside the image");
     }
+    if (white_domain.at<std::uint8_t>(source.y, source.x) == 0) {
+        throw std::runtime_error(context +
+                                 " source is outside the expanded rim domain");
+    }
+
+    cv::Mat labels;
+    const int component_count =
+        cv::connectedComponents(white_domain, labels, 8, CV_32S);
+    const int source_label = labels.at<int>(source.y, source.x);
+    cv::Mat filtered = cv::Mat::zeros(white_domain.size(), CV_8U);
+    if (source_label <= 0 || source_label >= component_count) {
+        return filtered;
+    }
+    for (int y = 0; y < labels.rows; ++y) {
+        const int* label_row = labels.ptr<int>(y);
+        std::uint8_t* out_row = filtered.ptr<std::uint8_t>(y);
+        for (int x = 0; x < labels.cols; ++x) {
+            if (label_row[x] == source_label) {
+                out_row[x] = 255;
+            }
+        }
+    }
+    return filtered;
+}
+
+cv::Mat make_padded_expanded_rim_label_domain(const cv::Mat& white_domain,
+                                              const cv::Point source) {
+    CV_Assert(white_domain.type() == CV_8U);
+
+    cv::Mat expanded_source;
+    cv::bitwise_not(white_domain, expanded_source);
+    if (!expanded_source.empty()) {
+        const cv::Mat kernel = cv::getStructuringElement(
+            cv::MORPH_RECT, cv::Size(3, 3));
+        cv::dilate(expanded_source, expanded_source, kernel);
+    }
+
+    cv::Mat expanded_white;
+    cv::bitwise_not(expanded_source, expanded_white);
+    if (source.x >= 0 || source.y >= 0) {
+        expanded_white = keep_source_component_white_domain(
+            expanded_white, source, "rim-label");
+    }
+
+    cv::Mat domain(expanded_white.rows + 2, expanded_white.cols + 2, CV_8U,
+                   cv::Scalar(0));
+    if (!expanded_white.empty()) {
+        expanded_white.copyTo(
+            domain(cv::Rect(1, 1, expanded_white.cols, expanded_white.rows)));
+    }
+
     return domain;
 }
 
@@ -3890,6 +3941,45 @@ cv::Mat render_graph_capacity(const SkeletonGraph& graph, cv::Size size,
     return out;
 }
 
+float max_graph_edge_capacity(const SkeletonGraph& graph) {
+    float max_capacity = 0.0f;
+    for (const GraphEdge& edge : graph.edges) {
+        if (std::isfinite(edge.capacity)) {
+            max_capacity = std::max(max_capacity, edge.capacity);
+        }
+    }
+    return max_capacity;
+}
+
+cv::Mat render_graph_capacity_normalized_u8(const SkeletonGraph& graph,
+                                            cv::Size size) {
+    cv::Mat out(size, CV_8UC3, cv::Scalar(0, 0, 0));
+    const float max_capacity = max_graph_edge_capacity(graph);
+    const float denom = max_capacity > 0.0f ? max_capacity : 1.0f;
+    for (const GraphEdge& edge : graph.edges) {
+        const float normalized =
+            std::clamp(edge.capacity / denom, 0.0f, 1.0f);
+        const auto value = static_cast<std::uint8_t>(
+            std::lround(static_cast<double>(normalized) * 255.0));
+        draw_graph_edge(out, edge, cv::Scalar(value, value, value));
+    }
+    return out;
+}
+
+cv::Mat render_graph_capacity_normalized_float(const SkeletonGraph& graph,
+                                               cv::Size size) {
+    cv::Mat out(size, CV_32FC3, cv::Scalar(0, 0, 0));
+    const float max_capacity = max_graph_edge_capacity(graph);
+    const float denom = max_capacity > 0.0f ? max_capacity : 1.0f;
+    for (const GraphEdge& edge : graph.edges) {
+        const float normalized =
+            std::clamp(edge.capacity / denom, 0.0f, 1.0f);
+        draw_graph_edge(out, edge,
+                        cv::Scalar(normalized, normalized, normalized));
+    }
+    return out;
+}
+
 struct DinicEdge {
     int to = 0;
     int rev = 0;
@@ -3977,6 +4067,7 @@ struct DenseFlowResult {
     cv::Mat tree_dense_nn_flow;
     cv::Mat dense_backtrack_nn_flow;
     cv::Mat smooth_grid_flow;
+    cv::Mat tree_dense_flow_no_backtrack;
     cv::Mat tree_dense_flow;
     cv::Mat tree_path_debug;
     cv::Mat carrier_debug;
@@ -5813,7 +5904,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                   << "  source_seed_pixel: (" << source_seed_pixel.x
                   << "," << source_seed_pixel.y << ")\n"
                   << "  source_seed_capacity: " << source_seed_capacity << "\n";
-        timings.push_back(finish_timing("source_region_detect", timing));
+        timings.push_back(finish_timing("source_seed_detect", timing));
     }
 
     const int node_count = static_cast<int>(graph.nodes.size());
@@ -6223,6 +6314,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat tree_dense_nn_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat dense_backtrack_nn_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat smooth_grid_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    cv::Mat tree_dense_flow_no_backtrack(white_domain.size(), CV_32F,
+                                         cv::Scalar(0));
     cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_path_debug(white_domain.size(), CV_32FC3,
                             cv::Scalar(0, 0, 0));
@@ -6646,6 +6739,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         dense_backtrack_nn_flow = dense_backtrack.nn_flow;
         smooth_grid_flow = bilinear_from_regular_grid_samples(
             dense_backtrack.smooth_grid_flow, grid_step);
+        tree_dense_flow_no_backtrack = smooth_grid_flow;
         tree_dense_flow =
             bilinear_from_regular_grid_samples(dense_backtrack.flow, grid_step);
         tree_path_debug = dense_backtrack.debug_paths;
@@ -6999,6 +7093,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             tree_dense_nn_flow,
             dense_backtrack_nn_flow,
             smooth_grid_flow,
+            tree_dense_flow_no_backtrack,
             tree_dense_flow,
             tree_path_debug,
             carrier_debug,
@@ -7531,7 +7626,8 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         cv::Mat rim_source_pixel_labels;
         {
             const TimingMark timing = start_timing();
-            rim_label_domain = make_padded_rim_label_domain(white_domain);
+            rim_label_domain =
+                make_padded_expanded_rim_label_domain(white_domain, source);
             cv::distanceTransform(rim_label_domain, rim_dt,
                                   rim_source_pixel_labels, cv::DIST_L2,
                                   cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
@@ -7722,6 +7818,8 @@ int main(int argc, char** argv) {
         cv::Mat graph_nodes;
         cv::Mat graph_capacity;
         cv::Mat graph_capacity_gray_bg;
+        cv::Mat graph_capacity_normalized;
+        cv::Mat graph_capacity_normalized_layer;
         DenseFlowResult dense_flow_result;
         bool has_dense_flow = false;
         std::string rim_error;
@@ -7757,7 +7855,10 @@ int main(int argc, char** argv) {
             cv::Mat rim_source_pixel_labels;
             {
                 const TimingMark timing = start_timing();
-                rim_label_domain = make_padded_rim_label_domain(white_domain);
+                rim_label_domain =
+                    make_padded_expanded_rim_label_domain(
+                        white_domain,
+                        args.has_source ? args.source : cv::Point(-1, -1));
                 cv::distanceTransform(rim_label_domain, rim_dt,
                                       rim_source_pixel_labels, cv::DIST_L2,
                                       cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
@@ -7847,6 +7948,11 @@ int main(int argc, char** argv) {
                     render_graph_capacity(graph, binary.size(), 0);
                 graph_capacity_gray_bg =
                     render_graph_capacity(graph, binary.size(), 127);
+                graph_capacity_normalized =
+                    render_graph_capacity_normalized_u8(graph, binary.size());
+                graph_capacity_normalized_layer =
+                    render_graph_capacity_normalized_float(graph,
+                                                           binary.size());
                 timings.push_back(
                     finish_timing("graph_capacity_render", timing));
             }
@@ -7906,6 +8012,8 @@ int main(int argc, char** argv) {
                         graph_capacity);
             write_image(workdir / (stem + "_graph_capacity_gray_bg.tif"),
                         graph_capacity_gray_bg);
+            write_image(workdir / (stem + "_graph_capacity_normalized.tif"),
+                        graph_capacity_normalized);
             write_graph_connectivity_report(
                 workdir / (stem + "_graph_components.txt"), graph_stats);
             timings.push_back(finish_timing("write_regular_outputs", timing));
@@ -7934,6 +8042,9 @@ int main(int argc, char** argv) {
             }
             write_image(workdir / (stem + "_smooth_grid_flow.tif"),
                         dense_flow_result.smooth_grid_flow);
+            write_image(workdir /
+                            (stem + "_tree_dense_flow_no_backtrack.tif"),
+                        dense_flow_result.tree_dense_flow_no_backtrack);
             write_image(workdir / (stem + "_tree_dense_flow.tif"),
                         dense_flow_result.tree_dense_flow);
             write_image(workdir / (stem + "_tree_paths_debug.tif"),
@@ -7975,6 +8086,7 @@ int main(int argc, char** argv) {
             {"graph_nodes", to_float_layer(graph_nodes)},
             {"graph_capacity", to_float_layer(graph_capacity)},
             {"graph_capacity_gray_bg", to_float_layer(graph_capacity_gray_bg)},
+            {"graph_capacity_normalized", graph_capacity_normalized_layer},
         };
         if (has_dense_flow) {
             if (kEnableLegacyDenseDtAscent) {
@@ -8005,6 +8117,10 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"smooth_grid_flow",
                  to_float_layer(dense_flow_result.smooth_grid_flow)});
+            layered_tiff.push_back(
+                {"tree_dense_flow_no_backtrack",
+                 to_float_layer(
+                     dense_flow_result.tree_dense_flow_no_backtrack)});
             layered_tiff.push_back(
                 {"tree_dense_flow",
                  to_float_layer(dense_flow_result.tree_dense_flow)});

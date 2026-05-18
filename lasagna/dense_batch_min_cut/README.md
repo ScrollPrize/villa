@@ -44,8 +44,9 @@ Outputs:
   to the nearest dark foreground island.
 - `<stem>_source_rim_ridges.tif`: ridge candidates where neighboring
   source-pixel labels map to sufficiently distant points along the source rim.
-  The rim-label pass pads the image with a one-pixel source rim while
-  preserving the unmodified distance transform for graph capacities.
+  The rim-label pass expands source islands by one pixel and pads the image
+  with a one-pixel source rim while preserving the unmodified distance
+  transform for graph capacities.
 - `<stem>_source_rim_distance.tif`: max along-rim distance used by the ridge
   candidate test.
 - `<stem>_source_rim_arc.tif`: source-rim arc-position visualization used to
@@ -99,6 +100,9 @@ Outputs:
 - `<stem>_graph_capacity.tif`: graph edges rendered in grayscale by edge
   capacity, where capacity is the minimum raw distance-transform value along
   the complete traced edge.
+- `<stem>_graph_capacity_normalized.tif`: graph edges rendered in normalized
+  grayscale capacity, where the maximum graph edge capacity is 255 in the image
+  output and 1.0 in the layered TIFF page.
 - `<stem>_graph_components.txt`: graph connectivity report with component node
   and edge counts, plus counts for self-loop, one-endpoint, and zero-endpoint
   edges. It also reports skeleton coverage: total skeleton pixels, node pixels,
@@ -110,6 +114,9 @@ Outputs:
   dense source-flow map.
 - `<stem>_graph_edge_flow.tif`: optional graph-edge visualization of propagated
   source flow.
+- `<stem>_tree_dense_flow_no_backtrack.tif`: optional dense source-flow debug
+  image before the route/backtracking pass. Compare this with
+  `<stem>_tree_dense_flow.tif` to inspect the backtracking effect.
 - `<stem>_graph_source_edges.tif`: optional diagnostic showing which graph edges
   were treated as directly adjacent to the source region and therefore seeded
   with internal infinite capacity.
@@ -117,7 +124,8 @@ Outputs:
   The pages include `binary_threshold`, `dt`, `source_rim_distance`,
   `source_rim_arc`, `source_rim_arc_skeleton`, `loops_connected`,
   `graph_random_edges`, `graph_edges_random`, `graph_components_random`,
-  `graph_nodes`, and `graph_capacity`. When `--source x,y` is provided, the pages
+  `graph_nodes`, `graph_capacity`, and `graph_capacity_normalized`. When
+  `--source x,y` is provided, the pages `tree_dense_flow_no_backtrack`,
   `tree_dense_flow`, `graph_edge_flow`, `flow_gate_weight`, and related flow
   debug layers are appended.
 
@@ -126,14 +134,17 @@ The component Voronoi path treats each dark foreground connected component as
 one fat site. The CLI prints a fixed-width timing table with elapsed time, CPU
 time, and estimated CPU/elapsed utilization for the main stages and component
 Voronoi substages.
-The rim-label pass pads the image before computing rim labels, then crops the
-debug layers back to the input size. Multiple source-rim contours in one white
-connected component are allowed; disconnected source islands are treated as
-infinitely far apart along the rim, so their Voronoi boundary is kept. Every
-nearest-rim source pixel selected by the labeled distance transform must still
-map to one rim contour. Missing rim assignments mean the border-connected rim
-model is broken; the CLI writes the usual debug outputs and exits non-zero with
-the component summary.
+The rim-label pass expands source islands by one pixel, keeps only the expanded
+white component containing `--source`, pads the image before computing rim
+labels, then crops the debug layers back to the input size. This removes
+ambiguous one-pixel rim pockets and post-expansion disconnected pockets from the
+rim-distance model while leaving the original distance transform in place for
+graph capacities. Multiple source-rim contours in one white connected component
+are allowed; disconnected source islands are treated as infinitely far apart
+along the rim, so their Voronoi boundary is kept. Every nearest-rim source pixel
+selected by the labeled distance transform must still map to one rim contour.
+Missing rim assignments mean the border-connected rim model is broken; the CLI
+writes the usual debug outputs and exits non-zero with the component summary.
 The extracted graph is expected to be one connected component; disconnected
 graphs write the usual debug outputs and then exit non-zero with the component
 summary.
@@ -146,11 +157,13 @@ components are pruned after that repair; these are isolated skeleton islands,
 not raster-adjacent graph extraction misses.
 
 `--source x,y` must point into the light/white distance domain, not into a dark
-foreground island. The graph edge(s) bordering the source region are seeded with
-internal infinite capacity. The small extracted graph is then evaluated with
-exact per-node max-flow, edge flow is assigned from the maximum of its endpoint
-flows, and dense pixels take the minimum of their raw DT value and the flow at
-the nearest graph-edge pixel.
+foreground island. The source is snapped onto the nearest graph edge, that edge
+is split at the snapped pixel, and the split node is seeded with the local graph
+capacity. Graph edges touching that split node are marked in
+`<stem>_graph_source_edges.tif`. The small extracted graph is then evaluated
+with exact per-node max-flow, edge flow is assigned from the maximum of its
+endpoint flows, and dense pixels take the minimum of their raw DT value and the
+flow at the nearest graph-edge pixel.
 
 ## Candidate Optimizations
 
