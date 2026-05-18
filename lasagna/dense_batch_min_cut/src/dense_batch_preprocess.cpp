@@ -3980,6 +3980,137 @@ cv::Mat render_graph_capacity_normalized_float(const SkeletonGraph& graph,
     return out;
 }
 
+cv::Mat nearest_graph_flow_projection(const cv::Mat& white_domain,
+                                      const cv::Mat& graph_mask,
+                                      const cv::Mat& graph_pixel_flow) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(graph_mask.type() == CV_8U);
+    CV_Assert(graph_pixel_flow.type() == CV_32F);
+    CV_Assert(white_domain.size() == graph_mask.size());
+    CV_Assert(white_domain.size() == graph_pixel_flow.size());
+
+    cv::Mat out(white_domain.size(), CV_32F, cv::Scalar(0));
+    if (cv::countNonZero(graph_mask) == 0) {
+        return out;
+    }
+
+    cv::Mat graph_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
+    graph_source_mask.setTo(0, graph_mask);
+
+    cv::Mat nearest_graph_distance;
+    cv::Mat nearest_graph_label;
+    cv::distanceTransform(graph_source_mask, nearest_graph_distance,
+                          nearest_graph_label, cv::DIST_L2, cv::DIST_MASK_5,
+                          cv::DIST_LABEL_PIXEL);
+    const std::vector<cv::Point> graph_source_points =
+        label_source_points(graph_source_mask, nearest_graph_label);
+
+    cv::parallel_for_(cv::Range(0, white_domain.rows),
+                      [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const std::uint8_t* domain_row = white_domain.ptr<std::uint8_t>(y);
+            const int* label_row = nearest_graph_label.ptr<int>(y);
+            float* out_row = out.ptr<float>(y);
+            for (int x = 0; x < white_domain.cols; ++x) {
+                if (domain_row[x] == 0) {
+                    continue;
+                }
+                const int label = label_row[x];
+                if (label <= 0 ||
+                    label >= static_cast<int>(graph_source_points.size())) {
+                    continue;
+                }
+                const cv::Point graph_pixel =
+                    graph_source_points[static_cast<std::size_t>(label)];
+                if (graph_pixel.x < 0) {
+                    continue;
+                }
+                out_row[x] =
+                    graph_pixel_flow.at<float>(graph_pixel.y, graph_pixel.x);
+            }
+        }
+    });
+    return out;
+}
+
+cv::Mat greedy_increasing_flow_ascent(const cv::Mat& white_domain,
+                                      const cv::Mat& source_flow) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(source_flow.type() == CV_32F);
+    CV_Assert(white_domain.size() == source_flow.size());
+
+    cv::Mat out(white_domain.size(), CV_32F, cv::Scalar(0));
+    cv::Mat cached(white_domain.size(), CV_32F, cv::Scalar(-1));
+    constexpr float kFlowEpsilon = 1.0e-4f;
+    const std::array<cv::Point, 8> kDirs = {
+        cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
+        cv::Point(-1, 0),                    cv::Point(1, 0),
+        cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
+
+    const auto in_white_domain = [&](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < white_domain.cols && pixel.y >= 0 &&
+               pixel.y < white_domain.rows &&
+               white_domain.at<std::uint8_t>(pixel.y, pixel.x) != 0;
+    };
+
+    std::vector<cv::Point> path;
+    path.reserve(256);
+    for (int y = 0; y < white_domain.rows; ++y) {
+        for (int x = 0; x < white_domain.cols; ++x) {
+            const cv::Point start(x, y);
+            if (!in_white_domain(start)) {
+                continue;
+            }
+            if (cached.at<float>(y, x) >= 0.0f) {
+                out.at<float>(y, x) = cached.at<float>(y, x);
+                continue;
+            }
+
+            path.clear();
+            cv::Point current = start;
+            float terminal_flow = 0.0f;
+            while (in_white_domain(current)) {
+                const float cached_flow =
+                    cached.at<float>(current.y, current.x);
+                if (cached_flow >= 0.0f) {
+                    terminal_flow = cached_flow;
+                    break;
+                }
+                path.push_back(current);
+
+                const float current_flow =
+                    source_flow.at<float>(current.y, current.x);
+                cv::Point next(-1, -1);
+                float best_flow = current_flow;
+                for (const cv::Point dir : kDirs) {
+                    const cv::Point neighbor = current + dir;
+                    if (!in_white_domain(neighbor)) {
+                        continue;
+                    }
+                    const float neighbor_flow =
+                        source_flow.at<float>(neighbor.y, neighbor.x);
+                    if (neighbor_flow <= best_flow + kFlowEpsilon) {
+                        continue;
+                    }
+                    best_flow = neighbor_flow;
+                    next = neighbor;
+                }
+                if (next.x < 0) {
+                    terminal_flow = std::max(0.0f, current_flow);
+                    break;
+                }
+                current = next;
+            }
+
+            for (const cv::Point pixel : path) {
+                cached.at<float>(pixel.y, pixel.x) = terminal_flow;
+                out.at<float>(pixel.y, pixel.x) = terminal_flow;
+            }
+        }
+    }
+    return out;
+}
+
 struct DinicEdge {
     int to = 0;
     int rev = 0;
@@ -4068,6 +4199,8 @@ struct DenseFlowResult {
     cv::Mat dense_backtrack_nn_flow;
     cv::Mat smooth_grid_flow;
     cv::Mat tree_dense_flow_no_backtrack;
+    cv::Mat nearest_graph_flow;
+    cv::Mat tree_dense_flow_greedy_ascent;
     cv::Mat tree_dense_flow;
     cv::Mat tree_path_debug;
     cv::Mat carrier_debug;
@@ -6316,11 +6449,20 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat smooth_grid_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_dense_flow_no_backtrack(white_domain.size(), CV_32F,
                                          cv::Scalar(0));
+    cv::Mat nearest_graph_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    cv::Mat tree_dense_flow_greedy_ascent(white_domain.size(), CV_32F,
+                                          cv::Scalar(0));
     cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_path_debug(white_domain.size(), CV_32FC3,
                             cv::Scalar(0, 0, 0));
     cv::Mat carrier_debug(white_domain.size(), CV_32FC3,
                           cv::Scalar(0, 0, 0));
+    {
+        const TimingMark timing = start_timing();
+        nearest_graph_flow = nearest_graph_flow_projection(
+            white_domain, graph_edge_mask, graph_pixel_flow);
+        timings.push_back(finish_timing("nearest_graph_flow", timing));
+    }
     if (kEnableLegacyVoronoiTreeDensification) {
         const TimingMark timing = start_timing();
         cv::Mat tree_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
@@ -6740,6 +6882,14 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         smooth_grid_flow = bilinear_from_regular_grid_samples(
             dense_backtrack.smooth_grid_flow, grid_step);
         tree_dense_flow_no_backtrack = smooth_grid_flow;
+        {
+            const TimingMark timing = start_timing();
+            tree_dense_flow_greedy_ascent =
+                greedy_increasing_flow_ascent(white_domain,
+                                              tree_dense_flow_no_backtrack);
+            timings.push_back(finish_timing(
+                "tree_dense_flow_greedy_ascent", timing));
+        }
         tree_dense_flow =
             bilinear_from_regular_grid_samples(dense_backtrack.flow, grid_step);
         tree_path_debug = dense_backtrack.debug_paths;
@@ -7094,6 +7244,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             dense_backtrack_nn_flow,
             smooth_grid_flow,
             tree_dense_flow_no_backtrack,
+            nearest_graph_flow,
+            tree_dense_flow_greedy_ascent,
             tree_dense_flow,
             tree_path_debug,
             carrier_debug,
@@ -8045,6 +8197,11 @@ int main(int argc, char** argv) {
             write_image(workdir /
                             (stem + "_tree_dense_flow_no_backtrack.tif"),
                         dense_flow_result.tree_dense_flow_no_backtrack);
+            write_image(workdir / (stem + "_nearest_graph_flow.tif"),
+                        dense_flow_result.nearest_graph_flow);
+            write_image(workdir /
+                            (stem + "_tree_dense_flow_greedy_ascent.tif"),
+                        dense_flow_result.tree_dense_flow_greedy_ascent);
             write_image(workdir / (stem + "_tree_dense_flow.tif"),
                         dense_flow_result.tree_dense_flow);
             write_image(workdir / (stem + "_tree_paths_debug.tif"),
@@ -8121,6 +8278,13 @@ int main(int argc, char** argv) {
                 {"tree_dense_flow_no_backtrack",
                  to_float_layer(
                      dense_flow_result.tree_dense_flow_no_backtrack)});
+            layered_tiff.push_back(
+                {"nearest_graph_flow",
+                 to_float_layer(dense_flow_result.nearest_graph_flow)});
+            layered_tiff.push_back(
+                {"tree_dense_flow_greedy_ascent",
+                 to_float_layer(
+                     dense_flow_result.tree_dense_flow_greedy_ascent)});
             layered_tiff.push_back(
                 {"tree_dense_flow",
                  to_float_layer(dense_flow_result.tree_dense_flow)});

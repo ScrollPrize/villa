@@ -117,6 +117,11 @@ Outputs:
 - `<stem>_tree_dense_flow_no_backtrack.tif`: optional dense source-flow debug
   image before the route/backtracking pass. Compare this with
   `<stem>_tree_dense_flow.tif` to inspect the backtracking effect.
+- `<stem>_nearest_graph_flow.tif`: optional dense source-flow debug image that
+  assigns every white-domain pixel the flow value of its nearest graph pixel.
+- `<stem>_tree_dense_flow_greedy_ascent.tif`: optional dense source-flow debug
+  image that starts from the no-backtrack flow field, greedily walks to the
+  highest neighboring larger flow value, and stops at the first local maximum.
 - `<stem>_graph_source_edges.tif`: optional diagnostic showing which graph edges
   were treated as directly adjacent to the source region and therefore seeded
   with internal infinite capacity.
@@ -126,8 +131,9 @@ Outputs:
   `graph_random_edges`, `graph_edges_random`, `graph_components_random`,
   `graph_nodes`, `graph_capacity`, and `graph_capacity_normalized`. When
   `--source x,y` is provided, the pages `tree_dense_flow_no_backtrack`,
-  `tree_dense_flow`, `graph_edge_flow`, `flow_gate_weight`, and related flow
-  debug layers are appended.
+  `nearest_graph_flow`, `tree_dense_flow_greedy_ascent`, `tree_dense_flow`,
+  `graph_edge_flow`, `flow_gate_weight`, and related flow debug layers are
+  appended.
 
 The threshold and polarity are intentionally fixed for repeatable comparisons.
 The component Voronoi path treats each dark foreground connected component as
