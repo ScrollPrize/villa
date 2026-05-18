@@ -146,11 +146,11 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
-            ChunkStatus::Error,
+            ChunkStatus::Missing,
             state->dtype_,
             state->levels_[static_cast<std::size_t>(level)].chunkShape,
             {},
-            "requested missing zarr scale level " + std::to_string(level)};
+            {}};
     }
     if (!isValidKey(*state, key))
         return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
@@ -176,11 +176,11 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
-            ChunkStatus::Error,
+            ChunkStatus::Missing,
             state->dtype_,
             state->levels_[static_cast<std::size_t>(level)].chunkShape,
             {},
-            "requested missing zarr scale level " + std::to_string(level)};
+            {}};
     }
     if (!isValidKey(*state, key))
         return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
