@@ -503,6 +503,23 @@ cv::Mat keep_source_white_component(const cv::Mat& binary,
     return filtered;
 }
 
+cv::Mat make_border_source_domain(const cv::Mat& white_domain) {
+    CV_Assert(white_domain.type() == CV_8U);
+    cv::Mat domain = white_domain.clone();
+    if (domain.empty()) {
+        return domain;
+    }
+    for (int x = 0; x < domain.cols; ++x) {
+        domain.at<std::uint8_t>(0, x) = 0;
+        domain.at<std::uint8_t>(domain.rows - 1, x) = 0;
+    }
+    for (int y = 0; y < domain.rows; ++y) {
+        domain.at<std::uint8_t>(y, 0) = 0;
+        domain.at<std::uint8_t>(y, domain.cols - 1) = 0;
+    }
+    return domain;
+}
+
 int transition_count(const std::uint8_t p[8]) {
     int count = 0;
     for (int i = 0; i < 8; ++i) {
@@ -1245,6 +1262,7 @@ cv::Mat source_rim_distance_label_ridges(
     const std::vector<cv::Point>& source_points,
     const float min_rim_distance_px,
     cv::Mat* rim_distance_debug_out = nullptr,
+    cv::Mat* rim_arc_debug_out = nullptr,
     std::vector<StageTiming>* timings = nullptr) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(source_pixel_labels.type() == CV_32S);
@@ -1406,6 +1424,29 @@ cv::Mat source_rim_distance_label_ridges(
         }
         return rim_lookup[linear_index(pixel)];
     };
+
+    if (rim_arc_debug_out != nullptr) {
+        const TimingMark timing = start_timing();
+        cv::Mat rim_arc_debug = cv::Mat::zeros(white_domain.size(), CV_8U);
+        cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                std::uint8_t* out_row = rim_arc_debug.ptr<std::uint8_t>(y);
+                for (int x = 0; x < cols; ++x) {
+                    const RimPosition position =
+                        rim_lookup[static_cast<std::size_t>(y * cols + x)];
+                    if (position.contour < 0 || position.total <= 0.0f) {
+                        continue;
+                    }
+                    const float t = std::max(
+                        0.0f, std::min(1.0f, position.arc / position.total));
+                    out_row[x] = static_cast<std::uint8_t>(
+                        1 + static_cast<int>(std::lround(254.0f * t)));
+                }
+            }
+        });
+        *rim_arc_debug_out = rim_arc_debug;
+        record_timing("rim_arc_debug", timing);
+    }
 
     cv::Mat ridges;
     cv::Mat rim_distance_debug;
@@ -2314,6 +2355,8 @@ cv::Mat connect_clean_skeleton_with_source_ridges(
 struct SourceRimSkeletonResult {
     cv::Mat source_rim_ridges;
     cv::Mat source_rim_distance;
+    cv::Mat source_rim_arc;
+    cv::Mat source_rim_arc_skeleton;
     cv::Mat loops_connected;
     std::vector<StageTiming> timings;
 };
@@ -2678,16 +2721,24 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
     };
 
     cv::Mat visited_edges = cv::Mat::zeros(skel.size(), CV_8U);
-    const auto trace_edge = [&](int start_node, const cv::Point start_pixel,
-                                const cv::Point first_pixel) {
-        GraphEdge edge;
-        edge.a = start_node;
-        edge.b = 0;
-        edge.capacity = std::numeric_limits<float>::max();
+	const auto trace_edge = [&](int start_node, const cv::Point start_pixel,
+	                            const cv::Point first_pixel) {
+	    GraphEdge edge;
+	    edge.a = start_node;
+	    edge.b = 0;
+	    edge.capacity = std::numeric_limits<float>::max();
 
-        cv::Point previous = start_pixel;
-        cv::Point current = first_pixel;
-        while (is_skeleton(current)) {
+	    const auto append_edge_pixel = [&](const cv::Point pixel) {
+	        visited_edges.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+	        edge.pixels.push_back(pixel);
+	        edge.capacity =
+	            std::min(edge.capacity,
+	                     capacity_from_dt(dt.at<float>(pixel.y, pixel.x)));
+	    };
+
+	    cv::Point previous = start_pixel;
+	    cv::Point current = first_pixel;
+	    while (is_skeleton(current)) {
             if (is_node(current)) {
                 edge.b = node_labels.at<int>(current.y, current.x);
                 break;
@@ -2697,12 +2748,13 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
                 break;
             }
 
-            LabelList nodes = adjacent_nodes(current);
-            nodes.erase(start_node);
-            if (!nodes.empty() && !edge.pixels.empty()) {
-                edge.b = nodes.front();
-                break;
-            }
+	        LabelList nodes = adjacent_nodes(current);
+	        nodes.erase(start_node);
+	        if (!nodes.empty()) {
+	            append_edge_pixel(current);
+	            edge.b = nodes.front();
+	            break;
+	        }
 
             std::array<cv::Point, 8> candidates;
             int candidate_count = 0;
@@ -2716,31 +2768,26 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
                 candidates[candidate_count++] = neighbor;
             });
 
-            const cv::Point next =
-                choose_next(current, candidates, candidate_count);
-            if (next.x < 0 && candidate_count > 0) {
-                edge.b = make_node(current);
-                break;
-            }
+	        const cv::Point next =
+	            choose_next(current, candidates, candidate_count);
+	        if (next.x < 0 && candidate_count > 0) {
+	            append_edge_pixel(current);
+	            edge.b = make_node(current);
+	            break;
+	        }
 
-            visited_edges.at<std::uint8_t>(current.y, current.x) = 255;
-            edge.pixels.push_back(current);
-            edge.capacity =
-                std::min(edge.capacity,
-                         capacity_from_dt(dt.at<float>(current.y, current.x)));
+	        append_edge_pixel(current);
 
-            if (next.x < 0) {
-                nodes = adjacent_nodes(current);
-                if (edge.pixels.size() > 1 &&
-                    nodes.contains(start_node)) {
-                    edge.b = start_node;
-                } else {
-                    edge.b = make_node(current);
-                    edge.pixels.pop_back();
-                    visited_edges.at<std::uint8_t>(current.y, current.x) = 0;
-                }
-                break;
-            }
+	        if (next.x < 0) {
+	            nodes = adjacent_nodes(current);
+	            if (edge.pixels.size() > 1 &&
+	                nodes.contains(start_node)) {
+	                edge.b = start_node;
+	            } else {
+	                edge.b = make_node(current);
+	            }
+	            break;
+	        }
 
             previous = current;
             current = next;
@@ -2925,6 +2972,100 @@ cv::Mat render_graph_edges_random_colors(const SkeletonGraph& graph,
     return out;
 }
 
+std::vector<int> graph_node_component_ids(const SkeletonGraph& graph) {
+    struct DisjointSet {
+        std::vector<int> parent;
+        explicit DisjointSet(int n) : parent(static_cast<std::size_t>(n)) {
+            std::iota(parent.begin(), parent.end(), 0);
+        }
+        int find(int x) {
+            while (parent[x] != x) {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            return x;
+        }
+        void unite(int a, int b) {
+            a = find(a);
+            b = find(b);
+            if (a != b) {
+                parent[b] = a;
+            }
+        }
+    };
+
+    const int node_count = static_cast<int>(graph.nodes.size());
+    DisjointSet sets(node_count);
+    const auto valid_node = [&](int node) {
+        return node > 0 && node < node_count;
+    };
+
+    for (const GraphEdge& edge : graph.edges) {
+        if (valid_node(edge.a) && valid_node(edge.b) && edge.a != edge.b) {
+            sets.unite(edge.a, edge.b);
+        }
+    }
+
+    std::vector<int> root_to_component(static_cast<std::size_t>(node_count), -1);
+    std::vector<int> node_component(static_cast<std::size_t>(node_count), -1);
+    int next_component = 0;
+    for (int node = 1; node < node_count; ++node) {
+        const int root = sets.find(node);
+        int& component = root_to_component[static_cast<std::size_t>(root)];
+        if (component < 0) {
+            component = next_component++;
+        }
+        node_component[static_cast<std::size_t>(node)] = component;
+    }
+    return node_component;
+}
+
+cv::Mat render_graph_component_colors(const SkeletonGraph& graph, cv::Size size) {
+    cv::Mat out(size, CV_8UC3, cv::Scalar(0, 0, 0));
+    const std::vector<int> node_component = graph_node_component_ids(graph);
+    const int node_count = static_cast<int>(node_component.size());
+    const auto component_for_node = [&](int node) {
+        if (node <= 0 || node >= node_count) {
+            return -1;
+        }
+        return node_component[static_cast<std::size_t>(node)];
+    };
+
+    for (const GraphEdge& edge : graph.edges) {
+        int component = component_for_node(edge.a);
+        if (component < 0) {
+            component = component_for_node(edge.b);
+        }
+        if (component < 0) {
+            continue;
+        }
+        draw_graph_edge(out, edge, deterministic_edge_color(component));
+    }
+
+    const std::size_t node_group_count =
+        std::min(graph.node_pixel_groups.size(), node_component.size());
+    for (std::size_t node = 1; node < node_group_count; ++node) {
+        const int component = node_component[node];
+        if (component < 0) {
+            continue;
+        }
+        const cv::Scalar color = deterministic_edge_color(component);
+        const cv::Vec3b pixel_color(
+            static_cast<std::uint8_t>(color[0]),
+            static_cast<std::uint8_t>(color[1]),
+            static_cast<std::uint8_t>(color[2]));
+        for (const cv::Point pixel : graph.node_pixel_groups[node]) {
+            if (pixel.x < 0 || pixel.x >= out.cols || pixel.y < 0 ||
+                pixel.y >= out.rows) {
+                continue;
+            }
+            out.at<cv::Vec3b>(pixel.y, pixel.x) = pixel_color;
+        }
+    }
+
+    return out;
+}
+
 cv::Mat render_graph_nodes(const SkeletonGraph& graph, cv::Size size) {
     cv::Mat out(size, CV_8UC1, cv::Scalar(0));
     for (std::size_t label = 1; label < graph.nodes.size(); ++label) {
@@ -3039,6 +3180,26 @@ GraphConnectivityStats graph_connectivity_stats(const SkeletonGraph& graph) {
         stats.components[i].id = i;
     }
     return stats;
+}
+
+std::string graph_connectivity_error(const GraphConnectivityStats& stats) {
+    if (stats.valid_nodes > 0 && stats.components.size() == 1) {
+        return {};
+    }
+
+    std::ostringstream out;
+    out << "extracted graph is disconnected: components="
+        << stats.components.size() << " valid_nodes=" << stats.valid_nodes
+        << " valid_edges=" << stats.valid_edges
+        << " skeleton_pixels=" << stats.skeleton_pixels;
+    const int components_to_report =
+        std::min<int>(5, stats.components.size());
+    for (int i = 0; i < components_to_report; ++i) {
+        const GraphComponentStats& component = stats.components[i];
+        out << " component_" << component.id << "_nodes=" << component.nodes
+            << " component_" << component.id << "_edges=" << component.edges;
+    }
+    return out.str();
 }
 
 void write_graph_connectivity_report(const fs::path& path,
@@ -6405,6 +6566,7 @@ SourceRimSkeletonResult source_rim_skeleton(
 
     cv::Mat source_rim_ridges;
     cv::Mat source_rim_distance;
+    cv::Mat source_rim_arc;
     {
         const TimingMark timing = start_timing();
         constexpr float kSourceRimRidgeThresholdPx = 12.0f;
@@ -6412,9 +6574,16 @@ SourceRimSkeletonResult source_rim_skeleton(
             source_rim_distance_label_ridges(
                 white_domain, source_pixel_labels, source_points,
                 kSourceRimRidgeThresholdPx,
-                &source_rim_distance, &timings);
+                &source_rim_distance, &source_rim_arc, &timings);
         timings.push_back(
             finish_timing("source_rim.rim_distance_ridges", timing));
+    }
+
+    cv::Mat source_rim_arc_skeleton;
+    {
+        const TimingMark timing = start_timing();
+        source_rim_arc_skeleton = optimized_thinning(source_rim_arc);
+        timings.push_back(finish_timing("source_rim.rim_arc_thinning", timing));
     }
 
     cv::Mat loops_connected;
@@ -6426,6 +6595,8 @@ SourceRimSkeletonResult source_rim_skeleton(
 
     return {source_rim_ridges,
             source_rim_distance,
+            source_rim_arc,
+            source_rim_arc_skeleton,
             loops_connected,
             timings};
 }
@@ -6704,19 +6875,31 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             timings.push_back(finish_timing("labeled_dt", timing));
         }
 
-        std::vector<cv::Point> source_points;
+        cv::Mat rim_label_domain;
+        cv::Mat rim_dt;
+        cv::Mat rim_source_pixel_labels;
         {
             const TimingMark timing = start_timing();
-            source_points =
-                label_source_points(white_domain, source_pixel_labels);
-            timings.push_back(finish_timing("label_source_points", timing));
+            rim_label_domain = make_border_source_domain(white_domain);
+            cv::distanceTransform(rim_label_domain, rim_dt,
+                                  rim_source_pixel_labels, cv::DIST_L2,
+                                  cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+            timings.push_back(finish_timing("rim_labeled_dt", timing));
+        }
+
+        std::vector<cv::Point> rim_source_points;
+        {
+            const TimingMark timing = start_timing();
+            rim_source_points =
+                label_source_points(rim_label_domain, rim_source_pixel_labels);
+            timings.push_back(finish_timing("rim_label_source_points", timing));
         }
 
         SourceRimSkeletonResult source_rim_result;
         {
             const TimingMark timing = start_timing();
             source_rim_result = source_rim_skeleton(
-                white_domain, source_pixel_labels, source_points);
+                rim_label_domain, rim_source_pixel_labels, rim_source_points);
             timings.push_back(finish_timing("source_rim_skeleton", timing));
             timings.insert(timings.end(),
                            source_rim_result.timings.begin(),
@@ -6737,6 +6920,19 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             graph = extract_skeleton_graph(
                 source_rim_result.loops_connected, dt);
             timings.push_back(finish_timing("graph_extract", timing));
+        }
+
+        {
+            const TimingMark timing = start_timing();
+            const GraphConnectivityStats graph_stats =
+                graph_connectivity_stats(graph);
+            const std::string graph_error =
+                graph_connectivity_error(graph_stats);
+            if (!graph_error.empty()) {
+                throw std::runtime_error(graph_error);
+            }
+            timings.push_back(
+                finish_timing("graph_connectivity_stats", timing));
         }
 
         const bool enable_debug_outputs =
@@ -6860,17 +7056,18 @@ int main(int argc, char** argv) {
         cv::Mat white_domain;
         cv::Mat dt;
         cv::Mat source_pixel_labels;
-        std::vector<cv::Point> source_points;
         SourceRimSkeletonResult source_rim_result;
         SkeletonGraph graph;
         GraphConnectivityStats graph_stats;
         cv::Mat graph_random_colors;
         cv::Mat graph_edges_random_colors;
+        cv::Mat graph_component_colors;
         cv::Mat graph_nodes;
         cv::Mat graph_capacity;
         cv::Mat graph_capacity_gray_bg;
         DenseFlowResult dense_flow_result;
         bool has_dense_flow = false;
+        std::string graph_error;
         for (int repeat = 0; repeat < args.compute_repeats; ++repeat) {
             CoutSilencer silence_repeated_details(
                 args.compute_repeats > 1 && repeat + 1 < args.compute_repeats);
@@ -6897,17 +7094,32 @@ int main(int argc, char** argv) {
                 timings.push_back(finish_timing("labeled_dt", timing));
             }
 
+            cv::Mat rim_label_domain;
+            cv::Mat rim_dt;
+            cv::Mat rim_source_pixel_labels;
             {
                 const TimingMark timing = start_timing();
-                source_points =
-                    label_source_points(white_domain, source_pixel_labels);
-                timings.push_back(finish_timing("label_source_points", timing));
+                rim_label_domain = make_border_source_domain(white_domain);
+                cv::distanceTransform(rim_label_domain, rim_dt,
+                                      rim_source_pixel_labels, cv::DIST_L2,
+                                      cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+                timings.push_back(finish_timing("rim_labeled_dt", timing));
+            }
+
+            std::vector<cv::Point> rim_source_points;
+            {
+                const TimingMark timing = start_timing();
+                rim_source_points = label_source_points(
+                    rim_label_domain, rim_source_pixel_labels);
+                timings.push_back(
+                    finish_timing("rim_label_source_points", timing));
             }
 
             {
                 const TimingMark timing = start_timing();
                 source_rim_result = source_rim_skeleton(
-                    white_domain, source_pixel_labels, source_points);
+                    rim_label_domain, rim_source_pixel_labels,
+                    rim_source_points);
                 timings.push_back(finish_timing("source_rim_skeleton", timing));
                 timings.insert(timings.end(),
                                source_rim_result.timings.begin(),
@@ -6932,6 +7144,7 @@ int main(int argc, char** argv) {
             {
                 const TimingMark timing = start_timing();
                 graph_stats = graph_connectivity_stats(graph);
+                graph_error = graph_connectivity_error(graph_stats);
                 timings.push_back(
                     finish_timing("graph_connectivity_stats", timing));
             }
@@ -6955,6 +7168,14 @@ int main(int argc, char** argv) {
 
             {
                 const TimingMark timing = start_timing();
+                graph_component_colors =
+                    render_graph_component_colors(graph, binary.size());
+                timings.push_back(
+                    finish_timing("graph_component_color_render", timing));
+            }
+
+            {
+                const TimingMark timing = start_timing();
                 graph_nodes = render_graph_nodes(graph, binary.size());
                 timings.push_back(finish_timing("graph_node_render", timing));
             }
@@ -6970,7 +7191,7 @@ int main(int argc, char** argv) {
             }
 
             has_dense_flow = false;
-            if (args.has_source) {
+            if (args.has_source && graph_error.empty()) {
                 dense_flow_result =
                     compute_dense_source_flow(
                         white_domain, dt, graph,
@@ -7006,12 +7227,18 @@ int main(int argc, char** argv) {
                         source_rim_result.source_rim_ridges);
             write_image(workdir / (stem + "_source_rim_distance.tif"),
                         source_rim_result.source_rim_distance);
+            write_image(workdir / (stem + "_source_rim_arc.tif"),
+                        source_rim_result.source_rim_arc);
+            write_image(workdir / (stem + "_source_rim_arc_skeleton.tif"),
+                        source_rim_result.source_rim_arc_skeleton);
             write_image(workdir / (stem + "_source_rim_skeleton.tif"),
                         source_rim_result.loops_connected);
             write_image(workdir / (stem + "_graph_random_edges.tif"),
                         graph_random_colors);
             write_image(workdir / (stem + "_graph_edges_random.tif"),
                         graph_edges_random_colors);
+            write_image(workdir / (stem + "_graph_components_random.tif"),
+                        graph_component_colors);
             write_image(workdir / (stem + "_graph_nodes.tif"),
                         graph_nodes);
             write_image(workdir / (stem + "_graph_capacity.tif"),
@@ -7076,8 +7303,14 @@ int main(int argc, char** argv) {
              to_float_layer(source_rim_result.source_rim_ridges)},
             {"source_rim_distance",
              to_float_layer(source_rim_result.source_rim_distance)},
+            {"source_rim_arc",
+             to_float_layer(source_rim_result.source_rim_arc)},
+            {"source_rim_arc_skeleton",
+             to_float_layer(source_rim_result.source_rim_arc_skeleton)},
             {"graph_random_edges", to_float_layer(graph_random_colors)},
             {"graph_edges_random", to_float_layer(graph_edges_random_colors)},
+            {"graph_components_random",
+             to_float_layer(graph_component_colors)},
             {"graph_nodes", to_float_layer(graph_nodes)},
             {"graph_capacity", to_float_layer(graph_capacity)},
             {"graph_capacity_gray_bg", to_float_layer(graph_capacity_gray_bg)},
@@ -7198,6 +7431,10 @@ int main(int argc, char** argv) {
         }
 
         print_stage_timings(timings);
+        if (!graph_error.empty()) {
+            std::cout << "error: " << graph_error << "\n";
+            return 2;
+        }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         print_usage(argv[0]);
