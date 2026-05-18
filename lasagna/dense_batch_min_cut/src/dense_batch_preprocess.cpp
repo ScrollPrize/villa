@@ -584,6 +584,100 @@ cv::Mat keep_source_component_white_domain(const cv::Mat& white_domain,
         white_domain, std::vector<cv::Point>{source}, context);
 }
 
+cv::Mat keep_source_components_after_erosion(
+        const cv::Mat& eroded_white_domain,
+        const cv::Mat& source_white_domain,
+        const std::vector<cv::Point>& sources,
+        const std::string& context) {
+    CV_Assert(eroded_white_domain.type() == CV_8U);
+    CV_Assert(source_white_domain.type() == CV_8U);
+    CV_Assert(eroded_white_domain.size() == source_white_domain.size());
+    if (sources.empty()) {
+        throw std::runtime_error(context + " source is required");
+    }
+    const cv::Point primary_source = sources.front();
+    if (primary_source.x < 0 ||
+        primary_source.x >= source_white_domain.cols ||
+        primary_source.y < 0 ||
+        primary_source.y >= source_white_domain.rows) {
+        throw std::runtime_error(context + " source is outside the image");
+    }
+    if (source_white_domain.at<std::uint8_t>(primary_source.y,
+                                             primary_source.x) == 0) {
+        throw std::runtime_error(context + " source is outside the source domain");
+    }
+
+    cv::Mat source_labels;
+    const int source_component_count =
+        cv::connectedComponents(source_white_domain, source_labels, 8, CV_32S);
+    cv::Mat eroded_labels;
+    const int eroded_component_count =
+        cv::connectedComponents(eroded_white_domain, eroded_labels, 8, CV_32S);
+    const int primary_source_label =
+        source_labels.at<int>(primary_source.y, primary_source.x);
+
+    std::vector<char> source_keep(
+        static_cast<std::size_t>(source_component_count), 0);
+    for (const cv::Point source : sources) {
+        if (source.x < 0 || source.x >= source_white_domain.cols ||
+            source.y < 0 || source.y >= source_white_domain.rows ||
+            source_white_domain.at<std::uint8_t>(source.y, source.x) == 0) {
+            continue;
+        }
+        const int label = source_labels.at<int>(source.y, source.x);
+        if (label > 0 && label < source_component_count) {
+            source_keep[static_cast<std::size_t>(label)] = 1;
+        }
+    }
+
+    std::vector<char> eroded_keep(
+        static_cast<std::size_t>(eroded_component_count), 0);
+    bool primary_component_survived = false;
+    for (int y = 0; y < eroded_labels.rows; ++y) {
+        const int* eroded_row = eroded_labels.ptr<int>(y);
+        const int* source_row = source_labels.ptr<int>(y);
+        for (int x = 0; x < eroded_labels.cols; ++x) {
+            const int eroded_label = eroded_row[x];
+            if (eroded_label <= 0 || eroded_label >= eroded_component_count) {
+                continue;
+            }
+            const int source_label = source_row[x];
+            if (source_label > 0 && source_label < source_component_count &&
+                source_keep[static_cast<std::size_t>(source_label)] != 0) {
+                eroded_keep[static_cast<std::size_t>(eroded_label)] = 1;
+                if (source_label == primary_source_label) {
+                    primary_component_survived = true;
+                }
+            }
+        }
+    }
+
+    cv::Mat filtered = cv::Mat::zeros(eroded_white_domain.size(), CV_8U);
+    int kept_components = 0;
+    for (char keep : eroded_keep) {
+        if (keep != 0) {
+            ++kept_components;
+        }
+    }
+    if (kept_components == 0 || !primary_component_survived) {
+        throw std::runtime_error(
+            context + " source component disappeared after rim expansion");
+    }
+
+    for (int y = 0; y < eroded_labels.rows; ++y) {
+        const int* label_row = eroded_labels.ptr<int>(y);
+        std::uint8_t* out_row = filtered.ptr<std::uint8_t>(y);
+        for (int x = 0; x < eroded_labels.cols; ++x) {
+            const int label = label_row[x];
+            if (label > 0 && label < eroded_component_count &&
+                eroded_keep[static_cast<std::size_t>(label)] != 0) {
+                out_row[x] = 255;
+            }
+        }
+    }
+    return filtered;
+}
+
 cv::Mat make_padded_expanded_rim_label_domain(const cv::Mat& white_domain,
                                               const std::vector<cv::Point>&
                                                   sources) {
@@ -600,8 +694,8 @@ cv::Mat make_padded_expanded_rim_label_domain(const cv::Mat& white_domain,
     cv::Mat expanded_white;
     cv::bitwise_not(expanded_source, expanded_white);
     if (!sources.empty() && (sources.front().x >= 0 || sources.front().y >= 0)) {
-        expanded_white = keep_source_components_white_domain(
-            expanded_white, sources, "rim-label");
+        expanded_white = keep_source_components_after_erosion(
+            expanded_white, white_domain, sources, "rim-label");
     }
 
     cv::Mat domain(expanded_white.rows + 2, expanded_white.cols + 2, CV_8U,
@@ -2680,7 +2774,8 @@ std::vector<cv::Point> sorted_skeleton_neighbors(const cv::Mat& skeleton,
     return neighbors;
 }
 
-SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt) {
+SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt,
+                                     bool prune_to_largest_component = true) {
     CV_Assert(skeleton.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
 
@@ -3422,7 +3517,9 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
         node_pixels = std::move(kept_node_pixels);
     };
 
-    prune_to_largest_graph_component();
+    if (prune_to_largest_component) {
+        prune_to_largest_graph_component();
+    }
     graph.adjacent_component_contacts =
         find_raster_component_contact().contacts;
 
@@ -9557,8 +9654,13 @@ FlowGraphPipelineResult build_flow_graph_pipeline(
 
     {
         const TimingMark timing = start_timing();
+        // Corr-point sources may intentionally keep several white-domain
+        // components. Preserve the matching graph components so each source can
+        // seed its own flow/gate region.
+        const bool prune_to_largest_graph_component = sources.size() <= 1;
         result.graph = extract_skeleton_graph(
-            result.source_rim_result.loops_connected, result.dt);
+            result.source_rim_result.loops_connected, result.dt,
+            prune_to_largest_graph_component);
         timings.push_back(
             finish_timing(timing_prefix + "graph_extract", timing));
     }
