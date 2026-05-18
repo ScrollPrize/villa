@@ -133,6 +133,7 @@ def _load_library_from_path(path: Path) -> ctypes.CDLL:
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.c_int,
 		ctypes.c_float,
+		ctypes.c_float,
 		ctypes.POINTER(ctypes.c_int),
 		ctypes.POINTER(ctypes.c_int),
 		ctypes.POINTER(ctypes.c_float),
@@ -184,6 +185,7 @@ def compute_flow_grid(
 	return_metadata: bool = False,
 	grid_step: int = 50,
 	backtrack_distance: float = 10.0,
+	local_boost: float = 1.0,
 ) -> tuple[np.ndarray, ...]:
 	"""Run dense source flow gating and sample it at explicit image-space points.
 
@@ -298,6 +300,7 @@ def compute_flow_grid(
 		),
 		int(max(1, grid_step)),
 		ctypes.c_float(max(0.0, float(backtrack_distance))),
+		ctypes.c_float(min(1.0, max(0.0, float(local_boost)))),
 		ctypes.byref(resolved_source_x),
 		ctypes.byref(resolved_source_y),
 		ctypes.byref(resolved_source_capacity),

@@ -367,6 +367,7 @@ struct Args {
     cv::Point source{-1, -1};
     int grid_step = 50;
     float backtrack_distance = 10.0f;
+    float local_boost = 1.0f;
     float flow_weight_one = 100.0f;
     float flow_weight_zero = 20.0f;
     int compute_repeats = 1;
@@ -377,6 +378,7 @@ void print_usage(const char* argv0) {
     std::cerr << "Usage: " << argv0
               << " -i <image> [--source x,y] [--grid-step pixels]"
               << " [--backtrack-distance pixels]"
+              << " [--local-boost value]"
               << " [--flow-weight-one value] [--flow-weight-zero value]"
               << " [--compute-repeats n] [--no-write]\n";
 }
@@ -401,6 +403,9 @@ Args parse_args(int argc, char** argv) {
         } else if (key == "--backtrack-distance" && i + 1 < argc) {
             args.backtrack_distance =
                 std::max(0.0f, std::stof(argv[++i]));
+        } else if (key == "--local-boost" && i + 1 < argc) {
+            args.local_boost =
+                std::clamp(std::stof(argv[++i]), 0.0f, 1.0f);
         } else if (key == "--flow-weight-one" && i + 1 < argc) {
             args.flow_weight_one = std::stof(argv[++i]);
         } else if (key == "--flow-weight-zero" && i + 1 < argc) {
@@ -8303,7 +8308,8 @@ cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
 }
 
 cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
-                                       const float backtrack_distance) {
+                                       const float backtrack_distance,
+                                       const float local_boost) {
     CV_Assert(flow.type() == CV_32F);
     const int rows = flow.rows;
     const int cols = flow.cols;
@@ -8311,6 +8317,11 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
 
     cv::Mat nonnegative_flow = flow.clone();
     nonnegative_flow.setTo(0.0f, nonnegative_flow < 0.0f);
+    double global_max_flow = 0.0;
+    cv::minMaxLoc(nonnegative_flow, nullptr, &global_max_flow);
+    const float global_denominator =
+        global_max_flow > 1.0e-6 ? static_cast<float>(global_max_flow) : 0.0f;
+    const float local_blend = std::clamp(local_boost, 0.0f, 1.0f);
 
     const int local_radius =
         std::max(0, static_cast<int>(std::ceil(backtrack_distance)));
@@ -8331,18 +8342,28 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
             const float* max_row = local_max.ptr<float>(y);
             for (int x = 0; x < cols; ++x) {
                 const float local_denominator = max_row[x];
-                if (local_denominator <= 1.0e-6f || flow_row[x] <= 0.0f) {
+                if (flow_row[x] <= 0.0f) {
                     continue;
                 }
-                out_row[x] =
-                    std::clamp(flow_row[x] / local_denominator, 0.0f, 1.0f);
+                const float local_gate =
+                    local_denominator > 1.0e-6f
+                        ? std::clamp(flow_row[x] / local_denominator, 0.0f, 1.0f)
+                        : 0.0f;
+                const float normalized_gate =
+                    global_denominator > 0.0f
+                        ? std::clamp(flow_row[x] / global_denominator, 0.0f, 1.0f)
+                        : 0.0f;
+                out_row[x] = local_blend * local_gate +
+                             (1.0f - local_blend) * normalized_gate;
             }
         }
     });
 
     std::cout << "Flow gate weight:\n"
               << "  local_max_radius: " << local_radius << "\n"
-              << "  backtrack_distance: " << backtrack_distance << "\n";
+              << "  backtrack_distance: " << backtrack_distance << "\n"
+              << "  local_boost: " << local_blend << "\n"
+              << "  global_max_flow: " << global_max_flow << "\n";
     return weight;
 }
 
@@ -8729,6 +8750,7 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                                         float* island_tree_dense_greedy_ascent,
                                         int grid_step,
                                         float backtrack_distance,
+                                        float local_boost,
                                         int* resolved_source_x,
                                         int* resolved_source_y,
                                         float* resolved_source_capacity,
@@ -8878,7 +8900,7 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
 
         const cv::Mat flow_gate_weight = compute_flow_gate_weight_image(
             dense_flow_result.tree_dense_flow_greedy_ascent,
-            backtrack_distance);
+            backtrack_distance, local_boost);
 
         if (dense_flow != nullptr) {
             for (int y = 0; y < height; ++y) {
@@ -9257,7 +9279,7 @@ int main(int argc, char** argv) {
                     dense_flow_result.flow_gate_weight =
                         compute_flow_gate_weight_image(
                             dense_flow_result.tree_dense_flow_greedy_ascent,
-                            args.backtrack_distance);
+                            args.backtrack_distance, args.local_boost);
                     timings.push_back(
                         finish_timing("flow_gate_weight", timing));
                 }

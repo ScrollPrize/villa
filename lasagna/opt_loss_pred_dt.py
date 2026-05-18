@@ -1177,18 +1177,22 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 
 	gate_factor = float(cfg.get("gate_factor", 1.0))
 	backtrack_distance = float(cfg.get("backtrack_distance", 10.0))
+	local_boost = float(cfg.get("local_boost", 1.0))
 	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 0))
 	pred_dt_pool_step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
 	pull_cfg = _anticipatory_pull_cfg(cfg)
 	if not 0.0 <= gate_factor <= 1.0:
 		raise ValueError("pred_dt_flow_gate requires gate_factor in [0, 1]")
+	if not 0.0 <= local_boost <= 1.0:
+		raise ValueError("pred_dt_flow_gate requires local_boost in [0, 1]")
 	debug = bool(cfg.get("debug", True))
 	debug_index = 0
 	if debug:
 		debug_index = _flow_gate_debug_counts.get(_flow_gate_stage, 0)
 		_flow_gate_debug_counts[_flow_gate_stage] = debug_index + 1
 	debug_layer_interval = max(1, int(cfg.get("debug_layer_interval", 10)))
-	debug_jpg_interval = max(1, int(cfg.get("debug_jpg_interval", 50)))
+	debug_vis_interval = cfg.get("debug_vis_interval", cfg.get("debug_jpg_interval", 50))
+	debug_jpg_interval = max(1, int(debug_vis_interval))
 	write_layer_debug = debug and (debug_index % debug_layer_interval) == 0
 	write_jpg_debug = debug and (debug_index % debug_jpg_interval) == 0
 	return_flow_debug = write_layer_debug or write_jpg_debug
@@ -1307,6 +1311,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					return_metadata=True,
 					grid_step=grid_step,
 					backtrack_distance=backtrack_distance,
+					local_boost=local_boost,
 				)
 			finally:
 				done("flow_calc", _t_flow)

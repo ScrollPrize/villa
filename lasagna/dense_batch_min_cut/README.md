@@ -125,8 +125,10 @@ Outputs:
 - `<stem>_graph_source_edges.tif`: optional diagnostic showing the graph edges
   selected by source-edge ascent and used as flow sources.
 - `<stem>_flow_gate_weight.tif`: optional dense gate-weight image computed as
-  local greedy-ascent flow divided by the dilated local maximum of that same
-  greedy-ascent flow. The dilation radius is `--backtrack-distance`.
+  a blend between globally normalized greedy-ascent flow and local greedy-ascent
+  flow divided by the dilated local maximum of that same greedy-ascent flow. The
+  dilation radius is `--backtrack-distance`; `--local-boost 1` uses the local
+  gate, while `--local-boost 0` uses only the globally normalized flow.
 - `<stem>_layers.tif`: named multipage TIFF for easier inspection in GIMP.
   The pages include `binary_threshold`, `dt`, `source_rim_distance`,
   `source_rim_arc`, `source_rim_arc_skeleton`, `loops_connected`,

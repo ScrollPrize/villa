@@ -62,6 +62,8 @@ iterations by default. Override per stage with `global_opt.args.status_interval`
       "enabled": true,
       "gate_factor": 1.0,
       "backtrack_distance": 10.0,
+      "local_boost": 1.0,
+      "debug_vis_interval": 50,
       "anticipatory_pull": {
         "enabled": true,
         "samples": 8,
@@ -89,10 +91,13 @@ mesh normals. Set it to `"gt"` to use sampled GT normals for that stage.
 
 When enabled, the current single-winding `pred_dt` render is median-filtered
 with radius 1, thresholded at `110`, routed through `dense_batch_min_cut`, and
-sampled at the exact model grid corners. The C++ flow code computes the gate as
-local greedy-ascent flow divided by the dilated local maximum of that same
-greedy-ascent flow; `backtrack_distance` is the dilation radius. The resulting
-gate multiplies the `pred_dt` loss map.
+sampled at the exact model grid corners. The C++ flow code computes both the
+normalized greedy-ascent flow and the local gate, where the local gate is
+greedy-ascent flow divided by the dilated local maximum of that same
+greedy-ascent flow. `backtrack_distance` is the dilation radius.
+`local_boost` blends between them: `0.0` uses only globally normalized
+greedy-ascent flow, `1.0` uses the local gate, and values between are linear.
+The resulting gate multiplies the `pred_dt` loss map.
 `gate_factor` controls how much of the regular pred-dt weight comes from the gate:
 `weight = gate_factor * gate + (1 - gate_factor)`, so `0.99` keeps a `0.01`
 baseline pred-dt loss weight active everywhere. The anticipatory pull uses the
@@ -102,11 +107,11 @@ The loss denominator remains the original validity-mask sum; the gate is
 intentionally not renormalized.
 
 `backtrack_distance` is measured in the rendered `pred_dt` image pixel units.
-It is passed through to the dense grid flow routing and local gate dilation, and
-matches the C++ debug CLI option:
+It is passed through to the dense grid flow routing and local gate dilation.
+`backtrack_distance` and `local_boost` match the C++ debug CLI options:
 
 ```bash
-./dense_batch_preprocess -i pred.tif --source 240,240 --grid-step 4 --backtrack-distance 10
+./dense_batch_preprocess -i pred.tif --source 240,240 --grid-step 4 --backtrack-distance 10 --local-boost 1.0
 ```
 
 `anticipatory_pull` is optional and only runs with active flow gating. It scores
@@ -126,7 +131,8 @@ corner counts for gate weights `>0`, `>0.1`, and `>0.5`, plus the fraction at
 
 With `debug: true`, flow layer TIFFs are written every `debug_layer_interval`
 flow evaluations (default `10`). The service JPG is written every
-`debug_jpg_interval` evaluations (default `50`) as
+`debug_vis_interval` evaluations (default `50`; `debug_jpg_interval` remains a
+legacy alias) as
 `pred_dt_flow_gate_weight_jpg/vis_<iteration>.jpg` and shows `pred_dt`, the
 dense local-max-ratio gate weight actually used by flow gating, then the
 normalized greedy-ascent flow value before the local max ratio. The layer TIFF also includes
