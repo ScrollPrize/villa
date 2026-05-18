@@ -4798,6 +4798,24 @@ cv::Mat greedy_increasing_flow_ascent(const cv::Mat& white_domain,
     return out;
 }
 
+cv::Mat source_attractor_flow_input(const cv::Mat& white_domain,
+                                    const cv::Mat& source_flow,
+                                    const cv::Mat& source_mask) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(source_flow.type() == CV_32F);
+    CV_Assert(source_mask.type() == CV_8U);
+    CV_Assert(white_domain.size() == source_flow.size());
+    CV_Assert(white_domain.size() == source_mask.size());
+
+    cv::Mat out = source_flow.clone();
+    double max_flow = 0.0;
+    cv::minMaxLoc(out, nullptr, &max_flow, nullptr, nullptr, white_domain);
+    const float source_value =
+        static_cast<float>(std::max(1.0e-3, max_flow + 1.0e-3));
+    out.setTo(source_value, source_mask);
+    return out;
+}
+
 cv::Mat greedy_increasing_flow_source_reach_mask(
         const cv::Mat& white_domain,
         const cv::Mat& source_flow,
@@ -8094,18 +8112,23 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         smooth_grid_flow = bilinear_from_regular_grid_samples(
             dense_backtrack.smooth_grid_flow, grid_step);
         tree_dense_flow_no_backtrack = smooth_grid_flow;
+        const cv::Mat tree_dense_flow_source_attractor =
+            source_attractor_flow_input(
+                white_domain, tree_dense_flow_no_backtrack,
+                source_edge_mask);
         {
             const TimingMark timing = start_timing();
             tree_dense_flow_greedy_ascent =
-                greedy_increasing_flow_ascent(white_domain,
-                                              tree_dense_flow_no_backtrack);
+                greedy_increasing_flow_ascent(
+                    white_domain, tree_dense_flow_source_attractor);
             timings.push_back(finish_timing(
                 "tree_dense_flow_greedy_ascent", timing));
         }
         {
             const TimingMark timing = start_timing();
             source_reach_mask = greedy_increasing_flow_source_reach_mask(
-                white_domain, tree_dense_flow_no_backtrack, source_edge_mask);
+                white_domain, tree_dense_flow_source_attractor,
+                source_edge_mask);
             std::cout << "Source reach mask:\n"
                       << "  pixels: "
                       << cv::countNonZero(source_reach_mask) << "\n";
