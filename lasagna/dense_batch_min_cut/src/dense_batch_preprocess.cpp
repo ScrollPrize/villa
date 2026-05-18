@@ -3980,6 +3980,256 @@ cv::Mat render_graph_capacity_normalized_float(const SkeletonGraph& graph,
     return out;
 }
 
+struct IslandObstacleDebugResult {
+    cv::Mat label_factor;
+    int islands = 0;
+    int loop_sampled_islands = 0;
+};
+
+IslandObstacleDebugResult render_island_obstacle_factors(
+    const cv::Mat& white_domain, const SkeletonGraph& graph) {
+    CV_Assert(white_domain.type() == CV_8U);
+
+    IslandObstacleDebugResult result;
+    result.label_factor =
+        cv::Mat(white_domain.size(), CV_8UC3, cv::Scalar(0, 0, 0));
+    if (white_domain.empty()) {
+        return result;
+    }
+
+    cv::Mat obstacle_mask;
+    cv::compare(white_domain, 0, obstacle_mask, cv::CMP_EQ);
+
+    cv::Mat obstacle_labels;
+    cv::Mat obstacle_stats;
+    cv::Mat obstacle_centroids;
+    const int obstacle_count = cv::connectedComponentsWithStats(
+        obstacle_mask, obstacle_labels, obstacle_stats, obstacle_centroids, 8,
+        CV_32S);
+    if (obstacle_count <= 1) {
+        return result;
+    }
+
+    cv::Mat graph_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
+    if (!graph.edge_mask.empty()) {
+        cv::bitwise_or(graph_mask, graph.edge_mask, graph_mask);
+    }
+    if (!graph.node_mask.empty()) {
+        cv::bitwise_or(graph_mask, graph.node_mask, graph_mask);
+    }
+
+    const auto factor_text = [](int label, double factor) {
+        std::ostringstream out;
+        out << label << ":" << std::fixed << std::setprecision(2) << factor;
+        return out.str();
+    };
+    const auto in_image = [&](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < white_domain.cols && pixel.y >= 0 &&
+               pixel.y < white_domain.rows;
+    };
+    constexpr float kDtEpsilon = 1.0e-4f;
+
+    for (int label = 1; label < obstacle_count; ++label) {
+        const int area = obstacle_stats.at<int>(label, cv::CC_STAT_AREA);
+        if (area <= 0) {
+            continue;
+        }
+        const int left = obstacle_stats.at<int>(label, cv::CC_STAT_LEFT);
+        const int top = obstacle_stats.at<int>(label, cv::CC_STAT_TOP);
+        const int width = obstacle_stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = obstacle_stats.at<int>(label, cv::CC_STAT_HEIGHT);
+        const bool touches_border =
+            left <= 0 || top <= 0 || left + width >= white_domain.cols ||
+            top + height >= white_domain.rows;
+        if (touches_border) {
+            continue;
+        }
+
+        ++result.islands;
+        const int longest = std::max(width, height);
+        const int padding = std::clamp(longest + 16, 16, 128);
+        const int roi_left = std::max(0, left - padding);
+        const int roi_top = std::max(0, top - padding);
+        const int roi_right = std::min(white_domain.cols, left + width + padding);
+        const int roi_bottom =
+            std::min(white_domain.rows, top + height + padding);
+        const cv::Rect roi(roi_left, roi_top, roi_right - roi_left,
+                           roi_bottom - roi_top);
+        if (roi.empty()) {
+            continue;
+        }
+
+        cv::Mat patch_domain = white_domain(roi).clone();
+        cv::Mat nearest_source_label;
+        cv::Mat nearest_source_dt;
+        cv::distanceTransform(patch_domain, nearest_source_dt,
+                              nearest_source_label,
+                              cv::DIST_L2, cv::DIST_MASK_5,
+                              cv::DIST_LABEL_PIXEL);
+        const std::vector<cv::Point> source_points =
+            label_source_points(patch_domain, nearest_source_label);
+        std::vector<char> source_is_island(source_points.size(), 0);
+        for (int source_label = 1;
+             source_label < static_cast<int>(source_points.size());
+             ++source_label) {
+            const cv::Point local = source_points[source_label];
+            const cv::Point global(local.x + roi.x, local.y + roi.y);
+            if (!in_image(global)) {
+                continue;
+            }
+            source_is_island[static_cast<std::size_t>(source_label)] =
+                obstacle_labels.at<int>(global.y, global.x) == label ? 1 : 0;
+        }
+
+        std::vector<cv::Point> island_pixels;
+        island_pixels.reserve(static_cast<std::size_t>(area));
+        cv::Mat island_source_domain(roi.size(), CV_8U, cv::Scalar(255));
+        for (int y = top; y < top + height; ++y) {
+            for (int x = left; x < left + width; ++x) {
+                if (obstacle_labels.at<int>(y, x) != label) {
+                    continue;
+                }
+                const cv::Point global(x, y);
+                const cv::Point local(x - roi.x, y - roi.y);
+                island_source_domain.at<std::uint8_t>(local.y, local.x) = 0;
+                island_pixels.push_back(global);
+            }
+        }
+
+        std::vector<cv::Point> loop_pixels;
+        for (int y = 0; y < roi.height; ++y) {
+            for (int x = 0; x < roi.width; ++x) {
+                const cv::Point global(x + roi.x, y + roi.y);
+                if (graph_mask.at<std::uint8_t>(global.y, global.x) == 0) {
+                    continue;
+                }
+                bool touches_island_voronoi = false;
+                for (int dy = -1; dy <= 1 && !touches_island_voronoi; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= roi.width || ny < 0 ||
+                            ny >= roi.height) {
+                            continue;
+                        }
+                        const int nearest =
+                            nearest_source_label.at<int>(ny, nx);
+                        if (nearest > 0 &&
+                            nearest <
+                                static_cast<int>(source_is_island.size()) &&
+                            source_is_island
+                                    [static_cast<std::size_t>(nearest)] != 0) {
+                            touches_island_voronoi = true;
+                            break;
+                        }
+                    }
+                }
+                if (!touches_island_voronoi) {
+                    continue;
+                }
+                loop_pixels.push_back(global);
+            }
+        }
+
+        cv::Point representative_pixel = island_pixels.empty()
+                                             ? cv::Point(left, top)
+                                             : island_pixels.front();
+        cv::Mat loop_source_domain(roi.size(), CV_8U, cv::Scalar(255));
+        for (const cv::Point pixel : loop_pixels) {
+            loop_source_domain.at<std::uint8_t>(pixel.y - roi.y,
+                                                pixel.x - roi.x) = 0;
+        }
+        if (!loop_pixels.empty() && !island_pixels.empty()) {
+            cv::Mat loop_dt;
+            cv::distanceTransform(loop_source_domain, loop_dt, cv::DIST_L2,
+                                  cv::DIST_MASK_5);
+            float best_loop_distance = -1.0f;
+            for (const cv::Point pixel : island_pixels) {
+                const cv::Point local(pixel.x - roi.x, pixel.y - roi.y);
+                const float value = loop_dt.at<float>(local.y, local.x);
+                if (value > best_loop_distance ||
+                    (std::abs(value - best_loop_distance) <= kDtEpsilon &&
+                     (pixel.y < representative_pixel.y ||
+                      (pixel.y == representative_pixel.y &&
+                       pixel.x < representative_pixel.x)))) {
+                    best_loop_distance = value;
+                    representative_pixel = pixel;
+                }
+            }
+        }
+
+        cv::Mat actual_island_dt;
+        cv::distanceTransform(island_source_domain, actual_island_dt,
+                              cv::DIST_L2, cv::DIST_MASK_5);
+
+        cv::Mat point_source_domain(roi.size(), CV_8U, cv::Scalar(255));
+        const cv::Point representative_local(representative_pixel.x - roi.x,
+                                             representative_pixel.y - roi.y);
+        if (representative_local.x >= 0 &&
+            representative_local.x < point_source_domain.cols &&
+            representative_local.y >= 0 &&
+            representative_local.y < point_source_domain.rows) {
+            point_source_domain.at<std::uint8_t>(representative_local.y,
+                                                 representative_local.x) = 0;
+        }
+        cv::Mat point_dt;
+        cv::distanceTransform(point_source_domain, point_dt, cv::DIST_L2,
+                              cv::DIST_MASK_5);
+
+        double score = 1.0;
+        bool has_loop_score = false;
+        for (const cv::Point pixel : loop_pixels) {
+            const cv::Point local(pixel.x - roi.x, pixel.y - roi.y);
+            const float single_point_distance =
+                point_dt.at<float>(local.y, local.x);
+            if (single_point_distance <= kDtEpsilon) {
+                continue;
+            }
+            const float island_distance =
+                actual_island_dt.at<float>(local.y, local.x);
+            const double point_score = std::clamp(
+                static_cast<double>(island_distance) /
+                    static_cast<double>(single_point_distance),
+                0.0, 1.0);
+            score = std::min(score, point_score);
+            has_loop_score = true;
+        }
+        if (has_loop_score) {
+            ++result.loop_sampled_islands;
+        }
+
+        const cv::Scalar base_color = deterministic_edge_color(label);
+        const double scale = 0.35 + 0.65 * score;
+        const cv::Vec3b island_color(
+            static_cast<std::uint8_t>(
+                std::clamp(base_color[0] * scale, 0.0, 255.0)),
+            static_cast<std::uint8_t>(
+                std::clamp(base_color[1] * scale, 0.0, 255.0)),
+            static_cast<std::uint8_t>(
+                std::clamp(base_color[2] * scale, 0.0, 255.0)));
+        const cv::Vec3b graph_color(
+            static_cast<std::uint8_t>(std::clamp(base_color[0], 0.0, 255.0)),
+            static_cast<std::uint8_t>(std::clamp(base_color[1], 0.0, 255.0)),
+            static_cast<std::uint8_t>(std::clamp(base_color[2], 0.0, 255.0)));
+
+        for (const cv::Point pixel : loop_pixels) {
+            result.label_factor.at<cv::Vec3b>(pixel.y, pixel.x) = graph_color;
+        }
+        for (const cv::Point pixel : island_pixels) {
+            result.label_factor.at<cv::Vec3b>(pixel.y, pixel.x) = island_color;
+        }
+        if (in_image(representative_pixel)) {
+            cv::circle(result.label_factor, representative_pixel, 1,
+                       cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_8);
+        }
+
+        draw_debug_label(result.label_factor, representative_pixel,
+                         factor_text(label, score), cv::Scalar(255, 255, 255));
+    }
+
+    return result;
+}
+
 cv::Mat nearest_graph_flow_projection(const cv::Mat& white_domain,
                                       const cv::Mat& graph_mask,
                                       const cv::Mat& graph_pixel_flow) {
@@ -4211,6 +4461,7 @@ struct DenseFlowResult {
     cv::Mat edge_flow_px;
     cv::Mat edge_flow_px_gray_bg;
     cv::Mat graph_source_edges;
+    cv::Mat island_obstacle_factor;
     cv::Mat flow_gate_weight;
     cv::Point source_seed_pixel{-1, -1};
     float source_seed_capacity = 0.0f;
@@ -5883,6 +6134,20 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     };
     rebuild_graph_edge_maps();
 
+    cv::Mat island_obstacle_factor(white_domain.size(), CV_8UC3,
+                                   cv::Scalar(0, 0, 0));
+    if (enable_debug_outputs) {
+        const TimingMark timing = start_timing();
+        const IslandObstacleDebugResult island_debug =
+            render_island_obstacle_factors(white_domain, graph);
+        island_obstacle_factor = island_debug.label_factor;
+        std::cout << "Island obstacle factors:\n"
+                  << "  islands: " << island_debug.islands << "\n"
+                  << "  loop_sampled_islands: "
+                  << island_debug.loop_sampled_islands << "\n";
+        timings.push_back(finish_timing("island_obstacle_factor", timing));
+    }
+
     int source_seed_node = -1;
     cv::Point source_seed_pixel(-1, -1);
     float source_seed_capacity = 0.0f;
@@ -7524,6 +7789,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             edge_flow_px,
             edge_flow_px_gray_bg,
             graph_source_edges,
+            island_obstacle_factor,
             cv::Mat(),
             source_seed_pixel,
             source_seed_capacity,
@@ -7936,6 +8202,7 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                                         float* smooth_grid_flow,
                                         float* gate_basis_flow,
                                         float* graph_edge_flow_rgb,
+                                        float* island_obstacle_factor_rgb,
                                         int grid_step,
                                         float backtrack_distance,
                                         int* resolved_source_x,
@@ -8088,7 +8355,8 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
 
         const bool enable_debug_outputs =
             smooth_grid_flow != nullptr || gate_basis_flow != nullptr ||
-            graph_edge_flow_rgb != nullptr;
+            graph_edge_flow_rgb != nullptr ||
+            island_obstacle_factor_rgb != nullptr;
         DenseFlowResult dense_flow_result =
             compute_dense_source_flow(
                 white_domain, dt, graph,
@@ -8144,6 +8412,23 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                 const cv::Vec3f* src_row = graph_rgb.ptr<cv::Vec3f>(y);
                 float* dst_row =
                     graph_edge_flow_rgb +
+                    static_cast<std::size_t>(y) * width * 3;
+                for (int x = 0; x < width; ++x) {
+                    dst_row[3 * x + 0] = src_row[x][0];
+                    dst_row[3 * x + 1] = src_row[x][1];
+                    dst_row[3 * x + 2] = src_row[x][2];
+                }
+            }
+        }
+        if (island_obstacle_factor_rgb != nullptr) {
+            cv::Mat island_rgb;
+            cv::cvtColor(dense_flow_result.island_obstacle_factor, island_rgb,
+                         cv::COLOR_BGR2RGB);
+            island_rgb.convertTo(island_rgb, CV_32FC3);
+            for (int y = 0; y < height; ++y) {
+                const cv::Vec3f* src_row = island_rgb.ptr<cv::Vec3f>(y);
+                float* dst_row =
+                    island_obstacle_factor_rgb +
                     static_cast<std::size_t>(y) * width * 3;
                 for (int x = 0; x < width; ++x) {
                     dst_row[3 * x + 0] = src_row[x][0];
@@ -8471,6 +8756,8 @@ int main(int argc, char** argv) {
                         dense_flow_result.edge_flow_px_gray_bg);
             write_image(workdir / (stem + "_graph_source_edges.tif"),
                         dense_flow_result.graph_source_edges);
+            write_image(workdir / (stem + "_island_obstacle_factor.tif"),
+                        dense_flow_result.island_obstacle_factor);
             write_image(workdir / (stem + "_flow_gate_weight.tif"),
                         dense_flow_result.flow_gate_weight);
             timings.push_back(finish_timing("dense_flow_write", timing));
@@ -8559,6 +8846,9 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"graph_source_edges",
                  to_float_layer(dense_flow_result.graph_source_edges)});
+            layered_tiff.push_back(
+                {"island_obstacle_factor",
+                 to_float_layer(dense_flow_result.island_obstacle_factor)});
             layered_tiff.push_back(
                 {"flow_gate_weight",
                  to_float_layer(dense_flow_result.flow_gate_weight)});

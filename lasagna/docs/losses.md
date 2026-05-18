@@ -127,7 +127,12 @@ corner counts for gate weights `>0`, `>0.1`, and `>0.5`, plus the fraction at
 With `debug: true`, flow layer TIFFs are written every `debug_layer_interval`
 flow evaluations (default `10`). The service JPG is written every
 `debug_jpg_interval` evaluations (default `50`) and shows `pred_dt` next to the
-normalized greedy-ascent flow layer that the local gate is based on.
+normalized greedy-ascent flow layer that the local gate is based on, then the
+normalized no-backtrack dense flow. The layer TIFF also includes
+`island_obstacle_factor`, which labels enclosed obstacle islands and annotates
+the local loop score. The score is `min(full_island_dt / representative_point_dt)`
+over loop pixels associated with the island, so lower values mean the island is
+acting more like a real obstacle.
 
 When `anticipatory_pull.debug_points` or `debug_roi_center_xyz` is set, every normal flow-gate layer-debug
 iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.jpg`.

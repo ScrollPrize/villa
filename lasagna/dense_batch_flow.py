@@ -124,6 +124,7 @@ def _load_library_from_path(path: Path) -> ctypes.CDLL:
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
 		ctypes.c_int,
 		ctypes.c_float,
 		ctypes.POINTER(ctypes.c_int),
@@ -184,7 +185,7 @@ def compute_flow_grid(
 	query_xy: (N, 2) float32 image coordinates, x then y.
 	Returns (query_weight, dense_weight), both float32 gate weights in [0, 1].
 	When return_debug is true, also returns smooth grid flow, greedy-ascent gate
-	basis flow, and graph edge flow.
+	basis flow, graph edge flow, and island obstacle-factor labels.
 	"""
 	if image_u8.ndim != 2:
 		raise ValueError(f"image_u8 must be 2D, got shape {image_u8.shape}")
@@ -201,6 +202,9 @@ def compute_flow_grid(
 		np.zeros((height, width), dtype=np.float32) if return_debug else None
 	)
 	graph_edge_flow = np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
+	island_obstacle_factor = (
+		np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
+	)
 	resolved_source_x = ctypes.c_int(-1)
 	resolved_source_y = ctypes.c_int(-1)
 	resolved_source_capacity = ctypes.c_float(0.0)
@@ -231,6 +235,11 @@ def compute_flow_grid(
 			if graph_edge_flow is not None
 			else None
 		),
+		(
+			island_obstacle_factor.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if island_obstacle_factor is not None
+			else None
+		),
 		int(max(1, grid_step)),
 		ctypes.c_float(max(0.0, float(backtrack_distance))),
 		ctypes.byref(resolved_source_x),
@@ -255,6 +264,7 @@ def compute_flow_grid(
 			smooth_grid_flow,
 			gate_basis_flow,
 			graph_edge_flow,
+			island_obstacle_factor,
 		)
 	else:
 		result = (query_flow, dense_flow)

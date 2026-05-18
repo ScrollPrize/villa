@@ -19,7 +19,7 @@
 	"stages": [
 		{
 			"name": "snap",
-			"steps": 1000,
+			"steps": 500,
 			"min_scaledown": 0,
 			"lr": 0.1,
 			"dlr": [1.0, 0.1, 0.01, 0.001, 0.0001],

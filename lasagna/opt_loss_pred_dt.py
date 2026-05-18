@@ -920,6 +920,7 @@ def _write_flow_gate_debug(
 	smooth_grid_flow: np.ndarray | None,
 	gate_basis_hr: np.ndarray | None,
 	graph_edge_flow_rgb: np.ndarray | None,
+	island_obstacle_factor_rgb: np.ndarray | None,
 	weight_hr: np.ndarray | None,
 	out_dir: Path | None,
 	pull_weight_hr: np.ndarray | None = None,
@@ -951,6 +952,11 @@ def _write_flow_gate_debug(
 		None
 		if graph_edge_flow_rgb is None
 		else np.asarray(graph_edge_flow_rgb, dtype=np.float32)
+	)
+	island_obstacle = (
+		None
+		if island_obstacle_factor_rgb is None
+		else np.asarray(island_obstacle_factor_rgb, dtype=np.float32)
 	)
 	weights = (
 		np.zeros_like(pred_raw_u8, dtype=np.float32)
@@ -986,6 +992,8 @@ def _write_flow_gate_debug(
 				write_named_layer(tw, gate_basis, name="gate_basis_flow_normalized")
 			if graph_flow is not None:
 				write_named_layer(tw, graph_flow, name="graph_edge_flow")
+			if island_obstacle is not None:
+				write_named_layer(tw, island_obstacle, name="island_obstacle_factor")
 			write_named_layer(tw, weights, name="flow_gate_weight")
 			if pull_weight is not None:
 				write_named_layer(tw, pull_weight, name="anticipatory_pull_weight")
@@ -1006,6 +1014,11 @@ def _write_flow_gate_debug(
 			)
 		if graph_flow is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_edge_flow.tif"), graph_flow)
+		if island_obstacle is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_obstacle_factor.tif"),
+				island_obstacle,
+			)
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_weight.tif"), weights)
 		if pull_weight is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_weight.tif"), pull_weight)
@@ -1024,6 +1037,7 @@ def _write_flow_gate_weight_jpg(
 	pred_u8: np.ndarray,
 	used_weight_hr: np.ndarray,
 	gate_basis_hr: np.ndarray | None,
+	smooth_grid_flow: np.ndarray | None,
 	out_dir: Path | None,
 ) -> None:
 	global _flow_gate_jpg_warned
@@ -1038,16 +1052,20 @@ def _write_flow_gate_weight_jpg(
 	gate_basis_vis = _normalize_positive_debug_image(gate_basis_hr)
 	if gate_basis_vis is None or gate_basis_vis.shape != pred.shape:
 		gate_basis_vis = weight.clip(0.0, 1.0)
+	no_backtrack_vis = _normalize_positive_debug_image(smooth_grid_flow)
+	if no_backtrack_vis is None or no_backtrack_vis.shape != pred.shape:
+		no_backtrack_vis = np.zeros_like(weight, dtype=np.float32)
 	pred_vis = ((pred.astype(np.float32) - 80.0) / (127.0 - 80.0)).clip(0.0, 1.0)
 	img = np.concatenate([
 		(pred_vis * 255.0 + 0.5).astype(np.uint8),
 		(gate_basis_vis * 255.0 + 0.5).astype(np.uint8),
+		(no_backtrack_vis * 255.0 + 0.5).astype(np.uint8),
 	], axis=1)
 	jpg_dir = out_dir / "pred_dt_flow_gate_weight_jpg"
 	try:
 		jpg_dir.mkdir(parents=True, exist_ok=True)
 		for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
-			path = jpg_dir / f"{suffix}_pred_dt_and_gate_basis.jpg"
+			path = jpg_dir / f"{suffix}_pred_dt_gate_basis_no_backtrack.jpg"
 			try:
 				import cv2
 				if not cv2.imwrite(str(path), img):
@@ -1184,6 +1202,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				smooth_grid_flow=None,
 				gate_basis_hr=None,
 				graph_edge_flow_rgb=None,
+				island_obstacle_factor_rgb=None,
 				weight_hr=None,
 				out_dir=_flow_gate_out_dir,
 			)
@@ -1221,6 +1240,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					smooth_grid_flow,
 					gate_basis_flow,
 					graph_edge_flow_rgb,
+					island_obstacle_factor_rgb,
 					flow_metadata,
 				) = flow_outputs
 			else:
@@ -1228,6 +1248,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				smooth_grid_flow = None
 				gate_basis_flow = None
 				graph_edge_flow_rgb = None
+				island_obstacle_factor_rgb = None
 		except RuntimeError as exc:
 			message = str(exc)
 			source_value = int(pred_img[source_y, source_x]) if 0 <= source_y < He and 0 <= source_x < We else -1
@@ -1271,6 +1292,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						smooth_grid_flow=None,
 						gate_basis_hr=None,
 						graph_edge_flow_rgb=None,
+						island_obstacle_factor_rgb=None,
 						weight_hr=weight_hr,
 						out_dir=_flow_gate_out_dir,
 					)
@@ -1286,6 +1308,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						pred_u8=pred_img,
 						used_weight_hr=used_weight_hr,
 						gate_basis_hr=None,
+						smooth_grid_flow=None,
 						out_dir=_flow_gate_out_dir,
 					)
 				publish_timing()
@@ -1382,6 +1405,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				smooth_grid_flow=smooth_grid_flow,
 				gate_basis_hr=gate_basis_hr,
 				graph_edge_flow_rgb=graph_edge_flow_rgb,
+				island_obstacle_factor_rgb=island_obstacle_factor_rgb,
 				weight_hr=weight_hr,
 				pull_weight_hr=pull_weight_hr,
 				pull_prefix_hr=pull_prefix_hr,
@@ -1414,6 +1438,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				pred_u8=pred_img,
 				used_weight_hr=used_weight_hr,
 				gate_basis_hr=gate_basis_hr,
+				smooth_grid_flow=smooth_grid_flow,
 				out_dir=_flow_gate_out_dir,
 			)
 			done("write_weight_jpg", _t)
