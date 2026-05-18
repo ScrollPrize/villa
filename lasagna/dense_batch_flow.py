@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import shlex
+import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
 
 
 _LIB = None
+_LIB_LOCK = threading.Lock()
+_AUTOBUILD_ENV = "LASAGNA_DENSE_BATCH_FLOW_AUTOBUILD"
 
 
 def _candidate_library_paths() -> list[Path]:
@@ -18,44 +24,121 @@ def _candidate_library_paths() -> list[Path]:
 	]
 
 
+def _manual_build_message() -> str:
+	return (
+		"Build it with:\n"
+		"  cmake -S lasagna/dense_batch_min_cut -B lasagna/dense_batch_min_cut/build\n"
+		"  cmake --build lasagna/dense_batch_min_cut/build --target dense_batch_flow"
+	)
+
+
+def _format_candidate_paths() -> str:
+	return "\n".join(f"  {p}" for p in _candidate_library_paths())
+
+
+def _find_library_path() -> Path | None:
+	for path in _candidate_library_paths():
+		if path.exists():
+			return path
+	return None
+
+
+def _build_commands() -> list[list[str]]:
+	source_dir = Path(__file__).resolve().parent / "dense_batch_min_cut"
+	build_dir = source_dir / "build"
+	return [
+		["cmake", "-S", str(source_dir), "-B", str(build_dir)],
+		["cmake", "--build", str(build_dir), "--target", "dense_batch_flow"],
+	]
+
+
+def _autobuild_enabled() -> bool:
+	return os.environ.get(_AUTOBUILD_ENV, "1") != "0"
+
+
+def _run_build_command(cmd: list[str]) -> None:
+	try:
+		result = subprocess.run(
+			cmd,
+			check=False,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT,
+			text=True,
+		)
+	except FileNotFoundError as exc:
+		commands = "\n".join(f"  {shlex.join(c)}" for c in _build_commands())
+		raise RuntimeError(
+			"dense_batch_flow auto-build failed because CMake was not found.\n"
+			f"Attempted:\n{commands}\n"
+			f"{_manual_build_message()}"
+		) from exc
+	if result.returncode != 0:
+		commands = "\n".join(f"  {shlex.join(c)}" for c in _build_commands())
+		raise RuntimeError(
+			"dense_batch_flow auto-build failed.\n"
+			f"Failed command:\n  {shlex.join(cmd)}\n"
+			f"Attempted:\n{commands}\n"
+			f"Output:\n{result.stdout}"
+		)
+
+
+def _auto_build_library() -> None:
+	for cmd in _build_commands():
+		_run_build_command(cmd)
+
+
+def _load_library_from_path(path: Path) -> ctypes.CDLL:
+	lib = ctypes.CDLL(str(path))
+	lib.dense_batch_flow_grid_u8.argtypes = [
+		ctypes.POINTER(ctypes.c_uint8),
+		ctypes.c_int,
+		ctypes.c_int,
+		ctypes.c_int,
+		ctypes.c_int,
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.c_int,
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.c_int,
+		ctypes.c_float,
+		ctypes.POINTER(ctypes.c_int),
+		ctypes.POINTER(ctypes.c_int),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.c_char_p,
+		ctypes.c_int,
+		ctypes.c_int,
+	]
+	lib.dense_batch_flow_grid_u8.restype = ctypes.c_int
+	return lib
+
+
 def _load_library() -> ctypes.CDLL:
 	global _LIB
 	if _LIB is not None:
 		return _LIB
-	for path in _candidate_library_paths():
-		if path.exists():
-			lib = ctypes.CDLL(str(path))
-			lib.dense_batch_flow_grid_u8.argtypes = [
-				ctypes.POINTER(ctypes.c_uint8),
-				ctypes.c_int,
-				ctypes.c_int,
-				ctypes.c_int,
-				ctypes.c_int,
-				ctypes.POINTER(ctypes.c_float),
-				ctypes.c_int,
-				ctypes.POINTER(ctypes.c_float),
-				ctypes.POINTER(ctypes.c_float),
-				ctypes.POINTER(ctypes.c_float),
-				ctypes.POINTER(ctypes.c_float),
-				ctypes.c_int,
-				ctypes.c_float,
-				ctypes.POINTER(ctypes.c_int),
-				ctypes.POINTER(ctypes.c_int),
-				ctypes.POINTER(ctypes.c_float),
-				ctypes.c_char_p,
-				ctypes.c_int,
-				ctypes.c_int,
-			]
-			lib.dense_batch_flow_grid_u8.restype = ctypes.c_int
-			_LIB = lib
-			return lib
-	paths = "\n".join(f"  {p}" for p in _candidate_library_paths())
-	raise RuntimeError(
-		"dense_batch_flow library was not found. Build it with:\n"
-		"  cmake -S lasagna/dense_batch_min_cut -B lasagna/dense_batch_min_cut/build\n"
-		"  cmake --build lasagna/dense_batch_min_cut/build\n"
-		f"Looked for:\n{paths}"
-	)
+	with _LIB_LOCK:
+		if _LIB is not None:
+			return _LIB
+		path = _find_library_path()
+		if path is None and _autobuild_enabled():
+			_auto_build_library()
+			path = _find_library_path()
+		if path is None:
+			autobuild_note = (
+				f"Automatic build is disabled by {_AUTOBUILD_ENV}=0.\n"
+				if not _autobuild_enabled()
+				else "Automatic build did not produce a loadable library.\n"
+			)
+			raise RuntimeError(
+				"dense_batch_flow library was not found.\n"
+				f"{autobuild_note}"
+				f"{_manual_build_message()}\n"
+				f"Looked for:\n{_format_candidate_paths()}"
+			)
+		_LIB = _load_library_from_path(path)
+		return _LIB
 
 
 def compute_flow_grid(

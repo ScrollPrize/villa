@@ -1,10 +1,13 @@
 {
+	"args": {
+		"model-init": "model"
+	},
 	"base": {
 		"normal": 1.0,
 		"step": 10.0,
 		"smooth": 0.1,
-		"station_n": 0.0001,
-		"station_t": 0.0001,
+		"station_n": 1.0,
+		"station_t": 1.0,
 		"winding_density": 0.01,
 		"data": 0.0,
 		"data_plain": 0.0,
@@ -16,9 +19,10 @@
 	"stages": [
 		{
 			"name": "snap",
-			"steps": 500,
+			"steps": 1000,
 			"min_scaledown": 0,
-			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"lr": 0.1,
+			"dlr": [1.0, 0.1, 0.01, 0.001, 0.0001],
 			"_lr": [10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
 			"args": {

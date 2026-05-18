@@ -7,10 +7,18 @@ Small C++/OpenCV experiments for dense batched min-cut preprocessing.
 Requires OpenCV with `core`, `imgcodecs`, `imgproc`, and `ximgproc`, plus
 libtiff for named multipage TIFF layers.
 
+Python callers normally do not need to run this manually. `dense_batch_flow.py`
+builds the `dense_batch_flow` shared library on first use if it is missing,
+using the same CMake build directory shown below. Set
+`LASAGNA_DENSE_BATCH_FLOW_AUTOBUILD=0` to disable that behavior and require an
+explicit manual build. The library-only build is:
+
 ```bash
 cmake -S lasagna/dense_batch_min_cut -B lasagna/dense_batch_min_cut/build
-cmake --build lasagna/dense_batch_min_cut/build
+cmake --build lasagna/dense_batch_min_cut/build --target dense_batch_flow
 ```
+
+To build the CLI used below as well, omit `--target dense_batch_flow`.
 
 ## Run
 
