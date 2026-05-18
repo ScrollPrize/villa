@@ -93,7 +93,8 @@ Outputs:
   pseudo-random graph edge visualization.
 - `<stem>_graph_components_random.tif`: graph visualization where every
   connected graph component gets one deterministic pseudo-random color on a
-  black background.
+  black background. Components pruned from the computational graph are still
+  overlaid in this debug image with separate colors.
 - `<stem>_graph_nodes.tif`: node-only graph visualization.
 - `<stem>_graph_capacity.tif`: graph edges rendered in grayscale by edge
   capacity, where capacity is the minimum raw distance-transform value along

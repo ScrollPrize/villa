@@ -2466,6 +2466,7 @@ struct SkeletonGraph {
     std::vector<cv::Point2f> nodes;
     std::vector<GraphEdge> edges;
     std::vector<std::vector<cv::Point>> node_pixel_groups;
+    std::vector<std::vector<cv::Point>> pruned_graph_component_pixel_groups;
     cv::Mat node_mask;
     cv::Mat edge_mask;
     int skeleton_pixels = 0;
@@ -3223,6 +3224,45 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
             }
         }
 
+        graph.pruned_graph_component_pixel_groups.clear();
+        std::vector<int> pruned_group_for_component(
+            static_cast<std::size_t>(component_count), -1);
+        const auto pruned_group = [&](int component) -> std::vector<cv::Point>& {
+            int& group =
+                pruned_group_for_component[static_cast<std::size_t>(component)];
+            if (group < 0) {
+                group = static_cast<int>(
+                    graph.pruned_graph_component_pixel_groups.size());
+                graph.pruned_graph_component_pixel_groups.emplace_back();
+            }
+            return graph.pruned_graph_component_pixel_groups[
+                static_cast<std::size_t>(group)];
+        };
+        for (int node = 1; node < static_cast<int>(node_component.size());
+             ++node) {
+            const int component = node_component[node];
+            if (component < 0 || component == keep_component ||
+                node >= static_cast<int>(node_pixels.size())) {
+                continue;
+            }
+            std::vector<cv::Point>& pixels = pruned_group(component);
+            pixels.insert(pixels.end(),
+                          node_pixels[static_cast<std::size_t>(node)].begin(),
+                          node_pixels[static_cast<std::size_t>(node)].end());
+        }
+        for (const GraphEdge& edge : graph.edges) {
+            if (edge.a <= 0 ||
+                edge.a >= static_cast<int>(node_component.size())) {
+                continue;
+            }
+            const int component = node_component[edge.a];
+            if (component < 0 || component == keep_component) {
+                continue;
+            }
+            std::vector<cv::Point>& pixels = pruned_group(component);
+            pixels.insert(pixels.end(), edge.pixels.begin(), edge.pixels.end());
+        }
+
         std::vector<int> node_remap(node_component.size(), -1);
         node_remap[0] = 0;
         std::vector<cv::Point2f> kept_nodes;
@@ -3593,6 +3633,24 @@ cv::Mat render_graph_component_colors(const SkeletonGraph& graph, cv::Size size)
             static_cast<std::uint8_t>(color[1]),
             static_cast<std::uint8_t>(color[2]));
         for (const cv::Point pixel : graph.node_pixel_groups[node]) {
+            if (pixel.x < 0 || pixel.x >= out.cols || pixel.y < 0 ||
+                pixel.y >= out.rows) {
+                continue;
+            }
+            out.at<cv::Vec3b>(pixel.y, pixel.x) = pixel_color;
+        }
+    }
+
+    for (std::size_t group = 0;
+         group < graph.pruned_graph_component_pixel_groups.size(); ++group) {
+        const cv::Scalar color =
+            deterministic_edge_color(1000 + static_cast<int>(group));
+        const cv::Vec3b pixel_color(
+            static_cast<std::uint8_t>(color[0]),
+            static_cast<std::uint8_t>(color[1]),
+            static_cast<std::uint8_t>(color[2]));
+        for (const cv::Point pixel :
+             graph.pruned_graph_component_pixel_groups[group]) {
             if (pixel.x < 0 || pixel.x >= out.cols || pixel.y < 0 ||
                 pixel.y >= out.rows) {
                 continue;
