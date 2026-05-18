@@ -1041,13 +1041,16 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
     """Per-patch satisfaction metrics.
 
     Returns ``(satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks,
-    boundary_satisfied_count)``: a bool flag per patch indicating whether at least
-    ``metrics_config['satisfied_patch_quad_fraction']`` of its valid quads are
-    satisfied, the satisfied/total area tensors, the per-patch (H-1, W-1) bool quad
-    masks, and a bool flag per patch indicating whether at least
+    boundary_satisfied_count, target_winding_idx_per_patch)``: a bool flag per patch
+    indicating whether at least ``metrics_config['satisfied_patch_quad_fraction']`` of
+    its valid quads are satisfied, the satisfied/total area tensors, the per-patch
+    (H-1, W-1) bool quad masks, a bool flag per patch indicating whether at least
     ``metrics_config['boundary_satisfied_patch_quad_fraction']`` of its boundary quads
     (in-ROI valid quads with at least one 4-neighbor that is out-of-bounds or not
-    in-ROI-valid) are satisfied.
+    in-ROI-valid) are satisfied, and the per-patch (H-1, W-1) int64 winding-index
+    tensors (the integer output-mesh winding each quad's snap-target sits on; -1 where
+    the quad has no target set, e.g. invalid quads or quads in disconnected unwrap
+    components).
 
     For each patch we first find valid quads whose footprint touches the z-ROI. Each
     such quad is then evaluated only at its center point, defined as the mean of its
@@ -1074,6 +1077,7 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
     satisfied_areas = torch.zeros(len(patches), dtype=torch.float64)
     total_areas = torch.zeros(len(patches), dtype=torch.float64)
     satisfied_quad_masks = [torch.zeros([max(p.zyxs.shape[0] - 1, 0), max(p.zyxs.shape[1] - 1, 0)], dtype=torch.bool) for p in patches]
+    target_winding_idx_per_patch = [torch.full([max(p.zyxs.shape[0] - 1, 0), max(p.zyxs.shape[1] - 1, 0)], -1, dtype=torch.int64) for p in patches]
 
     with torch.no_grad():
         for patch_index, patch in enumerate(patches):
@@ -1280,6 +1284,15 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
 
             satisfied_quad_mask = satisfied_quad_mask & scan_in_band & in_roi_valid_quad_mask
 
+            # Per-quad output-mesh winding index, derived from the raw (per-row) target
+            # shifted-radius. NaN entries (quads without a target set) become -1.
+            target_winding_idx_full = torch.where(
+                torch.isnan(target_raw_shifted_all),
+                torch.full_like(target_raw_shifted_all, -1.),
+                torch.round(target_raw_shifted_all / dr),
+            ).to(torch.int64)
+            target_winding_idx_per_patch[patch_index] = target_winding_idx_full.cpu()
+
             # Boundary = in-ROI-valid quads with at least one 4-neighbor that is
             # out-of-bounds or not in in_roi_valid_quad_mask.
             padded = torch.nn.functional.pad(in_roi_valid_quad_mask, (1, 1, 1, 1), value=False)
@@ -1298,7 +1311,7 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                 num_satisfied_boundary_quads = int((boundary_quad_mask & satisfied_quad_mask).sum().item())
                 boundary_satisfied_patches[patch_index] = num_satisfied_boundary_quads >= metrics_config['boundary_satisfied_patch_quad_fraction'] * num_boundary_quads
 
-    return satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches
+    return satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch
 
 
 def get_face_indices(h, w):
@@ -1364,6 +1377,199 @@ def _get_working_set_winding_range(slice_to_spiral_transform, dr_per_winding, wo
     return max(min_w - margin, cfg_min), min(max_w + 1 + margin, cfg_max)
 
 
+def _rasterize_triangles_into_mesh(
+    tri_uvs,  # (T, 3, 2) — (u, v) per triangle vertex
+    tri_scrolls,  # (T, 3, 3) — scroll zyx per triangle vertex
+    tri_target_w,  # (T,) — output winding index per triangle
+    scroll_zyxs,  # (num_zs, total_thetas, 3) — modified in place
+    winding_offsets_t,  # (num_windings + 1,) cumulative theta-offset per winding
+    num_thetas_t,  # (num_windings,) — num theta points per output winding
+):
+    device = scroll_zyxs.device
+    T = tri_uvs.shape[0]
+    if T == 0:
+        return
+
+    num_zs = scroll_zyxs.shape[0]
+    v_lim_per_tri = num_thetas_t[tri_target_w]  # (T,)
+
+    u_min = torch.floor(tri_uvs[..., 0].min(dim=-1).values).to(torch.long)
+    u_max = torch.ceil(tri_uvs[..., 0].max(dim=-1).values).to(torch.long)
+    v_min = torch.floor(tri_uvs[..., 1].min(dim=-1).values).to(torch.long)
+    v_max = torch.ceil(tri_uvs[..., 1].max(dim=-1).values).to(torch.long)
+    u_min = u_min.clamp(min=0, max=num_zs - 1)
+    u_max = u_max.clamp(min=0, max=num_zs - 1)
+    v_min = v_min.clamp(min=0)
+    v_max = torch.minimum(v_max, v_lim_per_tri - 1)
+    valid_bbox = (u_min <= u_max) & (v_min <= v_max)
+
+    bbox_h = (u_max - u_min + 1).clamp(min=1)
+    bbox_w = (v_max - v_min + 1).clamp(min=1)
+    max_h = int(bbox_h[valid_bbox].max().item()) if valid_bbox.any() else 1
+    max_w = int(bbox_w[valid_bbox].max().item()) if valid_bbox.any() else 1
+
+    du_grid, dv_grid = torch.meshgrid(
+        torch.arange(max_h, device=device),
+        torch.arange(max_w, device=device),
+        indexing='ij',
+    )
+    us = u_min[:, None, None] + du_grid[None]  # (T, max_h, max_w)
+    vs = v_min[:, None, None] + dv_grid[None]
+    in_bbox = (
+        (du_grid[None] < bbox_h[:, None, None])
+        & (dv_grid[None] < bbox_w[:, None, None])
+        & valid_bbox[:, None, None]
+    )
+
+    pts = torch.stack([us.float(), vs.float()], dim=-1)
+    a = tri_uvs[:, 0]
+    b = tri_uvs[:, 1]
+    c = tri_uvs[:, 2]
+    v0 = b - a
+    v1 = c - a
+    v2 = pts - a[:, None, None]
+    d00 = (v0 * v0).sum(-1)
+    d01 = (v0 * v1).sum(-1)
+    d11 = (v1 * v1).sum(-1)
+    d20 = (v2 * v0[:, None, None]).sum(-1)
+    d21 = (v2 * v1[:, None, None]).sum(-1)
+    denom = d00 * d11 - d01 * d01
+    nonzero = denom.abs() >= 1e-9
+    denom_safe = torch.where(nonzero, denom, torch.ones_like(denom))
+    beta = (d11[:, None, None] * d20 - d01[:, None, None] * d21) / denom_safe[:, None, None]
+    gamma = (d00[:, None, None] * d21 - d01[:, None, None] * d20) / denom_safe[:, None, None]
+    alpha = 1 - beta - gamma
+    inside = (alpha >= -1e-6) & (beta >= -1e-6) & (gamma >= -1e-6) & nonzero[:, None, None]
+    mask = in_bbox & inside
+    if not mask.any():
+        return
+
+    sa = tri_scrolls[:, 0][:, None, None, :]
+    sb = tri_scrolls[:, 1][:, None, None, :]
+    sc = tri_scrolls[:, 2][:, None, None, :]
+    interp = alpha[..., None] * sa + beta[..., None] * sb + gamma[..., None] * sc
+
+    sel = mask.reshape(-1)
+    target_u = us.reshape(-1)[sel]
+    target_v_local = vs.reshape(-1)[sel]
+    target_w_flat = tri_target_w[:, None, None].expand(-1, max_h, max_w).reshape(-1)[sel]
+    target_v_global = winding_offsets_t[target_w_flat] + target_v_local
+    scroll_zyxs[target_u, target_v_global] = interp.reshape(-1, 3)[sel]
+
+
+@torch.inference_mode
+def _build_snapped_overlay(
+    scroll_zyxs,  # (num_zs, total_thetas, 3) — modified in place
+    num_thetas_by_winding,  # list[int]
+    z0,  # scalar — spiral z corresponding to scroll_zyxs[0]
+    grid_spacing,  # int — z and theta-arc-length step in spiral coords
+    slice_to_spiral_transform,
+    dr_per_winding,
+    patches,
+    satisfied_patches,
+    boundary_satisfied_patches,
+    target_winding_idx_per_patch,
+):
+    device = scroll_zyxs.device
+    dr = dr_per_winding.detach()
+    num_windings = len(num_thetas_by_winding)
+    winding_offsets_t = torch.cat([
+        torch.zeros([1], dtype=torch.long, device=device),
+        torch.cumsum(torch.tensor(num_thetas_by_winding, dtype=torch.long, device=device), dim=0),
+    ])
+    num_thetas_t = torch.tensor(num_thetas_by_winding, dtype=torch.long, device=device)
+
+    all_quad_uvs = []
+    all_quad_scrolls = []
+    all_target_w = []
+    chunk = 65536
+
+    for patch_idx, patch in enumerate(patches):
+        # Gate on patch-level satisfaction: snap every quad of an overall- or
+        # boundary-satisfied patch (even the ones that individually fail the
+        # spiral/scan tolerance), as long as the satisfaction pass figured out
+        # which integer winding they sit on (target_winding_idx_per_patch >= 0).
+        if not (bool(satisfied_patches[patch_idx]) or bool(boundary_satisfied_patches[patch_idx])):
+            continue
+        target_winding_idx = target_winding_idx_per_patch[patch_idx].to(device)
+        quad_mask = (target_winding_idx >= 0) & (target_winding_idx < num_windings)
+        if not quad_mask.any():
+            continue
+
+        patch_zyxs = patch.zyxs.to(device=device, dtype=torch.float32)
+        Hv, Wv = patch_zyxs.shape[:2]
+
+        def chunked_transform(flat):
+            pieces = []
+            for s in range(0, flat.shape[0], chunk):
+                pieces.append(slice_to_spiral_transform(flat[s : s + chunk]))
+            return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+
+        vertex_spiral = chunked_transform(patch_zyxs.reshape(-1, 3)).reshape(Hv, Wv, 3)
+        v_theta, _, v_shifted = get_theta_and_radii(vertex_spiral[..., 1:], dr_per_winding)
+        v_winding_raw = (v_shifted / dr).round().to(torch.int64)
+
+        quad_center_scroll = (
+            patch_zyxs[:-1, :-1]
+            + patch_zyxs[1:, :-1]
+            + patch_zyxs[:-1, 1:]
+            + patch_zyxs[1:, 1:]
+        ) / 4
+        center_spiral = chunked_transform(quad_center_scroll.reshape(-1, 3)).reshape(*quad_center_scroll.shape)
+        c_theta, _, _ = get_theta_and_radii(center_spiral[..., 1:], dr_per_winding)
+
+        qi, qj = torch.where(quad_mask)
+        w_target = target_winding_idx[qi, qj].to(torch.float32)
+        # Reference full angle at the quad center, anchored to the satisfaction
+        # pass's target winding so unsatisfied quads (whose own raw c_shifted may
+        # round to a neighbouring winding) still snap into the target's frame.
+        ref_full = c_theta[qi, qj] + w_target * (2 * np.pi)
+
+        # Vertex indices for each quad corner: 0=(i,j), 1=(i,j+1), 2=(i+1,j), 3=(i+1,j+1)
+        vi = torch.stack([qi, qi, qi + 1, qi + 1], dim=-1)
+        vj = torch.stack([qj, qj + 1, qj, qj + 1], dim=-1)
+        vert_spiral = vertex_spiral[vi, vj]  # (N, 4, 3)
+        vert_scroll = patch_zyxs[vi, vj]  # (N, 4, 3)
+        vert_theta = v_theta[vi, vj]  # (N, 4)
+        vert_w_raw = v_winding_raw[vi, vj].to(torch.float32)
+        vert_full = vert_theta + vert_w_raw * (2 * np.pi)
+        # Snap each vertex's full angle to be within pi of the center's reference.
+        diff = vert_full - ref_full[:, None]
+        vert_full_snapped = vert_full - torch.round(diff / (2 * np.pi)) * (2 * np.pi)
+
+        # UV coords in the target winding's mesh.
+        u_coords = (vert_spiral[..., 0] - z0) / grid_spacing  # (N, 4)
+        theta_step_per_quad = grid_spacing / ((w_target + 0.5) * dr)  # (N,)
+        v_coords = (vert_full_snapped - w_target[:, None] * (2 * np.pi)) / theta_step_per_quad[:, None]  # (N, 4)
+
+        all_quad_uvs.append(torch.stack([u_coords, v_coords], dim=-1))
+        all_quad_scrolls.append(vert_scroll)
+        all_target_w.append(target_winding_idx[qi, qj])
+
+    if not all_quad_uvs:
+        return
+
+    quad_uvs = torch.cat(all_quad_uvs, dim=0)  # (Nq, 4, 2)
+    quad_scrolls = torch.cat(all_quad_scrolls, dim=0)  # (Nq, 4, 3)
+    quad_target_w = torch.cat(all_target_w, dim=0)  # (Nq,)
+    Nq = quad_uvs.shape[0]
+
+    # Split each quad into 2 triangles along the (0,3) diagonal:
+    #   v00=(i,j) (0), v01=(i,j+1) (1), v10=(i+1,j) (2), v11=(i+1,j+1) (3)
+    # Triangle order: (v00, v01, v11), (v00, v11, v10)
+    tri_local = torch.tensor([[0, 1, 3], [0, 3, 2]], device=device, dtype=torch.long)
+    quad_repeat = torch.arange(Nq, device=device).repeat_interleave(2)
+    tri_local_flat = tri_local.unsqueeze(0).expand(Nq, -1, -1).reshape(-1, 3)
+    tri_uvs = quad_uvs[quad_repeat[:, None].expand(-1, 3), tri_local_flat]
+    tri_scrolls = quad_scrolls[quad_repeat[:, None].expand(-1, 3), tri_local_flat]
+    tri_target_w = quad_target_w[quad_repeat]
+
+    _rasterize_triangles_into_mesh(
+        tri_uvs, tri_scrolls, tri_target_w,
+        scroll_zyxs, winding_offsets_t, num_thetas_t,
+    )
+
+
 @torch.inference_mode
 def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, out_path, name='mesh'):
 
@@ -1374,26 +1580,42 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, ou
     spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
     num_thetas_by_winding = [len(yxs_for_winding) for yxs_for_winding in spiral_yxs_by_winding]
     spiral_yxs = torch.cat(spiral_yxs_by_winding, dim=0)
-    spiral_zs = torch.arange(z_begin - z_margin, z_end + z_margin, grid_spacing, dtype=torch.float32, device=spiral_yxs.device)
+    z0 = z_begin - z_margin
+    spiral_zs = torch.arange(z0, z_end + z_margin, grid_spacing, dtype=torch.float32, device=spiral_yxs.device)
     spiral_zyxs = torch.cat([spiral_zs[:, None, None].expand(-1, spiral_yxs.shape[0], 1), spiral_yxs[None, :, :].expand(spiral_zs.shape[0], -1, 2)], dim=-1)
     scroll_zyxs = slice_to_spiral_transform.inv(spiral_zyxs)
+
+    # Snapped variant: replace cells covered by quads of overall- or boundary-satisfied
+    # patches with patch-derived points, interpolated bilinearly across each quad in the
+    # flattened-spiral UV coords of its target winding.
+    snapped_scroll_zyxs = scroll_zyxs.clone()
+    satisfied_patches, _, _, _, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
+        slice_to_spiral_transform, dr_per_winding, working_set_patches,
+    )
+    _build_snapped_overlay(
+        snapped_scroll_zyxs, num_thetas_by_winding, z0, grid_spacing,
+        slice_to_spiral_transform, dr_per_winding,
+        working_set_patches,
+        satisfied_patches, boundary_satisfied_patches, target_winding_idx_per_patch,
+    )
 
     step_size = grid_spacing * downsample_factor
     out_dir = f'{out_path}/meshes/{name}'
     os.makedirs(out_dir, exist_ok=True)
-    offset = 0
-    for winding_idx, num_thetas in enumerate(tqdm(num_thetas_by_winding, desc='saving winding patches')):
-        if num_thetas >= 2 and winding_idx >= min_winding_idx:
-            winding_zyxs = (scroll_zyxs[:, offset:offset + num_thetas] * downsample_factor).cpu().numpy().astype(np.float32)
-            save_tifxyz(
-                winding_zyxs,
-                out_dir,
-                uuid=f'w{winding_idx:03d}',
-                step_size=step_size,
-                voxel_size_um=voxel_size_um * downsample_factor,
-                source=f'fit_spiral {name}',
-            )
-        offset += num_thetas
+    for uuid_suffix, variant_zyxs in [('', scroll_zyxs), ('_snapped', snapped_scroll_zyxs)]:
+        offset = 0
+        for winding_idx, num_thetas in enumerate(tqdm(num_thetas_by_winding, desc=f'saving winding patches ({name}{uuid_suffix})')):
+            if num_thetas >= 2 and winding_idx >= min_winding_idx:
+                winding_zyxs = (variant_zyxs[:, offset:offset + num_thetas] * downsample_factor).cpu().numpy().astype(np.float32)
+                save_tifxyz(
+                    winding_zyxs,
+                    out_dir,
+                    uuid=f'w{winding_idx:03d}{uuid_suffix}',
+                    step_size=step_size,
+                    voxel_size_um=voxel_size_um * downsample_factor,
+                    source=f'fit_spiral {name}{uuid_suffix}',
+                )
+            offset += num_thetas
 
 
 def _compute_patch_lines_by_slice(patches, slice_zs):
@@ -1706,7 +1928,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
         profiler = None
 
     def save_overlay_and_print_satisfaction(suffix):
-        satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches = get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches_list, verbose=True)
+        satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches_list, verbose=True)
         satisfied_count = satisfied_patches.sum().item()
         boundary_satisfied_count = boundary_satisfied_patches.sum().item()
         total_count = satisfied_patches.numel()
