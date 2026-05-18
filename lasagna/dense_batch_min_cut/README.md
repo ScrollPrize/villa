@@ -122,9 +122,11 @@ Outputs:
 - `<stem>_tree_dense_flow_greedy_ascent.tif`: optional dense source-flow debug
   image that starts from the no-backtrack flow field, greedily walks to the
   highest neighboring larger flow value, and stops at the first local maximum.
-- `<stem>_graph_source_edges.tif`: optional diagnostic showing which graph edges
-  were treated as directly adjacent to the source region and therefore seeded
-  with internal infinite capacity.
+- `<stem>_graph_source_edges.tif`: optional diagnostic showing the graph edges
+  selected by source-edge ascent and used as flow sources.
+- `<stem>_flow_gate_weight.tif`: optional dense gate-weight image computed as
+  local greedy-ascent flow divided by the dilated local maximum of that same
+  greedy-ascent flow. The dilation radius is `--backtrack-distance`.
 - `<stem>_layers.tif`: named multipage TIFF for easier inspection in GIMP.
   The pages include `binary_threshold`, `dt`, `source_rim_distance`,
   `source_rim_arc`, `source_rim_arc_skeleton`, `loops_connected`,

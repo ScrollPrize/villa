@@ -4559,9 +4559,31 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                 }
             };
             std::priority_queue<NodeRouteItem> node_queue;
-            if (valid_node(source_seed_node)) {
-                node_route_distance[source_seed_node] = 0.0;
-                node_queue.push({0.0, source_seed_node});
+            std::vector<char> root_nodes(static_cast<std::size_t>(node_count),
+                                         0);
+            const auto add_root_node = [&](const int node) {
+                if (!valid_node(node) ||
+                    root_nodes[static_cast<std::size_t>(node)] != 0) {
+                    return;
+                }
+                root_nodes[static_cast<std::size_t>(node)] = 1;
+                node_route_distance[static_cast<std::size_t>(node)] = 0.0;
+                node_queue.push({0.0, node});
+            };
+            if (source_edges.size() == graph.edges.size()) {
+                for (int edge_index = 0;
+                     edge_index < static_cast<int>(graph.edges.size());
+                     ++edge_index) {
+                    if (source_edges[static_cast<std::size_t>(edge_index)] ==
+                        0) {
+                        continue;
+                    }
+                    add_root_node(graph.edges[edge_index].a);
+                    add_root_node(graph.edges[edge_index].b);
+                }
+            }
+            if (node_queue.empty()) {
+                add_root_node(source_seed_node);
             }
 
             while (!node_queue.empty()) {
@@ -5864,6 +5886,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     int source_seed_node = -1;
     cv::Point source_seed_pixel(-1, -1);
     float source_seed_capacity = 0.0f;
+    int source_initial_edge = -1;
     {
         const TimingMark timing = start_timing();
         const std::array<cv::Point, 8> kDirs = {
@@ -5963,13 +5986,14 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
 
         if (source_edge >= 0 &&
             source_edge < static_cast<int>(graph.edges.size())) {
-            GraphEdge edge = graph.edges[source_edge];
+            source_initial_edge = source_edge;
+            const GraphEdge& edge = graph.edges[source_edge];
             std::vector<cv::Point> ordered = order_edge_pixels(edge, graph);
             if (ordered.empty()) {
                 ordered = edge.pixels;
             }
             if (!ordered.empty()) {
-                int split_index = 0;
+                int closest_index = 0;
                 double best_distance = std::numeric_limits<double>::max();
                 for (int i = 0; i < static_cast<int>(ordered.size()); ++i) {
                     const double dx = ordered[i].x - source.x;
@@ -5977,85 +6001,286 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                     const double distance = dx * dx + dy * dy;
                     if (distance < best_distance) {
                         best_distance = distance;
-                        split_index = i;
+                        closest_index = i;
                     }
                 }
-                if (ordered.size() > 2) {
-                    split_index =
-                        std::clamp(split_index, 1,
-                                   static_cast<int>(ordered.size()) - 2);
-                }
-
-                const cv::Point split_pixel = ordered[split_index];
-                source_seed_pixel = split_pixel;
-                source_seed_node = static_cast<int>(graph.nodes.size());
-                graph.nodes.push_back(cv::Point2f(
-                    static_cast<float>(split_pixel.x),
-                    static_cast<float>(split_pixel.y)));
-                if (graph.node_pixel_groups.size() < graph.nodes.size()) {
-                    graph.node_pixel_groups.resize(graph.nodes.size());
-                }
-                graph.node_pixel_groups[source_seed_node].push_back(split_pixel);
-                if (graph.node_mask.empty()) {
-                    graph.node_mask =
-                        cv::Mat::zeros(white_domain.size(), CV_8U);
-                }
-                cv::circle(graph.node_mask, split_pixel, 2, cv::Scalar(255),
-                           cv::FILLED, cv::LINE_8);
-                source_seed_capacity =
-                    capacity_from_dt(dt.at<float>(split_pixel.y, split_pixel.x));
-
-                const auto edge_capacity_from_pixels =
-                    [&](const std::vector<cv::Point>& pixels) {
-                        float capacity = std::numeric_limits<float>::max();
-                        for (const cv::Point pixel : pixels) {
-                            capacity = std::min(
-                                capacity,
-                                capacity_from_dt(dt.at<float>(pixel.y,
-                                                              pixel.x)));
-                        }
-                        return capacity == std::numeric_limits<float>::max()
-                                   ? 0.0f
-                                   : capacity;
-                    };
-
-                std::vector<cv::Point> first(
-                    ordered.begin(), ordered.begin() + split_index + 1);
-                std::vector<cv::Point> second(
-                    ordered.begin() + split_index, ordered.end());
-                graph.edges[source_edge] =
-                    GraphEdge{edge.a, source_seed_node,
-                              edge_capacity_from_pixels(first), first};
-                graph.edges.push_back(
-                    GraphEdge{source_seed_node, edge.b,
-                              edge_capacity_from_pixels(second), second});
-                rebuild_graph_edge_maps();
+                source_seed_pixel = ordered[closest_index];
+                source_seed_capacity = std::max(0.0f, edge.capacity);
             }
         }
-        std::cout << "Source graph split:\n"
-                  << "  source_seed_node: " << source_seed_node << "\n"
+        std::cout << "Source graph edge:\n"
+                  << "  source_edge: " << source_initial_edge << "\n"
                   << "  source_seed_pixel: (" << source_seed_pixel.x
                   << "," << source_seed_pixel.y << ")\n"
                   << "  source_seed_capacity: " << source_seed_capacity << "\n";
-        timings.push_back(finish_timing("source_seed_detect", timing));
+        timings.push_back(finish_timing("source_edge_detect", timing));
     }
 
     const int node_count = static_cast<int>(graph.nodes.size());
     std::vector<char> seeded_nodes(static_cast<std::size_t>(node_count), 0);
     std::vector<double> seed_node_capacity(static_cast<std::size_t>(node_count),
                                            0.0);
-    if (source_seed_node > 0 && source_seed_node < node_count &&
-        source_seed_capacity > 0.0f) {
-        seeded_nodes[source_seed_node] = 1;
-        seed_node_capacity[source_seed_node] = source_seed_capacity;
-    }
     std::vector<char> source_edges(graph.edges.size(), 0);
-    for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
-         ++edge_index) {
-        const GraphEdge& edge = graph.edges[edge_index];
-        if (edge.a == source_seed_node || edge.b == source_seed_node) {
-            source_edges[edge_index] = 1;
+    std::vector<float> source_edge_capacity(graph.edges.size(), 0.0f);
+    int source_first_edge = -1;
+    int source_final_edge = -1;
+    float source_final_edge_capacity = 0.0f;
+    {
+        const TimingMark timing = start_timing();
+        const auto valid_node = [&](const int node) {
+            return node > 0 && node < node_count;
+        };
+        const auto valid_edge = [&](const int edge_index) {
+            return edge_index >= 0 &&
+                   edge_index < static_cast<int>(graph.edges.size());
+        };
+        const auto edge_other_node = [&](const int edge_index,
+                                         const int node) {
+            if (!valid_edge(edge_index)) {
+                return -1;
+            }
+            const GraphEdge& edge = graph.edges[edge_index];
+            if (edge.a == node) {
+                return edge.b;
+            }
+            if (edge.b == node) {
+                return edge.a;
+            }
+            return -1;
+        };
+
+        std::vector<std::vector<int>> incident_edges(
+            static_cast<std::size_t>(node_count));
+        for (int edge_index = 0;
+             edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
+            const GraphEdge& edge = graph.edges[edge_index];
+            if (valid_node(edge.a)) {
+                incident_edges[static_cast<std::size_t>(edge.a)].push_back(
+                    edge_index);
+            }
+            if (valid_node(edge.b) && edge.b != edge.a) {
+                incident_edges[static_cast<std::size_t>(edge.b)].push_back(
+                    edge_index);
+            }
         }
+
+        constexpr float kCapacityEpsilon = 1.0e-4f;
+        source_first_edge = valid_edge(source_initial_edge)
+                                ? source_initial_edge
+                                : -1;
+
+        std::vector<int> traversed_edges;
+        std::vector<char> visited_edges(graph.edges.size(), 0);
+        int current_edge = source_first_edge;
+        int current_entry_node = -1;
+        int terminal_node = -1;
+        struct SourceAscentStep {
+            int edge = -1;
+            int node = -1;
+            int next_edge = -1;
+        };
+        std::vector<SourceAscentStep> ascent_steps;
+        struct SourceAscentNext {
+            int edge = -1;
+            int node = -1;
+        };
+        const auto select_next_edge = [&](const int edge_index,
+                                          const int entry_node) {
+            SourceAscentNext result;
+            if (!valid_edge(edge_index)) {
+                return result;
+            }
+            const GraphEdge& edge = graph.edges[edge_index];
+            std::array<int, 2> candidate_nodes = {edge.a, edge.b};
+            if (valid_node(entry_node)) {
+                candidate_nodes = {edge_other_node(edge_index, entry_node), -1};
+            }
+            float best_capacity = edge.capacity;
+            for (const int node : candidate_nodes) {
+                if (!valid_node(node)) {
+                    continue;
+                }
+                for (const int candidate :
+                     incident_edges[static_cast<std::size_t>(node)]) {
+                    if (candidate == edge_index ||
+                        visited_edges[static_cast<std::size_t>(candidate)] !=
+                            0) {
+                        continue;
+                    }
+                    const float capacity = graph.edges[candidate].capacity;
+                    if (capacity <= best_capacity + kCapacityEpsilon) {
+                        continue;
+                    }
+                    if (result.edge < 0 ||
+                        capacity > best_capacity + kCapacityEpsilon ||
+                        (std::abs(capacity - best_capacity) <=
+                             kCapacityEpsilon &&
+                         candidate < result.edge)) {
+                        result.edge = candidate;
+                        result.node = node;
+                        best_capacity = capacity;
+                    }
+                }
+            }
+            return result;
+        };
+        while (valid_edge(current_edge) &&
+               visited_edges[static_cast<std::size_t>(current_edge)] == 0) {
+            visited_edges[static_cast<std::size_t>(current_edge)] = 1;
+            traversed_edges.push_back(current_edge);
+            source_edges[static_cast<std::size_t>(current_edge)] = 1;
+            source_edge_capacity[static_cast<std::size_t>(current_edge)] =
+                std::max(0.0f, graph.edges[current_edge].capacity);
+            source_final_edge = current_edge;
+            source_final_edge_capacity =
+                source_edge_capacity[static_cast<std::size_t>(current_edge)];
+
+            const SourceAscentNext next =
+                select_next_edge(current_edge, current_entry_node);
+            terminal_node = next.node;
+            if (next.edge < 0) {
+                ascent_steps.push_back({current_edge, next.node, -1});
+                break;
+            }
+            ascent_steps.push_back({current_edge, next.node, next.edge});
+            current_entry_node = next.node;
+            current_edge = next.edge;
+        }
+
+        if (traversed_edges.empty() && valid_edge(source_first_edge)) {
+            const GraphEdge& edge = graph.edges[source_first_edge];
+            traversed_edges.push_back(source_first_edge);
+            source_edges[static_cast<std::size_t>(source_first_edge)] = 1;
+            source_edge_capacity[static_cast<std::size_t>(source_first_edge)] =
+                std::max(0.0f, edge.capacity);
+            source_final_edge = source_first_edge;
+            source_final_edge_capacity =
+                source_edge_capacity[static_cast<std::size_t>(
+                    source_first_edge)];
+        }
+
+        float max_source_capacity = 0.0f;
+        for (int edge_index = 0;
+             edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
+            if (source_edges[static_cast<std::size_t>(edge_index)] == 0) {
+                continue;
+            }
+            const GraphEdge& edge = graph.edges[edge_index];
+            const float capacity = std::max(
+                source_edge_capacity[static_cast<std::size_t>(edge_index)],
+                std::max(0.0f, edge.capacity));
+            source_edge_capacity[static_cast<std::size_t>(edge_index)] =
+                capacity;
+            max_source_capacity = std::max(max_source_capacity, capacity);
+            if (valid_node(edge.a)) {
+                seeded_nodes[static_cast<std::size_t>(edge.a)] = 1;
+                seed_node_capacity[static_cast<std::size_t>(edge.a)] =
+                    std::max(seed_node_capacity
+                                 [static_cast<std::size_t>(edge.a)],
+                             static_cast<double>(capacity));
+            }
+            if (valid_node(edge.b)) {
+                seeded_nodes[static_cast<std::size_t>(edge.b)] = 1;
+                seed_node_capacity[static_cast<std::size_t>(edge.b)] =
+                    std::max(seed_node_capacity
+                                 [static_cast<std::size_t>(edge.b)],
+                             static_cast<double>(capacity));
+            }
+        }
+
+        if (max_source_capacity > 0.0f) {
+            source_seed_capacity = max_source_capacity;
+        }
+        if (valid_edge(source_final_edge) &&
+            !graph.edges[source_final_edge].pixels.empty()) {
+            const GraphEdge& final_edge = graph.edges[source_final_edge];
+            cv::Point best_pixel = final_edge.pixels.front();
+            float best_dt = dt.at<float>(best_pixel.y, best_pixel.x);
+            for (const cv::Point pixel : final_edge.pixels) {
+                const float pixel_dt = dt.at<float>(pixel.y, pixel.x);
+                if (pixel_dt > best_dt + kCapacityEpsilon ||
+                    (std::abs(pixel_dt - best_dt) <= kCapacityEpsilon &&
+                     (pixel.y < best_pixel.y ||
+                      (pixel.y == best_pixel.y && pixel.x < best_pixel.x)))) {
+                    best_dt = pixel_dt;
+                    best_pixel = pixel;
+                }
+            }
+            source_seed_pixel = best_pixel;
+        }
+        std::cout << "Source edge ascent:\n"
+                  << "  first_edge: " << source_first_edge << "\n"
+                  << "  final_edge: " << source_final_edge << "\n"
+                  << "  final_edge_capacity: " << source_final_edge_capacity
+                  << "\n"
+                  << "  traversed_edges: " << traversed_edges.size() << "\n";
+        const auto print_edge = [&](const std::string& prefix,
+                                    const int edge_index) {
+            if (!valid_edge(edge_index)) {
+                std::cout << prefix << edge_index << " invalid\n";
+                return;
+            }
+            const GraphEdge& edge = graph.edges[edge_index];
+            std::cout << prefix << edge_index << " cap=" << edge.capacity
+                      << " a=" << edge.a << " b=" << edge.b
+                      << " px=" << edge.pixels.size() << "\n";
+        };
+        const auto print_node_candidates = [&](const std::string& prefix,
+                                               const int node,
+                                               const int from_edge) {
+            std::cout << prefix << " node=" << node;
+            if (!valid_node(node)) {
+                std::cout << " invalid\n";
+                return;
+            }
+            std::cout << " degree="
+                      << incident_edges[static_cast<std::size_t>(node)].size()
+                      << " from_edge=" << from_edge << "\n";
+            for (const int candidate :
+                 incident_edges[static_cast<std::size_t>(node)]) {
+                const GraphEdge& edge = graph.edges[candidate];
+                std::cout << "    cand edge=" << candidate
+                          << " cap=" << edge.capacity << " a=" << edge.a
+                          << " b=" << edge.b
+                          << " visited="
+                          << static_cast<int>(
+                                 visited_edges[static_cast<std::size_t>(
+                                     candidate)])
+                          << " source="
+                          << static_cast<int>(
+                                 source_edges[static_cast<std::size_t>(
+                                     candidate)])
+                          << " uphill_from_current="
+                          << (valid_edge(from_edge)
+                                  ? edge.capacity >
+                                        graph.edges[from_edge].capacity +
+                                            kCapacityEpsilon
+                                  : false)
+                          << "\n";
+            }
+        };
+        for (int step = 0; step < static_cast<int>(ascent_steps.size());
+             ++step) {
+            const SourceAscentStep& ascent_step = ascent_steps[step];
+            std::cout << "  step_" << step << ": edge=" << ascent_step.edge
+                      << " node=" << ascent_step.node
+                      << " next_edge=" << ascent_step.next_edge << "\n";
+            print_node_candidates("    considered", ascent_step.node,
+                                  ascent_step.edge);
+        }
+        print_edge("  first_edge_detail: ", source_first_edge);
+        print_edge("  final_edge_detail: ", source_final_edge);
+        if (valid_edge(source_final_edge)) {
+            const GraphEdge& final_edge = graph.edges[source_final_edge];
+            print_node_candidates("  final_endpoint_a", final_edge.a,
+                                  source_final_edge);
+            if (final_edge.b != final_edge.a) {
+                print_node_candidates("  final_endpoint_b", final_edge.b,
+                                      source_final_edge);
+            }
+        }
+        std::cout << "  terminal_node: " << terminal_node << "\n";
+        timings.push_back(finish_timing("source_edge_ascent", timing));
     }
 
     int source_edge_count = 0;
@@ -6075,16 +6300,59 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         if (target <= 0 || target >= node_count) {
             return 0.0;
         }
-        if (seeded_nodes[target] != 0) {
-            return seed_node_capacity[target];
+
+        int edge_source_count = 0;
+        for (int edge_index = 0;
+             edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
+            if (edge_index == removed_edge ||
+                source_edges[static_cast<std::size_t>(edge_index)] == 0 ||
+                source_edge_capacity[static_cast<std::size_t>(edge_index)] <=
+                    0.0f) {
+                continue;
+            }
+            const GraphEdge& edge = graph.edges[edge_index];
+            if ((edge.a > 0 && edge.a < node_count) ||
+                (edge.b > 0 && edge.b < node_count)) {
+                ++edge_source_count;
+            }
         }
 
-        Dinic flow(node_count);
+        Dinic flow(node_count + edge_source_count);
         constexpr int kSuperSource = 0;
-        for (int node = 1; node < node_count; ++node) {
-            if (seeded_nodes[node] != 0) {
-                flow.add_edge(kSuperSource, node,
-                              std::max(0.0, seed_node_capacity[node]));
+        if (edge_source_count > 0) {
+            int edge_source_node = node_count;
+            for (int edge_index = 0;
+                 edge_index < static_cast<int>(graph.edges.size());
+                 ++edge_index) {
+                if (edge_index == removed_edge ||
+                    source_edges[static_cast<std::size_t>(edge_index)] == 0) {
+                    continue;
+                }
+                const float capacity =
+                    source_edge_capacity[static_cast<std::size_t>(edge_index)];
+                if (capacity <= 0.0f) {
+                    continue;
+                }
+                const GraphEdge& edge = graph.edges[edge_index];
+                if ((edge.a <= 0 || edge.a >= node_count) &&
+                    (edge.b <= 0 || edge.b >= node_count)) {
+                    continue;
+                }
+                flow.add_edge(kSuperSource, edge_source_node, capacity);
+                if (edge.a > 0 && edge.a < node_count) {
+                    flow.add_edge(edge_source_node, edge.a, kGraphFlowInf);
+                }
+                if (edge.b > 0 && edge.b < node_count) {
+                    flow.add_edge(edge_source_node, edge.b, kGraphFlowInf);
+                }
+                ++edge_source_node;
+            }
+        } else {
+            for (int node = 1; node < node_count; ++node) {
+                if (seeded_nodes[node] != 0) {
+                    flow.add_edge(kSuperSource, node,
+                                  std::max(0.0, seed_node_capacity[node]));
+                }
             }
         }
         for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
@@ -7348,69 +7616,46 @@ cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
 }
 
 cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
-                                       const cv::Mat& dt,
-                                       const cv::Point gate_source,
-                                       const float gate_source_capacity,
-                                       const int grid_step,
-                                       const float configured_one,
-                                       const float configured_zero) {
+                                       const float backtrack_distance) {
     CV_Assert(flow.type() == CV_32F);
-    CV_Assert(dt.type() == CV_32F);
-    CV_Assert(flow.size() == dt.size());
     const int rows = flow.rows;
     const int cols = flow.cols;
     cv::Mat weight(flow.size(), CV_32F, cv::Scalar(0));
-    if (gate_source.x < 0 || gate_source.x >= cols || gate_source.y < 0 ||
-        gate_source.y >= rows) {
-        return weight;
-    }
 
-    const float safe_one = std::max(1.0e-6f, configured_one);
-    const float seed_dt = dt.at<float>(gate_source.y, gate_source.x);
-    const float seed_capacity =
-        gate_source_capacity > 0.0f ? gate_source_capacity
-                                    : capacity_from_dt(seed_dt);
-    float effective_one = safe_one;
-    float effective_zero = configured_zero;
-    if (seed_capacity > 0.0f && seed_capacity < safe_one) {
-        const float scale = seed_capacity / safe_one;
-        effective_one = seed_capacity;
-        effective_zero = configured_zero * scale;
+    cv::Mat nonnegative_flow = flow.clone();
+    nonnegative_flow.setTo(0.0f, nonnegative_flow < 0.0f);
+
+    const int local_radius =
+        std::max(0, static_cast<int>(std::ceil(backtrack_distance)));
+    cv::Mat local_max;
+    if (local_radius > 0) {
+        const int kernel_size = local_radius * 2 + 1;
+        const cv::Mat kernel = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE, cv::Size(kernel_size, kernel_size));
+        cv::dilate(nonnegative_flow, local_max, kernel);
+    } else {
+        local_max = nonnegative_flow;
     }
-    if (effective_one <= effective_zero) {
-        effective_zero = std::max(0.0f, effective_one - 1.0f);
-    }
-    const float denom = std::max(1.0e-6f, effective_one - effective_zero);
-    const float seed_radius_px =
-        2.0f * static_cast<float>(std::max(1, grid_step));
-    const float seed_radius_sq = seed_radius_px * seed_radius_px;
 
     cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             float* out_row = weight.ptr<float>(y);
             const float* flow_row = flow.ptr<float>(y);
+            const float* max_row = local_max.ptr<float>(y);
             for (int x = 0; x < cols; ++x) {
-                float value = (flow_row[x] - effective_zero) / denom;
-                value = std::max(0.0f, std::min(1.0f, value));
-                const float dx = static_cast<float>(x - gate_source.x);
-                const float dy = static_cast<float>(y - gate_source.y);
-                if (dx * dx + dy * dy <= seed_radius_sq) {
-                    value = 1.0f;
+                const float local_denominator = max_row[x];
+                if (local_denominator <= 1.0e-6f || flow_row[x] <= 0.0f) {
+                    continue;
                 }
-                out_row[x] = value;
+                out_row[x] =
+                    std::clamp(flow_row[x] / local_denominator, 0.0f, 1.0f);
             }
         }
     });
 
     std::cout << "Flow gate weight:\n"
-              << "  gate_source: (" << gate_source.x << "," << gate_source.y
-              << ")\n"
-              << "  gate_source_dt: " << seed_dt << "\n"
-              << "  gate_source_capacity: " << seed_capacity << "\n"
-              << "  configured_zero: " << configured_zero << "\n"
-              << "  configured_one: " << safe_one << "\n"
-              << "  effective_zero: " << effective_zero << "\n"
-              << "  effective_one: " << effective_one << "\n";
+              << "  local_max_radius: " << local_radius << "\n"
+              << "  backtrack_distance: " << backtrack_distance << "\n";
     return weight;
 }
 
@@ -8121,11 +8366,8 @@ int main(int argc, char** argv) {
                     const TimingMark timing = start_timing();
                     dense_flow_result.flow_gate_weight =
                         compute_flow_gate_weight_image(
-                            dense_flow_result.tree_dense_flow, dt,
-                            dense_flow_result.source_seed_pixel,
-                            dense_flow_result.source_seed_capacity,
-                            args.grid_step, args.flow_weight_one,
-                            args.flow_weight_zero);
+                            dense_flow_result.tree_dense_flow_greedy_ascent,
+                            args.backtrack_distance);
                     timings.push_back(
                         finish_timing("flow_gate_weight", timing));
                 }
