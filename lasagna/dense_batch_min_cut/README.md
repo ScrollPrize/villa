@@ -44,8 +44,8 @@ Outputs:
   to the nearest dark foreground island.
 - `<stem>_source_rim_ridges.tif`: ridge candidates where neighboring
   source-pixel labels map to sufficiently distant points along the source rim.
-  The rim-label pass treats the image border as a source rim while preserving
-  the unmodified distance transform for graph capacities.
+  The rim-label pass pads the image with a one-pixel source rim while
+  preserving the unmodified distance transform for graph capacities.
 - `<stem>_source_rim_distance.tif`: max along-rim distance used by the ridge
   candidate test.
 - `<stem>_source_rim_arc.tif`: source-rim arc-position visualization used to
@@ -124,6 +124,14 @@ The component Voronoi path treats each dark foreground connected component as
 one fat site. The CLI prints a fixed-width timing table with elapsed time, CPU
 time, and estimated CPU/elapsed utilization for the main stages and component
 Voronoi substages.
+The rim-label pass pads the image before computing rim labels, then crops the
+debug layers back to the input size. Multiple source-rim contours in one white
+connected component are allowed; disconnected source islands are treated as
+infinitely far apart along the rim, so their Voronoi boundary is kept. Every
+nearest-rim source pixel selected by the labeled distance transform must still
+map to one rim contour. Missing rim assignments mean the border-connected rim
+model is broken; the CLI writes the usual debug outputs and exits non-zero with
+the component summary.
 The extracted graph is expected to be one connected component; disconnected
 graphs write the usual debug outputs and then exit non-zero with the component
 summary.

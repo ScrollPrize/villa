@@ -56,8 +56,6 @@ struct RimPosition {
 };
 
 struct DenseBatchScratch {
-    cv::Mat rim_source_mask;
-    cv::Mat rim_cleaned_source;
     cv::Mat rim_contour_input;
     std::vector<RimPosition> rim_lookup;
 
@@ -503,19 +501,13 @@ cv::Mat keep_source_white_component(const cv::Mat& binary,
     return filtered;
 }
 
-cv::Mat make_border_source_domain(const cv::Mat& white_domain) {
+cv::Mat make_padded_rim_label_domain(const cv::Mat& white_domain) {
     CV_Assert(white_domain.type() == CV_8U);
-    cv::Mat domain = white_domain.clone();
-    if (domain.empty()) {
-        return domain;
-    }
-    for (int x = 0; x < domain.cols; ++x) {
-        domain.at<std::uint8_t>(0, x) = 0;
-        domain.at<std::uint8_t>(domain.rows - 1, x) = 0;
-    }
-    for (int y = 0; y < domain.rows; ++y) {
-        domain.at<std::uint8_t>(y, 0) = 0;
-        domain.at<std::uint8_t>(y, domain.cols - 1) = 0;
+    cv::Mat domain(white_domain.rows + 2, white_domain.cols + 2, CV_8U,
+                   cv::Scalar(0));
+    if (!white_domain.empty()) {
+        white_domain.copyTo(
+            domain(cv::Rect(1, 1, white_domain.cols, white_domain.rows)));
     }
     return domain;
 }
@@ -1257,13 +1249,161 @@ cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
     return ridges;
 }
 
+std::string rim_assignment_error(
+    const cv::Mat& white_domain, const cv::Mat& source_pixel_labels,
+    const std::vector<cv::Point>& source_points,
+    const std::vector<RimPosition>& rim_lookup) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(source_pixel_labels.type() == CV_32S);
+    CV_Assert(white_domain.size() == source_pixel_labels.size());
+
+    struct ComponentRimUse {
+        int pixels = 0;
+        int missing = 0;
+        cv::Point sample{-1, -1};
+        std::vector<int> contours;
+    };
+
+    const int rows = white_domain.rows;
+    const int cols = white_domain.cols;
+    if (rows == 0 || cols == 0) {
+        return {};
+    }
+
+    cv::Mat white_components;
+    const int component_count =
+        cv::connectedComponents(white_domain, white_components, 8, CV_32S);
+    std::vector<ComponentRimUse> rim_uses(
+        static_cast<std::size_t>(component_count));
+
+    const auto add_contour = [](ComponentRimUse& use, const int contour) {
+        if (std::find(use.contours.begin(), use.contours.end(), contour) ==
+            use.contours.end()) {
+            use.contours.push_back(contour);
+        }
+    };
+    const auto in_bounds = [rows, cols](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < cols && pixel.y >= 0 &&
+               pixel.y < rows;
+    };
+
+    for (int y = 0; y < rows; ++y) {
+        const std::uint8_t* domain_row = white_domain.ptr<std::uint8_t>(y);
+        const int* component_row = white_components.ptr<int>(y);
+        const int* label_row = source_pixel_labels.ptr<int>(y);
+        for (int x = 0; x < cols; ++x) {
+            if (domain_row[x] == 0) {
+                continue;
+            }
+            const int component = component_row[x];
+            if (component <= 0 || component >= component_count) {
+                continue;
+            }
+
+            ComponentRimUse& use =
+                rim_uses[static_cast<std::size_t>(component)];
+            ++use.pixels;
+            if (use.sample.x < 0) {
+                use.sample = cv::Point(x, y);
+            }
+
+            const int label = label_row[x];
+            if (label <= 0 ||
+                label >= static_cast<int>(source_points.size())) {
+                ++use.missing;
+                continue;
+            }
+            const cv::Point source = source_points[static_cast<std::size_t>(
+                label)];
+            if (!in_bounds(source)) {
+                ++use.missing;
+                continue;
+            }
+
+            const std::size_t source_index =
+                static_cast<std::size_t>(source.y * cols + source.x);
+            if (source_index >= rim_lookup.size() ||
+                rim_lookup[source_index].contour < 0) {
+                ++use.missing;
+                continue;
+            }
+            add_contour(use, rim_lookup[source_index].contour);
+        }
+    }
+
+    int components_with_missing = 0;
+    int missing_assignments = 0;
+    int multi_rim_components = 0;
+    int max_contours_per_component = 0;
+    for (int component = 1; component < component_count; ++component) {
+        ComponentRimUse& use = rim_uses[static_cast<std::size_t>(component)];
+        std::sort(use.contours.begin(), use.contours.end());
+        missing_assignments += use.missing;
+        max_contours_per_component = std::max(
+            max_contours_per_component, static_cast<int>(use.contours.size()));
+        if (use.pixels > 0 && use.contours.size() > 1) {
+            ++multi_rim_components;
+        }
+        if (use.pixels > 0 && use.missing > 0) {
+            ++components_with_missing;
+        }
+    }
+    if (missing_assignments == 0) {
+        return {};
+    }
+
+    std::ostringstream out;
+    out << "source rim labeling has unassigned nearest-rim source pixels:"
+        << " every source pixel selected by the rim distance transform must"
+        << " map to a rim contour"
+        << " white_components=" << std::max(0, component_count - 1)
+        << " components_with_missing=" << components_with_missing
+        << " missing_assignments=" << missing_assignments
+        << " multi_rim_components=" << multi_rim_components
+        << " max_rim_contours_per_component="
+        << max_contours_per_component;
+
+    int reported = 0;
+    constexpr int kMaxReportedComponents = 5;
+    constexpr int kMaxReportedContours = 8;
+    for (int component = 1;
+         component < component_count && reported < kMaxReportedComponents;
+         ++component) {
+        const ComponentRimUse& use =
+            rim_uses[static_cast<std::size_t>(component)];
+        if (use.pixels == 0 || use.missing == 0) {
+            continue;
+        }
+        out << " component_" << component << "_pixels=" << use.pixels
+            << " component_" << component << "_rim_contours="
+            << use.contours.size() << " component_" << component
+            << "_missing=" << use.missing << " component_" << component
+            << "_sample=(" << use.sample.x << "," << use.sample.y << ")"
+            << " component_" << component << "_contours=";
+        const int contours_to_report =
+            std::min<int>(kMaxReportedContours, use.contours.size());
+        for (int i = 0; i < contours_to_report; ++i) {
+            if (i > 0) {
+                out << ",";
+            }
+            out << use.contours[static_cast<std::size_t>(i)];
+        }
+        if (contours_to_report < static_cast<int>(use.contours.size())) {
+            out << ",...";
+        }
+        ++reported;
+    }
+    return out.str();
+}
+
 cv::Mat source_rim_distance_label_ridges(
     const cv::Mat& white_domain, const cv::Mat& source_pixel_labels,
     const std::vector<cv::Point>& source_points,
     const float min_rim_distance_px,
     cv::Mat* rim_distance_debug_out = nullptr,
     cv::Mat* rim_arc_debug_out = nullptr,
-    std::vector<StageTiming>* timings = nullptr) {
+    std::vector<StageTiming>* timings = nullptr,
+    std::string* rim_connectivity_error_out = nullptr) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(source_pixel_labels.type() == CV_32S);
 
@@ -1280,68 +1420,13 @@ cv::Mat source_rim_distance_label_ridges(
         }
     };
 
-    cv::Mat& source_mask = scratch.rim_source_mask;
-    {
-        const TimingMark timing = start_timing();
-        source_mask.create(white_domain.size(), CV_8U);
-        for (int y = 0; y < rows; ++y) {
-            const std::uint8_t* src = white_domain.ptr<std::uint8_t>(y);
-            std::uint8_t* dst = source_mask.ptr<std::uint8_t>(y);
-            for (int x = 0; x < cols; ++x) {
-                dst[x] = src[x] == 0 ? 255 : 0;
-            }
-        }
-        for (int x = 0; x < cols; ++x) {
-            source_mask.at<std::uint8_t>(0, x) = 255;
-            source_mask.at<std::uint8_t>(rows - 1, x) = 255;
-        }
-        for (int y = 0; y < rows; ++y) {
-            source_mask.at<std::uint8_t>(y, 0) = 255;
-            source_mask.at<std::uint8_t>(y, cols - 1) = 255;
-        }
-        record_timing("source_mask", timing);
-    }
-
-    cv::Mat source_components;
-    cv::Mat source_stats;
-    cv::Mat source_centroids;
-    int source_component_count = 0;
-    {
-        const TimingMark timing = start_timing();
-        source_component_count = cv::connectedComponentsWithStats(
-            source_mask, source_components, source_stats, source_centroids, 4,
-            CV_32S);
-        record_timing("connected_components", timing);
-    }
-
-    cv::Mat& cleaned_source = scratch.rim_cleaned_source;
-    constexpr int kMinSourceComponentArea = 8;
-    {
-        const TimingMark timing = start_timing();
-        cleaned_source.create(source_mask.size(), CV_8U);
-        cleaned_source.setTo(cv::Scalar(0));
-        for (int y = 0; y < rows; ++y) {
-            const int* labels = source_components.ptr<int>(y);
-            std::uint8_t* dst = cleaned_source.ptr<std::uint8_t>(y);
-            for (int x = 0; x < cols; ++x) {
-                const int label = labels[x];
-                if (label > 0 && label < source_component_count &&
-                    source_stats.at<int>(label, cv::CC_STAT_AREA) >=
-                        kMinSourceComponentArea) {
-                    dst[x] = 255;
-                }
-            }
-        }
-        record_timing("cleanup", timing);
-    }
-
     std::vector<std::vector<cv::Point>> contours;
     {
         const TimingMark timing = start_timing();
-        cleaned_source.copyTo(scratch.rim_contour_input);
+        white_domain.copyTo(scratch.rim_contour_input);
         cv::findContours(scratch.rim_contour_input, contours, cv::RETR_LIST,
                          cv::CHAIN_APPROX_NONE);
-        record_timing("find_contours", timing);
+        record_timing("white_boundary_contours", timing);
     }
 
     std::vector<RimPosition>& rim_lookup = scratch.rim_lookup;
@@ -1379,7 +1464,7 @@ cv::Mat source_rim_distance_label_ridges(
         for (int contour_id = 0; contour_id < static_cast<int>(contours.size());
              ++contour_id) {
             const std::vector<cv::Point>& contour = contours[contour_id];
-            if (contour.size() < 4) {
+            if (contour.empty()) {
                 continue;
             }
 
@@ -1388,11 +1473,9 @@ cv::Mat source_rim_distance_label_ridges(
                 arc[i] =
                     arc[i - 1] + segment_length(contour[i], contour[i - 1]);
             }
-            const float total_length =
-                arc.back() + segment_length(contour.front(), contour.back());
-            if (total_length <= 0.0f) {
-                continue;
-            }
+            const float total_length = std::max(
+                1.0f,
+                arc.back() + segment_length(contour.front(), contour.back()));
 
             for (std::size_t i = 0; i < contour.size(); ++i) {
                 assign_rim_position(
@@ -1406,8 +1489,8 @@ cv::Mat source_rim_distance_label_ridges(
                         const cv::Point pixel =
                             contour[i] + cv::Point(dx, dy);
                         if (!in_bounds(pixel) ||
-                            cleaned_source.at<std::uint8_t>(pixel.y,
-                                                             pixel.x) == 0) {
+                            white_domain.at<std::uint8_t>(pixel.y,
+                                                           pixel.x) != 0) {
                             continue;
                         }
                         assign_rim_position(pixel, position);
@@ -1424,6 +1507,13 @@ cv::Mat source_rim_distance_label_ridges(
         }
         return rim_lookup[linear_index(pixel)];
     };
+
+    if (rim_connectivity_error_out != nullptr) {
+        const TimingMark timing = start_timing();
+        *rim_connectivity_error_out = rim_assignment_error(
+            white_domain, source_pixel_labels, source_points, rim_lookup);
+        record_timing("rim_assignment_check", timing);
+    }
 
     if (rim_arc_debug_out != nullptr) {
         const TimingMark timing = start_timing();
@@ -1538,6 +1628,9 @@ cv::Mat source_rim_distance_label_ridges(
                         if (center_rim.contour >= 0 &&
                             other_rim.contour >= 0) {
                             if (center_rim.contour != other_rim.contour) {
+                                // Separate source rings are intentionally
+                                // treated as infinitely far apart along the
+                                // rim, so their Voronoi boundary is kept.
                                 rim_distance = 255.0f;
                                 reason = "different_contour";
                             } else {
@@ -2359,6 +2452,7 @@ struct SourceRimSkeletonResult {
     cv::Mat source_rim_arc_skeleton;
     cv::Mat loops_connected;
     std::vector<StageTiming> timings;
+    std::string rim_connectivity_error;
 };
 
 struct GraphEdge {
@@ -6567,6 +6661,7 @@ SourceRimSkeletonResult source_rim_skeleton(
     cv::Mat source_rim_ridges;
     cv::Mat source_rim_distance;
     cv::Mat source_rim_arc;
+    std::string rim_connectivity_error;
     {
         const TimingMark timing = start_timing();
         constexpr float kSourceRimRidgeThresholdPx = 12.0f;
@@ -6574,7 +6669,8 @@ SourceRimSkeletonResult source_rim_skeleton(
             source_rim_distance_label_ridges(
                 white_domain, source_pixel_labels, source_points,
                 kSourceRimRidgeThresholdPx,
-                &source_rim_distance, &source_rim_arc, &timings);
+                &source_rim_distance, &source_rim_arc, &timings,
+                &rim_connectivity_error);
         timings.push_back(
             finish_timing("source_rim.rim_distance_ridges", timing));
     }
@@ -6598,7 +6694,20 @@ SourceRimSkeletonResult source_rim_skeleton(
             source_rim_arc,
             source_rim_arc_skeleton,
             loops_connected,
-            timings};
+            timings,
+            rim_connectivity_error};
+}
+
+SourceRimSkeletonResult crop_padded_source_rim_result(
+    const SourceRimSkeletonResult& padded, const cv::Size original_size) {
+    const cv::Rect roi(1, 1, original_size.width, original_size.height);
+    return {padded.source_rim_ridges(roi).clone(),
+            padded.source_rim_distance(roi).clone(),
+            padded.source_rim_arc(roi).clone(),
+            padded.source_rim_arc_skeleton(roi).clone(),
+            padded.loops_connected(roi).clone(),
+            padded.timings,
+            padded.rim_connectivity_error};
 }
 
 cv::Mat add_valid_frame_to_skeleton(const cv::Mat& skeleton, const cv::Mat& dt) {
@@ -6880,7 +6989,7 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         cv::Mat rim_source_pixel_labels;
         {
             const TimingMark timing = start_timing();
-            rim_label_domain = make_border_source_domain(white_domain);
+            rim_label_domain = make_padded_rim_label_domain(white_domain);
             cv::distanceTransform(rim_label_domain, rim_dt,
                                   rim_source_pixel_labels, cv::DIST_L2,
                                   cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
@@ -6900,10 +7009,16 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             const TimingMark timing = start_timing();
             source_rim_result = source_rim_skeleton(
                 rim_label_domain, rim_source_pixel_labels, rim_source_points);
+            source_rim_result = crop_padded_source_rim_result(
+                source_rim_result, white_domain.size());
             timings.push_back(finish_timing("source_rim_skeleton", timing));
             timings.insert(timings.end(),
                            source_rim_result.timings.begin(),
                            source_rim_result.timings.end());
+        }
+        if (!source_rim_result.rim_connectivity_error.empty()) {
+            throw std::runtime_error(
+                source_rim_result.rim_connectivity_error);
         }
 
         {
@@ -7067,6 +7182,7 @@ int main(int argc, char** argv) {
         cv::Mat graph_capacity_gray_bg;
         DenseFlowResult dense_flow_result;
         bool has_dense_flow = false;
+        std::string rim_error;
         std::string graph_error;
         for (int repeat = 0; repeat < args.compute_repeats; ++repeat) {
             CoutSilencer silence_repeated_details(
@@ -7099,7 +7215,7 @@ int main(int argc, char** argv) {
             cv::Mat rim_source_pixel_labels;
             {
                 const TimingMark timing = start_timing();
-                rim_label_domain = make_border_source_domain(white_domain);
+                rim_label_domain = make_padded_rim_label_domain(white_domain);
                 cv::distanceTransform(rim_label_domain, rim_dt,
                                       rim_source_pixel_labels, cv::DIST_L2,
                                       cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
@@ -7120,10 +7236,13 @@ int main(int argc, char** argv) {
                 source_rim_result = source_rim_skeleton(
                     rim_label_domain, rim_source_pixel_labels,
                     rim_source_points);
+                source_rim_result = crop_padded_source_rim_result(
+                    source_rim_result, white_domain.size());
                 timings.push_back(finish_timing("source_rim_skeleton", timing));
                 timings.insert(timings.end(),
                                source_rim_result.timings.begin(),
                                source_rim_result.timings.end());
+                rim_error = source_rim_result.rim_connectivity_error;
             }
 
             {
@@ -7191,7 +7310,7 @@ int main(int argc, char** argv) {
             }
 
             has_dense_flow = false;
-            if (args.has_source && graph_error.empty()) {
+            if (args.has_source && rim_error.empty() && graph_error.empty()) {
                 dense_flow_result =
                     compute_dense_source_flow(
                         white_domain, dt, graph,
@@ -7384,6 +7503,9 @@ int main(int argc, char** argv) {
                                                : 0)
                   << "\n"
                   << "  graph_edges: " << graph.edges.size() << "\n";
+        std::cout << "Rim connectivity:\n"
+                  << "  rim_assignments: "
+                  << (rim_error.empty() ? "ok" : "failed") << "\n";
         std::cout << "Graph connectivity:\n"
                   << "  graph_components: "
                   << graph_stats.components.size() << "\n"
@@ -7431,8 +7553,10 @@ int main(int argc, char** argv) {
         }
 
         print_stage_timings(timings);
-        if (!graph_error.empty()) {
-            std::cout << "error: " << graph_error << "\n";
+        if (!rim_error.empty() || !graph_error.empty()) {
+            std::cout << "error: "
+                      << (!rim_error.empty() ? rim_error : graph_error)
+                      << "\n";
             return 2;
         }
     } catch (const std::exception& e) {
