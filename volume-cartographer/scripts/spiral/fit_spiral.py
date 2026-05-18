@@ -89,8 +89,9 @@ default_config = {
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
     'loss_start_patch_dt': 5000,
-    'working_set_mode': 'global',  # 'progressive' (grow from a seed) | 'global' (fit all patches at once)
+    'working_set_mode': 'progressive_fixed',  # 'progressive' (grow from a seed when satisfied) | 'progressive_fixed' (grow from a seed on a fixed iteration schedule) | 'global' (fit all patches at once)
     'working_set_check_interval': 10,
+    'progressive_fixed_add_interval': 50,
     'output_winding_range': (10, 80),
     'output_winding_margin': 4,
     'output_step_size': 20,
@@ -1520,6 +1521,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
 
     num_patches = len(patches_list)
     is_global_mode = cfg['working_set_mode'] == 'global'
+    is_progressive_fixed_mode = cfg['working_set_mode'] == 'progressive_fixed'
 
     if is_global_mode:
         progressive_patch_order = list(range(num_patches))
@@ -1528,7 +1530,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
         if pass_seed_patch_id not in patches_dict:
             raise KeyError(f'pass_seed_patch_id {pass_seed_patch_id!r} not found among loaded patches')
         seed_patch_idx = patch_ids.index(pass_seed_patch_id)
-        print(f'pass {pass_idx}: building progressive patch ordering from seed {pass_seed_patch_id} ({num_patches} patches in pool)')
+        mode_label = 'progressive_fixed' if is_progressive_fixed_mode else 'progressive'
+        print(f'pass {pass_idx}: building {mode_label} patch ordering from seed {pass_seed_patch_id} ({num_patches} patches in pool)')
         progressive_patch_order = _build_progressive_patch_order(patches_list, seed_patch_idx)
 
     num_slices_for_visualisation = 20
@@ -1681,8 +1684,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
         working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, global mode ===\n')
         working_set_log.write(f'step {start_iteration}: initialised with all {num_patches} patches\n')
     else:
-        print(f'step {start_iteration}: working set initialised with {working_set_size}/{num_patches} patches (seed {patch_ids[working_set_indices[0]]})')
-        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, seed {pass_seed_patch_id} ===\n')
+        mode_label = 'progressive_fixed' if is_progressive_fixed_mode else 'progressive'
+        print(f'step {start_iteration}: working set initialised with {working_set_size}/{num_patches} patches (seed {patch_ids[working_set_indices[0]]}, {mode_label} mode)')
+        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, seed {pass_seed_patch_id}, {mode_label} mode ===\n')
         working_set_log.write(f'step {start_iteration}: initialised with seed patch {patch_ids[working_set_indices[0]]} (size {working_set_size}/{num_patches})\n')
 
     # Snapshot of the most recent state at which the working set was fully satisfied —
@@ -1699,7 +1703,26 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
-        if (
+        if is_progressive_fixed_mode:
+            should_grow = (
+                working_set_size < num_patches
+                and iteration > start_iteration
+                and iteration % cfg['progressive_fixed_add_interval'] == 0
+            )
+            if should_grow:
+                last_known_good_state = (
+                    copy.deepcopy(spiral_and_transform.state_dict()),
+                    copy.deepcopy(optimiser.state_dict()),
+                )
+                last_known_good_ws_size = working_set_size
+                last_known_good_iteration = iteration
+                working_set_size += 1
+                working_set_indices = progressive_patch_order[:working_set_size]
+                working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
+                working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
+                print(f'step {iteration}: working set grew to {working_set_size}/{num_patches} patches (added {patch_ids[working_set_indices[-1]]}, fixed schedule)')
+                working_set_log.write(f'step {iteration}: added patch {patch_ids[working_set_indices[-1]]} (size {working_set_size}/{num_patches}, fixed schedule)\n')
+        elif (
             working_set_size < num_patches
             and iteration > start_iteration
             and iteration % cfg['working_set_check_interval'] == 0
@@ -1914,7 +1937,7 @@ def main():
     print(f'dropped {len(dropped_patch_ids)} patches and {len(dropped_pcl_ids)} pcls outside z-roi [{z_begin}, {z_end})')
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{len(patches)}-patch'
+    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{len(patches)}-patch_{cfg["working_set_mode"]}'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
     run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
@@ -1930,6 +1953,18 @@ def main():
             umbilicus,
             out_path,
             pass_seed_patch_id=None,
+            pass_idx=1,
+        )
+        return
+
+    if cfg['working_set_mode'] == 'progressive_fixed':
+        fit_spiral_3d(
+            scroll_zarr_array,
+            patches,
+            list(point_collections.values()),
+            umbilicus,
+            out_path,
+            pass_seed_patch_id=seed_patch_id,
             pass_idx=1,
         )
         return
