@@ -12,7 +12,7 @@
 		"data": 0.0,
 		"data_plain": 0.0,
 		"pred_dt": 0.001,
-		"corr": 0.0,
+		"corr": 0.001,
 		"bend": 100.0,
 		"ext_offset": 0.0
 	},
@@ -21,18 +21,19 @@
 			"name": "snap",
 			"steps": 500,
 			"min_scaledown": 0,
-			"lr": 0.1,
+			"lr": 1.0,
 			"dlr": [1.0, 0.1, 0.01, 0.001, 0.0001],
 			"_lr": [10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
 			"args": {
+				"status_interval": 10,
 				"pred_dt_flow_gate": {
 					"enabled": true,
 					"debug": true,
 					"gate_factor": 1.0,
 					"backtrack_distance": 50.0,
 					"local_boost": 0.5,
-					"debug_vis_interval": 1,
+					"debug_vis_interval": 50,
 					"anticipatory_pull": {
 						"enabled": true,
 						"samples": 8,

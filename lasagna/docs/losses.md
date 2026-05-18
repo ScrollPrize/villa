@@ -63,6 +63,7 @@ iterations by default. Override per stage with `global_opt.args.status_interval`
       "gate_factor": 1.0,
       "backtrack_distance": 10.0,
       "local_boost": 1.0,
+      "corr_seed_surface_distance": 6.0,
       "debug_vis_interval": 50,
       "anticipatory_pull": {
         "enabled": true,
@@ -98,6 +99,11 @@ greedy-ascent flow. `backtrack_distance` is the dilation radius.
 `local_boost` blends between them: `0.0` uses only globally normalized
 greedy-ascent flow, `1.0` uses the local gate, and values between are linear.
 The resulting gate multiplies the `pred_dt` loss map.
+Correction points are also passed to the flow code as additional source seeds
+when `corr_seed_enabled` is not false and the point is within
+`corr_seed_surface_distance` full-resolution voxels of the current rendered
+surface. The C++ flow graph applies the same source-edge detection and uphill
+start traversal to these correction seeds as it does to the primary fit seed.
 `gate_factor` controls how much of the regular pred-dt weight comes from the gate:
 `weight = gate_factor * gate + (1 - gate_factor)`, so `0.99` keeps a `0.01`
 baseline pred-dt loss weight active everywhere. The anticipatory pull uses the
@@ -133,9 +139,21 @@ With `debug: true`, flow layer TIFFs are written every `debug_layer_interval`
 flow evaluations (default `10`). The service JPG is written every
 `debug_vis_interval` evaluations (default `50`; `debug_jpg_interval` remains a
 legacy alias) as
-`pred_dt_flow_gate_weight_jpg/vis_<iteration>.jpg` and shows `pred_dt`, the
-dense local-max-ratio gate weight actually used by flow gating, then the
-normalized greedy-ascent flow value before the local max ratio. The layer TIFF also includes
+`pred_dt_flow_gate_weight_jpg/vis_<iteration>.jpg` and shows the thresholded
+flow basis, the retained seed/correction source component mask when available,
+`pred_dt`, the dense local-max-ratio gate weight actually used by flow gating,
+then the normalized greedy-ascent flow value before the local max ratio. The
+rightmost panel overlays the primary seed in cyan plus correction
+points at their nearest rendered-surface pixel; green correction points are
+within `corr_seed_surface_distance` and become extra flow seeds, while orange
+points are too far and are labeled with their current full-resolution voxel
+distance to the rendered mesh. Magenta pixels show the source graph edges that
+C++ actually accepted after graph edge detection and uphill source traversal,
+and the panel header reports accepted source count, source edge count, and
+seeded node count. The layer TIFF also includes `source_components`, a black
+and white mask of the final threshold-domain connected component(s) retained
+because they contain the primary seed or a valid correction-point source, plus
+`graph_source_edges` and
 `island_obstacle_factor`, which labels enclosed obstacle islands and annotates
 the local loop score without coloring the associated loop pixels. The score is
 `min(full_island_dt / representative_point_dt)` over loop pixels associated with

@@ -117,8 +117,12 @@ def _load_library_from_path(path: Path) -> ctypes.CDLL:
 		ctypes.c_int,
 		ctypes.c_int,
 		ctypes.c_int,
+		ctypes.POINTER(ctypes.c_int),
+		ctypes.c_int,
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.c_int,
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.POINTER(ctypes.c_float),
@@ -137,6 +141,9 @@ def _load_library_from_path(path: Path) -> ctypes.CDLL:
 		ctypes.POINTER(ctypes.c_int),
 		ctypes.POINTER(ctypes.c_int),
 		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_int),
+		ctypes.POINTER(ctypes.c_int),
+		ctypes.POINTER(ctypes.c_int),
 		ctypes.c_char_p,
 		ctypes.c_int,
 		ctypes.c_int,
@@ -179,6 +186,7 @@ def compute_flow_grid(
 	image_u8: np.ndarray,
 	*,
 	source_xy: tuple[int, int],
+	extra_source_xy: np.ndarray | None = None,
 	query_xy: np.ndarray,
 	verbose: bool = False,
 	return_debug: bool = False,
@@ -190,12 +198,13 @@ def compute_flow_grid(
 	"""Run dense source flow gating and sample it at explicit image-space points.
 
 	image_u8: (H, W) uint8 pred_dt render.
+	source_xy and extra_source_xy are image coordinates, x then y.
 	query_xy: (N, 2) float32 image coordinates, x then y.
 	Returns (query_weight, dense_weight), both float32 gate weights in [0, 1].
 	When return_debug is true, also returns smooth grid flow, greedy-ascent gate
 	basis flow, graph edge flow, island obstacle-factor labels, the island
 	removal mask, island-flow propagation debug images, and island-propagated
-	dense-flow visualizations.
+	dense-flow visualizations plus source edge/component masks.
 	"""
 	if image_u8.ndim != 2:
 		raise ValueError(f"image_u8 must be 2D, got shape {image_u8.shape}")
@@ -203,6 +212,14 @@ def compute_flow_grid(
 	query = np.ascontiguousarray(query_xy, dtype=np.float32)
 	if query.ndim != 2 or query.shape[1] != 2:
 		raise ValueError(f"query_xy must have shape (N, 2), got {query.shape}")
+	if extra_source_xy is None:
+		extra_sources = np.zeros((0, 2), dtype=np.int32)
+	else:
+		extra_sources = np.ascontiguousarray(extra_source_xy, dtype=np.int32)
+		if extra_sources.ndim != 2 or extra_sources.shape[1] != 2:
+			raise ValueError(
+				f"extra_source_xy must have shape (N, 2), got {extra_sources.shape}"
+			)
 
 	height, width = image.shape
 	query_flow = np.zeros((query.shape[0],), dtype=np.float32)
@@ -233,9 +250,18 @@ def compute_flow_grid(
 	island_tree_dense_greedy_ascent = (
 		np.zeros((height, width), dtype=np.float32) if return_debug else None
 	)
+	source_edge_mask = (
+		np.zeros((height, width), dtype=np.float32) if return_debug else None
+	)
+	source_component_mask = (
+		np.zeros((height, width), dtype=np.float32) if return_debug else None
+	)
 	resolved_source_x = ctypes.c_int(-1)
 	resolved_source_y = ctypes.c_int(-1)
 	resolved_source_capacity = ctypes.c_float(0.0)
+	resolved_accepted_sources = ctypes.c_int(0)
+	resolved_source_edges = ctypes.c_int(0)
+	resolved_seeded_nodes = ctypes.c_int(0)
 	err = ctypes.create_string_buffer(4096)
 	lib = _load_library()
 	rc = lib.dense_batch_flow_grid_u8(
@@ -244,6 +270,12 @@ def compute_flow_grid(
 		height,
 		int(source_xy[0]),
 		int(source_xy[1]),
+		(
+			extra_sources.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+			if extra_sources.size > 0
+			else None
+		),
+		int(extra_sources.shape[0]),
 		query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
 		int(query.shape[0]),
 		query_flow.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -298,12 +330,25 @@ def compute_flow_grid(
 			if island_tree_dense_greedy_ascent is not None
 			else None
 		),
+		(
+			source_edge_mask.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if source_edge_mask is not None
+			else None
+		),
+		(
+			source_component_mask.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if source_component_mask is not None
+			else None
+		),
 		int(max(1, grid_step)),
 		ctypes.c_float(max(0.0, float(backtrack_distance))),
 		ctypes.c_float(min(1.0, max(0.0, float(local_boost)))),
 		ctypes.byref(resolved_source_x),
 		ctypes.byref(resolved_source_y),
 		ctypes.byref(resolved_source_capacity),
+		ctypes.byref(resolved_accepted_sources),
+		ctypes.byref(resolved_source_edges),
+		ctypes.byref(resolved_seeded_nodes),
 		err,
 		ctypes.sizeof(err),
 		1 if verbose else 0,
@@ -315,6 +360,10 @@ def compute_flow_grid(
 		"source_x": int(resolved_source_x.value),
 		"source_y": int(resolved_source_y.value),
 		"source_capacity": float(resolved_source_capacity.value),
+		"extra_source_count": int(extra_sources.shape[0]),
+		"accepted_source_count": int(resolved_accepted_sources.value),
+		"source_edge_count": int(resolved_source_edges.value),
+		"seeded_node_count": int(resolved_seeded_nodes.value),
 	}
 	if return_debug:
 		result = (
@@ -330,6 +379,8 @@ def compute_flow_grid(
 			island_bonus_edge_flow,
 			island_tree_dense_no_backtrack,
 			island_tree_dense_greedy_ascent,
+			source_edge_mask,
+			source_component_mask,
 		)
 	else:
 		result = (query_flow, dense_flow)
