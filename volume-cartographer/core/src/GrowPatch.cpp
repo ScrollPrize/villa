@@ -138,6 +138,67 @@ static cv::Size scaled_grid_size(const cv::Size& size, int factor)
         std::max(1, (size.height + factor - 1) / factor));
 }
 
+static cv::Size growth_source_size_from_meta(const utils::Json& meta)
+{
+    if (!meta.contains("_growth_source_width") ||
+        !meta.contains("_growth_source_height") ||
+        !meta["_growth_source_width"].is_number() ||
+        !meta["_growth_source_height"].is_number()) {
+        return {};
+    }
+
+    const int width = meta["_growth_source_width"].get_int();
+    const int height = meta["_growth_source_height"].get_int();
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+    return cv::Size(width, height);
+}
+
+static cv::Size exact_growth_output_size(const QuadSurface* coarse,
+                                         int factor,
+                                         bool preserve_source_extent)
+{
+    if (!coarse || factor <= 1) {
+        return {};
+    }
+
+    const cv::Size source_size = growth_source_size_from_meta(coarse->meta);
+    if (source_size.width <= 0 || source_size.height <= 0) {
+        return {};
+    }
+    if (preserve_source_extent) {
+        return source_size;
+    }
+
+    const cv::Mat_<cv::Vec3f>* coarse_points = coarse->rawPointsPtr();
+    if (!coarse_points || coarse_points->empty()) {
+        return source_size;
+    }
+
+    cv::Point source_offset(0, 0);
+    if (coarse->meta.contains("grid_offset") &&
+        coarse->meta["grid_offset"].is_array() &&
+        coarse->meta["grid_offset"].size() >= 2 &&
+        coarse->meta["grid_offset"][0].is_number() &&
+        coarse->meta["grid_offset"][1].is_number()) {
+        source_offset.x = coarse->meta["grid_offset"][0].get_int();
+        source_offset.y = coarse->meta["grid_offset"][1].get_int();
+    }
+
+    const cv::Size coarse_source_size = scaled_grid_size(source_size, factor);
+    const int extra_left = std::max(0, source_offset.x);
+    const int extra_top = std::max(0, source_offset.y);
+    const int extra_right = std::max(
+        0, coarse_points->cols - source_offset.x - coarse_source_size.width);
+    const int extra_bottom = std::max(
+        0, coarse_points->rows - source_offset.y - coarse_source_size.height);
+
+    return cv::Size(
+        source_size.width + (extra_left + extra_right) * factor,
+        source_size.height + (extra_top + extra_bottom) * factor);
+}
+
 static cv::Mat_<cv::Vec3f> downsample_surface_points_nearest(const cv::Mat_<cv::Vec3f>& points, int factor)
 {
     const cv::Size dst_size = scaled_grid_size(points.size(), factor);
@@ -3130,16 +3191,11 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
     }
 
-    auto exact_growth_output_size_for_fill = [&]() -> cv::Size {
-        if (!use_growth_scale || !params.value("disable_grid_expansion", false) ||
-            !resume_surf ||
-            !resume_surf->meta.contains("_growth_source_width") ||
-            !resume_surf->meta.contains("_growth_source_height")) {
-            return {};
-        }
-        return cv::Size(
-            resume_surf->meta["_growth_source_width"].get_int(),
-            resume_surf->meta["_growth_source_height"].get_int());
+    auto exact_growth_output_size_for_fill = [&](const QuadSurface* coarse) -> cv::Size {
+        return exact_growth_output_size(
+            coarse,
+            use_growth_scale ? growth_scale_factor : 1,
+            params.value("disable_grid_expansion", false));
     };
 
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
@@ -3718,14 +3774,10 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         surf->meta["elapsed_time_s"] = f_timer.seconds();
 
         delete timer;
-        cv::Size exact_output_size;
-        if (use_growth_scale &&
-            resume_surf->meta.contains("_growth_source_width") &&
-            resume_surf->meta.contains("_growth_source_height")) {
-            exact_output_size = cv::Size(
-                resume_surf->meta["_growth_source_width"].get_int(),
-                resume_surf->meta["_growth_source_height"].get_int());
-        }
+        const cv::Size exact_output_size = exact_growth_output_size(
+            surf,
+            use_growth_scale ? growth_scale_factor : 1,
+            true);
         return make_output_scale_surface(
             surf,
             output_surface_scale,
@@ -3858,7 +3910,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     surf,
                     output_surface_scale,
                     use_growth_scale ? growth_scale_factor : 1,
-                    exact_growth_output_size_for_fill());
+                    exact_growth_output_size_for_fill(surf));
             }
             const cv::Size raw_size = new_points->size();
 
@@ -3942,7 +3994,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             surf,
             output_surface_scale,
             use_growth_scale ? growth_scale_factor : 1,
-            exact_growth_output_size_for_fill());
+            exact_growth_output_size_for_fill(surf));
     };
 
     cv::Vec3f vx = {1,0,0};
