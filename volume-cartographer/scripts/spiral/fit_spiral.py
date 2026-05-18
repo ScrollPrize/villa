@@ -30,7 +30,7 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 # PHercParis4
 volpkg_path = '/home/paul/projects/vesuvius-scrolls/volpkgs/s1_ds2.volpkg'
 scroll_zarr_path = None
-pcl_json_path = None  # '/home/paul/projects/vesuvius-scrolls/spiral/windings.json'
+pcl_json_path = '/home/paul/projects/vesuvius-scrolls/spiral/windings_8205.json'
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
@@ -84,12 +84,12 @@ default_config = {
     'loss_weight_patch_radius': 8.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
-    'loss_weight_winding_number': 0.,
+    'loss_weight_winding_number': 10.,
     'loss_weight_patch_stretch': 40.0,
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
     'loss_start_patch_dt': 5000,
-    'working_set_mode': 'progressive_fixed',  # 'progressive' (grow from a seed when satisfied) | 'progressive_fixed' (grow from a seed on a fixed iteration schedule) | 'global' (fit all patches at once)
+    'working_set_mode': 'global',  # 'progressive' (grow from a seed when satisfied) | 'progressive_fixed' (grow from a seed on a fixed iteration schedule) | 'global' (fit all patches at once)
     'working_set_check_interval': 10,
     'progressive_fixed_add_interval': 50,
     'output_winding_range': (10, 80),
@@ -780,32 +780,122 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
     return mean_radius_deviation, umbilicus_loss, patch_dt_loss
 
 
-def _sample_strip_through_ij(patch, i, j, axis, num_points):
-    # Sample a strip on `patch` along `axis` passing through approximately (i, j).
-    # axis=0 -> row strip (fixed i, varying j); axis=1 -> column strip (fixed j, varying i).
-    # Returns float32 [num_points, 2] or None if (i, j) doesn't lie on a valid quad.
+def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, num_points):
+    # Sample a single L-shape on `valid_quad` starting at (i_q, j_q). Leg 1 walks along
+    # `leg1_axis` (0 -> varying j, 1 -> varying i) in direction `leg1_dir` (+1 or -1) to a
+    # uniformly random turn point inside the contiguous valid run. Leg 2 walks from the
+    # turn point along the perpendicular axis in direction `leg2_dir` (+1 or -1) to the end
+    # of its valid run. Returns a float32 [num_points, 2] sampled in traversal order, with
+    # subpixel jitter; the fixed-axis jitter is shared within each leg (matching the
+    # _sample_strip_ijs convention), so the unwrap can stitch theta=0 crossings along the
+    # full L (the only ~sqrt(2)-quad jump is across the corner, still well within the
+    # |dtheta| < pi requirement). Caller guarantees valid_quad[i_q, j_q].
+
+    if leg1_axis == 0:
+        line1_valid = valid_quad[i_q, :]
+        var_start1 = j_q
+    else:
+        line1_valid = valid_quad[:, j_q]
+        var_start1 = i_q
+    lo1, hi1 = run_containing_index(line1_valid, var_start1)
+    var_far1 = (hi1 - 1) if leg1_dir > 0 else lo1
+    leg1_max_steps = abs(var_far1 - var_start1)
+    turn_step = int(np.random.randint(0, leg1_max_steps + 1))
+    var_turn = var_start1 + leg1_dir * turn_step
+
+    if leg1_axis == 0:
+        i_turn, j_turn = i_q, var_turn
+    else:
+        i_turn, j_turn = var_turn, j_q
+
+    leg2_axis = 1 - leg1_axis
+    if leg2_axis == 0:
+        line2_valid = valid_quad[i_turn, :]
+        var_start2 = j_turn
+    else:
+        line2_valid = valid_quad[:, j_turn]
+        var_start2 = i_turn
+    lo2, hi2 = run_containing_index(line2_valid, var_start2)
+    var_far2 = (hi2 - 1) if leg2_dir > 0 else lo2
+    leg2_max_steps = abs(var_far2 - var_start2)
+
+    total_steps = turn_step + leg2_max_steps  # leg 1 spans [0, turn_step]; leg 2 spans (turn_step, total_steps]
+    num_positions = total_steps + 1
+    steps = np.sort(np.random.choice(num_positions, num_points, replace=num_points > num_positions))
+
+    ijs = np.empty([num_points, 2], dtype=np.float32)
+    leg1_fixed_jitter = float(np.random.uniform(0, 1))
+    leg2_fixed_jitter = float(np.random.uniform(0, 1))
+
+    on_leg1 = steps <= turn_step
+    leg1_steps = steps[on_leg1]
+    leg2_steps = steps[~on_leg1] - turn_step
+
+    leg1_var = (var_start1 + leg1_dir * leg1_steps).astype(np.float32) + np.random.uniform(0., 1., size=leg1_steps.shape).astype(np.float32)
+    leg1_fixed = float(i_q if leg1_axis == 0 else j_q) + leg1_fixed_jitter
+    if leg1_axis == 0:
+        ijs[on_leg1, 0] = leg1_fixed
+        ijs[on_leg1, 1] = leg1_var
+    else:
+        ijs[on_leg1, 0] = leg1_var
+        ijs[on_leg1, 1] = leg1_fixed
+
+    leg2_var = (var_start2 + leg2_dir * leg2_steps).astype(np.float32) + np.random.uniform(0., 1., size=leg2_steps.shape).astype(np.float32)
+    leg2_fixed = float(i_turn if leg2_axis == 0 else j_turn) + leg2_fixed_jitter
+    if leg2_axis == 0:
+        ijs[~on_leg1, 0] = leg2_fixed
+        ijs[~on_leg1, 1] = leg2_var
+    else:
+        ijs[~on_leg1, 0] = leg2_var
+        ijs[~on_leg1, 1] = leg2_fixed
+
+    return ijs
+
+
+def _sample_l_shapes_at_ij(patch, i, j, num_points):
+    # Sample 4 L-shapes anchored on the annotated point (i, j) of `patch`, one per cardinal
+    # primary direction: right (+j), left (-j), down (+i), up (-i). For each, leg 2's
+    # perpendicular direction is chosen uniformly at random. Returns a list of 4 float32
+    # [num_points, 2] arrays sampled in traversal order, or None if (i, j) doesn't lie on
+    # a valid quad. Each L is a single contiguous walk in patch space, so the unwrap can
+    # handle theta=0 seam crossings along the bent strip just as it does along a straight
+    # row/column.
     valid_quad = patch._sampling_valid_quad_mask_np
     H_q, W_q = valid_quad.shape
     i_q = min(max(int(i), 0), H_q - 1)
     j_q = min(max(int(j), 0), W_q - 1)
-    line_valid = valid_quad[i_q, :] if axis == 0 else valid_quad[:, j_q]
-    seed = j_q if axis == 0 else i_q
-    if not line_valid[seed]:
+    if not valid_quad[i_q, j_q]:
         return None
-    fixed_coord = i_q if axis == 0 else j_q
-    return _sample_strip_ijs(line_valid, seed, fixed_coord, axis=axis, num_points=num_points)
+
+    primary_specs = [(0, +1), (0, -1), (1, +1), (1, -1)]  # (leg1_axis, leg1_dir)
+    return [
+        _sample_single_l_shape(
+            valid_quad, i_q, j_q, leg1_axis, leg1_dir,
+            leg2_dir=int(np.random.choice([-1, +1])),
+            num_points=num_points,
+        )
+        for leg1_axis, leg1_dir in primary_specs
+    ]
 
 
 def get_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections):
     # For pairs of annotated PCL points (possibly on different patches), constrain the spiral
-    # shifted-radius gap to match the annotated winding-number difference. Samples a row strip
-    # and a column strip through each annotated point's (i, j); the cross-strip all-pairs diff
-    # is regressed onto winding_diff * dr_per_winding. Theta=0 seam crossings inside each strip
-    # are handled by _unwrap_track_shifted_radii.
+    # shifted-radius gap to match the annotated winding-number difference. For each annotated
+    # point we build 4 L-shaped strips: from (i, j), walk along one of the cardinal patch
+    # directions (right, left, down, up) to a uniformly-random turn point inside the
+    # contiguous valid run, then 90-degree-turn into a uniformly-random perpendicular
+    # direction and walk to the end of that valid run. Each L is sampled in traversal order
+    # along its bent path, so _unwrap_track_shifted_radii can stitch theta=0 seam crossings
+    # along the whole strip (the corner only introduces a ~sqrt(2)-quad ij jump). We then
+    # pool all 4 L-strips per annotated point into one set of sample points and take a
+    # single all-pairs diff between p1's and p2's pooled sets, regressing it onto
+    # winding_diff * dr_per_winding.
 
     num_points_per_strip = cfg['num_points_per_patch'] // 2
+    num_strips_per_pcl = 4
+    num_strips_per_pair = 2 * num_strips_per_pcl  # 8
 
-    # Each entry: (h1_ij, h2_ij, v1_ij, v2_ij, pid1, pid2, winding_diff)
+    # Each entry: (ls1, ls2, pid1, pid2, winding_diff) where ls* is a list of 4 L-shape ij strips
     strip_pairs = []
 
     for pcl in point_collections:
@@ -834,32 +924,27 @@ def get_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_d
             pid2 = p2['on_patch']['id']
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
-            patch1 = patches_dict[pid1]
-            patch2 = patches_dict[pid2]
 
-            h1 = _sample_strip_through_ij(patch1, i1, j1, axis=0, num_points=num_points_per_strip)
-            h2 = _sample_strip_through_ij(patch2, i2, j2, axis=0, num_points=num_points_per_strip)
-            v1 = _sample_strip_through_ij(patch1, i1, j1, axis=1, num_points=num_points_per_strip)
-            v2 = _sample_strip_through_ij(patch2, i2, j2, axis=1, num_points=num_points_per_strip)
-            if h1 is None or h2 is None or v1 is None or v2 is None:
+            ls1 = _sample_l_shapes_at_ij(patches_dict[pid1], i1, j1, num_points_per_strip)
+            ls2 = _sample_l_shapes_at_ij(patches_dict[pid2], i2, j2, num_points_per_strip)
+            if ls1 is None or ls2 is None:
                 continue
-            strip_pairs.append((h1, h2, v1, v2, pid1, pid2, winding_diff))
+            strip_pairs.append((ls1, ls2, pid1, pid2, winding_diff))
 
     if not strip_pairs:
         return torch.zeros([], device='cuda')
 
-    # Flatten: 4 strips per pair, ordered (h1, h2, v1, v2).
-    num_strips_per_pair = 4
+    # Flatten: 8 strips per pair, ordered as p1's 4 strips followed by p2's 4 strips.
     total_strips = len(strip_pairs) * num_strips_per_pair
     flat_ijs = np.empty([total_strips, num_points_per_strip, 2], dtype=np.float32)
     flat_pids = []
-    for k, (h1, h2, v1, v2, pid1, pid2, _) in enumerate(strip_pairs):
+    for k, (ls1, ls2, pid1, pid2, _) in enumerate(strip_pairs):
         base = k * num_strips_per_pair
-        flat_ijs[base + 0] = h1
-        flat_ijs[base + 1] = h2
-        flat_ijs[base + 2] = v1
-        flat_ijs[base + 3] = v2
-        flat_pids.extend([pid1, pid2, pid1, pid2])
+        for s, strip in enumerate(ls1):
+            flat_ijs[base + s] = strip
+        for s, strip in enumerate(ls2):
+            flat_ijs[base + num_strips_per_pcl + s] = strip
+        flat_pids.extend([pid1] * num_strips_per_pcl + [pid2] * num_strips_per_pcl)
 
     # Group strips by patch and run ij_to_zyx in a single batched call per patch.
     flat_zyxs = torch.empty([total_strips, num_points_per_strip, 3], dtype=torch.float32)
@@ -877,23 +962,21 @@ def get_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_d
     theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
     shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
 
-    # [num_pairs, 4, num_points_per_strip]
+    # [num_pairs, 8, num_points_per_strip] -> pool each side's 4 strips into a single set.
     shifted_radii = shifted_radii.reshape(len(strip_pairs), num_strips_per_pair, num_points_per_strip)
-    h1_r = shifted_radii[:, 0]
-    h2_r = shifted_radii[:, 1]
-    v1_r = shifted_radii[:, 2]
-    v2_r = shifted_radii[:, 3]
+    num_points_per_side = num_strips_per_pcl * num_points_per_strip
+    p1_r = shifted_radii[:, :num_strips_per_pcl].reshape(len(strip_pairs), num_points_per_side)
+    p2_r = shifted_radii[:, num_strips_per_pcl:].reshape(len(strip_pairs), num_points_per_side)
 
     winding_diffs = torch.tensor(
-        [sp[6] for sp in strip_pairs],
+        [sp[4] for sp in strip_pairs],
         device='cuda',
         dtype=torch.float32,
     )
     expected_diff = (winding_diffs * dr_per_winding)[:, None, None]
 
-    h_diff = h2_r[:, :, None] - h1_r[:, None, :]
-    v_diff = v2_r[:, :, None] - v1_r[:, None, :]
-    return (h_diff - expected_diff).abs().mean() + (v_diff - expected_diff).abs().mean()
+    diff = p2_r[:, :, None] - p1_r[:, None, :]
+    return (diff - expected_diff).abs().mean()
 
 
 def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, patches, patch_sampling_probabilities, epsilon=1.0):
