@@ -60,8 +60,6 @@ iterations by default. Override per stage with `global_opt.args.status_interval`
     "pred_dt_normal_source": "model",
     "pred_dt_flow_gate": {
       "enabled": true,
-      "flow_zero": 50.0,
-      "flow_one": 300.0,
       "gate_factor": 1.0,
       "backtrack_distance": 10.0,
       "anticipatory_pull": {
@@ -91,8 +89,10 @@ mesh normals. Set it to `"gt"` to use sampled GT normals for that stage.
 
 When enabled, the current single-winding `pred_dt` render is median-filtered
 with radius 1, thresholded at `110`, routed through `dense_batch_min_cut`, and
-sampled at the exact model grid corners. The resulting gate is linearly mapped
-from `flow_zero -> 0` to `flow_one -> 1` and multiplies the `pred_dt` loss map.
+sampled at the exact model grid corners. The C++ flow code computes the gate as
+local greedy-ascent flow divided by the dilated local maximum of that same
+greedy-ascent flow; `backtrack_distance` is the dilation radius. The resulting
+gate multiplies the `pred_dt` loss map.
 `gate_factor` controls how much of the regular pred-dt weight comes from the gate:
 `weight = gate_factor * gate + (1 - gate_factor)`, so `0.99` keeps a `0.01`
 baseline pred-dt loss weight active everywhere. The anticipatory pull uses the
@@ -102,8 +102,8 @@ The loss denominator remains the original validity-mask sum; the gate is
 intentionally not renormalized.
 
 `backtrack_distance` is measured in the rendered `pred_dt` image pixel units.
-It is passed through to the dense grid flow routing and matches the C++ debug
-CLI option:
+It is passed through to the dense grid flow routing and local gate dilation, and
+matches the C++ debug CLI option:
 
 ```bash
 ./dense_batch_preprocess -i pred.tif --source 240,240 --grid-step 4 --backtrack-distance 10

@@ -24,6 +24,28 @@ def _candidate_library_paths() -> list[Path]:
 	]
 
 
+def _source_dependency_paths() -> list[Path]:
+	root = Path(__file__).resolve().parent / "dense_batch_min_cut"
+	return [
+		root / "CMakeLists.txt",
+		root / "src" / "dense_batch_preprocess.cpp",
+	]
+
+
+def _library_needs_rebuild(path: Path) -> bool:
+	try:
+		lib_mtime = path.stat().st_mtime
+	except OSError:
+		return True
+	for source_path in _source_dependency_paths():
+		try:
+			if source_path.stat().st_mtime > lib_mtime:
+				return True
+		except OSError:
+			continue
+	return False
+
+
 def _manual_build_message() -> str:
 	return (
 		"Build it with:\n"
@@ -122,6 +144,9 @@ def _load_library() -> ctypes.CDLL:
 		if _LIB is not None:
 			return _LIB
 		path = _find_library_path()
+		if path is not None and _autobuild_enabled() and _library_needs_rebuild(path):
+			_auto_build_library()
+			path = _find_library_path()
 		if path is None and _autobuild_enabled():
 			_auto_build_library()
 			path = _find_library_path()
@@ -152,11 +177,11 @@ def compute_flow_grid(
 	grid_step: int = 50,
 	backtrack_distance: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
-	"""Run dense source flow and sample it at explicit image-space points.
+	"""Run dense source flow gating and sample it at explicit image-space points.
 
 	image_u8: (H, W) uint8 pred_dt render.
 	query_xy: (N, 2) float32 image coordinates, x then y.
-	Returns (query_flow, dense_flow), both float32.
+	Returns (query_weight, dense_weight), both float32 gate weights in [0, 1].
 	"""
 	if image_u8.ndim != 2:
 		raise ValueError(f"image_u8 must be 2D, got shape {image_u8.shape}")

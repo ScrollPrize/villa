@@ -1029,15 +1029,11 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 	if res.data_s.pred_dt is None:
 		raise RuntimeError("pred_dt_flow_gate requires pred_dt to be loaded")
 
-	flow_zero = float(cfg.get("flow_zero", 20.0))
-	flow_one = float(cfg.get("flow_one", 100.0))
 	gate_factor = float(cfg.get("gate_factor", 1.0))
 	backtrack_distance = float(cfg.get("backtrack_distance", 10.0))
 	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 0))
 	pred_dt_pool_step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
 	pull_cfg = _anticipatory_pull_cfg(cfg)
-	if flow_one <= flow_zero:
-		raise ValueError("pred_dt_flow_gate requires flow_one > flow_zero")
 	if not 0.0 <= gate_factor <= 1.0:
 		raise ValueError("pred_dt_flow_gate requires gate_factor in [0, 1]")
 	debug = bool(cfg.get("debug", True))
@@ -1240,17 +1236,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			dtype=torch.float32,
 		).view(1, 1, Hm, Wm)
 		_t = mark("compute_weight")
-		seed_capacity = float(flow_metadata.get("source_capacity", 0.0))
-		effective_flow_one = flow_one
-		effective_flow_zero = flow_zero
-		if seed_capacity > 0.0 and seed_capacity < flow_one:
-			scale = seed_capacity / flow_one
-			effective_flow_one = seed_capacity
-			effective_flow_zero = flow_zero * scale
-		if effective_flow_one <= effective_flow_zero:
-			effective_flow_zero = max(0.0, effective_flow_one - 1.0)
-		gate_weight = ((flow_lr - effective_flow_zero) / (effective_flow_one - effective_flow_zero)).clamp(0.0, 1.0)
-		gate_weight = torch.where(seed_area, torch.ones_like(gate_weight), gate_weight)
+		gate_weight = flow_lr.clamp(0.0, 1.0)
 		weight = gate_weight
 		if gate_factor < 1.0:
 			weight = gate_factor * gate_weight + (1.0 - gate_factor)

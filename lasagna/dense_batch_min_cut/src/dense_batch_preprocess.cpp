@@ -8104,10 +8104,13 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         timings.insert(timings.end(), dense_flow_result.timings.begin(),
                        dense_flow_result.timings.end());
 
+        const cv::Mat flow_gate_weight = compute_flow_gate_weight_image(
+            dense_flow_result.tree_dense_flow_greedy_ascent,
+            backtrack_distance);
+
         if (dense_flow != nullptr) {
             for (int y = 0; y < height; ++y) {
-                const float* src_row =
-                    dense_flow_result.tree_dense_flow.ptr<float>(y);
+                const float* src_row = flow_gate_weight.ptr<float>(y);
                 std::copy(src_row, src_row + width,
                           dense_flow + static_cast<std::size_t>(y) * width);
             }
@@ -8151,14 +8154,10 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             const int y1 = std::min(y0 + 1, height - 1);
             const float fx = x - static_cast<float>(x0);
             const float fy = y - static_cast<float>(y0);
-            const float v00 =
-                dense_flow_result.tree_dense_flow.at<float>(y0, x0);
-            const float v10 =
-                dense_flow_result.tree_dense_flow.at<float>(y0, x1);
-            const float v01 =
-                dense_flow_result.tree_dense_flow.at<float>(y1, x0);
-            const float v11 =
-                dense_flow_result.tree_dense_flow.at<float>(y1, x1);
+            const float v00 = flow_gate_weight.at<float>(y0, x0);
+            const float v10 = flow_gate_weight.at<float>(y0, x1);
+            const float v01 = flow_gate_weight.at<float>(y1, x0);
+            const float v11 = flow_gate_weight.at<float>(y1, x1);
             const float v0 = v00 * (1.0f - fx) + v10 * fx;
             const float v1 = v01 * (1.0f - fx) + v11 * fx;
             return v0 * (1.0f - fy) + v1 * fy;

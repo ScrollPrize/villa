@@ -32,7 +32,7 @@
 					"flow_one": 300.0,
 					"debug": true,
 					"gate_factor": 1.0,
-					"backtrack_distance": 100.0,
+					"backtrack_distance": 50.0,
 					"anticipatory_pull": {
 						"enabled": true,
 						"samples": 8,
