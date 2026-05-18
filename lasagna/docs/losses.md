@@ -126,9 +126,10 @@ corner counts for gate weights `>0`, `>0.1`, and `>0.5`, plus the fraction at
 
 With `debug: true`, flow layer TIFFs are written every `debug_layer_interval`
 flow evaluations (default `10`). The service JPG is written every
-`debug_jpg_interval` evaluations (default `50`) and shows `pred_dt` next to the
-normalized greedy-ascent flow layer that the local gate is based on, then the
-normalized no-backtrack dense flow. The layer TIFF also includes
+`debug_jpg_interval` evaluations (default `50`) as
+`pred_dt_flow_gate_weight_jpg/vis_<iteration>.jpg` and shows `pred_dt`, the
+dense local-max-ratio gate weight actually used by flow gating, then the
+normalized greedy-ascent flow value before the local max ratio. The layer TIFF also includes
 `island_obstacle_factor`, which labels enclosed obstacle islands and annotates
 the local loop score without coloring the associated loop pixels. The score is
 `min(full_island_dt / representative_point_dt)` over loop pixels associated with
@@ -136,6 +137,18 @@ the island, so lower values mean the island is acting more like a real obstacle.
 The debug log prints the raw score ingredients for each island: area, bbox,
 sample counts, representative point, worst loop point, raw DT values, and
 min/mean/max sampled ratios.
+As a stop-gap, islands with score greater than `0.5` are filled into the white
+domain and the distance transform, rim graph, and dense flow are rebuilt from
+that filtered domain before producing the gate weights. The debug layer TIFF
+includes `island_removed_mask` to show the filled islands.
+The same debug pass also emits experimental island-flow propagation layers:
+`island_flow_passability` shows graph edges that can pass flow through compact
+island associations, `island_propagated_edge_flow` shows max-product propagated
+edge flow over those links, and `island_bonus_edge_flow` shows the extra flow
+above the raw graph edge flow. `island_tree_dense_flow_no_backtrack` and
+`island_tree_dense_flow_greedy_ascent` then run the same dense no-backtrack and
+greedy-ascent visualization path from the propagated edge flow. These layers are
+diagnostic only and do not change the gate weights.
 
 When `anticipatory_pull.debug_points` or `debug_roi_center_xyz` is set, every normal flow-gate layer-debug
 iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.jpg`.

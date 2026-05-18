@@ -28,8 +28,6 @@
 			"args": {
 				"pred_dt_flow_gate": {
 					"enabled": true,
-					"flow_zero": 100.0,
-					"flow_one": 300.0,
 					"debug": true,
 					"gate_factor": 1.0,
 					"backtrack_distance": 50.0,
@@ -38,7 +36,7 @@
 						"samples": 8,
 						"inlier_zero": 80.0,
 						"inlier_one": 120.0,
-						"loss_weight": 0.25,
+						"loss_weight": 1.0,
 						"_debug_roi_center_xyz": [17499, 13412, 51144],
 						"debug_roi_k": 8,
 						"debug_roi_root_min": 0.5,

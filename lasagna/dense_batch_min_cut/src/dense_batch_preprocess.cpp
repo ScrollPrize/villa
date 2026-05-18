@@ -36,6 +36,7 @@ constexpr float kCapacityScale = 2.0f;
 constexpr bool kEnableLegacyVoronoiTreeDensification = false;
 constexpr bool kEnableLegacyDenseDtAscent = false;
 constexpr bool kWriteReferenceDenseBacktrackNn = false;
+constexpr double kIslandRemovalScoreThreshold = 0.5;
 using Clock = std::chrono::steady_clock;
 
 struct TimingMark {
@@ -3980,16 +3981,53 @@ cv::Mat render_graph_capacity_normalized_float(const SkeletonGraph& graph,
     return out;
 }
 
+struct GraphEdgeMaps {
+    cv::Mat edge_mask;
+    cv::Mat edge_index;
+};
+
+GraphEdgeMaps build_graph_edge_maps(const SkeletonGraph& graph,
+                                    cv::Size size) {
+    GraphEdgeMaps maps;
+    maps.edge_mask = cv::Mat(size, CV_8U, cv::Scalar(0));
+    maps.edge_index = cv::Mat(size, CV_32S, cv::Scalar(-1));
+    for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+         ++edge_index) {
+        const GraphEdge& edge = graph.edges[edge_index];
+        for (const cv::Point pixel : edge.pixels) {
+            if (pixel.x < 0 || pixel.x >= maps.edge_mask.cols || pixel.y < 0 ||
+                pixel.y >= maps.edge_mask.rows) {
+                continue;
+            }
+            maps.edge_mask.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+            maps.edge_index.at<int>(pixel.y, pixel.x) = edge_index;
+        }
+    }
+    return maps;
+}
+
+struct IslandObstacleDebugIsland {
+    int label = 0;
+    double score = 1.0;
+    std::vector<int> loop_edges;
+    std::vector<cv::Point> pixels;
+};
+
 struct IslandObstacleDebugResult {
     cv::Mat label_factor;
     int islands = 0;
     int loop_sampled_islands = 0;
     std::vector<std::string> score_logs;
+    std::vector<IslandObstacleDebugIsland> scored_islands;
 };
 
 IslandObstacleDebugResult render_island_obstacle_factors(
-    const cv::Mat& white_domain, const SkeletonGraph& graph) {
+    const cv::Mat& white_domain,
+    const SkeletonGraph& graph,
+    const cv::Mat& graph_edge_index) {
     CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(graph_edge_index.empty() ||
+              graph_edge_index.type() == CV_32S);
 
     IslandObstacleDebugResult result;
     result.label_factor =
@@ -4216,6 +4254,38 @@ IslandObstacleDebugResult render_island_obstacle_factors(
         if (has_loop_score) {
             ++result.loop_sampled_islands;
         }
+        std::vector<int> loop_edge_indices;
+        if (!graph_edge_index.empty()) {
+            std::vector<char> seen_edges(graph.edges.size(), 0);
+            const auto add_loop_edge = [&](const cv::Point pixel) {
+                if (pixel.x < 0 || pixel.x >= graph_edge_index.cols ||
+                    pixel.y < 0 || pixel.y >= graph_edge_index.rows) {
+                    return;
+                }
+                const int edge_index =
+                    graph_edge_index.at<int>(pixel.y, pixel.x);
+                if (edge_index < 0 ||
+                    edge_index >= static_cast<int>(graph.edges.size()) ||
+                    seen_edges[static_cast<std::size_t>(edge_index)] != 0) {
+                    return;
+                }
+                seen_edges[static_cast<std::size_t>(edge_index)] = 1;
+                loop_edge_indices.push_back(edge_index);
+            };
+            for (const cv::Point pixel : loop_pixels) {
+                add_loop_edge(pixel);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        add_loop_edge(cv::Point(pixel.x + dx, pixel.y + dy));
+                    }
+                }
+            }
+        }
+        const std::size_t loop_edge_count = loop_edge_indices.size();
+        if (has_loop_score) {
+            result.scored_islands.push_back(
+                {label, score, std::move(loop_edge_indices), island_pixels});
+        }
         {
             std::ostringstream log;
             log << "  island " << label << ":"
@@ -4224,6 +4294,7 @@ IslandObstacleDebugResult render_island_obstacle_factors(
                 << "," << width << "x" << height
                 << " loop_pixels=" << loop_pixels.size()
                 << " scored_loop_pixels=" << scored_loop_pixels
+                << " loop_edges=" << loop_edge_count
                 << " rep=" << representative_pixel.x << ","
                 << representative_pixel.y
                 << " rep_loop_dt=" << std::setprecision(3)
@@ -4268,6 +4339,178 @@ IslandObstacleDebugResult render_island_obstacle_factors(
                          factor_text(label, score), cv::Scalar(255, 255, 255));
     }
 
+    return result;
+}
+
+struct IslandFlowPropagationResult {
+    std::vector<float> propagated_edge_flow;
+    std::vector<float> bonus_edge_flow;
+    std::vector<float> edge_passability;
+    int linked_islands = 0;
+    int transition_links = 0;
+    int boosted_edges = 0;
+};
+
+IslandFlowPropagationResult propagate_flow_across_island_links(
+    const SkeletonGraph& graph,
+    const std::vector<float>& edge_flow,
+    const IslandObstacleDebugResult& island_debug) {
+    CV_Assert(edge_flow.size() == graph.edges.size());
+
+    struct Transition {
+        int to = -1;
+        float passability = 0.0f;
+    };
+    struct QueueItem {
+        float flow = 0.0f;
+        int edge = -1;
+        bool operator<(const QueueItem& other) const {
+            return flow < other.flow;
+        }
+    };
+
+    IslandFlowPropagationResult result;
+    result.propagated_edge_flow = edge_flow;
+    result.bonus_edge_flow.assign(edge_flow.size(), 0.0f);
+    result.edge_passability.assign(edge_flow.size(), 0.0f);
+
+    std::vector<std::vector<Transition>> transitions(edge_flow.size());
+    for (const IslandObstacleDebugIsland& island :
+         island_debug.scored_islands) {
+        const float passability =
+            std::clamp(static_cast<float>(island.score), 0.0f, 1.0f);
+        if (passability <= 1.0e-4f || island.loop_edges.size() < 2) {
+            continue;
+        }
+        ++result.linked_islands;
+        for (const int edge_index : island.loop_edges) {
+            if (edge_index < 0 ||
+                edge_index >= static_cast<int>(edge_flow.size())) {
+                continue;
+            }
+            float& current =
+                result.edge_passability[static_cast<std::size_t>(edge_index)];
+            current = std::max(current, passability);
+        }
+        for (std::size_t i = 0; i < island.loop_edges.size(); ++i) {
+            const int a = island.loop_edges[i];
+            if (a < 0 || a >= static_cast<int>(edge_flow.size())) {
+                continue;
+            }
+            for (std::size_t j = i + 1; j < island.loop_edges.size(); ++j) {
+                const int b = island.loop_edges[j];
+                if (b < 0 || b >= static_cast<int>(edge_flow.size()) ||
+                    a == b) {
+                    continue;
+                }
+                transitions[static_cast<std::size_t>(a)].push_back(
+                    {b, passability});
+                transitions[static_cast<std::size_t>(b)].push_back(
+                    {a, passability});
+                result.transition_links += 2;
+            }
+        }
+    }
+
+    std::priority_queue<QueueItem> queue;
+    for (int edge_index = 0; edge_index < static_cast<int>(edge_flow.size());
+         ++edge_index) {
+        const float value = edge_flow[static_cast<std::size_t>(edge_index)];
+        if (std::isfinite(value) && value > 0.0f) {
+            queue.push({value, edge_index});
+        }
+    }
+
+    constexpr float kFlowEpsilon = 1.0e-4f;
+    while (!queue.empty()) {
+        const QueueItem item = queue.top();
+        queue.pop();
+        float& current =
+            result.propagated_edge_flow[static_cast<std::size_t>(item.edge)];
+        if (item.flow + kFlowEpsilon < current) {
+            continue;
+        }
+        for (const Transition transition :
+             transitions[static_cast<std::size_t>(item.edge)]) {
+            const float candidate = item.flow * transition.passability;
+            float& target = result.propagated_edge_flow
+                [static_cast<std::size_t>(transition.to)];
+            if (candidate <= target + kFlowEpsilon) {
+                continue;
+            }
+            target = candidate;
+            queue.push({candidate, transition.to});
+        }
+    }
+
+    for (int edge_index = 0; edge_index < static_cast<int>(edge_flow.size());
+         ++edge_index) {
+        const float raw = edge_flow[static_cast<std::size_t>(edge_index)];
+        const float propagated =
+            result.propagated_edge_flow[static_cast<std::size_t>(edge_index)];
+        const float bonus = std::max(0.0f, propagated - raw);
+        result.bonus_edge_flow[static_cast<std::size_t>(edge_index)] = bonus;
+        if (bonus > kFlowEpsilon) {
+            ++result.boosted_edges;
+        }
+    }
+
+    return result;
+}
+
+cv::Mat render_graph_edge_values(const SkeletonGraph& graph,
+                                 cv::Size size,
+                                 const std::vector<float>& values,
+                                 float scale = 1.0f) {
+    CV_Assert(values.size() == graph.edges.size());
+    cv::Mat out(size, CV_32FC3, cv::Scalar(0, 0, 0));
+    for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+         ++edge_index) {
+        const float value =
+            values[static_cast<std::size_t>(edge_index)] * scale;
+        if (value <= 0.0f) {
+            continue;
+        }
+        draw_graph_edge(out, graph.edges[edge_index],
+                        cv::Scalar(value, value, value));
+    }
+    return out;
+}
+
+struct IslandRemovalResult {
+    cv::Mat white_domain;
+    cv::Mat removed_mask;
+    int removed_islands = 0;
+    int removed_pixels = 0;
+};
+
+IslandRemovalResult remove_high_score_islands(
+    const cv::Mat& white_domain,
+    const IslandObstacleDebugResult& island_debug) {
+    CV_Assert(white_domain.type() == CV_8U);
+
+    IslandRemovalResult result;
+    result.white_domain = white_domain.clone();
+    result.removed_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
+    for (const IslandObstacleDebugIsland& island :
+         island_debug.scored_islands) {
+        if (island.score <= kIslandRemovalScoreThreshold) {
+            continue;
+        }
+        ++result.removed_islands;
+        for (const cv::Point pixel : island.pixels) {
+            if (pixel.x < 0 || pixel.x >= result.white_domain.cols ||
+                pixel.y < 0 || pixel.y >= result.white_domain.rows) {
+                continue;
+            }
+            if (result.white_domain.at<std::uint8_t>(pixel.y, pixel.x) != 0) {
+                continue;
+            }
+            result.white_domain.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+            result.removed_mask.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+            ++result.removed_pixels;
+        }
+    }
     return result;
 }
 
@@ -4503,6 +4746,11 @@ struct DenseFlowResult {
     cv::Mat edge_flow_px_gray_bg;
     cv::Mat graph_source_edges;
     cv::Mat island_obstacle_factor;
+    cv::Mat island_flow_passability;
+    cv::Mat island_propagated_edge_flow;
+    cv::Mat island_bonus_edge_flow;
+    cv::Mat island_tree_dense_flow_no_backtrack;
+    cv::Mat island_tree_dense_flow_greedy_ascent;
     cv::Mat flow_gate_weight;
     cv::Point source_seed_pixel{-1, -1};
     float source_seed_capacity = 0.0f;
@@ -5137,15 +5385,18 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             result.timings.push_back(
                 finish_timing("dense_graph_route.stats", sub_timing));
         }
-        std::cout << "Dense graph backtrack:\n"
-                  << "  graph_edge_pixels: " << graph_edge_pixels << "\n"
-                  << "  graph_node_pixels: " << graph_node_pixels << "\n"
-                  << "  graph_root_pixels: " << graph_root_pixels << "\n"
-                  << "  graph_routed_pixels: " << graph_routed_pixels << "\n"
-                  << "  graph_routed_route_pixels: "
-                  << graph_routed_route_pixels << "\n"
-                  << "  graph_unrouted_pixels: "
-                  << (graph_edge_pixels - graph_routed_pixels) << "\n";
+        if (enable_debug_outputs) {
+            std::cout << "Dense graph backtrack:\n"
+                      << "  graph_edge_pixels: " << graph_edge_pixels << "\n"
+                      << "  graph_node_pixels: " << graph_node_pixels << "\n"
+                      << "  graph_root_pixels: " << graph_root_pixels << "\n"
+                      << "  graph_routed_pixels: " << graph_routed_pixels
+                      << "\n"
+                      << "  graph_routed_route_pixels: "
+                      << graph_routed_route_pixels << "\n"
+                      << "  graph_unrouted_pixels: "
+                      << (graph_edge_pixels - graph_routed_pixels) << "\n";
+        }
         result.timings.push_back(
             finish_timing("dense_backtrack_graph_route", timing));
     }
@@ -6077,21 +6328,30 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         if (improved_carriers == 0) {
             min_route_distance = 0.0f;
         }
-        std::cout << "Dense grid carrier backtrack:\n"
-                  << "  grid_step: " << kGridStep << "\n"
-                  << "  grid_carriers: " << grid_carriers << "\n"
-                  << "  graph_carriers: " << graph_carriers << "\n"
-                  << "  graph_node_carriers: " << graph_node_carriers << "\n"
-                  << "  graph_edge_carriers: " << graph_edge_carriers << "\n"
-                  << "  carrier_edges: " << (carrier_edges_count / 2) << "\n"
-                  << "  carrier_flow_seeds: " << carrier_flow_seeds << "\n"
-                  << "  carrier_flow_reached: " << carrier_flow_reached
-                  << "\n"
-                  << "  route_bucket_px: " << kCarrierRouteBucketPx << "\n"
-                  << "  route_buckets: " << kCarrierRouteBuckets << "\n"
-                  << "  improved_carriers: " << improved_carriers << "\n"
-                  << "  min_route_distance: " << min_route_distance << "\n"
-                  << "  max_route_distance: " << max_route_distance << "\n";
+        if (enable_debug_outputs) {
+            std::cout << "Dense grid carrier backtrack:\n"
+                      << "  grid_step: " << kGridStep << "\n"
+                      << "  grid_carriers: " << grid_carriers << "\n"
+                      << "  graph_carriers: " << graph_carriers << "\n"
+                      << "  graph_node_carriers: " << graph_node_carriers
+                      << "\n"
+                      << "  graph_edge_carriers: " << graph_edge_carriers
+                      << "\n"
+                      << "  carrier_edges: " << (carrier_edges_count / 2)
+                      << "\n"
+                      << "  carrier_flow_seeds: " << carrier_flow_seeds
+                      << "\n"
+                      << "  carrier_flow_reached: " << carrier_flow_reached
+                      << "\n"
+                      << "  route_bucket_px: " << kCarrierRouteBucketPx
+                      << "\n"
+                      << "  route_buckets: " << kCarrierRouteBuckets << "\n"
+                      << "  improved_carriers: " << improved_carriers << "\n"
+                      << "  min_route_distance: " << min_route_distance
+                      << "\n"
+                      << "  max_route_distance: " << max_route_distance
+                      << "\n";
+        }
         StageTiming dense_grid_total =
             finish_timing("dense_backtrack_grid_carrier",
                           dense_grid_outer_timing);
@@ -6155,32 +6415,23 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     constexpr double kGraphFlowInf = 1.0e12;
     SkeletonGraph graph = input_graph;
 
-    cv::Mat graph_edge_mask(white_domain.size(), CV_8U, cv::Scalar(0));
-    cv::Mat graph_edge_index(white_domain.size(), CV_32S, cv::Scalar(-1));
+    cv::Mat graph_edge_mask;
+    cv::Mat graph_edge_index;
     cv::Mat graph_pixel_flow(white_domain.size(), CV_32F, cv::Scalar(0));
-    const auto rebuild_graph_edge_maps = [&]() {
-        graph_edge_mask.setTo(0);
-        graph_edge_index.setTo(-1);
-        for (int edge_index = 0;
-             edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
-            const GraphEdge& edge = graph.edges[edge_index];
-            for (const cv::Point pixel : edge.pixels) {
-                if (pixel.x >= 0 && pixel.x < graph_edge_mask.cols &&
-                    pixel.y >= 0 && pixel.y < graph_edge_mask.rows) {
-                    graph_edge_mask.at<std::uint8_t>(pixel.y, pixel.x) = 255;
-                    graph_edge_index.at<int>(pixel.y, pixel.x) = edge_index;
-                }
-            }
-        }
-    };
-    rebuild_graph_edge_maps();
+    {
+        const GraphEdgeMaps edge_maps =
+            build_graph_edge_maps(graph, white_domain.size());
+        graph_edge_mask = edge_maps.edge_mask;
+        graph_edge_index = edge_maps.edge_index;
+    }
 
     cv::Mat island_obstacle_factor(white_domain.size(), CV_8UC3,
                                    cv::Scalar(0, 0, 0));
+    IslandObstacleDebugResult island_debug;
     if (enable_debug_outputs) {
         const TimingMark timing = start_timing();
-        const IslandObstacleDebugResult island_debug =
-            render_island_obstacle_factors(white_domain, graph);
+        island_debug = render_island_obstacle_factors(
+            white_domain, graph, graph_edge_index);
         island_obstacle_factor = island_debug.label_factor;
         std::cout << "Island obstacle factors:\n"
                   << "  islands: " << island_debug.islands << "\n"
@@ -6825,6 +7076,35 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         timings.push_back(finish_timing("graph_edge_point_flow", timing));
     }
 
+    cv::Mat island_flow_passability(white_domain.size(), CV_32FC3,
+                                    cv::Scalar(0, 0, 0));
+    cv::Mat island_propagated_edge_flow(white_domain.size(), CV_32FC3,
+                                        cv::Scalar(0, 0, 0));
+    cv::Mat island_bonus_edge_flow(white_domain.size(), CV_32FC3,
+                                   cv::Scalar(0, 0, 0));
+    IslandFlowPropagationResult island_flow;
+    if (enable_debug_outputs) {
+        const TimingMark timing = start_timing();
+        island_flow =
+            propagate_flow_across_island_links(graph, edge_flow, island_debug);
+        island_flow_passability =
+            render_graph_edge_values(graph, white_domain.size(),
+                                     island_flow.edge_passability, 255.0f);
+        island_propagated_edge_flow =
+            render_graph_edge_values(graph, white_domain.size(),
+                                     island_flow.propagated_edge_flow);
+        island_bonus_edge_flow =
+            render_graph_edge_values(graph, white_domain.size(),
+                                     island_flow.bonus_edge_flow);
+        std::cout << "Island flow propagation:\n"
+                  << "  linked_islands: " << island_flow.linked_islands << "\n"
+                  << "  transition_links: " << island_flow.transition_links
+                  << "\n"
+                  << "  boosted_edges: " << island_flow.boosted_edges << "\n";
+        timings.push_back(
+            finish_timing("island_flow_propagation", timing));
+    }
+
     cv::Mat tree_pixel_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_parent(white_domain.size(), CV_32SC2, cv::Scalar(-1, -1));
     cv::Mat source_edge_mask(white_domain.size(), CV_8U, cv::Scalar(0));
@@ -7029,6 +7309,10 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat nearest_graph_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_dense_flow_greedy_ascent(white_domain.size(), CV_32F,
                                           cv::Scalar(0));
+    cv::Mat island_tree_dense_flow_no_backtrack(white_domain.size(), CV_32F,
+                                                cv::Scalar(0));
+    cv::Mat island_tree_dense_flow_greedy_ascent(white_domain.size(), CV_32F,
+                                                 cv::Scalar(0));
     cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_path_debug(white_domain.size(), CV_32FC3,
                             cv::Scalar(0, 0, 0));
@@ -7482,6 +7766,94 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                   << dense_backtrack.unreached_white_pixels << "\n";
     }
 
+    if (enable_debug_outputs &&
+        island_flow.propagated_edge_flow.size() == graph.edges.size()) {
+        const TimingMark timing = start_timing();
+        std::vector<double> island_node_flow(
+            static_cast<std::size_t>(node_count), 0.0);
+        for (int node = 1; node < node_count; ++node) {
+            const double value = node_flow[static_cast<std::size_t>(node)];
+            if (std::isfinite(value) && value > 0.0) {
+                island_node_flow[static_cast<std::size_t>(node)] = value;
+            }
+        }
+        cv::Mat island_graph_pixel_flow(white_domain.size(), CV_32F,
+                                        cv::Scalar(0));
+        for (int edge_index = 0;
+             edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
+            const GraphEdge& edge = graph.edges[edge_index];
+            const float value = island_flow.propagated_edge_flow
+                [static_cast<std::size_t>(edge_index)];
+            if (!std::isfinite(value) || value <= 0.0f) {
+                continue;
+            }
+            if (edge.a > 0 && edge.a < node_count) {
+                double& node_value =
+                    island_node_flow[static_cast<std::size_t>(edge.a)];
+                node_value = std::max(node_value, static_cast<double>(value));
+            }
+            if (edge.b > 0 && edge.b < node_count) {
+                double& node_value =
+                    island_node_flow[static_cast<std::size_t>(edge.b)];
+                node_value = std::max(node_value, static_cast<double>(value));
+            }
+            for (const cv::Point pixel : edge.pixels) {
+                if (pixel.x < 0 || pixel.x >= island_graph_pixel_flow.cols ||
+                    pixel.y < 0 || pixel.y >= island_graph_pixel_flow.rows) {
+                    continue;
+                }
+                float& pixel_value =
+                    island_graph_pixel_flow.at<float>(pixel.y, pixel.x);
+                pixel_value = std::max(pixel_value, value);
+            }
+        }
+
+        cv::Mat island_graph_node_flow(white_domain.size(), CV_32F,
+                                       cv::Scalar(0));
+        for (int node = 1; node < node_count; ++node) {
+            const cv::Point anchor(cvRound(graph.nodes[node].x),
+                                   cvRound(graph.nodes[node].y));
+            if (anchor.x < 0 || anchor.x >= island_graph_node_flow.cols ||
+                anchor.y < 0 || anchor.y >= island_graph_node_flow.rows ||
+                white_domain.at<std::uint8_t>(anchor.y, anchor.x) == 0) {
+                continue;
+            }
+            const float value = static_cast<float>(std::min(
+                static_cast<double>(kDenseFlowInf),
+                std::max(0.0,
+                         island_node_flow[static_cast<std::size_t>(node)])));
+            if (value <= 0.0f) {
+                continue;
+            }
+            cv::circle(island_graph_node_flow, anchor, 2, cv::Scalar(value),
+                       cv::FILLED, cv::LINE_8);
+        }
+
+        const DenseBacktrackResult island_dense_backtrack =
+            compute_dense_backtrack_flow(white_domain, dt,
+                                         island_graph_pixel_flow,
+                                         island_graph_node_flow, graph,
+                                         island_node_flow,
+                                         island_flow.propagated_edge_flow,
+                                         source_seed_node, source_edges,
+                                         grid_step, backtrack_distance, false);
+        island_tree_dense_flow_no_backtrack =
+            bilinear_from_regular_grid_samples(
+                island_dense_backtrack.smooth_grid_flow, grid_step);
+        island_tree_dense_flow_greedy_ascent =
+            greedy_increasing_flow_ascent(
+                white_domain, island_tree_dense_flow_no_backtrack);
+        std::cout << "Island propagated dense flow:\n"
+                  << "  seeded_pixels: "
+                  << island_dense_backtrack.seeded_pixels << "\n"
+                  << "  reached_pixels: "
+                  << island_dense_backtrack.reached_pixels << "\n"
+                  << "  unreached_white_pixels: "
+                  << island_dense_backtrack.unreached_white_pixels << "\n";
+        timings.push_back(
+            finish_timing("island_propagated_dense_flow", timing));
+    }
+
     cv::Mat dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     if (kEnableLegacyDenseDtAscent) {
         const TimingMark timing = start_timing();
@@ -7834,6 +8206,11 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             edge_flow_px_gray_bg,
             graph_source_edges,
             island_obstacle_factor,
+            island_flow_passability,
+            island_propagated_edge_flow,
+            island_bonus_edge_flow,
+            island_tree_dense_flow_no_backtrack,
+            island_tree_dense_flow_greedy_ascent,
             cv::Mat(),
             source_seed_pixel,
             source_seed_capacity,
@@ -8159,6 +8536,103 @@ cv::Mat add_valid_frame_to_skeleton(const cv::Mat& skeleton, const cv::Mat& dt) 
     return out;
 }
 
+struct FlowGraphPipelineResult {
+    cv::Mat white_domain;
+    cv::Mat binary;
+    cv::Mat dt;
+    cv::Mat source_pixel_labels;
+    SourceRimSkeletonResult source_rim_result;
+    SkeletonGraph graph;
+    GraphConnectivityStats graph_stats;
+    std::string rim_error;
+    std::string graph_error;
+};
+
+FlowGraphPipelineResult build_flow_graph_pipeline(
+    const cv::Mat& input_white_domain,
+    const cv::Point source,
+    std::vector<StageTiming>& timings,
+    const std::string& timing_prefix = "") {
+    CV_Assert(input_white_domain.type() == CV_8U);
+
+    FlowGraphPipelineResult result;
+    result.white_domain = input_white_domain.clone();
+    cv::bitwise_not(result.white_domain, result.binary);
+
+    {
+        const TimingMark timing = start_timing();
+        cv::distanceTransform(result.white_domain, result.dt,
+                              result.source_pixel_labels, cv::DIST_L2,
+                              cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+        timings.push_back(
+            finish_timing(timing_prefix + "labeled_dt", timing));
+    }
+
+    cv::Mat rim_label_domain;
+    cv::Mat rim_dt;
+    cv::Mat rim_source_pixel_labels;
+    {
+        const TimingMark timing = start_timing();
+        rim_label_domain =
+            make_padded_expanded_rim_label_domain(result.white_domain, source);
+        cv::distanceTransform(rim_label_domain, rim_dt,
+                              rim_source_pixel_labels, cv::DIST_L2,
+                              cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+        timings.push_back(
+            finish_timing(timing_prefix + "rim_labeled_dt", timing));
+    }
+
+    std::vector<cv::Point> rim_source_points;
+    {
+        const TimingMark timing = start_timing();
+        rim_source_points =
+            label_source_points(rim_label_domain, rim_source_pixel_labels);
+        timings.push_back(
+            finish_timing(timing_prefix + "rim_label_source_points", timing));
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        result.source_rim_result = source_rim_skeleton(
+            rim_label_domain, rim_source_pixel_labels, rim_source_points);
+        result.source_rim_result = crop_padded_source_rim_result(
+            result.source_rim_result, result.white_domain.size());
+        timings.push_back(
+            finish_timing(timing_prefix + "source_rim_skeleton", timing));
+        timings.insert(timings.end(),
+                       result.source_rim_result.timings.begin(),
+                       result.source_rim_result.timings.end());
+        result.rim_error = result.source_rim_result.rim_connectivity_error;
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        result.source_rim_result.loops_connected =
+            add_valid_frame_to_skeleton(
+                result.source_rim_result.loops_connected, result.dt);
+        timings.push_back(
+            finish_timing(timing_prefix + "add_valid_frame", timing));
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        result.graph = extract_skeleton_graph(
+            result.source_rim_result.loops_connected, result.dt);
+        timings.push_back(
+            finish_timing(timing_prefix + "graph_extract", timing));
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        result.graph_stats = graph_connectivity_stats(result.graph);
+        result.graph_error = graph_connectivity_error(result.graph_stats);
+        timings.push_back(
+            finish_timing(timing_prefix + "graph_connectivity_stats", timing));
+    }
+
+    return result;
+}
+
 void write_image(const fs::path& path, const cv::Mat& image) {
     if (!cv::imwrite(path.string(), image)) {
         throw std::runtime_error("failed to write image: " + path.string());
@@ -8247,6 +8721,12 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                                         float* gate_basis_flow,
                                         float* graph_edge_flow_rgb,
                                         float* island_obstacle_factor_rgb,
+                                        float* island_removed_mask,
+                                        float* island_flow_passability_rgb,
+                                        float* island_propagated_edge_flow_rgb,
+                                        float* island_bonus_edge_flow_rgb,
+                                        float* island_tree_dense_no_backtrack,
+                                        float* island_tree_dense_greedy_ascent,
                                         int grid_step,
                                         float backtrack_distance,
                                         int* resolved_source_x,
@@ -8320,87 +8800,65 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         cv::Mat white_domain(binary.size(), CV_8U, cv::Scalar(255));
         white_domain.setTo(0, binary);
 
-        cv::Mat dt;
-        cv::Mat source_pixel_labels;
-        {
-            const TimingMark timing = start_timing();
-            cv::distanceTransform(white_domain, dt, source_pixel_labels,
-                                  cv::DIST_L2, cv::DIST_MASK_5,
-                                  cv::DIST_LABEL_PIXEL);
-            timings.push_back(finish_timing("labeled_dt", timing));
-        }
-
-        cv::Mat rim_label_domain;
-        cv::Mat rim_dt;
-        cv::Mat rim_source_pixel_labels;
-        {
-            const TimingMark timing = start_timing();
-            rim_label_domain =
-                make_padded_expanded_rim_label_domain(white_domain, source);
-            cv::distanceTransform(rim_label_domain, rim_dt,
-                                  rim_source_pixel_labels, cv::DIST_L2,
-                                  cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
-            timings.push_back(finish_timing("rim_labeled_dt", timing));
-        }
-
-        std::vector<cv::Point> rim_source_points;
-        {
-            const TimingMark timing = start_timing();
-            rim_source_points =
-                label_source_points(rim_label_domain, rim_source_pixel_labels);
-            timings.push_back(finish_timing("rim_label_source_points", timing));
-        }
-
-        SourceRimSkeletonResult source_rim_result;
-        {
-            const TimingMark timing = start_timing();
-            source_rim_result = source_rim_skeleton(
-                rim_label_domain, rim_source_pixel_labels, rim_source_points);
-            source_rim_result = crop_padded_source_rim_result(
-                source_rim_result, white_domain.size());
-            timings.push_back(finish_timing("source_rim_skeleton", timing));
-            timings.insert(timings.end(),
-                           source_rim_result.timings.begin(),
-                           source_rim_result.timings.end());
-        }
-        if (!source_rim_result.rim_connectivity_error.empty()) {
-            throw std::runtime_error(
-                source_rim_result.rim_connectivity_error);
-        }
-
-        {
-            const TimingMark timing = start_timing();
-            source_rim_result.loops_connected =
-                add_valid_frame_to_skeleton(
-                    source_rim_result.loops_connected, dt);
-            timings.push_back(finish_timing("add_valid_frame", timing));
-        }
-
-        SkeletonGraph graph;
-        {
-            const TimingMark timing = start_timing();
-            graph = extract_skeleton_graph(
-                source_rim_result.loops_connected, dt);
-            timings.push_back(finish_timing("graph_extract", timing));
-        }
-
-        {
-            const TimingMark timing = start_timing();
-            const GraphConnectivityStats graph_stats =
-                graph_connectivity_stats(graph);
-            const std::string graph_error =
-                graph_connectivity_error(graph_stats);
-            if (!graph_error.empty()) {
-                throw std::runtime_error(graph_error);
-            }
-            timings.push_back(
-                finish_timing("graph_connectivity_stats", timing));
-        }
-
         const bool enable_debug_outputs =
             smooth_grid_flow != nullptr || gate_basis_flow != nullptr ||
             graph_edge_flow_rgb != nullptr ||
-            island_obstacle_factor_rgb != nullptr;
+            island_obstacle_factor_rgb != nullptr ||
+            island_removed_mask != nullptr ||
+            island_flow_passability_rgb != nullptr ||
+            island_propagated_edge_flow_rgb != nullptr ||
+            island_bonus_edge_flow_rgb != nullptr ||
+            island_tree_dense_no_backtrack != nullptr ||
+            island_tree_dense_greedy_ascent != nullptr;
+
+        FlowGraphPipelineResult pipeline =
+            build_flow_graph_pipeline(white_domain, source, timings);
+        if (!pipeline.rim_error.empty()) {
+            throw std::runtime_error(pipeline.rim_error);
+        }
+
+        IslandRemovalResult island_removal;
+        {
+            const TimingMark timing = start_timing();
+            const GraphEdgeMaps edge_maps =
+                build_graph_edge_maps(pipeline.graph,
+                                      pipeline.white_domain.size());
+            const IslandObstacleDebugResult island_debug =
+                render_island_obstacle_factors(
+                    pipeline.white_domain, pipeline.graph,
+                    edge_maps.edge_index);
+            island_removal =
+                remove_high_score_islands(pipeline.white_domain, island_debug);
+            std::cout << "Island removal filter:\n"
+                      << "  threshold: " << kIslandRemovalScoreThreshold
+                      << "\n"
+                      << "  scored_islands: "
+                      << island_debug.scored_islands.size() << "\n"
+                      << "  removed_islands: "
+                      << island_removal.removed_islands << "\n"
+                      << "  removed_pixels: "
+                      << island_removal.removed_pixels << "\n";
+            timings.push_back(finish_timing("island_removal_filter", timing));
+        }
+
+        if (island_removal.removed_pixels > 0) {
+            pipeline = build_flow_graph_pipeline(
+                island_removal.white_domain, source, timings, "filtered_");
+            if (!pipeline.rim_error.empty()) {
+                throw std::runtime_error(pipeline.rim_error);
+            }
+        }
+        if (!pipeline.graph_error.empty()) {
+            throw std::runtime_error(pipeline.graph_error);
+        }
+
+        white_domain = pipeline.white_domain;
+        binary = pipeline.binary;
+        cv::Mat& dt = pipeline.dt;
+        SourceRimSkeletonResult& source_rim_result =
+            pipeline.source_rim_result;
+        SkeletonGraph& graph = pipeline.graph;
+
         DenseFlowResult dense_flow_result =
             compute_dense_source_flow(
                 white_domain, dt, graph,
@@ -8481,6 +8939,56 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                 }
             }
         }
+        if (island_removed_mask != nullptr) {
+            cv::Mat removed_float;
+            island_removal.removed_mask.convertTo(removed_float, CV_32F);
+            for (int y = 0; y < height; ++y) {
+                const float* src_row = removed_float.ptr<float>(y);
+                std::copy(src_row, src_row + width,
+                          island_removed_mask +
+                              static_cast<std::size_t>(y) * width);
+            }
+        }
+        const auto copy_bgr_float_image = [&](const cv::Mat& bgr_image,
+                                              float* dst) {
+            if (dst == nullptr) {
+                return;
+            }
+            cv::Mat rgb_image;
+            cv::cvtColor(bgr_image, rgb_image, cv::COLOR_BGR2RGB);
+            rgb_image.convertTo(rgb_image, CV_32FC3);
+            for (int y = 0; y < height; ++y) {
+                const cv::Vec3f* src_row = rgb_image.ptr<cv::Vec3f>(y);
+                float* dst_row =
+                    dst + static_cast<std::size_t>(y) * width * 3;
+                for (int x = 0; x < width; ++x) {
+                    dst_row[3 * x + 0] = src_row[x][0];
+                    dst_row[3 * x + 1] = src_row[x][1];
+                    dst_row[3 * x + 2] = src_row[x][2];
+                }
+            }
+        };
+        copy_bgr_float_image(dense_flow_result.island_flow_passability,
+                             island_flow_passability_rgb);
+        copy_bgr_float_image(dense_flow_result.island_propagated_edge_flow,
+                             island_propagated_edge_flow_rgb);
+        copy_bgr_float_image(dense_flow_result.island_bonus_edge_flow,
+                             island_bonus_edge_flow_rgb);
+        const auto copy_float_image = [&](const cv::Mat& image, float* dst) {
+            if (dst == nullptr) {
+                return;
+            }
+            CV_Assert(image.type() == CV_32F);
+            for (int y = 0; y < height; ++y) {
+                const float* src_row = image.ptr<float>(y);
+                std::copy(src_row, src_row + width,
+                          dst + static_cast<std::size_t>(y) * width);
+            }
+        };
+        copy_float_image(dense_flow_result.island_tree_dense_flow_no_backtrack,
+                         island_tree_dense_no_backtrack);
+        copy_float_image(dense_flow_result.island_tree_dense_flow_greedy_ascent,
+                         island_tree_dense_greedy_ascent);
 
         const auto sample_flow = [&](const float x, const float y) {
             if (x < 0.0f || y < 0.0f || x > static_cast<float>(width - 1) ||
@@ -8557,6 +9065,7 @@ int main(int argc, char** argv) {
         cv::Mat graph_capacity_gray_bg;
         cv::Mat graph_capacity_normalized;
         cv::Mat graph_capacity_normalized_layer;
+        cv::Mat island_removed_mask;
         DenseFlowResult dense_flow_result;
         bool has_dense_flow = false;
         std::string rim_error;
@@ -8648,6 +9157,47 @@ int main(int argc, char** argv) {
                     finish_timing("graph_connectivity_stats", timing));
             }
 
+            island_removed_mask =
+                cv::Mat::zeros(white_domain.size(), CV_8U);
+            if (args.has_source && rim_error.empty()) {
+                const TimingMark timing = start_timing();
+                const GraphEdgeMaps edge_maps =
+                    build_graph_edge_maps(graph, white_domain.size());
+                const IslandObstacleDebugResult island_debug =
+                    render_island_obstacle_factors(
+                        white_domain, graph, edge_maps.edge_index);
+                const IslandRemovalResult island_removal =
+                    remove_high_score_islands(white_domain, island_debug);
+                island_removed_mask = island_removal.removed_mask;
+                std::cout << "Island removal filter:\n"
+                          << "  threshold: "
+                          << kIslandRemovalScoreThreshold << "\n"
+                          << "  scored_islands: "
+                          << island_debug.scored_islands.size() << "\n"
+                          << "  removed_islands: "
+                          << island_removal.removed_islands << "\n"
+                          << "  removed_pixels: "
+                          << island_removal.removed_pixels << "\n";
+                timings.push_back(
+                    finish_timing("island_removal_filter", timing));
+
+                if (island_removal.removed_pixels > 0) {
+                    FlowGraphPipelineResult filtered =
+                        build_flow_graph_pipeline(
+                            island_removal.white_domain,
+                            args.source, timings, "filtered_");
+                    white_domain = filtered.white_domain;
+                    binary = filtered.binary;
+                    dt = filtered.dt;
+                    source_pixel_labels = filtered.source_pixel_labels;
+                    source_rim_result = filtered.source_rim_result;
+                    graph = filtered.graph;
+                    graph_stats = filtered.graph_stats;
+                    rim_error = filtered.rim_error;
+                    graph_error = filtered.graph_error;
+                }
+            }
+
             {
                 const TimingMark timing = start_timing();
                 graph_random_colors =
@@ -8724,6 +9274,8 @@ int main(int argc, char** argv) {
             const TimingMark timing = start_timing();
             write_image(workdir / (stem + "_binary.tif"), binary);
             write_image(workdir / (stem + "_dt.tif"), dt);
+            write_image(workdir / (stem + "_island_removed_mask.tif"),
+                        island_removed_mask);
             write_image(workdir / (stem + "_source_rim_ridges.tif"),
                         source_rim_result.source_rim_ridges);
             write_image(workdir / (stem + "_source_rim_distance.tif"),
@@ -8802,6 +9354,23 @@ int main(int argc, char** argv) {
                         dense_flow_result.graph_source_edges);
             write_image(workdir / (stem + "_island_obstacle_factor.tif"),
                         dense_flow_result.island_obstacle_factor);
+            write_image(workdir / (stem + "_island_flow_passability.tif"),
+                        dense_flow_result.island_flow_passability);
+            write_image(workdir /
+                            (stem + "_island_propagated_edge_flow.tif"),
+                        dense_flow_result.island_propagated_edge_flow);
+            write_image(workdir / (stem + "_island_bonus_edge_flow.tif"),
+                        dense_flow_result.island_bonus_edge_flow);
+            write_image(workdir /
+                            (stem +
+                             "_island_tree_dense_flow_no_backtrack.tif"),
+                        dense_flow_result
+                            .island_tree_dense_flow_no_backtrack);
+            write_image(workdir /
+                            (stem +
+                             "_island_tree_dense_flow_greedy_ascent.tif"),
+                        dense_flow_result
+                            .island_tree_dense_flow_greedy_ascent);
             write_image(workdir / (stem + "_flow_gate_weight.tif"),
                         dense_flow_result.flow_gate_weight);
             timings.push_back(finish_timing("dense_flow_write", timing));
@@ -8810,6 +9379,7 @@ int main(int argc, char** argv) {
         std::vector<NamedLayer> layered_tiff = {
             {"binary_threshold", to_float_layer(binary)},
             {"dt", to_float_layer(dt)},
+            {"island_removed_mask", to_float_layer(island_removed_mask)},
             {"loops_connected",
              to_float_layer(source_rim_result.loops_connected)},
             {"source_rim_ridges",
@@ -8893,6 +9463,26 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"island_obstacle_factor",
                  to_float_layer(dense_flow_result.island_obstacle_factor)});
+            layered_tiff.push_back(
+                {"island_flow_passability",
+                 to_float_layer(dense_flow_result.island_flow_passability)});
+            layered_tiff.push_back(
+                {"island_propagated_edge_flow",
+                 to_float_layer(
+                     dense_flow_result.island_propagated_edge_flow)});
+            layered_tiff.push_back(
+                {"island_bonus_edge_flow",
+                 to_float_layer(dense_flow_result.island_bonus_edge_flow)});
+            layered_tiff.push_back(
+                {"island_tree_dense_flow_no_backtrack",
+                 to_float_layer(
+                     dense_flow_result
+                         .island_tree_dense_flow_no_backtrack)});
+            layered_tiff.push_back(
+                {"island_tree_dense_flow_greedy_ascent",
+                 to_float_layer(
+                     dense_flow_result
+                         .island_tree_dense_flow_greedy_ascent)});
             layered_tiff.push_back(
                 {"flow_gate_weight",
                  to_float_layer(dense_flow_result.flow_gate_weight)});

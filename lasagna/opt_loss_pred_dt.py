@@ -921,6 +921,12 @@ def _write_flow_gate_debug(
 	gate_basis_hr: np.ndarray | None,
 	graph_edge_flow_rgb: np.ndarray | None,
 	island_obstacle_factor_rgb: np.ndarray | None,
+	island_removed_mask_hr: np.ndarray | None,
+	island_flow_passability_rgb: np.ndarray | None,
+	island_propagated_edge_flow_rgb: np.ndarray | None,
+	island_bonus_edge_flow_rgb: np.ndarray | None,
+	island_tree_dense_no_backtrack_hr: np.ndarray | None,
+	island_tree_dense_greedy_ascent_hr: np.ndarray | None,
 	weight_hr: np.ndarray | None,
 	out_dir: Path | None,
 	pull_weight_hr: np.ndarray | None = None,
@@ -958,6 +964,36 @@ def _write_flow_gate_debug(
 		if island_obstacle_factor_rgb is None
 		else np.asarray(island_obstacle_factor_rgb, dtype=np.float32)
 	)
+	island_removed = (
+		None
+		if island_removed_mask_hr is None
+		else np.asarray(island_removed_mask_hr, dtype=np.float32)
+	)
+	island_passability = (
+		None
+		if island_flow_passability_rgb is None
+		else np.asarray(island_flow_passability_rgb, dtype=np.float32)
+	)
+	island_propagated = (
+		None
+		if island_propagated_edge_flow_rgb is None
+		else np.asarray(island_propagated_edge_flow_rgb, dtype=np.float32)
+	)
+	island_bonus = (
+		None
+		if island_bonus_edge_flow_rgb is None
+		else np.asarray(island_bonus_edge_flow_rgb, dtype=np.float32)
+	)
+	island_dense_no_backtrack = (
+		None
+		if island_tree_dense_no_backtrack_hr is None
+		else np.asarray(island_tree_dense_no_backtrack_hr, dtype=np.float32)
+	)
+	island_dense_greedy = (
+		None
+		if island_tree_dense_greedy_ascent_hr is None
+		else np.asarray(island_tree_dense_greedy_ascent_hr, dtype=np.float32)
+	)
 	weights = (
 		np.zeros_like(pred_raw_u8, dtype=np.float32)
 		if weight_hr is None
@@ -994,6 +1030,26 @@ def _write_flow_gate_debug(
 				write_named_layer(tw, graph_flow, name="graph_edge_flow")
 			if island_obstacle is not None:
 				write_named_layer(tw, island_obstacle, name="island_obstacle_factor")
+			if island_removed is not None:
+				write_named_layer(tw, island_removed, name="island_removed_mask")
+			if island_passability is not None:
+				write_named_layer(tw, island_passability, name="island_flow_passability")
+			if island_propagated is not None:
+				write_named_layer(tw, island_propagated, name="island_propagated_edge_flow")
+			if island_bonus is not None:
+				write_named_layer(tw, island_bonus, name="island_bonus_edge_flow")
+			if island_dense_no_backtrack is not None:
+				write_named_layer(
+					tw,
+					island_dense_no_backtrack,
+					name="island_tree_dense_flow_no_backtrack",
+				)
+			if island_dense_greedy is not None:
+				write_named_layer(
+					tw,
+					island_dense_greedy,
+					name="island_tree_dense_flow_greedy_ascent",
+				)
 			write_named_layer(tw, weights, name="flow_gate_weight")
 			if pull_weight is not None:
 				write_named_layer(tw, pull_weight, name="anticipatory_pull_weight")
@@ -1019,6 +1075,36 @@ def _write_flow_gate_debug(
 				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_obstacle_factor.tif"),
 				island_obstacle,
 			)
+		if island_removed is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_removed_mask.tif"),
+				island_removed,
+			)
+		if island_passability is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_flow_passability.tif"),
+				island_passability,
+			)
+		if island_propagated is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_propagated_edge_flow.tif"),
+				island_propagated,
+			)
+		if island_bonus is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_bonus_edge_flow.tif"),
+				island_bonus,
+			)
+		if island_dense_no_backtrack is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_no_backtrack.tif"),
+				island_dense_no_backtrack,
+			)
+		if island_dense_greedy is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_greedy_ascent.tif"),
+				island_dense_greedy,
+			)
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_weight.tif"), weights)
 		if pull_weight is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_weight.tif"), pull_weight)
@@ -1035,44 +1121,40 @@ def _write_flow_gate_weight_jpg(
 	stage_name: str,
 	debug_index: int,
 	pred_u8: np.ndarray,
-	used_weight_hr: np.ndarray,
-	gate_basis_hr: np.ndarray | None,
-	smooth_grid_flow: np.ndarray | None,
+	gate_weight_hr: np.ndarray,
+	greedy_direct_flow_hr: np.ndarray | None,
 	out_dir: Path | None,
 ) -> None:
 	global _flow_gate_jpg_warned
 	if out_dir is None:
 		return
 	pred = np.asarray(pred_u8)
-	weight = np.asarray(used_weight_hr, dtype=np.float32)
-	if pred.ndim != 2 or weight.ndim != 2:
+	gate_weight = np.asarray(gate_weight_hr, dtype=np.float32)
+	if pred.ndim != 2 or gate_weight.ndim != 2:
 		return
-	if pred.shape != weight.shape:
+	if pred.shape != gate_weight.shape:
 		return
-	gate_basis_vis = _normalize_positive_debug_image(gate_basis_hr)
-	if gate_basis_vis is None or gate_basis_vis.shape != pred.shape:
-		gate_basis_vis = weight.clip(0.0, 1.0)
-	no_backtrack_vis = _normalize_positive_debug_image(smooth_grid_flow)
-	if no_backtrack_vis is None or no_backtrack_vis.shape != pred.shape:
-		no_backtrack_vis = np.zeros_like(weight, dtype=np.float32)
+	gate_vis = gate_weight.clip(0.0, 1.0)
+	greedy_direct_vis = _normalize_positive_debug_image(greedy_direct_flow_hr)
+	if greedy_direct_vis is None or greedy_direct_vis.shape != pred.shape:
+		greedy_direct_vis = np.zeros_like(gate_weight, dtype=np.float32)
 	pred_vis = ((pred.astype(np.float32) - 80.0) / (127.0 - 80.0)).clip(0.0, 1.0)
 	img = np.concatenate([
 		(pred_vis * 255.0 + 0.5).astype(np.uint8),
-		(gate_basis_vis * 255.0 + 0.5).astype(np.uint8),
-		(no_backtrack_vis * 255.0 + 0.5).astype(np.uint8),
+		(gate_vis * 255.0 + 0.5).astype(np.uint8),
+		(greedy_direct_vis * 255.0 + 0.5).astype(np.uint8),
 	], axis=1)
 	jpg_dir = out_dir / "pred_dt_flow_gate_weight_jpg"
 	try:
 		jpg_dir.mkdir(parents=True, exist_ok=True)
-		for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
-			path = jpg_dir / f"{suffix}_pred_dt_gate_basis_no_backtrack.jpg"
-			try:
-				import cv2
-				if not cv2.imwrite(str(path), img):
-					raise RuntimeError("cv2.imwrite returned false")
-			except Exception:
-				from PIL import Image
-				Image.fromarray(img, mode="L").save(str(path), quality=95)
+		path = jpg_dir / f"vis_{debug_index:06d}.jpg"
+		try:
+			import cv2
+			if not cv2.imwrite(str(path), img):
+				raise RuntimeError("cv2.imwrite returned false")
+		except Exception:
+			from PIL import Image
+			Image.fromarray(img, mode="L").save(str(path), quality=95)
 	except Exception as exc:
 		if not _flow_gate_jpg_warned:
 			print(f"[pred_dt_flow_gate] jpg weight write skipped: {exc}", flush=True)
@@ -1203,6 +1285,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				gate_basis_hr=None,
 				graph_edge_flow_rgb=None,
 				island_obstacle_factor_rgb=None,
+				island_removed_mask_hr=None,
+				island_flow_passability_rgb=None,
+				island_propagated_edge_flow_rgb=None,
+				island_bonus_edge_flow_rgb=None,
+				island_tree_dense_no_backtrack_hr=None,
+				island_tree_dense_greedy_ascent_hr=None,
 				weight_hr=None,
 				out_dir=_flow_gate_out_dir,
 			)
@@ -1241,6 +1329,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					gate_basis_flow,
 					graph_edge_flow_rgb,
 					island_obstacle_factor_rgb,
+					island_removed_mask_hr,
+					island_flow_passability_rgb,
+					island_propagated_edge_flow_rgb,
+					island_bonus_edge_flow_rgb,
+					island_tree_dense_no_backtrack_hr,
+					island_tree_dense_greedy_ascent_hr,
 					flow_metadata,
 				) = flow_outputs
 			else:
@@ -1249,6 +1343,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				gate_basis_flow = None
 				graph_edge_flow_rgb = None
 				island_obstacle_factor_rgb = None
+				island_removed_mask_hr = None
+				island_flow_passability_rgb = None
+				island_propagated_edge_flow_rgb = None
+				island_bonus_edge_flow_rgb = None
+				island_tree_dense_no_backtrack_hr = None
+				island_tree_dense_greedy_ascent_hr = None
 		except RuntimeError as exc:
 			message = str(exc)
 			source_value = int(pred_img[source_y, source_x]) if 0 <= source_y < He and 0 <= source_x < We else -1
@@ -1259,7 +1359,6 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					weight = gate_factor * gate_weight + (1.0 - gate_factor)
 				valid = res.mask_lr > 0.0
 				valid_count = max(1.0, float(valid.sum().detach().cpu()))
-				used_weight = weight * res.mask_lr
 				_flow_gate_last_stats = {
 					"pred_dt_gate_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_gate_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
@@ -1293,12 +1392,18 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						gate_basis_hr=None,
 						graph_edge_flow_rgb=None,
 						island_obstacle_factor_rgb=None,
+						island_removed_mask_hr=None,
+						island_flow_passability_rgb=None,
+						island_propagated_edge_flow_rgb=None,
+						island_bonus_edge_flow_rgb=None,
+						island_tree_dense_no_backtrack_hr=None,
+						island_tree_dense_greedy_ascent_hr=None,
 						weight_hr=weight_hr,
 						out_dir=_flow_gate_out_dir,
 					)
 				if write_jpg_debug:
-					used_weight_hr = F.interpolate(
-						used_weight,
+					gate_weight_hr = F.interpolate(
+						gate_weight,
 						size=(He, We),
 						mode="nearest",
 					)[0, 0].detach().cpu().numpy().astype(np.float32)
@@ -1306,9 +1411,8 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						stage_name=_flow_gate_stage,
 						debug_index=debug_index,
 						pred_u8=pred_img,
-						used_weight_hr=used_weight_hr,
-						gate_basis_hr=None,
-						smooth_grid_flow=None,
+						gate_weight_hr=gate_weight_hr,
+						greedy_direct_flow_hr=None,
 						out_dir=_flow_gate_out_dir,
 					)
 				publish_timing()
@@ -1326,7 +1430,6 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			weight = gate_factor * gate_weight + (1.0 - gate_factor)
 		valid = res.mask_lr > 0.0
 		valid_count = max(1.0, float(valid.sum().detach().cpu()))
-		used_weight = weight * res.mask_lr
 		_flow_gate_last_stats = {
 			"pred_dt_gate_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
 			"pred_dt_gate_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
@@ -1406,6 +1509,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				gate_basis_hr=gate_basis_hr,
 				graph_edge_flow_rgb=graph_edge_flow_rgb,
 				island_obstacle_factor_rgb=island_obstacle_factor_rgb,
+				island_removed_mask_hr=island_removed_mask_hr,
+				island_flow_passability_rgb=island_flow_passability_rgb,
+				island_propagated_edge_flow_rgb=island_propagated_edge_flow_rgb,
+				island_bonus_edge_flow_rgb=island_bonus_edge_flow_rgb,
+				island_tree_dense_no_backtrack_hr=island_tree_dense_no_backtrack_hr,
+				island_tree_dense_greedy_ascent_hr=island_tree_dense_greedy_ascent_hr,
 				weight_hr=weight_hr,
 				pull_weight_hr=pull_weight_hr,
 				pull_prefix_hr=pull_prefix_hr,
@@ -1427,18 +1536,19 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			done("write_layer_debug", _t)
 		if write_jpg_debug:
 			_t = mark("write_weight_jpg")
-			used_weight_hr = F.interpolate(
-				used_weight,
-				size=(He, We),
-				mode="nearest",
-			)[0, 0].detach().cpu().numpy().astype(np.float32)
+			gate_weight_hr = np.asarray(dense_flow, dtype=np.float32)
+			if gate_weight_hr.shape != pred_img.shape:
+				gate_weight_hr = F.interpolate(
+					gate_weight,
+					size=(He, We),
+					mode="nearest",
+				)[0, 0].detach().cpu().numpy().astype(np.float32)
 			_write_flow_gate_weight_jpg(
 				stage_name=_flow_gate_stage,
 				debug_index=debug_index,
 				pred_u8=pred_img,
-				used_weight_hr=used_weight_hr,
-				gate_basis_hr=gate_basis_hr,
-				smooth_grid_flow=smooth_grid_flow,
+				gate_weight_hr=gate_weight_hr,
+				greedy_direct_flow_hr=gate_basis_hr,
 				out_dir=_flow_gate_out_dir,
 			)
 			done("write_weight_jpg", _t)

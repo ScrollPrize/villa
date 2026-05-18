@@ -125,6 +125,12 @@ def _load_library_from_path(path: Path) -> ctypes.CDLL:
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.POINTER(ctypes.c_float),
 		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
 		ctypes.c_int,
 		ctypes.c_float,
 		ctypes.POINTER(ctypes.c_int),
@@ -185,7 +191,9 @@ def compute_flow_grid(
 	query_xy: (N, 2) float32 image coordinates, x then y.
 	Returns (query_weight, dense_weight), both float32 gate weights in [0, 1].
 	When return_debug is true, also returns smooth grid flow, greedy-ascent gate
-	basis flow, graph edge flow, and island obstacle-factor labels.
+	basis flow, graph edge flow, island obstacle-factor labels, the island
+	removal mask, island-flow propagation debug images, and island-propagated
+	dense-flow visualizations.
 	"""
 	if image_u8.ndim != 2:
 		raise ValueError(f"image_u8 must be 2D, got shape {image_u8.shape}")
@@ -204,6 +212,24 @@ def compute_flow_grid(
 	graph_edge_flow = np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
 	island_obstacle_factor = (
 		np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
+	)
+	island_removed_mask = (
+		np.zeros((height, width), dtype=np.float32) if return_debug else None
+	)
+	island_flow_passability = (
+		np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
+	)
+	island_propagated_edge_flow = (
+		np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
+	)
+	island_bonus_edge_flow = (
+		np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
+	)
+	island_tree_dense_no_backtrack = (
+		np.zeros((height, width), dtype=np.float32) if return_debug else None
+	)
+	island_tree_dense_greedy_ascent = (
+		np.zeros((height, width), dtype=np.float32) if return_debug else None
 	)
 	resolved_source_x = ctypes.c_int(-1)
 	resolved_source_y = ctypes.c_int(-1)
@@ -240,6 +266,36 @@ def compute_flow_grid(
 			if island_obstacle_factor is not None
 			else None
 		),
+		(
+			island_removed_mask.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if island_removed_mask is not None
+			else None
+		),
+		(
+			island_flow_passability.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if island_flow_passability is not None
+			else None
+		),
+		(
+			island_propagated_edge_flow.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if island_propagated_edge_flow is not None
+			else None
+		),
+		(
+			island_bonus_edge_flow.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if island_bonus_edge_flow is not None
+			else None
+		),
+		(
+			island_tree_dense_no_backtrack.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if island_tree_dense_no_backtrack is not None
+			else None
+		),
+		(
+			island_tree_dense_greedy_ascent.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if island_tree_dense_greedy_ascent is not None
+			else None
+		),
 		int(max(1, grid_step)),
 		ctypes.c_float(max(0.0, float(backtrack_distance))),
 		ctypes.byref(resolved_source_x),
@@ -265,6 +321,12 @@ def compute_flow_grid(
 			gate_basis_flow,
 			graph_edge_flow,
 			island_obstacle_factor,
+			island_removed_mask,
+			island_flow_passability,
+			island_propagated_edge_flow,
+			island_bonus_edge_flow,
+			island_tree_dense_no_backtrack,
+			island_tree_dense_greedy_ascent,
 		)
 	else:
 		result = (query_flow, dense_flow)
