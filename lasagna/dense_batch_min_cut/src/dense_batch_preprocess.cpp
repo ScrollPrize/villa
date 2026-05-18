@@ -4798,6 +4798,100 @@ cv::Mat greedy_increasing_flow_ascent(const cv::Mat& white_domain,
     return out;
 }
 
+cv::Mat greedy_increasing_flow_source_reach_mask(
+        const cv::Mat& white_domain,
+        const cv::Mat& source_flow,
+        const cv::Mat& source_mask) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(source_flow.type() == CV_32F);
+    CV_Assert(source_mask.type() == CV_8U);
+    CV_Assert(white_domain.size() == source_flow.size());
+    CV_Assert(white_domain.size() == source_mask.size());
+
+    cv::Mat out(white_domain.size(), CV_8U, cv::Scalar(0));
+    cv::Mat cached(white_domain.size(), CV_32S, cv::Scalar(-1));
+    constexpr float kFlowEpsilon = 1.0e-4f;
+    const std::array<cv::Point, 8> kDirs = {
+        cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
+        cv::Point(-1, 0),                    cv::Point(1, 0),
+        cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
+
+    const auto in_white_domain = [&](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < white_domain.cols && pixel.y >= 0 &&
+               pixel.y < white_domain.rows &&
+               white_domain.at<std::uint8_t>(pixel.y, pixel.x) != 0;
+    };
+
+    std::vector<cv::Point> path;
+    path.reserve(256);
+    for (int y = 0; y < white_domain.rows; ++y) {
+        for (int x = 0; x < white_domain.cols; ++x) {
+            const cv::Point start(x, y);
+            if (!in_white_domain(start)) {
+                continue;
+            }
+            const int cached_value = cached.at<int>(y, x);
+            if (cached_value >= 0) {
+                out.at<std::uint8_t>(y, x) =
+                    cached_value != 0 ? 255 : 0;
+                continue;
+            }
+
+            path.clear();
+            cv::Point current = start;
+            bool reaches_source = false;
+            while (in_white_domain(current)) {
+                if (source_mask.at<std::uint8_t>(current.y, current.x) != 0) {
+                    reaches_source = true;
+                    break;
+                }
+                const int cached_current =
+                    cached.at<int>(current.y, current.x);
+                if (cached_current >= 0) {
+                    reaches_source = cached_current != 0;
+                    break;
+                }
+                path.push_back(current);
+
+                const float current_flow =
+                    source_flow.at<float>(current.y, current.x);
+                cv::Point next(-1, -1);
+                float best_flow = current_flow;
+                for (const cv::Point dir : kDirs) {
+                    const cv::Point neighbor = current + dir;
+                    if (!in_white_domain(neighbor)) {
+                        continue;
+                    }
+                    const float neighbor_flow =
+                        source_flow.at<float>(neighbor.y, neighbor.x);
+                    if (neighbor_flow <= best_flow + kFlowEpsilon) {
+                        continue;
+                    }
+                    best_flow = neighbor_flow;
+                    next = neighbor;
+                }
+                if (next.x < 0) {
+                    break;
+                }
+                current = next;
+            }
+
+            const int value = reaches_source ? 1 : 0;
+            for (const cv::Point pixel : path) {
+                cached.at<int>(pixel.y, pixel.x) = value;
+                if (reaches_source) {
+                    out.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+                }
+            }
+            if (reaches_source && in_white_domain(current)) {
+                cached.at<int>(current.y, current.x) = 1;
+                out.at<std::uint8_t>(current.y, current.x) = 255;
+            }
+        }
+    }
+    return out;
+}
+
 struct DinicEdge {
     int to = 0;
     int rev = 0;
@@ -4905,6 +4999,8 @@ struct DenseFlowResult {
     cv::Mat island_tree_dense_flow_no_backtrack;
     cv::Mat island_tree_dense_flow_greedy_ascent;
     cv::Mat flow_gate_regions;
+    cv::Mat flow_gate_component_regions;
+    cv::Mat source_reach_mask;
     cv::Mat flow_gate_weight;
     cv::Point source_seed_pixel{-1, -1};
     float source_seed_capacity = 0.0f;
@@ -5143,7 +5239,8 @@ FlowGateRegionBuildResult build_flow_gate_region_labels(
         const cv::Mat& white_domain,
         const cv::Mat& dt,
         const SkeletonGraph& graph,
-        const std::vector<SourceEdgeStart>& source_starts);
+        const std::vector<SourceEdgeStart>& source_starts,
+        bool merge_sources = true);
 
 DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                                                   const cv::Mat& dt,
@@ -7562,6 +7659,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat nearest_graph_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_dense_flow_greedy_ascent(white_domain.size(), CV_32F,
                                           cv::Scalar(0));
+    cv::Mat source_reach_mask(white_domain.size(), CV_8U, cv::Scalar(0));
     cv::Mat island_tree_dense_flow_no_backtrack(white_domain.size(), CV_32F,
                                                 cv::Scalar(0));
     cv::Mat island_tree_dense_flow_greedy_ascent(white_domain.size(), CV_32F,
@@ -8004,6 +8102,16 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             timings.push_back(finish_timing(
                 "tree_dense_flow_greedy_ascent", timing));
         }
+        {
+            const TimingMark timing = start_timing();
+            source_reach_mask = greedy_increasing_flow_source_reach_mask(
+                white_domain, tree_dense_flow_no_backtrack, source_edge_mask);
+            std::cout << "Source reach mask:\n"
+                      << "  pixels: "
+                      << cv::countNonZero(source_reach_mask) << "\n";
+            timings.push_back(
+                finish_timing("source_reach_mask", timing));
+        }
         tree_dense_flow =
             bilinear_from_regular_grid_samples(dense_backtrack.flow, grid_step);
         tree_path_debug = dense_backtrack.debug_paths;
@@ -8020,11 +8128,32 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
 
     cv::Mat flow_gate_regions;
+    cv::Mat flow_gate_component_regions;
+    FlowGateRegionBuildResult component_regions;
+    {
+        const TimingMark timing = start_timing();
+        component_regions = build_flow_gate_region_labels(
+            white_domain, dt, graph, source_starts, false);
+        flow_gate_component_regions = component_regions.labels;
+        std::cout << "Flow gate component regions:\n"
+                  << "  regions: " << component_regions.region_count
+                  << "\n"
+                  << "  source_groups: " << component_regions.source_groups
+                  << "\n"
+                  << "  graph_seed_pixels: "
+                  << component_regions.graph_seed_pixels << "\n"
+                  << "  unlabeled_white_pixels: "
+                  << component_regions.unlabeled_white_pixels << "\n";
+        timings.push_back(
+            finish_timing("flow_gate_component_region_labels", timing));
+    }
     {
         const TimingMark timing = start_timing();
         const FlowGateRegionBuildResult regions =
-            build_flow_gate_region_labels(white_domain, dt, graph,
-                                          source_starts);
+            source_starts.size() <= 1
+                ? component_regions
+                : build_flow_gate_region_labels(white_domain, dt, graph,
+                                                source_starts, true);
         flow_gate_regions = regions.labels;
         std::cout << "Flow gate normalization regions:\n"
                   << "  regions: " << regions.region_count << "\n"
@@ -8485,6 +8614,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             island_tree_dense_flow_no_backtrack,
             island_tree_dense_flow_greedy_ascent,
             flow_gate_regions,
+            flow_gate_component_regions,
+            source_reach_mask,
             cv::Mat(),
             source_seed_pixel,
             source_seed_capacity,
@@ -8581,7 +8712,8 @@ FlowGateRegionBuildResult build_flow_gate_region_labels(
         const cv::Mat& white_domain,
         const cv::Mat& dt,
         const SkeletonGraph& graph,
-        const std::vector<SourceEdgeStart>& source_starts) {
+        const std::vector<SourceEdgeStart>& source_starts,
+        const bool merge_sources) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
     CV_Assert(white_domain.size() == dt.size());
@@ -8809,76 +8941,84 @@ FlowGateRegionBuildResult build_flow_gate_region_labels(
             return a.node > b.node;
         }
     };
-    for (int source_a = 1; source_a <= source_count; ++source_a) {
-        if (source_endpoint_seeds[static_cast<std::size_t>(source_a)].empty()) {
-            continue;
-        }
-        std::vector<float> widest(static_cast<std::size_t>(node_count),
-                                  -std::numeric_limits<float>::infinity());
-        std::priority_queue<SourceMergeQueueItem,
-                            std::vector<SourceMergeQueueItem>,
-                            SourceMergeQueueCompare>
-            merge_queue;
-        const auto seed_widest = [&](const int node, const float score) {
-            if (!valid_node(node) || score <= 0.0f ||
-                score <= widest[static_cast<std::size_t>(node)] + 1.0e-4f) {
-                return;
-            }
-            widest[static_cast<std::size_t>(node)] = score;
-            merge_queue.push({score, node});
-        };
-        for (const SourceEndpointSeed& seed :
-             source_endpoint_seeds[static_cast<std::size_t>(source_a)]) {
-            seed_widest(seed.node, seed.capacity);
-        }
-        while (!merge_queue.empty()) {
-            const SourceMergeQueueItem item = merge_queue.top();
-            merge_queue.pop();
-            if (!valid_node(item.node) ||
-                std::abs(widest[static_cast<std::size_t>(item.node)] -
-                         item.score) > 1.0e-4f) {
+    if (merge_sources) {
+        for (int source_a = 1; source_a <= source_count; ++source_a) {
+            if (source_endpoint_seeds[static_cast<std::size_t>(source_a)]
+                    .empty()) {
                 continue;
             }
-            for (const int edge_index :
-                 incident_edges[static_cast<std::size_t>(item.node)]) {
-                const int next_node = edge_other_node(edge_index, item.node);
-                if (!valid_node(next_node)) {
-                    continue;
+            std::vector<float> widest(static_cast<std::size_t>(node_count),
+                                      -std::numeric_limits<float>::infinity());
+            std::priority_queue<SourceMergeQueueItem,
+                                std::vector<SourceMergeQueueItem>,
+                                SourceMergeQueueCompare>
+                merge_queue;
+            const auto seed_widest = [&](const int node, const float score) {
+                if (!valid_node(node) || score <= 0.0f ||
+                    score <=
+                        widest[static_cast<std::size_t>(node)] + 1.0e-4f) {
+                    return;
                 }
-                const float score = std::min(
-                    item.score,
-                    std::max(0.0f, graph.edges[edge_index].capacity));
-                seed_widest(next_node, score);
-            }
-        }
-        for (int source_b = source_a + 1; source_b <= source_count;
-             ++source_b) {
-            float bottleneck = 0.0f;
+                widest[static_cast<std::size_t>(node)] = score;
+                merge_queue.push({score, node});
+            };
             for (const SourceEndpointSeed& seed :
-                 source_endpoint_seeds[static_cast<std::size_t>(source_b)]) {
-                if (!valid_node(seed.node)) {
-                    continue;
-                }
-                const float reached =
-                    widest[static_cast<std::size_t>(seed.node)];
-                if (reached <= 0.0f) {
-                    continue;
-                }
-                bottleneck =
-                    std::max(bottleneck, std::min(reached, seed.capacity));
+                 source_endpoint_seeds[static_cast<std::size_t>(source_a)]) {
+                seed_widest(seed.node, seed.capacity);
             }
-            const float required = kFlowGateRegionMergeRatio *
-                                   std::max(source_value
-                                                [static_cast<std::size_t>(
-                                                    source_a)],
-                                            source_value
-                                                [static_cast<std::size_t>(
-                                                    source_b)]);
-            if (required > 1.0e-4f && bottleneck + 1.0e-4f >= required) {
-                if (source_dsu.find(source_a) != source_dsu.find(source_b)) {
-                    ++result.merged_source_pairs;
+            while (!merge_queue.empty()) {
+                const SourceMergeQueueItem item = merge_queue.top();
+                merge_queue.pop();
+                if (!valid_node(item.node) ||
+                    std::abs(widest[static_cast<std::size_t>(item.node)] -
+                             item.score) > 1.0e-4f) {
+                    continue;
                 }
-                source_dsu.unite(source_a, source_b);
+                for (const int edge_index :
+                     incident_edges[static_cast<std::size_t>(item.node)]) {
+                    const int next_node =
+                        edge_other_node(edge_index, item.node);
+                    if (!valid_node(next_node)) {
+                        continue;
+                    }
+                    const float score = std::min(
+                        item.score,
+                        std::max(0.0f, graph.edges[edge_index].capacity));
+                    seed_widest(next_node, score);
+                }
+            }
+            for (int source_b = source_a + 1; source_b <= source_count;
+                 ++source_b) {
+                float bottleneck = 0.0f;
+                for (const SourceEndpointSeed& seed :
+                     source_endpoint_seeds
+                         [static_cast<std::size_t>(source_b)]) {
+                    if (!valid_node(seed.node)) {
+                        continue;
+                    }
+                    const float reached =
+                        widest[static_cast<std::size_t>(seed.node)];
+                    if (reached <= 0.0f) {
+                        continue;
+                    }
+                    bottleneck =
+                        std::max(bottleneck, std::min(reached, seed.capacity));
+                }
+                const float required = kFlowGateRegionMergeRatio *
+                                       std::max(source_value
+                                                    [static_cast<std::size_t>(
+                                                        source_a)],
+                                                source_value
+                                                    [static_cast<std::size_t>(
+                                                        source_b)]);
+                if (required > 1.0e-4f &&
+                    bottleneck + 1.0e-4f >= required) {
+                    if (source_dsu.find(source_a) !=
+                        source_dsu.find(source_b)) {
+                        ++result.merged_source_pairs;
+                    }
+                    source_dsu.unite(source_a, source_b);
+                }
             }
         }
     }
@@ -9310,22 +9450,33 @@ cv::Mat normalize_flow_by_regions(
     return normalized_flow;
 }
 
-cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
-                                       const float backtrack_distance,
-                                       const float local_boost,
-                                       const cv::Mat& region_labels =
-                                           cv::Mat()) {
+cv::Mat compute_flow_gate_weight_image(
+        const cv::Mat& flow,
+        const float backtrack_distance,
+        const float local_boost,
+        const cv::Mat& normalization_labels = cv::Mat(),
+        const cv::Mat& source_reach_mask = cv::Mat()) {
     CV_Assert(flow.type() == CV_32F);
-    CV_Assert(region_labels.empty() ||
-              (region_labels.type() == CV_32S &&
-               region_labels.size() == flow.size()));
+    CV_Assert(normalization_labels.empty() ||
+              (normalization_labels.type() == CV_32S &&
+               normalization_labels.size() == flow.size()));
+    CV_Assert(source_reach_mask.empty() ||
+              (source_reach_mask.type() == CV_8U &&
+               source_reach_mask.size() == flow.size()));
     const int rows = flow.rows;
     const int cols = flow.cols;
     cv::Mat weight(flow.size(), CV_32F, cv::Scalar(0));
 
     FlowGateNormalizationStats norm_stats;
     cv::Mat normalized_flow =
-        normalize_flow_by_regions(flow, region_labels, &norm_stats);
+        normalize_flow_by_regions(flow, normalization_labels, &norm_stats);
+    const int source_reach_pixels =
+        source_reach_mask.empty() ? 0 : cv::countNonZero(source_reach_mask);
+    if (!source_reach_mask.empty()) {
+        // Pixels whose greedy ascent reaches an accepted source edge are the
+        // intended source basin, so keep them saturated before local boost.
+        normalized_flow.setTo(1.0f, source_reach_mask);
+    }
     const int region_count = norm_stats.region_count;
     const float local_blend = std::clamp(local_boost, 0.0f, 1.0f);
 
@@ -9372,6 +9523,7 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
               << "  local_boost: " << local_blend << "\n"
               << "  normalization_regions: " << region_count << "\n"
               << "  local_max_scope: global_after_region_normalization\n"
+              << "  source_reach_pixels: " << source_reach_pixels << "\n"
               << "  global_max_flow: " << norm_stats.global_max_flow << "\n";
     return weight;
 }
@@ -9966,10 +10118,15 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         const cv::Mat flow_gate_weight = compute_flow_gate_weight_image(
             dense_flow_result.tree_dense_flow_greedy_ascent,
             backtrack_distance, local_boost,
-            dense_flow_result.flow_gate_regions);
-        const cv::Mat flow_gate_basis = normalize_flow_by_regions(
+            dense_flow_result.flow_gate_component_regions,
+            dense_flow_result.source_reach_mask);
+        cv::Mat flow_gate_basis = normalize_flow_by_regions(
             dense_flow_result.tree_dense_flow_greedy_ascent,
-            dense_flow_result.flow_gate_regions);
+            dense_flow_result.flow_gate_component_regions);
+        if (!dense_flow_result.source_reach_mask.empty()) {
+            flow_gate_basis.setTo(1.0f,
+                                  dense_flow_result.source_reach_mask);
+        }
 
         if (dense_flow != nullptr) {
             for (int y = 0; y < height; ++y) {
@@ -10373,7 +10530,8 @@ int main(int argc, char** argv) {
                         compute_flow_gate_weight_image(
                             dense_flow_result.tree_dense_flow_greedy_ascent,
                             args.backtrack_distance, args.local_boost,
-                            dense_flow_result.flow_gate_regions);
+                            dense_flow_result.flow_gate_component_regions,
+                            dense_flow_result.source_reach_mask);
                     timings.push_back(
                         finish_timing("flow_gate_weight", timing));
                 }
@@ -10478,6 +10636,22 @@ int main(int argc, char** argv) {
                             labels_to_u16(
                                 dense_flow_result.flow_gate_regions,
                                 static_cast<int>(max_region_label)));
+            }
+            if (!dense_flow_result.flow_gate_component_regions.empty()) {
+                double max_component_label = 0.0;
+                cv::minMaxLoc(
+                    dense_flow_result.flow_gate_component_regions, nullptr,
+                    &max_component_label);
+                write_image(
+                    workdir /
+                        (stem + "_flow_gate_component_regions.tif"),
+                    labels_to_u16(
+                        dense_flow_result.flow_gate_component_regions,
+                        static_cast<int>(max_component_label)));
+            }
+            if (!dense_flow_result.source_reach_mask.empty()) {
+                write_image(workdir / (stem + "_source_reach_mask.tif"),
+                            dense_flow_result.source_reach_mask);
             }
             write_image(workdir / (stem + "_island_obstacle_factor.tif"),
                         dense_flow_result.island_obstacle_factor);
@@ -10595,6 +10769,19 @@ int main(int argc, char** argv) {
                 layered_tiff.push_back(
                     {"flow_gate_regions",
                      to_float_layer(flow_gate_regions_float)});
+            }
+            if (!dense_flow_result.flow_gate_component_regions.empty()) {
+                cv::Mat flow_gate_component_regions_float;
+                dense_flow_result.flow_gate_component_regions.convertTo(
+                    flow_gate_component_regions_float, CV_32F);
+                layered_tiff.push_back(
+                    {"flow_gate_component_regions",
+                     to_float_layer(flow_gate_component_regions_float)});
+            }
+            if (!dense_flow_result.source_reach_mask.empty()) {
+                layered_tiff.push_back(
+                    {"source_reach_mask",
+                     to_float_layer(dense_flow_result.source_reach_mask)});
             }
             layered_tiff.push_back(
                 {"island_obstacle_factor",
