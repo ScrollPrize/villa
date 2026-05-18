@@ -7934,6 +7934,7 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                                         float* query_flow,
                                         float* dense_flow,
                                         float* smooth_grid_flow,
+                                        float* gate_basis_flow,
                                         float* graph_edge_flow_rgb,
                                         int grid_step,
                                         float backtrack_distance,
@@ -8086,7 +8087,8 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         }
 
         const bool enable_debug_outputs =
-            smooth_grid_flow != nullptr || graph_edge_flow_rgb != nullptr;
+            smooth_grid_flow != nullptr || gate_basis_flow != nullptr ||
+            graph_edge_flow_rgb != nullptr;
         DenseFlowResult dense_flow_result =
             compute_dense_source_flow(
                 white_domain, dt, graph,
@@ -8121,6 +8123,16 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                     dense_flow_result.smooth_grid_flow.ptr<float>(y);
                 std::copy(src_row, src_row + width,
                           smooth_grid_flow +
+                              static_cast<std::size_t>(y) * width);
+            }
+        }
+        if (gate_basis_flow != nullptr) {
+            for (int y = 0; y < height; ++y) {
+                const float* src_row = dense_flow_result
+                                           .tree_dense_flow_greedy_ascent
+                                           .ptr<float>(y);
+                std::copy(src_row, src_row + width,
+                          gate_basis_flow +
                               static_cast<std::size_t>(y) * width);
             }
         }

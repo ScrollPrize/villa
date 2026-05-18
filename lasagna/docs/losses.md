@@ -124,6 +124,11 @@ The optimizer status table reports the flow-gate strength as fractions and
 corner counts for gate weights `>0`, `>0.1`, and `>0.5`, plus the fraction at
 `1.0`.
 
+With `debug: true`, flow layer TIFFs are written every `debug_layer_interval`
+flow evaluations (default `10`). The service JPG is written every
+`debug_jpg_interval` evaluations (default `50`) and shows `pred_dt` next to the
+normalized greedy-ascent flow layer that the local gate is based on.
+
 When `anticipatory_pull.debug_points` or `debug_roi_center_xyz` is set, every normal flow-gate layer-debug
 iteration also writes `pred_dt_flow_gate_<stage>_anticipatory_fit_points.jpg`.
 Explicit `debug_points` are LR mesh tip coordinates `(h,w)`. The ROI selector

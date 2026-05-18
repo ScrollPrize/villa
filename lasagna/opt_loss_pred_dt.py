@@ -893,6 +893,24 @@ def flow_gate_last_timing() -> dict[str, float]:
 	return dict(_flow_gate_last_timing)
 
 
+def _normalize_positive_debug_image(image: np.ndarray | None) -> np.ndarray | None:
+	if image is None:
+		return None
+	arr = np.asarray(image, dtype=np.float32)
+	if arr.ndim != 2:
+		return None
+	finite = np.isfinite(arr)
+	positive = finite & (arr > 0.0)
+	out = np.zeros_like(arr, dtype=np.float32)
+	if not positive.any():
+		return out
+	scale = float(arr[positive].max())
+	if scale <= 0.0:
+		return out
+	out[finite] = np.clip(np.maximum(arr[finite], 0.0) / scale, 0.0, 1.0)
+	return out
+
+
 def _write_flow_gate_debug(
 	*,
 	stage_name: str,
@@ -900,6 +918,7 @@ def _write_flow_gate_debug(
 	pred_u8: np.ndarray,
 	flow_hr: np.ndarray | None,
 	smooth_grid_flow: np.ndarray | None,
+	gate_basis_hr: np.ndarray | None,
 	graph_edge_flow_rgb: np.ndarray | None,
 	weight_hr: np.ndarray | None,
 	out_dir: Path | None,
@@ -917,10 +936,27 @@ def _write_flow_gate_debug(
 		return
 	out_dir.mkdir(parents=True, exist_ok=True)
 	pred_raw_u8 = pred_u8.astype(np.uint8, copy=True)
-	flow = np.zeros_like(pred_raw_u8, dtype=np.float32) if flow_hr is None else np.asarray(flow_hr, dtype=np.float32)
-	grid_flow = None if smooth_grid_flow is None else np.asarray(smooth_grid_flow, dtype=np.float32)
-	graph_flow = None if graph_edge_flow_rgb is None else np.asarray(graph_edge_flow_rgb, dtype=np.float32)
-	weights = np.zeros_like(pred_raw_u8, dtype=np.float32) if weight_hr is None else np.asarray(weight_hr, dtype=np.float32)
+	flow = (
+		np.zeros_like(pred_raw_u8, dtype=np.float32)
+		if flow_hr is None
+		else np.asarray(flow_hr, dtype=np.float32)
+	)
+	grid_flow = (
+		None
+		if smooth_grid_flow is None
+		else np.asarray(smooth_grid_flow, dtype=np.float32)
+	)
+	gate_basis = _normalize_positive_debug_image(gate_basis_hr)
+	graph_flow = (
+		None
+		if graph_edge_flow_rgb is None
+		else np.asarray(graph_edge_flow_rgb, dtype=np.float32)
+	)
+	weights = (
+		np.zeros_like(pred_raw_u8, dtype=np.float32)
+		if weight_hr is None
+		else np.asarray(weight_hr, dtype=np.float32)
+	)
 	pull_weight = None if pull_weight_hr is None else np.asarray(pull_weight_hr, dtype=np.float32)
 	pull_prefix = None if pull_prefix_hr is None else np.asarray(pull_prefix_hr, dtype=np.float32)
 	pull_root_weight = None if pull_root_weight_hr is None else np.asarray(pull_root_weight_hr, dtype=np.float32)
@@ -946,6 +982,8 @@ def _write_flow_gate_debug(
 			write_named_layer(tw, flow, name="raw_flow_bilinear")
 			if grid_flow is not None:
 				write_named_layer(tw, grid_flow, name="smooth_grid_flow")
+			if gate_basis is not None:
+				write_named_layer(tw, gate_basis, name="gate_basis_flow_normalized")
 			if graph_flow is not None:
 				write_named_layer(tw, graph_flow, name="graph_edge_flow")
 			write_named_layer(tw, weights, name="flow_gate_weight")
@@ -961,6 +999,11 @@ def _write_flow_gate_debug(
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_raw_flow.tif"), flow)
 		if grid_flow is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_smooth_grid_flow.tif"), grid_flow)
+		if gate_basis is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_gate_basis_flow_normalized.tif"),
+				gate_basis,
+			)
 		if graph_flow is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_edge_flow.tif"), graph_flow)
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_weight.tif"), weights)
@@ -980,6 +1023,7 @@ def _write_flow_gate_weight_jpg(
 	debug_index: int,
 	pred_u8: np.ndarray,
 	used_weight_hr: np.ndarray,
+	gate_basis_hr: np.ndarray | None,
 	out_dir: Path | None,
 ) -> None:
 	global _flow_gate_jpg_warned
@@ -991,17 +1035,19 @@ def _write_flow_gate_weight_jpg(
 		return
 	if pred.shape != weight.shape:
 		return
+	gate_basis_vis = _normalize_positive_debug_image(gate_basis_hr)
+	if gate_basis_vis is None or gate_basis_vis.shape != pred.shape:
+		gate_basis_vis = weight.clip(0.0, 1.0)
 	pred_vis = ((pred.astype(np.float32) - 80.0) / (127.0 - 80.0)).clip(0.0, 1.0)
-	weight_vis = weight.clip(0.0, 1.0)
 	img = np.concatenate([
 		(pred_vis * 255.0 + 0.5).astype(np.uint8),
-		(weight_vis * 255.0 + 0.5).astype(np.uint8),
+		(gate_basis_vis * 255.0 + 0.5).astype(np.uint8),
 	], axis=1)
 	jpg_dir = out_dir / "pred_dt_flow_gate_weight_jpg"
 	try:
 		jpg_dir.mkdir(parents=True, exist_ok=True)
 		for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
-			path = jpg_dir / f"{suffix}_pred_dt_and_used_weight.jpg"
+			path = jpg_dir / f"{suffix}_pred_dt_and_gate_basis.jpg"
 			try:
 				import cv2
 				if not cv2.imwrite(str(path), img):
@@ -1041,7 +1087,11 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 	if debug:
 		debug_index = _flow_gate_debug_counts.get(_flow_gate_stage, 0)
 		_flow_gate_debug_counts[_flow_gate_stage] = debug_index + 1
-	write_layer_debug = debug and (debug_index % 10) == 0
+	debug_layer_interval = max(1, int(cfg.get("debug_layer_interval", 10)))
+	debug_jpg_interval = max(1, int(cfg.get("debug_jpg_interval", 50)))
+	write_layer_debug = debug and (debug_index % debug_layer_interval) == 0
+	write_jpg_debug = debug and (debug_index % debug_jpg_interval) == 0
+	return_flow_debug = write_layer_debug or write_jpg_debug
 	timing: dict[str, float] = {}
 	def mark(label: str) -> float:
 		return time.perf_counter()
@@ -1132,6 +1182,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				pred_u8=pred_img,
 				flow_hr=None,
 				smooth_grid_flow=None,
+				gate_basis_hr=None,
 				graph_edge_flow_rgb=None,
 				weight_hr=None,
 				out_dir=_flow_gate_out_dir,
@@ -1145,7 +1196,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					source_xy=(source_x, source_y),
 					query_xy=query_xy,
 					verbose=False,
-					return_debug=write_layer_debug,
+					return_debug=return_flow_debug,
 					return_metadata=True,
 					grid_step=grid_step,
 					backtrack_distance=backtrack_distance,
@@ -1163,11 +1214,19 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			else:
 				flow_outputs = _compute_flow_outputs()
 			publish_timing()
-			if write_layer_debug:
-				query_flow, dense_flow, smooth_grid_flow, graph_edge_flow_rgb, flow_metadata = flow_outputs
+			if return_flow_debug:
+				(
+					query_flow,
+					dense_flow,
+					smooth_grid_flow,
+					gate_basis_flow,
+					graph_edge_flow_rgb,
+					flow_metadata,
+				) = flow_outputs
 			else:
 				query_flow, dense_flow, flow_metadata = flow_outputs
 				smooth_grid_flow = None
+				gate_basis_flow = None
 				graph_edge_flow_rgb = None
 		except RuntimeError as exc:
 			message = str(exc)
@@ -1210,11 +1269,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						pred_u8=pred_img,
 						flow_hr=None,
 						smooth_grid_flow=None,
+						gate_basis_hr=None,
 						graph_edge_flow_rgb=None,
 						weight_hr=weight_hr,
 						out_dir=_flow_gate_out_dir,
 					)
-				if debug:
+				if write_jpg_debug:
 					used_weight_hr = F.interpolate(
 						used_weight,
 						size=(He, We),
@@ -1225,6 +1285,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						debug_index=debug_index,
 						pred_u8=pred_img,
 						used_weight_hr=used_weight_hr,
+						gate_basis_hr=None,
 						out_dir=_flow_gate_out_dir,
 					)
 				publish_timing()
@@ -1274,6 +1335,10 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			})
 		done("compute_weight", _t)
 
+		gate_basis_hr = None
+		if gate_basis_flow is not None and (write_layer_debug or write_jpg_debug):
+			gate_basis_hr = np.asarray(gate_basis_flow, dtype=np.float32)
+
 		if write_layer_debug:
 			_t = mark("write_layer_debug")
 			flow_hr = F.interpolate(
@@ -1315,6 +1380,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				pred_u8=pred_img,
 				flow_hr=flow_hr,
 				smooth_grid_flow=smooth_grid_flow,
+				gate_basis_hr=gate_basis_hr,
 				graph_edge_flow_rgb=graph_edge_flow_rgb,
 				weight_hr=weight_hr,
 				pull_weight_hr=pull_weight_hr,
@@ -1335,7 +1401,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					out_dir=_flow_gate_out_dir,
 				)
 			done("write_layer_debug", _t)
-		if debug:
+		if write_jpg_debug:
 			_t = mark("write_weight_jpg")
 			used_weight_hr = F.interpolate(
 				used_weight,
@@ -1347,6 +1413,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				debug_index=debug_index,
 				pred_u8=pred_img,
 				used_weight_hr=used_weight_hr,
+				gate_basis_hr=gate_basis_hr,
 				out_dir=_flow_gate_out_dir,
 			)
 			done("write_weight_jpg", _t)
