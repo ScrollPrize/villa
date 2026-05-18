@@ -1901,7 +1901,8 @@ def main():
         del point_collections[pid]
     print(f'dropped {len(dropped_patch_ids)} patches and {len(dropped_pcl_ids)} pcls outside z-roi [{z_begin}, {z_end})')
 
-    out_path = f'out/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{len(patches)}-patch'
+    out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
+    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{len(patches)}-patch'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
     run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
