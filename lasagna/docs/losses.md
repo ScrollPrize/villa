@@ -93,12 +93,20 @@ mesh normals. Set it to `"gt"` to use sampled GT normals for that stage.
 When enabled, the current single-winding `pred_dt` render is median-filtered
 with radius 1, thresholded at `110`, routed through `dense_batch_min_cut`, and
 sampled at the exact model grid corners. The C++ flow code computes both the
-normalized greedy-ascent flow and the local gate, where the local gate is
-greedy-ascent flow divided by the dilated local maximum of that same
-greedy-ascent flow. `backtrack_distance` is the dilation radius.
-`local_boost` blends between them: `0.0` uses only globally normalized
-greedy-ascent flow, `1.0` uses the local gate, and values between are linear.
-The resulting gate multiplies the `pred_dt` loss map.
+normalized greedy-ascent flow and the local gate. The greedy-ascent flow is
+first normalized per source region, then the local gate is that normalized
+greedy-ascent flow divided by the dilated local maximum of the same normalized
+image. `backtrack_distance` is the dilation radius. `local_boost` blends
+between them: `0.0` uses only the per-region normalized greedy-ascent flow,
+`1.0` uses the local gate, and values between are linear.
+The resulting gate multiplies the `pred_dt` loss map. When multiple accepted
+flow sources are present, the C++ flow code normalizes the gate separately per
+source region. Disconnected threshold-domain components naturally get separate
+regions; connected components are partitioned on the skeleton graph with a
+widest-path source assignment, and graph edges where regions meet are split at
+their lowest-capacity pixel for normalization only. Sources connected by a
+graph bottleneck at least `0.75` of the larger source value share one
+normalization region rather than being split.
 Correction points are also passed to the flow code as additional source seeds
 when `corr_seed_enabled` is not false and the point is within
 `corr_seed_surface_distance` full-resolution voxels of the current rendered
@@ -142,7 +150,8 @@ legacy alias) as
 `pred_dt_flow_gate_weight_jpg/vis_<iteration>.jpg` and shows the thresholded
 flow basis, the retained seed/correction source component mask when available,
 `pred_dt`, the dense local-max-ratio gate weight actually used by flow gating,
-then the normalized greedy-ascent flow value before the local max ratio. The
+then the per-region normalized greedy-ascent flow value before the local max
+ratio. The
 rightmost panel overlays the primary seed in cyan plus correction
 points at their nearest rendered-surface pixel; green correction points are
 within `corr_seed_surface_distance` and become extra flow seeds, while orange

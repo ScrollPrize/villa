@@ -37,6 +37,7 @@ constexpr bool kEnableLegacyVoronoiTreeDensification = false;
 constexpr bool kEnableLegacyDenseDtAscent = false;
 constexpr bool kWriteReferenceDenseBacktrackNn = false;
 constexpr double kIslandRemovalScoreThreshold = 0.5;
+constexpr float kFlowGateRegionMergeRatio = 0.75f;
 using Clock = std::chrono::steady_clock;
 
 struct TimingMark {
@@ -4806,6 +4807,7 @@ struct DenseFlowResult {
     cv::Mat island_bonus_edge_flow;
     cv::Mat island_tree_dense_flow_no_backtrack;
     cv::Mat island_tree_dense_flow_greedy_ascent;
+    cv::Mat flow_gate_regions;
     cv::Mat flow_gate_weight;
     cv::Point source_seed_pixel{-1, -1};
     float source_seed_capacity = 0.0f;
@@ -4816,6 +4818,14 @@ struct DenseFlowResult {
     float finite_edge_flow_max = 0.0f;
     int finite_edge_flows = 0;
     std::vector<StageTiming> timings;
+};
+
+struct SourceEdgeStart {
+    cv::Point source{-1, -1};
+    int source_index = -1;
+    int edge = -1;
+    cv::Point seed_pixel{-1, -1};
+    float seed_capacity = 0.0f;
 };
 
 std::vector<cv::Point> unique_edge_pixels(const std::vector<cv::Point>& pixels) {
@@ -5020,8 +5030,23 @@ struct DenseBacktrackResult {
     std::vector<StageTiming> timings;
 };
 
+struct FlowGateRegionBuildResult {
+    cv::Mat labels;
+    int region_count = 0;
+    int source_groups = 0;
+    int merged_source_pairs = 0;
+    int graph_seed_pixels = 0;
+    int unlabeled_white_pixels = 0;
+};
+
 cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
                                            int grid_step);
+
+FlowGateRegionBuildResult build_flow_gate_region_labels(
+        const cv::Mat& white_domain,
+        const cv::Mat& dt,
+        const SkeletonGraph& graph,
+        const std::vector<SourceEdgeStart>& source_starts);
 
 DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                                                   const cv::Mat& dt,
@@ -5472,8 +5497,9 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                         continue;
                     }
                     const int index = y * cols + x;
-                    const float seed =
-                        graph_seed_flow[static_cast<std::size_t>(index)];
+                    const float seed = std::max(
+                        graph_seed_flow[static_cast<std::size_t>(index)],
+                        graph_pixel_flow.at<float>(y, x));
                     if (seed <= 0.0f) {
                         continue;
                     }
@@ -6507,13 +6533,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Point source_seed_pixel(-1, -1);
     float source_seed_capacity = 0.0f;
     int source_initial_edge = -1;
-    struct SourceEdgeStart {
-        cv::Point source{-1, -1};
-        int source_index = -1;
-        int edge = -1;
-        cv::Point seed_pixel{-1, -1};
-        float seed_capacity = 0.0f;
-    };
     std::vector<SourceEdgeStart> source_starts;
     {
         const TimingMark timing = start_timing();
@@ -7903,6 +7922,26 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                   << dense_backtrack.unreached_white_pixels << "\n";
     }
 
+    cv::Mat flow_gate_regions;
+    {
+        const TimingMark timing = start_timing();
+        const FlowGateRegionBuildResult regions =
+            build_flow_gate_region_labels(white_domain, dt, graph,
+                                          source_starts);
+        flow_gate_regions = regions.labels;
+        std::cout << "Flow gate normalization regions:\n"
+                  << "  regions: " << regions.region_count << "\n"
+                  << "  source_groups: " << regions.source_groups << "\n"
+                  << "  merged_source_pairs: "
+                  << regions.merged_source_pairs << "\n"
+                  << "  graph_seed_pixels: " << regions.graph_seed_pixels
+                  << "\n"
+                  << "  unlabeled_white_pixels: "
+                  << regions.unlabeled_white_pixels << "\n";
+        timings.push_back(
+            finish_timing("flow_gate_region_labels", timing));
+    }
+
     if (enable_debug_outputs &&
         island_flow.propagated_edge_flow.size() == graph.edges.size()) {
         const TimingMark timing = start_timing();
@@ -8348,6 +8387,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             island_bonus_edge_flow,
             island_tree_dense_flow_no_backtrack,
             island_tree_dense_flow_greedy_ascent,
+            flow_gate_regions,
             cv::Mat(),
             source_seed_pixel,
             source_seed_capacity,
@@ -8440,20 +8480,756 @@ cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
     return out;
 }
 
+FlowGateRegionBuildResult build_flow_gate_region_labels(
+        const cv::Mat& white_domain,
+        const cv::Mat& dt,
+        const SkeletonGraph& graph,
+        const std::vector<SourceEdgeStart>& source_starts) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(dt.type() == CV_32F);
+    CV_Assert(white_domain.size() == dt.size());
+
+    FlowGateRegionBuildResult result;
+    result.labels = cv::Mat::zeros(white_domain.size(), CV_32S);
+    if (source_starts.empty()) {
+        cv::Mat cc_labels;
+        const int cc_count =
+            cv::connectedComponents(white_domain, cc_labels, 8, CV_32S);
+        result.labels = cc_labels;
+        result.region_count = std::max(0, cc_count - 1);
+        return result;
+    }
+
+    const int node_count = static_cast<int>(graph.nodes.size());
+    const auto valid_node = [&](const int node) {
+        return node > 0 && node < node_count;
+    };
+    const auto valid_edge = [&](const int edge_index) {
+        return edge_index >= 0 &&
+               edge_index < static_cast<int>(graph.edges.size());
+    };
+    const auto edge_other_node = [&](const int edge_index, const int node) {
+        if (!valid_edge(edge_index)) {
+            return -1;
+        }
+        const GraphEdge& edge = graph.edges[edge_index];
+        if (edge.a == node) {
+            return edge.b;
+        }
+        if (edge.b == node) {
+            return edge.a;
+        }
+        return -1;
+    };
+
+    std::vector<std::vector<int>> incident_edges(
+        static_cast<std::size_t>(node_count));
+    std::vector<double> edge_lengths(graph.edges.size(), 1.0);
+    for (int edge_index = 0;
+         edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
+        const GraphEdge& edge = graph.edges[edge_index];
+        if (valid_node(edge.a)) {
+            incident_edges[static_cast<std::size_t>(edge.a)].push_back(
+                edge_index);
+        }
+        if (valid_node(edge.b) && edge.b != edge.a) {
+            incident_edges[static_cast<std::size_t>(edge.b)].push_back(
+                edge_index);
+        }
+        const std::vector<cv::Point> ordered = order_edge_pixels(edge, graph);
+        double length = 1.0;
+        for (std::size_t i = 1; i < ordered.size(); ++i) {
+            const int dx = std::abs(ordered[i].x - ordered[i - 1].x);
+            const int dy = std::abs(ordered[i].y - ordered[i - 1].y);
+            length += (dx + dy == 2 ? std::sqrt(2.0) : 1.0);
+        }
+        edge_lengths[static_cast<std::size_t>(edge_index)] = length;
+    }
+
+    std::vector<float> best_score(static_cast<std::size_t>(node_count),
+                                  -std::numeric_limits<float>::infinity());
+    std::vector<double> best_distance(static_cast<std::size_t>(node_count),
+                                      std::numeric_limits<double>::infinity());
+    std::vector<int> node_label(static_cast<std::size_t>(node_count), 0);
+    std::vector<int> edge_source_label(graph.edges.size(), 0);
+    const int source_count = static_cast<int>(source_starts.size());
+    struct SourceEndpointSeed {
+        int node = -1;
+        float capacity = 0.0f;
+        double distance = 0.0;
+    };
+    std::vector<std::vector<SourceEndpointSeed>> source_endpoint_seeds(
+        static_cast<std::size_t>(source_count + 1));
+    std::vector<float> source_value(static_cast<std::size_t>(source_count + 1),
+                                    0.0f);
+
+    const auto add_endpoint_seed =
+        [&](std::vector<SourceEndpointSeed>& seeds, const int node,
+            const float capacity, const double distance) {
+            if (!valid_node(node)) {
+                return;
+            }
+            const float safe_capacity = std::max(0.0f, capacity);
+            for (SourceEndpointSeed& seed : seeds) {
+                if (seed.node != node) {
+                    continue;
+                }
+                if (safe_capacity > seed.capacity + 1.0e-4f ||
+                    (std::abs(safe_capacity - seed.capacity) <= 1.0e-4f &&
+                     distance < seed.distance)) {
+                    seed.capacity = safe_capacity;
+                    seed.distance = distance;
+                }
+                return;
+            }
+            seeds.push_back({node, safe_capacity, distance});
+        };
+
+    for (int i = 0; i < source_count; ++i) {
+        const int source_label = i + 1;
+        const SourceEdgeStart& start = source_starts[i];
+        if (!valid_edge(start.edge)) {
+            continue;
+        }
+        const GraphEdge& edge = graph.edges[start.edge];
+        std::vector<cv::Point> ordered = order_edge_pixels(edge, graph);
+        if (ordered.empty()) {
+            ordered = edge.pixels;
+        }
+        int seed_index = 0;
+        if (!ordered.empty()) {
+            double best_seed_distance = std::numeric_limits<double>::max();
+            const cv::Point seed_pixel =
+                start.seed_pixel.x >= 0 ? start.seed_pixel : start.source;
+            for (int j = 0; j < static_cast<int>(ordered.size()); ++j) {
+                const cv::Point pixel =
+                    ordered[static_cast<std::size_t>(j)];
+                const double dx = pixel.x - seed_pixel.x;
+                const double dy = pixel.y - seed_pixel.y;
+                const double distance = dx * dx + dy * dy;
+                if (distance < best_seed_distance) {
+                    best_seed_distance = distance;
+                    seed_index = j;
+                }
+            }
+        }
+        auto segment_seed = [&](const int node, const int begin,
+                                const int end) {
+            if (!valid_node(node) || ordered.empty()) {
+                return;
+            }
+            const int step = begin <= end ? 1 : -1;
+            float capacity = std::numeric_limits<float>::infinity();
+            double distance = 0.0;
+            int previous = begin;
+            for (int j = begin;; j += step) {
+                const cv::Point pixel = ordered[static_cast<std::size_t>(j)];
+                capacity = std::min(
+                    capacity,
+                    capacity_from_dt(dt.at<float>(pixel.y, pixel.x)));
+                if (j != begin) {
+                    const cv::Point prev =
+                        ordered[static_cast<std::size_t>(previous)];
+                    const int dx = std::abs(pixel.x - prev.x);
+                    const int dy = std::abs(pixel.y - prev.y);
+                    distance += (dx + dy == 2 ? std::sqrt(2.0) : 1.0);
+                }
+                if (j == end) {
+                    break;
+                }
+                previous = j;
+            }
+            if (!std::isfinite(capacity)) {
+                capacity = std::max(start.seed_capacity,
+                                    std::max(0.0f, edge.capacity));
+            }
+            add_endpoint_seed(
+                source_endpoint_seeds[static_cast<std::size_t>(source_label)],
+                node, capacity, distance);
+        };
+        segment_seed(edge.a, seed_index, 0);
+        segment_seed(edge.b, seed_index,
+                     std::max(0, static_cast<int>(ordered.size()) - 1));
+        if (ordered.empty()) {
+            const float score = std::max(start.seed_capacity,
+                                         std::max(0.0f, edge.capacity));
+            add_endpoint_seed(
+                source_endpoint_seeds[static_cast<std::size_t>(source_label)],
+                edge.a, score, 0.0);
+            add_endpoint_seed(
+                source_endpoint_seeds[static_cast<std::size_t>(source_label)],
+                edge.b, score, 0.0);
+        }
+        for (const SourceEndpointSeed& seed :
+             source_endpoint_seeds[static_cast<std::size_t>(source_label)]) {
+            source_value[static_cast<std::size_t>(source_label)] =
+                std::max(source_value[static_cast<std::size_t>(source_label)],
+                         seed.capacity);
+        }
+        if (source_value[static_cast<std::size_t>(source_label)] <= 0.0f) {
+            source_value[static_cast<std::size_t>(source_label)] = std::max(
+                start.seed_capacity, std::max(0.0f, edge.capacity));
+        }
+    }
+
+    struct SourceDsu {
+        std::vector<int> parent;
+        explicit SourceDsu(const int n) : parent(static_cast<std::size_t>(n)) {
+            std::iota(parent.begin(), parent.end(), 0);
+        }
+        int find(const int x) {
+            if (parent[static_cast<std::size_t>(x)] == x) {
+                return x;
+            }
+            parent[static_cast<std::size_t>(x)] =
+                find(parent[static_cast<std::size_t>(x)]);
+            return parent[static_cast<std::size_t>(x)];
+        }
+        void unite(const int a, const int b) {
+            int ra = find(a);
+            int rb = find(b);
+            if (ra == rb) {
+                return;
+            }
+            if (ra > rb) {
+                std::swap(ra, rb);
+            }
+            parent[static_cast<std::size_t>(rb)] = ra;
+        }
+    };
+    SourceDsu source_dsu(source_count + 1);
+
+    struct SourceMergeQueueItem {
+        float score = 0.0f;
+        int node = -1;
+    };
+    struct SourceMergeQueueCompare {
+        bool operator()(const SourceMergeQueueItem& a,
+                        const SourceMergeQueueItem& b) const {
+            if (std::abs(a.score - b.score) > 1.0e-4f) {
+                return a.score < b.score;
+            }
+            return a.node > b.node;
+        }
+    };
+    for (int source_a = 1; source_a <= source_count; ++source_a) {
+        if (source_endpoint_seeds[static_cast<std::size_t>(source_a)].empty()) {
+            continue;
+        }
+        std::vector<float> widest(static_cast<std::size_t>(node_count),
+                                  -std::numeric_limits<float>::infinity());
+        std::priority_queue<SourceMergeQueueItem,
+                            std::vector<SourceMergeQueueItem>,
+                            SourceMergeQueueCompare>
+            merge_queue;
+        const auto seed_widest = [&](const int node, const float score) {
+            if (!valid_node(node) || score <= 0.0f ||
+                score <= widest[static_cast<std::size_t>(node)] + 1.0e-4f) {
+                return;
+            }
+            widest[static_cast<std::size_t>(node)] = score;
+            merge_queue.push({score, node});
+        };
+        for (const SourceEndpointSeed& seed :
+             source_endpoint_seeds[static_cast<std::size_t>(source_a)]) {
+            seed_widest(seed.node, seed.capacity);
+        }
+        while (!merge_queue.empty()) {
+            const SourceMergeQueueItem item = merge_queue.top();
+            merge_queue.pop();
+            if (!valid_node(item.node) ||
+                std::abs(widest[static_cast<std::size_t>(item.node)] -
+                         item.score) > 1.0e-4f) {
+                continue;
+            }
+            for (const int edge_index :
+                 incident_edges[static_cast<std::size_t>(item.node)]) {
+                const int next_node = edge_other_node(edge_index, item.node);
+                if (!valid_node(next_node)) {
+                    continue;
+                }
+                const float score = std::min(
+                    item.score,
+                    std::max(0.0f, graph.edges[edge_index].capacity));
+                seed_widest(next_node, score);
+            }
+        }
+        for (int source_b = source_a + 1; source_b <= source_count;
+             ++source_b) {
+            float bottleneck = 0.0f;
+            for (const SourceEndpointSeed& seed :
+                 source_endpoint_seeds[static_cast<std::size_t>(source_b)]) {
+                if (!valid_node(seed.node)) {
+                    continue;
+                }
+                const float reached =
+                    widest[static_cast<std::size_t>(seed.node)];
+                if (reached <= 0.0f) {
+                    continue;
+                }
+                bottleneck =
+                    std::max(bottleneck, std::min(reached, seed.capacity));
+            }
+            const float required = kFlowGateRegionMergeRatio *
+                                   std::max(source_value
+                                                [static_cast<std::size_t>(
+                                                    source_a)],
+                                            source_value
+                                                [static_cast<std::size_t>(
+                                                    source_b)]);
+            if (required > 1.0e-4f && bottleneck + 1.0e-4f >= required) {
+                if (source_dsu.find(source_a) != source_dsu.find(source_b)) {
+                    ++result.merged_source_pairs;
+                }
+                source_dsu.unite(source_a, source_b);
+            }
+        }
+    }
+    std::vector<int> root_region_label(
+        static_cast<std::size_t>(source_count + 1), 0);
+    std::vector<int> source_region_label(
+        static_cast<std::size_t>(source_count + 1), 0);
+    for (int i = 1; i <= source_count; ++i) {
+        const int root = source_dsu.find(i);
+        int& label = root_region_label[static_cast<std::size_t>(root)];
+        if (label == 0) {
+            label = ++result.source_groups;
+        }
+        source_region_label[static_cast<std::size_t>(i)] = label;
+    }
+
+    struct QueueItem {
+        float score = 0.0f;
+        double distance = 0.0;
+        int label = 0;
+        int node = 0;
+    };
+    struct QueueCompare {
+        bool operator()(const QueueItem& a, const QueueItem& b) const {
+            constexpr float kScoreEps = 1.0e-4f;
+            constexpr double kDistEps = 1.0e-6;
+            if (std::abs(a.score - b.score) > kScoreEps) {
+                return a.score < b.score;
+            }
+            if (std::abs(a.distance - b.distance) > kDistEps) {
+                return a.distance > b.distance;
+            }
+            return a.label > b.label;
+        }
+    };
+    std::priority_queue<QueueItem, std::vector<QueueItem>, QueueCompare> queue;
+
+    const auto better_node_label = [&](const int node, const int label,
+                                       const float score,
+                                       const double distance) {
+        constexpr float kScoreEps = 1.0e-4f;
+        constexpr double kDistEps = 1.0e-6;
+        if (score > best_score[static_cast<std::size_t>(node)] + kScoreEps) {
+            return true;
+        }
+        if (std::abs(score -
+                     best_score[static_cast<std::size_t>(node)]) <=
+            kScoreEps) {
+            if (distance <
+                best_distance[static_cast<std::size_t>(node)] - kDistEps) {
+                return true;
+            }
+            if (std::abs(distance -
+                         best_distance[static_cast<std::size_t>(node)]) <=
+                    kDistEps &&
+                (node_label[static_cast<std::size_t>(node)] == 0 ||
+                 label < node_label[static_cast<std::size_t>(node)])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto seed_node = [&](const int node, const int label,
+                               const float score, const double distance) {
+        if (!valid_node(node) || label <= 0) {
+            return;
+        }
+        const float safe_score = std::max(0.0f, score);
+        if (!better_node_label(node, label, safe_score, distance)) {
+            return;
+        }
+        best_score[static_cast<std::size_t>(node)] = safe_score;
+        best_distance[static_cast<std::size_t>(node)] = distance;
+        node_label[static_cast<std::size_t>(node)] = label;
+        queue.push({safe_score, distance, label, node});
+    };
+
+    for (int i = 0; i < source_count; ++i) {
+        const SourceEdgeStart& start = source_starts[i];
+        if (!valid_edge(start.edge)) {
+            continue;
+        }
+        const int source_label = i + 1;
+        const int region_label =
+            source_region_label[static_cast<std::size_t>(source_label)];
+        if (region_label <= 0) {
+            continue;
+        }
+        edge_source_label[static_cast<std::size_t>(start.edge)] =
+            region_label;
+        for (const SourceEndpointSeed& seed :
+             source_endpoint_seeds[static_cast<std::size_t>(source_label)]) {
+            seed_node(seed.node, region_label, seed.capacity, seed.distance);
+        }
+    }
+
+    while (!queue.empty()) {
+        const QueueItem item = queue.top();
+        queue.pop();
+        if (!valid_node(item.node)) {
+            continue;
+        }
+        const int node_index = item.node;
+        if (node_label[static_cast<std::size_t>(node_index)] != item.label ||
+            std::abs(best_score[static_cast<std::size_t>(node_index)] -
+                     item.score) > 1.0e-4f ||
+            std::abs(best_distance[static_cast<std::size_t>(node_index)] -
+                     item.distance) > 1.0e-6) {
+            continue;
+        }
+        for (const int edge_index :
+             incident_edges[static_cast<std::size_t>(node_index)]) {
+            const int next_node = edge_other_node(edge_index, node_index);
+            if (!valid_node(next_node)) {
+                continue;
+            }
+            const GraphEdge& edge = graph.edges[edge_index];
+            const float score =
+                std::min(item.score, std::max(0.0f, edge.capacity));
+            const double distance =
+                item.distance +
+                edge_lengths[static_cast<std::size_t>(edge_index)];
+            seed_node(next_node, item.label, score, distance);
+        }
+    }
+
+    cv::Mat graph_labels = cv::Mat::zeros(white_domain.size(), CV_32S);
+    const auto set_graph_label = [&](const cv::Point pixel, const int label) {
+        if (label <= 0 || pixel.x < 0 || pixel.x >= graph_labels.cols ||
+            pixel.y < 0 || pixel.y >= graph_labels.rows ||
+            white_domain.at<std::uint8_t>(pixel.y, pixel.x) == 0) {
+            return;
+        }
+        int& current = graph_labels.at<int>(pixel.y, pixel.x);
+        if (current == 0 || label < current) {
+            current = label;
+        }
+    };
+
+    for (int node = 1; node < node_count; ++node) {
+        const int label = node_label[static_cast<std::size_t>(node)];
+        if (label <= 0) {
+            continue;
+        }
+        if (node < static_cast<int>(graph.node_pixel_groups.size())) {
+            for (const cv::Point pixel :
+                 graph.node_pixel_groups[static_cast<std::size_t>(node)]) {
+                set_graph_label(pixel, label);
+            }
+        }
+        const cv::Point anchor(cvRound(graph.nodes[node].x),
+                               cvRound(graph.nodes[node].y));
+        set_graph_label(anchor, label);
+    }
+
+    for (int edge_index = 0;
+         edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
+        const GraphEdge& edge = graph.edges[edge_index];
+        int label_a =
+            valid_node(edge.a) ? node_label[static_cast<std::size_t>(edge.a)]
+                               : 0;
+        int label_b =
+            valid_node(edge.b) ? node_label[static_cast<std::size_t>(edge.b)]
+                               : 0;
+        const int source_label =
+            edge_source_label[static_cast<std::size_t>(edge_index)];
+        if (label_a == 0 && label_b == 0 && source_label > 0) {
+            label_a = source_label;
+            label_b = source_label;
+        } else if (label_a == 0) {
+            label_a = label_b > 0 ? label_b : source_label;
+        } else if (label_b == 0) {
+            label_b = label_a > 0 ? label_a : source_label;
+        }
+        std::vector<cv::Point> ordered = order_edge_pixels(edge, graph);
+        if (ordered.empty()) {
+            ordered = edge.pixels;
+        }
+        if (ordered.empty()) {
+            continue;
+        }
+        if (label_a == label_b || label_a <= 0 || label_b <= 0) {
+            const int label = label_a > 0 ? label_a : label_b;
+            for (const cv::Point pixel : ordered) {
+                set_graph_label(pixel, label);
+            }
+            continue;
+        }
+
+        if (edge.a != edge.b && ordered.size() > 1) {
+            const cv::Point first = ordered.front();
+            const cv::Point last = ordered.back();
+            const cv::Point2f a = graph.nodes[edge.a];
+            const cv::Point2f b = graph.nodes[edge.b];
+            const double first_a = (first.x - a.x) * (first.x - a.x) +
+                                   (first.y - a.y) * (first.y - a.y);
+            const double first_b = (first.x - b.x) * (first.x - b.x) +
+                                   (first.y - b.y) * (first.y - b.y);
+            const double last_a = (last.x - a.x) * (last.x - a.x) +
+                                  (last.y - a.y) * (last.y - a.y);
+            const double last_b = (last.x - b.x) * (last.x - b.x) +
+                                  (last.y - b.y) * (last.y - b.y);
+            if (first_b + last_a < first_a + last_b) {
+                std::reverse(ordered.begin(), ordered.end());
+            }
+        }
+
+        int cut_index = static_cast<int>(ordered.size() / 2);
+        float best_capacity = std::numeric_limits<float>::infinity();
+        const double middle = static_cast<double>(ordered.size() - 1) * 0.5;
+        for (int i = 0; i < static_cast<int>(ordered.size()); ++i) {
+            const cv::Point pixel = ordered[static_cast<std::size_t>(i)];
+            if (pixel.x < 0 || pixel.x >= dt.cols || pixel.y < 0 ||
+                pixel.y >= dt.rows) {
+                continue;
+            }
+            const float capacity = capacity_from_dt(
+                dt.at<float>(pixel.y, pixel.x));
+            const double middle_distance = std::abs(static_cast<double>(i) -
+                                                    middle);
+            const double best_middle_distance =
+                std::abs(static_cast<double>(cut_index) - middle);
+            if (capacity < best_capacity - 1.0e-4f ||
+                (std::abs(capacity - best_capacity) <= 1.0e-4f &&
+                 middle_distance < best_middle_distance)) {
+                best_capacity = capacity;
+                cut_index = i;
+            }
+        }
+        for (int i = 0; i < static_cast<int>(ordered.size()); ++i) {
+            set_graph_label(ordered[static_cast<std::size_t>(i)],
+                            i <= cut_index ? label_a : label_b);
+        }
+    }
+
+    struct PixelQueueItem {
+        float distance = 0.0f;
+        int label = 0;
+        cv::Point pixel{-1, -1};
+    };
+    struct PixelQueueCompare {
+        bool operator()(const PixelQueueItem& a,
+                        const PixelQueueItem& b) const {
+            if (std::abs(a.distance - b.distance) > 1.0e-6f) {
+                return a.distance > b.distance;
+            }
+            return a.label > b.label;
+        }
+    };
+    std::priority_queue<PixelQueueItem, std::vector<PixelQueueItem>,
+                        PixelQueueCompare>
+        pixel_queue;
+    cv::Mat label_distance(white_domain.size(), CV_32F,
+                           cv::Scalar(std::numeric_limits<float>::infinity()));
+    const auto seed_label_pixel = [&](const cv::Point pixel, const int label,
+                                      const float distance) {
+        if (label <= 0 || pixel.x < 0 || pixel.x >= white_domain.cols ||
+            pixel.y < 0 || pixel.y >= white_domain.rows ||
+            white_domain.at<std::uint8_t>(pixel.y, pixel.x) == 0) {
+            return;
+        }
+        float& current_distance =
+            label_distance.at<float>(pixel.y, pixel.x);
+        int& current_label = result.labels.at<int>(pixel.y, pixel.x);
+        if (distance < current_distance - 1.0e-6f ||
+            (std::abs(distance - current_distance) <= 1.0e-6f &&
+             (current_label == 0 || label < current_label))) {
+            current_distance = distance;
+            current_label = label;
+            pixel_queue.push({distance, label, pixel});
+        }
+    };
+    for (int y = 0; y < graph_labels.rows; ++y) {
+        for (int x = 0; x < graph_labels.cols; ++x) {
+            const int label = graph_labels.at<int>(y, x);
+            if (label <= 0) {
+                continue;
+            }
+            ++result.graph_seed_pixels;
+            seed_label_pixel(cv::Point(x, y), label, 0.0f);
+        }
+    }
+
+    const std::array<cv::Point, 8> kDirs = {
+        {{-1, -1}, {0, -1}, {1, -1}, {-1, 0},
+         {1, 0},   {-1, 1}, {0, 1},  {1, 1}}};
+    while (!pixel_queue.empty()) {
+        const PixelQueueItem item = pixel_queue.top();
+        pixel_queue.pop();
+        if (item.pixel.x < 0 || item.pixel.x >= white_domain.cols ||
+            item.pixel.y < 0 || item.pixel.y >= white_domain.rows) {
+            continue;
+        }
+        if (result.labels.at<int>(item.pixel.y, item.pixel.x) != item.label ||
+            std::abs(label_distance.at<float>(item.pixel.y, item.pixel.x) -
+                     item.distance) > 1.0e-6f) {
+            continue;
+        }
+        for (const cv::Point dir : kDirs) {
+            const cv::Point next = item.pixel + dir;
+            if (next.x < 0 || next.x >= white_domain.cols || next.y < 0 ||
+                next.y >= white_domain.rows ||
+                white_domain.at<std::uint8_t>(next.y, next.x) == 0) {
+                continue;
+            }
+            const float step = (std::abs(dir.x) + std::abs(dir.y) == 2)
+                                   ? static_cast<float>(std::sqrt(2.0))
+                                   : 1.0f;
+            seed_label_pixel(next, item.label, item.distance + step);
+        }
+    }
+
+    double max_label_value = 0.0;
+    cv::minMaxLoc(result.labels, nullptr, &max_label_value);
+    result.region_count = static_cast<int>(max_label_value);
+
+    cv::Mat cc_labels;
+    const int cc_count =
+        cv::connectedComponents(white_domain, cc_labels, 8, CV_32S);
+    std::vector<int> component_label(static_cast<std::size_t>(cc_count), 0);
+    for (int y = 0; y < result.labels.rows; ++y) {
+        for (int x = 0; x < result.labels.cols; ++x) {
+            const int label = result.labels.at<int>(y, x);
+            if (label <= 0) {
+                continue;
+            }
+            const int component = cc_labels.at<int>(y, x);
+            if (component > 0 && component < cc_count &&
+                component_label[static_cast<std::size_t>(component)] == 0) {
+                component_label[static_cast<std::size_t>(component)] = label;
+            }
+        }
+    }
+    for (int y = 0; y < result.labels.rows; ++y) {
+        for (int x = 0; x < result.labels.cols; ++x) {
+            if (white_domain.at<std::uint8_t>(y, x) == 0 ||
+                result.labels.at<int>(y, x) > 0) {
+                continue;
+            }
+            ++result.unlabeled_white_pixels;
+            const int component = cc_labels.at<int>(y, x);
+            if (component <= 0 || component >= cc_count) {
+                continue;
+            }
+            int& label = component_label[static_cast<std::size_t>(component)];
+            if (label == 0) {
+                label = ++result.region_count;
+            }
+            result.labels.at<int>(y, x) = label;
+        }
+    }
+
+    return result;
+}
+
+struct FlowGateNormalizationStats {
+    int region_count = 0;
+    double global_max_flow = 0.0;
+};
+
+cv::Mat normalize_flow_by_regions(
+        const cv::Mat& flow,
+        const cv::Mat& region_labels,
+        FlowGateNormalizationStats* stats = nullptr) {
+    CV_Assert(flow.type() == CV_32F);
+    CV_Assert(region_labels.empty() ||
+              (region_labels.type() == CV_32S &&
+               region_labels.size() == flow.size()));
+
+    cv::Mat nonnegative_flow = flow.clone();
+    nonnegative_flow.setTo(0.0f, nonnegative_flow < 0.0f);
+
+    double global_max_flow = 0.0;
+    cv::minMaxLoc(nonnegative_flow, nullptr, &global_max_flow);
+    double max_region_label_value = 0.0;
+    if (!region_labels.empty()) {
+        cv::minMaxLoc(region_labels, nullptr, &max_region_label_value);
+    }
+    const int region_count = static_cast<int>(max_region_label_value);
+
+    std::vector<float> region_max(static_cast<std::size_t>(region_count + 1),
+                                  0.0f);
+    if (region_count > 0) {
+        for (int y = 0; y < flow.rows; ++y) {
+            const float* flow_row = nonnegative_flow.ptr<float>(y);
+            const int* label_row = region_labels.ptr<int>(y);
+            for (int x = 0; x < flow.cols; ++x) {
+                const int label = label_row[x];
+                if (label <= 0 || label > region_count) {
+                    continue;
+                }
+                region_max[static_cast<std::size_t>(label)] =
+                    std::max(region_max[static_cast<std::size_t>(label)],
+                             flow_row[x]);
+            }
+        }
+    }
+
+    const float fallback_denominator =
+        global_max_flow > 1.0e-6 ? static_cast<float>(global_max_flow) : 0.0f;
+    cv::Mat normalized_flow(flow.size(), CV_32F, cv::Scalar(0));
+    cv::parallel_for_(cv::Range(0, flow.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const float* flow_row = nonnegative_flow.ptr<float>(y);
+            const int* label_row =
+                region_count > 0 ? region_labels.ptr<int>(y) : nullptr;
+            float* out_row = normalized_flow.ptr<float>(y);
+            for (int x = 0; x < flow.cols; ++x) {
+                if (flow_row[x] <= 0.0f) {
+                    continue;
+                }
+                const int label = label_row != nullptr ? label_row[x] : 0;
+                const float denominator =
+                    label > 0 && label <= region_count
+                        ? region_max[static_cast<std::size_t>(label)]
+                        : fallback_denominator;
+                if (denominator <= 1.0e-6f) {
+                    continue;
+                }
+                out_row[x] = std::clamp(flow_row[x] / denominator, 0.0f, 1.0f);
+            }
+        }
+    });
+
+    if (stats != nullptr) {
+        stats->region_count = region_count;
+        stats->global_max_flow = global_max_flow;
+    }
+    return normalized_flow;
+}
+
 cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
                                        const float backtrack_distance,
-                                       const float local_boost) {
+                                       const float local_boost,
+                                       const cv::Mat& region_labels =
+                                           cv::Mat()) {
     CV_Assert(flow.type() == CV_32F);
+    CV_Assert(region_labels.empty() ||
+              (region_labels.type() == CV_32S &&
+               region_labels.size() == flow.size()));
     const int rows = flow.rows;
     const int cols = flow.cols;
     cv::Mat weight(flow.size(), CV_32F, cv::Scalar(0));
 
-    cv::Mat nonnegative_flow = flow.clone();
-    nonnegative_flow.setTo(0.0f, nonnegative_flow < 0.0f);
-    double global_max_flow = 0.0;
-    cv::minMaxLoc(nonnegative_flow, nullptr, &global_max_flow);
-    const float global_denominator =
-        global_max_flow > 1.0e-6 ? static_cast<float>(global_max_flow) : 0.0f;
+    FlowGateNormalizationStats norm_stats;
+    cv::Mat normalized_flow =
+        normalize_flow_by_regions(flow, region_labels, &norm_stats);
+    const int region_count = norm_stats.region_count;
     const float local_blend = std::clamp(local_boost, 0.0f, 1.0f);
 
     const int local_radius =
@@ -8463,28 +9239,38 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
         const int kernel_size = local_radius * 2 + 1;
         const cv::Mat kernel = cv::getStructuringElement(
             cv::MORPH_ELLIPSE, cv::Size(kernel_size, kernel_size));
-        cv::dilate(nonnegative_flow, local_max, kernel);
+        if (region_count > 0) {
+            local_max = cv::Mat::zeros(flow.size(), CV_32F);
+            for (int label = 1; label <= region_count; ++label) {
+                const cv::Mat label_mask = region_labels == label;
+                cv::Mat label_flow = cv::Mat::zeros(flow.size(), CV_32F);
+                normalized_flow.copyTo(label_flow, label_mask);
+                cv::Mat label_local_max;
+                cv::dilate(label_flow, label_local_max, kernel);
+                label_local_max.copyTo(local_max, label_mask);
+            }
+        } else {
+            cv::dilate(normalized_flow, local_max, kernel);
+        }
     } else {
-        local_max = nonnegative_flow;
+        local_max = normalized_flow;
     }
 
     cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             float* out_row = weight.ptr<float>(y);
-            const float* flow_row = flow.ptr<float>(y);
+            const float* norm_row = normalized_flow.ptr<float>(y);
             const float* max_row = local_max.ptr<float>(y);
             for (int x = 0; x < cols; ++x) {
-                const float local_denominator = max_row[x];
-                if (flow_row[x] <= 0.0f) {
+                const float normalized_gate = norm_row[x];
+                if (normalized_gate <= 0.0f) {
                     continue;
                 }
+                const float local_denominator = max_row[x];
                 const float local_gate =
                     local_denominator > 1.0e-6f
-                        ? std::clamp(flow_row[x] / local_denominator, 0.0f, 1.0f)
-                        : 0.0f;
-                const float normalized_gate =
-                    global_denominator > 0.0f
-                        ? std::clamp(flow_row[x] / global_denominator, 0.0f, 1.0f)
+                        ? std::clamp(normalized_gate / local_denominator,
+                                     0.0f, 1.0f)
                         : 0.0f;
                 out_row[x] = local_blend * local_gate +
                              (1.0f - local_blend) * normalized_gate;
@@ -8496,7 +9282,8 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
               << "  local_max_radius: " << local_radius << "\n"
               << "  backtrack_distance: " << backtrack_distance << "\n"
               << "  local_boost: " << local_blend << "\n"
-              << "  global_max_flow: " << global_max_flow << "\n";
+              << "  normalization_regions: " << region_count << "\n"
+              << "  global_max_flow: " << norm_stats.global_max_flow << "\n";
     return weight;
 }
 
@@ -9084,7 +9871,11 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
 
         const cv::Mat flow_gate_weight = compute_flow_gate_weight_image(
             dense_flow_result.tree_dense_flow_greedy_ascent,
-            backtrack_distance, local_boost);
+            backtrack_distance, local_boost,
+            dense_flow_result.flow_gate_regions);
+        const cv::Mat flow_gate_basis = normalize_flow_by_regions(
+            dense_flow_result.tree_dense_flow_greedy_ascent,
+            dense_flow_result.flow_gate_regions);
 
         if (dense_flow != nullptr) {
             for (int y = 0; y < height; ++y) {
@@ -9104,9 +9895,7 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         }
         if (gate_basis_flow != nullptr) {
             for (int y = 0; y < height; ++y) {
-                const float* src_row = dense_flow_result
-                                           .tree_dense_flow_greedy_ascent
-                                           .ptr<float>(y);
+                const float* src_row = flow_gate_basis.ptr<float>(y);
                 std::copy(src_row, src_row + width,
                           gate_basis_flow +
                               static_cast<std::size_t>(y) * width);
@@ -9489,7 +10278,8 @@ int main(int argc, char** argv) {
                     dense_flow_result.flow_gate_weight =
                         compute_flow_gate_weight_image(
                             dense_flow_result.tree_dense_flow_greedy_ascent,
-                            args.backtrack_distance, args.local_boost);
+                            args.backtrack_distance, args.local_boost,
+                            dense_flow_result.flow_gate_regions);
                     timings.push_back(
                         finish_timing("flow_gate_weight", timing));
                 }
@@ -9586,6 +10376,15 @@ int main(int argc, char** argv) {
                         dense_flow_result.edge_flow_px_gray_bg);
             write_image(workdir / (stem + "_graph_source_edges.tif"),
                         dense_flow_result.graph_source_edges);
+            if (!dense_flow_result.flow_gate_regions.empty()) {
+                double max_region_label = 0.0;
+                cv::minMaxLoc(dense_flow_result.flow_gate_regions, nullptr,
+                              &max_region_label);
+                write_image(workdir / (stem + "_flow_gate_regions.tif"),
+                            labels_to_u16(
+                                dense_flow_result.flow_gate_regions,
+                                static_cast<int>(max_region_label)));
+            }
             write_image(workdir / (stem + "_island_obstacle_factor.tif"),
                         dense_flow_result.island_obstacle_factor);
             write_image(workdir / (stem + "_island_flow_passability.tif"),
@@ -9695,6 +10494,14 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"graph_source_edges",
                  to_float_layer(dense_flow_result.graph_source_edges)});
+            if (!dense_flow_result.flow_gate_regions.empty()) {
+                cv::Mat flow_gate_regions_float;
+                dense_flow_result.flow_gate_regions.convertTo(
+                    flow_gate_regions_float, CV_32F);
+                layered_tiff.push_back(
+                    {"flow_gate_regions",
+                     to_float_layer(flow_gate_regions_float)});
+            }
             layered_tiff.push_back(
                 {"island_obstacle_factor",
                  to_float_layer(dense_flow_result.island_obstacle_factor)});
