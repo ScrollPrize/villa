@@ -9336,19 +9336,10 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
         const int kernel_size = local_radius * 2 + 1;
         const cv::Mat kernel = cv::getStructuringElement(
             cv::MORPH_ELLIPSE, cv::Size(kernel_size, kernel_size));
-        if (region_count > 0) {
-            local_max = cv::Mat::zeros(flow.size(), CV_32F);
-            for (int label = 1; label <= region_count; ++label) {
-                const cv::Mat label_mask = region_labels == label;
-                cv::Mat label_flow = cv::Mat::zeros(flow.size(), CV_32F);
-                normalized_flow.copyTo(label_flow, label_mask);
-                cv::Mat label_local_max;
-                cv::dilate(label_flow, label_local_max, kernel);
-                label_local_max.copyTo(local_max, label_mask);
-            }
-        } else {
-            cv::dilate(normalized_flow, local_max, kernel);
-        }
+        // Normalize per source/merged region first, then compute the local
+        // boost denominator globally so nearby high-flow regions can suppress
+        // weaker neighboring regions.
+        cv::dilate(normalized_flow, local_max, kernel);
     } else {
         local_max = normalized_flow;
     }
@@ -9380,6 +9371,7 @@ cv::Mat compute_flow_gate_weight_image(const cv::Mat& flow,
               << "  backtrack_distance: " << backtrack_distance << "\n"
               << "  local_boost: " << local_blend << "\n"
               << "  normalization_regions: " << region_count << "\n"
+              << "  local_max_scope: global_after_region_normalization\n"
               << "  global_max_flow: " << norm_stats.global_max_flow << "\n";
     return weight;
 }
