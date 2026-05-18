@@ -782,6 +782,14 @@ def _output_tifxyz_uuid(timestamp=None, iteration_idx=None, total_iterations=Non
     if timestamp is None:
         timestamp = RUN_TIMESTAMP or datetime.now().strftime("%Y%m%d_%H%M%S")
     input_name = Path(TIFXYZ_PATH).name
+    # Truncate input_name to keep total uuid + filename under filesystem limits.
+    # Iterative resumes can accumulate parent names, blowing past Linux's 255-char
+    # filename ceiling. Keep the segment-id prefix (first 24 chars) and append a
+    # short 8-char hash so resumes still produce unique-but-bounded dir names.
+    if len(input_name) > 40:
+        import hashlib as _hl
+        digest = _hl.sha1(input_name.encode("utf-8")).hexdigest()[:8]
+        input_name = f"{input_name[:24]}_{digest}"
     suffix = ""
     if total_iterations is not None and int(total_iterations) > 1:
         suffix = f"_iter{int(iteration_idx):02d}of{int(total_iterations):02d}"
