@@ -984,6 +984,13 @@ def configure_flow_gate(
 	_flow_gate_debug_counts[str(stage_name)] = 0
 
 
+def _debug_interval(cfg: dict, *names: str) -> int:
+	for name in names:
+		if name in cfg:
+			return max(0, int(cfg.get(name, 0)))
+	return 0
+
+
 def configure_pred_dt(*, normal_source: str | None = None) -> None:
 	global _pred_dt_normal_source
 	src = "model" if normal_source is None else str(normal_source)
@@ -1473,11 +1480,14 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 	if debug:
 		debug_index = _flow_gate_debug_counts.get(_flow_gate_stage, 0)
 		_flow_gate_debug_counts[_flow_gate_stage] = debug_index + 1
-	debug_layer_interval = max(1, int(cfg.get("debug_layer_interval", 10)))
-	debug_vis_interval = cfg.get("debug_vis_interval", cfg.get("debug_jpg_interval", 50))
-	debug_jpg_interval = max(1, int(debug_vis_interval))
-	write_layer_debug = debug and (debug_index % debug_layer_interval) == 0
-	write_jpg_debug = debug and (debug_index % debug_jpg_interval) == 0
+	debug_layer_interval = _debug_interval(cfg, "debug_layer_interval")
+	debug_jpg_interval = _debug_interval(cfg, "debug_vis_interval", "debug_jpg_interval")
+	write_layer_debug = (
+		debug and debug_layer_interval > 0 and (debug_index % debug_layer_interval) == 0
+	)
+	write_jpg_debug = (
+		debug and debug_jpg_interval > 0 and (debug_index % debug_jpg_interval) == 0
+	)
 	return_flow_debug = write_layer_debug or write_jpg_debug
 	timing: dict[str, float] = {}
 	def mark(label: str) -> float:
