@@ -2,6 +2,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -82,10 +83,6 @@ def _process_point_collections(
     for collection_id, collection in tqdm(point_collections.items(), 'linking points to patches'):
         for point_id, point in collection['points'].items():
             point_zyx = torch.as_tensor(point['p'][::-1], dtype=torch.float32, device=device)
-            point_winding = torch.as_tensor(point['winding_annotation'], dtype=torch.float32, device=device)
-
-            if not torch.isfinite(point_winding):
-                continue
 
             nearest_patch_id = None
             nearest_distance = torch.tensor(float('inf'), device=device)
@@ -108,8 +105,59 @@ def _process_point_collections(
                         point_zyx=point_zyx.cpu().tolist(),
                         ij_coords=nearest_ij.tolist(),
                         distance=float(nearest_distance.cpu().item()),
-                        winding_annotation=float(point_winding.cpu().item()),
+                        winding_annotation=float(point['winding_annotation']),
                     )
                 )
 
     return links
+
+
+def normalise_pcl_winding_annotations(point_collections):
+    # Per-pcl: if every point has a winding annotation, leave alone; if none has one, set them all to 0;
+    # if mixed, print a warning and strip the unannotated points.
+    for pcl_id, pcl in point_collections.items():
+        points = pcl['points']
+        annotated = [pid for pid, p in points.items() if np.isfinite(p['winding_annotation'])]
+        unannotated = [pid for pid, p in points.items() if not np.isfinite(p['winding_annotation'])]
+        if not unannotated:
+            continue
+        if not annotated:
+            for p in points.values():
+                p['winding_annotation'] = 0.0
+            continue
+        print(
+            f'WARNING: pcl {pcl_id} ({pcl.get("name", "?")}) has mixed winding-number annotations: '
+            f'{len(annotated)} annotated, {len(unannotated)} missing — stripping unannotated points'
+        )
+        for pid in unannotated:
+            del points[pid]
+
+
+def categorise_point_collections(point_collections, patches_dict):
+    # Partition point_collections (post-attachment) into:
+    #   cross_patch: collections whose attached points span >= 2 different patches.
+    #                Each cross-patch pcl is given a 'points_by_patch' field: an
+    #                ordered dict mapping patch_id -> list of attached points on
+    #                that patch. Patches are ordered by the first attached point
+    #                that hits them when scanning the pcl's points in int(json-key)
+    #                order; within each patch, points are also in int(key) order.
+    #                The winding-number loss consumes this directly.
+    #   single_patch: the rest (touch 0 or 1 patches in total).
+    cross_patch = {}
+    single_patch = {}
+    for pcl_id, pcl in point_collections.items():
+        points_by_patch = {}
+        for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
+            if 'on_patch' not in point:
+                continue
+            pid = point['on_patch']['id']
+            if pid not in patches_dict:
+                continue
+            points_by_patch.setdefault(pid, []).append(point)
+        if len(points_by_patch) >= 2:
+            new_pcl = dict(pcl)
+            new_pcl['points_by_patch'] = points_by_patch
+            cross_patch[pcl_id] = new_pcl
+        else:
+            single_patch[pcl_id] = pcl
+    return cross_patch, single_patch

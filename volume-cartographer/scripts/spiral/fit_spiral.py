@@ -11,6 +11,7 @@ import kornia
 import hashlib
 import trimesh
 import datetime
+import itertools
 import numpy as np
 import scipy.ndimage
 import torch.nn as nn
@@ -23,7 +24,7 @@ from torchdiffeq import odeint
 
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
-from point_collection import load_point_collection, _process_point_collections
+from point_collection import load_point_collection, _process_point_collections, normalise_pcl_winding_annotations, categorise_point_collections
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
@@ -80,6 +81,7 @@ default_config = {
     'num_points_per_patch': 800,
     'winding_number_num_pairs': 2000,
     'winding_number_num_pcls': 1,
+    'winding_number_adjacent_patches_only': True,
     'normals_num_points': 2000,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 8.e0,
@@ -880,17 +882,20 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
 
 
 def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections):
-    # For pairs of annotated PCL points (possibly on different patches), constrain the spiral
-    # shifted-radius gap to match the annotated winding-number difference. For each annotated
-    # point we build 4 L-shaped strips: from (i, j), walk along one of the cardinal patch
-    # directions (right, left, down, up) to a uniformly-random turn point inside the
-    # contiguous valid run, then 90-degree-turn into a uniformly-random perpendicular
-    # direction and walk to the end of that valid run. Each L is sampled in traversal order
-    # along its bent path, so _unwrap_track_shifted_radii can stitch theta=0 seam crossings
-    # along the whole strip (the corner only introduces a ~sqrt(2)-quad ij jump). We then
-    # pool all 4 L-strips per annotated point into one set of sample points and take a
-    # single all-pairs diff between p1's and p2's pooled sets, regressing it onto
-    # winding_diff * dr_per_winding.
+    # For pairs of annotated PCL points on different patches, constrain the spiral
+    # shifted-radius gap to match the annotated winding-number difference. Each
+    # cross-patch pcl exposes its attached points grouped by patch
+    # (pcl['points_by_patch']); we form the set of all pairs (p1, p2) whose patches
+    # differ and sample uniformly from it. For each annotated point we build 4
+    # L-shaped strips: from (i, j), walk along one of the cardinal patch directions
+    # (right, left, down, up) to a uniformly-random turn point inside the contiguous
+    # valid run, then 90-degree-turn into a uniformly-random perpendicular direction
+    # and walk to the end of that valid run. Each L is sampled in traversal order
+    # along its bent path, so _unwrap_track_shifted_radii can stitch theta=0 seam
+    # crossings along the whole strip (the corner only introduces a ~sqrt(2)-quad ij
+    # jump). We then pool all 4 L-strips per annotated point into one set of sample
+    # points and take a single all-pairs diff between p1's and p2's pooled sets,
+    # regressing it onto winding_diff * dr_per_winding.
 
     num_points_per_strip = cfg['num_points_per_patch'] // 2
     num_strips_per_pcl = 4
@@ -906,29 +911,31 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
     selected_pcls = [point_collections[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
-        points = list(pcl['points'].values())
-        valid_points = [
-            p for p in points
-            if 'on_patch' in p
-            and np.isfinite(p['winding_annotation'])
-            and p['on_patch']['id'] in patches_dict
-        ]
-        if len(valid_points) < 2:
+        # Pair patches either only with their immediate neighbour in the pcl's
+        # patch ordering (first-seen order; see categorise_point_collections),
+        # or with every other patch.
+        if cfg['winding_number_adjacent_patches_only']:
+            cross_pairs = [(p1, p2) for p1, p2 in zip(pcl['points_by_patch'], list(pcl['points_by_patch'])[1:])]
+        else:
+            cross_pairs = list(itertools.combinations(pcl['points_by_patch'], r=2))
+        if not cross_pairs:
             continue
 
         num_pairs_for_pcl = min(
-            len(valid_points) - 1,
+            len(cross_pairs),
             cfg['winding_number_num_pairs'] // max(1, len(selected_pcls)),
         )
         if num_pairs_for_pcl <= 0:
             continue
-        pair_indices = np.random.choice(len(valid_points) - 1, num_pairs_for_pcl, replace=False)
+        chosen = np.random.choice(len(cross_pairs), num_pairs_for_pcl, replace=False)
+        pid_pairs = [cross_pairs[i] for i in chosen]
 
-        for pair_idx in pair_indices:
-            p1, p2 = valid_points[pair_idx], valid_points[pair_idx + 1]
+        for pid1, pid2 in pid_pairs:
+            points1 = pcl['points_by_patch'][pid1]
+            points2 = pcl['points_by_patch'][pid2]
+            p1 = points1[np.random.randint(len(points1))]
+            p2 = points2[np.random.randint(len(points2))]
             winding_diff = p2['winding_annotation'] - p1['winding_annotation']
-            pid1 = p1['on_patch']['id']
-            pid2 = p2['on_patch']['id']
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
 
@@ -2248,6 +2255,13 @@ def main():
         del point_collections[pid]
     print(f'dropped {len(dropped_patch_ids)} patches and {len(dropped_pcl_ids)} pcls outside z-roi [{z_begin}, {z_end})')
 
+    normalise_pcl_winding_annotations(point_collections)
+    cross_patch_point_collections, single_patch_point_collections = categorise_point_collections(point_collections, patches)
+    print(
+        f'partitioned pcls: {len(cross_patch_point_collections)} cross-patch '
+        f'(used for winding-number loss), {len(single_patch_point_collections)} single-patch'
+    )
+
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
     out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{len(patches)}-patch_{cfg["working_set_mode"]}'
     if not wandb.run.name.startswith('dummy-'):
@@ -2261,7 +2275,7 @@ def main():
         fit_spiral_3d(
             scroll_zarr_array,
             patches,
-            list(point_collections.values()),
+            list(cross_patch_point_collections.values()),
             umbilicus,
             out_path,
             pass_seed_patch_id=None,
@@ -2273,7 +2287,7 @@ def main():
         fit_spiral_3d(
             scroll_zarr_array,
             patches,
-            list(point_collections.values()),
+            list(cross_patch_point_collections.values()),
             umbilicus,
             out_path,
             pass_seed_patch_id=seed_patch_id,
@@ -2289,7 +2303,7 @@ def main():
         result = fit_spiral_3d(
             scroll_zarr_array,
             pass_pool_patches,
-            list(point_collections.values()),
+            list(cross_patch_point_collections.values()),
             umbilicus,
             out_path,
             pass_seed_patch_id=current_seed_patch_id,
