@@ -71,6 +71,33 @@ void CPointCollectionWidget::setupUi()
     layout->addWidget(_chkAnnotate);
     connect(_chkAnnotate, &QCheckBox::toggled, this, &CPointCollectionWidget::annotateToggled);
 
+    QGroupBox *same_wrap_group = new QGroupBox("Same-wrap Annotation");
+    QVBoxLayout *same_wrap_layout = new QVBoxLayout(same_wrap_group);
+    _chkSameWrapAnnotation = new QCheckBox("Same-wrap annotation mode", same_wrap_group);
+    _chkSameWrapAnnotation->setToolTip("Shift-click in an active volume viewer to preview points along one skeleton component. Shift+E commits; Ctrl+Z clears.");
+    same_wrap_layout->addWidget(_chkSameWrapAnnotation);
+    QHBoxLayout *same_wrap_spacing_layout = new QHBoxLayout();
+    same_wrap_spacing_layout->addWidget(new QLabel("Spacing:"));
+    _sameWrapSpacingSpinbox = new QDoubleSpinBox(same_wrap_group);
+    _sameWrapSpacingSpinbox->setRange(1.0, 1000.0);
+    _sameWrapSpacingSpinbox->setDecimals(1);
+    _sameWrapSpacingSpinbox->setSingleStep(1.0);
+    _sameWrapSpacingSpinbox->setValue(10.0);
+    _sameWrapSpacingSpinbox->setSuffix(" vx");
+    _sameWrapSpacingSpinbox->setMaximumWidth(90);
+    _sameWrapSpacingSpinbox->setToolTip("Distance between generated same-wrap annotation points in surface voxels.");
+    same_wrap_spacing_layout->addWidget(_sameWrapSpacingSpinbox);
+    same_wrap_spacing_layout->addStretch();
+    same_wrap_layout->addLayout(same_wrap_spacing_layout);
+    _clearSameWrapAnnotationButton = new QPushButton("Clear Same-wrap Preview", same_wrap_group);
+    _clearSameWrapAnnotationButton->setToolTip("Clear the current same-wrap annotation preview without committing it.");
+    same_wrap_layout->addWidget(_clearSameWrapAnnotationButton);
+    layout->addWidget(same_wrap_group);
+    connect(_chkSameWrapAnnotation, &QCheckBox::toggled, this, &CPointCollectionWidget::sameWrapAnnotationToggled);
+    connect(_sameWrapSpacingSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged);
+    connect(_clearSameWrapAnnotationButton, &QPushButton::clicked, this, &CPointCollectionWidget::sameWrapAnnotationClearRequested);
+
     _tree_view = new QTreeView(main_widget);
     _model = new QStandardItemModel(this);
     _tree_view->setModel(_model);
@@ -925,6 +952,16 @@ void CPointCollectionWidget::setAnnotateChecked(bool checked)
         const QSignalBlocker blocker(_chkAnnotate);
         _chkAnnotate->setChecked(checked);
     }
+}
+
+bool CPointCollectionWidget::sameWrapAnnotationEnabled() const
+{
+    return _chkSameWrapAnnotation && _chkSameWrapAnnotation->isChecked();
+}
+
+double CPointCollectionWidget::sameWrapAnnotationSpacing() const
+{
+    return _sameWrapSpacingSpinbox ? _sameWrapSpacingSpinbox->value() : 10.0;
 }
 
 CPointCollectionWidget::~CPointCollectionWidget() {

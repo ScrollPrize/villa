@@ -40,9 +40,14 @@ public:
     void clearCorrPointsResults();
 
     void setAnnotateChecked(bool checked);
+    bool sameWrapAnnotationEnabled() const;
+    double sameWrapAnnotationSpacing() const;
 
 signals:
     void annotateToggled(bool enabled);
+    void sameWrapAnnotationToggled(bool enabled);
+    void sameWrapAnnotationSpacingChanged(double spacing);
+    void sameWrapAnnotationClearRequested();
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
@@ -90,6 +95,9 @@ private slots:
     uint64_t _selected_point_id = 0;
 
     QCheckBox *_chkAnnotate{nullptr};
+    QCheckBox *_chkSameWrapAnnotation{nullptr};
+    QDoubleSpinBox *_sameWrapSpacingSpinbox{nullptr};
+    QPushButton *_clearSameWrapAnnotationButton{nullptr};
 
     QTreeView *_tree_view;
     QStandardItemModel *_model;
@@ -119,4 +127,3 @@ private slots:
     std::unordered_map<uint64_t, CorrPointResult> _corr_point_results;
     std::unordered_map<uint64_t, float> _corr_collection_avgs;
 };
-

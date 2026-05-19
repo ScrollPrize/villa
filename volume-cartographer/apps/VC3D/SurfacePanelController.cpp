@@ -17,6 +17,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QAction>
 #include <QMenu>
@@ -44,7 +45,8 @@
 
 namespace {
 
-constexpr float kFocusPointFilterRadius = 10.0f;
+constexpr double kFocusPointFilterRadius = 10.0;
+constexpr int kReviewOverlapSearchEffort = 1000;
 
 void sync_tag(utils::Json& dict, bool checked, const std::string& name, const std::string& username = {})
 {
@@ -65,6 +67,68 @@ void sync_tag(utils::Json& dict, bool checked, const std::string& name, const st
             dict["date_last_modified"] = get_surface_time_str();
         }
     }
+}
+
+bool has_review_tag(const utils::Json& meta)
+{
+    if (meta.is_null() || !meta.contains("tags")) {
+        return false;
+    }
+    const auto& tags = meta.at("tags");
+    return tags.contains("reviewed");
+}
+
+std::set<std::string> find_review_overlaps(VolumePkg& volumePkg, QuadSurface& surface)
+{
+    std::set<std::string> overlapIds = surface.overlappingIds();
+
+    for (const auto& candidateId : volumePkg.segmentationIDs()) {
+        if (candidateId == surface.id || overlapIds.contains(candidateId)) {
+            continue;
+        }
+
+        auto candidate = volumePkg.getSurface(candidateId);
+        if (!candidate) {
+            candidate = volumePkg.loadSurface(candidateId);
+        }
+        if (!candidate || candidate.get() == &surface) {
+            continue;
+        }
+
+        if (overlap(surface, *candidate, kReviewOverlapSearchEffort)) {
+            overlapIds.insert(candidate->id);
+            candidate->addOverlappingId(surface.id);
+            candidate->writeOverlappingJson();
+        }
+    }
+
+    if (overlapIds != surface.overlappingIds()) {
+        surface.setOverlappingIds(overlapIds);
+        surface.writeOverlappingJson();
+    }
+
+    return overlapIds;
+}
+
+bool mark_partial_review(QuadSurface& surface, const std::string& sourceId, const std::string& username)
+{
+    if (surface.meta.is_null() || has_review_tag(surface.meta)) {
+        return false;
+    }
+
+    if (!surface.meta.contains("tags")) {
+        surface.meta["tags"] = utils::Json::object();
+    }
+
+    auto& tags = surface.meta["tags"];
+    tags["partial_review"] = utils::Json::object();
+    if (!username.empty()) {
+        tags["partial_review"]["user"] = username;
+    }
+    tags["partial_review"]["source"] = sourceId;
+    tags["partial_review"]["date"] = get_surface_time_str();
+    surface.save_meta();
+    return true;
 }
 
 } // namespace
@@ -986,12 +1050,24 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         }
     }
 
+    if (_filters.focusPointDistance) {
+        _filters.focusPointDistance->setRange(0.0, 1000000.0);
+        _filters.focusPointDistance->setDecimals(2);
+        _filters.focusPointDistance->setSingleStep(1.0);
+        _filters.focusPointDistance->setSuffix(tr(" vox"));
+        if (_filters.focusPointDistance->value() <= 0.0) {
+            _filters.focusPointDistance->setValue(kFocusPointFilterRadius);
+        }
+        _filters.focusPointDistance->setToolTip(tr("Maximum distance from the focus point for the Focus Point filter."));
+    }
+
     _filters.focusPoints = nullptr;
     _filters.unreviewed = nullptr;
     _filters.hideUnapproved = nullptr;
     _filters.noExpansion = nullptr;
     _filters.noDefective = nullptr;
     _filters.partialReview = nullptr;
+    _filters.showPartialReview = nullptr;
     _filters.inspectOnly = nullptr;
     _filters.currentOnly = nullptr;
 
@@ -1026,9 +1102,14 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
     addFilterOption(_filters.noExpansion, tr("Hide Expansion"), QStringLiteral("chkFilterNoExpansion"));
     addFilterOption(_filters.noDefective, tr("Hide Defective"), QStringLiteral("chkFilterNoDefective"));
     addFilterOption(_filters.partialReview, tr("Hide Partial Review"), QStringLiteral("chkFilterPartialReview"));
+    addFilterOption(_filters.showPartialReview, tr("Show Partial Review"), QStringLiteral("chkFilterShowPartialReview"));
     addFilterOption(_filters.inspectOnly, tr("Inspect Only"), QStringLiteral("chkFilterInspectOnly"));
     addSeparator();
     addFilterOption(_filters.currentOnly, tr("Current Segment Only"), QStringLiteral("chkFilterCurrentOnly"));
+
+    if (_filters.focusPointDistance && _filters.focusPoints) {
+        _filters.focusPointDistance->setEnabled(_filters.focusPoints->isChecked());
+    }
 
     connectFilterSignals();
     rebuildPointSetFilterModel();
@@ -1167,10 +1248,41 @@ void SurfacePanelController::connectFilterSignals()
     connectToggle(_filters.unreviewed);
     connectToggle(_filters.noExpansion);
     connectToggle(_filters.noDefective);
-    connectToggle(_filters.partialReview);
     connectToggle(_filters.hideUnapproved);
     connectToggle(_filters.inspectOnly);
     connectToggle(_filters.currentOnly);
+
+    if (_filters.partialReview) {
+        connect(_filters.partialReview, &QCheckBox::toggled, this, [this](bool checked) {
+            if (checked && _filters.showPartialReview) {
+                const QSignalBlocker blocker(_filters.showPartialReview);
+                _filters.showPartialReview->setChecked(false);
+            }
+            applyFilters();
+        });
+    }
+
+    if (_filters.focusPoints && _filters.focusPointDistance) {
+        connect(_filters.focusPoints, &QCheckBox::toggled,
+                _filters.focusPointDistance, &QDoubleSpinBox::setEnabled);
+    }
+
+    if (_filters.focusPointDistance) {
+        connect(_filters.focusPointDistance,
+                QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this,
+                [this](double) { applyFilters(); });
+    }
+
+    if (_filters.showPartialReview) {
+        connect(_filters.showPartialReview, &QCheckBox::toggled, this, [this](bool checked) {
+            if (checked && _filters.partialReview) {
+                const QSignalBlocker blocker(_filters.partialReview);
+                _filters.partialReview->setChecked(false);
+            }
+            applyFilters();
+        });
+    }
 
     if (_filters.pointSetMode) {
         connect(_filters.pointSetMode, &QComboBox::currentIndexChanged, this, [this]() { applyFilters(); });
@@ -1310,6 +1422,7 @@ void SurfacePanelController::updateFilterSummary()
     countIfChecked(_filters.noExpansion);
     countIfChecked(_filters.noDefective);
     countIfChecked(_filters.partialReview);
+    countIfChecked(_filters.showPartialReview);
     countIfChecked(_filters.inspectOnly);
     countIfChecked(_filters.currentOnly);
 
@@ -1342,9 +1455,7 @@ void SurfacePanelController::onTagCheckboxToggled()
             continue;
         }
 
-        const bool wasReviewed = surface->meta.contains("tags") && surface->meta.at("tags").contains("reviewed");
         const bool isNowReviewed = _tags.reviewed && _tags.reviewed->checkState() == Qt::Checked;
-        const bool reviewedJustAdded = !wasReviewed && isNowReviewed;
 
         if (surface->meta.contains("tags")) {
             auto& tags = surface->meta.at("tags");
@@ -1388,32 +1499,12 @@ void SurfacePanelController::onTagCheckboxToggled()
             surface->save_meta();
         }
 
-        if (reviewedJustAdded && _volumePkg) {
+        if (isNowReviewed && _volumePkg) {
             auto surf = _volumePkg->getSurface(id);
             if (surf) {
-                for (const auto& overlapId : surf->overlappingIds()) {
+                for (const auto& overlapId : find_review_overlaps(*_volumePkg, *surf)) {
                     auto overlapMeta = _volumePkg->getSurface(overlapId);
-                    if (!overlapMeta || overlapMeta->meta.is_null()) {
-                        continue;
-                    }
-
-                    const bool alreadyReviewed = overlapMeta->meta.contains("tags") &&
-                                                 overlapMeta->meta.at("tags").contains("reviewed");
-                    if (alreadyReviewed) {
-                        continue;
-                    }
-
-                    if (!overlapMeta->meta.contains("tags")) {
-                        overlapMeta->meta["tags"] = utils::Json::object();
-                    }
-
-                    auto& overlapTags = overlapMeta->meta["tags"];
-                    overlapTags["partial_review"] = utils::Json::object();
-                    if (!username.empty()) {
-                        overlapTags["partial_review"]["user"] = username;
-                    }
-                    overlapTags["partial_review"]["source"] = id;
-                    overlapMeta->save_meta();
+                    if (overlapMeta) mark_partial_review(*overlapMeta, id, username);
                 }
             }
         }
@@ -1445,6 +1536,7 @@ void SurfacePanelController::applyFiltersInternal()
                             isChecked(_filters.noExpansion) ||
                             isChecked(_filters.noDefective) ||
                             isChecked(_filters.partialReview) ||
+                            isChecked(_filters.showPartialReview) ||
                             isChecked(_filters.currentOnly) ||
                             isChecked(_filters.hideUnapproved) ||
                             isChecked(_filters.inspectOnly) ||
@@ -1510,12 +1602,15 @@ void SurfacePanelController::applyFiltersInternal()
     int filterCounter = 0;
     const bool currentOnly = isChecked(_filters.currentOnly);
     const bool focusPointFilter = isChecked(_filters.focusPoints) && poi;
+    const double focusPointFilterRadius = _filters.focusPointDistance
+        ? _filters.focusPointDistance->value()
+        : kFocusPointFilterRadius;
     std::unordered_set<QuadSurface*> focusPointSurfaces;
     if (focusPointFilter) {
         if (auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr) {
             SurfacePatchIndex::PointQuery query;
             query.worldPoint = poi->p;
-            query.tolerance = kFocusPointFilterRadius;
+            query.tolerance = static_cast<float>(focusPointFilterRadius);
             for (const auto& hit : patchIndex->locateAll(query)) {
                 if (hit.surface) {
                     focusPointSurfaces.insert(hit.surface.get());
@@ -1600,7 +1695,18 @@ void SurfacePanelController::applyFiltersInternal()
             if (isChecked(_filters.partialReview)) {
                 if (!surf->meta.is_null()) {
                     const auto tags = vc::json::tags_or_empty(surf->meta);
-                    show = show && !tags.contains("partial_review");
+                    const bool hasPartialReview = tags.contains("partial_review") || tags.contains("reviewed");
+                    show = show && !hasPartialReview;
+                }
+            }
+
+            if (isChecked(_filters.showPartialReview)) {
+                if (!surf->meta.is_null()) {
+                    const auto tags = vc::json::tags_or_empty(surf->meta);
+                    const bool hasPartialReview = tags.contains("partial_review") || tags.contains("reviewed");
+                    show = show && hasPartialReview;
+                } else {
+                    show = false;
                 }
             }
 

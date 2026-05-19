@@ -918,6 +918,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointClicked,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationToggled,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationClearRequested,
+                viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
+        viewer->setSameWrapAnnotationSpacing(_point_collection_widget->sameWrapAnnotationSpacing());
+        viewer->setSameWrapAnnotationMode(_point_collection_widget->sameWrapAnnotationEnabled());
         viewer->setProperty("vc_points_bound", true);
     }
 
@@ -2198,6 +2206,7 @@ void CWindow::CreateWidgets(void)
     filterUi.pointSetNone = btnPointSetFilterNone;
     filterUi.pointSetMode = cmbPointSetFilterMode;
     filterUi.surfaceIdFilter = ui.lineEditSurfaceFilter;
+    filterUi.focusPointDistance = ui.spinFocusPointFilterDistance;
     _surfacePanel->configureFilters(filterUi, _state->pointCollection());
 
     SurfacePanelController::TagUiRefs tagUi{
@@ -2325,6 +2334,36 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
+    if (_viewerManager && _point_collection_widget && _point_collection_widget->sameWrapAnnotationEnabled()) {
+        if (event->key() == Qt::Key_E && event->modifiers() == Qt::ShiftModifier) {
+            bool committed = false;
+            _viewerManager->forEachBaseViewer([&committed](VolumeViewerBase* baseViewer) {
+                if (committed || !baseViewer) {
+                    return;
+                }
+                if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
+                    committed = viewer->commitSameWrapAnnotationPreview();
+                }
+            });
+            if (committed) {
+                event->accept();
+                return;
+            }
+        }
+        if (event->key() == Qt::Key_Z && event->modifiers() == Qt::ControlModifier) {
+            _viewerManager->forEachBaseViewer([](VolumeViewerBase* baseViewer) {
+                if (!baseViewer) {
+                    return;
+                }
+                if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
+                    viewer->clearSameWrapAnnotationPreview();
+                }
+            });
+            event->accept();
+            return;
+        }
+    }
+
     // Shift+G decreases slice step size, Shift+H increases it
     if (event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers && _viewerManager) {
         if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
@@ -2353,6 +2392,19 @@ void CWindow::keyPressEvent(QKeyEvent* event)
 
 void CWindow::keyReleaseEvent(QKeyEvent* event)
 {
+    if (_viewerManager && _point_collection_widget &&
+        _point_collection_widget->sameWrapAnnotationEnabled() &&
+        event->key() == Qt::Key_Shift) {
+        _viewerManager->forEachBaseViewer([event](VolumeViewerBase* baseViewer) {
+            if (!baseViewer) {
+                return;
+            }
+            if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
+                viewer->onKeyRelease(event->key(), event->modifiers());
+            }
+        });
+    }
+
     if (_segmentationModule && _segmentationModule->handleKeyRelease(event)) {
         return;
     }

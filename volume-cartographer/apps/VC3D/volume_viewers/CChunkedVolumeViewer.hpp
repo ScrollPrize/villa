@@ -183,11 +183,15 @@ public slots:
     void onMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void onMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
-    void onKeyRelease(int, Qt::KeyboardModifiers) {}
+    void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onCollectionSelected(uint64_t) {}
     void onPointSelected(uint64_t) {}
+    void setSameWrapAnnotationMode(bool enabled);
+    void setSameWrapAnnotationSpacing(double spacingVx);
+    void clearSameWrapAnnotationPreview();
+    bool commitSameWrapAnnotationPreview();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
@@ -262,6 +266,9 @@ private:
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
+    bool generateSameWrapAnnotationPreview(const QPointF& scenePos, bool appendToPreview);
+    bool sampleSameWrapSourceImage(cv::Mat& gray) const;
+    void updateSameWrapAnnotationOverlay();
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
@@ -450,6 +457,18 @@ private:
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
     QGraphicsItem* _focusMarker = nullptr;
+
+    struct SameWrapAnnotationState {
+        bool enabled = false;
+        float spacingVx = 10.0f;
+        bool shiftReleasedSincePreview = true;
+        std::vector<QPointF> componentScenePath;
+        std::vector<cv::Vec3f> componentVolumePath;
+        std::vector<cv::Vec3f> sampledVolumePoints;
+        QPointF clickScenePos;
+        bool hasPreview = false;
+    };
+    SameWrapAnnotationState _sameWrapAnnotation;
 
     bool _bboxMode = false;
     QPointF _bboxStart;

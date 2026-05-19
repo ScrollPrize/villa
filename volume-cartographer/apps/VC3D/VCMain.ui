@@ -353,6 +353,35 @@
              <property name="bottomMargin">
               <number>8</number>
              </property>
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblFocusPointFilterDistance">
+               <property name="text">
+                <string>Focus radius</string>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QDoubleSpinBox" name="spinFocusPointFilterDistance">
+               <property name="toolTip">
+                <string>Maximum distance from the focus point for the Focus Point filter.</string>
+               </property>
+               <property name="suffix">
+                <string> vox</string>
+               </property>
+               <property name="decimals">
+                <number>2</number>
+               </property>
+               <property name="maximum">
+                <double>1000000.000000000000000</double>
+               </property>
+               <property name="singleStep">
+                <double>1.000000000000000</double>
+               </property>
+               <property name="value">
+                <double>10.000000000000000</double>
+               </property>
+              </widget>
+             </item>
              <item row="1" column="0">
               <widget class="QCheckBox" name="chkApproved">
                <property name="text">
