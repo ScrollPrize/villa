@@ -27,6 +27,16 @@ def _stage_done(label: str, t0: float) -> None:
 	return None
 
 
+def _truthy_config_bool(value: object) -> bool:
+	if isinstance(value, bool):
+		return value
+	if isinstance(value, (int, float)):
+		return bool(value)
+	if isinstance(value, str):
+		return value.strip().lower() in {"1", "true", "yes", "on"}
+	return False
+
+
 def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	"""Bilinear center of the model grid — matches (Hm-1)/2, (Wm-1)/2 in station loss."""
 	xyz = mdl._grid_xyz()  # (D, Hm, Wm, 3)
@@ -39,6 +49,19 @@ def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	      + fh * (1 - fw) * xyz[0, h1, w0]
 	      + (1 - fh) * fw * xyz[0, h0, w1]
 	      + fh * fw * xyz[0, h1, w1])
+
+
+def _optimization_seed_xyz(
+	*,
+	model_init: str,
+	config_seed: tuple[float, float, float] | None,
+	mdl: "model.Model3D",
+) -> tuple[float, float, float] | None:
+	"""Return the station seed used during optimization."""
+	if model_init in {"ext", "model"}:
+		center_pt = _grid_center(mdl)
+		return (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
+	return config_seed
 
 
 def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | None:
@@ -155,6 +178,13 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
 	p.add_argument("--window-overlap", type=int, default=0,
 		help="Overlap between windows in fullres voxels")
+	p.add_argument("--approval-inpaint", action=argparse.BooleanOptionalAction, default=False,
+		help="Use selected approval mask/tifxyz data to inpaint the seed-region setup")
+	p.add_argument("--approval-inpaint-corr-spacing", type=float, default=None,
+		help="Correction point spacing for approval inpaint (default: --mesh-step)")
+	p.add_argument("--approval-inpaint-padding-frac", type=float, default=0.25,
+		help="Per-side model extent padding for approval inpaint")
+	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
@@ -239,6 +269,53 @@ def main(argv: list[str] | None = None) -> int:
 		  f"source_to_base={source_to_base}) volume_extent={volume_extent_fullres}", flush=True)
 	_stage_done("probe_preprocessed_data", _t)
 
+	# Approval inpaint is a seed-mode preprocessor: VC3D sends the selected
+	# tifxyz plus approval/d channels, then this step derives corr points,
+	# a centered effective seed, and extents before the configured init runs.
+	_t = _stage_start("approval_inpaint")
+	approval_inpaint_enabled = _truthy_config_bool(getattr(args, "approval_inpaint", False))
+	if approval_inpaint_enabled:
+		if model_init != "seed":
+			raise ValueError("approval-inpaint requires args.model-init=seed")
+		if data_cfg.seed is None:
+			raise ValueError("approval-inpaint requires args.seed")
+		approval_tifxyz = getattr(args, "approval_inpaint_tifxyz", None)
+		if not approval_tifxyz:
+			raise ValueError("approval-inpaint requires service arg approval-inpaint-tifxyz")
+		from approval_inpaint import build_approval_inpaint
+
+		result = build_approval_inpaint(
+			tifxyz_path=str(approval_tifxyz),
+			seed=tuple(float(v) for v in data_cfg.seed),
+			mesh_step=float(model_cfg.mesh_step),
+			corr_spacing=getattr(args, "approval_inpaint_corr_spacing", None),
+			padding_frac=getattr(args, "approval_inpaint_padding_frac", 0.25),
+			existing_corr_points=cfg.get("corr_points") if isinstance(cfg.get("corr_points"), dict) else None,
+		)
+		data_cfg = dataclasses.replace(
+			data_cfg,
+			seed=result.seed,
+			model_w=result.model_w,
+			model_h=result.model_h,
+		)
+		cfg["corr_points"] = result.corr_points
+		fit_config["corr_points"] = copy.deepcopy(result.corr_points)
+		fit_config.setdefault("args", {}).update({
+			"seed": [float(v) for v in result.seed],
+			"model-w": int(result.model_w),
+			"model-h": int(result.model_h),
+			"approval-inpaint": True,
+		})
+		print(
+			f"[fit] approval-inpaint: points={result.point_count} "
+			f"component={result.component_size} skeleton={result.skeleton_size} "
+			f"bounds={result.index_bounds} source_step={result.source_mesh_step:.3f} "
+			f"seed=({result.seed[0]:.1f},{result.seed[1]:.1f},{result.seed[2]:.1f}) "
+			f"model_w={result.model_w} model_h={result.model_h}",
+			flush=True,
+		)
+	_stage_done("approval_inpaint", _t)
+
 	# --- Init from seed (new model only) ---
 	_t = _stage_start("derive_initial_model_params")
 	if model_init == "seed":
@@ -317,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
 		cfg.pop("args", None)
 		cfg.pop("voxel_size_um", None)
 		cfg.pop("external_surfaces", None)
-		cfg.pop("tifxyz_data", None)
+		cfg.pop("tifxyz", None)
 		cfg.pop("offset_value", None)
 		stages = optimizer.load_stages_cfg(
 			cfg,
@@ -603,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("args", None)
 	cfg.pop("voxel_size_um", None)
 	cfg.pop("external_surfaces", None)
-	cfg.pop("tifxyz_data", None)
+	cfg.pop("tifxyz", None)
 	cfg.pop("offset_value", None)
 	stages = optimizer.load_stages_cfg(
 		cfg,
@@ -756,17 +833,12 @@ def main(argv: list[str] | None = None) -> int:
 
 	# Run optimization
 	_t = _stage_start("prepare_optimization")
-	seed_xyz = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
-	# tifxyz init: always use model grid center as seed (overrides CLI seed)
+	config_seed = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
+	seed_xyz = _optimization_seed_xyz(model_init=model_init, config_seed=config_seed, mdl=mdl)
 	if model_init == "ext":
-		center_pt = _grid_center(mdl)
-		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] tifxyz seed: ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
-	# Re-optimize from checkpoint: derive seed from model grid center
-	if seed_xyz is None and model_init == "model":
-		center_pt = _grid_center(mdl)
-		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
+	elif model_init == "model":
 		print(f"[fit] checkpoint seed (grid center): ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
 	_stage_done("prepare_optimization", _t)

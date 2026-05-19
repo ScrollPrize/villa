@@ -238,6 +238,114 @@ void c3d_chunk_decode_lod(const uint8_t *in, size_t in_len, uint8_t lod,
  * side ∈ {256, 128, 64, 32, 16}.  Writes (side/2)^3 to out. */
 void c3d_downsample_chunk_2x(const uint8_t *in, uint32_t side, uint8_t *out);
 
+/* ==========================================================================
+ * Labels codec — lossless multi-channel u8 label volumes per 256³ chunk.
+ *
+ * A label volume has N independent channels, each with its own enumerated
+ * alphabet (2..255 values).  Value 0 is reserved as "no label / padding" in
+ * every channel.  Channels are stored as separate 256³ u8 buffers in SoA
+ * form and declared once per dataset via an immutable schema.
+ *
+ * Independent of the grayscale codec above — no DWT, no rate control, always
+ * lossless.  Layered over the same rANS engine, XXH3 hash, bit-io, and
+ * panic-on-error conventions.
+ *
+ * See PLAN.md §? (labels section) and `memory/` for full design.
+ * ========================================================================== */
+
+#define C3D_LABEL_SCHEMA_MAGIC "C3DLSCHM"
+#define C3D_LABEL_CHUNK_MAGIC  "C3DL"
+#define C3D_LABEL_MAX_CHANNELS 255u
+#define C3D_LABEL_MAX_NAME_LEN 63u
+
+typedef struct c3d_label_schema  c3d_label_schema;   /* opaque */
+typedef struct c3d_label_encoder c3d_label_encoder;  /* opaque */
+typedef struct c3d_label_decoder c3d_label_decoder;  /* opaque */
+
+/* ─── schema builder + introspection (in-memory) ─────────────────────────── */
+
+c3d_label_schema *c3d_label_schema_new(void);
+void              c3d_label_schema_free(c3d_label_schema *);
+
+/* num_values ∈ [2, 255].  num_values == 2 is the binary case (local-dict
+ * elided, values constrained to {0, 1}).  name must be 1..63 UTF-8 bytes and
+ * unique within the schema; otherwise panic. */
+void              c3d_label_schema_add_channel(c3d_label_schema *,
+                                               const char *name,
+                                               uint8_t num_values);
+
+uint32_t          c3d_label_schema_channel_count(const c3d_label_schema *);
+uint8_t           c3d_label_schema_channel_num_values(const c3d_label_schema *, uint32_t i);
+const char       *c3d_label_schema_channel_name(const c3d_label_schema *, uint32_t i);
+
+/* 16-byte schema identity hash (c3d_hash128 over the serialized schema
+ * bytes, excluding the trailing hash itself).  Stable across
+ * serialize/parse round-trips. */
+void              c3d_label_schema_hash(const c3d_label_schema *, uint8_t out[16]);
+
+/* ─── schema sidecar parse / serialize ───────────────────────────────────── */
+
+size_t            c3d_label_schema_serialized_size(const c3d_label_schema *);
+size_t            c3d_label_schema_serialize(const c3d_label_schema *, uint8_t *out, size_t cap);
+c3d_label_schema *c3d_label_schema_parse(const uint8_t *in, size_t len);
+
+/* ─── reusable encoder / decoder contexts ────────────────────────────────── */
+
+c3d_label_encoder *c3d_label_encoder_new(const c3d_label_schema *);
+void               c3d_label_encoder_free(c3d_label_encoder *);
+
+/* Upper bound on a single-chunk encode output.  Callers use this to size
+ * `out` for c3d_label_encoder_chunk_encode / c3d_label_chunk_encode.  */
+size_t             c3d_label_encoder_max_chunk_size(const c3d_label_encoder *);
+
+/* `channels` is an array of `schema_channel_count` pointers.  Each non-NULL
+ * pointer must reference a 32-byte-aligned 256³ u8 buffer.  NULL slots are
+ * treated as all-zero (ALL_ABSENT sentinel; zero payload bytes for that
+ * channel).  Returns total bytes written to `out`. */
+size_t             c3d_label_encoder_chunk_encode(c3d_label_encoder *,
+                                                  const uint8_t *const *channels,
+                                                  uint8_t *out, size_t cap);
+
+c3d_label_decoder *c3d_label_decoder_new(const c3d_label_schema *);
+void               c3d_label_decoder_free(c3d_label_decoder *);
+
+/* `channels_out` is an array of `schema_channel_count` pointers.  Non-NULL
+ * slots receive the decoded 256³ u8 buffer (must be 32-byte aligned).  NULL
+ * slots skip that channel without paying its decode cost. */
+void               c3d_label_decoder_chunk_decode(c3d_label_decoder *,
+                                                  const uint8_t *in, size_t len,
+                                                  uint8_t *const *channels_out);
+
+/* ─── stateless one-shot wrappers ────────────────────────────────────────── */
+
+size_t c3d_label_chunk_encode(const c3d_label_schema *,
+                              const uint8_t *const *channels,
+                              uint8_t *out, size_t cap);
+void   c3d_label_chunk_decode(const c3d_label_schema *,
+                              const uint8_t *in, size_t len,
+                              uint8_t *const *channels_out);
+
+/* ─── inspect / validate ─────────────────────────────────────────────────── */
+
+/* Per-channel state reported by c3d_label_chunk_inspect. */
+#define C3D_LABEL_STATE_ABSENT  0u  /* channel is all-zero, no payload                */
+#define C3D_LABEL_STATE_UNIFORM 1u  /* channel has one value everywhere (0 or nonzero) */
+#define C3D_LABEL_STATE_ENCODED 2u  /* channel has a full octree-coded payload        */
+
+typedef struct {
+    uint8_t  schema_hash[16];
+    uint32_t chan_count;
+    uint8_t  channel_state        [C3D_LABEL_MAX_CHANNELS]; /* C3D_LABEL_STATE_* */
+    uint8_t  channel_uniform_value[C3D_LABEL_MAX_CHANNELS]; /* valid iff state == UNIFORM */
+    uint32_t channel_stream_bytes [C3D_LABEL_MAX_CHANNELS]; /* valid iff state == ENCODED */
+} c3d_label_chunk_info;
+
+bool c3d_label_chunk_validate(const c3d_label_schema *,
+                              const uint8_t *in, size_t len);
+void c3d_label_chunk_inspect (const c3d_label_schema *,
+                              const uint8_t *in, size_t len,
+                              c3d_label_chunk_info *out);
+
 #ifdef __cplusplus
 }
 #endif

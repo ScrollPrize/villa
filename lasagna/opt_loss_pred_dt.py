@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
 
@@ -33,7 +32,7 @@ def flow_gate_prefetch_points(
 	xyz_lr: torch.Tensor | None = None,
 	cfg: dict | None,
 ) -> torch.Tensor | None:
-	"""Extra pred-dt sample positions used by flow-gate render and pull fitting."""
+	"""Extra pred-dt sample positions used by the flow-gate render."""
 	if cfg is None or not bool(cfg.get("enabled", False)):
 		return None
 	if xyz_hr.shape[0] != 1:
@@ -59,11 +58,6 @@ def flow_gate_prefetch_points(
 		offsets = offsets * spacing.view(1, 3) * step_scale
 		extra.append((xyz0.unsqueeze(0) + offsets.view(-1, 1, 1, 3)).reshape(-1, 3))
 
-	pull_cfg = cfg.get("anticipatory_pull", None)
-	if isinstance(pull_cfg, dict) and bool(pull_cfg.get("enabled", False)) and xyz_lr is not None and xyz_lr.shape[0] == 1:
-		pull_pf = _anticipatory_pull_prefetch_points(xyz_lr=xyz_lr, cfg=pull_cfg)
-		if pull_pf is not None:
-			extra.append(pull_pf.reshape(-1, 3))
 	if not extra:
 		return None
 	return torch.cat(extra, dim=0).view(1, 1, -1, 3)
@@ -195,6 +189,113 @@ def _seed_surface_intersection_xy_from_cache(
 	return float(new_col) + float(v2), float(new_row) + float(u2)
 
 
+def _corr_point_source_xy(
+	*,
+	res: fit_model.FitResult3D,
+	xyz_img: torch.Tensor,
+	cfg: dict,
+	sub_h: int,
+	sub_w: int,
+) -> tuple[np.ndarray, dict[str, float], dict[str, np.ndarray]]:
+	"""Project nearby correction points to rendered-surface pixels for flow seeds."""
+	stats: dict[str, float] = {
+		"pred_dt_corr_seed_candidates": 0.0,
+		"pred_dt_corr_seed_valid": 0.0,
+	}
+	def empty_debug(surface_distance: float | None = None) -> dict[str, np.ndarray]:
+		debug = {
+			"xy": np.zeros((0, 2), dtype=np.int32),
+			"distance": np.zeros((0,), dtype=np.float32),
+			"valid": np.zeros((0,), dtype=np.bool_),
+		}
+		if surface_distance is not None:
+			debug["surface_distance"] = np.asarray([surface_distance], dtype=np.float32)
+		return debug
+
+	if not bool(cfg.get("corr_seed_enabled", True)):
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	corr = res.data.corr_points
+	if corr is None or corr.points_xyz_winda.shape[0] == 0:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	if xyz_img.ndim != 3 or xyz_img.shape[-1] != 3:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	He, We, _ = xyz_img.shape
+	if He <= 0 or We <= 0:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+
+	default_distance = max(2.0, 1.5 * float(max(1, sub_h, sub_w)))
+	max_distance = float(cfg.get("corr_seed_surface_distance", default_distance))
+	stats["pred_dt_corr_seed_surface_distance"] = max_distance
+	if max_distance < 0.0:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug(max_distance)
+
+	pts = corr.points_xyz_winda[:, :3].to(
+		device=xyz_img.device,
+		dtype=xyz_img.dtype,
+	).detach()
+	finite = torch.isfinite(pts).all(dim=-1)
+	if not finite.any():
+		stats["pred_dt_corr_seed_candidates"] = float(int(pts.shape[0]))
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug(max_distance)
+	pts = pts[finite]
+	stats["pred_dt_corr_seed_candidates"] = float(int(pts.shape[0]))
+
+	surface = xyz_img.detach().reshape(-1, 3)
+	if surface.shape[0] == 0:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug(max_distance)
+	point_chunk = max(1, int(cfg.get("corr_seed_point_chunk", 32)))
+	surface_chunk = max(1024, int(cfg.get("corr_seed_surface_chunk", 65536)))
+	best_dist2_all: list[torch.Tensor] = []
+	best_index_all: list[torch.Tensor] = []
+	for p0 in range(0, int(pts.shape[0]), point_chunk):
+		p = pts[p0:p0 + point_chunk]
+		best_dist2 = torch.full(
+			(p.shape[0],),
+			float("inf"),
+			device=pts.device,
+			dtype=pts.dtype,
+		)
+		best_index = torch.zeros((p.shape[0],), device=pts.device, dtype=torch.long)
+		for s0 in range(0, int(surface.shape[0]), surface_chunk):
+			s = surface[s0:s0 + surface_chunk]
+			d2 = ((p[:, None, :] - s[None, :, :]) ** 2).sum(dim=-1)
+			chunk_dist2, chunk_index = d2.min(dim=1)
+			update = chunk_dist2 < best_dist2
+			best_dist2 = torch.where(update, chunk_dist2, best_dist2)
+			best_index = torch.where(update, chunk_index + int(s0), best_index)
+		best_dist2_all.append(best_dist2)
+		best_index_all.append(best_index)
+	best_dist2 = torch.cat(best_dist2_all, dim=0)
+	best_index = torch.cat(best_index_all, dim=0)
+	best_dist = best_dist2.clamp_min(0.0).sqrt()
+	valid = torch.isfinite(best_dist) & (best_dist <= max_distance)
+	valid_count = int(valid.sum().detach().cpu())
+	stats["pred_dt_corr_seed_valid"] = float(valid_count)
+	flat = best_index.detach().cpu().numpy().astype(np.int64, copy=False)
+	y = (flat // int(We)).clip(0, int(He) - 1)
+	x = (flat % int(We)).clip(0, int(We) - 1)
+	all_xy = np.stack([x, y], axis=1).astype(np.int32, copy=False)
+	valid_np = valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+	distance_np = best_dist.detach().cpu().numpy().astype(np.float32, copy=False)
+	debug = {
+		"xy": all_xy,
+		"distance": distance_np,
+		"valid": valid_np,
+		"surface_distance": np.asarray([max_distance], dtype=np.float32),
+	}
+	if valid_count <= 0:
+		stats["pred_dt_corr_seed_unique"] = 0.0
+		return np.zeros((0, 2), dtype=np.int32), stats, debug
+	valid_dist = best_dist[valid]
+	stats["pred_dt_corr_seed_mean_distance"] = float(valid_dist.mean().detach().cpu())
+	stats["pred_dt_corr_seed_max_distance"] = float(valid_dist.max().detach().cpu())
+	xy = all_xy[valid_np]
+	if xy.shape[0] > 1:
+		xy = np.unique(xy, axis=0)
+	stats["pred_dt_corr_seed_unique"] = float(int(xy.shape[0]))
+	return xy, stats, debug
+
+
 def _sample_pred_dt_max3d(
 	*,
 	res: fit_model.FitResult3D,
@@ -313,30 +414,6 @@ def _anticipatory_reference_step(
 	return torch.tensor(1.0, device=device, dtype=dtype)
 
 
-def _anticipatory_pull_prefetch_points(*, xyz_lr: torch.Tensor, cfg: dict) -> torch.Tensor | None:
-	"""Conservative line-fit sample positions for sparse pred-dt cache prefetch."""
-	if xyz_lr.shape[0] != 1:
-		return None
-	xyz0 = xyz_lr[0].detach()
-	Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
-	if Hm <= 1 or Wm <= 1:
-		return None
-	samples_n = max(2, int(cfg.get("samples", 8)))
-	tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
-	root = xyz0[root_h, root_w]
-	tip = xyz0[tip_h, tip_w]
-	normals = _vertex_normals(xyz_lr.detach())[0]
-	offset_factors = _anticipatory_normal_offset_factors(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
-	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
-	line_vec = tip - root
-	ref_step = _anticipatory_reference_step(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype, xyz0=xyz0)
-	n = normals[tip_h, tip_w]
-	offset = ref_step * offset_factors.view(1, -1)
-	target_vec = line_vec.view(-1, 1, 3) + offset.unsqueeze(-1) * n.view(-1, 1, 3)
-	line = root.view(-1, 1, 1, 3) + t * target_vec.view(-1, int(offset_factors.numel()), 1, 3)
-	return line.reshape(-1, 3)
-
-
 def flow_gate_prefetch_points_for_result(
 	*,
 	res: fit_model.FitResult3D,
@@ -390,25 +467,9 @@ def flow_gate_prefetch_items_for_result(
 		pool_points = (xyz_hr.unsqueeze(0) + offsets.view(-1, 1, 1, 3)).reshape(1, 1, -1, 3)
 		out["pred_dt"] = torch.cat([out["pred_dt"], pool_points], dim=2)
 
-	pull_cfg = _anticipatory_pull_cfg(cfg)
-	if pull_cfg is not None:
-		xyz0 = res.xyz_lr[0].detach()
-		Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
-		if Hm > 1 and Wm > 1:
-			samples_n = max(2, int(pull_cfg.get("samples", 8)))
-			tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
-			root = xyz0[root_h, root_w]
-			tip = xyz0[tip_h, tip_w]
-			line_vec = tip - root
-			n = _tip_normals_from_result(res=res, tip_h=tip_h, tip_w=tip_w)
-			offset_factors = _anticipatory_normal_offset_factors(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype)
-			ref_step = _anticipatory_reference_step(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
-			offset = ref_step * offset_factors.view(1, -1)
-			target_vec = line_vec.view(-1, 1, 3) + offset.unsqueeze(-1) * n.view(-1, 1, 3)
-			t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
-			line = root.view(-1, 1, 1, 3) + t * target_vec.view(-1, int(offset_factors.numel()), 1, 3)
-			pull_points = line.reshape(1, 1, -1, 3)
-			out["pred_dt"] = torch.cat([out["pred_dt"], pull_points], dim=2) if "pred_dt" in out else pull_points
+	# Anticipatory pull depends on the current flow gate. It is intentionally not
+	# prefetched here; `_score_anticipatory_pull_candidates` filters by the known
+	# gate and prefetches/samples the remaining candidates in bounded chunks.
 	return out
 
 
@@ -434,12 +495,53 @@ def _tip_normals_from_result(
 	return n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
+def _empty_anticipatory_pull_candidates(
+	*,
+	device: torch.device,
+	dtype: torch.dtype,
+	samples_n: int,
+	stats: dict[str, float],
+) -> dict:
+	return {
+		"candidate_idx": torch.empty(0, device=device, dtype=torch.long),
+		"tip_h": torch.empty(0, device=device, dtype=torch.long),
+		"tip_w": torch.empty(0, device=device, dtype=torch.long),
+		"root_h": torch.empty(0, device=device, dtype=torch.long),
+		"root_w": torch.empty(0, device=device, dtype=torch.long),
+		"target_xyz": torch.empty((0, 3), device=device, dtype=dtype),
+		"prefix": torch.empty(0, device=device, dtype=dtype),
+		"inliers": torch.empty((0, samples_n), device=device, dtype=dtype),
+		"offset": torch.empty(0, device=device, dtype=dtype),
+		"_stats": stats,
+	}
+
+
+def _prefetch_sparse_pred_dt_chunks(*, res: fit_model.FitResult3D, query: torch.Tensor) -> int:
+	sparse_caches = getattr(res.data, "sparse_caches", None)
+	if not sparse_caches:
+		return 0
+	pred_dt_caches = [
+		cache for cache in sparse_caches.values()
+		if "pred_dt" in set(getattr(cache, "channels", ()))
+	]
+	if not pred_dt_caches:
+		return 0
+	for cache in pred_dt_caches:
+		spacing = res.data._spacing_for(cache.channels[0])
+		cache.prefetch(query, res.data.origin_fullres, spacing)
+	for cache in pred_dt_caches:
+		cache.sync()
+	return len(pred_dt_caches)
+
+
 def _score_anticipatory_pull_candidates(
 	*,
 	res: fit_model.FitResult3D,
 	cfg: dict,
+	flow_weight: torch.Tensor | None = None,
+	mask_lr: torch.Tensor | None = None,
 ) -> dict | None:
-	"""Fit all one-step straight root->tip candidates, independent of flow."""
+	"""Fit one-step root->tip candidates that can actually use the known gate."""
 	if res.xyz_lr.shape[0] != 1:
 		return None
 	xyz0 = res.xyz_lr[0].detach()
@@ -451,20 +553,58 @@ def _score_anticipatory_pull_candidates(
 	inlier_one = float(cfg.get("inlier_one", 120.0))
 	if inlier_one <= inlier_zero:
 		raise ValueError("anticipatory_pull requires inlier_one > inlier_zero")
-	chunk_candidates = max(256, int(cfg.get("chunk_candidates", 4096)))
+	chunk_candidates = max(256, int(cfg.get("chunk_candidates", 65536)))
 	tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
+	total_candidates = int(tip_h.numel())
+	stats: dict[str, float] = {
+		"total_candidates": float(total_candidates),
+		"gate_candidates": float(total_candidates),
+		"scored_candidates": 0.0,
+		"active_batches": 0.0,
+		"chunk_candidates": float(chunk_candidates),
+		"query_samples": 0.0,
+		"sparse_prefetch_batches": 0.0,
+	}
+	if flow_weight is not None:
+		root_weight = flow_weight[0, 0, root_h, root_w].detach()
+		tip_weight = flow_weight[0, 0, tip_h, tip_w].detach()
+		if mask_lr is not None:
+			tip_mask = mask_lr[0, 0, tip_h, tip_w].detach()
+		else:
+			tip_mask = torch.ones_like(tip_weight)
+		gate_candidate = (root_weight > 0.0) & (tip_weight < 1.0) & (root_weight > tip_weight) & (tip_mask > 0.0)
+		stats["gate_candidates"] = float(gate_candidate.sum().detach().cpu())
+		if not bool(gate_candidate.any().detach().cpu()):
+			return _empty_anticipatory_pull_candidates(
+				device=xyz0.device,
+				dtype=xyz0.dtype,
+				samples_n=samples_n,
+				stats=stats,
+			)
+		tip_h = tip_h[gate_candidate]
+		tip_w = tip_w[gate_candidate]
+		root_h = root_h[gate_candidate]
+		root_w = root_w[gate_candidate]
 	n_candidates = int(tip_h.numel())
 	if n_candidates <= 0:
-		return None
+		return _empty_anticipatory_pull_candidates(
+			device=xyz0.device,
+			dtype=xyz0.dtype,
+			samples_n=samples_n,
+			stats=stats,
+		)
 	offset_factors = _anticipatory_normal_offset_factors(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
 	ref_step = _anticipatory_reference_step(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
 	if offset_factors.ndim != 1:
 		raise RuntimeError(f"anticipatory_pull expected 1D offset factors, got {tuple(offset_factors.shape)}")
+	offset_count = int(offset_factors.numel())
 	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
 	targets: list[torch.Tensor] = []
 	prefixes: list[torch.Tensor] = []
 	best_inliers: list[torch.Tensor] = []
 	best_offsets_all: list[torch.Tensor] = []
+	batches = 0
+	sparse_prefetch_batches = 0
 	with torch.no_grad():
 		for c0 in range(0, n_candidates, chunk_candidates):
 			c1 = min(n_candidates, c0 + chunk_candidates)
@@ -478,12 +618,14 @@ def _score_anticipatory_pull_candidates(
 			n = _tip_normals_from_result(res=res, tip_h=th, tip_w=tw)
 			offsets = ref_step * offset_factors
 			target_vec = line_vec.view(-1, 1, 3) + offsets.view(1, -1, 1) * n.view(-1, 1, 3)
-			query = root.view(-1, 1, 1, 3) + t * target_vec.view(c1 - c0, int(offset_factors.numel()), 1, 3)
+			query = root.view(-1, 1, 1, 3) + t * target_vec.view(c1 - c0, offset_count, 1, 3)
 			flat_query = query.reshape(1, 1, -1, 3)
+			if _prefetch_sparse_pred_dt_chunks(res=res, query=flat_query) > 0:
+				sparse_prefetch_batches += 1
 			sampled = res.data.grid_sample_fullres(flat_query, channels={"pred_dt"}).pred_dt
 			if sampled is None:
 				raise RuntimeError("anticipatory_pull requires pred_dt to be loaded")
-			pred = sampled.reshape(c1 - c0, int(offset_factors.numel()), samples_n)
+			pred = sampled.reshape(c1 - c0, offset_count, samples_n)
 			inlier = ((pred - inlier_zero) / (inlier_one - inlier_zero)).clamp(0.0, 1.0)
 			prefix = inlier.cumprod(dim=2).mean(dim=2)
 			best_score, best_offset_idx = prefix.max(dim=1)
@@ -492,6 +634,13 @@ def _score_anticipatory_pull_candidates(
 			prefixes.append(best_score)
 			best_inliers.append(inlier[torch.arange(c1 - c0, device=xyz0.device), best_offset_idx])
 			best_offsets_all.append(best_offsets)
+			batches += 1
+	stats.update({
+		"scored_candidates": float(n_candidates),
+		"active_batches": float(batches),
+		"query_samples": float(n_candidates * offset_count * samples_n),
+		"sparse_prefetch_batches": float(sparse_prefetch_batches),
+	})
 	candidate_idx = torch.arange(n_candidates, device=xyz0.device, dtype=torch.long)
 	return {
 		"candidate_idx": candidate_idx,
@@ -503,6 +652,7 @@ def _score_anticipatory_pull_candidates(
 		"prefix": torch.cat(prefixes, dim=0),
 		"inliers": torch.cat(best_inliers, dim=0),
 		"offset": torch.cat(best_offsets_all, dim=0),
+		"_stats": stats,
 	}
 
 
@@ -877,6 +1027,13 @@ def configure_flow_gate(
 	_flow_gate_debug_counts[str(stage_name)] = 0
 
 
+def _debug_interval(cfg: dict, *names: str) -> int:
+	for name in names:
+		if name in cfg:
+			return max(0, int(cfg.get(name, 0)))
+	return 0
+
+
 def configure_pred_dt(*, normal_source: str | None = None) -> None:
 	global _pred_dt_normal_source
 	src = "model" if normal_source is None else str(normal_source)
@@ -893,6 +1050,148 @@ def flow_gate_last_timing() -> dict[str, float]:
 	return dict(_flow_gate_last_timing)
 
 
+def _normalize_positive_debug_image(image: np.ndarray | None) -> np.ndarray | None:
+	if image is None:
+		return None
+	arr = np.asarray(image, dtype=np.float32)
+	if arr.ndim != 2:
+		return None
+	finite = np.isfinite(arr)
+	positive = finite & (arr > 0.0)
+	out = np.zeros_like(arr, dtype=np.float32)
+	if not positive.any():
+		return out
+	scale = float(arr[positive].max())
+	if scale <= 0.0:
+		return out
+	out[finite] = np.clip(np.maximum(arr[finite], 0.0) / scale, 0.0, 1.0)
+	return out
+
+
+def _flow_seed_overlay_panel(
+	base_u8: np.ndarray,
+	*,
+	source_xy: tuple[int, int] | None,
+	corr_seed_debug: dict[str, np.ndarray] | None,
+	source_edge_mask: np.ndarray | None,
+	flow_metadata: dict | None,
+) -> np.ndarray:
+	panel = np.repeat(np.asarray(base_u8, dtype=np.uint8)[..., None], 3, axis=2)
+	if panel.ndim != 3 or panel.shape[2] != 3:
+		return panel
+	H, W, _ = panel.shape
+
+	try:
+		import cv2
+	except Exception:
+		cv2 = None
+	pil_image = None
+	pil_draw = None
+	if cv2 is None:
+		try:
+			from PIL import Image, ImageDraw
+			pil_image = Image.fromarray(panel, mode="RGB")
+			pil_draw = ImageDraw.Draw(pil_image)
+		except Exception:
+			pil_image = None
+			pil_draw = None
+
+	def put_text(text: str, x: int, y: int, color: tuple[int, int, int]) -> None:
+		if cv2 is not None:
+			cv2.putText(
+				panel,
+				text,
+				(max(0, min(W - 1, x)), max(8, min(H - 1, y))),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				0.35,
+				color,
+				1,
+				cv2.LINE_AA,
+			)
+		elif pil_draw is not None:
+			pil_draw.text((max(0, min(W - 1, x)), max(0, min(H - 1, y - 8))), text, fill=color)
+
+	def draw_circle(x: int, y: int, color: tuple[int, int, int], *, radius: int = 3) -> None:
+		if x < 0 or y < 0 or x >= W or y >= H:
+			return
+		if cv2 is not None:
+			cv2.circle(panel, (x, y), radius, color, 1, cv2.LINE_AA)
+		elif pil_draw is not None:
+			pil_draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color)
+		else:
+			for yy in range(max(0, y - radius), min(H, y + radius + 1)):
+				for xx in range(max(0, x - radius), min(W, x + radius + 1)):
+					if (xx - x) * (xx - x) + (yy - y) * (yy - y) <= radius * radius:
+						panel[yy, xx] = color
+
+	def draw_cross(x: int, y: int, color: tuple[int, int, int]) -> None:
+		if x < 0 or y < 0 or x >= W or y >= H:
+			return
+		if cv2 is not None:
+			cv2.drawMarker(
+				panel,
+				(x, y),
+				color,
+				markerType=cv2.MARKER_CROSS,
+				markerSize=11,
+				thickness=1,
+				line_type=cv2.LINE_AA,
+			)
+		elif pil_draw is not None:
+			pil_draw.line((x, max(0, y - 5), x, min(H - 1, y + 5)), fill=color)
+			pil_draw.line((max(0, x - 5), y, min(W - 1, x + 5), y), fill=color)
+		else:
+			panel[max(0, y - 5):min(H, y + 6), x] = color
+			panel[y, max(0, x - 5):min(W, x + 6)] = color
+
+	if source_edge_mask is not None:
+		mask = np.asarray(source_edge_mask, dtype=np.float32)
+		if mask.shape == (H, W):
+			panel[mask > 0.0] = (255, 64, 255)
+			if pil_image is not None:
+				from PIL import Image, ImageDraw
+				pil_image = Image.fromarray(panel, mode="RGB")
+				pil_draw = ImageDraw.Draw(pil_image)
+
+	if isinstance(flow_metadata, dict):
+		accepted = int(flow_metadata.get("accepted_source_count", 0))
+		requested = int(flow_metadata.get("extra_source_count", 0)) + 1
+		source_edges = int(flow_metadata.get("source_edge_count", 0))
+		seeded_nodes = int(flow_metadata.get("seeded_node_count", 0))
+		put_text(
+			f"c++ src {accepted}/{requested} edges {source_edges} nodes {seeded_nodes}",
+			4,
+			28,
+			(255, 64, 255),
+		)
+
+	if corr_seed_debug:
+		xy = np.asarray(corr_seed_debug.get("xy", np.zeros((0, 2), dtype=np.int32)), dtype=np.int32)
+		distance = np.asarray(corr_seed_debug.get("distance", np.zeros((0,), dtype=np.float32)), dtype=np.float32)
+		valid = np.asarray(corr_seed_debug.get("valid", np.zeros((0,), dtype=np.bool_)), dtype=np.bool_)
+		n = min(int(xy.shape[0]) if xy.ndim == 2 else 0, int(distance.shape[0]), int(valid.shape[0]))
+		label_limit = min(n, 64)
+		for i in range(n):
+			x = int(xy[i, 0])
+			y = int(xy[i, 1])
+			color = (80, 255, 80) if bool(valid[i]) else (255, 96, 32)
+			draw_circle(x, y, color, radius=3)
+			if i < label_limit:
+				put_text(f"{float(distance[i]):.1f}", x + 4, y - 4, color)
+		threshold_arr = corr_seed_debug.get("surface_distance")
+		if threshold_arr is not None and np.asarray(threshold_arr).size > 0:
+			threshold = float(np.asarray(threshold_arr, dtype=np.float32).reshape(-1)[0])
+			if np.isfinite(threshold):
+				put_text(f"corr <= {threshold:.1f}", 4, 14, (255, 255, 255))
+
+	if source_xy is not None:
+		draw_cross(int(source_xy[0]), int(source_xy[1]), (64, 224, 255))
+		put_text("seed", int(source_xy[0]) + 6, int(source_xy[1]) + 12, (64, 224, 255))
+	if pil_image is not None:
+		panel = np.asarray(pil_image, dtype=np.uint8)
+	return panel
+
+
 def _write_flow_gate_debug(
 	*,
 	stage_name: str,
@@ -900,7 +1199,17 @@ def _write_flow_gate_debug(
 	pred_u8: np.ndarray,
 	flow_hr: np.ndarray | None,
 	smooth_grid_flow: np.ndarray | None,
+	gate_basis_hr: np.ndarray | None,
 	graph_edge_flow_rgb: np.ndarray | None,
+	island_obstacle_factor_rgb: np.ndarray | None,
+	island_removed_mask_hr: np.ndarray | None,
+	island_flow_passability_rgb: np.ndarray | None,
+	island_propagated_edge_flow_rgb: np.ndarray | None,
+	island_bonus_edge_flow_rgb: np.ndarray | None,
+	island_tree_dense_no_backtrack_hr: np.ndarray | None,
+	island_tree_dense_greedy_ascent_hr: np.ndarray | None,
+	source_edge_mask_hr: np.ndarray | None,
+	source_component_mask_hr: np.ndarray | None,
 	weight_hr: np.ndarray | None,
 	out_dir: Path | None,
 	pull_weight_hr: np.ndarray | None = None,
@@ -917,10 +1226,72 @@ def _write_flow_gate_debug(
 		return
 	out_dir.mkdir(parents=True, exist_ok=True)
 	pred_raw_u8 = pred_u8.astype(np.uint8, copy=True)
-	flow = np.zeros_like(pred_raw_u8, dtype=np.float32) if flow_hr is None else np.asarray(flow_hr, dtype=np.float32)
-	grid_flow = None if smooth_grid_flow is None else np.asarray(smooth_grid_flow, dtype=np.float32)
-	graph_flow = None if graph_edge_flow_rgb is None else np.asarray(graph_edge_flow_rgb, dtype=np.float32)
-	weights = np.zeros_like(pred_raw_u8, dtype=np.float32) if weight_hr is None else np.asarray(weight_hr, dtype=np.float32)
+	flow = (
+		np.zeros_like(pred_raw_u8, dtype=np.float32)
+		if flow_hr is None
+		else np.asarray(flow_hr, dtype=np.float32)
+	)
+	grid_flow = (
+		None
+		if smooth_grid_flow is None
+		else np.asarray(smooth_grid_flow, dtype=np.float32)
+	)
+	gate_basis = _normalize_positive_debug_image(gate_basis_hr)
+	graph_flow = (
+		None
+		if graph_edge_flow_rgb is None
+		else np.asarray(graph_edge_flow_rgb, dtype=np.float32)
+	)
+	island_obstacle = (
+		None
+		if island_obstacle_factor_rgb is None
+		else np.asarray(island_obstacle_factor_rgb, dtype=np.float32)
+	)
+	island_removed = (
+		None
+		if island_removed_mask_hr is None
+		else np.asarray(island_removed_mask_hr, dtype=np.float32)
+	)
+	island_passability = (
+		None
+		if island_flow_passability_rgb is None
+		else np.asarray(island_flow_passability_rgb, dtype=np.float32)
+	)
+	island_propagated = (
+		None
+		if island_propagated_edge_flow_rgb is None
+		else np.asarray(island_propagated_edge_flow_rgb, dtype=np.float32)
+	)
+	island_bonus = (
+		None
+		if island_bonus_edge_flow_rgb is None
+		else np.asarray(island_bonus_edge_flow_rgb, dtype=np.float32)
+	)
+	island_dense_no_backtrack = (
+		None
+		if island_tree_dense_no_backtrack_hr is None
+		else np.asarray(island_tree_dense_no_backtrack_hr, dtype=np.float32)
+	)
+	island_dense_greedy = (
+		None
+		if island_tree_dense_greedy_ascent_hr is None
+		else np.asarray(island_tree_dense_greedy_ascent_hr, dtype=np.float32)
+	)
+	source_edges = (
+		None
+		if source_edge_mask_hr is None
+		else np.asarray(source_edge_mask_hr, dtype=np.float32)
+	)
+	source_components = (
+		None
+		if source_component_mask_hr is None
+		else np.asarray(source_component_mask_hr, dtype=np.float32)
+	)
+	weights = (
+		np.zeros_like(pred_raw_u8, dtype=np.float32)
+		if weight_hr is None
+		else np.asarray(weight_hr, dtype=np.float32)
+	)
 	pull_weight = None if pull_weight_hr is None else np.asarray(pull_weight_hr, dtype=np.float32)
 	pull_prefix = None if pull_prefix_hr is None else np.asarray(pull_prefix_hr, dtype=np.float32)
 	pull_root_weight = None if pull_root_weight_hr is None else np.asarray(pull_root_weight_hr, dtype=np.float32)
@@ -946,8 +1317,36 @@ def _write_flow_gate_debug(
 			write_named_layer(tw, flow, name="raw_flow_bilinear")
 			if grid_flow is not None:
 				write_named_layer(tw, grid_flow, name="smooth_grid_flow")
+			if gate_basis is not None:
+				write_named_layer(tw, gate_basis, name="gate_basis_flow_normalized")
 			if graph_flow is not None:
 				write_named_layer(tw, graph_flow, name="graph_edge_flow")
+			if island_obstacle is not None:
+				write_named_layer(tw, island_obstacle, name="island_obstacle_factor")
+			if island_removed is not None:
+				write_named_layer(tw, island_removed, name="island_removed_mask")
+			if island_passability is not None:
+				write_named_layer(tw, island_passability, name="island_flow_passability")
+			if island_propagated is not None:
+				write_named_layer(tw, island_propagated, name="island_propagated_edge_flow")
+			if island_bonus is not None:
+				write_named_layer(tw, island_bonus, name="island_bonus_edge_flow")
+			if island_dense_no_backtrack is not None:
+				write_named_layer(
+					tw,
+					island_dense_no_backtrack,
+					name="island_tree_dense_flow_no_backtrack",
+				)
+			if island_dense_greedy is not None:
+				write_named_layer(
+					tw,
+					island_dense_greedy,
+					name="island_tree_dense_flow_greedy_ascent",
+				)
+			if source_edges is not None:
+				write_named_layer(tw, source_edges, name="graph_source_edges")
+			if source_components is not None:
+				write_named_layer(tw, source_components, name="source_components")
 			write_named_layer(tw, weights, name="flow_gate_weight")
 			if pull_weight is not None:
 				write_named_layer(tw, pull_weight, name="anticipatory_pull_weight")
@@ -961,8 +1360,58 @@ def _write_flow_gate_debug(
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_raw_flow.tif"), flow)
 		if grid_flow is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_smooth_grid_flow.tif"), grid_flow)
+		if gate_basis is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_gate_basis_flow_normalized.tif"),
+				gate_basis,
+			)
 		if graph_flow is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_edge_flow.tif"), graph_flow)
+		if island_obstacle is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_obstacle_factor.tif"),
+				island_obstacle,
+			)
+		if island_removed is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_removed_mask.tif"),
+				island_removed,
+			)
+		if island_passability is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_flow_passability.tif"),
+				island_passability,
+			)
+		if island_propagated is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_propagated_edge_flow.tif"),
+				island_propagated,
+			)
+		if island_bonus is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_bonus_edge_flow.tif"),
+				island_bonus,
+			)
+		if island_dense_no_backtrack is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_no_backtrack.tif"),
+				island_dense_no_backtrack,
+			)
+		if island_dense_greedy is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_greedy_ascent.tif"),
+				island_dense_greedy,
+			)
+		if source_edges is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_source_edges.tif"),
+				source_edges,
+			)
+		if source_components is not None:
+			tifffile.imwrite(
+				str(out_dir / f"pred_dt_flow_gate_{suffix}_source_components.tif"),
+				source_components,
+			)
 		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_weight.tif"), weights)
 		if pull_weight is not None:
 			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_weight.tif"), pull_weight)
@@ -979,36 +1428,66 @@ def _write_flow_gate_weight_jpg(
 	stage_name: str,
 	debug_index: int,
 	pred_u8: np.ndarray,
-	used_weight_hr: np.ndarray,
+	gate_weight_hr: np.ndarray,
+	greedy_direct_flow_hr: np.ndarray | None,
+	source_edge_mask_hr: np.ndarray | None,
+	source_component_mask_hr: np.ndarray | None,
+	source_xy: tuple[int, int] | None,
+	corr_seed_debug: dict[str, np.ndarray] | None,
+	flow_metadata: dict | None,
 	out_dir: Path | None,
 ) -> None:
 	global _flow_gate_jpg_warned
 	if out_dir is None:
 		return
 	pred = np.asarray(pred_u8)
-	weight = np.asarray(used_weight_hr, dtype=np.float32)
-	if pred.ndim != 2 or weight.ndim != 2:
+	gate_weight = np.asarray(gate_weight_hr, dtype=np.float32)
+	if pred.ndim != 2 or gate_weight.ndim != 2:
 		return
-	if pred.shape != weight.shape:
+	if pred.shape != gate_weight.shape:
 		return
+	gate_vis = gate_weight.clip(0.0, 1.0)
+	greedy_direct_vis = _normalize_positive_debug_image(greedy_direct_flow_hr)
+	if greedy_direct_vis is None or greedy_direct_vis.shape != pred.shape:
+		greedy_direct_vis = np.zeros_like(gate_weight, dtype=np.float32)
+	threshold_basis_vis = (pred.astype(np.uint8) >= 110).astype(np.uint8) * 255
+	source_component_vis = None
+	if source_component_mask_hr is not None:
+		source_component = np.asarray(source_component_mask_hr, dtype=np.float32)
+		if source_component.shape == pred.shape:
+			source_component_vis = (source_component > 0.0).astype(np.uint8) * 255
 	pred_vis = ((pred.astype(np.float32) - 80.0) / (127.0 - 80.0)).clip(0.0, 1.0)
-	weight_vis = weight.clip(0.0, 1.0)
-	img = np.concatenate([
-		(pred_vis * 255.0 + 0.5).astype(np.uint8),
-		(weight_vis * 255.0 + 0.5).astype(np.uint8),
-	], axis=1)
+	right_panel = _flow_seed_overlay_panel(
+		(greedy_direct_vis * 255.0 + 0.5).astype(np.uint8),
+		source_xy=source_xy,
+		corr_seed_debug=corr_seed_debug,
+		source_edge_mask=source_edge_mask_hr,
+		flow_metadata=flow_metadata,
+	)
+	def gray_to_rgb(gray: np.ndarray) -> np.ndarray:
+		return np.repeat(np.asarray(gray, dtype=np.uint8)[..., None], 3, axis=2)
+	panels = [
+		gray_to_rgb(threshold_basis_vis),
+	]
+	if source_component_vis is not None:
+		panels.append(gray_to_rgb(source_component_vis))
+	panels.extend([
+		gray_to_rgb((pred_vis * 255.0 + 0.5).astype(np.uint8)),
+		gray_to_rgb((gate_vis * 255.0 + 0.5).astype(np.uint8)),
+		right_panel,
+	])
+	img = np.concatenate(panels, axis=1)
 	jpg_dir = out_dir / "pred_dt_flow_gate_weight_jpg"
 	try:
 		jpg_dir.mkdir(parents=True, exist_ok=True)
-		for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
-			path = jpg_dir / f"{suffix}_pred_dt_and_used_weight.jpg"
-			try:
-				import cv2
-				if not cv2.imwrite(str(path), img):
-					raise RuntimeError("cv2.imwrite returned false")
-			except Exception:
-				from PIL import Image
-				Image.fromarray(img, mode="L").save(str(path), quality=95)
+		path = jpg_dir / f"vis_{debug_index:06d}.jpg"
+		try:
+			import cv2
+			if not cv2.imwrite(str(path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR)):
+				raise RuntimeError("cv2.imwrite returned false")
+		except Exception:
+			from PIL import Image
+			Image.fromarray(img, mode="RGB").save(str(path), quality=95)
 	except Exception as exc:
 		if not _flow_gate_jpg_warned:
 			print(f"[pred_dt_flow_gate] jpg weight write skipped: {exc}", flush=True)
@@ -1029,23 +1508,30 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 	if res.data_s.pred_dt is None:
 		raise RuntimeError("pred_dt_flow_gate requires pred_dt to be loaded")
 
-	flow_zero = float(cfg.get("flow_zero", 20.0))
-	flow_one = float(cfg.get("flow_one", 100.0))
 	gate_factor = float(cfg.get("gate_factor", 1.0))
 	backtrack_distance = float(cfg.get("backtrack_distance", 10.0))
+	local_boost = float(cfg.get("local_boost", 1.0))
 	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 0))
 	pred_dt_pool_step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
 	pull_cfg = _anticipatory_pull_cfg(cfg)
-	if flow_one <= flow_zero:
-		raise ValueError("pred_dt_flow_gate requires flow_one > flow_zero")
 	if not 0.0 <= gate_factor <= 1.0:
 		raise ValueError("pred_dt_flow_gate requires gate_factor in [0, 1]")
+	if not 0.0 <= local_boost <= 1.0:
+		raise ValueError("pred_dt_flow_gate requires local_boost in [0, 1]")
 	debug = bool(cfg.get("debug", True))
 	debug_index = 0
 	if debug:
 		debug_index = _flow_gate_debug_counts.get(_flow_gate_stage, 0)
 		_flow_gate_debug_counts[_flow_gate_stage] = debug_index + 1
-	write_layer_debug = debug and (debug_index % 10) == 0
+	debug_layer_interval = _debug_interval(cfg, "debug_layer_interval")
+	debug_jpg_interval = _debug_interval(cfg, "debug_vis_interval", "debug_jpg_interval")
+	write_layer_debug = (
+		debug and debug_layer_interval > 0 and (debug_index % debug_layer_interval) == 0
+	)
+	write_jpg_debug = (
+		debug and debug_jpg_interval > 0 and (debug_index % debug_jpg_interval) == 0
+	)
+	return_flow_debug = write_layer_debug or write_jpg_debug
 	timing: dict[str, float] = {}
 	def mark(label: str) -> float:
 		return time.perf_counter()
@@ -1110,6 +1596,13 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 		sub_h = int(res.params.subsample_mesh)
 		sub_w = int(res.params.subsample_winding)
 		grid_step = max(1, int(round(0.5 * (sub_h + sub_w))))
+		corr_source_xy, corr_seed_stats, corr_seed_debug = _corr_point_source_xy(
+			res=res,
+			xyz_img=xyz_hr,
+			cfg=cfg,
+			sub_h=sub_h,
+			sub_w=sub_w,
+		)
 		yy, xx = np.meshgrid(
 			np.arange(Hm, dtype=np.float32) * float(sub_h),
 			np.arange(Wm, dtype=np.float32) * float(sub_w),
@@ -1136,7 +1629,17 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				pred_u8=pred_img,
 				flow_hr=None,
 				smooth_grid_flow=None,
+				gate_basis_hr=None,
 				graph_edge_flow_rgb=None,
+				island_obstacle_factor_rgb=None,
+				island_removed_mask_hr=None,
+				island_flow_passability_rgb=None,
+				island_propagated_edge_flow_rgb=None,
+				island_bonus_edge_flow_rgb=None,
+				island_tree_dense_no_backtrack_hr=None,
+				island_tree_dense_greedy_ascent_hr=None,
+				source_edge_mask_hr=None,
+				source_component_mask_hr=None,
 				weight_hr=None,
 				out_dir=_flow_gate_out_dir,
 			)
@@ -1147,32 +1650,53 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				return dense_batch_flow.compute_flow_grid(
 					pred_img,
 					source_xy=(source_x, source_y),
+					extra_source_xy=corr_source_xy,
 					query_xy=query_xy,
 					verbose=False,
-					return_debug=write_layer_debug,
+					return_debug=return_flow_debug,
 					return_metadata=True,
 					grid_step=grid_step,
 					backtrack_distance=backtrack_distance,
+					local_boost=local_boost,
 				)
 			finally:
 				done("flow_calc", _t_flow)
 
-		pull_candidates = None
 		try:
-			if pull_cfg is not None:
-				with ThreadPoolExecutor(max_workers=1) as executor:
-					flow_future = executor.submit(_compute_flow_outputs)
-					pull_candidates = _score_anticipatory_pull_candidates(res=res, cfg=pull_cfg)
-					flow_outputs = flow_future.result()
-			else:
-				flow_outputs = _compute_flow_outputs()
+			flow_outputs = _compute_flow_outputs()
 			publish_timing()
-			if write_layer_debug:
-				query_flow, dense_flow, smooth_grid_flow, graph_edge_flow_rgb, flow_metadata = flow_outputs
+			if return_flow_debug:
+				(
+					query_flow,
+					dense_flow,
+					smooth_grid_flow,
+					gate_basis_flow,
+					graph_edge_flow_rgb,
+					island_obstacle_factor_rgb,
+					island_removed_mask_hr,
+					island_flow_passability_rgb,
+					island_propagated_edge_flow_rgb,
+					island_bonus_edge_flow_rgb,
+					island_tree_dense_no_backtrack_hr,
+					island_tree_dense_greedy_ascent_hr,
+					source_edge_mask_hr,
+					source_component_mask_hr,
+					flow_metadata,
+				) = flow_outputs
 			else:
 				query_flow, dense_flow, flow_metadata = flow_outputs
 				smooth_grid_flow = None
+				gate_basis_flow = None
 				graph_edge_flow_rgb = None
+				island_obstacle_factor_rgb = None
+				island_removed_mask_hr = None
+				island_flow_passability_rgb = None
+				island_propagated_edge_flow_rgb = None
+				island_bonus_edge_flow_rgb = None
+				island_tree_dense_no_backtrack_hr = None
+				island_tree_dense_greedy_ascent_hr = None
+				source_edge_mask_hr = None
+				source_component_mask_hr = None
 		except RuntimeError as exc:
 			message = str(exc)
 			source_value = int(pred_img[source_y, source_x]) if 0 <= source_y < He and 0 <= source_x < We else -1
@@ -1183,7 +1707,6 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					weight = gate_factor * gate_weight + (1.0 - gate_factor)
 				valid = res.mask_lr > 0.0
 				valid_count = max(1.0, float(valid.sum().detach().cpu()))
-				used_weight = weight * res.mask_lr
 				_flow_gate_last_stats = {
 					"pred_dt_gate_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_gate_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
@@ -1192,10 +1715,15 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					"pred_dt_gate_n_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_gate_n_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_gate_n_gt05": float(((gate_weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_pull_gate_frac": 0.0,
+					"pred_dt_pull_scored_frac": 0.0,
 					"pred_dt_pull_active_frac": 0.0,
+					"pred_dt_pull_batches": 0.0,
+					"pred_dt_pull_samples_m": 0.0,
 					"pred_dt_pull_weight_mean": 0.0,
 					"pred_dt_pull_prefix_mean": 0.0,
 				}
+				_flow_gate_last_stats.update(corr_seed_stats)
 				print(
 					f"[pred_dt_flow_gate] {_flow_gate_stage}: skipped flow "
 					f"(source outside C++ flow domain, value={source_value})",
@@ -1214,13 +1742,23 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						pred_u8=pred_img,
 						flow_hr=None,
 						smooth_grid_flow=None,
+						gate_basis_hr=None,
 						graph_edge_flow_rgb=None,
+						island_obstacle_factor_rgb=None,
+						island_removed_mask_hr=None,
+						island_flow_passability_rgb=None,
+						island_propagated_edge_flow_rgb=None,
+						island_bonus_edge_flow_rgb=None,
+						island_tree_dense_no_backtrack_hr=None,
+						island_tree_dense_greedy_ascent_hr=None,
+						source_edge_mask_hr=None,
+						source_component_mask_hr=None,
 						weight_hr=weight_hr,
 						out_dir=_flow_gate_out_dir,
 					)
-				if debug:
-					used_weight_hr = F.interpolate(
-						used_weight,
+				if write_jpg_debug:
+					gate_weight_hr = F.interpolate(
+						gate_weight,
 						size=(He, We),
 						mode="nearest",
 					)[0, 0].detach().cpu().numpy().astype(np.float32)
@@ -1228,7 +1766,13 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						stage_name=_flow_gate_stage,
 						debug_index=debug_index,
 						pred_u8=pred_img,
-						used_weight_hr=used_weight_hr,
+						gate_weight_hr=gate_weight_hr,
+						greedy_direct_flow_hr=None,
+						source_edge_mask_hr=None,
+						source_component_mask_hr=None,
+						source_xy=(source_x, source_y),
+						corr_seed_debug=corr_seed_debug,
+						flow_metadata=None,
 						out_dir=_flow_gate_out_dir,
 					)
 				publish_timing()
@@ -1240,23 +1784,12 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			dtype=torch.float32,
 		).view(1, 1, Hm, Wm)
 		_t = mark("compute_weight")
-		seed_capacity = float(flow_metadata.get("source_capacity", 0.0))
-		effective_flow_one = flow_one
-		effective_flow_zero = flow_zero
-		if seed_capacity > 0.0 and seed_capacity < flow_one:
-			scale = seed_capacity / flow_one
-			effective_flow_one = seed_capacity
-			effective_flow_zero = flow_zero * scale
-		if effective_flow_one <= effective_flow_zero:
-			effective_flow_zero = max(0.0, effective_flow_one - 1.0)
-		gate_weight = ((flow_lr - effective_flow_zero) / (effective_flow_one - effective_flow_zero)).clamp(0.0, 1.0)
-		gate_weight = torch.where(seed_area, torch.ones_like(gate_weight), gate_weight)
+		gate_weight = flow_lr.clamp(0.0, 1.0)
 		weight = gate_weight
 		if gate_factor < 1.0:
 			weight = gate_factor * gate_weight + (1.0 - gate_factor)
 		valid = res.mask_lr > 0.0
 		valid_count = max(1.0, float(valid.sum().detach().cpu()))
-		used_weight = weight * res.mask_lr
 		_flow_gate_last_stats = {
 			"pred_dt_gate_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
 			"pred_dt_gate_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
@@ -1266,8 +1799,24 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			"pred_dt_gate_n_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
 			"pred_dt_gate_n_gt05": float(((gate_weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
 		}
+		_flow_gate_last_stats.update(corr_seed_stats)
+		if isinstance(flow_metadata, dict):
+			_flow_gate_last_stats.update({
+				"pred_dt_corr_seed_cxx_accepted": float(flow_metadata.get("accepted_source_count", 0)),
+				"pred_dt_flow_source_edges": float(flow_metadata.get("source_edge_count", 0)),
+				"pred_dt_flow_seeded_nodes": float(flow_metadata.get("seeded_node_count", 0)),
+			})
+		done("compute_weight", _t)
+		pull_candidates = None
 		pull = None
 		if pull_cfg is not None:
+			_t_pull = mark("anticipatory_pull")
+			pull_candidates = _score_anticipatory_pull_candidates(
+				res=res,
+				cfg=pull_cfg,
+				flow_weight=gate_weight,
+				mask_lr=res.mask_lr,
+			)
 			pull = _activate_anticipatory_pull(
 				candidates=pull_candidates,
 				flow_weight=gate_weight,
@@ -1275,10 +1824,23 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				cfg=pull_cfg,
 				weight_scale=gate_factor,
 			)
+			done("anticipatory_pull", _t_pull)
 			active_count = 0 if pull is None else int(pull["tip_h"].numel())
-			candidate_count = 0 if pull_candidates is None else int(pull_candidates["tip_h"].numel())
+			pull_stats = pull_candidates.get("_stats", {}) if pull_candidates is not None else {}
+			total_candidates = int(pull_stats.get("total_candidates", 0.0))
+			gate_candidates = int(pull_stats.get("gate_candidates", 0.0))
+			scored_candidates = int(pull_stats.get("scored_candidates", 0.0))
+			batches = int(pull_stats.get("active_batches", 0.0))
+			chunk_candidates = int(pull_stats.get("chunk_candidates", 0.0))
+			query_samples = int(pull_stats.get("query_samples", 0.0))
+			sparse_prefetch_batches = int(pull_stats.get("sparse_prefetch_batches", 0.0))
+			den_total = float(max(1, total_candidates))
 			_flow_gate_last_stats.update({
-				"pred_dt_pull_active_frac": float(active_count) / float(max(1, candidate_count)),
+				"pred_dt_pull_gate_frac": float(gate_candidates) / den_total,
+				"pred_dt_pull_scored_frac": float(scored_candidates) / den_total,
+				"pred_dt_pull_active_frac": float(active_count) / den_total,
+				"pred_dt_pull_batches": float(batches),
+				"pred_dt_pull_samples_m": float(query_samples) / 1.0e6,
 				"pred_dt_pull_weight_mean": (
 					float(pull["candidate_weight"].mean().detach().cpu()) if active_count > 0 else 0.0
 				),
@@ -1286,7 +1848,18 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					float(pull["prefix"].mean().detach().cpu()) if active_count > 0 else 0.0
 				),
 			})
-		done("compute_weight", _t)
+			if bool(pull_cfg.get("print_stats", False)):
+				print(
+					f"[pred_dt_flow_gate] {_flow_gate_stage}: anticipatory pull "
+					f"total={total_candidates} gate={gate_candidates} scored={scored_candidates} "
+					f"active={active_count} batches={batches} chunk={chunk_candidates} "
+					f"samples={query_samples} sparse_prefetch_batches={sparse_prefetch_batches}",
+					flush=True,
+				)
+
+		gate_basis_hr = None
+		if gate_basis_flow is not None and (write_layer_debug or write_jpg_debug):
+			gate_basis_hr = np.asarray(gate_basis_flow, dtype=np.float32)
 
 		if write_layer_debug:
 			_t = mark("write_layer_debug")
@@ -1329,7 +1902,17 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				pred_u8=pred_img,
 				flow_hr=flow_hr,
 				smooth_grid_flow=smooth_grid_flow,
+				gate_basis_hr=gate_basis_hr,
 				graph_edge_flow_rgb=graph_edge_flow_rgb,
+				island_obstacle_factor_rgb=island_obstacle_factor_rgb,
+				island_removed_mask_hr=island_removed_mask_hr,
+				island_flow_passability_rgb=island_flow_passability_rgb,
+				island_propagated_edge_flow_rgb=island_propagated_edge_flow_rgb,
+				island_bonus_edge_flow_rgb=island_bonus_edge_flow_rgb,
+				island_tree_dense_no_backtrack_hr=island_tree_dense_no_backtrack_hr,
+				island_tree_dense_greedy_ascent_hr=island_tree_dense_greedy_ascent_hr,
+				source_edge_mask_hr=source_edge_mask_hr,
+				source_component_mask_hr=source_component_mask_hr,
 				weight_hr=weight_hr,
 				pull_weight_hr=pull_weight_hr,
 				pull_prefix_hr=pull_prefix_hr,
@@ -1349,18 +1932,26 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					out_dir=_flow_gate_out_dir,
 				)
 			done("write_layer_debug", _t)
-		if debug:
+		if write_jpg_debug:
 			_t = mark("write_weight_jpg")
-			used_weight_hr = F.interpolate(
-				used_weight,
-				size=(He, We),
-				mode="nearest",
-			)[0, 0].detach().cpu().numpy().astype(np.float32)
+			gate_weight_hr = np.asarray(dense_flow, dtype=np.float32)
+			if gate_weight_hr.shape != pred_img.shape:
+				gate_weight_hr = F.interpolate(
+					gate_weight,
+					size=(He, We),
+					mode="nearest",
+				)[0, 0].detach().cpu().numpy().astype(np.float32)
 			_write_flow_gate_weight_jpg(
 				stage_name=_flow_gate_stage,
 				debug_index=debug_index,
 				pred_u8=pred_img,
-				used_weight_hr=used_weight_hr,
+				gate_weight_hr=gate_weight_hr,
+				greedy_direct_flow_hr=gate_basis_hr,
+				source_edge_mask_hr=source_edge_mask_hr,
+				source_component_mask_hr=source_component_mask_hr,
+				source_xy=(source_x, source_y),
+				corr_seed_debug=corr_seed_debug,
+				flow_metadata=flow_metadata,
 				out_dir=_flow_gate_out_dir,
 			)
 			done("write_weight_jpg", _t)

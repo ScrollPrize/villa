@@ -53,11 +53,9 @@ target_link_libraries(vc_core
 )
 
 # utils header-only library + vendored c3d codec.
-# WHOLE_ARCHIVE is needed because ThinLTO + lld can internalize symbols from
-# static archives before cross-archive references are resolved.
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
-    $<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,utils_c3d_codec>>
+    $<BUILD_INTERFACE:utils_c3d_codec>
 )
 target_link_libraries(vc_core PRIVATE
     Blosc::blosc

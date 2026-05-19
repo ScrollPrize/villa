@@ -6,7 +6,7 @@
 		"normal": 1.0,
 		"step": 10.0,
 		"smooth": 10.0,
-		"station_n": 1.0,
+		"station_n": 0.0,
 		"station_t": 1.0,
 		"winding_density": 0.01,
 		"data": 0.0,

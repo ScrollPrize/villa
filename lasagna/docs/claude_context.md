@@ -136,6 +136,10 @@ Pixel (row, col) → 3D point from (x.tif, y.tif, z.tif). Points with z <= 0 are
 
 ## Lasagna ↔ VC3D Integration
 
+Invariant: VC3D is transport only. Do not add Lasagna config-semantic branching in
+VC3D request assembly; config interpretation belongs in `fit_service.py` /
+`fit.py`.
+
 ```
 VC3D → lasagna:  tifxyz seed + corrections (JSON with wind_a)
 lasagna → VC3D:  optimized tifxyz (with updated d.tif channel)
@@ -163,7 +167,7 @@ lasagna → VC3D:  optimized tifxyz (with updated d.tif channel)
 Generates a new surface at a configurable grad_mag integral offset from an existing tifxyz reference. Used to trace adjacent papyrus windings from a known surface.
 
 **Data flow:**
-1. VC3D sends the existing tifxyz as base64 (`tifxyz_data` in request body) — no model.pt needed
+1. VC3D sends the existing tifxyz as base64 (`tifxyz` in request body) — no model.pt needed
 2. `fit_service.py` decodes files to temp dir, creates config with:
    - `tifxyz-init`: initialize model from the tifxyz (via `Model3D.from_tifxyz()`)
    - `external_surfaces`: same tifxyz registered as frozen reference with target offset

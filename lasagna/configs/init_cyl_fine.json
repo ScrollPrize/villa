@@ -1,0 +1,131 @@
+{
+	"args": {
+		"model-init": "seed",
+		"init-mode": "cylinder_seed",
+		"mesh-step": 50.0
+	},
+	"base": {
+		"cyl_normal": 10.0,
+		"cyl_smooth": 10.0,
+		"cyl_z_smooth": 1.0,
+		"cyl_z_center": 1.0,
+		"cyl_step": 100.0,
+		"cyl_radial_mean": 0.0,
+		"cyl_step_push": 0.1,
+		"cyl_bend": 100.0,
+		"cyl_conn_mesh": 0.0,
+		"cyl_conn_gt": 0.0,
+		"cyl_base_mesh": 0.0,
+		"cyl_base_gt": 0.0,
+		"cyl_outside": 100.0,
+		"normal": 1.0,
+		"step": 10.0,
+		"smooth": 0.0001,
+		"station_n": 0.0001,
+		"station_t": 0.0001,
+		"winding_density": 0.01,
+		"data": 0.0,
+		"data_plain": 0.0,
+		"pred_dt": 0.001,
+		"corr": 0.1,
+		"bend": 100.0,
+		"ext_offset": 0.0
+	},
+	"stages": [
+		{
+			"name": "cyl_init",
+			"steps": 1000,
+			"lr" : 1.0,
+			"params": ["cyl_params"],
+			"args": {
+			    "cyl_output_all_shells": true,
+				"cyl_max_shells": 6,
+				"model-step": 200.0,
+				"compile_cyl_normal": true,
+				"profile_opt": false
+			}
+		},
+			{
+				"name": "cyl_grow",
+				"steps": 1000,
+				"lr" : 1.0,
+			"params": ["cyl_params"],
+			"w_fac": {
+				"cyl_smooth": 1.0
+			},
+			"args": {
+				"grow_factor": 1.02,
+				"cyl_grow_direction": "outward",
+				"model-step": 200.0,
+				"compile_cyl_normal": true,
+					"profile_opt": false
+				}
+			},
+			{
+				"name": "cyl_grow_refine",
+				"steps": 2000,
+				"lr": 1.0,
+				"params": ["cyl_params"],
+				"w_fac": {
+					"cyl_smooth": 1.0
+				},
+				"args": {
+					"model-step": 200.0,
+					"compile_cyl_normal": true,
+					"profile_opt": false
+				}
+			},
+			{
+				"name": "cyl_refine",
+				"steps": 0,
+			"_lr": [10.0, 1.0, 0.1, 0.01, 0.001],
+				"lr": [2.0, 1.0, 0.5, 0.25, 0.125],
+				"_lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+				"_lr": [16.0, 8.0, 4.0, 2.0, 1.0],
+			"params": ["cyl_params"],
+			"w_fac": {
+				"cyl_smooth": 0.1
+			},
+			"args": {
+				"model-step": 200.0,
+				"compile_cyl_normal": true,
+				"profile_opt": false
+			}
+		},
+		{
+			"name": "cyl_polish",
+			"steps": 0,
+			"lr": [10.0, 1.0, 0.1, 0.01],
+			"params": ["cyl_params"],
+			"w_fac": {
+				"cyl_step": 10.0
+			},
+			"args": {
+				"model-step": 200.0,
+				"compile_cyl_normal": true,
+				"profile_opt": false
+			}
+		},
+		{
+			"name": "mesh_opt",
+			"steps": 0,
+			"min_scaledown": 0,
+			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"params": ["mesh_ms"],
+			"w_fac": {
+				"cyl_normal": 0.0,
+				"cyl_smooth": 0.0,
+				"cyl_z_smooth": 0.0,
+				"cyl_step": 0.0,
+				"cyl_radial_mean": 0.0,
+				"cyl_bend": 0.0,
+				"cyl_conn_mesh": 0.0,
+				"cyl_conn_gt": 0.0,
+				"cyl_base_mesh": 0.0,
+				"cyl_base_gt": 0.0,
+				"cyl_outside": 0.0,
+				"pred_dt": 0.0
+			}
+		}
+	]
+}

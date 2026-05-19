@@ -71,4 +71,4 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `ext` initializes from the selected tifxyz mesh sent by VC3D.
 - `model` initializes from the selected segment's `model.pt`.
 
-If any effective optimizer stage uses a nonzero `ext_offset` loss, VC3D also sends the selected tifxyz mesh as the external reference surface, independently of `model-init`.
+For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model data and UI state it has available. `fit_service.py` / `fit.py` decide whether those fields are consumed as `tifxyz-init`, `external_surfaces`, approval-inpaint input, model checkpoint input, or ignored as surplus transport data.
