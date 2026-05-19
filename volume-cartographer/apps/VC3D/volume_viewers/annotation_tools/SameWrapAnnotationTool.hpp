@@ -14,6 +14,11 @@ class VCCollection;
 
 class SameWrapAnnotationTool {
 public:
+    enum class PathType {
+        ConnectedComponents = 0,
+        ShortestPath = 1
+    };
+
     using SceneToVolumeFn = std::function<cv::Vec3f(const QPointF&)>;
     using VolumeToSceneFn = std::function<QPointF(const cv::Vec3f&)>;
     using SetOverlayGroupFn = std::function<void(const std::string&, const std::vector<QGraphicsItem*>&)>;
@@ -26,6 +31,7 @@ public:
     void setEnabled(bool enabled);
     void setSpacing(double spacingVx);
     void setMergeExistingAnnotations(bool enabled);
+    void setPathType(PathType pathType);
     void noteShiftReleased();
     void clear(const ClearOverlayGroupFn& clearOverlayGroup);
     bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
@@ -47,8 +53,12 @@ private:
     struct State {
         bool enabled = false;
         bool mergeExistingAnnotations = false;
+        PathType pathType = PathType::ConnectedComponents;
         float spacingVx = 20.0f;
         bool shiftReleasedSincePreview = true;
+        bool hasShortestPathSource = false;
+        QPointF shortestPathSourceScenePos;
+        cv::Vec3f shortestPathSourceVolumePos{0.0f, 0.0f, 0.0f};
         std::vector<QPointF> componentScenePath;
         std::vector<cv::Vec3f> componentVolumePath;
         std::vector<cv::Vec3f> sampledVolumePoints;

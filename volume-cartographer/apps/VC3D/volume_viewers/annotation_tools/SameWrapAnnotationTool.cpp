@@ -2,6 +2,8 @@
 
 #include "vc/ui/VCCollection.hpp"
 
+#include "dijkstra3d.hpp"
+
 #include <QBrush>
 #include <QColor>
 #include <QGraphicsEllipseItem>
@@ -96,6 +98,64 @@ void appendIfDistinct(std::vector<cv::Vec3f>& points, const cv::Vec3f& point, fl
     }
     points.push_back(point);
 }
+
+int nearestSkeletonPixel(const cv::Mat& skeleton, int x, int y, int searchRadius)
+{
+    int bestKey = -1;
+    int bestDist2 = std::numeric_limits<int>::max();
+    for (int dy = -searchRadius; dy <= searchRadius; ++dy) {
+        const int py = y + dy;
+        if (py < 0 || py >= skeleton.rows) {
+            continue;
+        }
+        const uint8_t* row = skeleton.ptr<uint8_t>(py);
+        for (int dx = -searchRadius; dx <= searchRadius; ++dx) {
+            const int px = x + dx;
+            if (px < 0 || px >= skeleton.cols || row[px] == 0) {
+                continue;
+            }
+            const int dist2 = dx * dx + dy * dy;
+            if (dist2 < bestDist2) {
+                bestDist2 = dist2;
+                bestKey = py * skeleton.cols + px;
+            }
+        }
+    }
+    return bestKey;
+}
+
+std::vector<cv::Vec3f> sampleScenePath(const std::vector<QPointF>& scenePath,
+                                       float spacingPx,
+                                       const SameWrapAnnotationTool::SceneToVolumeFn& sceneToVolume)
+{
+    std::vector<cv::Vec3f> sampled;
+    if (scenePath.empty()) {
+        return sampled;
+    }
+
+    sampled.push_back(sceneToVolume(scenePath.front()));
+    float sinceLast = 0.0f;
+    QPointF prev = scenePath.front();
+    for (size_t i = 1; i < scenePath.size(); ++i) {
+        QPointF cur = scenePath[i];
+        float segmentLen = static_cast<float>(std::hypot(cur.x() - prev.x(), cur.y() - prev.y()));
+        while (sinceLast + segmentLen >= spacingPx && segmentLen > 0.0f) {
+            const float t = (spacingPx - sinceLast) / segmentLen;
+            const QPointF sample(prev.x() + (cur.x() - prev.x()) * t,
+                                 prev.y() + (cur.y() - prev.y()) * t);
+            sampled.push_back(sceneToVolume(sample));
+            prev = sample;
+            segmentLen = static_cast<float>(std::hypot(cur.x() - prev.x(), cur.y() - prev.y()));
+            sinceLast = 0.0f;
+        }
+        sinceLast += segmentLen;
+        prev = cur;
+    }
+    if (sampled.empty() || cv::norm(sampled.back() - sceneToVolume(scenePath.back())) > 0.5f) {
+        sampled.push_back(sceneToVolume(scenePath.back()));
+    }
+    return sampled;
+}
 }
 
 void SameWrapAnnotationTool::setEnabled(bool enabled)
@@ -113,6 +173,15 @@ void SameWrapAnnotationTool::setMergeExistingAnnotations(bool enabled)
     _state.mergeExistingAnnotations = enabled;
 }
 
+void SameWrapAnnotationTool::setPathType(PathType pathType)
+{
+    if (_state.pathType == pathType) {
+        return;
+    }
+    _state.pathType = pathType;
+    _state.hasShortestPathSource = false;
+}
+
 void SameWrapAnnotationTool::noteShiftReleased()
 {
     _state.shiftReleasedSincePreview = true;
@@ -126,6 +195,9 @@ void SameWrapAnnotationTool::clear(const ClearOverlayGroupFn& clearOverlayGroup)
     _state.mergeCollectionIds.clear();
     _state.mergeCollectionName.clear();
     _state.clickVolumePos = {0.0f, 0.0f, 0.0f};
+    _state.hasShortestPathSource = false;
+    _state.shortestPathSourceScenePos = QPointF();
+    _state.shortestPathSourceVolumePos = {0.0f, 0.0f, 0.0f};
     _state.hasPreview = false;
     _state.shiftReleasedSincePreview = true;
     clearOverlayGroup(kSameWrapAnnotationOverlayKey);
@@ -175,7 +247,9 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
         previousMergeCollectionIds = _state.mergeCollectionIds;
         previousMergeCollectionName = _state.mergeCollectionName;
     } else {
-        clear(clearOverlayGroup);
+        if (!(_state.pathType == PathType::ShortestPath && _state.hasShortestPathSource)) {
+            clear(clearOverlayGroup);
+        }
         appendToPreview = false;
     }
 
@@ -202,6 +276,95 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
 
     cv::Mat skeleton;
     cv::ximgproc::thinning(binary, skeleton, cv::ximgproc::THINNING_GUOHALL);
+
+    if (_state.pathType == PathType::ShortestPath) {
+        constexpr int kSearchRadius = 10;
+        const int selectedKey = nearestSkeletonPixel(skeleton, clickX, clickY, kSearchRadius);
+        if (selectedKey < 0) {
+            return false;
+        }
+
+        const QPointF snappedScenePos(static_cast<qreal>(selectedKey % w),
+                                      static_cast<qreal>(selectedKey / w));
+        if (!_state.hasShortestPathSource) {
+            clear(clearOverlayGroup);
+            _state.hasShortestPathSource = true;
+            _state.shortestPathSourceScenePos = snappedScenePos;
+            _state.shortestPathSourceVolumePos = sceneToVolume(snappedScenePos);
+            _state.clickVolumePos = _state.shortestPathSourceVolumePos;
+            _state.hasPreview = true;
+            _state.shiftReleasedSincePreview = false;
+            updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
+            return true;
+        }
+
+        const int sourceKey = nearestSkeletonPixel(
+            skeleton,
+            static_cast<int>(std::lround(_state.shortestPathSourceScenePos.x())),
+            static_cast<int>(std::lround(_state.shortestPathSourceScenePos.y())),
+            kSearchRadius);
+        const int targetKey = selectedKey;
+        if (sourceKey < 0 || sourceKey == targetKey) {
+            return false;
+        }
+
+        std::vector<float> weights(static_cast<size_t>(w) * static_cast<size_t>(h), 1000000.0f);
+        for (int y = 0; y < h; ++y) {
+            const uint8_t* row = skeleton.ptr<uint8_t>(y);
+            for (int x = 0; x < w; ++x) {
+                if (row[x] > 0) {
+                    weights[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)] = 1.0f;
+                }
+            }
+        }
+
+        std::vector<uint32_t> path = dijkstra::dijkstra2d<float, uint32_t>(
+            weights.data(),
+            static_cast<size_t>(w),
+            static_cast<size_t>(h),
+            static_cast<size_t>(sourceKey),
+            static_cast<size_t>(targetKey),
+            8);
+        if (path.size() < 2) {
+            return false;
+        }
+        std::reverse(path.begin(), path.end());
+
+        std::vector<QPointF> scenePath;
+        scenePath.reserve(path.size());
+        for (uint32_t key : path) {
+            const int x = static_cast<int>(key % static_cast<uint32_t>(w));
+            const int y = static_cast<int>(key / static_cast<uint32_t>(w));
+            if (x < 0 || x >= w || y < 0 || y >= h || skeleton.at<uint8_t>(y, x) == 0) {
+                return false;
+            }
+            scenePath.emplace_back(static_cast<qreal>(x), static_cast<qreal>(y));
+        }
+
+        std::vector<cv::Vec3f> volumePath;
+        volumePath.reserve(scenePath.size());
+        for (const QPointF& point : scenePath) {
+            volumePath.push_back(sceneToVolume(point));
+        }
+
+        const float spacingPx = std::max(1.0f, _state.spacingVx * viewScale);
+        std::vector<cv::Vec3f> sampled = sampleScenePath(scenePath, spacingPx, sceneToVolume);
+        if (sampled.size() < 2) {
+            return false;
+        }
+
+        _state.componentScenePath = std::move(scenePath);
+        _state.componentVolumePath = std::move(volumePath);
+        _state.sampledVolumePoints = std::move(sampled);
+        _state.mergeCollectionIds.clear();
+        _state.mergeCollectionName.clear();
+        _state.clickVolumePos = sceneToVolume(snappedScenePos);
+        _state.hasPreview = true;
+        _state.hasShortestPathSource = false;
+        _state.shiftReleasedSincePreview = false;
+        updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
+        return true;
+    }
 
     cv::Mat labels;
     const int componentCount = cv::connectedComponents(skeleton, labels, 8, CV_32S);
@@ -408,28 +571,7 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
     }
 
     const float spacingPx = std::max(1.0f, _state.spacingVx * viewScale);
-    std::vector<cv::Vec3f> sampled;
-    sampled.push_back(sceneToVolume(scenePath.front()));
-    float sinceLast = 0.0f;
-    QPointF prev = scenePath.front();
-    for (size_t i = 1; i < scenePath.size(); ++i) {
-        QPointF cur = scenePath[i];
-        float segmentLen = static_cast<float>(std::hypot(cur.x() - prev.x(), cur.y() - prev.y()));
-        while (sinceLast + segmentLen >= spacingPx && segmentLen > 0.0f) {
-            const float t = (spacingPx - sinceLast) / segmentLen;
-            const QPointF sample(prev.x() + (cur.x() - prev.x()) * t,
-                                 prev.y() + (cur.y() - prev.y()) * t);
-            sampled.push_back(sceneToVolume(sample));
-            prev = sample;
-            segmentLen = static_cast<float>(std::hypot(cur.x() - prev.x(), cur.y() - prev.y()));
-            sinceLast = 0.0f;
-        }
-        sinceLast += segmentLen;
-        prev = cur;
-    }
-    if (sampled.empty() || cv::norm(sampled.back() - sceneToVolume(scenePath.back())) > 0.5f) {
-        sampled.push_back(sceneToVolume(scenePath.back()));
-    }
+    std::vector<cv::Vec3f> sampled = sampleScenePath(scenePath, spacingPx, sceneToVolume);
     if (sampled.size() < 2) {
         return false;
     }
@@ -602,6 +744,15 @@ void SameWrapAnnotationTool::updateOverlay(const VolumeToSceneFn& volumeToScene,
         pathItem->setPen(pen);
         pathItem->setZValue(130.0);
         items.push_back(pathItem);
+    }
+
+    if (_state.hasShortestPathSource) {
+        const QPointF scenePoint = volumeToScene(_state.shortestPathSourceVolumePos);
+        auto* marker = new QGraphicsEllipseItem(scenePoint.x() - 5.0, scenePoint.y() - 5.0, 10.0, 10.0);
+        marker->setPen(QPen(QColor(0, 255, 255, 240), 2.0));
+        marker->setBrush(QBrush(QColor(0, 255, 255, 110)));
+        marker->setZValue(134.0);
+        items.push_back(marker);
     }
 
     for (const auto& point : _state.sampledVolumePoints) {

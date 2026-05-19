@@ -79,6 +79,15 @@ void CPointCollectionWidget::setupUi()
     _chkSameWrapMerge = new QCheckBox("Merge same-wrap annotations", same_wrap_group);
     _chkSameWrapMerge->setToolTip("Preview and commit matching existing same-wrap annotations as one ordered point set.");
     same_wrap_layout->addWidget(_chkSameWrapMerge);
+    QHBoxLayout *same_wrap_path_type_layout = new QHBoxLayout();
+    same_wrap_path_type_layout->addWidget(new QLabel("Path type:"));
+    _sameWrapPathTypeCombo = new QComboBox(same_wrap_group);
+    _sameWrapPathTypeCombo->addItem("Connected components", 0);
+    _sameWrapPathTypeCombo->addItem("Shortest path", 1);
+    _sameWrapPathTypeCombo->setToolTip("Choose whether shift-click selects a skeleton component or two endpoints for a shortest path.");
+    same_wrap_path_type_layout->addWidget(_sameWrapPathTypeCombo);
+    same_wrap_path_type_layout->addStretch();
+    same_wrap_layout->addLayout(same_wrap_path_type_layout);
     QHBoxLayout *same_wrap_spacing_layout = new QHBoxLayout();
     same_wrap_spacing_layout->addWidget(new QLabel("Spacing:"));
     _sameWrapSpacingSpinbox = new QDoubleSpinBox(same_wrap_group);
@@ -98,6 +107,9 @@ void CPointCollectionWidget::setupUi()
     layout->addWidget(same_wrap_group);
     connect(_chkSameWrapAnnotation, &QCheckBox::toggled, this, &CPointCollectionWidget::sameWrapAnnotationToggled);
     connect(_chkSameWrapMerge, &QCheckBox::toggled, this, &CPointCollectionWidget::sameWrapAnnotationMergeToggled);
+    connect(_sameWrapPathTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        emit sameWrapAnnotationPathTypeChanged(sameWrapAnnotationPathType());
+    });
     connect(_sameWrapSpacingSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged);
     connect(_clearSameWrapAnnotationButton, &QPushButton::clicked, this, &CPointCollectionWidget::sameWrapAnnotationClearRequested);
@@ -971,6 +983,11 @@ double CPointCollectionWidget::sameWrapAnnotationSpacing() const
 bool CPointCollectionWidget::sameWrapAnnotationMergeEnabled() const
 {
     return _chkSameWrapMerge && _chkSameWrapMerge->isChecked();
+}
+
+int CPointCollectionWidget::sameWrapAnnotationPathType() const
+{
+    return _sameWrapPathTypeCombo ? _sameWrapPathTypeCombo->currentData().toInt() : 0;
 }
 
 CPointCollectionWidget::~CPointCollectionWidget() {

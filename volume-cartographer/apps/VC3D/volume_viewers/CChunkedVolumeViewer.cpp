@@ -2948,6 +2948,15 @@ void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
     _sameWrapAnnotation.setMergeExistingAnnotations(enabled);
 }
 
+void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
+{
+    _sameWrapAnnotation.setPathType(
+        pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)
+            ? SameWrapAnnotationTool::PathType::ShortestPath
+            : SameWrapAnnotationTool::PathType::ConnectedComponents);
+    clearSameWrapAnnotationPreview();
+}
+
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
 {
     _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
