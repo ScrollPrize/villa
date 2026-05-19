@@ -21,7 +21,8 @@ public:
 
     enum class ImageFilterType {
         None = 0,
-        Median = 1
+        Median = 1,
+        Gaussian = 2
     };
 
     using SceneToVolumeFn = std::function<cv::Vec3f(const QPointF&)>;

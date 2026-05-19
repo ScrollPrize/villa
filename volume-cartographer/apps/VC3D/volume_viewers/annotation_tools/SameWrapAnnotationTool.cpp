@@ -367,6 +367,9 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
     }
     if (_state.imageFilterType == ImageFilterType::Median) {
         cv::medianBlur(gray, gray, std::max(3, _state.imageFilterKernelSize | 1));
+    } else if (_state.imageFilterType == ImageFilterType::Gaussian) {
+        const int kernelSize = std::max(3, _state.imageFilterKernelSize | 1);
+        cv::GaussianBlur(gray, gray, cv::Size(kernelSize, kernelSize), 0.0);
     }
 
     const int w = framebuffer.width();

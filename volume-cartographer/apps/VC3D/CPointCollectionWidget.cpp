@@ -93,6 +93,7 @@ void CPointCollectionWidget::setupUi()
     _sameWrapFilterTypeCombo = new QComboBox(same_wrap_group);
     _sameWrapFilterTypeCombo->addItem("None", 0);
     _sameWrapFilterTypeCombo->addItem("Median", 1);
+    _sameWrapFilterTypeCombo->addItem("Gaussian", 2);
     _sameWrapFilterTypeCombo->setToolTip("Optionally filter the source image before thresholding and skeleton tracing.");
     same_wrap_filter_layout->addWidget(_sameWrapFilterTypeCombo);
     same_wrap_filter_layout->addWidget(new QLabel("Kernel:"));
@@ -103,7 +104,7 @@ void CPointCollectionWidget::setupUi()
     _sameWrapFilterKernelSpinbox->setSuffix(" px");
     _sameWrapFilterKernelSpinbox->setMaximumWidth(80);
     _sameWrapFilterKernelSpinbox->setEnabled(false);
-    _sameWrapFilterKernelSpinbox->setToolTip("Odd median-filter kernel size applied before connected components or shortest-path tracing.");
+    _sameWrapFilterKernelSpinbox->setToolTip("Odd blur kernel size applied before connected components or shortest-path tracing.");
     same_wrap_filter_layout->addWidget(_sameWrapFilterKernelSpinbox);
     same_wrap_filter_layout->addStretch();
     same_wrap_layout->addLayout(same_wrap_filter_layout);

@@ -2959,10 +2959,13 @@ void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
 
 void CChunkedVolumeViewer::setSameWrapAnnotationFilterType(int filterType)
 {
-    _sameWrapAnnotation.setImageFilterType(
-        filterType == static_cast<int>(SameWrapAnnotationTool::ImageFilterType::Median)
-            ? SameWrapAnnotationTool::ImageFilterType::Median
-            : SameWrapAnnotationTool::ImageFilterType::None);
+    SameWrapAnnotationTool::ImageFilterType toolFilterType = SameWrapAnnotationTool::ImageFilterType::None;
+    if (filterType == static_cast<int>(SameWrapAnnotationTool::ImageFilterType::Median)) {
+        toolFilterType = SameWrapAnnotationTool::ImageFilterType::Median;
+    } else if (filterType == static_cast<int>(SameWrapAnnotationTool::ImageFilterType::Gaussian)) {
+        toolFilterType = SameWrapAnnotationTool::ImageFilterType::Gaussian;
+    }
+    _sameWrapAnnotation.setImageFilterType(toolFilterType);
     clearSameWrapAnnotationPreview();
 }
 
