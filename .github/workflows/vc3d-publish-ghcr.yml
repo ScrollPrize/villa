@@ -23,15 +23,14 @@ permissions:
   contents: read
   packages: write
 
-concurrency:
-  group: ${{ github.workflow }}-${{ matrix.image }}
-  cancel-in-progress: false
-
 jobs:
   publish:
     name: Publish ${{ matrix.image }} builder
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.image }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
