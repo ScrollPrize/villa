@@ -1,5 +1,7 @@
 #include "ChunkCache.hpp"
 
+#include "vc/core/util/Logging.hpp"
+
 #include <algorithm>
 #include <fstream>
 #include <limits>
@@ -407,9 +409,22 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
     } catch (const std::exception& e) {
         fetch.status = ChunkFetchStatus::IoError;
         fetch.message = e.what();
+        Logger()->error(
+            "ChunkCache caught chunk fetch exception for {}/{}/{}/{}: {}",
+            key.level,
+            key.iz,
+            key.iy,
+            key.ix,
+            fetch.message);
     } catch (...) {
         fetch.status = ChunkFetchStatus::IoError;
         fetch.message = "unknown chunk fetch exception";
+        Logger()->error(
+            "ChunkCache caught unknown chunk fetch exception for {}/{}/{}/{}",
+            key.level,
+            key.iz,
+            key.iy,
+            key.ix);
     }
 
     {
