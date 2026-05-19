@@ -8,7 +8,14 @@
 
 namespace vc3d::segmentation {
 
-inline void invalidateApprovalPlaneIntersections(const std::vector<VolumeViewerBase*>& viewers)
+enum class ApprovalIntersectionRefresh {
+    Immediate,
+    Deferred,
+};
+
+inline void invalidateApprovalPlaneIntersections(
+    const std::vector<VolumeViewerBase*>& viewers,
+    ApprovalIntersectionRefresh refresh)
 {
     for (auto* viewer : viewers) {
         if (!viewer) {
@@ -16,7 +23,11 @@ inline void invalidateApprovalPlaneIntersections(const std::vector<VolumeViewerB
         }
         if (dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
             viewer->invalidateIntersect("segmentation");
-            viewer->scheduleIntersectionRender("approval mask changed");
+            if (refresh == ApprovalIntersectionRefresh::Immediate) {
+                viewer->renderIntersections("approval mask changed");
+            } else {
+                viewer->scheduleIntersectionRender("approval mask changed");
+            }
         }
     }
 }

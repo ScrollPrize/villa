@@ -176,7 +176,7 @@ class SegmentationIntersectionInvalidationTest final : public QObject {
     Q_OBJECT
 
 private slots:
-    void repeatedPlaneInvalidationsAreDebounced()
+    void repeatedAutoApprovalPlaneInvalidationsAreDebounced()
     {
         PlaneSurface plane;
         FakeViewer viewer(&plane);
@@ -184,9 +184,12 @@ private slots:
         QSignalSpy scheduleStarted(&viewer, &FakeViewer::scheduleStarted);
         QSignalSpy rendered(&viewer, &FakeViewer::rendered);
 
-        vc3d::segmentation::invalidateApprovalPlaneIntersections(viewers);
-        vc3d::segmentation::invalidateApprovalPlaneIntersections(viewers);
-        vc3d::segmentation::invalidateApprovalPlaneIntersections(viewers);
+        vc3d::segmentation::invalidateApprovalPlaneIntersections(
+            viewers, vc3d::segmentation::ApprovalIntersectionRefresh::Deferred);
+        vc3d::segmentation::invalidateApprovalPlaneIntersections(
+            viewers, vc3d::segmentation::ApprovalIntersectionRefresh::Deferred);
+        vc3d::segmentation::invalidateApprovalPlaneIntersections(
+            viewers, vc3d::segmentation::ApprovalIntersectionRefresh::Deferred);
 
         QCOMPARE(viewer.invalidateCount, 3);
         QCOMPARE(QString::fromStdString(viewer.lastInvalidatedName), QString("segmentation"));
@@ -197,6 +200,28 @@ private slots:
         QCOMPARE(rendered.count(), 0);
     }
 
+    void manualPlaneInvalidationsRenderSynchronously()
+    {
+        PlaneSurface plane;
+        FakeViewer viewer(&plane);
+        std::vector<VolumeViewerBase*> viewers{&viewer};
+        QSignalSpy scheduleStarted(&viewer, &FakeViewer::scheduleStarted);
+        QSignalSpy rendered(&viewer, &FakeViewer::rendered);
+
+        vc3d::segmentation::invalidateApprovalPlaneIntersections(
+            viewers, vc3d::segmentation::ApprovalIntersectionRefresh::Immediate);
+        vc3d::segmentation::invalidateApprovalPlaneIntersections(
+            viewers, vc3d::segmentation::ApprovalIntersectionRefresh::Immediate);
+
+        QCOMPARE(viewer.invalidateCount, 2);
+        QCOMPARE(QString::fromStdString(viewer.lastInvalidatedName), QString("segmentation"));
+        QCOMPARE(viewer.scheduleRequestCount, 0);
+        QCOMPARE(viewer.scheduleStartCount, 0);
+        QCOMPARE(scheduleStarted.count(), 0);
+        QCOMPARE(viewer.renderCount, 2);
+        QCOMPARE(rendered.count(), 2);
+    }
+
     void nonPlaneViewersAreIgnored()
     {
         DummySurface surface;
@@ -205,7 +230,8 @@ private slots:
         QSignalSpy scheduleStarted(&viewer, &FakeViewer::scheduleStarted);
         QSignalSpy rendered(&viewer, &FakeViewer::rendered);
 
-        vc3d::segmentation::invalidateApprovalPlaneIntersections(viewers);
+        vc3d::segmentation::invalidateApprovalPlaneIntersections(
+            viewers, vc3d::segmentation::ApprovalIntersectionRefresh::Deferred);
 
         QCOMPARE(viewer.invalidateCount, 0);
         QCOMPARE(viewer.scheduleRequestCount, 0);

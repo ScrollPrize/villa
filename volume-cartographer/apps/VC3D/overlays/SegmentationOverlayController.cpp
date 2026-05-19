@@ -513,8 +513,12 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     // Invalidate pending version since we modified the pending image
     ++_pendingImageVersion;
 
-    // Trigger re-rendering of intersection lines on plane viewers
-    invalidatePlaneIntersections();
+    // Manual painting should update interactively; auto-approval bursts are coalesced.
+    if (isAutoApproval) {
+        schedulePlaneIntersectionRefresh();
+    } else {
+        invalidatePlaneIntersections();
+    }
 }
 
 void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surface)
@@ -1433,12 +1437,26 @@ void SegmentationOverlayController::forceRefreshAllOverlays()
 
 void SegmentationOverlayController::invalidatePlaneIntersections()
 {
-    OverlayProfileScope profile("invalidatePlaneIntersections");
+    OverlayProfileScope profile("invalidatePlaneIntersections", "immediate");
     if (!_viewerManager) {
         return;
     }
 
-    vc3d::segmentation::invalidateApprovalPlaneIntersections(_viewerManager->baseViewers());
+    vc3d::segmentation::invalidateApprovalPlaneIntersections(
+        _viewerManager->baseViewers(),
+        vc3d::segmentation::ApprovalIntersectionRefresh::Immediate);
+}
+
+void SegmentationOverlayController::schedulePlaneIntersectionRefresh()
+{
+    OverlayProfileScope profile("invalidatePlaneIntersections", "deferred");
+    if (!_viewerManager) {
+        return;
+    }
+
+    vc3d::segmentation::invalidateApprovalPlaneIntersections(
+        _viewerManager->baseViewers(),
+        vc3d::segmentation::ApprovalIntersectionRefresh::Deferred);
 }
 
 void SegmentationOverlayController::setApprovalMaskOpacity(int opacity)
