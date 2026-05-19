@@ -77,6 +77,25 @@ public:
     }
 };
 
+class HttpErrorChunkFetcher final : public vc::render::IChunkFetcher {
+public:
+    vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey& key) override
+    {
+        if (key.level == 0 && key.iz == 0 && key.iy == 0 && key.ix == 0) {
+            vc::render::ChunkFetchResult result;
+            result.status = vc::render::ChunkFetchStatus::HttpError;
+            result.httpStatus = 400;
+            result.message = "HTTP 400 fetching 0/0/0/0";
+            return result;
+        }
+
+        vc::render::ChunkFetchResult result;
+        result.status = vc::render::ChunkFetchStatus::Found;
+        result.bytes = chunkBytes(std::byte{7});
+        return result;
+    }
+};
+
 } // namespace
 
 TEST_CASE("ChunkCache converts fetch exceptions to chunk errors")
@@ -102,6 +121,24 @@ TEST_CASE("Volume::readZYX reports downloader chunk errors outside OpenMP worker
         const std::string message = e.what();
         CHECK(message.find("Volume::read failed fetching chunk 0/0/0/0") != std::string::npos);
         CHECK(message.find("synthetic downloader exception") != std::string::npos);
+    }
+
+    CHECK(threw);
+}
+
+TEST_CASE("Volume::readZYX reports HTTP chunk errors outside OpenMP workers")
+{
+    auto cache = makeCache(std::make_shared<HttpErrorChunkFetcher>());
+    Array3D<uint8_t> out({4, 4, 4});
+
+    bool threw = false;
+    try {
+        Volume::readZYX(out, {0, 0, 0}, *cache, 0);
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        const std::string message = e.what();
+        CHECK(message.find("Volume::read failed fetching chunk 0/0/0/0") != std::string::npos);
+        CHECK(message.find("HTTP 400 fetching 0/0/0/0") != std::string::npos);
     }
 
     CHECK(threw);
