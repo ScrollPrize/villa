@@ -1848,7 +1848,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					float(pull["prefix"].mean().detach().cpu()) if active_count > 0 else 0.0
 				),
 			})
-			if bool(pull_cfg.get("print_stats", True)):
+			if bool(pull_cfg.get("print_stats", False)):
 				print(
 					f"[pred_dt_flow_gate] {_flow_gate_stage}: anticipatory pull "
 					f"total={total_candidates} gate={gate_candidates} scored={scored_candidates} "
