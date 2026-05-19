@@ -127,7 +127,8 @@ void SegmentationModule::HoverState::clear()
 SegmentationModule::~SegmentationModule()
 {
     // Cancel any in-progress background save on shutdown
-    if (_saveInProgress && _saveFuture.isRunning()) {
+    _autosaveState.endSession();
+    if (_autosaveState.saveInProgress() && _saveFuture.isRunning()) {
         _saveFuture.cancel();
     }
 }
@@ -575,8 +576,11 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         resetHoverLookupDetail();
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
-        if (_pendingAutosave) {
+        if (_autosaveState.pending() && _editManager && _editManager->hasSession()) {
             performAutosave();
+        } else if (!_editManager || !_editManager->hasSession()) {
+            _autosaveState.clearDeferred();
+            _pendingAutosaveVertexUpdates.clear();
         }
     }
     updateCorrectionsWidget();
@@ -1817,7 +1821,7 @@ bool SegmentationModule::beginManualAdd()
         emit statusMessageRequested(tr("Apply or cancel pending edits before Manual Add."), kStatusMedium);
         return false;
     }
-    if (_saveInProgress || _pendingAutosave) {
+    if (_autosaveState.saveInProgress() || _autosaveState.pending()) {
         emit statusMessageRequested(tr("Wait for the current save before Manual Add."), kStatusMedium);
         return false;
     }
@@ -2526,8 +2530,7 @@ void SegmentationModule::markAutosaveNeeded(bool immediate)
         return;
     }
 
-    _pendingAutosave = true;
-    _autosaveNotifiedFailure = false;
+    _autosaveState.markPending();
 
     ensureAutosaveTimer();
     if (_editingEnabled && _autosaveTimer && !_autosaveTimer->isActive()) {
@@ -2558,29 +2561,42 @@ void SegmentationModule::queueAutosaveVertexUpdates(
 
 void SegmentationModule::performAutosave()
 {
-    if (!_pendingAutosave) {
+    if (!_autosaveState.pending()) {
         return;
     }
     if (!_editManager) {
+        _autosaveState.clearDeferred();
+        _pendingAutosaveVertexUpdates.clear();
         return;
     }
 
     // If a save is already running, mark dirty so we re-save when it finishes
-    if (_saveInProgress) {
-        _dirtyAfterSave = true;
+    if (_autosaveState.markDirtyIfSaving()) {
+        return;
+    }
+
+    if (!_editManager->hasSession()) {
+        if (!_editingEnabled) {
+            _autosaveState.clearDeferred();
+            _pendingAutosaveVertexUpdates.clear();
+        }
         return;
     }
 
     auto surfacePtr = _editManager->baseSurface();
     if (!surfacePtr) {
+        if (!_editingEnabled) {
+            _autosaveState.clearDeferred();
+            _pendingAutosaveVertexUpdates.clear();
+        }
         return;
     }
     if (surfacePtr->path.empty() || surfacePtr->id.empty()) {
-        if (!_autosaveNotifiedFailure) {
+        if (!_autosaveState.failureNotified()) {
             qCWarning(lcSegModule) << "Skipping autosave: segmentation surface lacks path or id.";
             emit statusMessageRequested(tr("Cannot autosave segmentation: surface is missing file metadata."),
                                         kStatusMedium);
-            _autosaveNotifiedFailure = true;
+            _autosaveState.setFailureNotified(true);
         }
         return;
     }
@@ -2622,9 +2638,7 @@ void SegmentationModule::performAutosave()
         snapshot->meta = saveMeta;
     }
 
-    _pendingAutosave = false;
-    _saveInProgress = true;
-    _dirtyAfterSave = false;
+    const auto autosaveTicket = _autosaveState.startSave();
 
     emit statusMessageRequested(tr("Saving..."), kStatusShort);
 
@@ -2665,42 +2679,54 @@ void SegmentationModule::performAutosave()
         snapshot->saveOverwrite();
         return snapshot;
     });
+    auto saveFuture = _saveFuture;
 
     // Poll for completion via a single-shot timer to avoid blocking
     auto* pollTimer = new QTimer(this);
     pollTimer->setInterval(50);
     pollTimer->setSingleShot(false);
-    connect(pollTimer, &QTimer::timeout, this, [this, pollTimer]() {
-        if (!_saveFuture.isFinished()) {
+    connect(pollTimer, &QTimer::timeout, this, [this, pollTimer, saveFuture, autosaveTicket]() mutable {
+        if (!saveFuture.isFinished()) {
             return;
         }
         pollTimer->stop();
         pollTimer->deleteLater();
 
-        _saveInProgress = false;
-
-        // Check for exceptions from the future
+        std::shared_ptr<QuadSurface> savedSnapshot;
+        QString failureMessage;
         try {
-            _saveFuture.waitForFinished();
-            _saveSnapshot = _saveFuture.result();
-            _autosaveNotifiedFailure = false;
-            emit statusMessageRequested(tr("Saved"), kStatusShort);
+            saveFuture.waitForFinished();
+            savedSnapshot = saveFuture.result();
         } catch (const std::exception& ex) {
-            qCWarning(lcSegModule) << "Autosave failed:" << ex.what();
-            if (!_autosaveNotifiedFailure) {
+            failureMessage = QString::fromUtf8(ex.what());
+        } catch (...) {
+            failureMessage = tr("unknown error");
+        }
+
+        const bool canRetry = _editManager && _editManager->hasSession();
+        const auto completion = failureMessage.isEmpty()
+            ? _autosaveState.completeSuccess(autosaveTicket)
+            : _autosaveState.completeFailure(autosaveTicket, canRetry);
+        if (completion == segmentation::AutosaveState::Completion::Stale) {
+            updateAutosaveState();
+            return;
+        }
+
+        if (failureMessage.isEmpty()) {
+            _saveSnapshot = savedSnapshot;
+            emit statusMessageRequested(tr("Saved"), kStatusShort);
+        } else {
+            qCWarning(lcSegModule) << "Autosave failed:" << failureMessage;
+            if (!_autosaveState.failureNotified()) {
                 emit statusMessageRequested(tr("Failed to autosave segmentation: %1")
-                                                .arg(QString::fromUtf8(ex.what())),
+                                                .arg(failureMessage),
                                             kStatusLong);
-                _autosaveNotifiedFailure = true;
+                _autosaveState.setFailureNotified(true);
             }
-            // Re-mark pending so the next timer tick retries
-            _pendingAutosave = true;
         }
 
         // If another save was requested while we were saving, start it now
-        if (_dirtyAfterSave) {
-            _dirtyAfterSave = false;
-            _pendingAutosave = true;
+        if (_autosaveState.consumeDirtyAfterSave()) {
             performAutosave();
         }
     });

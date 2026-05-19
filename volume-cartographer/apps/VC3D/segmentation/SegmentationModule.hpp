@@ -27,6 +27,7 @@
 #include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
+#include "SegmentationAutosaveState.hpp"
 
 namespace segmentation { class CorrectionsState; }
 
@@ -456,8 +457,7 @@ private:
 
     static constexpr int kAutosaveIntervalMs = 10000;
     QTimer* _autosaveTimer{nullptr};
-    bool _pendingAutosave{false};
-    bool _autosaveNotifiedFailure{false};
+    segmentation::AutosaveState _autosaveState;
 
     // Async save state
     struct AutosaveVertexUpdate
@@ -470,8 +470,6 @@ private:
     QFuture<std::shared_ptr<QuadSurface>> _saveFuture;
     std::shared_ptr<QuadSurface> _saveSnapshot;
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
-    bool _saveInProgress{false};
-    bool _dirtyAfterSave{false};
 
     // Correction points auto-save
     static constexpr int kCorrectionsSaveDelayMs = 2000;

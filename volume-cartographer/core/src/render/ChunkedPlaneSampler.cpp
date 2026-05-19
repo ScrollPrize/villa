@@ -113,6 +113,12 @@ LevelAccess makeLevelAccess(IChunkedArray& array, int level)
     return access;
 }
 
+bool hasSampleableLevel(const LevelAccess& access)
+{
+    return access.shape[0] > 0 && access.shape[1] > 0 && access.shape[2] > 0
+        && access.chunkShape[0] > 0 && access.chunkShape[1] > 0 && access.chunkShape[2] > 0;
+}
+
 cv::Vec3f toLevelCoord(const LevelAccess& access, const cv::Vec3f& p0)
 {
     const auto& t = access.transform;
@@ -538,6 +544,8 @@ std::vector<ChunkKey> ChunkedPlaneSampler::collectPlaneDependencies(
         return result;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return result;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     const int tile = std::max(1, options.tileSize);
     std::unordered_set<ChunkKey, ChunkKeyHash> keys;
@@ -579,6 +587,8 @@ std::vector<ChunkKey> ChunkedPlaneSampler::collectCoordsDependencies(
         return result;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return result;
     const int tile = std::max(1, options.tileSize);
     const int h = std::min(coords.rows, coverage.rows);
     const int w = std::min(coords.cols, coverage.cols);
@@ -621,6 +631,8 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     LocalChunkCache chunkCache(array, 64);
     const int tile = std::max(1, options.tileSize);
@@ -660,6 +672,8 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestCoordsDependencies(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     LocalChunkCache chunkCache(array, 64);
     const int tile = std::max(1, options.tileSize);
     const int h = std::min(coords.rows, coverage.rows);
@@ -703,6 +717,8 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     const int tile = std::max(1, options.tileSize);
     std::vector<SampleTile> tiles;
@@ -783,6 +799,8 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     const int tile = std::max(1, options.tileSize);
     const int h = std::min({coords.rows, out.rows, coverage.rows});
     const int w = std::min({coords.cols, out.cols, coverage.cols});

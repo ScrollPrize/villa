@@ -24,6 +24,15 @@ add_executable(test_chunked_plane_sampler_fallback test_chunked_plane_sampler_fa
 target_link_libraries(test_chunked_plane_sampler_fallback PRIVATE doctest::doctest vc_core)
 add_test(NAME test_chunked_plane_sampler_fallback COMMAND test_chunked_plane_sampler_fallback)
 
+add_executable(test_volume_chunk_errors test_volume_chunk_errors.cpp)
+target_link_libraries(test_volume_chunk_errors PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_chunk_errors COMMAND test_volume_chunk_errors)
+
+add_executable(test_segmentation_autosave_state test_segmentation_autosave_state.cpp)
+target_include_directories(test_segmentation_autosave_state PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_segmentation_autosave_state PRIVATE doctest::doctest)
+add_test(NAME test_segmentation_autosave_state COMMAND test_segmentation_autosave_state)
+
 add_executable(test_quadsurface_save_roundtrip test_quadsurface_save_roundtrip.cpp)
 target_link_libraries(test_quadsurface_save_roundtrip PRIVATE doctest::doctest vc_core)
 add_test(NAME test_quadsurface_save_roundtrip COMMAND test_quadsurface_save_roundtrip)
@@ -249,3 +258,122 @@ add_test(NAME test_quadsurface_snapshot COMMAND test_quadsurface_snapshot)
 add_executable(test_quadsurface_save_paths test_quadsurface_save_paths.cpp)
 target_link_libraries(test_quadsurface_save_paths PRIVATE doctest::doctest vc_core)
 add_test(NAME test_quadsurface_save_paths COMMAND test_quadsurface_save_paths)
+
+add_executable(test_volume_local test_volume_local.cpp)
+target_link_libraries(test_volume_local PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_local COMMAND test_volume_local)
+
+add_executable(test_zarr_helpers test_zarr_helpers.cpp)
+target_link_libraries(test_zarr_helpers PRIVATE doctest::doctest vc_core)
+add_test(NAME test_zarr_helpers COMMAND test_zarr_helpers)
+
+add_executable(test_chunked_plane_sampler test_chunked_plane_sampler.cpp)
+target_link_libraries(test_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
+add_test(NAME test_chunked_plane_sampler COMMAND test_chunked_plane_sampler)
+
+add_executable(test_slicing test_slicing.cpp)
+target_link_libraries(test_slicing PRIVATE doctest::doctest vc_core)
+add_test(NAME test_slicing COMMAND test_slicing)
+
+add_executable(test_volume_pkg test_volume_pkg.cpp)
+target_link_libraries(test_volume_pkg PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_pkg COMMAND test_volume_pkg)
+
+add_executable(test_volpkg_convert test_volpkg_convert.cpp)
+target_link_libraries(test_volpkg_convert PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volpkg_convert COMMAND test_volpkg_convert)
+
+add_executable(test_vcdataset test_vcdataset.cpp)
+target_link_libraries(test_vcdataset PRIVATE doctest::doctest vc_core)
+add_test(NAME test_vcdataset COMMAND test_vcdataset)
+
+add_executable(test_zarr test_zarr.cpp)
+target_link_libraries(test_zarr PRIVATE doctest::doctest vc_core)
+add_test(NAME test_zarr COMMAND test_zarr)
+
+add_executable(test_chunk_cache test_chunk_cache.cpp)
+target_link_libraries(test_chunk_cache PRIVATE doctest::doctest vc_core)
+add_test(NAME test_chunk_cache COMMAND test_chunk_cache)
+
+add_executable(test_volume_extras test_volume_extras.cpp)
+target_link_libraries(test_volume_extras PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_extras COMMAND test_volume_extras)
+
+add_executable(test_zarr_more test_zarr_more.cpp)
+target_link_libraries(test_zarr_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_zarr_more COMMAND test_zarr_more)
+
+add_executable(test_vcdataset_compressors test_vcdataset_compressors.cpp)
+target_link_libraries(test_vcdataset_compressors PRIVATE doctest::doctest vc_core)
+add_test(NAME test_vcdataset_compressors COMMAND test_vcdataset_compressors)
+
+add_executable(test_volume_static_read test_volume_static_read.cpp)
+target_link_libraries(test_volume_static_read PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_static_read COMMAND test_volume_static_read)
+
+add_executable(test_volume_pyramid test_volume_pyramid.cpp)
+target_link_libraries(test_volume_pyramid PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_pyramid COMMAND test_volume_pyramid)
+
+add_executable(test_chunk_cache_persist test_chunk_cache_persist.cpp)
+target_link_libraries(test_chunk_cache_persist PRIVATE doctest::doctest vc_core)
+add_test(NAME test_chunk_cache_persist COMMAND test_chunk_cache_persist)
+
+add_executable(test_zarr_chunk_fetcher test_zarr_chunk_fetcher.cpp)
+target_link_libraries(test_zarr_chunk_fetcher PRIVATE doctest::doctest vc_core)
+add_test(NAME test_zarr_chunk_fetcher COMMAND test_zarr_chunk_fetcher)
+
+add_executable(test_chunked_plane_sampler_more test_chunked_plane_sampler_more.cpp)
+target_link_libraries(test_chunked_plane_sampler_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_chunked_plane_sampler_more COMMAND test_chunked_plane_sampler_more)
+
+add_executable(test_slicing_more test_slicing_more.cpp)
+target_link_libraries(test_slicing_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_slicing_more COMMAND test_slicing_more)
+
+add_executable(test_vcdataset_more test_vcdataset_more.cpp)
+target_link_libraries(test_vcdataset_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_vcdataset_more COMMAND test_vcdataset_more)
+
+# Real PHerc 0172 segments committed under core/test/data/segments/.
+add_executable(test_quadsurface_fixtures test_quadsurface_fixtures.cpp)
+target_compile_definitions(test_quadsurface_fixtures PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_quadsurface_fixtures PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_fixtures COMMAND test_quadsurface_fixtures)
+
+add_executable(test_volume_pkg_full test_volume_pkg_full.cpp)
+target_compile_definitions(test_volume_pkg_full PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_volume_pkg_full PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_pkg_full COMMAND test_volume_pkg_full)
+
+add_executable(test_load_quad_from_tifxyz test_load_quad_from_tifxyz.cpp)
+target_compile_definitions(test_load_quad_from_tifxyz PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_load_quad_from_tifxyz PRIVATE doctest::doctest vc_core)
+add_test(NAME test_load_quad_from_tifxyz COMMAND test_load_quad_from_tifxyz)
+
+add_executable(test_surface_patch_index_more test_surface_patch_index_more.cpp)
+target_compile_definitions(test_surface_patch_index_more PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_surface_patch_index_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_surface_patch_index_more COMMAND test_surface_patch_index_more)
+
+add_executable(test_quadsurface_extras test_quadsurface_extras.cpp)
+target_compile_definitions(test_quadsurface_extras PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_quadsurface_extras PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_extras COMMAND test_quadsurface_extras)
+
+add_executable(test_surface_patch_index_cache test_surface_patch_index_cache.cpp)
+target_compile_definitions(test_surface_patch_index_cache PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_surface_patch_index_cache PRIVATE doctest::doctest vc_core)
+add_test(NAME test_surface_patch_index_cache COMMAND test_surface_patch_index_cache)
+
+add_executable(test_volume_pkg_more test_volume_pkg_more.cpp)
+target_compile_definitions(test_volume_pkg_more PRIVATE
+    VC_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_link_libraries(test_volume_pkg_more PRIVATE doctest::doctest vc_core)
+add_test(NAME test_volume_pkg_more COMMAND test_volume_pkg_more)
