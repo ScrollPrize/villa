@@ -46,7 +46,6 @@
 namespace {
 
 constexpr double kFocusPointFilterRadius = 10.0;
-constexpr int kReviewOverlapSearchEffort = 1000;
 
 void sync_tag(utils::Json& dict, bool checked, const std::string& name, const std::string& username = {})
 {
@@ -67,68 +66,6 @@ void sync_tag(utils::Json& dict, bool checked, const std::string& name, const st
             dict["date_last_modified"] = get_surface_time_str();
         }
     }
-}
-
-bool has_review_tag(const utils::Json& meta)
-{
-    if (meta.is_null() || !meta.contains("tags")) {
-        return false;
-    }
-    const auto& tags = meta.at("tags");
-    return tags.contains("reviewed");
-}
-
-std::set<std::string> find_review_overlaps(VolumePkg& volumePkg, QuadSurface& surface)
-{
-    std::set<std::string> overlapIds = surface.overlappingIds();
-
-    for (const auto& candidateId : volumePkg.segmentationIDs()) {
-        if (candidateId == surface.id || overlapIds.contains(candidateId)) {
-            continue;
-        }
-
-        auto candidate = volumePkg.getSurface(candidateId);
-        if (!candidate) {
-            candidate = volumePkg.loadSurface(candidateId);
-        }
-        if (!candidate || candidate.get() == &surface) {
-            continue;
-        }
-
-        if (overlap(surface, *candidate, kReviewOverlapSearchEffort)) {
-            overlapIds.insert(candidate->id);
-            candidate->addOverlappingId(surface.id);
-            candidate->writeOverlappingJson();
-        }
-    }
-
-    if (overlapIds != surface.overlappingIds()) {
-        surface.setOverlappingIds(overlapIds);
-        surface.writeOverlappingJson();
-    }
-
-    return overlapIds;
-}
-
-bool mark_partial_review(QuadSurface& surface, const std::string& sourceId, const std::string& username)
-{
-    if (surface.meta.is_null() || has_review_tag(surface.meta)) {
-        return false;
-    }
-
-    if (!surface.meta.contains("tags")) {
-        surface.meta["tags"] = utils::Json::object();
-    }
-
-    auto& tags = surface.meta["tags"];
-    tags["partial_review"] = utils::Json::object();
-    if (!username.empty()) {
-        tags["partial_review"]["user"] = username;
-    }
-    tags["partial_review"]["source"] = sourceId;
-    tags["partial_review"]["date"] = get_surface_time_str();
-    surface.save_meta();
-    return true;
 }
 
 } // namespace
@@ -1455,8 +1392,6 @@ void SurfacePanelController::onTagCheckboxToggled()
             continue;
         }
 
-        const bool isNowReviewed = _tags.reviewed && _tags.reviewed->checkState() == Qt::Checked;
-
         if (surface->meta.contains("tags")) {
             auto& tags = surface->meta.at("tags");
             sync_tag(tags, _tags.approved && _tags.approved->checkState() == Qt::Checked, "approved", username);
@@ -1497,16 +1432,6 @@ void SurfacePanelController::onTagCheckboxToggled()
             }
 
             surface->save_meta();
-        }
-
-        if (isNowReviewed && _volumePkg) {
-            auto surf = _volumePkg->getSurface(id);
-            if (surf) {
-                for (const auto& overlapId : find_review_overlaps(*_volumePkg, *surf)) {
-                    auto overlapMeta = _volumePkg->getSurface(overlapId);
-                    if (overlapMeta) mark_partial_review(*overlapMeta, id, username);
-                }
-            }
         }
 
         if (auto* treeItem = dynamic_cast<SurfaceTreeWidgetItem*>(item)) {
