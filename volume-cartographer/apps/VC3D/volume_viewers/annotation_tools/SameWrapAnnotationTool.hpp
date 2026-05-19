@@ -19,6 +19,11 @@ public:
         ShortestPath = 1
     };
 
+    enum class ImageFilterType {
+        None = 0,
+        Median = 1
+    };
+
     using SceneToVolumeFn = std::function<cv::Vec3f(const QPointF&)>;
     using VolumeToSceneFn = std::function<QPointF(const cv::Vec3f&)>;
     using SetOverlayGroupFn = std::function<void(const std::string&, const std::vector<QGraphicsItem*>&)>;
@@ -32,6 +37,9 @@ public:
     void setSpacing(double spacingVx);
     void setMergeExistingAnnotations(bool enabled);
     void setPathType(PathType pathType);
+    void setImageFilter(ImageFilterType filterType, int kernelSize);
+    void setImageFilterType(ImageFilterType filterType);
+    void setImageFilterKernelSize(int kernelSize);
     void noteShiftReleased();
     void clear(const ClearOverlayGroupFn& clearOverlayGroup);
     bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
@@ -54,6 +62,8 @@ private:
         bool enabled = false;
         bool mergeExistingAnnotations = false;
         PathType pathType = PathType::ConnectedComponents;
+        ImageFilterType imageFilterType = ImageFilterType::None;
+        int imageFilterKernelSize = 3;
         float spacingVx = 20.0f;
         bool shiftReleasedSincePreview = true;
         bool hasShortestPathSource = false;

@@ -99,6 +99,87 @@ void appendIfDistinct(std::vector<cv::Vec3f>& points, const cv::Vec3f& point, fl
     points.push_back(point);
 }
 
+struct ProjectedPoint {
+    float arclength = 0.0f;
+    uint64_t collectionId = 0;
+    uint64_t pointId = 0;
+    cv::Vec3f point;
+};
+
+bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
+                                      const std::vector<cv::Vec3f>& volumePath,
+                                      float spacingVx,
+                                      std::vector<cv::Vec3f>& sampled,
+                                      std::vector<uint64_t>& mergeCollectionIds,
+                                      std::string& mergeCollectionName)
+{
+    if (!pointCollection || volumePath.size() < 2) {
+        return true;
+    }
+
+    std::vector<ProjectedPoint> projectedPoints;
+    const std::vector<float> cumulativeLength = cumulativePathLength(volumePath);
+    const float mergeTolerance = kSameWrapMergeContactToleranceVx;
+    std::unordered_set<uint64_t> seenCollections(mergeCollectionIds.begin(), mergeCollectionIds.end());
+
+    for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {
+        if (!isSameWrapCollectionName(collection.name) || collection.points.empty() ||
+            seenCollections.count(collectionId) > 0) {
+            continue;
+        }
+
+        const std::vector<ColPoint> orderedPoints = orderedCollectionPoints(collection);
+        std::vector<ProjectedPoint> collectionProjectedPoints;
+        collectionProjectedPoints.reserve(orderedPoints.size());
+        bool collectionMatchesPath = false;
+        for (const ColPoint& point : orderedPoints) {
+            const PathProjection projection = projectPointToPath(point.p, volumePath, cumulativeLength);
+            if (projection.distance <= mergeTolerance) {
+                collectionMatchesPath = true;
+            }
+            collectionProjectedPoints.push_back({projection.arclength, collectionId, point.id, point.p});
+        }
+
+        if (!collectionMatchesPath) {
+            continue;
+        }
+        if (mergeCollectionName.empty()) {
+            mergeCollectionName = collection.name;
+        }
+        mergeCollectionIds.push_back(collectionId);
+        seenCollections.insert(collectionId);
+        projectedPoints.insert(projectedPoints.end(),
+                               collectionProjectedPoints.begin(),
+                               collectionProjectedPoints.end());
+    }
+
+    if (projectedPoints.empty()) {
+        return true;
+    }
+
+    for (const cv::Vec3f& point : sampled) {
+        const PathProjection projection = projectPointToPath(point, volumePath, cumulativeLength);
+        projectedPoints.push_back({projection.arclength, 0, 0, point});
+    }
+
+    std::sort(projectedPoints.begin(), projectedPoints.end(),
+              [](const ProjectedPoint& a, const ProjectedPoint& b) {
+                  if (a.arclength != b.arclength) {
+                      return a.arclength < b.arclength;
+                  }
+                  if (a.collectionId != b.collectionId) {
+                      return a.collectionId < b.collectionId;
+                  }
+                  return a.pointId < b.pointId;
+              });
+
+    sampled.clear();
+    for (const ProjectedPoint& projected : projectedPoints) {
+        appendIfDistinct(sampled, projected.point, std::max(0.5f, spacingVx * 0.5f));
+    }
+    return sampled.size() >= 2;
+}
+
 int nearestSkeletonPixel(const cv::Mat& skeleton, int x, int y, int searchRadius)
 {
     int bestKey = -1;
@@ -179,6 +260,25 @@ void SameWrapAnnotationTool::setPathType(PathType pathType)
         return;
     }
     _state.pathType = pathType;
+    _state.hasShortestPathSource = false;
+}
+
+void SameWrapAnnotationTool::setImageFilter(ImageFilterType filterType, int kernelSize)
+{
+    _state.imageFilterType = filterType;
+    _state.imageFilterKernelSize = std::max(3, kernelSize | 1);
+    _state.hasShortestPathSource = false;
+}
+
+void SameWrapAnnotationTool::setImageFilterType(ImageFilterType filterType)
+{
+    _state.imageFilterType = filterType;
+    _state.hasShortestPathSource = false;
+}
+
+void SameWrapAnnotationTool::setImageFilterKernelSize(int kernelSize)
+{
+    _state.imageFilterKernelSize = std::max(3, kernelSize | 1);
     _state.hasShortestPathSource = false;
 }
 
@@ -264,6 +364,9 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
             _state.hasPreview = !_state.sampledVolumePoints.empty();
         }
         return false;
+    }
+    if (_state.imageFilterType == ImageFilterType::Median) {
+        cv::medianBlur(gray, gray, std::max(3, _state.imageFilterKernelSize | 1));
     }
 
     const int w = framebuffer.width();
@@ -353,11 +456,23 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
             return false;
         }
 
+        std::vector<uint64_t> mergeCollectionIds;
+        std::string mergeCollectionName;
+        if (_state.mergeExistingAnnotations &&
+            !mergeExistingSameWrapAnnotations(pointCollection,
+                                              volumePath,
+                                              _state.spacingVx,
+                                              sampled,
+                                              mergeCollectionIds,
+                                              mergeCollectionName)) {
+            return false;
+        }
+
         _state.componentScenePath = std::move(scenePath);
         _state.componentVolumePath = std::move(volumePath);
         _state.sampledVolumePoints = std::move(sampled);
-        _state.mergeCollectionIds.clear();
-        _state.mergeCollectionName.clear();
+        _state.mergeCollectionIds = std::move(mergeCollectionIds);
+        _state.mergeCollectionName = std::move(mergeCollectionName);
         _state.clickVolumePos = sceneToVolume(snappedScenePos);
         _state.hasPreview = true;
         _state.hasShortestPathSource = false;
@@ -583,75 +698,14 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
         mergeCollectionName = std::move(previousMergeCollectionName);
     }
 
-    if (_state.mergeExistingAnnotations && pointCollection && volumePath.size() >= 2) {
-        struct ProjectedPoint {
-            float arclength = 0.0f;
-            uint64_t collectionId = 0;
-            uint64_t pointId = 0;
-            cv::Vec3f point;
-        };
-
-        std::vector<ProjectedPoint> projectedPoints;
-        const std::vector<float> cumulativeLength = cumulativePathLength(volumePath);
-        const float mergeTolerance = kSameWrapMergeContactToleranceVx;
-        std::unordered_set<uint64_t> seenCollections(mergeCollectionIds.begin(), mergeCollectionIds.end());
-
-        for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {
-            if (!isSameWrapCollectionName(collection.name) || collection.points.empty() ||
-                seenCollections.count(collectionId) > 0) {
-                continue;
-            }
-
-            const std::vector<ColPoint> orderedPoints = orderedCollectionPoints(collection);
-            std::vector<ProjectedPoint> collectionProjectedPoints;
-            collectionProjectedPoints.reserve(orderedPoints.size());
-            bool collectionMatchesPath = false;
-            for (const ColPoint& point : orderedPoints) {
-                const PathProjection projection = projectPointToPath(point.p, volumePath, cumulativeLength);
-                if (projection.distance <= mergeTolerance) {
-                    collectionMatchesPath = true;
-                }
-                collectionProjectedPoints.push_back({projection.arclength, collectionId, point.id, point.p});
-            }
-
-            if (!collectionMatchesPath) {
-                continue;
-            }
-            if (mergeCollectionName.empty()) {
-                mergeCollectionName = collection.name;
-            }
-            mergeCollectionIds.push_back(collectionId);
-            seenCollections.insert(collectionId);
-            projectedPoints.insert(projectedPoints.end(),
-                                   collectionProjectedPoints.begin(),
-                                   collectionProjectedPoints.end());
-        }
-
-        if (!projectedPoints.empty()) {
-            for (const cv::Vec3f& point : sampled) {
-                const PathProjection projection = projectPointToPath(point, volumePath, cumulativeLength);
-                projectedPoints.push_back({projection.arclength, 0, 0, point});
-            }
-
-            std::sort(projectedPoints.begin(), projectedPoints.end(),
-                      [](const ProjectedPoint& a, const ProjectedPoint& b) {
-                          if (a.arclength != b.arclength) {
-                              return a.arclength < b.arclength;
-                          }
-                          if (a.collectionId != b.collectionId) {
-                              return a.collectionId < b.collectionId;
-                          }
-                          return a.pointId < b.pointId;
-                      });
-
-            sampled.clear();
-            for (const ProjectedPoint& projected : projectedPoints) {
-                appendIfDistinct(sampled, projected.point, std::max(0.5f, _state.spacingVx * 0.5f));
-            }
-            if (sampled.size() < 2) {
-                return false;
-            }
-        }
+    if (_state.mergeExistingAnnotations &&
+        !mergeExistingSameWrapAnnotations(pointCollection,
+                                          volumePath,
+                                          _state.spacingVx,
+                                          sampled,
+                                          mergeCollectionIds,
+                                          mergeCollectionName)) {
+        return false;
     }
 
     if (appendToPreview && !previousSampledPoints.empty() && !sampled.empty()) {

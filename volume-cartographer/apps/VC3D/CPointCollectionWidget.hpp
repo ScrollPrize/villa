@@ -11,6 +11,7 @@
 #include <QCheckBox>
 #include <QItemSelection>
 #include <QDoubleSpinBox>
+#include <QSpinBox>
 #include <QLabel>
 #include <QComboBox>
 
@@ -45,6 +46,8 @@ public:
     double sameWrapAnnotationSpacing() const;
     bool sameWrapAnnotationMergeEnabled() const;
     int sameWrapAnnotationPathType() const;
+    int sameWrapAnnotationFilterType() const;
+    int sameWrapAnnotationFilterKernelSize() const;
 
 signals:
     void annotateToggled(bool enabled);
@@ -52,6 +55,8 @@ signals:
     void sameWrapAnnotationSpacingChanged(double spacing);
     void sameWrapAnnotationMergeToggled(bool enabled);
     void sameWrapAnnotationPathTypeChanged(int pathType);
+    void sameWrapAnnotationFilterTypeChanged(int filterType);
+    void sameWrapAnnotationFilterKernelSizeChanged(int kernelSize);
     void sameWrapAnnotationClearRequested();
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
@@ -103,6 +108,8 @@ private slots:
     QCheckBox *_chkSameWrapAnnotation{nullptr};
     QCheckBox *_chkSameWrapMerge{nullptr};
     QComboBox *_sameWrapPathTypeCombo{nullptr};
+    QComboBox *_sameWrapFilterTypeCombo{nullptr};
+    QSpinBox *_sameWrapFilterKernelSpinbox{nullptr};
     QDoubleSpinBox *_sameWrapSpacingSpinbox{nullptr};
     QPushButton *_clearSameWrapAnnotationButton{nullptr};
 

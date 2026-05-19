@@ -88,6 +88,25 @@ void CPointCollectionWidget::setupUi()
     same_wrap_path_type_layout->addWidget(_sameWrapPathTypeCombo);
     same_wrap_path_type_layout->addStretch();
     same_wrap_layout->addLayout(same_wrap_path_type_layout);
+    QHBoxLayout *same_wrap_filter_layout = new QHBoxLayout();
+    same_wrap_filter_layout->addWidget(new QLabel("Filter:"));
+    _sameWrapFilterTypeCombo = new QComboBox(same_wrap_group);
+    _sameWrapFilterTypeCombo->addItem("None", 0);
+    _sameWrapFilterTypeCombo->addItem("Median", 1);
+    _sameWrapFilterTypeCombo->setToolTip("Optionally filter the source image before thresholding and skeleton tracing.");
+    same_wrap_filter_layout->addWidget(_sameWrapFilterTypeCombo);
+    same_wrap_filter_layout->addWidget(new QLabel("Kernel:"));
+    _sameWrapFilterKernelSpinbox = new QSpinBox(same_wrap_group);
+    _sameWrapFilterKernelSpinbox->setRange(3, 99);
+    _sameWrapFilterKernelSpinbox->setSingleStep(2);
+    _sameWrapFilterKernelSpinbox->setValue(3);
+    _sameWrapFilterKernelSpinbox->setSuffix(" px");
+    _sameWrapFilterKernelSpinbox->setMaximumWidth(80);
+    _sameWrapFilterKernelSpinbox->setEnabled(false);
+    _sameWrapFilterKernelSpinbox->setToolTip("Odd median-filter kernel size applied before connected components or shortest-path tracing.");
+    same_wrap_filter_layout->addWidget(_sameWrapFilterKernelSpinbox);
+    same_wrap_filter_layout->addStretch();
+    same_wrap_layout->addLayout(same_wrap_filter_layout);
     QHBoxLayout *same_wrap_spacing_layout = new QHBoxLayout();
     same_wrap_spacing_layout->addWidget(new QLabel("Spacing:"));
     _sameWrapSpacingSpinbox = new QDoubleSpinBox(same_wrap_group);
@@ -109,6 +128,18 @@ void CPointCollectionWidget::setupUi()
     connect(_chkSameWrapMerge, &QCheckBox::toggled, this, &CPointCollectionWidget::sameWrapAnnotationMergeToggled);
     connect(_sameWrapPathTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         emit sameWrapAnnotationPathTypeChanged(sameWrapAnnotationPathType());
+    });
+    connect(_sameWrapFilterTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        const bool filterEnabled = sameWrapAnnotationFilterType() != 0;
+        _sameWrapFilterKernelSpinbox->setEnabled(filterEnabled);
+        emit sameWrapAnnotationFilterTypeChanged(sameWrapAnnotationFilterType());
+    });
+    connect(_sameWrapFilterKernelSpinbox, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if ((value % 2) == 0) {
+            const QSignalBlocker blocker(_sameWrapFilterKernelSpinbox);
+            _sameWrapFilterKernelSpinbox->setValue(value + 1);
+        }
+        emit sameWrapAnnotationFilterKernelSizeChanged(sameWrapAnnotationFilterKernelSize());
     });
     connect(_sameWrapSpacingSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged);
@@ -988,6 +1019,17 @@ bool CPointCollectionWidget::sameWrapAnnotationMergeEnabled() const
 int CPointCollectionWidget::sameWrapAnnotationPathType() const
 {
     return _sameWrapPathTypeCombo ? _sameWrapPathTypeCombo->currentData().toInt() : 0;
+}
+
+int CPointCollectionWidget::sameWrapAnnotationFilterType() const
+{
+    return _sameWrapFilterTypeCombo ? _sameWrapFilterTypeCombo->currentData().toInt() : 0;
+}
+
+int CPointCollectionWidget::sameWrapAnnotationFilterKernelSize() const
+{
+    const int kernelSize = _sameWrapFilterKernelSpinbox ? _sameWrapFilterKernelSpinbox->value() : 3;
+    return std::max(3, kernelSize | 1);
 }
 
 CPointCollectionWidget::~CPointCollectionWidget() {

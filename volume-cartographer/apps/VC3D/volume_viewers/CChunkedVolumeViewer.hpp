@@ -196,6 +196,8 @@ public slots:
     void setSameWrapAnnotationSpacing(double spacingVx);
     void setSameWrapAnnotationMergeExisting(bool enabled);
     void setSameWrapAnnotationPathType(int pathType);
+    void setSameWrapAnnotationFilterType(int filterType);
+    void setSameWrapAnnotationFilterKernelSize(int kernelSize);
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}

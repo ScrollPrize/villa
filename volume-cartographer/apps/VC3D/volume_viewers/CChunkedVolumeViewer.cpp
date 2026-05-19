@@ -2957,6 +2957,21 @@ void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
     clearSameWrapAnnotationPreview();
 }
 
+void CChunkedVolumeViewer::setSameWrapAnnotationFilterType(int filterType)
+{
+    _sameWrapAnnotation.setImageFilterType(
+        filterType == static_cast<int>(SameWrapAnnotationTool::ImageFilterType::Median)
+            ? SameWrapAnnotationTool::ImageFilterType::Median
+            : SameWrapAnnotationTool::ImageFilterType::None);
+    clearSameWrapAnnotationPreview();
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize(int kernelSize)
+{
+    _sameWrapAnnotation.setImageFilterKernelSize(kernelSize);
+    clearSameWrapAnnotationPreview();
+}
+
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
 {
     _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
