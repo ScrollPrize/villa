@@ -1,0 +1,59 @@
+#pragma once
+
+#include <QImage>
+#include <QPointF>
+
+#include <functional>
+#include <string>
+#include <vector>
+
+#include <opencv2/core.hpp>
+
+class QGraphicsItem;
+class VCCollection;
+
+class SameWrapAnnotationTool {
+public:
+    using SceneToVolumeFn = std::function<cv::Vec3f(const QPointF&)>;
+    using VolumeToSceneFn = std::function<QPointF(const cv::Vec3f&)>;
+    using SetOverlayGroupFn = std::function<void(const std::string&, const std::vector<QGraphicsItem*>&)>;
+    using ClearOverlayGroupFn = std::function<void(const std::string&)>;
+
+    bool enabled() const { return _state.enabled; }
+    bool hasPreview() const { return _state.hasPreview; }
+    bool shiftReleasedSincePreview() const { return _state.shiftReleasedSincePreview; }
+
+    void setEnabled(bool enabled);
+    void setSpacing(double spacingVx);
+    void noteShiftReleased();
+    void clear(const ClearOverlayGroupFn& clearOverlayGroup);
+    bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
+
+    bool generatePreview(const QImage& framebuffer,
+                         const QPointF& scenePos,
+                         bool appendToPreview,
+                         float viewScale,
+                         const SceneToVolumeFn& sceneToVolume,
+                         const VolumeToSceneFn& volumeToScene,
+                         const SetOverlayGroupFn& setOverlayGroup,
+                         const ClearOverlayGroupFn& clearOverlayGroup);
+
+private:
+    struct State {
+        bool enabled = false;
+        float spacingVx = 10.0f;
+        bool shiftReleasedSincePreview = true;
+        std::vector<QPointF> componentScenePath;
+        std::vector<cv::Vec3f> componentVolumePath;
+        std::vector<cv::Vec3f> sampledVolumePoints;
+        QPointF clickScenePos;
+        bool hasPreview = false;
+    };
+
+    bool sampleSourceImage(const QImage& framebuffer, cv::Mat& gray) const;
+    void updateOverlay(const VolumeToSceneFn& volumeToScene,
+                       const SetOverlayGroupFn& setOverlayGroup,
+                       const ClearOverlayGroupFn& clearOverlayGroup);
+
+    State _state;
+};

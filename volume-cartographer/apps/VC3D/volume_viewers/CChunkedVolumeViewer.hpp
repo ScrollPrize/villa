@@ -23,6 +23,7 @@
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
+#include "annotation_tools/SameWrapAnnotationTool.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
@@ -266,9 +267,6 @@ private:
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
-    bool generateSameWrapAnnotationPreview(const QPointF& scenePos, bool appendToPreview);
-    bool sampleSameWrapSourceImage(cv::Mat& gray) const;
-    void updateSameWrapAnnotationOverlay();
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
@@ -458,17 +456,7 @@ private:
     QGraphicsItem* _cursorCrosshair = nullptr;
     QGraphicsItem* _focusMarker = nullptr;
 
-    struct SameWrapAnnotationState {
-        bool enabled = false;
-        float spacingVx = 10.0f;
-        bool shiftReleasedSincePreview = true;
-        std::vector<QPointF> componentScenePath;
-        std::vector<cv::Vec3f> componentVolumePath;
-        std::vector<cv::Vec3f> sampledVolumePoints;
-        QPointF clickScenePos;
-        bool hasPreview = false;
-    };
-    SameWrapAnnotationState _sameWrapAnnotation;
+    SameWrapAnnotationTool _sameWrapAnnotation;
 
     bool _bboxMode = false;
     QPointF _bboxStart;
