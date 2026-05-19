@@ -124,6 +124,7 @@ void SameWrapAnnotationTool::clear(const ClearOverlayGroupFn& clearOverlayGroup)
     _state.sampledVolumePoints.clear();
     _state.mergeCollectionIds.clear();
     _state.mergeCollectionName.clear();
+    _state.clickVolumePos = {0.0f, 0.0f, 0.0f};
     _state.hasPreview = false;
     _state.shiftReleasedSincePreview = true;
     clearOverlayGroup(kSameWrapAnnotationOverlayKey);
@@ -545,11 +546,18 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
         _state.mergeCollectionIds = std::move(mergeCollectionIds);
         _state.mergeCollectionName = std::move(mergeCollectionName);
     }
-    _state.clickScenePos = QPointF(clickX, clickY);
+    _state.clickVolumePos = sceneToVolume(QPointF(clickX, clickY));
     _state.hasPreview = true;
     _state.shiftReleasedSincePreview = false;
     updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
     return true;
+}
+
+void SameWrapAnnotationTool::refreshOverlay(const VolumeToSceneFn& volumeToScene,
+                                            const SetOverlayGroupFn& setOverlayGroup,
+                                            const ClearOverlayGroupFn& clearOverlayGroup)
+{
+    updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
 }
 
 bool SameWrapAnnotationTool::sampleSourceImage(const QImage& framebuffer, cv::Mat& gray) const
@@ -604,8 +612,9 @@ void SameWrapAnnotationTool::updateOverlay(const VolumeToSceneFn& volumeToScene,
         items.push_back(marker);
     }
 
-    auto* clickMarker = new QGraphicsEllipseItem(_state.clickScenePos.x() - 6.0,
-                                                 _state.clickScenePos.y() - 6.0,
+    const QPointF clickScenePos = volumeToScene(_state.clickVolumePos);
+    auto* clickMarker = new QGraphicsEllipseItem(clickScenePos.x() - 6.0,
+                                                 clickScenePos.y() - 6.0,
                                                  12.0,
                                                  12.0);
     clickMarker->setPen(QPen(QColor(0, 255, 255, 240), 2.0));

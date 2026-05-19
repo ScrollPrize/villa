@@ -2632,6 +2632,7 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
     if (shouldRefreshInteractivePreview())
         updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
     scheduleRender("pan");
+    refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
 
@@ -2665,6 +2666,7 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     if (shouldRefreshInteractivePreview())
         updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
     scheduleRender("zoom");
+    refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
 
@@ -2955,6 +2957,20 @@ bool CChunkedVolumeViewer::commitSameWrapAnnotationPreview()
 {
     return _sameWrapAnnotation.commit(
         _pointCollection,
+        [this](const std::string& key) { clearOverlayGroup(key); });
+}
+
+void CChunkedVolumeViewer::refreshSameWrapAnnotationOverlay()
+{
+    if (!_sameWrapAnnotation.hasPreview()) {
+        return;
+    }
+
+    _sameWrapAnnotation.refreshOverlay(
+        [this](const cv::Vec3f& point) { return volumeToScene(point); },
+        [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+            setOverlayGroup(key, items);
+        },
         [this](const std::string& key) { clearOverlayGroup(key); });
 }
 

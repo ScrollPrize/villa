@@ -29,6 +29,9 @@ public:
     void noteShiftReleased();
     void clear(const ClearOverlayGroupFn& clearOverlayGroup);
     bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
+    void refreshOverlay(const VolumeToSceneFn& volumeToScene,
+                        const SetOverlayGroupFn& setOverlayGroup,
+                        const ClearOverlayGroupFn& clearOverlayGroup);
 
     bool generatePreview(const QImage& framebuffer,
                          const QPointF& scenePos,
@@ -51,7 +54,7 @@ private:
         std::vector<cv::Vec3f> sampledVolumePoints;
         std::vector<uint64_t> mergeCollectionIds;
         std::string mergeCollectionName;
-        QPointF clickScenePos;
+        cv::Vec3f clickVolumePos{0.0f, 0.0f, 0.0f};
         bool hasPreview = false;
     };
 
