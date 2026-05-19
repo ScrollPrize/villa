@@ -12,6 +12,8 @@ if(NOT TARGET doctest::doctest)
     FetchContent_MakeAvailable(doctest)
 endif()
 
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Test)
+
 add_executable(test_smoke test_smoke.cpp)
 target_link_libraries(test_smoke PRIVATE doctest::doctest)
 add_test(NAME test_smoke COMMAND test_smoke)
@@ -32,6 +34,11 @@ add_executable(test_segmentation_autosave_state test_segmentation_autosave_state
 target_include_directories(test_segmentation_autosave_state PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_segmentation_autosave_state PRIVATE doctest::doctest)
 add_test(NAME test_segmentation_autosave_state COMMAND test_segmentation_autosave_state)
+
+add_executable(test_segmentation_intersection_invalidation test_segmentation_intersection_invalidation.cpp)
+target_include_directories(test_segmentation_intersection_invalidation PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_segmentation_intersection_invalidation PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core)
+add_test(NAME test_segmentation_intersection_invalidation COMMAND test_segmentation_intersection_invalidation)
 
 add_executable(test_quadsurface_save_roundtrip test_quadsurface_save_roundtrip.cpp)
 target_link_libraries(test_quadsurface_save_roundtrip PRIVATE doctest::doctest vc_core)

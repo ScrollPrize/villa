@@ -132,6 +132,9 @@ public:
     void renderIntersections(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
+    void scheduleIntersectionRender(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) override;
     void invalidateIntersect(const std::string& = "") override;
     void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells) override;
     float intersectionOpacity() const override { return _intersectionOpacity; }
@@ -213,9 +216,6 @@ signals:
 
 private:
     void scheduleRender(
-        const char* reason = "internal caller",
-        std::source_location caller = std::source_location::current());
-    void scheduleIntersectionRender(
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
     void quiesceForClose();
