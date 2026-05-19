@@ -2894,6 +2894,7 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
                 scenePos,
                 appendToPreview,
                 _scale,
+                _pointCollection,
                 [this](const QPointF& point) { return sceneToVolume(point); },
                 [this](const cv::Vec3f& point) { return volumeToScene(point); },
                 [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
@@ -2938,6 +2939,11 @@ void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
 void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
 {
     _sameWrapAnnotation.setSpacing(spacingVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
+{
+    _sameWrapAnnotation.setMergeExistingAnnotations(enabled);
 }
 
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()

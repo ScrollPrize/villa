@@ -42,11 +42,13 @@ public:
     void setAnnotateChecked(bool checked);
     bool sameWrapAnnotationEnabled() const;
     double sameWrapAnnotationSpacing() const;
+    bool sameWrapAnnotationMergeEnabled() const;
 
 signals:
     void annotateToggled(bool enabled);
     void sameWrapAnnotationToggled(bool enabled);
     void sameWrapAnnotationSpacingChanged(double spacing);
+    void sameWrapAnnotationMergeToggled(bool enabled);
     void sameWrapAnnotationClearRequested();
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
@@ -96,6 +98,7 @@ private slots:
 
     QCheckBox *_chkAnnotate{nullptr};
     QCheckBox *_chkSameWrapAnnotation{nullptr};
+    QCheckBox *_chkSameWrapMerge{nullptr};
     QDoubleSpinBox *_sameWrapSpacingSpinbox{nullptr};
     QPushButton *_clearSameWrapAnnotationButton{nullptr};
 

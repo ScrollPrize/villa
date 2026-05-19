@@ -922,9 +922,12 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged,
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationMergeToggled,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationClearRequested,
                 viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
         viewer->setSameWrapAnnotationSpacing(_point_collection_widget->sameWrapAnnotationSpacing());
+        viewer->setSameWrapAnnotationMergeExisting(_point_collection_widget->sameWrapAnnotationMergeEnabled());
         viewer->setSameWrapAnnotationMode(_point_collection_widget->sameWrapAnnotationEnabled());
         viewer->setProperty("vc_points_bound", true);
     }

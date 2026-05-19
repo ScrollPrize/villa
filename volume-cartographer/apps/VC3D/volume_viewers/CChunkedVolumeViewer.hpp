@@ -191,6 +191,7 @@ public slots:
     void onPointSelected(uint64_t) {}
     void setSameWrapAnnotationMode(bool enabled);
     void setSameWrapAnnotationSpacing(double spacingVx);
+    void setSameWrapAnnotationMergeExisting(bool enabled);
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}

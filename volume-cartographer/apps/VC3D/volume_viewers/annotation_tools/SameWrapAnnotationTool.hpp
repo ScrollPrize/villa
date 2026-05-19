@@ -25,6 +25,7 @@ public:
 
     void setEnabled(bool enabled);
     void setSpacing(double spacingVx);
+    void setMergeExistingAnnotations(bool enabled);
     void noteShiftReleased();
     void clear(const ClearOverlayGroupFn& clearOverlayGroup);
     bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
@@ -33,6 +34,7 @@ public:
                          const QPointF& scenePos,
                          bool appendToPreview,
                          float viewScale,
+                         const VCCollection* pointCollection,
                          const SceneToVolumeFn& sceneToVolume,
                          const VolumeToSceneFn& volumeToScene,
                          const SetOverlayGroupFn& setOverlayGroup,
@@ -41,11 +43,14 @@ public:
 private:
     struct State {
         bool enabled = false;
+        bool mergeExistingAnnotations = false;
         float spacingVx = 10.0f;
         bool shiftReleasedSincePreview = true;
         std::vector<QPointF> componentScenePath;
         std::vector<cv::Vec3f> componentVolumePath;
         std::vector<cv::Vec3f> sampledVolumePoints;
+        std::vector<uint64_t> mergeCollectionIds;
+        std::string mergeCollectionName;
         QPointF clickScenePos;
         bool hasPreview = false;
     };
