@@ -85,7 +85,7 @@ void CPointCollectionWidget::setupUi()
     _sameWrapSpacingSpinbox->setRange(1.0, 1000.0);
     _sameWrapSpacingSpinbox->setDecimals(1);
     _sameWrapSpacingSpinbox->setSingleStep(1.0);
-    _sameWrapSpacingSpinbox->setValue(10.0);
+    _sameWrapSpacingSpinbox->setValue(20.0);
     _sameWrapSpacingSpinbox->setSuffix(" vx");
     _sameWrapSpacingSpinbox->setMaximumWidth(90);
     _sameWrapSpacingSpinbox->setToolTip("Distance between generated same-wrap annotation points in surface voxels.");
@@ -965,7 +965,7 @@ bool CPointCollectionWidget::sameWrapAnnotationEnabled() const
 
 double CPointCollectionWidget::sameWrapAnnotationSpacing() const
 {
-    return _sameWrapSpacingSpinbox ? _sameWrapSpacingSpinbox->value() : 10.0;
+    return _sameWrapSpacingSpinbox ? _sameWrapSpacingSpinbox->value() : 20.0;
 }
 
 bool CPointCollectionWidget::sameWrapAnnotationMergeEnabled() const

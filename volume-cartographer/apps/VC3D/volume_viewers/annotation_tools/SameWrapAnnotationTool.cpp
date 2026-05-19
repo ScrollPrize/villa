@@ -24,6 +24,7 @@
 
 namespace {
 constexpr const char* kSameWrapAnnotationOverlayKey = "same_wrap_annotation_preview";
+constexpr float kSameWrapMergeContactToleranceVx = 1.0f;
 
 bool isSameWrapCollectionName(const std::string& name)
 {
@@ -450,7 +451,7 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
 
         std::vector<ProjectedPoint> projectedPoints;
         const std::vector<float> cumulativeLength = cumulativePathLength(volumePath);
-        const float mergeTolerance = std::max(1.0f, _state.spacingVx);
+        const float mergeTolerance = kSameWrapMergeContactToleranceVx;
         std::unordered_set<uint64_t> seenCollections(mergeCollectionIds.begin(), mergeCollectionIds.end());
 
         for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {

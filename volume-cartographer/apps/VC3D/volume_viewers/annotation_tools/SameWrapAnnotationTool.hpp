@@ -47,7 +47,7 @@ private:
     struct State {
         bool enabled = false;
         bool mergeExistingAnnotations = false;
-        float spacingVx = 10.0f;
+        float spacingVx = 20.0f;
         bool shiftReleasedSincePreview = true;
         std::vector<QPointF> componentScenePath;
         std::vector<cv::Vec3f> componentVolumePath;
