@@ -79,6 +79,7 @@ default_config = {
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
     'winding_number_num_pairs': 2000,
+    'winding_number_num_pcls': 1,
     'normals_num_points': 2000,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 8.e0,
@@ -878,7 +879,7 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
-def get_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections):
+def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections):
     # For pairs of annotated PCL points (possibly on different patches), constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. For each annotated
     # point we build 4 L-shaped strips: from (i, j), walk along one of the cardinal patch
@@ -898,7 +899,13 @@ def get_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_d
     # Each entry: (ls1, ls2, pid1, pid2, winding_diff) where ls* is a list of 4 L-shape ij strips
     strip_pairs = []
 
-    for pcl in point_collections:
+    num_pcls_per_step = min(cfg['winding_number_num_pcls'], len(point_collections))
+    if num_pcls_per_step <= 0:
+        return torch.zeros([], device='cuda')
+    selected_idxs = np.random.choice(len(point_collections), num_pcls_per_step, replace=False)
+    selected_pcls = [point_collections[i] for i in selected_idxs]
+
+    for pcl in selected_pcls:
         points = list(pcl['points'].values())
         valid_points = [
             p for p in points
@@ -911,7 +918,7 @@ def get_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_d
 
         num_pairs_for_pcl = min(
             len(valid_points) - 1,
-            cfg['winding_number_num_pairs'] // max(1, len(point_collections)),
+            cfg['winding_number_num_pairs'] // max(1, len(selected_pcls)),
         )
         if num_pairs_for_pcl <= 0:
             continue
@@ -2084,7 +2091,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
             losses['patch_normals'] = patch_normals_loss * cfg['loss_weight_patch_normals']
 
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
-            losses['winding_number'] = get_winding_number_loss(slice_to_spiral_transform, dr_per_winding, working_set_patches_dict, point_collections) * cfg['loss_weight_winding_number']
+            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, working_set_patches_dict, point_collections) * cfg['loss_weight_winding_number']
 
         losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
 
