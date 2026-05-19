@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
 
@@ -33,7 +32,7 @@ def flow_gate_prefetch_points(
 	xyz_lr: torch.Tensor | None = None,
 	cfg: dict | None,
 ) -> torch.Tensor | None:
-	"""Extra pred-dt sample positions used by flow-gate render and pull fitting."""
+	"""Extra pred-dt sample positions used by the flow-gate render."""
 	if cfg is None or not bool(cfg.get("enabled", False)):
 		return None
 	if xyz_hr.shape[0] != 1:
@@ -59,11 +58,6 @@ def flow_gate_prefetch_points(
 		offsets = offsets * spacing.view(1, 3) * step_scale
 		extra.append((xyz0.unsqueeze(0) + offsets.view(-1, 1, 1, 3)).reshape(-1, 3))
 
-	pull_cfg = cfg.get("anticipatory_pull", None)
-	if isinstance(pull_cfg, dict) and bool(pull_cfg.get("enabled", False)) and xyz_lr is not None and xyz_lr.shape[0] == 1:
-		pull_pf = _anticipatory_pull_prefetch_points(xyz_lr=xyz_lr, cfg=pull_cfg)
-		if pull_pf is not None:
-			extra.append(pull_pf.reshape(-1, 3))
 	if not extra:
 		return None
 	return torch.cat(extra, dim=0).view(1, 1, -1, 3)
@@ -420,30 +414,6 @@ def _anticipatory_reference_step(
 	return torch.tensor(1.0, device=device, dtype=dtype)
 
 
-def _anticipatory_pull_prefetch_points(*, xyz_lr: torch.Tensor, cfg: dict) -> torch.Tensor | None:
-	"""Conservative line-fit sample positions for sparse pred-dt cache prefetch."""
-	if xyz_lr.shape[0] != 1:
-		return None
-	xyz0 = xyz_lr[0].detach()
-	Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
-	if Hm <= 1 or Wm <= 1:
-		return None
-	samples_n = max(2, int(cfg.get("samples", 8)))
-	tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
-	root = xyz0[root_h, root_w]
-	tip = xyz0[tip_h, tip_w]
-	normals = _vertex_normals(xyz_lr.detach())[0]
-	offset_factors = _anticipatory_normal_offset_factors(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
-	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
-	line_vec = tip - root
-	ref_step = _anticipatory_reference_step(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype, xyz0=xyz0)
-	n = normals[tip_h, tip_w]
-	offset = ref_step * offset_factors.view(1, -1)
-	target_vec = line_vec.view(-1, 1, 3) + offset.unsqueeze(-1) * n.view(-1, 1, 3)
-	line = root.view(-1, 1, 1, 3) + t * target_vec.view(-1, int(offset_factors.numel()), 1, 3)
-	return line.reshape(-1, 3)
-
-
 def flow_gate_prefetch_points_for_result(
 	*,
 	res: fit_model.FitResult3D,
@@ -497,25 +467,9 @@ def flow_gate_prefetch_items_for_result(
 		pool_points = (xyz_hr.unsqueeze(0) + offsets.view(-1, 1, 1, 3)).reshape(1, 1, -1, 3)
 		out["pred_dt"] = torch.cat([out["pred_dt"], pool_points], dim=2)
 
-	pull_cfg = _anticipatory_pull_cfg(cfg)
-	if pull_cfg is not None:
-		xyz0 = res.xyz_lr[0].detach()
-		Hm, Wm = int(xyz0.shape[0]), int(xyz0.shape[1])
-		if Hm > 1 and Wm > 1:
-			samples_n = max(2, int(pull_cfg.get("samples", 8)))
-			tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
-			root = xyz0[root_h, root_w]
-			tip = xyz0[tip_h, tip_w]
-			line_vec = tip - root
-			n = _tip_normals_from_result(res=res, tip_h=tip_h, tip_w=tip_w)
-			offset_factors = _anticipatory_normal_offset_factors(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype)
-			ref_step = _anticipatory_reference_step(cfg=pull_cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
-			offset = ref_step * offset_factors.view(1, -1)
-			target_vec = line_vec.view(-1, 1, 3) + offset.unsqueeze(-1) * n.view(-1, 1, 3)
-			t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
-			line = root.view(-1, 1, 1, 3) + t * target_vec.view(-1, int(offset_factors.numel()), 1, 3)
-			pull_points = line.reshape(1, 1, -1, 3)
-			out["pred_dt"] = torch.cat([out["pred_dt"], pull_points], dim=2) if "pred_dt" in out else pull_points
+	# Anticipatory pull depends on the current flow gate. It is intentionally not
+	# prefetched here; `_score_anticipatory_pull_candidates` filters by the known
+	# gate and prefetches/samples the remaining candidates in bounded chunks.
 	return out
 
 
@@ -541,12 +495,53 @@ def _tip_normals_from_result(
 	return n / n.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
+def _empty_anticipatory_pull_candidates(
+	*,
+	device: torch.device,
+	dtype: torch.dtype,
+	samples_n: int,
+	stats: dict[str, float],
+) -> dict:
+	return {
+		"candidate_idx": torch.empty(0, device=device, dtype=torch.long),
+		"tip_h": torch.empty(0, device=device, dtype=torch.long),
+		"tip_w": torch.empty(0, device=device, dtype=torch.long),
+		"root_h": torch.empty(0, device=device, dtype=torch.long),
+		"root_w": torch.empty(0, device=device, dtype=torch.long),
+		"target_xyz": torch.empty((0, 3), device=device, dtype=dtype),
+		"prefix": torch.empty(0, device=device, dtype=dtype),
+		"inliers": torch.empty((0, samples_n), device=device, dtype=dtype),
+		"offset": torch.empty(0, device=device, dtype=dtype),
+		"_stats": stats,
+	}
+
+
+def _prefetch_sparse_pred_dt_chunks(*, res: fit_model.FitResult3D, query: torch.Tensor) -> int:
+	sparse_caches = getattr(res.data, "sparse_caches", None)
+	if not sparse_caches:
+		return 0
+	pred_dt_caches = [
+		cache for cache in sparse_caches.values()
+		if "pred_dt" in set(getattr(cache, "channels", ()))
+	]
+	if not pred_dt_caches:
+		return 0
+	for cache in pred_dt_caches:
+		spacing = res.data._spacing_for(cache.channels[0])
+		cache.prefetch(query, res.data.origin_fullres, spacing)
+	for cache in pred_dt_caches:
+		cache.sync()
+	return len(pred_dt_caches)
+
+
 def _score_anticipatory_pull_candidates(
 	*,
 	res: fit_model.FitResult3D,
 	cfg: dict,
+	flow_weight: torch.Tensor | None = None,
+	mask_lr: torch.Tensor | None = None,
 ) -> dict | None:
-	"""Fit all one-step straight root->tip candidates, independent of flow."""
+	"""Fit one-step root->tip candidates that can actually use the known gate."""
 	if res.xyz_lr.shape[0] != 1:
 		return None
 	xyz0 = res.xyz_lr[0].detach()
@@ -558,20 +553,58 @@ def _score_anticipatory_pull_candidates(
 	inlier_one = float(cfg.get("inlier_one", 120.0))
 	if inlier_one <= inlier_zero:
 		raise ValueError("anticipatory_pull requires inlier_one > inlier_zero")
-	chunk_candidates = max(256, int(cfg.get("chunk_candidates", 4096)))
+	chunk_candidates = max(256, int(cfg.get("chunk_candidates", 65536)))
 	tip_h, tip_w, root_h, root_w = _neighbor_candidate_indices(Hm=Hm, Wm=Wm, device=xyz0.device)
+	total_candidates = int(tip_h.numel())
+	stats: dict[str, float] = {
+		"total_candidates": float(total_candidates),
+		"gate_candidates": float(total_candidates),
+		"scored_candidates": 0.0,
+		"active_batches": 0.0,
+		"chunk_candidates": float(chunk_candidates),
+		"query_samples": 0.0,
+		"sparse_prefetch_batches": 0.0,
+	}
+	if flow_weight is not None:
+		root_weight = flow_weight[0, 0, root_h, root_w].detach()
+		tip_weight = flow_weight[0, 0, tip_h, tip_w].detach()
+		if mask_lr is not None:
+			tip_mask = mask_lr[0, 0, tip_h, tip_w].detach()
+		else:
+			tip_mask = torch.ones_like(tip_weight)
+		gate_candidate = (root_weight > 0.0) & (tip_weight < 1.0) & (root_weight > tip_weight) & (tip_mask > 0.0)
+		stats["gate_candidates"] = float(gate_candidate.sum().detach().cpu())
+		if not bool(gate_candidate.any().detach().cpu()):
+			return _empty_anticipatory_pull_candidates(
+				device=xyz0.device,
+				dtype=xyz0.dtype,
+				samples_n=samples_n,
+				stats=stats,
+			)
+		tip_h = tip_h[gate_candidate]
+		tip_w = tip_w[gate_candidate]
+		root_h = root_h[gate_candidate]
+		root_w = root_w[gate_candidate]
 	n_candidates = int(tip_h.numel())
 	if n_candidates <= 0:
-		return None
+		return _empty_anticipatory_pull_candidates(
+			device=xyz0.device,
+			dtype=xyz0.dtype,
+			samples_n=samples_n,
+			stats=stats,
+		)
 	offset_factors = _anticipatory_normal_offset_factors(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype)
 	ref_step = _anticipatory_reference_step(cfg=cfg, device=xyz0.device, dtype=xyz0.dtype, params=res.params)
 	if offset_factors.ndim != 1:
 		raise RuntimeError(f"anticipatory_pull expected 1D offset factors, got {tuple(offset_factors.shape)}")
+	offset_count = int(offset_factors.numel())
 	t = torch.linspace(0.0, 1.0, samples_n, device=xyz0.device, dtype=xyz0.dtype).view(1, 1, samples_n, 1)
 	targets: list[torch.Tensor] = []
 	prefixes: list[torch.Tensor] = []
 	best_inliers: list[torch.Tensor] = []
 	best_offsets_all: list[torch.Tensor] = []
+	batches = 0
+	sparse_prefetch_batches = 0
 	with torch.no_grad():
 		for c0 in range(0, n_candidates, chunk_candidates):
 			c1 = min(n_candidates, c0 + chunk_candidates)
@@ -585,12 +618,14 @@ def _score_anticipatory_pull_candidates(
 			n = _tip_normals_from_result(res=res, tip_h=th, tip_w=tw)
 			offsets = ref_step * offset_factors
 			target_vec = line_vec.view(-1, 1, 3) + offsets.view(1, -1, 1) * n.view(-1, 1, 3)
-			query = root.view(-1, 1, 1, 3) + t * target_vec.view(c1 - c0, int(offset_factors.numel()), 1, 3)
+			query = root.view(-1, 1, 1, 3) + t * target_vec.view(c1 - c0, offset_count, 1, 3)
 			flat_query = query.reshape(1, 1, -1, 3)
+			if _prefetch_sparse_pred_dt_chunks(res=res, query=flat_query) > 0:
+				sparse_prefetch_batches += 1
 			sampled = res.data.grid_sample_fullres(flat_query, channels={"pred_dt"}).pred_dt
 			if sampled is None:
 				raise RuntimeError("anticipatory_pull requires pred_dt to be loaded")
-			pred = sampled.reshape(c1 - c0, int(offset_factors.numel()), samples_n)
+			pred = sampled.reshape(c1 - c0, offset_count, samples_n)
 			inlier = ((pred - inlier_zero) / (inlier_one - inlier_zero)).clamp(0.0, 1.0)
 			prefix = inlier.cumprod(dim=2).mean(dim=2)
 			best_score, best_offset_idx = prefix.max(dim=1)
@@ -599,6 +634,13 @@ def _score_anticipatory_pull_candidates(
 			prefixes.append(best_score)
 			best_inliers.append(inlier[torch.arange(c1 - c0, device=xyz0.device), best_offset_idx])
 			best_offsets_all.append(best_offsets)
+			batches += 1
+	stats.update({
+		"scored_candidates": float(n_candidates),
+		"active_batches": float(batches),
+		"query_samples": float(n_candidates * offset_count * samples_n),
+		"sparse_prefetch_batches": float(sparse_prefetch_batches),
+	})
 	candidate_idx = torch.arange(n_candidates, device=xyz0.device, dtype=torch.long)
 	return {
 		"candidate_idx": candidate_idx,
@@ -610,6 +652,7 @@ def _score_anticipatory_pull_candidates(
 		"prefix": torch.cat(prefixes, dim=0),
 		"inliers": torch.cat(best_inliers, dim=0),
 		"offset": torch.cat(best_offsets_all, dim=0),
+		"_stats": stats,
 	}
 
 
@@ -1619,15 +1662,8 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			finally:
 				done("flow_calc", _t_flow)
 
-		pull_candidates = None
 		try:
-			if pull_cfg is not None:
-				with ThreadPoolExecutor(max_workers=1) as executor:
-					flow_future = executor.submit(_compute_flow_outputs)
-					pull_candidates = _score_anticipatory_pull_candidates(res=res, cfg=pull_cfg)
-					flow_outputs = flow_future.result()
-			else:
-				flow_outputs = _compute_flow_outputs()
+			flow_outputs = _compute_flow_outputs()
 			publish_timing()
 			if return_flow_debug:
 				(
@@ -1679,7 +1715,11 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					"pred_dt_gate_n_gt0": float(((gate_weight > 0.0) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_gate_n_gt01": float(((gate_weight > 0.1) & valid).sum().detach().cpu()) / valid_count,
 					"pred_dt_gate_n_gt05": float(((gate_weight > 0.5) & valid).sum().detach().cpu()) / valid_count,
+					"pred_dt_pull_gate_frac": 0.0,
+					"pred_dt_pull_scored_frac": 0.0,
 					"pred_dt_pull_active_frac": 0.0,
+					"pred_dt_pull_batches": 0.0,
+					"pred_dt_pull_samples_m": 0.0,
 					"pred_dt_pull_weight_mean": 0.0,
 					"pred_dt_pull_prefix_mean": 0.0,
 				}
@@ -1766,8 +1806,17 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				"pred_dt_flow_source_edges": float(flow_metadata.get("source_edge_count", 0)),
 				"pred_dt_flow_seeded_nodes": float(flow_metadata.get("seeded_node_count", 0)),
 			})
+		done("compute_weight", _t)
+		pull_candidates = None
 		pull = None
 		if pull_cfg is not None:
+			_t_pull = mark("anticipatory_pull")
+			pull_candidates = _score_anticipatory_pull_candidates(
+				res=res,
+				cfg=pull_cfg,
+				flow_weight=gate_weight,
+				mask_lr=res.mask_lr,
+			)
 			pull = _activate_anticipatory_pull(
 				candidates=pull_candidates,
 				flow_weight=gate_weight,
@@ -1775,10 +1824,23 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				cfg=pull_cfg,
 				weight_scale=gate_factor,
 			)
+			done("anticipatory_pull", _t_pull)
 			active_count = 0 if pull is None else int(pull["tip_h"].numel())
-			candidate_count = 0 if pull_candidates is None else int(pull_candidates["tip_h"].numel())
+			pull_stats = pull_candidates.get("_stats", {}) if pull_candidates is not None else {}
+			total_candidates = int(pull_stats.get("total_candidates", 0.0))
+			gate_candidates = int(pull_stats.get("gate_candidates", 0.0))
+			scored_candidates = int(pull_stats.get("scored_candidates", 0.0))
+			batches = int(pull_stats.get("active_batches", 0.0))
+			chunk_candidates = int(pull_stats.get("chunk_candidates", 0.0))
+			query_samples = int(pull_stats.get("query_samples", 0.0))
+			sparse_prefetch_batches = int(pull_stats.get("sparse_prefetch_batches", 0.0))
+			den_total = float(max(1, total_candidates))
 			_flow_gate_last_stats.update({
-				"pred_dt_pull_active_frac": float(active_count) / float(max(1, candidate_count)),
+				"pred_dt_pull_gate_frac": float(gate_candidates) / den_total,
+				"pred_dt_pull_scored_frac": float(scored_candidates) / den_total,
+				"pred_dt_pull_active_frac": float(active_count) / den_total,
+				"pred_dt_pull_batches": float(batches),
+				"pred_dt_pull_samples_m": float(query_samples) / 1.0e6,
 				"pred_dt_pull_weight_mean": (
 					float(pull["candidate_weight"].mean().detach().cpu()) if active_count > 0 else 0.0
 				),
@@ -1786,7 +1848,14 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					float(pull["prefix"].mean().detach().cpu()) if active_count > 0 else 0.0
 				),
 			})
-		done("compute_weight", _t)
+			if bool(pull_cfg.get("print_stats", True)):
+				print(
+					f"[pred_dt_flow_gate] {_flow_gate_stage}: anticipatory pull "
+					f"total={total_candidates} gate={gate_candidates} scored={scored_candidates} "
+					f"active={active_count} batches={batches} chunk={chunk_candidates} "
+					f"samples={query_samples} sparse_prefetch_batches={sparse_prefetch_batches}",
+					flush=True,
+				)
 
 		gate_basis_hr = None
 		if gate_basis_flow is not None and (write_layer_debug or write_jpg_debug):

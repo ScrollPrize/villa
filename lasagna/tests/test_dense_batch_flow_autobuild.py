@@ -158,6 +158,82 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 			7,
 		)
 
+	def test_flow_gate_prefetch_skips_anticipatory_pull_until_gate_exists(self) -> None:
+		class FakeData:
+			def _spacing_for(self, channel: str) -> tuple[float, float, float]:
+				return (1.0, 1.0, 1.0)
+
+		cfg = {
+			"enabled": True,
+			"anticipatory_pull": {
+				"enabled": True,
+				"samples": 8,
+			},
+		}
+		xyz_hr = torch.zeros((1, 3, 3, 3), dtype=torch.float32)
+		xyz_lr = torch.zeros((1, 3, 3, 3), dtype=torch.float32)
+
+		self.assertIsNone(
+			opt_loss_pred_dt.flow_gate_prefetch_points(
+				data=FakeData(),
+				xyz_hr=xyz_hr,
+				xyz_lr=xyz_lr,
+				cfg=cfg,
+			)
+		)
+
+	def test_flow_gate_loss_prefetch_skips_anticipatory_pull_until_gate_exists(self) -> None:
+		cfg = {
+			"enabled": True,
+			"anticipatory_pull": {
+				"enabled": True,
+				"samples": 8,
+				"search_steps": 21,
+			},
+		}
+		xyz_lr = torch.zeros((1, 3, 3, 3), dtype=torch.float32)
+		gt_normal = torch.zeros_like(xyz_lr)
+		gt_normal[..., 2] = 1.0
+		res = SimpleNamespace(
+			xyz_lr=xyz_lr,
+			xyz_hr=torch.zeros((1, 3, 3, 3), dtype=torch.float32),
+			gt_normal_lr=gt_normal,
+		)
+
+		opt_loss_pred_dt.configure_pred_dt(normal_source="gt")
+		try:
+			items = opt_loss_pred_dt.flow_gate_prefetch_items_for_result(res=res, cfg=cfg)
+		finally:
+			opt_loss_pred_dt.configure_pred_dt(normal_source="model")
+
+		self.assertEqual(set(items.keys()), {"pred_dt"})
+		self.assertEqual(int(items["pred_dt"].reshape(-1, 3).shape[0]), 9)
+
+	def test_anticipatory_pull_candidate_scoring_is_gate_filtered(self) -> None:
+		class ExplodingData:
+			sparse_caches = None
+
+			def grid_sample_fullres(self, *args, **kwargs):
+				raise AssertionError("inactive anticipatory candidates should not be sampled")
+
+		res = SimpleNamespace(
+			xyz_lr=torch.zeros((1, 2, 2, 3), dtype=torch.float32),
+			data=ExplodingData(),
+			params=SimpleNamespace(mesh_step=1.0),
+		)
+		candidates = opt_loss_pred_dt._score_anticipatory_pull_candidates(
+			res=res,
+			cfg={"samples": 4},
+			flow_weight=torch.zeros((1, 1, 2, 2), dtype=torch.float32),
+			mask_lr=torch.ones((1, 1, 2, 2), dtype=torch.float32),
+		)
+
+		self.assertIsNotNone(candidates)
+		self.assertEqual(int(candidates["tip_h"].numel()), 0)
+		self.assertEqual(candidates["_stats"]["total_candidates"], 12.0)
+		self.assertEqual(candidates["_stats"]["gate_candidates"], 0.0)
+		self.assertEqual(candidates["_stats"]["scored_candidates"], 0.0)
+
 	def test_local_boost_dilation_is_global_after_region_normalization(self) -> None:
 		source_path = Path(ROOT) / "dense_batch_min_cut/src/dense_batch_preprocess.cpp"
 		source = source_path.read_text()
