@@ -22,7 +22,12 @@ class PointPatchLink:
 
 
 def load_point_collection(filename: str) -> Optional[Dict[int, Dict[str, Any]]]:
-    """Load point collection from JSON file and return as dictionary."""
+    """Load point collection from JSON file and return as dictionary.
+
+    `kind` must be one of PCL_KINDS and is stamped onto each loaded pcl; it
+    determines whether the pcl partakes in patch attachment (cross_patch) or is
+    consumed as a free-floating ordered strip (unattached).
+    """
     try:
         with open(filename, 'r') as f:
             data = json.load(f)
@@ -133,31 +138,3 @@ def normalise_pcl_winding_annotations(point_collections):
             del points[pid]
 
 
-def categorise_point_collections(point_collections, patches_dict):
-    # Partition point_collections (post-attachment) into:
-    #   cross_patch: collections whose attached points span >= 2 different patches.
-    #                Each cross-patch pcl is given a 'points_by_patch' field: an
-    #                ordered dict mapping patch_id -> list of attached points on
-    #                that patch. Patches are ordered by the first attached point
-    #                that hits them when scanning the pcl's points in int(json-key)
-    #                order; within each patch, points are also in int(key) order.
-    #                The winding-number loss consumes this directly.
-    #   single_patch: the rest (touch 0 or 1 patches in total).
-    cross_patch = {}
-    unattached = {}
-    for pcl_id, pcl in point_collections.items():
-        points_by_patch = {}
-        for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
-            if 'on_patch' not in point:
-                continue
-            pid = point['on_patch']['id']
-            if pid not in patches_dict:
-                continue
-            points_by_patch.setdefault(pid, []).append(point)
-        if len(points_by_patch) >= 2:
-            new_pcl = dict(pcl)
-            new_pcl['points_by_patch'] = points_by_patch
-            cross_patch[pcl_id] = new_pcl
-        else:
-            unattached[pcl_id] = pcl
-    return cross_patch, unattached

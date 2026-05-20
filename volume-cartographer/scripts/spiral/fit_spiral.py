@@ -24,15 +24,15 @@ from torchdiffeq import odeint
 
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
-from point_collection import load_point_collection, _process_point_collections, normalise_pcl_winding_annotations, categorise_point_collections
+from point_collection import load_point_collection, _process_point_collections, normalise_pcl_winding_annotations
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
 # PHercParis4
 volpkg_path = '/home/paul/projects/vesuvius-scrolls/volpkgs/s1_ds2.volpkg'
 scroll_zarr_path = None
-pcl_json_paths = [
-    '/home/paul/projects/vesuvius-scrolls/spiral/windings_8205.json',
+cross_patch_pcl_json_paths = ['/home/paul/projects/vesuvius-scrolls/spiral/windings_8205.json']
+unattached_pcl_json_paths = [
     '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations.json',
     '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations_2.json'
 ]
@@ -47,7 +47,8 @@ seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
 # # PHerc0172
 # volpkg_path = '/home/paul/projects/vesuvius-scrolls/volpkgs/PHerc0172.volpkg'
 # scroll_zarr_path = f'{volpkg_path}/volumes/s5_masked_ome.zarr/2'
-# pcl_json_paths = [f'{volpkg_path}/atlas-pcl.json']
+# cross_patch_pcl_json_paths = [f'{volpkg_path}/atlas-pcl.json']
+# unattached_pcl_json_paths = []
 # spiral_outward_sense = 'CW'  # CW | ACW
 # umbilicus_z_to_yx = lambda f: thaumato_umbilicus_z_to_yx('/home/paul/projects/vesuvius-scrolls/data/s5-umbilicus.txt', downsample_factor=f)
 # scroll_name = 's5'
@@ -920,7 +921,7 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
 
     for pcl in selected_pcls:
         # Pair patches either only with their immediate neighbour in the pcl's
-        # patch ordering (first-seen order; see categorise_point_collections),
+        # patch ordering (first-seen order; built in main()),
         # or with every other patch.
         if cfg['winding_number_adjacent_patches_only']:
             cross_pairs = [(p1, p2) for p1, p2 in zip(pcl['points_by_patch'], list(pcl['points_by_patch'])[1:])]
@@ -1023,10 +1024,9 @@ def get_unattached_pcl_strip_losses(
     num_points_per_pcl,
     compute_dt,
 ):
-    # Unattached pcls (touching 0 or 1 patches; see categorise_point_collections) are
-    # treated as ordered strips, indexed by int(point_id), and assumed to be locally
-    # dense enough that adjacent samples have |dtheta| < pi (so
-    # _unwrap_track_shifted_radii can stitch theta=0 crossings, exactly like a patch
+    # Unattached pcls are treated as ordered strips, indexed by int(point_id), and
+    # assumed to be locally dense enough that adjacent samples have |dtheta| < pi
+    # (so _unwrap_track_shifted_radii can stitch theta=0 crossings, exactly like a patch
     # row/column). Two losses are computed, analogous to the patch radius
     # and DT losses: (1) shifted-radius should be constant along the strip after
     # subtracting per-point winding-annotation offsets; (2) each point should snap to
@@ -2327,28 +2327,31 @@ def main():
 
     patches = load_patches(patches_path, segment_id_filter=lambda s: 'monster' not in s)
 
-    point_collections = {}
-    for path in pcl_json_paths:
-        loaded = load_point_collection(path) or {}
-        next_id = (max(point_collections.keys()) + 1) if point_collections else 0
-        for pcl in loaded.values():
-            new_id = pcl['id'] if pcl['id'] not in point_collections else next_id
-            if new_id == next_id:
+    cross_patch_point_collections = {}
+    unattached_point_collections = {}
+    next_id = 0
+    for target, paths in (
+        (cross_patch_point_collections, cross_patch_pcl_json_paths),
+        (unattached_point_collections, unattached_pcl_json_paths),
+    ):
+        for path in paths:
+            loaded = load_point_collection(path) or {}
+            for pcl in loaded.values():
+                pcl['source_file'] = path
+                target[next_id] = pcl
                 next_id += 1
-            pcl['id'] = new_id
-            for point in pcl['points'].values():
-                point['collectionId'] = new_id
-            point_collections[new_id] = pcl
-    process_point_collections_cached(patches, point_collections)
+
+    process_point_collections_cached(patches, cross_patch_point_collections)
 
     for patch in patches.values():
         patch.scale *= downsample_factor
         patch.zyxs /= downsample_factor
         patch.valid_zyxs /= downsample_factor
         patch.area /= downsample_factor ** 2
-    for pcl in point_collections.values():
-        for point in pcl['points'].values():
-            point['zyx'] = np.array([point['p'][2], point['p'][1], point['p'][0]]) / downsample_factor
+    for pcl_dict in (cross_patch_point_collections, unattached_point_collections):
+        for pcl in pcl_dict.values():
+            for point in pcl['points'].values():
+                point['zyx'] = np.array([point['p'][2], point['p'][1], point['p'][0]]) / downsample_factor
 
     def patch_intersects_z_roi(patch):
         zs = patch.valid_zyxs[..., 0]
@@ -2367,16 +2370,33 @@ def main():
     for pid in dropped_patch_ids:
         del patches[pid]
 
-    dropped_pcl_ids = [pid for pid, pcl in point_collections.items() if not pcl_intersects_z_roi(pcl)]
-    for pid in dropped_pcl_ids:
-        del point_collections[pid]
-    print(f'dropped {len(dropped_patch_ids)} patches and {len(dropped_pcl_ids)} pcls outside z-roi [{z_begin}, {z_end})')
+    dropped_pcl_count = 0
+    for pcl_dict in (cross_patch_point_collections, unattached_point_collections):
+        dropped = [pid for pid, pcl in pcl_dict.items() if not pcl_intersects_z_roi(pcl)]
+        for pid in dropped:
+            del pcl_dict[pid]
+        dropped_pcl_count += len(dropped)
+    print(f'dropped {len(dropped_patch_ids)} patches and {dropped_pcl_count} pcls outside z-roi [{z_begin}, {z_end})')
 
-    normalise_pcl_winding_annotations(point_collections)
-    cross_patch_point_collections, unattached_point_collections = categorise_point_collections(point_collections, patches)
+    normalise_pcl_winding_annotations(cross_patch_point_collections)
+    normalise_pcl_winding_annotations(unattached_point_collections)
+    # Group each cross-patch pcl's attached points by patch, for the
+    # winding-number loss. Patches are ordered by the first attached point that
+    # hits them when scanning the pcl's points in int(json-key) order; within
+    # each patch, points are also in int(key) order.
+    for pcl in cross_patch_point_collections.values():
+        points_by_patch = {}
+        for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
+            if 'on_patch' not in point:
+                continue
+            pid = point['on_patch']['id']
+            if pid not in patches:
+                continue
+            points_by_patch.setdefault(pid, []).append(point)
+        pcl['points_by_patch'] = points_by_patch
     unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections)
     print(
-        f'partitioned pcls: {len(cross_patch_point_collections)} cross-patch, '
+        f'pcls: {len(cross_patch_point_collections)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
 
