@@ -200,6 +200,7 @@ public slots:
     void setSameWrapAnnotationPathType(int pathType);
     void setSameWrapAnnotationFilterType(int filterType);
     void setSameWrapAnnotationFilterKernelSize(int kernelSize);
+    bool hasSameWrapAnnotationPreview() const;
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
     bool undoSameWrapAnnotation();
@@ -469,6 +470,7 @@ private:
     QGraphicsItem* _focusMarker = nullptr;
 
     SameWrapAnnotationTool _sameWrapAnnotation;
+    bool _sameWrapManualMergePressConsumed = false;
 
     bool _bboxMode = false;
     QPointF _bboxStart;

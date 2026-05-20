@@ -3021,6 +3021,11 @@ void CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize(int kernelSize)
     clearSameWrapAnnotationPreview();
 }
 
+bool CChunkedVolumeViewer::hasSameWrapAnnotationPreview() const
+{
+    return _sameWrapAnnotation.hasPreview();
+}
+
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
 {
     _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
@@ -3062,6 +3067,27 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    _sameWrapManualMergePressConsumed = false;
+    if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
+        modifiers.testFlag(Qt::ShiftModifier)) {
+        if (const auto hit = pointAtScenePosition(scenePos)) {
+            if (_sameWrapAnnotation.manualMergePointClicked(_pointCollection, hit->first, hit->second)) {
+                if (_pointCollection && _pointCollection->getPoint(hit->second)) {
+                    _selectedCollectionId = hit->first;
+                    _selectedPointId = hit->second;
+                } else {
+                    _selectedCollectionId = 0;
+                    _selectedPointId = 0;
+                }
+                _sameWrapManualMergePressConsumed = true;
+                if (_selectedPointId != 0) {
+                    emit pointClicked(_selectedPointId);
+                }
+                emit overlaysUpdated();
+                return;
+            }
+        }
+    }
     if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton &&
         modifiers.testFlag(Qt::ShiftModifier)) {
         if (_sameWrapAnnotation.manualPathType()) {
@@ -3150,6 +3176,10 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_sameWrapManualMergePressConsumed && button == Qt::RightButton) {
+        _sameWrapManualMergePressConsumed = false;
+        return;
+    }
     if (_sameWrapAnnotation.enabled() && _sameWrapAnnotation.manualPathType() &&
         button == Qt::LeftButton && modifiers.testFlag(Qt::ShiftModifier)) {
         _sameWrapAnnotation.appendManualPreview(

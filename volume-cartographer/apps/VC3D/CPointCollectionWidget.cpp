@@ -158,8 +158,8 @@ void CPointCollectionWidget::setupUi()
     _chkSameWrapAnnotation = new QCheckBox("Same-wrap annotation mode", same_wrap_group);
     _chkSameWrapAnnotation->setToolTip("Shift-click or Shift-drag in an active volume viewer to preview same-wrap annotation points. Shift+E commits; Ctrl+Z clears the preview or undoes the last committed collection.");
     same_wrap_layout->addWidget(_chkSameWrapAnnotation);
-    _chkSameWrapMerge = new QCheckBox("Merge same-wrap annotations", same_wrap_group);
-    _chkSameWrapMerge->setToolTip("Preview and commit matching existing same-wrap annotations as one ordered point set.");
+    _chkSameWrapMerge = new QCheckBox("Manual same-wrap merge", same_wrap_group);
+    _chkSameWrapMerge->setToolTip("Shift-right-click a point in one same-wrap collection, then Shift-right-click a point in another same-wrap collection to merge them.");
     same_wrap_layout->addWidget(_chkSameWrapMerge);
     QHBoxLayout *same_wrap_path_type_layout = new QHBoxLayout();
     same_wrap_path_type_layout->addWidget(new QLabel("Path type:"));
@@ -210,7 +210,7 @@ void CPointCollectionWidget::setupUi()
     _sameWrapMergeToleranceSpinbox->setValue(1.0);
     _sameWrapMergeToleranceSpinbox->setSuffix(" vx");
     _sameWrapMergeToleranceSpinbox->setMaximumWidth(90);
-    _sameWrapMergeToleranceSpinbox->setToolTip("Maximum distance for merging same-wrap annotation paths.");
+    _sameWrapMergeToleranceSpinbox->setToolTip("Reserved for same-wrap merge tools.");
     same_wrap_spacing_layout->addWidget(_sameWrapMergeToleranceSpinbox);
     same_wrap_spacing_layout->addStretch();
     same_wrap_layout->addLayout(same_wrap_spacing_layout);

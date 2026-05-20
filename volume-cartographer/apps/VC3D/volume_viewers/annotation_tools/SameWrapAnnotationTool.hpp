@@ -56,6 +56,7 @@ public:
     void clear(const ClearOverlayGroupFn& clearOverlayGroup);
     bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
     bool undoLastCommit(VCCollection* pointCollection);
+    bool manualMergePointClicked(VCCollection* pointCollection, uint64_t collectionId, uint64_t pointId);
     void refreshOverlay(const VolumeToSceneFn& volumeToScene,
                         const SetOverlayGroupFn& setOverlayGroup,
                         const ClearOverlayGroupFn& clearOverlayGroup);
@@ -100,8 +101,11 @@ private:
         std::vector<QPointF> componentScenePath;
         std::vector<cv::Vec3f> componentVolumePath;
         std::vector<cv::Vec3f> sampledVolumePoints;
+        std::vector<cv::Vec3f> mergeQueryVolumePoints;
         std::vector<SameWrapAnnotationMergeBucket> mergeBuckets;
         cv::Vec3f clickVolumePos{0.0f, 0.0f, 0.0f};
+        uint64_t pendingMergeCollectionId = 0;
+        uint64_t pendingMergePointId = 0;
         bool hasPreview = false;
     };
 

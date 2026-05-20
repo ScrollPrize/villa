@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <iterator>
 #include <queue>
 #include <string_view>
 #include <unordered_map>
@@ -63,7 +64,80 @@ std::vector<ColPoint> orderedCollectionPoints(const VCCollection::Collection& co
     return points;
 }
 
+std::vector<cv::Vec3f> orderedCollectionPositions(const VCCollection::Collection& collection)
+{
+    std::vector<ColPoint> points = orderedCollectionPoints(collection);
+    std::vector<cv::Vec3f> positions;
+    positions.reserve(points.size());
+    for (const ColPoint& point : points) {
+        positions.push_back(point.p);
+    }
+    return positions;
+}
+
+float endpointGap(const std::vector<cv::Vec3f>& first, const std::vector<cv::Vec3f>& second)
+{
+    if (first.empty() || second.empty()) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return cv::norm(first.back() - second.front());
+}
+
+std::vector<cv::Vec3f> reversedCopy(std::vector<cv::Vec3f> points)
+{
+    std::reverse(points.begin(), points.end());
+    return points;
+}
+
+std::vector<cv::Vec3f> bestEndpointMergeOrder(const VCCollection::Collection& firstCollection,
+                                              const VCCollection::Collection& secondCollection)
+{
+    const std::vector<cv::Vec3f> firstOrdered = orderedCollectionPositions(firstCollection);
+    const std::vector<cv::Vec3f> secondOrdered = orderedCollectionPositions(secondCollection);
+    if (firstOrdered.empty() || secondOrdered.empty()) {
+        return {};
+    }
+
+    std::vector<cv::Vec3f> bestFirst;
+    std::vector<cv::Vec3f> bestSecond;
+    float bestGap = std::numeric_limits<float>::infinity();
+
+    const std::array<std::vector<cv::Vec3f>, 2> firstVariants = {
+        firstOrdered,
+        reversedCopy(firstOrdered)
+    };
+    const std::array<std::vector<cv::Vec3f>, 2> secondVariants = {
+        secondOrdered,
+        reversedCopy(secondOrdered)
+    };
+
+    for (const std::vector<cv::Vec3f>& first : firstVariants) {
+        for (const std::vector<cv::Vec3f>& second : secondVariants) {
+            const float gap = endpointGap(first, second);
+            if (gap < bestGap) {
+                bestGap = gap;
+                bestFirst = first;
+                bestSecond = second;
+            }
+        }
+    }
+
+    if (bestFirst.empty() || bestSecond.empty()) {
+        return {};
+    }
+    if (bestGap <= 0.5f) {
+        bestSecond.erase(bestSecond.begin());
+    }
+    bestFirst.insert(bestFirst.end(), bestSecond.begin(), bestSecond.end());
+    return bestFirst;
+}
+
 struct PathProjection {
+    float distance = std::numeric_limits<float>::infinity();
+    float arclength = 0.0f;
+};
+
+struct PathComponentProjection {
     float distance = std::numeric_limits<float>::infinity();
     float arclength = 0.0f;
 };
@@ -98,75 +172,35 @@ PathProjection projectPointToPath(const cv::Vec3f& point,
 
 std::vector<float> cumulativePathLength(const std::vector<cv::Vec3f>& path);
 
-float segmentDistanceSquared(const cv::Vec3f& p1,
-                             const cv::Vec3f& q1,
-                             const cv::Vec3f& p2,
-                             const cv::Vec3f& q2)
+PathComponentProjection projectPointToPathComponents(
+    const cv::Vec3f& point,
+    const std::vector<std::vector<cv::Vec3f>>& paths,
+    const std::vector<std::vector<float>>& cumulativeLengths,
+    const std::vector<float>& componentOffsets)
 {
-    const cv::Vec3f d1 = q1 - p1;
-    const cv::Vec3f d2 = q2 - p2;
-    const cv::Vec3f r = p1 - p2;
-    const float a = d1.dot(d1);
-    const float e = d2.dot(d2);
-    const float f = d2.dot(r);
-
-    float s = 0.0f;
-    float t = 0.0f;
-    if (a <= 1e-8f && e <= 1e-8f) {
-        return r.dot(r);
-    }
-    if (a <= 1e-8f) {
-        t = std::clamp(f / e, 0.0f, 1.0f);
-    } else {
-        const float c = d1.dot(r);
-        if (e <= 1e-8f) {
-            s = std::clamp(-c / a, 0.0f, 1.0f);
-        } else {
-            const float b = d1.dot(d2);
-            const float denom = a * e - b * b;
-            if (denom != 0.0f) {
-                s = std::clamp((b * f - c * e) / denom, 0.0f, 1.0f);
-            }
-            t = (b * s + f) / e;
-            if (t < 0.0f) {
-                t = 0.0f;
-                s = std::clamp(-c / a, 0.0f, 1.0f);
-            } else if (t > 1.0f) {
-                t = 1.0f;
-                s = std::clamp((b - c) / a, 0.0f, 1.0f);
-            }
+    PathComponentProjection best;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        const PathProjection projection = projectPointToPath(point, paths[i], cumulativeLengths[i]);
+        if (projection.distance < best.distance) {
+            best.distance = projection.distance;
+            best.arclength = componentOffsets[i] + projection.arclength;
         }
     }
-
-    const cv::Vec3f c1 = p1 + d1 * s;
-    const cv::Vec3f c2 = p2 + d2 * t;
-    const cv::Vec3f delta = c1 - c2;
-    return delta.dot(delta);
+    return best;
 }
 
-bool pathsTouchWithinTolerance(const std::vector<cv::Vec3f>& a,
-                               const std::vector<cv::Vec3f>& b,
-                               float tolerance)
+bool pointsTouchWithinTolerance(const std::vector<cv::Vec3f>& a,
+                                const std::vector<cv::Vec3f>& b,
+                                float tolerance)
 {
     if (a.empty() || b.empty()) {
         return false;
     }
     const float tolerance2 = tolerance * tolerance;
-    if (a.size() == 1 && b.size() == 1) {
-        return cv::norm(a.front() - b.front()) <= tolerance;
-    }
-    if (a.size() == 1) {
-        const std::vector<float> cumulative = cumulativePathLength(b);
-        return projectPointToPath(a.front(), b, cumulative).distance <= tolerance;
-    }
-    if (b.size() == 1) {
-        const std::vector<float> cumulative = cumulativePathLength(a);
-        return projectPointToPath(b.front(), a, cumulative).distance <= tolerance;
-    }
-
-    for (size_t i = 1; i < a.size(); ++i) {
-        for (size_t j = 1; j < b.size(); ++j) {
-            if (segmentDistanceSquared(a[i - 1], a[i], b[j - 1], b[j]) <= tolerance2) {
+    for (const cv::Vec3f& pa : a) {
+        for (const cv::Vec3f& pb : b) {
+            const cv::Vec3f delta = pa - pb;
+            if (delta.dot(delta) <= tolerance2) {
                 return true;
             }
         }
@@ -189,6 +223,29 @@ void appendIfSeparated(std::vector<cv::Vec3f>& points, const cv::Vec3f& point, f
         return;
     }
     points.push_back(point);
+}
+
+std::vector<cv::Vec3f> removeClosePoints(const std::vector<cv::Vec3f>& points, float minSpacing)
+{
+    if (points.size() < 2) {
+        return points;
+    }
+
+    minSpacing = std::max(0.0f, minSpacing);
+    const float minSpacing2 = minSpacing * minSpacing;
+    std::vector<cv::Vec3f> filtered;
+    filtered.reserve(points.size());
+    for (const cv::Vec3f& point : points) {
+        if (filtered.empty()) {
+            filtered.push_back(point);
+            continue;
+        }
+        const cv::Vec3f delta = point - filtered.back();
+        if (delta.dot(delta) >= minSpacing2) {
+            filtered.push_back(point);
+        }
+    }
+    return filtered;
 }
 
 std::string dominantDirectionKey(const std::vector<cv::Vec3f>& path)
@@ -240,19 +297,42 @@ struct ProjectedPoint {
 };
 
 bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
-                                      const std::vector<cv::Vec3f>& volumePath,
+                                      const std::vector<std::vector<cv::Vec3f>>& volumePaths,
                                       float spacingVx,
                                       float mergeTolerance,
                                       std::vector<cv::Vec3f>& sampled,
+                                      const std::vector<cv::Vec3f>& mergeQueryPoints,
                                       std::vector<SameWrapAnnotationMergeBucket>& mergeBuckets,
                                       bool includeKnownMergeCollections = false)
 {
-    if (!pointCollection || volumePath.size() < 2) {
+    if (!pointCollection) {
+        return true;
+    }
+
+    std::vector<std::vector<cv::Vec3f>> mergePaths;
+    mergePaths.reserve(volumePaths.size());
+    for (const std::vector<cv::Vec3f>& path : volumePaths) {
+        if (path.size() >= 2) {
+            mergePaths.push_back(path);
+        }
+    }
+    if (mergePaths.empty()) {
         return true;
     }
 
     std::vector<ProjectedPoint> projectedPoints;
-    const std::vector<float> cumulativeLength = cumulativePathLength(volumePath);
+    std::vector<std::vector<float>> cumulativeLengths;
+    cumulativeLengths.reserve(mergePaths.size());
+    std::vector<float> componentOffsets;
+    componentOffsets.reserve(mergePaths.size());
+    float nextOffset = 0.0f;
+    for (const std::vector<cv::Vec3f>& path : mergePaths) {
+        componentOffsets.push_back(nextOffset);
+        cumulativeLengths.push_back(cumulativePathLength(path));
+        if (!cumulativeLengths.back().empty()) {
+            nextOffset += cumulativeLengths.back().back();
+        }
+    }
     std::unordered_set<uint64_t> seenCollections = bucketCollectionIds(mergeBuckets);
     std::string baseCollectionName;
     if (!mergeBuckets.empty()) {
@@ -281,12 +361,11 @@ bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
 
         std::vector<ProjectedPoint> collectionProjectedPoints;
         collectionProjectedPoints.reserve(orderedPoints.size());
-        bool collectionMatchesPath = pathsTouchWithinTolerance(collectionPath, volumePath, mergeTolerance);
+        bool collectionMatchesPath =
+            pointsTouchWithinTolerance(collectionPath, mergeQueryPoints, mergeTolerance);
         for (const ColPoint& point : orderedPoints) {
-            const PathProjection projection = projectPointToPath(point.p, volumePath, cumulativeLength);
-            if (projection.distance <= mergeTolerance) {
-                collectionMatchesPath = true;
-            }
+            const PathComponentProjection projection =
+                projectPointToPathComponents(point.p, mergePaths, cumulativeLengths, componentOffsets);
             collectionProjectedPoints.push_back({projection.arclength, collectionId, point.id, "", point.p});
         }
 
@@ -317,7 +396,8 @@ bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
 
     const std::string sampledDirectionKey = dominantDirectionKey(sampled);
     for (const cv::Vec3f& point : sampled) {
-        const PathProjection projection = projectPointToPath(point, volumePath, cumulativeLength);
+        const PathComponentProjection projection =
+            projectPointToPathComponents(point, mergePaths, cumulativeLengths, componentOffsets);
         projectedPoints.push_back({projection.arclength, 0, 0, sampledDirectionKey, point});
     }
     if (baseCollectionName.empty()) {
@@ -347,6 +427,24 @@ bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
         appendIfSeparated(bucket.points, projected.point, minMergedSpacing);
     }
     return sampled.size() >= 2;
+}
+
+bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
+                                      const std::vector<cv::Vec3f>& volumePath,
+                                      float spacingVx,
+                                      float mergeTolerance,
+                                      std::vector<cv::Vec3f>& sampled,
+                                      std::vector<SameWrapAnnotationMergeBucket>& mergeBuckets,
+                                      bool includeKnownMergeCollections = false)
+{
+    return mergeExistingSameWrapAnnotations(pointCollection,
+                                            std::vector<std::vector<cv::Vec3f>>{volumePath},
+                                            spacingVx,
+                                            mergeTolerance,
+                                            sampled,
+                                            sampled,
+                                            mergeBuckets,
+                                            includeKnownMergeCollections);
 }
 
 int nearestSkeletonPixel(const cv::Mat& skeleton, int x, int y, int searchRadius)
@@ -466,8 +564,11 @@ void SameWrapAnnotationTool::clear(const ClearOverlayGroupFn& clearOverlayGroup)
     _state.componentScenePath.clear();
     _state.componentVolumePath.clear();
     _state.sampledVolumePoints.clear();
+    _state.mergeQueryVolumePoints.clear();
     _state.mergeBuckets.clear();
     _state.clickVolumePos = {0.0f, 0.0f, 0.0f};
+    _state.pendingMergeCollectionId = 0;
+    _state.pendingMergePointId = 0;
     _state.hasShortestPathSource = false;
     _state.shortestPathSourceScenePos = QPointF();
     _state.shortestPathSourceVolumePos = {0.0f, 0.0f, 0.0f};
@@ -544,6 +645,66 @@ bool SameWrapAnnotationTool::undoLastCommit(VCCollection* pointCollection)
     return false;
 }
 
+bool SameWrapAnnotationTool::manualMergePointClicked(VCCollection* pointCollection,
+                                                     uint64_t collectionId,
+                                                     uint64_t pointId)
+{
+    if (!_state.enabled || !_state.mergeExistingAnnotations || !pointCollection ||
+        collectionId == 0 || pointId == 0) {
+        return false;
+    }
+
+    const auto& collections = pointCollection->getAllCollections();
+    const auto collectionIt = collections.find(collectionId);
+    if (collectionIt == collections.end() ||
+        !isSameWrapCollectionName(collectionIt->second.name) ||
+        collectionIt->second.points.count(pointId) == 0) {
+        _state.pendingMergeCollectionId = 0;
+        _state.pendingMergePointId = 0;
+        return false;
+    }
+
+    if (_state.pendingMergeCollectionId == 0 ||
+        _state.pendingMergePointId == 0 ||
+        _state.pendingMergeCollectionId == collectionId) {
+        _state.pendingMergeCollectionId = collectionId;
+        _state.pendingMergePointId = pointId;
+        return true;
+    }
+
+    const uint64_t firstCollectionId = _state.pendingMergeCollectionId;
+    const uint64_t firstPointId = _state.pendingMergePointId;
+    _state.pendingMergeCollectionId = 0;
+    _state.pendingMergePointId = 0;
+
+    const auto firstIt = collections.find(firstCollectionId);
+    if (firstIt == collections.end() ||
+        !isSameWrapCollectionName(firstIt->second.name) ||
+        firstIt->second.points.count(firstPointId) == 0) {
+        _state.pendingMergeCollectionId = collectionId;
+        _state.pendingMergePointId = pointId;
+        return true;
+    }
+
+    std::vector<cv::Vec3f> mergedPoints =
+        bestEndpointMergeOrder(firstIt->second, collectionIt->second);
+    mergedPoints = removeClosePoints(mergedPoints, _state.spacingVx);
+    if (mergedPoints.size() < 2) {
+        return false;
+    }
+
+    const std::string mergedCollectionName = firstIt->second.name;
+    const std::string directionKey = dominantDirectionKey(mergedPoints);
+    pointCollection->clearCollection(firstCollectionId);
+    pointCollection->clearCollection(collectionId);
+    pointCollection->addPoints(mergedCollectionName, mergedPoints);
+    const uint64_t mergedCollectionId = pointCollection->getCollectionId(mergedCollectionName);
+    if (mergedCollectionId != 0) {
+        pointCollection->setCollectionTag(mergedCollectionId, "same_wrap_direction", directionKey);
+    }
+    return true;
+}
+
 bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
                                              const QPointF& scenePos,
                                              bool appendToPreview,
@@ -561,11 +722,13 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
     std::vector<QPointF> previousScenePath;
     std::vector<cv::Vec3f> previousVolumePath;
     std::vector<cv::Vec3f> previousSampledPoints;
+    std::vector<cv::Vec3f> previousMergeQueryPoints;
     std::vector<SameWrapAnnotationMergeBucket> previousMergeBuckets;
     if (appendToPreview && _state.hasPreview) {
         previousScenePath = _state.componentScenePath;
         previousVolumePath = _state.componentVolumePath;
         previousSampledPoints = _state.sampledVolumePoints;
+        previousMergeQueryPoints = _state.mergeQueryVolumePoints;
         previousMergeBuckets = _state.mergeBuckets;
     } else {
         if (!(_state.pathType == PathType::ShortestPath && _state.hasShortestPathSource)) {
@@ -580,6 +743,7 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
             _state.componentScenePath = std::move(previousScenePath);
             _state.componentVolumePath = std::move(previousVolumePath);
             _state.sampledVolumePoints = std::move(previousSampledPoints);
+            _state.mergeQueryVolumePoints = std::move(previousMergeQueryPoints);
             _state.mergeBuckets = std::move(previousMergeBuckets);
             _state.hasPreview = !_state.sampledVolumePoints.empty();
         }
@@ -678,21 +842,13 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
         if (sampled.size() < 2) {
             return false;
         }
+        const std::vector<cv::Vec3f> mergeQueryPoints = sampled;
 
         std::vector<SameWrapAnnotationMergeBucket> mergeBuckets;
-        if (_state.mergeExistingAnnotations &&
-            !mergeExistingSameWrapAnnotations(pointCollection,
-                                              volumePath,
-                                              _state.spacingVx,
-                                              _state.mergeToleranceVx,
-                                              sampled,
-                                              mergeBuckets)) {
-            return false;
-        }
-
         _state.componentScenePath = std::move(scenePath);
         _state.componentVolumePath = std::move(volumePath);
         _state.sampledVolumePoints = std::move(sampled);
+        _state.mergeQueryVolumePoints = mergeQueryPoints;
         _state.mergeBuckets = std::move(mergeBuckets);
         _state.clickVolumePos = sceneToVolume(snappedScenePos);
         _state.hasPreview = true;
@@ -911,20 +1067,11 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
     if (sampled.size() < 2) {
         return false;
     }
+    const std::vector<cv::Vec3f> mergeQueryPoints = sampled;
 
     std::vector<SameWrapAnnotationMergeBucket> mergeBuckets;
     if (appendToPreview) {
         mergeBuckets = std::move(previousMergeBuckets);
-    }
-
-    if (_state.mergeExistingAnnotations &&
-        !mergeExistingSameWrapAnnotations(pointCollection,
-                                          volumePath,
-                                          _state.spacingVx,
-                                          _state.mergeToleranceVx,
-                                          sampled,
-                                          mergeBuckets)) {
-        return false;
     }
 
     if (appendToPreview && !previousSampledPoints.empty() && !sampled.empty()) {
@@ -950,24 +1097,19 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
         }
 
         previousSampledPoints.insert(previousSampledPoints.end(), sampled.begin(), sampled.end());
-        if (_state.mergeExistingAnnotations &&
-            !mergeExistingSameWrapAnnotations(pointCollection,
-                                              previousVolumePath,
-                                              _state.spacingVx,
-                                              _state.mergeToleranceVx,
-                                              previousSampledPoints,
-                                              mergeBuckets,
-                                              true)) {
-            return false;
-        }
+        previousMergeQueryPoints.insert(previousMergeQueryPoints.end(),
+                                        mergeQueryPoints.begin(),
+                                        mergeQueryPoints.end());
         _state.componentScenePath = std::move(previousScenePath);
         _state.componentVolumePath = std::move(previousVolumePath);
         _state.sampledVolumePoints = std::move(previousSampledPoints);
+        _state.mergeQueryVolumePoints = std::move(previousMergeQueryPoints);
         _state.mergeBuckets = std::move(mergeBuckets);
     } else {
         _state.componentScenePath = std::move(scenePath);
         _state.componentVolumePath = std::move(volumePath);
         _state.sampledVolumePoints = std::move(sampled);
+        _state.mergeQueryVolumePoints = mergeQueryPoints;
         _state.mergeBuckets = std::move(mergeBuckets);
     }
     _state.clickVolumePos = sceneToVolume(QPointF(clickX, clickY));
@@ -1035,23 +1177,15 @@ bool SameWrapAnnotationTool::appendManualPreview(const QPointF& scenePos,
     std::vector<cv::Vec3f> sampled = sampleScenePath(_state.componentScenePath, spacingPx, sceneToVolume);
     if (sampled.size() < 2) {
         _state.sampledVolumePoints.clear();
+        _state.mergeQueryVolumePoints.clear();
         updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
         return true;
     }
+    const std::vector<cv::Vec3f> mergeQueryPoints = sampled;
 
     std::vector<SameWrapAnnotationMergeBucket> mergeBuckets = _state.mergeBuckets;
-    if (_state.mergeExistingAnnotations &&
-        !mergeExistingSameWrapAnnotations(pointCollection,
-                                          _state.componentVolumePath,
-                                          _state.spacingVx,
-                                          _state.mergeToleranceVx,
-                                          sampled,
-                                          mergeBuckets,
-                                          true)) {
-        return false;
-    }
-
     _state.sampledVolumePoints = std::move(sampled);
+    _state.mergeQueryVolumePoints = mergeQueryPoints;
     _state.mergeBuckets = std::move(mergeBuckets);
     _state.shiftReleasedSincePreview = false;
     updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);

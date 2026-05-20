@@ -2371,6 +2371,23 @@ void CWindow::keyPressEvent(QKeyEvent* event)
             }
         }
         if (event->key() == Qt::Key_Z && event->modifiers() == Qt::ControlModifier) {
+            bool clearedPreview = false;
+            _viewerManager->forEachBaseViewer([&clearedPreview](VolumeViewerBase* baseViewer) {
+                if (!baseViewer) {
+                    return;
+                }
+                if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
+                    if (viewer->hasSameWrapAnnotationPreview()) {
+                        viewer->clearSameWrapAnnotationPreview();
+                        clearedPreview = true;
+                    }
+                }
+            });
+            if (clearedPreview) {
+                event->accept();
+                return;
+            }
+
             bool undone = false;
             _viewerManager->forEachBaseViewer([&undone](VolumeViewerBase* baseViewer) {
                 if (undone || !baseViewer) {
