@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 
+class QTimer;
 
 
 
@@ -44,20 +45,24 @@ public:
     void setAnnotateChecked(bool checked);
     bool sameWrapAnnotationEnabled() const;
     double sameWrapAnnotationSpacing() const;
+    double sameWrapAnnotationMergeTolerance() const;
     bool sameWrapAnnotationMergeEnabled() const;
     int sameWrapAnnotationPathType() const;
     int sameWrapAnnotationFilterType() const;
     int sameWrapAnnotationFilterKernelSize() const;
+    double pointViewTolerance() const;
 
 signals:
     void annotateToggled(bool enabled);
     void sameWrapAnnotationToggled(bool enabled);
     void sameWrapAnnotationSpacingChanged(double spacing);
+    void sameWrapAnnotationMergeToleranceChanged(double tolerance);
     void sameWrapAnnotationMergeToggled(bool enabled);
     void sameWrapAnnotationPathTypeChanged(int pathType);
     void sameWrapAnnotationFilterTypeChanged(int filterType);
     void sameWrapAnnotationFilterKernelSizeChanged(int kernelSize);
     void sameWrapAnnotationClearRequested();
+    void pointViewToleranceChanged(double tolerance);
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
@@ -99,10 +104,14 @@ private slots:
     void setupUi();
     void updateMetadataWidgets();
     QStandardItem* findCollectionItem(uint64_t collectionId);
+    void scheduleAutosave();
+    void autosavePointCollection();
 
     VCCollection *_point_collection = nullptr;
     uint64_t _selected_collection_id = 0;
     uint64_t _selected_point_id = 0;
+    QTimer *_autosave_timer{nullptr};
+    bool _suppress_autosave{false};
 
     QCheckBox *_chkAnnotate{nullptr};
     QCheckBox *_chkSameWrapAnnotation{nullptr};
@@ -111,7 +120,9 @@ private slots:
     QComboBox *_sameWrapFilterTypeCombo{nullptr};
     QSpinBox *_sameWrapFilterKernelSpinbox{nullptr};
     QDoubleSpinBox *_sameWrapSpacingSpinbox{nullptr};
+    QDoubleSpinBox *_sameWrapMergeToleranceSpinbox{nullptr};
     QPushButton *_clearSameWrapAnnotationButton{nullptr};
+    QDoubleSpinBox *_pointViewToleranceSpinbox{nullptr};
 
     QTreeView *_tree_view;
     QStandardItemModel *_model;

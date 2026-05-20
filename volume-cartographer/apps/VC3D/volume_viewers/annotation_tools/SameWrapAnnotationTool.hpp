@@ -4,6 +4,7 @@
 #include <QPointF>
 
 #include <functional>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -12,11 +13,19 @@
 class QGraphicsItem;
 class VCCollection;
 
+struct SameWrapAnnotationMergeBucket {
+    std::string directionKey;
+    std::string collectionName;
+    std::vector<cv::Vec3f> points;
+    std::vector<uint64_t> collectionIds;
+};
+
 class SameWrapAnnotationTool {
 public:
     enum class PathType {
         ConnectedComponents = 0,
-        ShortestPath = 1
+        ShortestPath = 1,
+        Manual = 2
     };
 
     enum class ImageFilterType {
@@ -33,9 +42,11 @@ public:
     bool enabled() const { return _state.enabled; }
     bool hasPreview() const { return _state.hasPreview; }
     bool shiftReleasedSincePreview() const { return _state.shiftReleasedSincePreview; }
+    bool manualPathType() const { return _state.pathType == PathType::Manual; }
 
     void setEnabled(bool enabled);
     void setSpacing(double spacingVx);
+    void setMergeTolerance(double toleranceVx);
     void setMergeExistingAnnotations(bool enabled);
     void setPathType(PathType pathType);
     void setImageFilter(ImageFilterType filterType, int kernelSize);
@@ -58,6 +69,20 @@ public:
                          const SetOverlayGroupFn& setOverlayGroup,
                          const ClearOverlayGroupFn& clearOverlayGroup);
 
+    bool beginManualPreview(const QPointF& scenePos,
+                            bool appendToPreview,
+                            const SceneToVolumeFn& sceneToVolume,
+                            const VolumeToSceneFn& volumeToScene,
+                            const SetOverlayGroupFn& setOverlayGroup,
+                            const ClearOverlayGroupFn& clearOverlayGroup);
+    bool appendManualPreview(const QPointF& scenePos,
+                             float viewScale,
+                             const VCCollection* pointCollection,
+                             const SceneToVolumeFn& sceneToVolume,
+                             const VolumeToSceneFn& volumeToScene,
+                             const SetOverlayGroupFn& setOverlayGroup,
+                             const ClearOverlayGroupFn& clearOverlayGroup);
+
 private:
     struct State {
         bool enabled = false;
@@ -66,6 +91,7 @@ private:
         ImageFilterType imageFilterType = ImageFilterType::None;
         int imageFilterKernelSize = 3;
         float spacingVx = 20.0f;
+        float mergeToleranceVx = 1.0f;
         bool shiftReleasedSincePreview = true;
         bool hasShortestPathSource = false;
         QPointF shortestPathSourceScenePos;
@@ -73,8 +99,7 @@ private:
         std::vector<QPointF> componentScenePath;
         std::vector<cv::Vec3f> componentVolumePath;
         std::vector<cv::Vec3f> sampledVolumePoints;
-        std::vector<uint64_t> mergeCollectionIds;
-        std::string mergeCollectionName;
+        std::vector<SameWrapAnnotationMergeBucket> mergeBuckets;
         cv::Vec3f clickVolumePos{0.0f, 0.0f, 0.0f};
         bool hasPreview = false;
     };

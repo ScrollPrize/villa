@@ -25,7 +25,6 @@ constexpr qreal kHighlightPenWidth = 2.5;
 constexpr qreal kSelectedPenWidth = 2.5;
 constexpr qreal kZValue = 95.0;
 constexpr qreal kTextZValue = 96.0;
-constexpr float kFadeThreshold = 10.0f;
 
 QColor toColor(const cv::Vec3f& c, float opacity)
 {
@@ -72,6 +71,16 @@ void PointsOverlayController::setCollection(VCCollection* collection)
     disconnectCollectionSignals();
     _collection = collection;
     connectCollectionSignals();
+    refreshAll();
+}
+
+void PointsOverlayController::setViewTolerance(double tolerance)
+{
+    tolerance = std::clamp(tolerance, 0.0, 10000.0);
+    if (std::abs(_viewTolerance - tolerance) < 0.001) {
+        return;
+    }
+    _viewTolerance = tolerance;
     refreshAll();
 }
 
@@ -142,23 +151,20 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         filter.requireSceneVisibility = true;
         filter.computeScenePoints = true;
         auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
-        filter.volumePredicate = [planeSurface, quadSurface, patchIndex, &entries](const cv::Vec3f&, size_t index) {
+        const float viewTolerance = static_cast<float>(_viewTolerance);
+        filter.volumePredicate = [planeSurface, quadSurface, patchIndex, &entries, viewTolerance](const cv::Vec3f&, size_t index) {
             auto& entry = entries[index];
             float opacity = 1.0f;
             if (planeSurface) {
                 float dist = std::fabs(planeSurface->pointDist(entry.world));
-                if (dist >= kFadeThreshold) {
+                if (dist > viewTolerance) {
                     opacity = 0.0f;
-                } else {
-                    opacity = 1.0f - (dist / kFadeThreshold);
                 }
             } else if (quadSurface) {
                 cv::Vec3f ptr(0, 0, 0);
-                float dist = quadSurface->pointTo(ptr, entry.world, 10.0, 100, patchIndex);
-                if (dist >= kFadeThreshold) {
+                float dist = quadSurface->pointTo(ptr, entry.world, viewTolerance, 100, patchIndex);
+                if (dist < 0.0f || dist > viewTolerance) {
                     opacity = 0.0f;
-                } else if (dist >= 0.0f) {
-                    opacity = 1.0f - (dist / kFadeThreshold);
                 }
             }
             entry.opacity = opacity;

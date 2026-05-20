@@ -15,6 +15,7 @@
 #include <set>
 #include <source_location>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -114,9 +115,9 @@ public:
     void setSegmentationCursorMirroring(bool) override {}
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
-    uint64_t highlightedPointId() const override { return 0; }
-    uint64_t selectedPointId() const override { return 0; }
-    uint64_t selectedCollectionId() const override { return 0; }
+    uint64_t highlightedPointId() const override { return _highlightedPointId; }
+    uint64_t selectedPointId() const override { return _selectedPointId; }
+    uint64_t selectedCollectionId() const override { return _selectedCollectionId; }
     bool isPointDragActive() const override { return false; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
 
@@ -190,10 +191,11 @@ public slots:
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
-    void onCollectionSelected(uint64_t) {}
-    void onPointSelected(uint64_t) {}
+    void onCollectionSelected(uint64_t collectionId);
+    void onPointSelected(uint64_t pointId);
     void setSameWrapAnnotationMode(bool enabled);
     void setSameWrapAnnotationSpacing(double spacingVx);
+    void setSameWrapAnnotationMergeTolerance(double toleranceVx);
     void setSameWrapAnnotationMergeExisting(bool enabled);
     void setSameWrapAnnotationPathType(int pathType);
     void setSameWrapAnnotationFilterType(int filterType);
@@ -270,6 +272,7 @@ private:
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
+    std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     void clearIntersectionItems();
@@ -284,6 +287,9 @@ private:
     VCCollection* _pointCollection = nullptr;
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
+    uint64_t _highlightedPointId = 0;
+    uint64_t _selectedCollectionId = 0;
+    uint64_t _selectedPointId = 0;
     ViewerStatsBar* _statsBar = nullptr;
     QTimer* _renderTimer = nullptr;
     QTimer* _settleRenderTimer = nullptr;

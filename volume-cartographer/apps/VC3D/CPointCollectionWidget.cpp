@@ -1,6 +1,7 @@
 #include "CPointCollectionWidget.hpp"
 
 #include "Keybinds.hpp"
+#include "VCSettings.hpp"
 
 // Qt compat: stateChanged(int) works on all Qt6 versions.
 // Lambda bridges to Qt::CheckState for the slot signature.
@@ -13,12 +14,17 @@
 #include <vector>
 #include <algorithm>
 #include <QColorDialog>
+#include <QDebug>
+#include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QKeyEvent>
 #include <QMessageBox>
 #include <QLabel>
 #include <QMenu>
+#include <QSettings>
 #include <QSignalBlocker>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
@@ -28,6 +34,36 @@
 #include "vc/ui/VCCollection.hpp"
 
 namespace {
+enum PointCollectionColumn {
+    kNameColumn = 0,
+    kCountColumn = 1,
+    kDirectionColumn = 2,
+    kWindingColumn = 3,
+    kErrorColumn = 4,
+    kPositionColumn = 5
+};
+
+QString sameWrapDirectionText(const VCCollection::Collection& collection)
+{
+    const auto it = collection.tags.find("same_wrap_direction");
+    if (it == collection.tags.end()) {
+        return {};
+    }
+    return QString::fromStdString(it->second);
+}
+
+QStandardItem* readOnlyItem(const QString& text = {})
+{
+    QStandardItem* item = new QStandardItem(text);
+    item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+    return item;
+}
+
+QString pointPositionText(const cv::Vec3f& point)
+{
+    return QString("{%1, %2, %3}").arg(point[0]).arg(point[1]).arg(point[2]);
+}
+
 // Check if a corr result's stored position matches the current point position.
 // Returns true if the positions match within 0.1 voxel per axis.
 bool corrResultPositionMatches(const CorrPointResult& r, const cv::Vec3f& currentPos)
@@ -37,6 +73,19 @@ bool corrResultPositionMatches(const CorrPointResult& r, const cv::Vec3f& curren
            std::abs(r.p[0] - currentPos[0]) < kTol &&
            std::abs(r.p[1] - currentPos[1]) < kTol &&
            std::abs(r.p[2] - currentPos[2]) < kTol;
+}
+
+QString pointCollectionAutosavePath()
+{
+    const QFileInfo settingsFile(vc3d::settingsFilePath());
+    QDir settingsDir(settingsFile.absoluteDir());
+    if (!settingsDir.exists(QStringLiteral("autosaves")) &&
+        !settingsDir.mkpath(QStringLiteral("autosaves"))) {
+        qWarning() << "Failed to create point collection autosave directory under"
+                   << settingsDir.absolutePath();
+        return {};
+    }
+    return settingsDir.filePath(QStringLiteral("autosaves/point_collection_autosave.json"));
 }
 } // namespace
 
@@ -49,6 +98,11 @@ CPointCollectionWidget::CPointCollectionWidget(VCCollection *collection, QWidget
     }
 
     setupUi();
+
+    _autosave_timer = new QTimer(this);
+    _autosave_timer->setSingleShot(true);
+    _autosave_timer->setInterval(750);
+    connect(_autosave_timer, &QTimer::timeout, this, &CPointCollectionWidget::autosavePointCollection);
 
     connect(_point_collection, &VCCollection::collectionsAdded, this, &CPointCollectionWidget::onCollectionsAdded);
     connect(_point_collection, &VCCollection::collectionChanged, this, &CPointCollectionWidget::onCollectionChanged);
@@ -71,10 +125,38 @@ void CPointCollectionWidget::setupUi()
     layout->addWidget(_chkAnnotate);
     connect(_chkAnnotate, &QCheckBox::toggled, this, &CPointCollectionWidget::annotateToggled);
 
+    QGroupBox *view_group = new QGroupBox("Display", main_widget);
+    QHBoxLayout *view_layout = new QHBoxLayout(view_group);
+    view_layout->addWidget(new QLabel("Tolerance:"));
+    _pointViewToleranceSpinbox = new QDoubleSpinBox(view_group);
+    _pointViewToleranceSpinbox->setRange(0.0, 10000.0);
+    _pointViewToleranceSpinbox->setDecimals(1);
+    _pointViewToleranceSpinbox->setSingleStep(1.0);
+    _pointViewToleranceSpinbox->setSuffix(" vx");
+    _pointViewToleranceSpinbox->setMaximumWidth(100);
+    _pointViewToleranceSpinbox->setToolTip("Maximum distance from the current plane or surface for point collection markers to be shown.");
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _pointViewToleranceSpinbox->setValue(settings.value(
+            vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE,
+            vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT).toDouble());
+    }
+    view_layout->addWidget(_pointViewToleranceSpinbox);
+    view_layout->addStretch();
+    layout->addWidget(view_group);
+    connect(_pointViewToleranceSpinbox,
+            QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this,
+            [this](double value) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE, value);
+                emit pointViewToleranceChanged(value);
+            });
+
     QGroupBox *same_wrap_group = new QGroupBox("Same-wrap Annotation");
     QVBoxLayout *same_wrap_layout = new QVBoxLayout(same_wrap_group);
     _chkSameWrapAnnotation = new QCheckBox("Same-wrap annotation mode", same_wrap_group);
-    _chkSameWrapAnnotation->setToolTip("Shift-click in an active volume viewer to preview points along one skeleton component. Shift+E commits; Ctrl+Z clears.");
+    _chkSameWrapAnnotation->setToolTip("Shift-click or Shift-drag in an active volume viewer to preview same-wrap annotation points. Shift+E commits; Ctrl+Z clears.");
     same_wrap_layout->addWidget(_chkSameWrapAnnotation);
     _chkSameWrapMerge = new QCheckBox("Merge same-wrap annotations", same_wrap_group);
     _chkSameWrapMerge->setToolTip("Preview and commit matching existing same-wrap annotations as one ordered point set.");
@@ -84,7 +166,8 @@ void CPointCollectionWidget::setupUi()
     _sameWrapPathTypeCombo = new QComboBox(same_wrap_group);
     _sameWrapPathTypeCombo->addItem("Connected components", 0);
     _sameWrapPathTypeCombo->addItem("Shortest path", 1);
-    _sameWrapPathTypeCombo->setToolTip("Choose whether shift-click selects a skeleton component or two endpoints for a shortest path.");
+    _sameWrapPathTypeCombo->addItem("Manual", 2);
+    _sameWrapPathTypeCombo->setToolTip("Choose whether Shift input selects a skeleton component, two shortest-path endpoints, or a manually drawn path.");
     same_wrap_path_type_layout->addWidget(_sameWrapPathTypeCombo);
     same_wrap_path_type_layout->addStretch();
     same_wrap_layout->addLayout(same_wrap_path_type_layout);
@@ -119,6 +202,16 @@ void CPointCollectionWidget::setupUi()
     _sameWrapSpacingSpinbox->setMaximumWidth(90);
     _sameWrapSpacingSpinbox->setToolTip("Distance between generated same-wrap annotation points in surface voxels.");
     same_wrap_spacing_layout->addWidget(_sameWrapSpacingSpinbox);
+    same_wrap_spacing_layout->addWidget(new QLabel("Merge tol.:"));
+    _sameWrapMergeToleranceSpinbox = new QDoubleSpinBox(same_wrap_group);
+    _sameWrapMergeToleranceSpinbox->setRange(0.0, 1000.0);
+    _sameWrapMergeToleranceSpinbox->setDecimals(2);
+    _sameWrapMergeToleranceSpinbox->setSingleStep(0.25);
+    _sameWrapMergeToleranceSpinbox->setValue(1.0);
+    _sameWrapMergeToleranceSpinbox->setSuffix(" vx");
+    _sameWrapMergeToleranceSpinbox->setMaximumWidth(90);
+    _sameWrapMergeToleranceSpinbox->setToolTip("Maximum distance for merging same-wrap annotation paths.");
+    same_wrap_spacing_layout->addWidget(_sameWrapMergeToleranceSpinbox);
     same_wrap_spacing_layout->addStretch();
     same_wrap_layout->addLayout(same_wrap_spacing_layout);
     _clearSameWrapAnnotationButton = new QPushButton("Clear Same-wrap Preview", same_wrap_group);
@@ -144,6 +237,8 @@ void CPointCollectionWidget::setupUi()
     });
     connect(_sameWrapSpacingSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged);
+    connect(_sameWrapMergeToleranceSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, &CPointCollectionWidget::sameWrapAnnotationMergeToleranceChanged);
     connect(_clearSameWrapAnnotationButton, &QPushButton::clicked, this, &CPointCollectionWidget::sameWrapAnnotationClearRequested);
 
     _tree_view = new QTreeView(main_widget);
@@ -291,7 +386,7 @@ void CPointCollectionWidget::refreshTree()
         }
 
         _model->clear();
-        _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
+        _model->setHorizontalHeaderLabels({"Name", "Points", "Direction", "Winding", "Error", "Position"});
         _model->blockSignals(false);
     }
 
@@ -319,24 +414,20 @@ void CPointCollectionWidget::refreshTree()
         name_item->setData(QVariant::fromValue(collection.id));
         name_item->setFlags(name_item->flags() & ~Qt::ItemIsEditable);
 
-        QStandardItem *count_item = new QStandardItem(QString::number(collection.points.size()));
-        count_item->setFlags(count_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *count_item = readOnlyItem(QString::number(collection.points.size()));
+        QStandardItem *direction_item = readOnlyItem(sameWrapDirectionText(collection));
 
         // Collection-level winding average
-        QStandardItem *col_winding_item = new QStandardItem();
-        col_winding_item->setFlags(col_winding_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *col_winding_item = readOnlyItem();
         auto col_avg_it = _corr_collection_avgs.find(collection.id);
         if (col_avg_it != _corr_collection_avgs.end()) {
             col_winding_item->setText(QString::number(col_avg_it->second, 'f', 3));
         }
 
-        QStandardItem *col_err_item = new QStandardItem();
-        col_err_item->setFlags(col_err_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *col_err_item = readOnlyItem();
+        QStandardItem *col_pos_item = readOnlyItem();
 
-        QStandardItem *col_pos_item = new QStandardItem();
-        col_pos_item->setFlags(col_pos_item->flags() & ~Qt::ItemIsEditable);
-
-        _model->appendRow({name_item, count_item, col_winding_item, col_err_item, col_pos_item});
+        _model->appendRow({name_item, count_item, direction_item, col_winding_item, col_err_item, col_pos_item});
 
         // Get points and sort them by ID
         std::vector<ColPoint> sorted_points;
@@ -355,16 +446,13 @@ void CPointCollectionWidget::refreshTree()
             id_item->setData(QVariant::fromValue(point.id));
             id_item->setFlags(id_item->flags() & ~Qt::ItemIsEditable);
 
-            QStandardItem *empty_item = new QStandardItem();
-            empty_item->setFlags(empty_item->flags() & ~Qt::ItemIsEditable);
+            QStandardItem *empty_item = readOnlyItem();
+            QStandardItem *direction_item = readOnlyItem(sameWrapDirectionText(collection));
 
-            QStandardItem *pt_winding_item = new QStandardItem();
-            pt_winding_item->setFlags(pt_winding_item->flags() & ~Qt::ItemIsEditable);
-            QStandardItem *pt_err_item = new QStandardItem();
-            pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
+            QStandardItem *pt_winding_item = readOnlyItem();
+            QStandardItem *pt_err_item = readOnlyItem();
 
-            QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
-            pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
+            QStandardItem *pos_item = readOnlyItem(pointPositionText(point.p));
 
             auto res_it = _corr_point_results.find(point.id);
             if (res_it != _corr_point_results.end()) {
@@ -378,7 +466,7 @@ void CPointCollectionWidget::refreshTree()
                 }
             }
 
-            name_item->appendRow({id_item, empty_item, pt_winding_item, pt_err_item, pos_item});
+            name_item->appendRow({id_item, empty_item, direction_item, pt_winding_item, pt_err_item, pos_item});
         }
     }
 
@@ -393,6 +481,30 @@ void CPointCollectionWidget::onResetClicked()
     }
 }
 
+void CPointCollectionWidget::scheduleAutosave()
+{
+    if (_suppress_autosave || !_point_collection || !_autosave_timer) {
+        return;
+    }
+    _autosave_timer->start();
+}
+
+void CPointCollectionWidget::autosavePointCollection()
+{
+    if (_suppress_autosave || !_point_collection) {
+        return;
+    }
+
+    const QString filePath = pointCollectionAutosavePath();
+    if (filePath.isEmpty()) {
+        return;
+    }
+
+    if (!_point_collection->saveToJSON(filePath.toStdString())) {
+        qWarning() << "Failed to autosave point collection to" << filePath;
+    }
+}
+
 void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)
 {
     for (uint64_t collectionId : collectionIds) {
@@ -403,28 +515,26 @@ void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& col
         name_item->setData(QVariant::fromValue(collection.id));
         name_item->setFlags(name_item->flags() & ~Qt::ItemIsEditable);
 
-        QStandardItem *count_item = new QStandardItem(QString::number(collection.points.size()));
-        count_item->setFlags(count_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *count_item = readOnlyItem(QString::number(collection.points.size()));
+        QStandardItem *direction_item = readOnlyItem(sameWrapDirectionText(collection));
 
-        QStandardItem *col_winding_item = new QStandardItem();
-        col_winding_item->setFlags(col_winding_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *col_winding_item = readOnlyItem();
         auto col_avg_it = _corr_collection_avgs.find(collectionId);
         if (col_avg_it != _corr_collection_avgs.end()) {
             col_winding_item->setText(QString::number(col_avg_it->second, 'f', 3));
         }
 
-        QStandardItem *col_err_item = new QStandardItem();
-        col_err_item->setFlags(col_err_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *col_err_item = readOnlyItem();
 
-        QStandardItem *col_pos_item = new QStandardItem();
-        col_pos_item->setFlags(col_pos_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *col_pos_item = readOnlyItem();
 
-        _model->appendRow({name_item, count_item, col_winding_item, col_err_item, col_pos_item});
+        _model->appendRow({name_item, count_item, direction_item, col_winding_item, col_err_item, col_pos_item});
 
         for(const auto& point_pair : collection.points) {
             onPointAdded(point_pair.second);
         }
     }
+    scheduleAutosave();
 }
 
 void CPointCollectionWidget::onCollectionChanged(uint64_t collectionId)
@@ -437,11 +547,23 @@ void CPointCollectionWidget::onCollectionChanged(uint64_t collectionId)
         }
         QColor color(collection.color[0] * 255, collection.color[1] * 255, collection.color[2] * 255);
         item->setData(QBrush(color), Qt::DecorationRole);
+        const QString direction = sameWrapDirectionText(collection);
+        QStandardItem* direction_item = _model->item(item->row(), kDirectionColumn);
+        if (direction_item) {
+            direction_item->setText(direction);
+        }
+        for (int row = 0; row < item->rowCount(); ++row) {
+            QStandardItem* point_direction_item = item->child(row, kDirectionColumn);
+            if (point_direction_item) {
+                point_direction_item->setText(direction);
+            }
+        }
         // Also update metadata display if it's the selected collection
         if (collectionId == _selected_collection_id) {
             updateMetadataWidgets();
         }
     }
+    scheduleAutosave();
 }
 
 void CPointCollectionWidget::onCollectionRemoved(uint64_t collectionId)
@@ -452,7 +574,7 @@ void CPointCollectionWidget::onCollectionRemoved(uint64_t collectionId)
             _model->blockSignals(true);
             _model->removeRows(0, _model->rowCount());
             _model->clear();
-            _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
+            _model->setHorizontalHeaderLabels({"Name", "Points", "Direction", "Winding", "Error", "Position"});
             _model->blockSignals(false);
         }
         return;
@@ -472,16 +594,20 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
         id_item->setData(QVariant::fromValue(point.id));
         id_item->setFlags(id_item->flags() & ~Qt::ItemIsEditable);
 
-        QStandardItem *empty_item = new QStandardItem();
-        empty_item->setFlags(empty_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *empty_item = readOnlyItem();
 
-        QStandardItem *pt_winding_item = new QStandardItem();
-        pt_winding_item->setFlags(pt_winding_item->flags() & ~Qt::ItemIsEditable);
-        QStandardItem *pt_err_item = new QStandardItem();
-        pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
+        QString direction;
+        const auto& collections = _point_collection->getAllCollections();
+        auto collection_it = collections.find(point.collectionId);
+        if (collection_it != collections.end()) {
+            direction = sameWrapDirectionText(collection_it->second);
+        }
+        QStandardItem *direction_item = readOnlyItem(direction);
 
-        QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
-        pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *pt_winding_item = readOnlyItem();
+        QStandardItem *pt_err_item = readOnlyItem();
+
+        QStandardItem *pos_item = readOnlyItem(pointPositionText(point.p));
 
         auto res_it = _corr_point_results.find(point.id);
         if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
@@ -493,14 +619,15 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
             }
         }
 
-        collection_item->appendRow({id_item, empty_item, pt_winding_item, pt_err_item, pos_item});
+        collection_item->appendRow({id_item, empty_item, direction_item, pt_winding_item, pt_err_item, pos_item});
 
         // Update count
-        QStandardItem* count_item = _model->item(collection_item->row(), 1);
+        QStandardItem* count_item = _model->item(collection_item->row(), kCountColumn);
         if(count_item) {
             count_item->setText(QString::number(collection_item->rowCount()));
         }
     }
+    scheduleAutosave();
 }
 
 void CPointCollectionWidget::onPointChanged(const ColPoint& point)
@@ -510,18 +637,16 @@ void CPointCollectionWidget::onPointChanged(const ColPoint& point)
         QStandardItem *collection_item = _model->item(i);
         if (!collection_item) continue;
         for (int j = 0; j < collection_item->rowCount(); ++j) {
-            QStandardItem *point_item = collection_item->child(j, 0);
+            QStandardItem *point_item = collection_item->child(j, kNameColumn);
             if (!point_item || point_item->data().toULongLong() != point.id) continue;
 
-            // Update position text (column 4)
-            QStandardItem *pos_item = collection_item->child(j, 4);
+            QStandardItem *pos_item = collection_item->child(j, kPositionColumn);
             if (pos_item) {
-                pos_item->setText(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
+                pos_item->setText(pointPositionText(point.p));
             }
 
-            // Re-evaluate winding/error display (columns 2-3)
-            QStandardItem *winding_item = collection_item->child(j, 2);
-            QStandardItem *err_item = collection_item->child(j, 3);
+            QStandardItem *winding_item = collection_item->child(j, kWindingColumn);
+            QStandardItem *err_item = collection_item->child(j, kErrorColumn);
             if (winding_item) winding_item->setText({});
             if (err_item) err_item->setText({});
 
@@ -542,6 +667,7 @@ void CPointCollectionWidget::onPointChanged(const ColPoint& point)
     if (point.id == _selected_point_id) {
         updateMetadataWidgets();
     }
+    scheduleAutosave();
 }
 
 void CPointCollectionWidget::onPointRemoved(uint64_t pointId)
@@ -555,7 +681,7 @@ void CPointCollectionWidget::onPointRemoved(uint64_t pointId)
                 if (point_item && point_item->data().toULongLong() == pointId) {
                     collection_item->removeRow(j);
                     // Update count
-                    QStandardItem* count_item = _model->item(collection_item->row(), 1);
+                    QStandardItem* count_item = _model->item(collection_item->row(), kCountColumn);
                     if(count_item) {
                         count_item->setText(QString::number(collection_item->rowCount()));
                     }
@@ -833,10 +959,13 @@ void CPointCollectionWidget::onLoadClicked()
  
     if (_point_collection) {
        try {
+           _suppress_autosave = true;
            if (_point_collection->loadFromJSON(fileName.toStdString())) {
                refreshTree();
            }
+           _suppress_autosave = false;
        } catch (const std::exception& e) {
+           _suppress_autosave = false;
            QMessageBox::critical(this, "Error Loading File", e.what());
        }
     }
@@ -1012,6 +1141,11 @@ double CPointCollectionWidget::sameWrapAnnotationSpacing() const
     return _sameWrapSpacingSpinbox ? _sameWrapSpacingSpinbox->value() : 20.0;
 }
 
+double CPointCollectionWidget::sameWrapAnnotationMergeTolerance() const
+{
+    return _sameWrapMergeToleranceSpinbox ? _sameWrapMergeToleranceSpinbox->value() : 1.0;
+}
+
 bool CPointCollectionWidget::sameWrapAnnotationMergeEnabled() const
 {
     return _chkSameWrapMerge && _chkSameWrapMerge->isChecked();
@@ -1031,6 +1165,13 @@ int CPointCollectionWidget::sameWrapAnnotationFilterKernelSize() const
 {
     const int kernelSize = _sameWrapFilterKernelSpinbox ? _sameWrapFilterKernelSpinbox->value() : 3;
     return std::max(3, kernelSize | 1);
+}
+
+double CPointCollectionWidget::pointViewTolerance() const
+{
+    return _pointViewToleranceSpinbox
+        ? _pointViewToleranceSpinbox->value()
+        : vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT;
 }
 
 CPointCollectionWidget::~CPointCollectionWidget() {

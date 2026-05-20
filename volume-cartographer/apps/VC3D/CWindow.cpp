@@ -922,6 +922,8 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged,
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationMergeToleranceChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationMergeToggled,
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationPathTypeChanged,
@@ -933,6 +935,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
         connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationClearRequested,
                 viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
         viewer->setSameWrapAnnotationSpacing(_point_collection_widget->sameWrapAnnotationSpacing());
+        viewer->setSameWrapAnnotationMergeTolerance(_point_collection_widget->sameWrapAnnotationMergeTolerance());
         viewer->setSameWrapAnnotationMergeExisting(_point_collection_widget->sameWrapAnnotationMergeEnabled());
         viewer->setSameWrapAnnotationPathType(_point_collection_widget->sameWrapAnnotationPathType());
         viewer->setSameWrapAnnotationFilterKernelSize(_point_collection_widget->sameWrapAnnotationFilterKernelSize());
@@ -1906,6 +1909,11 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    if (_pointsOverlay) {
+        _pointsOverlay->setViewTolerance(_point_collection_widget->pointViewTolerance());
+        connect(_point_collection_widget, &CPointCollectionWidget::pointViewToleranceChanged,
+                _pointsOverlay.get(), &PointsOverlayController::setViewTolerance);
+    }
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, and Point Collections together
     // Wire annotate mode & annotation selection: dock widget <-> segmentation module
