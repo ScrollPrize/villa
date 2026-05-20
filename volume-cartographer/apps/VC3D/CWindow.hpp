@@ -178,7 +178,7 @@ private slots:
 private:
     CState* _state;
 
-    QComboBox* volSelect;
+    QComboBox* volSelect{nullptr};
     QComboBox* cmbSegmentationDir;
 
 

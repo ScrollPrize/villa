@@ -195,6 +195,7 @@ private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surface);
 
 private:
+    void schedulePlaneIntersectionRefresh();
     void buildRadiusOverlay(const State& state,
                             VolumeViewerBase* viewer,
                             ViewerOverlayControllerBase::OverlayBuilder& builder) const;

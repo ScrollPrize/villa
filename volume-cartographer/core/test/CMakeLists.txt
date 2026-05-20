@@ -12,6 +12,8 @@ if(NOT TARGET doctest::doctest)
     FetchContent_MakeAvailable(doctest)
 endif()
 
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Test)
+
 add_executable(test_smoke test_smoke.cpp)
 target_link_libraries(test_smoke PRIVATE doctest::doctest)
 add_test(NAME test_smoke COMMAND test_smoke)
@@ -32,6 +34,11 @@ add_executable(test_segmentation_autosave_state test_segmentation_autosave_state
 target_include_directories(test_segmentation_autosave_state PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_segmentation_autosave_state PRIVATE doctest::doctest)
 add_test(NAME test_segmentation_autosave_state COMMAND test_segmentation_autosave_state)
+
+add_executable(test_segmentation_intersection_invalidation test_segmentation_intersection_invalidation.cpp)
+target_include_directories(test_segmentation_intersection_invalidation PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_segmentation_intersection_invalidation PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core)
+add_test(NAME test_segmentation_intersection_invalidation COMMAND test_segmentation_intersection_invalidation)
 
 add_executable(test_quadsurface_save_roundtrip test_quadsurface_save_roundtrip.cpp)
 target_link_libraries(test_quadsurface_save_roundtrip PRIVATE doctest::doctest vc_core)
@@ -83,6 +90,16 @@ target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 # it's always built and runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
+endif()
+
+add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
+target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
+# Perf guard for the slice sampler hot path. Like bench_volume_sample it
+# carries only a loose wall-clock assertion, so it stays out of default
+# ctest unless the user opts in via VC_RUN_BENCHES; the target is always
+# built and runnable manually.
+if(VC_RUN_BENCHES)
+    add_test(NAME bench_chunked_plane_sampler COMMAND bench_chunked_plane_sampler)
 endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
@@ -258,6 +275,53 @@ add_test(NAME test_quadsurface_snapshot COMMAND test_quadsurface_snapshot)
 add_executable(test_quadsurface_save_paths test_quadsurface_save_paths.cpp)
 target_link_libraries(test_quadsurface_save_paths PRIVATE doctest::doctest vc_core)
 add_test(NAME test_quadsurface_save_paths COMMAND test_quadsurface_save_paths)
+
+add_executable(test_segmentation test_segmentation.cpp)
+target_link_libraries(test_segmentation PRIVATE doctest::doctest vc_core)
+add_test(NAME test_segmentation COMMAND test_segmentation)
+
+add_executable(test_chunked_tensor_meta test_chunked_tensor_meta.cpp)
+target_link_libraries(test_chunked_tensor_meta PRIVATE doctest::doctest vc_tracer)
+add_test(NAME test_chunked_tensor_meta COMMAND test_chunked_tensor_meta)
+
+add_executable(test_post_process_util test_post_process_util.cpp)
+target_link_libraries(test_post_process_util PRIVATE doctest::doctest vc_core)
+add_test(NAME test_post_process_util COMMAND test_post_process_util)
+
+add_executable(test_render test_render.cpp)
+target_link_libraries(test_render PRIVATE doctest::doctest vc_core)
+add_test(NAME test_render COMMAND test_render)
+
+add_executable(test_growth_config test_growth_config.cpp)
+target_include_directories(test_growth_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_growth_config PRIVATE doctest::doctest vc_tracer)
+add_test(NAME test_growth_config COMMAND test_growth_config)
+
+add_executable(test_growth_helpers test_growth_helpers.cpp)
+target_include_directories(test_growth_helpers PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_growth_helpers PRIVATE doctest::doctest vc_tracer)
+add_test(NAME test_growth_helpers COMMAND test_growth_helpers)
+
+add_executable(test_surf_tracker_data test_surf_tracker_data.cpp)
+target_include_directories(test_surf_tracker_data PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_surf_tracker_data PRIVATE doctest::doctest vc_tracer)
+add_test(NAME test_surf_tracker_data COMMAND test_surf_tracker_data)
+
+add_executable(test_sparse_chunk_spool test_sparse_chunk_spool.cpp)
+target_link_libraries(test_sparse_chunk_spool PRIVATE doctest::doctest vc_core)
+add_test(NAME test_sparse_chunk_spool COMMAND test_sparse_chunk_spool)
+
+add_executable(test_neural_tracer_connection test_neural_tracer_connection.cpp)
+target_link_libraries(test_neural_tracer_connection PRIVATE doctest::doctest vc_tracer)
+add_test(NAME test_neural_tracer_connection COMMAND test_neural_tracer_connection)
+
+add_executable(test_quadsurface_final test_quadsurface_final.cpp)
+target_link_libraries(test_quadsurface_final PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_final COMMAND test_quadsurface_final)
+
+add_executable(test_quadsurface_components test_quadsurface_components.cpp)
+target_link_libraries(test_quadsurface_components PRIVATE doctest::doctest vc_core)
+add_test(NAME test_quadsurface_components COMMAND test_quadsurface_components)
 
 add_executable(test_volume_local test_volume_local.cpp)
 target_link_libraries(test_volume_local PRIVATE doctest::doctest vc_core)

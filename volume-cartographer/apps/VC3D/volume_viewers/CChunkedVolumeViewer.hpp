@@ -23,6 +23,7 @@
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
+#include "annotation_tools/SameWrapAnnotationTool.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
@@ -132,6 +133,9 @@ public:
     void renderIntersections(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
+    void scheduleIntersectionRender(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) override;
     void invalidateIntersect(const std::string& = "") override;
     void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells) override;
     float intersectionOpacity() const override { return _intersectionOpacity; }
@@ -183,11 +187,19 @@ public slots:
     void onMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void onMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
-    void onKeyRelease(int, Qt::KeyboardModifiers) {}
+    void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onCollectionSelected(uint64_t) {}
     void onPointSelected(uint64_t) {}
+    void setSameWrapAnnotationMode(bool enabled);
+    void setSameWrapAnnotationSpacing(double spacingVx);
+    void setSameWrapAnnotationMergeExisting(bool enabled);
+    void setSameWrapAnnotationPathType(int pathType);
+    void setSameWrapAnnotationFilterType(int filterType);
+    void setSameWrapAnnotationFilterKernelSize(int kernelSize);
+    void clearSameWrapAnnotationPreview();
+    bool commitSameWrapAnnotationPreview();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
@@ -213,9 +225,6 @@ signals:
 
 private:
     void scheduleRender(
-        const char* reason = "internal caller",
-        std::source_location caller = std::source_location::current());
-    void scheduleIntersectionRender(
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
     void quiesceForClose();
@@ -262,6 +271,7 @@ private:
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
+    void refreshSameWrapAnnotationOverlay();
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
@@ -450,6 +460,8 @@ private:
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
     QGraphicsItem* _focusMarker = nullptr;
+
+    SameWrapAnnotationTool _sameWrapAnnotation;
 
     bool _bboxMode = false;
     QPointF _bboxStart;

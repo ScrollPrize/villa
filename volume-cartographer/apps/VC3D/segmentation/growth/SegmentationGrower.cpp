@@ -1509,6 +1509,19 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             request.customParams = std::move(customParams);
         }
     }
+    if (method == SegmentationGrowthMethod::Tracer || method == SegmentationGrowthMethod::Corrections) {
+        if (request.customParams.is_null()) {
+            request.customParams = utils::Json::object();
+        }
+        const int growthScale = std::clamp(_context.widget->growthScale(), 0, 5);
+        if (!request.customParams.contains("growth_scale")) {
+            request.customParams["growth_scale"] = growthScale;
+        }
+        if (!request.customParams.contains("normal_grid_level") &&
+            !request.customParams.contains("normal_grid_scale")) {
+            request.customParams["normal_grid_level"] = growthScale;
+        }
+    }
     const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
     const bool denseMode = neuralTracerEnabled &&

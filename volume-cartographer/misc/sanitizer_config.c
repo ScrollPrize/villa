@@ -54,6 +54,27 @@ const char* __nsan_default_options(void)
            "print_stacktrace=1";
 }
 
+// QtTest's internal watchdog thread is never joined before exit (leak is
+// entirely inside libQt6Core). The system libtbb is not built with tsan
+// instrumentation, so its internal acquire/release fences are invisible and
+// any worker-vs-main handoff in the task scheduler is flagged as a data race
+// even though TBB's atomics make it safe; OpenCV uses TBB internally (cv::LUT,
+// connected-components, parallel_for), so the racing frames land in
+// libopencv_* with libtbb only on the thread-creation stack — hence
+// called_from_lib:libtbb is what actually matches.
+const char* __tsan_default_suppressions(void)
+{
+    return
+        "called_from_lib:libQt6Core.so.6\n"
+        "called_from_lib:libtbb\n"
+        "race:libtbb.so\n"
+        "race:libtbbmalloc.so\n"
+        "race:tbb::detail::\n"
+        "race:tbb::interface\n"
+        "race:libopencv_core.so\n"
+        "race:libopencv_imgproc.so\n";
+}
+
 const char* __lsan_default_suppressions(void)
 {
     return

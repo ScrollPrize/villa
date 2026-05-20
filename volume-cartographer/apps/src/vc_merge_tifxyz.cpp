@@ -1263,6 +1263,13 @@ gmEdtBlend(const std::vector<std::string>& names,
         const Mat1f& ur = uv.at(tgt).ur;
         const int Hm = s.H, Wm = s.W;
         const int Ntot = Hm * Wm;
+        const auto overlap_it = real_overlap_native.find(tgt);
+        const Mat1b* blend_mask =
+            (overlap_it != real_overlap_native.end() &&
+             !overlap_it->second.empty() &&
+             overlap_it->second.size() == s.mask.size())
+                ? &overlap_it->second
+                : nullptr;
         cv::Mat q(Ntot, 2, CV_32F);
         for (int r = 0; r < Hm; ++r) {
             const float* uu = uc.ptr<float>(r);
@@ -1361,26 +1368,51 @@ gmEdtBlend(const std::vector<std::string>& names,
         }
         GMBlend bo;
         bo.X.create(Hm, Wm); bo.Y.create(Hm, Wm); bo.Z.create(Hm, Wm);
+        int n_blended = 0, n_preserved_private = 0, n_overlap_no_weight = 0;
         for (int r = 0; r < Hm; ++r) {
             const uint8_t* mp = s.mask.ptr<uint8_t>(r);
+            const uint8_t* bm = blend_mask ? blend_mask->ptr<uint8_t>(r) : nullptr;
             const float* uu = uc.ptr<float>(r);
             const float* vv = ur.ptr<float>(r);
+            const float* xp_old = s.x.ptr<float>(r);
+            const float* yp_old = s.y.ptr<float>(r);
+            const float* zp_old = s.z.ptr<float>(r);
             float* xp = bo.X.ptr<float>(r);
             float* yp = bo.Y.ptr<float>(r);
             float* zp = bo.Z.ptr<float>(r);
             for (int c = 0; c < Wm; ++c) {
                 const int i = r*Wm + c;
                 const bool ok = mp[c] && std::isfinite(uu[c]) && std::isfinite(vv[c]);
-                const double* bp = blended.ptr<double>(i);
-                xp[c] = ok ? (float)bp[0] : -1.0f;
-                yp[c] = ok ? (float)bp[1] : -1.0f;
-                zp[c] = ok ? (float)bp[2] : -1.0f;
+                if (!ok) {
+                    xp[c] = yp[c] = zp[c] = -1.0f;
+                    continue;
+                }
+                const bool should_blend = bm && bm[c] != 0;
+                if (should_blend && wsum[i] > 1e-6) {
+                    const double* bp = blended.ptr<double>(i);
+                    xp[c] = (float)bp[0];
+                    yp[c] = (float)bp[1];
+                    zp[c] = (float)bp[2];
+                    ++n_blended;
+                } else {
+                    xp[c] = xp_old[c];
+                    yp[c] = yp_old[c];
+                    zp[c] = zp_old[c];
+                    if (should_blend) ++n_overlap_no_weight;
+                    else ++n_preserved_private;
+                }
             }
         }
+        std::cout << "  " << tgt << " blend mask: blended=" << n_blended
+                  << "  preserved_private=" << n_preserved_private;
+        if (n_overlap_no_weight > 0)
+            std::cout << "  overlap_no_weight=" << n_overlap_no_weight;
+        std::cout << "\n";
         Mat1f own_w = gmSampleBilinearReplicate(Wgrid[tgt], uc, ur, u_min, v_min);
         std::vector<double> shifts; shifts.reserve(Ntot/4);
         for (int r = 0; r < Hm; ++r) {
             const uint8_t* mp = s.mask.ptr<uint8_t>(r);
+            const uint8_t* bm = blend_mask ? blend_mask->ptr<uint8_t>(r) : nullptr;
             const float* uu = uc.ptr<float>(r);
             const float* vv = ur.ptr<float>(r);
             const float* ow = own_w.ptr<float>(r);
@@ -1393,6 +1425,7 @@ gmEdtBlend(const std::vector<std::string>& names,
             for (int c = 0; c < Wm; ++c) {
                 if (!mp[c]) continue;
                 if (!std::isfinite(uu[c]) || !std::isfinite(vv[c])) continue;
+                if (!bm || !bm[c]) continue;
                 if (!(ow[c] > 1e-3 && ow[c] < 1.0 - 1e-3)) continue;
                 const double dx = xp_new[c]-xp_old[c];
                 const double dy = yp_new[c]-yp_old[c];
@@ -2232,4 +2265,3 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 }
-

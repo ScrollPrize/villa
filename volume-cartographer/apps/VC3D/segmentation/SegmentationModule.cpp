@@ -945,7 +945,7 @@ void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, in
     const QColor brushColor = approvalBrushColor();
     _overlay->paintApprovalMaskDirect(vertices, _autoApprovalRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
     _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
-    qCInfo(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
+    qCDebug(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
 }
 
 void SegmentationModule::saveApprovalMaskToDisk()

@@ -33,12 +33,14 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <queue>
 #include <source_location>
 #include <sstream>
 #include <unordered_map>
@@ -2630,6 +2632,7 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
     if (shouldRefreshInteractivePreview())
         updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
     scheduleRender("pan");
+    refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
 
@@ -2663,6 +2666,7 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     if (shouldRefreshInteractivePreview())
         updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
     scheduleRender("zoom");
+    refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
 
@@ -2884,6 +2888,25 @@ void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
 
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
+    if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton && modifiers.testFlag(Qt::ShiftModifier)) {
+        const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
+                                     !_sameWrapAnnotation.shiftReleasedSincePreview();
+        if (_sameWrapAnnotation.generatePreview(
+                _framebuffer,
+                scenePos,
+                appendToPreview,
+                _scale,
+                _pointCollection,
+                [this](const QPointF& point) { return sceneToVolume(point); },
+                [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                    setOverlayGroup(key, items);
+                },
+                [this](const std::string& key) { clearOverlayGroup(key); })) {
+            return;
+        }
+    }
+
     auto surf = _surfWeak.lock();
     const auto cursorPos = cursorVolumePosition(scenePos);
     cv::Vec3f volumePos;
@@ -2907,12 +2930,87 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
     emit sendVolumeClicked(volumePos, n, surf.get(), button, modifiers);
 }
 
+void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
+{
+    _sameWrapAnnotation.setEnabled(enabled);
+    if (!enabled) {
+        clearSameWrapAnnotationPreview();
+    }
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
+{
+    _sameWrapAnnotation.setSpacing(spacingVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
+{
+    _sameWrapAnnotation.setMergeExistingAnnotations(enabled);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
+{
+    _sameWrapAnnotation.setPathType(
+        pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)
+            ? SameWrapAnnotationTool::PathType::ShortestPath
+            : SameWrapAnnotationTool::PathType::ConnectedComponents);
+    clearSameWrapAnnotationPreview();
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationFilterType(int filterType)
+{
+    SameWrapAnnotationTool::ImageFilterType toolFilterType = SameWrapAnnotationTool::ImageFilterType::None;
+    if (filterType == static_cast<int>(SameWrapAnnotationTool::ImageFilterType::Median)) {
+        toolFilterType = SameWrapAnnotationTool::ImageFilterType::Median;
+    } else if (filterType == static_cast<int>(SameWrapAnnotationTool::ImageFilterType::Gaussian)) {
+        toolFilterType = SameWrapAnnotationTool::ImageFilterType::Gaussian;
+    }
+    _sameWrapAnnotation.setImageFilterType(toolFilterType);
+    clearSameWrapAnnotationPreview();
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize(int kernelSize)
+{
+    _sameWrapAnnotation.setImageFilterKernelSize(kernelSize);
+    clearSameWrapAnnotationPreview();
+}
+
+void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
+{
+    _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
+}
+
+bool CChunkedVolumeViewer::commitSameWrapAnnotationPreview()
+{
+    return _sameWrapAnnotation.commit(
+        _pointCollection,
+        [this](const std::string& key) { clearOverlayGroup(key); });
+}
+
+void CChunkedVolumeViewer::refreshSameWrapAnnotationOverlay()
+{
+    if (!_sameWrapAnnotation.hasPreview()) {
+        return;
+    }
+
+    _sameWrapAnnotation.refreshOverlay(
+        [this](const cv::Vec3f& point) { return volumeToScene(point); },
+        [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+            setOverlayGroup(key, items);
+        },
+        [this](const std::string& key) { clearOverlayGroup(key); });
+}
+
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton &&
+        modifiers.testFlag(Qt::ShiftModifier)) {
+        return;
+    }
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _bboxStart = QPointF(sp[0], sp[1]);
@@ -2999,6 +3097,13 @@ void CChunkedVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers)
         case Qt::Key_Up: panByF(0, kPanPx); break;
         case Qt::Key_Down: panByF(0, -kPanPx); break;
         default: break;
+    }
+}
+
+void CChunkedVolumeViewer::onKeyRelease(int key, Qt::KeyboardModifiers)
+{
+    if (key == Qt::Key_Shift) {
+        _sameWrapAnnotation.noteShiftReleased();
     }
 }
 

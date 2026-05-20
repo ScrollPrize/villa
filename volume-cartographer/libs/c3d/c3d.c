@@ -32,8 +32,8 @@
  * the portable scalar path, which is always correct (just slower).
  *
  * C3D_HAVE_AVX512 implies C3D_HAVE_AVX2.  C3D_HAVE_NEON is aarch64-only.  The
- * hot kernels are gated with `#if C3D_HAVE_AVX512 / #elif C3D_HAVE_AVX2 /
- * #elif C3D_HAVE_NEON / #else scalar`. */
+ * hot kernels are gated with `#if defined(C3D_HAVE_AVX512) / #elif defined(C3D_HAVE_AVX2) /
+ * #elif defined(C3D_HAVE_NEON) / #else scalar`. */
 #if defined(C3D_FORCE_SCALAR)
     /* nothing */
 #elif defined(C3D_FORCE_AVX512) || (!defined(C3D_FORCE_AVX2) && !defined(C3D_FORCE_NEON) && defined(__AVX512F__))
@@ -129,8 +129,8 @@ static inline void c3d_check_voxel_alignment(const void *p) {
     c3d_assert(((uintptr_t)p & (C3D_ALIGN - 1)) == 0);
 }
 
-/* ----- 12-bit Morton (shard chunk-index ordering) ------------------------- *
- * Chunk coords are 4 bits each; Morton interleaves as z3 y3 x3 ... z0 y0 x0. */
+/* ----- 12-bit Morton helper ---------------------------------------------- *
+ * 4 bits per axis; Morton interleaves as z3 y3 x3 ... z0 y0 x0.              */
 
 C3D_CONST
 static inline uint32_t c3d_morton12(uint32_t cx, uint32_t cy, uint32_t cz) {
@@ -258,9 +258,11 @@ typedef struct {
     uint32_t freq;    /* probability of symbol            */
 } c3d_rans_sym;
 
+#define C3D_RANS_MAX_SYMBOLS 256u   /* grayscale: 65 zigzag+escape; labels: ≤256 */
+
 typedef struct {
     uint32_t cum2sym[1u << 14];  /* map cumulative prob → symbol (max M=16384) */
-    c3d_rans_sym syms[65];        /* 65 symbols in the c3d alphabet            */
+    c3d_rans_sym syms[C3D_RANS_MAX_SYMBOLS];
     uint32_t denom_shift;         /* log2(M); M = 1<<denom_shift               */
 } c3d_rans_tables;
 
@@ -272,6 +274,7 @@ static void c3d_rans_build_tables(c3d_rans_tables *t,
                                   size_t n_symbols)
 {
     c3d_assert(denom_shift <= 14);
+    c3d_assert(n_symbols <= C3D_RANS_MAX_SYMBOLS);
     const uint32_t M = 1u << denom_shift;
     t->denom_shift = denom_shift;
 
@@ -286,7 +289,7 @@ static void c3d_rans_build_tables(c3d_rans_tables *t,
     }
     c3d_assert(cum == M);
     /* Fill unused alphabet entries (freq=0) with defined start/freq. */
-    for (size_t s = n_symbols; s < 65; ++s) {
+    for (size_t s = n_symbols; s < C3D_RANS_MAX_SYMBOLS; ++s) {
         t->syms[s].start = cum;
         t->syms[s].freq  = 0;
     }
@@ -905,14 +908,48 @@ static void c3d_deinterleave(float *x, size_t N, float *aux) {
         aux[i / 2]        = x[i];
         aux[half + i / 2] = x[i + 1];
     }
+#elif defined(C3D_HAVE_AVX512)
+    /* x86 has no stride-2 deinterleaving load (unlike NEON vld2q).  Two
+     * 16-float loads → one permutexvar gathering evens, one gathering odds. */
+    const __m512i evi = _mm512_setr_epi32(0,2,4,6,8,10,12,14,
+                                          16,18,20,22,24,26,28,30);
+    const __m512i odi = _mm512_setr_epi32(1,3,5,7,9,11,13,15,
+                                          17,19,21,23,25,27,29,31);
+    size_t i = 0;
+    for (; i + 32 <= N; i += 32) {
+        __m512 a = _mm512_loadu_ps(x + i);
+        __m512 b = _mm512_loadu_ps(x + i + 16);
+        _mm512_storeu_ps(aux + i / 2,
+                         _mm512_permutex2var_ps(a, evi, b));
+        _mm512_storeu_ps(aux + half + i / 2,
+                         _mm512_permutex2var_ps(a, odi, b));
+    }
+    for (; i < N; i += 2) {
+        aux[i / 2]        = x[i];
+        aux[half + i / 2] = x[i + 1];
+    }
 #elif defined(C3D_HAVE_AVX2)
-    /* AVX2 has no hardware stride-2 deinterleaving load (unlike NEON vld2q).
-     * Shuffle + permute2f128 chains are possible but the scalar pair-copy
-     * below vectorises cleanly under -O3 via gathers / simple lane swaps, so
-     * the extra code is not worth it for a rarely-called helper.  Left here
-     * as a hook if profiling shows this path is hot on amd64. */
-    for (size_t i = 0; i < half; ++i) aux[i]        = x[2 * i];
-    for (size_t i = 0; i < half; ++i) aux[half + i] = x[2 * i + 1];
+    const __m256i evi = _mm256_setr_epi32(0,2,4,6, 8,10,12,14);
+    const __m256i odi = _mm256_setr_epi32(1,3,5,7, 9,11,13,15);
+    size_t i = 0;
+    for (; i + 16 <= N; i += 16) {
+        /* gather 8 evens / 8 odds out of a 16-float window via two
+         * permutevar8x32 + a 128-bit blend across the two lanes. */
+        __m256 a = _mm256_loadu_ps(x + i);
+        __m256 b = _mm256_loadu_ps(x + i + 8);
+        __m256 ae = _mm256_permutevar8x32_ps(a, evi);   /* a evens in lo 4 */
+        __m256 be = _mm256_permutevar8x32_ps(b, evi);   /* b evens in lo 4 */
+        __m256 ao = _mm256_permutevar8x32_ps(a, odi);
+        __m256 bo = _mm256_permutevar8x32_ps(b, odi);
+        _mm256_storeu_ps(aux + i / 2,
+            _mm256_permute2f128_ps(ae, be, 0x20));
+        _mm256_storeu_ps(aux + half + i / 2,
+            _mm256_permute2f128_ps(ao, bo, 0x20));
+    }
+    for (; i < N; i += 2) {
+        aux[i / 2]        = x[i];
+        aux[half + i / 2] = x[i + 1];
+    }
 #else
     for (size_t i = 0; i < half; ++i) aux[i]        = x[2 * i];
     for (size_t i = 0; i < half; ++i) aux[half + i] = x[2 * i + 1];
@@ -929,6 +966,42 @@ static void c3d_interleave(float *x, size_t N, float *aux) {
         p.val[0] = vld1q_f32(x + i / 2);
         p.val[1] = vld1q_f32(x + half + i / 2);
         vst2q_f32(aux + i, p);
+    }
+    for (; i < N; i += 2) {
+        aux[i]     = x[i / 2];
+        aux[i + 1] = x[half + i / 2];
+    }
+#elif defined(C3D_HAVE_AVX512)
+    /* lo[k]=evens[k], hi[k]=odds[k]; permutex2var with interleave indices
+     * writes 32 interleaved outputs from two 16-float halves. */
+    const __m512i lo = _mm512_setr_epi32(0,16,1,17,2,18,3,19,
+                                         4,20,5,21,6,22,7,23);
+    const __m512i hi = _mm512_setr_epi32(8,24,9,25,10,26,11,27,
+                                         12,28,13,29,14,30,15,31);
+    size_t i = 0;
+    for (; i + 32 <= N; i += 32) {
+        __m512 e = _mm512_loadu_ps(x + i / 2);
+        __m512 o = _mm512_loadu_ps(x + half + i / 2);
+        _mm512_storeu_ps(aux + i,      _mm512_permutex2var_ps(e, lo, o));
+        _mm512_storeu_ps(aux + i + 16, _mm512_permutex2var_ps(e, hi, o));
+    }
+    for (; i < N; i += 2) {
+        aux[i]     = x[i / 2];
+        aux[i + 1] = x[half + i / 2];
+    }
+#elif defined(C3D_HAVE_AVX2)
+    size_t i = 0;
+    for (; i + 16 <= N; i += 16) {
+        __m256 e = _mm256_loadu_ps(x + i / 2);
+        __m256 o = _mm256_loadu_ps(x + half + i / 2);
+        /* unpacklo/hi interleave within 128-bit lanes; permute2f128
+         * reassembles the contiguous 16-float interleaved run. */
+        __m256 ul = _mm256_unpacklo_ps(e, o);   /* e0 o0 e1 o1 | e4 o4 e5 o5 */
+        __m256 uh = _mm256_unpackhi_ps(e, o);   /* e2 o2 e3 o3 | e6 o6 e7 o7 */
+        _mm256_storeu_ps(aux + i,
+            _mm256_permute2f128_ps(ul, uh, 0x20));
+        _mm256_storeu_ps(aux + i + 8,
+            _mm256_permute2f128_ps(ul, uh, 0x31));
     }
     for (; i < N; i += 2) {
         aux[i]     = x[i / 2];
@@ -967,7 +1040,9 @@ static void c3d_dwt_1d_inv(float *x, size_t N, float *aux) {
  * makes the hot inner memory ops inlineable.  Compiler trivially fuses
  * the pair when the data is aligned. */
 static inline void c3d_copy8(float *restrict dst, const float *restrict src) {
-#ifdef C3D_HAVE_NEON
+#if defined(C3D_HAVE_AVX2)
+    _mm256_storeu_ps(dst, _mm256_loadu_ps(src));   /* one 256-bit move */
+#elif defined(C3D_HAVE_NEON)
     float32x4_t a = vld1q_f32(src);
     float32x4_t b = vld1q_f32(src + 4);
     vst1q_f32(dst,     a);
@@ -1081,127 +1156,164 @@ static void c3d_dwt_1d_inv_x4(float *restrict x, size_t N, float *restrict aux) 
 #define C3D_Y_TILE  C3D_TILE_X
 #define C3D_Z_TILE  C3D_TILE_X
 
-static void c3d_dwt3_fwd_level(float *restrict buf, size_t side, float *scratch) {
-    (void)scratch;  /* per-thread buffers supersede the shared scratch. */
+/* One forward DWT level, X→Y→Z.  MUST be called from inside an existing
+ * `#pragma omp parallel` region: the three passes use `omp for` whose
+ * implicit end-of-loop barrier enforces the X→Y→Z (and, across calls,
+ * level→level) data dependency without tearing the thread team down.
+ * Collapsing the per-axis / per-level fork-joins (15 per fwd DWT) into a
+ * single persistent team is the whole point — see the scaling profile.
+ * `t_aux` / `t_tile` are caller-supplied thread-private scratch, each
+ * C3D_TILE_X * C3D_CHUNK_SIDE floats (t_aux's first C3D_CHUNK_SIDE used
+ * by the contiguous X pass). */
+static void c3d_dwt3_fwd_level_team(float *restrict buf, size_t side,
+                                    float *restrict t_aux,
+                                    float *restrict t_tile) {
     buf = __builtin_assume_aligned(buf, C3D_ALIGN);
     /* side ∈ {256,128,64,32,16}: power-of-2 ≥ 16, ≤ 256. */
     c3d_invariant(side >= 16u && side <= 256u);
     c3d_invariant((side & (side - 1u)) == 0u);
-
-    /* X pass — row stride 1, contiguous.  Outer z loop is parallelised;
-     * each thread gets its own aux (512 floats = 2 KB on stack). */
-    #pragma omp parallel
-    {
-        float aux[C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t y = 0; y < side; ++y) {
-                float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
-                c3d_dwt_1d_fwd(row, side, aux);
-            }
-        }
-    }
-    /* Y pass — 4 adjacent X-columns at a time (cache-line-sized load/store). */
     c3d_assert((side & 3u) == 0);
-    #pragma omp parallel
-    {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&tile[y * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_fwd_x4(tile, side, aux);
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[y * C3D_TILE_X]);
-            }
-        }
-    }
-    /* Z pass — same tiling, parallelise over outer y. */
-    #pragma omp parallel
-    {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
+
+    /* X pass — row stride 1, contiguous. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
         for (size_t y = 0; y < side; ++y) {
-            for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&tile[z * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_fwd_x4(tile, side, aux);
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[z * C3D_TILE_X]);
-            }
+            float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
+            c3d_dwt_1d_fwd(row, side, t_aux);
         }
     }
+    /* implicit barrier here: X complete before any Y read */
+
+    /* Y pass — TILE_X adjacent X-columns at a time. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
+        for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&t_tile[y * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_fwd_x4(t_tile, side, t_aux);
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[y * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier here: Y complete before any Z read */
+
+    /* Z pass — same tiling, parallelise over outer y. */
+    #pragma omp for schedule(static)
+    for (size_t y = 0; y < side; ++y) {
+        for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&t_tile[z * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_fwd_x4(t_tile, side, t_aux);
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[z * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier here: level complete before next level's X pass */
 }
 
-static void c3d_dwt3_inv_level(float *restrict buf, size_t side, float *scratch) {
-    (void)scratch;  /* per-thread buffers supersede the shared scratch. */
+/* One inverse DWT level, Z→Y→X (mirror of the forward team function).
+ * MUST be called from inside an existing `#pragma omp parallel`; the
+ * `omp for` implicit barriers enforce Z→Y→X and level→level ordering
+ * while reusing one persistent thread team. */
+static void c3d_dwt3_inv_level_team(float *restrict buf, size_t side,
+                                    float *restrict t_aux,
+                                    float *restrict t_tile) {
     buf = __builtin_assume_aligned(buf, C3D_ALIGN);
     c3d_invariant(side >= 16u && side <= 256u);
     c3d_invariant((side & (side - 1u)) == 0u);
-
     c3d_assert((side & 3u) == 0);
-    /* Inverse order: Z, Y, X — each pass parallelised over its outer loop. */
-    #pragma omp parallel
-    {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
+
+    /* Z pass. */
+    #pragma omp for schedule(static)
+    for (size_t y = 0; y < side; ++y) {
+        for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&t_tile[z * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_inv_x4(t_tile, side, t_aux);
+            for (size_t z = 0; z < side; ++z)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[z * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier: Z complete before any Y read */
+
+    /* Y pass. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
+        for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&t_tile[y * C3D_TILE_X],
+                          &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
+            c3d_dwt_1d_inv_x4(t_tile, side, t_aux);
+            for (size_t y = 0; y < side; ++y)
+                c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
+                          &t_tile[y * C3D_TILE_X]);
+        }
+    }
+    /* implicit barrier: Y complete before any X read */
+
+    /* X pass — contiguous. */
+    #pragma omp for schedule(static)
+    for (size_t z = 0; z < side; ++z) {
         for (size_t y = 0; y < side; ++y) {
-            for (size_t xb = 0; xb < side; xb += C3D_Z_TILE) {
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&tile[z * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_inv_x4(tile, side, aux);
-                for (size_t z = 0; z < side; ++z)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[z * C3D_TILE_X]);
-            }
+            float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
+            c3d_dwt_1d_inv(row, side, t_aux);
         }
     }
+    /* implicit barrier: level complete before next level's Z pass */
+}
+
+/* Single-level inverse DWT with its own thread team.  Test/compat shim;
+ * production goes through c3d_dwt3_inv_levels (one team, all levels). */
+static void c3d_dwt3_inv_level(float *restrict buf, size_t side,
+                               float *scratch) {
+    (void)scratch;
     #pragma omp parallel
     {
-        float tile[C3D_TILE_X * C3D_CHUNK_SIDE];
-        float aux [C3D_TILE_X * C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t xb = 0; xb < side; xb += C3D_Y_TILE) {
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&tile[y * C3D_TILE_X],
-                              &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb]);
-                c3d_dwt_1d_inv_x4(tile, side, aux);
-                for (size_t y = 0; y < side; ++y)
-                    c3d_copy8(&buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + xb],
-                              &tile[y * C3D_TILE_X]);
-            }
-        }
-    }
-    #pragma omp parallel
-    {
-        float aux[C3D_CHUNK_SIDE];
-        #pragma omp for schedule(static)
-        for (size_t z = 0; z < side; ++z) {
-            for (size_t y = 0; y < side; ++y) {
-                float *row = &buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y];
-                c3d_dwt_1d_inv(row, side, aux);
-            }
-        }
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        c3d_dwt3_inv_level_team(buf, side, t_aux, t_tile);
     }
 }
 
-/* Full 5-level forward DWT on a 256³ f32 buffer.
- * scratch must be ≥ 8 * C3D_CHUNK_SIDE floats (2 KiB). */
+/* Single-level forward DWT with its own thread team.  Only used by the
+ * test harness (partial k-level forwards); production goes through
+ * c3d_dwt3_fwd which keeps one team across all levels. */
+static void c3d_dwt3_fwd_level(float *restrict buf, size_t side,
+                               float *scratch) {
+    (void)scratch;
+    #pragma omp parallel
+    {
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        c3d_dwt3_fwd_level_team(buf, side, t_aux, t_tile);
+    }
+}
+
+/* Full 5-level forward DWT on a 256³ f32 buffer.  `scratch` is unused
+ * (thread-private scratch is stack-allocated per worker); kept in the
+ * signature for call-site compatibility.
+ *
+ * One `omp parallel` spans all 5 levels: the thread team is created once
+ * and reused across every axis pass of every level, with `omp for`
+ * implicit barriers providing the X→Y→Z and level→level ordering.  This
+ * replaces the previous 15 fork/join regions (5 levels × 3 axes). */
 static void c3d_dwt3_fwd(float *restrict buf, float *scratch) {
-    size_t side = C3D_CHUNK_SIDE;
-    for (unsigned lvl = 0; lvl < C3D_N_DWT_LEVELS; ++lvl) {
-        c3d_dwt3_fwd_level(buf, side, scratch);
-        side /= 2;
+    (void)scratch;
+    #pragma omp parallel
+    {
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        size_t side = C3D_CHUNK_SIDE;
+        for (unsigned lvl = 0; lvl < C3D_N_DWT_LEVELS; ++lvl) {
+            c3d_dwt3_fwd_level_team(buf, side, t_aux, t_tile);
+            side /= 2;
+        }
     }
 }
 
@@ -1210,10 +1322,18 @@ static void c3d_dwt3_fwd(float *restrict buf, float *scratch) {
  *   n=k → synthesise levels 5, 4, ..., 6-k; output is LLL_{5-k} at [0:(8<<k), ...].
  *   n=5 → full inverse, output at [0:256, 0:256, 0:256]. */
 static void c3d_dwt3_inv_levels(float *restrict buf, unsigned n_synth_levels, float *scratch) {
+    (void)scratch;
     c3d_assert(n_synth_levels <= C3D_N_DWT_LEVELS);
-    for (unsigned i = 0; i < n_synth_levels; ++i) {
-        size_t active_side = (size_t)16u << i;   /* 16, 32, 64, 128, 256 */
-        c3d_dwt3_inv_level(buf, active_side, scratch);
+    if (n_synth_levels == 0u) return;   /* LOD decode stopping at LLL_5 */
+    /* One team for all synth levels; omp-for barriers chain the levels. */
+    #pragma omp parallel
+    {
+        float t_aux [C3D_TILE_X * C3D_CHUNK_SIDE];
+        float t_tile[C3D_TILE_X * C3D_CHUNK_SIDE];
+        for (unsigned i = 0; i < n_synth_levels; ++i) {
+            size_t active_side = (size_t)16u << i;   /* 16, 32, 64, 128, 256 */
+            c3d_dwt3_inv_level_team(buf, active_side, t_aux, t_tile);
+        }
     }
 }
 
@@ -1266,6 +1386,181 @@ static inline float c3d_dequant(int32_t q, float step, float dz_half, float alph
     float aq  = (float)((q < 0) ? -q : q);
     float mag = dz_half + (aq - 1.0f + alpha) * step;
     return (q < 0) ? -mag : mag;
+}
+
+/* ---- Vectorised row quant / dequant ------------------------------------- *
+ *
+ * Three hot kernels (encode, rate-estimate, inverse) share an identical
+ * float↔int dead-zone quant/dequant inner loop.  Factoring the SIMD body
+ * into these two helpers keeps the AVX512 / AVX2 / NEON / scalar branching
+ * in one place instead of three duplicated copies.
+ *
+ * Bit-exactness vs the scalar c3d_quant / c3d_dequant:
+ *   - float→int truncation toward zero: NEON vcvtq_s32_f32, AVX
+ *     _mm*_cvtt ps_epi32 ("cvtt" = truncate), and C (int32_t) all agree.
+ *   - the dead-zone (|c| < dz_half → 0) and sign are reapplied by mask
+ *     select, mirroring the scalar branch order exactly.
+ * Same-binary determinism (CLAUDE.md §0) holds because every lane runs
+ * the identical fused expression the scalar path runs. */
+
+/* qv[x] = c3d_quant(crow[x], step, dz_half) for x in [0, n). */
+static inline void c3d_quant_row(const float *restrict crow,
+                                 int32_t *restrict qv, uint32_t n,
+                                 float step, float dz_half) {
+    const float inv_step = 1.0f / step;
+    (void)inv_step;   /* unused on the pure-scalar fallback */
+    uint32_t x = 0;
+#if defined(C3D_HAVE_AVX512)
+    __m512 vdz  = _mm512_set1_ps(dz_half);
+    __m512 vinv = _mm512_set1_ps(inv_step);
+    for (; x + 16 <= n; x += 16) {
+        __m512 c   = _mm512_loadu_ps(crow + x);
+        __m512 ac  = _mm512_abs_ps(c);
+        __mmask16 below = _mm512_cmp_ps_mask(ac, vdz, _CMP_LT_OQ);
+        __m512 s   = _mm512_mul_ps(_mm512_sub_ps(ac, vdz), vinv);
+        __m512i qi = _mm512_add_epi32(_mm512_cvttps_epi32(s),
+                                      _mm512_set1_epi32(1));
+        __mmask16 neg = _mm512_cmp_ps_mask(c, _mm512_setzero_ps(), _CMP_LT_OQ);
+        __m512i q  = _mm512_mask_sub_epi32(qi, neg, _mm512_setzero_si512(), qi);
+        q = _mm512_mask_blend_epi32(below, q, _mm512_setzero_si512());
+        _mm512_storeu_si512((void *)(qv + x), q);
+    }
+#elif defined(C3D_HAVE_AVX2)
+    __m256 vdz  = _mm256_set1_ps(dz_half);
+    __m256 vinv = _mm256_set1_ps(inv_step);
+    __m256 vzero = _mm256_setzero_ps();
+    for (; x + 8 <= n; x += 8) {
+        __m256 c   = _mm256_loadu_ps(crow + x);
+        __m256 ac  = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), c);   /* fabs */
+        __m256 below = _mm256_cmp_ps(ac, vdz, _CMP_LT_OQ);
+        __m256 s   = _mm256_mul_ps(_mm256_sub_ps(ac, vdz), vinv);
+        __m256i qi = _mm256_add_epi32(_mm256_cvttps_epi32(s),
+                                      _mm256_set1_epi32(1));
+        __m256 neg = _mm256_cmp_ps(c, vzero, _CMP_LT_OQ);
+        __m256i qn = _mm256_sub_epi32(_mm256_setzero_si256(), qi);
+        __m256i q  = _mm256_blendv_epi8(qi, qn, _mm256_castps_si256(neg));
+        q = _mm256_blendv_epi8(q, _mm256_setzero_si256(),
+                               _mm256_castps_si256(below));
+        _mm256_storeu_si256((__m256i *)(qv + x), q);
+    }
+#elif defined(C3D_HAVE_NEON)
+    float32x4_t vdz  = vdupq_n_f32(dz_half);
+    float32x4_t vinv = vdupq_n_f32(inv_step);
+    float32x4_t vzero = vdupq_n_f32(0.0f);
+    for (; x + 4 <= n; x += 4) {
+        float32x4_t c  = vld1q_f32(crow + x);
+        float32x4_t ac = vabsq_f32(c);
+        uint32x4_t below = vcltq_f32(ac, vdz);
+        float32x4_t s  = vmulq_f32(vsubq_f32(ac, vdz), vinv);
+        int32x4_t  qi  = vaddq_s32(vcvtq_s32_f32(s), vdupq_n_s32(1));
+        uint32x4_t neg = vcltq_f32(c, vzero);
+        int32x4_t  q   = vbslq_s32(neg, vnegq_s32(qi), qi);
+        q = vbslq_s32(below, vdupq_n_s32(0), q);
+        vst1q_s32(qv + x, q);
+    }
+#endif
+    for (; x < n; ++x) qv[x] = c3d_quant(crow[x], step, dz_half);
+}
+
+/* out[x] = c3d_dequant(qv[x], step, dz_half, alpha) for x in [0, n). */
+static inline void c3d_dequant_row(const int32_t *restrict qv,
+                                   float *restrict out, uint32_t n,
+                                   float step, float dz_half, float alpha) {
+    uint32_t x = 0;
+#if defined(C3D_HAVE_AVX512)
+    __m512 vdz   = _mm512_set1_ps(dz_half);
+    __m512 vstep = _mm512_set1_ps(step);
+    __m512 vbias = _mm512_set1_ps(alpha - 1.0f);
+    for (; x + 16 <= n; x += 16) {
+        __m512i q  = _mm512_loadu_si512((const void *)(qv + x));
+        __mmask16 isz = _mm512_cmpeq_epi32_mask(q, _mm512_setzero_si512());
+        __mmask16 neg = _mm512_cmpgt_epi32_mask(_mm512_setzero_si512(), q);
+        __m512 af  = _mm512_cvtepi32_ps(_mm512_abs_epi32(q));
+        __m512 mag = _mm512_fmadd_ps(vstep, _mm512_add_ps(af, vbias), vdz);
+        __m512 res = _mm512_mask_sub_ps(mag, neg, _mm512_setzero_ps(), mag);
+        res = _mm512_mask_blend_ps(isz, res, _mm512_setzero_ps());
+        _mm512_storeu_ps(out + x, res);
+    }
+#elif defined(C3D_HAVE_AVX2)
+    __m256 vdz   = _mm256_set1_ps(dz_half);
+    __m256 vstep = _mm256_set1_ps(step);
+    __m256 vbias = _mm256_set1_ps(alpha - 1.0f);
+    __m256i izero = _mm256_setzero_si256();
+    for (; x + 8 <= n; x += 8) {
+        __m256i q  = _mm256_loadu_si256((const __m256i *)(qv + x));
+        __m256i isz = _mm256_cmpeq_epi32(q, izero);
+        __m256i neg = _mm256_cmpgt_epi32(izero, q);
+        __m256 af  = _mm256_cvtepi32_ps(_mm256_abs_epi32(q));
+        __m256 mag = _mm256_fmadd_ps(vstep, _mm256_add_ps(af, vbias), vdz);
+        __m256 res = _mm256_blendv_ps(mag,
+                        _mm256_sub_ps(_mm256_setzero_ps(), mag),
+                        _mm256_castsi256_ps(neg));
+        res = _mm256_blendv_ps(res, _mm256_setzero_ps(),
+                               _mm256_castsi256_ps(isz));
+        _mm256_storeu_ps(out + x, res);
+    }
+#elif defined(C3D_HAVE_NEON)
+    float32x4_t vdz   = vdupq_n_f32(dz_half);
+    float32x4_t vstep = vdupq_n_f32(step);
+    float32x4_t vbias = vdupq_n_f32(alpha - 1.0f);
+    float32x4_t vzero = vdupq_n_f32(0.0f);
+    for (; x + 4 <= n; x += 4) {
+        int32x4_t q   = vld1q_s32(qv + x);
+        uint32x4_t isz = vceqq_s32(q, vdupq_n_s32(0));
+        float32x4_t af = vcvtq_f32_s32(vabsq_s32(q));
+        float32x4_t mag = vfmaq_f32(vdz, vstep, vaddq_f32(af, vbias));
+        uint32x4_t neg = vcltq_s32(q, vdupq_n_s32(0));
+        float32x4_t res = vbslq_f32(neg, vnegq_f32(mag), mag);
+        res = vbslq_f32(isz, vzero, res);
+        vst1q_f32(out + x, res);
+    }
+#endif
+    for (; x < n; ++x) out[x] = c3d_dequant(qv[x], step, dz_half, alpha);
+}
+
+/* bin[x] = min((uint32_t)(fabsf(row[x]) * inv_w), nbins-1) for x in [0, n).
+ * Phase-1 of the fine-histogram builder; the scatter increment stays scalar.
+ * float→uint truncation toward zero (NEON vcvtq_u32_f32 / AVX cvttps_epi32 /
+ * C cast) agrees because every value is non-negative and < nbins after the
+ * clamp.  `nbins` is passed in because C3D_FINE_BINS is #defined further down
+ * the TU than this helper. */
+static inline void c3d_bin_row(const float *restrict row,
+                               uint32_t *restrict bin, uint32_t n,
+                               float inv_w, uint32_t nbins) {
+    uint32_t x = 0;
+#if defined(C3D_HAVE_AVX512)
+    __m512 vinv  = _mm512_set1_ps(inv_w);
+    __m512i vclip = _mm512_set1_epi32((int32_t)(nbins - 1u));
+    for (; x + 16 <= n; x += 16) {
+        __m512 a = _mm512_abs_ps(_mm512_loadu_ps(row + x));
+        __m512i b = _mm512_cvttps_epi32(_mm512_mul_ps(a, vinv));
+        b = _mm512_min_epu32(b, vclip);
+        _mm512_storeu_si512((void *)(bin + x), b);
+    }
+#elif defined(C3D_HAVE_AVX2)
+    __m256 vinv  = _mm256_set1_ps(inv_w);
+    __m256i vclip = _mm256_set1_epi32((int32_t)(nbins - 1u));
+    for (; x + 8 <= n; x += 8) {
+        __m256 a = _mm256_andnot_ps(_mm256_set1_ps(-0.0f),
+                                    _mm256_loadu_ps(row + x));   /* fabs */
+        __m256i b = _mm256_cvttps_epi32(_mm256_mul_ps(a, vinv));
+        b = _mm256_min_epu32(b, vclip);
+        _mm256_storeu_si256((__m256i *)(bin + x), b);
+    }
+#elif defined(C3D_HAVE_NEON)
+    float32x4_t vinv = vdupq_n_f32(inv_w);
+    uint32x4_t vclip = vdupq_n_u32(nbins - 1u);
+    for (; x + 4 <= n; x += 4) {
+        float32x4_t a = vabsq_f32(vld1q_f32(row + x));
+        uint32x4_t b = vcvtq_u32_f32(vmulq_f32(a, vinv));
+        b = vminq_u32(b, vclip);
+        vst1q_u32(bin + x, b);
+    }
+#endif
+    for (; x < n; ++x) {
+        uint32_t b = (uint32_t)(fabsf(row[x]) * inv_w);
+        bin[x] = b >= nbins ? nbins - 1u : b;
+    }
 }
 
 /* Look up dz_half for a subband from its kind. */
@@ -1443,7 +1738,7 @@ static void c3d_subband_scatter(float *buf,
 #endif
 
 /* ========================================================================= *
- *  §G/§H/§I  Chunk encoder + decoder (SELF mode only for now)               *
+ *  §G/§H/§I  Chunk encoder + decoder                                        *
  * ========================================================================= *
  *
  * Chunk layout (PLAN §2.2):
@@ -1664,9 +1959,9 @@ struct c3d_encoder {
      * skipped — see c3d_prepare_chunk. */
     float    coeff_scale;
     /* Warm start for rate-control bisection.  Populated from the previous
-     * call at the same target_ratio; successive chunks in a shard usually
-     * converge to a very similar q, so this cuts bisection from ~8 iters
-     * to ~3-4. */
+     * call at the same target_ratio; consecutive chunks from the same
+     * dataset usually converge to a very similar q, so this cuts bisection
+     * from ~8 iters to ~3-4. */
     float    last_q;
     float    last_target_ratio;
     /* Per-subband fine histogram + running prefix sum over |c|.  Built once
@@ -1709,12 +2004,6 @@ struct c3d_decoder {
      * indices 1..N-1 are allocated on first parallel decode and reused
      * across chunks.  Arena-style to avoid malloc/free on the hot path. */
     uint8_t *thread_sub_symbols[C3D_OMP_MAX_THREADS];
-    /* rANS table cache for stable EXTERNAL ctx.  cached_tables is lazily
-     * allocated (2.4 MiB total, 36 × ~65 KiB) on first EXTERNAL-ctx decode;
-     * reused across chunks as long as the ctx id matches. */
-    c3d_rans_tables *cached_tables;
-    uint8_t          cached_ctx_id[16];
-    bool             cached_valid;
 
     bool             denoise_enabled;
 };
@@ -1772,9 +2061,6 @@ c3d_decoder *c3d_decoder_new(void) {
     c3d_assert(d->coeff_buf && d->sub_symbols);
     memset(d->thread_sub_symbols, 0, sizeof d->thread_sub_symbols);
     d->thread_sub_symbols[0] = d->sub_symbols;
-    d->cached_tables = NULL;
-    memset(d->cached_ctx_id, 0, 16);
-    d->cached_valid = false;
     d->denoise_enabled = true;
     return d;
 }
@@ -1784,7 +2070,7 @@ void c3d_decoder_set_denoise(c3d_decoder *d, bool enabled) {
 }
 void c3d_decoder_free(c3d_decoder *d) {
     if (!d) return;
-    free(d->coeff_buf); free(d->sub_symbols); free(d->cached_tables);
+    free(d->coeff_buf); free(d->sub_symbols);
     /* Index 0 aliases sub_symbols (already freed).  Free the rest. */
     for (unsigned i = 1; i < C3D_OMP_MAX_THREADS; ++i)
         free(d->thread_sub_symbols[i]);
@@ -1816,7 +2102,7 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
      * Uniform-chunk fast path: scan tracks min/max alongside sum.  If
      * min == max, every voxel is the same and the DWT of the centred
      * buffer is exactly zero — skip DWT (~80 ms saved per uniform chunk).
-     * Critical for masked scroll shards where 75-85 % of chunks are
+     * Critical for masked scroll volumes where 75-85 % of chunks are
      * either all-air or all-material. */
     uint64_t u8_sum = 0;
     uint8_t  u8_min = 255, u8_max = 0;
@@ -1909,36 +2195,14 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
         if (mx <= 0.0f) continue;
         float inv_w = (float)C3D_FINE_BINS / mx;
         c3d_subband_info sb; c3d_subband_info_of(sidx, &sb);
-        /* Two-phase per row: NEON computes 4-wide fabs + bin index;
-         * scalar pass increments the histogram (scatter dependency). */
+        /* Two-phase per row: SIMD computes fabs + clamped bin index
+         * (AVX512/AVX2/NEON/scalar); the scalar pass below increments the
+         * histogram (scatter dependency keeps it scalar). */
         uint32_t bin_row[128];
         for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
         for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y) {
             const float *row = &s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb.x0];
-#ifdef C3D_HAVE_NEON
-            float32x4_t vinv = vdupq_n_f32(inv_w);
-            uint32x4_t vclip = vdupq_n_u32(C3D_FINE_BINS - 1u);
-            uint32_t xx = 0;
-            for (; xx + 4 <= sb.side; xx += 4) {
-                float32x4_t a = vabsq_f32(vld1q_f32(row + xx));
-                uint32x4_t b = vcvtq_u32_f32(vmulq_f32(a, vinv));
-                b = vminq_u32(b, vclip);
-                vst1q_u32(bin_row + xx, b);
-            }
-            for (; xx < sb.side; ++xx) {
-                float ac = fabsf(row[xx]);
-                uint32_t b = (uint32_t)(ac * inv_w);
-                if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
-                bin_row[xx] = b;
-            }
-#else
-            for (uint32_t xx = 0; xx < sb.side; ++xx) {
-                float ac = fabsf(row[xx]);
-                uint32_t b = (uint32_t)(ac * inv_w);
-                if (b >= C3D_FINE_BINS) b = C3D_FINE_BINS - 1u;
-                bin_row[xx] = b;
-            }
-#endif
+            c3d_bin_row(row, bin_row, sb.side, inv_w, C3D_FINE_BINS);
             for (uint32_t xh = 0; xh < sb.side; ++xh) pref[bin_row[xh] + 1]++;
         }
         for (unsigned i = 1; i <= C3D_FINE_BINS; ++i) pref[i] += pref[i - 1];
@@ -1947,15 +2211,10 @@ static void c3d_build_fine_hist(c3d_encoder *s) {
 }
 
 /* -- Stage 2: per-subband encode (quantize → symbols + escapes → freq table
- *             → rANS → pack).  Writes bytes to `out`.  Returns bytes written.
- * If `external_freqs` is non-NULL, use those frequencies (EXTERNAL mode):
- * all chunk symbols must have freq ≥ 1 in the provided table, otherwise rANS
- * encoding panics.  freq_table_size is written as 0 in this mode.
- * §T13: dz_ratio is looked up by caller (ctx override or kind default). */
+ *             → rANS → pack).  Writes bytes to `out`.  Returns bytes written. */
 static size_t c3d_encode_one_subband(
     const float *restrict coeff_buf, const c3d_subband_info *sb,
     float step, float dz_ratio, uint32_t denom_shift,
-    const uint32_t *external_freqs,
     uint8_t *restrict sub_symbols, uint8_t *restrict sub_escapes,
     uint8_t *restrict rans_scratch, size_t rans_scratch_size,
     uint8_t *restrict out, size_t out_cap,
@@ -1976,7 +2235,7 @@ static size_t c3d_encode_one_subband(
     if (max_abs < dz_half) {
         c3d_assert(out_cap >= 2);
         c3d_write_u16_le(out, 0xFFFFu);
-        (void)denom_shift; (void)external_freqs;
+        (void)denom_shift;
         (void)sub_symbols; (void)sub_escapes;
         (void)rans_scratch; (void)rans_scratch_size;
         return 2;
@@ -2009,37 +2268,11 @@ static size_t c3d_encode_one_subband(
      * state (sp, lane_ctx, hist) is unchanged; only the float arithmetic
      * moves to 4-lane NEON fma/fabs/vcvt. */
     int32_t qv_row[128];
-#ifdef C3D_HAVE_NEON
-    const float inv_step = 1.0f / step;
-#endif
     for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
     for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y) {
         const float *crow = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
-        /* Phase 1. */
-#ifdef C3D_HAVE_NEON
-        float32x4_t vdz    = vdupq_n_f32(dz_half);
-        float32x4_t vinv   = vdupq_n_f32(inv_step);
-        float32x4_t vzero  = vdupq_n_f32(0.0f);
-        uint32_t x = 0;
-        for (; x + 4 <= sb_side; x += 4) {
-            float32x4_t c  = vld1q_f32(crow + x);
-            float32x4_t ac = vabsq_f32(c);
-            uint32x4_t below = vcltq_f32(ac, vdz);             /* zero mask */
-            float32x4_t s  = vmulq_f32(vsubq_f32(ac, vdz), vinv);
-            int32x4_t  qi  = vcvtq_s32_f32(s);
-            qi = vaddq_s32(qi, vdupq_n_s32(1));
-            uint32x4_t neg = vcltq_f32(c, vzero);
-            int32x4_t  qn  = vnegq_s32(qi);
-            int32x4_t  q   = vbslq_s32(neg, qn, qi);
-            q = vbslq_s32(below, vdupq_n_s32(0), q);
-            vst1q_s32(qv_row + x, q);
-        }
-        for (; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#else
-        for (uint32_t x = 0; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#endif
+        /* Phase 1 — vectorised float→int quant (AVX512/AVX2/NEON/scalar). */
+        c3d_quant_row(crow, qv_row, sb_side, step, dz_half);
         /* Phase 2 — scalar, keeps sp/lane_ctx/hist/escape correct. */
         for (uint32_t xp = 0; xp < sb_side; ++xp) {
             uint32_t escape_mag;
@@ -2148,50 +2381,15 @@ static size_t c3d_encode_one_subband(
         c3d_normalise_freqs(hist_ctx[1], denom_shift, ctx_freqs[1]);
     }
 
-    /* Pick the frequency source per-subband.  When external freqs are
-     * available, compare actual byte cost against the SELF path.
-     * 2-table mode overrides both (external ctx doesn't support it yet). */
     uint32_t local_freqs[65];
-    const uint32_t *freqs_to_use;
-    bool use_external = false;
     c3d_normalise_freqs(hist, denom_shift, local_freqs);
-    if (external_freqs && !use_2table) {
-        bool ext_covers = true;
-        for (unsigned k = 0; k < 65; ++k) {
-            if (hist[k] > 0 && external_freqs[k] == 0) { ext_covers = false; break; }
-        }
-        if (ext_covers) {
-            /* Both paths are decodable; compare actual rate. */
-            double log2_M = (double)denom_shift;
-            double ext_bits = 0.0, self_bits = 0.0;
-            double inv_n = 1.0 / (double)n;
-            for (unsigned k = 0; k < 65; ++k) {
-                if (!hist[k]) continue;
-                ext_bits  += (double)hist[k] * (log2_M - log2((double)external_freqs[k]));
-                double p = (double)hist[k] * inv_n;
-                self_bits += -(double)hist[k] * log2(p);
-            }
-            /* SELF pays ftable_serialised_size extra bytes; ~2 + 3*nnz. */
-            unsigned nnz = 0;
-            for (unsigned k = 0; k < 65; ++k) if (hist[k]) nnz++;
-            double self_overhead_bytes = 2.0 + 3.0 * (double)nnz;
-            double ext_bytes  = ext_bits / 8.0;
-            double self_bytes = self_bits / 8.0 + self_overhead_bytes;
-            use_external = ext_bytes <= self_bytes;
-        }
-    }
-    if (use_external) {
-        freqs_to_use = external_freqs;
-    } else {
-        freqs_to_use = local_freqs;
-    }
     c3d_rans_tables tbl;
-    c3d_rans_build_tables(&tbl, denom_shift, freqs_to_use, 65);
+    c3d_rans_build_tables(&tbl, denom_shift, local_freqs, 65);
 
     /* Emit per-subband bitstream layout. */
     size_t w = 0;
 
-    /* [freq_table_size u16] — 0 for EXTERNAL (table lives in ctx). */
+    /* [freq_table_size u16] */
     c3d_assert(w + 2 <= out_cap);
     size_t ftable_size_pos = w;
     w += 2;
@@ -2199,12 +2397,9 @@ static size_t c3d_encode_one_subband(
     /* [freq_table region] layout:
      *   [ctx_mode u8] — 0 = 1 table, 1 = 2-table lane-local ctx
      *   [freq_table_0 ...]
-     *   [freq_table_1 ...] (only if ctx_mode == 1)
-     * External mode: ftable_bytes = 0 (no ctx_mode byte either). */
+     *   [freq_table_1 ...] (only if ctx_mode == 1) */
     size_t ftable_bytes;
-    if (use_external) {
-        ftable_bytes = 0;
-    } else {
+    {
         out[w] = use_2table ? 1u : 0u;
         size_t ft_w = 1;
         if (use_2table) {
@@ -2257,19 +2452,17 @@ static size_t c3d_encode_one_subband(
     return w;
 }
 
-/* Cheap entropy estimator: quantize + histogram + Shannon (or cross-entropy
- * vs external freqs when applicable) + escape LEB128 size, no rANS encode,
- * no freq-table normalisation, no serialise.  Used by the rate-control
- * bisection so each iteration costs ~1 quantize pass instead of a full emit.
- * Returns estimated subband byte size (double so errors aggregate cleanly).
- * Matches c3d_encode_one_subband's "use external iff external covers every
- * symbol present in this chunk" decision so the estimate tracks reality. */
+/* Cheap entropy estimator: quantize + histogram + Shannon + escape LEB128
+ * size, no rANS encode, no freq-table normalisation, no serialise.  Used by
+ * the rate-control bisection so each iteration costs ~1 quantize pass instead
+ * of a full emit.  Returns estimated subband byte size (double so errors
+ * aggregate cleanly). */
 static double c3d_estimate_one_subband_bytes(
     const float *restrict coeff_buf, const c3d_subband_info *sb,
     float step, float dz_ratio, uint32_t denom_shift,
-    const uint32_t *external_freqs,
     float max_abs)
 {
+    (void)denom_shift;
     c3d_invariant(sb->side >= 8u && sb->side <= 128u);
     c3d_invariant((sb->side & (sb->side - 1u)) == 0u);
     float dz_half = dz_ratio * step;
@@ -2289,37 +2482,11 @@ static double c3d_estimate_one_subband_bytes(
     size_t est_idx = 0;
     /* §S11 two-phase quant (same as c3d_encode_one_subband). */
     int32_t qv_row[128];
-#ifdef C3D_HAVE_NEON
-    const float inv_step = 1.0f / step;
-#endif
     const uint32_t sb_side = sb->side;
     for (uint32_t z = sb->z0; z < sb->z0 + sb_side; ++z)
     for (uint32_t y = sb->y0; y < sb->y0 + sb_side; ++y) {
         const float *crow = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb->x0];
-#ifdef C3D_HAVE_NEON
-        float32x4_t vdz    = vdupq_n_f32(dz_half);
-        float32x4_t vinv   = vdupq_n_f32(inv_step);
-        float32x4_t vzero  = vdupq_n_f32(0.0f);
-        uint32_t x = 0;
-        for (; x + 4 <= sb_side; x += 4) {
-            float32x4_t c  = vld1q_f32(crow + x);
-            float32x4_t ac = vabsq_f32(c);
-            uint32x4_t below = vcltq_f32(ac, vdz);
-            float32x4_t s  = vmulq_f32(vsubq_f32(ac, vdz), vinv);
-            int32x4_t  qi  = vcvtq_s32_f32(s);
-            qi = vaddq_s32(qi, vdupq_n_s32(1));
-            uint32x4_t neg = vcltq_f32(c, vzero);
-            int32x4_t  qn  = vnegq_s32(qi);
-            int32x4_t  q   = vbslq_s32(neg, qn, qi);
-            q = vbslq_s32(below, vdupq_n_s32(0), q);
-            vst1q_s32(qv_row + x, q);
-        }
-        for (; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#else
-        for (uint32_t x = 0; x < sb_side; ++x)
-            qv_row[x] = c3d_quant(crow[x], step, dz_half);
-#endif
+        c3d_quant_row(crow, qv_row, sb_side, step, dz_half);
         for (uint32_t xp = 0; xp < sb_side; ++xp) {
             uint32_t escape_mag;
             bool *sp = &prev_sign_zy[(y - sb->y0) * sb_side + xp];
@@ -2371,22 +2538,6 @@ static double c3d_estimate_one_subband_bytes(
         }
     }
 
-    if (external_freqs) {
-        bool ext_covers = true;
-        for (unsigned k = 0; k < 65; ++k) {
-            if (hist[k] > 0 && external_freqs[k] == 0) { ext_covers = false; break; }
-        }
-        if (ext_covers) {
-            double log2_M = (double)denom_shift;
-            double ext_bits = 0.0;
-            for (unsigned k = 0; k < 65; ++k) {
-                if (!hist[k]) continue;
-                ext_bits += (double)hist[k] * (log2_M - log2((double)external_freqs[k]));
-            }
-            double ext_total = 2.0 + 0.0 + 8.0 + ext_bits / 8.0 + 32.0 + (double)escape_bytes;
-            if (ext_total < self_total) return ext_total;
-        }
-    }
     return self_total;
 }
 
@@ -2458,7 +2609,7 @@ static void c3d_rd_estimate_subband(const c3d_encoder *s, unsigned sidx,
     }
     /* Per-subband framing (matches c3d_estimate_one_subband_bytes):
      *   2  freq_table_size u16
-     *   ~2 + 3*nnz  ftable_bytes (SELF mode; encoder chooses this for us)
+     *   ~2 + 3*nnz  ftable_bytes
      *   8  n_symbols + rans_block_size u32s
      *   32 rANS initial state header */
     double ftable_bytes = 2.0 + 3.0 * (double)nnz;
@@ -2757,16 +2908,12 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s)
         float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
         total += c3d_estimate_one_subband_bytes(
             s->coeff_buf, &sb, step, dz_ratio, denom_shift,
-            NULL,
             max_abs);
     }
     return total;
 }
 
 /* -- Stage 3: emit all subbands given normalised coeff_buf and chunk_scalar q.
- * If `ctx` is non-NULL, applies its overrides:
- *   - has_quantizer_baseline: step = q * baseline[s]
- *   - has_freq_tables: uses ctx's freqs, emits freq_table_size = 0 per subband
  * Writes entropy payload into out[352..], fills qmul/subband_offset/lod_offset
  * tables.  Returns total chunk size (352 + entropy bytes). */
 static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
@@ -2807,7 +2954,6 @@ static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
             float fitted_alpha = c3d_default_alpha(i);
             size_t bytes = c3d_encode_one_subband(
                 s->coeff_buf, &sb, step, dz_ratio, denom_shift,
-                NULL,
                 s->sub_symbols, s->sub_escapes,
                 s->rans_scratch, rans_scratch_size,
                 out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
@@ -2902,7 +3048,6 @@ static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
             size_t slot_cap = sub_max_offset[i + 1] - sub_max_offset[i];
             size_t bytes = c3d_encode_one_subband(
                 s->coeff_buf, &sb, step, dz_ratio, denom_shift,
-                NULL,
                 t_syms, t_esc, t_rans, rans_scratch_size,
                 slot, slot_cap,
                 max_abs, &fitted_alpha);
@@ -3054,7 +3199,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
      *
      * §S7: when warm-started, accept the warm q if it lands within ±5% of
      * target (R-D allocator can correct the rest).  Saves 2-4 iterations on
-     * sequential chunks in a shard.
+     * sequential chunks from the same dataset.
      *
      * §T14: the rate curve log(bytes) vs log(q) is nearly linear for
      * DWT+rANS on CT data, with slope ~-1.5.  We track that slope as an EMA
@@ -3473,21 +3618,17 @@ static float c3d_denoise_strength(size_t in_len)
 }
 
 /* ------------------------------------------------------------------------- *
- *  §I  Chunk decoder (SELF mode)                                            *
+ *  §I  Chunk decoder                                                        *
  * ------------------------------------------------------------------------- */
 
 /* Decodes one subband's bitstream (its full byte range), dequantizes, and
  * scatters reconstructed float coefficients into coeff_buf at the subband's
- * spatial position.
- * If `external_freqs` is non-NULL and freq_table_size == 0, uses those
- * frequencies with the provided `external_denom_shift`. */
+ * spatial position. */
 static void c3d_decode_one_subband(
     const uint8_t *restrict in, size_t in_size,
     float step, float dz_ratio, float alpha,
-    const uint32_t *external_freqs, uint32_t external_denom_shift,
     float *restrict coeff_buf, const c3d_subband_info *sb,
-    uint8_t *restrict sub_symbols, c3d_rans_tables *tbl_scratch,
-    const c3d_rans_tables *cached_external_tbl)
+    uint8_t *restrict sub_symbols, c3d_rans_tables *tbl_scratch)
 {
     c3d_invariant(sb->side >= 8u && sb->side <= 128u);
     c3d_invariant((sb->side & (sb->side - 1u)) == 0u);
@@ -3521,27 +3662,21 @@ static void c3d_decode_one_subband(
     bool ctx_2table = false;
     uint32_t ctx_freqs_z[65], ctx_freqs_nz[65];
 
-    if (ftable_bytes == 0) {
-        /* EXTERNAL: require ctx to have provided tables. */
-        c3d_assert(external_freqs != NULL);
-        denom_shift = external_denom_shift;
+    c3d_assert(ftable_bytes > 0 && r + ftable_bytes <= in_size);
+    /* First byte = ctx_mode: 0 = single table, 1 = 2-table lane-local. */
+    uint8_t ctx_mode = in[r];
+    r++;
+    if (ctx_mode == 1) {
+        ctx_2table = true;
+        size_t c1 = c3d_freqs_parse(in + r, ftable_bytes - 1, &denom_shift, ctx_freqs_z);
+        r += c1;
+        uint32_t ds2;
+        size_t c2 = c3d_freqs_parse(in + r, ftable_bytes - 1 - c1, &ds2, ctx_freqs_nz);
+        c3d_assert(ds2 == denom_shift);
+        r += c2;
     } else {
-        c3d_assert(r + ftable_bytes <= in_size);
-        /* First byte = ctx_mode: 0 = single table, 1 = 2-table lane-local. */
-        uint8_t ctx_mode = in[r];
-        r++;
-        if (ctx_mode == 1) {
-            ctx_2table = true;
-            size_t c1 = c3d_freqs_parse(in + r, ftable_bytes - 1, &denom_shift, ctx_freqs_z);
-            r += c1;
-            uint32_t ds2;
-            size_t c2 = c3d_freqs_parse(in + r, ftable_bytes - 1 - c1, &ds2, ctx_freqs_nz);
-            c3d_assert(ds2 == denom_shift);
-            r += c2;
-        } else {
-            size_t consumed = c3d_freqs_parse(in + r, ftable_bytes - 1, &denom_shift, local_freqs);
-            r += consumed;
-        }
+        size_t consumed = c3d_freqs_parse(in + r, ftable_bytes - 1, &denom_shift, local_freqs);
+        r += consumed;
     }
 
     /* n_symbols + rans_block_size */
@@ -3556,11 +3691,8 @@ static void c3d_decode_one_subband(
         c3d_rans_build_tables(&tbl_z,  denom_shift, ctx_freqs_z, 65);
         c3d_rans_build_tables(&tbl_nz, denom_shift, ctx_freqs_nz, 65);
         c3d_rans_dec_x8_ctx(in + r, rans_block_size, &tbl_z, &tbl_nz, sub_symbols, n);
-    } else if (cached_external_tbl && ftable_bytes == 0) {
-        c3d_rans_dec_x8(in + r, rans_block_size, cached_external_tbl, sub_symbols, n);
     } else {
-        const uint32_t *ftu = (ftable_bytes == 0) ? external_freqs : local_freqs;
-        c3d_rans_build_tables(tbl_scratch, denom_shift, ftu, 65);
+        c3d_rans_build_tables(tbl_scratch, denom_shift, local_freqs, 65);
         c3d_rans_dec_x8(in + r, rans_block_size, tbl_scratch, sub_symbols, n);
     }
     r += rans_block_size;
@@ -3581,12 +3713,11 @@ static void c3d_decode_one_subband(
     size_t idx = 0;
     /* Row-wise two-phase dequant.  Phase 1 (scalar): read sub_symbols, do
      * the stateful sign-prediction + escape LEB128 decode, emit qv into a
-     * stack-local row buffer.  Phase 2 (NEON): turn qv → float via the
-     * dequant formula, 4 lanes at a time, write contiguous x-run.
-     * The scalar phase keeps sp/escape flow trivially correct; NEON only
-     * touches the pure float math. */
+     * stack-local row buffer.  Phase 2 (SIMD): turn qv → float via the
+     * dequant formula, AVX512/AVX2/NEON-wide, write contiguous x-run.
+     * The scalar phase keeps sp/escape flow trivially correct; the SIMD
+     * helper only touches the pure float math. */
     int32_t qv_row[128];   /* max sb_side = 128 */
-    const float inv_step_unused = 0.0f; (void)inv_step_unused;
     for (uint32_t z = sb_z0; z < sb_z0 + sb_side; ++z)
     for (uint32_t y = sb_y0; y < sb_y0 + sb_side; ++y) {
         /* Phase 1 — scalar, keeps sp + escape state correct. */
@@ -3604,31 +3735,9 @@ static void c3d_decode_one_subband(
             bool *sp = &prev_sign_zy[(y - sb_y0) * sb_side + x];
             qv_row[x] = c3d_symbol_to_quant(sym, escape_mag, sp);
         }
-        /* Phase 2 — NEON dequant over the row. */
+        /* Phase 2 — vectorised int→float dequant (AVX512/AVX2/NEON/scalar). */
         float *out_row = &coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + sb_x0];
-#ifdef C3D_HAVE_NEON
-        float32x4_t vdz    = vdupq_n_f32(dz_half);
-        float32x4_t vstep  = vdupq_n_f32(step);
-        float32x4_t vbias  = vdupq_n_f32(alpha - 1.0f);
-        float32x4_t vzero  = vdupq_n_f32(0.0f);
-        uint32_t x = 0;
-        for (; x + 4 <= sb_side; x += 4) {
-            int32x4_t q   = vld1q_s32(qv_row + x);
-            uint32x4_t isz = vceqq_s32(q, vdupq_n_s32(0));
-            int32x4_t aq   = vabsq_s32(q);
-            float32x4_t af = vcvtq_f32_s32(aq);
-            float32x4_t mag = vfmaq_f32(vdz, vstep, vaddq_f32(af, vbias));
-            uint32x4_t neg = vcltq_s32(q, vdupq_n_s32(0));
-            float32x4_t res = vbslq_f32(neg, vnegq_f32(mag), mag);
-            res = vbslq_f32(isz, vzero, res);
-            vst1q_f32(out_row + x, res);
-        }
-        for (; x < sb_side; ++x)
-            out_row[x] = c3d_dequant(qv_row[x], step, dz_half, alpha);
-#else
-        for (uint32_t x = 0; x < sb_side; ++x)
-            out_row[x] = c3d_dequant(qv_row[x], step, dz_half, alpha);
-#endif
+        c3d_dequant_row(qv_row, out_row, sb_side, step, dz_half, alpha);
     }
     c3d_assert(esc_remaining == 0);
 }
@@ -3667,8 +3776,6 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     }
 
     unsigned n_sb = c3d_n_subbands_for_lod[lod];
-
-    const c3d_rans_tables *cached_ext = NULL;
 
     /* §T9 — quality-scalable truncation.  If `in_len` is shorter than the
      * emitted chunk (caller truncated for streaming / bandwidth-adaptive
@@ -3729,8 +3836,6 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
                 uint8_t av = alpha_ptr[s];
                 alpha = av ? c3d_alpha_from_u8(av) : c3d_default_alpha(s);
             }
-            const uint32_t *ext_freqs = NULL;
-            uint32_t ext_ds           = 0u;
             float dz_ratio = c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
             uint32_t sub_start = c3d_read_u32_le(suboff_ptr + 4 * s);
             uint32_t sub_end   = (s + 1 < n_sb)
@@ -3738,9 +3843,7 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
                                : lod_end;
             c3d_decode_one_subband(entropy + sub_start, sub_end - sub_start,
                                    step, dz_ratio, alpha,
-                                   ext_freqs, ext_ds,
-                                   d->coeff_buf, &sb, tls_syms, &tls_tbl,
-                                   cached_ext ? &cached_ext[s] : NULL);
+                                   d->coeff_buf, &sb, tls_syms, &tls_tbl);
         }
         /* tls_syms is arena-owned by the decoder; do not free here. */
     }
@@ -3775,12 +3878,9 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     /* Encoder v2: coeff_scale is already absorbed into per-subband step, so
      * dequant produces raw-magnitude coefficients.  coeff_scale in the header
      * is informational only (preserved for c3d_inspect and downstream tools). */
-    /* §T10: branch-free u8 output cast.  Previous version had `? 0.5 : -0.5`
-     * and a clamping if-ladder, both of which blocked auto-vectorization.
-     * This form is pure float arithmetic with fminf/fmaxf and single cast —
-     * clang and gcc both auto-vectorize the innermost x-loop.  Inputs to the
-     * cast live in [0, 255] after the fmaxf/fminf so (uint8_t)(v_c + 0.5f)
-     * rounds correctly (no negative-rounding case needed). */
+    /* Ternary clamp, not fminf/fmaxf: under strict IEEE math the libm
+     * calls don't lower to minss/maxss and block vectorization. v is a
+     * finite coefficient sum, so this is bit-identical for real inputs. */
     (void)coeff_scale;
     for (size_t z = 0; z < out_side; ++z) {
         for (size_t y = 0; y < out_side; ++y) {
@@ -3790,7 +3890,7 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
                                    + y * out_side;
             for (size_t x = 0; x < out_side; ++x) {
                 float v = row[x] + dc_offset + 128.0f;
-                float v_c = fminf(fmaxf(v, 0.0f), 255.0f);
+                float v_c = (v < 0.0f) ? 0.0f : ((v > 255.0f) ? 255.0f : v);
                 orow[x] = (uint8_t)(v_c + 0.5f);
             }
         }
@@ -3803,9 +3903,7 @@ void c3d_decoder_chunk_decode(c3d_decoder *d, const uint8_t *in, size_t in_len,
     c3d_decoder_chunk_decode_lod(d, in, in_len, 0, out);
 }
 
-/* §I3.  Batched multi-chunk decode — loop the single-chunk API.  When all
- * chunks share the same EXTERNAL ctx, the decoder's per-ctx rANS table
- * cache (S2) stays warm across the batch. */
+/* §I3.  Batched multi-chunk decode — loop the single-chunk API. */
 void c3d_decoder_chunks_decode(c3d_decoder *d,
                                const uint8_t *const *ins,
                                const size_t *in_sizes,
@@ -3908,5 +4006,1024 @@ void c3d_downsample_chunk_2x(const uint8_t *in, uint32_t side, uint8_t *out) {
          * For perfectly even ties (sum mod 8 == 4), bias to even. */
         if ((sum & 7u) == 4u && (rounded & 1u)) --rounded;
         out[z * half * half + y * half + x] = (uint8_t)rounded;
+    }
+}
+
+/* ========================================================================= *
+ *  §M  Labels codec — schema + octree helpers                               *
+ * ========================================================================= *
+ *
+ * Overview.  A label volume is N independently-typed channels, each a 256³
+ * u8 buffer.  Each channel has num_values ∈ [2, 255]; value 0 is reserved as
+ * "no label / padding".  The schema (channel count + names + alphabet sizes)
+ * is declared once per dataset and stored as a `.c3dls` sidecar file.
+ *
+ * Per channel per chunk, the encoder picks one of three states:
+ *   ABSENT   — channel is all zero; zero payload bytes.
+ *   UNIFORM  — channel is one value everywhere; 1 payload byte (that value).
+ *   ENCODED — full octree over 256³:
+ *               depth 0 root covers 256³, depth 5 leaves cover 8³.
+ *               Per node a 2-bit tag ∈ {UNIFORM_ZERO, UNIFORM_NZ, SUBDIVIDE,
+ *               RAW_BLOCK}.  RAW_BLOCK is depth-5-only and carries 512 packed
+ *               local-dict indices.  UNIFORM_NZ carries one local-dict index.
+ *
+ * Tag and value streams are scalar-rANS encoded; raw blocks are bit-packed
+ * at ceil(log2(dict_size + 1)) bits per voxel.                             */
+
+/* ---- octree dimensions --------------------------------------------------- */
+
+#define C3D_LABEL_OCTREE_DEPTH 5u
+#define C3D_LABEL_LEAF_SIDE    8u
+#define C3D_LABEL_LEAF_VOX     ((size_t)C3D_LABEL_LEAF_SIDE * C3D_LABEL_LEAF_SIDE * C3D_LABEL_LEAF_SIDE)
+#define C3D_LABEL_N_LEAVES     32768u   /* 32³ blocks of 8³ each */
+#define C3D_LABEL_N_NODES      37449u   /* 1+8+64+512+4096+32768 */
+
+/* Byte offset of depth d's first node in the flat node arrays. */
+static const uint32_t c3d_label_octree_offsets[C3D_LABEL_OCTREE_DEPTH + 1] = {
+    0u, 1u, 9u, 73u, 585u, 4681u
+};
+
+/* Linear offset of node (i, j, k) at depth d within the flat node array. */
+static inline uint32_t c3d_label_node_offset(unsigned depth,
+                                             uint32_t i, uint32_t j, uint32_t k) {
+    c3d_assert(depth <= C3D_LABEL_OCTREE_DEPTH);
+    uint32_t side = 1u << depth;
+    c3d_assert(i < side && j < side && k < side);
+    return c3d_label_octree_offsets[depth]
+         + (k * side * side + j * side + i);
+}
+
+/* ---- tag alphabet -------------------------------------------------------- */
+
+enum {
+    C3D_LABEL_TAG_ZERO    = 0,  /* subcube is uniformly zero                  */
+    C3D_LABEL_TAG_UNIFORM = 1,  /* subcube is uniformly one nonzero value     */
+    C3D_LABEL_TAG_SUBDIV  = 2,  /* descend 8 children                         */
+    C3D_LABEL_TAG_RAW     = 3,  /* depth-5 only: 512 raw voxels follow        */
+};
+#define C3D_LABEL_N_TAGS 4u
+
+/* rANS denom shifts for label alphabets.  12 = M=4096, plenty of precision
+ * for a 4-symbol alphabet; 12 for values too (alphabet ≤ 254). */
+#define C3D_LABEL_DENOM_SHIFT 12u
+
+/* ---- schema -------------------------------------------------------------- */
+
+struct c3d_label_schema {
+    uint32_t count;
+    uint8_t  num_values[C3D_LABEL_MAX_CHANNELS];
+    char    *names     [C3D_LABEL_MAX_CHANNELS];
+    uint8_t  name_len  [C3D_LABEL_MAX_CHANNELS];
+    uint8_t  hash[16];
+    bool     hash_valid;
+};
+
+c3d_label_schema *c3d_label_schema_new(void) {
+    c3d_label_schema *s = calloc(1, sizeof *s);
+    c3d_assert(s);
+    return s;
+}
+
+void c3d_label_schema_free(c3d_label_schema *s) {
+    if (!s) return;
+    for (uint32_t i = 0; i < s->count; ++i) free(s->names[i]);
+    free(s);
+}
+
+void c3d_label_schema_add_channel(c3d_label_schema *s,
+                                  const char *name, uint8_t num_values) {
+    c3d_assert(s && name);
+    c3d_assert(s->count < C3D_LABEL_MAX_CHANNELS);
+    c3d_assert(num_values >= 2u);
+    size_t nlen = strlen(name);
+    c3d_assert(nlen >= 1u && nlen <= C3D_LABEL_MAX_NAME_LEN);
+    for (uint32_t i = 0; i < s->count; ++i) {
+        bool same = (s->name_len[i] == nlen)
+                 && (memcmp(s->names[i], name, nlen) == 0);
+        c3d_assert(!same);  /* duplicate channel name */
+    }
+    char *copy = malloc(nlen + 1);
+    c3d_assert(copy);
+    memcpy(copy, name, nlen);
+    copy[nlen] = 0;
+    s->names     [s->count] = copy;
+    s->name_len  [s->count] = (uint8_t)nlen;
+    s->num_values[s->count] = num_values;
+    s->count++;
+    s->hash_valid = false;
+}
+
+uint32_t c3d_label_schema_channel_count(const c3d_label_schema *s) {
+    c3d_assert(s); return s->count;
+}
+uint8_t c3d_label_schema_channel_num_values(const c3d_label_schema *s, uint32_t i) {
+    c3d_assert(s && i < s->count); return s->num_values[i];
+}
+const char *c3d_label_schema_channel_name(const c3d_label_schema *s, uint32_t i) {
+    c3d_assert(s && i < s->count); return s->names[i];
+}
+
+size_t c3d_label_schema_serialized_size(const c3d_label_schema *s) {
+    c3d_assert(s);
+    /* magic(8) + version(1) + chan_count(1) + per-chan(name_len(1)+name+num(1)) + hash(16) */
+    size_t n = 8 + 1 + 1 + 16;
+    for (uint32_t i = 0; i < s->count; ++i) n += 1u + s->name_len[i] + 1u;
+    return n;
+}
+
+/* Shared body writer: produces bytes [0, w) — everything up to (but not
+ * including) the trailing hash.  Returns w. */
+static size_t c3d_label_schema_write_body(const c3d_label_schema *s, uint8_t *out) {
+    size_t w = 0;
+    memcpy(out + w, C3D_LABEL_SCHEMA_MAGIC, 8); w += 8;
+    out[w++] = 1u;  /* version */
+    out[w++] = (uint8_t)s->count;
+    for (uint32_t i = 0; i < s->count; ++i) {
+        out[w++] = s->name_len[i];
+        memcpy(out + w, s->names[i], s->name_len[i]);
+        w += s->name_len[i];
+        out[w++] = s->num_values[i];
+    }
+    return w;
+}
+
+/* The hash cache on `c3d_label_schema` is an implementation detail that lets
+ * us avoid recomputing c3d_hash128 on every call.  Callers pass const*; we
+ * write the cache via a void* intermediate (legal under C aliasing rules,
+ * and silences -Wcast-qual). */
+static inline c3d_label_schema *c3d_label_schema_mut(const c3d_label_schema *s) {
+    void *p = (void *)(uintptr_t)s;
+    return (c3d_label_schema *)p;
+}
+
+void c3d_label_schema_hash(const c3d_label_schema *s, uint8_t out[16]) {
+    c3d_assert(s && out);
+    c3d_label_schema *ms = c3d_label_schema_mut(s);
+    if (!ms->hash_valid) {
+        size_t sz = c3d_label_schema_serialized_size(s) - 16;
+        uint8_t *buf = malloc(sz);
+        c3d_assert(buf);
+        size_t w = c3d_label_schema_write_body(s, buf);
+        c3d_assert(w == sz);
+        c3d_hash128(buf, w, ms->hash);
+        ms->hash_valid = true;
+        free(buf);
+    }
+    memcpy(out, ms->hash, 16);
+}
+
+size_t c3d_label_schema_serialize(const c3d_label_schema *s, uint8_t *out, size_t cap) {
+    c3d_assert(s && out);
+    size_t sz = c3d_label_schema_serialized_size(s);
+    c3d_assert(cap >= sz);
+    size_t w = c3d_label_schema_write_body(s, out);
+    uint8_t h[16];
+    c3d_hash128(out, w, h);
+    memcpy(out + w, h, 16); w += 16;
+    c3d_assert(w == sz);
+    c3d_label_schema *ms = c3d_label_schema_mut(s);
+    memcpy(ms->hash, h, 16);
+    ms->hash_valid = true;
+    return w;
+}
+
+c3d_label_schema *c3d_label_schema_parse(const uint8_t *in, size_t len) {
+    c3d_assert(in);
+    /* Minimum: magic(8) + ver(1) + count(1) + 1 channel (3 B min) + hash(16) = 29. */
+    c3d_assert(len >= 8u + 1u + 1u + 3u + 16u);
+    c3d_assert(memcmp(in, C3D_LABEL_SCHEMA_MAGIC, 8) == 0);
+    uint8_t ver = in[8];
+    c3d_assert(ver == 1u);
+    uint8_t n = in[9];
+    c3d_assert(n >= 1u);
+
+    c3d_label_schema *s = c3d_label_schema_new();
+    size_t r = 10;
+    char tmp[C3D_LABEL_MAX_NAME_LEN + 1];
+    for (unsigned i = 0; i < n; ++i) {
+        c3d_assert(r + 1u <= len);
+        uint8_t nl = in[r]; r++;
+        c3d_assert(nl >= 1u && nl <= C3D_LABEL_MAX_NAME_LEN);
+        c3d_assert(r + (size_t)nl + 1u + 16u <= len);
+        memcpy(tmp, in + r, nl); tmp[nl] = 0;
+        r += nl;
+        uint8_t nv = in[r]; r++;
+        c3d_assert(nv >= 2u);
+        c3d_label_schema_add_channel(s, tmp, nv);  /* rejects duplicate names */
+    }
+    c3d_assert(r + 16u == len);
+    uint8_t h[16];
+    c3d_hash128(in, r, h);
+    c3d_assert(memcmp(h, in + r, 16) == 0);
+    memcpy(s->hash, h, 16);
+    s->hash_valid = true;
+    return s;
+}
+
+/* ---- local-dict builder -------------------------------------------------- */
+
+/* Scan a 256³ channel buffer, build a sorted local-dict of distinct nonzero
+ * values.  Returns dict_size ∈ [0, 254].  l2g[0..dict_size) holds the sorted
+ * global values; g2l[v] maps a nonzero global value v → 0-based local index
+ * (written only for v present in the buffer; 0 slot is meaningless).
+ * Also returns the (min, max) observed, used by callers for ABSENT/UNIFORM
+ * detection without re-scanning. */
+static uint32_t c3d_label_build_dict(const uint8_t *buf,
+                                     uint8_t l2g[256], int16_t g2l[256],
+                                     uint8_t *out_min, uint8_t *out_max)
+{
+    bool seen[256];
+    memset(seen, 0, sizeof seen);
+    uint8_t mn = 255, mx = 0;
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        uint8_t v = buf[i];
+        seen[v] = true;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    uint32_t n = 0;
+    for (unsigned v = 1; v < 256; ++v) {
+        if (seen[v]) {
+            l2g[n] = (uint8_t)v;
+            g2l[v] = (int16_t)n;
+            n++;
+        }
+    }
+    *out_min = mn; *out_max = mx;
+    return n;
+}
+
+/* ---- generic freq normaliser for arbitrary alphabet size ----------------- */
+
+/* Same algorithm as c3d_normalise_freqs but parameterised on n_symbols.
+ * Used by the labels codec (tag alphabet = 4, value alphabet ≤ 254). */
+static void c3d_label_normalise_freqs(const uint32_t *hist, size_t n_symbols,
+                                      uint32_t denom_shift, uint32_t *freqs) {
+    c3d_assert(denom_shift >= 1u && denom_shift <= 14u);
+    c3d_assert(n_symbols <= C3D_RANS_MAX_SYMBOLS);
+    const uint32_t M = 1u << denom_shift;
+    uint64_t T = 0;
+    for (size_t i = 0; i < n_symbols; ++i) T += hist[i];
+    c3d_assert(T > 0u);
+    uint64_t used = 0;
+    for (size_t i = 0; i < n_symbols; ++i) {
+        if (hist[i] == 0u) { freqs[i] = 0u; continue; }
+        uint64_t f = ((uint64_t)hist[i] * M) / T;
+        if (f == 0u) f = 1u;
+        freqs[i] = (uint32_t)f;
+        used += f;
+    }
+    while (used != M) {
+        size_t best = 0; uint32_t best_f = freqs[0];
+        for (size_t i = 1; i < n_symbols; ++i) {
+            if (freqs[i] > best_f) { best_f = freqs[i]; best = i; }
+        }
+        if (used > M) {
+            uint64_t over = used - M;
+            uint32_t keep_min = (hist[best] > 0u) ? 1u : 0u;
+            uint32_t max_trim = freqs[best] - keep_min;
+            uint32_t trim = (over < max_trim) ? (uint32_t)over : max_trim;
+            c3d_assert(trim > 0u);
+            freqs[best] -= trim;
+            used -= trim;
+        } else {
+            freqs[best] += (uint32_t)(M - used);
+            used = M;
+        }
+    }
+    for (size_t i = 0; i < n_symbols; ++i)
+        if (hist[i] > 0u) c3d_assert(freqs[i] >= 1u);
+}
+
+/* ========================================================================= *
+ *  §N  Labels codec — per-channel encode / decode + chunk pipeline          *
+ * ========================================================================= */
+
+struct c3d_label_encoder {
+    const c3d_label_schema *schema;
+    /* Scratch, lazily allocated on first encode. */
+    uint8_t *tag_at;       /* [C3D_LABEL_N_NODES] */
+    uint8_t *value_at;     /* [C3D_LABEL_N_NODES] */
+    uint8_t *tag_seq;      /* ≤ C3D_LABEL_N_NODES */
+    uint8_t *val_seq;      /* ≤ C3D_LABEL_N_LEAVES */
+    uint8_t *raw_syms;     /* unpacked raw-block voxels (local-dict idx+1) */
+    uint8_t *rans_scratch; /* scratch for reverse-encoded rANS output      */
+};
+
+c3d_label_encoder *c3d_label_encoder_new(const c3d_label_schema *schema) {
+    c3d_assert(schema && schema->count > 0u);
+    c3d_label_encoder *e = calloc(1, sizeof *e);
+    c3d_assert(e);
+    e->schema       = schema;
+    e->tag_at       = malloc(C3D_LABEL_N_NODES);
+    e->value_at     = malloc(C3D_LABEL_N_NODES);
+    e->tag_seq      = malloc(C3D_LABEL_N_NODES);
+    e->val_seq      = malloc(C3D_LABEL_N_LEAVES);
+    e->raw_syms     = malloc(C3D_VOXELS_PER_CHUNK);  /* worst-case 16 MiB */
+    e->rans_scratch = malloc((size_t)2 * C3D_LABEL_N_NODES + 4096u);
+    c3d_assert(e->tag_at && e->value_at && e->tag_seq && e->val_seq
+               && e->raw_syms && e->rans_scratch);
+    return e;
+}
+
+void c3d_label_encoder_free(c3d_label_encoder *e) {
+    if (!e) return;
+    free(e->tag_at); free(e->value_at);
+    free(e->tag_seq); free(e->val_seq);
+    free(e->raw_syms); free(e->rans_scratch);
+    free(e);
+}
+
+struct c3d_label_decoder {
+    const c3d_label_schema *schema;
+    uint8_t *tag_at;
+    uint8_t *value_at;
+    uint8_t *raw_syms;     /* scratch for unpacked raw-block voxels        */
+};
+
+c3d_label_decoder *c3d_label_decoder_new(const c3d_label_schema *schema) {
+    c3d_assert(schema && schema->count > 0u);
+    c3d_label_decoder *d = calloc(1, sizeof *d);
+    c3d_assert(d);
+    d->schema   = schema;
+    d->tag_at   = malloc(C3D_LABEL_N_NODES);
+    d->value_at = malloc(C3D_LABEL_N_NODES);
+    d->raw_syms = malloc(C3D_VOXELS_PER_CHUNK);
+    c3d_assert(d->tag_at && d->value_at && d->raw_syms);
+    return d;
+}
+
+void c3d_label_decoder_free(c3d_label_decoder *d) {
+    if (!d) return;
+    free(d->tag_at); free(d->value_at); free(d->raw_syms);
+    free(d);
+}
+
+/* ---- chunk header sizes -------------------------------------------------- */
+
+#define C3D_LABEL_CHUNK_HEADER_MIN 22u  /* magic(4)+ver(1)+hash(16)+count(1) */
+
+static inline size_t c3d_label_chunk_header_size(uint32_t chan_count) {
+    /* header + per-channel state + per-channel uniform-value byte */
+    return (size_t)C3D_LABEL_CHUNK_HEADER_MIN + (size_t)chan_count * 2u;
+}
+
+size_t c3d_label_encoder_max_chunk_size(const c3d_label_encoder *e) {
+    c3d_assert(e);
+    uint32_t n = e->schema->count;
+    /* Per-channel encoded stream worst case:
+     *   stream_len u32 + local_dict (256) + tag_freqs u16[4] + n_unz/n_raw u32
+     *   + val_freqs u16[256] + tag_rANS (≤ N_NODES + 16) + val_rANS (≤ N_LEAVES + 16)
+     *   + raw packed (≤ 16 MiB) */
+    size_t per = 4u + 1u + 256u + 8u + 8u + 512u
+               + (C3D_LABEL_N_NODES + 16u)
+               + (C3D_LABEL_N_LEAVES + 16u)
+               + C3D_VOXELS_PER_CHUNK;
+    return c3d_label_chunk_header_size(n) + per * (size_t)n;
+}
+
+/* ---- rANS encode of a symbol array into scratch (reverse path) ---------- *
+ *
+ * Returns bytes written into out[0..n_out); encoder writes backwards into
+ * `scratch[scratch_size]` and then memcpy's forward.                        */
+static size_t c3d_label_rans_encode(const uint8_t *symbols, size_t n_syms,
+                                    const c3d_rans_tables *tbl,
+                                    uint8_t *scratch, size_t scratch_size,
+                                    uint8_t *out, size_t out_cap)
+{
+    uint8_t *buf_end = scratch + scratch_size;
+    uint8_t *buf_ptr = buf_end;
+    const uint8_t *buf_beg = scratch;
+
+    uint32_t state;
+    c3d_rans_enc_init(&state);
+    for (size_t i = n_syms; i-- > 0; ) {
+        uint8_t s = symbols[i];
+        const c3d_rans_sym *sym = &tbl->syms[s];
+        c3d_assert(sym->freq > 0u);
+        c3d_rans_enc_put(&state, &buf_ptr, buf_beg, sym->start, sym->freq, tbl->denom_shift);
+    }
+    c3d_rans_enc_flush(state, &buf_ptr, buf_beg);
+    size_t nbytes = (size_t)(buf_end - buf_ptr);
+    c3d_assert(nbytes <= out_cap);
+    memcpy(out, buf_ptr, nbytes);
+    return nbytes;
+}
+
+/* Inverse — reads `nbytes` from in[0..nbytes) and writes `n_syms` into
+ * symbols[].  Panics on truncation / bad state. */
+static void c3d_label_rans_decode(const uint8_t *in, size_t nbytes,
+                                  const c3d_rans_tables *tbl,
+                                  uint8_t *symbols, size_t n_syms)
+{
+    const uint8_t *p   = in;
+    const uint8_t *p_e = in + nbytes;
+    uint32_t state;
+    c3d_rans_dec_init(&state, &p, p_e);
+    for (size_t i = 0; i < n_syms; ++i) {
+        uint32_t s = c3d_rans_dec_get(&state, tbl);
+        c3d_assert(s < C3D_RANS_MAX_SYMBOLS);
+        symbols[i] = (uint8_t)s;
+        c3d_rans_dec_renorm(&state, &p, p_e);
+    }
+    c3d_assert(p == p_e);
+    c3d_assert(state == C3D_RANS_BYTE_L);
+}
+
+/* ---- bit-pack helpers for raw-block voxels ------------------------------- */
+
+/* Pack `n` symbols each in [0, 2^bits) into `out`.  Returns bytes written. */
+static size_t c3d_label_bitpack(const uint8_t *syms, size_t n, unsigned bits,
+                                uint8_t *out, size_t out_cap)
+{
+    c3d_assert(bits >= 1u && bits <= 8u);
+    size_t nbytes = (n * bits + 7u) / 8u;
+    c3d_assert(nbytes <= out_cap);
+    memset(out, 0, nbytes);
+    size_t bitpos = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t v = syms[i];
+        c3d_assert(v < (1u << bits));
+        for (unsigned b = 0; b < bits; ++b) {
+            if ((v >> b) & 1u) {
+                size_t bp = bitpos + b;
+                out[bp >> 3] |= (uint8_t)(1u << (bp & 7u));
+            }
+        }
+        bitpos += bits;
+    }
+    return nbytes;
+}
+
+static void c3d_label_bitunpack(const uint8_t *in, size_t nbytes, unsigned bits,
+                                uint8_t *out, size_t n)
+{
+    c3d_assert(bits >= 1u && bits <= 8u);
+    c3d_assert(nbytes >= (n * bits + 7u) / 8u);
+    size_t bitpos = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t v = 0;
+        for (unsigned b = 0; b < bits; ++b) {
+            size_t bp = bitpos + b;
+            if ((in[bp >> 3] >> (bp & 7u)) & 1u) v |= (1u << b);
+        }
+        out[i] = (uint8_t)v;
+        bitpos += bits;
+    }
+}
+
+static inline unsigned c3d_label_bits_for_alphabet(uint32_t n) {
+    /* ceil(log2(n)) for n ≥ 2. */
+    c3d_assert(n >= 2u);
+    unsigned b = 0;
+    uint32_t m = n - 1u;
+    while (m) { b++; m >>= 1; }
+    return b;
+}
+
+/* ---- per-channel encode -------------------------------------------------- */
+
+/* Encode one ENCODED channel stream.  Returns stream bytes written including
+ * the leading u32 stream_len field.  Caller already verified the channel
+ * isn't ABSENT or UNIFORM. */
+static size_t c3d_label_encode_channel_encoded(c3d_label_encoder *e,
+                                               const uint8_t *buf,
+                                               uint8_t num_values,
+                                               uint8_t *out, size_t cap)
+{
+    c3d_assert(((uintptr_t)buf & (C3D_ALIGN - 1u)) == 0u);
+    c3d_assert(cap >= 4u);
+
+    /* Local dict. */
+    uint8_t  l2g[256];
+    int16_t  g2l[256];
+    for (unsigned i = 0; i < 256; ++i) g2l[i] = -1;
+    uint8_t  mn, mx;
+    uint32_t dict_size = c3d_label_build_dict(buf, l2g, g2l, &mn, &mx);
+    c3d_assert(dict_size >= 1u && dict_size <= 254u);
+    c3d_assert(mx < num_values);
+
+    /* Pass 1: classify 8³ leaves (depth 5 of the octree). */
+    uint8_t *tag_at = e->tag_at;
+    uint8_t *val_at = e->value_at;
+    for (uint32_t kk = 0; kk < 32u; ++kk)
+    for (uint32_t jj = 0; jj < 32u; ++jj)
+    for (uint32_t ii = 0; ii < 32u; ++ii) {
+        uint32_t x0 = ii * 8u, y0 = jj * 8u, z0 = kk * 8u;
+        uint8_t u_val = buf[((size_t)z0 * 256u + y0) * 256u + x0];
+        bool uniform = true;
+        for (uint32_t dz = 0; dz < 8u && uniform; ++dz)
+        for (uint32_t dy = 0; dy < 8u && uniform; ++dy)
+        for (uint32_t dx = 0; dx < 8u; ++dx) {
+            uint8_t v = buf[((size_t)(z0 + dz) * 256u + (y0 + dy)) * 256u + (x0 + dx)];
+            if (v != u_val) { uniform = false; break; }
+        }
+        uint32_t off = c3d_label_node_offset(5u, ii, jj, kk);
+        if (uniform) {
+            if (u_val == 0u) {
+                tag_at[off] = C3D_LABEL_TAG_ZERO;
+            } else {
+                tag_at[off] = C3D_LABEL_TAG_UNIFORM;
+                val_at[off] = (uint8_t)g2l[u_val];
+            }
+        } else {
+            tag_at[off] = C3D_LABEL_TAG_RAW;
+        }
+    }
+
+    /* Pass 2: propagate tags up the tree (depths 4 → 0). */
+    for (int d = 4; d >= 0; --d) {
+        uint32_t side = 1u << d;
+        for (uint32_t kk = 0; kk < side; ++kk)
+        for (uint32_t jj = 0; jj < side; ++jj)
+        for (uint32_t ii = 0; ii < side; ++ii) {
+            uint32_t coff0 = c3d_label_node_offset((unsigned)(d + 1), 2u*ii, 2u*jj, 2u*kk);
+            uint8_t first_tag = tag_at[coff0];
+            uint8_t first_val = val_at[coff0];
+            bool all_zero     = (first_tag == C3D_LABEL_TAG_ZERO);
+            bool all_same_unz = (first_tag == C3D_LABEL_TAG_UNIFORM);
+            for (uint32_t ci = 1u; ci < 8u; ++ci) {
+                uint32_t dx = ci & 1u, dy = (ci >> 1) & 1u, dz = (ci >> 2) & 1u;
+                uint32_t coff = c3d_label_node_offset((unsigned)(d + 1),
+                                                      2u*ii + dx, 2u*jj + dy, 2u*kk + dz);
+                uint8_t t = tag_at[coff];
+                if (t != C3D_LABEL_TAG_ZERO) all_zero = false;
+                if (t != C3D_LABEL_TAG_UNIFORM || val_at[coff] != first_val) all_same_unz = false;
+            }
+            uint32_t off = c3d_label_node_offset((unsigned)d, ii, jj, kk);
+            if (all_zero) {
+                tag_at[off] = C3D_LABEL_TAG_ZERO;
+            } else if (all_same_unz) {
+                tag_at[off] = C3D_LABEL_TAG_UNIFORM;
+                val_at[off] = first_val;
+            } else {
+                tag_at[off] = C3D_LABEL_TAG_SUBDIV;
+            }
+        }
+    }
+
+    /* Pass 3: DFS emit — produce tag_seq, val_seq, raw_syms in visit order. */
+    typedef struct { uint8_t depth; uint32_t i, j, k; } dfs_node;
+    dfs_node stk[C3D_LABEL_OCTREE_DEPTH * 8u + 16u];
+    int sp = 0;
+    stk[sp++] = (dfs_node){ 0u, 0u, 0u, 0u };
+
+    uint8_t *tag_seq = e->tag_seq;
+    uint8_t *val_seq = e->val_seq;
+    uint8_t *raw_syms = e->raw_syms;
+    uint32_t n_tags = 0, n_unz = 0, n_raw = 0;
+    size_t raw_pos = 0;
+
+    while (sp > 0) {
+        dfs_node node = stk[--sp];
+        uint32_t off = c3d_label_node_offset(node.depth, node.i, node.j, node.k);
+        uint8_t t = tag_at[off];
+        tag_seq[n_tags++] = t;
+        if (t == C3D_LABEL_TAG_UNIFORM) {
+            val_seq[n_unz++] = val_at[off];
+        } else if (t == C3D_LABEL_TAG_RAW) {
+            c3d_assert(node.depth == C3D_LABEL_OCTREE_DEPTH);
+            uint32_t x0 = node.i * 8u, y0 = node.j * 8u, z0 = node.k * 8u;
+            for (uint32_t dz = 0; dz < 8u; ++dz)
+            for (uint32_t dy = 0; dy < 8u; ++dy)
+            for (uint32_t dx = 0; dx < 8u; ++dx) {
+                uint8_t gv = buf[((size_t)(z0 + dz) * 256u + (y0 + dy)) * 256u + (x0 + dx)];
+                /* Raw symbol alphabet: 0 = "no label", 1..dict_size = dict indices. */
+                uint8_t sym = (gv == 0u) ? 0u : (uint8_t)(g2l[gv] + 1);
+                raw_syms[raw_pos++] = sym;
+            }
+            n_raw++;
+        } else if (t == C3D_LABEL_TAG_SUBDIV) {
+            for (int ci = 7; ci >= 0; --ci) {
+                uint32_t dx = (uint32_t)ci & 1u,
+                         dy = ((uint32_t)ci >> 1) & 1u,
+                         dz = ((uint32_t)ci >> 2) & 1u;
+                stk[sp++] = (dfs_node){ (uint8_t)(node.depth + 1u),
+                                        node.i * 2u + dx,
+                                        node.j * 2u + dy,
+                                        node.k * 2u + dz };
+            }
+        }
+    }
+
+    /* Build tag freqs + rANS table. */
+    uint32_t tag_hist[C3D_LABEL_N_TAGS] = {0};
+    for (uint32_t i = 0; i < n_tags; ++i) tag_hist[tag_seq[i]]++;
+    uint32_t tag_freqs[C3D_LABEL_N_TAGS];
+    c3d_label_normalise_freqs(tag_hist, C3D_LABEL_N_TAGS, C3D_LABEL_DENOM_SHIFT, tag_freqs);
+    c3d_rans_tables tag_tbl;
+    c3d_rans_build_tables(&tag_tbl, C3D_LABEL_DENOM_SHIFT, tag_freqs, C3D_LABEL_N_TAGS);
+
+    /* Optional value stream: only if dict_size > 1 AND n_unz > 0 (UNIFORM_NZ
+     * leaves carry a value; dict_size==1 implies the only nonzero value). */
+    bool emit_val_stream = (dict_size > 1u) && (n_unz > 0u);
+    uint32_t val_freqs[256] = {0};
+    c3d_rans_tables val_tbl;
+    if (emit_val_stream) {
+        uint32_t val_hist[256] = {0};
+        for (uint32_t i = 0; i < n_unz; ++i) {
+            c3d_assert(val_seq[i] < dict_size);
+            val_hist[val_seq[i]]++;
+        }
+        c3d_label_normalise_freqs(val_hist, dict_size, C3D_LABEL_DENOM_SHIFT, val_freqs);
+        c3d_rans_build_tables(&val_tbl, C3D_LABEL_DENOM_SHIFT, val_freqs, dict_size);
+    }
+
+    /* Raw block bit-width: symbol alphabet = dict_size + 1 ({0} ∪ dict).
+     * For dict_size=1 (binary channel): bits=1. */
+    unsigned raw_bits = c3d_label_bits_for_alphabet(dict_size + 1u);
+
+    /* Layout:
+     *   u32 stream_len
+     *   u8  dict_size
+     *   u8[dict_size] local_dict
+     *   u16[4] tag_freqs
+     *   u32 n_unz
+     *   u32 n_raw
+     *   (if emit_val_stream) u16[dict_size] val_freqs
+     *   u32 tag_rans_bytes
+     *   u8[tag_rans_bytes] tag_rans body
+     *   (if emit_val_stream) u32 val_rans_bytes + body
+     *   u8[ceil(n_raw*512*raw_bits/8)] raw packed */
+    c3d_assert(cap >= 4u);
+    size_t w = 4u;  /* reserve for stream_len */
+    c3d_assert(w + 1u + dict_size + 8u + 8u <= cap);
+    out[w++] = (uint8_t)dict_size;
+    memcpy(out + w, l2g, dict_size); w += dict_size;
+    for (unsigned i = 0; i < C3D_LABEL_N_TAGS; ++i) {
+        c3d_write_u16_le(out + w, (uint16_t)tag_freqs[i]); w += 2u;
+    }
+    c3d_write_u32_le(out + w, n_unz); w += 4u;
+    c3d_write_u32_le(out + w, n_raw); w += 4u;
+    if (emit_val_stream) {
+        c3d_assert(w + 2u * dict_size <= cap);
+        for (uint32_t i = 0; i < dict_size; ++i) {
+            c3d_write_u16_le(out + w, (uint16_t)val_freqs[i]); w += 2u;
+        }
+    }
+    /* Tag rANS. */
+    c3d_assert(w + 4u <= cap);
+    size_t tag_len_pos = w; w += 4u;
+    size_t tag_bytes = c3d_label_rans_encode(tag_seq, n_tags, &tag_tbl,
+                                             e->rans_scratch,
+                                             (size_t)2 * C3D_LABEL_N_NODES + 4096u,
+                                             out + w, cap - w);
+    c3d_write_u32_le(out + tag_len_pos, (uint32_t)tag_bytes); w += tag_bytes;
+    /* Value rANS. */
+    if (emit_val_stream) {
+        c3d_assert(w + 4u <= cap);
+        size_t val_len_pos = w; w += 4u;
+        size_t val_bytes = c3d_label_rans_encode(val_seq, n_unz, &val_tbl,
+                                                 e->rans_scratch,
+                                                 (size_t)2 * C3D_LABEL_N_NODES + 4096u,
+                                                 out + w, cap - w);
+        c3d_write_u32_le(out + val_len_pos, (uint32_t)val_bytes); w += val_bytes;
+    }
+    /* Raw bit-packed voxels. */
+    size_t raw_bytes = c3d_label_bitpack(raw_syms, raw_pos, raw_bits,
+                                         out + w, cap - w);
+    w += raw_bytes;
+    /* Finalize stream_len (doesn't include the 4-byte stream_len prefix). */
+    c3d_assert(w >= 4u);
+    c3d_write_u32_le(out, (uint32_t)(w - 4u));
+    return w;
+}
+
+size_t c3d_label_encoder_chunk_encode(c3d_label_encoder *e,
+                                      const uint8_t *const *channels,
+                                      uint8_t *out, size_t cap)
+{
+    c3d_assert(e && channels && out);
+    uint32_t n = e->schema->count;
+    size_t hdr = c3d_label_chunk_header_size(n);
+    c3d_assert(cap >= hdr);
+
+    /* Header: magic + ver + schema_hash + chan_count + state[N] + unif[N]. */
+    memcpy(out, C3D_LABEL_CHUNK_MAGIC, 4);
+    out[4] = 1u;  /* version */
+    uint8_t sh[16];
+    c3d_label_schema_hash(e->schema, sh);
+    memcpy(out + 5, sh, 16);
+    out[21] = (uint8_t)n;
+    uint8_t *state_row   = out + 22;
+    uint8_t *uniform_row = out + 22 + n;
+    memset(state_row, 0, n);
+    memset(uniform_row, 0, n);
+    size_t w = hdr;
+
+    for (uint32_t c = 0; c < n; ++c) {
+        const uint8_t *buf = channels[c];
+        uint8_t num_values = e->schema->num_values[c];
+        if (!buf) {
+            state_row[c] = (uint8_t)C3D_LABEL_STATE_ABSENT;
+            continue;
+        }
+        c3d_assert(((uintptr_t)buf & (C3D_ALIGN - 1u)) == 0u);
+
+        /* Quick scan for ABSENT / UNIFORM. */
+        uint8_t mn = 255u, mx = 0u;
+        for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+            uint8_t v = buf[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        c3d_assert(mx < num_values);
+        if (mx == 0u) {
+            state_row[c] = (uint8_t)C3D_LABEL_STATE_ABSENT;
+            continue;
+        }
+        if (mn == mx) {
+            state_row[c]   = (uint8_t)C3D_LABEL_STATE_UNIFORM;
+            uniform_row[c] = mn;
+            continue;
+        }
+        state_row[c] = (uint8_t)C3D_LABEL_STATE_ENCODED;
+        size_t bytes = c3d_label_encode_channel_encoded(e, buf, num_values,
+                                                        out + w, cap - w);
+        w += bytes;
+    }
+    return w;
+}
+
+/* ---- per-channel decode -------------------------------------------------- */
+
+static void c3d_label_decode_channel_encoded(c3d_label_decoder *d,
+                                             const uint8_t *in, size_t len,
+                                             uint8_t num_values,
+                                             uint8_t *out)
+{
+    c3d_assert(((uintptr_t)out & (C3D_ALIGN - 1u)) == 0u);
+    c3d_assert(len >= 1u + 1u + 8u + 8u);  /* minimal ENCODED stream */
+
+    size_t r = 0;
+    uint32_t dict_size = in[r++];
+    c3d_assert(dict_size >= 1u && dict_size <= 254u);
+    c3d_assert(dict_size < num_values);
+    c3d_assert(r + dict_size + 8u + 8u <= len);
+    uint8_t l2g[256];
+    memcpy(l2g, in + r, dict_size); r += dict_size;
+    /* Verify dict is strictly increasing and all < num_values. */
+    uint8_t prev = 0;
+    for (uint32_t i = 0; i < dict_size; ++i) {
+        c3d_assert(l2g[i] > prev && l2g[i] < num_values);
+        prev = l2g[i];
+    }
+
+    uint32_t tag_freqs[C3D_LABEL_N_TAGS];
+    for (unsigned i = 0; i < C3D_LABEL_N_TAGS; ++i) {
+        tag_freqs[i] = c3d_read_u16_le(in + r); r += 2u;
+    }
+    uint32_t freq_sum = 0;
+    for (unsigned i = 0; i < C3D_LABEL_N_TAGS; ++i) freq_sum += tag_freqs[i];
+    c3d_assert(freq_sum == (1u << C3D_LABEL_DENOM_SHIFT));
+    c3d_rans_tables tag_tbl;
+    c3d_rans_build_tables(&tag_tbl, C3D_LABEL_DENOM_SHIFT, tag_freqs, C3D_LABEL_N_TAGS);
+
+    uint32_t n_unz = c3d_read_u32_le(in + r); r += 4u;
+    uint32_t n_raw = c3d_read_u32_le(in + r); r += 4u;
+    c3d_assert(n_unz <= C3D_LABEL_N_LEAVES);
+    c3d_assert(n_raw <= C3D_LABEL_N_LEAVES);
+
+    bool emit_val_stream = (dict_size > 1u) && (n_unz > 0u);
+    c3d_rans_tables val_tbl;
+    if (emit_val_stream) {
+        c3d_assert(r + 2u * dict_size <= len);
+        uint32_t val_freqs[256];
+        for (uint32_t i = 0; i < dict_size; ++i) {
+            val_freqs[i] = c3d_read_u16_le(in + r); r += 2u;
+        }
+        uint32_t vfs = 0;
+        for (uint32_t i = 0; i < dict_size; ++i) vfs += val_freqs[i];
+        c3d_assert(vfs == (1u << C3D_LABEL_DENOM_SHIFT));
+        c3d_rans_build_tables(&val_tbl, C3D_LABEL_DENOM_SHIFT, val_freqs, dict_size);
+    }
+
+    /* Tag rANS body. */
+    c3d_assert(r + 4u <= len);
+    uint32_t tag_bytes = c3d_read_u32_le(in + r); r += 4u;
+    c3d_assert(r + tag_bytes <= len);
+    /* Decode all tags into d->tag_at (overloaded: flat array sized N_NODES). */
+    /* First we need to know how many tags — it's exactly the DFS-visit
+     * length, which we reconstruct on-the-fly.  Use an explicit decode loop
+     * that follows the same DFS ordering as the encoder. */
+    /* To avoid a second pass, decode tags one-at-a-time as we traverse. */
+    const uint8_t *tag_p   = in + r;
+    const uint8_t *tag_p_e = in + r + tag_bytes;
+    uint32_t tag_state;
+    c3d_rans_dec_init(&tag_state, &tag_p, tag_p_e);
+
+    r += tag_bytes;
+
+    /* Value rANS body (pre-decoded into d->value_at linearly). */
+    uint8_t *val_seq = d->value_at;  /* reuse scratch */
+    if (emit_val_stream) {
+        c3d_assert(r + 4u <= len);
+        uint32_t val_bytes = c3d_read_u32_le(in + r); r += 4u;
+        c3d_assert(r + val_bytes <= len);
+        c3d_label_rans_decode(in + r, val_bytes, &val_tbl, val_seq, n_unz);
+        r += val_bytes;
+    }
+    uint32_t val_consumed = 0;
+
+    /* Raw bit-packed voxels. */
+    unsigned raw_bits = c3d_label_bits_for_alphabet(dict_size + 1u);
+    size_t raw_symbols_needed = (size_t)n_raw * C3D_LABEL_LEAF_VOX;
+    size_t raw_bytes_needed = (raw_symbols_needed * raw_bits + 7u) / 8u;
+    c3d_assert(r + raw_bytes_needed == len);
+    c3d_label_bitunpack(in + r, raw_bytes_needed, raw_bits, d->raw_syms, raw_symbols_needed);
+    size_t raw_consumed = 0;  /* in voxels */
+
+    /* DFS traverse: decode a tag at each node, write voxels to `out`. */
+    typedef struct { uint8_t depth; uint32_t i, j, k; } dfs_node;
+    dfs_node stk[C3D_LABEL_OCTREE_DEPTH * 8u + 16u];
+    int sp = 0;
+    stk[sp++] = (dfs_node){ 0u, 0u, 0u, 0u };
+
+    while (sp > 0) {
+        dfs_node node = stk[--sp];
+        uint32_t t = c3d_rans_dec_get(&tag_state, &tag_tbl);
+        c3d_rans_dec_renorm(&tag_state, &tag_p, tag_p_e);
+        c3d_assert(t < C3D_LABEL_N_TAGS);
+        uint32_t side = (uint32_t)C3D_CHUNK_SIDE >> node.depth;
+        uint32_t x0 = node.i * side, y0 = node.j * side, z0 = node.k * side;
+        if (t == C3D_LABEL_TAG_ZERO) {
+            for (uint32_t dz = 0; dz < side; ++dz)
+            for (uint32_t dy = 0; dy < side; ++dy)
+                memset(&out[((size_t)(z0 + dz) * 256u + (y0 + dy)) * 256u + x0],
+                       0, side);
+        } else if (t == C3D_LABEL_TAG_UNIFORM) {
+            uint8_t local_idx;
+            if (dict_size == 1u) {
+                local_idx = 0u;
+            } else {
+                c3d_assert(val_consumed < n_unz);
+                local_idx = val_seq[val_consumed++];
+                c3d_assert(local_idx < dict_size);
+            }
+            uint8_t gv = l2g[local_idx];
+            for (uint32_t dz = 0; dz < side; ++dz)
+            for (uint32_t dy = 0; dy < side; ++dy)
+                memset(&out[((size_t)(z0 + dz) * 256u + (y0 + dy)) * 256u + x0],
+                       gv, side);
+        } else if (t == C3D_LABEL_TAG_RAW) {
+            c3d_assert(node.depth == C3D_LABEL_OCTREE_DEPTH);
+            c3d_assert(raw_consumed + C3D_LABEL_LEAF_VOX <= raw_symbols_needed);
+            const uint8_t *src = &d->raw_syms[raw_consumed];
+            for (uint32_t dz = 0; dz < 8u; ++dz)
+            for (uint32_t dy = 0; dy < 8u; ++dy) {
+                uint8_t *dst = &out[((size_t)(z0 + dz) * 256u + (y0 + dy)) * 256u + x0];
+                for (uint32_t dx = 0; dx < 8u; ++dx) {
+                    uint8_t sym = src[(size_t)dz * 64u + dy * 8u + dx];
+                    dst[dx] = (sym == 0u) ? 0u : l2g[sym - 1u];
+                }
+            }
+            raw_consumed += C3D_LABEL_LEAF_VOX;
+        } else { /* SUBDIV */
+            c3d_assert(node.depth < C3D_LABEL_OCTREE_DEPTH);
+            for (int ci = 7; ci >= 0; --ci) {
+                uint32_t dx = (uint32_t)ci & 1u,
+                         dy = ((uint32_t)ci >> 1) & 1u,
+                         dz = ((uint32_t)ci >> 2) & 1u;
+                stk[sp++] = (dfs_node){ (uint8_t)(node.depth + 1u),
+                                        node.i * 2u + dx,
+                                        node.j * 2u + dy,
+                                        node.k * 2u + dz };
+            }
+        }
+    }
+    c3d_assert(val_consumed == n_unz);
+    c3d_assert(raw_consumed == raw_symbols_needed);
+    c3d_assert(tag_p == tag_p_e);
+    c3d_assert(tag_state == C3D_RANS_BYTE_L);
+}
+
+void c3d_label_decoder_chunk_decode(c3d_label_decoder *d,
+                                    const uint8_t *in, size_t len,
+                                    uint8_t *const *channels_out)
+{
+    c3d_assert(d && in && channels_out);
+    uint32_t n = d->schema->count;
+    size_t hdr = c3d_label_chunk_header_size(n);
+    c3d_assert(len >= hdr);
+    c3d_assert(memcmp(in, C3D_LABEL_CHUNK_MAGIC, 4) == 0);
+    c3d_assert(in[4] == 1u);  /* version */
+    uint8_t sh[16];
+    c3d_label_schema_hash(d->schema, sh);
+    c3d_assert(memcmp(in + 5, sh, 16) == 0);
+    c3d_assert(in[21] == (uint8_t)n);
+    const uint8_t *state_row   = in + 22;
+    const uint8_t *uniform_row = in + 22 + n;
+    size_t r = hdr;
+
+    for (uint32_t c = 0; c < n; ++c) {
+        uint8_t *outbuf = channels_out[c];
+        uint8_t st = state_row[c];
+        if (st == (uint8_t)C3D_LABEL_STATE_ABSENT) {
+            if (outbuf) {
+                c3d_assert(((uintptr_t)outbuf & (C3D_ALIGN - 1u)) == 0u);
+                memset(outbuf, 0, C3D_VOXELS_PER_CHUNK);
+            }
+        } else if (st == (uint8_t)C3D_LABEL_STATE_UNIFORM) {
+            if (outbuf) {
+                c3d_assert(((uintptr_t)outbuf & (C3D_ALIGN - 1u)) == 0u);
+                memset(outbuf, uniform_row[c], C3D_VOXELS_PER_CHUNK);
+            }
+        } else if (st == (uint8_t)C3D_LABEL_STATE_ENCODED) {
+            c3d_assert(r + 4u <= len);
+            uint32_t stream_len = c3d_read_u32_le(in + r); r += 4u;
+            c3d_assert(r + stream_len <= len);
+            if (outbuf) {
+                c3d_label_decode_channel_encoded(d, in + r, stream_len,
+                                                 d->schema->num_values[c], outbuf);
+            }
+            r += stream_len;
+        } else {
+            c3d_panic(__FILE__, __LINE__, "invalid label channel state byte");
+        }
+    }
+}
+
+/* ---- stateless one-shot wrappers ----------------------------------------- */
+
+size_t c3d_label_chunk_encode(const c3d_label_schema *schema,
+                              const uint8_t *const *channels,
+                              uint8_t *out, size_t cap)
+{
+    c3d_label_encoder *e = c3d_label_encoder_new(schema);
+    size_t n = c3d_label_encoder_chunk_encode(e, channels, out, cap);
+    c3d_label_encoder_free(e);
+    return n;
+}
+
+void c3d_label_chunk_decode(const c3d_label_schema *schema,
+                            const uint8_t *in, size_t len,
+                            uint8_t *const *channels_out)
+{
+    c3d_label_decoder *d = c3d_label_decoder_new(schema);
+    c3d_label_decoder_chunk_decode(d, in, len, channels_out);
+    c3d_label_decoder_free(d);
+}
+
+/* ---- validate / inspect -------------------------------------------------- */
+
+/* Non-panicking structural check. */
+bool c3d_label_chunk_validate(const c3d_label_schema *schema,
+                              const uint8_t *in, size_t len)
+{
+    if (!schema || !in) return false;
+    uint32_t n = schema->count;
+    size_t hdr = c3d_label_chunk_header_size(n);
+    if (len < hdr) return false;
+    if (memcmp(in, C3D_LABEL_CHUNK_MAGIC, 4) != 0) return false;
+    if (in[4] != 1u) return false;
+    uint8_t sh[16];
+    c3d_label_schema_hash(schema, sh);
+    if (memcmp(in + 5, sh, 16) != 0) return false;
+    if (in[21] != (uint8_t)n) return false;
+    const uint8_t *state_row = in + 22;
+    size_t r = hdr;
+    for (uint32_t c = 0; c < n; ++c) {
+        uint8_t st = state_row[c];
+        if (st == (uint8_t)C3D_LABEL_STATE_ABSENT) continue;
+        if (st == (uint8_t)C3D_LABEL_STATE_UNIFORM) continue;
+        if (st != (uint8_t)C3D_LABEL_STATE_ENCODED) return false;
+        if (r + 4u > len) return false;
+        uint32_t stream_len = c3d_read_u32_le(in + r); r += 4u;
+        if (r + stream_len > len) return false;
+        r += stream_len;
+    }
+    return (r == len);
+}
+
+void c3d_label_chunk_inspect(const c3d_label_schema *schema,
+                             const uint8_t *in, size_t len,
+                             c3d_label_chunk_info *info)
+{
+    c3d_assert(schema && in && info);
+    uint32_t n = schema->count;
+    size_t hdr = c3d_label_chunk_header_size(n);
+    c3d_assert(len >= hdr);
+    c3d_assert(memcmp(in, C3D_LABEL_CHUNK_MAGIC, 4) == 0);
+    c3d_assert(in[4] == 1u);
+    memcpy(info->schema_hash, in + 5, 16);
+    info->chan_count = n;
+    const uint8_t *state_row   = in + 22;
+    const uint8_t *uniform_row = in + 22 + n;
+    memset(info->channel_state,         0, sizeof info->channel_state);
+    memset(info->channel_uniform_value, 0, sizeof info->channel_uniform_value);
+    memset(info->channel_stream_bytes,  0, sizeof info->channel_stream_bytes);
+    size_t r = hdr;
+    for (uint32_t c = 0; c < n; ++c) {
+        uint8_t st = state_row[c];
+        info->channel_state[c] = st;
+        if (st == (uint8_t)C3D_LABEL_STATE_UNIFORM) {
+            info->channel_uniform_value[c] = uniform_row[c];
+        } else if (st == (uint8_t)C3D_LABEL_STATE_ENCODED) {
+            c3d_assert(r + 4u <= len);
+            uint32_t stream_len = c3d_read_u32_le(in + r); r += 4u;
+            info->channel_stream_bytes[c] = stream_len;
+            c3d_assert(r + stream_len <= len);
+            r += stream_len;
+        }
     }
 }
