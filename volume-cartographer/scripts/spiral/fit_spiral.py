@@ -31,7 +31,11 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 # PHercParis4
 volpkg_path = '/home/paul/projects/vesuvius-scrolls/volpkgs/s1_ds2.volpkg'
 scroll_zarr_path = None
-pcl_json_path = '/home/paul/projects/vesuvius-scrolls/spiral/windings_8205.json'
+pcl_json_paths = [
+    '/home/paul/projects/vesuvius-scrolls/spiral/windings_8205.json',
+    '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations.json',
+    '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations_2.json'
+]
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
@@ -43,7 +47,7 @@ seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
 # # PHerc0172
 # volpkg_path = '/home/paul/projects/vesuvius-scrolls/volpkgs/PHerc0172.volpkg'
 # scroll_zarr_path = f'{volpkg_path}/volumes/s5_masked_ome.zarr/2'
-# pcl_json_path = f'{volpkg_path}/atlas-pcl.json'
+# pcl_json_paths = [f'{volpkg_path}/atlas-pcl.json']
 # spiral_outward_sense = 'CW'  # CW | ACW
 # umbilicus_z_to_yx = lambda f: thaumato_umbilicus_z_to_yx('/home/paul/projects/vesuvius-scrolls/data/s5-umbilicus.txt', downsample_factor=f)
 # scroll_name = 's5'
@@ -2323,7 +2327,18 @@ def main():
 
     patches = load_patches(patches_path, segment_id_filter=lambda s: 'monster' not in s)
 
-    point_collections = load_point_collection(pcl_json_path) if pcl_json_path else {}
+    point_collections = {}
+    for path in pcl_json_paths:
+        loaded = load_point_collection(path) or {}
+        next_id = (max(point_collections.keys()) + 1) if point_collections else 0
+        for pcl in loaded.values():
+            new_id = pcl['id'] if pcl['id'] not in point_collections else next_id
+            if new_id == next_id:
+                next_id += 1
+            pcl['id'] = new_id
+            for point in pcl['points'].values():
+                point['collectionId'] = new_id
+            point_collections[new_id] = pcl
     process_point_collections_cached(patches, point_collections)
 
     for patch in patches.values():
