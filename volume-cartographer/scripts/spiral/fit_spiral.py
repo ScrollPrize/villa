@@ -1422,6 +1422,54 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
     return satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch
 
 
+def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_winding, pcl_strips):
+    # For each unattached pcl, treat its id-sorted points as a strip (so theta=0
+    # crossings can be unwrapped, mirroring the patch row-walk in
+    # get_patch_satisfied_areas), pick the snapped median normalised shifted-radius
+    # as the target winding, then count points that satisfy both the same spiral-
+    # space radius tolerance and the same scan-space distance tolerance used for
+    # quad satisfaction. Returns two 1-D int64 tensors: (satisfied_count_per_pcl,
+    # total_count_per_pcl).
+    spiral_tolerance = dr_per_winding.detach() * metrics_config['satisfaction_radius_tolerance']
+    scan_tolerance = metrics_config['satisfaction_distance_tolerance']
+    dr = dr_per_winding.detach()
+    device = dr_per_winding.device
+
+    satisfied_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
+    total_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
+    with torch.no_grad():
+        for k, strip in enumerate(pcl_strips):
+            N = strip['zyxs'].shape[0]
+            total_counts[k] = N
+            if N == 0:
+                continue
+            zyxs = torch.from_numpy(strip['zyxs']).to(device=device, dtype=torch.float32)
+            windings = torch.from_numpy(strip['windings']).to(device=device, dtype=torch.float32)
+
+            spiral_zyxs = slice_to_spiral_transform(zyxs)
+            theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+            unwrapped_shifted = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
+
+            normalised_radii = unwrapped_shifted - windings * dr
+            target_normalised = torch.round(normalised_radii.median() / dr) * dr
+            target_shifted = target_normalised + windings * dr
+            spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
+
+            target_radii = target_shifted + theta / (2 * np.pi) * dr
+            target_spiral_zyxs = torch.stack([
+                spiral_zyxs[..., 0],
+                torch.sin(theta) * target_radii,
+                torch.cos(theta) * target_radii,
+            ], dim=-1)
+            target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs)
+            scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs, dim=-1)
+            scan_in_band = scan_distances <= scan_tolerance
+
+            satisfied = spiral_in_band & scan_in_band
+            satisfied_counts[k] = int(satisfied.sum().item())
+    return satisfied_counts, total_counts
+
+
 def get_face_indices(h, w):
     indices = torch.arange(h * w).view(h, w)
     top_left = indices[:-1, :-1].flatten()
@@ -2048,6 +2096,16 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         total_area = float(total_areas.sum().item())
         satisfied_area_ratio = satisfied_area / max(total_area, 1e-9)
         print(f'satisfied_area = {satisfied_area:.1f}/{total_area:.1f} ({satisfied_area_ratio * 100:.1f}%)')
+        if unattached_pcl_strips:
+            unattached_pcl_satisfied_counts, unattached_pcl_total_counts = get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips)
+            fully_satisfied_pcls = int((unattached_pcl_satisfied_counts == unattached_pcl_total_counts).sum().item())
+            num_pcls = len(unattached_pcl_strips)
+            fully_satisfied_ratio = fully_satisfied_pcls / max(num_pcls, 1)
+            print(f'satisfied_unattached_pcls = {fully_satisfied_pcls}/{num_pcls} ({fully_satisfied_ratio * 100:.1f}%)')
+            satisfied_points = int(unattached_pcl_satisfied_counts.sum().item())
+            total_points = int(unattached_pcl_total_counts.sum().item())
+            satisfied_point_ratio = satisfied_points / max(total_points, 1)
+            print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
         # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
         # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
         if satisfied_quad_masks:
