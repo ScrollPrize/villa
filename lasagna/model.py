@@ -2868,12 +2868,12 @@ class Model3D(nn.Module):
 		Invalid vertices (VC3D sentinel -1,-1,-1) are inpainted via
 		masked scale-space pyramid reconstruction.
 		"""
-		from tifxyz_io import load_tifxyz
-		xyz, valid, meta = load_tifxyz(path, device=device)
-		# Derive mesh_step from meta scale if available
-		scale = meta.get("scale")
-		if scale is not None and isinstance(scale, list) and len(scale) >= 1 and float(scale[0]) > 0:
-			mesh_step = max(1, int(round(1.0 / float(scale[0]))))
+		from tifxyz_io import load_tifxyz, surface_step_stats
+		xyz, valid, _meta = load_tifxyz(path, device=device)
+		# VC3D metadata scale can be stale; derive the step from actual geometry.
+		_step_h, _step_w, _step_diag, step_avg = surface_step_stats(xyz, valid)
+		if math.isfinite(step_avg) and step_avg > 0.0:
+			mesh_step = max(1, int(round(step_avg)))
 		return Model3D.from_tifxyz_crop(
 			xyz, valid, device=device, mesh_step=mesh_step,
 			winding_step=winding_step, subsample_mesh=subsample_mesh,

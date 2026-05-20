@@ -716,16 +716,17 @@ def _revalidate_direction(
 	normal_xyz: torch.Tensor,
 	normal_from_source: bool,
 	cfg: SnapSurfConfig,
-) -> dict[str, int]:
+) -> dict[str, int | float]:
 	start_count = state.count()
+	out: dict[str, int | float] = {"drop": 0, "pgrid": 0, "perr_n": 0, "perr_sum": 0.0, "perr_max": 0.0}
 	if state.map is None or state.valid is None or state.target_shape is None:
-		return {"drop": 0}
+		return out
 	if start_count == 0:
-		return {"drop": 0}
+		return out
 	valid_b, map_b, source_valid_b = _batched_source_views(state, source_valid)
 	new_valid_b = valid_b.clone()
 	if not bool(new_valid_b.any().detach().cpu()):
-		return {"drop": 0}
+		return out
 
 	coords = map_b[new_valid_b]
 	source_idx_b = new_valid_b.nonzero(as_tuple=False)
@@ -769,14 +770,22 @@ def _revalidate_direction(
 		if cfg.orientation != "none":
 			expected = 1.0 if int(state.orientation_sign) >= 0 else -1.0
 			orient_ok = (det * expected) >= -1.0e-6
+		grid_fail = check & (grid_err > float(cfg.grid_error))
+		if bool(grid_fail.any().detach().cpu()):
+			fail_vals = grid_err[grid_fail]
+			out["pgrid"] = int(fail_vals.numel())
+			out["perr_n"] = int(fail_vals.numel())
+			out["perr_sum"] = float(fail_vals.sum().detach().cpu())
+			out["perr_max"] = float(fail_vals.max().detach().cpu())
 		new_valid_b &= (~check) | ((grid_err <= float(cfg.grid_error)) & orient_ok)
 
 	after_count = int(new_valid_b.sum().detach().cpu())
 	_write_batched_state(state, new_valid_b, map_b)
-	return {"drop": max(0, int(start_count) - after_count)}
+	out["drop"] = max(0, int(start_count) - after_count)
+	return out
 
 
-def _empty_grow_stats() -> dict[str, int]:
+def _empty_grow_stats() -> dict[str, int | float]:
 	return {
 		"ring": 0,
 		"sup": 0,
@@ -785,6 +794,9 @@ def _empty_grow_stats() -> dict[str, int]:
 		"grid": 0,
 		"ori": 0,
 		"new": 0,
+		"gerr_n": 0,
+		"gerr_sum": 0.0,
+		"gerr_max": 0.0,
 	}
 
 
@@ -798,7 +810,7 @@ def _grow_direction(
 	normal_xyz: torch.Tensor,
 	normal_from_source: bool,
 	cfg: SnapSurfConfig,
-) -> dict[str, int]:
+) -> dict[str, int | float]:
 	stats = _empty_grow_stats()
 	if state.map is None or state.valid is None or state.source_shape is None or state.target_shape is None:
 		return stats
@@ -862,6 +874,13 @@ def _grow_direction(
 	)
 	dist_ok = target_ok & target_geom_ok & (dist <= float(cfg.point_distance))
 	stats["dist"] = int(dist_ok.any(dim=1).sum().detach().cpu())
+	best_dist_gerr = torch.where(dist_ok, grid_err, torch.full_like(grid_err, float("inf"))).min(dim=1).values
+	finite_best = torch.isfinite(best_dist_gerr)
+	if bool(finite_best.any().detach().cpu()):
+		gerr_vals = best_dist_gerr[finite_best]
+		stats["gerr_n"] = int(gerr_vals.numel())
+		stats["gerr_sum"] = float(gerr_vals.sum().detach().cpu())
+		stats["gerr_max"] = float(gerr_vals.max().detach().cpu())
 	grid_ok = dist_ok & (grid_err <= float(cfg.grid_error))
 	stats["grid"] = int(grid_ok.any(dim=1).sum().detach().cpu())
 	ok = grid_ok
@@ -1290,6 +1309,13 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		"snaps_grid": 0.0,
 		"snaps_ori": 0.0,
 		"snaps_new": 0.0,
+		"snaps_pgrid": 0.0,
+		"_snaps_gerr_n": 0.0,
+		"_snaps_gerr_sum": 0.0,
+		"_snaps_gerr_max": 0.0,
+		"_snaps_perr_n": 0.0,
+		"_snaps_perr_sum": 0.0,
+		"_snaps_perr_max": 0.0,
 	}
 	total_model_possible = 0
 	total_ext_possible = 0
@@ -1331,6 +1357,14 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				cfg=cfg,
 			)
 			stats["snaps_drop"] += float(rv_m2e.get("drop", 0) + rv_e2m.get("drop", 0))
+			stats["snaps_pgrid"] += float(rv_m2e.get("pgrid", 0) + rv_e2m.get("pgrid", 0))
+			stats["_snaps_perr_n"] += float(rv_m2e.get("perr_n", 0) + rv_e2m.get("perr_n", 0))
+			stats["_snaps_perr_sum"] += float(rv_m2e.get("perr_sum", 0.0) + rv_e2m.get("perr_sum", 0.0))
+			stats["_snaps_perr_max"] = max(
+				stats["_snaps_perr_max"],
+				float(rv_m2e.get("perr_max", 0.0)),
+				float(rv_e2m.get("perr_max", 0.0)),
+			)
 			seed_inserted, seed_dist, seed_ext_dist = _try_seed_reinsert(
 				state,
 				model_xyz=model_xyz_det,
@@ -1367,6 +1401,13 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 			)
 			for k in ("ring", "sup", "tgt", "dist", "grid", "ori", "new"):
 				stats[f"snaps_{k}"] += float(grow_m2e.get(k, 0) + grow_e2m.get(k, 0))
+			stats["_snaps_gerr_n"] += float(grow_m2e.get("gerr_n", 0) + grow_e2m.get("gerr_n", 0))
+			stats["_snaps_gerr_sum"] += float(grow_m2e.get("gerr_sum", 0.0) + grow_e2m.get("gerr_sum", 0.0))
+			stats["_snaps_gerr_max"] = max(
+				stats["_snaps_gerr_max"],
+				float(grow_m2e.get("gerr_max", 0.0)),
+				float(grow_e2m.get("gerr_max", 0.0)),
+			)
 
 		l_m2e, lm_m2e, mask_m2e, n_m2e = _direction_loss_model_to_ext(
 			state.model_to_ext,
@@ -1398,5 +1439,15 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	stats["snaps_m2e"] = _safe_frac(stats["snaps_m2e"], total_model_possible)
 	stats["snaps_e2m"] = _safe_frac(stats["snaps_e2m"], total_ext_possible)
 	stats["snaps_seed"] = _safe_frac(stats["snaps_seed"], len(records))
+	gerr_n = stats.pop("_snaps_gerr_n")
+	gerr_sum = stats.pop("_snaps_gerr_sum")
+	gerr_max = stats.pop("_snaps_gerr_max")
+	perr_n = stats.pop("_snaps_perr_n")
+	perr_sum = stats.pop("_snaps_perr_sum")
+	perr_max = stats.pop("_snaps_perr_max")
+	stats["snaps_gerr_avg"] = _safe_frac(gerr_sum, gerr_n)
+	stats["snaps_gerr_max"] = float(gerr_max)
+	stats["snaps_perr_avg"] = _safe_frac(perr_sum, perr_n)
+	stats["snaps_perr_max"] = float(perr_max)
 	_last_stats = stats
 	return total, (lm_accum,), (mask_accum,)

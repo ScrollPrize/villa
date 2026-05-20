@@ -370,17 +370,17 @@ def main(argv: list[str] | None = None) -> int:
 		raise ValueError("windowed optimization currently requires model-init=ext")
 
 	if model_init == "ext" and tifxyz_init and window_size > 0:
-		from tifxyz_io import load_tifxyz
+		from tifxyz_io import load_tifxyz, surface_step_stats
 		import fit2tifxyz as _f2t
 		import json as _json
 
 		# Load full tifxyz to CPU (save GPU mem)
-		full_xyz, full_valid, full_meta = load_tifxyz(tifxyz_init, device="cpu")
+		full_xyz, full_valid, _full_meta = load_tifxyz(tifxyz_init, device="cpu")
 		H_full, W_full, _ = full_xyz.shape
 		mesh_step = model_cfg.mesh_step
-		scale = full_meta.get("scale")
-		if scale is not None and isinstance(scale, list) and len(scale) >= 1 and float(scale[0]) > 0:
-			mesh_step = max(1, int(round(1.0 / float(scale[0]))))
+		_step_h, _step_w, _step_diag, step_avg = surface_step_stats(full_xyz, full_valid)
+		if math.isfinite(step_avg) and step_avg > 0.0:
+			mesh_step = max(1, int(round(step_avg)))
 
 		# Get offset from external_surfaces config
 		ext_surfaces_cfg = cfg.pop("external_surfaces", None)
@@ -655,14 +655,23 @@ def main(argv: list[str] | None = None) -> int:
 	_t = _stage_start("load_external_surfaces")
 	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
 	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
-		from tifxyz_io import load_tifxyz
+		from tifxyz_io import load_tifxyz, surface_step_stats
 		for es in ext_surfaces_cfg:
 			es_path = str(es["path"])
 			es_offset = float(es.get("offset", 1.0))
 			xyz_ext, valid_ext, meta_ext = load_tifxyz(es_path, device=device)
 			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
+			scale = meta_ext.get("scale") if isinstance(meta_ext, dict) else None
+			meta_step = float("nan")
+			if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
+				meta_step = 1.0 / float(scale[0])
+			step_h, step_w, step_diag, step_avg = surface_step_stats(xyz_ext, valid_ext)
+			ratio = step_avg / max(1.0e-8, float(mdl.params.mesh_step))
 			print(f"[fit] external surface {idx}: path={es_path} offset={es_offset} "
-				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()}", flush=True)
+				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()} "
+				  f"meta_step={meta_step:.3f} step_h={step_h:.3f} step_w={step_w:.3f} step_diag={step_diag:.3f} "
+				  f"step_avg={step_avg:.3f} model_step={float(mdl.params.mesh_step):.3f} "
+				  f"step_ratio={ratio:.3f}", flush=True)
 	_stage_done("load_external_surfaces", _t)
 
 	# Parse correction points from config (injected by VC3D)
