@@ -11,6 +11,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QElapsedTimer>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
@@ -43,6 +44,26 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+
+namespace
+{
+QString lasagnaModeDebugName(int mode)
+{
+    switch (mode) {
+    case 1:
+        return QStringLiteral("new_model");
+    case 3:
+        return QStringLiteral("offset");
+    default:
+        return QStringLiteral("reopt");
+    }
+}
+
+double bytesToMiB(qint64 bytes)
+{
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+}  // namespace
 
 SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     const QString& settingsGroup, QWidget* parent)
@@ -723,6 +744,12 @@ void SegmentationLasagnaPanel::triggerOptimization()
                               : (_lasagnaMode == 3) ? _offsetConfigFilePath
                               : _reoptConfigFilePath;
 
+    std::cerr << "[lasagna] task requested:"
+              << " mode=" << lasagnaModeDebugName(_lasagnaMode).toStdString()
+              << " config=" << configPath.toStdString()
+              << " connection=" << (_connectionMode == 1 ? "external" : "internal")
+              << std::endl;
+
     if (configPath.isEmpty()) {
         _progressLabel->setText(tr("No config file selected."));
         _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
@@ -791,6 +818,9 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
             return;
         }
     }
+
+    QElapsedTimer prepTimer;
+    prepTimer.start();
 
     std::filesystem::path outputSegmentsPath;
     if (state && state->vpkg()) {
@@ -1069,6 +1099,9 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
 
     const bool sendModelData = !modelPath.isEmpty();
     const bool sendTifxyz = !segPath.empty();
+    qint64 rawTifxyzBytes = 0;
+    int tifxyzFileCount = 0;
+    qint64 rawModelBytes = 0;
     std::cerr << "[lasagna] request payload: send_model="
               << (sendModelData ? "yes" : "no")
               << " send_tifxyz=" << (sendTifxyz ? "yes" : "no")
@@ -1095,8 +1128,11 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
             }
             QFile f(QString::fromStdString(filePath.string()));
             if (f.open(QIODevice::ReadOnly)) {
+                QByteArray bytes = f.readAll();
+                rawTifxyzBytes += bytes.size();
+                ++tifxyzFileCount;
                 tifxyzData[fname] =
-                    QString::fromLatin1(f.readAll().toBase64());
+                    QString::fromLatin1(bytes.toBase64());
             } else {
                 auto msg = tr("Cannot read selected segment tifxyz file: %1").arg(fname);
                 std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
@@ -1128,8 +1164,17 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         }
         QByteArray modelBytes = modelFile.readAll();
         modelFile.close();
+        rawModelBytes = modelBytes.size();
         request[QStringLiteral("model_data")] = QString::fromLatin1(modelBytes.toBase64());
     }
+
+    std::cerr << "[lasagna] request prep:"
+              << " mode=" << lasagnaModeDebugName(_lasagnaMode).toStdString()
+              << " elapsed=" << (static_cast<double>(prepTimer.elapsed()) / 1000.0) << "s"
+              << " tifxyz_files=" << tifxyzFileCount
+              << " tifxyz_raw=" << bytesToMiB(rawTifxyzBytes) << " MiB"
+              << " model_raw=" << bytesToMiB(rawModelBytes) << " MiB"
+              << std::endl;
 
     mgr.startOptimization(request, outputDir);
     showStatus(

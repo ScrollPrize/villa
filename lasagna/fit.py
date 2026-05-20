@@ -327,6 +327,19 @@ def _run_flatten_mode(
 	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device)
 	mesh_step = _mesh_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
 	scale = _scale_from_tifxyz_meta(meta, mesh_step)
+
+	stage_cfg = copy.deepcopy(cfg)
+	for key in ("external_surfaces", "tifxyz", "offset_value", "voxel_size_um", "corr_points"):
+		stage_cfg.pop(key, None)
+	stages = optimizer.load_stages_cfg(stage_cfg, init_mode=None)
+	flatten_args: dict[str, object] = {}
+	if isinstance(cfg.get("args"), dict):
+		flatten_args.update(cfg["args"])
+	if stages:
+		flatten_args.update(stages[0].global_opt.args or {})
+	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
+	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
+	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
 	mdl = model.Model3D.from_flatten_tifxyz_crop(
 		xyz,
 		valid,
@@ -335,13 +348,11 @@ def _run_flatten_mode(
 		winding_step=model_cfg.winding_step,
 		subsample_mesh=model_cfg.subsample_mesh,
 		subsample_winding=model_cfg.subsample_winding,
+		flatten_filter_source_angles=filter_source_angles,
+		flatten_filter_angle_deg=filter_angle_deg,
+		flatten_filter_radius=filter_radius,
 	)
 	data = _dummy_flatten_data()
-
-	stage_cfg = copy.deepcopy(cfg)
-	for key in ("external_surfaces", "tifxyz", "offset_value", "voxel_size_um", "corr_points"):
-		stage_cfg.pop(key, None)
-	stages = optimizer.load_stages_cfg(stage_cfg, init_mode=None)
 
 	print("data: flatten-only (no volume input)")
 	print("model:", model_cfg)
@@ -352,6 +363,17 @@ def _run_flatten_mode(
 		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",
 		flush=True,
 	)
+	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})
+	if filter_source_angles:
+		print(
+			f"[fit] flatten source angle filter: angle>{filter_angle_deg:.4g} radius={max(0, filter_radius)} "
+			f"bad_pairs={int(filter_stats.get('bad_pairs', 0.0))} "
+			f"bad_cells={int(filter_stats.get('bad_cells', 0.0))} "
+			f"dilated={int(filter_stats.get('bad_cells_dilated', 0.0))} "
+			f"cell_valid={int(filter_stats.get('cell_valid_after', 0.0))}/"
+			f"{int(filter_stats.get('cell_valid_before', 0.0))}",
+			flush=True,
+		)
 
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
 		if out_dir is None:

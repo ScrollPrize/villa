@@ -1220,7 +1220,7 @@ def optimize(
 		)
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
-			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.05)),
+			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
 		)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",

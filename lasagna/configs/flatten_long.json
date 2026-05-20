@@ -20,7 +20,10 @@
 			"args": {
 				"flatten_support": true,
 				"flatten_support_radius": 1,
-				"flatten_orient_min_det": 0.05,
+				"flatten_orient_min_det": 0.0,
+				"flatten_filter_source_angles": true,
+				"flatten_filter_angle_deg": 60.0,
+				"flatten_filter_radius": 2,
 				"flatten_sdir_eps": 1e-8,
 				"status_interval": 100
 			}

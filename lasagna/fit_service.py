@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -37,6 +38,26 @@ _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backe
 # One debug switch for sparse coverage and coordinate sanity guards. The service
 # enables it by default so optimizer jobs fail before CUDA indexing asserts.
 os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
+
+
+def _mib(n_bytes: int) -> float:
+    return float(n_bytes) / (1024.0 * 1024.0)
+
+
+def _mib_per_s(n_bytes: int, seconds: float) -> float:
+    return _mib(n_bytes) / seconds if seconds > 0.0 else 0.0
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        root_path = Path(root)
+        for name in files:
+            try:
+                total += (root_path / name).stat().st_size
+            except OSError:
+                pass
+    return total
 
 
 def _truthy_config_bool(value: Any) -> bool:
@@ -482,6 +503,11 @@ def _run_optimization(body: dict[str, Any]) -> None:
     global _job
     import tempfile
 
+    print(
+        f"[fit-service] optimization worker starting: keys={sorted(body.keys())}",
+        flush=True,
+    )
+
     model_output = body.get("model_output")
     data_input = body.get("data_input")
     output_dir = body.get("output_dir")
@@ -633,6 +659,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
             # Export to tifxyz — skip if windowed mode already exported.
             # Windowed mode exports .tifxyz dirs into the parent of
             # model_output (= tmp_dir). Move them to output_dir.
+            save_t0 = time.perf_counter()
             _window_tifxyz = [p for p in Path(tmp_dir).iterdir()
                               if p.name.endswith(".tifxyz") and p.is_dir()]
             if _window_tifxyz:
@@ -670,6 +697,16 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 if voxel_size_um is not None:
                     export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
                 fit2tifxyz.main(export_argv)
+            save_s = time.perf_counter() - save_t0
+            try:
+                saved_bytes = _dir_size_bytes(Path(output_dir))
+            except OSError:
+                saved_bytes = 0
+            print(
+                f"[fit-service] results saved: {_mib(saved_bytes):.3f} MiB "
+                f"in {save_s:.3f}s",
+                flush=True,
+            )
 
         # Clean up intermediate files (but keep results_tmp for download)
         import shutil
@@ -700,10 +737,22 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> Any:
+    def _read_json(self, label: str = "request") -> Any:
         length = int(self.headers.get("Content-Length", 0))
+        print(f"[fit-service] {label}: reading {_mib(length):.3f} MiB", flush=True)
+        read_t0 = time.perf_counter()
         raw = self.rfile.read(length)
-        return json.loads(raw) if raw else {}
+        read_s = time.perf_counter() - read_t0
+        parse_t0 = time.perf_counter()
+        obj = json.loads(raw) if raw else {}
+        parse_s = time.perf_counter() - parse_t0
+        print(
+            f"[fit-service] {label}: read {_mib(len(raw)):.3f} MiB "
+            f"in {read_s:.3f}s ({_mib_per_s(len(raw), read_s):.3f} MiB/s), "
+            f"json_parse={parse_s:.3f}s",
+            flush=True,
+        )
+        return obj
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
@@ -735,6 +784,7 @@ class _Handler(BaseHTTPRequestHandler):
         # Create tar.gz in memory.  Archive paths are relative to output_dir
         # so the tar contains e.g. "winding_combined_v004.tifxyz/meta.json".
         # Extracting in the local paths dir recreates the tifxyz subdirectory.
+        pack_t0 = time.perf_counter()
         buf = io.BytesIO()
         out_path = Path(output_dir)
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -742,24 +792,39 @@ class _Handler(BaseHTTPRequestHandler):
                 tar.add(str(child), arcname=child.name)
 
         data = buf.getvalue()
+        pack_s = time.perf_counter() - pack_t0
         self.send_response(200)
         self.send_header("Content-Type", "application/gzip")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
+        send_t0 = time.perf_counter()
         self.wfile.write(data)
+        self.wfile.flush()
+        send_s = time.perf_counter() - send_t0
 
-        print(f"[fit-service] results downloaded ({len(data)} bytes)", flush=True)
+        print(
+            f"[fit-service] results packed: {_mib(len(data)):.3f} MiB "
+            f"in {pack_s:.3f}s",
+            flush=True,
+        )
+        print(
+            f"[fit-service] results sent: {_mib(len(data)):.3f} MiB "
+            f"in {send_s:.3f}s ({_mib_per_s(len(data), send_s):.3f} MiB/s)",
+            flush=True,
+        )
         _job.clear_results()
 
     def do_POST(self) -> None:  # noqa: N802
         global _job_thread
 
         if self.path == "/optimize":
+            print("[fit-service] /optimize POST received", flush=True)
             if _job.is_busy:
+                print("[fit-service] /optimize rejected: optimization already running", flush=True)
                 self._send_json({"error": "optimization already running"}, 409)
                 return
             try:
-                body = self._read_json()
+                body = self._read_json("optimize request")
             except Exception as exc:
                 self._send_json({"error": f"bad json: {exc}"}, 400)
                 return
@@ -767,6 +832,7 @@ class _Handler(BaseHTTPRequestHandler):
             _job.set_running("starting", 0, 0, 0.0)
             _job_thread = threading.Thread(target=_run_optimization, args=(body,), daemon=True)
             _job_thread.start()
+            print("[fit-service] /optimize accepted: worker thread started", flush=True)
             self._send_json({"status": "started"})
 
         elif self.path == "/stop":
@@ -778,7 +844,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif self.path == "/export_vis":
             try:
-                body = self._read_json()
+                body = self._read_json("export_vis request")
             except Exception as exc:
                 self._send_json({"error": f"bad json: {exc}"}, 400)
                 return
