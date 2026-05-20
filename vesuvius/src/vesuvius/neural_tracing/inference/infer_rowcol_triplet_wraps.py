@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +76,7 @@ _COPY_ARG_TO_CLI = {
     "disp_sample_spacing": "--disp-sample-spacing",
     "disp_sample_min_count": "--disp-sample-min-count",
     "disp_sample_reduce": "--disp-sample-reduce",
+    "merge_temp_dir": "--merge-temp-dir",
     "out_dir": "--out-dir",
     "output_prefix": "--output-prefix",
     "iterations": "--iterations",
@@ -489,8 +491,29 @@ def _sample_trilinear_displacement_stack_tensor(
             torch.zeros((0,), dtype=torch.bool),
         )
 
-    if float(sample_radius) <= 0.0 or uv_rc is None:
+    if float(sample_radius) <= 0.0:
         return _sample_displacement_at_local_coords_tensor(disp_t, coords_t)
+
+    if uv_rc is None:
+        offsets_t = _displacement_sample_offsets_rc(
+            radius=float(sample_radius),
+            spacing=float(sample_spacing),
+        ).to(dtype=torch.float32, device="cpu")
+        query_coords_t = coords_t[:, None, :].repeat(1, offsets_t.shape[0], 1)
+        query_coords_t[:, :, 1] += offsets_t[None, :, 0]
+        query_coords_t[:, :, 2] += offsets_t[None, :, 1]
+        sampled_flat_t, valid_flat_t = _sample_displacement_at_local_coords_tensor(
+            disp_t,
+            query_coords_t.reshape(-1, 3),
+        )
+        sampled_stack_t = sampled_flat_t.view(coords_t.shape[0], offsets_t.shape[0], 3)
+        valid_stack_t = valid_flat_t.view(coords_t.shape[0], offsets_t.shape[0])
+        return _reduce_sampled_displacements(
+            sampled_stack_t,
+            valid_stack_t,
+            reduce=sample_reduce,
+            min_count=int(sample_min_count),
+        )
 
     uv_t = torch.from_numpy(np.asarray(uv_rc, dtype=np.float32))
     if uv_t.ndim != 2 or uv_t.shape[1] != 2 or uv_t.shape[0] != coords_t.shape[0]:
@@ -786,6 +809,12 @@ def parse_args(argv=None):
         choices=("mean", "median"),
         help="Reducer used across the dense displacement sampling kernel.",
     )
+    parser.add_argument(
+        "--merge-temp-dir",
+        type=str,
+        default=None,
+        help="Parent directory for temporary dense overlap-merge memmaps. Defaults to the system temp directory.",
+    )
 
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--output-prefix", type=str, default=None)
@@ -840,6 +869,10 @@ def parse_args(argv=None):
         parser.error("--disp-sample-spacing must be > 0")
     if args.disp_sample_min_count < 1:
         parser.error("--disp-sample-min-count must be >= 1")
+    if args.merge_temp_dir is not None:
+        merge_temp_dir = Path(args.merge_temp_dir)
+        if merge_temp_dir.exists() and not merge_temp_dir.is_dir():
+            parser.error("--merge-temp-dir must be a directory when it already exists")
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be >= 1 when provided.")
     if args.iterations is not None and args.iter_direction is None:
@@ -989,6 +1022,234 @@ def _split_triplet_displacement_channels(disp_batch):
     branch_a = disp_batch[:, 0:3]
     branch_b = disp_batch[:, 3:6]
     return branch_a, branch_b
+
+
+def _crop_center_distance_weights(crop_size, eps=1e-3):
+    crop_size = tuple(int(v) for v in crop_size)
+    if len(crop_size) != 3:
+        raise RuntimeError(f"crop_size must be length 3, got {crop_size}")
+
+    axes = []
+    for n in crop_size:
+        n = int(n)
+        center = 0.5 * float(n - 1)
+        radius = max(center, float(n) - 1.0 - center, 1.0)
+        axis = 1.0 - (np.abs(np.arange(n, dtype=np.float32) - np.float32(center)) / np.float32(radius))
+        axes.append(np.maximum(axis, np.float32(eps)))
+    weights = axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
+    return weights.astype(np.float32, copy=False)
+
+
+def _records_window(records, crop_size):
+    crop_arr = np.asarray(crop_size, dtype=np.int64)
+    if len(records) == 0:
+        raise RuntimeError("Cannot build merged displacement window without bbox records.")
+    starts = []
+    ends = []
+    for rec in records:
+        min_corner, _ = _bbox_to_min_corner_and_bounds_array(tuple(rec["bbox"]))
+        start = min_corner.astype(np.int64, copy=False)
+        starts.append(start)
+        ends.append(start + crop_arr)
+    window_min = np.min(np.stack(starts, axis=0), axis=0).astype(np.int64, copy=False)
+    window_max = np.max(np.stack(ends, axis=0), axis=0).astype(np.int64, copy=False)
+    window_shape = (window_max - window_min).astype(np.int64, copy=False)
+    return window_min, tuple(int(v) for v in window_shape.tolist())
+
+
+def _slice_len(s):
+    return int(s.stop) - int(s.start)
+
+
+def _chunk_slices_for_region(start, end, chunks):
+    start = np.asarray(start, dtype=np.int64)
+    end = np.asarray(end, dtype=np.int64)
+    chunks = np.asarray(chunks, dtype=np.int64)
+    chunk_start = start // chunks
+    chunk_end = (end - 1) // chunks
+    for zz in range(int(chunk_start[0]), int(chunk_end[0]) + 1):
+        z0 = max(int(start[0]), zz * int(chunks[0]))
+        z1 = min(int(end[0]), (zz + 1) * int(chunks[0]))
+        for yy in range(int(chunk_start[1]), int(chunk_end[1]) + 1):
+            y0 = max(int(start[1]), yy * int(chunks[1]))
+            y1 = min(int(end[1]), (yy + 1) * int(chunks[1]))
+            for xx in range(int(chunk_start[2]), int(chunk_end[2]) + 1):
+                x0 = max(int(start[2]), xx * int(chunks[2]))
+                x1 = min(int(end[2]), (xx + 1) * int(chunks[2]))
+                yield (zz, yy, xx), (slice(z0, z1), slice(y0, y1), slice(x0, x1))
+
+
+class _WeightedDenseDisplacementMerger:
+    def __init__(self, window_min, window_shape, crop_size, channels=6, temp_dir=None, chunk_size=128):
+        self.window_min = np.asarray(window_min, dtype=np.int64)
+        self.window_shape = tuple(int(v) for v in window_shape)
+        self.crop_size = tuple(int(v) for v in crop_size)
+        self.channels = int(channels)
+        chunk_size = max(1, int(chunk_size))
+        self.chunks_3d = tuple(min(chunk_size, int(v)) for v in self.crop_size)
+        parent_dir = None if temp_dir is None else str(temp_dir)
+        if parent_dir is not None:
+            Path(parent_dir).mkdir(parents=True, exist_ok=True)
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="infer_rowcol_triplet_merge_", dir=parent_dir)
+        self.path = Path(self._tmpdir.name)
+        self.weighted_sum_chunks = {}
+        self.weight_sum_chunks = {}
+        self.crop_weights = _crop_center_distance_weights(self.crop_size)
+        self.crop_count = 0
+        self.current_bytes = 0
+
+    def _chunk_path(self, kind, chunk_key):
+        zz, yy, xx = (int(v) for v in chunk_key)
+        return self.path / f"{kind}_{zz}_{yy}_{xx}.npy"
+
+    def _chunk_region(self, chunk_key):
+        zz, yy, xx = (int(v) for v in chunk_key)
+        z0 = zz * self.chunks_3d[0]
+        y0 = yy * self.chunks_3d[1]
+        x0 = xx * self.chunks_3d[2]
+        return (
+            slice(z0, min(z0 + self.chunks_3d[0], self.window_shape[0])),
+            slice(y0, min(y0 + self.chunks_3d[1], self.window_shape[1])),
+            slice(x0, min(x0 + self.chunks_3d[2], self.window_shape[2])),
+        )
+
+    def _close_memmap(self, arr):
+        if arr is None:
+            return
+        if hasattr(arr, "flush"):
+            arr.flush()
+        mmap_obj = getattr(arr, "_mmap", None)
+        if mmap_obj is not None:
+            mmap_obj.close()
+
+    def _create_chunk(self, kind, chunk_key, shape):
+        path = self._chunk_path(kind, chunk_key)
+        arr = np.lib.format.open_memmap(
+            path,
+            mode="w+",
+            dtype=np.float32,
+            shape=shape,
+        )
+        arr[...] = 0.0
+        self._close_memmap(arr)
+        self.current_bytes += int(np.prod(shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
+        return path
+
+    def _open_chunk(self, path, mode):
+        return np.lib.format.open_memmap(path, mode=mode, dtype=np.float32)
+
+    def _ensure_chunk(self, chunk_key):
+        chunk_key = tuple(int(v) for v in chunk_key)
+        sum_path = self.weighted_sum_chunks.get(chunk_key)
+        if sum_path is not None:
+            return sum_path, self.weight_sum_chunks[chunk_key]
+
+        region = self._chunk_region(chunk_key)
+        chunk_shape = tuple(_slice_len(s) for s in region)
+        sum_path = self._create_chunk("weighted_sum", chunk_key, (self.channels, *chunk_shape))
+        weight_path = self._create_chunk("weight_sum", chunk_key, chunk_shape)
+        self.weighted_sum_chunks[chunk_key] = sum_path
+        self.weight_sum_chunks[chunk_key] = weight_path
+        return sum_path, weight_path
+
+    def close(self):
+        self.weighted_sum_chunks.clear()
+        self.weight_sum_chunks.clear()
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def _relative_crop_bounds(self, min_corner):
+        start = np.asarray(min_corner, dtype=np.int64) - self.window_min
+        end = start + np.asarray(self.crop_size, dtype=np.int64)
+        if np.any(start < 0) or np.any(end > np.asarray(self.window_shape, dtype=np.int64)):
+            raise RuntimeError(
+                "BBox crop lies outside merged displacement window: "
+                f"start={start.tolist()} end={end.tolist()} window_shape={self.window_shape}"
+            )
+        return start, end
+
+    def accumulate_batch(self, disp_batch, items):
+        disp_arr = np.asarray(disp_batch, dtype=np.float32)
+        if disp_arr.ndim != 5:
+            raise RuntimeError(f"Expected dense displacement batch [B,C,D,H,W], got {tuple(disp_arr.shape)}")
+        if disp_arr.shape[1] != self.channels:
+            raise RuntimeError(f"Expected {self.channels} displacement channels, got {int(disp_arr.shape[1])}")
+        if tuple(int(v) for v in disp_arr.shape[2:]) != self.crop_size:
+            raise RuntimeError(
+                f"Dense displacement spatial shape {tuple(disp_arr.shape[2:])} does not match crop_size {self.crop_size}"
+            )
+        if int(disp_arr.shape[0]) != len(items):
+            raise RuntimeError(f"Displacement batch size {int(disp_arr.shape[0])} does not match item count {len(items)}")
+
+        weights = self.crop_weights
+        for i, item in enumerate(items):
+            start, end = self._relative_crop_bounds(item["min_corner"])
+            for chunk_key, region in _chunk_slices_for_region(start, end, self.chunks_3d):
+                crop_region = tuple(
+                    slice(int(region_axis.start) - int(start_axis), int(region_axis.stop) - int(start_axis))
+                    for region_axis, start_axis in zip(region, start)
+                )
+                chunk_region = self._chunk_region(chunk_key)
+                local_region = tuple(
+                    slice(int(region_axis.start) - int(chunk_axis.start), int(region_axis.stop) - int(chunk_axis.start))
+                    for region_axis, chunk_axis in zip(region, chunk_region)
+                )
+                sum_path, weight_path = self._ensure_chunk(chunk_key)
+                weight_region = weights[crop_region]
+                sum_chunk = self._open_chunk(sum_path, mode="r+")
+                weight_chunk = self._open_chunk(weight_path, mode="r+")
+                try:
+                    sum_chunk[(slice(None), *local_region)] += (
+                        disp_arr[i][(slice(None), *crop_region)] * weight_region[None, ...]
+                    )
+                    weight_chunk[local_region] += weight_region
+                finally:
+                    self._close_memmap(sum_chunk)
+                    self._close_memmap(weight_chunk)
+            self.crop_count += 1
+
+    def read_crop(self, min_corner):
+        start, end = self._relative_crop_bounds(min_corner)
+        out = np.zeros((self.channels, *self.crop_size), dtype=np.float32)
+        for chunk_key, region in _chunk_slices_for_region(start, end, self.chunks_3d):
+            chunk_key = tuple(int(v) for v in chunk_key)
+            sum_path = self.weighted_sum_chunks.get(chunk_key)
+            if sum_path is None:
+                continue
+            weight_path = self.weight_sum_chunks[chunk_key]
+            crop_region = tuple(
+                slice(int(region_axis.start) - int(start_axis), int(region_axis.stop) - int(start_axis))
+                for region_axis, start_axis in zip(region, start)
+            )
+            chunk_region = self._chunk_region(chunk_key)
+            local_region = tuple(
+                slice(int(region_axis.start) - int(chunk_axis.start), int(region_axis.stop) - int(chunk_axis.start))
+                for region_axis, chunk_axis in zip(region, chunk_region)
+            )
+            sum_chunk = self._open_chunk(sum_path, mode="r")
+            weight_chunk = self._open_chunk(weight_path, mode="r")
+            try:
+                sums = np.asarray(sum_chunk[(slice(None), *local_region)], dtype=np.float32)
+                weights = np.asarray(weight_chunk[local_region], dtype=np.float32)
+                valid = weights > 0.0
+                if bool(valid.any()):
+                    np.divide(
+                        sums,
+                        weights[None, ...],
+                        out=out[(slice(None), *crop_region)],
+                        where=valid[None, ...],
+                    )
+            finally:
+                self._close_memmap(sum_chunk)
+                self._close_memmap(weight_chunk)
+        return out
 
 
 def _estimate_global_unit_normal(input_normals, input_normals_valid):
@@ -1388,6 +1649,36 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
     }
 
 
+def _prepare_bbox_sample_item(record, crop_size, world_points, uv_points):
+    bbox = tuple(record["bbox"])
+    min_corner, _ = _bbox_to_min_corner_and_bounds_array(bbox)
+    crop_arr = np.asarray(crop_size, dtype=np.int32)
+    max_corner = min_corner + crop_arr
+
+    in_bounds = (
+        (world_points[:, 0] >= float(min_corner[0]))
+        & (world_points[:, 0] < float(max_corner[0]))
+        & (world_points[:, 1] >= float(min_corner[1]))
+        & (world_points[:, 1] < float(max_corner[1]))
+        & (world_points[:, 2] >= float(min_corner[2]))
+        & (world_points[:, 2] < float(max_corner[2]))
+    )
+    if not bool(in_bounds.any()):
+        return None
+
+    uv_sel = uv_points[in_bounds].astype(np.int32, copy=False)
+    world_sel = world_points[in_bounds].astype(np.float32, copy=False)
+    local_sel = (world_sel - min_corner[None, :].astype(np.float32, copy=False)).astype(np.float32, copy=False)
+
+    return {
+        "bbox_id": int(record.get("bbox_id", -1)),
+        "min_corner": min_corner.astype(np.int32, copy=False),
+        "uv": uv_sel,
+        "world": world_sel,
+        "local": local_sel,
+    }
+
+
 def _gather_batch_items(
     batch_records,
     crop_size,
@@ -1415,6 +1706,35 @@ def _gather_batch_items(
             [world_points] * len(batch_records),
             [uv_points] * len(batch_records),
             [volume_arr] * len(batch_records),
+        )
+        return [item for item in prepared if item is not None]
+
+
+def _gather_sample_items(
+    batch_records,
+    crop_size,
+    world_points,
+    uv_points,
+    num_workers,
+):
+    if len(batch_records) == 0:
+        return []
+    if int(num_workers) <= 1 or len(batch_records) == 1:
+        items = []
+        for rec in batch_records:
+            item = _prepare_bbox_sample_item(rec, crop_size, world_points, uv_points)
+            if item is not None:
+                items.append(item)
+        return items
+
+    max_workers = min(int(num_workers), len(batch_records))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        prepared = executor.map(
+            _prepare_bbox_sample_item,
+            batch_records,
+            [crop_size] * len(batch_records),
+            [world_points] * len(batch_records),
+            [uv_points] * len(batch_records),
         )
         return [item for item in prepared if item is not None]
 
@@ -1472,106 +1792,136 @@ def _run_triplet_inference(
     n_batches = (n_total + int(args.batch_size) - 1) // int(args.batch_size)
     kept_bboxes = 0
     side_assignment_points = 0
+    window_min, window_shape = _records_window(records, crop_size)
 
-    batch_iter = _iter_bbox_batches(records, int(args.batch_size))
-    batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_batches", unit="batch")
-    for batch_idx, (_, batch_records) in enumerate(batch_iter, start=1):
-        items = _gather_batch_items(
-            batch_records=batch_records,
-            crop_size=crop_size,
-            world_points=world_points,
-            uv_points=uv_points,
-            volume_arr=volume_arr,
-            num_workers=int(args.crop_input_workers),
+    with _WeightedDenseDisplacementMerger(
+        window_min=window_min,
+        window_shape=window_shape,
+        crop_size=crop_size,
+        channels=6,
+        temp_dir=getattr(args, "merge_temp_dir", None),
+    ) as merger:
+        _log(
+            args.verbose,
+            "temporary dense merge path: "
+            f"{merger.path} window_min={window_min.tolist()} window_shape={list(window_shape)}",
         )
-
-        if len(items) == 0:
-            _log(args.verbose, f"batch {batch_idx}/{n_batches}: skipped (no points in batch bboxes)")
-            continue
-
-        kept_bboxes += len(items)
-        d, h_c, w_c = crop_size
-        batch_np = np.empty((len(items), 8, d, h_c, w_c), dtype=np.float32)
-        for i, item in enumerate(items):
-            uv = item["uv"].astype(np.int64, copy=False)
-            batch_np[i, 0] = item["volume"]
-            batch_np[i, 1] = item["cond_vox"]
-            batch_np[i, 2:8] = _build_triplet_direction_priors_for_crop(
+        batch_iter = _iter_bbox_batches(records, int(args.batch_size))
+        batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_infer_merge", unit="batch")
+        for batch_idx, (_, batch_records) in enumerate(batch_iter, start=1):
+            items = _gather_batch_items(
+                batch_records=batch_records,
                 crop_size=crop_size,
-                cond_vox=item["cond_vox"],
-                local_zyx=item["local"],
-                local_normals=normals_arr[uv[:, 0], uv[:, 1]],
-                local_normals_valid=normals_valid_arr[uv[:, 0], uv[:, 1]],
-                fallback_unit_normal=global_unit_normal,
-                mask_mode=triplet_direction_prior_mask,
+                world_points=world_points,
+                uv_points=uv_points,
+                volume_arr=volume_arr,
+                num_workers=int(args.crop_input_workers),
             )
 
-        model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
-        disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=bool(args.tta), profiler=None)
-        if disp_pred is None:
-            raise RuntimeError("Model output did not contain 'displacement'.")
-        disp_pred_np = (
-            disp_pred.detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
-        )
-        slot_a_batch, slot_b_batch = _split_triplet_displacement_channels(disp_pred_np)
+            if len(items) == 0:
+                _log(args.verbose, f"batch {batch_idx}/{n_batches}: skipped (no points in batch bboxes)")
+                continue
 
-        for i, item in enumerate(items):
-            local = item["local"]
-            uv = item["uv"]
-            world = item["world"]
-
-            sample_kwargs = {
-                "sample_radius": float(args.disp_sample_radius),
-                "sample_spacing": float(args.disp_sample_spacing),
-                "sample_min_count": int(args.disp_sample_min_count),
-                "sample_reduce": str(args.disp_sample_reduce),
-            }
-            slot_a_disp, slot_a_valid = _sample_trilinear_displacement_stack(
-                slot_a_batch[i],
-                local,
-                uv_rc=uv,
-                **sample_kwargs,
-            )
-            slot_b_disp, slot_b_valid = _sample_trilinear_displacement_stack(
-                slot_b_batch[i],
-                local,
-                uv_rc=uv,
-                **sample_kwargs,
-            )
-
-            world_front_all, front_valid, world_back_all, back_valid, n_side_assigned = (
-                _assign_triplet_slots_to_chart_sides(
-                    world=world,
-                    uv_rc=uv,
-                    slot_a_disp=slot_a_disp,
-                    slot_a_valid=np.asarray(slot_a_valid, dtype=bool),
-                    slot_b_disp=slot_b_disp,
-                    slot_b_valid=np.asarray(slot_b_valid, dtype=bool),
-                    normals=normals_arr,
-                    normals_valid=normals_valid_arr,
+            kept_bboxes += len(items)
+            d, h_c, w_c = crop_size
+            batch_np = np.empty((len(items), 8, d, h_c, w_c), dtype=np.float32)
+            for i, item in enumerate(items):
+                uv = item["uv"].astype(np.int64, copy=False)
+                batch_np[i, 0] = item["volume"]
+                batch_np[i, 1] = item["cond_vox"]
+                batch_np[i, 2:8] = _build_triplet_direction_priors_for_crop(
+                    crop_size=crop_size,
+                    cond_vox=item["cond_vox"],
+                    local_zyx=item["local"],
+                    local_normals=normals_arr[uv[:, 0], uv[:, 1]],
+                    local_normals_valid=normals_valid_arr[uv[:, 0], uv[:, 1]],
+                    fallback_unit_normal=global_unit_normal,
+                    mask_mode=triplet_direction_prior_mask,
                 )
+
+            model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
+            disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=bool(args.tta), profiler=None)
+            if disp_pred is None:
+                raise RuntimeError("Model output did not contain 'displacement'.")
+            disp_pred_np = (
+                disp_pred.detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
             )
-            side_assignment_points += int(n_side_assigned)
-            front_ok = np.asarray(front_valid, dtype=bool) & np.isfinite(world_front_all).all(axis=1)
-            back_ok = np.asarray(back_valid, dtype=bool) & np.isfinite(world_back_all).all(axis=1)
+            _split_triplet_displacement_channels(disp_pred_np)
+            merger.accumulate_batch(disp_pred_np[:, :6], items)
 
-            if bool(back_ok.any()):
-                uv_b = uv[back_ok].astype(np.int32, copy=False)
-                world_b = world_back_all[back_ok].astype(np.float32, copy=False)
-                _accumulate_displaced(sum_back, count_back, uv_b, world_b)
+            del model_inputs
+            del disp_pred
+            del disp_pred_np
 
-            if bool(front_ok.any()):
-                uv_f = uv[front_ok].astype(np.int32, copy=False)
-                world_f = world_front_all[front_ok].astype(np.float32, copy=False)
-                _accumulate_displaced(sum_front, count_front, uv_f, world_f)
+            _log(args.verbose, f"batch {batch_idx}/{n_batches}: merged {len(items)} bbox dense outputs")
 
-        del model_inputs
-        del disp_pred
-        del disp_pred_np
+        _log(args.verbose, f"merged bbox crops with points: {kept_bboxes}/{len(records)}")
 
-        _log(args.verbose, f"batch {batch_idx}/{n_batches}: processed {len(items)} bbox crops")
+        sample_kwargs = {
+            "sample_radius": float(args.disp_sample_radius),
+            "sample_spacing": float(args.disp_sample_spacing),
+            "sample_min_count": int(args.disp_sample_min_count),
+            "sample_reduce": str(args.disp_sample_reduce),
+        }
+        batch_iter = _iter_bbox_batches(records, int(args.batch_size))
+        batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_sample_merged", unit="batch")
+        for batch_idx, (_, batch_records) in enumerate(batch_iter, start=1):
+            items = _gather_sample_items(
+                batch_records=batch_records,
+                crop_size=crop_size,
+                world_points=world_points,
+                uv_points=uv_points,
+                num_workers=int(args.crop_input_workers),
+            )
+            if len(items) == 0:
+                continue
 
-    _log(args.verbose, f"processed bbox crops with points: {kept_bboxes}/{len(records)}")
+            for item in items:
+                local = item["local"]
+                uv = item["uv"]
+                world = item["world"]
+                merged_disp = merger.read_crop(item["min_corner"])
+                slot_a, slot_b = _split_triplet_displacement_channels(merged_disp[None, ...])
+                slot_a_disp, slot_a_valid = _sample_trilinear_displacement_stack(
+                    slot_a[0],
+                    local,
+                    uv_rc=uv,
+                    **sample_kwargs,
+                )
+                slot_b_disp, slot_b_valid = _sample_trilinear_displacement_stack(
+                    slot_b[0],
+                    local,
+                    uv_rc=uv,
+                    **sample_kwargs,
+                )
+
+                world_front_all, front_valid, world_back_all, back_valid, n_side_assigned = (
+                    _assign_triplet_slots_to_chart_sides(
+                        world=world,
+                        uv_rc=uv,
+                        slot_a_disp=slot_a_disp,
+                        slot_a_valid=np.asarray(slot_a_valid, dtype=bool),
+                        slot_b_disp=slot_b_disp,
+                        slot_b_valid=np.asarray(slot_b_valid, dtype=bool),
+                        normals=normals_arr,
+                        normals_valid=normals_valid_arr,
+                    )
+                )
+                side_assignment_points += int(n_side_assigned)
+                front_ok = np.asarray(front_valid, dtype=bool) & np.isfinite(world_front_all).all(axis=1)
+                back_ok = np.asarray(back_valid, dtype=bool) & np.isfinite(world_back_all).all(axis=1)
+
+                if bool(back_ok.any()):
+                    uv_b = uv[back_ok].astype(np.int32, copy=False)
+                    world_b = world_back_all[back_ok].astype(np.float32, copy=False)
+                    _accumulate_displaced(sum_back, count_back, uv_b, world_b)
+
+                if bool(front_ok.any()):
+                    uv_f = uv[front_ok].astype(np.int32, copy=False)
+                    world_f = world_front_all[front_ok].astype(np.float32, copy=False)
+                    _accumulate_displaced(sum_front, count_front, uv_f, world_f)
+
+            _log(args.verbose, f"batch {batch_idx}/{n_batches}: sampled merged outputs for {len(items)} bbox crops")
 
     back_sparse_grid, back_sparse_valid = _finalize_sparse_prediction(sum_back, count_back, shape_hw=(h, w))
     front_sparse_grid, front_sparse_valid = _finalize_sparse_prediction(sum_front, count_front, shape_hw=(h, w))
@@ -1603,6 +1953,14 @@ def _run_triplet_inference(
         "triplet_slot_to_output": {"A": "dynamic", "B": "dynamic"},
         "triplet_slot_assignment": "per-point chart-side signed displacement",
         "triplet_output_direction_prior_sign": {"front": 1, "back": -1},
+        "dense_overlap_merge": "center_distance_weighted_sparse_chunked_temporary_memmap",
+        "dense_overlap_merge_window_min_zyx": [int(v) for v in window_min.tolist()],
+        "dense_overlap_merge_window_shape_zyx": [int(v) for v in window_shape],
+        "dense_overlap_merge_crop_count": int(kept_bboxes),
+        "dense_overlap_merge_chunk_shape_zyx": [int(v) for v in merger.chunks_3d],
+        "dense_overlap_merge_chunks": int(len(merger.weight_sum_chunks)),
+        "dense_overlap_merge_sparse_bytes": int(merger.current_bytes),
+        "dense_overlap_merge_temp_parent": None if getattr(args, "merge_temp_dir", None) is None else str(args.merge_temp_dir),
         "disp_sample_space": "parameterized_row_col",
         "disp_sample_radius": float(args.disp_sample_radius),
         "disp_sample_spacing": float(args.disp_sample_spacing),
@@ -2113,6 +2471,14 @@ def _run_single_iteration(
         "triplet_slot_to_output": dict(infer_out.get("triplet_slot_to_output", {"A": "front", "B": "back"})),
         "triplet_slot_assignment": str(infer_out.get("triplet_slot_assignment", "")),
         "triplet_output_direction_prior_sign": dict(infer_out.get("triplet_output_direction_prior_sign", {"front": 1, "back": -1})),
+        "dense_overlap_merge": str(infer_out.get("dense_overlap_merge", "")),
+        "dense_overlap_merge_window_min_zyx": list(infer_out.get("dense_overlap_merge_window_min_zyx", [])),
+        "dense_overlap_merge_window_shape_zyx": list(infer_out.get("dense_overlap_merge_window_shape_zyx", [])),
+        "dense_overlap_merge_crop_count": int(infer_out.get("dense_overlap_merge_crop_count", 0)),
+        "dense_overlap_merge_chunk_shape_zyx": list(infer_out.get("dense_overlap_merge_chunk_shape_zyx", [])),
+        "dense_overlap_merge_chunks": int(infer_out.get("dense_overlap_merge_chunks", 0)),
+        "dense_overlap_merge_sparse_bytes": int(infer_out.get("dense_overlap_merge_sparse_bytes", 0)),
+        "dense_overlap_merge_temp_parent": infer_out.get("dense_overlap_merge_temp_parent", None),
         "disp_sample_space": str(infer_out.get("disp_sample_space", "parameterized_row_col")),
         "disp_sample_radius": float(infer_out.get("disp_sample_radius", args.disp_sample_radius)),
         "disp_sample_spacing": float(infer_out.get("disp_sample_spacing", args.disp_sample_spacing)),
