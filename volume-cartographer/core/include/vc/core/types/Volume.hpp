@@ -20,6 +20,7 @@
 #include "vc/core/util/RemoteAuth.hpp"
 
 namespace vc::render { class IChunkedArray; }
+namespace utils { class ZarrArray; }
 
 struct CompositeParams;
 
@@ -215,6 +216,18 @@ public:
     [[nodiscard]] std::optional<std::vector<std::byte>> readChunk(
         int level,
         const std::array<size_t, 3>& chunkZYX) const;
+    // Decompress directly into a caller-owned scratch buffer (must be
+    // sized to chunkByteSize(level)). Returns false when the chunk is
+    // missing on disk; otherwise writes exactly chunkByteSize(level)
+    // bytes into `output` and returns true. Avoids the per-call heap
+    // allocation that readChunk() performs.
+    [[nodiscard]] bool readChunkInto(
+        int level,
+        const std::array<size_t, 3>& chunkZYX,
+        std::span<std::byte> output) const;
+    // Byte size of one decompressed chunk at the given level (matches
+    // what readChunk returns and what readChunkInto requires).
+    [[nodiscard]] size_t chunkByteSize(int level) const;
     [[nodiscard]] std::vector<std::byte> readChunkOrFill(
         int level,
         const std::array<size_t, 3>& chunkZYX) const;
@@ -260,6 +273,14 @@ protected:
     mutable std::mutex cacheMutex_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     int ioThreads_ = 0;  // 0 = use default
+
+    // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
+    // and rebuilding the codec registry on every chunk read. ZarrArray is
+    // read-only after open and serialises its own shard I/O internally, so a
+    // shared instance is safe to use concurrently from OMP workers.
+    mutable std::vector<std::shared_ptr<utils::ZarrArray>> readArrayCache_;
+    mutable std::mutex readArrayCacheMutex_;
+    std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
 
     void loadMetadata();
 

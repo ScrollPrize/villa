@@ -1,6 +1,7 @@
 #include "vc/core/types/Volume.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -22,6 +23,7 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/types/VcDataset.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
@@ -216,6 +218,21 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     const T fill = typedFillValue<T>(array);
     const size_t chunkStrideY = static_cast<size_t>(chunkShape[2]);
     const size_t chunkStrideZ = static_cast<size_t>(chunkShape[1]) * chunkStrideY;
+    std::atomic<bool> chunkReadFailed{false};
+    ChunkKey failedChunk{};
+    std::string chunkReadError;
+    std::mutex chunkReadErrorMutex;
+
+    auto recordChunkReadError = [&](int cz, int cy, int cx, const std::string& error) {
+        bool expected = false;
+        if (!chunkReadFailed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(chunkReadErrorMutex);
+        failedChunk = ChunkKey{level, cz, cy, cx};
+        chunkReadError = error.empty() ? "chunk fetch failed" : error;
+    };
 
     #pragma omp parallel
     {
@@ -228,9 +245,12 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
             std::shared_ptr<const std::vector<std::byte>> bytes;
         } cached;
 
-        auto loadChunk = [&](int cz, int cy, int cx) {
+        auto loadChunk = [&](int cz, int cy, int cx) -> bool {
+            if (chunkReadFailed.load(std::memory_order_acquire)) {
+                return false;
+            }
             if (cached.cz == cz && cached.cy == cy && cached.cx == cx) {
-                return;
+                return true;
             }
             cached = {};
             cached.cz = cz;
@@ -244,15 +264,20 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 cached.bytes = result.bytes;
                 cached.data = reinterpret_cast<const T*>(cached.bytes->data());
             } else if (result.status == ChunkStatus::Error) {
-                throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
+                recordChunkReadError(cz, cy, cx, result.error);
+                return false;
             } else {
                 cached.allFill = true;
             }
+            return true;
         };
 
         #pragma omp for schedule(dynamic, 4) collapse(2)
         for (size_t z = 0; z < outShape[0]; ++z) {
             for (size_t y = 0; y < outShape[1]; ++y) {
+                if (chunkReadFailed.load(std::memory_order_acquire)) {
+                    continue;
+                }
                 const int iz = z0 + static_cast<int>(z);
                 const int iy = y0 + static_cast<int>(y);
                 if (iz < 0 || iz >= volumeShape[0] ||
@@ -264,13 +289,18 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 const int lz = iz - cz * chunkShape[0];
                 const int ly = iy - cy * chunkShape[1];
                 for (size_t x = 0; x < outShape[2]; ++x) {
+                    if (chunkReadFailed.load(std::memory_order_acquire)) {
+                        break;
+                    }
                     const int ix = x0 + static_cast<int>(x);
                     if (ix < 0 || ix >= volumeShape[2]) {
                         continue;
                     }
                     const int cx = ix / chunkShape[2];
                     const int lx = ix - cx * chunkShape[2];
-                    loadChunk(cz, cy, cx);
+                    if (!loadChunk(cz, cy, cx)) {
+                        break;
+                    }
                     if (cached.allFill || !cached.data) {
                         out(z, y, x) = fill;
                     } else {
@@ -282,6 +312,15 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 }
             }
         }
+    }
+
+    if (chunkReadFailed.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(chunkReadErrorMutex);
+        std::ostringstream oss;
+        oss << "Volume::read failed fetching chunk "
+            << failedChunk.level << "/" << failedChunk.iz << "/" << failedChunk.iy << "/"
+            << failedChunk.ix << ": " << chunkReadError;
+        throw std::runtime_error(oss.str());
     }
 }
 
@@ -416,6 +455,15 @@ utils::ZarrArray openLocalZarrArrayForWrite(const std::filesystem::path& path)
     if (!meta.compressor_id.empty() || !meta.codecs.empty())
         throw std::runtime_error("cannot write compressed zarr without compression codec support: " + path.string());
     return array;
+}
+
+// Read-side opener: uses the same codec registry that backs the chunked
+// read cache (ZarrChunkFetcher / VcDataset), so it works in builds where
+// `compression.hpp` is unavailable and `zarrCodecRegistry()` is empty.
+utils::ZarrArray openLocalZarrArrayForRead(const std::filesystem::path& path,
+                                           int dtypeSize)
+{
+    return utils::ZarrArray::open(path, vc::buildZarrCodecRegistry(dtypeSize));
 }
 
 std::vector<size_t> toVector(const std::array<size_t, 3>& value)
@@ -1758,6 +1806,22 @@ void Volume::writeXYZ(const Array3D<uint16_t>& data,
     writeZYX(data, xyzToZyx(offsetXYZ), level);
 }
 
+std::shared_ptr<utils::ZarrArray>
+Volume::cachedZarrArrayForRead(int level) const
+{
+    std::lock_guard<std::mutex> lk(readArrayCacheMutex_);
+    if (readArrayCache_.size() <= static_cast<size_t>(level)) {
+        readArrayCache_.resize(static_cast<size_t>(level) + 1);
+    }
+    auto& slot = readArrayCache_[static_cast<size_t>(level)];
+    if (!slot) {
+        slot = std::make_shared<utils::ZarrArray>(
+            openLocalZarrArrayForRead(zarrArrayPathForLevel(path(), level),
+                                      static_cast<int>(dtypeSize())));
+    }
+    return slot;
+}
+
 std::optional<std::vector<std::byte>> Volume::readChunk(
     int level,
     const std::array<size_t, 3>& chunkZYX) const
@@ -1769,8 +1833,31 @@ std::optional<std::vector<std::byte>> Volume::readChunk(
     if (!hasScaleLevel(level))
         throw std::out_of_range("Volume::readChunk requested missing zarr scale level " + std::to_string(level));
 
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
-    return array.read_chunk(chunkZYX);
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    return arrayPtr->read_chunk(chunkZYX);
+}
+
+bool Volume::readChunkInto(
+    int level,
+    const std::array<size_t, 3>& chunkZYX,
+    std::span<std::byte> output) const
+{
+    if (isRemote())
+        throw std::runtime_error("Volume::readChunkInto is only supported for local zarr volumes");
+    if (level < 0)
+        throw std::out_of_range("Volume::readChunkInto level must be non-negative");
+    if (!hasScaleLevel(level))
+        throw std::out_of_range("Volume::readChunkInto requested missing zarr scale level " + std::to_string(level));
+
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    return arrayPtr->read_chunk_into(chunkZYX, output);
+}
+
+size_t Volume::chunkByteSize(int level) const
+{
+    const auto cs = chunkShape(level);
+    return static_cast<size_t>(cs[0]) * static_cast<size_t>(cs[1]) *
+           static_cast<size_t>(cs[2]) * dtypeSize();
 }
 
 std::vector<std::byte> Volume::readChunkOrFill(
@@ -1780,8 +1867,8 @@ std::vector<std::byte> Volume::readChunkOrFill(
     if (auto chunk = readChunk(level, chunkZYX))
         return std::move(*chunk);
 
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
-    return filledChunkBytes(array);
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    return filledChunkBytes(*arrayPtr);
 }
 
 bool Volume::chunkExists(
@@ -1795,10 +1882,10 @@ bool Volume::chunkExists(
     if (!hasScaleLevel(level))
         throw std::out_of_range("Volume::chunkExists requested missing zarr scale level " + std::to_string(level));
 
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
-    if (array.is_sharded())
-        return array.inner_chunk_exists(chunkZYX);
-    return array.chunk_exists(chunkZYX);
+    auto arrayPtr = cachedZarrArrayForRead(level);
+    if (arrayPtr->is_sharded())
+        return arrayPtr->inner_chunk_exists(chunkZYX);
+    return arrayPtr->chunk_exists(chunkZYX);
 }
 
 void Volume::writeChunk(int level,

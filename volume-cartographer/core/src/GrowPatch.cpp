@@ -130,6 +130,253 @@ static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
     return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
 }
 
+static cv::Size scaled_grid_size(const cv::Size& size, int factor)
+{
+    factor = std::max(1, factor);
+    return cv::Size(
+        std::max(1, (size.width + factor - 1) / factor),
+        std::max(1, (size.height + factor - 1) / factor));
+}
+
+static cv::Size growth_source_size_from_meta(const utils::Json& meta)
+{
+    if (!meta.contains("_growth_source_width") ||
+        !meta.contains("_growth_source_height") ||
+        !meta["_growth_source_width"].is_number() ||
+        !meta["_growth_source_height"].is_number()) {
+        return {};
+    }
+
+    const int width = meta["_growth_source_width"].get_int();
+    const int height = meta["_growth_source_height"].get_int();
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+    return cv::Size(width, height);
+}
+
+static cv::Size exact_growth_output_size(const QuadSurface* coarse,
+                                         int factor,
+                                         bool preserve_source_extent)
+{
+    if (!coarse || factor <= 1) {
+        return {};
+    }
+
+    const cv::Size source_size = growth_source_size_from_meta(coarse->meta);
+    if (source_size.width <= 0 || source_size.height <= 0) {
+        return {};
+    }
+    if (preserve_source_extent) {
+        return source_size;
+    }
+
+    const cv::Mat_<cv::Vec3f>* coarse_points = coarse->rawPointsPtr();
+    if (!coarse_points || coarse_points->empty()) {
+        return source_size;
+    }
+
+    cv::Point source_offset(0, 0);
+    if (coarse->meta.contains("grid_offset") &&
+        coarse->meta["grid_offset"].is_array() &&
+        coarse->meta["grid_offset"].size() >= 2 &&
+        coarse->meta["grid_offset"][0].is_number() &&
+        coarse->meta["grid_offset"][1].is_number()) {
+        source_offset.x = coarse->meta["grid_offset"][0].get_int();
+        source_offset.y = coarse->meta["grid_offset"][1].get_int();
+    }
+
+    const cv::Size coarse_source_size = scaled_grid_size(source_size, factor);
+    const int extra_left = std::max(0, source_offset.x);
+    const int extra_top = std::max(0, source_offset.y);
+    const int extra_right = std::max(
+        0, coarse_points->cols - source_offset.x - coarse_source_size.width);
+    const int extra_bottom = std::max(
+        0, coarse_points->rows - source_offset.y - coarse_source_size.height);
+
+    return cv::Size(
+        source_size.width + (extra_left + extra_right) * factor,
+        source_size.height + (extra_top + extra_bottom) * factor);
+}
+
+static cv::Mat_<cv::Vec3f> downsample_surface_points_nearest(const cv::Mat_<cv::Vec3f>& points, int factor)
+{
+    const cv::Size dst_size = scaled_grid_size(points.size(), factor);
+    cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int r = 0; r < result.rows; ++r) {
+        const int src_r = std::min(points.rows - 1, r * factor);
+        for (int c = 0; c < result.cols; ++c) {
+            const int src_c = std::min(points.cols - 1, c * factor);
+            result(r, c) = points(src_r, src_c);
+        }
+    }
+    return result;
+}
+
+static cv::Mat resize_surface_points_weighted(const cv::Mat_<cv::Vec3f>& points,
+                                              const cv::Size& dst_size,
+                                              int interpolation)
+{
+    cv::Mat value(points.size(), CV_32FC3, cv::Scalar(0, 0, 0));
+    cv::Mat weight(points.size(), CV_32FC1, cv::Scalar(0));
+    for (int r = 0; r < points.rows; ++r) {
+        for (int c = 0; c < points.cols; ++c) {
+            const cv::Vec3f& p = points(r, c);
+            if (p[0] == -1.0f) {
+                continue;
+            }
+            value.at<cv::Vec3f>(r, c) = p;
+            weight.at<float>(r, c) = 1.0f;
+        }
+    }
+
+    cv::Mat value_resized;
+    cv::Mat weight_resized;
+    cv::resize(value, value_resized, dst_size, 0.0, 0.0, interpolation);
+    cv::resize(weight, weight_resized, dst_size, 0.0, 0.0, interpolation);
+
+    cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int r = 0; r < result.rows; ++r) {
+        for (int c = 0; c < result.cols; ++c) {
+            const float w = weight_resized.at<float>(r, c);
+            if (w <= 1e-5f) {
+                continue;
+            }
+            result(r, c) = value_resized.at<cv::Vec3f>(r, c) * (1.0f / w);
+        }
+    }
+    return result;
+}
+
+static cv::Mat downsample_channel_for_growth(const cv::Mat& channel, const cv::Size& dst_size, const std::string& name)
+{
+    if (channel.empty()) {
+        return {};
+    }
+    cv::Mat result;
+    const int interpolation = (name == "generations" || name == "mask" || name == "approval")
+        ? cv::INTER_NEAREST
+        : cv::INTER_AREA;
+    cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
+    return result;
+}
+
+static cv::Mat downsample_allowed_growth_mask_conservative(const cv::Mat& mask, int factor)
+{
+    if (mask.empty()) {
+        return {};
+    }
+    factor = std::max(1, factor);
+    const cv::Size dst_size = scaled_grid_size(mask.size(), factor);
+    cv::Mat normalized;
+    if (mask.type() == CV_8UC1) {
+        normalized = mask;
+    } else {
+        mask.convertTo(normalized, CV_8U);
+    }
+
+    cv::Mat_<uchar> result(dst_size, static_cast<uchar>(0));
+    for (int r = 0; r < result.rows; ++r) {
+        const int src_r0 = r * factor;
+        const int src_r1 = std::min(mask.rows, src_r0 + factor);
+        for (int c = 0; c < result.cols; ++c) {
+            const int src_c0 = c * factor;
+            const int src_c1 = std::min(mask.cols, src_c0 + factor);
+            bool all_allowed = true;
+            for (int sr = src_r0; sr < src_r1 && all_allowed; ++sr) {
+                for (int sc = src_c0; sc < src_c1; ++sc) {
+                    if (normalized.at<uchar>(sr, sc) == 0) {
+                        all_allowed = false;
+                        break;
+                    }
+                }
+            }
+            result(r, c) = static_cast<uchar>(all_allowed ? 255 : 0);
+        }
+    }
+    return result;
+}
+
+static cv::Mat upsample_channel_from_growth(const cv::Mat& channel, const cv::Size& dst_size, const std::string& name)
+{
+    if (channel.empty()) {
+        return {};
+    }
+    cv::Mat result;
+    const int interpolation = (name == "generations" || name == "mask" || name == "approval")
+        ? cv::INTER_NEAREST
+        : cv::INTER_LINEAR;
+    cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
+    return result;
+}
+
+static std::unique_ptr<QuadSurface> make_growth_scale_resume_surface(QuadSurface& source, int factor)
+{
+    auto source_points = source.rawPoints();
+    auto scaled_points = downsample_surface_points_nearest(source_points, factor);
+    const cv::Vec2f source_scale = source.scale();
+    auto scaled = std::make_unique<QuadSurface>(
+        scaled_points,
+        cv::Vec2f(source_scale[0] / static_cast<float>(factor),
+                  source_scale[1] / static_cast<float>(factor)));
+    scaled->id = source.id;
+    scaled->path = source.path;
+    scaled->meta = source.meta;
+    scaled->setDpi(source.dpi());
+
+    const cv::Size dst_size = scaled_points.size();
+    for (const std::string& name : source.channelNames()) {
+        cv::Mat channel = source.channel(name, SURF_CHANNEL_NORESIZE);
+        if (!channel.empty()) {
+            scaled->setChannel(name, downsample_channel_for_growth(channel, dst_size, name));
+        }
+    }
+    return scaled;
+}
+
+static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
+                                              const cv::Vec2f& output_scale,
+                                              int factor,
+                                              cv::Size exact_output_size = {})
+{
+    if (!coarse || factor <= 1) {
+        return coarse;
+    }
+
+    auto coarse_points = coarse->rawPoints();
+    cv::Size output_size(
+        std::max(1, coarse_points.cols * factor),
+        std::max(1, coarse_points.rows * factor));
+    if (exact_output_size.width > 0 && exact_output_size.height > 0) {
+        output_size = exact_output_size;
+    }
+    cv::Mat_<cv::Vec3f> output_points =
+        resize_surface_points_weighted(coarse_points, output_size, cv::INTER_LINEAR);
+
+    auto* output = new QuadSurface(output_points, output_scale);
+    output->id = coarse->id;
+    output->path = coarse->path;
+    output->meta = coarse->meta;
+    output->setDpi(coarse->dpi());
+    output->meta["growth_scale_factor"] = factor;
+
+    if (output->meta.contains("grid_offset") && output->meta["grid_offset"].is_array() &&
+        output->meta["grid_offset"].size() >= 2) {
+        output->meta["grid_offset"][0] = output->meta["grid_offset"][0].get_int() * factor;
+        output->meta["grid_offset"][1] = output->meta["grid_offset"][1].get_int() * factor;
+    }
+
+    for (const std::string& name : coarse->channelNames()) {
+        cv::Mat channel = coarse->channel(name, SURF_CHANNEL_NORESIZE);
+        if (!channel.empty()) {
+            output->setChannel(name, upsample_channel_from_growth(channel, output_size, name));
+        }
+    }
+
+    delete coarse;
+    return output;
+}
+
 static cv::Mat_<uchar> make_approved_mask(const cv::Mat& approval,
                                           const cv::Rect& resume_area,
                                           const cv::Size& trace_size)
@@ -355,7 +602,7 @@ public:
     };
 
     PointCorrection() = default;
-    PointCorrection(const VCCollection& corrections) {
+    explicit PointCorrection(const VCCollection& corrections, float anchor_grid_scale = 1.0f) {
         const auto& collections = corrections.getAllCollections();
         if (collections.empty()) return;
 
@@ -366,6 +613,9 @@ public:
 
             CorrectionCollection new_collection;
             new_collection.anchor2d_ = collection.anchor2d;
+            if (new_collection.anchor2d_.has_value() && anchor_grid_scale != 1.0f) {
+                new_collection.anchor2d_ = new_collection.anchor2d_.value() * anchor_grid_scale;
+            }
 
             std::vector<ColPoint> sorted_points;
             sorted_points.reserve(collection.points.size());
@@ -1123,9 +1373,6 @@ struct LossSettings {
     int y_max = std::numeric_limits<int>::max();
     int x_min = -1;
     int x_max = std::numeric_limits<int>::max();
-    // Anti-flipback constraint settings
-    float flipback_threshold = 5.0f;  // Allow up to this much inward movement (voxels) before penalty
-    float flipback_weight = 1.0f;     // Weight of the anti-flipback loss (0 = disabled)
 
     int space_line_steps = 8;
     float space_line_threshold = 170.0f;
@@ -2655,18 +2902,8 @@ struct LocalOptimizationConfig {
     bool use_dense_qr = false;
 };
 
-// Configuration for anti-flipback constraint
-// This prevents the surface from flipping back through itself during optimization
-struct AntiFlipbackConfig {
-    const cv::Mat_<cv::Vec3d>* anchors = nullptr;        // Positions before optimization
-    const cv::Mat_<cv::Vec3d>* surface_normals = nullptr; // Consistently oriented surface normals
-    double threshold = 5.0;   // Allow up to this much inward movement (voxels) before penalty kicks in
-    double weight = 1.0;       // Weight of the anti-flipback loss when activated
-};
-
 struct LocalOptTimingAccumulator {
     std::atomic<double> problem_setup{0.0};
-    std::atomic<double> anti_flipback{0.0};
     std::atomic<double> cell_reopt{0.0};
     std::atomic<double> param_fixup{0.0};
     std::atomic<double> ceres_solve{0.0};
@@ -2678,9 +2915,8 @@ struct LocalOptTimingAccumulator {
                std::memory_order_relaxed, std::memory_order_relaxed)) {}
     }
 
-    void accumulate(double ps, double af, double cr, double pf, double cs) {
+    void accumulate(double ps, double cr, double pf, double cs) {
         atomic_add(problem_setup, ps);
-        atomic_add(anti_flipback, af);
         atomic_add(cell_reopt, cr);
         atomic_add(param_fixup, pf);
         atomic_add(ceres_solve, cs);
@@ -2690,14 +2926,12 @@ struct LocalOptTimingAccumulator {
     void print(double wall_time) const {
         int n = total_solves.load();
         double ps = problem_setup.load();
-        double af = anti_flipback.load();
         double cr = cell_reopt.load();
         double pf = param_fixup.load();
         double cs = ceres_solve.load();
-        double total_cpu = ps + af + cr + pf + cs;
+        double total_cpu = ps + cr + pf + cs;
         printf("\nresume opt local timing breakdown:\n");
         printf("  problem setup:          %8.3fs  (%5.1f%%)\n", ps, 100.0*ps/total_cpu);
-        printf("  anti-flipback losses:   %8.3fs  (%5.1f%%)\n", af, 100.0*af/total_cpu);
         printf("  cell reopt constraints: %8.3fs  (%5.1f%%)\n", cr, 100.0*cr/total_cpu);
         printf("  param block fixup:      %8.3fs  (%5.1f%%)\n", pf, 100.0*pf/total_cpu);
         printf("  ceres solve:            %8.3fs  (%5.1f%%)\n", cs, 100.0*cs/total_cpu);
@@ -2712,7 +2946,6 @@ struct LocalOptTimingAccumulator {
 static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters &params,
     TraceData& trace_data, LossSettings &settings, bool quiet = false, bool parallel = false,
     const LocalOptimizationConfig* solver_config = nullptr,
-    const AntiFlipbackConfig* flipback_config = nullptr,
     LocalOptTimingAccumulator* timing = nullptr)
 {
     // This Ceres problem is parameterised by locs; residuals are progressively added as the patch grows enforcing that
@@ -2720,7 +2953,11 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     auto t0 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
     ceres::Problem problem;
-    cv::Mat_<uint16_t> loss_status(params.state.size());
+    static thread_local cv::Mat_<uint16_t> thread_loss_status;
+    if (thread_loss_status.size() != params.state.size()) {
+        thread_loss_status.create(params.state.size());
+    }
+    cv::Mat_<uint16_t>& loss_status = thread_loss_status;
 
     int r_outer = radius+3;
 
@@ -2737,26 +2974,6 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
         }
 
     auto t1 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-
-    // Add anti-flipback loss if configured
-    // This penalizes points that move too far in the inward (negative normal) direction
-    if (flipback_config && flipback_config->anchors && flipback_config->surface_normals) {
-        for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
-            for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
-                cv::Vec2i op = {oy, ox};
-                if (cv::norm(p-op) <= radius && (params.state(op) & STATE_LOC_VALID)) {
-                    cv::Vec3d anchor = (*flipback_config->anchors)(op);
-                    cv::Vec3d normal = (*flipback_config->surface_normals)(op);
-                    // Only add loss if we have valid anchor and normal
-                    if (cv::norm(normal) > 0.5 && anchor[0] >= 0) {
-                        problem.AddResidualBlock(
-                            AntiFlipbackLoss::Create(anchor, normal, flipback_config->threshold, flipback_config->weight),
-                            nullptr,
-                            &params.dpoints(op)[0]);
-                    }
-                }
-            }
-    }
 
     auto t2 = timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
@@ -2829,7 +3046,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
     if (timing) {
         auto t5 = std::chrono::high_resolution_clock::now();
         auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
-        timing->accumulate(secs(t0, t1), secs(t1, t2), secs(t2, t3), secs(t3, t4), secs(t4, t5));
+        timing->accumulate(secs(t0, t1), secs(t2, t3), secs(t3, t4), secs(t4, t5));
     }
 
     if (!quiet)
@@ -2940,6 +3157,46 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 {
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
+
+    const int growth_scale_level = std::clamp(params.value("growth_scale", 0), 0, 5);
+    const int growth_scale_factor = 1 << growth_scale_level;
+    const bool use_growth_scale = resume_surf && growth_scale_factor > 1;
+    const cv::Vec2f output_surface_scale = resume_surf ? resume_surf->scale() : cv::Vec2f(1.0f, 1.0f);
+    std::unique_ptr<QuadSurface> growth_scale_resume_surf;
+    cv::Mat growth_scale_allowed_mask;
+    const cv::Mat* effective_allowed_growth_mask = allowed_growth_mask;
+    if (use_growth_scale) {
+        const cv::Size source_resume_size = resume_surf->rawPoints().size();
+        growth_scale_resume_surf = make_growth_scale_resume_surface(*resume_surf, growth_scale_factor);
+        resume_surf = growth_scale_resume_surf.get();
+        resume_surf->meta["_growth_source_width"] = source_resume_size.width;
+        resume_surf->meta["_growth_source_height"] = source_resume_size.height;
+        if (allowed_growth_mask && !allowed_growth_mask->empty()) {
+            growth_scale_allowed_mask =
+                downsample_allowed_growth_mask_conservative(*allowed_growth_mask, growth_scale_factor);
+            effective_allowed_growth_mask = &growth_scale_allowed_mask;
+        }
+        std::cout << "GrowPatch growth scale level " << growth_scale_level
+                  << " (factor=" << growth_scale_factor
+                  << ", working surface scale=" << resume_surf->scale()
+                  << ", output surface scale=" << output_surface_scale
+                  << ")" << std::endl;
+        if (effective_allowed_growth_mask && !effective_allowed_growth_mask->empty()) {
+            std::cout << "Allowed growth mask downsampled conservatively: "
+                      << allowed_growth_mask->cols << "x" << allowed_growth_mask->rows
+                      << " -> " << effective_allowed_growth_mask->cols << "x"
+                      << effective_allowed_growth_mask->rows
+                      << ", cells=" << cv::countNonZero(*effective_allowed_growth_mask)
+                      << std::endl;
+        }
+    }
+
+    auto exact_growth_output_size_for_fill = [&](const QuadSurface* coarse) -> cv::Size {
+        return exact_growth_output_size(
+            coarse,
+            use_growth_scale ? growth_scale_factor : 1,
+            params.value("disable_grid_expansion", false));
+    };
 
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
@@ -3214,18 +3471,27 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     // Load normal grid first if provided, so we can use its spiral-step
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
     if (params.contains("normal_grid_path")) {
-        ngv = std::make_unique<vc::core::util::NormalGridVolume>(params["normal_grid_path"].get_string());
+        const int normal_grid_level = std::clamp(
+            params.value("normal_grid_level", params.value("normal_grid_scale", growth_scale_level)),
+            0,
+            5);
+        ngv = std::make_unique<vc::core::util::NormalGridVolume>(
+            params["normal_grid_path"].get_string(),
+            normal_grid_level);
+        std::cout << "Loaded normal grid level " << ngv->level()
+                  << " (coordinate_scale=" << ngv->coordinateScale()
+                  << ", output_spiral_step=" << ngv->outputSpiralStep()
+                  << ")" << std::endl;
     }
 
     // Determine step size with priority: explicit param > normal_grid > resume_surf > default
     float step;
     if (params.contains("step_size")) {
         step = params.value("step_size", 20.0f);
-    } else if (ngv) {
-        // Use normal grid's spiral-step as authoritative (handles legacy surfaces with wrong scale)
-        step = ngv->metadata()["spiral-step"].get_float();
     } else if (resume_surf) {
         step = 1.0f / resume_surf->scale()[0];
+    } else if (ngv) {
+        step = static_cast<float>(ngv->outputSpiralStep());
     } else {
         step = 20.0f;
     }
@@ -3233,7 +3499,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     // Validate step matches normal grid if explicit step_size was provided
     if (ngv && params.contains("step_size")) {
-        float ngv_step = ngv->metadata()["spiral-step"].get_float();
+        float ngv_step = static_cast<float>(ngv->outputSpiralStep());
         if (std::abs(ngv_step - step) > 1e-6) {
             throw std::runtime_error("step_size parameter mismatch between normal grid volume and tracer.");
         }
@@ -3259,11 +3525,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     loss_settings.y_max = params.value("y_max", std::numeric_limits<int>::max());
     loss_settings.x_min = params.value("x_min", -1);
     loss_settings.x_max = params.value("x_max", std::numeric_limits<int>::max());
-    loss_settings.flipback_threshold = params.value("flipback_threshold", 5.0f);
-    loss_settings.flipback_weight = params.value("flipback_weight", 1.0f);
-    std::cout << "Anti-flipback: threshold=" << loss_settings.flipback_threshold
-              << " weight=" << loss_settings.flipback_weight
-              << (loss_settings.flipback_weight == 0 ? " (DISABLED)" : "") << std::endl;
     ALifeTime f_timer("empty space tracing\n");
 
 
@@ -3288,8 +3549,22 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
         int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
         int gen_diff = std::max(0, stop_gen - start_gen);
-        w = resume_generations.cols + 2 * gen_diff + 50;
-        h = resume_generations.rows + 2 * gen_diff + 50;
+        const bool disable_grid_expansion = params.value("disable_grid_expansion", false);
+        const int grow_extra_cols = std::max(0, params.value("grow_extra_cols", 0));
+        const int grow_extra_rows = std::max(0, params.value("grow_extra_rows", 0));
+        const int grow_max_extra_cols = std::max(grow_extra_cols, params.value("grow_max_extra_cols", gen_diff));
+        const int grow_max_extra_rows = std::max(grow_extra_rows, params.value("grow_max_extra_rows", gen_diff));
+        const int extra_cols = disable_grid_expansion ? grow_extra_cols : grow_max_extra_cols;
+        const int extra_rows = disable_grid_expansion ? grow_extra_rows : grow_max_extra_rows;
+        constexpr int grid_margin_each_side = 25;
+        w = resume_generations.cols + 2 * extra_cols + 2 * grid_margin_each_side;
+        h = resume_generations.rows + 2 * extra_rows + 2 * grid_margin_each_side;
+        std::cout << "GrowPatch work grid " << w << "x" << h
+                  << " (resume=" << resume_generations.cols << "x" << resume_generations.rows
+                  << ", extra_cols=" << extra_cols
+                  << ", extra_rows=" << extra_rows
+                  << ", disable_grid_expansion=" << disable_grid_expansion
+                  << ")" << std::endl;
     } else {
         // Calculate the maximum possible size the patch might grow to
         //FIXME show and handle area edge!
@@ -3336,6 +3611,180 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     float T = step;
     // float Ts = step*scale;
 
+    if (resume_surf && params.value("inpaint", false)) {
+        cv::Mat_<cv::Vec3f>* resume_points_ptr = resume_surf->rawPointsPtr();
+        if (!resume_points_ptr || resume_points_ptr->empty()) {
+            throw std::runtime_error("Missing resume surface points for inpaint.");
+        }
+
+        cv::Mat_<uint16_t> resume_generations = resume_surf->channel("generations");
+        if (resume_generations.empty()) {
+            resume_generations = cv::Mat_<uint16_t>(resume_points_ptr->size(), static_cast<uint16_t>(0));
+            for (int y = 0; y < resume_points_ptr->rows; ++y) {
+                for (int x = 0; x < resume_points_ptr->cols; ++x) {
+                    if ((*resume_points_ptr)(y, x)[0] != -1.0f) {
+                        resume_generations(y, x) = 1;
+                    }
+                }
+            }
+            resume_surf->setChannel("generations", resume_generations);
+        }
+
+        auto result_points_storage = std::make_unique<cv::Mat_<cv::Vec3f>>(resume_points_ptr->clone());
+        cv::Mat_<cv::Vec3f>& result_points = *result_points_storage;
+
+        cv::Mat active_area_mask(result_points.size(), CV_8U, cv::Scalar(0));
+        for (int y = 0; y < result_points.rows; ++y) {
+            for (int x = 0; x < result_points.cols; ++x) {
+                if (result_points(y, x)[0] != -1.0f) {
+                    active_area_mask.at<uchar>(y, x) = 255;
+                }
+            }
+        }
+
+        cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
+        cv::Mat hole_mask;
+        if (!mask.empty()) {
+            if (mask.size() != result_points.size()) {
+                throw std::runtime_error("inpaint mask size does not match resume surface size.");
+            }
+            cv::bitwise_and(active_area_mask, mask, hole_mask);
+        } else {
+            hole_mask = active_area_mask;
+        }
+
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(hole_mask, contours, hierarchy, cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
+        std::cout << "performing ROI inpaint on " << contours.size() << " potential holes" << std::endl;
+
+        int inpaint_count = 0;
+        int inpaint_skip = 0;
+        constexpr int margin = 4;
+
+        for (int i = 0; i < static_cast<int>(contours.size()); ++i) {
+            if (hierarchy[i][3] == -1) {
+                ++inpaint_skip;
+                continue;
+            }
+
+            cv::Rect roi = cv::boundingRect(contours[i]);
+            roi.x = std::max(0, roi.x - margin);
+            roi.y = std::max(0, roi.y - margin);
+            roi.width = std::min(result_points.cols - roi.x, roi.width + 2 * margin);
+            roi.height = std::min(result_points.rows - roi.y, roi.height + 2 * margin);
+
+            if (roi.width <= 4 || roi.height <= 4 ||
+                roi.x < 2 || roi.y < 2 ||
+                roi.x + roi.width > result_points.cols - 2 ||
+                roi.y + roi.height > result_points.rows - 2) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: insufficient margin around roi " << roi << std::endl;
+                continue;
+            }
+
+            cv::Mat_<uchar> inpaint_mask(roi.size(), static_cast<uchar>(1));
+            std::vector<cv::Point> hole_contour_roi;
+            hole_contour_roi.reserve(contours[i].size());
+            for (const auto& p : contours[i]) {
+                hole_contour_roi.push_back({p.x - roi.x, p.y - roi.y});
+            }
+            cv::fillPoly(inpaint_mask, std::vector<std::vector<cv::Point>>{hole_contour_roi}, cv::Scalar(0));
+
+            TraceParameters local_params;
+            local_params.unit = trace_params.unit;
+            local_params.dpoints = cv::Mat_<cv::Vec3d>(roi.size(), cv::Vec3d(-1.0, -1.0, -1.0));
+            local_params.state = cv::Mat_<uint8_t>(roi.size(), static_cast<uint8_t>(0));
+            for (int y = 0; y < roi.height; ++y) {
+                for (int x = 0; x < roi.width; ++x) {
+                    const cv::Vec3f& p = result_points(roi.y + y, roi.x + x);
+                    if (p[0] != -1.0f) {
+                        local_params.dpoints(y, x) = cv::Vec3d(p[0], p[1], p[2]);
+                        local_params.state(y, x) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    }
+                }
+            }
+
+            bool did_inpaint = false;
+            try {
+                did_inpaint = inpaint(cv::Rect(0, 0, roi.width, roi.height),
+                                      inpaint_mask,
+                                      local_params,
+                                      trace_data);
+            } catch (const cv::Exception& ex) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: OpenCV exception for roi " << roi << " => " << ex.what() << std::endl;
+                continue;
+            } catch (const std::exception& ex) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: exception for roi " << roi << " => " << ex.what() << std::endl;
+                continue;
+            } catch (...) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: unknown exception for roi " << roi << std::endl;
+                continue;
+            }
+
+            if (!did_inpaint) {
+                ++inpaint_skip;
+                std::cout << "skip ROI inpaint: mask border check failed for roi " << roi << std::endl;
+                continue;
+            }
+
+            for (int y = 0; y < roi.height; ++y) {
+                for (int x = 0; x < roi.width; ++x) {
+                    if (inpaint_mask(y, x) != 0 || !(local_params.state(y, x) & STATE_LOC_VALID)) {
+                        continue;
+                    }
+                    const cv::Vec3d& p = local_params.dpoints(y, x);
+                    if (p[0] != -1.0) {
+                        result_points(roi.y + y, roi.x + x) =
+                            cv::Vec3f(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
+                    }
+                }
+            }
+            ++inpaint_count;
+        }
+
+        std::cout << "ROI inpaint completed: " << inpaint_count
+                  << " holes, " << inpaint_skip << " skipped" << std::endl;
+
+        auto surf = new QuadSurface(result_points_storage.release(), {1/T, 1/T});
+        surf->setDpi(voxelSizeToDpi(voxelsize));
+        surf->setChannel("generations", resume_generations.clone());
+
+        cv::Mat approval = resume_surf->channel("approval", SURF_CHANNEL_NORESIZE);
+        if (!approval.empty()) {
+            surf->setChannel("approval", approval);
+        }
+        if (!mask.empty()) {
+            surf->setChannel("mask", mask);
+        }
+
+        const double area_est_vx2 = vc::surface::computeSurfaceAreaVox2(*surf);
+        const double voxel_size_d = static_cast<double>(voxelsize);
+        const double area_est_cm2 = area_est_vx2 * voxel_size_d * voxel_size_d / 1e8;
+        surf->meta = utils::Json::parse(meta_params.dump());
+        if (resume_surf && !resume_surf->id.empty()) {
+            surf->meta["seed_surface_id"] = resume_surf->id;
+        }
+        surf->meta["area_vx2"] = area_est_vx2;
+        surf->meta["area_cm2"] = area_est_cm2;
+        surf->meta["max_gen"] = stop_gen;
+        surf->meta["elapsed_time_s"] = f_timer.seconds();
+
+        delete timer;
+        const cv::Size exact_output_size = exact_growth_output_size(
+            surf,
+            use_growth_scale ? growth_scale_factor : 1,
+            true);
+        return make_output_scale_surface(
+            surf,
+            output_surface_scale,
+            use_growth_scale ? growth_scale_factor : 1,
+            exact_output_size);
+    }
+
     
     // The following track the state of the patch; they are each as big as the largest possible patch but initially empty
     // - locs defines the patch! It says for each 2D position, which 3D position it corresponds to
@@ -3368,7 +3817,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         auto surf = new QuadSurface(points_crop, {1/T, 1/T});
         surf->setDpi(voxelSizeToDpi(voxelsize));
-        surf->setChannel("generations", generations_crop);
+        surf->setChannel("generations", generations_crop.clone());
 
         if (params.value("vis_losses", false)) {
             cv::Mat_<float> loss_dist(generations_crop.size(), 0.0f);
@@ -3457,7 +3906,11 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             // Get raw points size (channels are stored at this resolution)
             const cv::Mat_<cv::Vec3f>* new_points = surf->rawPointsPtr();
             if (!new_points || new_points->empty()) {
-                return surf;
+                return make_output_scale_surface(
+                    surf,
+                    output_surface_scale,
+                    use_growth_scale ? growth_scale_factor : 1,
+                    exact_growth_output_size_for_fill(surf));
             }
             const cv::Size raw_size = new_points->size();
 
@@ -3537,7 +3990,11 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
-        return surf;
+        return make_output_scale_surface(
+            surf,
+            output_surface_scale,
+            use_growth_scale ? growth_scale_factor : 1,
+            exact_growth_output_size_for_fill(surf));
     };
 
     cv::Vec3f vx = {1,0,0};
@@ -3567,19 +4024,19 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
 
-        if (allowed_growth_mask && !allowed_growth_mask->empty()) {
-            if (allowed_growth_mask->rows != resume_points.rows || allowed_growth_mask->cols != resume_points.cols) {
+        if (effective_allowed_growth_mask && !effective_allowed_growth_mask->empty()) {
+            if (effective_allowed_growth_mask->rows != resume_points.rows || effective_allowed_growth_mask->cols != resume_points.cols) {
                 throw std::runtime_error("allowed growth mask size does not match resume surface size.");
             }
-            if (allowed_growth_mask->channels() != 1) {
+            if (effective_allowed_growth_mask->channels() != 1) {
                 throw std::runtime_error("allowed growth mask must be single-channel.");
             }
             trace_data.allowed_growth_mask = cv::Mat_<uchar>(trace_params.state.size(), static_cast<uchar>(0));
             cv::Mat normalized_mask;
-            if (allowed_growth_mask->type() == CV_8UC1) {
-                normalized_mask = *allowed_growth_mask;
+            if (effective_allowed_growth_mask->type() == CV_8UC1) {
+                normalized_mask = *effective_allowed_growth_mask;
             } else {
-                allowed_growth_mask->convertTo(normalized_mask, CV_8U);
+                effective_allowed_growth_mask->convertTo(normalized_mask, CV_8U);
             }
 
             cv::Mat nonzero_mask;
@@ -3644,7 +4101,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                       << " points newer than rewind generation " << start_gen << "." << std::endl;
         }
 
-        trace_data.point_correction = PointCorrection(corrections);
+        trace_data.point_correction = PointCorrection(
+            corrections,
+            use_growth_scale ? (1.0f / static_cast<float>(growth_scale_factor)) : 1.0f);
 
         if (trace_data.point_correction.isValid()) {
             trace_data.point_correction.init(trace_params.dpoints);
@@ -3755,7 +4214,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
 
             std::cout << "Resuming with " << trace_data.point_correction.all_grid_locs().size() << " correction points." << std::endl;
-            cv::Mat mask = resume_surf->channel("mask");
+            cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
             if (!mask.empty()) {
                 std::vector<std::vector<cv::Point2f>> all_hulls;
                 // For single-point collections (e.g., drag-and-drop), store center and radius
@@ -4077,7 +4536,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config, nullptr, &timing_accum);
+                    local_optimization(opt_radius, p, trace_params, trace_data, loss_settings, true, false, &resume_local_config, &timing_accum);
                     done++;
 #pragma omp critical
                     {
@@ -4097,7 +4556,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
         else if (params.value("inpaint", false)) {
-            cv::Mat mask = resume_surf->channel("mask");
+            cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
             cv::Mat_<uchar> hole_mask(trace_params.state.size(), (uchar)0);
 
             cv::Mat active_area_mask(trace_params.state.size(), (uchar)0);
@@ -4376,17 +4835,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         } else {
 
-            // Snapshot positions before per-point optimization for flip detection
-            cv::Mat_<cv::Vec3d> positions_before_perpoint = trace_params.dpoints.clone();
-
-            // Configure anti-flipback constraint for per-point optimization
-            // Note: new points won't have surface normals yet, but the loss function handles this
-            AntiFlipbackConfig perpoint_flipback_config;
-            perpoint_flipback_config.anchors = &positions_before_perpoint;
-            perpoint_flipback_config.surface_normals = &surface_normals;
-            perpoint_flipback_config.threshold = loss_settings.flipback_threshold;
-            perpoint_flipback_config.weight = loss_settings.flipback_weight;
-
             // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
             // considering two points that are too close to each other...
             OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
@@ -4473,9 +4921,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     ceres::Solver::Summary summary;
                     ceres::Solve(options, &problem, &summary);
 
-                    local_optimization(1, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
+                    local_optimization(1, p, trace_params, trace_data, loss_settings, true, false);
                     if (local_opt_r > 1)
-                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false, nullptr, &perpoint_flipback_config);
+                        local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false);
 
                     generations(p) = generation;
 
@@ -4523,16 +4971,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             int done = 0;
 
             if (!opt_local.empty()) {
-                // Snapshot positions before optimization for flip detection
-                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
-
-                // Configure anti-flipback constraint
-                AntiFlipbackConfig flipback_config;
-                flipback_config.anchors = &positions_before_opt;
-                flipback_config.surface_normals = &surface_normals;
-                flipback_config.threshold = loss_settings.flipback_threshold;
-                flipback_config.weight = loss_settings.flipback_weight;
-
                 OmpThreadPointCol opt_local_threadcol(17, opt_local);
 
 #pragma omp parallel
@@ -4543,7 +4981,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     if (p[0] == -1)
                         break;
 
-                    local_optimization(8, p, trace_params, trace_data, loss_settings, true, false, nullptr, &flipback_config);
+                    local_optimization(8, p, trace_params, trace_data, loss_settings, true, false);
 
 #pragma omp atomic
                     done++;
@@ -4553,17 +4991,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         else {
             //we do the global opt only every 8 gens, as every add does a small local solve anyweays
             if (generation % 8 == 0) {
-                // Snapshot positions before global optimization
-                cv::Mat_<cv::Vec3d> positions_before_opt = trace_params.dpoints.clone();
-
-                // Configure anti-flipback constraint
-                AntiFlipbackConfig flipback_config;
-                flipback_config.anchors = &positions_before_opt;
-                flipback_config.surface_normals = &surface_normals;
-                flipback_config.threshold = loss_settings.flipback_threshold;
-                flipback_config.weight = loss_settings.flipback_weight;
-
-                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true, nullptr, &flipback_config);
+                local_optimization(stop_gen+10, {y0,x0}, trace_params, trace_data, loss_settings, false, true);
             }
         }
 

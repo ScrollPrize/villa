@@ -41,7 +41,6 @@ constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
 constexpr float kAlphaDefaultHighDelta = 0.05f;
-constexpr float kAlphaBorderLimit = 20.0f;
 constexpr int kAlphaBlurRadiusMax = 15;
 constexpr float kAlphaPerVertexLimitMax = 128.0f;
 constexpr std::size_t kAlphaPerVertexMaxSamples = 512;
@@ -462,8 +461,8 @@ AlphaPushPullConfig SegmentationPushPullTool::sanitizeConfig(const AlphaPushPull
         sanitized.high = std::min(1.0f, sanitized.low + kAlphaDefaultHighDelta);
     }
 
-    sanitized.borderOffset = std::clamp(sanitized.borderOffset, -kAlphaBorderLimit, kAlphaBorderLimit);
     sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, kAlphaBlurRadiusMax);
+    sanitized.computeScale = std::clamp(sanitized.computeScale, 0, 5);
     sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, kAlphaPerVertexLimitMax);
 
     return sanitized;
@@ -476,8 +475,8 @@ bool SegmentationPushPullTool::configsEqual(const AlphaPushPullConfig& lhs, cons
            nearlyEqual(lhs.step, rhs.step) &&
            nearlyEqual(lhs.low, rhs.low) &&
            nearlyEqual(lhs.high, rhs.high) &&
-           nearlyEqual(lhs.borderOffset, rhs.borderOffset) &&
            lhs.blurRadius == rhs.blurRadius &&
+           lhs.computeScale == rhs.computeScale &&
            nearlyEqual(lhs.perVertexLimit, rhs.perVertexLimit) &&
            lhs.perVertex == rhs.perVertex;
 }
@@ -613,12 +612,13 @@ void SegmentationPushPullTool::stopAll()
 
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _state) {
+        const auto editedVerts = _editManager->editedVertices();
+
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)_module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
-            const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 // Get drag center from the cached row/col if available
                 std::optional<std::pair<int, int>> dragCenter;
@@ -633,6 +633,8 @@ void SegmentationPushPullTool::stopAll()
         _editManager->applyPreview();
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         _module.emitPendingChanges();
+        _module.queueAutosaveVertexUpdates(editedVerts);
+        _module.markAutosaveNeeded();
     }
 
     if (wasActive) {
@@ -819,26 +821,21 @@ void SegmentationPushPullTool::launchAlphaCompute()
         return;
     }
 
-    // Capture all inputs needed by the background thread on the main thread
+    // Capture all inputs needed by the background thread on the main thread.
+    // Alpha push/pull is an editing interaction against the displayed volume,
+    // not the growth volume selected in the segmentation widget.
     std::shared_ptr<Volume> volume = hover.viewer->currentVolume();
-    if (_state && _state->vpkg()) {
-        const std::string selectedVolumeId = _state->segmentationGrowthVolumeId().empty()
-            ? _state->currentVolumeId()
-            : _state->segmentationGrowthVolumeId();
-        if (!selectedVolumeId.empty() && _state->vpkg()->hasVolume(selectedVolumeId)) {
-            volume = _state->vpkg()->volume(selectedVolumeId);
-        }
+    if (!volume && _state) {
+        volume = _state->currentVolume();
     }
     if (!volume) {
         failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active volume to sample."));
         return;
     }
 
-    // Alpha push/pull should follow the opacity boundary in the source data,
-    // independent of the viewer's current LOD. Sampling a coarser display level
-    // can move or blur the detected boundary, especially with remote chunked
-    // volumes where the viewer may be several pyramid levels down.
-    constexpr int datasetIndex = 0;
+    // Alpha push/pull samples the user-selected OME-Zarr scale, independent of
+    // the viewer's current display LOD.
+    const int datasetIndex = std::clamp(_alphaConfig.computeScale, 0, 5);
     constexpr float scale = 1.0f;
 
     const int direction = _ppState.direction;
@@ -846,13 +843,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
     const std::uint64_t generation = _alphaGeneration;
     bool perVertex = config.perVertex;
 
-    // Snapshot per-vertex sample data from the active drag
-    struct SampleInput {
-        cv::Vec3f baseWorld;
-        cv::Vec3f normal;
-    };
-
-    std::vector<SampleInput> sampleInputs;
+    std::vector<AlphaTargetInput> sampleInputs;
     cv::Vec3f centerWorld(0, 0, 0);
     cv::Vec3f centerNormal(0, 0, 0);
 
@@ -927,43 +918,24 @@ void SegmentationPushPullTool::launchAlphaCompute()
         if (perVertex && !sampleInputs.empty()) {
             result.perVertex = true;
 
-            std::vector<cv::Vec3f> targets;
-            targets.reserve(sampleInputs.size());
+            result = computeAlphaTargetsStatic(sampleInputs,
+                                               direction,
+                                               config,
+                                               volume,
+                                               datasetIndex,
+                                               scale,
+                                               generation);
+            if (!result.success) {
+                return result;
+            }
+
+            std::vector<cv::Vec3f>& targets = result.perVertexTargets;
             std::vector<float> movements;
-            movements.reserve(sampleInputs.size());
-            bool anyMovement = false;
+            movements.reserve(targets.size());
             float minMovement = std::numeric_limits<float>::max();
-            std::string noTargetReason;
-
-            for (const auto& si : sampleInputs) {
-                bool unavailable = false;
-                std::string sampleReason;
-                auto target = computeAlphaTargetStatic(
-                    si.baseWorld, si.normal, direction, config,
-                    volume, datasetIndex, scale, &unavailable, &sampleReason);
-
-                if (unavailable) {
-                    result.noMovementReason = sampleReason.empty()
-                        ? "Alpha push/pull could not read the volume data."
-                        : sampleReason;
-                    return result;  // success = false
-                }
-                if (!sampleReason.empty() && noTargetReason.empty()) {
-                    noTargetReason = std::move(sampleReason);
-                }
-
-                cv::Vec3f newWorld = si.baseWorld;
-                float movement = 0.0f;
-                if (target) {
-                    newWorld = *target;
-                    const cv::Vec3f delta = newWorld - si.baseWorld;
-                    movement = static_cast<float>(cv::norm(delta));
-                    if (movement >= 1e-4f) {
-                        anyMovement = true;
-                    }
-                }
-
-                targets.push_back(newWorld);
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                const cv::Vec3f delta = targets[i] - sampleInputs[i].baseWorld;
+                const float movement = static_cast<float>(cv::norm(delta));
                 movements.push_back(movement);
                 minMovement = std::min(minMovement, movement);
             }
@@ -980,23 +952,10 @@ void SegmentationPushPullTool::launchAlphaCompute()
                             const float s = maxAllowed / length;
                             targets[i] = sampleInputs[i].baseWorld + delta * s;
                             movements[i] = maxAllowed;
-                            if (maxAllowed >= 1e-4f) {
-                                anyMovement = true;
-                            }
                         }
                     }
                 }
             }
-
-            if (!anyMovement) {
-                result.noMovementReason = noTargetReason.empty()
-                    ? "Alpha push/pull computed no vertex movement."
-                    : noTargetReason;
-                return result;  // success = false
-            }
-
-            result.perVertexTargets = std::move(targets);
-            result.success = true;
         } else {
             // Single-target alpha mode
             bool unavailable = false;
@@ -1202,6 +1161,174 @@ void SegmentationPushPullTool::ensureTimer()
     });
 }
 
+SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTargetsStatic(
+    const std::vector<AlphaTargetInput>& inputs,
+    int direction,
+    const AlphaPushPullConfig& config,
+    const std::shared_ptr<Volume>& volume,
+    int datasetIndex,
+    float scale,
+    std::uint64_t generation)
+{
+    AlphaResult result;
+    result.generation = generation;
+    result.perVertex = true;
+
+    if (inputs.empty()) {
+        result.noMovementReason = "Alpha push/pull computed no vertex movement.";
+        return result;
+    }
+    if (!volume) {
+        result.noMovementReason = "Alpha push/pull has no active volume to sample.";
+        return result;
+    }
+
+    AlphaPushPullConfig cfg = sanitizeConfig(config);
+    if (!volume->hasScaleLevel(datasetIndex)) {
+        result.noMovementReason = "Alpha push/pull requested missing OME-Zarr scale " +
+                                  std::to_string(datasetIndex) + ".";
+        return result;
+    }
+
+    const int radius = std::max(cfg.blurRadius, 0);
+    const int kernel = radius * 2 + 1;
+    const cv::Size patchSize(kernel, kernel);
+    const cv::Point2i centerIndex(radius, radius);
+    const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
+
+    std::vector<cv::Vec3f> normals(inputs.size(), cv::Vec3f(0.0f, 0.0f, 0.0f));
+    std::vector<uint8_t> valid(inputs.size(), 0);
+    std::vector<float> transparent(inputs.size(), 1.0f);
+    std::vector<float> integ(inputs.size(), 0.0f);
+
+    cv::Mat_<cv::Vec3f> baseCoords(static_cast<int>(inputs.size()) * kernel, kernel);
+    cv::Mat_<cv::Vec3f> patchCoords;
+    std::string firstNoTargetReason;
+
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        cv::Vec3f orientedNormal = inputs[i].normal * static_cast<float>(direction);
+        const float norm = cv::norm(orientedNormal);
+        if (norm <= 1e-4f || !std::isfinite(norm)) {
+            if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull could not determine a valid surface normal.";
+            }
+            continue;
+        }
+        orientedNormal /= norm;
+        normals[i] = orientedNormal;
+        valid[i] = 1;
+
+        PlaneSurface plane(inputs[i].baseWorld, orientedNormal);
+        plane.gen(&patchCoords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
+        patchCoords.copyTo(baseCoords.rowRange(static_cast<int>(i) * kernel,
+                                               static_cast<int>(i + 1) * kernel));
+    }
+
+    const float start = cfg.start;
+    const float stop = cfg.stop;
+    const float step = std::fabs(cfg.step);
+
+    cv::Mat_<cv::Vec3f> offsetCoords(baseCoords.size());
+    cv::Mat_<uint8_t> slice;
+    cv::Mat floatPatch(patchSize, CV_32F);
+
+    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const int row0 = static_cast<int>(i) * kernel;
+            auto dstBlock = offsetCoords.rowRange(row0, row0 + kernel);
+            auto srcBlock = baseCoords.rowRange(row0, row0 + kernel);
+            const int total = kernel * kernel;
+            const auto* src = srcBlock.ptr<cv::Vec3f>();
+            auto* dst = dstBlock.ptr<cv::Vec3f>();
+            if (valid[i]) {
+                const cv::Vec3f delta = normals[i] * offset;
+                for (int p = 0; p < total; ++p) {
+                    dst[p] = src[p] + delta;
+                }
+            } else {
+                for (int p = 0; p < total; ++p) {
+                    dst[p] = src[p];
+                }
+            }
+        }
+
+        vc::SampleParams sp;
+        sp.level = datasetIndex;
+        volume->sample(slice, offsetCoords, sp);
+        if (slice.empty()) {
+            if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull sampled an empty volume slice.";
+            }
+            continue;
+        }
+
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            if (!valid[i] || transparent[i] <= 1e-3f) {
+                continue;
+            }
+
+            const int row0 = static_cast<int>(i) * kernel;
+            const cv::Mat srcBlock(slice, cv::Rect(0, row0, kernel, kernel));
+            srcBlock.convertTo(floatPatch, CV_32F, 1.0 / 255.0);
+            cv::GaussianBlur(floatPatch, floatPatch, cv::Size(kernel, kernel), 0);
+
+            cv::Mat_<float> opaq = floatPatch;
+            opaq = (opaq - cfg.low) / range;
+            cv::min(opaq, 1.0f, opaq);
+            cv::max(opaq, 0.0f, opaq);
+
+            const float centerOpacity = opaq(centerIndex);
+            const float joint = transparent[i] * centerOpacity;
+            integ[i] += joint * offset;
+            transparent[i] -= joint;
+        }
+    }
+
+    result.perVertexTargets.reserve(inputs.size());
+    bool anyMovement = false;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        cv::Vec3f targetWorld = inputs[i].baseWorld;
+        if (valid[i] && transparent[i] < 1.0f) {
+            const float denom = 1.0f - transparent[i];
+            if (denom >= 1e-5f) {
+                const float expected = integ[i] / denom;
+                if (std::isfinite(expected) && expected > 0.0f) {
+                    targetWorld = inputs[i].baseWorld + normals[i] * expected;
+                } else if (firstNoTargetReason.empty()) {
+                    firstNoTargetReason = "Alpha push/pull target is at or behind the current surface.";
+                }
+            } else if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull opacity response was too small to choose a target.";
+            }
+        } else if (firstNoTargetReason.empty()) {
+            firstNoTargetReason = "Alpha push/pull found no opacity in the configured alpha range.";
+        }
+
+        if (!std::isfinite(targetWorld[0]) || !std::isfinite(targetWorld[1]) || !std::isfinite(targetWorld[2])) {
+            targetWorld = inputs[i].baseWorld;
+            if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull computed a non-finite target position.";
+            }
+        }
+
+        if (cv::norm(targetWorld - inputs[i].baseWorld) >= 1e-4f) {
+            anyMovement = true;
+        }
+        result.perVertexTargets.push_back(targetWorld);
+    }
+
+    if (!anyMovement) {
+        result.perVertexTargets.clear();
+        result.noMovementReason = firstNoTargetReason.empty()
+            ? "Alpha push/pull computed no vertex movement."
+            : firstNoTargetReason;
+        return result;
+    }
+
+    result.success = true;
+    return result;
+}
+
 std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     const cv::Vec3f& centerWorld,
     const cv::Vec3f& normal,
@@ -1226,6 +1353,16 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     }
 
     AlphaPushPullConfig cfg = sanitizeConfig(config);
+    if (!volume->hasScaleLevel(datasetIndex)) {
+        if (outUnavailable) {
+            *outUnavailable = true;
+        }
+        if (outNoTargetReason && outNoTargetReason->empty()) {
+            *outNoTargetReason = "Alpha push/pull requested missing OME-Zarr scale " +
+                                 std::to_string(datasetIndex) + ".";
+        }
+        return std::nullopt;
+    }
 
     cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
     const float norm = cv::norm(orientedNormal);
@@ -1308,14 +1445,13 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
         return std::nullopt;
     }
 
-    const float totalOffset = expected + cfg.borderOffset;
-    if (!std::isfinite(totalOffset) || totalOffset <= 0.0f) {
+    if (expected <= 0.0f) {
         setAlphaNoTargetReason(outNoTargetReason,
                                "Alpha push/pull target is at or behind the current surface.");
         return std::nullopt;
     }
 
-    const cv::Vec3f targetWorld = centerWorld + orientedNormal * totalOffset;
+    const cv::Vec3f targetWorld = centerWorld + orientedNormal * expected;
     if (!std::isfinite(targetWorld[0]) || !std::isfinite(targetWorld[1]) || !std::isfinite(targetWorld[2])) {
         setAlphaNoTargetReason(outNoTargetReason,
                                "Alpha push/pull computed a non-finite target position.");

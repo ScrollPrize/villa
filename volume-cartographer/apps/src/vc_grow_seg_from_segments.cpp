@@ -1444,11 +1444,11 @@ int main(int argc, char *argv[])
 
             surf->meta["source"] = "vc_grow_seg_from_segments_seed_coordinate";
             surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
-            surf->meta["seed_coordinate"] = {
-                seed.point[0],
-                seed.point[1],
-                seed.point[2]
-            };
+            auto seed_coord = utils::Json::array();
+            seed_coord.push_back(static_cast<double>(seed.point[0]));
+            seed_coord.push_back(static_cast<double>(seed.point[1]));
+            seed_coord.push_back(static_cast<double>(seed.point[2]));
+            surf->meta["seed_coordinate"] = seed_coord;
             surf->meta["seed_source_patch"] = src->path.string();
             add_target_context(surf->meta, vol_path);
 

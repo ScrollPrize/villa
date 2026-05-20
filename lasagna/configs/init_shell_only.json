@@ -1,0 +1,48 @@
+{
+	"args": {
+		"model-init": "seed",
+		"init-mode": "shell-dir-crop",
+		"mesh-step": 50.0
+	},
+	"base": {
+		"normal": 1.0,
+		"step": 10.0,
+		"smooth": 10.0,
+		"station_n": 0.1,
+		"station_t": 0.1,
+		"winding_density": 0.01,
+		"data": 0.0,
+		"data_plain": 0.0,
+		"pred_dt": 0.001,
+		"corr": 0.1,
+		"bend": 100.0,
+		"ext_offset": 0.0
+	},
+	"stages": [
+
+		{
+			"name": "stage1",
+			"steps": 1000,
+			"lr": 0.1,
+			"params": ["mesh_ms"],
+			"min_scaledown": 0,
+			"w_fac": {
+				"pred_dt": 0.0,
+				"station_n": 10.0,
+				"station_t": 10.0
+			}
+		},
+		{
+			"name": "stage2",
+			"steps": 500,
+			"lr": 0.01,
+			"params": ["mesh_ms"],
+			"min_scaledown": 0,
+			"w_fac": {
+				"pred_dt": 0.0,
+				"station_n": 10.0,
+				"station_t": 10.0
+			}
+		}
+	]
+}

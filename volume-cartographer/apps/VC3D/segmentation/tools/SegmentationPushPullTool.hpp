@@ -66,6 +66,12 @@ public:
     };
 
 private:
+    struct AlphaTargetInput
+    {
+        cv::Vec3f baseWorld{0.0f, 0.0f, 0.0f};
+        cv::Vec3f normal{0.0f, 0.0f, 0.0f};
+    };
+
     bool applyStepInternal();
     void ensureTimer();
     void launchAlphaCompute();
@@ -83,6 +89,15 @@ private:
         float scale,
         bool* outUnavailable,
         std::string* outNoTargetReason = nullptr);
+
+    static AlphaResult computeAlphaTargetsStatic(
+        const std::vector<AlphaTargetInput>& inputs,
+        int direction,
+        const AlphaPushPullConfig& config,
+        const std::shared_ptr<Volume>& volume,
+        int datasetIndex,
+        float scale,
+        std::uint64_t generation);
 
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};

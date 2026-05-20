@@ -23,6 +23,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       pull-requests: read
       contents: read
@@ -48,7 +49,7 @@ jobs:
     if: github.event_name == 'pull_request'
     needs: [changes]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       security-events: write
       contents: read
@@ -68,6 +69,7 @@ jobs:
           languages: c-cpp
           build-mode: none
           queries: security-extended
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Analyze
         if: needs.changes.outputs.vc == 'true'
@@ -103,32 +105,17 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            build-essential git cmake ninja-build ccache \
-            qt6-base-dev libboost-system-dev libboost-program-options-dev \
-            libceres-dev libcgal-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
-            libgsl-dev libsdl2-dev libcurl4-openssl-dev
-
-      - name: Restore ccache
-        if: needs.changes.outputs.vc == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-vc3d-codeql-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-codeql.yml') }}
-          restore-keys: ccache-${{ runner.os }}-vc3d-codeql-
-
-      - name: Enable ccache
-        if: needs.changes.outputs.vc == 'true'
-        run: |
-          mkdir -p ~/.ccache
-          echo 'max_size = 5G' >> ~/.ccache/ccache.conf || true
-          echo 'hash_dir = true' >> ~/.ccache/ccache.conf || true
-          echo 'compiler_check = content' >> ~/.ccache/ccache.conf || true
-          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE/volume-cartographer" >> $GITHUB_ENV
-
-      - name: Reset ccache stats
-        if: needs.changes.outputs.vc == 'true'
-        run: ccache -z || true
-
+            build-essential git cmake ninja-build pkg-config \
+            qt6-base-dev \
+            libboost-system-dev libboost-program-options-dev \
+            libceres-dev libsuitesparse-dev \
+            libopencv-dev libopencv-contrib-dev \
+            libcgal-dev libmpfr-dev libgmp-dev \
+            libblosc-dev libzstd-dev libcurl4-openssl-dev \
+            nlohmann-json3-dev libavahi-client-dev \
+            liblz4-dev libtiff-dev \
+            zlib1g-dev gfortran libopenblas-dev liblapack-dev liblapacke-dev \
+            libscotch-dev libhwloc-dev
 
       - name: Initialize CodeQL
         if: needs.changes.outputs.vc == 'true'
@@ -137,47 +124,22 @@ jobs:
           languages: c-cpp
           build-mode: manual
           queries: security-extended,security-and-quality
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Configure (Ninja, fast flags)
         if: needs.changes.outputs.vc == 'true'
         working-directory: ./volume-cartographer
         run: |
           cmake -S . -B build -G Ninja \
-                -DVC_WITH_CUDA_SPARSE=off \
-                -DVC_WITH_PASTIX=OFF \
-                -DVC_BUILD_TESTS=OFF \
-                -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Debug \
+                -DVC_TESTING=OFF \
+                -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_C_COMPILER=gcc \
-                -DCMAKE_CXX_COMPILER=g++ \
-                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-
-      - name: Verify compiler toolchain
-        if: needs.changes.outputs.vc == 'true'
-        working-directory: ./volume-cartographer
-        run: |
-          set -euo pipefail
-          rg -n "^(CMAKE_C_COMPILER|CMAKE_CXX_COMPILER|CMAKE_ASM_COMPILER):" build/CMakeCache.txt || true
-          if rg -n "^(CMAKE_C_COMPILER|CMAKE_CXX_COMPILER|CMAKE_ASM_COMPILER):.*ccache" build/CMakeCache.txt; then
-            echo "Compiler resolved to a ccache wrapper; expected gcc/g++ and launcher-only ccache."
-            exit 1
-          fi
+                -DCMAKE_CXX_COMPILER=g++
 
       - name: Build (fast)
         if: needs.changes.outputs.vc == 'true'
         working-directory: ./volume-cartographer
         run: cmake --build build --parallel
-
-      - name: Show ccache stats
-        if: always() && needs.changes.outputs.vc == 'true'
-        run: ccache -s || true
-
-      - name: Save ccache
-        if: always() && needs.changes.outputs.vc == 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-vc3d-codeql-${{ hashFiles('volume-cartographer/**/CMakeLists.txt','volume-cartographer/**/*.cmake','.github/workflows/vc3d-codeql.yml') }}
 
       - name: Analyze
         if: needs.changes.outputs.vc == 'true'

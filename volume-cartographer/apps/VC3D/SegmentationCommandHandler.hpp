@@ -122,6 +122,9 @@ public slots:
     void onABFFlatten(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
     void onRasterizeSegments(const QStringList& segmentIds);
+    // Open the MergeTifxyzDialog seeded with `segmentIds` (empty = open
+    // dialog with empty grid for the user to populate via "Add segments").
+    void onMergeTifxyz(const QStringList& segmentIds);
     void onAddIgnoreLabel();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);

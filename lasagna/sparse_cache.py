@@ -261,6 +261,18 @@ class SparseChunkGroupCache:
             flat = xyz_fullres.reshape(-1, 3)
             local = (flat - origin.view(1, 3)) * inv_scale.view(1, 3)
             finite = torch.isfinite(local).all(dim=1)
+            if not bool(finite.all().detach().cpu()):
+                bad_idx = (~finite).nonzero(as_tuple=False).flatten()
+                first = bad_idx[:8]
+                ctx = f" context={context}" if context else ""
+                raise RuntimeError(
+                    "non-finite sparse sample coordinates before CUDA sample: "
+                    f"channels={','.join(self.channels)}{ctx} "
+                    f"bad={int(bad_idx.numel())}/{int(flat.shape[0])} "
+                    f"chunk_grid={cZ}x{cY}x{cX} "
+                    f"first_local_xyz={local[first].detach().cpu().tolist()} "
+                    f"first_full_xyz={flat[first].detach().cpu().tolist()}"
+                )
             ci_x = torch.floor(local[:, 0] / float(_CHUNK_SIZE)).to(torch.long)
             ci_y = torch.floor(local[:, 1] / float(_CHUNK_SIZE)).to(torch.long)
             ci_z = torch.floor(local[:, 2] / float(_CHUNK_SIZE)).to(torch.long)

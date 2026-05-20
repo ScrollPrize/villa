@@ -482,6 +482,7 @@ private:
     void onStdout_() {
         const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
         ioLog_ += chunk;
+        std::cout << chunk.toStdString() << std::flush;
         const QStringList lines = chunk.split('\n', Qt::SkipEmptyParts);
         for (const QString& raw : lines) {
             const QString line = raw.trimmed();

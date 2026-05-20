@@ -61,7 +61,7 @@ Here is an excellent 2 minute overview of how this was achieved:
 
 <iframe className="w-[100%] aspect-video mb-4" src="https://www.youtube.com/embed/GduCExxB0vw" title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen/>
 
-For the Herculaneum papyri, many of the same steps apply, with one key change - the ink is much less readily visible. There is much room for improvement in each step of the pipeline: We can currently only read 5% of a complete scroll. We would like to read 90% in 2024. That is your goal!
+For the Herculaneum papyri, many of the same steps apply, with one key change - the ink is much less readily visible. There is still room for improvement in each step of the pipeline as the project scales from isolated readable passages toward broad, reliable scroll reading. Current milestones and prize criteria are maintained on the [Prizes](prizes) page.
 
 
 Let's go through each of the key steps one by one.

@@ -19,6 +19,7 @@
 #include <memory>
 #include <unordered_map>
 #include <variant>
+#include <limits>
 
 #if !defined(_WIN32)
 #  include <fcntl.h>
@@ -986,9 +987,13 @@ private:
 class ZarrArray final {
 public:
     /// Codec callback struct: compress and decompress functions.
+    /// `decompress_into` is optional; when provided, callers can avoid the
+    /// per-call decompressed-buffer heap allocation by passing a reusable
+    /// scratch span sized to the (sub-)chunk byte count.
     struct Codec {
         std::function<std::vector<std::byte>(std::span<const std::byte>)> compress;
         std::function<std::vector<std::byte>(std::span<const std::byte>, std::size_t)> decompress;
+        std::function<void(std::span<const std::byte>, std::span<std::byte>)> decompress_into;
     };
 
     /// Named codec registry: maps codec name to Codec.
@@ -1199,6 +1204,106 @@ public:
         }
 
         return data;
+    }
+
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    read_chunk_encoded(std::span<const std::size_t> chunk_indices) const {
+        if (is_sharded())
+            return read_inner_chunk_from_shard(chunk_indices);
+        return read_chunk_raw(chunk_indices);
+    }
+
+    [[nodiscard]] std::vector<std::byte>
+    decode_chunk_payload(std::span<const std::byte> payload) const {
+        std::vector<std::byte> data(payload.begin(), payload.end());
+        const std::size_t expected = is_sharded()
+            ? meta_.sub_chunk_byte_size()
+            : meta_.chunk_byte_size();
+
+        if (codec_.decompress && needs_decompression()) {
+            data = codec_.decompress(data, expected);
+        }
+
+        if (meta_.version == ZarrVersion::v2) {
+            for (auto it = meta_.filters.rbegin(); it != meta_.filters.rend(); ++it)
+                data = it->decode(data);
+        }
+
+        if (needs_byteswap()) {
+            detail::byteswap_inplace(data, dtype_size(meta_.dtype));
+        }
+
+        return data;
+    }
+
+    [[nodiscard]] bool stores_chunks_with_codec(std::string_view codec_name) const noexcept {
+        auto has_codec = [codec_name](const std::vector<ZarrCodecConfig>& codecs) {
+            for (const auto& codec : codecs) {
+                if (codec.name == codec_name)
+                    return true;
+            }
+            return false;
+        };
+        if (meta_.version == ZarrVersion::v2)
+            return meta_.compressor_id == codec_name;
+        if (meta_.shard_config && has_codec(meta_.shard_config->sub_codecs))
+            return true;
+        return has_codec(meta_.codecs);
+    }
+
+    /// Read a chunk and decompress it directly into the caller-provided
+    /// `output` buffer. `output` must be at least sub_chunk_byte_size().
+    /// Returns false if the chunk is missing on disk; otherwise writes
+    /// exactly sub_chunk_byte_size() bytes into `output` and returns true.
+    ///
+    /// When the codec exposes `decompress_into`, decompression skips the
+    /// per-call heap allocation that `read_chunk` performs. v2 filters and
+    /// host-byte-order mismatches force a fallback to the allocating path
+    /// (and a final memcpy into `output`).
+    [[nodiscard]] bool
+    read_chunk_into(std::span<const std::size_t> chunk_indices,
+                    std::span<std::byte> output) const {
+        const std::size_t expected = meta_.sub_chunk_byte_size();
+        if (output.size() < expected) {
+            throw std::runtime_error("zarr: read_chunk_into output buffer too small");
+        }
+        auto out = output.subspan(0, expected);
+
+        std::optional<std::vector<std::byte>> raw_opt;
+        if (is_sharded()) {
+            raw_opt = read_inner_chunk_from_shard(chunk_indices);
+        } else {
+            raw_opt = read_chunk_raw(chunk_indices);
+        }
+        if (!raw_opt) return false;
+
+        const bool has_v2_filters =
+            (meta_.version == ZarrVersion::v2 && !meta_.filters.empty());
+        const bool needs_decode = needs_decompression();
+
+        if (needs_decode && codec_.decompress_into && !has_v2_filters && !needs_byteswap()) {
+            codec_.decompress_into(*raw_opt, out);
+            return true;
+        }
+
+        std::vector<std::byte> data;
+        if (needs_decode) {
+            if (!codec_.decompress) return false;
+            data = codec_.decompress(*raw_opt, expected);
+        } else {
+            data = std::move(*raw_opt);
+        }
+
+        if (has_v2_filters) {
+            for (auto it = meta_.filters.rbegin(); it != meta_.filters.rend(); ++it)
+                data = it->decode(data);
+        }
+        if (needs_byteswap()) {
+            detail::byteswap_inplace(data, dtype_size(meta_.dtype));
+        }
+        if (data.size() < expected) return false;
+        std::memcpy(out.data(), data.data(), expected);
+        return true;
     }
 
     void write_chunk(std::span<const std::size_t> chunk_indices,
@@ -1667,8 +1772,37 @@ public:
             linear += inner_idx[d] * stride;
             stride *= meta_.sub_chunks_per_shard(d);
         }
+        if (linear > std::numeric_limits<std::size_t>::max() / 16)
+            return std::nullopt;
+        const std::size_t index_offset = linear * 16;
+        auto is_missing_or_empty = [](std::uint64_t offset, std::uint64_t nbytes) {
+            return (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) ||
+                   (offset == ~std::uint64_t(0) - 1 && nbytes == 0) ||
+                   nbytes == 0;
+        };
 
         auto key = chunk_key(shard_idx);
+        if (store_) {
+            auto full_key = array_key_.empty() ? key : array_key_ + "/" + key;
+            auto entry = store_->get_partial(full_key, index_offset, 16);
+            if (!entry || entry->size() < 16) return std::nullopt;
+
+            std::uint64_t offset = 0, nbytes = 0;
+            std::memcpy(&offset, entry->data(), 8);
+            std::memcpy(&nbytes, entry->data() + 8, 8);
+            if (is_missing_or_empty(offset, nbytes)) return std::nullopt;
+            if (offset > std::numeric_limits<std::size_t>::max() ||
+                nbytes > std::numeric_limits<std::size_t>::max())
+                return std::nullopt;
+
+            auto data = store_->get_partial(full_key,
+                                            static_cast<std::size_t>(offset),
+                                            static_cast<std::size_t>(nbytes));
+            if (!data || data->size() != static_cast<std::size_t>(nbytes))
+                return std::nullopt;
+            return data;
+        }
+
         auto p = root_ / key;
         // Lock to prevent reading while another thread is writing the
         // same shard (striped — reads against other shards don't block).
@@ -1677,12 +1811,16 @@ public:
         if (!f) return std::nullopt;
 
         // Read 16-byte index entry at position linear*16
-        f.seekg(static_cast<std::streamoff>(linear * 16));
+        if (index_offset > static_cast<std::size_t>(std::numeric_limits<std::streamoff>::max()))
+            return std::nullopt;
+        f.seekg(static_cast<std::streamoff>(index_offset));
         std::uint64_t offset = 0, nbytes = 0;
         f.read(reinterpret_cast<char*>(&offset), 8);
         f.read(reinterpret_cast<char*>(&nbytes), 8);
         if (!f) return std::nullopt;
-        if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0))
+        if (is_missing_or_empty(offset, nbytes)) return std::nullopt;
+        if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+            nbytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
             return std::nullopt;
 
         // Read chunk data

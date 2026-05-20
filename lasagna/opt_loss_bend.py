@@ -13,9 +13,10 @@ _COS_THRESHOLD = math.cos(math.pi - _THRESHOLD_RAD)  # cos(120°) = -0.5
 def bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Penalize sharp bends in the mesh where adjacent edges form angles > 60° from flat.
 
-	For each triplet of consecutive vertices (along H or W), compute the angle
-	at the middle vertex. Flat = 180° = cos(-1). Threshold at 120° (60° from flat).
-	Only active when cos(angle) > cos(120°) = -0.5.
+	For each triplet of consecutive vertices (along H, W, and both diagonals),
+	compute the angle at the middle vertex. Flat = 180° = cos(-1).
+	Threshold at 120° (60° from flat). Only active when
+	cos(angle) > cos(120°) = -0.5.
 	"""
 	xyz = res.xyz_lr  # (D, Hm, Wm, 3)
 
@@ -44,10 +45,20 @@ def bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.
 	e2_w = xyz[:, :, 2:, :] - xyz[:, :, 1:-1, :]
 	pen_w = _bend_penalty(e1_w, e2_w)                 # (D, Hm, Wm-2, 1)
 
+	# Diagonal triplets on the non-periodic interior, matching cyl_bend's two
+	# diagonal directions without cylindrical width wrapping.
+	mid = xyz[:, 1:-1, 1:-1, :]
+	e1_d0 = mid - xyz[:, :-2, :-2, :]
+	e2_d0 = xyz[:, 2:, 2:, :] - mid
+	pen_d0 = _bend_penalty(e1_d0, e2_d0)              # (D, Hm-2, Wm-2, 1)
+	e1_d1 = mid - xyz[:, :-2, 2:, :]
+	e2_d1 = xyz[:, 2:, :-2, :] - mid
+	pen_d1 = _bend_penalty(e1_d1, e2_d1)              # (D, Hm-2, Wm-2, 1)
+
 	# Crop to common interior and average
 	pen_h_crop = pen_h[:, :, 1:-1, :]                 # (D, Hm-2, Wm-2, 1)
 	pen_w_crop = pen_w[:, 1:-1, :, :]                 # (D, Hm-2, Wm-2, 1)
-	lm = (0.5 * (pen_h_crop + pen_w_crop)).permute(0, 3, 1, 2)  # (D, 1, Hm-2, Wm-2)
+	lm = (0.25 * (pen_h_crop + pen_w_crop + pen_d0 + pen_d1)).permute(0, 3, 1, 2)
 
 	mask = torch.ones_like(lm)
 	return lm.mean(), (lm,), (mask,)

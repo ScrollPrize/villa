@@ -27,6 +27,7 @@ public:
     void pauseStroke();
     void finishStroke();
     void cancelStroke();
+    void refreshFromSurface();
 
 private:
     [[nodiscard]] std::optional<std::pair<float, float>> surfaceToGridPosition(const QPointF& surfacePos) const;
@@ -46,6 +47,7 @@ private:
     cv::Mat_<uint8_t> _mask;
     bool _active{false};
     bool _strokeActive{false};
+    bool _undoSnapshotCaptured{false};
     std::optional<std::pair<float, float>> _lastGridPosition;
     std::unordered_set<uint64_t> _paintedCells;
     std::vector<std::pair<int, int>> _pendingCells;

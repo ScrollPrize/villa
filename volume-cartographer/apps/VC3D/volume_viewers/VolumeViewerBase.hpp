@@ -112,6 +112,7 @@ public:
     virtual void setVolumeWindow(float low, float high) = 0;
     virtual void setBaseColormap(const std::string& id) = 0;
     virtual void setResetViewOnSurfaceChange(bool enabled) = 0;
+    virtual void setPlaneIntersectionLinesVisible(bool visible) = 0;
     virtual void setShowDirectionHints(bool enabled) = 0;
     virtual void setShowSurfaceNormals(bool enabled) = 0;
     virtual void setSegmentationEditActive(bool active) = 0;
@@ -145,6 +146,9 @@ public:
 
     // --- Intersection rendering ---
     virtual void renderIntersections(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) = 0;
+    virtual void scheduleIntersectionRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
     virtual void invalidateIntersect(const std::string& name = "") = 0;

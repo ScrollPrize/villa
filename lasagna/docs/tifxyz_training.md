@@ -689,7 +689,7 @@ Output is a JSON manifest describing channel groups, each stored in a separate z
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "source_to_base": 1.0,
   "crop_xyzwhd": [0, 0, 0, 4000, 4000, 4000],
   "grad_mag_encode_scale": 1000.0,

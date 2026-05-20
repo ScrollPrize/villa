@@ -381,7 +381,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
             if (_surfaceMaskTool->strokeActive() || _surfaceMaskTool->hasPendingStroke()) {
                 _surfaceMaskTool->finishStroke();
             }
-            _surfaceMaskTool->setActive(_drawMaskEnabled);
+            _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
         }
         _shiftDrawMaskActive = false;
         event->accept();
@@ -418,8 +418,9 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
         return;
     }
 
-    const bool drawMaskRequested = _drawMaskEnabled ||
-                                   modifiers.testFlag(Qt::ShiftModifier);
+    const bool drawMaskAllowed = _editingEnabled && _editManager && _editManager->hasSession();
+    const bool drawMaskRequested = drawMaskAllowed &&
+                                   (_drawMaskEnabled || modifiers.testFlag(Qt::ShiftModifier));
     if (drawMaskRequested && isRightButton && viewer && isSegmentationViewer(viewer) && _surfaceMaskTool) {
         auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
         if (!surface && _editManager && _editManager->hasSession()) {
@@ -562,7 +563,7 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
         } else {
             _surfaceMaskTool->finishStroke();
             if (_shiftDrawMaskActive) {
-                _surfaceMaskTool->setActive(_drawMaskEnabled);
+                _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
                 _shiftDrawMaskActive = false;
             }
         }
@@ -693,7 +694,7 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
             _surfaceMaskTool->extendStroke(QPointF(surfCoords[0], surfCoords[1]), true);
             if (_shiftDrawMaskActive) {
                 _surfaceMaskTool->finishStroke();
-                _surfaceMaskTool->setActive(_drawMaskEnabled);
+                _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
                 _shiftDrawMaskActive = false;
             } else {
                 _surfaceMaskTool->finishStroke();

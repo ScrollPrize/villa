@@ -55,6 +55,12 @@ private slots:
     void beginRotateSurfaceTransform();
     void exitApplication();
 
+signals:
+    // Emitted when the user picks Actions -> Merge tifxyz... CWindow
+    // wires this to SegmentationCommandHandler::onMergeTifxyz with an
+    // empty seed list so the dialog opens with an empty grid.
+    void mergeTifxyzFromMenuRequested();
+
 private:
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
@@ -116,6 +122,7 @@ private:
     QAction* _selectionClearAct{nullptr};
     QAction* _importObjAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
+    QAction* _mergeTifxyzAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
 };

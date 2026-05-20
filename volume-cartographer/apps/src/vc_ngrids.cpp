@@ -8,6 +8,7 @@
 #include <deque>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 #include <array>
 #include <random>
@@ -39,6 +40,19 @@ namespace po = boost::program_options;
 namespace {
 
 using Json = utils::Json;
+
+template <typename Solver, typename = void>
+struct TinySolverParameterVector {
+    using type = typename Solver::Parameters;
+};
+
+template <typename Solver>
+struct TinySolverParameterVector<Solver, std::void_t<typename Solver::ParameterVector>> {
+    using type = typename Solver::ParameterVector;
+};
+
+template <typename Solver>
+using TinySolverParameterVectorT = typename TinySolverParameterVector<Solver>::type;
 
 static void write_metrics_json(const fs::path& path, const Json& metrics) {
     std::ofstream out(path);
@@ -798,7 +812,7 @@ static bool fit_normal_tiny(
     ceres::TinySolver<AutoDiffFn> solver;
     solver.options.max_num_iterations = 1000;
 
-    typename ceres::TinySolver<AutoDiffFn>::Parameters params;
+    TinySolverParameterVectorT<ceres::TinySolver<AutoDiffFn>> params;
     params.setZero();
     params[0] = n0[0];
     params[1] = n0[1];

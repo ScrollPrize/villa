@@ -138,6 +138,9 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
         bool resetView = settings.value(viewer::RESET_VIEW_ON_SURFACE_CHANGE, viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
         baseViewer->setResetViewOnSurfaceChange(resetView);
         _resetDefaults[baseViewer] = resetView;
+        bool showPlaneIntersectionLines = settings.value(viewer::SHOW_PLANE_INTERSECTION_LINES,
+                                                         viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
+        baseViewer->setPlaneIntersectionLinesVisible(showPlaneIntersectionLines);
     }
 
     baseViewer->setSurface(surfaceName);

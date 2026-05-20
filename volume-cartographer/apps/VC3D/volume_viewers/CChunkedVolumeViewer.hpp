@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QPointF>
+#include <QPointer>
 #include <QWidget>
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
+#include "annotation_tools/SameWrapAnnotationTool.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Sampling.hpp"
@@ -90,6 +92,7 @@ public:
     void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; scheduleRender("setBaseColormap"); }
     void setStretchValues(bool) { if (_closing) return; scheduleRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
+    void setPlaneIntersectionLinesVisible(bool visible) override;
 
     void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
@@ -128,6 +131,9 @@ public:
     void clearSelections() override;
 
     void renderIntersections(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) override;
+    void scheduleIntersectionRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
     void invalidateIntersect(const std::string& = "") override;
@@ -181,11 +187,19 @@ public slots:
     void onMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void onMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
-    void onKeyRelease(int, Qt::KeyboardModifiers) {}
+    void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onCollectionSelected(uint64_t) {}
     void onPointSelected(uint64_t) {}
+    void setSameWrapAnnotationMode(bool enabled);
+    void setSameWrapAnnotationSpacing(double spacingVx);
+    void setSameWrapAnnotationMergeExisting(bool enabled);
+    void setSameWrapAnnotationPathType(int pathType);
+    void setSameWrapAnnotationFilterType(int filterType);
+    void setSameWrapAnnotationFilterKernelSize(int kernelSize);
+    void clearSameWrapAnnotationPreview();
+    bool commitSameWrapAnnotationPreview();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
@@ -211,9 +225,6 @@ signals:
 
 private:
     void scheduleRender(
-        const char* reason = "internal caller",
-        std::source_location caller = std::source_location::current());
-    void scheduleIntersectionRender(
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
     void quiesceForClose();
@@ -260,6 +271,7 @@ private:
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
+    void refreshSameWrapAnnotationOverlay();
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
@@ -268,7 +280,7 @@ private:
     QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
 
     CState* _state = nullptr;
-    ViewerManager* _viewerManager = nullptr;
+    QPointer<ViewerManager> _viewerManager;
     VCCollection* _pointCollection = nullptr;
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
@@ -348,15 +360,18 @@ private:
 
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
+    bool _planeIntersectionLinesVisible = true;
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
+    int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;
     bool _showSurfaceNormals = false;
     float _normalArrowLengthScale = 1.0f;
     int _normalMaxArrows = 32;
     bool _surfaceOverlayEnabled = false;
+    bool _initializedFirstSegmentationSurface = false;
     std::map<std::string, cv::Vec3b> _surfaceOverlays;
     float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;
@@ -445,6 +460,8 @@ private:
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
     QGraphicsItem* _focusMarker = nullptr;
+
+    SameWrapAnnotationTool _sameWrapAnnotation;
 
     bool _bboxMode = false;
     QPointF _bboxStart;

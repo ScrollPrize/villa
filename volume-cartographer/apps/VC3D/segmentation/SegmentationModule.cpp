@@ -127,7 +127,8 @@ void SegmentationModule::HoverState::clear()
 SegmentationModule::~SegmentationModule()
 {
     // Cancel any in-progress background save on shutdown
-    if (_saveInProgress && _saveFuture.isRunning()) {
+    _autosaveState.endSession();
+    if (_autosaveState.saveInProgress() && _saveFuture.isRunning()) {
         _saveFuture.cancel();
     }
 }
@@ -431,6 +432,9 @@ void SegmentationModule::bindWidgetSignals()
     connect(_widget, &SegmentationWidget::manualAddConfigChanged, this, [this]() {
         if (_manualAddTool && _widget) {
             _manualAddTool->setConfig(_widget->manualAddConfig());
+            if (_manualAddMode) {
+                refreshOverlay();
+            }
         }
     });
     connect(_widget, &SegmentationWidget::manualAddClearPendingRequested,
@@ -559,6 +563,9 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_overlay) {
         _overlay->setEditingEnabled(enabled);
     }
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setActive(enabled && hasActiveSession() && _drawMaskEnabled);
+    }
     updateViewerCursors();
     if (!enabled) {
         resetManualAddState(true);
@@ -569,8 +576,11 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         resetHoverLookupDetail();
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
-        if (_pendingAutosave) {
+        if (_autosaveState.pending() && _editManager && _editManager->hasSession()) {
             performAutosave();
+        } else if (!_editManager || !_editManager->hasSession()) {
+            _autosaveState.clearDeferred();
+            _pendingAutosaveVertexUpdates.clear();
         }
     }
     updateCorrectionsWidget();
@@ -626,7 +636,7 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     }
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setSurface(newSurface);
-        _surfaceMaskTool->setActive(_drawMaskEnabled);
+        _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
     }
 
     // Turn off any approval mask editing when switching segments
@@ -847,7 +857,7 @@ void SegmentationModule::setDrawMaskEnabled(bool enabled)
     _shiftDrawMaskActive = false;
 
     if (_surfaceMaskTool) {
-        _surfaceMaskTool->setActive(_drawMaskEnabled);
+        _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
 
         QuadSurface* surface = nullptr;
         std::shared_ptr<Surface> surfaceHolder;
@@ -935,7 +945,7 @@ void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, in
     const QColor brushColor = approvalBrushColor();
     _overlay->paintApprovalMaskDirect(vertices, _autoApprovalRadius, kApproved, brushColor, false, 0.0f, 0.0f, kIsAutoApproval);
     _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
-    qCInfo(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
+    qCDebug(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
 }
 
 void SegmentationModule::saveApprovalMaskToDisk()
@@ -1306,6 +1316,10 @@ void SegmentationModule::refreshOverlay()
             state.manualAddHoverVertex = QPointF(hover->col, hover->row);
             state.manualAddHoverCrossFill =
                 _manualAddTool->config().linePreviewMode == ManualAddTool::LinePreviewMode::CrossFill;
+        }
+        state.manualAddHoverFillVertices.reserve(_manualAddTool->hoverFillVertices().size());
+        for (const auto& key : _manualAddTool->hoverFillVertices()) {
+            state.manualAddHoverFillVertices.push_back(QPointF(key.col, key.row));
         }
         for (const auto& key : _manualAddTool->fillVertices()) {
             if (key.row >= 0 && key.row < preview.rows && key.col >= 0 && key.col < preview.cols &&
@@ -1807,7 +1821,7 @@ bool SegmentationModule::beginManualAdd()
         emit statusMessageRequested(tr("Apply or cancel pending edits before Manual Add."), kStatusMedium);
         return false;
     }
-    if (_saveInProgress || _pendingAutosave) {
+    if (_autosaveState.saveInProgress() || _autosaveState.pending()) {
         emit statusMessageRequested(tr("Wait for the current save before Manual Add."), kStatusMedium);
         return false;
     }
@@ -2218,12 +2232,13 @@ void SegmentationModule::finishDrag()
     _drag.reset();
 
     if (moved) {
+        const auto editedVerts = _editManager->editedVertices();
+
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData()) {
-            const auto editedVerts = _editManager->editedVertices();
             if (!editedVerts.empty()) {
                 // Get drag center from the active drag state
                 const auto& activeDrag = _editManager->activeDrag();
@@ -2240,6 +2255,7 @@ void SegmentationModule::finishDrag()
         if (_state) {
             _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
+        queueAutosaveVertexUpdates(editedVerts);
         markAutosaveNeeded();
     }
 
@@ -2514,12 +2530,7 @@ void SegmentationModule::markAutosaveNeeded(bool immediate)
         return;
     }
 
-    if (_editManager->hasPendingChanges()) {
-        queueAutosaveVertexUpdates(_editManager->editedVertices());
-    }
-
-    _pendingAutosave = true;
-    _autosaveNotifiedFailure = false;
+    _autosaveState.markPending();
 
     ensureAutosaveTimer();
     if (_editingEnabled && _autosaveTimer && !_autosaveTimer->isActive()) {
@@ -2550,34 +2561,51 @@ void SegmentationModule::queueAutosaveVertexUpdates(
 
 void SegmentationModule::performAutosave()
 {
-    if (!_pendingAutosave) {
+    if (!_autosaveState.pending()) {
         return;
     }
     if (!_editManager) {
+        _autosaveState.clearDeferred();
+        _pendingAutosaveVertexUpdates.clear();
         return;
     }
 
     // If a save is already running, mark dirty so we re-save when it finishes
-    if (_saveInProgress) {
-        _dirtyAfterSave = true;
+    if (_autosaveState.markDirtyIfSaving()) {
+        return;
+    }
+
+    if (!_editManager->hasSession()) {
+        if (!_editingEnabled) {
+            _autosaveState.clearDeferred();
+            _pendingAutosaveVertexUpdates.clear();
+        }
         return;
     }
 
     auto surfacePtr = _editManager->baseSurface();
     if (!surfacePtr) {
+        if (!_editingEnabled) {
+            _autosaveState.clearDeferred();
+            _pendingAutosaveVertexUpdates.clear();
+        }
         return;
     }
     if (surfacePtr->path.empty() || surfacePtr->id.empty()) {
-        if (!_autosaveNotifiedFailure) {
+        if (!_autosaveState.failureNotified()) {
             qCWarning(lcSegModule) << "Skipping autosave: segmentation surface lacks path or id.";
             emit statusMessageRequested(tr("Cannot autosave segmentation: surface is missing file metadata."),
                                         kStatusMedium);
-            _autosaveNotifiedFailure = true;
+            _autosaveState.setFailureNotified(true);
         }
         return;
     }
 
     ensureSurfaceMetaObject(surfacePtr.get());
+
+    if (_pendingAutosaveVertexUpdates.empty() && _editManager->hasPendingChanges()) {
+        queueAutosaveVertexUpdates(_editManager->editedVertices());
+    }
 
     auto vertexUpdates = std::move(_pendingAutosaveVertexUpdates);
     _pendingAutosaveVertexUpdates.clear();
@@ -2610,9 +2638,7 @@ void SegmentationModule::performAutosave()
         snapshot->meta = saveMeta;
     }
 
-    _pendingAutosave = false;
-    _saveInProgress = true;
-    _dirtyAfterSave = false;
+    const auto autosaveTicket = _autosaveState.startSave();
 
     emit statusMessageRequested(tr("Saving..."), kStatusShort);
 
@@ -2653,42 +2679,54 @@ void SegmentationModule::performAutosave()
         snapshot->saveOverwrite();
         return snapshot;
     });
+    auto saveFuture = _saveFuture;
 
     // Poll for completion via a single-shot timer to avoid blocking
     auto* pollTimer = new QTimer(this);
     pollTimer->setInterval(50);
     pollTimer->setSingleShot(false);
-    connect(pollTimer, &QTimer::timeout, this, [this, pollTimer]() {
-        if (!_saveFuture.isFinished()) {
+    connect(pollTimer, &QTimer::timeout, this, [this, pollTimer, saveFuture, autosaveTicket]() mutable {
+        if (!saveFuture.isFinished()) {
             return;
         }
         pollTimer->stop();
         pollTimer->deleteLater();
 
-        _saveInProgress = false;
-
-        // Check for exceptions from the future
+        std::shared_ptr<QuadSurface> savedSnapshot;
+        QString failureMessage;
         try {
-            _saveFuture.waitForFinished();
-            _saveSnapshot = _saveFuture.result();
-            _autosaveNotifiedFailure = false;
-            emit statusMessageRequested(tr("Saved"), kStatusShort);
+            saveFuture.waitForFinished();
+            savedSnapshot = saveFuture.result();
         } catch (const std::exception& ex) {
-            qCWarning(lcSegModule) << "Autosave failed:" << ex.what();
-            if (!_autosaveNotifiedFailure) {
+            failureMessage = QString::fromUtf8(ex.what());
+        } catch (...) {
+            failureMessage = tr("unknown error");
+        }
+
+        const bool canRetry = _editManager && _editManager->hasSession();
+        const auto completion = failureMessage.isEmpty()
+            ? _autosaveState.completeSuccess(autosaveTicket)
+            : _autosaveState.completeFailure(autosaveTicket, canRetry);
+        if (completion == segmentation::AutosaveState::Completion::Stale) {
+            updateAutosaveState();
+            return;
+        }
+
+        if (failureMessage.isEmpty()) {
+            _saveSnapshot = savedSnapshot;
+            emit statusMessageRequested(tr("Saved"), kStatusShort);
+        } else {
+            qCWarning(lcSegModule) << "Autosave failed:" << failureMessage;
+            if (!_autosaveState.failureNotified()) {
                 emit statusMessageRequested(tr("Failed to autosave segmentation: %1")
-                                                .arg(QString::fromUtf8(ex.what())),
+                                                .arg(failureMessage),
                                             kStatusLong);
-                _autosaveNotifiedFailure = true;
+                _autosaveState.setFailureNotified(true);
             }
-            // Re-mark pending so the next timer tick retries
-            _pendingAutosave = true;
         }
 
         // If another save was requested while we were saving, start it now
-        if (_dirtyAfterSave) {
-            _dirtyAfterSave = false;
-            _pendingAutosave = true;
+        if (_autosaveState.consumeDirtyAfterSave()) {
             performAutosave();
         }
     });

@@ -21,6 +21,8 @@ set(srcs
     SurfaceAreaCalculator.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
+    volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
+    volume_viewers/annotation_tools/SameWrapAnnotationTool.hpp
     volume_viewers/CVolumeViewerView.cpp
     VolumeViewerCmaps.cpp
     VolumeViewerCmaps.hpp
@@ -216,9 +218,5 @@ target_link_libraries(VC3D
     Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
-    blosc_static
+    Blosc::blosc
 )
-
-if(VC_USE_PCH)
-    target_precompile_headers(VC3D REUSE_FROM vc_core)
-endif()

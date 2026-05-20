@@ -1509,9 +1509,23 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             request.customParams = std::move(customParams);
         }
     }
+    if (method == SegmentationGrowthMethod::Tracer || method == SegmentationGrowthMethod::Corrections) {
+        if (request.customParams.is_null()) {
+            request.customParams = utils::Json::object();
+        }
+        const int growthScale = std::clamp(_context.widget->growthScale(), 0, 5);
+        if (!request.customParams.contains("growth_scale")) {
+            request.customParams["growth_scale"] = growthScale;
+        }
+        if (!request.customParams.contains("normal_grid_level") &&
+            !request.customParams.contains("normal_grid_scale")) {
+            request.customParams["normal_grid_level"] = growthScale;
+        }
+    }
     const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
     const bool denseMode = neuralTracerEnabled &&
+        !inpaintOnly &&
         _context.widget->neuralModelType() == NeuralTracerModelType::DenseDisplacement &&
         !manualAddTracerMask;
 
@@ -1657,7 +1671,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
 
     // Heatmap neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
-    if (neuralTracerEnabled) {
+    if (neuralTracerEnabled && !inpaintOnly) {
         const QString checkpointPath = _context.widget->neuralCheckpointPath();
         const QString pythonPath = _context.widget->neuralPythonPath();
         const QString volumeZarr = _context.widget->volumeZarrPath();

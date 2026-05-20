@@ -792,32 +792,41 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         }
     }
 
+    std::filesystem::path outputSegmentsPath;
+    if (state && state->vpkg()) {
+        outputSegmentsPath = state->vpkg()->outputSegmentsPath();
+        if (outputSegmentsPath.empty()) {
+            outputSegmentsPath = state->vpkg()->findSegmentPathByName(
+                state->vpkg()->getSegmentationDirectory());
+        }
+        if (outputSegmentsPath.empty()) {
+            auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
+            outputSegmentsPath = vpkgRoot / "paths";
+        }
+        outputSegmentsPath = std::filesystem::absolute(outputSegmentsPath).lexically_normal();
+    }
+
     std::filesystem::path segPath;
     if (state) {
         auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
         if (activeSurface && !activeSurface->path.empty()) {
             segPath = activeSurface->path;
+            if (segPath.is_relative() && !outputSegmentsPath.empty()) {
+                segPath = outputSegmentsPath / segPath.filename();
+            }
         }
     }
 
     const bool isOffsetMode = (lasagnaMode() == LasagnaMode::Offset);
 
     QString modelPath;
-    if (!isNewModel && !isOffsetMode) {
-        if (!segPath.empty()) {
-            auto modelFile = segPath / "model.pt";
-            if (std::filesystem::exists(modelFile)) {
-                try {
-                    modelPath = QString::fromStdString(std::filesystem::canonical(modelFile).string());
-                } catch (const std::filesystem::filesystem_error&) {
-                }
+    if (!segPath.empty()) {
+        auto modelFile = segPath / "model.pt";
+        if (std::filesystem::exists(modelFile)) {
+            try {
+                modelPath = QString::fromStdString(std::filesystem::canonical(modelFile).string());
+            } catch (const std::filesystem::filesystem_error&) {
             }
-        }
-        if (modelPath.isEmpty()) {
-            auto msg = tr("No model.pt found in segment directory. Cannot run lasagna.");
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 5000);
-            return;
         }
     }
 
@@ -830,12 +839,11 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     }
 
     QString outputDir;
-    if (!segPath.empty()) {
-        outputDir = QString::fromStdString(segPath.parent_path().string());
-    } else if (state && state->vpkg()) {
-        auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
-        auto segDir = vpkgRoot / state->vpkg()->getSegmentationDirectory();
-        outputDir = QString::fromStdString(segDir.string());
+    if (!outputSegmentsPath.empty()) {
+        outputDir = QString::fromStdString(outputSegmentsPath.string());
+    } else if (!segPath.empty()) {
+        outputDir = QString::fromStdString(
+            std::filesystem::absolute(segPath.parent_path()).lexically_normal().string());
     }
 
     const std::string tifxyzSuffix = ".tifxyz";
@@ -912,72 +920,82 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     QJsonObject config;
     QString configText = lasagnaConfigText().trimmed();
     if (!configText.isEmpty()) {
-        QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
-        if (doc.isObject()) {
-            config = doc.object();
+        QJsonParseError parseError;
+        QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8(), &parseError);
+        if (parseError.error != QJsonParseError::NoError) {
+            auto msg = tr("Invalid Lasagna config JSON at byte %1: %2")
+                .arg(parseError.offset)
+                .arg(parseError.errorString());
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 7000);
+            return;
         }
+        if (!doc.isObject()) {
+            auto msg = tr("Invalid Lasagna config JSON: top-level value must be an object.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 7000);
+            return;
+        }
+        config = doc.object();
     }
 
-    if (isNewModel) {
-        int nmW = newModelWidth();
-        int nmH = newModelHeight();
-        int nmN = newModelWindings();
+    int nmW = newModelWidth();
+    int nmH = newModelHeight();
+    int nmN = newModelWindings();
 
-        int cx = 0;
-        int cy = 0;
-        int cz = 0;
-        QString seedText = seedPointText();
-        bool seedOk = false;
-        if (!seedText.isEmpty()) {
-            QStringList parts = seedText.split(',');
-            if (parts.size() == 3) {
-                bool ok0 = false;
-                bool ok1 = false;
-                bool ok2 = false;
-                cx = parts[0].trimmed().toInt(&ok0);
-                cy = parts[1].trimmed().toInt(&ok1);
-                cz = parts[2].trimmed().toInt(&ok2);
-                seedOk = ok0 && ok1 && ok2;
-            }
+    int cx = 0;
+    int cy = 0;
+    int cz = 0;
+    QString seedText = seedPointText();
+    bool seedOk = false;
+    if (!seedText.isEmpty()) {
+        QStringList parts = seedText.split(',');
+        if (parts.size() == 3) {
+            bool ok0 = false;
+            bool ok1 = false;
+            bool ok2 = false;
+            cx = parts[0].trimmed().toInt(&ok0);
+            cy = parts[1].trimmed().toInt(&ok1);
+            cz = parts[2].trimmed().toInt(&ok2);
+            seedOk = ok0 && ok1 && ok2;
         }
-        if (!seedOk) {
-            POI* focus = state ? state->poi("focus") : nullptr;
-            if (!focus) {
-                auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                showStatus(msg, 5000);
-                return;
-            }
-            cx = static_cast<int>(focus->p[0]);
-            cy = static_cast<int>(focus->p[1]);
-            cz = static_cast<int>(focus->p[2]);
-        }
-
-        QJsonObject args = config[QStringLiteral("args")].toObject();
-        args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
-        args[QStringLiteral("model-w")] = nmW;
-        args[QStringLiteral("model-h")] = nmH;
-        args[QStringLiteral("windings")] = nmN;
-        config[QStringLiteral("args")] = args;
-
-        std::cerr << "[lasagna] new model: seed=(" << cx << "," << cy
-                  << "," << cz << ") w=" << nmW << " h=" << nmH
-                  << " windings=" << nmN << std::endl;
     }
+    if (!seedOk) {
+        POI* focus = state ? state->poi("focus") : nullptr;
+        if (!focus) {
+            auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return;
+        }
+        cx = static_cast<int>(focus->p[0]);
+        cy = static_cast<int>(focus->p[1]);
+        cz = static_cast<int>(focus->p[2]);
+    }
+
+    const double offsetVal = offsetValue();
+    const int size = windowSize();
+    const int overlap = windowOverlap();
+
+    QJsonObject args = config[QStringLiteral("args")].toObject();
+    // VC3D is transport only. Do not add config-semantic branching here.
+    // Config interpretation belongs in fit_service.py / fit.py.
+    args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
+    args[QStringLiteral("model-w")] = nmW;
+    args[QStringLiteral("model-h")] = nmH;
+    args[QStringLiteral("windings")] = nmN;
+    config[QStringLiteral("args")] = args;
+    config[QStringLiteral("offset_value")] = offsetVal;
+
+    std::cerr << "[lasagna] request settings:"
+              << " seed=(" << cx << "," << cy << "," << cz << ")"
+              << " w=" << nmW << " h=" << nmH
+              << " windings=" << nmN
+              << " offset=" << offsetVal
+              << " window_size=" << size
+              << " window_overlap=" << overlap << std::endl;
 
     if (isOffsetMode && !segPath.empty()) {
-        double offsetVal = offsetValue();
-        int size = windowSize();
-        int overlap = windowOverlap();
-
-        QJsonObject args = config[QStringLiteral("args")].toObject();
-        args[QStringLiteral("windings")] = 1;
-        if (size > 0) {
-            args[QStringLiteral("window-size")] = size;
-            args[QStringLiteral("window-overlap")] = overlap;
-        }
-        config[QStringLiteral("args")] = args;
-        config[QStringLiteral("offset_value")] = offsetVal;
 
         if (size > 0 && !outputDir.isEmpty()) {
             int offIdx = 1;
@@ -1043,23 +1061,64 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
     }
+    if (size > 0) {
+        request[QStringLiteral("window_size")] = size;
+        request[QStringLiteral("window_overlap")] = overlap;
+    }
     request[QStringLiteral("config")] = config;
 
-    if (isOffsetMode && !segPath.empty()) {
+    const bool sendModelData = !modelPath.isEmpty();
+    const bool sendTifxyz = !segPath.empty();
+    std::cerr << "[lasagna] request payload: send_model="
+              << (sendModelData ? "yes" : "no")
+              << " send_tifxyz=" << (sendTifxyz ? "yes" : "no")
+              << std::endl;
+
+    if (sendTifxyz) {
         QJsonObject tifxyzData;
-        for (const auto* fname : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
-            auto filePath = segPath / fname;
+        QStringList coreTifxyzFiles{
+            QStringLiteral("x.tif"),
+            QStringLiteral("y.tif"),
+            QStringLiteral("z.tif"),
+            QStringLiteral("meta.json"),
+        };
+        QStringList extraTifxyzFiles{
+            QStringLiteral("approval.tif"),
+            QStringLiteral("d.tif"),
+        };
+        auto addTifxyzFile = [&](const QString& fname) -> bool {
+            auto filePath = segPath / fname.toStdString();
             if (!std::filesystem::exists(filePath)) {
-                continue;
+                std::cerr << "[lasagna] selected segment has no optional tifxyz file: "
+                          << fname.toStdString() << std::endl;
+                return true;
             }
             QFile f(QString::fromStdString(filePath.string()));
             if (f.open(QIODevice::ReadOnly)) {
-                tifxyzData[QString::fromLatin1(fname)] =
+                tifxyzData[fname] =
                     QString::fromLatin1(f.readAll().toBase64());
+            } else {
+                auto msg = tr("Cannot read selected segment tifxyz file: %1").arg(fname);
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                showStatus(msg, 5000);
+                return false;
+            }
+            return true;
+        };
+        for (const QString& fname : coreTifxyzFiles) {
+            if (!addTifxyzFile(fname)) {
+                return;
             }
         }
-        request[QStringLiteral("tifxyz_data")] = tifxyzData;
-    } else if (!isNewModel) {
+        for (const QString& fname : extraTifxyzFiles) {
+            if (!addTifxyzFile(fname)) {
+                return;
+            }
+        }
+        request[QStringLiteral("tifxyz")] = tifxyzData;
+    }
+
+    if (sendModelData) {
         QFile modelFile(modelPath);
         if (!modelFile.open(QIODevice::ReadOnly)) {
             auto msg = tr("Cannot read model file: %1").arg(modelPath);
@@ -1074,8 +1133,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
 
     mgr.startOptimization(request, outputDir);
     showStatus(
-        tr("Lasagna optimization started (%1). Output: %2")
-            .arg(isNewModel ? tr("new model") : tr("re-optimize"))
+        tr("Lasagna optimization started. Output: %1")
             .arg(outputName),
         3000);
 }

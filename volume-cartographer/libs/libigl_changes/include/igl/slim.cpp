@@ -7,6 +7,8 @@
 // obtain one at http://mozilla.org/MPL/2.0/.
 #include "slim.h"
 
+#include <unordered_map>
+
 #include "boundary_loop.h"
 #include "cotmatrix.h"
 #include "edge_lengths.h"
@@ -44,11 +46,8 @@
 #include "sparse_cached.h"
 #include "AtA_cached.h"
 
-#ifdef CHOLMOD
-#  include <Eigen/CholmodSupport>
-#endif
-#ifdef PASTIX
-#  include <Eigen/PaStiXSupport>
+#ifdef PASTIX6
+#  include <igl/pastix6_solver.h>
 #endif
 
 namespace igl
@@ -127,37 +126,31 @@ namespace igl
       //t.start();
       // solve
       Eigen::VectorXd Uc;
-#if !defined(CHOLMOD) && !defined(PASTIX)
-      if (s.dim == 2)
-      {
-        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
-        Uc = solver.compute(L).solve(s.rhs);
+      // PaStiX 6 multifrontal direct solver. We cache one solver per
+      // (SLIMData*, sparsity-pattern signature). Caching by SLIMData* alone
+      // is unsafe because s.dim changing or the user re-invoking SLIM with
+      // a different mesh would reuse a stale symbolic factorization.
+      //
+      // Signature: (rows, cols, nnz). Cheap to compute, sufficient to
+      // detect any pattern change that would invalidate analyzePattern().
+      // factorize() refreshes numerical values each iter regardless.
+      struct PastixCache {
+        igl::Pastix6LLT solver;
+        Eigen::Index rows = -1;
+        Eigen::Index cols = -1;
+        Eigen::Index nnz  = -1;
+      };
+      static std::unordered_map<const igl::SLIMData*, PastixCache> cache;
+      PastixCache& entry = cache[&s];
+      const Eigen::Index L_nnz = L.nonZeros();
+      if (entry.rows != L.rows() || entry.cols != L.cols() || entry.nnz != L_nnz) {
+        entry.solver.analyzePattern(L);
+        entry.rows = L.rows();
+        entry.cols = L.cols();
+        entry.nnz  = L_nnz;
       }
-      else
-      { // seems like CG performs much worse for 2D and way better for 3D
-        Eigen::VectorXd guess(uv.rows() * s.dim);
-        for (int i = 0; i < s.v_num; i++) for (int j = 0; j < s.dim; j++) guess(uv.rows() * j + i) = uv(i, j); // flatten vector
-        Eigen::ConjugateGradient<Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper> cg;
-        cg.setTolerance(1e-8);
-        cg.compute(L);
-        Uc = cg.solveWithGuess(s.rhs, guess);
-      }
-#elif defined(PASTIX)
-        // PaStiX expects SPD; LLT is fine here (L = Aᵀ W A + λI + diag)
-        // std::cerr << "[SLIM] Backend: PaStiX (Eigen::PastixLDLT)\n";
-        using SpMat = Eigen::SparseMatrix<double>;
-        static bool analyzed = false;
-        static Eigen::PastixLDLT<SpMat, Eigen::Lower> solver;
-        if(!analyzed){
-          solver.analyzePattern(L);
-          analyzed = true;
-        }
-        solver.factorize(L);
-        Uc = solver.solve(s.rhs);
-#else /* CHOLMOD */
-        Eigen::CholmodSimplicialLDLT<Eigen::SparseMatrix<double>> solver;
-        Uc = solver.compute(L).solve(s.rhs);
-#endif /* solvers */
+      entry.solver.factorize(L);
+      Uc = entry.solver.solve(s.rhs);
       for (int i = 0; i < s.dim; i++)
         uv.col(i) = Uc.block(i * s.v_n, 0, s.v_n, 1);
 

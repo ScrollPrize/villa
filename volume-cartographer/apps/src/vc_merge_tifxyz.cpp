@@ -17,6 +17,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc_merge_tifxyz_grid.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -336,8 +337,12 @@ std::vector<Anchor> pickAnchors(const std::shared_ptr<QuadSurface>& A,
 using Mat1f = cv::Mat_<float>;
 using Mat1b = cv::Mat_<uint8_t>;
 
-struct GMSurfaceSpec { std::string name; fs::path path; };
-struct GMEdgeSpec    { std::string a; std::string b; };
+// Grid parser + connectivity check live in vc_merge_tifxyz_grid.{hpp,cpp}
+// so the unit tests can link them without spawning the binary.
+using vc::merge::GMSurfaceSpec;
+using vc::merge::GMEdgeSpec;
+using vc::merge::gmResolveGrid;
+using vc::merge::gmCheckConnected;
 
 // Hard-coded stage params (no flag, no JSON). Match the long-tuned values that
 // have been working across volpkgs; expose only the knobs that actually vary.
@@ -366,153 +371,6 @@ struct GMConfig {
     std::vector<GMSurfaceSpec> surfaces;
     std::vector<GMEdgeSpec>    edges;
 };
-
-// -----------------------------------------------------------------------------
-// Grid input: <volpkg>/merge.json holds a `rows` array. Each row is either a
-// JSON array of strings or (preferred, easier to hand-edit) a single
-// whitespace-delimited string. Each cell is a full tifxyz directory name
-// under <paths_dir>/, or null/"" for an empty slot. Surfaces are deduplicated;
-// edges are derived from horizontal + vertical adjacency, skipping self-edges
-// and edges incident to empty cells. The duplicate-cell case (same name twice)
-// resolves to the same surface and produces no self-edge, so adjacent
-// neighbors above and beside still connect.
-// -----------------------------------------------------------------------------
-
-void gmResolveGrid(const fs::path& merge_path,
-                   const fs::path& paths_dir,
-                   std::vector<GMSurfaceSpec>& surfaces,
-                   std::vector<GMEdgeSpec>& edges)
-{
-    const fs::path& mj = merge_path;
-    std::ifstream f(mj);
-    if (!f) throw std::runtime_error("cannot open " + mj.string());
-    json j; f >> j;
-
-    if (j.size() != 1 || !j.contains("rows"))
-        throw std::runtime_error(mj.string() +
-            ": only the 'rows' key is accepted");
-    const auto& rows_j = j.at("rows");
-    if (!rows_j.is_array() || rows_j.empty())
-        throw std::runtime_error(mj.string() + ": 'rows' must be a non-empty array");
-
-    const size_t R = rows_j.size();
-    std::vector<std::vector<std::string>> grid(R);
-    std::unordered_map<std::string, fs::path> name_to_path;
-
-    // Each row may be either a JSON array of strings (legacy) OR a single
-    // whitespace-delimited string. The string form is easier to hand-edit:
-    //   "rows": ["name_a name_b name_c", "name_d name_e name_f"]
-    auto splitWhitespace = [](const std::string& s) {
-        std::vector<std::string> out;
-        std::istringstream iss(s);
-        std::string tok;
-        while (iss >> tok) out.push_back(std::move(tok));
-        return out;
-    };
-
-    for (size_t r = 0; r < R; ++r) {
-        const auto& row_j = rows_j[r];
-        std::vector<std::string> row_names;
-        if (row_j.is_array()) {
-            row_names.reserve(row_j.size());
-            for (size_t c = 0; c < row_j.size(); ++c) {
-                const auto& cell = row_j[c];
-                if (cell.is_null()) { row_names.emplace_back(); continue; }
-                if (!cell.is_string())
-                    throw std::runtime_error(mj.string() + ": rows[" +
-                        std::to_string(r) + "][" + std::to_string(c) +
-                        "] must be a string or null");
-                row_names.push_back(cell.get<std::string>());
-            }
-        } else if (row_j.is_string()) {
-            row_names = splitWhitespace(row_j.get<std::string>());
-        } else {
-            throw std::runtime_error(mj.string() + ": rows[" + std::to_string(r) +
-                "] must be an array or a whitespace-delimited string");
-        }
-
-        const size_t C = row_names.size();
-        grid[r].resize(C);
-        for (size_t c = 0; c < C; ++c) {
-            const std::string& name = row_names[c];
-            if (name.empty()) continue;
-            if (name_to_path.count(name)) {
-                grid[r][c] = name;  // duplicate cell -> same surface
-                continue;
-            }
-            const fs::path dir = paths_dir / name;
-            if (!fs::is_directory(dir))
-                throw std::runtime_error(mj.string() + ": rows[" +
-                    std::to_string(r) + "][" + std::to_string(c) + "] = '" +
-                    name + "' is not a directory under " + paths_dir.string());
-            name_to_path[name] = dir;
-            grid[r][c] = name;
-        }
-    }
-
-    surfaces.clear();
-    surfaces.reserve(name_to_path.size());
-    std::set<std::string> seen;
-    for (size_t r = 0; r < R; ++r) {
-        for (size_t c = 0; c < grid[r].size(); ++c) {
-            const std::string& n = grid[r][c];
-            if (n.empty() || !seen.insert(n).second) continue;
-            GMSurfaceSpec s;
-            s.name = n;
-            s.path = name_to_path.at(n);
-            surfaces.push_back(std::move(s));
-        }
-    }
-
-    if (surfaces.size() < 2)
-        throw std::runtime_error(mj.string() + ": need at least 2 distinct "
-            "surfaces in the grid; got " + std::to_string(surfaces.size()));
-
-    auto edgeKey = [](const std::string& a, const std::string& b) {
-        return a < b ? a + "\t" + b : b + "\t" + a;
-    };
-    std::set<std::string> edge_seen;
-    edges.clear();
-    auto addEdge = [&](const std::string& a, const std::string& b) {
-        if (a.empty() || b.empty() || a == b) return;
-        if (edge_seen.insert(edgeKey(a, b)).second) edges.push_back({a, b});
-    };
-    for (size_t r = 0; r < R; ++r) {
-        const auto& row = grid[r];
-        for (size_t c = 0; c + 1 < row.size(); ++c) addEdge(row[c], row[c + 1]);
-    }
-    for (size_t r = 0; r + 1 < R; ++r) {
-        const size_t C = std::min(grid[r].size(), grid[r + 1].size());
-        for (size_t c = 0; c < C; ++c) addEdge(grid[r][c], grid[r + 1][c]);
-    }
-}
-
-void gmCheckConnected(const std::vector<GMSurfaceSpec>& surfaces,
-                      const std::vector<GMEdgeSpec>& edges)
-{
-    std::unordered_map<std::string, std::vector<std::string>> adj;
-    for (const auto& s : surfaces) adj[s.name];
-    for (const auto& e : edges) {
-        adj[e.a].push_back(e.b);
-        adj[e.b].push_back(e.a);
-    }
-    std::unordered_set<std::string> visited;
-    std::deque<std::string> q;
-    q.push_back(surfaces.front().name);
-    visited.insert(surfaces.front().name);
-    while (!q.empty()) {
-        const std::string u = q.front(); q.pop_front();
-        for (const auto& v : adj[u])
-            if (visited.insert(v).second) q.push_back(v);
-    }
-    if (visited.size() == surfaces.size()) return;
-    std::ostringstream msg;
-    msg << "edge graph from merge.json is disconnected; "
-           "unreachable surfaces:";
-    for (const auto& s : surfaces)
-        if (!visited.count(s.name)) msg << "\n  " << s.name;
-    throw std::runtime_error(msg.str());
-}
 
 // -----------------------------------------------------------------------------
 // Surface holder: rawPoints from QuadSurface (already mask.tif-aware) split
@@ -1405,6 +1263,13 @@ gmEdtBlend(const std::vector<std::string>& names,
         const Mat1f& ur = uv.at(tgt).ur;
         const int Hm = s.H, Wm = s.W;
         const int Ntot = Hm * Wm;
+        const auto overlap_it = real_overlap_native.find(tgt);
+        const Mat1b* blend_mask =
+            (overlap_it != real_overlap_native.end() &&
+             !overlap_it->second.empty() &&
+             overlap_it->second.size() == s.mask.size())
+                ? &overlap_it->second
+                : nullptr;
         cv::Mat q(Ntot, 2, CV_32F);
         for (int r = 0; r < Hm; ++r) {
             const float* uu = uc.ptr<float>(r);
@@ -1503,26 +1368,51 @@ gmEdtBlend(const std::vector<std::string>& names,
         }
         GMBlend bo;
         bo.X.create(Hm, Wm); bo.Y.create(Hm, Wm); bo.Z.create(Hm, Wm);
+        int n_blended = 0, n_preserved_private = 0, n_overlap_no_weight = 0;
         for (int r = 0; r < Hm; ++r) {
             const uint8_t* mp = s.mask.ptr<uint8_t>(r);
+            const uint8_t* bm = blend_mask ? blend_mask->ptr<uint8_t>(r) : nullptr;
             const float* uu = uc.ptr<float>(r);
             const float* vv = ur.ptr<float>(r);
+            const float* xp_old = s.x.ptr<float>(r);
+            const float* yp_old = s.y.ptr<float>(r);
+            const float* zp_old = s.z.ptr<float>(r);
             float* xp = bo.X.ptr<float>(r);
             float* yp = bo.Y.ptr<float>(r);
             float* zp = bo.Z.ptr<float>(r);
             for (int c = 0; c < Wm; ++c) {
                 const int i = r*Wm + c;
                 const bool ok = mp[c] && std::isfinite(uu[c]) && std::isfinite(vv[c]);
-                const double* bp = blended.ptr<double>(i);
-                xp[c] = ok ? (float)bp[0] : -1.0f;
-                yp[c] = ok ? (float)bp[1] : -1.0f;
-                zp[c] = ok ? (float)bp[2] : -1.0f;
+                if (!ok) {
+                    xp[c] = yp[c] = zp[c] = -1.0f;
+                    continue;
+                }
+                const bool should_blend = bm && bm[c] != 0;
+                if (should_blend && wsum[i] > 1e-6) {
+                    const double* bp = blended.ptr<double>(i);
+                    xp[c] = (float)bp[0];
+                    yp[c] = (float)bp[1];
+                    zp[c] = (float)bp[2];
+                    ++n_blended;
+                } else {
+                    xp[c] = xp_old[c];
+                    yp[c] = yp_old[c];
+                    zp[c] = zp_old[c];
+                    if (should_blend) ++n_overlap_no_weight;
+                    else ++n_preserved_private;
+                }
             }
         }
+        std::cout << "  " << tgt << " blend mask: blended=" << n_blended
+                  << "  preserved_private=" << n_preserved_private;
+        if (n_overlap_no_weight > 0)
+            std::cout << "  overlap_no_weight=" << n_overlap_no_weight;
+        std::cout << "\n";
         Mat1f own_w = gmSampleBilinearReplicate(Wgrid[tgt], uc, ur, u_min, v_min);
         std::vector<double> shifts; shifts.reserve(Ntot/4);
         for (int r = 0; r < Hm; ++r) {
             const uint8_t* mp = s.mask.ptr<uint8_t>(r);
+            const uint8_t* bm = blend_mask ? blend_mask->ptr<uint8_t>(r) : nullptr;
             const float* uu = uc.ptr<float>(r);
             const float* vv = ur.ptr<float>(r);
             const float* ow = own_w.ptr<float>(r);
@@ -1535,6 +1425,7 @@ gmEdtBlend(const std::vector<std::string>& names,
             for (int c = 0; c < Wm; ++c) {
                 if (!mp[c]) continue;
                 if (!std::isfinite(uu[c]) || !std::isfinite(vv[c])) continue;
+                if (!bm || !bm[c]) continue;
                 if (!(ow[c] > 1e-3 && ow[c] < 1.0 - 1e-3)) continue;
                 const double dx = xp_new[c]-xp_old[c];
                 const double dy = yp_new[c]-yp_old[c];
@@ -1784,10 +1675,15 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
     GMAlignState st;
     st.merge_path = merge_path;
     st.cfg        = std::move(cfg);
-    st.cfg.paths_dir = merge_path.parent_path() / "paths";
+    // Preserve a caller-supplied paths_dir (e.g. --paths-dir from the CLI
+    // or the GUI handler); fall back to <merge.parent>/paths only when
+    // unset, matching the legacy default.
+    if (st.cfg.paths_dir.empty())
+        st.cfg.paths_dir = merge_path.parent_path() / "paths";
     if (!fs::is_directory(st.cfg.paths_dir))
-        throw std::runtime_error("expected " + st.cfg.paths_dir.string() +
-            " (sibling of " + merge_path.string() + ") to be a directory");
+        throw std::runtime_error("expected paths_dir " +
+            st.cfg.paths_dir.string() + " to be a directory (override "
+            "with --paths-dir, default is <merge.parent>/paths)");
 
     std::cout << "[0/6] grid -> surfaces+edges from " << merge_path << "\n";
     gmResolveGrid(merge_path, st.cfg.paths_dir, st.cfg.surfaces, st.cfg.edges);
@@ -2290,8 +2186,14 @@ int main(int argc, char** argv)
     desc.add_options()
         ("help,h", "print help")
         ("merge,m", po::value<std::string>(),
-         "Path to <volpkg>/merge.json (required). The volpkg dir is its "
-         "parent and paths_dir is <volpkg>/paths.")
+         "Path to <volpkg>/merge.json (required). By default the volpkg "
+         "dir is its parent and paths_dir is <volpkg>/paths; pass "
+         "--paths-dir to override.")
+        ("paths-dir", po::value<std::string>()->default_value(""),
+         "Override the directory holding the input tifxyz subdirs. "
+         "Defaults to <merge.json parent>/paths. Useful when the volpkg "
+         "stores segments under a non-default name like paths_2um_ds2/ "
+         "or traces/, or when the merge.json lives outside the data dir.")
         ("obj2tifxyz", po::value<std::string>()->default_value(""),
          "Path to vc_obj2tifxyz_legacy. Default: sibling binary next to "
          "vc_merge_tifxyz, falling back to PATH lookup.")
@@ -2350,6 +2252,10 @@ int main(int argc, char** argv)
     cfg.ransac_mad_k          = vm["ransac-mad-k"].as<double>();
     cfg.ransac_seed           = vm["ransac-seed"].as<uint32_t>();
     cfg.anchor_cap            = vm["anchor-cap"].as<int>();
+    {
+        const std::string pd = vm["paths-dir"].as<std::string>();
+        if (!pd.empty()) cfg.paths_dir = fs::path(pd);
+    }
     const int strip_cols      = vm["strip-cols"].as<int>();
 
     try {
@@ -2359,4 +2265,3 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 }
-

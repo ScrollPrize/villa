@@ -230,7 +230,9 @@ bool CommandLineToolRunner::execute(Tool tool)
         return false;
     }
 
-    if (!isCustom) {
+    // vc_merge_tifxyz operates on segment paths only; no volume required.
+    const bool needsVolume = !isCustom && tool != Tool::MergeTifxyz;
+    if (needsVolume) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
                 QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified."));
@@ -250,6 +252,11 @@ bool CommandLineToolRunner::execute(Tool tool)
             }
             _volumePath = resolvedVolumePath;
         }
+    }
+
+    if (tool == Tool::MergeTifxyz && _mergeJsonPath.isEmpty()) {
+        QMessageBox::warning(nullptr, tr("Error"), tr("merge.json path not specified."));
+        return false;
     }
 
     if (tool == Tool::RenderTifXYZ && _segmentPath.isEmpty()) {
@@ -643,6 +650,28 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                 args << "--resume-opt" << _resumeOpt;
             }
             break;
+        case Tool::MergeTifxyz:
+            args << "--merge" << _mergeJsonPath;
+            // The tool defaults paths-dir to <merge.parent>/paths; pass
+            // the resolved segments dir (e.g. paths_2um_ds2/) explicitly
+            // so this works regardless of the volpkg's directory layout.
+            if (!_mergePathsDir.isEmpty()) {
+                args << "--paths-dir" << _mergePathsDir;
+            }
+            // Empty refSurface -> let vc_merge_tifxyz auto-pick the
+            // surface with the largest valid-cell count. Otherwise pass
+            // the user's pick straight through.
+            if (!_mergeRefSurface.isEmpty()) {
+                args << "--ref" << _mergeRefSurface;
+            }
+            args << "--ransac-iters"      << QString::number(_mergeRansacIters)
+                 << "--ransac-min-thresh" << QString::number(_mergeRansacMinThresh, 'g', 10)
+                 << "--ransac-max-thresh" << QString::number(_mergeRansacMaxThresh, 'g', 10)
+                 << "--ransac-mad-k"      << QString::number(_mergeRansacMadK,      'g', 10)
+                 << "--ransac-seed"       << QString::number(_mergeRansacSeed)
+                 << "--anchor-cap"        << QString::number(_mergeAnchorCap)
+                 << "--strip-cols"        << QString::number(_mergeStripCols);
+            break;
         case Tool::CustomCommand:
             args = _customArgs;
             break;
@@ -673,6 +702,9 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::NeighborCopy:
             return basePath + "vc_grow_seg_from_seed";
 
+        case Tool::MergeTifxyz:
+            return basePath + "vc_merge_tifxyz";
+
         case Tool::CustomCommand:
             return _customCommand.isEmpty() ? "custom_command" : _customCommand;
 
@@ -689,12 +721,40 @@ QString CommandLineToolRunner::getOutputPath() const
     if (_currentTool == Tool::NeighborCopy) {
         return _tgtDir;
     }
+    if (_currentTool == Tool::MergeTifxyz) {
+        // The tool auto-names the output dir under <volpkg>/paths/; we
+        // surface the merge.json instead so the user can find the run.
+        return _mergeJsonPath;
+    }
     if (_currentTool == Tool::CustomCommand) {
         return QString();
     }
 
     QFileInfo outputInfo(_outputPattern);
     return outputInfo.dir().path();
+}
+
+void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
+                                           const QString& pathsDir,
+                                           const QString& refSurface,
+                                           int ransacIters,
+                                           double ransacMinThresh,
+                                           double ransacMaxThresh,
+                                           double ransacMadK,
+                                           int ransacSeed,
+                                           int anchorCap,
+                                           int stripCols)
+{
+    _mergeJsonPath        = mergeJsonPath;
+    _mergePathsDir        = pathsDir;
+    _mergeRefSurface      = refSurface;
+    _mergeRansacIters     = ransacIters;
+    _mergeRansacMinThresh = ransacMinThresh;
+    _mergeRansacMaxThresh = ransacMaxThresh;
+    _mergeRansacMadK      = ransacMadK;
+    _mergeRansacSeed      = ransacSeed;
+    _mergeAnchorCap       = anchorCap;
+    _mergeStripCols       = stripCols;
 }
 
 void CommandLineToolRunner::setObj2TifxyzParams(const QString& objPath, const QString& outputDir,

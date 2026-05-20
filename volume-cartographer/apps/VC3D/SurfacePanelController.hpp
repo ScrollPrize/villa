@@ -20,6 +20,7 @@ class VCCollection;
 class QTreeWidget;
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QPushButton;
 class QStandardItemModel;
 class QuadSurface;
@@ -41,6 +42,7 @@ public:
     struct FilterUiRefs {
         DropdownChecklistButton* dropdown{nullptr};
         QCheckBox* focusPoints{nullptr};
+        QDoubleSpinBox* focusPointDistance{nullptr};
         QComboBox* pointSet{nullptr};
         QPushButton* pointSetAll{nullptr};
         QPushButton* pointSetNone{nullptr};
@@ -49,6 +51,7 @@ public:
         QCheckBox* noExpansion{nullptr};
         QCheckBox* noDefective{nullptr};
         QCheckBox* partialReview{nullptr};
+        QCheckBox* showPartialReview{nullptr};
         QCheckBox* hideUnapproved{nullptr};
         QCheckBox* inspectOnly{nullptr};
         QCheckBox* currentOnly{nullptr};
@@ -122,6 +125,7 @@ signals:
     void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
+    void mergeTifxyzRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);

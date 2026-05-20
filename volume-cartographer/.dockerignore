@@ -4,9 +4,17 @@
 .gitignore
 .gitlab-ci.yml
 .zenodo.json
+.idea/
 build
 results
 **/build/
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake-build*/
+**/.cache/
+**/lto-cache/
+**/pgo-data/
+*.gcda
+*.gcno
+*.profraw
+*.profdata

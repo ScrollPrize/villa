@@ -1,6 +1,7 @@
 #include "SegmentationOverlayController.hpp"
 
 #include "../CState.hpp"
+#include "SegmentationIntersectionInvalidation.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../segmentation/tools/SegmentationEditManager.hpp"
@@ -18,11 +19,13 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
+#include <string>
 #include <tuple>
 #include <unordered_set>
 
 #include <opencv2/imgcodecs.hpp>
 
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -55,6 +58,43 @@ constexpr float kManualAddIntersectionMinWidthDelta = 0.75f;
 
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
+
+class OverlayProfileScope {
+public:
+    OverlayProfileScope(const char* event, const char* detail = "")
+        : event_(event)
+        , detail_(detail)
+        , enabled_(ProfileLoggingEnabled())
+    {
+        if (!enabled_) {
+            return;
+        }
+        timer_.start();
+        Logger()->info("[vc3d-profile] {} begin{}", event_, detailSuffix());
+    }
+
+    ~OverlayProfileScope()
+    {
+        if (!enabled_) {
+            return;
+        }
+        Logger()->info("[vc3d-profile] {} end elapsed_ms={}{}",
+                       event_,
+                       timer_.elapsed(),
+                       detailSuffix());
+    }
+
+private:
+    std::string detailSuffix() const
+    {
+        return detail_.empty() ? std::string{} : " detail='" + detail_ + "'";
+    }
+
+    const char* event_;
+    std::string detail_;
+    bool enabled_{false};
+    QElapsedTimer timer_;
+};
 
 QColor manualAddIntersectionColor()
 {
@@ -363,6 +403,8 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     float heightSteps,
     bool isAutoApproval)
 {
+    OverlayProfileScope profile("paintApprovalMaskDirect",
+                                isAutoApproval ? "auto_approval" : "manual");
     if (_pendingApprovalMaskImage.isNull()) {
         qWarning() << "paintApprovalMaskDirect: pending image is NULL!";
         return;
@@ -471,12 +513,17 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     // Invalidate pending version since we modified the pending image
     ++_pendingImageVersion;
 
-    // Trigger re-rendering of intersection lines on plane viewers
-    invalidatePlaneIntersections();
+    // Manual painting should update interactively; auto-approval bursts are coalesced.
+    if (isAutoApproval) {
+        schedulePlaneIntersectionRefresh();
+    } else {
+        invalidatePlaneIntersections();
+    }
 }
 
 void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surface)
 {
+    OverlayProfileScope profile("saveApprovalMaskToSurface");
     if (!surface || (_savedApprovalMaskImage.isNull() && _pendingApprovalMaskImage.isNull())) {
         return;
     }
@@ -760,6 +807,22 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             style.z = 110.0;
             builder.addLineStrip(points, false, style);
         };
+        if (flattened) {
+            ViewerOverlayControllerBase::OverlayStyle hoverFillStyle;
+            hoverFillStyle.penColor = Qt::transparent;
+            hoverFillStyle.brushColor = QColor(255, 220, 0, 55);
+            hoverFillStyle.penWidth = 0.0;
+            hoverFillStyle.z = 104.0;
+            for (const QPointF& grid : state.manualAddHoverFillVertices) {
+                const QPointF topLeft = gridToScene(QPointF(grid.x() - 0.5, grid.y() - 0.5));
+                const QPointF bottomRight = gridToScene(QPointF(grid.x() + 0.5, grid.y() + 0.5));
+                if (!std::isfinite(topLeft.x()) || !std::isfinite(topLeft.y()) ||
+                    !std::isfinite(bottomRight.x()) || !std::isfinite(bottomRight.y())) {
+                    continue;
+                }
+                builder.addRect(QRectF(topLeft, bottomRight).normalized(), true, hoverFillStyle);
+            }
+        }
         for (const auto& line : state.manualAddCommittedLines) {
             drawLine(line);
         }
@@ -1374,21 +1437,26 @@ void SegmentationOverlayController::forceRefreshAllOverlays()
 
 void SegmentationOverlayController::invalidatePlaneIntersections()
 {
+    OverlayProfileScope profile("invalidatePlaneIntersections", "immediate");
     if (!_viewerManager) {
         return;
     }
 
-    _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
-        if (!viewer) {
-            return;
-        }
-        // Only invalidate for plane surface viewers (XY, XZ, YZ)
-        if (dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
-            // Invalidate the intersection cache for segmentation so approval colors get recomputed
-            viewer->invalidateIntersect("segmentation");
-            viewer->renderIntersections();
-        }
-    });
+    vc3d::segmentation::invalidateApprovalPlaneIntersections(
+        _viewerManager->baseViewers(),
+        vc3d::segmentation::ApprovalIntersectionRefresh::Immediate);
+}
+
+void SegmentationOverlayController::schedulePlaneIntersectionRefresh()
+{
+    OverlayProfileScope profile("invalidatePlaneIntersections", "deferred");
+    if (!_viewerManager) {
+        return;
+    }
+
+    vc3d::segmentation::invalidateApprovalPlaneIntersections(
+        _viewerManager->baseViewers(),
+        vc3d::segmentation::ApprovalIntersectionRefresh::Deferred);
 }
 
 void SegmentationOverlayController::setApprovalMaskOpacity(int opacity)

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <random>
@@ -26,6 +27,19 @@ namespace vc::core::util {
 namespace {
 constexpr uint32_t GRIDSTORE_MAGIC = 0x56434753; // "VCGS"
 constexpr uint32_t GRIDSTORE_VERSION = 3;
+
+// GridStore wire format is byte-packed with no alignment guarantees, so
+// dereferencing a uint32_t* into mmapped data is UB and trips ubsan.
+// Always go through memcpy to honor the platform's strict-aliasing /
+// alignment rules.
+inline uint32_t read_be_u32(const char* p) {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return ntohl(v);
+}
+inline uint32_t read_be_u32_at(const char* base, size_t byte_offset) {
+    return read_be_u32(base + byte_offset);
+}
 }
 
 struct MmappedData {
@@ -467,8 +481,8 @@ public:
         if (mmapped_data_->size < min_header_size) {
             throw std::runtime_error("Invalid GridStore file: too small for header.");
         }
-        uint32_t magic = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        uint32_t version = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+        uint32_t magic = read_be_u32(current); current += sizeof(uint32_t);
+        uint32_t version = read_be_u32(current); current += sizeof(uint32_t);
         if (magic != GRIDSTORE_MAGIC) {
             throw std::runtime_error("Invalid GridStore file: magic mismatch.");
         }
@@ -479,15 +493,15 @@ public:
              throw std::runtime_error("GridStore file version " + std::to_string(version) + " is older than minimum supported version 1.");
         }
 
-        bounds_.x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        bounds_.y = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        bounds_.width = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        bounds_.height = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        cell_size_ = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        uint32_t num_buckets = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        uint32_t num_paths = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        uint32_t buckets_offset = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        uint32_t paths_offset = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+        bounds_.x = read_be_u32(current); current += sizeof(uint32_t);
+        bounds_.y = read_be_u32(current); current += sizeof(uint32_t);
+        bounds_.width = read_be_u32(current); current += sizeof(uint32_t);
+        bounds_.height = read_be_u32(current); current += sizeof(uint32_t);
+        cell_size_ = read_be_u32(current); current += sizeof(uint32_t);
+        uint32_t num_buckets = read_be_u32(current); current += sizeof(uint32_t);
+        uint32_t num_paths = read_be_u32(current); current += sizeof(uint32_t);
+        uint32_t buckets_offset = read_be_u32(current); current += sizeof(uint32_t);
+        uint32_t paths_offset = read_be_u32(current); current += sizeof(uint32_t);
         
         uint32_t json_meta_offset = 0;
         uint32_t json_meta_size = 0;
@@ -495,8 +509,8 @@ public:
             if (mmapped_data_->size < 13 * sizeof(uint32_t)) {
                 throw std::runtime_error("Invalid GridStore v2+ file: too small for extended header.");
             }
-            json_meta_offset = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-            json_meta_size = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+            json_meta_offset = read_be_u32(current); current += sizeof(uint32_t);
+            json_meta_size = read_be_u32(current); current += sizeof(uint32_t);
         }
 
         grid_size_ = cv::Size(
@@ -515,7 +529,7 @@ public:
             const char* current_bucket_ptr = buckets_start;
             for (uint32_t i = 0; i < num_buckets; ++i) {
                 if (current_bucket_ptr + sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in bucket header.");
-                uint32_t num_indices = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr));
+                uint32_t num_indices = read_be_u32(current_bucket_ptr);
                 grid_bucket_descriptors_[i] = { (size_t)(current_bucket_ptr - buckets_start), num_indices };
                 current_bucket_ptr += sizeof(uint32_t) + num_indices * sizeof(uint32_t);
                 if (current_bucket_ptr > end) throw std::runtime_error("Invalid GridStore file: bucket data out of bounds during descriptor reading.");
@@ -568,21 +582,21 @@ private:
 
     const char* read_bucket(const char* current, const char* end, std::vector<int>& bucket) const {
         if (current + sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in bucket header.");
-        uint32_t num_indices = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+        uint32_t num_indices = read_be_u32(current); current += sizeof(uint32_t);
 
         bucket.resize(num_indices);
         if (current + num_indices * sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: bucket indices out of bounds.");
         for (uint32_t i = 0; i < num_indices; ++i) {
-            bucket[i] = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+            bucket[i] = read_be_u32(current); current += sizeof(uint32_t);
         }
         return current;
     }
 
     const char* read_seglist_header_and_data(const char* current, const char* end, std::shared_ptr<LineSegList>& seglist) const {
         if (current + 3 * sizeof(uint32_t) > end) throw std::runtime_error("Invalid GridStore file: unexpected end in seglist header.");
-        uint32_t start_x = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        uint32_t start_y = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
-        uint32_t num_offsets = ntohl(*reinterpret_cast<const uint32_t*>(current)); current += sizeof(uint32_t);
+        uint32_t start_x = read_be_u32(current); current += sizeof(uint32_t);
+        uint32_t start_y = read_be_u32(current); current += sizeof(uint32_t);
+        uint32_t num_offsets = read_be_u32(current); current += sizeof(uint32_t);
  
         if (current + num_offsets > end) throw std::runtime_error("Invalid GridStore file: seglist offsets out of bounds.");
         
@@ -721,37 +735,38 @@ private:
                     
                     bucket_ptr->reserve(descriptor.second);
                     for (uint32_t j = 0; j < descriptor.second; ++j) {
-                        uint32_t path_offset = ntohl(*reinterpret_cast<const uint32_t*>(current_bucket_ptr)); current_bucket_ptr += sizeof(uint32_t);
+                        uint32_t path_offset = read_be_u32(current_bucket_ptr); current_bucket_ptr += sizeof(uint32_t);
                         bucket_ptr->push_back(path_offset);
                     }
                 }
             }
         } else { // Version 3
             const char* data_start = static_cast<const char*>(mmapped_data_->data);
-            const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
-            
-            uint32_t start_idx = ntohl(bucket_indices[index]);
-            uint32_t end_idx = ntohl(bucket_indices[index + 1]);
+            const size_t bi_off = buckets_offset_in_file_;
+
+            uint32_t start_idx = read_be_u32_at(data_start, bi_off + index * sizeof(uint32_t));
+            uint32_t end_idx   = read_be_u32_at(data_start, bi_off + (index + 1) * sizeof(uint32_t));
             uint32_t count = end_idx - start_idx;
 
             if (count > 0) {
-                const uint32_t* header_ptr = reinterpret_cast<const uint32_t*>(data_start);
-                uint32_t num_buckets = ntohl(header_ptr[7]);
-                // In V3, header[8] is the total number of paths in the storage, not the number of paths in all buckets combined.
-                // The total number of path offsets in the flat list is given by the last element of the bucket_indices array.
-                const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
-                uint32_t total_path_indices = ntohl(bucket_indices[num_buckets]);
+                // header[7] = num_buckets. header[8] is the total number of paths
+                // in the storage, not the count summed across all buckets — the
+                // last element of the bucket_indices array gives the total
+                // number of path offsets in the flat list.
+                uint32_t num_buckets = read_be_u32_at(data_start, 7 * sizeof(uint32_t));
+                uint32_t total_path_indices = read_be_u32_at(data_start, bi_off + num_buckets * sizeof(uint32_t));
 
                 if (start_idx + count > total_path_indices) {
                     throw std::runtime_error("Bucket data is out of bounds of the flat path offset list.");
                 }
 
-                size_t bucket_indices_size = (num_buckets + 1) * sizeof(uint32_t);
-                const uint32_t* path_offsets_flat = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_ + bucket_indices_size);
+                const size_t bucket_indices_size = (num_buckets + 1) * sizeof(uint32_t);
+                const size_t path_offsets_off = bi_off + bucket_indices_size;
 
                 bucket_ptr->reserve(count);
                 for (uint32_t i = 0; i < count; ++i) {
-                    bucket_ptr->push_back(ntohl(path_offsets_flat[start_idx + i]));
+                    bucket_ptr->push_back(
+                        read_be_u32_at(data_start, path_offsets_off + (start_idx + i) * sizeof(uint32_t)));
                 }
             }
         }
