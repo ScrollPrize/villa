@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 import model as fit_model
+import opt_loss_station
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,9 @@ class _SurfaceState:
 		self.model_to_ext = _DirectionState(source_rank=3, target_rank=2)
 		self.ext_to_model = _DirectionState(source_rank=2, target_rank=3)
 		self.ext_seed_hw: tuple[int, int] | None = None
+		self.seed_ext_distance: float | None = None
+		self.seed_ext_key: tuple[float, float, float] | None = None
+		self.seed_ext_point_xyz: tuple[float, float, float] | None = None
 
 	def ensure(
 		self,
@@ -157,6 +161,9 @@ class _SurfaceState:
 		)
 		if old_ext_shape != ext_shape:
 			self.ext_seed_hw = None
+			self.seed_ext_distance = None
+			self.seed_ext_key = None
+			self.seed_ext_point_xyz = None
 
 
 _CORNERS_2D = ((0, 0), (1, 0), (0, 1), (1, 1))
@@ -638,15 +645,16 @@ def _revalidate_direction(
 	target_valid: torch.Tensor,
 	target_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
-) -> None:
+) -> dict[str, int]:
+	start_count = state.count()
 	if state.map is None or state.valid is None or state.target_shape is None:
-		return
-	if state.count() == 0:
-		return
+		return {"drop": 0}
+	if start_count == 0:
+		return {"drop": 0}
 	valid_b, map_b, source_valid_b = _batched_source_views(state, source_valid)
 	new_valid_b = valid_b.clone()
 	if not bool(new_valid_b.any().detach().cpu()):
-		return
+		return {"drop": 0}
 
 	coords = map_b[new_valid_b]
 	source_idx_b = new_valid_b.nonzero(as_tuple=False)
@@ -696,7 +704,21 @@ def _revalidate_direction(
 			orient_ok = (det * expected) >= -1.0e-6
 		new_valid_b &= (~check) | ((grid_err <= float(cfg.grid_error)) & orient_ok)
 
+	after_count = int(new_valid_b.sum().detach().cpu())
 	_write_batched_state(state, new_valid_b, map_b)
+	return {"drop": max(0, int(start_count) - after_count)}
+
+
+def _empty_grow_stats() -> dict[str, int]:
+	return {
+		"ring": 0,
+		"sup": 0,
+		"tgt": 0,
+		"dist": 0,
+		"grid": 0,
+		"ori": 0,
+		"new": 0,
+	}
 
 
 def _grow_direction(
@@ -708,17 +730,19 @@ def _grow_direction(
 	target_valid: torch.Tensor,
 	target_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
-) -> None:
+) -> dict[str, int]:
+	stats = _empty_grow_stats()
 	if state.map is None or state.valid is None or state.source_shape is None or state.target_shape is None:
-		return
+		return stats
 	valid_b, map_b, source_valid_b = _batched_source_views(state, source_valid)
 	base_valid = valid_b.clone()
 	if int(base_valid.sum().detach().cpu()) == 0:
-		return
+		return stats
 	n, h, w = base_valid.shape
 	candidate_mask = _neighbor4_mask(base_valid) & source_valid_b & ~base_valid
+	stats["ring"] = int(candidate_mask.sum().detach().cpu())
 	if not bool(candidate_mask.any().detach().cpu()):
-		return
+		return stats
 
 	pred, count, det = _local_affine_predict_batched(
 		state,
@@ -728,8 +752,9 @@ def _grow_direction(
 		exclude_self=False,
 	)
 	candidate_mask &= count >= 2
+	stats["sup"] = int(candidate_mask.sum().detach().cpu())
 	if not bool(candidate_mask.any().detach().cpu()):
-		return
+		return stats
 
 	flat_mask = candidate_mask.reshape(-1)
 	flat_ids = flat_mask.nonzero(as_tuple=False).squeeze(1)
@@ -760,28 +785,32 @@ def _grow_direction(
 	occupied = _target_occupied_mask(state, base_valid)
 	target_ids = _linear_ids(search_coords, state.target_shape)
 	target_ok &= ~occupied[target_ids]
+	stats["tgt"] = int(target_ok.any(dim=1).sum().detach().cpu())
 
 	grid_err = (search_coords.to(dtype=map_b.dtype) - pred_flat.unsqueeze(1)).norm(dim=-1)
 	target_pos = _gather_points_at_coords(target_xyz, search_coords)
 	target_n = _gather_points_at_coords(target_normals, search_coords)
 	source_pos = _points_at_indices(source_xyz, source_idx).unsqueeze(1)
 	dist = (source_pos - target_pos).norm(dim=-1)
-	geom_ok = (
+	target_geom_ok = (
 		torch.isfinite(target_pos).all(dim=-1) &
 		torch.isfinite(target_n).all(dim=-1) &
-		(target_n.norm(dim=-1) > 1.0e-8) &
-		(dist <= float(cfg.point_distance)) &
-		(grid_err <= float(cfg.grid_error))
+		(target_n.norm(dim=-1) > 1.0e-8)
 	)
+	dist_ok = target_ok & target_geom_ok & (dist <= float(cfg.point_distance))
+	stats["dist"] = int(dist_ok.any(dim=1).sum().detach().cpu())
+	grid_ok = dist_ok & (grid_err <= float(cfg.grid_error))
+	stats["grid"] = int(grid_ok.any(dim=1).sum().detach().cpu())
+	ok = grid_ok
 	if cfg.orientation != "none":
 		expected = 1.0 if int(state.orientation_sign) >= 0 else -1.0
-		geom_ok &= ((det_flat * expected) >= -1.0e-6).unsqueeze(1)
-	ok = target_ok & geom_ok
+		ok = ok & ((det_flat * expected) >= -1.0e-6).unsqueeze(1)
+	stats["ori"] = int(ok.any(dim=1).sum().detach().cpu())
 	score = torch.where(ok, dist + grid_err, torch.full_like(dist, float("inf")))
 	best_score, best_pos = score.min(dim=1)
 	accepted = torch.isfinite(best_score)
 	if not bool(accepted.any().detach().cpu()):
-		return
+		return stats
 
 	acc_source_idx = source_idx[accepted]
 	acc_target_coords = search_coords[accepted, best_pos[accepted]]
@@ -799,8 +828,9 @@ def _grow_direction(
 		acc_source_idx = acc_source_idx[accepted_unique]
 		acc_target_coords = acc_target_coords[accepted_unique]
 
+	stats["new"] = int(acc_source_idx.shape[0])
 	if acc_source_idx.numel() == 0:
-		return
+		return stats
 	map_out = map_b.clone()
 	valid_out = base_valid.clone()
 	if state.source_rank == 3:
@@ -810,59 +840,119 @@ def _grow_direction(
 		map_out[0, acc_source_idx[:, 0], acc_source_idx[:, 1]] = acc_target_coords.to(dtype=map_b.dtype)
 		valid_out[0, acc_source_idx[:, 0], acc_source_idx[:, 1]] = True
 	_write_batched_state(state, valid_out, map_out)
+	return stats
 
 
-def _closest_external_seed_quad(
+def _closest_external_seed_surface(
 	*,
 	seed: torch.Tensor,
 	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
 	ext_quad_valid: torch.Tensor,
-) -> tuple[int, int] | None:
-	if ext_quad_valid.numel() == 0 or not bool(ext_quad_valid.any().detach().cpu()):
-		return None
-	centers = 0.25 * (
-		ext_xyz[:-1, :-1] +
-		ext_xyz[1:, :-1] +
-		ext_xyz[:-1, 1:] +
-		ext_xyz[1:, 1:]
-	)
-	finite = torch.isfinite(centers).all(dim=-1)
-	valid = ext_quad_valid & finite
-	if not bool(valid.any().detach().cpu()):
-		return None
-	dist2 = (centers - seed.view(1, 1, 3)).square().sum(dim=-1)
-	dist2 = torch.where(valid, dist2, torch.full_like(dist2, float("inf")))
-	flat = int(torch.argmin(dist2).detach().cpu())
-	Hq, Wq = int(ext_quad_valid.shape[0]), int(ext_quad_valid.shape[1])
-	return flat // Wq, flat % Wq
+	chunk_quads: int = 262144,
+) -> tuple[tuple[int, int] | None, torch.Tensor | None, float]:
+	"""Closest point on any valid external tifxyz quad to the seed."""
+	if ext_valid.numel() == 0 or not bool(ext_valid.any().detach().cpu()):
+		return None, None, float("inf")
+	if ext_xyz.ndim != 3 or int(ext_xyz.shape[-1]) != 3:
+		return None, None, float("inf")
+	H, W, _ = ext_xyz.shape
+	if H < 2 or W < 2 or ext_quad_valid.numel() == 0 or not bool(ext_quad_valid.any().detach().cpu()):
+		pts = ext_xyz[ext_valid & torch.isfinite(ext_xyz).all(dim=-1)]
+		if pts.numel() == 0:
+			return None, None, float("inf")
+		dist2 = (pts - seed.view(1, 3)).square().sum(dim=-1)
+		best = int(torch.argmin(dist2).detach().cpu())
+		return None, pts[best].detach(), math.sqrt(float(dist2[best].detach().cpu()))
+
+	valid_ids = ext_quad_valid.reshape(-1).nonzero(as_tuple=False).flatten()
+	if valid_ids.numel() == 0:
+		return None, None, float("inf")
+	Wq = W - 1
+	rows_all = torch.div(valid_ids, Wq, rounding_mode="floor")
+	cols_all = valid_ids - rows_all * Wq
+	best = torch.full((), float("inf"), device=ext_xyz.device, dtype=ext_xyz.dtype)
+	best_hw: tuple[int, int] | None = None
+	best_point: torch.Tensor | None = None
+	chunk = max(1, int(chunk_quads))
+	for start in range(0, int(valid_ids.numel()), chunk):
+		end = min(start + chunk, int(valid_ids.numel()))
+		rows = rows_all[start:end]
+		cols = cols_all[start:end]
+		p00 = ext_xyz[rows, cols]
+		p10 = ext_xyz[rows + 1, cols]
+		p01 = ext_xyz[rows, cols + 1]
+		p11 = ext_xyz[rows + 1, cols + 1]
+		finite = (
+			torch.isfinite(p00).all(dim=-1) &
+			torch.isfinite(p10).all(dim=-1) &
+			torch.isfinite(p01).all(dim=-1) &
+			torch.isfinite(p11).all(dim=-1)
+		)
+		if not bool(finite.any().detach().cpu()):
+			continue
+		rows_f = rows[finite]
+		cols_f = cols[finite]
+		p00 = p00[finite]
+		p10 = p10[finite]
+		p01 = p01[finite]
+		p11 = p11[finite]
+		cp0, _ = opt_loss_station._closest_points_on_triangles(seed, p00, p10, p11)
+		cp1, _ = opt_loss_station._closest_points_on_triangles(seed, p00, p11, p01)
+		d20 = (cp0 - seed.view(1, 3)).square().sum(dim=-1)
+		d21 = (cp1 - seed.view(1, 3)).square().sum(dim=-1)
+		use_first = d20 <= d21
+		d2 = torch.where(use_first, d20, d21)
+		local = int(torch.argmin(d2).detach().cpu())
+		local_best = d2[local]
+		if float(local_best.detach().cpu()) < float(best.detach().cpu()):
+			best = local_best
+			best_hw = (int(rows_f[local].detach().cpu()), int(cols_f[local].detach().cpu()))
+			best_point = (cp0 if bool(use_first[local].detach().cpu()) else cp1)[local].detach()
+	if not bool(torch.isfinite(best).detach().cpu()):
+		return None, None, float("inf")
+	return best_hw, best_point, math.sqrt(float(best.detach().cpu()))
 
 
-def _closest_model_quad(
+def _closest_model_surface_quad(
 	*,
-	ext_center: torch.Tensor,
+	point: torch.Tensor,
 	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
 ) -> tuple[tuple[int, int, int] | None, float]:
 	D, H, W, _ = model_xyz.shape
 	if H < 2 or W < 2:
 		return None, float("inf")
-	centers = 0.25 * (
-		model_xyz[:, :-1, :-1] +
-		model_xyz[:, 1:, :-1] +
-		model_xyz[:, :-1, 1:] +
-		model_xyz[:, 1:, 1:]
+	quad_valid = (
+		model_valid[:, :-1, :-1] &
+		model_valid[:, 1:, :-1] &
+		model_valid[:, :-1, 1:] &
+		model_valid[:, 1:, 1:]
 	)
-	finite = torch.isfinite(centers).all(dim=-1)
-	if not bool(finite.any().detach().cpu()):
+	valid_ids = quad_valid.reshape(-1).nonzero(as_tuple=False).flatten()
+	if valid_ids.numel() == 0:
 		return None, float("inf")
-	dist2 = (centers - ext_center.view(1, 1, 1, 3)).square().sum(dim=-1)
-	dist2 = torch.where(finite, dist2, torch.full_like(dist2, float("inf")))
-	flat = int(torch.argmin(dist2).detach().cpu())
 	Hq, Wq = H - 1, W - 1
-	d = flat // (Hq * Wq)
-	rem = flat - d * Hq * Wq
-	h = rem // Wq
-	w = rem % Wq
-	return (d, h, w), math.sqrt(float(dist2[d, h, w].detach().cpu()))
+	d = torch.div(valid_ids, Hq * Wq, rounding_mode="floor")
+	rem = valid_ids - d * Hq * Wq
+	h = torch.div(rem, Wq, rounding_mode="floor")
+	w = rem - h * Wq
+	p00 = model_xyz[d, h, w]
+	p10 = model_xyz[d, h + 1, w]
+	p01 = model_xyz[d, h, w + 1]
+	p11 = model_xyz[d, h + 1, w + 1]
+	cp0, _ = opt_loss_station._closest_points_on_triangles(point, p00, p10, p11)
+	cp1, _ = opt_loss_station._closest_points_on_triangles(point, p00, p11, p01)
+	d2 = torch.minimum(
+		(cp0 - point.view(1, 3)).square().sum(dim=-1),
+		(cp1 - point.view(1, 3)).square().sum(dim=-1),
+	)
+	best = int(torch.argmin(d2).detach().cpu())
+	return (
+		int(d[best].detach().cpu()),
+		int(h[best].detach().cpu()),
+		int(w[best].detach().cpu()),
+	), math.sqrt(float(d2[best].detach().cpu()))
 
 
 def _choose_seed_transform(
@@ -901,28 +991,40 @@ def _try_seed_reinsert(
 	ext_quad_valid: torch.Tensor,
 	cfg: SnapSurfConfig,
 	seed_xyz: tuple[float, float, float],
-) -> tuple[bool, float]:
+) -> tuple[bool, float, float]:
 	seed = torch.tensor(seed_xyz, device=ext_xyz.device, dtype=ext_xyz.dtype)
-	if state.ext_seed_hw is None:
-		state.ext_seed_hw = _closest_external_seed_quad(seed=seed, ext_xyz=ext_xyz, ext_quad_valid=ext_quad_valid)
-	if state.ext_seed_hw is None:
-		return False, float("inf")
+	seed_key = tuple(float(v) for v in seed_xyz)
+	if state.seed_ext_distance is None or state.seed_ext_key != seed_key:
+		ext_seed_hw, ext_seed_point, ext_seed_dist = _closest_external_seed_surface(
+			seed=seed,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+		)
+		state.ext_seed_hw = ext_seed_hw
+		state.seed_ext_distance = ext_seed_dist
+		state.seed_ext_key = seed_key
+		state.seed_ext_point_xyz = (
+			None if ext_seed_point is None
+			else tuple(float(v) for v in ext_seed_point.detach().cpu().tolist())
+		)
+	if state.ext_seed_hw is None or state.seed_ext_point_xyz is None:
+		return False, float("inf"), state.seed_ext_distance
 	eh, ew = state.ext_seed_hw
 	if eh < 0 or ew < 0 or eh >= int(ext_quad_valid.shape[0]) or ew >= int(ext_quad_valid.shape[1]):
 		state.ext_seed_hw = None
-		return False, float("inf")
+		return False, float("inf"), state.seed_ext_distance
 	if not _bool_at_index(ext_quad_valid, (eh, ew)):
 		state.ext_seed_hw = None
-		return False, float("inf")
-	ext_center = 0.25 * (
-		ext_xyz[eh, ew] +
-		ext_xyz[eh + 1, ew] +
-		ext_xyz[eh, ew + 1] +
-		ext_xyz[eh + 1, ew + 1]
+		return False, float("inf"), state.seed_ext_distance
+	ext_seed_point_t = torch.tensor(state.seed_ext_point_xyz, device=model_xyz.device, dtype=model_xyz.dtype)
+	model_quad, surface_dist = _closest_model_surface_quad(
+		point=ext_seed_point_t,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
 	)
-	model_quad, center_dist = _closest_model_quad(ext_center=ext_center, model_xyz=model_xyz)
-	if model_quad is None or center_dist > cfg.init_distance:
-		return False, center_dist
+	if model_quad is None or surface_dist > cfg.init_distance:
+		return False, surface_dist, state.seed_ext_distance
 	d, mh, mw = model_quad
 	model_quad_valid = (
 		_bool_at_index(model_valid, (d, mh, mw)) and
@@ -931,7 +1033,7 @@ def _try_seed_reinsert(
 		_bool_at_index(model_valid, (d, mh + 1, mw + 1))
 	)
 	if not model_quad_valid:
-		return False, center_dist
+		return False, surface_dist, state.seed_ext_distance
 	transform, det_sign = _choose_seed_transform(
 		model_xyz=model_xyz,
 		ext_xyz=ext_xyz,
@@ -951,7 +1053,7 @@ def _try_seed_reinsert(
 		model_coord = torch.tensor(model_idx, device=model_xyz.device, dtype=model_xyz.dtype)
 		_set_correspondence(state.model_to_ext, model_idx, ext_coord)
 		_set_correspondence(state.ext_to_model, ext_idx, model_coord)
-	return True, center_dist
+	return True, surface_dist, state.seed_ext_distance
 
 
 def _huber(residual: torch.Tensor, *, delta: float) -> torch.Tensor:
@@ -1070,8 +1172,17 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	stats = {
 		"snaps_seed": 0.0,
 		"snaps_sdist": float("inf"),
+		"snaps_sext": float("inf"),
 		"snaps_m2e": 0.0,
 		"snaps_e2m": 0.0,
+		"snaps_drop": 0.0,
+		"snaps_ring": 0.0,
+		"snaps_sup": 0.0,
+		"snaps_tgt": 0.0,
+		"snaps_dist": 0.0,
+		"snaps_grid": 0.0,
+		"snaps_ori": 0.0,
+		"snaps_new": 0.0,
 	}
 	total_model_possible = 0
 	total_ext_possible = 0
@@ -1092,7 +1203,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		total_ext_possible += int(ext_valid.sum().detach().cpu())
 
 		with torch.no_grad():
-			_revalidate_direction(
+			rv_m2e = _revalidate_direction(
 				state.model_to_ext,
 				source_xyz=model_xyz_det,
 				source_valid=model_valid,
@@ -1101,7 +1212,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				target_normals=ext_normals,
 				cfg=cfg,
 			)
-			_revalidate_direction(
+			rv_e2m = _revalidate_direction(
 				state.ext_to_model,
 				source_xyz=ext_xyz,
 				source_valid=ext_valid,
@@ -1110,7 +1221,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				target_normals=model_normals.detach(),
 				cfg=cfg,
 			)
-			seed_inserted, seed_dist = _try_seed_reinsert(
+			stats["snaps_drop"] += float(rv_m2e.get("drop", 0) + rv_e2m.get("drop", 0))
+			seed_inserted, seed_dist, seed_ext_dist = _try_seed_reinsert(
 				state,
 				model_xyz=model_xyz_det,
 				model_valid=model_valid,
@@ -1121,9 +1233,10 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				seed_xyz=_seed_xyz,
 			)
 			stats["snaps_sdist"] = min(stats["snaps_sdist"], float(seed_dist))
+			stats["snaps_sext"] = min(stats["snaps_sext"], float(seed_ext_dist))
 			if seed_inserted:
 				stats["snaps_seed"] += 1.0
-			_grow_direction(
+			grow_m2e = _grow_direction(
 				state.model_to_ext,
 				source_xyz=model_xyz_det,
 				source_valid=model_valid,
@@ -1132,7 +1245,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				target_normals=ext_normals,
 				cfg=cfg,
 			)
-			_grow_direction(
+			grow_e2m = _grow_direction(
 				state.ext_to_model,
 				source_xyz=ext_xyz,
 				source_valid=ext_valid,
@@ -1141,6 +1254,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				target_normals=model_normals.detach(),
 				cfg=cfg,
 			)
+			for k in ("ring", "sup", "tgt", "dist", "grid", "ori", "new"):
+				stats[f"snaps_{k}"] += float(grow_m2e.get(k, 0) + grow_e2m.get(k, 0))
 
 		l_m2e, lm_m2e, mask_m2e, n_m2e = _direction_loss_model_to_ext(
 			state.model_to_ext,

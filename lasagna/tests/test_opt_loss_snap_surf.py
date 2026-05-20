@@ -150,6 +150,23 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertTrue(torch.allclose(state.model_to_ext.map[0, 0, 0], torch.tensor([0.0, 0.0])))
 		self.assertTrue(torch.allclose(state.ext_to_model.map[0, 0], torch.tensor([0.0, 0.0, 0.0])))
 		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sdist"], 0.0, places=6)
+		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sext"], 0.0, places=6)
+
+	def test_seed_attachment_uses_closest_surface_not_quad_center(self) -> None:
+		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
+		ext_xyz = 50.0 * _plane_xyz(h=2, w=2, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"init_distance": 1.0, "point_distance": 10.0, "grid_error": 0.25},
+			seed_xyz=(0.0, 0.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		stats = opt_loss_snap_surf.last_stats()
+
+		self.assertAlmostEqual(stats["snaps_sext"], 0.0, places=6)
+		self.assertAlmostEqual(stats["snaps_sdist"], 0.0, places=6)
+		self.assertEqual(opt_loss_snap_surf._states[0].model_to_ext.count(), 4)
 
 	def test_outlier_correspondences_drop_on_next_loss_evaluation(self) -> None:
 		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
