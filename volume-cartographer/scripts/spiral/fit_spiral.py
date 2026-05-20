@@ -39,7 +39,7 @@ unattached_pcl_json_paths = [
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 1875, 2375
+z_begin, z_end = 7500, 9500
 patches_path = '/home/paul/projects/vesuvius-scrolls/spiral/custom_patches'
 voxel_size_um = 2.4 * 4  # before downsampling
 seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
@@ -52,12 +52,14 @@ seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
 # spiral_outward_sense = 'CW'  # CW | ACW
 # umbilicus_z_to_yx = lambda f: thaumato_umbilicus_z_to_yx('/home/paul/projects/vesuvius-scrolls/data/s5-umbilicus.txt', downsample_factor=f)
 # scroll_name = 's5'
-# z_begin, z_end = 3850, 4150
+# z_begin, z_end = 15400, 16600
 # voxel_size_um = 8.0
 # seed_patch_id = None
 
 cache_path = '../cache'
 downsample_factor = 4
+z_begin //= downsample_factor
+z_end //= downsample_factor
 
 default_config = {
     'random_seed': 1,
@@ -2516,7 +2518,7 @@ def main():
     )
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{len(patches)}-patch_{cfg["working_set_mode"]}'
+    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch_{cfg["working_set_mode"]}'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
     run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
