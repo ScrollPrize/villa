@@ -1205,11 +1205,6 @@ def optimize(
 			seed_xyz=seed_xyz,
 			out_dir=out_dir,
 		)
-		if hasattr(model, "configure_flatten"):
-			model.configure_flatten(
-				support=_truthy(stage_args.get("flatten_support", True)),
-				support_radius=int(stage_args.get("flatten_support_radius", 1)),
-			)
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
 		)
@@ -1380,8 +1375,10 @@ def optimize(
 				"cyl_outside_depth_avg": "outavg",
 				"flatten_point_valid": "f_pt",
 				"flatten_quad_valid": "f_quad",
-				"flatten_affine": "f_aff",
 				"flatten_tgt_step": "f_tgt",
+				"flatten_valid_to_invalid": "f_v2i",
+				"flatten_invalid_to_valid": "f_i2v",
+				"flatten_sdir_no_new": "f_noadd",
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
 				"p:wstep_invalid_avg_vx": "iavg",

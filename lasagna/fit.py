@@ -258,7 +258,7 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 	with torch.no_grad():
 		st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
 		st["flatten_map_flat"] = mdl.flatten_map().detach().cpu()
-		_map_yx, _xyz, point_mask, _quad_mask, _affine_mask = mdl._flatten_sample_current()
+		_map_yx, _xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
 		st["flatten_point_mask"] = point_mask.detach().cpu()
 	st["_model_params_"] = asdict(mdl.params)
 	st["_fit_config_"] = fit_config
@@ -280,7 +280,7 @@ def _export_flatten_result(
 
 	out_dir.mkdir(parents=True, exist_ok=True)
 	with torch.no_grad():
-		_map_yx, xyz, point_mask, _quad_mask, _affine_mask = mdl._flatten_sample_current()
+		_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
 	xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
 	mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
 	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
@@ -367,12 +367,11 @@ def _run_flatten_mode(
 			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
 
 	with torch.no_grad():
-		map_yx, xyz0, point_mask, quad_mask, affine_mask = mdl._flatten_sample_current()
+		map_yx, xyz0, point_mask, quad_mask = mdl._flatten_sample_current()
 		print(
 			f"initial flatten: map_shape={tuple(map_yx.shape)} "
 			f"point_valid={int(point_mask.sum())}/{point_mask.numel()} "
-			f"quad_valid={int(quad_mask.sum())}/{quad_mask.numel()} "
-			f"affine_support={int(affine_mask.sum())}",
+			f"quad_valid={int(quad_mask.sum())}/{quad_mask.numel()}",
 			flush=True,
 		)
 
