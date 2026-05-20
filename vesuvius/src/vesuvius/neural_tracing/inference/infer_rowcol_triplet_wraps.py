@@ -1824,7 +1824,17 @@ def _run_triplet_inference(
 
             kept_bboxes += len(items)
             d, h_c, w_c = crop_size
-            batch_np = np.empty((len(items), 8, d, h_c, w_c), dtype=np.float32)
+            real_batch_size = len(items)
+            infer_batch_size = real_batch_size
+            if bool(model_state.get("compiled", False)):
+                infer_batch_size = int(args.batch_size)
+            use_pinned_input = bool(str(args.device).startswith("cuda") and torch.cuda.is_available())
+            batch_cpu = torch.empty(
+                (infer_batch_size, 8, d, h_c, w_c),
+                dtype=torch.float32,
+                pin_memory=use_pinned_input,
+            )
+            batch_np = batch_cpu.numpy()
             for i, item in enumerate(items):
                 uv = item["uv"].astype(np.int64, copy=False)
                 batch_np[i, 0] = item["volume"]
@@ -1838,17 +1848,20 @@ def _run_triplet_inference(
                     fallback_unit_normal=global_unit_normal,
                     mask_mode=triplet_direction_prior_mask,
                 )
+            if infer_batch_size > real_batch_size:
+                batch_np[real_batch_size:] = 0.0
 
-            model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
+            model_inputs = batch_cpu.to(args.device, non_blocking=use_pinned_input)
             disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=bool(args.tta), profiler=None)
             if disp_pred is None:
                 raise RuntimeError("Model output did not contain 'displacement'.")
             disp_pred_np = (
-                disp_pred.detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
+                disp_pred[:real_batch_size].detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
             )
             _split_triplet_displacement_channels(disp_pred_np)
             merger.accumulate_batch(disp_pred_np[:, :6], items)
 
+            del batch_cpu
             del model_inputs
             del disp_pred
             del disp_pred_np
