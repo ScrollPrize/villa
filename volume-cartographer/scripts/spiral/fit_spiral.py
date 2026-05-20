@@ -34,12 +34,13 @@ scroll_zarr_path = None
 cross_patch_pcl_json_paths = ['/home/paul/projects/vesuvius-scrolls/spiral/windings_8205.json']
 unattached_pcl_json_paths = [
     '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations.json',
-    '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations_2.json'
+    '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations_2.json',
+    '/home/paul/projects/vesuvius-scrolls/spiral/s1_relative_windings.json',
 ]
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 7500, 9500
+z_begin, z_end = 6000, 16000
 patches_path = '/home/paul/projects/vesuvius-scrolls/spiral/custom_patches'
 voxel_size_um = 2.4 * 4  # before downsampling
 seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
@@ -106,7 +107,7 @@ default_config = {
     'working_set_mode': 'global',  # 'progressive' (grow from a seed when satisfied) | 'progressive_fixed' (grow from a seed on a fixed iteration schedule) | 'global' (fit all patches at once)
     'working_set_check_interval': 10,
     'progressive_fixed_add_interval': 50,
-    'output_winding_range': (10, 80),
+    'output_winding_range': (10, 100),
     'output_winding_margin': 4,
     'output_step_size': 20,
 }
