@@ -3,7 +3,8 @@
 		"model-init": "flatten"
 	},
 	"base": {
-		"flatten_sdir": 1.0
+		"flatten_sdir": 1.0,
+		"flatten_map_step": 0.001
 	},
 	"stages": [
 		{

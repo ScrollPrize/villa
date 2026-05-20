@@ -256,7 +256,10 @@ def _parse_opt_settings(
 			)
 		if not any(float(eff.get(name, 0.0)) != 0.0 for name in CYLINDER_LOSS_NAMES):
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
-	if "flatten_map_ms" in params and not any(float(eff.get(name, 0.0)) != 0.0 for name in ("flatten_sdir",)):
+	if "flatten_map_ms" in params and not any(
+		float(eff.get(name, 0.0)) != 0.0
+		for name in ("flatten_sdir", "flatten_map_step")
+	):
 		raise ValueError(f"stages_json: stage '{stage_name}' with flatten_map_ms requires a nonzero flatten loss")
 	return OptSettings(
 		steps=steps,
@@ -299,6 +302,7 @@ lambda_global: dict[str, float] = {
 	"cyl_base_gt": 0.0,
 	"cyl_outside": 0.0,
 	"flatten_sdir": 0.0,
+	"flatten_map_step": 0.0,
 }
 
 
@@ -1003,6 +1007,10 @@ def optimize(
 			"loss": opt_loss_flatten.flatten_sdir_loss,
 			"needs": Needs(flatten=True),
 		},
+		"flatten_map_step": {
+			"loss": opt_loss_flatten.flatten_map_step_loss,
+			"needs": Needs(flatten=True),
+		},
 	}
 
 	_corr_start_printed = [False]
@@ -1378,6 +1386,7 @@ def optimize(
 				"flatten_tgt_step": "f_tgt",
 				"flatten_valid_to_invalid": "f_v2i",
 				"flatten_invalid_to_valid": "f_i2v",
+				"flatten_map_step": "f_mstep",
 				"flatten_sdir_no_new": "f_noadd",
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
