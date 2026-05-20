@@ -11,10 +11,7 @@
 	"stages": [
 		{
 			"name": "flatten",
-			"steps": 10000,
-			"_lr": [0.001, 0.0003, 0.0001, 0.00003],
-			"_lr": [0.0003, 0.0001, 0.00003, 0.00001],
-			"_lr": [0.001,0.0003,0.0001],
+			"steps": "auto",
 			"lr" : 0.01,
 			"params": ["flatten_map_ms"],
 			"min_scaledown": 0,
@@ -27,7 +24,52 @@
 				"flatten_filter_radius": 2,
 				"flatten_max_update": 0.1,
 				"flatten_sdir_eps": 1e-8,
-				"status_interval": 100
+				"status_interval": 100,
+				"auto_steps_window": 2000,
+				"auto_steps_max": 100000,
+				"auto_steps_rel_threshold": 1e-5
+			}
+		},
+		{
+			"name": "flatten",
+			"steps": "auto",
+			"lr" : 0.001,
+			"params": ["flatten_map_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"flatten_support": true,
+				"flatten_support_radius": 1,
+				"flatten_orient_min_det": 0.0,
+				"flatten_filter_source_angles": true,
+				"flatten_filter_angle_deg": 60.0,
+				"flatten_filter_radius": 2,
+				"flatten_max_update": 0.1,
+				"flatten_sdir_eps": 1e-8,
+				"status_interval": 100,
+				"auto_steps_window": 2000,
+				"auto_steps_max": 100000,
+				"auto_steps_rel_threshold": 1e-5
+			}
+		},
+		{
+			"name": "flatten",
+			"steps": "auto",
+			"lr" : 0.0001,
+			"params": ["flatten_map_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"flatten_support": true,
+				"flatten_support_radius": 1,
+				"flatten_orient_min_det": 0.0,
+				"flatten_filter_source_angles": true,
+				"flatten_filter_angle_deg": 60.0,
+				"flatten_filter_radius": 2,
+				"flatten_max_update": 0.1,
+				"flatten_sdir_eps": 1e-8,
+				"status_interval": 100,
+				"auto_steps_window": 2000,
+				"auto_steps_max": 100000,
+				"auto_steps_rel_threshold": 1e-5
 			}
 		}
 	]
