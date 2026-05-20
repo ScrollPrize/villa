@@ -23,6 +23,7 @@ import opt_loss_winding_volume
 import opt_loss_station
 import opt_loss_bend
 import opt_loss_cyl
+import opt_loss_flatten
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -208,7 +209,7 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	valid = {"mesh_ms", "amp", "bias", "cyl_params"}
+	valid = {"mesh_ms", "amp", "bias", "cyl_params", "flatten_map_ms"}
 	bad_params = sorted(set(params) - valid)
 	if bad_params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
@@ -255,6 +256,8 @@ def _parse_opt_settings(
 			)
 		if not any(float(eff.get(name, 0.0)) != 0.0 for name in CYLINDER_LOSS_NAMES):
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
+	if "flatten_map_ms" in params and not any(float(eff.get(name, 0.0)) != 0.0 for name in ("flatten_sdir",)):
+		raise ValueError(f"stages_json: stage '{stage_name}' with flatten_map_ms requires a nonzero flatten loss")
 	return OptSettings(
 		steps=steps,
 		lr=lr,
@@ -295,6 +298,7 @@ lambda_global: dict[str, float] = {
 	"cyl_base_mesh": 0.0,
 	"cyl_base_gt": 0.0,
 	"cyl_outside": 0.0,
+	"flatten_sdir": 0.0,
 }
 
 
@@ -306,6 +310,12 @@ def _init_mode_from_args(args_cfg: object) -> str | None:
 		return None
 	init_mode = args_cfg.get("init-mode", args_cfg.get("init_mode", None))
 	return None if init_mode is None else str(init_mode).strip().lower()
+
+
+def _model_init_from_args(args_cfg: object) -> str | None:
+	if not isinstance(args_cfg, dict):
+		return None
+	return str(args_cfg.get("model-init", args_cfg.get("model_init", "seed"))).strip().lower()
 
 
 def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
@@ -366,11 +376,14 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 	cfg = dict(cfg)
 	args_cfg = cfg.pop("args", None)
+	model_init = _model_init_from_args(args_cfg)
 	if init_mode is None:
 		init_mode = _init_mode_from_args(args_cfg)
 	else:
 		init_mode = str(init_mode).strip().lower()
 	base = dict(lambda_global)
+	if model_init == "flatten":
+		base = {k: 0.0 for k in base.keys()}
 	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
 		bad_base = sorted(set(str(k) for k in base_cfg.keys()) - set(base.keys()))
@@ -986,6 +999,10 @@ def optimize(
 			"loss": opt_loss_cyl.cyl_outside_loss,
 			"needs": Needs(cyl_samples=True, cyl_shell_fields=True, prefetch_cyl_grad_mask=True),
 		},
+		"flatten_sdir": {
+			"loss": opt_loss_flatten.flatten_sdir_loss,
+			"needs": Needs(flatten=True),
+		},
 	}
 
 	_corr_start_printed = [False]
@@ -1067,6 +1084,15 @@ def optimize(
 			missing.append("normals")
 		if required.ext_conn and res_.ext_conn is None:
 			missing.append("ext_conn")
+		if required.flatten:
+			if res_.flatten_map is None:
+				missing.append("flatten_map")
+			if res_.flatten_xyz is None:
+				missing.append("flatten_xyz")
+			if res_.flatten_point_mask is None:
+				missing.append("flatten_point_mask")
+			if res_.flatten_quad_mask is None:
+				missing.append("flatten_quad_mask")
 		cyl_active = bool(getattr(model, "cylinder_enabled", False))
 		if cyl_active:
 			if required.cyl_samples and (res_.cyl_xyz is None or res_.cyl_count <= 0):
@@ -1179,6 +1205,14 @@ def optimize(
 			seed_xyz=seed_xyz,
 			out_dir=out_dir,
 		)
+		if hasattr(model, "configure_flatten"):
+			model.configure_flatten(
+				support=_truthy(stage_args.get("flatten_support", True)),
+				support_radius=int(stage_args.get("flatten_support_radius", 1)),
+			)
+		opt_loss_flatten.configure(
+			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
+		)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
@@ -1253,7 +1287,7 @@ def optimize(
 			param_groups_: list[dict] = []
 			for name in settings.params:
 				group = all_params_.get(name, [])
-				if name in {"mesh_ms"}:
+				if name in {"mesh_ms", "flatten_map_ms"}:
 					k0 = max(0, int(settings.min_scaledown))
 					for pi, p in enumerate(group):
 						if pi < k0:
@@ -1344,6 +1378,10 @@ def optimize(
 				"cyl_outside_pen_frac": "out%",
 				"cyl_outside_depth_max": "outmax",
 				"cyl_outside_depth_avg": "outavg",
+				"flatten_point_valid": "f_pt",
+				"flatten_quad_valid": "f_quad",
+				"flatten_affine": "f_aff",
+				"flatten_tgt_step": "f_tgt",
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
 				"p:wstep_invalid_avg_vx": "iavg",
@@ -1625,6 +1663,8 @@ def optimize(
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
 						tv.update(opt_loss_cyl.last_stats())
+					if name == "flatten_sdir":
+						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
 			if stage_uses_cyl_loss and not bool(getattr(res_, "cyl_shell_mode", False)):

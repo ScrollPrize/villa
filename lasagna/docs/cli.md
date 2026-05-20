@@ -35,7 +35,7 @@ Each part provides `add_args(parser)` + `from_args(args)`:
 ## fit.py-specific arguments
 
 - `--out-dir` output directory for snapshots and debug
-- `--model-init` (`seed`, `ext`, or `model`; default `seed`)
+- `--model-init` (`seed`, `ext`, `model`, or `flatten`; default `seed`)
 - `--tifxyz-init` tifxyz directory used when `--model-init ext`
 - `--window-size` window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)
 - `--window-overlap` overlap between windows in fullres voxels (default 0)
@@ -61,7 +61,7 @@ All arguments can be set via JSON config files (merged left-to-right). The `args
 Top-level keys (other than `args`) are parsed as optimizer stages by `optimizer.load_stages_cfg()`.
 
 Special config keys consumed by fit.py/fit_service.py before stage parsing:
-- `external_surfaces`: list of `{"path": "...", "offset": 1.0}` for offset mode
+- `external_surfaces`: list of `{"path": "...", "offset": 1.0}` for offset mode, or one `{"path": "..."}` tifxyz source for flatten mode
 - `corr_points`: correction point collections from VC3D
 - `voxel_size_um`: voxel size for area calculations
 - `offset_value`: target offset (injected by VC3D offset mode)
@@ -70,5 +70,6 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.windings`.
 - `ext` initializes from the selected tifxyz mesh sent by VC3D.
 - `model` initializes from the selected segment's `model.pt`.
+- `flatten` optimizes an inverse 2D map over one external tifxyz source. Use [`configs/flatten.json`](../configs/flatten.json) with exactly one `external_surfaces` entry supplied by VC3D or the calling config.
 
 For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model data and UI state it has available. `fit_service.py` / `fit.py` decide whether those fields are consumed as `tifxyz-init`, `external_surfaces`, approval-inpaint input, model checkpoint input, or ignored as surplus transport data.

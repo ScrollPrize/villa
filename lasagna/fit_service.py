@@ -119,6 +119,8 @@ def _decode_tifxyz_for_request(
         print(f"[fit-service] decoded tifxyz ({len(tifxyz_payload)} files) to {tifxyz_dir}", flush=True)
         if model_init == "ext":
             args_section["tifxyz-init"] = tifxyz_dir
+        if model_init == "flatten" and "external_surfaces" not in cfg:
+            cfg["external_surfaces"] = [{"path": tifxyz_dir}]
         if approval_enabled:
             args_section["approval-inpaint-tifxyz"] = tifxyz_dir
         if ext_offset_enabled:
@@ -130,6 +132,8 @@ def _decode_tifxyz_for_request(
         raise ValueError("ext_offset is enabled but request has no tifxyz")
     elif approval_enabled:
         raise ValueError("approval-inpaint requires request tifxyz")
+    elif model_init == "flatten" and "external_surfaces" not in cfg:
+        raise ValueError("model-init=flatten requires request tifxyz or config external_surfaces")
 
     return tifxyz_dir
 
@@ -483,7 +487,21 @@ def _run_optimization(body: dict[str, Any]) -> None:
     output_dir = body.get("output_dir")
     config = body.get("config", {})
 
-    if not data_input:
+    if not isinstance(config, dict):
+        _job.set_error("request config must be an object")
+        return
+    args_section_initial = config.get("args", {})
+    if not isinstance(args_section_initial, dict):
+        args_section_initial = {}
+    model_init_requested = str(
+        args_section_initial.get("model-init", args_section_initial.get("model_init", "seed"))
+    ).strip().lower()
+    if model_init_requested not in {"seed", "ext", "model", "flatten"}:
+        _job.set_error(
+            f"invalid args.model-init '{model_init_requested}' (expected seed, ext, model, or flatten)"
+        )
+        return
+    if not data_input and model_init_requested != "flatten":
         _job.set_error("missing 'data_input'")
         return
 
@@ -500,7 +518,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
             results_tmp = tempfile.mkdtemp(prefix="fit_results_")
             output_dir = results_tmp
 
-        # model_output goes into temp dir
+        # model_output goes into temp dir. Flatten forces --copy-model during
+        # export so the resulting tifxyz remains self-contained after cleanup.
         if not model_output:
             model_output = str(Path(tmp_dir) / "model_reopt.pt")
 
@@ -509,13 +528,13 @@ def _run_optimization(body: dict[str, Any]) -> None:
         args_section_pre = cfg.get("args", {})
         if not isinstance(args_section_pre, dict):
             args_section_pre = {}
-        model_init = str(args_section_pre.get("model-init", args_section_pre.get("model_init", "seed"))).strip().lower()
-        if model_init not in {"seed", "ext", "model"}:
-            raise ValueError(f"invalid args.model-init '{model_init}' (expected seed, ext, or model)")
+        model_init = model_init_requested
         args_section_pre.pop("model_init", None)
         args_section_pre["model-init"] = model_init
         cfg["args"] = args_section_pre
         ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
+        if model_init == "flatten" and ext_offset_enabled:
+            raise ValueError("model-init=flatten does not support ext_offset")
         model_input = _decode_model_for_request(
             body=body,
             tmp_dir=tmp_dir,
@@ -544,8 +563,9 @@ def _run_optimization(body: dict[str, Any]) -> None:
             cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
 
         args_section = dict(cfg.get("args", {}))
-        args_section["input"] = str(data_input)
-        args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
+        if model_init != "flatten":
+            args_section["input"] = str(data_input)
+            args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
         args_section["model-output"] = str(model_output)
@@ -641,7 +661,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 export_argv = ["--input", str(model_output), "--output", str(output_dir)]
                 if body.get("single_segment"):
                     export_argv.append("--single-segment")
-                if body.get("copy_model"):
+                if body.get("copy_model") or model_init == "flatten":
                     export_argv.append("--copy-model")
                 output_name = body.get("output_name")
                 if output_name:

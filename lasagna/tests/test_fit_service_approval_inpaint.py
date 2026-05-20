@@ -111,6 +111,38 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					ext_offset_enabled=False,
 				)
 
+	def test_flatten_wires_generic_tifxyz_as_external_surface(self) -> None:
+		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
+		cfg = {"args": {"model-init": "flatten"}}
+
+		with tempfile.TemporaryDirectory() as td:
+			tifxyz_dir = fit_service._decode_tifxyz_for_request(
+				body=body,
+				cfg=cfg,
+				args_section=cfg["args"],
+				tmp_dir=td,
+				model_init="flatten",
+				ext_offset_enabled=False,
+			)
+
+			self.assertIsNotNone(tifxyz_dir)
+			self.assertEqual(cfg["external_surfaces"], [{"path": tifxyz_dir}])
+			self.assertNotIn("tifxyz-init", cfg["args"])
+
+	def test_flatten_requires_generic_tifxyz_or_external_surface(self) -> None:
+		cfg = {"args": {"model-init": "flatten"}}
+
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "model-init=flatten requires request tifxyz"):
+				fit_service._decode_tifxyz_for_request(
+					body={},
+					cfg=cfg,
+					args_section=cfg["args"],
+					tmp_dir=td,
+					model_init="flatten",
+					ext_offset_enabled=False,
+				)
+
 	def test_ext_offset_requires_generic_tifxyz(self) -> None:
 		cfg = {"args": {"model-init": "seed"}}
 
