@@ -2971,6 +2971,7 @@ void CChunkedVolumeViewer::onPointSelected(uint64_t pointId)
 
 void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.setEnabled(enabled);
     if (!enabled) {
         clearSameWrapAnnotationPreview();
@@ -3007,6 +3008,7 @@ void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
     } else if (pathType == static_cast<int>(SameWrapAnnotationTool::PathType::Manual)) {
         toolPathType = SameWrapAnnotationTool::PathType::Manual;
     }
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.setPathType(toolPathType);
     clearSameWrapAnnotationPreview();
 }
@@ -3036,6 +3038,7 @@ bool CChunkedVolumeViewer::hasSameWrapAnnotationPreview() const
 
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
 }
 
@@ -3127,7 +3130,7 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
         if (_sameWrapAnnotation.manualPathType()) {
             const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
                                          !_sameWrapAnnotation.shiftReleasedSincePreview();
-            _sameWrapAnnotation.beginManualPreview(
+            _sameWrapManualPathDragActive = _sameWrapAnnotation.beginManualPreview(
                 scenePos,
                 appendToPreview,
                 [this](const QPointF& point) { return sceneToVolume(point); },
@@ -3175,8 +3178,7 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
         emit overlaysUpdated();
     }
 
-    if (_sameWrapAnnotation.enabled() && _sameWrapAnnotation.manualPathType() &&
-        (buttons & Qt::LeftButton) && modifiers.testFlag(Qt::ShiftModifier)) {
+    if (_sameWrapManualPathDragActive && (buttons & Qt::LeftButton)) {
         _sameWrapAnnotation.appendManualPreview(
             scenePos,
             _scale,
@@ -3214,8 +3216,7 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
         _sameWrapManualMergePressConsumed = false;
         return;
     }
-    if (_sameWrapAnnotation.enabled() && _sameWrapAnnotation.manualPathType() &&
-        button == Qt::LeftButton && modifiers.testFlag(Qt::ShiftModifier)) {
+    if (_sameWrapManualPathDragActive && button == Qt::LeftButton) {
         _sameWrapAnnotation.appendManualPreview(
             scenePos,
             _scale,
@@ -3226,6 +3227,7 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
                 setOverlayGroup(key, items);
             },
             [this](const std::string& key) { clearOverlayGroup(key); });
+        _sameWrapManualPathDragActive = false;
         return;
     }
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&

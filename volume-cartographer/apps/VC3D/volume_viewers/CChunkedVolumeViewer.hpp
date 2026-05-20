@@ -475,6 +475,7 @@ private:
     SameWrapAnnotationTool _sameWrapAnnotation;
     double _sameWrapAnnotationPolylineOpacity = 0.75;
     bool _sameWrapManualMergePressConsumed = false;
+    bool _sameWrapManualPathDragActive = false;
 
     bool _bboxMode = false;
     QPointF _bboxStart;
