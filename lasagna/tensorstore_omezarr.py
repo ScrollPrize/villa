@@ -122,10 +122,10 @@ def _read_array(store, z0: int, z1: int, y0: int, y1: int, x0: int, x1: int) -> 
 	return np.asarray(store[z0:z1, y0:y1, x0:x1].read().result())
 
 
-def _write_array(store, z0: int, y0: int, x0: int, data: np.ndarray, *, fill_value=0) -> None:
+def _write_array(store, z0: int, y0: int, x0: int, data: np.ndarray, *, fill_value=0, skip_zero: bool = True) -> None:
 	if data.size == 0:
 		return
-	if fill_value == 0 and not np.any(data):
+	if skip_zero and fill_value == 0 and not np.any(data):
 		return
 	z1 = int(z0) + int(data.shape[0])
 	y1 = int(y0) + int(data.shape[1])
@@ -181,6 +181,50 @@ def _z_shards(
 	return shards
 
 
+def _job_shards(
+	jobs: list[tuple[int, int, int, int, int, int]],
+	workers: int,
+) -> list[dict]:
+	if not jobs:
+		return []
+	jobs = sorted(jobs)
+	n_shards = min(max(1, int(workers)), len(jobs))
+	shards: list[dict] = []
+	for si in range(n_shards):
+		i0 = (si * len(jobs)) // n_shards
+		i1 = ((si + 1) * len(jobs)) // n_shards
+		if i0 >= i1:
+			continue
+		shards.append({
+			"jobs": jobs[i0:i1],
+			"job_count": int(i1 - i0),
+		})
+	return shards
+
+
+def _affected_downsample_jobs(
+	changed_parent_jobs: list[tuple[int, int, int, int, int, int]],
+	dst_shape: tuple[int, int, int],
+	dst_chunk: tuple[int, int, int],
+) -> list[tuple[int, int, int, int, int, int]]:
+	if not changed_parent_jobs:
+		return []
+	dz, dy, dx = (int(v) for v in dst_shape)
+	cz, cy, cx = (int(v) for v in dst_chunk)
+	out: set[tuple[int, int, int, int, int, int]] = set()
+	for pz0, pz1, py0, py1, px0, px1 in changed_parent_jobs:
+		if pz0 >= pz1 or py0 >= py1 or px0 >= px1:
+			continue
+		z0, z1 = int(pz0) // 2, (int(pz1) + 1) // 2
+		y0, y1 = int(py0) // 2, (int(py1) + 1) // 2
+		x0, x1 = int(px0) // 2, (int(px1) + 1) // 2
+		for zz in range((z0 // cz) * cz, min(dz, z1), cz):
+			for yy in range((y0 // cy) * cy, min(dy, y1), cy):
+				for xx in range((x0 // cx) * cx, min(dx, x1), cx):
+					out.add((zz, min(dz, zz + cz), yy, min(dy, yy + cy), xx, min(dx, xx + cx)))
+	return sorted(out)
+
+
 def _cfg_for_worker(cfg_values: dict) -> TensorStoreConfig:
 	return TensorStoreConfig(
 		cache_pool_bytes=int(cfg_values["cache_pool_bytes"]),
@@ -193,6 +237,11 @@ def _cfg_for_worker(cfg_values: dict) -> TensorStoreConfig:
 def _progress_emit(progress_q, n: int) -> None:
 	if n > 0:
 		progress_q.put(("progress", int(n)))
+
+
+def _changed_emit(progress_q, jobs: list[tuple[int, int, int, int, int, int]]) -> None:
+	if jobs:
+		progress_q.put(("changed", [tuple(int(v) for v in job) for job in jobs]))
 
 
 def _process_copy_shard(payload: dict, cfg_values: dict, progress_q) -> None:
@@ -211,6 +260,66 @@ def _process_copy_shard(payload: dict, cfg_values: dict, progress_q) -> None:
 			_progress_emit(progress_q, pending)
 			pending = 0
 	_progress_emit(progress_q, pending)
+
+
+def _process_copy_changed_shard(payload: dict, cfg_values: dict, progress_q) -> None:
+	cfg = _cfg_for_worker(cfg_values)
+	ctx = tensorstore_context(cfg)
+	src_store = open_tensorstore(payload["src_path"], ctx, read=True, write=False)
+	dst_store = open_tensorstore(payload["dst_path"], ctx, read=True, write=True)
+	meta = level_meta(payload["dst_path"])
+	pending = 0
+	changed: list[tuple[int, int, int, int, int, int]] = []
+	for job in _chunk_jobs_for_z_range(meta.shape, meta.chunks, payload["z0"], payload["z1"]):
+		z0, z1, y0, y1, x0, x1 = job
+		data = _read_array(src_store, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		old = _read_array(dst_store, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		if data.shape != old.shape or not np.array_equal(data, old):
+			_write_array(dst_store, z0, y0, x0, data, fill_value=meta.fill_value, skip_zero=False)
+			changed.append(job)
+		pending += 1
+		if pending >= 16:
+			_progress_emit(progress_q, pending)
+			_changed_emit(progress_q, changed)
+			pending = 0
+			changed = []
+	_progress_emit(progress_q, pending)
+	_changed_emit(progress_q, changed)
+
+
+def _process_normal_copy_changed_shard(payload: dict, cfg_values: dict, progress_q) -> None:
+	cfg = _cfg_for_worker(cfg_values)
+	ctx = tensorstore_context(cfg)
+	nx_src = open_tensorstore(payload["nx_src_path"], ctx, read=True, write=False)
+	ny_src = open_tensorstore(payload["ny_src_path"], ctx, read=True, write=False)
+	nx_dst = open_tensorstore(payload["nx_dst_path"], ctx, read=True, write=True)
+	ny_dst = open_tensorstore(payload["ny_dst_path"], ctx, read=True, write=True)
+	meta = level_meta(payload["nx_dst_path"])
+	pending = 0
+	changed: list[tuple[int, int, int, int, int, int]] = []
+	for job in _chunk_jobs_for_z_range(meta.shape, meta.chunks, payload["z0"], payload["z1"]):
+		z0, z1, y0, y1, x0, x1 = job
+		nx_data = _read_array(nx_src, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		ny_data = _read_array(ny_src, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		nx_old = _read_array(nx_dst, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		ny_old = _read_array(ny_dst, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		if (
+			nx_data.shape != nx_old.shape
+			or ny_data.shape != ny_old.shape
+			or not np.array_equal(nx_data, nx_old)
+			or not np.array_equal(ny_data, ny_old)
+		):
+			_write_array(nx_dst, z0, y0, x0, nx_data, fill_value=meta.fill_value, skip_zero=False)
+			_write_array(ny_dst, z0, y0, x0, ny_data, fill_value=meta.fill_value, skip_zero=False)
+			changed.append(job)
+		pending += 1
+		if pending >= 16:
+			_progress_emit(progress_q, pending)
+			_changed_emit(progress_q, changed)
+			pending = 0
+			changed = []
+	_progress_emit(progress_q, pending)
+	_changed_emit(progress_q, changed)
 
 
 def _process_scalar_scale_shard(payload: dict, cfg_values: dict, progress_q) -> None:
@@ -236,6 +345,38 @@ def _process_scalar_scale_shard(payload: dict, cfg_values: dict, progress_q) -> 
 			_progress_emit(progress_q, pending)
 			pending = 0
 	_progress_emit(progress_q, pending)
+
+
+def _process_scalar_scale_changed_shard(payload: dict, cfg_values: dict, progress_q) -> None:
+	cfg = _cfg_for_worker(cfg_values)
+	ctx = tensorstore_context(cfg)
+	src_store = open_tensorstore(payload["src_path"], ctx, read=True, write=False)
+	dst_store = open_tensorstore(payload["dst_path"], ctx, read=True, write=True)
+	src_meta = level_meta(payload["src_path"])
+	dst_meta = level_meta(payload["dst_path"])
+	zero_overrides = bool(payload["zero_overrides"])
+	pending = 0
+	changed: list[tuple[int, int, int, int, int, int]] = []
+	for job in payload["jobs"]:
+		z0, z1, y0, y1, x0, x1 = (int(v) for v in job)
+		sz0, sy0, sx0 = z0 * 2, y0 * 2, x0 * 2
+		sz1 = min(src_meta.shape[0], z1 * 2)
+		sy1 = min(src_meta.shape[1], y1 * 2)
+		sx1 = min(src_meta.shape[2], x1 * 2)
+		slab = _read_array(src_store, sz0, sz1, sy0, sy1, sx0, sx1).astype(np.uint8, copy=False)
+		down = _mean_pool2x_u8(slab, zero_overrides=zero_overrides)
+		old = _read_array(dst_store, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		if down.shape != old.shape or not np.array_equal(down, old):
+			_write_array(dst_store, z0, y0, x0, down, fill_value=dst_meta.fill_value, skip_zero=False)
+			changed.append((z0, z1, y0, y1, x0, x1))
+		pending += 1
+		if pending >= 16:
+			_progress_emit(progress_q, pending)
+			_changed_emit(progress_q, changed)
+			pending = 0
+			changed = []
+	_progress_emit(progress_q, pending)
+	_changed_emit(progress_q, changed)
 
 
 def _process_normal_scale_shard(payload: dict, cfg_values: dict, progress_q) -> None:
@@ -266,14 +407,63 @@ def _process_normal_scale_shard(payload: dict, cfg_values: dict, progress_q) -> 
 	_progress_emit(progress_q, pending)
 
 
+def _process_normal_scale_changed_shard(payload: dict, cfg_values: dict, progress_q) -> None:
+	cfg = _cfg_for_worker(cfg_values)
+	ctx = tensorstore_context(cfg)
+	nx_src = open_tensorstore(payload["nx_src_path"], ctx, read=True, write=False)
+	ny_src = open_tensorstore(payload["ny_src_path"], ctx, read=True, write=False)
+	nx_dst = open_tensorstore(payload["nx_dst_path"], ctx, read=True, write=True)
+	ny_dst = open_tensorstore(payload["ny_dst_path"], ctx, read=True, write=True)
+	src_meta = level_meta(payload["nx_src_path"])
+	dst_meta = level_meta(payload["nx_dst_path"])
+	pending = 0
+	changed: list[tuple[int, int, int, int, int, int]] = []
+	for job in payload["jobs"]:
+		z0, z1, y0, y1, x0, x1 = (int(v) for v in job)
+		sz0, sy0, sx0 = z0 * 2, y0 * 2, x0 * 2
+		sz1 = min(src_meta.shape[0], z1 * 2)
+		sy1 = min(src_meta.shape[1], y1 * 2)
+		sx1 = min(src_meta.shape[2], x1 * 2)
+		nx_slab = _read_array(nx_src, sz0, sz1, sy0, sy1, sx0, sx1).astype(np.uint8, copy=False)
+		ny_slab = _read_array(ny_src, sz0, sz1, sy0, sy1, sx0, sx1).astype(np.uint8, copy=False)
+		nx_down, ny_down = _moment_pool2x_normals(nx_slab, ny_slab)
+		nx_old = _read_array(nx_dst, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		ny_old = _read_array(ny_dst, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
+		if (
+			nx_down.shape != nx_old.shape
+			or ny_down.shape != ny_old.shape
+			or not np.array_equal(nx_down, nx_old)
+			or not np.array_equal(ny_down, ny_old)
+		):
+			_write_array(nx_dst, z0, y0, x0, nx_down, fill_value=dst_meta.fill_value, skip_zero=False)
+			_write_array(ny_dst, z0, y0, x0, ny_down, fill_value=dst_meta.fill_value, skip_zero=False)
+			changed.append((z0, z1, y0, y1, x0, x1))
+		pending += 1
+		if pending >= 16:
+			_progress_emit(progress_q, pending)
+			_changed_emit(progress_q, changed)
+			pending = 0
+			changed = []
+	_progress_emit(progress_q, pending)
+	_changed_emit(progress_q, changed)
+
+
 def _process_entry(kind: str, payload: dict, cfg_values: dict, progress_q) -> None:
 	try:
 		if kind == "copy":
 			_process_copy_shard(payload, cfg_values, progress_q)
+		elif kind == "copy_changed":
+			_process_copy_changed_shard(payload, cfg_values, progress_q)
+		elif kind == "normal_copy_changed":
+			_process_normal_copy_changed_shard(payload, cfg_values, progress_q)
 		elif kind == "scalar_scale":
 			_process_scalar_scale_shard(payload, cfg_values, progress_q)
+		elif kind == "scalar_scale_changed":
+			_process_scalar_scale_changed_shard(payload, cfg_values, progress_q)
 		elif kind == "normal_scale":
 			_process_normal_scale_shard(payload, cfg_values, progress_q)
+		elif kind == "normal_scale_changed":
+			_process_normal_scale_changed_shard(payload, cfg_values, progress_q)
 		else:
 			raise ValueError(f"unknown shard kind: {kind}")
 	except BaseException as exc:
@@ -281,40 +471,18 @@ def _process_entry(kind: str, payload: dict, cfg_values: dict, progress_q) -> No
 		raise
 
 
-def _run_process_shards(
+def _monitor_processes(
 	*,
-	kind: str,
-	base_payload: dict,
-	shape: tuple[int, int, int],
-	chunk: tuple[int, int, int],
-	cfg: TensorStoreConfig,
+	procs: list[multiprocessing.Process],
+	progress_q,
+	total: int,
 	tag: str,
-) -> None:
-	shards = _z_shards(shape, chunk, cfg.worker_count())
-	total = sum(int(s["jobs"]) for s in shards)
-	if total == 0:
-		return
-
-	n_procs = len(shards)
-	per_proc_cache = max(64 << 20, int(cfg.cache_pool_bytes) // max(1, n_procs))
-	cfg_values = {
-		"cache_pool_bytes": per_proc_cache,
-		"file_io_threads": int(cfg.file_io_threads),
-		"data_copy_threads": int(cfg.data_copy_threads),
-	}
-	mp_ctx = multiprocessing.get_context("spawn")
-	progress_q = mp_ctx.Queue()
-	procs: list[multiprocessing.Process] = []
-	for shard in shards:
-		payload = dict(base_payload)
-		payload.update(shard)
-		proc = mp_ctx.Process(target=_process_entry, args=(kind, payload, cfg_values, progress_q))
-		proc.start()
-		procs.append(proc)
-
+	collect_changed: bool,
+) -> list[tuple[int, int, int, int, int, int]]:
 	t0 = time.time()
 	done = 0
 	last_print_done = -1
+	changed_jobs: list[tuple[int, int, int, int, int, int]] = []
 	try:
 		while procs:
 			try:
@@ -329,6 +497,9 @@ def _run_process_shards(
 					if done < total:
 						print_progress(prefix=tag, done=done, total=total, t0=t0)
 						last_print_done = done
+				elif msg == "changed":
+					if collect_changed:
+						changed_jobs.extend(tuple(int(v) for v in job) for job in value)
 				elif msg == "error":
 					raise RuntimeError(str(value))
 			alive: list[multiprocessing.Process] = []
@@ -347,6 +518,9 @@ def _run_process_shards(
 				break
 			if msg == "progress":
 				done += int(value)
+			elif msg == "changed":
+				if collect_changed:
+					changed_jobs.extend(tuple(int(v) for v in job) for job in value)
 			elif msg == "error":
 				raise RuntimeError(str(value))
 	finally:
@@ -357,6 +531,86 @@ def _run_process_shards(
 			proc.join(timeout=5)
 	print_progress(prefix=tag, done=total, total=total, t0=t0)
 	print("", flush=True)
+	return changed_jobs
+
+
+def _run_process_shards(
+	*,
+	kind: str,
+	base_payload: dict,
+	shape: tuple[int, int, int],
+	chunk: tuple[int, int, int],
+	cfg: TensorStoreConfig,
+	tag: str,
+	collect_changed: bool = False,
+) -> list[tuple[int, int, int, int, int, int]]:
+	shards = _z_shards(shape, chunk, cfg.worker_count())
+	total = sum(int(s["jobs"]) for s in shards)
+	if total == 0:
+		return []
+
+	n_procs = len(shards)
+	per_proc_cache = max(64 << 20, int(cfg.cache_pool_bytes) // max(1, n_procs))
+	cfg_values = {
+		"cache_pool_bytes": per_proc_cache,
+		"file_io_threads": int(cfg.file_io_threads),
+		"data_copy_threads": int(cfg.data_copy_threads),
+	}
+	mp_ctx = multiprocessing.get_context("spawn")
+	progress_q = mp_ctx.Queue()
+	procs: list[multiprocessing.Process] = []
+	for shard in shards:
+		payload = dict(base_payload)
+		payload.update(shard)
+		proc = mp_ctx.Process(target=_process_entry, args=(kind, payload, cfg_values, progress_q))
+		proc.start()
+		procs.append(proc)
+	return _monitor_processes(
+		procs=procs,
+		progress_q=progress_q,
+		total=total,
+		tag=tag,
+		collect_changed=collect_changed,
+	)
+
+
+def _run_job_shards(
+	*,
+	kind: str,
+	base_payload: dict,
+	jobs: list[tuple[int, int, int, int, int, int]],
+	cfg: TensorStoreConfig,
+	tag: str,
+	collect_changed: bool,
+) -> list[tuple[int, int, int, int, int, int]]:
+	shards = _job_shards(jobs, cfg.worker_count())
+	total = sum(int(s["job_count"]) for s in shards)
+	if total == 0:
+		return []
+
+	n_procs = len(shards)
+	per_proc_cache = max(64 << 20, int(cfg.cache_pool_bytes) // max(1, n_procs))
+	cfg_values = {
+		"cache_pool_bytes": per_proc_cache,
+		"file_io_threads": int(cfg.file_io_threads),
+		"data_copy_threads": int(cfg.data_copy_threads),
+	}
+	mp_ctx = multiprocessing.get_context("spawn")
+	progress_q = mp_ctx.Queue()
+	procs: list[multiprocessing.Process] = []
+	for shard in shards:
+		payload = dict(base_payload)
+		payload["jobs"] = shard["jobs"]
+		proc = mp_ctx.Process(target=_process_entry, args=(kind, payload, cfg_values, progress_q))
+		proc.start()
+		procs.append(proc)
+	return _monitor_processes(
+		procs=procs,
+		progress_q=progress_q,
+		total=total,
+		tag=tag,
+		collect_changed=collect_changed,
+	)
 
 
 def _read_json(path: Path, default):
@@ -512,6 +766,58 @@ def create_omezarr_like(
 	)
 
 
+def _validate_existing_omezarr_like(
+	*,
+	src_root: str | Path,
+	dst_root: str | Path,
+	data_level: int,
+	n_levels: int,
+	chunk: tuple[int, int, int],
+	label: str,
+) -> None:
+	src_root = Path(src_root)
+	dst_root = Path(dst_root)
+	if not dst_root.is_dir():
+		raise FileNotFoundError(f"--overwrite-changed requires an existing output OME-Zarr: {dst_root}")
+	src_meta0 = level_meta(src_root / str(data_level))
+	if src_meta0.dtype != np.dtype("uint8"):
+		raise ValueError(f"only uint8 OME-Zarr arrays are supported, got dtype={src_meta0.dtype}")
+	for lv in range(int(data_level), int(n_levels)):
+		dst_level = dst_root / str(lv)
+		if not (dst_level / ".zarray").is_file():
+			raise FileNotFoundError(f"existing output is missing level {lv}: {dst_level}")
+		expect_shape = shape_div2(src_meta0.shape, lv - int(data_level))
+		expect_chunk = tuple(min(expect_shape[i], chunk[i]) for i in range(3))
+		dst_meta = level_meta(dst_level)
+		if dst_meta.shape != expect_shape:
+			raise ValueError(f"{label} level {lv} shape mismatch: expected {expect_shape}, got {dst_meta.shape}")
+		if dst_meta.chunks != expect_chunk:
+			raise ValueError(f"{label} level {lv} chunk mismatch: expected {expect_chunk}, got {dst_meta.chunks}")
+		if dst_meta.dtype != src_meta0.dtype:
+			raise ValueError(f"{label} level {lv} dtype mismatch: expected {src_meta0.dtype}, got {dst_meta.dtype}")
+	_update_multiscales(
+		dst_root,
+		data_level=data_level,
+		n_levels=n_levels,
+		source_attrs=_read_attrs(src_root),
+		name=label,
+	)
+
+
+def _validate_incremental_chunking(*, src_root: str | Path, data_level: int, chunk: tuple[int, int, int]) -> None:
+	src_chunk = level_meta(Path(src_root) / str(data_level)).chunks
+	if any(chunk[i] > src_chunk[i] for i in range(3)):
+		raise ValueError(
+			"--overwrite-changed requires output chunks no larger than input chunks; "
+			f"input chunks={src_chunk} requested chunks={chunk}"
+		)
+	if all(chunk[i] == src_chunk[i] for i in range(3)):
+		raise ValueError(
+			"--overwrite-changed is intended for smaller output chunks; "
+			f"input chunks={src_chunk} requested chunks={chunk}"
+		)
+
+
 def copy_data_level(
 	*,
 	src_root: str | Path,
@@ -533,6 +839,32 @@ def copy_data_level(
 		cfg=cfg,
 		tag=f"[rechunk {label} L{data_level}]",
 	)
+
+
+def copy_data_level_changed(
+	*,
+	src_root: str | Path,
+	dst_root: str | Path,
+	data_level: int,
+	cfg: TensorStoreConfig,
+	label: str,
+) -> list[tuple[int, int, int, int, int, int]]:
+	dst_path = Path(dst_root) / str(data_level)
+	meta = level_meta(dst_path)
+	changed = _run_process_shards(
+		kind="copy_changed",
+		base_payload={
+			"src_path": str(Path(src_root) / str(data_level)),
+			"dst_path": str(dst_path),
+		},
+		shape=meta.shape,
+		chunk=meta.chunks,
+		cfg=cfg,
+		tag=f"[rechunk changed {label} L{data_level}]",
+		collect_changed=True,
+	)
+	print(f"[rechunk changed {label} L{data_level}] changed_chunks={len(changed)}")
+	return changed
 
 
 def rebuild_scalar_scales(
@@ -564,6 +896,42 @@ def rebuild_scalar_scales(
 			cfg=cfg,
 			tag=f"[scale {label} L{lv}]",
 		)
+	_set_downsample_method(root, "mean_pool2x_zero_overrides" if zero_overrides else "mean_pool2x")
+
+
+def rebuild_scalar_scales_changed(
+	*,
+	root: str | Path,
+	data_level: int,
+	n_levels: int,
+	cfg: TensorStoreConfig,
+	label: str,
+	zero_overrides: bool,
+	changed_parent_jobs: list[tuple[int, int, int, int, int, int]],
+) -> None:
+	root = Path(root)
+	parent_changed = changed_parent_jobs
+	for lv in range(int(data_level) + 1, int(n_levels)):
+		if not parent_changed:
+			print(f"[scale changed {label} L{lv}] changed_chunks=0")
+			break
+		src_path = root / str(lv - 1)
+		dst_path = root / str(lv)
+		dst_meta = level_meta(dst_path)
+		jobs = _affected_downsample_jobs(parent_changed, dst_meta.shape, dst_meta.chunks)
+		parent_changed = _run_job_shards(
+			kind="scalar_scale_changed",
+			base_payload={
+				"src_path": str(src_path),
+				"dst_path": str(dst_path),
+				"zero_overrides": bool(zero_overrides),
+			},
+			jobs=jobs,
+			cfg=cfg,
+			tag=f"[scale changed {label} L{lv}]",
+			collect_changed=True,
+		)
+		print(f"[scale changed {label} L{lv}] checked_chunks={len(jobs)} changed_chunks={len(parent_changed)}")
 	_set_downsample_method(root, "mean_pool2x_zero_overrides" if zero_overrides else "mean_pool2x")
 
 
@@ -609,6 +977,75 @@ def rebuild_normal_scales(
 	_set_downsample_method(ny_root, "normal_second_moment_mean_pool2x")
 
 
+def copy_normal_data_level_changed(
+	*,
+	nx_src: str | Path,
+	ny_src: str | Path,
+	nx_dst: str | Path,
+	ny_dst: str | Path,
+	data_level: int,
+	cfg: TensorStoreConfig,
+) -> list[tuple[int, int, int, int, int, int]]:
+	dst_path = Path(nx_dst) / str(data_level)
+	meta = level_meta(dst_path)
+	changed = _run_process_shards(
+		kind="normal_copy_changed",
+		base_payload={
+			"nx_src_path": str(Path(nx_src) / str(data_level)),
+			"ny_src_path": str(Path(ny_src) / str(data_level)),
+			"nx_dst_path": str(Path(nx_dst) / str(data_level)),
+			"ny_dst_path": str(Path(ny_dst) / str(data_level)),
+		},
+		shape=meta.shape,
+		chunk=meta.chunks,
+		cfg=cfg,
+		tag=f"[rechunk changed normal L{data_level}]",
+		collect_changed=True,
+	)
+	print(f"[rechunk changed normal L{data_level}] changed_chunks={len(changed)}")
+	return changed
+
+
+def rebuild_normal_scales_changed(
+	*,
+	nx_root: str | Path,
+	ny_root: str | Path,
+	data_level: int,
+	n_levels: int,
+	cfg: TensorStoreConfig,
+	changed_parent_jobs: list[tuple[int, int, int, int, int, int]],
+) -> None:
+	nx_root = Path(nx_root)
+	ny_root = Path(ny_root)
+	parent_changed = changed_parent_jobs
+	for lv in range(int(data_level) + 1, int(n_levels)):
+		if not parent_changed:
+			print(f"[scale changed normal L{lv}] changed_chunks=0")
+			break
+		nx_src_path = nx_root / str(lv - 1)
+		ny_src_path = ny_root / str(lv - 1)
+		nx_dst_path = nx_root / str(lv)
+		ny_dst_path = ny_root / str(lv)
+		dst_meta = level_meta(nx_dst_path)
+		jobs = _affected_downsample_jobs(parent_changed, dst_meta.shape, dst_meta.chunks)
+		parent_changed = _run_job_shards(
+			kind="normal_scale_changed",
+			base_payload={
+				"nx_src_path": str(nx_src_path),
+				"ny_src_path": str(ny_src_path),
+				"nx_dst_path": str(nx_dst_path),
+				"ny_dst_path": str(ny_dst_path),
+			},
+			jobs=jobs,
+			cfg=cfg,
+			tag=f"[scale changed normal L{lv}]",
+			collect_changed=True,
+		)
+		print(f"[scale changed normal L{lv}] checked_chunks={len(jobs)} changed_chunks={len(parent_changed)}")
+	_set_downsample_method(nx_root, "normal_second_moment_mean_pool2x")
+	_set_downsample_method(ny_root, "normal_second_moment_mean_pool2x")
+
+
 def rechunk_scalar_out_of_place(
 	*,
 	src_root: str | Path,
@@ -641,6 +1078,46 @@ def rechunk_scalar_out_of_place(
 		label=label,
 		zero_overrides=zero_overrides,
 		clear_existing=False,
+	)
+
+
+def rechunk_scalar_out_of_place_changed(
+	*,
+	src_root: str | Path,
+	dst_root: str | Path,
+	chunk: tuple[int, int, int],
+	data_level: int,
+	n_levels: int | None,
+	cfg: TensorStoreConfig,
+	zero_overrides: bool,
+	label: str,
+) -> None:
+	if n_levels is None:
+		n_levels = infer_n_levels(src_root)
+	_validate_incremental_chunking(src_root=src_root, data_level=data_level, chunk=chunk)
+	_validate_existing_omezarr_like(
+		src_root=src_root,
+		dst_root=dst_root,
+		data_level=data_level,
+		n_levels=n_levels,
+		chunk=chunk,
+		label=label,
+	)
+	changed = copy_data_level_changed(
+		src_root=src_root,
+		dst_root=dst_root,
+		data_level=data_level,
+		cfg=cfg,
+		label=label,
+	)
+	rebuild_scalar_scales_changed(
+		root=dst_root,
+		data_level=data_level,
+		n_levels=n_levels,
+		cfg=cfg,
+		label=label,
+		zero_overrides=zero_overrides,
+		changed_parent_jobs=changed,
 	)
 
 
@@ -687,6 +1164,57 @@ def rechunk_normal_pair_out_of_place(
 		n_levels=n_levels,
 		cfg=cfg,
 		clear_existing=False,
+	)
+
+
+def rechunk_normal_pair_out_of_place_changed(
+	*,
+	nx_src: str | Path,
+	ny_src: str | Path,
+	nx_dst: str | Path,
+	ny_dst: str | Path,
+	chunk: tuple[int, int, int],
+	data_level: int,
+	n_levels: int | None,
+	cfg: TensorStoreConfig,
+) -> None:
+	if n_levels is None:
+		n_levels = max(infer_n_levels(nx_src), infer_n_levels(ny_src))
+	if level_meta(Path(nx_src) / str(data_level)).shape != level_meta(Path(ny_src) / str(data_level)).shape:
+		raise ValueError("normal data-level shape mismatch")
+	_validate_incremental_chunking(src_root=nx_src, data_level=data_level, chunk=chunk)
+	_validate_incremental_chunking(src_root=ny_src, data_level=data_level, chunk=chunk)
+	_validate_existing_omezarr_like(
+		src_root=nx_src,
+		dst_root=nx_dst,
+		data_level=data_level,
+		n_levels=n_levels,
+		chunk=chunk,
+		label="nx",
+	)
+	_validate_existing_omezarr_like(
+		src_root=ny_src,
+		dst_root=ny_dst,
+		data_level=data_level,
+		n_levels=n_levels,
+		chunk=chunk,
+		label="ny",
+	)
+	changed = copy_normal_data_level_changed(
+		nx_src=nx_src,
+		ny_src=ny_src,
+		nx_dst=nx_dst,
+		ny_dst=ny_dst,
+		data_level=data_level,
+		cfg=cfg,
+	)
+	rebuild_normal_scales_changed(
+		nx_root=nx_dst,
+		ny_root=ny_dst,
+		data_level=data_level,
+		n_levels=n_levels,
+		cfg=cfg,
+		changed_parent_jobs=changed,
 	)
 
 
