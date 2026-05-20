@@ -2974,6 +2974,7 @@ void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
     if (!enabled) {
         clearSameWrapAnnotationPreview();
     }
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
@@ -2984,6 +2985,12 @@ void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
 void CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance(double toleranceVx)
 {
     _sameWrapAnnotation.setMergeTolerance(toleranceVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity(double opacity)
+{
+    _sameWrapAnnotationPolylineOpacity = std::clamp(opacity, 0.0, 1.0);
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)

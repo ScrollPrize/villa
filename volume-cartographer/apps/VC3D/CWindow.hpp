@@ -21,6 +21,7 @@
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
+#include "WrapAnnotationWidget.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -186,6 +187,7 @@ private:
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
     CPointCollectionWidget* _point_collection_widget;
+    WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
     std::unique_ptr<FiberAnnotationController> _fiberController;
 

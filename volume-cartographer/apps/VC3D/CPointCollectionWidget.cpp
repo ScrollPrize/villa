@@ -153,94 +153,6 @@ void CPointCollectionWidget::setupUi()
                 emit pointViewToleranceChanged(value);
             });
 
-    QGroupBox *same_wrap_group = new QGroupBox("Same-wrap Annotation");
-    QVBoxLayout *same_wrap_layout = new QVBoxLayout(same_wrap_group);
-    _chkSameWrapAnnotation = new QCheckBox("Same-wrap annotation mode", same_wrap_group);
-    _chkSameWrapAnnotation->setToolTip("Shift-click or Shift-drag in an active volume viewer to preview same-wrap annotation points. Shift+E commits; Ctrl+Z clears the preview or undoes the last committed collection.");
-    same_wrap_layout->addWidget(_chkSameWrapAnnotation);
-    _chkSameWrapMerge = new QCheckBox("Manual same-wrap merge", same_wrap_group);
-    _chkSameWrapMerge->setToolTip("Shift-right-click a point in one same-wrap collection, then Shift-right-click a point in another same-wrap collection to merge them.");
-    same_wrap_layout->addWidget(_chkSameWrapMerge);
-    QHBoxLayout *same_wrap_path_type_layout = new QHBoxLayout();
-    same_wrap_path_type_layout->addWidget(new QLabel("Path type:"));
-    _sameWrapPathTypeCombo = new QComboBox(same_wrap_group);
-    _sameWrapPathTypeCombo->addItem("Connected components", 0);
-    _sameWrapPathTypeCombo->addItem("Shortest path", 1);
-    _sameWrapPathTypeCombo->addItem("Manual", 2);
-    _sameWrapPathTypeCombo->setToolTip("Choose whether Shift input selects a skeleton component, two shortest-path endpoints, or a manually drawn path.");
-    same_wrap_path_type_layout->addWidget(_sameWrapPathTypeCombo);
-    same_wrap_path_type_layout->addStretch();
-    same_wrap_layout->addLayout(same_wrap_path_type_layout);
-    QHBoxLayout *same_wrap_filter_layout = new QHBoxLayout();
-    same_wrap_filter_layout->addWidget(new QLabel("Filter:"));
-    _sameWrapFilterTypeCombo = new QComboBox(same_wrap_group);
-    _sameWrapFilterTypeCombo->addItem("None", 0);
-    _sameWrapFilterTypeCombo->addItem("Median", 1);
-    _sameWrapFilterTypeCombo->addItem("Gaussian", 2);
-    _sameWrapFilterTypeCombo->setToolTip("Optionally filter the source image before thresholding and skeleton tracing.");
-    same_wrap_filter_layout->addWidget(_sameWrapFilterTypeCombo);
-    same_wrap_filter_layout->addWidget(new QLabel("Kernel:"));
-    _sameWrapFilterKernelSpinbox = new QSpinBox(same_wrap_group);
-    _sameWrapFilterKernelSpinbox->setRange(3, 99);
-    _sameWrapFilterKernelSpinbox->setSingleStep(2);
-    _sameWrapFilterKernelSpinbox->setValue(3);
-    _sameWrapFilterKernelSpinbox->setSuffix(" px");
-    _sameWrapFilterKernelSpinbox->setMaximumWidth(80);
-    _sameWrapFilterKernelSpinbox->setEnabled(false);
-    _sameWrapFilterKernelSpinbox->setToolTip("Odd blur kernel size applied before connected components or shortest-path tracing.");
-    same_wrap_filter_layout->addWidget(_sameWrapFilterKernelSpinbox);
-    same_wrap_filter_layout->addStretch();
-    same_wrap_layout->addLayout(same_wrap_filter_layout);
-    QHBoxLayout *same_wrap_spacing_layout = new QHBoxLayout();
-    same_wrap_spacing_layout->addWidget(new QLabel("Spacing:"));
-    _sameWrapSpacingSpinbox = new QDoubleSpinBox(same_wrap_group);
-    _sameWrapSpacingSpinbox->setRange(1.0, 1000.0);
-    _sameWrapSpacingSpinbox->setDecimals(1);
-    _sameWrapSpacingSpinbox->setSingleStep(1.0);
-    _sameWrapSpacingSpinbox->setValue(20.0);
-    _sameWrapSpacingSpinbox->setSuffix(" vx");
-    _sameWrapSpacingSpinbox->setMaximumWidth(90);
-    _sameWrapSpacingSpinbox->setToolTip("Distance between generated same-wrap annotation points in surface voxels.");
-    same_wrap_spacing_layout->addWidget(_sameWrapSpacingSpinbox);
-    same_wrap_spacing_layout->addWidget(new QLabel("Merge tol.:"));
-    _sameWrapMergeToleranceSpinbox = new QDoubleSpinBox(same_wrap_group);
-    _sameWrapMergeToleranceSpinbox->setRange(0.0, 1000.0);
-    _sameWrapMergeToleranceSpinbox->setDecimals(2);
-    _sameWrapMergeToleranceSpinbox->setSingleStep(0.25);
-    _sameWrapMergeToleranceSpinbox->setValue(1.0);
-    _sameWrapMergeToleranceSpinbox->setSuffix(" vx");
-    _sameWrapMergeToleranceSpinbox->setMaximumWidth(90);
-    _sameWrapMergeToleranceSpinbox->setToolTip("Reserved for same-wrap merge tools.");
-    same_wrap_spacing_layout->addWidget(_sameWrapMergeToleranceSpinbox);
-    same_wrap_spacing_layout->addStretch();
-    same_wrap_layout->addLayout(same_wrap_spacing_layout);
-    _clearSameWrapAnnotationButton = new QPushButton("Clear Same-wrap Preview", same_wrap_group);
-    _clearSameWrapAnnotationButton->setToolTip("Clear the current same-wrap annotation preview without committing it.");
-    same_wrap_layout->addWidget(_clearSameWrapAnnotationButton);
-    layout->addWidget(same_wrap_group);
-    connect(_chkSameWrapAnnotation, &QCheckBox::toggled, this, &CPointCollectionWidget::sameWrapAnnotationToggled);
-    connect(_chkSameWrapMerge, &QCheckBox::toggled, this, &CPointCollectionWidget::sameWrapAnnotationMergeToggled);
-    connect(_sameWrapPathTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
-        emit sameWrapAnnotationPathTypeChanged(sameWrapAnnotationPathType());
-    });
-    connect(_sameWrapFilterTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
-        const bool filterEnabled = sameWrapAnnotationFilterType() != 0;
-        _sameWrapFilterKernelSpinbox->setEnabled(filterEnabled);
-        emit sameWrapAnnotationFilterTypeChanged(sameWrapAnnotationFilterType());
-    });
-    connect(_sameWrapFilterKernelSpinbox, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if ((value % 2) == 0) {
-            const QSignalBlocker blocker(_sameWrapFilterKernelSpinbox);
-            _sameWrapFilterKernelSpinbox->setValue(value + 1);
-        }
-        emit sameWrapAnnotationFilterKernelSizeChanged(sameWrapAnnotationFilterKernelSize());
-    });
-    connect(_sameWrapSpacingSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-            this, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged);
-    connect(_sameWrapMergeToleranceSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-            this, &CPointCollectionWidget::sameWrapAnnotationMergeToleranceChanged);
-    connect(_clearSameWrapAnnotationButton, &QPushButton::clicked, this, &CPointCollectionWidget::sameWrapAnnotationClearRequested);
-
     _tree_view = new QTreeView(main_widget);
     _model = new QStandardItemModel(this);
     _tree_view->setModel(_model);
@@ -1129,42 +1041,6 @@ void CPointCollectionWidget::setAnnotateChecked(bool checked)
         const QSignalBlocker blocker(_chkAnnotate);
         _chkAnnotate->setChecked(checked);
     }
-}
-
-bool CPointCollectionWidget::sameWrapAnnotationEnabled() const
-{
-    return _chkSameWrapAnnotation && _chkSameWrapAnnotation->isChecked();
-}
-
-double CPointCollectionWidget::sameWrapAnnotationSpacing() const
-{
-    return _sameWrapSpacingSpinbox ? _sameWrapSpacingSpinbox->value() : 20.0;
-}
-
-double CPointCollectionWidget::sameWrapAnnotationMergeTolerance() const
-{
-    return _sameWrapMergeToleranceSpinbox ? _sameWrapMergeToleranceSpinbox->value() : 1.0;
-}
-
-bool CPointCollectionWidget::sameWrapAnnotationMergeEnabled() const
-{
-    return _chkSameWrapMerge && _chkSameWrapMerge->isChecked();
-}
-
-int CPointCollectionWidget::sameWrapAnnotationPathType() const
-{
-    return _sameWrapPathTypeCombo ? _sameWrapPathTypeCombo->currentData().toInt() : 0;
-}
-
-int CPointCollectionWidget::sameWrapAnnotationFilterType() const
-{
-    return _sameWrapFilterTypeCombo ? _sameWrapFilterTypeCombo->currentData().toInt() : 0;
-}
-
-int CPointCollectionWidget::sameWrapAnnotationFilterKernelSize() const
-{
-    const int kernelSize = _sameWrapFilterKernelSpinbox ? _sameWrapFilterKernelSpinbox->value() : 3;
-    return std::max(3, kernelSize | 1);
 }
 
 double CPointCollectionWidget::pointViewTolerance() const

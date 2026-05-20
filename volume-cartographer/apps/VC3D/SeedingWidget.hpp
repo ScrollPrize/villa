@@ -37,6 +37,7 @@ public:
 signals:
     void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void sendStatusMessageAvailable(QString text, int timeout);
+    void relWindingAnnotationModeChanged(bool active);
     
 public slots:
     void onSurfacesLoaded();  // Called when surfaces have been loaded/reloaded
@@ -50,6 +51,7 @@ public slots:
     void onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void setRelWindingAnnotationMode(bool active);
     
 private slots:
     void onPreviewRaysClicked();
@@ -86,10 +88,9 @@ private:
     void startDrawing(cv::Vec3f startPoint);
     void addPointToPath(cv::Vec3f point);
     void finalizePath();
-    // Label Wraps helpers
+    // Relative winding annotation helpers
     void finalizePathLabelWraps(bool shiftHeld);
     void findPeaksAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
-    void setLabelWrapsMode(bool active);
     QColor generatePathColor();
     void displayPaths();
     void updatePointsDisplay();
@@ -125,7 +126,6 @@ private:
     QPushButton* expandSeedsButton;
     QPushButton* resetPointsButton;
     QPushButton* cancelButton;
-    QPushButton* labelWrapsButton;
     QProgressBar* progressBar;
     ProgressUtil* progressUtil;
     

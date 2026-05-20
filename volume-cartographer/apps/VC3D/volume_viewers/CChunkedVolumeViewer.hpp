@@ -119,6 +119,8 @@ public:
     uint64_t selectedPointId() const override { return _selectedPointId; }
     uint64_t selectedCollectionId() const override { return _selectedCollectionId; }
     bool isPointDragActive() const override { return false; }
+    bool isSameWrapAnnotationModeEnabled() const override { return _sameWrapAnnotation.enabled(); }
+    double sameWrapAnnotationPolylineOpacity() const override { return _sameWrapAnnotationPolylineOpacity; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
 
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) override;
@@ -196,6 +198,7 @@ public slots:
     void setSameWrapAnnotationMode(bool enabled);
     void setSameWrapAnnotationSpacing(double spacingVx);
     void setSameWrapAnnotationMergeTolerance(double toleranceVx);
+    void setSameWrapAnnotationPolylineOpacity(double opacity);
     void setSameWrapAnnotationMergeExisting(bool enabled);
     void setSameWrapAnnotationPathType(int pathType);
     void setSameWrapAnnotationFilterType(int filterType);
@@ -470,6 +473,7 @@ private:
     QGraphicsItem* _focusMarker = nullptr;
 
     SameWrapAnnotationTool _sameWrapAnnotation;
+    double _sameWrapAnnotationPolylineOpacity = 0.75;
     bool _sameWrapManualMergePressConsumed = false;
 
     bool _bboxMode = false;

@@ -28,6 +28,8 @@ set(srcs
     VolumeViewerCmaps.hpp
     WindowRangeWidget.cpp
     WindowRangeWidget.hpp
+    WrapAnnotationWidget.cpp
+    WrapAnnotationWidget.hpp
     elements/CollapsibleSettingsGroup.cpp
     elements/CollapsibleSettingsGroup.hpp
     elements/DropdownChecklistButton.cpp
