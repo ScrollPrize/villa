@@ -1,0 +1,27 @@
+{
+	"args": {
+		"model-init": "flatten"
+	},
+	"base": {
+		"flatten_sdir": 1.0,
+		"flatten_affine_tether": 0.0
+	},
+	"stages": [
+		{
+			"name": "flatten",
+			"steps": 1000,
+			"_lr": [0.001, 0.0003, 0.0001, 0.00003],
+			"_lr": [0.0003, 0.0001, 0.00003, 0.00001],
+			"_lr": [0.001,0.0003,0.0001],
+			"lr" : 0.01,
+			"params": ["flatten_map_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"flatten_support": true,
+				"flatten_support_radius": 1,
+				"flatten_sdir_eps": 1e-8,
+				"status_interval": 100
+			}
+		}
+	]
+}
