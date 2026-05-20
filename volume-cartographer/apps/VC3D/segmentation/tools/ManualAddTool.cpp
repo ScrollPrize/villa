@@ -90,6 +90,7 @@ void ManualAddTool::clear()
     _fillSeenMarks.clear();
     _barrierMarks.clear();
     _sideMarks.clear();
+    _otherSideMarks.clear();
     _markerEpoch = 0;
     _hoverPolylines.clear();
     _hoverVertex.reset();
@@ -173,6 +174,7 @@ void ManualAddTool::rebuildGridCache()
     _fillSeenMarks.clear();
     _barrierMarks.clear();
     _sideMarks.clear();
+    _otherSideMarks.clear();
     _markerEpoch = 0;
     clearHoverFillCache();
 
@@ -187,6 +189,7 @@ void ManualAddTool::rebuildGridCache()
     _fillSeenMarks.assign(size, 0);
     _barrierMarks.assign(size, 0);
     _sideMarks.assign(size, 0);
+    _otherSideMarks.assign(size, 0);
 
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
@@ -238,6 +241,7 @@ uint32_t ManualAddTool::nextMarkerEpoch() const
         std::fill(_fillSeenMarks.begin(), _fillSeenMarks.end(), 0);
         std::fill(_barrierMarks.begin(), _barrierMarks.end(), 0);
         std::fill(_sideMarks.begin(), _sideMarks.end(), 0);
+        std::fill(_otherSideMarks.begin(), _otherSideMarks.end(), 0);
         _markerEpoch = 0;
     }
     return ++_markerEpoch;
@@ -397,7 +401,8 @@ std::vector<ManualAddTool::GridKey> ManualAddTool::computeFillVerticesForLines(
     const int rows = _entrySnapshotPoints.rows;
     const int cols = _entrySnapshotPoints.cols;
     const std::size_t size = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
-    if (_fillSeenMarks.size() != size || _barrierMarks.size() != size || _sideMarks.size() != size) {
+    if (_fillSeenMarks.size() != size || _barrierMarks.size() != size ||
+        _sideMarks.size() != size || _otherSideMarks.size() != size) {
         return {};
     }
 
@@ -446,6 +451,7 @@ std::vector<ManualAddTool::GridKey> ManualAddTool::computeFillVerticesForLines(
     {
         std::vector<GridKey> cells;
         std::queue<GridKey> queue;
+        std::vector<uint32_t>* marks{nullptr};
         uint32_t epoch{0};
         bool complete{false};
     };
@@ -455,16 +461,18 @@ std::vector<ManualAddTool::GridKey> ManualAddTool::computeFillVerticesForLines(
             return;
         }
         const int index = indexOf(row, col);
-        if (marked(_barrierMarks, index, barrierEpoch) || marked(_sideMarks, index, side.epoch)) {
+        if (!side.marks || marked(_barrierMarks, index, barrierEpoch) || marked(*side.marks, index, side.epoch)) {
             return;
         }
-        _sideMarks[static_cast<std::size_t>(index)] = side.epoch;
+        (*side.marks)[static_cast<std::size_t>(index)] = side.epoch;
         side.queue.push(GridKey{row, col});
     };
 
     auto collectPreferredSide = [&](const GridPolyline& line, int negRow, int negCol, int posRow, int posCol) {
         SideSearch negative;
         SideSearch positive;
+        negative.marks = &_sideMarks;
+        positive.marks = &_otherSideMarks;
         negative.epoch = nextMarkerEpoch();
         positive.epoch = nextMarkerEpoch();
 

@@ -130,6 +130,7 @@ private:
     mutable std::vector<uint32_t> _fillSeenMarks;
     mutable std::vector<uint32_t> _barrierMarks;
     mutable std::vector<uint32_t> _sideMarks;
+    mutable std::vector<uint32_t> _otherSideMarks;
     mutable uint32_t _markerEpoch{0};
 
     std::vector<GridPolyline> _cachedHoverFillLines;
