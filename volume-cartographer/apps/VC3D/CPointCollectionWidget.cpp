@@ -156,7 +156,7 @@ void CPointCollectionWidget::setupUi()
     QGroupBox *same_wrap_group = new QGroupBox("Same-wrap Annotation");
     QVBoxLayout *same_wrap_layout = new QVBoxLayout(same_wrap_group);
     _chkSameWrapAnnotation = new QCheckBox("Same-wrap annotation mode", same_wrap_group);
-    _chkSameWrapAnnotation->setToolTip("Shift-click or Shift-drag in an active volume viewer to preview same-wrap annotation points. Shift+E commits; Ctrl+Z clears.");
+    _chkSameWrapAnnotation->setToolTip("Shift-click or Shift-drag in an active volume viewer to preview same-wrap annotation points. Shift+E commits; Ctrl+Z clears the preview or undoes the last committed collection.");
     same_wrap_layout->addWidget(_chkSameWrapAnnotation);
     _chkSameWrapMerge = new QCheckBox("Merge same-wrap annotations", same_wrap_group);
     _chkSameWrapMerge->setToolTip("Preview and commit matching existing same-wrap annotations as one ordered point set.");

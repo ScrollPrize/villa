@@ -55,6 +55,7 @@ public:
     void noteShiftReleased();
     void clear(const ClearOverlayGroupFn& clearOverlayGroup);
     bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
+    bool undoLastCommit(VCCollection* pointCollection);
     void refreshOverlay(const VolumeToSceneFn& volumeToScene,
                         const SetOverlayGroupFn& setOverlayGroup,
                         const ClearOverlayGroupFn& clearOverlayGroup);
@@ -110,4 +111,5 @@ private:
                        const ClearOverlayGroupFn& clearOverlayGroup);
 
     State _state;
+    std::vector<std::vector<uint64_t>> _committedCollectionHistory;
 };

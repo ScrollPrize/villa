@@ -202,6 +202,7 @@ public slots:
     void setSameWrapAnnotationFilterKernelSize(int kernelSize);
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
+    bool undoSameWrapAnnotation();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;

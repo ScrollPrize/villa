@@ -484,6 +484,7 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
         return false;
     }
 
+    std::vector<uint64_t> committedCollectionIds;
     if (_state.mergeExistingAnnotations && !_state.mergeBuckets.empty()) {
         std::unordered_set<uint64_t> collectionIdsToClear;
         for (const SameWrapAnnotationMergeBucket& bucket : _state.mergeBuckets) {
@@ -500,14 +501,47 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
             const uint64_t collectionId = pointCollection->getCollectionId(bucket.collectionName);
             if (collectionId != 0) {
                 pointCollection->setCollectionTag(collectionId, "same_wrap_direction", bucket.directionKey);
+                committedCollectionIds.push_back(collectionId);
             }
         }
     } else {
         const std::string collectionName = pointCollection->generateNewCollectionName("same_wrap");
         pointCollection->addPoints(collectionName, _state.sampledVolumePoints);
+        const uint64_t collectionId = pointCollection->getCollectionId(collectionName);
+        if (collectionId != 0) {
+            committedCollectionIds.push_back(collectionId);
+        }
+    }
+    if (!committedCollectionIds.empty()) {
+        _committedCollectionHistory.push_back(std::move(committedCollectionIds));
     }
     clear(clearOverlayGroup);
     return true;
+}
+
+bool SameWrapAnnotationTool::undoLastCommit(VCCollection* pointCollection)
+{
+    if (!pointCollection) {
+        return false;
+    }
+
+    while (!_committedCollectionHistory.empty()) {
+        std::vector<uint64_t> collectionIds = std::move(_committedCollectionHistory.back());
+        _committedCollectionHistory.pop_back();
+
+        bool removedAny = false;
+        for (uint64_t collectionId : collectionIds) {
+            if (pointCollection->getAllCollections().count(collectionId) == 0) {
+                continue;
+            }
+            pointCollection->clearCollection(collectionId);
+            removedAny = true;
+        }
+        if (removedAny) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,

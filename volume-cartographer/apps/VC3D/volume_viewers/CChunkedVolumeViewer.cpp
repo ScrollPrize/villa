@@ -3033,6 +3033,15 @@ bool CChunkedVolumeViewer::commitSameWrapAnnotationPreview()
         [this](const std::string& key) { clearOverlayGroup(key); });
 }
 
+bool CChunkedVolumeViewer::undoSameWrapAnnotation()
+{
+    if (_sameWrapAnnotation.hasPreview()) {
+        clearSameWrapAnnotationPreview();
+        return true;
+    }
+    return _sameWrapAnnotation.undoLastCommit(_pointCollection);
+}
+
 void CChunkedVolumeViewer::refreshSameWrapAnnotationOverlay()
 {
     if (!_sameWrapAnnotation.hasPreview()) {
