@@ -1747,7 +1747,12 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, ou
     z0 = z_begin - z_margin
     spiral_zs = torch.arange(z0, z_end + z_margin, grid_spacing, dtype=torch.float32, device=spiral_yxs.device)
     spiral_zyxs = torch.cat([spiral_zs[:, None, None].expand(-1, spiral_yxs.shape[0], 1), spiral_yxs[None, :, :].expand(spiral_zs.shape[0], -1, 2)], dim=-1)
-    scroll_zyxs = slice_to_spiral_transform.inv(spiral_zyxs)
+    chunk = 65536
+    flat_spiral_zyxs = spiral_zyxs.reshape(-1, 3)
+    scroll_pieces = []
+    for start in range(0, flat_spiral_zyxs.shape[0], chunk):
+        scroll_pieces.append(slice_to_spiral_transform.inv(flat_spiral_zyxs[start : start + chunk]))
+    scroll_zyxs = torch.cat(scroll_pieces, dim=0).reshape(*spiral_zyxs.shape)
 
     # Snapped variant: replace cells covered by quads of overall- or boundary-satisfied
     # patches with patch-derived points, interpolated bilinearly across each quad in the
