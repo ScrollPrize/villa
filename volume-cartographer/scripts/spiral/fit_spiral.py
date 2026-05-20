@@ -2464,13 +2464,34 @@ def main():
     for pid in dropped_patch_ids:
         del patches[pid]
 
-    dropped_pcl_count = 0
-    for pcl_dict in (cross_patch_point_collections, unattached_point_collections):
-        dropped = [pid for pid, pcl in pcl_dict.items() if not pcl_intersects_z_roi(pcl)]
-        for pid in dropped:
-            del pcl_dict[pid]
-        dropped_pcl_count += len(dropped)
-    print(f'dropped {len(dropped_patch_ids)} patches and {dropped_pcl_count} pcls outside z-roi [{z_begin}, {z_end})')
+    # For unattached pcls, keep only the longest contiguous subrange (in id-sorted
+    # order) of points whose zs lie within [z_begin - margin, z_end + margin); drop
+    # the pcl entirely if fewer than 2 points remain.
+    z_margin = cfg['patch_loss_z_margin']
+    dropped_unattached_pcl_count = 0
+    for pid in list(unattached_point_collections.keys()):
+        pcl = unattached_point_collections[pid]
+        sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+        best_start, best_end = 0, 0
+        run_start = 0
+        for i, (_, point) in enumerate(sorted_items):
+            z = point['zyx'][0]
+            if z_begin - z_margin <= z < z_end + z_margin:
+                if i + 1 - run_start > best_end - best_start:
+                    best_start, best_end = run_start, i + 1
+            else:
+                run_start = i + 1
+        kept_items = sorted_items[best_start:best_end]
+        if len(kept_items) < 2:
+            del unattached_point_collections[pid]
+            dropped_unattached_pcl_count += 1
+        else:
+            pcl['points'] = dict(kept_items)
+
+    dropped_cross_patch_pcl_ids = [pid for pid, pcl in cross_patch_point_collections.items() if not pcl_intersects_z_roi(pcl)]
+    for pid in dropped_cross_patch_pcl_ids:
+        del cross_patch_point_collections[pid]
+    print(f'dropped {len(dropped_patch_ids)} patches, {len(dropped_cross_patch_pcl_ids)} cross-patch pcls, and {dropped_unattached_pcl_count} unattached pcls outside z-roi [{z_begin}, {z_end})')
 
     normalise_pcl_winding_annotations(cross_patch_point_collections)
     normalise_pcl_winding_annotations(unattached_point_collections)
