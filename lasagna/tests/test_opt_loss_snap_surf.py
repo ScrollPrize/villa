@@ -112,7 +112,8 @@ class SnapSurfMapperTest(unittest.TestCase):
 			source_valid=valid_source,
 			target_xyz=target,
 			target_valid=valid_target,
-			target_normals=_normals_2d(3, 3),
+			normal_xyz=_normals_3d(1, 3, 3),
+			normal_from_source=True,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(point_distance=10.0, grid_error=2.0),
 		)
 
@@ -202,6 +203,31 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertFalse(bool(state.model_to_ext.valid[0, 0, 0]))
 		self.assertFalse(bool(state.model_to_ext.valid[0, 3, 3]))
 
+	def test_growth_accepts_continuous_target_quad_coordinate(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
+		state.ensure(source_shape=(1, 3, 3), target_shape=(4, 4), device=torch.device("cpu"), dtype=torch.float32)
+		state.map[0, 0, 0] = torch.tensor([0.5, 0.5])
+		state.map[0, 0, 1] = torch.tensor([0.5, 1.5])
+		state.valid[0, 0, 0] = True
+		state.valid[0, 0, 1] = True
+		source = _plane_xyz(h=3, w=3, z=0.0).unsqueeze(0)
+		source[0, 0, 2] = torch.tensor([2.5, 0.5, 0.0])
+		target = _plane_xyz(h=4, w=4, z=0.0)
+
+		opt_loss_snap_surf._grow_direction(
+			state,
+			source_xyz=source,
+			source_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			target_xyz=target,
+			target_valid=torch.ones(4, 4, dtype=torch.bool),
+			normal_xyz=_normals_3d(1, 3, 3),
+			normal_from_source=True,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(point_distance=0.01, grid_error=0.01, search_ring=0),
+		)
+
+		self.assertTrue(bool(state.valid[0, 0, 2]))
+		self.assertTrue(torch.allclose(state.map[0, 0, 2], torch.tensor([0.5, 2.5]), atol=1.0e-3))
+
 	def test_low_distance_affine_inconsistent_candidate_is_rejected(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
 		state.ensure(source_shape=(1, 3, 3), target_shape=(3, 3), device=torch.device("cpu"), dtype=torch.float32)
@@ -211,7 +237,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		state.valid[0, 0, 1] = True
 		source = _plane_xyz(h=3, w=3, z=0.0).unsqueeze(0)
 		target = _plane_xyz(h=3, w=3, z=0.0)
-		target[0, 2] = torch.tensor([100.0, 100.0, 0.0])
+		target[0, 2] = torch.tensor([100.0, 100.0, 100.0])
 		source[0, 0, 2] = target[1, 1]
 		valid_source = torch.ones(1, 3, 3, dtype=torch.bool)
 		valid_target = torch.ones(3, 3, dtype=torch.bool)
@@ -222,7 +248,8 @@ class SnapSurfMapperTest(unittest.TestCase):
 			source_valid=valid_source,
 			target_xyz=target,
 			target_valid=valid_target,
-			target_normals=_normals_2d(3, 3),
+			normal_xyz=_normals_3d(1, 3, 3),
+			normal_from_source=True,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(point_distance=1.0, grid_error=0.25, search_ring=2),
 		)
 

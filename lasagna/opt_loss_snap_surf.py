@@ -264,6 +264,32 @@ def _sample_grid(grid: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
 	raise ValueError(f"expected 2D/3D grid with vector channel, got shape {tuple(grid.shape)}")
 
 
+def _sample_surface_grid(grid: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+	if grid.ndim == 3:
+		return _sample_grid2d(grid, coords)
+	if grid.ndim != 4:
+		raise ValueError(f"expected 2D/3D surface grid with vector channel, got shape {tuple(grid.shape)}")
+	D, H, W, C = int(grid.shape[0]), int(grid.shape[1]), int(grid.shape[2]), int(grid.shape[3])
+	if H < 2 or W < 2:
+		return torch.full((*coords.shape[:-1], C), float("nan"), device=grid.device, dtype=grid.dtype)
+	flat = coords.reshape(-1, 3)
+	d = torch.round(flat[:, 0]).clamp(0, D - 1).long()
+	h = flat[:, 1].clamp(0.0, float(H - 1))
+	w = flat[:, 2].clamp(0.0, float(W - 1))
+	h0 = torch.floor(h).clamp(0, H - 2).long()
+	w0 = torch.floor(w).clamp(0, W - 2).long()
+	h1 = h0 + 1
+	w1 = w0 + 1
+	fh = (h - h0.to(dtype=grid.dtype)).unsqueeze(-1)
+	fw = (w - w0.to(dtype=grid.dtype)).unsqueeze(-1)
+	v00 = grid[d, h0, w0]
+	v10 = grid[d, h1, w0]
+	v01 = grid[d, h0, w1]
+	v11 = grid[d, h1, w1]
+	out = (1 - fh) * (1 - fw) * v00 + fh * (1 - fw) * v10 + (1 - fh) * fw * v01 + fh * fw * v11
+	return out.reshape(*coords.shape[:-1], C)
+
+
 def _points_at_indices(grid: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 	if idx.numel() == 0:
 		return torch.empty(0, int(grid.shape[-1]), device=grid.device, dtype=grid.dtype)
@@ -321,6 +347,52 @@ def _gather_points_at_coords(grid: torch.Tensor, coords: torch.Tensor) -> torch.
 	if coords.shape[-1] == 2:
 		return grid[coords[..., 0], coords[..., 1]]
 	return grid[coords[..., 0], coords[..., 1], coords[..., 2]]
+
+
+def _quad_valid_at_coords(valid: torch.Tensor, coords: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+	if coords.numel() == 0:
+		return torch.zeros(coords.shape[:-1], device=valid.device, dtype=torch.bool)
+	flat = coords.reshape(-1, coords.shape[-1])
+	finite = torch.isfinite(flat).all(dim=-1)
+	if len(shape) == 2:
+		H, W = int(shape[0]), int(shape[1])
+		if H < 2 or W < 2:
+			return torch.zeros(coords.shape[:-1], device=valid.device, dtype=torch.bool)
+		h = flat[:, 0]
+		w = flat[:, 1]
+		in_bounds = finite & (h >= 0.0) & (h <= float(H - 1)) & (w >= 0.0) & (w <= float(W - 1))
+		h0 = torch.floor(h.clamp(0.0, float(H - 1))).clamp(0, H - 2).long()
+		w0 = torch.floor(w.clamp(0.0, float(W - 1))).clamp(0, W - 2).long()
+		ok = (
+			valid[h0, w0] &
+			valid[h0 + 1, w0] &
+			valid[h0, w0 + 1] &
+			valid[h0 + 1, w0 + 1]
+		) & in_bounds
+		return ok.reshape(coords.shape[:-1])
+
+	D, H, W = int(shape[0]), int(shape[1]), int(shape[2])
+	if H < 2 or W < 2:
+		return torch.zeros(coords.shape[:-1], device=valid.device, dtype=torch.bool)
+	d = flat[:, 0]
+	h = flat[:, 1]
+	w = flat[:, 2]
+	in_bounds = (
+		finite &
+		(d >= 0.0) & (d <= float(D - 1)) &
+		(h >= 0.0) & (h <= float(H - 1)) &
+		(w >= 0.0) & (w <= float(W - 1))
+	)
+	di = torch.round(d.clamp(0.0, float(D - 1))).long()
+	h0 = torch.floor(h.clamp(0.0, float(H - 1))).clamp(0, H - 2).long()
+	w0 = torch.floor(w.clamp(0.0, float(W - 1))).clamp(0, W - 2).long()
+	ok = (
+		valid[di, h0, w0] &
+		valid[di, h0 + 1, w0] &
+		valid[di, h0, w0 + 1] &
+		valid[di, h0 + 1, w0 + 1]
+	) & in_bounds
+	return ok.reshape(coords.shape[:-1])
 
 
 def _neighbor4_mask(valid_b: torch.Tensor) -> torch.Tensor:
@@ -465,8 +537,6 @@ def _clear_target_key(state: _DirectionState, key: tuple[int, ...]) -> None:
 def _set_correspondence(state: _DirectionState, source_idx: tuple[int, ...], target_coord: torch.Tensor) -> None:
 	if state.map is None or state.valid is None:
 		return
-	key = _target_key(target_coord)
-	_clear_target_key(state, key)
 	state.map[source_idx] = target_coord.to(device=state.map.device, dtype=state.map.dtype)
 	state.valid[source_idx] = True
 
@@ -643,7 +713,8 @@ def _revalidate_direction(
 	source_valid: torch.Tensor,
 	target_xyz: torch.Tensor,
 	target_valid: torch.Tensor,
-	target_normals: torch.Tensor,
+	normal_xyz: torch.Tensor,
+	normal_from_source: bool,
 	cfg: SnapSurfConfig,
 ) -> dict[str, int]:
 	start_count = state.count()
@@ -663,25 +734,21 @@ def _revalidate_direction(
 		if state.source_rank == 3
 		else source_idx_b[:, 1:]
 	)
-	coord_finite = torch.isfinite(coords).all(dim=-1)
-	in_bounds = coord_finite.clone()
-	for axis, size in enumerate(state.target_shape):
-		in_bounds &= (coords[:, axis] >= 0.0) & (coords[:, axis] <= float(int(size) - 1))
-
-	rounded = torch.round(torch.where(in_bounds.unsqueeze(-1), coords, torch.zeros_like(coords))).to(dtype=torch.long)
-	for axis, size in enumerate(state.target_shape):
-		rounded[:, axis].clamp_(0, int(size) - 1)
-	target_ok = _gather_bool_at_coords(target_valid.bool(), rounded) & in_bounds
+	target_ok = _quad_valid_at_coords(target_valid.bool(), coords, state.target_shape)
 
 	src_pos = _points_at_indices(source_xyz, source_idx)
-	tgt_pos = _sample_grid(target_xyz, coords)
-	tgt_n = _sample_grid(target_normals, coords)
-	dist = (src_pos - tgt_pos).norm(dim=-1)
+	tgt_pos = _sample_surface_grid(target_xyz, coords)
+	if normal_from_source:
+		n = _points_at_indices(normal_xyz, source_idx)
+	else:
+		n = _sample_surface_grid(normal_xyz, coords)
+	n = F.normalize(n, dim=-1, eps=1.0e-8)
+	dist = ((src_pos - tgt_pos) * n).sum(dim=-1).abs()
 	geom_ok = (
 		torch.isfinite(src_pos).all(dim=-1) &
 		torch.isfinite(tgt_pos).all(dim=-1) &
-		torch.isfinite(tgt_n).all(dim=-1) &
-		(tgt_n.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(n).all(dim=-1) &
+		(n.norm(dim=-1) > 1.0e-8) &
 		(dist <= float(cfg.point_distance))
 	)
 	source_ok = source_valid_b[new_valid_b]
@@ -728,7 +795,8 @@ def _grow_direction(
 	source_valid: torch.Tensor,
 	target_xyz: torch.Tensor,
 	target_valid: torch.Tensor,
-	target_normals: torch.Tensor,
+	normal_xyz: torch.Tensor,
+	normal_from_source: bool,
 	cfg: SnapSurfConfig,
 ) -> dict[str, int]:
 	stats = _empty_grow_stats()
@@ -762,40 +830,35 @@ def _grow_direction(
 	pred_flat = pred.reshape(-1, state.target_rank)[flat_ids]
 	det_flat = det.reshape(-1)[flat_ids]
 
-	base = torch.round(pred_flat).to(dtype=torch.long)
 	offsets = []
 	r = int(cfg.search_ring)
 	if state.target_rank == 2:
 		for dh in range(-r, r + 1):
 			for dw in range(-r, r + 1):
-				offsets.append((dh, dw))
+				offsets.append((float(dh), float(dw)))
 	else:
-		for dd in range(-r, r + 1):
-			for dh in range(-r, r + 1):
-				for dw in range(-r, r + 1):
-					offsets.append((dd, dh, dw))
-	offset_t = torch.tensor(offsets, device=map_b.device, dtype=torch.long)
-	search_coords = base.unsqueeze(1) + offset_t.view(1, -1, state.target_rank)
-	in_bounds = torch.ones(search_coords.shape[:2], device=map_b.device, dtype=torch.bool)
-	for axis, size in enumerate(state.target_shape):
-		in_bounds &= (search_coords[..., axis] >= 0) & (search_coords[..., axis] < int(size))
-		search_coords[..., axis].clamp_(0, int(size) - 1)
+		for dh in range(-r, r + 1):
+			for dw in range(-r, r + 1):
+				offsets.append((0.0, float(dh), float(dw)))
+	offset_t = torch.tensor(offsets, device=map_b.device, dtype=map_b.dtype)
+	search_coords = pred_flat.unsqueeze(1) + offset_t.view(1, -1, state.target_rank)
 
-	target_ok = _gather_bool_at_coords(target_valid.bool(), search_coords) & in_bounds
-	occupied = _target_occupied_mask(state, base_valid)
-	target_ids = _linear_ids(search_coords, state.target_shape)
-	target_ok &= ~occupied[target_ids]
+	target_ok = _quad_valid_at_coords(target_valid.bool(), search_coords, state.target_shape)
 	stats["tgt"] = int(target_ok.any(dim=1).sum().detach().cpu())
 
-	grid_err = (search_coords.to(dtype=map_b.dtype) - pred_flat.unsqueeze(1)).norm(dim=-1)
-	target_pos = _gather_points_at_coords(target_xyz, search_coords)
-	target_n = _gather_points_at_coords(target_normals, search_coords)
+	grid_err = (search_coords - pred_flat.unsqueeze(1)).norm(dim=-1)
+	target_pos = _sample_surface_grid(target_xyz, search_coords)
 	source_pos = _points_at_indices(source_xyz, source_idx).unsqueeze(1)
-	dist = (source_pos - target_pos).norm(dim=-1)
+	if normal_from_source:
+		n = _points_at_indices(normal_xyz, source_idx).unsqueeze(1).expand_as(target_pos)
+	else:
+		n = _sample_surface_grid(normal_xyz, search_coords)
+	n = F.normalize(n, dim=-1, eps=1.0e-8)
+	dist = ((source_pos - target_pos) * n).sum(dim=-1).abs()
 	target_geom_ok = (
 		torch.isfinite(target_pos).all(dim=-1) &
-		torch.isfinite(target_n).all(dim=-1) &
-		(target_n.norm(dim=-1) > 1.0e-8)
+		torch.isfinite(n).all(dim=-1) &
+		(n.norm(dim=-1) > 1.0e-8)
 	)
 	dist_ok = target_ok & target_geom_ok & (dist <= float(cfg.point_distance))
 	stats["dist"] = int(dist_ok.any(dim=1).sum().detach().cpu())
@@ -814,19 +877,6 @@ def _grow_direction(
 
 	acc_source_idx = source_idx[accepted]
 	acc_target_coords = search_coords[accepted, best_pos[accepted]]
-	acc_score = best_score[accepted]
-	acc_target_ids = _linear_ids(acc_target_coords, state.target_shape)
-	if acc_target_ids.numel() > 0:
-		min_score = torch.full(
-			(int(acc_target_ids.max().detach().cpu()) + 1,),
-			float("inf"),
-			device=acc_score.device,
-			dtype=acc_score.dtype,
-		)
-		min_score.scatter_reduce_(0, acc_target_ids, acc_score, reduce="amin", include_self=True)
-		accepted_unique = acc_score <= (min_score[acc_target_ids] + 1.0e-8)
-		acc_source_idx = acc_source_idx[accepted_unique]
-		acc_target_coords = acc_target_coords[accepted_unique]
 
 	stats["new"] = int(acc_source_idx.shape[0])
 	if acc_source_idx.numel() == 0:
@@ -955,6 +1005,42 @@ def _closest_model_surface_quad(
 	), math.sqrt(float(d2[best].detach().cpu()))
 
 
+def _closest_point_on_quad_coord(
+	point: torch.Tensor,
+	p00: torch.Tensor,
+	p10: torch.Tensor,
+	p01: torch.Tensor,
+	p11: torch.Tensor,
+	base_coord: torch.Tensor,
+) -> torch.Tensor:
+	cp0, bary0 = opt_loss_station._closest_points_on_triangles(
+		point,
+		p00.view(1, 3),
+		p10.view(1, 3),
+		p11.view(1, 3),
+	)
+	cp1, bary1 = opt_loss_station._closest_points_on_triangles(
+		point,
+		p00.view(1, 3),
+		p11.view(1, 3),
+		p01.view(1, 3),
+	)
+	d0 = (cp0[0] - point).square().sum()
+	d1 = (cp1[0] - point).square().sum()
+	if float(d0.detach().cpu()) <= float(d1.detach().cpu()):
+		bary = bary0[0]
+		h_frac = bary[1] + bary[2]
+		w_frac = bary[2]
+	else:
+		bary = bary1[0]
+		h_frac = bary[1]
+		w_frac = bary[1] + bary[2]
+	coord = base_coord.clone()
+	coord[-2] = coord[-2] + h_frac
+	coord[-1] = coord[-1] + w_frac
+	return coord
+
+
 def _choose_seed_transform(
 	*,
 	model_xyz: torch.Tensor,
@@ -1034,25 +1120,46 @@ def _try_seed_reinsert(
 	)
 	if not model_quad_valid:
 		return False, surface_dist, state.seed_ext_distance
-	transform, det_sign = _choose_seed_transform(
-		model_xyz=model_xyz,
-		ext_xyz=ext_xyz,
-		model_quad=model_quad,
-		ext_quad=(eh, ew),
-		cfg=cfg,
-	)
+	ext_base = torch.tensor([float(eh), float(ew)], device=model_xyz.device, dtype=model_xyz.dtype)
+	model_base = torch.tensor([float(d), float(mh), float(mw)], device=model_xyz.device, dtype=model_xyz.dtype)
+	model_to_ext_seed: dict[tuple[int, int], torch.Tensor] = {}
+	ext_to_model_seed: dict[tuple[int, int], torch.Tensor] = {}
+	for sh, sw in _CORNERS_2D:
+		model_point = model_xyz[d, mh + sh, mw + sw]
+		model_to_ext_seed[(sh, sw)] = _closest_point_on_quad_coord(
+			model_point,
+			ext_xyz[eh, ew],
+			ext_xyz[eh + 1, ew],
+			ext_xyz[eh, ew + 1],
+			ext_xyz[eh + 1, ew + 1],
+			ext_base,
+		)
+	for th, tw in _CORNERS_2D:
+		ext_point = ext_xyz[eh + th, ew + tw]
+		ext_to_model_seed[(th, tw)] = _closest_point_on_quad_coord(
+			ext_point,
+			model_xyz[d, mh, mw],
+			model_xyz[d, mh + 1, mw],
+			model_xyz[d, mh, mw + 1],
+			model_xyz[d, mh + 1, mw + 1],
+			model_base,
+		)
+	a = model_to_ext_seed[(1, 0)] - model_to_ext_seed[(0, 0)]
+	b = model_to_ext_seed[(0, 1)] - model_to_ext_seed[(0, 0)]
+	det = float((a[0] * b[1] - a[1] * b[0]).detach().cpu())
+	det_sign = 1 if det >= 0.0 else -1
 	state.model_to_ext.orientation_sign = det_sign
 	state.ext_to_model.orientation_sign = det_sign
 	for i, (sh, sw) in enumerate(_CORNERS_2D):
-		th, tw = transform[i]
 		model_idx = (d, mh + sh, mw + sw)
-		ext_idx = (eh + th, ew + tw)
-		if not _bool_at_index(model_valid, model_idx) or not _bool_at_index(ext_valid, ext_idx):
+		if not _bool_at_index(model_valid, model_idx):
 			continue
-		ext_coord = torch.tensor(ext_idx, device=model_xyz.device, dtype=model_xyz.dtype)
-		model_coord = torch.tensor(model_idx, device=model_xyz.device, dtype=model_xyz.dtype)
-		_set_correspondence(state.model_to_ext, model_idx, ext_coord)
-		_set_correspondence(state.ext_to_model, ext_idx, model_coord)
+		_set_correspondence(state.model_to_ext, model_idx, model_to_ext_seed[(sh, sw)])
+	for th, tw in _CORNERS_2D:
+		ext_idx = (eh + th, ew + tw)
+		if not _bool_at_index(ext_valid, ext_idx):
+			continue
+		_set_correspondence(state.ext_to_model, ext_idx, ext_to_model_seed[(th, tw)])
 	return True, surface_dist, state.seed_ext_distance
 
 
@@ -1066,8 +1173,8 @@ def _direction_loss_model_to_ext(
 	state: _DirectionState,
 	*,
 	model_xyz: torch.Tensor,
+	model_normals: torch.Tensor,
 	ext_xyz: torch.Tensor,
-	ext_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
 	device = model_xyz.device
@@ -1080,8 +1187,8 @@ def _direction_loss_model_to_ext(
 	idx = state.valid.nonzero(as_tuple=False)
 	src = _points_at_indices(model_xyz, idx)
 	coords = state.map[state.valid]
-	tgt = _sample_grid2d(ext_xyz, coords).detach()
-	n = F.normalize(_sample_grid2d(ext_normals, coords).detach(), dim=-1, eps=1.0e-8)
+	tgt = _sample_surface_grid(ext_xyz, coords).detach()
+	n = F.normalize(_points_at_indices(model_normals.detach(), idx), dim=-1, eps=1.0e-8)
 	residual = ((src - tgt) * n).sum(dim=-1) / cfg.distance_scale
 	values = _huber(residual, delta=cfg.huber_delta / cfg.distance_scale)
 	loss = values.mean() if values.numel() else model_xyz.sum() * 0.0
@@ -1103,8 +1210,8 @@ def _direction_loss_ext_to_model(
 	idx = state.valid.nonzero(as_tuple=False)
 	src = _points_at_indices(ext_xyz, idx).detach()
 	coords = state.map[state.valid]
-	tgt = _sample_grid3d(model_xyz, coords)
-	n = F.normalize(_sample_grid3d(model_normals.detach(), coords), dim=-1, eps=1.0e-8)
+	tgt = _sample_surface_grid(model_xyz, coords)
+	n = F.normalize(_sample_surface_grid(model_normals.detach(), coords), dim=-1, eps=1.0e-8)
 	residual = ((tgt - src) * n).sum(dim=-1) / cfg.distance_scale
 	values = _huber(residual, delta=cfg.huber_delta / cfg.distance_scale)
 	loss = values.mean() if values.numel() else model_xyz.sum() * 0.0
@@ -1209,7 +1316,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				source_valid=model_valid,
 				target_xyz=ext_xyz,
 				target_valid=ext_valid,
-				target_normals=ext_normals,
+				normal_xyz=model_normals.detach(),
+				normal_from_source=True,
 				cfg=cfg,
 			)
 			rv_e2m = _revalidate_direction(
@@ -1218,7 +1326,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				source_valid=ext_valid,
 				target_xyz=model_xyz_det,
 				target_valid=model_valid,
-				target_normals=model_normals.detach(),
+				normal_xyz=model_normals.detach(),
+				normal_from_source=False,
 				cfg=cfg,
 			)
 			stats["snaps_drop"] += float(rv_m2e.get("drop", 0) + rv_e2m.get("drop", 0))
@@ -1242,7 +1351,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				source_valid=model_valid,
 				target_xyz=ext_xyz,
 				target_valid=ext_valid,
-				target_normals=ext_normals,
+				normal_xyz=model_normals.detach(),
+				normal_from_source=True,
 				cfg=cfg,
 			)
 			grow_e2m = _grow_direction(
@@ -1251,7 +1361,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				source_valid=ext_valid,
 				target_xyz=model_xyz_det,
 				target_valid=model_valid,
-				target_normals=model_normals.detach(),
+				normal_xyz=model_normals.detach(),
+				normal_from_source=False,
 				cfg=cfg,
 			)
 			for k in ("ring", "sup", "tgt", "dist", "grid", "ori", "new"):
@@ -1260,8 +1371,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		l_m2e, lm_m2e, mask_m2e, n_m2e = _direction_loss_model_to_ext(
 			state.model_to_ext,
 			model_xyz=res.xyz_lr,
+			model_normals=model_normals,
 			ext_xyz=ext_xyz,
-			ext_normals=ext_normals,
 			cfg=cfg,
 		)
 		l_e2m, n_e2m = _direction_loss_ext_to_model(
