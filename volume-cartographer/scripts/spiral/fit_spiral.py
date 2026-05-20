@@ -82,12 +82,16 @@ default_config = {
     'winding_number_num_pairs': 2000,
     'winding_number_num_pcls': 1,
     'winding_number_adjacent_patches_only': True,
+    'unattached_pcl_num_per_step': 16,
+    'unattached_pcl_num_points_per_step': 32,
     'normals_num_points': 2000,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 8.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
     'loss_weight_winding_number': 10.,
+    'loss_weight_unattached_pcl_radius': 8.e0,
+    'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_patch_stretch': 40.0,
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
@@ -993,6 +997,92 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
     return (diff - expected_diff).abs().mean()
 
 
+def _prepare_unattached_pcl_strips(pcls_dict):
+    # For each unattached pcl, materialise an id-sorted strip of point zyxs and the
+    # corresponding winding annotations. Strips with <2 points are dropped.
+    prepared = []
+    for pcl in pcls_dict.values():
+        sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+        if len(sorted_items) < 2:
+            continue
+        zyxs = np.stack([p['zyx'] for _, p in sorted_items], axis=0).astype(np.float32)
+        windings = np.array([p['winding_annotation'] for _, p in sorted_items], dtype=np.float32)
+        prepared.append({'zyxs': zyxs, 'windings': windings})
+    return prepared
+
+
+def get_unattached_pcl_strip_losses(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    pcl_strips,
+    num_pcls_per_step,
+    num_points_per_pcl,
+    compute_dt,
+):
+    # Unattached pcls (touching 0 or 1 patches; see categorise_point_collections) are
+    # treated as ordered strips, indexed by int(point_id), and assumed to be locally
+    # dense enough that adjacent samples have |dtheta| < pi (so
+    # _unwrap_track_shifted_radii can stitch theta=0 crossings, exactly like a patch
+    # row/column). Two losses are computed, analogous to the patch radius
+    # and DT losses: (1) shifted-radius should be constant along the strip after
+    # subtracting per-point winding-annotation offsets; (2) each point should snap to
+    # its target winding, with the target taken from the snapped strip median.
+    device = dr_per_winding.device
+    zero = torch.zeros([], device=device)
+    if not pcl_strips:
+        return zero, zero
+
+    num_to_sample = min(num_pcls_per_step, len(pcl_strips))
+    chosen = np.random.choice(len(pcl_strips), num_to_sample, replace=False)
+
+    sampled_zyxs = np.empty([num_to_sample, num_points_per_pcl, 3], dtype=np.float32)
+    sampled_winding = np.empty([num_to_sample, num_points_per_pcl], dtype=np.float32)
+    for k, pcl_idx in enumerate(chosen):
+        strip = pcl_strips[pcl_idx]
+        N = len(strip['zyxs'])
+        coords = np.sort(np.random.choice(N, num_points_per_pcl, replace=num_points_per_pcl > N))
+        sampled_zyxs[k] = strip['zyxs'][coords]
+        sampled_winding[k] = strip['windings'][coords]
+
+    zyxs_t = torch.from_numpy(sampled_zyxs).to(device=device)
+    winding_t = torch.from_numpy(sampled_winding).to(device=device)
+
+    spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
+    theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+    shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
+
+    # Normalise so a pcl with mixed annotations still reads as a single 'strip'.
+    normalised_radii = shifted_radii - winding_t * dr_per_winding
+
+    hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
+
+    mean_radii = normalised_radii.mean(dim=-1, keepdim=True)
+    radius_deviations = (normalised_radii - mean_radii).abs()
+    radius_loss = F.relu(radius_deviations - hinge_margin).mean()
+
+    if not compute_dt:
+        return radius_loss, zero
+
+    target_normalised = torch.round(normalised_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
+    target_shifted = target_normalised + winding_t * dr_per_winding
+    target_radii = target_shifted + theta / (2 * np.pi) * dr_per_winding
+    target_spiral_zyxs = torch.stack([
+        spiral_zyxs[..., 0],
+        torch.sin(theta) * target_radii,
+        torch.cos(theta) * target_radii,
+    ], dim=-1).detach()
+    target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
+
+    within_p = cfg['patch_dt_within_patch_norm_p']
+    across_p = cfg['patch_dt_norm_p']
+    point_distances = torch.linalg.norm(zyxs_t - target_scroll_zyxs, dim=-1)
+    point_distances = F.relu(point_distances - hinge_margin) + 1.e-5
+    track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
+    dt_loss = ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
+
+    return radius_loss, dt_loss
+
+
 def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, patches, patch_sampling_probabilities, epsilon=1.0):
     # Sample patch points and enforce, at each point, two local rigidity properties of the scroll->spiral transform:
     #   (stretch) epsilon-steps along the discrete patch tangents (+i and +j neighbors in patch coordinates) preserve
@@ -1833,7 +1923,7 @@ def save_overlay(
         overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], f'patches_s{slice_z * downsample_factor:05}')
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_yx, out_path, pass_seed_patch_id, pass_idx=1):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path, pass_seed_patch_id, pass_idx=1):
     patches_list = list(patches_dict.values())
     patch_ids = list(patches_dict.keys())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
@@ -2100,6 +2190,18 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, z_to_umbilicus_y
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
             losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, working_set_patches_dict, point_collections) * cfg['loss_weight_winding_number']
 
+        if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
+            unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                unattached_pcl_strips,
+                cfg['unattached_pcl_num_per_step'],
+                cfg['unattached_pcl_num_points_per_step'],
+                compute_dt=compute_patch_dt,
+            )
+            losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
+            losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
+
         losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
 
         loss = sum(losses.values())
@@ -2256,10 +2358,11 @@ def main():
     print(f'dropped {len(dropped_patch_ids)} patches and {len(dropped_pcl_ids)} pcls outside z-roi [{z_begin}, {z_end})')
 
     normalise_pcl_winding_annotations(point_collections)
-    cross_patch_point_collections, single_patch_point_collections = categorise_point_collections(point_collections, patches)
+    cross_patch_point_collections, unattached_point_collections = categorise_point_collections(point_collections, patches)
+    unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections)
     print(
-        f'partitioned pcls: {len(cross_patch_point_collections)} cross-patch '
-        f'(used for winding-number loss), {len(single_patch_point_collections)} single-patch'
+        f'partitioned pcls: {len(cross_patch_point_collections)} cross-patch, '
+        f'{len(unattached_pcl_strips)} unattached'
     )
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
@@ -2276,6 +2379,7 @@ def main():
             scroll_zarr_array,
             patches,
             list(cross_patch_point_collections.values()),
+            unattached_pcl_strips,
             umbilicus,
             out_path,
             pass_seed_patch_id=None,
@@ -2288,6 +2392,7 @@ def main():
             scroll_zarr_array,
             patches,
             list(cross_patch_point_collections.values()),
+            unattached_pcl_strips,
             umbilicus,
             out_path,
             pass_seed_patch_id=seed_patch_id,
@@ -2304,6 +2409,7 @@ def main():
             scroll_zarr_array,
             pass_pool_patches,
             list(cross_patch_point_collections.values()),
+            unattached_pcl_strips,
             umbilicus,
             out_path,
             pass_seed_patch_id=current_seed_patch_id,

@@ -144,7 +144,7 @@ def categorise_point_collections(point_collections, patches_dict):
     #                The winding-number loss consumes this directly.
     #   single_patch: the rest (touch 0 or 1 patches in total).
     cross_patch = {}
-    single_patch = {}
+    unattached = {}
     for pcl_id, pcl in point_collections.items():
         points_by_patch = {}
         for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
@@ -159,5 +159,5 @@ def categorise_point_collections(point_collections, patches_dict):
             new_pcl['points_by_patch'] = points_by_patch
             cross_patch[pcl_id] = new_pcl
         else:
-            single_patch[pcl_id] = pcl
-    return cross_patch, single_patch
+            unattached[pcl_id] = pcl
+    return cross_patch, unattached
