@@ -1428,8 +1428,10 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
     # get_patch_satisfied_areas), pick the snapped median normalised shifted-radius
     # as the target winding, then count points that satisfy both the same spiral-
     # space radius tolerance and the same scan-space distance tolerance used for
-    # quad satisfaction. Returns two 1-D int64 tensors: (satisfied_count_per_pcl,
-    # total_count_per_pcl).
+    # quad satisfaction. Returns three values: (satisfied_count_per_pcl,
+    # total_count_per_pcl, per_point_satisfaction) — the first two are 1-D int64
+    # tensors, and per_point_satisfaction is a list of CPU bool tensors (one per
+    # pcl, of length N for that pcl; empty pcls get an empty tensor).
     spiral_tolerance = dr_per_winding.detach() * metrics_config['satisfaction_radius_tolerance']
     scan_tolerance = metrics_config['satisfaction_distance_tolerance']
     dr = dr_per_winding.detach()
@@ -1437,11 +1439,13 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
 
     satisfied_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
     total_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
+    per_point_satisfaction = []
     with torch.no_grad():
         for k, strip in enumerate(pcl_strips):
             N = strip['zyxs'].shape[0]
             total_counts[k] = N
             if N == 0:
+                per_point_satisfaction.append(torch.zeros([0], dtype=torch.bool))
                 continue
             zyxs = torch.from_numpy(strip['zyxs']).to(device=device, dtype=torch.float32)
             windings = torch.from_numpy(strip['windings']).to(device=device, dtype=torch.float32)
@@ -1467,7 +1471,8 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
 
             satisfied = spiral_in_band & scan_in_band
             satisfied_counts[k] = int(satisfied.sum().item())
-    return satisfied_counts, total_counts
+            per_point_satisfaction.append(satisfied.cpu())
+    return satisfied_counts, total_counts, per_point_satisfaction
 
 
 def get_face_indices(h, w):
@@ -1871,6 +1876,7 @@ def save_overlay(
     zs_for_visualisation, all_zs, slice_yx,
     scroll_slices_for_visualisation, prediction_slices_for_visualisation,
     quad_label_map, quad_status_flat,
+    unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
     umbilicus_zyx, z_to_umbilicus_yx,
     out_path, suffix
 ):
@@ -1899,7 +1905,7 @@ def save_overlay(
         canvas = canvas.to(torch.uint8).cpu().numpy()
         Image.fromarray(canvas).save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
-    def overlay_on_patch_satisfaction(spiral, spiral_zyx, label_map, name):
+    def overlay_on_patch_satisfaction(spiral, spiral_zyx, label_map, slice_z, name):
         # quad_status_flat: 0=patch-and-quad not satisfied, 1=quad-only satisfied, 2=patch overall satisfied, 3=not in working set
         status = quad_status_flat.to(device=spiral.device, dtype=torch.int64)
         label_map = label_map.to(device=spiral.device, dtype=torch.int64)
@@ -1927,7 +1933,33 @@ def save_overlay(
         patch_mask = (label_map > 0)[..., None]
         canvas = torch.where(patch_mask, colour_table[label_map].to(torch.float32), canvas)
         canvas = canvas.to(torch.uint8).cpu().numpy()
-        Image.fromarray(canvas).save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
+        image = Image.fromarray(canvas)
+        if unattached_pcl_strips:
+            draw = ImageDraw.Draw(image)
+            pcl_z_window = 4
+            point_radius = 1
+            pcl_palette = [(200, 0, 0), (230, 140, 0), (255, 200, 0)]  # matches status_palette[0:3]
+            for k, strip in enumerate(unattached_pcl_strips):
+                zyxs = strip['zyxs']
+                in_slab = np.abs(zyxs[:, 0] - float(slice_z)) <= pcl_z_window
+                if not in_slab.any():
+                    continue
+                fully = bool(unattached_pcl_fully_satisfied[k].item())
+                per_point_sat = unattached_pcl_per_point_satisfied[k].numpy()
+                for idx in np.nonzero(in_slab)[0]:
+                    y = float(zyxs[idx, 1])
+                    x = float(zyxs[idx, 2])
+                    if fully:
+                        colour = pcl_palette[2]
+                    elif per_point_sat[idx]:
+                        colour = pcl_palette[1]
+                    else:
+                        colour = pcl_palette[0]
+                    draw.ellipse(
+                        [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
+                        fill=colour,
+                    )
+        image.save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
     def overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, name):
         slice_min = slice[slice > 0].amin() if (slice > 0).any() else 0
@@ -1972,7 +2004,7 @@ def save_overlay(
         slice = scroll_slices_for_visualisation[vis_slice_idx].to(device)
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
-        overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], f'patches_s{slice_z * downsample_factor:05}')
+        overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
 
 
 def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path, pass_seed_patch_id, pass_idx=1):
@@ -2096,9 +2128,12 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         total_area = float(total_areas.sum().item())
         satisfied_area_ratio = satisfied_area / max(total_area, 1e-9)
         print(f'satisfied_area = {satisfied_area:.1f}/{total_area:.1f} ({satisfied_area_ratio * 100:.1f}%)')
+        unattached_pcl_per_point_satisfied = []
+        unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
         if unattached_pcl_strips:
-            unattached_pcl_satisfied_counts, unattached_pcl_total_counts = get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips)
-            fully_satisfied_pcls = int((unattached_pcl_satisfied_counts == unattached_pcl_total_counts).sum().item())
+            unattached_pcl_satisfied_counts, unattached_pcl_total_counts, unattached_pcl_per_point_satisfied = get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips)
+            unattached_pcl_fully_satisfied = (unattached_pcl_satisfied_counts == unattached_pcl_total_counts)
+            fully_satisfied_pcls = int(unattached_pcl_fully_satisfied.sum().item())
             num_pcls = len(unattached_pcl_strips)
             fully_satisfied_ratio = fully_satisfied_pcls / max(num_pcls, 1)
             print(f'satisfied_unattached_pcls = {fully_satisfied_pcls}/{num_pcls} ({fully_satisfied_ratio * 100:.1f}%)')
@@ -2135,6 +2170,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 zs_for_visualisation, all_zs, slice_yx,
                 scroll_slices_for_visualisation, prediction_slices_for_visualisation,
                 quad_label_map, quad_status_flat,
+                unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
                 umbilicus_zyx, z_to_umbilicus_yx,
                 out_path, suffix
             )
