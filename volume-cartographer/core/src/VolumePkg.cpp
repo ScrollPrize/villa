@@ -69,7 +69,7 @@ bool isSingleZarrVolumeDir(const fs::path& dir)
              || hasZarrMarkerAtRoot(dir);
     if (!meta) return false;
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.is_directory() && fs::exists(e.path() / ".zarray")) return true;
+        if (e.is_directory() && hasZarrMarkerAtRoot(e.path())) return true;
     }
     return false;
 }
@@ -295,7 +295,7 @@ std::string validateLocation(Category category, const std::string& location)
         case Category::Volumes:
             if (isSingleZarrVolumeDir(path)) return {};
             if (anyImmediateSubdir(path, &isSingleZarrVolumeDir)) return {};
-            return "Not a zarr volume and contains no zarr volumes (expected meta.json + chunk-level .zarray).";
+            return "Not a zarr volume and contains no zarr volumes (expected volume metadata plus chunk-level .zarray or zarr.json).";
         case Category::Segments:
             if (isSegmentDir(path)) return {};
             if (anyImmediateSubdir(path, &isSegmentDir)) return {};

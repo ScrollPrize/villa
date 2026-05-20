@@ -78,7 +78,8 @@ public:
 
     // Create a Volume backed by a remote zarr store over HTTP.
     // If auth is provided, it is used as-is; otherwise credentials are read
-    // from environment variables. cacheRoot is currently ignored.
+    // from environment variables. When cacheRoot is non-empty, remote chunks
+    // are persisted under a volume-specific subdirectory of that root.
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},
@@ -95,6 +96,8 @@ public:
     void updateMetadata(const utils::Json& metadata);
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
+    [[nodiscard]] std::filesystem::path remoteCacheRoot() const noexcept { return remoteCacheRoot_; }
+    [[nodiscard]] std::filesystem::path remotePersistentCachePath() const;
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
 
     [[nodiscard]] int sliceWidth() const noexcept;
@@ -246,6 +249,7 @@ protected:
 
     std::vector<std::array<int, 3>> zarrLevelShapes_;
     std::vector<std::array<int, 3>> zarrLevelChunkShapes_;
+    std::vector<std::array<int, 3>> zarrLevelStorageChunkShapes_;
     vc::render::ChunkDtype zarrDtype_ = vc::render::ChunkDtype::UInt8;
     double zarrFillValue_ = 0.0;
     PyramidPolicy::Reduction pyramidReduction_ = PyramidPolicy::Reduction::Mean;
@@ -263,5 +267,6 @@ protected:
     bool isRemote_ = false;
     std::string remoteUrl_;
     vc::HttpAuth remoteAuth_;
+    std::filesystem::path remoteCacheRoot_;
     size_t remoteNumScales_ = 0;
 };

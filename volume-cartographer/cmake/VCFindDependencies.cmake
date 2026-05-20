@@ -133,9 +133,21 @@ endif()
 # Use system-installed libblosc instead of building from source.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(BLOSC REQUIRED IMPORTED_TARGET blosc)
-# Alias so existing target_link_libraries(... blosc_static) still works
+find_path(LZ4_INCLUDE_DIR NAMES lz4.h REQUIRED)
+find_library(LZ4_LIBRARY NAMES lz4 REQUIRED)
+if(NOT TARGET VC::LZ4)
+    add_library(VC::LZ4 UNKNOWN IMPORTED)
+    set_target_properties(VC::LZ4 PROPERTIES
+        IMPORTED_LOCATION "${LZ4_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${LZ4_INCLUDE_DIR}"
+    )
+endif()
+# Compatibility target so existing target_link_libraries(... blosc_static) still
+# works while carrying libblosc's LZ4 dependency on distros where pkg-config does
+# not expose it on the imported target.
 if(NOT TARGET blosc_static)
-    add_library(blosc_static ALIAS PkgConfig::BLOSC)
+    add_library(blosc_static INTERFACE)
+    target_link_libraries(blosc_static INTERFACE PkgConfig::BLOSC VC::LZ4)
 endif()
 
 # ---- CURL (for HTTP chunk source / remote volumes) ---------------------------

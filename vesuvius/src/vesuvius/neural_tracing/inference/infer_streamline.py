@@ -35,7 +35,7 @@ from vesuvius.tifxyz import read_tifxyz
 TIFXYZ_PATH = None
 VOLUME_PATH = "auto"
 VOLUME_SCALE = 0
-VOLUME_CACHE_DIR = "/tmp/vesuvius-volume-cache"
+VOLUME_CACHE_DIR = "/home/sean/Documents/tmp_infer/vesuvius-volume-cache"
 VOLUME_CACHE_RETRY_SECONDS = 0.0
 CHECKPOINT_PATH = None
 
@@ -48,17 +48,17 @@ COMPILE_MODEL = True
 
 OVERLAP_FRAC = 0.5
 OUTPUT_ZARR_PATH = None
-OUTPUT_TIFXYZ_DIR = None
+OUTPUT_TIFXYZ_DIR = "/home/sean/Documents/"
 OUTPUT_TIFXYZ_VOXEL_SIZE_UM = None
 RUN_OUTPUT_DIR = None
 RUN_TIMESTAMP = None
 MERGE_OUTPUTS_CHUNK_SIZE = 256
-MERGE_OUTPUTS_MMAP_DIR = "/tmp/streamline_tmp_outputs/"
+MERGE_OUTPUTS_MMAP_DIR = "/home/sean/Documents/tmp_infer/streamline_tmp_outputs/"
 GEOMEDIAN_VECTOR_OUTPUTS = ("velocity_dir", "surface_attract")
 VECTOR_MERGE_METHOD = "mean"  # "geomedian" or "mean"
 GEOMEDIAN_MAX_ITER = 8
 GEOMEDIAN_EPS = 1e-6
-USE_TTA = True
+USE_TTA = False
 TTA_FLIP_AXES = ((2,), (3,), (4,)) #, (2, 3), (2, 4), (3, 4), (2, 3, 4))
 SHOW_NAPARI = False
 

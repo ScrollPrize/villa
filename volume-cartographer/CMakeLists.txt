@@ -29,7 +29,13 @@ option(VC_ENABLE_TSAN       "Enable ThreadSanitizer for data race detection"    
 option(VC_ENABLE_LSAN       "Enable LeakSanitizer for memory leak detection (standalone)" OFF)
 option(VC_ENABLE_COVERAGE   "Enable code coverage instrumentation (use with Debug build)" OFF)
 option(VC_BUILD_TESTS          "Build unit tests"                               OFF)
+option(VC_BUILD_PYTHON         "Build Python bindings"                          OFF)
 mark_as_advanced(VC_DEVELOPER_WARNINGS)
+
+if(VC_BUILD_PYTHON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY ON)
+endif()
 
 # ---- Modules -----------------------------------------------------------------
 include(VCToolchain)
@@ -48,8 +54,11 @@ add_subdirectory(utils)
 add_subdirectory(core)
 add_subdirectory(apps)
 
+if(VC_BUILD_PYTHON)
+    add_subdirectory(python)
+endif()
+
 if(VC_BUILD_TESTS)
     enable_testing()
     add_subdirectory(core/test)
 endif()
-

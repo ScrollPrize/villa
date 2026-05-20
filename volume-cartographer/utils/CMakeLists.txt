@@ -1,7 +1,9 @@
 # utils — C++23 utility library (vendored)
 # Source: https://github.com/SuperOptimizer/utils
 
-find_package(nlohmann_json REQUIRED)
+if(NOT TARGET nlohmann_json::nlohmann_json)
+    find_package(nlohmann_json REQUIRED)
+endif()
 
 add_library(utils STATIC src/zarr.cpp src/Json.cpp src/aws_auth.cpp)
 target_include_directories(utils PUBLIC
