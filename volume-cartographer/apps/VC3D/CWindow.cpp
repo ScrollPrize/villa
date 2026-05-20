@@ -926,6 +926,16 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     }
 
     if (_wrapAnnotationWidget && !viewer->property("vc_wrap_annotation_bound").toBool()) {
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::collectionSelected,
+                viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectCollection, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointSelected,
+                viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointSelected,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointClicked,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationToggled,
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationSpacingChanged,
@@ -1928,6 +1938,8 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
     if (_pointsOverlay) {
         _pointsOverlay->setViewTolerance(_point_collection_widget->pointViewTolerance());
         connect(_point_collection_widget, &CPointCollectionWidget::pointViewToleranceChanged,

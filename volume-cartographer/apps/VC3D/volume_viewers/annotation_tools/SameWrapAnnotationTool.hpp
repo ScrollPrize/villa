@@ -2,6 +2,7 @@
 
 #include <QImage>
 #include <QPointF>
+#include <QRectF>
 
 #include <functional>
 #include <cstdint>
@@ -22,6 +23,13 @@ struct SameWrapAnnotationMergeBucket {
 
 class SameWrapAnnotationTool {
 public:
+    struct MixedDirectionMergeWarning {
+        std::string firstCollectionName;
+        std::string firstDirectionKey;
+        std::string secondCollectionName;
+        std::string secondDirectionKey;
+    };
+
     enum class PathType {
         ConnectedComponents = 0,
         ShortestPath = 1,
@@ -38,6 +46,7 @@ public:
     using VolumeToSceneFn = std::function<QPointF(const cv::Vec3f&)>;
     using SetOverlayGroupFn = std::function<void(const std::string&, const std::vector<QGraphicsItem*>&)>;
     using ClearOverlayGroupFn = std::function<void(const std::string&)>;
+    using ConfirmMixedDirectionMergeFn = std::function<bool(const MixedDirectionMergeWarning&)>;
 
     bool enabled() const { return _state.enabled; }
     bool hasPreview() const { return _state.hasPreview; }
@@ -54,9 +63,17 @@ public:
     void setImageFilterKernelSize(int kernelSize);
     void noteShiftReleased();
     void clear(const ClearOverlayGroupFn& clearOverlayGroup);
-    bool commit(VCCollection* pointCollection, const ClearOverlayGroupFn& clearOverlayGroup);
+    bool commit(VCCollection* pointCollection,
+                const VolumeToSceneFn& volumeToScene,
+                const QRectF& visibleSceneRect,
+                const ClearOverlayGroupFn& clearOverlayGroup);
     bool undoLastCommit(VCCollection* pointCollection);
-    bool manualMergePointClicked(VCCollection* pointCollection, uint64_t collectionId, uint64_t pointId);
+    bool manualMergePointClicked(VCCollection* pointCollection,
+                                 uint64_t collectionId,
+                                 uint64_t pointId,
+                                 const VolumeToSceneFn& volumeToScene,
+                                 const QRectF& visibleSceneRect,
+                                 const ConfirmMixedDirectionMergeFn& confirmMixedDirectionMerge = {});
     void refreshOverlay(const VolumeToSceneFn& volumeToScene,
                         const SetOverlayGroupFn& setOverlayGroup,
                         const ClearOverlayGroupFn& clearOverlayGroup);

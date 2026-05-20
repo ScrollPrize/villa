@@ -24,6 +24,7 @@
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPointer>
@@ -3042,6 +3043,8 @@ bool CChunkedVolumeViewer::commitSameWrapAnnotationPreview()
 {
     return _sameWrapAnnotation.commit(
         _pointCollection,
+        [this](const cv::Vec3f& point) { return volumeToScene(point); },
+        QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
         [this](const std::string& key) { clearOverlayGroup(key); });
 }
 
@@ -3078,7 +3081,31 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
         modifiers.testFlag(Qt::ShiftModifier)) {
         if (const auto hit = pointAtScenePosition(scenePos)) {
-            if (_sameWrapAnnotation.manualMergePointClicked(_pointCollection, hit->first, hit->second)) {
+            if (_sameWrapAnnotation.manualMergePointClicked(
+                    _pointCollection,
+                    hit->first,
+                    hit->second,
+                    [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                    QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
+                    [this](const SameWrapAnnotationTool::MixedDirectionMergeWarning& warning) {
+                        const auto directionText = [this](const std::string& key) {
+                            return key == "z" ? tr("mostly up/down in Z") : tr("mostly in XY");
+                        };
+                        const QMessageBox::StandardButton reply = QMessageBox::warning(
+                            this,
+                            tr("Same-wrap Merge"),
+                            tr("You are about to merge two same-wrap point collections with different dominant directions:\n\n"
+                               "%1: %2\n"
+                               "%3: %4\n\n"
+                               "Continue merging?")
+                                .arg(QString::fromStdString(warning.firstCollectionName),
+                                     directionText(warning.firstDirectionKey),
+                                     QString::fromStdString(warning.secondCollectionName),
+                                     directionText(warning.secondDirectionKey)),
+                            QMessageBox::Yes | QMessageBox::No,
+                            QMessageBox::No);
+                        return reply == QMessageBox::Yes;
+                    })) {
                 if (_pointCollection && _pointCollection->getPoint(hit->second)) {
                     _selectedCollectionId = hit->first;
                     _selectedPointId = hit->second;

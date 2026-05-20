@@ -10,6 +10,7 @@
 #include <QGraphicsPathItem>
 #include <QPainterPath>
 #include <QPen>
+#include <QRectF>
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <iterator>
+#include <optional>
 #include <queue>
 #include <string_view>
 #include <unordered_map>
@@ -27,6 +29,7 @@
 
 namespace {
 constexpr const char* kSameWrapAnnotationOverlayKey = "same_wrap_annotation_preview";
+constexpr qreal kNearbyCollectionColorRadiusPx = 160.0;
 
 bool isSameWrapCollectionName(const std::string& name)
 {
@@ -258,6 +261,271 @@ std::string dominantDirectionKey(const std::vector<cv::Vec3f>& path)
         zMotion += std::abs(delta[2]);
     }
     return zMotion > xyMotion ? "z" : "xy";
+}
+
+float rgbDistance2(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    const cv::Vec3f delta = a - b;
+    return delta.dot(delta);
+}
+
+cv::Vec3f qColorToVec3f(const QColor& color)
+{
+    return {
+        static_cast<float>(color.redF()),
+        static_cast<float>(color.greenF()),
+        static_cast<float>(color.blueF())
+    };
+}
+
+struct WeightedColor {
+    cv::Vec3f color;
+    float weight = 1.0f;
+};
+
+std::vector<cv::Vec3f> sameWrapCandidateColors()
+{
+    static constexpr std::array<QRgb, 16> palette = {
+        qRgb(0, 255, 255),    // cyan
+        qRgb(255, 230, 0),    // yellow
+        qRgb(0, 255, 70),     // green
+        qRgb(0, 120, 255),    // blue
+        qRgb(255, 128, 0),    // orange
+        qRgb(180, 0, 255),    // violet
+        qRgb(255, 0, 180),    // magenta
+        qRgb(255, 40, 40),    // red
+        qRgb(64, 255, 160),   // mint
+        qRgb(120, 180, 255),  // sky
+        qRgb(255, 160, 220),  // pink
+        qRgb(180, 255, 80),   // lime
+        qRgb(0, 190, 160),    // teal
+        qRgb(255, 180, 80),   // amber
+        qRgb(120, 80, 255),   // indigo
+        qRgb(255, 80, 120)    // coral
+    };
+
+    std::vector<cv::Vec3f> colors;
+    colors.reserve(palette.size());
+    for (const QRgb rgb : palette) {
+        colors.push_back(qColorToVec3f(QColor::fromRgb(rgb)));
+    }
+    return colors;
+}
+
+float circularHueDistance(float a, float b)
+{
+    if (a < 0.0f || b < 0.0f) {
+        return 0.0f;
+    }
+    const float delta = std::abs(a - b);
+    return std::min(delta, 1.0f - delta);
+}
+
+float visualColorDistance(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    const QColor qa = QColor::fromRgbF(
+        std::clamp(a[0], 0.0f, 1.0f),
+        std::clamp(a[1], 0.0f, 1.0f),
+        std::clamp(a[2], 0.0f, 1.0f));
+    const QColor qb = QColor::fromRgbF(
+        std::clamp(b[0], 0.0f, 1.0f),
+        std::clamp(b[1], 0.0f, 1.0f),
+        std::clamp(b[2], 0.0f, 1.0f));
+
+    const float hueDistance = circularHueDistance(qa.hsvHueF(), qb.hsvHueF());
+    const float saturationDistance = static_cast<float>(qa.hsvSaturationF() - qb.hsvSaturationF());
+    const float valueDistance = static_cast<float>(qa.valueF() - qb.valueF());
+    return 4.0f * hueDistance * hueDistance +
+           0.75f * saturationDistance * saturationDistance +
+           0.5f * valueDistance * valueDistance +
+           1.25f * rgbDistance2(a, b);
+}
+
+std::vector<int> sameWrapPaletteUsage(const VCCollection* pointCollection,
+                                      const std::unordered_set<uint64_t>& excludedCollectionIds,
+                                      const std::vector<cv::Vec3f>& candidates)
+{
+    std::vector<int> usage(candidates.size(), 0);
+    if (!pointCollection) {
+        return usage;
+    }
+
+    constexpr float kSameColorDistance = 0.03f;
+    for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {
+        if (excludedCollectionIds.count(collectionId) != 0 || !isSameWrapCollectionName(collection.name)) {
+            continue;
+        }
+
+        auto bestIt = candidates.end();
+        float bestDistance = std::numeric_limits<float>::infinity();
+        for (auto it = candidates.begin(); it != candidates.end(); ++it) {
+            const float distance = visualColorDistance(collection.color, *it);
+            if (distance < bestDistance) {
+                bestIt = it;
+                bestDistance = distance;
+            }
+        }
+        if (bestIt != candidates.end() && bestDistance <= kSameColorDistance) {
+            const auto idx = static_cast<std::size_t>(std::distance(candidates.begin(), bestIt));
+            ++usage[idx];
+        }
+    }
+    return usage;
+}
+
+std::optional<cv::Vec3f> mostRecentSameWrapColor(
+    const VCCollection* pointCollection,
+    const std::unordered_set<uint64_t>& excludedCollectionIds)
+{
+    if (!pointCollection) {
+        return std::nullopt;
+    }
+
+    std::optional<cv::Vec3f> color;
+    int64_t latestCreationTime = std::numeric_limits<int64_t>::min();
+    uint64_t latestCollectionId = 0;
+    for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {
+        if (excludedCollectionIds.count(collectionId) != 0 || !isSameWrapCollectionName(collection.name)) {
+            continue;
+        }
+
+        int64_t collectionCreationTime = std::numeric_limits<int64_t>::min();
+        for (const auto& [pointId, point] : collection.points) {
+            (void)pointId;
+            collectionCreationTime = std::max(collectionCreationTime, point.creation_time);
+        }
+        if (collectionCreationTime > latestCreationTime ||
+            (collectionCreationTime == latestCreationTime && collectionId > latestCollectionId)) {
+            color = collection.color;
+            latestCreationTime = collectionCreationTime;
+            latestCollectionId = collectionId;
+        }
+    }
+    return color;
+}
+
+cv::Vec3f mostDistinctColor(const std::vector<WeightedColor>& avoidedColors,
+                            const std::vector<int>& paletteUsage)
+{
+    const std::vector<cv::Vec3f> candidates = sameWrapCandidateColors();
+    cv::Vec3f best = candidates.front();
+    float bestMinDistance = -1.0f;
+    float bestTotalDistance = -1.0f;
+    int bestUsage = std::numeric_limits<int>::max();
+
+    int minUsage = 0;
+    if (paletteUsage.size() == candidates.size()) {
+        minUsage = *std::min_element(paletteUsage.begin(), paletteUsage.end());
+    }
+
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const int usage = paletteUsage.size() == candidates.size() ? paletteUsage[i] : 0;
+        if (usage != minUsage) {
+            continue;
+        }
+
+        const cv::Vec3f& candidate = candidates[i];
+        float minDistance = std::numeric_limits<float>::infinity();
+        float totalDistance = 0.0f;
+        for (const WeightedColor& avoidedColor : avoidedColors) {
+            const float distance = visualColorDistance(candidate, avoidedColor.color);
+            minDistance = std::min(minDistance, distance);
+            totalDistance += distance * avoidedColor.weight;
+        }
+        if (usage < bestUsage ||
+            (usage == bestUsage && minDistance > bestMinDistance) ||
+            (minDistance == bestMinDistance && totalDistance > bestTotalDistance)) {
+            best = candidate;
+            bestUsage = usage;
+            bestMinDistance = minDistance;
+            bestTotalDistance = totalDistance;
+        }
+    }
+    return best;
+}
+
+std::optional<cv::Vec3f> colorDistinctFromVisibleCollections(
+    const VCCollection* pointCollection,
+    const std::vector<cv::Vec3f>& points,
+    const std::unordered_set<uint64_t>& excludedCollectionIds,
+    const std::vector<cv::Vec3f>& extraAvoidedColors,
+    const SameWrapAnnotationTool::VolumeToSceneFn& volumeToScene,
+    const QRectF& visibleSceneRect)
+{
+    if (!pointCollection || points.empty()) {
+        return std::nullopt;
+    }
+
+    const std::vector<cv::Vec3f> candidates = sameWrapCandidateColors();
+    const std::vector<int> paletteUsage =
+        sameWrapPaletteUsage(pointCollection, excludedCollectionIds, candidates);
+
+    std::vector<WeightedColor> avoidedColors;
+    avoidedColors.reserve(extraAvoidedColors.size() + 1);
+    for (const cv::Vec3f& color : extraAvoidedColors) {
+        avoidedColors.push_back({color, 24.0f});
+    }
+    if (const auto previousColor = mostRecentSameWrapColor(pointCollection, excludedCollectionIds)) {
+        avoidedColors.push_back({*previousColor, 32.0f});
+    }
+
+    if (!volumeToScene || visibleSceneRect.isEmpty()) {
+        return mostDistinctColor(avoidedColors, paletteUsage);
+    }
+
+    std::vector<QPointF> visibleNewPoints;
+    visibleNewPoints.reserve(points.size());
+    for (const cv::Vec3f& point : points) {
+        const QPointF scenePoint = volumeToScene(point);
+        if (std::isfinite(scenePoint.x()) &&
+            std::isfinite(scenePoint.y()) &&
+            visibleSceneRect.contains(scenePoint)) {
+            visibleNewPoints.push_back(scenePoint);
+        }
+    }
+    if (visibleNewPoints.empty()) {
+        return mostDistinctColor(avoidedColors, paletteUsage);
+    }
+
+    constexpr qreal radius2 = kNearbyCollectionColorRadiusPx * kNearbyCollectionColorRadiusPx;
+    std::unordered_set<uint64_t> avoidedCollectionIds;
+    const auto& collections = pointCollection->getAllCollections();
+    for (const auto& [collectionId, collection] : collections) {
+        if (excludedCollectionIds.count(collectionId) != 0) {
+            continue;
+        }
+        bool isVisible = false;
+        bool isNearby = false;
+        for (const auto& [pointId, point] : collection.points) {
+            (void)pointId;
+            const QPointF scenePoint = volumeToScene(point.p);
+            if (!std::isfinite(scenePoint.x()) ||
+                !std::isfinite(scenePoint.y()) ||
+                !visibleSceneRect.contains(scenePoint)) {
+                continue;
+            }
+            isVisible = true;
+            for (const QPointF& newScenePoint : visibleNewPoints) {
+                const qreal dx = scenePoint.x() - newScenePoint.x();
+                const qreal dy = scenePoint.y() - newScenePoint.y();
+                if (dx * dx + dy * dy <= radius2) {
+                    isNearby = true;
+                    break;
+                }
+            }
+            if (isNearby) {
+                break;
+            }
+        }
+        if (isVisible && avoidedCollectionIds.insert(collectionId).second) {
+            avoidedColors.push_back({collection.color, isNearby ? 8.0f : 1.0f});
+        }
+    }
+
+    if (avoidedColors.empty()) {
+        return mostDistinctColor(avoidedColors, paletteUsage);
+    }
+    return mostDistinctColor(avoidedColors, paletteUsage);
 }
 
 SameWrapAnnotationMergeBucket& findOrCreateMergeBucket(
@@ -578,6 +846,8 @@ void SameWrapAnnotationTool::clear(const ClearOverlayGroupFn& clearOverlayGroup)
 }
 
 bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
+                                    const VolumeToSceneFn& volumeToScene,
+                                    const QRectF& visibleSceneRect,
                                     const ClearOverlayGroupFn& clearOverlayGroup)
 {
     if (!_state.enabled || !_state.hasPreview ||
@@ -591,6 +861,16 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
         for (const SameWrapAnnotationMergeBucket& bucket : _state.mergeBuckets) {
             collectionIdsToClear.insert(bucket.collectionIds.begin(), bucket.collectionIds.end());
         }
+
+        std::unordered_map<uint64_t, cv::Vec3f> sourceCollectionColors;
+        const auto& collections = pointCollection->getAllCollections();
+        for (uint64_t collectionId : collectionIdsToClear) {
+            const auto it = collections.find(collectionId);
+            if (it != collections.end()) {
+                sourceCollectionColors.emplace(collectionId, it->second.color);
+            }
+        }
+
         for (uint64_t collectionId : collectionIdsToClear) {
             pointCollection->clearCollection(collectionId);
         }
@@ -602,6 +882,23 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
             const uint64_t collectionId = pointCollection->getCollectionId(bucket.collectionName);
             if (collectionId != 0) {
                 pointCollection->setCollectionTag(collectionId, "same_wrap_direction", bucket.directionKey);
+                std::vector<cv::Vec3f> sourceColorsToAvoid;
+                sourceColorsToAvoid.reserve(bucket.collectionIds.size());
+                for (uint64_t sourceCollectionId : bucket.collectionIds) {
+                    const auto colorIt = sourceCollectionColors.find(sourceCollectionId);
+                    if (colorIt != sourceCollectionColors.end()) {
+                        sourceColorsToAvoid.push_back(colorIt->second);
+                    }
+                }
+                if (const auto color = colorDistinctFromVisibleCollections(
+                        pointCollection,
+                        bucket.points,
+                        std::unordered_set<uint64_t>{collectionId},
+                        sourceColorsToAvoid,
+                        volumeToScene,
+                        visibleSceneRect)) {
+                    pointCollection->setCollectionColor(collectionId, *color);
+                }
                 committedCollectionIds.push_back(collectionId);
             }
         }
@@ -610,6 +907,15 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
         pointCollection->addPoints(collectionName, _state.sampledVolumePoints);
         const uint64_t collectionId = pointCollection->getCollectionId(collectionName);
         if (collectionId != 0) {
+            if (const auto color = colorDistinctFromVisibleCollections(
+                    pointCollection,
+                    _state.sampledVolumePoints,
+                    std::unordered_set<uint64_t>{collectionId},
+                    {},
+                    volumeToScene,
+                    visibleSceneRect)) {
+                pointCollection->setCollectionColor(collectionId, *color);
+            }
             committedCollectionIds.push_back(collectionId);
         }
     }
@@ -647,7 +953,10 @@ bool SameWrapAnnotationTool::undoLastCommit(VCCollection* pointCollection)
 
 bool SameWrapAnnotationTool::manualMergePointClicked(VCCollection* pointCollection,
                                                      uint64_t collectionId,
-                                                     uint64_t pointId)
+                                                     uint64_t pointId,
+                                                     const VolumeToSceneFn& volumeToScene,
+                                                     const QRectF& visibleSceneRect,
+                                                     const ConfirmMixedDirectionMergeFn& confirmMixedDirectionMerge)
 {
     if (!_state.enabled || !_state.mergeExistingAnnotations || !pointCollection ||
         collectionId == 0 || pointId == 0) {
@@ -686,6 +995,22 @@ bool SameWrapAnnotationTool::manualMergePointClicked(VCCollection* pointCollecti
         return true;
     }
 
+    const std::string firstDirectionKey = dominantDirectionKey(orderedCollectionPositions(firstIt->second));
+    const std::string secondDirectionKey = dominantDirectionKey(orderedCollectionPositions(collectionIt->second));
+    if (firstDirectionKey != secondDirectionKey && confirmMixedDirectionMerge) {
+        const MixedDirectionMergeWarning warning{
+            firstIt->second.name,
+            firstDirectionKey,
+            collectionIt->second.name,
+            secondDirectionKey
+        };
+        if (!confirmMixedDirectionMerge(warning)) {
+            _state.pendingMergeCollectionId = firstCollectionId;
+            _state.pendingMergePointId = firstPointId;
+            return true;
+        }
+    }
+
     std::vector<cv::Vec3f> mergedPoints =
         bestEndpointMergeOrder(firstIt->second, collectionIt->second);
     mergedPoints = removeClosePoints(mergedPoints, _state.spacingVx);
@@ -695,12 +1020,25 @@ bool SameWrapAnnotationTool::manualMergePointClicked(VCCollection* pointCollecti
 
     const std::string mergedCollectionName = firstIt->second.name;
     const std::string directionKey = dominantDirectionKey(mergedPoints);
+    const std::vector<cv::Vec3f> sourceColorsToAvoid{
+        firstIt->second.color,
+        collectionIt->second.color
+    };
     pointCollection->clearCollection(firstCollectionId);
     pointCollection->clearCollection(collectionId);
     pointCollection->addPoints(mergedCollectionName, mergedPoints);
     const uint64_t mergedCollectionId = pointCollection->getCollectionId(mergedCollectionName);
     if (mergedCollectionId != 0) {
         pointCollection->setCollectionTag(mergedCollectionId, "same_wrap_direction", directionKey);
+        if (const auto color = colorDistinctFromVisibleCollections(
+                pointCollection,
+                mergedPoints,
+                std::unordered_set<uint64_t>{mergedCollectionId},
+                sourceColorsToAvoid,
+                volumeToScene,
+                visibleSceneRect)) {
+            pointCollection->setCollectionColor(mergedCollectionId, *color);
+        }
     }
     return true;
 }

@@ -2,12 +2,15 @@
 
 #include <algorithm>
 
+#include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QItemSelectionModel>
 #include <QLabel>
+#include <QMenu>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSpinBox>
@@ -60,17 +63,17 @@ WrapAnnotationWidget::WrapAnnotationWidget(VCCollection* collection, QWidget* pa
 
     if (_pointCollection) {
         connect(_pointCollection, &VCCollection::collectionsAdded,
-                this, &WrapAnnotationWidget::refreshSameWrapTree);
+                this, &WrapAnnotationWidget::onCollectionsAdded);
         connect(_pointCollection, &VCCollection::collectionChanged,
-                this, &WrapAnnotationWidget::refreshSameWrapTree);
+                this, &WrapAnnotationWidget::onCollectionChanged);
         connect(_pointCollection, &VCCollection::collectionRemoved,
-                this, &WrapAnnotationWidget::refreshSameWrapTree);
+                this, &WrapAnnotationWidget::onCollectionRemoved);
         connect(_pointCollection, &VCCollection::pointAdded,
-                this, &WrapAnnotationWidget::refreshSameWrapTree);
+                this, &WrapAnnotationWidget::onPointAdded);
         connect(_pointCollection, &VCCollection::pointChanged,
-                this, &WrapAnnotationWidget::refreshSameWrapTree);
+                this, &WrapAnnotationWidget::onPointChanged);
         connect(_pointCollection, &VCCollection::pointRemoved,
-                this, &WrapAnnotationWidget::refreshSameWrapTree);
+                this, &WrapAnnotationWidget::onPointRemoved);
     }
 
     refreshSameWrapTree();
@@ -172,8 +175,19 @@ void WrapAnnotationWidget::setupUi()
     _sameWrapTreeView->setSelectionBehavior(QAbstractItemView::SelectRows);
     _sameWrapTreeView->setSelectionMode(QAbstractItemView::SingleSelection);
     _sameWrapTreeView->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _sameWrapTreeView->setContextMenuPolicy(Qt::CustomContextMenu);
     _sameWrapTreeView->setToolTip("Committed same-wrap annotation collections.");
     sameWrapLayout->addWidget(_sameWrapTreeView);
+    connect(_sameWrapTreeView->selectionModel(), &QItemSelectionModel::selectionChanged,
+            this, &WrapAnnotationWidget::onSelectionChanged);
+    connect(_sameWrapTreeView, &QWidget::customContextMenuRequested,
+            this, &WrapAnnotationWidget::showContextMenu);
+    connect(_sameWrapTreeView, &QTreeView::doubleClicked, this, [this](const QModelIndex& index) {
+        QStandardItem* item = _sameWrapModel ? _sameWrapModel->itemFromIndex(index.sibling(index.row(), kNameColumn)) : nullptr;
+        if (item && item->parent() && item->parent() != _sameWrapModel->invisibleRootItem()) {
+            emit pointDoubleClicked(item->data().toULongLong());
+        }
+    });
 
     layout->addWidget(sameWrapGroup);
 
@@ -277,6 +291,7 @@ void WrapAnnotationWidget::refreshSameWrapTree()
     _sameWrapModel->blockSignals(true);
     _sameWrapModel->clear();
     _sameWrapModel->setHorizontalHeaderLabels({"Name", "Points", "Direction", "Position"});
+    _pointItems.clear();
 
     if (_pointCollection) {
         std::vector<VCCollection::Collection> collections;
@@ -292,36 +307,7 @@ void WrapAnnotationWidget::refreshSameWrapTree()
                   });
 
         for (const VCCollection::Collection& collection : collections) {
-            QStandardItem* nameItem = readOnlyItem(QString::fromStdString(collection.name));
-            const QColor color(collection.color[0] * 255,
-                               collection.color[1] * 255,
-                               collection.color[2] * 255);
-            nameItem->setData(QBrush(color), Qt::DecorationRole);
-            nameItem->setData(QVariant::fromValue(collection.id));
-
-            QStandardItem* countItem = readOnlyItem(QString::number(collection.points.size()));
-            QStandardItem* directionItem = readOnlyItem(sameWrapDirectionText(collection));
-            QStandardItem* positionItem = readOnlyItem();
-            _sameWrapModel->appendRow({nameItem, countItem, directionItem, positionItem});
-
-            std::vector<ColPoint> points;
-            points.reserve(collection.points.size());
-            for (const auto& [_, point] : collection.points) {
-                points.push_back(point);
-            }
-            std::sort(points.begin(), points.end(),
-                      [](const ColPoint& a, const ColPoint& b) {
-                          return a.id < b.id;
-                      });
-
-            for (const ColPoint& point : points) {
-                QStandardItem* pointItem = readOnlyItem(QString::number(point.id));
-                pointItem->setData(QVariant::fromValue(point.id));
-                QStandardItem* emptyCountItem = readOnlyItem();
-                QStandardItem* pointDirectionItem = readOnlyItem(sameWrapDirectionText(collection));
-                QStandardItem* pointPositionItem = readOnlyItem(pointPositionText(point.p));
-                nameItem->appendRow({pointItem, emptyCountItem, pointDirectionItem, pointPositionItem});
-            }
+            appendCollectionRow(collection);
         }
     }
 
@@ -332,5 +318,357 @@ void WrapAnnotationWidget::refreshSameWrapTree()
         _sameWrapTreeView->resizeColumnToContents(kNameColumn);
         _sameWrapTreeView->resizeColumnToContents(kCountColumn);
         _sameWrapTreeView->resizeColumnToContents(kDirectionColumn);
+    }
+}
+
+void WrapAnnotationWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)
+{
+    if (!_pointCollection || !_sameWrapModel) {
+        return;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    for (uint64_t collectionId : collectionIds) {
+        if (findCollectionItem(collectionId)) {
+            continue;
+        }
+        const auto it = collections.find(collectionId);
+        if (it != collections.end() && isSameWrapCollection(it->second)) {
+            appendCollectionRow(it->second);
+        }
+    }
+}
+
+void WrapAnnotationWidget::onCollectionChanged(uint64_t collectionId)
+{
+    if (!_pointCollection || !_sameWrapModel) {
+        return;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    const auto it = collections.find(collectionId);
+    QStandardItem* item = findCollectionItem(collectionId);
+    if (it == collections.end() || !isSameWrapCollection(it->second)) {
+        if (item) {
+            for (int row = 0; row < item->rowCount(); ++row) {
+                if (QStandardItem* pointItem = item->child(row, kNameColumn)) {
+                    _pointItems.erase(pointItem->data().toULongLong());
+                }
+            }
+            _sameWrapModel->removeRow(item->row());
+        }
+        return;
+    }
+
+    const VCCollection::Collection& collection = it->second;
+    if (!item) {
+        appendCollectionRow(collection);
+        return;
+    }
+
+    item->setText(QString::fromStdString(collection.name));
+    const QColor color(collection.color[0] * 255,
+                       collection.color[1] * 255,
+                       collection.color[2] * 255);
+    item->setData(QBrush(color), Qt::DecorationRole);
+    const QString direction = sameWrapDirectionText(collection);
+    if (QStandardItem* directionItem = _sameWrapModel->item(item->row(), kDirectionColumn)) {
+        directionItem->setText(direction);
+    }
+    for (int row = 0; row < item->rowCount(); ++row) {
+        if (QStandardItem* pointDirectionItem = item->child(row, kDirectionColumn)) {
+            pointDirectionItem->setText(direction);
+        }
+    }
+    updateCollectionCount(item);
+}
+
+void WrapAnnotationWidget::onCollectionRemoved(uint64_t collectionId)
+{
+    if (!_sameWrapModel) {
+        return;
+    }
+
+    if (collectionId == static_cast<uint64_t>(-1)) {
+        _pointItems.clear();
+        refreshSameWrapTree();
+        return;
+    }
+
+    QStandardItem* item = findCollectionItem(collectionId);
+    if (item) {
+        for (int row = 0; row < item->rowCount(); ++row) {
+            if (QStandardItem* pointItem = item->child(row, kNameColumn)) {
+                _pointItems.erase(pointItem->data().toULongLong());
+            }
+        }
+        _sameWrapModel->removeRow(item->row());
+    }
+}
+
+void WrapAnnotationWidget::onPointAdded(const ColPoint& point)
+{
+    if (!_pointCollection || !_sameWrapModel) {
+        return;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    const auto it = collections.find(point.collectionId);
+    if (it == collections.end() || !isSameWrapCollection(it->second)) {
+        return;
+    }
+
+    QStandardItem* collectionItem = findCollectionItem(point.collectionId);
+    if (!collectionItem) {
+        appendCollectionRow(it->second);
+        return;
+    }
+
+    appendPointRow(collectionItem, it->second, point);
+    updateCollectionCount(collectionItem);
+}
+
+void WrapAnnotationWidget::onPointChanged(const ColPoint& point)
+{
+    QStandardItem* pointItem = findPointItem(point.id);
+    if (!pointItem) {
+        onPointAdded(point);
+        return;
+    }
+
+    QStandardItem* collectionItem = pointItem->parent();
+    if (!collectionItem) {
+        return;
+    }
+    if (QStandardItem* positionItem = collectionItem->child(pointItem->row(), kPositionColumn)) {
+        positionItem->setText(pointPositionText(point.p));
+    }
+}
+
+void WrapAnnotationWidget::onPointRemoved(uint64_t pointId)
+{
+    QStandardItem* pointItem = findPointItem(pointId);
+    if (!pointItem) {
+        return;
+    }
+
+    QStandardItem* collectionItem = pointItem->parent();
+    if (!collectionItem) {
+        return;
+    }
+
+    collectionItem->removeRow(pointItem->row());
+    _pointItems.erase(pointId);
+    updateCollectionCount(collectionItem);
+}
+
+void WrapAnnotationWidget::onSelectionChanged(const QItemSelection&, const QItemSelection&)
+{
+    _selectedCollectionId = 0;
+    _selectedPointId = 0;
+
+    if (!_sameWrapTreeView || !_sameWrapModel) {
+        emit collectionSelected(0);
+        return;
+    }
+
+    const QModelIndexList selectedIndexes = _sameWrapTreeView->selectionModel()->selectedIndexes();
+    if (!selectedIndexes.isEmpty()) {
+        QStandardItem* item = _sameWrapModel->itemFromIndex(selectedIndexes.first().sibling(selectedIndexes.first().row(), kNameColumn));
+        if (item) {
+            if (!item->parent() || item->parent() == _sameWrapModel->invisibleRootItem()) {
+                _selectedCollectionId = item->data().toULongLong();
+            } else {
+                _selectedPointId = item->data().toULongLong();
+                _selectedCollectionId = item->parent()->data().toULongLong();
+            }
+        }
+    }
+
+    emit collectionSelected(_selectedCollectionId);
+    if (_selectedPointId != 0) {
+        emit pointSelected(_selectedPointId);
+    }
+}
+
+void WrapAnnotationWidget::showContextMenu(const QPoint& pos)
+{
+    if (!_sameWrapTreeView || _selectedCollectionId == 0) {
+        return;
+    }
+
+    QMenu menu(tr("Context Menu"), _sameWrapTreeView);
+    QAction* focusAction = menu.addAction(tr("Focus && Align View"));
+    QAction* chosen = menu.exec(_sameWrapTreeView->viewport()->mapToGlobal(pos));
+    if (chosen == focusAction) {
+        emit focusViewsRequested(_selectedCollectionId, _selectedPointId);
+    }
+}
+
+void WrapAnnotationWidget::selectCollection(uint64_t collectionId)
+{
+    if (!_sameWrapTreeView || !_sameWrapModel) {
+        return;
+    }
+
+    if (collectionId == 0) {
+        _sameWrapTreeView->selectionModel()->clearSelection();
+        return;
+    }
+
+    QStandardItem* item = findCollectionItem(collectionId);
+    if (!item) {
+        return;
+    }
+
+    _sameWrapTreeView->selectionModel()->clearSelection();
+    _sameWrapTreeView->selectionModel()->select(item->index(),
+                                                QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    _sameWrapTreeView->scrollTo(item->index());
+}
+
+void WrapAnnotationWidget::selectPoint(uint64_t pointId)
+{
+    if (!_sameWrapTreeView || !_sameWrapModel) {
+        return;
+    }
+
+    QStandardItem* pointItem = findPointItem(pointId);
+    if (!pointItem) {
+        return;
+    }
+    _sameWrapTreeView->selectionModel()->clearSelection();
+    _sameWrapTreeView->selectionModel()->select(pointItem->index(),
+                                                QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    _sameWrapTreeView->scrollTo(pointItem->index());
+    _sameWrapTreeView->setFocus();
+}
+
+QStandardItem* WrapAnnotationWidget::findCollectionItem(uint64_t collectionId) const
+{
+    if (!_sameWrapModel) {
+        return nullptr;
+    }
+
+    for (int row = 0; row < _sameWrapModel->rowCount(); ++row) {
+        QStandardItem* item = _sameWrapModel->item(row, kNameColumn);
+        if (item && item->data().toULongLong() == collectionId) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
+QStandardItem* WrapAnnotationWidget::findPointItem(uint64_t pointId) const
+{
+    if (!_sameWrapModel) {
+        return nullptr;
+    }
+
+    const auto cachedIt = _pointItems.find(pointId);
+    if (cachedIt != _pointItems.end() && cachedIt->second.isValid()) {
+        return _sameWrapModel->itemFromIndex(cachedIt->second);
+    }
+
+    for (int row = 0; row < _sameWrapModel->rowCount(); ++row) {
+        QStandardItem* collectionItem = _sameWrapModel->item(row, kNameColumn);
+        if (!collectionItem) {
+            continue;
+        }
+        for (int pointRow = 0; pointRow < collectionItem->rowCount(); ++pointRow) {
+            QStandardItem* pointItem = collectionItem->child(pointRow, kNameColumn);
+            if (pointItem && pointItem->data().toULongLong() == pointId) {
+                return pointItem;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void WrapAnnotationWidget::appendCollectionRow(const VCCollection::Collection& collection)
+{
+    if (!_sameWrapModel) {
+        return;
+    }
+
+    QStandardItem* nameItem = readOnlyItem(QString::fromStdString(collection.name));
+    const QColor color(collection.color[0] * 255,
+                       collection.color[1] * 255,
+                       collection.color[2] * 255);
+    nameItem->setData(QBrush(color), Qt::DecorationRole);
+    nameItem->setData(QVariant::fromValue(collection.id));
+
+    QStandardItem* countItem = readOnlyItem(QString::number(collection.points.size()));
+    QStandardItem* directionItem = readOnlyItem(sameWrapDirectionText(collection));
+    QStandardItem* positionItem = readOnlyItem();
+
+    int insertRow = _sameWrapModel->rowCount();
+    for (int row = 0; row < _sameWrapModel->rowCount(); ++row) {
+        QStandardItem* existing = _sameWrapModel->item(row, kNameColumn);
+        if (existing && existing->text() > nameItem->text()) {
+            insertRow = row;
+            break;
+        }
+    }
+    _sameWrapModel->insertRow(insertRow, {nameItem, countItem, directionItem, positionItem});
+
+    std::vector<ColPoint> points;
+    points.reserve(collection.points.size());
+    for (const auto& [_, point] : collection.points) {
+        points.push_back(point);
+    }
+    std::sort(points.begin(), points.end(),
+              [](const ColPoint& a, const ColPoint& b) {
+                  return a.id < b.id;
+              });
+
+    for (const ColPoint& point : points) {
+        appendPointRow(nameItem, collection, point);
+    }
+}
+
+void WrapAnnotationWidget::appendPointRow(QStandardItem* collectionItem,
+                                          const VCCollection::Collection& collection,
+                                          const ColPoint& point)
+{
+    if (!collectionItem) {
+        return;
+    }
+
+    QStandardItem* pointItem = readOnlyItem(QString::number(point.id));
+    pointItem->setData(QVariant::fromValue(point.id));
+    QStandardItem* emptyCountItem = readOnlyItem();
+    QStandardItem* pointDirectionItem = readOnlyItem(sameWrapDirectionText(collection));
+    QStandardItem* pointPositionItem = readOnlyItem(pointPositionText(point.p));
+
+    int insertRow = collectionItem->rowCount();
+    if (insertRow > 0) {
+        QStandardItem* last = collectionItem->child(insertRow - 1, kNameColumn);
+        if (last && last->data().toULongLong() <= point.id) {
+            collectionItem->appendRow({pointItem, emptyCountItem, pointDirectionItem, pointPositionItem});
+            _pointItems[point.id] = pointItem->index();
+            return;
+        }
+    }
+    for (int row = 0; row < insertRow; ++row) {
+        QStandardItem* existing = collectionItem->child(row, kNameColumn);
+        if (existing && existing->data().toULongLong() > point.id) {
+            insertRow = row;
+            break;
+        }
+    }
+    collectionItem->insertRow(insertRow, {pointItem, emptyCountItem, pointDirectionItem, pointPositionItem});
+    _pointItems[point.id] = pointItem->index();
+}
+
+void WrapAnnotationWidget::updateCollectionCount(QStandardItem* collectionItem)
+{
+    if (!_sameWrapModel || !collectionItem) {
+        return;
+    }
+
+    QStandardItem* countItem = _sameWrapModel->item(collectionItem->row(), kCountColumn);
+    if (countItem) {
+        countItem->setText(QString::number(collectionItem->rowCount()));
     }
 }
