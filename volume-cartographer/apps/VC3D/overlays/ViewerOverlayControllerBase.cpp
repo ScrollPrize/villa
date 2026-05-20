@@ -15,6 +15,7 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QBrush>
+#include <QPolygonF>
 #include <QVector>
 
 #include <algorithm>
@@ -104,11 +105,13 @@ ViewerOverlayControllerBase::OverlayBuilder::OverlayBuilder(VolumeViewerBase* vi
 
 void ViewerOverlayControllerBase::OverlayBuilder::addPoint(const QPointF& position,
                                                            qreal radius,
-                                                           OverlayStyle style)
+                                                           OverlayStyle style,
+                                                           PointMarkerShape shape)
 {
     PointPrimitive prim;
     prim.position = position;
     prim.radius = radius;
+    prim.shape = shape;
     prim.style = style;
     _primitives.emplace_back(std::move(prim));
 }
@@ -596,6 +599,7 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
     struct PointGroup
     {
         qreal radius{0.0};
+        PointMarkerShape shape{PointMarkerShape::Circle};
         OverlayStyle style{};
         QPainterPath path;
     };
@@ -632,12 +636,15 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
 
     auto groupForPoint = [&](const PointPrimitive& prim) -> PointGroup& {
         for (auto& group : pointGroups) {
-            if (fuzzyEqual(group.radius, prim.radius) && styleEquals(group.style, prim.style)) {
+            if (fuzzyEqual(group.radius, prim.radius) &&
+                group.shape == prim.shape &&
+                styleEquals(group.style, prim.style)) {
                 return group;
             }
         }
         PointGroup group;
         group.radius = prim.radius;
+        group.shape = prim.shape;
         group.style = prim.style;
         group.path = QPainterPath();
         pointGroups.push_back(group);
@@ -661,7 +668,36 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                 using T = std::decay_t<decltype(prim)>;
                 if constexpr (std::is_same_v<T, PointPrimitive>) {
                     PointGroup& group = groupForPoint(prim);
-                    group.path.addEllipse(prim.position, prim.radius, prim.radius);
+                    switch (prim.shape) {
+                        case PointMarkerShape::Circle:
+                            group.path.addEllipse(prim.position, prim.radius, prim.radius);
+                            break;
+                        case PointMarkerShape::Square:
+                            group.path.addRect(prim.position.x() - prim.radius,
+                                               prim.position.y() - prim.radius,
+                                               prim.radius * 2.0,
+                                               prim.radius * 2.0);
+                            break;
+                        case PointMarkerShape::Triangle: {
+                            QPolygonF triangle;
+                            triangle << QPointF(prim.position.x(), prim.position.y() - prim.radius)
+                                     << QPointF(prim.position.x() + prim.radius, prim.position.y() + prim.radius)
+                                     << QPointF(prim.position.x() - prim.radius, prim.position.y() + prim.radius);
+                            group.path.addPolygon(triangle);
+                            group.path.closeSubpath();
+                            break;
+                        }
+                        case PointMarkerShape::Diamond: {
+                            QPolygonF diamond;
+                            diamond << QPointF(prim.position.x(), prim.position.y() - prim.radius)
+                                    << QPointF(prim.position.x() + prim.radius, prim.position.y())
+                                    << QPointF(prim.position.x(), prim.position.y() + prim.radius)
+                                    << QPointF(prim.position.x() - prim.radius, prim.position.y());
+                            group.path.addPolygon(diamond);
+                            group.path.closeSubpath();
+                            break;
+                        }
+                    }
                 } else if constexpr (std::is_same_v<T, CirclePrimitive>) {
                     flushPointGroups();
                     auto* item = new QGraphicsEllipseItem(

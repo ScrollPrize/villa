@@ -28,7 +28,10 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
+#include <optional>
 #include "utils/Json.hpp"
 
 #include "vc/ui/VCCollection.hpp"
@@ -42,6 +45,26 @@ enum PointCollectionColumn {
     kErrorColumn = 4,
     kPositionColumn = 5
 };
+
+constexpr uint8_t kMaxLoadedPointCollectionFiles = 4;
+
+std::optional<uint8_t> nextAvailableMarkerShapeIndex(const VCCollection& collection)
+{
+    std::array<bool, kMaxLoadedPointCollectionFiles> used{};
+    for (const auto& [id, col] : collection.getAllCollections()) {
+        (void)id;
+        if (col.marker_shape_index < used.size()) {
+            used[col.marker_shape_index] = true;
+        }
+    }
+
+    for (uint8_t i = 0; i < used.size(); ++i) {
+        if (!used[i]) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
 
 QString sameWrapDirectionText(const VCCollection::Collection& collection)
 {
@@ -864,22 +887,43 @@ void CPointCollectionWidget::onSaveClicked()
  
 void CPointCollectionWidget::onLoadClicked()
 {
-    QString fileName = QFileDialog::getOpenFileName(this, tr("Load Point Collection"), "", tr("JSON Files (*.json)"));
-    if (fileName.isEmpty()) {
+    QStringList fileNames = QFileDialog::getOpenFileNames(
+        this, tr("Load Point Collections"), "", tr("JSON Files (*.json)"));
+    if (fileNames.isEmpty()) {
         return;
     }
- 
+
     if (_point_collection) {
-       try {
-           _suppress_autosave = true;
-           if (_point_collection->loadFromJSON(fileName.toStdString())) {
-               refreshTree();
-           }
-           _suppress_autosave = false;
-       } catch (const std::exception& e) {
-           _suppress_autosave = false;
-           QMessageBox::critical(this, "Error Loading File", e.what());
-       }
+        try {
+            _suppress_autosave = true;
+            int loadedCount = 0;
+            for (const QString& fileName : fileNames) {
+                auto markerShapeIndex = nextAvailableMarkerShapeIndex(*_point_collection);
+                if (!markerShapeIndex.has_value()) {
+                    QMessageBox::warning(
+                        this,
+                        "Point Collection Limit",
+                        QString("Only %1 loaded point collection files are supported for shaped markers.")
+                            .arg(static_cast<int>(kMaxLoadedPointCollectionFiles)));
+                    break;
+                }
+
+                if (_point_collection->appendFromJSON(fileName.toStdString(), *markerShapeIndex)) {
+                    ++loadedCount;
+                } else {
+                    QMessageBox::warning(this, "Error Loading File",
+                                         QString("Failed to load %1").arg(fileName));
+                }
+            }
+            _suppress_autosave = false;
+            if (loadedCount > 0) {
+                refreshTree();
+                scheduleAutosave();
+            }
+        } catch (const std::exception& e) {
+            _suppress_autosave = false;
+            QMessageBox::critical(this, "Error Loading File", e.what());
+        }
     }
 }
  

@@ -2,6 +2,8 @@
 
 #include <QObject>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
@@ -51,6 +53,7 @@ public:
         WindingFillMode autoFillMode = WindingFillMode::None;
         float autoFillConstant = 0.0f;
         std::unordered_map<std::string, std::string> tags;
+        uint8_t marker_shape_index = 0;
     };
 
     explicit VCCollection(QObject* parent = nullptr);
@@ -86,6 +89,7 @@ public:
 
    bool saveToJSON(const std::string& filename) const;
    bool loadFromJSON(const std::string& filename);
+   bool appendFromJSON(const std::string& filename, uint8_t markerShapeIndex, std::size_t maxLoadedCollections = 0);
 
    // Path-based persistence for segment-specific corrections
    // Only saves collections with anchor2d set (2D anchored points only)

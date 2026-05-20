@@ -46,9 +46,17 @@ public:
         qreal z{0.0};
     };
 
+    enum class PointMarkerShape {
+        Circle,
+        Square,
+        Triangle,
+        Diamond
+    };
+
     struct PointPrimitive {
         QPointF position;
         qreal radius{3.0};
+        PointMarkerShape shape{PointMarkerShape::Circle};
         OverlayStyle style{};
     };
 
@@ -173,7 +181,8 @@ protected:
 
         void addPoint(const QPointF& position,
                       qreal radius,
-                      OverlayStyle style);
+                      OverlayStyle style,
+                      PointMarkerShape shape = PointMarkerShape::Circle);
 
         void addCircle(const QPointF& center,
                        qreal radius,

@@ -32,6 +32,31 @@ static cv::Vec2f vec2f_from_json(const Json& j) {
     return {j.at(0).get_float(), j.at(1).get_float()};
 }
 
+static std::string unique_collection_name(
+    const std::unordered_map<uint64_t, VCCollection::Collection>& collections,
+    const std::string& desiredName)
+{
+    auto name_exists = [&](const std::string& name) {
+        for (const auto& pair : collections) {
+            if (pair.second.name == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (!name_exists(desiredName)) {
+        return desiredName;
+    }
+
+    int suffix = 2;
+    std::string candidate;
+    do {
+        candidate = desiredName + " (" + std::to_string(suffix++) + ")";
+    } while (name_exists(candidate));
+    return candidate;
+}
+
 // -- to_json / from_json --
 void to_json(Json& j, const ColPoint& p) {
     j = Json{
@@ -517,6 +542,7 @@ bool VCCollection::loadFromJSON(const std::string& filename)
             Collection col;
             from_json(*it, col);
             col.id = id;
+            col.marker_shape_index = 0;
             _collections[col.id] = col;
             for (auto& point_pair : _collections.at(col.id).points) {
                 point_pair.second.collectionId = col.id;
@@ -555,6 +581,76 @@ bool VCCollection::loadFromJSON(const std::string& filename)
         collectionIds.push_back(col_id);
     }
     emit collectionsAdded(collectionIds);
+
+    return true;
+}
+
+bool VCCollection::appendFromJSON(const std::string& filename, uint8_t markerShapeIndex, std::size_t maxLoadedCollections)
+{
+    Json j;
+    try {
+        j = Json::parse_file(filename);
+    } catch (const std::exception& e) {
+        qWarning() << "Failed to parse JSON: " << e.what();
+        return false;
+    }
+
+    try {
+        if (!j.contains("vc_pointcollections_json_version") ||
+            j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
+            throw std::runtime_error("JSON file has incorrect version or is missing version info.");
+        }
+
+        Json collections_obj = j.at("collections");
+        if (!collections_obj.is_object()) {
+            return false;
+        }
+
+        std::vector<Collection> loadedCollections;
+        for (auto it = collections_obj.begin(); it != collections_obj.end(); ++it) {
+            Collection col;
+            from_json(*it, col);
+            loadedCollections.push_back(std::move(col));
+        }
+
+        if (maxLoadedCollections > 0 && _collections.size() + loadedCollections.size() > maxLoadedCollections) {
+            qWarning() << "Point collection load would exceed the supported collection count:"
+                       << static_cast<int>(_collections.size() + loadedCollections.size())
+                       << "/" << static_cast<int>(maxLoadedCollections);
+            return false;
+        }
+
+        std::vector<uint64_t> addedCollectionIds;
+        addedCollectionIds.reserve(loadedCollections.size());
+
+        for (auto& col : loadedCollections) {
+            const uint64_t newCollectionId = getNextCollectionId();
+            col.id = newCollectionId;
+            col.name = unique_collection_name(_collections, col.name);
+            col.marker_shape_index = markerShapeIndex;
+
+            std::unordered_map<uint64_t, ColPoint> remappedPoints;
+            remappedPoints.reserve(col.points.size());
+            for (auto& point_pair : col.points) {
+                ColPoint point = point_pair.second;
+                point.id = getNextPointId();
+                point.collectionId = newCollectionId;
+                remappedPoints[point.id] = point;
+                _points[point.id] = point;
+            }
+            col.points = std::move(remappedPoints);
+
+            _collections[col.id] = std::move(col);
+            addedCollectionIds.push_back(newCollectionId);
+        }
+
+        if (!addedCollectionIds.empty()) {
+            emit collectionsAdded(addedCollectionIds);
+        }
+    } catch (const std::exception& e) {
+        qWarning() << "Failed to extract data from JSON: " << e.what();
+        return false;
+    }
 
     return true;
 }

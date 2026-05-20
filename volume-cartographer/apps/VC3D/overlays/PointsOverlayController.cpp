@@ -53,6 +53,22 @@ QString formatWinding(float winding, bool absolute)
     return text;
 }
 
+ViewerOverlayControllerBase::PointMarkerShape markerShapeForIndex(uint8_t markerShapeIndex)
+{
+    switch (markerShapeIndex) {
+        case 0:
+            return ViewerOverlayControllerBase::PointMarkerShape::Circle;
+        case 1:
+            return ViewerOverlayControllerBase::PointMarkerShape::Square;
+        case 2:
+            return ViewerOverlayControllerBase::PointMarkerShape::Triangle;
+        case 3:
+            return ViewerOverlayControllerBase::PointMarkerShape::Diamond;
+        default:
+            return ViewerOverlayControllerBase::PointMarkerShape::Circle;
+    }
+}
+
 std::vector<ColPoint> orderedCollectionPoints(const VCCollection::Collection& collection)
 {
     std::vector<ColPoint> points;
@@ -159,6 +175,7 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
     for (const auto& [collectionId, collection] : collections) {
         const cv::Vec3f collectionColor = collection.color;
         const bool absoluteWinding = collection.metadata.absolute_winding_number;
+        const auto markerShape = markerShapeForIndex(collection.marker_shape_index);
         struct Entry {
             cv::Vec3f world;
             uint64_t pointId;
@@ -283,7 +300,7 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
             style.z = kZValue;
             style.penColor.setAlphaF(entry.opacity);
 
-            builder.addPoint(scenePos, radius, style);
+            builder.addPoint(scenePos, radius, style, markerShape);
 
             if (entry.hasLabel) {
                 OverlayStyle textStyle;
