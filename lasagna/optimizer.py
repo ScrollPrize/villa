@@ -23,6 +23,7 @@ import opt_loss_winding_volume
 import opt_loss_station
 import opt_loss_bend
 import opt_loss_cyl
+import opt_loss_snap_surf
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -281,6 +282,7 @@ lambda_global: dict[str, float] = {
 	"station_t": 0.0,
 	"bend": 0.0,
 	"ext_offset": 0.0,
+	"snap_surf": 0.0,
 	"cyl_normal": 0.0,
 	"cyl_center": 0.0,
 	"cyl_smooth": 0.0,
@@ -498,6 +500,7 @@ def optimize(
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
+	opt_loss_snap_surf.reset_state()
 
 	def _stage_start(name: str) -> float:
 		return 0.0
@@ -935,6 +938,10 @@ def optimize(
 			"loss": opt_loss_winding_density.ext_offset_loss,
 			"needs": Needs(ext_conn=True, prefetch_ext_offset=True),
 		},
+		"snap_surf": {
+			"loss": opt_loss_snap_surf.snap_surf_loss,
+			"needs": Needs(mesh_normals=True, ext_surfaces=True),
+		},
 		"cyl_normal": {
 			"loss": opt_loss_cyl.cyl_normal_loss,
 			"needs": Needs(
@@ -1067,6 +1074,8 @@ def optimize(
 			missing.append("normals")
 		if required.ext_conn and res_.ext_conn is None:
 			missing.append("ext_conn")
+		if required.ext_surfaces and res_.ext_surfaces is None:
+			missing.append("ext_surfaces")
 		cyl_active = bool(getattr(model, "cylinder_enabled", False))
 		if cyl_active:
 			if required.cyl_samples and (res_.cyl_xyz is None or res_.cyl_count <= 0):
@@ -1179,6 +1188,16 @@ def optimize(
 			seed_xyz=seed_xyz,
 			out_dir=out_dir,
 		)
+		snap_surf_args = stage_args.get("snap_surf")
+		if snap_surf_args is not None and not isinstance(snap_surf_args, dict):
+			raise ValueError(f"stage '{stage.name}' opt.args.snap_surf must be an object")
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg=snap_surf_args,
+			seed_xyz=seed_xyz,
+			active=_need_term("snap_surf", stage_eff) > 0.0,
+		)
+		if _need_term("snap_surf", stage_eff) > 0.0 and not getattr(model, "_ext_surfaces", None):
+			raise ValueError("snap_surf requires external_surfaces")
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
@@ -1341,6 +1360,11 @@ def optimize(
 				"pred_dt_pull_samples_m": "psampM",
 				"pred_dt_pull_prefix_mean": "pullpre",
 				"pred_dt_pull_weight_mean": "pullw",
+				"snap_surf": "snaps",
+				"snaps_e2m": "s_e2m",
+				"snaps_m2e": "s_m2e",
+				"snaps_seed": "s_seed",
+				"snaps_sdist": "s_dist",
 				"cyl_outside_pen_frac": "out%",
 				"cyl_outside_depth_max": "outmax",
 				"cyl_outside_depth_avg": "outavg",
@@ -1625,6 +1649,8 @@ def optimize(
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
 						tv.update(opt_loss_cyl.last_stats())
+					if name == "snap_surf":
+						tv.update(opt_loss_snap_surf.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
 			if stage_uses_cyl_loss and not bool(getattr(res_, "cyl_shell_mode", False)):

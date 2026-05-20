@@ -98,11 +98,13 @@ def _decode_tifxyz_for_request(
     tmp_dir: str,
     model_init: str,
     ext_offset_enabled: bool,
+    snap_surf_enabled: bool = False,
 ) -> str | None:
     """Decode generic request tifxyz and attach it to configured consumers."""
     import base64
 
     approval_enabled = _approval_inpaint_enabled(args_section)
+    external_surface_enabled = bool(ext_offset_enabled or snap_surf_enabled)
     if approval_enabled and model_init != "seed":
         raise ValueError("args.approval-inpaint is only valid with args.model-init=seed")
 
@@ -121,13 +123,18 @@ def _decode_tifxyz_for_request(
             args_section["tifxyz-init"] = tifxyz_dir
         if approval_enabled:
             args_section["approval-inpaint-tifxyz"] = tifxyz_dir
-        if ext_offset_enabled:
+        if external_surface_enabled:
             offset_val = float(cfg.pop("offset_value", 1.0))
             cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
     elif model_init == "ext":
         raise ValueError("model-init=ext requires request tifxyz")
-    elif ext_offset_enabled:
-        raise ValueError("ext_offset is enabled but request has no tifxyz")
+    elif external_surface_enabled:
+        loss_names = []
+        if ext_offset_enabled:
+            loss_names.append("ext_offset")
+        if snap_surf_enabled:
+            loss_names.append("snap_surf")
+        raise ValueError(f"{'/'.join(loss_names)} is enabled but request has no tifxyz")
     elif approval_enabled:
         raise ValueError("approval-inpaint requires request tifxyz")
 
@@ -196,15 +203,15 @@ def _apply_window_transport_args(
             raise ValueError("request window_overlap must be an integer") from exc
 
 
-def _config_effective_ext_offset_enabled(cfg: dict[str, Any]) -> bool:
+def _config_effective_loss_enabled(cfg: dict[str, Any], term_name: str) -> bool:
     base_cfg = cfg.get("base")
-    base_ext = 0.0
+    base_term = 0.0
     if isinstance(base_cfg, dict):
         try:
-            base_ext = float(base_cfg.get("ext_offset", 0.0))
+            base_term = float(base_cfg.get(term_name, 0.0))
         except (TypeError, ValueError):
-            base_ext = 0.0
-    if abs(base_ext) > 0.0:
+            base_term = 0.0
+    if abs(base_term) > 0.0:
         return True
 
     stages = cfg.get("stages")
@@ -223,23 +230,31 @@ def _config_effective_ext_offset_enabled(cfg: dict[str, Any]) -> bool:
         if steps <= 0:
             continue
 
-        eff = base_ext
+        eff = base_term
         w_fac = opt_cfg.get("w_fac")
-        has_ext_wfac = isinstance(w_fac, dict) and "ext_offset" in w_fac
+        has_term_wfac = isinstance(w_fac, dict) and term_name in w_fac
         default_mul = opt_cfg.get("default_mul")
-        if default_mul is not None and not has_ext_wfac:
+        if default_mul is not None and not has_term_wfac:
             try:
-                eff = base_ext * float(default_mul)
+                eff = base_term * float(default_mul)
             except (TypeError, ValueError):
                 eff = 0.0
-        if has_ext_wfac and w_fac.get("ext_offset") is not None:
+        if has_term_wfac and w_fac.get(term_name) is not None:
             try:
-                eff = base_ext * float(w_fac.get("ext_offset"))
+                eff = base_term * float(w_fac.get(term_name))
             except (TypeError, ValueError):
                 eff = 0.0
         if abs(eff) > 0.0:
             return True
     return False
+
+
+def _config_effective_ext_offset_enabled(cfg: dict[str, Any]) -> bool:
+    return _config_effective_loss_enabled(cfg, "ext_offset")
+
+
+def _config_effective_snap_surf_enabled(cfg: dict[str, Any]) -> bool:
+    return _config_effective_loss_enabled(cfg, "snap_surf")
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +531,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
         args_section_pre["model-init"] = model_init
         cfg["args"] = args_section_pre
         ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
+        snap_surf_enabled = _config_effective_snap_surf_enabled(cfg)
+        external_surface_enabled = ext_offset_enabled or snap_surf_enabled
         model_input = _decode_model_for_request(
             body=body,
             tmp_dir=tmp_dir,
@@ -534,12 +551,13 @@ def _run_optimization(body: dict[str, Any]) -> None:
             tmp_dir=tmp_dir,
             model_init=model_init,
             ext_offset_enabled=ext_offset_enabled,
+            snap_surf_enabled=snap_surf_enabled,
         )
 
         if model_init == "model" and not model_input:
             raise ValueError("model-init=model requires request model_data or model_input")
 
-        if ext_offset_enabled and tifxyz_dir is not None and "external_surfaces" not in cfg:
+        if external_surface_enabled and tifxyz_dir is not None and "external_surfaces" not in cfg:
             offset_val = float(cfg.pop("offset_value", 1.0))
             cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
 

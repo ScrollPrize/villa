@@ -51,6 +51,7 @@ class ModelForwardNeeds:
 	mesh_conn: bool = False
 	mesh_normals: bool = False
 	ext_conn: bool = False
+	ext_surfaces: bool = False
 	cyl_samples: bool = False
 	cyl_normals: bool = False
 	cyl_centers_axes: bool = False
@@ -93,6 +94,7 @@ class ModelForwardNeeds:
 			mesh_conn=True,
 			mesh_normals=True,
 			ext_conn=True,
+			ext_surfaces=True,
 			cyl_samples=True,
 			cyl_normals=True,
 			cyl_centers_axes=True,
@@ -117,6 +119,7 @@ class ModelForwardNeeds:
 				mesh_conn=out.mesh_conn or other.mesh_conn,
 				mesh_normals=out.mesh_normals or other.mesh_normals,
 				ext_conn=out.ext_conn or other.ext_conn,
+				ext_surfaces=out.ext_surfaces or other.ext_surfaces,
 				cyl_samples=out.cyl_samples or other.cyl_samples,
 				cyl_normals=out.cyl_normals or other.cyl_normals,
 				cyl_centers_axes=out.cyl_centers_axes or other.cyl_centers_axes,
@@ -183,6 +186,7 @@ class ModelForwardNeeds:
 			("mesh_conn", self.mesh_conn),
 			("mesh_normals", self.mesh_normals),
 			("ext_conn", self.ext_conn),
+			("ext_surfaces", self.ext_surfaces),
 			("cyl", self.cyl_samples),
 			("cyl_normals", self.cyl_normals),
 			("cyl_axes", self.cyl_centers_axes),
@@ -238,6 +242,7 @@ class FitResult3D:
 	params: ModelParams3D
 	gt_normal_lr: torch.Tensor | None = None  # (D, Hm, Wm, 3) GT unit normals at LR mesh positions
 	ext_conn: list | None = None
+	ext_surfaces: list | None = None  # per surface: (xyz, corner_valid, normals, quad_valid), detached
 	cyl_xyz: torch.Tensor | None = None      # (N*D, Hm, Wm, 3) analytic cylinder samples
 	cyl_normals: torch.Tensor | None = None  # (N*D, Hm, Wm, 3) analytic cylinder normals
 	cyl_centers: torch.Tensor | None = None  # (N, 3) cylinder axis anchor [cx, cy, zc]
@@ -2984,6 +2989,41 @@ class Model3D(nn.Module):
 
 		return results
 
+	def _external_surface_records(self) -> list | None:
+		"""Return detached frozen external surfaces for losses that own matching state."""
+		if not self._ext_surfaces:
+			return None
+		out = []
+		for i, ext_xyz in enumerate(self._ext_surfaces):
+			ext_norms = self._ext_normals[i]
+			corner_valid = (
+				self._ext_valid[i] &
+				torch.isfinite(ext_xyz).all(dim=-1) &
+				torch.isfinite(ext_norms).all(dim=-1) &
+				(ext_norms.norm(dim=-1) > 1e-8)
+			)
+			if ext_xyz.shape[0] > 1 and ext_xyz.shape[1] > 1:
+				quad_valid = (
+					corner_valid[:-1, :-1] &
+					corner_valid[1:, :-1] &
+					corner_valid[:-1, 1:] &
+					corner_valid[1:, 1:]
+				)
+			else:
+				quad_valid = torch.zeros(
+					max(0, int(ext_xyz.shape[0]) - 1),
+					max(0, int(ext_xyz.shape[1]) - 1),
+					device=ext_xyz.device,
+					dtype=torch.bool,
+				)
+			out.append((
+				ext_xyz.detach(),
+				corner_valid.detach(),
+				ext_norms.detach(),
+				quad_valid.detach(),
+			))
+		return out
+
 	def forward(self, data: fit_data.FitData3D, needs: ModelForwardNeeds | None = None) -> FitResult3D:
 		if needs is None:
 			needs = ModelForwardNeeds.full(data)
@@ -3099,6 +3139,7 @@ class Model3D(nn.Module):
 
 		# External surface intersections
 		ext_conn = self._intersect_ext_surfaces(xyz_lr, data) if needs.ext_conn else None
+		ext_surfaces = self._external_surface_records() if (needs.ext_surfaces or needs.ext_conn) else None
 		cyl_xyz = None
 		cyl_normals = None
 		cyl_axes = None
@@ -3153,6 +3194,7 @@ class Model3D(nn.Module):
 			params=self.params,
 			gt_normal_lr=gt_normal_lr,
 			ext_conn=ext_conn,
+			ext_surfaces=ext_surfaces,
 			cyl_xyz=cyl_xyz,
 			cyl_normals=cyl_normals,
 			cyl_centers=cyl_centers,

@@ -125,6 +125,52 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					ext_offset_enabled=True,
 				)
 
+	def test_snap_surf_wires_generic_tifxyz_as_external_surface(self) -> None:
+		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
+		cfg = {"args": {"model-init": "seed"}}
+		args = cfg["args"]
+
+		with tempfile.TemporaryDirectory() as td:
+			tifxyz_dir = fit_service._decode_tifxyz_for_request(
+				body=body,
+				cfg=cfg,
+				args_section=args,
+				tmp_dir=td,
+				model_init="seed",
+				ext_offset_enabled=False,
+				snap_surf_enabled=True,
+			)
+
+			self.assertIsNotNone(tifxyz_dir)
+			self.assertEqual(cfg["external_surfaces"], [{"path": tifxyz_dir, "offset": 1.0}])
+			self.assertNotIn("tifxyz-init", args)
+
+	def test_snap_surf_requires_generic_tifxyz(self) -> None:
+		cfg = {"args": {"model-init": "seed"}}
+
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "snap_surf is enabled but request has no tifxyz"):
+				fit_service._decode_tifxyz_for_request(
+					body={},
+					cfg=cfg,
+					args_section=cfg["args"],
+					tmp_dir=td,
+					model_init="seed",
+					ext_offset_enabled=False,
+					snap_surf_enabled=True,
+				)
+
+	def test_snap_surf_effective_loss_detection(self) -> None:
+		cfg = {
+			"base": {"snap_surf": 0.01},
+			"stages": [
+				{"name": "stage0", "steps": 1000, "w_fac": {"snap_surf": 1.0}},
+			],
+		}
+
+		self.assertTrue(fit_service._config_effective_snap_surf_enabled(cfg))
+		self.assertFalse(fit_service._config_effective_ext_offset_enabled(cfg))
+
 	def test_seed_mode_ignores_surplus_model_transport(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			model_input = fit_service._decode_model_for_request(
