@@ -360,6 +360,7 @@ def _run_flatten_mode(
 	print(
 		f"[fit] model-init=flatten source={ext0['path']} "
 		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
+		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
 		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",
 		flush=True,
 	)

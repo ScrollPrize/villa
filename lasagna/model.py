@@ -271,6 +271,8 @@ class FitResult3D:
 	flatten_point_mask: torch.Tensor | None = None       # (Hout, Wout) bool
 	flatten_quad_mask: torch.Tensor | None = None        # (1, Hout-1, Wout-1) bool
 	flatten_target_step: torch.Tensor | None = None      # scalar measured source spacing
+	flatten_avg_offset_mask: torch.Tensor | None = None  # (Hout, Wout) bool fixed init-valid anchor mask
+	flatten_initial_avg_offset: torch.Tensor | None = None  # (2,) initial mean map offset over anchor mask
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
@@ -418,6 +420,8 @@ class Model3D(nn.Module):
 		self.register_buffer("flatten_source_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_source_cell_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_target_step", torch.tensor(float(mesh_step), device=device, dtype=torch.float32))
+		self.register_buffer("flatten_avg_offset_mask", torch.empty(0, 0, device=device, dtype=torch.bool))
+		self.register_buffer("flatten_initial_avg_offset", torch.zeros(2, device=device, dtype=torch.float32))
 		self.flatten_source_filter_stats: dict[str, float] = {}
 
 		# Amplitude and bias for data matching (deferred but needed for FitResult3D)
@@ -489,6 +493,41 @@ class Model3D(nn.Module):
 			residuals[i] = targets[i] - up
 			recon = up + residuals[i]
 		return nn.ParameterList([nn.Parameter(r) for r in residuals])
+
+	@staticmethod
+	def _scale_count_to_longer_dim_2(h: int, w: int) -> int:
+		longer = max(2, int(h), int(w))
+		count = 1
+		while longer > 2:
+			longer = max(2, (longer + 1) // 2)
+			count += 1
+		return count
+
+	@staticmethod
+	def _flatten_output_shape_for_source(h: int, w: int) -> tuple[int, int]:
+		def _scaled_vertex_count(n: int) -> int:
+			extent = max(1, int(n) - 1)
+			return max(2, int(math.ceil(float(extent) * 1.2)) + 1)
+
+		return _scaled_vertex_count(h), _scaled_vertex_count(w)
+
+	@staticmethod
+	def _centered_flatten_source_map(
+		*,
+		source_h: int,
+		source_w: int,
+		out_h: int,
+		out_w: int,
+		device: torch.device,
+		dtype: torch.dtype,
+	) -> torch.Tensor:
+		map_yx = Model3D._identity_flatten_map(h=out_h, w=out_w, device=device, dtype=dtype)
+		offset = torch.tensor(
+			[0.5 * float(out_h - source_h), 0.5 * float(out_w - source_w)],
+			device=device,
+			dtype=dtype,
+		)
+		return (map_yx - offset.reshape(1, 1, 2)).contiguous()
 
 	def _shell_delta_scale_count(self) -> int:
 		return max(1, int(getattr(self, "cyl_shell_n_scales", 5)))
@@ -2635,6 +2674,24 @@ class Model3D(nn.Module):
 		return torch.stack([yy, xx], dim=-1).contiguous()
 
 	@staticmethod
+	def _flatten_avg_offset(map_yx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+		if map_yx.ndim != 3 or int(map_yx.shape[-1]) != 2:
+			raise ValueError(f"flatten map must have shape (H,W,2), got {tuple(map_yx.shape)}")
+		if tuple(mask.shape) != tuple(map_yx.shape[:2]):
+			raise ValueError(f"flatten avg offset mask shape {tuple(mask.shape)} does not match map {tuple(map_yx.shape[:2])}")
+		identity = Model3D._identity_flatten_map(
+			h=int(map_yx.shape[0]),
+			w=int(map_yx.shape[1]),
+			device=map_yx.device,
+			dtype=map_yx.dtype,
+		)
+		mask_f = mask.to(device=map_yx.device, dtype=map_yx.dtype)
+		weight = mask_f.sum()
+		if bool((weight > 0).detach().cpu()):
+			return ((map_yx - identity) * mask_f.unsqueeze(-1)).sum(dim=(0, 1)) / weight
+		return torch.zeros(2, device=map_yx.device, dtype=map_yx.dtype)
+
+	@staticmethod
 	def _source_cell_valid(valid: torch.Tensor) -> torch.Tensor:
 		if int(valid.shape[0]) < 2 or int(valid.shape[1]) < 2:
 			return torch.zeros(max(0, int(valid.shape[0]) - 1), max(0, int(valid.shape[1]) - 1),
@@ -2834,10 +2891,11 @@ class Model3D(nn.Module):
 		xyz_dev = xyz.detach().to(device=device, dtype=torch.float32)
 		valid_dev = valid.detach().to(device=device, dtype=torch.bool) & torch.isfinite(xyz_dev).all(dim=-1)
 		xyz_dev = torch.where(valid_dev.unsqueeze(-1), xyz_dev, torch.zeros_like(xyz_dev))
+		Hout, Wout = self._flatten_output_shape_for_source(H, W)
 
 		self.depth = 1
-		self.mesh_h = H
-		self.mesh_w = W
+		self.mesh_h = Hout
+		self.mesh_w = Wout
 		self.pyramid_d = False
 		self.params = replace(
 			self.params,
@@ -2846,12 +2904,12 @@ class Model3D(nn.Module):
 			subsample_mesh=int(subsample_mesh),
 			subsample_winding=int(subsample_winding),
 			pyramid_d=False,
-			model_h=float(max(1, H - 1) * max(1, int(mesh_step))),
-			model_w=float(max(1, W - 1) * max(1, int(mesh_step))),
+			model_h=float(max(1, Hout - 1) * max(1, int(mesh_step))),
+			model_w=float(max(1, Wout - 1) * max(1, int(mesh_step))),
 		)
-		self.conn_offsets = torch.zeros(4, 1, H, W, device=device, dtype=torch.float32)
-		self.amp = nn.Parameter(torch.ones(1, 1, H, W, device=device, dtype=torch.float32), requires_grad=False)
-		self.bias = nn.Parameter(torch.zeros(1, 1, H, W, device=device, dtype=torch.float32), requires_grad=False)
+		self.conn_offsets = torch.zeros(4, 1, Hout, Wout, device=device, dtype=torch.float32)
+		self.amp = nn.Parameter(torch.ones(1, 1, Hout, Wout, device=device, dtype=torch.float32), requires_grad=False)
+		self.bias = nn.Parameter(torch.zeros(1, 1, Hout, Wout, device=device, dtype=torch.float32), requires_grad=False)
 		self.flatten_source_xyz = xyz_dev
 		self.flatten_source_valid = valid_dev
 		source_cell_valid = self._source_cell_valid(valid_dev)
@@ -2880,11 +2938,28 @@ class Model3D(nn.Module):
 			valid_dev,
 			fallback=float(mesh_step),
 		).detach()
-		identity = self._identity_flatten_map(h=H, w=W, device=device, dtype=torch.float32)
+		identity = self._centered_flatten_source_map(
+			source_h=H,
+			source_w=W,
+			out_h=Hout,
+			out_w=Wout,
+			device=device,
+			dtype=torch.float32,
+		)
+		_sampled_init, initial_point_mask = self._flatten_sample_map(
+			xyz_dev,
+			source_cell_valid,
+			identity,
+		)
+		self.flatten_avg_offset_mask = initial_point_mask.detach()
+		self.flatten_initial_avg_offset = self._flatten_avg_offset(
+			identity,
+			initial_point_mask,
+		).detach()
 		flat = identity.permute(2, 0, 1).unsqueeze(1).contiguous()
 		self.flatten_map_ms = self._construct_pyramid_from_flat_3d(
 			flat,
-			len(self.mesh_ms),
+			self._scale_count_to_longer_dim_2(Hout, Wout),
 			pyramid_d=False,
 		)
 		self.flatten_enabled = True
@@ -2909,11 +2984,12 @@ class Model3D(nn.Module):
 		flatten_filter_radius: int = 2,
 	) -> "Model3D":
 		H, W, _ = xyz.shape
+		Hout, Wout = Model3D._flatten_output_shape_for_source(H, W)
 		mdl = Model3D(
 			device=device,
 			depth=1,
-			mesh_h=H,
-			mesh_w=W,
+			mesh_h=Hout,
+			mesh_w=Wout,
 			mesh_step=mesh_step,
 			winding_step=winding_step,
 			subsample_mesh=subsample_mesh,
@@ -3560,6 +3636,8 @@ class Model3D(nn.Module):
 			flatten_point_mask=flatten_point_mask,
 			flatten_quad_mask=flatten_quad_mask,
 			flatten_target_step=self.flatten_target_step if self.flatten_enabled else None,
+			flatten_avg_offset_mask=self.flatten_avg_offset_mask if self.flatten_enabled else None,
+			flatten_initial_avg_offset=self.flatten_initial_avg_offset if self.flatten_enabled else None,
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
@@ -3658,6 +3736,8 @@ class Model3D(nn.Module):
 		st.pop("flatten_source_valid", None)
 		st.pop("flatten_source_cell_valid", None)
 		st.pop("flatten_target_step", None)
+		st.pop("flatten_avg_offset_mask", None)
+		st.pop("flatten_initial_avg_offset", None)
 		st.pop("flatten_map_flat", None)
 		st.pop("flatten_point_mask", None)
 		incompat = super().load_state_dict(st, strict=bool(strict))

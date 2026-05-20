@@ -62,6 +62,7 @@ class OptSettings:
 	default_mul: float | None
 	w_fac: dict | None
 	eff: dict[str, float]
+	steps_auto: bool = False
 	args: dict | None = None
 
 
@@ -197,7 +198,7 @@ def _parse_opt_settings(
 	prev_eff: dict[str, float] | None,
 ) -> OptSettings:
 	opt_cfg = dict(opt_cfg)
-	steps = max(0, int(opt_cfg.get("steps", 0)))
+	steps_raw = opt_cfg.get("steps", 0)
 	lr_raw = opt_cfg.get("lr", 1e-3)
 	if isinstance(lr_raw, list):
 		if not lr_raw:
@@ -223,6 +224,18 @@ def _parse_opt_settings(
 	if args_raw is not None and not isinstance(args_raw, dict):
 		raise ValueError(f"stages_json: stage '{stage_name}' opt 'args' must be an object or null")
 	args = dict(args_raw) if args_raw else {}
+	steps_auto = isinstance(steps_raw, str) and steps_raw.strip().lower() == "auto"
+	if steps_auto:
+		steps = max(1, int(args.get("auto_steps_max", 10000)))
+	elif isinstance(steps_raw, str):
+		try:
+			steps = max(0, int(steps_raw))
+		except ValueError as exc:
+			raise ValueError(
+				f"stages_json: stage '{stage_name}' opt.steps: expected an integer or 'auto'"
+			) from exc
+	else:
+		steps = max(0, int(steps_raw))
 	opt_cfg.pop("steps", None)
 	opt_cfg.pop("lr", None)
 	opt_cfg.pop("params", None)
@@ -241,6 +254,8 @@ def _parse_opt_settings(
 		if bad_terms:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.w_fac: unknown term(s): {bad_terms}")
 	eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, w_fac)
+	if steps_auto and "cyl_params" in params:
+		raise ValueError(f"stages_json: stage '{stage_name}' opt.steps='auto' is not supported for cyl_params stages")
 	if "cyl_params" in params:
 		if params != ["cyl_params"]:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
@@ -258,7 +273,7 @@ def _parse_opt_settings(
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	if "flatten_map_ms" in params and not any(
 		float(eff.get(name, 0.0)) != 0.0
-		for name in ("flatten_sdir", "flatten_map_step", "flatten_orient")
+		for name in ("flatten_sdir", "flatten_map_step", "flatten_avg_offset", "flatten_orient")
 	):
 		raise ValueError(f"stages_json: stage '{stage_name}' with flatten_map_ms requires a nonzero flatten loss")
 	return OptSettings(
@@ -269,6 +284,7 @@ def _parse_opt_settings(
 		default_mul=default_mul,
 		w_fac=w_fac,
 		eff=eff,
+		steps_auto=steps_auto,
 		args=args,
 	)
 
@@ -303,6 +319,7 @@ lambda_global: dict[str, float] = {
 	"cyl_outside": 0.0,
 	"flatten_sdir": 0.0,
 	"flatten_map_step": 0.0,
+	"flatten_avg_offset": 0.0,
 	"flatten_orient": 0.0,
 }
 
@@ -463,6 +480,73 @@ def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
 	if -len(lr) <= idx < 0:
 		return float(lr[idx])
 	return float(lr[0])
+
+
+def _steps_label(opt_cfg: OptSettings) -> str:
+	if opt_cfg.steps_auto:
+		return f"auto:{int(opt_cfg.steps)}"
+	return str(int(opt_cfg.steps))
+
+
+def _auto_steps_window(args: dict | None) -> int:
+	args = args or {}
+	return max(1, int(args.get("auto_steps_window", 100)))
+
+
+def _auto_steps_min(args: dict | None, *, window: int) -> int:
+	args = args or {}
+	return max(1, int(args.get("auto_steps_min", int(window))))
+
+
+def _auto_steps_rel_threshold(args: dict | None) -> float:
+	args = args or {}
+	raw = args.get("auto_steps_rel_threshold", args.get("auto_steps_rel_tol", 1.0e-4))
+	return max(0.0, float(raw))
+
+
+def _auto_steps_relative_improvement(history: list[float], *, window: int) -> float:
+	if len(history) <= int(window):
+		return math.inf
+	before = history[:-int(window)]
+	recent = history[-int(window):]
+	if not before or not recent:
+		return math.inf
+	best_before = min(float(v) for v in before)
+	best_recent = min(float(v) for v in recent)
+	return (best_before - best_recent) / max(abs(best_before), 1.0e-12)
+
+
+def _auto_steps_should_stop(history: list[float], *, window: int, rel_threshold: float) -> bool:
+	return _auto_steps_relative_improvement(history, window=window) < float(rel_threshold)
+
+
+def _flatten_max_update_base(args: dict | None) -> float:
+	if args is None:
+		return 0.1
+	return float(args.get("flatten_max_update", 0.1))
+
+
+def _clamp_flatten_map_ms_update(
+	params: list[torch.nn.Parameter],
+	before: list[torch.Tensor],
+	*,
+	base_step: float,
+) -> None:
+	base = float(base_step)
+	if base <= 0.0:
+		return
+	with torch.no_grad():
+		for scale_i, (p, prev) in enumerate(zip(params, before)):
+			if p.shape != prev.shape:
+				continue
+			max_step = base * (2.0 ** int(scale_i))
+			delta = p - prev
+			if delta.ndim >= 1 and int(delta.shape[0]) == 2:
+				norm = torch.linalg.vector_norm(delta, dim=0, keepdim=True)
+				scale = (float(max_step) / norm.clamp_min(1.0e-12)).clamp_max(1.0)
+				p.copy_(prev + delta * scale)
+			else:
+				p.copy_(prev + delta.clamp(min=-float(max_step), max=float(max_step)))
 
 
 def check_data_bounds(model, data: fit_data.FitData3D, margin: float = 100.0,
@@ -1012,6 +1096,10 @@ def optimize(
 			"loss": opt_loss_flatten.flatten_map_step_loss,
 			"needs": Needs(flatten=True),
 		},
+		"flatten_avg_offset": {
+			"loss": opt_loss_flatten.flatten_avg_offset_loss,
+			"needs": Needs(flatten=True),
+		},
 		"flatten_orient": {
 			"loss": opt_loss_flatten.flatten_orient_loss,
 			"needs": Needs(flatten=True),
@@ -1167,7 +1255,7 @@ def optimize(
 			_stage_done(f"{label}.total", _t_stage_total)
 			return data
 		if not is_cyl_shelling_stage:
-			print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
+			print(f"[optimizer] {label}: params={opt_cfg.params} steps={_steps_label(opt_cfg)} "
 				  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0 and not is_cyl_stage:
 			return data
@@ -1193,13 +1281,28 @@ def optimize(
 		stage_args = opt_cfg.args or {}
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
 		status_interval = max(0, int(status_interval_raw))
+		steps_label = _steps_label(opt_cfg)
+		auto_window = _auto_steps_window(stage_args) if opt_cfg.steps_auto else 0
+		auto_min = _auto_steps_min(stage_args, window=auto_window) if opt_cfg.steps_auto else 0
+		auto_rel_threshold = _auto_steps_rel_threshold(stage_args) if opt_cfg.steps_auto else 0.0
 		opt_timing_enabled = _opt_timing_enabled(stage_args)
 		opt_timing_interval = _opt_timing_interval(stage_args, fallback=max(1, status_interval or 100))
 		opt_timing_sync = _opt_timing_sync_cuda(stage_args)
+		flatten_max_update = (
+			_flatten_max_update_base(stage_args)
+			if "flatten_map_ms" in opt_cfg.params and bool(getattr(model, "flatten_enabled", False))
+			else 0.0
+		)
 		if opt_timing_enabled and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: opt timing enabled interval={opt_timing_interval} "
 				f"sync_cuda={int(opt_timing_sync)}",
+				flush=True,
+			)
+		if opt_cfg.steps_auto and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: auto steps max={opt_cfg.steps} window={auto_window} "
+				f"min={auto_min} rel_threshold={auto_rel_threshold:g}",
 				flush=True,
 			)
 
@@ -1325,6 +1428,12 @@ def optimize(
 		if not param_groups:
 			return data
 		opt = torch.optim.Adam(param_groups)
+		if flatten_max_update > 0.0 and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: flatten_max_update={flatten_max_update:g} "
+				f"(per-scale cap doubles at each coarser level)",
+				flush=True,
+			)
 		_stage_done(f"{label}.build_optimizer", _t)
 
 		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
@@ -1351,7 +1460,7 @@ def optimize(
 		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
 		_status_rows = 0
-		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
+		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{steps_label}") + 2)
 
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
 						  its: float | None = None, force_header: bool = False,
@@ -1393,6 +1502,8 @@ def optimize(
 				"flatten_valid_to_invalid": "f_v2i",
 				"flatten_invalid_to_valid": "f_i2v",
 				"flatten_map_step": "f_mstep",
+				"flatten_avg_offset": "f_avg",
+				"flatten_avg_offset_norm": "f_avgn",
 				"flatten_orient": "f_orient",
 				"flatten_orient_fold_frac": "f_fold",
 				"flatten_orient_lowdet_frac": "f_lowdet",
@@ -1680,7 +1791,7 @@ def optimize(
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
 						tv.update(opt_loss_cyl.last_stats())
-					if name in ("flatten_sdir", "flatten_orient"):
+					if name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
@@ -2412,7 +2523,7 @@ def optimize(
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(
-				step_label=f"{label} 0/{opt_cfg.steps}",
+				step_label=f"{label} 0/{steps_label}",
 				loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
 				tv=term_vals0,
 				pv=param_vals0,
@@ -2429,6 +2540,8 @@ def optimize(
 		_stage_done(f"{label}.initial_snapshot", _t)
 
 		max_steps = opt_cfg.steps
+		final_step = 0
+		auto_loss_history = [float(loss0.detach().cpu())] if opt_cfg.steps_auto else []
 		_t_wall_start = time.perf_counter()
 		_t_steps_acc = 0
 		loss = loss0
@@ -2449,6 +2562,7 @@ def optimize(
 
 		for step in range(max_steps):
 			_t_iter = time.perf_counter()
+			auto_stop = False
 			# Sync: wait for chunks loaded by last prefetch
 			_t_io = time.perf_counter()
 			if _active_caches:
@@ -2513,7 +2627,17 @@ def optimize(
 				_opt_timing.sync()
 				_opt_timing.add("backward", time.perf_counter() - _t_part)
 			_t_part = time.perf_counter()
+			_flatten_update_before = None
+			_flatten_update_params = all_params.get("flatten_map_ms", [])
+			if flatten_max_update > 0.0 and _flatten_update_params:
+				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			opt.step()
+			if _flatten_update_before is not None:
+				_clamp_flatten_map_ms_update(
+					_flatten_update_params,
+					_flatten_update_before,
+					base_step=flatten_max_update,
+				)
 			if _opt_timing is not None:
 				_opt_timing.sync()
 				_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
@@ -2541,6 +2665,7 @@ def optimize(
 			_t_steps_acc += 1
 			_done_steps[0] += 1
 			step1 = step + 1
+			final_step = step1
 			_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
 			_overall_progress = (si + _stage_progress) / _num_stages if _num_stages > 0 else 1.0
 
@@ -2555,8 +2680,17 @@ def optimize(
 			if _opt_timing is not None:
 				_opt_timing.add("progress", time.perf_counter() - _t_part)
 
+			if opt_cfg.steps_auto:
+				auto_loss_history.append(float(loss.detach().cpu()))
+				if step1 >= auto_min and _auto_steps_should_stop(
+					auto_loss_history,
+					window=auto_window,
+					rel_threshold=auto_rel_threshold,
+				):
+					auto_stop = True
+
 			_t_part = time.perf_counter()
-			if step == 0 or step1 == max_steps or (status_interval > 0 and (step1 % status_interval) == 0):
+			if step == 0 or step1 == max_steps or auto_stop or (status_interval > 0 and (step1 % status_interval) == 0):
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
@@ -2566,7 +2700,7 @@ def optimize(
 				_t_wall_now = time.perf_counter()
 				_t_wall_elapsed = _t_wall_now - _t_wall_start
 				_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
-				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps}",
+				_print_status(step_label=f"{label} {step1}/{steps_label}",
 							  loss_val=float(display_loss) if display_loss is not None else loss.item(),
 							  tv=term_vals, pv=param_vals, its=_its)
 				_t_steps_acc = 0
@@ -2594,9 +2728,18 @@ def optimize(
 			if _opt_timing is not None:
 				_opt_timing.add("total", time.perf_counter() - _t_iter)
 				_opt_timing.finish_iter(label=label, step1=step1, max_steps=max_steps)
+			if auto_stop:
+				rel_improvement = _auto_steps_relative_improvement(auto_loss_history, window=auto_window)
+				print(
+					f"[optimizer] {label}: auto steps stopped at {step1}/{max_steps} "
+					f"rel_improvement_{auto_window}={rel_improvement:.6g} "
+					f"< {auto_rel_threshold:g}",
+					flush=True,
+				)
+				break
 
 		_t = _stage_start(f"{label}.final_snapshot")
-		snapshot_fn(stage=label, step=max_steps, loss=float(loss.detach().cpu()), data=data, res=res)
+		snapshot_fn(stage=label, step=final_step, loss=float(loss.detach().cpu()), data=data, res=res)
 		_stage_done(f"{label}.final_snapshot", _t)
 		_stage_done(f"{label}.total", _t_stage_total)
 		return data
