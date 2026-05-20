@@ -258,7 +258,7 @@ def _parse_opt_settings(
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	if "flatten_map_ms" in params and not any(
 		float(eff.get(name, 0.0)) != 0.0
-		for name in ("flatten_sdir", "flatten_map_step")
+		for name in ("flatten_sdir", "flatten_map_step", "flatten_orient")
 	):
 		raise ValueError(f"stages_json: stage '{stage_name}' with flatten_map_ms requires a nonzero flatten loss")
 	return OptSettings(
@@ -303,6 +303,7 @@ lambda_global: dict[str, float] = {
 	"cyl_outside": 0.0,
 	"flatten_sdir": 0.0,
 	"flatten_map_step": 0.0,
+	"flatten_orient": 0.0,
 }
 
 
@@ -1011,6 +1012,10 @@ def optimize(
 			"loss": opt_loss_flatten.flatten_map_step_loss,
 			"needs": Needs(flatten=True),
 		},
+		"flatten_orient": {
+			"loss": opt_loss_flatten.flatten_orient_loss,
+			"needs": Needs(flatten=True),
+		},
 	}
 
 	_corr_start_printed = [False]
@@ -1215,6 +1220,7 @@ def optimize(
 		)
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
+			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.05)),
 		)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
@@ -1387,6 +1393,11 @@ def optimize(
 				"flatten_valid_to_invalid": "f_v2i",
 				"flatten_invalid_to_valid": "f_i2v",
 				"flatten_map_step": "f_mstep",
+				"flatten_orient": "f_orient",
+				"flatten_orient_fold_frac": "f_fold",
+				"flatten_orient_lowdet_frac": "f_lowdet",
+				"flatten_orient_min_det": "f_mindet",
+				"flatten_orient_mean_det": "f_det",
 				"flatten_sdir_no_new": "f_noadd",
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
@@ -1669,7 +1680,7 @@ def optimize(
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
 						tv.update(opt_loss_cyl.last_stats())
-					if name == "flatten_sdir":
+					if name in ("flatten_sdir", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
