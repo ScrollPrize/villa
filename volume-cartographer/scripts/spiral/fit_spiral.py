@@ -107,7 +107,7 @@ default_config = {
     'working_set_mode': 'global',  # 'progressive' (grow from a seed when satisfied) | 'progressive_fixed' (grow from a seed on a fixed iteration schedule) | 'global' (fit all patches at once)
     'working_set_check_interval': 10,
     'progressive_fixed_add_interval': 50,
-    'output_winding_range': (10, 100),
+    'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
 }
@@ -217,9 +217,12 @@ def get_bounding_windings(relative_yx, dr_per_winding):
     return theta, radius, inner_winding, outer_winding
 
 
-def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3.):
+def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3., winding_range=None):
 
-    min_w, max_w = cfg['output_winding_range']
+    if winding_range is None:
+        min_w, max_w = cfg['output_first_winding'], float('inf')
+    else:
+        min_w, max_w = winding_range
     theta, radius, inner_winding, outer_winding = get_bounding_windings(relative_yx, dr_per_winding)
     def evaluate_kernel(winding_idx):
         winding_xy = get_winding_xy(winding_idx, theta, dr_per_winding)
@@ -528,8 +531,8 @@ class SpiralAndTransform(nn.Module):
     def get_dr_per_winding(self):
         return F.softplus(self.dr_per_winding_logit * self.dr_per_winding_scale)
 
-    def get_spiral_density(self, spiral_zyx):
-        return get_spiral_density(spiral_zyx[..., 1:], dr_per_winding=self.get_dr_per_winding(), sigma=1.) * self.spiral_intensity
+    def get_spiral_density(self, spiral_zyx, winding_range=None):
+        return get_spiral_density(spiral_zyx[..., 1:], dr_per_winding=self.get_dr_per_winding(), sigma=1., winding_range=winding_range) * self.spiral_intensity
 
 
 def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | None:
@@ -1491,16 +1494,33 @@ def get_face_indices(h, w):
 
 
 @torch.inference_mode
-def _get_working_set_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches):
+def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches, unattached_pcl_strips=()):
     """Returns (min_winding_idx, max_winding_idx) — inclusive min and exclusive max
-    integer winding indices covered by the given patches' in-ROI valid quad centers.
-    Winding indices are computed by transforming quad centers to spiral space and
-    rounding shifted_radius/dr_per_winding to the nearest integer (matching the
-    convention in overlay_patches_on_slices)."""
+    integer winding indices covered by the given patches' in-ROI valid quad centers
+    and by in-ROI unattached pcl points. Winding indices are computed by transforming
+    points to spiral space and rounding shifted_radius/dr_per_winding to the nearest
+    integer (matching the convention in overlay_patches_on_slices). The min is
+    clamped to cfg['output_first_winding']; the max has no upper cap."""
     device = dr_per_winding.device
     dr = dr_per_winding.detach()
     min_w = None
     max_w = None
+
+    def update_from_winding_indices(winding_indices):
+        nonlocal min_w, max_w
+        local_min = int(winding_indices.min().item())
+        local_max = int(winding_indices.max().item())
+        min_w = local_min if min_w is None else min(min_w, local_min)
+        max_w = local_max if max_w is None else max(max_w, local_max)
+
+    chunk = 65536
+
+    def transform_in_chunks(zyxs):
+        spiral_pieces = []
+        for start in range(0, zyxs.shape[0], chunk):
+            spiral_pieces.append(slice_to_spiral_transform(zyxs[start:start + chunk]))
+        return torch.cat(spiral_pieces, dim=0) if len(spiral_pieces) > 1 else spiral_pieces[0]
+
     for patch in working_set_patches:
         patch_zyxs = patch.zyxs.to(device=device, dtype=torch.float32)
         if patch_zyxs.shape[0] < 2 or patch_zyxs.shape[1] < 2:
@@ -1522,23 +1542,24 @@ def _get_working_set_winding_range(slice_to_spiral_transform, dr_per_winding, wo
         mask = valid_quad_mask & quad_touches_roi
         if not mask.any():
             continue
-        zyxs = quad_center_zyxs[mask]
-        chunk = 65536
-        spiral_pieces = []
-        for start in range(0, zyxs.shape[0], chunk):
-            spiral_pieces.append(slice_to_spiral_transform(zyxs[start:start + chunk]))
-        spiral_zyxs = torch.cat(spiral_pieces, dim=0) if len(spiral_pieces) > 1 else spiral_pieces[0]
+        spiral_zyxs = transform_in_chunks(quad_center_zyxs[mask])
         _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-        winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
-        patch_min = int(winding_indices.min().item())
-        patch_max = int(winding_indices.max().item())
-        min_w = patch_min if min_w is None else min(min_w, patch_min)
-        max_w = patch_max if max_w is None else max(max_w, patch_max)
-    cfg_min, cfg_max = cfg['output_winding_range']
+        update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+
+    for strip in unattached_pcl_strips:
+        zyxs = torch.from_numpy(strip['zyxs']).to(device=device, dtype=torch.float32)
+        in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
+        if not in_roi.any():
+            continue
+        spiral_zyxs = transform_in_chunks(zyxs[in_roi])
+        _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+        update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+
+    first_winding = cfg['output_first_winding']
     if min_w is None:
-        return cfg_min, cfg_max
+        return first_winding, first_winding
     margin = cfg['output_winding_margin']
-    return max(min_w - margin, cfg_min), min(max_w + 1 + margin, cfg_max)
+    return max(min_w - margin, first_winding), max_w + 1 + margin
 
 
 def _rasterize_triangles_into_mesh(
@@ -1735,10 +1756,10 @@ def _build_snapped_overlay(
 
 
 @torch.inference_mode
-def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, out_path, name='mesh'):
+def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, unattached_pcl_strips, out_path, name='mesh'):
 
-    min_winding_idx, max_winding_idx = _get_working_set_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches)
-    print(f'save_mesh {name}: adaptive winding range [{min_winding_idx}, {max_winding_idx})')
+    min_winding_idx, max_winding_idx = _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches, unattached_pcl_strips)
+    print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size'] // downsample_factor  # voxels in downsampled volume
     z_margin = cfg['flow_bounds_z_margin']
     spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
@@ -1886,6 +1907,7 @@ def save_overlay(
     quad_label_map, quad_status_flat,
     unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
     umbilicus_zyx, z_to_umbilicus_yx,
+    winding_range,
     out_path, suffix
 ):
 
@@ -2008,7 +2030,7 @@ def save_overlay(
         slice_zyx = torch.cat([torch.full([*slice_yx.shape[:2], 1], slice_z, device=device), slice_yx], dim=-1)
 
         spiral_zyx = slice_to_spiral_transform(slice_zyx)
-        spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx)
+        spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx, winding_range=winding_range)
         slice = scroll_slices_for_visualisation[vis_slice_idx].to(device)
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
@@ -2172,6 +2194,10 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             ),
         )
         if os.environ.get('FIT_SPIRAL_SKIP_FITTED_OVERLAY') != '1':
+            working_set_patches_list = [patches_list[i] for i in working_set_indices]
+            winding_range = _get_output_winding_range(
+                slice_to_spiral_transform, dr_per_winding, working_set_patches_list, unattached_pcl_strips,
+            )
             save_overlay(
                 spiral_and_transform,
                 flow_min_corner_spiral_zyx, flow_max_corner_spiral_zyx,
@@ -2180,10 +2206,10 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 quad_label_map, quad_status_flat,
                 unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
                 umbilicus_zyx, z_to_umbilicus_yx,
+                winding_range,
                 out_path, suffix
             )
-            working_set_patches_list = [patches_list[i] for i in working_set_indices]
-            save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches_list, out_path, name=suffix)
+            save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches_list, unattached_pcl_strips, out_path, name=suffix)
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
