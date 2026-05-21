@@ -1,0 +1,19 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vc-surface-index"
+version = "0.1.0"
+description = "Python bindings for volume-cartographer QuadSurface and SurfacePatchIndex"
+requires-python = ">=3.9"
+
+[tool.scikit-build]
+cmake.args = [
+  "-DVC_BUILD_PYTHON=ON",
+  "-DVC_BUILD_APPS=OFF",
+  "-DVC_BUILD_UI_TRACER=OFF",
+  "-DVC_BUILD_FLATBOI=OFF",
+  "-DVC_TESTING=OFF",
+]
+wheel.packages = []

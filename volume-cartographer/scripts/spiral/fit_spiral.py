@@ -24,7 +24,7 @@ from torchdiffeq import odeint
 
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
-from point_collection import load_point_collection, _process_point_collections, normalise_pcl_winding_annotations
+from point_collection import load_point_collection, _process_point_collections, can_use_surface_index_backend, normalise_pcl_winding_annotations
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
@@ -35,13 +35,16 @@ spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
 z_begin, z_end = 7500, 9500
-cross_patch_pcl_json_paths = None
+cross_patch_pcl_json_paths = [
+      '/home/sean/Desktop/s1_relative_windings.json',
+  ]
+
 patches_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/traces/custom_patches'
 voxel_size_um = 2.4 * 4  # before downsampling
 seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
 unattached_pcl_json_paths = [
-    '/home/sean/Desktop/same_winding_annotations.json',
-    '/home/sean/Desktop/s1_relative_winding_annotations.json'
+    '/home/sean/Desktop/same_winding_annotations_2.json',
+    '/home/sean/Desktop/s1_relative_windings.json'
 ]
 
 # # PHerc0172
@@ -2176,6 +2179,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 umbilicus_zyx, z_to_umbilicus_yx,
                 out_path, suffix
             )
+        if os.environ.get('FIT_SPIRAL_SKIP_MESH') != '1':
             working_set_patches_list = [patches_list[i] for i in working_set_indices]
             save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches_list, out_path, name=suffix)
 
@@ -2342,8 +2346,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
     suffix = 'fitted' if pool_fully_absorbed else f'fitted_p{pass_idx}_ws{working_set_size}'
-    save_overlay_and_print_satisfaction(suffix)
     save_model(suffix)
+    save_overlay_and_print_satisfaction(suffix)
 
     return {
         'working_set_size': working_set_size,
@@ -2373,6 +2377,7 @@ def load_patches(patches_path, segment_id_filter=lambda s: True):
             continue
         try:
             patches[entry] = load_tifxyz(segment_path)
+            patches[entry].source_path = segment_path
         except Exception as e:
             print(f'Failed to load segment {entry}: {e}')
             failed_count += 1
@@ -2382,7 +2387,13 @@ def load_patches(patches_path, segment_id_filter=lambda s: True):
     return patches
 
 
-def process_point_collections_cached(patches, point_collections, tolerance=10.0):
+def process_point_collections_cached(
+    patches,
+    point_collections,
+    tolerance=10.0,
+    surface_index_tolerance=None,
+    distance_scale=1.0,
+):
     patch_ids_str = '_'.join(sorted(patches.keys()))
     hashed_patches = hashlib.sha256(bytes(patch_ids_str, 'ascii')).hexdigest()[:8]
 
@@ -2394,7 +2405,11 @@ def process_point_collections_cached(patches, point_collections, tolerance=10.0)
             pcl_locations.append(tuple(point['p']))
     hashed_pcls = hashlib.sha256(pickle.dumps(pcl_locations)).hexdigest()[:8]
 
-    cache_filename = f'{cache_path}/point_patch_links-{hashed_patches}_{hashed_pcls}_tol-{tolerance}.pkl'
+    backend = 'surface-index' if surface_index_tolerance is not None and can_use_surface_index_backend(patches) else 'torch'
+    cache_filename = (
+        f'{cache_path}/point_patch_links-{hashed_patches}_{hashed_pcls}'
+        f'_backend-{backend}_tol-{tolerance}_idx-tol-{surface_index_tolerance}.pkl'
+    )
 
     if os.path.exists(cache_filename):
         with open(cache_filename, 'rb') as fp:
@@ -2402,7 +2417,13 @@ def process_point_collections_cached(patches, point_collections, tolerance=10.0)
         point_collections.clear()
         point_collections.update(point_collections_cached)
     else:
-        _process_point_collections(patches, point_collections, tolerance)
+        _process_point_collections(
+            patches,
+            point_collections,
+            tolerance,
+            surface_index_tolerance=surface_index_tolerance,
+            distance_scale=distance_scale,
+        )
         os.makedirs(cache_path, exist_ok=True)
         with open(cache_filename, 'wb') as fp:
             pickle.dump(point_collections, fp)
@@ -2437,8 +2458,6 @@ def main():
                 target[next_id] = pcl
                 next_id += 1
 
-    process_point_collections_cached(patches, cross_patch_point_collections)
-
     for patch in patches.values():
         patch.scale *= downsample_factor
         patch.zyxs /= downsample_factor
@@ -2465,6 +2484,14 @@ def main():
     dropped_patch_ids = [pid for pid, patch in patches.items() if not patch_intersects_z_roi(patch)]
     for pid in dropped_patch_ids:
         del patches[pid]
+
+    process_point_collections_cached(
+        patches,
+        cross_patch_point_collections,
+        tolerance=10.0 / downsample_factor,
+        surface_index_tolerance=10.0 / downsample_factor,
+        distance_scale=1.0,
+    )
 
     # For unattached pcls, keep only the longest contiguous subrange (in id-sorted
     # order) of points whose zs lie within [z_begin - margin, z_end + margin); drop

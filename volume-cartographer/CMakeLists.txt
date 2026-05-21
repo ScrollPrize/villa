@@ -25,6 +25,7 @@ option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
+option(VC_BUILD_PYTHON     "Build Python bindings"                         OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 
 # Skip building app executables (vc_*, VC3D) when generating coverage:
@@ -39,6 +40,7 @@ if(VC_ENABLE_COVERAGE)
 else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
+option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"            ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
@@ -266,19 +268,21 @@ if(VC_DEAD_CODE_REPORT)
 endif()
 
 # ---- Dependencies -----------------------------------------------------------
-find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
+if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
+    find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOUIC ON)
 
-find_package(Ceres REQUIRED)
+    find_package(Ceres REQUIRED)
+    find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
+endif()
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
 find_package(PkgConfig REQUIRED)
 # Blosc1 (libblosc-dev on Debian/Ubuntu; c-blosc on Homebrew). No upstream
 # CMake config is shipped, so locate by header+lib and wrap in an imported
@@ -312,7 +316,23 @@ endif()
 if(NOT TARGET LZ4::lz4)
     add_library(LZ4::lz4 ALIAS PkgConfig::lz4)
 endif()
-find_package(CGAL REQUIRED)
+if(VC_BUILD_APPS)
+    find_package(CGAL REQUIRED)
+endif()
+if(VC_BUILD_PYTHON)
+    find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -m nanobind --cmake_dir
+        OUTPUT_VARIABLE VC_NANOBIND_CMAKE_DIR
+        RESULT_VARIABLE VC_NANOBIND_CMAKE_DIR_RESULT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(VC_NANOBIND_CMAKE_DIR_RESULT EQUAL 0 AND VC_NANOBIND_CMAKE_DIR)
+        list(APPEND CMAKE_PREFIX_PATH "${VC_NANOBIND_CMAKE_DIR}")
+    endif()
+    find_package(nanobind CONFIG REQUIRED)
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     include_directories(${CMAKE_SOURCE_DIR}/core/openmp_stub)
@@ -377,6 +397,9 @@ endif()
 add_subdirectory(utils)
 add_subdirectory(core)
 add_subdirectory(apps)
+if(VC_BUILD_PYTHON)
+    add_subdirectory(python)
+endif()
 
 if(VC_TESTING)
     enable_testing()
