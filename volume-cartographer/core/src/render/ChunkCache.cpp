@@ -1,5 +1,7 @@
 #include "ChunkCache.hpp"
 
+#include "vc/core/util/Logging.hpp"
+
 #include <algorithm>
 #include <fstream>
 #include <limits>
@@ -146,11 +148,11 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
-            ChunkStatus::Error,
+            ChunkStatus::Missing,
             state->dtype_,
             state->levels_[static_cast<std::size_t>(level)].chunkShape,
             {},
-            "requested missing zarr scale level " + std::to_string(level)};
+            {}};
     }
     if (!isValidKey(*state, key))
         return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
@@ -176,11 +178,11 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
-            ChunkStatus::Error,
+            ChunkStatus::Missing,
             state->dtype_,
             state->levels_[static_cast<std::size_t>(level)].chunkShape,
             {},
-            "requested missing zarr scale level " + std::to_string(level)};
+            {}};
     }
     if (!isValidKey(*state, key))
         return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
@@ -407,9 +409,22 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
     } catch (const std::exception& e) {
         fetch.status = ChunkFetchStatus::IoError;
         fetch.message = e.what();
+        Logger()->error(
+            "ChunkCache caught chunk fetch exception for {}/{}/{}/{}: {}",
+            key.level,
+            key.iz,
+            key.iy,
+            key.ix,
+            fetch.message);
     } catch (...) {
         fetch.status = ChunkFetchStatus::IoError;
         fetch.message = "unknown chunk fetch exception";
+        Logger()->error(
+            "ChunkCache caught unknown chunk fetch exception for {}/{}/{}/{}",
+            key.level,
+            key.iz,
+            key.iy,
+            key.ix);
     }
 
     {

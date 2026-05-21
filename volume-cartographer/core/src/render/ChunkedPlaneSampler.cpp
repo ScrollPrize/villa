@@ -26,25 +26,35 @@ struct LocalChunkCache {
         }
     }
 
-    ChunkResult get(const ChunkKey& key, int& requested, int& errors)
+    const ChunkResult& get(const ChunkKey& key, int& requested, int& errors)
     {
-        auto it = chunks.find(key);
-        if (it != chunks.end())
-            return it->second;
+        // Trilinear sampling reads 8 voxels per pixel and adjacent pixels share
+        // chunks, so consecutive lookups overwhelmingly hit the same key. Skip
+        // the hash-map probe in that case.
+        if (lastResult && lastKey == key)
+            return *lastResult;
 
-        ChunkResult result = array.tryGetChunk(key.level, key.iz, key.iy, key.ix);
-        chunks.emplace(key, result);
-        if (result.status == ChunkStatus::MissQueued && requestedKeys.insert(key).second)
-            ++requested;
-        if (result.status == ChunkStatus::Error && errorKeys.insert(key).second)
-            ++errors;
-        return result;
+        auto it = chunks.find(key);
+        if (it == chunks.end()) {
+            ChunkResult result = array.tryGetChunk(key.level, key.iz, key.iy, key.ix);
+            if (result.status == ChunkStatus::MissQueued && requestedKeys.insert(key).second)
+                ++requested;
+            if (result.status == ChunkStatus::Error && errorKeys.insert(key).second)
+                ++errors;
+            it = chunks.emplace(key, std::move(result)).first;
+        }
+
+        lastKey = key;
+        lastResult = &it->second;
+        return it->second;
     }
 
     IChunkedArray& array;
     std::unordered_map<ChunkKey, ChunkResult, ChunkKeyHash> chunks;
     std::unordered_set<ChunkKey, ChunkKeyHash> requestedKeys;
     std::unordered_set<ChunkKey, ChunkKeyHash> errorKeys;
+    ChunkKey lastKey{};
+    const ChunkResult* lastResult = nullptr;
 };
 
 constexpr int kParallelMinPixels = 128 * 128;
@@ -113,6 +123,12 @@ LevelAccess makeLevelAccess(IChunkedArray& array, int level)
     return access;
 }
 
+bool hasSampleableLevel(const LevelAccess& access)
+{
+    return access.shape[0] > 0 && access.shape[1] > 0 && access.shape[2] > 0
+        && access.chunkShape[0] > 0 && access.chunkShape[1] > 0 && access.chunkShape[2] > 0;
+}
+
 cv::Vec3f toLevelCoord(const LevelAccess& access, const cv::Vec3f& p0)
 {
     const auto& t = access.transform;
@@ -175,7 +191,7 @@ bool readVoxel(IChunkedArray& array,
     const int cz = iz / chunkShape[0];
     const int cy = iy / chunkShape[1];
     const int cx = ix / chunkShape[2];
-    ChunkResult result = cache.get({level, cz, cy, cx}, requested, errors);
+    const ChunkResult& result = cache.get({level, cz, cy, cx}, requested, errors);
     if (result.status == ChunkStatus::MissQueued ||
         result.status == ChunkStatus::Missing ||
         result.status == ChunkStatus::Error)
@@ -355,9 +371,9 @@ bool sampleTrilinear(IChunkedArray& array,
         return true;
     }
 
-    const int ix = int(std::floor(x));
-    const int iy = int(std::floor(y));
-    const int iz = int(std::floor(z));
+    const int ix = int(x);
+    const int iy = int(y);
+    const int iz = int(z);
     const float fx = x - float(ix);
     const float fy = y - float(iy);
     const float fz = z - float(iz);
@@ -372,7 +388,7 @@ bool sampleTrilinear(IChunkedArray& array,
         const int ly = iy - cy * chunkShape[1];
         const int lx = ix - cx * chunkShape[2];
         if (lx + 1 < chunkShape[2] && ly + 1 < chunkShape[1] && lz + 1 < chunkShape[0]) {
-            ChunkResult result = cache.get({level, cz, cy, cx}, requested, errors);
+            const ChunkResult& result = cache.get({level, cz, cy, cx}, requested, errors);
             if (result.status == ChunkStatus::MissQueued ||
                 result.status == ChunkStatus::Missing ||
                 result.status == ChunkStatus::Error)
@@ -476,11 +492,8 @@ bool sampleLevelPoint(IChunkedArray& array,
                       int& requested,
                       int& errors)
 {
-    if (!finiteCoord(p)) {
-        out = access.fill;
-        return true;
-    }
-
+    // Non-finite coords fail inLevelBounds (NaN compares false) and return
+    // fill, identical to an explicit finiteCoord check.
     if (sampling == vc::Sampling::Nearest)
         return sampleNearest(array, cache, access, level, p, out, requested, errors);
 
@@ -538,6 +551,8 @@ std::vector<ChunkKey> ChunkedPlaneSampler::collectPlaneDependencies(
         return result;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return result;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     const int tile = std::max(1, options.tileSize);
     std::unordered_set<ChunkKey, ChunkKeyHash> keys;
@@ -579,6 +594,8 @@ std::vector<ChunkKey> ChunkedPlaneSampler::collectCoordsDependencies(
         return result;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return result;
     const int tile = std::max(1, options.tileSize);
     const int h = std::min(coords.rows, coverage.rows);
     const int w = std::min(coords.cols, coverage.cols);
@@ -621,6 +638,8 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     LocalChunkCache chunkCache(array, 64);
     const int tile = std::max(1, options.tileSize);
@@ -660,6 +679,8 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestCoordsDependencies(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     LocalChunkCache chunkCache(array, 64);
     const int tile = std::max(1, options.tileSize);
     const int h = std::min(coords.rows, coverage.rows);
@@ -703,6 +724,8 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
     const int tile = std::max(1, options.tileSize);
     std::vector<SampleTile> tiles;
@@ -783,6 +806,8 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
         return stats;
 
     const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
     const int tile = std::max(1, options.tileSize);
     const int h = std::min({coords.rows, out.rows, coverage.rows});
     const int w = std::min({coords.cols, out.cols, coverage.cols});

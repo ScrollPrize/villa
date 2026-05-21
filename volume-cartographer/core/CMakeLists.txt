@@ -53,11 +53,9 @@ target_link_libraries(vc_core
 )
 
 # utils header-only library + vendored c3d codec.
-# WHOLE_ARCHIVE is needed because ThinLTO + lld can internalize symbols from
-# static archives before cross-archive references are resolved.
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
-    $<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,utils_c3d_codec>>
+    $<BUILD_INTERFACE:utils_c3d_codec>
 )
 target_link_libraries(vc_core PRIVATE
     Blosc::blosc
@@ -78,6 +76,9 @@ target_link_libraries(vc_ui PUBLIC vc_core Qt6::Core Qt6::Gui Qt6::Widgets)
 
 add_library(vc_flattening src/ABFFlattening.cpp)
 target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
+
+add_library(vc_inpaint src/InpaintSurface.cpp)
+target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_tracer
     src/GrowPatch.cpp

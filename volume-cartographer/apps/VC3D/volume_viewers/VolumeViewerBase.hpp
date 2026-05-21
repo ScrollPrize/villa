@@ -148,6 +148,9 @@ public:
     virtual void renderIntersections(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
+    virtual void scheduleIntersectionRender(
+        const char* reason = "external caller",
+        std::source_location caller = std::source_location::current()) = 0;
     virtual void invalidateIntersect(const std::string& name = "") = 0;
     virtual void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells)
     {

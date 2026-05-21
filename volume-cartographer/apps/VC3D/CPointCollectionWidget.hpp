@@ -11,7 +11,9 @@
 #include <QCheckBox>
 #include <QItemSelection>
 #include <QDoubleSpinBox>
+#include <QSpinBox>
 #include <QLabel>
+#include <QComboBox>
 
 #include <cmath>
 #include <filesystem>
@@ -40,9 +42,22 @@ public:
     void clearCorrPointsResults();
 
     void setAnnotateChecked(bool checked);
+    bool sameWrapAnnotationEnabled() const;
+    double sameWrapAnnotationSpacing() const;
+    bool sameWrapAnnotationMergeEnabled() const;
+    int sameWrapAnnotationPathType() const;
+    int sameWrapAnnotationFilterType() const;
+    int sameWrapAnnotationFilterKernelSize() const;
 
 signals:
     void annotateToggled(bool enabled);
+    void sameWrapAnnotationToggled(bool enabled);
+    void sameWrapAnnotationSpacingChanged(double spacing);
+    void sameWrapAnnotationMergeToggled(bool enabled);
+    void sameWrapAnnotationPathTypeChanged(int pathType);
+    void sameWrapAnnotationFilterTypeChanged(int filterType);
+    void sameWrapAnnotationFilterKernelSizeChanged(int kernelSize);
+    void sameWrapAnnotationClearRequested();
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
@@ -90,6 +105,13 @@ private slots:
     uint64_t _selected_point_id = 0;
 
     QCheckBox *_chkAnnotate{nullptr};
+    QCheckBox *_chkSameWrapAnnotation{nullptr};
+    QCheckBox *_chkSameWrapMerge{nullptr};
+    QComboBox *_sameWrapPathTypeCombo{nullptr};
+    QComboBox *_sameWrapFilterTypeCombo{nullptr};
+    QSpinBox *_sameWrapFilterKernelSpinbox{nullptr};
+    QDoubleSpinBox *_sameWrapSpacingSpinbox{nullptr};
+    QPushButton *_clearSameWrapAnnotationButton{nullptr};
 
     QTreeView *_tree_view;
     QStandardItemModel *_model;
@@ -119,4 +141,3 @@ private slots:
     std::unordered_map<uint64_t, CorrPointResult> _corr_point_results;
     std::unordered_map<uint64_t, float> _corr_collection_avgs;
 };
-

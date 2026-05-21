@@ -30,6 +30,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         qCWarning(lcSegModule) << "Failed to begin segmentation editing session";
         return false;
     }
+    _autosaveState.beginSession();
 
     if (_state) {
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
@@ -73,10 +74,8 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     }
 
     emitPendingChanges();
-    _pendingAutosave = false;
     _pendingAutosaveVertexUpdates.clear();
     _saveSnapshot.reset();
-    _autosaveNotifiedFailure = false;
     updateAutosaveState();
     return true;
 }
@@ -119,16 +118,15 @@ void SegmentationModule::endEditingSession()
     }
     _correctionsSegmentPath.clear();
 
-    if (_pendingAutosave) {
+    if (_autosaveState.pending()) {
         performAutosave();
     }
 
     if (_editManager) {
         _editManager->endSession();
     }
-    if (!_saveInProgress) {
-        _saveSnapshot.reset();
-    }
+    _autosaveState.endSession();
+    _saveSnapshot.reset();
     _pendingAutosaveVertexUpdates.clear();
     updateAutosaveState();
 }
