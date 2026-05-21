@@ -290,6 +290,10 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
+        # Cached upsampled flow at t=0 for the num_flow_timesteps==1 fast path. Built once
+        # per diffeomorphism instance (one per training iteration), shared across forward and
+        # inverse calls so the per-iteration trilinear LR->HR upsampling is amortised.
+        self._cached_flow = None
 
     def _velocity(self, t_int, current_zyx_scaled):
         # t_int is a scalar in [0, 1]; flow_field expects t in [-1, 1]
@@ -308,7 +312,9 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
             # Time-invariant flow: precompute the upsampled flow once and inline a manual rk4 loop
             # to skip torchdiffeq's per-step dispatch overhead.
             assert self.solver == 'rk4'
-            cached_flow = self.flow_field(0.0)
+            if self._cached_flow is None:
+                self._cached_flow = self.flow_field(0.0)
+            cached_flow = self._cached_flow
             for _ in range(n_steps):
                 k1 = sample_field(y, cached_flow)
                 k2 = sample_field(y + (h / 2) * k1, cached_flow)
@@ -539,6 +545,15 @@ def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | Non
     return run_starts[run_idx], run_ends[run_idx] + 1
 
 
+def _build_line_runs(line_valid):
+    # Returns (los, his) arrays of contiguous True runs in a 1-D bool array.
+    padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
+    diff = np.diff(padded)
+    los = np.where(diff == 1)[0].astype(np.int64)
+    his = np.where(diff == -1)[0].astype(np.int64)
+    return los, his
+
+
 def _prepare_patch_sampling_cache(patches, patch_loss_z_margin):
     patch_areas = np.empty(len(patches), dtype=np.float64)
     for patch_idx, patch in enumerate(patches):
@@ -561,6 +576,31 @@ def _prepare_patch_sampling_cache(patches, patch_loss_z_margin):
         patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
         patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
         patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
+
+        # Precompute, per row and per column, the contiguous valid-quad runs so the
+        # per-iteration sampler can skip the run_containing_index work. We keep the
+        # original "row uniform, run-within-row weighted by length" distribution by
+        # indexing runs per row/col.
+        def _runs_per_line(mask_np, fixed_axis, valid_lines):
+            # Returns parallel lists indexed 0..len(valid_lines)-1:
+            # los_list[k], his_list[k], cum_list[k] are arrays of run lo/hi/cum-length
+            # for the k'th valid line (mask_np row if fixed_axis==0 else column).
+            los_list, his_list, cum_list = [], [], []
+            for r in valid_lines:
+                line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
+                los, his = _build_line_runs(line)
+                los_list.append(los)
+                his_list.append(his)
+                cum_list.append(np.cumsum(his - los))
+            return los_list, his_list, cum_list
+
+        patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
+            in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
+        )
+        patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
+            in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
+        )
+
         patch_areas[patch_idx] = float(patch.area)
     inv_weights = patch_areas ** 0.5
     return inv_weights / inv_weights.sum()
@@ -600,7 +640,58 @@ def _sample_strip_ijs(line_valid, seed, fixed_coord, axis, num_points):
     return ijs
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_indices, umbilicus_zyx=None):
+class PatchGpuAtlas:
+    """All patches' (H, W, 3) zyxs grids packed into one flat GPU tensor, so
+    fractional-(i, j) bilinear lookups can run as a single batched gather instead
+    of per-patch CPU dispatch."""
+
+    def __init__(self, patches_by_id, device='cuda'):
+        flat_pieces = []
+        offsets = [0]
+        widths = []
+        heights = []
+        for p in patches_by_id.values():
+            z = p.zyxs  # (H, W, 3) on CPU
+            H, W = z.shape[:2]
+            flat_pieces.append(z.reshape(-1, 3).to(device=device, dtype=torch.float32))
+            offsets.append(offsets[-1] + H * W)
+            widths.append(W)
+            heights.append(H)
+        self.zyxs_flat = torch.cat(flat_pieces, dim=0)
+        self.offsets = torch.tensor(offsets, device=device, dtype=torch.int64)  # (N+1,)
+        self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
+        self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
+        self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
+
+    def memory_mb(self):
+        return self.zyxs_flat.numel() * 4 / 1e6
+
+    def lookup(self, patch_idx_per_sample, ijs):
+        # patch_idx_per_sample: (...,) int64 on GPU
+        # ijs: (..., 2) float on GPU
+        # returns (..., 3) on GPU. Caller must ensure floor(ij) lies on a valid quad.
+        base = self.offsets[patch_idx_per_sample]
+        W = self.widths[patch_idx_per_sample]
+        ij = ijs.to(torch.float32)
+        i0 = ij[..., 0].floor().to(torch.int64)
+        j0 = ij[..., 1].floor().to(torch.int64)
+        di = (ij[..., 0] - i0.to(torch.float32)).unsqueeze(-1)
+        dj = (ij[..., 1] - j0.to(torch.float32)).unsqueeze(-1)
+        flat_tl = base + i0 * W + j0
+        flat_tr = flat_tl + 1
+        flat_bl = flat_tl + W
+        flat_br = flat_bl + 1
+        z = self.zyxs_flat
+        tl = z[flat_tl]
+        tr = z[flat_tr]
+        bl = z[flat_bl]
+        br = z[flat_br]
+        top = tl + (tr - tl) * dj
+        bottom = bl + (br - bl) * dj
+        return top + (bottom - top) * di
+
+
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, umbilicus_zyx=None):
     if len(patch_indices) == 0:
         raise ValueError('Expected at least one patch index')
 
@@ -614,39 +705,61 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     num_points_per_direction = cfg['num_points_per_patch'] // 2
     N = len(patch_indices)
 
-    horizontal_ijs_by_patch = np.empty([N, num_points_per_direction, 2], dtype=np.float32)
-    vertical_ijs_by_patch = np.empty([N, num_points_per_direction, 2], dtype=np.float32)
+    P = num_points_per_direction
+    horizontal_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
+    vertical_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
+    rand = np.random.random
+    randint = np.random.randint
+    fixed_jitters_h = rand(N).astype(np.float32)
+    fixed_jitters_v = rand(N).astype(np.float32)
+    var_jitters_h = rand((N, P)).astype(np.float32)
+    var_jitters_v = rand((N, P)).astype(np.float32)
     for n, patch_idx in enumerate(patch_indices):
         patch = patches[patch_idx]
-        valid_quad_mask_np = patch._sampling_valid_quad_mask_np
 
-        # Subsample from a contiguous region of one row
-        row_idx = np.random.choice(patch._sampling_valid_quad_rows)
-        row_valid = valid_quad_mask_np[row_idx, :]
-        seed_j = np.random.choice(np.flatnonzero(row_valid))
-        horizontal_ijs_by_patch[n] = _sample_strip_ijs(row_valid, seed_j, row_idx, axis=0, num_points=num_points_per_direction)
+        # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
+        # within that row weighted by length (matches original `np.random.choice(flatnonzero)`).
+        rows_h = patch._sampling_valid_quad_rows
+        k = randint(rows_h.shape[0])
+        row_idx = rows_h[k]
+        cum_h = patch._h_runs_cum[k]
+        total_h = cum_h[-1]
+        if cum_h.shape[0] == 1:
+            r = 0
+        else:
+            r = np.searchsorted(cum_h, randint(total_h), side='right')
+        lo_h = patch._h_runs_los[k][r]
+        hi_h = patch._h_runs_his[k][r]
+        run_len_h = hi_h - lo_h
+        coords_h = np.sort(np.random.choice(run_len_h, P, replace=P > run_len_h))
+        horizontal_ijs_by_patch[n, :, 0] = row_idx + fixed_jitters_h[n]
+        horizontal_ijs_by_patch[n, :, 1] = lo_h + coords_h + var_jitters_h[n]
 
-        # Subsample from a contiguous region of one column
-        col_idx = np.random.choice(patch._sampling_valid_quad_cols)
-        col_valid = valid_quad_mask_np[:, col_idx]
-        seed_i = np.random.choice(np.flatnonzero(col_valid))
-        vertical_ijs_by_patch[n] = _sample_strip_ijs(col_valid, seed_i, col_idx, axis=1, num_points=num_points_per_direction)
+        # Vertical: same but with rows/cols swapped (fixed-coord is the column).
+        cols_v = patch._sampling_valid_quad_cols
+        k = randint(cols_v.shape[0])
+        col_idx = cols_v[k]
+        cum_v = patch._v_runs_cum[k]
+        total_v = cum_v[-1]
+        if cum_v.shape[0] == 1:
+            r = 0
+        else:
+            r = np.searchsorted(cum_v, randint(total_v), side='right')
+        lo_v = patch._v_runs_los[k][r]
+        hi_v = patch._v_runs_his[k][r]
+        run_len_v = hi_v - lo_v
+        coords_v = np.sort(np.random.choice(run_len_v, P, replace=P > run_len_v))
+        vertical_ijs_by_patch[n, :, 1] = col_idx + fixed_jitters_v[n]
+        vertical_ijs_by_patch[n, :, 0] = lo_v + coords_v + var_jitters_v[n]
 
-    # Bilinear-interpolate all sampled (i,j) in one batched call when all patch_indices reference
-    # the same patch (the common single-patch case); otherwise fall back to per-patch calls.
-    unique_patch_indices = np.unique(patch_indices)
-    if len(unique_patch_indices) == 1:
-        patch = patches[unique_patch_indices[0]]
-        combined_ijs = np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0)
-        combined_zyxs, _ = patch.ij_to_zyx(torch.from_numpy(combined_ijs))
-        all_slice_zyxs = combined_zyxs.cuda()
-    else:
-        # TODO: merge with above -- group by unique patches, then feed as batches
-        h_list = [patches[idx].ij_to_zyx(torch.from_numpy(horizontal_ijs_by_patch[n]))[0]
-                  for n, idx in enumerate(patch_indices)]
-        v_list = [patches[idx].ij_to_zyx(torch.from_numpy(vertical_ijs_by_patch[n]))[0]
-                  for n, idx in enumerate(patch_indices)]
-        all_slice_zyxs = torch.stack([torch.stack(h_list, dim=0), torch.stack(v_list, dim=0)], dim=0).cuda()
+    # Batched bilinear interp on GPU: ijs are guaranteed to fall on valid quads by the
+    # _sample_strip_ijs sampler (it draws i0/j0 from `_sampling_valid_quad_*`), so we
+    # skip the per-call validity check used by patch.ij_to_zyx.
+    combined_ijs_np = np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0)  # (2, N, P, 2)
+    combined_ijs_gpu = torch.from_numpy(combined_ijs_np).cuda(non_blocking=True)
+    patch_indices_gpu = torch.from_numpy(np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
+    patch_idx_per_sample = patch_indices_gpu[None, :, None].expand(2, N, num_points_per_direction)
+    all_slice_zyxs = patch_atlas.lookup(patch_idx_per_sample, combined_ijs_gpu)
 
     # When the caller also needs umbilicus_spiral (radius loss path), pack it into the same
     # forward ODE call to amortise the per-call overhead
@@ -683,7 +796,7 @@ def _get_patch_valid_points(patch, device, max_points=None, fixed_num_points=Non
     return patch.zyxs[valid_indices[0], valid_indices[1], :].to(device=device, dtype=torch.float32)
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True):
 
     # Sample once and share the tracks between the radius and DT losses; the loss using
     # fewer patches takes a prefix of the larger sample.
@@ -694,6 +807,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         slice_to_spiral_transform,
         dr_per_winding,
         patches,
+        patch_atlas,
         patch_indices,
         umbilicus_zyx,
     )
@@ -841,7 +955,7 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
-def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections):
+def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
     # cross-patch pcl exposes its attached points grouped by patch
@@ -920,17 +1034,16 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
             flat_ijs[base + num_strips_per_pcl + s] = strip
         flat_pids.extend([pid1] * num_strips_per_pcl + [pid2] * num_strips_per_pcl)
 
-    # Group strips by patch and run ij_to_zyx in a single batched call per patch.
-    flat_zyxs = torch.empty([total_strips, num_points_per_strip, 3], dtype=torch.float32)
-    strips_by_patch = {}
-    for k, pid in enumerate(flat_pids):
-        strips_by_patch.setdefault(pid, []).append(k)
-    for pid, strip_ks in strips_by_patch.items():
-        idxs = np.asarray(strip_ks)
-        ij_batch = torch.from_numpy(flat_ijs[idxs])
-        zyx_batch, _ = patches_dict[pid].ij_to_zyx(ij_batch)
-        flat_zyxs[idxs] = zyx_batch.to(dtype=torch.float32, device='cpu')
-    flat_zyxs = flat_zyxs.cuda()
+    # Batched GPU bilinear interp across all strips.
+    patch_idx_per_strip_np = np.fromiter(
+        (patch_atlas.id_to_idx[pid] for pid in flat_pids),
+        dtype=np.int64,
+        count=total_strips,
+    )
+    patch_idx_per_strip_gpu = torch.from_numpy(patch_idx_per_strip_np).cuda(non_blocking=True)
+    ijs_gpu = torch.from_numpy(flat_ijs).cuda(non_blocking=True)
+    patch_idx_per_sample = patch_idx_per_strip_gpu[:, None].expand(total_strips, num_points_per_strip)
+    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, ijs_gpu)
 
     # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
     # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
@@ -1999,6 +2112,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
     num_patches = len(patches_list)
     print(f'fitting {num_patches} patches')
 
+    patch_atlas = PatchGpuAtlas(patches_dict, device='cuda')
+    print(f'patch GPU atlas: {patch_atlas.memory_mb():.1f} MB')
+
     num_slices_for_visualisation = 20
     rendering_slices_downsample_factor = 2  # stride the scroll by this along zyx for rendering
 
@@ -2169,6 +2285,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             cfg['num_patches_per_step'],
             cfg['num_patches_per_step_for_dt'],
             patches_list,
+            patch_atlas,
             patch_sampling_probabilities,
             umbilicus_zyx,
             compute_dt=compute_patch_dt,
@@ -2187,7 +2304,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['patch_normals'] = patch_normals_loss * cfg['loss_weight_patch_normals']
 
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
-            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections) * cfg['loss_weight_winding_number']
+            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_winding_number']
 
         if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
             unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
