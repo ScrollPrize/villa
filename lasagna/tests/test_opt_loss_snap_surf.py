@@ -274,6 +274,68 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertEqual(state.model_to_ext.count(), 64)
 		self.assertEqual(state.ext_to_model.count(), 0)
 
+	def test_existing_ray_correspondences_use_local_update_before_bruteforce(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"init_distance": 10.0, "search_ring": 0},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		stats = opt_loss_snap_surf.last_stats()
+
+		self.assertGreater(stats["snaps_local"], 0.0)
+		self.assertEqual(stats["snaps_brute"], 0.0)
+		self.assertGreater(stats["snaps_pairs_m"], 0.0)
+
+	def test_bruteforce_runs_only_on_interval(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"init_distance": 10.0, "search_ring": 0, "brute_interval": 10},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		state = opt_loss_snap_surf._states[0]
+		state.model_to_ext.valid[0, 2, 2] = False
+		state.model_to_ext.map[0, 2, 2] = torch.tensor([float("nan"), float("nan")])
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		stats = opt_loss_snap_surf.last_stats()
+		self.assertEqual(stats["snaps_brute_on"], 0.0)
+		self.assertEqual(stats["snaps_brute"], 0.0)
+		self.assertEqual(state.model_to_ext.count(), 24)
+
+		for _ in range(8):
+			opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		stats = opt_loss_snap_surf.last_stats()
+		self.assertEqual(stats["snaps_brute_on"], 1.0)
+		self.assertGreater(stats["snaps_brute"], 0.0)
+		self.assertEqual(state.model_to_ext.count(), 25)
+
+	def test_bruteforce_is_limited_to_seed_front_initially(self) -> None:
+		model_xyz = _plane_xyz(h=31, w=31, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=31, w=31, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"init_distance": 10.0, "search_ring": 0, "brute_boundary_radius": 1},
+			seed_xyz=(15.0, 15.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		stats = opt_loss_snap_surf.last_stats()
+
+		self.assertEqual(stats["snaps_brute_on"], 1.0)
+		self.assertEqual(stats["snaps_front"], 16.0)
+		self.assertEqual(stats["snaps_brute"], 16.0)
+		self.assertLess(opt_loss_snap_surf._states[0].model_to_ext.count(), 31 * 31)
+
 	def test_seeded_mapping_filter_rejects_local_global_jump(self) -> None:
 		raw_map = torch.full((1, 4, 5, 2), float("nan"))
 		raw_valid = torch.zeros(1, 4, 5, dtype=torch.bool)
