@@ -1091,7 +1091,7 @@ def _prepare_unattached_pcl_strips(pcls_dict, min_point_spacing):
     # so consecutive kept points are at least min_point_spacing apart in 3D scroll space.
     # The first and last points are always kept.
     prepared = _UnattachedPclStripList()
-    for pcl in pcls_dict.values():
+    for pcl_id, pcl in pcls_dict.items():
         sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
         if len(sorted_items) < 2:
             continue
@@ -1107,7 +1107,13 @@ def _prepare_unattached_pcl_strips(pcls_dict, min_point_spacing):
             keep.append(len(zyxs) - 1)
             zyxs = zyxs[keep]
             windings = windings[keep]
-        prepared.append({'zyxs': zyxs, 'windings': windings})
+        prepared.append({
+            'id': pcl_id,
+            'name': pcl.get('name'),
+            'source_file': pcl.get('source_file'),
+            'zyxs': zyxs,
+            'windings': windings,
+        })
     return prepared
 
 
@@ -2356,6 +2362,34 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             total_points = int(unattached_pcl_total_counts.sum().item())
             satisfied_point_ratio = satisfied_points / max(total_points, 1)
             print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
+        patch_ids = list(patches_dict.keys())
+        patch_satisfaction_entries = []
+        for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):
+            fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
+            patch_satisfaction_entries.append({
+                'id': pid,
+                'satisfied_area': sat_area_t,
+                'total_area': tot_area_t,
+                'fraction': fraction,
+            })
+        patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
+        pcl_satisfaction_entries = []
+        if unattached_pcl_strips:
+            sat_counts = unattached_pcl_satisfied_counts.tolist()
+            tot_counts = unattached_pcl_total_counts.tolist()
+            for strip, sc, tc in zip(unattached_pcl_strips, sat_counts, tot_counts):
+                fraction = sc / tc if tc > 0 else 0.0
+                pcl_satisfaction_entries.append({
+                    'id': strip.get('id'),
+                    'name': strip.get('name'),
+                    'source_file': strip.get('source_file'),
+                    'satisfied_points': int(sc),
+                    'total_points': int(tc),
+                    'fraction': fraction,
+                })
+            pcl_satisfaction_entries.sort(key=lambda e: e['fraction'])
+        with open(f'{out_path}/satisfied_{suffix}.json', 'w') as f:
+            json.dump({'patches': patch_satisfaction_entries, 'pcls': pcl_satisfaction_entries}, f, indent=2)
         # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
         # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
         if satisfied_quad_masks:
