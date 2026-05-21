@@ -2289,21 +2289,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         indexing='ij'
     ), axis=-1).to(device)
 
-    if scroll_zarr is not None:
-        # TODO: it's a bit nasty to use the *visualisation* slices here
-        z_to_roi_min_max_yx = {
-            z: torch.tensor([
-                [slice.amax(dim=1).nonzero().amin(), slice.amax(dim=0).nonzero().amin()],
-                [slice.amax(dim=1).nonzero().amax(), slice.amax(dim=0).nonzero().amax()]
-            ])
-            for z, slice in zip(zs_for_visualisation, scroll_slices_for_visualisation)
-        }
-    else:
-        z_to_roi_min_max_yx = {0: torch.tensor([[640, 1020], [1100, 1420]])}
-    # FIXME: this assumes the scale in scroll-space is the same as that in spiral-space, which is only true at the start of optimisation
-    #  The only way to deal with this cleanly is to revert to supporting the flow field on scroll-space (but then the flow field no 
-    #  longer shifts with the umbilicus)
-    flow_field_radius = torch.stack([min_max_yx for min_max_yx in z_to_roi_min_max_yx.values()]).diff(dim=1).amax().item() / 2
+    flow_field_radius = cfg['flow_bounds_radius']
     flow_min_corner_spiral_zyx = torch.tensor([z_begin - cfg['flow_bounds_z_margin'], -flow_field_radius, -flow_field_radius], dtype=torch.int64, device=device)
     flow_max_corner_spiral_zyx = torch.tensor([z_end + cfg['flow_bounds_z_margin'], flow_field_radius, flow_field_radius], dtype=torch.int64, device=device)
 
