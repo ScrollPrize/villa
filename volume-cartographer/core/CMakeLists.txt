@@ -62,6 +62,18 @@ target_link_libraries(vc_core PRIVATE
     ${VC_LIBBACKTRACE}
 )
 
+if(VC_BUILD_APPS OR VC_BUILD_UI_TRACER)
+    add_library(vc_inpaint STATIC
+        src/InpaintSurface.cpp
+    )
+    target_link_libraries(vc_inpaint
+        PUBLIC
+        opencv_core
+        PRIVATE
+        opencv_imgproc
+        Ceres::ceres
+    )
+endif()
 
 
 # Slicing.cpp is the hot sampling loop (87% of render time).
