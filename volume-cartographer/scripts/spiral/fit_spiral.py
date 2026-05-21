@@ -930,17 +930,26 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
         ij_batch = torch.from_numpy(flat_ijs[idxs])
         zyx_batch, _ = patches_dict[pid].ij_to_zyx(ij_batch)
         flat_zyxs[idxs] = zyx_batch.to(dtype=torch.float32, device='cpu')
-
     flat_zyxs = flat_zyxs.cuda()
+
+    # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
+    # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
+    # needs the full sequential strip to stitch theta=0 crossings.
+    z_margin = cfg['patch_loss_z_margin']
+    z_mask = (flat_zyxs[..., 0] >= z_begin - z_margin) & (flat_zyxs[..., 0] < z_end + z_margin)
+
     flat_spiral = slice_to_spiral_transform(flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
     shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
 
     # [num_pairs, 8, num_points_per_strip] -> pool each side's 4 strips into a single set.
     shifted_radii = shifted_radii.reshape(len(strip_pairs), num_strips_per_pair, num_points_per_strip)
+    z_mask = z_mask.reshape(len(strip_pairs), num_strips_per_pair, num_points_per_strip)
     num_points_per_side = num_strips_per_pcl * num_points_per_strip
     p1_r = shifted_radii[:, :num_strips_per_pcl].reshape(len(strip_pairs), num_points_per_side)
     p2_r = shifted_radii[:, num_strips_per_pcl:].reshape(len(strip_pairs), num_points_per_side)
+    m1 = z_mask[:, :num_strips_per_pcl].reshape(len(strip_pairs), num_points_per_side)
+    m2 = z_mask[:, num_strips_per_pcl:].reshape(len(strip_pairs), num_points_per_side)
 
     winding_diffs = torch.tensor(
         [sp[4] for sp in strip_pairs],
@@ -950,7 +959,9 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
     expected_diff = (winding_diffs * dr_per_winding)[:, None, None]
 
     diff = p2_r[:, :, None] - p1_r[:, None, :]
-    return (diff - expected_diff).abs().mean()
+    pair_mask = m2[:, :, None] & m1[:, None, :]
+    err = (diff - expected_diff).abs()
+    return (err * pair_mask).sum() / pair_mask.sum().clamp(min=1)
 
 
 def _prepare_unattached_pcl_strips(pcls_dict):
