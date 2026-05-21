@@ -20,6 +20,8 @@ class SnapSurfConfig:
 	affine_radius: int = 2
 	search_ring: int = 1
 	seed_radius: int = 4
+	map_inlier_distance: float = 8.0
+	ray_residual: float = 1.0e-2
 	huber_delta: float = 5.0
 	distance_scale: float = 1.0
 	w_to_ext: float = 1.0
@@ -65,6 +67,8 @@ def configure_snap_surf(
 		affine_radius=max(1, int(raw.get("affine_radius", SnapSurfConfig.affine_radius))),
 		search_ring=max(0, int(raw.get("search_ring", SnapSurfConfig.search_ring))),
 		seed_radius=int(raw.get("seed_radius", SnapSurfConfig.seed_radius)),
+		map_inlier_distance=float(raw.get("map_inlier_distance", SnapSurfConfig.map_inlier_distance)),
+		ray_residual=float(raw.get("ray_residual", SnapSurfConfig.ray_residual)),
 		huber_delta=float(raw.get("huber_delta", SnapSurfConfig.huber_delta)),
 		distance_scale=max(1.0e-8, float(raw.get("distance_scale", SnapSurfConfig.distance_scale))),
 		w_to_ext=float(raw.get("w_to_ext", SnapSurfConfig.w_to_ext)),
@@ -81,6 +85,10 @@ def configure_snap_surf(
 		raise ValueError("snap_surf args.grid_error must be >= 0")
 	if _cfg.seed_radius < 0:
 		raise ValueError("snap_surf args.seed_radius must be >= 0")
+	if _cfg.map_inlier_distance <= 0.0:
+		raise ValueError("snap_surf args.map_inlier_distance must be > 0")
+	if _cfg.ray_residual < 0.0:
+		raise ValueError("snap_surf args.ray_residual must be >= 0")
 	if _cfg.huber_delta <= 0.0:
 		raise ValueError("snap_surf args.huber_delta must be > 0")
 	if _cfg.w_to_ext < 0.0 or _cfg.w_to_model < 0.0:
@@ -1117,6 +1125,7 @@ def _revalidate_direction(
 
 def _empty_grow_stats() -> dict[str, int | float]:
 	return {
+		"drop": 0,
 		"ring": 0,
 		"sup": 0,
 		"tgt": 0,
@@ -1127,13 +1136,25 @@ def _empty_grow_stats() -> dict[str, int | float]:
 		"gerr_n": 0,
 		"gerr_sum": 0.0,
 		"gerr_max": 0.0,
+		"raw_map_n": 0,
+		"raw_map_min": float("inf"),
+		"raw_map_sum": 0.0,
+		"raw_map_max": 0.0,
+		"in_map_n": 0,
+		"in_map_min": float("inf"),
+		"in_map_sum": 0.0,
+		"in_map_max": 0.0,
 	}
 
 
 def _add_grow_stats(dst: dict[str, int | float], src: dict[str, int | float]) -> None:
-	for k in ("ring", "sup", "tgt", "dist", "grid", "ori", "new", "gerr_n", "gerr_sum"):
+	for k in ("drop", "ring", "sup", "tgt", "dist", "grid", "ori", "new", "gerr_n", "gerr_sum", "raw_map_n", "raw_map_sum", "in_map_n", "in_map_sum"):
 		dst[k] = dst.get(k, 0) + src.get(k, 0)
 	dst["gerr_max"] = max(float(dst.get("gerr_max", 0.0)), float(src.get("gerr_max", 0.0)))
+	dst["raw_map_min"] = min(float(dst.get("raw_map_min", float("inf"))), float(src.get("raw_map_min", float("inf"))))
+	dst["raw_map_max"] = max(float(dst.get("raw_map_max", 0.0)), float(src.get("raw_map_max", 0.0)))
+	dst["in_map_min"] = min(float(dst.get("in_map_min", float("inf"))), float(src.get("in_map_min", float("inf"))))
+	dst["in_map_max"] = max(float(dst.get("in_map_max", 0.0)), float(src.get("in_map_max", 0.0)))
 
 
 def _grow_direction(
@@ -1631,33 +1652,191 @@ def _direction_loss_ext_to_model(
 	return loss, int(values_f.numel()), stats
 
 
-def _seed_model_region_mask(
+def _seed_model_sheet_mask(
 	*,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	seed_quad: tuple[int, int, int] | None,
-	radius: int,
 ) -> torch.Tensor:
 	if seed_quad is None:
 		return torch.zeros_like(model_valid, dtype=torch.bool)
-	D, H, W = (int(v) for v in model_valid.shape)
-	d0, h0, w0 = (int(v) for v in seed_quad)
-	r = int(radius)
+	D = int(model_valid.shape[0])
+	d0 = int(seed_quad[0])
 	dd = torch.arange(D, device=model_valid.device).view(D, 1, 1)
-	hh = torch.arange(H, device=model_valid.device).view(1, H, 1)
-	ww = torch.arange(W, device=model_valid.device).view(1, 1, W)
-	region = (
-		(dd == d0) &
-		(hh >= h0 - r) &
-		(hh <= h0 + 1 + r) &
-		(ww >= w0 - r) &
-		(ww <= w0 + 1 + r)
-	)
 	normal_ok = (
 		torch.isfinite(model_normals).all(dim=-1) &
 		(model_normals.norm(dim=-1) > 1.0e-8)
 	)
-	return model_valid.bool() & normal_ok & region
+	return model_valid.bool() & normal_ok & (dd == d0)
+
+
+def _normalized_model_to_ext_map(map_b: torch.Tensor) -> torch.Tensor:
+	D, H, W = (int(v) for v in map_b.shape[:3])
+	source_hw = _source_hw_grid(n=D, h=H, w=W, device=map_b.device, dtype=map_b.dtype)
+	return map_b - source_hw
+
+
+def _neighbor_min_mapping_distance(
+	*,
+	center_valid: torch.Tensor,
+	neighbor_valid: torch.Tensor,
+	norm_map: torch.Tensor,
+) -> torch.Tensor:
+	D, H, W = (int(v) for v in center_valid.shape)
+	if H == 0 or W == 0:
+		return torch.empty(D, H, W, device=norm_map.device, dtype=norm_map.dtype)
+	finite_map = torch.isfinite(norm_map).all(dim=-1)
+	center_ok = center_valid.bool() & finite_map
+	neighbor_ok = neighbor_valid.bool() & finite_map
+	map_safe = torch.where(neighbor_ok.unsqueeze(-1), norm_map, torch.zeros_like(norm_map))
+	map_patch = F.unfold(
+		map_safe.permute(0, 3, 1, 2),
+		kernel_size=3,
+		padding=1,
+	).transpose(1, 2).reshape(D, H, W, 2, 9)
+	valid_patch = F.unfold(
+		neighbor_ok.to(dtype=norm_map.dtype).unsqueeze(1),
+		kernel_size=3,
+		padding=1,
+	).transpose(1, 2).reshape(D, H, W, 9) > 0.0
+	valid_patch[..., 4] = False
+	dist = (map_patch - norm_map.unsqueeze(-1)).square().sum(dim=3).sqrt()
+	dist = torch.where(
+		center_ok.unsqueeze(-1) & valid_patch,
+		dist,
+		torch.full_like(dist, float("inf")),
+	)
+	return dist.min(dim=-1).values
+
+
+def _mapping_distance_stats(
+	*,
+	center_valid: torch.Tensor,
+	neighbor_valid: torch.Tensor,
+	norm_map: torch.Tensor,
+) -> dict[str, int | float]:
+	dist = _neighbor_min_mapping_distance(
+		center_valid=center_valid,
+		neighbor_valid=neighbor_valid,
+		norm_map=norm_map,
+	)
+	finite = center_valid.bool() & torch.isfinite(dist)
+	if not bool(finite.any().detach().cpu()):
+		return {"n": 0, "min": float("inf"), "sum": 0.0, "max": 0.0}
+	vals = dist[finite].detach()
+	return {
+		"n": int(vals.numel()),
+		"min": float(vals.min().cpu()),
+		"sum": float(vals.sum().cpu()),
+		"max": float(vals.max().cpu()),
+	}
+
+
+def _seed_quad_corner_mask(
+	shape: tuple[int, int, int],
+	seed_quad: tuple[int, int, int],
+	*,
+	device: torch.device,
+) -> torch.Tensor:
+	D, H, W = (int(v) for v in shape)
+	mask = torch.zeros(D, H, W, device=device, dtype=torch.bool)
+	d0, h0, w0 = (int(v) for v in seed_quad)
+	if d0 < 0 or d0 >= D:
+		return mask
+	h1 = min(H, h0 + 2)
+	w1 = min(W, w0 + 2)
+	h0 = max(0, h0)
+	w0 = max(0, w0)
+	if h0 < h1 and w0 < w1:
+		mask[d0, h0:h1, w0:w1] = True
+	return mask
+
+
+def _closest_seed_source_mask(
+	*,
+	raw_valid: torch.Tensor,
+	model_xyz: torch.Tensor,
+	seed: torch.Tensor,
+) -> torch.Tensor:
+	mask = torch.zeros_like(raw_valid, dtype=torch.bool)
+	if not bool(raw_valid.any().detach().cpu()):
+		return mask
+	finite = raw_valid.bool() & torch.isfinite(model_xyz).all(dim=-1)
+	if not bool(finite.any().detach().cpu()):
+		return mask
+	dist2 = (model_xyz - seed.view(1, 1, 1, 3)).square().sum(dim=-1)
+	dist2 = torch.where(finite, dist2, torch.full_like(dist2, float("inf")))
+	best_flat = torch.argmin(dist2.reshape(-1))
+	best_dist = dist2.reshape(-1)[best_flat]
+	if not bool(torch.isfinite(best_dist).detach().cpu()):
+		return mask
+	mask.reshape(-1)[best_flat] = True
+	return mask
+
+
+def _seeded_mapping_inlier_filter(
+	*,
+	raw_valid: torch.Tensor,
+	raw_map: torch.Tensor,
+	seed_quad: tuple[int, int, int] | None = None,
+	initial_inlier: torch.Tensor | None = None,
+	max_distance: float,
+) -> tuple[torch.Tensor, dict[str, int | float]]:
+	norm_map = _normalized_model_to_ext_map(raw_map)
+	raw_valid = raw_valid.bool() & torch.isfinite(norm_map).all(dim=-1)
+	if initial_inlier is not None:
+		inlier = raw_valid & initial_inlier.to(device=raw_valid.device).bool()
+	elif seed_quad is not None:
+		seed_mask = _seed_quad_corner_mask(
+			tuple(int(v) for v in raw_valid.shape),
+			seed_quad,
+			device=raw_valid.device,
+		)
+		inlier = raw_valid & seed_mask
+	else:
+		inlier = torch.zeros_like(raw_valid)
+	D, H, W = (int(v) for v in raw_valid.shape)
+	stats: dict[str, int | float] = {
+		"raw_map_n": 0,
+		"raw_map_min": float("inf"),
+		"raw_map_sum": 0.0,
+		"raw_map_max": 0.0,
+		"in_map_n": 0,
+		"in_map_min": float("inf"),
+		"in_map_sum": 0.0,
+		"in_map_max": 0.0,
+	}
+	if bool(inlier.any().detach().cpu()):
+		for _ in range(max(1, D + H + W)):
+			candidate = raw_valid & ~inlier
+			if not bool(candidate.any().detach().cpu()):
+				break
+			min_dist = _neighbor_min_mapping_distance(
+				center_valid=candidate,
+				neighbor_valid=inlier,
+				norm_map=norm_map,
+			)
+			new_inlier = candidate & (min_dist < float(max_distance))
+			if not bool(new_inlier.any().detach().cpu()):
+				break
+			inlier = inlier | new_inlier
+
+	raw_stats = _mapping_distance_stats(
+		center_valid=raw_valid,
+		neighbor_valid=raw_valid,
+		norm_map=norm_map,
+	)
+	in_stats = _mapping_distance_stats(
+		center_valid=inlier,
+		neighbor_valid=inlier,
+		norm_map=norm_map,
+	)
+	for prefix, src in (("raw_map", raw_stats), ("in_map", in_stats)):
+		stats[f"{prefix}_n"] = int(src["n"])
+		stats[f"{prefix}_min"] = float(src["min"])
+		stats[f"{prefix}_sum"] = float(src["sum"])
+		stats[f"{prefix}_max"] = float(src["max"])
+	return inlier, stats
 
 
 def _valid_ext_quad_bases(ext_valid: torch.Tensor, ext_quad_valid: torch.Tensor) -> torch.Tensor:
@@ -1675,19 +1854,21 @@ def _valid_ext_quad_bases(ext_valid: torch.Tensor, ext_quad_valid: torch.Tensor)
 	return corner_quad_valid.nonzero(as_tuple=False)
 
 
-def _intersect_model_points_with_ext_surface(
+def _intersect_model_points_with_ext_surface_chunk(
 	*,
 	source_pos: torch.Tensor,
 	source_normals: torch.Tensor,
-	ext_xyz: torch.Tensor,
-	ext_valid: torch.Tensor,
-	ext_quad_valid: torch.Tensor,
+	bases: torch.Tensor,
+	p00: torch.Tensor,
+	p10: torch.Tensor,
+	p01: torch.Tensor,
+	p11: torch.Tensor,
 	cfg: SnapSurfConfig,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | float]]:
 	C = int(source_pos.shape[0])
 	device = source_pos.device
 	dtype = source_pos.dtype
-	coords_empty = torch.empty(C, 2, device=device, dtype=dtype)
+	coords_empty = torch.full((C, 2), float("nan"), device=device, dtype=dtype)
 	accepted_empty = torch.zeros(C, device=device, dtype=torch.bool)
 	stats: dict[str, int | float] = {
 		"target_hit": 0,
@@ -1700,13 +1881,11 @@ def _intersect_model_points_with_ext_surface(
 	if C == 0:
 		return coords_empty, accepted_empty, stats
 
-	bases = _valid_ext_quad_bases(ext_valid, ext_quad_valid)
 	K = int(bases.shape[0])
 	stats["tested"] = C * K
 	if K == 0:
 		return coords_empty, accepted_empty, stats
 
-	p00, p10, p01, p11 = _quad_corners_batched(ext_xyz, bases)
 	n = F.normalize(source_normals, dim=-1, eps=1.0e-8)
 	O = source_pos[:, None, :]
 	N = n[:, None, :]
@@ -1756,12 +1935,17 @@ def _intersect_model_points_with_ext_surface(
 	if not bool(has_hit.any().detach().cpu()):
 		return coords_empty, accepted_empty, stats
 
-	score = torch.where(hit, abs_signed, torch.full_like(abs_signed, float("inf")))
+	line_hit = hit & (line_err <= float(cfg.ray_residual))
+	has_line_hit = line_hit.any(dim=1)
+	if not bool(has_line_hit.any().detach().cpu()):
+		return coords_empty, accepted_empty, stats
+
+	score = torch.where(line_hit, abs_signed, torch.full_like(abs_signed, float("inf")))
 	best_k = torch.argmin(score, dim=1)
 	row = torch.arange(C, device=device)
 	best_dist = score[row, best_k]
 	best_line_err = line_err[row, best_k]
-	accepted = has_hit & torch.isfinite(best_dist)
+	accepted = has_line_hit & torch.isfinite(best_dist)
 	stats["distance_hit"] = int(accepted.sum().detach().cpu())
 	stats["accepted"] = int(accepted.sum().detach().cpu())
 	best_bases = bases[best_k].to(dtype=dtype)
@@ -1774,6 +1958,61 @@ def _intersect_model_points_with_ext_surface(
 		stats["line_err_sum"] = float(err.sum().cpu())
 		stats["line_err_max"] = float(err.max().cpu())
 	return coords, accepted, stats
+
+
+def _intersect_model_points_with_ext_surface(
+	*,
+	source_pos: torch.Tensor,
+	source_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	pair_chunk_limit: int = 2_000_000,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | float]]:
+	C = int(source_pos.shape[0])
+	device = source_pos.device
+	dtype = source_pos.dtype
+	coords_all = torch.full((C, 2), float("nan"), device=device, dtype=dtype)
+	accepted_all = torch.zeros(C, device=device, dtype=torch.bool)
+	stats: dict[str, int | float] = {
+		"target_hit": 0,
+		"distance_hit": 0,
+		"accepted": 0,
+		"tested": 0,
+		"line_err_sum": 0.0,
+		"line_err_max": 0.0,
+	}
+	if C == 0:
+		return coords_all, accepted_all, stats
+
+	bases = _valid_ext_quad_bases(ext_valid, ext_quad_valid)
+	K = int(bases.shape[0])
+	stats["tested"] = C * K
+	if K == 0:
+		return coords_all, accepted_all, stats
+	p00, p10, p01, p11 = _quad_corners_batched(ext_xyz, bases)
+	chunk = max(1, min(C, int(pair_chunk_limit) // max(1, K)))
+	for start in range(0, C, chunk):
+		end = min(C, start + chunk)
+		coords, accepted, part = _intersect_model_points_with_ext_surface_chunk(
+			source_pos=source_pos[start:end],
+			source_normals=source_normals[start:end],
+			bases=bases,
+			p00=p00,
+			p10=p10,
+			p01=p01,
+			p11=p11,
+			cfg=cfg,
+		)
+		coords_all[start:end] = coords
+		accepted_all[start:end] = accepted
+		stats["target_hit"] += int(part.get("target_hit", 0))
+		stats["distance_hit"] += int(part.get("distance_hit", 0))
+		stats["accepted"] += int(part.get("accepted", 0))
+		stats["line_err_sum"] += float(part.get("line_err_sum", 0.0))
+		stats["line_err_max"] = max(float(stats["line_err_max"]), float(part.get("line_err_max", 0.0)))
+	return coords_all, accepted_all, stats
 
 
 def _rebuild_model_to_ext_rays(
@@ -1806,11 +2045,10 @@ def _rebuild_model_to_ext_rays(
 	if seed_quad is None:
 		return False, float("inf"), stats, 0
 
-	source_mask = _seed_model_region_mask(
+	source_mask = _seed_model_sheet_mask(
 		model_valid=model_valid,
 		model_normals=model_normals_det,
 		seed_quad=seed_quad,
-		radius=cfg.seed_radius,
 	)
 	source_idx = source_mask.nonzero(as_tuple=False)
 	source_possible = int(source_idx.shape[0])
@@ -1830,19 +2068,43 @@ def _rebuild_model_to_ext_rays(
 		cfg=cfg,
 	)
 	stats["tgt"] = int(ray_stats.get("target_hit", 0))
-	stats["dist"] = int(ray_stats.get("distance_hit", 0))
-	stats["grid"] = int(ray_stats.get("accepted", 0))
-	stats["ori"] = int(ray_stats.get("accepted", 0))
-	stats["new"] = int(ray_stats.get("accepted", 0))
+	raw_accepted = int(ray_stats.get("accepted", 0))
+	stats["dist"] = raw_accepted
 	stats["tested"] = int(ray_stats.get("tested", 0))
-	stats["gerr_n"] = int(ray_stats.get("accepted", 0))
+	stats["gerr_n"] = raw_accepted
 	stats["gerr_sum"] = float(ray_stats.get("line_err_sum", 0.0))
 	stats["gerr_max"] = float(ray_stats.get("line_err_max", 0.0))
 	if state.model_to_ext.map is not None and state.model_to_ext.valid is not None and bool(accepted.any().detach().cpu()):
+		raw_map = torch.full_like(state.model_to_ext.map, float("nan"))
+		raw_valid = torch.zeros_like(state.model_to_ext.valid)
 		acc_idx = source_idx[accepted]
-		state.model_to_ext.map[acc_idx[:, 0], acc_idx[:, 1], acc_idx[:, 2]] = coords[accepted].to(dtype=state.model_to_ext.map.dtype)
-		state.model_to_ext.valid[acc_idx[:, 0], acc_idx[:, 1], acc_idx[:, 2]] = True
+		raw_map[acc_idx[:, 0], acc_idx[:, 1], acc_idx[:, 2]] = coords[accepted].to(dtype=raw_map.dtype)
+		raw_valid[acc_idx[:, 0], acc_idx[:, 1], acc_idx[:, 2]] = True
+		initial_inlier = _closest_seed_source_mask(
+			raw_valid=raw_valid,
+			model_xyz=model_xyz_det,
+			seed=seed,
+		)
+		inlier_valid, map_stats = _seeded_mapping_inlier_filter(
+			raw_valid=raw_valid,
+			raw_map=raw_map,
+			initial_inlier=initial_inlier,
+			max_distance=cfg.map_inlier_distance,
+		)
+		final_n = int(inlier_valid.sum().detach().cpu())
+		stats["drop"] = max(0, raw_accepted - final_n)
+		stats["grid"] = final_n
+		stats["ori"] = final_n
+		stats["new"] = final_n
+		for k, v in map_stats.items():
+			stats[k] = v
+		state.model_to_ext.map[:] = torch.where(inlier_valid.unsqueeze(-1), raw_map, torch.full_like(raw_map, float("nan")))
+		state.model_to_ext.valid[:] = inlier_valid
 		state.model_to_ext.map[~state.model_to_ext.valid] = float("nan")
+	else:
+		stats["grid"] = 0
+		stats["ori"] = 0
+		stats["new"] = 0
 	return True, seed_model_dist, stats, source_possible
 
 
@@ -2101,6 +2363,14 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		"_snaps_gerr_n": 0.0,
 		"_snaps_gerr_sum": 0.0,
 		"_snaps_gerr_max": 0.0,
+		"_snaps_raw_map_n": 0.0,
+		"_snaps_raw_map_sum": 0.0,
+		"_snaps_raw_map_min": float("inf"),
+		"_snaps_raw_map_max": 0.0,
+		"_snaps_in_map_n": 0.0,
+		"_snaps_in_map_sum": 0.0,
+		"_snaps_in_map_min": float("inf"),
+		"_snaps_in_map_max": 0.0,
 		"_snaps_perr_n": 0.0,
 		"_snaps_perr_sum": 0.0,
 		"_snaps_perr_max": 0.0,
@@ -2161,13 +2431,33 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 			stats["snaps_sext"] = min(stats["snaps_sext"], float(seed_ext_dist))
 			if seed_inserted:
 				stats["snaps_seed"] += 1.0
-			for k in ("ring", "sup", "tgt", "dist", "grid", "ori", "new"):
+			for k in ("drop", "ring", "sup", "tgt", "dist", "grid", "ori", "new"):
 				stats[f"snaps_{k}"] += float(grow_m2e.get(k, 0))
 			stats["_snaps_gerr_n"] += float(grow_m2e.get("gerr_n", 0))
 			stats["_snaps_gerr_sum"] += float(grow_m2e.get("gerr_sum", 0.0))
 			stats["_snaps_gerr_max"] = max(
 				stats["_snaps_gerr_max"],
 				float(grow_m2e.get("gerr_max", 0.0)),
+			)
+			stats["_snaps_raw_map_n"] += float(grow_m2e.get("raw_map_n", 0))
+			stats["_snaps_raw_map_sum"] += float(grow_m2e.get("raw_map_sum", 0.0))
+			stats["_snaps_raw_map_min"] = min(
+				stats["_snaps_raw_map_min"],
+				float(grow_m2e.get("raw_map_min", float("inf"))),
+			)
+			stats["_snaps_raw_map_max"] = max(
+				stats["_snaps_raw_map_max"],
+				float(grow_m2e.get("raw_map_max", 0.0)),
+			)
+			stats["_snaps_in_map_n"] += float(grow_m2e.get("in_map_n", 0))
+			stats["_snaps_in_map_sum"] += float(grow_m2e.get("in_map_sum", 0.0))
+			stats["_snaps_in_map_min"] = min(
+				stats["_snaps_in_map_min"],
+				float(grow_m2e.get("in_map_min", float("inf"))),
+			)
+			stats["_snaps_in_map_max"] = max(
+				stats["_snaps_in_map_max"],
+				float(grow_m2e.get("in_map_max", 0.0)),
 			)
 			_debug_write_snap_objs(
 				cfg=cfg,
@@ -2211,6 +2501,14 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	gerr_n = stats.pop("_snaps_gerr_n")
 	gerr_sum = stats.pop("_snaps_gerr_sum")
 	gerr_max = stats.pop("_snaps_gerr_max")
+	raw_map_n = stats.pop("_snaps_raw_map_n")
+	raw_map_sum = stats.pop("_snaps_raw_map_sum")
+	raw_map_min = stats.pop("_snaps_raw_map_min")
+	raw_map_max = stats.pop("_snaps_raw_map_max")
+	in_map_n = stats.pop("_snaps_in_map_n")
+	in_map_sum = stats.pop("_snaps_in_map_sum")
+	in_map_min = stats.pop("_snaps_in_map_min")
+	in_map_max = stats.pop("_snaps_in_map_max")
 	perr_n = stats.pop("_snaps_perr_n")
 	perr_sum = stats.pop("_snaps_perr_sum")
 	perr_max = stats.pop("_snaps_perr_max")
@@ -2221,6 +2519,12 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	toward_sum = stats.pop("_snaps_toward_sum")
 	stats["snaps_gerr_avg"] = _safe_frac(gerr_sum, gerr_n)
 	stats["snaps_gerr_max"] = float(gerr_max)
+	stats["snaps_raw_map_min"] = 0.0 if raw_map_n <= 0.0 or not math.isfinite(raw_map_min) else float(raw_map_min)
+	stats["snaps_raw_map_avg"] = _safe_frac(raw_map_sum, raw_map_n)
+	stats["snaps_raw_map_max"] = float(raw_map_max)
+	stats["snaps_in_map_min"] = 0.0 if in_map_n <= 0.0 or not math.isfinite(in_map_min) else float(in_map_min)
+	stats["snaps_in_map_avg"] = _safe_frac(in_map_sum, in_map_n)
+	stats["snaps_in_map_max"] = float(in_map_max)
 	stats["snaps_perr_avg"] = _safe_frac(perr_sum, perr_n)
 	stats["snaps_perr_max"] = float(perr_max)
 	stats["snaps_ravg"] = _safe_frac(res_sum, res_n)

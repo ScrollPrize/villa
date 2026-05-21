@@ -259,7 +259,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 
 		self.assertGreater(len(valid), 12)
 
-	def test_seed_radius_limits_flood_to_seed_neighborhood(self) -> None:
+	def test_seed_radius_does_not_limit_seed_grown_inliers(self) -> None:
 		model_xyz = _plane_xyz(h=8, w=8, z=0.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=8, w=8, z=0.0)
 		opt_loss_snap_surf.configure_snap_surf(
@@ -271,8 +271,56 @@ class SnapSurfMapperTest(unittest.TestCase):
 		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
 		state = opt_loss_snap_surf._states[0]
 
-		self.assertLessEqual(state.model_to_ext.count(), 16)
-		self.assertLessEqual(state.ext_to_model.count(), 16)
+		self.assertEqual(state.model_to_ext.count(), 64)
+		self.assertEqual(state.ext_to_model.count(), 0)
+
+	def test_seeded_mapping_filter_rejects_local_global_jump(self) -> None:
+		raw_map = torch.full((1, 4, 5, 2), float("nan"))
+		raw_valid = torch.zeros(1, 4, 5, dtype=torch.bool)
+		for h, w in ((1, 1), (1, 2), (2, 1), (2, 2), (2, 3)):
+			raw_valid[0, h, w] = True
+			raw_map[0, h, w] = torch.tensor([float(h), float(w)])
+		raw_valid[0, 2, 4] = True
+		raw_map[0, 2, 4] = torch.tensor([40.0, 40.0])
+
+		inlier, stats = opt_loss_snap_surf._seeded_mapping_inlier_filter(
+			raw_valid=raw_valid,
+			raw_map=raw_map,
+			seed_quad=(0, 1, 1),
+			max_distance=8.0,
+		)
+
+		self.assertTrue(bool(inlier[0, 2, 3]))
+		self.assertFalse(bool(inlier[0, 2, 4]))
+		self.assertGreater(stats["raw_map_max"], 8.0)
+		self.assertLess(stats["in_map_max"], 8.0)
+
+	def test_ray_intersection_rejects_off_normal_line_candidate(self) -> None:
+		source_pos = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+		source_normals = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+		ext_xyz = torch.tensor(
+			[
+				[[-2.6301122, 0.9572288, 1.4183259], [-1.1567254, -2.6544838, -2.2087803]],
+				[[0.2669331, -8.669413, 5.194581], [4.1991696, -4.5634775, -0.6482223]],
+			],
+			dtype=torch.float32,
+		)
+		ext_valid = torch.ones(2, 2, dtype=torch.bool)
+		ext_quad_valid = torch.ones(1, 1, dtype=torch.bool)
+
+		coords, accepted, stats = opt_loss_snap_surf._intersect_model_points_with_ext_surface(
+			source_pos=source_pos,
+			source_normals=source_normals,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(ray_residual=0.5),
+		)
+
+		self.assertEqual(stats["target_hit"], 1)
+		self.assertEqual(stats["accepted"], 0)
+		self.assertFalse(bool(accepted[0]))
+		self.assertFalse(bool(torch.isfinite(coords[0]).all()))
 
 	def test_debug_step_burst_grows_until_stalled(self) -> None:
 		model_xyz = _plane_xyz(h=6, w=6, z=0.0).unsqueeze(0)
