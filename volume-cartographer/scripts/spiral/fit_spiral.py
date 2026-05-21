@@ -2192,6 +2192,16 @@ def save_overlay(
                     )
         image.save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
+    def visualise_field(spiral_zyx, name):
+        # Show the slice→spiral field as RGB: spiral (z, y, x) normalised into [0, 1] per channel
+        # using the value range across the slice.
+        values = spiral_zyx.to(torch.float32).reshape(-1, 3)
+        lo = values.amin(dim=0)
+        hi = values.amax(dim=0)
+        normalised = ((spiral_zyx.to(torch.float32) - lo) / (hi - lo).clamp_min(1e-6)).clamp(0., 1.)
+        canvas = (normalised * 255).to(torch.uint8)
+        Image.fromarray(canvas.cpu().numpy()).save(f'{out_path}/{name}_{suffix}.png', compress_level=3)
+
     def overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, name):
         slice_min = slice[slice > 0].amin() if (slice > 0).any() else 0
         slice_normalised = (slice - slice_min) / (slice.amax() - slice_min) * (slice > 0)
@@ -2236,6 +2246,7 @@ def save_overlay(
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
         overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
+        visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
 def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path):
