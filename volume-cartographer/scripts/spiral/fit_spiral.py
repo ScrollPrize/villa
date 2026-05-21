@@ -34,7 +34,7 @@ scroll_zarr_path = None
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 1875, 2375
+z_begin, z_end = 7500, 9500
 cross_patch_pcl_json_paths = None
 patches_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/traces/custom_patches'
 voxel_size_um = 2.4 * 4  # before downsampling
@@ -58,6 +58,8 @@ unattached_pcl_json_paths = [
 
 cache_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/spiral_cache'
 downsample_factor = 4
+z_begin //= downsample_factor
+z_end //= downsample_factor
 
 default_config = {
     'random_seed': 1,
@@ -1422,6 +1424,59 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
     return satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch
 
 
+def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_winding, pcl_strips):
+    # For each unattached pcl, treat its id-sorted points as a strip (so theta=0
+    # crossings can be unwrapped, mirroring the patch row-walk in
+    # get_patch_satisfied_areas), pick the snapped median normalised shifted-radius
+    # as the target winding, then count points that satisfy both the same spiral-
+    # space radius tolerance and the same scan-space distance tolerance used for
+    # quad satisfaction. Returns three values: (satisfied_count_per_pcl,
+    # total_count_per_pcl, per_point_satisfaction) — the first two are 1-D int64
+    # tensors, and per_point_satisfaction is a list of CPU bool tensors (one per
+    # pcl, of length N for that pcl; empty pcls get an empty tensor).
+    spiral_tolerance = dr_per_winding.detach() * metrics_config['satisfaction_radius_tolerance']
+    scan_tolerance = metrics_config['satisfaction_distance_tolerance']
+    dr = dr_per_winding.detach()
+    device = dr_per_winding.device
+
+    satisfied_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
+    total_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
+    per_point_satisfaction = []
+    with torch.no_grad():
+        for k, strip in enumerate(pcl_strips):
+            N = strip['zyxs'].shape[0]
+            total_counts[k] = N
+            if N == 0:
+                per_point_satisfaction.append(torch.zeros([0], dtype=torch.bool))
+                continue
+            zyxs = torch.from_numpy(strip['zyxs']).to(device=device, dtype=torch.float32)
+            windings = torch.from_numpy(strip['windings']).to(device=device, dtype=torch.float32)
+
+            spiral_zyxs = slice_to_spiral_transform(zyxs)
+            theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+            unwrapped_shifted = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
+
+            normalised_radii = unwrapped_shifted - windings * dr
+            target_normalised = torch.round(normalised_radii.median() / dr) * dr
+            target_shifted = target_normalised + windings * dr
+            spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
+
+            target_radii = target_shifted + theta / (2 * np.pi) * dr
+            target_spiral_zyxs = torch.stack([
+                spiral_zyxs[..., 0],
+                torch.sin(theta) * target_radii,
+                torch.cos(theta) * target_radii,
+            ], dim=-1)
+            target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs)
+            scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs, dim=-1)
+            scan_in_band = scan_distances <= scan_tolerance
+
+            satisfied = spiral_in_band & scan_in_band
+            satisfied_counts[k] = int(satisfied.sum().item())
+            per_point_satisfaction.append(satisfied.cpu())
+    return satisfied_counts, total_counts, per_point_satisfaction
+
+
 def get_face_indices(h, w):
     indices = torch.arange(h * w).view(h, w)
     top_left = indices[:-1, :-1].flatten()
@@ -1823,6 +1878,7 @@ def save_overlay(
     zs_for_visualisation, all_zs, slice_yx,
     scroll_slices_for_visualisation, prediction_slices_for_visualisation,
     quad_label_map, quad_status_flat,
+    unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
     umbilicus_zyx, z_to_umbilicus_yx,
     out_path, suffix
 ):
@@ -1851,7 +1907,7 @@ def save_overlay(
         canvas = canvas.to(torch.uint8).cpu().numpy()
         Image.fromarray(canvas).save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
-    def overlay_on_patch_satisfaction(spiral, spiral_zyx, label_map, name):
+    def overlay_on_patch_satisfaction(spiral, spiral_zyx, label_map, slice_z, name):
         # quad_status_flat: 0=patch-and-quad not satisfied, 1=quad-only satisfied, 2=patch overall satisfied, 3=not in working set
         status = quad_status_flat.to(device=spiral.device, dtype=torch.int64)
         label_map = label_map.to(device=spiral.device, dtype=torch.int64)
@@ -1879,7 +1935,33 @@ def save_overlay(
         patch_mask = (label_map > 0)[..., None]
         canvas = torch.where(patch_mask, colour_table[label_map].to(torch.float32), canvas)
         canvas = canvas.to(torch.uint8).cpu().numpy()
-        Image.fromarray(canvas).save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
+        image = Image.fromarray(canvas)
+        if unattached_pcl_strips:
+            draw = ImageDraw.Draw(image)
+            pcl_z_window = 4
+            point_radius = 1
+            pcl_palette = [(200, 0, 0), (230, 140, 0), (255, 200, 0)]  # matches status_palette[0:3]
+            for k, strip in enumerate(unattached_pcl_strips):
+                zyxs = strip['zyxs']
+                in_slab = np.abs(zyxs[:, 0] - float(slice_z)) <= pcl_z_window
+                if not in_slab.any():
+                    continue
+                fully = bool(unattached_pcl_fully_satisfied[k].item())
+                per_point_sat = unattached_pcl_per_point_satisfied[k].numpy()
+                for idx in np.nonzero(in_slab)[0]:
+                    y = float(zyxs[idx, 1])
+                    x = float(zyxs[idx, 2])
+                    if fully:
+                        colour = pcl_palette[2]
+                    elif per_point_sat[idx]:
+                        colour = pcl_palette[1]
+                    else:
+                        colour = pcl_palette[0]
+                    draw.ellipse(
+                        [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
+                        fill=colour,
+                    )
+        image.save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
     def overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, name):
         slice_min = slice[slice > 0].amin() if (slice > 0).any() else 0
@@ -1924,7 +2006,7 @@ def save_overlay(
         slice = scroll_slices_for_visualisation[vis_slice_idx].to(device)
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
-        overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], f'patches_s{slice_z * downsample_factor:05}')
+        overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
 
 
 def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path, pass_seed_patch_id, pass_idx=1):
@@ -2048,6 +2130,19 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         total_area = float(total_areas.sum().item())
         satisfied_area_ratio = satisfied_area / max(total_area, 1e-9)
         print(f'satisfied_area = {satisfied_area:.1f}/{total_area:.1f} ({satisfied_area_ratio * 100:.1f}%)')
+        unattached_pcl_per_point_satisfied = []
+        unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
+        if unattached_pcl_strips:
+            unattached_pcl_satisfied_counts, unattached_pcl_total_counts, unattached_pcl_per_point_satisfied = get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips)
+            unattached_pcl_fully_satisfied = (unattached_pcl_satisfied_counts == unattached_pcl_total_counts)
+            fully_satisfied_pcls = int(unattached_pcl_fully_satisfied.sum().item())
+            num_pcls = len(unattached_pcl_strips)
+            fully_satisfied_ratio = fully_satisfied_pcls / max(num_pcls, 1)
+            print(f'satisfied_unattached_pcls = {fully_satisfied_pcls}/{num_pcls} ({fully_satisfied_ratio * 100:.1f}%)')
+            satisfied_points = int(unattached_pcl_satisfied_counts.sum().item())
+            total_points = int(unattached_pcl_total_counts.sum().item())
+            satisfied_point_ratio = satisfied_points / max(total_points, 1)
+            print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
         # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
         # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
         if satisfied_quad_masks:
@@ -2077,6 +2172,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 zs_for_visualisation, all_zs, slice_yx,
                 scroll_slices_for_visualisation, prediction_slices_for_visualisation,
                 quad_label_map, quad_status_flat,
+                unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
                 umbilicus_zyx, z_to_umbilicus_yx,
                 out_path, suffix
             )
@@ -2370,13 +2466,34 @@ def main():
     for pid in dropped_patch_ids:
         del patches[pid]
 
-    dropped_pcl_count = 0
-    for pcl_dict in (cross_patch_point_collections, unattached_point_collections):
-        dropped = [pid for pid, pcl in pcl_dict.items() if not pcl_intersects_z_roi(pcl)]
-        for pid in dropped:
-            del pcl_dict[pid]
-        dropped_pcl_count += len(dropped)
-    print(f'dropped {len(dropped_patch_ids)} patches and {dropped_pcl_count} pcls outside z-roi [{z_begin}, {z_end})')
+    # For unattached pcls, keep only the longest contiguous subrange (in id-sorted
+    # order) of points whose zs lie within [z_begin - margin, z_end + margin); drop
+    # the pcl entirely if fewer than 2 points remain.
+    z_margin = cfg['patch_loss_z_margin']
+    dropped_unattached_pcl_count = 0
+    for pid in list(unattached_point_collections.keys()):
+        pcl = unattached_point_collections[pid]
+        sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+        best_start, best_end = 0, 0
+        run_start = 0
+        for i, (_, point) in enumerate(sorted_items):
+            z = point['zyx'][0]
+            if z_begin - z_margin <= z < z_end + z_margin:
+                if i + 1 - run_start > best_end - best_start:
+                    best_start, best_end = run_start, i + 1
+            else:
+                run_start = i + 1
+        kept_items = sorted_items[best_start:best_end]
+        if len(kept_items) < 2:
+            del unattached_point_collections[pid]
+            dropped_unattached_pcl_count += 1
+        else:
+            pcl['points'] = dict(kept_items)
+
+    dropped_cross_patch_pcl_ids = [pid for pid, pcl in cross_patch_point_collections.items() if not pcl_intersects_z_roi(pcl)]
+    for pid in dropped_cross_patch_pcl_ids:
+        del cross_patch_point_collections[pid]
+    print(f'dropped {len(dropped_patch_ids)} patches, {len(dropped_cross_patch_pcl_ids)} cross-patch pcls, and {dropped_unattached_pcl_count} unattached pcls outside z-roi [{z_begin}, {z_end})')
 
     normalise_pcl_winding_annotations(cross_patch_point_collections)
     normalise_pcl_winding_annotations(unattached_point_collections)
@@ -2401,7 +2518,7 @@ def main():
     )
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{len(patches)}-patch_{cfg["working_set_mode"]}'
+    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch_{cfg["working_set_mode"]}'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
     run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
