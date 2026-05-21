@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -96,7 +97,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 			active=True,
 		)
 
-	def test_mapper_refuses_to_grow_from_one_inlier(self) -> None:
+	def test_mapper_can_grow_from_one_inlier_in_direct_search_mode(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
 		state.ensure(source_shape=(1, 3, 3), target_shape=(3, 3), device=torch.device("cpu"), dtype=torch.float32)
 		state.map[0, 1, 1] = torch.tensor([1.0, 1.0])
@@ -117,8 +118,8 @@ class SnapSurfMapperTest(unittest.TestCase):
 			cfg=opt_loss_snap_surf.SnapSurfConfig(point_distance=10.0, grid_error=2.0),
 		)
 
-		self.assertEqual(state.count(), 1)
-		self.assertFalse(bool(state.valid[0, 1, 2]))
+		self.assertGreater(state.count(), 1)
+		self.assertTrue(bool(state.valid[0, 1, 2]))
 
 	def test_two_inlier_similarity_predicts_neighbor_step(self) -> None:
 		source = torch.tensor([[0.0, 0.0], [0.0, 1.0]])
@@ -153,6 +154,82 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sdist"], 0.0, places=6)
 		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sext"], 0.0, places=6)
 
+	def test_seed_initialization_detects_flipped_quad_orientation(self) -> None:
+		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
+		model_xyz[..., 0] = 1.0 - model_xyz[..., 0]
+		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
+		res = _result(model_xyz, ext_xyz)
+
+		opt_loss_snap_surf.snap_surf_loss(res=res)
+		state = opt_loss_snap_surf._states[0]
+
+		self.assertEqual(state.model_to_ext.count(), 4)
+		self.assertEqual(state.ext_to_model.count(), 4)
+		self.assertEqual(state.model_to_ext.orientation_sign, -1)
+		self.assertEqual(state.ext_to_model.orientation_sign, -1)
+		self.assertTrue(torch.allclose(state.model_to_ext.map[0, 0, 0], torch.tensor([0.0, 1.0])))
+
+	def test_seed_orientation_is_scale_invariant(self) -> None:
+		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
+		model_xyz[..., 0] = 1.0 - model_xyz[..., 0]
+		ext_xyz = 20.0 * _plane_xyz(h=2, w=2, z=0.0)
+		res = _result(model_xyz, ext_xyz)
+
+		opt_loss_snap_surf.snap_surf_loss(res=res)
+		state = opt_loss_snap_surf._states[0]
+
+		self.assertEqual(state.model_to_ext.orientation_sign, -1)
+		self.assertEqual(state.ext_to_model.orientation_sign, -1)
+
+	def test_seed_orientation_matches_growth_affine_convention(self) -> None:
+		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
+		model_xyz[..., 0] = 1.0 - model_xyz[..., 0]
+		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		state = opt_loss_snap_surf._states[0]
+
+		_, m2e_count, m2e_det = opt_loss_snap_surf._local_affine_predict_batched(
+			state.model_to_ext,
+			valid_b=state.model_to_ext.valid,
+			map_b=state.model_to_ext.map,
+			radius=1,
+			exclude_self=False,
+		)
+		_, e2m_count, e2m_det = opt_loss_snap_surf._local_affine_predict_batched(
+			state.ext_to_model,
+			valid_b=state.ext_to_model.valid.unsqueeze(0),
+			map_b=state.ext_to_model.map.unsqueeze(0),
+			radius=1,
+			exclude_self=False,
+		)
+
+		self.assertGreaterEqual(int(m2e_count[0, 0, 0]), 3)
+		self.assertGreaterEqual(int(e2m_count[0, 0, 0]), 3)
+		self.assertGreater(float(m2e_det[0, 0, 0]) * state.model_to_ext.orientation_sign, 0.0)
+		self.assertGreater(float(e2m_det[0, 0, 0]) * state.ext_to_model.orientation_sign, 0.0)
+
+	def test_direct_growth_accepts_one_ring_candidates_without_orientation_gate(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
+		state.ensure(source_shape=(1, 5, 5), target_shape=(5, 5), device=torch.device("cpu"), dtype=torch.float32)
+		for h, w in ((1, 1), (2, 1), (1, 2), (2, 2)):
+			state.valid[0, h, w] = True
+			state.map[0, h, w] = torch.tensor([float(h), float(w)])
+
+		stats = opt_loss_snap_surf._grow_direction(
+			state,
+			source_xyz=_plane_xyz(h=5, w=5, z=0.0).unsqueeze(0),
+			source_valid=torch.ones(1, 5, 5, dtype=torch.bool),
+			target_xyz=_plane_xyz(h=5, w=5, z=0.0),
+			target_valid=torch.ones(5, 5, dtype=torch.bool),
+			normal_xyz=_normals_2d(5, 5),
+			normal_from_source=False,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(affine_radius=2, search_ring=1),
+		)
+
+		self.assertGreater(stats["new"], 0)
+		self.assertEqual(stats["ori"], stats["new"])
+
 	def test_seed_attachment_uses_closest_surface_not_quad_center(self) -> None:
 		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
 		ext_xyz = 50.0 * _plane_xyz(h=2, w=2, z=0.0)
@@ -186,7 +263,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertEqual(state.model_to_ext.count(), 0)
 		self.assertEqual(state.ext_to_model.count(), 0)
 
-	def test_growth_advances_at_most_one_neighbor_layer_per_call(self) -> None:
+	def test_snap_loss_floods_from_seed_quad(self) -> None:
 		model_xyz = _plane_xyz(h=5, w=5, z=0.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
 		opt_loss_snap_surf.configure_snap_surf(
@@ -199,9 +276,64 @@ class SnapSurfMapperTest(unittest.TestCase):
 		state = opt_loss_snap_surf._states[0]
 		valid = state.model_to_ext.valid[0].nonzero(as_tuple=False)
 
-		self.assertTrue(all(0 <= int(h) <= 3 and 0 <= int(w) <= 3 for h, w in valid.tolist()))
-		self.assertFalse(bool(state.model_to_ext.valid[0, 0, 0]))
-		self.assertFalse(bool(state.model_to_ext.valid[0, 3, 3]))
+		self.assertGreater(len(valid), 12)
+
+	def test_seed_radius_limits_flood_to_seed_neighborhood(self) -> None:
+		model_xyz = _plane_xyz(h=8, w=8, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=8, w=8, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"init_distance": 10.0, "seed_radius": 1},
+			seed_xyz=(3.5, 3.5, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		state = opt_loss_snap_surf._states[0]
+
+		self.assertLessEqual(state.model_to_ext.count(), 16)
+		self.assertLessEqual(state.ext_to_model.count(), 16)
+
+	def test_debug_step_burst_grows_until_stalled(self) -> None:
+		model_xyz = _plane_xyz(h=6, w=6, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=6, w=6, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"init_distance": 10.0, "point_distance": 10.0, "grid_error": 0.25},
+			seed_xyz=(2.5, 2.5, 0.0),
+			active=True,
+		)
+		opt_loss_snap_surf.set_debug_step(100)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		stats = opt_loss_snap_surf.last_stats()
+
+		self.assertGreater(stats["snaps_dbg_iter"], 0)
+		self.assertGreater(stats["snaps_dbg_new"], 0)
+		self.assertEqual(stats["snaps_dbg_grid"], stats["snaps_dbg_ori"])
+		self.assertGreater(opt_loss_snap_surf._states[0].model_to_ext.count(), 12)
+
+	def test_debug_obj_outputs_write_files_in_iteration_dir(self) -> None:
+		model_xyz = _plane_xyz(h=3, w=3, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=3, w=3, z=0.0)
+		with tempfile.TemporaryDirectory() as tmp:
+			opt_loss_snap_surf.configure_snap_surf(
+				cfg={
+					"init_distance": 10.0,
+					"debug_obj_dir": tmp,
+					"debug_obj_interval": 1,
+				},
+				seed_xyz=(1.0, 1.0, 0.0),
+				active=True,
+			)
+			opt_loss_snap_surf.set_debug_step(0, label="stageX_initial")
+
+			opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+
+			out = os.path.join(tmp, "stageX_initial_step000000")
+			self.assertTrue(os.path.isdir(out))
+			self.assertTrue(os.path.exists(os.path.join(out, "ext_surface.obj")))
+			self.assertTrue(os.path.exists(os.path.join(out, "model_surface.obj")))
+			self.assertTrue(os.path.exists(os.path.join(out, "corr_model_to_ext.obj")))
+			self.assertTrue(os.path.exists(os.path.join(out, "corr_ext_to_model.obj")))
 
 	def test_growth_accepts_continuous_target_quad_coordinate(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
@@ -228,7 +360,82 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertTrue(bool(state.valid[0, 0, 2]))
 		self.assertTrue(torch.allclose(state.map[0, 0, 2], torch.tensor([0.5, 2.5]), atol=1.0e-3))
 
-	def test_low_distance_affine_inconsistent_candidate_is_rejected(self) -> None:
+	def test_invalid_prediction_falls_back_to_neighbor_correspondence(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
+		state.ensure(source_shape=(1, 3, 4), target_shape=(5, 5), device=torch.device("cpu"), dtype=torch.float32)
+		state.map[0, 1, 1] = torch.tensor([1.0, 1.0])
+		state.map[0, 1, 2] = torch.tensor([1.0, 3.0])
+		state.valid[0, 1, 1] = True
+		state.valid[0, 1, 2] = True
+
+		opt_loss_snap_surf._grow_direction(
+			state,
+			source_xyz=_plane_xyz(h=3, w=4, z=0.0).unsqueeze(0),
+			source_valid=torch.ones(1, 3, 4, dtype=torch.bool),
+			target_xyz=_plane_xyz(h=5, w=5, z=0.0),
+			target_valid=torch.ones(5, 5, dtype=torch.bool),
+			normal_xyz=_normals_3d(1, 3, 4),
+			normal_from_source=True,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(affine_radius=1, search_ring=0),
+		)
+
+		self.assertTrue(bool(state.valid[0, 1, 3]))
+
+	def test_no_orientation_gate_rejects_wrong_handed_growth(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
+		state.ensure(source_shape=(1, 3, 3), target_shape=(3, 3), device=torch.device("cpu"), dtype=torch.float32)
+		state.map[0, 0, 0] = torch.tensor([0.0, 0.0])
+		state.map[0, 0, 1] = torch.tensor([0.0, 1.0])
+		state.map[0, 1, 0] = torch.tensor([1.0, 0.0])
+		state.valid[0, 0, 0] = True
+		state.valid[0, 0, 1] = True
+		state.valid[0, 1, 0] = True
+		state.orientation_sign = -1
+		source = _plane_xyz(h=3, w=3, z=0.0).unsqueeze(0)
+		target = _plane_xyz(h=3, w=3, z=0.0)
+
+		stats = opt_loss_snap_surf._grow_direction(
+			state,
+			source_xyz=source,
+			source_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			target_xyz=target,
+			target_valid=torch.ones(3, 3, dtype=torch.bool),
+			normal_xyz=_normals_3d(1, 3, 3),
+			normal_from_source=True,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(point_distance=0.01, grid_error=0.01, search_ring=0),
+		)
+
+		self.assertGreaterEqual(stats["grid"], 1)
+		self.assertEqual(stats["ori"], stats["grid"])
+		self.assertTrue(bool(state.valid[0, 1, 1]))
+
+	def test_orientation_gate_does_not_reject_two_support_growth(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
+		state.ensure(source_shape=(1, 3, 3), target_shape=(3, 3), device=torch.device("cpu"), dtype=torch.float32)
+		state.map[0, 0, 1] = torch.tensor([0.0, 1.0])
+		state.map[0, 1, 0] = torch.tensor([1.0, 0.0])
+		state.valid[0, 0, 1] = True
+		state.valid[0, 1, 0] = True
+		state.orientation_sign = -1
+		source = _plane_xyz(h=3, w=3, z=0.0).unsqueeze(0)
+		target = _plane_xyz(h=3, w=3, z=0.0)
+
+		stats = opt_loss_snap_surf._grow_direction(
+			state,
+			source_xyz=source,
+			source_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			target_xyz=target,
+			target_valid=torch.ones(3, 3, dtype=torch.bool),
+			normal_xyz=_normals_3d(1, 3, 3),
+			normal_from_source=True,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(point_distance=0.01, grid_error=0.01, search_ring=0),
+		)
+
+		self.assertGreaterEqual(stats["grid"], 1)
+		self.assertEqual(stats["ori"], stats["grid"])
+		self.assertTrue(bool(state.valid[0, 1, 1]))
+
+	def test_low_distance_affine_inconsistent_candidate_is_accepted_without_gates(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
 		state.ensure(source_shape=(1, 3, 3), target_shape=(3, 3), device=torch.device("cpu"), dtype=torch.float32)
 		state.map[0, 0, 0] = torch.tensor([0.0, 0.0])
@@ -253,7 +460,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 			cfg=opt_loss_snap_surf.SnapSurfConfig(point_distance=1.0, grid_error=0.25, search_ring=2),
 		)
 
-		self.assertFalse(bool(state.valid[0, 0, 2]))
+		self.assertTrue(bool(state.valid[0, 0, 2]))
 
 	def test_both_directions_produce_model_gradients(self) -> None:
 		model_xyz = (_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0)).requires_grad_(True)
@@ -270,6 +477,64 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertLessEqual(stats["snaps_m2e"], 1.0)
 		self.assertLessEqual(stats["snaps_e2m"], 1.0)
 
+	def test_nonfinite_external_normals_do_not_poison_loss(self) -> None:
+		model_xyz = (_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0)).requires_grad_(True)
+		ext_xyz = _plane_xyz(h=3, w=3, z=0.0)
+		ext_normals = _normals_2d(3, 3)
+		ext_normals[0, 0] = torch.tensor([float("nan"), float("nan"), float("nan")])
+
+		loss, _, _ = opt_loss_snap_surf.snap_surf_loss(
+			res=_result(model_xyz, ext_xyz, ext_normals=ext_normals),
+		)
+		loss.backward()
+
+		self.assertTrue(bool(torch.isfinite(loss).detach()))
+		self.assertTrue(bool(torch.isfinite(model_xyz.grad).all().detach()))
+
+	def test_invalid_correspondence_coordinates_do_not_poison_loss(self) -> None:
+		model_xyz = (_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0)).requires_grad_(True)
+		ext_xyz = _plane_xyz(h=3, w=3, z=0.0)
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		state = opt_loss_snap_surf._states[0]
+		state.model_to_ext.map[0, 1, 1] = torch.tensor([float("nan"), float("nan")])
+		state.model_to_ext.valid[0, 1, 1] = True
+		state.ext_to_model.map[1, 1] = torch.tensor([float("nan"), float("nan"), float("nan")])
+		state.ext_to_model.valid[1, 1] = True
+
+		l_m2e, _, _, _, _ = opt_loss_snap_surf._direction_loss_model_to_ext(
+			state.model_to_ext,
+			model_xyz=model_xyz,
+			ext_xyz=ext_xyz,
+			ext_valid=torch.ones(3, 3, dtype=torch.bool),
+			ext_normals=_normals_2d(3, 3),
+			cfg=opt_loss_snap_surf.SnapSurfConfig(),
+		)
+		l_e2m, _, _ = opt_loss_snap_surf._direction_loss_ext_to_model(
+			state.ext_to_model,
+			model_xyz=model_xyz,
+			model_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			ext_normals=_normals_2d(3, 3),
+			ext_xyz=ext_xyz,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(),
+		)
+		loss = l_m2e + l_e2m
+		loss.backward()
+
+		self.assertTrue(bool(torch.isfinite(loss).detach()))
+		self.assertTrue(bool(torch.isfinite(model_xyz.grad).all().detach()))
+
+	def test_valid_state_never_retains_nonfinite_correspondence(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
+		state.ensure(source_shape=(1, 2, 2), target_shape=(2, 2), device=torch.device("cpu"), dtype=torch.float32)
+		valid_b = torch.ones(1, 2, 2, dtype=torch.bool)
+		map_b = torch.zeros(1, 2, 2, 2)
+		map_b[0, 1, 1] = torch.tensor([float("nan"), 1.0])
+
+		opt_loss_snap_surf._write_batched_state(state, valid_b, map_b)
+
+		self.assertFalse(bool(state.valid[0, 1, 1]))
+		self.assertTrue(bool(torch.isfinite(state.map[state.valid]).all()))
+
 	def test_planar_smoke_distance_decreases_over_optimizer_steps(self) -> None:
 		param = torch.nn.Parameter(_plane_xyz(h=3, w=3, z=4.0).unsqueeze(0))
 		ext_xyz = _plane_xyz(h=3, w=3, z=0.0)
@@ -285,6 +550,17 @@ class SnapSurfMapperTest(unittest.TestCase):
 
 		self.assertLess(values[-1], values[0])
 		self.assertLess(float(param[..., 2].abs().mean().detach()), 4.0)
+
+	def test_snap_descent_direction_points_toward_proxy_plane(self) -> None:
+		model_xyz = (_plane_xyz(h=3, w=3, z=2.0).unsqueeze(0)).requires_grad_(True)
+		ext_xyz = _plane_xyz(h=3, w=3, z=0.0)
+
+		loss, _, _ = opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		loss.backward()
+		stats = opt_loss_snap_surf.last_stats()
+
+		self.assertGreater(stats["snaps_tow"], 0.0)
+		self.assertGreater(float(model_xyz.grad[..., 2].mean().detach()), 0.0)
 
 
 if __name__ == "__main__":

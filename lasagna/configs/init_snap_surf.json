@@ -22,7 +22,7 @@
 	"stages": [
 		{
 			"name": "stage1",
-			"steps": 1000,
+			"steps": 300,
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
@@ -35,7 +35,7 @@
 			"args": {
 				"snap_surf": {
 					"init_distance": 10.0,
-					"point_distance": 25.0,
+					"point_distance": 50.0,
 					"grid_error": 0.75,
 					"affine_radius": 2,
 					"search_ring": 1,
@@ -49,7 +49,7 @@
 		},
 		{
 			"name": "stage2",
-			"steps": 500,
+			"steps": 200,
 			"lr": 0.01,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
@@ -62,7 +62,7 @@
 			"args": {
 				"snap_surf": {
 					"init_distance": 10.0,
-					"point_distance": 25.0,
+					"point_distance": 50.0,
 					"grid_error": 0.75,
 					"affine_radius": 2,
 					"search_ring": 1,
@@ -76,7 +76,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 1000,
+			"steps": 500,
 			"lr": 0.01,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
@@ -85,9 +85,10 @@
 				"snap_surf": 1.0
 			},
 			"args": {
+				"status_interval": 50,
 				"snap_surf": {
 					"init_distance": 10.0,
-					"point_distance": 25.0,
+					"point_distance": 50.0,
 					"grid_error": 0.75,
 					"affine_radius": 2,
 					"search_ring": 1,

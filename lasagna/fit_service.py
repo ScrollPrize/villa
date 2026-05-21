@@ -90,6 +90,29 @@ def _set_pred_dt_flow_gate_debug_out_dir(cfg: dict[str, Any], out_dir: str) -> N
             gate.setdefault("debug_out_dir", out_dir)
 
 
+def _set_snap_surf_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
+    stages = cfg.get("stages")
+    if not isinstance(stages, list):
+        return
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage
+        args = opt_cfg.get("args")
+        if not isinstance(args, dict):
+            args = {}
+            opt_cfg["args"] = args
+        snap = args.get("snap_surf")
+        if snap is None:
+            snap = {}
+            args["snap_surf"] = snap
+        if isinstance(snap, dict):
+            snap["debug_obj_dir"] = out_dir
+            snap.pop("debug_obj_per_iteration", None)
+
+
 def _decode_tifxyz_for_request(
     *,
     body: dict[str, Any],
@@ -574,6 +597,9 @@ def _run_optimization(body: dict[str, Any]) -> None:
             args_section["out-dir"] = str(body["out_dir"])
         elif _config_enables_pred_dt_flow_gate(cfg):
             _set_pred_dt_flow_gate_debug_out_dir(cfg, str(service_workdir))
+        if snap_surf_enabled:
+            snap_debug_dir = Path(service_workdir) / "snap_surf_objs"
+            _set_snap_surf_debug_obj_dir(cfg, str(snap_debug_dir))
         cfg["args"] = args_section
         cfg_path = str(Path(tmp_dir) / "fit_config.json")
         has_corr = "corr_points" in cfg

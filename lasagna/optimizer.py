@@ -1191,6 +1191,10 @@ def optimize(
 		snap_surf_args = stage_args.get("snap_surf")
 		if snap_surf_args is not None and not isinstance(snap_surf_args, dict):
 			raise ValueError(f"stage '{stage.name}' opt.args.snap_surf must be an object")
+		if isinstance(snap_surf_args, dict):
+			snap_surf_args = dict(snap_surf_args)
+			if snap_surf_args.get("debug_obj_dir") and "debug_obj_interval" not in snap_surf_args:
+				snap_surf_args["debug_obj_interval"] = max(1, int(status_interval or opt_cfg.steps or 1))
 		opt_loss_snap_surf.configure_snap_surf(
 			cfg=snap_surf_args,
 			seed_xyz=seed_xyz,
@@ -1379,6 +1383,15 @@ def optimize(
 				"snaps_pgrid": "s_pgrd",
 				"snaps_perr_avg": "s_pav",
 				"snaps_perr_max": "s_pmx",
+				"snaps_ravg": "s_rav",
+				"snaps_rabs": "s_rab",
+				"snaps_rmax": "s_rmx",
+				"snaps_tow": "s_tow",
+				"snaps_dbg_iter": "sd_it",
+				"snaps_dbg_ring": "sd_rng",
+				"snaps_dbg_grid": "sd_grd",
+				"snaps_dbg_ori": "sd_ori",
+				"snaps_dbg_new": "sd_new",
 				"cyl_outside_pen_frac": "out%",
 				"cyl_outside_depth_max": "outmax",
 				"cyl_outside_depth_avg": "outavg",
@@ -1423,9 +1436,18 @@ def optimize(
 				"snaps_pgrid": 130,
 				"snaps_perr_avg": 131,
 				"snaps_perr_max": 132,
-				"cyl_outside_pen_frac": 140,
-				"cyl_outside_depth_max": 141,
-				"cyl_outside_depth_avg": 142,
+				"snaps_ravg": 133,
+				"snaps_rabs": 134,
+				"snaps_rmax": 135,
+				"snaps_tow": 136,
+				"snaps_dbg_iter": 137,
+				"snaps_dbg_ring": 138,
+				"snaps_dbg_grid": 139,
+				"snaps_dbg_ori": 140,
+				"snaps_dbg_new": 141,
+				"cyl_outside_pen_frac": 150,
+				"cyl_outside_depth_max": 151,
+				"cyl_outside_depth_avg": 152,
 			}
 			def _sort_key(k: str) -> tuple[int, str]:
 				return (key_order.get(k, 0), k)
@@ -2394,6 +2416,7 @@ def optimize(
 			_debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
 			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
 			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
+			opt_loss_snap_surf.set_debug_step(0, label=f"{label}_initial")
 			loss0, term_vals0, display_loss0 = _eval_terms(
 				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
@@ -2487,6 +2510,7 @@ def optimize(
 				_opt_timing.add("loss_prefetch", time.perf_counter() - _t_io)
 
 			_t_loss_eval = time.perf_counter()
+			opt_loss_snap_surf.set_debug_step(step + 1, label=label)
 			loss, term_vals, display_loss = _eval_terms(res, stage_eff, timing=_opt_timing)
 			if _flow_timing is not None:
 				_timing_cuda_sync()

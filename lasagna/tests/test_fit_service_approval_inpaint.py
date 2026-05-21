@@ -171,6 +171,19 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 		self.assertTrue(fit_service._config_effective_snap_surf_enabled(cfg))
 		self.assertFalse(fit_service._config_effective_ext_offset_enabled(cfg))
 
+	def test_snap_surf_debug_obj_dir_does_not_force_interval(self) -> None:
+		cfg = {
+			"stages": [
+				{"name": "stage0", "global_opt": {"args": {"snap_surf": {}}}},
+			],
+		}
+
+		fit_service._set_snap_surf_debug_obj_dir(cfg, "/tmp/snap_surf_objs")
+		snap = cfg["stages"][0]["global_opt"]["args"]["snap_surf"]
+
+		self.assertEqual(snap["debug_obj_dir"], "/tmp/snap_surf_objs")
+		self.assertNotIn("debug_obj_interval", snap)
+
 	def test_seed_mode_ignores_surplus_model_transport(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			model_input = fit_service._decode_model_for_request(
