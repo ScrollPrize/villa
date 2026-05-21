@@ -2435,12 +2435,14 @@ def main():
         (cross_patch_point_collections, cross_patch_pcl_json_paths),
         (unattached_point_collections, unattached_pcl_json_paths),
     ):
-        for path in paths:
-            loaded = load_point_collection(path) or {}
-            for pcl in loaded.values():
-                pcl['source_file'] = path
-                target[next_id] = pcl
-                next_id += 1
+        for pattern in paths:
+            expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
+            for path in expanded:
+                loaded = load_point_collection(path) or {}
+                for pcl in loaded.values():
+                    pcl['source_file'] = path
+                    target[next_id] = pcl
+                    next_id += 1
 
     process_point_collections_cached(patches, cross_patch_point_collections)
 
