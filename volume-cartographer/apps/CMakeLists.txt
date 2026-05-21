@@ -38,7 +38,11 @@ add_executable(vc_grow_seg_from_segments src/vc_grow_seg_from_segments.cpp)
 target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program_options)
 
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
-target_link_libraries(vc_tifxyz2obj vc_core)
+target_link_libraries(vc_tifxyz2obj vc_core vc_inpaint)
+
+add_executable(vc_obj_uv_lift src/vc_obj_uv_lift.cpp)
+target_link_libraries(vc_obj_uv_lift PRIVATE igl::core OpenMP::OpenMP_CXX)
+set_target_properties(vc_obj_uv_lift PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
 add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
 target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)

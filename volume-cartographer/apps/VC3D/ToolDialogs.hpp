@@ -462,16 +462,28 @@ public:
     double tolerance() const;   // 0.0 = disabled (run all iterations)
     QString energyType() const; // "symmetric_dirichlet" or "conformal"
     QString outputPath() const;
+    // Target percentage of source grid points to flatten (1..100). 100 means
+    // no decimation. Below 100 the SLIM step runs on a decimated mesh and
+    // the resulting UVs are lifted back to the full-resolution mesh via
+    // vc_obj_uv_lift. Default 1.5% picks stride~8, which is roughly what
+    // 2-iter stride-3 produced in earlier versions and matches the
+    // configuration that converges on 2um Paris segments.
+    double keepPercent() const;
+    bool inpaintHoles() const;
 
 private:
     static bool s_haveSession;
     static int s_iterations;
     static double s_tolerance;
     static QString s_energy;
+    static double s_keepPercent;
+    static bool s_inpaintHoles;
 
     QSpinBox* spIterations_{nullptr};
     QDoubleSpinBox* spTolerance_{nullptr};
     QComboBox* cbEnergy_{nullptr};
+    QDoubleSpinBox* spKeepPercent_{nullptr};
+    QCheckBox* cbInpaint_{nullptr};
     QLineEdit* edtOutput_{nullptr};
     QString defaultOutput_;
 };

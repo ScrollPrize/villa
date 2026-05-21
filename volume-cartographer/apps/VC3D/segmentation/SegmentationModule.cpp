@@ -9,6 +9,7 @@
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
+#include "tools/ThinPlateSpline3d.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -29,6 +30,7 @@
 #include <array>
 #include <cmath>
 #include <optional>
+#include <tuple>
 #include <limits>
 #include <exception>
 #include <set>
@@ -1317,9 +1319,20 @@ void SegmentationModule::refreshOverlay()
             state.manualAddHoverCrossFill =
                 _manualAddTool->config().linePreviewMode == ManualAddTool::LinePreviewMode::CrossFill;
         }
-        state.manualAddHoverFillVertices.reserve(_manualAddTool->hoverFillVertices().size());
-        for (const auto& key : _manualAddTool->hoverFillVertices()) {
-            state.manualAddHoverFillVertices.push_back(QPointF(key.col, key.row));
+        std::vector<SegmentationEditManager::GridKey> hoverFillVertices = _manualAddTool->hoverFillVertices();
+        std::sort(hoverFillVertices.begin(), hoverFillVertices.end(), [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.row, lhs.col) < std::tie(rhs.row, rhs.col);
+        });
+        for (const auto& key : hoverFillVertices) {
+            if (!state.manualAddHoverFillSpans.empty()) {
+                auto& span = state.manualAddHoverFillSpans.back();
+                if (span.row == key.row && span.colLast + 1 == key.col) {
+                    span.colLast = key.col;
+                    continue;
+                }
+            }
+            state.manualAddHoverFillSpans.push_back(
+                SegmentationOverlayController::State::ManualAddFillSpan{key.row, key.col, key.col});
         }
         for (const auto& key : _manualAddTool->fillVertices()) {
             if (key.row >= 0 && key.row < preview.rows && key.col >= 0 && key.col < preview.cols &&
@@ -1766,13 +1779,36 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
         }
     }
 
-    cv::Mat_<cv::Vec3f> preview = snapshot.clone();
-    std::vector<SegmentationEditManager::GridKey> changed;
-    changed.reserve(fill.size());
+    struct TracerFillPoint
+    {
+        SegmentationEditManager::GridKey key;
+        cv::Vec3f world;
+    };
+
+    auto toTpsSample = [](const SegmentationEditManager::GridKey& key, const cv::Vec3f& world) {
+        return ThinPlateSpline3d::Sample{cv::Point2d(key.col, key.row),
+                                         cv::Vec3d(world[0], world[1], world[2])};
+    };
+
+    auto appendChanged = [](std::vector<SegmentationEditManager::GridKey>& target,
+                            std::set<std::pair<int, int>>& seen,
+                            const SegmentationEditManager::GridKey& key) {
+        if (seen.insert({key.row, key.col}).second) {
+            target.push_back(key);
+        }
+    };
+
+    cv::Mat_<cv::Vec3f> rawPreview = snapshot.clone();
+    std::vector<SegmentationEditManager::GridKey> rawChanged;
+    std::set<std::pair<int, int>> rawChangedSeen;
+    std::vector<TracerFillPoint> tracedFillPoints;
+    rawChanged.reserve(fill.size());
+    tracedFillPoints.reserve(fill.size());
+
     for (const auto& key : fill) {
         const int srcRow = key.row + offsetRow;
         const int srcCol = key.col + offsetCol;
-        if (key.row < 0 || key.row >= preview.rows || key.col < 0 || key.col >= preview.cols ||
+        if (key.row < 0 || key.row >= rawPreview.rows || key.col < 0 || key.col >= rawPreview.cols ||
             srcRow < 0 || srcRow >= tracedPoints->rows || srcCol < 0 || srcCol >= tracedPoints->cols) {
             continue;
         }
@@ -1781,12 +1817,118 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
         if (ManualAddTool::isInvalidPoint(point)) {
             continue;
         }
-        preview(key.row, key.col) = point;
-        changed.push_back(key);
+        rawPreview(key.row, key.col) = point;
+        appendChanged(rawChanged, rawChangedSeen, key);
+        tracedFillPoints.push_back(TracerFillPoint{key, point});
     }
 
-    if (changed.empty()) {
+    if (rawChanged.empty()) {
         return false;
+    }
+
+    cv::Mat_<cv::Vec3f> preview = rawPreview;
+    std::vector<SegmentationEditManager::GridKey> changed = rawChanged;
+
+    const auto config = _manualAddTool->config();
+    if (config.allowBoundarySmoothing) {
+        std::vector<ThinPlateSpline3d::Sample> boundarySamples;
+        std::vector<SegmentationEditManager::GridKey> boundaryKeys;
+        boundarySamples.reserve(_manualAddTool->borderSampleVertices().size());
+        boundaryKeys.reserve(_manualAddTool->borderSampleVertices().size());
+        for (const auto& key : _manualAddTool->borderSampleVertices()) {
+            if (key.row < 0 || key.row >= snapshot.rows || key.col < 0 || key.col >= snapshot.cols) {
+                continue;
+            }
+            const cv::Vec3f& point = snapshot(key.row, key.col);
+            if (ManualAddTool::isInvalidPoint(point)) {
+                continue;
+            }
+            boundarySamples.push_back(toTpsSample(key, point));
+            boundaryKeys.push_back(key);
+        }
+
+        std::vector<ThinPlateSpline3d::Sample> fillSamples;
+        fillSamples.reserve(tracedFillPoints.size());
+        for (const auto& point : tracedFillPoints) {
+            fillSamples.push_back(toTpsSample(point.key, point.world));
+        }
+
+        const int sampleCap = std::max(3, config.sampleCap);
+        std::vector<ThinPlateSpline3d::Sample> tpsSamples;
+        tpsSamples.reserve(static_cast<std::size_t>(sampleCap));
+
+        auto appendSampleSubset = [](const std::vector<ThinPlateSpline3d::Sample>& source,
+                                     int limit,
+                                     std::vector<ThinPlateSpline3d::Sample>& target) {
+            if (limit <= 0 || source.empty()) {
+                return;
+            }
+            if (static_cast<int>(source.size()) <= limit) {
+                target.insert(target.end(), source.begin(), source.end());
+                return;
+            }
+            for (int i = 0; i < limit; ++i) {
+                const std::size_t index = static_cast<std::size_t>(i) * source.size() / static_cast<std::size_t>(limit);
+                target.push_back(source[std::min(index, source.size() - 1)]);
+            }
+        };
+
+        const int totalSamples = static_cast<int>(boundarySamples.size() + fillSamples.size());
+        if (totalSamples <= sampleCap) {
+            appendSampleSubset(boundarySamples, static_cast<int>(boundarySamples.size()), tpsSamples);
+            appendSampleSubset(fillSamples, static_cast<int>(fillSamples.size()), tpsSamples);
+        } else {
+            int boundaryLimit = std::min<int>(boundarySamples.size(), sampleCap);
+            int fillLimit = std::min<int>(fillSamples.size(), sampleCap - boundaryLimit);
+            const int desiredFill = std::min<int>(fillSamples.size(), std::max(1, sampleCap / 3));
+            if (fillLimit < desiredFill && boundaryLimit > 0) {
+                const int shift = std::min(boundaryLimit, desiredFill - fillLimit);
+                boundaryLimit -= shift;
+                fillLimit += shift;
+            }
+            appendSampleSubset(boundarySamples, boundaryLimit, tpsSamples);
+            appendSampleSubset(fillSamples, fillLimit, tpsSamples);
+        }
+
+        ThinPlateSpline3d tps;
+        if (tps.fit(tpsSamples, config.regularization)) {
+            cv::Mat_<cv::Vec3f> smoothedPreview = snapshot.clone();
+            std::vector<SegmentationEditManager::GridKey> smoothedChanged;
+            std::set<std::pair<int, int>> smoothedChangedSeen;
+            smoothedChanged.reserve(tracedFillPoints.size() + boundaryKeys.size());
+            bool smoothingOk = true;
+
+            for (const auto& point : tracedFillPoints) {
+                auto predicted = tps.evaluate(cv::Point2d(point.key.col, point.key.row));
+                if (!predicted || ManualAddTool::isInvalidPoint(*predicted)) {
+                    smoothingOk = false;
+                    break;
+                }
+                smoothedPreview(point.key.row, point.key.col) = *predicted;
+                appendChanged(smoothedChanged, smoothedChangedSeen, point.key);
+            }
+
+            if (smoothingOk) {
+                for (const auto& key : boundaryKeys) {
+                    auto predicted = tps.evaluate(cv::Point2d(key.col, key.row));
+                    if (!predicted || ManualAddTool::isInvalidPoint(*predicted)) {
+                        smoothingOk = false;
+                        break;
+                    }
+                    smoothedPreview(key.row, key.col) = *predicted;
+                    appendChanged(smoothedChanged, smoothedChangedSeen, key);
+                }
+            }
+
+            if (smoothingOk && !smoothedChanged.empty()) {
+                preview = std::move(smoothedPreview);
+                changed = std::move(smoothedChanged);
+            } else {
+                qCInfo(lcSegModule) << "Manual Add tracer TPS smoothing failed; using raw tracer preview.";
+            }
+        } else {
+            qCInfo(lcSegModule) << "Manual Add tracer TPS smoothing could not fit; using raw tracer preview.";
+        }
     }
 
     std::optional<cv::Rect> bounds;
@@ -1846,6 +1988,7 @@ bool SegmentationModule::beginManualAdd()
         return false;
     }
     _manualAddMode = true;
+    _manualAddHoverThrottle.invalidate();
     _widget->setManualAddActive(true);
     refreshOverlay();
     emit statusMessageRequested(tr("Manual Add enabled."), kStatusShort);
@@ -1895,6 +2038,7 @@ bool SegmentationModule::finishManualAdd(bool apply)
     }
 
     _manualAddMode = false;
+    _manualAddHoverThrottle.invalidate();
     _manualAddTool->clear();
     if (_widget) {
         _widget->setManualAddActive(false);
@@ -1925,6 +2069,7 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
 
     const bool wasManualAddMode = _manualAddMode;
     _manualAddMode = false;
+    _manualAddHoverThrottle.invalidate();
 
     if (_widget) {
         _widget->setManualAddActive(false);
@@ -2060,6 +2205,15 @@ bool SegmentationModule::handleManualAddMousePress(VolumeViewerBase* viewer,
         return false;
     }
     if (viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+        const auto grid = segmentationSceneToGrid(viewer,
+                                                  scenePos,
+                                                  _manualAddTool->entrySnapshotPoints().rows,
+                                                  _manualAddTool->entrySnapshotPoints().cols);
+        if (grid) {
+            _manualAddTool->updateHover(grid->first, grid->second);
+        }
+        _manualAddHoverThrottle.restart();
+
         std::string status;
         if (!_manualAddTool->commitHover(&status)) {
             emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
@@ -2122,8 +2276,23 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
                                               scenePos,
                                               _manualAddTool->entrySnapshotPoints().rows,
                                               _manualAddTool->entrySnapshotPoints().cols);
+    bool gridIsInvalid = false;
+    if (grid) {
+        const auto& entry = _manualAddTool->entrySnapshotPoints();
+        gridIsInvalid = grid->first >= 0 && grid->first < entry.rows &&
+                        grid->second >= 0 && grid->second < entry.cols &&
+                        ManualAddTool::isInvalidPoint(entry(grid->first, grid->second));
+    }
+    const int throttleMs = _manualAddTool->config().previewThrottleMs;
+    if (gridIsInvalid && throttleMs > 0 &&
+        _manualAddTool->config().linePreviewMode != ManualAddTool::LinePreviewMode::CrossFill &&
+        _manualAddHoverThrottle.isValid() && _manualAddHoverThrottle.elapsed() < throttleMs) {
+        return true;
+    }
+
     const bool changed = grid ? _manualAddTool->updateHover(grid->first, grid->second)
                               : _manualAddTool->updateHover(-1, -1);
+    _manualAddHoverThrottle.restart();
     if (changed) {
         refreshOverlay();
     }
