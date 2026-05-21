@@ -89,6 +89,7 @@ default_config = {
     'winding_number_adjacent_patches_only': True,
     'unattached_pcl_num_per_step': 28,
     'unattached_pcl_num_points_per_step': 32,
+    'unattached_pcl_min_point_spacing': 4.,
     'normals_num_points': 2000,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 32.e0,
@@ -1077,9 +1078,12 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
     return (err * pair_mask).sum() / pair_mask.sum().clamp(min=1)
 
 
-def _prepare_unattached_pcl_strips(pcls_dict):
+def _prepare_unattached_pcl_strips(pcls_dict, min_point_spacing):
     # For each unattached pcl, materialise an id-sorted strip of point zyxs and the
     # corresponding winding annotations. Strips with <2 points are dropped.
+    # If min_point_spacing > 0, decimate each strip greedily along its id-sorted order
+    # so consecutive kept points are at least min_point_spacing apart in 3D scroll space.
+    # The first and last points are always kept.
     prepared = []
     for pcl in pcls_dict.values():
         sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
@@ -1087,6 +1091,16 @@ def _prepare_unattached_pcl_strips(pcls_dict):
             continue
         zyxs = np.stack([p['zyx'] for _, p in sorted_items], axis=0).astype(np.float32)
         windings = np.array([p['winding_annotation'] for _, p in sorted_items], dtype=np.float32)
+        if min_point_spacing > 0 and len(zyxs) > 2:
+            keep = [0]
+            last_kept = zyxs[0]
+            for i in range(1, len(zyxs) - 1):
+                if np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
+                    keep.append(i)
+                    last_kept = zyxs[i]
+            keep.append(len(zyxs) - 1)
+            zyxs = zyxs[keep]
+            windings = windings[keep]
         prepared.append({'zyxs': zyxs, 'windings': windings})
     return prepared
 
@@ -2502,7 +2516,7 @@ def main():
                 continue
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
-    unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections)
+    unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections, cfg['unattached_pcl_min_point_spacing'])
     print(
         f'pcls: {len(cross_patch_point_collections)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
