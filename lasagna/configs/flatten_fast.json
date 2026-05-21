@@ -12,7 +12,7 @@
 	"stages": [
 		{
 			"name": "flatten",
-			"steps": "auto",
+			"steps": 1000,
 			"lr" : 0.01,
 			"params": ["flatten_map_ms"],
 			"min_scaledown": 0,
@@ -33,7 +33,7 @@
 		},
 		{
 			"name": "flatten",
-			"steps": "auto",
+			"steps": 1000,
 			"lr" : 0.001,
 			"params": ["flatten_map_ms"],
 			"min_scaledown": 0,
@@ -54,7 +54,7 @@
 		},
 		{
 			"name": "flatten",
-			"steps": "auto",
+			"steps": 1000,
 			"lr" : 0.0001,
 			"params": ["flatten_map_ms"],
 			"min_scaledown": 0,

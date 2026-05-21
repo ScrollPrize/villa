@@ -1,7 +1,7 @@
 {
 	"args": {
 		"model-init": "flatten",
-	    "flatten_solver": "forward"
+		"flatten_solver": "forward"
 	},
 	"base": {
 		"flatten_sdir": 1.0,
@@ -13,7 +13,7 @@
 		{
 			"name": "flatten",
 			"steps": "auto",
-			"lr" : 0.01,
+			"lr": 0.01,
 			"params": ["flatten_map_ms"],
 			"min_scaledown": 0,
 			"args": {
@@ -23,6 +23,7 @@
 				"flatten_filter_source_angles": true,
 				"flatten_filter_angle_deg": 60.0,
 				"flatten_filter_radius": 2,
+				"flatten_output_margin": 0.10,
 				"flatten_max_update": 0.1,
 				"flatten_sdir_eps": 1e-8,
 				"status_interval": 100,
@@ -34,7 +35,7 @@
 		{
 			"name": "flatten",
 			"steps": "auto",
-			"lr" : 0.001,
+			"lr": 0.001,
 			"params": ["flatten_map_ms"],
 			"min_scaledown": 0,
 			"args": {
@@ -44,6 +45,7 @@
 				"flatten_filter_source_angles": true,
 				"flatten_filter_angle_deg": 60.0,
 				"flatten_filter_radius": 2,
+				"flatten_output_margin": 0.10,
 				"flatten_max_update": 0.1,
 				"flatten_sdir_eps": 1e-8,
 				"status_interval": 100,
@@ -55,7 +57,7 @@
 		{
 			"name": "flatten",
 			"steps": "auto",
-			"lr" : 0.0001,
+			"lr": 0.0001,
 			"params": ["flatten_map_ms"],
 			"min_scaledown": 0,
 			"args": {
@@ -65,6 +67,7 @@
 				"flatten_filter_source_angles": true,
 				"flatten_filter_angle_deg": 60.0,
 				"flatten_filter_radius": 2,
+				"flatten_output_margin": 0.10,
 				"flatten_max_update": 0.1,
 				"flatten_sdir_eps": 1e-8,
 				"status_interval": 100,

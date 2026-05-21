@@ -31,6 +31,109 @@ def last_stats() -> dict[str, float]:
 	return dict(_last_stats)
 
 
+def _is_forward(res: fit_model.FitResult3D) -> bool:
+	return str(getattr(res, "flatten_direction", "inverse")).strip().lower() == "forward"
+
+
+def _forward_source_fields(
+	res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	uv = res.flatten_map
+	xyz = res.flatten_source_xyz
+	vertex_valid = res.flatten_source_valid
+	cell_valid = res.flatten_source_cell_valid
+	if uv is None or xyz is None or vertex_valid is None or cell_valid is None:
+		raise RuntimeError("forward flatten loss requires source UV, xyz, vertex mask, and cell mask")
+	if uv.ndim != 3 or int(uv.shape[-1]) != 2:
+		raise RuntimeError(f"forward flatten UV map must have shape (H,W,2), got {tuple(uv.shape)}")
+	if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
+		raise RuntimeError(f"forward flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
+	if tuple(uv.shape[:2]) != tuple(xyz.shape[:2]):
+		raise RuntimeError("forward flatten UV map shape does not match source xyz")
+	if tuple(vertex_valid.shape) != tuple(uv.shape[:2]):
+		raise RuntimeError("forward flatten source vertex mask shape does not match UV map")
+	if tuple(cell_valid.shape) != (max(0, int(uv.shape[0]) - 1), max(0, int(uv.shape[1]) - 1)):
+		raise RuntimeError("forward flatten source cell mask shape does not match UV map")
+	return uv, xyz, vertex_valid.to(dtype=torch.bool), cell_valid.to(dtype=torch.bool)
+
+
+def _flatten_forward_sdir_loss(
+	*,
+	res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	global _last_stats, _prev_point_mask
+	uv, xyz, vertex_valid, cell_valid = _forward_source_fields(res)
+	if int(uv.shape[0]) < 2 or int(uv.shape[1]) < 2:
+		zero = uv.sum() * 0.0
+		return zero, (zero.reshape(1, 1, 1, 1),), (zero.reshape(1, 1, 1, 1),)
+	if res.flatten_target_step is None:
+		domain_step = torch.tensor(float(res.params.mesh_step), device=uv.device, dtype=uv.dtype)
+	else:
+		domain_step = res.flatten_target_step.to(device=uv.device, dtype=uv.dtype)
+	domain_step = domain_step.clamp_min(1.0e-12)
+
+	p00 = xyz[:-1, :-1]
+	p10 = xyz[1:, :-1]
+	p01 = xyz[:-1, 1:]
+	p11 = xyz[1:, 1:]
+	u00 = uv[:-1, :-1]
+	u10 = uv[1:, :-1]
+	u01 = uv[:-1, 1:]
+	u11 = uv[1:, 1:]
+	Xy = 0.5 * ((p10 - p00) + (p11 - p01))
+	Xx = 0.5 * ((p01 - p00) + (p11 - p10))
+	Uy = 0.5 * ((u10 - u00) + (u11 - u01))
+	Ux = 0.5 * ((u01 - u00) + (u11 - u10))
+
+	g00 = (Xy * Xy).sum(dim=-1)
+	g01 = (Xy * Xx).sum(dim=-1)
+	g11 = (Xx * Xx).sum(dim=-1)
+	c00 = (Uy * Uy).sum(dim=-1)
+	c01 = (Uy * Ux).sum(dim=-1)
+	c11 = (Ux * Ux).sum(dim=-1)
+	det_g = g00 * g11 - g01 * g01
+	det_c = c00 * c11 - c01 * c01
+	eps = float(_sdir_eps)
+	inv_g00 = g11 / det_g.clamp_min(eps)
+	inv_g01 = -g01 / det_g.clamp_min(eps)
+	inv_g11 = g00 / det_g.clamp_min(eps)
+	inv_c00 = c11 / det_c.clamp_min(eps)
+	inv_c01 = -c01 / det_c.clamp_min(eps)
+	inv_c11 = c00 / det_c.clamp_min(eps)
+	tr_j = (domain_step * domain_step) * (c00 * inv_g00 + 2.0 * c01 * inv_g01 + c11 * inv_g11)
+	tr_inv = (g00 * inv_c00 + 2.0 * g01 * inv_c01 + g11 * inv_c11) / (domain_step * domain_step)
+	lm = torch.nan_to_num(tr_j + tr_inv - 4.0, nan=0.0, posinf=1.0e12, neginf=0.0)
+	det_uv = Uy[..., 0] * Ux[..., 1] - Uy[..., 1] * Ux[..., 0]
+	valid = (
+		cell_valid.to(device=uv.device)
+		& torch.isfinite(lm)
+		& torch.isfinite(det_g)
+		& torch.isfinite(det_c)
+		& (det_g > eps)
+		& (det_c > eps)
+		& torch.isfinite(det_uv)
+		& (det_uv > eps)
+	)
+	mask = valid.to(dtype=uv.dtype)
+	wsum = mask.sum()
+	if bool((wsum > 0).detach().cpu()):
+		loss = (lm * mask).sum() / wsum
+	else:
+		loss = (lm * 0.0).sum()
+
+	with torch.no_grad():
+		_last_stats = {
+			"flatten_point_valid": float(vertex_valid.float().mean().detach().cpu()),
+			"flatten_quad_valid": float(valid.float().mean().detach().cpu()) if valid.numel() else 0.0,
+			"flatten_tgt_step": float(domain_step.detach().cpu()),
+			"flatten_valid_to_invalid": 0.0,
+			"flatten_invalid_to_valid": 0.0,
+			"flatten_sdir_no_new": float(loss.detach().cpu()),
+		}
+		_prev_point_mask = None
+	return loss, (lm.unsqueeze(0).unsqueeze(1),), (mask.unsqueeze(0).unsqueeze(1),)
+
+
 def flatten_sdir_loss(
 	*,
 	res: fit_model.FitResult3D,
@@ -41,6 +144,8 @@ def flatten_sdir_loss(
 	uses the measured average spacing of the source tifxyz grid, so flattening
 	does not impose global scaling from metadata.
 	"""
+	if _is_forward(res):
+		return _flatten_forward_sdir_loss(res=res)
 	global _last_stats, _prev_point_mask
 	xyz = res.flatten_xyz
 	point_mask = res.flatten_point_mask
@@ -136,23 +241,35 @@ def flatten_map_step_loss(
 	sum_loss = map_yx.sum() * 0.0
 	sum_weight = map_yx.new_zeros(())
 
-	def _accumulate(lm: torch.Tensor) -> None:
+	def _accumulate(lm: torch.Tensor, valid_mask: torch.Tensor | None = None) -> None:
 		nonlocal sum_loss, sum_weight
 		mask = torch.isfinite(lm)
+		if valid_mask is not None:
+			mask = mask & valid_mask.to(device=lm.device, dtype=torch.bool)
 		mask_f = mask.to(dtype=lm.dtype)
 		maps.append(torch.nan_to_num(lm, nan=0.0, posinf=1.0e12, neginf=0.0).unsqueeze(0).unsqueeze(1))
 		masks.append(mask_f.unsqueeze(0).unsqueeze(1))
 		sum_loss = sum_loss + (maps[-1].squeeze(0).squeeze(0) * mask_f).sum()
 		sum_weight = sum_weight + mask_f.sum()
 
+	source_valid = None
+	if _is_forward(res):
+		if res.flatten_source_valid is None:
+			raise RuntimeError("forward flatten_map_step requires flatten_source_valid")
+		source_valid = res.flatten_source_valid.to(device=map_yx.device, dtype=torch.bool)
+		if tuple(source_valid.shape) != tuple(map_yx.shape[:2]):
+			raise RuntimeError("forward flatten source mask shape does not match map")
+
 	if H > 1:
 		target_y = torch.tensor([1.0, 0.0], device=map_yx.device, dtype=map_yx.dtype)
 		dy = map_yx[1:, :] - map_yx[:-1, :] - target_y
-		_accumulate((dy * dy).sum(dim=-1))
+		valid_edge = None if source_valid is None else (source_valid[1:, :] & source_valid[:-1, :])
+		_accumulate((dy * dy).sum(dim=-1), valid_edge)
 	if W > 1:
 		target_x = torch.tensor([0.0, 1.0], device=map_yx.device, dtype=map_yx.dtype)
 		dx = map_yx[:, 1:] - map_yx[:, :-1] - target_x
-		_accumulate((dx * dx).sum(dim=-1))
+		valid_edge = None if source_valid is None else (source_valid[:, 1:] & source_valid[:, :-1])
+		_accumulate((dx * dx).sum(dim=-1), valid_edge)
 
 	if bool((sum_weight > 0).detach().cpu()):
 		loss = sum_loss / sum_weight
@@ -238,12 +355,19 @@ def flatten_orient_loss(
 	det = dy[..., 0] * dx[..., 1] - dy[..., 1] * dx[..., 0]
 	min_det = torch.tensor(float(_orient_min_det), device=map_yx.device, dtype=map_yx.dtype)
 	lm = torch.nan_to_num(torch.relu(min_det - det) ** 2, nan=0.0, posinf=1.0e12, neginf=0.0)
-	active = torch.isfinite(det) & (det < min_det)
+	valid_cells = torch.ones_like(det, dtype=torch.bool)
+	if _is_forward(res):
+		if res.flatten_source_cell_valid is None:
+			raise RuntimeError("forward flatten_orient requires flatten_source_cell_valid")
+		valid_cells = res.flatten_source_cell_valid.to(device=map_yx.device, dtype=torch.bool)
+		if tuple(valid_cells.shape) != tuple(det.shape):
+			raise RuntimeError("forward flatten source cell mask shape does not match orient determinant")
+	active = valid_cells & torch.isfinite(det) & (det < min_det)
 	mask = active.to(dtype=lm.dtype)
 	loss = (lm * mask).sum()
 
 	with torch.no_grad():
-		valid_det = det[torch.isfinite(det)]
+		valid_det = det[valid_cells & torch.isfinite(det)]
 		if valid_det.numel():
 			fold_frac = float((valid_det <= 0.0).float().mean().detach().cpu())
 			lowdet_frac = float((valid_det < min_det).float().mean().detach().cpu())

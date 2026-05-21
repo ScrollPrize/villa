@@ -174,6 +174,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
 	p.add_argument("--model-init", choices=("seed", "ext", "model", "flatten"), default="seed",
 		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input, flatten optimizes one external tifxyz inverse map")
+	p.add_argument("--flatten-solver", choices=("torch", "inverse", "forward"), default="torch",
+		help="Flatten solver variant for model-init=flatten: torch/inverse keeps the existing inverse-map Adam path; forward optimizes source-vertex UVs and inverts at export")
 	p.add_argument("--window-size", type=int, default=None,
 		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
 	p.add_argument("--window-overlap", type=int, default=0,
@@ -256,9 +258,11 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 	for k in [k for k in st if k.startswith("mesh_ms.")]:
 		del st[k]
 	with torch.no_grad():
-		st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
-		st["flatten_map_flat"] = mdl.flatten_map().detach().cpu()
-		_map_yx, _xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+		sentinel = torch.full_like(xyz, -1.0)
+		xyz = torch.where(point_mask.unsqueeze(0).unsqueeze(-1), xyz, sentinel)
+		st["mesh_flat"] = xyz.permute(3, 0, 1, 2).detach().cpu()
+		st["flatten_map_flat"] = map_yx.detach().cpu()
 		st["flatten_point_mask"] = point_mask.detach().cpu()
 	st["_model_params_"] = asdict(mdl.params)
 	st["_fit_config_"] = fit_config
@@ -337,6 +341,15 @@ def _run_flatten_mode(
 		flatten_args.update(cfg["args"])
 	if stages:
 		flatten_args.update(stages[0].global_opt.args or {})
+	flatten_solver_raw = flatten_args.get(
+		"flatten_solver",
+		flatten_args.get("flatten-solver", getattr(args, "flatten_solver", "torch")),
+	)
+	flatten_direction = model.Model3D._normalize_flatten_direction(str(flatten_solver_raw))
+	flatten_output_margin = float(flatten_args.get(
+		"flatten_output_margin",
+		flatten_args.get("flatten_forward_output_margin", 0.10),
+	))
 	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
 	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
@@ -351,6 +364,8 @@ def _run_flatten_mode(
 		flatten_filter_source_angles=filter_source_angles,
 		flatten_filter_angle_deg=filter_angle_deg,
 		flatten_filter_radius=filter_radius,
+		flatten_direction=flatten_direction,
+		flatten_output_margin=flatten_output_margin,
 	)
 	data = _dummy_flatten_data()
 
@@ -358,7 +373,7 @@ def _run_flatten_mode(
 	print("model:", model_cfg)
 	print("opt:", opt_cfg)
 	print(
-		f"[fit] model-init=flatten source={ext0['path']} "
+		f"[fit] model-init=flatten solver={flatten_direction} source={ext0['path']} "
 		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
 		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
 		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",

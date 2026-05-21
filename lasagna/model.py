@@ -273,6 +273,10 @@ class FitResult3D:
 	flatten_target_step: torch.Tensor | None = None      # scalar measured source spacing
 	flatten_avg_offset_mask: torch.Tensor | None = None  # (Hout, Wout) bool fixed init-valid anchor mask
 	flatten_initial_avg_offset: torch.Tensor | None = None  # (2,) initial mean map offset over anchor mask
+	flatten_direction: str = "inverse"                   # inverse: output->source, forward: source->output UV
+	flatten_source_xyz: torch.Tensor | None = None       # (Hs, Ws, 3) frozen source surface
+	flatten_source_valid: torch.Tensor | None = None     # (Hs, Ws) bool frozen source vertices
+	flatten_source_cell_valid: torch.Tensor | None = None  # (Hs-1, Ws-1) bool frozen source quads
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
@@ -415,6 +419,9 @@ class Model3D(nn.Module):
 		# flatten mode and are intentionally separate from external offset
 		# surfaces.
 		self.flatten_enabled = False
+		self.flatten_direction = "inverse"
+		self.flatten_output_shape: tuple[int, int] = (0, 0)
+		self.flatten_output_margin = 0.10
 		self.flatten_map_ms = nn.ParameterList()
 		self.register_buffer("flatten_source_xyz", torch.empty(0, 0, 3, device=device, dtype=torch.float32))
 		self.register_buffer("flatten_source_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
@@ -528,6 +535,33 @@ class Model3D(nn.Module):
 			dtype=dtype,
 		)
 		return (map_yx - offset.reshape(1, 1, 2)).contiguous()
+
+	@staticmethod
+	def _normalize_flatten_direction(raw: str | None) -> str:
+		value = str(raw or "inverse").strip().lower().replace("-", "_")
+		if value in {"torch", "bilin", "bilinear", "inverse", "inverse_adam"}:
+			return "inverse"
+		if value in {"forward", "forward_adam", "uv", "source_uv"}:
+			return "forward"
+		raise ValueError(f"unsupported flatten solver/direction {raw!r} (expected inverse/torch or forward)")
+
+	@staticmethod
+	def _centered_flatten_forward_uv_map(
+		*,
+		source_h: int,
+		source_w: int,
+		out_h: int,
+		out_w: int,
+		device: torch.device,
+		dtype: torch.dtype,
+	) -> torch.Tensor:
+		uv_yx = Model3D._identity_flatten_map(h=source_h, w=source_w, device=device, dtype=dtype)
+		offset = torch.tensor(
+			[0.5 * float(out_h - source_h), 0.5 * float(out_w - source_w)],
+			device=device,
+			dtype=dtype,
+		)
+		return (uv_yx + offset.reshape(1, 1, 2)).contiguous()
 
 	def _shell_delta_scale_count(self) -> int:
 		return max(1, int(getattr(self, "cyl_shell_n_scales", 5)))
@@ -2391,7 +2425,10 @@ class Model3D(nn.Module):
 	def _grid_xyz(self) -> torch.Tensor:
 		"""(D, Hm, Wm, 3) mesh positions in fullres voxel coords."""
 		if self.flatten_enabled:
-			_map_yx, flatten_xyz, _point_mask, _quad_mask = self._flatten_sample_current()
+			if self.flatten_direction == "forward":
+				_map_yx, flatten_xyz, _point_mask, _quad_mask = self._flatten_forward_current()
+			else:
+				_map_yx, flatten_xyz, _point_mask, _quad_mask = self._flatten_sample_current()
 			return flatten_xyz
 		if self.cylinder_enabled:
 			if self.cyl_shell_mode:
@@ -2856,6 +2893,216 @@ class Model3D(nn.Module):
 		xyz = torch.where(valid.unsqueeze(-1), xyz, torch.zeros_like(xyz))
 		return xyz, valid
 
+	@staticmethod
+	def _flatten_invert_forward_uv_map(
+		source_xyz: torch.Tensor,
+		source_cell_valid: torch.Tensor,
+		uv_yx: torch.Tensor,
+		*,
+		output_margin: float = 0.10,
+		min_shape: tuple[int, int] | None = None,
+		k_candidates: int = 32,
+		chunk_points: int = 65536,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		"""Invert a source-vertex UV map onto a regular output grid for export.
+
+		This is intentionally non-differentiable.  Optimization happens on the
+		forward source->UV map; export finds the source quad containing each
+		output UV pixel and bilinearly samples the frozen tifxyz source.
+		"""
+		if uv_yx.ndim != 3 or int(uv_yx.shape[-1]) != 2:
+			raise ValueError(f"forward flatten UV map must have shape (H,W,2), got {tuple(uv_yx.shape)}")
+		if source_xyz.ndim != 3 or int(source_xyz.shape[-1]) != 3:
+			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(source_xyz.shape)}")
+		if tuple(source_xyz.shape[:2]) != tuple(uv_yx.shape[:2]):
+			raise ValueError("forward flatten UV map shape must match source xyz shape")
+		if tuple(source_cell_valid.shape) != (max(0, int(uv_yx.shape[0]) - 1), max(0, int(uv_yx.shape[1]) - 1)):
+			raise ValueError("forward flatten source_cell_valid shape does not match UV map")
+
+		import numpy as np
+
+		device = uv_yx.device
+		dtype = uv_yx.dtype
+		uv = uv_yx.detach().cpu().numpy().astype(np.float64, copy=False)
+		xyz = source_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
+		cell_valid = source_cell_valid.detach().cpu().numpy().astype(bool, copy=False)
+		Hs, Ws = int(uv.shape[0]), int(uv.shape[1])
+		min_h, min_w = min_shape if min_shape is not None else Model3D._flatten_output_shape_for_source(Hs, Ws)
+		min_h = max(2, int(min_h))
+		min_w = max(2, int(min_w))
+
+		if Hs < 2 or Ws < 2 or not cell_valid.any():
+			out_map = np.zeros((min_h, min_w, 2), dtype=np.float32)
+			out_xyz = np.zeros((1, min_h, min_w, 3), dtype=np.float32)
+			out_mask = np.zeros((min_h, min_w), dtype=bool)
+			return (
+				torch.as_tensor(out_map, device=device, dtype=dtype),
+				torch.as_tensor(out_xyz, device=device, dtype=dtype),
+				torch.as_tensor(out_mask, device=device, dtype=torch.bool),
+			)
+
+		q00_all = uv[:-1, :-1]
+		q10_all = uv[1:, :-1]
+		q01_all = uv[:-1, 1:]
+		q11_all = uv[1:, 1:]
+		xyz00_all = xyz[:-1, :-1]
+		xyz10_all = xyz[1:, :-1]
+		xyz01_all = xyz[:-1, 1:]
+		xyz11_all = xyz[1:, 1:]
+		finite_uv = (
+			np.isfinite(q00_all).all(axis=-1) &
+			np.isfinite(q10_all).all(axis=-1) &
+			np.isfinite(q01_all).all(axis=-1) &
+			np.isfinite(q11_all).all(axis=-1)
+		)
+		finite_xyz = (
+			np.isfinite(xyz00_all).all(axis=-1) &
+			np.isfinite(xyz10_all).all(axis=-1) &
+			np.isfinite(xyz01_all).all(axis=-1) &
+			np.isfinite(xyz11_all).all(axis=-1)
+		)
+		e_s = 0.5 * ((q10_all - q00_all) + (q11_all - q01_all))
+		e_t = 0.5 * ((q01_all - q00_all) + (q11_all - q10_all))
+		det_center = e_s[..., 0] * e_t[..., 1] - e_s[..., 1] * e_t[..., 0]
+		valid_cells_2d = cell_valid & finite_uv & finite_xyz & np.isfinite(det_center) & (det_center > 1.0e-10)
+		if not valid_cells_2d.any():
+			out_map = np.zeros((min_h, min_w, 2), dtype=np.float32)
+			out_xyz = np.zeros((1, min_h, min_w, 3), dtype=np.float32)
+			out_mask = np.zeros((min_h, min_w), dtype=bool)
+			return (
+				torch.as_tensor(out_map, device=device, dtype=dtype),
+				torch.as_tensor(out_xyz, device=device, dtype=dtype),
+				torch.as_tensor(out_mask, device=device, dtype=torch.bool),
+			)
+
+		rows, cols = np.nonzero(valid_cells_2d)
+		q00 = q00_all[rows, cols]
+		q10 = q10_all[rows, cols]
+		q01 = q01_all[rows, cols]
+		q11 = q11_all[rows, cols]
+		x00 = xyz00_all[rows, cols]
+		x10 = xyz10_all[rows, cols]
+		x01 = xyz01_all[rows, cols]
+		x11 = xyz11_all[rows, cols]
+		uv_corners = np.concatenate([q00, q10, q01, q11], axis=0)
+		lo = uv_corners.min(axis=0)
+		hi = uv_corners.max(axis=0)
+		span = np.maximum(hi - lo, 1.0)
+		pad = np.maximum(float(output_margin), 0.0) * span
+		lo = lo - pad
+		hi = hi + pad
+		out_h = max(min_h, int(math.ceil(float(hi[0] - lo[0]))) + 1)
+		out_w = max(min_w, int(math.ceil(float(hi[1] - lo[1]))) + 1)
+		if out_h > int(math.ceil(float(hi[0] - lo[0]))) + 1:
+			extra = 0.5 * float(out_h - (int(math.ceil(float(hi[0] - lo[0]))) + 1))
+			lo[0] -= extra
+		if out_w > int(math.ceil(float(hi[1] - lo[1]))) + 1:
+			extra = 0.5 * float(out_w - (int(math.ceil(float(hi[1] - lo[1]))) + 1))
+			lo[1] -= extra
+
+		out_map = np.zeros((out_h, out_w, 2), dtype=np.float32)
+		out_xyz = np.zeros((out_h, out_w, 3), dtype=np.float32)
+		out_mask = np.zeros((out_h, out_w), dtype=bool)
+		centers = 0.25 * (q00 + q10 + q01 + q11)
+		k = max(1, min(int(k_candidates), int(centers.shape[0])))
+		try:
+			from scipy.spatial import cKDTree
+			tree = cKDTree(centers)
+			use_tree = True
+		except Exception:
+			tree = None
+			use_tree = False
+			if int(centers.shape[0]) * int(out_h) * int(out_w) > 20_000_000:
+				raise RuntimeError("scipy.spatial.cKDTree is required for large forward-flatten export")
+
+		total = int(out_h) * int(out_w)
+		chunk = max(1, int(chunk_points))
+		cell_index_all = np.arange(int(centers.shape[0]), dtype=np.int64)
+		for start in range(0, total, chunk):
+			stop = min(total, start + chunk)
+			flat_idx = np.arange(start, stop, dtype=np.int64)
+			oy = flat_idx // int(out_w)
+			ox = flat_idx - oy * int(out_w)
+			points = np.stack([lo[0] + oy.astype(np.float64), lo[1] + ox.astype(np.float64)], axis=-1)
+			if use_tree:
+				_dist, cand = tree.query(points, k=k)
+				cand = np.asarray(cand, dtype=np.int64)
+				if cand.ndim == 1:
+					cand = cand[:, None]
+			else:
+				d2 = ((points[:, None, :] - centers[None, :, :]) ** 2).sum(axis=-1)
+				if k < int(centers.shape[0]):
+					cand = np.argpartition(d2, kth=k - 1, axis=1)[:, :k]
+				else:
+					cand = np.broadcast_to(cell_index_all.reshape(1, -1), (points.shape[0], centers.shape[0]))
+
+			Q00 = q00[cand]
+			Q10 = q10[cand]
+			Q01 = q01[cand]
+			Q11 = q11[cand]
+			rhs = points[:, None, :] - Q00
+			es = Q10 - Q00
+			et = Q01 - Q00
+			bilin = Q11 - Q10 - Q01 + Q00
+			det = es[..., 0] * et[..., 1] - es[..., 1] * et[..., 0]
+			s = np.where(np.abs(det) > 1.0e-12, (rhs[..., 0] * et[..., 1] - et[..., 0] * rhs[..., 1]) / det, 0.5)
+			t = np.where(np.abs(det) > 1.0e-12, (es[..., 0] * rhs[..., 1] - rhs[..., 0] * es[..., 1]) / det, 0.5)
+			for _ in range(6):
+				P = Q00 + s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bilin
+				resid = P - points[:, None, :]
+				Js = es + t[..., None] * bilin
+				Jt = et + s[..., None] * bilin
+				jdet = Js[..., 0] * Jt[..., 1] - Js[..., 1] * Jt[..., 0]
+				ok = np.abs(jdet) > 1.0e-12
+				ds = np.where(ok, (resid[..., 0] * Jt[..., 1] - Jt[..., 0] * resid[..., 1]) / jdet, 0.0)
+				dt = np.where(ok, (Js[..., 0] * resid[..., 1] - resid[..., 0] * Js[..., 1]) / jdet, 0.0)
+				s = s - ds
+				t = t - dt
+			P = Q00 + s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bilin
+			res2 = ((P - points[:, None, :]) ** 2).sum(axis=-1)
+			inside = (
+				np.isfinite(res2) &
+				(s >= -1.0e-4) & (s <= 1.0 + 1.0e-4) &
+				(t >= -1.0e-4) & (t <= 1.0 + 1.0e-4) &
+				(res2 <= 1.0e-5)
+			)
+			score = np.where(inside, res2, np.inf)
+			best_pos = np.argmin(score, axis=1)
+			best_score = score[np.arange(score.shape[0]), best_pos]
+			good = np.isfinite(best_score)
+			if not good.any():
+				continue
+			best_cell = cand[np.arange(cand.shape[0]), best_pos][good]
+			best_s = np.clip(s[np.arange(s.shape[0]), best_pos][good], 0.0, 1.0)
+			best_t = np.clip(t[np.arange(t.shape[0]), best_pos][good], 0.0, 1.0)
+			dst_y = oy[good]
+			dst_x = ox[good]
+			src_r = rows[best_cell].astype(np.float64) + best_s
+			src_c = cols[best_cell].astype(np.float64) + best_t
+			X00 = x00[best_cell]
+			X10 = x10[best_cell]
+			X01 = x01[best_cell]
+			X11 = x11[best_cell]
+			S = best_s[:, None]
+			T = best_t[:, None]
+			sampled = (
+				(1.0 - S) * (1.0 - T) * X00
+				+ S * (1.0 - T) * X10
+				+ (1.0 - S) * T * X01
+				+ S * T * X11
+			)
+			out_map[dst_y, dst_x, 0] = src_r.astype(np.float32, copy=False)
+			out_map[dst_y, dst_x, 1] = src_c.astype(np.float32, copy=False)
+			out_xyz[dst_y, dst_x] = sampled.astype(np.float32, copy=False)
+			out_mask[dst_y, dst_x] = True
+
+		out_xyz = np.where(out_mask[..., None], out_xyz, 0.0).astype(np.float32, copy=False)
+		return (
+			torch.as_tensor(out_map, device=device, dtype=dtype),
+			torch.as_tensor(out_xyz[None], device=device, dtype=dtype),
+			torch.as_tensor(out_mask, device=device, dtype=torch.bool),
+		)
+
 	def _flatten_map_flat(self) -> torch.Tensor:
 		if not self.flatten_enabled or len(self.flatten_map_ms) == 0:
 			raise RuntimeError("flatten map is not initialized")
@@ -2879,6 +3126,8 @@ class Model3D(nn.Module):
 		flatten_filter_source_angles: bool = False,
 		flatten_filter_angle_deg: float = 90.0,
 		flatten_filter_radius: int = 2,
+		flatten_direction: str = "inverse",
+		flatten_output_margin: float = 0.10,
 	) -> None:
 		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
 			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
@@ -2892,10 +3141,12 @@ class Model3D(nn.Module):
 		valid_dev = valid.detach().to(device=device, dtype=torch.bool) & torch.isfinite(xyz_dev).all(dim=-1)
 		xyz_dev = torch.where(valid_dev.unsqueeze(-1), xyz_dev, torch.zeros_like(xyz_dev))
 		Hout, Wout = self._flatten_output_shape_for_source(H, W)
+		direction = self._normalize_flatten_direction(flatten_direction)
+		map_h, map_w = (H, W) if direction == "forward" else (Hout, Wout)
 
 		self.depth = 1
-		self.mesh_h = Hout
-		self.mesh_w = Wout
+		self.mesh_h = map_h
+		self.mesh_w = map_w
 		self.pyramid_d = False
 		self.params = replace(
 			self.params,
@@ -2907,9 +3158,9 @@ class Model3D(nn.Module):
 			model_h=float(max(1, Hout - 1) * max(1, int(mesh_step))),
 			model_w=float(max(1, Wout - 1) * max(1, int(mesh_step))),
 		)
-		self.conn_offsets = torch.zeros(4, 1, Hout, Wout, device=device, dtype=torch.float32)
-		self.amp = nn.Parameter(torch.ones(1, 1, Hout, Wout, device=device, dtype=torch.float32), requires_grad=False)
-		self.bias = nn.Parameter(torch.zeros(1, 1, Hout, Wout, device=device, dtype=torch.float32), requires_grad=False)
+		self.conn_offsets = torch.zeros(4, 1, map_h, map_w, device=device, dtype=torch.float32)
+		self.amp = nn.Parameter(torch.ones(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
+		self.bias = nn.Parameter(torch.zeros(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
 		self.flatten_source_xyz = xyz_dev
 		self.flatten_source_valid = valid_dev
 		source_cell_valid = self._source_cell_valid(valid_dev)
@@ -2938,19 +3189,33 @@ class Model3D(nn.Module):
 			valid_dev,
 			fallback=float(mesh_step),
 		).detach()
-		identity = self._centered_flatten_source_map(
-			source_h=H,
-			source_w=W,
-			out_h=Hout,
-			out_w=Wout,
-			device=device,
-			dtype=torch.float32,
-		)
-		_sampled_init, initial_point_mask = self._flatten_sample_map(
-			xyz_dev,
-			source_cell_valid,
-			identity,
-		)
+		if direction == "forward":
+			identity = self._centered_flatten_forward_uv_map(
+				source_h=H,
+				source_w=W,
+				out_h=Hout,
+				out_w=Wout,
+				device=device,
+				dtype=torch.float32,
+			)
+			initial_point_mask = valid_dev
+		else:
+			identity = self._centered_flatten_source_map(
+				source_h=H,
+				source_w=W,
+				out_h=Hout,
+				out_w=Wout,
+				device=device,
+				dtype=torch.float32,
+			)
+			_sampled_init, initial_point_mask = self._flatten_sample_map(
+				xyz_dev,
+				source_cell_valid,
+				identity,
+			)
+		self.flatten_direction = direction
+		self.flatten_output_shape = (Hout, Wout)
+		self.flatten_output_margin = max(0.0, float(flatten_output_margin))
 		self.flatten_avg_offset_mask = initial_point_mask.detach()
 		self.flatten_initial_avg_offset = self._flatten_avg_offset(
 			identity,
@@ -2959,7 +3224,7 @@ class Model3D(nn.Module):
 		flat = identity.permute(2, 0, 1).unsqueeze(1).contiguous()
 		self.flatten_map_ms = self._construct_pyramid_from_flat_3d(
 			flat,
-			self._scale_count_to_longer_dim_2(Hout, Wout),
+			self._scale_count_to_longer_dim_2(map_h, map_w),
 			pyramid_d=False,
 		)
 		self.flatten_enabled = True
@@ -2982,14 +3247,18 @@ class Model3D(nn.Module):
 		flatten_filter_source_angles: bool = False,
 		flatten_filter_angle_deg: float = 90.0,
 		flatten_filter_radius: int = 2,
+		flatten_direction: str = "inverse",
+		flatten_output_margin: float = 0.10,
 	) -> "Model3D":
 		H, W, _ = xyz.shape
 		Hout, Wout = Model3D._flatten_output_shape_for_source(H, W)
+		direction = Model3D._normalize_flatten_direction(flatten_direction)
+		init_h, init_w = (H, W) if direction == "forward" else (Hout, Wout)
 		mdl = Model3D(
 			device=device,
 			depth=1,
-			mesh_h=Hout,
-			mesh_w=Wout,
+			mesh_h=init_h,
+			mesh_w=init_w,
 			mesh_step=mesh_step,
 			winding_step=winding_step,
 			subsample_mesh=subsample_mesh,
@@ -3007,8 +3276,25 @@ class Model3D(nn.Module):
 			flatten_filter_source_angles=flatten_filter_source_angles,
 			flatten_filter_angle_deg=flatten_filter_angle_deg,
 			flatten_filter_radius=flatten_filter_radius,
+			flatten_direction=direction,
+			flatten_output_margin=flatten_output_margin,
 		)
 		return mdl
+
+	def _flatten_forward_current(self) -> tuple[
+		torch.Tensor,
+		torch.Tensor,
+		torch.Tensor,
+		torch.Tensor,
+	]:
+		map_yx = self.flatten_map()
+		xyz = torch.where(
+			self.flatten_source_valid.unsqueeze(-1),
+			self.flatten_source_xyz,
+			torch.zeros_like(self.flatten_source_xyz),
+		)
+		quad_mask = self.flatten_source_cell_valid.unsqueeze(0)
+		return map_yx, xyz.unsqueeze(0), self.flatten_source_valid, quad_mask
 
 	def _flatten_sample_current(self) -> tuple[
 		torch.Tensor,
@@ -3016,6 +3302,25 @@ class Model3D(nn.Module):
 		torch.Tensor,
 		torch.Tensor,
 	]:
+		if self.flatten_direction == "forward":
+			map_yx = self.flatten_map()
+			out_map, xyz, point_mask = self._flatten_invert_forward_uv_map(
+				self.flatten_source_xyz,
+				self.flatten_source_cell_valid,
+				map_yx,
+				output_margin=float(getattr(self, "flatten_output_margin", 0.10)),
+				min_shape=getattr(self, "flatten_output_shape", None),
+			)
+			if int(point_mask.shape[0]) > 1 and int(point_mask.shape[1]) > 1:
+				quad_mask = (
+					point_mask[:-1, :-1] &
+					point_mask[1:, :-1] &
+					point_mask[:-1, 1:] &
+					point_mask[1:, 1:]
+				).unsqueeze(0)
+			else:
+				quad_mask = torch.zeros(1, 0, 0, device=point_mask.device, dtype=torch.bool)
+			return out_map, xyz, point_mask, quad_mask
 		map_yx = self.flatten_map()
 		xyz, point_mask = self._flatten_sample_map(
 			self.flatten_source_xyz,
@@ -3429,12 +3734,20 @@ class Model3D(nn.Module):
 		flatten_point_mask = None
 		flatten_quad_mask = None
 		if self.flatten_enabled:
-			(
-				flatten_map,
-				flatten_xyz,
-				flatten_point_mask,
-				flatten_quad_mask,
-			) = self._flatten_sample_current()
+			if self.flatten_direction == "forward":
+				(
+					flatten_map,
+					flatten_xyz,
+					flatten_point_mask,
+					flatten_quad_mask,
+				) = self._flatten_forward_current()
+			else:
+				(
+					flatten_map,
+					flatten_xyz,
+					flatten_point_mask,
+					flatten_quad_mask,
+				) = self._flatten_sample_current()
 			xyz_lr = flatten_xyz
 		else:
 			xyz_lr = self._grid_xyz()  # (D, Hm, Wm, 3)
@@ -3638,6 +3951,10 @@ class Model3D(nn.Module):
 			flatten_target_step=self.flatten_target_step if self.flatten_enabled else None,
 			flatten_avg_offset_mask=self.flatten_avg_offset_mask if self.flatten_enabled else None,
 			flatten_initial_avg_offset=self.flatten_initial_avg_offset if self.flatten_enabled else None,
+			flatten_direction=self.flatten_direction if self.flatten_enabled else "inverse",
+			flatten_source_xyz=self.flatten_source_xyz if self.flatten_enabled else None,
+			flatten_source_valid=self.flatten_source_valid if self.flatten_enabled else None,
+			flatten_source_cell_valid=self.flatten_source_cell_valid if self.flatten_enabled else None,
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:

@@ -36,6 +36,7 @@ Each part provides `add_args(parser)` + `from_args(args)`:
 
 - `--out-dir` output directory for snapshots and debug
 - `--model-init` (`seed`, `ext`, `model`, or `flatten`; default `seed`)
+- `--flatten-solver` (`torch`, `inverse`, or `forward`; default `torch`) selects the flattening variant when `--model-init flatten`
 - `--tifxyz-init` tifxyz directory used when `--model-init ext`
 - `--window-size` window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)
 - `--window-overlap` overlap between windows in fullres voxels (default 0)
@@ -70,6 +71,6 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.windings`.
 - `ext` initializes from the selected tifxyz mesh sent by VC3D.
 - `model` initializes from the selected segment's `model.pt`.
-- `flatten` optimizes an inverse 2D map over one external tifxyz source. Use [`configs/flatten.json`](../configs/flatten.json) with exactly one `external_surfaces` entry supplied by VC3D or the calling config.
+- `flatten` optimizes a 2D flattening over one external tifxyz source. The default [`configs/flatten.json`](../configs/flatten.json) keeps the existing inverse-map Adam path. [`configs/flatten_forward.json`](../configs/flatten_forward.json) sets `flatten_solver: "forward"` to optimize source-vertex UVs with the same pyramid/Adam stages, then invert that UV map at export. Use exactly one `external_surfaces` entry supplied by VC3D or the calling config.
 
 For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model data and UI state it has available. `fit_service.py` / `fit.py` decide whether those fields are consumed as `tifxyz-init`, `external_surfaces`, approval-inpaint input, model checkpoint input, or ignored as surplus transport data.
