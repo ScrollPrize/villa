@@ -1,6 +1,5 @@
 
 import os
-import copy
 import json
 import glob
 import zarr
@@ -43,7 +42,6 @@ scroll_name = 's1'
 z_begin, z_end = 6000, 16000
 patches_path = '/home/paul/projects/vesuvius-scrolls/spiral/custom_patches'
 voxel_size_um = 2.4 * 4  # before downsampling
-seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
 
 # # PHerc0172
 # volpkg_path = '/home/paul/projects/vesuvius-scrolls/volpkgs/PHerc0172.volpkg'
@@ -55,7 +53,6 @@ seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
 # scroll_name = 's5'
 # z_begin, z_end = 15400, 16600
 # voxel_size_um = 8.0
-# seed_patch_id = None
 
 cache_path = '../cache'
 downsample_factor = 4
@@ -104,9 +101,6 @@ default_config = {
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
     'loss_start_patch_dt': 9000,
-    'working_set_mode': 'global',  # 'progressive' (grow from a seed when satisfied) | 'progressive_fixed' (grow from a seed on a fixed iteration schedule) | 'global' (fit all patches at once)
-    'working_set_check_interval': 10,
-    'progressive_fixed_add_interval': 50,
     'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
@@ -543,55 +537,6 @@ def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | Non
     run_ends = np.where(diff == -1)[0] - 1
     run_idx = np.searchsorted(run_starts, idx, side='right') - 1
     return run_starts[run_idx], run_ends[run_idx] + 1
-
-
-def _min_pair_distance(a, b):
-    # Minimum pairwise distance between two point clouds (each [N, 3]).
-    return torch.cdist(a, b).min()
-
-
-def _build_progressive_patch_order(patches, seed_patch_idx, num_sample_points=500):
-    # Greedy nearest-to-active ordering: starting from seed_patch_idx, repeatedly add the
-    # not-yet-active patch with the smallest min-pairwise distance to its closest active patch.
-    device = torch.device('cuda')
-    samples = []
-    for patch in patches:
-        valid_zyxs = patch.valid_zyxs.to(device=device, dtype=torch.float32)
-        if valid_zyxs.shape[0] > num_sample_points:
-            idx = torch.randperm(valid_zyxs.shape[0], device=device)[:num_sample_points]
-            valid_zyxs = valid_zyxs[idx]
-        samples.append(valid_zyxs)
-
-    n = len(patches)
-    active = np.zeros(n, dtype=bool)
-    min_dist = np.full(n, np.inf, dtype=np.float64)
-    active[seed_patch_idx] = True
-    min_dist[seed_patch_idx] = -np.inf
-
-    order = [seed_patch_idx]
-    last_added_pts = samples[seed_patch_idx]
-    for _ in tqdm(range(n - 1), desc='ordering patches'):
-        for i in range(n):
-            if active[i]:
-                continue
-            d = float(_min_pair_distance(samples[i], last_added_pts).item())
-            if d < min_dist[i]:
-                min_dist[i] = d
-        next_idx = int(np.argmin(np.where(active, np.inf, min_dist)))
-        order.append(next_idx)
-        active[next_idx] = True
-        min_dist[next_idx] = -np.inf
-        last_added_pts = samples[next_idx]
-    return order
-
-
-def _get_working_set_probabilities(full_probabilities, working_set_indices):
-    masked = np.zeros_like(full_probabilities)
-    masked[working_set_indices] = full_probabilities[working_set_indices]
-    total = masked.sum()
-    if total <= 0:
-        raise ValueError('Working set has zero total sampling probability')
-    return masked / total
 
 
 def _prepare_patch_sampling_cache(patches, patch_loss_z_margin):
@@ -1494,7 +1439,7 @@ def get_face_indices(h, w):
 
 
 @torch.inference_mode
-def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches, unattached_pcl_strips=()):
+def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips=()):
     """Returns (min_winding_idx, max_winding_idx) — inclusive min and exclusive max
     integer winding indices covered by the given patches' in-ROI valid quad centers
     and by in-ROI unattached pcl points. Winding indices are computed by transforming
@@ -1521,7 +1466,7 @@ def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, working
             spiral_pieces.append(slice_to_spiral_transform(zyxs[start:start + chunk]))
         return torch.cat(spiral_pieces, dim=0) if len(spiral_pieces) > 1 else spiral_pieces[0]
 
-    for patch in working_set_patches:
+    for patch in patches:
         patch_zyxs = patch.zyxs.to(device=device, dtype=torch.float32)
         if patch_zyxs.shape[0] < 2 or patch_zyxs.shape[1] < 2:
             continue
@@ -1756,9 +1701,9 @@ def _build_snapped_overlay(
 
 
 @torch.inference_mode
-def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, unattached_pcl_strips, out_path, name='mesh'):
+def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips, out_path, name='mesh'):
 
-    min_winding_idx, max_winding_idx = _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches, unattached_pcl_strips)
+    min_winding_idx, max_winding_idx = _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips)
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size'] // downsample_factor  # voxels in downsampled volume
     z_margin = cfg['flow_bounds_z_margin']
@@ -1780,12 +1725,12 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, un
     # flattened-spiral UV coords of its target winding.
     snapped_scroll_zyxs = scroll_zyxs.clone()
     satisfied_patches, _, _, _, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
-        slice_to_spiral_transform, dr_per_winding, working_set_patches,
+        slice_to_spiral_transform, dr_per_winding, patches,
     )
     _build_snapped_overlay(
         snapped_scroll_zyxs, num_thetas_by_winding, z0, grid_spacing,
         slice_to_spiral_transform, dr_per_winding,
-        working_set_patches,
+        patches,
         satisfied_patches, boundary_satisfied_patches, target_winding_idx_per_patch,
     )
 
@@ -1936,7 +1881,7 @@ def save_overlay(
         Image.fromarray(canvas).save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
     def overlay_on_patch_satisfaction(spiral, spiral_zyx, label_map, slice_z, name):
-        # quad_status_flat: 0=patch-and-quad not satisfied, 1=quad-only satisfied, 2=patch overall satisfied, 3=not in working set
+        # quad_status_flat: 0=patch-and-quad not satisfied, 1=quad-only satisfied, 2=patch overall satisfied
         status = quad_status_flat.to(device=spiral.device, dtype=torch.int64)
         label_map = label_map.to(device=spiral.device, dtype=torch.int64)
         num_labels = status.numel()
@@ -1944,7 +1889,6 @@ def save_overlay(
             [200, 0, 0],  # 0: red — quad not satisfied (patch not overall satisfied)
             [230, 140, 0],  # 1: orange — quad satisfied but patch not overall satisfied
             [255, 200, 0],  # 2: yellow — patch overall satisfied
-            [160, 160, 160],  # 3: gray — patch not in working set
         ], dtype=torch.uint8, device=spiral.device)
         colour_table = torch.zeros([num_labels + 1, 3], dtype=torch.uint8, device=spiral.device)
         colour_table[1:] = status_palette[status]
@@ -2037,25 +1981,12 @@ def save_overlay(
         overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path, pass_seed_patch_id, pass_idx=1):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
-    patch_ids = list(patches_dict.keys())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
     num_patches = len(patches_list)
-    is_global_mode = cfg['working_set_mode'] == 'global'
-    is_progressive_fixed_mode = cfg['working_set_mode'] == 'progressive_fixed'
-
-    if is_global_mode:
-        progressive_patch_order = list(range(num_patches))
-        print(f'pass {pass_idx}: global mode — fitting all {num_patches} patches at once')
-    else:
-        if pass_seed_patch_id not in patches_dict:
-            raise KeyError(f'pass_seed_patch_id {pass_seed_patch_id!r} not found among loaded patches')
-        seed_patch_idx = patch_ids.index(pass_seed_patch_id)
-        mode_label = 'progressive_fixed' if is_progressive_fixed_mode else 'progressive'
-        print(f'pass {pass_idx}: building {mode_label} patch ordering from seed {pass_seed_patch_id} ({num_patches} patches in pool)')
-        progressive_patch_order = _build_progressive_patch_order(patches_list, seed_patch_idx)
+    print(f'fitting {num_patches} patches')
 
     num_slices_for_visualisation = 20
     rendering_slices_downsample_factor = 2  # stride the scroll by this along zyx for rendering
@@ -2177,26 +2108,17 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             satisfied_quads_flat = torch.cat([m.flatten() for m in satisfied_quad_masks])
             quads_per_patch = torch.tensor([m.numel() for m in satisfied_quad_masks], dtype=torch.int64)
             overall_satisfied_per_quad = satisfied_patches.to(torch.bool).repeat_interleave(quads_per_patch)
-            in_working_set_per_patch = torch.zeros(len(patches_list), dtype=torch.bool)
-            in_working_set_per_patch[list(working_set_indices)] = True
-            in_working_set_per_quad = in_working_set_per_patch.repeat_interleave(quads_per_patch)
         else:
             satisfied_quads_flat = torch.zeros([0], dtype=torch.bool)
             overall_satisfied_per_quad = torch.zeros([0], dtype=torch.bool)
-            in_working_set_per_quad = torch.zeros([0], dtype=torch.bool)
         quad_status_flat = torch.where(
-            ~in_working_set_per_quad,
-            torch.full_like(satisfied_quads_flat, 3, dtype=torch.int64),
-            torch.where(
-                overall_satisfied_per_quad,
-                torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
-                satisfied_quads_flat.to(torch.int64),
-            ),
+            overall_satisfied_per_quad,
+            torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
+            satisfied_quads_flat.to(torch.int64),
         )
         if os.environ.get('FIT_SPIRAL_SKIP_FITTED_OVERLAY') != '1':
-            working_set_patches_list = [patches_list[i] for i in working_set_indices]
             winding_range = _get_output_winding_range(
-                slice_to_spiral_transform, dr_per_winding, working_set_patches_list, unattached_pcl_strips,
+                slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             )
             save_overlay(
                 spiral_and_transform,
@@ -2209,81 +2131,15 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 winding_range,
                 out_path, suffix
             )
-            save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches_list, unattached_pcl_strips, out_path, name=suffix)
+            save_mesh(slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips, out_path, name=suffix)
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
-
-    working_set_size = num_patches if is_global_mode else 1
-    working_set_indices = progressive_patch_order[:working_set_size]
-    working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
-    working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
-
-    working_set_log = open(f'{out_path}/working-set.txt', 'a', buffering=1)
-    if is_global_mode:
-        print(f'step {start_iteration}: working set initialised with all {num_patches} patches (global mode)')
-        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, global mode ===\n')
-        working_set_log.write(f'step {start_iteration}: initialised with all {num_patches} patches\n')
-    else:
-        mode_label = 'progressive_fixed' if is_progressive_fixed_mode else 'progressive'
-        print(f'step {start_iteration}: working set initialised with {working_set_size}/{num_patches} patches (seed {patch_ids[working_set_indices[0]]}, {mode_label} mode)')
-        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, seed {pass_seed_patch_id}, {mode_label} mode ===\n')
-        working_set_log.write(f'step {start_iteration}: initialised with seed patch {patch_ids[working_set_indices[0]]} (size {working_set_size}/{num_patches})\n')
-
-    # Snapshot of the most recent state at which the working set was fully satisfied —
-    # i.e. the model state taken just before each successful expansion. If the pass
-    # ends without absorbing every candidate, the optimisation phase since the final
-    # expansion is an unsuccessful attempt that may have degraded earlier windings,
-    # so save_outputs() can revert to this snapshot.
-    last_known_good_state = None
-    last_known_good_ws_size = None
-    last_known_good_iteration = None
 
     for iteration in tqdm(range(start_iteration, num_training_steps)):
 
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
-
-        if is_progressive_fixed_mode:
-            should_grow = (
-                working_set_size < num_patches
-                and iteration > start_iteration
-                and iteration % cfg['progressive_fixed_add_interval'] == 0
-            )
-            if should_grow:
-                last_known_good_state = (
-                    copy.deepcopy(spiral_and_transform.state_dict()),
-                    copy.deepcopy(optimiser.state_dict()),
-                )
-                last_known_good_ws_size = working_set_size
-                last_known_good_iteration = iteration
-                working_set_size += 1
-                working_set_indices = progressive_patch_order[:working_set_size]
-                working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
-                working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
-                print(f'step {iteration}: working set grew to {working_set_size}/{num_patches} patches (added {patch_ids[working_set_indices[-1]]}, fixed schedule)')
-                working_set_log.write(f'step {iteration}: added patch {patch_ids[working_set_indices[-1]]} (size {working_set_size}/{num_patches}, fixed schedule)\n')
-        elif (
-            working_set_size < num_patches
-            and iteration > start_iteration
-            and iteration % cfg['working_set_check_interval'] == 0
-        ):
-            with torch.no_grad():
-                working_set_patches_list = [patches_list[i] for i in working_set_indices]
-                working_set_satisfied, *_ = get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, working_set_patches_list)
-            if bool(working_set_satisfied.all().item()):
-                last_known_good_state = (
-                    copy.deepcopy(spiral_and_transform.state_dict()),
-                    copy.deepcopy(optimiser.state_dict()),
-                )
-                last_known_good_ws_size = working_set_size
-                last_known_good_iteration = iteration
-                working_set_size += 1
-                working_set_indices = progressive_patch_order[:working_set_size]
-                working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
-                working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
-                print(f'step {iteration}: working set grew to {working_set_size}/{num_patches} patches (added {patch_ids[working_set_indices[-1]]})')
-                working_set_log.write(f'step {iteration}: added patch {patch_ids[working_set_indices[-1]]} (size {working_set_size}/{num_patches})\n')
 
         losses = {}
 
@@ -2302,7 +2158,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             cfg['num_patches_per_step'],
             cfg['num_patches_per_step_for_dt'],
             patches_list,
-            working_set_probabilities,
+            patch_sampling_probabilities,
             umbilicus_zyx,
             compute_dt=compute_patch_dt,
         )
@@ -2314,13 +2170,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 slice_to_spiral_transform,
                 cfg['regularisation_num_points'],
                 patches_list,
-                working_set_probabilities,
+                patch_sampling_probabilities,
             )
             losses['patch_stretch'] = patch_stretch_loss * cfg['loss_weight_patch_stretch']
             losses['patch_normals'] = patch_normals_loss * cfg['loss_weight_patch_normals']
 
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
-            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, working_set_patches_dict, point_collections) * cfg['loss_weight_winding_number']
+            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections) * cfg['loss_weight_winding_number']
 
         if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
             unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
@@ -2357,34 +2213,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 **{name + '_loss': value for name, value in losses.items()},
             })
 
-    working_set_log.write(f'pass {pass_idx} ended: final working set size {working_set_size}/{num_patches}\n')
-    working_set_log.close()
-
-    working_set_patch_ids = [patch_ids[i] for i in working_set_indices]
-    last_added_patch_id = working_set_patch_ids[-1]
-    pool_fully_absorbed = (working_set_size == num_patches)
-
-    if not pool_fully_absorbed and last_known_good_state is not None:
-        print(f'reverting model state to last-known-good (step {last_known_good_iteration}, working set size {last_known_good_ws_size}) for saving outputs')
-        model_state, opt_state = last_known_good_state
-        spiral_and_transform.load_state_dict(model_state)
-        optimiser.load_state_dict(opt_state)
-        with torch.no_grad():
-            slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
-            dr_per_winding = spiral_and_transform.get_dr_per_winding()
-
-    suffix = 'fitted' if pool_fully_absorbed else f'fitted_p{pass_idx}_ws{working_set_size}'
+    suffix = 'fitted'
     save_overlay_and_print_satisfaction(suffix)
     save_model(suffix)
-
-    return {
-        'working_set_size': working_set_size,
-        'working_set_patch_ids': working_set_patch_ids,
-        'last_added_patch_id': last_added_patch_id,
-        'num_patches': num_patches,
-        'pool_fully_absorbed': pool_fully_absorbed,
-        'progressive_patch_order_ids': [patch_ids[i] for i in progressive_patch_order],
-    }
 
 
 def load_patches(patches_path, segment_id_filter=lambda s: True):
@@ -2550,7 +2381,7 @@ def main():
     )
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch_{cfg["working_set_mode"]}'
+    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
     run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
@@ -2558,82 +2389,14 @@ def main():
         out_path += f'_{run_tag}'
     os.makedirs(out_path, exist_ok=True)
 
-    if cfg['working_set_mode'] == 'global':
-        fit_spiral_3d(
-            scroll_zarr_array,
-            patches,
-            list(cross_patch_point_collections.values()),
-            unattached_pcl_strips,
-            umbilicus,
-            out_path,
-            pass_seed_patch_id=None,
-            pass_idx=1,
-        )
-        return
-
-    if cfg['working_set_mode'] == 'progressive_fixed':
-        fit_spiral_3d(
-            scroll_zarr_array,
-            patches,
-            list(cross_patch_point_collections.values()),
-            unattached_pcl_strips,
-            umbilicus,
-            out_path,
-            pass_seed_patch_id=seed_patch_id,
-            pass_idx=1,
-        )
-        return
-
-    pass_pool_patches = dict(patches)
-    current_seed_patch_id = seed_patch_id
-    pass_idx = 0
-    while True:
-        pass_idx += 1
-        result = fit_spiral_3d(
-            scroll_zarr_array,
-            pass_pool_patches,
-            list(cross_patch_point_collections.values()),
-            unattached_pcl_strips,
-            umbilicus,
-            out_path,
-            pass_seed_patch_id=current_seed_patch_id,
-            pass_idx=pass_idx,
-        )
-
-        ws_size = result['working_set_size']
-        ws_ids = set(result['working_set_patch_ids'])
-        last_added_patch_id = result['last_added_patch_id']
-        progressive_order_ids = result['progressive_patch_order_ids']
-        leftover_ids = [pid for pid in pass_pool_patches if pid not in ws_ids]
-        pool_fully_absorbed = result['pool_fully_absorbed']
-        no_progress = (ws_size <= 1)
-
-        del result
-        torch.cuda.empty_cache()
-
-        if pool_fully_absorbed:
-            print(f'all {len(patches)} patches covered after {pass_idx} pass(es)')
-            break
-
-        if no_progress:
-            # The seed couldn't bootstrap any growth even with a fresh model — drop it
-            # permanently and retry with the next-nearest candidate from this pass's
-            # progressive ordering (= the leftover patch nearest to the failed seed).
-            dropped_seed = current_seed_patch_id
-            next_seed = next((pid for pid in progressive_order_ids[1:] if pid != dropped_seed), None)
-            if next_seed is None:
-                print(f'pass {pass_idx} made no progress and no other candidate seed remains; stopping with {len(leftover_ids)} patches unfit')
-                break
-            next_pool_ids = [pid for pid in pass_pool_patches if pid != dropped_seed]
-            pass_pool_patches = {pid: patches[pid] for pid in next_pool_ids}
-            current_seed_patch_id = next_seed
-            print(f'pass {pass_idx} made no progress; dropping seed {dropped_seed} and retrying with seed {current_seed_patch_id} ({len(next_pool_ids)} candidates remaining)')
-            continue
-
-        next_pool_ids = leftover_ids + [last_added_patch_id]
-        pass_pool_patches = {pid: patches[pid] for pid in next_pool_ids}
-        current_seed_patch_id = last_added_patch_id
-        print(f'starting pass {pass_idx + 1}: {len(next_pool_ids)} candidate patches (seed {current_seed_patch_id})')
+    fit_spiral_3d(
+        scroll_zarr_array,
+        patches,
+        list(cross_patch_point_collections.values()),
+        unattached_pcl_strips,
+        umbilicus,
+        out_path,
+    )
 
 
 if __name__ == '__main__':
