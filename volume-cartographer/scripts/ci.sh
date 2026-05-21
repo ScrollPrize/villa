@@ -22,8 +22,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-IMAGES=(ubuntu-24.04 ubuntu-26.04)
-DOCKERFILES=(ubuntu-24.04-noble.Dockerfile ubuntu-26.04.Dockerfile)
+IMAGES=(ubuntu-26.04)
+DOCKERFILES=(Dockerfile)
 COMPILERS=(gcc clang)
 # Sanitizer presets are clang-only; ci-tests runs both gcc and clang. This
 # mirrors the cells in .github/workflows/vc3d-ci.yml so `ci.sh all` is the
@@ -276,12 +276,7 @@ cmd_all() {
         echo "=== Builder: $image ==="
         cmd_builder "$image"
     done
-    # 24.04: compile-only Release smoke (matches the blocking cells).
-    for compiler in "${COMPILERS[@]}"; do
-        echo "=== ubuntu-24.04: ci-release-$compiler (compile) ==="
-        cmd_compile ubuntu-24.04 "$compiler" ci-release
-    done
-    # 26.04: same Release compile + full test matrix + sanitizers.
+    # 26.04: Release compile + full test matrix + sanitizers.
     for compiler in "${COMPILERS[@]}"; do
         echo "=== ubuntu-26.04: ci-release-$compiler (compile) ==="
         cmd_compile ubuntu-26.04 "$compiler" ci-release
