@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 import model as fit_model
+import opt_loss_winding_density
 import opt_loss_station
 
 
@@ -828,6 +829,33 @@ def _target_quad_bases_around_batched(
 	return torch.cat([base_d, base_hw], dim=-1), in_bounds
 
 
+def _all_valid_target_quad_bases(valid: torch.Tensor) -> torch.Tensor:
+	"""Return every target quad whose four corners are valid."""
+	if valid.ndim == 2:
+		H, W = int(valid.shape[0]), int(valid.shape[1])
+		if H < 2 or W < 2:
+			return torch.empty(0, 2, device=valid.device, dtype=torch.long)
+		quad_ok = (
+			valid[:-1, :-1].bool() &
+			valid[1:, :-1].bool() &
+			valid[:-1, 1:].bool() &
+			valid[1:, 1:].bool()
+		)
+		return quad_ok.nonzero(as_tuple=False)
+	if valid.ndim == 3:
+		D, H, W = int(valid.shape[0]), int(valid.shape[1]), int(valid.shape[2])
+		if D < 1 or H < 2 or W < 2:
+			return torch.empty(0, 3, device=valid.device, dtype=torch.long)
+		quad_ok = (
+			valid[:, :-1, :-1].bool() &
+			valid[:, 1:, :-1].bool() &
+			valid[:, :-1, 1:].bool() &
+			valid[:, 1:, 1:].bool()
+		)
+		return quad_ok.nonzero(as_tuple=False)
+	raise ValueError(f"expected 2D/3D validity mask, got shape {tuple(valid.shape)}")
+
+
 def _quad_valid_at_bases(valid: torch.Tensor, bases: torch.Tensor, in_bounds: torch.Tensor) -> torch.Tensor:
 	if bases.numel() == 0:
 		return torch.zeros(bases.shape[:-1], device=valid.device, dtype=torch.bool)
@@ -987,7 +1015,7 @@ def _closest_point_on_quad_along_normal_batched(
 	q = torch.where(use_first.unsqueeze(-1), q0, q1)
 	line = torch.where(use_first, line0, line1)
 	normal_abs = ((point - q) * n).sum(dim=-1).abs()
-	coord = base_coord.to(dtype=point.dtype).clone()
+	coord = base_coord.to(dtype=point.dtype).expand(*coord_h.shape, int(base_coord.shape[-1])).clone()
 	coord[..., -2] = coord[..., -2] + coord_h
 	coord[..., -1] = coord[..., -1] + coord_w
 	finite = (
@@ -1138,54 +1166,46 @@ def _grow_direction(
 		return stats
 
 	cand_bidx = candidate_mask.nonzero(as_tuple=False)
-	pred, support_count, fallback_pred = _direct_predict_candidates_batched(
+	_, support_count, _ = _direct_predict_candidates_batched(
 		state,
 		valid_b=base_valid,
 		map_b=map_b,
 		candidate_bidx=cand_bidx,
 		radius=cfg.affine_radius,
 	)
-	pred_ok = (support_count >= 1) & torch.isfinite(fallback_pred).all(dim=-1)
-	if not bool(pred_ok.any().detach().cpu()):
+	support_ok = support_count >= 1
+	if not bool(support_ok.any().detach().cpu()):
 		return stats
-	cand_bidx = cand_bidx[pred_ok]
-	pred = pred[pred_ok]
-	fallback_pred = fallback_pred[pred_ok]
+	cand_bidx = cand_bidx[support_ok]
 	C = int(cand_bidx.shape[0])
 	if state.source_rank == 3:
 		source_idx = cand_bidx
 	else:
 		source_idx = cand_bidx[:, 1:]
 	source_pos = _points_at_indices(source_xyz, source_idx)
-	pred_lands_valid = _quad_valid_at_coords(target_valid.bool(), pred, state.target_shape)
-	pred = torch.where(pred_lands_valid.unsqueeze(-1), pred, fallback_pred)
 
-	bases, base_in_bounds = _target_quad_bases_around_batched(
-		pred,
-		state.target_shape,
-		search_ring=max(cfg.search_ring, cfg.affine_radius),
-	)
-	if bases.shape[1] == 0:
+	bases = _all_valid_target_quad_bases(target_valid.bool())
+	if int(bases.shape[0]) == 0:
 		return stats
-	quad_ok = _quad_valid_at_bases(target_valid.bool(), bases, base_in_bounds)
 	p00, p10, p01, p11 = _quad_corners_batched(target_xyz, bases)
+	K = int(bases.shape[0])
 	if normal_from_source:
 		ref_normal = _points_at_indices(normal_xyz, source_idx)
-		ref_normal = F.normalize(ref_normal, dim=-1, eps=1.0e-8)[:, None, :].expand_as(p00)
+		ref_normal = F.normalize(ref_normal, dim=-1, eps=1.0e-8)[:, None, :].expand(C, K, -1)
 	else:
 		ref_normal = _quad_average_normal_batched(normal_xyz, bases)
-	base_coord = bases.to(dtype=map_b.dtype)
+		ref_normal = ref_normal.unsqueeze(0).expand(C, K, -1)
+	base_coord = bases.to(dtype=map_b.dtype).unsqueeze(0).expand(C, K, -1)
 	coord, line_score, normal_abs = _closest_point_on_quad_along_normal_batched(
-		source_pos[:, None, :].expand_as(p00),
+		source_pos[:, None, :],
 		ref_normal,
-		p00,
-		p10,
-		p01,
-		p11,
+		p00.unsqueeze(0),
+		p10.unsqueeze(0),
+		p01.unsqueeze(0),
+		p11.unsqueeze(0),
 		base_coord,
 	)
 	valid_choice = (
-		quad_ok &
 		torch.isfinite(source_pos).all(dim=-1)[:, None] &
 		torch.isfinite(line_score) &
 		torch.isfinite(normal_abs) &
@@ -1611,6 +1631,274 @@ def _direction_loss_ext_to_model(
 	return loss, int(values_f.numel()), stats
 
 
+def _seed_model_region_mask(
+	*,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	seed_quad: tuple[int, int, int] | None,
+	radius: int,
+) -> torch.Tensor:
+	if seed_quad is None:
+		return torch.zeros_like(model_valid, dtype=torch.bool)
+	D, H, W = (int(v) for v in model_valid.shape)
+	d0, h0, w0 = (int(v) for v in seed_quad)
+	r = int(radius)
+	dd = torch.arange(D, device=model_valid.device).view(D, 1, 1)
+	hh = torch.arange(H, device=model_valid.device).view(1, H, 1)
+	ww = torch.arange(W, device=model_valid.device).view(1, 1, W)
+	region = (
+		(dd == d0) &
+		(hh >= h0 - r) &
+		(hh <= h0 + 1 + r) &
+		(ww >= w0 - r) &
+		(ww <= w0 + 1 + r)
+	)
+	normal_ok = (
+		torch.isfinite(model_normals).all(dim=-1) &
+		(model_normals.norm(dim=-1) > 1.0e-8)
+	)
+	return model_valid.bool() & normal_ok & region
+
+
+def _valid_ext_quad_bases(ext_valid: torch.Tensor, ext_quad_valid: torch.Tensor) -> torch.Tensor:
+	H, W = int(ext_valid.shape[0]), int(ext_valid.shape[1])
+	if H < 2 or W < 2:
+		return torch.empty(0, 2, device=ext_valid.device, dtype=torch.long)
+	corner_quad_valid = (
+		ext_valid[:-1, :-1].bool() &
+		ext_valid[1:, :-1].bool() &
+		ext_valid[:-1, 1:].bool() &
+		ext_valid[1:, 1:].bool()
+	)
+	if tuple(ext_quad_valid.shape) == tuple(corner_quad_valid.shape):
+		corner_quad_valid = corner_quad_valid & ext_quad_valid.bool()
+	return corner_quad_valid.nonzero(as_tuple=False)
+
+
+def _intersect_model_points_with_ext_surface(
+	*,
+	source_pos: torch.Tensor,
+	source_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | float]]:
+	C = int(source_pos.shape[0])
+	device = source_pos.device
+	dtype = source_pos.dtype
+	coords_empty = torch.empty(C, 2, device=device, dtype=dtype)
+	accepted_empty = torch.zeros(C, device=device, dtype=torch.bool)
+	stats: dict[str, int | float] = {
+		"target_hit": 0,
+		"distance_hit": 0,
+		"accepted": 0,
+		"tested": 0,
+		"line_err_sum": 0.0,
+		"line_err_max": 0.0,
+	}
+	if C == 0:
+		return coords_empty, accepted_empty, stats
+
+	bases = _valid_ext_quad_bases(ext_valid, ext_quad_valid)
+	K = int(bases.shape[0])
+	stats["tested"] = C * K
+	if K == 0:
+		return coords_empty, accepted_empty, stats
+
+	p00, p10, p01, p11 = _quad_corners_batched(ext_xyz, bases)
+	n = F.normalize(source_normals, dim=-1, eps=1.0e-8)
+	O = source_pos[:, None, :]
+	N = n[:, None, :]
+	P00 = p00.unsqueeze(0)
+	P10 = p10.unsqueeze(0)
+	P01 = p01.unsqueeze(0)
+	P11 = p11.unsqueeze(0)
+	hint = torch.full((C, K), 0.5, device=device, dtype=dtype)
+	u, v = opt_loss_winding_density.ray_bilinear_intersect_refined(
+		O,
+		N,
+		P00,
+		P10,
+		P01,
+		P11,
+		hint,
+		hint,
+		passes=2,
+	)
+	a = P10 - P00
+	b = P01 - P00
+	c = P11 - P10 - P01 + P00
+	q = P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
+	delta = q - O
+	signed = (delta * N).sum(dim=-1)
+	abs_signed = signed.abs()
+	line_delta = delta - signed.unsqueeze(-1) * N
+	line_err = line_delta.norm(dim=-1)
+	finite = (
+		torch.isfinite(source_pos).all(dim=-1)[:, None] &
+		torch.isfinite(n).all(dim=-1)[:, None] &
+		(n.norm(dim=-1) > 1.0e-8)[:, None] &
+		torch.isfinite(q).all(dim=-1) &
+		torch.isfinite(u) &
+		torch.isfinite(v) &
+		torch.isfinite(abs_signed) &
+		torch.isfinite(line_err)
+	)
+	uv_tol = 1.0e-4
+	uv_ok = (
+		(u >= -uv_tol) & (u <= 1.0 + uv_tol) &
+		(v >= -uv_tol) & (v <= 1.0 + uv_tol)
+	)
+	hit = finite & uv_ok
+	has_hit = hit.any(dim=1)
+	stats["target_hit"] = int(has_hit.sum().detach().cpu())
+	if not bool(has_hit.any().detach().cpu()):
+		return coords_empty, accepted_empty, stats
+
+	score = torch.where(hit, abs_signed, torch.full_like(abs_signed, float("inf")))
+	best_k = torch.argmin(score, dim=1)
+	row = torch.arange(C, device=device)
+	best_dist = score[row, best_k]
+	best_line_err = line_err[row, best_k]
+	accepted = has_hit & torch.isfinite(best_dist)
+	stats["distance_hit"] = int(accepted.sum().detach().cpu())
+	stats["accepted"] = int(accepted.sum().detach().cpu())
+	best_bases = bases[best_k].to(dtype=dtype)
+	best_u = u[row, best_k].clamp(0.0, 1.0)
+	best_v = v[row, best_k].clamp(0.0, 1.0)
+	coords = best_bases + torch.stack([best_u, best_v], dim=-1)
+	coords = torch.where(accepted.unsqueeze(-1), coords, torch.full_like(coords, float("nan")))
+	if bool(accepted.any().detach().cpu()):
+		err = best_line_err[accepted].detach()
+		stats["line_err_sum"] = float(err.sum().cpu())
+		stats["line_err_max"] = float(err.max().cpu())
+	return coords, accepted, stats
+
+
+def _rebuild_model_to_ext_rays(
+	state: _SurfaceState,
+	*,
+	model_xyz_det: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals_det: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	seed_xyz: tuple[float, float, float],
+) -> tuple[bool, float, dict[str, int | float], int]:
+	stats = _empty_grow_stats()
+	stats["tested"] = 0
+	stats["line_err_sum"] = 0.0
+	stats["line_err_max"] = 0.0
+	_clear_direction_state(state.model_to_ext)
+	_clear_direction_state(state.ext_to_model)
+	state.ext_to_model.seed_base_idx = None
+	seed = torch.tensor(seed_xyz, device=model_xyz_det.device, dtype=model_xyz_det.dtype)
+	seed_quad, seed_model_dist = _closest_model_surface_quad(
+		point=seed,
+		model_xyz=model_xyz_det,
+		model_valid=model_valid,
+	)
+	state.model_to_ext.seed_base_idx = seed_quad
+	state.model_to_ext.orientation_sign = 1
+	if seed_quad is None:
+		return False, float("inf"), stats, 0
+
+	source_mask = _seed_model_region_mask(
+		model_valid=model_valid,
+		model_normals=model_normals_det,
+		seed_quad=seed_quad,
+		radius=cfg.seed_radius,
+	)
+	source_idx = source_mask.nonzero(as_tuple=False)
+	source_possible = int(source_idx.shape[0])
+	stats["ring"] = source_possible
+	stats["sup"] = source_possible
+	if source_possible == 0:
+		return True, seed_model_dist, stats, 0
+
+	source_pos = _points_at_indices(model_xyz_det, source_idx)
+	source_normals = _points_at_indices(model_normals_det, source_idx)
+	coords, accepted, ray_stats = _intersect_model_points_with_ext_surface(
+		source_pos=source_pos,
+		source_normals=source_normals,
+		ext_xyz=ext_xyz,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		cfg=cfg,
+	)
+	stats["tgt"] = int(ray_stats.get("target_hit", 0))
+	stats["dist"] = int(ray_stats.get("distance_hit", 0))
+	stats["grid"] = int(ray_stats.get("accepted", 0))
+	stats["ori"] = int(ray_stats.get("accepted", 0))
+	stats["new"] = int(ray_stats.get("accepted", 0))
+	stats["tested"] = int(ray_stats.get("tested", 0))
+	stats["gerr_n"] = int(ray_stats.get("accepted", 0))
+	stats["gerr_sum"] = float(ray_stats.get("line_err_sum", 0.0))
+	stats["gerr_max"] = float(ray_stats.get("line_err_max", 0.0))
+	if state.model_to_ext.map is not None and state.model_to_ext.valid is not None and bool(accepted.any().detach().cpu()):
+		acc_idx = source_idx[accepted]
+		state.model_to_ext.map[acc_idx[:, 0], acc_idx[:, 1], acc_idx[:, 2]] = coords[accepted].to(dtype=state.model_to_ext.map.dtype)
+		state.model_to_ext.valid[acc_idx[:, 0], acc_idx[:, 1], acc_idx[:, 2]] = True
+		state.model_to_ext.map[~state.model_to_ext.valid] = float("nan")
+	return True, seed_model_dist, stats, source_possible
+
+
+def _direction_loss_model_ray_to_ext(
+	state: _DirectionState,
+	*,
+	model_xyz: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, dict[str, float]]:
+	device = model_xyz.device
+	dtype = model_xyz.dtype
+	lm = torch.zeros(model_xyz.shape[:3], device=device, dtype=dtype)
+	mask = torch.zeros(model_xyz.shape[:3], device=device, dtype=dtype)
+	if state.map is None or state.valid is None or state.count() == 0:
+		z = model_xyz.new_zeros(())
+		return z, lm.unsqueeze(1), mask.unsqueeze(1), 0, _empty_residual_stats()
+	idx = state.valid.nonzero(as_tuple=False)
+	all_coords = state.map[state.valid]
+	coord_ok = torch.isfinite(all_coords).all(dim=-1) & _quad_valid_at_coords(
+		ext_valid.bool(),
+		all_coords,
+		tuple(int(v) for v in ext_xyz.shape[:2]),
+	)
+	if not bool(coord_ok.any().detach().cpu()):
+		return model_xyz.new_zeros(()), lm.unsqueeze(1), mask.unsqueeze(1), 0, _empty_residual_stats()
+	idx = idx[coord_ok]
+	coords = all_coords[coord_ok]
+	src = _points_at_indices(model_xyz, idx)
+	tgt = _sample_surface_grid(ext_xyz, coords).detach()
+	n_raw = _points_at_indices(model_normals.detach(), idx)
+	n = F.normalize(n_raw, dim=-1, eps=1.0e-8)
+	raw_residual = ((src - tgt) * n).sum(dim=-1)
+	residual = raw_residual / cfg.distance_scale
+	values = _huber(residual, delta=cfg.huber_delta / cfg.distance_scale)
+	finite = (
+		torch.isfinite(src).all(dim=-1) &
+		torch.isfinite(tgt).all(dim=-1) &
+		torch.isfinite(n_raw).all(dim=-1) &
+		torch.isfinite(n).all(dim=-1) &
+		(n.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(raw_residual) &
+		torch.isfinite(values)
+	)
+	values_f = values[finite]
+	loss = values_f.mean() if values_f.numel() else model_xyz.new_zeros(())
+	if bool(finite.any().detach().cpu()):
+		lm_idx = idx[finite]
+		lm[lm_idx[:, 0], lm_idx[:, 1], lm_idx[:, 2]] = values_f.detach()
+		mask[lm_idx[:, 0], lm_idx[:, 1], lm_idx[:, 2]] = 1.0
+	stats = _residual_stats(raw_residual, residual, delta=cfg.huber_delta / cfg.distance_scale)
+	return loss, lm.unsqueeze(1), mask.unsqueeze(1), int(values_f.numel()), stats
+
+
 def _surface_records_from_res(res: fit_model.FitResult3D) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
 	records = getattr(res, "ext_surfaces", None)
 	if records is not None:
@@ -1782,7 +2070,10 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	if not records:
 		raise RuntimeError("snap_surf requires at least one external_surfaces entry")
 
+	if res.normals is None:
+		raise RuntimeError("snap_surf requires model normals")
 	model_xyz_det = res.xyz_lr.detach()
+	model_normals_det = res.normals.detach()
 	model_valid = torch.isfinite(model_xyz_det).all(dim=-1)
 
 	while len(_states) < len(records):
@@ -1819,11 +2110,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		"_snaps_res_abs_max": 0.0,
 		"_snaps_toward_sum": 0.0,
 	}
-	debug_burst = _debug_step is not None and _debug_step > 0 and (_debug_step % 100) == 0
-	debug_grow = _empty_grow_stats()
-	debug_iters = 0
 	total_model_possible = 0
-	total_ext_possible = 0
 
 	for si, (ext_xyz, ext_valid, ext_normals, ext_quad_valid) in enumerate(records):
 		state = _states[si]
@@ -1831,12 +2118,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		ext_valid = ext_valid.to(device=device).bool()
 		ext_normals = ext_normals.to(device=device, dtype=dtype).detach()
 		ext_quad_valid = ext_quad_valid.to(device=device).bool()
-		ext_valid = (
-			ext_valid &
-			torch.isfinite(ext_xyz).all(dim=-1) &
-			torch.isfinite(ext_normals).all(dim=-1) &
-			(ext_normals.norm(dim=-1) > 1.0e-8)
-		)
+		ext_valid = ext_valid & torch.isfinite(ext_xyz).all(dim=-1)
 		if int(ext_valid.shape[0]) > 1 and int(ext_valid.shape[1]) > 1:
 			corner_quad_valid = (
 				ext_valid[:-1, :-1] &
@@ -1854,69 +2136,39 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 			device=device,
 			dtype=dtype,
 		)
-		total_model_possible += int(model_valid.sum().detach().cpu())
-		total_ext_possible += int(ext_valid.sum().detach().cpu())
 
 		with torch.no_grad():
-			_clear_direction_state(state.model_to_ext)
-			_clear_direction_state(state.ext_to_model)
-			seed_inserted, seed_dist, seed_ext_dist = _try_seed_reinsert(
-				state,
-				model_xyz=model_xyz_det,
+			seed = torch.tensor(_seed_xyz, device=device, dtype=dtype)
+			_ext_seed_hw, _ext_seed_point, seed_ext_dist = _closest_external_seed_surface(
+				seed=seed,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_quad_valid=ext_quad_valid,
+			)
+			seed_inserted, seed_dist, grow_m2e, source_possible = _rebuild_model_to_ext_rays(
+				state=state,
+				model_xyz_det=model_xyz_det,
 				model_valid=model_valid,
+				model_normals_det=model_normals_det,
 				ext_xyz=ext_xyz,
 				ext_valid=ext_valid,
 				ext_quad_valid=ext_quad_valid,
 				cfg=cfg,
 				seed_xyz=_seed_xyz,
 			)
+			total_model_possible += int(source_possible)
 			stats["snaps_sdist"] = min(stats["snaps_sdist"], float(seed_dist))
 			stats["snaps_sext"] = min(stats["snaps_sext"], float(seed_ext_dist))
 			if seed_inserted:
 				stats["snaps_seed"] += 1.0
-			max_iters = min(
-				4096,
-				max(
-					1,
-					int(model_xyz_det.shape[1]) + int(model_xyz_det.shape[2]) +
-					int(ext_xyz.shape[0]) + int(ext_xyz.shape[1]),
-				),
-			)
-			grow_i_m2e, grow_m2e = _grow_until_stalled_direction(
-				state.model_to_ext,
-				source_xyz=model_xyz_det,
-				source_valid=model_valid,
-				target_xyz=ext_xyz,
-				target_valid=ext_valid,
-				normal_xyz=ext_normals,
-				normal_from_source=False,
-				cfg=cfg,
-				max_iters=max_iters,
-			)
-			grow_i_e2m, grow_e2m = _grow_until_stalled_direction(
-				state.ext_to_model,
-				source_xyz=ext_xyz,
-				source_valid=ext_valid,
-				target_xyz=model_xyz_det,
-				target_valid=model_valid,
-				normal_xyz=ext_normals,
-				normal_from_source=True,
-				cfg=cfg,
-				max_iters=max_iters,
-			)
 			for k in ("ring", "sup", "tgt", "dist", "grid", "ori", "new"):
-				stats[f"snaps_{k}"] += float(grow_m2e.get(k, 0) + grow_e2m.get(k, 0))
-			stats["_snaps_gerr_n"] += float(grow_m2e.get("gerr_n", 0) + grow_e2m.get("gerr_n", 0))
-			stats["_snaps_gerr_sum"] += float(grow_m2e.get("gerr_sum", 0.0) + grow_e2m.get("gerr_sum", 0.0))
+				stats[f"snaps_{k}"] += float(grow_m2e.get(k, 0))
+			stats["_snaps_gerr_n"] += float(grow_m2e.get("gerr_n", 0))
+			stats["_snaps_gerr_sum"] += float(grow_m2e.get("gerr_sum", 0.0))
 			stats["_snaps_gerr_max"] = max(
 				stats["_snaps_gerr_max"],
 				float(grow_m2e.get("gerr_max", 0.0)),
-				float(grow_e2m.get("gerr_max", 0.0)),
 			)
-			if debug_burst:
-				debug_iters = max(debug_iters, int(grow_i_m2e), int(grow_i_e2m))
-				_add_grow_stats(debug_grow, grow_m2e)
-				_add_grow_stats(debug_grow, grow_e2m)
 			_debug_write_snap_objs(
 				cfg=cfg,
 				surface_index=si,
@@ -1928,35 +2180,23 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				state=state,
 			)
 
-		l_m2e, lm_m2e, mask_m2e, n_m2e, rs_m2e = _direction_loss_model_to_ext(
+		l_m2e, lm_m2e, mask_m2e, n_m2e, rs_m2e = _direction_loss_model_ray_to_ext(
 			state.model_to_ext,
 			model_xyz=res.xyz_lr,
+			model_normals=model_normals_det,
 			ext_xyz=ext_xyz,
 			ext_valid=ext_valid,
-			ext_normals=ext_normals,
 			cfg=cfg,
 		)
-		l_e2m, n_e2m, rs_e2m = _direction_loss_ext_to_model(
-			state.ext_to_model,
-			model_xyz=res.xyz_lr,
-			model_valid=model_valid,
-			ext_normals=ext_normals,
-			ext_xyz=ext_xyz,
-			cfg=cfg,
-		)
-		for rs in (rs_m2e, rs_e2m):
-			stats["_snaps_res_n"] += float(rs.get("n", 0.0))
-			stats["_snaps_res_sum"] += float(rs.get("sum", 0.0))
-			stats["_snaps_res_abs_sum"] += float(rs.get("abs_sum", 0.0))
-			stats["_snaps_res_abs_max"] = max(stats["_snaps_res_abs_max"], float(rs.get("abs_max", 0.0)))
-			stats["_snaps_toward_sum"] += float(rs.get("toward_sum", 0.0))
+		stats["_snaps_res_n"] += float(rs_m2e.get("n", 0.0))
+		stats["_snaps_res_sum"] += float(rs_m2e.get("sum", 0.0))
+		stats["_snaps_res_abs_sum"] += float(rs_m2e.get("abs_sum", 0.0))
+		stats["_snaps_res_abs_max"] = max(stats["_snaps_res_abs_max"], float(rs_m2e.get("abs_max", 0.0)))
+		stats["_snaps_toward_sum"] += float(rs_m2e.get("toward_sum", 0.0))
 		stats["snaps_m2e"] += float(n_m2e)
-		stats["snaps_e2m"] += float(n_e2m)
 		w_m2e = cfg.w_to_ext if n_m2e > 0 else 0.0
-		w_e2m = cfg.w_to_model if n_e2m > 0 else 0.0
-		w_sum = w_m2e + w_e2m
-		if w_sum > 0.0:
-			total = total + (w_m2e * l_m2e + w_e2m * l_e2m) / w_sum
+		if w_m2e > 0.0:
+			total = total + l_m2e
 			total_weight += 1.0
 		lm_accum = lm_accum + lm_m2e
 		mask_accum = (mask_accum + mask_m2e).clamp(max=1.0)
@@ -1966,7 +2206,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	if not bool(torch.isfinite(total.detach()).all().cpu()):
 		raise RuntimeError(f"snap_surf produced non-finite loss: stats={stats}")
 	stats["snaps_m2e"] = _safe_frac(stats["snaps_m2e"], total_model_possible)
-	stats["snaps_e2m"] = _safe_frac(stats["snaps_e2m"], total_ext_possible)
+	stats["snaps_e2m"] = 0.0
 	stats["snaps_seed"] = _safe_frac(stats["snaps_seed"], len(records))
 	gerr_n = stats.pop("_snaps_gerr_n")
 	gerr_sum = stats.pop("_snaps_gerr_sum")
@@ -1987,11 +2227,5 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	stats["snaps_rabs"] = _safe_frac(res_abs_sum, res_n)
 	stats["snaps_rmax"] = float(res_abs_max)
 	stats["snaps_tow"] = _safe_frac(toward_sum, res_n)
-	if debug_burst:
-		stats["snaps_dbg_iter"] = float(debug_iters)
-		stats["snaps_dbg_ring"] = float(debug_grow.get("ring", 0))
-		stats["snaps_dbg_grid"] = float(debug_grow.get("grid", 0))
-		stats["snaps_dbg_ori"] = float(debug_grow.get("ori", 0))
-		stats["snaps_dbg_new"] = float(debug_grow.get("new", 0))
 	_last_stats = stats
 	return total, (lm_accum,), (mask_accum,)

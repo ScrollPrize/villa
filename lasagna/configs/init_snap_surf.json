@@ -76,7 +76,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 500,
+			"steps": 1,
 			"lr": 0.01,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,

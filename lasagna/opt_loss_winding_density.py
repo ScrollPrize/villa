@@ -141,6 +141,98 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 EXT_OFFSET_USE_GT_NORMALS = False
 
 
+def ray_bilinear_intersect_refined(
+	O: torch.Tensor,
+	n: torch.Tensor,
+	M00: torch.Tensor,
+	M10: torch.Tensor,
+	M01: torch.Tensor,
+	M11: torch.Tensor,
+	frac_h: torch.Tensor,
+	frac_w: torch.Tensor,
+	*,
+	passes: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Ray-bilinear-patch intersection with robust quad-space root selection.
+
+	This is the same analytic intersection used by the external-offset /
+	winding-density path, but evaluates all three projected quadratic equations
+	and both roots.  This avoids the degenerate-pair failure of the raw helper on
+	planar quads while still returning bilinear quad coordinates.
+	"""
+	eps = 1.0e-12
+	a = M10 - M00
+	b = M01 - M00
+	c = M11 - M10 - M01 + M00
+	g = M00 - O
+
+	def _solve_once(h_hint: torch.Tensor, w_hint: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
+			return vec[..., i] * n[..., j] - vec[..., j] * n[..., i]
+
+		Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
+		Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
+		Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
+		Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
+		qpairs = ((0, 1), (0, 2), (1, 2))
+
+		u_candidates = []
+		for p, q in qpairs:
+			alpha = Ap[p] * Cp[q] - Ap[q] * Cp[p]
+			beta = Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p]
+			gamma = Gp[p] * Bp[q] - Gp[q] * Bp[p]
+			is_linear = alpha.abs() < eps
+			den_quad = 2.0 * alpha + eps * is_linear.to(dtype=alpha.dtype)
+			disc = (beta * beta - 4.0 * alpha * gamma).clamp(min=0.0)
+			sqrt_disc = torch.sqrt(disc + eps)
+			u1 = (-beta + sqrt_disc) / den_quad
+			u2 = (-beta - sqrt_disc) / den_quad
+			u_lin = -gamma / (beta + eps * (beta.abs() < eps).to(dtype=beta.dtype))
+			u_candidates.append(torch.where(is_linear, u_lin, u1))
+			u_candidates.append(torch.where(is_linear, u_lin, u2))
+		u_stack = torch.stack(u_candidates, dim=-1)
+
+		v_candidates = []
+		line_candidates = []
+		hint_candidates = []
+		for i in range(int(u_stack.shape[-1])):
+			u_i = u_stack[..., i]
+			denom_v = [Bp[k] + u_i * Cp[k] for k in range(3)]
+			numer_v = [-(Gp[k] + u_i * Ap[k]) for k in range(3)]
+			abs_dv = [d.abs() for d in denom_v]
+			sel_v0 = (abs_dv[0] >= abs_dv[1]) & (abs_dv[0] >= abs_dv[2])
+			sel_v1 = (~sel_v0) & (abs_dv[1] >= abs_dv[2])
+			dv = torch.where(sel_v0, denom_v[0], torch.where(sel_v1, denom_v[1], denom_v[2]))
+			nv = torch.where(sel_v0, numer_v[0], torch.where(sel_v1, numer_v[1], numer_v[2]))
+			v_i = nv / (dv + eps * (dv.abs() < eps).to(dtype=dv.dtype))
+			q_i = M00 + u_i.unsqueeze(-1) * a + v_i.unsqueeze(-1) * b + (u_i * v_i).unsqueeze(-1) * c
+			delta = q_i - O
+			nn = n / (n.norm(dim=-1, keepdim=True) + 1.0e-8)
+			signed = (delta * nn).sum(dim=-1)
+			line = (delta - signed.unsqueeze(-1) * nn).square().sum(dim=-1)
+			hint = (u_i - h_hint).square() + (v_i - w_hint).square()
+			v_candidates.append(v_i)
+			line_candidates.append(line)
+			hint_candidates.append(hint)
+
+		v_stack = torch.stack(v_candidates, dim=-1)
+		line_stack = torch.stack(line_candidates, dim=-1)
+		hint_stack = torch.stack(hint_candidates, dim=-1)
+		finite = torch.isfinite(u_stack) & torch.isfinite(v_stack) & torch.isfinite(line_stack)
+		score = torch.where(finite, line_stack + hint_stack * 1.0e-9, torch.full_like(line_stack, float("inf")))
+		best = torch.argmin(score, dim=-1)
+		u = torch.gather(u_stack, -1, best.unsqueeze(-1)).squeeze(-1)
+		v = torch.gather(v_stack, -1, best.unsqueeze(-1)).squeeze(-1)
+		return u, v
+
+	u, v = _solve_once(frac_h, frac_w)
+	for _ in range(max(0, int(passes) - 1)):
+		u_hint = torch.where(torch.isfinite(u), u, frac_h)
+		v_hint = torch.where(torch.isfinite(v), v, frac_w)
+		u, v = _solve_once(u_hint, v_hint)
+	return u, v
+
+
 def _ext_offset_oob_sentinel(*, res: fit_model.FitResult3D, channel: str = "grad_mag") -> torch.Tensor:
 	device = res.xyz_lr.device
 	dtype = res.xyz_lr.dtype

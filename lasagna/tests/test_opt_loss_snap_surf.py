@@ -148,9 +148,8 @@ class SnapSurfMapperTest(unittest.TestCase):
 		state = opt_loss_snap_surf._states[0]
 
 		self.assertEqual(state.model_to_ext.count(), 4)
-		self.assertEqual(state.ext_to_model.count(), 4)
+		self.assertEqual(state.ext_to_model.count(), 0)
 		self.assertTrue(torch.allclose(state.model_to_ext.map[0, 0, 0], torch.tensor([0.0, 0.0])))
-		self.assertTrue(torch.allclose(state.ext_to_model.map[0, 0], torch.tensor([0.0, 0.0, 0.0])))
 		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sdist"], 0.0, places=6)
 		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sext"], 0.0, places=6)
 
@@ -164,9 +163,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		state = opt_loss_snap_surf._states[0]
 
 		self.assertEqual(state.model_to_ext.count(), 4)
-		self.assertEqual(state.ext_to_model.count(), 4)
-		self.assertEqual(state.model_to_ext.orientation_sign, -1)
-		self.assertEqual(state.ext_to_model.orientation_sign, -1)
+		self.assertEqual(state.ext_to_model.count(), 0)
 		self.assertTrue(torch.allclose(state.model_to_ext.map[0, 0, 0], torch.tensor([0.0, 1.0])))
 
 	def test_seed_orientation_is_scale_invariant(self) -> None:
@@ -178,10 +175,10 @@ class SnapSurfMapperTest(unittest.TestCase):
 		opt_loss_snap_surf.snap_surf_loss(res=res)
 		state = opt_loss_snap_surf._states[0]
 
-		self.assertEqual(state.model_to_ext.orientation_sign, -1)
-		self.assertEqual(state.ext_to_model.orientation_sign, -1)
+		self.assertEqual(state.model_to_ext.count(), 4)
+		self.assertEqual(state.ext_to_model.count(), 0)
 
-	def test_seed_orientation_matches_growth_affine_convention(self) -> None:
+	def test_seed_region_rays_replace_growth_affine_convention(self) -> None:
 		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
 		model_xyz[..., 0] = 1.0 - model_xyz[..., 0]
 		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
@@ -189,25 +186,9 @@ class SnapSurfMapperTest(unittest.TestCase):
 		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
 		state = opt_loss_snap_surf._states[0]
 
-		_, m2e_count, m2e_det = opt_loss_snap_surf._local_affine_predict_batched(
-			state.model_to_ext,
-			valid_b=state.model_to_ext.valid,
-			map_b=state.model_to_ext.map,
-			radius=1,
-			exclude_self=False,
-		)
-		_, e2m_count, e2m_det = opt_loss_snap_surf._local_affine_predict_batched(
-			state.ext_to_model,
-			valid_b=state.ext_to_model.valid.unsqueeze(0),
-			map_b=state.ext_to_model.map.unsqueeze(0),
-			radius=1,
-			exclude_self=False,
-		)
-
-		self.assertGreaterEqual(int(m2e_count[0, 0, 0]), 3)
-		self.assertGreaterEqual(int(e2m_count[0, 0, 0]), 3)
-		self.assertGreater(float(m2e_det[0, 0, 0]) * state.model_to_ext.orientation_sign, 0.0)
-		self.assertGreater(float(e2m_det[0, 0, 0]) * state.ext_to_model.orientation_sign, 0.0)
+		self.assertEqual(state.model_to_ext.count(), 4)
+		self.assertEqual(state.ext_to_model.count(), 0)
+		self.assertTrue(torch.isfinite(state.model_to_ext.map[state.model_to_ext.valid]).all())
 
 	def test_direct_growth_accepts_one_ring_candidates_without_orientation_gate(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
@@ -246,7 +227,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertAlmostEqual(stats["snaps_sdist"], 0.0, places=6)
 		self.assertEqual(opt_loss_snap_surf._states[0].model_to_ext.count(), 4)
 
-	def test_outlier_correspondences_drop_on_next_loss_evaluation(self) -> None:
+	def test_normal_distance_does_not_drop_ray_correspondences(self) -> None:
 		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
 		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
@@ -260,7 +241,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		opt_loss_snap_surf.snap_surf_loss(res=_result(far_model, ext_xyz))
 		state = opt_loss_snap_surf._states[0]
 
-		self.assertEqual(state.model_to_ext.count(), 0)
+		self.assertEqual(state.model_to_ext.count(), 4)
 		self.assertEqual(state.ext_to_model.count(), 0)
 
 	def test_snap_loss_floods_from_seed_quad(self) -> None:
@@ -306,9 +287,8 @@ class SnapSurfMapperTest(unittest.TestCase):
 		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
 		stats = opt_loss_snap_surf.last_stats()
 
-		self.assertGreater(stats["snaps_dbg_iter"], 0)
-		self.assertGreater(stats["snaps_dbg_new"], 0)
-		self.assertEqual(stats["snaps_dbg_grid"], stats["snaps_dbg_ori"])
+		self.assertGreater(stats["snaps_new"], 0)
+		self.assertEqual(stats["snaps_grid"], stats["snaps_ori"])
 		self.assertGreater(opt_loss_snap_surf._states[0].model_to_ext.count(), 12)
 
 	def test_debug_obj_outputs_write_files_in_iteration_dir(self) -> None:
@@ -380,6 +360,28 @@ class SnapSurfMapperTest(unittest.TestCase):
 		)
 
 		self.assertTrue(bool(state.valid[0, 1, 3]))
+
+	def test_growth_bruteforces_target_quads_outside_prediction_window(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
+		state.ensure(source_shape=(1, 3, 3), target_shape=(8, 8), device=torch.device("cpu"), dtype=torch.float32)
+		state.map[0, 1, 1] = torch.tensor([1.0, 1.0])
+		state.valid[0, 1, 1] = True
+		source = _plane_xyz(h=3, w=3, z=0.0).unsqueeze(0)
+		source[0, 1, 2] = torch.tensor([5.4, 5.4, 0.0])
+
+		opt_loss_snap_surf._grow_direction(
+			state,
+			source_xyz=source,
+			source_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			target_xyz=_plane_xyz(h=8, w=8, z=0.0),
+			target_valid=torch.ones(8, 8, dtype=torch.bool),
+			normal_xyz=_normals_3d(1, 3, 3),
+			normal_from_source=True,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(affine_radius=1, search_ring=0),
+		)
+
+		self.assertTrue(bool(state.valid[0, 1, 2]))
+		self.assertTrue(torch.allclose(state.map[0, 1, 2], torch.tensor([5.4, 5.4]), atol=1.0e-3))
 
 	def test_no_orientation_gate_rejects_wrong_handed_growth(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=3, target_rank=2)
@@ -462,7 +464,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 
 		self.assertTrue(bool(state.valid[0, 0, 2]))
 
-	def test_both_directions_produce_model_gradients(self) -> None:
+	def test_model_to_ext_direction_produces_model_gradients(self) -> None:
 		model_xyz = (_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0)).requires_grad_(True)
 		ext_xyz = _plane_xyz(h=3, w=3, z=0.0)
 		res = _result(model_xyz, ext_xyz)
@@ -473,9 +475,8 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertGreater(float(model_xyz.grad.abs().sum()), 0.0)
 		stats = opt_loss_snap_surf.last_stats()
 		self.assertGreater(stats["snaps_m2e"], 0.0)
-		self.assertGreater(stats["snaps_e2m"], 0.0)
+		self.assertEqual(stats["snaps_e2m"], 0.0)
 		self.assertLessEqual(stats["snaps_m2e"], 1.0)
-		self.assertLessEqual(stats["snaps_e2m"], 1.0)
 
 	def test_nonfinite_external_normals_do_not_poison_loss(self) -> None:
 		model_xyz = (_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0)).requires_grad_(True)
