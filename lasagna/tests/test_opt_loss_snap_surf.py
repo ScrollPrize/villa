@@ -753,6 +753,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 					"repair_max_blocks": 2,
 					"repair_lr_mult": 0.5,
 					"repair_w_jac_mult": 8.0,
+					"edge_init_radius": 3,
 				}
 			},
 			seed_xyz=(1.0, 1.0, 0.0),
@@ -769,6 +770,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.repair_max_blocks, 2)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.repair_lr_mult, 0.5)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.repair_w_jac_mult, 8.0)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.edge_init_radius, 3)
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf.configure_snap_surf(
 				cfg={"map_init": {"unknown": 1}},
@@ -842,6 +844,54 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertTrue(mi.done)
 		self.assertTrue(torch.isfinite(mi.uv).all())
 		self.assertGreater(stats["snaps_map_reg"], stats["snaps_map_active"])
+
+	def test_map_init_grow_ignores_inpaint_guess_when_not_dense(self) -> None:
+		state = opt_loss_snap_surf._SurfaceState()
+		H, W = 5, 5
+		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		ww = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		uv = torch.stack([hh, ww], dim=-1)
+		active = torch.zeros(H, W, dtype=torch.bool)
+		active[1:4, 1:4] = True
+		state.map_init.active = active
+		state.map_init.uv = torch.where(active.unsqueeze(-1), uv, torch.full_like(uv, float("nan")))
+		state.map_init.uv_guess = torch.zeros_like(uv)
+		state.map_init.ext_valid = torch.ones(H, W, dtype=torch.bool)
+		state.map_init.model_depth = 0
+		state.map_init.orientation_sign = 1
+
+		added = opt_loss_snap_surf._map_init_grow_once(
+			state,
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+			model_normals=_normals_3d(1, H, W),
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(edge_init_radius=2),
+			),
+		)
+
+		self.assertGreater(added, 0)
+		self.assertTrue(bool(state.map_init.active[0, 2]))
+		self.assertTrue(torch.allclose(state.map_init.uv[0, 2], torch.tensor([0.0, 2.0]), atol=5.0e-4))
+
+	def test_map_init_refresh_skips_inpaint_when_not_dense(self) -> None:
+		state = opt_loss_snap_surf._SurfaceState()
+		state.map_init.active = torch.ones(3, 3, dtype=torch.bool)
+		state.map_init.uv = torch.zeros(3, 3, 2)
+		state.map_init.uv_guess = torch.ones(3, 3, 2)
+
+		opt_loss_snap_surf._map_init_refresh_uv_guess(
+			state,
+			model_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					dense_opt=False,
+					scale_levels=8,
+				),
+			),
+		)
+
+		self.assertIsNone(state.map_init.uv_guess)
+		self.assertEqual(state.map_init.scale_levels_used, 1)
 
 	def test_map_init_inverted_external_normals_choose_negative_sign(self) -> None:
 		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)

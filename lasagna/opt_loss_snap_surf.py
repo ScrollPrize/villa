@@ -30,6 +30,7 @@ class SnapSurfMapInitConfig:
 	repair_w_jac_mult: float = 10.0
 	lr: float = 0.05
 	seed_radius: int = 1
+	edge_init_radius: int = 2
 	w_dist: float = 1.0
 	w_vec_normal: float = 1.0
 	w_surface_normal: float = 1.0
@@ -181,6 +182,7 @@ def configure_snap_surf(
 			f"repair_w_jac_mult={_cfg.map_init.repair_w_jac_mult} "
 			f"lr={_cfg.map_init.lr} "
 			f"seed_radius={_cfg.map_init.seed_radius} "
+			f"edge_init_radius={_cfg.map_init.edge_init_radius} "
 			f"jac_margin={_cfg.map_init.jac_margin}"
 		)
 		for state in _states:
@@ -214,6 +216,7 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			repair_w_jac_mult=float(raw.get("repair_w_jac_mult", defaults.repair_w_jac_mult)),
 			lr=float(raw.get("lr", defaults.lr)),
 			seed_radius=max(0, int(raw.get("seed_radius", defaults.seed_radius))),
+			edge_init_radius=max(1, int(raw.get("edge_init_radius", defaults.edge_init_radius))),
 			w_dist=float(raw.get("w_dist", defaults.w_dist)),
 			w_vec_normal=float(raw.get("w_vec_normal", defaults.w_vec_normal)),
 			w_surface_normal=float(raw.get("w_surface_normal", defaults.w_surface_normal)),
@@ -3086,6 +3089,10 @@ def _map_init_refresh_uv_guess(
 		return
 	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
 	uv_finite = torch.isfinite(state.map_init.uv).all(dim=-1)
+	if not cfg.map_init.dense_opt:
+		state.map_init.uv_guess = None
+		state.map_init.scale_levels_used = 1
+		return
 	if cfg.map_init.dense_opt and bool(uv_finite.all().detach().cpu()):
 		state.map_init.uv_guess = _map_init_clamp_uv(
 			state.map_init.uv.detach(),
@@ -3099,7 +3106,7 @@ def _map_init_refresh_uv_guess(
 			factor=int(cfg.map_init.scale_factor),
 		))
 		return
-	if int(cfg.map_init.scale_levels) <= 1 and not cfg.map_init.dense_opt:
+	if int(cfg.map_init.scale_levels) <= 1:
 		state.map_init.uv_guess = None
 		state.map_init.scale_levels_used = 1
 		return
@@ -3609,14 +3616,20 @@ def _map_init_grow_once(
 		valid_b=active.unsqueeze(0),
 		map_b=uv.unsqueeze(0),
 		candidate_bidx=cand_bidx,
-		radius=max(1, int(mi.seed_radius) + 1),
+		radius=max(1, int(mi.edge_init_radius)),
 	)
 	support_ok = count >= 1
 	if not bool(support_ok.any().detach().cpu()):
 		return 0
 	cand_hw = cand_hw[support_ok]
 	pred = pred[support_ok]
-	if state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(active.shape):
+	local_ok = torch.isfinite(pred).all(dim=-1) & _map_init_model_coord_ok(
+		pred,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		depth=int(depth),
+	)
+	if bool(mi.dense_opt) and state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(active.shape):
 		guess = state.map_init.uv_guess[cand_hw[:, 0], cand_hw[:, 1]]
 		guess_ok = torch.isfinite(guess).all(dim=-1) & _map_init_model_coord_ok(
 			guess,
@@ -3624,15 +3637,10 @@ def _map_init_grow_once(
 			model_normals=model_normals,
 			depth=int(depth),
 		)
-		pred = torch.where(guess_ok.unsqueeze(-1), guess, pred)
-	coord_ok = _map_init_model_coord_ok(
-		pred,
-		model_valid=model_valid,
-		model_normals=model_normals,
-		depth=int(depth),
-	)
-	cand_hw = cand_hw[coord_ok]
-	pred = pred[coord_ok]
+		pred = torch.where(local_ok.unsqueeze(-1), pred, torch.where(guess_ok.unsqueeze(-1), guess, pred))
+		local_ok = local_ok | guess_ok
+	cand_hw = cand_hw[local_ok]
+	pred = pred[local_ok]
 	if int(cand_hw.shape[0]) == 0:
 		return 0
 	active_new = active.clone()
