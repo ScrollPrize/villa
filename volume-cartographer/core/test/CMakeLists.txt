@@ -18,7 +18,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Test)
 #
 # Wraps the add_executable / target_link_libraries / add_test trio. SOURCES
 # defaults to <name>.cpp, LIBS to "doctest::doctest vc_core" (pass LIBS to
-# override, e.g. Qt tests). Appends misc/sanitizer_config.c when any *San is
+# override, e.g. Qt tests). Appends misc/sanitizer_config.cpp when any *San is
 # enabled so __tsan_default_suppressions et al. are present in the test exe
 # itself — otherwise the suppressions only land in the canary/VC3D and never
 # fire for the real tests. VC_TEST_FIXTURES_DIR is baked into every exe.
@@ -35,11 +35,14 @@ function(vc_add_test)
     endif()
     if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN OR VC_ENABLE_LSAN
        OR VC_ENABLE_TYSAN OR VC_ENABLE_NSAN)
-        list(APPEND T_SOURCES "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.c")
+        list(APPEND T_SOURCES "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.cpp")
     endif()
     add_executable(${T_NAME} ${T_SOURCES})
     if(T_LIBS)
         target_link_libraries(${T_NAME} PRIVATE ${T_LIBS})
+    endif()
+    if(VC_USE_PCH AND T_LIBS AND "vc_core" IN_LIST T_LIBS)
+        target_precompile_headers(${T_NAME} REUSE_FROM vc_core)
     endif()
     if(T_INCLUDES)
         target_include_directories(${T_NAME} PRIVATE ${T_INCLUDES})
@@ -67,6 +70,18 @@ vc_add_test(NAME test_segmentation_autosave_state
 vc_add_test(NAME test_segmentation_intersection_invalidation
     LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+# Qt-free data/IO layer.
+vc_add_test(NAME test_point_collections)
+
+# VCCollection shim: verify the on*() hooks still emit Qt signals. Needs the
+# shim TU + its MOC (it isn't built into a lib anymore).
+qt6_wrap_cpp(vccollection_test_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+vc_add_test(NAME test_vccollection_signals
+    SOURCES test_vccollection_signals.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            ${vccollection_test_moc}
+    LIBS doctest::doctest vc_core Qt6::Core Qt6::Test)
 
 vc_add_test(NAME test_quadsurface_save_roundtrip)
 
@@ -128,7 +143,7 @@ endif()
 set(_canary_srcs sanitizer_canary.cpp)
 if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN OR VC_ENABLE_LSAN
    OR VC_ENABLE_TYSAN OR VC_ENABLE_NSAN)
-    list(APPEND _canary_srcs "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.c")
+    list(APPEND _canary_srcs "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.cpp")
 endif()
 add_executable(sanitizer_canary ${_canary_srcs})
 set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)

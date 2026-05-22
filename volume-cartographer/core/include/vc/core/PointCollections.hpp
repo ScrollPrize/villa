@@ -1,0 +1,125 @@
+#pragma once
+
+#include <chrono>
+#include <opencv2/core.hpp>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <cmath>
+#include <optional>
+#include <filesystem>
+
+#include "utils/Json.hpp"
+
+
+struct ColPoint
+{
+    uint64_t id;
+    uint64_t collectionId;
+    cv::Vec3f p = {0,0,0};
+    float winding_annotation = NAN;
+    int64_t creation_time = 0;
+};
+
+struct CollectionMetadata
+{
+    bool absolute_winding_number = true;
+};
+
+// Qt-free point-collection data + IO. VCCollection is a thin QObject subclass
+// that turns the protected onXxx hooks into Qt signals.
+class PointCollections
+{
+public:
+    enum class WindingFillMode {
+        None,
+        Incremental,
+        Decremental,
+        Constant
+    };
+
+    struct Collection
+    {
+        uint64_t id;
+        std::string name;
+        std::unordered_map<uint64_t, ColPoint> points;
+        CollectionMetadata metadata;
+        cv::Vec3f color;
+        std::optional<cv::Vec2f> anchor2d;  // 2D grid anchor for drag-and-drop corrections
+        WindingFillMode autoFillMode = WindingFillMode::None;
+        float autoFillConstant = 0.0f;
+        std::unordered_map<std::string, std::string> tags;
+    };
+
+    PointCollections() = default;
+    virtual ~PointCollections() = default;
+
+    uint64_t addCollection(const std::string& name);
+    ColPoint addPoint(const std::string& collectionName, const cv::Vec3f& point);
+    void addPoints(const std::string& collectionName, const std::vector<cv::Vec3f>& points);
+    void updatePoint(const ColPoint& point);
+    void removePoint(uint64_t pointId);
+
+    void clearCollection(uint64_t collectionId);
+    void clearAll();
+    void renameCollection(uint64_t collectionId, const std::string& newName);
+
+    uint64_t getCollectionId(const std::string& name) const;
+    const std::unordered_map<uint64_t, Collection>& getAllCollections() const;
+    void setCollectionMetadata(uint64_t collectionId, const CollectionMetadata& metadata);
+    void setCollectionColor(uint64_t collectionId, const cv::Vec3f& color);
+    void setCollectionAnchor2d(uint64_t collectionId, const std::optional<cv::Vec2f>& anchor);
+    std::optional<cv::Vec2f> getCollectionAnchor2d(uint64_t collectionId) const;
+    void setCollectionTag(uint64_t collectionId, const std::string& key, const std::string& value);
+    void removeCollectionTag(uint64_t collectionId, const std::string& key);
+    std::optional<std::string> getCollectionTag(uint64_t collectionId, const std::string& key) const;
+    std::optional<ColPoint> getPoint(uint64_t pointId) const;
+    std::vector<ColPoint> getPoints(const std::string& collectionName) const;
+    std::string generateNewCollectionName(const std::string& prefix = "col") const;
+    void autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
+    void setAutoFillMode(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
+    WindingFillMode getAutoFillMode(uint64_t collectionId) const;
+    float getAutoFillConstant(uint64_t collectionId) const;
+    float computeAutoFillValue(uint64_t collectionId) const;
+
+   bool saveToJSON(const std::string& filename) const;
+   bool loadFromJSON(const std::string& filename);
+
+   // Path-based persistence for segment-specific corrections
+   // Only saves collections with anchor2d set (2D anchored points only)
+   bool saveToSegmentPath(const std::filesystem::path& segmentPath) const;
+   bool loadFromSegmentPath(const std::filesystem::path& segmentPath);
+
+   // Apply grid offset to all anchor2d values (for surface growth remapping)
+   void applyAnchorOffset(float offsetX, float offsetY);
+
+protected:
+    // Change hooks; the QObject shim overrides these to emit signals.
+    virtual void onCollectionChanged(uint64_t) {}
+    virtual void onCollectionsAdded(const std::vector<uint64_t>&) {}
+    virtual void onCollectionRemoved(uint64_t) {}
+    virtual void onPointAdded(const ColPoint&) {}
+    virtual void onPointChanged(const ColPoint&) {}
+    virtual void onPointRemoved(uint64_t) {}
+
+private:
+    uint64_t getNextPointId();
+    uint64_t getNextCollectionId();
+
+    std::optional<uint64_t> findCollectionByName(const std::string& name) const;
+    uint64_t findOrCreateCollectionByName(const std::string& name);
+
+    std::unordered_map<uint64_t, Collection> _collections;
+    std::unordered_map<uint64_t, ColPoint> _points;
+    uint64_t _next_point_id = 1;
+    uint64_t _next_collection_id = 1;
+};
+
+void to_json(utils::Json& j, const ColPoint& p);
+void from_json(const utils::Json& j, ColPoint& p);
+
+void to_json(utils::Json& j, const CollectionMetadata& m);
+void from_json(const utils::Json& j, CollectionMetadata& m);
+
+void to_json(utils::Json& j, const PointCollections::Collection& c);
+void from_json(const utils::Json& j, PointCollections::Collection& c);

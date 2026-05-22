@@ -40,6 +40,22 @@ option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on c
 option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
 option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
+option(VC_USE_PCH "Precompile common headers into vc_core; downstream targets REUSE_FROM it" OFF)
+option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
+
+if(VC_USE_CCACHE)
+    find_program(CCACHE_PROGRAM ccache)
+    if(NOT CCACHE_PROGRAM)
+        message(FATAL_ERROR "VC_USE_CCACHE=ON but ccache was not found on PATH.")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
+# PCH and ccache fight (PCH tanks ccache's hit rate). Pick at most one.
+if(VC_USE_PCH AND (VC_USE_CCACHE OR CMAKE_C_COMPILER_LAUNCHER MATCHES "ccache" OR CMAKE_CXX_COMPILER_LAUNCHER MATCHES "ccache"))
+    message(FATAL_ERROR "VC_USE_PCH and ccache are mutually exclusive — disable one.")
+endif()
 
 # Skip building app executables (vc_*, VC3D) when generating coverage:
 # the apps add ~3 GB of debug+coverage-instrumented binaries to the

@@ -205,7 +205,7 @@ int main(int argc, char *argv[])
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
     Json params;
-    VCCollection corrections;
+    PointCollections corrections;
     bool skip_overlap_check = false;
     std::string segment_name;
 

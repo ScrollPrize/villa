@@ -21,7 +21,7 @@ add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)
 
 add_executable(vc_grow_seg_from_seed src/vc_grow_seg_from_seed.cpp)
-target_link_libraries(vc_grow_seg_from_seed vc_core vc_ui vc_tracer Boost::program_options)
+target_link_libraries(vc_grow_seg_from_seed vc_core vc_tracer Boost::program_options)
 
 add_executable(vc_seg_add_overlap src/vc_seg_add_overlap.cpp)
 target_link_libraries(vc_seg_add_overlap vc_core)
@@ -127,10 +127,10 @@ add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
 add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
-target_link_libraries(vc_calc_surface_metrics vc_core vc_ui Boost::program_options)
+target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
 
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
-target_link_libraries(vc_tifxyz_gengt vc_core vc_ui Boost::program_options)
+target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
 set(vc_diffuse_winding_sources
     diffusion/continuous3d.cpp
@@ -145,13 +145,18 @@ set(vc_diffuse_winding_sources
     diffusion/vc_diffuse_winding.cpp
 )
 
-add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources})
+# vc_diffuse_winding constructs a Qt VCCollection, so it compiles the shim
+# directly and links Qt; wrap the header for MOC to emit the vtable.
+qt6_wrap_cpp(vc_diffuse_winding_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources}
+    ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${vc_diffuse_winding_moc})
 target_include_directories(vc_diffuse_winding PRIVATE diffusion)
 target_link_libraries(vc_diffuse_winding
         opencv_videoio
         opencv_ximgproc
         vc_core
-        vc_ui
+        Qt6::Core
         Boost::program_options
         OpenMP::OpenMP_CXX
         Ceres::ceres
@@ -216,40 +221,20 @@ target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core Blosc::blosc)
 
-# Precompiled headers for CLI apps (reuse vc_core's PCH)
+# Reuse vc_core's PCH on the CLI apps that link vc_core. vc_obj_uv_lift and
+# vc_tifxyz_mmap_prepare are omitted — they don't link vc_core (no shared
+# include paths), so REUSE_FROM would fail to compile against them.
 if(VC_USE_PCH)
     foreach(_app
-        vc_render_video
-        vc_render_tifxyz
-        vc_objrefine
-        vc_grow_seg_from_seed
-        vc_seg_add_overlap
-        vc_grow_seg_from_segments
-        vc_tifxyz2obj
-        vc_obj2tifxyz
-        vc_obj2tifxyz_legacy
-        vc_flatten
-        vc_tifxyz_inp_mask
-        vc_tifxyz_trim
-        vc_cut_windings
-        vc_tifxyz_winding
-        vc_tifxyz2zarr_sparse
-        vc_add_ignore_label
-        vc_calc_surface_metrics
-        vc_tifxyz_gengt
-        vc_diffuse_winding
-        vc_tifxyz_mmap_prepare
-        vc_create_segment_mask
-        vc_visualize
-        vc_transform_geom
-        vc_gen_normalgrids
-        vc_ngrids
-        vc_tifxyz2rgb
-        vc_rgb2tifxyz
-        vc_thinning
-        vc_tifxyz
-        vc_project_tifxyz
-        vc_zarr_to_tiff
+        vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
+        vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj
+        vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+        vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
+        vc_cut_windings vc_tifxyz_winding vc_calc_surface_metrics
+        vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
+        vc_merge_tifxyz vc_visualize vc_volpkg_convert vc_transform_geom
+        vc_gen_normalgrids vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning
+        vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress
     )
         target_precompile_headers(${_app} REUSE_FROM vc_core)
     endforeach()

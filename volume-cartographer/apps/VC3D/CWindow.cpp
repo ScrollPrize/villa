@@ -62,7 +62,6 @@
 #include "viewer_controls/ViewerControlsPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
-#include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "CPointCollectionWidget.hpp"

@@ -15,7 +15,8 @@
     {
       "name": "_ci-base",
       "hidden": true,
-      "inherits": "_base"
+      "inherits": "_base",
+      "cacheVariables": { "VC_USE_PCH": "ON" }
     },
     {
       "name": "_dev-base",
