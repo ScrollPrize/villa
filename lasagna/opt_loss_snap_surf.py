@@ -18,6 +18,7 @@ class SnapSurfMapInitConfig:
 	subdiv: int = 4
 	iters: int = 1000
 	grow_opt_iters: int = 100
+	progress_interval: int = 10
 	lr: float = 0.05
 	seed_radius: int = 1
 	w_dist: float = 1.0
@@ -89,6 +90,11 @@ def configure_snap_surf(
 		raise ValueError(f"snap_surf args: unknown key(s): {bad}")
 	default_cfg = SnapSurfConfig()
 	map_init_cfg = _parse_map_init_config(raw.get("map_init", default_cfg.map_init))
+	debug_obj_raw = raw.get("debug_obj_dir", default_cfg.debug_obj_dir)
+	if isinstance(debug_obj_raw, bool):
+		debug_obj_dir = "snap_surf_objs" if debug_obj_raw else None
+	else:
+		debug_obj_dir = None if debug_obj_raw in {None, ""} else str(debug_obj_raw)
 	_cfg = SnapSurfConfig(
 		init_distance=float(raw.get("init_distance", default_cfg.init_distance)),
 		point_distance=float(raw.get("point_distance", default_cfg.point_distance)),
@@ -108,7 +114,7 @@ def configure_snap_surf(
 		w_to_ext=float(raw.get("w_to_ext", default_cfg.w_to_ext)),
 		w_to_model=float(raw.get("w_to_model", default_cfg.w_to_model)),
 		orientation=str(raw.get("orientation", default_cfg.orientation)).strip().lower(),
-		debug_obj_dir=None if raw.get("debug_obj_dir", default_cfg.debug_obj_dir) in {None, ""} else str(raw.get("debug_obj_dir")),
+		debug_obj_dir=debug_obj_dir,
 		debug_obj_interval=max(1, int(raw.get("debug_obj_interval", default_cfg.debug_obj_interval))),
 		map_init=map_init_cfg,
 	)
@@ -154,6 +160,7 @@ def configure_snap_surf(
 			f"subdiv={_cfg.map_init.subdiv} "
 			f"iters={_cfg.map_init.iters} "
 			f"grow_opt_iters={_cfg.map_init.grow_opt_iters} "
+			f"progress_interval={_cfg.map_init.progress_interval} "
 			f"lr={_cfg.map_init.lr} "
 			f"seed_radius={_cfg.map_init.seed_radius} "
 			f"jac_margin={_cfg.map_init.jac_margin}"
@@ -177,6 +184,7 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			subdiv=max(1, int(raw.get("subdiv", defaults.subdiv))),
 			iters=max(0, int(raw.get("iters", defaults.iters))),
 			grow_opt_iters=max(0, int(raw.get("grow_opt_iters", defaults.grow_opt_iters))),
+			progress_interval=max(1, int(raw.get("progress_interval", defaults.progress_interval))),
 			lr=float(raw.get("lr", defaults.lr)),
 			seed_radius=max(0, int(raw.get("seed_radius", defaults.seed_radius))),
 			w_dist=float(raw.get("w_dist", defaults.w_dist)),
@@ -2824,6 +2832,8 @@ def _map_init_empty_stats() -> dict[str, float]:
 		"snaps_map_bend": 0.0,
 		"snaps_map_jac": 0.0,
 		"snaps_map_jmin": 0.0,
+		"snaps_map_samples": 0.0,
+		"snaps_map_uvbad": 0.0,
 		"snaps_map_nsign": 1.0,
 	}
 
@@ -2934,7 +2944,15 @@ def _map_init_jacobian_values(
 	H, W = int(active.shape[0]), int(active.shape[1])
 	if H < 2 or W < 2:
 		return torch.empty(0, device=uv.device, dtype=uv.dtype)
-	cell = active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:]
+	finite_uv = torch.isfinite(uv).all(dim=-1)
+	cell = (
+		active[:-1, :-1] &
+		active[1:, :-1] &
+		active[:-1, 1:] &
+		finite_uv[:-1, :-1] &
+		finite_uv[1:, :-1] &
+		finite_uv[:-1, 1:]
+	)
 	if not bool(cell.any().detach().cpu()):
 		return torch.empty(0, device=uv.device, dtype=uv.dtype)
 	dh = uv[1:, :-1] - uv[:-1, :-1]
@@ -2956,7 +2974,10 @@ def _map_init_jacobian_penalty(
 ) -> torch.Tensor:
 	values = _map_init_jacobian_values(uv, active, orientation_sign=orientation_sign)
 	if values.numel() == 0:
-		return uv.sum() * 0.0
+		finite = uv[torch.isfinite(uv)]
+		if finite.numel():
+			return finite.sum() * 0.0
+		return torch.zeros((), device=uv.device, dtype=uv.dtype)
 	return F.relu(float(jac_margin) - values).square().mean()
 
 
@@ -3002,7 +3023,12 @@ def _map_init_objective(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
-	sample_mask = active.bool() & ext_valid.bool() & torch.isfinite(uv_full).all(dim=-1)
+	uv_finite = torch.isfinite(uv_full).all(dim=-1)
+	active_finite = active.bool() & uv_finite
+	active_count = int(active.bool().sum().detach().cpu())
+	active_bad_count = int((active.bool() & ~uv_finite).sum().detach().cpu())
+	finite_count = 0
+	sample_mask = active_finite & ext_valid.bool()
 	if bool(sample_mask.any().detach().cpu()):
 		uv = uv_full[sample_mask]
 		coords3 = _map_init_coords3(uv, depth=model_depth)
@@ -3043,6 +3069,7 @@ def _map_init_objective(
 			torch.isfinite(norm_values)
 		)
 		if bool(finite.any().detach().cpu()):
+			finite_count = int(finite.sum().detach().cpu())
 			dist_loss = dist_values[finite].mean()
 			vec_loss = vec_values[finite].mean()
 			norm_loss = norm_values[finite].mean()
@@ -3058,16 +3085,16 @@ def _map_init_objective(
 		norm_loss = z
 		dist_avg = z
 
-	uv_safe = torch.where(active.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
+	uv_safe = torch.where(active_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
 	smooth_vals: list[torch.Tensor] = []
 	if int(active.shape[0]) > 1:
-		m = active[1:, :] & active[:-1, :]
+		m = active_finite[1:, :] & active_finite[:-1, :]
 		dv = uv_safe[1:, :] - uv_safe[:-1, :]
 		finite = m & torch.isfinite(dv).all(dim=-1)
 		if bool(finite.any().detach().cpu()):
 			smooth_vals.append(dv.square().sum(dim=-1)[finite])
 	if int(active.shape[1]) > 1:
-		m = active[:, 1:] & active[:, :-1]
+		m = active_finite[:, 1:] & active_finite[:, :-1]
 		dv = uv_safe[:, 1:] - uv_safe[:, :-1]
 		finite = m & torch.isfinite(dv).all(dim=-1)
 		if bool(finite.any().detach().cpu()):
@@ -3076,11 +3103,11 @@ def _map_init_objective(
 
 	if int(active.shape[0]) > 2 and int(active.shape[1]) > 2:
 		m = (
-			active[1:-1, 1:-1] &
-			active[:-2, 1:-1] &
-			active[2:, 1:-1] &
-			active[1:-1, :-2] &
-			active[1:-1, 2:]
+			active_finite[1:-1, 1:-1] &
+			active_finite[:-2, 1:-1] &
+			active_finite[2:, 1:-1] &
+			active_finite[1:-1, :-2] &
+			active_finite[1:-1, 2:]
 		)
 		lap = (
 			uv_safe[:-2, 1:-1] +
@@ -3095,12 +3122,12 @@ def _map_init_objective(
 		bend_loss = z
 
 	jac_loss = _map_init_jacobian_penalty(
-		uv_full,
-		active,
+		uv_safe,
+		active_finite,
 		orientation_sign=orientation_sign,
 		jac_margin=mi.jac_margin,
 	)
-	jac_vals = _map_init_jacobian_values(uv_full, active, orientation_sign=orientation_sign)
+	jac_vals = _map_init_jacobian_values(uv_safe, active_finite, orientation_sign=orientation_sign)
 	jac_min = jac_vals.min() if jac_vals.numel() else z
 	loss = (
 		float(mi.w_dist) * dist_loss +
@@ -3120,6 +3147,9 @@ def _map_init_objective(
 		"jac": jac_loss.detach(),
 		"jac_min": jac_min.detach(),
 		"dist_avg": dist_avg.detach(),
+		"active": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
+		"samples": torch.tensor(float(finite_count), device=uv_full.device, dtype=uv_full.dtype),
+		"uv_bad": torch.tensor(float(active_bad_count), device=uv_full.device, dtype=uv_full.dtype),
 	}
 
 
@@ -3378,7 +3408,10 @@ def _map_init_optimize_block(
 	base_uv = uv.detach().clone()
 	last_terms: dict[str, torch.Tensor] | None = None
 	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
-	for _ in range(int(steps)):
+	requested_steps = int(steps)
+	progress_interval = max(1, int(cfg.map_init.progress_interval))
+	completed = 0
+	for local_iter in range(1, requested_steps + 1):
 		opt.zero_grad(set_to_none=True)
 		uv_full = base_uv.clone()
 		uv_full[active] = param
@@ -3396,17 +3429,64 @@ def _map_init_optimize_block(
 			orientation_sign=state.map_init.orientation_sign,
 			cfg=cfg,
 		)
+		if not bool(torch.isfinite(loss).detach().cpu()):
+			_map_init_log(
+				"opt nonfinite "
+				f"block={state.map_init.opt_blocks + 1} "
+				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
+				f"active={state.map_init.active_count()} "
+				f"uv_bad={float(terms.get('uv_bad', torch.zeros(())).detach().cpu()):.0f} "
+				f"samples={float(terms.get('samples', torch.zeros(())).detach().cpu()):.0f} "
+				f"loss={float(loss.detach().cpu())}"
+			)
+			break
 		loss.backward()
+		if param.grad is not None and not bool(torch.isfinite(param.grad).all().detach().cpu()):
+			_map_init_log(
+				"opt nonfinite_grad "
+				f"block={state.map_init.opt_blocks + 1} "
+				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
+				f"active={state.map_init.active_count()}"
+			)
+			break
+		prev_param = param.detach().clone()
 		opt.step()
 		with torch.no_grad():
 			param[:, 0].clamp_(0.0, float(max(0, H - 1)))
 			param[:, 1].clamp_(0.0, float(max(0, W - 1)))
+			if not bool(torch.isfinite(param).all().detach().cpu()):
+				param.copy_(prev_param)
+				_map_init_log(
+					"opt nonfinite_param "
+					f"block={state.map_init.opt_blocks + 1} "
+					f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
+					f"active={state.map_init.active_count()}"
+				)
+				break
 		last_terms = terms
+		completed += 1
+		if local_iter == 1 or local_iter == requested_steps or (state.map_init.total_iters + local_iter) % progress_interval == 0:
+			_map_init_log(
+				"opt_iter "
+				f"block={state.map_init.opt_blocks + 1} "
+				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
+				f"active={state.map_init.active_count()} "
+				f"samples={float(terms.get('samples', torch.zeros(())).detach().cpu()):.0f} "
+				f"uv_bad={float(terms.get('uv_bad', torch.zeros(())).detach().cpu()):.0f} "
+				f"loss={float(terms.get('loss', torch.zeros(())).detach().cpu()):.6g} "
+				f"dist={float(terms.get('dist', torch.zeros(())).detach().cpu()):.6g} "
+				f"vec={float(terms.get('vec', torch.zeros(())).detach().cpu()):.6g} "
+				f"norm={float(terms.get('norm', torch.zeros(())).detach().cpu()):.6g} "
+				f"smooth={float(terms.get('smooth', torch.zeros(())).detach().cpu()):.6g} "
+				f"bend={float(terms.get('bend', torch.zeros(())).detach().cpu()):.6g} "
+				f"jac={float(terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
+				f"jac_min={float(terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g}"
+			)
 	with torch.no_grad():
 		uv_out = base_uv.clone()
 		uv_out[active] = param.detach()
 		state.map_init.uv = uv_out
-	state.map_init.total_iters += int(steps)
+	state.map_init.total_iters += int(completed)
 	state.map_init.opt_blocks += 1
 	if last_terms is None:
 		uv_full = base_uv.clone()
@@ -3425,6 +3505,9 @@ def _map_init_optimize_block(
 			orientation_sign=state.map_init.orientation_sign,
 			cfg=cfg,
 		)
+	last_terms = dict(last_terms)
+	last_terms["completed"] = torch.tensor(float(completed), device=model_xyz.device, dtype=model_xyz.dtype)
+	last_terms["requested"] = torch.tensor(float(requested_steps), device=model_xyz.device, dtype=model_xyz.dtype)
 	return last_terms
 
 
@@ -3519,16 +3602,22 @@ def _run_map_init_for_surface(
 						cfg=cfg,
 						steps=block,
 					)
+					completed = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
 					_map_init_log(
 						"opt "
 						f"block={state.map_init.opt_blocks} "
 						f"iters={state.map_init.total_iters}/{cfg.map_init.iters} "
 						f"active={state.map_init.active_count()} "
+						f"completed={completed}/{block} "
 						f"loss={float(last_terms.get('loss', torch.zeros(())).detach().cpu()):.6g} "
 						f"dist={float(last_terms.get('dist', torch.zeros(())).detach().cpu()):.6g} "
+						f"samples={float(last_terms.get('samples', torch.zeros(())).detach().cpu()):.0f} "
+						f"uv_bad={float(last_terms.get('uv_bad', torch.zeros(())).detach().cpu()):.0f} "
 						f"jac={float(last_terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
 						f"jac_min={float(last_terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g}"
 					)
+					if completed < block:
+						break
 				if added <= 0 or block <= 0:
 					break
 			if not last_terms and state.map_init.active is not None and state.map_init.uv is not None:
@@ -3555,6 +3644,8 @@ def _run_map_init_for_surface(
 				("bend", "snaps_map_bend"),
 				("jac", "snaps_map_jac"),
 				("jac_min", "snaps_map_jmin"),
+				("samples", "snaps_map_samples"),
+				("uv_bad", "snaps_map_uvbad"),
 			):
 				if key in last_terms:
 					stats[stat_key] = float(last_terms[key].detach().cpu())
@@ -3809,7 +3900,9 @@ def _debug_write_map_init_objs(
 	coords3 = _map_init_coords3(mi.uv, depth=int(mi.model_depth))
 	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
 	mapped = _sample_surface_grid(model_xyz, safe_coords)
-	ok = mi.active.bool() & torch.isfinite(mi.uv).all(dim=-1) & torch.isfinite(mapped).all(dim=-1)
+	uv_ok = mi.active.bool() & torch.isfinite(mi.uv).all(dim=-1)
+	model_ok = uv_ok & _quad_valid_at_coords(model_valid.bool(), safe_coords, tuple(int(v) for v in model_xyz.shape[:3]))
+	ok = model_ok & torch.isfinite(mapped).all(dim=-1)
 	mapped_grid = torch.where(ok.unsqueeze(-1), mapped, torch.full_like(mapped, float("nan")))
 	write_mesh_2d("map_mapped_surface.obj", mapped_grid, ok)
 	if bool(ok.any().detach().cpu()):
@@ -3821,6 +3914,8 @@ def _debug_write_map_init_objs(
 		"obj wrote "
 		f"prefix={prefix!r} "
 		f"active={int(mi.active.sum().detach().cpu())} "
+		f"uv_finite={int(uv_ok.sum().detach().cpu())} "
+		f"model_ok={int(model_ok.sum().detach().cpu())} "
 		f"mapped={int(ok.sum().detach().cpu())} "
 		"files=map_ext_to_model.obj,map_mapped_surface.obj,map_active_mask.obj"
 	)
@@ -3868,7 +3963,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		avg_keys = {
 			"snaps_map_loss", "snaps_map_dist", "snaps_map_vec", "snaps_map_norm",
 			"snaps_map_smooth", "snaps_map_bend", "snaps_map_jac",
-			"snaps_map_jmin", "snaps_map_nsign",
+			"snaps_map_jmin", "snaps_map_samples", "snaps_map_uvbad", "snaps_map_nsign",
 		}
 		for k in avg_keys:
 			stats[k] = 0.0

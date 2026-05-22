@@ -850,6 +850,22 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertAlmostEqual(float(ok_pen.detach()), 0.0, places=6)
 		self.assertGreater(float(flip_pen.detach()), 0.0)
 
+	def test_map_init_jacobian_penalty_empty_cells_ignores_inactive_nans(self) -> None:
+		active = torch.zeros(3, 3, dtype=torch.bool)
+		active[1, 1] = True
+		uv = torch.full((3, 3, 2), float("nan"))
+		uv[1, 1] = torch.tensor([1.0, 1.0])
+
+		pen = opt_loss_snap_surf._map_init_jacobian_penalty(
+			uv,
+			active,
+			orientation_sign=1,
+			jac_margin=0.05,
+		)
+
+		self.assertTrue(torch.isfinite(pen))
+		self.assertAlmostEqual(float(pen.detach()), 0.0, places=6)
+
 	def test_map_init_debug_obj_outputs_write_files(self) -> None:
 		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)

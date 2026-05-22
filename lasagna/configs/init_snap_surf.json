@@ -48,10 +48,11 @@
 		},
 		{
 			"name": "snap",
-			"steps": 1000,
+			"steps": 1,
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
+			"default_mul": 0.0,
 			"w_fac": {
 				"pred_dt": 0.0,
 				"snap_surf": 1.0
@@ -62,12 +63,14 @@
 					"init_distance": 10.0,
 					"w_to_ext": 1.0,
 					"debug_obj_dir": true,
-					"map_inlier_distance": 4.0,
-					"map_init": {
-						"enabled": true
-					}
+				"map_inlier_distance": 4.0,
+				"map_init": {
+					"enabled": true,
+					"iters": 9000,
+					"grow_opt_iters": 30
 				}
 			}
+		}
 		}
 	]
 }
