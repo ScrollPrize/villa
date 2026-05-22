@@ -184,6 +184,10 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Correction point spacing for approval inpaint (default: --mesh-step)")
 	p.add_argument("--approval-inpaint-padding-frac", type=float, default=0.25,
 		help="Per-side model extent padding for approval inpaint")
+	p.add_argument("--approval-inpaint-output-mask", action=argparse.BooleanOptionalAction, default=False,
+		help="Store selected approval-inpaint cell as an export mask")
+	p.add_argument("--approval-inpaint-output-mask-dilate", type=int, default=3,
+		help="Output-mask dilation radius in exported mesh vertices")
 	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
@@ -274,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
 	# a centered effective seed, and extents before the configured init runs.
 	_t = _stage_start("approval_inpaint")
 	approval_inpaint_enabled = _truthy_config_bool(getattr(args, "approval_inpaint", False))
+	approval_inpaint_output_mask_enabled = _truthy_config_bool(getattr(args, "approval_inpaint_output_mask", False))
+	if approval_inpaint_output_mask_enabled and not approval_inpaint_enabled:
+		raise ValueError("approval-inpaint-output-mask requires approval-inpaint=true")
+	approval_inpaint_output_mask: dict | None = None
 	if approval_inpaint_enabled:
 		if model_init != "seed":
 			raise ValueError("approval-inpaint requires args.model-init=seed")
@@ -291,7 +299,10 @@ def main(argv: list[str] | None = None) -> int:
 			corr_spacing=getattr(args, "approval_inpaint_corr_spacing", None),
 			padding_frac=getattr(args, "approval_inpaint_padding_frac", 0.25),
 			existing_corr_points=cfg.get("corr_points") if isinstance(cfg.get("corr_points"), dict) else None,
+			output_mask=approval_inpaint_output_mask_enabled,
+			output_mask_dilate=int(getattr(args, "approval_inpaint_output_mask_dilate", 3)),
 		)
+		approval_inpaint_output_mask = result.output_mask
 		data_cfg = dataclasses.replace(
 			data_cfg,
 			seed=result.seed,
@@ -305,7 +316,17 @@ def main(argv: list[str] | None = None) -> int:
 			"model-w": int(result.model_w),
 			"model-h": int(result.model_h),
 			"approval-inpaint": True,
+			"approval-inpaint-output-mask": bool(approval_inpaint_output_mask_enabled),
+			"approval-inpaint-output-mask-dilate": int(getattr(args, "approval_inpaint_output_mask_dilate", 3)),
 		})
+		if approval_inpaint_output_mask is not None:
+			fit_config["args"]["approval-inpaint-output-mask-contours"] = len(
+				approval_inpaint_output_mask.get("contours_xyz", [])
+			)
+			fit_config["args"]["approval-inpaint-output-mask-points"] = sum(
+				len(c) for c in approval_inpaint_output_mask.get("contours_xyz", [])
+				if isinstance(c, list)
+			)
 		print(
 			f"[fit] approval-inpaint: points={result.point_count} "
 			f"component={result.component_size} skeleton={result.skeleton_size} "
@@ -810,6 +831,8 @@ def main(argv: list[str] | None = None) -> int:
 		corr_results = opt_loss_corr.get_last_results()
 		if corr_results is not None:
 			st["_corr_points_results_"] = corr_results
+		if approval_inpaint_output_mask is not None:
+			st["_approval_inpaint_output_mask_"] = copy.deepcopy(approval_inpaint_output_mask)
 		# Store winding volume auto-offset if computed
 		from opt_loss_winding_volume import _winding_offset, _winding_direction
 		if _winding_offset is not None:

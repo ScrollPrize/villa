@@ -22,6 +22,7 @@ class ApprovalInpaintResult:
 	skeleton_size: int
 	index_bounds: tuple[int, int, int, int]  # row_min, row_max, col_min, col_max
 	source_mesh_step: float
+	output_mask: dict | None = None
 
 
 def _as_2d_nonzero(arr: np.ndarray, *, name: str) -> np.ndarray:
@@ -378,6 +379,119 @@ def _sample_xyz_at_index_center(
 	return float(xyz[rr, cc, 0]), float(xyz[rr, cc, 1]), float(xyz[rr, cc, 2])
 
 
+def _boundary_contours_for_vertex_mask(mask: np.ndarray) -> list[list[tuple[float, float]]]:
+	"""Return ordered contours around a vertex mask.
+
+	Each true vertex is treated as a unit square centered on the vertex index.
+	The returned contour coordinates are therefore in source grid index space
+	and may contain half-integer row/col values.
+	"""
+	m = np.asarray(mask, dtype=bool)
+	if m.ndim != 2:
+		raise ValueError(f"output mask region must be 2D, got {m.shape}")
+	h, w = m.shape
+	if not bool(m.any()):
+		return []
+
+	def pt(row2: int, col2: int) -> tuple[int, int]:
+		return int(row2), int(col2)
+
+	edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+
+	def add_edge(a: tuple[int, int], b: tuple[int, int]) -> None:
+		edges.add((a, b) if a <= b else (b, a))
+
+	for r in range(h):
+		for c in range(w):
+			if not bool(m[r, c]):
+				continue
+			top = pt(2 * r - 1, 2 * c - 1)
+			right = pt(2 * r - 1, 2 * c + 1)
+			bottom = pt(2 * r + 1, 2 * c + 1)
+			left = pt(2 * r + 1, 2 * c - 1)
+			if r == 0 or not bool(m[r - 1, c]):
+				add_edge(top, right)
+			if c + 1 == w or not bool(m[r, c + 1]):
+				add_edge(right, bottom)
+			if r + 1 == h or not bool(m[r + 1, c]):
+				add_edge(left, bottom)
+			if c == 0 or not bool(m[r, c - 1]):
+				add_edge(top, left)
+
+	adj: dict[tuple[int, int], list[tuple[int, int]]] = {}
+	for a, b in edges:
+		adj.setdefault(a, []).append(b)
+		adj.setdefault(b, []).append(a)
+	for ns in adj.values():
+		ns.sort()
+
+	unused = set(edges)
+	contours: list[list[tuple[float, float]]] = []
+	while unused:
+		a, b = min(unused)
+		unused.remove((a, b))
+		start = a
+		prev = a
+		cur = b
+		loop = [a, b]
+		while cur != start:
+			candidates = []
+			for n in adj.get(cur, []):
+				e = (cur, n) if cur <= n else (n, cur)
+				if e in unused:
+					candidates.append(n)
+			if not candidates:
+				break
+			non_backtrack = [n for n in candidates if n != prev]
+			nxt = min(non_backtrack or candidates)
+			e = (cur, nxt) if cur <= nxt else (nxt, cur)
+			unused.remove(e)
+			prev, cur = cur, nxt
+			if cur != start:
+				loop.append(cur)
+		if len(loop) >= 3:
+			contours.append([(float(r2) * 0.5, float(c2) * 0.5) for r2, c2 in loop])
+	return contours
+
+
+def _build_output_mask_payload(
+	*,
+	keep_region: np.ndarray,
+	xyz: np.ndarray,
+	valid: np.ndarray,
+	source_mesh_step: float,
+	dilation_radius: int,
+) -> dict:
+	radius = int(dilation_radius)
+	if radius < 0:
+		raise ValueError(f"approval inpaint output-mask dilation must be >= 0, got {dilation_radius}")
+	contours_rc = _boundary_contours_for_vertex_mask(keep_region)
+	if not contours_rc:
+		raise ValueError("approval inpaint output mask generated no boundary contours")
+	contours_xyz: list[list[list[float]]] = []
+	for contour in contours_rc:
+		pts = [
+			list(_sample_xyz_at_index_center(xyz, valid, float(r), float(c)))
+			for r, c in contour
+		]
+		if len(pts) >= 3:
+			contours_xyz.append(pts)
+	if not contours_xyz:
+		raise ValueError("approval inpaint output mask generated no valid contour xyz points")
+
+	rc = np.argwhere(keep_region)
+	rmin, cmin = (int(v) for v in rc.min(axis=0))
+	rmax, cmax = (int(v) for v in rc.max(axis=0))
+	return {
+		"version": 1,
+		"contours_xyz": contours_xyz,
+		"source_bounds": [rmin, rmax, cmin, cmax],
+		"source_shape": [int(keep_region.shape[0]), int(keep_region.shape[1])],
+		"source_mesh_step": float(source_mesh_step),
+		"dilation_radius": radius,
+	}
+
+
 def _next_collection_id(corr_points: dict) -> str:
 	cols = corr_points.get("collections", {})
 	max_id = -1
@@ -438,6 +552,8 @@ def build_approval_inpaint(
 	corr_spacing: float | None = None,
 	padding_frac: float | None = 0.25,
 	existing_corr_points: dict | None = None,
+	output_mask: bool = False,
+	output_mask_dilate: int = 3,
 ) -> ApprovalInpaintResult:
 	xyz, valid, d, meta = _load_tifxyz_arrays(tifxyz_path)
 	approval = load_approval_mask(Path(tifxyz_path) / "approval.tif", expected_shape=valid.shape)
@@ -447,10 +563,19 @@ def build_approval_inpaint(
 	seed_index = nearest_valid_index(xyz, valid, seed)
 	component_label, component = select_component_for_seed(labels, seed_index)
 	boundary_source = enclosing_approval_mask(component, approval, valid)
+	source_step = _source_mesh_step(meta, mesh_step)
+	output_mask_payload = None
+	if output_mask:
+		output_mask_payload = _build_output_mask_payload(
+			keep_region=component | boundary_source,
+			xyz=xyz,
+			valid=valid,
+			source_mesh_step=source_step,
+			dilation_radius=int(output_mask_dilate),
+		)
 	skeleton = skeletonize_boundary(boundary_source)
 	if not bool(skeleton.any()):
 		skeleton = boundary_source
-	source_step = _source_mesh_step(meta, mesh_step)
 	spacing = float(corr_spacing) if corr_spacing is not None else float(mesh_step)
 	if not math.isfinite(spacing) or spacing <= 0.0:
 		raise ValueError(f"approval inpaint corr spacing must be > 0, got {corr_spacing}")
@@ -496,4 +621,5 @@ def build_approval_inpaint(
 		skeleton_size=int(skeleton.sum()),
 		index_bounds=(rmin, rmax, cmin, cmax),
 		source_mesh_step=float(source_step),
+		output_mask=output_mask_payload,
 	)

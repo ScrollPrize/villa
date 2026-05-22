@@ -109,9 +109,69 @@ class ApprovalInpaintTest(unittest.TestCase):
 		self.assertIn("3", result.corr_points["collections"])
 		generated = result.corr_points["collections"]["3"]
 		self.assertTrue(generated["metadata"]["winding_is_absolute"])
+		self.assertIsNone(result.output_mask)
 		for point in generated["points"].values():
 			self.assertEqual(point["wind_a"], 2.0)
 		_assert_points_inside_centered_extent(self, result)
+
+	def test_output_mask_contours_cover_selected_cell_and_boundary(self) -> None:
+		approval = np.zeros((7, 7), dtype=np.uint8)
+		approval[1:6, 1:6] = 255
+		approval[2:5, 2:5] = 0
+
+		with tempfile.TemporaryDirectory() as td:
+			tifxyz = Path(td) / "source.tifxyz"
+			_write_tifxyz(tifxyz, approval)
+
+			result = approval_inpaint.build_approval_inpaint(
+				tifxyz_path=tifxyz,
+				seed=(30.0, 30.0, 100.0),
+				mesh_step=10.0,
+				output_mask=True,
+				output_mask_dilate=3,
+			)
+
+		self.assertIsNotNone(result.output_mask)
+		mask = result.output_mask or {}
+		self.assertEqual(mask["source_bounds"], [1, 5, 1, 5])
+		self.assertEqual(mask["source_shape"], [7, 7])
+		self.assertEqual(mask["source_mesh_step"], 10.0)
+		self.assertEqual(mask["dilation_radius"], 3)
+		self.assertEqual(len(mask["contours_xyz"]), 1)
+		contour = np.asarray(mask["contours_xyz"][0], dtype=np.float32)
+		self.assertGreaterEqual(contour.shape[0], 4)
+		self.assertAlmostEqual(float(contour[:, 0].min()), 5.0)
+		self.assertAlmostEqual(float(contour[:, 0].max()), 55.0)
+		self.assertAlmostEqual(float(contour[:, 1].min()), 5.0)
+		self.assertAlmostEqual(float(contour[:, 1].max()), 55.0)
+
+	def test_output_mask_recenters_with_off_center_seed(self) -> None:
+		approval = np.zeros((7, 7), dtype=np.uint8)
+		approval[1:6, 1:6] = 255
+		approval[2:5, 2:5] = 0
+
+		with tempfile.TemporaryDirectory() as td:
+			tifxyz = Path(td) / "source.tifxyz"
+			_write_tifxyz(tifxyz, approval)
+
+			result_a = approval_inpaint.build_approval_inpaint(
+				tifxyz_path=tifxyz,
+				seed=(20.0, 20.0, 100.0),
+				mesh_step=10.0,
+				output_mask=True,
+			)
+			result_b = approval_inpaint.build_approval_inpaint(
+				tifxyz_path=tifxyz,
+				seed=(40.0, 40.0, 100.0),
+				mesh_step=10.0,
+				output_mask=True,
+			)
+
+		self.assertEqual(result_a.seed, (30.0, 30.0, 100.0))
+		mask_a = result_a.output_mask or {}
+		mask_b = result_b.output_mask or {}
+		self.assertEqual(mask_a["source_bounds"], [1, 5, 1, 5])
+		self.assertEqual(mask_a["source_bounds"], mask_b["source_bounds"])
 
 	def test_build_recenters_off_center_seed_from_approval_bounds(self) -> None:
 		approval = np.zeros((7, 7), dtype=np.uint8)
