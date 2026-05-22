@@ -39,9 +39,9 @@ def _print_json_log(label, payload):
 )
 @click.option(
     "--volume_zarr",
-    type=click.Path(exists=True),
+    type=str,
     required=True,
-    help="Path to ome-zarr folder (used as default volume_path for dense requests).",
+    help="Path or URL to ome-zarr folder (used as default volume_path for dense requests).",
 )
 @click.option("--volume_scale", type=int, required=True, help="OME scale to use")
 @click.option("--socket_path", type=click.Path(), required=True, help="Path to Unix domain socket")
@@ -146,29 +146,6 @@ def _merge_dense_args(dst, src):
         dst[_normalize_key(key)] = value
 
 
-def _build_dense_args(request, state):
-    from vesuvius.neural_tracing.inference.infer_global_extrap import normalize_dense_args
-
-    dense_args = {}
-
-    _merge_dense_args(dense_args, request.get("dense_args"))
-    _merge_dense_args(dense_args, request.get("args"))
-    _merge_dense_args(dense_args, request.get("overrides"))
-    _merge_dense_args(dense_args, request)
-
-    dense_args = normalize_dense_args(dense_args)
-    dense_args.setdefault("iterations", 1)
-    dense_args.setdefault("volume_path", state.get("volume_zarr"))
-    dense_args.setdefault("volume_scale", state.get("volume_scale"))
-
-    if dense_args.get("tifxyz_path") is None:
-        return None, "Missing required field for dense displacement: tifxyz_path"
-    if dense_args.get("grow_direction") is None:
-        return None, "Missing required field for dense displacement: grow_direction"
-    if dense_args.get("volume_path") is None:
-        return None, "Missing required field for dense displacement: volume_path"
-    return dense_args, None
-
 
 def _build_copy_args(request, state):
     from vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps import normalize_copy_args
@@ -193,50 +170,6 @@ def _build_copy_args(request, state):
         return None, "Missing required field for displacement copy: checkpoint_path"
     return copy_args, None
 
-
-def _process_dense_request(request, state):
-    dense_args, err = _build_dense_args(request, state)
-    if err is not None:
-        _print_json_log(
-            "dense request rejected",
-            {
-                "request_type": DENSE_REQUEST_TYPE,
-                "error": err,
-                "request_keys": sorted(str(k) for k in request.keys())
-                if isinstance(request, dict)
-                else [],
-            },
-        )
-        return {"error": err}
-
-    _print_json_log(
-        "dense request args",
-        {"request_type": DENSE_REQUEST_TYPE, "run_args": dense_args},
-    )
-
-    from vesuvius.neural_tracing.inference.infer_global_extrap import run_global_extrap
-
-    try:
-        with state["dense_lock"]:
-            output_path = run_global_extrap(dense_args)
-    except Exception as exc:
-        return {"error": f"Dense displacement failed: {exc}"}
-
-    return {
-        "ok": True,
-        "output_tifxyz_path": output_path,
-        "grow_direction": str(dense_args.get("grow_direction")),
-        "iterations": int(dense_args.get("iterations", 1)),
-        "resolved": {
-            "volume_path": dense_args.get("volume_path"),
-            "volume_scale": int(dense_args.get("volume_scale")),
-            "checkpoint_path": dense_args.get("checkpoint_path"),
-            "config_path": dense_args.get("config_path"),
-            "tifxyz_path": dense_args.get("tifxyz_path"),
-            "tifxyz_out_dir": dense_args.get("tifxyz_out_dir"),
-            "edge_input_rowscols": dense_args.get("edge_input_rowscols"),
-        },
-    }
 
 
 def _process_copy_request(request, state):
@@ -377,8 +310,6 @@ def process_request(request, state):
     """Process a single inference request and return results."""
 
     request_type = request.get("request_type", HEATMAP_REQUEST_TYPE)
-    if request_type == DENSE_REQUEST_TYPE:
-        return _process_dense_request(request, state)
     if request_type == COPY_REQUEST_TYPE:
         return _process_copy_request(request, state)
     if request_type == HEATMAP_REQUEST_TYPE:
