@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 
@@ -10,6 +10,24 @@ import torch.nn.functional as F
 import model as fit_model
 import opt_loss_winding_density
 import opt_loss_station
+
+
+@dataclass(frozen=True)
+class SnapSurfMapInitConfig:
+	enabled: bool = False
+	subdiv: int = 4
+	iters: int = 1000
+	grow_opt_iters: int = 100
+	lr: float = 0.05
+	seed_radius: int = 1
+	w_dist: float = 1.0
+	w_vec_normal: float = 1.0
+	w_surface_normal: float = 1.0
+	w_smooth: float = 0.05
+	w_bend: float = 0.01
+	w_jac: float = 1.0
+	angle_dist_mult: float = 9.0
+	jac_margin: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -34,6 +52,7 @@ class SnapSurfConfig:
 	orientation: str = "auto"
 	debug_obj_dir: str | None = None
 	debug_obj_interval: int = 1
+	map_init: SnapSurfMapInitConfig = field(default_factory=SnapSurfMapInitConfig)
 
 
 _cfg = SnapSurfConfig()
@@ -43,14 +62,16 @@ _states: list["_SurfaceState"] = []
 _last_stats: dict[str, float] = {}
 _debug_step: int | None = None
 _debug_label: str | None = None
+_stage_label: str | None = None
 
 
 def reset_state() -> None:
-	global _states, _last_stats, _debug_step, _debug_label
+	global _states, _last_stats, _debug_step, _debug_label, _stage_label
 	_states = []
 	_last_stats = {}
 	_debug_step = None
 	_debug_label = None
+	_stage_label = None
 
 
 def configure_snap_surf(
@@ -58,34 +79,38 @@ def configure_snap_surf(
 	cfg: dict | None = None,
 	seed_xyz: tuple[float, float, float] | None = None,
 	active: bool = False,
+	stage_label: str | None = None,
 ) -> None:
 	"""Configure the runtime snap-surface loss state for the current stage."""
-	global _cfg, _active, _seed_xyz
+	global _cfg, _active, _seed_xyz, _stage_label
 	raw = dict(cfg or {})
 	bad = sorted(set(raw.keys()) - set(SnapSurfConfig.__dataclass_fields__.keys()))
 	if bad:
 		raise ValueError(f"snap_surf args: unknown key(s): {bad}")
+	default_cfg = SnapSurfConfig()
+	map_init_cfg = _parse_map_init_config(raw.get("map_init", default_cfg.map_init))
 	_cfg = SnapSurfConfig(
-		init_distance=float(raw.get("init_distance", SnapSurfConfig.init_distance)),
-		point_distance=float(raw.get("point_distance", SnapSurfConfig.point_distance)),
-		grid_error=float(raw.get("grid_error", SnapSurfConfig.grid_error)),
-		affine_radius=max(1, int(raw.get("affine_radius", SnapSurfConfig.affine_radius))),
-		search_ring=max(0, int(raw.get("search_ring", SnapSurfConfig.search_ring))),
-		seed_radius=int(raw.get("seed_radius", SnapSurfConfig.seed_radius)),
-		map_inlier_distance=float(raw.get("map_inlier_distance", SnapSurfConfig.map_inlier_distance)),
-		inlier_normal_distance_ratio=float(raw.get("inlier_normal_distance_ratio", SnapSurfConfig.inlier_normal_distance_ratio)),
-		inlier_normal_distance_floor=float(raw.get("inlier_normal_distance_floor", SnapSurfConfig.inlier_normal_distance_floor)),
-		ray_residual=float(raw.get("ray_residual", SnapSurfConfig.ray_residual)),
-		brute_interval=max(1, int(raw.get("brute_interval", SnapSurfConfig.brute_interval))),
-		brute_boundary_radius=max(0, int(raw.get("brute_boundary_radius", SnapSurfConfig.brute_boundary_radius))),
-		brute_pair_chunk_limit=max(1, int(raw.get("brute_pair_chunk_limit", SnapSurfConfig.brute_pair_chunk_limit))),
-		huber_delta=float(raw.get("huber_delta", SnapSurfConfig.huber_delta)),
-		distance_scale=max(1.0e-8, float(raw.get("distance_scale", SnapSurfConfig.distance_scale))),
-		w_to_ext=float(raw.get("w_to_ext", SnapSurfConfig.w_to_ext)),
-		w_to_model=float(raw.get("w_to_model", SnapSurfConfig.w_to_model)),
-		orientation=str(raw.get("orientation", SnapSurfConfig.orientation)).strip().lower(),
-		debug_obj_dir=None if raw.get("debug_obj_dir", SnapSurfConfig.debug_obj_dir) in {None, ""} else str(raw.get("debug_obj_dir")),
-		debug_obj_interval=max(1, int(raw.get("debug_obj_interval", SnapSurfConfig.debug_obj_interval))),
+		init_distance=float(raw.get("init_distance", default_cfg.init_distance)),
+		point_distance=float(raw.get("point_distance", default_cfg.point_distance)),
+		grid_error=float(raw.get("grid_error", default_cfg.grid_error)),
+		affine_radius=max(1, int(raw.get("affine_radius", default_cfg.affine_radius))),
+		search_ring=max(0, int(raw.get("search_ring", default_cfg.search_ring))),
+		seed_radius=int(raw.get("seed_radius", default_cfg.seed_radius)),
+		map_inlier_distance=float(raw.get("map_inlier_distance", default_cfg.map_inlier_distance)),
+		inlier_normal_distance_ratio=float(raw.get("inlier_normal_distance_ratio", default_cfg.inlier_normal_distance_ratio)),
+		inlier_normal_distance_floor=float(raw.get("inlier_normal_distance_floor", default_cfg.inlier_normal_distance_floor)),
+		ray_residual=float(raw.get("ray_residual", default_cfg.ray_residual)),
+		brute_interval=max(1, int(raw.get("brute_interval", default_cfg.brute_interval))),
+		brute_boundary_radius=max(0, int(raw.get("brute_boundary_radius", default_cfg.brute_boundary_radius))),
+		brute_pair_chunk_limit=max(1, int(raw.get("brute_pair_chunk_limit", default_cfg.brute_pair_chunk_limit))),
+		huber_delta=float(raw.get("huber_delta", default_cfg.huber_delta)),
+		distance_scale=max(1.0e-8, float(raw.get("distance_scale", default_cfg.distance_scale))),
+		w_to_ext=float(raw.get("w_to_ext", default_cfg.w_to_ext)),
+		w_to_model=float(raw.get("w_to_model", default_cfg.w_to_model)),
+		orientation=str(raw.get("orientation", default_cfg.orientation)).strip().lower(),
+		debug_obj_dir=None if raw.get("debug_obj_dir", default_cfg.debug_obj_dir) in {None, ""} else str(raw.get("debug_obj_dir")),
+		debug_obj_interval=max(1, int(raw.get("debug_obj_interval", default_cfg.debug_obj_interval))),
+		map_init=map_init_cfg,
 	)
 	if _cfg.init_distance < 0.0:
 		raise ValueError("snap_surf args.init_distance must be >= 0")
@@ -113,6 +138,66 @@ def configure_snap_surf(
 		raise ValueError("snap_surf requires args.seed")
 	_active = bool(active)
 	_seed_xyz = None if seed_xyz is None else tuple(float(v) for v in seed_xyz)
+	_stage_label = None if stage_label is None else str(stage_label)
+	_snap_surf_log(
+		"configured "
+		f"stage={_stage_label!r} "
+		f"active={int(_active)} "
+		f"map_init={int(_cfg.map_init.enabled)} "
+		f"debug_obj_dir={_cfg.debug_obj_dir!r} "
+		f"debug_obj_interval={_cfg.debug_obj_interval} "
+		f"seed={_seed_xyz}"
+	)
+	if _active and _cfg.map_init.enabled:
+		_map_init_log(
+			"enabled "
+			f"subdiv={_cfg.map_init.subdiv} "
+			f"iters={_cfg.map_init.iters} "
+			f"grow_opt_iters={_cfg.map_init.grow_opt_iters} "
+			f"lr={_cfg.map_init.lr} "
+			f"seed_radius={_cfg.map_init.seed_radius} "
+			f"jac_margin={_cfg.map_init.jac_margin}"
+		)
+		for state in _states:
+			state.reset_map_init()
+
+
+def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
+	defaults = SnapSurfMapInitConfig()
+	if raw is None:
+		return defaults
+	if isinstance(raw, SnapSurfMapInitConfig):
+		cfg = raw
+	elif isinstance(raw, dict):
+		bad = sorted(set(raw.keys()) - set(SnapSurfMapInitConfig.__dataclass_fields__.keys()))
+		if bad:
+			raise ValueError(f"snap_surf args.map_init: unknown key(s): {bad}")
+		cfg = SnapSurfMapInitConfig(
+			enabled=bool(raw.get("enabled", defaults.enabled)),
+			subdiv=max(1, int(raw.get("subdiv", defaults.subdiv))),
+			iters=max(0, int(raw.get("iters", defaults.iters))),
+			grow_opt_iters=max(0, int(raw.get("grow_opt_iters", defaults.grow_opt_iters))),
+			lr=float(raw.get("lr", defaults.lr)),
+			seed_radius=max(0, int(raw.get("seed_radius", defaults.seed_radius))),
+			w_dist=float(raw.get("w_dist", defaults.w_dist)),
+			w_vec_normal=float(raw.get("w_vec_normal", defaults.w_vec_normal)),
+			w_surface_normal=float(raw.get("w_surface_normal", defaults.w_surface_normal)),
+			w_smooth=float(raw.get("w_smooth", defaults.w_smooth)),
+			w_bend=float(raw.get("w_bend", defaults.w_bend)),
+			w_jac=float(raw.get("w_jac", defaults.w_jac)),
+			angle_dist_mult=float(raw.get("angle_dist_mult", defaults.angle_dist_mult)),
+			jac_margin=float(raw.get("jac_margin", defaults.jac_margin)),
+		)
+	else:
+		raise ValueError("snap_surf args.map_init must be an object or null")
+	if cfg.lr <= 0.0:
+		raise ValueError("snap_surf args.map_init.lr must be > 0")
+	for name in ("w_dist", "w_vec_normal", "w_surface_normal", "w_smooth", "w_bend", "w_jac", "angle_dist_mult"):
+		if float(getattr(cfg, name)) < 0.0:
+			raise ValueError(f"snap_surf args.map_init.{name} must be >= 0")
+	if cfg.jac_margin < 0.0:
+		raise ValueError("snap_surf args.map_init.jac_margin must be >= 0")
+	return cfg
 
 
 def last_stats() -> dict[str, float]:
@@ -130,6 +215,14 @@ def _safe_frac(n: int | float, d: int | float) -> float:
 	if den <= 0.0:
 		return 0.0
 	return float(n) / den
+
+
+def _snap_surf_log(message: str) -> None:
+	print(f"[snap_surf] {message}", flush=True)
+
+
+def _map_init_log(message: str) -> None:
+	print(f"[snap_surf.map_init] {message}", flush=True)
 
 
 class _DirectionState:
@@ -173,15 +266,48 @@ class _DirectionState:
 		return int(self.valid.sum().detach().cpu())
 
 
+class _MapInitState:
+	def __init__(self) -> None:
+		self.done: bool = False
+		self.active: torch.Tensor | None = None
+		self.uv: torch.Tensor | None = None
+		self.ext_pos: torch.Tensor | None = None
+		self.ext_normals: torch.Tensor | None = None
+		self.ext_valid: torch.Tensor | None = None
+		self.ext_coords: torch.Tensor | None = None
+		self.model_depth: int | None = None
+		self.seed_ext_sample_hw: tuple[int, int] | None = None
+		self.seed_model_quad: tuple[int, int, int] | None = None
+		self.orientation_sign: int = 1
+		self.normal_sign: int = 1
+		self.total_iters: int = 0
+		self.grow_steps: int = 0
+		self.opt_blocks: int = 0
+		self.added_total: int = 0
+		self.stats: dict[str, float] = {}
+
+	def reset(self) -> None:
+		self.__init__()
+
+	def active_count(self) -> int:
+		if self.active is None:
+			return 0
+		return int(self.active.sum().detach().cpu())
+
+
 class _SurfaceState:
 	def __init__(self) -> None:
 		self.model_to_ext = _DirectionState(source_rank=3, target_rank=2)
 		self.ext_to_model = _DirectionState(source_rank=2, target_rank=3)
+		self.map_init = _MapInitState()
 		self.ext_seed_hw: tuple[int, int] | None = None
 		self.seed_ext_distance: float | None = None
 		self.seed_ext_key: tuple[float, float, float] | None = None
 		self.seed_ext_point_xyz: tuple[float, float, float] | None = None
 		self.snap_eval_count: int = 0
+
+	def reset_map_init(self) -> None:
+		self.map_init.reset()
 
 	def ensure(
 		self,
@@ -191,6 +317,7 @@ class _SurfaceState:
 		device: torch.device,
 		dtype: torch.dtype,
 	) -> None:
+		old_model_shape = self.model_to_ext.source_shape
 		old_ext_shape = self.model_to_ext.target_shape
 		self.model_to_ext.ensure(
 			source_shape=model_shape,
@@ -204,12 +331,13 @@ class _SurfaceState:
 			device=device,
 			dtype=dtype,
 		)
-		if old_ext_shape != ext_shape:
+		if old_model_shape != model_shape or old_ext_shape != ext_shape:
 			self.ext_seed_hw = None
 			self.seed_ext_distance = None
 			self.seed_ext_key = None
 			self.seed_ext_point_xyz = None
 			self.snap_eval_count = 0
+			self.reset_map_init()
 
 
 _CORNERS_2D = ((0, 0), (1, 0), (0, 1), (1, 1))
@@ -2676,6 +2804,780 @@ def _direction_loss_model_ray_to_ext(
 	return loss, lm.unsqueeze(1), mask.unsqueeze(1), int(values_f.numel()), stats
 
 
+def _map_init_empty_stats() -> dict[str, float]:
+	return {
+		"snaps_seed": 0.0,
+		"snaps_sdist": float("inf"),
+		"snaps_sext": float("inf"),
+		"snaps_m2e": 0.0,
+		"snaps_map_active": 0.0,
+		"snaps_map_init": 0.0,
+		"snaps_map_added": 0.0,
+		"snaps_map_iters": 0.0,
+		"snaps_map_blocks": 0.0,
+		"snaps_map_grow": 0.0,
+		"snaps_map_loss": 0.0,
+		"snaps_map_dist": 0.0,
+		"snaps_map_vec": 0.0,
+		"snaps_map_norm": 0.0,
+		"snaps_map_smooth": 0.0,
+		"snaps_map_bend": 0.0,
+		"snaps_map_jac": 0.0,
+		"snaps_map_jmin": 0.0,
+		"snaps_map_nsign": 1.0,
+	}
+
+
+def _map_init_sample_external_surface(
+	*,
+	ext_xyz: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	subdiv: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	H, W = int(ext_xyz.shape[0]), int(ext_xyz.shape[1])
+	s = max(1, int(subdiv))
+	device = ext_xyz.device
+	dtype = ext_xyz.dtype
+	if H < 2 or W < 2:
+		coords = torch.empty(0, 0, 2, device=device, dtype=dtype)
+		pos = torch.empty(0, 0, 3, device=device, dtype=dtype)
+		normals = torch.empty(0, 0, 3, device=device, dtype=dtype)
+		valid = torch.zeros(0, 0, device=device, dtype=torch.bool)
+		return coords, pos, normals, valid
+	Hs = (H - 1) * s
+	Ws = (W - 1) * s
+	hh = (torch.arange(Hs, device=device, dtype=dtype) + 0.5) / float(s)
+	ww = (torch.arange(Ws, device=device, dtype=dtype) + 0.5) / float(s)
+	grid_h, grid_w = torch.meshgrid(hh, ww, indexing="ij")
+	coords = torch.stack([grid_h, grid_w], dim=-1)
+	base_h = torch.floor(grid_h).clamp(0, H - 2).long()
+	base_w = torch.floor(grid_w).clamp(0, W - 2).long()
+	corner_quad_valid = (
+		ext_valid[:-1, :-1].bool() &
+		ext_valid[1:, :-1].bool() &
+		ext_valid[:-1, 1:].bool() &
+		ext_valid[1:, 1:].bool()
+	)
+	if tuple(ext_quad_valid.shape) == tuple(corner_quad_valid.shape):
+		corner_quad_valid = corner_quad_valid & ext_quad_valid.bool()
+	quad_ok = corner_quad_valid[base_h, base_w]
+	pos = _sample_surface_grid(ext_xyz, coords)
+	n_raw = _sample_surface_grid(ext_normals, coords)
+	normals = F.normalize(n_raw, dim=-1, eps=1.0e-8)
+	valid = (
+		quad_ok &
+		torch.isfinite(pos).all(dim=-1) &
+		torch.isfinite(n_raw).all(dim=-1) &
+		torch.isfinite(normals).all(dim=-1) &
+		(normals.norm(dim=-1) > 1.0e-8)
+	)
+	return coords, pos, normals, valid
+
+
+def _map_init_coords3(uv: torch.Tensor, *, depth: int) -> torch.Tensor:
+	d = torch.full((*uv.shape[:-1], 1), float(depth), device=uv.device, dtype=uv.dtype)
+	return torch.cat([d, uv], dim=-1)
+
+
+def _map_init_model_coord_ok(
+	uv: torch.Tensor,
+	*,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	depth: int,
+) -> torch.Tensor:
+	if uv.numel() == 0:
+		return torch.zeros(uv.shape[:-1], device=uv.device, dtype=torch.bool)
+	coords3 = _map_init_coords3(uv, depth=depth)
+	finite = torch.isfinite(coords3).all(dim=-1)
+	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+	coord_ok = _quad_valid_at_coords(
+		model_valid.bool(),
+		safe_coords,
+		tuple(int(v) for v in model_valid.shape),
+	) & finite
+	n_raw = _sample_surface_grid(model_normals, safe_coords)
+	n = F.normalize(n_raw, dim=-1, eps=1.0e-8)
+	return (
+		coord_ok &
+		torch.isfinite(n_raw).all(dim=-1) &
+		torch.isfinite(n).all(dim=-1) &
+		(n.norm(dim=-1) > 1.0e-8)
+	)
+
+
+def _map_init_distance_multiplier(
+	c_ext: torch.Tensor,
+	c_model: torch.Tensor,
+	cfg: SnapSurfMapInitConfig,
+) -> torch.Tensor:
+	def angle(c: torch.Tensor) -> torch.Tensor:
+		clamped = c.clamp(0.0, 1.0)
+		near_one = clamped >= (1.0 - 1.0e-7)
+		safe = clamped.clamp(max=1.0 - 1.0e-7)
+		return torch.where(near_one, torch.zeros_like(clamped), torch.acos(safe))
+
+	a_ext = angle(c_ext)
+	a_model = angle(c_model)
+	angle_sum = ((a_ext + a_model) / (math.pi / 2.0)).clamp(0.0, 2.0)
+	return 1.0 + float(cfg.angle_dist_mult) * angle_sum.square()
+
+
+def _map_init_jacobian_values(
+	uv: torch.Tensor,
+	active: torch.Tensor,
+	*,
+	orientation_sign: int,
+) -> torch.Tensor:
+	H, W = int(active.shape[0]), int(active.shape[1])
+	if H < 2 or W < 2:
+		return torch.empty(0, device=uv.device, dtype=uv.dtype)
+	cell = active[:-1, :-1] & active[1:, :-1] & active[:-1, 1:]
+	if not bool(cell.any().detach().cpu()):
+		return torch.empty(0, device=uv.device, dtype=uv.dtype)
+	dh = uv[1:, :-1] - uv[:-1, :-1]
+	dw = uv[:-1, 1:] - uv[:-1, :-1]
+	det = dh[..., 0] * dw[..., 1] - dh[..., 1] * dw[..., 0]
+	finite = cell & torch.isfinite(det)
+	if not bool(finite.any().detach().cpu()):
+		return torch.empty(0, device=uv.device, dtype=uv.dtype)
+	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
+	return det[finite] * sign
+
+
+def _map_init_jacobian_penalty(
+	uv: torch.Tensor,
+	active: torch.Tensor,
+	*,
+	orientation_sign: int,
+	jac_margin: float,
+) -> torch.Tensor:
+	values = _map_init_jacobian_values(uv, active, orientation_sign=orientation_sign)
+	if values.numel() == 0:
+		return uv.sum() * 0.0
+	return F.relu(float(jac_margin) - values).square().mean()
+
+
+def _map_init_local_jacobian_pass(
+	uv: torch.Tensor,
+	active: torch.Tensor,
+	*,
+	h: int,
+	w: int,
+	orientation_sign: int,
+	jac_margin: float,
+) -> bool:
+	H, W = int(active.shape[0]), int(active.shape[1])
+	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
+	for bh in (int(h) - 1, int(h)):
+		for bw in (int(w) - 1, int(w)):
+			if bh < 0 or bw < 0 or bh >= H - 1 or bw >= W - 1:
+				continue
+			if not bool(active[bh, bw] and active[bh + 1, bw] and active[bh, bw + 1]):
+				continue
+			dh = uv[bh + 1, bw] - uv[bh, bw]
+			dw = uv[bh, bw + 1] - uv[bh, bw]
+			det = dh[0] * dw[1] - dh[1] * dw[0]
+			if (not bool(torch.isfinite(det).detach().cpu())) or float((det * sign).detach().cpu()) < float(jac_margin):
+				return False
+	return True
+
+
+def _map_init_objective(
+	*,
+	uv_full: torch.Tensor,
+	active: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_depth: int,
+	normal_sign: int,
+	orientation_sign: int,
+	cfg: SnapSurfConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+	mi = cfg.map_init
+	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
+	sample_mask = active.bool() & ext_valid.bool() & torch.isfinite(uv_full).all(dim=-1)
+	if bool(sample_mask.any().detach().cpu()):
+		uv = uv_full[sample_mask]
+		coords3 = _map_init_coords3(uv, depth=model_depth)
+		safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+		p_ext = ext_pos[sample_mask]
+		n_ext_raw = ext_normals[sample_mask]
+		n_ext = F.normalize(n_ext_raw, dim=-1, eps=1.0e-8) * (1.0 if int(normal_sign) >= 0 else -1.0)
+		p_model = _sample_surface_grid(model_xyz, safe_coords)
+		n_model_raw = _sample_surface_grid(model_normals, safe_coords)
+		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+		coord_ok = _quad_valid_at_coords(
+			model_valid.bool(),
+			safe_coords,
+			tuple(int(v) for v in model_valid.shape),
+		)
+		v = p_model - p_ext
+		d = v.norm(dim=-1)
+		u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
+		c_ext = (u * n_ext).sum(dim=-1)
+		c_model = (u * n_model).sum(dim=-1)
+		c_norm = (n_ext * n_model).sum(dim=-1)
+		dist_mult = _map_init_distance_multiplier(c_ext, c_model, mi)
+		dist_values = _huber(d, delta=cfg.huber_delta) * dist_mult
+		vec_values = (1.0 - c_ext) + (1.0 - c_model)
+		norm_values = 1.0 - c_norm
+		finite = (
+			coord_ok &
+			torch.isfinite(p_ext).all(dim=-1) &
+			torch.isfinite(n_ext_raw).all(dim=-1) &
+			torch.isfinite(n_ext).all(dim=-1) &
+			(n_ext.norm(dim=-1) > 1.0e-8) &
+			torch.isfinite(p_model).all(dim=-1) &
+			torch.isfinite(n_model_raw).all(dim=-1) &
+			torch.isfinite(n_model).all(dim=-1) &
+			(n_model.norm(dim=-1) > 1.0e-8) &
+			torch.isfinite(dist_values) &
+			torch.isfinite(vec_values) &
+			torch.isfinite(norm_values)
+		)
+		if bool(finite.any().detach().cpu()):
+			dist_loss = dist_values[finite].mean()
+			vec_loss = vec_values[finite].mean()
+			norm_loss = norm_values[finite].mean()
+			dist_avg = d[finite].mean()
+		else:
+			dist_loss = z
+			vec_loss = z
+			norm_loss = z
+			dist_avg = z
+	else:
+		dist_loss = z
+		vec_loss = z
+		norm_loss = z
+		dist_avg = z
+
+	uv_safe = torch.where(active.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
+	smooth_vals: list[torch.Tensor] = []
+	if int(active.shape[0]) > 1:
+		m = active[1:, :] & active[:-1, :]
+		dv = uv_safe[1:, :] - uv_safe[:-1, :]
+		finite = m & torch.isfinite(dv).all(dim=-1)
+		if bool(finite.any().detach().cpu()):
+			smooth_vals.append(dv.square().sum(dim=-1)[finite])
+	if int(active.shape[1]) > 1:
+		m = active[:, 1:] & active[:, :-1]
+		dv = uv_safe[:, 1:] - uv_safe[:, :-1]
+		finite = m & torch.isfinite(dv).all(dim=-1)
+		if bool(finite.any().detach().cpu()):
+			smooth_vals.append(dv.square().sum(dim=-1)[finite])
+	smooth_loss = torch.cat(smooth_vals).mean() if smooth_vals else z
+
+	if int(active.shape[0]) > 2 and int(active.shape[1]) > 2:
+		m = (
+			active[1:-1, 1:-1] &
+			active[:-2, 1:-1] &
+			active[2:, 1:-1] &
+			active[1:-1, :-2] &
+			active[1:-1, 2:]
+		)
+		lap = (
+			uv_safe[:-2, 1:-1] +
+			uv_safe[2:, 1:-1] +
+			uv_safe[1:-1, :-2] +
+			uv_safe[1:-1, 2:] -
+			4.0 * uv_safe[1:-1, 1:-1]
+		)
+		finite = m & torch.isfinite(lap).all(dim=-1)
+		bend_loss = lap.square().sum(dim=-1)[finite].mean() if bool(finite.any().detach().cpu()) else z
+	else:
+		bend_loss = z
+
+	jac_loss = _map_init_jacobian_penalty(
+		uv_full,
+		active,
+		orientation_sign=orientation_sign,
+		jac_margin=mi.jac_margin,
+	)
+	jac_vals = _map_init_jacobian_values(uv_full, active, orientation_sign=orientation_sign)
+	jac_min = jac_vals.min() if jac_vals.numel() else z
+	loss = (
+		float(mi.w_dist) * dist_loss +
+		float(mi.w_vec_normal) * vec_loss +
+		float(mi.w_surface_normal) * norm_loss +
+		float(mi.w_smooth) * smooth_loss +
+		float(mi.w_bend) * bend_loss +
+		float(mi.w_jac) * jac_loss
+	)
+	return loss, {
+		"loss": loss.detach(),
+		"dist": dist_loss.detach(),
+		"vec": vec_loss.detach(),
+		"norm": norm_loss.detach(),
+		"smooth": smooth_loss.detach(),
+		"bend": bend_loss.detach(),
+		"jac": jac_loss.detach(),
+		"jac_min": jac_min.detach(),
+		"dist_avg": dist_avg.detach(),
+	}
+
+
+def _map_init_estimate_normal_sign(
+	*,
+	active: torch.Tensor,
+	uv: torch.Tensor,
+	ext_normals: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_depth: int,
+) -> int:
+	mask = active.bool() & torch.isfinite(uv).all(dim=-1)
+	if not bool(mask.any().detach().cpu()):
+		return 1
+	coords3 = _map_init_coords3(uv[mask], depth=model_depth)
+	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+	n_ext = F.normalize(ext_normals[mask], dim=-1, eps=1.0e-8)
+	n_model = F.normalize(_sample_surface_grid(model_normals, safe_coords), dim=-1, eps=1.0e-8)
+	ok = (
+		torch.isfinite(n_ext).all(dim=-1) &
+		torch.isfinite(n_model).all(dim=-1) &
+		(n_ext.norm(dim=-1) > 1.0e-8) &
+		(n_model.norm(dim=-1) > 1.0e-8)
+	)
+	if not bool(ok.any().detach().cpu()):
+		return 1
+	mean_dot = (n_ext[ok] * n_model[ok]).sum(dim=-1).mean()
+	return 1 if float(mean_dot.detach().cpu()) >= 0.0 else -1
+
+
+def _map_init_seed_state(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	seed_xyz: tuple[float, float, float],
+) -> tuple[bool, float, float, int]:
+	mi = cfg.map_init
+	coords, ext_pos, ext_n, sample_valid = _map_init_sample_external_surface(
+		ext_xyz=ext_xyz,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		subdiv=mi.subdiv,
+	)
+	state.map_init.ext_coords = coords.detach()
+	state.map_init.ext_pos = ext_pos.detach()
+	state.map_init.ext_normals = ext_n.detach()
+	state.map_init.ext_valid = sample_valid.detach()
+	state.map_init.active = torch.zeros_like(sample_valid, dtype=torch.bool)
+	state.map_init.uv = torch.full((*sample_valid.shape, 2), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
+	if not bool(sample_valid.any().detach().cpu()):
+		return False, float("inf"), float("inf"), 0
+
+	seed = torch.tensor(seed_xyz, device=model_xyz.device, dtype=model_xyz.dtype)
+	dist2 = (ext_pos - seed.view(1, 1, 3)).square().sum(dim=-1)
+	dist2 = torch.where(sample_valid, dist2, torch.full_like(dist2, float("inf")))
+	best_flat = torch.argmin(dist2.reshape(-1))
+	best_dist = dist2.reshape(-1)[best_flat]
+	if not bool(torch.isfinite(best_dist).detach().cpu()):
+		return False, float("inf"), float("inf"), 0
+	Hs, Ws = int(sample_valid.shape[0]), int(sample_valid.shape[1])
+	seed_h = int((best_flat // Ws).detach().cpu())
+	seed_w = int((best_flat - (best_flat // Ws) * Ws).detach().cpu())
+	seed_ext_dist = math.sqrt(float(best_dist.detach().cpu()))
+	seed_coord = coords[seed_h, seed_w]
+	eh = int(torch.floor(seed_coord[0]).clamp(0, max(0, int(ext_xyz.shape[0]) - 2)).detach().cpu())
+	ew = int(torch.floor(seed_coord[1]).clamp(0, max(0, int(ext_xyz.shape[1]) - 2)).detach().cpu())
+
+	model_quad, seed_model_dist = _closest_model_surface_quad(
+		point=seed,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+	)
+	if model_quad is None:
+		return False, float("inf"), seed_ext_dist, 0
+	transform, fallback_sign = _choose_seed_transform(
+		model_xyz=model_xyz,
+		ext_xyz=ext_xyz,
+		model_quad=model_quad,
+		ext_quad=(eh, ew),
+		cfg=cfg,
+	)
+	d, mh, mw = model_quad
+	src = torch.stack([
+		torch.tensor([float(eh + th), float(ew + tw)], device=model_xyz.device, dtype=model_xyz.dtype)
+		for th, tw in transform
+	], dim=0)
+	tgt = torch.stack([
+		torch.tensor([float(mh + sh), float(mw + sw)], device=model_xyz.device, dtype=model_xyz.dtype)
+		for sh, sw in _CORNERS_2D
+	], dim=0)
+	A = torch.cat([src, torch.ones(4, 1, device=model_xyz.device, dtype=model_xyz.dtype)], dim=1)
+	try:
+		sol = torch.linalg.lstsq(A, tgt).solution
+	except RuntimeError:
+		sol = torch.linalg.pinv(A) @ tgt
+	flat_coords = coords.reshape(-1, 2)
+	query = torch.cat([flat_coords, torch.ones(flat_coords.shape[0], 1, device=model_xyz.device, dtype=model_xyz.dtype)], dim=1)
+	uv_all = (query @ sol).reshape(Hs, Ws, 2)
+	seed_source_hw = src
+	orientation_sign = 1 if cfg.orientation in {"identity", "none"} else _affine_det_sign_from_points(
+		seed_source_hw,
+		tgt,
+		fallback=fallback_sign,
+	)
+	r = max(0, int(mi.seed_radius))
+	hh = torch.arange(Hs, device=model_xyz.device).view(Hs, 1)
+	ww = torch.arange(Ws, device=model_xyz.device).view(1, Ws)
+	active = (
+		sample_valid &
+		(hh >= seed_h - r) &
+		(hh <= seed_h + r) &
+		(ww >= seed_w - r) &
+		(ww <= seed_w + r)
+	)
+	active = active & _map_init_model_coord_ok(
+		uv_all,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		depth=d,
+	)
+	if not bool(active.any().detach().cpu()):
+		active[seed_h, seed_w] = bool(sample_valid[seed_h, seed_w].detach().cpu())
+		active = active & _map_init_model_coord_ok(
+			uv_all,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			depth=d,
+		)
+	state.map_init.active = active.detach()
+	state.map_init.uv = torch.where(active.unsqueeze(-1), uv_all.detach(), torch.full_like(uv_all, float("nan")))
+	state.map_init.model_depth = int(d)
+	state.map_init.seed_ext_sample_hw = (seed_h, seed_w)
+	state.map_init.seed_model_quad = model_quad
+	state.map_init.orientation_sign = int(orientation_sign)
+	state.map_init.normal_sign = _map_init_estimate_normal_sign(
+		active=active,
+		uv=uv_all,
+		ext_normals=ext_n,
+		model_normals=model_normals,
+		model_depth=int(d),
+	)
+	init_count = int(active.sum().detach().cpu())
+	state.map_init.added_total = init_count
+	return init_count > 0, float(seed_model_dist), seed_ext_dist, init_count
+
+
+def _map_init_grow_once(
+	state: _SurfaceState,
+	*,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	cfg: SnapSurfConfig,
+) -> int:
+	mi = cfg.map_init
+	active = state.map_init.active
+	uv = state.map_init.uv
+	ext_valid = state.map_init.ext_valid
+	depth = state.map_init.model_depth
+	if active is None or uv is None or ext_valid is None or depth is None:
+		return 0
+	if not bool(active.any().detach().cpu()):
+		return 0
+	candidate = _neighbor8_mask(active.unsqueeze(0))[0] & ~active & ext_valid.bool()
+	if not bool(candidate.any().detach().cpu()):
+		return 0
+	cand_hw = candidate.nonzero(as_tuple=False)
+	cand_bidx = torch.cat([
+		torch.zeros(cand_hw.shape[0], 1, device=cand_hw.device, dtype=torch.long),
+		cand_hw,
+	], dim=1)
+	tmp_state = _DirectionState(source_rank=2, target_rank=2)
+	pred, count, _nearest = _direct_predict_candidates_batched(
+		tmp_state,
+		valid_b=active.unsqueeze(0),
+		map_b=uv.unsqueeze(0),
+		candidate_bidx=cand_bidx,
+		radius=max(1, int(mi.seed_radius) + 1),
+	)
+	support_ok = count >= 1
+	if not bool(support_ok.any().detach().cpu()):
+		return 0
+	cand_hw = cand_hw[support_ok]
+	pred = pred[support_ok]
+	coord_ok = _map_init_model_coord_ok(
+		pred,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		depth=int(depth),
+	)
+	cand_hw = cand_hw[coord_ok]
+	pred = pred[coord_ok]
+	if int(cand_hw.shape[0]) == 0:
+		return 0
+	active_new = active.clone()
+	uv_new = uv.clone()
+	added = 0
+	for i in range(int(cand_hw.shape[0])):
+		h = int(cand_hw[i, 0].detach().cpu())
+		w = int(cand_hw[i, 1].detach().cpu())
+		if bool(active_new[h, w].detach().cpu()):
+			continue
+		uv_new[h, w] = pred[i].detach()
+		active_new[h, w] = True
+		if _map_init_local_jacobian_pass(
+			uv_new,
+			active_new,
+			h=h,
+			w=w,
+			orientation_sign=state.map_init.orientation_sign,
+			jac_margin=mi.jac_margin,
+		):
+			added += 1
+		else:
+			active_new[h, w] = False
+			uv_new[h, w] = float("nan")
+	state.map_init.active = active_new
+	state.map_init.uv = uv_new
+	state.map_init.added_total += added
+	if added > 0:
+		state.map_init.grow_steps += 1
+	return added
+
+
+def _map_init_optimize_block(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	cfg: SnapSurfConfig,
+	steps: int,
+) -> dict[str, torch.Tensor]:
+	active = state.map_init.active
+	uv = state.map_init.uv
+	ext_pos = state.map_init.ext_pos
+	ext_normals = state.map_init.ext_normals
+	ext_valid = state.map_init.ext_valid
+	depth = state.map_init.model_depth
+	if (
+		active is None or uv is None or ext_pos is None or ext_normals is None or
+		ext_valid is None or depth is None or int(steps) <= 0 or
+		not bool(active.any().detach().cpu())
+	):
+		z = model_xyz.sum() * 0.0
+		return {"loss": z.detach(), "dist": z.detach(), "vec": z.detach(), "norm": z.detach(), "smooth": z.detach(), "bend": z.detach(), "jac": z.detach(), "jac_min": z.detach()}
+	param = torch.nn.Parameter(uv[active].detach().clone())
+	opt = torch.optim.Adam([param], lr=float(cfg.map_init.lr))
+	base_uv = uv.detach().clone()
+	last_terms: dict[str, torch.Tensor] | None = None
+	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
+	for _ in range(int(steps)):
+		opt.zero_grad(set_to_none=True)
+		uv_full = base_uv.clone()
+		uv_full[active] = param
+		loss, terms = _map_init_objective(
+			uv_full=uv_full,
+			active=active,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
+			orientation_sign=state.map_init.orientation_sign,
+			cfg=cfg,
+		)
+		loss.backward()
+		opt.step()
+		with torch.no_grad():
+			param[:, 0].clamp_(0.0, float(max(0, H - 1)))
+			param[:, 1].clamp_(0.0, float(max(0, W - 1)))
+		last_terms = terms
+	with torch.no_grad():
+		uv_out = base_uv.clone()
+		uv_out[active] = param.detach()
+		state.map_init.uv = uv_out
+	state.map_init.total_iters += int(steps)
+	state.map_init.opt_blocks += 1
+	if last_terms is None:
+		uv_full = base_uv.clone()
+		uv_full[active] = param
+		_, last_terms = _map_init_objective(
+			uv_full=uv_full,
+			active=active,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
+			orientation_sign=state.map_init.orientation_sign,
+			cfg=cfg,
+		)
+	return last_terms
+
+
+def _run_map_init_for_surface(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	seed_xyz: tuple[float, float, float],
+) -> dict[str, float]:
+	if state.map_init.done:
+		_map_init_log(
+			"reuse "
+			f"surface_active={state.map_init.active_count()} "
+			f"iters={state.map_init.total_iters} "
+			f"normal_sign={state.map_init.normal_sign}"
+		)
+		return dict(state.map_init.stats)
+	stats = _map_init_empty_stats()
+	_map_init_log(
+		"start "
+		f"model_shape={tuple(int(v) for v in model_xyz.shape[:3])} "
+		f"ext_shape={tuple(int(v) for v in ext_xyz.shape[:2])} "
+		f"valid_ext={int(ext_valid.sum().detach().cpu())} "
+		f"valid_ext_quads={int(ext_quad_valid.sum().detach().cpu()) if ext_quad_valid.numel() else 0}"
+	)
+	with torch.enable_grad():
+		with torch.no_grad():
+			ok, seed_model_dist, seed_ext_dist, init_count = _map_init_seed_state(
+				state,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad_valid,
+				cfg=cfg,
+				seed_xyz=seed_xyz,
+			)
+		stats["snaps_sdist"] = float(seed_model_dist)
+		stats["snaps_sext"] = float(seed_ext_dist)
+		stats["snaps_seed"] = 1.0 if ok else 0.0
+		stats["snaps_map_init"] = float(init_count)
+		_map_init_log(
+			"seed "
+			f"ok={int(ok)} "
+			f"seed_model_dist={seed_model_dist:.6g} "
+			f"seed_ext_dist={seed_ext_dist:.6g} "
+			f"init_active={init_count} "
+			f"seed_ext_sample={state.map_init.seed_ext_sample_hw} "
+			f"seed_model_quad={state.map_init.seed_model_quad} "
+			f"model_depth={state.map_init.model_depth} "
+			f"orientation_sign={state.map_init.orientation_sign} "
+			f"normal_sign={state.map_init.normal_sign}"
+		)
+		if ok:
+			last_terms: dict[str, torch.Tensor] = {}
+			while state.map_init.total_iters < int(cfg.map_init.iters):
+				before_active = state.map_init.active_count()
+				with torch.no_grad():
+					added = _map_init_grow_once(
+						state,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						cfg=cfg,
+					)
+				block = min(
+					int(cfg.map_init.grow_opt_iters),
+					int(cfg.map_init.iters) - int(state.map_init.total_iters),
+				)
+				_map_init_log(
+					"grow "
+					f"block={state.map_init.opt_blocks + 1} "
+					f"added={added} "
+					f"active={state.map_init.active_count()} "
+					f"prev_active={before_active} "
+					f"next_opt_steps={block}"
+				)
+				if block > 0:
+					last_terms = _map_init_optimize_block(
+						state,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						cfg=cfg,
+						steps=block,
+					)
+					_map_init_log(
+						"opt "
+						f"block={state.map_init.opt_blocks} "
+						f"iters={state.map_init.total_iters}/{cfg.map_init.iters} "
+						f"active={state.map_init.active_count()} "
+						f"loss={float(last_terms.get('loss', torch.zeros(())).detach().cpu()):.6g} "
+						f"dist={float(last_terms.get('dist', torch.zeros(())).detach().cpu()):.6g} "
+						f"jac={float(last_terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
+						f"jac_min={float(last_terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g}"
+					)
+				if added <= 0 or block <= 0:
+					break
+			if not last_terms and state.map_init.active is not None and state.map_init.uv is not None:
+				_, last_terms = _map_init_objective(
+					uv_full=state.map_init.uv,
+					active=state.map_init.active,
+					ext_pos=state.map_init.ext_pos,
+					ext_normals=state.map_init.ext_normals,
+					ext_valid=state.map_init.ext_valid,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					model_depth=int(state.map_init.model_depth),
+					normal_sign=state.map_init.normal_sign,
+					orientation_sign=state.map_init.orientation_sign,
+					cfg=cfg,
+				)
+			for key, stat_key in (
+				("loss", "snaps_map_loss"),
+				("dist", "snaps_map_dist"),
+				("vec", "snaps_map_vec"),
+				("norm", "snaps_map_norm"),
+				("smooth", "snaps_map_smooth"),
+				("bend", "snaps_map_bend"),
+				("jac", "snaps_map_jac"),
+				("jac_min", "snaps_map_jmin"),
+			):
+				if key in last_terms:
+					stats[stat_key] = float(last_terms[key].detach().cpu())
+	stats["snaps_map_active"] = float(state.map_init.active_count())
+	stats["snaps_map_added"] = float(state.map_init.added_total)
+	stats["snaps_map_iters"] = float(state.map_init.total_iters)
+	stats["snaps_map_blocks"] = float(state.map_init.opt_blocks)
+	stats["snaps_map_grow"] = float(state.map_init.grow_steps)
+	stats["snaps_map_nsign"] = float(state.map_init.normal_sign)
+	state.map_init.done = True
+	state.map_init.stats = stats
+	_map_init_log(
+		"done "
+		f"active={stats['snaps_map_active']:.0f} "
+		f"added_total={stats['snaps_map_added']:.0f} "
+		f"iters={stats['snaps_map_iters']:.0f} "
+		f"grow_steps={stats['snaps_map_grow']:.0f} "
+		f"loss={stats['snaps_map_loss']:.6g} "
+		f"normal_sign={state.map_init.normal_sign}"
+	)
+	return dict(stats)
+
+
 def _surface_records_from_res(res: fit_model.FitResult3D) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
 	records = getattr(res, "ext_surfaces", None)
 	if records is not None:
@@ -2786,6 +3688,18 @@ def _write_obj_lines(path: Path, a: torch.Tensor, b: torch.Tensor, *, label: str
 	path.write_text("".join(lines), encoding="utf-8")
 
 
+def _write_obj_points(path: Path, points: torch.Tensor, valid: torch.Tensor, *, label: str) -> None:
+	points_cpu = points.detach().cpu()
+	valid_cpu = valid.detach().cpu().bool() & torch.isfinite(points_cpu).all(dim=-1)
+	lines: list[str] = [f"# snap_surf {label}\n", f"o {label}\n"]
+	for p, ok in zip(points_cpu.reshape(-1, 3), valid_cpu.reshape(-1), strict=False):
+		if not bool(ok):
+			continue
+		q = p.tolist()
+		lines.append(f"v {q[0]:.9g} {q[1]:.9g} {q[2]:.9g}\n")
+	path.write_text("".join(lines), encoding="utf-8")
+
+
 def _debug_write_snap_objs(
 	*,
 	cfg: SnapSurfConfig,
@@ -2832,6 +3746,86 @@ def _debug_write_snap_objs(
 		_write_obj_lines(iter_dir / f"{prefix}corr_ext_to_model.obj", model_xyz.new_empty(0, 3), model_xyz.new_empty(0, 3), label="corr_ext_to_model")
 
 
+def _debug_write_map_init_objs(
+	*,
+	cfg: SnapSurfConfig,
+	surface_index: int,
+	surface_count: int,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	state: _SurfaceState,
+) -> None:
+	iter_dir = _debug_obj_iter_dir(cfg)
+	if iter_dir is None:
+		_map_init_log(
+			"obj skip "
+			f"debug_obj_dir={cfg.debug_obj_dir!r} "
+			f"debug_step={_debug_step} "
+			f"debug_obj_interval={cfg.debug_obj_interval}"
+		)
+		return
+	iter_dir.mkdir(parents=True, exist_ok=True)
+	_map_init_log(f"obj write dir={iter_dir}")
+	prefix = "" if int(surface_count) == 1 else f"surf{int(surface_index):03d}_"
+
+	def paths(name: str) -> list[Path]:
+		out = [iter_dir / f"{prefix}{name}"]
+		if int(surface_count) > 1 and int(surface_index) == 0:
+			out.append(iter_dir / name)
+		return out
+
+	def write_mesh_2d(name: str, xyz: torch.Tensor, valid: torch.Tensor) -> None:
+		for path in paths(name):
+			_write_obj_mesh_2d(path, xyz, valid)
+
+	def write_mesh_3d(name: str, xyz: torch.Tensor, valid: torch.Tensor) -> None:
+		for path in paths(name):
+			_write_obj_mesh_3d_surfaces(path, xyz, valid)
+
+	def write_lines(name: str, a: torch.Tensor, b: torch.Tensor, *, label: str) -> None:
+		for path in paths(name):
+			_write_obj_lines(path, a, b, label=label)
+
+	def write_points(name: str, points: torch.Tensor, valid: torch.Tensor, *, label: str) -> None:
+		for path in paths(name):
+			_write_obj_points(path, points, valid, label=label)
+
+	write_mesh_2d("ext_surface.obj", ext_xyz, ext_valid)
+	write_mesh_3d("model_surface.obj", model_xyz, model_valid)
+	mi = state.map_init
+	empty = model_xyz.new_empty(0, 3)
+	write_lines("corr_model_to_ext.obj", empty, empty, label="map_init_no_corr_model_to_ext")
+	write_lines("corr_ext_to_model.obj", empty, empty, label="map_init_no_corr_ext_to_model")
+	if (
+		mi.active is None or mi.uv is None or mi.ext_pos is None or
+		mi.model_depth is None or mi.active_count() <= 0
+	):
+		write_mesh_2d("map_mapped_surface.obj", model_xyz.new_empty(0, 0, 3), torch.zeros(0, 0, device=model_xyz.device, dtype=torch.bool))
+		write_lines("map_ext_to_model.obj", empty, empty, label="map_ext_to_model")
+		write_points("map_active_mask.obj", empty, torch.zeros(0, device=model_xyz.device, dtype=torch.bool), label="map_active_mask")
+		return
+	coords3 = _map_init_coords3(mi.uv, depth=int(mi.model_depth))
+	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+	mapped = _sample_surface_grid(model_xyz, safe_coords)
+	ok = mi.active.bool() & torch.isfinite(mi.uv).all(dim=-1) & torch.isfinite(mapped).all(dim=-1)
+	mapped_grid = torch.where(ok.unsqueeze(-1), mapped, torch.full_like(mapped, float("nan")))
+	write_mesh_2d("map_mapped_surface.obj", mapped_grid, ok)
+	if bool(ok.any().detach().cpu()):
+		write_lines("map_ext_to_model.obj", mi.ext_pos[ok], mapped[ok], label="map_ext_to_model")
+	else:
+		write_lines("map_ext_to_model.obj", empty, empty, label="map_ext_to_model")
+	write_points("map_active_mask.obj", mi.ext_pos, mi.active.bool(), label="map_active_mask")
+	_map_init_log(
+		"obj wrote "
+		f"prefix={prefix!r} "
+		f"active={int(mi.active.sum().detach().cpu())} "
+		f"mapped={int(ok.sum().detach().cpu())} "
+		"files=map_ext_to_model.obj,map_mapped_surface.obj,map_active_mask.obj"
+	)
+
+
 def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Stateful external-surface snapping loss with explicit grown correspondences."""
 	global _last_stats
@@ -2855,6 +3849,92 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 
 	while len(_states) < len(records):
 		_states.append(_SurfaceState())
+
+	if cfg.map_init.enabled:
+		_map_init_log(
+			"loss call "
+			f"stage={_stage_label!r} "
+			f"surfaces={len(records)} "
+			f"debug_step={_debug_step} "
+			f"debug_label={_debug_label!r} "
+			f"debug_dir={_debug_obj_iter_dir(cfg)}"
+		)
+		z = res.xyz_lr.sum() * 0.0
+		lm_zero = torch.zeros(res.xyz_lr.shape[:3], device=device, dtype=dtype).unsqueeze(1)
+		mask_zero = torch.zeros_like(lm_zero)
+		stats = _map_init_empty_stats()
+		stats["snaps_sdist"] = float("inf")
+		stats["snaps_sext"] = float("inf")
+		avg_keys = {
+			"snaps_map_loss", "snaps_map_dist", "snaps_map_vec", "snaps_map_norm",
+			"snaps_map_smooth", "snaps_map_bend", "snaps_map_jac",
+			"snaps_map_jmin", "snaps_map_nsign",
+		}
+		for k in avg_keys:
+			stats[k] = 0.0
+		for si, (ext_xyz, ext_valid, ext_normals, ext_quad_valid) in enumerate(records):
+			state = _states[si]
+			ext_xyz = ext_xyz.to(device=device, dtype=dtype).detach()
+			ext_valid = ext_valid.to(device=device).bool()
+			ext_normals = ext_normals.to(device=device, dtype=dtype).detach()
+			ext_quad_valid = ext_quad_valid.to(device=device).bool()
+			ext_valid = ext_valid & torch.isfinite(ext_xyz).all(dim=-1)
+			if int(ext_valid.shape[0]) > 1 and int(ext_valid.shape[1]) > 1:
+				corner_quad_valid = (
+					ext_valid[:-1, :-1] &
+					ext_valid[1:, :-1] &
+					ext_valid[:-1, 1:] &
+					ext_valid[1:, 1:]
+				)
+				if tuple(ext_quad_valid.shape) == tuple(corner_quad_valid.shape):
+					ext_quad_valid = ext_quad_valid & corner_quad_valid
+				else:
+					ext_quad_valid = corner_quad_valid
+			state.ensure(
+				model_shape=tuple(int(v) for v in res.xyz_lr.shape[:3]),
+				ext_shape=tuple(int(v) for v in ext_xyz.shape[:2]),
+				device=device,
+				dtype=dtype,
+			)
+			map_stats = _run_map_init_for_surface(
+				state,
+				model_xyz=model_xyz_det,
+				model_valid=model_valid,
+				model_normals=model_normals_det,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad_valid,
+				cfg=cfg,
+				seed_xyz=_seed_xyz,
+			)
+			stats["snaps_sdist"] = min(stats["snaps_sdist"], float(map_stats.get("snaps_sdist", float("inf"))))
+			stats["snaps_sext"] = min(stats["snaps_sext"], float(map_stats.get("snaps_sext", float("inf"))))
+			for k, v in map_stats.items():
+				if k in {"snaps_sdist", "snaps_sext"}:
+					continue
+				stats[k] = float(stats.get(k, 0.0)) + float(v)
+			_debug_write_map_init_objs(
+				cfg=cfg,
+				surface_index=si,
+				surface_count=len(records),
+				model_xyz=model_xyz_det,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				state=state,
+			)
+		stats["snaps_seed"] = _safe_frac(stats["snaps_seed"], len(records))
+		for k in avg_keys:
+			stats[k] = _safe_frac(stats.get(k, 0.0), len(records))
+		_last_stats = stats
+		return z, (lm_zero,), (mask_zero,)
+
+	if _debug_step == 0:
+		_snap_surf_log(
+			"map_init disabled for this active snap_surf stage; "
+			f"stage={_stage_label!r}; using legacy correspondence snapping"
+		)
 
 	total = res.xyz_lr.new_zeros(())
 	total_weight = 0.0

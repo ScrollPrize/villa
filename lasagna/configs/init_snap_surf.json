@@ -31,21 +31,6 @@
 				"station_n": 10.0,
 				"station_t": 10.0,
 				"snap_surf": 0.0
-			},
-			"args": {
-				"snap_surf": {
-					"init_distance": 10.0,
-					"point_distance": 50.0,
-					"grid_error": 0.75,
-					"affine_radius": 2,
-					"search_ring": 1,
-					"huber_delta": 5.0,
-					"distance_scale": 1.0,
-					"w_to_ext": 1.0,
-					"w_to_model": 1.0,
-					"orientation": "auto",
-					"debug_obj_dir": null
-				}
 			}
 		},
 		{
@@ -59,21 +44,6 @@
 				"station_n": 10.0,
 				"station_t": 10.0,
 				"snap_surf": 0.0
-			},
-			"args": {
-				"snap_surf": {
-					"init_distance": 10.0,
-					"point_distance": 50.0,
-					"grid_error": 0.75,
-					"affine_radius": 2,
-					"search_ring": 1,
-					"huber_delta": 5.0,
-					"distance_scale": 1.0,
-					"w_to_ext": 1.0,
-					"w_to_model": 1.0,
-					"orientation": "auto",
-					"debug_obj_dir": null
-				}
 			}
 		},
 		{
@@ -92,7 +62,10 @@
 					"init_distance": 10.0,
 					"w_to_ext": 1.0,
 					"debug_obj_dir": true,
-					"map_inlier_distance": 4.0
+					"map_inlier_distance": 4.0,
+					"map_init": {
+						"enabled": true
+					}
 				}
 			}
 		}

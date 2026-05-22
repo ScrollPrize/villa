@@ -1195,10 +1195,16 @@ def optimize(
 			snap_surf_args = dict(snap_surf_args)
 			if snap_surf_args.get("debug_obj_dir") and "debug_obj_interval" not in snap_surf_args:
 				snap_surf_args["debug_obj_interval"] = max(1, int(status_interval or opt_cfg.steps or 1))
+		print(
+			f"[optimizer] {label}: snap_surf_weight={_need_term('snap_surf', stage_eff):.6g} "
+			f"snap_surf_args={snap_surf_args}",
+			flush=True,
+		)
 		opt_loss_snap_surf.configure_snap_surf(
 			cfg=snap_surf_args,
 			seed_xyz=seed_xyz,
 			active=_need_term("snap_surf", stage_eff) > 0.0,
+			stage_label=f"{label}:{stage.name}",
 		)
 		if _need_term("snap_surf", stage_eff) > 0.0 and not getattr(model, "_ext_surfaces", None):
 			raise ValueError("snap_surf requires external_surfaces")
@@ -1385,6 +1391,21 @@ def optimize(
 				"snaps_dbg_grid": "sd_grd",
 				"snaps_dbg_ori": "sd_ori",
 				"snaps_dbg_new": "sd_new",
+				"snaps_map_active": "sm_act",
+				"snaps_map_init": "sm_ini",
+				"snaps_map_added": "sm_add",
+				"snaps_map_iters": "sm_it",
+				"snaps_map_blocks": "sm_blk",
+				"snaps_map_grow": "sm_grw",
+				"snaps_map_loss": "sm_los",
+				"snaps_map_dist": "sm_dst",
+				"snaps_map_vec": "sm_vec",
+				"snaps_map_norm": "sm_nrm",
+				"snaps_map_smooth": "sm_smo",
+				"snaps_map_bend": "sm_bnd",
+				"snaps_map_jac": "sm_jac",
+				"snaps_map_jmin": "sm_jmn",
+				"snaps_map_nsign": "sm_sgn",
 				"cyl_outside_pen_frac": "out%",
 				"cyl_outside_depth_max": "outmax",
 				"cyl_outside_depth_avg": "outavg",
@@ -1431,6 +1452,21 @@ def optimize(
 				"snaps_dbg_grid": 132,
 				"snaps_dbg_ori": 133,
 				"snaps_dbg_new": 134,
+				"snaps_map_active": 135,
+				"snaps_map_init": 136,
+				"snaps_map_added": 137,
+				"snaps_map_iters": 138,
+				"snaps_map_blocks": 139,
+				"snaps_map_grow": 140,
+				"snaps_map_loss": 141,
+				"snaps_map_dist": 142,
+				"snaps_map_vec": 143,
+				"snaps_map_norm": 144,
+				"snaps_map_smooth": 145,
+				"snaps_map_bend": 146,
+				"snaps_map_jac": 147,
+				"snaps_map_jmin": 148,
+				"snaps_map_nsign": 149,
 				"cyl_outside_pen_frac": 160,
 				"cyl_outside_depth_max": 161,
 				"cyl_outside_depth_avg": 162,

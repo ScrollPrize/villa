@@ -400,6 +400,15 @@ def main(argv: list[str] | None = None) -> int:
 			cfg,
 			init_mode=model_cfg.init_mode if model_init == "seed" else None,
 		)
+		print("[fit] optimizer stages:", flush=True)
+		for i, st in enumerate(stages):
+			args_snap = st.global_opt.args.get("snap_surf") if isinstance(st.global_opt.args, dict) else None
+			print(
+				f"[fit]   stage{i} name={st.name!r} steps={st.global_opt.steps} "
+				f"snap_surf_eff={st.global_opt.eff.get('snap_surf', 0.0):.6g} "
+				f"snap_surf_args={args_snap}",
+				flush=True,
+			)
 
 		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
 		n_windows = len(windows)
@@ -695,6 +704,15 @@ def main(argv: list[str] | None = None) -> int:
 		cfg,
 		init_mode=model_cfg.init_mode if model_init == "seed" else None,
 	)
+	print("[fit] optimizer stages:", flush=True)
+	for i, st in enumerate(stages):
+		args_snap = st.global_opt.args.get("snap_surf") if isinstance(st.global_opt.args, dict) else None
+		print(
+			f"[fit]   stage{i} name={st.name!r} steps={st.global_opt.steps} "
+			f"snap_surf_eff={st.global_opt.eff.get('snap_surf', 0.0):.6g} "
+			f"snap_surf_args={args_snap}",
+			flush=True,
+		)
 	_stage_done("load_optimizer_stages", _t)
 
 	# --- Streaming data loader ---

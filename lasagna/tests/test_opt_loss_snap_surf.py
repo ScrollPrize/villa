@@ -739,6 +739,146 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertGreater(stats["snaps_tow"], 0.0)
 		self.assertGreater(float(model_xyz.grad[..., 2].mean().detach()), 0.0)
 
+	def test_map_init_config_parse_and_validation(self) -> None:
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"map_init": {"enabled": True, "subdiv": 2, "iters": 3}},
+			seed_xyz=(1.0, 1.0, 0.0),
+			active=True,
+		)
+
+		self.assertTrue(opt_loss_snap_surf._cfg.map_init.enabled)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.subdiv, 2)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.iters, 3)
+		with self.assertRaises(ValueError):
+			opt_loss_snap_surf.configure_snap_surf(
+				cfg={"map_init": {"unknown": 1}},
+				seed_xyz=(1.0, 1.0, 0.0),
+				active=True,
+			)
+
+	def test_map_init_returns_zero_loss_and_zero_model_gradient(self) -> None:
+		model_xyz = (_plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)).requires_grad_(True)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"map_init": {"enabled": True, "subdiv": 1, "iters": 2, "grow_opt_iters": 1}},
+			seed_xyz=(1.5, 1.5, 0.0),
+			active=True,
+		)
+
+		loss, _, _ = opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		loss.backward()
+
+		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
+		self.assertIsNotNone(model_xyz.grad)
+		self.assertAlmostEqual(float(model_xyz.grad.abs().sum().detach()), 0.0, places=6)
+		self.assertGreater(opt_loss_snap_surf.last_stats()["snaps_map_active"], 0.0)
+
+	def test_map_init_planar_aligned_surfaces_produce_identity_map(self) -> None:
+		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"map_init": {"enabled": True, "subdiv": 1, "iters": 2, "grow_opt_iters": 1, "seed_radius": 1}},
+			seed_xyz=(1.5, 1.5, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		mi = opt_loss_snap_surf._states[0].map_init
+		self.assertTrue(mi.done)
+		self.assertGreater(mi.active_count(), 0)
+		delta = (mi.uv[mi.active] - mi.ext_coords[mi.active]).abs().max()
+		self.assertLess(float(delta.detach()), 0.2)
+
+	def test_map_init_inverted_external_normals_choose_negative_sign(self) -> None:
+		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		ext_normals = -_normals_2d(4, 4)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"map_init": {"enabled": True, "subdiv": 1, "iters": 1, "grow_opt_iters": 1}},
+			seed_xyz=(1.5, 1.5, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz, ext_normals=ext_normals))
+
+		self.assertEqual(opt_loss_snap_surf._states[0].map_init.normal_sign, -1)
+		self.assertEqual(opt_loss_snap_surf.last_stats()["snaps_map_nsign"], -1.0)
+
+	def test_map_init_normal_sign_is_held_after_initialization(self) -> None:
+		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"map_init": {"enabled": True, "subdiv": 1, "iters": 1, "grow_opt_iters": 1}},
+			seed_xyz=(1.5, 1.5, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz, ext_normals=-_normals_2d(4, 4)))
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz, ext_normals=_normals_2d(4, 4)))
+
+		self.assertEqual(opt_loss_snap_surf._states[0].map_init.normal_sign, -1)
+		self.assertEqual(opt_loss_snap_surf.last_stats()["snaps_map_nsign"], -1.0)
+
+	def test_map_init_angle_distance_multiplier_at_ninety_degrees(self) -> None:
+		cfg = opt_loss_snap_surf.SnapSurfMapInitConfig(angle_dist_mult=9.0)
+		got = opt_loss_snap_surf._map_init_distance_multiplier(
+			torch.tensor([1.0]),
+			torch.tensor([0.0]),
+			cfg,
+		)
+
+		self.assertAlmostEqual(float(got[0]), 10.0, places=5)
+
+	def test_map_init_jacobian_penalty_catches_flipped_cells(self) -> None:
+		active = torch.ones(2, 2, dtype=torch.bool)
+		uv_ok = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
+		uv_flip = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[-1.0, 0.0], [-1.0, 1.0]]])
+
+		ok_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
+			uv_ok,
+			active,
+			orientation_sign=1,
+			jac_margin=0.05,
+		)
+		flip_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
+			uv_flip,
+			active,
+			orientation_sign=1,
+			jac_margin=0.05,
+		)
+
+		self.assertAlmostEqual(float(ok_pen.detach()), 0.0, places=6)
+		self.assertGreater(float(flip_pen.detach()), 0.0)
+
+	def test_map_init_debug_obj_outputs_write_files(self) -> None:
+		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		with tempfile.TemporaryDirectory() as tmp:
+			opt_loss_snap_surf.configure_snap_surf(
+				cfg={
+					"debug_obj_dir": tmp,
+					"debug_obj_interval": 1,
+					"map_init": {"enabled": True, "subdiv": 1, "iters": 1, "grow_opt_iters": 1},
+				},
+				seed_xyz=(1.5, 1.5, 0.0),
+				active=True,
+			)
+			opt_loss_snap_surf.set_debug_step(0, label="map_init")
+			out = os.path.join(tmp, "map_init_step000000")
+			os.makedirs(out, exist_ok=True)
+			stale_corr = os.path.join(out, "corr_ext_to_model.obj")
+			with open(stale_corr, "w", encoding="utf-8") as f:
+				f.write("stale previous grow\n")
+
+			opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+
+			for name in ("ext_surface.obj", "model_surface.obj", "map_mapped_surface.obj", "map_ext_to_model.obj", "map_active_mask.obj"):
+				path = os.path.join(out, name)
+				self.assertTrue(os.path.exists(path), name)
+				self.assertGreater(os.path.getsize(path), 0, name)
+			with open(stale_corr, "r", encoding="utf-8") as f:
+				self.assertIn("map_init_no_corr_ext_to_model", f.read())
+
 
 if __name__ == "__main__":
 	unittest.main()
