@@ -1113,6 +1113,117 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertGreater(float(terms["metric_smooth"].detach()), 0.0)
 		self.assertAlmostEqual(float(terms["area_smooth"].detach()), 0.0, places=6)
 
+	def test_map_init_local_evenness_uses_model_surface_lengths(self) -> None:
+		H, W = 4, 3
+		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		ww = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		uv = torch.stack([hh, ww], dim=-1)
+		ext_xyz = _plane_xyz(h=H, w=W, z=0.0)
+		model_xyz = _plane_xyz(h=H, w=W, z=1.0)
+		model_xyz[..., 1] = torch.tensor([0.0, 1.0, 5.0, 6.0]).view(H, 1).expand(H, W)
+		active = torch.ones(H - 1, W - 1, dtype=torch.bool)
+
+		uv_terms = opt_loss_snap_surf._map_init_local_evenness_terms(uv, ext_xyz, active)
+		model_terms = opt_loss_snap_surf._map_init_local_evenness_terms(
+			uv,
+			ext_xyz,
+			active,
+			model_xyz=model_xyz.unsqueeze(0),
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+			model_depth=0,
+		)
+
+		self.assertAlmostEqual(float(uv_terms["metric_smooth"].detach()), 0.0, places=6)
+		self.assertGreater(float(model_terms["metric_smooth"].detach()), 0.0)
+		self.assertGreater(float(model_terms["area_smooth"].detach()), 0.0)
+
+	def test_map_init_forward_smoothness_includes_uv_and_model_surface(self) -> None:
+		H, W = 4, 3
+		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		ww = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		uv = torch.stack([hh, ww], dim=-1)
+		model_xyz = _plane_xyz(h=H, w=W, z=1.0)
+		model_xyz[..., 1] = torch.tensor([0.0, 1.0, 5.0, 6.0]).view(H, 1).expand(H, W)
+
+		_, terms = opt_loss_snap_surf._map_init_objective(
+			uv_full=uv,
+			active_quad=torch.ones(H - 1, W - 1, dtype=torch.bool),
+			ext_pos=_plane_xyz(h=H, w=W, z=0.0),
+			ext_normals=_normals_2d(H, W),
+			ext_valid=torch.ones(H, W, dtype=torch.bool),
+			ext_quad_valid=torch.ones(H - 1, W - 1, dtype=torch.bool),
+			model_xyz=model_xyz.unsqueeze(0),
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+			model_normals=_normals_3d(1, H, W),
+			model_depth=0,
+			normal_sign=1,
+			orientation_sign=1,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					w_dist=0.0,
+					w_vec_normal=0.0,
+					w_surface_normal=0.0,
+					w_jac=0.0,
+					w_metric_smooth=0.0,
+					w_area_smooth=0.0,
+					w_dense_prior=0.0,
+				),
+			),
+		)
+
+		expected_smooth = terms["smooth_uv_fwd"] + terms["smooth_model_fwd"] + terms["smooth_rev"]
+		expected_bend = terms["bend_uv_fwd"] + terms["bend_model_fwd"] + terms["bend_rev"]
+		self.assertGreater(float(terms["smooth_model_fwd"].detach()), float(terms["smooth_uv_fwd"].detach()))
+		self.assertAlmostEqual(float(terms["bend_uv_fwd"].detach()), 0.0, places=6)
+		self.assertGreater(float(terms["bend_model_fwd"].detach()), 0.0)
+		self.assertAlmostEqual(float(terms["smooth"].detach()), float(expected_smooth.detach()), places=6)
+		self.assertAlmostEqual(float(terms["bend"].detach()), float(expected_bend.detach()), places=6)
+
+	def test_map_init_model_surface_smoothness_is_physical_scale_normalized(self) -> None:
+		H, W = 4, 3
+		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		ww = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		uv = torch.stack([hh, ww], dim=-1)
+		model_xyz = _plane_xyz(h=H, w=W, z=1.0)
+		model_xyz[..., 1] = torch.tensor([0.0, 1.0, 5.0, 6.0]).view(H, 1).expand(H, W)
+
+		def eval_terms(ext_pos: torch.Tensor) -> dict[str, torch.Tensor]:
+			_, terms = opt_loss_snap_surf._map_init_objective(
+				uv_full=uv,
+				active_quad=torch.ones(H - 1, W - 1, dtype=torch.bool),
+				ext_pos=ext_pos,
+				ext_normals=_normals_2d(H, W),
+				ext_valid=torch.ones(H, W, dtype=torch.bool),
+				ext_quad_valid=torch.ones(H - 1, W - 1, dtype=torch.bool),
+				model_xyz=model_xyz.unsqueeze(0),
+				model_valid=torch.ones(1, H, W, dtype=torch.bool),
+				model_normals=_normals_3d(1, H, W),
+				model_depth=0,
+				normal_sign=1,
+				orientation_sign=1,
+				cfg=opt_loss_snap_surf.SnapSurfConfig(
+					map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+						w_dist=0.0,
+						w_vec_normal=0.0,
+						w_surface_normal=0.0,
+						w_jac=0.0,
+						w_metric_smooth=0.0,
+						w_area_smooth=0.0,
+						w_dense_prior=0.0,
+					),
+				),
+			)
+			return terms
+
+		ext_unit = _plane_xyz(h=H, w=W, z=0.0)
+		ext_scaled = ext_unit.clone()
+		ext_scaled[..., :2] *= 10.0
+		unit_terms = eval_terms(ext_unit)
+		scaled_terms = eval_terms(ext_scaled)
+
+		self.assertLess(float(scaled_terms["smooth_model_fwd"].detach()), float(unit_terms["smooth_model_fwd"].detach()) / 50.0)
+		self.assertLess(float(scaled_terms["bend_model_fwd"].detach()), float(unit_terms["bend_model_fwd"].detach()) / 50.0)
+
 	def test_map_init_local_evenness_detects_area_jump(self) -> None:
 		H, W = 2, 3
 		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
@@ -1388,10 +1499,17 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertTrue(bool(state.map_init.blocked_quad[0, 0]))
 
 	def test_map_init_sparse_cleanup_recursively_removes_under_supported_quads(self) -> None:
-		active = torch.ones(3, 3, dtype=torch.bool)
-		sparse = opt_loss_snap_surf._map_init_sparse_quad_mask(active, min_neighbors=4)
+		active = torch.zeros(3, 3, dtype=torch.bool)
+		active[1, :] = True
+		sparse = opt_loss_snap_surf._map_init_sparse_quad_mask(active, min_neighbors=3)
 
 		self.assertTrue(torch.equal(sparse, active))
+
+	def test_map_init_sparse_cleanup_keeps_solid_frontier_at_threshold_three(self) -> None:
+		active = torch.ones(3, 3, dtype=torch.bool)
+		sparse = opt_loss_snap_surf._map_init_sparse_quad_mask(active, min_neighbors=3)
+
+		self.assertFalse(bool(sparse.any()))
 
 	def test_map_init_blocked_quads_are_revisited_on_progress_interval(self) -> None:
 		state = opt_loss_snap_surf._SurfaceState()

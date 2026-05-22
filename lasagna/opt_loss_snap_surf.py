@@ -3538,11 +3538,136 @@ def _map_init_mean_square_diffs(
 	return torch.where(count > 0.0, total / count.clamp_min(1.0), z)
 
 
+def _map_init_model_metric_positions(
+	uv: torch.Tensor,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor | None,
+	model_depth: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	finite_uv = torch.isfinite(uv).all(dim=-1)
+	if model_xyz.ndim == 4:
+		if model_depth is None:
+			return uv, finite_uv
+		coords = _map_init_coords3(uv, depth=int(model_depth))
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		pos = _sample_surface_grid(model_xyz, safe_coords)
+		valid = torch.isfinite(coords).all(dim=-1) & torch.isfinite(pos).all(dim=-1)
+		if model_valid is not None:
+			valid = valid & _quad_valid_at_coords(
+				model_valid.bool(),
+				safe_coords,
+				tuple(int(v) for v in model_valid.shape),
+			)
+		return pos, valid
+	if model_xyz.ndim == 3:
+		safe_coords = torch.where(torch.isfinite(uv), uv, torch.zeros_like(uv))
+		pos = _sample_surface_grid(model_xyz, safe_coords)
+		valid = finite_uv & torch.isfinite(pos).all(dim=-1)
+		if model_valid is not None:
+			valid = valid & _quad_valid_at_coords(
+				model_valid.bool(),
+				safe_coords,
+				tuple(int(v) for v in model_valid.shape),
+			)
+		return pos, valid
+	return uv, finite_uv
+
+
+def _map_init_forward_smooth_bend_terms(
+	field: torch.Tensor,
+	vertex_valid: torch.Tensor,
+	reg_quad: torch.Tensor,
+	z: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+	H, W = int(field.shape[0]), int(field.shape[1])
+	field_safe = torch.where(vertex_valid.bool().unsqueeze(-1), field, torch.zeros_like(field))
+	smooth_vals: list[torch.Tensor] = []
+	if H > 1:
+		edge = torch.zeros(H - 1, W, device=field.device, dtype=torch.bool)
+		if reg_quad.numel():
+			edge[:, :-1] |= reg_quad
+			edge[:, 1:] |= reg_quad
+		m = edge & vertex_valid[1:, :] & vertex_valid[:-1, :]
+		dv = field_safe[1:, :] - field_safe[:-1, :]
+		finite = m & torch.isfinite(dv).all(dim=-1)
+		if bool(finite.any().detach().cpu()):
+			smooth_vals.append(dv.square().sum(dim=-1)[finite])
+	if W > 1:
+		edge = torch.zeros(H, W - 1, device=field.device, dtype=torch.bool)
+		if reg_quad.numel():
+			edge[:-1, :] |= reg_quad
+			edge[1:, :] |= reg_quad
+		m = edge & vertex_valid[:, 1:] & vertex_valid[:, :-1]
+		dv = field_safe[:, 1:] - field_safe[:, :-1]
+		finite = m & torch.isfinite(dv).all(dim=-1)
+		if bool(finite.any().detach().cpu()):
+			smooth_vals.append(dv.square().sum(dim=-1)[finite])
+	smooth = torch.cat(smooth_vals).mean() if smooth_vals else z
+
+	if H > 2 and W > 2:
+		m = (
+			vertex_valid[1:-1, 1:-1] &
+			vertex_valid[:-2, 1:-1] &
+			vertex_valid[2:, 1:-1] &
+			vertex_valid[1:-1, :-2] &
+			vertex_valid[1:-1, 2:]
+		)
+		lap = (
+			field_safe[:-2, 1:-1] +
+			field_safe[2:, 1:-1] +
+			field_safe[1:-1, :-2] +
+			field_safe[1:-1, 2:] -
+			4.0 * field_safe[1:-1, 1:-1]
+		)
+		finite = m & torch.isfinite(lap).all(dim=-1)
+		bend = lap.square().sum(dim=-1)[finite].mean() if bool(finite.any().detach().cpu()) else z
+	else:
+		bend = z
+	return {"smooth": smooth, "bend": bend}
+
+
+def _map_init_reference_edge_square(
+	ext_pos: torch.Tensor,
+	finite_ext: torch.Tensor,
+	reg_quad: torch.Tensor,
+	z: torch.Tensor,
+) -> torch.Tensor:
+	H, W = int(ext_pos.shape[0]), int(ext_pos.shape[1])
+	values: list[torch.Tensor] = []
+	if H > 1:
+		edge = torch.zeros(H - 1, W, device=ext_pos.device, dtype=torch.bool)
+		if reg_quad.numel():
+			edge[:, :-1] |= reg_quad
+			edge[:, 1:] |= reg_quad
+		dv = ext_pos[1:, :] - ext_pos[:-1, :]
+		valid = edge & finite_ext[1:, :] & finite_ext[:-1, :] & torch.isfinite(dv).all(dim=-1)
+		if bool(valid.any().detach().cpu()):
+			values.append(dv.square().sum(dim=-1)[valid])
+	if W > 1:
+		edge = torch.zeros(H, W - 1, device=ext_pos.device, dtype=torch.bool)
+		if reg_quad.numel():
+			edge[:-1, :] |= reg_quad
+			edge[1:, :] |= reg_quad
+		dv = ext_pos[:, 1:] - ext_pos[:, :-1]
+		valid = edge & finite_ext[:, 1:] & finite_ext[:, :-1] & torch.isfinite(dv).all(dim=-1)
+		if bool(valid.any().detach().cpu()):
+			values.append(dv.square().sum(dim=-1)[valid])
+	if not values:
+		return torch.ones((), device=z.device, dtype=z.dtype)
+	return torch.cat(values).mean().clamp_min(1.0e-6)
+
+
 def _map_init_local_evenness_terms(
 	uv: torch.Tensor,
 	ext_pos: torch.Tensor,
 	active_quad: torch.Tensor,
 	*,
+	metric_pos: torch.Tensor | None = None,
+	metric_valid: torch.Tensor | None = None,
+	model_xyz: torch.Tensor | None = None,
+	model_valid: torch.Tensor | None = None,
+	model_depth: int | None = None,
 	eps: float = 1.0e-6,
 ) -> dict[str, torch.Tensor]:
 	z = uv[torch.isfinite(uv)].sum() * 0.0 if uv.numel() else torch.zeros((), device=uv.device, dtype=uv.dtype)
@@ -3552,21 +3677,32 @@ def _map_init_local_evenness_terms(
 
 	finite_uv = torch.isfinite(uv).all(dim=-1)
 	finite_ext = torch.isfinite(ext_pos).all(dim=-1)
-	quad = active_quad.bool() & _map_init_quad_corner_all(finite_uv) & _map_init_quad_corner_all(finite_ext)
-	safe_uv = torch.where(finite_uv.unsqueeze(-1), uv, torch.zeros_like(uv))
+	if metric_pos is None or metric_valid is None:
+		if model_xyz is not None:
+			metric_pos, metric_valid = _map_init_model_metric_positions(
+				uv,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_depth=model_depth,
+			)
+		else:
+			metric_pos = uv
+			metric_valid = finite_uv
+	quad = active_quad.bool() & _map_init_quad_corner_all(metric_valid) & _map_init_quad_corner_all(finite_ext)
+	safe_metric = torch.where(metric_valid.unsqueeze(-1), metric_pos, torch.zeros_like(metric_pos))
 	safe_ext = torch.where(finite_ext.unsqueeze(-1), ext_pos, torch.zeros_like(ext_pos))
 	eps_t = torch.tensor(float(eps), device=uv.device, dtype=uv.dtype)
 
 	edge_h = torch.zeros(H - 1, W, device=uv.device, dtype=torch.bool)
 	edge_h[:, :-1] |= quad
 	edge_h[:, 1:] |= quad
-	duv_h = safe_uv[1:, :] - safe_uv[:-1, :]
+	duv_h = safe_metric[1:, :] - safe_metric[:-1, :]
 	dext_h = safe_ext[1:, :] - safe_ext[:-1, :]
 	uv_len_h = duv_h.norm(dim=-1)
 	ext_len_h = dext_h.norm(dim=-1)
 	valid_h = (
 		edge_h &
-		finite_uv[1:, :] & finite_uv[:-1, :] &
+		metric_valid[1:, :] & metric_valid[:-1, :] &
 		finite_ext[1:, :] & finite_ext[:-1, :] &
 		torch.isfinite(uv_len_h) & torch.isfinite(ext_len_h)
 	)
@@ -3575,13 +3711,13 @@ def _map_init_local_evenness_terms(
 	edge_w = torch.zeros(H, W - 1, device=uv.device, dtype=torch.bool)
 	edge_w[:-1, :] |= quad
 	edge_w[1:, :] |= quad
-	duv_w = safe_uv[:, 1:] - safe_uv[:, :-1]
+	duv_w = safe_metric[:, 1:] - safe_metric[:, :-1]
 	dext_w = safe_ext[:, 1:] - safe_ext[:, :-1]
 	uv_len_w = duv_w.norm(dim=-1)
 	ext_len_w = dext_w.norm(dim=-1)
 	valid_w = (
 		edge_w &
-		finite_uv[:, 1:] & finite_uv[:, :-1] &
+		metric_valid[:, 1:] & metric_valid[:, :-1] &
 		finite_ext[:, 1:] & finite_ext[:, :-1] &
 		torch.isfinite(uv_len_w) & torch.isfinite(ext_len_w)
 	)
@@ -3601,11 +3737,17 @@ def _map_init_local_evenness_terms(
 	def cross2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 		return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
-	p00 = safe_uv[:-1, :-1]
-	p10 = safe_uv[1:, :-1]
-	p01 = safe_uv[:-1, 1:]
-	p11 = safe_uv[1:, 1:]
-	uv_area = 0.5 * cross2(p10 - p00, p01 - p00).abs() + 0.5 * cross2(p11 - p10, p11 - p01).abs()
+	p00 = safe_metric[:-1, :-1]
+	p10 = safe_metric[1:, :-1]
+	p01 = safe_metric[:-1, 1:]
+	p11 = safe_metric[1:, 1:]
+	if int(safe_metric.shape[-1]) == 2:
+		uv_area = 0.5 * cross2(p10 - p00, p01 - p00).abs() + 0.5 * cross2(p11 - p10, p11 - p01).abs()
+	else:
+		uv_area = (
+			0.5 * torch.cross(p10 - p00, p01 - p00, dim=-1).norm(dim=-1) +
+			0.5 * torch.cross(p11 - p10, p11 - p01, dim=-1).norm(dim=-1)
+		)
 
 	e00 = safe_ext[:-1, :-1]
 	e10 = safe_ext[1:, :-1]
@@ -3791,48 +3933,32 @@ def _map_init_objective(
 	)
 	reg_count = int(reg_finite.sum().detach().cpu())
 	uv_safe = torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
-	smooth_vals: list[torch.Tensor] = []
-	if int(uv_full.shape[0]) > 1:
-		edge = torch.zeros(int(uv_full.shape[0]) - 1, int(uv_full.shape[1]), device=uv_full.device, dtype=torch.bool)
-		if reg_quad.numel():
-			edge[:, :-1] |= reg_quad
-			edge[:, 1:] |= reg_quad
-		m = edge & reg_finite[1:, :] & reg_finite[:-1, :]
-		dv = uv_safe[1:, :] - uv_safe[:-1, :]
-		finite = m & torch.isfinite(dv).all(dim=-1)
-		if bool(finite.any().detach().cpu()):
-			smooth_vals.append(dv.square().sum(dim=-1)[finite])
-	if int(uv_full.shape[1]) > 1:
-		edge = torch.zeros(int(uv_full.shape[0]), int(uv_full.shape[1]) - 1, device=uv_full.device, dtype=torch.bool)
-		if reg_quad.numel():
-			edge[:-1, :] |= reg_quad
-			edge[1:, :] |= reg_quad
-		m = edge & reg_finite[:, 1:] & reg_finite[:, :-1]
-		dv = uv_safe[:, 1:] - uv_safe[:, :-1]
-		finite = m & torch.isfinite(dv).all(dim=-1)
-		if bool(finite.any().detach().cpu()):
-			smooth_vals.append(dv.square().sum(dim=-1)[finite])
-	smooth_fwd_loss = torch.cat(smooth_vals).mean() if smooth_vals else z
-
-	if int(uv_full.shape[0]) > 2 and int(uv_full.shape[1]) > 2:
-		m = (
-			reg_finite[1:-1, 1:-1] &
-			reg_finite[:-2, 1:-1] &
-			reg_finite[2:, 1:-1] &
-			reg_finite[1:-1, :-2] &
-			reg_finite[1:-1, 2:]
-		)
-		lap = (
-			uv_safe[:-2, 1:-1] +
-			uv_safe[2:, 1:-1] +
-			uv_safe[1:-1, :-2] +
-			uv_safe[1:-1, 2:] -
-			4.0 * uv_safe[1:-1, 1:-1]
-		)
-		finite = m & torch.isfinite(lap).all(dim=-1)
-		bend_fwd_loss = lap.square().sum(dim=-1)[finite].mean() if bool(finite.any().detach().cpu()) else z
-	else:
-		bend_fwd_loss = z
+	model_metric_pos, model_metric_valid = _map_init_model_metric_positions(
+		uv_safe,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_depth=model_depth,
+	)
+	model_metric_valid = model_metric_valid & reg_finite
+	model_metric_safe = torch.where(
+		model_metric_valid.unsqueeze(-1),
+		model_metric_pos,
+		torch.zeros_like(model_metric_pos),
+	)
+	uv_fwd_terms = _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z)
+	model_raw_fwd_terms = _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z)
+	physical_ref2 = _map_init_reference_edge_square(
+		ext_pos,
+		torch.isfinite(ext_pos).all(dim=-1),
+		reg_quad,
+		z,
+	)
+	smooth_uv_fwd_loss = uv_fwd_terms["smooth"]
+	bend_uv_fwd_loss = uv_fwd_terms["bend"]
+	smooth_model_fwd_loss = model_raw_fwd_terms["smooth"] / physical_ref2
+	bend_model_fwd_loss = model_raw_fwd_terms["bend"] / physical_ref2
+	smooth_fwd_loss = smooth_uv_fwd_loss + smooth_model_fwd_loss
+	bend_fwd_loss = bend_uv_fwd_loss + bend_model_fwd_loss
 
 	jac_fwd_loss = _map_init_jacobian_penalty(
 		uv_safe,
@@ -3850,6 +3976,8 @@ def _map_init_objective(
 		uv_safe,
 		ext_pos,
 		reg_quad,
+		metric_pos=model_metric_pos,
+		metric_valid=model_metric_valid,
 	)
 	metric_smooth_loss = even_terms["metric_smooth"]
 	area_smooth_loss = even_terms["area_smooth"]
@@ -3897,6 +4025,10 @@ def _map_init_objective(
 		"jac": jac_loss.detach(),
 		"smooth_fwd": smooth_fwd_loss.detach(),
 		"bend_fwd": bend_fwd_loss.detach(),
+		"smooth_uv_fwd": smooth_uv_fwd_loss.detach(),
+		"bend_uv_fwd": bend_uv_fwd_loss.detach(),
+		"smooth_model_fwd": smooth_model_fwd_loss.detach(),
+		"bend_model_fwd": bend_model_fwd_loss.detach(),
 		"jac_fwd": jac_fwd_loss.detach(),
 		"metric_smooth": metric_smooth_loss.detach(),
 		"area_smooth": area_smooth_loss.detach(),
@@ -4293,6 +4425,40 @@ def _map_init_fmt_val(v: float) -> str:
 	return f"{float(v):.1f}"
 
 
+def _map_init_print_progress_legend() -> None:
+	items = (
+		("mi", "map init"),
+		("ph", "grow/repair"),
+		("blk", "opt block"),
+		("it", "iter/total"),
+		("it/s", "opt it/s"),
+		("act", "active quads"),
+		("blkq", "blocked quads"),
+		("spr", "sparse pruned"),
+		("smp", "valid samples"),
+		("bad", "uv/model/jac/rjac"),
+		("loss", "objective"),
+		("dist", "distance"),
+		("metr", "model edge scale"),
+		("area", "model area scale"),
+		("jmin", "min jac"),
+		("rmin", "min rev jac"),
+	)
+	_map_init_log("progress columns")
+	key_w = max(len(k) for k, _v in items)
+	desc_w = max(len(v) for _k, v in items)
+	cell_w = key_w + 3 + desc_w
+	header_cell = f"{'col':<{key_w}} : {'meaning':<{desc_w}}"
+	header = " | ".join(f"{header_cell:<{cell_w}}" for _ in range(3))
+	print(f"  {header}", flush=True)
+	for i in range(0, len(items), 3):
+		cells = [f"{k:<{key_w}} : {v:<{desc_w}}" for k, v in items[i:i + 3]]
+		while len(cells) < 3:
+			cells.append(" " * cell_w)
+		row = " | ".join(cells)
+		print(f"  {row}", flush=True)
+
+
 def _map_init_log_progress(
 	*,
 	state: _MapInitState,
@@ -4312,9 +4478,8 @@ def _map_init_log_progress(
 	state.progress_last_time = now
 	state.progress_last_iter = int(iter_idx)
 	blocked_count = int(state.blocked_quad.sum().detach().cpu()) if state.blocked_quad is not None else 0
-	if int(state.progress_rows) == 0:
-		_map_init_log("progress table: bad=u/model/jac/revjac blkq=blocked spr=sparse-pruned")
 	if int(state.progress_rows) % 20 == 0:
+		_map_init_print_progress_legend()
 		print(
 			f"{'mi':>2s} {'ph':>6s} {'blk':>3s} {'it':>9s} {'it/s':>6s} "
 			f"{'act':>5s} {'blkq':>5s} {'spr':>5s} {'smp':>6s} {'bad':>9s} "
@@ -4382,18 +4547,29 @@ def _map_init_folded_quad_mask(
 	return bad | (active & cell & (det_min <= 0.0))
 
 
-def _map_init_sparse_quad_mask(active_quad: torch.Tensor, *, min_neighbors: int = 4) -> torch.Tensor:
+def _map_init_sparse_quad_mask(
+	active_quad: torch.Tensor,
+	*,
+	min_neighbors: int = 3,
+	seed_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
 	active = active_quad.bool()
 	out = torch.zeros_like(active, dtype=torch.bool)
 	if active.numel() == 0 or int(min_neighbors) <= 0:
 		return out
 	keep = active.clone()
+	seed = torch.zeros_like(active, dtype=torch.bool)
+	if seed_mask is not None and tuple(seed_mask.shape) == tuple(active.shape):
+		seed = seed_mask.bool()
 	H, W = int(keep.shape[0]), int(keep.shape[1])
 	k = torch.ones(1, 1, 3, 3, device=keep.device, dtype=torch.float32)
 	k[..., 1, 1] = 0.0
 	while bool(keep.any().detach().cpu()):
 		count = F.conv2d(keep.to(dtype=torch.float32).reshape(1, 1, H, W), k, padding=1).reshape(H, W)
 		remove = keep & (count < float(min_neighbors))
+		if seed_mask is not None:
+			hole_touch = _neighbor8_mask((seed | out).unsqueeze(0))[0]
+			remove = remove & hole_touch
 		if not bool(remove.any().detach().cpu()):
 			break
 		out |= remove
@@ -4408,8 +4584,9 @@ def _map_init_apply_sparse_quad_cleanup(
 	blocked_quad: torch.Tensor,
 	*,
 	cfg: SnapSurfConfig,
+	seed_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-	sparse_bad = _map_init_sparse_quad_mask(active_quad, min_neighbors=4)
+	sparse_bad = _map_init_sparse_quad_mask(active_quad, min_neighbors=3, seed_mask=seed_mask)
 	sparse_count = int(sparse_bad.sum().detach().cpu())
 	if sparse_count <= 0:
 		return active_quad, uv, blocked_quad, 0
@@ -4479,6 +4656,7 @@ def _map_init_prune_bad_active_quads(
 		uv,
 		blocked,
 		cfg=cfg,
+		seed_mask=bad,
 	)
 	state.map_init.blocked_quad = blocked
 	state.map_init.active_quad = active_new
@@ -4521,6 +4699,9 @@ def _map_init_optimize_block(
 		return {
 			"loss": z.detach(), "dist": z.detach(), "vec": z.detach(), "norm": z.detach(),
 			"smooth": z.detach(), "bend": z.detach(), "jac": z.detach(),
+			"smooth_fwd": z.detach(), "bend_fwd": z.detach(),
+			"smooth_uv_fwd": z.detach(), "bend_uv_fwd": z.detach(),
+			"smooth_model_fwd": z.detach(), "bend_model_fwd": z.detach(),
 			"metric_smooth": z.detach(), "area_smooth": z.detach(),
 			"jac_min": z.detach(), "jac_bad": z.detach(), "jac_bad_frac": z.detach(),
 			"model_bad": z.detach(),

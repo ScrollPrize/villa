@@ -1337,12 +1337,13 @@ def optimize(
 		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
 		_status_rows = 0
+		_status_legend_cols: tuple[str, ...] | None = None
 		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
 
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
 						  its: float | None = None, force_header: bool = False,
 						  shell_no: int | None = None) -> None:
-			nonlocal _status_rows
+			nonlocal _status_rows, _status_legend_cols
 			label_map = {
 				"cyl_bend": "c_bend",
 				"cyl_normal": "c_norm",
@@ -1437,6 +1438,97 @@ def optimize(
 				"p:wstep_avg_vx": "wavg",
 				"p:wstep_tgt_vx": "wtgt",
 			}
+			desc_map = {
+				"cyl_bend": "cyl bend",
+				"cyl_normal": "cyl normal",
+				"cyl_outside": "cyl outside",
+				"cyl_radial_mean": "cyl radius",
+				"cyl_smooth": "cyl smooth",
+				"cyl_step": "cyl step",
+				"cyl_step_push": "cyl push",
+				"cyl_z_center": "cyl z center",
+				"cyl_z_smooth": "cyl z smooth",
+				"pred_dt_gate_gt0": "gate >0",
+				"pred_dt_gate_gt01": "gate >.1",
+				"pred_dt_gate_gt05": "gate >.5",
+				"pred_dt_gate_eq1": "gate =1",
+				"pred_dt_gate_n_gt0": "n gate >0",
+				"pred_dt_gate_n_gt01": "n gate >.1",
+				"pred_dt_gate_n_gt05": "n gate >.5",
+				"pred_dt_pull_gate_frac": "pull candidates",
+				"pred_dt_pull_scored_frac": "pull scored",
+				"pred_dt_pull_active_frac": "pull active",
+				"pred_dt_pull_batches": "pull batches",
+				"pred_dt_pull_samples_m": "pull samples M",
+				"pred_dt_pull_prefix_mean": "pull prefix",
+				"pred_dt_pull_weight_mean": "pull weight",
+				"snap_surf": "snap loss",
+				"snaps_seed": "seed ok",
+				"snaps_sdist": "seed model dist",
+				"snaps_sext": "seed ext dist",
+				"snaps_m2e": "model->ext loss",
+				"snaps_local": "local hits",
+				"snaps_brute": "brute hits",
+				"snaps_front": "brute frontier",
+				"snaps_brute_on": "brute enabled",
+				"snaps_pairs_m": "pairs M",
+				"snaps_gerr_avg": "grid err avg",
+				"snaps_gerr_max": "grid err max",
+				"snaps_ravg": "residual avg",
+				"snaps_rabs": "residual abs",
+				"snaps_rmax": "residual max",
+				"snaps_tow": "toward loss",
+				"snaps_dbg_iter": "debug iter",
+				"snaps_dbg_ring": "debug ring",
+				"snaps_dbg_grid": "debug grid",
+				"snaps_dbg_ori": "debug orient",
+				"snaps_dbg_new": "debug new",
+				"snaps_map_active": "map active",
+				"snaps_map_init": "seeded quads",
+				"snaps_map_added": "grown quads",
+				"snaps_map_blocked": "blocked quads",
+				"snaps_map_sparse": "sparse pruned",
+				"snaps_map_iters": "map iters",
+				"snaps_map_blocks": "opt blocks",
+				"snaps_map_grow": "grow steps",
+				"snaps_map_loss": "map objective",
+				"snaps_map_dist": "map distance",
+				"snaps_map_vec": "vector normal",
+				"snaps_map_norm": "normal align",
+				"snaps_map_smooth": "smooth reg",
+				"snaps_map_bend": "bend reg",
+				"snaps_map_jac": "jac reg",
+					"snaps_map_smooth_fwd": "uv+model smooth",
+					"snaps_map_bend_fwd": "uv+model bend",
+					"snaps_map_jac_fwd": "forward jac",
+					"snaps_map_metric_smooth": "model edge scale",
+					"snaps_map_area_smooth": "model area scale",
+				"snaps_map_smooth_rev": "reverse smooth",
+				"snaps_map_bend_rev": "reverse bend",
+				"snaps_map_jac_rev": "reverse jac",
+				"snaps_map_jinv_min": "min rev jac",
+				"snaps_map_jinv_bad": "bad rev jac",
+				"snaps_map_jmin": "min jac",
+				"snaps_map_prior": "dense prior",
+				"snaps_map_reg": "reg vertices",
+				"snaps_map_jbad": "bad jac",
+				"snaps_map_jbadf": "bad jac frac",
+				"snaps_map_samples": "valid samples",
+				"snaps_map_uvbad": "bad uv quads",
+				"snaps_map_model_bad": "bad model quads",
+				"snaps_map_nsign": "normal sign",
+				"snaps_map_scales": "scale levels",
+				"snaps_map_repair": "repair blocks",
+				"cyl_outside_pen_frac": "outside frac",
+				"cyl_outside_depth_max": "outside max",
+				"cyl_outside_depth_avg": "outside avg",
+				"p:wcirc_avg_vx": "param circ avg",
+				"p:wcirc_tgt_vx": "param circ target",
+				"p:wstep_invalid_avg_vx": "param invalid avg",
+				"p:wstep_invalid_frac": "param invalid frac",
+				"p:wstep_avg_vx": "param step avg",
+				"p:wstep_tgt_vx": "param step target",
+			}
 			key_order = {
 				"pred_dt_gate_gt0": 100,
 				"pred_dt_gate_gt01": 101,
@@ -1517,6 +1609,31 @@ def optimize(
 				return (key_order.get(k, 0), k)
 			def _display_key(k: str) -> str:
 				return label_map.get(k, k)
+			def _desc_key(k: str) -> str:
+				if k in desc_map:
+					return desc_map[k]
+				if k.startswith("p:"):
+					return f"param {k[2:]}"
+				return k
+			def _print_status_legend(cols: list[str]) -> None:
+				items = []
+				if shell_no is not None:
+					items.append(("shell", "shell index"))
+				items.extend((("step", "stage step"), ("loss", "total loss"), ("it/s", "optimizer it/s")))
+				items.extend((_display_key(c), _desc_key(c)) for c in cols)
+				print("[optimizer] progress columns", flush=True)
+				key_w = max(len(k) for k, _v in items)
+				desc_w = max(len(v) for _k, v in items)
+				cell_w = key_w + 3 + desc_w
+				header_cell = f"{'col':<{key_w}} : {'meaning':<{desc_w}}"
+				header = " | ".join(f"{header_cell:<{cell_w}}" for _ in range(3))
+				print(f"  {header}", flush=True)
+				for i in range(0, len(items), 3):
+					cells = [f"{k:<{key_w}} : {v:<{desc_w}}" for k, v in items[i:i + 3]]
+					while len(cells) < 3:
+						cells.append(" " * cell_w)
+					row = " | ".join(cells)
+					print(f"  {row}", flush=True)
 			def _fmt_val(k: str, v: float) -> str:
 				av = abs(v)
 				if av != 0.0 and (av >= 1000.0 or av < 1.0e-3):
@@ -1533,6 +1650,10 @@ def optimize(
 			values.update({f"p:{k}": _fmt_val(f"p:{k}", pv[k]) for k in pv_keys})
 			widths = {k: max(len(_display_key(k)), len(values[k]), 5) for k in cols}
 			if force_header or (shell_no is not None and _status_rows == 0) or (shell_no is None and _status_rows % 20 == 0):
+				legend_cols = tuple(cols)
+				if _status_legend_cols != legend_cols:
+					_print_status_legend(cols)
+					_status_legend_cols = legend_cols
 				hdr = ""
 				if shell_no is not None:
 					hdr += f"{'shell':>5s} "
