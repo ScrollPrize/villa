@@ -20,10 +20,13 @@
 //         child's distance-to-boundary: weight ramps 0 -> 1 over the
 //         outermost `blend_cells` of the child. Inside that thin rim the
 //         child fully replaces the parent.
-//   [6/6] parent->save(parent_path, force_overwrite=true) + writeValidMask;
-//         cells outside the footprint are written verbatim. The original
-//         parent tifxyz is replaced atomically; aux files in the parent
-//         dir (approval.tif, generations.tif, etc.) are preserved.
+//   [6/6] parent->saveOverwrite() + writeValidMask. The save snapshots
+//         the last-persisted state into <volpkg>/backups/<parent>/{0..7}/
+//         (rotating 8-slot ring, same convention as grow / brush /
+//         rotation edits) and then atomically swaps the new
+//         x/y/z/mask/meta into place. Cells outside the footprint are
+//         written verbatim; aux files in the parent dir (approval.tif,
+//         generations.tif, etc.) are preserved.
 //
 // Hard-coded fitting params (kThresholds, kRidgeLambda, kAnchorBinSize)
 // match vc_merge_tifxyz; the per-run CLI knobs cover RANSAC, border
@@ -1149,27 +1152,33 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg)
               << "  parent_filled_invalid=" << stats.parent_filled_invalid
               << "  no_child_neighbor="     << stats.no_child_neighbor << "\n";
 
-    // Overwrite the parent tifxyz in place. QuadSurface::save with
-    // force_overwrite=true writes new x/y/z/meta to a sibling temp dir,
-    // carries forward aux files (approval.tif, generations.tif, etc.) into
-    // that temp dir, then atomically swaps temp <-> parent (renameat2 with
-    // RENAME_EXCHANGE on Linux, remove+rename fallback elsewhere). Cells
-    // we didn't touch retain their parent values bit-identical to the
-    // input. invalidateMask + writeValidMask after save re-derive mask.tif
-    // from the patched points so any newly valid cells are reflected.
-    const fs::path    output_dir = parent.path;
-    const std::string out_uuid   = output_dir.filename().string();
-    std::cout << "[6/6] overwriting parent tifxyz at " << output_dir << "\n";
+    // Overwrite the parent tifxyz in place via QuadSurface::saveOverwrite.
+    // That call:
+    //   1. saveSnapshot(8) -- copies the LAST-PERSISTED on-disk state
+    //      into <volpkg>/backups/<parent_name>/{0..7}/ (rotating ring),
+    //      same convention used by grow / brush / rotation edits. Snapshot
+    //      failures are logged via the QuadSurface logger but never block
+    //      the actual save.
+    //   2. save(force_overwrite=true) -- writes new x/y/z/meta to a
+    //      sibling temp dir, carries forward aux files (approval.tif,
+    //      generations.tif, etc.) into that temp dir, then atomically
+    //      swaps temp <-> parent (renameat2 RENAME_EXCHANGE on Linux,
+    //      remove+rename fallback elsewhere). Cells we didn't touch
+    //      retain their parent values bit-identical to the input.
+    // invalidateMask + writeValidMask re-derive mask.tif from the patched
+    // points so any newly valid cells are reflected.
+    std::cout << "[6/6] overwriting parent tifxyz at " << parent.path
+              << " (snapshot to <volpkg>/backups/" << parent.name << "/)\n";
 
     parent.qs->invalidateMask();
-    parent.qs->save(output_dir, out_uuid, /*force_overwrite=*/true);
+    parent.qs->saveOverwrite();
     parent.qs->writeValidMask();
 
-    const fs::path summary_path = output_dir / (out_uuid + "_summary.json");
+    const fs::path summary_path = parent.path / (parent.name + "_summary.json");
     json summary = {
         {"parent",       parent.path.string()},
         {"child",        child.path.string()},
-        {"output",       output_dir.string()},
+        {"output",       parent.path.string()},
         {"border_cells", cfg.border_cells},
         {"blend_cells",  cfg.blend_cells},
         {"anchors", {
@@ -1234,7 +1243,12 @@ int main(int argc, char** argv)
         "Pass the two tifxyz dirs as positional args; the larger of the two "
         "(by valid-cell count) is taken as the parent. Use --parent / "
         "--child if you want to set the roles explicitly (e.g. ambiguous "
-        "sizes, or for scripts)");
+        "sizes, or for scripts).\n"
+        "\n"
+        "Backups: before overwriting, the parent's last-persisted on-disk "
+        "state is snapshotted to <volpkg>/backups/<parent_name>/{0..7}/ "
+        "(rotating 8-slot ring, same convention as grow / brush / rotation "
+        "edits in VC3D)");
     desc.add_options()
         ("help,h", "print help")
         ("parent,p", po::value<std::string>(),
