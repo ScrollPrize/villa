@@ -80,7 +80,7 @@ def test_read_tifxyz_discovers_labels_without_loading_shapes_by_default(
     assert labels[0]["error"] is None
 
 
-def test_read_tifxyz_rewrites_non_mmapable_coordinates(tmp_path: Path) -> None:
+def test_read_tifxyz_caches_non_mmapable_coordinates_without_rewriting_source(tmp_path: Path) -> None:
     segment_dir = _write_segment(tmp_path / "segment", (32, 32))
     original_x = tifffile.imread(str(segment_dir / "x.tif"))
     tifffile.imwrite(
@@ -98,11 +98,13 @@ def test_read_tifxyz_rewrites_non_mmapable_coordinates(tmp_path: Path) -> None:
 
     assert isinstance(segment._x, np.memmap)
     np.testing.assert_array_equal(segment._x, original_x)
-    tifffile.memmap(str(segment_dir / "x.tif"), mode="c")
+    assert Path(segment._x.filename) != segment_dir / "x.tif"
+    with pytest.raises(ValueError):
+        tifffile.memmap(str(segment_dir / "x.tif"), mode="c")
     with tifffile.TiffFile(str(segment_dir / "x.tif")) as tif:
         page = tif.pages[0]
-        assert not page.is_tiled
-        assert page.compression.name == "NONE"
+        assert page.is_tiled
+        assert page.compression.name != "NONE"
 
 
 def test_discover_labels_can_validate_shapes_without_loading_surface(tmp_path: Path) -> None:

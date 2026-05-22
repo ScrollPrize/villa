@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -350,10 +352,29 @@ class TifxyzReader:
         """Memory-map a coordinate TIFF without persisting in-place edits."""
         return tifffile.memmap(str(tif_path), mode="c")
 
-    def _rewrite_mmapable_coordinate(self, tif_path: Path) -> None:
-        """Rewrite a coordinate TIFF as uncompressed, untiled float32 data."""
+    def _mmap_cache_path(self, tif_path: Path) -> Path:
+        """Return a stable temp-cache path for a mmapable copy of a TIFF."""
+        stat = tif_path.stat()
+        cache_key = "|".join(
+            (
+                str(tif_path.resolve()),
+                str(stat.st_size),
+                str(stat.st_mtime_ns),
+            )
+        )
+        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+        cache_dir = Path(tempfile.gettempdir()) / "vesuvius_tifxyz_mmap_cache"
+        return cache_dir / f"{digest}_{tif_path.name}"
+
+    def _write_mmapable_coordinate_cache(self, tif_path: Path) -> Path:
+        """Write an uncompressed, untiled float32 temp-cache copy of a TIFF."""
+        cache_path = self._mmap_cache_path(tif_path)
+        if cache_path.exists():
+            return cache_path
+
         data = tifffile.imread(str(tif_path)).astype(np.float32, copy=False)
-        tmp_path = tif_path.with_name(f".{tif_path.name}.mmap.tmp")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
         try:
             tifffile.imwrite(
                 str(tmp_path),
@@ -361,10 +382,11 @@ class TifxyzReader:
                 compression=None,
                 photometric="minisblack",
             )
-            os.replace(tmp_path, tif_path)
+            os.replace(tmp_path, cache_path)
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
+        return cache_path
 
     def read_coordinate(self, component: str) -> np.ndarray:
         """Read a single coordinate component ('x', 'y', or 'z').
@@ -390,21 +412,19 @@ class TifxyzReader:
             data = self._mmap_coordinate(tif_path)
         except ValueError as exc:
             logger.info(
-                "Rewriting %s as uncompressed, untiled TIFF for mmap: %s",
+                "Caching %s as uncompressed, untiled TIFF for mmap: %s",
                 tif_path,
                 exc,
             )
-            self._rewrite_mmapable_coordinate(tif_path)
-            data = self._mmap_coordinate(tif_path)
+            data = self._mmap_coordinate(self._write_mmapable_coordinate_cache(tif_path))
 
         if data.dtype != np.float32:
             logger.info(
-                "Rewriting %s as float32 TIFF for mmap; found dtype %s",
+                "Caching %s as float32 TIFF for mmap; found dtype %s",
                 tif_path,
                 data.dtype,
             )
-            self._rewrite_mmapable_coordinate(tif_path)
-            data = self._mmap_coordinate(tif_path)
+            data = self._mmap_coordinate(self._write_mmapable_coordinate_cache(tif_path))
 
         return data
 
