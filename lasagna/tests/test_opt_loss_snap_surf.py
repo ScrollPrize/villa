@@ -1892,6 +1892,40 @@ class SnapSurfMapperTest(unittest.TestCase):
 			with open(stale_corr, "r", encoding="utf-8") as f:
 				self.assertIn("map_init_no_corr_ext_to_model", f.read())
 
+	def test_map_init_debug_obj_outputs_scale_snapshots(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		with tempfile.TemporaryDirectory() as tmp:
+			opt_loss_snap_surf.configure_snap_surf(
+				cfg={
+					"debug_obj_dir": tmp,
+					"debug_obj_interval": 1,
+					"map_init": {
+						"enabled": True,
+						"subdiv": 1,
+						"iters": 3,
+						"grow_opt_iters": 1,
+						"seed_radius": 0,
+						"scale_levels": 3,
+					},
+				},
+				seed_xyz=(2.0, 2.0, 0.0),
+				active=True,
+			)
+			opt_loss_snap_surf.set_debug_step(0, label="map_init_scales")
+
+			opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+
+			scale_root = os.path.join(tmp, "map_init_scales_step000000", "map_init_scales")
+			self.assertTrue(os.path.isdir(scale_root))
+			snapshots = os.listdir(scale_root)
+			for token in ("scale_l02", "scale_l01", "scale_l00"):
+				self.assertIn(token, snapshots)
+				for obj_name in ("map_mapped_surface.obj", "map_ext_to_model.obj", "map_active_mask.obj"):
+					path = os.path.join(scale_root, token, obj_name)
+					self.assertTrue(os.path.exists(path), path)
+					self.assertGreater(os.path.getsize(path), 0, path)
+
 
 if __name__ == "__main__":
 	unittest.main()

@@ -6007,6 +6007,37 @@ def _map_init_repair_block_allowed(cfg: SnapSurfConfig, completed_repair_blocks:
 	return cap <= 0 or int(completed_repair_blocks) < cap
 
 
+def _debug_write_map_init_scale_objs(
+	*,
+	cfg: SnapSurfConfig,
+	surface_index: int,
+	surface_count: int,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	state: _SurfaceState,
+) -> None:
+	if _debug_obj_iter_dir(cfg) is None:
+		return
+	mi = state.map_init
+	if mi.uv is None:
+		return
+	level = int(mi.scale_level)
+	snapshot = f"scale_l{level:02d}"
+	_debug_write_map_init_objs(
+		cfg=cfg,
+		surface_index=surface_index,
+		surface_count=surface_count,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		ext_xyz=ext_xyz,
+		ext_valid=ext_valid,
+		state=state,
+		snapshot_name=snapshot,
+	)
+
+
 def _run_map_init_for_surface(
 	state: _SurfaceState,
 	*,
@@ -6019,6 +6050,8 @@ def _run_map_init_for_surface(
 	ext_quad_valid: torch.Tensor,
 	cfg: SnapSurfConfig,
 	seed_xyz: tuple[float, float, float],
+	surface_index: int = 0,
+	surface_count: int = 1,
 ) -> dict[str, float]:
 	if state.map_init.done:
 		_map_init_log(
@@ -6207,6 +6240,17 @@ def _run_map_init_for_surface(
 							"continue_growth=1"
 						)
 				if added <= 0 or block <= 0:
+					if int(state.map_init.scale_level) > 0:
+						_debug_write_map_init_scale_objs(
+							cfg=cfg,
+							surface_index=surface_index,
+							surface_count=surface_count,
+							model_xyz=model_xyz,
+							model_valid=model_valid,
+							ext_xyz=ext_xyz,
+							ext_valid=ext_valid,
+							state=state,
+						)
 					if int(state.map_init.scale_level) > 0 and _map_init_transition_to_finer(state, cfg):
 						pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
 							state,
@@ -6232,6 +6276,16 @@ def _run_map_init_for_surface(
 						)
 						continue
 					break
+			_debug_write_map_init_scale_objs(
+				cfg=cfg,
+				surface_index=surface_index,
+				surface_count=surface_count,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				state=state,
+			)
 			_map_init_finalize_dyadic_state(state, cfg)
 			if not last_terms and state.map_init.active_quad is not None and state.map_init.uv is not None:
 				_, last_terms = _map_init_objective(
@@ -6524,6 +6578,7 @@ def _debug_write_map_init_objs(
 	ext_xyz: torch.Tensor,
 	ext_valid: torch.Tensor,
 	state: _SurfaceState,
+	snapshot_name: str | None = None,
 ) -> None:
 	iter_dir = _debug_obj_iter_dir(cfg)
 	if iter_dir is None:
@@ -6534,6 +6589,8 @@ def _debug_write_map_init_objs(
 			f"debug_obj_interval={cfg.debug_obj_interval}"
 		)
 		return
+	if snapshot_name is not None:
+		iter_dir = iter_dir / "map_init_scales" / _debug_obj_safe_label(snapshot_name)
 	iter_dir.mkdir(parents=True, exist_ok=True)
 	_map_init_log(f"obj write dir={iter_dir}")
 	prefix = "" if int(surface_count) == 1 else f"surf{int(surface_index):03d}_"
@@ -6589,6 +6646,7 @@ def _debug_write_map_init_objs(
 			ext_normals=mi.ext_normals,
 			ext_valid=mi.ext_valid,
 			ext_quad_valid=mi.ext_quad_valid,
+			ext_coords=mi.ext_coords,
 			quad_hw=quad_hw,
 			subdiv=s,
 		)
@@ -6618,6 +6676,7 @@ def _debug_write_map_init_objs(
 	_map_init_log(
 		"obj wrote "
 		f"prefix={prefix!r} "
+		f"snapshot={snapshot_name!r} "
 		f"active={int(mi.active_quad.sum().detach().cpu())} "
 		f"uv_finite={int(torch.isfinite(mi.uv).all(dim=-1).sum().detach().cpu())} "
 		f"model_ok={int(ok.sum().detach().cpu())} "
@@ -6710,6 +6769,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				ext_quad_valid=ext_quad_valid,
 				cfg=cfg,
 				seed_xyz=_seed_xyz,
+				surface_index=si,
+				surface_count=len(records),
 			)
 			stats["snaps_sdist"] = min(stats["snaps_sdist"], float(map_stats.get("snaps_sdist", float("inf"))))
 			stats["snaps_sext"] = min(stats["snaps_sext"], float(map_stats.get("snaps_sext", float("inf"))))
