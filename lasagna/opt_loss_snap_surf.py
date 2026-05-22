@@ -18,8 +18,13 @@ class SnapSurfMapInitConfig:
 	enabled: bool = False
 	subdiv: int = 4
 	iters: int = 1000
+	candidate_opt_iters: int = 10
+	candidate_lr: float = 0.05
+	fringe_opt_iters: int = 10
+	fringe_lr: float = 0.05
 	grow_opt_iters: int = 100
 	progress_interval: int = 100
+	progress_mode: str = "block"
 	scale_levels: int = 1
 	scale_factor: int = 2
 	dense_opt: bool = False
@@ -172,8 +177,13 @@ def configure_snap_surf(
 			"enabled "
 			f"subdiv={_cfg.map_init.subdiv} "
 			f"iters={_cfg.map_init.iters} "
+			f"candidate_opt_iters={_cfg.map_init.candidate_opt_iters} "
+			f"candidate_lr={_cfg.map_init.candidate_lr} "
+			f"fringe_opt_iters={_cfg.map_init.fringe_opt_iters} "
+			f"fringe_lr={_cfg.map_init.fringe_lr} "
 			f"grow_opt_iters={_cfg.map_init.grow_opt_iters} "
 			f"progress_interval={_cfg.map_init.progress_interval} "
+			f"progress_mode={_cfg.map_init.progress_mode!r} "
 			f"scale_levels={_cfg.map_init.scale_levels} "
 			f"scale_factor={_cfg.map_init.scale_factor} "
 			f"dense_opt={int(_cfg.map_init.dense_opt)} "
@@ -208,8 +218,13 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			enabled=bool(raw.get("enabled", defaults.enabled)),
 			subdiv=max(1, int(raw.get("subdiv", defaults.subdiv))),
 			iters=max(0, int(raw.get("iters", defaults.iters))),
+			candidate_opt_iters=max(0, int(raw.get("candidate_opt_iters", defaults.candidate_opt_iters))),
+			candidate_lr=float(raw.get("candidate_lr", defaults.candidate_lr)),
+			fringe_opt_iters=max(0, int(raw.get("fringe_opt_iters", defaults.fringe_opt_iters))),
+			fringe_lr=float(raw.get("fringe_lr", defaults.fringe_lr)),
 			grow_opt_iters=max(0, int(raw.get("grow_opt_iters", defaults.grow_opt_iters))),
 			progress_interval=max(100, int(raw.get("progress_interval", defaults.progress_interval))),
+			progress_mode=str(raw.get("progress_mode", defaults.progress_mode)).lower(),
 			scale_levels=max(1, int(raw.get("scale_levels", defaults.scale_levels))),
 			scale_factor=max(2, int(raw.get("scale_factor", defaults.scale_factor))),
 			dense_opt=bool(raw.get("dense_opt", defaults.dense_opt)),
@@ -237,6 +252,10 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 		raise ValueError("snap_surf args.map_init must be an object or null")
 	if cfg.lr <= 0.0:
 		raise ValueError("snap_surf args.map_init.lr must be > 0")
+	if cfg.candidate_lr <= 0.0:
+		raise ValueError("snap_surf args.map_init.candidate_lr must be > 0")
+	if cfg.fringe_lr <= 0.0:
+		raise ValueError("snap_surf args.map_init.fringe_lr must be > 0")
 	if cfg.repair_lr_mult <= 0.0:
 		raise ValueError("snap_surf args.map_init.repair_lr_mult must be > 0")
 	if cfg.repair_w_jac_mult < 0.0:
@@ -249,6 +268,8 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			raise ValueError(f"snap_surf args.map_init.{name} must be >= 0")
 	if cfg.jac_margin < 0.0:
 		raise ValueError("snap_surf args.map_init.jac_margin must be >= 0")
+	if cfg.progress_mode not in ("block", "periodic", "both", "none"):
+		raise ValueError("snap_surf args.map_init.progress_mode must be one of block, periodic, both, none")
 	return cfg
 
 
@@ -341,6 +362,31 @@ class _MapInitState:
 		self.repair_blocks: int = 0
 		self.added_total: int = 0
 		self.sparse_pruned_total: int = 0
+		self.add_sample_loss_sum: float = 0.0
+		self.add_sample_weight: float = 0.0
+		self.add_bad_samples: float = 0.0
+		self.add_total_samples: float = 0.0
+		self.add_success_quads: float = 0.0
+		self.add_total_quads: float = 0.0
+		self.fringe_sample_loss_sum: float = 0.0
+		self.fringe_sample_weight: float = 0.0
+		self.fringe_bad_samples: float = 0.0
+		self.fringe_total_samples: float = 0.0
+		self.fringe_success_quads: float = 0.0
+		self.fringe_total_quads: float = 0.0
+		self.interval_add_sample_loss_sum: float = 0.0
+		self.interval_add_sample_weight: float = 0.0
+		self.interval_add_bad_samples: float = 0.0
+		self.interval_add_total_samples: float = 0.0
+		self.interval_add_success_quads: float = 0.0
+		self.interval_add_total_quads: float = 0.0
+		self.interval_fringe_sample_loss_sum: float = 0.0
+		self.interval_fringe_sample_weight: float = 0.0
+		self.interval_fringe_bad_samples: float = 0.0
+		self.interval_fringe_total_samples: float = 0.0
+		self.interval_fringe_success_quads: float = 0.0
+		self.interval_fringe_total_quads: float = 0.0
+		self.fringe_debug_rows: int = 0
 		self.scale_levels_used: int = 1
 		self.progress_rows: int = 0
 		self.progress_last_time: float | None = None
@@ -2896,6 +2942,12 @@ def _map_init_empty_stats() -> dict[str, float]:
 		"snaps_map_iters": 0.0,
 		"snaps_map_blocks": 0.0,
 		"snaps_map_grow": 0.0,
+		"snaps_map_add_loss": 0.0,
+		"snaps_map_add_bad_frac": 0.0,
+		"snaps_map_add_success_frac": 0.0,
+		"snaps_map_fringe_loss": 0.0,
+		"snaps_map_fringe_bad_frac": 0.0,
+		"snaps_map_fringe_success_frac": 0.0,
 		"snaps_map_loss": 0.0,
 		"snaps_map_dist": 0.0,
 		"snaps_map_vec": 0.0,
@@ -3429,6 +3481,72 @@ def _map_init_jacobian_values(
 	return (dets * sign)[finite]
 
 
+def _map_init_jacobian_bad_quad_mask(
+	uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	*,
+	orientation_sign: int,
+	jac_margin: float,
+) -> torch.Tensor:
+	if active_quad.numel() == 0:
+		return torch.zeros_like(active_quad, dtype=torch.bool)
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	bad = torch.zeros_like(active_quad, dtype=torch.bool)
+	if H < 2 or W < 2:
+		return bad
+	finite_uv = torch.isfinite(uv).all(dim=-1)
+	cell = active_quad.bool() & _map_init_quad_corner_all(finite_uv)
+	if not bool(cell.any().detach().cpu()):
+		return bad
+	p00 = uv[:-1, :-1]
+	p10 = uv[1:, :-1]
+	p01 = uv[:-1, 1:]
+	p11 = uv[1:, 1:]
+	dh0 = p10 - p00
+	dh1 = p11 - p01
+	dw0 = p01 - p00
+	dw1 = p11 - p10
+	dets = torch.stack([
+		dh0[..., 0] * dw0[..., 1] - dh0[..., 1] * dw0[..., 0],
+		dh0[..., 0] * dw1[..., 1] - dh0[..., 1] * dw1[..., 0],
+		dh1[..., 0] * dw0[..., 1] - dh1[..., 1] * dw0[..., 0],
+		dh1[..., 0] * dw1[..., 1] - dh1[..., 1] * dw1[..., 0],
+	], dim=-1)
+	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
+	finite = cell.unsqueeze(-1) & torch.isfinite(dets)
+	bad = cell & (~finite.all(dim=-1) | ((dets * sign) < float(jac_margin)).any(dim=-1))
+	return bad
+
+
+def _map_init_inverse_jacobian_bad_quad_mask(
+	uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	*,
+	orientation_sign: int,
+	jac_margin: float,
+) -> torch.Tensor:
+	if active_quad.numel() == 0:
+		return torch.zeros_like(active_quad, dtype=torch.bool)
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	bad = torch.zeros_like(active_quad, dtype=torch.bool)
+	if H < 2 or W < 2:
+		return bad
+	finite_uv = torch.isfinite(uv).all(dim=-1)
+	cell = active_quad.bool() & _map_init_quad_corner_all(finite_uv)
+	if not bool(cell.any().detach().cpu()):
+		return bad
+	dh = uv[1:, :-1] - uv[:-1, :-1]
+	dw = uv[:-1, 1:] - uv[:-1, :-1]
+	det = dh[..., 0] * dw[..., 1] - dh[..., 1] * dw[..., 0]
+	finite = cell & torch.isfinite(dh).all(dim=-1) & torch.isfinite(dw).all(dim=-1) & torch.isfinite(det)
+	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
+	det_signed = det * sign
+	eps = max(1.0e-3, 0.1 * float(jac_margin))
+	inv_det = torch.where(det_signed > eps, det_signed.clamp_min(eps).reciprocal(), torch.zeros_like(det_signed))
+	bad = cell & (~finite | (inv_det < float(jac_margin)))
+	return bad
+
+
 def _map_init_jacobian_penalty(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
@@ -3846,6 +3964,12 @@ def _map_init_objective(
 	active_bad_count = int((active_quad & ~quad_uv_ok_grid).sum().detach().cpu())
 	finite_count = 0
 	model_bad_count = 0
+	sample_total_count = 0
+	sample_bad_count = 0
+	sample_valid_count = 0
+	sample_loss = z
+	sample_bad_frac = z
+	sample_quad_ok_grid = torch.zeros_like(active_quad, dtype=torch.bool)
 	quad_hw = active_quad.nonzero(as_tuple=False)
 	if int(quad_hw.shape[0]) > 0:
 		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
@@ -3901,6 +4025,22 @@ def _map_init_objective(
 		)
 		finite_qs = finite.reshape(Q, S)
 		valid_quad = finite_qs.all(dim=1)
+		sample_quad_ok_grid[quad_hw[:, 0], quad_hw[:, 1]] = valid_quad
+		sample_total_count = Q * S
+		sample_valid_count = int(finite.sum().detach().cpu())
+		sample_bad_count = int((~finite).sum().detach().cpu())
+		sample_bad_frac = torch.tensor(
+			float(sample_bad_count) / float(max(1, sample_total_count)),
+			device=uv_full.device,
+			dtype=uv_full.dtype,
+		)
+		if bool(finite.any().detach().cpu()):
+			sample_values = (
+				float(mi.w_dist) * dist_values +
+				float(mi.w_vec_normal) * vec_values +
+				float(mi.w_surface_normal) * norm_values
+			)
+			sample_loss = sample_values[finite].mean()
 		if bool(valid_quad.any().detach().cpu()):
 			finite_count = int(finite_qs[valid_quad].sum().detach().cpu())
 			model_bad_count = int((~valid_quad).sum().detach().cpu())
@@ -3996,6 +4136,31 @@ def _map_init_objective(
 	else:
 		jac_bad_count = 0
 		jac_bad_frac = 0.0
+	jac_bad_quad_grid = _map_init_jacobian_bad_quad_mask(
+		uv_safe,
+		reg_quad,
+		orientation_sign=orientation_sign,
+		jac_margin=mi.jac_margin,
+	)
+	jac_inv_bad_quad_grid = _map_init_inverse_jacobian_bad_quad_mask(
+		uv_safe,
+		reg_quad,
+		orientation_sign=orientation_sign,
+		jac_margin=mi.jac_margin,
+	)
+	quad_success_grid = (
+		active_quad &
+		quad_uv_ok_grid &
+		sample_quad_ok_grid &
+		~jac_bad_quad_grid &
+		~jac_inv_bad_quad_grid
+	)
+	quad_success_count = int(quad_success_grid.sum().detach().cpu())
+	quad_success_frac = torch.tensor(
+		float(quad_success_count) / float(max(1, active_count)),
+		device=uv_full.device,
+		dtype=uv_full.dtype,
+	)
 	if bool(mi.dense_opt) and uv_prior is not None:
 		prior_finite = reg_finite & torch.isfinite(uv_prior).all(dim=-1)
 		if bool(prior_finite.any().detach().cpu()):
@@ -4042,11 +4207,21 @@ def _map_init_objective(
 		"active": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
 		"reg": torch.tensor(float(reg_count), device=uv_full.device, dtype=uv_full.dtype),
 		"samples": torch.tensor(float(finite_count), device=uv_full.device, dtype=uv_full.dtype),
+		"sample_loss": sample_loss.detach(),
+		"sample_total": torch.tensor(float(sample_total_count), device=uv_full.device, dtype=uv_full.dtype),
+		"sample_valid": torch.tensor(float(sample_valid_count), device=uv_full.device, dtype=uv_full.dtype),
+		"sample_bad": torch.tensor(float(sample_bad_count), device=uv_full.device, dtype=uv_full.dtype),
+		"sample_bad_frac": sample_bad_frac.detach(),
+		"quad_total": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
+		"quad_success": torch.tensor(float(quad_success_count), device=uv_full.device, dtype=uv_full.dtype),
+		"quad_success_frac": quad_success_frac.detach(),
 		"uv_bad": torch.tensor(float(active_bad_count), device=uv_full.device, dtype=uv_full.dtype),
 		"model_bad": torch.tensor(float(model_bad_count), device=uv_full.device, dtype=uv_full.dtype),
 		"jac_bad": torch.tensor(float(jac_bad_count), device=uv_full.device, dtype=uv_full.dtype),
 		"jac_bad_frac": torch.tensor(float(jac_bad_frac), device=uv_full.device, dtype=uv_full.dtype),
+		"jac_bad_quad": torch.tensor(float(int(jac_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
 		"jac_inv_bad": inv_terms["jac_bad"].detach(),
+		"jac_inv_bad_quad": torch.tensor(float(int(jac_inv_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
 	}
 
 
@@ -4261,6 +4436,7 @@ def _map_init_seed_state(
 def _map_init_grow_once(
 	state: _SurfaceState,
 	*,
+	model_xyz: torch.Tensor | None = None,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
@@ -4331,6 +4507,97 @@ def _map_init_grow_once(
 			ok_hw = vert_hw[local_ok]
 			pred_grid[ok_hw[:, 0], ok_hw[:, 1]] = pred[local_ok].detach()
 			pred_ok_grid[ok_hw[:, 0], ok_hw[:, 1]] = True
+	candidate_seed = candidate & _map_init_quad_corner_all(pred_ok_grid & torch.isfinite(pred_grid).all(dim=-1))
+	if model_xyz is not None and bool(candidate_seed.any().detach().cpu()):
+		_map_init_log_fringe_debug(
+			state=state.map_init,
+			phase="init",
+			block=state.map_init.opt_blocks + 1,
+			iter_idx=state.map_init.total_iters,
+			uv_full=pred_grid,
+			active_quad=candidate_seed,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			cfg=cfg,
+		)
+	candidate_possible = candidate_seed
+	if bool(candidate_possible.any().detach().cpu()):
+		possible_hw = candidate_possible.nonzero(as_tuple=False)
+		possible_ok = _map_init_candidate_quad_samples_ok(
+			uv_full=pred_grid,
+			quad_hw=possible_hw,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			cfg=cfg,
+		)
+		filtered = torch.zeros_like(candidate_possible, dtype=torch.bool)
+		filtered[possible_hw[:, 0], possible_hw[:, 1]] = possible_ok
+		candidate_possible = filtered
+	if (
+		not bool(mi.dense_opt) and model_xyz is not None and int(mi.candidate_opt_iters) > 0 and
+		bool(candidate_possible.any().detach().cpu())
+	):
+		candidate_opt_vertices = (
+			_map_init_active_vertex_mask(candidate_possible, tuple(int(v) for v in uv.shape[:2])) &
+			~active_vertices &
+			pred_ok_grid &
+			torch.isfinite(pred_grid).all(dim=-1)
+		)
+		if bool(candidate_opt_vertices.any().detach().cpu()):
+			pred_grid, _prefit_terms = _map_init_optimize_vertex_mask(
+				state,
+				base_uv=pred_grid,
+				active_quad=candidate_possible,
+				opt_vertex_mask=candidate_opt_vertices,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				cfg=cfg,
+				steps=int(mi.candidate_opt_iters),
+				mode="add",
+				lr=float(mi.candidate_lr),
+			)
+			pred_ok_grid = (
+				(active_vertices & torch.isfinite(uv).all(dim=-1)) |
+				(
+					torch.isfinite(pred_grid).all(dim=-1) &
+					_map_init_model_coord_ok(
+						pred_grid,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						depth=int(depth),
+					)
+				)
+			)
+			candidate_possible = candidate & _map_init_quad_corner_all(pred_ok_grid)
+			_map_init_log_fringe_debug(
+				state=state.map_init,
+				phase="cand",
+				block=state.map_init.opt_blocks,
+				iter_idx=state.map_init.total_iters,
+				uv_full=pred_grid,
+				active_quad=candidate_possible,
+				ext_pos=ext_pos,
+				ext_normals=ext_normals,
+				ext_valid=ext_valid,
+				ext_quad_valid=ext_quad_valid,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				model_depth=int(depth),
+				cfg=cfg,
+			)
 	active_new = active.clone()
 	blocked_new = blocked.clone()
 	uv_new = uv.clone()
@@ -4340,6 +4607,8 @@ def _map_init_grow_once(
 		h = int(cand_hw[i, 0].detach().cpu())
 		w = int(cand_hw[i, 1].detach().cpu())
 		if bool(active_new[h, w].detach().cpu()):
+			continue
+		if not bool(candidate_possible[h, w].detach().cpu()):
 			continue
 		corners = (
 			(h, w),
@@ -4397,6 +4666,58 @@ def _map_init_grow_once(
 			blocked_new,
 			cfg=cfg,
 		)
+	new_quad = active_new.bool() & ~active.bool()
+	if (
+		not bool(mi.dense_opt) and model_xyz is not None and int(mi.fringe_opt_iters) > 0 and
+		bool(new_quad.any().detach().cpu())
+	):
+		fringe_vertices = (
+			_map_init_active_vertex_mask(new_quad, tuple(int(v) for v in uv_new.shape[:2])) &
+			~active_vertices &
+			torch.isfinite(uv_new).all(dim=-1)
+		)
+		if bool(fringe_vertices.any().detach().cpu()):
+			uv_new, _fringe_terms = _map_init_optimize_vertex_mask(
+				state,
+				base_uv=uv_new,
+				active_quad=new_quad,
+				opt_vertex_mask=fringe_vertices,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				cfg=cfg,
+				steps=int(mi.fringe_opt_iters),
+				mode="fringe",
+				lr=float(mi.fringe_lr),
+			)
+			_map_init_log_fringe_debug(
+				state=state.map_init,
+				phase="fringe",
+				block=state.map_init.opt_blocks,
+				iter_idx=state.map_init.total_iters,
+				uv_full=uv_new,
+				active_quad=new_quad,
+				ext_pos=ext_pos,
+				ext_normals=ext_normals,
+				ext_valid=ext_valid,
+				ext_quad_valid=ext_quad_valid,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				model_depth=int(depth),
+				cfg=cfg,
+			)
+			active_new, uv_new, blocked_new, _fringe_sample_reject, _fringe_fold_reject, _fringe_sparse = _map_init_reject_bad_new_quads(
+				state,
+				active_before=active,
+				active_quad=active_new,
+				uv=uv_new,
+				blocked_quad=blocked_new,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				cfg=cfg,
+			)
+	added = int((active_new.bool() & ~active.bool()).sum().detach().cpu())
 	state.map_init.active_quad = active_new
 	state.map_init.blocked_quad = blocked_new
 	state.map_init.uv = uv_new
@@ -4414,6 +4735,168 @@ def _map_init_term_float(terms: dict[str, torch.Tensor], key: str) -> float:
 	return float(v.detach().cpu())
 
 
+def _map_init_accumulate_phase_stats(state: _MapInitState, phase: str, terms: dict[str, torch.Tensor]) -> None:
+	valid = max(0.0, _map_init_term_float(terms, "sample_valid"))
+	total = max(0.0, _map_init_term_float(terms, "sample_total"))
+	bad = max(0.0, _map_init_term_float(terms, "sample_bad"))
+	loss = _map_init_term_float(terms, "sample_loss")
+	quad_success = max(0.0, _map_init_term_float(terms, "quad_success"))
+	quad_total = max(0.0, _map_init_term_float(terms, "quad_total"))
+	if phase == "add":
+		state.add_sample_loss_sum += loss * valid
+		state.add_sample_weight += valid
+		state.add_bad_samples += bad
+		state.add_total_samples += total
+		state.add_success_quads += quad_success
+		state.add_total_quads += quad_total
+		state.interval_add_sample_loss_sum += loss * valid
+		state.interval_add_sample_weight += valid
+		state.interval_add_bad_samples += bad
+		state.interval_add_total_samples += total
+		state.interval_add_success_quads += quad_success
+		state.interval_add_total_quads += quad_total
+	elif phase == "fringe":
+		state.fringe_sample_loss_sum += loss * valid
+		state.fringe_sample_weight += valid
+		state.fringe_bad_samples += bad
+		state.fringe_total_samples += total
+		state.fringe_success_quads += quad_success
+		state.fringe_total_quads += quad_total
+		state.interval_fringe_sample_loss_sum += loss * valid
+		state.interval_fringe_sample_weight += valid
+		state.interval_fringe_bad_samples += bad
+		state.interval_fringe_total_samples += total
+		state.interval_fringe_success_quads += quad_success
+		state.interval_fringe_total_quads += quad_total
+
+
+def _map_init_interval_phase_stats(state: _MapInitState, phase: str) -> tuple[float, float]:
+	if phase == "add":
+		loss_sum = state.interval_add_sample_loss_sum
+		weight = state.interval_add_sample_weight
+		quad_success = state.interval_add_success_quads
+		quad_total = state.interval_add_total_quads
+	elif phase == "fringe":
+		loss_sum = state.interval_fringe_sample_loss_sum
+		weight = state.interval_fringe_sample_weight
+		quad_success = state.interval_fringe_success_quads
+		quad_total = state.interval_fringe_total_quads
+	else:
+		return 0.0, 0.0
+	loss = float(loss_sum) / float(max(1.0, weight))
+	success = float(quad_success) / float(max(1.0, quad_total))
+	if quad_total <= 0.0:
+		success = 0.0
+	return loss, success
+
+
+def _map_init_reset_interval_phase_stats(state: _MapInitState) -> None:
+	state.interval_add_sample_loss_sum = 0.0
+	state.interval_add_sample_weight = 0.0
+	state.interval_add_bad_samples = 0.0
+	state.interval_add_total_samples = 0.0
+	state.interval_add_success_quads = 0.0
+	state.interval_add_total_quads = 0.0
+	state.interval_fringe_sample_loss_sum = 0.0
+	state.interval_fringe_sample_weight = 0.0
+	state.interval_fringe_bad_samples = 0.0
+	state.interval_fringe_total_samples = 0.0
+	state.interval_fringe_success_quads = 0.0
+	state.interval_fringe_total_quads = 0.0
+
+
+def _map_init_block_progress_enabled(cfg: SnapSurfConfig) -> bool:
+	return str(cfg.map_init.progress_mode) in ("block", "both")
+
+
+def _map_init_periodic_progress_enabled(cfg: SnapSurfConfig) -> bool:
+	return str(cfg.map_init.progress_mode) in ("periodic", "both")
+
+
+def _map_init_log_fringe_debug(
+	*,
+	state: _MapInitState,
+	phase: str,
+	block: int,
+	iter_idx: int,
+	uv_full: torch.Tensor,
+	active_quad: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_depth: int,
+	cfg: SnapSurfConfig,
+) -> None:
+	if not _map_init_block_progress_enabled(cfg):
+		return
+	if not bool(active_quad.any().detach().cpu()):
+		return
+	with torch.no_grad():
+		_, terms = _map_init_objective(
+			uv_full=uv_full,
+			active_quad=active_quad,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(model_depth),
+			normal_sign=state.normal_sign,
+			orientation_sign=state.orientation_sign,
+			cfg=cfg,
+		)
+	if int(state.fringe_debug_rows) % 20 == 0:
+		_map_init_log("map-init block columns")
+		print(
+			f"{'map':>3s} {'ph':>6s} {'blk':>3s} {'it':>9s} {'quad':>5s} "
+			f"{'smp':>6s} {'succ':>6s} {'sloss':>7s} {'badq':>9s} "
+			f"{'loss':>7s} {'dst':>7s} {'vec':>7s} {'nrm':>7s} "
+			f"{'smo':>7s} {'bnd':>7s} {'jac':>7s} {'met':>7s} "
+			f"{'ar':>7s} {'sr':>7s} {'br':>7s} {'jr':>7s} "
+			f"{'jbad':>5s} {'jmin':>6s} {'rmin':>6s}",
+			flush=True,
+		)
+	success = _map_init_term_float(terms, "quad_success_frac")
+	bad = (
+		f"{_map_init_term_float(terms, 'uv_bad'):.0f}/"
+		f"{_map_init_term_float(terms, 'model_bad'):.0f}/"
+		f"{_map_init_term_float(terms, 'jac_bad_quad'):.0f}/"
+		f"{_map_init_term_float(terms, 'jac_inv_bad_quad'):.0f}"
+	)
+	print(
+		f"{'map':>3s} {str(phase)[:6]:>6s} {int(block):3d} "
+		f"{int(iter_idx):4d}/{int(cfg.map_init.iters):<4d} "
+		f"{int(active_quad.sum().detach().cpu()):5d} "
+		f"{_map_init_term_float(terms, 'sample_valid'):6.0f} "
+		f"{_map_init_fmt_val(success):>6s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'sample_loss')):>7s} "
+		f"{bad:>9s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'loss')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'dist')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'vec')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'norm')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'smooth')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'bend')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'jac')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'metric_smooth')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'area_smooth')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'smooth_rev')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'bend_rev')):>7s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'jac_rev')):>7s} "
+		f"{_map_init_term_float(terms, 'jac_bad'):5.0f} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'jac_min')):>6s} "
+		f"{_map_init_fmt_val(_map_init_term_float(terms, 'jac_inv_min')):>6s}",
+		flush=True,
+	)
+	state.fringe_debug_rows += 1
+
+
 def _map_init_fmt_val(v: float) -> str:
 	av = abs(float(v))
 	if av != 0.0 and (av >= 1000.0 or av < 1.0e-3):
@@ -4428,7 +4911,7 @@ def _map_init_fmt_val(v: float) -> str:
 def _map_init_print_progress_legend() -> None:
 	items = (
 		("mi", "map init"),
-		("ph", "grow/repair"),
+		("ph", "add/fringe/grow"),
 		("blk", "opt block"),
 		("it", "iter/total"),
 		("it/s", "opt it/s"),
@@ -4437,6 +4920,10 @@ def _map_init_print_progress_legend() -> None:
 		("spr", "sparse pruned"),
 		("smp", "valid samples"),
 		("bad", "uv/model/jac/rjac"),
+		("aloss", "add sample loss"),
+		("asuc", "add success frac"),
+		("floss", "fringe sample loss"),
+		("fsuc", "fringe success frac"),
 		("loss", "objective"),
 		("dist", "distance"),
 		("metr", "model edge scale"),
@@ -4483,7 +4970,9 @@ def _map_init_log_progress(
 		print(
 			f"{'mi':>2s} {'ph':>6s} {'blk':>3s} {'it':>9s} {'it/s':>6s} "
 			f"{'act':>5s} {'blkq':>5s} {'spr':>5s} {'smp':>6s} {'bad':>9s} "
-			f"{'loss':>7s} {'dist':>7s} {'metr':>7s} {'area':>7s} {'jmin':>6s} {'rmin':>6s}",
+			f"{'aloss':>7s} {'asuc':>6s} {'floss':>7s} {'fsuc':>6s} "
+			f"{'loss':>7s} {'dist':>7s} {'metr':>7s} {'area':>7s} "
+			f"{'jmin':>6s} {'rmin':>6s}",
 			flush=True,
 		)
 	bad = (
@@ -4492,6 +4981,8 @@ def _map_init_log_progress(
 		f"{_map_init_term_float(terms, 'jac_bad'):.0f}/"
 		f"{_map_init_term_float(terms, 'jac_inv_bad'):.0f}"
 	)
+	add_loss, add_success = _map_init_interval_phase_stats(state, "add")
+	fringe_loss, fringe_success = _map_init_interval_phase_stats(state, "fringe")
 	print(
 		f"{'mi':>2s} {str(mode)[:6]:>6s} {int(block):3d} "
 		f"{int(iter_idx):4d}/{int(iter_total):<4d} "
@@ -4501,6 +4992,10 @@ def _map_init_log_progress(
 		f"{int(state.sparse_pruned_total):5d} "
 		f"{_map_init_term_float(terms, 'samples'):6.0f} "
 		f"{bad:>9s} "
+		f"{_map_init_fmt_val(add_loss):>7s} "
+		f"{_map_init_fmt_val(add_success):>6s} "
+		f"{_map_init_fmt_val(fringe_loss):>7s} "
+		f"{_map_init_fmt_val(fringe_success):>6s} "
 		f"{_map_init_fmt_val(_map_init_term_float(terms, 'loss')):>7s} "
 		f"{_map_init_fmt_val(_map_init_term_float(terms, 'dist')):>7s} "
 		f"{_map_init_fmt_val(_map_init_term_float(terms, 'metric_smooth')):>7s} "
@@ -4510,6 +5005,7 @@ def _map_init_log_progress(
 		flush=True,
 	)
 	state.progress_rows += 1
+	_map_init_reset_interval_phase_stats(state)
 
 
 def _map_init_folded_quad_mask(
@@ -4671,6 +5167,257 @@ def _map_init_prune_bad_active_quads(
 	return sample_count, fold_count, sparse_count
 
 
+def _map_init_reject_bad_new_quads(
+	state: _SurfaceState,
+	*,
+	active_before: torch.Tensor,
+	active_quad: torch.Tensor,
+	uv: torch.Tensor,
+	blocked_quad: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	cfg: SnapSurfConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+	ext_pos = state.map_init.ext_pos
+	ext_normals = state.map_init.ext_normals
+	ext_valid = state.map_init.ext_valid
+	ext_quad_valid = state.map_init.ext_quad_valid
+	depth = state.map_init.model_depth
+	if ext_pos is None or ext_normals is None or ext_valid is None or depth is None:
+		return active_quad, uv, blocked_quad, 0, 0, 0
+	new_quad = active_quad.bool() & ~active_before.bool()
+	if not bool(new_quad.any().detach().cpu()):
+		return active_quad, uv, blocked_quad, 0, 0, 0
+	sample_bad = torch.zeros_like(active_quad, dtype=torch.bool)
+	quad_hw = new_quad.nonzero(as_tuple=False)
+	if int(quad_hw.shape[0]) > 0:
+		ok = _map_init_candidate_quad_samples_ok(
+			uv_full=uv,
+			quad_hw=quad_hw,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			cfg=cfg,
+		)
+		sample_bad[quad_hw[:, 0], quad_hw[:, 1]] = ~ok
+	folded_bad = _map_init_folded_quad_mask(
+		uv,
+		active_quad,
+		orientation_sign=state.map_init.orientation_sign,
+	) & new_quad
+	bad = new_quad & (sample_bad | folded_bad)
+	if not bool(bad.any().detach().cpu()):
+		return active_quad, uv, blocked_quad, 0, 0, 0
+	active_new = active_quad.bool() & ~bad
+	blocked_new = blocked_quad.bool() | bad
+	active_new, uv_new, blocked_new, sparse_count = _map_init_apply_sparse_quad_cleanup(
+		state,
+		active_new,
+		uv,
+		blocked_new,
+		cfg=cfg,
+		seed_mask=bad,
+	)
+	if not bool(cfg.map_init.dense_opt):
+		active_vertices = _map_init_active_vertex_mask(active_new, tuple(int(v) for v in uv.shape[:2]))
+		uv_new = torch.where(active_vertices.unsqueeze(-1), uv_new, torch.full_like(uv_new, float("nan")))
+	sample_count = int((bad & sample_bad).sum().detach().cpu())
+	fold_count = int((bad & folded_bad).sum().detach().cpu())
+	return active_new, uv_new, blocked_new, sample_count, fold_count, sparse_count
+
+
+def _map_init_optimize_vertex_mask(
+	state: _SurfaceState,
+	*,
+	base_uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	opt_vertex_mask: torch.Tensor,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	cfg: SnapSurfConfig,
+	steps: int,
+	mode: str,
+	lr: float,
+	w_jac_mult: float = 1.0,
+	commit: bool = False,
+	refresh_guess: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+	ext_pos = state.map_init.ext_pos
+	ext_normals = state.map_init.ext_normals
+	ext_valid = state.map_init.ext_valid
+	ext_quad_valid = state.map_init.ext_quad_valid
+	depth = state.map_init.model_depth
+	active_quad = active_quad.bool()
+	opt_vertex_mask = opt_vertex_mask.bool() & torch.isfinite(base_uv).all(dim=-1)
+	if (
+		ext_pos is None or ext_normals is None or ext_valid is None or depth is None or
+		not bool(active_quad.any().detach().cpu())
+	):
+		z = model_xyz.sum() * 0.0
+		return base_uv.detach(), {
+			"loss": z.detach(), "dist": z.detach(), "vec": z.detach(), "norm": z.detach(),
+			"smooth": z.detach(), "bend": z.detach(), "jac": z.detach(),
+			"smooth_fwd": z.detach(), "bend_fwd": z.detach(),
+			"smooth_uv_fwd": z.detach(), "bend_uv_fwd": z.detach(),
+			"smooth_model_fwd": z.detach(), "bend_model_fwd": z.detach(),
+			"metric_smooth": z.detach(), "area_smooth": z.detach(),
+			"jac_min": z.detach(), "jac_bad": z.detach(), "jac_bad_frac": z.detach(),
+			"model_bad": z.detach(),
+			"sample_loss": z.detach(), "sample_total": z.detach(), "sample_valid": z.detach(),
+			"sample_bad": z.detach(), "sample_bad_frac": z.detach(),
+			"quad_total": z.detach(), "quad_success": z.detach(), "quad_success_frac": z.detach(),
+			"jac_bad_quad": z.detach(), "jac_inv_bad_quad": z.detach(),
+			"completed": z.detach(), "requested": z.detach(),
+		}
+	remaining = max(0, int(cfg.map_init.iters) - int(state.map_init.total_iters))
+	requested_steps = min(max(0, int(steps)), remaining)
+	if requested_steps <= 0 or not bool(opt_vertex_mask.any().detach().cpu()):
+		_, terms = _map_init_objective(
+			uv_full=base_uv.detach(),
+			active_quad=active_quad,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
+			orientation_sign=state.map_init.orientation_sign,
+			cfg=cfg,
+			w_jac_mult=w_jac_mult,
+		)
+		terms = dict(terms)
+		z = model_xyz.sum() * 0.0
+		terms["completed"] = z.detach()
+		terms["requested"] = torch.tensor(float(requested_steps), device=model_xyz.device, dtype=model_xyz.dtype)
+		return base_uv.detach(), terms
+	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
+	base = base_uv.detach().clone()
+	param = torch.nn.Parameter(base[opt_vertex_mask].detach().clone())
+	opt = torch.optim.Adam([param], lr=float(lr))
+
+	def current_uv_full() -> torch.Tensor:
+		out = base.clone()
+		out[opt_vertex_mask] = param
+		return out
+
+	periodic_progress = _map_init_periodic_progress_enabled(cfg)
+	progress_interval = max(100, int(cfg.map_init.progress_interval))
+	if periodic_progress and state.map_init.progress_last_time is None:
+		state.map_init.progress_last_time = time.monotonic()
+		state.map_init.progress_last_iter = int(state.map_init.total_iters)
+	active_count = int(active_quad.sum().detach().cpu())
+	last_terms: dict[str, torch.Tensor] | None = None
+	completed = 0
+	for local_iter in range(1, requested_steps + 1):
+		opt.zero_grad(set_to_none=True)
+		uv_full = current_uv_full()
+		loss, terms = _map_init_objective(
+			uv_full=uv_full,
+			active_quad=active_quad,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
+			orientation_sign=state.map_init.orientation_sign,
+			cfg=cfg,
+			w_jac_mult=w_jac_mult,
+		)
+		if not bool(torch.isfinite(loss).detach().cpu()):
+			_map_init_log(
+				"opt nonfinite "
+				f"mode={mode} "
+				f"block={state.map_init.opt_blocks + 1} "
+				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
+				f"active={active_count} "
+				f"uv_bad={float(terms.get('uv_bad', torch.zeros(())).detach().cpu()):.0f} "
+				f"samples={float(terms.get('samples', torch.zeros(())).detach().cpu()):.0f} "
+				f"loss={float(loss.detach().cpu())}"
+			)
+			break
+		loss.backward()
+		if param.grad is not None and not bool(torch.isfinite(param.grad).all().detach().cpu()):
+			_map_init_log(
+				"opt nonfinite_grad "
+				f"mode={mode} "
+				f"block={state.map_init.opt_blocks + 1} "
+				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
+				f"active={active_count}"
+			)
+			break
+		prev_param = param.detach().clone()
+		opt.step()
+		with torch.no_grad():
+			param[:, 0].clamp_(0.0, float(max(0, H - 1)))
+			param[:, 1].clamp_(0.0, float(max(0, W - 1)))
+			if not bool(torch.isfinite(param).all().detach().cpu()):
+				param.copy_(prev_param)
+				_map_init_log(
+					"opt nonfinite_param "
+					f"mode={mode} "
+					f"block={state.map_init.opt_blocks + 1} "
+					f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
+					f"active={active_count}"
+				)
+				break
+		last_terms = terms
+		completed += 1
+		if periodic_progress:
+			global_iter = state.map_init.total_iters + local_iter
+			if global_iter % progress_interval == 0:
+				_map_init_log_progress(
+					state=state.map_init,
+					mode=mode,
+					block=state.map_init.opt_blocks + 1,
+					iter_idx=global_iter,
+					iter_total=int(cfg.map_init.iters),
+					active_count=active_count,
+					terms=terms,
+				)
+	with torch.no_grad():
+		uv_full = current_uv_full().detach()
+	state.map_init.total_iters += int(completed)
+	state.map_init.opt_blocks += 1
+	_, last_terms_eval = _map_init_objective(
+		uv_full=uv_full,
+		active_quad=active_quad,
+		ext_pos=ext_pos,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		model_depth=int(depth),
+		normal_sign=state.map_init.normal_sign,
+		orientation_sign=state.map_init.orientation_sign,
+		cfg=cfg,
+		w_jac_mult=w_jac_mult,
+	)
+	last_terms = dict(last_terms_eval if last_terms is None else last_terms_eval)
+	last_terms["completed"] = torch.tensor(float(completed), device=model_xyz.device, dtype=model_xyz.dtype)
+	last_terms["requested"] = torch.tensor(float(requested_steps), device=model_xyz.device, dtype=model_xyz.dtype)
+	if mode in ("add", "fringe"):
+		_map_init_accumulate_phase_stats(state.map_init, mode, last_terms)
+	if commit:
+		state.map_init.uv = uv_full.detach()
+		if refresh_guess:
+			_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
+	return uv_full.detach(), last_terms
+
+
 def _map_init_optimize_block(
 	state: _SurfaceState,
 	*,
@@ -4705,6 +5452,10 @@ def _map_init_optimize_block(
 			"metric_smooth": z.detach(), "area_smooth": z.detach(),
 			"jac_min": z.detach(), "jac_bad": z.detach(), "jac_bad_frac": z.detach(),
 			"model_bad": z.detach(),
+			"sample_loss": z.detach(), "sample_total": z.detach(), "sample_valid": z.detach(),
+			"sample_bad": z.detach(), "sample_bad_frac": z.detach(),
+			"quad_total": z.detach(), "quad_success": z.detach(), "quad_success_frac": z.detach(),
+			"jac_bad_quad": z.detach(), "jac_inv_bad_quad": z.detach(),
 		}
 	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
 	dense_mode = bool(cfg.map_init.dense_opt)
@@ -4750,8 +5501,9 @@ def _map_init_optimize_block(
 
 	last_terms: dict[str, torch.Tensor] | None = None
 	requested_steps = int(steps)
+	periodic_progress = _map_init_periodic_progress_enabled(cfg)
 	progress_interval = max(100, int(cfg.map_init.progress_interval))
-	if state.map_init.progress_last_time is None:
+	if periodic_progress and state.map_init.progress_last_time is None:
 		state.map_init.progress_last_time = time.monotonic()
 		state.map_init.progress_last_iter = int(state.map_init.total_iters)
 	completed = 0
@@ -4824,17 +5576,18 @@ def _map_init_optimize_block(
 				break
 		last_terms = terms
 		completed += 1
-		global_iter = state.map_init.total_iters + local_iter
-		if global_iter % progress_interval == 0:
-			_map_init_log_progress(
-				state=state.map_init,
-				mode=mode,
-				block=state.map_init.opt_blocks + 1,
-				iter_idx=global_iter,
-				iter_total=int(cfg.map_init.iters),
-				active_count=state.map_init.active_count(),
-				terms=terms,
-			)
+		if periodic_progress:
+			global_iter = state.map_init.total_iters + local_iter
+			if global_iter % progress_interval == 0:
+				_map_init_log_progress(
+					state=state.map_init,
+					mode=mode,
+					block=state.map_init.opt_blocks + 1,
+					iter_idx=global_iter,
+					iter_total=int(cfg.map_init.iters),
+					active_count=state.map_init.active_count(),
+					terms=terms,
+				)
 	with torch.no_grad():
 		state.map_init.uv = current_uv_full().detach()
 	state.map_init.total_iters += int(completed)
@@ -4979,18 +5732,40 @@ def _run_map_init_for_surface(
 		if ok:
 			last_terms: dict[str, torch.Tensor] = {}
 			while state.map_init.total_iters < int(cfg.map_init.iters):
-				with torch.no_grad():
-					added = _map_init_grow_once(
-						state,
-						model_valid=model_valid,
-						model_normals=model_normals,
-						cfg=cfg,
-					)
+				added = _map_init_grow_once(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					cfg=cfg,
+				)
 				block = min(
 					int(cfg.map_init.grow_opt_iters),
 					int(cfg.map_init.iters) - int(state.map_init.total_iters),
 				)
 				if block > 0:
+					if (
+						state.map_init.active_quad is not None and state.map_init.uv is not None and
+						state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
+						state.map_init.ext_valid is not None and state.map_init.model_depth is not None
+					):
+						_map_init_log_fringe_debug(
+							state=state.map_init,
+							phase="grow0",
+							block=state.map_init.opt_blocks + 1,
+							iter_idx=state.map_init.total_iters,
+							uv_full=state.map_init.uv,
+							active_quad=state.map_init.active_quad,
+							ext_pos=state.map_init.ext_pos,
+							ext_normals=state.map_init.ext_normals,
+							ext_valid=state.map_init.ext_valid,
+							ext_quad_valid=state.map_init.ext_quad_valid,
+							model_xyz=model_xyz,
+							model_valid=model_valid,
+							model_normals=model_normals,
+							model_depth=int(state.map_init.model_depth),
+							cfg=cfg,
+						)
 					last_terms = _map_init_optimize_block(
 						state,
 						model_xyz=model_xyz,
@@ -4999,6 +5774,28 @@ def _run_map_init_for_surface(
 						cfg=cfg,
 						steps=block,
 					)
+					if (
+						state.map_init.active_quad is not None and state.map_init.uv is not None and
+						state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
+						state.map_init.ext_valid is not None and state.map_init.model_depth is not None
+					):
+						_map_init_log_fringe_debug(
+							state=state.map_init,
+							phase="grow",
+							block=state.map_init.opt_blocks,
+							iter_idx=state.map_init.total_iters,
+							uv_full=state.map_init.uv,
+							active_quad=state.map_init.active_quad,
+							ext_pos=state.map_init.ext_pos,
+							ext_normals=state.map_init.ext_normals,
+							ext_valid=state.map_init.ext_valid,
+							ext_quad_valid=state.map_init.ext_quad_valid,
+							model_xyz=model_xyz,
+							model_valid=model_valid,
+							model_normals=model_normals,
+							model_depth=int(state.map_init.model_depth),
+							cfg=cfg,
+						)
 					completed = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
 					pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
 						state,
@@ -5142,6 +5939,26 @@ def _run_map_init_for_surface(
 	stats["snaps_map_iters"] = float(state.map_init.total_iters)
 	stats["snaps_map_blocks"] = float(state.map_init.opt_blocks)
 	stats["snaps_map_grow"] = float(state.map_init.grow_steps)
+	stats["snaps_map_add_loss"] = (
+		float(state.map_init.add_sample_loss_sum) / float(max(1.0, state.map_init.add_sample_weight))
+	)
+	stats["snaps_map_add_bad_frac"] = (
+		float(state.map_init.add_bad_samples) / float(max(1.0, state.map_init.add_total_samples))
+	)
+	stats["snaps_map_add_success_frac"] = (
+		float(state.map_init.add_success_quads) / float(max(1.0, state.map_init.add_total_quads))
+		if state.map_init.add_total_quads > 0.0 else 0.0
+	)
+	stats["snaps_map_fringe_loss"] = (
+		float(state.map_init.fringe_sample_loss_sum) / float(max(1.0, state.map_init.fringe_sample_weight))
+	)
+	stats["snaps_map_fringe_bad_frac"] = (
+		float(state.map_init.fringe_bad_samples) / float(max(1.0, state.map_init.fringe_total_samples))
+	)
+	stats["snaps_map_fringe_success_frac"] = (
+		float(state.map_init.fringe_success_quads) / float(max(1.0, state.map_init.fringe_total_quads))
+		if state.map_init.fringe_total_quads > 0.0 else 0.0
+	)
 	stats["snaps_map_nsign"] = float(state.map_init.normal_sign)
 	stats["snaps_map_scales"] = float(state.map_init.scale_levels_used)
 	stats["snaps_map_repair"] = float(state.map_init.repair_blocks)
