@@ -954,6 +954,48 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertAlmostEqual(float(ok_pen.detach()), 0.0, places=6)
 		self.assertGreater(float(flip_pen.detach()), 0.0)
 
+	def test_map_init_inverse_regularization_penalizes_compression(self) -> None:
+		active = torch.ones(2, 2, dtype=torch.bool)
+		uv_ok = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
+		uv_compressed = uv_ok * 0.1
+
+		ok_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
+			uv_ok,
+			active,
+			orientation_sign=1,
+			jac_margin=0.05,
+		)
+		compressed_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
+			uv_compressed,
+			active,
+			orientation_sign=1,
+			jac_margin=0.05,
+		)
+
+		self.assertAlmostEqual(float(ok_terms["smooth"].detach()), 1.0, places=6)
+		self.assertGreater(float(compressed_terms["smooth"].detach()), 50.0)
+
+	def test_map_init_inverse_jacobian_penalizes_large_expansion(self) -> None:
+		active = torch.ones(2, 2, dtype=torch.bool)
+		uv_expanded = torch.tensor([[[0.0, 0.0], [0.0, 30.0]], [[30.0, 0.0], [30.0, 30.0]]])
+
+		forward_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
+			uv_expanded,
+			active,
+			orientation_sign=1,
+			jac_margin=0.05,
+		)
+		reverse_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
+			uv_expanded,
+			active,
+			orientation_sign=1,
+			jac_margin=0.05,
+		)
+
+		self.assertAlmostEqual(float(forward_pen.detach()), 0.0, places=6)
+		self.assertGreater(float(reverse_terms["jac"].detach()), 0.0)
+		self.assertGreater(float(reverse_terms["jac_bad"].detach()), 0.0)
+
 	def test_map_init_repair_detects_folded_jacobian(self) -> None:
 		active = torch.ones(2, 2, dtype=torch.bool)
 		uv_flip = torch.tensor([[[1.0, 0.0], [1.0, 1.0]], [[0.0, 0.0], [0.0, 1.0]]])

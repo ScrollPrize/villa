@@ -2868,6 +2868,14 @@ def _map_init_empty_stats() -> dict[str, float]:
 		"snaps_map_smooth": 0.0,
 		"snaps_map_bend": 0.0,
 		"snaps_map_jac": 0.0,
+		"snaps_map_smooth_fwd": 0.0,
+		"snaps_map_bend_fwd": 0.0,
+		"snaps_map_jac_fwd": 0.0,
+		"snaps_map_smooth_rev": 0.0,
+		"snaps_map_bend_rev": 0.0,
+		"snaps_map_jac_rev": 0.0,
+		"snaps_map_jinv_min": 0.0,
+		"snaps_map_jinv_bad": 0.0,
 		"snaps_map_jmin": 0.0,
 		"snaps_map_prior": 0.0,
 		"snaps_map_reg": 0.0,
@@ -3213,6 +3221,91 @@ def _map_init_jacobian_penalty(
 	return F.relu(float(jac_margin) - values).square().mean()
 
 
+def _map_init_inverse_regularization_terms(
+	uv: torch.Tensor,
+	active: torch.Tensor,
+	*,
+	orientation_sign: int,
+	jac_margin: float,
+) -> dict[str, torch.Tensor]:
+	z = uv[torch.isfinite(uv)].sum() * 0.0 if uv.numel() else torch.zeros((), device=uv.device, dtype=uv.dtype)
+	H, W = int(active.shape[0]), int(active.shape[1])
+	if H < 2 or W < 2:
+		return {
+			"smooth": z,
+			"bend": z,
+			"jac": z,
+			"jac_min": z,
+			"jac_bad": torch.tensor(0.0, device=uv.device, dtype=uv.dtype),
+		}
+
+	finite_uv = torch.isfinite(uv).all(dim=-1)
+	cell = (
+		active[:-1, :-1] &
+		active[1:, :-1] &
+		active[:-1, 1:] &
+		finite_uv[:-1, :-1] &
+		finite_uv[1:, :-1] &
+		finite_uv[:-1, 1:]
+	)
+	dh = uv[1:, :-1] - uv[:-1, :-1]
+	dw = uv[:-1, 1:] - uv[:-1, :-1]
+	det = dh[..., 0] * dw[..., 1] - dh[..., 1] * dw[..., 0]
+	finite = cell & torch.isfinite(dh).all(dim=-1) & torch.isfinite(dw).all(dim=-1) & torch.isfinite(det)
+	if not bool(finite.any().detach().cpu()):
+		return {
+			"smooth": z,
+			"bend": z,
+			"jac": z,
+			"jac_min": z,
+			"jac_bad": torch.tensor(0.0, device=uv.device, dtype=uv.dtype),
+		}
+
+	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
+	det_signed = det * sign
+	det_v = det_signed[finite]
+	dh_v = dh[finite]
+	dw_v = dw[finite]
+	eps = max(1.0e-3, 0.1 * float(jac_margin))
+	safe_det = det_v.clamp_min(eps)
+	fro2 = dh_v.square().sum(dim=-1) + dw_v.square().sum(dim=-1)
+	# This is the Frobenius norm of d(source)/d(model). Identity maps to 1,
+	# matching the forward smooth term's identity scale.
+	smooth_rev = (0.5 * fro2 / safe_det.square()).mean()
+	det_for_recip = det_v.clamp_min(eps)
+	inv_det = torch.where(det_v > eps, det_for_recip.reciprocal(), torch.zeros_like(det_v))
+	jac_rev = F.relu(float(jac_margin) - inv_det).square().mean()
+	jac_inv_min = inv_det.min()
+	jac_inv_bad = (inv_det < float(jac_margin)).sum()
+
+	raw_safe_det = safe_det * sign
+	inv_j = torch.zeros((*det.shape, 2, 2), device=uv.device, dtype=uv.dtype)
+	inv_j_finite = torch.stack([
+		torch.stack([dw_v[:, 1] / raw_safe_det, -dw_v[:, 0] / raw_safe_det], dim=-1),
+		torch.stack([-dh_v[:, 1] / raw_safe_det, dh_v[:, 0] / raw_safe_det], dim=-1),
+	], dim=-2)
+	inv_j[finite] = inv_j_finite
+	bend_vals: list[torch.Tensor] = []
+	if int(inv_j.shape[0]) > 1:
+		m = finite[1:, :] & finite[:-1, :]
+		dj = inv_j[1:, :] - inv_j[:-1, :]
+		if bool(m.any().detach().cpu()):
+			bend_vals.append(dj.square().sum(dim=(-1, -2))[m])
+	if int(inv_j.shape[1]) > 1:
+		m = finite[:, 1:] & finite[:, :-1]
+		dj = inv_j[:, 1:] - inv_j[:, :-1]
+		if bool(m.any().detach().cpu()):
+			bend_vals.append(dj.square().sum(dim=(-1, -2))[m])
+	bend_rev = torch.cat(bend_vals).mean() if bend_vals else z
+	return {
+		"smooth": smooth_rev,
+		"bend": bend_rev,
+		"jac": jac_rev,
+		"jac_min": jac_inv_min,
+		"jac_bad": torch.tensor(float(int(jac_inv_bad.detach().cpu())), device=uv.device, dtype=uv.dtype),
+	}
+
+
 def _map_init_local_jacobian_pass(
 	uv: torch.Tensor,
 	active: torch.Tensor,
@@ -3359,7 +3452,7 @@ def _map_init_objective(
 		finite = m & torch.isfinite(dv).all(dim=-1)
 		if bool(finite.any().detach().cpu()):
 			smooth_vals.append(dv.square().sum(dim=-1)[finite])
-	smooth_loss = torch.cat(smooth_vals).mean() if smooth_vals else z
+	smooth_fwd_loss = torch.cat(smooth_vals).mean() if smooth_vals else z
 
 	if int(active.shape[0]) > 2 and int(active.shape[1]) > 2:
 		m = (
@@ -3377,16 +3470,28 @@ def _map_init_objective(
 			4.0 * uv_safe[1:-1, 1:-1]
 		)
 		finite = m & torch.isfinite(lap).all(dim=-1)
-		bend_loss = lap.square().sum(dim=-1)[finite].mean() if bool(finite.any().detach().cpu()) else z
+		bend_fwd_loss = lap.square().sum(dim=-1)[finite].mean() if bool(finite.any().detach().cpu()) else z
 	else:
-		bend_loss = z
+		bend_fwd_loss = z
 
-	jac_loss = _map_init_jacobian_penalty(
+	jac_fwd_loss = _map_init_jacobian_penalty(
 		uv_safe,
 		reg_finite,
 		orientation_sign=orientation_sign,
 		jac_margin=mi.jac_margin,
 	)
+	inv_terms = _map_init_inverse_regularization_terms(
+		uv_safe,
+		reg_finite,
+		orientation_sign=orientation_sign,
+		jac_margin=mi.jac_margin,
+	)
+	smooth_rev_loss = inv_terms["smooth"]
+	bend_rev_loss = inv_terms["bend"]
+	jac_rev_loss = inv_terms["jac"]
+	smooth_loss = smooth_fwd_loss + smooth_rev_loss
+	bend_loss = bend_fwd_loss + bend_rev_loss
+	jac_loss = jac_fwd_loss + jac_rev_loss
 	jac_vals = _map_init_jacobian_values(uv_safe, reg_finite, orientation_sign=orientation_sign)
 	jac_min = jac_vals.min() if jac_vals.numel() else z
 	if jac_vals.numel():
@@ -3421,7 +3526,14 @@ def _map_init_objective(
 		"smooth": smooth_loss.detach(),
 		"bend": bend_loss.detach(),
 		"jac": jac_loss.detach(),
+		"smooth_fwd": smooth_fwd_loss.detach(),
+		"bend_fwd": bend_fwd_loss.detach(),
+		"jac_fwd": jac_fwd_loss.detach(),
+		"smooth_rev": smooth_rev_loss.detach(),
+		"bend_rev": bend_rev_loss.detach(),
+		"jac_rev": jac_rev_loss.detach(),
 		"jac_min": jac_min.detach(),
+		"jac_inv_min": inv_terms["jac_min"].detach(),
 		"prior": prior_loss.detach(),
 		"dist_avg": dist_avg.detach(),
 		"active": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
@@ -3431,6 +3543,7 @@ def _map_init_objective(
 		"model_bad": torch.tensor(float(model_bad_count), device=uv_full.device, dtype=uv_full.dtype),
 		"jac_bad": torch.tensor(float(jac_bad_count), device=uv_full.device, dtype=uv_full.dtype),
 		"jac_bad_frac": torch.tensor(float(jac_bad_frac), device=uv_full.device, dtype=uv_full.dtype),
+		"jac_inv_bad": inv_terms["jac_bad"].detach(),
 	}
 
 
@@ -3836,6 +3949,11 @@ def _map_init_optimize_block(
 				f"bend={float(terms.get('bend', torch.zeros(())).detach().cpu()):.6g} "
 				f"jac={float(terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
 				f"jac_min={float(terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g} "
+				f"rsmooth={float(terms.get('smooth_rev', torch.zeros(())).detach().cpu()):.6g} "
+				f"rbend={float(terms.get('bend_rev', torch.zeros(())).detach().cpu()):.6g} "
+				f"rjac={float(terms.get('jac_rev', torch.zeros(())).detach().cpu()):.6g} "
+				f"rjac_min={float(terms.get('jac_inv_min', torch.zeros(())).detach().cpu()):.6g} "
+				f"rjac_bad={float(terms.get('jac_inv_bad', torch.zeros(())).detach().cpu()):.0f} "
 				f"prior={float(terms.get('prior', torch.zeros(())).detach().cpu()):.6g} "
 				f"lr={lr:.6g} "
 				f"w_jac_mult={float(w_jac_mult):.6g}"
@@ -4007,6 +4125,9 @@ def _run_map_init_for_surface(
 						f"jac={float(last_terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
 						f"jac_min={float(last_terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g} "
 						f"jac_bad={float(last_terms.get('jac_bad', torch.zeros(())).detach().cpu()):.0f} "
+						f"rjac={float(last_terms.get('jac_rev', torch.zeros(())).detach().cpu()):.6g} "
+						f"rjac_min={float(last_terms.get('jac_inv_min', torch.zeros(())).detach().cpu()):.6g} "
+						f"rjac_bad={float(last_terms.get('jac_inv_bad', torch.zeros(())).detach().cpu()):.0f} "
 						f"prior={float(last_terms.get('prior', torch.zeros(())).detach().cpu()):.6g}"
 					)
 					if completed < block:
@@ -4067,6 +4188,9 @@ def _run_map_init_for_surface(
 							f"jac={float(last_terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
 							f"jac_min={float(last_terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g} "
 							f"jac_bad={float(last_terms.get('jac_bad', torch.zeros(())).detach().cpu()):.0f} "
+							f"rjac={float(last_terms.get('jac_rev', torch.zeros(())).detach().cpu()):.6g} "
+							f"rjac_min={float(last_terms.get('jac_inv_min', torch.zeros(())).detach().cpu()):.6g} "
+							f"rjac_bad={float(last_terms.get('jac_inv_bad', torch.zeros(())).detach().cpu()):.0f} "
 							f"prior={float(last_terms.get('prior', torch.zeros(())).detach().cpu()):.6g}"
 						)
 						if completed_repair < repair_block:
@@ -4124,11 +4248,19 @@ def _run_map_init_for_surface(
 				("smooth", "snaps_map_smooth"),
 				("bend", "snaps_map_bend"),
 				("jac", "snaps_map_jac"),
+				("smooth_fwd", "snaps_map_smooth_fwd"),
+				("bend_fwd", "snaps_map_bend_fwd"),
+				("jac_fwd", "snaps_map_jac_fwd"),
+				("smooth_rev", "snaps_map_smooth_rev"),
+				("bend_rev", "snaps_map_bend_rev"),
+				("jac_rev", "snaps_map_jac_rev"),
 				("jac_min", "snaps_map_jmin"),
+				("jac_inv_min", "snaps_map_jinv_min"),
 				("prior", "snaps_map_prior"),
 				("reg", "snaps_map_reg"),
 				("jac_bad", "snaps_map_jbad"),
 				("jac_bad_frac", "snaps_map_jbadf"),
+				("jac_inv_bad", "snaps_map_jinv_bad"),
 				("samples", "snaps_map_samples"),
 				("uv_bad", "snaps_map_uvbad"),
 				("model_bad", "snaps_map_model_bad"),
@@ -4153,6 +4285,7 @@ def _run_map_init_for_surface(
 		f"grow_steps={stats['snaps_map_grow']:.0f} "
 		f"repair_blocks={stats['snaps_map_repair']:.0f} "
 		f"jac_bad={stats['snaps_map_jbad']:.0f} "
+		f"rjac_bad={stats['snaps_map_jinv_bad']:.0f} "
 		f"model_bad={stats['snaps_map_model_bad']:.0f} "
 		f"loss={stats['snaps_map_loss']:.6g} "
 		f"normal_sign={state.map_init.normal_sign}"
