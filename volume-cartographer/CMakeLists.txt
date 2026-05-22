@@ -25,6 +25,7 @@ option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
+option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 
 # Skip building app executables (vc_*, VC3D) when generating coverage:
@@ -73,6 +74,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 if(VC_DEAD_CODE_REPORT)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+endif()
+if(VC_BUILD_PYTHON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
 # Portable shippable defaults; VC_MARCH_NATIVE=ON (set by dev-* presets) opts
@@ -377,6 +381,9 @@ endif()
 add_subdirectory(utils)
 add_subdirectory(core)
 add_subdirectory(apps)
+if(VC_BUILD_PYTHON)
+    add_subdirectory(python)
+endif()
 
 if(VC_TESTING)
     enable_testing()
