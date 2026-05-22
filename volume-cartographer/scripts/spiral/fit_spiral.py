@@ -1855,13 +1855,16 @@ def get_face_indices(h, w):
 
 
 @torch.inference_mode
-def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips=()):
-    """Returns (min_winding_idx, max_winding_idx) — inclusive min and exclusive max
-    integer winding indices covered by the given patches' in-ROI valid quad centers
-    and by in-ROI unattached pcl points. Winding indices are computed by transforming
-    points to spiral space and rounding shifted_radius/dr_per_winding to the nearest
-    integer (matching the convention in overlay_patches_on_slices). The min is
-    clamped to cfg['output_first_winding']; the max has no upper cap."""
+def _compute_winding_range_and_input_extents(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips=()):
+    """Transforms each patch's valid in-ROI quad centers and each unattached pcl strip's
+    in-ROI points into spiral space, and computes:
+      - output_winding_range = (min_winding_idx, max_winding_idx) — inclusive min and
+        exclusive max winding indices, using `(shifted_radius / dr).round().clamp_min(0)`
+        (the convention in overlay_patches_on_slices); min clamped to
+        cfg['output_first_winding'], cfg['output_winding_margin'] applied on both sides.
+      - patch_extents: list parallel to `patches` of (max_radius, max_winding) per input,
+        or (None, None) when no valid in-ROI samples.
+      - pcl_extents: list parallel to `unattached_pcl_strips`, same shape."""
     device = dr_per_winding.device
     dr = dr_per_winding.detach()
     min_w = None
@@ -1882,7 +1885,8 @@ def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches
             spiral_pieces.append(slice_to_spiral_transform(zyxs[start:start + chunk]))
         return torch.cat(spiral_pieces, dim=0) if len(spiral_pieces) > 1 else spiral_pieces[0]
 
-    for patch in patches:
+    patch_extents = [(None, None)] * len(patches)
+    for patch_index, patch in enumerate(patches):
         patch_zyxs = patch.zyxs.to(device=device, dtype=torch.float32)
         if patch_zyxs.shape[0] < 2 or patch_zyxs.shape[1] < 2:
             continue
@@ -1904,24 +1908,96 @@ def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches
         if not mask.any():
             continue
         spiral_zyxs = transform_in_chunks(quad_center_zyxs[mask])
-        _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-        update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+        _, radius, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+        winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
+        update_from_winding_indices(winding_indices)
+        patch_extents[patch_index] = (
+            float(radius.max().item()),
+            int(winding_indices.max().item()),
+        )
 
+    pcl_extents = [(None, None)] * len(unattached_pcl_strips)
     if unattached_pcl_strips:
         flat = _get_or_build_unattached_pcl_flat(unattached_pcl_strips, device)
         if flat is not None and flat['total'] > 0:
             zyxs = flat['zyxs']
+            strip_id = flat['strip_id']
+            num_strips = flat['num_strips']
             in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
             if in_roi.any():
-                spiral_zyxs = transform_in_chunks(zyxs[in_roi])
-                _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-                update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+                zyxs_roi = zyxs[in_roi]
+                strip_id_roi = strip_id[in_roi]
+                spiral_zyxs = transform_in_chunks(zyxs_roi)
+                _, radius, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+                winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
+                update_from_winding_indices(winding_indices)
+                per_strip_max_r = torch.zeros(num_strips, dtype=torch.float32, device=device)
+                per_strip_max_w = torch.full((num_strips,), -1, dtype=torch.int64, device=device)
+                strip_has_roi = torch.zeros(num_strips, dtype=torch.bool, device=device)
+                per_strip_max_r.scatter_reduce_(0, strip_id_roi, radius.to(torch.float32), reduce='amax')
+                per_strip_max_w.scatter_reduce_(0, strip_id_roi, winding_indices, reduce='amax')
+                strip_has_roi.scatter_(0, strip_id_roi, torch.ones_like(strip_id_roi, dtype=torch.bool))
+                per_strip_max_r_cpu = per_strip_max_r.cpu().tolist()
+                per_strip_max_w_cpu = per_strip_max_w.cpu().tolist()
+                strip_has_roi_cpu = strip_has_roi.cpu().tolist()
+                for k in range(num_strips):
+                    if strip_has_roi_cpu[k]:
+                        pcl_extents[k] = (per_strip_max_r_cpu[k], per_strip_max_w_cpu[k])
 
     first_winding = cfg['output_first_winding']
     if min_w is None:
-        return first_winding, first_winding
-    margin = cfg['output_winding_margin']
-    return max(min_w - margin, first_winding), max_w + 1 + margin
+        output_winding_range = (first_winding, first_winding)
+    else:
+        margin = cfg['output_winding_margin']
+        output_winding_range = (max(min_w - margin, first_winding), max_w + 1 + margin)
+    return output_winding_range, patch_extents, pcl_extents
+
+
+def _warn_if_inputs_exceed_flow_bounds(patch_ids, patch_extents, unattached_pcl_strips, pcl_extents, flow_field_radius):
+    gap_expander_num_windings = cfg['gap_expander_num_windings']
+
+    over_radius_patches = []
+    over_winding_patches = []
+    for pid, (max_r, max_w) in zip(patch_ids, patch_extents):
+        if max_r is None:
+            continue
+        if max_r > flow_field_radius:
+            over_radius_patches.append((pid, max_r))
+        if max_w >= gap_expander_num_windings:
+            over_winding_patches.append((pid, max_w))
+
+    over_radius_pcls = []
+    over_winding_pcls = []
+    for k, (strip, (max_r, max_w)) in enumerate(zip(unattached_pcl_strips, pcl_extents)):
+        if max_r is None:
+            continue
+        name = strip.get('name') or strip.get('id') or strip.get('source_file') or f'#{k}'
+        if max_r > flow_field_radius:
+            over_radius_pcls.append((name, max_r))
+        if max_w >= gap_expander_num_windings:
+            over_winding_pcls.append((name, max_w))
+
+    def _print_offenders(kind, value_label, threshold_label, patches, pcls, fmt):
+        if not (patches or pcls):
+            return
+        print(f'WARNING: {len(patches)} patch(es) and {len(pcls)} unattached pcl(s) have {value_label} exceeding {threshold_label}:')
+        for pid, v in sorted(patches, key=lambda e: -e[1])[:10]:
+            print(f'  patch {pid}: max {kind} {fmt(v)}')
+        if len(patches) > 10:
+            print(f'  ... and {len(patches) - 10} more patches')
+        for name, v in sorted(pcls, key=lambda e: -e[1])[:10]:
+            print(f'  pcl {name}: max {kind} {fmt(v)}')
+        if len(pcls) > 10:
+            print(f'  ... and {len(pcls) - 10} more pcls')
+
+    _print_offenders(
+        'spiral radius', 'spiral-space radius', f'flow_bounds_radius ({flow_field_radius})',
+        over_radius_patches, over_radius_pcls, lambda v: f'{v:.1f}',
+    )
+    _print_offenders(
+        'winding idx', 'winding index', f'gap_expander_num_windings ({gap_expander_num_windings})',
+        over_winding_patches, over_winding_pcls, lambda v: f'{v}',
+    )
 
 
 def _rasterize_triangles_into_mesh(
@@ -2120,7 +2196,7 @@ def _build_snapped_overlay(
 @torch.inference_mode
 def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips, out_path, name='mesh'):
 
-    min_winding_idx, max_winding_idx = _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips)
+    (min_winding_idx, max_winding_idx), _, _ = _compute_winding_range_and_input_extents(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips)
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size'] // downsample_factor  # voxels in downsampled volume
     z_margin = cfg['flow_bounds_z_margin']
@@ -2562,8 +2638,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             satisfied_quads_flat.to(torch.int64),
         )
         if os.environ.get('FIT_SPIRAL_SKIP_FITTED_OVERLAY') != '1':
-            winding_range = _get_output_winding_range(
+            winding_range, patch_extents, pcl_extents = _compute_winding_range_and_input_extents(
                 slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
+            )
+            _warn_if_inputs_exceed_flow_bounds(
+                list(patches_dict.keys()), patch_extents,
+                unattached_pcl_strips, pcl_extents,
+                flow_field_radius,
             )
             save_overlay(
                 spiral_and_transform,
