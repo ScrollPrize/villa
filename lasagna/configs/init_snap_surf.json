@@ -63,14 +63,30 @@
 					"init_distance": 10.0,
 					"w_to_ext": 1.0,
 					"debug_obj_dir": true,
-				"map_inlier_distance": 4.0,
-				"map_init": {
-					"enabled": true,
-					"iters": 9000,
-					"grow_opt_iters": 30
+					"map_inlier_distance": 4.0,
+					"map_init": {
+						"enabled": true,
+						"iters": 9000,
+						"grow_opt_iters": 30,
+						"scale_levels": 8,
+						"scale_factor": 2,
+						"dense_opt": true,
+						"dense_reg_radius": 2,
+						"w_dense_prior": 0.001,
+						"repair_max_blocks": 0,
+						"repair_opt_iters": 100,
+						"repair_lr_mult": 0.1,
+						"repair_w_jac_mult": 10.0,
+						"lr": 0.1,
+						"w_dist": 1.0,
+						"w_vec_normal": 1.0,
+						"w_surface_normal": 1.0,
+						"w_smooth": 1.0,
+						"w_bend": 0.01,
+						"w_jac": 10.0
+					}
 				}
 			}
-		}
 		}
 	]
 }

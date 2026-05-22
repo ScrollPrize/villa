@@ -741,7 +741,20 @@ class SnapSurfMapperTest(unittest.TestCase):
 
 	def test_map_init_config_parse_and_validation(self) -> None:
 		opt_loss_snap_surf.configure_snap_surf(
-			cfg={"map_init": {"enabled": True, "subdiv": 2, "iters": 3}},
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"subdiv": 2,
+					"iters": 3,
+					"scale_levels": 4,
+					"dense_opt": True,
+					"dense_reg_radius": 5,
+					"w_dense_prior": 0.25,
+					"repair_max_blocks": 2,
+					"repair_lr_mult": 0.5,
+					"repair_w_jac_mult": 8.0,
+				}
+			},
 			seed_xyz=(1.0, 1.0, 0.0),
 			active=True,
 		)
@@ -749,12 +762,36 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertTrue(opt_loss_snap_surf._cfg.map_init.enabled)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.subdiv, 2)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.iters, 3)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.scale_levels, 4)
+		self.assertTrue(opt_loss_snap_surf._cfg.map_init.dense_opt)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.dense_reg_radius, 5)
+		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.w_dense_prior, 0.25)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.repair_max_blocks, 2)
+		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.repair_lr_mult, 0.5)
+		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.repair_w_jac_mult, 8.0)
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf.configure_snap_surf(
 				cfg={"map_init": {"unknown": 1}},
 				seed_xyz=(1.0, 1.0, 0.0),
 				active=True,
 			)
+
+	def test_map_init_scalespace_inpaint_preserves_active_uv(self) -> None:
+		uv = torch.full((5, 5, 2), float("nan"))
+		active = torch.zeros(5, 5, dtype=torch.bool)
+		active[2, 2] = True
+		uv[2, 2] = torch.tensor([2.0, 3.0])
+
+		got = opt_loss_snap_surf._map_init_scalespace_inpaint_uv(
+			uv,
+			active,
+			cfg=opt_loss_snap_surf.SnapSurfMapInitConfig(scale_levels=3),
+			model_h=10,
+			model_w=10,
+		)
+
+		self.assertTrue(torch.isfinite(got).all())
+		self.assertTrue(torch.equal(got[2, 2], uv[2, 2]))
 
 	def test_map_init_returns_zero_loss_and_zero_model_gradient(self) -> None:
 		model_xyz = (_plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)).requires_grad_(True)
@@ -788,6 +825,23 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertGreater(mi.active_count(), 0)
 		delta = (mi.uv[mi.active] - mi.ext_coords[mi.active]).abs().max()
 		self.assertLess(float(delta.detach()), 0.2)
+
+	def test_map_init_dense_optimizer_runs_on_full_field(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"map_init": {"enabled": True, "subdiv": 1, "iters": 1, "grow_opt_iters": 1, "seed_radius": 0, "dense_opt": True, "scale_levels": 2}},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		mi = opt_loss_snap_surf._states[0].map_init
+		stats = opt_loss_snap_surf.last_stats()
+
+		self.assertTrue(mi.done)
+		self.assertTrue(torch.isfinite(mi.uv).all())
+		self.assertGreater(stats["snaps_map_reg"], stats["snaps_map_active"])
 
 	def test_map_init_inverted_external_normals_choose_negative_sign(self) -> None:
 		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
@@ -849,6 +903,150 @@ class SnapSurfMapperTest(unittest.TestCase):
 
 		self.assertAlmostEqual(float(ok_pen.detach()), 0.0, places=6)
 		self.assertGreater(float(flip_pen.detach()), 0.0)
+
+	def test_map_init_repair_detects_folded_jacobian(self) -> None:
+		active = torch.ones(2, 2, dtype=torch.bool)
+		uv_flip = torch.tensor([[[1.0, 0.0], [1.0, 1.0]], [[0.0, 0.0], [0.0, 1.0]]])
+		model_xyz = _plane_xyz(h=2, w=2, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
+		loss, terms = opt_loss_snap_surf._map_init_objective(
+			uv_full=uv_flip,
+			active=active,
+			ext_pos=ext_xyz,
+			ext_normals=_normals_2d(2, 2),
+			ext_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_xyz=model_xyz,
+			model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+			model_normals=_normals_3d(1, 2, 2),
+			model_depth=0,
+			normal_sign=1,
+			orientation_sign=1,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(w_dist=0.0, w_vec_normal=0.0, w_surface_normal=0.0),
+			),
+		)
+
+		self.assertTrue(torch.isfinite(loss))
+		self.assertGreater(float(terms["jac_bad"].detach()), 0.0)
+		self.assertLess(float(terms["jac_min"].detach()), 0.0)
+		self.assertTrue(opt_loss_snap_surf._map_init_needs_repair(terms))
+
+	def test_map_init_repair_ignores_positive_jacobian_margin_warnings(self) -> None:
+		terms = {
+			"uv_bad": torch.tensor(0.0),
+			"model_bad": torch.tensor(0.0),
+			"jac_bad": torch.tensor(12.0),
+			"jac_min": torch.tensor(0.03),
+		}
+
+		self.assertFalse(opt_loss_snap_surf._map_init_needs_repair(terms))
+
+	def test_map_init_dense_objective_regularizes_inactive_field(self) -> None:
+		active = torch.zeros(2, 2, dtype=torch.bool)
+		active[0, 0] = True
+		uv_flip = torch.tensor([[[1.0, 0.0], [1.0, 1.0]], [[0.0, 0.0], [0.0, 1.0]]])
+		model_xyz = _plane_xyz(h=2, w=2, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
+		_, sparse_terms = opt_loss_snap_surf._map_init_objective(
+			uv_full=uv_flip,
+			active=active,
+			ext_pos=ext_xyz,
+			ext_normals=_normals_2d(2, 2),
+			ext_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_xyz=model_xyz,
+			model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+			model_normals=_normals_3d(1, 2, 2),
+			model_depth=0,
+			normal_sign=1,
+			orientation_sign=1,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(),
+		)
+		_, dense_terms = opt_loss_snap_surf._map_init_objective(
+			uv_full=uv_flip,
+			active=active,
+			ext_pos=ext_xyz,
+			ext_normals=_normals_2d(2, 2),
+			ext_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_xyz=model_xyz,
+			model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+			model_normals=_normals_3d(1, 2, 2),
+			model_depth=0,
+			normal_sign=1,
+			orientation_sign=1,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(dense_opt=True),
+			),
+		)
+
+		self.assertEqual(float(sparse_terms["jac_bad"].detach()), 0.0)
+		self.assertGreater(float(dense_terms["jac_bad"].detach()), 0.0)
+		self.assertGreater(float(dense_terms["reg"].detach()), float(sparse_terms["reg"].detach()))
+
+	def test_map_init_dense_objective_regularizes_only_active_band(self) -> None:
+		H, W = 7, 7
+		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		ww = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		uv = torch.stack([hh, ww], dim=-1)
+		active = torch.zeros(H, W, dtype=torch.bool)
+		active[3, 3] = True
+		ext_valid = torch.ones(H, W, dtype=torch.bool)
+		ext_valid[2, 2] = False
+
+		_, terms = opt_loss_snap_surf._map_init_objective(
+			uv_full=uv,
+			active=active,
+			ext_pos=_plane_xyz(h=H, w=W, z=0.0),
+			ext_normals=_normals_2d(H, W),
+			ext_valid=ext_valid,
+			model_xyz=_plane_xyz(h=H, w=W, z=1.0).unsqueeze(0),
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+			model_normals=_normals_3d(1, H, W),
+			model_depth=0,
+			normal_sign=1,
+			orientation_sign=1,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					dense_opt=True,
+					dense_reg_radius=2,
+				),
+			),
+		)
+
+		self.assertEqual(float(terms["reg"].detach()), 24.0)
+
+	def test_map_init_repair_detects_invalid_model_uv(self) -> None:
+		active = torch.ones(1, 1, dtype=torch.bool)
+		uv_bad = torch.tensor([[[10.0, 10.0]]])
+		model_xyz = _plane_xyz(h=2, w=2, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=1, w=1, z=0.0)
+		_, terms = opt_loss_snap_surf._map_init_objective(
+			uv_full=uv_bad,
+			active=active,
+			ext_pos=ext_xyz,
+			ext_normals=_normals_2d(1, 1),
+			ext_valid=torch.ones(1, 1, dtype=torch.bool),
+			model_xyz=model_xyz,
+			model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+			model_normals=_normals_3d(1, 2, 2),
+			model_depth=0,
+			normal_sign=1,
+			orientation_sign=1,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(),
+		)
+
+		self.assertGreater(float(terms["model_bad"].detach()), 0.0)
+		self.assertTrue(opt_loss_snap_surf._map_init_needs_repair(terms))
+
+	def test_map_init_repair_max_blocks_zero_is_unlimited(self) -> None:
+		limited = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(repair_max_blocks=3),
+		)
+		unlimited = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(repair_max_blocks=0),
+		)
+
+		self.assertFalse(opt_loss_snap_surf._map_init_repair_block_allowed(limited, 3))
+		self.assertTrue(opt_loss_snap_surf._map_init_repair_block_allowed(unlimited, 300))
 
 	def test_map_init_jacobian_penalty_empty_cells_ignores_inactive_nans(self) -> None:
 		active = torch.zeros(3, 3, dtype=torch.bool)

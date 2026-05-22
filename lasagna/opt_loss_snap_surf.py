@@ -19,6 +19,15 @@ class SnapSurfMapInitConfig:
 	iters: int = 1000
 	grow_opt_iters: int = 100
 	progress_interval: int = 10
+	scale_levels: int = 1
+	scale_factor: int = 2
+	dense_opt: bool = False
+	dense_reg_radius: int = 2
+	w_dense_prior: float = 0.001
+	repair_max_blocks: int = 3  # 0 means no repair-block cap; repair may consume the remaining iters budget.
+	repair_opt_iters: int = 0
+	repair_lr_mult: float = 0.25
+	repair_w_jac_mult: float = 10.0
 	lr: float = 0.05
 	seed_radius: int = 1
 	w_dist: float = 1.0
@@ -161,6 +170,15 @@ def configure_snap_surf(
 			f"iters={_cfg.map_init.iters} "
 			f"grow_opt_iters={_cfg.map_init.grow_opt_iters} "
 			f"progress_interval={_cfg.map_init.progress_interval} "
+			f"scale_levels={_cfg.map_init.scale_levels} "
+			f"scale_factor={_cfg.map_init.scale_factor} "
+			f"dense_opt={int(_cfg.map_init.dense_opt)} "
+			f"dense_reg_radius={_cfg.map_init.dense_reg_radius} "
+			f"w_dense_prior={_cfg.map_init.w_dense_prior} "
+			f"repair_max_blocks={_cfg.map_init.repair_max_blocks} "
+			f"repair_opt_iters={_cfg.map_init.repair_opt_iters} "
+			f"repair_lr_mult={_cfg.map_init.repair_lr_mult} "
+			f"repair_w_jac_mult={_cfg.map_init.repair_w_jac_mult} "
 			f"lr={_cfg.map_init.lr} "
 			f"seed_radius={_cfg.map_init.seed_radius} "
 			f"jac_margin={_cfg.map_init.jac_margin}"
@@ -185,6 +203,15 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			iters=max(0, int(raw.get("iters", defaults.iters))),
 			grow_opt_iters=max(0, int(raw.get("grow_opt_iters", defaults.grow_opt_iters))),
 			progress_interval=max(1, int(raw.get("progress_interval", defaults.progress_interval))),
+			scale_levels=max(1, int(raw.get("scale_levels", defaults.scale_levels))),
+			scale_factor=max(2, int(raw.get("scale_factor", defaults.scale_factor))),
+			dense_opt=bool(raw.get("dense_opt", defaults.dense_opt)),
+			dense_reg_radius=max(0, int(raw.get("dense_reg_radius", defaults.dense_reg_radius))),
+			w_dense_prior=float(raw.get("w_dense_prior", defaults.w_dense_prior)),
+			repair_max_blocks=max(0, int(raw.get("repair_max_blocks", defaults.repair_max_blocks))),
+			repair_opt_iters=max(0, int(raw.get("repair_opt_iters", defaults.repair_opt_iters))),
+			repair_lr_mult=float(raw.get("repair_lr_mult", defaults.repair_lr_mult)),
+			repair_w_jac_mult=float(raw.get("repair_w_jac_mult", defaults.repair_w_jac_mult)),
 			lr=float(raw.get("lr", defaults.lr)),
 			seed_radius=max(0, int(raw.get("seed_radius", defaults.seed_radius))),
 			w_dist=float(raw.get("w_dist", defaults.w_dist)),
@@ -200,7 +227,11 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 		raise ValueError("snap_surf args.map_init must be an object or null")
 	if cfg.lr <= 0.0:
 		raise ValueError("snap_surf args.map_init.lr must be > 0")
-	for name in ("w_dist", "w_vec_normal", "w_surface_normal", "w_smooth", "w_bend", "w_jac", "angle_dist_mult"):
+	if cfg.repair_lr_mult <= 0.0:
+		raise ValueError("snap_surf args.map_init.repair_lr_mult must be > 0")
+	if cfg.repair_w_jac_mult < 0.0:
+		raise ValueError("snap_surf args.map_init.repair_w_jac_mult must be >= 0")
+	for name in ("w_dist", "w_vec_normal", "w_surface_normal", "w_smooth", "w_bend", "w_jac", "w_dense_prior", "angle_dist_mult"):
 		if float(getattr(cfg, name)) < 0.0:
 			raise ValueError(f"snap_surf args.map_init.{name} must be >= 0")
 	if cfg.jac_margin < 0.0:
@@ -279,6 +310,7 @@ class _MapInitState:
 		self.done: bool = False
 		self.active: torch.Tensor | None = None
 		self.uv: torch.Tensor | None = None
+		self.uv_guess: torch.Tensor | None = None
 		self.ext_pos: torch.Tensor | None = None
 		self.ext_normals: torch.Tensor | None = None
 		self.ext_valid: torch.Tensor | None = None
@@ -291,7 +323,9 @@ class _MapInitState:
 		self.total_iters: int = 0
 		self.grow_steps: int = 0
 		self.opt_blocks: int = 0
+		self.repair_blocks: int = 0
 		self.added_total: int = 0
+		self.scale_levels_used: int = 1
 		self.stats: dict[str, float] = {}
 
 	def reset(self) -> None:
@@ -2832,9 +2866,16 @@ def _map_init_empty_stats() -> dict[str, float]:
 		"snaps_map_bend": 0.0,
 		"snaps_map_jac": 0.0,
 		"snaps_map_jmin": 0.0,
+		"snaps_map_prior": 0.0,
+		"snaps_map_reg": 0.0,
+		"snaps_map_jbad": 0.0,
+		"snaps_map_jbadf": 0.0,
 		"snaps_map_samples": 0.0,
 		"snaps_map_uvbad": 0.0,
+		"snaps_map_model_bad": 0.0,
 		"snaps_map_nsign": 1.0,
+		"snaps_map_scales": 1.0,
+		"snaps_map_repair": 0.0,
 	}
 
 
@@ -2916,6 +2957,190 @@ def _map_init_model_coord_ok(
 		torch.isfinite(n).all(dim=-1) &
 		(n.norm(dim=-1) > 1.0e-8)
 	)
+
+
+def _map_init_clamp_uv(uv: torch.Tensor, *, model_h: int, model_w: int) -> torch.Tensor:
+	h = uv[..., 0].clamp(0.0, float(max(0, int(model_h) - 1)))
+	w = uv[..., 1].clamp(0.0, float(max(0, int(model_w) - 1)))
+	return torch.stack([h, w], dim=-1)
+
+
+def _map_init_scale_shapes(h: int, w: int, *, levels: int, factor: int) -> list[tuple[int, int]]:
+	out: list[tuple[int, int]] = [(max(1, int(h)), max(1, int(w)))]
+	step = max(2, int(factor))
+	for _ in range(1, max(1, int(levels))):
+		prev_h, prev_w = out[-1]
+		if prev_h <= 1 and prev_w <= 1:
+			break
+		out.append((max(1, (prev_h + step - 1) // step), max(1, (prev_w + step - 1) // step)))
+	return out
+
+
+def _map_init_integrate_uv_pyr(pyr: torch.nn.ParameterList) -> torch.Tensor:
+	v = pyr[-1]
+	for d in reversed(pyr[:-1]):
+		v = F.interpolate(v, size=(int(d.shape[2]), int(d.shape[3])), mode="bilinear", align_corners=True) + d
+	return v.permute(0, 2, 3, 1).squeeze(0).contiguous()
+
+
+def _map_init_uv_pyr_from_masked(
+	uv: torch.Tensor,
+	valid: torch.Tensor,
+	*,
+	levels: int,
+	factor: int,
+) -> torch.nn.ParameterList:
+	if uv.ndim != 3 or int(uv.shape[-1]) != 2:
+		raise ValueError("map-init uv must be (H,W,2)")
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	shapes = _map_init_scale_shapes(H, W, levels=levels, factor=factor)
+	valid = valid.bool() & torch.isfinite(uv).all(dim=-1)
+	valid_nchw = valid.to(dtype=uv.dtype).view(1, 1, H, W)
+	target0 = torch.where(valid.unsqueeze(-1), uv, torch.zeros_like(uv)).permute(2, 0, 1).unsqueeze(0).contiguous()
+	targets: list[torch.Tensor] = [target0]
+	valids: list[torch.Tensor] = [valid_nchw]
+	for h_t, w_t in shapes[1:]:
+		prev_valid = valids[-1]
+		data_down = F.interpolate(targets[-1] * prev_valid, size=(int(h_t), int(w_t)), mode="bilinear", align_corners=True)
+		valid_down = F.interpolate(prev_valid, size=(int(h_t), int(w_t)), mode="bilinear", align_corners=True)
+		target = data_down / valid_down.clamp_min(1.0e-6)
+		valid_mask = (valid_down > 0.01).to(dtype=uv.dtype)
+		targets.append(target)
+		valids.append(valid_mask)
+
+	residuals: list[torch.Tensor] = [torch.empty(0, device=uv.device, dtype=uv.dtype)] * len(targets)
+	recon = targets[-1]
+	residuals[-1] = targets[-1]
+	for i in range(len(targets) - 2, -1, -1):
+		up = F.interpolate(recon, size=(int(targets[i].shape[2]), int(targets[i].shape[3])), mode="bilinear", align_corners=True)
+		residuals[i] = (targets[i] - up) * valids[i]
+		recon = up + residuals[i]
+
+	out = torch.nn.ParameterList()
+	for r in residuals:
+		out.append(torch.nn.Parameter(r.detach().clone()))
+	return out
+
+
+def _map_init_uv_pyr_from_dense(
+	uv: torch.Tensor,
+	*,
+	levels: int,
+	factor: int,
+) -> torch.nn.ParameterList:
+	if uv.ndim != 3 or int(uv.shape[-1]) != 2:
+		raise ValueError("map-init dense uv must be (H,W,2)")
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	shapes = _map_init_scale_shapes(H, W, levels=levels, factor=factor)
+	targets: list[torch.Tensor] = [uv.permute(2, 0, 1).unsqueeze(0).contiguous()]
+	for h_t, w_t in shapes[1:]:
+		targets.append(F.interpolate(targets[-1], size=(int(h_t), int(w_t)), mode="bilinear", align_corners=True))
+
+	residuals: list[torch.Tensor] = [torch.empty(0, device=uv.device, dtype=uv.dtype)] * len(targets)
+	recon = targets[-1]
+	residuals[-1] = targets[-1]
+	for i in range(len(targets) - 2, -1, -1):
+		up = F.interpolate(recon, size=(int(targets[i].shape[2]), int(targets[i].shape[3])), mode="bilinear", align_corners=True)
+		residuals[i] = targets[i] - up
+		recon = up + residuals[i]
+
+	out = torch.nn.ParameterList()
+	for r in residuals:
+		out.append(torch.nn.Parameter(r.detach().clone()))
+	return out
+
+
+def _map_init_scalespace_inpaint_uv(
+	uv: torch.Tensor,
+	active: torch.Tensor,
+	*,
+	cfg: SnapSurfMapInitConfig,
+	model_h: int | None = None,
+	model_w: int | None = None,
+) -> torch.Tensor:
+	valid = active.bool() & torch.isfinite(uv).all(dim=-1)
+	if uv.numel() == 0 or not bool(valid.any().detach().cpu()):
+		return uv.detach().clone()
+	pyr = _map_init_uv_pyr_from_masked(
+		uv,
+		valid,
+		levels=int(cfg.scale_levels),
+		factor=int(cfg.scale_factor),
+	)
+	with torch.no_grad():
+		out = _map_init_integrate_uv_pyr(pyr).detach()
+		if model_h is not None and model_w is not None:
+			out = _map_init_clamp_uv(out, model_h=int(model_h), model_w=int(model_w))
+		out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
+		out = torch.where(valid.unsqueeze(-1), uv.detach(), out)
+		return out
+
+
+def _map_init_refresh_uv_guess(
+	state: _SurfaceState,
+	*,
+	model_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+) -> None:
+	if state.map_init.uv is None or state.map_init.active is None:
+		return
+	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
+	uv_finite = torch.isfinite(state.map_init.uv).all(dim=-1)
+	if cfg.map_init.dense_opt and bool(uv_finite.all().detach().cpu()):
+		state.map_init.uv_guess = _map_init_clamp_uv(
+			state.map_init.uv.detach(),
+			model_h=H,
+			model_w=W,
+		)
+		state.map_init.scale_levels_used = len(_map_init_scale_shapes(
+			int(state.map_init.uv.shape[0]),
+			int(state.map_init.uv.shape[1]),
+			levels=int(cfg.map_init.scale_levels),
+			factor=int(cfg.map_init.scale_factor),
+		))
+		return
+	if int(cfg.map_init.scale_levels) <= 1 and not cfg.map_init.dense_opt:
+		state.map_init.uv_guess = None
+		state.map_init.scale_levels_used = 1
+		return
+	state.map_init.uv_guess = _map_init_scalespace_inpaint_uv(
+		state.map_init.uv,
+		state.map_init.active,
+		cfg=cfg.map_init,
+		model_h=H,
+		model_w=W,
+	).detach()
+	state.map_init.scale_levels_used = len(_map_init_scale_shapes(
+		int(state.map_init.uv.shape[0]),
+		int(state.map_init.uv.shape[1]),
+		levels=int(cfg.map_init.scale_levels),
+		factor=int(cfg.map_init.scale_factor),
+	))
+
+
+def _map_init_dense_seed_uv(
+	state: _SurfaceState,
+	*,
+	model_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+) -> torch.Tensor:
+	if state.map_init.uv is None or state.map_init.active is None:
+		raise RuntimeError("map-init dense seed requested before initialization")
+	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
+	if state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(state.map_init.uv.shape[:2]):
+		seed = state.map_init.uv_guess.detach().clone()
+	else:
+		seed = _map_init_scalespace_inpaint_uv(
+			state.map_init.uv,
+			state.map_init.active,
+			cfg=cfg.map_init,
+			model_h=H,
+			model_w=W,
+		)
+	active_finite = state.map_init.active.bool() & torch.isfinite(state.map_init.uv).all(dim=-1)
+	seed = torch.where(active_finite.unsqueeze(-1), state.map_init.uv.detach(), seed)
+	seed = torch.where(torch.isfinite(seed), seed, torch.zeros_like(seed))
+	return _map_init_clamp_uv(seed, model_h=H, model_w=W)
 
 
 def _map_init_distance_multiplier(
@@ -3006,6 +3231,22 @@ def _map_init_local_jacobian_pass(
 	return True
 
 
+def _map_init_regularization_mask(
+	*,
+	active_finite: torch.Tensor,
+	ext_valid: torch.Tensor,
+	uv_finite: torch.Tensor,
+	cfg: SnapSurfMapInitConfig,
+) -> torch.Tensor:
+	if not bool(cfg.dense_opt):
+		return active_finite
+	band = _dilate_mask_2d(
+		active_finite.unsqueeze(0),
+		radius=int(cfg.dense_reg_radius),
+	)[0]
+	return band & ext_valid.bool() & uv_finite
+
+
 def _map_init_objective(
 	*,
 	uv_full: torch.Tensor,
@@ -3020,6 +3261,8 @@ def _map_init_objective(
 	normal_sign: int,
 	orientation_sign: int,
 	cfg: SnapSurfConfig,
+	w_jac_mult: float = 1.0,
+	uv_prior: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
@@ -3028,6 +3271,7 @@ def _map_init_objective(
 	active_count = int(active.bool().sum().detach().cpu())
 	active_bad_count = int((active.bool() & ~uv_finite).sum().detach().cpu())
 	finite_count = 0
+	model_bad_count = 0
 	sample_mask = active_finite & ext_valid.bool()
 	if bool(sample_mask.any().detach().cpu()):
 		uv = uv_full[sample_mask]
@@ -3070,11 +3314,13 @@ def _map_init_objective(
 		)
 		if bool(finite.any().detach().cpu()):
 			finite_count = int(finite.sum().detach().cpu())
+			model_bad_count = int((~finite).sum().detach().cpu())
 			dist_loss = dist_values[finite].mean()
 			vec_loss = vec_values[finite].mean()
 			norm_loss = norm_values[finite].mean()
 			dist_avg = d[finite].mean()
 		else:
+			model_bad_count = int(finite.numel())
 			dist_loss = z
 			vec_loss = z
 			norm_loss = z
@@ -3085,16 +3331,23 @@ def _map_init_objective(
 		norm_loss = z
 		dist_avg = z
 
-	uv_safe = torch.where(active_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
+	reg_finite = _map_init_regularization_mask(
+		active_finite=active_finite,
+		ext_valid=ext_valid,
+		uv_finite=uv_finite,
+		cfg=mi,
+	)
+	reg_count = int(reg_finite.sum().detach().cpu())
+	uv_safe = torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
 	smooth_vals: list[torch.Tensor] = []
 	if int(active.shape[0]) > 1:
-		m = active_finite[1:, :] & active_finite[:-1, :]
+		m = reg_finite[1:, :] & reg_finite[:-1, :]
 		dv = uv_safe[1:, :] - uv_safe[:-1, :]
 		finite = m & torch.isfinite(dv).all(dim=-1)
 		if bool(finite.any().detach().cpu()):
 			smooth_vals.append(dv.square().sum(dim=-1)[finite])
 	if int(active.shape[1]) > 1:
-		m = active_finite[:, 1:] & active_finite[:, :-1]
+		m = reg_finite[:, 1:] & reg_finite[:, :-1]
 		dv = uv_safe[:, 1:] - uv_safe[:, :-1]
 		finite = m & torch.isfinite(dv).all(dim=-1)
 		if bool(finite.any().detach().cpu()):
@@ -3103,11 +3356,11 @@ def _map_init_objective(
 
 	if int(active.shape[0]) > 2 and int(active.shape[1]) > 2:
 		m = (
-			active_finite[1:-1, 1:-1] &
-			active_finite[:-2, 1:-1] &
-			active_finite[2:, 1:-1] &
-			active_finite[1:-1, :-2] &
-			active_finite[1:-1, 2:]
+			reg_finite[1:-1, 1:-1] &
+			reg_finite[:-2, 1:-1] &
+			reg_finite[2:, 1:-1] &
+			reg_finite[1:-1, :-2] &
+			reg_finite[1:-1, 2:]
 		)
 		lap = (
 			uv_safe[:-2, 1:-1] +
@@ -3123,19 +3376,35 @@ def _map_init_objective(
 
 	jac_loss = _map_init_jacobian_penalty(
 		uv_safe,
-		active_finite,
+		reg_finite,
 		orientation_sign=orientation_sign,
 		jac_margin=mi.jac_margin,
 	)
-	jac_vals = _map_init_jacobian_values(uv_safe, active_finite, orientation_sign=orientation_sign)
+	jac_vals = _map_init_jacobian_values(uv_safe, reg_finite, orientation_sign=orientation_sign)
 	jac_min = jac_vals.min() if jac_vals.numel() else z
+	if jac_vals.numel():
+		jac_bad = jac_vals < float(mi.jac_margin)
+		jac_bad_count = int(jac_bad.sum().detach().cpu())
+		jac_bad_frac = float(jac_bad_count) / float(max(1, int(jac_vals.numel())))
+	else:
+		jac_bad_count = 0
+		jac_bad_frac = 0.0
+	if bool(mi.dense_opt) and uv_prior is not None:
+		prior_finite = reg_finite & torch.isfinite(uv_prior).all(dim=-1)
+		if bool(prior_finite.any().detach().cpu()):
+			prior_loss = (uv_full - uv_prior).square().sum(dim=-1)[prior_finite].mean()
+		else:
+			prior_loss = z
+	else:
+		prior_loss = z
 	loss = (
 		float(mi.w_dist) * dist_loss +
 		float(mi.w_vec_normal) * vec_loss +
 		float(mi.w_surface_normal) * norm_loss +
 		float(mi.w_smooth) * smooth_loss +
 		float(mi.w_bend) * bend_loss +
-		float(mi.w_jac) * jac_loss
+		float(mi.w_jac) * float(w_jac_mult) * jac_loss +
+		float(mi.w_dense_prior) * prior_loss
 	)
 	return loss, {
 		"loss": loss.detach(),
@@ -3146,10 +3415,15 @@ def _map_init_objective(
 		"bend": bend_loss.detach(),
 		"jac": jac_loss.detach(),
 		"jac_min": jac_min.detach(),
+		"prior": prior_loss.detach(),
 		"dist_avg": dist_avg.detach(),
 		"active": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
+		"reg": torch.tensor(float(reg_count), device=uv_full.device, dtype=uv_full.dtype),
 		"samples": torch.tensor(float(finite_count), device=uv_full.device, dtype=uv_full.dtype),
 		"uv_bad": torch.tensor(float(active_bad_count), device=uv_full.device, dtype=uv_full.dtype),
+		"model_bad": torch.tensor(float(model_bad_count), device=uv_full.device, dtype=uv_full.dtype),
+		"jac_bad": torch.tensor(float(jac_bad_count), device=uv_full.device, dtype=uv_full.dtype),
+		"jac_bad_frac": torch.tensor(float(jac_bad_frac), device=uv_full.device, dtype=uv_full.dtype),
 	}
 
 
@@ -3301,6 +3575,7 @@ def _map_init_seed_state(
 	)
 	init_count = int(active.sum().detach().cpu())
 	state.map_init.added_total = init_count
+	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
 	return init_count > 0, float(seed_model_dist), seed_ext_dist, init_count
 
 
@@ -3341,6 +3616,15 @@ def _map_init_grow_once(
 		return 0
 	cand_hw = cand_hw[support_ok]
 	pred = pred[support_ok]
+	if state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(active.shape):
+		guess = state.map_init.uv_guess[cand_hw[:, 0], cand_hw[:, 1]]
+		guess_ok = torch.isfinite(guess).all(dim=-1) & _map_init_model_coord_ok(
+			guess,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			depth=int(depth),
+		)
+		pred = torch.where(guess_ok.unsqueeze(-1), guess, pred)
 	coord_ok = _map_init_model_coord_ok(
 		pred,
 		model_valid=model_valid,
@@ -3359,6 +3643,7 @@ def _map_init_grow_once(
 		w = int(cand_hw[i, 1].detach().cpu())
 		if bool(active_new[h, w].detach().cpu()):
 			continue
+		prev_uv = uv_new[h, w].clone()
 		uv_new[h, w] = pred[i].detach()
 		active_new[h, w] = True
 		if _map_init_local_jacobian_pass(
@@ -3372,12 +3657,16 @@ def _map_init_grow_once(
 			added += 1
 		else:
 			active_new[h, w] = False
-			uv_new[h, w] = float("nan")
+			if bool(mi.dense_opt):
+				uv_new[h, w] = prev_uv
+			else:
+				uv_new[h, w] = float("nan")
 	state.map_init.active = active_new
 	state.map_init.uv = uv_new
 	state.map_init.added_total += added
 	if added > 0:
 		state.map_init.grow_steps += 1
+		_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
 	return added
 
 
@@ -3389,6 +3678,9 @@ def _map_init_optimize_block(
 	model_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
 	steps: int,
+	mode: str = "grow",
+	lr_mult: float = 1.0,
+	w_jac_mult: float = 1.0,
 ) -> dict[str, torch.Tensor]:
 	active = state.map_init.active
 	uv = state.map_init.uv
@@ -3402,19 +3694,55 @@ def _map_init_optimize_block(
 		not bool(active.any().detach().cpu())
 	):
 		z = model_xyz.sum() * 0.0
-		return {"loss": z.detach(), "dist": z.detach(), "vec": z.detach(), "norm": z.detach(), "smooth": z.detach(), "bend": z.detach(), "jac": z.detach(), "jac_min": z.detach()}
-	param = torch.nn.Parameter(uv[active].detach().clone())
-	opt = torch.optim.Adam([param], lr=float(cfg.map_init.lr))
-	base_uv = uv.detach().clone()
-	last_terms: dict[str, torch.Tensor] | None = None
+		return {"loss": z.detach(), "dist": z.detach(), "vec": z.detach(), "norm": z.detach(), "smooth": z.detach(), "bend": z.detach(), "jac": z.detach(), "jac_min": z.detach(), "jac_bad": z.detach(), "jac_bad_frac": z.detach(), "model_bad": z.detach()}
 	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
+	dense_mode = bool(cfg.map_init.dense_opt)
+	lr = float(cfg.map_init.lr) * float(lr_mult)
+	base_uv = uv.detach().clone()
+	uv_prior: torch.Tensor | None = None
+	if dense_mode:
+		dense_seed = _map_init_dense_seed_uv(state, model_valid=model_valid, cfg=cfg)
+		uv_prior = dense_seed.detach().clone()
+		if int(cfg.map_init.scale_levels) > 1:
+			dense_pyr = _map_init_uv_pyr_from_dense(
+				dense_seed,
+				levels=int(cfg.map_init.scale_levels),
+				factor=int(cfg.map_init.scale_factor),
+			)
+			opt_params = list(dense_pyr)
+			param = None
+		else:
+			param = torch.nn.Parameter(dense_seed.detach().clone())
+			dense_pyr = None
+			opt_params = [param]
+	else:
+		param = torch.nn.Parameter(uv[active].detach().clone())
+		dense_pyr = None
+		opt_params = [param]
+	opt = torch.optim.Adam(opt_params, lr=lr)
+
+	def current_uv_full() -> torch.Tensor:
+		if dense_mode:
+			if dense_pyr is not None:
+				dense_uv = _map_init_integrate_uv_pyr(dense_pyr)
+			else:
+				if param is None:
+					raise RuntimeError("map-init dense optimizer parameter missing")
+				dense_uv = param
+			return _map_init_clamp_uv(dense_uv, model_h=H, model_w=W)
+		if param is None:
+			raise RuntimeError("map-init active optimizer parameter missing")
+		out = base_uv.clone()
+		out[active] = param
+		return out
+
+	last_terms: dict[str, torch.Tensor] | None = None
 	requested_steps = int(steps)
 	progress_interval = max(1, int(cfg.map_init.progress_interval))
 	completed = 0
 	for local_iter in range(1, requested_steps + 1):
 		opt.zero_grad(set_to_none=True)
-		uv_full = base_uv.clone()
-		uv_full[active] = param
+		uv_full = current_uv_full()
 		loss, terms = _map_init_objective(
 			uv_full=uv_full,
 			active=active,
@@ -3428,10 +3756,13 @@ def _map_init_optimize_block(
 			normal_sign=state.map_init.normal_sign,
 			orientation_sign=state.map_init.orientation_sign,
 			cfg=cfg,
+			w_jac_mult=w_jac_mult,
+			uv_prior=uv_prior,
 		)
 		if not bool(torch.isfinite(loss).detach().cpu()):
 			_map_init_log(
 				"opt nonfinite "
+				f"mode={mode} "
 				f"block={state.map_init.opt_blocks + 1} "
 				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
 				f"active={state.map_init.active_count()} "
@@ -3441,23 +3772,35 @@ def _map_init_optimize_block(
 			)
 			break
 		loss.backward()
-		if param.grad is not None and not bool(torch.isfinite(param.grad).all().detach().cpu()):
+		grad_finite = True
+		for p in opt_params:
+			if p.grad is not None and not bool(torch.isfinite(p.grad).all().detach().cpu()):
+				grad_finite = False
+				break
+		if not grad_finite:
 			_map_init_log(
 				"opt nonfinite_grad "
+				f"mode={mode} "
 				f"block={state.map_init.opt_blocks + 1} "
 				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
 				f"active={state.map_init.active_count()}"
 			)
 			break
-		prev_param = param.detach().clone()
+		prev_params = [p.detach().clone() for p in opt_params]
 		opt.step()
 		with torch.no_grad():
-			param[:, 0].clamp_(0.0, float(max(0, H - 1)))
-			param[:, 1].clamp_(0.0, float(max(0, W - 1)))
-			if not bool(torch.isfinite(param).all().detach().cpu()):
-				param.copy_(prev_param)
+			if not dense_mode:
+				if param is None:
+					raise RuntimeError("map-init active optimizer parameter missing")
+				param[:, 0].clamp_(0.0, float(max(0, H - 1)))
+				param[:, 1].clamp_(0.0, float(max(0, W - 1)))
+			param_finite = all(bool(torch.isfinite(p).all().detach().cpu()) for p in opt_params)
+			if not param_finite:
+				for p, prev in zip(opt_params, prev_params, strict=False):
+					p.copy_(prev)
 				_map_init_log(
 					"opt nonfinite_param "
+					f"mode={mode} "
 					f"block={state.map_init.opt_blocks + 1} "
 					f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
 					f"active={state.map_init.active_count()}"
@@ -3468,11 +3811,15 @@ def _map_init_optimize_block(
 		if local_iter == 1 or local_iter == requested_steps or (state.map_init.total_iters + local_iter) % progress_interval == 0:
 			_map_init_log(
 				"opt_iter "
+				f"mode={mode} "
 				f"block={state.map_init.opt_blocks + 1} "
 				f"iter={state.map_init.total_iters + local_iter}/{cfg.map_init.iters} "
 				f"active={state.map_init.active_count()} "
+				f"reg={float(terms.get('reg', torch.zeros(())).detach().cpu()):.0f} "
 				f"samples={float(terms.get('samples', torch.zeros(())).detach().cpu()):.0f} "
 				f"uv_bad={float(terms.get('uv_bad', torch.zeros(())).detach().cpu()):.0f} "
+				f"model_bad={float(terms.get('model_bad', torch.zeros(())).detach().cpu()):.0f} "
+				f"jac_bad={float(terms.get('jac_bad', torch.zeros(())).detach().cpu()):.0f} "
 				f"loss={float(terms.get('loss', torch.zeros(())).detach().cpu()):.6g} "
 				f"dist={float(terms.get('dist', torch.zeros(())).detach().cpu()):.6g} "
 				f"vec={float(terms.get('vec', torch.zeros(())).detach().cpu()):.6g} "
@@ -3480,35 +3827,69 @@ def _map_init_optimize_block(
 				f"smooth={float(terms.get('smooth', torch.zeros(())).detach().cpu()):.6g} "
 				f"bend={float(terms.get('bend', torch.zeros(())).detach().cpu()):.6g} "
 				f"jac={float(terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
-				f"jac_min={float(terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g}"
+				f"jac_min={float(terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g} "
+				f"prior={float(terms.get('prior', torch.zeros(())).detach().cpu()):.6g} "
+				f"lr={lr:.6g} "
+				f"w_jac_mult={float(w_jac_mult):.6g}"
 			)
 	with torch.no_grad():
-		uv_out = base_uv.clone()
-		uv_out[active] = param.detach()
-		state.map_init.uv = uv_out
+		state.map_init.uv = current_uv_full().detach()
 	state.map_init.total_iters += int(completed)
 	state.map_init.opt_blocks += 1
-	if last_terms is None:
-		uv_full = base_uv.clone()
-		uv_full[active] = param
-		_, last_terms = _map_init_objective(
-			uv_full=uv_full,
-			active=active,
-			ext_pos=ext_pos,
-			ext_normals=ext_normals,
-			ext_valid=ext_valid,
-			model_xyz=model_xyz,
-			model_valid=model_valid,
-			model_normals=model_normals,
-			model_depth=int(depth),
-			normal_sign=state.map_init.normal_sign,
-			orientation_sign=state.map_init.orientation_sign,
-			cfg=cfg,
-		)
+	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
+	if state.map_init.uv is not None:
+		uv_full = state.map_init.uv
+	else:
+		uv_full = current_uv_full().detach()
+	_, last_terms = _map_init_objective(
+		uv_full=uv_full,
+		active=active,
+		ext_pos=ext_pos,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		model_depth=int(depth),
+		normal_sign=state.map_init.normal_sign,
+		orientation_sign=state.map_init.orientation_sign,
+		cfg=cfg,
+		w_jac_mult=w_jac_mult,
+		uv_prior=uv_prior,
+	)
 	last_terms = dict(last_terms)
 	last_terms["completed"] = torch.tensor(float(completed), device=model_xyz.device, dtype=model_xyz.dtype)
 	last_terms["requested"] = torch.tensor(float(requested_steps), device=model_xyz.device, dtype=model_xyz.dtype)
 	return last_terms
+
+
+def _map_init_term_float(terms: dict[str, torch.Tensor], key: str) -> float:
+	v = terms.get(key)
+	if v is None:
+		return 0.0
+	return float(v.detach().cpu())
+
+
+def _map_init_needs_repair(terms: dict[str, torch.Tensor]) -> bool:
+	jac_bad = _map_init_term_float(terms, "jac_bad") > 0.0
+	jac_flipped = _map_init_term_float(terms, "jac_min") <= 0.0
+	return (
+		_map_init_term_float(terms, "uv_bad") > 0.0 or
+		_map_init_term_float(terms, "model_bad") > 0.0 or
+		(jac_bad and jac_flipped)
+	)
+
+
+def _map_init_repair_block_steps(cfg: SnapSurfConfig) -> int:
+	steps = int(cfg.map_init.repair_opt_iters)
+	if steps <= 0:
+		steps = int(cfg.map_init.grow_opt_iters)
+	return max(0, steps)
+
+
+def _map_init_repair_block_allowed(cfg: SnapSurfConfig, completed_repair_blocks: int) -> bool:
+	cap = int(cfg.map_init.repair_max_blocks)
+	return cap <= 0 or int(completed_repair_blocks) < cap
 
 
 def _run_map_init_for_surface(
@@ -3611,16 +3992,108 @@ def _run_map_init_for_surface(
 						f"completed={completed}/{block} "
 						f"loss={float(last_terms.get('loss', torch.zeros(())).detach().cpu()):.6g} "
 						f"dist={float(last_terms.get('dist', torch.zeros(())).detach().cpu()):.6g} "
+						f"reg={float(last_terms.get('reg', torch.zeros(())).detach().cpu()):.0f} "
 						f"samples={float(last_terms.get('samples', torch.zeros(())).detach().cpu()):.0f} "
 						f"uv_bad={float(last_terms.get('uv_bad', torch.zeros(())).detach().cpu()):.0f} "
+						f"model_bad={float(last_terms.get('model_bad', torch.zeros(())).detach().cpu()):.0f} "
 						f"jac={float(last_terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
-						f"jac_min={float(last_terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g}"
+						f"jac_min={float(last_terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g} "
+						f"jac_bad={float(last_terms.get('jac_bad', torch.zeros(())).detach().cpu()):.0f} "
+						f"prior={float(last_terms.get('prior', torch.zeros(())).detach().cpu()):.6g}"
 					)
 					if completed < block:
+						break
+					repair_local_blocks = 0
+					repair_block_cap = int(cfg.map_init.repair_max_blocks)
+					repair_block_cap_label = "unlimited" if repair_block_cap <= 0 else str(repair_block_cap)
+					while (
+						_map_init_needs_repair(last_terms) and
+						_map_init_repair_block_allowed(cfg, repair_local_blocks) and
+						state.map_init.total_iters < int(cfg.map_init.iters)
+					):
+						repair_block = min(
+							_map_init_repair_block_steps(cfg),
+							int(cfg.map_init.iters) - int(state.map_init.total_iters),
+						)
+						if repair_block <= 0:
+							break
+						repair_local_blocks += 1
+						_map_init_log(
+							"repair "
+							f"block={state.map_init.opt_blocks + 1} "
+							f"repair_block={repair_local_blocks}/{repair_block_cap_label} "
+							f"active={state.map_init.active_count()} "
+							f"uv_bad={_map_init_term_float(last_terms, 'uv_bad'):.0f} "
+							f"model_bad={_map_init_term_float(last_terms, 'model_bad'):.0f} "
+							f"jac_bad={_map_init_term_float(last_terms, 'jac_bad'):.0f} "
+							f"jac_min={_map_init_term_float(last_terms, 'jac_min'):.6g} "
+							f"next_opt_steps={repair_block} "
+							f"lr_mult={cfg.map_init.repair_lr_mult:.6g} "
+							f"w_jac_mult={cfg.map_init.repair_w_jac_mult:.6g}"
+						)
+						last_terms = _map_init_optimize_block(
+							state,
+							model_xyz=model_xyz,
+							model_valid=model_valid,
+							model_normals=model_normals,
+							cfg=cfg,
+							steps=repair_block,
+							mode="repair",
+							lr_mult=float(cfg.map_init.repair_lr_mult),
+							w_jac_mult=float(cfg.map_init.repair_w_jac_mult),
+						)
+						state.map_init.repair_blocks += 1
+						completed_repair = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
+						_map_init_log(
+							"repair_opt "
+							f"block={state.map_init.opt_blocks} "
+							f"iters={state.map_init.total_iters}/{cfg.map_init.iters} "
+							f"active={state.map_init.active_count()} "
+							f"completed={completed_repair}/{repair_block} "
+							f"loss={float(last_terms.get('loss', torch.zeros(())).detach().cpu()):.6g} "
+							f"dist={float(last_terms.get('dist', torch.zeros(())).detach().cpu()):.6g} "
+							f"reg={float(last_terms.get('reg', torch.zeros(())).detach().cpu()):.0f} "
+							f"samples={float(last_terms.get('samples', torch.zeros(())).detach().cpu()):.0f} "
+							f"uv_bad={float(last_terms.get('uv_bad', torch.zeros(())).detach().cpu()):.0f} "
+							f"model_bad={float(last_terms.get('model_bad', torch.zeros(())).detach().cpu()):.0f} "
+							f"jac={float(last_terms.get('jac', torch.zeros(())).detach().cpu()):.6g} "
+							f"jac_min={float(last_terms.get('jac_min', torch.zeros(())).detach().cpu()):.6g} "
+							f"jac_bad={float(last_terms.get('jac_bad', torch.zeros(())).detach().cpu()):.0f} "
+							f"prior={float(last_terms.get('prior', torch.zeros(())).detach().cpu()):.6g}"
+						)
+						if completed_repair < repair_block:
+							break
+					if _map_init_needs_repair(last_terms):
+						_map_init_log(
+							"repair_unresolved "
+							f"iters={state.map_init.total_iters}/{cfg.map_init.iters} "
+							f"active={state.map_init.active_count()} "
+							f"uv_bad={_map_init_term_float(last_terms, 'uv_bad'):.0f} "
+							f"model_bad={_map_init_term_float(last_terms, 'model_bad'):.0f} "
+							f"jac_bad={_map_init_term_float(last_terms, 'jac_bad'):.0f} "
+							f"jac_min={_map_init_term_float(last_terms, 'jac_min'):.6g} "
+							f"repair_block_cap={repair_block_cap_label} "
+							"stop_growth=1"
+						)
 						break
 				if added <= 0 or block <= 0:
 					break
 			if not last_terms and state.map_init.active is not None and state.map_init.uv is not None:
+				_, last_terms = _map_init_objective(
+					uv_full=state.map_init.uv,
+					active=state.map_init.active,
+					ext_pos=state.map_init.ext_pos,
+					ext_normals=state.map_init.ext_normals,
+					ext_valid=state.map_init.ext_valid,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					model_depth=int(state.map_init.model_depth),
+					normal_sign=state.map_init.normal_sign,
+					orientation_sign=state.map_init.orientation_sign,
+					cfg=cfg,
+				)
+			elif state.map_init.active is not None and state.map_init.uv is not None:
 				_, last_terms = _map_init_objective(
 					uv_full=state.map_init.uv,
 					active=state.map_init.active,
@@ -3644,8 +4117,13 @@ def _run_map_init_for_surface(
 				("bend", "snaps_map_bend"),
 				("jac", "snaps_map_jac"),
 				("jac_min", "snaps_map_jmin"),
+				("prior", "snaps_map_prior"),
+				("reg", "snaps_map_reg"),
+				("jac_bad", "snaps_map_jbad"),
+				("jac_bad_frac", "snaps_map_jbadf"),
 				("samples", "snaps_map_samples"),
 				("uv_bad", "snaps_map_uvbad"),
+				("model_bad", "snaps_map_model_bad"),
 			):
 				if key in last_terms:
 					stats[stat_key] = float(last_terms[key].detach().cpu())
@@ -3655,6 +4133,8 @@ def _run_map_init_for_surface(
 	stats["snaps_map_blocks"] = float(state.map_init.opt_blocks)
 	stats["snaps_map_grow"] = float(state.map_init.grow_steps)
 	stats["snaps_map_nsign"] = float(state.map_init.normal_sign)
+	stats["snaps_map_scales"] = float(state.map_init.scale_levels_used)
+	stats["snaps_map_repair"] = float(state.map_init.repair_blocks)
 	state.map_init.done = True
 	state.map_init.stats = stats
 	_map_init_log(
@@ -3663,6 +4143,9 @@ def _run_map_init_for_surface(
 		f"added_total={stats['snaps_map_added']:.0f} "
 		f"iters={stats['snaps_map_iters']:.0f} "
 		f"grow_steps={stats['snaps_map_grow']:.0f} "
+		f"repair_blocks={stats['snaps_map_repair']:.0f} "
+		f"jac_bad={stats['snaps_map_jbad']:.0f} "
+		f"model_bad={stats['snaps_map_model_bad']:.0f} "
 		f"loss={stats['snaps_map_loss']:.6g} "
 		f"normal_sign={state.map_init.normal_sign}"
 	)
@@ -3963,7 +4446,10 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		avg_keys = {
 			"snaps_map_loss", "snaps_map_dist", "snaps_map_vec", "snaps_map_norm",
 			"snaps_map_smooth", "snaps_map_bend", "snaps_map_jac",
-			"snaps_map_jmin", "snaps_map_samples", "snaps_map_uvbad", "snaps_map_nsign",
+			"snaps_map_jmin", "snaps_map_prior", "snaps_map_reg",
+			"snaps_map_jbad", "snaps_map_jbadf",
+			"snaps_map_samples", "snaps_map_uvbad", "snaps_map_model_bad",
+			"snaps_map_nsign", "snaps_map_scales",
 		}
 		for k in avg_keys:
 			stats[k] = 0.0
