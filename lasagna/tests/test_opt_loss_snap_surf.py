@@ -746,12 +746,14 @@ class SnapSurfMapperTest(unittest.TestCase):
 					"enabled": True,
 					"subdiv": 2,
 					"iters": 3,
+					"seed_opt_iters": 7,
 					"candidate_opt_iters": 4,
 					"candidate_lr": 0.07,
 					"fringe_opt_iters": 5,
 					"fringe_lr": 0.03,
 					"progress_mode": "both",
 					"scale_levels": 4,
+					"min_scale_level": 2,
 					"dense_opt": True,
 					"dense_reg_radius": 5,
 					"w_dense_prior": 0.25,
@@ -771,12 +773,14 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertTrue(opt_loss_snap_surf._cfg.map_init.enabled)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.subdiv, 2)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.iters, 3)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.seed_opt_iters, 7)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.candidate_opt_iters, 4)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.candidate_lr, 0.07)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.fringe_opt_iters, 5)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.fringe_lr, 0.03)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.progress_mode, "both")
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.scale_levels, 4)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.min_scale_level, 2)
 		self.assertTrue(opt_loss_snap_surf._cfg.map_init.dense_opt)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.dense_reg_radius, 5)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.w_dense_prior, 0.25)
@@ -819,6 +823,18 @@ class SnapSurfMapperTest(unittest.TestCase):
 				seed_xyz=(1.0, 1.0, 0.0),
 				active=True,
 			)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"map_init": {"minscale": 1}},
+			seed_xyz=(1.0, 1.0, 0.0),
+			active=True,
+		)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.min_scale_level, 1)
+		with self.assertRaises(ValueError):
+			opt_loss_snap_surf.configure_snap_surf(
+				cfg={"map_init": {"minscale": 1, "min_scale_level": 1}},
+				seed_xyz=(1.0, 1.0, 0.0),
+				active=True,
+			)
 
 	def test_map_init_dyadic_level_helpers_are_exact(self) -> None:
 		strides = opt_loss_snap_surf._map_init_dyadic_strides(
@@ -832,6 +848,74 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertEqual(opt_loss_snap_surf._map_init_dyadic_level_shape(9, 5, 2), (3, 2))
 		coords = opt_loss_snap_surf._map_init_dyadic_level_coords(torch.zeros(9, 5, 3), 2)
 		self.assertTrue(torch.equal(coords[1, 1], torch.tensor([4.0, 4.0])))
+
+	def test_map_init_single_neighbor_prediction_uses_source_to_uv_transform(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=2, target_rank=2)
+		valid = torch.zeros(1, 4, 4, dtype=torch.bool)
+		valid[0, 1, 1] = True
+		map_b = torch.full((1, 4, 4, 2), float("nan"))
+		map_b[0, 1, 1] = torch.tensor([10.0, 20.0])
+		candidate = torch.tensor([[0, 2, 1]], dtype=torch.long)
+		transform = torch.tensor([
+			[5.0, 0.0],
+			[0.0, 7.0],
+		])
+
+		pred, count, _nearest = opt_loss_snap_surf._direct_predict_candidates_batched(
+			state,
+			valid_b=valid,
+			map_b=map_b,
+			candidate_bidx=candidate,
+			radius=1,
+			single_neighbor_transform=transform,
+		)
+
+		self.assertEqual(int(count[0]), 1)
+		self.assertTrue(torch.allclose(pred[0], torch.tensor([15.0, 20.0]), atol=1.0e-5))
+
+	def test_map_init_underconstrained_prediction_uses_source_to_uv_transform(self) -> None:
+		state = opt_loss_snap_surf._DirectionState(source_rank=2, target_rank=2)
+		valid = torch.zeros(1, 4, 4, dtype=torch.bool)
+		valid[0, 1, 1] = True
+		valid[0, 1, 2] = True
+		map_b = torch.full((1, 4, 4, 2), float("nan"))
+		map_b[0, 1, 1] = torch.tensor([10.0, 20.0])
+		map_b[0, 1, 2] = torch.tensor([10.0, 27.0])
+		candidate = torch.tensor([[0, 2, 2]], dtype=torch.long)
+		transform = torch.tensor([
+			[5.0, 0.0],
+			[0.0, 7.0],
+		])
+
+		pred, count, _nearest = opt_loss_snap_surf._direct_predict_candidates_batched(
+			state,
+			valid_b=valid,
+			map_b=map_b,
+			candidate_bidx=candidate,
+			radius=1,
+			single_neighbor_transform=transform,
+		)
+
+		self.assertEqual(int(count[0]), 2)
+		self.assertTrue(torch.allclose(pred[0], torch.tensor([15.0, 27.0]), atol=1.0e-5))
+
+	def test_map_init_source_to_uv_transform_requires_rank_two(self) -> None:
+		uv = torch.full((3, 3, 2), float("nan"))
+		active = torch.zeros(3, 3, dtype=torch.bool)
+		active[0, 0] = True
+		active[1, 1] = True
+		uv[0, 0] = torch.tensor([10.0, 20.0])
+		uv[1, 1] = torch.tensor([12.0, 23.0])
+
+		self.assertIsNone(opt_loss_snap_surf._map_init_source_to_uv_transform(uv, active))
+
+		active[0, 1] = True
+		uv[0, 1] = torch.tensor([10.0, 23.0])
+		got = opt_loss_snap_surf._map_init_source_to_uv_transform(uv, active)
+
+		self.assertIsNotNone(got)
+		assert got is not None
+		self.assertTrue(torch.allclose(got, torch.tensor([[2.0, 0.0], [0.0, 3.0]]), atol=1.0e-5))
 
 	def test_map_init_active_transition_repeats_quads_to_finer_blocks(self) -> None:
 		active = torch.tensor([[True, False], [False, True]])
@@ -1024,6 +1108,66 @@ class SnapSurfMapperTest(unittest.TestCase):
 
 		self.assertFalse(bool(ok[0]))
 
+	def test_map_init_seed_quad_uv_uses_seed_anchor_and_physical_scale(self) -> None:
+		model_xyz = _plane_xyz(h=9, w=9, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		ext_xyz[..., 0] *= 2.0
+		ext_xyz[..., 1] *= 2.0
+		points = torch.tensor([
+			[0.0, 0.0, 0.0],
+			[8.0, 8.0, 0.0],
+		])
+
+		model_point, model_uv, dist = opt_loss_snap_surf._closest_point_uv_on_model_quad(
+			point=torch.tensor([4.0, 4.0, 0.0]),
+			model_xyz=model_xyz,
+			model_quad=(0, 3, 3),
+		)
+		uv, ok, reason = opt_loss_snap_surf._map_init_seed_quad_uv_for_points(
+			points,
+			ext_xyz=ext_xyz,
+			model_xyz=model_xyz,
+			ext_quad=(1, 1),
+			model_quad=(0, 3, 3),
+			transform=opt_loss_snap_surf._dihedral_transforms()[0],
+			ext_anchor=torch.tensor([4.0, 4.0, 0.0]),
+			model_anchor_uv=model_uv,
+		)
+
+		self.assertIsNone(reason)
+		self.assertTrue(bool(ok.all()))
+		self.assertTrue(torch.allclose(uv[0], torch.tensor([0.0, 0.0]), atol=1.0e-5))
+		self.assertTrue(torch.allclose(uv[1], torch.tensor([8.0, 8.0]), atol=1.0e-5))
+		self.assertTrue(torch.allclose(model_point, torch.tensor([4.0, 4.0, 1.0]), atol=1.0e-5))
+		self.assertAlmostEqual(dist, 1.0, places=5)
+
+	def test_map_init_seed_uv_uses_seed_quad_transform_on_mismatched_grid_steps(self) -> None:
+		model_xyz = _plane_xyz(h=9, w=9, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		ext_xyz[..., 0] *= 2.0
+		ext_xyz[..., 1] *= 2.0
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"subdiv": 1,
+					"iters": 0,
+					"seed_radius": 0,
+					"scale_levels": 3,
+					"min_scale_level": 2,
+				}
+			},
+			seed_xyz=(4.0, 4.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		mi = opt_loss_snap_surf._states[0].map_init
+
+		self.assertEqual(mi.scale_level, 2)
+		self.assertEqual(tuple(mi.uv.shape), (2, 2, 2))
+		self.assertTrue(torch.allclose(mi.uv, mi.ext_coords * 2.0, atol=1.0e-5))
+
 	def test_map_init_dyadic_final_state_is_full_lr_sized(self) -> None:
 		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
@@ -1040,6 +1184,59 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertEqual(tuple(mi.active_quad.shape), (4, 4))
 		self.assertEqual(mi.scale_level, 0)
 		self.assertEqual(opt_loss_snap_surf.last_stats()["snaps_map_scales"], 3.0)
+
+	def test_map_init_min_scale_level_stops_before_full_lr(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"subdiv": 1,
+					"iters": 3,
+					"grow_opt_iters": 1,
+					"seed_radius": 0,
+					"scale_levels": 3,
+					"min_scale_level": 1,
+				}
+			},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		mi = opt_loss_snap_surf._states[0].map_init
+
+		self.assertEqual(mi.scale_level, 1)
+		self.assertEqual(tuple(mi.uv.shape), (3, 3, 2))
+		self.assertEqual(tuple(mi.active_quad.shape), (2, 2))
+		self.assertEqual(opt_loss_snap_surf.last_stats()["snaps_map_scales"], 2.0)
+
+	def test_map_init_seed_opt_runs_before_growth_and_uses_budget(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"subdiv": 1,
+					"iters": 2,
+					"seed_opt_iters": 2,
+					"grow_opt_iters": 1,
+					"seed_radius": 0,
+					"scale_levels": 1,
+				}
+			},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		mi = opt_loss_snap_surf._states[0].map_init
+
+		self.assertEqual(mi.total_iters, 2)
+		self.assertEqual(mi.opt_blocks, 1)
+		self.assertEqual(int(mi.active_quad.sum()), 1)
 
 	def test_map_init_dense_optimizer_runs_on_full_field(self) -> None:
 		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
@@ -1904,6 +2101,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 						"enabled": True,
 						"subdiv": 1,
 						"iters": 3,
+						"seed_opt_iters": 0,
 						"grow_opt_iters": 1,
 						"seed_radius": 0,
 						"scale_levels": 3,

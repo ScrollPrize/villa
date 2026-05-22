@@ -18,6 +18,7 @@ class SnapSurfMapInitConfig:
 	enabled: bool = False
 	subdiv: int = 4
 	iters: int = 1000
+	seed_opt_iters: int = 100
 	candidate_opt_iters: int = 10
 	candidate_lr: float = 0.05
 	fringe_opt_iters: int = 10
@@ -27,6 +28,7 @@ class SnapSurfMapInitConfig:
 	progress_mode: str = "block"
 	scale_levels: int = 1
 	scale_factor: int = 2
+	min_scale_level: int = 0
 	dense_opt: bool = False
 	dense_reg_radius: int = 2
 	w_dense_prior: float = 0.001
@@ -177,6 +179,7 @@ def configure_snap_surf(
 			"enabled "
 			f"subdiv={_cfg.map_init.subdiv} "
 			f"iters={_cfg.map_init.iters} "
+			f"seed_opt_iters={_cfg.map_init.seed_opt_iters} "
 			f"candidate_opt_iters={_cfg.map_init.candidate_opt_iters} "
 			f"candidate_lr={_cfg.map_init.candidate_lr} "
 			f"fringe_opt_iters={_cfg.map_init.fringe_opt_iters} "
@@ -186,6 +189,7 @@ def configure_snap_surf(
 			f"progress_mode={_cfg.map_init.progress_mode!r} "
 			f"scale_levels={_cfg.map_init.scale_levels} "
 			f"scale_factor={_cfg.map_init.scale_factor} "
+			f"min_scale_level={_cfg.map_init.min_scale_level} "
 			f"dense_opt={int(_cfg.map_init.dense_opt)} "
 			f"dense_reg_radius={_cfg.map_init.dense_reg_radius} "
 			f"w_dense_prior={_cfg.map_init.w_dense_prior} "
@@ -211,42 +215,50 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 	if isinstance(raw, SnapSurfMapInitConfig):
 		cfg = raw
 	elif isinstance(raw, dict):
-		bad = sorted(set(raw.keys()) - set(SnapSurfMapInitConfig.__dataclass_fields__.keys()))
+		raw_cfg = dict(raw)
+		for alias in ("minscale", "min_scale"):
+			if alias in raw_cfg:
+				if "min_scale_level" in raw_cfg:
+					raise ValueError("snap_surf args.map_init: use only one of min_scale_level, min_scale, minscale")
+				raw_cfg["min_scale_level"] = raw_cfg.pop(alias)
+		bad = sorted(set(raw_cfg.keys()) - set(SnapSurfMapInitConfig.__dataclass_fields__.keys()))
 		if bad:
 			raise ValueError(f"snap_surf args.map_init: unknown key(s): {bad}")
 		cfg = SnapSurfMapInitConfig(
-			enabled=bool(raw.get("enabled", defaults.enabled)),
-			subdiv=max(1, int(raw.get("subdiv", defaults.subdiv))),
-			iters=max(0, int(raw.get("iters", defaults.iters))),
-			candidate_opt_iters=max(0, int(raw.get("candidate_opt_iters", defaults.candidate_opt_iters))),
-			candidate_lr=float(raw.get("candidate_lr", defaults.candidate_lr)),
-			fringe_opt_iters=max(0, int(raw.get("fringe_opt_iters", defaults.fringe_opt_iters))),
-			fringe_lr=float(raw.get("fringe_lr", defaults.fringe_lr)),
-			grow_opt_iters=max(0, int(raw.get("grow_opt_iters", defaults.grow_opt_iters))),
-			progress_interval=max(100, int(raw.get("progress_interval", defaults.progress_interval))),
-			progress_mode=str(raw.get("progress_mode", defaults.progress_mode)).lower(),
-			scale_levels=max(1, int(raw.get("scale_levels", defaults.scale_levels))),
-			scale_factor=max(1, int(raw.get("scale_factor", defaults.scale_factor))),
-			dense_opt=bool(raw.get("dense_opt", defaults.dense_opt)),
-			dense_reg_radius=max(0, int(raw.get("dense_reg_radius", defaults.dense_reg_radius))),
-			w_dense_prior=float(raw.get("w_dense_prior", defaults.w_dense_prior)),
-			repair_max_blocks=max(0, int(raw.get("repair_max_blocks", defaults.repair_max_blocks))),
-			repair_opt_iters=max(0, int(raw.get("repair_opt_iters", defaults.repair_opt_iters))),
-			repair_lr_mult=float(raw.get("repair_lr_mult", defaults.repair_lr_mult)),
-			repair_w_jac_mult=float(raw.get("repair_w_jac_mult", defaults.repair_w_jac_mult)),
-			lr=float(raw.get("lr", defaults.lr)),
-			seed_radius=max(0, int(raw.get("seed_radius", defaults.seed_radius))),
-			edge_init_radius=max(1, int(raw.get("edge_init_radius", defaults.edge_init_radius))),
-			w_dist=float(raw.get("w_dist", defaults.w_dist)),
-			w_vec_normal=float(raw.get("w_vec_normal", defaults.w_vec_normal)),
-			w_surface_normal=float(raw.get("w_surface_normal", defaults.w_surface_normal)),
-			w_smooth=float(raw.get("w_smooth", defaults.w_smooth)),
-			w_bend=float(raw.get("w_bend", defaults.w_bend)),
-			w_jac=float(raw.get("w_jac", defaults.w_jac)),
-			w_metric_smooth=float(raw.get("w_metric_smooth", defaults.w_metric_smooth)),
-			w_area_smooth=float(raw.get("w_area_smooth", defaults.w_area_smooth)),
-			angle_dist_mult=float(raw.get("angle_dist_mult", defaults.angle_dist_mult)),
-			jac_margin=float(raw.get("jac_margin", defaults.jac_margin)),
+			enabled=bool(raw_cfg.get("enabled", defaults.enabled)),
+			subdiv=max(1, int(raw_cfg.get("subdiv", defaults.subdiv))),
+			iters=max(0, int(raw_cfg.get("iters", defaults.iters))),
+			seed_opt_iters=max(0, int(raw_cfg.get("seed_opt_iters", defaults.seed_opt_iters))),
+			candidate_opt_iters=max(0, int(raw_cfg.get("candidate_opt_iters", defaults.candidate_opt_iters))),
+			candidate_lr=float(raw_cfg.get("candidate_lr", defaults.candidate_lr)),
+			fringe_opt_iters=max(0, int(raw_cfg.get("fringe_opt_iters", defaults.fringe_opt_iters))),
+			fringe_lr=float(raw_cfg.get("fringe_lr", defaults.fringe_lr)),
+			grow_opt_iters=max(0, int(raw_cfg.get("grow_opt_iters", defaults.grow_opt_iters))),
+			progress_interval=max(100, int(raw_cfg.get("progress_interval", defaults.progress_interval))),
+			progress_mode=str(raw_cfg.get("progress_mode", defaults.progress_mode)).lower(),
+			scale_levels=max(1, int(raw_cfg.get("scale_levels", defaults.scale_levels))),
+			scale_factor=max(1, int(raw_cfg.get("scale_factor", defaults.scale_factor))),
+			min_scale_level=max(0, int(raw_cfg.get("min_scale_level", defaults.min_scale_level))),
+			dense_opt=bool(raw_cfg.get("dense_opt", defaults.dense_opt)),
+			dense_reg_radius=max(0, int(raw_cfg.get("dense_reg_radius", defaults.dense_reg_radius))),
+			w_dense_prior=float(raw_cfg.get("w_dense_prior", defaults.w_dense_prior)),
+			repair_max_blocks=max(0, int(raw_cfg.get("repair_max_blocks", defaults.repair_max_blocks))),
+			repair_opt_iters=max(0, int(raw_cfg.get("repair_opt_iters", defaults.repair_opt_iters))),
+			repair_lr_mult=float(raw_cfg.get("repair_lr_mult", defaults.repair_lr_mult)),
+			repair_w_jac_mult=float(raw_cfg.get("repair_w_jac_mult", defaults.repair_w_jac_mult)),
+			lr=float(raw_cfg.get("lr", defaults.lr)),
+			seed_radius=max(0, int(raw_cfg.get("seed_radius", defaults.seed_radius))),
+			edge_init_radius=max(1, int(raw_cfg.get("edge_init_radius", defaults.edge_init_radius))),
+			w_dist=float(raw_cfg.get("w_dist", defaults.w_dist)),
+			w_vec_normal=float(raw_cfg.get("w_vec_normal", defaults.w_vec_normal)),
+			w_surface_normal=float(raw_cfg.get("w_surface_normal", defaults.w_surface_normal)),
+			w_smooth=float(raw_cfg.get("w_smooth", defaults.w_smooth)),
+			w_bend=float(raw_cfg.get("w_bend", defaults.w_bend)),
+			w_jac=float(raw_cfg.get("w_jac", defaults.w_jac)),
+			w_metric_smooth=float(raw_cfg.get("w_metric_smooth", defaults.w_metric_smooth)),
+			w_area_smooth=float(raw_cfg.get("w_area_smooth", defaults.w_area_smooth)),
+			angle_dist_mult=float(raw_cfg.get("angle_dist_mult", defaults.angle_dist_mult)),
+			jac_margin=float(raw_cfg.get("jac_margin", defaults.jac_margin)),
 		)
 	else:
 		raise ValueError("snap_surf args.map_init must be an object or null")
@@ -355,6 +367,7 @@ class _MapInitState:
 		self.ext_coords: torch.Tensor | None = None
 		self.uv_pyramid: list[torch.Tensor] | None = None
 		self.scale_level: int = 0
+		self.target_scale_level: int = 0
 		self.scale_strides: list[int] = [1]
 		self.model_depth: int | None = None
 		self.seed_ext_sample_hw: tuple[int, int] | None = None
@@ -910,6 +923,7 @@ def _direct_predict_candidates_batched(
 	map_b: torch.Tensor,
 	candidate_bidx: torch.Tensor,
 	radius: int,
+	single_neighbor_transform: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 	C = int(candidate_bidx.shape[0])
 	rank = state.target_rank
@@ -976,9 +990,19 @@ def _direct_predict_candidates_batched(
 		1,
 		nearest.view(C, 1, 1).expand(C, 1, rank),
 	).squeeze(1)
-	nearest_step_pred = nearest_tgt.clone()
-	nearest_step_pred[..., -2:] = nearest_step_pred[..., -2:] + (query_hw - nearest_src)
-	pred = torch.where((count == 1).unsqueeze(-1), nearest_step_pred, affine_pred)
+	if single_neighbor_transform is None:
+		nearest_step_pred = nearest_tgt.clone()
+		nearest_step_pred[..., -2:] = nearest_step_pred[..., -2:] + (query_hw - nearest_src)
+	else:
+		step = single_neighbor_transform.to(device=device, dtype=dtype)
+		if tuple(step.shape) != (2, rank):
+			raise ValueError(f"single_neighbor_transform must have shape {(2, rank)}, got {tuple(step.shape)}")
+		nearest_step_pred = nearest_tgt + (query_hw - nearest_src) @ step
+	if single_neighbor_transform is None:
+		use_step = count == 1
+	else:
+		use_step = count < 3
+	pred = torch.where(use_step.unsqueeze(-1), nearest_step_pred, affine_pred)
 	return pred, count, nearest_tgt
 
 
@@ -1729,6 +1753,103 @@ def _closest_model_surface_quad(
 		int(h[best].detach().cpu()),
 		int(w[best].detach().cpu()),
 	), math.sqrt(float(d2[best].detach().cpu()))
+
+
+def _closest_point_uv_on_model_quad(
+	*,
+	point: torch.Tensor,
+	model_xyz: torch.Tensor,
+	model_quad: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+	d, h, w = model_quad
+	p00 = model_xyz[d, h, w].view(1, 3)
+	p10 = model_xyz[d, h + 1, w].view(1, 3)
+	p01 = model_xyz[d, h, w + 1].view(1, 3)
+	p11 = model_xyz[d, h + 1, w + 1].view(1, 3)
+	cp0, bary0 = opt_loss_station._closest_points_on_triangles(point, p00, p10, p11)
+	cp1, bary1 = opt_loss_station._closest_points_on_triangles(point, p00, p11, p01)
+	d20 = (cp0 - point.view(1, 3)).square().sum(dim=-1)
+	d21 = (cp1 - point.view(1, 3)).square().sum(dim=-1)
+	if float(d20[0].detach().cpu()) <= float(d21[0].detach().cpu()):
+		b = bary0[0]
+		uv = torch.stack([
+			torch.as_tensor(float(h), device=point.device, dtype=point.dtype) + b[1] + b[2],
+			torch.as_tensor(float(w), device=point.device, dtype=point.dtype) + b[2],
+		], dim=0)
+		return cp0[0].detach(), uv.detach(), math.sqrt(float(d20[0].detach().cpu()))
+	b = bary1[0]
+	uv = torch.stack([
+		torch.as_tensor(float(h), device=point.device, dtype=point.dtype) + b[1],
+		torch.as_tensor(float(w), device=point.device, dtype=point.dtype) + b[1] + b[2],
+	], dim=0)
+	return cp1[0].detach(), uv.detach(), math.sqrt(float(d21[0].detach().cpu()))
+
+
+def _map_init_seed_quad_uv_for_points(
+	points: torch.Tensor,
+	*,
+	ext_xyz: torch.Tensor,
+	model_xyz: torch.Tensor,
+	ext_quad: tuple[int, int],
+	model_quad: tuple[int, int, int],
+	transform: tuple[tuple[int, int], ...],
+	ext_anchor: torch.Tensor,
+	model_anchor_uv: torch.Tensor,
+	eps: float = 1.0e-8,
+) -> tuple[torch.Tensor, torch.Tensor, str | None]:
+	out = torch.full((*points.shape[:-1], 2), float("nan"), device=points.device, dtype=points.dtype)
+	ok = torch.zeros(points.shape[:-1], device=points.device, dtype=torch.bool)
+	if points.numel() == 0:
+		return out, ok, None
+	eh, ew = ext_quad
+	d, mh, mw = model_quad
+	ext_pts = torch.stack([ext_xyz[eh + th, ew + tw] for th, tw in transform], dim=0)
+	model_pts = torch.stack([model_xyz[d, mh + sh, mw + sw] for sh, sw in _CORNERS_2D], dim=0)
+	if not bool(torch.isfinite(ext_pts).all().detach().cpu()):
+		return out, ok, "non-finite external seed quad"
+	if not bool(torch.isfinite(model_pts).all().detach().cpu()):
+		return out, ok, "non-finite model seed quad"
+	if not bool(torch.isfinite(ext_anchor).all().detach().cpu()):
+		return out, ok, "non-finite external seed anchor"
+	if not bool(torch.isfinite(model_anchor_uv).all().detach().cpu()):
+		return out, ok, "non-finite model seed anchor"
+
+	ext_h = ext_pts[1] - ext_pts[0]
+	ext_w = ext_pts[2] - ext_pts[0]
+	model_h = model_pts[1] - model_pts[0]
+	model_w = model_pts[2] - model_pts[0]
+	ext_h_len = ext_h.norm()
+	ext_w_len = ext_w.norm()
+	model_h_len = model_h.norm()
+	model_w_len = model_w.norm()
+	lengths = torch.stack([ext_h_len, ext_w_len, model_h_len, model_w_len])
+	if not bool(torch.isfinite(lengths).all().detach().cpu()):
+		return out, ok, "non-finite seed quad edge length"
+	if float(lengths.min().detach().cpu()) <= float(eps):
+		return out, ok, "degenerate seed quad edge"
+
+	ext_basis = torch.stack([ext_h / ext_h_len, ext_w / ext_w_len], dim=1)
+	model_unit = torch.stack([model_h / model_h_len, model_w / model_w_len], dim=1)
+	model_edges = torch.stack([model_h, model_w], dim=1)
+	flat = points.reshape(-1, 3)
+	point_ok = torch.isfinite(flat).all(dim=-1)
+	if not bool(point_ok.any().detach().cpu()):
+		return out, ok, None
+	rel = (flat[point_ok] - ext_anchor.view(1, 3)).transpose(0, 1)
+	try:
+		ext_coeff = torch.linalg.lstsq(ext_basis, rel).solution.transpose(0, 1)
+		model_disp = (ext_coeff @ model_unit.transpose(0, 1)).transpose(0, 1)
+		uv_delta = torch.linalg.lstsq(model_edges, model_disp).solution.transpose(0, 1)
+	except RuntimeError as exc:
+		return out, ok, f"seed quad solve failed: {exc}"
+	uv = model_anchor_uv.view(1, 2) + uv_delta
+	local_ok = torch.isfinite(uv).all(dim=-1)
+	flat_out = out.reshape(-1, 2)
+	flat_ok = ok.reshape(-1)
+	idx = point_ok.nonzero(as_tuple=False).flatten()
+	flat_out[idx] = torch.where(local_ok.unsqueeze(-1), uv, flat_out[idx])
+	flat_ok[idx] = local_ok
+	return out, ok, None
 
 
 def _choose_seed_transform(
@@ -3534,12 +3655,41 @@ def _map_init_transition_to_finer(state: _SurfaceState, cfg: SnapSurfConfig) -> 
 	return True
 
 
+def _map_init_source_to_uv_transform(
+	uv: torch.Tensor,
+	active_vertices: torch.Tensor,
+	*,
+	eps: float = 1.0e-6,
+) -> torch.Tensor | None:
+	valid = active_vertices.bool() & torch.isfinite(uv).all(dim=-1)
+	if int(valid.sum().detach().cpu()) < 3:
+		return None
+	hw = valid.nonzero(as_tuple=False).to(device=uv.device, dtype=uv.dtype)
+	if _svd_rank_2d(hw) < 2:
+		return None
+	target = uv[valid]
+	A = torch.cat([hw, torch.ones(hw.shape[0], 1, device=uv.device, dtype=uv.dtype)], dim=1)
+	try:
+		sol = torch.linalg.lstsq(A, target).solution
+	except RuntimeError:
+		return None
+	step = sol[:2, :]
+	if not bool(torch.isfinite(step).all().detach().cpu()):
+		return None
+	if float(step.norm(dim=-1).min().detach().cpu()) <= float(eps):
+		return None
+	return step.detach()
+
+
 def _map_init_finalize_dyadic_state(state: _SurfaceState, cfg: SnapSurfConfig) -> None:
 	mi = state.map_init
 	if mi.uv_pyramid is None or mi.active_quad is None:
 		return
+	target_level = max(0, min(int(mi.target_scale_level), len(mi.uv_pyramid) - 1))
+	if int(mi.scale_level) < target_level:
+		target_level = int(mi.scale_level)
 	_map_init_sync_current_uv_to_pyramid(mi)
-	while int(mi.scale_level) > 0:
+	while int(mi.scale_level) > target_level:
 		old_level = int(mi.scale_level)
 		mi.scale_level = old_level - 1
 		mi.active_quad = _map_init_repeat_quads_to_finer(mi.active_quad)
@@ -3547,8 +3697,8 @@ def _map_init_finalize_dyadic_state(state: _SurfaceState, cfg: SnapSurfConfig) -
 		_map_init_set_current_level_external_coords(mi)
 		_map_init_refresh_current_uv_from_pyramid(mi, cfg)
 		_map_init_sync_current_uv_to_pyramid(mi)
-	uv_full = _map_init_integrate_dyadic_uv_pyramid(mi.uv_pyramid, active_level=0).detach()
-	mi.scale_level = 0
+	uv_full = _map_init_integrate_dyadic_uv_pyramid(mi.uv_pyramid, active_level=target_level).detach()
+	mi.scale_level = target_level
 	_map_init_set_current_level_external_coords(mi)
 	mi.uv = _map_init_mask_current_uv(mi, uv_full, cfg)
 	if mi.blocked_quad is None or tuple(mi.blocked_quad.shape) != tuple(mi.active_quad.shape):
@@ -4571,13 +4721,6 @@ def _map_init_seed_state(
 	seed_xyz: tuple[float, float, float],
 ) -> tuple[bool, float, float, int]:
 	mi = cfg.map_init
-	coords, sample_ext_pos, _sample_ext_n, sample_valid = _map_init_sample_external_surface(
-		ext_xyz=ext_xyz,
-		ext_normals=ext_normals,
-		ext_valid=ext_valid,
-		ext_quad_valid=ext_quad_valid,
-		subdiv=mi.subdiv,
-	)
 	H_ext, W_ext = int(ext_xyz.shape[0]), int(ext_xyz.shape[1])
 	state.map_init.ext_pos = ext_xyz.detach()
 	state.map_init.ext_normals = ext_normals.detach()
@@ -4596,9 +4739,19 @@ def _map_init_seed_state(
 			f"usable={len(strides)} "
 			f"quad_shape={(max(0, H_ext - 1), max(0, W_ext - 1))}"
 		)
+	start_level = len(strides) - 1
+	target_level = max(0, min(int(mi.min_scale_level), start_level))
+	if target_level != int(mi.min_scale_level):
+		_map_init_log(
+			"min scale clamped "
+			f"requested={int(mi.min_scale_level)} "
+			f"usable_max={start_level} "
+			f"target={target_level}"
+		)
 	state.map_init.scale_strides = strides
-	state.map_init.scale_levels_used = len(strides)
-	state.map_init.scale_level = len(strides) - 1
+	state.map_init.target_scale_level = target_level
+	state.map_init.scale_levels_used = start_level - target_level + 1
+	state.map_init.scale_level = start_level
 	state.map_init.uv_pyramid = _map_init_make_zero_uv_pyramid(
 		ext_xyz=ext_xyz,
 		strides=strides,
@@ -4609,23 +4762,17 @@ def _map_init_seed_state(
 	state.map_init.active_quad = torch.zeros(max(0, level_H - 1), max(0, level_W - 1), device=model_xyz.device, dtype=torch.bool)
 	state.map_init.blocked_quad = torch.zeros_like(state.map_init.active_quad)
 	state.map_init.uv = torch.full((level_H, level_W, 2), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
-	if not bool(sample_valid.any().detach().cpu()):
-		return False, float("inf"), float("inf"), 0
 
 	seed = torch.tensor(seed_xyz, device=model_xyz.device, dtype=model_xyz.dtype)
-	dist2 = (sample_ext_pos - seed.view(1, 1, 3)).square().sum(dim=-1)
-	dist2 = torch.where(sample_valid, dist2, torch.full_like(dist2, float("inf")))
-	best_flat = torch.argmin(dist2.reshape(-1))
-	best_dist = dist2.reshape(-1)[best_flat]
-	if not bool(torch.isfinite(best_dist).detach().cpu()):
+	ext_seed_hw, ext_seed_point, seed_ext_dist = _closest_external_seed_surface(
+		seed=seed,
+		ext_xyz=ext_xyz,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+	)
+	if ext_seed_hw is None or ext_seed_point is None:
 		return False, float("inf"), float("inf"), 0
-	Hs, Ws = int(sample_valid.shape[0]), int(sample_valid.shape[1])
-	seed_h = int((best_flat // Ws).detach().cpu())
-	seed_w = int((best_flat - (best_flat // Ws) * Ws).detach().cpu())
-	seed_ext_dist = math.sqrt(float(best_dist.detach().cpu()))
-	seed_coord = coords[seed_h, seed_w]
-	eh = int(torch.floor(seed_coord[0]).clamp(0, max(0, int(ext_xyz.shape[0]) - 2)).detach().cpu())
-	ew = int(torch.floor(seed_coord[1]).clamp(0, max(0, int(ext_xyz.shape[1]) - 2)).detach().cpu())
+	eh, ew = ext_seed_hw
 
 	model_quad, seed_model_dist = _closest_model_surface_quad(
 		point=seed,
@@ -4634,7 +4781,12 @@ def _map_init_seed_state(
 	)
 	if model_quad is None:
 		return False, float("inf"), seed_ext_dist, 0
-	transform, fallback_sign = _choose_seed_transform(
+	model_seed_point, model_seed_uv, seed_model_dist = _closest_point_uv_on_model_quad(
+		point=seed,
+		model_xyz=model_xyz,
+		model_quad=model_quad,
+	)
+	transform, transform_sign = _choose_seed_transform(
 		model_xyz=model_xyz,
 		ext_xyz=ext_xyz,
 		model_quad=model_quad,
@@ -4642,37 +4794,48 @@ def _map_init_seed_state(
 		cfg=cfg,
 	)
 	d, mh, mw = model_quad
-	src = torch.stack([
-		torch.tensor([float(eh + th), float(ew + tw)], device=model_xyz.device, dtype=model_xyz.dtype)
-		for th, tw in transform
-	], dim=0)
-	tgt = torch.stack([
-		torch.tensor([float(mh + sh), float(mw + sw)], device=model_xyz.device, dtype=model_xyz.dtype)
-		for sh, sw in _CORNERS_2D
-	], dim=0)
-	A = torch.cat([src, torch.ones(4, 1, device=model_xyz.device, dtype=model_xyz.dtype)], dim=1)
-	try:
-		sol = torch.linalg.lstsq(A, tgt).solution
-	except RuntimeError:
-		sol = torch.linalg.pinv(A) @ tgt
 	vertex_coords = state.map_init.ext_coords
 	if vertex_coords is None:
 		return False, float("inf"), seed_ext_dist, 0
-	flat_coords = vertex_coords.reshape(-1, 2)
-	query = torch.cat([flat_coords, torch.ones(flat_coords.shape[0], 1, device=model_xyz.device, dtype=model_xyz.dtype)], dim=1)
-	uv_all = _map_init_clamp_uv(
-		(query @ sol).reshape(level_H, level_W, 2),
-		model_h=int(model_valid.shape[1]),
-		model_w=int(model_valid.shape[2]),
+	ext_level_pos, _ext_level_normals, ext_level_valid, _ext_level_quad_valid = _map_init_level_external_tensors(
+		ext_pos=ext_xyz,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		ext_coords=state.map_init.ext_coords,
+	)
+	uv_all, uv_ok, uv_reason = _map_init_seed_quad_uv_for_points(
+		ext_level_pos,
+		ext_xyz=ext_xyz,
+		model_xyz=model_xyz,
+		ext_quad=(eh, ew),
+		model_quad=model_quad,
+		transform=transform,
+		ext_anchor=ext_seed_point.to(device=model_xyz.device, dtype=model_xyz.dtype),
+		model_anchor_uv=model_seed_uv.to(device=model_xyz.device, dtype=model_xyz.dtype),
+	)
+	uv_ok = uv_ok & ext_level_valid
+	if not bool(uv_ok.any().detach().cpu()):
+		_map_init_log(
+			"seed quad uv failed "
+			f"reason={uv_reason or 'no valid current-level vertices'} "
+			f"ext_quad={(eh, ew)} "
+			f"model_quad={model_quad}"
+		)
+		return False, float(seed_model_dist), seed_ext_dist, 0
+	uv_all = torch.where(uv_ok.unsqueeze(-1), uv_all, torch.full_like(uv_all, float("nan")))
+	_map_init_log(
+		"seed quad uv "
+		f"vertices={int(uv_ok.sum().detach().cpu())}/{level_H * level_W} "
+		f"ext_quad={(eh, ew)} "
+		f"model_quad={model_quad} "
+		f"model_anchor_uv=({float(model_seed_uv[0].detach().cpu()):.6g},{float(model_seed_uv[1].detach().cpu()):.6g}) "
+		f"seed_model_point=({float(model_seed_point[0].detach().cpu()):.6g},{float(model_seed_point[1].detach().cpu()):.6g},{float(model_seed_point[2].detach().cpu()):.6g})"
 	)
 	if state.map_init.uv_pyramid is not None:
-		state.map_init.uv_pyramid[int(state.map_init.scale_level)] = uv_all.permute(2, 0, 1).unsqueeze(0).contiguous().detach()
-	seed_source_hw = src
-	orientation_sign = 1 if cfg.orientation in {"identity", "none"} else _affine_det_sign_from_points(
-		seed_source_hw,
-		tgt,
-		fallback=fallback_sign,
-	)
+		seed_level = torch.where(torch.isfinite(uv_all), uv_all, torch.zeros_like(uv_all))
+		state.map_init.uv_pyramid[int(state.map_init.scale_level)] = seed_level.permute(2, 0, 1).unsqueeze(0).contiguous().detach()
+	orientation_sign = 1 if cfg.orientation in {"identity", "none"} else int(transform_sign)
 	r = max(0, int(mi.seed_radius))
 	level = int(state.map_init.scale_level)
 	stride = int(state.map_init.current_stride())
@@ -4736,7 +4899,7 @@ def _map_init_seed_state(
 	_map_init_sync_current_uv_to_pyramid(state.map_init)
 	_map_init_refresh_current_uv_from_pyramid(state.map_init, cfg)
 	state.map_init.model_depth = int(d)
-	state.map_init.seed_ext_sample_hw = (seed_h, seed_w)
+	state.map_init.seed_ext_sample_hw = (eh, ew)
 	state.map_init.seed_model_quad = model_quad
 	state.map_init.orientation_sign = int(orientation_sign)
 	state.map_init.normal_sign = _map_init_estimate_normal_sign(
@@ -4797,6 +4960,7 @@ def _map_init_grow_once(
 	cand_vertices = _map_init_active_vertex_mask(candidate, tuple(int(v) for v in uv.shape[:2])) & ~active_vertices
 	pred_grid = uv.clone()
 	pred_ok_grid = active_vertices.clone()
+	single_neighbor_transform = _map_init_source_to_uv_transform(uv, active_vertices)
 	if bool(cand_vertices.any().detach().cpu()):
 		vert_hw = cand_vertices.nonzero(as_tuple=False)
 		vert_bidx = torch.cat([
@@ -4810,6 +4974,7 @@ def _map_init_grow_once(
 			map_b=uv.unsqueeze(0),
 			candidate_bidx=vert_bidx,
 			radius=max(1, int(mi.edge_init_radius)),
+			single_neighbor_transform=single_neighbor_transform,
 		)
 		local_ok = (count >= 1) & torch.isfinite(pred).all(dim=-1) & _map_init_model_coord_ok(
 			pred,
@@ -4817,6 +4982,8 @@ def _map_init_grow_once(
 			model_normals=model_normals,
 			depth=int(depth),
 		)
+		if single_neighbor_transform is None:
+			local_ok = local_ok & (count >= 3)
 		if bool(mi.dense_opt) and state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(uv.shape[:2]):
 			guess = state.map_init.uv_guess[vert_hw[:, 0], vert_hw[:, 1]]
 			guess_ok = torch.isfinite(guess).all(dim=-1) & _map_init_model_coord_ok(
@@ -4835,7 +5002,7 @@ def _map_init_grow_once(
 	if model_xyz is not None and bool(candidate_seed.any().detach().cpu()):
 		_map_init_log_fringe_debug(
 			state=state.map_init,
-			phase="init",
+			phase="cinit",
 			block=state.map_init.opt_blocks + 1,
 			iter_idx=state.map_init.total_iters,
 			uv_full=pred_grid,
@@ -6101,7 +6268,83 @@ def _run_map_init_for_surface(
 		)
 		if ok:
 			last_terms: dict[str, torch.Tensor] = {}
-			while state.map_init.total_iters < int(cfg.map_init.iters):
+			seed_block = min(
+				int(cfg.map_init.seed_opt_iters),
+				int(cfg.map_init.iters) - int(state.map_init.total_iters),
+			)
+			seed_opt_complete = True
+			if seed_block > 0:
+				if (
+					state.map_init.active_quad is not None and state.map_init.uv is not None and
+					state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
+					state.map_init.ext_valid is not None and state.map_init.model_depth is not None
+				):
+					_map_init_log_fringe_debug(
+						state=state.map_init,
+						phase="seed0",
+						block=state.map_init.opt_blocks + 1,
+						iter_idx=state.map_init.total_iters,
+						uv_full=state.map_init.uv,
+						active_quad=state.map_init.active_quad,
+						ext_pos=state.map_init.ext_pos,
+						ext_normals=state.map_init.ext_normals,
+						ext_valid=state.map_init.ext_valid,
+						ext_quad_valid=state.map_init.ext_quad_valid,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						model_depth=int(state.map_init.model_depth),
+						cfg=cfg,
+					)
+				last_terms = _map_init_optimize_block(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					cfg=cfg,
+					steps=seed_block,
+					mode="seed",
+				)
+				if (
+					state.map_init.active_quad is not None and state.map_init.uv is not None and
+					state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
+					state.map_init.ext_valid is not None and state.map_init.model_depth is not None
+				):
+					_map_init_log_fringe_debug(
+						state=state.map_init,
+						phase="seed",
+						block=state.map_init.opt_blocks,
+						iter_idx=state.map_init.total_iters,
+						uv_full=state.map_init.uv,
+						active_quad=state.map_init.active_quad,
+						ext_pos=state.map_init.ext_pos,
+						ext_normals=state.map_init.ext_normals,
+						ext_valid=state.map_init.ext_valid,
+						ext_quad_valid=state.map_init.ext_quad_valid,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						model_depth=int(state.map_init.model_depth),
+						cfg=cfg,
+					)
+				completed_seed = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
+				pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
+					state,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					cfg=cfg,
+				)
+				if pruned_sample > 0 or pruned_fold > 0 or pruned_sparse > 0:
+					last_terms = _map_init_eval_terms_for_state(
+						state,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						cfg=cfg,
+					)
+				if completed_seed < seed_block:
+					seed_opt_complete = False
+			while seed_opt_complete and state.map_init.total_iters < int(cfg.map_init.iters):
 				added = _map_init_grow_once(
 					state,
 					model_xyz=model_xyz,
@@ -6240,7 +6483,7 @@ def _run_map_init_for_surface(
 							"continue_growth=1"
 						)
 				if added <= 0 or block <= 0:
-					if int(state.map_init.scale_level) > 0:
+					if int(state.map_init.scale_level) > int(state.map_init.target_scale_level):
 						_debug_write_map_init_scale_objs(
 							cfg=cfg,
 							surface_index=surface_index,
@@ -6251,7 +6494,10 @@ def _run_map_init_for_surface(
 							ext_valid=ext_valid,
 							state=state,
 						)
-					if int(state.map_init.scale_level) > 0 and _map_init_transition_to_finer(state, cfg):
+					if (
+						int(state.map_init.scale_level) > int(state.map_init.target_scale_level) and
+						_map_init_transition_to_finer(state, cfg)
+					):
 						pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
 							state,
 							model_valid=model_valid,
@@ -6276,6 +6522,7 @@ def _run_map_init_for_surface(
 						)
 						continue
 					break
+			_map_init_finalize_dyadic_state(state, cfg)
 			_debug_write_map_init_scale_objs(
 				cfg=cfg,
 				surface_index=surface_index,
@@ -6286,7 +6533,6 @@ def _run_map_init_for_surface(
 				ext_valid=ext_valid,
 				state=state,
 			)
-			_map_init_finalize_dyadic_state(state, cfg)
 			if not last_terms and state.map_init.active_quad is not None and state.map_init.uv is not None:
 				_, last_terms = _map_init_objective(
 					uv_full=state.map_init.uv,
