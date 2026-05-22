@@ -311,12 +311,13 @@ class _DirectionState:
 class _MapInitState:
 	def __init__(self) -> None:
 		self.done: bool = False
-		self.active: torch.Tensor | None = None
+		self.active_quad: torch.Tensor | None = None
 		self.uv: torch.Tensor | None = None
 		self.uv_guess: torch.Tensor | None = None
 		self.ext_pos: torch.Tensor | None = None
 		self.ext_normals: torch.Tensor | None = None
 		self.ext_valid: torch.Tensor | None = None
+		self.ext_quad_valid: torch.Tensor | None = None
 		self.ext_coords: torch.Tensor | None = None
 		self.model_depth: int | None = None
 		self.seed_ext_sample_hw: tuple[int, int] | None = None
@@ -334,10 +335,26 @@ class _MapInitState:
 	def reset(self) -> None:
 		self.__init__()
 
+	@property
+	def active(self) -> torch.Tensor | None:
+		return self.active_quad
+
+	@active.setter
+	def active(self, value: torch.Tensor | None) -> None:
+		self.active_quad = value
+
+	@property
+	def uv_ext_vertex(self) -> torch.Tensor | None:
+		return self.uv
+
+	@uv_ext_vertex.setter
+	def uv_ext_vertex(self, value: torch.Tensor | None) -> None:
+		self.uv = value
+
 	def active_count(self) -> int:
-		if self.active is None:
+		if self.active_quad is None:
 			return 0
-		return int(self.active.sum().detach().cpu())
+		return int(self.active_quad.sum().detach().cpu())
 
 
 class _SurfaceState:
@@ -2938,6 +2955,187 @@ def _map_init_sample_external_surface(
 	return coords, pos, normals, valid
 
 
+def _map_init_external_vertex_coords(ext_xyz: torch.Tensor) -> torch.Tensor:
+	H, W = int(ext_xyz.shape[0]), int(ext_xyz.shape[1])
+	hh = torch.arange(H, device=ext_xyz.device, dtype=ext_xyz.dtype).view(H, 1).expand(H, W)
+	ww = torch.arange(W, device=ext_xyz.device, dtype=ext_xyz.dtype).view(1, W).expand(H, W)
+	return torch.stack([hh, ww], dim=-1)
+
+
+def _map_init_external_quad_valid(
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+) -> torch.Tensor:
+	H, W = int(ext_valid.shape[0]), int(ext_valid.shape[1])
+	if H < 2 or W < 2:
+		return torch.zeros(max(0, H - 1), max(0, W - 1), device=ext_valid.device, dtype=torch.bool)
+	out = (
+		ext_valid[:-1, :-1].bool() &
+		ext_valid[1:, :-1].bool() &
+		ext_valid[:-1, 1:].bool() &
+		ext_valid[1:, 1:].bool()
+	)
+	if ext_quad_valid is not None and tuple(ext_quad_valid.shape) == tuple(out.shape):
+		out = out & ext_quad_valid.bool()
+	return out
+
+
+def _map_init_active_vertex_mask(active_quad: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
+	H, W = int(shape[0]), int(shape[1])
+	out = torch.zeros(H, W, device=active_quad.device, dtype=torch.bool)
+	if active_quad.numel() == 0:
+		return out
+	q = active_quad.bool()
+	out[:-1, :-1] |= q
+	out[1:, :-1] |= q
+	out[:-1, 1:] |= q
+	out[1:, 1:] |= q
+	return out
+
+
+def _map_init_quad_corner_all(mask: torch.Tensor) -> torch.Tensor:
+	H, W = int(mask.shape[0]), int(mask.shape[1])
+	if H < 2 or W < 2:
+		return torch.zeros(max(0, H - 1), max(0, W - 1), device=mask.device, dtype=torch.bool)
+	return mask[:-1, :-1].bool() & mask[1:, :-1].bool() & mask[:-1, 1:].bool() & mask[1:, 1:].bool()
+
+
+def _map_init_quad_offsets(*, subdiv: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+	s = max(1, int(subdiv))
+	v = (torch.arange(s, device=device, dtype=dtype) + 0.5) / float(s)
+	oh, ow = torch.meshgrid(v, v, indexing="ij")
+	return torch.stack([oh.reshape(-1), ow.reshape(-1)], dim=-1)
+
+
+def _map_init_bilerp_quad(
+	v00: torch.Tensor,
+	v10: torch.Tensor,
+	v01: torch.Tensor,
+	v11: torch.Tensor,
+	offsets: torch.Tensor,
+) -> torch.Tensor:
+	fh = offsets[:, 0].view(1, -1, *([1] * (v00.ndim - 1)))
+	fw = offsets[:, 1].view(1, -1, *([1] * (v00.ndim - 1)))
+	return (
+		(1.0 - fh) * (1.0 - fw) * v00.unsqueeze(1) +
+		fh * (1.0 - fw) * v10.unsqueeze(1) +
+		(1.0 - fh) * fw * v01.unsqueeze(1) +
+		fh * fw * v11.unsqueeze(1)
+	)
+
+
+def _map_init_quad_sample_tensors(
+	*,
+	uv_full: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	quad_hw: torch.Tensor,
+	subdiv: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	Q = int(quad_hw.shape[0])
+	s = max(1, int(subdiv))
+	S = s * s
+	if Q == 0:
+		return (
+			uv_full.new_empty(0, S, 2),
+			ext_pos.new_empty(0, S, 3),
+			ext_normals.new_empty(0, S, 3),
+			torch.zeros(0, S, device=uv_full.device, dtype=torch.bool),
+			torch.zeros(0, device=uv_full.device, dtype=torch.bool),
+		)
+	qh = quad_hw[:, 0]
+	qw = quad_hw[:, 1]
+	offsets = _map_init_quad_offsets(subdiv=s, device=uv_full.device, dtype=uv_full.dtype)
+	uv_samples = _map_init_bilerp_quad(
+		uv_full[qh, qw],
+		uv_full[qh + 1, qw],
+		uv_full[qh, qw + 1],
+		uv_full[qh + 1, qw + 1],
+		offsets,
+	)
+	ext_samples = _map_init_bilerp_quad(
+		ext_pos[qh, qw],
+		ext_pos[qh + 1, qw],
+		ext_pos[qh, qw + 1],
+		ext_pos[qh + 1, qw + 1],
+		offsets.to(dtype=ext_pos.dtype),
+	)
+	n_raw = _map_init_bilerp_quad(
+		ext_normals[qh, qw],
+		ext_normals[qh + 1, qw],
+		ext_normals[qh, qw + 1],
+		ext_normals[qh + 1, qw + 1],
+		offsets.to(dtype=ext_normals.dtype),
+	)
+	n_samples = F.normalize(n_raw, dim=-1, eps=1.0e-8)
+	quad_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)[qh, qw]
+	quad_uv_ok = (
+		torch.isfinite(uv_full[qh, qw]).all(dim=-1) &
+		torch.isfinite(uv_full[qh + 1, qw]).all(dim=-1) &
+		torch.isfinite(uv_full[qh, qw + 1]).all(dim=-1) &
+		torch.isfinite(uv_full[qh + 1, qw + 1]).all(dim=-1)
+	)
+	sample_ext_ok = (
+		quad_valid.unsqueeze(-1) &
+		torch.isfinite(ext_samples).all(dim=-1) &
+		torch.isfinite(n_raw).all(dim=-1) &
+		torch.isfinite(n_samples).all(dim=-1) &
+		(n_samples.norm(dim=-1) > 1.0e-8)
+	)
+	return uv_samples, ext_samples, n_samples, sample_ext_ok, quad_uv_ok
+
+
+def _map_init_model_samples_ok(
+	uv_samples: torch.Tensor,
+	*,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	depth: int,
+) -> torch.Tensor:
+	if uv_samples.numel() == 0:
+		return torch.zeros(uv_samples.shape[:-1], device=uv_samples.device, dtype=torch.bool)
+	flat_ok = _map_init_model_coord_ok(
+		uv_samples.reshape(-1, 2),
+		model_valid=model_valid,
+		model_normals=model_normals,
+		depth=int(depth),
+	)
+	return flat_ok.reshape(uv_samples.shape[:-1])
+
+
+def _map_init_candidate_quad_samples_ok(
+	*,
+	uv_full: torch.Tensor,
+	quad_hw: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_depth: int,
+	cfg: SnapSurfConfig,
+) -> torch.Tensor:
+	uv_samples, _p_ext, _n_ext, ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
+		uv_full=uv_full,
+		ext_pos=ext_pos,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		quad_hw=quad_hw,
+		subdiv=int(cfg.map_init.subdiv),
+	)
+	model_ok = _map_init_model_samples_ok(
+		uv_samples,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		depth=int(model_depth),
+	)
+	return quad_uv_ok & (ext_ok & torch.isfinite(uv_samples).all(dim=-1) & model_ok).all(dim=1)
+
+
 def _map_init_coords3(uv: torch.Tensor, *, depth: int) -> torch.Tensor:
 	d = torch.full((*uv.shape[:-1], 1), float(depth), device=uv.device, dtype=uv.dtype)
 	return torch.cat([d, uv], dim=-1)
@@ -3093,10 +3291,11 @@ def _map_init_refresh_uv_guess(
 	model_valid: torch.Tensor,
 	cfg: SnapSurfConfig,
 ) -> None:
-	if state.map_init.uv is None or state.map_init.active is None:
+	if state.map_init.uv is None or state.map_init.active_quad is None:
 		return
 	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
 	uv_finite = torch.isfinite(state.map_init.uv).all(dim=-1)
+	active_vertex = _map_init_active_vertex_mask(state.map_init.active_quad, tuple(int(v) for v in state.map_init.uv.shape[:2]))
 	if not cfg.map_init.dense_opt:
 		state.map_init.uv_guess = None
 		state.map_init.scale_levels_used = 1
@@ -3120,7 +3319,7 @@ def _map_init_refresh_uv_guess(
 		return
 	state.map_init.uv_guess = _map_init_scalespace_inpaint_uv(
 		state.map_init.uv,
-		state.map_init.active,
+		active_vertex,
 		cfg=cfg.map_init,
 		model_h=H,
 		model_w=W,
@@ -3139,20 +3338,21 @@ def _map_init_dense_seed_uv(
 	model_valid: torch.Tensor,
 	cfg: SnapSurfConfig,
 ) -> torch.Tensor:
-	if state.map_init.uv is None or state.map_init.active is None:
+	if state.map_init.uv is None or state.map_init.active_quad is None:
 		raise RuntimeError("map-init dense seed requested before initialization")
 	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
+	active_vertex = _map_init_active_vertex_mask(state.map_init.active_quad, tuple(int(v) for v in state.map_init.uv.shape[:2]))
 	if state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(state.map_init.uv.shape[:2]):
 		seed = state.map_init.uv_guess.detach().clone()
 	else:
 		seed = _map_init_scalespace_inpaint_uv(
 			state.map_init.uv,
-			state.map_init.active,
+			active_vertex,
 			cfg=cfg.map_init,
 			model_h=H,
 			model_w=W,
 		)
-	active_finite = state.map_init.active.bool() & torch.isfinite(state.map_init.uv).all(dim=-1)
+	active_finite = active_vertex & torch.isfinite(state.map_init.uv).all(dim=-1)
 	seed = torch.where(active_finite.unsqueeze(-1), state.map_init.uv.detach(), seed)
 	seed = torch.where(torch.isfinite(seed), seed, torch.zeros_like(seed))
 	return _map_init_clamp_uv(seed, model_h=H, model_w=W)
@@ -3177,42 +3377,46 @@ def _map_init_distance_multiplier(
 
 def _map_init_jacobian_values(
 	uv: torch.Tensor,
-	active: torch.Tensor,
+	active_quad: torch.Tensor,
 	*,
 	orientation_sign: int,
 ) -> torch.Tensor:
-	H, W = int(active.shape[0]), int(active.shape[1])
-	if H < 2 or W < 2:
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	if H < 2 or W < 2 or active_quad.numel() == 0:
 		return torch.empty(0, device=uv.device, dtype=uv.dtype)
 	finite_uv = torch.isfinite(uv).all(dim=-1)
-	cell = (
-		active[:-1, :-1] &
-		active[1:, :-1] &
-		active[:-1, 1:] &
-		finite_uv[:-1, :-1] &
-		finite_uv[1:, :-1] &
-		finite_uv[:-1, 1:]
-	)
+	cell = active_quad.bool() & _map_init_quad_corner_all(finite_uv)
 	if not bool(cell.any().detach().cpu()):
 		return torch.empty(0, device=uv.device, dtype=uv.dtype)
-	dh = uv[1:, :-1] - uv[:-1, :-1]
-	dw = uv[:-1, 1:] - uv[:-1, :-1]
-	det = dh[..., 0] * dw[..., 1] - dh[..., 1] * dw[..., 0]
-	finite = cell & torch.isfinite(det)
+	p00 = uv[:-1, :-1]
+	p10 = uv[1:, :-1]
+	p01 = uv[:-1, 1:]
+	p11 = uv[1:, 1:]
+	dh0 = p10 - p00
+	dh1 = p11 - p01
+	dw0 = p01 - p00
+	dw1 = p11 - p10
+	dets = torch.stack([
+		dh0[..., 0] * dw0[..., 1] - dh0[..., 1] * dw0[..., 0],
+		dh0[..., 0] * dw1[..., 1] - dh0[..., 1] * dw1[..., 0],
+		dh1[..., 0] * dw0[..., 1] - dh1[..., 1] * dw0[..., 0],
+		dh1[..., 0] * dw1[..., 1] - dh1[..., 1] * dw1[..., 0],
+	], dim=-1)
+	finite = cell.unsqueeze(-1) & torch.isfinite(dets)
 	if not bool(finite.any().detach().cpu()):
 		return torch.empty(0, device=uv.device, dtype=uv.dtype)
 	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
-	return det[finite] * sign
+	return (dets * sign)[finite]
 
 
 def _map_init_jacobian_penalty(
 	uv: torch.Tensor,
-	active: torch.Tensor,
+	active_quad: torch.Tensor,
 	*,
 	orientation_sign: int,
 	jac_margin: float,
 ) -> torch.Tensor:
-	values = _map_init_jacobian_values(uv, active, orientation_sign=orientation_sign)
+	values = _map_init_jacobian_values(uv, active_quad, orientation_sign=orientation_sign)
 	if values.numel() == 0:
 		finite = uv[torch.isfinite(uv)]
 		if finite.numel():
@@ -3223,14 +3427,14 @@ def _map_init_jacobian_penalty(
 
 def _map_init_inverse_regularization_terms(
 	uv: torch.Tensor,
-	active: torch.Tensor,
+	active_quad: torch.Tensor,
 	*,
 	orientation_sign: int,
 	jac_margin: float,
 ) -> dict[str, torch.Tensor]:
 	z = uv[torch.isfinite(uv)].sum() * 0.0 if uv.numel() else torch.zeros((), device=uv.device, dtype=uv.dtype)
-	H, W = int(active.shape[0]), int(active.shape[1])
-	if H < 2 or W < 2:
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	if H < 2 or W < 2 or active_quad.numel() == 0:
 		return {
 			"smooth": z,
 			"bend": z,
@@ -3240,14 +3444,7 @@ def _map_init_inverse_regularization_terms(
 		}
 
 	finite_uv = torch.isfinite(uv).all(dim=-1)
-	cell = (
-		active[:-1, :-1] &
-		active[1:, :-1] &
-		active[:-1, 1:] &
-		finite_uv[:-1, :-1] &
-		finite_uv[1:, :-1] &
-		finite_uv[:-1, 1:]
-	)
+	cell = active_quad.bool() & _map_init_quad_corner_all(finite_uv)
 	dh = uv[1:, :-1] - uv[:-1, :-1]
 	dw = uv[:-1, 1:] - uv[:-1, :-1]
 	det = dh[..., 0] * dw[..., 1] - dh[..., 1] * dw[..., 0]
@@ -3308,52 +3505,62 @@ def _map_init_inverse_regularization_terms(
 
 def _map_init_local_jacobian_pass(
 	uv: torch.Tensor,
-	active: torch.Tensor,
+	active_quad: torch.Tensor,
 	*,
 	h: int,
 	w: int,
 	orientation_sign: int,
 	jac_margin: float,
 ) -> bool:
-	H, W = int(active.shape[0]), int(active.shape[1])
-	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
-	for bh in (int(h) - 1, int(h)):
-		for bw in (int(w) - 1, int(w)):
-			if bh < 0 or bw < 0 or bh >= H - 1 or bw >= W - 1:
+	QH, QW = int(active_quad.shape[0]), int(active_quad.shape[1])
+	if QH == 0 or QW == 0:
+		return True
+	for bh in range(max(0, int(h) - 1), min(QH, int(h) + 2)):
+		for bw in range(max(0, int(w) - 1), min(QW, int(w) + 2)):
+			if not bool(active_quad[bh, bw].detach().cpu()):
 				continue
-			if not bool(active[bh, bw] and active[bh + 1, bw] and active[bh, bw + 1]):
-				continue
-			dh = uv[bh + 1, bw] - uv[bh, bw]
-			dw = uv[bh, bw + 1] - uv[bh, bw]
-			det = dh[0] * dw[1] - dh[1] * dw[0]
-			if (not bool(torch.isfinite(det).detach().cpu())) or float((det * sign).detach().cpu()) < float(jac_margin):
+			cell = torch.zeros_like(active_quad, dtype=torch.bool)
+			cell[bh, bw] = True
+			vals = _map_init_jacobian_values(uv, cell, orientation_sign=orientation_sign)
+			if vals.numel() == 0:
+				return False
+			if float(vals.min().detach().cpu()) < float(jac_margin):
+				return False
+			if float(jac_margin) > 0.0 and float(vals.max().detach().cpu()) > 1.0 / float(jac_margin):
 				return False
 	return True
 
 
-def _map_init_regularization_mask(
+def _map_init_regularization_masks(
 	*,
-	active_finite: torch.Tensor,
+	active_quad: torch.Tensor,
 	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
 	uv_finite: torch.Tensor,
 	cfg: SnapSurfMapInitConfig,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+	active_vertex = _map_init_active_vertex_mask(active_quad, tuple(int(v) for v in uv_finite.shape))
 	if not bool(cfg.dense_opt):
-		return active_finite
+		vertex = active_vertex & ext_valid.bool() & uv_finite
+		quad = active_quad.bool() & _map_init_external_quad_valid(ext_valid, ext_quad_valid) & _map_init_quad_corner_all(uv_finite)
+		return vertex, quad
 	band = _dilate_mask_2d(
-		active_finite.unsqueeze(0),
+		active_vertex.unsqueeze(0),
 		radius=int(cfg.dense_reg_radius),
 	)[0]
-	return band & ext_valid.bool() & uv_finite
+	vertex = band & ext_valid.bool() & uv_finite
+	quad = _map_init_quad_corner_all(vertex) & _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	return vertex, quad
 
 
 def _map_init_objective(
 	*,
 	uv_full: torch.Tensor,
-	active: torch.Tensor,
+	active_quad: torch.Tensor,
 	ext_pos: torch.Tensor,
 	ext_normals: torch.Tensor,
 	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None = None,
 	model_xyz: torch.Tensor,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
@@ -3367,19 +3574,30 @@ def _map_init_objective(
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
 	uv_finite = torch.isfinite(uv_full).all(dim=-1)
-	active_finite = active.bool() & uv_finite
-	active_count = int(active.bool().sum().detach().cpu())
-	active_bad_count = int((active.bool() & ~uv_finite).sum().detach().cpu())
+	active_quad = active_quad.bool()
+	active_count = int(active_quad.sum().detach().cpu())
+	quad_uv_ok_grid = active_quad & _map_init_quad_corner_all(uv_finite)
+	active_bad_count = int((active_quad & ~quad_uv_ok_grid).sum().detach().cpu())
 	finite_count = 0
 	model_bad_count = 0
-	sample_mask = active_finite & ext_valid.bool()
-	if bool(sample_mask.any().detach().cpu()):
-		uv = uv_full[sample_mask]
+	quad_hw = active_quad.nonzero(as_tuple=False)
+	if int(quad_hw.shape[0]) > 0:
+		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
+			uv_full=uv_full,
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			quad_hw=quad_hw,
+			subdiv=int(mi.subdiv),
+		)
+		Q, S = int(uv_samples.shape[0]), int(uv_samples.shape[1])
+		uv = uv_samples.reshape(Q * S, 2)
 		coords3 = _map_init_coords3(uv, depth=model_depth)
 		safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
-		p_ext = ext_pos[sample_mask]
-		n_ext_raw = ext_normals[sample_mask]
-		n_ext = F.normalize(n_ext_raw, dim=-1, eps=1.0e-8) * (1.0 if int(normal_sign) >= 0 else -1.0)
+		p_ext_f = p_ext.reshape(Q * S, 3)
+		n_ext_raw_f = n_ext_raw.reshape(Q * S, 3)
+		n_ext = F.normalize(n_ext_raw_f, dim=-1, eps=1.0e-8) * (1.0 if int(normal_sign) >= 0 else -1.0)
 		p_model = _sample_surface_grid(model_xyz, safe_coords)
 		n_model_raw = _sample_surface_grid(model_normals, safe_coords)
 		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
@@ -3388,7 +3606,7 @@ def _map_init_objective(
 			safe_coords,
 			tuple(int(v) for v in model_valid.shape),
 		)
-		v = p_model - p_ext
+		v = p_model - p_ext_f
 		d = v.norm(dim=-1)
 		u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
 		c_ext = (u * n_ext).sum(dim=-1)
@@ -3399,9 +3617,12 @@ def _map_init_objective(
 		vec_values = (1.0 - c_ext) + (1.0 - c_model)
 		norm_values = 1.0 - c_norm
 		finite = (
+			sample_ext_ok.reshape(Q * S) &
+			quad_uv_ok[:, None].expand(Q, S).reshape(Q * S) &
+			torch.isfinite(uv).all(dim=-1) &
 			coord_ok &
-			torch.isfinite(p_ext).all(dim=-1) &
-			torch.isfinite(n_ext_raw).all(dim=-1) &
+			torch.isfinite(p_ext_f).all(dim=-1) &
+			torch.isfinite(n_ext_raw_f).all(dim=-1) &
 			torch.isfinite(n_ext).all(dim=-1) &
 			(n_ext.norm(dim=-1) > 1.0e-8) &
 			torch.isfinite(p_model).all(dim=-1) &
@@ -3412,15 +3633,21 @@ def _map_init_objective(
 			torch.isfinite(vec_values) &
 			torch.isfinite(norm_values)
 		)
-		if bool(finite.any().detach().cpu()):
-			finite_count = int(finite.sum().detach().cpu())
-			model_bad_count = int((~finite).sum().detach().cpu())
-			dist_loss = dist_values[finite].mean()
-			vec_loss = vec_values[finite].mean()
-			norm_loss = norm_values[finite].mean()
-			dist_avg = d[finite].mean()
+		finite_qs = finite.reshape(Q, S)
+		valid_quad = finite_qs.all(dim=1)
+		if bool(valid_quad.any().detach().cpu()):
+			finite_count = int(finite_qs[valid_quad].sum().detach().cpu())
+			model_bad_count = int((~valid_quad).sum().detach().cpu())
+			dist_q = dist_values.reshape(Q, S)[valid_quad].mean(dim=1)
+			vec_q = vec_values.reshape(Q, S)[valid_quad].mean(dim=1)
+			norm_q = norm_values.reshape(Q, S)[valid_quad].mean(dim=1)
+			d_q = d.reshape(Q, S)[valid_quad].mean(dim=1)
+			dist_loss = dist_q.mean()
+			vec_loss = vec_q.mean()
+			norm_loss = norm_q.mean()
+			dist_avg = d_q.mean()
 		else:
-			model_bad_count = int(finite.numel())
+			model_bad_count = active_count
 			dist_loss = z
 			vec_loss = z
 			norm_loss = z
@@ -3431,30 +3658,39 @@ def _map_init_objective(
 		norm_loss = z
 		dist_avg = z
 
-	reg_finite = _map_init_regularization_mask(
-		active_finite=active_finite,
+	reg_finite, reg_quad = _map_init_regularization_masks(
+		active_quad=active_quad,
 		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
 		uv_finite=uv_finite,
 		cfg=mi,
 	)
 	reg_count = int(reg_finite.sum().detach().cpu())
 	uv_safe = torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
 	smooth_vals: list[torch.Tensor] = []
-	if int(active.shape[0]) > 1:
-		m = reg_finite[1:, :] & reg_finite[:-1, :]
+	if int(uv_full.shape[0]) > 1:
+		edge = torch.zeros(int(uv_full.shape[0]) - 1, int(uv_full.shape[1]), device=uv_full.device, dtype=torch.bool)
+		if reg_quad.numel():
+			edge[:, :-1] |= reg_quad
+			edge[:, 1:] |= reg_quad
+		m = edge & reg_finite[1:, :] & reg_finite[:-1, :]
 		dv = uv_safe[1:, :] - uv_safe[:-1, :]
 		finite = m & torch.isfinite(dv).all(dim=-1)
 		if bool(finite.any().detach().cpu()):
 			smooth_vals.append(dv.square().sum(dim=-1)[finite])
-	if int(active.shape[1]) > 1:
-		m = reg_finite[:, 1:] & reg_finite[:, :-1]
+	if int(uv_full.shape[1]) > 1:
+		edge = torch.zeros(int(uv_full.shape[0]), int(uv_full.shape[1]) - 1, device=uv_full.device, dtype=torch.bool)
+		if reg_quad.numel():
+			edge[:-1, :] |= reg_quad
+			edge[1:, :] |= reg_quad
+		m = edge & reg_finite[:, 1:] & reg_finite[:, :-1]
 		dv = uv_safe[:, 1:] - uv_safe[:, :-1]
 		finite = m & torch.isfinite(dv).all(dim=-1)
 		if bool(finite.any().detach().cpu()):
 			smooth_vals.append(dv.square().sum(dim=-1)[finite])
 	smooth_fwd_loss = torch.cat(smooth_vals).mean() if smooth_vals else z
 
-	if int(active.shape[0]) > 2 and int(active.shape[1]) > 2:
+	if int(uv_full.shape[0]) > 2 and int(uv_full.shape[1]) > 2:
 		m = (
 			reg_finite[1:-1, 1:-1] &
 			reg_finite[:-2, 1:-1] &
@@ -3476,13 +3712,13 @@ def _map_init_objective(
 
 	jac_fwd_loss = _map_init_jacobian_penalty(
 		uv_safe,
-		reg_finite,
+		reg_quad,
 		orientation_sign=orientation_sign,
 		jac_margin=mi.jac_margin,
 	)
 	inv_terms = _map_init_inverse_regularization_terms(
 		uv_safe,
-		reg_finite,
+		reg_quad,
 		orientation_sign=orientation_sign,
 		jac_margin=mi.jac_margin,
 	)
@@ -3492,7 +3728,7 @@ def _map_init_objective(
 	smooth_loss = smooth_fwd_loss + smooth_rev_loss
 	bend_loss = bend_fwd_loss + bend_rev_loss
 	jac_loss = jac_fwd_loss + jac_rev_loss
-	jac_vals = _map_init_jacobian_values(uv_safe, reg_finite, orientation_sign=orientation_sign)
+	jac_vals = _map_init_jacobian_values(uv_safe, reg_quad, orientation_sign=orientation_sign)
 	jac_min = jac_vals.min() if jac_vals.numel() else z
 	if jac_vals.numel():
 		jac_bad = jac_vals < float(mi.jac_margin)
@@ -3549,18 +3785,35 @@ def _map_init_objective(
 
 def _map_init_estimate_normal_sign(
 	*,
-	active: torch.Tensor,
+	active_quad: torch.Tensor,
 	uv: torch.Tensor,
+	ext_pos: torch.Tensor,
 	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
 	model_normals: torch.Tensor,
 	model_depth: int,
+	subdiv: int,
 ) -> int:
-	mask = active.bool() & torch.isfinite(uv).all(dim=-1)
+	quad_hw = active_quad.bool().nonzero(as_tuple=False)
+	if int(quad_hw.shape[0]) == 0:
+		return 1
+	uv_samples, _p_ext, n_ext_samples, sample_ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
+		uv_full=uv,
+		ext_pos=ext_pos,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		quad_hw=quad_hw,
+		subdiv=int(subdiv),
+	)
+	mask = sample_ext_ok & quad_uv_ok.unsqueeze(-1) & torch.isfinite(uv_samples).all(dim=-1)
 	if not bool(mask.any().detach().cpu()):
 		return 1
-	coords3 = _map_init_coords3(uv[mask], depth=model_depth)
+	uv_flat = uv_samples[mask]
+	coords3 = _map_init_coords3(uv_flat, depth=model_depth)
 	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
-	n_ext = F.normalize(ext_normals[mask], dim=-1, eps=1.0e-8)
+	n_ext = F.normalize(n_ext_samples[mask], dim=-1, eps=1.0e-8)
 	n_model = F.normalize(_sample_surface_grid(model_normals, safe_coords), dim=-1, eps=1.0e-8)
 	ok = (
 		torch.isfinite(n_ext).all(dim=-1) &
@@ -3588,24 +3841,26 @@ def _map_init_seed_state(
 	seed_xyz: tuple[float, float, float],
 ) -> tuple[bool, float, float, int]:
 	mi = cfg.map_init
-	coords, ext_pos, ext_n, sample_valid = _map_init_sample_external_surface(
+	coords, sample_ext_pos, _sample_ext_n, sample_valid = _map_init_sample_external_surface(
 		ext_xyz=ext_xyz,
 		ext_normals=ext_normals,
 		ext_valid=ext_valid,
 		ext_quad_valid=ext_quad_valid,
 		subdiv=mi.subdiv,
 	)
-	state.map_init.ext_coords = coords.detach()
-	state.map_init.ext_pos = ext_pos.detach()
-	state.map_init.ext_normals = ext_n.detach()
-	state.map_init.ext_valid = sample_valid.detach()
-	state.map_init.active = torch.zeros_like(sample_valid, dtype=torch.bool)
-	state.map_init.uv = torch.full((*sample_valid.shape, 2), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
+	H_ext, W_ext = int(ext_xyz.shape[0]), int(ext_xyz.shape[1])
+	state.map_init.ext_coords = _map_init_external_vertex_coords(ext_xyz).detach()
+	state.map_init.ext_pos = ext_xyz.detach()
+	state.map_init.ext_normals = ext_normals.detach()
+	state.map_init.ext_valid = ext_valid.detach()
+	state.map_init.ext_quad_valid = ext_quad_valid.detach()
+	state.map_init.active_quad = torch.zeros(max(0, H_ext - 1), max(0, W_ext - 1), device=model_xyz.device, dtype=torch.bool)
+	state.map_init.uv = torch.full((H_ext, W_ext, 2), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
 	if not bool(sample_valid.any().detach().cpu()):
 		return False, float("inf"), float("inf"), 0
 
 	seed = torch.tensor(seed_xyz, device=model_xyz.device, dtype=model_xyz.dtype)
-	dist2 = (ext_pos - seed.view(1, 1, 3)).square().sum(dim=-1)
+	dist2 = (sample_ext_pos - seed.view(1, 1, 3)).square().sum(dim=-1)
 	dist2 = torch.where(sample_valid, dist2, torch.full_like(dist2, float("inf")))
 	best_flat = torch.argmin(dist2.reshape(-1))
 	best_dist = dist2.reshape(-1)[best_flat]
@@ -3647,9 +3902,12 @@ def _map_init_seed_state(
 		sol = torch.linalg.lstsq(A, tgt).solution
 	except RuntimeError:
 		sol = torch.linalg.pinv(A) @ tgt
-	flat_coords = coords.reshape(-1, 2)
+	vertex_coords = state.map_init.ext_coords
+	if vertex_coords is None:
+		return False, float("inf"), seed_ext_dist, 0
+	flat_coords = vertex_coords.reshape(-1, 2)
 	query = torch.cat([flat_coords, torch.ones(flat_coords.shape[0], 1, device=model_xyz.device, dtype=model_xyz.dtype)], dim=1)
-	uv_all = (query @ sol).reshape(Hs, Ws, 2)
+	uv_all = (query @ sol).reshape(H_ext, W_ext, 2)
 	seed_source_hw = src
 	orientation_sign = 1 if cfg.orientation in {"identity", "none"} else _affine_det_sign_from_points(
 		seed_source_hw,
@@ -3657,43 +3915,75 @@ def _map_init_seed_state(
 		fallback=fallback_sign,
 	)
 	r = max(0, int(mi.seed_radius))
-	hh = torch.arange(Hs, device=model_xyz.device).view(Hs, 1)
-	ww = torch.arange(Ws, device=model_xyz.device).view(1, Ws)
-	active = (
-		sample_valid &
-		(hh >= seed_h - r) &
-		(hh <= seed_h + r) &
-		(ww >= seed_w - r) &
-		(ww <= seed_w + r)
+	quad_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	QH, QW = int(quad_valid.shape[0]), int(quad_valid.shape[1])
+	hh = torch.arange(QH, device=model_xyz.device).view(QH, 1)
+	ww = torch.arange(QW, device=model_xyz.device).view(1, QW)
+	active_quad = (
+		quad_valid &
+		(hh >= eh - r) &
+		(hh <= eh + r) &
+		(ww >= ew - r) &
+		(ww <= ew + r)
 	)
-	active = active & _map_init_model_coord_ok(
-		uv_all,
-		model_valid=model_valid,
-		model_normals=model_normals,
-		depth=d,
-	)
-	if not bool(active.any().detach().cpu()):
-		active[seed_h, seed_w] = bool(sample_valid[seed_h, seed_w].detach().cpu())
-		active = active & _map_init_model_coord_ok(
+	cand_hw = active_quad.nonzero(as_tuple=False)
+	if int(cand_hw.shape[0]) > 0:
+		ok_quad = _map_init_candidate_quad_samples_ok(
+			uv_full=uv_all,
+			quad_hw=cand_hw,
+			ext_pos=ext_xyz,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(d),
+			cfg=cfg,
+		)
+		active_quad[cand_hw[:, 0], cand_hw[:, 1]] = ok_quad
+	if not bool(active_quad.any().detach().cpu()) and 0 <= eh < QH and 0 <= ew < QW:
+		seed_quad_hw = torch.tensor([[eh, ew]], device=model_xyz.device, dtype=torch.long)
+		seed_ok = bool(_map_init_candidate_quad_samples_ok(
+			uv_full=uv_all,
+			quad_hw=seed_quad_hw,
+			ext_pos=ext_xyz,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(d),
+			cfg=cfg,
+		)[0].detach().cpu())
+		active_quad[eh, ew] = seed_ok
+	if bool(active_quad.any().detach().cpu()):
+		active_quad = active_quad & _map_init_quad_corner_all(_map_init_model_coord_ok(
 			uv_all,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			depth=d,
-		)
-	state.map_init.active = active.detach()
-	state.map_init.uv = torch.where(active.unsqueeze(-1), uv_all.detach(), torch.full_like(uv_all, float("nan")))
+		))
+	if not bool(active_quad.any().detach().cpu()):
+		return False, float(seed_model_dist), seed_ext_dist, 0
+	vertex_active = _map_init_active_vertex_mask(active_quad, (H_ext, W_ext))
+	state.map_init.active_quad = active_quad.detach()
+	state.map_init.uv = torch.where(vertex_active.unsqueeze(-1), uv_all.detach(), torch.full_like(uv_all, float("nan")))
 	state.map_init.model_depth = int(d)
 	state.map_init.seed_ext_sample_hw = (seed_h, seed_w)
 	state.map_init.seed_model_quad = model_quad
 	state.map_init.orientation_sign = int(orientation_sign)
 	state.map_init.normal_sign = _map_init_estimate_normal_sign(
-		active=active,
+		active_quad=active_quad,
 		uv=uv_all,
-		ext_normals=ext_n,
-		model_normals=model_normals,
-		model_depth=int(d),
-	)
-	init_count = int(active.sum().detach().cpu())
+		ext_pos=ext_xyz,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_normals=model_normals,
+			model_depth=int(d),
+			subdiv=int(mi.subdiv),
+		)
+	init_count = int(active_quad.sum().detach().cpu())
 	state.map_init.added_total = init_count
 	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
 	return init_count > 0, float(seed_model_dist), seed_ext_dist, init_count
@@ -3707,55 +3997,60 @@ def _map_init_grow_once(
 	cfg: SnapSurfConfig,
 ) -> int:
 	mi = cfg.map_init
-	active = state.map_init.active
+	active = state.map_init.active_quad
 	uv = state.map_init.uv
+	ext_pos = state.map_init.ext_pos
+	ext_normals = state.map_init.ext_normals
 	ext_valid = state.map_init.ext_valid
+	ext_quad_valid = state.map_init.ext_quad_valid
 	depth = state.map_init.model_depth
-	if active is None or uv is None or ext_valid is None or depth is None:
+	if active is None or uv is None or ext_pos is None or ext_normals is None or ext_valid is None or depth is None:
 		return 0
 	if not bool(active.any().detach().cpu()):
 		return 0
-	candidate = _neighbor8_mask(active.unsqueeze(0))[0] & ~active & ext_valid.bool()
+	quad_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	candidate = _neighbor8_mask(active.unsqueeze(0))[0] & ~active & quad_valid
 	if not bool(candidate.any().detach().cpu()):
 		return 0
 	cand_hw = candidate.nonzero(as_tuple=False)
-	cand_bidx = torch.cat([
-		torch.zeros(cand_hw.shape[0], 1, device=cand_hw.device, dtype=torch.long),
-		cand_hw,
-	], dim=1)
-	tmp_state = _DirectionState(source_rank=2, target_rank=2)
-	pred, count, _nearest = _direct_predict_candidates_batched(
-		tmp_state,
-		valid_b=active.unsqueeze(0),
-		map_b=uv.unsqueeze(0),
-		candidate_bidx=cand_bidx,
-		radius=max(1, int(mi.edge_init_radius)),
-	)
-	support_ok = count >= 1
-	if not bool(support_ok.any().detach().cpu()):
-		return 0
-	cand_hw = cand_hw[support_ok]
-	pred = pred[support_ok]
-	local_ok = torch.isfinite(pred).all(dim=-1) & _map_init_model_coord_ok(
-		pred,
-		model_valid=model_valid,
-		model_normals=model_normals,
-		depth=int(depth),
-	)
-	if bool(mi.dense_opt) and state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(active.shape):
-		guess = state.map_init.uv_guess[cand_hw[:, 0], cand_hw[:, 1]]
-		guess_ok = torch.isfinite(guess).all(dim=-1) & _map_init_model_coord_ok(
-			guess,
+	active_vertices = _map_init_active_vertex_mask(active, tuple(int(v) for v in uv.shape[:2])) & torch.isfinite(uv).all(dim=-1)
+	cand_vertices = _map_init_active_vertex_mask(candidate, tuple(int(v) for v in uv.shape[:2])) & ~active_vertices
+	pred_grid = uv.clone()
+	pred_ok_grid = active_vertices.clone()
+	if bool(cand_vertices.any().detach().cpu()):
+		vert_hw = cand_vertices.nonzero(as_tuple=False)
+		vert_bidx = torch.cat([
+			torch.zeros(vert_hw.shape[0], 1, device=vert_hw.device, dtype=torch.long),
+			vert_hw,
+		], dim=1)
+		tmp_state = _DirectionState(source_rank=2, target_rank=2)
+		pred, count, _nearest = _direct_predict_candidates_batched(
+			tmp_state,
+			valid_b=active_vertices.unsqueeze(0),
+			map_b=uv.unsqueeze(0),
+			candidate_bidx=vert_bidx,
+			radius=max(1, int(mi.edge_init_radius)),
+		)
+		local_ok = (count >= 1) & torch.isfinite(pred).all(dim=-1) & _map_init_model_coord_ok(
+			pred,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			depth=int(depth),
 		)
-		pred = torch.where(local_ok.unsqueeze(-1), pred, torch.where(guess_ok.unsqueeze(-1), guess, pred))
-		local_ok = local_ok | guess_ok
-	cand_hw = cand_hw[local_ok]
-	pred = pred[local_ok]
-	if int(cand_hw.shape[0]) == 0:
-		return 0
+		if bool(mi.dense_opt) and state.map_init.uv_guess is not None and tuple(state.map_init.uv_guess.shape[:2]) == tuple(uv.shape[:2]):
+			guess = state.map_init.uv_guess[vert_hw[:, 0], vert_hw[:, 1]]
+			guess_ok = torch.isfinite(guess).all(dim=-1) & _map_init_model_coord_ok(
+				guess,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				depth=int(depth),
+			)
+			pred = torch.where(local_ok.unsqueeze(-1), pred, torch.where(guess_ok.unsqueeze(-1), guess, pred))
+			local_ok = local_ok | guess_ok
+		if bool(local_ok.any().detach().cpu()):
+			ok_hw = vert_hw[local_ok]
+			pred_grid[ok_hw[:, 0], ok_hw[:, 1]] = pred[local_ok].detach()
+			pred_ok_grid[ok_hw[:, 0], ok_hw[:, 1]] = True
 	active_new = active.clone()
 	uv_new = uv.clone()
 	added = 0
@@ -3764,25 +4059,52 @@ def _map_init_grow_once(
 		w = int(cand_hw[i, 1].detach().cpu())
 		if bool(active_new[h, w].detach().cpu()):
 			continue
-		prev_uv = uv_new[h, w].clone()
-		uv_new[h, w] = pred[i].detach()
+		corners = (
+			(h, w),
+			(h + 1, w),
+			(h, w + 1),
+			(h + 1, w + 1),
+		)
+		prev_uv = [uv_new[ch, cw].clone() for ch, cw in corners]
+		proposed = [uv_new[ch, cw] if bool(torch.isfinite(uv_new[ch, cw]).all().detach().cpu()) else pred_grid[ch, cw] for ch, cw in corners]
+		if not all(bool(torch.isfinite(p).all().detach().cpu()) for p in proposed):
+			continue
+		if not all(bool(pred_ok_grid[ch, cw].detach().cpu()) or bool(torch.isfinite(uv_new[ch, cw]).all().detach().cpu()) for ch, cw in corners):
+			continue
+		for (ch, cw), p in zip(corners, proposed, strict=False):
+			uv_new[ch, cw] = p.detach()
 		active_new[h, w] = True
-		if _map_init_local_jacobian_pass(
+		samples_ok = bool(_map_init_candidate_quad_samples_ok(
+			uv_full=uv_new,
+			quad_hw=cand_hw[i:i + 1],
+			ext_pos=ext_pos,
+			ext_normals=ext_normals,
+			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(depth),
+			cfg=cfg,
+		)[0].detach().cpu())
+		jac_ok = _map_init_local_jacobian_pass(
 			uv_new,
 			active_new,
 			h=h,
 			w=w,
 			orientation_sign=state.map_init.orientation_sign,
 			jac_margin=mi.jac_margin,
-		):
+		)
+		if samples_ok and jac_ok:
 			added += 1
 		else:
 			active_new[h, w] = False
-			if bool(mi.dense_opt):
-				uv_new[h, w] = prev_uv
-			else:
-				uv_new[h, w] = float("nan")
-	state.map_init.active = active_new
+			active_vertices_after = _map_init_active_vertex_mask(active_new, tuple(int(v) for v in uv_new.shape[:2]))
+			for (ch, cw), prev in zip(corners, prev_uv, strict=False):
+				if bool(mi.dense_opt) or bool(active_vertices_after[ch, cw].detach().cpu()):
+					uv_new[ch, cw] = prev
+				else:
+					uv_new[ch, cw] = float("nan")
+	state.map_init.active_quad = active_new
 	state.map_init.uv = uv_new
 	state.map_init.added_total += added
 	if added > 0:
@@ -3803,11 +4125,12 @@ def _map_init_optimize_block(
 	lr_mult: float = 1.0,
 	w_jac_mult: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-	active = state.map_init.active
+	active = state.map_init.active_quad
 	uv = state.map_init.uv
 	ext_pos = state.map_init.ext_pos
 	ext_normals = state.map_init.ext_normals
 	ext_valid = state.map_init.ext_valid
+	ext_quad_valid = state.map_init.ext_quad_valid
 	depth = state.map_init.model_depth
 	if (
 		active is None or uv is None or ext_pos is None or ext_normals is None or
@@ -3820,6 +4143,7 @@ def _map_init_optimize_block(
 	dense_mode = bool(cfg.map_init.dense_opt)
 	lr = float(cfg.map_init.lr) * float(lr_mult)
 	base_uv = uv.detach().clone()
+	active_vertices = _map_init_active_vertex_mask(active, tuple(int(v) for v in uv.shape[:2])) & torch.isfinite(uv).all(dim=-1)
 	uv_prior: torch.Tensor | None = None
 	if dense_mode:
 		dense_seed = _map_init_dense_seed_uv(state, model_valid=model_valid, cfg=cfg)
@@ -3837,7 +4161,7 @@ def _map_init_optimize_block(
 			dense_pyr = None
 			opt_params = [param]
 	else:
-		param = torch.nn.Parameter(uv[active].detach().clone())
+		param = torch.nn.Parameter(uv[active_vertices].detach().clone())
 		dense_pyr = None
 		opt_params = [param]
 	opt = torch.optim.Adam(opt_params, lr=lr)
@@ -3854,7 +4178,7 @@ def _map_init_optimize_block(
 		if param is None:
 			raise RuntimeError("map-init active optimizer parameter missing")
 		out = base_uv.clone()
-		out[active] = param
+		out[active_vertices] = param
 		return out
 
 	last_terms: dict[str, torch.Tensor] | None = None
@@ -3866,10 +4190,11 @@ def _map_init_optimize_block(
 		uv_full = current_uv_full()
 		loss, terms = _map_init_objective(
 			uv_full=uv_full,
-			active=active,
+			active_quad=active,
 			ext_pos=ext_pos,
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
+			ext_quad_valid=ext_quad_valid,
 			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
@@ -3969,10 +4294,11 @@ def _map_init_optimize_block(
 		uv_full = current_uv_full().detach()
 	_, last_terms = _map_init_objective(
 		uv_full=uv_full,
-		active=active,
+		active_quad=active,
 		ext_pos=ext_pos,
 		ext_normals=ext_normals,
 		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
 		model_xyz=model_xyz,
 		model_valid=model_valid,
 		model_normals=model_normals,
@@ -4210,13 +4536,14 @@ def _run_map_init_for_surface(
 						break
 				if added <= 0 or block <= 0:
 					break
-			if not last_terms and state.map_init.active is not None and state.map_init.uv is not None:
+			if not last_terms and state.map_init.active_quad is not None and state.map_init.uv is not None:
 				_, last_terms = _map_init_objective(
 					uv_full=state.map_init.uv,
-					active=state.map_init.active,
+					active_quad=state.map_init.active_quad,
 					ext_pos=state.map_init.ext_pos,
 					ext_normals=state.map_init.ext_normals,
 					ext_valid=state.map_init.ext_valid,
+					ext_quad_valid=state.map_init.ext_quad_valid,
 					model_xyz=model_xyz,
 					model_valid=model_valid,
 					model_normals=model_normals,
@@ -4225,13 +4552,14 @@ def _run_map_init_for_surface(
 					orientation_sign=state.map_init.orientation_sign,
 					cfg=cfg,
 				)
-			elif state.map_init.active is not None and state.map_init.uv is not None:
+			elif state.map_init.active_quad is not None and state.map_init.uv is not None:
 				_, last_terms = _map_init_objective(
 					uv_full=state.map_init.uv,
-					active=state.map_init.active,
+					active_quad=state.map_init.active_quad,
 					ext_pos=state.map_init.ext_pos,
 					ext_normals=state.map_init.ext_normals,
 					ext_valid=state.map_init.ext_valid,
+					ext_quad_valid=state.map_init.ext_quad_valid,
 					model_xyz=model_xyz,
 					model_valid=model_valid,
 					model_normals=model_normals,
@@ -4514,32 +4842,60 @@ def _debug_write_map_init_objs(
 	write_lines("corr_model_to_ext.obj", empty, empty, label="map_init_no_corr_model_to_ext")
 	write_lines("corr_ext_to_model.obj", empty, empty, label="map_init_no_corr_ext_to_model")
 	if (
-		mi.active is None or mi.uv is None or mi.ext_pos is None or
+		mi.active_quad is None or mi.uv is None or mi.ext_pos is None or
+		mi.ext_normals is None or mi.ext_valid is None or
 		mi.model_depth is None or mi.active_count() <= 0
 	):
 		write_mesh_2d("map_mapped_surface.obj", model_xyz.new_empty(0, 0, 3), torch.zeros(0, 0, device=model_xyz.device, dtype=torch.bool))
 		write_lines("map_ext_to_model.obj", empty, empty, label="map_ext_to_model")
 		write_points("map_active_mask.obj", empty, torch.zeros(0, device=model_xyz.device, dtype=torch.bool), label="map_active_mask")
 		return
-	coords3 = _map_init_coords3(mi.uv, depth=int(mi.model_depth))
-	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
-	mapped = _sample_surface_grid(model_xyz, safe_coords)
-	uv_ok = mi.active.bool() & torch.isfinite(mi.uv).all(dim=-1)
-	model_ok = uv_ok & _quad_valid_at_coords(model_valid.bool(), safe_coords, tuple(int(v) for v in model_xyz.shape[:3]))
-	ok = model_ok & torch.isfinite(mapped).all(dim=-1)
-	mapped_grid = torch.where(ok.unsqueeze(-1), mapped, torch.full_like(mapped, float("nan")))
+	s = max(1, int(cfg.map_init.subdiv))
+	H_ext, W_ext = int(mi.uv.shape[0]), int(mi.uv.shape[1])
+	Hs, Ws = max(0, H_ext - 1) * s, max(0, W_ext - 1) * s
+	mapped_grid = torch.full((Hs, Ws, 3), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
+	ext_grid = torch.full((Hs, Ws, 3), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
+	ok = torch.zeros(Hs, Ws, device=model_xyz.device, dtype=torch.bool)
+	quad_hw = mi.active_quad.bool().nonzero(as_tuple=False)
+	if int(quad_hw.shape[0]) > 0:
+		uv_samples, ext_samples, _n_ext, sample_ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
+			uv_full=mi.uv,
+			ext_pos=mi.ext_pos,
+			ext_normals=mi.ext_normals,
+			ext_valid=mi.ext_valid,
+			ext_quad_valid=mi.ext_quad_valid,
+			quad_hw=quad_hw,
+			subdiv=s,
+		)
+		coords3 = _map_init_coords3(uv_samples, depth=int(mi.model_depth))
+		safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+		mapped = _sample_surface_grid(model_xyz, safe_coords)
+		model_ok = _quad_valid_at_coords(model_valid.bool(), safe_coords, tuple(int(v) for v in model_xyz.shape[:3]))
+		sample_ok = (
+			sample_ext_ok &
+			quad_uv_ok.unsqueeze(-1) &
+			torch.isfinite(uv_samples).all(dim=-1) &
+			model_ok &
+			torch.isfinite(mapped).all(dim=-1)
+		)
+		sample_idx = torch.arange(s * s, device=model_xyz.device, dtype=torch.long)
+		rows = quad_hw[:, 0:1] * s + (sample_idx // s).view(1, -1)
+		cols = quad_hw[:, 1:2] * s + (sample_idx % s).view(1, -1)
+		mapped_grid[rows, cols] = torch.where(sample_ok.unsqueeze(-1), mapped, torch.full_like(mapped, float("nan")))
+		ext_grid[rows, cols] = torch.where(sample_ok.unsqueeze(-1), ext_samples, torch.full_like(ext_samples, float("nan")))
+		ok[rows, cols] = sample_ok
 	write_mesh_2d("map_mapped_surface.obj", mapped_grid, ok)
 	if bool(ok.any().detach().cpu()):
-		write_lines("map_ext_to_model.obj", mi.ext_pos[ok], mapped[ok], label="map_ext_to_model")
+		write_lines("map_ext_to_model.obj", ext_grid[ok], mapped_grid[ok], label="map_ext_to_model")
 	else:
 		write_lines("map_ext_to_model.obj", empty, empty, label="map_ext_to_model")
-	write_points("map_active_mask.obj", mi.ext_pos, mi.active.bool(), label="map_active_mask")
+	write_points("map_active_mask.obj", ext_grid, ok, label="map_active_mask")
 	_map_init_log(
 		"obj wrote "
 		f"prefix={prefix!r} "
-		f"active={int(mi.active.sum().detach().cpu())} "
-		f"uv_finite={int(uv_ok.sum().detach().cpu())} "
-		f"model_ok={int(model_ok.sum().detach().cpu())} "
+		f"active={int(mi.active_quad.sum().detach().cpu())} "
+		f"uv_finite={int(torch.isfinite(mi.uv).all(dim=-1).sum().detach().cpu())} "
+		f"model_ok={int(ok.sum().detach().cpu())} "
 		f"mapped={int(ok.sum().detach().cpu())} "
 		"files=map_ext_to_model.obj,map_mapped_surface.obj,map_active_mask.obj"
 	)
