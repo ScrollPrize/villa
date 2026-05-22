@@ -813,7 +813,10 @@ def parse_args(argv=None):
         "--merge-temp-dir",
         type=str,
         default=None,
-        help="Parent directory for temporary dense overlap-merge memmaps. Defaults to the system temp directory.",
+        help=(
+            "Parent directory for temporary dense overlap-merge memmaps. "
+            "Defaults to the parent directory of the output path."
+        ),
     )
 
     parser.add_argument("--out-dir", type=str, default=None)
@@ -1057,6 +1060,14 @@ def _records_window(records, crop_size):
     return window_min, tuple(int(v) for v in window_shape.tolist())
 
 
+def _filesystem_available_bytes(path):
+    try:
+        stat = os.statvfs(str(path))
+    except OSError:
+        return None
+    return int(stat.f_bavail) * int(stat.f_frsize)
+
+
 def _slice_len(s):
     return int(s.stop) - int(s.start)
 
@@ -1124,6 +1135,17 @@ class _WeightedDenseDisplacementMerger:
 
     def _create_chunk(self, kind, chunk_key, shape):
         path = self._chunk_path(kind, chunk_key)
+        required_bytes = int(np.prod(shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
+        available_bytes = _filesystem_available_bytes(self.path)
+        if available_bytes is not None:
+            reserve_bytes = 64 * 1024 * 1024
+            if available_bytes < required_bytes + reserve_bytes:
+                raise RuntimeError(
+                    "Not enough free space for dense overlap-merge temporary files: "
+                    f"need at least {(required_bytes + reserve_bytes) / (1024 ** 3):.2f} GiB, "
+                    f"available {available_bytes / (1024 ** 3):.2f} GiB in {self.path}. "
+                    "Set --merge-temp-dir to a filesystem with more free space."
+                )
         arr = np.lib.format.open_memmap(
             path,
             mode="w+",
@@ -1132,7 +1154,7 @@ class _WeightedDenseDisplacementMerger:
         )
         arr[...] = 0.0
         self._close_memmap(arr)
-        self.current_bytes += int(np.prod(shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
+        self.current_bytes += required_bytes
         return path
 
     def _open_chunk(self, path, mode):
@@ -2625,6 +2647,8 @@ def run(args):
 
     out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
     os.makedirs(out_dir, exist_ok=True)
+    if args.merge_temp_dir is None:
+        args.merge_temp_dir = str(Path(out_dir).parent)
     save_scale_factor = int(2 ** int(args.volume_scale))
     iterative_mode = args.iterations is not None
     iterations_requested = int(args.iterations) if iterative_mode else 1
