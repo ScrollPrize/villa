@@ -20,11 +20,22 @@ nanobind_add_module(vc_python
 
 set_target_properties(vc_python PROPERTIES
     OUTPUT_NAME vc
+    INSTALL_RPATH "$ORIGIN"
 )
 
 target_link_libraries(vc_python PRIVATE vc_core)
 
+set_target_properties(vc_core utils utils_c3d_codec c3d PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+)
+
 install(TARGETS vc_python
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
+)
+
+install(TARGETS vc_core utils utils_c3d_codec c3d
+    LIBRARY DESTINATION .
+    RUNTIME DESTINATION .
+    ARCHIVE DESTINATION .
 )
