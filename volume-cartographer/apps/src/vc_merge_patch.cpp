@@ -633,8 +633,6 @@ int pmDecimateAnchors(std::vector<cv::Vec2d>& src,
 // =============================================================================
 
 struct PMConfig {
-    fs::path parent_path;
-    fs::path child_path;
     int      border_cells{kDefaultBorderCells};
     int      blend_cells{kDefaultBlendCells};
     int      ransac_iters{3000};
@@ -1053,16 +1051,9 @@ PMPatchStats pmApplyPatch(cv::Mat_<cv::Vec3f>& parent_points,
     return stats;
 }
 
-int pmRun(const PMConfig& cfg)
+int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg)
 {
-    std::cout << "[0/6] loading parent + child\n";
-    if (!fs::is_directory(cfg.parent_path))
-        throw std::runtime_error("parent is not a directory: " + cfg.parent_path.string());
-    if (!fs::is_directory(cfg.child_path))
-        throw std::runtime_error("child is not a directory: "  + cfg.child_path.string());
-
-    PMSurface parent = pmLoadSurface(cfg.parent_path);
-    PMSurface child  = pmLoadSurface(cfg.child_path);
+    std::cout << "[0/6] parent + child ready\n";
     std::cout << "  parent: " << parent.name
               << "  shape=(" << parent.H << "," << parent.W << ")"
               << "  valid=" << parent.valid << "\n";
@@ -1166,7 +1157,7 @@ int pmRun(const PMConfig& cfg)
     // we didn't touch retain their parent values bit-identical to the
     // input. invalidateMask + writeValidMask after save re-derive mask.tif
     // from the patched points so any newly valid cells are reflected.
-    const fs::path    output_dir = cfg.parent_path;
+    const fs::path    output_dir = parent.path;
     const std::string out_uuid   = output_dir.filename().string();
     std::cout << "[6/6] overwriting parent tifxyz at " << output_dir << "\n";
 
@@ -1176,8 +1167,8 @@ int pmRun(const PMConfig& cfg)
 
     const fs::path summary_path = output_dir / (out_uuid + "_summary.json");
     json summary = {
-        {"parent",       cfg.parent_path.string()},
-        {"child",        cfg.child_path.string()},
+        {"parent",       parent.path.string()},
+        {"child",        child.path.string()},
         {"output",       output_dir.string()},
         {"border_cells", cfg.border_cells},
         {"blend_cells",  cfg.blend_cells},
@@ -1230,23 +1221,33 @@ int main(int argc, char** argv)
 {
     PMConfig defaults;
     po::options_description desc(
-        "vc_merge_patch: patch a small child tifxyz into a parent tifxyz. "
-        "The child's border overlaps the parent and is smoothly blended into "
-        "it; the child interior fully replaces the corresponding region of "
-        "the parent. Cells outside the child footprint are written verbatim "
-        "from the parent (no rasterization, no UV transform). The parent "
-        "tifxyz is overwritten in place -- back up the parent dir first if "
-        "you want to keep the pre-patch version.");
+        "vc_merge_patch <tifxyz_a> <tifxyz_b> [options]\n"
+        "\n"
+        "Patch a small child tifxyz into a parent tifxyz. The child's border "
+        "overlaps the parent and is smoothly blended into it; the child "
+        "interior fully replaces the corresponding region of the parent. "
+        "Cells outside the child footprint are written verbatim from the "
+        "parent (no rasterization, no UV transform). The parent tifxyz is "
+        "overwritten in place -- back up the parent dir first if you want "
+        "to keep the pre-patch version.\n"
+        "\n"
+        "Pass the two tifxyz dirs as positional args; the larger of the two "
+        "(by valid-cell count) is taken as the parent. Use --parent / "
+        "--child if you want to set the roles explicitly (e.g. ambiguous "
+        "sizes, or for scripts)");
     desc.add_options()
         ("help,h", "print help")
         ("parent,p", po::value<std::string>(),
-            "Parent tifxyz directory (required). Overwritten in place: "
-            "x/y/z/mask/meta are replaced atomically; aux files in the "
-            "parent dir (approval.tif, generations.tif, ...) are preserved.")
+            "Parent tifxyz directory (explicit override). When both "
+            "--parent and --child are set, auto-detection is skipped. "
+            "Overwritten in place: x/y/z/mask/meta are replaced atomically; "
+            "aux files in the parent dir (approval.tif, generations.tif, "
+            "...) are preserved.")
         ("child,c", po::value<std::string>(),
-            "Child tifxyz directory (required). Its border should already "
-            "overlap parent geometry; alignment refines the seam, blending "
-            "smooths it, and the child interior replaces the parent there.")
+            "Child tifxyz directory (explicit override). Its border should "
+            "already overlap parent geometry; alignment refines the seam, "
+            "blending smooths it, and the child interior replaces the "
+            "parent there.")
         ("border-cells", po::value<int>()->default_value(defaults.border_cells),
             "Width (in child grid cells) of the rim used for anchor seeding. "
             "Only child cells whose distance-to-boundary is < border-cells "
@@ -1278,22 +1279,50 @@ int main(int argc, char** argv)
             "Number of nearest child cells (by warped UV) to IDW-sample "
             "per parent footprint cell.");
 
+    // Hidden positional sink so up to two bare paths land in `inputs` without
+    // showing up in --help.
+    po::options_description hidden;
+    hidden.add_options()
+        ("inputs", po::value<std::vector<std::string>>(), "tifxyz inputs (positional)");
+    po::positional_options_description pos;
+    pos.add("inputs", -1);
+    po::options_description all_opts;
+    all_opts.add(desc).add(hidden);
+
     po::variables_map vm;
     try {
-        po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
+        po::store(po::command_line_parser(argc, argv)
+            .options(all_opts).positional(pos).run(), vm);
         po::notify(vm);
     } catch (const std::exception& e) {
         std::cerr << "error parsing arguments: " << e.what() << "\n" << desc << "\n";
         return EXIT_FAILURE;
     }
-    if (vm.count("help") || !vm.count("parent") || !vm.count("child")) {
+
+    const bool has_parent = vm.count("parent") > 0;
+    const bool has_child  = vm.count("child")  > 0;
+    const std::vector<std::string> positional = vm.count("inputs")
+        ? vm["inputs"].as<std::vector<std::string>>()
+        : std::vector<std::string>();
+    const bool explicit_roles = has_parent && has_child;
+
+    if (vm.count("help") ||
+        (!explicit_roles && positional.size() != 2) ||
+        (has_parent != has_child) ||
+        (explicit_roles && !positional.empty()))
+    {
+        if (has_parent != has_child)
+            std::cerr << "specify both --parent and --child, or neither\n";
+        else if (explicit_roles && !positional.empty())
+            std::cerr << "do not mix positional args with --parent/--child\n";
+        else if (!vm.count("help"))
+            std::cerr << "usage: vc_merge_patch <tifxyz_a> <tifxyz_b> [options]\n"
+                         "   or: vc_merge_patch --parent <tifxyz> --child <tifxyz> [options]\n";
         std::cout << desc << "\n";
         return vm.count("help") ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     PMConfig cfg;
-    cfg.parent_path       = vm["parent"].as<std::string>();
-    cfg.child_path        = vm["child"].as<std::string>();
     cfg.border_cells      = vm["border-cells"].as<int>();
     cfg.blend_cells       = vm["blend-cells"].as<int>();
     cfg.ransac_iters      = vm["ransac-iters"].as<int>();
@@ -1304,8 +1333,59 @@ int main(int argc, char** argv)
     cfg.anchor_cap        = vm["anchor-cap"].as<int>();
     cfg.idw_k             = vm["idw-k"].as<int>();
 
+    fs::path path_a, path_b;
+    if (explicit_roles) {
+        path_a = vm["parent"].as<std::string>();
+        path_b = vm["child"].as<std::string>();
+    } else {
+        path_a = positional[0];
+        path_b = positional[1];
+    }
+
     try {
-        return pmRun(cfg);
+        if (!fs::is_directory(path_a))
+            throw std::runtime_error("not a directory: " + path_a.string());
+        if (!fs::is_directory(path_b))
+            throw std::runtime_error("not a directory: " + path_b.string());
+
+        std::cout << "[0/6] loading " << path_a.filename().string()
+                  << " and " << path_b.filename().string() << "\n";
+        PMSurface a = pmLoadSurface(path_a);
+        PMSurface b = pmLoadSurface(path_b);
+
+        PMSurface parent_surf, child_surf;
+        if (explicit_roles) {
+            parent_surf = std::move(a);
+            child_surf  = std::move(b);
+        } else {
+            // Auto-detect: bigger surface (by valid-cell count) is the
+            // parent. The two roles are dramatically asymmetric in normal
+            // use (parent millions of cells, child thousands), so a flat
+            // valid-count compare is enough; flag if the ratio is small in
+            // case the user passed two near-equal segments by mistake.
+            if (a.valid >= b.valid) {
+                parent_surf = std::move(a);
+                child_surf  = std::move(b);
+            } else {
+                parent_surf = std::move(b);
+                child_surf  = std::move(a);
+            }
+            std::cout << "  auto-detected parent: " << parent_surf.name
+                      << " (valid=" << parent_surf.valid << ")\n";
+            std::cout << "  auto-detected child : " << child_surf.name
+                      << " (valid=" << child_surf.valid  << ")\n";
+            if (child_surf.valid > 0 &&
+                parent_surf.valid < 2 * child_surf.valid)
+            {
+                std::cout << "  warning: parent is only "
+                          << (double)parent_surf.valid /
+                             (double)child_surf.valid
+                          << "x larger than child; pass --parent/--child "
+                             "explicitly if this is wrong\n";
+            }
+        }
+
+        return pmRun(std::move(parent_surf), std::move(child_surf), cfg);
     } catch (const std::exception& e) {
         std::cerr << "vc_merge_patch failed: " << e.what() << "\n";
         return EXIT_FAILURE;
