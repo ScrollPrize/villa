@@ -67,7 +67,7 @@
 					"map_init": {
 						"enabled": true,
 						"subdiv": 2,
-						"iters": 4000,
+						"iters": 1000,
 						"candidate_opt_iters": 5,
 						"candidate_lr": 0.1,
 						"fringe_opt_iters": 10,

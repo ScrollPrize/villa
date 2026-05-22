@@ -226,7 +226,7 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			progress_interval=max(100, int(raw.get("progress_interval", defaults.progress_interval))),
 			progress_mode=str(raw.get("progress_mode", defaults.progress_mode)).lower(),
 			scale_levels=max(1, int(raw.get("scale_levels", defaults.scale_levels))),
-			scale_factor=max(2, int(raw.get("scale_factor", defaults.scale_factor))),
+			scale_factor=max(1, int(raw.get("scale_factor", defaults.scale_factor))),
 			dense_opt=bool(raw.get("dense_opt", defaults.dense_opt)),
 			dense_reg_radius=max(0, int(raw.get("dense_reg_radius", defaults.dense_reg_radius))),
 			w_dense_prior=float(raw.get("w_dense_prior", defaults.w_dense_prior)),
@@ -270,6 +270,8 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 		raise ValueError("snap_surf args.map_init.jac_margin must be >= 0")
 	if cfg.progress_mode not in ("block", "periodic", "both", "none"):
 		raise ValueError("snap_surf args.map_init.progress_mode must be one of block, periodic, both, none")
+	if int(cfg.scale_levels) > 1 and int(cfg.scale_factor) != 2:
+		raise ValueError("snap_surf args.map_init.scale_factor must be 2 when scale_levels > 1")
 	return cfg
 
 
@@ -351,6 +353,9 @@ class _MapInitState:
 		self.ext_valid: torch.Tensor | None = None
 		self.ext_quad_valid: torch.Tensor | None = None
 		self.ext_coords: torch.Tensor | None = None
+		self.uv_pyramid: list[torch.Tensor] | None = None
+		self.scale_level: int = 0
+		self.scale_strides: list[int] = [1]
 		self.model_depth: int | None = None
 		self.seed_ext_sample_hw: tuple[int, int] | None = None
 		self.seed_model_quad: tuple[int, int, int] | None = None
@@ -417,6 +422,11 @@ class _MapInitState:
 		if self.active_quad is None:
 			return 0
 		return int(self.active_quad.sum().detach().cpu())
+
+	def current_stride(self) -> int:
+		if 0 <= int(self.scale_level) < len(self.scale_strides):
+			return int(self.scale_strides[int(self.scale_level)])
+		return 1
 
 
 class _SurfaceState:
@@ -3034,6 +3044,73 @@ def _map_init_external_vertex_coords(ext_xyz: torch.Tensor) -> torch.Tensor:
 	return torch.stack([hh, ww], dim=-1)
 
 
+def _map_init_dyadic_strides(
+	h_ext: int,
+	w_ext: int,
+	*,
+	requested_levels: int,
+	scale_factor: int = 2,
+) -> list[int]:
+	levels = max(1, int(requested_levels))
+	if levels > 1 and int(scale_factor) != 2:
+		raise ValueError("map-init dyadic pyramid requires scale_factor=2 when scale_levels > 1")
+	qh = max(0, int(h_ext) - 1)
+	qw = max(0, int(w_ext) - 1)
+	out: list[int] = []
+	for level in range(levels):
+		stride = 1 << int(level)
+		if qh % stride != 0 or qw % stride != 0:
+			break
+		out.append(stride)
+	if not out:
+		out.append(1)
+	return out
+
+
+def _map_init_dyadic_level_shape(h_ext: int, w_ext: int, level: int) -> tuple[int, int]:
+	stride = 1 << int(level)
+	qh = max(0, int(h_ext) - 1)
+	qw = max(0, int(w_ext) - 1)
+	if qh % stride != 0 or qw % stride != 0:
+		raise ValueError(f"external quad grid {(qh, qw)} is not divisible by dyadic stride {stride}")
+	return qh // stride + 1, qw // stride + 1
+
+
+def _map_init_dyadic_level_coords(
+	ext_xyz: torch.Tensor,
+	level: int,
+) -> torch.Tensor:
+	H, W = _map_init_dyadic_level_shape(int(ext_xyz.shape[0]), int(ext_xyz.shape[1]), int(level))
+	stride = 1 << int(level)
+	hh = (torch.arange(H, device=ext_xyz.device, dtype=ext_xyz.dtype) * float(stride)).view(H, 1).expand(H, W)
+	ww = (torch.arange(W, device=ext_xyz.device, dtype=ext_xyz.dtype) * float(stride)).view(1, W).expand(H, W)
+	return torch.stack([hh, ww], dim=-1)
+
+
+def _map_init_dyadic_level_quad_valid(
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	level: int,
+) -> torch.Tensor:
+	full = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	stride = 1 << int(level)
+	if stride == 1:
+		return full
+	QH, QW = int(full.shape[0]), int(full.shape[1])
+	if QH == 0 or QW == 0:
+		return torch.zeros(QH // stride, QW // stride, device=ext_valid.device, dtype=torch.bool)
+	if QH % stride != 0 or QW % stride != 0:
+		raise ValueError(f"external quad grid {(QH, QW)} is not divisible by dyadic stride {stride}")
+	x = full.to(dtype=torch.float32).reshape(1, 1, QH, QW)
+	pooled = F.avg_pool2d(x, kernel_size=stride, stride=stride).reshape(QH // stride, QW // stride)
+	return pooled >= 1.0
+
+
+def _map_init_dyadic_level_vertex_valid(ext_valid: torch.Tensor, level: int) -> torch.Tensor:
+	stride = 1 << int(level)
+	return ext_valid[::stride, ::stride].bool()
+
+
 def _map_init_external_quad_valid(
 	ext_valid: torch.Tensor,
 	ext_quad_valid: torch.Tensor | None,
@@ -3096,6 +3173,57 @@ def _map_init_bilerp_quad(
 	)
 
 
+def _map_init_ext_quad_valid_at_coords(
+	ext_quad_valid: torch.Tensor | None,
+	coords: torch.Tensor,
+	shape: tuple[int, int],
+) -> torch.Tensor:
+	if coords.numel() == 0:
+		return torch.zeros(coords.shape[:-1], device=coords.device, dtype=torch.bool)
+	H, W = int(shape[0]), int(shape[1])
+	if H < 2 or W < 2:
+		return torch.zeros(coords.shape[:-1], device=coords.device, dtype=torch.bool)
+	if ext_quad_valid is None or tuple(ext_quad_valid.shape) != (H - 1, W - 1):
+		return torch.ones(coords.shape[:-1], device=coords.device, dtype=torch.bool)
+	flat = coords.reshape(-1, 2)
+	finite = torch.isfinite(flat).all(dim=-1)
+	safe = torch.where(torch.isfinite(flat), flat, torch.zeros_like(flat))
+	h = safe[:, 0]
+	w = safe[:, 1]
+	in_bounds = finite & (h >= 0.0) & (h <= float(H - 1)) & (w >= 0.0) & (w <= float(W - 1))
+	h0 = torch.floor(h.clamp(0.0, float(H - 1))).clamp(0, H - 2).long()
+	w0 = torch.floor(w.clamp(0.0, float(W - 1))).clamp(0, W - 2).long()
+	ok = ext_quad_valid.bool()[h0, w0] & in_bounds
+	return ok.reshape(coords.shape[:-1])
+
+
+def _map_init_level_external_tensors(
+	*,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	ext_coords: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+	if ext_coords is None:
+		return ext_pos, ext_normals, ext_valid.bool(), ext_quad_valid
+	safe = torch.where(torch.isfinite(ext_coords), ext_coords, torch.zeros_like(ext_coords))
+	pos = _sample_surface_grid(ext_pos, safe)
+	n_raw = _sample_surface_grid(ext_normals, safe)
+	normals = F.normalize(n_raw, dim=-1, eps=1.0e-8)
+	valid = (
+		torch.isfinite(ext_coords).all(dim=-1) &
+		_quad_valid_at_coords(ext_valid.bool(), safe, tuple(int(v) for v in ext_valid.shape)) &
+		_map_init_ext_quad_valid_at_coords(ext_quad_valid, safe, tuple(int(v) for v in ext_valid.shape)) &
+		torch.isfinite(pos).all(dim=-1) &
+		torch.isfinite(n_raw).all(dim=-1) &
+		torch.isfinite(normals).all(dim=-1) &
+		(normals.norm(dim=-1) > 1.0e-8)
+	)
+	level_quad_valid = _map_init_quad_corner_all(valid)
+	return pos, normals, valid, level_quad_valid
+
+
 def _map_init_quad_sample_tensors(
 	*,
 	uv_full: torch.Tensor,
@@ -3103,6 +3231,7 @@ def _map_init_quad_sample_tensors(
 	ext_normals: torch.Tensor,
 	ext_valid: torch.Tensor,
 	ext_quad_valid: torch.Tensor | None,
+	ext_coords: torch.Tensor | None = None,
 	quad_hw: torch.Tensor,
 	subdiv: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3127,22 +3256,39 @@ def _map_init_quad_sample_tensors(
 		uv_full[qh + 1, qw + 1],
 		offsets,
 	)
-	ext_samples = _map_init_bilerp_quad(
-		ext_pos[qh, qw],
-		ext_pos[qh + 1, qw],
-		ext_pos[qh, qw + 1],
-		ext_pos[qh + 1, qw + 1],
-		offsets.to(dtype=ext_pos.dtype),
-	)
-	n_raw = _map_init_bilerp_quad(
-		ext_normals[qh, qw],
-		ext_normals[qh + 1, qw],
-		ext_normals[qh, qw + 1],
-		ext_normals[qh + 1, qw + 1],
-		offsets.to(dtype=ext_normals.dtype),
-	)
+	if ext_coords is None:
+		ext_samples = _map_init_bilerp_quad(
+			ext_pos[qh, qw],
+			ext_pos[qh + 1, qw],
+			ext_pos[qh, qw + 1],
+			ext_pos[qh + 1, qw + 1],
+			offsets.to(dtype=ext_pos.dtype),
+		)
+		n_raw = _map_init_bilerp_quad(
+			ext_normals[qh, qw],
+			ext_normals[qh + 1, qw],
+			ext_normals[qh, qw + 1],
+			ext_normals[qh + 1, qw + 1],
+			offsets.to(dtype=ext_normals.dtype),
+		)
+		quad_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)[qh, qw]
+	else:
+		sample_coords = _map_init_bilerp_quad(
+			ext_coords[qh, qw],
+			ext_coords[qh + 1, qw],
+			ext_coords[qh, qw + 1],
+			ext_coords[qh + 1, qw + 1],
+			offsets.to(dtype=ext_coords.dtype),
+		)
+		safe_coords = torch.where(torch.isfinite(sample_coords), sample_coords, torch.zeros_like(sample_coords))
+		ext_samples = _sample_surface_grid(ext_pos, safe_coords)
+		n_raw = _sample_surface_grid(ext_normals, safe_coords)
+		quad_valid = (
+			torch.isfinite(sample_coords).all(dim=-1) &
+			_quad_valid_at_coords(ext_valid.bool(), safe_coords, tuple(int(v) for v in ext_valid.shape)) &
+			_map_init_ext_quad_valid_at_coords(ext_quad_valid, safe_coords, tuple(int(v) for v in ext_valid.shape))
+		).all(dim=1)
 	n_samples = F.normalize(n_raw, dim=-1, eps=1.0e-8)
-	quad_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)[qh, qw]
 	quad_uv_ok = (
 		torch.isfinite(uv_full[qh, qw]).all(dim=-1) &
 		torch.isfinite(uv_full[qh + 1, qw]).all(dim=-1) &
@@ -3185,6 +3331,7 @@ def _map_init_candidate_quad_samples_ok(
 	ext_normals: torch.Tensor,
 	ext_valid: torch.Tensor,
 	ext_quad_valid: torch.Tensor | None,
+	ext_coords: torch.Tensor | None = None,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	model_depth: int,
@@ -3196,6 +3343,7 @@ def _map_init_candidate_quad_samples_ok(
 		ext_normals=ext_normals,
 		ext_valid=ext_valid,
 		ext_quad_valid=ext_quad_valid,
+		ext_coords=ext_coords,
 		quad_hw=quad_hw,
 		subdiv=int(cfg.map_init.subdiv),
 	)
@@ -3262,6 +3410,149 @@ def _map_init_integrate_uv_pyr(pyr: torch.nn.ParameterList) -> torch.Tensor:
 	for d in reversed(pyr[:-1]):
 		v = F.interpolate(v, size=(int(d.shape[2]), int(d.shape[3])), mode="bilinear", align_corners=True) + d
 	return v.permute(0, 2, 3, 1).squeeze(0).contiguous()
+
+
+def _map_init_make_zero_uv_pyramid(
+	*,
+	ext_xyz: torch.Tensor,
+	strides: list[int],
+	dtype: torch.dtype,
+) -> list[torch.Tensor]:
+	pyr: list[torch.Tensor] = []
+	for level, _stride in enumerate(strides):
+		H, W = _map_init_dyadic_level_shape(int(ext_xyz.shape[0]), int(ext_xyz.shape[1]), int(level))
+		pyr.append(torch.zeros(1, 2, H, W, device=ext_xyz.device, dtype=dtype))
+	return pyr
+
+
+def _map_init_integrate_dyadic_uv_pyramid(
+	pyr: list[torch.Tensor],
+	*,
+	active_level: int = 0,
+) -> torch.Tensor:
+	if not pyr:
+		raise ValueError("empty map-init UV pyramid")
+	level = int(active_level)
+	if level < 0 or level >= len(pyr):
+		raise ValueError(f"active_level {level} outside pyramid with {len(pyr)} levels")
+	v = pyr[-1]
+	for i in range(len(pyr) - 2, level - 1, -1):
+		v = F.interpolate(v, size=(int(pyr[i].shape[2]), int(pyr[i].shape[3])), mode="bilinear", align_corners=True) + pyr[i]
+	return v.permute(0, 2, 3, 1).squeeze(0).contiguous()
+
+
+def _map_init_integrate_dyadic_uv_to_nchw(
+	pyr: list[torch.Tensor],
+	*,
+	active_level: int,
+) -> torch.Tensor:
+	return _map_init_integrate_dyadic_uv_pyramid(pyr, active_level=active_level).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+
+def _map_init_coarser_dyadic_uv_nchw(
+	pyr: list[torch.Tensor],
+	*,
+	level: int,
+) -> torch.Tensor:
+	if not pyr:
+		raise ValueError("empty map-init UV pyramid")
+	level_i = int(level)
+	if level_i == len(pyr) - 1:
+		return torch.zeros_like(pyr[level_i])
+	coarse = _map_init_integrate_dyadic_uv_to_nchw(pyr, active_level=level_i + 1)
+	return F.interpolate(coarse, size=(int(pyr[level_i].shape[2]), int(pyr[level_i].shape[3])), mode="bilinear", align_corners=True)
+
+
+def _map_init_sync_current_uv_to_pyramid(state: _MapInitState) -> None:
+	if state.uv_pyramid is None or state.uv is None:
+		return
+	level = int(state.scale_level)
+	if level < 0 or level >= len(state.uv_pyramid):
+		return
+	current = _map_init_integrate_dyadic_uv_pyramid(state.uv_pyramid, active_level=level)
+	valid = torch.isfinite(state.uv).all(dim=-1)
+	updated = torch.where(valid.unsqueeze(-1), state.uv.detach(), current.detach())
+	coarse_up = _map_init_coarser_dyadic_uv_nchw(state.uv_pyramid, level=level)
+	state.uv_pyramid[level] = updated.permute(2, 0, 1).unsqueeze(0).contiguous().detach() - coarse_up.detach()
+
+
+def _map_init_mask_current_uv(state: _MapInitState, uv: torch.Tensor, cfg: SnapSurfConfig) -> torch.Tensor:
+	if bool(cfg.map_init.dense_opt):
+		return uv
+	active = state.active_quad
+	if active is None:
+		return uv
+	active_vertex = _map_init_active_vertex_mask(active, tuple(int(v) for v in uv.shape[:2]))
+	return torch.where(active_vertex.unsqueeze(-1), uv, torch.full_like(uv, float("nan")))
+
+
+def _map_init_refresh_current_uv_from_pyramid(state: _MapInitState, cfg: SnapSurfConfig) -> None:
+	if state.uv_pyramid is None:
+		return
+	uv = _map_init_integrate_dyadic_uv_pyramid(state.uv_pyramid, active_level=int(state.scale_level)).detach()
+	state.uv = _map_init_mask_current_uv(state, uv, cfg)
+
+
+def _map_init_set_current_level_external_coords(state: _MapInitState) -> None:
+	if state.ext_pos is None:
+		state.ext_coords = None
+		return
+	state.ext_coords = _map_init_dyadic_level_coords(state.ext_pos, int(state.scale_level)).detach()
+
+
+def _map_init_repeat_quads_to_finer(active_quad: torch.Tensor) -> torch.Tensor:
+	if active_quad.numel() == 0:
+		return torch.zeros(
+			int(active_quad.shape[0]) * 2,
+			int(active_quad.shape[1]) * 2,
+			device=active_quad.device,
+			dtype=torch.bool,
+		)
+	return active_quad.bool().repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
+
+
+def _map_init_transition_to_finer(state: _SurfaceState, cfg: SnapSurfConfig) -> bool:
+	mi = state.map_init
+	if mi.uv_pyramid is None or mi.active_quad is None or int(mi.scale_level) <= 0:
+		return False
+	_map_init_sync_current_uv_to_pyramid(mi)
+	old_level = int(mi.scale_level)
+	old_stride = mi.current_stride()
+	mi.scale_level = old_level - 1
+	mi.active_quad = _map_init_repeat_quads_to_finer(mi.active_quad)
+	mi.blocked_quad = torch.zeros_like(mi.active_quad, dtype=torch.bool)
+	mi.blocked_last_revisit_iter = int(mi.total_iters)
+	_map_init_set_current_level_external_coords(mi)
+	_map_init_refresh_current_uv_from_pyramid(mi, cfg)
+	_map_init_log(
+		"scale transition "
+		f"level={old_level}->{mi.scale_level} "
+		f"stride={old_stride}->{mi.current_stride()} "
+		f"active={mi.active_count()} "
+		f"uv_shape={tuple(int(v) for v in mi.uv.shape[:2]) if mi.uv is not None else None}"
+	)
+	return True
+
+
+def _map_init_finalize_dyadic_state(state: _SurfaceState, cfg: SnapSurfConfig) -> None:
+	mi = state.map_init
+	if mi.uv_pyramid is None or mi.active_quad is None:
+		return
+	_map_init_sync_current_uv_to_pyramid(mi)
+	while int(mi.scale_level) > 0:
+		old_level = int(mi.scale_level)
+		mi.scale_level = old_level - 1
+		mi.active_quad = _map_init_repeat_quads_to_finer(mi.active_quad)
+		mi.blocked_quad = torch.zeros_like(mi.active_quad, dtype=torch.bool)
+		_map_init_set_current_level_external_coords(mi)
+		_map_init_refresh_current_uv_from_pyramid(mi, cfg)
+		_map_init_sync_current_uv_to_pyramid(mi)
+	uv_full = _map_init_integrate_dyadic_uv_pyramid(mi.uv_pyramid, active_level=0).detach()
+	mi.scale_level = 0
+	_map_init_set_current_level_external_coords(mi)
+	mi.uv = _map_init_mask_current_uv(mi, uv_full, cfg)
+	if mi.blocked_quad is None or tuple(mi.blocked_quad.shape) != tuple(mi.active_quad.shape):
+		mi.blocked_quad = torch.zeros_like(mi.active_quad, dtype=torch.bool)
 
 
 def _map_init_uv_pyr_from_masked(
@@ -3370,7 +3661,6 @@ def _map_init_refresh_uv_guess(
 	active_vertex = _map_init_active_vertex_mask(state.map_init.active_quad, tuple(int(v) for v in state.map_init.uv.shape[:2]))
 	if not cfg.map_init.dense_opt:
 		state.map_init.uv_guess = None
-		state.map_init.scale_levels_used = 1
 		return
 	if cfg.map_init.dense_opt and bool(uv_finite.all().detach().cpu()):
 		state.map_init.uv_guess = _map_init_clamp_uv(
@@ -3378,16 +3668,9 @@ def _map_init_refresh_uv_guess(
 			model_h=H,
 			model_w=W,
 		)
-		state.map_init.scale_levels_used = len(_map_init_scale_shapes(
-			int(state.map_init.uv.shape[0]),
-			int(state.map_init.uv.shape[1]),
-			levels=int(cfg.map_init.scale_levels),
-			factor=int(cfg.map_init.scale_factor),
-		))
 		return
 	if int(cfg.map_init.scale_levels) <= 1:
 		state.map_init.uv_guess = None
-		state.map_init.scale_levels_used = 1
 		return
 	state.map_init.uv_guess = _map_init_scalespace_inpaint_uv(
 		state.map_init.uv,
@@ -3396,12 +3679,6 @@ def _map_init_refresh_uv_guess(
 		model_h=H,
 		model_w=W,
 	).detach()
-	state.map_init.scale_levels_used = len(_map_init_scale_shapes(
-		int(state.map_init.uv.shape[0]),
-		int(state.map_init.uv.shape[1]),
-		levels=int(cfg.map_init.scale_levels),
-		factor=int(cfg.map_init.scale_factor),
-	))
 
 
 def _map_init_dense_seed_uv(
@@ -3945,6 +4222,7 @@ def _map_init_objective(
 	ext_normals: torch.Tensor,
 	ext_valid: torch.Tensor,
 	ext_quad_valid: torch.Tensor | None = None,
+	ext_coords: torch.Tensor | None = None,
 	model_xyz: torch.Tensor,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
@@ -3957,6 +4235,13 @@ def _map_init_objective(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
+	ext_vertex_pos, _ext_vertex_normals, ext_vertex_valid, ext_level_quad_valid = _map_init_level_external_tensors(
+		ext_pos=ext_pos,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		ext_coords=ext_coords,
+	)
 	uv_finite = torch.isfinite(uv_full).all(dim=-1)
 	active_quad = active_quad.bool()
 	active_count = int(active_quad.sum().detach().cpu())
@@ -3978,6 +4263,7 @@ def _map_init_objective(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=ext_coords,
 			quad_hw=quad_hw,
 			subdiv=int(mi.subdiv),
 		)
@@ -4066,8 +4352,8 @@ def _map_init_objective(
 
 	reg_finite, reg_quad = _map_init_regularization_masks(
 		active_quad=active_quad,
-		ext_valid=ext_valid,
-		ext_quad_valid=ext_quad_valid,
+		ext_valid=ext_vertex_valid,
+		ext_quad_valid=ext_level_quad_valid,
 		uv_finite=uv_finite,
 		cfg=mi,
 	)
@@ -4088,8 +4374,8 @@ def _map_init_objective(
 	uv_fwd_terms = _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z)
 	model_raw_fwd_terms = _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z)
 	physical_ref2 = _map_init_reference_edge_square(
-		ext_pos,
-		torch.isfinite(ext_pos).all(dim=-1),
+		ext_vertex_pos,
+		torch.isfinite(ext_vertex_pos).all(dim=-1) & ext_vertex_valid,
 		reg_quad,
 		z,
 	)
@@ -4114,7 +4400,7 @@ def _map_init_objective(
 	)
 	even_terms = _map_init_local_evenness_terms(
 		uv_safe,
-		ext_pos,
+		ext_vertex_pos,
 		reg_quad,
 		metric_pos=model_metric_pos,
 		metric_valid=model_metric_valid,
@@ -4233,6 +4519,7 @@ def _map_init_estimate_normal_sign(
 	ext_normals: torch.Tensor,
 	ext_valid: torch.Tensor,
 	ext_quad_valid: torch.Tensor | None,
+	ext_coords: torch.Tensor | None = None,
 	model_normals: torch.Tensor,
 	model_depth: int,
 	subdiv: int,
@@ -4246,6 +4533,7 @@ def _map_init_estimate_normal_sign(
 		ext_normals=ext_normals,
 		ext_valid=ext_valid,
 		ext_quad_valid=ext_quad_valid,
+		ext_coords=ext_coords,
 		quad_hw=quad_hw,
 		subdiv=int(subdiv),
 	)
@@ -4291,14 +4579,36 @@ def _map_init_seed_state(
 		subdiv=mi.subdiv,
 	)
 	H_ext, W_ext = int(ext_xyz.shape[0]), int(ext_xyz.shape[1])
-	state.map_init.ext_coords = _map_init_external_vertex_coords(ext_xyz).detach()
 	state.map_init.ext_pos = ext_xyz.detach()
 	state.map_init.ext_normals = ext_normals.detach()
 	state.map_init.ext_valid = ext_valid.detach()
 	state.map_init.ext_quad_valid = ext_quad_valid.detach()
-	state.map_init.active_quad = torch.zeros(max(0, H_ext - 1), max(0, W_ext - 1), device=model_xyz.device, dtype=torch.bool)
+	strides = _map_init_dyadic_strides(
+		H_ext,
+		W_ext,
+		requested_levels=int(mi.scale_levels),
+		scale_factor=int(mi.scale_factor),
+	)
+	if len(strides) != int(mi.scale_levels):
+		_map_init_log(
+			"dyadic levels clamped "
+			f"requested={int(mi.scale_levels)} "
+			f"usable={len(strides)} "
+			f"quad_shape={(max(0, H_ext - 1), max(0, W_ext - 1))}"
+		)
+	state.map_init.scale_strides = strides
+	state.map_init.scale_levels_used = len(strides)
+	state.map_init.scale_level = len(strides) - 1
+	state.map_init.uv_pyramid = _map_init_make_zero_uv_pyramid(
+		ext_xyz=ext_xyz,
+		strides=strides,
+		dtype=model_xyz.dtype,
+	)
+	_map_init_set_current_level_external_coords(state.map_init)
+	level_H, level_W = _map_init_dyadic_level_shape(H_ext, W_ext, int(state.map_init.scale_level))
+	state.map_init.active_quad = torch.zeros(max(0, level_H - 1), max(0, level_W - 1), device=model_xyz.device, dtype=torch.bool)
 	state.map_init.blocked_quad = torch.zeros_like(state.map_init.active_quad)
-	state.map_init.uv = torch.full((H_ext, W_ext, 2), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
+	state.map_init.uv = torch.full((level_H, level_W, 2), float("nan"), device=model_xyz.device, dtype=model_xyz.dtype)
 	if not bool(sample_valid.any().detach().cpu()):
 		return False, float("inf"), float("inf"), 0
 
@@ -4350,7 +4660,13 @@ def _map_init_seed_state(
 		return False, float("inf"), seed_ext_dist, 0
 	flat_coords = vertex_coords.reshape(-1, 2)
 	query = torch.cat([flat_coords, torch.ones(flat_coords.shape[0], 1, device=model_xyz.device, dtype=model_xyz.dtype)], dim=1)
-	uv_all = (query @ sol).reshape(H_ext, W_ext, 2)
+	uv_all = _map_init_clamp_uv(
+		(query @ sol).reshape(level_H, level_W, 2),
+		model_h=int(model_valid.shape[1]),
+		model_w=int(model_valid.shape[2]),
+	)
+	if state.map_init.uv_pyramid is not None:
+		state.map_init.uv_pyramid[int(state.map_init.scale_level)] = uv_all.permute(2, 0, 1).unsqueeze(0).contiguous().detach()
 	seed_source_hw = src
 	orientation_sign = 1 if cfg.orientation in {"identity", "none"} else _affine_det_sign_from_points(
 		seed_source_hw,
@@ -4358,16 +4674,20 @@ def _map_init_seed_state(
 		fallback=fallback_sign,
 	)
 	r = max(0, int(mi.seed_radius))
-	quad_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	level = int(state.map_init.scale_level)
+	stride = int(state.map_init.current_stride())
+	quad_valid = _map_init_dyadic_level_quad_valid(ext_valid, ext_quad_valid, level)
 	QH, QW = int(quad_valid.shape[0]), int(quad_valid.shape[1])
+	eh_level = max(0, min(max(0, QH - 1), int(eh) // max(1, stride)))
+	ew_level = max(0, min(max(0, QW - 1), int(ew) // max(1, stride)))
 	hh = torch.arange(QH, device=model_xyz.device).view(QH, 1)
 	ww = torch.arange(QW, device=model_xyz.device).view(1, QW)
 	active_quad = (
 		quad_valid &
-		(hh >= eh - r) &
-		(hh <= eh + r) &
-		(ww >= ew - r) &
-		(ww <= ew + r)
+		(hh >= eh_level - r) &
+		(hh <= eh_level + r) &
+		(ww >= ew_level - r) &
+		(ww <= ew_level + r)
 	)
 	cand_hw = active_quad.nonzero(as_tuple=False)
 	if int(cand_hw.shape[0]) > 0:
@@ -4378,14 +4698,15 @@ def _map_init_seed_state(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(d),
 			cfg=cfg,
 		)
 		active_quad[cand_hw[:, 0], cand_hw[:, 1]] = ok_quad
-	if not bool(active_quad.any().detach().cpu()) and 0 <= eh < QH and 0 <= ew < QW:
-		seed_quad_hw = torch.tensor([[eh, ew]], device=model_xyz.device, dtype=torch.long)
+	if not bool(active_quad.any().detach().cpu()) and 0 <= eh_level < QH and 0 <= ew_level < QW:
+		seed_quad_hw = torch.tensor([[eh_level, ew_level]], device=model_xyz.device, dtype=torch.long)
 		seed_ok = bool(_map_init_candidate_quad_samples_ok(
 			uv_full=uv_all,
 			quad_hw=seed_quad_hw,
@@ -4393,12 +4714,13 @@ def _map_init_seed_state(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(d),
 			cfg=cfg,
 		)[0].detach().cpu())
-		active_quad[eh, ew] = seed_ok
+		active_quad[eh_level, ew_level] = seed_ok
 	if bool(active_quad.any().detach().cpu()):
 		active_quad = active_quad & _map_init_quad_corner_all(_map_init_model_coord_ok(
 			uv_all,
@@ -4408,10 +4730,11 @@ def _map_init_seed_state(
 		))
 	if not bool(active_quad.any().detach().cpu()):
 		return False, float(seed_model_dist), seed_ext_dist, 0
-	vertex_active = _map_init_active_vertex_mask(active_quad, (H_ext, W_ext))
 	state.map_init.active_quad = active_quad.detach()
 	state.map_init.blocked_quad = torch.zeros_like(active_quad, dtype=torch.bool)
-	state.map_init.uv = torch.where(vertex_active.unsqueeze(-1), uv_all.detach(), torch.full_like(uv_all, float("nan")))
+	state.map_init.uv = _map_init_mask_current_uv(state.map_init, uv_all.detach(), cfg)
+	_map_init_sync_current_uv_to_pyramid(state.map_init)
+	_map_init_refresh_current_uv_from_pyramid(state.map_init, cfg)
 	state.map_init.model_depth = int(d)
 	state.map_init.seed_ext_sample_hw = (seed_h, seed_w)
 	state.map_init.seed_model_quad = model_quad
@@ -4420,13 +4743,14 @@ def _map_init_seed_state(
 		active_quad=active_quad,
 		uv=uv_all,
 		ext_pos=ext_xyz,
-			ext_normals=ext_normals,
-			ext_valid=ext_valid,
-			ext_quad_valid=ext_quad_valid,
-			model_normals=model_normals,
-			model_depth=int(d),
-			subdiv=int(mi.subdiv),
-		)
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		ext_coords=state.map_init.ext_coords,
+		model_normals=model_normals,
+		model_depth=int(d),
+		subdiv=int(mi.subdiv),
+	)
 	init_count = int(active_quad.sum().detach().cpu())
 	state.map_init.added_total = init_count
 	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
@@ -4453,7 +4777,7 @@ def _map_init_grow_once(
 		return 0
 	if not bool(active.any().detach().cpu()):
 		return 0
-	quad_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	quad_valid = _map_init_dyadic_level_quad_valid(ext_valid, ext_quad_valid, int(state.map_init.scale_level))
 	blocked = state.map_init.blocked_quad
 	if blocked is None or tuple(blocked.shape) != tuple(active.shape):
 		blocked = torch.zeros_like(active, dtype=torch.bool)
@@ -4527,6 +4851,7 @@ def _map_init_grow_once(
 			cfg=cfg,
 		)
 	candidate_possible = candidate_seed
+	candidate_sample_reject = torch.zeros_like(candidate_seed, dtype=torch.bool)
 	if bool(candidate_possible.any().detach().cpu()):
 		possible_hw = candidate_possible.nonzero(as_tuple=False)
 		possible_ok = _map_init_candidate_quad_samples_ok(
@@ -4536,6 +4861,7 @@ def _map_init_grow_once(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
@@ -4543,6 +4869,9 @@ def _map_init_grow_once(
 		)
 		filtered = torch.zeros_like(candidate_possible, dtype=torch.bool)
 		filtered[possible_hw[:, 0], possible_hw[:, 1]] = possible_ok
+		if bool((~possible_ok).any().detach().cpu()):
+			bad_hw = possible_hw[~possible_ok]
+			candidate_sample_reject[bad_hw[:, 0], bad_hw[:, 1]] = True
 		candidate_possible = filtered
 	if (
 		not bool(mi.dense_opt) and model_xyz is not None and int(mi.candidate_opt_iters) > 0 and
@@ -4580,7 +4909,7 @@ def _map_init_grow_once(
 					)
 				)
 			)
-			candidate_possible = candidate & _map_init_quad_corner_all(pred_ok_grid)
+			candidate_possible = candidate & _map_init_quad_corner_all(pred_ok_grid) & ~candidate_sample_reject
 			_map_init_log_fringe_debug(
 				state=state.map_init,
 				phase="cand",
@@ -4599,7 +4928,7 @@ def _map_init_grow_once(
 				cfg=cfg,
 			)
 	active_new = active.clone()
-	blocked_new = blocked.clone()
+	blocked_new = blocked.clone() | candidate_sample_reject
 	uv_new = uv.clone()
 	added = 0
 	rejected = 0
@@ -4632,6 +4961,7 @@ def _map_init_grow_once(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
@@ -4721,6 +5051,8 @@ def _map_init_grow_once(
 	state.map_init.active_quad = active_new
 	state.map_init.blocked_quad = blocked_new
 	state.map_init.uv = uv_new
+	_map_init_sync_current_uv_to_pyramid(state.map_init)
+	_map_init_refresh_current_uv_from_pyramid(state.map_init, cfg)
 	state.map_init.added_total += added
 	if added > 0:
 		state.map_init.grow_steps += 1
@@ -4843,6 +5175,7 @@ def _map_init_log_fringe_debug(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.ext_coords,
 			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
@@ -4854,7 +5187,7 @@ def _map_init_log_fringe_debug(
 	if int(state.fringe_debug_rows) % 20 == 0:
 		_map_init_log("map-init block columns")
 		print(
-			f"{'map':>3s} {'ph':>6s} {'blk':>3s} {'it':>9s} {'quad':>5s} "
+			f"{'map':>3s} {'ph':>6s} {'sc':>2s} {'st':>3s} {'res':>7s} {'blk':>3s} {'it':>9s} {'quad':>5s} "
 			f"{'smp':>6s} {'succ':>6s} {'sloss':>7s} {'badq':>9s} "
 			f"{'loss':>7s} {'dst':>7s} {'vec':>7s} {'nrm':>7s} "
 			f"{'smo':>7s} {'bnd':>7s} {'jac':>7s} {'met':>7s} "
@@ -4869,8 +5202,9 @@ def _map_init_log_fringe_debug(
 		f"{_map_init_term_float(terms, 'jac_bad_quad'):.0f}/"
 		f"{_map_init_term_float(terms, 'jac_inv_bad_quad'):.0f}"
 	)
+	res_label = f"{int(uv_full.shape[0])}x{int(uv_full.shape[1])}"
 	print(
-		f"{'map':>3s} {str(phase)[:6]:>6s} {int(block):3d} "
+		f"{'map':>3s} {str(phase)[:6]:>6s} {int(state.scale_level):2d} {int(state.current_stride()):3d} {res_label:>7s} {int(block):3d} "
 		f"{int(iter_idx):4d}/{int(cfg.map_init.iters):<4d} "
 		f"{int(active_quad.sum().detach().cpu()):5d} "
 		f"{_map_init_term_float(terms, 'sample_valid'):6.0f} "
@@ -4912,6 +5246,9 @@ def _map_init_print_progress_legend() -> None:
 	items = (
 		("mi", "map init"),
 		("ph", "add/fringe/grow"),
+		("sc", "scale level"),
+		("st", "dyadic stride"),
+		("res", "scale vertices"),
 		("blk", "opt block"),
 		("it", "iter/total"),
 		("it/s", "opt it/s"),
@@ -4968,7 +5305,7 @@ def _map_init_log_progress(
 	if int(state.progress_rows) % 20 == 0:
 		_map_init_print_progress_legend()
 		print(
-			f"{'mi':>2s} {'ph':>6s} {'blk':>3s} {'it':>9s} {'it/s':>6s} "
+			f"{'mi':>2s} {'ph':>6s} {'sc':>2s} {'st':>3s} {'res':>7s} {'blk':>3s} {'it':>9s} {'it/s':>6s} "
 			f"{'act':>5s} {'blkq':>5s} {'spr':>5s} {'smp':>6s} {'bad':>9s} "
 			f"{'aloss':>7s} {'asuc':>6s} {'floss':>7s} {'fsuc':>6s} "
 			f"{'loss':>7s} {'dist':>7s} {'metr':>7s} {'area':>7s} "
@@ -4983,8 +5320,11 @@ def _map_init_log_progress(
 	)
 	add_loss, add_success = _map_init_interval_phase_stats(state, "add")
 	fringe_loss, fringe_success = _map_init_interval_phase_stats(state, "fringe")
+	res_label = "?"
+	if state.uv is not None:
+		res_label = f"{int(state.uv.shape[0])}x{int(state.uv.shape[1])}"
 	print(
-		f"{'mi':>2s} {str(mode)[:6]:>6s} {int(block):3d} "
+		f"{'mi':>2s} {str(mode)[:6]:>6s} {int(state.scale_level):2d} {int(state.current_stride()):3d} {res_label:>7s} {int(block):3d} "
 		f"{int(iter_idx):4d}/{int(iter_total):<4d} "
 		f"{_map_init_fmt_val(it_s):>6s} "
 		f"{int(active_count):5d} "
@@ -5126,6 +5466,7 @@ def _map_init_prune_bad_active_quads(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
@@ -5161,6 +5502,8 @@ def _map_init_prune_bad_active_quads(
 		state.map_init.uv = torch.where(active_vertices.unsqueeze(-1), uv_new, torch.full_like(uv_new, float("nan")))
 	else:
 		state.map_init.uv = uv_new
+	_map_init_sync_current_uv_to_pyramid(state.map_init)
+	_map_init_refresh_current_uv_from_pyramid(state.map_init, cfg)
 	sample_count = int((bad & sample_bad).sum().detach().cpu())
 	fold_count = int((bad & folded_bad).sum().detach().cpu())
 	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
@@ -5198,6 +5541,7 @@ def _map_init_reject_bad_new_quads(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
@@ -5284,6 +5628,7 @@ def _map_init_optimize_vertex_mask(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
@@ -5326,6 +5671,7 @@ def _map_init_optimize_vertex_mask(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
@@ -5397,6 +5743,7 @@ def _map_init_optimize_vertex_mask(
 		ext_normals=ext_normals,
 		ext_valid=ext_valid,
 		ext_quad_valid=ext_quad_valid,
+		ext_coords=state.map_init.ext_coords,
 		model_xyz=model_xyz,
 		model_valid=model_valid,
 		model_normals=model_normals,
@@ -5413,6 +5760,8 @@ def _map_init_optimize_vertex_mask(
 		_map_init_accumulate_phase_stats(state.map_init, mode, last_terms)
 	if commit:
 		state.map_init.uv = uv_full.detach()
+		_map_init_sync_current_uv_to_pyramid(state.map_init)
+		_map_init_refresh_current_uv_from_pyramid(state.map_init, cfg)
 		if refresh_guess:
 			_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
 	return uv_full.detach(), last_terms
@@ -5466,33 +5815,16 @@ def _map_init_optimize_block(
 	if dense_mode:
 		dense_seed = _map_init_dense_seed_uv(state, model_valid=model_valid, cfg=cfg)
 		uv_prior = dense_seed.detach().clone()
-		if int(cfg.map_init.scale_levels) > 1:
-			dense_pyr = _map_init_uv_pyr_from_dense(
-				dense_seed,
-				levels=int(cfg.map_init.scale_levels),
-				factor=int(cfg.map_init.scale_factor),
-			)
-			opt_params = list(dense_pyr)
-			param = None
-		else:
-			param = torch.nn.Parameter(dense_seed.detach().clone())
-			dense_pyr = None
-			opt_params = [param]
+		param = torch.nn.Parameter(dense_seed.detach().clone())
+		opt_params = [param]
 	else:
 		param = torch.nn.Parameter(uv[active_vertices].detach().clone())
-		dense_pyr = None
 		opt_params = [param]
 	opt = torch.optim.Adam(opt_params, lr=lr)
 
 	def current_uv_full() -> torch.Tensor:
 		if dense_mode:
-			if dense_pyr is not None:
-				dense_uv = _map_init_integrate_uv_pyr(dense_pyr)
-			else:
-				if param is None:
-					raise RuntimeError("map-init dense optimizer parameter missing")
-				dense_uv = param
-			return _map_init_clamp_uv(dense_uv, model_h=H, model_w=W)
+			return _map_init_clamp_uv(param, model_h=H, model_w=W)
 		if param is None:
 			raise RuntimeError("map-init active optimizer parameter missing")
 		out = base_uv.clone()
@@ -5517,6 +5849,7 @@ def _map_init_optimize_block(
 			ext_normals=ext_normals,
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
+			ext_coords=state.map_init.ext_coords,
 			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
@@ -5590,6 +5923,8 @@ def _map_init_optimize_block(
 				)
 	with torch.no_grad():
 		state.map_init.uv = current_uv_full().detach()
+	_map_init_sync_current_uv_to_pyramid(state.map_init)
+	_map_init_refresh_current_uv_from_pyramid(state.map_init, cfg)
 	state.map_init.total_iters += int(completed)
 	state.map_init.opt_blocks += 1
 	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
@@ -5604,6 +5939,7 @@ def _map_init_optimize_block(
 		ext_normals=ext_normals,
 		ext_valid=ext_valid,
 		ext_quad_valid=ext_quad_valid,
+		ext_coords=state.map_init.ext_coords,
 		model_xyz=model_xyz,
 		model_valid=model_valid,
 		model_normals=model_normals,
@@ -5641,6 +5977,7 @@ def _map_init_eval_terms_for_state(
 		ext_normals=state.map_init.ext_normals,
 		ext_valid=state.map_init.ext_valid,
 		ext_quad_valid=state.map_init.ext_quad_valid,
+		ext_coords=state.map_init.ext_coords,
 		model_xyz=model_xyz,
 		model_valid=model_valid,
 		model_normals=model_normals,
@@ -5870,7 +6207,32 @@ def _run_map_init_for_surface(
 							"continue_growth=1"
 						)
 				if added <= 0 or block <= 0:
+					if int(state.map_init.scale_level) > 0 and _map_init_transition_to_finer(state, cfg):
+						pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
+							state,
+							model_valid=model_valid,
+							model_normals=model_normals,
+							cfg=cfg,
+						)
+						last_terms = _map_init_eval_terms_for_state(
+							state,
+							model_xyz=model_xyz,
+							model_valid=model_valid,
+							model_normals=model_normals,
+							cfg=cfg,
+						)
+						_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
+						_map_init_log(
+							"scale prune "
+							f"level={state.map_init.scale_level} "
+							f"sample={pruned_sample} "
+							f"fold={pruned_fold} "
+							f"sparse={pruned_sparse} "
+							f"active={state.map_init.active_count()}"
+						)
+						continue
 					break
+			_map_init_finalize_dyadic_state(state, cfg)
 			if not last_terms and state.map_init.active_quad is not None and state.map_init.uv is not None:
 				_, last_terms = _map_init_objective(
 					uv_full=state.map_init.uv,
@@ -5879,6 +6241,7 @@ def _run_map_init_for_surface(
 					ext_normals=state.map_init.ext_normals,
 					ext_valid=state.map_init.ext_valid,
 					ext_quad_valid=state.map_init.ext_quad_valid,
+					ext_coords=state.map_init.ext_coords,
 					model_xyz=model_xyz,
 					model_valid=model_valid,
 					model_normals=model_normals,
@@ -5895,6 +6258,7 @@ def _run_map_init_for_surface(
 					ext_normals=state.map_init.ext_normals,
 					ext_valid=state.map_init.ext_valid,
 					ext_quad_valid=state.map_init.ext_quad_valid,
+					ext_coords=state.map_init.ext_coords,
 					model_xyz=model_xyz,
 					model_valid=model_valid,
 					model_normals=model_normals,
