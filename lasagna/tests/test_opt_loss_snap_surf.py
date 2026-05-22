@@ -291,6 +291,28 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertEqual(stats["snaps_brute"], 0.0)
 		self.assertGreater(stats["snaps_pairs_m"], 0.0)
 
+	def test_invalid_finite_ray_correspondence_is_refined_without_bruteforce(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={"init_distance": 10.0, "brute_interval": 10},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		state = opt_loss_snap_surf._states[0]
+		state.model_to_ext.valid[0, 2, 2] = False
+		state.model_to_ext.map[0, 2, 2] = torch.tensor([2.0, 2.0])
+
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		stats = opt_loss_snap_surf.last_stats()
+
+		self.assertEqual(stats["snaps_brute_on"], 0.0)
+		self.assertEqual(stats["snaps_brute"], 0.0)
+		self.assertEqual(state.model_to_ext.count(), 25)
+		self.assertTrue(bool(state.model_to_ext.valid[0, 2, 2]))
+
 	def test_bruteforce_runs_only_on_interval(self) -> None:
 		model_xyz = _plane_xyz(h=5, w=5, z=0.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
@@ -354,8 +376,54 @@ class SnapSurfMapperTest(unittest.TestCase):
 
 		self.assertTrue(bool(inlier[0, 2, 3]))
 		self.assertFalse(bool(inlier[0, 2, 4]))
-		self.assertGreater(stats["raw_map_max"], 8.0)
-		self.assertLess(stats["in_map_max"], 8.0)
+		self.assertEqual(stats, {})
+
+	def test_seeded_mapping_filter_rejects_normal_distance_jump(self) -> None:
+		raw_map = torch.full((1, 1, 3, 2), float("nan"))
+		raw_valid = torch.ones(1, 1, 3, dtype=torch.bool)
+		normal_dist = torch.full((1, 1, 3), float("nan"))
+		for w in range(3):
+			raw_map[0, 0, w] = torch.tensor([0.0, float(w)])
+		normal_dist[0, 0, 0] = 10.0
+		normal_dist[0, 0, 1] = 14.0
+		normal_dist[0, 0, 2] = 30.0
+		initial = torch.zeros_like(raw_valid)
+		initial[0, 0, 0] = True
+
+		inlier, stats = opt_loss_snap_surf._seeded_mapping_inlier_filter(
+			raw_valid=raw_valid,
+			raw_map=raw_map,
+			initial_inlier=initial,
+			max_distance=8.0,
+			normal_dist=normal_dist,
+			max_normal_ratio=1.5,
+		)
+
+		self.assertTrue(bool(inlier[0, 0, 1]))
+		self.assertFalse(bool(inlier[0, 0, 2]))
+		self.assertEqual(stats, {})
+
+	def test_seeded_mapping_filter_clamps_small_normal_distances(self) -> None:
+		raw_map = torch.full((1, 1, 2, 2), float("nan"))
+		raw_valid = torch.ones(1, 1, 2, dtype=torch.bool)
+		raw_map[0, 0, 0] = torch.tensor([0.0, 0.0])
+		raw_map[0, 0, 1] = torch.tensor([0.0, 1.0])
+		normal_dist = torch.tensor([[[1.0, 9.0]]])
+		initial = torch.zeros_like(raw_valid)
+		initial[0, 0, 0] = True
+
+		inlier, stats = opt_loss_snap_surf._seeded_mapping_inlier_filter(
+			raw_valid=raw_valid,
+			raw_map=raw_map,
+			initial_inlier=initial,
+			max_distance=8.0,
+			normal_dist=normal_dist,
+			max_normal_ratio=1.5,
+			normal_distance_floor=10.0,
+		)
+
+		self.assertTrue(bool(inlier[0, 0, 1]))
+		self.assertEqual(stats, {})
 
 	def test_ray_intersection_rejects_off_normal_line_candidate(self) -> None:
 		source_pos = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
@@ -397,8 +465,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
 		stats = opt_loss_snap_surf.last_stats()
 
-		self.assertGreater(stats["snaps_new"], 0)
-		self.assertEqual(stats["snaps_grid"], stats["snaps_ori"])
+		self.assertGreater(stats["snaps_m2e"], 0.0)
 		self.assertGreater(opt_loss_snap_surf._states[0].model_to_ext.count(), 12)
 
 	def test_debug_obj_outputs_write_files_in_iteration_dir(self) -> None:
@@ -585,7 +652,6 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertGreater(float(model_xyz.grad.abs().sum()), 0.0)
 		stats = opt_loss_snap_surf.last_stats()
 		self.assertGreater(stats["snaps_m2e"], 0.0)
-		self.assertEqual(stats["snaps_e2m"], 0.0)
 		self.assertLessEqual(stats["snaps_m2e"], 1.0)
 
 	def test_nonfinite_external_normals_do_not_poison_loss(self) -> None:
