@@ -19,6 +19,7 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		)
 
 	def test_map_init_config_parse_and_validation(self) -> None:
+		self.assertEqual(opt_loss_snap_surf.SnapSurfMapInitConfig().global_opt_interval, 10)
 		opt_loss_snap_surf.configure_snap_surf(
 			cfg={
 				"map_init": {

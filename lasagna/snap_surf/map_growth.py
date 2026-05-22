@@ -305,6 +305,7 @@ def _map_init_grow_once(
 	ext_valid = state.map_init.ext_valid
 	ext_quad_valid = state.map_init.ext_quad_valid
 	depth = state.map_init.model_depth
+	state.map_init.last_growth_terms = {}
 	if active is None or uv is None or ext_pos is None or ext_normals is None or ext_valid is None or depth is None:
 		return 0
 	if not bool(active.any().detach().cpu()):
@@ -609,7 +610,28 @@ def _map_init_grow_once(
 				model_normals=model_normals,
 				cfg=cfg,
 			)
-	added = int((active_new.bool() & ~active.bool()).sum().detach().cpu())
+	final_new_quad = active_new.bool() & ~active.bool()
+	added = int(final_new_quad.sum().detach().cpu())
+	if added > 0:
+		with torch.no_grad():
+			_, growth_terms = _map_init_objective(
+				uv_full=uv_new,
+				active_quad=final_new_quad,
+				ext_pos=ext_pos,
+				ext_normals=ext_normals,
+				ext_valid=ext_valid,
+				ext_quad_valid=ext_quad_valid,
+				ext_coords=state.map_init.ext_coords,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				model_depth=int(depth),
+				normal_sign=state.map_init.normal_sign,
+				orientation_sign=state.map_init.orientation_sign,
+				cfg=cfg,
+				allow_partial_model_samples=allow_partial_model_samples,
+			)
+		state.map_init.last_growth_terms = dict(growth_terms)
 	state.map_init.active_quad = active_new
 	state.map_init.blocked_quad = blocked_new
 	state.map_init.uv = uv_new
@@ -1606,6 +1628,8 @@ def _map_init_should_run_global_opt(
 	pruned_sparse: int,
 	terms: dict[str, torch.Tensor],
 ) -> tuple[bool, str]:
+	# `terms` are the just-expanded rim terms. Persistent whole-map warnings should
+	# not defeat the rim-only interval when the new fringe itself is clean.
 	interval = max(1, int(cfg.map_init.global_opt_interval))
 	if interval <= 1:
 		return True, "interval"
@@ -1818,6 +1842,7 @@ def _run_map_init_for_surface(
 					model_normals=model_normals,
 					cfg=cfg,
 				)
+				growth_terms = dict(state.map_init.last_growth_terms)
 				block = min(
 					int(cfg.map_init.grow_opt_iters),
 					int(cfg.map_init.iters) - int(state.map_init.total_iters),
@@ -1832,14 +1857,6 @@ def _run_map_init_for_surface(
 						run_global = True
 						global_reason = "interval"
 					else:
-						if state.map_init.active_count() > 0:
-							last_terms = _map_init_eval_terms_for_state(
-								state,
-								model_xyz=model_xyz,
-								model_valid=model_valid,
-								model_normals=model_normals,
-								cfg=cfg,
-							)
 						run_global, global_reason = _map_init_should_run_global_opt(
 							state,
 							cfg,
@@ -1847,7 +1864,7 @@ def _run_map_init_for_surface(
 							pruned_sample=pruned_sample,
 							pruned_fold=pruned_fold,
 							pruned_sparse=pruned_sparse,
-							terms=last_terms,
+							terms=growth_terms,
 						)
 				if run_global:
 					if global_reason in ("rim_prune", "rim_problem"):

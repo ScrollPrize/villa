@@ -73,6 +73,7 @@
 						"fringe_opt_iters": 20,
 						"fringe_lr": 0.1,
 						"grow_opt_iters": 20,
+						"global_opt_interval": 10,
 						"scale_levels": 5,
 					    "min_scale_level": 0,
 						"scale_factor": 2,

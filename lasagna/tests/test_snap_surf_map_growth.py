@@ -291,6 +291,9 @@ class SnapSurfMapGrowthTest(unittest.TestCase):
 		self.assertGreater(added, 0)
 		self.assertEqual(state.map_init.total_iters, 5)
 		self.assertEqual(state.map_init.opt_blocks, 2)
+		self.assertIn("loss", state.map_init.last_growth_terms)
+		self.assertEqual(float(state.map_init.last_growth_terms["uv_bad"].detach()), 0.0)
+		self.assertEqual(float(state.map_init.last_growth_terms["model_bad"].detach()), 0.0)
 
 	def test_map_init_grow_rejects_candidate_quad_when_any_oversample_is_invalid(self) -> None:
 		state = opt_loss_snap_surf._SurfaceState()

@@ -86,6 +86,7 @@ class _MapInitState:
 		self.rim_blocks_since_global_opt: int = 0
 		self.repair_blocks: int = 0
 		self.added_total: int = 0
+		self.last_growth_terms: dict[str, torch.Tensor] = {}
 		self.sparse_pruned_total: int = 0
 		self.add_sample_loss_sum: float = 0.0
 		self.add_sample_weight: float = 0.0

@@ -23,7 +23,7 @@ class SnapSurfMapInitConfig:
 	fringe_opt_iters: int = 10
 	fringe_lr: float = 0.05
 	grow_opt_iters: int = 100
-	global_opt_interval: int = 1
+	global_opt_interval: int = 10
 	progress_interval: int = 100
 	progress_mode: str = "block"
 	scale_levels: int = 1
