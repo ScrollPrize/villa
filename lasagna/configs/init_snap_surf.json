@@ -76,7 +76,7 @@
 						"scale_levels": 5,
 						"min_scale_level": 0,
 						"scale_factor": 2,
-						"coarse_revisit_blocks": 10,
+						"coarse_revisit_blocks": 0,
 						"dense_opt": false,
 						"dense_reg_radius": 2,
 						"w_dense_prior": 0.0,

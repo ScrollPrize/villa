@@ -29,7 +29,7 @@ class SnapSurfMapInitConfig:
 	scale_levels: int = 1
 	scale_factor: int = 2
 	min_scale_level: int = 0
-	coarse_revisit_blocks: int = 10
+	coarse_revisit_blocks: int = 0
 	dense_opt: bool = False
 	dense_reg_radius: int = 2
 	w_dense_prior: float = 0.001
@@ -7039,21 +7039,13 @@ def _run_map_init_for_surface(
 					if state.map_init.active_count() <= 0:
 						seed_opt_complete = False
 			while seed_opt_complete and state.map_init.total_iters < int(cfg.map_init.iters):
-				added = _map_init_try_coarser_revisit(
+				added = _map_init_grow_once(
 					state,
 					model_xyz=model_xyz,
 					model_valid=model_valid,
 					model_normals=model_normals,
 					cfg=cfg,
 				)
-				if added <= 0:
-					added = _map_init_grow_once(
-						state,
-						model_xyz=model_xyz,
-						model_valid=model_valid,
-						model_normals=model_normals,
-						cfg=cfg,
-					)
 				block = min(
 					int(cfg.map_init.grow_opt_iters),
 					int(cfg.map_init.iters) - int(state.map_init.total_iters),
