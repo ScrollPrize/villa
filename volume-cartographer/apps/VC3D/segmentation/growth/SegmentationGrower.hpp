@@ -59,6 +59,7 @@ public:
         std::string requestedVolumeId;
         QString normalGridPath;
         QString normal3dZarrPath;
+        QString volumeZarrPath;
     };
 
     SegmentationGrower(Context context,

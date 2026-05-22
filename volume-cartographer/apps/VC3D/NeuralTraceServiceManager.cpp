@@ -30,11 +30,21 @@ bool isCheckpointSentinel(const QString& checkpointPath)
     return trimmed == kDenseLatestSentinel || trimmed == kCopyLatestSentinel;
 }
 
+bool isRemoteZarrPath(const QString& path)
+{
+    return path.startsWith(QStringLiteral("http://"), Qt::CaseInsensitive) ||
+           path.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive) ||
+           path.startsWith(QStringLiteral("s3://"), Qt::CaseInsensitive);
+}
+
 QString normalizeExistingPath(const QString& path)
 {
     const QString trimmed = path.trimmed();
     if (trimmed.isEmpty()) {
         return QString();
+    }
+    if (isRemoteZarrPath(trimmed)) {
+        return trimmed;
     }
 
     QFileInfo info(trimmed);
@@ -195,7 +205,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
         emit serviceError(_lastError);
         return false;
     }
-    if (!QDir(volumeZarr).exists()) {
+    if (!isRemoteZarrPath(volumeZarr) && !QDir(volumeZarr).exists()) {
         _lastError = tr("Volume zarr directory does not exist: %1").arg(volumeZarr);
         emit serviceError(_lastError);
         return false;

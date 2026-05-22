@@ -194,6 +194,17 @@ QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>&
     return candidates;
 }
 
+QString neuralVolumeZarrPathForVolume(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return QString();
+    }
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl());
+    }
+    return QString::fromStdString(volume->path().string());
+}
+
 QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath,
                                         const std::shared_ptr<VolumePkg>& pkg)
 {
@@ -1824,7 +1835,7 @@ void CWindow::CreateWidgets(void)
             _state->setSegmentationGrowthVolumeId(requestedId);
             // Set volume zarr path for neural tracing
             if (_segmentationWidget && vol) {
-                _segmentationWidget->setVolumeZarrPath(QString::fromStdString(vol->path().string()));
+                _segmentationWidget->setVolumeZarrPath(neuralVolumeZarrPathForVolume(vol));
             }
             statusBar()->showMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
         } catch (const std::out_of_range&) {
@@ -2756,7 +2767,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             try {
                 auto growthVolume = _state->vpkg()->volume(growthVolumeId.toStdString());
                 if (growthVolume) {
-                    _segmentationWidget->setVolumeZarrPath(QString::fromStdString(growthVolume->path().string()));
+                    _segmentationWidget->setVolumeZarrPath(neuralVolumeZarrPathForVolume(growthVolume));
                 }
             } catch (...) {
                 // Ignore errors - neural growth path update is non-critical.
@@ -3609,7 +3620,8 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         _state->currentVolumeId(),
         _state->segmentationGrowthVolumeId().empty() ? _state->currentVolumeId() : _state->segmentationGrowthVolumeId(),
         _normalGridPath,
-        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString(),
+        _segmentationWidget ? _segmentationWidget->volumeZarrPath() : QString()
     };
 
     if (!_segmentationGrower->start(volumeContext, method, direction, steps, inpaintOnly)) {
@@ -3803,7 +3815,8 @@ void CWindow::onCopyWithNtRequested()
         _state->currentVolumeId(),
         _state->segmentationGrowthVolumeId().empty() ? _state->currentVolumeId() : _state->segmentationGrowthVolumeId(),
         _normalGridPath,
-        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString(),
+        _segmentationWidget ? _segmentationWidget->volumeZarrPath() : QString()
     };
 
     if (!_segmentationGrower->startCopyWithNt(volumeContext)) {

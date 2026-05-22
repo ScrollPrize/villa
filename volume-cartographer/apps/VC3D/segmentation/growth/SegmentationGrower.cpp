@@ -63,6 +63,29 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
     return QDir(base).filePath(QStringLiteral("cache"));
 }
 
+QString neuralVolumeZarrPath(const SegmentationWidget* widget,
+                             const SegmentationGrower::VolumeContext& volumeContext,
+                             const std::shared_ptr<Volume>& volume)
+{
+    const QString widgetPath = widget ? widget->volumeZarrPath().trimmed() : QString();
+    if (!widgetPath.isEmpty()) {
+        return widgetPath;
+    }
+
+    const QString contextPath = volumeContext.volumeZarrPath.trimmed();
+    if (!contextPath.isEmpty()) {
+        return contextPath;
+    }
+
+    if (!volume) {
+        return QString();
+    }
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteUrl());
+    }
+    return QString::fromStdString(volume->path().string()).trimmed();
+}
+
 // NOTE: SegmentationGrowth.cpp has an equivalent ensureGenerationsChannel with a bool
 // return value. These two live in separate anonymous namespaces (different TUs) and
 // cannot easily be merged without a shared header; keep them in sync if modified.
@@ -1532,7 +1555,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     if (denseMode) {
         const QString denseCheckpointPath = _context.widget->denseCheckpointPath().trimmed();
         const QString pythonPath = _context.widget->neuralPythonPath();
-        const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+        const QString volumeZarr = neuralVolumeZarrPath(_context.widget, volumeContext, growthVolume);
         const int volumeScale = _context.widget->neuralVolumeScale();
         const DenseTtaMode denseTtaMode = _context.widget->denseTtaMode();
         const QString denseTtaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
@@ -1674,7 +1697,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     if (neuralTracerEnabled && !inpaintOnly) {
         const QString checkpointPath = _context.widget->neuralCheckpointPath();
         const QString pythonPath = _context.widget->neuralPythonPath();
-        const QString volumeZarr = _context.widget->volumeZarrPath();
+        const QString volumeZarr = neuralVolumeZarrPath(_context.widget, volumeContext, growthVolume);
         const int volumeScale = _context.widget->neuralVolumeScale();
         const int batchSize = _context.widget->neuralBatchSize();
 
@@ -1921,7 +1944,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 
     const QString copyCheckpointPath = _context.widget->copyCheckpointPath().trimmed();
     const QString pythonPath = _context.widget->neuralPythonPath();
-    const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+    const QString volumeZarr = neuralVolumeZarrPath(_context.widget, volumeContext, growthVolume);
     const int volumeScale = _context.widget->neuralVolumeScale();
     const DenseTtaMode ttaMode = _context.widget->denseTtaMode();
     const QString ttaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
