@@ -40,8 +40,64 @@ target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
 target_link_libraries(vc_tifxyz2obj vc_core vc_inpaint)
 
+function(vc_find_libigl_core out_var)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    foreach(_pkg IN ITEMS igl libigl Libigl)
+        find_package(${_pkg} CONFIG QUIET)
+        if(TARGET igl::core)
+            set(${out_var} igl::core PARENT_SCOPE)
+            return()
+        endif()
+        if(TARGET igl::igl_core)
+            set(${out_var} igl::igl_core PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+
+    set(_prefixes ${CMAKE_PREFIX_PATH} ${CMAKE_SYSTEM_PREFIX_PATH})
+    foreach(_env_prefix IN ITEMS "$ENV{LIBIGL_ROOT}" "$ENV{HOMEBREW_PREFIX}")
+        if(NOT "${_env_prefix}" STREQUAL "")
+            list(APPEND _prefixes "${_env_prefix}")
+        endif()
+    endforeach()
+    if(_prefixes)
+        list(REMOVE_DUPLICATES _prefixes)
+    endif()
+
+    find_package(igl CONFIG QUIET
+        NAMES igl libigl Libigl
+        HINTS ${_prefixes}
+        PATH_SUFFIXES
+            lib/cmake/igl
+            lib/cmake/libigl
+            share/cmake/igl
+            share/libigl/cmake)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    message(FATAL_ERROR
+        "vc_obj_uv_lift requires libigl core. Enable VC_BUILD_FLATBOI to "
+        "use the local FetchContent libigl path, or install a libigl CMake "
+        "package exporting igl::core or igl::igl_core.")
+endfunction()
+
+vc_find_libigl_core(_vc_libigl_core_target)
 add_executable(vc_obj_uv_lift src/vc_obj_uv_lift.cpp)
-target_link_libraries(vc_obj_uv_lift PRIVATE igl::core OpenMP::OpenMP_CXX)
+target_link_libraries(vc_obj_uv_lift PRIVATE ${_vc_libigl_core_target} OpenMP::OpenMP_CXX)
 set_target_properties(vc_obj_uv_lift PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
 add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
