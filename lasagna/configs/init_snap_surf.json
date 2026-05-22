@@ -93,7 +93,11 @@
 						"w_bend": 0.01,
 						"w_jac": 10.0,
 						"w_metric_smooth": 1.0,
-						"w_area_smooth": 1.0
+						"w_area_smooth": 1.0,
+						"max_sample_distance": 500.0,
+						"max_sample_angle_deg": 45.0,
+						"sample_angle_step_fraction": 0.1,
+						"max_step_neighbor_ratio": 10.0
 					}
 				}
 			}

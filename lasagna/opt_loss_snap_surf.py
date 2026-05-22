@@ -49,6 +49,10 @@ class SnapSurfMapInitConfig:
 	w_metric_smooth: float = 0.05
 	w_area_smooth: float = 0.02
 	angle_dist_mult: float = 9.0
+	max_sample_distance: float = 500.0
+	max_sample_angle_deg: float = 45.0
+	sample_angle_step_fraction: float = 0.1
+	max_step_neighbor_ratio: float = 10.0
 	jac_margin: float = 0.05
 
 
@@ -197,6 +201,10 @@ def configure_snap_surf(
 			f"w_dense_prior={_cfg.map_init.w_dense_prior} "
 			f"w_metric_smooth={_cfg.map_init.w_metric_smooth} "
 			f"w_area_smooth={_cfg.map_init.w_area_smooth} "
+			f"max_sample_distance={_cfg.map_init.max_sample_distance} "
+			f"max_sample_angle_deg={_cfg.map_init.max_sample_angle_deg} "
+			f"sample_angle_step_fraction={_cfg.map_init.sample_angle_step_fraction} "
+			f"max_step_neighbor_ratio={_cfg.map_init.max_step_neighbor_ratio} "
 			f"repair_max_blocks={_cfg.map_init.repair_max_blocks} "
 			f"repair_opt_iters={_cfg.map_init.repair_opt_iters} "
 			f"repair_lr_mult={_cfg.map_init.repair_lr_mult} "
@@ -261,6 +269,10 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			w_metric_smooth=float(raw_cfg.get("w_metric_smooth", defaults.w_metric_smooth)),
 			w_area_smooth=float(raw_cfg.get("w_area_smooth", defaults.w_area_smooth)),
 			angle_dist_mult=float(raw_cfg.get("angle_dist_mult", defaults.angle_dist_mult)),
+			max_sample_distance=float(raw_cfg.get("max_sample_distance", defaults.max_sample_distance)),
+			max_sample_angle_deg=float(raw_cfg.get("max_sample_angle_deg", defaults.max_sample_angle_deg)),
+			sample_angle_step_fraction=float(raw_cfg.get("sample_angle_step_fraction", defaults.sample_angle_step_fraction)),
+			max_step_neighbor_ratio=float(raw_cfg.get("max_step_neighbor_ratio", defaults.max_step_neighbor_ratio)),
 			jac_margin=float(raw_cfg.get("jac_margin", defaults.jac_margin)),
 		)
 	else:
@@ -281,6 +293,14 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 	):
 		if float(getattr(cfg, name)) < 0.0:
 			raise ValueError(f"snap_surf args.map_init.{name} must be >= 0")
+	if cfg.max_sample_distance < 0.0:
+		raise ValueError("snap_surf args.map_init.max_sample_distance must be >= 0")
+	if cfg.max_sample_angle_deg < 0.0 or cfg.max_sample_angle_deg > 180.0:
+		raise ValueError("snap_surf args.map_init.max_sample_angle_deg must be in [0, 180]")
+	if cfg.sample_angle_step_fraction < 0.0:
+		raise ValueError("snap_surf args.map_init.sample_angle_step_fraction must be >= 0")
+	if cfg.max_step_neighbor_ratio < 0.0:
+		raise ValueError("snap_surf args.map_init.max_step_neighbor_ratio must be >= 0")
 	if cfg.jac_margin < 0.0:
 		raise ValueError("snap_surf args.map_init.jac_margin must be >= 0")
 	if cfg.progress_mode not in ("block", "periodic", "both", "none"):
@@ -3110,6 +3130,7 @@ def _map_init_empty_stats() -> dict[str, float]:
 		"snaps_map_samples": 0.0,
 		"snaps_map_uvbad": 0.0,
 		"snaps_map_model_bad": 0.0,
+		"snaps_map_step_bad": 0.0,
 		"snaps_map_nsign": 1.0,
 		"snaps_map_scales": 1.0,
 		"snaps_map_repair": 0.0,
@@ -3454,6 +3475,216 @@ def _map_init_allow_partial_model_samples(scale_level: int) -> bool:
 	return int(scale_level) > 0
 
 
+def _map_init_mean_quad_edge_length(corners: torch.Tensor, corner_valid: torch.Tensor) -> torch.Tensor:
+	if corners.numel() == 0:
+		return torch.zeros(corners.shape[:1], device=corners.device, dtype=corners.dtype)
+	edges = torch.stack([
+		corners[:, 1] - corners[:, 0],
+		corners[:, 3] - corners[:, 2],
+		corners[:, 2] - corners[:, 0],
+		corners[:, 3] - corners[:, 1],
+	], dim=1)
+	valid = torch.stack([
+		corner_valid[:, 1] & corner_valid[:, 0],
+		corner_valid[:, 3] & corner_valid[:, 2],
+		corner_valid[:, 2] & corner_valid[:, 0],
+		corner_valid[:, 3] & corner_valid[:, 1],
+	], dim=1)
+	length = edges.norm(dim=-1)
+	valid = valid & torch.isfinite(edges).all(dim=-1) & torch.isfinite(length) & (length > 1.0e-8)
+	count = valid.to(dtype=corners.dtype).sum(dim=1)
+	total = torch.where(valid, length, torch.zeros_like(length)).sum(dim=1)
+	return torch.where(count > 0.0, total / count.clamp_min(1.0), torch.zeros_like(total))
+
+
+def _map_init_ext_quad_corner_positions(
+	*,
+	ext_pos: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_coords: torch.Tensor | None,
+	quad_hw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	Q = int(quad_hw.shape[0])
+	if Q == 0:
+		return (
+			ext_pos.new_empty(0, 4, 3),
+			torch.zeros(0, 4, device=ext_pos.device, dtype=torch.bool),
+		)
+	qh = quad_hw[:, 0]
+	qw = quad_hw[:, 1]
+	if ext_coords is None:
+		corners = torch.stack([
+			ext_pos[qh, qw],
+			ext_pos[qh + 1, qw],
+			ext_pos[qh, qw + 1],
+			ext_pos[qh + 1, qw + 1],
+		], dim=1)
+		corner_valid = torch.stack([
+			ext_valid[qh, qw],
+			ext_valid[qh + 1, qw],
+			ext_valid[qh, qw + 1],
+			ext_valid[qh + 1, qw + 1],
+		], dim=1).bool()
+	else:
+		coords = torch.stack([
+			ext_coords[qh, qw],
+			ext_coords[qh + 1, qw],
+			ext_coords[qh, qw + 1],
+			ext_coords[qh + 1, qw + 1],
+		], dim=1)
+		safe = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		corners = _sample_surface_grid(ext_pos, safe)
+		corner_valid = (
+			torch.isfinite(coords).all(dim=-1) &
+			_quad_valid_at_coords(ext_valid.bool(), safe, tuple(int(v) for v in ext_valid.shape))
+		)
+	corner_valid = corner_valid & torch.isfinite(corners).all(dim=-1)
+	return corners, corner_valid
+
+
+def _map_init_model_quad_corner_positions(
+	*,
+	uv_full: torch.Tensor,
+	quad_hw: torch.Tensor,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_depth: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	Q = int(quad_hw.shape[0])
+	if Q == 0:
+		return (
+			model_xyz.new_empty(0, 4, 3),
+			torch.zeros(0, 4, device=model_xyz.device, dtype=torch.bool),
+		)
+	qh = quad_hw[:, 0]
+	qw = quad_hw[:, 1]
+	uv_corners = torch.stack([
+		uv_full[qh, qw],
+		uv_full[qh + 1, qw],
+		uv_full[qh, qw + 1],
+		uv_full[qh + 1, qw + 1],
+	], dim=1)
+	coords = _map_init_coords3(uv_corners, depth=int(model_depth))
+	safe = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+	corners = _sample_surface_grid(model_xyz, safe)
+	corner_valid = (
+		torch.isfinite(coords).all(dim=-1) &
+		_quad_valid_at_coords(model_valid.bool(), safe, tuple(int(v) for v in model_valid.shape)) &
+		torch.isfinite(corners).all(dim=-1)
+	)
+	return corners, corner_valid
+
+
+def _map_init_quad_physical_step_lengths(
+	*,
+	uv_full: torch.Tensor,
+	quad_hw: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_coords: torch.Tensor | None,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_depth: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	ext_corners, ext_corner_valid = _map_init_ext_quad_corner_positions(
+		ext_pos=ext_pos,
+		ext_valid=ext_valid,
+		ext_coords=ext_coords,
+		quad_hw=quad_hw,
+	)
+	model_corners, model_corner_valid = _map_init_model_quad_corner_positions(
+		uv_full=uv_full,
+		quad_hw=quad_hw,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_depth=int(model_depth),
+	)
+	return (
+		_map_init_mean_quad_edge_length(ext_corners, ext_corner_valid),
+		_map_init_mean_quad_edge_length(model_corners, model_corner_valid),
+	)
+
+
+def _map_init_connection_cos_min(
+	distance: torch.Tensor,
+	opposing_step: torch.Tensor | None,
+	*,
+	cfg: SnapSurfMapInitConfig,
+) -> torch.Tensor:
+	base_angle = math.radians(max(0.0, min(180.0, float(cfg.max_sample_angle_deg))))
+	if opposing_step is None or float(cfg.sample_angle_step_fraction) <= 0.0:
+		return torch.full_like(distance, math.cos(base_angle))
+	step = torch.where(
+		torch.isfinite(opposing_step),
+		opposing_step.clamp_min(0.0),
+		torch.zeros_like(opposing_step),
+	).to(device=distance.device, dtype=distance.dtype)
+	extra = torch.atan2(
+		float(cfg.sample_angle_step_fraction) * step,
+		distance.clamp_min(1.0e-6),
+	)
+	cap = math.pi if base_angle > (math.pi / 2.0) else (math.pi / 2.0)
+	allowed = (base_angle + extra).clamp(max=cap)
+	return torch.cos(allowed)
+
+
+def _map_init_sample_geometry_limit_ok(
+	*,
+	p_ext: torch.Tensor,
+	n_ext: torch.Tensor,
+	p_model: torch.Tensor,
+	n_model_raw: torch.Tensor,
+	normal_sign: int | None,
+	cfg: SnapSurfMapInitConfig,
+	ext_step: torch.Tensor | None = None,
+	model_step: torch.Tensor | None = None,
+) -> torch.Tensor:
+	if p_ext.numel() == 0:
+		return torch.zeros(p_ext.shape[:-1], device=p_ext.device, dtype=torch.bool)
+	n_ext_base = F.normalize(n_ext, dim=-1, eps=1.0e-8)
+	n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+	v = p_model - p_ext
+	d = v.norm(dim=-1)
+	ok = (
+		torch.isfinite(p_ext).all(dim=-1) &
+		torch.isfinite(p_model).all(dim=-1) &
+		torch.isfinite(n_ext).all(dim=-1) &
+		torch.isfinite(n_ext_base).all(dim=-1) &
+		(n_ext_base.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(n_model_raw).all(dim=-1) &
+		torch.isfinite(n_model).all(dim=-1) &
+		(n_model.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(d)
+	)
+	max_dist = float(cfg.max_sample_distance)
+	if max_dist > 0.0:
+		ok = ok & (d <= max_dist)
+	max_angle = float(cfg.max_sample_angle_deg)
+	if max_angle < 180.0:
+		cos_min = math.cos(math.radians(max(0.0, max_angle)))
+		near_zero = d <= 1.0
+		u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
+		cos_min_ext = _map_init_connection_cos_min(d, model_step, cfg=cfg)
+		cos_min_model = _map_init_connection_cos_min(d, ext_step, cfg=cfg)
+		signs = (1.0, -1.0) if normal_sign is None else (1.0 if int(normal_sign) >= 0 else -1.0,)
+		angle_ok = torch.zeros_like(ok)
+		for sign in signs:
+			n_ext_s = n_ext_base * float(sign)
+			c_ext = (u * n_ext_s).sum(dim=-1)
+			c_model = (u * n_model).sum(dim=-1)
+			c_norm = (n_ext_s * n_model).sum(dim=-1)
+			angle_ok = angle_ok | (
+				torch.isfinite(c_ext) &
+				torch.isfinite(c_model) &
+				torch.isfinite(c_norm) &
+				torch.isfinite(cos_min_ext) &
+				torch.isfinite(cos_min_model) &
+				((near_zero | (c_ext >= cos_min_ext)) & (near_zero | (c_model >= cos_min_model)) & (c_norm >= cos_min))
+			)
+		ok = ok & angle_ok
+	return ok
+
+
 def _map_init_candidate_quad_samples_ok(
 	*,
 	uv_full: torch.Tensor,
@@ -3463,13 +3694,16 @@ def _map_init_candidate_quad_samples_ok(
 	ext_valid: torch.Tensor,
 	ext_quad_valid: torch.Tensor | None,
 	ext_coords: torch.Tensor | None = None,
+	model_xyz: torch.Tensor | None = None,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	model_depth: int,
+	normal_sign: int | None = 1,
 	cfg: SnapSurfConfig,
 	allow_partial_model_samples: bool = False,
+	enforce_sample_limits: bool = True,
 ) -> torch.Tensor:
-	uv_samples, _p_ext, _n_ext, ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
+	uv_samples, p_ext, n_ext, ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
 		uv_full=uv_full,
 		ext_pos=ext_pos,
 		ext_normals=ext_normals,
@@ -3485,6 +3719,31 @@ def _map_init_candidate_quad_samples_ok(
 		model_normals=model_normals,
 		depth=int(model_depth),
 	)
+	if bool(enforce_sample_limits) and model_xyz is not None:
+		coords3 = _map_init_coords3(uv_samples, depth=int(model_depth))
+		safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+		p_model = _sample_surface_grid(model_xyz, safe_coords)
+		n_model_raw = _sample_surface_grid(model_normals, safe_coords)
+		ext_step, model_step = _map_init_quad_physical_step_lengths(
+			uv_full=uv_full,
+			quad_hw=quad_hw,
+			ext_pos=ext_pos,
+			ext_valid=ext_valid,
+			ext_coords=ext_coords,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_depth=int(model_depth),
+		)
+		model_ok = model_ok & _map_init_sample_geometry_limit_ok(
+			p_ext=p_ext,
+			n_ext=n_ext,
+			p_model=p_model,
+			n_model_raw=n_model_raw,
+			normal_sign=normal_sign,
+			cfg=cfg.map_init,
+			ext_step=ext_step[:, None].expand_as(model_ok),
+			model_step=model_step[:, None].expand_as(model_ok),
+		)
 	base_ok = ext_ok & torch.isfinite(uv_samples).all(dim=-1)
 	if bool(allow_partial_model_samples):
 		return quad_uv_ok & base_ok.all(dim=1) & (base_ok & model_ok).any(dim=1)
@@ -4284,6 +4543,79 @@ def _map_init_model_metric_positions(
 	return uv, finite_uv
 
 
+def _map_init_long_step_mask(length: torch.Tensor, valid: torch.Tensor, *, max_ratio: float) -> torch.Tensor:
+	if length.numel() == 0 or float(max_ratio) <= 0.0:
+		return torch.zeros_like(valid, dtype=torch.bool)
+	H, W = int(length.shape[0]), int(length.shape[1])
+	if H == 0 or W == 0:
+		return torch.zeros_like(valid, dtype=torch.bool)
+	length_safe = torch.where(valid.bool() & torch.isfinite(length), length, torch.zeros_like(length))
+	len_patch = F.unfold(length_safe.reshape(1, 1, H, W), kernel_size=3, padding=1).reshape(1, 9, H, W)[0]
+	valid_patch = F.unfold(valid.to(dtype=length.dtype).reshape(1, 1, H, W), kernel_size=3, padding=1).reshape(1, 9, H, W)[0] > 0.0
+	valid_patch[4] = False
+	inf = torch.full_like(len_patch, float("inf"))
+	neighbor_min = torch.where(valid_patch, len_patch, inf).min(dim=0).values
+	has_neighbor = torch.isfinite(neighbor_min)
+	return (
+		valid.bool() &
+		has_neighbor &
+		torch.isfinite(length) &
+		(length > neighbor_min.clamp_min(1.0e-6) * float(max_ratio))
+	)
+
+
+def _map_init_step_neighbor_bad_quad_mask(
+	uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_depth: int,
+	max_ratio: float,
+) -> torch.Tensor:
+	active = active_quad.bool()
+	if active.numel() == 0 or float(max_ratio) <= 0.0:
+		return torch.zeros_like(active, dtype=torch.bool)
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	if H < 2 or W < 2:
+		return torch.zeros_like(active, dtype=torch.bool)
+	metric_pos, metric_valid = _map_init_model_metric_positions(
+		uv,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_depth=int(model_depth),
+	)
+	metric_safe = torch.where(metric_valid.unsqueeze(-1), metric_pos, torch.zeros_like(metric_pos))
+	edge_h_active = torch.zeros(H - 1, W, device=uv.device, dtype=torch.bool)
+	edge_h_active[:, :-1] |= active
+	edge_h_active[:, 1:] |= active
+	length_h = (metric_safe[1:, :] - metric_safe[:-1, :]).norm(dim=-1)
+	valid_h = (
+		edge_h_active &
+		metric_valid[1:, :] &
+		metric_valid[:-1, :] &
+		torch.isfinite(length_h)
+	)
+	bad_h = _map_init_long_step_mask(length_h, valid_h, max_ratio=float(max_ratio))
+
+	edge_w_active = torch.zeros(H, W - 1, device=uv.device, dtype=torch.bool)
+	edge_w_active[:-1, :] |= active
+	edge_w_active[1:, :] |= active
+	length_w = (metric_safe[:, 1:] - metric_safe[:, :-1]).norm(dim=-1)
+	valid_w = (
+		edge_w_active &
+		metric_valid[:, 1:] &
+		metric_valid[:, :-1] &
+		torch.isfinite(length_w)
+	)
+	bad_w = _map_init_long_step_mask(length_w, valid_w, max_ratio=float(max_ratio))
+
+	bad_quad = torch.zeros_like(active, dtype=torch.bool)
+	bad_quad |= bad_h[:, :-1] | bad_h[:, 1:]
+	bad_quad |= bad_w[:-1, :] | bad_w[1:, :]
+	return active & bad_quad
+
+
 def _map_init_forward_smooth_bend_terms(
 	field: torch.Tensor,
 	vertex_valid: torch.Tensor,
@@ -4593,6 +4925,18 @@ def _map_init_objective(
 		p_model = _sample_surface_grid(model_xyz, safe_coords)
 		n_model_raw = _sample_surface_grid(model_normals, safe_coords)
 		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+		ext_step_q, model_step_q = _map_init_quad_physical_step_lengths(
+			uv_full=uv_full,
+			quad_hw=quad_hw,
+			ext_pos=ext_pos,
+			ext_valid=ext_valid,
+			ext_coords=ext_coords,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_depth=int(model_depth),
+		)
+		ext_step_f = ext_step_q[:, None].expand(Q, S).reshape(Q * S)
+		model_step_f = model_step_q[:, None].expand(Q, S).reshape(Q * S)
 		coord_ok = _quad_valid_at_coords(
 			model_valid.bool(),
 			safe_coords,
@@ -4604,6 +4948,16 @@ def _map_init_objective(
 		c_ext = (u * n_ext).sum(dim=-1)
 		c_model = (u * n_model).sum(dim=-1)
 		c_norm = (n_ext * n_model).sum(dim=-1)
+		sample_limit_ok = _map_init_sample_geometry_limit_ok(
+			p_ext=p_ext_f,
+			n_ext=n_ext_raw_f,
+			p_model=p_model,
+			n_model_raw=n_model_raw,
+			normal_sign=normal_sign,
+			cfg=mi,
+			ext_step=ext_step_f,
+			model_step=model_step_f,
+		)
 		dist_mult = _map_init_distance_multiplier(c_ext, c_model, mi)
 		dist_values = _huber(d, delta=cfg.huber_delta) * dist_mult
 		vec_values = (1.0 - c_ext) + (1.0 - c_model)
@@ -4628,16 +4982,20 @@ def _map_init_objective(
 			torch.isfinite(norm_values)
 		)
 		finite = base_finite & model_finite
+		limited_finite = finite & sample_limit_ok
 		finite_qs = finite.reshape(Q, S)
+		limited_finite_qs = limited_finite.reshape(Q, S)
 		base_finite_qs = base_finite.reshape(Q, S)
 		if bool(allow_partial_model_samples):
-			valid_quad = base_finite_qs.all(dim=1) & finite_qs.any(dim=1)
+			loss_quad = base_finite_qs.all(dim=1) & finite_qs.any(dim=1)
+			valid_quad = base_finite_qs.all(dim=1) & limited_finite_qs.any(dim=1)
 		else:
-			valid_quad = finite_qs.all(dim=1)
+			loss_quad = finite_qs.all(dim=1)
+			valid_quad = limited_finite_qs.all(dim=1)
 		sample_quad_ok_grid[quad_hw[:, 0], quad_hw[:, 1]] = valid_quad
 		sample_total_count = Q * S
 		sample_valid_count = int(finite.sum().detach().cpu())
-		sample_bad_count = int((~finite).sum().detach().cpu())
+		sample_bad_count = int((~limited_finite).sum().detach().cpu())
 		sample_bad_frac = torch.tensor(
 			float(sample_bad_count) / float(max(1, sample_total_count)),
 			device=uv_full.device,
@@ -4650,8 +5008,8 @@ def _map_init_objective(
 				float(mi.w_surface_normal) * norm_values
 			)
 			sample_loss = sample_values[finite].mean()
-		if bool(valid_quad.any().detach().cpu()):
-			loss_sample = finite_qs & valid_quad.unsqueeze(1)
+		if bool(loss_quad.any().detach().cpu()):
+			loss_sample = finite_qs & loss_quad.unsqueeze(1)
 			loss_count = loss_sample.to(dtype=uv_full.dtype).sum(dim=1).clamp_min(1.0)
 			finite_count = int(loss_sample.sum().detach().cpu())
 			model_bad_count = int((~valid_quad).sum().detach().cpu())
@@ -4663,10 +5021,10 @@ def _map_init_objective(
 			vec_q_all = torch.where(loss_sample, vec_grid, vec_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
 			norm_q_all = torch.where(loss_sample, norm_grid, norm_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
 			d_q_all = torch.where(loss_sample, d_grid, d_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
-			dist_q = dist_q_all[valid_quad]
-			vec_q = vec_q_all[valid_quad]
-			norm_q = norm_q_all[valid_quad]
-			d_q = d_q_all[valid_quad]
+			dist_q = dist_q_all[loss_quad]
+			vec_q = vec_q_all[loss_quad]
+			norm_q = norm_q_all[loss_quad]
+			d_q = d_q_all[loss_quad]
 			dist_loss = dist_q.mean()
 			vec_loss = vec_q.mean()
 			norm_loss = norm_q.mean()
@@ -4767,12 +5125,21 @@ def _map_init_objective(
 		orientation_sign=orientation_sign,
 		jac_margin=mi.jac_margin,
 	)
+	step_bad_quad_grid = _map_init_step_neighbor_bad_quad_mask(
+		uv_safe,
+		reg_quad,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_depth=int(model_depth),
+		max_ratio=float(mi.max_step_neighbor_ratio),
+	)
 	quad_success_grid = (
 		active_quad &
 		quad_uv_ok_grid &
 		sample_quad_ok_grid &
 		~jac_bad_quad_grid &
-		~jac_inv_bad_quad_grid
+		~jac_inv_bad_quad_grid &
+		~step_bad_quad_grid
 	)
 	quad_success_count = int(quad_success_grid.sum().detach().cpu())
 	quad_success_frac = torch.tensor(
@@ -4841,6 +5208,7 @@ def _map_init_objective(
 		"jac_bad_quad": torch.tensor(float(int(jac_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
 		"jac_inv_bad": inv_terms["jac_bad"].detach(),
 		"jac_inv_bad_quad": torch.tensor(float(int(jac_inv_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
+		"step_bad_quad": torch.tensor(float(int(step_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
 	}
 
 
@@ -5048,11 +5416,14 @@ def _map_init_seed_state(
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=state.map_init.ext_coords,
+			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(d),
+			normal_sign=None,
 			cfg=cfg,
 			allow_partial_model_samples=allow_partial_model_samples,
+			enforce_sample_limits=False,
 		)
 		active_quad[cand_hw[:, 0], cand_hw[:, 1]] = ok_quad
 	if not bool(active_quad.any().detach().cpu()) and 0 <= eh_level < QH and 0 <= ew_level < QW:
@@ -5065,11 +5436,14 @@ def _map_init_seed_state(
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=state.map_init.ext_coords,
+			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(d),
+			normal_sign=None,
 			cfg=cfg,
 			allow_partial_model_samples=allow_partial_model_samples,
+			enforce_sample_limits=False,
 		)[0].detach().cpu())
 		active_quad[eh_level, ew_level] = seed_ok
 	if not allow_partial_model_samples and bool(active_quad.any().detach().cpu()):
@@ -5112,7 +5486,7 @@ def _map_init_seed_state(
 def _map_init_grow_once(
 	state: _SurfaceState,
 	*,
-	model_xyz: torch.Tensor | None = None,
+	model_xyz: torch.Tensor,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
@@ -5182,10 +5556,10 @@ def _map_init_grow_once(
 			if not allow_partial_model_samples:
 				guess_ok = guess_ok & _map_init_model_coord_ok(
 					guess,
-					model_valid=model_valid,
-					model_normals=model_normals,
+				model_valid=model_valid,
+				model_normals=model_normals,
 					depth=int(depth),
-				)
+			)
 			pred = torch.where(local_ok.unsqueeze(-1), pred, torch.where(guess_ok.unsqueeze(-1), guess, pred))
 			local_ok = local_ok | guess_ok
 		if bool(local_ok.any().detach().cpu()):
@@ -5193,7 +5567,7 @@ def _map_init_grow_once(
 			pred_grid[ok_hw[:, 0], ok_hw[:, 1]] = pred[local_ok].detach()
 			pred_ok_grid[ok_hw[:, 0], ok_hw[:, 1]] = True
 	candidate_seed = candidate & _map_init_quad_corner_all(pred_ok_grid & torch.isfinite(pred_grid).all(dim=-1))
-	if model_xyz is not None and bool(candidate_seed.any().detach().cpu()):
+	if bool(candidate_seed.any().detach().cpu()):
 		_map_init_log_fringe_debug(
 			state=state.map_init,
 			phase="cinit",
@@ -5223,11 +5597,14 @@ def _map_init_grow_once(
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=state.map_init.ext_coords,
+			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
 			cfg=cfg,
 			allow_partial_model_samples=allow_partial_model_samples,
+			enforce_sample_limits=False,
 		)
 		filtered = torch.zeros_like(candidate_possible, dtype=torch.bool)
 		filtered[possible_hw[:, 0], possible_hw[:, 1]] = possible_ok
@@ -5236,7 +5613,7 @@ def _map_init_grow_once(
 			candidate_sample_reject[bad_hw[:, 0], bad_hw[:, 1]] = True
 		candidate_possible = filtered
 	if (
-		not bool(mi.dense_opt) and model_xyz is not None and int(mi.candidate_opt_iters) > 0 and
+		not bool(mi.dense_opt) and int(mi.candidate_opt_iters) > 0 and
 		bool(candidate_possible.any().detach().cpu())
 	):
 		candidate_opt_vertices = (
@@ -5328,9 +5705,11 @@ def _map_init_grow_once(
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=state.map_init.ext_coords,
+			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
 			cfg=cfg,
 			allow_partial_model_samples=allow_partial_model_samples,
 		)[0].detach().cpu())
@@ -5342,7 +5721,16 @@ def _map_init_grow_once(
 			orientation_sign=state.map_init.orientation_sign,
 			jac_margin=mi.jac_margin,
 		)
-		if samples_ok and jac_ok:
+		step_bad = _map_init_step_neighbor_bad_quad_mask(
+			uv_new,
+			active_new,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_depth=int(depth),
+			max_ratio=float(mi.max_step_neighbor_ratio),
+		)
+		step_ok = not bool(step_bad[h, w].detach().cpu())
+		if samples_ok and jac_ok and step_ok:
 			added += 1
 			blocked_new[h, w] = False
 		else:
@@ -5365,7 +5753,7 @@ def _map_init_grow_once(
 		)
 	new_quad = active_new.bool() & ~active.bool()
 	if (
-		not bool(mi.dense_opt) and model_xyz is not None and int(mi.fringe_opt_iters) > 0 and
+		not bool(mi.dense_opt) and int(mi.fringe_opt_iters) > 0 and
 		bool(new_quad.any().detach().cpu())
 	):
 		fringe_vertices = (
@@ -5410,6 +5798,7 @@ def _map_init_grow_once(
 				active_quad=active_new,
 				uv=uv_new,
 				blocked_quad=blocked_new,
+				model_xyz=model_xyz,
 				model_valid=model_valid,
 				model_normals=model_normals,
 				cfg=cfg,
@@ -5557,7 +5946,7 @@ def _map_init_log_fringe_debug(
 		_map_init_log("map-init block columns")
 		print(
 			f"{'map':>3s} {'ph':>6s} {'sc':>2s} {'st':>3s} {'res':>7s} {'blk':>3s} {'it':>9s} {'quad':>5s} "
-			f"{'smp':>6s} {'succ':>6s} {'sloss':>7s} {'badq':>9s} "
+			f"{'smp':>6s} {'succ':>6s} {'sloss':>7s} {'badq':>11s} "
 			f"{'loss':>7s} {'dst':>7s} {'vec':>7s} {'nrm':>7s} "
 			f"{'smo':>7s} {'bnd':>7s} {'jac':>7s} {'met':>7s} "
 			f"{'ar':>7s} {'sr':>7s} {'br':>7s} {'jr':>7s} "
@@ -5569,7 +5958,8 @@ def _map_init_log_fringe_debug(
 		f"{_map_init_term_float(terms, 'uv_bad'):.0f}/"
 		f"{_map_init_term_float(terms, 'model_bad'):.0f}/"
 		f"{_map_init_term_float(terms, 'jac_bad_quad'):.0f}/"
-		f"{_map_init_term_float(terms, 'jac_inv_bad_quad'):.0f}"
+		f"{_map_init_term_float(terms, 'jac_inv_bad_quad'):.0f}/"
+		f"{_map_init_term_float(terms, 'step_bad_quad'):.0f}"
 	)
 	res_label = f"{int(uv_full.shape[0])}x{int(uv_full.shape[1])}"
 	print(
@@ -5579,7 +5969,7 @@ def _map_init_log_fringe_debug(
 		f"{_map_init_term_float(terms, 'sample_valid'):6.0f} "
 		f"{_map_init_fmt_val(success):>6s} "
 		f"{_map_init_fmt_val(_map_init_term_float(terms, 'sample_loss')):>7s} "
-		f"{bad:>9s} "
+		f"{bad:>11s} "
 		f"{_map_init_fmt_val(_map_init_term_float(terms, 'loss')):>7s} "
 		f"{_map_init_fmt_val(_map_init_term_float(terms, 'dist')):>7s} "
 		f"{_map_init_fmt_val(_map_init_term_float(terms, 'vec')):>7s} "
@@ -5625,7 +6015,7 @@ def _map_init_print_progress_legend() -> None:
 		("blkq", "blocked quads"),
 		("spr", "sparse pruned"),
 		("smp", "valid samples"),
-		("bad", "uv/model/jac/rjac"),
+		("bad", "uv/model/jac/rjac/step"),
 		("aloss", "add sample loss"),
 		("asuc", "add success frac"),
 		("floss", "fringe sample loss"),
@@ -5675,7 +6065,7 @@ def _map_init_log_progress(
 		_map_init_print_progress_legend()
 		print(
 			f"{'mi':>2s} {'ph':>6s} {'sc':>2s} {'st':>3s} {'res':>7s} {'blk':>3s} {'it':>9s} {'it/s':>6s} "
-			f"{'act':>5s} {'blkq':>5s} {'spr':>5s} {'smp':>6s} {'bad':>9s} "
+			f"{'act':>5s} {'blkq':>5s} {'spr':>5s} {'smp':>6s} {'bad':>11s} "
 			f"{'aloss':>7s} {'asuc':>6s} {'floss':>7s} {'fsuc':>6s} "
 			f"{'loss':>7s} {'dist':>7s} {'metr':>7s} {'area':>7s} "
 			f"{'jmin':>6s} {'rmin':>6s}",
@@ -5685,7 +6075,8 @@ def _map_init_log_progress(
 		f"{_map_init_term_float(terms, 'uv_bad'):.0f}/"
 		f"{_map_init_term_float(terms, 'model_bad'):.0f}/"
 		f"{_map_init_term_float(terms, 'jac_bad'):.0f}/"
-		f"{_map_init_term_float(terms, 'jac_inv_bad'):.0f}"
+		f"{_map_init_term_float(terms, 'jac_inv_bad'):.0f}/"
+		f"{_map_init_term_float(terms, 'step_bad_quad'):.0f}"
 	)
 	add_loss, add_success = _map_init_interval_phase_stats(state, "add")
 	fringe_loss, fringe_success = _map_init_interval_phase_stats(state, "fringe")
@@ -5700,7 +6091,7 @@ def _map_init_log_progress(
 		f"{blocked_count:5d} "
 		f"{int(state.sparse_pruned_total):5d} "
 		f"{_map_init_term_float(terms, 'samples'):6.0f} "
-		f"{bad:>9s} "
+		f"{bad:>11s} "
 		f"{_map_init_fmt_val(add_loss):>7s} "
 		f"{_map_init_fmt_val(add_success):>6s} "
 		f"{_map_init_fmt_val(fringe_loss):>7s} "
@@ -5810,6 +6201,7 @@ def _map_init_apply_sparse_quad_cleanup(
 def _map_init_prune_bad_active_quads(
 	state: _SurfaceState,
 	*,
+	model_xyz: torch.Tensor,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
@@ -5837,19 +6229,29 @@ def _map_init_prune_bad_active_quads(
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=state.map_init.ext_coords,
+			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
 			cfg=cfg,
 			allow_partial_model_samples=allow_partial_model_samples,
 		)
 		sample_bad[quad_hw[:, 0], quad_hw[:, 1]] = ~ok
+	step_bad = _map_init_step_neighbor_bad_quad_mask(
+		uv,
+		active,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_depth=int(depth),
+		max_ratio=float(cfg.map_init.max_step_neighbor_ratio),
+	)
 	folded_bad = _map_init_folded_quad_mask(
 		uv,
 		active,
 		orientation_sign=state.map_init.orientation_sign,
 	)
-	bad = active.bool() & (sample_bad | folded_bad)
+	bad = active.bool() & (sample_bad | step_bad | folded_bad)
 	bad_count = int(bad.sum().detach().cpu())
 	if bad_count <= 0:
 		return 0, 0, 0
@@ -5876,7 +6278,7 @@ def _map_init_prune_bad_active_quads(
 	_map_init_sync_current_uv_to_pyramid(state.map_init)
 	_map_init_refresh_current_uv_from_pyramid(state.map_init, cfg)
 	_map_init_store_current_scale_masks(state.map_init)
-	sample_count = int((bad & sample_bad).sum().detach().cpu())
+	sample_count = int((bad & (sample_bad | step_bad)).sum().detach().cpu())
 	fold_count = int((bad & folded_bad).sum().detach().cpu())
 	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
 	return sample_count, fold_count, sparse_count
@@ -5889,6 +6291,7 @@ def _map_init_reject_bad_new_quads(
 	active_quad: torch.Tensor,
 	uv: torch.Tensor,
 	blocked_quad: torch.Tensor,
+	model_xyz: torch.Tensor,
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	cfg: SnapSurfConfig,
@@ -5915,19 +6318,29 @@ def _map_init_reject_bad_new_quads(
 			ext_valid=ext_valid,
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=state.map_init.ext_coords,
+			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_normals=model_normals,
 			model_depth=int(depth),
+			normal_sign=state.map_init.normal_sign,
 			cfg=cfg,
 			allow_partial_model_samples=allow_partial_model_samples,
 		)
 		sample_bad[quad_hw[:, 0], quad_hw[:, 1]] = ~ok
+	step_bad = _map_init_step_neighbor_bad_quad_mask(
+		uv,
+		active_quad,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_depth=int(depth),
+		max_ratio=float(cfg.map_init.max_step_neighbor_ratio),
+	) & new_quad
 	folded_bad = _map_init_folded_quad_mask(
 		uv,
 		active_quad,
 		orientation_sign=state.map_init.orientation_sign,
 	) & new_quad
-	bad = new_quad & (sample_bad | folded_bad)
+	bad = new_quad & (sample_bad | step_bad | folded_bad)
 	if not bool(bad.any().detach().cpu()):
 		return active_quad, uv, blocked_quad, 0, 0, 0
 	active_new = active_quad.bool() & ~bad
@@ -5943,7 +6356,7 @@ def _map_init_reject_bad_new_quads(
 	if not bool(cfg.map_init.dense_opt):
 		active_vertices = _map_init_active_vertex_mask(active_new, tuple(int(v) for v in uv.shape[:2]))
 		uv_new = torch.where(active_vertices.unsqueeze(-1), uv_new, torch.full_like(uv_new, float("nan")))
-	sample_count = int((bad & sample_bad).sum().detach().cpu())
+	sample_count = int((bad & (sample_bad | step_bad)).sum().detach().cpu())
 	fold_count = int((bad & folded_bad).sum().detach().cpu())
 	return active_new, uv_new, blocked_new, sample_count, fold_count, sparse_count
 
@@ -5989,7 +6402,7 @@ def _map_init_optimize_vertex_mask(
 			"sample_loss": z.detach(), "sample_total": z.detach(), "sample_valid": z.detach(),
 			"sample_bad": z.detach(), "sample_bad_frac": z.detach(),
 			"quad_total": z.detach(), "quad_success": z.detach(), "quad_success_frac": z.detach(),
-			"jac_bad_quad": z.detach(), "jac_inv_bad_quad": z.detach(),
+			"jac_bad_quad": z.detach(), "jac_inv_bad_quad": z.detach(), "step_bad_quad": z.detach(),
 			"completed": z.detach(), "requested": z.detach(),
 		}
 	remaining = max(0, int(cfg.map_init.iters) - int(state.map_init.total_iters))
@@ -6101,7 +6514,7 @@ def _map_init_optimize_vertex_mask(
 			global_iter = state.map_init.total_iters + local_iter
 			if global_iter % progress_interval == 0:
 				_map_init_log_progress(
-					state=state.map_init,
+				state=state.map_init,
 					mode=mode,
 					block=state.map_init.opt_blocks + 1,
 					iter_idx=global_iter,
@@ -6183,7 +6596,7 @@ def _map_init_optimize_block(
 			"sample_loss": z.detach(), "sample_total": z.detach(), "sample_valid": z.detach(),
 			"sample_bad": z.detach(), "sample_bad_frac": z.detach(),
 			"quad_total": z.detach(), "quad_success": z.detach(), "quad_success_frac": z.detach(),
-			"jac_bad_quad": z.detach(), "jac_inv_bad_quad": z.detach(),
+			"jac_bad_quad": z.detach(), "jac_inv_bad_quad": z.detach(), "step_bad_quad": z.detach(),
 		}
 	H, W = int(model_valid.shape[1]), int(model_valid.shape[2])
 	dense_mode = bool(cfg.map_init.dense_opt)
@@ -6294,7 +6707,7 @@ def _map_init_optimize_block(
 			global_iter = state.map_init.total_iters + local_iter
 			if global_iter % progress_interval == 0:
 				_map_init_log_progress(
-					state=state.map_init,
+				state=state.map_init,
 					mode=mode,
 					block=state.map_init.opt_blocks + 1,
 					iter_idx=global_iter,
@@ -6597,22 +7010,34 @@ def _run_map_init_for_surface(
 						cfg=cfg,
 					)
 				completed_seed = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
-				pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
-					state,
-					model_valid=model_valid,
-					model_normals=model_normals,
-					cfg=cfg,
-				)
-				if pruned_sample > 0 or pruned_fold > 0 or pruned_sparse > 0:
-					last_terms = _map_init_eval_terms_for_state(
+				if completed_seed < seed_block:
+					seed_opt_complete = False
+				if seed_opt_complete:
+					pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
 						state,
 						model_xyz=model_xyz,
 						model_valid=model_valid,
 						model_normals=model_normals,
 						cfg=cfg,
 					)
-				if completed_seed < seed_block:
-					seed_opt_complete = False
+					if pruned_sample > 0 or pruned_fold > 0 or pruned_sparse > 0:
+						last_terms = _map_init_eval_terms_for_state(
+							state,
+							model_xyz=model_xyz,
+							model_valid=model_valid,
+							model_normals=model_normals,
+							cfg=cfg,
+						)
+						_map_init_log(
+							"seed prune "
+							f"level={state.map_init.scale_level} "
+							f"sample={pruned_sample} "
+							f"fold={pruned_fold} "
+							f"sparse={pruned_sparse} "
+							f"active={state.map_init.active_count()}"
+						)
+					if state.map_init.active_count() <= 0:
+						seed_opt_complete = False
 			while seed_opt_complete and state.map_init.total_iters < int(cfg.map_init.iters):
 				added = _map_init_try_coarser_revisit(
 					state,
@@ -6689,6 +7114,7 @@ def _run_map_init_for_surface(
 					completed = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
 					pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
 						state,
+						model_xyz=model_xyz,
 						model_valid=model_valid,
 						model_normals=model_normals,
 						cfg=cfg,
@@ -6733,6 +7159,7 @@ def _run_map_init_for_surface(
 						completed_repair = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
 						pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
 							state,
+							model_xyz=model_xyz,
 							model_valid=model_valid,
 							model_normals=model_normals,
 							cfg=cfg,
@@ -6777,6 +7204,7 @@ def _run_map_init_for_surface(
 					):
 						pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
 							state,
+							model_xyz=model_xyz,
 							model_valid=model_valid,
 							model_normals=model_normals,
 							cfg=cfg,
@@ -6799,6 +7227,20 @@ def _run_map_init_for_surface(
 						)
 						continue
 					break
+			while int(state.map_init.scale_level) > int(state.map_init.target_scale_level):
+				_debug_write_map_init_scale_objs(
+					cfg=cfg,
+					surface_index=surface_index,
+					surface_count=surface_count,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					ext_xyz=ext_xyz,
+					ext_valid=ext_valid,
+					state=state,
+				)
+				if not _map_init_transition_to_finer(state, cfg):
+					break
+				_map_init_sync_current_uv_to_pyramid(state.map_init)
 			_map_init_finalize_dyadic_state(state, cfg)
 			_debug_write_map_init_scale_objs(
 				cfg=cfg,
@@ -6872,6 +7314,7 @@ def _run_map_init_for_surface(
 				("samples", "snaps_map_samples"),
 				("uv_bad", "snaps_map_uvbad"),
 				("model_bad", "snaps_map_model_bad"),
+				("step_bad_quad", "snaps_map_step_bad"),
 			):
 				if key in last_terms:
 					stats[stat_key] = float(last_terms[key].detach().cpu())
@@ -7254,7 +7697,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 			"snaps_map_smooth", "snaps_map_bend", "snaps_map_jac",
 			"snaps_map_jmin", "snaps_map_prior", "snaps_map_reg",
 			"snaps_map_jbad", "snaps_map_jbadf",
-			"snaps_map_samples", "snaps_map_uvbad", "snaps_map_model_bad",
+			"snaps_map_samples", "snaps_map_uvbad", "snaps_map_model_bad", "snaps_map_step_bad",
 			"snaps_map_nsign", "snaps_map_scales",
 		}
 		for k in avg_keys:
