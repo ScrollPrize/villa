@@ -37,6 +37,25 @@ def _truthy_config_bool(value: object) -> bool:
 	return False
 
 
+def _require_torch_device_available(device: torch.device) -> None:
+	if device.type != "cuda":
+		return
+	if not torch.cuda.is_available():
+		raise RuntimeError(
+			"CUDA device was requested, but PyTorch cannot access an NVIDIA GPU. "
+			"Expose the NVIDIA driver/device nodes to this process (for example "
+			"/dev/nvidia*, Docker --gpus all, or the equivalent sandbox GPU "
+			"passthrough). Refusing to continue because falling back to CPU would "
+			"make fit smoke/perf runs misleading."
+		)
+	count = int(torch.cuda.device_count())
+	if device.index is not None and int(device.index) >= count:
+		raise RuntimeError(
+			f"CUDA device {device} was requested, but PyTorch reports only "
+			f"{count} visible CUDA device(s)."
+		)
+
+
 def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
 	"""Bilinear center of the model grid — matches (Hm-1)/2, (Wm-1)/2 in station loss."""
 	xyz = mdl._grid_xyz()  # (D, Hm, Wm, 3)
@@ -249,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
 	print("opt:", opt_cfg)
 
 	device = torch.device(data_cfg.device)
+	_require_torch_device_available(device)
 	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
 	if model_init not in {"seed", "ext", "model"}:
 		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, or model)")

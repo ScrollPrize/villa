@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 
 import torch
 
@@ -12,6 +13,25 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 import fit
+
+
+class FitDeviceAvailabilityTest(unittest.TestCase):
+	def test_cpu_device_does_not_require_cuda(self) -> None:
+		with mock.patch.object(fit.torch.cuda, "is_available", return_value=False):
+			fit._require_torch_device_available(torch.device("cpu"))
+
+	def test_requested_cuda_fails_fast_when_not_visible(self) -> None:
+		with mock.patch.object(fit.torch.cuda, "is_available", return_value=False):
+			with self.assertRaisesRegex(RuntimeError, "CUDA device was requested"):
+				fit._require_torch_device_available(torch.device("cuda"))
+
+	def test_requested_cuda_index_must_be_visible(self) -> None:
+		with (
+			mock.patch.object(fit.torch.cuda, "is_available", return_value=True),
+			mock.patch.object(fit.torch.cuda, "device_count", return_value=1),
+		):
+			with self.assertRaisesRegex(RuntimeError, "only 1 visible CUDA"):
+				fit._require_torch_device_available(torch.device("cuda:1"))
 
 
 class _GridModel:

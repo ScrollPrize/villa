@@ -66,14 +66,14 @@
 					"map_inlier_distance": 4.0,
 					"map_init": {
 						"enabled": true,
-						"iters": 9000,
+						"iters": 2000,
 						"grow_opt_iters": 30,
 						"scale_levels": 1,
 						"scale_factor": 2,
 						"dense_opt": false,
 						"dense_reg_radius": 2,
 						"w_dense_prior": 0.0,
-						"repair_max_blocks": 0,
+						"repair_max_blocks": 10,
 						"repair_opt_iters": 100,
 						"repair_lr_mult": 0.1,
 						"repair_w_jac_mult": 10.0,
@@ -84,7 +84,9 @@
 						"w_surface_normal": 1.0,
 						"w_smooth": 1.0,
 						"w_bend": 0.01,
-						"w_jac": 10.0
+						"w_jac": 10.0,
+						"w_metric_smooth": 10.0,
+						"w_area_smooth": 1.0
 					}
 				}
 			}
