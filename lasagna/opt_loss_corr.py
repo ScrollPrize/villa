@@ -1044,6 +1044,12 @@ def _corr_winding_loss(
 	normal_align_sum = torch.zeros(K, device=dev, dtype=dt)
 	normal_align_wsum = torch.zeros(K, device=dev, dtype=dt)
 	target_normal_sum = torch.zeros(K, 3, device=dev, dtype=dt)
+	model_loc_d = torch.full((K, 2), -1, dtype=torch.long, device=dev)
+	model_loc_h = torch.full((K, 2), float("nan"), dtype=dt, device=dev)
+	model_loc_w = torch.full((K, 2), float("nan"), dtype=dt, device=dev)
+	model_loc_weight = torch.zeros(K, 2, dtype=dt, device=dev)
+	model_loc_residual = torch.full((K, 2), float("nan"), dtype=dt, device=dev)
+	model_loc_valid = torch.zeros(K, 2, dtype=torch.bool, device=dev)
 
 	# Shared splat maps across both ci=2 and ci=3. H_map is kept for scalar
 	# diagnostics; V_map/W_map is the averaged displacement vector used by the
@@ -1110,6 +1116,14 @@ def _corr_winding_loss(
 			# Continuous mesh-space position of the corr point on the avg-pair quad.
 			h_cont = h_ci.to(dt) + u_ci
 			w_cont = w_ci.to(dt) + v_ci
+			loc_idx = ci - 2
+			loc_ok = mask_p > 1e-8
+			model_loc_valid[vi, loc_idx] = loc_ok
+			model_loc_d[vi, loc_idx] = d_ci
+			model_loc_h[vi, loc_idx] = torch.where(loc_ok, h_cont, model_loc_h[vi, loc_idx])
+			model_loc_w[vi, loc_idx] = torch.where(loc_ok, w_cont, model_loc_w[vi, loc_idx])
+			model_loc_weight[vi, loc_idx] = torch.where(loc_ok, mask_p, model_loc_weight[vi, loc_idx])
+			model_loc_residual[vi, loc_idx] = torch.where(loc_ok, err, model_loc_residual[vi, loc_idx])
 
 			_height_map_splat(
 				d_ci, h_ci, w_ci, h_cont, w_cont,
@@ -1173,6 +1187,9 @@ def _corr_winding_loss(
 		valid=point_valid, is_absolute=is_absolute,
 		point_normal=gt_n, target_normal=target_normal,
 		normal_alignment=normal_alignment,
+		model_loc_d=model_loc_d, model_loc_h=model_loc_h, model_loc_w=model_loc_w,
+		model_loc_weight=model_loc_weight, model_loc_residual=model_loc_residual,
+		model_loc_valid=model_loc_valid,
 	)
 	if _dbg_call_count == 1:
 		print_detail("INIT")
@@ -1188,9 +1205,12 @@ def _build_winding_results(
 	pts: torch.Tensor, winda: torch.Tensor, valid: torch.Tensor,
 	is_absolute: torch.Tensor, point_normal: torch.Tensor,
 	target_normal: torch.Tensor, normal_alignment: torch.Tensor,
+	model_loc_d: torch.Tensor, model_loc_h: torch.Tensor, model_loc_w: torch.Tensor,
+	model_loc_weight: torch.Tensor, model_loc_residual: torch.Tensor,
+	model_loc_valid: torch.Tensor,
 ) -> dict:
 	"""Build JSON-serializable dict of per-point winding results."""
-	result: dict = {"points": {}, "collection_avgs": {}}
+	result: dict = {"points": {}, "points_list": [], "collection_avgs": {}}
 	K = int(pts.shape[0])
 
 	def _finite_float(t: torch.Tensor) -> float | None:
@@ -1211,8 +1231,29 @@ def _build_winding_results(
 		e_raw = _finite_float(err[i])
 		e = e_raw if bool(valid[i]) else None
 		n_dot = _finite_float(normal_alignment[i])
+		locations = []
+		for loc_i, anchor_name in enumerate(("avg_low", "avg_up")):
+			if not bool(model_loc_valid[i, loc_i]):
+				continue
+			d_v = int(model_loc_d[i, loc_i].item())
+			h_v = _finite_float(model_loc_h[i, loc_i])
+			w_v = _finite_float(model_loc_w[i, loc_i])
+			weight_v = _finite_float(model_loc_weight[i, loc_i])
+			residual_v = _finite_float(model_loc_residual[i, loc_i])
+			if h_v is None or w_v is None or weight_v is None:
+				continue
+			locations.append({
+				"anchor": anchor_name,
+				"d": d_v,
+				"h": round(h_v, 6),
+				"w": round(w_v, 6),
+				"weight": round(weight_v, 6),
+				"residual": round(residual_v, 6) if residual_v is not None else None,
+			})
 		entry: dict = {
+			"row_index": i,
 			"collection_id": cid,
+			"point_id": pid,
 			"p": [round(float(pts[i, j].item()), 2) for j in range(3)],
 			"winding_obs": round(w_obs, 6) if w_obs is not None else None,
 			"winding_target": round(w_tgt, 6) if w_tgt is not None else None,
@@ -1222,7 +1263,9 @@ def _build_winding_results(
 			"target_normal": _finite_vec(target_normal[i]),
 			"valid": bool(valid[i]),
 			"absolute": bool(is_absolute[i]),
+			"model_locations": locations,
 		}
+		result["points_list"].append(entry)
 		result["points"][str(pid)] = entry
 	# Per-collection averages
 	uc = torch.unique(col)

@@ -114,7 +114,7 @@ class ApprovalInpaintTest(unittest.TestCase):
 			self.assertEqual(point["wind_a"], 2.0)
 		_assert_points_inside_centered_extent(self, result)
 
-	def test_output_mask_contours_cover_selected_cell_and_boundary(self) -> None:
+	def test_output_mask_uses_generated_corr_collection(self) -> None:
 		approval = np.zeros((7, 7), dtype=np.uint8)
 		approval[1:6, 1:6] = 255
 		approval[2:5, 2:5] = 0
@@ -133,17 +133,29 @@ class ApprovalInpaintTest(unittest.TestCase):
 
 		self.assertIsNotNone(result.output_mask)
 		mask = result.output_mask or {}
-		self.assertEqual(mask["source_bounds"], [1, 5, 1, 5])
-		self.assertEqual(mask["source_shape"], [7, 7])
-		self.assertEqual(mask["source_mesh_step"], 10.0)
+		self.assertEqual(mask["version"], 2)
+		self.assertEqual(mask["source"], "corr_points")
+		self.assertEqual(mask["corr_collection_ids"], [0])
 		self.assertEqual(mask["dilation_radius"], 3)
-		self.assertEqual(len(mask["contours_xyz"]), 1)
-		contour = np.asarray(mask["contours_xyz"][0], dtype=np.float32)
-		self.assertGreaterEqual(contour.shape[0], 4)
-		self.assertAlmostEqual(float(contour[:, 0].min()), 5.0)
-		self.assertAlmostEqual(float(contour[:, 0].max()), 55.0)
-		self.assertAlmostEqual(float(contour[:, 1].min()), 5.0)
-		self.assertAlmostEqual(float(contour[:, 1].max()), 55.0)
+		self.assertEqual(len(mask["corr_contours"]), 1)
+		self.assertGreaterEqual(len(mask["corr_contours"][0]["point_ids"]), 4)
+		self.assertIn("0", result.corr_points["collections"])
+		self.assertEqual(result.corr_points["collections"]["0"]["name"], "approval_inpaint")
+
+	def test_skeleton_points_are_emitted_in_loop_order(self) -> None:
+		skeleton = np.zeros((9, 9), dtype=bool)
+		skeleton[2, 3:6] = True
+		skeleton[3:6, 6] = True
+		skeleton[6, 3:6] = True
+		skeleton[3:6, 2] = True
+
+		contours = approval_inpaint.sample_skeleton_contours(skeleton, spacing_px=1.0)
+
+		self.assertEqual(len(contours), 1)
+		contour = contours[0]
+		self.assertEqual(len(contour), int(skeleton.sum()))
+		for a, b in zip(contour, contour[1:] + contour[:1]):
+			self.assertLessEqual(max(abs(a[0] - b[0]), abs(a[1] - b[1])), 1)
 
 	def test_output_mask_recenters_with_off_center_seed(self) -> None:
 		approval = np.zeros((7, 7), dtype=np.uint8)
@@ -170,8 +182,8 @@ class ApprovalInpaintTest(unittest.TestCase):
 		self.assertEqual(result_a.seed, (30.0, 30.0, 100.0))
 		mask_a = result_a.output_mask or {}
 		mask_b = result_b.output_mask or {}
-		self.assertEqual(mask_a["source_bounds"], [1, 5, 1, 5])
-		self.assertEqual(mask_a["source_bounds"], mask_b["source_bounds"])
+		self.assertEqual(mask_a["corr_collection_ids"], [0])
+		self.assertEqual(mask_a["corr_collection_ids"], mask_b["corr_collection_ids"])
 
 	def test_build_recenters_off_center_seed_from_approval_bounds(self) -> None:
 		approval = np.zeros((7, 7), dtype=np.uint8)

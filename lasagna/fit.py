@@ -320,13 +320,12 @@ def main(argv: list[str] | None = None) -> int:
 			"approval-inpaint-output-mask-dilate": int(getattr(args, "approval_inpaint_output_mask_dilate", 3)),
 		})
 		if approval_inpaint_output_mask is not None:
-			fit_config["args"]["approval-inpaint-output-mask-contours"] = len(
-				approval_inpaint_output_mask.get("contours_xyz", [])
+			fit_config["args"]["approval-inpaint-output-mask-source"] = str(
+				approval_inpaint_output_mask.get("source", "corr_points")
 			)
-			fit_config["args"]["approval-inpaint-output-mask-points"] = sum(
-				len(c) for c in approval_inpaint_output_mask.get("contours_xyz", [])
-				if isinstance(c, list)
-			)
+			fit_config["args"]["approval-inpaint-output-mask-corr-collections"] = [
+				int(v) for v in approval_inpaint_output_mask.get("corr_collection_ids", [])
+			]
 		print(
 			f"[fit] approval-inpaint: points={result.point_count} "
 			f"component={result.component_size} skeleton={result.skeleton_size} "
@@ -833,6 +832,19 @@ def main(argv: list[str] | None = None) -> int:
 			st["_corr_points_results_"] = corr_results
 		if approval_inpaint_output_mask is not None:
 			st["_approval_inpaint_output_mask_"] = copy.deepcopy(approval_inpaint_output_mask)
+			print(
+				"[fit] saving approval-inpaint output mask "
+				f"collections={approval_inpaint_output_mask.get('corr_collection_ids', [])} "
+				f"dilate={approval_inpaint_output_mask.get('dilation_radius')} "
+				f"corr_results_saved={corr_results is not None}",
+				flush=True,
+			)
+			if corr_results is None:
+				print(
+					"[fit] WARNING: approval-inpaint output mask was requested, but no "
+					"corr point results were produced; fit2tifxyz cannot project the mask",
+					flush=True,
+				)
 		# Store winding volume auto-offset if computed
 		from opt_loss_winding_volume import _winding_offset, _winding_direction
 		if _winding_offset is not None:

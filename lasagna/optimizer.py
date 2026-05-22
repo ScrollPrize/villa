@@ -157,25 +157,19 @@ def _cyl_outside_mode_for_direction(direction: int) -> str:
 
 def _stage_to_modifiers(
 	base: dict[str, float],
-	prev_eff: dict[str, float] | None,
 	default_mul: float | None,
 	w_fac: dict | None,
 ) -> tuple[dict[str, float], dict[str, float]]:
-	if prev_eff is None:
-		prev_eff = {k: float(v) for k, v in base.items()}
-	if default_mul is None and w_fac is None:
-		eff = dict(prev_eff)
-	else:
-		eff = dict(prev_eff)
-		if default_mul is not None:
-			for name in base.keys():
-				if w_fac is None or name not in w_fac:
-					eff[name] = float(base[name]) * float(default_mul)
-		if w_fac is not None:
-			for k, v in w_fac.items():
-				if v is None:
-					continue
-				eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
+	eff = {k: float(v) for k, v in base.items()}
+	if default_mul is not None:
+		for name in base.keys():
+			if w_fac is None or name not in w_fac:
+				eff[name] = float(base[name]) * float(default_mul)
+	if w_fac is not None:
+		for k, v in w_fac.items():
+			if v is None:
+				continue
+			eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
 
 	mods: dict[str, float] = {}
 	for name, val in eff.items():
@@ -193,7 +187,6 @@ def _parse_opt_settings(
 	stage_name: str,
 	opt_cfg: dict,
 	base: dict[str, float],
-	prev_eff: dict[str, float] | None,
 ) -> OptSettings:
 	opt_cfg = dict(opt_cfg)
 	steps = max(0, int(opt_cfg.get("steps", 0)))
@@ -239,7 +232,7 @@ def _parse_opt_settings(
 		bad_terms = sorted(set(str(k) for k in w_fac.keys()) - set(base.keys()))
 		if bad_terms:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.w_fac: unknown term(s): {bad_terms}")
-	eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, w_fac)
+	eff, _mods = _stage_to_modifiers(base, default_mul, w_fac)
 	if "cyl_params" in params:
 		if params != ["cyl_params"]:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
@@ -403,7 +396,7 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 		_require_consumed_dict(where=f"stage '{name}'", cfg=s)
 		if not isinstance(global_opt_cfg, dict):
 			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
-		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base, prev_eff=None)
+		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
 		out.append(Stage(name=name, global_opt=global_opt))
 	if init_mode == "cylinder_seed":
 		_validate_cylinder_seed_stage_roles(out)
