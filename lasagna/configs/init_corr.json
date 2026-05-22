@@ -2,7 +2,7 @@
 	"args": {
 		"model-init": "seed",
 		"init-mode": "shell-dir-crop",
-		"mesh-step": 50.0
+		"mesh-step": 20.0
 	},
 	"base": {
 		"normal": 1.0,

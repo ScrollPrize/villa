@@ -783,6 +783,28 @@ void CPointCollectionWidget::onAbsoluteWindingChanged(Qt::CheckState state)
             auto metadata = collections.at(_selected_collection_id).metadata;
             metadata.absolute_winding_number = (state == Qt::Checked);
             _point_collection->setCollectionMetadata(_selected_collection_id, metadata);
+
+            if (state == Qt::Checked) {
+                const float defaultWinding = _fill_constant_spinbox
+                    ? static_cast<float>(_fill_constant_spinbox->value())
+                    : 0.0f;
+                std::vector<ColPoint> pointsToEnable;
+                pointsToEnable.reserve(collections.at(_selected_collection_id).points.size());
+                for (const auto& [pointId, point] : collections.at(_selected_collection_id).points) {
+                    (void)pointId;
+                    if (std::isnan(point.winding_annotation)) {
+                        ColPoint updatedPoint = point;
+                        updatedPoint.winding_annotation = defaultWinding;
+                        pointsToEnable.push_back(updatedPoint);
+                    }
+                }
+                for (const ColPoint& point : pointsToEnable) {
+                    _point_collection->updatePoint(point);
+                }
+                if (!pointsToEnable.empty()) {
+                    updateMetadataWidgets();
+                }
+            }
         }
     }
 }

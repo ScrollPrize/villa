@@ -1,6 +1,5 @@
 
 import os
-import copy
 import json
 import glob
 import zarr
@@ -30,11 +29,11 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 # PHercParis4
 volpkg_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg'
-scroll_zarr_path = None
+scroll_zarr_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/2um_ds2_ps256_surf.zarr/0'
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 7500, 9500
+z_begin, z_end = 6000, 15500
 cross_patch_pcl_json_paths = [
       '/home/sean/Desktop/s1_relative_windings.json',
   ]
@@ -55,9 +54,8 @@ unattached_pcl_json_paths = [
 # spiral_outward_sense = 'CW'  # CW | ACW
 # umbilicus_z_to_yx = lambda f: thaumato_umbilicus_z_to_yx('/home/paul/projects/vesuvius-scrolls/data/s5-umbilicus.txt', downsample_factor=f)
 # scroll_name = 's5'
-# z_begin, z_end = 3850, 4150
+# z_begin, z_end = 15400, 16600
 # voxel_size_um = 8.0
-# seed_patch_id = None
 
 cache_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/spiral_cache'
 downsample_factor = 4
@@ -66,50 +64,48 @@ z_end //= downsample_factor
 
 default_config = {
     'random_seed': 1,
-    'learning_rate': 2.e-4,
+    'learning_rate': 1.e-4,
     'exp_lr_schedule': True,
     'lr_final_factor': 0.05,
-    'num_training_steps': 10_000,
+    'num_training_steps': 15_000,
     'num_flow_integration_steps': 3,
     'flow_integration_solver': 'rk4',
     'num_flow_timesteps': 1,
     'flow_bounds_z_margin': 40,
     'flow_bounds_radius': 800,
-    'flow_voxel_resolution': 5,
-    'flow_field_high_res_lr_scale': 1.5e-1,
+    'flow_voxel_resolution': 4,
+    'flow_field_high_res_lr_scale': 3.0e-1,
     'gap_expander_logit_resolution': 6,
     'gap_expander_num_windings': 85,
-    'gap_expander_lr_scale': 0.1,
+    'gap_expander_lr_scale': 0.3,
     'linear_z_resolution': 12,
     'initial_dr_per_winding': 4.,
     'radius_loss_margin': 0.025,
     'patch_loss_z_margin': 0,
     'patch_dt_norm_p': 0.5,
     'patch_dt_within_patch_norm_p': 3.0,
-    'num_patches_per_step': 120,
+    'num_patches_per_step': 256,
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
     'winding_number_num_pairs': 2000,
-    'winding_number_num_pcls': 1,
+    'winding_number_num_pcls': 3,
     'winding_number_adjacent_patches_only': True,
-    'unattached_pcl_num_per_step': 16,
-    'unattached_pcl_num_points_per_step': 32,
+    'unattached_pcl_num_per_step': 48,
+    'unattached_pcl_num_points_per_step': 64,
+    'unattached_pcl_min_point_spacing': 4.,
     'normals_num_points': 2000,
     'regularisation_num_points': 1500,
-    'loss_weight_patch_radius': 8.e0,
+    'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
-    'loss_weight_winding_number': 10.,
+    'loss_weight_winding_number': 20.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_patch_stretch': 40.0,
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
-    'loss_start_patch_dt': 5000,
-    'working_set_mode': 'global',  # 'progressive' (grow from a seed when satisfied) | 'progressive_fixed' (grow from a seed on a fixed iteration schedule) | 'global' (fit all patches at once)
-    'working_set_check_interval': 10,
-    'progressive_fixed_add_interval': 50,
-    'output_winding_range': (10, 80),
+    'loss_start_patch_dt': 9000,
+    'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
 }
@@ -219,9 +215,12 @@ def get_bounding_windings(relative_yx, dr_per_winding):
     return theta, radius, inner_winding, outer_winding
 
 
-def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3.):
+def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3., winding_range=None):
 
-    min_w, max_w = cfg['output_winding_range']
+    if winding_range is None:
+        min_w, max_w = cfg['output_first_winding'], float('inf')
+    else:
+        min_w, max_w = winding_range
     theta, radius, inner_winding, outer_winding = get_bounding_windings(relative_yx, dr_per_winding)
     def evaluate_kernel(winding_idx):
         winding_xy = get_winding_xy(winding_idx, theta, dr_per_winding)
@@ -295,6 +294,10 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
+        # Cached upsampled flow at t=0 for the num_flow_timesteps==1 fast path. Built once
+        # per diffeomorphism instance (one per training iteration), shared across forward and
+        # inverse calls so the per-iteration trilinear LR->HR upsampling is amortised.
+        self._cached_flow = None
 
     def _velocity(self, t_int, current_zyx_scaled):
         # t_int is a scalar in [0, 1]; flow_field expects t in [-1, 1]
@@ -313,7 +316,9 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
             # Time-invariant flow: precompute the upsampled flow once and inline a manual rk4 loop
             # to skip torchdiffeq's per-step dispatch overhead.
             assert self.solver == 'rk4'
-            cached_flow = self.flow_field(0.0)
+            if self._cached_flow is None:
+                self._cached_flow = self.flow_field(0.0)
+            cached_flow = self._cached_flow
             for _ in range(n_steps):
                 k1 = sample_field(y, cached_flow)
                 k2 = sample_field(y + (h / 2) * k1, cached_flow)
@@ -530,8 +535,8 @@ class SpiralAndTransform(nn.Module):
     def get_dr_per_winding(self):
         return F.softplus(self.dr_per_winding_logit * self.dr_per_winding_scale)
 
-    def get_spiral_density(self, spiral_zyx):
-        return get_spiral_density(spiral_zyx[..., 1:], dr_per_winding=self.get_dr_per_winding(), sigma=1.) * self.spiral_intensity
+    def get_spiral_density(self, spiral_zyx, winding_range=None):
+        return get_spiral_density(spiral_zyx[..., 1:], dr_per_winding=self.get_dr_per_winding(), sigma=1., winding_range=winding_range) * self.spiral_intensity
 
 
 def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | None:
@@ -543,54 +548,13 @@ def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | Non
     run_idx = np.searchsorted(run_starts, idx, side='right') - 1
     return run_starts[run_idx], run_ends[run_idx] + 1
 
-
-def _min_pair_distance(a, b):
-    # Minimum pairwise distance between two point clouds (each [N, 3]).
-    return torch.cdist(a, b).min()
-
-
-def _build_progressive_patch_order(patches, seed_patch_idx, num_sample_points=500):
-    # Greedy nearest-to-active ordering: starting from seed_patch_idx, repeatedly add the
-    # not-yet-active patch with the smallest min-pairwise distance to its closest active patch.
-    device = torch.device('cuda')
-    samples = []
-    for patch in patches:
-        valid_zyxs = patch.valid_zyxs.to(device=device, dtype=torch.float32)
-        if valid_zyxs.shape[0] > num_sample_points:
-            idx = torch.randperm(valid_zyxs.shape[0], device=device)[:num_sample_points]
-            valid_zyxs = valid_zyxs[idx]
-        samples.append(valid_zyxs)
-
-    n = len(patches)
-    active = np.zeros(n, dtype=bool)
-    min_dist = np.full(n, np.inf, dtype=np.float64)
-    active[seed_patch_idx] = True
-    min_dist[seed_patch_idx] = -np.inf
-
-    order = [seed_patch_idx]
-    last_added_pts = samples[seed_patch_idx]
-    for _ in tqdm(range(n - 1), desc='ordering patches'):
-        for i in range(n):
-            if active[i]:
-                continue
-            d = float(_min_pair_distance(samples[i], last_added_pts).item())
-            if d < min_dist[i]:
-                min_dist[i] = d
-        next_idx = int(np.argmin(np.where(active, np.inf, min_dist)))
-        order.append(next_idx)
-        active[next_idx] = True
-        min_dist[next_idx] = -np.inf
-        last_added_pts = samples[next_idx]
-    return order
-
-
-def _get_working_set_probabilities(full_probabilities, working_set_indices):
-    masked = np.zeros_like(full_probabilities)
-    masked[working_set_indices] = full_probabilities[working_set_indices]
-    total = masked.sum()
-    if total <= 0:
-        raise ValueError('Working set has zero total sampling probability')
-    return masked / total
+def _build_line_runs(line_valid):
+    # Returns (los, his) arrays of contiguous True runs in a 1-D bool array.
+    padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
+    diff = np.diff(padded)
+    los = np.where(diff == 1)[0].astype(np.int64)
+    his = np.where(diff == -1)[0].astype(np.int64)
+    return los, his
 
 
 def _prepare_patch_sampling_cache(patches, patch_loss_z_margin):
@@ -615,6 +579,31 @@ def _prepare_patch_sampling_cache(patches, patch_loss_z_margin):
         patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
         patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
         patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
+
+        # Precompute, per row and per column, the contiguous valid-quad runs so the
+        # per-iteration sampler can skip the run_containing_index work. We keep the
+        # original "row uniform, run-within-row weighted by length" distribution by
+        # indexing runs per row/col.
+        def _runs_per_line(mask_np, fixed_axis, valid_lines):
+            # Returns parallel lists indexed 0..len(valid_lines)-1:
+            # los_list[k], his_list[k], cum_list[k] are arrays of run lo/hi/cum-length
+            # for the k'th valid line (mask_np row if fixed_axis==0 else column).
+            los_list, his_list, cum_list = [], [], []
+            for r in valid_lines:
+                line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
+                los, his = _build_line_runs(line)
+                los_list.append(los)
+                his_list.append(his)
+                cum_list.append(np.cumsum(his - los))
+            return los_list, his_list, cum_list
+
+        patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
+            in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
+        )
+        patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
+            in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
+        )
+
         patch_areas[patch_idx] = float(patch.area)
     inv_weights = patch_areas ** 0.5
     return inv_weights / inv_weights.sum()
@@ -654,7 +643,80 @@ def _sample_strip_ijs(line_valid, seed, fixed_coord, axis, num_points):
     return ijs
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_indices, umbilicus_zyx=None):
+class PatchGpuAtlas:
+    """All patches' (H, W, 3) zyxs grids packed into one flat GPU tensor, so
+    fractional-(i, j) bilinear lookups can run as a single batched gather instead
+    of per-patch CPU dispatch."""
+
+    def __init__(self, patches_by_id, device='cuda'):
+        flat_pieces = []
+        valid_quad_pieces = []
+        offsets = [0]
+        quad_offsets = [0]
+        widths = []
+        heights = []
+        for p in patches_by_id.values():
+            z = p.zyxs  # (H, W, 3) on CPU
+            H, W = z.shape[:2]
+            flat_pieces.append(z.reshape(-1, 3).to(device=device, dtype=torch.float32))
+            valid_quad_pieces.append(p.valid_quad_mask.reshape(-1).to(device=device, dtype=torch.bool))
+            offsets.append(offsets[-1] + H * W)
+            quad_offsets.append(quad_offsets[-1] + max(H - 1, 0) * max(W - 1, 0))
+            widths.append(W)
+            heights.append(H)
+        self.zyxs_flat = torch.cat(flat_pieces, dim=0)
+        self.valid_quads_flat = torch.cat(valid_quad_pieces, dim=0)
+        self.offsets = torch.tensor(offsets, device=device, dtype=torch.int64)  # (N+1,)
+        self.quad_offsets = torch.tensor(quad_offsets, device=device, dtype=torch.int64)  # (N+1,)
+        self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
+        self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
+        self.quad_widths = torch.clamp(self.widths - 1, min=0)
+        self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
+
+    def memory_mb(self):
+        return (self.zyxs_flat.numel() * 4 + self.valid_quads_flat.numel()) / 1e6
+
+    def lookup(self, patch_idx_per_sample, ijs):
+        # patch_idx_per_sample: (...,) int64 on GPU
+        # ijs: (..., 2) float on GPU
+        # returns (..., 3) on GPU. Matches Patch.ij_to_zyx: invalid or out-of-bounds
+        # samples are filled with -1 instead of indexing past the flat atlas tensor.
+        patch_idx_ok = (patch_idx_per_sample >= 0) & (patch_idx_per_sample < self.widths.shape[0])
+        if not patch_idx_ok.all():
+            bad_idx = (~patch_idx_ok).nonzero()[0]
+            bad_patch = int(patch_idx_per_sample[tuple(bad_idx)].item())
+            raise IndexError(f'PatchGpuAtlas.lookup got patch index {bad_patch}, expected [0, {self.widths.shape[0]})')
+
+        base = self.offsets[patch_idx_per_sample]
+        W = self.widths[patch_idx_per_sample]
+        H = self.heights[patch_idx_per_sample]
+        quad_base = self.quad_offsets[patch_idx_per_sample]
+        quad_W = self.quad_widths[patch_idx_per_sample]
+        ij = ijs.to(torch.float32)
+        i0 = ij[..., 0].floor().to(torch.int64)
+        j0 = ij[..., 1].floor().to(torch.int64)
+        in_bounds = (i0 >= 0) & (j0 >= 0) & (i0 < H - 1) & (j0 < W - 1)
+        safe_i0 = torch.minimum(i0.clamp(min=0), (H - 2).clamp(min=0))
+        safe_j0 = torch.minimum(j0.clamp(min=0), (W - 2).clamp(min=0))
+        valid_quad = self.valid_quads_flat[quad_base + safe_i0 * quad_W + safe_j0] & in_bounds
+        di = (ij[..., 0] - safe_i0.to(torch.float32)).unsqueeze(-1)
+        dj = (ij[..., 1] - safe_j0.to(torch.float32)).unsqueeze(-1)
+        flat_tl = base + safe_i0 * W + safe_j0
+        flat_tr = flat_tl + 1
+        flat_bl = flat_tl + W
+        flat_br = flat_bl + 1
+        z = self.zyxs_flat
+        tl = z[flat_tl]
+        tr = z[flat_tr]
+        bl = z[flat_bl]
+        br = z[flat_br]
+        top = tl + (tr - tl) * dj
+        bottom = bl + (br - bl) * dj
+        interp = top + (bottom - top) * di
+        return torch.where(valid_quad.unsqueeze(-1), interp, torch.full_like(interp, -1.0))
+
+
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, umbilicus_zyx=None):
     if len(patch_indices) == 0:
         raise ValueError('Expected at least one patch index')
 
@@ -668,39 +730,60 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     num_points_per_direction = cfg['num_points_per_patch'] // 2
     N = len(patch_indices)
 
-    horizontal_ijs_by_patch = np.empty([N, num_points_per_direction, 2], dtype=np.float32)
-    vertical_ijs_by_patch = np.empty([N, num_points_per_direction, 2], dtype=np.float32)
+    P = num_points_per_direction
+    horizontal_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
+    vertical_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
+    rand = np.random.random
+    randint = np.random.randint
+    fixed_jitters_h = rand(N).astype(np.float32)
+    fixed_jitters_v = rand(N).astype(np.float32)
+    var_jitters_h = rand((N, P)).astype(np.float32)
+    var_jitters_v = rand((N, P)).astype(np.float32)
     for n, patch_idx in enumerate(patch_indices):
         patch = patches[patch_idx]
-        valid_quad_mask_np = patch._sampling_valid_quad_mask_np
 
-        # Subsample from a contiguous region of one row
-        row_idx = np.random.choice(patch._sampling_valid_quad_rows)
-        row_valid = valid_quad_mask_np[row_idx, :]
-        seed_j = np.random.choice(np.flatnonzero(row_valid))
-        horizontal_ijs_by_patch[n] = _sample_strip_ijs(row_valid, seed_j, row_idx, axis=0, num_points=num_points_per_direction)
+        # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
+        # within that row weighted by length (matches original `np.random.choice(flatnonzero)`).
+        rows_h = patch._sampling_valid_quad_rows
+        k = randint(rows_h.shape[0])
+        row_idx = rows_h[k]
+        cum_h = patch._h_runs_cum[k]
+        total_h = cum_h[-1]
+        if cum_h.shape[0] == 1:
+            r = 0
+        else:
+            r = np.searchsorted(cum_h, randint(total_h), side='right')
+        lo_h = patch._h_runs_los[k][r]
+        hi_h = patch._h_runs_his[k][r]
+        run_len_h = hi_h - lo_h
+        coords_h = np.sort(np.random.choice(run_len_h, P, replace=P > run_len_h))
+        horizontal_ijs_by_patch[n, :, 0] = row_idx + fixed_jitters_h[n]
+        horizontal_ijs_by_patch[n, :, 1] = lo_h + coords_h + var_jitters_h[n]
 
-        # Subsample from a contiguous region of one column
-        col_idx = np.random.choice(patch._sampling_valid_quad_cols)
-        col_valid = valid_quad_mask_np[:, col_idx]
-        seed_i = np.random.choice(np.flatnonzero(col_valid))
-        vertical_ijs_by_patch[n] = _sample_strip_ijs(col_valid, seed_i, col_idx, axis=1, num_points=num_points_per_direction)
+        # Vertical: same but with rows/cols swapped (fixed-coord is the column).
+        cols_v = patch._sampling_valid_quad_cols
+        k = randint(cols_v.shape[0])
+        col_idx = cols_v[k]
+        cum_v = patch._v_runs_cum[k]
+        total_v = cum_v[-1]
+        if cum_v.shape[0] == 1:
+            r = 0
+        else:
+            r = np.searchsorted(cum_v, randint(total_v), side='right')
+        lo_v = patch._v_runs_los[k][r]
+        hi_v = patch._v_runs_his[k][r]
+        run_len_v = hi_v - lo_v
+        coords_v = np.sort(np.random.choice(run_len_v, P, replace=P > run_len_v))
+        vertical_ijs_by_patch[n, :, 1] = col_idx + fixed_jitters_v[n]
+        vertical_ijs_by_patch[n, :, 0] = lo_v + coords_v + var_jitters_v[n]
 
-    # Bilinear-interpolate all sampled (i,j) in one batched call when all patch_indices reference
-    # the same patch (the common single-patch case); otherwise fall back to per-patch calls.
-    unique_patch_indices = np.unique(patch_indices)
-    if len(unique_patch_indices) == 1:
-        patch = patches[unique_patch_indices[0]]
-        combined_ijs = np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0)
-        combined_zyxs, _ = patch.ij_to_zyx(torch.from_numpy(combined_ijs))
-        all_slice_zyxs = combined_zyxs.cuda()
-    else:
-        # TODO: merge with above -- group by unique patches, then feed as batches
-        h_list = [patches[idx].ij_to_zyx(torch.from_numpy(horizontal_ijs_by_patch[n]))[0]
-                  for n, idx in enumerate(patch_indices)]
-        v_list = [patches[idx].ij_to_zyx(torch.from_numpy(vertical_ijs_by_patch[n]))[0]
-                  for n, idx in enumerate(patch_indices)]
-        all_slice_zyxs = torch.stack([torch.stack(h_list, dim=0), torch.stack(v_list, dim=0)], dim=0).cuda()
+    # Batched bilinear interp on GPU. The sampler draws from valid quads, and
+    # PatchGpuAtlas.lookup still preserves Patch.ij_to_zyx's invalid-sample handling.
+    combined_ijs_np = np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0)  # (2, N, P, 2)
+    combined_ijs_gpu = torch.from_numpy(combined_ijs_np).cuda(non_blocking=True)
+    patch_indices_gpu = torch.from_numpy(np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
+    patch_idx_per_sample = patch_indices_gpu[None, :, None].expand(2, N, num_points_per_direction)
+    all_slice_zyxs = patch_atlas.lookup(patch_idx_per_sample, combined_ijs_gpu)
 
     # When the caller also needs umbilicus_spiral (radius loss path), pack it into the same
     # forward ODE call to amortise the per-call overhead
@@ -737,7 +820,7 @@ def _get_patch_valid_points(patch, device, max_points=None, fixed_num_points=Non
     return patch.zyxs[valid_indices[0], valid_indices[1], :].to(device=device, dtype=torch.float32)
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True):
 
     # Sample once and share the tracks between the radius and DT losses; the loss using
     # fewer patches takes a prefix of the larger sample.
@@ -748,6 +831,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         slice_to_spiral_transform,
         dr_per_winding,
         patches,
+        patch_atlas,
         patch_indices,
         umbilicus_zyx,
     )
@@ -895,7 +979,34 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
-def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, point_collections):
+def _masked_pairwise_abs_mean(p1_r, p2_r, m1, m2, expected_diff):
+    # Computes mean(abs(p2 - p1 - expected_diff)) over the same masked Cartesian
+    # product as the explicit pairwise matrix, but without materialising BxNxN.
+    x_sorted = torch.sort(torch.where(m1, p1_r, torch.full_like(p1_r, float('inf'))), dim=-1).values
+    x_sorted_for_sum = torch.where(torch.isfinite(x_sorted), x_sorted, torch.zeros_like(x_sorted))
+    x_prefix = F.pad(torch.cumsum(x_sorted_for_sum, dim=-1), (1, 0))
+    n_x = m1.sum(dim=-1)
+    sum_x = x_sorted_for_sum.sum(dim=-1)
+
+    y = p2_r - expected_diff[:, None]
+    k = torch.searchsorted(x_sorted, y, right=True)
+    prefix_at_k = torch.gather(x_prefix, dim=-1, index=k)
+
+    k_float = k.to(y.dtype)
+    n_x_float = n_x.to(y.dtype)[:, None]
+    sum_abs = (
+        y * k_float
+        - prefix_at_k
+        + (sum_x[:, None] - prefix_at_k)
+        - y * (n_x_float - k_float)
+    )
+    sum_abs = torch.where(m2, sum_abs, torch.zeros_like(sum_abs))
+
+    denom = (n_x * m2.sum(dim=-1)).sum().clamp(min=1)
+    return sum_abs.sum() / denom
+
+
+def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
     # cross-patch pcl exposes its attached points grouped by patch
@@ -974,51 +1085,123 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
             flat_ijs[base + num_strips_per_pcl + s] = strip
         flat_pids.extend([pid1] * num_strips_per_pcl + [pid2] * num_strips_per_pcl)
 
-    # Group strips by patch and run ij_to_zyx in a single batched call per patch.
-    flat_zyxs = torch.empty([total_strips, num_points_per_strip, 3], dtype=torch.float32)
-    strips_by_patch = {}
-    for k, pid in enumerate(flat_pids):
-        strips_by_patch.setdefault(pid, []).append(k)
-    for pid, strip_ks in strips_by_patch.items():
-        idxs = np.asarray(strip_ks)
-        ij_batch = torch.from_numpy(flat_ijs[idxs])
-        zyx_batch, _ = patches_dict[pid].ij_to_zyx(ij_batch)
-        flat_zyxs[idxs] = zyx_batch.to(dtype=torch.float32, device='cpu')
+    # Batched GPU bilinear interp across all strips.
+    patch_idx_per_strip_np = np.fromiter(
+        (patch_atlas.id_to_idx[pid] for pid in flat_pids),
+        dtype=np.int64,
+        count=total_strips,
+    )
+    patch_idx_per_strip_gpu = torch.from_numpy(patch_idx_per_strip_np).cuda(non_blocking=True)
+    ijs_gpu = torch.from_numpy(flat_ijs).cuda(non_blocking=True)
+    patch_idx_per_sample = patch_idx_per_strip_gpu[:, None].expand(total_strips, num_points_per_strip)
+    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, ijs_gpu)
 
-    flat_zyxs = flat_zyxs.cuda()
+    # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
+    # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
+    # needs the full sequential strip to stitch theta=0 crossings.
+    z_margin = cfg['patch_loss_z_margin']
+    z_mask = (flat_zyxs[..., 0] >= z_begin - z_margin) & (flat_zyxs[..., 0] < z_end + z_margin)
+
     flat_spiral = slice_to_spiral_transform(flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
     shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
 
     # [num_pairs, 8, num_points_per_strip] -> pool each side's 4 strips into a single set.
     shifted_radii = shifted_radii.reshape(len(strip_pairs), num_strips_per_pair, num_points_per_strip)
+    z_mask = z_mask.reshape(len(strip_pairs), num_strips_per_pair, num_points_per_strip)
     num_points_per_side = num_strips_per_pcl * num_points_per_strip
     p1_r = shifted_radii[:, :num_strips_per_pcl].reshape(len(strip_pairs), num_points_per_side)
     p2_r = shifted_radii[:, num_strips_per_pcl:].reshape(len(strip_pairs), num_points_per_side)
+    m1 = z_mask[:, :num_strips_per_pcl].reshape(len(strip_pairs), num_points_per_side)
+    m2 = z_mask[:, num_strips_per_pcl:].reshape(len(strip_pairs), num_points_per_side)
 
     winding_diffs = torch.tensor(
         [sp[4] for sp in strip_pairs],
         device='cuda',
         dtype=torch.float32,
     )
-    expected_diff = (winding_diffs * dr_per_winding)[:, None, None]
-
-    diff = p2_r[:, :, None] - p1_r[:, None, :]
-    return (diff - expected_diff).abs().mean()
+    expected_diff = winding_diffs * dr_per_winding
+    return _masked_pairwise_abs_mean(p1_r, p2_r, m1, m2, expected_diff)
 
 
-def _prepare_unattached_pcl_strips(pcls_dict):
+class _UnattachedPclStripList(list):
+    """List of unattached-pcl strip dicts, with a slot for an attached `.flat`
+    GPU bundle that batched satisfaction / winding-range computations reuse."""
+    pass
+
+
+def _prepare_unattached_pcl_strips(pcls_dict, min_point_spacing):
     # For each unattached pcl, materialise an id-sorted strip of point zyxs and the
     # corresponding winding annotations. Strips with <2 points are dropped.
-    prepared = []
-    for pcl in pcls_dict.values():
+    # If min_point_spacing > 0, decimate each strip greedily along its id-sorted order
+    # so consecutive kept points are at least min_point_spacing apart in 3D scroll space.
+    # The first and last points are always kept.
+    prepared = _UnattachedPclStripList()
+    for pcl_id, pcl in pcls_dict.items():
         sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
         if len(sorted_items) < 2:
             continue
         zyxs = np.stack([p['zyx'] for _, p in sorted_items], axis=0).astype(np.float32)
         windings = np.array([p['winding_annotation'] for _, p in sorted_items], dtype=np.float32)
-        prepared.append({'zyxs': zyxs, 'windings': windings})
+        if min_point_spacing > 0 and len(zyxs) > 2:
+            keep = [0]
+            last_kept = zyxs[0]
+            for i in range(1, len(zyxs) - 1):
+                if np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
+                    keep.append(i)
+                    last_kept = zyxs[i]
+            keep.append(len(zyxs) - 1)
+            zyxs = zyxs[keep]
+            windings = windings[keep]
+        prepared.append({
+            'id': pcl_id,
+            'name': pcl.get('name'),
+            'source_file': pcl.get('source_file'),
+            'zyxs': zyxs,
+            'windings': windings,
+        })
     return prepared
+
+
+def _build_unattached_pcl_flat_bundle(strips, device):
+    # Concatenate all strips' point zyxs / windings into one flat GPU tensor so the
+    # downstream metrics can run a single transform call plus segmented reductions
+    # instead of per-strip Python loops. Returns None when there are no points.
+    if len(strips) == 0:
+        return None
+    lengths_np = np.fromiter((len(s['zyxs']) for s in strips), dtype=np.int64, count=len(strips))
+    starts_np = np.empty(len(strips) + 1, dtype=np.int64)
+    starts_np[0] = 0
+    np.cumsum(lengths_np, out=starts_np[1:])
+    total = int(starts_np[-1])
+    if total == 0:
+        return None
+    zyxs_flat = np.concatenate([s['zyxs'] for s in strips], axis=0).astype(np.float32, copy=False)
+    windings_flat = np.concatenate([s['windings'] for s in strips], axis=0).astype(np.float32, copy=False)
+    strip_id_np = np.repeat(np.arange(len(strips), dtype=np.int64), lengths_np)
+    return {
+        'zyxs': torch.from_numpy(zyxs_flat).to(device=device),
+        'windings': torch.from_numpy(windings_flat).to(device=device),
+        'strip_id': torch.from_numpy(strip_id_np).to(device=device),
+        'starts': torch.from_numpy(starts_np).to(device=device),
+        'lengths': torch.from_numpy(lengths_np).to(device=device),
+        'lengths_cpu': torch.from_numpy(lengths_np),
+        'num_strips': len(strips),
+        'total': total,
+    }
+
+
+def _get_or_build_unattached_pcl_flat(pcl_strips, device):
+    # Reuse a cached `.flat` bundle on the strip list when available (set up at the
+    # top of fit_spiral_3d); otherwise build it now and try to cache for next call.
+    flat = getattr(pcl_strips, 'flat', None)
+    if flat is None and len(pcl_strips) > 0:
+        flat = _build_unattached_pcl_flat_bundle(pcl_strips, device)
+        try:
+            pcl_strips.flat = flat
+        except AttributeError:
+            pass
+    return flat
 
 
 def get_unattached_pcl_strip_losses(
@@ -1437,47 +1620,112 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
     # total_count_per_pcl, per_point_satisfaction) — the first two are 1-D int64
     # tensors, and per_point_satisfaction is a list of CPU bool tensors (one per
     # pcl, of length N for that pcl; empty pcls get an empty tensor).
+    #
+    # All strips are processed in a single batched pass: points are concatenated
+    # into one flat (T, 3) tensor, the scan->spiral transform runs once over
+    # everything, then unwrap / median / satisfaction are done with segmented
+    # cumsum and a single composite-key sort (no Python-level per-strip loop).
     spiral_tolerance = dr_per_winding.detach() * metrics_config['satisfaction_radius_tolerance']
     scan_tolerance = metrics_config['satisfaction_distance_tolerance']
     dr = dr_per_winding.detach()
     device = dr_per_winding.device
+    S = len(pcl_strips)
 
-    satisfied_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
-    total_counts = torch.zeros(len(pcl_strips), dtype=torch.int64)
-    per_point_satisfaction = []
+    flat = _get_or_build_unattached_pcl_flat(pcl_strips, device)
+    if flat is None or flat['total'] == 0:
+        lengths_cpu = flat['lengths_cpu'] if flat is not None else torch.zeros(S, dtype=torch.int64)
+        per_point = [torch.zeros([int(n.item())], dtype=torch.bool) for n in lengths_cpu]
+        return torch.zeros(S, dtype=torch.int64), lengths_cpu.clone(), per_point
+
+    chunk = 65536
+
+    def transform_in_chunks(zyxs, fn):
+        if zyxs.shape[0] <= chunk:
+            return fn(zyxs)
+        pieces = []
+        for st in range(0, zyxs.shape[0], chunk):
+            pieces.append(fn(zyxs[st:st + chunk]))
+        return torch.cat(pieces, dim=0)
+
+    zyxs = flat['zyxs']
+    windings = flat['windings']
+    strip_id = flat['strip_id']
+    starts = flat['starts']
+    lengths = flat['lengths']
+    lengths_cpu = flat['lengths_cpu']
+    T = flat['total']
+
     with torch.no_grad():
-        for k, strip in enumerate(pcl_strips):
-            N = strip['zyxs'].shape[0]
-            total_counts[k] = N
-            if N == 0:
-                per_point_satisfaction.append(torch.zeros([0], dtype=torch.bool))
-                continue
-            zyxs = torch.from_numpy(strip['zyxs']).to(device=device, dtype=torch.float32)
-            windings = torch.from_numpy(strip['windings']).to(device=device, dtype=torch.float32)
+        spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
+        theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
-            spiral_zyxs = slice_to_spiral_transform(zyxs)
-            theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-            unwrapped_shifted = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
+        # Segmented version of _unwrap_track_shifted_radii: build
+        # adjustments via a global cumsum where step_adj is zeroed across strip
+        # boundaries, then subtract each strip's start value so each strip
+        # starts at 0 in its own frame.
+        if T > 1:
+            theta_d = theta.detach()
+            diffs = theta_d[1:] - theta_d[:-1]
+            same_strip = strip_id[1:] == strip_id[:-1]
+            step_adj = (
+                (diffs > np.pi).to(shifted_radii.dtype)
+                - (diffs < -np.pi).to(shifted_radii.dtype)
+            ) * dr
+            step_adj = torch.where(same_strip, step_adj, torch.zeros_like(step_adj))
+            cumsum_inner = torch.cumsum(step_adj, dim=0)
+            cumsum_flat = torch.cat([
+                torch.zeros(1, device=device, dtype=cumsum_inner.dtype),
+                cumsum_inner,
+            ], dim=0)
+            adjustments = cumsum_flat - cumsum_flat[starts[:-1][strip_id]]
+        else:
+            adjustments = torch.zeros_like(shifted_radii)
+        unwrapped_shifted = shifted_radii + adjustments
 
-            normalised_radii = unwrapped_shifted - windings * dr
-            target_normalised = torch.round(normalised_radii.median() / dr) * dr
-            target_shifted = target_normalised + windings * dr
-            spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
+        normalised_radii = unwrapped_shifted - windings * dr
 
-            target_radii = target_shifted + theta / (2 * np.pi) * dr
-            target_spiral_zyxs = torch.stack([
-                spiral_zyxs[..., 0],
-                torch.sin(theta) * target_radii,
-                torch.cos(theta) * target_radii,
-            ], dim=-1)
-            target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs)
-            scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs, dim=-1)
-            scan_in_band = scan_distances <= scan_tolerance
+        # Segmented median: sort the flat values with a composite key
+        # (strip_id-major, normalised_radii-minor) so values for each strip end
+        # up contiguous and sorted within their range. Per-strip median is then
+        # at start + (length - 1) // 2 (matching torch.median's lower-median
+        # convention for even lengths). Float64 keeps headroom against
+        # strip_id * val_range overflow for hundreds-of-thousands of strips.
+        val_min = normalised_radii.min().to(torch.float64)
+        val_max = normalised_radii.max().to(torch.float64)
+        val_range = (val_max - val_min) + 1.0
+        composite = (
+            strip_id.to(torch.float64) * val_range
+            + (normalised_radii.to(torch.float64) - val_min)
+        )
+        order = torch.argsort(composite)
+        sorted_norm = normalised_radii[order]
+        median_indices = starts[:-1] + (lengths - 1) // 2
+        medians = sorted_norm[median_indices]
 
-            satisfied = spiral_in_band & scan_in_band
-            satisfied_counts[k] = int(satisfied.sum().item())
-            per_point_satisfaction.append(satisfied.cpu())
-    return satisfied_counts, total_counts, per_point_satisfaction
+        target_normalised_per_strip = torch.round(medians / dr) * dr
+        target_normalised = target_normalised_per_strip[strip_id]
+        target_shifted = target_normalised + windings * dr
+        spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
+
+        target_radii = target_shifted + theta / (2 * np.pi) * dr
+        target_spiral_zyxs = torch.stack([
+            spiral_zyxs[..., 0],
+            torch.sin(theta) * target_radii,
+            torch.cos(theta) * target_radii,
+        ], dim=-1)
+        target_scroll_zyxs = transform_in_chunks(target_spiral_zyxs, slice_to_spiral_transform.inv)
+        scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs, dim=-1)
+        scan_in_band = scan_distances <= scan_tolerance
+
+        satisfied = spiral_in_band & scan_in_band
+
+        satisfied_counts_dev = torch.zeros(S, dtype=torch.int64, device=device)
+        satisfied_counts_dev.scatter_add_(0, strip_id, satisfied.to(torch.int64))
+        satisfied_counts = satisfied_counts_dev.cpu()
+
+        per_point_satisfaction = list(torch.split(satisfied.cpu(), lengths_cpu.tolist()))
+
+    return satisfied_counts, lengths_cpu.clone(), per_point_satisfaction
 
 
 def get_face_indices(h, w):
@@ -1493,17 +1741,34 @@ def get_face_indices(h, w):
 
 
 @torch.inference_mode
-def _get_working_set_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches):
+def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips=()):
     """Returns (min_winding_idx, max_winding_idx) — inclusive min and exclusive max
-    integer winding indices covered by the given patches' in-ROI valid quad centers.
-    Winding indices are computed by transforming quad centers to spiral space and
-    rounding shifted_radius/dr_per_winding to the nearest integer (matching the
-    convention in overlay_patches_on_slices)."""
+    integer winding indices covered by the given patches' in-ROI valid quad centers
+    and by in-ROI unattached pcl points. Winding indices are computed by transforming
+    points to spiral space and rounding shifted_radius/dr_per_winding to the nearest
+    integer (matching the convention in overlay_patches_on_slices). The min is
+    clamped to cfg['output_first_winding']; the max has no upper cap."""
     device = dr_per_winding.device
     dr = dr_per_winding.detach()
     min_w = None
     max_w = None
-    for patch in working_set_patches:
+
+    def update_from_winding_indices(winding_indices):
+        nonlocal min_w, max_w
+        local_min = int(winding_indices.min().item())
+        local_max = int(winding_indices.max().item())
+        min_w = local_min if min_w is None else min(min_w, local_min)
+        max_w = local_max if max_w is None else max(max_w, local_max)
+
+    chunk = 65536
+
+    def transform_in_chunks(zyxs):
+        spiral_pieces = []
+        for start in range(0, zyxs.shape[0], chunk):
+            spiral_pieces.append(slice_to_spiral_transform(zyxs[start:start + chunk]))
+        return torch.cat(spiral_pieces, dim=0) if len(spiral_pieces) > 1 else spiral_pieces[0]
+
+    for patch in patches:
         patch_zyxs = patch.zyxs.to(device=device, dtype=torch.float32)
         if patch_zyxs.shape[0] < 2 or patch_zyxs.shape[1] < 2:
             continue
@@ -1524,23 +1789,25 @@ def _get_working_set_winding_range(slice_to_spiral_transform, dr_per_winding, wo
         mask = valid_quad_mask & quad_touches_roi
         if not mask.any():
             continue
-        zyxs = quad_center_zyxs[mask]
-        chunk = 65536
-        spiral_pieces = []
-        for start in range(0, zyxs.shape[0], chunk):
-            spiral_pieces.append(slice_to_spiral_transform(zyxs[start:start + chunk]))
-        spiral_zyxs = torch.cat(spiral_pieces, dim=0) if len(spiral_pieces) > 1 else spiral_pieces[0]
+        spiral_zyxs = transform_in_chunks(quad_center_zyxs[mask])
         _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-        winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
-        patch_min = int(winding_indices.min().item())
-        patch_max = int(winding_indices.max().item())
-        min_w = patch_min if min_w is None else min(min_w, patch_min)
-        max_w = patch_max if max_w is None else max(max_w, patch_max)
-    cfg_min, cfg_max = cfg['output_winding_range']
+        update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+
+    if unattached_pcl_strips:
+        flat = _get_or_build_unattached_pcl_flat(unattached_pcl_strips, device)
+        if flat is not None and flat['total'] > 0:
+            zyxs = flat['zyxs']
+            in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
+            if in_roi.any():
+                spiral_zyxs = transform_in_chunks(zyxs[in_roi])
+                _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+                update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+
+    first_winding = cfg['output_first_winding']
     if min_w is None:
-        return cfg_min, cfg_max
+        return first_winding, first_winding
     margin = cfg['output_winding_margin']
-    return max(min_w - margin, cfg_min), min(max_w + 1 + margin, cfg_max)
+    return max(min_w - margin, first_winding), max_w + 1 + margin
 
 
 def _rasterize_triangles_into_mesh(
@@ -1737,10 +2004,10 @@ def _build_snapped_overlay(
 
 
 @torch.inference_mode
-def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, out_path, name='mesh'):
+def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips, out_path, name='mesh'):
 
-    min_winding_idx, max_winding_idx = _get_working_set_winding_range(slice_to_spiral_transform, dr_per_winding, working_set_patches)
-    print(f'save_mesh {name}: adaptive winding range [{min_winding_idx}, {max_winding_idx})')
+    min_winding_idx, max_winding_idx = _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips)
+    print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size'] // downsample_factor  # voxels in downsampled volume
     z_margin = cfg['flow_bounds_z_margin']
     spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
@@ -1749,19 +2016,24 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches, ou
     z0 = z_begin - z_margin
     spiral_zs = torch.arange(z0, z_end + z_margin, grid_spacing, dtype=torch.float32, device=spiral_yxs.device)
     spiral_zyxs = torch.cat([spiral_zs[:, None, None].expand(-1, spiral_yxs.shape[0], 1), spiral_yxs[None, :, :].expand(spiral_zs.shape[0], -1, 2)], dim=-1)
-    scroll_zyxs = slice_to_spiral_transform.inv(spiral_zyxs)
+    chunk = 65536
+    flat_spiral_zyxs = spiral_zyxs.reshape(-1, 3)
+    scroll_pieces = []
+    for start in range(0, flat_spiral_zyxs.shape[0], chunk):
+        scroll_pieces.append(slice_to_spiral_transform.inv(flat_spiral_zyxs[start : start + chunk]))
+    scroll_zyxs = torch.cat(scroll_pieces, dim=0).reshape(*spiral_zyxs.shape)
 
     # Snapped variant: replace cells covered by quads of overall- or boundary-satisfied
     # patches with patch-derived points, interpolated bilinearly across each quad in the
     # flattened-spiral UV coords of its target winding.
     snapped_scroll_zyxs = scroll_zyxs.clone()
     satisfied_patches, _, _, _, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
-        slice_to_spiral_transform, dr_per_winding, working_set_patches,
+        slice_to_spiral_transform, dr_per_winding, patches,
     )
     _build_snapped_overlay(
         snapped_scroll_zyxs, num_thetas_by_winding, z0, grid_spacing,
         slice_to_spiral_transform, dr_per_winding,
-        working_set_patches,
+        patches,
         satisfied_patches, boundary_satisfied_patches, target_winding_idx_per_patch,
     )
 
@@ -1883,6 +2155,7 @@ def save_overlay(
     quad_label_map, quad_status_flat,
     unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
     umbilicus_zyx, z_to_umbilicus_yx,
+    winding_range,
     out_path, suffix
 ):
 
@@ -1911,7 +2184,7 @@ def save_overlay(
         Image.fromarray(canvas).save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
     def overlay_on_patch_satisfaction(spiral, spiral_zyx, label_map, slice_z, name):
-        # quad_status_flat: 0=patch-and-quad not satisfied, 1=quad-only satisfied, 2=patch overall satisfied, 3=not in working set
+        # quad_status_flat: 0=patch-and-quad not satisfied, 1=quad-only satisfied, 2=patch overall satisfied
         status = quad_status_flat.to(device=spiral.device, dtype=torch.int64)
         label_map = label_map.to(device=spiral.device, dtype=torch.int64)
         num_labels = status.numel()
@@ -1919,7 +2192,6 @@ def save_overlay(
             [200, 0, 0],  # 0: red — quad not satisfied (patch not overall satisfied)
             [230, 140, 0],  # 1: orange — quad satisfied but patch not overall satisfied
             [255, 200, 0],  # 2: yellow — patch overall satisfied
-            [160, 160, 160],  # 3: gray — patch not in working set
         ], dtype=torch.uint8, device=spiral.device)
         colour_table = torch.zeros([num_labels + 1, 3], dtype=torch.uint8, device=spiral.device)
         colour_table[1:] = status_palette[status]
@@ -1966,6 +2238,16 @@ def save_overlay(
                     )
         image.save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
+    def visualise_field(spiral_zyx, name):
+        # Show the slice→spiral field as RGB: spiral (z, y, x) normalised into [0, 1] per channel
+        # using the value range across the slice.
+        values = spiral_zyx.to(torch.float32).reshape(-1, 3)
+        lo = values.amin(dim=0)
+        hi = values.amax(dim=0)
+        normalised = ((spiral_zyx.to(torch.float32) - lo) / (hi - lo).clamp_min(1e-6)).clamp(0., 1.)
+        canvas = (normalised * 255).to(torch.uint8)
+        Image.fromarray(canvas.cpu().numpy()).save(f'{out_path}/{name}_{suffix}.png', compress_level=3)
+
     def overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, name):
         slice_min = slice[slice > 0].amin() if (slice > 0).any() else 0
         slice_normalised = (slice - slice_min) / (slice.amax() - slice_min) * (slice > 0)
@@ -2005,78 +2287,55 @@ def save_overlay(
         slice_zyx = torch.cat([torch.full([*slice_yx.shape[:2], 1], slice_z, device=device), slice_yx], dim=-1)
 
         spiral_zyx = slice_to_spiral_transform(slice_zyx)
-        spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx)
+        spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx, winding_range=winding_range)
         slice = scroll_slices_for_visualisation[vis_slice_idx].to(device)
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
         overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
+        visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path, pass_seed_patch_id, pass_idx=1):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
-    patch_ids = list(patches_dict.keys())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
     num_patches = len(patches_list)
-    is_global_mode = cfg['working_set_mode'] == 'global'
-    is_progressive_fixed_mode = cfg['working_set_mode'] == 'progressive_fixed'
+    print(f'fitting {num_patches} patches')
 
-    if is_global_mode:
-        progressive_patch_order = list(range(num_patches))
-        print(f'pass {pass_idx}: global mode — fitting all {num_patches} patches at once')
-    else:
-        if pass_seed_patch_id not in patches_dict:
-            raise KeyError(f'pass_seed_patch_id {pass_seed_patch_id!r} not found among loaded patches')
-        seed_patch_idx = patch_ids.index(pass_seed_patch_id)
-        mode_label = 'progressive_fixed' if is_progressive_fixed_mode else 'progressive'
-        print(f'pass {pass_idx}: building {mode_label} patch ordering from seed {pass_seed_patch_id} ({num_patches} patches in pool)')
-        progressive_patch_order = _build_progressive_patch_order(patches_list, seed_patch_idx)
+    patch_atlas = PatchGpuAtlas(patches_dict, device='cuda')
+    print(f'patch GPU atlas: {patch_atlas.memory_mb():.1f} MB')
 
+    overlay_enabled = os.environ.get('FIT_SPIRAL_SKIP_FITTED_OVERLAY') != '1'
     num_slices_for_visualisation = 20
-    rendering_slices_downsample_factor = 2  # stride the scroll by this along zyx for rendering
 
     device = torch.device('cuda')
 
     all_zs = np.arange(z_begin, z_end)
-    zs_for_visualisation = np.linspace(z_begin, z_end - 1, min(num_slices_for_visualisation, z_end - 1 - z_begin), dtype=np.int64)
+    if overlay_enabled:
+        zs_for_visualisation = np.linspace(z_begin, z_end - 1, min(num_slices_for_visualisation, z_end - 1 - z_begin), dtype=np.int64)
 
     umbilicus_zyx = torch.from_numpy(np.concatenate([all_zs[:, None], z_to_umbilicus_yx(all_zs)], axis=-1).astype(np.float32)).to(device)
 
     all_zs = torch.from_numpy(all_zs).to(device)
 
-    if scroll_zarr is not None:
-        subvolume_shape = tuple([z_end - z_begin, *scroll_zarr.shape[1:]])
-        print('loading slices for visualisation')
-        scroll_slices_for_visualisation = (torch.from_numpy(scroll_zarr[zs_for_visualisation]).to(torch.float32) / np.iinfo(scroll_zarr.dtype).max * 0.75 * 255).to(torch.uint8)
-        scroll_slices_for_rendering = (torch.from_numpy(scroll_zarr[z_begin : z_end : rendering_slices_downsample_factor, ::rendering_slices_downsample_factor, ::rendering_slices_downsample_factor]).to(torch.int32) // (np.iinfo(scroll_zarr.dtype).max // 255)).to(torch.uint8)
-    else:
-        subvolume_shape = [z_end - z_begin, 32693 // 4 // downsample_factor, 32693 // 4 // downsample_factor]
-        scroll_slices_for_visualisation = torch.zeros([len(zs_for_visualisation), *subvolume_shape[1:]])
-        scroll_slices_for_rendering = None
+    if overlay_enabled:
+        if scroll_zarr is not None:
+            subvolume_shape = tuple([z_end - z_begin, *scroll_zarr.shape[1:]])
+            print('loading slices for visualisation')
+            scroll_slices_for_visualisation = (torch.from_numpy(scroll_zarr[zs_for_visualisation]).to(torch.float32) / np.iinfo(scroll_zarr.dtype).max * 0.75 * 255).to(torch.uint8)
+        else:
+            subvolume_shape = [z_end - z_begin, 32693 // 4 // downsample_factor, 32693 // 4 // downsample_factor]
+            scroll_slices_for_visualisation = torch.zeros([len(zs_for_visualisation), *subvolume_shape[1:]])
 
-    prediction_slices_for_visualisation, quad_label_map, _quad_offsets = overlay_patches_on_slices(patches_list, zs_for_visualisation, subvolume_shape[1:])
+        prediction_slices_for_visualisation, quad_label_map, _quad_offsets = overlay_patches_on_slices(patches_list, zs_for_visualisation, subvolume_shape[1:])
 
-    slice_yx = torch.stack(torch.meshgrid(
-        torch.arange(subvolume_shape[1], dtype=torch.float32),
-        torch.arange(subvolume_shape[2], dtype=torch.float32),
-        indexing='ij'
-    ), axis=-1).to(device)
+        slice_yx = torch.stack(torch.meshgrid(
+            torch.arange(subvolume_shape[1], dtype=torch.float32),
+            torch.arange(subvolume_shape[2], dtype=torch.float32),
+            indexing='ij'
+        ), axis=-1).to(device)
 
-    if scroll_zarr is not None:
-        # TODO: it's a bit nasty to use the *visualisation* slices here
-        z_to_roi_min_max_yx = {
-            z: torch.tensor([
-                [slice.amax(dim=1).nonzero().amin(), slice.amax(dim=0).nonzero().amin()],
-                [slice.amax(dim=1).nonzero().amax(), slice.amax(dim=0).nonzero().amax()]
-            ])
-            for z, slice in zip(zs_for_visualisation, scroll_slices_for_visualisation)
-        }
-    else:
-        z_to_roi_min_max_yx = {0: torch.tensor([[640, 1020], [1100, 1420]])}
-    # FIXME: this assumes the scale in scroll-space is the same as that in spiral-space, which is only true at the start of optimisation
-    #  The only way to deal with this cleanly is to revert to supporting the flow field on scroll-space (but then the flow field no 
-    #  longer shifts with the umbilicus)
-    flow_field_radius = torch.stack([min_max_yx for min_max_yx in z_to_roi_min_max_yx.values()]).diff(dim=1).amax().item() / 2
+    flow_field_radius = cfg['flow_bounds_radius']
     flow_min_corner_spiral_zyx = torch.tensor([z_begin - cfg['flow_bounds_z_margin'], -flow_field_radius, -flow_field_radius], dtype=torch.int64, device=device)
     flow_max_corner_spiral_zyx = torch.tensor([z_end + cfg['flow_bounds_z_margin'], flow_field_radius, flow_field_radius], dtype=torch.int64, device=device)
 
@@ -2146,29 +2405,52 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             total_points = int(unattached_pcl_total_counts.sum().item())
             satisfied_point_ratio = satisfied_points / max(total_points, 1)
             print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
-        # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
-        # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
-        if satisfied_quad_masks:
-            satisfied_quads_flat = torch.cat([m.flatten() for m in satisfied_quad_masks])
-            quads_per_patch = torch.tensor([m.numel() for m in satisfied_quad_masks], dtype=torch.int64)
-            overall_satisfied_per_quad = satisfied_patches.to(torch.bool).repeat_interleave(quads_per_patch)
-            in_working_set_per_patch = torch.zeros(len(patches_list), dtype=torch.bool)
-            in_working_set_per_patch[list(working_set_indices)] = True
-            in_working_set_per_quad = in_working_set_per_patch.repeat_interleave(quads_per_patch)
-        else:
-            satisfied_quads_flat = torch.zeros([0], dtype=torch.bool)
-            overall_satisfied_per_quad = torch.zeros([0], dtype=torch.bool)
-            in_working_set_per_quad = torch.zeros([0], dtype=torch.bool)
-        quad_status_flat = torch.where(
-            ~in_working_set_per_quad,
-            torch.full_like(satisfied_quads_flat, 3, dtype=torch.int64),
-            torch.where(
+        patch_ids = list(patches_dict.keys())
+        patch_satisfaction_entries = []
+        for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):
+            fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
+            patch_satisfaction_entries.append({
+                'id': pid,
+                'satisfied_area': sat_area_t,
+                'total_area': tot_area_t,
+                'fraction': fraction,
+            })
+        patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
+        pcl_satisfaction_entries = []
+        if unattached_pcl_strips:
+            sat_counts = unattached_pcl_satisfied_counts.tolist()
+            tot_counts = unattached_pcl_total_counts.tolist()
+            for strip, sc, tc in zip(unattached_pcl_strips, sat_counts, tot_counts):
+                fraction = sc / tc if tc > 0 else 0.0
+                pcl_satisfaction_entries.append({
+                    'id': strip.get('id'),
+                    'name': strip.get('name'),
+                    'source_file': strip.get('source_file'),
+                    'satisfied_points': int(sc),
+                    'total_points': int(tc),
+                    'fraction': fraction,
+                })
+            pcl_satisfaction_entries.sort(key=lambda e: e['fraction'])
+        with open(f'{out_path}/satisfied_{suffix}.json', 'w') as f:
+            json.dump({'patches': patch_satisfaction_entries, 'pcls': pcl_satisfaction_entries}, f, indent=2)
+        if overlay_enabled:
+            # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
+            # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
+            if satisfied_quad_masks:
+                satisfied_quads_flat = torch.cat([m.flatten() for m in satisfied_quad_masks])
+                quads_per_patch = torch.tensor([m.numel() for m in satisfied_quad_masks], dtype=torch.int64)
+                overall_satisfied_per_quad = satisfied_patches.to(torch.bool).repeat_interleave(quads_per_patch)
+            else:
+                satisfied_quads_flat = torch.zeros([0], dtype=torch.bool)
+                overall_satisfied_per_quad = torch.zeros([0], dtype=torch.bool)
+            quad_status_flat = torch.where(
                 overall_satisfied_per_quad,
                 torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
                 satisfied_quads_flat.to(torch.int64),
-            ),
-        )
-        if os.environ.get('FIT_SPIRAL_SKIP_FITTED_OVERLAY') != '1':
+            )
+            winding_range = _get_output_winding_range(
+                slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
+            )
             save_overlay(
                 spiral_and_transform,
                 flow_min_corner_spiral_zyx, flow_max_corner_spiral_zyx,
@@ -2177,85 +2459,19 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 quad_label_map, quad_status_flat,
                 unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
                 umbilicus_zyx, z_to_umbilicus_yx,
+                winding_range,
                 out_path, suffix
             )
         if os.environ.get('FIT_SPIRAL_SKIP_MESH') != '1':
-            working_set_patches_list = [patches_list[i] for i in working_set_indices]
-            save_mesh(slice_to_spiral_transform, dr_per_winding, working_set_patches_list, out_path, name=suffix)
+            save_mesh(slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips, out_path, name=suffix)
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
-
-    working_set_size = num_patches if is_global_mode else 1
-    working_set_indices = progressive_patch_order[:working_set_size]
-    working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
-    working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
-
-    working_set_log = open(f'{out_path}/working-set.txt', 'a', buffering=1)
-    if is_global_mode:
-        print(f'step {start_iteration}: working set initialised with all {num_patches} patches (global mode)')
-        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, global mode ===\n')
-        working_set_log.write(f'step {start_iteration}: initialised with all {num_patches} patches\n')
-    else:
-        mode_label = 'progressive_fixed' if is_progressive_fixed_mode else 'progressive'
-        print(f'step {start_iteration}: working set initialised with {working_set_size}/{num_patches} patches (seed {patch_ids[working_set_indices[0]]}, {mode_label} mode)')
-        working_set_log.write(f'=== pass {pass_idx}: {num_patches} candidate patches, seed {pass_seed_patch_id}, {mode_label} mode ===\n')
-        working_set_log.write(f'step {start_iteration}: initialised with seed patch {patch_ids[working_set_indices[0]]} (size {working_set_size}/{num_patches})\n')
-
-    # Snapshot of the most recent state at which the working set was fully satisfied —
-    # i.e. the model state taken just before each successful expansion. If the pass
-    # ends without absorbing every candidate, the optimisation phase since the final
-    # expansion is an unsuccessful attempt that may have degraded earlier windings,
-    # so save_outputs() can revert to this snapshot.
-    last_known_good_state = None
-    last_known_good_ws_size = None
-    last_known_good_iteration = None
 
     for iteration in tqdm(range(start_iteration, num_training_steps)):
 
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
-
-        if is_progressive_fixed_mode:
-            should_grow = (
-                working_set_size < num_patches
-                and iteration > start_iteration
-                and iteration % cfg['progressive_fixed_add_interval'] == 0
-            )
-            if should_grow:
-                last_known_good_state = (
-                    copy.deepcopy(spiral_and_transform.state_dict()),
-                    copy.deepcopy(optimiser.state_dict()),
-                )
-                last_known_good_ws_size = working_set_size
-                last_known_good_iteration = iteration
-                working_set_size += 1
-                working_set_indices = progressive_patch_order[:working_set_size]
-                working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
-                working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
-                print(f'step {iteration}: working set grew to {working_set_size}/{num_patches} patches (added {patch_ids[working_set_indices[-1]]}, fixed schedule)')
-                working_set_log.write(f'step {iteration}: added patch {patch_ids[working_set_indices[-1]]} (size {working_set_size}/{num_patches}, fixed schedule)\n')
-        elif (
-            working_set_size < num_patches
-            and iteration > start_iteration
-            and iteration % cfg['working_set_check_interval'] == 0
-        ):
-            with torch.no_grad():
-                working_set_patches_list = [patches_list[i] for i in working_set_indices]
-                working_set_satisfied, *_ = get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, working_set_patches_list)
-            if bool(working_set_satisfied.all().item()):
-                last_known_good_state = (
-                    copy.deepcopy(spiral_and_transform.state_dict()),
-                    copy.deepcopy(optimiser.state_dict()),
-                )
-                last_known_good_ws_size = working_set_size
-                last_known_good_iteration = iteration
-                working_set_size += 1
-                working_set_indices = progressive_patch_order[:working_set_size]
-                working_set_probabilities = _get_working_set_probabilities(patch_sampling_probabilities, working_set_indices)
-                working_set_patches_dict = {patch_ids[i]: patches_list[i] for i in working_set_indices}
-                print(f'step {iteration}: working set grew to {working_set_size}/{num_patches} patches (added {patch_ids[working_set_indices[-1]]})')
-                working_set_log.write(f'step {iteration}: added patch {patch_ids[working_set_indices[-1]]} (size {working_set_size}/{num_patches})\n')
 
         losses = {}
 
@@ -2274,7 +2490,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             cfg['num_patches_per_step'],
             cfg['num_patches_per_step_for_dt'],
             patches_list,
-            working_set_probabilities,
+            patch_atlas,
+            patch_sampling_probabilities,
             umbilicus_zyx,
             compute_dt=compute_patch_dt,
         )
@@ -2286,13 +2503,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 slice_to_spiral_transform,
                 cfg['regularisation_num_points'],
                 patches_list,
-                working_set_probabilities,
+                patch_sampling_probabilities,
             )
             losses['patch_stretch'] = patch_stretch_loss * cfg['loss_weight_patch_stretch']
             losses['patch_normals'] = patch_normals_loss * cfg['loss_weight_patch_normals']
 
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
-            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, working_set_patches_dict, point_collections) * cfg['loss_weight_winding_number']
+            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_winding_number']
 
         if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
             unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
@@ -2329,34 +2546,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 **{name + '_loss': value for name, value in losses.items()},
             })
 
-    working_set_log.write(f'pass {pass_idx} ended: final working set size {working_set_size}/{num_patches}\n')
-    working_set_log.close()
-
-    working_set_patch_ids = [patch_ids[i] for i in working_set_indices]
-    last_added_patch_id = working_set_patch_ids[-1]
-    pool_fully_absorbed = (working_set_size == num_patches)
-
-    if not pool_fully_absorbed and last_known_good_state is not None:
-        print(f'reverting model state to last-known-good (step {last_known_good_iteration}, working set size {last_known_good_ws_size}) for saving outputs')
-        model_state, opt_state = last_known_good_state
-        spiral_and_transform.load_state_dict(model_state)
-        optimiser.load_state_dict(opt_state)
-        with torch.no_grad():
-            slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
-            dr_per_winding = spiral_and_transform.get_dr_per_winding()
-
-    suffix = 'fitted' if pool_fully_absorbed else f'fitted_p{pass_idx}_ws{working_set_size}'
-    save_model(suffix)
+    suffix = 'fitted'
     save_overlay_and_print_satisfaction(suffix)
-
-    return {
-        'working_set_size': working_set_size,
-        'working_set_patch_ids': working_set_patch_ids,
-        'last_added_patch_id': last_added_patch_id,
-        'num_patches': num_patches,
-        'pool_fully_absorbed': pool_fully_absorbed,
-        'progressive_patch_order_ids': [patch_ids[i] for i in progressive_patch_order],
-    }
+    save_model(suffix)
 
 
 def load_patches(patches_path, segment_id_filter=lambda s: True):
@@ -2377,7 +2569,6 @@ def load_patches(patches_path, segment_id_filter=lambda s: True):
             continue
         try:
             patches[entry] = load_tifxyz(segment_path)
-            patches[entry].source_path = segment_path
         except Exception as e:
             print(f'Failed to load segment {entry}: {e}')
             failed_count += 1
@@ -2451,12 +2642,14 @@ def main():
         (cross_patch_point_collections, cross_patch_pcl_json_paths),
         (unattached_point_collections, unattached_pcl_json_paths),
     ):
-        for path in paths:
-            loaded = load_point_collection(path) or {}
-            for pcl in loaded.values():
-                pcl['source_file'] = path
-                target[next_id] = pcl
-                next_id += 1
+        for pattern in paths:
+            expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
+            for path in expanded:
+                loaded = load_point_collection(path) or {}
+                for pcl in loaded.values():
+                    pcl['source_file'] = path
+                    target[next_id] = pcl
+                    next_id += 1
 
     for patch in patches.values():
         patch.scale *= downsample_factor
@@ -2538,14 +2731,14 @@ def main():
                 continue
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
-    unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections)
+    unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections, cfg['unattached_pcl_min_point_spacing'])
     print(
         f'pcls: {len(cross_patch_point_collections)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch_{cfg["working_set_mode"]}'
+    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
     run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
@@ -2553,82 +2746,14 @@ def main():
         out_path += f'_{run_tag}'
     os.makedirs(out_path, exist_ok=True)
 
-    if cfg['working_set_mode'] == 'global':
-        fit_spiral_3d(
-            scroll_zarr_array,
-            patches,
-            list(cross_patch_point_collections.values()),
-            unattached_pcl_strips,
-            umbilicus,
-            out_path,
-            pass_seed_patch_id=None,
-            pass_idx=1,
-        )
-        return
-
-    if cfg['working_set_mode'] == 'progressive_fixed':
-        fit_spiral_3d(
-            scroll_zarr_array,
-            patches,
-            list(cross_patch_point_collections.values()),
-            unattached_pcl_strips,
-            umbilicus,
-            out_path,
-            pass_seed_patch_id=seed_patch_id,
-            pass_idx=1,
-        )
-        return
-
-    pass_pool_patches = dict(patches)
-    current_seed_patch_id = seed_patch_id
-    pass_idx = 0
-    while True:
-        pass_idx += 1
-        result = fit_spiral_3d(
-            scroll_zarr_array,
-            pass_pool_patches,
-            list(cross_patch_point_collections.values()),
-            unattached_pcl_strips,
-            umbilicus,
-            out_path,
-            pass_seed_patch_id=current_seed_patch_id,
-            pass_idx=pass_idx,
-        )
-
-        ws_size = result['working_set_size']
-        ws_ids = set(result['working_set_patch_ids'])
-        last_added_patch_id = result['last_added_patch_id']
-        progressive_order_ids = result['progressive_patch_order_ids']
-        leftover_ids = [pid for pid in pass_pool_patches if pid not in ws_ids]
-        pool_fully_absorbed = result['pool_fully_absorbed']
-        no_progress = (ws_size <= 1)
-
-        del result
-        torch.cuda.empty_cache()
-
-        if pool_fully_absorbed:
-            print(f'all {len(patches)} patches covered after {pass_idx} pass(es)')
-            break
-
-        if no_progress:
-            # The seed couldn't bootstrap any growth even with a fresh model — drop it
-            # permanently and retry with the next-nearest candidate from this pass's
-            # progressive ordering (= the leftover patch nearest to the failed seed).
-            dropped_seed = current_seed_patch_id
-            next_seed = next((pid for pid in progressive_order_ids[1:] if pid != dropped_seed), None)
-            if next_seed is None:
-                print(f'pass {pass_idx} made no progress and no other candidate seed remains; stopping with {len(leftover_ids)} patches unfit')
-                break
-            next_pool_ids = [pid for pid in pass_pool_patches if pid != dropped_seed]
-            pass_pool_patches = {pid: patches[pid] for pid in next_pool_ids}
-            current_seed_patch_id = next_seed
-            print(f'pass {pass_idx} made no progress; dropping seed {dropped_seed} and retrying with seed {current_seed_patch_id} ({len(next_pool_ids)} candidates remaining)')
-            continue
-
-        next_pool_ids = leftover_ids + [last_added_patch_id]
-        pass_pool_patches = {pid: patches[pid] for pid in next_pool_ids}
-        current_seed_patch_id = last_added_patch_id
-        print(f'starting pass {pass_idx + 1}: {len(next_pool_ids)} candidate patches (seed {current_seed_patch_id})')
+    fit_spiral_3d(
+        scroll_zarr_array,
+        patches,
+        list(cross_patch_point_collections.values()),
+        unattached_pcl_strips,
+        umbilicus,
+        out_path,
+    )
 
 
 if __name__ == '__main__':

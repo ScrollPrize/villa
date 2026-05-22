@@ -1,5 +1,8 @@
 #include "LasagnaServiceManager.hpp"
 
+#include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
@@ -15,7 +18,11 @@
 #include <QSet>
 #include <QUrl>
 
+#include <cmath>
+#include <filesystem>
 #include <iostream>
+#include <optional>
+#include <vector>
 
 #ifdef Q_OS_UNIX
 #include <signal.h>
@@ -35,6 +42,128 @@ namespace
 constexpr int kServiceStartTimeoutMs = 60000;  // 1 minute (no torch compile)
 constexpr int kServiceStopTimeoutMs = 500;
 constexpr int kPollIntervalMs = 500;
+
+bool isTifxyzDir(const std::filesystem::path& path)
+{
+    return std::filesystem::is_directory(path)
+        && std::filesystem::exists(path / "x.tif")
+        && std::filesystem::exists(path / "y.tif")
+        && std::filesystem::exists(path / "z.tif")
+        && std::filesystem::exists(path / "meta.json");
+}
+
+double normalizedScaleFactor(double factor)
+{
+    return (std::isfinite(factor) && factor > 0.0) ? factor : 1.0;
+}
+
+bool isIdentityScale(double factor)
+{
+    return std::abs(normalizedScaleFactor(factor) - 1.0) < 1e-9;
+}
+
+void loadAllSurfaceChannels(QuadSurface& surface)
+{
+    const std::vector<std::string> names = surface.channelNames();
+    for (const std::string& name : names) {
+        (void)surface.channel(name, SURF_CHANNEL_NORESIZE);
+    }
+}
+
+int countValidSurfacePoints(const QuadSurface& surface)
+{
+    const auto* points = surface.rawPointsPtr();
+    if (!points) {
+        return 0;
+    }
+
+    int valid = 0;
+    for (int row = 0; row < points->rows; ++row) {
+        for (int col = 0; col < points->cols; ++col) {
+            const cv::Vec3f& point = (*points)(row, col);
+            if (point[0] != -1.0f
+                && std::isfinite(point[0])
+                && std::isfinite(point[1])
+                && std::isfinite(point[2])) {
+                ++valid;
+            }
+        }
+    }
+    return valid;
+}
+
+std::optional<std::filesystem::path> findReturnedTifxyzDir(const std::filesystem::path& outputRoot,
+                                                           const QString& outputName)
+{
+    if (outputName.isEmpty()) {
+        return std::nullopt;
+    }
+
+    const std::filesystem::path requested(outputName.toStdString());
+    std::vector<std::filesystem::path> candidates;
+    candidates.push_back(outputRoot / requested);
+
+    if (requested.extension() != ".tifxyz") {
+        candidates.push_back(outputRoot / (requested.string() + ".tifxyz"));
+    }
+
+    for (const auto& candidate : candidates) {
+        if (isTifxyzDir(candidate)) {
+            return candidate;
+        }
+    }
+
+    const std::string requestedStem = requested.extension() == ".tifxyz"
+        ? requested.stem().string()
+        : requested.filename().string();
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(outputRoot, ec)) {
+        if (ec || !entry.is_directory()) {
+            continue;
+        }
+        const auto filename = entry.path().filename();
+        const std::string stem = filename.extension() == ".tifxyz"
+            ? filename.stem().string()
+            : filename.string();
+        if (stem == requestedStem && isTifxyzDir(entry.path())) {
+            return entry.path();
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool scaleTifxyzInPlace(const std::filesystem::path& dir, double scaleFactor, QString* error)
+{
+    try {
+        auto surface = load_quad_from_tifxyz(dir.string());
+        if (!surface) {
+            if (error) {
+                *error = QObject::tr("failed to load %1").arg(QString::fromStdString(dir.string()));
+            }
+            return false;
+        }
+        loadAllSurfaceChannels(*surface);
+        vc::core::util::transformSurfacePoints(
+            surface.get(), normalizedScaleFactor(scaleFactor), std::nullopt, 1.0);
+        vc::core::util::refreshTransformedSurfaceState(surface.get());
+        if (countValidSurfacePoints(*surface) == 0) {
+            if (error) {
+                *error = QObject::tr("%1: scaled tifxyz has no valid points")
+                    .arg(QString::fromStdString(dir.string()));
+            }
+            return false;
+        }
+        surface->save(dir.string(), surface->id.empty() ? dir.filename().string() : surface->id, true);
+        return true;
+    } catch (const std::exception& e) {
+        if (error) {
+            *error = QObject::tr("%1: %2")
+                .arg(QString::fromStdString(dir.string()), QString::fromUtf8(e.what()));
+        }
+        return false;
+    }
+}
 
 QString findPythonExecutable()
 {
@@ -387,7 +516,9 @@ void LasagnaServiceManager::handleReadyReadStderr()
 // ---------------------------------------------------------------------------
 
 void LasagnaServiceManager::startOptimization(const QJsonObject& config,
-                                           const QString& localOutputDir)
+                                           const QString& localOutputDir,
+                                           const QString& localOutputName,
+                                           double outputScaleFactor)
 {
     if (!isRunning()) {
         emit optimizationError(tr("Lasagna service is not running"));
@@ -395,6 +526,8 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
     }
 
     _localOutputDir = localOutputDir;
+    _localOutputName = localOutputName;
+    _outputScaleFactor = normalizedScaleFactor(outputScaleFactor);
 
     QUrl url(QStringLiteral("%1/optimize").arg(baseUrl()));
     QNetworkRequest req(url);
@@ -628,6 +761,34 @@ void LasagnaServiceManager::downloadResults()
             QString err = QString::fromUtf8(tar.readAllStandardError());
             emit optimizationError(tr("tar extraction failed: %1").arg(err));
             return;
+        }
+
+        if (!isIdentityScale(_outputScaleFactor)) {
+            if (_localOutputName.isEmpty()) {
+                emit optimizationError(tr("Cannot scale returned tifxyz: exact output name is empty."));
+                return;
+            }
+            const std::filesystem::path outputRoot(_localOutputDir.toStdString());
+            const auto resultDir = findReturnedTifxyzDir(outputRoot, _localOutputName);
+            if (!resultDir) {
+                emit optimizationError(
+                    tr("Cannot scale returned tifxyz: exact output directory is missing or invalid: %1")
+                        .arg(_localOutputName));
+                return;
+            }
+
+            emit statusMessage(
+                tr("Scaling returned tifxyz %1 by %2...")
+                    .arg(_localOutputName)
+                    .arg(_outputScaleFactor));
+            QString scaleError;
+            if (!scaleTifxyzInPlace(*resultDir, _outputScaleFactor, &scaleError)) {
+                emit optimizationError(tr("Failed to scale returned tifxyz: %1").arg(scaleError));
+                return;
+            }
+            std::cout << "[lasagna] scaled returned tifxyz "
+                      << resultDir->string()
+                      << " by factor " << _outputScaleFactor << std::endl;
         }
 
         std::cout << "[lasagna] results unpacked to "

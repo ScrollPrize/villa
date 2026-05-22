@@ -8,9 +8,10 @@ To set up a new experiment, work with the user to:
 
 1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current HEAD (any working copy changes should be left intact, assuming they are not in `fit_spiral.py`).
-3. **Read the in-scope files**: Only this 'atlas' subfolder of the repo is relevant. Read these files for full context:
-   - `tifxyz.py` — helper for loading grid-topo quad-mesh patches.
+3. **Read the in-scope files**: Only this 'spiral' subfolder of the repo is relevant. Read these files for full context:
    - `fit_spiral.py` — the file you modify. Losses, optimization, flow model, etc.
+   - `tifxyz.py` — helper for loading grid-topo quad-mesh patches.
+   - `point_collection.py` — helper for loading sets of annotated points, and linking them to nearby patches.
 4. **Initialize results.tsv**: Create `results_mar5.tsv` with just the header row. The baseline will be recorded after the first run. Change `mar5` to whatever branch tag is chosen.
 5. **Confirm and go**: Confirm setup looks good.
 
@@ -18,8 +19,8 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The fitting script runs for a **fixed iteration budget of 10000 steps**; this will take a few minutes in the baseline configuration (and you should avoid increasing this time by too large a factor).
-You launch it as: `WANDB_MODE=disabled python fit_spiral.py`.
+Each experiment runs on a single GPU. The fitting script runs for a **fixed iteration budget of 10000 steps**; this will take around 20 minutes in the baseline configuration (and you should avoid increasing this time by too large a factor).
+You launch it as: `WANDB_MODE=disabled python fit_spiral.py > run.log`.
 
 **What you CAN do:**
 - Modify `fit_spiral.py` — this is the only file you edit. Everything is fair game: losses, optimizer, hyperparameters, flow field, etc -- but NOT the metrics themselves! That would be cheating.
@@ -27,11 +28,16 @@ You launch it as: `WANDB_MODE=disabled python fit_spiral.py`.
 **What you CANNOT do:**
 - Change the number of iterations (num_training_steps in config) above 10000. It must stay fixed (or can be reduced if that actually gives better results).
 - Install new packages or add dependencies. You can only use what's already installed in this conda env.
-- Modify the evaluation metric (get_patch_satisfied_areas and related methods) or its parameters (in metrics_config), or the working-set growth logic (working_set_check_interval and how the working set expands).
+- Modify the evaluation metrics (get_patch_satisfied_areas, get_unattached_pcl_satisfied_counts, and related methods) or their parameters (in metrics_config).
+- Change from the 'global' `working_set_mode` to another. Only the global mode is in scope here.
 
-**The goal is simple: get the largest working set by the end of training.** The working set grows progressively as patches become satisfied; the script logs each addition to `working-set.txt` in the run's output directory, ending with a `training ended: final working set size N/M` line. That final `N` is the primary metric. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the losses. The only constraints are that the code runs without crashing, does not run for more than 10000 iterations, and wall-clock time does not increase to more than three times the baseline run.
+**The goal: improve a balance of `satisfied_patches` and `satisfied_unattached_pcls`.** These are the two primary metrics. These can be extracted from the process output using grep, if you redirect it to a file.
 
-**Hint — early growth matters**: Look at *when* patches enter the working set in `working-set.txt`, not just the final count. Seeing many patches added EARLY in training (low step numbers, growing densely in the first ~quarter of the run) is a strong positive signal — it means the optimizer is finding good geometry quickly and the run has lots of remaining budget to absorb harder patches. Conversely, a run where additions are sparse early and only pick up near the end is fragile: it likely got lucky and probably won't generalize across seeds. When two runs reach a similar final `N`, prefer the one whose early-step density is higher. Consider aborting runs early if their working set is clearly growing much slower than prior runs.
+We also track two "softer" versions of these metrics: `satisfied_area` (a continuous-area version of `satisfied_patches`) and `satisfied_unattached_pcl_points` (a per-point version of `satisfied_unattached_pcls`). These are often more sensitive — improvements may show up here first before they crystallise into the harder metrics — so they are useful as a leading signal.
+
+We expect all four metrics to be reasonably well correlated, but **avoid changes that make any of them substantially worse**, even if one of the others improves. A change that lifts `satisfied_patches` by 1 while halving `satisfied_unattached_pcls` is not a win.
+
+Everything else is fair game: change the diffeomorphism, the optimizer, the hyperparameters, the losses. The only constraints are that the code runs without crashing, does not run for more than 10000 iterations, and wall-clock time does not increase more than 50% versus the baseline run.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A tiny working-set improvement that adds 20 lines of hacky code? Probably not worth it. A tiny working-set improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
@@ -41,48 +47,54 @@ You launch it as: `WANDB_MODE=disabled python fit_spiral.py`.
 
 ## Output format
 
-The script writes a `working-set.txt` file into the run's output directory (something like `out/<date>_<scroll>_..._<runtag>/working-set.txt`). It contains one line per working-set change and a final summary line. Example:
+The four metrics we care about are printed to stdout near the end of the run, in the `run.log`:
 
 ```
-step 0: initialised with seed patch <id> (size 1/345)
-step 120: added patch <id> (size 2/345)
-step 350: added patch <id> (size 3/345)
-...
-training ended: final working set size 47/345
+satisfied_patches = 47/345 (13.6%)
+satisfied_area = 12345.6/98765.4 (12.5%)
+satisfied_unattached_pcls = 8/20 (40.0%)
+satisfied_unattached_pcl_points = 412/1023 (40.3%)
 ```
 
-The last line is what matters — extract the final working set size with:
+Extract these from `run.log` after the run completes, e.g.:
 ```
-grep "training ended" out/*/working-set.txt | tail -n 1
+grep -E "^(satisfied_patches|satisfied_area|satisfied_unattached_pcls|satisfied_unattached_pcl_points) =" run.log | tail -n 4
 ```
 
-(or use the specific run's directory if multiple runs are present). If the file has no `training ended` line, the run did not finish cleanly. Note depending on the computing platform the numbers might look different.
+If the four lines aren't present, the run did not finish cleanly. (Note: depending on the computing platform the absolute numbers might look different — only relative comparisons against the baseline on the same machine matter.)
+
+`working-set.txt` is still useful as a diagnostic for *when* in training patches become satisfied (see the "early growth matters" hint above), even though the final size itself isn't the metric.
 
 ## Logging results
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 5 columns:
+The TSV has a header row and 8 columns:
 
 ```
-commit	final_working_set	time_s	status	description
+commit	satisfied_patches	satisfied_area	satisfied_unattached_pcls	satisfied_unattached_pcl_points	time_s	status	description
 ```
 
 1. git commit hash (short, 7 chars)
-2. final working set size (e.g. 47) — use 0 for crashes. This is the metric.
-3. wall-clock time in seconds
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+2. `satisfied_patches` count (e.g. 47) — use 0 for crashes
+3. `satisfied_area` (float, e.g. 12345.6) — use 0 for crashes
+4. `satisfied_unattached_pcls` count (e.g. 8) — use 0 for crashes
+5. `satisfied_unattached_pcl_points` count (e.g. 412) — use 0 for crashes
+6. wall-clock time in seconds
+7. status: `keep`, `discard`, or `crash`
+8. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	final_working_set	time_s	status	description
-a1b2c3d	12	300	keep	baseline
-b2c3d4e	18	320	keep	increase LR to 0.04
-c3d4e5f	22	254	keep	switch to GeLU activation
-d4e5f6g	0	289	crash	double model width (OOM)
+commit	satisfied_patches	satisfied_area	satisfied_unattached_pcls	satisfied_unattached_pcl_points	time_s	status	description
+a1b2c3d	12	3210.4	5	287	300	keep	baseline
+b2c3d4e	18	4580.1	6	305	320	keep	increase LR to 0.04
+c3d4e5f	22	5102.7	5	291	254	keep	switch to GeLU activation (pcls flat — borderline)
+d4e5f6g	0	0	0	0	289	crash	double model width (OOM)
 ```
+
+When deciding `keep` vs `discard`, judge across all four metrics together: any metric falling substantially below baseline is grounds for `discard`, even if another metric improved a bit. The two hard counts (`satisfied_patches`, `satisfied_unattached_pcls`) are the primary signals; the two softer values (`satisfied_area`, `satisfied_unattached_pcl_points`) are the leading signals.
 
 ## The experiment loop
 
@@ -94,10 +106,10 @@ LOOP FOREVER:
 2. Tune `fit_spiral.py` with an experimental idea by directly hacking the code.
 3. git commit
 4. Run the experiment: `WANDB_MODE=disabled python fit_spiral.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the result: find the run's output directory and grep `working-set.txt` for the `training ended` line to get the final working set size.
-6. If there is no `training ended` line, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+5. Read out the result: grep `run.log` for the four `satisfied_*` summary lines (see Output format above).
+6. If the four summary lines are not present, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. Compare: if the final working set size improved (higher), advance the branch keeping the commit. Otherwise, git reset back to where you started.
+8. Compare against the baseline / previous best: advance the branch keeping the commit only if the change looks like a net improvement across the four metrics (and none of them are substantially worse). Otherwise, git reset back to where you started.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 

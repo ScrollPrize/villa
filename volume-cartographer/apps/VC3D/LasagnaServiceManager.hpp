@@ -56,7 +56,9 @@ public:
      * @param localOutputDir  Where to unpack results after completion.
      */
     void startOptimization(const QJsonObject& config,
-                           const QString& localOutputDir = QString());
+                           const QString& localOutputDir,
+                           const QString& localOutputName,
+                           double outputScaleFactor);
 
     /** Request cancellation of the running optimization. */
     void stopOptimization();
@@ -129,5 +131,7 @@ private:
     bool _serviceReady{false};
     bool _optimizationRunning{false};
     QString _localOutputDir;  // where to unpack optimization results
+    QString _localOutputName; // expected local tifxyz result name
     QString _visOutputDir;    // where to unpack vis export results
+    double _outputScaleFactor{1.0};
 };

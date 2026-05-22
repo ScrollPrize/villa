@@ -1,6 +1,7 @@
 {
 	"args": {
-		"model-init": "model"
+		"model-init": "model",
+		"mesh-step": 20.0
 	},
 	"base": {
 		"normal": 1.0,
