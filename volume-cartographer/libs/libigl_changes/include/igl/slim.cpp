@@ -29,10 +29,15 @@
 #include "mapping_energy_with_jacobians.h"
 
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <vector>
 #include <cassert>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <Eigen/IterativeLinearSolvers>
 #include <Eigen/SparseCholesky>
@@ -474,6 +479,16 @@ IGL_INLINE void igl::slim_update_weights_and_closest_rotations_with_jacobians(co
 
       if (std::abs(s1 - 1) < eps) m_sing_new(0) = 1;
       if (std::abs(s2 - 1) < eps) m_sing_new(1) = 1;
+      // Clamp weights to a sane finite range. Extreme starting triangles can
+      // make the SLIM weight formulas (e.g. sqrt(s_g / (2*(s-1)))) approach
+      // infinity, which then poisons AtA via mat_W = U * diag(sing) * U^T
+      // and produces "Negative diagonal term" in the Cholesky solver or
+      // outright NaN energy from the first iter. The clamp keeps the local
+      // step well-defined; SLIM still converges (weights just stop growing
+      // past the cap for those triangles).
+      const double w_cap = 1e8;
+      m_sing_new(0) = std::min(std::max(m_sing_new(0), 1.0/w_cap), w_cap);
+      m_sing_new(1) = std::min(std::max(m_sing_new(1), 1.0/w_cap), w_cap);
       mat_W = ui * m_sing_new.asDiagonal() * ui.transpose();
 
       W.row(i) = Eigen::Map<Eigen::Matrix<double, 1, 4, Eigen::RowMajor>>(mat_W.data());
@@ -606,6 +621,14 @@ IGL_INLINE void igl::slim_update_weights_and_closest_rotations_with_jacobians(co
       if (std::abs(s1 - 1) < eps) m_sing_new(0) = 1;
       if (std::abs(s2 - 1) < eps) m_sing_new(1) = 1;
       if (std::abs(s3 - 1) < eps) m_sing_new(2) = 1;
+      // See 2D path: clamp to keep AtA finite when starting triangles are
+      // numerically extreme.
+      {
+        const double w_cap = 1e8;
+        for (int k = 0; k < 3; ++k) {
+          m_sing_new(k) = std::min(std::max(m_sing_new(k), 1.0/w_cap), w_cap);
+        }
+      }
       RMat3 mat_W;
       mat_W = ui * m_sing_new.asDiagonal() * ui.transpose();
 
@@ -637,35 +660,64 @@ std::vector<Eigen::Triplet<double> > & IJV)
           W11*Dy, W12*Dy;
           W21*Dx, W22*Dx;
           W21*Dy, W22*Dy];*/
-    for (int k = 0; k < Dx.outerSize(); ++k)
+    // Parallel triplet emit: each thread fills its own buffer, then we
+    // concatenate. The outer-column loops have no cross-iteration dependence
+    // and dominate the per-iter wallclock at large mesh sizes.
     {
-      for (Eigen::SparseMatrix<double>::InnerIterator it(Dx, k); it; ++it)
+      const int dx_outer = Dx.outerSize();
+      const int dy_outer = Dy.outerSize();
+      int n_threads = 1;
+#ifdef _OPENMP
+      n_threads = std::max(1, omp_get_max_threads());
+#endif
+      std::vector<std::vector<Eigen::Triplet<double>>> bufs(n_threads);
+      // Rough prealloc per thread.
+      const std::size_t pre = static_cast<std::size_t>(4 * (dx_outer + dy_outer)) /
+                              static_cast<std::size_t>(n_threads) + 16;
+      for (auto& b : bufs) b.reserve(pre);
+
+      #pragma omp parallel
       {
-        int dx_r = it.row();
-        int dx_c = it.col();
-        double val = it.value();
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        auto& buf = bufs[tid];
 
-        IJV.push_back(Eigen::Triplet<double>(dx_r, dx_c, val * W(dx_r, 0)));
-        IJV.push_back(Eigen::Triplet<double>(dx_r, v_n + dx_c, val * W(dx_r, 1)));
+        #pragma omp for nowait schedule(static)
+        for (int k = 0; k < dx_outer; ++k) {
+          for (Eigen::SparseMatrix<double>::InnerIterator it(Dx, k); it; ++it) {
+            int dx_r = it.row();
+            int dx_c = it.col();
+            double val = it.value();
+            buf.emplace_back(dx_r, dx_c, val * W(dx_r, 0));
+            buf.emplace_back(dx_r, v_n + dx_c, val * W(dx_r, 1));
+            buf.emplace_back(2 * f_n + dx_r, dx_c, val * W(dx_r, 2));
+            buf.emplace_back(2 * f_n + dx_r, v_n + dx_c, val * W(dx_r, 3));
+          }
+        }
 
-        IJV.push_back(Eigen::Triplet<double>(2 * f_n + dx_r, dx_c, val * W(dx_r, 2)));
-        IJV.push_back(Eigen::Triplet<double>(2 * f_n + dx_r, v_n + dx_c, val * W(dx_r, 3)));
+        #pragma omp for schedule(static)
+        for (int k = 0; k < dy_outer; ++k) {
+          for (Eigen::SparseMatrix<double>::InnerIterator it(Dy, k); it; ++it) {
+            int dy_r = it.row();
+            int dy_c = it.col();
+            double val = it.value();
+            buf.emplace_back(f_n + dy_r, dy_c, val * W(dy_r, 0));
+            buf.emplace_back(f_n + dy_r, v_n + dy_c, val * W(dy_r, 1));
+            buf.emplace_back(3 * f_n + dy_r, dy_c, val * W(dy_r, 2));
+            buf.emplace_back(3 * f_n + dy_r, v_n + dy_c, val * W(dy_r, 3));
+          }
+        }
       }
-    }
 
-    for (int k = 0; k < Dy.outerSize(); ++k)
-    {
-      for (Eigen::SparseMatrix<double>::InnerIterator it(Dy, k); it; ++it)
-      {
-        int dy_r = it.row();
-        int dy_c = it.col();
-        double val = it.value();
-
-        IJV.push_back(Eigen::Triplet<double>(f_n + dy_r, dy_c, val * W(dy_r, 0)));
-        IJV.push_back(Eigen::Triplet<double>(f_n + dy_r, v_n + dy_c, val * W(dy_r, 1)));
-
-        IJV.push_back(Eigen::Triplet<double>(3 * f_n + dy_r, dy_c, val * W(dy_r, 2)));
-        IJV.push_back(Eigen::Triplet<double>(3 * f_n + dy_r, v_n + dy_c, val * W(dy_r, 3)));
+      std::size_t total = 0;
+      for (auto& b : bufs) total += b.size();
+      IJV.reserve(IJV.size() + total);
+      for (auto& b : bufs) {
+        IJV.insert(IJV.end(),
+                   std::make_move_iterator(b.begin()),
+                   std::make_move_iterator(b.end()));
       }
     }
   }

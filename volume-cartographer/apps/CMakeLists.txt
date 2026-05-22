@@ -1,11 +1,3 @@
-# Grid-resolution helpers split into a static lib so the unit tests can
-# link them without spawning the binary. Built unconditionally because
-# tests depend on it; the rest of this file's app executables are gated
-# behind VC_BUILD_APPS.
-add_library(vc_merge_grid STATIC src/vc_merge_tifxyz_grid.cpp)
-target_link_libraries(vc_merge_grid PUBLIC vc_core)
-target_include_directories(vc_merge_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
 if(NOT VC_BUILD_APPS)
     return()
 endif()
@@ -38,7 +30,67 @@ add_executable(vc_grow_seg_from_segments src/vc_grow_seg_from_segments.cpp)
 target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program_options)
 
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
-target_link_libraries(vc_tifxyz2obj vc_core)
+target_link_libraries(vc_tifxyz2obj vc_core vc_inpaint)
+
+function(vc_find_libigl_core out_var)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    foreach(_pkg IN ITEMS igl libigl Libigl)
+        find_package(${_pkg} CONFIG QUIET)
+        if(TARGET igl::core)
+            set(${out_var} igl::core PARENT_SCOPE)
+            return()
+        endif()
+        if(TARGET igl::igl_core)
+            set(${out_var} igl::igl_core PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+
+    set(_prefixes ${CMAKE_PREFIX_PATH} ${CMAKE_SYSTEM_PREFIX_PATH})
+    foreach(_env_prefix IN ITEMS "$ENV{LIBIGL_ROOT}" "$ENV{HOMEBREW_PREFIX}")
+        if(NOT "${_env_prefix}" STREQUAL "")
+            list(APPEND _prefixes "${_env_prefix}")
+        endif()
+    endforeach()
+    if(_prefixes)
+        list(REMOVE_DUPLICATES _prefixes)
+    endif()
+
+    find_package(igl CONFIG QUIET
+        NAMES igl libigl Libigl
+        HINTS ${_prefixes}
+        PATH_SUFFIXES
+            lib/cmake/igl
+            lib/cmake/libigl
+            share/cmake/igl
+            share/libigl/cmake)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    message(FATAL_ERROR
+        "vc_obj_uv_lift requires libigl core. Enable VC_BUILD_FLATBOI to "
+        "use the local FetchContent libigl path, or install a libigl CMake "
+        "package exporting igl::core or igl::igl_core.")
+endfunction()
+
+vc_find_libigl_core(_vc_libigl_core_target)
+add_executable(vc_obj_uv_lift src/vc_obj_uv_lift.cpp)
+target_link_libraries(vc_obj_uv_lift PRIVATE ${_vc_libigl_core_target} OpenMP::OpenMP_CXX)
+set_target_properties(vc_obj_uv_lift PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
 add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
 target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
@@ -112,7 +164,7 @@ add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
 
 add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
-target_link_libraries(vc_merge_tifxyz vc_merge_grid Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
+target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
 
 add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)

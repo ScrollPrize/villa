@@ -1,6 +1,6 @@
 # c3d — 3D volumetric u8 compression codec (single TU, C23, libc only).
 # Upstream: ~/c3d (vendored as a copy of c3d.c + c3d.h).
-add_library(c3d STATIC c3d.c)
+add_library(c3d c3d.c)
 
 target_include_directories(c3d PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
@@ -22,6 +22,3 @@ target_compile_options(c3d PRIVATE
 )
 
 target_link_libraries(c3d PRIVATE m)
-
-# -fPIC so vc_core (potentially built as a shared lib downstream) can link it.
-set_target_properties(c3d PROPERTIES POSITION_INDEPENDENT_CODE ON)

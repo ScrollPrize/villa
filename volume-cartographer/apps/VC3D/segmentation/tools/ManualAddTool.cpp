@@ -65,6 +65,7 @@ bool ManualAddTool::begin(const cv::Mat_<cv::Vec3f>& points, Config config)
     _config = sanitize(config);
     _entrySnapshotPoints = points.clone();
     _previewPoints = points.clone();
+    rebuildGridCache();
     _hoverPolylines.clear();
     _hoverVertex.reset();
     _hoverFillVertices.clear();
@@ -74,6 +75,7 @@ bool ManualAddTool::begin(const cv::Mat_<cv::Vec3f>& points, Config config)
     _changedVertices.clear();
     _userPlaneConstraints.clear();
     _initialFillCommitted = false;
+    clearHoverFillCache();
     touchRevision();
     return true;
 }
@@ -82,6 +84,14 @@ void ManualAddTool::clear()
 {
     _entrySnapshotPoints.release();
     _previewPoints.release();
+    _validBounds = cv::Rect();
+    _haveValidBounds = false;
+    _invalidMask.clear();
+    _fillSeenMarks.clear();
+    _barrierMarks.clear();
+    _sideMarks.clear();
+    _otherSideMarks.clear();
+    _markerEpoch = 0;
     _hoverPolylines.clear();
     _hoverVertex.reset();
     _hoverFillVertices.clear();
@@ -91,6 +101,7 @@ void ManualAddTool::clear()
     _changedVertices.clear();
     _userPlaneConstraints.clear();
     _initialFillCommitted = false;
+    clearHoverFillCache();
     touchRevision();
 }
 
@@ -101,6 +112,7 @@ bool ManualAddTool::clearPending(Config config)
     }
     _config = sanitize(config);
     _previewPoints = _entrySnapshotPoints.clone();
+    rebuildGridCache();
     _hoverPolylines.clear();
     _hoverVertex.reset();
     _hoverFillVertices.clear();
@@ -109,13 +121,18 @@ bool ManualAddTool::clearPending(Config config)
     _borderSampleVertices.clear();
     _changedVertices.clear();
     _userPlaneConstraints.clear();
+    clearHoverFillCache();
     touchRevision();
     return true;
 }
 
 void ManualAddTool::setConfig(Config config)
 {
+    const LinePreviewMode previousMode = _config.linePreviewMode;
     _config = sanitize(config);
+    if (_config.linePreviewMode != previousMode) {
+        clearHoverFillCache();
+    }
     if (_hoverVertex) {
         updateHover(_hoverVertex->row, _hoverVertex->col);
     }
@@ -142,6 +159,92 @@ bool ManualAddTool::isInvalid(int row, int col) const
 bool ManualAddTool::isValid(int row, int col) const
 {
     return inBounds(row, col) && !isInvalidPoint(_entrySnapshotPoints(row, col));
+}
+
+int ManualAddTool::flatIndex(int row, int col) const
+{
+    return row * _entrySnapshotPoints.cols + col;
+}
+
+void ManualAddTool::rebuildGridCache()
+{
+    _validBounds = cv::Rect();
+    _haveValidBounds = false;
+    _invalidMask.clear();
+    _fillSeenMarks.clear();
+    _barrierMarks.clear();
+    _sideMarks.clear();
+    _otherSideMarks.clear();
+    _markerEpoch = 0;
+    clearHoverFillCache();
+
+    if (_entrySnapshotPoints.empty()) {
+        return;
+    }
+
+    const int rows = _entrySnapshotPoints.rows;
+    const int cols = _entrySnapshotPoints.cols;
+    const std::size_t size = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    _invalidMask.assign(size, 0);
+    _fillSeenMarks.assign(size, 0);
+    _barrierMarks.assign(size, 0);
+    _sideMarks.assign(size, 0);
+    _otherSideMarks.assign(size, 0);
+
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            const int index = flatIndex(row, col);
+            const bool invalid = isInvalidPoint(_entrySnapshotPoints(row, col));
+            _invalidMask[static_cast<std::size_t>(index)] = invalid ? 1 : 0;
+            if (invalid) {
+                continue;
+            }
+            const cv::Rect cell(col, row, 1, 1);
+            _validBounds = _haveValidBounds ? (_validBounds | cell) : cell;
+            _haveValidBounds = true;
+        }
+    }
+}
+
+void ManualAddTool::clearHoverFillCache()
+{
+    _cachedHoverFillLines.clear();
+    _cachedHoverFillVertices.clear();
+    _cachedHoverFillMode = _config.linePreviewMode;
+    _hasCachedHoverFill = false;
+}
+
+bool ManualAddTool::hoverFillCacheMatches(const std::vector<GridPolyline>& lines) const
+{
+    if (!_hasCachedHoverFill || _cachedHoverFillMode != _config.linePreviewMode ||
+        _cachedHoverFillLines.size() != lines.size()) {
+        return false;
+    }
+    return std::equal(lines.begin(), lines.end(), _cachedHoverFillLines.begin(), [](const auto& a, const auto& b) {
+        return a.vertices == b.vertices &&
+               a.committed == b.committed &&
+               a.floodFillComponent == b.floodFillComponent;
+    });
+}
+
+void ManualAddTool::storeHoverFillCache(const std::vector<GridPolyline>& lines, const std::vector<GridKey>& fill)
+{
+    _cachedHoverFillLines = lines;
+    _cachedHoverFillVertices = fill;
+    _cachedHoverFillMode = _config.linePreviewMode;
+    _hasCachedHoverFill = true;
+}
+
+uint32_t ManualAddTool::nextMarkerEpoch() const
+{
+    if (_markerEpoch >= UINT32_MAX - 4) {
+        std::fill(_fillSeenMarks.begin(), _fillSeenMarks.end(), 0);
+        std::fill(_barrierMarks.begin(), _barrierMarks.end(), 0);
+        std::fill(_sideMarks.begin(), _sideMarks.end(), 0);
+        std::fill(_otherSideMarks.begin(), _otherSideMarks.end(), 0);
+        _markerEpoch = 0;
+    }
+    return ++_markerEpoch;
 }
 
 std::optional<ManualAddTool::GridPolyline> ManualAddTool::discoverAxisLine(int row, int col, bool horizontal) const
@@ -210,9 +313,15 @@ bool ManualAddTool::updateHover(int row, int col)
             next.push_back(*line);
         }
     }
-    const auto nextHoverFill = _config.linePreviewMode == LinePreviewMode::CrossFill
-        ? std::vector<GridKey>{}
-        : computeFillVerticesForLines(next, false);
+    std::vector<GridKey> nextHoverFill;
+    if (_config.linePreviewMode != LinePreviewMode::CrossFill) {
+        if (hoverFillCacheMatches(next)) {
+            nextHoverFill = _cachedHoverFillVertices;
+        } else {
+            nextHoverFill = computeFillVerticesForLines(next, false);
+            storeHoverFillCache(next, nextHoverFill);
+        }
+    }
 
     const bool vertexChanged = !_hoverVertex ||
                                _hoverVertex->row != row ||
@@ -285,87 +394,166 @@ std::vector<ManualAddTool::GridKey> ManualAddTool::computeFillVerticesForLines(
     const std::vector<GridPolyline>& lines,
     bool includeUserConstraints) const
 {
-    if (_entrySnapshotPoints.empty()) {
+    if (_entrySnapshotPoints.empty() || !_haveValidBounds || _invalidMask.empty()) {
         return {};
     }
 
     const int rows = _entrySnapshotPoints.rows;
     const int cols = _entrySnapshotPoints.cols;
-    std::vector<GridKey> fillVertices;
-    std::set<std::pair<int, int>> seen;
-    std::set<std::pair<int, int>> barriers;
-    cv::Rect validBounds;
-    bool haveValidBounds = false;
-
-    for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-            if (!isValid(row, col)) {
-                continue;
-            }
-            const cv::Rect cell(col, row, 1, 1);
-            validBounds = haveValidBounds ? (validBounds | cell) : cell;
-            haveValidBounds = true;
-        }
-    }
-    if (!haveValidBounds) {
+    const std::size_t size = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    if (_fillSeenMarks.size() != size || _barrierMarks.size() != size ||
+        _sideMarks.size() != size || _otherSideMarks.size() != size) {
         return {};
     }
 
+    std::vector<GridKey> fillVertices;
+    const uint32_t seenEpoch = nextMarkerEpoch();
+    const uint32_t barrierEpoch = nextMarkerEpoch();
+
+    auto indexOf = [&](int row, int col) -> int {
+        return row * cols + col;
+    };
     auto fillAllowed = [&](int row, int col) {
-        return validBounds.contains(cv::Point(col, row)) && isInvalid(row, col);
+        if (row < _validBounds.y || row >= _validBounds.y + _validBounds.height ||
+            col < _validBounds.x || col >= _validBounds.x + _validBounds.width) {
+            return false;
+        }
+        const int index = indexOf(row, col);
+        return _invalidMask[static_cast<std::size_t>(index)] != 0;
+    };
+    auto marked = [&](const std::vector<uint32_t>& marks, int index, uint32_t epoch) {
+        return marks[static_cast<std::size_t>(index)] == epoch;
     };
 
     for (const auto& line : lines) {
         for (const auto& p : line.vertices) {
-            barriers.insert({rowOf(p), colOf(p)});
+            const int row = rowOf(p);
+            const int col = colOf(p);
+            if (row >= 0 && row < rows && col >= 0 && col < cols) {
+                _barrierMarks[static_cast<std::size_t>(indexOf(row, col))] = barrierEpoch;
+            }
         }
     }
 
     auto addFill = [&](int row, int col) {
-        if (!fillAllowed(row, col) || seen.count({row, col}) != 0) {
+        if (!fillAllowed(row, col)) {
             return;
         }
-        seen.insert({row, col});
+        const int index = indexOf(row, col);
+        if (marked(_fillSeenMarks, index, seenEpoch)) {
+            return;
+        }
+        _fillSeenMarks[static_cast<std::size_t>(index)] = seenEpoch;
         fillVertices.push_back(GridKey{row, col});
     };
 
-    auto collectSide = [&](const GridPolyline& line, int dRow, int dCol) {
-        std::vector<GridKey> side;
+    struct SideSearch
+    {
+        std::vector<GridKey> cells;
         std::queue<GridKey> queue;
-        std::set<std::pair<int, int>> sideSeen;
+        std::vector<uint32_t>* marks{nullptr};
+        uint32_t epoch{0};
+        bool complete{false};
+    };
 
-        auto push = [&](int row, int col) {
-            const auto key = std::make_pair(row, col);
-            if (!fillAllowed(row, col) || barriers.count(key) != 0 || sideSeen.count(key) != 0) {
-                return;
-            }
-            sideSeen.insert(key);
-            queue.push(GridKey{row, col});
-        };
+    auto pushSide = [&](SideSearch& side, int row, int col) {
+        if (!fillAllowed(row, col)) {
+            return;
+        }
+        const int index = indexOf(row, col);
+        if (!side.marks || marked(_barrierMarks, index, barrierEpoch) || marked(*side.marks, index, side.epoch)) {
+            return;
+        }
+        (*side.marks)[static_cast<std::size_t>(index)] = side.epoch;
+        side.queue.push(GridKey{row, col});
+    };
+
+    auto collectPreferredSide = [&](const GridPolyline& line, int negRow, int negCol, int posRow, int posCol) {
+        SideSearch negative;
+        SideSearch positive;
+        negative.marks = &_sideMarks;
+        positive.marks = &_otherSideMarks;
+        negative.epoch = nextMarkerEpoch();
+        positive.epoch = nextMarkerEpoch();
 
         for (const auto& p : line.vertices) {
-            push(rowOf(p) + dRow, colOf(p) + dCol);
+            pushSide(negative, rowOf(p) + negRow, colOf(p) + negCol);
+            pushSide(positive, rowOf(p) + posRow, colOf(p) + posCol);
         }
 
         constexpr int kDirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
-        while (!queue.empty()) {
-            const GridKey key = queue.front();
-            queue.pop();
-            side.push_back(key);
+        auto step = [&](SideSearch& side) {
+            if (side.complete) {
+                return;
+            }
+            if (side.queue.empty()) {
+                side.complete = true;
+                return;
+            }
+            const GridKey key = side.queue.front();
+            side.queue.pop();
+            side.cells.push_back(key);
             for (const auto& dir : kDirs) {
-                push(key.row + dir[0], key.col + dir[1]);
+                pushSide(side, key.row + dir[0], key.col + dir[1]);
+            }
+            if (side.queue.empty()) {
+                side.complete = true;
+            }
+        };
+
+        auto shouldStop = [&]() {
+            if (!negative.complete && !positive.complete) {
+                return false;
+            }
+            if (negative.complete && positive.complete) {
+                return true;
+            }
+            const SideSearch& done = negative.complete ? negative : positive;
+            const SideSearch& running = negative.complete ? positive : negative;
+            if (done.cells.empty()) {
+                return false;
+            }
+            return running.cells.size() > done.cells.size();
+        };
+
+        while (!shouldStop()) {
+            step(negative);
+            step(positive);
+        }
+
+        const std::vector<GridKey>* chosen = nullptr;
+        if (negative.complete && positive.complete) {
+            if (negative.cells.empty()) {
+                chosen = &positive.cells;
+            } else if (positive.cells.empty()) {
+                chosen = &negative.cells;
+            } else {
+                chosen = (positive.cells.size() <= negative.cells.size()) ? &positive.cells : &negative.cells;
+            }
+        } else if (negative.complete) {
+            chosen = &negative.cells;
+        } else if (positive.complete) {
+            chosen = &positive.cells;
+        }
+
+        if (chosen) {
+            for (const auto& key : *chosen) {
+                addFill(key.row, key.col);
             }
         }
-        return side;
     };
 
     auto collectComponentFromLine = [&](const GridPolyline& line) {
         std::queue<GridKey> queue;
         auto push = [&](int row, int col) {
-            if (!fillAllowed(row, col) || seen.count({row, col}) != 0) {
+            if (!fillAllowed(row, col)) {
                 return;
             }
-            seen.insert({row, col});
+            const int index = indexOf(row, col);
+            if (marked(_fillSeenMarks, index, seenEpoch)) {
+                return;
+            }
+            _fillSeenMarks[static_cast<std::size_t>(index)] = seenEpoch;
             queue.push(GridKey{row, col});
         };
 
@@ -398,24 +586,10 @@ std::vector<ManualAddTool::GridKey> ManualAddTool::computeFillVerticesForLines(
 
         const bool horizontal = rowOf(line.vertices.front()) == rowOf(line.vertices.back());
         const bool vertical = colOf(line.vertices.front()) == colOf(line.vertices.back());
-        if (!horizontal && !vertical) {
-            continue;
-        }
-
-        const auto negativeSide = horizontal ? collectSide(line, -1, 0) : collectSide(line, 0, -1);
-        const auto positiveSide = horizontal ? collectSide(line, 1, 0) : collectSide(line, 0, 1);
-        const std::vector<GridKey>* chosen = nullptr;
-        if (negativeSide.empty()) {
-            chosen = &positiveSide;
-        } else if (positiveSide.empty()) {
-            chosen = &negativeSide;
-        } else {
-            chosen = (positiveSide.size() <= negativeSide.size()) ? &positiveSide : &negativeSide;
-        }
-        if (chosen) {
-            for (const auto& key : *chosen) {
-                addFill(key.row, key.col);
-            }
+        if (horizontal) {
+            collectPreferredSide(line, -1, 0, 1, 0);
+        } else if (vertical) {
+            collectPreferredSide(line, 0, -1, 0, 1);
         }
     }
     if (includeUserConstraints) {

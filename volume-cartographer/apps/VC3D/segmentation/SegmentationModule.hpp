@@ -435,6 +435,7 @@ private:
     std::unique_ptr<SurfaceMaskBrushTool> _surfaceMaskTool;
     std::unique_ptr<ManualAddTool> _manualAddTool;
     bool _manualAddMode{false};
+    QElapsedTimer _manualAddHoverThrottle;
     cv::Mat _pendingManualAddTracerMask;
     SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
 

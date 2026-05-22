@@ -30,9 +30,10 @@ jobs:
               - 'volume-cartographer/**'
               - '.github/workflows/vc3d-ci.yml'
             dockerfile:
-              - 'volume-cartographer/*.Dockerfile'
+              - 'volume-cartographer/Dockerfile'
               - 'volume-cartographer/.dockerignore'
               - 'volume-cartographer/scripts/ci.sh'
+              - 'volume-cartographer/scripts/install_build_deps.sh'
 
   skip:
     name: Skip (no volume-cartographer changes)
@@ -52,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ["ubuntu-24.04", "ubuntu-26.04"]
+        image: ["ubuntu-26.04"]
     env:
       # If the PR touched a Dockerfile (or ci.sh), the published ghcr image
       # is stale for this PR. Force a local build with the GHA buildx cache.
@@ -72,12 +73,10 @@ jobs:
     continue-on-error: ${{ matrix.blocking != true }}
     strategy:
       fail-fast: false
-      # ubuntu-24.04: compile-only smoke (Release, no tests).
-      # ubuntu-26.04: full test + sanitizer matrix + coverage + dead-code.
+      # ubuntu-26.04: Release compile + full test + sanitizer matrix
+      # + coverage + dead-code.
       matrix:
         include:
-          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
-          - { image: "ubuntu-24.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests,      action: test,    blocking: false }
@@ -99,7 +98,7 @@ jobs:
         run: volume-cartographer/scripts/ci.sh ${{ matrix.action }} ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
 
   coverage:
-    name: Coverage (gcc, gcov)
+    name: Coverage (clang, source-based)
     needs: [changes, builder]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -110,8 +109,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Coverage builds are huge: -O0 -g + libgcov instrumentation, every
-      # test executable linked statically against vc_core. The default
+      # Coverage builds are huge: clang source-based instrumentation
+      # (-fprofile-instr-generate -fcoverage-mapping) on every test
+      # executable linked statically against vc_core. The default
       # ubuntu runner ships ~14 GB free, which is not enough — `ar` and
       # the final link step hit ENOSPC intermittently. Free ~25-30 GB by
       # purging preinstalled toolchains we don't use (Android SDK, .NET,

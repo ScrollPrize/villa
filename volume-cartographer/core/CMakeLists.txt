@@ -35,8 +35,13 @@ add_library(vc_core
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         src/render/ZarrChunkFetcher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src/vc_merge_tifxyz_grid.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
+
+# Grid-resolution helpers (vc_merge_tifxyz_grid) live in apps/src but are
+# compiled into vc_core so the unit tests link them without the binary.
+target_include_directories(vc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src)
 
 target_link_libraries(vc_core
         PUBLIC
@@ -76,6 +81,9 @@ target_link_libraries(vc_ui PUBLIC vc_core Qt6::Core Qt6::Gui Qt6::Widgets)
 
 add_library(vc_flattening src/ABFFlattening.cpp)
 target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
+
+add_library(vc_inpaint src/InpaintSurface.cpp)
+target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_tracer
     src/GrowPatch.cpp

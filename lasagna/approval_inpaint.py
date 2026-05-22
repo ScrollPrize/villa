@@ -22,6 +22,7 @@ class ApprovalInpaintResult:
 	skeleton_size: int
 	index_bounds: tuple[int, int, int, int]  # row_min, row_max, col_min, col_max
 	source_mesh_step: float
+	output_mask: dict | None = None
 
 
 def _as_2d_nonzero(arr: np.ndarray, *, name: str) -> np.ndarray:
@@ -281,45 +282,95 @@ def skeletonize_boundary(mask: np.ndarray) -> np.ndarray:
 
 def _order_component(coords: list[tuple[int, int]], shape: tuple[int, int]) -> list[tuple[int, int]]:
 	coord_set = set(coords)
-	degree: dict[tuple[int, int], int] = {}
-	for p in coords:
-		degree[p] = sum((n in coord_set) for n in _neighbors8(p[0], p[1], shape[0], shape[1]))
-	unvisited = set(coords)
+	adj = {
+		p: sorted(n for n in _neighbors8(p[0], p[1], shape[0], shape[1]) if n in coord_set)
+		for p in coords
+	}
+	degree = {p: len(ns) for p, ns in adj.items()}
+	endpoints = sorted(p for p, deg in degree.items() if deg <= 1)
+	start = endpoints[0] if endpoints else min(coords)
+
+	def _next(prev: tuple[int, int] | None, cur: tuple[int, int], seen: set[tuple[int, int]]) -> tuple[int, int] | None:
+		candidates = [n for n in adj[cur] if n != prev]
+		unseen = [n for n in candidates if n not in seen]
+		if unseen:
+			candidates = unseen
+		elif not endpoints and start in candidates and len(seen) == len(coords):
+			return start
+		else:
+			return None
+		if prev is None:
+			return min(candidates)
+		in_vec = (cur[0] - prev[0], cur[1] - prev[1])
+
+		def score(n: tuple[int, int]) -> tuple[int, int, int, int]:
+			out_vec = (n[0] - cur[0], n[1] - cur[1])
+			dot = in_vec[0] * out_vec[0] + in_vec[1] * out_vec[1]
+			cross_abs = abs(in_vec[0] * out_vec[1] - in_vec[1] * out_vec[0])
+			return (-dot, cross_abs, n[0], n[1])
+
+		return min(candidates, key=score)
+
 	order: list[tuple[int, int]] = []
+	seen: set[tuple[int, int]] = set()
+	prev: tuple[int, int] | None = None
+	cur = start
+	while cur not in seen:
+		order.append(cur)
+		seen.add(cur)
+		nxt = _next(prev, cur, seen)
+		if nxt is None or nxt == start:
+			break
+		prev, cur = cur, nxt
+	if len(order) == len(coords):
+		return order
+
+	# Fallback for branched/noisy skeletons: keep walking the graph from the
+	# closest ordered point so the emitted corr points remain locally connected.
+	unvisited = set(coords) - set(order)
 	while unvisited:
-		endpoints = sorted(p for p in unvisited if degree.get(p, 0) <= 1)
-		start = endpoints[0] if endpoints else min(unvisited)
-		stack = [start]
-		while stack:
-			p = stack.pop()
-			if p not in unvisited:
-				continue
-			unvisited.remove(p)
-			order.append(p)
-			neigh = [n for n in _neighbors8(p[0], p[1], shape[0], shape[1]) if n in unvisited]
-			neigh.sort(key=lambda q: (degree.get(q, 0), q[0], q[1]), reverse=True)
-			stack.extend(neigh)
+		if order:
+			cur = min(unvisited, key=lambda p: min((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 for q in order))
+		else:
+			cur = min(unvisited)
+		prev = None
+		while cur in unvisited:
+			order.append(cur)
+			unvisited.remove(cur)
+			seen = set(order)
+			nxt = _next(prev, cur, seen)
+			if nxt is None or nxt not in unvisited:
+				break
+			prev, cur = cur, nxt
 	return order
 
 
-def ordered_skeleton_points(skeleton: np.ndarray) -> list[tuple[int, int]]:
+def ordered_skeleton_contours(skeleton: np.ndarray) -> list[list[tuple[int, int]]]:
 	labels, n, _sizes = _connected_components(skeleton.astype(bool), connectivity=8)
-	ordered: list[tuple[int, int]] = []
+	contours: list[list[tuple[int, int]]] = []
 	for label in range(1, n + 1):
 		coords_np = np.argwhere(labels == label)
 		if coords_np.size == 0:
 			continue
 		coords = [(int(r), int(c)) for r, c in coords_np]
-		ordered.extend(_order_component(coords, skeleton.shape))
+		ordered = _order_component(coords, skeleton.shape)
+		if ordered:
+			contours.append(ordered)
+	return contours
+
+
+def ordered_skeleton_points(skeleton: np.ndarray) -> list[tuple[int, int]]:
+	ordered: list[tuple[int, int]] = []
+	for contour in ordered_skeleton_contours(skeleton):
+		ordered.extend(contour)
 	return ordered
 
 
-def sample_skeleton_points(
-	skeleton: np.ndarray,
+def _sample_ordered_points(
+	ordered: list[tuple[int, int]],
 	*,
 	spacing_px: float,
 ) -> list[tuple[int, int]]:
-	ordered = ordered_skeleton_points(skeleton)
 	if not ordered:
 		return []
 	spacing = max(1.0, float(spacing_px))
@@ -337,6 +388,30 @@ def sample_skeleton_points(
 	if not selected:
 		selected.append(ordered[0])
 	return selected
+
+
+def sample_skeleton_contours(
+	skeleton: np.ndarray,
+	*,
+	spacing_px: float,
+) -> list[list[tuple[int, int]]]:
+	contours = []
+	for contour in ordered_skeleton_contours(skeleton):
+		sampled = _sample_ordered_points(contour, spacing_px=spacing_px)
+		if sampled:
+			contours.append(sampled)
+	return contours
+
+
+def sample_skeleton_points(
+	skeleton: np.ndarray,
+	*,
+	spacing_px: float,
+) -> list[tuple[int, int]]:
+	points: list[tuple[int, int]] = []
+	for contour in sample_skeleton_contours(skeleton, spacing_px=spacing_px):
+		points.extend(contour)
+	return points
 
 
 def _sample_xyz_at_index_center(
@@ -378,6 +453,29 @@ def _sample_xyz_at_index_center(
 	return float(xyz[rr, cc, 0]), float(xyz[rr, cc, 1]), float(xyz[rr, cc, 2])
 
 
+def _build_output_mask_payload(
+	*,
+	corr_collection_ids: list[int],
+	corr_contours: list[dict] | None = None,
+	dilation_radius: int,
+) -> dict:
+	radius = int(dilation_radius)
+	if radius < 0:
+		raise ValueError(f"approval inpaint output-mask dilation must be >= 0, got {dilation_radius}")
+	ids = [int(v) for v in corr_collection_ids]
+	if not ids:
+		raise ValueError("approval inpaint output mask requires at least one corr collection")
+	payload = {
+		"version": 2,
+		"source": "corr_points",
+		"corr_collection_ids": ids,
+		"dilation_radius": radius,
+	}
+	if corr_contours:
+		payload["corr_contours"] = corr_contours
+	return payload
+
+
 def _next_collection_id(corr_points: dict) -> str:
 	cols = corr_points.get("collections", {})
 	max_id = -1
@@ -392,10 +490,10 @@ def _next_collection_id(corr_points: dict) -> str:
 
 def _merge_generated_corr_points(
 	existing: dict | None,
-	coords: list[tuple[int, int]],
+	contours: list[list[tuple[int, int]]],
 	xyz: np.ndarray,
 	d: np.ndarray,
-) -> dict:
+) -> tuple[dict, int, list[dict]]:
 	out = copy.deepcopy(existing) if isinstance(existing, dict) else {}
 	cols = out.setdefault("collections", {})
 	if not isinstance(cols, dict):
@@ -403,21 +501,29 @@ def _merge_generated_corr_points(
 		out["collections"] = cols
 	cid = _next_collection_id(out)
 	points = {}
-	for pid, (r, c) in enumerate(coords):
-		points[str(pid)] = {
-			"p": [
-				float(xyz[r, c, 0]),
-				float(xyz[r, c, 1]),
-				float(xyz[r, c, 2]),
-			],
-			"wind_a": float(d[r, c]),
-		}
+	contour_payload: list[dict] = []
+	pid = 0
+	for contour in contours:
+		point_ids = []
+		for r, c in contour:
+			points[str(pid)] = {
+				"p": [
+					float(xyz[r, c, 0]),
+					float(xyz[r, c, 1]),
+					float(xyz[r, c, 2]),
+				],
+				"wind_a": float(d[r, c]),
+			}
+			point_ids.append(pid)
+			pid += 1
+		if len(point_ids) >= 3:
+			contour_payload.append({"collection_id": int(cid), "point_ids": point_ids})
 	cols[cid] = {
 		"name": "approval_inpaint",
 		"metadata": {"winding_is_absolute": True},
 		"points": points,
 	}
-	return out
+	return out, int(cid), contour_payload
 
 
 def _snap_extent_to_mesh_step(raw_extent: float, mesh_step: float) -> int:
@@ -438,6 +544,8 @@ def build_approval_inpaint(
 	corr_spacing: float | None = None,
 	padding_frac: float | None = 0.25,
 	existing_corr_points: dict | None = None,
+	output_mask: bool = False,
+	output_mask_dilate: int = 3,
 ) -> ApprovalInpaintResult:
 	xyz, valid, d, meta = _load_tifxyz_arrays(tifxyz_path)
 	approval = load_approval_mask(Path(tifxyz_path) / "approval.tif", expected_shape=valid.shape)
@@ -447,20 +555,25 @@ def build_approval_inpaint(
 	seed_index = nearest_valid_index(xyz, valid, seed)
 	component_label, component = select_component_for_seed(labels, seed_index)
 	boundary_source = enclosing_approval_mask(component, approval, valid)
+	source_step = _source_mesh_step(meta, mesh_step)
 	skeleton = skeletonize_boundary(boundary_source)
 	if not bool(skeleton.any()):
 		skeleton = boundary_source
-	source_step = _source_mesh_step(meta, mesh_step)
 	spacing = float(corr_spacing) if corr_spacing is not None else float(mesh_step)
 	if not math.isfinite(spacing) or spacing <= 0.0:
 		raise ValueError(f"approval inpaint corr spacing must be > 0, got {corr_spacing}")
 	spacing_px = max(1.0, spacing / source_step)
-	candidate_coords = sample_skeleton_points(skeleton, spacing_px=spacing_px)
-	coords = [
-		(r, c)
-		for r, c in candidate_coords
-		if bool(valid[r, c]) and bool(np.isfinite(xyz[r, c]).all()) and bool(np.isfinite(d[r, c]))
+	candidate_contours = sample_skeleton_contours(skeleton, spacing_px=spacing_px)
+	contours = [
+		[
+			(r, c)
+			for r, c in contour
+			if bool(valid[r, c]) and bool(np.isfinite(xyz[r, c]).all()) and bool(np.isfinite(d[r, c]))
+		]
+		for contour in candidate_contours
 	]
+	contours = [contour for contour in contours if contour]
+	coords = [p for contour in contours for p in contour]
 	if not coords:
 		raise ValueError("approval inpaint generated no valid skeleton correction points")
 
@@ -485,7 +598,14 @@ def build_approval_inpaint(
 	pad_mul = 1.0 + 2.0 * pad
 	model_w = _snap_extent_to_mesh_step(raw_w * pad_mul, mesh_step)
 	model_h = _snap_extent_to_mesh_step(raw_h * pad_mul, mesh_step)
-	corr_points = _merge_generated_corr_points(existing_corr_points, coords, xyz, d)
+	corr_points, generated_cid, corr_contours = _merge_generated_corr_points(existing_corr_points, contours, xyz, d)
+	output_mask_payload = None
+	if output_mask:
+		output_mask_payload = _build_output_mask_payload(
+			corr_collection_ids=[generated_cid],
+			corr_contours=corr_contours,
+			dilation_radius=int(output_mask_dilate),
+		)
 	return ApprovalInpaintResult(
 		seed=new_seed,
 		model_w=model_w,
@@ -496,4 +616,5 @@ def build_approval_inpaint(
 		skeleton_size=int(skeleton.sum()),
 		index_bounds=(rmin, rmax, cmin, cmax),
 		source_mesh_step=float(source_step),
+		output_mask=output_mask_payload,
 	)
