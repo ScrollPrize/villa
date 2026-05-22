@@ -751,6 +751,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 					"candidate_lr": 0.07,
 					"fringe_opt_iters": 5,
 					"fringe_lr": 0.03,
+					"global_opt_interval": 6,
 					"progress_mode": "both",
 					"scale_levels": 4,
 					"min_scale_level": 2,
@@ -782,6 +783,7 @@ class SnapSurfMapperTest(unittest.TestCase):
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.candidate_lr, 0.07)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.fringe_opt_iters, 5)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.fringe_lr, 0.03)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.global_opt_interval, 6)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.progress_mode, "both")
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.scale_levels, 4)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.min_scale_level, 2)
@@ -2349,6 +2351,88 @@ class SnapSurfMapperTest(unittest.TestCase):
 		}
 
 		self.assertFalse(opt_loss_snap_surf._map_init_needs_repair(terms))
+
+	def test_map_init_global_opt_interval_skips_clean_rim_steps(self) -> None:
+		state = opt_loss_snap_surf._SurfaceState()
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(global_opt_interval=3),
+		)
+		terms = {
+			"loss": torch.tensor(1.0),
+			"uv_bad": torch.tensor(0.0),
+			"model_bad": torch.tensor(0.0),
+			"step_bad_quad": torch.tensor(0.0),
+			"jac_bad": torch.tensor(12.0),
+			"jac_min": torch.tensor(0.03),
+			"jac_inv_bad_quad": torch.tensor(0.0),
+		}
+
+		run, reason = opt_loss_snap_surf._map_init_should_run_global_opt(
+			state,
+			cfg,
+			added=4,
+			pruned_sample=0,
+			pruned_fold=0,
+			pruned_sparse=0,
+			terms=terms,
+		)
+		self.assertFalse(run)
+		self.assertEqual(reason, "rim_ok")
+
+		state.map_init.rim_blocks_since_global_opt = 2
+		run, reason = opt_loss_snap_surf._map_init_should_run_global_opt(
+			state,
+			cfg,
+			added=4,
+			pruned_sample=0,
+			pruned_fold=0,
+			pruned_sparse=0,
+			terms=terms,
+		)
+		self.assertTrue(run)
+		self.assertEqual(reason, "interval")
+
+	def test_map_init_global_opt_runs_on_rim_problems(self) -> None:
+		state = opt_loss_snap_surf._SurfaceState()
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(global_opt_interval=10),
+		)
+		terms = {
+			"loss": torch.tensor(1.0),
+			"uv_bad": torch.tensor(0.0),
+			"model_bad": torch.tensor(0.0),
+			"step_bad_quad": torch.tensor(0.0),
+			"jac_bad": torch.tensor(1.0),
+			"jac_min": torch.tensor(-0.01),
+			"jac_inv_bad_quad": torch.tensor(0.0),
+		}
+
+		run, reason = opt_loss_snap_surf._map_init_should_run_global_opt(
+			state,
+			cfg,
+			added=1,
+			pruned_sample=0,
+			pruned_fold=0,
+			pruned_sparse=0,
+			terms=terms,
+		)
+		self.assertTrue(run)
+		self.assertEqual(reason, "rim_problem")
+
+		terms["jac_bad"] = torch.tensor(0.0)
+		terms["jac_min"] = torch.tensor(0.1)
+		terms["step_bad_quad"] = torch.tensor(1.0)
+		run, reason = opt_loss_snap_surf._map_init_should_run_global_opt(
+			state,
+			cfg,
+			added=1,
+			pruned_sample=0,
+			pruned_fold=0,
+			pruned_sparse=0,
+			terms=terms,
+		)
+		self.assertTrue(run)
+		self.assertEqual(reason, "rim_problem")
 
 	def test_map_init_dense_objective_regularizes_inactive_field(self) -> None:
 		active_quad = torch.zeros(2, 2, dtype=torch.bool)

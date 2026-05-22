@@ -73,6 +73,7 @@
 						"fringe_opt_iters": 10,
 						"fringe_lr": 0.1,
 						"grow_opt_iters": 10,
+						"global_opt_interval": 10,
 						"scale_levels": 5,
 						"min_scale_level": 0,
 						"scale_factor": 2,
@@ -94,7 +95,7 @@
 						"w_jac": 10.0,
 						"w_metric_smooth": 1.0,
 						"w_area_smooth": 1.0,
-						"max_sample_distance": 500.0,
+						"max_sample_distance": 1000.0,
 						"max_sample_angle_deg": 45.0,
 						"sample_angle_step_fraction": 0.1,
 						"max_step_neighbor_ratio": 10.0

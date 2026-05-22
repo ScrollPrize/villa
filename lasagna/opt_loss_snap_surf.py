@@ -24,6 +24,7 @@ class SnapSurfMapInitConfig:
 	fringe_opt_iters: int = 10
 	fringe_lr: float = 0.05
 	grow_opt_iters: int = 100
+	global_opt_interval: int = 1
 	progress_interval: int = 100
 	progress_mode: str = "block"
 	scale_levels: int = 1
@@ -49,7 +50,7 @@ class SnapSurfMapInitConfig:
 	w_metric_smooth: float = 0.05
 	w_area_smooth: float = 0.02
 	angle_dist_mult: float = 9.0
-	max_sample_distance: float = 500.0
+	max_sample_distance: float = 1000.0
 	max_sample_angle_deg: float = 45.0
 	sample_angle_step_fraction: float = 0.1
 	max_step_neighbor_ratio: float = 10.0
@@ -190,6 +191,7 @@ def configure_snap_surf(
 			f"fringe_opt_iters={_cfg.map_init.fringe_opt_iters} "
 			f"fringe_lr={_cfg.map_init.fringe_lr} "
 			f"grow_opt_iters={_cfg.map_init.grow_opt_iters} "
+			f"global_opt_interval={_cfg.map_init.global_opt_interval} "
 			f"progress_interval={_cfg.map_init.progress_interval} "
 			f"progress_mode={_cfg.map_init.progress_mode!r} "
 			f"scale_levels={_cfg.map_init.scale_levels} "
@@ -244,6 +246,7 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			fringe_opt_iters=max(0, int(raw_cfg.get("fringe_opt_iters", defaults.fringe_opt_iters))),
 			fringe_lr=float(raw_cfg.get("fringe_lr", defaults.fringe_lr)),
 			grow_opt_iters=max(0, int(raw_cfg.get("grow_opt_iters", defaults.grow_opt_iters))),
+			global_opt_interval=max(1, int(raw_cfg.get("global_opt_interval", defaults.global_opt_interval))),
 			progress_interval=max(100, int(raw_cfg.get("progress_interval", defaults.progress_interval))),
 			progress_mode=str(raw_cfg.get("progress_mode", defaults.progress_mode)).lower(),
 			scale_levels=max(1, int(raw_cfg.get("scale_levels", defaults.scale_levels))),
@@ -402,6 +405,10 @@ class _MapInitState:
 		self.total_iters: int = 0
 		self.grow_steps: int = 0
 		self.opt_blocks: int = 0
+		self.global_opt_blocks: int = 0
+		self.rim_only_blocks: int = 0
+		self.rim_problem_blocks: int = 0
+		self.rim_blocks_since_global_opt: int = 0
 		self.repair_blocks: int = 0
 		self.added_total: int = 0
 		self.sparse_pruned_total: int = 0
@@ -3099,6 +3106,9 @@ def _map_init_empty_stats() -> dict[str, float]:
 		"snaps_map_iters": 0.0,
 		"snaps_map_blocks": 0.0,
 		"snaps_map_grow": 0.0,
+		"snaps_map_global": 0.0,
+		"snaps_map_rim": 0.0,
+		"snaps_map_rim_problem": 0.0,
 		"snaps_map_add_loss": 0.0,
 		"snaps_map_add_bad_frac": 0.0,
 		"snaps_map_add_success_frac": 0.0,
@@ -4044,6 +4054,7 @@ def _map_init_switch_to_scale(
 	else:
 		mi.blocked_quad = blocked.detach().bool().clone()
 	mi.blocked_last_revisit_iter = int(mi.total_iters)
+	mi.rim_blocks_since_global_opt = 0
 	_map_init_set_current_level_external_coords(mi)
 	_map_init_refresh_current_uv_from_pyramid(mi, cfg)
 	return True
@@ -6792,6 +6803,49 @@ def _map_init_needs_repair(terms: dict[str, torch.Tensor]) -> bool:
 	return jac_bad and jac_flipped
 
 
+def _map_init_terms_need_global_opt(terms: dict[str, torch.Tensor]) -> bool:
+	if not terms:
+		return True
+	loss = terms.get("loss")
+	if loss is None or not bool(torch.isfinite(loss).all().detach().cpu()):
+		return True
+	if _map_init_term_float(terms, "uv_bad") > 0.0:
+		return True
+	if _map_init_term_float(terms, "model_bad") > 0.0:
+		return True
+	if _map_init_term_float(terms, "step_bad_quad") > 0.0:
+		return True
+	if _map_init_term_float(terms, "jac_bad") > 0.0 and _map_init_term_float(terms, "jac_min") <= 0.0:
+		return True
+	if _map_init_term_float(terms, "jac_inv_bad_quad") > 0.0:
+		return True
+	return False
+
+
+def _map_init_should_run_global_opt(
+	state: _SurfaceState,
+	cfg: SnapSurfConfig,
+	*,
+	added: int,
+	pruned_sample: int,
+	pruned_fold: int,
+	pruned_sparse: int,
+	terms: dict[str, torch.Tensor],
+) -> tuple[bool, str]:
+	interval = max(1, int(cfg.map_init.global_opt_interval))
+	if interval <= 1:
+		return True, "interval"
+	if int(added) <= 0:
+		return True, "stall"
+	if int(pruned_sample) > 0 or int(pruned_fold) > 0 or int(pruned_sparse) > 0:
+		return True, "rim_prune"
+	if _map_init_terms_need_global_opt(terms):
+		return True, "rim_problem"
+	if int(state.map_init.rim_blocks_since_global_opt) + 1 >= interval:
+		return True, "interval"
+	return False, "rim_ok"
+
+
 def _map_init_try_coarser_revisit(
 	state: _SurfaceState,
 	*,
@@ -7050,7 +7104,36 @@ def _run_map_init_for_surface(
 					int(cfg.map_init.grow_opt_iters),
 					int(cfg.map_init.iters) - int(state.map_init.total_iters),
 				)
+				pruned_sample = 0
+				pruned_fold = 0
+				pruned_sparse = 0
+				run_global = False
+				global_reason = "none"
 				if block > 0:
+					if int(cfg.map_init.global_opt_interval) <= 1:
+						run_global = True
+						global_reason = "interval"
+					else:
+						if state.map_init.active_count() > 0:
+							last_terms = _map_init_eval_terms_for_state(
+								state,
+								model_xyz=model_xyz,
+								model_valid=model_valid,
+								model_normals=model_normals,
+								cfg=cfg,
+							)
+						run_global, global_reason = _map_init_should_run_global_opt(
+							state,
+							cfg,
+							added=added,
+							pruned_sample=pruned_sample,
+							pruned_fold=pruned_fold,
+							pruned_sparse=pruned_sparse,
+							terms=last_terms,
+						)
+				if run_global:
+					if global_reason in ("rim_prune", "rim_problem"):
+						state.map_init.rim_problem_blocks += 1
 					if (
 						state.map_init.active_quad is not None and state.map_init.uv is not None and
 						state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
@@ -7081,6 +7164,8 @@ def _run_map_init_for_surface(
 						cfg=cfg,
 						steps=block,
 					)
+					state.map_init.global_opt_blocks += 1
+					state.map_init.rim_blocks_since_global_opt = 0
 					if (
 						state.map_init.active_quad is not None and state.map_init.uv is not None and
 						state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
@@ -7104,14 +7189,14 @@ def _run_map_init_for_surface(
 							cfg=cfg,
 						)
 					completed = int(float(last_terms.get("completed", torch.zeros(())).detach().cpu()))
-					pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
+					pruned_sample_after, pruned_fold_after, pruned_sparse_after = _map_init_prune_bad_active_quads(
 						state,
 						model_xyz=model_xyz,
 						model_valid=model_valid,
 						model_normals=model_normals,
 						cfg=cfg,
 					)
-					if pruned_sample > 0 or pruned_fold > 0 or pruned_sparse > 0:
+					if pruned_sample_after > 0 or pruned_fold_after > 0 or pruned_sparse_after > 0:
 						last_terms = _map_init_eval_terms_for_state(
 							state,
 							model_xyz=model_xyz,
@@ -7178,6 +7263,9 @@ def _run_map_init_for_surface(
 							f"repair_block_cap={repair_block_cap_label} "
 							"continue_growth=1"
 						)
+				elif added > 0:
+					state.map_init.rim_only_blocks += 1
+					state.map_init.rim_blocks_since_global_opt += 1
 				if added <= 0 or block <= 0:
 					if int(state.map_init.scale_level) > int(state.map_init.target_scale_level):
 						_debug_write_map_init_scale_objs(
@@ -7317,6 +7405,9 @@ def _run_map_init_for_surface(
 	stats["snaps_map_iters"] = float(state.map_init.total_iters)
 	stats["snaps_map_blocks"] = float(state.map_init.opt_blocks)
 	stats["snaps_map_grow"] = float(state.map_init.grow_steps)
+	stats["snaps_map_global"] = float(state.map_init.global_opt_blocks)
+	stats["snaps_map_rim"] = float(state.map_init.rim_only_blocks)
+	stats["snaps_map_rim_problem"] = float(state.map_init.rim_problem_blocks)
 	stats["snaps_map_add_loss"] = (
 		float(state.map_init.add_sample_loss_sum) / float(max(1.0, state.map_init.add_sample_weight))
 	)
@@ -7350,6 +7441,8 @@ def _run_map_init_for_surface(
 		f"sparse_pruned={stats['snaps_map_sparse']:.0f} "
 		f"iters={stats['snaps_map_iters']:.0f} "
 		f"grow_steps={stats['snaps_map_grow']:.0f} "
+		f"global_blocks={stats['snaps_map_global']:.0f} "
+		f"rim_only_blocks={stats['snaps_map_rim']:.0f} "
 		f"repair_blocks={stats['snaps_map_repair']:.0f} "
 		f"jac_bad={stats['snaps_map_jbad']:.0f} "
 		f"rjac_bad={stats['snaps_map_jinv_bad']:.0f} "
