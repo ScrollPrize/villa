@@ -172,6 +172,76 @@ def _build_copy_args(request, state):
 
 
 
+def _copy_outputs_for_service(outputs):
+    if not isinstance(outputs, dict):
+        return None, None, "Displacement copy returned invalid outputs payload.", {}
+
+    front_path = outputs.get("front")
+    back_path = outputs.get("back")
+    if isinstance(front_path, str) and front_path and isinstance(back_path, str) and back_path:
+        return front_path, back_path, None, {"mode": "single"}
+
+    outputs_by_iteration = outputs.get("outputs_by_iteration")
+    if not isinstance(outputs_by_iteration, dict):
+        return None, None, "Displacement copy output missing 'front'/'back' paths.", {}
+
+    numeric_items = []
+    other_items = []
+    for key, value in outputs_by_iteration.items():
+        try:
+            numeric_items.append((int(key), str(key), value))
+        except (TypeError, ValueError):
+            other_items.append((str(key), value))
+    numeric_items.sort(key=lambda item: item[0], reverse=True)
+
+    iteration_items = [(key, value) for _, key, value in numeric_items]
+    iteration_items.extend(other_items)
+
+    selected = {}
+    selected_iterations = {}
+    for role in ("front", "back"):
+        for iteration_key, iteration_payload in iteration_items:
+            if not isinstance(iteration_payload, dict):
+                continue
+            iteration_outputs = iteration_payload.get("outputs")
+            if not isinstance(iteration_outputs, dict):
+                continue
+            path = iteration_outputs.get(role)
+            if isinstance(path, str) and path:
+                selected[role] = path
+                selected_iterations[role] = iteration_key
+                break
+
+    missing = [role for role in ("front", "back") if role not in selected]
+    if missing:
+        return (
+            None,
+            None,
+            "Displacement copy iterative output missing latest path(s): " + ", ".join(missing),
+            {
+                "mode": "iterative",
+                "iterations_requested": outputs.get("iterations_requested"),
+                "iterations_completed": outputs.get("iterations_completed"),
+                "iter_direction": outputs.get("iter_direction"),
+                "selected_iterations": selected_iterations,
+            },
+        )
+
+    return (
+        selected["front"],
+        selected["back"],
+        None,
+        {
+            "mode": "iterative",
+            "iterations_requested": outputs.get("iterations_requested"),
+            "iterations_completed": outputs.get("iterations_completed"),
+            "iter_direction": outputs.get("iter_direction"),
+            "selected_iterations": selected_iterations,
+        },
+    )
+
+
+
 def _process_copy_request(request, state):
     copy_args, err = _build_copy_args(request, state)
     if err is not None:
@@ -200,14 +270,9 @@ def _process_copy_request(request, state):
     except Exception as exc:
         return {"error": f"Displacement copy failed: {exc}"}
 
-    if not isinstance(outputs, dict):
-        return {"error": "Displacement copy returned invalid outputs payload."}
-    front_path = outputs.get("front")
-    back_path = outputs.get("back")
-    if not isinstance(front_path, str) or not front_path:
-        return {"error": "Displacement copy output missing 'front' path."}
-    if not isinstance(back_path, str) or not back_path:
-        return {"error": "Displacement copy output missing 'back' path."}
+    front_path, back_path, output_err, output_meta = _copy_outputs_for_service(outputs)
+    if output_err is not None:
+        return {"error": output_err, "copy_output": output_meta}
 
     return {
         "ok": True,
@@ -215,6 +280,7 @@ def _process_copy_request(request, state):
             "front": front_path,
             "back": back_path,
         },
+        "copy_output": output_meta,
         "resolved": {
             "volume_path": copy_args.get("volume_path"),
             "volume_scale": int(copy_args.get("volume_scale")),
@@ -224,6 +290,140 @@ def _process_copy_request(request, state):
             "output_prefix": copy_args.get("output_prefix"),
         },
     }
+
+
+def _build_dense_args(request, state):
+    dense_args = {}
+    _merge_dense_args(dense_args, request.get("dense_args"))
+    _merge_dense_args(dense_args, request.get("args"))
+    _merge_dense_args(dense_args, request.get("overrides"))
+    _merge_dense_args(dense_args, request)
+
+    if "iterations" in dense_args and "num_iterations" not in dense_args:
+        dense_args["num_iterations"] = dense_args.get("iterations")
+    if "volume_zarr" in dense_args and "volume_path" not in dense_args:
+        dense_args["volume_path"] = dense_args.get("volume_zarr")
+    if "dense_checkpoint_path" in dense_args and "checkpoint_path" not in dense_args:
+        dense_args["checkpoint_path"] = dense_args.get("dense_checkpoint_path")
+
+    dense_args.setdefault("volume_path", state.get("volume_zarr"))
+    dense_args.setdefault("volume_scale", state.get("volume_scale"))
+    dense_args.setdefault("checkpoint_path", state.get("checkpoint_path"))
+
+    tifxyz_path = dense_args.get("tifxyz_path")
+    if tifxyz_path is not None and dense_args.get("output_dir") is None:
+        input_path = Path(str(tifxyz_path)).resolve()
+        direction = str(dense_args.get("grow_direction", "grow"))
+        suffix = f"dense_{direction}_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1000000:06d}"
+        dense_args["output_dir"] = str(input_path.parent / f"{input_path.name}_{suffix}")
+
+    if dense_args.get("tifxyz_path") is None:
+        return None, "Missing required field for dense displacement: tifxyz_path"
+    if dense_args.get("volume_path") is None:
+        return None, "Missing required field for dense displacement: volume_path"
+    if dense_args.get("checkpoint_path") is None:
+        return None, "Missing required field for dense displacement: checkpoint_path"
+    if dense_args.get("output_dir") is None:
+        return None, "Missing required field for dense displacement: output_dir"
+    return dense_args, None
+
+
+def _append_dense_cli_arg(argv, flag, value):
+    if value is None:
+        return
+    if isinstance(value, (list, tuple)):
+        argv.append(flag)
+        argv.extend(str(v) for v in value)
+        return
+    argv.extend([flag, str(value)])
+
+
+def _dense_args_to_argv(dense_args):
+    arg_to_cli = {
+        "tifxyz_path": "--tifxyz-path",
+        "checkpoint_path": "--checkpoint-path",
+        "volume_path": "--volume-path",
+        "volume_scale": "--volume-scale",
+        "volume_cache_dir": "--volume-cache-dir",
+        "volume_cache_retry_seconds": "--volume-cache-retry-seconds",
+        "output_dir": "--output-dir",
+        "grow_direction": "--grow-direction",
+        "num_iterations": "--num-iterations",
+        "tifxyz_steps": "--tifxyz-steps",
+        "tifxyz_voxel_step": "--tifxyz-voxel-step",
+        "tifxyz_voxel_size_um": "--tifxyz-voxel-size-um",
+        "batch_size": "--batch-size",
+        "bbox_overlap": "--bbox-overlap",
+        "device": "--device",
+        "distributed_backend": "--distributed-backend",
+    }
+    argv = []
+    for key, flag in arg_to_cli.items():
+        if key in dense_args:
+            _append_dense_cli_arg(argv, flag, dense_args.get(key))
+    if "tta" in dense_args and bool(dense_args.get("tta")) is False:
+        argv.append("--no-tta")
+    if "compile_model" in dense_args and bool(dense_args.get("compile_model")) is False:
+        argv.append("--no-compile")
+    if "save_each_iteration" in dense_args and bool(dense_args.get("save_each_iteration")) is False:
+        argv.append("--final-only")
+    if "show_napari" in dense_args and bool(dense_args.get("show_napari")):
+        argv.append("--show-napari")
+    return argv
+
+
+def _process_dense_request(request, state):
+    dense_args, err = _build_dense_args(request, state)
+    if err is not None:
+        _print_json_log(
+            "dense request rejected",
+            {
+                "request_type": DENSE_REQUEST_TYPE,
+                "error": err,
+                "request_keys": sorted(str(k) for k in request.keys())
+                if isinstance(request, dict)
+                else [],
+            },
+        )
+        return {"error": err}
+
+    _print_json_log(
+        "dense request args",
+        {"request_type": DENSE_REQUEST_TYPE, "run_args": dense_args},
+    )
+
+    from vesuvius.neural_tracing.inference.infer_streamline import _parse_args, run_from_args
+
+    try:
+        args = _parse_args(_dense_args_to_argv(dense_args))
+        with state["dense_lock"]:
+            summary = run_from_args(args)
+    except SystemExit as exc:
+        return {"error": f"Invalid dense displacement args: {exc}"}
+    except Exception as exc:
+        return {"error": f"Dense displacement failed: {exc}"}
+
+    if not isinstance(summary, dict):
+        return {"error": "Dense displacement returned invalid summary payload."}
+    output_path = summary.get("final_output_tifxyz_path")
+    if not isinstance(output_path, str) or not output_path:
+        return {"error": "Dense displacement output missing final_output_tifxyz_path."}
+
+    return {
+        "ok": True,
+        "output_tifxyz_path": output_path,
+        "resolved": {
+            "volume_path": dense_args.get("volume_path"),
+            "volume_scale": int(dense_args.get("volume_scale")),
+            "checkpoint_path": dense_args.get("checkpoint_path"),
+            "tifxyz_path": dense_args.get("tifxyz_path"),
+            "output_dir": dense_args.get("output_dir"),
+            "grow_direction": dense_args.get("grow_direction"),
+            "num_iterations": dense_args.get("num_iterations"),
+            "bbox_overlap": dense_args.get("bbox_overlap"),
+        },
+    }
+
 
 
 def _process_heatmap_request(request, state):
@@ -312,6 +512,8 @@ def process_request(request, state):
     request_type = request.get("request_type", HEATMAP_REQUEST_TYPE)
     if request_type == COPY_REQUEST_TYPE:
         return _process_copy_request(request, state)
+    if request_type == DENSE_REQUEST_TYPE:
+        return _process_dense_request(request, state)
     if request_type == HEATMAP_REQUEST_TYPE:
         return _process_heatmap_request(request, state)
     return {

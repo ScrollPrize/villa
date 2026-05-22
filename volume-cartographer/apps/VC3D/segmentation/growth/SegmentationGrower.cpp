@@ -679,6 +679,7 @@ struct DenseDisplacementJob
     DenseTtaMode ttaMode{DenseTtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
+    double bboxOverlap{0.0};
     utils::Json customParams;
     std::vector<SegmentationGrowthDirection> directions;
 };
@@ -693,6 +694,7 @@ struct CopyDisplacementJob
     DenseTtaMode ttaMode{DenseTtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
+    double bboxOverlap{0.0};
     utils::Json customParams;
 };
 
@@ -1035,6 +1037,9 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     request["checkpoint_path"] = job.checkpointPath.toStdString();
     request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
     request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
+    if (job.bboxOverlap > 0.0) {
+        request["bbox_overlap"] = std::clamp(job.bboxOverlap, 0.0, 0.95);
+    }
 
     switch (job.ttaMode) {
     case DenseTtaMode::Rotate3:
@@ -1146,6 +1151,9 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
         request["checkpoint_path"] = job.checkpointPath.toStdString();
         request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
         request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
+        if (job.bboxOverlap > 0.0) {
+            request["bbox_overlap"] = std::clamp(job.bboxOverlap, 0.0, 0.95);
+        }
         switch (job.ttaMode) {
         case DenseTtaMode::Rotate3:
             request["tta"] = true;
@@ -1560,6 +1568,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         const DenseTtaMode denseTtaMode = _context.widget->denseTtaMode();
         const QString denseTtaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
         const double denseTtaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
+        const double denseBboxOverlap = _context.widget->denseBboxOverlap();
         const auto outputMode = _context.widget->neuralOutputMode();
 
         if (denseCheckpointPath.isEmpty()) {
@@ -1641,6 +1650,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             ? QStringLiteral("vector_geomedian")
             : denseTtaMergeMethod;
         denseJob.ttaOutlierDropThresh = std::max(0.01, denseTtaOutlierDropThresh);
+        denseJob.bboxOverlap = std::clamp(denseBboxOverlap, 0.0, 0.95);
         if (!request.customParams.is_null())
             denseJob.customParams = request.customParams;
         denseJob.directions = denseDirections;
@@ -1949,6 +1959,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     const DenseTtaMode ttaMode = _context.widget->denseTtaMode();
     const QString ttaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
     const double ttaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
+    const double bboxOverlap = _context.widget->denseBboxOverlap();
     const bool usingCopyLatestPreset = copyCheckpointPath == kCopyLatestSentinel;
 
     if (copyCheckpointPath.isEmpty()) {
@@ -2023,6 +2034,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         ? QStringLiteral("vector_geomedian")
         : ttaMergeMethod;
     copyJob.ttaOutlierDropThresh = std::max(0.01, ttaOutlierDropThresh);
+    copyJob.bboxOverlap = std::clamp(bboxOverlap, 0.0, 0.95);
     copyJob.customParams = customParams;
 
     _running = true;

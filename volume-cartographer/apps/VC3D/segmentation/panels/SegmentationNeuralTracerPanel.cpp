@@ -35,8 +35,10 @@ const QString kCopyPresetCustom = QStringLiteral("custom");
 const QString kDenseTtaModeSettingKey = QStringLiteral("neural_dense_tta_mode");
 const QString kDenseTtaMergeMethodSettingKey = QStringLiteral("neural_dense_tta_merge_method");
 const QString kDenseTtaOutlierDropThreshSettingKey = QStringLiteral("neural_dense_tta_outlier_drop_thresh");
+const QString kDenseBboxOverlapSettingKey = QStringLiteral("neural_dense_bbox_overlap");
 const QString kDenseTtaMergeMethodDefault = QStringLiteral("vector_geomedian");
 constexpr double kDenseTtaOutlierDropThreshDefault = 1.25;
+constexpr double kDenseBboxOverlapDefault = 0.0;
 
 QString normalizeDenseTtaMergeMethod(const QString& method)
 {
@@ -131,6 +133,17 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         row->addSpacing(12);
         row->addWidget(threshLabel);
         row->addWidget(_spinDenseTtaOutlierDropThresh);
+        row->addStretch(1);
+    });
+
+    _groupNeuralTracer->addRow(tr("BBox overlap:"), [&](QHBoxLayout* row) {
+        _spinDenseBboxOverlap = new QDoubleSpinBox(neuralParent);
+        _spinDenseBboxOverlap->setDecimals(2);
+        _spinDenseBboxOverlap->setRange(0.0, 0.95);
+        _spinDenseBboxOverlap->setSingleStep(0.05);
+        _spinDenseBboxOverlap->setToolTip(
+            tr("Fractional overlap between generated inference bounding boxes. 0 uses non-overlapping boxes."));
+        row->addWidget(_spinDenseBboxOverlap);
         row->addStretch(1);
     });
 
@@ -237,6 +250,10 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
 
     connect(_spinDenseTtaOutlierDropThresh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setDenseTtaOutlierDropThresh(value);
+    });
+
+    connect(_spinDenseBboxOverlap, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setDenseBboxOverlap(value);
     });
 
     connect(_comboDenseCheckpointPreset, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -529,6 +546,21 @@ void SegmentationNeuralTracerPanel::setDenseTtaOutlierDropThresh(double threshol
     }
 }
 
+void SegmentationNeuralTracerPanel::setDenseBboxOverlap(double overlap)
+{
+    const double sanitized = std::clamp(overlap, 0.0, 0.95);
+    if (qFuzzyCompare(_denseBboxOverlap + 1.0, sanitized + 1.0)) {
+        return;
+    }
+    _denseBboxOverlap = sanitized;
+    writeSetting(kDenseBboxOverlapSettingKey, _denseBboxOverlap);
+
+    if (_spinDenseBboxOverlap) {
+        const QSignalBlocker blocker(_spinDenseBboxOverlap);
+        _spinDenseBboxOverlap->setValue(_denseBboxOverlap);
+    }
+}
+
 void SegmentationNeuralTracerPanel::setDenseCheckpointPath(const QString& path)
 {
     const QString trimmed = path.trimmed();
@@ -628,6 +660,10 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
     if (_denseTtaOutlierDropThresh <= 0.0) {
         _denseTtaOutlierDropThresh = kDenseTtaOutlierDropThreshDefault;
     }
+    _denseBboxOverlap = std::clamp(
+        settings.value(kDenseBboxOverlapSettingKey, kDenseBboxOverlapDefault).toDouble(),
+        0.0,
+        0.95);
     const QString presetValue = settings.value(kDensePresetSettingKey, kDensePresetLatest).toString();
     if (presetValue == kDensePresetCustom) {
         _denseCheckpointPreset = DenseCheckpointPreset::CustomPath;
@@ -708,6 +744,10 @@ void SegmentationNeuralTracerPanel::syncUiState()
         const QSignalBlocker blocker(_spinDenseTtaOutlierDropThresh);
         _spinDenseTtaOutlierDropThresh->setValue(_denseTtaOutlierDropThresh);
     }
+    if (_spinDenseBboxOverlap) {
+        const QSignalBlocker blocker(_spinDenseBboxOverlap);
+        _spinDenseBboxOverlap->setValue(_denseBboxOverlap);
+    }
     if (_comboDenseCheckpointPreset) {
         const QSignalBlocker blocker(_comboDenseCheckpointPreset);
         int idx = _comboDenseCheckpointPreset->findData(static_cast<int>(_denseCheckpointPreset));
@@ -758,6 +798,10 @@ void SegmentationNeuralTracerPanel::updateDenseUiState()
     if (_spinDenseTtaOutlierDropThresh) {
         _spinDenseTtaOutlierDropThresh->setEnabled(displacementMode);
         _spinDenseTtaOutlierDropThresh->setVisible(displacementMode);
+    }
+    if (_spinDenseBboxOverlap) {
+        _spinDenseBboxOverlap->setEnabled(displacementMode);
+        _spinDenseBboxOverlap->setVisible(displacementMode);
     }
     if (_comboNeuralOutputMode) {
         _comboNeuralOutputMode->setEnabled(denseMode);

@@ -58,7 +58,7 @@ QString normalizeExistingPath(const QString& path)
 QString normalizeCheckpointValue(const QString& checkpointPath)
 {
     if (isCheckpointSentinel(checkpointPath)) {
-        return kDenseLatestSentinel;
+        return checkpointPath.trimmed();
     }
     return normalizeExistingPath(checkpointPath);
 }
@@ -248,6 +248,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
         // Development paths
         QDir(appDir).filePath("../../vesuvius/src/vesuvius/neural_tracing/trace_service.py"),
         QDir(appDir).filePath("../../../vesuvius/src/vesuvius/neural_tracing/trace_service.py"),
+        QDir(appDir).filePath("../../../../vesuvius/src/vesuvius/neural_tracing/trace_service.py"),
         // Installed paths
         QDir(appDir).filePath("../share/vesuvius/neural_tracing/trace_service.py"),
         // Environment variable

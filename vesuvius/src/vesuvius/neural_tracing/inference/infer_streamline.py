@@ -2792,6 +2792,7 @@ def _parse_args(argv=None):
         help="Physical voxel size written to output tifxyz metadata. Defaults to first '<N>um' in volume path.",
     )
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--bbox-overlap", type=float, default=OVERLAP_FRAC)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--distributed-backend",
@@ -2813,7 +2814,7 @@ def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tif
     global TIFXYZ_PATH, VOLUME_PATH, VOLUME_SCALE, VOLUME_CACHE_DIR, VOLUME_CACHE_RETRY_SECONDS
     global CHECKPOINT_PATH, BATCH_SIZE, DEVICE, COMPILE_MODEL, OUTPUT_TIFXYZ_DIR
     global OUTPUT_TIFXYZ_VOXEL_SIZE_UM, RUN_OUTPUT_DIR, RUN_TIMESTAMP, USE_TTA
-    global GROW_DIRECTION, TIFXYZ_VOXEL_STEP, TIFXYZ_STEPS, NUM_ITERATIONS
+    global GROW_DIRECTION, TIFXYZ_VOXEL_STEP, TIFXYZ_STEPS, NUM_ITERATIONS, OVERLAP_FRAC
     global SAVE_EACH_ITERATION_TIFXYZ, SHOW_NAPARI
 
     TIFXYZ_PATH = str(Path(args.tifxyz_path).resolve())
@@ -2834,6 +2835,7 @@ def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tif
     TIFXYZ_VOXEL_STEP = float(tifxyz_voxel_step)
     TIFXYZ_STEPS = int(args.tifxyz_steps)
     NUM_ITERATIONS = int(args.num_iterations)
+    OVERLAP_FRAC = float(args.bbox_overlap)
     SAVE_EACH_ITERATION_TIFXYZ = bool(args.save_each_iteration)
     SHOW_NAPARI = bool(args.show_napari)
 
@@ -2851,6 +2853,8 @@ def run_from_args(args):
             raise ValueError("--num-iterations must be >= 1.")
         if int(args.batch_size) <= 0:
             raise ValueError("--batch-size must be >= 1.")
+        if float(args.bbox_overlap) < 0.0 or float(args.bbox_overlap) >= 1.0:
+            raise ValueError("--bbox-overlap must satisfy 0.0 <= overlap < 1.0")
 
         model, model_config = load_checkpoint(args.checkpoint_path)
         resolved_volume_path, resolved_volume_scale, matched_dataset = resolve_volume_path_from_config(
@@ -2894,6 +2898,7 @@ def run_from_args(args):
                 "args": vars(args),
                 "crop_size": list(crop_size),
                 "batch_size": BATCH_SIZE,
+                "bbox_overlap": float(OVERLAP_FRAC),
                 "device": DEVICE,
                 "compile_model": COMPILE_MODEL,
                 "use_tta": USE_TTA,

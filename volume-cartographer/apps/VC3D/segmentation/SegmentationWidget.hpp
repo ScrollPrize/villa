@@ -74,6 +74,7 @@ public:
     [[nodiscard]] DenseTtaMode denseTtaMode() const;
     [[nodiscard]] QString denseTtaMergeMethod() const;
     [[nodiscard]] double denseTtaOutlierDropThresh() const;
+    [[nodiscard]] double denseBboxOverlap() const;
     [[nodiscard]] QString denseCheckpointPath() const;
     [[nodiscard]] QString copyCheckpointPath() const;
 

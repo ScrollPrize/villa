@@ -449,6 +449,7 @@ NeuralTracerOutputMode SegmentationWidget::neuralOutputMode() const { return _ne
 DenseTtaMode SegmentationWidget::denseTtaMode() const { return _neuralTracerPanel->denseTtaMode(); }
 QString SegmentationWidget::denseTtaMergeMethod() const { return _neuralTracerPanel->denseTtaMergeMethod(); }
 double SegmentationWidget::denseTtaOutlierDropThresh() const { return _neuralTracerPanel->denseTtaOutlierDropThresh(); }
+double SegmentationWidget::denseBboxOverlap() const { return _neuralTracerPanel->denseBboxOverlap(); }
 QString SegmentationWidget::denseCheckpointPath() const { return _neuralTracerPanel->denseCheckpointPath(); }
 QString SegmentationWidget::copyCheckpointPath() const { return _neuralTracerPanel->copyCheckpointPath(); }
 

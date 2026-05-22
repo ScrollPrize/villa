@@ -36,6 +36,7 @@ public:
     [[nodiscard]] DenseTtaMode denseTtaMode() const { return _denseTtaMode; }
     [[nodiscard]] QString denseTtaMergeMethod() const { return _denseTtaMergeMethod; }
     [[nodiscard]] double denseTtaOutlierDropThresh() const { return _denseTtaOutlierDropThresh; }
+    [[nodiscard]] double denseBboxOverlap() const { return _denseBboxOverlap; }
     [[nodiscard]] QString denseCheckpointPath() const;
     [[nodiscard]] QString copyCheckpointPath() const;
 
@@ -51,6 +52,7 @@ public:
     void setDenseTtaMode(DenseTtaMode mode);
     void setDenseTtaMergeMethod(const QString& method);
     void setDenseTtaOutlierDropThresh(double threshold);
+    void setDenseBboxOverlap(double overlap);
     void setDenseCheckpointPath(const QString& path);
     void setCopyCheckpointPath(const QString& path);
 
@@ -97,6 +99,7 @@ private:
     QComboBox* _comboNeuralVolumeScale{nullptr};
     QSpinBox* _spinNeuralBatchSize{nullptr};
     QDoubleSpinBox* _spinDenseTtaOutlierDropThresh{nullptr};
+    QDoubleSpinBox* _spinDenseBboxOverlap{nullptr};
     QLabel* _lblNeuralTracerStatus{nullptr};
 
     bool _neuralTracerEnabled{false};
@@ -110,6 +113,7 @@ private:
     DenseTtaMode _denseTtaMode{DenseTtaMode::Mirror};
     QString _denseTtaMergeMethod{QStringLiteral("vector_geomedian")};
     double _denseTtaOutlierDropThresh{1.25};
+    double _denseBboxOverlap{0.0};
     DenseCheckpointPreset _denseCheckpointPreset{DenseCheckpointPreset::DenseLatest};
     CopyCheckpointPreset _copyCheckpointPreset{CopyCheckpointPreset::CopyLatest};
 
