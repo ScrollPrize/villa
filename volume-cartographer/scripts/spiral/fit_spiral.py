@@ -2811,7 +2811,7 @@ def main():
     else:
         scroll_zarr_array = None
 
-    patches = load_patches(patches_path, segment_id_filter=lambda s: 'monster' not in s)
+    patches = load_patches(patches_path)
 
     cross_patch_point_collections = {}
     unattached_point_collections = {}
