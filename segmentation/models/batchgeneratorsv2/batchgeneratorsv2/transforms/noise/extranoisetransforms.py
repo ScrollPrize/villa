@@ -1,3 +1,4 @@
+from numbers import Integral, Real
 from typing import Union, Tuple, List, Callable
 import numpy as np
 import torch
@@ -178,24 +179,89 @@ class RicianNoiseTransform(BasicTransform):
         return regr_target  # Don't apply noise to regression targets
 
 
-def _sample_int(value: Union[int, Tuple[int, int], List[int]]) -> int:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, (tuple, list)) and len(value) == 2:
+def _is_int(value) -> bool:
+    return isinstance(value, Integral) and not isinstance(value, bool)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool)
+
+
+def _validate_probability(value: float, name: str) -> None:
+    if not _is_number(value) or not (0 <= float(value) <= 1):
+        raise ValueError(f"{name} must be a number in [0, 1], got {value!r}")
+
+
+def _validate_random_scalar_range(value: RandomScalar, name: str) -> None:
+    if callable(value):
+        return
+    if _is_number(value):
+        _validate_probability(float(value), name)
+        return
+    if isinstance(value, (tuple, list)) and len(value) == 2 and all(_is_number(v) for v in value):
+        lo, hi = float(value[0]), float(value[1])
+        if not (0 <= lo <= hi <= 1):
+            raise ValueError(f"{name} range must satisfy 0 <= min <= max <= 1, got {value!r}")
+        return
+    raise ValueError(f"{name} must be a number, inclusive range, or callable, got {value!r}")
+
+
+def _validate_num_prev_slices(value: Union[int, Tuple[int, int], List[int]]) -> None:
+    if _is_int(value):
+        if int(value) < 1:
+            raise ValueError(f"num_prev_slices must be >= 1, got {value!r}")
+        return
+    if isinstance(value, (tuple, list)) and len(value) == 2 and all(_is_int(v) for v in value):
         lo, hi = int(value[0]), int(value[1])
+        if not (1 <= lo <= hi):
+            raise ValueError(f"num_prev_slices range must satisfy 1 <= min <= max, got {value!r}")
+        return
+    raise ValueError(f"num_prev_slices must be an int or inclusive int range, got {value!r}")
+
+
+def _validate_shift_ranges(shift) -> None:
+    if _is_int(shift):
+        return
+    if not isinstance(shift, (tuple, list)):
+        raise ValueError(f"shift must be an int, tuple, or list, got {type(shift)}")
+    for entry in shift:
+        if _is_int(entry):
+            continue
+        if isinstance(entry, (tuple, list)) and len(entry) == 2 and all(_is_int(v) for v in entry):
+            lo, hi = int(entry[0]), int(entry[1])
+            if lo > hi:
+                raise ValueError(f"shift ranges must satisfy min <= max, got {entry!r}")
+            continue
+        raise ValueError(f"shift entries must be ints or inclusive int ranges, got {entry!r}")
+
+
+def _validate_smear_axis(smear_axis: int) -> None:
+    if not _is_int(smear_axis):
+        raise ValueError(f"smear_axis must be a positive integer, got {smear_axis!r}")
+    if int(smear_axis) < 1:
+        raise ValueError(f"smear_axis must be >= 1, got {smear_axis!r}")
+
+
+def _sample_int(value: Union[int, Tuple[int, int], List[int]]) -> int:
+    if _is_int(value):
+        return int(value)
+    if isinstance(value, (tuple, list)) and len(value) == 2 and all(_is_int(v) for v in value):
+        lo, hi = int(value[0]), int(value[1])
+        if lo > hi:
+            raise ValueError(f"Expected inclusive int range with min <= max, got {value!r}")
         if lo == hi:
             return lo
         return int(torch.randint(lo, hi + 1, (1,)).item())
-    raise RuntimeError(f"Expected int or inclusive int range, got {value!r}")
+    raise ValueError(f"Expected int or inclusive int range, got {value!r}")
 
 
 def _sample_shift(shift, num_plane_dims: int) -> Tuple[int, ...]:
-    if isinstance(shift, int):
-        return (shift,) * num_plane_dims
+    if _is_int(shift):
+        return (int(shift),) * num_plane_dims
     if not isinstance(shift, (tuple, list)):
-        raise RuntimeError(f"Expected int, tuple, or list for shift, got {type(shift)}")
+        raise ValueError(f"Expected int, tuple, or list for shift, got {type(shift)}")
     if len(shift) != num_plane_dims:
-        raise RuntimeError(f"Expected {num_plane_dims} shift entries, got {len(shift)}")
+        raise ValueError(f"Expected {num_plane_dims} shift entries, got {len(shift)}")
     return tuple(_sample_int(s) for s in shift)
 
 
@@ -216,6 +282,8 @@ class DecohesionTransform(ImageOnlyTransform):
             shift:
                 Int shift applied to every in-slice dimension, a tuple of constant
                 shifts, or a tuple of inclusive integer ranges sampled per call.
+                For 2D (C, H, W) images, use an int shift because there is only one
+                non-smear plane dimension.
             alpha:
                 Blending factor for the aggregated shifted slices (0 = no influence, 1 = full replacement).
             num_prev_slices:
@@ -228,10 +296,15 @@ class DecohesionTransform(ImageOnlyTransform):
                 Probability of applying the transform to each channel.
         """
         super().__init__()
+        _validate_shift_ranges(shift)
+        _validate_random_scalar_range(alpha, "alpha")
+        _validate_num_prev_slices(num_prev_slices)
+        _validate_smear_axis(smear_axis)
+        _validate_probability(p_per_channel, "p_per_channel")
         self.shift = shift
         self.alpha = alpha
         self.num_prev_slices = num_prev_slices
-        self.smear_axis = smear_axis
+        self.smear_axis = int(smear_axis)
         self.p_per_channel = p_per_channel
 
     def get_parameters(self, **data_dict) -> dict:
@@ -241,10 +314,13 @@ class DecohesionTransform(ImageOnlyTransform):
         if not (0 <= local_smear_axis < num_spatial_dims):
             raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {tuple(img.shape)}")
         num_plane_dims = num_spatial_dims - 1
+        alpha = float(sample_scalar(self.alpha, image=img))
+        _validate_probability(alpha, "alpha")
+        num_prev_slices = _sample_int(self.num_prev_slices)
         return {
             "apply_to_channel": torch.rand(img.shape[0], device=img.device) < self.p_per_channel,
-            "alpha": float(sample_scalar(self.alpha, image=img)),
-            "num_prev_slices": _sample_int(self.num_prev_slices),
+            "alpha": alpha,
+            "num_prev_slices": num_prev_slices,
             "shift": _sample_shift(self.shift, num_plane_dims),
             "local_smear_axis": local_smear_axis,
         }
