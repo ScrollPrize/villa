@@ -565,6 +565,13 @@ def optimize(
 			status_fn=status_fn,
 		)
 
+	def _compact_snap_global_map_stats(stats: dict[str, float]) -> dict[str, float]:
+		return {
+			k: float(stats[k])
+			for k in ("snaps_map_loss", "snaps_map_dist", "snaps_map_vec", "snaps_map_norm")
+			if k in stats
+		}
+
 	def _snap_global_map_loss(*, res) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
@@ -2873,7 +2880,7 @@ def optimize(
 					stage_args=stage_args,
 					persistent_optimizer=True,
 				)
-				term_vals0.update(map_initial_stats)
+				term_vals0.update(_compact_snap_global_map_stats(map_initial_stats))
 			_t_prune = _stage_start(f"{label}.initial_eval.cylinder_prune")
 			if _prune_cylinder_candidates_after_initial_eval():
 				all_params, param_groups = _make_param_groups()
@@ -3023,7 +3030,7 @@ def optimize(
 					persistent_optimizer=True,
 				)
 				opt_loss_snap_surf.update_last_stats(map_stats)
-				term_vals.update(map_stats)
+				term_vals.update(_compact_snap_global_map_stats(map_stats))
 			if _flow_timing is not None:
 				_timing_cuda_sync()
 				_flow_timing.add("opt_step", time.perf_counter() - _t_opt)
