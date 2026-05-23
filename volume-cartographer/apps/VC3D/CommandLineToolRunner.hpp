@@ -37,6 +37,7 @@ public:
         AlphaCompRefine,
         NeighborCopy,
         MergeTifxyz,
+        MergePatch,
         CustomCommand
     };
 
@@ -89,6 +90,23 @@ public:
                         int ransacSeed,
                         int anchorCap,
                         int stripCols);
+    // vc_merge_patch: two tifxyz dirs; the binary auto-detects parent vs
+    // child by valid-cell count unless explicitRoles is set, in which case
+    // we pass --parent / --child explicitly. The parent tifxyz is
+    // overwritten in place (the binary snapshots the pre-patch state to
+    // <volpkg>/backups/<parent_name>/{0..7}/ first).
+    void setMergePatchParams(const QString& parentPath,
+                             const QString& childPath,
+                             bool explicitRoles,
+                             int borderCells,
+                             int blendCells,
+                             int idwK,
+                             int ransacIters,
+                             double ransacMinThresh,
+                             double ransacMaxThresh,
+                             double ransacMadK,
+                             int ransacSeed,
+                             int anchorCap);
     bool execute(Tool tool);
     void cancel();
     bool isRunning() const;
@@ -195,4 +213,18 @@ private:
     int     _mergeRansacSeed{0};
     int     _mergeAnchorCap{0};
     int     _mergeStripCols{0};
+
+    // vc_merge_patch parameters
+    QString _patchParentPath;
+    QString _patchChildPath;
+    bool    _patchExplicitRoles{false};
+    int     _patchBorderCells{16};
+    int     _patchBlendCells{6};
+    int     _patchIdwK{4};
+    int     _patchRansacIters{3000};
+    double  _patchRansacMinThresh{5.0};
+    double  _patchRansacMaxThresh{10.0};
+    double  _patchRansacMadK{3.0};
+    int     _patchRansacSeed{0};
+    int     _patchAnchorCap{0};
 };

@@ -479,6 +479,10 @@ CWindow::CWindow(size_t cacheSizeGB) :
             this, [this]() {
                 _segmentationCommandHandler->onMergeTifxyz(QStringList{});
             });
+    connect(_menuController.get(), &MenuActionController::mergePatchFromMenuRequested,
+            this, [this]() {
+                _segmentationCommandHandler->onMergePatch(QStringList{});
+            });
 
     if (isDarkMode()) {
         applyDarkPalette();
@@ -1530,6 +1534,10 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::mergeTifxyzRequested,
             this, [this](const QStringList& segmentIds) {
                 _segmentationCommandHandler->onMergeTifxyz(segmentIds);
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::mergePatchRequested,
+            this, [this](const QStringList& segmentIds) {
+                _segmentationCommandHandler->onMergePatch(segmentIds);
             });
     // Note: the Actions -> Merge tifxyz... menu wiring lives in the
     // constructor after _menuController is initialized -- _menuController

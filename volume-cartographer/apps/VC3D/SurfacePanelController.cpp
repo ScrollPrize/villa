@@ -835,6 +835,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
             emit mergeTifxyzRequested(selectedSegmentIds);
         });
     }
+    // Patch tifxyz is exactly-2-input; gate to exactly 2 selected segments
+    // so the dialog opens with both pickers pre-filled and the user can
+    // dial in border / blend without picking inputs.
+    if (selectedSegmentIds.size() == 2) {
+        QAction* patchAction = contextMenu.addAction(tr("Patch tifxyz..."));
+        connect(patchAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
+            emit mergePatchRequested(selectedSegmentIds);
+        });
+    }
 
     QAction* addIgnoreLabelAction = contextMenu.addAction(tr("Add ignore label"));
     connect(addIgnoreLabelAction, &QAction::triggered, this, [this]() {

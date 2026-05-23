@@ -302,6 +302,116 @@ private:
     static int    s_ompThreads;
 };
 
+class QComboBox;
+class QSpinBox;
+class QLineEdit;
+class QLabel;
+class QCheckBox;
+class VolumePkg;
+
+// MergePatchDialog
+//
+// Two-input cousin of MergeTifxyzDialog: picks a parent + child tifxyz from
+// the volpkg, exposes vc_merge_patch's tunables (border-cells, blend-cells,
+// idw-k, RANSAC set, anchor-cap, OMP threads), and surfaces the role
+// auto-detect / explicit-override the binary supports. The parent dir is
+// overwritten in place by the binary; the dialog shows a banner up front so
+// the user knows. Recovery is via the rotating backup ring
+// (<volpkg>/backups/<parent_name>/{0..7}/) that the binary populates via
+// QuadSurface::saveOverwrite.
+class MergePatchDialog : public QDialog {
+    Q_OBJECT
+public:
+    MergePatchDialog(QWidget* parent,
+                     const QStringList& seedSegmentIds,
+                     const QStringList& availableSegments,
+                     std::shared_ptr<VolumePkg> volpkg,
+                     const QString& volpkgDir,
+                     const QString& pathsDir);
+
+    // Resolved paths (filesystem-ready). parentPath() is the dir that will
+    // be overwritten; childPath() is the dir whose data gets patched in.
+    QString parentPath() const;
+    QString childPath() const;
+    // Roles set explicitly by the user (via the Swap button or a manual
+    // override) instead of auto-detected. Drives whether the runner passes
+    // --parent/--child or positional args.
+    bool    explicitRoles() const;
+
+    int     borderCells() const;
+    int     blendCells() const;
+    int     idwK() const;
+    int     ransacIters() const;
+    double  ransacMinThresh() const;
+    double  ransacMaxThresh() const;
+    double  ransacMadK() const;
+    int     ransacSeed() const;
+    int     anchorCap() const;
+    int     ompThreads() const; // -1 if unset
+
+protected:
+    void accept() override;
+
+private:
+    void recomputeRoleHint();
+    void refreshOverwriteBanner();
+    void applyCodeDefaults();
+    void applySessionDefaults();
+    void updateSessionFromUI();
+
+    // Cheap valid-cell count for an already-loaded surface, via
+    // QuadSurface::countValidPoints (an in-memory scan, no I/O). Returns
+    // -1 if the surface isn't loaded in the volpkg cache.
+    int validCellCountFor(const QString& segId) const;
+
+    QStringList _availableSegments;
+    std::shared_ptr<VolumePkg> _volpkg;
+    QString _volpkgDir;
+    QString _pathsDir;
+
+    QComboBox* cmbA_{nullptr};
+    QComboBox* cmbB_{nullptr};
+    QPushButton* btnSwap_{nullptr};
+    QLabel* lblRoleHint_{nullptr};
+    QLabel* lblBanner_{nullptr};
+
+    QSpinBox* spBorderCells_{nullptr};
+    QSpinBox* spBlendCells_{nullptr};
+    QSpinBox* spIdwK_{nullptr};
+
+    QSpinBox* spIters_{nullptr};
+    QDoubleSpinBox* spMin_{nullptr};
+    QDoubleSpinBox* spMax_{nullptr};
+    QDoubleSpinBox* spMadK_{nullptr};
+    QSpinBox* spSeed_{nullptr};
+    QSpinBox* spAnchorCap_{nullptr};
+    QLineEdit* edtThreads_{nullptr};
+
+    // Resolved on accept().
+    QString _parentPath;
+    QString _childPath;
+    bool    _explicitRoles{false};
+
+    // Auto-detect bookkeeping: true means combo A is the parent. The Swap
+    // button toggles this AND sets _userSwapped so accept() emits explicit
+    // --parent/--child instead of trusting the binary's auto-detect.
+    bool _aIsParent{true};
+    bool _userSwapped{false};
+
+    // Session defaults (in-memory only; persist across one VC3D run).
+    static bool   ms_haveSession;
+    static int    ms_borderCells;
+    static int    ms_blendCells;
+    static int    ms_idwK;
+    static int    ms_iters;
+    static double ms_min;
+    static double ms_max;
+    static double ms_madK;
+    static int    ms_seed;
+    static int    ms_anchorCap;
+    static int    ms_ompThreads;
+};
+
 class AlphaCompRefineDialog : public QDialog {
     Q_OBJECT
 public:

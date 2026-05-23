@@ -2902,6 +2902,110 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
 }
 
+void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("Open a volpkg first."));
+        return;
+    }
+    if (!_cmdRunner) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("Command runner is not initialized."));
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("A command-line tool is already running."));
+        return;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("No active segmentation directory; pick one "
+                                "before running patch."));
+        return;
+    }
+    const QString pathsDir  = QString::fromStdString(resolvedSeg.string());
+    const QString volpkgDir = QString::fromStdString(
+        resolvedSeg.parent_path().string());
+
+    QStringList availableSegments;
+    {
+        const auto ids = vpkg->segmentationIDs();
+        availableSegments.reserve(static_cast<int>(ids.size()));
+        for (const auto& s : ids) availableSegments << QString::fromStdString(s);
+    }
+    if (availableSegments.size() < 2) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("This volpkg has fewer than 2 segments; "
+                                "patch needs a parent + child."));
+        return;
+    }
+
+    MergePatchDialog dlg(_parentWidget, segmentIds, availableSegments,
+                         vpkg, volpkgDir, pathsDir);
+    if (dlg.exec() != QDialog::Accepted) {
+        emit statusMessage(tr("Patch cancelled"), 3000);
+        return;
+    }
+
+    _cmdRunner->setMergePatchParams(dlg.parentPath(),
+                                    dlg.childPath(),
+                                    dlg.explicitRoles(),
+                                    dlg.borderCells(),
+                                    dlg.blendCells(),
+                                    dlg.idwK(),
+                                    dlg.ransacIters(),
+                                    dlg.ransacMinThresh(),
+                                    dlg.ransacMaxThresh(),
+                                    dlg.ransacMadK(),
+                                    dlg.ransacSeed(),
+                                    dlg.anchorCap());
+    if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+
+    // One-shot handler: on success, force-refresh the parent (and any
+    // other modified) surface from disk. The mask.tif mtime drives the
+    // per-surface reload inside detectSurfaceChanges, so the in-memory
+    // QuadSurface picks up the patched x/y/z without per-surface
+    // bookkeeping here.
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
+                          this,
+                          [this, guard, connection]
+                          (CommandLineToolRunner::Tool tool,
+                           bool success,
+                           const QString& message,
+                           const QString& outputPath,
+                           bool) {
+        if (!guard) {
+            disconnect(*connection);
+            return;
+        }
+        if (tool != CommandLineToolRunner::Tool::MergePatch) {
+            return;
+        }
+        disconnect(*connection);
+        if (success) {
+            if (_surfacePanel) _surfacePanel->reloadSurfacesFromDisk();
+            emit statusMessage(
+                tr("Patch applied to %1")
+                    .arg(QDir::toNativeSeparators(outputPath)), 5000);
+        } else {
+            QMessageBox::critical(_parentWidget, tr("Patch tifxyz"),
+                                  tr("vc_merge_patch failed.\n%1").arg(message));
+            emit statusMessage(tr("Patch failed"), 5000);
+        }
+    });
+
+    _cmdRunner->showConsoleOutput();
+    _cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch);
+    emit statusMessage(tr("Patching tifxyz..."), 0);
+}
+
 void SegmentationCommandHandler::onAddIgnoreLabel()
 {
     if (!_state || !_state->vpkg()) {

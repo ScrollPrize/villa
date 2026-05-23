@@ -2348,3 +2348,397 @@ void MergeTifxyzDialog::accept()
     updateSessionFromUI();
     QDialog::accept();
 }
+
+// ============================================================================
+// MergePatchDialog
+//
+// Two-input front-end for vc_merge_patch. Picks a parent + child tifxyz from
+// the volpkg, exposes the binary's tunables, and previews the auto-detected
+// parent/child role assignment (cheap: countValidPoints() against the
+// already-loaded VolumePkg surface cache).
+// ============================================================================
+
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
+#include <QComboBox>
+
+bool   MergePatchDialog::ms_haveSession  = false;
+int    MergePatchDialog::ms_borderCells  = 16;
+int    MergePatchDialog::ms_blendCells   = 6;
+int    MergePatchDialog::ms_idwK         = 4;
+int    MergePatchDialog::ms_iters        = 3000;
+double MergePatchDialog::ms_min          = 5.0;
+double MergePatchDialog::ms_max          = 10.0;
+double MergePatchDialog::ms_madK         = 3.0;
+int    MergePatchDialog::ms_seed         = 0;
+int    MergePatchDialog::ms_anchorCap    = 0;
+int    MergePatchDialog::ms_ompThreads   = -1;
+
+MergePatchDialog::MergePatchDialog(QWidget* parent,
+                                   const QStringList& seedSegmentIds,
+                                   const QStringList& availableSegments,
+                                   std::shared_ptr<VolumePkg> volpkg,
+                                   const QString& volpkgDir,
+                                   const QString& pathsDir)
+    : QDialog(parent),
+      _availableSegments(availableSegments),
+      _volpkg(std::move(volpkg)),
+      _volpkgDir(volpkgDir),
+      _pathsDir(pathsDir)
+{
+    setWindowTitle(tr("Patch tifxyz"));
+    auto main = new QVBoxLayout(this);
+
+    // --- Surface pickers -------------------------------------------------
+    auto grpInputs = new QGroupBox(tr("Inputs"), this);
+    auto inputsLay = new QFormLayout(grpInputs);
+
+    auto fillCombo = [&](QComboBox* cmb) {
+        cmb->setEditable(false);
+        for (const auto& id : _availableSegments) cmb->addItem(id);
+    };
+    cmbA_ = new QComboBox(grpInputs);
+    cmbB_ = new QComboBox(grpInputs);
+    fillCombo(cmbA_);
+    fillCombo(cmbB_);
+
+    // Seed selection: prefer the two segments the user right-clicked from
+    // the SurfacePanel. If the menu launched with no seeds, leave the
+    // combos at index 0/0 (user picks both).
+    auto pickSeed = [&](QComboBox* cmb, int index) {
+        if (index < 0 || index >= seedSegmentIds.size()) return;
+        const QString id = seedSegmentIds.at(index);
+        const int idx = cmb->findText(id);
+        if (idx >= 0) cmb->setCurrentIndex(idx);
+    };
+    pickSeed(cmbA_, 0);
+    pickSeed(cmbB_, 1);
+    // If only one seed was passed, leave B at index 0 (different from A
+    // by happenstance — user has to pick the other side).
+    if (seedSegmentIds.size() < 2 && _availableSegments.size() >= 2 &&
+        cmbA_->currentIndex() == cmbB_->currentIndex())
+    {
+        cmbB_->setCurrentIndex(cmbA_->currentIndex() == 0 ? 1 : 0);
+    }
+
+    inputsLay->addRow(tr("Surface A:"), cmbA_);
+    inputsLay->addRow(tr("Surface B:"), cmbB_);
+
+    lblRoleHint_ = new QLabel(grpInputs);
+    lblRoleHint_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lblRoleHint_->setWordWrap(true);
+    inputsLay->addRow(tr("Roles:"), lblRoleHint_);
+
+    btnSwap_ = new QPushButton(tr("Swap parent/child"), grpInputs);
+    inputsLay->addRow(QString(), btnSwap_);
+
+    main->addWidget(grpInputs);
+
+    // --- Tunables ---------------------------------------------------------
+    auto grpTunables = new QGroupBox(tr("Patch"), this);
+    auto tForm = new QFormLayout(grpTunables);
+
+    spBorderCells_ = new QSpinBox(grpTunables);
+    spBorderCells_->setRange(1, 256);
+    spBorderCells_->setValue(ms_borderCells);
+    spBorderCells_->setToolTip(tr("Width of the child rim used for anchor seeding "
+                                  "(child grid cells)."));
+
+    spBlendCells_ = new QSpinBox(grpTunables);
+    spBlendCells_->setRange(1, 256);
+    spBlendCells_->setValue(ms_blendCells);
+    spBlendCells_->setToolTip(tr("Smoothstep blend ramp width at the seam "
+                                 "(parent grid cells)."));
+
+    spIdwK_ = new QSpinBox(grpTunables);
+    spIdwK_->setRange(1, 16);
+    spIdwK_->setValue(ms_idwK);
+    spIdwK_->setToolTip(tr("Base K for KDTree-IDW resampling of child XYZ "
+                           "(clamped to >= 8 internally)."));
+
+    tForm->addRow(tr("Border cells (anchor scope):"), spBorderCells_);
+    tForm->addRow(tr("Blend cells (seam ramp):"),     spBlendCells_);
+    tForm->addRow(tr("IDW K:"),                       spIdwK_);
+    main->addWidget(grpTunables);
+
+    // --- Advanced ---------------------------------------------------------
+    auto grpAdv = new QGroupBox(tr("Advanced"), this);
+    grpAdv->setCheckable(true);
+    grpAdv->setChecked(false);
+    auto advForm = new QFormLayout(grpAdv);
+
+    spIters_ = new QSpinBox(grpAdv);
+    spIters_->setRange(1, 1'000'000);
+    spIters_->setValue(ms_iters);
+    spIters_->setSingleStep(100);
+
+    spMin_ = new QDoubleSpinBox(grpAdv);
+    spMin_->setRange(0.1, 1000.0); spMin_->setDecimals(2); spMin_->setSingleStep(0.5);
+    spMin_->setValue(ms_min);
+
+    spMax_ = new QDoubleSpinBox(grpAdv);
+    spMax_->setRange(0.1, 1000.0); spMax_->setDecimals(2); spMax_->setSingleStep(0.5);
+    spMax_->setValue(ms_max);
+
+    spMadK_ = new QDoubleSpinBox(grpAdv);
+    spMadK_->setRange(0.1, 20.0); spMadK_->setDecimals(2); spMadK_->setSingleStep(0.1);
+    spMadK_->setValue(ms_madK);
+
+    spSeed_ = new QSpinBox(grpAdv);
+    spSeed_->setRange(0, std::numeric_limits<int>::max());
+    spSeed_->setValue(ms_seed);
+
+    spAnchorCap_ = new QSpinBox(grpAdv);
+    spAnchorCap_->setRange(0, 1'000'000);
+    spAnchorCap_->setValue(ms_anchorCap);
+    spAnchorCap_->setToolTip(tr("0 = no cap"));
+
+    edtThreads_ = new QLineEdit(grpAdv);
+    edtThreads_->setPlaceholderText(tr("optional"));
+    edtThreads_->setValidator(new QRegularExpressionValidator(
+        QRegularExpression("^\\s*\\d*\\s*$"), edtThreads_));
+    if (ms_ompThreads > 0) edtThreads_->setText(QString::number(ms_ompThreads));
+
+    advForm->addRow(tr("RANSAC iterations:"),         spIters_);
+    advForm->addRow(tr("RANSAC min threshold (vox):"), spMin_);
+    advForm->addRow(tr("RANSAC max threshold (vox):"), spMax_);
+    advForm->addRow(tr("RANSAC MAD k:"),               spMadK_);
+    advForm->addRow(tr("RANSAC seed (0 = random):"),   spSeed_);
+    advForm->addRow(tr("Anchor cap:"),                 spAnchorCap_);
+    advForm->addRow(tr("OMP threads:"),                edtThreads_);
+    main->addWidget(grpAdv);
+
+    // --- Destructive-action banner ---------------------------------------
+    lblBanner_ = new QLabel(this);
+    lblBanner_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lblBanner_->setWordWrap(true);
+    lblBanner_->setStyleSheet(
+        "QLabel { background-color: #5a1a1a; color: #ffd0d0; "
+        "padding: 8px; border: 1px solid #a04040; border-radius: 4px; }");
+    main->addWidget(lblBanner_);
+
+    // --- Buttons ----------------------------------------------------------
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    auto btnReset = btns->addButton(tr("Reset to Defaults"), QDialogButtonBox::ResetRole);
+    connect(btns,     &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns,     &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(btnReset, &QPushButton::clicked,       this, [this]() { applyCodeDefaults(); });
+    main->addWidget(btns);
+
+    // --- Wiring -----------------------------------------------------------
+    connect(cmbA_, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) { _userSwapped = false; recomputeRoleHint(); });
+    connect(cmbB_, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) { _userSwapped = false; recomputeRoleHint(); });
+    connect(btnSwap_, &QPushButton::clicked, this, [this]() {
+        _aIsParent = !_aIsParent;
+        _userSwapped = true;
+        recomputeRoleHint();
+    });
+
+    applySessionDefaults();
+    recomputeRoleHint();
+
+    setSizeGripEnabled(true);
+    resize(560, 720);
+}
+
+void MergePatchDialog::applyCodeDefaults()
+{
+    spBorderCells_->setValue(16);
+    spBlendCells_->setValue(6);
+    spIdwK_->setValue(4);
+    spIters_->setValue(3000);
+    spMin_->setValue(5.0);
+    spMax_->setValue(10.0);
+    spMadK_->setValue(3.0);
+    spSeed_->setValue(0);
+    spAnchorCap_->setValue(0);
+    edtThreads_->clear();
+}
+
+void MergePatchDialog::applySessionDefaults()
+{
+    if (!ms_haveSession) return;
+    spBorderCells_->setValue(ms_borderCells);
+    spBlendCells_->setValue(ms_blendCells);
+    spIdwK_->setValue(ms_idwK);
+    spIters_->setValue(ms_iters);
+    spMin_->setValue(ms_min);
+    spMax_->setValue(ms_max);
+    spMadK_->setValue(ms_madK);
+    spSeed_->setValue(ms_seed);
+    spAnchorCap_->setValue(ms_anchorCap);
+    if (ms_ompThreads > 0) edtThreads_->setText(QString::number(ms_ompThreads));
+}
+
+void MergePatchDialog::updateSessionFromUI()
+{
+    ms_haveSession = true;
+    ms_borderCells = spBorderCells_->value();
+    ms_blendCells  = spBlendCells_->value();
+    ms_idwK        = spIdwK_->value();
+    ms_iters       = spIters_->value();
+    ms_min         = spMin_->value();
+    ms_max         = spMax_->value();
+    ms_madK        = spMadK_->value();
+    ms_seed        = spSeed_->value();
+    ms_anchorCap   = spAnchorCap_->value();
+    ms_ompThreads  = ompThreads();
+}
+
+int MergePatchDialog::validCellCountFor(const QString& segId) const
+{
+    if (!_volpkg) return -1;
+    auto surf = _volpkg->getSurface(segId.toStdString());
+    if (!surf || !surf->isLoaded()) return -1;
+    return surf->countValidPoints();
+}
+
+void MergePatchDialog::recomputeRoleHint()
+{
+    const QString idA = cmbA_->currentText();
+    const QString idB = cmbB_->currentText();
+
+    if (idA.isEmpty() || idB.isEmpty()) {
+        lblRoleHint_->setText(tr("(pick two surfaces)"));
+        refreshOverwriteBanner();
+        return;
+    }
+    if (idA == idB) {
+        lblRoleHint_->setText(QString::fromLatin1(
+            "<span style='color:#d04040;'>%1</span>")
+            .arg(tr("Surface A and B must be different")));
+        refreshOverwriteBanner();
+        return;
+    }
+
+    const int vA = validCellCountFor(idA);
+    const int vB = validCellCountFor(idB);
+
+    // Auto-detect parent if the user hasn't swapped; otherwise keep
+    // whichever side the user pinned.
+    if (!_userSwapped) {
+        if (vA >= 0 && vB >= 0) {
+            _aIsParent = (vA >= vB);
+        } else {
+            // No valid-count signal -> default to A as parent. The user
+            // can swap if that's wrong.
+            _aIsParent = true;
+        }
+    }
+
+    const QString parentId = _aIsParent ? idA : idB;
+    const QString childId  = _aIsParent ? idB : idA;
+    const int     vParent  = _aIsParent ? vA  : vB;
+    const int     vChild   = _aIsParent ? vB  : vA;
+
+    auto fmt = [](int v) {
+        return v < 0 ? QString("?") : QString::number(v);
+    };
+    QString tag = _userSwapped ? tr(" (swapped — explicit)") :
+                                 tr(" (auto-detect)");
+    lblRoleHint_->setText(
+        tr("Parent: %1 (valid=%2)<br/>Child: %3 (valid=%4)%5")
+            .arg(parentId, fmt(vParent), childId, fmt(vChild), tag));
+
+    if (vParent >= 0 && vChild > 0 && vParent < 2 * vChild) {
+        lblRoleHint_->setText(lblRoleHint_->text() +
+            QString::fromLatin1("<br/><span style='color:#c08040;'>%1</span>")
+                .arg(tr("warning: parent only %1× larger than child — "
+                        "verify roles")
+                         .arg((double)vParent / std::max(1, vChild), 0, 'f', 1)));
+    }
+
+    refreshOverwriteBanner();
+}
+
+void MergePatchDialog::refreshOverwriteBanner()
+{
+    const QString idA = cmbA_->currentText();
+    const QString idB = cmbB_->currentText();
+    QString parentId;
+    if (!idA.isEmpty() && !idB.isEmpty() && idA != idB) {
+        parentId = _aIsParent ? idA : idB;
+    }
+    if (parentId.isEmpty()) {
+        lblBanner_->setText(tr("Pick two distinct surfaces before continuing."));
+        return;
+    }
+    lblBanner_->setText(
+        tr("Parent <b>%1</b> will be overwritten in place. "
+           "x/y/z/mask/meta are replaced atomically; aux files "
+           "(approval.tif, generations.tif, ...) are preserved. "
+           "The pre-patch state is snapshotted to "
+           "<code>%2/backups/%1/{0..7}/</code>.").arg(parentId, _volpkgDir));
+}
+
+QString MergePatchDialog::parentPath() const { return _parentPath; }
+QString MergePatchDialog::childPath()  const { return _childPath;  }
+bool    MergePatchDialog::explicitRoles() const { return _explicitRoles; }
+int     MergePatchDialog::borderCells() const { return spBorderCells_->value(); }
+int     MergePatchDialog::blendCells()  const { return spBlendCells_->value();  }
+int     MergePatchDialog::idwK()        const { return spIdwK_->value();        }
+int     MergePatchDialog::ransacIters() const { return spIters_->value();       }
+double  MergePatchDialog::ransacMinThresh() const { return spMin_->value();     }
+double  MergePatchDialog::ransacMaxThresh() const { return spMax_->value();     }
+double  MergePatchDialog::ransacMadK()  const { return spMadK_->value();        }
+int     MergePatchDialog::ransacSeed()  const { return spSeed_->value();        }
+int     MergePatchDialog::anchorCap()   const { return spAnchorCap_->value();   }
+int     MergePatchDialog::ompThreads()  const {
+    const QString t = edtThreads_->text().trimmed();
+    if (t.isEmpty()) return -1;
+    bool ok = false;
+    const int v = t.toInt(&ok);
+    return (ok && v > 0) ? v : -1;
+}
+
+void MergePatchDialog::accept()
+{
+    const QString idA = cmbA_->currentText();
+    const QString idB = cmbB_->currentText();
+    if (idA.isEmpty() || idB.isEmpty()) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("Pick two surfaces before proceeding."));
+        return;
+    }
+    if (idA == idB) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("Parent and child must be different surfaces."));
+        return;
+    }
+    if (spMin_->value() >= spMax_->value()) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("RANSAC min threshold must be strictly less than max."));
+        return;
+    }
+
+    QSet<QString> avail(_availableSegments.begin(), _availableSegments.end());
+    if (!avail.contains(idA) || !avail.contains(idB)) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("One of the picked surfaces is not present under %1.")
+                .arg(_pathsDir));
+        return;
+    }
+
+    const QString parentId = _aIsParent ? idA : idB;
+    const QString childId  = _aIsParent ? idB : idA;
+
+    namespace fs = std::filesystem;
+    const fs::path pathsRoot = fs::path(_pathsDir.toStdString());
+    const fs::path parentDir = pathsRoot / parentId.toStdString();
+    const fs::path childDir  = pathsRoot / childId.toStdString();
+    if (!fs::is_directory(parentDir) || !fs::is_directory(childDir)) {
+        QMessageBox::critical(this, tr("Patch tifxyz"),
+            tr("Surface directories not found under %1.").arg(_pathsDir));
+        return;
+    }
+
+    _parentPath     = QString::fromStdString(parentDir.string());
+    _childPath      = QString::fromStdString(childDir.string());
+    _explicitRoles  = _userSwapped;
+
+    updateSessionFromUI();
+    QDialog::accept();
+}
