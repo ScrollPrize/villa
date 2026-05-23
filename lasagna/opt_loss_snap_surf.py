@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from snap_surf.api import configure_snap_surf, last_stats, reset_state, set_debug_step, snap_surf_loss
+from snap_surf.api import configure_snap_surf, last_stats, reset_state, set_debug_step, snap_surf_loss, update_last_stats
 import snap_surf.api as _api
 import snap_surf.config as _config
 import snap_surf.state as _state
@@ -51,4 +51,5 @@ __all__ = [
 	"reset_state",
 	"set_debug_step",
 	"snap_surf_loss",
+	"update_last_stats",
 ]

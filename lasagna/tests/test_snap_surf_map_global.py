@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 
 import torch
+import optimizer
 
 TEST_DIR = os.path.dirname(__file__)
 if TEST_DIR not in sys.path:
@@ -23,6 +24,7 @@ from snap_surf.map_global import (
 	_affine_multistart_candidates,
 	_objective_for_uv,
 	optimize_fixture,
+	parse_global_map_stage_item,
 	parse_global_map_config,
 	snap_surf_config_from_global_config,
 )
@@ -108,6 +110,35 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8) -> st
 
 
 class SnapSurfMapGlobalTest(unittest.TestCase):
+	def test_lasagna_stage_parser_routes_model_and_map_params(self) -> None:
+		cfg = {
+			"base": {"snap_surf": 1.0},
+			"stages": [
+				{"name": "model", "steps": 1, "lr": 0.1, "params": ["mesh_ms"]},
+				{"name": "map", "steps": 1, "lr": 0.01, "params": ["map_affine"], "w_fac": 1.0},
+			],
+		}
+
+		stages = optimizer.load_stages_cfg(cfg)
+
+		self.assertEqual(stages[0].global_opt.kind, "model")
+		self.assertEqual(stages[1].global_opt.kind, "map")
+
+	def test_lasagna_stage_parser_rejects_plain_affine_and_mixed_params(self) -> None:
+		with self.assertRaisesRegex(ValueError, "map_affine"):
+			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["affine"]}]})
+		with self.assertRaisesRegex(ValueError, "cannot mix model params"):
+			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["mesh_ms", "map_uv_ms"]}]})
+
+	def test_nested_map_opt_uses_normal_lasagna_param_names(self) -> None:
+		stage = parse_global_map_stage_item(
+			{"steps": 1, "lr": 0.01, "params": ["map_affine"], "args": {"subdiv": 2}},
+			normal_lasagna=True,
+		)
+		self.assertEqual(stage.params, ("affine",))
+		with self.assertRaisesRegex(ValueError, "map_affine"):
+			parse_global_map_stage_item({"params": ["affine"]}, normal_lasagna=True)
+
 	def test_cli_default_device_is_auto(self) -> None:
 		parser = map_global_cli._build_parser()
 		args = parser.parse_args(["optimize-fixture", "fixture", "cfg.json", "--out", "out"])

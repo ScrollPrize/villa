@@ -179,6 +179,9 @@ def configure_snap_surf(
 def last_stats() -> dict[str, float]:
 	return dict(_last_stats)
 
+def update_last_stats(values: dict[str, float]) -> None:
+	_last_stats.update({str(k): float(v) for k, v in values.items()})
+
 def set_debug_step(step: int | None, *, label: str | None = None) -> None:
 	global _debug_step, _debug_label
 	_debug_step = None if step is None else int(step)

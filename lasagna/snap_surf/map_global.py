@@ -21,6 +21,7 @@ from .debug_obj import _debug_obj_safe_label, _write_obj_lines, _write_obj_mesh_
 from .legacy import (
 	_choose_seed_transform,
 	_closest_external_seed_surface,
+	_closest_model_surface_quad,
 	_closest_point_uv_on_model_quad,
 	_map_init_seed_quad_uv_for_points,
 )
@@ -50,6 +51,53 @@ class GlobalMapStageConfig:
 class GlobalMapConfig:
 	base: dict[str, Any] = field(default_factory=dict)
 	stages: tuple[GlobalMapStageConfig, ...] = ()
+
+
+def _canonical_stage_params(params: tuple[str, ...], *, normal_lasagna: bool = False) -> tuple[str, ...]:
+	out: list[str] = []
+	for p in params:
+		name = str(p)
+		if normal_lasagna and name == "affine":
+			raise ValueError("global map stage params: use 'map_affine' in normal lasagna stages, not 'affine'")
+		if normal_lasagna and name == "map_affine":
+			name = "affine"
+		out.append(name)
+	bad = sorted(set(out) - {"affine", "map_uv_ms"})
+	if bad:
+		raise ValueError(f"global map stage params: unknown name(s): {bad}")
+	if "affine" in out and "map_uv_ms" in out:
+		raise ValueError("global map stage params: affine and map_uv_ms must be optimized in separate stages")
+	return tuple(out)
+
+
+def parse_global_map_stage_item(item: dict[str, Any], *, index: int = 0, normal_lasagna: bool = False) -> GlobalMapStageConfig:
+	if not isinstance(item, dict):
+		raise ValueError(f"global map stage {index} must be an object")
+	params = item.get("params", ())
+	if isinstance(params, str):
+		params_t = (params,)
+	elif isinstance(params, list):
+		params_t = tuple(str(v) for v in params)
+	else:
+		raise ValueError(f"global map stage {index} params must be a string or list")
+	params_t = _canonical_stage_params(params_t, normal_lasagna=normal_lasagna)
+	args = item.get("args", {})
+	if args is None:
+		args = {}
+	if not isinstance(args, dict):
+		raise ValueError(f"global map stage {index} args must be an object")
+	w_fac = item.get("w_fac", 1.0)
+	if isinstance(w_fac, dict):
+		raise ValueError(f"global map stage {index} w_fac must be a number")
+	return GlobalMapStageConfig(
+		name=str(item.get("name", item.get("kind", ""))),
+		steps=max(0, int(item.get("steps", 0))),
+		lr=float(item.get("lr", 0.05)),
+		params=params_t,
+		min_scaledown=max(0, int(item.get("min_scaledown", 0))),
+		w_fac=float(w_fac),
+		args=dict(args),
+	)
 
 
 class AffineMapModel(torch.nn.Module):
@@ -117,31 +165,7 @@ def parse_global_map_config(path: str | Path) -> GlobalMapConfig:
 		raise ValueError("global map config stages must be a list")
 	stages: list[GlobalMapStageConfig] = []
 	for i, item in enumerate(stages_raw):
-		if not isinstance(item, dict):
-			raise ValueError(f"global map stage {i} must be an object")
-		params = item.get("params", ())
-		if isinstance(params, str):
-			params_t = (params,)
-		elif isinstance(params, list):
-			params_t = tuple(str(v) for v in params)
-		else:
-			raise ValueError(f"global map stage {i} params must be a string or list")
-		args = item.get("args", {})
-		if args is None:
-			args = {}
-		if not isinstance(args, dict):
-			raise ValueError(f"global map stage {i} args must be an object")
-		stages.append(
-			GlobalMapStageConfig(
-				name=str(item.get("name", item.get("kind", ""))),
-				steps=max(0, int(item.get("steps", 0))),
-				lr=float(item.get("lr", 0.05)),
-				params=params_t,
-				min_scaledown=max(0, int(item.get("min_scaledown", 0))),
-				w_fac=float(item.get("w_fac", 1.0)),
-				args=dict(args),
-			)
-		)
+		stages.append(parse_global_map_stage_item(item, index=i))
 	return GlobalMapConfig(base=dict(base), stages=tuple(stages))
 
 
@@ -1221,6 +1245,253 @@ def _global_progress_state(
 	progress_terms["station"] = station_raw.detach()
 	err = _fixture_mapping_error(uv.detach(), fixture)
 	return float(loss.detach().cpu()), progress_terms, err
+
+
+def _nan_reference_uv(ext_shape: tuple[int, int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+	return torch.full((int(ext_shape[0]), int(ext_shape[1]), 2), float("nan"), device=device, dtype=dtype)
+
+
+def _fixture_from_live_tensors(
+	*,
+	model_xyz: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_valid: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	seed_xyz: tuple[float, float, float] | None,
+) -> MapFixture:
+	device = model_xyz.device
+	dtype = model_xyz.dtype
+	metadata: dict[str, Any] = {
+		"model_depth": 0,
+		"normal_sign": 1,
+		"orientation_sign": 1,
+	}
+	if seed_xyz is not None:
+		seed = torch.tensor(seed_xyz, device=device, dtype=dtype)
+		ext_quad, _ext_point, _ext_dist = _closest_external_seed_surface(
+			seed=seed,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid.bool(),
+			ext_quad_valid=ext_quad_valid.bool(),
+		)
+		model_quad, _model_dist = _closest_model_surface_quad(
+			point=seed,
+			model_xyz=model_xyz,
+			model_valid=model_valid.bool(),
+		)
+		if ext_quad is not None:
+			metadata["seed_ext_sample_hw"] = [int(ext_quad[0]), int(ext_quad[1])]
+		if model_quad is not None:
+			metadata["seed_model_quad"] = [int(model_quad[0]), int(model_quad[1]), int(model_quad[2])]
+		metadata["seed_xyz"] = [float(v) for v in seed_xyz]
+	return MapFixture(
+		root=Path("."),
+		metadata=metadata,
+		ext_xyz=ext_xyz.detach(),
+		ext_valid=ext_valid.detach().bool(),
+		ext_quad_valid=ext_quad_valid.detach().bool(),
+		ext_normals=ext_normals.detach(),
+		model_xyz=model_xyz.detach(),
+		model_valid=model_valid.detach().bool(),
+		model_normals=model_normals.detach(),
+		reference_uv=_nan_reference_uv(tuple(int(v) for v in ext_xyz.shape[:2]), device=device, dtype=dtype),
+		reference_active_quad=torch.zeros(
+			max(0, int(ext_xyz.shape[0]) - 1),
+			max(0, int(ext_xyz.shape[1]) - 1),
+			device=device,
+			dtype=torch.bool,
+		),
+		reference_blocked_quad=torch.zeros(
+			max(0, int(ext_xyz.shape[0]) - 1),
+			max(0, int(ext_xyz.shape[1]) - 1),
+			device=device,
+			dtype=torch.bool,
+		),
+	)
+
+
+class GlobalMapRuntime:
+	"""Persistent global rectangular map optimizer for live snap-surf tensors."""
+
+	def __init__(self, *, base: dict[str, Any] | None = None, seed_xyz: tuple[float, float, float] | None = None) -> None:
+		self.cfg_global = GlobalMapConfig(base=dict(base or {}), stages=())
+		self.seed_xyz = seed_xyz
+		self.affine: AffineMapModel | None = None
+		self.global_model: GlobalMapModel | None = None
+		self.optimizer: torch.optim.Optimizer | None = None
+		self.optimizer_key: tuple[tuple[str, ...], int, float, int] | None = None
+		self.station_target: torch.Tensor | None = None
+		self.last: dict[str, float] = {}
+		self.steps_run = 0
+
+	def _ensure_models(self, fixture: MapFixture, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
+		device = fixture.model_xyz.device
+		dtype = fixture.model_xyz.dtype
+		seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device, dtype=dtype)
+		if self.affine is None:
+			seed_uv = _seed_model_uv(fixture, seed_hw)
+			initial_affine = _affine_from_linear(seed_hw, seed_uv, torch.eye(2, device=device, dtype=dtype))
+			self.affine = AffineMapModel(
+				ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+				device=device,
+				dtype=dtype,
+				initial=initial_affine,
+			)
+			self.station_target = self.affine.eval_at(seed_hw).detach()
+		if "map_uv_ms" in stage.params and self.global_model is None:
+			levels = _max_supported_level(
+				tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+				max(int(stage.min_scaledown), int(base_cfg.map_init.scale_levels) - 1),
+			) + 1
+			self.station_target = self.affine.eval_at(seed_hw).detach()
+			self.global_model = GlobalMapModel(self.affine().detach(), levels=levels, factor=2)
+
+	def _uv(self) -> torch.Tensor:
+		if self.global_model is not None:
+			return self.global_model(active_level=0)
+		if self.affine is None:
+			raise RuntimeError("global map runtime is not initialized")
+		return self.affine()
+
+	def _params_for_stage(self, stage: GlobalMapStageConfig) -> tuple[list[torch.nn.Parameter], int]:
+		params: list[torch.nn.Parameter] = []
+		level = 0
+		if "affine" in stage.params:
+			if self.affine is None:
+				raise RuntimeError("affine map model is not initialized")
+			params.append(self.affine.affine)
+		if "map_uv_ms" in stage.params:
+			if self.global_model is None:
+				raise RuntimeError("global map model is not initialized")
+			level = min(max(0, int(stage.min_scaledown)), len(self.global_model.map_uv_ms) - 1)
+			params.extend(list(self.global_model.map_uv_ms.parameters())[level:])
+		return params, level
+
+	def run_stage(
+		self,
+		*,
+		stage: GlobalMapStageConfig,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		ext_xyz: torch.Tensor,
+		ext_valid: torch.Tensor,
+		ext_normals: torch.Tensor,
+		ext_quad_valid: torch.Tensor,
+		persistent_optimizer: bool = False,
+		status_fn=None,
+	) -> dict[str, float]:
+		fixture = _fixture_from_live_tensors(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad_valid,
+			seed_xyz=self.seed_xyz,
+		)
+		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
+		stage_cfg = _stage_loss_cfg(base_cfg, stage)
+		self._ensure_models(fixture, base_cfg, stage)
+		assert self.affine is not None
+		seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+		station_target = self.station_target if self.station_target is not None else self.affine.eval_at(seed_hw).detach()
+		w_station = float(stage.args.get("map_station_t", stage.args.get("w_station_t", self.cfg_global.base.get("map_station_t", 0.0))))
+		if _is_affine_seed_quad_init(stage):
+			candidate = _affine_from_seed_ext_quads(
+				fixture=fixture,
+				stage_cfg=stage_cfg,
+				seed_hw=seed_hw,
+				seed_model_uv=_seed_model_uv(fixture, seed_hw),
+			)
+			if candidate is not None:
+				with torch.no_grad():
+					self.affine.affine.copy_(candidate)
+		if _is_affine_init_scan(stage):
+			_run_affine_multistart(
+				cfg_global=self.cfg_global,
+				stage=stage,
+				affine=self.affine,
+				fixture=fixture,
+				stage_cfg=stage_cfg,
+				seed_hw=seed_hw,
+				station_target=station_target,
+				w_station=w_station,
+			)
+		def _stats_for_current_uv() -> dict[str, float]:
+			with torch.no_grad():
+				loss_f, terms, err = _global_progress_state(
+					uv=self._uv(),
+					fixture=fixture,
+					cfg=stage_cfg,
+					seed_hw=seed_hw,
+					station_target=station_target,
+					w_station=w_station,
+				)
+			return {
+				"snaps_map_loss": float(loss_f),
+				"snaps_map_samples": float(_global_term_value(terms, "samples")),
+				"snaps_map_avg": float(err["avg_model_quad_distance"]),
+				"snaps_map_max": float(err["max_model_quad_distance"]),
+				"snaps_map_runtime_steps": float(self.steps_run),
+			}
+
+		params, level = self._params_for_stage(stage)
+		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		if status_fn is not None:
+			status_fn(step=0, total=int(stage.steps), stats=_stats_for_current_uv())
+		if params and int(stage.steps) > 0:
+			key = (tuple(stage.params), int(level), float(stage.lr), int(stage.min_scaledown))
+			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
+				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
+				self.optimizer_key = key
+			opt = self.optimizer
+			assert opt is not None
+			for _ in range(int(stage.steps)):
+				opt.zero_grad(set_to_none=True)
+				uv = self._uv()
+				loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+				if w_station > 0.0:
+					loss = loss + w_station * _station_loss(uv, seed_hw, station_target)
+				loss.backward()
+				opt.step()
+				self.steps_run += 1
+				step1 = _ + 1
+				if status_fn is not None and (
+					step1 == 1 or
+					step1 == int(stage.steps) or
+					(status_interval > 0 and (step1 % status_interval) == 0)
+				):
+					status_fn(step=step1, total=int(stage.steps), stats=_stats_for_current_uv())
+			if not persistent_optimizer:
+				self.optimizer = None
+				self.optimizer_key = None
+		stats = _stats_for_current_uv()
+		self.last = stats
+		debug_obj_dir = stage.args.get("debug_obj_dir", None)
+		if debug_obj_dir:
+			if isinstance(debug_obj_dir, bool):
+				debug_root = Path("snap_surf_objs")
+			else:
+				debug_root = Path(str(debug_obj_dir))
+			label = stage.name or ("_".join(stage.params) if stage.params else "map_stage")
+			_write_map_objs(
+				debug_root / f"map_global_{_debug_obj_safe_label(label)}",
+				uv=self._uv().detach(),
+				fixture=fixture,
+				meta={
+					"name": label,
+					"params": list(stage.params),
+					"steps": int(stage.steps),
+					"persistent_optimizer": bool(persistent_optimizer),
+					**stats,
+				},
+			)
+		return stats
 
 
 def optimize_fixture(
