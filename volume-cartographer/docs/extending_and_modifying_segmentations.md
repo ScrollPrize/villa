@@ -1,12 +1,13 @@
-Segmentation growth and editing is now supported within the segmentation widget. Starting from a seed patch (or some segmentation imported into vc3d), you can grow them using the tracing method used during regular patch growth, and influence the direction it grows or modify its underlying geoemetry right in vc3d.
+Segmentation growth and editing is now supported within the segmentation widget. Starting from a seed patch (or some segmentation imported into vc3d), you can grow them using the tracing method used during regular patch growth, and influence the direction it grows or modify its underlying geometry right in vc3d.
 
 This is relatively untested, but (should) work. It's possible to easily create relatively large segmentations rather quickly -- i created this nearly 22cm segmentation in less than 5 minutes. ![grow_example.png](grow_example.png)
 
-**prerequisites** 
-- you must have computed normal grids in the volpkg directory stored as `/path/to/example.volpkg/normal_grids/`
-  - to compute these, run `/path/to/build/bin/vc_compute_normal_grids` , use the help option to see the options (or just enter it without any arguments)
-- you must have the latest branch of volume-cartographer checked out (as this contains major changes that are required for this to work)
-- you must have an existing patch or sgementation, or create one using the seeding widget
+**prerequisites**
+- you must have an existing patch or segmentation, or create one using the seeding widget
+- if you want to grow segments, you must have computed normal grids in the volpkg directory stored as `/path/to/example.volpkg/normal_grids/`
+  - normal grids are used by the growth tools to constrain surface normals; they are not required just to open a volpkg and inspect existing segments
+  - to compute these, run `/path/to/build/bin/vc_gen_normalgrids --help` to see the current options, then generate the grids into the `normal_grids/` directory
+- you must have a current build of volume-cartographer checked out, as segmentation editing and growth depend on recent VC3D changes
 
 **methods**
 
@@ -16,7 +17,7 @@ there are two main ways to influence growth of a segmentation:
 
 these can be used together, or independently -- the mesh deformation at times creates some undesirable geometry, so it's recommended for now to stick mostly with correction points, but this is something we're continuing to work on. 
 
-**useage**
+**usage**
 
 1. open a volpkg 
 2. click on the segmentation you want to edit
