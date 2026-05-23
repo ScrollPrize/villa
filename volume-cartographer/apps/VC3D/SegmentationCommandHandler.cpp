@@ -3002,7 +3002,16 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
     });
 
     _cmdRunner->showConsoleOutput();
-    _cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch);
+    // If execute() rejects the launch (preflight failure, missing binary),
+    // it never emits toolFinished -- so the one-shot lambda above would
+    // stay attached and fire on the NEXT tool's toolFinished. Disconnect
+    // immediately on launch failure to keep the runner's signal table
+    // clean across subsequent runs.
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
+        QObject::disconnect(*connection);
+        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
+        return;
+    }
     emit statusMessage(tr("Patching tifxyz..."), 0);
 }
 

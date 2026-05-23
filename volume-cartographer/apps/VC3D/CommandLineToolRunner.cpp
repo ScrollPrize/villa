@@ -230,8 +230,11 @@ bool CommandLineToolRunner::execute(Tool tool)
         return false;
     }
 
-    // vc_merge_tifxyz operates on segment paths only; no volume required.
-    const bool needsVolume = !isCustom && tool != Tool::MergeTifxyz;
+    // vc_merge_tifxyz and vc_merge_patch are path-only tools (segment dirs);
+    // no volume required.
+    const bool needsVolume = !isCustom
+                             && tool != Tool::MergeTifxyz
+                             && tool != Tool::MergePatch;
     if (needsVolume) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
