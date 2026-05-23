@@ -302,6 +302,7 @@ lambda_global: dict[str, float] = {
 	"bend": 0.0,
 	"ext_offset": 0.0,
 	"snap_surf": 0.0,
+	"snap_surf_map": 0.0,
 	"cyl_normal": 0.0,
 	"cyl_center": 0.0,
 	"cyl_smooth": 0.0,
@@ -563,6 +564,25 @@ def optimize(
 			persistent_optimizer=persistent_optimizer,
 			status_fn=status_fn,
 		)
+
+	def _snap_global_map_loss(*, res) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+		records = getattr(res, "ext_surfaces", None)
+		if not records:
+			raise RuntimeError("snap_surf_map requires external_surfaces")
+		if res.normals is None:
+			raise RuntimeError("snap_surf_map requires model normals")
+		ext_xyz, ext_valid, ext_normals, ext_quad_valid = records[0]
+		loss, lms, masks, stats = _snap_global_runtime_for().snap_loss(
+			model_xyz=res.xyz_lr,
+			model_normals=res.normals,
+			model_valid=torch.isfinite(res.xyz_lr).all(dim=-1),
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad_valid,
+		)
+		opt_loss_snap_surf.update_last_stats(stats)
+		return loss, lms, masks
 
 	def _stage_start(name: str) -> float:
 		return 0.0
@@ -1000,10 +1020,14 @@ def optimize(
 			"loss": opt_loss_winding_density.ext_offset_loss,
 			"needs": Needs(ext_conn=True, prefetch_ext_offset=True),
 		},
-		"snap_surf": {
-			"loss": opt_loss_snap_surf.snap_surf_loss,
-			"needs": Needs(mesh_normals=True, ext_surfaces=True),
-		},
+			"snap_surf": {
+				"loss": opt_loss_snap_surf.snap_surf_loss,
+				"needs": Needs(mesh_normals=True, ext_surfaces=True),
+			},
+			"snap_surf_map": {
+				"loss": _snap_global_map_loss,
+				"needs": Needs(mesh_normals=True, ext_surfaces=True),
+			},
 		"cyl_normal": {
 			"loss": opt_loss_cyl.cyl_normal_loss,
 			"needs": Needs(
@@ -1260,15 +1284,16 @@ def optimize(
 						items=[
 							("step", "stage step"),
 							("sm_los", "map objective loss"),
-							("sm_avg", "avg model quad mapping distance"),
-							("sm_max", "max model quad mapping distance"),
+							("sm_dst", "map distance loss"),
+							("sm_vec", "map vector-normal loss"),
+							("sm_nrm", "map normal alignment loss"),
 							("sm_smp", "valid map samples"),
 							("it/s", "optimizer it/s"),
 						],
 					)
 					print(
-						f"{'step':>{_map_status_width}s} {'sm_los':>8s} {'sm_avg':>8s} "
-						f"{'sm_max':>8s} {'sm_smp':>8s} {'it/s':>5s}",
+						f"{'step':>{_map_status_width}s} {'sm_los':>8s} {'sm_dst':>8s} "
+						f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_smp':>8s} {'it/s':>5s}",
 						flush=True,
 					)
 				now = time.perf_counter()
@@ -1281,8 +1306,9 @@ def optimize(
 				print(
 					f"{f'{label} {int(step)}/{int(total)}':>{_map_status_width}s} "
 					f"{format_progress_value(float(stats.get('snaps_map_loss', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_avg', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_max', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_dist', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_vec', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
 					f"{its_str}",
 					flush=True,
@@ -1349,10 +1375,7 @@ def optimize(
 					raw_map_opt,
 					normal_lasagna=True,
 				)
-				map_init_raw = snap_surf_args.get("map_init", {})
-				map_init_cfg = dict(map_init_raw) if isinstance(map_init_raw, dict) else {}
-				map_init_cfg["enabled"] = False
-				snap_surf_args["map_init"] = map_init_cfg
+				snap_surf_args["map_init"] = {"enabled": False}
 		if isinstance(snap_surf_args, dict) and "map_global" in snap_surf_args:
 			snap_surf_args.pop("map_global")
 		print(
@@ -1533,6 +1556,11 @@ def optimize(
 				"pred_dt_pull_prefix_mean": "pullpre",
 				"pred_dt_pull_weight_mean": "pullw",
 				"snap_surf": "snaps",
+				"snap_surf_map": "smap",
+				"snaps_map_snap": "sms_los",
+				"snaps_map_snap_abs": "sms_abs",
+				"snaps_map_snap_max": "sms_max",
+				"snaps_map_snap_samples": "sms_smp",
 				"snaps_m2e": "s_m2e",
 				"snaps_seed": "s_seed",
 				"snaps_sdist": "s_mod",
@@ -1638,6 +1666,11 @@ def optimize(
 				"pred_dt_pull_prefix_mean": "pull prefix",
 				"pred_dt_pull_weight_mean": "pull weight",
 				"snap_surf": "snap loss",
+				"snap_surf_map": "map-projected snap loss",
+				"snaps_map_snap": "map-projected snap loss",
+				"snaps_map_snap_abs": "map-projected snap abs residual",
+				"snaps_map_snap_max": "map-projected snap max residual",
+				"snaps_map_snap_samples": "map-projected snap samples",
 				"snaps_seed": "seed ok",
 				"snaps_sdist": "seed model dist",
 				"snaps_sext": "seed ext dist",
@@ -1734,57 +1767,62 @@ def optimize(
 				"pred_dt_pull_prefix_mean": 112,
 				"pred_dt_pull_weight_mean": 113,
 				"snap_surf": 114,
-				"snaps_seed": 115,
-				"snaps_sext": 116,
-				"snaps_sdist": 117,
-				"snaps_m2e": 118,
-				"snaps_local": 119,
-				"snaps_brute": 120,
-				"snaps_front": 121,
-				"snaps_brute_on": 122,
-				"snaps_pairs_m": 123,
-				"snaps_gerr_avg": 124,
-				"snaps_gerr_max": 125,
-				"snaps_ravg": 126,
-				"snaps_rabs": 127,
-				"snaps_rmax": 128,
-				"snaps_tow": 129,
-				"snaps_dbg_iter": 130,
-				"snaps_dbg_ring": 131,
-				"snaps_dbg_grid": 132,
-				"snaps_dbg_ori": 133,
-				"snaps_dbg_new": 134,
-				"snaps_map_active": 135,
-				"snaps_map_init": 136,
-				"snaps_map_added": 137,
-				"snaps_map_blocked": 138,
-				"snaps_map_sparse": 139,
-				"snaps_map_iters": 140,
-				"snaps_map_blocks": 141,
-				"snaps_map_grow": 142,
-				"snaps_map_add_loss": 143,
-				"snaps_map_add_bad_frac": 144,
-				"snaps_map_add_success_frac": 145,
-				"snaps_map_fringe_loss": 146,
-				"snaps_map_fringe_bad_frac": 147,
-				"snaps_map_fringe_success_frac": 148,
-				"snaps_map_loss": 149,
-				"snaps_map_avg": 150,
-				"snaps_map_max": 151,
-				"snaps_map_dist": 150,
-				"snaps_map_vec": 151,
-				"snaps_map_norm": 152,
-				"snaps_map_smooth": 153,
-				"snaps_map_bend": 154,
-				"snaps_map_jac": 155,
-				"snaps_map_smooth_fwd": 156,
-				"snaps_map_bend_fwd": 157,
-				"snaps_map_jac_fwd": 158,
-				"snaps_map_metric_smooth": 159,
-				"snaps_map_area_smooth": 160,
-				"snaps_map_smooth_rev": 161,
-				"snaps_map_bend_rev": 162,
-				"snaps_map_jac_rev": 163,
+				"snap_surf_map": 115,
+				"snaps_map_snap": 116,
+				"snaps_map_snap_abs": 117,
+				"snaps_map_snap_max": 118,
+				"snaps_map_snap_samples": 119,
+				"snaps_seed": 120,
+				"snaps_sext": 121,
+				"snaps_sdist": 122,
+				"snaps_m2e": 123,
+				"snaps_local": 124,
+				"snaps_brute": 125,
+				"snaps_front": 126,
+				"snaps_brute_on": 127,
+				"snaps_pairs_m": 128,
+				"snaps_gerr_avg": 129,
+				"snaps_gerr_max": 130,
+				"snaps_ravg": 131,
+				"snaps_rabs": 132,
+				"snaps_rmax": 133,
+				"snaps_tow": 134,
+				"snaps_dbg_iter": 135,
+				"snaps_dbg_ring": 136,
+				"snaps_dbg_grid": 137,
+				"snaps_dbg_ori": 138,
+				"snaps_dbg_new": 139,
+				"snaps_map_active": 140,
+				"snaps_map_init": 141,
+				"snaps_map_added": 142,
+				"snaps_map_blocked": 143,
+				"snaps_map_sparse": 144,
+				"snaps_map_iters": 145,
+				"snaps_map_blocks": 146,
+				"snaps_map_grow": 147,
+				"snaps_map_add_loss": 148,
+				"snaps_map_add_bad_frac": 149,
+				"snaps_map_add_success_frac": 150,
+				"snaps_map_fringe_loss": 151,
+				"snaps_map_fringe_bad_frac": 152,
+				"snaps_map_fringe_success_frac": 153,
+				"snaps_map_loss": 154,
+				"snaps_map_dist": 155,
+				"snaps_map_vec": 156,
+				"snaps_map_norm": 157,
+				"snaps_map_smooth": 158,
+				"snaps_map_bend": 159,
+				"snaps_map_jac": 160,
+				"snaps_map_avg": 161,
+				"snaps_map_max": 162,
+				"snaps_map_smooth_fwd": 163,
+				"snaps_map_bend_fwd": 164,
+				"snaps_map_jac_fwd": 165,
+				"snaps_map_metric_smooth": 166,
+				"snaps_map_area_smooth": 167,
+				"snaps_map_smooth_rev": 168,
+				"snaps_map_bend_rev": 169,
+				"snaps_map_jac_rev": 170,
 				"snaps_map_jmin": 164,
 				"snaps_map_jinv_min": 165,
 				"snaps_map_jinv_bad": 166,
@@ -2074,6 +2112,8 @@ def optimize(
 					if name == "cyl_outside":
 						tv.update(opt_loss_cyl.last_stats())
 					if name == "snap_surf":
+						tv.update(opt_loss_snap_surf.last_stats())
+					if name == "snap_surf_map":
 						tv.update(opt_loss_snap_surf.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
@@ -2918,8 +2958,21 @@ def optimize(
 			if snap_surf_map_opt_stage is not None:
 				with torch.no_grad():
 					res_map_after = model(data, needs=_map_forward_needs)
+				map_stage_for_step = snap_surf_map_opt_stage
+				if step + 1 != max_steps:
+					map_args = dict(snap_surf_map_opt_stage.args)
+					map_args.pop("debug_obj_dir", None)
+					map_stage_for_step = snap_surf_map_global.GlobalMapStageConfig(
+						name=snap_surf_map_opt_stage.name,
+						steps=snap_surf_map_opt_stage.steps,
+						lr=snap_surf_map_opt_stage.lr,
+						params=snap_surf_map_opt_stage.params,
+						min_scaledown=snap_surf_map_opt_stage.min_scaledown,
+						w_fac=snap_surf_map_opt_stage.w_fac,
+						args=map_args,
+					)
 				map_stats = _run_snap_global_map_stage(
-					stage=snap_surf_map_opt_stage,
+					stage=map_stage_for_step,
 					res=res_map_after,
 					stage_args=stage_args,
 					persistent_optimizer=True,

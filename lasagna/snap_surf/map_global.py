@@ -1432,13 +1432,27 @@ class GlobalMapRuntime:
 					station_target=station_target,
 					w_station=w_station,
 				)
-			return {
+			stats = {
 				"snaps_map_loss": float(loss_f),
 				"snaps_map_samples": float(_global_term_value(terms, "samples")),
-				"snaps_map_avg": float(err["avg_model_quad_distance"]),
-				"snaps_map_max": float(err["max_model_quad_distance"]),
 				"snaps_map_runtime_steps": float(self.steps_run),
 			}
+			for term_key, stat_key in (
+				("dist", "snaps_map_dist"),
+				("vec", "snaps_map_vec"),
+				("norm", "snaps_map_norm"),
+				("smooth", "snaps_map_smooth"),
+				("bend", "snaps_map_bend"),
+				("jac", "snaps_map_jac"),
+				("metric_smooth", "snaps_map_metric_smooth"),
+				("area_smooth", "snaps_map_area_smooth"),
+				("prior", "snaps_map_prior"),
+			):
+				stats[stat_key] = float(_global_term_value(terms, term_key))
+			if int(err["mapping_error_samples"]) > 0:
+				stats["snaps_map_avg"] = float(err["avg_model_quad_distance"])
+				stats["snaps_map_max"] = float(err["max_model_quad_distance"])
+			return stats
 
 		params, level = self._params_for_stage(stage)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
@@ -1492,6 +1506,66 @@ class GlobalMapRuntime:
 				},
 			)
 		return stats
+
+	def snap_loss(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		ext_xyz: torch.Tensor,
+		ext_valid: torch.Tensor,
+		ext_normals: torch.Tensor,
+		ext_quad_valid: torch.Tensor,
+	) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], dict[str, float]]:
+		if self.affine is None:
+			fixture = _fixture_from_live_tensors(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad_valid,
+				seed_xyz=self.seed_xyz,
+			)
+			base_cfg = snap_surf_config_from_global_config(self.cfg_global)
+			self._ensure_models(fixture, base_cfg, GlobalMapStageConfig(params=("affine",)))
+		uv = self._uv().detach()
+		depth = torch.zeros((*uv.shape[:-1], 1), device=uv.device, dtype=uv.dtype)
+		coords = torch.cat([depth, uv], dim=-1)
+		model_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+		ext_ok = ext_valid.bool() & torch.isfinite(ext_xyz).all(dim=-1)
+		finite = torch.isfinite(coords).all(dim=-1)
+		valid = finite & ext_ok & model_ok
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		model_pos = _sample_surface_grid(model_xyz, safe_coords)
+		model_n = torch.nn.functional.normalize(
+			_sample_surface_grid(model_normals.detach(), safe_coords),
+			dim=-1,
+			eps=1.0e-8,
+		)
+		valid = valid & torch.isfinite(model_pos).all(dim=-1) & torch.isfinite(model_n).all(dim=-1)
+		z = model_xyz.sum() * 0.0
+		lm = torch.zeros(model_xyz.shape[:3], device=model_xyz.device, dtype=model_xyz.dtype).unsqueeze(1)
+		mask = torch.zeros_like(lm)
+		if not bool(valid.any().detach().cpu()):
+			return z, (lm,), (mask,), {
+				"snaps_map_snap": 0.0,
+				"snaps_map_snap_abs": 0.0,
+				"snaps_map_snap_max": 0.0,
+				"snaps_map_snap_samples": 0.0,
+			}
+		signed = ((model_pos - ext_xyz.detach()) * model_n).sum(dim=-1)
+		vals = signed[valid]
+		loss = vals.square().mean()
+		stats = {
+			"snaps_map_snap": float(loss.detach().cpu()),
+			"snaps_map_snap_abs": float(vals.detach().abs().mean().cpu()),
+			"snaps_map_snap_max": float(vals.detach().abs().max().cpu()),
+			"snaps_map_snap_samples": float(int(vals.numel())),
+		}
+		return loss, (lm,), (mask,), stats
 
 
 def optimize_fixture(

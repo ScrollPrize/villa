@@ -20,6 +20,8 @@ from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_
 from snap_surf.map_global import (
 	AffineMapModel,
 	GlobalMapModel,
+	GlobalMapRuntime,
+	GlobalMapStageConfig,
 	_affine_from_seed_ext_quads,
 	_affine_multistart_candidates,
 	_objective_for_uv,
@@ -138,6 +140,36 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertEqual(stage.params, ("affine",))
 		with self.assertRaisesRegex(ValueError, "map_affine"):
 			parse_global_map_stage_item({"params": ["affine"]}, normal_lasagna=True)
+
+	def test_live_runtime_exports_objective_terms_without_reference_distance(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			cfg = parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0))
+			runtime = GlobalMapRuntime(base=cfg.base)
+			h, w = 5, 5
+			model_xyz = _plane_xyz(h=h + 2, w=w + 2, z=0.0).unsqueeze(0)
+			ext_xyz = _plane_xyz(h=h, w=w, z=0.0, offset_h=0.25, offset_w=0.5)
+			model_valid = torch.ones(1, h + 2, w + 2, dtype=torch.bool)
+			ext_valid = torch.ones(h, w, dtype=torch.bool)
+			ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
+			model_normals = _normals_3d(1, h + 2, w + 2)
+			ext_normals = _normals_2d(h, w)
+
+			stats = runtime.run_stage(
+				stage=GlobalMapStageConfig(steps=0, lr=0.01, params=("affine",), args={"subdiv": 2}),
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad,
+			)
+
+			self.assertIn("snaps_map_dist", stats)
+			self.assertIn("snaps_map_vec", stats)
+			self.assertIn("snaps_map_norm", stats)
+			self.assertNotIn("snaps_map_avg", stats)
+			self.assertNotIn("snaps_map_max", stats)
 
 	def test_cli_default_device_is_auto(self) -> None:
 		parser = map_global_cli._build_parser()
