@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <vector>
 #include <fstream>
+#include <unordered_set>
 
 using Json = utils::Json;
 
@@ -620,6 +621,23 @@ bool VCCollection::appendFromJSON(const std::string& filename, uint8_t markerSha
             return false;
         }
 
+        std::unordered_set<uint64_t> loadedPointIds;
+        for (const auto& col : loadedCollections) {
+            for (const auto& point_pair : col.points) {
+                const uint64_t pointId = point_pair.first;
+                if (_points.count(pointId) != 0) {
+                    qWarning() << "Point collection load would duplicate existing point id:"
+                               << static_cast<qulonglong>(pointId);
+                    return false;
+                }
+                if (!loadedPointIds.insert(pointId).second) {
+                    qWarning() << "Point collection file contains duplicate point id:"
+                               << static_cast<qulonglong>(pointId);
+                    return false;
+                }
+            }
+        }
+
         std::vector<uint64_t> addedCollectionIds;
         addedCollectionIds.reserve(loadedCollections.size());
 
@@ -629,16 +647,18 @@ bool VCCollection::appendFromJSON(const std::string& filename, uint8_t markerSha
             col.name = unique_collection_name(_collections, col.name);
             col.marker_shape_index = markerShapeIndex;
 
-            std::unordered_map<uint64_t, ColPoint> remappedPoints;
-            remappedPoints.reserve(col.points.size());
+            std::unordered_map<uint64_t, ColPoint> preservedPoints;
+            preservedPoints.reserve(col.points.size());
             for (auto& point_pair : col.points) {
                 ColPoint point = point_pair.second;
-                point.id = getNextPointId();
                 point.collectionId = newCollectionId;
-                remappedPoints[point.id] = point;
+                preservedPoints[point.id] = point;
                 _points[point.id] = point;
+                if (point.id >= _next_point_id) {
+                    _next_point_id = point.id + 1;
+                }
             }
-            col.points = std::move(remappedPoints);
+            col.points = std::move(preservedPoints);
 
             _collections[col.id] = std::move(col);
             addedCollectionIds.push_back(newCollectionId);
@@ -858,5 +878,4 @@ uint64_t VCCollection::findOrCreateCollectionByName(const std::string& name)
     emit collectionsAdded({new_id});
     return new_id;
 }
-
 

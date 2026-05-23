@@ -33,17 +33,17 @@ scroll_zarr_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/2um_ds2_p
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 6000, 15500
+z_begin, z_end = 7000, 16000
 cross_patch_pcl_json_paths = [
-      '/home/sean/Desktop/s1_relative_windings.json',
+      '/home/sean/Desktop/s1_relative_windings_fixed.json',
   ]
 
 patches_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/traces/custom_patches'
+shell_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/s1_2um_outer'  # e.g. '/path/to/outer_shell_tifxyz'; kept separate from patches_path
 voxel_size_um = 2.4 * 4  # before downsampling
-seed_patch_id = 'auto_grown_20260429215626691_sel_20260512_102916_79'
 unattached_pcl_json_paths = [
-    '/home/sean/Desktop/same_winding_annotations_2.json',
-    '/home/sean/Desktop/s1_relative_windings.json'
+    '/home/sean/Desktop/same_winding_annotations_fixed.json',
+    '/home/sean/Desktop/s1_relative_windings_fixed.json'
 ]
 
 # # PHerc0172
@@ -67,16 +67,17 @@ default_config = {
     'learning_rate': 1.e-4,
     'exp_lr_schedule': True,
     'lr_final_factor': 0.05,
-    'num_training_steps': 15_000,
+    'num_training_steps': 12_500,
     'num_flow_integration_steps': 3,
     'flow_integration_solver': 'rk4',
     'num_flow_timesteps': 1,
     'flow_bounds_z_margin': 40,
     'flow_bounds_radius': 800,
     'flow_voxel_resolution': 4,
+    'flow_field_type': 'cartesian',  # 'cartesian' or 'cylindrical'
     'flow_field_high_res_lr_scale': 3.0e-1,
     'gap_expander_logit_resolution': 6,
-    'gap_expander_num_windings': 85,
+    'gap_expander_num_windings': 230,
     'gap_expander_lr_scale': 0.3,
     'linear_z_resolution': 12,
     'initial_dr_per_winding': 4.,
@@ -84,30 +85,43 @@ default_config = {
     'patch_loss_z_margin': 0,
     'patch_dt_norm_p': 0.5,
     'patch_dt_within_patch_norm_p': 3.0,
-    'num_patches_per_step': 256,
+    'num_patches_per_step': 192,
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
     'winding_number_num_pairs': 2000,
-    'winding_number_num_pcls': 3,
+    'winding_number_num_pcls': 8,
     'winding_number_adjacent_patches_only': True,
     'unattached_pcl_num_per_step': 48,
-    'unattached_pcl_num_points_per_step': 64,
+    'unattached_pcl_num_points_per_step': 48,
     'unattached_pcl_min_point_spacing': 4.,
     'normals_num_points': 2000,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
-    'loss_weight_winding_number': 20.,
+    'loss_weight_winding_number': 0.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_patch_stretch': 40.0,
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
+    'loss_weight_shell_outer': 4.0,
+    'loss_weight_shell_no_cross': 1.0,
+    'loss_weight_shell_z_drift': 1.0,
     'loss_start_patch_dt': 9000,
     'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
+    'shell_outer_winding_idx': 130,
+    'shell_outer_winding_margin': 10,
+    'shell_num_samples': 8192,
+    'shell_num_theta_bins': 720,
+    'shell_near_outer_num_windings': 3,
+    'shell_huber_delta': 4.0,
+    'shell_no_cross_margin': 2.0,
+    'shell_table_smooth_sigma_z': 1.0,
+    'shell_table_smooth_sigma_theta': 1.0,
+    'shell_min_confidence': 0.25,
 }
 
 
@@ -232,7 +246,173 @@ def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3., winding_range=
     return result.clip(0., 1.)
 
 
-class ExplicitFlowField(nn.Module):
+def _huber_abs(residual, delta):
+    abs_residual = residual.abs()
+    return torch.where(
+        abs_residual <= delta,
+        0.5 * residual ** 2 / delta,
+        abs_residual - 0.5 * delta,
+    )
+
+
+def _masked_mean(values, mask):
+    mask_f = mask.to(values.dtype)
+    return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
+
+
+class ShellPolarMap:
+
+    def __init__(self, shell_patch, z_to_umbilicus_yx, z_min, z_max, num_theta_bins, device):
+        self.z_min = int(z_min)
+        self.z_max = int(z_max)
+        self.num_theta_bins = int(num_theta_bins)
+        self.device = device
+
+        shell_zyxs = shell_patch.valid_zyxs.cpu().numpy().astype(np.float32, copy=False)
+        in_z = (shell_zyxs[:, 0] >= self.z_min) & (shell_zyxs[:, 0] <= self.z_max)
+        shell_zyxs = shell_zyxs[in_z]
+        if len(shell_zyxs) == 0:
+            raise RuntimeError(f'shell has no valid points in z range [{self.z_min}, {self.z_max}]')
+
+        centres_yx = z_to_umbilicus_yx(shell_zyxs[:, 0]).astype(np.float32)
+        rel_yx = shell_zyxs[:, 1:] - centres_yx
+        theta = np.mod(np.arctan2(rel_yx[:, 0], rel_yx[:, 1]), 2 * np.pi)
+        radius = np.linalg.norm(rel_yx, axis=-1)
+
+        num_z = self.z_max - self.z_min + 1
+        z_idx = np.rint(shell_zyxs[:, 0] - self.z_min).astype(np.int64).clip(0, num_z - 1)
+        theta_idx = np.floor(theta / (2 * np.pi) * self.num_theta_bins).astype(np.int64) % self.num_theta_bins
+
+        radius_sum = np.zeros([num_z, self.num_theta_bins], dtype=np.float64)
+        counts = np.zeros([num_z, self.num_theta_bins], dtype=np.float64)
+        np.add.at(radius_sum, (z_idx, theta_idx), radius)
+        np.add.at(counts, (z_idx, theta_idx), 1.0)
+        valid = counts > 0
+        if not valid.any():
+            raise RuntimeError('shell polar table has no occupied bins')
+
+        radius_mean = np.zeros_like(radius_sum, dtype=np.float32)
+        radius_mean[valid] = (radius_sum[valid] / counts[valid]).astype(np.float32)
+
+        valid_ext = np.concatenate([valid, valid, valid], axis=1)
+        radius_ext = np.concatenate([radius_mean, radius_mean, radius_mean], axis=1)
+        nearest_indices = scipy.ndimage.distance_transform_edt(~valid_ext, return_distances=False, return_indices=True)
+        filled_ext = radius_ext[nearest_indices[0], nearest_indices[1]]
+        filled = filled_ext[:, self.num_theta_bins:2 * self.num_theta_bins]
+
+        sigma = (cfg['shell_table_smooth_sigma_z'], cfg['shell_table_smooth_sigma_theta'])
+        if sigma[0] > 0 or sigma[1] > 0:
+            smooth_ext = np.concatenate([filled, filled, filled], axis=1)
+            smooth_ext = scipy.ndimage.gaussian_filter(smooth_ext, sigma=sigma, mode=('nearest', 'wrap'))
+            filled = smooth_ext[:, self.num_theta_bins:2 * self.num_theta_bins]
+
+        confidence = scipy.ndimage.gaussian_filter(valid.astype(np.float32), sigma=sigma, mode=('nearest', 'wrap'))
+        if confidence.max() > 0:
+            confidence = confidence / confidence.max()
+
+        radius_with_wrap = np.concatenate([filled, filled[:, :1]], axis=1).astype(np.float32)
+        confidence_with_wrap = np.concatenate([confidence, confidence[:, :1]], axis=1).astype(np.float32)
+
+        self.lookup_table = torch.from_numpy(
+            np.stack([radius_with_wrap, confidence_with_wrap], axis=0)
+        ).to(device=device)
+
+        z_coords = np.arange(self.z_min, self.z_max + 1, dtype=np.float32)
+        self.umbilicus_zyx = torch.from_numpy(
+            np.concatenate([z_coords[:, None], z_to_umbilicus_yx(z_coords).astype(np.float32)], axis=-1)
+        ).to(device=device)
+
+        occupied = int(valid.sum())
+        total = int(valid.size)
+        print(
+            f'shell polar table: {num_z} z bins x {self.num_theta_bins} theta bins, '
+            f'{occupied}/{total} occupied ({occupied / max(total, 1) * 100:.1f}%)'
+        )
+
+    def lookup(self, scan_zyx):
+        centre_yx = interp1d(scan_zyx[..., 0].contiguous(), self.umbilicus_zyx[:, :1], self.umbilicus_zyx[:, 1:])
+        rel_yx = scan_zyx[..., 1:] - centre_yx
+        theta, rel_yx = get_theta(rel_yx)
+        radius = torch.linalg.norm(rel_yx, dim=-1)
+
+        z_normalised = (scan_zyx[..., 0] - self.z_min) / (self.z_max - self.z_min) * 2 - 1
+        theta_normalised = theta / (2 * torch.pi) * 2 - 1
+        grid = torch.stack([theta_normalised, z_normalised], dim=-1).view(1, -1, 1, 2)
+        sampled = F.grid_sample(
+            self.lookup_table[None],
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        ).view(2, -1)
+        target_radius = sampled[0].view(scan_zyx.shape[:-1])
+        confidence = sampled[1].view(scan_zyx.shape[:-1])
+        in_z = (scan_zyx[..., 0] >= self.z_min) & (scan_zyx[..., 0] <= self.z_max)
+        valid = in_z & (confidence >= cfg['shell_min_confidence'])
+        return target_radius, radius, confidence, valid
+
+
+def _canonical_winding_samples(winding_indices, num_samples, dr_per_winding, device):
+    winding_indices_t = torch.as_tensor(winding_indices, device=device, dtype=torch.float32)
+    theta = torch.rand([len(winding_indices), num_samples], device=device) * (2 * torch.pi)
+    z = torch.empty([len(winding_indices), num_samples], device=device).uniform_(float(z_begin), float(z_end - 1))
+    radius = (winding_indices_t[:, None] + theta / (2 * torch.pi)) * dr_per_winding
+    return torch.stack([
+        z,
+        torch.sin(theta) * radius,
+        torch.cos(theta) * radius,
+    ], dim=-1)
+
+
+def get_shell_losses(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx):
+    device = dr_per_winding.device
+    zero = torch.zeros([], device=device)
+    if shell_map is None or outer_winding_idx is None:
+        return zero, zero, zero, {}
+
+    num_samples = max(1, int(cfg['shell_num_samples']))
+    huber_delta = torch.as_tensor(cfg['shell_huber_delta'], device=device, dtype=torch.float32)
+
+    outer_spiral = _canonical_winding_samples([outer_winding_idx], num_samples, dr_per_winding, device)[0]
+    near_count = max(1, int(cfg['shell_near_outer_num_windings']))
+    first_w = max(0, int(outer_winding_idx) - near_count + 1)
+    winding_indices = list(range(first_w, int(outer_winding_idx) + 1))
+    barrier_spiral = _canonical_winding_samples(winding_indices, max(1, num_samples // len(winding_indices)), dr_per_winding, device)
+
+    outer_count = outer_spiral.shape[0]
+    combined_scan = slice_to_spiral_transform.inv(torch.cat([
+        outer_spiral,
+        barrier_spiral.reshape(-1, 3),
+    ], dim=0))
+    outer_scan = combined_scan[:outer_count]
+    barrier_scan = combined_scan[outer_count:].reshape(*barrier_spiral.shape)
+    target_r, scan_r, confidence, valid = shell_map.lookup(outer_scan)
+    residual = scan_r - target_r
+    shell_outer_loss = _masked_mean(_huber_abs(residual, huber_delta), valid)
+    shell_z_drift_loss = _masked_mean(_huber_abs(outer_scan[..., 0] - outer_spiral[..., 0], huber_delta), valid)
+
+    barrier_target_r, barrier_scan_r, _, barrier_valid = shell_map.lookup(barrier_scan)
+    violation = F.relu(barrier_scan_r - barrier_target_r - cfg['shell_no_cross_margin'])
+    shell_no_cross_loss = _masked_mean(_huber_abs(violation, huber_delta), barrier_valid)
+
+    metrics = {}
+    with torch.no_grad():
+        if valid.any():
+            abs_residual = residual[valid].abs()
+            metrics = {
+                'shell_outer_error_mean': abs_residual.mean(),
+                'shell_outer_error_p95': torch.quantile(abs_residual, 0.95),
+                'shell_z_drift_mean': (outer_scan[..., 0] - outer_spiral[..., 0]).abs()[valid].mean(),
+                'shell_confidence_mean': confidence[valid].mean(),
+            }
+        if barrier_valid.any():
+            metrics['shell_no_cross_violation_p95'] = torch.quantile(violation[barrier_valid], 0.95)
+            metrics['shell_no_cross_violation_fraction'] = (violation[barrier_valid] > 0).to(torch.float32).mean()
+
+    return shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, metrics
+
+
+class CartesianFlowField(nn.Module):
 
     def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1):
         super().__init__()
@@ -245,24 +425,182 @@ class ExplicitFlowField(nn.Module):
             ]
         ])
 
-    def __call__(self, t):
+    def get_sampler(self, t):
+        # Returns a callable mapping normalised zyx points in [0, 1] to flow velocity at time t.
+        # Materialises the flow as a [3, Z, Y, X] cartesian tensor of zyx vector components once
+        # and reuses it across the (e.g. RK4) integrator's many sample calls.
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         hr_shape = tuple(hr_flow.shape[2:])
         if cfg['num_flow_timesteps'] == 1:
             # Time-invariant: HR flow is already at the target resolution, so skip interpolating it.
             lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')[0] * self.flow_scales[0]
-            return lr_upsampled + hr_flow[0] * self.flow_scales[1]
-        t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (cfg['num_flow_timesteps'] - 1)
-        t_idx_before = int(t_scaled)
-        flows_interpolated = [
-            F.interpolate(flow[t_idx_before : t_idx_before + 2], size=hr_shape, mode='trilinear') * flow_scale
-            for flow, flow_scale in zip(self.flows, self.flow_scales)
-        ]
-        flows_interpolated = [
-            torch.lerp(flow_interpolated[0], flow_interpolated[1], t_scaled % 1.)
-            for flow_interpolated in flows_interpolated
-        ]
-        return sum(flows_interpolated)
+            field = lr_upsampled + hr_flow[0] * self.flow_scales[1]
+        else:
+            t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (cfg['num_flow_timesteps'] - 1)
+            t_idx_before = int(t_scaled)
+            flows_interpolated = [
+                F.interpolate(flow[t_idx_before : t_idx_before + 2], size=hr_shape, mode='trilinear') * flow_scale
+                for flow, flow_scale in zip(self.flows, self.flow_scales)
+            ]
+            field = sum(
+                torch.lerp(flow_interpolated[0], flow_interpolated[1], t_scaled % 1.)
+                for flow_interpolated in flows_interpolated
+            )
+        return lambda y: sample_field(y, field)
+
+
+class CylindricalFlowField(nn.Module):
+
+    # Flow field with parameters on a cylindrical lattice (z, r, phi). The cylinder axis lies
+    # along z at the centre of the y, x box; the lattice spans z=[0,Z) and the inscribed disk in
+    # y, x (radius<=1 in normalised cartesian; corners outside the disk are clamped on r). Stored
+    # per-cell vectors are in the local (z, radial, tangential) basis: component 1 points outward
+    # radially, component 2 in the direction of increasing phi (right-hand rule about +z). The
+    # integrator samples the lattice directly at cartesian query points and rotates the (r, phi)
+    # components into (y, x) on the fly using the local basis at each query point.
+    #
+    # Rings have *varying* numbers of angular cells: ring r holds num_phi[r] = max(1, round(2*pi*r))
+    # cells (= circumference / lattice radial spacing), so inner rings are coarse and outer rings
+    # fine. All rings are packed end-to-end along the last (phi) axis of the parameter tensor,
+    # which is therefore "ragged"; sampling does explicit per-query gathers (one per surrounding
+    # corner of the (z, r, phi) trilinear stencil).
+    #
+    # Note: near r=0 the cylindrical basis is degenerate; ring 0 holds a single cell that is
+    # pinned to zero.
+
+    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1):
+        # resolution is interpreted as the equivalent cartesian (Z, Y, X) voxel shape; the
+        # cylindrical lattice sizes are derived from it.
+        super().__init__()
+        Z, Y, X = (int(s) for s in resolution)
+
+        nz_hr = Z
+        nr_hr = max(2, min(Y, X) // 2)
+        nz_lr = max(2, nz_hr // spatial_scale_factor)
+        nr_lr = max(2, nr_hr // spatial_scale_factor)
+
+        # The lr lattice has spatial_scale_factor-wider rings, so its ring r covers the same
+        # circumference as the hr ring r*spatial_scale_factor; the factors cancel in
+        # "cells per (sub-)ring unit", so the same 2*pi*r formula applies to both lattices.
+        def compute_num_phi(nr):
+            return torch.tensor(
+                [1 if r == 0 else max(1, int(round(2 * np.pi * r))) for r in range(nr)],
+                dtype=torch.long,
+            )
+
+        lr_num_phi = compute_num_phi(nr_lr)
+        hr_num_phi = compute_num_phi(nr_hr)
+        lr_offsets = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(lr_num_phi, dim=0)])
+        hr_offsets = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(hr_num_phi, dim=0)])
+        self.register_buffer('_lr_num_phi', lr_num_phi)
+        self.register_buffer('_hr_num_phi', hr_num_phi)
+        self.register_buffer('_lr_offsets', lr_offsets)
+        self.register_buffer('_hr_offsets', hr_offsets)
+
+        self.flow_scales = [1., lr_scale_factor]
+        self.flows = nn.ParameterList([
+            nn.Parameter(torch.zeros([cfg['num_flow_timesteps'], 3, nz_lr, int(lr_offsets[-1])])),
+            nn.Parameter(torch.zeros([cfg['num_flow_timesteps'], 3, nz_hr, int(hr_offsets[-1])])),
+        ])
+
+    @staticmethod
+    def _sample_lattice(field, ring_num_phi, ring_offsets, normalised_zyx):
+        # field :: 3, nz, total_phi -- rings packed end-to-end along the last axis
+        # ring_num_phi :: nr (long) -- per-ring phi cell counts
+        # ring_offsets :: nr+1 (long) -- cumulative ring start offsets in the flat phi axis
+        # normalised_zyx :: *, 3 in [0, 1] (cartesian box-relative)
+        # Returns: *, 3 with components in cartesian (z, y, x).
+        nz = field.shape[1]
+        nr = ring_num_phi.shape[0]
+        orig_shape = normalised_zyx.shape
+        pts = normalised_zyx.reshape(-1, 3) * 2. - 1.  # n, 3 in [-1, 1] cartesian
+        z_n, y_n, x_n = pts[:, 0], pts[:, 1], pts[:, 2]
+        # The cylindrical basis is singular exactly on the axis: sqrt(0) and atan2(0, 0)
+        # have finite forward values but undefined gradients. Use a fixed +x basis there.
+        axis_eps = torch.finfo(pts.dtype).eps
+        on_axis = (y_n.abs() <= axis_eps) & (x_n.abs() <= axis_eps)
+        safe_y_n = torch.where(on_axis, torch.zeros_like(y_n), y_n)
+        safe_x_n = torch.where(on_axis, torch.ones_like(x_n), x_n)
+        rr = torch.sqrt(safe_y_n ** 2 + safe_x_n ** 2).clamp(max=1.)  # inscribed-disk clamp
+        rr = torch.where(on_axis, torch.zeros_like(rr), rr)
+        phi = torch.atan2(safe_y_n, safe_x_n)  # in (-pi, pi]
+
+        # Map to continuous lattice indices, align_corners=True style.
+        z_cont = ((z_n + 1.) * 0.5 * (nz - 1)).clamp(0., float(nz - 1))
+        r_cont = rr * (nr - 1)
+        phi_in_2pi = phi % (2. * np.pi)  # in [0, 2pi)
+
+        z_lo = torch.floor(z_cont).clamp(max=nz - 2).long()
+        z_hi = z_lo + 1
+        frac_z = (z_cont - z_lo.to(z_cont.dtype)).unsqueeze(0)  # 1, n
+
+        r_lo = torch.floor(r_cont).clamp(max=nr - 2).long()
+        r_hi = r_lo + 1
+        frac_r = (r_cont - r_lo.to(r_cont.dtype)).unsqueeze(0)  # 1, n
+
+        def sample_at_ring(r_idx):
+            # r_idx :: n (long). Returns 3, n -- bilinear in (z, phi) at this integer ring.
+            num_phi_r = ring_num_phi[r_idx]
+            offset_r = ring_offsets[r_idx]
+            phi_cont = phi_in_2pi * (num_phi_r.to(phi_in_2pi.dtype) / (2. * np.pi))
+            phi_lo_floor = torch.floor(phi_cont)
+            phi_lo = phi_lo_floor.long() % num_phi_r
+            phi_hi = (phi_lo + 1) % num_phi_r  # cyclic wrap
+            frac_phi = (phi_cont - phi_lo_floor).unsqueeze(0)
+            flat_lo = offset_r + phi_lo
+            flat_hi = offset_r + phi_hi
+            v00 = field[:, z_lo, flat_lo]
+            v01 = field[:, z_lo, flat_hi]
+            v10 = field[:, z_hi, flat_lo]
+            v11 = field[:, z_hi, flat_hi]
+            v0 = v00 + (v01 - v00) * frac_phi
+            v1 = v10 + (v11 - v10) * frac_phi
+            return v0 + (v1 - v0) * frac_z
+
+        v_rlo = sample_at_ring(r_lo)
+        v_rhi = sample_at_ring(r_hi)
+        sampled = v_rlo + (v_rhi - v_rlo) * frac_r  # 3, n in (z, r, phi) local components
+
+        z_c, r_c, p_c = sampled[0], sampled[1], sampled[2]
+        # phi = atan2(y, x), so outward-radial in (y, x) is (sin(phi), cos(phi)) and tangential
+        # (d/dphi unit) is (cos(phi), -sin(phi)). Rotate local (r, phi) components into (y, x).
+        sin_phi, cos_phi = torch.sin(phi), torch.cos(phi)
+        y_c = r_c * sin_phi + p_c * cos_phi
+        x_c = r_c * cos_phi - p_c * sin_phi
+        return torch.stack([z_c, y_c, x_c], dim=-1).view(*orig_shape)
+
+    def get_sampler(self, t):
+        # Returns a callable mapping normalised zyx points in [0, 1] to flow velocity at time t,
+        # by sampling the cylindrical lattice directly at each query point. The closure captures
+        # the time-interpolated, scale-applied, axis-pinned LR & HR lattices so those one-time
+        # costs amortise across the integrator's sample calls.
+        if cfg['num_flow_timesteps'] == 1:
+            lr_field = self.flows[0][0]
+            hr_field = self.flows[1][0]
+        else:
+            t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (cfg['num_flow_timesteps'] - 1)
+            t_idx_before = int(t_scaled)
+            frac = t_scaled % 1.
+            lr_field = torch.lerp(self.flows[0][t_idx_before], self.flows[0][t_idx_before + 1], frac)
+            hr_field = torch.lerp(self.flows[1][t_idx_before], self.flows[1][t_idx_before + 1], frac)
+        # Pin the r=0 ring (axis singularity) to zero by replacing its flat-phi slice with a
+        # constant zero, so no gradient flows to those parameters; they stay zero indefinitely.
+        n0_lr = int(self._lr_num_phi[0])
+        n0_hr = int(self._hr_num_phi[0])
+        lr_field = torch.cat([torch.zeros_like(lr_field[:, :, :n0_lr]), lr_field[:, :, n0_lr:]], dim=2) * self.flow_scales[0]
+        hr_field = torch.cat([torch.zeros_like(hr_field[:, :, :n0_hr]), hr_field[:, :, n0_hr:]], dim=2) * self.flow_scales[1]
+
+        sample_lattice = self._sample_lattice
+        lr_num_phi = self._lr_num_phi
+        lr_offsets = self._lr_offsets
+        hr_num_phi = self._hr_num_phi
+        hr_offsets = self._hr_offsets
+        def sample(normalised_zyx):
+            return (
+                sample_lattice(lr_field, lr_num_phi, lr_offsets, normalised_zyx)
+                + sample_lattice(hr_field, hr_num_phi, hr_offsets, normalised_zyx)
+            )
+        return sample
 
 
 def sample_field(normalised_zyx, field_for_grid_sample):
@@ -294,15 +632,15 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
-        # Cached upsampled flow at t=0 for the num_flow_timesteps==1 fast path. Built once
+        # Cached sampler closure at t=0 for the num_flow_timesteps==1 fast path. Built once
         # per diffeomorphism instance (one per training iteration), shared across forward and
-        # inverse calls so the per-iteration trilinear LR->HR upsampling is amortised.
-        self._cached_flow = None
+        # inverse calls so per-iteration setup (e.g. trilinear LR->HR upsampling) is amortised.
+        self._cached_sampler = None
 
     def _velocity(self, t_int, current_zyx_scaled):
         # t_int is a scalar in [0, 1]; flow_field expects t in [-1, 1]
         t_flow = t_int * 2 - 1
-        return sample_field(current_zyx_scaled, self.flow_field(t_flow))
+        return self.flow_field.get_sampler(t_flow)(current_zyx_scaled)
 
     def _call(self, input_zyx, inverse=False):
 
@@ -313,17 +651,17 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         t_span = n_steps / self.num_steps
         h = (-t_span if inverse else t_span) / n_steps
         if cfg['num_flow_timesteps'] == 1:
-            # Time-invariant flow: precompute the upsampled flow once and inline a manual rk4 loop
-            # to skip torchdiffeq's per-step dispatch overhead.
+            # Time-invariant flow: build the sampler once and inline a manual rk4 loop to skip
+            # torchdiffeq's per-step dispatch overhead.
             assert self.solver == 'rk4'
-            if self._cached_flow is None:
-                self._cached_flow = self.flow_field(0.0)
-            cached_flow = self._cached_flow
+            if self._cached_sampler is None:
+                self._cached_sampler = self.flow_field.get_sampler(0.0)
+            sampler = self._cached_sampler
             for _ in range(n_steps):
-                k1 = sample_field(y, cached_flow)
-                k2 = sample_field(y + (h / 2) * k1, cached_flow)
-                k3 = sample_field(y + (h / 2) * k2, cached_flow)
-                k4 = sample_field(y + h * k3, cached_flow)
+                k1 = sampler(y)
+                k2 = sampler(y + (h / 2) * k1)
+                k3 = sampler(y + (h / 2) * k2)
+                k4 = sampler(y + h * k3)
                 y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
         else:
             t0 = 1. if inverse else 0.
@@ -498,7 +836,8 @@ class SpiralAndTransform(nn.Module):
         self.dr_per_winding_logit = nn.Parameter(torch.tensor(cfg['initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // cfg['flow_voxel_resolution']
-        self.flow_field = ExplicitFlowField(flow_resolution, lr_scale_factor=cfg['flow_field_high_res_lr_scale'])
+        flow_field_cls = {'cartesian': CartesianFlowField, 'cylindrical': CylindricalFlowField}[cfg['flow_field_type']]
+        self.flow_field = flow_field_cls(flow_resolution, lr_scale_factor=cfg['flow_field_high_res_lr_scale'])
 
         self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // cfg['linear_z_resolution'], 2, 2], dtype=torch.float32))
 
@@ -547,6 +886,7 @@ def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | Non
     run_ends = np.where(diff == -1)[0] - 1
     run_idx = np.searchsorted(run_starts, idx, side='right') - 1
     return run_starts[run_idx], run_ends[run_idx] + 1
+
 
 def _build_line_runs(line_valid):
     # Returns (los, his) arrays of contiguous True runs in a 1-D bool array.
@@ -650,58 +990,37 @@ class PatchGpuAtlas:
 
     def __init__(self, patches_by_id, device='cuda'):
         flat_pieces = []
-        valid_quad_pieces = []
         offsets = [0]
-        quad_offsets = [0]
         widths = []
         heights = []
         for p in patches_by_id.values():
             z = p.zyxs  # (H, W, 3) on CPU
             H, W = z.shape[:2]
             flat_pieces.append(z.reshape(-1, 3).to(device=device, dtype=torch.float32))
-            valid_quad_pieces.append(p.valid_quad_mask.reshape(-1).to(device=device, dtype=torch.bool))
             offsets.append(offsets[-1] + H * W)
-            quad_offsets.append(quad_offsets[-1] + max(H - 1, 0) * max(W - 1, 0))
             widths.append(W)
             heights.append(H)
         self.zyxs_flat = torch.cat(flat_pieces, dim=0)
-        self.valid_quads_flat = torch.cat(valid_quad_pieces, dim=0)
         self.offsets = torch.tensor(offsets, device=device, dtype=torch.int64)  # (N+1,)
-        self.quad_offsets = torch.tensor(quad_offsets, device=device, dtype=torch.int64)  # (N+1,)
         self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
         self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
-        self.quad_widths = torch.clamp(self.widths - 1, min=0)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
 
     def memory_mb(self):
-        return (self.zyxs_flat.numel() * 4 + self.valid_quads_flat.numel()) / 1e6
+        return self.zyxs_flat.numel() * 4 / 1e6
 
     def lookup(self, patch_idx_per_sample, ijs):
         # patch_idx_per_sample: (...,) int64 on GPU
         # ijs: (..., 2) float on GPU
-        # returns (..., 3) on GPU. Matches Patch.ij_to_zyx: invalid or out-of-bounds
-        # samples are filled with -1 instead of indexing past the flat atlas tensor.
-        patch_idx_ok = (patch_idx_per_sample >= 0) & (patch_idx_per_sample < self.widths.shape[0])
-        if not patch_idx_ok.all():
-            bad_idx = (~patch_idx_ok).nonzero()[0]
-            bad_patch = int(patch_idx_per_sample[tuple(bad_idx)].item())
-            raise IndexError(f'PatchGpuAtlas.lookup got patch index {bad_patch}, expected [0, {self.widths.shape[0]})')
-
+        # returns (..., 3) on GPU. Caller must ensure floor(ij) lies on a valid quad.
         base = self.offsets[patch_idx_per_sample]
         W = self.widths[patch_idx_per_sample]
-        H = self.heights[patch_idx_per_sample]
-        quad_base = self.quad_offsets[patch_idx_per_sample]
-        quad_W = self.quad_widths[patch_idx_per_sample]
         ij = ijs.to(torch.float32)
         i0 = ij[..., 0].floor().to(torch.int64)
         j0 = ij[..., 1].floor().to(torch.int64)
-        in_bounds = (i0 >= 0) & (j0 >= 0) & (i0 < H - 1) & (j0 < W - 1)
-        safe_i0 = torch.minimum(i0.clamp(min=0), (H - 2).clamp(min=0))
-        safe_j0 = torch.minimum(j0.clamp(min=0), (W - 2).clamp(min=0))
-        valid_quad = self.valid_quads_flat[quad_base + safe_i0 * quad_W + safe_j0] & in_bounds
-        di = (ij[..., 0] - safe_i0.to(torch.float32)).unsqueeze(-1)
-        dj = (ij[..., 1] - safe_j0.to(torch.float32)).unsqueeze(-1)
-        flat_tl = base + safe_i0 * W + safe_j0
+        di = (ij[..., 0] - i0.to(torch.float32)).unsqueeze(-1)
+        dj = (ij[..., 1] - j0.to(torch.float32)).unsqueeze(-1)
+        flat_tl = base + i0 * W + j0
         flat_tr = flat_tl + 1
         flat_bl = flat_tl + W
         flat_br = flat_bl + 1
@@ -712,8 +1031,7 @@ class PatchGpuAtlas:
         br = z[flat_br]
         top = tl + (tr - tl) * dj
         bottom = bl + (br - bl) * dj
-        interp = top + (bottom - top) * di
-        return torch.where(valid_quad.unsqueeze(-1), interp, torch.full_like(interp, -1.0))
+        return top + (bottom - top) * di
 
 
 def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, umbilicus_zyx=None):
@@ -777,8 +1095,9 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
         vertical_ijs_by_patch[n, :, 1] = col_idx + fixed_jitters_v[n]
         vertical_ijs_by_patch[n, :, 0] = lo_v + coords_v + var_jitters_v[n]
 
-    # Batched bilinear interp on GPU. The sampler draws from valid quads, and
-    # PatchGpuAtlas.lookup still preserves Patch.ij_to_zyx's invalid-sample handling.
+    # Batched bilinear interp on GPU: ijs are guaranteed to fall on valid quads by the
+    # _sample_strip_ijs sampler (it draws i0/j0 from `_sampling_valid_quad_*`), so we
+    # skip the per-call validity check used by patch.ij_to_zyx.
     combined_ijs_np = np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0)  # (2, N, P, 2)
     combined_ijs_gpu = torch.from_numpy(combined_ijs_np).cuda(non_blocking=True)
     patch_indices_gpu = torch.from_numpy(np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
@@ -979,33 +1298,6 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
-def _masked_pairwise_abs_mean(p1_r, p2_r, m1, m2, expected_diff):
-    # Computes mean(abs(p2 - p1 - expected_diff)) over the same masked Cartesian
-    # product as the explicit pairwise matrix, but without materialising BxNxN.
-    x_sorted = torch.sort(torch.where(m1, p1_r, torch.full_like(p1_r, float('inf'))), dim=-1).values
-    x_sorted_for_sum = torch.where(torch.isfinite(x_sorted), x_sorted, torch.zeros_like(x_sorted))
-    x_prefix = F.pad(torch.cumsum(x_sorted_for_sum, dim=-1), (1, 0))
-    n_x = m1.sum(dim=-1)
-    sum_x = x_sorted_for_sum.sum(dim=-1)
-
-    y = p2_r - expected_diff[:, None]
-    k = torch.searchsorted(x_sorted, y, right=True)
-    prefix_at_k = torch.gather(x_prefix, dim=-1, index=k)
-
-    k_float = k.to(y.dtype)
-    n_x_float = n_x.to(y.dtype)[:, None]
-    sum_abs = (
-        y * k_float
-        - prefix_at_k
-        + (sum_x[:, None] - prefix_at_k)
-        - y * (n_x_float - k_float)
-    )
-    sum_abs = torch.where(m2, sum_abs, torch.zeros_like(sum_abs))
-
-    denom = (n_x * m2.sum(dim=-1)).sum().clamp(min=1)
-    return sum_abs.sum() / denom
-
-
 def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
@@ -1120,8 +1412,12 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
         device='cuda',
         dtype=torch.float32,
     )
-    expected_diff = winding_diffs * dr_per_winding
-    return _masked_pairwise_abs_mean(p1_r, p2_r, m1, m2, expected_diff)
+    expected_diff = (winding_diffs * dr_per_winding)[:, None, None]
+
+    diff = p2_r[:, :, None] - p1_r[:, None, :]
+    pair_mask = m2[:, :, None] & m1[:, None, :]
+    err = (diff - expected_diff).abs()
+    return (err * pair_mask).sum() / pair_mask.sum().clamp(min=1)
 
 
 class _UnattachedPclStripList(list):
@@ -1184,6 +1480,7 @@ def _build_unattached_pcl_flat_bundle(strips, device):
         'windings': torch.from_numpy(windings_flat).to(device=device),
         'strip_id': torch.from_numpy(strip_id_np).to(device=device),
         'starts': torch.from_numpy(starts_np).to(device=device),
+        'starts_cpu': torch.from_numpy(starts_np),
         'lengths': torch.from_numpy(lengths_np).to(device=device),
         'lengths_cpu': torch.from_numpy(lengths_np),
         'num_strips': len(strips),
@@ -1227,17 +1524,20 @@ def get_unattached_pcl_strip_losses(
     num_to_sample = min(num_pcls_per_step, len(pcl_strips))
     chosen = np.random.choice(len(pcl_strips), num_to_sample, replace=False)
 
-    sampled_zyxs = np.empty([num_to_sample, num_points_per_pcl, 3], dtype=np.float32)
-    sampled_winding = np.empty([num_to_sample, num_points_per_pcl], dtype=np.float32)
+    flat = _get_or_build_unattached_pcl_flat(pcl_strips, device)
+    if flat is None or flat['total'] == 0:
+        return zero, zero
+    starts_cpu = flat['starts_cpu'].numpy()
+    sampled_flat_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
     for k, pcl_idx in enumerate(chosen):
         strip = pcl_strips[pcl_idx]
         N = len(strip['zyxs'])
         coords = np.sort(np.random.choice(N, num_points_per_pcl, replace=num_points_per_pcl > N))
-        sampled_zyxs[k] = strip['zyxs'][coords]
-        sampled_winding[k] = strip['windings'][coords]
+        sampled_flat_indices[k] = starts_cpu[pcl_idx] + coords
 
-    zyxs_t = torch.from_numpy(sampled_zyxs).to(device=device)
-    winding_t = torch.from_numpy(sampled_winding).to(device=device)
+    sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
+    zyxs_t = flat['zyxs'][sampled_flat_indices_t]
+    winding_t = flat['windings'][sampled_flat_indices_t]
 
     spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
@@ -1275,6 +1575,34 @@ def get_unattached_pcl_strip_losses(
     return radius_loss, dt_loss
 
 
+def _get_patch_regularisation_cache(patch, device):
+    cache = getattr(patch, '_regularisation_cache', None)
+    if cache is not None and cache['scroll_zyx'].device.type == device.type:
+        return cache
+
+    valid_indices = patch.valid_quad_indices
+    i_coords = valid_indices[:, 0]
+    j_coords = valid_indices[:, 1]
+
+    H, W = patch.valid_vertex_mask.shape
+    in_bounds_i = i_coords + 1 < H
+    in_bounds_j = j_coords + 1 < W
+    safe_i_next = (i_coords + 1).clamp(max=H - 1)
+    safe_j_next = (j_coords + 1).clamp(max=W - 1)
+    neighbor_i_valid = patch.valid_vertex_mask[safe_i_next, j_coords] & in_bounds_i
+    neighbor_j_valid = patch.valid_vertex_mask[i_coords, safe_j_next] & in_bounds_j
+
+    cache = {
+        'num_valid': len(valid_indices),
+        'mask': (neighbor_i_valid & neighbor_j_valid).to(device=device, dtype=torch.float32),
+        'scroll_zyx': patch.zyxs[i_coords, j_coords].to(device=device),
+        'scroll_neighbor_i': patch.zyxs[safe_i_next, j_coords].to(device=device),
+        'scroll_neighbor_j': patch.zyxs[i_coords, safe_j_next].to(device=device),
+    }
+    patch._regularisation_cache = cache
+    return cache
+
+
 def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, patches, patch_sampling_probabilities, epsilon=1.0):
     # Sample patch points and enforce, at each point, two local rigidity properties of the scroll->spiral transform:
     #   (stretch) epsilon-steps along the discrete patch tangents (+i and +j neighbors in patch coordinates) preserve
@@ -1286,24 +1614,15 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
     # The normal's sign relative to outward is ambiguous; |cosine| absorbs that.
     patch_idx = int(np.random.choice(len(patches), p=patch_sampling_probabilities))
     patch = patches[patch_idx]
-    valid_indices = patch.valid_quad_indices
-    sampled = np.random.randint(len(valid_indices), size=num_points)
-    i_coords = valid_indices[sampled, 0]
-    j_coords = valid_indices[sampled, 1]
+    device = torch.device('cuda')
+    cache = _get_patch_regularisation_cache(patch, device)
+    sampled = np.random.randint(cache['num_valid'], size=num_points)
+    sampled_t = torch.from_numpy(sampled).to(device=cache['scroll_zyx'].device, dtype=torch.long)
 
-    H, W = patch.valid_vertex_mask.shape
-    in_bounds_i = i_coords + 1 < H
-    in_bounds_j = j_coords + 1 < W
-    safe_i_next = (i_coords + 1).clamp(max=H - 1)
-    safe_j_next = (j_coords + 1).clamp(max=W - 1)
-    neighbor_i_valid = patch.valid_vertex_mask[safe_i_next, j_coords] & in_bounds_i
-    neighbor_j_valid = patch.valid_vertex_mask[i_coords, safe_j_next] & in_bounds_j
-    # Require both neighbors so the cross-product normal is well-defined.
-    mask = (neighbor_i_valid & neighbor_j_valid).float().cuda()
-
-    scroll_zyx = patch.zyxs[i_coords, j_coords].cuda()
-    scroll_neighbor_i = patch.zyxs[safe_i_next, j_coords].cuda()
-    scroll_neighbor_j = patch.zyxs[i_coords, safe_j_next].cuda()
+    mask = cache['mask'][sampled_t]
+    scroll_zyx = cache['scroll_zyx'][sampled_t]
+    scroll_neighbor_i = cache['scroll_neighbor_i'][sampled_t]
+    scroll_neighbor_j = cache['scroll_neighbor_j'][sampled_t]
     delta_i = scroll_neighbor_i - scroll_zyx
     delta_j = scroll_neighbor_j - scroll_zyx
     tangent_i = F.normalize(delta_i, dim=-1)
@@ -1741,13 +2060,16 @@ def get_face_indices(h, w):
 
 
 @torch.inference_mode
-def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips=()):
-    """Returns (min_winding_idx, max_winding_idx) — inclusive min and exclusive max
-    integer winding indices covered by the given patches' in-ROI valid quad centers
-    and by in-ROI unattached pcl points. Winding indices are computed by transforming
-    points to spiral space and rounding shifted_radius/dr_per_winding to the nearest
-    integer (matching the convention in overlay_patches_on_slices). The min is
-    clamped to cfg['output_first_winding']; the max has no upper cap."""
+def _compute_winding_range_and_input_extents(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips=()):
+    """Transforms each patch's valid in-ROI quad centers and each unattached pcl strip's
+    in-ROI points into spiral space, and computes:
+      - output_winding_range = (min_winding_idx, max_winding_idx) — inclusive min and
+        exclusive max winding indices, using `(shifted_radius / dr).round().clamp_min(0)`
+        (the convention in overlay_patches_on_slices); min clamped to
+        cfg['output_first_winding'], cfg['output_winding_margin'] applied on both sides.
+      - patch_extents: list parallel to `patches` of (max_radius, max_winding) per input,
+        or (None, None) when no valid in-ROI samples.
+      - pcl_extents: list parallel to `unattached_pcl_strips`, same shape."""
     device = dr_per_winding.device
     dr = dr_per_winding.detach()
     min_w = None
@@ -1768,7 +2090,8 @@ def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches
             spiral_pieces.append(slice_to_spiral_transform(zyxs[start:start + chunk]))
         return torch.cat(spiral_pieces, dim=0) if len(spiral_pieces) > 1 else spiral_pieces[0]
 
-    for patch in patches:
+    patch_extents = [(None, None)] * len(patches)
+    for patch_index, patch in enumerate(patches):
         patch_zyxs = patch.zyxs.to(device=device, dtype=torch.float32)
         if patch_zyxs.shape[0] < 2 or patch_zyxs.shape[1] < 2:
             continue
@@ -1790,24 +2113,113 @@ def _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches
         if not mask.any():
             continue
         spiral_zyxs = transform_in_chunks(quad_center_zyxs[mask])
-        _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-        update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+        _, radius, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+        winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
+        update_from_winding_indices(winding_indices)
+        patch_extents[patch_index] = (
+            float(radius.max().item()),
+            int(winding_indices.max().item()),
+        )
 
+    pcl_extents = [(None, None)] * len(unattached_pcl_strips)
     if unattached_pcl_strips:
         flat = _get_or_build_unattached_pcl_flat(unattached_pcl_strips, device)
         if flat is not None and flat['total'] > 0:
             zyxs = flat['zyxs']
+            strip_id = flat['strip_id']
+            num_strips = flat['num_strips']
             in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
             if in_roi.any():
-                spiral_zyxs = transform_in_chunks(zyxs[in_roi])
-                _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-                update_from_winding_indices((shifted_radius / dr).round().to(torch.int64).clamp_min(0))
+                zyxs_roi = zyxs[in_roi]
+                strip_id_roi = strip_id[in_roi]
+                spiral_zyxs = transform_in_chunks(zyxs_roi)
+                _, radius, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+                winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
+                update_from_winding_indices(winding_indices)
+                per_strip_max_r = torch.zeros(num_strips, dtype=torch.float32, device=device)
+                per_strip_max_w = torch.full((num_strips,), -1, dtype=torch.int64, device=device)
+                strip_has_roi = torch.zeros(num_strips, dtype=torch.bool, device=device)
+                per_strip_max_r.scatter_reduce_(0, strip_id_roi, radius.to(torch.float32), reduce='amax')
+                per_strip_max_w.scatter_reduce_(0, strip_id_roi, winding_indices, reduce='amax')
+                strip_has_roi.scatter_(0, strip_id_roi, torch.ones_like(strip_id_roi, dtype=torch.bool))
+                per_strip_max_r_cpu = per_strip_max_r.cpu().tolist()
+                per_strip_max_w_cpu = per_strip_max_w.cpu().tolist()
+                strip_has_roi_cpu = strip_has_roi.cpu().tolist()
+                for k in range(num_strips):
+                    if strip_has_roi_cpu[k]:
+                        pcl_extents[k] = (per_strip_max_r_cpu[k], per_strip_max_w_cpu[k])
 
     first_winding = cfg['output_first_winding']
     if min_w is None:
-        return first_winding, first_winding
-    margin = cfg['output_winding_margin']
-    return max(min_w - margin, first_winding), max_w + 1 + margin
+        output_winding_range = (first_winding, first_winding)
+    else:
+        margin = cfg['output_winding_margin']
+        output_winding_range = (max(min_w - margin, first_winding), max_w + 1 + margin)
+    return output_winding_range, patch_extents, pcl_extents
+
+
+def _infer_shell_outer_winding_idx(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips):
+    _, patch_extents, pcl_extents = _compute_winding_range_and_input_extents(
+        slice_to_spiral_transform,
+        dr_per_winding,
+        patches,
+        unattached_pcl_strips,
+    )
+    observed_max = None
+    for _, max_w in itertools.chain(patch_extents, pcl_extents):
+        if max_w is None:
+            continue
+        observed_max = max_w if observed_max is None else max(observed_max, max_w)
+    if observed_max is None:
+        observed_max = cfg['output_first_winding']
+    return int(observed_max + cfg['shell_outer_winding_margin'])
+
+
+def _warn_if_inputs_exceed_flow_bounds(patch_ids, patch_extents, unattached_pcl_strips, pcl_extents, flow_field_radius):
+    gap_expander_num_windings = cfg['gap_expander_num_windings']
+
+    over_radius_patches = []
+    over_winding_patches = []
+    for pid, (max_r, max_w) in zip(patch_ids, patch_extents):
+        if max_r is None:
+            continue
+        if max_r > flow_field_radius:
+            over_radius_patches.append((pid, max_r))
+        if max_w >= gap_expander_num_windings:
+            over_winding_patches.append((pid, max_w))
+
+    over_radius_pcls = []
+    over_winding_pcls = []
+    for k, (strip, (max_r, max_w)) in enumerate(zip(unattached_pcl_strips, pcl_extents)):
+        if max_r is None:
+            continue
+        name = strip.get('name') or strip.get('id') or strip.get('source_file') or f'#{k}'
+        if max_r > flow_field_radius:
+            over_radius_pcls.append((name, max_r))
+        if max_w >= gap_expander_num_windings:
+            over_winding_pcls.append((name, max_w))
+
+    def _print_offenders(kind, value_label, threshold_label, patches, pcls, fmt):
+        if not (patches or pcls):
+            return
+        print(f'WARNING: {len(patches)} patch(es) and {len(pcls)} unattached pcl(s) have {value_label} exceeding {threshold_label}:')
+        for pid, v in sorted(patches, key=lambda e: -e[1])[:10]:
+            print(f'  patch {pid}: max {kind} {fmt(v)}')
+        if len(patches) > 10:
+            print(f'  ... and {len(patches) - 10} more patches')
+        for name, v in sorted(pcls, key=lambda e: -e[1])[:10]:
+            print(f'  pcl {name}: max {kind} {fmt(v)}')
+        if len(pcls) > 10:
+            print(f'  ... and {len(pcls) - 10} more pcls')
+
+    _print_offenders(
+        'spiral radius', 'spiral-space radius', f'flow_bounds_radius ({flow_field_radius})',
+        over_radius_patches, over_radius_pcls, lambda v: f'{v:.1f}',
+    )
+    _print_offenders(
+        'winding idx', 'winding index', f'gap_expander_num_windings ({gap_expander_num_windings})',
+        over_winding_patches, over_winding_pcls, lambda v: f'{v}',
+    )
 
 
 def _rasterize_triangles_into_mesh(
@@ -2006,7 +2418,7 @@ def _build_snapped_overlay(
 @torch.inference_mode
 def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips, out_path, name='mesh'):
 
-    min_winding_idx, max_winding_idx = _get_output_winding_range(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips)
+    (min_winding_idx, max_winding_idx), _, _ = _compute_winding_range_and_input_extents(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips)
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size'] // downsample_factor  # voxels in downsampled volume
     z_margin = cfg['flow_bounds_z_margin']
@@ -2295,7 +2707,7 @@ def save_overlay(
         visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, shell_patch, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
@@ -2306,26 +2718,28 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
     print(f'patch GPU atlas: {patch_atlas.memory_mb():.1f} MB')
 
     overlay_enabled = os.environ.get('FIT_SPIRAL_SKIP_FITTED_OVERLAY') != '1'
-    num_slices_for_visualisation = 20
+    mesh_enabled = os.environ.get('FIT_SPIRAL_SKIP_MESH') != '1'
 
     device = torch.device('cuda')
 
-    all_zs = np.arange(z_begin, z_end)
+    all_zs_np = np.arange(z_begin, z_end)
+    umbilicus_zyx = torch.from_numpy(np.concatenate([all_zs_np[:, None], z_to_umbilicus_yx(all_zs_np)], axis=-1).astype(np.float32)).to(device)
+
     if overlay_enabled:
+        num_slices_for_visualisation = 20
+        rendering_slices_downsample_factor = 2  # stride the scroll by this along zyx for rendering
         zs_for_visualisation = np.linspace(z_begin, z_end - 1, min(num_slices_for_visualisation, z_end - 1 - z_begin), dtype=np.int64)
+        all_zs = torch.from_numpy(all_zs_np).to(device)
 
-    umbilicus_zyx = torch.from_numpy(np.concatenate([all_zs[:, None], z_to_umbilicus_yx(all_zs)], axis=-1).astype(np.float32)).to(device)
-
-    all_zs = torch.from_numpy(all_zs).to(device)
-
-    if overlay_enabled:
         if scroll_zarr is not None:
             subvolume_shape = tuple([z_end - z_begin, *scroll_zarr.shape[1:]])
             print('loading slices for visualisation')
             scroll_slices_for_visualisation = (torch.from_numpy(scroll_zarr[zs_for_visualisation]).to(torch.float32) / np.iinfo(scroll_zarr.dtype).max * 0.75 * 255).to(torch.uint8)
+            scroll_slices_for_rendering = (torch.from_numpy(scroll_zarr[z_begin : z_end : rendering_slices_downsample_factor, ::rendering_slices_downsample_factor, ::rendering_slices_downsample_factor]).to(torch.int32) // (np.iinfo(scroll_zarr.dtype).max // 255)).to(torch.uint8)
         else:
             subvolume_shape = [z_end - z_begin, 32693 // 4 // downsample_factor, 32693 // 4 // downsample_factor]
             scroll_slices_for_visualisation = torch.zeros([len(zs_for_visualisation), *subvolume_shape[1:]])
+            scroll_slices_for_rendering = None
 
         prediction_slices_for_visualisation, quad_label_map, _quad_offsets = overlay_patches_on_slices(patches_list, zs_for_visualisation, subvolume_shape[1:])
 
@@ -2343,6 +2757,39 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
     spiral_and_transform = SpiralAndTransform(flow_integration_steps=cfg['num_flow_integration_steps'], flow_integration_solver=cfg['flow_integration_solver'], umbilicus_zyx=umbilicus_zyx, flow_min_corner_zyx=flow_min_corner_spiral_zyx, flow_max_corner_zyx=flow_max_corner_spiral_zyx)
     spiral_and_transform.to(device)
+
+    shell_map = None
+    shell_outer_winding_idx = None
+    if shell_patch is not None:
+        shell_map = ShellPolarMap(
+            shell_patch,
+            z_to_umbilicus_yx,
+            z_min=z_begin - cfg['flow_bounds_z_margin'],
+            z_max=z_end + cfg['flow_bounds_z_margin'],
+            num_theta_bins=cfg['shell_num_theta_bins'],
+            device=device,
+        )
+        initial_transform = spiral_and_transform.get_slice_to_spiral_transform()
+        initial_dr = spiral_and_transform.get_dr_per_winding()
+        if cfg['shell_outer_winding_idx'] is None:
+            shell_outer_winding_idx = _infer_shell_outer_winding_idx(
+                initial_transform,
+                initial_dr,
+                patches_list,
+                unattached_pcl_strips,
+            )
+            print(f'inferred shell_outer_winding_idx = {shell_outer_winding_idx}')
+        else:
+            shell_outer_winding_idx = int(cfg['shell_outer_winding_idx'])
+            print(f'using configured shell_outer_winding_idx = {shell_outer_winding_idx}')
+        min_gap_expander_num_windings = shell_outer_winding_idx + 3
+        if cfg['gap_expander_num_windings'] < min_gap_expander_num_windings:
+            print(
+                f'WARNING: shell_outer_winding_idx {shell_outer_winding_idx} requires '
+                f'gap_expander_num_windings >= {min_gap_expander_num_windings}, got '
+                f'gap_expander_num_windings {cfg["gap_expander_num_windings"]}; '
+                'increase gap_expander_num_windings or lower shell_outer_winding_idx'
+            )
 
     optimiser = torch.optim.Adam(spiral_and_transform.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
     if cfg['exp_lr_schedule']:
@@ -2448,8 +2895,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
                 satisfied_quads_flat.to(torch.int64),
             )
-            winding_range = _get_output_winding_range(
+            winding_range, patch_extents, pcl_extents = _compute_winding_range_and_input_extents(
                 slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
+            )
+            _warn_if_inputs_exceed_flow_bounds(
+                list(patches_dict.keys()), patch_extents,
+                unattached_pcl_strips, pcl_extents,
+                flow_field_radius,
             )
             save_overlay(
                 spiral_and_transform,
@@ -2462,7 +2914,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 winding_range,
                 out_path, suffix
             )
-        if os.environ.get('FIT_SPIRAL_SKIP_MESH') != '1':
+        if mesh_enabled:
             save_mesh(slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips, out_path, name=suffix)
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
@@ -2523,6 +2975,18 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
 
+        shell_metrics = {}
+        if shell_map is not None:
+            shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, shell_metrics = get_shell_losses(
+                shell_map,
+                slice_to_spiral_transform,
+                dr_per_winding,
+                shell_outer_winding_idx,
+            )
+            losses['shell_outer'] = shell_outer_loss * cfg['loss_weight_shell_outer']
+            losses['shell_no_cross'] = shell_no_cross_loss * cfg['loss_weight_shell_no_cross']
+            losses['shell_z_drift'] = shell_z_drift_loss * cfg['loss_weight_shell_z_drift']
+
         losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
 
         loss = sum(losses.values())
@@ -2537,13 +3001,19 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         if iteration % 200 == 0:
             # Only sync to CPU and log when we actually print, avoiding a per-iter
             # GPU->CPU sync that would otherwise stall CPU/GPU overlap.
-            print(f'step {iteration}: loss = {loss.item():.1f}, ' + ', '.join(f'{name} = {value.item():.1f}' for name, value in losses.items()))
+            loss_items = ', '.join(f'{name}={value.item():.1f}' for name, value in losses.items())
+            print(f'step {iteration}: total={loss.item():.1f}')
+            print(f'  losses: {loss_items}')
+            if shell_metrics:
+                metric_items = ', '.join(f'{name}={value.item():.2f}' for name, value in shell_metrics.items())
+                print(f'  shell: {metric_items}')
             if loss.isnan().item():
                 print('aborting due to NaN')
                 return
             wandb.log({
                 'total_loss': loss.item(),
                 **{name + '_loss': value for name, value in losses.items()},
+                **shell_metrics,
             })
 
     suffix = 'fitted'
@@ -2633,7 +3103,8 @@ def main():
     else:
         scroll_zarr_array = None
 
-    patches = load_patches(patches_path, segment_id_filter=lambda s: 'monster' not in s)
+    patches = load_patches(patches_path)
+    shell_patch = load_tifxyz(shell_path) if shell_path else None
 
     cross_patch_point_collections = {}
     unattached_point_collections = {}
@@ -2656,6 +3127,12 @@ def main():
         patch.zyxs /= downsample_factor
         patch.valid_zyxs /= downsample_factor
         patch.area /= downsample_factor ** 2
+    if shell_patch is not None:
+        shell_patch.scale *= downsample_factor
+        shell_patch.zyxs /= downsample_factor
+        shell_patch.valid_zyxs /= downsample_factor
+        shell_patch.area /= downsample_factor ** 2
+        print(f'loaded shell from {shell_path}: {shell_patch.valid_zyxs.shape[0]} valid points')
     for pcl_dict in (cross_patch_point_collections, unattached_point_collections):
         for pcl in pcl_dict.values():
             for point in pcl['points'].values():
@@ -2751,6 +3228,7 @@ def main():
         patches,
         list(cross_patch_point_collections.values()),
         unattached_pcl_strips,
+        shell_patch,
         umbilicus,
         out_path,
     )
