@@ -61,40 +61,7 @@
 			"steps": 200,
 			"lr": 0.1,
 			"params": ["map_uv_ms"],
-			"min_scaledown": 4,
-			"w_fac": 1.0,
-			"args": {
-				"subdiv": 2,
-				"status_interval": 20
-			}
-		},
-		{
-			"steps": 200,
-			"lr": 0.1,
-			"params": ["map_uv_ms"],
-			"min_scaledown": 3,
-			"w_fac": 1.0,
-			"args": {
-				"subdiv": 2,
-				"status_interval": 20
-			}
-		},
-		{
-			"steps": 200,
-			"lr": 0.1,
-			"params": ["map_uv_ms"],
-			"min_scaledown": 2,
-			"w_fac": 1.0,
-			"args": {
-				"subdiv": 2,
-				"status_interval": 20
-			}
-		},
-		{
-			"steps": 200,
-			"lr": 0.1,
-			"params": ["map_uv_ms"],
-			"min_scaledown": 1,
+			"min_scaledown": 0,
 			"w_fac": 1.0,
 			"args": {
 				"subdiv": 2,

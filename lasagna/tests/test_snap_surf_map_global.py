@@ -19,6 +19,7 @@ from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_
 from snap_surf.map_global import (
 	AffineMapModel,
 	GlobalMapModel,
+	_affine_from_seed_ext_quads,
 	_affine_multistart_candidates,
 	_objective_for_uv,
 	optimize_fixture,
@@ -147,6 +148,32 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			mapped = affine[:, :2] @ seed_ext + affine[:, 2]
 			self.assertTrue(torch.allclose(mapped, seed_uv, atol=1.0e-6))
 
+	def test_seed_quad_affine_uses_local_fixture_geometry(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp)
+			fixture_json = Path(tmp, "fixture.json")
+			meta = json.loads(fixture_json.read_text(encoding="utf-8"))
+			meta["seed_model_quad"] = [0, 1, 1]
+			fixture_json.write_text(json.dumps(meta), encoding="utf-8")
+			from snap_surf.map_fixture_io import load_map_fixture
+
+			fixture = load_map_fixture(tmp)
+			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+			seed_hw = torch.tensor([2.0, 2.0])
+			seed_uv = torch.tensor([2.0, 2.0])
+
+			affine = _affine_from_seed_ext_quads(
+				fixture=fixture,
+				stage_cfg=cfg,
+				seed_hw=seed_hw,
+				seed_model_uv=seed_uv,
+			)
+
+			self.assertIsNotNone(affine)
+			assert affine is not None
+			pred = torch.tensor([0.0, 0.0, 1.0]) @ affine.transpose(0, 1)
+			self.assertTrue(torch.allclose(pred, torch.tensor([0.25, 0.5]), atol=1.0e-4))
+
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			cfg = parse_global_map_config(_write_config(tmp, affine_steps=1, map_steps=1))
@@ -154,6 +181,10 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual(cfg.stages[1].min_scaledown, 3)
 			parsed = snap_surf_config_from_global_config(cfg, cfg.stages[1])
 			self.assertEqual(parsed.map_init.subdiv, 2)
+			path = Path(tmp, "named_cfg.json")
+			path.write_text(json.dumps({"stages": [{"name": "affine_init_scan", "params": ["affine"]}]}), encoding="utf-8")
+			named = parse_global_map_config(path)
+			self.assertEqual(named.stages[0].name, "affine_init_scan")
 
 	def test_out_of_bounds_samples_are_skipped_without_clamping(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -186,6 +217,11 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "metrics.json")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_affine", "map_ext_to_model.obj")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_001_map_uv_ms", "map_ext_to_model.obj")))
+			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "final", "map_ext_to_model.obj")))
+			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "final", "map_ext_to_model_worst_ref_1pct.obj")))
+			final_meta = json.loads(Path(out_dir, "objs", "final", "meta.json").read_text(encoding="utf-8"))
+			self.assertEqual(final_meta["name"], "final")
+			self.assertIn("worst_ref_1pct_vectors", final_meta)
 			self.assertFalse(os.path.exists(os.path.join(out_dir, "active_quad.tif")))
 			self.assertFalse(os.path.exists(os.path.join(out_dir, "blocked_quad.tif")))
 			metrics = json.loads(Path(out_dir, "metrics.json").read_text(encoding="utf-8"))
@@ -207,21 +243,23 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			model_x = tifffile.imread(os.path.join(out_dir, "model_x.tif"))
 			self.assertEqual(tuple(model_x.shape), (9, 9))
 
-	def test_progress_default_status_interval_skips_middle_steps(self) -> None:
+	def test_progress_default_status_interval_skips_middle_steps_and_prints_stage_zero(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			fixture_dir = os.path.join(tmp, "fixture")
 			out_dir = os.path.join(tmp, "out")
 			_write_planar_global_fixture(fixture_dir)
-			cfg_path = _write_config(tmp, affine_steps=3, map_steps=0)
+			cfg_path = _write_config(tmp, affine_steps=3, map_steps=2)
 			stdout = StringIO()
 
 			with redirect_stdout(stdout):
 				optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
 
 			text = stdout.getvalue()
+			self.assertIn("0/3", text)
 			self.assertIn("1/3", text)
 			self.assertIn("3/3", text)
 			self.assertNotIn("2/3", text)
+			self.assertRegex(text, r"0/2\s+map_uv_ms")
 			self.assertIn("stat", text)
 			self.assertIn("station loss", text)
 			self.assertIn("dst", text)
@@ -248,8 +286,112 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			text = stdout.getvalue()
 			self.assertIn("affine multistart progress columns", text)
 			self.assertIn("affine multistart candidates=2", text)
+			self.assertIn("i00", text)
+			self.assertIn("sdet", text)
 			self.assertIn("0.0000", text)
 			self.assertIn("15.000", text)
+
+	def test_named_affine_init_scan_runs_without_training_stage_steps(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = Path(tmp, "cfg.json")
+			_write_json(
+				cfg_path,
+				{
+					"base": {
+						"map_station_t": 0.001,
+						"map_init": {
+							"subdiv": 2,
+							"w_dist": 1.0,
+							"w_vec_normal": 0.0,
+							"w_surface_normal": 0.0,
+							"w_smooth": 0.0,
+							"w_bend": 0.0,
+							"w_jac": 0.0,
+							"w_metric_smooth": 0.0,
+							"w_area_smooth": 0.0,
+						},
+					},
+					"stages": [
+						{
+							"name": "affine_init_scan",
+							"steps": 0,
+							"lr": 0.05,
+							"params": ["affine"],
+							"args": {
+								"affine_multistart": {
+									"enabled": True,
+									"rot_deg": [0.0, 15.0],
+									"scales": [1.0],
+									"steps": 1,
+								}
+							},
+						}
+					],
+				},
+			)
+			stdout = StringIO()
+
+			with redirect_stdout(stdout):
+				metrics = optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
+
+			text = stdout.getvalue()
+			self.assertIn("affine multistart candidates=2", text)
+			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_affine_init_scan", "map_ext_to_model.obj")))
+			self.assertEqual(metrics["history"][0]["name"], "affine_init_scan")
+
+	def test_named_affine_seed_quad_init_runs_single_seed_fit(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			fixture_json = Path(fixture_dir, "fixture.json")
+			meta = json.loads(fixture_json.read_text(encoding="utf-8"))
+			meta["seed_model_quad"] = [0, 1, 1]
+			fixture_json.write_text(json.dumps(meta), encoding="utf-8")
+			cfg_path = Path(tmp, "cfg.json")
+			_write_json(
+				cfg_path,
+				{
+					"base": {
+						"map_station_t": 0.001,
+						"map_init": {
+							"subdiv": 2,
+							"w_dist": 1.0,
+							"w_vec_normal": 0.0,
+							"w_surface_normal": 0.0,
+							"w_smooth": 0.0,
+							"w_bend": 0.0,
+							"w_jac": 0.0,
+							"w_metric_smooth": 0.0,
+							"w_area_smooth": 0.0,
+						},
+					},
+					"stages": [
+						{
+							"name": "affine_seed_quad_init",
+							"steps": 1,
+							"lr": 0.05,
+							"params": ["affine"],
+							"args": {"affine_seed_quad_init": {"enabled": True}},
+						}
+					],
+				},
+			)
+			stdout = StringIO()
+
+			with redirect_stdout(stdout):
+				metrics = optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
+
+			text = stdout.getvalue()
+			self.assertIn("affine seed quad init", text)
+			self.assertIn("0/1", text)
+			self.assertIn("1/1", text)
+			self.assertNotIn("affine multistart candidates", text)
+			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_affine_seed_quad_init", "map_ext_to_model.obj")))
+			self.assertEqual(metrics["history"][0]["name"], "affine_seed_quad_init")
 
 
 if __name__ == "__main__":
