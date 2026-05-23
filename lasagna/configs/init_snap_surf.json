@@ -18,7 +18,7 @@
 		"bend": 100.0,
 		"ext_offset": 0.0,
 		"snap_surf": 0.0,
-		"snap_surf_map": 0.00001
+		"snap_surf_map": 0.0001
 	},
 	"stages": [
 		{
@@ -135,7 +135,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 2000,
+			"steps": 1000,
 			"lr": 1.0,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
@@ -164,7 +164,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 0,
+			"steps": 1000,
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
