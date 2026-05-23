@@ -1365,32 +1365,60 @@ def optimize(
 			snap_surf_args = dict(snap_surf_args)
 			if snap_surf_args.get("debug_obj_dir") and "debug_obj_interval" not in snap_surf_args:
 				snap_surf_args["debug_obj_interval"] = max(1, int(status_interval or opt_cfg.steps or 1))
+		snap_surf_map_args = stage_args.get("snap_surf_map")
+		if snap_surf_map_args is not None and not isinstance(snap_surf_map_args, dict):
+			raise ValueError(f"stage '{stage.name}' opt.args.snap_surf_map must be an object")
+		if isinstance(snap_surf_map_args, dict):
+			snap_surf_map_args = dict(snap_surf_map_args)
 		snap_surf_map_opt_stage: snap_surf_map_global.GlobalMapStageConfig | None = None
+		raw_map_opt = None
+		if isinstance(snap_surf_map_args, dict) and "map_opt" in snap_surf_map_args:
+			raw_map_opt = snap_surf_map_args.get("map_opt")
 		if isinstance(snap_surf_args, dict) and "map_opt" in snap_surf_args:
-			raw_map_opt = snap_surf_args.pop("map_opt")
 			if raw_map_opt is not None:
-				if not isinstance(raw_map_opt, dict):
-					raise ValueError(f"stage '{stage.name}' opt.args.snap_surf.map_opt must be an object or null")
-				snap_surf_map_opt_stage = snap_surf_map_global.parse_global_map_stage_item(
-					raw_map_opt,
-					normal_lasagna=True,
+				raise ValueError(
+					f"stage '{stage.name}' configures both opt.args.snap_surf.map_opt and "
+					"opt.args.snap_surf_map.map_opt; use snap_surf_map.map_opt"
 				)
-				snap_surf_args["map_init"] = {"enabled": False}
+			raw_map_opt = snap_surf_args.pop("map_opt")
+		if raw_map_opt is not None:
+			if not isinstance(raw_map_opt, dict):
+				raise ValueError(f"stage '{stage.name}' opt.args.snap_surf_map.map_opt must be an object or null")
+			snap_surf_map_opt_stage = snap_surf_map_global.parse_global_map_stage_item(
+				raw_map_opt,
+				normal_lasagna=True,
+			)
 		if isinstance(snap_surf_args, dict) and "map_global" in snap_surf_args:
 			snap_surf_args.pop("map_global")
+		snap_surf_legacy_weight = _need_term("snap_surf", stage_eff)
+		snap_surf_map_weight = _need_term("snap_surf_map", stage_eff)
+		snap_surf_global_map_mode = snap_surf_map_opt_stage is not None or snap_surf_map_weight > 0.0
+		if snap_surf_global_map_mode and snap_surf_legacy_weight > 0.0:
+			raise ValueError(
+				f"stage '{stage.name}' enables global snap-surf mapping but also has snap_surf weight "
+				f"{snap_surf_legacy_weight:.6g}; set snap_surf to 0 and use snap_surf_map for the model loss"
+			)
+		if snap_surf_global_map_mode:
+			snap_surf_legacy_cfg = None
+			snap_surf_legacy_active = False
+		else:
+			snap_surf_legacy_cfg = snap_surf_args
+			snap_surf_legacy_active = snap_surf_legacy_weight > 0.0
 		print(
-			f"[optimizer] {label}: snap_surf_weight={_need_term('snap_surf', stage_eff):.6g} "
-			f"snap_surf_args={snap_surf_args}",
+			f"[optimizer] {label}: snap_surf_weight={snap_surf_legacy_weight:.6g} "
+			f"snap_surf_map_weight={snap_surf_map_weight:.6g} "
+			f"snap_surf_legacy_active={snap_surf_legacy_active} "
+			f"snap_surf_args={snap_surf_legacy_cfg}",
 			flush=True,
 		)
 		opt_loss_snap_surf.configure_snap_surf(
-			cfg=snap_surf_args,
+			cfg=snap_surf_legacy_cfg,
 			seed_xyz=seed_xyz,
-			active=_need_term("snap_surf", stage_eff) > 0.0,
+			active=snap_surf_legacy_active,
 			stage_label=f"{label}:{stage.name}",
 			stage_steps=opt_cfg.steps,
 		)
-		if _need_term("snap_surf", stage_eff) > 0.0 and not getattr(model, "_ext_surfaces", None):
+		if snap_surf_legacy_active and not getattr(model, "_ext_surfaces", None):
 			raise ValueError("snap_surf requires external_surfaces")
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
@@ -2829,6 +2857,23 @@ def optimize(
 			loss0, term_vals0, display_loss0 = _eval_terms(
 				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
+			if snap_surf_map_opt_stage is not None:
+				map_initial_stage = snap_surf_map_global.GlobalMapStageConfig(
+					name=f"{snap_surf_map_opt_stage.name or 'map_opt'}_initial",
+					steps=0,
+					lr=snap_surf_map_opt_stage.lr,
+					params=snap_surf_map_opt_stage.params,
+					min_scaledown=snap_surf_map_opt_stage.min_scaledown,
+					w_fac=snap_surf_map_opt_stage.w_fac,
+					args=dict(snap_surf_map_opt_stage.args),
+				)
+				map_initial_stats = _run_snap_global_map_stage(
+					stage=map_initial_stage,
+					res=res0,
+					stage_args=stage_args,
+					persistent_optimizer=True,
+				)
+				term_vals0.update(map_initial_stats)
 			_t_prune = _stage_start(f"{label}.initial_eval.cylinder_prune")
 			if _prune_cylinder_candidates_after_initial_eval():
 				all_params, param_groups = _make_param_groups()

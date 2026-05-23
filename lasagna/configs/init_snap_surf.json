@@ -18,7 +18,7 @@
 		"bend": 100.0,
 		"ext_offset": 0.0,
 		"snap_surf": 0.0,
-		"snap_surf_map": 0.001
+		"snap_surf_map": 0.0001
 	},
 	"stages": [
 		{
@@ -31,7 +31,8 @@
 				"pred_dt": 0.0,
 				"station_n": 10.0,
 				"station_t": 10.0,
-				"snap_surf": 0.0
+				"snap_surf": 0.0,
+				"snap_surf_map": 0.0
 			}
 		},
 		{
@@ -44,7 +45,8 @@
 				"pred_dt": 0.0,
 				"station_n": 10.0,
 				"station_t": 10.0,
-				"snap_surf": 0.0
+				"snap_surf": 0.0,
+				"snap_surf_map": 0.0
 			}
 		},
 		{
@@ -127,7 +129,38 @@
 			"w_fac": 1.0,
 			"args": {
 				"subdiv": 2,
-				"status_interval": 20
+				"status_interval": 20,
+				"debug_obj_dir": "snap_surf_objs"
+			}
+		},
+		{
+			"name": "snap",
+			"steps": 1000,
+			"lr": 1.0,
+			"params": ["mesh_ms"],
+			"min_scaledown": 0,
+			"default_mul": 0.0,
+			"w_fac": {
+				"pred_dt": 0.0,
+				"snap_surf": 0.0,
+				"snap_surf_map": 1.0
+			},
+			"args": {
+				"status_interval": 50,
+				"snap_surf_map": {
+					"map_opt": {
+						"name": "snap_map_opt_final",
+						"steps": 1,
+						"lr": 0.01,
+						"params": ["map_uv_ms"],
+						"min_scaledown": 0,
+						"w_fac": 1.0,
+						"args": {
+							"subdiv": 2,
+							"debug_obj_dir": "snap_surf_objs"
+						}
+					}
+				}
 			}
 		},
 		{
@@ -144,15 +177,41 @@
 			},
 			"args": {
 				"status_interval": 50,
-				"snap_surf": {
-					"init_distance": 10.0,
-					"w_to_ext": 1.0,
-					"debug_obj_dir": true,
-					"map_inlier_distance": 4.0,
+				"snap_surf_map": {
 					"map_opt": {
 						"name": "snap_map_opt_final",
 						"steps": 1,
-						"lr": 0.1,
+						"lr": 0.01,
+						"params": ["map_uv_ms"],
+						"min_scaledown": 0,
+						"w_fac": 1.0,
+						"args": {
+							"subdiv": 2,
+							"debug_obj_dir": "snap_surf_objs"
+						}
+					}
+				}
+			}
+		},
+		{
+			"name": "snap",
+			"steps": 0,
+			"lr": 0.01,
+			"params": ["mesh_ms"],
+			"min_scaledown": 0,
+			"default_mul": 0.0,
+			"w_fac": {
+				"pred_dt": 0.0,
+				"snap_surf": 0.0,
+				"snap_surf_map": 1.0
+			},
+			"args": {
+				"status_interval": 50,
+				"snap_surf_map": {
+					"map_opt": {
+						"name": "snap_map_opt_final",
+						"steps": 1,
+						"lr": 0.01,
 						"params": ["map_uv_ms"],
 						"min_scaledown": 0,
 						"w_fac": 1.0,
