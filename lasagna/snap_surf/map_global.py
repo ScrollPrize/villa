@@ -1087,45 +1087,43 @@ def _write_map_objs(
 	else:
 		empty = fixture.model_xyz.new_empty(0, 3)
 		_write_obj_lines(out / "map_ext_to_model.obj", empty, empty, label="global_map_ext_to_model")
-	ref_pos, ref_ok = _uv_model_positions(fixture.reference_uv.to(device=uv.device, dtype=uv.dtype), fixture)
-	ref_common = ok & ref_ok
 	worst_count = 0
-	if bool(ref_common.any().detach().cpu()):
-		common_dist = (model_pos[ref_common] - ref_pos[ref_common]).norm(dim=-1)
-		k = max(1, int(math.ceil(float(common_dist.numel()) * 0.01)))
-		_common_vals, common_idx = torch.topk(common_dist, k=min(k, int(common_dist.numel())), largest=True)
-		common_ids = ref_common.reshape(-1).nonzero(as_tuple=False).flatten()
-		worst_ids = common_ids[common_idx]
-		worst_mask = torch.zeros_like(ref_common.reshape(-1))
+	if bool(ok.any().detach().cpu()):
+		map_dist = (model_pos[ok] - fixture.ext_xyz[ok]).norm(dim=-1)
+		k = max(1, int(math.ceil(float(map_dist.numel()) * 0.01)))
+		_dist_vals, dist_idx = torch.topk(map_dist, k=min(k, int(map_dist.numel())), largest=True)
+		ok_ids = ok.reshape(-1).nonzero(as_tuple=False).flatten()
+		worst_ids = ok_ids[dist_idx]
+		worst_mask = torch.zeros_like(ok.reshape(-1))
 		worst_mask[worst_ids] = True
-		worst_mask = worst_mask.view_as(ref_common)
+		worst_mask = worst_mask.view_as(ok)
 		worst_count = int(worst_mask.sum().detach().cpu())
 		_write_obj_lines(
-			out / "map_ext_to_model_worst_ref_1pct.obj",
+			out / "map_ext_to_model_worst_1pct.obj",
 			fixture.ext_xyz[worst_mask],
 			model_pos[worst_mask],
-			label="global_map_ext_to_model_worst_ref_1pct",
+			label="global_map_ext_to_model_worst_1pct",
 		)
 	else:
 		empty = fixture.model_xyz.new_empty(0, 3)
 		_write_obj_lines(
-			out / "map_ext_to_model_worst_ref_1pct.obj",
+			out / "map_ext_to_model_worst_1pct.obj",
 			empty,
 			empty,
-			label="global_map_ext_to_model_worst_ref_1pct",
+			label="global_map_ext_to_model_worst_1pct",
 		)
 	_write_obj_points(out / "map_valid_ext_points.obj", fixture.ext_xyz, ok, label="global_map_valid_ext_points")
 	_write_json(
 		out / "meta.json",
 		{
-			**meta,
-			"map_ext_to_model": "map_ext_to_model.obj",
-			"map_ext_to_model_worst_ref_1pct": "map_ext_to_model_worst_ref_1pct.obj",
-			"valid_vectors": int(ok.sum().detach().cpu()),
-			"worst_ref_1pct_vectors": worst_count,
-			**_fixture_mapping_error(uv, fixture),
-		},
-	)
+				**meta,
+				"map_ext_to_model": "map_ext_to_model.obj",
+				"map_ext_to_model_worst_1pct": "map_ext_to_model_worst_1pct.obj",
+				"valid_vectors": int(ok.sum().detach().cpu()),
+				"worst_1pct_vectors": worst_count,
+				**_fixture_mapping_error(uv, fixture),
+			},
+		)
 
 
 def _level_coords(ext_shape: torch.Size | tuple[int, int], level: int, uv: torch.Tensor) -> torch.Tensor:
