@@ -160,6 +160,41 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					snap_surf_enabled=True,
 				)
 
+	def test_global_map_wires_generic_tifxyz_as_external_surface(self) -> None:
+		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
+		cfg = {"args": {"model-init": "seed"}}
+		args = cfg["args"]
+
+		with tempfile.TemporaryDirectory() as td:
+			tifxyz_dir = fit_service._decode_tifxyz_for_request(
+				body=body,
+				cfg=cfg,
+				args_section=args,
+				tmp_dir=td,
+				model_init="seed",
+				ext_offset_enabled=False,
+				global_map_enabled=True,
+			)
+
+			self.assertIsNotNone(tifxyz_dir)
+			self.assertEqual(cfg["external_surfaces"], [{"path": tifxyz_dir, "offset": 1.0}])
+			self.assertNotIn("tifxyz-init", args)
+
+	def test_global_map_requires_generic_tifxyz(self) -> None:
+		cfg = {"args": {"model-init": "seed"}}
+
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "snap_surf_map/global_map is enabled but request has no tifxyz"):
+				fit_service._decode_tifxyz_for_request(
+					body={},
+					cfg=cfg,
+					args_section=cfg["args"],
+					tmp_dir=td,
+					model_init="seed",
+					ext_offset_enabled=False,
+					global_map_enabled=True,
+				)
+
 	def test_snap_surf_effective_loss_detection(self) -> None:
 		cfg = {
 			"base": {"snap_surf": 0.01},
@@ -170,6 +205,31 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 
 		self.assertTrue(fit_service._config_effective_snap_surf_enabled(cfg))
 		self.assertFalse(fit_service._config_effective_ext_offset_enabled(cfg))
+
+	def test_global_map_detection_from_map_stage_params(self) -> None:
+		cfg = {
+			"base": {"snap_surf_map": 0.0},
+			"stages": [
+				{"name": "map_init", "steps": 100, "params": ["map_affine"]},
+			],
+		}
+
+		self.assertTrue(fit_service._config_global_map_enabled(cfg))
+
+	def test_global_map_detection_from_nested_map_opt(self) -> None:
+		cfg = {
+			"base": {"snap_surf_map": 0.0},
+			"stages": [
+				{
+					"name": "snap",
+					"steps": 100,
+					"params": ["mesh_ms"],
+					"args": {"snap_surf_map": {"map_opt": {"params": ["map_uv_ms"]}}},
+				},
+			],
+		}
+
+		self.assertTrue(fit_service._config_global_map_enabled(cfg))
 
 	def test_snap_surf_debug_obj_dir_does_not_force_interval(self) -> None:
 		cfg = {
@@ -183,6 +243,37 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 
 		self.assertEqual(snap["debug_obj_dir"], "/tmp/snap_surf_objs")
 		self.assertNotIn("debug_obj_interval", snap)
+
+	def test_snap_surf_map_debug_obj_dir_rewrites_existing_outputs(self) -> None:
+		cfg = {
+			"stages": [
+				{
+					"name": "map_uv_fine",
+					"params": ["map_uv_ms"],
+					"args": {"debug_obj_dir": "snap_surf_objs"},
+				},
+				{
+					"name": "snap",
+					"params": ["mesh_ms"],
+					"args": {
+						"snap_surf_map": {
+							"map_opt": {
+								"args": {"debug_obj_dir": "snap_surf_objs"},
+							}
+						}
+					},
+				},
+			],
+		}
+
+		fit_service._set_snap_surf_map_debug_obj_dir(cfg, "/tmp/snap_surf_objs")
+
+		self.assertEqual(cfg["stages"][0]["args"]["debug_obj_dir"], "/tmp/snap_surf_objs")
+		self.assertEqual(
+			cfg["stages"][1]["args"]["snap_surf_map"]["map_opt"]["args"]["debug_obj_dir"],
+			"/tmp/snap_surf_objs",
+		)
+		self.assertNotIn("snap_surf", cfg["stages"][1]["args"])
 
 	def test_seed_mode_ignores_surplus_model_transport(self) -> None:
 		with tempfile.TemporaryDirectory() as td:

@@ -113,6 +113,37 @@ def _set_snap_surf_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
             snap.pop("debug_obj_per_iteration", None)
 
 
+def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
+    stages = cfg.get("stages")
+    if not isinstance(stages, list):
+        return
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage
+        args = opt_cfg.get("args")
+        if not isinstance(args, dict):
+            continue
+        params = opt_cfg.get("params", [])
+        if isinstance(params, str):
+            params = [params]
+        if isinstance(params, list) and any(str(p) in {"map_affine", "map_uv_ms"} for p in params):
+            if args.get("debug_obj_dir"):
+                args["debug_obj_dir"] = out_dir
+        snap_map = args.get("snap_surf_map")
+        if isinstance(snap_map, dict):
+            map_opt = snap_map.get("map_opt")
+            if isinstance(map_opt, dict):
+                map_args = map_opt.get("args")
+                if not isinstance(map_args, dict):
+                    map_args = {}
+                    map_opt["args"] = map_args
+                if map_args.get("debug_obj_dir"):
+                    map_args["debug_obj_dir"] = out_dir
+
+
 def _decode_tifxyz_for_request(
     *,
     body: dict[str, Any],
@@ -122,12 +153,13 @@ def _decode_tifxyz_for_request(
     model_init: str,
     ext_offset_enabled: bool,
     snap_surf_enabled: bool = False,
+    global_map_enabled: bool = False,
 ) -> str | None:
     """Decode generic request tifxyz and attach it to configured consumers."""
     import base64
 
     approval_enabled = _approval_inpaint_enabled(args_section)
-    external_surface_enabled = bool(ext_offset_enabled or snap_surf_enabled)
+    external_surface_enabled = bool(ext_offset_enabled or snap_surf_enabled or global_map_enabled)
     if approval_enabled and model_init != "seed":
         raise ValueError("args.approval-inpaint is only valid with args.model-init=seed")
 
@@ -157,6 +189,8 @@ def _decode_tifxyz_for_request(
             loss_names.append("ext_offset")
         if snap_surf_enabled:
             loss_names.append("snap_surf")
+        if global_map_enabled:
+            loss_names.append("snap_surf_map/global_map")
         raise ValueError(f"{'/'.join(loss_names)} is enabled but request has no tifxyz")
     elif approval_enabled:
         raise ValueError("approval-inpaint requires request tifxyz")
@@ -278,6 +312,42 @@ def _config_effective_ext_offset_enabled(cfg: dict[str, Any]) -> bool:
 
 def _config_effective_snap_surf_enabled(cfg: dict[str, Any]) -> bool:
     return _config_effective_loss_enabled(cfg, "snap_surf")
+
+
+def _stage_params_list(opt_cfg: dict[str, Any]) -> list[str]:
+    params = opt_cfg.get("params", [])
+    if isinstance(params, str):
+        return [params]
+    if isinstance(params, list):
+        return [str(p) for p in params]
+    return []
+
+
+def _config_global_map_enabled(cfg: dict[str, Any]) -> bool:
+    if _config_effective_loss_enabled(cfg, "snap_surf_map"):
+        return True
+    stages = cfg.get("stages")
+    if not isinstance(stages, list):
+        return False
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage
+        params = set(_stage_params_list(opt_cfg))
+        if params & {"map_affine", "map_uv_ms"}:
+            return True
+        args = opt_cfg.get("args")
+        if not isinstance(args, dict):
+            continue
+        snap_map = args.get("snap_surf_map")
+        if isinstance(snap_map, dict) and snap_map.get("map_opt") is not None:
+            return True
+        legacy_snap = args.get("snap_surf")
+        if isinstance(legacy_snap, dict) and legacy_snap.get("map_opt") is not None:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +625,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
         cfg["args"] = args_section_pre
         ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
         snap_surf_enabled = _config_effective_snap_surf_enabled(cfg)
-        external_surface_enabled = ext_offset_enabled or snap_surf_enabled
+        global_map_enabled = _config_global_map_enabled(cfg)
+        external_surface_enabled = ext_offset_enabled or snap_surf_enabled or global_map_enabled
         model_input = _decode_model_for_request(
             body=body,
             tmp_dir=tmp_dir,
@@ -575,6 +646,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
             model_init=model_init,
             ext_offset_enabled=ext_offset_enabled,
             snap_surf_enabled=snap_surf_enabled,
+            global_map_enabled=global_map_enabled,
         )
 
         if model_init == "model" and not model_input:
@@ -600,6 +672,9 @@ def _run_optimization(body: dict[str, Any]) -> None:
         if snap_surf_enabled:
             snap_debug_dir = Path(service_workdir) / "snap_surf_objs"
             _set_snap_surf_debug_obj_dir(cfg, str(snap_debug_dir))
+        if global_map_enabled:
+            snap_debug_dir = Path(service_workdir) / "snap_surf_objs"
+            _set_snap_surf_map_debug_obj_dir(cfg, str(snap_debug_dir))
         cfg["args"] = args_section
         cfg_path = str(Path(tmp_dir) / "fit_config.json")
         has_corr = "corr_points" in cfg

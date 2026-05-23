@@ -136,35 +136,6 @@
 		{
 			"name": "snap",
 			"steps": 1000,
-			"lr": 1.0,
-			"params": ["mesh_ms"],
-			"min_scaledown": 0,
-			"w_fac": {
-				"pred_dt": 0.0,
-				"snap_surf": 0.0,
-				"snap_surf_map": 1.0
-			},
-			"args": {
-				"status_interval": 50,
-				"snap_surf_map": {
-					"map_opt": {
-						"name": "snap_map_opt_final",
-						"steps": 1,
-						"lr": 0.01,
-						"params": ["map_uv_ms"],
-						"min_scaledown": 0,
-						"w_fac": 1.0,
-						"args": {
-							"subdiv": 2,
-							"debug_obj_dir": "snap_surf_objs"
-						}
-					}
-				}
-			}
-		},
-		{
-			"name": "snap",
-			"steps": 1000,
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,

@@ -226,7 +226,7 @@ def _parse_opt_settings(
 	if model_params and map_params:
 		raise ValueError(
 			f"stages_json: stage '{stage_name}' opt.params: cannot mix model params {sorted(model_params)} "
-			f"with map params {sorted(map_params)}; put concurrent map optimization under args.snap_surf.map_opt"
+			f"with map params {sorted(map_params)}; put concurrent map optimization under args.snap_surf_map.map_opt"
 		)
 	kind = "map" if map_params else "model"
 	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
