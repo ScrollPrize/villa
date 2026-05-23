@@ -1,0 +1,44 @@
+{
+	"base": {
+		"distance_scale": 1.0,
+		"huber_delta": 5.0,
+		"map_station_t": 0.001,
+		"map_init": {
+			"subdiv": 2,
+			"scale_levels": 4,
+			"w_dist": 1.0,
+			"w_vec_normal": 0.0,
+			"w_surface_normal": 0.0,
+			"w_smooth": 0.02,
+			"w_bend": 0.001,
+			"w_jac": 0.0,
+			"w_metric_smooth": 0.0,
+			"w_area_smooth": 0.0,
+			"max_sample_distance": 1000.0,
+			"max_sample_angle_deg": 180.0,
+			"max_step_neighbor_ratio": 0.0
+		}
+	},
+	"stages": [
+		{
+			"steps": 20,
+			"lr": 0.05,
+			"params": ["affine"],
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 2
+			}
+		},
+		{
+			"steps": 20,
+			"lr": 0.02,
+			"params": ["map_uv_ms"],
+			"min_scaledown": 3,
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 2,
+				"map_station_t": 0.001
+			}
+		}
+	]
+}
