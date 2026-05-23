@@ -1,6 +1,7 @@
 from typing import Union, Tuple, List, Callable
 import numpy as np
 import torch
+from batchgeneratorsv2.helpers.scalar_type import RandomScalar, sample_scalar
 from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform, ImageOnlyTransform
 
 class ColorFunctionExtractor:
@@ -119,11 +120,6 @@ class BlankRectangleTransform(BasicTransform):
     def _apply_to_regr_target(self, regr_target: torch.Tensor, **kwargs) -> torch.Tensor:
         return regr_target  # Don't modify regression targets
     
-import numpy as np
-import torch
-from typing import Union, Tuple
-from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
-
 def augment_rician_noise(data: torch.Tensor, noise_variance: Tuple[float, float]) -> torch.Tensor:
     """
     Adds Rician noise to the input tensor.
@@ -182,72 +178,115 @@ class RicianNoiseTransform(BasicTransform):
         return regr_target  # Don't apply noise to regression targets
 
 
-class SmearTransform(ImageOnlyTransform):
-    def __init__(self, shift=(10, 0), alpha=0.5, num_prev_slices=1, smear_axis=1):
+def _sample_int(value: Union[int, Tuple[int, int], List[int]]) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        lo, hi = int(value[0]), int(value[1])
+        if lo == hi:
+            return lo
+        return int(torch.randint(lo, hi + 1, (1,)).item())
+    raise RuntimeError(f"Expected int or inclusive int range, got {value!r}")
+
+
+def _sample_shift(shift, num_plane_dims: int) -> Tuple[int, ...]:
+    if isinstance(shift, int):
+        return (shift,) * num_plane_dims
+    if not isinstance(shift, (tuple, list)):
+        raise RuntimeError(f"Expected int, tuple, or list for shift, got {type(shift)}")
+    if len(shift) != num_plane_dims:
+        raise RuntimeError(f"Expected {num_plane_dims} shift entries, got {len(shift)}")
+    return tuple(_sample_int(s) for s in shift)
+
+
+class DecohesionTransform(ImageOnlyTransform):
+    def __init__(
+            self,
+            shift: Union[int, Tuple[int, ...], Tuple[Tuple[int, int], ...]] = (10, 0),
+            alpha: RandomScalar = 0.5,
+            num_prev_slices: Union[int, Tuple[int, int]] = 1,
+            smear_axis: int = 1,
+            p_per_channel: float = 1.0,
+    ):
         """
+        Simulate scroll-specific decohesion by blending shifted previous slices into
+        later slices. This is an image-only transform; labels are left untouched.
+
         Args:
-            shift : tuple of int
-                The (row_shift, col_shift) to apply to each previous slice (wrap-around is used).
-            alpha : float
+            shift:
+                Int shift applied to every in-slice dimension, a tuple of constant
+                shifts, or a tuple of inclusive integer ranges sampled per call.
+            alpha:
                 Blending factor for the aggregated shifted slices (0 = no influence, 1 = full replacement).
-            num_prev_slices : int
+            num_prev_slices:
                 The number of previous slices to aggregate and use for blending.
-            smear_axis : int
+            smear_axis:
                 The spatial axis (in the full tensor) along which to apply the smear.
                 For an input image with shape (C, X, Y) or (C, X, Y, Z), spatial dimensions are indices 1,2,(3).
                 Default: 1 (i.e. the first spatial axis).
+            p_per_channel:
+                Probability of applying the transform to each channel.
         """
         super().__init__()
         self.shift = shift
         self.alpha = alpha
         self.num_prev_slices = num_prev_slices
         self.smear_axis = smear_axis
+        self.p_per_channel = p_per_channel
 
     def get_parameters(self, **data_dict) -> dict:
-        # No extra parameters are needed.
-        return {}
+        img = data_dict["image"]
+        num_spatial_dims = img.ndim - 1
+        local_smear_axis = self.smear_axis - 1
+        if not (0 <= local_smear_axis < num_spatial_dims):
+            raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {tuple(img.shape)}")
+        num_plane_dims = num_spatial_dims - 1
+        return {
+            "apply_to_channel": torch.rand(img.shape[0], device=img.device) < self.p_per_channel,
+            "alpha": float(sample_scalar(self.alpha, image=img)),
+            "num_prev_slices": _sample_int(self.num_prev_slices),
+            "shift": _sample_shift(self.shift, num_plane_dims),
+            "local_smear_axis": local_smear_axis,
+        }
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
-        # Ensure the image is on CPU and convert to numpy.
-        device = img.device
-        img_np = img.detach().cpu().numpy()
-        # We assume the input image has shape (C, ...) where the remaining dimensions are spatial.
-        C = img_np.shape[0]
-        spatial_shape = img_np.shape[1:]
-        num_spatial_dims = len(spatial_shape)
-        # Validate smear_axis: must be between 1 and number of spatial dimensions.
-        if not (1 <= self.smear_axis <= num_spatial_dims):
-            raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {img_np.shape}")
-        # For each channel, we want to operate on the corresponding spatial image.
-        # Since the channel dimension is separate, we adjust the smear axis to a "local" axis in the channel image.
-        # (For example, if smear_axis is 1 in the full tensor, then for the channel image it is 0.)
-        local_smear_axis = self.smear_axis - 1
+        apply_to_channel = params["apply_to_channel"]
+        if not torch.any(apply_to_channel):
+            return img
 
-        transformed = np.copy(img_np)
-        for ch in range(C):
-            chan_img = img_np[ch]  # shape: spatial_shape (e.g., for a 3D image: (D, H, W))
-            # Proceed only if the size along the smear axis is greater than num_prev_slices.
-            if chan_img.shape[local_smear_axis] <= self.num_prev_slices:
-                continue
+        num_prev_slices = int(params["num_prev_slices"])
+        if num_prev_slices <= 0:
+            return img
 
-            # To iterate easily along the smear axis, bring that axis to the front.
-            moved = np.moveaxis(chan_img, local_smear_axis, 0)  # shape: (N, ...) where N = size along smear axis
-            N = moved.shape[0]
-            # Iterate over slices starting from index num_prev_slices.
-            for i in range(self.num_prev_slices, N):
-                aggregated = np.zeros_like(moved[i], dtype=np.float32)
-                count = 0
-                for j in range(i - self.num_prev_slices, i):
-                    # Shift the previous slice by the given offset.
-                    shifted = np.roll(moved[j], shift=self.shift, axis=(0, 1))
-                    aggregated += shifted.astype(np.float32)
-                    count += 1
-                if count > 0:
-                    aggregated /= count
-                # Blend the aggregated slice with the current slice.
-                moved[i] = ((1 - self.alpha) * moved[i].astype(np.float32) + self.alpha * aggregated).astype(moved[i].dtype)
-            # Restore the original axis order.
-            transformed[ch] = np.moveaxis(moved, 0, local_smear_axis)
-        # Convert back to a torch tensor (preserving dtype and device).
-        out = torch.from_numpy(transformed).to(device)
-        return out
+        local_smear_axis = params["local_smear_axis"]
+        selected = torch.where(apply_to_channel.to(img.device))[0]
+        work = img[selected]
+        moved = torch.movedim(work, local_smear_axis + 1, 1)
+        num_slices = moved.shape[1]
+        if num_slices <= 1:
+            return img
+
+        work_dtype = moved.dtype if moved.is_floating_point() else torch.float32
+        base = moved.to(work_dtype)
+        accumulated = torch.zeros_like(base)
+        counts = torch.zeros(num_slices, dtype=work_dtype, device=img.device)
+        plane_dims = tuple(range(2, moved.ndim))
+        max_lag = min(num_prev_slices, num_slices - 1)
+
+        for lag in range(1, max_lag + 1):
+            shifted_previous = torch.roll(base[:, :-lag], shifts=params["shift"], dims=plane_dims)
+            accumulated[:, lag:] += shifted_previous
+            counts[lag:] += 1
+
+        view_shape = (1, num_slices, *([1] * (moved.ndim - 2)))
+        mean_previous = accumulated / counts.clamp_min(1).view(view_shape)
+        alpha = float(params["alpha"])
+        blended = (1 - alpha) * base + alpha * mean_previous
+        blended[:, counts == 0] = base[:, counts == 0]
+
+        img[selected] = torch.movedim(blended.to(img.dtype), 1, local_smear_axis + 1)
+        return img
+
+
+class SmearTransform(DecohesionTransform):
+    """Backward-compatible name for the scroll decohesion smear transform."""

@@ -27,7 +27,7 @@ from batchgeneratorsv2.transforms.nnunet.remove_connected_components import \
     RemoveRandomConnectedComponentFromOneHotEncodingTransform
 from batchgeneratorsv2.transforms.nnunet.seg_to_onehot import MoveSegAsOneHotToDataTransform
 from batchgeneratorsv2.transforms.noise.gaussian_blur import GaussianBlurTransform
-from batchgeneratorsv2.transforms.noise.extranoisetransforms import BlankRectangleTransform
+from batchgeneratorsv2.transforms.noise.extranoisetransforms import BlankRectangleTransform, DecohesionTransform
 from batchgeneratorsv2.transforms.spatial.low_resolution import SimulateLowResolutionTransform
 from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
 from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
@@ -753,6 +753,16 @@ class nnUNetTrainerExtraDA(nnUNetTrainer):
                 p_per_sample=0.4,  # same as original
                 p_per_channel=0.5  # same as original
             ), apply_probability=0.5
+        ))
+
+        transforms.append(RandomTransform(
+            DecohesionTransform(
+                shift=((-6, 6), (-6, 6)),
+                alpha=(0.15, 0.45),
+                num_prev_slices=(1, 3),
+                smear_axis=1,
+                p_per_channel=0.5
+            ), apply_probability=0.25
         ))
 
         transforms.append(RandomTransform(
