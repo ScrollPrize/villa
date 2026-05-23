@@ -40,6 +40,7 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 					"fringe_lr": 0.03,
 					"global_opt_interval": 6,
 					"progress_mode": "both",
+					"no_progress_iters": 31,
 					"scale_levels": 4,
 					"min_scale_level": 2,
 					"dense_opt": True,
@@ -56,6 +57,9 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 					"max_sample_angle_deg": 45.0,
 					"sample_angle_step_fraction": 0.2,
 					"max_step_neighbor_ratio": 10.0,
+					"fixture_export_dir": "fixture_out",
+					"fixture_export_once": False,
+					"fixture_export_objs": False,
 				}
 			},
 			seed_xyz=(1.0, 1.0, 0.0),
@@ -79,6 +83,7 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.fringe_lr, 0.03)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.global_opt_interval, 6)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.progress_mode, "both")
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.no_progress_iters, 31)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.scale_levels, 4)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.min_scale_level, 2)
 		self.assertTrue(opt_loss_snap_surf._cfg.map_init.dense_opt)
@@ -95,6 +100,9 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.max_sample_angle_deg, 45.0)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.sample_angle_step_fraction, 0.2)
 		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.max_step_neighbor_ratio, 10.0)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.fixture_export_dir, "fixture_out")
+		self.assertFalse(opt_loss_snap_surf._cfg.map_init.fixture_export_once)
+		self.assertFalse(opt_loss_snap_surf._cfg.map_init.fixture_export_objs)
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf.configure_snap_surf(
 				cfg={"map_init": {"unknown": 1}},

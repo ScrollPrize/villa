@@ -185,8 +185,9 @@ def _debug_write_snap_objs(
 	else:
 		_write_obj_lines(iter_dir / f"{prefix}corr_ext_to_model.obj", model_xyz.new_empty(0, 3), model_xyz.new_empty(0, 3), label="corr_ext_to_model")
 
-def _debug_write_map_init_objs(
+def _write_map_init_objs_to_dir(
 	*,
+	out_dir: Path,
 	cfg: SnapSurfConfig,
 	surface_index: int,
 	surface_count: int,
@@ -197,9 +198,7 @@ def _debug_write_map_init_objs(
 	state: _SurfaceState,
 	snapshot_name: str | None = None,
 ) -> None:
-	iter_dir = _debug_obj_iter_dir(cfg)
-	if iter_dir is None:
-		return
+	iter_dir = Path(out_dir)
 	if snapshot_name is not None:
 		iter_dir = iter_dir / "map_init_scales" / _debug_obj_safe_label(snapshot_name)
 	iter_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +292,34 @@ def _debug_write_map_init_objs(
 		f"model_ok={int(ok.sum().detach().cpu())} "
 		f"mapped={int(ok.sum().detach().cpu())} "
 		"files=map_ext_to_model.obj,map_mapped_surface.obj,map_active_mask.obj"
+	)
+
+def _debug_write_map_init_objs(
+	*,
+	cfg: SnapSurfConfig,
+	surface_index: int,
+	surface_count: int,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	state: _SurfaceState,
+	snapshot_name: str | None = None,
+) -> None:
+	iter_dir = _debug_obj_iter_dir(cfg)
+	if iter_dir is None:
+		return
+	_write_map_init_objs_to_dir(
+		out_dir=iter_dir,
+		cfg=cfg,
+		surface_index=surface_index,
+		surface_count=surface_count,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		ext_xyz=ext_xyz,
+		ext_valid=ext_valid,
+		state=state,
+		snapshot_name=snapshot_name,
 	)
 
 __all__ = [name for name in globals() if not name.startswith('__')]

@@ -33,6 +33,7 @@ class SnapSurfMapInitConfig:
 	global_opt_interval: int = 10
 	progress_interval: int = 100
 	progress_mode: str = "block"
+	no_progress_iters: int = 1000
 	scale_levels: int = 1
 	scale_factor: int = 2
 	min_scale_level: int = 0
@@ -60,6 +61,9 @@ class SnapSurfMapInitConfig:
 	sample_angle_step_fraction: float = 0.1
 	max_step_neighbor_ratio: float = 10.0
 	jac_margin: float = 0.05
+	fixture_export_dir: str | None = None
+	fixture_export_once: bool = True
+	fixture_export_objs: bool = True
 
 @dataclass(frozen=True)
 class SnapSurfConfig:
@@ -120,6 +124,7 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			global_opt_interval=max(1, int(raw_cfg.get("global_opt_interval", defaults.global_opt_interval))),
 			progress_interval=max(100, int(raw_cfg.get("progress_interval", defaults.progress_interval))),
 			progress_mode=str(raw_cfg.get("progress_mode", defaults.progress_mode)).lower(),
+			no_progress_iters=max(0, int(raw_cfg.get("no_progress_iters", defaults.no_progress_iters))),
 			scale_levels=max(1, int(raw_cfg.get("scale_levels", defaults.scale_levels))),
 			scale_factor=max(1, int(raw_cfg.get("scale_factor", defaults.scale_factor))),
 			min_scale_level=max(0, int(raw_cfg.get("min_scale_level", defaults.min_scale_level))),
@@ -147,6 +152,13 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			sample_angle_step_fraction=float(raw_cfg.get("sample_angle_step_fraction", defaults.sample_angle_step_fraction)),
 			max_step_neighbor_ratio=float(raw_cfg.get("max_step_neighbor_ratio", defaults.max_step_neighbor_ratio)),
 			jac_margin=float(raw_cfg.get("jac_margin", defaults.jac_margin)),
+			fixture_export_dir=(
+				None
+				if raw_cfg.get("fixture_export_dir", defaults.fixture_export_dir) in {None, ""}
+				else str(raw_cfg.get("fixture_export_dir", defaults.fixture_export_dir))
+			),
+			fixture_export_once=bool(raw_cfg.get("fixture_export_once", defaults.fixture_export_once)),
+			fixture_export_objs=bool(raw_cfg.get("fixture_export_objs", defaults.fixture_export_objs)),
 		)
 	else:
 		raise ValueError("snap_surf args.map_init must be an object or null")

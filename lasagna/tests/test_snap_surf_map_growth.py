@@ -143,6 +143,70 @@ class SnapSurfMapGrowthTest(unittest.TestCase):
 		self.assertEqual(mi.global_opt_blocks, 1)
 		self.assertTrue(mi.surface_last_global_done)
 
+	def test_interleaved_initial_map_uses_budget_after_scale_transition(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"surface_loss": True,
+					"initial_iters": 4,
+					"iters": 4,
+					"seed_opt_iters": 0,
+					"grow_opt_iters": 1,
+					"first_global_opt_iters": 0,
+					"last_global_opt_iters": 0,
+					"subdiv": 1,
+					"seed_radius": 0,
+					"scale_levels": 3,
+				}
+			},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.set_debug_step(0, label="initial")
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+
+		mi = opt_loss_snap_surf._states[0].map_init
+		self.assertTrue(mi.surface_initial_done)
+		self.assertEqual(mi.total_iters, 4)
+		self.assertEqual(mi.scale_level, 0)
+		self.assertGreater(mi.active_count(), 1)
+
+	def test_interleaved_initial_map_stops_after_no_new_best_then_refines(self) -> None:
+		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"surface_loss": True,
+					"initial_iters": 20,
+					"iters": 20,
+					"seed_opt_iters": 0,
+					"grow_opt_iters": 1,
+					"first_global_opt_iters": 3,
+					"last_global_opt_iters": 0,
+					"subdiv": 1,
+					"seed_radius": 10,
+					"no_progress_iters": 2,
+				}
+			},
+			seed_xyz=(1.5, 1.5, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.set_debug_step(0, label="initial")
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+
+		mi = opt_loss_snap_surf._states[0].map_init
+		self.assertTrue(mi.surface_initial_done)
+		self.assertTrue(mi.surface_first_global_done)
+		self.assertEqual(mi.total_iters, 5)
+		self.assertEqual(mi.global_opt_blocks, 3)
+
 	def test_map_init_planar_aligned_surfaces_produce_identity_map(self) -> None:
 		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)

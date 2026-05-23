@@ -48,7 +48,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 5000,
+			"steps": 1,
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
@@ -67,11 +67,11 @@
 					"map_init": {
 						"enabled": true,
 						"surface_loss": true,
-						"initial_iters": 1000,
+						"initial_iters": 10000,
 						"update_interval": 100,
 						"update_global_opt_iters": 50,
 						"tracking_opt_iters": 1,
-						"first_global_opt_iters": 50,
+						"first_global_opt_iters": 100,
 						"last_global_opt_iters": 50,
 						"subdiv": 2,
 						"iters": 10000,
@@ -81,6 +81,7 @@
 						"fringe_lr": 0.1,
 						"grow_opt_iters": 20,
 						"global_opt_interval": 10,
+						"no_progress_iters": 1000,
 						"scale_levels": 5,
 					    "min_scale_level": 0,
 						"scale_factor": 2,
@@ -100,7 +101,10 @@
 						"w_bend": 0.01,
 						"w_jac": 10.0,
 						"w_metric_smooth": 1.0,
-						"w_area_smooth": 1.0
+						"w_area_smooth": 1.0,
+						"fixture_export_dir": "snap_surf_map_fixture",
+						"fixture_export_once": true,
+						"fixture_export_objs": true
 					}
 				}
 			}

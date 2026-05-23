@@ -12,6 +12,7 @@ import snap_surf.map_pyramid as _map_pyramid
 import snap_surf.map_objective as _map_objective
 import snap_surf.map_growth as _map_growth
 import snap_surf.debug_obj as _debug_obj
+import snap_surf.map_fixture_io as _map_fixture_io
 
 _MODULES: tuple[ModuleType, ...] = (
 	_config,
@@ -22,6 +23,7 @@ _MODULES: tuple[ModuleType, ...] = (
 	_map_objective,
 	_map_growth,
 	_debug_obj,
+	_map_fixture_io,
 )
 _RUNTIME_NAMES = {"_cfg", "_active", "_seed_xyz", "_states", "_last_stats", "_debug_step", "_debug_label", "_stage_label"}
 

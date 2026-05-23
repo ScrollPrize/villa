@@ -19,6 +19,7 @@ from .legacy import *
 from .map_pyramid import *
 from .map_objective import *
 from .debug_obj import _debug_obj_iter_dir, _debug_write_map_init_objs
+from .map_fixture_io import export_map_fixture, map_fixture_surface_dir
 
 def _map_init_estimate_normal_sign(
 	*,
@@ -649,6 +650,11 @@ def _map_init_term_float(terms: dict[str, torch.Tensor], key: str) -> float:
 	if v is None:
 		return 0.0
 	return float(v.detach().cpu())
+
+def _map_init_progress_sample_count(terms: dict[str, torch.Tensor]) -> float:
+	if "samples" in terms:
+		return max(0.0, _map_init_term_float(terms, "samples"))
+	return max(0.0, _map_init_term_float(terms, "sample_valid"))
 
 def _map_init_accumulate_phase_stats(state: _MapInitState, phase: str, terms: dict[str, torch.Tensor]) -> None:
 	valid = max(0.0, _map_init_term_float(terms, "sample_valid"))
@@ -1776,6 +1782,53 @@ def _map_init_stats_from_state(state: _SurfaceState) -> dict[str, float]:
 	stats["snaps_map_repair"] = float(state.map_init.repair_blocks)
 	return stats
 
+def _map_init_maybe_export_fixture(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	seed_xyz: tuple[float, float, float],
+	surface_index: int,
+	surface_count: int,
+	stats: dict[str, float] | None = None,
+	step: int | None = None,
+) -> None:
+	root = cfg.map_init.fixture_export_dir
+	if root in {None, ""}:
+		return
+	if bool(cfg.map_init.fixture_export_once) and bool(state.map_init.fixture_exported):
+		return
+	if not _map_init_started(state):
+		return
+	out_dir = map_fixture_surface_dir(str(root), surface_index, surface_count)
+	stats_use = dict(stats) if stats is not None else _map_init_stats_from_state(state)
+	export_map_fixture(
+		out_dir,
+		cfg=cfg,
+		state=state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		ext_xyz=ext_xyz,
+		ext_valid=ext_valid,
+		ext_normals=ext_normals,
+		ext_quad_valid=ext_quad_valid,
+		seed_xyz=seed_xyz,
+		surface_index=surface_index,
+		surface_count=surface_count,
+		step=step,
+		stats=stats_use,
+		export_objs=bool(cfg.map_init.fixture_export_objs),
+	)
+	state.map_init.fixture_exported = True
+	_map_init_log(f"fixture exported dir={out_dir}")
+
 def _map_init_seed_if_needed(
 	state: _SurfaceState,
 	*,
@@ -2182,9 +2235,23 @@ def _run_map_init_interleaved_for_surface(
 						cfg=cfg,
 						phase="seed",
 					)
+				if not state.map_init.last_terms:
+					terms = _map_init_eval_terms_for_state(
+						state,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						cfg=cfg,
+					)
+					state.map_init.last_terms = dict(terms)
+				best_samples = _map_init_progress_sample_count(state.map_init.last_terms)
+				no_progress_limit = max(0, int(cfg.map_init.no_progress_iters))
+				no_progress_used = 0
 				while _map_init_iter_room(state, cfg, target) > 0 and state.map_init.active_count() > 0:
-					before = int(state.map_init.total_iters)
-					added, _terms = _map_init_growth_round(
+					before_iter = int(state.map_init.total_iters)
+					before_level = int(state.map_init.scale_level)
+					before_active = state.map_init.active_count()
+					added, terms = _map_init_growth_round(
 						state,
 						model_xyz=model_xyz,
 						model_valid=model_valid,
@@ -2198,7 +2265,35 @@ def _run_map_init_interleaved_for_surface(
 						global_steps=int(cfg.map_init.grow_opt_iters),
 						target_iter=target,
 					)
-					if int(state.map_init.total_iters) <= before or added <= 0:
+					after_iter = int(state.map_init.total_iters)
+					after_level = int(state.map_init.scale_level)
+					after_active = state.map_init.active_count()
+					current_samples = _map_init_progress_sample_count(terms)
+					scale_transitioned = after_level < before_level
+					if (
+						after_iter <= before_iter and
+						after_level >= before_level and
+						int(added) <= 0 and
+						after_active == before_active
+					):
+						break
+					if scale_transitioned:
+						best_samples = current_samples
+						no_progress_used = 0
+					elif current_samples > best_samples:
+						best_samples = current_samples
+						no_progress_used = 0
+					else:
+						no_progress_used += max(0, after_iter - before_iter)
+					if no_progress_limit > 0 and no_progress_used >= no_progress_limit:
+						_map_init_log(
+							"initial no-progress stop "
+							f"iters_without_progress={no_progress_used}/{no_progress_limit} "
+							f"best_samples={best_samples:.0f} "
+							f"current_samples={current_samples:.0f} "
+							f"active={after_active} "
+							f"scale={after_level}"
+						)
 						break
 			state.map_init.surface_initial_done = True
 			if not state.map_init.surface_first_global_done:
@@ -2212,6 +2307,22 @@ def _run_map_init_interleaved_for_surface(
 					mode="first",
 				)
 				state.map_init.surface_first_global_done = True
+				_map_init_maybe_export_fixture(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					ext_xyz=ext_xyz,
+					ext_valid=ext_valid,
+					ext_normals=ext_normals,
+					ext_quad_valid=ext_quad_valid,
+					cfg=cfg,
+					seed_xyz=seed_xyz,
+					surface_index=surface_index,
+					surface_count=surface_count,
+					stats=_map_init_stats_from_state(state),
+					step=debug_step,
+				)
 		step = None if debug_step is None else int(debug_step)
 		if step is not None and step > 0:
 			ran_update = False
@@ -2300,7 +2411,23 @@ def _run_map_init_for_surface(
 			f"iters={state.map_init.total_iters} "
 			f"normal_sign={state.map_init.normal_sign}"
 		)
-		return dict(state.map_init.stats)
+		stats = dict(state.map_init.stats)
+		_map_init_maybe_export_fixture(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad_valid,
+			cfg=cfg,
+			seed_xyz=seed_xyz,
+			surface_index=surface_index,
+			surface_count=surface_count,
+			stats=stats,
+		)
+		return stats
 	stats = _map_init_empty_stats()
 	_map_init_log(
 		"start "
@@ -2763,6 +2890,21 @@ def _run_map_init_for_surface(
 	stats["snaps_map_repair"] = float(state.map_init.repair_blocks)
 	state.map_init.done = True
 	state.map_init.stats = stats
+	_map_init_maybe_export_fixture(
+		state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		ext_xyz=ext_xyz,
+		ext_valid=ext_valid,
+		ext_normals=ext_normals,
+		ext_quad_valid=ext_quad_valid,
+		cfg=cfg,
+		seed_xyz=seed_xyz,
+		surface_index=surface_index,
+		surface_count=surface_count,
+		stats=stats,
+	)
 	_map_init_log(
 		"done "
 		f"active={stats['snaps_map_active']:.0f} "

@@ -127,6 +127,7 @@ class _MapInitState:
 		self.progress_last_iter: int = 0
 		self.blocked_last_revisit_iter: int = 0
 		self.stats: dict[str, float] = {}
+		self.fixture_exported: bool = False
 
 	def reset(self) -> None:
 		self.__init__()

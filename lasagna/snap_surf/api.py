@@ -148,6 +148,7 @@ def configure_snap_surf(
 			f"global_opt_interval={_cfg.map_init.global_opt_interval} "
 			f"progress_interval={_cfg.map_init.progress_interval} "
 			f"progress_mode={_cfg.map_init.progress_mode!r} "
+			f"no_progress_iters={_cfg.map_init.no_progress_iters} "
 			f"scale_levels={_cfg.map_init.scale_levels} "
 			f"scale_factor={_cfg.map_init.scale_factor} "
 			f"min_scale_level={_cfg.map_init.min_scale_level} "
@@ -167,7 +168,10 @@ def configure_snap_surf(
 			f"lr={_cfg.map_init.lr} "
 			f"seed_radius={_cfg.map_init.seed_radius} "
 			f"edge_init_radius={_cfg.map_init.edge_init_radius} "
-			f"jac_margin={_cfg.map_init.jac_margin}"
+			f"jac_margin={_cfg.map_init.jac_margin} "
+			f"fixture_export_dir={_cfg.map_init.fixture_export_dir!r} "
+			f"fixture_export_once={int(_cfg.map_init.fixture_export_once)} "
+			f"fixture_export_objs={int(_cfg.map_init.fixture_export_objs)}"
 		)
 		for state in _states:
 			state.reset_map_init()
