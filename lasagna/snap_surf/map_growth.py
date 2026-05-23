@@ -1683,6 +1683,601 @@ def _debug_write_map_init_scale_objs(
 		snapshot_name=snapshot,
 	)
 
+_MAP_INIT_TERM_STAT_KEYS = (
+	("loss", "snaps_map_loss"),
+	("dist", "snaps_map_dist"),
+	("vec", "snaps_map_vec"),
+	("norm", "snaps_map_norm"),
+	("smooth", "snaps_map_smooth"),
+	("bend", "snaps_map_bend"),
+	("jac", "snaps_map_jac"),
+	("smooth_fwd", "snaps_map_smooth_fwd"),
+	("bend_fwd", "snaps_map_bend_fwd"),
+	("jac_fwd", "snaps_map_jac_fwd"),
+	("metric_smooth", "snaps_map_metric_smooth"),
+	("area_smooth", "snaps_map_area_smooth"),
+	("smooth_rev", "snaps_map_smooth_rev"),
+	("bend_rev", "snaps_map_bend_rev"),
+	("jac_rev", "snaps_map_jac_rev"),
+	("jac_min", "snaps_map_jmin"),
+	("jac_inv_min", "snaps_map_jinv_min"),
+	("prior", "snaps_map_prior"),
+	("reg", "snaps_map_reg"),
+	("jac_bad", "snaps_map_jbad"),
+	("jac_bad_frac", "snaps_map_jbadf"),
+	("jac_inv_bad", "snaps_map_jinv_bad"),
+	("samples", "snaps_map_samples"),
+	("uv_bad", "snaps_map_uvbad"),
+	("model_bad", "snaps_map_model_bad"),
+	("step_bad_quad", "snaps_map_step_bad"),
+)
+
+def _map_init_started(state: _SurfaceState) -> bool:
+	return (
+		state.map_init.active_quad is not None and state.map_init.uv is not None and
+		state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
+		state.map_init.ext_valid is not None and state.map_init.model_depth is not None
+	)
+
+def _map_init_iter_room(state: _SurfaceState, cfg: SnapSurfConfig, target_iter: int | None = None) -> int:
+	room = max(0, int(cfg.map_init.iters) - int(state.map_init.total_iters))
+	if target_iter is not None:
+		room = min(room, max(0, int(target_iter) - int(state.map_init.total_iters)))
+	return int(room)
+
+def _map_init_write_term_stats(stats: dict[str, float], terms: dict[str, torch.Tensor]) -> None:
+	for key, stat_key in _MAP_INIT_TERM_STAT_KEYS:
+		if key in terms:
+			stats[stat_key] = float(terms[key].detach().cpu())
+
+def _map_init_stats_from_state(state: _SurfaceState) -> dict[str, float]:
+	stats = _map_init_empty_stats()
+	stats["snaps_sdist"] = float(state.map_init.seed_model_distance)
+	stats["snaps_sext"] = float(state.map_init.seed_ext_distance)
+	stats["snaps_seed"] = 1.0 if state.map_init.seed_model_quad is not None else 0.0
+	stats["snaps_map_init"] = float(state.map_init.seed_init_count)
+	terms = dict(state.map_init.last_terms)
+	_map_init_write_term_stats(stats, terms)
+	stats["snaps_map_active"] = float(state.map_init.active_count())
+	stats["snaps_map_added"] = float(state.map_init.added_total)
+	stats["snaps_map_blocked"] = (
+		float(int(state.map_init.blocked_quad.sum().detach().cpu()))
+		if state.map_init.blocked_quad is not None else 0.0
+	)
+	stats["snaps_map_sparse"] = float(state.map_init.sparse_pruned_total)
+	stats["snaps_map_iters"] = float(state.map_init.total_iters)
+	stats["snaps_map_blocks"] = float(state.map_init.opt_blocks)
+	stats["snaps_map_grow"] = float(state.map_init.grow_steps)
+	stats["snaps_map_global"] = float(state.map_init.global_opt_blocks)
+	stats["snaps_map_rim"] = float(state.map_init.rim_only_blocks)
+	stats["snaps_map_rim_problem"] = float(state.map_init.rim_problem_blocks)
+	stats["snaps_map_add_loss"] = (
+		float(state.map_init.add_sample_loss_sum) / float(max(1.0, state.map_init.add_sample_weight))
+	)
+	stats["snaps_map_add_bad_frac"] = (
+		float(state.map_init.add_bad_samples) / float(max(1.0, state.map_init.add_total_samples))
+	)
+	stats["snaps_map_add_success_frac"] = (
+		float(state.map_init.add_success_quads) / float(max(1.0, state.map_init.add_total_quads))
+		if state.map_init.add_total_quads > 0.0 else 0.0
+	)
+	stats["snaps_map_fringe_loss"] = (
+		float(state.map_init.fringe_sample_loss_sum) / float(max(1.0, state.map_init.fringe_sample_weight))
+	)
+	stats["snaps_map_fringe_bad_frac"] = (
+		float(state.map_init.fringe_bad_samples) / float(max(1.0, state.map_init.fringe_total_samples))
+	)
+	stats["snaps_map_fringe_success_frac"] = (
+		float(state.map_init.fringe_success_quads) / float(max(1.0, state.map_init.fringe_total_quads))
+		if state.map_init.fringe_total_quads > 0.0 else 0.0
+	)
+	stats["snaps_map_nsign"] = float(state.map_init.normal_sign)
+	stats["snaps_map_scales"] = float(state.map_init.scale_levels_used)
+	stats["snaps_map_repair"] = float(state.map_init.repair_blocks)
+	return stats
+
+def _map_init_seed_if_needed(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	seed_xyz: tuple[float, float, float],
+) -> bool:
+	if _map_init_started(state):
+		return state.map_init.seed_model_quad is not None
+	_map_init_log(
+		"start "
+		f"model_shape={tuple(int(v) for v in model_xyz.shape[:3])} "
+		f"ext_shape={tuple(int(v) for v in ext_xyz.shape[:2])} "
+		f"valid_ext={int(ext_valid.sum().detach().cpu())} "
+		f"valid_ext_quads={int(ext_quad_valid.sum().detach().cpu()) if ext_quad_valid.numel() else 0}"
+	)
+	with torch.no_grad():
+		ok, seed_model_dist, seed_ext_dist, init_count = _map_init_seed_state(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad_valid,
+			cfg=cfg,
+			seed_xyz=seed_xyz,
+		)
+	state.map_init.seed_model_distance = float(seed_model_dist)
+	state.map_init.seed_ext_distance = float(seed_ext_dist)
+	state.map_init.seed_init_count = int(init_count)
+	_map_init_log(
+		"seed "
+		f"ok={int(ok)} "
+		f"seed_model_dist={seed_model_dist:.6g} "
+		f"seed_ext_dist={seed_ext_dist:.6g} "
+		f"init_active={init_count} "
+		f"seed_ext_sample={state.map_init.seed_ext_sample_hw} "
+		f"seed_model_quad={state.map_init.seed_model_quad} "
+		f"model_depth={state.map_init.model_depth} "
+		f"orientation_sign={state.map_init.orientation_sign} "
+		f"normal_sign={state.map_init.normal_sign}"
+	)
+	return bool(ok)
+
+def _map_init_filter_and_eval(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	cfg: SnapSurfConfig,
+	phase: str,
+) -> tuple[dict[str, torch.Tensor], int, int, int]:
+	if not _map_init_started(state):
+		return {}, 0, 0, 0
+	pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
+		state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		cfg=cfg,
+	)
+	terms = _map_init_eval_terms_for_state(
+		state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		cfg=cfg,
+	)
+	state.map_init.last_terms = dict(terms)
+	if pruned_sample > 0 or pruned_fold > 0 or pruned_sparse > 0:
+		_map_init_log(
+			f"{phase} filter "
+			f"level={state.map_init.scale_level} "
+			f"sample={pruned_sample} "
+			f"fold={pruned_fold} "
+			f"sparse={pruned_sparse} "
+			f"active={state.map_init.active_count()}"
+		)
+	return terms, pruned_sample, pruned_fold, pruned_sparse
+
+def _map_init_global_filter_block(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	cfg: SnapSurfConfig,
+	requested_steps: int,
+	mode: str,
+	target_iter: int | None = None,
+	log_block: bool = True,
+) -> dict[str, torch.Tensor]:
+	if not _map_init_started(state):
+		return {}
+	terms, _ps, _pf, _pz = _map_init_filter_and_eval(
+		state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		cfg=cfg,
+		phase=f"{mode}0",
+	)
+	steps = min(max(0, int(requested_steps)), _map_init_iter_room(state, cfg, target_iter))
+	if steps > 0 and state.map_init.active_count() > 0:
+		if log_block and (
+			state.map_init.active_quad is not None and state.map_init.uv is not None and
+			state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
+			state.map_init.ext_valid is not None and state.map_init.model_depth is not None
+		):
+			_map_init_log_fringe_debug(
+				state=state.map_init,
+				phase=f"{mode}0",
+				block=state.map_init.opt_blocks + 1,
+				iter_idx=state.map_init.total_iters,
+				uv_full=state.map_init.uv,
+				active_quad=state.map_init.active_quad,
+				ext_pos=state.map_init.ext_pos,
+				ext_normals=state.map_init.ext_normals,
+				ext_valid=state.map_init.ext_valid,
+				ext_quad_valid=state.map_init.ext_quad_valid,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				model_depth=int(state.map_init.model_depth),
+				cfg=cfg,
+			)
+		terms = _map_init_optimize_block(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			cfg=cfg,
+			steps=steps,
+			mode=mode,
+		)
+		state.map_init.last_terms = dict(terms)
+		state.map_init.global_opt_blocks += 1
+		state.map_init.rim_blocks_since_global_opt = 0
+		if log_block and (
+			state.map_init.active_quad is not None and state.map_init.uv is not None and
+			state.map_init.ext_pos is not None and state.map_init.ext_normals is not None and
+			state.map_init.ext_valid is not None and state.map_init.model_depth is not None
+		):
+			_map_init_log_fringe_debug(
+				state=state.map_init,
+				phase=mode,
+				block=state.map_init.opt_blocks,
+				iter_idx=state.map_init.total_iters,
+				uv_full=state.map_init.uv,
+				active_quad=state.map_init.active_quad,
+				ext_pos=state.map_init.ext_pos,
+				ext_normals=state.map_init.ext_normals,
+				ext_valid=state.map_init.ext_valid,
+				ext_quad_valid=state.map_init.ext_quad_valid,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				model_depth=int(state.map_init.model_depth),
+				cfg=cfg,
+			)
+		terms, _ps, _pf, _pz = _map_init_filter_and_eval(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			cfg=cfg,
+			phase=mode,
+		)
+		repair_local_blocks = 0
+		while (
+			_map_init_needs_repair(terms) and
+			_map_init_repair_block_allowed(cfg, repair_local_blocks) and
+			_map_init_iter_room(state, cfg, target_iter) > 0
+		):
+			repair_steps = min(_map_init_repair_block_steps(cfg), _map_init_iter_room(state, cfg, target_iter))
+			if repair_steps <= 0:
+				break
+			repair_local_blocks += 1
+			terms = _map_init_optimize_block(
+				state,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				cfg=cfg,
+				steps=repair_steps,
+				mode=f"{mode}_repair",
+				lr_mult=float(cfg.map_init.repair_lr_mult),
+				w_jac_mult=float(cfg.map_init.repair_w_jac_mult),
+			)
+			state.map_init.last_terms = dict(terms)
+			state.map_init.repair_blocks += 1
+			terms, _ps, _pf, _pz = _map_init_filter_and_eval(
+				state,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				cfg=cfg,
+				phase=f"{mode}_repair",
+			)
+	return dict(terms)
+
+def _map_init_maybe_transition_scale(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	surface_index: int,
+	surface_count: int,
+) -> bool:
+	if int(state.map_init.scale_level) <= int(state.map_init.target_scale_level):
+		return False
+	_debug_write_map_init_scale_objs(
+		cfg=cfg,
+		surface_index=surface_index,
+		surface_count=surface_count,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		ext_xyz=ext_xyz,
+		ext_valid=ext_valid,
+		state=state,
+	)
+	if not _map_init_transition_to_finer(state, cfg):
+		return False
+	pruned_sample, pruned_fold, pruned_sparse = _map_init_prune_bad_active_quads(
+		state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		cfg=cfg,
+	)
+	terms = _map_init_eval_terms_for_state(
+		state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		cfg=cfg,
+	)
+	state.map_init.last_terms = dict(terms)
+	_map_init_refresh_uv_guess(state, model_valid=model_valid, cfg=cfg)
+	_map_init_log(
+		"scale prune "
+		f"level={state.map_init.scale_level} "
+		f"sample={pruned_sample} "
+		f"fold={pruned_fold} "
+		f"sparse={pruned_sparse} "
+		f"active={state.map_init.active_count()}"
+	)
+	return True
+
+def _map_init_growth_round(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	surface_index: int,
+	surface_count: int,
+	force_global: bool,
+	global_steps: int,
+	target_iter: int | None = None,
+) -> tuple[int, dict[str, torch.Tensor]]:
+	if not _map_init_started(state) or _map_init_iter_room(state, cfg, target_iter) <= 0:
+		return 0, dict(state.map_init.last_terms)
+	added = _map_init_grow_once(
+		state,
+		model_xyz=model_xyz,
+		model_valid=model_valid,
+		model_normals=model_normals,
+		cfg=cfg,
+	)
+	growth_terms = dict(state.map_init.last_growth_terms)
+	terms = growth_terms
+	steps = min(max(0, int(global_steps)), _map_init_iter_room(state, cfg, target_iter))
+	run_global = bool(force_global and steps > 0)
+	reason = "forced" if run_global else "none"
+	if not force_global and steps > 0:
+		run_global, reason = _map_init_should_run_global_opt(
+			state,
+			cfg,
+			added=added,
+			pruned_sample=0,
+			pruned_fold=0,
+			pruned_sparse=0,
+			terms=growth_terms,
+		)
+	if run_global:
+		if reason in ("rim_prune", "rim_problem"):
+			state.map_init.rim_problem_blocks += 1
+		terms = _map_init_global_filter_block(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			cfg=cfg,
+			requested_steps=steps,
+			mode="grow",
+			target_iter=target_iter,
+		)
+	elif added > 0:
+		state.map_init.rim_only_blocks += 1
+		state.map_init.rim_blocks_since_global_opt += 1
+		terms = _map_init_eval_terms_for_state(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			cfg=cfg,
+		)
+		state.map_init.last_terms = dict(terms)
+	if added <= 0:
+		_map_init_maybe_transition_scale(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			cfg=cfg,
+			surface_index=surface_index,
+			surface_count=surface_count,
+		)
+	if not terms:
+		terms = _map_init_eval_terms_for_state(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			cfg=cfg,
+		)
+		state.map_init.last_terms = dict(terms)
+	return int(added), dict(terms)
+
+def _run_map_init_interleaved_for_surface(
+	state: _SurfaceState,
+	*,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	seed_xyz: tuple[float, float, float],
+	surface_index: int = 0,
+	surface_count: int = 1,
+	debug_step: int | None = None,
+	stage_steps: int | None = None,
+) -> dict[str, float]:
+	with torch.enable_grad():
+		ok = _map_init_seed_if_needed(
+			state,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad_valid,
+			cfg=cfg,
+			seed_xyz=seed_xyz,
+		)
+		if not ok:
+			return _map_init_stats_from_state(state)
+		if not state.map_init.surface_initial_done:
+			target = min(int(cfg.map_init.iters), int(cfg.map_init.initial_iters))
+			if state.map_init.total_iters < target:
+				seed_block = min(
+					int(cfg.map_init.seed_opt_iters),
+					_map_init_iter_room(state, cfg, target),
+				)
+				if seed_block > 0:
+					terms = _map_init_optimize_block(
+						state,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						cfg=cfg,
+						steps=seed_block,
+						mode="seed",
+					)
+					state.map_init.last_terms = dict(terms)
+					_map_init_filter_and_eval(
+						state,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						cfg=cfg,
+						phase="seed",
+					)
+				while _map_init_iter_room(state, cfg, target) > 0 and state.map_init.active_count() > 0:
+					before = int(state.map_init.total_iters)
+					added, _terms = _map_init_growth_round(
+						state,
+						model_xyz=model_xyz,
+						model_valid=model_valid,
+						model_normals=model_normals,
+						ext_xyz=ext_xyz,
+						ext_valid=ext_valid,
+						cfg=cfg,
+						surface_index=surface_index,
+						surface_count=surface_count,
+						force_global=False,
+						global_steps=int(cfg.map_init.grow_opt_iters),
+						target_iter=target,
+					)
+					if int(state.map_init.total_iters) <= before or added <= 0:
+						break
+			state.map_init.surface_initial_done = True
+			if not state.map_init.surface_first_global_done:
+				_map_init_global_filter_block(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					cfg=cfg,
+					requested_steps=int(cfg.map_init.first_global_opt_iters),
+					mode="first",
+				)
+				state.map_init.surface_first_global_done = True
+		step = None if debug_step is None else int(debug_step)
+		if step is not None and step > 0:
+			ran_update = False
+			ran_final = False
+			interval = max(1, int(cfg.map_init.update_interval))
+			if (step % interval) == 0 and state.map_init.surface_last_update_step != step:
+				_map_init_filter_and_eval(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					cfg=cfg,
+					phase="update",
+				)
+				_map_init_growth_round(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					ext_xyz=ext_xyz,
+					ext_valid=ext_valid,
+					cfg=cfg,
+					surface_index=surface_index,
+					surface_count=surface_count,
+					force_global=True,
+					global_steps=int(cfg.map_init.update_global_opt_iters),
+				)
+				state.map_init.surface_last_update_step = step
+				ran_update = True
+			if (
+				stage_steps is not None and step >= int(stage_steps) and
+				not state.map_init.surface_last_global_done
+			):
+				_map_init_global_filter_block(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					cfg=cfg,
+					requested_steps=int(cfg.map_init.last_global_opt_iters),
+					mode="last",
+				)
+				state.map_init.surface_last_global_done = True
+				ran_final = True
+			if not ran_update and not ran_final and int(cfg.map_init.tracking_opt_iters) > 0:
+				_map_init_global_filter_block(
+					state,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_normals=model_normals,
+					cfg=cfg,
+					requested_steps=int(cfg.map_init.tracking_opt_iters),
+					mode="track",
+					log_block=False,
+				)
+		if not state.map_init.last_terms:
+			terms = _map_init_eval_terms_for_state(
+				state,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				cfg=cfg,
+			)
+			state.map_init.last_terms = dict(terms)
+	return _map_init_stats_from_state(state)
+
 def _run_map_init_for_surface(
 	state: _SurfaceState,
 	*,

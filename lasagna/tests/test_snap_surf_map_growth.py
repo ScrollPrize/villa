@@ -35,6 +35,114 @@ class SnapSurfMapGrowthTest(unittest.TestCase):
 		self.assertAlmostEqual(float(model_xyz.grad.abs().sum().detach()), 0.0, places=6)
 		self.assertGreater(opt_loss_snap_surf.last_stats()["snaps_map_active"], 0.0)
 
+	def test_interleaved_map_surface_loss_pulls_model_along_normal(self) -> None:
+		model_xyz = (_plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)).requires_grad_(True)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"surface_loss": True,
+					"initial_iters": 1,
+					"seed_opt_iters": 1,
+					"grow_opt_iters": 0,
+					"first_global_opt_iters": 0,
+					"last_global_opt_iters": 0,
+					"subdiv": 1,
+				}
+			},
+			seed_xyz=(1.5, 1.5, 0.0),
+			active=True,
+		)
+
+		loss, _, _ = opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		loss.backward()
+
+		stats = opt_loss_snap_surf.last_stats()
+		self.assertGreater(float(loss.detach()), 0.0)
+		self.assertGreater(stats["snaps_map_surf_n"], 0.0)
+		self.assertIsNotNone(model_xyz.grad)
+		self.assertGreater(float(model_xyz.grad[..., 2].sum().detach()), 0.0)
+		self.assertAlmostEqual(float(model_xyz.grad[..., :2].abs().sum().detach()), 0.0, places=6)
+
+	def test_interleaved_map_growth_runs_on_update_interval_with_forced_global(self) -> None:
+		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"surface_loss": True,
+					"initial_iters": 0,
+					"seed_opt_iters": 0,
+					"candidate_opt_iters": 1,
+					"fringe_opt_iters": 1,
+					"grow_opt_iters": 0,
+					"update_interval": 2,
+					"update_global_opt_iters": 1,
+					"tracking_opt_iters": 1,
+					"first_global_opt_iters": 0,
+					"last_global_opt_iters": 0,
+					"subdiv": 1,
+					"seed_radius": 0,
+					"edge_init_radius": 2,
+					"iters": 20,
+				}
+			},
+			seed_xyz=(2.0, 2.0, 0.0),
+			active=True,
+		)
+
+		opt_loss_snap_surf.set_debug_step(0, label="initial")
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		mi = opt_loss_snap_surf._states[0].map_init
+		initial_active = mi.active_count()
+		self.assertEqual(mi.global_opt_blocks, 0)
+
+		opt_loss_snap_surf.set_debug_step(1, label="snap")
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		self.assertEqual(mi.active_count(), initial_active)
+		self.assertEqual(mi.global_opt_blocks, 1)
+
+		opt_loss_snap_surf.set_debug_step(2, label="snap")
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		self.assertGreater(mi.active_count(), initial_active)
+		self.assertEqual(mi.global_opt_blocks, 2)
+		self.assertEqual(mi.surface_last_update_step, 2)
+
+	def test_interleaved_map_runs_last_global_on_final_stage_step(self) -> None:
+		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)
+		opt_loss_snap_surf.configure_snap_surf(
+			cfg={
+				"map_init": {
+					"enabled": True,
+					"surface_loss": True,
+					"initial_iters": 0,
+					"seed_opt_iters": 0,
+					"update_interval": 99,
+					"first_global_opt_iters": 0,
+					"last_global_opt_iters": 1,
+					"subdiv": 1,
+					"seed_radius": 0,
+					"iters": 20,
+				}
+			},
+			seed_xyz=(1.5, 1.5, 0.0),
+			active=True,
+			stage_steps=2,
+		)
+
+		opt_loss_snap_surf.set_debug_step(0, label="initial")
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		mi = opt_loss_snap_surf._states[0].map_init
+		self.assertEqual(mi.global_opt_blocks, 0)
+
+		opt_loss_snap_surf.set_debug_step(2, label="snap")
+		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
+		self.assertEqual(mi.global_opt_blocks, 1)
+		self.assertTrue(mi.surface_last_global_done)
+
 	def test_map_init_planar_aligned_surfaces_produce_identity_map(self) -> None:
 		model_xyz = _plane_xyz(h=4, w=4, z=1.0).unsqueeze(0)
 		ext_xyz = _plane_xyz(h=4, w=4, z=0.0)

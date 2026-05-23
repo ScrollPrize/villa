@@ -932,4 +932,100 @@ def _map_init_objective(
 		"step_bad_quad": torch.tensor(float(int(step_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
 	}
 
+def _map_init_surface_normal_loss(
+	*,
+	uv_full: torch.Tensor,
+	active_quad: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None = None,
+	ext_coords: torch.Tensor | None = None,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_depth: int,
+	cfg: SnapSurfConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+	device = model_xyz.device
+	dtype = model_xyz.dtype
+	lm = torch.zeros(model_xyz.shape[:3], device=device, dtype=dtype)
+	lm_count = torch.zeros_like(lm)
+	mask = torch.zeros_like(lm)
+	empty_stats = {
+		"snaps_map_surf": 0.0,
+		"snaps_map_surf_n": 0.0,
+		"snaps_map_surf_avg": 0.0,
+		"snaps_map_surf_abs": 0.0,
+		"snaps_map_surf_max": 0.0,
+	}
+	z = model_xyz.sum() * 0.0
+	if uv_full.numel() == 0 or active_quad.numel() == 0:
+		return z, lm.unsqueeze(1), mask.unsqueeze(1), empty_stats
+	active_quad = active_quad.bool()
+	quad_hw = active_quad.nonzero(as_tuple=False)
+	if int(quad_hw.shape[0]) == 0:
+		return z, lm.unsqueeze(1), mask.unsqueeze(1), empty_stats
+	uv_samples, p_ext, _n_ext, sample_ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
+		uv_full=uv_full.detach(),
+		ext_pos=ext_pos.detach(),
+		ext_normals=ext_normals.detach(),
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		ext_coords=ext_coords,
+		quad_hw=quad_hw,
+		subdiv=int(cfg.map_init.subdiv),
+	)
+	Q, S = int(uv_samples.shape[0]), int(uv_samples.shape[1])
+	uv = uv_samples.reshape(Q * S, 2).detach()
+	coords3 = _map_init_coords3(uv, depth=int(model_depth)).detach()
+	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+	p_ext_f = p_ext.reshape(Q * S, 3).detach()
+	p_model = _sample_surface_grid(model_xyz, safe_coords)
+	n_model_raw = _sample_surface_grid(model_normals.detach(), safe_coords)
+	n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+	coord_ok = _quad_valid_at_coords(
+		model_valid.bool(),
+		safe_coords,
+		tuple(int(v) for v in model_valid.shape),
+	)
+	raw_residual = ((p_model - p_ext_f) * n_model).sum(dim=-1)
+	scaled_residual = raw_residual / float(cfg.distance_scale)
+	values = _huber(scaled_residual, delta=float(cfg.huber_delta) / float(cfg.distance_scale))
+	finite = (
+		sample_ext_ok.reshape(Q * S) &
+		quad_uv_ok[:, None].expand(Q, S).reshape(Q * S) &
+		torch.isfinite(uv).all(dim=-1) &
+		coord_ok &
+		torch.isfinite(p_ext_f).all(dim=-1) &
+		torch.isfinite(p_model).all(dim=-1) &
+		torch.isfinite(n_model_raw).all(dim=-1) &
+		torch.isfinite(n_model).all(dim=-1) &
+		(n_model.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(raw_residual) &
+		torch.isfinite(values)
+	)
+	if not bool(finite.any().detach().cpu()):
+		return z, lm.unsqueeze(1), mask.unsqueeze(1), empty_stats
+	values_f = values[finite]
+	raw_f = raw_residual[finite]
+	loss = values_f.mean()
+	coords_f = safe_coords[finite]
+	D, H, W = (int(model_xyz.shape[0]), int(model_xyz.shape[1]), int(model_xyz.shape[2]))
+	idx_d = torch.round(coords_f[:, 0]).clamp(0, max(0, D - 1)).long()
+	idx_h = torch.round(coords_f[:, 1]).clamp(0, max(0, H - 1)).long()
+	idx_w = torch.round(coords_f[:, 2]).clamp(0, max(0, W - 1)).long()
+	lm.index_put_((idx_d, idx_h, idx_w), values_f.detach(), accumulate=True)
+	lm_count.index_put_((idx_d, idx_h, idx_w), torch.ones_like(values_f.detach()), accumulate=True)
+	mask = lm_count > 0.0
+	lm = torch.where(mask, lm / lm_count.clamp_min(1.0), lm)
+	stats = {
+		"snaps_map_surf": float(loss.detach().cpu()),
+		"snaps_map_surf_n": float(values_f.numel()),
+		"snaps_map_surf_avg": float(raw_f.mean().detach().cpu()),
+		"snaps_map_surf_abs": float(raw_f.abs().mean().detach().cpu()),
+		"snaps_map_surf_max": float(raw_f.abs().max().detach().cpu()),
+	}
+	return loss, lm.unsqueeze(1), mask.to(dtype=dtype).unsqueeze(1), stats
+
 __all__ = [name for name in globals() if not name.startswith('__')]

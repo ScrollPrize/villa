@@ -24,6 +24,13 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 			cfg={
 				"map_init": {
 					"enabled": True,
+					"surface_loss": True,
+					"initial_iters": 11,
+					"update_interval": 13,
+					"update_global_opt_iters": 17,
+					"tracking_opt_iters": 29,
+					"first_global_opt_iters": 19,
+					"last_global_opt_iters": 23,
 					"subdiv": 2,
 					"iters": 3,
 					"seed_opt_iters": 7,
@@ -56,6 +63,13 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		)
 
 		self.assertTrue(opt_loss_snap_surf._cfg.map_init.enabled)
+		self.assertTrue(opt_loss_snap_surf._cfg.map_init.surface_loss)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.initial_iters, 11)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.update_interval, 13)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.update_global_opt_iters, 17)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.tracking_opt_iters, 29)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.first_global_opt_iters, 19)
+		self.assertEqual(opt_loss_snap_surf._cfg.map_init.last_global_opt_iters, 23)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.subdiv, 2)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.iters, 3)
 		self.assertEqual(opt_loss_snap_surf._cfg.map_init.seed_opt_iters, 7)

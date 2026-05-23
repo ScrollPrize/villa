@@ -75,6 +75,9 @@ class _MapInitState:
 		self.model_depth: int | None = None
 		self.seed_ext_sample_hw: tuple[int, int] | None = None
 		self.seed_model_quad: tuple[int, int, int] | None = None
+		self.seed_model_distance: float = float("inf")
+		self.seed_ext_distance: float = float("inf")
+		self.seed_init_count: int = 0
 		self.orientation_sign: int = 1
 		self.normal_sign: int = 1
 		self.total_iters: int = 0
@@ -86,7 +89,12 @@ class _MapInitState:
 		self.rim_blocks_since_global_opt: int = 0
 		self.repair_blocks: int = 0
 		self.added_total: int = 0
+		self.last_terms: dict[str, torch.Tensor] = {}
 		self.last_growth_terms: dict[str, torch.Tensor] = {}
+		self.surface_initial_done: bool = False
+		self.surface_first_global_done: bool = False
+		self.surface_last_global_done: bool = False
+		self.surface_last_update_step: int | None = None
 		self.sparse_pruned_total: int = 0
 		self.add_sample_loss_sum: float = 0.0
 		self.add_sample_weight: float = 0.0

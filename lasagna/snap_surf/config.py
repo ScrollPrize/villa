@@ -15,6 +15,13 @@ import opt_loss_winding_density
 @dataclass(frozen=True)
 class SnapSurfMapInitConfig:
 	enabled: bool = False
+	surface_loss: bool = False
+	initial_iters: int = 1000
+	update_interval: int = 100
+	update_global_opt_iters: int = 50
+	tracking_opt_iters: int = 1
+	first_global_opt_iters: int = 50
+	last_global_opt_iters: int = 50
 	subdiv: int = 4
 	iters: int = 1000
 	seed_opt_iters: int = 100
@@ -95,6 +102,13 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			raise ValueError(f"snap_surf args.map_init: unknown key(s): {bad}")
 		cfg = SnapSurfMapInitConfig(
 			enabled=bool(raw_cfg.get("enabled", defaults.enabled)),
+			surface_loss=bool(raw_cfg.get("surface_loss", defaults.surface_loss)),
+			initial_iters=max(0, int(raw_cfg.get("initial_iters", defaults.initial_iters))),
+			update_interval=max(1, int(raw_cfg.get("update_interval", defaults.update_interval))),
+			update_global_opt_iters=max(0, int(raw_cfg.get("update_global_opt_iters", defaults.update_global_opt_iters))),
+			tracking_opt_iters=max(0, int(raw_cfg.get("tracking_opt_iters", defaults.tracking_opt_iters))),
+			first_global_opt_iters=max(0, int(raw_cfg.get("first_global_opt_iters", defaults.first_global_opt_iters))),
+			last_global_opt_iters=max(0, int(raw_cfg.get("last_global_opt_iters", defaults.last_global_opt_iters))),
 			subdiv=max(1, int(raw_cfg.get("subdiv", defaults.subdiv))),
 			iters=max(0, int(raw_cfg.get("iters", defaults.iters))),
 			seed_opt_iters=max(0, int(raw_cfg.get("seed_opt_iters", defaults.seed_opt_iters))),

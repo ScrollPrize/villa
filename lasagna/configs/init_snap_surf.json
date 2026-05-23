@@ -48,7 +48,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 1,
+			"steps": 5000,
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
@@ -66,6 +66,13 @@
 					"map_inlier_distance": 4.0,
 					"map_init": {
 						"enabled": true,
+						"surface_loss": true,
+						"initial_iters": 1000,
+						"update_interval": 100,
+						"update_global_opt_iters": 50,
+						"tracking_opt_iters": 1,
+						"first_global_opt_iters": 50,
+						"last_global_opt_iters": 50,
 						"subdiv": 2,
 						"iters": 10000,
 						"candidate_opt_iters": 5,

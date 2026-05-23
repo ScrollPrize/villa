@@ -16,7 +16,8 @@ from .config import SnapSurfConfig, _map_init_log, _parse_map_init_config, _safe
 from .state import _SurfaceState
 from .legacy import _closest_external_seed_surface, _direction_loss_model_ray_to_ext, _rebuild_model_to_ext_rays
 from .map_pyramid import _map_init_empty_stats
-from .map_growth import _run_map_init_for_surface
+from .map_growth import _run_map_init_for_surface, _run_map_init_interleaved_for_surface
+from .map_objective import _map_init_surface_normal_loss
 from .debug_obj import (
 	_debug_obj_iter_dir,
 	_debug_write_map_init_objs,
@@ -33,14 +34,16 @@ _last_stats: dict[str, float] = {}
 _debug_step: int | None = None
 _debug_label: str | None = None
 _stage_label: str | None = None
+_stage_steps: int | None = None
 
 def reset_state() -> None:
-	global _states, _last_stats, _debug_step, _debug_label, _stage_label
+	global _states, _last_stats, _debug_step, _debug_label, _stage_label, _stage_steps
 	_states = []
 	_last_stats = {}
 	_debug_step = None
 	_debug_label = None
 	_stage_label = None
+	_stage_steps = None
 	_set_debug_obj_step(None)
 
 def configure_snap_surf(
@@ -49,9 +52,10 @@ def configure_snap_surf(
 	seed_xyz: tuple[float, float, float] | None = None,
 	active: bool = False,
 	stage_label: str | None = None,
+	stage_steps: int | None = None,
 ) -> None:
 	"""Configure the runtime snap-surface loss state for the current stage."""
-	global _cfg, _active, _seed_xyz, _stage_label
+	global _cfg, _active, _seed_xyz, _stage_label, _stage_steps
 	raw = dict(cfg or {})
 	bad = sorted(set(raw.keys()) - set(SnapSurfConfig.__dataclass_fields__.keys()))
 	if bad:
@@ -112,6 +116,7 @@ def configure_snap_surf(
 	_active = bool(active)
 	_seed_xyz = None if seed_xyz is None else tuple(float(v) for v in seed_xyz)
 	_stage_label = None if stage_label is None else str(stage_label)
+	_stage_steps = None if stage_steps is None else max(0, int(stage_steps))
 	_snap_surf_log(
 		"configured "
 		f"stage={_stage_label!r} "
@@ -119,11 +124,19 @@ def configure_snap_surf(
 		f"map_init={int(_cfg.map_init.enabled)} "
 		f"debug_obj_dir={_cfg.debug_obj_dir!r} "
 		f"debug_obj_interval={_cfg.debug_obj_interval} "
+		f"stage_steps={_stage_steps} "
 		f"seed={_seed_xyz}"
 	)
 	if _active and _cfg.map_init.enabled:
 		_map_init_log(
 			"enabled "
+			f"surface_loss={int(_cfg.map_init.surface_loss)} "
+			f"initial_iters={_cfg.map_init.initial_iters} "
+			f"update_interval={_cfg.map_init.update_interval} "
+			f"update_global_opt_iters={_cfg.map_init.update_global_opt_iters} "
+			f"tracking_opt_iters={_cfg.map_init.tracking_opt_iters} "
+			f"first_global_opt_iters={_cfg.map_init.first_global_opt_iters} "
+			f"last_global_opt_iters={_cfg.map_init.last_global_opt_iters} "
 			f"subdiv={_cfg.map_init.subdiv} "
 			f"iters={_cfg.map_init.iters} "
 			f"seed_opt_iters={_cfg.map_init.seed_opt_iters} "
@@ -193,17 +206,10 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		_states.append(_SurfaceState())
 
 	if cfg.map_init.enabled:
-		_map_init_log(
-			"loss call "
-			f"stage={_stage_label!r} "
-			f"surfaces={len(records)} "
-			f"debug_step={_debug_step} "
-			f"debug_label={_debug_label!r} "
-			f"debug_dir={_debug_obj_iter_dir(cfg)}"
-		)
-		z = res.xyz_lr.sum() * 0.0
-		lm_zero = torch.zeros(res.xyz_lr.shape[:3], device=device, dtype=dtype).unsqueeze(1)
-		mask_zero = torch.zeros_like(lm_zero)
+		total = res.xyz_lr.sum() * 0.0
+		total_weight = 0.0
+		lm_accum = torch.zeros(res.xyz_lr.shape[:3], device=device, dtype=dtype).unsqueeze(1)
+		mask_accum = torch.zeros_like(lm_accum)
 		stats = _map_init_empty_stats()
 		stats["snaps_sdist"] = float("inf")
 		stats["snaps_sext"] = float("inf")
@@ -214,6 +220,8 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 			"snaps_map_jbad", "snaps_map_jbadf",
 			"snaps_map_samples", "snaps_map_uvbad", "snaps_map_model_bad", "snaps_map_step_bad",
 			"snaps_map_nsign", "snaps_map_scales",
+			"snaps_map_surf", "snaps_map_surf_n", "snaps_map_surf_avg",
+			"snaps_map_surf_abs", "snaps_map_surf_max",
 		}
 		for k in avg_keys:
 			stats[k] = 0.0
@@ -241,26 +249,66 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 				device=device,
 				dtype=dtype,
 			)
-			map_stats = _run_map_init_for_surface(
-				state,
-				model_xyz=model_xyz_det,
-				model_valid=model_valid,
-				model_normals=model_normals_det,
-				ext_xyz=ext_xyz,
-				ext_valid=ext_valid,
-				ext_normals=ext_normals,
-				ext_quad_valid=ext_quad_valid,
-				cfg=cfg,
-				seed_xyz=_seed_xyz,
-				surface_index=si,
-				surface_count=len(records),
-			)
+			if cfg.map_init.surface_loss:
+				map_stats = _run_map_init_interleaved_for_surface(
+					state,
+					model_xyz=model_xyz_det,
+					model_valid=model_valid,
+					model_normals=model_normals_det,
+					ext_xyz=ext_xyz,
+					ext_valid=ext_valid,
+					ext_normals=ext_normals,
+					ext_quad_valid=ext_quad_valid,
+					cfg=cfg,
+					seed_xyz=_seed_xyz,
+					surface_index=si,
+					surface_count=len(records),
+					debug_step=_debug_step,
+					stage_steps=_stage_steps,
+				)
+			else:
+				map_stats = _run_map_init_for_surface(
+					state,
+					model_xyz=model_xyz_det,
+					model_valid=model_valid,
+					model_normals=model_normals_det,
+					ext_xyz=ext_xyz,
+					ext_valid=ext_valid,
+					ext_normals=ext_normals,
+					ext_quad_valid=ext_quad_valid,
+					cfg=cfg,
+					seed_xyz=_seed_xyz,
+					surface_index=si,
+					surface_count=len(records),
+				)
 			stats["snaps_sdist"] = min(stats["snaps_sdist"], float(map_stats.get("snaps_sdist", float("inf"))))
 			stats["snaps_sext"] = min(stats["snaps_sext"], float(map_stats.get("snaps_sext", float("inf"))))
 			for k, v in map_stats.items():
 				if k in {"snaps_sdist", "snaps_sext"}:
 					continue
 				stats[k] = float(stats.get(k, 0.0)) + float(v)
+			if cfg.map_init.surface_loss and state.map_init.uv is not None and state.map_init.active_quad is not None and state.map_init.model_depth is not None:
+				l_map, lm_map, mask_map, loss_stats = _map_init_surface_normal_loss(
+					uv_full=state.map_init.uv,
+					active_quad=state.map_init.active_quad,
+					ext_pos=ext_xyz,
+					ext_normals=ext_normals,
+					ext_valid=ext_valid,
+					ext_quad_valid=ext_quad_valid,
+					ext_coords=state.map_init.ext_coords,
+					model_xyz=res.xyz_lr,
+					model_valid=model_valid,
+					model_normals=model_normals_det,
+					model_depth=int(state.map_init.model_depth),
+					cfg=cfg,
+				)
+				for k, v in loss_stats.items():
+					stats[k] = float(stats.get(k, 0.0)) + float(v)
+				if float(loss_stats.get("snaps_map_surf_n", 0.0)) > 0.0:
+					total = total + l_map
+					total_weight += 1.0
+					lm_accum = lm_accum + lm_map
+					mask_accum = (mask_accum + mask_map).clamp(max=1.0)
 			_debug_write_map_init_objs(
 				cfg=cfg,
 				surface_index=si,
@@ -274,8 +322,10 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		stats["snaps_seed"] = _safe_frac(stats["snaps_seed"], len(records))
 		for k in avg_keys:
 			stats[k] = _safe_frac(stats.get(k, 0.0), len(records))
+		if total_weight > 0.0:
+			total = total / total_weight
 		_last_stats = stats
-		return z, (lm_zero,), (mask_zero,)
+		return total, (lm_accum,), (mask_accum,)
 
 	if _debug_step == 0:
 		_snap_surf_log(

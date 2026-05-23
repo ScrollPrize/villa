@@ -199,12 +199,6 @@ def _debug_write_map_init_objs(
 ) -> None:
 	iter_dir = _debug_obj_iter_dir(cfg)
 	if iter_dir is None:
-		_map_init_log(
-			"obj skip "
-			f"debug_obj_dir={cfg.debug_obj_dir!r} "
-			f"debug_step={_debug_step} "
-			f"debug_obj_interval={cfg.debug_obj_interval}"
-		)
 		return
 	if snapshot_name is not None:
 		iter_dir = iter_dir / "map_init_scales" / _debug_obj_safe_label(snapshot_name)
