@@ -2,12 +2,23 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 import json
+import math
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
+from progress_table import (
+	ProgressColumn,
+	format_progress_value,
+	print_progress_legend,
+	progress_header,
+	progress_row,
+	progress_widths,
+)
 from .config import SnapSurfConfig, SnapSurfMapInitConfig, _parse_map_init_config
 from .debug_obj import _debug_obj_safe_label, _write_obj_lines, _write_obj_mesh_2d, _write_obj_mesh_3d_surfaces, _write_obj_points
+from .legacy import _closest_point_uv_on_model_quad
 from .map_fixture_io import MapFixture, _float_tif, _write_json, load_map_fixture
 from .map_objective import _map_init_objective
 from .map_pyramid import (
@@ -194,6 +205,369 @@ def _seed_ext_hw(metadata: dict[str, Any], ext_shape: tuple[int, int], *, device
 	return torch.tensor([h, w], device=device, dtype=dtype)
 
 
+def _seed_model_uv(fixture: MapFixture, seed_ext_hw: torch.Tensor) -> torch.Tensor:
+	raw_uv = fixture.metadata.get("seed_model_uv")
+	if isinstance(raw_uv, (list, tuple)) and len(raw_uv) == 2:
+		return torch.tensor([float(raw_uv[0]), float(raw_uv[1])], device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+	raw_quad = fixture.metadata.get("seed_model_quad")
+	raw_seed = fixture.metadata.get("seed_xyz")
+	if isinstance(raw_quad, (list, tuple)) and len(raw_quad) == 3 and isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3:
+		try:
+			model_quad = (int(raw_quad[0]), int(raw_quad[1]), int(raw_quad[2]))
+			seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+			_model_point, uv, _dist = _closest_point_uv_on_model_quad(point=seed, model_xyz=fixture.model_xyz, model_quad=model_quad)
+			return uv.to(device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+		except (RuntimeError, ValueError, TypeError, IndexError):
+			pass
+	return seed_ext_hw.to(device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+
+
+def _affine_from_linear(seed_ext_hw: torch.Tensor, seed_model_uv: torch.Tensor, linear: torch.Tensor) -> torch.Tensor:
+	offset = seed_model_uv - linear @ seed_ext_hw
+	return torch.cat([linear, offset.view(2, 1)], dim=1)
+
+
+def _affine_multistart_cfg(cfg: GlobalMapConfig, stage: GlobalMapStageConfig) -> dict[str, Any]:
+	base_raw = cfg.base.get("affine_multistart", {})
+	if not isinstance(base_raw, dict):
+		base_raw = {}
+	stage_raw = stage.args.get("affine_multistart", {})
+	if not isinstance(stage_raw, dict):
+		stage_raw = {}
+	out = dict(base_raw)
+	out.update(stage_raw)
+	return out
+
+
+def _affine_multistart_candidates(
+	*,
+	seed_ext_hw: torch.Tensor,
+	seed_model_uv: torch.Tensor,
+	rot_deg: list[float],
+	scales: list[float],
+) -> list[tuple[int, float, float, torch.Tensor]]:
+	candidates: list[tuple[int, float, float, torch.Tensor]] = []
+	device = seed_ext_hw.device
+	dtype = seed_ext_hw.dtype
+	idx = 0
+	for scale in scales:
+		for deg in rot_deg:
+			rad = math.radians(float(deg))
+			c = math.cos(rad)
+			s = math.sin(rad)
+			linear = torch.tensor(
+				[[float(scale) * c, -float(scale) * s], [float(scale) * s, float(scale) * c]],
+				device=device,
+				dtype=dtype,
+			)
+			candidates.append((idx, float(deg), float(scale), _affine_from_linear(seed_ext_hw, seed_model_uv, linear)))
+			idx += 1
+	return candidates
+
+
+def _score_affine_tensor(
+	affine_tensor: torch.Tensor,
+	*,
+	affine_model: AffineMapModel,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	seed_hw: torch.Tensor,
+	station_target: torch.Tensor,
+	w_station: float,
+) -> tuple[float, dict[str, torch.Tensor], dict[str, float], torch.Tensor]:
+	with torch.no_grad():
+		affine_model.affine.copy_(affine_tensor)
+	uv = affine_model()
+	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+	station_raw = loss.new_zeros(())
+	if float(w_station) > 0.0:
+		station_raw = _station_loss(uv, seed_hw, station_target)
+		loss = loss + float(w_station) * station_raw
+	terms = dict(terms)
+	terms["station"] = station_raw.detach()
+	err = _fixture_mapping_error(uv.detach(), fixture)
+	return float(loss.detach().cpu()), terms, err, affine_model.affine.detach().clone()
+
+
+def _optimize_affine_candidate(
+	*,
+	candidate: torch.Tensor,
+	affine_model: AffineMapModel,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	seed_hw: torch.Tensor,
+	station_target: torch.Tensor,
+	w_station: float,
+	steps: int,
+	lr: float,
+) -> tuple[float, torch.Tensor]:
+	with torch.no_grad():
+		affine_model.affine.copy_(candidate)
+	opt = torch.optim.Adam([affine_model.affine], lr=float(lr)) if int(steps) > 0 else None
+	last_loss = float("inf")
+	for _ in range(max(1, int(steps))):
+		if opt is not None:
+			opt.zero_grad(set_to_none=True)
+		uv = affine_model()
+		loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+		if float(w_station) > 0.0:
+			loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
+		last_loss = float(loss.detach().cpu())
+		if opt is None:
+			break
+		loss.backward()
+		opt.step()
+	return last_loss, affine_model.affine.detach().clone()
+
+
+_AFFINE_DIAG_COLUMNS = (
+	ProgressColumn("idx", "idx", "candidate index", min_width=3),
+	ProgressColumn("rot", "rot", "initial rotation degrees", min_width=7),
+	ProgressColumn("scl", "scl", "initial scale", min_width=6),
+	ProgressColumn("iloss", "iloss", "initial objective", min_width=7),
+	ProgressColumn("loss", "loss", "final objective", min_width=7),
+	ProgressColumn("dist", "dst", "distance loss", min_width=7),
+	ProgressColumn("vec", "vec", "vector-normal loss", min_width=7),
+	ProgressColumn("norm", "nrm", "surface-normal loss", min_width=7),
+	ProgressColumn("smooth", "smo", "uv smooth loss", min_width=7),
+	ProgressColumn("bend", "bnd", "uv bend loss", min_width=7),
+	ProgressColumn("jac", "jac", "jacobian loss", min_width=7),
+	ProgressColumn("metric_smooth", "met", "model metric loss", min_width=7),
+	ProgressColumn("area_smooth", "ar", "external physical area loss", min_width=7),
+	ProgressColumn("prior", "pri", "dense prior loss", min_width=7),
+	ProgressColumn("station", "stat", "station loss", min_width=7),
+	ProgressColumn("avgd", "avgd", "avg fixture model quad distance", min_width=7),
+	ProgressColumn("maxd", "maxd", "max fixture model quad distance", min_width=7),
+	ProgressColumn("smp", "smp", "fixture comparison samples", min_width=6),
+	ProgressColumn("a00", "a00", "affine h-from-h", min_width=8),
+	ProgressColumn("a01", "a01", "affine h-from-w", min_width=8),
+	ProgressColumn("a02", "a02", "affine h offset", min_width=8),
+	ProgressColumn("a10", "a10", "affine w-from-h", min_width=8),
+	ProgressColumn("a11", "a11", "affine w-from-w", min_width=8),
+	ProgressColumn("a12", "a12", "affine w offset", min_width=8),
+)
+
+
+def _affine_diag_widths() -> dict[str, int]:
+	values = {col.key: "-1.0e+99" for col in _AFFINE_DIAG_COLUMNS}
+	values["idx"] = "1000000"
+	values["rot"] = "-180.000"
+	values["scl"] = "100.000"
+	values["smp"] = "1000000"
+	return progress_widths(_AFFINE_DIAG_COLUMNS, values)
+
+
+def _affine_diag_values(
+	*,
+	idx: int | str,
+	rot: float | None,
+	scale: float | None,
+	initial_loss: float | None,
+	final_loss: float,
+	terms: dict[str, torch.Tensor],
+	err: dict[str, float],
+	affine_tensor: torch.Tensor,
+) -> dict[str, str]:
+	aff = affine_tensor.detach().cpu()
+	return {
+		"idx": str(idx),
+		"rot": "" if rot is None else format_progress_value(float(rot)),
+		"scl": "" if scale is None else format_progress_value(float(scale)),
+		"iloss": "" if initial_loss is None else format_progress_value(float(initial_loss)),
+		"loss": format_progress_value(float(final_loss)),
+		"dist": format_progress_value(_global_term_value(terms, "dist")),
+		"vec": format_progress_value(_global_term_value(terms, "vec")),
+		"norm": format_progress_value(_global_term_value(terms, "norm")),
+		"smooth": format_progress_value(_global_term_value(terms, "smooth")),
+		"bend": format_progress_value(_global_term_value(terms, "bend")),
+		"jac": format_progress_value(_global_term_value(terms, "jac")),
+		"metric_smooth": format_progress_value(_global_term_value(terms, "metric_smooth")),
+		"area_smooth": format_progress_value(_global_term_value(terms, "area_smooth")),
+		"prior": format_progress_value(_global_term_value(terms, "prior")),
+		"station": format_progress_value(_global_term_value(terms, "station")),
+		"avgd": format_progress_value(float(err["avg_model_quad_distance"])),
+		"maxd": format_progress_value(float(err["max_model_quad_distance"])),
+		"smp": str(int(err["mapping_error_samples"])),
+		"a00": format_progress_value(float(aff[0, 0])),
+		"a01": format_progress_value(float(aff[0, 1])),
+		"a02": format_progress_value(float(aff[0, 2])),
+		"a10": format_progress_value(float(aff[1, 0])),
+		"a11": format_progress_value(float(aff[1, 1])),
+		"a12": format_progress_value(float(aff[1, 2])),
+	}
+
+
+def _print_affine_diag_header(label: str, widths: dict[str, int]) -> None:
+	print_progress_legend(
+		prefix=f"[snap_surf.map_global] {label}",
+		items=[(col.label, col.description) for col in _AFFINE_DIAG_COLUMNS],
+	)
+	print(progress_header(_AFFINE_DIAG_COLUMNS, widths), flush=True)
+
+
+def _print_affine_diag_row(widths: dict[str, int], values: dict[str, str]) -> None:
+	print(progress_row(_AFFINE_DIAG_COLUMNS, widths, values), flush=True)
+
+
+def _fit_reference_affine(fixture: MapFixture) -> tuple[torch.Tensor, float] | None:
+	ref = fixture.reference_uv
+	valid = torch.isfinite(ref).all(dim=-1)
+	if int(valid.sum().detach().cpu()) < 3:
+		return None
+	H, W = int(ref.shape[0]), int(ref.shape[1])
+	hh = torch.arange(H, device=ref.device, dtype=ref.dtype).view(H, 1).expand(H, W)
+	ww = torch.arange(W, device=ref.device, dtype=ref.dtype).view(1, W).expand(H, W)
+	ones = torch.ones_like(hh)
+	x = torch.stack([hh, ww, ones], dim=-1)[valid]
+	y = ref[valid]
+	try:
+		sol = torch.linalg.lstsq(x, y).solution
+	except RuntimeError:
+		return None
+	affine = sol.transpose(0, 1).contiguous()
+	pred = x @ sol
+	uv_mse = float((pred - y).square().sum(dim=-1).mean().detach().cpu())
+	return affine, uv_mse
+
+
+def _print_reference_affine_diagnostic(
+	*,
+	affine: AffineMapModel,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	seed_hw: torch.Tensor,
+	station_target: torch.Tensor,
+) -> None:
+	fit = _fit_reference_affine(fixture)
+	if fit is None:
+		print("[snap_surf.map_global] affine fixture reference unavailable: fewer than 3 finite reference samples", flush=True)
+		return
+	ref_affine, uv_mse = fit
+	original = affine.affine.detach().clone()
+	try:
+		final_loss, terms, err, scored_affine = _score_affine_tensor(
+			ref_affine,
+			affine_model=affine,
+			fixture=fixture,
+			stage_cfg=stage_cfg,
+			seed_hw=seed_hw,
+			station_target=station_target,
+			w_station=0.0,
+		)
+	finally:
+		with torch.no_grad():
+			affine.affine.copy_(original)
+	widths = _affine_diag_widths()
+	print(f"[snap_surf.map_global] affine fixture reference uv_mse={uv_mse:.6g}", flush=True)
+	_print_affine_diag_header("affine fixture reference", widths)
+	_print_affine_diag_row(
+		widths,
+		_affine_diag_values(
+			idx="ref",
+			rot=None,
+			scale=None,
+			initial_loss=None,
+			final_loss=final_loss,
+			terms=terms,
+			err=err,
+			affine_tensor=scored_affine,
+		),
+	)
+
+
+def _run_affine_multistart(
+	*,
+	cfg_global: GlobalMapConfig,
+	stage: GlobalMapStageConfig,
+	affine: AffineMapModel,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	seed_hw: torch.Tensor,
+	station_target: torch.Tensor,
+	w_station: float,
+) -> None:
+	cfg = _affine_multistart_cfg(cfg_global, stage)
+	if not bool(cfg.get("enabled", False)):
+		return
+	rot_raw = cfg.get("rot_deg", cfg.get("rotations_deg", [-30.0, -15.0, 0.0, 15.0, 30.0]))
+	scale_raw = cfg.get("scales", [0.75, 1.0, 1.25])
+	if not isinstance(rot_raw, list) or not isinstance(scale_raw, list):
+		raise ValueError("affine_multistart rot_deg and scales must be lists")
+	rot_deg = [float(v) for v in rot_raw]
+	scales = [float(v) for v in scale_raw]
+	steps = max(0, int(cfg.get("steps", 25)))
+	lr = float(cfg.get("lr", stage.lr))
+	seed_model_uv = _seed_model_uv(fixture, seed_hw)
+	candidates = _affine_multistart_candidates(
+		seed_ext_hw=seed_hw,
+		seed_model_uv=seed_model_uv,
+		rot_deg=rot_deg,
+		scales=scales,
+	)
+	if not candidates:
+		return
+	start_affine = affine.affine.detach().clone()
+	best_loss = float("inf")
+	best_affine = start_affine
+	widths = _affine_diag_widths()
+	_print_affine_diag_header("affine multistart", widths)
+	for cand_idx, rot, scale, cand in candidates:
+		initial_loss, _initial_terms, _initial_err, _initial_affine = _score_affine_tensor(
+			cand,
+			affine_model=affine,
+			fixture=fixture,
+			stage_cfg=stage_cfg,
+			seed_hw=seed_hw,
+			station_target=station_target,
+			w_station=w_station,
+		)
+		loss, value = _optimize_affine_candidate(
+			candidate=cand,
+			affine_model=affine,
+			fixture=fixture,
+			stage_cfg=stage_cfg,
+			seed_hw=seed_hw,
+			station_target=station_target,
+			w_station=w_station,
+			steps=steps,
+			lr=lr,
+		)
+		final_loss, final_terms, final_err, final_affine = _score_affine_tensor(
+			value,
+			affine_model=affine,
+			fixture=fixture,
+			stage_cfg=stage_cfg,
+			seed_hw=seed_hw,
+			station_target=station_target,
+			w_station=w_station,
+		)
+		_print_affine_diag_row(
+			widths,
+			_affine_diag_values(
+				idx=cand_idx,
+				rot=rot,
+				scale=scale,
+				initial_loss=initial_loss,
+				final_loss=final_loss,
+				terms=final_terms,
+				err=final_err,
+				affine_tensor=final_affine,
+			),
+		)
+		loss = final_loss
+		value = final_affine
+		if math.isfinite(loss) and loss < best_loss:
+			best_loss = loss
+			best_affine = value
+	with torch.no_grad():
+		affine.affine.copy_(best_affine)
+	print(
+		f"[snap_surf.map_global] affine multistart candidates={len(candidates)} "
+		f"steps={steps} best_loss={best_loss:.6g}",
+		flush=True,
+	)
+
+
 def _stage_loss_cfg(base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> SnapSurfConfig:
 	mi = base_cfg.map_init
 	scale = float(stage.w_fac)
@@ -336,6 +710,97 @@ def _level_coords(ext_shape: torch.Size | tuple[int, int], level: int, uv: torch
 	return torch.stack([hh, ww], dim=-1)
 
 
+_GLOBAL_PROGRESS_COLUMNS = (
+	ProgressColumn("stg", "stg", "stage index"),
+	ProgressColumn("it", "it", "stage step"),
+	ProgressColumn("params", "params", "optimized params", min_width=6),
+	ProgressColumn("lvl", "lvl", "minimum trained pyramid level"),
+	ProgressColumn("loss", "loss", "objective", min_width=7),
+	ProgressColumn("dist", "dst", "distance loss", min_width=7),
+	ProgressColumn("vec", "vec", "vector-normal loss", min_width=7),
+	ProgressColumn("norm", "nrm", "surface-normal loss", min_width=7),
+	ProgressColumn("smooth", "smo", "uv smooth loss", min_width=7),
+	ProgressColumn("bend", "bnd", "uv bend loss", min_width=7),
+	ProgressColumn("jac", "jac", "jacobian loss", min_width=7),
+	ProgressColumn("metric_smooth", "met", "model metric loss", min_width=7),
+	ProgressColumn("area_smooth", "ar", "external physical area loss", min_width=7),
+	ProgressColumn("prior", "pri", "dense prior loss", min_width=7),
+	ProgressColumn("station", "stat", "station loss", min_width=7),
+	ProgressColumn("it_s", "it/s", "optimizer it/s", min_width=6),
+	ProgressColumn("avgd", "avgd", "avg fixture model quad distance", min_width=7),
+	ProgressColumn("maxd", "maxd", "max fixture model quad distance", min_width=7),
+	ProgressColumn("smp", "smp", "fixture comparison samples", min_width=6),
+)
+
+
+def _global_progress_widths(cfg: GlobalMapConfig) -> dict[str, int]:
+	values: dict[str, str] = {}
+	stage_count = max(1, len(cfg.stages))
+	max_steps = max((int(stage.steps) for stage in cfg.stages), default=1)
+	values["stg"] = str(stage_count - 1)
+	values["it"] = f"{max_steps}/{max_steps}"
+	values["params"] = max((",".join(stage.params) or "-" for stage in cfg.stages), key=len, default="-")
+	values["lvl"] = str(max((int(stage.min_scaledown) for stage in cfg.stages), default=0))
+	values["loss"] = "-1.0e+99"
+	for key in ("dist", "vec", "norm", "smooth", "bend", "jac", "metric_smooth", "area_smooth", "prior", "station"):
+		values[key] = "-1.0e+99"
+	values["it_s"] = "-1.0e+99"
+	values["avgd"] = "-1.0e+99"
+	values["maxd"] = "-1.0e+99"
+	values["smp"] = "1000000"
+	return progress_widths(_GLOBAL_PROGRESS_COLUMNS, values)
+
+
+def _global_term_value(terms: dict[str, torch.Tensor], key: str) -> float:
+	v = terms.get(key)
+	if v is None:
+		return 0.0
+	return float(v.detach().cpu())
+
+
+def _print_global_progress(
+	*,
+	row_idx: int,
+	widths: dict[str, int],
+	stage_idx: int,
+	iter_label: str,
+	params: tuple[str, ...],
+	level: int,
+	loss: float,
+	terms: dict[str, torch.Tensor],
+	it_s: float | None,
+	err: dict[str, float],
+) -> None:
+	values = {
+		"stg": str(int(stage_idx)),
+		"it": str(iter_label),
+		"params": ",".join(params) or "-",
+		"lvl": str(int(level)),
+		"loss": format_progress_value(float(loss)),
+		"dist": format_progress_value(_global_term_value(terms, "dist")),
+		"vec": format_progress_value(_global_term_value(terms, "vec")),
+		"norm": format_progress_value(_global_term_value(terms, "norm")),
+		"smooth": format_progress_value(_global_term_value(terms, "smooth")),
+		"bend": format_progress_value(_global_term_value(terms, "bend")),
+		"jac": format_progress_value(_global_term_value(terms, "jac")),
+		"metric_smooth": format_progress_value(_global_term_value(terms, "metric_smooth")),
+		"area_smooth": format_progress_value(_global_term_value(terms, "area_smooth")),
+		"prior": format_progress_value(_global_term_value(terms, "prior")),
+		"station": format_progress_value(_global_term_value(terms, "station")),
+		"it_s": format_progress_value(float(it_s)) if it_s is not None else "",
+		"avgd": format_progress_value(float(err["avg_model_quad_distance"])),
+		"maxd": format_progress_value(float(err["max_model_quad_distance"])),
+		"smp": str(int(err["mapping_error_samples"])),
+	}
+	if int(row_idx) % 20 == 0:
+		print_progress_legend(
+			prefix="[snap_surf.map_global]",
+			items=[(col.label, col.description) for col in _GLOBAL_PROGRESS_COLUMNS],
+		)
+		print(progress_header(_GLOBAL_PROGRESS_COLUMNS, widths), flush=True)
+	print(progress_row(_GLOBAL_PROGRESS_COLUMNS, widths, values), flush=True)
+
+
 def optimize_fixture(
 	fixture_dir: str | Path,
 	config_path: str | Path,
@@ -348,15 +813,32 @@ def optimize_fixture(
 	cfg_global = parse_global_map_config(config_path)
 	base_cfg = snap_surf_config_from_global_config(cfg_global)
 	dtype = fixture.model_xyz.dtype
-	affine = AffineMapModel(ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
-	global_model: GlobalMapModel | None = None
 	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
+	seed_uv = _seed_model_uv(fixture, seed_hw)
+	initial_affine = _affine_from_linear(seed_hw, seed_uv, torch.eye(2, device=device_t, dtype=dtype))
+	affine = AffineMapModel(
+		ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+		device=device_t,
+		dtype=dtype,
+		initial=initial_affine,
+	)
+	global_model: GlobalMapModel | None = None
 	station_target = affine.eval_at(seed_hw).detach()
 	history: list[dict[str, Any]] = []
 	full_active = _full_active_quad(fixture)
 	out = Path(out_dir)
 	out.mkdir(parents=True, exist_ok=True)
-	print("stage step params train_min loss avg_map_dist max_map_dist samples", flush=True)
+	progress_rows = 0
+	progress_widths_run = _global_progress_widths(cfg_global)
+	first_affine_stage = next((stage for stage in cfg_global.stages if "affine" in stage.params), None)
+	if first_affine_stage is not None:
+		_print_reference_affine_diagnostic(
+			affine=affine,
+			fixture=fixture,
+			stage_cfg=_stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, first_affine_stage), first_affine_stage),
+			seed_hw=seed_hw,
+			station_target=station_target,
+		)
 
 	for stage_idx, stage in enumerate(cfg_global.stages):
 		stage_cfg = _stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, stage), stage)
@@ -374,7 +856,22 @@ def optimize_fixture(
 			params.extend(list(global_model.map_uv_ms.parameters())[level:])
 		if not params or int(stage.steps) <= 0:
 			continue
+		w_station = float(stage.args.get("map_station_t", stage.args.get("w_station_t", cfg_global.base.get("map_station_t", 0.0))))
+		if "affine" in stage.params:
+			_run_affine_multistart(
+				cfg_global=cfg_global,
+				stage=stage,
+				affine=affine,
+				fixture=fixture,
+				stage_cfg=stage_cfg,
+				seed_hw=seed_hw,
+				station_target=station_target,
+				w_station=w_station,
+			)
 		opt = torch.optim.Adam(params, lr=float(stage.lr))
+		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		last_status_time: float | None = None
+		last_status_step = 0
 		for step in range(int(stage.steps)):
 			opt.zero_grad(set_to_none=True)
 			if "map_uv_ms" in stage.params and global_model is not None:
@@ -382,21 +879,48 @@ def optimize_fixture(
 			else:
 				uv = affine()
 			loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
-			w_station = float(stage.args.get("map_station_t", stage.args.get("w_station_t", cfg_global.base.get("map_station_t", 0.0))))
+			station_raw = loss.new_zeros(())
 			if w_station > 0.0:
-				loss = loss + w_station * _station_loss(uv, seed_hw, station_target)
+				station_raw = _station_loss(uv, seed_hw, station_target)
+				loss = loss + w_station * station_raw
 			loss.backward()
 			opt.step()
-			err = _fixture_mapping_error(uv.detach(), fixture)
-			print(
-				f"{stage_idx:5d} {step:4d} {','.join(stage.params) or '-':>10s} "
-				f"{level:9d} {float(loss.detach().cpu()):.9g} "
-				f"{err['avg_model_quad_distance']:.9g} "
-				f"{err['max_model_quad_distance']:.9g} "
-				f"{int(err['mapping_error_samples'])}",
-				flush=True,
+			progress_terms = dict(terms)
+			progress_terms["station"] = station_raw.detach()
+			with torch.no_grad():
+				if "map_uv_ms" in stage.params and global_model is not None:
+					uv_after = global_model(active_level=0)
+				else:
+					uv_after = affine()
+			step1 = step + 1
+			status_due = (
+				step == 0 or
+				step1 == int(stage.steps) or
+				(status_interval > 0 and (step1 % status_interval) == 0)
 			)
+			if status_due:
+				err = _fixture_mapping_error(uv_after.detach(), fixture)
+				now = time.monotonic()
+				it_s = None
+				if last_status_time is not None:
+					it_s = float(step1 - last_status_step) / max(1.0e-9, now - last_status_time)
+				last_status_time = now
+				last_status_step = step1
+				_print_global_progress(
+					row_idx=progress_rows,
+					widths=progress_widths_run,
+					stage_idx=stage_idx,
+					iter_label=f"{step1}/{int(stage.steps)}",
+					params=stage.params,
+					level=level,
+					loss=float(loss.detach().cpu()),
+					terms=progress_terms,
+					it_s=it_s,
+					err=err,
+				)
+				progress_rows += 1
 			if step == int(stage.steps) - 1:
+				err = _fixture_mapping_error(uv_after.detach(), fixture)
 				history.append({
 					"stage": stage_idx,
 					"step": step,
@@ -404,7 +928,7 @@ def optimize_fixture(
 					"train_min_level": level,
 					"loss": float(loss.detach().cpu()),
 					**err,
-					"terms": {k: float(v.detach().cpu()) for k, v in terms.items() if v.ndim == 0},
+					"terms": {k: float(v.detach().cpu()) for k, v in progress_terms.items() if v.ndim == 0},
 				})
 		if "map_uv_ms" in stage.params and global_model is not None:
 			stage_uv = global_model(active_level=0).detach()

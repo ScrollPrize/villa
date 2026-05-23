@@ -24,6 +24,7 @@ import opt_loss_station
 import opt_loss_bend
 import opt_loss_cyl
 import opt_loss_snap_surf
+from progress_table import format_progress_value, print_progress_legend
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -1655,28 +1656,9 @@ def optimize(
 					items.append(("shell", "shell index"))
 				items.extend((("step", "stage step"), ("loss", "total loss"), ("it/s", "optimizer it/s")))
 				items.extend((_display_key(c), _desc_key(c)) for c in cols)
-				print("[optimizer] progress columns", flush=True)
-				key_w = max(len(k) for k, _v in items)
-				desc_w = max(len(v) for _k, v in items)
-				cell_w = key_w + 3 + desc_w
-				header_cell = f"{'col':<{key_w}} : {'meaning':<{desc_w}}"
-				header = " | ".join(f"{header_cell:<{cell_w}}" for _ in range(3))
-				print(f"  {header}", flush=True)
-				for i in range(0, len(items), 3):
-					cells = [f"{k:<{key_w}} : {v:<{desc_w}}" for k, v in items[i:i + 3]]
-					while len(cells) < 3:
-						cells.append(" " * cell_w)
-					row = " | ".join(cells)
-					print(f"  {row}", flush=True)
+				print_progress_legend(prefix="[optimizer]", items=items)
 			def _fmt_val(k: str, v: float) -> str:
-				av = abs(v)
-				if av != 0.0 and (av >= 1000.0 or av < 1.0e-3):
-					return f"{v:.1e}"
-				if av < 10.0:
-					return f"{v:.4f}"
-				if av < 100.0:
-					return f"{v:.3f}"
-				return f"{v:.1f}"
+				return format_progress_value(v)
 			tv_keys = sorted(tv.keys(), key=_sort_key)
 			pv_keys = sorted(pv.keys())
 			cols = tv_keys + [f"p:{k}" for k in pv_keys]

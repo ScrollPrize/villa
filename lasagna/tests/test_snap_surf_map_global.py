@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 
 import torch
 
@@ -17,6 +19,7 @@ from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_
 from snap_surf.map_global import (
 	AffineMapModel,
 	GlobalMapModel,
+	_affine_multistart_candidates,
 	_objective_for_uv,
 	optimize_fixture,
 	parse_global_map_config,
@@ -128,6 +131,22 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 		self.assertTrue(torch.allclose(global_model(active_level=0), affine(), atol=1.0e-6))
 
+	def test_affine_multistart_candidates_keep_seed_anchor(self) -> None:
+		seed_ext = torch.tensor([10.0, 20.0])
+		seed_uv = torch.tensor([3.0, 4.0])
+
+		candidates = _affine_multistart_candidates(
+			seed_ext_hw=seed_ext,
+			seed_model_uv=seed_uv,
+			rot_deg=[-15.0, 0.0, 15.0],
+			scales=[0.5, 1.0],
+		)
+
+		self.assertEqual(len(candidates), 6)
+		for _idx, _rot, _scale, affine in candidates:
+			mapped = affine[:, :2] @ seed_ext + affine[:, 2]
+			self.assertTrue(torch.allclose(mapped, seed_uv, atol=1.0e-6))
+
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			cfg = parse_global_map_config(_write_config(tmp, affine_steps=1, map_steps=1))
@@ -187,6 +206,50 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 			model_x = tifffile.imread(os.path.join(out_dir, "model_x.tif"))
 			self.assertEqual(tuple(model_x.shape), (9, 9))
+
+	def test_progress_default_status_interval_skips_middle_steps(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=3, map_steps=0)
+			stdout = StringIO()
+
+			with redirect_stdout(stdout):
+				optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
+
+			text = stdout.getvalue()
+			self.assertIn("1/3", text)
+			self.assertIn("3/3", text)
+			self.assertNotIn("2/3", text)
+			self.assertIn("stat", text)
+			self.assertIn("station loss", text)
+			self.assertIn("dst", text)
+
+	def test_affine_multistart_prints_all_candidate_rows(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = Path(_write_config(tmp, affine_steps=1, map_steps=0))
+			cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+			cfg["stages"][0]["args"]["affine_multistart"] = {
+				"enabled": True,
+				"rot_deg": [0.0, 15.0],
+				"scales": [1.0],
+				"steps": 0,
+			}
+			cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+			stdout = StringIO()
+
+			with redirect_stdout(stdout):
+				optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
+
+			text = stdout.getvalue()
+			self.assertIn("affine multistart progress columns", text)
+			self.assertIn("affine multistart candidates=2", text)
+			self.assertIn("0.0000", text)
+			self.assertIn("15.000", text)
 
 
 if __name__ == "__main__":
