@@ -30,10 +30,13 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 # PHercParis4
 volpkg_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg'
 scroll_zarr_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/volumes/2um_ds2_ps256_surf.zarr/0'
+normal_nx_zarr_path = '/home/sean/Documents/volpkgs/s1_2um.volpkg/las_008_s1_full/las_008_nx.ome.zarr'
+normal_ny_zarr_path = '/home/sean/Documents/volpkgs/s1_2um.volpkg/las_008_s1_full/las_008_ny.ome.zarr'
+normal_zarr_group = '4'
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 7000, 16000
+z_begin, z_end = 7500, 11000
 cross_patch_pcl_json_paths = [
       '/home/sean/Desktop/s1_relative_windings_fixed.json',
   ]
@@ -67,7 +70,7 @@ default_config = {
     'learning_rate': 1.e-4,
     'exp_lr_schedule': True,
     'lr_final_factor': 0.05,
-    'num_training_steps': 12_500,
+    'num_training_steps': 10_000,
     'num_flow_integration_steps': 3,
     'flow_integration_solver': 'rk4',
     'num_flow_timesteps': 1,
@@ -95,15 +98,18 @@ default_config = {
     'unattached_pcl_num_points_per_step': 48,
     'unattached_pcl_min_point_spacing': 4.,
     'normals_num_points': 2000,
+    'pcl_normals_num_points': 2000,
+    'pcl_normals_sample_radius': 8,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
-    'loss_weight_winding_number': 0.,
+    'loss_weight_winding_number': 8.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_patch_stretch': 40.0,
     'loss_weight_patch_normals': 75.0,
+    'loss_weight_pcl_normals': 75.0,
     'loss_weight_umbilicus': 5.,
     'loss_weight_shell_outer': 4.0,
     'loss_weight_shell_no_cross': 1.0,
@@ -112,7 +118,7 @@ default_config = {
     'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
-    'shell_outer_winding_idx': 130,
+    'shell_outer_winding_idx': 120,
     'shell_outer_winding_margin': 10,
     'shell_num_samples': 8192,
     'shell_num_theta_bins': 720,
@@ -1501,6 +1507,176 @@ def _get_or_build_unattached_pcl_flat(pcl_strips, device):
     return flat
 
 
+def _sample_zarr_block_at_zyx(array, zyx, radius):
+    center = np.rint(zyx).astype(np.int64)
+    shape = np.array(array.shape, dtype=np.int64)
+    if np.any(center < 0) or np.any(center >= shape):
+        return None
+    lo = np.maximum(center - radius, 0)
+    hi = np.minimum(center + radius + 1, shape)
+    block = array[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
+    if block.size == 0:
+        return None
+    return block
+
+
+def _decode_uint8_normal_component(value):
+    return (value - 128.0) / 127.0
+
+
+def _sample_zarr_normal_zyx_at_zyx(nx_array, ny_array, zyx, radius):
+    nx_u8 = _sample_zarr_block_at_zyx(nx_array, zyx, radius)
+    ny_u8 = _sample_zarr_block_at_zyx(ny_array, zyx, radius)
+    if nx_u8 is None or ny_u8 is None:
+        return None
+    if nx_u8.shape != ny_u8.shape:
+        raise ValueError(f'nx/ny normal sample shapes differ: {nx_u8.shape} vs {ny_u8.shape}')
+
+    valid = (nx_u8 != 0) | (ny_u8 != 0)
+    if not valid.any():
+        return None
+
+    nx = _decode_uint8_normal_component(nx_u8.astype(np.float32, copy=False))[valid]
+    ny = _decode_uint8_normal_component(ny_u8.astype(np.float32, copy=False))[valid]
+    nz = np.sqrt(np.maximum(0.0, 1.0 - nx * nx - ny * ny)).astype(np.float32, copy=False)
+
+    if radius <= 0 or nx.size == 1:
+        n_xyz = np.array([float(nx.mean()), float(ny.mean()), float(nz.mean())], dtype=np.float32)
+    else:
+        mat = np.array([
+            [np.mean(nx * nx), np.mean(nx * ny), np.mean(nx * nz)],
+            [np.mean(nx * ny), np.mean(ny * ny), np.mean(ny * nz)],
+            [np.mean(nx * nz), np.mean(ny * nz), np.mean(nz * nz)],
+        ], dtype=np.float32)
+        vals, vecs = np.linalg.eigh(mat)
+        n_xyz = vecs[:, int(np.argmax(vals))].astype(np.float32)
+        if n_xyz[2] < 0:
+            n_xyz = -n_xyz
+
+    norm = float(np.linalg.norm(n_xyz))
+    if not np.isfinite(norm) or norm <= 0:
+        return None
+    n_xyz /= norm
+    return np.array([n_xyz[2], n_xyz[1], n_xyz[0]], dtype=np.float32)
+
+
+def _collect_pcl_normal_zyxs(point_collections, unattached_pcl_strips):
+    zyxs = []
+    seen = set()
+
+    def add_zyx(zyx):
+        zyx = np.asarray(zyx, dtype=np.float32)
+        if not (z_begin <= zyx[0] < z_end):
+            return
+        key = tuple(np.round(zyx, 3))
+        if key in seen:
+            return
+        seen.add(key)
+        zyxs.append(zyx)
+
+    for pcl in point_collections:
+        for point in pcl['points'].values():
+            if 'zyx' in point:
+                add_zyx(point['zyx'])
+
+    for strip in unattached_pcl_strips:
+        for zyx in strip['zyxs']:
+            add_zyx(zyx)
+
+    if not zyxs:
+        return np.zeros([0, 3], dtype=np.float32)
+    return np.stack(zyxs, axis=0).astype(np.float32, copy=False)
+
+
+def prepare_pcl_normal_samples(point_collections, unattached_pcl_strips, scroll_zarr):
+    if cfg['loss_weight_pcl_normals'] <= 0:
+        return None
+    if not normal_nx_zarr_path or not normal_ny_zarr_path:
+        return None
+
+    print(f'loading PCL normal zarrs group {normal_zarr_group}')
+    nx_array = zarr.open(normal_nx_zarr_path, mode='r')[normal_zarr_group]
+    ny_array = zarr.open(normal_ny_zarr_path, mode='r')[normal_zarr_group]
+    if nx_array.shape != ny_array.shape:
+        raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
+
+    if scroll_zarr is not None:
+        expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / downsample_factor).astype(np.int64))
+        if tuple(nx_array.shape) != expected_shape:
+            print(
+                f'WARNING: normal zarr shape {nx_array.shape} does not match '
+                f'ceil(scroll_zarr.shape / downsample_factor) {expected_shape}'
+            )
+        else:
+            print(f'normal zarr shape {nx_array.shape} matches current optimisation grid {expected_shape}')
+    root_attrs = dict(zarr.open(normal_nx_zarr_path, mode='r').attrs)
+    multiscales = root_attrs.get('multiscales', [])
+    if multiscales:
+        datasets = {d.get('path'): d for d in multiscales[0].get('datasets', [])}
+        scale = datasets.get(normal_zarr_group, {}).get('coordinateTransformations', [{}])[0].get('scale')
+        if scale is not None:
+            print(f'normal zarr group {normal_zarr_group} coordinate scale: {scale}')
+
+    zyxs = _collect_pcl_normal_zyxs(point_collections, unattached_pcl_strips)
+    if len(zyxs) == 0:
+        print('no PCL points available for normal loss')
+        return None
+
+    radius = int(cfg['pcl_normals_sample_radius'])
+    sampled_zyxs = []
+    sampled_normals = []
+    for zyx in tqdm(zyxs, 'sampling PCL normals'):
+        normal_zyx = _sample_zarr_normal_zyx_at_zyx(nx_array, ny_array, zyx, radius)
+        if normal_zyx is None:
+            continue
+        sampled_zyxs.append(zyx)
+        sampled_normals.append(normal_zyx)
+
+    if not sampled_zyxs:
+        print(f'no valid PCL normals sampled from {len(zyxs)} PCL points')
+        return None
+
+    sampled_zyxs = np.stack(sampled_zyxs, axis=0).astype(np.float32, copy=False)
+    sampled_normals = np.stack(sampled_normals, axis=0).astype(np.float32, copy=False)
+    print(f'PCL normals: sampled {len(sampled_zyxs)}/{len(zyxs)} points using radius {radius}')
+    return {
+        'zyxs': sampled_zyxs,
+        'normals': sampled_normals,
+    }
+
+
+def _pcl_normal_samples_to_gpu(pcl_normal_samples, device):
+    if pcl_normal_samples is None:
+        return None
+    return {
+        'zyxs': torch.from_numpy(pcl_normal_samples['zyxs']).to(device=device),
+        'normals': torch.from_numpy(pcl_normal_samples['normals']).to(device=device),
+    }
+
+
+def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_points, epsilon=1.0):
+    if pcl_normal_samples is None:
+        return torch.zeros([], device='cuda')
+    n = pcl_normal_samples['zyxs'].shape[0]
+    if n == 0:
+        return torch.zeros([], device=pcl_normal_samples['zyxs'].device)
+
+    device = pcl_normal_samples['zyxs'].device
+    sampled = np.random.choice(n, num_points, replace=n < num_points)
+    sampled_t = torch.from_numpy(sampled).to(device=device, dtype=torch.long)
+    scroll_zyx = pcl_normal_samples['zyxs'][sampled_t]
+    scroll_normal = pcl_normal_samples['normals'][sampled_t]
+
+    scroll_shift_n = scroll_zyx + scroll_normal * epsilon
+    combined_spiral = slice_to_spiral_transform(torch.cat([scroll_zyx, scroll_shift_n], dim=0))
+    spiral_zyx, spiral_shift_n = combined_spiral.chunk(2, dim=0)
+
+    spiral_outward_yx = F.normalize(spiral_zyx[:, 1:], dim=-1)
+    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
+    spiral_normal_step = F.normalize(spiral_shift_n - spiral_zyx, dim=-1)
+    return (1. - (spiral_normal_step * spiral_outward_zyx).sum(dim=-1).abs()).mean()
+
+
 def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
@@ -2707,7 +2883,7 @@ def save_overlay(
         visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, shell_patch, z_to_umbilicus_yx, out_path):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, pcl_normal_samples, shell_patch, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
@@ -2721,6 +2897,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
     mesh_enabled = os.environ.get('FIT_SPIRAL_SKIP_MESH') != '1'
 
     device = torch.device('cuda')
+    pcl_normal_samples = _pcl_normal_samples_to_gpu(pcl_normal_samples, device)
 
     all_zs_np = np.arange(z_begin, z_end)
     umbilicus_zyx = torch.from_numpy(np.concatenate([all_zs_np[:, None], z_to_umbilicus_yx(all_zs_np)], axis=-1).astype(np.float32)).to(device)
@@ -2962,6 +3139,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
             losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_winding_number']
+
+        if cfg['loss_weight_pcl_normals'] > 0 and pcl_normal_samples is not None:
+            losses['pcl_normals'] = get_pcl_normals_loss(
+                slice_to_spiral_transform,
+                pcl_normal_samples,
+                cfg['pcl_normals_num_points'],
+            ) * cfg['loss_weight_pcl_normals']
 
         if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
             unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
@@ -3213,6 +3397,11 @@ def main():
         f'pcls: {len(cross_patch_point_collections)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
+    pcl_normal_samples = prepare_pcl_normal_samples(
+        list(cross_patch_point_collections.values()),
+        unattached_pcl_strips,
+        scroll_zarr_array,
+    )
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
     out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch'
@@ -3228,6 +3417,7 @@ def main():
         patches,
         list(cross_patch_point_collections.values()),
         unattached_pcl_strips,
+        pcl_normal_samples,
         shell_patch,
         umbilicus,
         out_path,
