@@ -15,7 +15,7 @@ the final list of patches is a list of per-patch dictionaries, where each dict c
   (z_band, grid_index), coverage stats (valid_point_count, positive_point_count, positive_fraction, span_zyx), and load-time references (segment, volume, scale,
   ink_label_path)
 
-patch computation can be cached to disk , and reused with the `patch_cache_filename` key. patches can be forced to recompute by setting `"patch_cache_force_recompute": true`
+patch computation can be cached to disk , and reused with the `patch_cache_filename` key. patches can be forced to recompute by setting `"patch_cache_force_recompute": true`. `auto_fix_padding_multiples` controls which known bottom/right label-padding multiples may be cropped before patch finding; changing it is part of the patch-cache key.
 ___ 
 
 **modes**

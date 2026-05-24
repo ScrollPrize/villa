@@ -195,6 +195,33 @@ def _evaluate_patch_chunk(patch_chunk):
     }
 
 
+def _build_patch_cache_key(
+    dataset,
+    *,
+    patch_size_zyx,
+    min_positive_fraction,
+    min_span_ratio,
+    overlap_fraction,
+    auto_fix_padding_multiples,
+):
+    cache_keys = {
+        "dataset": {
+            "volume_path": str(dataset["volume_path"]),
+            "volume_scale": int(dataset["volume_scale"]),
+            "segments_path": str(dataset["segments_path"]),
+            "z_range": dataset.get("z_range"),
+        },
+        "patch_size_zyx": [int(v) for v in patch_size_zyx],
+        "min_positive_fraction": float(min_positive_fraction),
+        "min_span_ratio": float(min_span_ratio),
+        "overlap_fraction": float(overlap_fraction),
+        "auto_fix_padding_multiples": [int(v) for v in auto_fix_padding_multiples],
+    }
+    return hashlib.sha256(
+        json.dumps(cache_keys, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def find_patches(
     config,
     *,
@@ -257,21 +284,14 @@ def find_patches(
             str(dataset["segments_path"]),
             str(patch_cache_filename or _PATCH_CACHE_DEFAULT_FILENAME),
         )
-        cache_keys = {
-            "dataset": {
-                "volume_path": str(dataset["volume_path"]),
-                "volume_scale": int(dataset["volume_scale"]),
-                "segments_path": str(dataset["segments_path"]),
-                "z_range": dataset.get("z_range"),
-            },
-            "patch_size_zyx": [int(v) for v in patch_size_zyx],
-            "min_positive_fraction": float(min_positive_fraction),
-            "min_span_ratio": float(min_span_ratio),
-            "overlap_fraction": float(overlap_fraction),
-        }
-        cache_key = hashlib.sha256(
-            json.dumps(cache_keys, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        cache_key = _build_patch_cache_key(
+            dataset,
+            patch_size_zyx=patch_size_zyx,
+            min_positive_fraction=min_positive_fraction,
+            min_span_ratio=min_span_ratio,
+            overlap_fraction=overlap_fraction,
+            auto_fix_padding_multiples=auto_fix_padding_multiples,
+        )
 
         cache_entries = {}
         if not patch_cache_force_recompute and os.path.exists(cache_path):
@@ -387,7 +407,8 @@ def find_patches(
                     warnings.warn(
                         f"Skipping segment {original_seg.uuid!r}: label shape {ink_label.shape} "
                         f"does not match segment full-resolution shape {expected_label_shape}, "
-                        "and does not match known bottom/right 256/64 padding."
+                        f"and does not match configured bottom/right padding multiples "
+                        f"{list(auto_fix_padding_multiples)!r}."
                     )
                     continue
 

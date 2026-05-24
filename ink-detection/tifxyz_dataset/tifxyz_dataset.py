@@ -22,6 +22,35 @@ from .common import (
 from .patch_finding import _PATCH_CACHE_DEFAULT_FILENAME, find_patches
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
 
+
+def _normalize_auto_fix_padding_multiples(value):
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, bool, np.bool_)):
+        raise ValueError("auto_fix_padding_multiples must contain positive integer values")
+    if np.isscalar(value):
+        values = [value]
+    else:
+        try:
+            values = list(value)
+        except TypeError as exc:
+            raise ValueError(
+                "auto_fix_padding_multiples must be None, a positive integer, or a sequence of positive integers"
+            ) from exc
+
+    normalized = []
+    for multiple in values:
+        if isinstance(multiple, (str, bytes, bool, np.bool_)):
+            raise ValueError("auto_fix_padding_multiples must contain positive integer values")
+        if not np.isscalar(multiple):
+            raise ValueError("auto_fix_padding_multiples must contain positive integer values")
+        multiple_float = float(multiple)
+        if not np.isfinite(multiple_float) or multiple_float <= 0 or not multiple_float.is_integer():
+            raise ValueError("auto_fix_padding_multiples must contain positive integer values")
+        normalized.append(int(multiple_float))
+    return normalized
+
+
 class TifxyzInkDataset(Dataset):
     def __init__(
         self,
@@ -72,7 +101,9 @@ class TifxyzInkDataset(Dataset):
             config.get("patch_cache_filename", _PATCH_CACHE_DEFAULT_FILENAME)
         )
 
-        self.auto_fix_padding_multiples = [64, 256]                                     # if we find these common leftover padding multiples, we'll remove them
+        self.auto_fix_padding_multiples = _normalize_auto_fix_padding_multiples(        # if we find these common leftover padding multiples, we'll remove them
+            config.get("auto_fix_padding_multiples", [64, 256])
+        )
 
         self._segment_grid_cache = {}
         self._segment_ink_mask_cache = {}
