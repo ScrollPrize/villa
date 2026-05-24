@@ -54,8 +54,25 @@ CChunkedVolumeViewer* LineAnnotationDialog::addPane(
     }
 
     viewer->applyCameraState(camera, false);
+    bindPaneInteractions(surfaceName, viewer);
     _panes.push_back(Pane{surfaceName, viewer, subWindow});
     return viewer;
+}
+
+void LineAnnotationDialog::bindPaneInteractions(const std::string& surfaceName,
+                                                CChunkedVolumeViewer* viewer)
+{
+    if (!viewer) {
+        return;
+    }
+
+    viewer->setLineAnnotationPlacementPreviewEnabled(true);
+    connect(viewer,
+            &CChunkedVolumeViewer::sendLineAnnotationSeedRequested,
+            this,
+            [this, surfaceName](cv::Vec3f volumePoint, QPointF scenePoint) {
+                emit lineSeedRequested(surfaceName, volumePoint, scenePoint);
+            });
 }
 
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)

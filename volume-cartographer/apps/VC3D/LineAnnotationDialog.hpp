@@ -9,6 +9,8 @@
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
+#include <opencv2/core/mat.hpp>
+
 class CState;
 class QMdiArea;
 class QMdiSubWindow;
@@ -34,11 +36,14 @@ public:
 
 signals:
     void paneClosed(const std::string& surfaceName);
+    void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
 
 private:
+    void bindPaneInteractions(const std::string& surfaceName, CChunkedVolumeViewer* viewer);
+
     ViewerManager* _viewerManager = nullptr;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;

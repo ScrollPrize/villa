@@ -620,6 +620,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMousePress, this, &CChunkedVolumeViewer::onMousePress);
     connect(_view, &CVolumeViewerView::sendMouseMove, this, &CChunkedVolumeViewer::onMouseMove);
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
+    connect(_view, &CVolumeViewerView::sendMouseLeftView, this, [this]() {
+        clearLineAnnotationPlacementMarker();
+    });
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
                 const auto cursorPos = cursorVolumePosition(scenePos);
@@ -893,6 +896,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     _stableFramebufferValid = false;
     if (_cursorCrosshair)
         _cursorCrosshair->hide();
+    clearLineAnnotationPlacementMarker();
     if (_focusMarker)
         _focusMarker->hide();
 
@@ -1027,6 +1031,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         _scene->clear();
         _overlayGroups.clear();
         _cursorCrosshair = nullptr;
+        _lineAnnotationPlacementMarker = nullptr;
         _focusMarker = nullptr;
         return;
     }
@@ -3058,6 +3063,12 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
         volumePos = sceneToVolume(scenePos);
     }
     emit sendMousePressVolume(volumePos, {0, 0, 1}, button, modifiers, scenePos);
+    if (_lineAnnotationPlacementPreviewEnabled && button == Qt::LeftButton &&
+        modifiers == Qt::NoModifier &&
+        std::isfinite(volumePos[0]) && std::isfinite(volumePos[1]) &&
+        std::isfinite(volumePos[2])) {
+        emit sendLineAnnotationSeedRequested(volumePos, scenePos);
+    }
 }
 
 void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
@@ -3081,6 +3092,13 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
         volumePos = *_lastCursorVolumePos;
     } else {
         volumePos = sceneToVolume(scenePos);
+    }
+    if (_lineAnnotationPlacementPreviewEnabled &&
+        std::isfinite(volumePos[0]) && std::isfinite(volumePos[1]) &&
+        std::isfinite(volumePos[2])) {
+        updateLineAnnotationPlacementMarker(scenePos);
+    } else {
+        clearLineAnnotationPlacementMarker();
     }
     emit sendMouseMoveVolume(volumePos, buttons, modifiers, scenePos);
 }
@@ -3226,6 +3244,50 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
 
     _cursorCrosshair->setPos(scenePos);
     _cursorCrosshair->show();
+}
+
+void CChunkedVolumeViewer::setLineAnnotationPlacementPreviewEnabled(bool enabled)
+{
+    _lineAnnotationPlacementPreviewEnabled = enabled;
+    if (!enabled) {
+        clearLineAnnotationPlacementMarker();
+    }
+}
+
+bool CChunkedVolumeViewer::lineAnnotationPlacementMarkerVisible() const
+{
+    return _lineAnnotationPlacementMarker && _lineAnnotationPlacementMarker->isVisible();
+}
+
+void CChunkedVolumeViewer::updateLineAnnotationPlacementMarker(const QPointF& scenePos)
+{
+    if (!_lineAnnotationPlacementPreviewEnabled || !_scene ||
+        !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        clearLineAnnotationPlacementMarker();
+        return;
+    }
+
+    if (!_lineAnnotationPlacementMarker || !_lineAnnotationPlacementMarker->scene()) {
+        auto* marker = new QGraphicsEllipseItem(-6.0, -6.0, 12.0, 12.0);
+        QPen pen(QColor(Qt::yellow), 2.0);
+        pen.setCosmetic(true);
+        marker->setPen(pen);
+        marker->setBrush(QBrush(QColor(255, 255, 0, 70)));
+        marker->setZValue(135.0);
+        marker->setAcceptedMouseButtons(Qt::NoButton);
+        _scene->addItem(marker);
+        _lineAnnotationPlacementMarker = marker;
+    }
+
+    _lineAnnotationPlacementMarker->setPos(scenePos);
+    _lineAnnotationPlacementMarker->show();
+}
+
+void CChunkedVolumeViewer::clearLineAnnotationPlacementMarker()
+{
+    if (_lineAnnotationPlacementMarker) {
+        _lineAnnotationPlacementMarker->hide();
+    }
 }
 
 std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPointF& scenePos) const

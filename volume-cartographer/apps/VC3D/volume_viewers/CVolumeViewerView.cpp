@@ -472,3 +472,17 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
     // volume coordinates.
     sendMouseMove(scene_loc, event->buttons(), event->modifiers());
 }
+
+void CVolumeViewerView::leaveEvent(QEvent *event)
+{
+    emit sendMouseLeftView();
+    QGraphicsView::leaveEvent(event);
+}
+
+bool CVolumeViewerView::viewportEvent(QEvent* event)
+{
+    if (event && event->type() == QEvent::Leave) {
+        emit sendMouseLeftView();
+    }
+    return QGraphicsView::viewportEvent(event);
+}

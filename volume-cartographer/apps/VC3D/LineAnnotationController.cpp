@@ -83,6 +83,13 @@ void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, co
     connect(dialog, &LineAnnotationDialog::paneClosed, this, [this](const std::string& name) {
         cleanupSurfaceName(name);
     });
+    connect(dialog,
+            &LineAnnotationDialog::lineSeedRequested,
+            this,
+            [](const std::string&, cv::Vec3f, QPointF) {
+                // Stage 1 only exposes the placement event. The Lasagna-backed
+                // optimizer consumes this signal in the next implementation stage.
+            });
     connect(dialog, &QObject::destroyed, this, [this, surfaceName]() {
         cleanupSurfaceName(surfaceName);
     });

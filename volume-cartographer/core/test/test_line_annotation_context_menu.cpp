@@ -36,6 +36,7 @@ int main(int argc, char** argv)
     QSignalSpy contextSpy(&view, &CVolumeViewerView::sendAnnotationContextMenuRequested);
     QSignalSpy panSpy(&view, &CVolumeViewerView::sendPanStart);
     QSignalSpy pressSpy(&view, &CVolumeViewerView::sendMousePress);
+    QSignalSpy leaveSpy(&view, &CVolumeViewerView::sendMouseLeftView);
 
     QTest::mousePress(view.viewport(), Qt::RightButton, Qt::ControlModifier, pos);
     if (contextSpy.count() != 1 || panSpy.count() != 0 || pressSpy.count() != 0) {
@@ -57,6 +58,13 @@ int main(int argc, char** argv)
         return 1;
     }
     QTest::mouseRelease(view.viewport(), Qt::RightButton, Qt::ShiftModifier, pos);
+
+    QEvent leaveEvent(QEvent::Leave);
+    QApplication::sendEvent(view.viewport(), &leaveEvent);
+    if (leaveSpy.count() != 1) {
+        qWarning("Leave event did not emit mouse-left-view signal");
+        return 1;
+    }
 
     return 0;
 }

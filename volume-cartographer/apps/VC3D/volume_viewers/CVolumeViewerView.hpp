@@ -13,6 +13,8 @@ public:
     void mousePressEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
+    bool viewportEvent(QEvent* event) override;
     void wheelEvent(QWheelEvent *event) override;
     void scrollContentsBy(int dx, int dy) override;
     void keyPressEvent(QKeyEvent *event) override;
@@ -42,6 +44,7 @@ signals:
     void sendMouseDoubleClick(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendMouseLeftView();
     void sendAnnotationContextMenuRequested(QPointF scenePoint, QPoint globalPos, Qt::KeyboardModifiers modifiers);
     void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
