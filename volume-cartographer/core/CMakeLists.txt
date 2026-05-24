@@ -118,6 +118,12 @@ target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
 add_library(vc_inpaint src/InpaintSurface.cpp)
 target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
+add_library(vc_lasagna
+    src/lasagna/Dataset.cpp
+    src/lasagna/Manifest.cpp
+)
+target_link_libraries(vc_lasagna PUBLIC vc_core PRIVATE Ceres::ceres)
+
 add_library(vc_tracer
     src/GrowPatch.cpp
     src/GrowSurface.cpp
@@ -132,7 +138,7 @@ target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
-    foreach(_lib vc_flattening vc_inpaint vc_tracer)
+    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_tracer)
         target_precompile_headers(${_lib} REUSE_FROM vc_core)
     endforeach()
 endif()
