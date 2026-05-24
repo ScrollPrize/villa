@@ -458,6 +458,35 @@ fs::path VolumePkg::outputSegmentsPath() const
     return vc::project::resolveLocalPath(*outputSegments_, path_.parent_path());
 }
 
+std::string VolumePkg::selectedLasagnaDataset() const
+{
+    return selectedLasagnaDataset_.value_or(std::string{});
+}
+
+void VolumePkg::setSelectedLasagnaDataset(std::string location)
+{
+    if (location.empty()) {
+        clearSelectedLasagnaDataset();
+        return;
+    }
+    selectedLasagnaDataset_ = std::move(location);
+    persistProjectState();
+}
+
+void VolumePkg::clearSelectedLasagnaDataset()
+{
+    if (!selectedLasagnaDataset_) return;
+    selectedLasagnaDataset_.reset();
+    persistProjectState();
+}
+
+fs::path VolumePkg::selectedLasagnaDatasetPath() const
+{
+    if (!selectedLasagnaDataset_) return {};
+    if (vc::project::isLocationRemote(*selectedLasagnaDataset_)) return {};
+    return vc::project::resolveLocalPath(*selectedLasagnaDataset_, path_.parent_path());
+}
+
 bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
 bool VolumePkg::hasVolume(const std::string& id) const { return loadedVolumes_.count(id) > 0; }
 std::size_t VolumePkg::numberOfVolumes() const { return loadedVolumes_.size(); }
@@ -953,6 +982,7 @@ utils::Json VolumePkg::toJson() const
     j["normal_grids"] = entriesToJson(normalGrids_);
     if (!remoteCacheRoot_.empty()) j["remote_cache_root"] = remoteCacheRoot_.string();
     if (outputSegments_) j["output_segments"] = *outputSegments_;
+    if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     return j;
 }
 
@@ -970,6 +1000,10 @@ void VolumePkg::fromJson(const utils::Json& j)
         }
     }
     if (j.contains("output_segments")) outputSegments_ = j.at("output_segments").get_string();
+    if (j.contains("selected_lasagna_dataset")) {
+        selectedLasagnaDataset_ = j.at("selected_lasagna_dataset").get_string();
+        if (selectedLasagnaDataset_->empty()) selectedLasagnaDataset_.reset();
+    }
 }
 
 void VolumePkg::writeJsonTo(const fs::path& target) const
