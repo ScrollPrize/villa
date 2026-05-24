@@ -51,6 +51,14 @@ class CChunkedVolumeViewer : public QWidget, public VolumeViewerBase
     Q_OBJECT
 
 public:
+    struct CameraState {
+        float surfacePtrX = 0.0f;
+        float surfacePtrY = 0.0f;
+        float scale = 1.0f;
+        float zOffset = 0.0f;
+        cv::Vec3f zOffsetWorldDir{0, 0, 0};
+    };
+
     CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent = nullptr);
     ~CChunkedVolumeViewer() override;
 
@@ -78,6 +86,8 @@ public:
     float getCurrentScale() const override { return _scale; }
     float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }
+    CameraState cameraState() const;
+    void applyCameraState(const CameraState& state, bool forceRender = true);
     int datasetScaleIndex() const override { return _dsScaleIdx; }
     float datasetScaleFactor() const override { return _dsScale; }
     Surface* currentSurface() const override;

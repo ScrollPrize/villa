@@ -65,6 +65,7 @@ class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
+class LineAnnotationController;
 
 class CWindow : public QMainWindow
 {
@@ -241,6 +242,7 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
+    std::unique_ptr<LineAnnotationController> _lineAnnotationController;
     // Keyboard shortcuts
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;

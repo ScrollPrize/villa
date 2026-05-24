@@ -38,13 +38,19 @@ class ViewerManager : public QObject
     Q_OBJECT
 
 public:
+    enum class ViewerRole {
+        Standard,
+        Annotation,
+    };
+
     ViewerManager(CState* state,
                   VCCollection* points,
                   QObject* parent = nullptr);
 
     VolumeViewerBase* createViewer(const std::string& surfaceName,
                                    const QString& title,
-                                   QMdiArea* mdiArea);
+                                   QMdiArea* mdiArea,
+                                   ViewerRole role = ViewerRole::Standard);
     void unregisterViewer(VolumeViewerBase* viewer);
 
     const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }

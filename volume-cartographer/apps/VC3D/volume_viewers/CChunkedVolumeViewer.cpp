@@ -798,6 +798,38 @@ Surface* CChunkedVolumeViewer::currentSurface() const
     return _state->surfaceRaw(_surfName);
 }
 
+CChunkedVolumeViewer::CameraState CChunkedVolumeViewer::cameraState() const
+{
+    CameraState state;
+    state.surfacePtrX = _surfacePtrX;
+    state.surfacePtrY = _surfacePtrY;
+    state.scale = _scale;
+    state.zOffset = _zOff;
+    state.zOffsetWorldDir = _zOffWorldDir;
+    return state;
+}
+
+void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool forceRender)
+{
+    if (_closing) {
+        return;
+    }
+    _surfacePtrX = state.surfacePtrX;
+    _surfacePtrY = state.surfacePtrY;
+    _scale = state.scale;
+    _zOff = state.zOffset;
+    _zOffWorldDir = state.zOffsetWorldDir;
+    recalcPyramidLevel();
+    _genCacheDirty = true;
+    _stableFramebufferValid = false;
+    if (forceRender) {
+        renderVisible(true, "annotation camera state applied");
+    } else {
+        scheduleRender("annotation camera state applied");
+    }
+    emit overlaysUpdated();
+}
+
 void CChunkedVolumeViewer::rebuildChunkArray()
 {
     if (_chunkCbId != 0 && _chunkArray) {

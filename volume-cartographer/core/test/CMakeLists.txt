@@ -7,7 +7,7 @@ set_target_properties(doctest::doctest PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES
         "${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/doctest_compat")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Test)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Test Widgets)
 
 # Dedicated PCH carrier for the test suite. vc_core is SHARED, so CMake bakes
 # -Dvc_core_EXPORTS into its PCH; GCC then rejects that PCH for tests (which
@@ -77,6 +77,12 @@ vc_add_test(NAME test_segmentation_autosave_state
 
 vc_add_test(NAME test_segmentation_intersection_invalidation
     LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+vc_add_test(NAME test_line_annotation_context_menu
+    SOURCES test_line_annotation_context_menu.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 # Qt-free data/IO layer.

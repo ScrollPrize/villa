@@ -47,6 +47,7 @@
 #include <QDebug>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QMenu>
 #include "utils/Json.hpp"
 #include <QPointer>
 #include <QListView>
@@ -73,6 +74,7 @@
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
+#include "LineAnnotationController.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
@@ -417,6 +419,10 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
+    _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
+                                                                           _viewerManager.get(),
+                                                                           this,
+                                                                           this);
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
@@ -889,17 +895,46 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
         return;
     }
 
+    const bool annotationViewer = viewer->property("vc_viewer_role").toString() == QStringLiteral("annotation");
+
     connect(_state, &CState::volumeChanged, viewer, &CChunkedVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
     connect(_state, &CState::volumeClosing, viewer, &CChunkedVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
-    connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
+    if (!annotationViewer) {
+        connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
+    }
 
     if (auto* graphicsView = viewer->graphicsView()) {
-        connect(graphicsView, &CVolumeViewerView::sendMousePress,
-                viewer, &CChunkedVolumeViewer::onMousePress, Qt::UniqueConnection);
-        connect(graphicsView, &CVolumeViewerView::sendMouseMove,
-                viewer, &CChunkedVolumeViewer::onMouseMove, Qt::UniqueConnection);
-        connect(graphicsView, &CVolumeViewerView::sendMouseRelease,
-                viewer, &CChunkedVolumeViewer::onMouseRelease, Qt::UniqueConnection);
+        if (!viewer->property("vc_annotation_context_bound").toBool()) {
+            connect(graphicsView,
+                    &CVolumeViewerView::sendAnnotationContextMenuRequested,
+                    this,
+                    [this, viewer](QPointF scenePoint, QPoint globalPos, Qt::KeyboardModifiers) {
+                        if (!_lineAnnotationController) {
+                            return;
+                        }
+                        QMenu menu(this);
+                        QAction* action = menu.addAction(tr("New line annotation"));
+                        action->setEnabled(_lineAnnotationController->canLaunchFromViewer(viewer));
+                        QAction* selected = menu.exec(globalPos);
+                        if (selected == action && action->isEnabled()) {
+                            _lineAnnotationController->launchFromViewer(viewer, scenePoint);
+                        }
+                    });
+            viewer->setProperty("vc_annotation_context_bound", true);
+        }
+
+        if (!annotationViewer) {
+            connect(graphicsView, &CVolumeViewerView::sendMousePress,
+                    viewer, &CChunkedVolumeViewer::onMousePress, Qt::UniqueConnection);
+            connect(graphicsView, &CVolumeViewerView::sendMouseMove,
+                    viewer, &CChunkedVolumeViewer::onMouseMove, Qt::UniqueConnection);
+            connect(graphicsView, &CVolumeViewerView::sendMouseRelease,
+                    viewer, &CChunkedVolumeViewer::onMouseRelease, Qt::UniqueConnection);
+        }
+    }
+
+    if (annotationViewer) {
+        return;
     }
 
     if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
@@ -1272,7 +1307,8 @@ void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
         }
 
         const std::string name = viewer->surfName();
-        if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
+        if (name == "xy plane" || name == "seg xz" || name == "seg yz" ||
+            name.rfind("line_annotation_slice_", 0) == 0) {
             centerViewerOnVolumePointForNavigation(viewer, position);
         }
     });

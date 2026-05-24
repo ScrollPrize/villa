@@ -375,6 +375,16 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
             return;
         }
 
+        if (event->modifiers().testFlag(Qt::ControlModifier)) {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            emit sendAnnotationContextMenuRequested(scene_loc,
+                                                    event->globalPosition().toPoint(),
+                                                    event->modifiers());
+            event->accept();
+            return;
+        }
+
         _regular_pan = true;
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         sendPanStart(event->button(), event->modifiers());

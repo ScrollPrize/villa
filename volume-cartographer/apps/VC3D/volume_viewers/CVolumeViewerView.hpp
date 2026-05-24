@@ -42,6 +42,7 @@ signals:
     void sendMouseDoubleClick(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendAnnotationContextMenuRequested(QPointF scenePoint, QPoint globalPos, Qt::KeyboardModifiers modifiers);
     void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void sendTiltHandleChanged(QPointF tilt);

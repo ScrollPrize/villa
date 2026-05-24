@@ -20,6 +20,10 @@ set(srcs
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
+    LineAnnotationController.cpp
+    LineAnnotationController.hpp
+    LineAnnotationDialog.cpp
+    LineAnnotationDialog.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
