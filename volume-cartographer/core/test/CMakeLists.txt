@@ -239,6 +239,8 @@ vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
 
+vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
+
 vc_add_test(NAME test_remote_url)
 
 vc_add_test(NAME test_logging)

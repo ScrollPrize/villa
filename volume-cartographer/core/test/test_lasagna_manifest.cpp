@@ -38,65 +38,79 @@ private:
 
 } // namespace
 
-TEST_CASE("LasagnaDatasetManifest parses tolerant minimal normal-grid manifest")
+TEST_CASE("LasagnaDatasetManifest parses channel groups from canonical Lasagna JSON")
 {
-    const auto dir = makeTmpDir("normal_grid");
+    const auto dir = makeTmpDir("groups");
     const auto manifestPath = dir / "dataset.lasagna.json";
     {
         std::ofstream out(manifestPath);
         out << R"({
-            "name": "demo",
-            "volume_path": "volume.zarr",
-            "normal_grid_path": "normal_grids",
-            "unknown_future_field": {"kept": true}
+            "version": 2,
+            "source_to_base": 2.0,
+            "grad_mag_encode_scale": 1000.0,
+            "groups": {
+                "pred": {
+                    "zarr": "pred.zarr",
+                    "scaledown": 4,
+                    "channels": ["cos", "grad_mag", "nx", "ny"]
+                },
+                "extra": {
+                    "zarr": "../extra.zarr",
+                    "scaledown": 5,
+                    "channels": ["pred_dt"]
+                }
+            }
         })";
     }
 
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseFile(manifestPath);
 
-    REQUIRE(manifest.volumePath.has_value());
-    REQUIRE(manifest.normalPath.has_value());
-    CHECK(*manifest.volumePath == fs::absolute(dir / "volume.zarr").lexically_normal());
-    CHECK(*manifest.normalPath == fs::absolute(dir / "normal_grids").lexically_normal());
-    CHECK(manifest.normalSourceKind == vc::lasagna::NormalSourceKind::NormalGrid);
-    CHECK(manifest.normalSourceKey == "normal_grid_path");
+    CHECK(manifest.version == 2);
+    CHECK(manifest.sourceToBase == doctest::Approx(2.0));
+    REQUIRE(manifest.groups.size() == 2);
+    const auto* pred = manifest.groupForChannel("nx");
+    REQUIRE(pred != nullptr);
+    CHECK(pred->name == "pred");
+    CHECK(pred->zarrPath == fs::absolute(dir / "pred.zarr").lexically_normal());
+    CHECK(pred->scaleFactor() == 16);
+    CHECK(pred->hasChannel("nx"));
+    REQUIRE(pred->channelIndex("ny").has_value());
+    CHECK(*pred->channelIndex("ny") == 3);
+    REQUIRE(manifest.groupForChannel("grad_mag") != nullptr);
     CHECK(manifest.hasNormalSource());
-    CHECK(manifest.raw.contains("unknown_future_field"));
-
-    fs::remove_all(dir);
-}
-
-TEST_CASE("LasagnaDatasetManifest parses nested dense-normal aliases")
-{
-    const auto dir = makeTmpDir("dense_zarr");
-    const auto manifestPath = dir / "dataset.lasagna.json";
-
-    const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(
-        R"({
-            "paths": {
-                "volume": "volumes/main.zarr",
-                "normals": {"path": "../normals.zarr", "type": "zarr"}
-            }
-        })",
-        manifestPath);
-
-    REQUIRE(manifest.volumePath.has_value());
-    REQUIRE(manifest.normalPath.has_value());
-    CHECK(*manifest.volumePath == fs::absolute(dir / "volumes/main.zarr").lexically_normal());
-    CHECK(*manifest.normalPath == fs::absolute(dir / "../normals.zarr").lexically_normal());
     CHECK(manifest.normalSourceKind == vc::lasagna::NormalSourceKind::DenseZarr);
-    CHECK(manifest.normalSourceKey == "paths.normals");
+    CHECK(manifest.normalSourceKey == "groups.grad_mag_nx_ny");
+    CHECK(manifest.raw.contains("grad_mag_encode_scale"));
 
     fs::remove_all(dir);
 }
 
 TEST_CASE("LasagnaDataset wraps manifest and reports missing normal source")
 {
-    auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({"name":"no normals"})");
+    auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+        "version": 2,
+        "groups": {
+            "pred": {"zarr": "pred.zarr", "scaledown": 4, "channels": ["cos", "grad_mag"]}
+        }
+    })");
     vc::lasagna::LasagnaDataset dataset(std::move(manifest));
 
     CHECK_FALSE(dataset.hasNormalSource());
     CHECK_THROWS_AS(dataset.normalSourcePath(), std::runtime_error);
+}
+
+TEST_CASE("LasagnaDatasetManifest requires grad_mag for normal source")
+{
+    auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+        "version": 2,
+        "groups": {
+            "pred": {"zarr": "pred.zarr", "scaledown": 4, "channels": ["nx", "ny"]}
+        }
+    })");
+
+    CHECK_FALSE(manifest.hasNormalSource());
+    CHECK(manifest.normalSourceKind == vc::lasagna::NormalSourceKind::None);
+    CHECK(manifest.normalSourceKey.empty());
 }
 
 TEST_CASE("NormalSampler interface supports framework tests without Qt")

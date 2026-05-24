@@ -1,17 +1,11 @@
 #include "vc/lasagna/Manifest.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <stdexcept>
-#include <vector>
 
 namespace vc::lasagna {
 namespace {
-
-struct PathCandidate {
-    std::string key;
-    std::string value;
-    NormalSourceKind kind = NormalSourceKind::None;
-};
 
 std::filesystem::path manifestBaseDir(const std::filesystem::path& manifestPath)
 {
@@ -36,132 +30,98 @@ std::filesystem::path resolvePath(
     return std::filesystem::absolute(path).lexically_normal();
 }
 
-std::optional<std::string> stringAtPath(
+std::vector<std::string> parseChannels(const nlohmann::json& value)
+{
+    if (!value.is_array()) {
+        throw std::runtime_error("Lasagna channel group 'channels' must be an array");
+    }
+
+    std::vector<std::string> channels;
+    channels.reserve(value.size());
+    for (const auto& channel : value) {
+        if (!channel.is_string()) {
+            throw std::runtime_error("Lasagna channel names must be strings");
+        }
+        channels.push_back(channel.get<std::string>());
+    }
+    return channels;
+}
+
+std::vector<LasagnaChannelGroup> parseGroups(
     const nlohmann::json& root,
-    std::initializer_list<const char*> keys)
+    const std::filesystem::path& baseDirectory)
 {
-    const nlohmann::json* current = &root;
-    for (const char* key : keys) {
-        if (!current->is_object() || !current->contains(key)) {
-            return std::nullopt;
-        }
-        current = &current->at(key);
+    if (!root.contains("groups")) {
+        return {};
+    }
+    const auto& groupsJson = root.at("groups");
+    if (!groupsJson.is_object()) {
+        throw std::runtime_error("Lasagna manifest 'groups' must be a JSON object");
     }
 
-    if (current->is_string()) {
-        return current->get<std::string>();
-    }
-    if (current->is_object()) {
-        for (const char* key : {"path", "location", "src", "source", "url"}) {
-            if (current->contains(key) && current->at(key).is_string()) {
-                return current->at(key).get<std::string>();
-            }
+    std::vector<LasagnaChannelGroup> groups;
+    groups.reserve(groupsJson.size());
+    for (auto it = groupsJson.begin(); it != groupsJson.end(); ++it) {
+        if (!it.value().is_object()) {
+            throw std::runtime_error("Lasagna channel group '" + it.key() + "' must be an object");
         }
-    }
-    return std::nullopt;
-}
-
-void addPathCandidate(
-    std::vector<PathCandidate>& candidates,
-    const nlohmann::json& root,
-    std::initializer_list<const char*> keys,
-    NormalSourceKind kind)
-{
-    if (auto value = stringAtPath(root, keys)) {
-        std::string key;
-        for (const char* part : keys) {
-            if (!key.empty()) {
-                key += ".";
-            }
-            key += part;
+        const auto& groupJson = it.value();
+        if (!groupJson.contains("zarr") || !groupJson.at("zarr").is_string()) {
+            throw std::runtime_error("Lasagna channel group '" + it.key() + "' is missing string field 'zarr'");
         }
-        candidates.push_back({std::move(key), std::move(*value), kind});
-    }
-}
-
-NormalSourceKind kindFromObjectOrDefault(
-    const nlohmann::json& root,
-    std::initializer_list<const char*> keys,
-    NormalSourceKind fallback)
-{
-    const nlohmann::json* current = &root;
-    for (const char* key : keys) {
-        if (!current->is_object() || !current->contains(key)) {
-            return fallback;
+        if (!groupJson.contains("channels")) {
+            throw std::runtime_error("Lasagna channel group '" + it.key() + "' is missing field 'channels'");
         }
-        current = &current->at(key);
-    }
-    if (!current->is_object()) {
-        return fallback;
-    }
-    for (const char* typeKey : {"type", "kind", "format"}) {
-        if (!current->contains(typeKey) || !current->at(typeKey).is_string()) {
-            continue;
+
+        LasagnaChannelGroup group;
+        group.name = it.key();
+        group.zarrPath = resolvePath(baseDirectory, groupJson.at("zarr").get<std::string>());
+        group.scaledown = groupJson.value("scaledown", 0);
+        if (group.scaledown < 0 || group.scaledown > 30) {
+            throw std::runtime_error("Lasagna channel group '" + it.key() + "' has invalid scaledown");
         }
-        const std::string value = current->at(typeKey).get<std::string>();
-        if (value == "normal_grid" || value == "normal_grids" || value == "grid") {
-            return NormalSourceKind::NormalGrid;
-        }
-        if (value == "zarr" || value == "dense_zarr" || value == "normals_zarr") {
-            return NormalSourceKind::DenseZarr;
-        }
+        group.channels = parseChannels(groupJson.at("channels"));
+        groups.push_back(std::move(group));
     }
-    return fallback;
-}
-
-std::optional<PathCandidate> findVolumePath(const nlohmann::json& root)
-{
-    std::vector<PathCandidate> candidates;
-    addPathCandidate(candidates, root, {"volume_path"}, NormalSourceKind::None);
-    addPathCandidate(candidates, root, {"volume"}, NormalSourceKind::None);
-    addPathCandidate(candidates, root, {"zarr_path"}, NormalSourceKind::None);
-    addPathCandidate(candidates, root, {"data_path"}, NormalSourceKind::None);
-    addPathCandidate(candidates, root, {"input_path"}, NormalSourceKind::None);
-    addPathCandidate(candidates, root, {"paths", "volume"}, NormalSourceKind::None);
-    addPathCandidate(candidates, root, {"paths", "data"}, NormalSourceKind::None);
-    addPathCandidate(candidates, root, {"data", "volume"}, NormalSourceKind::None);
-    if (candidates.empty()) {
-        return std::nullopt;
-    }
-    return candidates.front();
-}
-
-std::optional<PathCandidate> findNormalPath(const nlohmann::json& root)
-{
-    std::vector<PathCandidate> candidates;
-    addPathCandidate(candidates, root, {"normal_grid_path"}, NormalSourceKind::NormalGrid);
-    addPathCandidate(candidates, root, {"normal_grid"}, NormalSourceKind::NormalGrid);
-    addPathCandidate(candidates, root, {"normal_grids"}, NormalSourceKind::NormalGrid);
-    addPathCandidate(candidates, root, {"paths", "normal_grid"}, NormalSourceKind::NormalGrid);
-    addPathCandidate(candidates, root, {"paths", "normal_grids"}, NormalSourceKind::NormalGrid);
-    addPathCandidate(candidates, root, {"normal_path"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"normals_path"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"normal_zarr"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"normals_zarr"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"gt_normals"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"normals"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"normal_dataset"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"paths", "normals"}, NormalSourceKind::DenseZarr);
-    addPathCandidate(candidates, root, {"data", "normals"}, NormalSourceKind::DenseZarr);
-
-    if (candidates.empty()) {
-        return std::nullopt;
-    }
-
-    PathCandidate candidate = candidates.front();
-    if (candidate.key == "normal_grid" || candidate.key == "normal_grids" ||
-        candidate.key == "normals" || candidate.key == "gt_normals" ||
-        candidate.key == "normal_dataset") {
-        candidate.kind = kindFromObjectOrDefault(root, {candidate.key.c_str()}, candidate.kind);
-    }
-    return candidate;
+    return groups;
 }
 
 } // namespace
 
+int LasagnaChannelGroup::scaleFactor() const noexcept
+{
+    return 1 << scaledown;
+}
+
+bool LasagnaChannelGroup::hasChannel(std::string_view channel) const noexcept
+{
+    return channelIndex(channel).has_value();
+}
+
+std::optional<size_t> LasagnaChannelGroup::channelIndex(std::string_view channel) const noexcept
+{
+    const auto it = std::find(channels.begin(), channels.end(), channel);
+    if (it == channels.end()) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(std::distance(channels.begin(), it));
+}
+
 bool LasagnaDatasetManifest::hasNormalSource() const noexcept
 {
-    return normalPath.has_value() && normalSourceKind != NormalSourceKind::None;
+    return groupForChannel("grad_mag") != nullptr &&
+           groupForChannel("nx") != nullptr &&
+           groupForChannel("ny") != nullptr;
+}
+
+const LasagnaChannelGroup* LasagnaDatasetManifest::groupForChannel(std::string_view channel) const noexcept
+{
+    for (const auto& group : groups) {
+        if (group.hasChannel(channel)) {
+            return &group;
+        }
+    }
+    return nullptr;
 }
 
 LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
@@ -193,15 +153,17 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
         : std::filesystem::absolute(manifestPath).lexically_normal();
     manifest.baseDirectory = manifestBaseDir(manifestPath);
     manifest.raw = root;
-
-    if (auto volume = findVolumePath(root)) {
-        manifest.volumePath = resolvePath(manifest.baseDirectory, volume->value);
+    manifest.version = root.value("version", 0);
+    manifest.sourceToBase = root.value("source_to_base", 1.0);
+    if (!(manifest.sourceToBase > 0.0)) {
+        throw std::runtime_error("Lasagna manifest source_to_base must be positive");
     }
+    manifest.groups = parseGroups(root, manifest.baseDirectory);
 
-    if (auto normal = findNormalPath(root)) {
-        manifest.normalPath = resolvePath(manifest.baseDirectory, normal->value);
-        manifest.normalSourceKind = normal->kind;
-        manifest.normalSourceKey = normal->key;
+    if (manifest.hasNormalSource()) {
+        manifest.normalPath = manifest.manifestPath;
+        manifest.normalSourceKind = NormalSourceKind::DenseZarr;
+        manifest.normalSourceKey = "groups.grad_mag_nx_ny";
     }
 
     return manifest;
@@ -212,8 +174,6 @@ std::string toString(NormalSourceKind kind)
     switch (kind) {
     case NormalSourceKind::None:
         return "none";
-    case NormalSourceKind::NormalGrid:
-        return "normal_grid";
     case NormalSourceKind::DenseZarr:
         return "dense_zarr";
     }
