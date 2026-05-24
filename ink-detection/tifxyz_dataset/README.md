@@ -58,3 +58,21 @@ ___
 **augmentation**
 
 augmentations are handled by the vesuvius augmentation module, and support both isotropic and anisotropic 3d patch sizes automatically
+
+___
+
+**sample export**
+
+dataset samples can be exported as npy arrays for offline inspection or downstream tools without enabling augmentation:
+
+```bash
+python -m tifxyz_dataset.export_samples --config /path/to/config.json --output /path/to/exported_samples --count 10
+```
+
+specific sample indices can be selected instead of a count:
+
+```bash
+python -m tifxyz_dataset.export_samples --config /path/to/config.json --output /path/to/exported_samples --indices 0,4,9
+```
+
+each exported sample is written to `sample_000000` style folders containing `vol.npy`, `labeled_vox_at_surface.npy`, `surface_vox.npy`, `projected_loss_mask.npy`, and `metadata.json`. the output root also contains `manifest.json`.
