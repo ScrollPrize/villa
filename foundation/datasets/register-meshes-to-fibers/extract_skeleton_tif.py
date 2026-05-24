@@ -3,9 +3,6 @@
 import numpy as np
 import argparse
 import os
-import open3d as o3d
-from skimage import io
-import kimimaro
 
 def extract_branches_from_kimimaro(vertices: np.ndarray, edges: np.ndarray) -> list:
     """
@@ -71,16 +68,25 @@ def extract_branches_from_kimimaro(vertices: np.ndarray, edges: np.ndarray) -> l
         curves.append(curve)
     return curves
 
-def classify_curve_pca(curve: np.ndarray, z_threshold: float = 1. / np.sqrt(2)) -> str:
+def z_axis_for_order(axis_order: str) -> np.ndarray:
+    if axis_order == "zyx":
+        return np.array([1, 0, 0], dtype=np.float32)
+    if axis_order == "xyz":
+        return np.array([0, 0, 1], dtype=np.float32)
+    raise ValueError(f"Unsupported axis order: {axis_order}")
+
+
+def classify_curve_pca(curve: np.ndarray, z_threshold: float = 1. / np.sqrt(2), axis_order: str = "zyx") -> str:
     """
     Classify a curve as 'vertical' or 'horizontal' using PCA on the curve coordinates.
     
-    The curve is assumed to be a NumPy array of shape (N, 3) in (x, y, z) order.
-    The classification compares the principal axis to the z-axis [0, 0, 1].
+    The curve is assumed to be a NumPy array of shape (N, 3). By default,
+    coordinates are interpreted as (z, y, x), matching NumPy volume indexing.
+    Use axis_order="xyz" for curves already converted to (x, y, z).
     
     Returns:
-        "vertical" if the absolute dot product between the principal axis and [0, 0, 1]
-        exceeds the threshold; "horizontal" otherwise.
+        "vertical" if the absolute dot product between the principal axis and the selected
+        z-axis exceeds the threshold; "horizontal" otherwise.
     """
     if curve.shape[0] < 2:
         return "horizontal"
@@ -96,11 +102,11 @@ def classify_curve_pca(curve: np.ndarray, z_threshold: float = 1. / np.sqrt(2)) 
     eigvecs = eigvecs[:, idx]
     principal_axis = eigvecs[:, 0]
     principal_axis /= np.linalg.norm(principal_axis)
-    z_axis = np.array([1, 0, 0], dtype=np.float32)
+    z_axis = z_axis_for_order(axis_order)
     cos_angle = abs(np.dot(principal_axis, z_axis))
     return "vertical" if cos_angle > z_threshold else "horizontal"
 
-def extract_skeleton_from_tif(tif_file: str, original_file: str, z_threshold: float = 1. / np.sqrt(2), label: int = 1, fiber_type: str = "hz") -> dict:
+def extract_skeleton_from_tif(tif_file: str, original_file: str, z_threshold: float = 1. / np.sqrt(2), label: int = 1, fiber_type: str = "hz", axis_order: str = "zyx") -> dict:
     """
     Loads a .tif volume, thresholds it, and performs 3D skeletonization using kimimaro.
     
@@ -111,6 +117,12 @@ def extract_skeleton_from_tif(tif_file: str, original_file: str, z_threshold: fl
         A dictionary with keys "vertical" and "horizontal". Each value is a list of NumPy arrays,
         where each array (of shape (N, 3)) represents an extracted skeleton curve.
     """
+    if fiber_type not in {"hz", "vt"}:
+        raise ValueError("fiber_type must be 'hz' or 'vt'")
+
+    from skimage import io
+    import kimimaro
+
     volume = io.imread(tif_file)
     label_volume = io.imread(original_file)
 
@@ -142,7 +154,7 @@ def extract_skeleton_from_tif(tif_file: str, original_file: str, z_threshold: fl
         branch_curves = extract_branches_from_kimimaro(vertices, edges)
         for curve in branch_curves:
             if curve.shape[0] > 1:
-                label_curve = classify_curve_pca(curve, z_threshold)
+                label_curve = classify_curve_pca(curve, z_threshold, axis_order=axis_order)
                 curves[label_curve].append(curve)
     return curves
 
@@ -154,6 +166,8 @@ def visualize_curves(curves_by_label: dict):
       - Vertical curves: red.
       - Horizontal curves: blue.
     """
+    import open3d as o3d
+
     line_sets = []
     color_map = {"vertical": [1, 0, 0], "horizontal": [0, 0, 1]}
     
@@ -169,19 +183,39 @@ def visualize_curves(curves_by_label: dict):
     
     o3d.visualization.draw_geometries(line_sets, window_name="Extracted Skeleton Curves")
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract and classify skeleton curves from a .tif volume using kimimaro skeletonization."
     )
     parser.add_argument("--tif", type=str, required=True, help="Path to the .tif volume file.")
+    parser.add_argument("--cube_label", type=str, required=True,
+                        help="Path to the cube label mask used to select the mesh label.")
+    parser.add_argument("--label", type=int, default=1, help="Label value to extract from the cube label mask.")
+    parser.add_argument("--fiber_type", type=str, choices=["hz", "vt"], default="hz",
+                        help="Fiber inference channel to use: hz uses value 2, vt uses value 1.")
+    parser.add_argument("--z_threshold", type=float, default=1. / np.sqrt(2),
+                        help="PCA alignment threshold for classifying vertical curves.")
+    parser.add_argument("--axis_order", type=str, choices=["zyx", "xyz"], default="zyx",
+                        help="Coordinate order for skeleton vertices before PCA classification.")
     parser.add_argument("--visualize", action="store_true", help="Visualize the extracted skeleton curves.")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
 
     if not os.path.isfile(args.tif):
         raise FileNotFoundError(f"File not found: {args.tif}")
+    if not os.path.isfile(args.cube_label):
+        raise FileNotFoundError(f"File not found: {args.cube_label}")
 
     print(f"Loading volume from: {args.tif}")
-    curves_dict = extract_skeleton_from_tif(args.tif)
+    curves_dict = extract_skeleton_from_tif(args.tif, args.cube_label,
+                                            z_threshold=args.z_threshold,
+                                            label=args.label,
+                                            fiber_type=args.fiber_type,
+                                            axis_order=args.axis_order)
     
     n_vert = len(curves_dict.get("vertical", []))
     n_horz = len(curves_dict.get("horizontal", []))
@@ -191,3 +225,8 @@ if __name__ == "__main__":
     if args.visualize:
         print("Visualizing skeleton curves...")
         visualize_curves(curves_dict)
+    return curves_dict
+
+
+if __name__ == "__main__":
+    main()

@@ -377,10 +377,13 @@ def optimize_all_registration(meshes: List[MeshSurface],
                               lambda_inter: float = 0.1,
                               delta_inter: float = 0.05,
                               beta_inter: float = 10.0,
-                              batch_size: int = 8) -> List[torch.Tensor]:
+    batch_size: int = 8) -> List[torch.Tensor]:
     # Assign skeleton points for each mesh.
     for mesh in meshes:
-        mesh.skeleton_points = assign_skeletons_to_mesh(mesh.vertices_np, global_skel_curves, thresh_z=0.1)
+        mesh_skel_curves = mesh.skeleton_curves if mesh.skeleton_curves is not None else global_skel_curves
+        if len(mesh_skel_curves) == 0:
+            raise ValueError("mesh has no skeleton curves")
+        mesh.skeleton_points = assign_skeletons_to_mesh(mesh.vertices_np, mesh_skel_curves, thresh_z=0.1)
     
     displacement_list = [mesh.displacement for mesh in meshes]
     optimizer = torch.optim.AdamW(displacement_list, lr=lr)

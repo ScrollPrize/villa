@@ -15,6 +15,8 @@ from registration import MeshSurface, optimize_all_registration, assign_skeleton
 
 # Global device (as defined in registration module)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+VALID_FIBER_TYPES = {"hz", "vt"}
+MESH_NAME_FORMAT = "<label>_<hz|vt>.obj"
 
 
 def simplify_mesh_o3d(mesh_o3d: o3d.geometry.TriangleMesh, target_triangles: int) -> o3d.geometry.TriangleMesh:
@@ -67,6 +69,53 @@ def simplify_curve(curve: np.ndarray, target_points: int) -> np.ndarray:
     return curve[indices]
 
 
+def prepare_skeleton_curves(
+    curves_dict: dict,
+    curve_type: str,
+    origin: np.ndarray,
+    skel_axis: str,
+    target_points: int,
+) -> dict:
+    """
+    Select and normalize skeleton curves before registration.
+    """
+    prepared = {curve_type: []}
+    for curve in curves_dict.get(curve_type, []):
+        new_curve = np.asarray(curve, dtype=np.float32) - origin
+        if skel_axis == "zyx":
+            new_curve = new_curve[:, [2, 1, 0]]
+        if target_points > 0:
+            new_curve = simplify_curve(new_curve, target_points)
+        prepared[curve_type].append(new_curve)
+    return prepared
+
+
+def parse_mesh_label_and_fiber(mesh_file: str) -> tuple[int, str]:
+    filename = os.path.basename(mesh_file)
+    base, ext = os.path.splitext(filename)
+    parts = base.split("_")
+    if ext.lower() != ".obj" or len(parts) != 2:
+        raise ValueError(f"mesh filename must match '{MESH_NAME_FORMAT}', got {filename!r}")
+    try:
+        label = int(parts[0])
+    except ValueError as exc:
+        raise ValueError(f"mesh filename must match '{MESH_NAME_FORMAT}', got {filename!r}") from exc
+    fiber_type = parts[1]
+    if fiber_type not in VALID_FIBER_TYPES:
+        raise ValueError(f"mesh filename must match '{MESH_NAME_FORMAT}', got {filename!r}")
+    return label, fiber_type
+
+
+def curve_type_for_fiber(fiber_type: str, requested_curve_type: str) -> str:
+    if fiber_type not in VALID_FIBER_TYPES:
+        raise ValueError("fiber_type must be 'hz' or 'vt'")
+    if requested_curve_type != "auto":
+        return requested_curve_type
+    if fiber_type == "vt":
+        return "vertical"
+    return "horizontal"
+
+
 def unified_pipeline(args):
     """
     Pipeline for processing a single mesh. Expects that:
@@ -77,39 +126,50 @@ def unified_pipeline(args):
     It extracts skeleton curves (via kimimaro), assigns the curves to the mesh, runs registration,
     and finally visualizes the registered mesh with the skeleton curves in one combined window.
     """
-    print(f"Loading mesh from {args.mesh} ...")
-    meshes = load_mesh_from_file(args.mesh)
+    mesh_files = list(getattr(args, "meshes", None) or [args.mesh])
+    print(f"Loading {len(mesh_files)} mesh(es) ...")
+    meshes = []
+    for mesh_file in mesh_files:
+        loaded_meshes = load_mesh_from_file(mesh_file)
+        for mesh in loaded_meshes:
+            mesh._source_mesh_file = mesh_file
+        meshes.extend(loaded_meshes)
     if not meshes:
         print("No mesh was loaded. Exiting.")
         return
-    # Parse fiber type and label number from mesh filename (assumes format: "<label>_<fiber_type>.obj")
-    base = os.path.splitext(os.path.basename(args.mesh))[0]
-    parts = base.split("_")
-    label_number = int(parts[0])
-    fiber_type = parts[1]
 
-    print(f"Extracting skeleton curves from {args.tif} ...")
-    curves_dict = extract_skeleton_from_tif(args.tif, args.cube_label,
-                                            z_threshold=1. / np.sqrt(2),
-                                            label=label_number,
-                                            fiber_type=fiber_type)
+    curves_dict = {"vertical": [], "horizontal": []}
+    origin = np.array([float(x) for x in args.skel_origin.split(",")])
+    skeleton_axis_order = getattr(args, "skeleton_axis_order", "zyx")
+    for mesh_file in mesh_files:
+        # Parse fiber type and label number from mesh filename (assumes format: "<label>_<fiber_type>.obj")
+        label_number, fiber_type = parse_mesh_label_and_fiber(mesh_file)
+        mesh_curve_type = curve_type_for_fiber(fiber_type, args.curve_type)
+        print(f"Extracting skeleton curves from {args.tif} for {mesh_file} ...")
+        extracted_curves = extract_skeleton_from_tif(args.tif, args.cube_label,
+                                                     z_threshold=1. / np.sqrt(2),
+                                                     label=label_number,
+                                                     fiber_type=fiber_type,
+                                                     axis_order=skeleton_axis_order)
+        prepared_curves = prepare_skeleton_curves(
+            extracted_curves,
+            mesh_curve_type,
+            origin,
+            args.skel_axis,
+            args.target_skel_points,
+        )
+        mesh_curves = prepared_curves.get(mesh_curve_type, [])
+        curves_dict[mesh_curve_type].extend(mesh_curves)
+        for mesh in meshes:
+            if getattr(mesh, "_source_mesh_file", None) == mesh_file:
+                mesh.skeleton_curves = mesh_curves
+        if not mesh_curves:
+            print(f"No {mesh_curve_type} skeleton curves matched {mesh_file}; skipping this mesh.")
     n_vert = len(curves_dict.get("vertical", []))
     n_horz = len(curves_dict.get("horizontal", []))
     print(f"Skeleton extraction complete. Extracted {n_vert} vertical and {n_horz} horizontal curve(s).")
 
-    # (Optional) Update curves (translation, axis reordering, simplification)
-    origin = np.array([float(x) for x in args.skel_origin.split(",")])
-    for label in curves_dict:
-        for i, curve in enumerate(curves_dict[label]):
-            new_curve = curve - origin
-            if args.skel_axis == "zyx":
-                new_curve = new_curve[:, [2, 1, 0]]
-            # Optionally, simplify:
-            # new_curve = simplify_curve(new_curve, args.target_skel_points)
-            curves_dict[label][i] = new_curve
-
-    # For registration we use all curves (or you can filter by type)
-    global_skel_curves = curves_dict.get("vertical", []) + curves_dict.get("horizontal", [])
+    global_skel_curves = curves_dict["vertical"] + curves_dict["horizontal"]
     print("Final number of skeleton curves for registration: {}".format(len(global_skel_curves)))
     
     # Check if no curves were extracted and skip registration if so.
@@ -118,14 +178,19 @@ def unified_pipeline(args):
         return
 
     # Assign skeleton curves to the mesh.
-    for mesh in meshes:
-        skel_pts = assign_skeletons_to_mesh(mesh.vertices_np, global_skel_curves, thresh_z=0.1).to(device)
+    active_meshes = [mesh for mesh in meshes if getattr(mesh, "skeleton_curves", None)]
+    if not active_meshes:
+        print("No meshes had matching skeleton curves; skipping registration.")
+        return
+
+    for mesh in active_meshes:
+        skel_pts = assign_skeletons_to_mesh(mesh.vertices_np, mesh.skeleton_curves, thresh_z=0.1).to(device)
         mesh.skeleton_points = skel_pts
 
     # (Optional) Visualize initial mesh and skeleton curves.
     initial_meshes_geom = []
     color_mesh = [0, 0, 1]
-    for mesh in meshes:
+    for mesh in active_meshes:
         init_pcd = o3d.geometry.PointCloud()
         init_pcd.points = o3d.utility.Vector3dVector(mesh.vertices_np)
         init_pcd.paint_uniform_color(color_mesh)
@@ -148,7 +213,7 @@ def unified_pipeline(args):
 
     # Run registration optimization.
     print("Running registration optimization...")
-    registered_vertices_list = optimize_all_registration(meshes, global_skel_curves,
+    registered_vertices_list = optimize_all_registration(active_meshes, global_skel_curves,
                                                           num_iters=args.num_iters, lr=args.lr,
                                                           lambda_data=args.lambda_data, lambda_disp=args.lambda_disp,
                                                           lambda_elastic=args.lambda_elastic, lambda_self=args.lambda_self,
@@ -158,8 +223,7 @@ def unified_pipeline(args):
                                                           batch_size=args.batch_size)
     # Final visualization: combine the registered mesh and the skeleton curves.
     registered_meshes_geom = []
-    for mesh in meshes:
-        print(mesh.displacement)
+    for mesh in active_meshes:
         reg_vertices = (mesh.vertices + mesh.displacement).detach().cpu().numpy()
         reg_pcd = o3d.geometry.PointCloud()
         reg_pcd.points = o3d.utility.Vector3dVector(reg_vertices)
@@ -170,7 +234,7 @@ def unified_pipeline(args):
         o3d.visualization.draw_geometries(final_geoms, window_name="Registered Mesh + Skeleton Curves")
 
     # Return the updated meshes so that their displacement is taken into account.
-    return meshes
+    return active_meshes
 
 
 def process_one_mesh(mesh_file: str, tif_file: str, cube_label_file: str, output_root: str, global_args):
@@ -207,13 +271,11 @@ def process_one_mesh(mesh_file: str, tif_file: str, cube_label_file: str, output
     temp.target_triangles = global_args.target_triangles
     temp.skel_origin = global_args.skel_origin
     temp.skel_axis = global_args.skel_axis
+    temp.skeleton_axis_order = getattr(global_args, "skeleton_axis_order", "zyx")
     temp.curve_type = global_args.curve_type
     temp.target_skel_points = global_args.target_skel_points
     # Parse fiber type and label number from the mesh filename.
-    base = os.path.splitext(os.path.basename(mesh_file))[0]
-    parts = base.split("_")
-    temp.skeleton_label = int(parts[0])
-    temp.fiber_type = parts[1]
+    temp.skeleton_label, temp.fiber_type = parse_mesh_label_and_fiber(mesh_file)
     temp.visualize = global_args.visualize
 
     # Run the registration pipeline and get the updated meshes.
@@ -235,6 +297,62 @@ def process_one_mesh(mesh_file: str, tif_file: str, cube_label_file: str, output
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     print("Saving registered mesh to:", out_file)
     o3d.io.write_triangle_mesh(out_file, original_mesh)
+
+
+def process_mesh_group(mesh_files: list[str], tif_file: str, cube_label_file: str, output_root: str, global_args):
+    """
+    Process meshes that share one TIFF/cube-label context in a single optimization call.
+    """
+    if not mesh_files:
+        return
+    print("Processing mesh group:", mesh_files)
+
+    class TempArgs:
+        pass
+    temp = TempArgs()
+    temp.meshes = list(mesh_files)
+    temp.tif = tif_file
+    temp.cube_label = cube_label_file
+    temp.num_iters = global_args.num_iters
+    temp.lr = global_args.lr
+    temp.lambda_data = global_args.lambda_data
+    temp.lambda_disp = global_args.lambda_disp
+    temp.lambda_elastic = global_args.lambda_elastic
+    temp.lambda_self = global_args.lambda_self
+    temp.lambda_lap = global_args.lambda_lap
+    temp.lambda_arap = global_args.lambda_arap
+    temp.lambda_sdf = global_args.lambda_sdf
+    temp.batch_size = global_args.batch_size
+    temp.tau = global_args.tau
+    temp.delta = global_args.delta
+    temp.beta = global_args.beta
+    temp.tau_sdf = global_args.tau_sdf
+    temp.lambda_inter = global_args.lambda_inter
+    temp.delta_inter = global_args.delta_inter
+    temp.beta_inter = global_args.beta_inter
+    temp.target_triangles = global_args.target_triangles
+    temp.skel_origin = global_args.skel_origin
+    temp.skel_axis = global_args.skel_axis
+    temp.skeleton_axis_order = getattr(global_args, "skeleton_axis_order", "zyx")
+    temp.curve_type = global_args.curve_type
+    temp.target_skel_points = global_args.target_skel_points
+    temp.visualize = global_args.visualize
+
+    registered_meshes = unified_pipeline(temp)
+    if registered_meshes is None or len(registered_meshes) == 0:
+        print("Registration failed for mesh group", mesh_files)
+        return
+
+    for mesh_file, mesh_surface in zip(mesh_files, registered_meshes):
+        mesh_file = getattr(mesh_surface, "_source_mesh_file", mesh_file)
+        reg_vertices = (mesh_surface.vertices + mesh_surface.displacement).detach().cpu().numpy()
+        original_mesh = o3d.io.read_triangle_mesh(mesh_file)
+        original_mesh.vertices = o3d.utility.Vector3dVector(reg_vertices)
+        rel_path = os.path.relpath(mesh_file, global_args.mesh_root)
+        out_file = os.path.join(output_root, os.path.splitext(rel_path)[0] + "_registered.obj")
+        os.makedirs(os.path.dirname(out_file), exist_ok=True)
+        print("Saving registered mesh to:", out_file)
+        o3d.io.write_triangle_mesh(out_file, original_mesh)
 
 
 
@@ -270,14 +388,17 @@ def main():
     parser.add_argument("--lambda_inter", type=float, default=0.1, help="Inter-mesh intersection term weight.")
     parser.add_argument("--delta_inter", type=float, default=0.05, help="Delta parameter for inter-mesh intersection.")
     parser.add_argument("--beta_inter", type=float, default=10.0, help="Beta parameter for inter-mesh intersection.")
-    parser.add_argument("--target_triangles", type=int, default=1000, help="Target number of triangles for mesh decimation.")
+    parser.add_argument("--target_triangles", type=int, default=1000,
+                        help="Reserved for topology-aware mesh decimation; not applied by the current pipeline.")
     # Skeleton processing arguments.
     parser.add_argument("--skel_origin", type=str, default="0,0,0",
                         help="Origin offset for skeleton curves as comma-separated values, e.g., '0,0,0'.")
-    parser.add_argument("--skel_axis", type=str, choices=["xyz", "zyx"], default="xyz",
-                        help="Axis order for skeleton curves. If 'zyx', curves will be converted to 'xyz'.")
-    parser.add_argument("--curve_type", type=str, choices=["vertical", "horizontal"], default="horizontal",
-                        help="Type of skeleton curves to use for registration.")
+    parser.add_argument("--skel_axis", type=str, choices=["xyz", "zyx"], default="zyx",
+                        help="Axis order for skeleton curves before registration. The default 'zyx' matches the skeleton extraction default and converts curves to mesh-style 'xyz'.")
+    parser.add_argument("--curve_type", type=str, choices=["auto", "vertical", "horizontal"], default="auto",
+                        help="Type of skeleton curves to use for registration. 'auto' maps hz meshes to horizontal and vt meshes to vertical.")
+    parser.add_argument("--skeleton_axis_order", type=str, choices=["zyx", "xyz"], default="zyx",
+                        help="Coordinate order used for PCA classification during skeleton extraction.")
     parser.add_argument("--target_skel_points", type=int, default=512,
                         help="Target number of points for skeleton curve simplification.")
     # These two are needed for the current extraction routine.
@@ -286,24 +407,29 @@ def main():
                         help="(Temporary) skeleton label; will be parsed from mesh filename in batch mode.")
     
     args = parser.parse_args()
+    if args.target_triangles != 1000:
+        print("--target_triangles is reserved for a future topology-aware decimation pass and is not applied.")
 
-    # Traverse the mesh root folder recursively and process all .obj files.
+    # Traverse the mesh root folder recursively and process .obj files by cube context.
     for root, dirs, files in os.walk(args.mesh_root):
+        group_mesh_files = []
         for file in files:
             if file.lower().endswith(".obj"):
-                mesh_file = os.path.join(root, file)
-                # The subfolder name is assumed to be the name of the parent directory.
-                subfolder = os.path.basename(os.path.dirname(mesh_file))
-                # Build the corresponding tif and cube label paths.
-                tif_file = os.path.join(args.tif_root, subfolder + ".tif")
-                cube_label_file = os.path.join(args.cube_label_root, subfolder, subfolder + "_mask.tif")
-                if not os.path.isfile(tif_file):
-                    print(f"Skipping {mesh_file}: corresponding TIF file not found: {tif_file}")
-                    continue
-                if not os.path.isfile(cube_label_file):
-                    print(f"Skipping {mesh_file}: corresponding cube label not found: {cube_label_file}")
-                    continue
-                process_one_mesh(mesh_file, tif_file, cube_label_file, args.output_root, args)
+                group_mesh_files.append(os.path.join(root, file))
+        if not group_mesh_files:
+            continue
+
+        group_mesh_files.sort()
+        subfolder = os.path.basename(root)
+        tif_file = os.path.join(args.tif_root, subfolder + ".tif")
+        cube_label_file = os.path.join(args.cube_label_root, subfolder, subfolder + "_mask.tif")
+        if not os.path.isfile(tif_file):
+            print(f"Skipping {root}: corresponding TIF file not found: {tif_file}")
+            continue
+        if not os.path.isfile(cube_label_file):
+            print(f"Skipping {root}: corresponding cube label not found: {cube_label_file}")
+            continue
+        process_mesh_group(group_mesh_files, tif_file, cube_label_file, args.output_root, args)
     
 if __name__ == "__main__":
     main()

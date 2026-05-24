@@ -10,6 +10,8 @@ dependencies:
   - pytorch
   - tqdm
   - scikit-image
+  - tifffile
+  - zarr
   - posix_ipc
   - psutil
   - pip
