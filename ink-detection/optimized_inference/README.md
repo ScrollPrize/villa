@@ -96,6 +96,9 @@ docker build --target gpu \
   --build-arg INSTALL_PRIMUS_DEPS=1 \
   -t ink-detection-optimized-inference:gpu-primus .
 
+# Primus GPU image plus checkpoint/load/forward smoke
+VILLA_REF=main ./smoke_primus_docker.sh
+
 # CPU utility image
 docker build --target cpu -t ink-detection-optimized-inference:cpu .
 
@@ -108,6 +111,7 @@ Notes:
 - The GPU image is the only image that supports `STEP=inference`.
 - The CPU image supports `STEP=prepare`, `STEP=reduce`, and `STEP=aggregate-profiling`.
 - `MODEL_TYPE=primus` requires `INSTALL_PRIMUS_DEPS=1`, which installs `vesuvius[models]` from the Villa monorepo into the GPU image. Override `VILLA_REPO` and `VILLA_REF` when validating a fork or branch.
+- `smoke_primus_docker.sh` builds the Primus-enabled GPU image, creates a minimal production-style Primus checkpoint inside the container, loads it through `model_primus`, and runs a small forward pass. Use `DOCKER_GPU_ARGS=""` to run the smoke without `--gpus all` on CPU-only Docker hosts.
 - The Dockerfile currently uses `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime` for the GPU target.
 
 ### Run

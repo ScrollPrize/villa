@@ -95,6 +95,14 @@ docker build --target gpu \
 Then run an end-to-end optimized inference smoke test with a real or minimal
 Primus checkpoint envelope inside the container.
 
+The branch includes `smoke_primus_docker.sh` for this final validation step:
+
+```bash
+VILLA_REPO=https://github.com/jonmarrs/villa.git \
+VILLA_REF=primus-loader-optimized-inference \
+./smoke_primus_docker.sh
+```
+
 ## Still Required Before Reviewer Reply
 
 - Run the Primus GPU container smoke after the host has working container
