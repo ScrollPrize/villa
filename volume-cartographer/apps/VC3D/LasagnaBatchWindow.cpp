@@ -9,6 +9,7 @@
 #include <QAbstractItemView>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QSignalBlocker>
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStringList>
@@ -156,6 +157,8 @@ void LasagnaBatchWindow::applyJobs(const QJsonArray& jobs, const QString& prefer
 {
     const QString selectedId = preferredSelection.isEmpty() ? selectedJobId() : preferredSelection;
     const int scrollValue = _table->verticalScrollBar()->value();
+    QItemSelectionModel* selectionModel = _table->selectionModel();
+    const QSignalBlocker selectionBlocker(selectionModel);
 
     _jobs = jobs;
 
@@ -182,7 +185,8 @@ void LasagnaBatchWindow::applyJobs(const QJsonArray& jobs, const QString& prefer
     }
 
     for (int row = _model->rowCount() - 1; row >= 0; --row) {
-        const QString jobId = _model->item(row, 0)->data(Qt::UserRole).toString();
+        QStandardItem* idItem = _model->item(row, 0);
+        const QString jobId = idItem ? idItem->data(Qt::UserRole).toString() : QString();
         bool stillPresent = false;
         for (const QJsonValue& value : jobs) {
             if (value.toObject()[QStringLiteral("job_id")].toString() == jobId) {
@@ -199,7 +203,9 @@ void LasagnaBatchWindow::applyJobs(const QJsonArray& jobs, const QString& prefer
     if (selectedRow >= 0) {
         const QModelIndex index = _model->index(selectedRow, 0);
         _table->setCurrentIndex(index);
-        _table->selectionModel()->select(index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        if (selectionModel) {
+            selectionModel->select(index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        }
     } else if (!selectedId.isEmpty()) {
         _table->clearSelection();
         _table->setCurrentIndex(QModelIndex());
@@ -240,7 +246,8 @@ QString LasagnaBatchWindow::selectedJobId() const
     if (row < 0 || row >= _model->rowCount()) {
         return {};
     }
-    return _model->item(row, 0)->data(Qt::UserRole).toString();
+    QStandardItem* item = _model->item(row, 0);
+    return item ? item->data(Qt::UserRole).toString() : QString();
 }
 
 int LasagnaBatchWindow::selectedRow() const

@@ -924,7 +924,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             ? static_cast<int>(std::lround(volumePoint[2]))
                             : 0;
 
-                        auto* lasagnaPanel = _segmentationWidget
+                        QPointer<SegmentationLasagnaPanel> lasagnaPanel = _segmentationWidget
                             ? _segmentationWidget->lasagnaPanel()
                             : nullptr;
 

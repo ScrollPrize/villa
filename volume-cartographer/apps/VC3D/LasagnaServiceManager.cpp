@@ -354,6 +354,7 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
         stopService();
     }
 
+    ++_requestGeneration;
     _isExternal = true;
     _host = host;
     _port = port;
@@ -361,6 +362,7 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
     _serviceReady = false;
     _lastQueueGeneration = -1;
     _fetchedQueueGeneration = -1;
+    _statusRequestInFlight = false;
     _jobsRequestInFlight = false;
     _jobsRequestPending = false;
 
@@ -370,8 +372,13 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
     QUrl url(QStringLiteral("%1/health").arg(baseUrl()));
     QNetworkRequest req = fitServiceRequest(url);
 
+    const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         reply->deleteLater();
 
         if (!validateApiVersion(reply, tr("Service health check"))) {
@@ -395,11 +402,13 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
 
 bool LasagnaServiceManager::startService(const QString& pythonPath)
 {
+    ++_requestGeneration;
     _lastError.clear();
     _serviceReady = false;
     _port = 0;
     _lastQueueGeneration = -1;
     _fetchedQueueGeneration = -1;
+    _statusRequestInFlight = false;
     _jobsRequestInFlight = false;
     _jobsRequestPending = false;
 
@@ -488,7 +497,9 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
 
 void LasagnaServiceManager::stopService()
 {
+    ++_requestGeneration;
     _pollTimer->stop();
+    _statusRequestInFlight = false;
 
     if (_isExternal) {
         // External mode: just reset state, don't terminate any process
@@ -505,6 +516,7 @@ void LasagnaServiceManager::stopService()
         _lastJobs = QJsonArray();
         _lastQueueGeneration = -1;
         _fetchedQueueGeneration = -1;
+        _statusRequestInFlight = false;
         _jobsRequestInFlight = false;
         _jobsRequestPending = false;
         emit serviceStopped();
@@ -537,6 +549,7 @@ void LasagnaServiceManager::stopService()
     _lastJobs = QJsonArray();
     _lastQueueGeneration = -1;
     _fetchedQueueGeneration = -1;
+    _statusRequestInFlight = false;
     _jobsRequestInFlight = false;
     _jobsRequestPending = false;
 
@@ -577,6 +590,7 @@ bool LasagnaServiceManager::validateApiVersion(QNetworkReply* reply, const QStri
 
 void LasagnaServiceManager::handleProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
+    ++_requestGeneration;
     std::cout << "Lasagna service finished with exit code " << exitCode << std::endl;
 
     if (exitStatus == QProcess::CrashExit) {
@@ -587,6 +601,9 @@ void LasagnaServiceManager::handleProcessFinished(int exitCode, QProcess::ExitSt
 
     _serviceReady = false;
     _pollTimer->stop();
+    _statusRequestInFlight = false;
+    _jobsRequestInFlight = false;
+    _jobsRequestPending = false;
     _activeJobId.clear();
     emit serviceStopped();
 }
@@ -671,6 +688,7 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
     std::cout << "[lasagna] sending queued optimize request: "
               << bytesToMiB(bodyBytes) << " MiB" << std::endl;
 
+    const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->post(req, body);
     auto sendTimer = std::make_shared<QElapsedTimer>();
     auto uploadLogged = std::make_shared<bool>(false);
@@ -687,7 +705,12 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
             logTransferTiming("optimize upload", expected, elapsedSeconds(*sendTimer));
         }
     });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, sendTimer, uploadLogged, bodyBytes]() {
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, sendTimer, uploadLogged, bodyBytes, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         if (!*uploadLogged) {
             *uploadLogged = true;
             logTransferTiming("optimize upload", bodyBytes, elapsedSeconds(*sendTimer));
@@ -721,7 +744,12 @@ void LasagnaServiceManager::stopOptimization()
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
     QNetworkReply* reply = _nam->post(req, QByteArray("{}"));
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    const quint64 generation = _requestGeneration;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         reply->deleteLater();
         validateApiVersion(reply, tr("Stop optimization"));
     });
@@ -734,7 +762,12 @@ void LasagnaServiceManager::cancelJob(const QString& jobId)
     QNetworkRequest req = fitServiceRequest(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     QNetworkReply* reply = _nam->post(req, QByteArray("{}"));
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    const quint64 generation = _requestGeneration;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         reply->deleteLater();
         validateApiVersion(reply, tr("Cancel job"));
     });
@@ -752,7 +785,12 @@ void LasagnaServiceManager::moveJobBefore(const QString& jobId, const QString& b
     QNetworkRequest req = fitServiceRequest(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     QNetworkReply* reply = _nam->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    const quint64 generation = _requestGeneration;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         reply->deleteLater();
         validateApiVersion(reply, tr("Reorder jobs"));
     });
@@ -782,8 +820,13 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
 
     QByteArray body = QJsonDocument(serverConfig).toJson(QJsonDocument::Compact);
 
+    const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->post(req, body);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         reply->deleteLater();
 
         if (!validateApiVersion(reply, tr("Export visualization"))) {
@@ -901,12 +944,21 @@ void LasagnaServiceManager::pollStatus()
         _pollTimer->stop();
         return;
     }
+    if (_statusRequestInFlight) {
+        return;
+    }
+    _statusRequestInFlight = true;
 
     QUrl url(QStringLiteral("%1/status").arg(baseUrl()));
     QNetworkRequest req = fitServiceRequest(url);
 
+    const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         handleStatusReply(reply);
     });
 }
@@ -926,8 +978,13 @@ void LasagnaServiceManager::fetchJobs()
     QUrl url(QStringLiteral("%1/jobs").arg(baseUrl()));
     QNetworkRequest req = fitServiceRequest(url);
 
+    const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         handleJobsReply(reply);
     });
 }
@@ -1016,6 +1073,7 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
 
 void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
 {
+    _statusRequestInFlight = false;
     reply->deleteLater();
 
     if (!validateApiVersion(reply, tr("Poll status"))) {
@@ -1071,8 +1129,13 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
         : QStringLiteral("%1/jobs/%2/results").arg(baseUrl(), jobId));
     QNetworkRequest req = fitServiceRequest(url);
 
+    const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, jobId, targetDir]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, jobId, targetDir, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         reply->deleteLater();
 
         if (!validateApiVersion(reply, tr("Download results"))) {
@@ -1312,8 +1375,13 @@ void LasagnaServiceManager::fetchDatasets()
     QUrl url(QStringLiteral("%1/datasets").arg(baseUrl()));
     QNetworkRequest req = fitServiceRequest(url);
 
+    const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
         reply->deleteLater();
         if (!validateApiVersion(reply, tr("Fetch datasets"))) {
             return;

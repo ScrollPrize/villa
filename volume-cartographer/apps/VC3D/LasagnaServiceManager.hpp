@@ -159,6 +159,8 @@ private:
     QJsonArray _lastJobs;
     qint64 _lastQueueGeneration{-1};
     qint64 _fetchedQueueGeneration{-1};
+    quint64 _requestGeneration{0};
+    bool _statusRequestInFlight{false};
     bool _jobsRequestInFlight{false};
     bool _jobsRequestPending{false};
 };
