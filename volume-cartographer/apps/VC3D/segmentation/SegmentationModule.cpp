@@ -240,11 +240,19 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             scheduleCorrectionsAutoSave();
         });
 
+        connect(_pointCollection, &VCCollection::pointsAdded, this, [this](const std::vector<ColPoint>&) {
+            scheduleCorrectionsAutoSave();
+        });
+
         connect(_pointCollection, &VCCollection::pointChanged, this, [this](const ColPoint&) {
             scheduleCorrectionsAutoSave();
         });
 
         connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
+            scheduleCorrectionsAutoSave();
+        });
+
+        connect(_pointCollection, &VCCollection::pointsRemoved, this, [this](const std::vector<uint64_t>&) {
             scheduleCorrectionsAutoSave();
         });
     }

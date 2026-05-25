@@ -1269,10 +1269,16 @@ void SurfacePanelController::connectFilterSignals()
         connect(_pointCollection, &VCCollection::pointAdded, this, [this](const ColPoint&) {
             applyFilters();
         });
+        connect(_pointCollection, &VCCollection::pointsAdded, this, [this](const std::vector<ColPoint>&) {
+            applyFilters();
+        });
         connect(_pointCollection, &VCCollection::pointChanged, this, [this](const ColPoint&) {
             applyFilters();
         });
         connect(_pointCollection, &VCCollection::pointRemoved, this, [this](uint64_t) {
+            applyFilters();
+        });
+        connect(_pointCollection, &VCCollection::pointsRemoved, this, [this](const std::vector<uint64_t>&) {
             applyFilters();
         });
     }

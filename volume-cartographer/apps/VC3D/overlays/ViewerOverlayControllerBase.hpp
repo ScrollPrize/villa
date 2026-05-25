@@ -257,6 +257,7 @@ protected:
     void clearOverlay(VolumeViewerBase* viewer) const;
 
     ViewerManager* manager() const { return _manager; }
+    void scheduleRefreshAll();
 
 private:
     struct ViewerEntry {

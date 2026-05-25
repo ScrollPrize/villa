@@ -488,6 +488,56 @@ std::optional<cv::Vec3f> colorDistinctFromVisibleCollections(
     }
 
     constexpr qreal radius2 = kNearbyCollectionColorRadiusPx * kNearbyCollectionColorRadiusPx;
+    constexpr qreal cellSize = kNearbyCollectionColorRadiusPx;
+    struct CellKey {
+        int x = 0;
+        int y = 0;
+        bool operator==(const CellKey& other) const
+        {
+            return x == other.x && y == other.y;
+        }
+    };
+    struct CellKeyHash {
+        std::size_t operator()(const CellKey& key) const
+        {
+            const std::uint64_t ux = static_cast<std::uint64_t>(static_cast<std::uint32_t>(key.x));
+            const std::uint64_t uy = static_cast<std::uint64_t>(static_cast<std::uint32_t>(key.y));
+            return static_cast<std::size_t>((ux << 32) ^ uy);
+        }
+    };
+    const auto cellForPoint = [&](const QPointF& point) {
+        return CellKey{
+            static_cast<int>(std::floor(point.x() / cellSize)),
+            static_cast<int>(std::floor(point.y() / cellSize))
+        };
+    };
+
+    std::unordered_map<CellKey, std::vector<QPointF>, CellKeyHash> newPointGrid;
+    newPointGrid.reserve(visibleNewPoints.size());
+    for (const QPointF& newScenePoint : visibleNewPoints) {
+        newPointGrid[cellForPoint(newScenePoint)].push_back(newScenePoint);
+    }
+
+    const auto isNearNewPoint = [&](const QPointF& scenePoint) {
+        const CellKey base = cellForPoint(scenePoint);
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const auto it = newPointGrid.find(CellKey{base.x + dx, base.y + dy});
+                if (it == newPointGrid.end()) {
+                    continue;
+                }
+                for (const QPointF& newScenePoint : it->second) {
+                    const qreal xDelta = scenePoint.x() - newScenePoint.x();
+                    const qreal yDelta = scenePoint.y() - newScenePoint.y();
+                    if (xDelta * xDelta + yDelta * yDelta <= radius2) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
     std::unordered_set<uint64_t> avoidedCollectionIds;
     const auto& collections = pointCollection->getAllCollections();
     for (const auto& [collectionId, collection] : collections) {
@@ -505,14 +555,7 @@ std::optional<cv::Vec3f> colorDistinctFromVisibleCollections(
                 continue;
             }
             isVisible = true;
-            for (const QPointF& newScenePoint : visibleNewPoints) {
-                const qreal dx = scenePoint.x() - newScenePoint.x();
-                const qreal dy = scenePoint.y() - newScenePoint.y();
-                if (dx * dx + dy * dy <= radius2) {
-                    isNearby = true;
-                    break;
-                }
-            }
+            isNearby = isNearNewPoint(scenePoint);
             if (isNearby) {
                 break;
             }

@@ -131,6 +131,7 @@ CPointCollectionWidget::CPointCollectionWidget(VCCollection *collection, QWidget
     connect(_point_collection, &VCCollection::collectionChanged, this, &CPointCollectionWidget::onCollectionChanged);
     connect(_point_collection, &VCCollection::collectionRemoved, this, &CPointCollectionWidget::onCollectionRemoved);
     connect(_point_collection, &VCCollection::pointAdded, this, &CPointCollectionWidget::onPointAdded);
+    connect(_point_collection, &VCCollection::pointsAdded, this, &CPointCollectionWidget::onPointsAdded);
     connect(_point_collection, &VCCollection::pointChanged, this, &CPointCollectionWidget::onPointChanged);
     connect(_point_collection, &VCCollection::pointRemoved, this, &CPointCollectionWidget::onPointRemoved);
 
@@ -560,6 +561,63 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
         QStandardItem* count_item = _model->item(collection_item->row(), kCountColumn);
         if(count_item) {
             count_item->setText(QString::number(collection_item->rowCount()));
+        }
+    }
+    scheduleAutosave();
+}
+
+void CPointCollectionWidget::onPointsAdded(const std::vector<ColPoint>& points)
+{
+    if (points.empty()) {
+        return;
+    }
+
+    const QSignalBlocker modelBlocker(_model);
+    std::unordered_map<uint64_t, QStandardItem*> changedCollections;
+    for (const ColPoint& point : points) {
+        QStandardItem* collection_item = findCollectionItem(point.collectionId);
+        if (!collection_item) {
+            continue;
+        }
+
+        QStandardItem *id_item = new QStandardItem(QString::number(point.id));
+        id_item->setData(QVariant::fromValue(point.id));
+        id_item->setFlags(id_item->flags() & ~Qt::ItemIsEditable);
+
+        QStandardItem *empty_item = readOnlyItem();
+
+        QString direction;
+        const auto& collections = _point_collection->getAllCollections();
+        auto collection_it = collections.find(point.collectionId);
+        if (collection_it != collections.end()) {
+            direction = sameWrapDirectionText(collection_it->second);
+        }
+        QStandardItem *direction_item = readOnlyItem(direction);
+
+        QStandardItem *pt_winding_item = readOnlyItem();
+        QStandardItem *pt_err_item = readOnlyItem();
+
+        QStandardItem *pos_item = readOnlyItem(pointPositionText(point.p));
+
+        auto res_it = _corr_point_results.find(point.id);
+        if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
+            if (std::isfinite(res_it->second.winding_obs)) {
+                pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
+            }
+            if (std::isfinite(res_it->second.winding_err)) {
+                pt_err_item->setText(QString::number(res_it->second.winding_err, 'f', 3));
+            }
+        }
+
+        collection_item->appendRow({id_item, empty_item, direction_item, pt_winding_item, pt_err_item, pos_item});
+        changedCollections[point.collectionId] = collection_item;
+    }
+
+    for (const auto& [collectionId, collectionItem] : changedCollections) {
+        (void)collectionId;
+        QStandardItem* count_item = _model->item(collectionItem->row(), kCountColumn);
+        if(count_item) {
+            count_item->setText(QString::number(collectionItem->rowCount()));
         }
     }
     scheduleAutosave();

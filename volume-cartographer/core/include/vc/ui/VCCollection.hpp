@@ -105,8 +105,10 @@ signals:
     void collectionRemoved(uint64_t collectionId);
 
     void pointAdded(const ColPoint& point);
+    void pointsAdded(const std::vector<ColPoint>& points);
     void pointChanged(const ColPoint& point);
     void pointRemoved(uint64_t pointId);
+    void pointsRemoved(const std::vector<uint64_t>& pointIds);
 
 
 private:

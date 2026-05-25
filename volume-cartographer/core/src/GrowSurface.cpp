@@ -9,6 +9,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
@@ -27,9 +28,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -43,6 +47,16 @@
 
 #include <fstream>
 #include <iostream>
+#include <sstream>
+
+#include <limits.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 using vec2i_hash = std::vec2i_hash;
 
@@ -83,6 +97,253 @@ static cv::Rect valid_points_bounds(const cv::Mat_<cv::Vec3d>& points)
         }
     }
     return bounds;
+}
+
+static bool is_executable_file(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec) &&
+           access(path.c_str(), X_OK) == 0;
+}
+
+static std::optional<std::filesystem::path> current_executable_dir()
+{
+#ifdef __linux__
+    std::vector<char> buf(4096);
+    while (true) {
+        const ssize_t len = readlink("/proc/self/exe", buf.data(), buf.size());
+        if (len < 0) {
+            return std::nullopt;
+        }
+        if (static_cast<std::size_t>(len) < buf.size()) {
+            return std::filesystem::path(std::string(buf.data(), static_cast<std::size_t>(len))).parent_path();
+        }
+        buf.resize(buf.size() * 2);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> buf(size + 1, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) {
+        return std::nullopt;
+    }
+    char resolved[PATH_MAX];
+    if (realpath(buf.data(), resolved)) {
+        return std::filesystem::path(resolved).parent_path();
+    }
+    return std::filesystem::path(buf.data()).parent_path();
+#else
+    return std::nullopt;
+#endif
+}
+
+static std::optional<std::filesystem::path> find_executable(
+    const std::string& name,
+    const char* env_var = nullptr,
+    const std::vector<std::filesystem::path>& extra_paths = {})
+{
+    if (env_var) {
+        if (const char* env = std::getenv(env_var); env && env[0] != '\0') {
+            std::filesystem::path env_path(env);
+            if (is_executable_file(env_path)) {
+                return std::filesystem::absolute(env_path);
+            }
+        }
+    }
+
+    for (const auto& path : extra_paths) {
+        if (is_executable_file(path)) {
+            return std::filesystem::absolute(path);
+        }
+    }
+
+    if (auto exe_dir = current_executable_dir()) {
+        const std::vector<std::filesystem::path> rels = {
+            name,
+            std::filesystem::path("..") / name,
+            std::filesystem::path("..") / "bin" / name,
+            std::filesystem::path("..") / ".." / "bin" / name,
+            std::filesystem::path("..") / "libexec" / name,
+            std::filesystem::path("..") / "Resources" / "bin" / name,
+        };
+        for (const auto& rel : rels) {
+            const auto candidate = *exe_dir / rel;
+            if (is_executable_file(candidate)) {
+                return std::filesystem::absolute(candidate);
+            }
+        }
+    }
+
+    if (const char* path_env = std::getenv("PATH"); path_env && path_env[0] != '\0') {
+        std::stringstream ss(path_env);
+        std::string dir;
+        while (std::getline(ss, dir, ':')) {
+            if (dir.empty()) {
+                continue;
+            }
+            const auto candidate = std::filesystem::path(dir) / name;
+            if (is_executable_file(candidate)) {
+                return std::filesystem::absolute(candidate);
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+static std::string command_for_log(const std::vector<std::string>& args)
+{
+    std::string out;
+    for (const auto& arg : args) {
+        if (!out.empty()) {
+            out += ' ';
+        }
+        const bool needs_quotes = arg.find_first_of(" \t\n'\"\\") != std::string::npos;
+        if (!needs_quotes) {
+            out += arg;
+            continue;
+        }
+        out += '\'';
+        for (char c : arg) {
+            if (c == '\'') {
+                out += "'\\''";
+            } else {
+                out += c;
+            }
+        }
+        out += '\'';
+    }
+    return out;
+}
+
+static int run_process(const std::vector<std::string>& args,
+                       const std::filesystem::path& working_dir = {})
+{
+    if (args.empty()) {
+        throw std::runtime_error("run_process called with no arguments");
+    }
+
+    std::cout << "[slim-flatten] running: " << command_for_log(args) << std::endl;
+
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) {
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
+    }
+    if (pid == 0) {
+        if (!working_dir.empty() && chdir(working_dir.c_str()) != 0) {
+            _exit(127);
+        }
+        execv(argv[0], argv.data());
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            throw std::runtime_error(std::string("waitpid failed: ") + std::strerror(errno));
+        }
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 1;
+}
+
+static void run_process_or_throw(const std::vector<std::string>& args,
+                                 const std::filesystem::path& working_dir = {})
+{
+    const int rc = run_process(args, working_dir);
+    if (rc != 0) {
+        throw std::runtime_error("command failed with exit code " + std::to_string(rc) +
+                                 ": " + command_for_log(args));
+    }
+}
+
+struct ScopedDirectory {
+    std::filesystem::path path;
+
+    ~ScopedDirectory()
+    {
+        if (path.empty()) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+        if (ec) {
+            std::cerr << "[slim-flatten] warning: failed to remove temp dir "
+                      << path << ": " << ec.message() << std::endl;
+        }
+    }
+};
+
+static std::unique_ptr<QuadSurface> run_gui_slim_flatten_keep_100(
+    QuadSurface& surface,
+    const std::filesystem::path& tgt_dir,
+    int iterations,
+    float voxelsize)
+{
+    auto tifxyz2obj = find_executable("vc_tifxyz2obj");
+    auto obj2tifxyz = find_executable("vc_obj2tifxyz");
+    auto flatboi = find_executable(
+        "flatboi",
+        "FLATBOI",
+        {"/usr/local/bin/flatboi", "/home/builder/vc-dependencies/bin/flatboi"});
+
+    if (!tifxyz2obj) {
+        throw std::runtime_error("could not find vc_tifxyz2obj for SLIM flatten");
+    }
+    if (!obj2tifxyz) {
+        throw std::runtime_error("could not find vc_obj2tifxyz for SLIM flatten");
+    }
+    if (!flatboi) {
+        throw std::runtime_error("could not find flatboi for SLIM flatten");
+    }
+
+    const std::filesystem::path temp_root =
+        tgt_dir / (".vc_global_opt_slim_" + get_surface_time_str() + "_" + std::to_string(getpid()));
+    ScopedDirectory cleanup{temp_root};
+    std::filesystem::create_directories(temp_root);
+
+    const std::filesystem::path input_dir = temp_root / "input";
+    const std::filesystem::path obj_path = temp_root / "input.obj";
+    const std::filesystem::path flat_obj_path = temp_root / "input_flatboi.obj";
+    const std::filesystem::path output_dir = temp_root / "output";
+
+    surface.save(input_dir.string(), "input", true);
+
+    // This mirrors the GUI SLIM-flatten flow with keepPercent == 100:
+    // no --keep argument, no UV lift phase, flatboi, then vc_obj2tifxyz.
+    run_process_or_throw({tifxyz2obj->string(), input_dir.string(), obj_path.string()}, temp_root);
+    run_process_or_throw({flatboi->string(), obj_path.string(), std::to_string(iterations), "symmetric_dirichlet"}, temp_root);
+    run_process_or_throw({obj2tifxyz->string(), flat_obj_path.string(), output_dir.string(), "--uv-downsample=20"}, temp_root);
+
+    auto loaded = load_quad_from_tifxyz(output_dir.string());
+    if (!loaded) {
+        throw std::runtime_error("failed to load SLIM-flattened output: " + output_dir.string());
+    }
+
+    auto flattened = std::make_unique<QuadSurface>(loaded->rawPoints(), cv::Vec2f(0.05f, 0.05f));
+    flattened->meta = surface.meta;
+
+    const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*flattened);
+    if (std::isfinite(area_vx2) && area_vx2 > 0.0) {
+        flattened->meta["area_vx2"] = area_vx2;
+        if (std::isfinite(voxelsize) && voxelsize > 0.0f) {
+            flattened->meta["area_cm2"] = area_vx2 * voxelsize * voxelsize / 1e8;
+        }
+    }
+
+    return flattened;
 }
 
 static std::string surface_name(const QuadSurface* surf)
@@ -1424,6 +1685,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     const int sweep_prune_min_valid_cells = std::max(1, params.value("sweep_prune_min_valid_cells", 100));
     const int sweep_prune_max_samples = std::max(1, params.value("sweep_prune_max_samples", 2000));
     const int reopt_interval = std::max(0, params.value("reopt_interval", 0));
+    const int slim_flatten_interval = std::max(
+        0,
+        params.value("slim_flatten_interval",
+                     params.value("slim_flatten_cadence", 0)));
+    const int slim_flatten_iterations = std::max(0, params.value("slim_flatten_iterations", 20));
 
     local_cost_inl_th = params.value("local_cost_inl_th", 0.2f);
     same_surface_th = params.value("same_surface_th", 2.0f);
@@ -1492,6 +1758,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                   << " min_generations=" << sweep_prune_min_generations << std::endl;
     }
     std::cout << "  reopt_interval: " << reopt_interval << std::endl;
+    std::cout << "  slim_flatten_interval: " << slim_flatten_interval
+              << " iterations=" << slim_flatten_iterations
+              << " keep_percent=100" << std::endl;
     if (external_surface_patch_index) {
         std::cout << "  external_surface_patch_index: true" << std::endl;
     }
@@ -1881,7 +2150,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     int best_expanded_up = expanded_up;
     int last_expansion_loc_valid_count = best_loc_valid_count;
     int no_growth_expansions = 0;
-
     auto save_best_surface = [&](int count) {
         best_loc_valid_count = count;
         best_points = points.clone();
@@ -1920,6 +2188,124 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             for(int i=std::max(0, active.x-2);i<=std::min(active.br().x+2, state.cols-1);i++)
                 if (state(j,i) & STATE_LOC_VALID)
                     fringe.insert(cv::Vec2i(j,i));
+    };
+
+    auto apply_slim_remap = [&](int generation) {
+        if (slim_flatten_iterations <= 0) {
+            return false;
+        }
+
+        std::cout << "[slim-flatten] running " << slim_flatten_iterations
+                  << "-iteration SLIM flatten at generation " << generation
+                  << " (keep_percent=100)" << std::endl;
+
+        cv::Mat_<cv::Vec3d> current_points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
+        QuadSurface current_surface(current_points_hr(used_area_hr), {1/src_step, 1/src_step});
+        auto flattened = run_gui_slim_flatten_keep_100(current_surface, tgt_dir, slim_flatten_iterations, voxelsize);
+        const cv::Mat_<cv::Vec3f> flattened_points = flattened->rawPoints();
+
+        const int margin = closing_r + 5;
+        const int sample_step = std::max(1, static_cast<int>(std::lround(step)));
+        const int low_rows = std::max(1, (flattened_points.rows + sample_step - 1) / sample_step);
+        const int low_cols = std::max(1, (flattened_points.cols + sample_step - 1) / sample_step);
+        const cv::Size new_size(low_cols + 2 * margin, low_rows + 2 * margin);
+
+        cv::Mat_<uint8_t> new_state(new_size, static_cast<uint8_t>(0));
+        cv::Mat_<uint16_t> new_generations(new_size, static_cast<uint16_t>(0));
+        cv::Mat_<uint16_t> new_inliers_sum_dbg(new_size, static_cast<uint16_t>(0));
+        cv::Mat_<cv::Vec3d> new_points(new_size, cv::Vec3d(-1, -1, -1));
+        SurfTrackerData new_data;
+        cv::Rect new_used;
+        bool have_used = false;
+        cv::Vec2i new_seed(-1, -1);
+        double best_seed_dist2 = std::numeric_limits<double>::infinity();
+        int sampled = 0;
+        int kept = 0;
+        int no_support = 0;
+        const uint16_t remap_generation = static_cast<uint16_t>(
+            std::min(generation + 1, static_cast<int>(std::numeric_limits<uint16_t>::max())));
+        const cv::Vec3d old_seed_coord = data.seed_coord;
+
+        for (int ry = 0; ry < flattened_points.rows; ry += sample_step) {
+            for (int rx = 0; rx < flattened_points.cols; rx += sample_step) {
+                const cv::Vec3f& src = flattened_points(ry, rx);
+                if (!std::isfinite(src[0]) || !std::isfinite(src[1]) || !std::isfinite(src[2]) || src[0] == -1.f) {
+                    continue;
+                }
+                ++sampled;
+
+                const cv::Vec2i p(margin + ry / sample_step, margin + rx / sample_step);
+                if (p[0] < 0 || p[0] >= new_state.rows || p[1] < 0 || p[1] >= new_state.cols) {
+                    continue;
+                }
+
+                const cv::Vec3d coord(src[0], src[1], src[2]);
+                const int support_added = add_surface_patch_candidates(p, coord, new_data, surface_patch_index_ptr);
+                if (support_added <= 0) {
+                    ++no_support;
+                    continue;
+                }
+
+                new_points(p) = coord;
+                new_state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                new_generations(p) = remap_generation;
+                const cv::Rect cell(p[1], p[0], 1, 1);
+                new_used = have_used ? (new_used | cell) : cell;
+                have_used = true;
+                ++kept;
+
+                const cv::Vec3d seed_delta = coord - old_seed_coord;
+                const double seed_dist2 = seed_delta.dot(seed_delta);
+                if (seed_dist2 < best_seed_dist2) {
+                    best_seed_dist2 = seed_dist2;
+                    new_seed = p;
+                }
+            }
+        }
+
+        if (!have_used || new_seed[0] < 0) {
+            throw std::runtime_error("SLIM remap produced no supported low-resolution tracker points");
+        }
+
+        new_data.seed_loc = new_seed;
+        new_data.seed_coord = new_points(new_seed);
+
+        state = std::move(new_state);
+        generations = std::move(new_generations);
+        inliers_sum_dbg = std::move(new_inliers_sum_dbg);
+        points = std::move(new_points);
+        data = std::move(new_data);
+        used_area = new_used;
+        used_area_hr = scaled_rect_trunc(used_area, step);
+        size = new_size;
+        w = size.width;
+        h = size.height;
+        x0 = new_seed[1];
+        y0 = new_seed[0];
+        bounds = {0, 0, w - 1, h - 1};
+        save_bounds_inv = {margin, margin, std::max(0, h - 2 * margin), std::max(0, w - 2 * margin)};
+        active_bounds = used_area;
+        static_bounds = cv::Rect(0, 0, 0, h);
+        fringe.clear();
+        reseed_fringe_from_valid(used_area);
+
+        for (int i = 0; i < omp_get_max_threads(); i++) {
+            data_ths[i] = data;
+            added_points_threads[i].clear();
+        }
+
+        loc_valid_count = kept;
+        last_succ_parametrization = kept;
+        best_loc_valid_count = kept;
+        save_best_surface(kept);
+
+        std::cout << "[slim-flatten] remapped tracker state: sampled=" << sampled
+                  << " kept=" << kept
+                  << " no_support=" << no_support
+                  << " new_size=" << size
+                  << " used_area=" << used_area
+                  << " seed=" << data.seed_loc << std::endl;
+        return true;
     };
 
     bool flip_x_done = !flip_x || initialized_from_resume;
@@ -3204,6 +3590,16 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 dbg_surf->save(tgt_dir / uuid, uuid, true);
                 delete dbg_surf;
             }
+        }
+
+        const bool slim_flatten_due =
+            slim_flatten_interval > 0 &&
+            generation > 0 &&
+            (generation % slim_flatten_interval) == 0;
+        if (slim_flatten_due && apply_slim_remap(generation)) {
+            suppress_empty_fringe_reopt_after_component_drop = false;
+            component_drop_reopt_skip_logged = false;
+            curr_best_inl_th = inlier_base_threshold;
         }
 
         float const current_area_vx2 = loc_valid_count*src_step*src_step*step*step;

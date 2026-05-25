@@ -30,6 +30,6 @@ private:
     void handleCollectionMutated();
 
     VCCollection* _collection{nullptr};
-    std::array<QMetaObject::Connection, 6> _collectionConnections{};
+    std::array<QMetaObject::Connection, 8> _collectionConnections{};
     double _viewTolerance{10.0};
 };

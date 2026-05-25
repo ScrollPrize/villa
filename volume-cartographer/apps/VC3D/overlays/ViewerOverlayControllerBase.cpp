@@ -364,6 +364,13 @@ void ViewerOverlayControllerBase::refreshAll()
     }
 }
 
+void ViewerOverlayControllerBase::scheduleRefreshAll()
+{
+    for (const auto& entry : _viewers) {
+        scheduleRebuild(entry.viewer);
+    }
+}
+
 void ViewerOverlayControllerBase::refreshViewer(VolumeViewerBase* viewer)
 {
     rebuildOverlay(viewer);

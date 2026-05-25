@@ -334,6 +334,10 @@ void PointsOverlayController::connectCollectionSignals()
                                         this, &PointsOverlayController::handleCollectionMutated);
     _collectionConnections[5] = connect(_collection, &VCCollection::pointRemoved,
                                         this, &PointsOverlayController::handleCollectionMutated);
+    _collectionConnections[6] = connect(_collection, &VCCollection::pointsAdded,
+                                        this, &PointsOverlayController::handleCollectionMutated);
+    _collectionConnections[7] = connect(_collection, &VCCollection::pointsRemoved,
+                                        this, &PointsOverlayController::handleCollectionMutated);
 }
 
 void PointsOverlayController::disconnectCollectionSignals()
@@ -346,5 +350,5 @@ void PointsOverlayController::disconnectCollectionSignals()
 
 void PointsOverlayController::handleCollectionMutated()
 {
-    refreshAll();
+    scheduleRefreshAll();
 }

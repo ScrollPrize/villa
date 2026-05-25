@@ -70,6 +70,8 @@ WrapAnnotationWidget::WrapAnnotationWidget(VCCollection* collection, QWidget* pa
                 this, &WrapAnnotationWidget::onCollectionRemoved);
         connect(_pointCollection, &VCCollection::pointAdded,
                 this, &WrapAnnotationWidget::onPointAdded);
+        connect(_pointCollection, &VCCollection::pointsAdded,
+                this, &WrapAnnotationWidget::onPointsAdded);
         connect(_pointCollection, &VCCollection::pointChanged,
                 this, &WrapAnnotationWidget::onPointChanged);
         connect(_pointCollection, &VCCollection::pointRemoved,
@@ -426,6 +428,40 @@ void WrapAnnotationWidget::onPointAdded(const ColPoint& point)
 
     appendPointRow(collectionItem, it->second, point);
     updateCollectionCount(collectionItem);
+}
+
+void WrapAnnotationWidget::onPointsAdded(const std::vector<ColPoint>& points)
+{
+    if (!_pointCollection || !_sameWrapModel || points.empty()) {
+        return;
+    }
+
+    const QSignalBlocker modelBlocker(_sameWrapModel);
+    std::unordered_map<uint64_t, QStandardItem*> changedCollections;
+    const auto& collections = _pointCollection->getAllCollections();
+    for (const ColPoint& point : points) {
+        const auto it = collections.find(point.collectionId);
+        if (it == collections.end() || !isSameWrapCollection(it->second)) {
+            continue;
+        }
+
+        QStandardItem* collectionItem = findCollectionItem(point.collectionId);
+        if (!collectionItem) {
+            appendCollectionRow(it->second);
+            continue;
+        }
+        if (findPointItem(point.id)) {
+            continue;
+        }
+
+        appendPointRow(collectionItem, it->second, point);
+        changedCollections[point.collectionId] = collectionItem;
+    }
+
+    for (const auto& [collectionId, collectionItem] : changedCollections) {
+        (void)collectionId;
+        updateCollectionCount(collectionItem);
+    }
 }
 
 void WrapAnnotationWidget::onPointChanged(const ColPoint& point)

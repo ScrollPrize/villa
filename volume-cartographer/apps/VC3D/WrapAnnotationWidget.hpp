@@ -46,6 +46,7 @@ private slots:
     void onCollectionChanged(uint64_t collectionId);
     void onCollectionRemoved(uint64_t collectionId);
     void onPointAdded(const ColPoint& point);
+    void onPointsAdded(const std::vector<ColPoint>& points);
     void onPointChanged(const ColPoint& point);
     void onPointRemoved(uint64_t pointId);
     void onSelectionChanged(const QItemSelection& selected, const QItemSelection& deselected);

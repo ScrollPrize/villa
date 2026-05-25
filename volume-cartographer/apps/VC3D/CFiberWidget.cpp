@@ -13,7 +13,9 @@ CFiberWidget::CFiberWidget(VCCollection* collection, QWidget* parent)
     connect(_collection, &VCCollection::collectionChanged, this, &CFiberWidget::onCollectionChanged);
     connect(_collection, &VCCollection::collectionRemoved, this, &CFiberWidget::onCollectionRemoved);
     connect(_collection, &VCCollection::pointAdded, this, &CFiberWidget::onPointAdded);
+    connect(_collection, &VCCollection::pointsAdded, this, &CFiberWidget::onPointsAdded);
     connect(_collection, &VCCollection::pointRemoved, this, &CFiberWidget::onPointRemoved);
+    connect(_collection, &VCCollection::pointsRemoved, this, &CFiberWidget::onPointsRemoved);
 
     refreshList();
 }
@@ -201,7 +203,24 @@ void CFiberWidget::onPointAdded(const ColPoint& point)
     }
 }
 
+void CFiberWidget::onPointsAdded(const std::vector<ColPoint>& points)
+{
+    for (const ColPoint& point : points) {
+        if (isFiber(point.collectionId)) {
+            refreshList();
+            return;
+        }
+    }
+}
+
 void CFiberWidget::onPointRemoved(uint64_t pointId)
 {
     refreshList();
+}
+
+void CFiberWidget::onPointsRemoved(const std::vector<uint64_t>& pointIds)
+{
+    if (!pointIds.empty()) {
+        refreshList();
+    }
 }

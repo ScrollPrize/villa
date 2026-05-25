@@ -209,6 +209,8 @@ void VCCollection::addPoints(const std::string& collectionName, const std::vecto
     uint64_t collection_id = findOrCreateCollectionByName(collectionName);
     auto& collection_points = _collections[collection_id].points;
 
+    std::vector<ColPoint> added_points;
+    added_points.reserve(points.size());
     for (const auto& p : points) {
         ColPoint new_point;
         new_point.id = getNextPointId();
@@ -218,7 +220,10 @@ void VCCollection::addPoints(const std::string& collectionName, const std::vecto
         std::chrono::system_clock::now().time_since_epoch()).count());
         collection_points[new_point.id] = new_point;
         _points[new_point.id] = new_point;
-        emit pointAdded(new_point);
+        added_points.push_back(new_point);
+    }
+    if (!added_points.empty()) {
+        emit pointsAdded(added_points);
     }
 }
 
@@ -249,9 +254,14 @@ void VCCollection::clearCollection(uint64_t collectionId)
 {
     if (_collections.count(collectionId)) {
         auto& collection = _collections.at(collectionId);
+        std::vector<uint64_t> removed_point_ids;
+        removed_point_ids.reserve(collection.points.size());
         for (const auto& pair : collection.points) {
             _points.erase(pair.first);
-            emit pointRemoved(pair.first);
+            removed_point_ids.push_back(pair.first);
+        }
+        if (!removed_point_ids.empty()) {
+            emit pointsRemoved(removed_point_ids);
         }
         _collections.erase(collectionId);
         emit collectionRemoved(collectionId);
@@ -260,8 +270,13 @@ void VCCollection::clearCollection(uint64_t collectionId)
 
 void VCCollection::clearAll()
 {
+    std::vector<uint64_t> removed_point_ids;
+    removed_point_ids.reserve(_points.size());
     for (auto& point_pair : _points) {
-        emit pointRemoved(point_pair.first);
+        removed_point_ids.push_back(point_pair.first);
+    }
+    if (!removed_point_ids.empty()) {
+        emit pointsRemoved(removed_point_ids);
     }
     _collections.clear();
     _points.clear();
@@ -878,4 +893,3 @@ uint64_t VCCollection::findOrCreateCollectionByName(const std::string& name)
     emit collectionsAdded({new_id});
     return new_id;
 }
-

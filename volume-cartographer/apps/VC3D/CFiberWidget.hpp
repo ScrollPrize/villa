@@ -37,7 +37,9 @@ private slots:
     void onCollectionChanged(uint64_t collectionId);
     void onCollectionRemoved(uint64_t collectionId);
     void onPointAdded(const ColPoint& point);
+    void onPointsAdded(const std::vector<ColPoint>& points);
     void onPointRemoved(uint64_t pointId);
+    void onPointsRemoved(const std::vector<uint64_t>& pointIds);
 
 private:
     void setupUi();

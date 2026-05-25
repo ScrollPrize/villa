@@ -11,6 +11,7 @@ import hashlib
 import trimesh
 import datetime
 import itertools
+import contextlib
 import numpy as np
 import scipy.ndimage
 import torch.nn as nn
@@ -36,7 +37,7 @@ normal_zarr_group = '4'
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 7500, 11000
+z_begin, z_end = 8000, 9500
 cross_patch_pcl_json_paths = [
       '/home/sean/Desktop/s1_relative_windings_fixed.json',
   ]
@@ -45,8 +46,7 @@ patches_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/traces/custom_patches
 shell_path = '/home/sean/Documents/volpkgs/s1_ds2.volpkg/s1_2um_outer'  # e.g. '/path/to/outer_shell_tifxyz'; kept separate from patches_path
 voxel_size_um = 2.4 * 4  # before downsampling
 unattached_pcl_json_paths = [
-    '/home/sean/Desktop/same_winding_annotations_fixed.json',
-    '/home/sean/Desktop/s1_relative_windings_fixed.json'
+    '/home/sean/Desktop/same_winding_annotations_fixed.json'
 ]
 
 # # PHerc0172
@@ -70,7 +70,7 @@ default_config = {
     'learning_rate': 1.e-4,
     'exp_lr_schedule': True,
     'lr_final_factor': 0.05,
-    'num_training_steps': 10_000,
+    'num_training_steps': 1000,
     'num_flow_integration_steps': 3,
     'flow_integration_solver': 'rk4',
     'num_flow_timesteps': 1,
@@ -80,7 +80,7 @@ default_config = {
     'flow_field_type': 'cartesian',  # 'cartesian' or 'cylindrical'
     'flow_field_high_res_lr_scale': 3.0e-1,
     'gap_expander_logit_resolution': 6,
-    'gap_expander_num_windings': 230,
+    'gap_expander_num_windings': 140,
     'gap_expander_lr_scale': 0.3,
     'linear_z_resolution': 12,
     'initial_dr_per_winding': 4.,
@@ -92,19 +92,19 @@ default_config = {
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
     'winding_number_num_pairs': 2000,
-    'winding_number_num_pcls': 8,
+    'winding_number_num_pcls': 4,
     'winding_number_adjacent_patches_only': True,
-    'unattached_pcl_num_per_step': 48,
-    'unattached_pcl_num_points_per_step': 48,
+    'unattached_pcl_num_per_step': 256,
+    'unattached_pcl_num_points_per_step': 64,
     'unattached_pcl_min_point_spacing': 4.,
-    'normals_num_points': 2000,
-    'pcl_normals_num_points': 2000,
-    'pcl_normals_sample_radius': 8,
+    'normals_num_points': 4000,
+    'pcl_normals_num_points': 4000,
+    'pcl_normals_sample_radius': 1,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
-    'loss_weight_winding_number': 8.,
+    'loss_weight_winding_number': 1.25,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_patch_stretch': 40.0,
@@ -114,11 +114,11 @@ default_config = {
     'loss_weight_shell_outer': 4.0,
     'loss_weight_shell_no_cross': 1.0,
     'loss_weight_shell_z_drift': 1.0,
-    'loss_start_patch_dt': 9000,
+    'loss_start_patch_dt': 900,
     'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
-    'shell_outer_winding_idx': 120,
+    'shell_outer_winding_idx': 130,
     'shell_outer_winding_margin': 10,
     'shell_num_samples': 8192,
     'shell_num_theta_bins': 720,
@@ -138,6 +138,26 @@ metrics_config = {
     'satisfied_patch_quad_fraction': 0.95,  # min fraction of valid quads satisfied for a patch to count as satisfied
     'boundary_satisfied_patch_quad_fraction': 0.90,  # min fraction of boundary quads satisfied for the boundary metric
 }
+
+
+PROFILE_FIT = os.environ.get('PROFILE_FIT', '').strip().lower() == 'true'
+
+
+def fit_profile_scope(name):
+    if not PROFILE_FIT:
+        return contextlib.nullcontext()
+    return torch.profiler.record_function(f'fit_spiral::{name}')
+
+
+def fit_profile_function(name):
+    def decorator(fn):
+        if not PROFILE_FIT:
+            return fn
+        def wrapped(*args, **kwargs):
+            with fit_profile_scope(name):
+                return fn(*args, **kwargs)
+        return wrapped
+    return decorator
 
 
 def get_env_config_overrides():
@@ -335,6 +355,7 @@ class ShellPolarMap:
             f'{occupied}/{total} occupied ({occupied / max(total, 1) * 100:.1f}%)'
         )
 
+    @fit_profile_function('function.ShellPolarMap.lookup')
     def lookup(self, scan_zyx):
         centre_yx = interp1d(scan_zyx[..., 0].contiguous(), self.umbilicus_zyx[:, :1], self.umbilicus_zyx[:, 1:])
         rel_yx = scan_zyx[..., 1:] - centre_yx
@@ -370,6 +391,7 @@ def _canonical_winding_samples(winding_indices, num_samples, dr_per_winding, dev
     ], dim=-1)
 
 
+@fit_profile_function('function.get_shell_losses')
 def get_shell_losses(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx):
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
@@ -609,6 +631,7 @@ class CylindricalFlowField(nn.Module):
         return sample
 
 
+@fit_profile_function('function.sample_field')
 def sample_field(normalised_zyx, field_for_grid_sample):
     # normalised_zyx :: *, zyx in [0, 1]; field_for_grid_sample :: zyx, z, y, x
     orig_shape = normalised_zyx.shape
@@ -648,6 +671,7 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         t_flow = t_int * 2 - 1
         return self.flow_field.get_sampler(t_flow)(current_zyx_scaled)
 
+    @fit_profile_function('function.IntegratedFlowDiffeomorphism._call')
     def _call(self, input_zyx, inverse=False):
 
         # ODE integration of the temporally-varying flow to give a diffeomorphism.
@@ -1015,6 +1039,7 @@ class PatchGpuAtlas:
     def memory_mb(self):
         return self.zyxs_flat.numel() * 4 / 1e6
 
+    @fit_profile_function('function.PatchGpuAtlas.lookup')
     def lookup(self, patch_idx_per_sample, ijs):
         # patch_idx_per_sample: (...,) int64 on GPU
         # ijs: (..., 2) float on GPU
@@ -1040,6 +1065,7 @@ class PatchGpuAtlas:
         return top + (bottom - top) * di
 
 
+@fit_profile_function('function._sample_patch_tracks')
 def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, umbilicus_zyx=None):
     if len(patch_indices) == 0:
         raise ValueError('Expected at least one patch index')
@@ -1145,6 +1171,7 @@ def _get_patch_valid_points(patch, device, max_points=None, fixed_num_points=Non
     return patch.zyxs[valid_indices[0], valid_indices[1], :].to(device=device, dtype=torch.float32)
 
 
+@fit_profile_function('function.get_patch_and_umbilicus_losses')
 def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True):
 
     # Sample once and share the tracks between the radius and DT losses; the loss using
@@ -1304,6 +1331,7 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
+@fit_profile_function('function.get_patch_winding_number_loss')
 def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
@@ -1654,6 +1682,7 @@ def _pcl_normal_samples_to_gpu(pcl_normal_samples, device):
     }
 
 
+@fit_profile_function('function.get_pcl_normals_loss')
 def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_points, epsilon=1.0):
     if pcl_normal_samples is None:
         return torch.zeros([], device='cuda')
@@ -1677,6 +1706,7 @@ def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_poin
     return (1. - (spiral_normal_step * spiral_outward_zyx).sum(dim=-1).abs()).mean()
 
 
+@fit_profile_function('function.get_unattached_pcl_strip_losses')
 def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
@@ -1779,6 +1809,7 @@ def _get_patch_regularisation_cache(patch, device):
     return cache
 
 
+@fit_profile_function('function.get_patch_stretch_and_normals_loss')
 def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, patches, patch_sampling_probabilities, epsilon=1.0):
     # Sample patch points and enforce, at each point, two local rigidity properties of the scroll->spiral transform:
     #   (stretch) epsilon-steps along the discrete patch tangents (+i and +j neighbors in patch coordinates) preserve
@@ -2991,13 +3022,29 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         for _ in range(start_iteration):
             lr_scheduler.step()
 
-    if False:
+    if PROFILE_FIT:
+        profile_wait = int(os.environ.get('PROFILE_FIT_WAIT', '5'))
+        profile_warmup = int(os.environ.get('PROFILE_FIT_WARMUP', '2'))
+        profile_active = int(os.environ.get('PROFILE_FIT_ACTIVE', '3'))
+        profile_repeat = int(os.environ.get('PROFILE_FIT_REPEAT', '1'))
+        profile_trace_path = os.environ.get('PROFILE_FIT_TRACE_PATH', f'{out_path}/fit_profile.json')
+        print(
+            'PROFILE_FIT=true: writing torch profiler trace to '
+            f'{profile_trace_path} '
+            f'(wait={profile_wait}, warmup={profile_warmup}, active={profile_active}, repeat={profile_repeat})'
+        )
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=5, warmup=2, active=2, repeat=1),
-            on_trace_ready=lambda p: p.export_chrome_trace(f'{out_path}/profile.out'),
-            record_shapes=True,
-            with_stack=True,
+            schedule=torch.profiler.schedule(
+                wait=profile_wait,
+                warmup=profile_warmup,
+                active=profile_active,
+                repeat=profile_repeat,
+            ),
+            on_trace_ready=lambda p: p.export_chrome_trace(profile_trace_path),
+            record_shapes=os.environ.get('PROFILE_FIT_RECORD_SHAPES', '1') != '0',
+            profile_memory=os.environ.get('PROFILE_FIT_MEMORY', '0') == '1',
+            with_stack=os.environ.get('PROFILE_FIT_WITH_STACK', '0') == '1',
         )
         profiler.start()
     else:
@@ -3099,8 +3146,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
     for iteration in tqdm(range(start_iteration, num_training_steps)):
 
-        slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
-        dr_per_winding = spiral_and_transform.get_dr_per_winding()
+        with fit_profile_scope('iteration.get_transform'):
+            slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
+            dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
         losses = {}
 
@@ -3113,74 +3161,88 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         #  on the patch -- but need to account properly for theta=0
 
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
-        patch_radius_loss, umbilicus_loss, patch_dt_loss = get_patch_and_umbilicus_losses(
-            slice_to_spiral_transform,
-            dr_per_winding,
-            cfg['num_patches_per_step'],
-            cfg['num_patches_per_step_for_dt'],
-            patches_list,
-            patch_atlas,
-            patch_sampling_probabilities,
-            umbilicus_zyx,
-            compute_dt=compute_patch_dt,
-        )
+        with fit_profile_scope('loss.patch_and_umbilicus'):
+            patch_radius_loss, umbilicus_loss, patch_dt_loss = get_patch_and_umbilicus_losses(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                cfg['num_patches_per_step'],
+                cfg['num_patches_per_step_for_dt'],
+                patches_list,
+                patch_atlas,
+                patch_sampling_probabilities,
+                umbilicus_zyx,
+                compute_dt=compute_patch_dt,
+            )
         losses['patch_radius'] = patch_radius_loss * cfg['loss_weight_patch_radius']
         losses['patch_dt'] = patch_dt_loss * cfg['loss_weight_patch_dt']
 
         if cfg['loss_weight_patch_stretch'] > 0 or cfg['loss_weight_patch_normals'] > 0:
-            patch_stretch_loss, patch_normals_loss = get_patch_stretch_and_normals_loss(
-                slice_to_spiral_transform,
-                cfg['regularisation_num_points'],
-                patches_list,
-                patch_sampling_probabilities,
-            )
+            with fit_profile_scope('loss.patch_stretch_and_normals'):
+                patch_stretch_loss, patch_normals_loss = get_patch_stretch_and_normals_loss(
+                    slice_to_spiral_transform,
+                    cfg['regularisation_num_points'],
+                    patches_list,
+                    patch_sampling_probabilities,
+                )
             losses['patch_stretch'] = patch_stretch_loss * cfg['loss_weight_patch_stretch']
             losses['patch_normals'] = patch_normals_loss * cfg['loss_weight_patch_normals']
 
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
-            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_winding_number']
+            with fit_profile_scope('loss.winding_number'):
+                losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_winding_number']
 
         if cfg['loss_weight_pcl_normals'] > 0 and pcl_normal_samples is not None:
-            losses['pcl_normals'] = get_pcl_normals_loss(
-                slice_to_spiral_transform,
-                pcl_normal_samples,
-                cfg['pcl_normals_num_points'],
-            ) * cfg['loss_weight_pcl_normals']
+            with fit_profile_scope('loss.pcl_normals'):
+                losses['pcl_normals'] = get_pcl_normals_loss(
+                    slice_to_spiral_transform,
+                    pcl_normal_samples,
+                    cfg['pcl_normals_num_points'],
+                ) * cfg['loss_weight_pcl_normals']
 
         if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
-            unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
-                slice_to_spiral_transform,
-                dr_per_winding,
-                unattached_pcl_strips,
-                cfg['unattached_pcl_num_per_step'],
-                cfg['unattached_pcl_num_points_per_step'],
-                compute_dt=compute_patch_dt,
-            )
+            with fit_profile_scope('loss.unattached_pcl'):
+                unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    unattached_pcl_strips,
+                    cfg['unattached_pcl_num_per_step'],
+                    cfg['unattached_pcl_num_points_per_step'],
+                    compute_dt=compute_patch_dt,
+                )
             losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
 
         shell_metrics = {}
         if shell_map is not None:
-            shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, shell_metrics = get_shell_losses(
-                shell_map,
-                slice_to_spiral_transform,
-                dr_per_winding,
-                shell_outer_winding_idx,
-            )
+            with fit_profile_scope('loss.shell'):
+                shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, shell_metrics = get_shell_losses(
+                    shell_map,
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    shell_outer_winding_idx,
+                )
             losses['shell_outer'] = shell_outer_loss * cfg['loss_weight_shell_outer']
             losses['shell_no_cross'] = shell_no_cross_loss * cfg['loss_weight_shell_no_cross']
             losses['shell_z_drift'] = shell_z_drift_loss * cfg['loss_weight_shell_z_drift']
 
         losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
 
-        loss = sum(losses.values())
+        with fit_profile_scope('loss.sum'):
+            loss = sum(losses.values())
 
-        loss.backward()
-        optimiser.step()
+        with fit_profile_scope('train.backward'):
+            loss.backward()
+        with fit_profile_scope('train.optimiser_step'):
+            optimiser.step()
         optimiser.zero_grad(set_to_none=True)
         lr_scheduler.step()
         if profiler is not None:
             profiler.step()
+
+        completed_step = iteration + 1
+        if completed_step % 1000 == 0:
+            with fit_profile_scope('checkpoint.save_interval'):
+                save_model(completed_step)
 
         if iteration % 200 == 0:
             # Only sync to CPU and log when we actually print, avoiding a per-iter
@@ -3193,6 +3255,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 print(f'  shell: {metric_items}')
             if loss.isnan().item():
                 print('aborting due to NaN')
+                if profiler is not None:
+                    profiler.stop()
                 return
             wandb.log({
                 'total_loss': loss.item(),
@@ -3201,8 +3265,14 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             })
 
     suffix = 'fitted'
-    save_overlay_and_print_satisfaction(suffix)
-    save_model(suffix)
+    with fit_profile_scope('final.save_model'):
+        save_model(suffix)
+    with fit_profile_scope('final.overlay_mesh_satisfaction'):
+        save_overlay_and_print_satisfaction(suffix)
+
+    if profiler is not None:
+        profiler.stop()
+        print(profiler.key_averages().table(sort_by='cuda_time_total', row_limit=40))
 
 
 def load_patches(patches_path, segment_id_filter=lambda s: True):
