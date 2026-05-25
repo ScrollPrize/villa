@@ -15,8 +15,8 @@ flat patch_size + targets pair), and `metadata`.
 
 Container dependencies: this loader imports from the `vesuvius` Python package
 (`vesuvius.models.build.build_network_from_config`). The optimized inference
-image must install the local `villa/vesuvius` package for `MODEL_TYPE=primus`
-to be runnable.
+image must install `vesuvius[models]` from the Villa monorepo for
+`MODEL_TYPE=primus` to be runnable.
 """
 from __future__ import annotations
 
@@ -159,9 +159,9 @@ def load_model(model_path: str, device: torch.device, num_frames: int = 26) -> P
         from vesuvius.models.build.build_network_from_config import NetworkFromConfig
     except ImportError as exc:  # pragma: no cover - exercised at container runtime
         raise ImportError(
-            "model_primus requires the vesuvius package. Install villa/vesuvius/src "
-            "into this container (or vendor build_network_from_config) before "
-            "loading MODEL_TYPE=primus."
+            "MODEL_TYPE=primus requires the Villa vesuvius package. Install "
+            "`vesuvius[models]` from the Villa monorepo into the optimized "
+            "inference GPU image before loading Primus checkpoints."
         ) from exc
 
     logger.info(f"Loading Primus model from: {model_path} with {num_frames} frames")

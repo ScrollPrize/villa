@@ -32,6 +32,18 @@ The useful contract is narrow:
   weak. The next repair slice should either install the local `villa/vesuvius`
   package in the GPU image or explicitly narrow the PR until a container smoke
   test exists.
+- Docker is part of the official Villa development/runtime surface for this
+  area: `ink-detection/optimized_inference/Dockerfile` defines the GPU and CPU
+  optimized-inference images, the README documents `docker build` and
+  `docker run --gpus all`, and the repository also carries Volume
+  Cartographer Dockerfiles plus Docker-backed CI. A Primus reviewer reply should
+  therefore include a container smoke result, not only host-side unit tests.
+- Local Docker installation attempt on 2026-05-25 installed Docker 29.5.2
+  static binaries and rootless extras under `~/.local/bin`, but the rootless
+  daemon is blocked by Ubuntu AppArmor unprivileged-user-namespace policy:
+  `rootlesskit` fails with `fork/exec /proc/self/exe: permission denied`.
+  Finishing the container smoke on this VM requires a sudo-owned AppArmor
+  policy change or a system Docker install.
 - The new unit tests exercise the wrapper shape contract and checkpoint loading
   against a stubbed `NetworkFromConfig`, so they verify the PR's local logic
   without requiring a heavyweight Primus checkpoint in CI.

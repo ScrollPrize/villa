@@ -2,6 +2,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -124,6 +125,48 @@ class ModelPrimusTests(unittest.TestCase):
         self.assertEqual(shim.targets["ink"]["out_channels"], 1)
         self.assertFalse(shim.autoconfigure)
         self.assertEqual(shim.op_dims, 3)
+
+    def test_load_model_reports_missing_vesuvius_dependency(self):
+        fake_module_name = "vesuvius.models.build.build_network_from_config"
+        old_modules = {
+            name: sys.modules.get(name)
+            for name in (
+                "vesuvius",
+                "vesuvius.models",
+                "vesuvius.models.build",
+                fake_module_name,
+            )
+        }
+        for name in old_modules:
+            sys.modules.pop(name, None)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                checkpoint_path = Path(tmpdir) / "production_model.pt"
+                torch.save(
+                    {
+                        "config": {"patch_size": [5, 8, 8]},
+                        "model_state_dict": {"weight": torch.ones(1)},
+                    },
+                    checkpoint_path,
+                )
+
+                original_import = __import__
+
+                def block_vesuvius_import(name, *args, **kwargs):
+                    if name == "vesuvius.models.build.build_network_from_config":
+                        raise ImportError("blocked vesuvius import for test")
+                    return original_import(name, *args, **kwargs)
+
+                with mock.patch("builtins.__import__", side_effect=block_vesuvius_import):
+                    with self.assertRaisesRegex(ImportError, r"vesuvius\[models\]"):
+                        model_primus.load_model(str(checkpoint_path), torch.device("cpu"), num_frames=5)
+        finally:
+            for name, module in old_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
 
 if __name__ == "__main__":
