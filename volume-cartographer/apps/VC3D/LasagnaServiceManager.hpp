@@ -69,8 +69,6 @@ public:
     /** Request cancellation of the running optimization. */
     void stopOptimization();
     void cancelJob(const QString& jobId);
-    void downloadResultsForJob(const QString& jobId,
-                               const QString& localOutputDir = QString());
     void moveJobBefore(const QString& jobId, const QString& beforeJobId);
     void moveJobToEnd(const QString& jobId);
     void fetchJobs();

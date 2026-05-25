@@ -3,7 +3,6 @@
 #include "LasagnaServiceManager.hpp"
 
 #include <QDateTime>
-#include <QFileDialog>
 #include <QHeaderView>
 #include <QItemSelectionModel>
 #include <QJsonObject>
@@ -88,11 +87,9 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
     _upButton = new QPushButton(tr("Up"), this);
     _downButton = new QPushButton(tr("Down"), this);
     _cancelButton = new QPushButton(tr("Cancel"), this);
-    _downloadButton = new QPushButton(tr("Download"), this);
     buttonRow->addWidget(_upButton);
     buttonRow->addWidget(_downButton);
     buttonRow->addWidget(_cancelButton);
-    buttonRow->addWidget(_downloadButton);
     buttonRow->addStretch(1);
     layout->addLayout(buttonRow);
 
@@ -144,16 +141,6 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
         if (!jobId.isEmpty()) {
             optimisticallyCancel(jobId);
             LasagnaServiceManager::instance().cancelJob(jobId);
-        }
-    });
-
-    connect(_downloadButton, &QPushButton::clicked, this, [this]() {
-        const QString jobId = selectedJobId();
-        if (jobId.isEmpty()) return;
-        const QString dir = QFileDialog::getExistingDirectory(
-            this, tr("Select result destination"));
-        if (!dir.isEmpty()) {
-            LasagnaServiceManager::instance().downloadResultsForJob(jobId, dir);
         }
     });
 
@@ -303,12 +290,10 @@ void LasagnaBatchWindow::updateActionState()
     const bool cancellable = state == QStringLiteral("upload")
         || state == QStringLiteral("waiting")
         || state == QStringLiteral("running");
-    const bool downloadable = state == QStringLiteral("finished");
 
     _upButton->setEnabled(hasSelection && waiting);
     _downButton->setEnabled(hasSelection && waiting);
     _cancelButton->setEnabled(hasSelection && cancellable);
-    _downloadButton->setEnabled(hasSelection && downloadable);
 }
 
 void LasagnaBatchWindow::optimisticallyCancel(const QString& jobId)

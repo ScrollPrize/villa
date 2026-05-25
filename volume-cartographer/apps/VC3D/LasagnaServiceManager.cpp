@@ -763,12 +763,6 @@ void LasagnaServiceManager::moveJobToEnd(const QString& jobId)
     moveJobBefore(jobId, QString());
 }
 
-void LasagnaServiceManager::downloadResultsForJob(const QString& jobId,
-                                                  const QString& localOutputDir)
-{
-    downloadResults(jobId, localOutputDir);
-}
-
 void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
 {
     if (!isRunning()) {

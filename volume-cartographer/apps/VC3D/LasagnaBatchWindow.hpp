@@ -33,6 +33,5 @@ private:
     QPushButton* _upButton{nullptr};
     QPushButton* _downButton{nullptr};
     QPushButton* _cancelButton{nullptr};
-    QPushButton* _downloadButton{nullptr};
     QJsonArray _jobs;
 };
