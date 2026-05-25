@@ -452,9 +452,7 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
 
     std::cout << "Adding segmentation: " << segId << std::endl;
     try {
-        if (!_volumePkg->addSingleSegmentation(segId)) {
-            _volumePkg->refreshSegmentations();
-        }
+        (void)_volumePkg->addSingleSegmentation(segId);
         auto surf = _volumePkg->loadSurface(segId);
         if (!surf) {
             return;
@@ -463,7 +461,18 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             _state->setSurface(segId, surf, true, false);
         }
         if (_ui.treeWidget) {
-            auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
+            SurfaceTreeWidgetItem* item = nullptr;
+            QTreeWidgetItemIterator it(_ui.treeWidget);
+            while (*it) {
+                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == segId) {
+                    item = static_cast<SurfaceTreeWidgetItem*>(*it);
+                    break;
+                }
+                ++it;
+            }
+            if (!item) {
+                item = new SurfaceTreeWidgetItem(_ui.treeWidget);
+            }
             item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
             const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);

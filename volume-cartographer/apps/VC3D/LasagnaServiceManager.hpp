@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
 #include <memory>
 
@@ -100,6 +101,7 @@ signals:
                               double stageProgress, double overallProgress,
                               const QString& stageName);
     void optimizationFinished(const QString& outputDir);
+    void resultsPlaced(const QString& outputDir, const QStringList& segmentNames);
     void optimizationError(const QString& message);
     void jobsUpdated(const QJsonArray& jobs);
     void jobStarted(const QString& jobId);

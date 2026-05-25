@@ -6,6 +6,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QFutureWatcher>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -17,6 +18,7 @@
 #include <QSysInfo>
 #include <QTemporaryDir>
 #include <QUrl>
+#include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
 #include <iostream>
@@ -152,6 +154,78 @@ QNetworkRequest fitServiceRequest(const QUrl& url)
     QNetworkRequest req(url);
     req.setRawHeader(kFitServiceApiVersionHeader, kFitServiceApiVersion);
     return req;
+}
+
+struct ResultsPlacementResult
+{
+    bool ok{false};
+    QString error;
+    QString targetDir;
+    QStringList placedNames;
+};
+
+ResultsPlacementResult placeResultsArchive(const QByteArray& data, const QString& targetDir)
+{
+    ResultsPlacementResult result;
+    result.targetDir = targetDir;
+
+    QDir().mkpath(targetDir);
+    QTemporaryDir unpackDir(QDir(targetDir).filePath(QStringLiteral(".lasagna_unpack_XXXXXX")));
+    if (!unpackDir.isValid()) {
+        result.error = QObject::tr("Cannot create temporary unpack directory in %1").arg(targetDir);
+        return result;
+    }
+
+    QString tarPath = QDir(unpackDir.path()).filePath(QStringLiteral(".lasagna_results.tar.gz"));
+    QFile tarFile(tarPath);
+    if (!tarFile.open(QIODevice::WriteOnly)) {
+        result.error = QObject::tr("Cannot write temp file: %1").arg(tarPath);
+        return result;
+    }
+    tarFile.write(data);
+    tarFile.close();
+
+    QProcess tar;
+    tar.setWorkingDirectory(unpackDir.path());
+    tar.start(QStringLiteral("tar"), {QStringLiteral("xzf"), tarPath});
+    if (!tar.waitForFinished(30000)) {
+        QFile::remove(tarPath);
+        result.error = QObject::tr("tar extraction timed out");
+        return result;
+    }
+    QFile::remove(tarPath);
+
+    if (tar.exitCode() != 0) {
+        QString err = QString::fromUtf8(tar.readAllStandardError());
+        result.error = QObject::tr("tar extraction failed: %1").arg(err);
+        return result;
+    }
+
+    QDir unpackRoot(unpackDir.path());
+    const QFileInfoList children = unpackRoot.entryInfoList(
+        QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot);
+    for (const QFileInfo& child : children) {
+        if (child.fileName() == QStringLiteral(".lasagna_results.tar.gz")) {
+            continue;
+        }
+        const QString finalName = uniqueSegmentName(targetDir, child.fileName());
+        const QString finalPath = QDir(targetDir).filePath(finalName);
+        if (QFileInfo::exists(finalPath)) {
+            result.error = QObject::tr("Refusing to overwrite existing segment: %1").arg(finalPath);
+            return result;
+        }
+        if (child.isDir() && finalName != child.fileName()) {
+            updateTifxyzUuid(child.absoluteFilePath(), finalName);
+        }
+        if (!QDir().rename(child.absoluteFilePath(), finalPath)) {
+            result.error = QObject::tr("Cannot place downloaded result: %1").arg(finalPath);
+            return result;
+        }
+        result.placedNames << finalName;
+    }
+
+    result.ok = true;
+    return result;
 }
 
 QString findPythonExecutable()
@@ -1027,97 +1101,36 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
         std::cout << "[lasagna] downloaded results archive ("
                   << data.size() << " bytes)" << std::endl;
 
-        QDir().mkpath(targetDir);
-        QTemporaryDir unpackDir(QDir(targetDir).filePath(QStringLiteral(".lasagna_unpack_XXXXXX")));
-        if (!unpackDir.isValid()) {
-            const QString msg = tr("Cannot create temporary unpack directory in %1").arg(targetDir);
-            if (!jobId.isEmpty()) {
-                emit jobError(jobId, msg);
-            }
-            emit optimizationError(msg);
-            return;
-        }
+        emit statusMessage(tr("Unpacking results from external service..."));
 
-        QString tarPath = QDir(unpackDir.path()).filePath(QStringLiteral(".lasagna_results.tar.gz"));
-        QFile tarFile(tarPath);
-        if (!tarFile.open(QIODevice::WriteOnly)) {
-            const QString msg = tr("Cannot write temp file: %1").arg(tarPath);
-            if (!jobId.isEmpty()) {
-                emit jobError(jobId, msg);
-            }
-            emit optimizationError(msg);
-            return;
-        }
-        tarFile.write(data);
-        tarFile.close();
-
-        QProcess tar;
-        tar.setWorkingDirectory(unpackDir.path());
-        tar.start(QStringLiteral("tar"),
-                  {QStringLiteral("xzf"), tarPath});
-        if (!tar.waitForFinished(30000)) {
-            QFile::remove(tarPath);
-            const QString msg = tr("tar extraction timed out");
-            if (!jobId.isEmpty()) {
-                emit jobError(jobId, msg);
-            }
-            emit optimizationError(msg);
-            return;
-        }
-        QFile::remove(tarPath);
-
-        if (tar.exitCode() != 0) {
-            QString err = QString::fromUtf8(tar.readAllStandardError());
-            const QString msg = tr("tar extraction failed: %1").arg(err);
-            if (!jobId.isEmpty()) {
-                emit jobError(jobId, msg);
-            }
-            emit optimizationError(msg);
-            return;
-        }
-
-        QDir unpackRoot(unpackDir.path());
-        const QFileInfoList children = unpackRoot.entryInfoList(
-            QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot);
-        QStringList placedNames;
-        for (const QFileInfo& child : children) {
-            if (child.fileName() == QStringLiteral(".lasagna_results.tar.gz")) {
-                continue;
-            }
-            const QString finalName = uniqueSegmentName(targetDir, child.fileName());
-            const QString finalPath = QDir(targetDir).filePath(finalName);
-            if (QFileInfo::exists(finalPath)) {
-                const QString msg = tr("Refusing to overwrite existing segment: %1").arg(finalPath);
+        auto* watcher = new QFutureWatcher<ResultsPlacementResult>(this);
+        connect(watcher, &QFutureWatcher<ResultsPlacementResult>::finished,
+                this, [this, watcher, jobId]() {
+            watcher->deleteLater();
+            const ResultsPlacementResult result = watcher->result();
+            if (!result.ok) {
                 if (!jobId.isEmpty()) {
-                    emit jobError(jobId, msg);
+                    emit jobError(jobId, result.error);
                 }
-                emit optimizationError(msg);
+                emit optimizationError(result.error);
                 return;
             }
-            if (child.isDir() && finalName != child.fileName()) {
-                updateTifxyzUuid(child.absoluteFilePath(), finalName);
-            }
-            if (!QDir().rename(child.absoluteFilePath(), finalPath)) {
-                const QString msg = tr("Cannot place downloaded result: %1").arg(finalPath);
-                if (!jobId.isEmpty()) {
-                    emit jobError(jobId, msg);
-                }
-                emit optimizationError(msg);
-                return;
-            }
-            placedNames << finalName;
-        }
 
-        std::cout << "[lasagna] results unpacked to "
-                  << targetDir.toStdString();
-        if (!placedNames.isEmpty()) {
-            std::cout << " as " << placedNames.join(QStringLiteral(", ")).toStdString();
-        }
-        std::cout << std::endl;
-        if (!jobId.isEmpty()) {
-            emit jobFinished(jobId, targetDir);
-        }
-        emit optimizationFinished(targetDir);
+            std::cout << "[lasagna] results unpacked to "
+                      << result.targetDir.toStdString();
+            if (!result.placedNames.isEmpty()) {
+                std::cout << " as " << result.placedNames.join(QStringLiteral(", ")).toStdString();
+            }
+            std::cout << std::endl;
+            emit resultsPlaced(result.targetDir, result.placedNames);
+            if (!jobId.isEmpty()) {
+                emit jobFinished(jobId, result.targetDir);
+            }
+            emit optimizationFinished(result.targetDir);
+        });
+        watcher->setFuture(QtConcurrent::run([data = std::move(data), targetDir]() {
+            return placeResultsArchive(data, targetDir);
+        }));
     });
 }
 

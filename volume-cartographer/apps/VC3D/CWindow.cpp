@@ -1910,13 +1910,18 @@ void CWindow::CreateWidgets(void)
         statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
     });
 
-    // Auto-reload segments when fit optimization finishes
-    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::optimizationFinished,
-            this, [this](const QString& outputDir) {
+    // Add only the segments placed by lasagna instead of rescanning every surface.
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,
+            this, [this](const QString& outputDir, const QStringList& segmentNames) {
         statusBar()->showMessage(
-            tr("Lasagna optimization finished. Reloading segments from %1").arg(outputDir), 5000);
+            tr("Lasagna optimization finished. Added %1 segment(s) from %2")
+                .arg(segmentNames.size())
+                .arg(outputDir), 5000);
         if (_surfacePanel) {
-            _surfacePanel->loadSurfacesIncremental();
+            for (const QString& segmentName : segmentNames) {
+                _surfacePanel->addSingleSegmentation(segmentName.toStdString());
+            }
+            _surfacePanel->refreshFiltersOnly();
         }
         // corr_points_results will be loaded when the new segment is activated
     });
