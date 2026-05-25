@@ -77,6 +77,7 @@ private:
     bool ensureDatasetForSession(LineAnnotationSession& session);
     void startOptimization(LineAnnotationSession& session, cv::Vec3d seedPoint);
     void finishOptimization(const std::string& surfaceName);
+    bool materializeGeneratedViews(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,

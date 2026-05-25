@@ -85,6 +85,16 @@ vc_add_test(NAME test_line_annotation_context_menu
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+vc_add_test(NAME test_line_annotation_generated_views
+    SOURCES test_line_annotation_generated_views.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            ${line_annotation_vccollection_moc}
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
 
@@ -238,6 +248,8 @@ vc_add_test(NAME test_load_json)
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
+
+vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagna)
 
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 

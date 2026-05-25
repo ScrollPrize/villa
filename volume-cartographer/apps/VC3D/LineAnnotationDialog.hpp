@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -14,6 +15,7 @@
 class CState;
 class QMdiArea;
 class QMdiSubWindow;
+class QVBoxLayout;
 class ViewerManager;
 
 class LineAnnotationDialog : public QDialog
@@ -32,6 +34,9 @@ public:
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
                                   const QString& title,
                                   const CChunkedVolumeViewer::CameraState& camera);
+    bool setGeneratedRows(
+        const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
+        const CChunkedVolumeViewer::CameraState& camera);
     const std::vector<Pane>& panes() const { return _panes; }
 
 signals:
@@ -42,9 +47,13 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
 
 private:
-    void bindPaneInteractions(const std::string& surfaceName, CChunkedVolumeViewer* viewer);
+    void bindPaneInteractions(const std::string& surfaceName,
+                              CChunkedVolumeViewer* viewer,
+                              bool seedPlacementEnabled);
 
     ViewerManager* _viewerManager = nullptr;
+    QVBoxLayout* _layout = nullptr;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
+    bool _suppressPaneClosed = false;
 };

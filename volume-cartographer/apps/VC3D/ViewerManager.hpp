@@ -18,6 +18,7 @@
 class QMdiArea;
 class CChunkedVolumeViewer;
 class CState;
+class QWidget;
 class VCCollection;
 class SegmentationOverlayController;
 class PointsOverlayController;
@@ -51,6 +52,9 @@ public:
                                    const QString& title,
                                    QMdiArea* mdiArea,
                                    ViewerRole role = ViewerRole::Standard);
+    VolumeViewerBase* createViewerInWidget(const std::string& surfaceName,
+                                           QWidget* parent,
+                                           ViewerRole role = ViewerRole::Standard);
     void unregisterViewer(VolumeViewerBase* viewer);
 
     const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }
@@ -157,6 +161,9 @@ private:
     };
 
     void registerOverlay(ViewerOverlayControllerBase* overlay);
+    VolumeViewerBase* initializeChunkedViewer(CChunkedVolumeViewer* chunkedViewer,
+                                              const std::string& surfaceName,
+                                              ViewerRole role);
     bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
     void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
     void startNextSurfacePatchIndexTask();

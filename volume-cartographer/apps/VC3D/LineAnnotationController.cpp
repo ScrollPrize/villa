@@ -12,6 +12,7 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
+#include "vc/lasagna/LineViewBuilder.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <QFileDialog>
@@ -24,6 +25,8 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <iomanip>
+#include <sstream>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -44,6 +47,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string sourceAnnotationSurfaceName;
     vc::lasagna::LineOptimizationReport optimizationReport;
     vc::lasagna::LineModel optimizedLine;
+    std::vector<std::string> generatedSurfaceNames;
     std::string error;
     QPointer<QFutureWatcher<OptimizationTaskResult>> watcher;
 };
@@ -312,6 +316,10 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         session.selectedManifestPath = task.manifestPath;
         session.optimizationReport = task.result.report;
         session.optimizedLine = std::move(task.result.line);
+        if (!materializeGeneratedViews(session)) {
+            session.taskState = LineAnnotationSession::TaskState::Failed;
+            return;
+        }
         Logger()->info("Line annotation Lasagna optimization complete: points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={}",
                        session.optimizedLine.points.size(),
                        session.optimizationReport.iterations,
@@ -329,6 +337,78 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                   .arg(QString::fromStdString(task.error)));
 }
 
+bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
+{
+    if (!_state) {
+        session.error = "No active application state.";
+        showError(tr("Could not create line annotation views: no active application state."));
+        return false;
+    }
+
+    vc::lasagna::LineViewSurfaces views;
+    try {
+        views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine);
+    } catch (const std::exception& ex) {
+        session.error = ex.what();
+        showError(tr("Could not create line annotation views: %1")
+                      .arg(QString::fromStdString(session.error)));
+        return false;
+    }
+
+    for (const auto& name : session.generatedSurfaceNames) {
+        _state->setSurface(name, nullptr);
+    }
+    session.generatedSurfaceNames.clear();
+
+    std::vector<std::vector<std::pair<std::string, QString>>> rows;
+    rows.push_back({{"line-surface", tr("Line Surface")}});
+    rows.push_back({{"line-side-slice", tr("Line Side Slice")}});
+
+    _state->setSurface("line-surface", views.lineSurface);
+    _state->setSurface("line-side-slice", views.lineSideSlice);
+    session.generatedSurfaceNames.push_back("line-surface");
+    session.generatedSurfaceNames.push_back("line-side-slice");
+
+    std::vector<std::pair<std::string, QString>> zSliceRow;
+    zSliceRow.reserve(views.lineZSlices.size());
+    for (size_t i = 0; i < views.lineZSlices.size(); ++i) {
+        std::ostringstream name;
+        name << "line-z-slice-" << std::setw(3) << std::setfill('0') << i;
+        const std::string surfaceName = name.str();
+        _state->setSurface(surfaceName, views.lineZSlices[i]);
+        session.generatedSurfaceNames.push_back(surfaceName);
+        zSliceRow.push_back({surfaceName,
+                             tr("Line Z Slice %1").arg(static_cast<int>(i))});
+    }
+    if (!zSliceRow.empty()) {
+        rows.push_back(std::move(zSliceRow));
+    }
+
+    auto* pane = paneForSurface(session.surfaceName);
+    if (!pane || !pane->dialog) {
+        return true;
+    }
+
+    CChunkedVolumeViewer::CameraState camera;
+    camera.scale = 1.0f;
+    if (!pane->dialog->panes().empty() && pane->dialog->panes().front().viewer) {
+        camera = pane->dialog->panes().front().viewer->cameraState();
+        camera.zOffset = 0.0f;
+        camera.zOffsetWorldDir = {0, 0, 0};
+    }
+
+    if (!pane->dialog->setGeneratedRows(rows, camera)) {
+        for (const auto& name : session.generatedSurfaceNames) {
+            _state->setSurface(name, nullptr);
+        }
+        session.generatedSurfaceNames.clear();
+        session.error = "Failed to create generated annotation viewers.";
+        showError(tr("Could not create generated line annotation viewers."));
+        return false;
+    }
+    return true;
+}
+
 std::string LineAnnotationController::nextSurfaceName()
 {
     return "line_annotation_slice_" + std::to_string(_nextPaneId++);
@@ -341,6 +421,7 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
     }
 
     const auto before = _panes.size();
+    std::vector<std::string> generatedSurfaceNames;
     for (const auto& pane : _panes) {
         if (pane.surfaceName == surfaceName && pane.session && pane.session->watcher) {
             auto* watcher = pane.session->watcher.data();
@@ -350,6 +431,9 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
                     watcher,
                     &QObject::deleteLater);
             pane.session->watcher = nullptr;
+        }
+        if (pane.surfaceName == surfaceName && pane.session) {
+            generatedSurfaceNames = pane.session->generatedSurfaceNames;
         }
     }
     _panes.erase(std::remove_if(_panes.begin(),
@@ -364,6 +448,9 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
 
     if (_state) {
         _state->setSurface(surfaceName, nullptr);
+        for (const auto& name : generatedSurfaceNames) {
+            _state->setSurface(name, nullptr);
+        }
     }
 }
 
