@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QPushButton>
@@ -105,9 +106,11 @@ int main(int argc, char** argv)
     };
     window.applyJobs(jobs);
 
+    const QString submittedAtOne =
+        QDateTime::fromSecsSinceEpoch(1).toString(Qt::ISODate);
     require(window._model->rowCount() == 3, "Unexpected rendered job count");
     require(rowTexts(window, 0).join('|') ==
-                QStringLiteral("1|local|cfg-a|sheet_v001.tifxyz|Waiting #1|1970-01-01T01:00:01"),
+                QStringLiteral("1|local|cfg-a|sheet_v001.tifxyz|Waiting #1|") + submittedAtOne,
             "Waiting row text did not match expected order/source/config/output/progress/submitted values");
     require(cell(window, 1, 3) == QStringLiteral("from-dir.tifxyz"),
             "output_dir basename should be shown when output_name is missing");

@@ -88,6 +88,11 @@ const char* __lsan_default_suppressions(void)
         "leak:libharfbuzz\n"
         "leak:libqgtk3\n"
         "leak:FcFont*\n"
+        "leak:QFontCache\n"
+        "leak:QFontDatabasePrivate\n"
+        "leak:QFontEngineFT\n"
+        "leak:QFontconfigDatabase\n"
+        "leak:QFreetypeFace\n"
         "leak:pango_*\n"
         "leak:g_type_*\n";
 }
