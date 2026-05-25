@@ -30,6 +30,8 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 _data_dir: str | None = None  # Set via --data-dir CLI flag
+_API_VERSION = "1"
+_API_VERSION_HEADER = "X-Fit-Service-API-Version"
 
 
 # ---------------------------------------------------------------------------
@@ -398,12 +400,29 @@ def _run_optimization(body: dict[str, Any]) -> None:
 class _Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj: Any, status: int = 200) -> None:
+        if isinstance(obj, dict):
+            obj.setdefault("api_version", _API_VERSION)
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header(_API_VERSION_HEADER, _API_VERSION)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _validate_api_version(self) -> bool:
+        got = self.headers.get(_API_VERSION_HEADER)
+        if got == _API_VERSION:
+            return True
+        self._send_json({
+            "error": (
+                f"fit-service API version mismatch: expected {_API_VERSION_HEADER}="
+                f"{_API_VERSION}, got {got or '<missing>'}"
+            ),
+            "expected_api_version": _API_VERSION,
+            "received_api_version": got,
+        }, 426)
+        return False
 
     def _read_json(self) -> Any:
         length = int(self.headers.get("Content-Length", 0))
@@ -411,6 +430,8 @@ class _Handler(BaseHTTPRequestHandler):
         return json.loads(raw) if raw else {}
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._validate_api_version():
+            return
         if self.path == "/health":
             self._send_json({"status": "ok"})
         elif self.path == "/status":
@@ -449,6 +470,7 @@ class _Handler(BaseHTTPRequestHandler):
         data = buf.getvalue()
         self.send_response(200)
         self.send_header("Content-Type", "application/gzip")
+        self.send_header(_API_VERSION_HEADER, _API_VERSION)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -458,6 +480,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         global _job_thread
+
+        if not self._validate_api_version():
+            return
 
         if self.path == "/optimize":
             if _job.is_busy:
