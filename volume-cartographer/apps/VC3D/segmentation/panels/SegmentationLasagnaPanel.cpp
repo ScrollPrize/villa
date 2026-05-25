@@ -732,6 +732,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
 
+#ifndef VC_TEST_DISABLE_LASAGNA_DISCOVERY
     // Run service discovery once on startup (in background thread)
     auto* watcher = new QFutureWatcher<QJsonArray>(this);
     connect(watcher, &QFutureWatcher<QJsonArray>::finished, this, [this, watcher]() {
@@ -759,6 +760,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     watcher->setFuture(QtConcurrent::run([]() {
         return LasagnaServiceManager::discoverServices();
     }));
+#endif
 }
 
 // ---------------------------------------------------------------------------
