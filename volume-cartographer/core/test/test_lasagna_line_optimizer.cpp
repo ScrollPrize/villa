@@ -106,3 +106,71 @@ TEST_CASE("LineOptimizer V1 rejects multi-seed requests explicitly")
     CHECK_THROWS_AS(optimizer.optimizeFromSeeds(seeds), std::invalid_argument);
     CHECK_THROWS_AS(optimizer.optimizeFromSeeds({}), std::invalid_argument);
 }
+
+TEST_CASE("LineOptimizer sanitizes degenerate config values")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 0;
+    config.segmentLength = -10.0;
+    config.samplesPerSegment = 0;
+    config.straightnessWeight = -1.0;
+    config.normalAlignmentWeight = -1.0;
+    config.distanceWeight = -1.0;
+    config.maxIterations = -5;
+
+    const auto result = optimizer.optimizeFromSeed({1.0, 2.0, 3.0}, config);
+
+    CHECK(result.line.points.size() == 3);
+    CHECK(result.line.segmentSamples.size() == 2);
+    CHECK(result.line.segmentSamples.front().samples.size() == 2);
+    CHECK(result.report.validNormalSamples == 4);
+    CHECK(result.report.invalidNormalSamples == 0);
+}
+
+TEST_CASE("LineOptimizer handles invalid and zero seed normals with deterministic tangent")
+{
+    MissingNormalSampler missingSampler;
+    vc::lasagna::LineOptimizer missingOptimizer(missingSampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 7.0;
+    config.maxIterations = 0;
+
+    const auto missingResult = missingOptimizer.optimizeFromSeed({10.0, 20.0, 30.0}, config);
+    REQUIRE(missingResult.line.points.size() == 3);
+    CHECK(missingResult.line.points.front().position[0] == doctest::Approx(3.0));
+    CHECK(missingResult.line.points.back().position[0] == doctest::Approx(17.0));
+    CHECK(missingResult.report.invalidNormalSamples == 2 * 5);
+
+    ConstantNormalSampler zeroSampler({0.0, 0.0, 0.0});
+    vc::lasagna::LineOptimizer zeroOptimizer(zeroSampler);
+    const auto zeroResult = zeroOptimizer.optimizeFromSeed({10.0, 20.0, 30.0}, config);
+    REQUIRE(zeroResult.line.points.size() == 3);
+    CHECK(zeroResult.line.points.front().position[0] == doctest::Approx(3.0));
+    CHECK(zeroResult.line.points.back().position[0] == doctest::Approx(17.0));
+    CHECK(zeroResult.report.invalidNormalSamples == 2 * 5);
+}
+
+TEST_CASE("LineOptimizer supports zero iterations and single-seed optimizeFromSeeds")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 25.0;
+    config.maxIterations = 0;
+
+    const auto result = optimizer.optimizeFromSeeds({{100.0, 200.0, 300.0}}, config);
+
+    REQUIRE(result.line.points.size() == 3);
+    CHECK(result.line.points[1].position[0] == doctest::Approx(100.0));
+    CHECK(result.line.points[1].position[1] == doctest::Approx(200.0));
+    CHECK(result.line.points[1].position[2] == doctest::Approx(300.0));
+    CHECK(result.report.validNormalSamples == 2 * 5);
+    CHECK(result.report.invalidNormalSamples == 0);
+}

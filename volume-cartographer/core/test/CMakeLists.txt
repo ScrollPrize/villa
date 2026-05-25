@@ -61,6 +61,7 @@ function(vc_add_test)
         target_compile_definitions(${T_NAME} PRIVATE ${T_DEFS})
     endif()
     add_test(NAME ${T_NAME} COMMAND ${T_NAME})
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS ${T_NAME})
 endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
@@ -85,13 +86,47 @@ vc_add_test(NAME test_line_annotation_context_menu
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
+qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
+vc_add_test(NAME test_lasagna_batch_window
+    SOURCES test_lasagna_batch_window.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.cpp
+            test_lasagna_service_manager_stub.cpp
+            ${lasagna_batch_window_moc}
+            ${lasagna_service_manager_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+qt6_wrap_cpp(segmentation_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.hpp)
+qt6_wrap_cpp(collapsible_settings_group_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.hpp)
+qt6_wrap_cpp(cstate_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(vccollection_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+vc_add_test(NAME test_segmentation_lasagna_panel_ui
+    SOURCES test_segmentation_lasagna_panel_ui.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.cpp
+            test_lasagna_service_manager_stub.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            ${segmentation_lasagna_panel_moc}
+            ${lasagna_batch_window_moc}
+            ${lasagna_service_manager_moc}
+            ${collapsible_settings_group_moc}
+            ${cstate_lasagna_panel_moc}
+            ${vccollection_lasagna_panel_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
+            ${line_annotation_cstate_moc}
     LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
@@ -134,6 +169,7 @@ add_executable(test_merge_e2e_small test_merge_e2e_small.cpp)
 target_link_libraries(test_merge_e2e_small PRIVATE doctest::doctest vc_core nlohmann_json::nlohmann_json)
 if(VC_RUN_E2E)
     add_test(NAME test_merge_e2e_small COMMAND test_merge_e2e_small)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_merge_e2e_small)
     # The binary path probe in the test prefers VC_MERGE_TIFXYZ_BIN, so
     # CTest runs reliably regardless of the working directory.
     set_tests_properties(test_merge_e2e_small PROPERTIES
@@ -147,6 +183,7 @@ target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 # it's always built and runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_volume_sample)
 endif()
 
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
@@ -157,6 +194,7 @@ target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_co
 # built and runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_chunked_plane_sampler COMMAND bench_chunked_plane_sampler)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_chunked_plane_sampler)
 endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary

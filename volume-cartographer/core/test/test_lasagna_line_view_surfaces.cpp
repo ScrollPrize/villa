@@ -6,6 +6,7 @@
 #include "vc/lasagna/LineViewBuilder.hpp"
 
 #include <cmath>
+#include <stdexcept>
 
 namespace {
 
@@ -116,4 +117,86 @@ TEST_CASE("LineViewBuilder uses finite deterministic fallback frames")
         }
     }
     checkVec(points(2, 1), {10.0, 0.0, 0.0});
+}
+
+TEST_CASE("LineViewBuilder rejects empty models and invalid cross-sample counts")
+{
+    vc::lasagna::LineModel empty;
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(empty), std::invalid_argument);
+
+    vc::lasagna::LineViewConfig config;
+    config.crossSamples = 1;
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(simpleLine(), config), std::invalid_argument);
+}
+
+TEST_CASE("LineViewBuilder falls back to control points when segment samples are absent")
+{
+    auto line = simpleLine();
+    line.segmentSamples.clear();
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line);
+    REQUIRE(views.lineSurface);
+    const auto points = views.lineSurface->rawPoints();
+
+    REQUIRE(points.rows == 3);
+    REQUIRE(points.cols == 3);
+    checkVec(points(0, 1), {0.0, 0.0, 0.0});
+    checkVec(points(1, 1), {10.0, 0.0, 0.0});
+    checkVec(points(2, 1), {20.0, 0.0, 0.0});
+}
+
+TEST_CASE("LineViewBuilder deduplicates shared segment-boundary samples")
+{
+    auto line = simpleLine();
+    line.segmentSamples[0].samples.push_back({1.0, {10.0, 0.0, 0.0}, normal({0.0, 0.0, 1.0})});
+    line.segmentSamples[1].samples.insert(
+        line.segmentSamples[1].samples.begin(),
+        {0.0, {10.0, 0.0, 0.0}, normal({0.0, 0.0, 1.0})});
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line);
+    const auto points = views.lineSurface->rawPoints();
+
+    REQUIRE(points.rows == 5);
+    checkVec(points(2, 1), {10.0, 0.0, 0.0});
+}
+
+TEST_CASE("LineViewBuilder falls back when all normals or tangents are degenerate")
+{
+    auto invalidNormalLine = simpleLine({0.0, 0.0, 0.0});
+    for (auto& point : invalidNormalLine.points) {
+        point.sampledNormal = normal({0.0, 0.0, 0.0}, false);
+    }
+    for (auto& segment : invalidNormalLine.segmentSamples) {
+        for (auto& sample : segment.samples) {
+            sample.sampledNormal = normal({0.0, 0.0, 0.0}, false);
+        }
+    }
+
+    vc::lasagna::LineViewConfig config;
+    config.surfaceHalfWidth = 4.0;
+    config.sideSliceHalfDepth = 6.0;
+    auto views = vc::lasagna::buildLineViewSurfaces(invalidNormalLine, config);
+    auto surfacePoints = views.lineSurface->rawPoints();
+    auto sideSlicePoints = views.lineSideSlice->rawPoints();
+
+    for (int row = 0; row < surfacePoints.rows; ++row) {
+        for (int col = 0; col < surfacePoints.cols; ++col) {
+            CHECK(finitePoint(surfacePoints(row, col)));
+            CHECK(finitePoint(sideSlicePoints(row, col)));
+        }
+    }
+
+    auto degenerateTangentLine = simpleLine();
+    for (auto& segment : degenerateTangentLine.segmentSamples) {
+        for (auto& sample : segment.samples) {
+            sample.position = {5.0, 5.0, 5.0};
+        }
+    }
+    views = vc::lasagna::buildLineViewSurfaces(degenerateTangentLine, config);
+    surfacePoints = views.lineSurface->rawPoints();
+    REQUIRE(surfacePoints.rows == 1);
+    REQUIRE(surfacePoints.cols == 3);
+    CHECK(finitePoint(surfacePoints(0, 0)));
+    CHECK(finitePoint(surfacePoints(0, 1)));
+    CHECK(finitePoint(surfacePoints(0, 2)));
 }

@@ -416,4 +416,22 @@ if(VC_TESTING)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         USES_TERMINAL)
+
+    if(VC_ENABLE_COVERAGE)
+        find_program(LLVM_PROFDATA NAMES llvm-profdata REQUIRED)
+        find_program(LLVM_COV NAMES llvm-cov REQUIRED)
+        get_property(_vc_test_targets GLOBAL PROPERTY VC_TEST_TARGETS)
+        string(REPLACE ";" "," _vc_test_targets_csv "${_vc_test_targets}")
+        add_custom_target(coverage-report
+            COMMAND ${CMAKE_COMMAND}
+                    -D "BUILD_DIR=${CMAKE_BINARY_DIR}"
+                    -D "CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+                    -D "LLVM_PROFDATA=${LLVM_PROFDATA}"
+                    -D "LLVM_COV=${LLVM_COV}"
+                    -D "TEST_TARGETS=${_vc_test_targets_csv}"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_coverage_report.cmake"
+            DEPENDS ${_vc_test_targets}
+            USES_TERMINAL
+            COMMENT "Running clang source-based coverage")
+    endif()
 endif()
