@@ -53,13 +53,13 @@ After their discovery in the 1750s, some were opened physically, mostly destroyi
 A few hundred scrolls were excavated that were never opened, and remain rolled up with their contents sealed away.
 Our community is building methods to read these scrolls using micro-CT and an algorithmic pipeline using machine learning and computer vision.
 
-We've awarded over \$1,000,000 in prizes and broken through, revealing complete passages of Greek philosophy from the inside of a closed Herculaneum scroll for the first time.
-Now we are continuing - we want to go from reading 5% of one scroll to reading multiple complete scrolls.
+We've awarded over \$1,780,000 in prizes and broken through, revealing complete passages of Greek philosophy from the inside of a closed Herculaneum scroll for the first time.
+Now we are continuing - we want to scale from isolated readable passages to reliable virtual unwrapping and ink detection across multiple complete scrolls.
 Join us to win prizes and be a part of history!
 
 ### What dates do I need to know?
 
-The [2024 prize](2024_prizes) deadlines closed on **December 31, 2024**, and we are now evaluating the submissions and preparing the next stages. [Join the community](get_started#1-join-the-community) to stay tuned!
+The [2024 prize](2024_prizes) deadlines closed on **December 31, 2024**. Current opportunities and monthly progress-prize deadlines are maintained on the [Open Prizes](prizes) page. [Join the community](get_started#1-join-the-community) to stay tuned!
 
 ### What's the historical background of Herculaneum and the scrolls?
 

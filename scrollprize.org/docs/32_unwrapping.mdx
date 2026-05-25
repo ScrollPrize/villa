@@ -60,7 +60,7 @@ The open question that has been puzzling our community for more than one year, a
 
 > **Can we find an automated way to isolate the 2-manifold that represents the rolled scroll in the 3D images?**
 
-We were awarding \$100k to anyone that could solve this problem by the end of 2024. The prize was left unclaimed.
+We offered a 2024 prize for solving this problem. It was left unclaimed, and the work now continues through [Progress Prizes](prizes#progress-prizes), including VC3D and virtual-unwrapping improvements from the public wishlist.
 
 However, both the community and the team worked on three approaches that are currently the state-of-the-art in virtual unwrapping attempts:
 - Spiral Fitting
@@ -80,7 +80,7 @@ On a **very high level**, all three methods apply two major steps:
 
 **Bottom-up approaches** solve a local optimization problem, building small patches that are then stitched together coherently.
 
-All approaches rely also on the information about the scroll umbilicus. Unfortunately, no method currently manages to fit the intended surface to the data!
+All approaches rely also on the information about the scroll umbilicus. By early 2026, semi-automated VC3D workflows could extract substantial scroll surfaces much faster than fully manual tracing, but sheet switches and compressed regions remain major blockers to fully automated unwrapping.
 
 Let us delve into the details of how the current state-of-the-art methods work.
 
@@ -244,7 +244,7 @@ The optimization looks for the assignment with the least number of wrongly estim
 #### 2023 Ink Detection Grand Prize - Additional Material
 An early version of Thaumato Anakalyptor, developed by Julian Schilliger, was included as additional material in the submission that won the 2023 Ink Detection Grand Prize.
 
-This is a recent (as of Juanuary 2025) virtual unwrapping attempt with Thaumato Anakalyptor on Scroll 5 (PHerc 172).
+This is a January 2025 virtual unwrapping attempt with Thaumato Anakalyptor on Scroll 5 (PHerc 172). For newer progress on PHerc 172, see the January 2026 update: [~70% of PHerc. 172 is now digitally unwrapped](https://scrollprize.substack.com/p/70-of-pherc-172-is-now-digitally).
 
 <div className="mb-4">
   <a href="/img/virtual-unwrapping/thaumato-s5jan.jpg" target="_blank" rel="noopener noreferrer">
@@ -262,7 +262,7 @@ All three methods—**Spiral Fitting**, **Surface Tracer**, and **Thaumato Anaka
 - **Surface Tracer** **locally** expands a mesh from patches, carefully balancing data fidelity and smoothness.
 - **Thaumato Anakalyptor** focuses on a **point-cloud** extraction and **local** segmentation strategy, which it then stitches into a global mesh.
 
-Despite these advances, the problem is still unsolved. No method so far manages to perfectly fit the wanted surface to the data.
+Despite these advances, the problem is still unsolved. Current methods can unwrap large regions, but no method so far reliably fits the wanted surface throughout a damaged scroll without human correction.
 The most common error is **sheet switching**, i.e. when the fitted surface jumps a winding, resulting in a distorted, non realistic shape.
 We need your help to virtually unwrap the Herculaneum scrolls.
 

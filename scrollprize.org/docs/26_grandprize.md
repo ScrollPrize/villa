@@ -414,7 +414,7 @@ In Stage 1 of Vesuvius Challenge, we answered all of these questions, extracting
 
 In 2023 we got from 0% to 5% of a scroll. In 2024 our goal is to go from 5% of one scroll, to 90% of all four scrolls we have scanned, and to lay the foundation to read all 300  scrolls.
 
-The primary goal for 2024 is to read 90% of the scrolls, and **we will issue the 2024 Grand Prize to the first team that is able to do this**. More details on the exact grand prize judging criteria will be available in March.
+The primary goal for 2024 was to read 90% of the scrolls. The 2024 prize year has since closed; current opportunities are maintained on the [Open Prizes](prizes) page.
 
 The bottleneck to achieve this milestone is the process of tracing the surface of the papyrus inside the scroll. Today this is extremely manual. It cost us more than \$100 per square centimeter in manual labor to produce the text we can read today. At this price, it would cost hundreds of millions or maybe even billions of dollars to segment all of the scrolls. While improvements to our segmentation tools have increased our efficiency, it is still far too manual and expensive. What we need is automation.
 

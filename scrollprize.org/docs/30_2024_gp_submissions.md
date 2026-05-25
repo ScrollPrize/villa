@@ -1,5 +1,5 @@
 ---
-title: "2024 Grand Prize Submission Instructions"
+title: "2024 Grand Prize Submission Instructions (closed)"
 hide_table_of_contents: true
 slug: "2024_gp_submissions"
 ---
@@ -40,7 +40,9 @@ slug: "2024_gp_submissions"
 
 ### Submitting your result
 
-<div>If you have a qualifying result, submit it for consideration by sending an email to <a href="mailto:grandprize@scrollprize.org">grandprize@scrollprize.org</a> and provide the following:</div>
+The 2024 Grand Prize submission deadline has passed. These instructions are preserved for reference; for current opportunities, see the [Open Prizes](prizes) page.
+
+<div>Original submissions were sent to the Grand Prize review team with the following materials:</div>
 
 * **Images.** Submissions must be in the form of images of the virtually unwrapped papyrus, showing visible and legible text.
     * Submit a single static image for each scroll. If necessary, the image can be tiled to reasonable dimensions. Images must be generated programmatically, as direct outputs of CT data inputs, and should not contain manual annotations of characters or text.

@@ -330,15 +330,15 @@ const prizes = [
   //   href: "/winners",
   // },
   {
-    title: "Unwrapping at Scale Prize",
-    prizeMoney: "$200,000",
-    description: "Automate virtual unwrapping",
+    title: "VC3D / Unwrapping Contributions",
+    prizeMoney: "$1,000-$20,000",
+    description: "Improve virtual unwrapping and segmentation tools",
     requirement: "",
-    href: "prizes#unwrapping-at-scale-prize",
+    href: "prizes#progress-prizes",
   },
   {
     title: "First Letters / First Title Prizes",
-    prizeMoney: "7 x $60,000",
+    prizeMoney: "Up to $60,000",
     description:
       "Find the first letters or the title of a scroll",
     requirement: "",
@@ -1673,7 +1673,7 @@ export function Landing() {
                     <a href="/grandprize">reading</a>&nbsp;
                   </span>
                   <span className="opacity-80 md:opacity-60">
-                    the carbonized Herculaneum scrolls & has awarded $1,700,000 in prizes.
+                    the carbonized Herculaneum scrolls & has awarded $1,781,500 in prizes.
                   </span>
                   <br />
                   <br />
@@ -1760,10 +1760,11 @@ export function Landing() {
                       imagePosition="right"
                     >
                       <p className="">
-                        We've so far recovered text from just two of our five
-                        scrolls. Is the ink fundamentally different in others?
-                        Is the papyrus surface? We're not yet sure. We are
-                        certain though that if it ever existed, it can be
+                        We've recovered text or ink evidence in multiple
+                        scrolls, but robust cross-scroll ink detection remains
+                        unsolved. Is the ink fundamentally different in some
+                        scrolls? Is the papyrus surface? We're not yet sure. We
+                        are certain though that if it ever existed, it can be
                         detected.
                       </p>
                       <p className="pt-16">
@@ -1794,7 +1795,7 @@ export function Landing() {
                   />
                   <BuildingBlock
                     title="Generalizable Ink Detection"
-                    description="Ink has been found in two scrolls, but remains elusive in our other scrolls."
+                    description="Ink has been found in multiple scrolls, but generalizable ink detection remains unsolved."
                     showDividerMobile={false}
                     showDividerDesktop={true}
                   />

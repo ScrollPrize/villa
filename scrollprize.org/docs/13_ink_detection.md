@@ -1,5 +1,5 @@
 ---
-title: "$100,000 Ink Detection (June 14th)"
+title: "$100,000 Ink Detection Prize (closed)"
 hide_table_of_contents: true
 ---
 
@@ -44,4 +44,4 @@ As you will learn in the [tutorials](/tutorial), one of the big challenges of re
   </video>
 </figure>
 
-For this important subproblem, we are offering a \$100,000 [Ink Detection Progress Prize](https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/). This progress prize is hosted on Kaggle, and the final submission deadline is June 14th, 2023.
+This important subproblem was the focus of the 2023 \$100,000 [Ink Detection Progress Prize](https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection/) on Kaggle, which closed on June 14th, 2023. For current opportunities, see the [Open Prizes](prizes) page.

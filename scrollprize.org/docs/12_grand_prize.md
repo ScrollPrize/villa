@@ -1,5 +1,5 @@
 ---
-title: "$700k/$100k/$50k Grand Prize (Dec 31)"
+title: "$700k/$100k/$50k Grand Prize (closed)"
 hide_table_of_contents: true
 ---
 
@@ -37,7 +37,7 @@ hide_table_of_contents: true
 </head>
 
 
-The \$700,000 Grand Prize will go to the first team to read four passages of text from the inside of the two intact scrolls. We also have prizes for second place (\$100,000) and third place (\$50,000). More details on the qualifying criteria are available [here](#qualifying-criteria).
+The 2023 Grand Prize closed on December 31st, 2023, and [the prize was awarded](grandprize). This page preserves the original prize criteria for reference. For current opportunities, see the [Open Prizes](prizes) page.
 
 Here are the scrolls in question:
 
@@ -73,7 +73,7 @@ As you will read in the [tutorials](/tutorial), advanced tools and techniques ex
 
 Based on the [landmark results](https://arxiv.org/abs/2304.02084) that Dr. Seales and his team have recently produced, we believe that it is possible to read the Herculaneum scrolls using the [scans](/data) that we already have and the tools and techniques that they have developed. And that is Vesuvius Challenge!
 
-The Grand Prize deadline is 11:59pm Pacific, December 31st, 2023.
+The Grand Prize deadline was 11:59pm Pacific, December 31st, 2023.
 
 ### Qualifying criteria
 
@@ -99,7 +99,7 @@ We will work with the Grand Prize winners to verify their results, put them in a
 
 ### Submitting your result
 
-<div>If you have a qualifying result, submit it for consideration by sending an email to <a href="mailto:grandprize@scrollprize.org">grandprize@scrollprize.org</a> and provide the following:</div>
+<div>Original submissions were sent to the Grand Prize review team with the following materials:</div>
 
 * **Images.** Submissions must be in the form of images of the virtually unwrapped papyrus, showing visible and legible text.
     * Submit a single static image for each text region. Images must be generated programmatically, as direct outputs of CT data inputs, and should not contain manual annotations of characters or text.

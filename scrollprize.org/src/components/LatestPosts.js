@@ -8,19 +8,19 @@ import TopCard from "./TopCard";
 // Fallback posts in case RSS fetch fails
 const FALLBACK_POSTS = [
   {
-    title: "$60,000 First Title Prize Awarded",
-    href: "https://scrollprize.substack.com/p/60000-first-title-prize-awarded",
-    subtext: "May 5"
+    title: "We are cooking",
+    href: "https://scrollprize.substack.com/p/we-are-cooking",
+    subtext: "March 19"
   },
   {
-    title: "February Prizes and Updates",
-    href: "https://scrollprize.substack.com/p/february-progress-prizes-and-updates",
-    subtext: "March 12"
+    title: "~70% of PHerc. 172 is now digitally unwrapped",
+    href: "https://scrollprize.substack.com/p/70-of-pherc-172-is-now-digitally",
+    subtext: "January 13"
   },
   {
-    title: "New Prizes and Progress Update",
-    href: "https://scrollprize.substack.com/p/new-prizes-and-an-update-on-progress",
-    subtext: "February 27"
+    title: "Finally—letters in Scroll 4!",
+    href: "https://scrollprize.substack.com/p/finallyletters-in-scroll-4",
+    subtext: "December 21"
   }
 ];
 
@@ -67,7 +67,7 @@ const LatestPosts = () => {
       <TopCard
         title="Get Started"
         href="/get_started"
-        subtext="$1.5M+ already awarded"
+        subtext="$1.78M+ already awarded"
         useArrow={true}
       />
       {posts.map((post, index) => (
