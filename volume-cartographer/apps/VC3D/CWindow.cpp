@@ -26,6 +26,7 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
+#include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QPointF>
@@ -909,14 +910,183 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                     &CVolumeViewerView::sendAnnotationContextMenuRequested,
                     this,
                     [this, viewer](QPointF scenePoint, QPoint globalPos, Qt::KeyboardModifiers) {
-                        if (!_lineAnnotationController) {
-                            return;
-                        }
                         QMenu menu(this);
                         QAction* action = menu.addAction(tr("New line annotation"));
-                        action->setEnabled(_lineAnnotationController->canLaunchFromViewer(viewer));
+                        action->setEnabled(_lineAnnotationController &&
+                                           _lineAnnotationController->canLaunchFromViewer(viewer));
+
+                        const cv::Vec3f volumePoint = viewer->sceneToVolume(scenePoint);
+                        const bool validVolumePoint =
+                            std::isfinite(volumePoint[0]) &&
+                            std::isfinite(volumePoint[1]) &&
+                            std::isfinite(volumePoint[2]);
+                        const int seedX = validVolumePoint
+                            ? static_cast<int>(std::lround(volumePoint[0]))
+                            : 0;
+                        const int seedY = validVolumePoint
+                            ? static_cast<int>(std::lround(volumePoint[1]))
+                            : 0;
+                        const int seedZ = validVolumePoint
+                            ? static_cast<int>(std::lround(volumePoint[2]))
+                            : 0;
+
+                        auto* lasagnaPanel = _segmentationWidget
+                            ? _segmentationWidget->lasagnaPanel()
+                            : nullptr;
+                        auto* coordMenu = menu.addMenu(
+                            validVolumePoint
+                                ? tr("(%1, %2, %3)").arg(seedX).arg(seedY).arg(seedZ)
+                                : tr("(?, ?, ?)"));
+                        coordMenu->setEnabled(validVolumePoint && lasagnaPanel);
+
+                        bool activeSegmentHasLasagnaModel = false;
+                        if (_state && _state->vpkg()) {
+                            auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
+                                _state->surface("segmentation"));
+                            if (activeSurface && !activeSurface->path.empty()) {
+                                std::filesystem::path segPath = activeSurface->path;
+                                if (segPath.is_relative()) {
+                                    std::filesystem::path outputSegmentsPath =
+                                        _state->vpkg()->outputSegmentsPath();
+                                    if (outputSegmentsPath.empty()) {
+                                        outputSegmentsPath = _state->vpkg()->findSegmentPathByName(
+                                            _state->vpkg()->getSegmentationDirectory());
+                                    }
+                                    if (outputSegmentsPath.empty()) {
+                                        outputSegmentsPath =
+                                            std::filesystem::path(_state->vpkg()->getVolpkgDirectory()) /
+                                            "paths";
+                                    }
+                                    segPath = outputSegmentsPath / segPath.filename();
+                                }
+                                std::error_code ec;
+                                activeSegmentHasLasagnaModel =
+                                    std::filesystem::exists(segPath / "model.pt", ec);
+                            }
+                        }
+
+                        auto addLasagnaLaunchAction =
+                            [this, lasagnaPanel, coordMenu, seedX, seedY, seedZ,
+                             activeSegmentHasLasagnaModel](
+                                const QString& verb,
+                                SegmentationLasagnaPanel::LasagnaMode mode,
+                                bool requiresLasagnaModel) {
+                                const QString configPath = lasagnaPanel
+                                    ? lasagnaPanel->selectedLasagnaConfigPathForMode(mode)
+                                    : QString();
+                                const QString configName = QFileInfo(configPath).fileName();
+                                QAction* launchAction = coordMenu->addAction(
+                                    configName.isEmpty()
+                                        ? tr("%1 l3d").arg(verb)
+                                        : tr("%1 l3d (%2)").arg(verb, configName));
+                                launchAction->setEnabled(
+                                    !configPath.isEmpty() &&
+                                    (!requiresLasagnaModel || activeSegmentHasLasagnaModel));
+                                launchAction->setToolTip(configPath);
+                                connect(launchAction, &QAction::triggered, this,
+                                        [this, lasagnaPanel, mode, configPath, seedX, seedY, seedZ]() {
+                                            if (!lasagnaPanel) {
+                                                return;
+                                            }
+                                            lasagnaPanel->startOptimizationAtSeed(
+                                                _state,
+                                                statusBar(),
+                                                mode,
+                                                configPath,
+                                                seedX,
+                                                seedY,
+                                                seedZ);
+                                        });
+                            };
+
+                        addLasagnaLaunchAction(
+                            tr("new"), SegmentationLasagnaPanel::LasagnaMode::NewModel, false);
+                        addLasagnaLaunchAction(
+                            tr("reopt"), SegmentationLasagnaPanel::LasagnaMode::ReOptimize, true);
+
+                        auto* chooseMenu = coordMenu->addMenu(tr("choose"));
+                        if (!lasagnaPanel) {
+                            chooseMenu->setEnabled(false);
+                        } else {
+                            QAction* loading = chooseMenu->addAction(tr("Loading..."));
+                            loading->setEnabled(false);
+
+                            const QString selectedNewConfig =
+                                lasagnaPanel->selectedLasagnaConfigPathForMode(
+                                    SegmentationLasagnaPanel::LasagnaMode::NewModel);
+                            const QString selectedReoptConfig =
+                                lasagnaPanel->selectedLasagnaConfigPathForMode(
+                                    SegmentationLasagnaPanel::LasagnaMode::ReOptimize);
+                            auto* watcher = new QFutureWatcher<QStringList>(this);
+                            QPointer<QMenu> chooseMenuPtr(chooseMenu);
+                            QPointer<SegmentationLasagnaPanel> panelPtr(lasagnaPanel);
+                            connect(watcher, &QFutureWatcher<QStringList>::finished, this,
+                                    [this, watcher, chooseMenuPtr, panelPtr, seedX, seedY, seedZ]() {
+                                        const QStringList configs = watcher->result();
+                                        watcher->deleteLater();
+                                        if (!chooseMenuPtr) {
+                                            return;
+                                        }
+                                        chooseMenuPtr->clear();
+                                        if (configs.isEmpty()) {
+                                            QAction* none =
+                                                chooseMenuPtr->addAction(tr("No config selected"));
+                                            none->setEnabled(false);
+                                            return;
+                                        }
+                                        for (const QString& configPath : configs) {
+                                            QAction* configAction = chooseMenuPtr->addAction(
+                                                QFileInfo(configPath).fileName());
+                                            configAction->setToolTip(configPath);
+                                            connect(configAction, &QAction::triggered, this,
+                                                    [this, panelPtr, configPath, seedX, seedY, seedZ]() {
+                                                        if (!panelPtr) {
+                                                            return;
+                                                        }
+                                                        panelPtr->startOptimizationAtSeed(
+                                                            _state,
+                                                            statusBar(),
+                                                            SegmentationLasagnaPanel::LasagnaMode::NewModel,
+                                                            configPath,
+                                                            seedX,
+                                                            seedY,
+                                                            seedZ);
+                                                    });
+                                        }
+                                    });
+                            watcher->setFuture(QtConcurrent::run([selectedNewConfig, selectedReoptConfig]() {
+                                QStringList configs;
+                                auto addConfig = [&configs](const QString& path) {
+                                    if (!path.isEmpty() && !configs.contains(path)) {
+                                        configs.append(path);
+                                    }
+                                };
+                                auto scanConfigDir = [&configs, addConfig](const QString& selectedConfig) {
+                                    if (selectedConfig.isEmpty()) {
+                                        return;
+                                    }
+                                    QFileInfo selectedInfo(selectedConfig);
+                                    const QString dirPath = selectedInfo.absolutePath();
+                                    if (!dirPath.isEmpty()) {
+                                        QDir dir(dirPath);
+                                        const QStringList jsonFiles = dir.entryList(
+                                            QStringList{QStringLiteral("*.json")},
+                                            QDir::Files,
+                                            QDir::Name);
+                                        for (const QString& fileName : jsonFiles) {
+                                            addConfig(dir.absoluteFilePath(fileName));
+                                        }
+                                    }
+                                    addConfig(selectedConfig);
+                                };
+                                scanConfigDir(selectedNewConfig);
+                                scanConfigDir(selectedReoptConfig);
+                                return configs;
+                            }));
+                        }
+
                         QAction* selected = menu.exec(globalPos);
-                        if (selected == action && action->isEnabled()) {
+                        if (selected == action && action->isEnabled() && _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewer(viewer, scenePoint);
                         }
                     });

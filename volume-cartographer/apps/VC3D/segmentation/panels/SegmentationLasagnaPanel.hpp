@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QSet>
+#include <QStringList>
 #include <QWidget>
 
 #include "utils/Json.hpp"
@@ -61,6 +62,15 @@ public:
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
     void startOptimization(CState* state, QStatusBar* statusBar);
+    void startOptimizationAtSeed(CState* state,
+                                 QStatusBar* statusBar,
+                                 LasagnaMode mode,
+                                 const QString& configPath,
+                                 int seedX,
+                                 int seedY,
+                                 int seedZ);
+    [[nodiscard]] QString selectedLasagnaConfigPathForMode(LasagnaMode mode) const;
+    [[nodiscard]] QStringList lasagnaConfigPathsForMode(LasagnaMode mode) const;
 
 public slots:
     void setSeedFromFocus(int x, int y, int z);
@@ -81,6 +91,14 @@ private:
     void onDiscoveredServiceSelected(int index);
     void updateConnectionWidgets();
     void triggerOptimization();
+    void startOptimizationWithOverrides(CState* state,
+                                        QStatusBar* statusBar,
+                                        int modeOverride,
+                                        const QString& configPathOverride,
+                                        bool hasSeedOverride,
+                                        int seedX,
+                                        int seedY,
+                                        int seedZ);
 
     // -- Sections --
     CollapsibleSettingsGroup* _connectionGroup{nullptr};

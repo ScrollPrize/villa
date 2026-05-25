@@ -818,6 +818,100 @@ void SegmentationLasagnaPanel::triggerOptimization()
 
 void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* statusBar)
 {
+    startOptimizationWithOverrides(state, statusBar, -1, QString(), false, 0, 0, 0);
+}
+
+void SegmentationLasagnaPanel::startOptimizationAtSeed(CState* state,
+                                                       QStatusBar* statusBar,
+                                                       LasagnaMode mode,
+                                                       const QString& configPath,
+                                                       int seedX,
+                                                       int seedY,
+                                                       int seedZ)
+{
+    auto showStatus = [statusBar](const QString& msg, int timeout) {
+        if (statusBar) {
+            statusBar->showMessage(msg, timeout);
+        }
+    };
+
+    if (configPath.isEmpty()) {
+        showStatus(tr("No Lasagna config file selected."), 5000);
+        return;
+    }
+    if (!QFileInfo::exists(configPath)) {
+        showStatus(tr("Config file not found: %1").arg(configPath), 7000);
+        return;
+    }
+
+    if (_connectionMode == 1) {
+        auto& mgr = LasagnaServiceManager::instance();
+        if (!mgr.isExternal() || !mgr.isRunning()) {
+            mgr.connectToExternal(_externalHost, _externalPort);
+            auto* conn = new QMetaObject::Connection;
+            auto* errConn = new QMetaObject::Connection;
+            *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
+                [this, conn, errConn, state, statusBar, mode, configPath, seedX, seedY, seedZ]() {
+                    QObject::disconnect(*conn);
+                    QObject::disconnect(*errConn);
+                    delete conn;
+                    delete errConn;
+                    startOptimizationWithOverrides(
+                        state, statusBar, static_cast<int>(mode), configPath, true, seedX, seedY, seedZ);
+                });
+            *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
+                [conn, errConn](const QString&) {
+                    QObject::disconnect(*conn);
+                    QObject::disconnect(*errConn);
+                    delete conn;
+                    delete errConn;
+                });
+            return;
+        }
+    }
+
+    startOptimizationWithOverrides(
+        state, statusBar, static_cast<int>(mode), configPath, true, seedX, seedY, seedZ);
+}
+
+QString SegmentationLasagnaPanel::selectedLasagnaConfigPathForMode(LasagnaMode mode) const
+{
+    return (mode == LasagnaMode::NewModel) ? _newModelConfigFilePath
+         : (mode == LasagnaMode::Offset) ? _offsetConfigFilePath
+         : _reoptConfigFilePath;
+}
+
+QStringList SegmentationLasagnaPanel::lasagnaConfigPathsForMode(LasagnaMode mode) const
+{
+    const QComboBox* combo = (mode == LasagnaMode::NewModel) ? _newModelConfigCombo
+                          : (mode == LasagnaMode::Offset) ? _offsetConfigCombo
+                          : _reoptConfigCombo;
+    const QString currentPath = selectedLasagnaConfigPathForMode(mode);
+    QStringList paths;
+    auto addPath = [&paths](const QString& path) {
+        if (!path.isEmpty() && QFileInfo::exists(path) && !paths.contains(path)) {
+            paths.append(path);
+        }
+    };
+
+    if (combo) {
+        for (int i = 0; i < combo->count(); ++i) {
+            addPath(combo->itemData(i).toString());
+        }
+    }
+    addPath(currentPath);
+    return paths;
+}
+
+void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
+                                                              QStatusBar* statusBar,
+                                                              int modeOverride,
+                                                              const QString& configPathOverride,
+                                                              bool hasSeedOverride,
+                                                              int seedX,
+                                                              int seedY,
+                                                              int seedZ)
+{
     auto showStatus = [statusBar](const QString& msg, int timeout) {
         if (statusBar) {
             statusBar->showMessage(msg, timeout);
@@ -825,7 +919,28 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     };
 
     auto& mgr = LasagnaServiceManager::instance();
-    const bool isNewModel = (lasagnaMode() == LasagnaMode::NewModel);
+    const LasagnaMode launchMode = modeOverride >= 0
+        ? static_cast<LasagnaMode>(modeOverride)
+        : lasagnaMode();
+    const QString configPath = !configPathOverride.isEmpty()
+        ? configPathOverride
+        : (launchMode == LasagnaMode::NewModel) ? _newModelConfigFilePath
+        : (launchMode == LasagnaMode::Offset) ? _offsetConfigFilePath
+        : _reoptConfigFilePath;
+    const bool isNewModel = (launchMode == LasagnaMode::NewModel);
+
+    if (configPath.isEmpty()) {
+        auto msg = tr("No Lasagna config file selected.");
+        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+        showStatus(msg, 5000);
+        return;
+    }
+    if (!QFileInfo::exists(configPath)) {
+        auto msg = tr("Config file not found: %1").arg(configPath);
+        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+        showStatus(msg, 7000);
+        return;
+    }
 
     if (mgr.isExternal()) {
         if (!mgr.isRunning()) {
@@ -871,7 +986,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
         }
     }
 
-    const bool isOffsetMode = (lasagnaMode() == LasagnaMode::Offset);
+    const bool isOffsetMode = (launchMode == LasagnaMode::Offset);
 
     QString modelPath;
     if (!segPath.empty()) {
@@ -987,7 +1102,17 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     }
 
     QJsonObject config;
-    QString configText = lasagnaConfigText().trimmed();
+    QString configText;
+    {
+        QFile f(configPath);
+        if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            auto msg = tr("Cannot read Lasagna config: %1").arg(configPath);
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 7000);
+            return;
+        }
+        configText = QString::fromUtf8(f.readAll()).trimmed();
+    }
     if (!configText.isEmpty()) {
         QJsonParseError parseError;
         QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8(), &parseError);
@@ -1015,9 +1140,14 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     int cx = 0;
     int cy = 0;
     int cz = 0;
-    QString seedText = seedPointText();
-    bool seedOk = false;
-    if (!seedText.isEmpty()) {
+    bool seedOk = hasSeedOverride;
+    if (hasSeedOverride) {
+        cx = seedX;
+        cy = seedY;
+        cz = seedZ;
+    }
+    QString seedText = seedOk ? QString() : seedPointText();
+    if (!seedOk && !seedText.isEmpty()) {
         QStringList parts = seedText.split(',');
         if (parts.size() == 3) {
             bool ok0 = false;
@@ -1133,10 +1263,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     request[QStringLiteral("data_input")] = dataInput;
     request[QStringLiteral("single_segment")] = true;
     request[QStringLiteral("copy_model")] = true;
-    request[QStringLiteral("config_name")] = QFileInfo(
-        (lasagnaMode() == LasagnaMode::NewModel) ? _newModelConfigFilePath
-        : (lasagnaMode() == LasagnaMode::Offset) ? _offsetConfigFilePath
-        : _reoptConfigFilePath).fileName();
+    request[QStringLiteral("config_name")] = QFileInfo(configPath).fileName();
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
     }
@@ -1218,7 +1345,7 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     }
 
     std::cerr << "[lasagna] request prep:"
-              << " mode=" << lasagnaModeDebugName(_lasagnaMode).toStdString()
+              << " mode=" << lasagnaModeDebugName(static_cast<int>(launchMode)).toStdString()
               << " elapsed=" << (static_cast<double>(prepTimer.elapsed()) / 1000.0) << "s"
               << " tifxyz_files=" << tifxyzFileCount
               << " tifxyz_raw=" << bytesToMiB(rawTifxyzBytes) << " MiB"
