@@ -22,7 +22,7 @@ class BasicTransform(abc.ABC):
             data_dict['image'] = self._apply_to_image(data_dict['image'], **params)
 
         if data_dict.get('regression_target') is not None:
-            data_dict['regression_target'] = self._apply_to_segmentation(data_dict['regression_target'], **params)
+            data_dict['regression_target'] = self._apply_to_regr_target(data_dict['regression_target'], **params)
 
         if data_dict.get('segmentation') is not None:
             data_dict['segmentation'] = self._apply_to_segmentation(data_dict['segmentation'], **params)
