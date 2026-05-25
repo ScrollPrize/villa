@@ -22,9 +22,12 @@ from snap_surf.map_global import (
 	GlobalMapModel,
 	GlobalMapRuntime,
 	GlobalMapStageConfig,
+	GlobalMapConfig,
 	_affine_from_seed_ext_quads,
 	_affine_multistart_candidates,
 	_objective_for_uv,
+	_stage_loss_cfg,
+	_stage_station_weight,
 	optimize_fixture,
 	parse_global_map_stage_item,
 	parse_global_map_config,
@@ -161,6 +164,51 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 						"w_fac": {"smooth": 0.0},
 					},
 				],
+			})
+
+	def test_global_map_stage_dict_w_fac_multiplies_base_weights(self) -> None:
+		stage = parse_global_map_stage_item({
+			"name": "map",
+			"steps": 1,
+			"params": ["map_surf_ms"],
+			"w_fac": {"dist": 0.5, "smooth": 3.0, "map_station_t": 0.25},
+		})
+		cfg = GlobalMapConfig(
+			base={
+				"map_station_t": 0.8,
+				"map_init": {
+					"w_dist": 2.0,
+					"w_smooth": 0.25,
+					"w_jac": 4.0,
+				},
+			},
+			stages=(stage,),
+		)
+		stage_cfg = _stage_loss_cfg(snap_surf_config_from_global_config(cfg, stage), stage)
+
+		self.assertEqual(stage_cfg.map_init.w_dist, 1.0)
+		self.assertEqual(stage_cfg.map_init.w_smooth, 0.75)
+		self.assertEqual(stage_cfg.map_init.w_jac, 4.0)
+		self.assertEqual(_stage_station_weight(cfg, stage), 0.2)
+
+	def test_global_map_stage_numeric_w_fac_scales_station_weight(self) -> None:
+		stage = parse_global_map_stage_item({
+			"name": "map",
+			"steps": 1,
+			"params": ["map_surf_affine"],
+			"w_fac": 0.5,
+		})
+		cfg = GlobalMapConfig(base={"map_station_t": 0.8}, stages=(stage,))
+
+		self.assertEqual(_stage_station_weight(cfg, stage), 0.4)
+
+	def test_global_map_stage_dict_w_fac_rejects_unknown_terms(self) -> None:
+		with self.assertRaisesRegex(ValueError, "unknown term"):
+			parse_global_map_stage_item({
+				"name": "map",
+				"steps": 1,
+				"params": ["map_surf_ms"],
+				"w_fac": {"not_a_loss": 1.0},
 			})
 
 	def test_lasagna_stage_parser_rejects_plain_affine_and_mixed_params(self) -> None:

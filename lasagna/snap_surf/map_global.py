@@ -90,6 +90,46 @@ def _canonical_stage_params(params: tuple[str, ...], *, normal_lasagna: bool = F
 	return tuple(out)
 
 
+_STAGE_W_FAC_KEYS = {
+	"dist": "dist",
+	"map_dist": "dist",
+	"vec": "vec",
+	"map_vec_normal": "vec",
+	"norm": "norm",
+	"map_surface_normal": "norm",
+	"smooth": "smooth",
+	"map_smooth": "smooth",
+	"bend": "bend",
+	"map_bend": "bend",
+	"jac": "jac",
+	"map_jac": "jac",
+	"metric_smooth": "metric_smooth",
+	"map_metric_smooth": "metric_smooth",
+	"area_smooth": "area_smooth",
+	"map_area_smooth": "area_smooth",
+	"prior": "prior",
+	"map_dense_prior": "prior",
+	"map_station_t": "map_station_t",
+	"w_station_t": "map_station_t",
+}
+
+
+def _canonical_stage_w_fac(raw: Any, *, index: int) -> float | dict[str, float]:
+	if raw is None:
+		return 1.0
+	if isinstance(raw, dict):
+		out: dict[str, float] = {}
+		bad = sorted(set(str(k) for k in raw.keys()) - set(_STAGE_W_FAC_KEYS.keys()))
+		if bad:
+			raise ValueError(f"global map stage {index} w_fac: unknown term(s): {bad}")
+		for k, v in raw.items():
+			if v is None:
+				continue
+			out[_STAGE_W_FAC_KEYS[str(k)]] = float(v)
+		return out
+	return float(raw)
+
+
 def parse_global_map_stage_item(item: dict[str, Any], *, index: int = 0, normal_lasagna: bool = False) -> GlobalMapStageConfig:
 	if not isinstance(item, dict):
 		raise ValueError(f"global map stage {index} must be an object")
@@ -106,16 +146,14 @@ def parse_global_map_stage_item(item: dict[str, Any], *, index: int = 0, normal_
 		args = {}
 	if not isinstance(args, dict):
 		raise ValueError(f"global map stage {index} args must be an object")
-	w_fac = item.get("w_fac", 1.0)
-	if isinstance(w_fac, dict):
-		raise ValueError(f"global map stage {index} w_fac must be a number")
+	w_fac = _canonical_stage_w_fac(item.get("w_fac", 1.0), index=index)
 	return GlobalMapStageConfig(
 		name=str(item.get("name", item.get("kind", ""))),
 		steps=max(0, int(item.get("steps", 0))),
 		lr=float(item.get("lr", 0.05)),
 		params=params_t,
 		min_scaledown=max(0, int(item.get("min_scaledown", 0))),
-		w_fac=float(w_fac),
+		w_fac=w_fac,
 		args=dict(args),
 	)
 
@@ -971,19 +1009,22 @@ def _stage_loss_cfg(base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> Sn
 	mi = base_cfg.map_init
 	if isinstance(stage.w_fac, dict):
 		weights = {str(k): float(v) for k, v in stage.w_fac.items()}
+		bad = sorted(set(weights.keys()) - set(_STAGE_W_FAC_KEYS.values()))
+		if bad:
+			raise ValueError(f"global map stage '{stage.name}' w_fac: unknown term(s): {bad}")
 		return replace(
 			base_cfg,
 			map_init=replace(
 				mi,
-				w_dist=weights.get("dist", float(mi.w_dist)),
-				w_vec_normal=weights.get("vec", float(mi.w_vec_normal)),
-				w_surface_normal=weights.get("norm", float(mi.w_surface_normal)),
-				w_smooth=weights.get("smooth", float(mi.w_smooth)),
-				w_bend=weights.get("bend", float(mi.w_bend)),
-				w_jac=weights.get("jac", float(mi.w_jac)),
-				w_metric_smooth=weights.get("metric_smooth", float(mi.w_metric_smooth)),
-				w_area_smooth=weights.get("area_smooth", float(mi.w_area_smooth)),
-				w_dense_prior=weights.get("prior", float(mi.w_dense_prior)),
+				w_dist=float(mi.w_dist) * weights.get("dist", 1.0),
+				w_vec_normal=float(mi.w_vec_normal) * weights.get("vec", 1.0),
+				w_surface_normal=float(mi.w_surface_normal) * weights.get("norm", 1.0),
+				w_smooth=float(mi.w_smooth) * weights.get("smooth", 1.0),
+				w_bend=float(mi.w_bend) * weights.get("bend", 1.0),
+				w_jac=float(mi.w_jac) * weights.get("jac", 1.0),
+				w_metric_smooth=float(mi.w_metric_smooth) * weights.get("metric_smooth", 1.0),
+				w_area_smooth=float(mi.w_area_smooth) * weights.get("area_smooth", 1.0),
+				w_dense_prior=float(mi.w_dense_prior) * weights.get("prior", 1.0),
 			),
 		)
 	scale = float(stage.w_fac)
@@ -1002,6 +1043,13 @@ def _stage_loss_cfg(base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> Sn
 			w_dense_prior=float(mi.w_dense_prior) * scale,
 		),
 	)
+
+
+def _stage_station_weight(cfg_global: GlobalMapConfig, stage: GlobalMapStageConfig) -> float:
+	base = float(stage.args.get("map_station_t", stage.args.get("w_station_t", cfg_global.base.get("map_station_t", 0.0))))
+	if isinstance(stage.w_fac, dict):
+		return base * float(stage.w_fac.get("map_station_t", 1.0))
+	return base * float(stage.w_fac)
 
 
 def _station_loss(uv: torch.Tensor, seed_ext_hw: torch.Tensor, target_uv: torch.Tensor) -> torch.Tensor:
@@ -1436,7 +1484,7 @@ class GlobalMapRuntime:
 		assert self.affine is not None
 		seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
 		station_target = self.station_target if self.station_target is not None else self.affine.eval_at(seed_hw).detach()
-		w_station = float(stage.args.get("map_station_t", stage.args.get("w_station_t", self.cfg_global.base.get("map_station_t", 0.0))))
+		w_station = _stage_station_weight(self.cfg_global, stage)
 		if _is_affine_seed_quad_init(stage):
 			candidate = _affine_from_seed_ext_quads(
 				fixture=fixture,
@@ -1645,7 +1693,7 @@ def optimize_fixture(
 
 	for stage_idx, stage in enumerate(cfg_global.stages):
 		stage_cfg = _stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, stage), stage)
-		w_station = float(stage.args.get("map_station_t", stage.args.get("w_station_t", cfg_global.base.get("map_station_t", 0.0))))
+		w_station = _stage_station_weight(cfg_global, stage)
 		if _is_affine_seed_quad_init(stage):
 			progress_rows += _run_affine_seed_quad_init(
 				stage_idx=stage_idx,

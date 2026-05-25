@@ -198,25 +198,24 @@ def _cyl_outside_mode_for_direction(direction: int) -> str:
 
 def _stage_to_modifiers(
 	base: dict[str, float],
-	prev_eff: dict[str, float] | None,
 	default_mul: float | None,
-	w_fac: dict | None,
+	w_fac: dict | float | None,
+	scalar_terms: set[str] | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
-	if prev_eff is None:
-		prev_eff = {k: float(v) for k, v in base.items()}
-	if default_mul is None and w_fac is None:
-		eff = dict(prev_eff)
-	else:
-		eff = dict(prev_eff)
-		if default_mul is not None:
-			for name in base.keys():
-				if w_fac is None or name not in w_fac:
-					eff[name] = float(base[name]) * float(default_mul)
-		if w_fac is not None:
-			for k, v in w_fac.items():
-				if v is None:
-					continue
-				eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
+	eff = {k: float(v) for k, v in base.items()}
+	if default_mul is not None:
+		for name in base.keys():
+			eff[name] = float(base[name]) * float(default_mul)
+	if isinstance(w_fac, (int, float)):
+		terms = scalar_terms if scalar_terms is not None else set(base.keys())
+		for name in terms:
+			if name in base:
+				eff[name] = float(base[name]) * float(w_fac)
+	elif isinstance(w_fac, dict):
+		for k, v in w_fac.items():
+			if v is None:
+				continue
+			eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
 
 	mods: dict[str, float] = {}
 	for name, val in eff.items():
@@ -234,7 +233,6 @@ def _parse_opt_settings(
 	stage_name: str,
 	opt_cfg: dict,
 	base: dict[str, float],
-	prev_eff: dict[str, float] | None,
 ) -> OptSettings:
 	opt_cfg = dict(opt_cfg)
 	steps_raw = opt_cfg.get("steps", 0)
@@ -298,8 +296,8 @@ def _parse_opt_settings(
 		default_mul = float(default_mul)
 	if kind == "map" and w_fac is not None and not isinstance(w_fac, (dict, int, float)):
 		raise ValueError(f"stages_json: stage '{stage_name}' opt 'w_fac' must be an object, number, or null for map stages")
-	if kind == "model" and w_fac is not None and not isinstance(w_fac, dict):
-		raise ValueError(f"stages_json: stage '{stage_name}' opt 'w_fac' must be an object or null")
+	if kind == "model" and w_fac is not None and not isinstance(w_fac, (dict, int, float)):
+		raise ValueError(f"stages_json: stage '{stage_name}' opt 'w_fac' must be an object, number, or null")
 	if isinstance(w_fac, dict):
 		bad_terms = sorted(set(str(k) for k in w_fac.keys()) - set(base.keys()))
 		if bad_terms:
@@ -311,14 +309,8 @@ def _parse_opt_settings(
 					f"stages_json: stage '{stage_name}' opt.w_fac: map stages may only override map loss term(s); "
 					f"got {bad_map_terms}"
 				)
-	if kind == "map" and isinstance(w_fac, (int, float)):
-		scale = float(w_fac)
-		eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, None)
-		for name in MAP_LOSS_NAMES:
-			eff[name] = float(base.get(name, 0.0)) * scale
-	else:
-		model_w_fac = w_fac if isinstance(w_fac, dict) else None
-		eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, model_w_fac)
+	scalar_terms = set(MAP_LOSS_NAMES) if kind == "map" else (set(base.keys()) - set(MAP_LOSS_NAMES))
+	eff, _mods = _stage_to_modifiers(base, default_mul, w_fac, scalar_terms=scalar_terms)
 	if steps_auto and "cyl_params" in params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.steps='auto' is not supported for cyl_params stages")
 	if "cyl_params" in params:
@@ -505,7 +497,6 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 	_require_consumed_dict(where="top-level", cfg=cfg)
 
 	out: list[Stage] = []
-	prev_eff: dict[str, float] | None = None
 	for s in stages_cfg:
 		if not isinstance(s, dict):
 			raise ValueError("stages_json: each stage must be an object")
@@ -518,8 +509,7 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 		_require_consumed_dict(where=f"stage '{name}'", cfg=s)
 		if not isinstance(global_opt_cfg, dict):
 			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
-		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base, prev_eff=prev_eff)
-		prev_eff = dict(global_opt.eff)
+		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
 		out.append(Stage(name=name, global_opt=global_opt))
 	if init_mode == "cylinder_seed":
 		_validate_cylinder_seed_stage_roles(out)
@@ -552,15 +542,30 @@ def _lr_last(lr: float | list[float]) -> float:
 	return float(lr)
 
 
-def _global_map_w_fac_from_eff(eff: dict[str, float]) -> dict[str, float]:
-	return {
-		stage_name: float(eff.get(global_name, 0.0))
-		for stage_name, global_name in MAP_STAGE_LOSS_TO_GLOBAL.items()
-	}
+def _global_map_w_fac_from_eff(*, base: dict[str, float], eff: dict[str, float]) -> dict[str, float]:
+	out: dict[str, float] = {}
+	for stage_name, global_name in MAP_STAGE_LOSS_TO_GLOBAL.items():
+		base_val = float(base.get(global_name, 0.0))
+		eff_val = float(eff.get(global_name, 0.0))
+		out[stage_name] = (eff_val / base_val) if base_val != 0.0 else 0.0
+	return out
 
 
-def _global_map_args_from_eff(args: dict, eff: dict[str, float]) -> dict:
+def _global_map_args_from_eff(args: dict, *, base: dict[str, float], eff: dict[str, float]) -> dict:
 	out = dict(args)
+	map_init = dict(out.get("map_init", {})) if isinstance(out.get("map_init", {}), dict) else {}
+	map_init.update({
+		"w_dist": float(base.get("map_dist", 0.0)),
+		"w_vec_normal": float(base.get("map_vec_normal", 0.0)),
+		"w_surface_normal": float(base.get("map_surface_normal", 0.0)),
+		"w_smooth": float(base.get("map_smooth", 0.0)),
+		"w_bend": float(base.get("map_bend", 0.0)),
+		"w_jac": float(base.get("map_jac", 0.0)),
+		"w_metric_smooth": float(base.get("map_metric_smooth", 0.0)),
+		"w_area_smooth": float(base.get("map_area_smooth", 0.0)),
+		"w_dense_prior": float(base.get("map_dense_prior", 0.0)),
+	})
+	out["map_init"] = map_init
 	out["map_station_t"] = float(eff.get("map_station_t", 0.0))
 	return out
 
@@ -574,8 +579,8 @@ def _global_map_stage_from_opt_settings(*, name: str, opt_cfg: OptSettings, args
 		lr=float(_lr_last(opt_cfg.lr)),
 		params=tuple({"map_surf_affine": "affine", "map_surf_ms": "map_uv_ms"}.get(p, p) for p in opt_cfg.params),
 		min_scaledown=int(opt_cfg.min_scaledown),
-		w_fac=_global_map_w_fac_from_eff(opt_cfg.eff),
-		args=_global_map_args_from_eff(args, opt_cfg.eff),
+		w_fac=_global_map_w_fac_from_eff(base=opt_cfg.base_eff, eff=opt_cfg.eff),
+		args=_global_map_args_from_eff(args, base=opt_cfg.base_eff, eff=opt_cfg.eff),
 	)
 
 
@@ -1617,7 +1622,6 @@ def optimize(
 				stage_name=f"{stage.name}.snap_surf_map.map_opt",
 				opt_cfg=raw_map_opt_cfg,
 				base=opt_cfg.base_eff,
-				prev_eff=None,
 			)
 			if map_opt_cfg.kind != "map":
 				raise ValueError(f"stage '{stage.name}' opt.args.snap_surf_map.map_opt params must be map params")

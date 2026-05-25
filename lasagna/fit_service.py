@@ -300,6 +300,20 @@ def _apply_window_transport_args(
 
 
 def _config_effective_loss_enabled(cfg: dict[str, Any], term_name: str) -> bool:
+    map_loss_names = {
+        "map_dist",
+        "map_vec_normal",
+        "map_surface_normal",
+        "map_smooth",
+        "map_bend",
+        "map_jac",
+        "map_metric_smooth",
+        "map_area_smooth",
+        "map_dense_prior",
+        "map_station_t",
+    }
+    map_params = {"map_surf_affine", "map_surf_ms"}
+    model_params = {"mesh_ms", "amp", "bias", "cyl_params", "map_flatten_ms"}
     base_cfg = cfg.get("base")
     base_term = 0.0
     if isinstance(base_cfg, dict):
@@ -307,8 +321,6 @@ def _config_effective_loss_enabled(cfg: dict[str, Any], term_name: str) -> bool:
             base_term = float(base_cfg.get(term_name, 0.0))
         except (TypeError, ValueError):
             base_term = 0.0
-    if abs(base_term) > 0.0:
-        return True
 
     stages = cfg.get("stages")
     if not isinstance(stages, list):
@@ -327,14 +339,25 @@ def _config_effective_loss_enabled(cfg: dict[str, Any], term_name: str) -> bool:
             continue
 
         eff = base_term
+        params = _stage_params_list(opt_cfg)
+        kind = "map" if (set(params) & map_params) and not (set(params) & model_params) else "model"
         w_fac = opt_cfg.get("w_fac")
         has_term_wfac = isinstance(w_fac, dict) and term_name in w_fac
         default_mul = opt_cfg.get("default_mul")
-        if default_mul is not None and not has_term_wfac:
+        if default_mul is not None:
             try:
                 eff = base_term * float(default_mul)
             except (TypeError, ValueError):
                 eff = 0.0
+        if isinstance(w_fac, (int, float)):
+            scalar_applies = (kind == "map" and term_name in map_loss_names) or (
+                kind == "model" and term_name not in map_loss_names
+            )
+            if scalar_applies:
+                try:
+                    eff = base_term * float(w_fac)
+                except (TypeError, ValueError):
+                    eff = 0.0
         if has_term_wfac and w_fac.get(term_name) is not None:
             try:
                 eff = base_term * float(w_fac.get(term_name))

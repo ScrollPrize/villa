@@ -238,6 +238,28 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 		self.assertTrue(fit_service._config_effective_snap_surf_enabled(cfg))
 		self.assertFalse(fit_service._config_effective_ext_offset_enabled(cfg))
 
+	def test_snap_surf_effective_loss_detection_respects_disabled_stages(self) -> None:
+		cfg = {
+			"base": {"snap_surf": 0.01},
+			"stages": [
+				{"name": "stage0", "steps": 1000, "w_fac": {"snap_surf": 0.0}},
+				{"name": "stage1", "steps": 0, "w_fac": {"snap_surf": 1.0}},
+			],
+		}
+
+		self.assertFalse(fit_service._config_effective_snap_surf_enabled(cfg))
+
+	def test_snap_surf_effective_loss_detection_does_not_inherit_disabled_weight(self) -> None:
+		cfg = {
+			"base": {"snap_surf": 0.01},
+			"stages": [
+				{"name": "stage0", "steps": 1000, "w_fac": {"snap_surf": 0.0}},
+				{"name": "stage1", "steps": 1000},
+			],
+		}
+
+		self.assertTrue(fit_service._config_effective_snap_surf_enabled(cfg))
+
 	def test_global_map_detection_from_map_stage_params(self) -> None:
 		cfg = {
 			"base": {"snap_surf_map": 0.0},
