@@ -29,21 +29,24 @@ The useful contract is narrow:
   directly.
 - The previous PR narrative correctly identified the missing `vesuvius`
   dependency, but leaving that as a caveat made the container support claim too
-  weak. The next repair slice should either install the local `villa/vesuvius`
-  package in the GPU image or explicitly narrow the PR until a container smoke
-  test exists.
+  weak. The GPU image now has an explicit `INSTALL_PRIMUS_DEPS=1` build path
+  that installs `vesuvius[models]` from Villa, with `VILLA_REPO` and
+  `VILLA_REF` build args for fork/branch validation.
 - Docker is part of the official Villa development/runtime surface for this
   area: `ink-detection/optimized_inference/Dockerfile` defines the GPU and CPU
   optimized-inference images, the README documents `docker build` and
   `docker run --gpus all`, and the repository also carries Volume
   Cartographer Dockerfiles plus Docker-backed CI. A Primus reviewer reply should
   therefore include a container smoke result, not only host-side unit tests.
-- Local Docker installation attempt on 2026-05-25 installed Docker 29.5.2
-  static binaries and rootless extras under `~/.local/bin`, but the rootless
-  daemon is blocked by Ubuntu AppArmor unprivileged-user-namespace policy:
-  `rootlesskit` fails with `fork/exec /proc/self/exe: permission denied`.
-  Finishing the container smoke on this VM requires a sudo-owned AppArmor
-  policy change or a system Docker install.
+- Local Docker work on 2026-05-25 installed Docker 29.5.2 static binaries and
+  rootless extras under `~/.local/bin`. A user-owned daemon can be started from
+  the Neo workspace with `tools/start-userns-docker.sh`; it connects containerd,
+  resolves DNS, pulls `hello-world`, and can build metadata-only Dockerfiles.
+  Full container execution and Dockerfile `RUN` layers are still blocked on this
+  host because `newuidmap`/`newgidmap` are unavailable and no sudo-owned system
+  Docker/AppArmor policy is installed. The observed failures are `runc`
+  cgroup/devpts setup errors and subordinate-ID layer extraction errors, so an
+  honest end-to-end container smoke still requires a privileged host fix.
 - The new unit tests exercise the wrapper shape contract and checkpoint loading
   against a stubbed `NetworkFromConfig`, so they verify the PR's local logic
   without requiring a heavyweight Primus checkpoint in CI.
@@ -79,10 +82,22 @@ saves a production checkpoint envelope, reloads it through `model_primus`, and
 checks that a `(1, 1, 16, 16, 16)` optimized-inference tensor produces an
 `ink` output of the same shape.
 
+## Docker Commands For Final Smoke
+
+```bash
+docker build --target gpu \
+  --build-arg INSTALL_PRIMUS_DEPS=1 \
+  --build-arg VILLA_REPO=https://github.com/jonmarrs/villa.git \
+  --build-arg VILLA_REF=primus-loader-optimized-inference \
+  -t ink-detection-optimized-inference:gpu-primus .
+```
+
+Then run an end-to-end optimized inference smoke test with a real or minimal
+Primus checkpoint envelope inside the container.
+
 ## Still Required Before Reviewer Reply
 
-- Resolve the Docker dependency path for `vesuvius`.
-- Run an end-to-end optimized inference smoke test with a real or minimal
-  Primus checkpoint envelope inside the container.
+- Run the Primus GPU container smoke after the host has working container
+  execution.
 - Rewrite the PR description/comment in human terms and remove generated-content
   footers.

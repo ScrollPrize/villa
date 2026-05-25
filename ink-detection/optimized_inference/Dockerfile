@@ -24,6 +24,13 @@ COPY requirements.txt /app
 # should only install additional dependencies, not torch, cuda, etc.
 # --break-system-packages: the 2.10 base image uses system Python with PEP 668 marker
 RUN uv pip install --system --break-system-packages --no-cache -r requirements.txt
+ARG INSTALL_PRIMUS_DEPS=0
+ARG VILLA_REPO=https://github.com/ScrollPrize/villa.git
+ARG VILLA_REF=main
+RUN if [ "$INSTALL_PRIMUS_DEPS" = "1" ]; then \
+      uv pip install --system --break-system-packages --no-cache \
+        "vesuvius[models] @ git+${VILLA_REPO}@${VILLA_REF}#subdirectory=vesuvius"; \
+    fi
 
 COPY entrypoint.py /app
 COPY processing.py /app

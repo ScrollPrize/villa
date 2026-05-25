@@ -27,7 +27,7 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 | `TILE_SIZE` | Tile size for sliding window inference (pixels, also sets network input size) | `64` |
 | `STRIDE` | Stride for sliding window (pixels) | `16` |
 | `BATCH_SIZE` | Batch size for inference | `256` |
-| `MODEL_TYPE` | Model architecture: `timesformer`, `resnet3d-50`, or `resnet3d-152-3d-decoder` | `timesformer` |
+| `MODEL_TYPE` | Model architecture: `timesformer`, `resnet3d-50`, `resnet3d-152-3d-decoder`, or `primus` | `timesformer` |
 | `STEP` | Execution step: `prepare`, `inference`, or `reduce` | `inference` |
 | `NUM_PARTS` | Number of partitions for distributed inference | `1` |
 | `PART_ID` | Partition ID (0-indexed) when NUM_PARTS > 1 | `0` |
@@ -91,6 +91,11 @@ The `Dockerfile` builds a slim runtime with a prebuilt virtualenv layer.
 # GPU inference image
 docker build --target gpu -t ink-detection-optimized-inference:gpu .
 
+# GPU image with Primus loader dependencies
+docker build --target gpu \
+  --build-arg INSTALL_PRIMUS_DEPS=1 \
+  -t ink-detection-optimized-inference:gpu-primus .
+
 # CPU utility image
 docker build --target cpu -t ink-detection-optimized-inference:cpu .
 
@@ -102,6 +107,7 @@ AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --target cpu -t ink-dete
 Notes:
 - The GPU image is the only image that supports `STEP=inference`.
 - The CPU image supports `STEP=prepare`, `STEP=reduce`, and `STEP=aggregate-profiling`.
+- `MODEL_TYPE=primus` requires `INSTALL_PRIMUS_DEPS=1`, which installs `vesuvius[models]` from the Villa monorepo into the GPU image. Override `VILLA_REPO` and `VILLA_REF` when validating a fork or branch.
 - The Dockerfile currently uses `pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime` for the GPU target.
 
 ### Run
