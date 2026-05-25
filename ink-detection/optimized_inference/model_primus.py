@@ -71,11 +71,43 @@ def _normalize_model_config(checkpoint_data: Dict[str, Any], num_frames: int) ->
             ):
                 if key in config:
                     model_config[key] = config[key]
+        else:
+            for key in ("patch_size", "train_patch_size", "in_channels", "enable_deep_supervision"):
+                if key in config and key not in model_config:
+                    model_config[key] = config[key]
     model_config.setdefault("in_channels", num_frames)
     model_config.setdefault("enable_deep_supervision", False)
     if "patch_size" in model_config and "train_patch_size" not in model_config:
         model_config["train_patch_size"] = model_config["patch_size"]
+    if "targets" not in model_config:
+        config = checkpoint_data.get("config") or {}
+        if isinstance(config, dict):
+            targets = config.get("targets")
+            dataset_config = config.get("dataset_config")
+            if targets is None and isinstance(dataset_config, dict):
+                targets = dataset_config.get("targets")
+            if isinstance(targets, dict):
+                model_config["targets"] = targets
     return model_config
+
+
+class _PrimusConfigShim:
+    """Small ConfigManager-compatible surface required by NetworkFromConfig."""
+
+    def __init__(self, model_config: Dict[str, Any]):
+        self.model_config = model_config
+        self.model_name = "optimized_inference_primus"
+        self.targets = model_config.get("targets") or {"ink": {"out_channels": 1, "activation": "none"}}
+        self.train_patch_size = model_config.get("train_patch_size") or model_config.get("patch_size")
+        if self.train_patch_size is None:
+            raise ValueError("Primus checkpoint config must include patch_size or train_patch_size")
+        self.train_batch_size = int(model_config.get("train_batch_size", 1))
+        self.in_channels = int(model_config.get("in_channels", 1))
+        self.enable_deep_supervision = bool(model_config.get("enable_deep_supervision", False))
+        self.autoconfigure = bool(model_config.get("autoconfigure", False))
+        self.op_dims = int(model_config.get("op_dims", len(self.train_patch_size)))
+        for key, value in model_config.items():
+            setattr(self, key, value)
 
 
 class PrimusWrapper:
@@ -139,17 +171,7 @@ def load_model(model_path: str, device: torch.device, num_frames: int = 26) -> P
 
     model_config = _normalize_model_config(checkpoint, num_frames=num_frames)
 
-    # NetworkFromConfig accepts either a ConfigManager-like object or a dict-of-mgr
-    # depending on villa version; we adapt below if the direct call signature
-    # changes. For current villa main, NetworkFromConfig(mgr) is expected, so
-    # we build a lightweight shim mgr that exposes the model_config attributes.
-    class _ShimMgr:
-        def __init__(self, mc: Dict[str, Any]):
-            self.model_config = mc
-            for key, value in mc.items():
-                setattr(self, key, value)
-
-    shim_mgr = _ShimMgr(model_config)
+    shim_mgr = _PrimusConfigShim(model_config)
     try:
         model = NetworkFromConfig(shim_mgr)
     except TypeError:

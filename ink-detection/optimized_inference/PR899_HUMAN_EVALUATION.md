@@ -50,7 +50,22 @@ This validates:
 - 4D tiles are lifted to `(B, 1, D, H, W)`.
 - 5D optimized-inference volumes keep `(B, 1, D, H, W)`.
 - checkpoint config normalization provides `train_patch_size`.
+- the ConfigManager shim exposes the attributes used by Villa's real
+  `NetworkFromConfig`.
 - the loader selects the `ink` target when present.
+
+After installing the local Villa package into the Vesuvius Autoresearch virtual
+environment:
+
+```bash
+uv pip install --python /home/jon/openclaw-workspace/Neo-VM/projects/vesuvius-autoresearch/.venv/bin/python -e '/home/jon/openclaw-workspace/Neo-VM/projects/vesuvius-autoresearch/villa/vesuvius[models]'
+python -m unittest tests.test_model_primus_integration -v
+```
+
+The integration test builds a minimal real `NetworkFromConfig` Primus-S model,
+saves a production checkpoint envelope, reloads it through `model_primus`, and
+checks that a `(1, 1, 16, 16, 16)` optimized-inference tensor produces an
+`ink` output of the same shape.
 
 ## Still Required Before Reviewer Reply
 

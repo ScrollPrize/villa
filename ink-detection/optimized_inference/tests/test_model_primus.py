@@ -103,6 +103,28 @@ class ModelPrimusTests(unittest.TestCase):
                 else:
                     sys.modules[name] = module
 
+    def test_config_shim_exposes_network_from_config_attrs(self):
+        model_config = model_primus._normalize_model_config(
+            {
+                "config": {
+                    "patch_size": [5, 8, 8],
+                    "in_channels": 1,
+                    "targets": {"ink": {"out_channels": 1, "activation": "none"}},
+                    "model_config": {"architecture_type": "primus_s"},
+                }
+            },
+            num_frames=5,
+        )
+
+        shim = model_primus._PrimusConfigShim(model_config)
+
+        self.assertEqual(shim.model_name, "optimized_inference_primus")
+        self.assertEqual(shim.train_patch_size, [5, 8, 8])
+        self.assertEqual(shim.train_batch_size, 1)
+        self.assertEqual(shim.targets["ink"]["out_channels"], 1)
+        self.assertFalse(shim.autoconfigure)
+        self.assertEqual(shim.op_dims, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
