@@ -179,7 +179,11 @@ def compute_voi(
         else:  # Single channel, just squeeze
             pred_np = pred_np.squeeze(1)
     elif pred_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, channels, height, width)
-        if pred_np.shape[1] <= 10:  # Likely channels dimension
+        if gt_np.ndim == 5 and gt_np.shape[1] == 1 and pred_np.shape == gt_np[:, 0].shape:
+            pass
+        elif gt_np.ndim == 4 and pred_np.shape == gt_np.shape:
+            pass
+        elif pred_np.shape[1] <= 10:  # Likely channels dimension
             if pred_np.shape[1] > 1:
                 pred_np = np.argmax(pred_np, axis=1)
             else:
@@ -200,7 +204,9 @@ def compute_voi(
             if mask_np is not None and mask_np.ndim == 5 and mask_np.shape[1] == 1:
                 mask_np = mask_np.squeeze(1)
     elif gt_np.ndim == 4:
-        if gt_np.shape[1] == 1:
+        if pred_np.ndim == 4 and gt_np.shape == pred_np.shape:
+            pass
+        elif gt_np.shape[1] == 1:
             gt_np = gt_np.squeeze(1)
             if mask_np is not None and mask_np.ndim == 4 and mask_np.shape[1] == 1:
                 mask_np = mask_np.squeeze(1)

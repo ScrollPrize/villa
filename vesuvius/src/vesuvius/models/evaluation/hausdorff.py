@@ -46,14 +46,25 @@ def compute_hausdorff_distance(pred: torch.Tensor,
             pred_np = pred_np.squeeze(1)
     elif pred_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, channels, height, width)
         # Check if second dimension is channels (usually small) or spatial dimension
-        if pred_np.shape[1] <= 10:  # Likely channels dimension
+        if gt_np.ndim == 5 and gt_np.shape[1] == 1 and pred_np.shape == gt_np[:, 0].shape:
+            pass
+        elif pred_np.shape[1] == num_classes:
+            if pred_np.shape[1] > 1:
+                pred_np = np.argmax(pred_np, axis=1)
+            else:
+                pred_np = pred_np.squeeze(1)
+        elif gt_np.ndim == 4 and pred_np.shape == gt_np.shape:
+            pass
+        elif pred_np.shape[1] <= 10:  # Likely channels dimension
             if pred_np.shape[1] > 1:
                 pred_np = np.argmax(pred_np, axis=1)
             else:
                 pred_np = pred_np.squeeze(1)
         # Otherwise assume it's already (batch, depth, height, width) or (batch, height, width)
-    elif pred_np.ndim == 3 and pred_np.shape[0] <= 10:  # (channels, height, width)
-        if pred_np.shape[0] > 1:
+    elif pred_np.ndim == 3 and pred_np.shape[0] <= 10:  # (channels, height, width) or (depth, height, width)
+        if gt_np.ndim == 3 and pred_np.shape == gt_np.shape:
+            pass
+        elif pred_np.shape[0] > 1:
             pred_np = np.argmax(pred_np, axis=0)
         else:
             pred_np = pred_np.squeeze(0)
@@ -67,13 +78,18 @@ def compute_hausdorff_distance(pred: torch.Tensor,
         else:
             gt_np = np.argmax(gt_np, axis=1)
     elif gt_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, channels, height, width)
-        if gt_np.shape[1] == 1:  # (batch, 1, height, width) for 2D
+        if pred_np.ndim == 4 and gt_np.shape == pred_np.shape:
+            pass
+        elif gt_np.shape[1] == 1:  # (batch, 1, height, width) for 2D
             gt_np = gt_np.squeeze(1)
         elif gt_np.shape[1] <= 10:  # Likely channels
             gt_np = np.argmax(gt_np, axis=1)
         # Otherwise assume it's already (batch, depth, height, width)
     elif gt_np.ndim == 2:  # (height, width)
         gt_np = gt_np[np.newaxis, ...]  # Add batch dimension
+
+    if pred_np.ndim == len(gt_np.shape) - 1:
+        pred_np = pred_np[np.newaxis, ...]
     
     # Ensure both have same number of dimensions
     if pred_np.ndim != gt_np.ndim:

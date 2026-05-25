@@ -35,20 +35,23 @@ def compute(
         Dictionary with keys "connected_components_class_X" (for each class X not ignored) containing the average absolute difference 
         in connected component counts, and a key "connected_components_total" for the overall difference.
     """
-    # If prediction is a probability map, convert to hard labels.
-    if prediction.ndim == 4:
-        prediction = np.argmax(prediction, axis=1)
-    
     # Ensure label and prediction have a batch dimension.
     # For 3D volumes, add a new axis so the shape becomes [1, H, W, D]
     if label.ndim == 3:
         label = label[np.newaxis, ...]
     elif label.ndim != 4:
         raise ValueError("Label array must have shape [H, W, D] or [N, H, W, D].")
-        
-    if prediction.ndim == 3:
+
+    if prediction.ndim == 5 and prediction.shape[1] == num_classes:
+        prediction = np.argmax(prediction, axis=1)
+    elif prediction.ndim == 4 and prediction.shape == label.shape:
+        pass
+    elif prediction.ndim == 4 and prediction.shape[0] == num_classes and prediction.shape[1:] == label.shape[1:]:
+        prediction = np.argmax(prediction, axis=0)
         prediction = prediction[np.newaxis, ...]
-    elif prediction.ndim != 3 and prediction.ndim != 4:
+    elif prediction.ndim == 3:
+        prediction = prediction[np.newaxis, ...]
+    else:
         raise ValueError("Prediction array must have shape [H, W, D] or [N, H, W, D] after conversion.")
 
     batch_size = label.shape[0]
@@ -62,6 +65,7 @@ def compute(
 
     total_label_cc = 0
     total_pred_cc = 0
+    total_absdiff = 0
 
     # Loop over images in the batch.
     for i in range(batch_size):
@@ -82,6 +86,7 @@ def compute(
 
             diff = abs(num_cc_pred - num_cc_gt)
             diff_per_class[f"connected_components_difference_class_{c}"] += diff
+            total_absdiff += diff
 
             total_label_cc += num_cc_gt
             total_pred_cc += num_cc_pred
@@ -90,7 +95,7 @@ def compute(
     for key in diff_per_class:
         diff_per_class[key] /= batch_size
 
-    total_diff = abs(total_pred_cc - total_label_cc) / batch_size
+    total_diff = total_absdiff / batch_size
     diff_per_class["connected_components_difference_total"] = total_diff
 
     return diff_per_class

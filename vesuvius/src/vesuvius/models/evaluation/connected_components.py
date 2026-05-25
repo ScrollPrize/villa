@@ -72,7 +72,16 @@ def get_connected_components_difference(
             pred_np = pred_np.squeeze(1)
     elif pred_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, channels, height, width)
         # Check if second dimension is channels (usually small) or spatial dimension
-        if pred_np.shape[1] <= 10:  # Likely channels dimension
+        if gt_np.ndim == 5 and gt_np.shape[1] == 1 and pred_np.shape == gt_np[:, 0].shape:
+            pass
+        elif pred_np.shape[1] == num_classes:
+            if pred_np.shape[1] > 1:
+                pred_np = np.argmax(pred_np, axis=1)
+            else:
+                pred_np = pred_np.squeeze(1)
+        elif gt_np.ndim == 4 and pred_np.shape == gt_np.shape:
+            pass
+        elif pred_np.shape[1] <= 10:  # Likely channels dimension
             if pred_np.shape[1] > 1:
                 pred_np = np.argmax(pred_np, axis=1)
             else:
@@ -96,6 +105,10 @@ def get_connected_components_difference(
     elif gt_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, 1, depth, height, width)
         if gt_np.shape[1] == 1:  # (batch, 1, height, width) for 2D or needs checking for 3D
             gt_np = gt_np.squeeze(1)
+            if mask_np is not None and mask_np.ndim == 4 and mask_np.shape[1] == 1:
+                mask_np = mask_np.squeeze(1)
+        elif gt_np.shape[1] == num_classes:
+            gt_np = np.argmax(gt_np, axis=1)
             if mask_np is not None and mask_np.ndim == 4 and mask_np.shape[1] == 1:
                 mask_np = mask_np.squeeze(1)
         # Otherwise assume it's already (batch, depth, height, width)
@@ -125,6 +138,7 @@ def get_connected_components_difference(
 
     total_gt_cc = 0
     total_pred_cc = 0
+    total_absdiff = 0
 
     for i in range(batch_size):
         current_valid = valid_mask[i]
@@ -143,6 +157,7 @@ def get_connected_components_difference(
 
             diff = abs(num_cc_pred - num_cc_gt)
             diff_per_class[f"connected_components_difference_class_{c}"] += diff
+            total_absdiff += diff
 
             total_gt_cc += num_cc_gt
             total_pred_cc += num_cc_pred
@@ -150,7 +165,7 @@ def get_connected_components_difference(
     for key in diff_per_class:
         diff_per_class[key] /= batch_size
 
-    total_diff = abs(total_pred_cc - total_gt_cc) / batch_size
+    total_diff = total_absdiff / batch_size
     diff_per_class["connected_components_difference_total"] = total_diff
     
     return diff_per_class

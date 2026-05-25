@@ -70,7 +70,22 @@ class SkeletonBranchPointsMetric(BaseMetric):
                 pred_lbl = (pred_np[:, 0] >= self.threshold).astype(np.int32)
         elif pred_np.ndim == 4:
             # Could be (B, C, H, W) or (B, Z, Y, X)
-            if pred_np.shape[1] <= 10:  # likely channels
+            if gt_np.ndim == 5 and gt_np.shape[1] == 1 and pred_np.shape == gt_np[:, 0].shape:
+                pred_lbl = pred_np.astype(np.int32)
+            elif pred_np.shape[1] == self.num_classes:
+                if pred_np.shape[1] > 1:
+                    if self.num_classes == 2:
+                        exps = np.exp(pred_np - np.max(pred_np, axis=1, keepdims=True))
+                        softmax = exps / np.sum(exps, axis=1, keepdims=True)
+                        pred_fg = softmax[:, 1]
+                        pred_lbl = (pred_fg >= self.threshold).astype(np.int32)
+                    else:
+                        pred_lbl = np.argmax(pred_np, axis=1).astype(np.int32)
+                else:
+                    pred_lbl = (pred_np[:, 0] >= self.threshold).astype(np.int32)
+            elif gt_np.ndim == 4 and pred_np.shape == gt_np.shape:
+                pred_lbl = pred_np.astype(np.int32)
+            elif pred_np.shape[1] <= 10:  # likely channels
                 if pred_np.shape[1] > 1:
                     if self.num_classes == 2:
                         exps = np.exp(pred_np - np.max(pred_np, axis=1, keepdims=True))
@@ -94,7 +109,9 @@ class SkeletonBranchPointsMetric(BaseMetric):
             else:
                 gt_lbl = np.argmax(gt_np, axis=1).astype(np.int32)
         elif gt_np.ndim == 4:
-            if gt_np.shape[1] == 1:  # (B,1,H,W)
+            if gt_np.shape == pred_lbl.shape:
+                gt_lbl = gt_np.astype(np.int32)
+            elif gt_np.shape[1] == 1:  # (B,1,H,W)
                 gt_lbl = gt_np[:, 0].astype(np.int32)
             elif gt_np.shape[1] <= 10:  # channels
                 gt_lbl = np.argmax(gt_np, axis=1).astype(np.int32)
@@ -130,6 +147,7 @@ class SkeletonBranchPointsMetric(BaseMetric):
 
         total_pred = 0.0
         total_gt = 0.0
+        total_absdiff = 0.0
 
         for b in range(batch_size):
             for c in classes:
@@ -165,6 +183,7 @@ class SkeletonBranchPointsMetric(BaseMetric):
                 results[f"branch_points_absdiff_class_{c}"] += abs(pred_bp - gt_bp)
                 total_pred += pred_bp
                 total_gt += gt_bp
+                total_absdiff += abs(pred_bp - gt_bp)
 
         # Average per batch
         valid_classes = [c for c in classes if (self.ignore_index is None or c != self.ignore_index)]
@@ -175,7 +194,7 @@ class SkeletonBranchPointsMetric(BaseMetric):
 
         results["branch_points_pred_total"] = total_pred / batch_size
         results["branch_points_gt_total"] = total_gt / batch_size
-        results["branch_points_absdiff_total"] = abs(total_pred - total_gt) / batch_size
+        results["branch_points_absdiff_total"] = total_absdiff / batch_size
 
         return results
 
