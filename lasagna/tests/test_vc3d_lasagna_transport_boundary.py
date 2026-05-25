@@ -65,6 +65,15 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 		self.assertIn('tr("Output")', self.batch_window_source)
 		self.assertIn('job[QStringLiteral("output_name")]', self.batch_window_source)
 
+	def test_poll_status_checks_transport_error_before_api_version(self) -> None:
+		start = self.manager_source.index("void LasagnaServiceManager::handleStatusReply")
+		end = self.manager_source.index("void LasagnaServiceManager::downloadResults", start)
+		method_source = self.manager_source[start:end]
+		self.assertLess(
+			method_source.index("reply->error() != QNetworkReply::NoError"),
+			method_source.index('validateApiVersion(reply, tr("Poll status"))'),
+		)
+
 
 if __name__ == "__main__":
 	unittest.main()

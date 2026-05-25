@@ -1093,11 +1093,11 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
     _statusRequestInFlight = false;
     reply->deleteLater();
 
-    if (!validateApiVersion(reply, tr("Poll status"))) {
-        return;
-    }
     if (reply->error() != QNetworkReply::NoError) {
         return;  // Transient network error, will retry next poll
+    }
+    if (!validateApiVersion(reply, tr("Poll status"))) {
+        return;
     }
 
     QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
