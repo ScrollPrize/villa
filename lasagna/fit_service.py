@@ -47,6 +47,7 @@ _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
 _API_VERSION = "1"
 _API_VERSION_HEADER = "X-Fit-Service-API-Version"
+_VC3D_SOURCE_HEADER = "X-VC3D-Source"
 
 # One debug switch for sparse coverage and coordinate sanity guards. The service
 # enables it by default so optimizer jobs fail before CUDA indexing asserts.
@@ -1176,6 +1177,9 @@ class _Handler(BaseHTTPRequestHandler):
             pass
         return f"{user}@{host}" if host else user
 
+    def _request_source(self) -> str:
+        return str(self.headers.get(_VC3D_SOURCE_HEADER) or self._client_source()).strip()
+
     def _job_path_parts(self) -> list[str]:
         path = urlparse(self.path).path
         return [part for part in path.split("/") if part]
@@ -1303,7 +1307,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif path == "/jobs":
             print("[fit-service] /jobs POST received", flush=True)
-            job = _jobs.create_upload(source=self._client_source(), config_name="")
+            job = _jobs.create_upload(source=self._request_source(), config_name="")
             try:
                 body = self._read_json(f"job {job.job_id} request")
             except Exception as exc:

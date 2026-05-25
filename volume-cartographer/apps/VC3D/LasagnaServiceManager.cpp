@@ -10,6 +10,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QHostInfo>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -44,6 +45,7 @@ constexpr int kServiceStopTimeoutMs = 500;
 constexpr int kPollIntervalMs = 500;
 constexpr const char* kFitServiceApiVersion = "1";
 constexpr const char* kFitServiceApiVersionHeader = "X-Fit-Service-API-Version";
+constexpr const char* kVc3dSourceHeader = "X-VC3D-Source";
 
 double bytesToMiB(qint64 bytes)
 {
@@ -328,7 +330,13 @@ QString LasagnaServiceManager::localSourceName() const
     if (user.isEmpty()) {
         user = QStringLiteral("vc3d");
     }
-    QString host = QSysInfo::machineHostName();
+    QString host = qEnvironmentVariable("HOSTNAME").trimmed();
+    if (host.isEmpty() || host == QStringLiteral("localhost")) {
+        host = QSysInfo::machineHostName().trimmed();
+    }
+    if (host.isEmpty() || host == QStringLiteral("localhost")) {
+        host = QHostInfo::localHostName().trimmed();
+    }
     return host.isEmpty() ? user : QStringLiteral("%1@%2").arg(user, host);
 }
 
@@ -674,12 +682,20 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
 
     _localOutputDir = localOutputDir;
     QJsonObject requestConfig = config;
-    if (!requestConfig.contains(QStringLiteral("source"))) {
-        requestConfig[QStringLiteral("source")] = localSourceName();
+    QString source = requestConfig.contains(QStringLiteral("source"))
+        ? requestConfig[QStringLiteral("source")].toString()
+        : localSourceName();
+    if (source.trimmed().isEmpty()) {
+        source = localSourceName();
+    }
+    if (!requestConfig.contains(QStringLiteral("source"))
+        || requestConfig[QStringLiteral("source")].toString().trimmed().isEmpty()) {
+        requestConfig[QStringLiteral("source")] = source;
     }
 
     QUrl url(QStringLiteral("%1/jobs").arg(baseUrl()));
     QNetworkRequest req = fitServiceRequest(url);
+    req.setRawHeader(kVc3dSourceHeader, source.toUtf8());
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
     QByteArray body = QJsonDocument(requestConfig).toJson(QJsonDocument::Compact);
