@@ -889,7 +889,7 @@ QStringList SegmentationLasagnaPanel::lasagnaConfigPathsForMode(LasagnaMode mode
     const QString currentPath = selectedLasagnaConfigPathForMode(mode);
     QStringList paths;
     auto addPath = [&paths](const QString& path) {
-        if (!path.isEmpty() && QFileInfo::exists(path) && !paths.contains(path)) {
+        if (!path.isEmpty() && !paths.contains(path)) {
             paths.append(path);
         }
     };

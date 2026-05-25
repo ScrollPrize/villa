@@ -26,7 +26,6 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
-#include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QPointF>
@@ -910,11 +909,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                     &CVolumeViewerView::sendAnnotationContextMenuRequested,
                     this,
                     [this, viewer](QPointF scenePoint, QPoint globalPos, Qt::KeyboardModifiers) {
-                        QMenu menu(this);
-                        QAction* action = menu.addAction(tr("New line annotation"));
-                        action->setEnabled(_lineAnnotationController &&
-                                           _lineAnnotationController->canLaunchFromViewer(viewer));
-
                         const cv::Vec3f volumePoint = viewer->sceneToVolume(scenePoint);
                         const bool validVolumePoint =
                             std::isfinite(volumePoint[0]) &&
@@ -933,11 +927,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         auto* lasagnaPanel = _segmentationWidget
                             ? _segmentationWidget->lasagnaPanel()
                             : nullptr;
-                        auto* coordMenu = menu.addMenu(
-                            validVolumePoint
-                                ? tr("(%1, %2, %3)").arg(seedX).arg(seedY).arg(seedZ)
-                                : tr("(?, ?, ?)"));
-                        coordMenu->setEnabled(validVolumePoint && lasagnaPanel);
 
                         bool activeSegmentHasLasagnaModel = false;
                         if (_state && _state->vpkg()) {
@@ -965,21 +954,32 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             }
                         }
 
+                        QMenu menu(this);
                         auto addLasagnaLaunchAction =
-                            [this, lasagnaPanel, coordMenu, seedX, seedY, seedZ,
+                            [this, lasagnaPanel, &menu, seedX, seedY, seedZ, validVolumePoint,
                              activeSegmentHasLasagnaModel](
                                 const QString& verb,
                                 SegmentationLasagnaPanel::LasagnaMode mode,
-                                bool requiresLasagnaModel) {
+                                bool requiresLasagnaModel,
+                                bool showSeedInLabel) {
                                 const QString configPath = lasagnaPanel
                                     ? lasagnaPanel->selectedLasagnaConfigPathForMode(mode)
                                     : QString();
                                 const QString configName = QFileInfo(configPath).fileName();
-                                QAction* launchAction = coordMenu->addAction(
-                                    configName.isEmpty()
-                                        ? tr("%1 l3d").arg(verb)
-                                        : tr("%1 l3d (%2)").arg(verb, configName));
+                                const QString seedText = tr("%1,%2,%3").arg(seedX).arg(seedY).arg(seedZ);
+                                QString label;
+                                if (configName.isEmpty()) {
+                                    label = showSeedInLabel
+                                        ? tr("%1 l3d (%2)").arg(verb, seedText)
+                                        : tr("%1 l3d").arg(verb);
+                                } else {
+                                    label = showSeedInLabel
+                                        ? tr("%1 l3d (%2 %3)").arg(verb, configName, seedText)
+                                        : tr("%1 l3d (%2)").arg(verb, configName);
+                                }
+                                QAction* launchAction = menu.addAction(label);
                                 launchAction->setEnabled(
+                                    validVolumePoint &&
                                     !configPath.isEmpty() &&
                                     (!requiresLasagnaModel || activeSegmentHasLasagnaModel));
                                 launchAction->setToolTip(configPath);
@@ -1000,91 +1000,51 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             };
 
                         addLasagnaLaunchAction(
-                            tr("new"), SegmentationLasagnaPanel::LasagnaMode::NewModel, false);
+                            tr("new"), SegmentationLasagnaPanel::LasagnaMode::NewModel, false, true);
                         addLasagnaLaunchAction(
-                            tr("reopt"), SegmentationLasagnaPanel::LasagnaMode::ReOptimize, true);
+                            tr("reopt"), SegmentationLasagnaPanel::LasagnaMode::ReOptimize, true, false);
 
-                        auto* chooseMenu = coordMenu->addMenu(tr("choose"));
-                        if (!lasagnaPanel) {
-                            chooseMenu->setEnabled(false);
-                        } else {
-                            QAction* loading = chooseMenu->addAction(tr("Loading..."));
-                            loading->setEnabled(false);
-
-                            const QString selectedNewConfig =
-                                lasagnaPanel->selectedLasagnaConfigPathForMode(
-                                    SegmentationLasagnaPanel::LasagnaMode::NewModel);
-                            const QString selectedReoptConfig =
-                                lasagnaPanel->selectedLasagnaConfigPathForMode(
-                                    SegmentationLasagnaPanel::LasagnaMode::ReOptimize);
-                            auto* watcher = new QFutureWatcher<QStringList>(this);
-                            QPointer<QMenu> chooseMenuPtr(chooseMenu);
-                            QPointer<SegmentationLasagnaPanel> panelPtr(lasagnaPanel);
-                            connect(watcher, &QFutureWatcher<QStringList>::finished, this,
-                                    [this, watcher, chooseMenuPtr, panelPtr, seedX, seedY, seedZ]() {
-                                        const QStringList configs = watcher->result();
-                                        watcher->deleteLater();
-                                        if (!chooseMenuPtr) {
-                                            return;
-                                        }
-                                        chooseMenuPtr->clear();
-                                        if (configs.isEmpty()) {
-                                            QAction* none =
-                                                chooseMenuPtr->addAction(tr("No config selected"));
-                                            none->setEnabled(false);
-                                            return;
-                                        }
-                                        for (const QString& configPath : configs) {
-                                            QAction* configAction = chooseMenuPtr->addAction(
-                                                QFileInfo(configPath).fileName());
-                                            configAction->setToolTip(configPath);
-                                            connect(configAction, &QAction::triggered, this,
-                                                    [this, panelPtr, configPath, seedX, seedY, seedZ]() {
-                                                        if (!panelPtr) {
-                                                            return;
-                                                        }
-                                                        panelPtr->startOptimizationAtSeed(
-                                                            _state,
-                                                            statusBar(),
-                                                            SegmentationLasagnaPanel::LasagnaMode::NewModel,
-                                                            configPath,
-                                                            seedX,
-                                                            seedY,
-                                                            seedZ);
-                                                    });
-                                        }
-                                    });
-                            watcher->setFuture(QtConcurrent::run([selectedNewConfig, selectedReoptConfig]() {
-                                QStringList configs;
-                                auto addConfig = [&configs](const QString& path) {
-                                    if (!path.isEmpty() && !configs.contains(path)) {
-                                        configs.append(path);
-                                    }
-                                };
-                                auto scanConfigDir = [&configs, addConfig](const QString& selectedConfig) {
-                                    if (selectedConfig.isEmpty()) {
-                                        return;
-                                    }
-                                    QFileInfo selectedInfo(selectedConfig);
-                                    const QString dirPath = selectedInfo.absolutePath();
-                                    if (!dirPath.isEmpty()) {
-                                        QDir dir(dirPath);
-                                        const QStringList jsonFiles = dir.entryList(
-                                            QStringList{QStringLiteral("*.json")},
-                                            QDir::Files,
-                                            QDir::Name);
-                                        for (const QString& fileName : jsonFiles) {
-                                            addConfig(dir.absoluteFilePath(fileName));
-                                        }
-                                    }
-                                    addConfig(selectedConfig);
-                                };
-                                scanConfigDir(selectedNewConfig);
-                                scanConfigDir(selectedReoptConfig);
-                                return configs;
-                            }));
+                        auto* configMenu = menu.addMenu(
+                            tr("l3d config (%1,%2,%3)").arg(seedX).arg(seedY).arg(seedZ));
+                        configMenu->setEnabled(validVolumePoint && lasagnaPanel);
+                        if (lasagnaPanel) {
+                            QStringList configs = lasagnaPanel->lasagnaConfigPathsForMode(
+                                SegmentationLasagnaPanel::LasagnaMode::NewModel);
+                            const QStringList reoptConfigs = lasagnaPanel->lasagnaConfigPathsForMode(
+                                SegmentationLasagnaPanel::LasagnaMode::ReOptimize);
+                            for (const QString& configPath : reoptConfigs) {
+                                if (!configs.contains(configPath)) {
+                                    configs.append(configPath);
+                                }
+                            }
+                            if (configs.isEmpty()) {
+                                QAction* none = configMenu->addAction(tr("No config selected"));
+                                none->setEnabled(false);
+                            }
+                            for (const QString& configPath : configs) {
+                                QAction* configAction =
+                                    configMenu->addAction(QFileInfo(configPath).fileName());
+                                configAction->setToolTip(configPath);
+                                connect(configAction, &QAction::triggered, this,
+                                        [this, lasagnaPanel, configPath, seedX, seedY, seedZ]() {
+                                            if (!lasagnaPanel) {
+                                                return;
+                                            }
+                                            lasagnaPanel->startOptimizationAtSeed(
+                                                _state,
+                                                statusBar(),
+                                                SegmentationLasagnaPanel::LasagnaMode::NewModel,
+                                                configPath,
+                                                seedX,
+                                                seedY,
+                                                seedZ);
+                                        });
+                            }
                         }
 
+                        QAction* action = menu.addAction(tr("New line annotation"));
+                        action->setEnabled(_lineAnnotationController &&
+                                           _lineAnnotationController->canLaunchFromViewer(viewer));
                         QAction* selected = menu.exec(globalPos);
                         if (selected == action && action->isEnabled() && _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewer(viewer, scenePoint);
