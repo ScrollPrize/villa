@@ -25,7 +25,7 @@
 			"name": "affine_seed_quad_init",
 			"steps": 100,
 			"lr": 0.1,
-			"params": ["affine"],
+			"params": ["map_surf_affine"],
 			"w_fac": 1.0,
 			"args": {
 				"status_interval": 10,
@@ -39,7 +39,7 @@
 		{
 			"steps": 500,
 			"lr": 0.01,
-			"params": ["affine"],
+			"params": ["map_surf_affine"],
 			"w_fac": 1.0,
 			"args": {
 				"status_interval": 100,
@@ -49,7 +49,7 @@
 		{
 			"steps": 500,
 			"lr": 0.1,
-			"params": ["map_uv_ms"],
+			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"w_fac": 1.0,
 			"args": {
@@ -60,7 +60,7 @@
 		{
 			"steps": 200,
 			"lr": 0.1,
-			"params": ["map_uv_ms"],
+			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"w_fac": 1.0,
 			"args": {
@@ -71,7 +71,7 @@
 		{
 			"steps": 200,
 			"lr": 0.01,
-			"params": ["map_uv_ms"],
+			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"w_fac": 1.0,
 			"args": {

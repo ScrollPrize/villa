@@ -16,6 +16,7 @@
 #include <QUrl>
 
 #include <iostream>
+#include <memory>
 
 #ifdef Q_OS_UNIX
 #include <signal.h>
@@ -35,6 +36,27 @@ namespace
 constexpr int kServiceStartTimeoutMs = 60000;  // 1 minute (no torch compile)
 constexpr int kServiceStopTimeoutMs = 500;
 constexpr int kPollIntervalMs = 500;
+
+double bytesToMiB(qint64 bytes)
+{
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+double elapsedSeconds(const QElapsedTimer& timer)
+{
+    const qint64 ms = timer.elapsed();
+    return ms > 0 ? static_cast<double>(ms) / 1000.0 : 0.001;
+}
+
+void logTransferTiming(const char* label, qint64 bytes, double seconds)
+{
+    const double mib = bytesToMiB(bytes);
+    const double rate = seconds > 0.0 ? mib / seconds : 0.0;
+    std::cout << "[lasagna] " << label
+              << ": " << mib << " MiB"
+              << " in " << seconds << "s"
+              << " (" << rate << " MiB/s)" << std::endl;
+}
 
 QString findPythonExecutable()
 {
@@ -401,9 +423,43 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
     QByteArray body = QJsonDocument(config).toJson(QJsonDocument::Compact);
+    const qint64 bodyBytes = body.size();
+
+    std::cout << "[lasagna] sending optimize request: "
+              << bytesToMiB(bodyBytes) << " MiB" << std::endl;
 
     QNetworkReply* reply = _nam->post(req, body);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+    auto sendTimer = std::make_shared<QElapsedTimer>();
+    auto uploadLogged = std::make_shared<bool>(false);
+    sendTimer->start();
+    connect(reply, &QNetworkReply::uploadProgress,
+            this,
+            [sendTimer, uploadLogged, bodyBytes](qint64 bytesSent, qint64 bytesTotal) {
+        if (*uploadLogged) {
+            return;
+        }
+        const qint64 expected = bytesTotal > 0 ? bytesTotal : bodyBytes;
+        if (expected > 0 && bytesSent >= expected) {
+            *uploadLogged = true;
+            logTransferTiming("optimize upload", expected, elapsedSeconds(*sendTimer));
+        }
+    });
+    connect(reply, &QNetworkReply::finished, this, [this, reply, sendTimer, uploadLogged, bodyBytes]() {
+        if (!*uploadLogged) {
+            *uploadLogged = true;
+            logTransferTiming("optimize upload", bodyBytes, elapsedSeconds(*sendTimer));
+        }
+        const QVariant status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+        std::cout << "[lasagna] optimize response:"
+                  << " elapsed=" << elapsedSeconds(*sendTimer) << "s";
+        if (status.isValid()) {
+            std::cout << " http=" << status.toInt();
+        } else {
+            std::cout << " http=<none>";
+        }
+        std::cout << " error=" << reply->error()
+                  << " bytes_available=" << reply->bytesAvailable()
+                  << std::endl;
         handleOptimizeReply(reply);
     });
 }

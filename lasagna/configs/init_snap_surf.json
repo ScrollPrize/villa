@@ -63,7 +63,7 @@
 			"name": "affine_seed_quad_init",
 			"steps": 100,
 			"lr": 0.1,
-			"params": ["map_affine"],
+			"params": ["map_surf_affine"],
 			"args": {
 				"status_interval": 10,
 				"subdiv": 2,
@@ -95,10 +95,10 @@
 			}
 		},
 		{
-			"name": "map_affine_refine",
+			"name": "map_surf_affine_refine",
 			"steps": 500,
 			"lr": 0.01,
-			"params": ["map_affine"],
+			"params": ["map_surf_affine"],
 			"args": {
 				"status_interval": 100,
 				"subdiv": 2
@@ -108,7 +108,7 @@
 			"name": "map_uv_coarse",
 			"steps": 500,
 			"lr": 0.1,
-			"params": ["map_uv_ms"],
+			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
 				"subdiv": 2,
@@ -119,7 +119,7 @@
 			"name": "map_uv_refine",
 			"steps": 200,
 			"lr": 0.1,
-			"params": ["map_uv_ms"],
+			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
 				"subdiv": 2,
@@ -130,7 +130,7 @@
 			"name": "map_uv_fine",
 			"steps": 200,
 			"lr": 0.01,
-			"params": ["map_uv_ms"],
+			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
 				"subdiv": 2,
@@ -156,7 +156,7 @@
 						"name": "snap_map_opt_final",
 						"steps": 1,
 						"lr": 0.01,
-						"params": ["map_uv_ms"],
+						"params": ["map_surf_ms"],
 						"min_scaledown": 0,
 						"args": {
 							"subdiv": 2,

@@ -191,8 +191,10 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_opt.add_args(p)
 	p.add_argument("--out-dir", default=None, help="Output directory for snapshots and debug")
 	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
-	p.add_argument("--model-init", choices=("seed", "ext", "model"), default="seed",
-		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input")
+	p.add_argument("--model-init", choices=("seed", "ext", "model", "flatten"), default="seed",
+		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input, flatten optimizes one external tifxyz inverse map")
+	p.add_argument("--flatten-solver", choices=("torch", "inverse", "forward"), default="torch",
+		help="Flatten solver variant for model-init=flatten: torch/inverse keeps the existing inverse-map Adam path; forward optimizes source-vertex UVs and inverts at export")
 	p.add_argument("--window-size", type=int, default=None,
 		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
 	p.add_argument("--window-overlap", type=int, default=0,
@@ -243,6 +245,235 @@ def _compute_window_grid(
 	return windows
 
 
+def _dummy_flatten_data() -> fit_data.FitData3D:
+	return fit_data.FitData3D(
+		cos=None,
+		grad_mag=None,
+		nx=None,
+		ny=None,
+		pred_dt=None,
+		corr_points=None,
+		winding_volume=None,
+		origin_fullres=(0.0, 0.0, 0.0),
+		spacing=(1.0, 1.0, 1.0),
+		channel_spacing=None,
+		_vol_size=(1, 1, 1),
+		sparse_caches=None,
+	)
+
+
+def _mesh_step_from_tifxyz_meta(meta: dict, fallback: int) -> int:
+	scale = meta.get("scale") if isinstance(meta, dict) else None
+	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
+		return max(1, int(round(1.0 / float(scale[0]))))
+	return max(1, int(fallback))
+
+
+def _scale_from_tifxyz_meta(meta: dict, mesh_step: int) -> float:
+	scale = meta.get("scale") if isinstance(meta, dict) else None
+	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
+		return float(scale[0])
+	return 1.0 / float(max(1, int(mesh_step)))
+
+
+def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData3D, fit_config: dict) -> None:
+	st = dict(mdl.state_dict())
+	for k in [k for k in st if k.startswith("mesh_ms.")]:
+		del st[k]
+	with torch.no_grad():
+		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+		sentinel = torch.full_like(xyz, -1.0)
+		xyz = torch.where(point_mask.unsqueeze(0).unsqueeze(-1), xyz, sentinel)
+		st["mesh_flat"] = xyz.permute(3, 0, 1, 2).detach().cpu()
+		st["flatten_map_flat"] = map_yx.detach().cpu()
+		st["flatten_point_mask"] = point_mask.detach().cpu()
+	st["_model_params_"] = asdict(mdl.params)
+	st["_fit_config_"] = fit_config
+	torch.save(st, path)
+
+
+def _export_flatten_result(
+	*,
+	mdl: model.Model3D,
+	data: fit_data.FitData3D,
+	out_dir: Path,
+	scale: float,
+	voxel_size_um: float | None,
+	fit_config: dict,
+	model_source: Path | None,
+) -> None:
+	import numpy as np
+	import fit2tifxyz
+
+	out_dir.mkdir(parents=True, exist_ok=True)
+	with torch.no_grad():
+		_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+	xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
+	mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
+	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
+	y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
+	z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
+	mesh_step = 1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step)
+	area = fit2tifxyz._get_area(x, y, z, mesh_step, voxel_size_um)
+	fit2tifxyz._write_tifxyz(
+		out_dir=out_dir / "flatten.tifxyz",
+		x=x,
+		y=y,
+		z=z,
+		scale=scale,
+		model_source=model_source,
+		fit_config=fit_config,
+		area=area,
+	)
+	fit2tifxyz._print_area(area)
+
+
+def _run_flatten_mode(
+	*,
+	cfg: dict,
+	fit_config: dict,
+	args: argparse.Namespace,
+	model_cfg: cli_model.ModelConfig,
+	opt_cfg: cli_opt.OptConfig,
+	progress_enabled: bool,
+	out_dir: str | None,
+) -> int:
+	ext_surfaces_cfg = cfg.get("external_surfaces", None)
+	if not isinstance(ext_surfaces_cfg, list) or len(ext_surfaces_cfg) != 1:
+		raise ValueError("model-init=flatten requires exactly one external_surfaces entry")
+	ext0 = ext_surfaces_cfg[0]
+	if not isinstance(ext0, dict) or not ext0.get("path"):
+		raise ValueError("model-init=flatten external_surfaces[0] requires path")
+	if getattr(args, "tifxyz_init", None):
+		raise ValueError("model-init=flatten uses external_surfaces[0], not --tifxyz-init")
+	if model_cfg.model_input is not None:
+		raise ValueError("model-init=flatten must not set --model-input")
+
+	device = torch.device(str(getattr(args, "device", "cuda")))
+	from tifxyz_io import load_tifxyz
+	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device)
+	mesh_step = _mesh_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
+	scale = _scale_from_tifxyz_meta(meta, mesh_step)
+
+	stage_cfg = copy.deepcopy(cfg)
+	for key in ("external_surfaces", "tifxyz", "offset_value", "voxel_size_um", "corr_points"):
+		stage_cfg.pop(key, None)
+	stages = optimizer.load_stages_cfg(stage_cfg, init_mode=None)
+	flatten_args: dict[str, object] = {}
+	if isinstance(cfg.get("args"), dict):
+		flatten_args.update(cfg["args"])
+	if stages:
+		flatten_args.update(stages[0].global_opt.args or {})
+	flatten_solver_raw = flatten_args.get(
+		"flatten_solver",
+		flatten_args.get("flatten-solver", getattr(args, "flatten_solver", "torch")),
+	)
+	flatten_direction = model.Model3D._normalize_flatten_direction(str(flatten_solver_raw))
+	flatten_output_margin = float(flatten_args.get(
+		"flatten_output_margin",
+		flatten_args.get("flatten_forward_output_margin", 0.10),
+	))
+	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
+	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
+	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
+	mdl = model.Model3D.from_flatten_tifxyz_crop(
+		xyz,
+		valid,
+		device=device,
+		mesh_step=mesh_step,
+		winding_step=model_cfg.winding_step,
+		subsample_mesh=model_cfg.subsample_mesh,
+		subsample_winding=model_cfg.subsample_winding,
+		flatten_filter_source_angles=filter_source_angles,
+		flatten_filter_angle_deg=filter_angle_deg,
+		flatten_filter_radius=filter_radius,
+		flatten_direction=flatten_direction,
+		flatten_output_margin=flatten_output_margin,
+	)
+	data = _dummy_flatten_data()
+
+	print("data: flatten-only (no volume input)")
+	print("model:", model_cfg)
+	print("opt:", opt_cfg)
+	print(
+		f"[fit] model-init=flatten solver={flatten_direction} source={ext0['path']} "
+		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
+		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
+		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",
+		flush=True,
+	)
+	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})
+	if filter_source_angles:
+		print(
+			f"[fit] flatten source angle filter: angle>{filter_angle_deg:.4g} radius={max(0, filter_radius)} "
+			f"bad_pairs={int(filter_stats.get('bad_pairs', 0.0))} "
+			f"bad_cells={int(filter_stats.get('bad_cells', 0.0))} "
+			f"dilated={int(filter_stats.get('bad_cells_dilated', 0.0))} "
+			f"cell_valid={int(filter_stats.get('cell_valid_after', 0.0))}/"
+			f"{int(filter_stats.get('cell_valid_before', 0.0))}",
+			flush=True,
+		)
+
+	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
+		if out_dir is None:
+			return
+		out = Path(out_dir)
+		out.mkdir(parents=True, exist_ok=True)
+		snaps = out / "model_snapshots"
+		snaps.mkdir(parents=True, exist_ok=True)
+		_save_flatten_model(str(snaps / f"model_{stage}_{step:06d}.pt"), mdl=mdl, data=data, fit_config=fit_config)
+
+	def _progress(*, step: int, total: int, loss: float, **_kw: object) -> None:
+		if progress_enabled:
+			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
+
+	with torch.no_grad():
+		map_yx, xyz0, point_mask, quad_mask = mdl._flatten_sample_current()
+		print(
+			f"initial flatten: map_shape={tuple(map_yx.shape)} "
+			f"point_valid={int(point_mask.sum())}/{point_mask.numel()} "
+			f"quad_valid={int(quad_mask.sum())}/{quad_mask.numel()}",
+			flush=True,
+		)
+
+	optimizer.optimize(
+		model=mdl,
+		data=data,
+		stages=stages,
+		snapshot_interval=opt_cfg.snapshot_interval,
+		snapshot_fn=_snapshot,
+		progress_fn=_progress,
+		ensure_data_fn=None,
+		seed_xyz=None,
+		out_dir=out_dir,
+	)
+
+	if device.type == "cuda":
+		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
+		print(f"[fit] peak GPU memory: {peak_gb:.2f} GiB", flush=True)
+
+	model_out: str | None = model_cfg.model_output
+	if model_out is not None:
+		_save_flatten_model(str(model_out), mdl=mdl, data=data, fit_config=fit_config)
+		print(f"[fit] saved model to {model_out}")
+	if out_dir is not None:
+		out = Path(out_dir)
+		out.mkdir(parents=True, exist_ok=True)
+		final_path = out / "model_final.pt"
+		_save_flatten_model(str(final_path), mdl=mdl, data=data, fit_config=fit_config)
+		model_source = Path(model_out) if model_out is not None else final_path
+		_export_flatten_result(
+			mdl=mdl,
+			data=data,
+			out_dir=out / "tifxyz",
+			scale=scale,
+			voxel_size_um=(None if cfg.get("voxel_size_um") is None else float(cfg.get("voxel_size_um"))),
+			fit_config=fit_config,
+			model_source=model_source,
+		)
+	return 0
+
+
 def main(argv: list[str] | None = None) -> int:
 	if argv is None:
 		argv = sys.argv[1:]
@@ -260,22 +491,33 @@ def main(argv: list[str] | None = None) -> int:
 	fit_config.setdefault("args", {}).update(
 		{k.replace("_", "-"): v for k, v in vars(args).items()})
 
-	data_cfg = cli_data.from_args(args)
 	model_cfg = cli_model.from_args(args)
 	opt_cfg = cli_opt.from_args(args)
 	progress_enabled = bool(args.progress)
 	_out_dir = args.out_dir
 	_stage_done("parse_config", _t)
 
+	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
+	if model_init not in {"seed", "ext", "model", "flatten"}:
+		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, model, or flatten)")
+	if model_init == "flatten":
+		return _run_flatten_mode(
+			cfg=cfg,
+			fit_config=fit_config,
+			args=args,
+			model_cfg=model_cfg,
+			opt_cfg=opt_cfg,
+			progress_enabled=progress_enabled,
+			out_dir=_out_dir,
+		)
+
+	data_cfg = cli_data.from_args(args)
 	print("data:", data_cfg)
 	print("model:", model_cfg)
 	print("opt:", opt_cfg)
 
 	device = torch.device(data_cfg.device)
 	_require_torch_device_available(device)
-	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
-	if model_init not in {"seed", "ext", "model"}:
-		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, or model)")
 	init_mode = str(model_cfg.init_mode).strip().lower()
 	if init_mode == "shell-dir-crop" and model_init != "seed":
 		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")

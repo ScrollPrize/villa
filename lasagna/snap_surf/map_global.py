@@ -53,20 +53,40 @@ class GlobalMapConfig:
 	stages: tuple[GlobalMapStageConfig, ...] = ()
 
 
+def _public_stage_param(name: str) -> str:
+	return {"affine": "map_surf_affine", "map_uv_ms": "map_surf_ms"}.get(str(name), str(name))
+
+
+def _public_stage_params(params: tuple[str, ...]) -> tuple[str, ...]:
+	return tuple(_public_stage_param(p) for p in params)
+
+
+def _stage_param_label(params: tuple[str, ...], *, fallback: str) -> str:
+	public = _public_stage_params(params)
+	return "_".join(public) if public else fallback
+
+
 def _canonical_stage_params(params: tuple[str, ...], *, normal_lasagna: bool = False) -> tuple[str, ...]:
 	out: list[str] = []
+	replacements = {
+		"affine": "map_surf_affine",
+		"map_affine": "map_surf_affine",
+		"map_uv_ms": "map_surf_ms",
+	}
 	for p in params:
 		name = str(p)
-		if normal_lasagna and name == "affine":
-			raise ValueError("global map stage params: use 'map_affine' in normal lasagna stages, not 'affine'")
-		if normal_lasagna and name == "map_affine":
+		if name in replacements:
+			raise ValueError(f"global map stage params: use '{replacements[name]}' instead of '{name}'")
+		if name == "map_surf_affine":
 			name = "affine"
+		elif name == "map_surf_ms":
+			name = "map_uv_ms"
 		out.append(name)
 	bad = sorted(set(out) - {"affine", "map_uv_ms"})
 	if bad:
 		raise ValueError(f"global map stage params: unknown name(s): {bad}")
 	if "affine" in out and "map_uv_ms" in out:
-		raise ValueError("global map stage params: affine and map_uv_ms must be optimized in separate stages")
+		raise ValueError("global map stage params: map_surf_affine and map_surf_ms must be optimized in separate stages")
 	return tuple(out)
 
 
@@ -1073,7 +1093,7 @@ def _write_stage_objs(
 	uv: torch.Tensor,
 	fixture: MapFixture,
 ) -> None:
-	label = stage.name or ("_".join(stage.params) if stage.params else "noop")
+	label = stage.name or _stage_param_label(stage.params, fallback="noop")
 	out = out_root / "objs" / f"stage_{int(stage_idx):03d}_{_debug_obj_safe_label(label)}"
 	_write_map_objs(
 		out,
@@ -1082,7 +1102,7 @@ def _write_stage_objs(
 		meta={
 			"stage": int(stage_idx),
 			"name": stage.name,
-			"params": list(stage.params),
+			"params": list(_public_stage_params(stage.params)),
 		},
 	)
 
@@ -1181,7 +1201,7 @@ def _global_progress_widths(cfg: GlobalMapConfig) -> dict[str, int]:
 	max_steps = max((int(stage.steps) for stage in cfg.stages), default=1)
 	values["stg"] = str(stage_count - 1)
 	values["it"] = f"{max_steps}/{max_steps}"
-	values["params"] = max((",".join(stage.params) or "-" for stage in cfg.stages), key=len, default="-")
+	values["params"] = max((",".join(_public_stage_params(stage.params)) or "-" for stage in cfg.stages), key=len, default="-")
 	values["lvl"] = str(max((int(stage.min_scaledown) for stage in cfg.stages), default=0))
 	values["loss"] = "-1.0e+99"
 	for key in ("dist", "vec", "norm", "smooth", "bend", "jac", "metric_smooth", "area_smooth", "prior", "station"):
@@ -1216,7 +1236,7 @@ def _print_global_progress(
 	values = {
 		"stg": str(int(stage_idx)),
 		"it": str(iter_label),
-		"params": ",".join(params) or "-",
+		"params": ",".join(_public_stage_params(params)) or "-",
 		"lvl": str(int(level)),
 		"loss": format_progress_value(float(loss)),
 		"dist": format_progress_value(_global_term_value(terms, "dist")),
@@ -1508,14 +1528,14 @@ class GlobalMapRuntime:
 				debug_root = Path("snap_surf_objs")
 			else:
 				debug_root = Path(str(debug_obj_dir))
-			label = stage.name or ("_".join(stage.params) if stage.params else "map_stage")
+			label = stage.name or _stage_param_label(stage.params, fallback="map_stage")
 			_write_map_objs(
 				debug_root / f"map_global_{_debug_obj_safe_label(label)}",
 				uv=self._uv().detach(),
 				fixture=fixture,
 				meta={
 					"name": label,
-					"params": list(stage.params),
+					"params": list(_public_stage_params(stage.params)),
 					"steps": int(stage.steps),
 					"persistent_optimizer": bool(persistent_optimizer),
 					**stats,
@@ -1645,7 +1665,7 @@ def optimize_fixture(
 				"stage": stage_idx,
 				"name": stage.name,
 				"step": int(stage.steps),
-				"params": list(stage.params),
+				"params": list(_public_stage_params(stage.params)),
 				"train_min_level": 0,
 				**err,
 			})
@@ -1668,7 +1688,7 @@ def optimize_fixture(
 				"stage": stage_idx,
 				"name": stage.name,
 				"step": 0,
-				"params": list(stage.params),
+				"params": list(_public_stage_params(stage.params)),
 				"train_min_level": 0,
 				**err,
 			})
@@ -1793,7 +1813,7 @@ def optimize_fixture(
 				history.append({
 					"stage": stage_idx,
 					"step": step,
-					"params": list(stage.params),
+					"params": list(_public_stage_params(stage.params)),
 					"train_min_level": level,
 					"loss": report_loss,
 					**err,
@@ -1812,7 +1832,7 @@ def optimize_fixture(
 		fixture=fixture,
 		meta={
 			"name": "final",
-			"params": ["map_uv_ms"] if global_model is not None else ["affine"],
+			"params": ["map_surf_ms"] if global_model is not None else ["map_surf_affine"],
 			"stages_completed": len(cfg_global.stages),
 		},
 	)

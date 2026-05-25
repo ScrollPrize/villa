@@ -26,6 +26,7 @@ import opt_loss_cyl
 import opt_loss_snap_surf
 from snap_surf import map_global as snap_surf_map_global
 from progress_table import format_progress_value, print_progress_legend
+import opt_loss_flatten
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -65,6 +66,7 @@ class OptSettings:
 	w_fac: dict | float | None
 	eff: dict[str, float]
 	base_eff: dict[str, float]
+	steps_auto: bool = False
 	args: dict | None = None
 	kind: str = "model"
 
@@ -101,8 +103,17 @@ CYLINDER_LOSS_NAMES = (
 	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
 	"cyl_base_mesh", "cyl_base_gt", "cyl_outside",
 )
-MODEL_OPT_PARAMS = {"mesh_ms", "amp", "bias", "cyl_params"}
-MAP_OPT_PARAMS = {"map_affine", "map_uv_ms"}
+MODEL_OPT_PARAMS = {"mesh_ms", "amp", "bias", "cyl_params", "map_flatten_ms"}
+MAP_OPT_PARAMS = {"map_surf_affine", "map_surf_ms"}
+PARAM_REPLACEMENTS = {
+	"flatten_map_ms": "map_flatten_ms",
+	"map_affine": "map_surf_affine",
+	"affine": "map_surf_affine",
+	"map_uv_ms": "map_surf_ms",
+}
+MODEL_INTERNAL_PARAM = {
+	"map_flatten_ms": "flatten_map_ms",
+}
 MAP_LOSS_NAMES = (
 	"map_dist",
 	"map_vec_normal",
@@ -187,19 +198,25 @@ def _cyl_outside_mode_for_direction(direction: int) -> str:
 
 def _stage_to_modifiers(
 	base: dict[str, float],
+	prev_eff: dict[str, float] | None,
 	default_mul: float | None,
 	w_fac: dict | None,
 ) -> tuple[dict[str, float], dict[str, float]]:
-	eff = {k: float(v) for k, v in base.items()}
-	if default_mul is not None:
-		for name in base.keys():
-			if w_fac is None or name not in w_fac:
-				eff[name] = float(base[name]) * float(default_mul)
-	if w_fac is not None:
-		for k, v in w_fac.items():
-			if v is None:
-				continue
-			eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
+	if prev_eff is None:
+		prev_eff = {k: float(v) for k, v in base.items()}
+	if default_mul is None and w_fac is None:
+		eff = dict(prev_eff)
+	else:
+		eff = dict(prev_eff)
+		if default_mul is not None:
+			for name in base.keys():
+				if w_fac is None or name not in w_fac:
+					eff[name] = float(base[name]) * float(default_mul)
+		if w_fac is not None:
+			for k, v in w_fac.items():
+				if v is None:
+					continue
+				eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
 
 	mods: dict[str, float] = {}
 	for name, val in eff.items():
@@ -217,9 +234,10 @@ def _parse_opt_settings(
 	stage_name: str,
 	opt_cfg: dict,
 	base: dict[str, float],
+	prev_eff: dict[str, float] | None,
 ) -> OptSettings:
 	opt_cfg = dict(opt_cfg)
-	steps = max(0, int(opt_cfg.get("steps", 0)))
+	steps_raw = opt_cfg.get("steps", 0)
 	lr_raw = opt_cfg.get("lr", 1e-3)
 	if isinstance(lr_raw, list):
 		if not lr_raw:
@@ -231,10 +249,9 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	if "affine" in params:
-		raise ValueError(
-			f"stages_json: stage '{stage_name}' opt.params: use 'map_affine' in normal lasagna stages, not 'affine'"
-		)
+	for old, new in PARAM_REPLACEMENTS.items():
+		if old in params:
+			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: use '{new}' instead of '{old}'")
 	model_params = set(params) & MODEL_OPT_PARAMS
 	map_params = set(params) & MAP_OPT_PARAMS
 	bad_params = sorted(set(params) - MODEL_OPT_PARAMS - MAP_OPT_PARAMS)
@@ -256,6 +273,18 @@ def _parse_opt_settings(
 	if args_raw is not None and not isinstance(args_raw, dict):
 		raise ValueError(f"stages_json: stage '{stage_name}' opt 'args' must be an object or null")
 	args = dict(args_raw) if args_raw else {}
+	steps_auto = isinstance(steps_raw, str) and steps_raw.strip().lower() == "auto"
+	if steps_auto:
+		steps = max(1, int(args.get("auto_steps_max", 10000)))
+	elif isinstance(steps_raw, str):
+		try:
+			steps = max(0, int(steps_raw))
+		except ValueError as exc:
+			raise ValueError(
+				f"stages_json: stage '{stage_name}' opt.steps: expected an integer or 'auto'"
+			) from exc
+	else:
+		steps = max(0, int(steps_raw))
 	opt_cfg.pop("steps", None)
 	opt_cfg.pop("lr", None)
 	opt_cfg.pop("params", None)
@@ -284,12 +313,14 @@ def _parse_opt_settings(
 				)
 	if kind == "map" and isinstance(w_fac, (int, float)):
 		scale = float(w_fac)
-		eff, _mods = _stage_to_modifiers(base, default_mul, None)
+		eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, None)
 		for name in MAP_LOSS_NAMES:
 			eff[name] = float(base.get(name, 0.0)) * scale
 	else:
 		model_w_fac = w_fac if isinstance(w_fac, dict) else None
-		eff, _mods = _stage_to_modifiers(base, default_mul, model_w_fac)
+		eff, _mods = _stage_to_modifiers(base, prev_eff, default_mul, model_w_fac)
+	if steps_auto and "cyl_params" in params:
+		raise ValueError(f"stages_json: stage '{stage_name}' opt.steps='auto' is not supported for cyl_params stages")
 	if "cyl_params" in params:
 		if params != ["cyl_params"]:
 			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
@@ -305,6 +336,11 @@ def _parse_opt_settings(
 			)
 		if not any(float(eff.get(name, 0.0)) != 0.0 for name in CYLINDER_LOSS_NAMES):
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
+	if "map_flatten_ms" in params and not any(
+		float(eff.get(name, 0.0)) != 0.0
+		for name in ("flatten_sdir", "flatten_map_step", "flatten_avg_offset", "flatten_orient")
+	):
+		raise ValueError(f"stages_json: stage '{stage_name}' with map_flatten_ms requires a nonzero flatten loss")
 	return OptSettings(
 		steps=steps,
 		lr=lr,
@@ -314,6 +350,7 @@ def _parse_opt_settings(
 		w_fac=w_fac,
 		eff=eff,
 		base_eff={k: float(v) for k, v in base.items()},
+		steps_auto=steps_auto,
 		args=args,
 		kind=kind,
 	)
@@ -359,6 +396,10 @@ lambda_global: dict[str, float] = {
 	"cyl_base_mesh": 0.0,
 	"cyl_base_gt": 0.0,
 	"cyl_outside": 0.0,
+	"flatten_sdir": 0.0,
+	"flatten_map_step": 0.0,
+	"flatten_avg_offset": 0.0,
+	"flatten_orient": 0.0,
 }
 
 
@@ -370,6 +411,12 @@ def _init_mode_from_args(args_cfg: object) -> str | None:
 		return None
 	init_mode = args_cfg.get("init-mode", args_cfg.get("init_mode", None))
 	return None if init_mode is None else str(init_mode).strip().lower()
+
+
+def _model_init_from_args(args_cfg: object) -> str | None:
+	if not isinstance(args_cfg, dict):
+		return None
+	return str(args_cfg.get("model-init", args_cfg.get("model_init", "seed"))).strip().lower()
 
 
 def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
@@ -430,11 +477,14 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 	cfg = dict(cfg)
 	args_cfg = cfg.pop("args", None)
+	model_init = _model_init_from_args(args_cfg)
 	if init_mode is None:
 		init_mode = _init_mode_from_args(args_cfg)
 	else:
 		init_mode = str(init_mode).strip().lower()
 	base = dict(lambda_global)
+	if model_init == "flatten":
+		base = {k: 0.0 for k in base.keys()}
 	base_cfg = cfg.pop("base", None)
 	if isinstance(base_cfg, dict):
 		bad_base = sorted(set(str(k) for k in base_cfg.keys()) - set(base.keys()))
@@ -455,6 +505,7 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 	_require_consumed_dict(where="top-level", cfg=cfg)
 
 	out: list[Stage] = []
+	prev_eff: dict[str, float] | None = None
 	for s in stages_cfg:
 		if not isinstance(s, dict):
 			raise ValueError("stages_json: each stage must be an object")
@@ -467,7 +518,8 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 		_require_consumed_dict(where=f"stage '{name}'", cfg=s)
 		if not isinstance(global_opt_cfg, dict):
 			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
-		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
+		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base, prev_eff=prev_eff)
+		prev_eff = dict(global_opt.eff)
 		out.append(Stage(name=name, global_opt=global_opt))
 	if init_mode == "cylinder_seed":
 		_validate_cylinder_seed_stage_roles(out)
@@ -520,7 +572,7 @@ def _global_map_stage_from_opt_settings(*, name: str, opt_cfg: OptSettings, args
 		name=name,
 		steps=int(opt_cfg.steps),
 		lr=float(_lr_last(opt_cfg.lr)),
-		params=tuple("affine" if p == "map_affine" else p for p in opt_cfg.params),
+		params=tuple({"map_surf_affine": "affine", "map_surf_ms": "map_uv_ms"}.get(p, p) for p in opt_cfg.params),
 		min_scaledown=int(opt_cfg.min_scaledown),
 		w_fac=_global_map_w_fac_from_eff(opt_cfg.eff),
 		args=_global_map_args_from_eff(args, opt_cfg.eff),
@@ -536,6 +588,73 @@ def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
 	if -len(lr) <= idx < 0:
 		return float(lr[idx])
 	return float(lr[0])
+
+
+def _steps_label(opt_cfg: OptSettings) -> str:
+	if opt_cfg.steps_auto:
+		return f"auto:{int(opt_cfg.steps)}"
+	return str(int(opt_cfg.steps))
+
+
+def _auto_steps_window(args: dict | None) -> int:
+	args = args or {}
+	return max(1, int(args.get("auto_steps_window", 100)))
+
+
+def _auto_steps_min(args: dict | None, *, window: int) -> int:
+	args = args or {}
+	return max(1, int(args.get("auto_steps_min", int(window))))
+
+
+def _auto_steps_rel_threshold(args: dict | None) -> float:
+	args = args or {}
+	raw = args.get("auto_steps_rel_threshold", args.get("auto_steps_rel_tol", 1.0e-4))
+	return max(0.0, float(raw))
+
+
+def _auto_steps_relative_improvement(history: list[float], *, window: int) -> float:
+	if len(history) <= int(window):
+		return math.inf
+	before = history[:-int(window)]
+	recent = history[-int(window):]
+	if not before or not recent:
+		return math.inf
+	best_before = min(float(v) for v in before)
+	best_recent = min(float(v) for v in recent)
+	return (best_before - best_recent) / max(abs(best_before), 1.0e-12)
+
+
+def _auto_steps_should_stop(history: list[float], *, window: int, rel_threshold: float) -> bool:
+	return _auto_steps_relative_improvement(history, window=window) < float(rel_threshold)
+
+
+def _flatten_max_update_base(args: dict | None) -> float:
+	if args is None:
+		return 0.1
+	return float(args.get("flatten_max_update", 0.1))
+
+
+def _clamp_flatten_map_ms_update(
+	params: list[torch.nn.Parameter],
+	before: list[torch.Tensor],
+	*,
+	base_step: float,
+) -> None:
+	base = float(base_step)
+	if base <= 0.0:
+		return
+	with torch.no_grad():
+		for scale_i, (p, prev) in enumerate(zip(params, before)):
+			if p.shape != prev.shape:
+				continue
+			max_step = base * (2.0 ** int(scale_i))
+			delta = p - prev
+			if delta.ndim >= 1 and int(delta.shape[0]) == 2:
+				norm = torch.linalg.vector_norm(delta, dim=0, keepdim=True)
+				scale = (float(max_step) / norm.clamp_min(1.0e-12)).clamp_max(1.0)
+				p.copy_(prev + delta * scale)
+			else:
+				p.copy_(prev + delta.clamp(min=-float(max_step), max=float(max_step)))
 
 
 def check_data_bounds(model, data: fit_data.FitData3D, margin: float = 100.0,
@@ -1155,6 +1274,22 @@ def optimize(
 			"loss": opt_loss_cyl.cyl_outside_loss,
 			"needs": Needs(cyl_samples=True, cyl_shell_fields=True, prefetch_cyl_grad_mask=True),
 		},
+		"flatten_sdir": {
+			"loss": opt_loss_flatten.flatten_sdir_loss,
+			"needs": Needs(flatten=True),
+		},
+		"flatten_map_step": {
+			"loss": opt_loss_flatten.flatten_map_step_loss,
+			"needs": Needs(flatten=True),
+		},
+		"flatten_avg_offset": {
+			"loss": opt_loss_flatten.flatten_avg_offset_loss,
+			"needs": Needs(flatten=True),
+		},
+		"flatten_orient": {
+			"loss": opt_loss_flatten.flatten_orient_loss,
+			"needs": Needs(flatten=True),
+		},
 	}
 
 	_corr_start_printed = [False]
@@ -1238,6 +1373,15 @@ def optimize(
 			missing.append("ext_conn")
 		if required.ext_surfaces and res_.ext_surfaces is None:
 			missing.append("ext_surfaces")
+		if required.flatten:
+			if res_.flatten_map is None:
+				missing.append("flatten_map")
+			if res_.flatten_xyz is None:
+				missing.append("flatten_xyz")
+			if res_.flatten_point_mask is None:
+				missing.append("flatten_point_mask")
+			if res_.flatten_quad_mask is None:
+				missing.append("flatten_quad_mask")
 		cyl_active = bool(getattr(model, "cylinder_enabled", False))
 		if cyl_active:
 			if required.cyl_samples and (res_.cyl_xyz is None or res_.cyl_count <= 0):
@@ -1299,7 +1443,7 @@ def optimize(
 			_stage_done(f"{label}.total", _t_stage_total)
 			return data
 		if not is_cyl_shelling_stage:
-			print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
+			print(f"[optimizer] {label}: params={opt_cfg.params} steps={_steps_label(opt_cfg)} "
 				  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0 and not is_cyl_stage:
 			return data
@@ -1325,13 +1469,28 @@ def optimize(
 		stage_args = opt_cfg.args or {}
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
 		status_interval = max(0, int(status_interval_raw))
+		steps_label = _steps_label(opt_cfg)
+		auto_window = _auto_steps_window(stage_args) if opt_cfg.steps_auto else 0
+		auto_min = _auto_steps_min(stage_args, window=auto_window) if opt_cfg.steps_auto else 0
+		auto_rel_threshold = _auto_steps_rel_threshold(stage_args) if opt_cfg.steps_auto else 0.0
 		opt_timing_enabled = _opt_timing_enabled(stage_args)
 		opt_timing_interval = _opt_timing_interval(stage_args, fallback=max(1, status_interval or 100))
 		opt_timing_sync = _opt_timing_sync_cuda(stage_args)
+		flatten_max_update = (
+			_flatten_max_update_base(stage_args)
+			if "map_flatten_ms" in opt_cfg.params and bool(getattr(model, "flatten_enabled", False))
+			else 0.0
+		)
 		if opt_timing_enabled and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: opt timing enabled interval={opt_timing_interval} "
 				f"sync_cuda={int(opt_timing_sync)}",
+				flush=True,
+			)
+		if opt_cfg.steps_auto and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: auto steps max={opt_cfg.steps} window={auto_window} "
+				f"min={auto_min} rel_threshold={auto_rel_threshold:g}",
 				flush=True,
 			)
 
@@ -1458,6 +1617,7 @@ def optimize(
 				stage_name=f"{stage.name}.snap_surf_map.map_opt",
 				opt_cfg=raw_map_opt_cfg,
 				base=opt_cfg.base_eff,
+				prev_eff=None,
 			)
 			if map_opt_cfg.kind != "map":
 				raise ValueError(f"stage '{stage.name}' opt.args.snap_surf_map.map_opt params must be map params")
@@ -1498,6 +1658,10 @@ def optimize(
 		)
 		if snap_surf_legacy_active and not getattr(model, "_ext_surfaces", None):
 			raise ValueError("snap_surf requires external_surfaces")
+		opt_loss_flatten.configure(
+			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
+			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
+		)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
@@ -1571,8 +1735,9 @@ def optimize(
 			all_params_ = model.opt_params()
 			param_groups_: list[dict] = []
 			for name in settings.params:
-				group = all_params_.get(name, [])
-				if name in {"mesh_ms"}:
+				internal_name = MODEL_INTERNAL_PARAM.get(name, name)
+				group = all_params_.get(internal_name, [])
+				if name in {"mesh_ms", "map_flatten_ms"}:
 					k0 = max(0, int(settings.min_scaledown))
 					for pi, p in enumerate(group):
 						if pi < k0:
@@ -1601,6 +1766,12 @@ def optimize(
 		if not param_groups:
 			return data
 		opt = torch.optim.Adam(param_groups)
+		if flatten_max_update > 0.0 and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: flatten_max_update={flatten_max_update:g} "
+				f"(per-scale cap doubles at each coarser level)",
+				flush=True,
+			)
 		_stage_done(f"{label}.build_optimizer", _t)
 
 		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
@@ -1628,7 +1799,7 @@ def optimize(
 
 		_status_rows = 0
 		_status_legend_cols: tuple[str, ...] | None = None
-		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
+		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{steps_label}") + 2)
 
 		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
 						  its: float | None = None, force_header: bool = False,
@@ -1740,6 +1911,20 @@ def optimize(
 				"cyl_outside_pen_frac": "out%",
 				"cyl_outside_depth_max": "outmax",
 				"cyl_outside_depth_avg": "outavg",
+				"flatten_point_valid": "f_pt",
+				"flatten_quad_valid": "f_quad",
+				"flatten_tgt_step": "f_tgt",
+				"flatten_valid_to_invalid": "f_v2i",
+				"flatten_invalid_to_valid": "f_i2v",
+				"flatten_map_step": "f_mstep",
+				"flatten_avg_offset": "f_avg",
+				"flatten_avg_offset_norm": "f_avgn",
+				"flatten_orient": "f_orient",
+				"flatten_orient_fold_frac": "f_fold",
+				"flatten_orient_lowdet_frac": "f_lowdet",
+				"flatten_orient_min_det": "f_mindet",
+				"flatten_orient_mean_det": "f_det",
+				"flatten_sdir_no_new": "f_noadd",
 				"p:wcirc_avg_vx": "cavg",
 				"p:wcirc_tgt_vx": "ctgt",
 				"p:wstep_invalid_avg_vx": "iavg",
@@ -2221,6 +2406,8 @@ def optimize(
 						tv.update(opt_loss_snap_surf.last_stats())
 					if name == "snap_surf_map":
 						tv.update(opt_loss_snap_surf.last_stats())
+					if name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
+						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
 			if stage_uses_cyl_loss and not bool(getattr(res_, "cyl_shell_mode", False)):
@@ -2969,7 +3156,7 @@ def optimize(
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(
-				step_label=f"{label} 0/{opt_cfg.steps}",
+				step_label=f"{label} 0/{steps_label}",
 				loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
 				tv=term_vals0,
 				pv=param_vals0,
@@ -2986,6 +3173,8 @@ def optimize(
 		_stage_done(f"{label}.initial_snapshot", _t)
 
 		max_steps = opt_cfg.steps
+		final_step = 0
+		auto_loss_history = [float(loss0.detach().cpu())] if opt_cfg.steps_auto else []
 		_t_wall_start = time.perf_counter()
 		_t_steps_acc = 0
 		loss = loss0
@@ -3006,6 +3195,7 @@ def optimize(
 
 		for step in range(max_steps):
 			_t_iter = time.perf_counter()
+			auto_stop = False
 			# Sync: wait for chunks loaded by last prefetch
 			_t_io = time.perf_counter()
 			if _active_caches:
@@ -3071,7 +3261,17 @@ def optimize(
 				_opt_timing.sync()
 				_opt_timing.add("backward", time.perf_counter() - _t_part)
 			_t_part = time.perf_counter()
+			_flatten_update_before = None
+			_flatten_update_params = all_params.get("flatten_map_ms", [])
+			if flatten_max_update > 0.0 and _flatten_update_params:
+				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			opt.step()
+			if _flatten_update_before is not None:
+				_clamp_flatten_map_ms_update(
+					_flatten_update_params,
+					_flatten_update_before,
+					base_step=flatten_max_update,
+				)
 			if _opt_timing is not None:
 				_opt_timing.sync()
 				_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
@@ -3123,6 +3323,7 @@ def optimize(
 			_t_steps_acc += 1
 			_done_steps[0] += 1
 			step1 = step + 1
+			final_step = step1
 			_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
 			_overall_progress = (si + _stage_progress) / _num_stages if _num_stages > 0 else 1.0
 
@@ -3137,8 +3338,17 @@ def optimize(
 			if _opt_timing is not None:
 				_opt_timing.add("progress", time.perf_counter() - _t_part)
 
+			if opt_cfg.steps_auto:
+				auto_loss_history.append(float(loss.detach().cpu()))
+				if step1 >= auto_min and _auto_steps_should_stop(
+					auto_loss_history,
+					window=auto_window,
+					rel_threshold=auto_rel_threshold,
+				):
+					auto_stop = True
+
 			_t_part = time.perf_counter()
-			if step == 0 or step1 == max_steps or (status_interval > 0 and (step1 % status_interval) == 0):
+			if step == 0 or step1 == max_steps or auto_stop or (status_interval > 0 and (step1 % status_interval) == 0):
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
@@ -3148,7 +3358,7 @@ def optimize(
 				_t_wall_now = time.perf_counter()
 				_t_wall_elapsed = _t_wall_now - _t_wall_start
 				_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
-				_print_status(step_label=f"{label} {step1}/{opt_cfg.steps}",
+				_print_status(step_label=f"{label} {step1}/{steps_label}",
 							  loss_val=float(display_loss) if display_loss is not None else loss.item(),
 							  tv=term_vals, pv=param_vals, its=_its)
 				_t_steps_acc = 0
@@ -3176,9 +3386,18 @@ def optimize(
 			if _opt_timing is not None:
 				_opt_timing.add("total", time.perf_counter() - _t_iter)
 				_opt_timing.finish_iter(label=label, step1=step1, max_steps=max_steps)
+			if auto_stop:
+				rel_improvement = _auto_steps_relative_improvement(auto_loss_history, window=auto_window)
+				print(
+					f"[optimizer] {label}: auto steps stopped at {step1}/{max_steps} "
+					f"rel_improvement_{auto_window}={rel_improvement:.6g} "
+					f"< {auto_rel_threshold:g}",
+					flush=True,
+				)
+				break
 
 		_t = _stage_start(f"{label}.final_snapshot")
-		snapshot_fn(stage=label, step=max_steps, loss=float(loss.detach().cpu()), data=data, res=res)
+		snapshot_fn(stage=label, step=final_step, loss=float(loss.detach().cpu()), data=data, res=res)
 		_stage_done(f"{label}.final_snapshot", _t)
 		_stage_done(f"{label}.total", _t_stage_total)
 		return data

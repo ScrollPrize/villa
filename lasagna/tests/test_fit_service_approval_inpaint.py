@@ -111,6 +111,38 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					ext_offset_enabled=False,
 				)
 
+	def test_flatten_wires_generic_tifxyz_as_external_surface(self) -> None:
+		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
+		cfg = {"args": {"model-init": "flatten"}}
+
+		with tempfile.TemporaryDirectory() as td:
+			tifxyz_dir = fit_service._decode_tifxyz_for_request(
+				body=body,
+				cfg=cfg,
+				args_section=cfg["args"],
+				tmp_dir=td,
+				model_init="flatten",
+				ext_offset_enabled=False,
+			)
+
+			self.assertIsNotNone(tifxyz_dir)
+			self.assertEqual(cfg["external_surfaces"], [{"path": tifxyz_dir}])
+			self.assertNotIn("tifxyz-init", cfg["args"])
+
+	def test_flatten_requires_generic_tifxyz_or_external_surface(self) -> None:
+		cfg = {"args": {"model-init": "flatten"}}
+
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "model-init=flatten requires request tifxyz"):
+				fit_service._decode_tifxyz_for_request(
+					body={},
+					cfg=cfg,
+					args_section=cfg["args"],
+					tmp_dir=td,
+					model_init="flatten",
+					ext_offset_enabled=False,
+				)
+
 	def test_ext_offset_requires_generic_tifxyz(self) -> None:
 		cfg = {"args": {"model-init": "seed"}}
 
@@ -210,7 +242,7 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 		cfg = {
 			"base": {"snap_surf_map": 0.0},
 			"stages": [
-				{"name": "map_init", "steps": 100, "params": ["map_affine"]},
+				{"name": "map_init", "steps": 100, "params": ["map_surf_affine"]},
 			],
 		}
 
@@ -224,7 +256,7 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					"name": "snap",
 					"steps": 100,
 					"params": ["mesh_ms"],
-					"args": {"snap_surf_map": {"map_opt": {"params": ["map_uv_ms"]}}},
+					"args": {"snap_surf_map": {"map_opt": {"params": ["map_surf_ms"]}}},
 				},
 			],
 		}
@@ -249,7 +281,7 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 			"stages": [
 				{
 					"name": "map_uv_fine",
-					"params": ["map_uv_ms"],
+					"params": ["map_surf_ms"],
 					"args": {"debug_obj_dir": "snap_surf_objs"},
 				},
 				{

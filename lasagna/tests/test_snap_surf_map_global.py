@@ -97,11 +97,11 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8) -> st
 				},
 			},
 			"stages": [
-				{"steps": affine_steps, "lr": 0.05, "params": ["affine"], "args": {"subdiv": 2}},
+				{"steps": affine_steps, "lr": 0.05, "params": ["map_surf_affine"], "args": {"subdiv": 2}},
 				{
 					"steps": map_steps,
 					"lr": 0.02,
-					"params": ["map_uv_ms"],
+					"params": ["map_surf_ms"],
 					"min_scaledown": 3,
 					"args": {"subdiv": 2, "map_station_t": 0.001},
 				},
@@ -117,7 +117,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			"base": {"snap_surf": 1.0},
 			"stages": [
 				{"name": "model", "steps": 1, "lr": 0.1, "params": ["mesh_ms"]},
-				{"name": "map", "steps": 1, "lr": 0.01, "params": ["map_affine"], "w_fac": 1.0},
+				{"name": "map", "steps": 1, "lr": 0.01, "params": ["map_surf_affine"], "w_fac": 1.0},
 			],
 		}
 
@@ -138,7 +138,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 					"name": "map",
 					"steps": 1,
 					"lr": 0.01,
-					"params": ["map_uv_ms"],
+					"params": ["map_surf_ms"],
 					"w_fac": {"map_dist": 0.5},
 				},
 			],
@@ -157,26 +157,32 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 					{
 						"name": "map",
 						"steps": 1,
-						"params": ["map_affine"],
+						"params": ["map_surf_affine"],
 						"w_fac": {"smooth": 0.0},
 					},
 				],
 			})
 
 	def test_lasagna_stage_parser_rejects_plain_affine_and_mixed_params(self) -> None:
-		with self.assertRaisesRegex(ValueError, "map_affine"):
+		with self.assertRaisesRegex(ValueError, "map_surf_affine"):
 			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["affine"]}]})
+		with self.assertRaisesRegex(ValueError, "map_surf_affine"):
+			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["map_affine"]}]})
+		with self.assertRaisesRegex(ValueError, "map_surf_ms"):
+			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["map_uv_ms"]}]})
 		with self.assertRaisesRegex(ValueError, "cannot mix model params"):
-			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["mesh_ms", "map_uv_ms"]}]})
+			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["mesh_ms", "map_surf_ms"]}]})
 
 	def test_nested_map_opt_uses_normal_lasagna_param_names(self) -> None:
 		stage = parse_global_map_stage_item(
-			{"steps": 1, "lr": 0.01, "params": ["map_affine"], "args": {"subdiv": 2}},
+			{"steps": 1, "lr": 0.01, "params": ["map_surf_affine"], "args": {"subdiv": 2}},
 			normal_lasagna=True,
 		)
 		self.assertEqual(stage.params, ("affine",))
-		with self.assertRaisesRegex(ValueError, "map_affine"):
+		with self.assertRaisesRegex(ValueError, "map_surf_affine"):
 			parse_global_map_stage_item({"params": ["affine"]}, normal_lasagna=True)
+		with self.assertRaisesRegex(ValueError, "map_surf_ms"):
+			parse_global_map_stage_item({"params": ["map_uv_ms"]}, normal_lasagna=True)
 
 	def test_live_runtime_exports_objective_terms_without_reference_distance(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -282,7 +288,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			parsed = snap_surf_config_from_global_config(cfg, cfg.stages[1])
 			self.assertEqual(parsed.map_init.subdiv, 2)
 			path = Path(tmp, "named_cfg.json")
-			path.write_text(json.dumps({"stages": [{"name": "affine_init_scan", "params": ["affine"]}]}), encoding="utf-8")
+			path.write_text(json.dumps({"stages": [{"name": "affine_init_scan", "params": ["map_surf_affine"]}]}), encoding="utf-8")
 			named = parse_global_map_config(path)
 			self.assertEqual(named.stages[0].name, "affine_init_scan")
 
@@ -315,8 +321,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "model_y.tif")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "meta.json")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "metrics.json")))
-			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_affine", "map_ext_to_model.obj")))
-			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_001_map_uv_ms", "map_ext_to_model.obj")))
+			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_map_surf_affine", "map_ext_to_model.obj")))
+			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_001_map_surf_ms", "map_ext_to_model.obj")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "final", "map_ext_to_model.obj")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "final", "map_ext_to_model_worst_1pct.obj")))
 			final_meta = json.loads(Path(out_dir, "objs", "final", "meta.json").read_text(encoding="utf-8"))
@@ -359,7 +365,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertIn("1/3", text)
 			self.assertIn("3/3", text)
 			self.assertNotIn("2/3", text)
-			self.assertRegex(text, r"0/2\s+map_uv_ms")
+			self.assertRegex(text, r"0/2\s+map_surf_ms")
 			self.assertIn("stat", text)
 			self.assertIn("station loss", text)
 			self.assertIn("dst", text)
@@ -418,8 +424,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 						{
 							"name": "affine_init_scan",
 							"steps": 0,
-							"lr": 0.05,
-							"params": ["affine"],
+								"lr": 0.05,
+								"params": ["map_surf_affine"],
 							"args": {
 								"affine_multistart": {
 									"enabled": True,
@@ -474,7 +480,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 							"name": "affine_seed_quad_init",
 							"steps": 1,
 							"lr": 0.05,
-							"params": ["affine"],
+								"params": ["map_surf_affine"],
 							"args": {"affine_seed_quad_init": {"enabled": True}},
 						}
 					],

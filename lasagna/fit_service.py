@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -37,6 +38,26 @@ _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backe
 # One debug switch for sparse coverage and coordinate sanity guards. The service
 # enables it by default so optimizer jobs fail before CUDA indexing asserts.
 os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
+
+
+def _mib(n_bytes: int) -> float:
+    return float(n_bytes) / (1024.0 * 1024.0)
+
+
+def _mib_per_s(n_bytes: int, seconds: float) -> float:
+    return _mib(n_bytes) / seconds if seconds > 0.0 else 0.0
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        root_path = Path(root)
+        for name in files:
+            try:
+                total += (root_path / name).stat().st_size
+            except OSError:
+                pass
+    return total
 
 
 def _truthy_config_bool(value: Any) -> bool:
@@ -129,7 +150,7 @@ def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
         params = opt_cfg.get("params", [])
         if isinstance(params, str):
             params = [params]
-        if isinstance(params, list) and any(str(p) in {"map_affine", "map_uv_ms"} for p in params):
+        if isinstance(params, list) and any(str(p) in {"map_surf_affine", "map_surf_ms"} for p in params):
             if args.get("debug_obj_dir"):
                 args["debug_obj_dir"] = out_dir
         snap_map = args.get("snap_surf_map")
@@ -176,6 +197,8 @@ def _decode_tifxyz_for_request(
         print(f"[fit-service] decoded tifxyz ({len(tifxyz_payload)} files) to {tifxyz_dir}", flush=True)
         if model_init == "ext":
             args_section["tifxyz-init"] = tifxyz_dir
+        if model_init == "flatten" and "external_surfaces" not in cfg:
+            cfg["external_surfaces"] = [{"path": tifxyz_dir}]
         if approval_enabled:
             args_section["approval-inpaint-tifxyz"] = tifxyz_dir
         if external_surface_enabled:
@@ -194,6 +217,8 @@ def _decode_tifxyz_for_request(
         raise ValueError(f"{'/'.join(loss_names)} is enabled but request has no tifxyz")
     elif approval_enabled:
         raise ValueError("approval-inpaint requires request tifxyz")
+    elif model_init == "flatten" and "external_surfaces" not in cfg:
+        raise ValueError("model-init=flatten requires request tifxyz or config external_surfaces")
 
     return tifxyz_dir
 
@@ -336,7 +361,7 @@ def _config_global_map_enabled(cfg: dict[str, Any]) -> bool:
         if not isinstance(opt_cfg, dict):
             opt_cfg = stage
         params = set(_stage_params_list(opt_cfg))
-        if params & {"map_affine", "map_uv_ms"}:
+        if params & {"map_surf_affine", "map_surf_ms"}:
             return True
         args = opt_cfg.get("args")
         if not isinstance(args, dict):
@@ -586,12 +611,31 @@ def _run_optimization(body: dict[str, Any]) -> None:
     global _job
     import tempfile
 
+    print(
+        f"[fit-service] optimization worker starting: keys={sorted(body.keys())}",
+        flush=True,
+    )
+
     model_output = body.get("model_output")
     data_input = body.get("data_input")
     output_dir = body.get("output_dir")
     config = body.get("config", {})
 
-    if not data_input:
+    if not isinstance(config, dict):
+        _job.set_error("request config must be an object")
+        return
+    args_section_initial = config.get("args", {})
+    if not isinstance(args_section_initial, dict):
+        args_section_initial = {}
+    model_init_requested = str(
+        args_section_initial.get("model-init", args_section_initial.get("model_init", "seed"))
+    ).strip().lower()
+    if model_init_requested not in {"seed", "ext", "model", "flatten"}:
+        _job.set_error(
+            f"invalid args.model-init '{model_init_requested}' (expected seed, ext, model, or flatten)"
+        )
+        return
+    if not data_input and model_init_requested != "flatten":
         _job.set_error("missing 'data_input'")
         return
 
@@ -608,7 +652,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
             results_tmp = tempfile.mkdtemp(prefix="fit_results_")
             output_dir = results_tmp
 
-        # model_output goes into temp dir
+        # model_output goes into temp dir. Flatten forces --copy-model during
+        # export so the resulting tifxyz remains self-contained after cleanup.
         if not model_output:
             model_output = str(Path(tmp_dir) / "model_reopt.pt")
 
@@ -617,9 +662,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
         args_section_pre = cfg.get("args", {})
         if not isinstance(args_section_pre, dict):
             args_section_pre = {}
-        model_init = str(args_section_pre.get("model-init", args_section_pre.get("model_init", "seed"))).strip().lower()
-        if model_init not in {"seed", "ext", "model"}:
-            raise ValueError(f"invalid args.model-init '{model_init}' (expected seed, ext, or model)")
+        model_init = model_init_requested
         args_section_pre.pop("model_init", None)
         args_section_pre["model-init"] = model_init
         cfg["args"] = args_section_pre
@@ -627,6 +670,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
         snap_surf_enabled = _config_effective_snap_surf_enabled(cfg)
         global_map_enabled = _config_global_map_enabled(cfg)
         external_surface_enabled = ext_offset_enabled or snap_surf_enabled or global_map_enabled
+        if model_init == "flatten" and ext_offset_enabled:
+            raise ValueError("model-init=flatten does not support ext_offset")
         model_input = _decode_model_for_request(
             body=body,
             tmp_dir=tmp_dir,
@@ -657,8 +702,9 @@ def _run_optimization(body: dict[str, Any]) -> None:
             cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
 
         args_section = dict(cfg.get("args", {}))
-        args_section["input"] = str(data_input)
-        args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
+        if model_init != "flatten":
+            args_section["input"] = str(data_input)
+            args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
         args_section["model-output"] = str(model_output)
@@ -732,6 +778,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
             # Export to tifxyz — skip if windowed mode already exported.
             # Windowed mode exports .tifxyz dirs into the parent of
             # model_output (= tmp_dir). Move them to output_dir.
+            save_t0 = time.perf_counter()
             _window_tifxyz = [p for p in Path(tmp_dir).iterdir()
                               if p.name.endswith(".tifxyz") and p.is_dir()]
             if _window_tifxyz:
@@ -760,7 +807,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 export_argv = ["--input", str(model_output), "--output", str(output_dir)]
                 if body.get("single_segment"):
                     export_argv.append("--single-segment")
-                if body.get("copy_model"):
+                if body.get("copy_model") or model_init == "flatten":
                     export_argv.append("--copy-model")
                 output_name = body.get("output_name")
                 if output_name:
@@ -769,6 +816,16 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 if voxel_size_um is not None:
                     export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
                 fit2tifxyz.main(export_argv)
+            save_s = time.perf_counter() - save_t0
+            try:
+                saved_bytes = _dir_size_bytes(Path(output_dir))
+            except OSError:
+                saved_bytes = 0
+            print(
+                f"[fit-service] results saved: {_mib(saved_bytes):.3f} MiB "
+                f"in {save_s:.3f}s",
+                flush=True,
+            )
 
         # Clean up intermediate files (but keep results_tmp for download)
         import shutil
@@ -799,10 +856,22 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> Any:
+    def _read_json(self, label: str = "request") -> Any:
         length = int(self.headers.get("Content-Length", 0))
+        print(f"[fit-service] {label}: reading {_mib(length):.3f} MiB", flush=True)
+        read_t0 = time.perf_counter()
         raw = self.rfile.read(length)
-        return json.loads(raw) if raw else {}
+        read_s = time.perf_counter() - read_t0
+        parse_t0 = time.perf_counter()
+        obj = json.loads(raw) if raw else {}
+        parse_s = time.perf_counter() - parse_t0
+        print(
+            f"[fit-service] {label}: read {_mib(len(raw)):.3f} MiB "
+            f"in {read_s:.3f}s ({_mib_per_s(len(raw), read_s):.3f} MiB/s), "
+            f"json_parse={parse_s:.3f}s",
+            flush=True,
+        )
+        return obj
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
@@ -834,6 +903,7 @@ class _Handler(BaseHTTPRequestHandler):
         # Create tar.gz in memory.  Archive paths are relative to output_dir
         # so the tar contains e.g. "winding_combined_v004.tifxyz/meta.json".
         # Extracting in the local paths dir recreates the tifxyz subdirectory.
+        pack_t0 = time.perf_counter()
         buf = io.BytesIO()
         out_path = Path(output_dir)
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -841,24 +911,39 @@ class _Handler(BaseHTTPRequestHandler):
                 tar.add(str(child), arcname=child.name)
 
         data = buf.getvalue()
+        pack_s = time.perf_counter() - pack_t0
         self.send_response(200)
         self.send_header("Content-Type", "application/gzip")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
+        send_t0 = time.perf_counter()
         self.wfile.write(data)
+        self.wfile.flush()
+        send_s = time.perf_counter() - send_t0
 
-        print(f"[fit-service] results downloaded ({len(data)} bytes)", flush=True)
+        print(
+            f"[fit-service] results packed: {_mib(len(data)):.3f} MiB "
+            f"in {pack_s:.3f}s",
+            flush=True,
+        )
+        print(
+            f"[fit-service] results sent: {_mib(len(data)):.3f} MiB "
+            f"in {send_s:.3f}s ({_mib_per_s(len(data), send_s):.3f} MiB/s)",
+            flush=True,
+        )
         _job.clear_results()
 
     def do_POST(self) -> None:  # noqa: N802
         global _job_thread
 
         if self.path == "/optimize":
+            print("[fit-service] /optimize POST received", flush=True)
             if _job.is_busy:
+                print("[fit-service] /optimize rejected: optimization already running", flush=True)
                 self._send_json({"error": "optimization already running"}, 409)
                 return
             try:
-                body = self._read_json()
+                body = self._read_json("optimize request")
             except Exception as exc:
                 self._send_json({"error": f"bad json: {exc}"}, 400)
                 return
@@ -866,6 +951,7 @@ class _Handler(BaseHTTPRequestHandler):
             _job.set_running("starting", 0, 0, 0.0)
             _job_thread = threading.Thread(target=_run_optimization, args=(body,), daemon=True)
             _job_thread.start()
+            print("[fit-service] /optimize accepted: worker thread started", flush=True)
             self._send_json({"status": "started"})
 
         elif self.path == "/stop":
@@ -877,7 +963,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif self.path == "/export_vis":
             try:
-                body = self._read_json()
+                body = self._read_json("export_vis request")
             except Exception as exc:
                 self._send_json({"error": f"bad json: {exc}"}, 400)
                 return
