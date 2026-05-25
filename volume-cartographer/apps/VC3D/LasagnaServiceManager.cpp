@@ -158,6 +158,12 @@ QNetworkRequest fitServiceRequest(const QUrl& url)
     return req;
 }
 
+bool isTransportError(const QNetworkReply* reply)
+{
+    return reply->error() != QNetworkReply::NoError
+        && !reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).isValid();
+}
+
 struct ResultsPlacementResult
 {
     bool ok{false};

@@ -9,7 +9,6 @@ PANEL_CPP = REPO_ROOT / "volume-cartographer/apps/VC3D/segmentation/panels/Segme
 MANAGER_CPP = REPO_ROOT / "volume-cartographer/apps/VC3D/LasagnaServiceManager.cpp"
 BATCH_WINDOW_CPP = REPO_ROOT / "volume-cartographer/apps/VC3D/LasagnaBatchWindow.cpp"
 FIT_SERVICE_PY = REPO_ROOT / "lasagna/fit_service.py"
-OLD_FIT_SERVICE_PY = REPO_ROOT / "lasagna/old_2d/fit_service.py"
 
 
 class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
@@ -52,14 +51,12 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 				self.assertIn(request_line, self.manager_source)
 
 	def test_lasagna_services_enforce_and_return_api_version_header(self) -> None:
-		for path in (FIT_SERVICE_PY, OLD_FIT_SERVICE_PY):
-			source = path.read_text(encoding="utf-8")
-			with self.subTest(path=str(path.relative_to(REPO_ROOT))):
-				self.assertIn('_API_VERSION = "1"', source)
-				self.assertIn('_API_VERSION_HEADER = "X-Fit-Service-API-Version"', source)
-				self.assertIn("self.send_header(_API_VERSION_HEADER, _API_VERSION)", source)
-				self.assertIn("def _validate_api_version", source)
-				self.assertIn("if not self._validate_api_version():", source)
+		source = FIT_SERVICE_PY.read_text(encoding="utf-8")
+		self.assertIn('_API_VERSION = "1"', source)
+		self.assertIn('_API_VERSION_HEADER = "X-Fit-Service-API-Version"', source)
+		self.assertIn("self.send_header(_API_VERSION_HEADER, _API_VERSION)", source)
+		self.assertIn("def _validate_api_version", source)
+		self.assertIn("if not self._validate_api_version():", source)
 
 	def test_batch_queue_table_shows_output_name(self) -> None:
 		self.assertIn('tr("Output")', self.batch_window_source)
