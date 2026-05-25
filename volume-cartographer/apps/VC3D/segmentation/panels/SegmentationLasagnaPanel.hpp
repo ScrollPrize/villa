@@ -1,11 +1,13 @@
 #pragma once
 
+#include <QSet>
 #include <QWidget>
 
 #include "utils/Json.hpp"
 
 class CollapsibleSettingsGroup;
 class CState;
+class LasagnaBatchWindow;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -131,6 +133,7 @@ private:
 
     QProgressBar* _progressBar{nullptr};
     QLabel* _progressLabel{nullptr};
+    LasagnaBatchWindow* _batchWindow{nullptr};
 
     QString _lasagnaDataInputPath;
     QString _newModelConfigFilePath;
@@ -144,4 +147,5 @@ private:
 
     bool _restoringSettings{false};
     const QString _settingsGroup;
+    QSet<QString> _submittedOutputNames;
 };

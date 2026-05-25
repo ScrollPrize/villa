@@ -7,7 +7,13 @@ Endpoints:
     GET  /health          -> {"status": "ok"}
     GET  /status          -> current job state
     GET  /datasets        -> available .lasagna.json datasets from --data-dir
-    POST /optimize        -> start an optimization job (JSON body)
+    POST /jobs            -> queue an optimization job (JSON body)
+    GET  /jobs            -> list queued/running/finished jobs
+    GET  /jobs/{id}       -> one job state
+    GET  /jobs/{id}/results -> download one job's results
+    POST /jobs/{id}/cancel -> cancel an upload/waiting/running job
+    POST /jobs/reorder    -> reorder upload/waiting jobs
+    POST /optimize        -> legacy queue wrapper
     POST /stop            -> request cancellation of the running job
     POST /export_vis      -> export multi-layer OBJ visualization (JSON body)
 """
@@ -15,16 +21,21 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import getpass
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import traceback
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import uuid
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +45,8 @@ from typing import Any
 _data_dir: str | None = None  # Set via --data-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
+_API_VERSION = "1"
+_API_VERSION_HEADER = "X-Fit-Service-API-Version"
 
 # One debug switch for sparse coverage and coordinate sanity guards. The service
 # enables it by default so optimizer jobs fail before CUDA indexing asserts.
@@ -492,15 +505,20 @@ def _stop_avahi_publish() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Global job state (one job at a time)
+# In-memory job queue
 # ---------------------------------------------------------------------------
 
 class _JobState:
-    """Thread-safe mutable job state."""
+    """Thread-safe mutable state for one queued optimizer job."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, job_id: str, sequence: int,
+                 source: str, config_name: str) -> None:
         self._lock = threading.Lock()
-        self._state = "idle"
+        self.job_id = job_id
+        self.sequence = sequence
+        self.source = source
+        self.config_name = config_name
+        self._state = "upload"
         self._stage = ""
         self._step = 0
         self._total_steps = 0
@@ -512,11 +530,21 @@ class _JobState:
         self._cancel = False
         self._output_dir: str | None = None
         self._results_tmp: str | None = None  # temp dir to clean up after download
+        self._tmp_dirs: list[str] = []
+        now = time.time()
+        self.submitted_at = now
+        self.started_at: float | None = None
+        self.finished_at: float | None = None
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, queue_position: int | None = None) -> dict[str, Any]:
         with self._lock:
             return {
+                "job_id": self.job_id,
+                "sequence": self.sequence,
+                "source": self.source,
+                "config_name": self.config_name,
                 "state": self._state,
+                "queue_position": queue_position,
                 "stage": self._stage,
                 "step": self._step,
                 "total_steps": self._total_steps,
@@ -526,12 +554,21 @@ class _JobState:
                 "stage_name": self._stage_name,
                 "error": self._error,
                 "output_dir": self._output_dir,
+                "submitted_at": self.submitted_at,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
             }
+
+    def set_waiting(self) -> None:
+        with self._lock:
+            self._state = "waiting"
 
     def set_running(self, stage: str, step: int, total: int, loss: float,
                     stage_progress: float = 0.0, overall_progress: float = 0.0,
                     stage_name: str = "") -> None:
         with self._lock:
+            if self.started_at is None:
+                self.started_at = time.time()
             self._state = "running"
             self._stage = stage
             self._step = step
@@ -546,23 +583,36 @@ class _JobState:
             self._state = "finished"
             self._output_dir = output_dir
             self._results_tmp = results_tmp
+            self.finished_at = time.time()
 
     def set_error(self, msg: str) -> None:
         with self._lock:
             self._state = "error"
             self._error = msg
+            self.finished_at = time.time()
 
-    def set_idle(self) -> None:
+    def set_cancelled(self, msg: str = "cancelled") -> None:
         with self._lock:
-            # Clean up any leftover results temp dir from previous run
-            if self._results_tmp:
-                import shutil
-                shutil.rmtree(self._results_tmp, ignore_errors=True)
-            self._state = "idle"
-            self._error = None
-            self._cancel = False
-            self._output_dir = None
-            self._results_tmp = None
+            self._state = "cancelled"
+            self._error = msg
+            self._cancel = True
+            self.finished_at = time.time()
+
+    def add_tmp_dir(self, path: str | None) -> None:
+        if not path:
+            return
+        with self._lock:
+            self._tmp_dirs.append(path)
+
+    def cleanup_tmp_dirs(self, keep_results: bool = True) -> None:
+        with self._lock:
+            tmp_dirs = list(self._tmp_dirs)
+            results_tmp = self._results_tmp
+            self._tmp_dirs.clear()
+        for path in tmp_dirs:
+            if keep_results and results_tmp and path == results_tmp:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
 
     @property
     def results_tmp(self) -> str | None:
@@ -573,7 +623,6 @@ class _JobState:
         """Clean up results temp dir after download."""
         with self._lock:
             if self._results_tmp:
-                import shutil
                 shutil.rmtree(self._results_tmp, ignore_errors=True)
                 self._results_tmp = None
 
@@ -587,20 +636,245 @@ class _JobState:
             return self._cancel
 
     @property
-    def is_busy(self) -> bool:
+    def state(self) -> str:
         with self._lock:
-            return self._state == "running"
+            return self._state
 
 
-_job = _JobState()
-_job_thread: threading.Thread | None = None
+class _JobQueue:
+    """FIFO scheduler with one running optimizer job."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._cv = threading.Condition(self._lock)
+        self._jobs: dict[str, _JobState] = {}
+        self._bodies: dict[str, dict[str, Any]] = {}
+        self._order: list[str] = []
+        self._next_sequence = 1
+        self._active_job_id: str | None = None
+        self._generation = 0
+        self._worker = threading.Thread(target=self._scheduler_loop, daemon=True)
+        self._worker.start()
+
+    def _bump_generation_locked(self) -> None:
+        self._generation += 1
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def create_upload(self, *, source: str, config_name: str) -> _JobState:
+        with self._cv:
+            sequence = self._next_sequence
+            self._next_sequence += 1
+            job_id = uuid.uuid4().hex[:12]
+            while job_id in self._jobs:
+                job_id = uuid.uuid4().hex[:12]
+            job = _JobState(
+                job_id=job_id,
+                sequence=sequence,
+                source=source,
+                config_name=config_name,
+            )
+            self._jobs[job_id] = job
+            self._order.append(job_id)
+            self._bump_generation_locked()
+            self._cv.notify_all()
+            return job
+
+    def enqueue_body(self, job: _JobState, body: dict[str, Any]) -> None:
+        with self._cv:
+            source = str(body.get("source") or job.source or "").strip()
+            config_name = str(body.get("config_name") or job.config_name or "").strip()
+            if source:
+                job.source = source
+            if config_name:
+                job.config_name = config_name
+            self._bodies[job.job_id] = body
+            job.set_waiting()
+            self._bump_generation_locked()
+            self._cv.notify_all()
+
+    def _waiting_ids_locked(self) -> list[str]:
+        return [
+            jid for jid in self._order
+            if self._jobs[jid].state in {"upload", "waiting"}
+        ]
+
+    def _reorderable_ids_locked(self) -> list[str]:
+        return [
+            jid for jid in self._order
+            if self._jobs[jid].state == "waiting"
+        ]
+
+    def queue_position(self, job_id: str) -> int | None:
+        with self._lock:
+            waiting = self._waiting_ids_locked()
+            if job_id in waiting:
+                return waiting.index(job_id) + 1
+            return None
+
+    def snapshot(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            return job.snapshot(self.queue_position(job_id))
+
+    def job(self, job_id: str) -> _JobState | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def snapshots(self) -> list[dict[str, Any]]:
+        with self._lock:
+            waiting = self._waiting_ids_locked()
+            positions = {jid: i + 1 for i, jid in enumerate(waiting)}
+            return [
+                self._jobs[jid].snapshot(positions.get(jid))
+                for jid in self._order
+            ]
+
+    def snapshot_response(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "queue_generation": self._generation,
+                "jobs": self.snapshots(),
+            }
+
+    def legacy_status(self) -> dict[str, Any]:
+        with self._lock:
+            job: _JobState | None = None
+            if self._active_job_id:
+                job = self._jobs.get(self._active_job_id)
+            if job is None:
+                for jid in self._order:
+                    candidate = self._jobs[jid]
+                    if candidate.state == "finished":
+                        job = candidate
+                if job is None and self._order:
+                    job = self._jobs[self._order[0]]
+            if job is None:
+                return {
+                    "state": "idle",
+                    "queue_generation": self._generation,
+                    "stage": "",
+                    "step": 0,
+                    "total_steps": 0,
+                    "loss": 0.0,
+                    "stage_progress": 0.0,
+                    "overall_progress": 0.0,
+                    "stage_name": "",
+                    "error": None,
+                    "output_dir": None,
+                }
+            snap = job.snapshot(self.queue_position(job.job_id))
+            if snap["state"] in {"upload", "waiting"}:
+                snap["state"] = "queued"
+            if snap["state"] == "cancelled":
+                snap["state"] = "error"
+            snap["queue_generation"] = self._generation
+            return snap
+
+    def latest_finished_job(self) -> _JobState | None:
+        with self._lock:
+            for jid in reversed(self._order):
+                job = self._jobs[jid]
+                if job.state == "finished":
+                    return job
+            return None
+
+    def cancel(self, job_id: str) -> tuple[bool, str]:
+        with self._cv:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False, "job not found"
+            if job.state in {"finished", "error", "cancelled"}:
+                return False, f"cannot cancel {job.state} job"
+            if job.state in {"upload", "waiting"}:
+                self._bodies.pop(job_id, None)
+                job.set_cancelled()
+                self._bump_generation_locked()
+                self._cv.notify_all()
+                return True, "cancelled"
+            job.request_cancel()
+            self._bump_generation_locked()
+            return True, "stopping"
+
+    def cancel_active(self) -> tuple[bool, str]:
+        with self._cv:
+            if self._active_job_id:
+                return self.cancel(self._active_job_id)
+            return False, "not running"
+
+    def reorder(self, body: dict[str, Any]) -> tuple[bool, str]:
+        with self._cv:
+            movable = self._reorderable_ids_locked()
+            if "order" in body:
+                requested = [str(x) for x in body.get("order", [])]
+                if sorted(requested) != sorted(movable):
+                    return False, "order must contain exactly the waiting job ids"
+                self._order = [
+                    jid for jid in self._order if jid not in movable
+                ] + requested
+                self._bump_generation_locked()
+                self._cv.notify_all()
+                return True, "reordered"
+
+            job_id = str(body.get("job_id", ""))
+            before_job_id = body.get("before_job_id")
+            before = str(before_job_id) if before_job_id is not None else None
+            if job_id not in movable:
+                return False, "job is not reorderable"
+            if before is not None and before not in movable:
+                return False, "before_job_id is not reorderable"
+            movable.remove(job_id)
+            if before is None:
+                movable.append(job_id)
+            else:
+                movable.insert(movable.index(before), job_id)
+            self._order = [
+                jid for jid in self._order if self._jobs[jid].state != "waiting"
+            ] + movable
+            self._bump_generation_locked()
+            self._cv.notify_all()
+            return True, "reordered"
+
+    def _scheduler_loop(self) -> None:
+        while True:
+            with self._cv:
+                ready_id = None
+                while ready_id is None:
+                    for jid in self._order:
+                        if self._jobs[jid].state == "waiting" and jid in self._bodies:
+                            ready_id = jid
+                            break
+                    if ready_id is None:
+                        self._cv.wait()
+                job = self._jobs[ready_id]
+                body = self._bodies.pop(ready_id)
+                self._active_job_id = ready_id
+                job.set_running("starting", 0, 0, 0.0)
+                self._bump_generation_locked()
+            try:
+                _run_optimization(job, body)
+            finally:
+                job.cleanup_tmp_dirs(keep_results=True)
+                with self._cv:
+                    if self._active_job_id == ready_id:
+                        self._active_job_id = None
+                    self._bump_generation_locked()
+                    self._cv.notify_all()
+
+
+_jobs = _JobQueue()
 
 
 # ---------------------------------------------------------------------------
 # Optimization runner (called in background thread)
 # ---------------------------------------------------------------------------
 
-def _run_optimization(body: dict[str, Any]) -> None:
+def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     """Run fit.py then fit2tifxyz.py based on the request body.
 
     Supports two modes:
@@ -608,7 +882,6 @@ def _run_optimization(body: dict[str, Any]) -> None:
       - Remote (external): model_data contains base64-encoded model bytes,
         output goes to a temp dir, caller downloads results via GET /results.
     """
-    global _job
     import tempfile
 
     print(
@@ -622,7 +895,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
     config = body.get("config", {})
 
     if not isinstance(config, dict):
-        _job.set_error("request config must be an object")
+        job.set_error("request config must be an object")
         return
     args_section_initial = config.get("args", {})
     if not isinstance(args_section_initial, dict):
@@ -631,18 +904,19 @@ def _run_optimization(body: dict[str, Any]) -> None:
         args_section_initial.get("model-init", args_section_initial.get("model_init", "seed"))
     ).strip().lower()
     if model_init_requested not in {"seed", "ext", "model", "flatten"}:
-        _job.set_error(
+        job.set_error(
             f"invalid args.model-init '{model_init_requested}' (expected seed, ext, model, or flatten)"
         )
         return
     if not data_input and model_init_requested != "flatten":
-        _job.set_error("missing 'data_input'")
+        job.set_error("missing 'data_input'")
         return
 
     try:
         # Use a temp directory for all intermediate files (config json,
         # model output, etc.) so nothing leaks into the volpkg paths dir.
         tmp_dir = tempfile.mkdtemp(prefix="fit_reopt_")
+        job.add_tmp_dir(tmp_dir)
         service_workdir = Path.cwd()
         print(f"[fit-service] cwd: {service_workdir}", flush=True)
 
@@ -650,6 +924,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
         results_tmp = None
         if not output_dir:
             results_tmp = tempfile.mkdtemp(prefix="fit_results_")
+            job.add_tmp_dir(results_tmp)
             output_dir = results_tmp
 
         # model_output goes into temp dir. Flatten forces --copy-model during
@@ -738,19 +1013,19 @@ def _run_optimization(body: dict[str, Any]) -> None:
             orig_progress = kwargs.get("progress_fn")
 
             def _wrapped_snapshot(*, stage: str, step: int, loss: float, **kw: Any) -> None:
-                if _job.cancelled:
+                if job.cancelled:
                     raise KeyboardInterrupt("cancelled by user")
                 if orig_snapshot is not None:
                     orig_snapshot(stage=stage, step=step, loss=loss, **kw)
 
             def _wrapped_progress(*, step: int, total: int, loss: float, **kw: Any) -> None:
-                _job.set_running(
+                job.set_running(
                     "optimizing", step, total, loss,
                     stage_progress=float(kw.get("stage_progress", 0.0)),
                     overall_progress=float(kw.get("overall_progress", 0.0)),
                     stage_name=str(kw.get("stage_name", "")),
                 )
-                if _job.cancelled:
+                if job.cancelled:
                     raise KeyboardInterrupt("cancelled by user")
                 if orig_progress is not None:
                     orig_progress(step=step, total=total, loss=loss, **kw)
@@ -766,13 +1041,13 @@ def _run_optimization(body: dict[str, Any]) -> None:
         with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
             try:
                 import fit as fit_mod
-                _job.set_running("loading", 0, 0, 0.0)
+                job.set_running("loading", 0, 0, 0.0)
                 fit_mod.main([cfg_path])
             finally:
                 opt_mod.optimize = _orig_optimize
 
-            if _job.cancelled:
-                _job.set_error("cancelled")
+            if job.cancelled:
+                job.set_cancelled()
                 return
 
             # Export to tifxyz — skip if windowed mode already exported.
@@ -802,7 +1077,7 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 print(f"[fit-service] windowed mode: moved {len(_window_tifxyz)} "
                       f"window tifxyz to {output_dir}", flush=True)
             else:
-                _job.set_running("exporting", 0, 0, 0.0)
+                job.set_running("exporting", 0, 0, 0.0)
                 import fit2tifxyz
                 export_argv = ["--input", str(model_output), "--output", str(output_dir)]
                 if body.get("single_segment"):
@@ -828,18 +1103,17 @@ def _run_optimization(body: dict[str, Any]) -> None:
             )
 
         # Clean up intermediate files (but keep results_tmp for download)
-        import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        _job.set_finished(str(output_dir), results_tmp=results_tmp)
+        job.set_finished(str(output_dir), results_tmp=results_tmp)
         print(f"[fit-service] optimization finished, output: {output_dir}", flush=True)
 
     except KeyboardInterrupt:
-        _job.set_error("cancelled")
+        job.set_cancelled()
     except Exception as exc:
         tb = traceback.format_exc()
         print(f"[fit-service] error: {tb}", file=sys.stderr, flush=True)
-        _job.set_error(str(exc))
+        job.set_error(str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -849,12 +1123,29 @@ def _run_optimization(body: dict[str, Any]) -> None:
 class _Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj: Any, status: int = 200) -> None:
+        if isinstance(obj, dict):
+            obj.setdefault("api_version", _API_VERSION)
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header(_API_VERSION_HEADER, _API_VERSION)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _validate_api_version(self) -> bool:
+        got = self.headers.get(_API_VERSION_HEADER)
+        if got == _API_VERSION:
+            return True
+        self._send_json({
+            "error": (
+                f"fit-service API version mismatch: expected {_API_VERSION_HEADER}="
+                f"{_API_VERSION}, got {got or '<missing>'}"
+            ),
+            "expected_api_version": _API_VERSION,
+            "received_api_version": got,
+        }, 426)
+        return False
 
     def _read_json(self, label: str = "request") -> Any:
         length = int(self.headers.get("Content-Length", 0))
@@ -873,24 +1164,64 @@ class _Handler(BaseHTTPRequestHandler):
         )
         return obj
 
+    def _client_source(self) -> str:
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = "unknown"
+        host = self.client_address[0] if self.client_address else ""
+        try:
+            host = socket.gethostbyaddr(host)[0]
+        except Exception:
+            pass
+        return f"{user}@{host}" if host else user
+
+    def _job_path_parts(self) -> list[str]:
+        path = urlparse(self.path).path
+        return [part for part in path.split("/") if part]
+
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
+        if not self._validate_api_version():
+            return
+        parts = self._job_path_parts()
+        path = "/" + "/".join(parts)
+
+        if path == "/health":
             self._send_json({"status": "ok"})
-        elif self.path == "/status":
-            self._send_json(_job.snapshot())
-        elif self.path == "/datasets":
+        elif path == "/status":
+            self._send_json(_jobs.legacy_status())
+        elif path == "/datasets":
             self._send_json({"datasets": _list_datasets()})
-        elif self.path == "/results":
-            self._handle_results()
+        elif path == "/results":
+            job = _jobs.latest_finished_job()
+            if job is None:
+                self._send_json({"error": "no finished results available"}, 404)
+                return
+            self._handle_results(job)
+        elif parts == ["jobs"]:
+            self._send_json(_jobs.snapshot_response())
+        elif len(parts) == 2 and parts[0] == "jobs":
+            snap = _jobs.snapshot(parts[1])
+            if snap is None:
+                self._send_json({"error": "job not found"}, 404)
+            else:
+                snap["queue_generation"] = _jobs.generation
+                self._send_json(snap)
+        elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "results":
+            job = _jobs.job(parts[1])
+            if job is None:
+                self._send_json({"error": "job not found"}, 404)
+                return
+            self._handle_results(job)
         else:
             self._send_json({"error": "not found"}, 404)
 
-    def _handle_results(self) -> None:
+    def _handle_results(self, job: _JobState) -> None:
         """Package finished optimization results as tar.gz and send them."""
         import tarfile
         import io
 
-        snap = _job.snapshot()
+        snap = job.snapshot(_jobs.queue_position(job.job_id))
         if snap["state"] != "finished":
             self._send_json({"error": "no finished results available"}, 404)
             return
@@ -914,6 +1245,7 @@ class _Handler(BaseHTTPRequestHandler):
         pack_s = time.perf_counter() - pack_t0
         self.send_response(200)
         self.send_header("Content-Type", "application/gzip")
+        self.send_header(_API_VERSION_HEADER, _API_VERSION)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         send_t0 = time.perf_counter()
@@ -931,37 +1263,85 @@ class _Handler(BaseHTTPRequestHandler):
             f"in {send_s:.3f}s ({_mib_per_s(len(data), send_s):.3f} MiB/s)",
             flush=True,
         )
-        _job.clear_results()
+        job.clear_results()
 
     def do_POST(self) -> None:  # noqa: N802
-        global _job_thread
+        if not self._validate_api_version():
+            return
+        parts = self._job_path_parts()
+        path = "/" + "/".join(parts)
 
-        if self.path == "/optimize":
+        if path == "/optimize":
             print("[fit-service] /optimize POST received", flush=True)
-            if _job.is_busy:
-                print("[fit-service] /optimize rejected: optimization already running", flush=True)
-                self._send_json({"error": "optimization already running"}, 409)
-                return
             try:
                 body = self._read_json("optimize request")
             except Exception as exc:
                 self._send_json({"error": f"bad json: {exc}"}, 400)
                 return
-            _job.set_idle()
-            _job.set_running("starting", 0, 0, 0.0)
-            _job_thread = threading.Thread(target=_run_optimization, args=(body,), daemon=True)
-            _job_thread.start()
-            print("[fit-service] /optimize accepted: worker thread started", flush=True)
-            self._send_json({"status": "started"})
+            job = _jobs.create_upload(
+                source=str(body.get("source") or self._client_source()),
+                config_name=str(body.get("config_name") or ""),
+            )
+            _jobs.enqueue_body(job, body)
+            print(f"[fit-service] /optimize accepted as queued job {job.job_id}", flush=True)
+            self._send_json({
+                "status": "started",
+                "job_id": job.job_id,
+                "sequence": job.sequence,
+                "source": job.source,
+                "config_name": job.config_name,
+                "queue_position": _jobs.queue_position(job.job_id),
+                "queue_generation": _jobs.generation,
+            })
 
-        elif self.path == "/stop":
-            if _job.is_busy:
-                _job.request_cancel()
-                self._send_json({"status": "stopping"})
+        elif path == "/stop":
+            ok, msg = _jobs.cancel_active()
+            if ok:
+                self._send_json({"status": msg})
             else:
                 self._send_json({"status": "not running"})
 
-        elif self.path == "/export_vis":
+        elif path == "/jobs":
+            print("[fit-service] /jobs POST received", flush=True)
+            job = _jobs.create_upload(source=self._client_source(), config_name="")
+            try:
+                body = self._read_json(f"job {job.job_id} request")
+            except Exception as exc:
+                job.set_error(f"bad json: {exc}")
+                self._send_json({"error": f"bad json: {exc}", "job_id": job.job_id}, 400)
+                return
+            _jobs.enqueue_body(job, body)
+            self._send_json({
+                "status": "queued",
+                "job_id": job.job_id,
+                "sequence": job.sequence,
+                "source": job.source,
+                "config_name": job.config_name,
+                "queue_position": _jobs.queue_position(job.job_id),
+                "queue_generation": _jobs.generation,
+            })
+
+        elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
+            ok, msg = _jobs.cancel(parts[1])
+            self._send_json(
+                {"status": msg, "queue_generation": _jobs.generation}
+                if ok else {"error": msg, "queue_generation": _jobs.generation},
+                200 if ok else 409,
+            )
+
+        elif parts == ["jobs", "reorder"]:
+            try:
+                body = self._read_json("reorder request")
+            except Exception as exc:
+                self._send_json({"error": f"bad json: {exc}"}, 400)
+                return
+            ok, msg = _jobs.reorder(body if isinstance(body, dict) else {})
+            response = _jobs.snapshot_response()
+            response["status"] = msg
+            self._send_json(response if ok else {"error": msg, "queue_generation": _jobs.generation},
+                            200 if ok else 409)
+
+        elif path == "/export_vis":
             try:
                 body = self._read_json("export_vis request")
             except Exception as exc:
@@ -1045,6 +1425,7 @@ class _Handler(BaseHTTPRequestHandler):
             data = buf.getvalue()
             self.send_response(200)
             self.send_header("Content-Type", "application/gzip")
+            self.send_header(_API_VERSION_HEADER, _API_VERSION)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -1106,7 +1487,7 @@ def main() -> None:
         )
         raise SystemExit(2)
 
-    server = HTTPServer((args.host, args.port), _Handler)
+    server = ThreadingHTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]
 
     # Write service announcement for discovery (file-based + mDNS)

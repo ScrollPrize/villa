@@ -4,6 +4,8 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QProcess>
+#include <QHash>
+#include <QSet>
 #include <QString>
 #include <QTimer>
 #include <memory>
@@ -57,9 +59,20 @@ public:
      */
     void startOptimization(const QJsonObject& config,
                            const QString& localOutputDir = QString());
+    void submitOptimization(const QJsonObject& config,
+                            const QString& localOutputDir = QString())
+    {
+        startOptimization(config, localOutputDir);
+    }
 
     /** Request cancellation of the running optimization. */
     void stopOptimization();
+    void cancelJob(const QString& jobId);
+    void downloadResultsForJob(const QString& jobId,
+                               const QString& localOutputDir = QString());
+    void moveJobBefore(const QString& jobId, const QString& beforeJobId);
+    void moveJobToEnd(const QString& jobId);
+    void fetchJobs();
 
     /**
      * Export multi-layer OBJ visualization.
@@ -88,6 +101,10 @@ signals:
                               const QString& stageName);
     void optimizationFinished(const QString& outputDir);
     void optimizationError(const QString& message);
+    void jobsUpdated(const QJsonArray& jobs);
+    void jobStarted(const QString& jobId);
+    void jobFinished(const QString& jobId, const QString& outputDir);
+    void jobError(const QString& jobId, const QString& message);
 
     void visExportFinished(const QString& outputDir);
     void visExportError(const QString& message);
@@ -113,10 +130,14 @@ private:
 
     void pollStatus();
     void handleStatusReply(QNetworkReply* reply);
+    void handleJobsReply(QNetworkReply* reply);
     void handleOptimizeReply(QNetworkReply* reply);
+    bool validateApiVersion(QNetworkReply* reply, const QString& context);
 
     /** Download results archive from service and unpack locally. */
-    void downloadResults();
+    void downloadResults(const QString& jobId = QString(),
+                         const QString& outputDir = QString());
+    QString localSourceName() const;
 
     std::unique_ptr<QProcess> _process;
     QNetworkAccessManager* _nam{nullptr};
@@ -130,4 +151,14 @@ private:
     bool _optimizationRunning{false};
     QString _localOutputDir;  // where to unpack optimization results
     QString _visOutputDir;    // where to unpack vis export results
+    QString _activeJobId;
+    QSet<QString> _submittedJobIds;
+    QSet<QString> _startedJobIds;
+    QSet<QString> _completedJobIds;
+    QHash<QString, QString> _jobOutputDirs;
+    QJsonArray _lastJobs;
+    qint64 _lastQueueGeneration{-1};
+    qint64 _fetchedQueueGeneration{-1};
+    bool _jobsRequestInFlight{false};
+    bool _jobsRequestPending{false};
 };

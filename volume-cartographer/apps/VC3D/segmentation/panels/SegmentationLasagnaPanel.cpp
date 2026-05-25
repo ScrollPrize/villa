@@ -1,6 +1,7 @@
 #include "SegmentationLasagnaPanel.hpp"
 
 #include "CState.hpp"
+#include "LasagnaBatchWindow.hpp"
 #include "LasagnaServiceManager.hpp"
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
@@ -44,6 +45,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <utility>
 
 namespace
 {
@@ -363,6 +365,10 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     _progressLabel->setVisible(false);
     panelLayout->addWidget(_progressLabel);
 
+    _batchWindow = new LasagnaBatchWindow(this);
+    _batchWindow->setMinimumHeight(180);
+    panelLayout->addWidget(_batchWindow);
+
     // -----------------------------------------------------------------------
     // Signal wiring
     // -----------------------------------------------------------------------
@@ -645,9 +651,6 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(&mgr, &LasagnaServiceManager::optimizationStarted, this, [this]() {
         if (_stopBtn) _stopBtn->setEnabled(true);
-        if (_newModelBtn) _newModelBtn->setEnabled(false);
-        if (_reoptBtn) _reoptBtn->setEnabled(false);
-        if (_offsetBtn) _offsetBtn->setEnabled(false);
 
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization started..."));
@@ -673,6 +676,27 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
                     .arg(stageProgress * 100.0, 0, 'f', 1)
                     .arg(overallProgress * 100.0, 0, 'f', 1)
                     .arg(loss, 0, 'g', 5));
+            _progressLabel->setStyleSheet(QString());
+            _progressLabel->setVisible(true);
+        }
+    });
+    connect(&mgr, &LasagnaServiceManager::jobsUpdated, this, [this](const QJsonArray& jobs) {
+        QStringList queued;
+        bool running = false;
+        for (const QJsonValue& value : jobs) {
+            QJsonObject job = value.toObject();
+            const QString state = job[QStringLiteral("state")].toString();
+            if (state == QStringLiteral("running")) {
+                running = true;
+            } else if (state == QStringLiteral("waiting")) {
+                const int pos = job[QStringLiteral("queue_position")].toInt();
+                if (pos > 0) {
+                    queued << QStringLiteral("#%1").arg(pos);
+                }
+            }
+        }
+        if (!running && !queued.isEmpty() && _progressLabel) {
+            _progressLabel->setText(tr("Queue: %1").arg(queued.join(QStringLiteral(", "))));
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
@@ -942,6 +966,21 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
                 }
             }
         }
+        const QString versionPrefix = QString::fromStdString(rootName + "_v");
+        for (const QString& reserved : std::as_const(_submittedOutputNames)) {
+            if (!reserved.startsWith(versionPrefix) ||
+                !reserved.endsWith(QString::fromStdString(tifxyzSuffix))) {
+                continue;
+            }
+            const QString numStr = reserved.mid(
+                versionPrefix.size(),
+                reserved.size() - versionPrefix.size() - static_cast<int>(tifxyzSuffix.size()));
+            bool ok = false;
+            const int version = numStr.toInt(&ok);
+            if (ok && version > maxVersion) {
+                maxVersion = version;
+            }
+        }
         char numBuf[16];
         std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
         outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
@@ -1033,6 +1072,12 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
             for (bool collision = true; collision; ++offIdx) {
                 collision = false;
                 std::string offPrefix = rootName + "_off" + std::to_string(offIdx) + "_w";
+                const QString reservedPrefix = QString::fromStdString(
+                    rootName + "_off" + std::to_string(offIdx));
+                if (_submittedOutputNames.contains(reservedPrefix)) {
+                    collision = true;
+                    continue;
+                }
                 for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec2)) {
                     auto name = entry.path().filename().string();
                     if (name.size() > offPrefix.size() + tifxyzSuffix.size() &&
@@ -1088,6 +1133,10 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
     request[QStringLiteral("data_input")] = dataInput;
     request[QStringLiteral("single_segment")] = true;
     request[QStringLiteral("copy_model")] = true;
+    request[QStringLiteral("config_name")] = QFileInfo(
+        (lasagnaMode() == LasagnaMode::NewModel) ? _newModelConfigFilePath
+        : (lasagnaMode() == LasagnaMode::Offset) ? _offsetConfigFilePath
+        : _reoptConfigFilePath).fileName();
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
     }
@@ -1177,6 +1226,9 @@ void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* stat
               << std::endl;
 
     mgr.startOptimization(request, outputDir);
+    if (!outputName.isEmpty()) {
+        _submittedOutputNames.insert(outputName);
+    }
     showStatus(
         tr("Lasagna optimization started. Output: %1")
             .arg(outputName),

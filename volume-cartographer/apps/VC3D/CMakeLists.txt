@@ -135,6 +135,8 @@ set(srcs
     NeuralTraceServiceManager.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
+    LasagnaBatchWindow.cpp
+    LasagnaBatchWindow.hpp
     segmentation/panels/SegmentationLasagnaPanel.cpp
     segmentation/panels/SegmentationLasagnaPanel.hpp
     ViewerManager.cpp
