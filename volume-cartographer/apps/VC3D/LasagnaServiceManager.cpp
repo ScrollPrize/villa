@@ -395,11 +395,18 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
         }
         reply->deleteLater();
 
+        if (isTransportError(reply)) {
+            _lastError = tr("Cannot reach external service: %1").arg(reply->errorString());
+            _serviceReady = false;
+            _isExternal = false;
+            emit serviceError(_lastError);
+            return;
+        }
         if (!validateApiVersion(reply, tr("Service health check"))) {
             return;
         }
         if (reply->error() != QNetworkReply::NoError) {
-            _lastError = tr("Cannot reach external service: %1").arg(reply->errorString());
+            _lastError = tr("External service health check failed: %1").arg(reply->errorString());
             _serviceReady = false;
             _isExternal = false;
             emit serviceError(_lastError);
@@ -773,6 +780,9 @@ void LasagnaServiceManager::stopOptimization()
             return;
         }
         reply->deleteLater();
+        if (isTransportError(reply)) {
+            return;
+        }
         validateApiVersion(reply, tr("Stop optimization"));
     });
 }
@@ -791,6 +801,9 @@ void LasagnaServiceManager::cancelJob(const QString& jobId)
             return;
         }
         reply->deleteLater();
+        if (isTransportError(reply)) {
+            return;
+        }
         validateApiVersion(reply, tr("Cancel job"));
     });
 }
@@ -814,6 +827,9 @@ void LasagnaServiceManager::moveJobBefore(const QString& jobId, const QString& b
             return;
         }
         reply->deleteLater();
+        if (isTransportError(reply)) {
+            return;
+        }
         validateApiVersion(reply, tr("Reorder jobs"));
     });
 }
@@ -851,6 +867,10 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
         }
         reply->deleteLater();
 
+        if (isTransportError(reply)) {
+            emit visExportError(tr("Export failed: %1").arg(reply->errorString()));
+            return;
+        }
         if (!validateApiVersion(reply, tr("Export visualization"))) {
             emit visExportError(_lastError);
             return;
@@ -910,6 +930,11 @@ void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply)
 {
     reply->deleteLater();
 
+    if (isTransportError(reply)) {
+        QString msg = tr("Failed to start optimization: %1").arg(reply->errorString());
+        emit optimizationError(msg);
+        return;
+    }
     if (!validateApiVersion(reply, tr("Submit optimization"))) {
         emit optimizationError(_lastError);
         return;
@@ -1017,6 +1042,12 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
     _jobsRequestInFlight = false;
     reply->deleteLater();
 
+    if (isTransportError(reply)) {
+        if (_jobsRequestPending) {
+            fetchJobs();
+        }
+        return;
+    }
     if (!validateApiVersion(reply, tr("Fetch jobs"))) {
         return;
     }
@@ -1099,10 +1130,13 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
     _statusRequestInFlight = false;
     reply->deleteLater();
 
-    if (reply->error() != QNetworkReply::NoError) {
+    if (isTransportError(reply)) {
         return;  // Transient network error, will retry next poll
     }
     if (!validateApiVersion(reply, tr("Poll status"))) {
+        return;
+    }
+    if (reply->error() != QNetworkReply::NoError) {
         return;
     }
 
@@ -1161,6 +1195,14 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
         }
         reply->deleteLater();
 
+        if (isTransportError(reply)) {
+            const QString msg = tr("Failed to download results: %1").arg(reply->errorString());
+            if (!jobId.isEmpty()) {
+                emit jobError(jobId, msg);
+            }
+            emit optimizationError(msg);
+            return;
+        }
         if (!validateApiVersion(reply, tr("Download results"))) {
             if (!jobId.isEmpty()) {
                 emit jobError(jobId, _lastError);
@@ -1406,6 +1448,9 @@ void LasagnaServiceManager::fetchDatasets()
             return;
         }
         reply->deleteLater();
+        if (isTransportError(reply)) {
+            return;
+        }
         if (!validateApiVersion(reply, tr("Fetch datasets"))) {
             return;
         }

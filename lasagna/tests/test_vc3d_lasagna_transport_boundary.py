@@ -50,7 +50,7 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 			with self.subTest(request_line=request_line):
 				self.assertIn(request_line, self.manager_source)
 
-	def test_lasagna_services_enforce_and_return_api_version_header(self) -> None:
+	def test_lasagna_service_enforces_and_returns_api_version_header(self) -> None:
 		source = FIT_SERVICE_PY.read_text(encoding="utf-8")
 		self.assertIn('_API_VERSION = "1"', source)
 		self.assertIn('_API_VERSION_HEADER = "X-Fit-Service-API-Version"', source)
@@ -62,12 +62,13 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 		self.assertIn('tr("Output")', self.batch_window_source)
 		self.assertIn('job[QStringLiteral("output_name")]', self.batch_window_source)
 
-	def test_poll_status_checks_transport_error_before_api_version(self) -> None:
+	def test_vc3d_checks_transport_error_before_api_version(self) -> None:
+		self.assertIn("bool isTransportError(const QNetworkReply* reply)", self.manager_source)
 		start = self.manager_source.index("void LasagnaServiceManager::handleStatusReply")
 		end = self.manager_source.index("void LasagnaServiceManager::downloadResults", start)
 		method_source = self.manager_source[start:end]
 		self.assertLess(
-			method_source.index("reply->error() != QNetworkReply::NoError"),
+			method_source.index("isTransportError(reply)"),
 			method_source.index('validateApiVersion(reply, tr("Poll status"))'),
 		)
 
