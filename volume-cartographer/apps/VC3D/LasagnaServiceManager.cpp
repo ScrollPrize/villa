@@ -936,6 +936,7 @@ void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply)
         optimisticJob[QStringLiteral("sequence")] = obj[QStringLiteral("sequence")].toInt();
         optimisticJob[QStringLiteral("source")] = obj[QStringLiteral("source")].toString();
         optimisticJob[QStringLiteral("config_name")] = obj[QStringLiteral("config_name")].toString();
+        optimisticJob[QStringLiteral("output_name")] = obj[QStringLiteral("output_name")].toString();
         optimisticJob[QStringLiteral("state")] = QStringLiteral("waiting");
         optimisticJob[QStringLiteral("queue_position")] = obj[QStringLiteral("queue_position")].toInt();
         optimisticJob[QStringLiteral("submitted_at")] = static_cast<double>(QDateTime::currentSecsSinceEpoch());

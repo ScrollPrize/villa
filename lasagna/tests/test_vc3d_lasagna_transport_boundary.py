@@ -7,6 +7,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PANEL_CPP = REPO_ROOT / "volume-cartographer/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.cpp"
 MANAGER_CPP = REPO_ROOT / "volume-cartographer/apps/VC3D/LasagnaServiceManager.cpp"
+BATCH_WINDOW_CPP = REPO_ROOT / "volume-cartographer/apps/VC3D/LasagnaBatchWindow.cpp"
 FIT_SERVICE_PY = REPO_ROOT / "lasagna/fit_service.py"
 OLD_FIT_SERVICE_PY = REPO_ROOT / "lasagna/old_2d/fit_service.py"
 
@@ -15,6 +16,7 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 	def setUp(self) -> None:
 		self.source = PANEL_CPP.read_text(encoding="utf-8")
 		self.manager_source = MANAGER_CPP.read_text(encoding="utf-8")
+		self.batch_window_source = BATCH_WINDOW_CPP.read_text(encoding="utf-8")
 
 	def test_transport_invariant_is_documented_at_request_assembly(self) -> None:
 		self.assertIn("VC3D is transport only", self.source)
@@ -58,6 +60,10 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 				self.assertIn("self.send_header(_API_VERSION_HEADER, _API_VERSION)", source)
 				self.assertIn("def _validate_api_version", source)
 				self.assertIn("if not self._validate_api_version():", source)
+
+	def test_batch_queue_table_shows_output_name(self) -> None:
+		self.assertIn('tr("Output")', self.batch_window_source)
+		self.assertIn('job[QStringLiteral("output_name")]', self.batch_window_source)
 
 
 if __name__ == "__main__":

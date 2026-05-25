@@ -3,6 +3,7 @@
 #include "LasagnaServiceManager.hpp"
 
 #include <QDateTime>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QItemSelectionModel>
 #include <QJsonObject>
@@ -54,6 +55,16 @@ QString submittedTimeText(const QJsonObject& job)
     }
     return QDateTime::fromSecsSinceEpoch(seconds).toString(Qt::ISODate);
 }
+
+QString outputNameText(const QJsonObject& job)
+{
+    const QString outputName = job[QStringLiteral("output_name")].toString().trimmed();
+    if (!outputName.isEmpty()) {
+        return outputName;
+    }
+    const QString outputDir = job[QStringLiteral("output_dir")].toString().trimmed();
+    return outputDir.isEmpty() ? QString() : QFileInfo(outputDir).fileName();
+}
 }
 
 LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
@@ -68,6 +79,7 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
         tr("Order"),
         tr("Source"),
         tr("Config"),
+        tr("Output"),
         tr("Progress"),
         tr("Submitted"),
     });
@@ -79,7 +91,7 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
     _table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     _table->horizontalHeader()->setStretchLastSection(true);
     _table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    _table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    _table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
     layout->addWidget(_table, 1);
     connect(_table->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, [this]() { updateActionState(); });
@@ -173,6 +185,7 @@ void LasagnaBatchWindow::applyJobs(const QJsonArray& jobs, const QString& prefer
                 new QStandardItem(),
                 new QStandardItem(),
                 new QStandardItem(),
+                new QStandardItem(),
             };
             _model->insertRow(targetRow, rowItems);
             existingRow = targetRow;
@@ -224,6 +237,7 @@ void LasagnaBatchWindow::updateRow(int row, const QJsonObject& job)
         order,
         job[QStringLiteral("source")].toString(),
         job[QStringLiteral("config_name")].toString(),
+        outputNameText(job),
         jobStateText(job),
         submittedTimeText(job),
     };

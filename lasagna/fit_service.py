@@ -536,12 +536,13 @@ class _JobState:
     """Thread-safe mutable state for one queued optimizer job."""
 
     def __init__(self, *, job_id: str, sequence: int,
-                 source: str, config_name: str) -> None:
+                 source: str, config_name: str, output_name: str = "") -> None:
         self._lock = threading.Lock()
         self.job_id = job_id
         self.sequence = sequence
         self.source = source
         self.config_name = config_name
+        self.output_name = output_name
         self._state = "upload"
         self._stage = ""
         self._step = 0
@@ -567,6 +568,7 @@ class _JobState:
                 "sequence": self.sequence,
                 "source": self.source,
                 "config_name": self.config_name,
+                "output_name": self.output_name,
                 "state": self._state,
                 "queue_position": queue_position,
                 "stage": self._stage,
@@ -688,7 +690,7 @@ class _JobQueue:
         with self._lock:
             return self._generation
 
-    def create_upload(self, *, source: str, config_name: str) -> _JobState:
+    def create_upload(self, *, source: str, config_name: str, output_name: str = "") -> _JobState:
         with self._cv:
             sequence = self._next_sequence
             self._next_sequence += 1
@@ -700,6 +702,7 @@ class _JobQueue:
                 sequence=sequence,
                 source=source,
                 config_name=config_name,
+                output_name=output_name,
             )
             self._jobs[job_id] = job
             self._order.append(job_id)
@@ -711,10 +714,13 @@ class _JobQueue:
         with self._cv:
             source = str(body.get("source") or job.source or "").strip()
             config_name = str(body.get("config_name") or job.config_name or "").strip()
+            output_name = str(body.get("output_name") or job.output_name or "").strip()
             if source:
                 job.source = source
             if config_name:
                 job.config_name = config_name
+            if output_name:
+                job.output_name = output_name
             self._bodies[job.job_id] = body
             job.set_waiting()
             self._bump_generation_locked()
@@ -1308,6 +1314,7 @@ class _Handler(BaseHTTPRequestHandler):
             job = _jobs.create_upload(
                 source=str(body.get("source") or self._client_source()),
                 config_name=str(body.get("config_name") or ""),
+                output_name=str(body.get("output_name") or ""),
             )
             _jobs.enqueue_body(job, body)
             print(f"[fit-service] /optimize accepted as queued job {job.job_id}", flush=True)
@@ -1317,6 +1324,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "sequence": job.sequence,
                 "source": job.source,
                 "config_name": job.config_name,
+                "output_name": job.output_name,
                 "queue_position": _jobs.queue_position(job.job_id),
                 "queue_generation": _jobs.generation,
             })
@@ -1344,6 +1352,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "sequence": job.sequence,
                 "source": job.source,
                 "config_name": job.config_name,
+                "output_name": job.output_name,
                 "queue_position": _jobs.queue_position(job.job_id),
                 "queue_generation": _jobs.generation,
             })

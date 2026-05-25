@@ -691,7 +691,10 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             } else if (state == QStringLiteral("waiting")) {
                 const int pos = job[QStringLiteral("queue_position")].toInt();
                 if (pos > 0) {
-                    queued << QStringLiteral("#%1").arg(pos);
+                    const QString outputName = job[QStringLiteral("output_name")].toString().trimmed();
+                    queued << (outputName.isEmpty()
+                        ? QStringLiteral("#%1").arg(pos)
+                        : QStringLiteral("#%1 %2").arg(pos).arg(outputName));
                 }
             }
         }

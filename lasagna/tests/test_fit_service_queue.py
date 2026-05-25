@@ -42,6 +42,14 @@ class FitServiceQueueTest(unittest.TestCase):
 		self.assertIn("queue_generation", queue.legacy_status())
 		self.assertEqual(queue.snapshot_response()["queue_generation"], queue.generation)
 
+	def test_enqueue_body_reports_requested_output_name(self):
+		queue = fit_service._JobQueue()
+		j1 = queue.create_upload(source="a", config_name="one.json")
+		queue.enqueue_body(j1, {"output_name": "sheet_042"})
+
+		self.assertEqual(queue.snapshot(j1.job_id)["output_name"], "sheet_042")
+		self.assertEqual(queue.snapshot_response()["jobs"][0]["output_name"], "sheet_042")
+
 	def test_reorder_waiting_jobs_changes_execution_order(self):
 		queue = fit_service._JobQueue()
 		seen = []
