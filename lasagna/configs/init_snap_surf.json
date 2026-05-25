@@ -140,8 +140,8 @@
 		},
 		{
 			"name": "snap",
-			"steps": 1000,
-			"lr": 0.1,
+			"steps": 2000,
+			"lr": 1.0,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
