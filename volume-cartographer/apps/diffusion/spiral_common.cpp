@@ -2,6 +2,9 @@
 #include "spiral_common.hpp"
 #include "spiral_ceres.hpp"
 
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+
 #include "utils/Json.hpp"
 
 void to_json(utils::Json& j, const SpiralPoint& p) {
@@ -45,9 +48,6 @@ void visualize_spiral(
 #include <iostream>
 #include <iomanip>
 #include <sstream>
-
-#include <opencv2/imgproc.hpp>
-#include <opencv2/imgcodecs.hpp>
 
 
 bool find_intersections(

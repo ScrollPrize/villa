@@ -1,5 +1,7 @@
 #include "discrete.hpp"
 #include "support.hpp"
+
+#include <opencv2/imgcodecs.hpp>
 #include "spiral_common.hpp"
 
 #include <iostream>

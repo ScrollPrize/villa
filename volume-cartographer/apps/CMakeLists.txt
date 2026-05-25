@@ -1,11 +1,3 @@
-# Grid-resolution helpers split into a static lib so the unit tests can
-# link them without spawning the binary. Built unconditionally because
-# tests depend on it; the rest of this file's app executables are gated
-# behind VC_BUILD_APPS.
-add_library(vc_merge_grid STATIC src/vc_merge_tifxyz_grid.cpp)
-target_link_libraries(vc_merge_grid PUBLIC vc_core)
-target_include_directories(vc_merge_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
 if(NOT VC_BUILD_APPS)
     return()
 endif()
@@ -29,7 +21,7 @@ add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)
 
 add_executable(vc_grow_seg_from_seed src/vc_grow_seg_from_seed.cpp)
-target_link_libraries(vc_grow_seg_from_seed vc_core vc_ui vc_tracer Boost::program_options)
+target_link_libraries(vc_grow_seg_from_seed vc_core vc_tracer Boost::program_options)
 
 add_executable(vc_seg_add_overlap src/vc_seg_add_overlap.cpp)
 target_link_libraries(vc_seg_add_overlap vc_core)
@@ -38,12 +30,72 @@ add_executable(vc_grow_seg_from_segments src/vc_grow_seg_from_segments.cpp)
 target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program_options)
 
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
-target_link_libraries(vc_tifxyz2obj vc_core)
+target_link_libraries(vc_tifxyz2obj vc_core vc_inpaint)
+
+function(vc_find_libigl_core out_var)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    foreach(_pkg IN ITEMS igl libigl Libigl)
+        find_package(${_pkg} CONFIG QUIET)
+        if(TARGET igl::core)
+            set(${out_var} igl::core PARENT_SCOPE)
+            return()
+        endif()
+        if(TARGET igl::igl_core)
+            set(${out_var} igl::igl_core PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+
+    set(_prefixes ${CMAKE_PREFIX_PATH} ${CMAKE_SYSTEM_PREFIX_PATH})
+    foreach(_env_prefix IN ITEMS "$ENV{LIBIGL_ROOT}" "$ENV{HOMEBREW_PREFIX}")
+        if(NOT "${_env_prefix}" STREQUAL "")
+            list(APPEND _prefixes "${_env_prefix}")
+        endif()
+    endforeach()
+    if(_prefixes)
+        list(REMOVE_DUPLICATES _prefixes)
+    endif()
+
+    find_package(igl CONFIG QUIET
+        NAMES igl libigl Libigl
+        HINTS ${_prefixes}
+        PATH_SUFFIXES
+            lib/cmake/igl
+            lib/cmake/libigl
+            share/cmake/igl
+            share/libigl/cmake)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    message(FATAL_ERROR
+        "vc_obj_uv_lift requires libigl core. Enable VC_BUILD_FLATBOI to "
+        "use the local FetchContent libigl path, or install a libigl CMake "
+        "package exporting igl::core or igl::igl_core.")
+endfunction()
+
+vc_find_libigl_core(_vc_libigl_core_target)
+add_executable(vc_obj_uv_lift src/vc_obj_uv_lift.cpp)
+target_link_libraries(vc_obj_uv_lift PRIVATE ${_vc_libigl_core_target} OpenMP::OpenMP_CXX)
+set_target_properties(vc_obj_uv_lift PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
 add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
 target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
 
-add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp)
+add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp src/alpha_wrap.cpp)
 target_link_libraries(vc_add_ignore_label
     vc_core
     Boost::program_options
@@ -75,10 +127,10 @@ add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
 add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
-target_link_libraries(vc_calc_surface_metrics vc_core vc_ui Boost::program_options)
+target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
 
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
-target_link_libraries(vc_tifxyz_gengt vc_core vc_ui Boost::program_options)
+target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
 set(vc_diffuse_winding_sources
     diffusion/continuous3d.cpp
@@ -93,13 +145,18 @@ set(vc_diffuse_winding_sources
     diffusion/vc_diffuse_winding.cpp
 )
 
-add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources})
+# vc_diffuse_winding constructs a Qt VCCollection, so it compiles the shim
+# directly and links Qt; wrap the header for MOC to emit the vtable.
+qt6_wrap_cpp(vc_diffuse_winding_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources}
+    ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${vc_diffuse_winding_moc})
 target_include_directories(vc_diffuse_winding PRIVATE diffusion)
 target_link_libraries(vc_diffuse_winding
         opencv_videoio
         opencv_ximgproc
         vc_core
-        vc_ui
+        Qt6::Core
         Boost::program_options
         OpenMP::OpenMP_CXX
         Ceres::ceres
@@ -112,7 +169,10 @@ add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
 
 add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
-target_link_libraries(vc_merge_tifxyz vc_merge_grid Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
+target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
+
+add_executable(vc_merge_patch src/vc_merge_patch.cpp)
+target_link_libraries(vc_merge_patch vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
 
 add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
@@ -164,40 +224,20 @@ target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core Blosc::blosc)
 
-# Precompiled headers for CLI apps (reuse vc_core's PCH)
+# Reuse vc_core's PCH on the CLI apps that link vc_core. vc_obj_uv_lift and
+# vc_tifxyz_mmap_prepare are omitted — they don't link vc_core (no shared
+# include paths), so REUSE_FROM would fail to compile against them.
 if(VC_USE_PCH)
     foreach(_app
-        vc_render_video
-        vc_render_tifxyz
-        vc_objrefine
-        vc_grow_seg_from_seed
-        vc_seg_add_overlap
-        vc_grow_seg_from_segments
-        vc_tifxyz2obj
-        vc_obj2tifxyz
-        vc_obj2tifxyz_legacy
-        vc_flatten
-        vc_tifxyz_inp_mask
-        vc_tifxyz_trim
-        vc_cut_windings
-        vc_tifxyz_winding
-        vc_tifxyz2zarr_sparse
-        vc_add_ignore_label
-        vc_calc_surface_metrics
-        vc_tifxyz_gengt
-        vc_diffuse_winding
-        vc_tifxyz_mmap_prepare
-        vc_create_segment_mask
-        vc_visualize
-        vc_transform_geom
-        vc_gen_normalgrids
-        vc_ngrids
-        vc_tifxyz2rgb
-        vc_rgb2tifxyz
-        vc_thinning
-        vc_tifxyz
-        vc_project_tifxyz
-        vc_zarr_to_tiff
+        vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
+        vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj
+        vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+        vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
+        vc_cut_windings vc_tifxyz_winding vc_calc_surface_metrics
+        vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
+        vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
+        vc_gen_normalgrids vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning
+        vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress
     )
         target_precompile_headers(${_app} REUSE_FROM vc_core)
     endforeach()

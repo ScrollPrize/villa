@@ -118,7 +118,7 @@ static cv::Vec2f find_closest_intersection(QuadSurface* surface, const cv::Vec3f
 }
 
 
-utils::Json calc_point_metrics(const VCCollection& collection, QuadSurface* surface, int z_min, int z_max)
+utils::Json calc_point_metrics(const PointCollections& collection, QuadSurface* surface, int z_min, int z_max)
 {
     utils::Json results;
     int total_points_for_in_surface_metric = 0;
@@ -189,7 +189,7 @@ utils::Json calc_point_metrics(const VCCollection& collection, QuadSurface* surf
     return results;
 }
 
-utils::Json calc_point_winding_metrics(const VCCollection& collection, QuadSurface* surface, const cv::Mat_<float>& winding, int z_min, int z_max)
+utils::Json calc_point_winding_metrics(const PointCollections& collection, QuadSurface* surface, const cv::Mat_<float>& winding, int z_min, int z_max)
 {
     utils::Json results;
 

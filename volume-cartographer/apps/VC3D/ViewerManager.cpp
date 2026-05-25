@@ -90,17 +90,15 @@ ViewerManager::ViewerManager(CState* state,
 
 VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
                                               const QString& title,
-                                              QMdiArea* mdiArea)
+                                              QMdiArea* mdiArea,
+                                              ViewerRole role)
 {
     if (!mdiArea || !_state) {
         return nullptr;
     }
 
-    QWidget* widget = nullptr;
-    VolumeViewerBase* baseViewer = nullptr;
     auto* chunkedViewer = new CChunkedVolumeViewer(_state, this, mdiArea);
-    widget = chunkedViewer;
-    baseViewer = chunkedViewer;
+    QWidget* widget = chunkedViewer;
 
     auto* win = mdiArea->addSubWindow(widget);
     win->setWindowTitle(title);
@@ -112,6 +110,35 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     win->setAttribute(Qt::WA_DeleteOnClose);
     win->installEventFilter(widget);
 
+    return initializeChunkedViewer(chunkedViewer, surfaceName, role);
+}
+
+VolumeViewerBase* ViewerManager::createViewerInWidget(const std::string& surfaceName,
+                                                      QWidget* parent,
+                                                      ViewerRole role)
+{
+    if (!parent || !_state) {
+        return nullptr;
+    }
+
+    auto* chunkedViewer = new CChunkedVolumeViewer(_state, this, parent);
+    return initializeChunkedViewer(chunkedViewer, surfaceName, role);
+}
+
+VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* chunkedViewer,
+                                                         const std::string& surfaceName,
+                                                         ViewerRole role)
+{
+    if (!chunkedViewer || !_state) {
+        return nullptr;
+    }
+
+    auto* widget = chunkedViewer;
+    VolumeViewerBase* baseViewer = chunkedViewer;
+    chunkedViewer->setProperty("vc_viewer_role",
+                               role == ViewerRole::Annotation
+                                   ? QStringLiteral("annotation")
+                                   : QStringLiteral("standard"));
     chunkedViewer->setPointCollection(_points);
 
     if (_state) {
@@ -144,6 +171,9 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     }
 
     baseViewer->setSurface(surfaceName);
+    if (_state->currentVolume()) {
+        chunkedViewer->OnVolumeChanged(_state->currentVolume());
+    }
     baseViewer->setSegmentationEditActive(_segmentationEditActive);
     baseViewer->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
 
@@ -167,7 +197,7 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     baseViewer->setOverlayColormap(_overlayColormapId);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
 
-    if (_segmentationModule) {
+    if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
     }
     emit baseViewerCreated(baseViewer);

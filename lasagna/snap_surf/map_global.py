@@ -43,7 +43,7 @@ class GlobalMapStageConfig:
 	lr: float = 0.05
 	params: tuple[str, ...] = ()
 	min_scaledown: int = 0
-	w_fac: float = 1.0
+	w_fac: float | dict[str, float] = 1.0
 	args: dict[str, Any] = field(default_factory=dict)
 
 
@@ -949,6 +949,23 @@ def _run_affine_seed_quad_init(
 
 def _stage_loss_cfg(base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> SnapSurfConfig:
 	mi = base_cfg.map_init
+	if isinstance(stage.w_fac, dict):
+		weights = {str(k): float(v) for k, v in stage.w_fac.items()}
+		return replace(
+			base_cfg,
+			map_init=replace(
+				mi,
+				w_dist=weights.get("dist", float(mi.w_dist)),
+				w_vec_normal=weights.get("vec", float(mi.w_vec_normal)),
+				w_surface_normal=weights.get("norm", float(mi.w_surface_normal)),
+				w_smooth=weights.get("smooth", float(mi.w_smooth)),
+				w_bend=weights.get("bend", float(mi.w_bend)),
+				w_jac=weights.get("jac", float(mi.w_jac)),
+				w_metric_smooth=weights.get("metric_smooth", float(mi.w_metric_smooth)),
+				w_area_smooth=weights.get("area_smooth", float(mi.w_area_smooth)),
+				w_dense_prior=weights.get("prior", float(mi.w_dense_prior)),
+			),
+		)
 	scale = float(stage.w_fac)
 	return replace(
 		base_cfg,
@@ -962,6 +979,7 @@ def _stage_loss_cfg(base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> Sn
 			w_jac=float(mi.w_jac) * scale,
 			w_metric_smooth=float(mi.w_metric_smooth) * scale,
 			w_area_smooth=float(mi.w_area_smooth) * scale,
+			w_dense_prior=float(mi.w_dense_prior) * scale,
 		),
 	)
 

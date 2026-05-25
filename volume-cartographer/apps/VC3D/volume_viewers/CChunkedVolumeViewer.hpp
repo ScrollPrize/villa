@@ -19,7 +19,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
@@ -32,6 +32,7 @@
 
 class CState;
 class QEvent;
+class QGraphicsEllipseItem;
 class QGraphicsItem;
 class QGraphicsPathItem;
 class QGraphicsScene;
@@ -51,6 +52,14 @@ class CChunkedVolumeViewer : public QWidget, public VolumeViewerBase
     Q_OBJECT
 
 public:
+    struct CameraState {
+        float surfacePtrX = 0.0f;
+        float surfacePtrY = 0.0f;
+        float scale = 1.0f;
+        float zOffset = 0.0f;
+        cv::Vec3f zOffsetWorldDir{0, 0, 0};
+    };
+
     CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent = nullptr);
     ~CChunkedVolumeViewer() override;
 
@@ -78,6 +87,8 @@ public:
     float getCurrentScale() const override { return _scale; }
     float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }
+    CameraState cameraState() const;
+    void applyCameraState(const CameraState& state, bool forceRender = true);
     int datasetScaleIndex() const override { return _dsScaleIdx; }
     float datasetScaleFactor() const override { return _dsScale; }
     Surface* currentSurface() const override;
@@ -159,6 +170,9 @@ public:
     QPointF surfaceCoordsToScene(float surfX, float surfY) const override { return surfaceToScene(surfX, surfY); }
     void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point) override;
     QPointF lastScenePosition() const override { return _lastScenePos; }
+    void setLineAnnotationPlacementPreviewEnabled(bool enabled);
+    bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
+    bool lineAnnotationPlacementMarkerVisible() const;
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -217,6 +231,7 @@ signals:
                                 Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseDoubleClickVolume(cv::Vec3f volLoc, Qt::MouseButton button,
                                     Qt::KeyboardModifiers modifiers);
+    void sendLineAnnotationSeedRequested(cv::Vec3f volLoc, QPointF scenePos);
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
@@ -270,6 +285,8 @@ private:
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
+    void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
+    void clearLineAnnotationPlacementMarker();
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     void clearIntersectionItems();
@@ -459,6 +476,8 @@ private:
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
+    QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
+    bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
 
     SameWrapAnnotationTool _sameWrapAnnotation;

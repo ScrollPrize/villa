@@ -2,7 +2,7 @@
 
 #include "GrowthConfig.hpp"
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <functional>
 #include <vector>

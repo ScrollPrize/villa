@@ -525,6 +525,18 @@ struct Flatboi {
       std::cout << "PROGRESS " << (it+1) << "/" << max_iter << std::endl;
       if (wblog) wblog->log_energy(data.energy, /*step=*/it+1);
 
+      // Bail out as soon as the energy goes non-finite. Continuing only
+      // wastes time -- every subsequent iter recomputes weights from a
+      // NaN-poisoned state. The caller (main) inspects the energies list
+      // and returns a non-zero exit code.
+      if (!std::isfinite(data.energy)) {
+        std::cout << "SLIM diverged at iter " << (it+1) << "/"
+                  << max_iter << " (energy = " << data.energy
+                  << "); stopping early.\n";
+        iters_run = it + 1;
+        break;
+      }
+
       if (((it+1) % 20) == 0) {
         auto [l2m, l2med, linf, area] = stretch_metrics(data.V_o.leftCols<2>());
         std::cout << "  stretch: L2(mean)=" << l2m
@@ -999,6 +1011,24 @@ int main(int argc, char** argv) {
       wblog.log_image("heatmap/kappa",    paths.kappa.string());
       wblog.log_image("heatmap/log_area", paths.logarea.string());
       wblog.finish();
+    }
+
+    // Fail the run if SLIM diverged. Two failure modes seen in practice:
+    //   1. Output UVs themselves contain NaN/Inf.
+    //   2. Every iter went NaN but data.V_o was left at the initial UVs
+    //      (allFinite passes, downstream sees an unchanged parametrization).
+    // Catch both by scanning the per-iter energies list for any non-finite
+    // entry past iter 0, and by checking UV finiteness.
+    bool diverged = !uv_out.allFinite();
+    if (!diverged) {
+      for (std::size_t k = 1; k < energies.size(); ++k) {
+        if (!std::isfinite(energies[k])) { diverged = true; break; }
+      }
+    }
+    if (diverged) {
+      std::cerr << "Error: SLIM diverged (NaN energy or non-finite UVs). "
+                << "Try a lower --keep percent on the input (smaller mesh).\n";
+      return 3;
     }
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";

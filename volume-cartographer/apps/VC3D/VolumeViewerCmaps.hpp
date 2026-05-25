@@ -1,7 +1,7 @@
 #pragma once
 
 #include <QString>
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <cstdint>
 #include <string>

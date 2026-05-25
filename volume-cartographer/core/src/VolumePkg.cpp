@@ -13,7 +13,10 @@
 #include <pwd.h>
 #include <unistd.h>
 
+#include "vc/core/types/Segmentation.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 namespace fs = std::filesystem;
@@ -69,7 +72,7 @@ bool isSingleZarrVolumeDir(const fs::path& dir)
              || hasZarrMarkerAtRoot(dir);
     if (!meta) return false;
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.is_directory() && fs::exists(e.path() / ".zarray")) return true;
+        if (e.is_directory() && hasZarrMarkerAtRoot(e.path())) return true;
     }
     return false;
 }
@@ -295,7 +298,7 @@ std::string validateLocation(Category category, const std::string& location)
         case Category::Volumes:
             if (isSingleZarrVolumeDir(path)) return {};
             if (anyImmediateSubdir(path, &isSingleZarrVolumeDir)) return {};
-            return "Not a zarr volume and contains no zarr volumes (expected meta.json + chunk-level .zarray).";
+            return "Not a zarr volume and contains no zarr volumes (expected volume metadata plus chunk-level .zarray or zarr.json).";
         case Category::Segments:
             if (isSegmentDir(path)) return {};
             if (anyImmediateSubdir(path, &isSegmentDir)) return {};
@@ -453,6 +456,35 @@ fs::path VolumePkg::outputSegmentsPath() const
     if (!outputSegments_) return {};
     if (vc::project::isLocationRemote(*outputSegments_)) return {};
     return vc::project::resolveLocalPath(*outputSegments_, path_.parent_path());
+}
+
+std::string VolumePkg::selectedLasagnaDataset() const
+{
+    return selectedLasagnaDataset_.value_or(std::string{});
+}
+
+void VolumePkg::setSelectedLasagnaDataset(std::string location)
+{
+    if (location.empty()) {
+        clearSelectedLasagnaDataset();
+        return;
+    }
+    selectedLasagnaDataset_ = std::move(location);
+    persistProjectState();
+}
+
+void VolumePkg::clearSelectedLasagnaDataset()
+{
+    if (!selectedLasagnaDataset_) return;
+    selectedLasagnaDataset_.reset();
+    persistProjectState();
+}
+
+fs::path VolumePkg::selectedLasagnaDatasetPath() const
+{
+    if (!selectedLasagnaDataset_) return {};
+    if (vc::project::isLocationRemote(*selectedLasagnaDataset_)) return {};
+    return vc::project::resolveLocalPath(*selectedLasagnaDataset_, path_.parent_path());
 }
 
 bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
@@ -950,6 +982,7 @@ utils::Json VolumePkg::toJson() const
     j["normal_grids"] = entriesToJson(normalGrids_);
     if (!remoteCacheRoot_.empty()) j["remote_cache_root"] = remoteCacheRoot_.string();
     if (outputSegments_) j["output_segments"] = *outputSegments_;
+    if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     return j;
 }
 
@@ -967,6 +1000,10 @@ void VolumePkg::fromJson(const utils::Json& j)
         }
     }
     if (j.contains("output_segments")) outputSegments_ = j.at("output_segments").get_string();
+    if (j.contains("selected_lasagna_dataset")) {
+        selectedLasagnaDataset_ = j.at("selected_lasagna_dataset").get_string();
+        if (selectedLasagnaDataset_->empty()) selectedLasagnaDataset_.reset();
+    }
 }
 
 void VolumePkg::writeJsonTo(const fs::path& target) const

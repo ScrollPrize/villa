@@ -2,6 +2,10 @@
 #include "support.hpp"
 #include "spiral_ceres.hpp"
 
+#include <boost/program_options.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+
 #include <iostream>
 #include <vector>
 #include <string>

@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = os.path.dirname(os.path.dirname(__file__))
+if ROOT not in sys.path:
+	sys.path.insert(0, ROOT)
+
+
+class ApprovalInpaintConfigTest(unittest.TestCase):
+	def test_approval_inpaint_export_configs_enable_output_mask(self) -> None:
+		config_names = [
+			"init_corr_approval_inpaint.json",
+			"init_corr_approval_inpaint_flow.json",
+			"init_corr_snap_approval_inpaint.json",
+		]
+		config_dir = Path(ROOT) / "configs"
+		for name in config_names:
+			with self.subTest(name=name):
+				cfg = json.loads((config_dir / name).read_text(encoding="utf-8"))
+				args = cfg.get("args", {})
+				self.assertTrue(args.get("approval-inpaint"))
+				self.assertTrue(args.get("approval-inpaint-output-mask"))
+				self.assertEqual(args.get("approval-inpaint-output-mask-dilate"), 3)
+
+
+if __name__ == "__main__":
+	unittest.main()

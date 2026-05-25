@@ -126,6 +126,43 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertEqual(stages[0].global_opt.kind, "model")
 		self.assertEqual(stages[1].global_opt.kind, "map")
 
+	def test_lasagna_map_stage_uses_global_map_loss_weights(self) -> None:
+		stages = optimizer.load_stages_cfg({
+			"base": {
+				"map_dist": 2.0,
+				"map_smooth": 0.25,
+				"map_station_t": 0.5,
+			},
+			"stages": [
+				{
+					"name": "map",
+					"steps": 1,
+					"lr": 0.01,
+					"params": ["map_uv_ms"],
+					"w_fac": {"map_dist": 0.5},
+				},
+			],
+		})
+
+		opt = stages[0].global_opt
+		self.assertEqual(opt.kind, "map")
+		self.assertEqual(opt.eff["map_dist"], 1.0)
+		self.assertEqual(opt.eff["map_smooth"], 0.25)
+		self.assertEqual(opt.eff["map_station_t"], 0.5)
+
+	def test_lasagna_map_stage_rejects_model_loss_weight_override(self) -> None:
+		with self.assertRaisesRegex(ValueError, "map stages may only override map loss"):
+			optimizer.load_stages_cfg({
+				"stages": [
+					{
+						"name": "map",
+						"steps": 1,
+						"params": ["map_affine"],
+						"w_fac": {"smooth": 0.0},
+					},
+				],
+			})
+
 	def test_lasagna_stage_parser_rejects_plain_affine_and_mixed_params(self) -> None:
 		with self.assertRaisesRegex(ValueError, "map_affine"):
 			optimizer.load_stages_cfg({"stages": [{"name": "bad", "params": ["affine"]}]})

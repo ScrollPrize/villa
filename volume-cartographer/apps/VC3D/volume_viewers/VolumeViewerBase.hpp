@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/Compositing.hpp"
 

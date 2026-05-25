@@ -13,7 +13,7 @@
 #include <QString>
 #include <QTransform>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <cstddef>
 #include <functional>

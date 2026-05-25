@@ -2,8 +2,6 @@
 
 #include "vc/core/render/IChunkedArray.hpp"
 
-#include <utils/thread_pool.hpp>
-
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -95,7 +93,7 @@ private:
         bool persisted = false;
         bool inLru = false;
         int basePriority = 0;
-        utils::PriorityThreadPool::Priority priority = 0;
+        std::int64_t priority = 0;
         std::uint64_t fetchSerial = 0;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -125,7 +123,7 @@ private:
         std::list<ChunkKey> lru_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t generation_ = 0;
-        utils::PriorityThreadPool::Priority viewEpoch_ = 1;
+        std::int64_t viewEpoch_ = 1;
         std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;

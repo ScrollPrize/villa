@@ -13,7 +13,7 @@
 #include <QPointer>
 #include <QToolButton>
 #include <QFutureWatcher>
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <memory>
 
 #include "elements/ProgressUtil.hpp"

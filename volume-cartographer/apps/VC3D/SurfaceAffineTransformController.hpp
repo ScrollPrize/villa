@@ -3,7 +3,7 @@
 #include <QObject>
 #include <QString>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <filesystem>
 #include <functional>

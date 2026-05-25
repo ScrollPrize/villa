@@ -412,7 +412,7 @@ write_tifxyz(
 For more control over reading:
 
 ```python
-from vesuvius.tifxyz import TifxyzReader
+from vesuvius.tifxyz import TifxyzReader, discover_labels
 
 reader = TifxyzReader("/path/to/segment")
 
@@ -429,8 +429,14 @@ mask = reader.read_mask()
 channels = reader.list_extra_channels()  # e.g., ['generations']
 data = reader.read_extra_channel('generations')
 
-# Discover labels (always used internally by read/read_tifxyz)
-labels = reader.discover_labels(expected_shape=(4215, 4373))
+# Discover label files without loading label pixels
+labels = discover_labels("/path/to/segment")
+
+# Optionally validate label shapes when needed
+labels = reader.discover_labels(
+    expected_shape=(4215, 4373),
+    validate_shapes=True,
+)
 ```
 
 ---

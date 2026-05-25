@@ -4,9 +4,11 @@
 #include <utils/zarr.hpp>
 
 #include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/GrowthMask.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/Tiff.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
@@ -44,7 +46,7 @@
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
-#include "vc/ui/VCCollection.hpp"
+#include "vc/core/PointCollections.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
 
 DirectionField::DirectionField(std::string dir,
@@ -130,14 +132,6 @@ static bool point_in_bounds(const cv::Mat_<T>& mat, const cv::Vec2i& p)
     return p[0] >= 0 && p[0] < mat.rows && p[1] >= 0 && p[1] < mat.cols;
 }
 
-static cv::Size scaled_grid_size(const cv::Size& size, int factor)
-{
-    factor = std::max(1, factor);
-    return cv::Size(
-        std::max(1, (size.width + factor - 1) / factor),
-        std::max(1, (size.height + factor - 1) / factor));
-}
-
 static cv::Size growth_source_size_from_meta(const utils::Json& meta)
 {
     if (!meta.contains("_growth_source_width") ||
@@ -186,7 +180,7 @@ static cv::Size exact_growth_output_size(const QuadSurface* coarse,
         source_offset.y = coarse->meta["grid_offset"][1].get_int();
     }
 
-    const cv::Size coarse_source_size = scaled_grid_size(source_size, factor);
+    const cv::Size coarse_source_size = vc::core::util::scaledGridSize(source_size, factor);
     const int extra_left = std::max(0, source_offset.x);
     const int extra_top = std::max(0, source_offset.y);
     const int extra_right = std::max(
@@ -201,7 +195,7 @@ static cv::Size exact_growth_output_size(const QuadSurface* coarse,
 
 static cv::Mat_<cv::Vec3f> downsample_surface_points_nearest(const cv::Mat_<cv::Vec3f>& points, int factor)
 {
-    const cv::Size dst_size = scaled_grid_size(points.size(), factor);
+    const cv::Size dst_size = vc::core::util::scaledGridSize(points.size(), factor);
     cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
     for (int r = 0; r < result.rows; ++r) {
         const int src_r = std::min(points.rows - 1, r * factor);
@@ -258,42 +252,6 @@ static cv::Mat downsample_channel_for_growth(const cv::Mat& channel, const cv::S
         ? cv::INTER_NEAREST
         : cv::INTER_AREA;
     cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
-    return result;
-}
-
-static cv::Mat downsample_allowed_growth_mask_conservative(const cv::Mat& mask, int factor)
-{
-    if (mask.empty()) {
-        return {};
-    }
-    factor = std::max(1, factor);
-    const cv::Size dst_size = scaled_grid_size(mask.size(), factor);
-    cv::Mat normalized;
-    if (mask.type() == CV_8UC1) {
-        normalized = mask;
-    } else {
-        mask.convertTo(normalized, CV_8U);
-    }
-
-    cv::Mat_<uchar> result(dst_size, static_cast<uchar>(0));
-    for (int r = 0; r < result.rows; ++r) {
-        const int src_r0 = r * factor;
-        const int src_r1 = std::min(mask.rows, src_r0 + factor);
-        for (int c = 0; c < result.cols; ++c) {
-            const int src_c0 = c * factor;
-            const int src_c1 = std::min(mask.cols, src_c0 + factor);
-            bool all_allowed = true;
-            for (int sr = src_r0; sr < src_r1 && all_allowed; ++sr) {
-                for (int sc = src_c0; sc < src_c1; ++sc) {
-                    if (normalized.at<uchar>(sr, sc) == 0) {
-                        all_allowed = false;
-                        break;
-                    }
-                }
-            }
-            result(r, c) = static_cast<uchar>(all_allowed ? 255 : 0);
-        }
-    }
     return result;
 }
 
@@ -602,7 +560,7 @@ public:
     };
 
     PointCorrection() = default;
-    explicit PointCorrection(const VCCollection& corrections, float anchor_grid_scale = 1.0f) {
+    explicit PointCorrection(const PointCollections& corrections, float anchor_grid_scale = 1.0f) {
         const auto& collections = corrections.getAllCollections();
         if (collections.empty()) return;
 
@@ -3153,7 +3111,7 @@ struct thresholdedDistance
 
 };
 
-QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
@@ -3173,7 +3131,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         resume_surf->meta["_growth_source_height"] = source_resume_size.height;
         if (allowed_growth_mask && !allowed_growth_mask->empty()) {
             growth_scale_allowed_mask =
-                downsample_allowed_growth_mask_conservative(*allowed_growth_mask, growth_scale_factor);
+                vc::core::util::downsampleAllowedGrowthMaskCovering(*allowed_growth_mask, growth_scale_factor);
             effective_allowed_growth_mask = &growth_scale_allowed_mask;
         }
         std::cout << "GrowPatch growth scale level " << growth_scale_level
@@ -3182,7 +3140,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                   << ", output surface scale=" << output_surface_scale
                   << ")" << std::endl;
         if (effective_allowed_growth_mask && !effective_allowed_growth_mask->empty()) {
-            std::cout << "Allowed growth mask downsampled conservatively: "
+            std::cout << "Allowed growth mask downsampled with covering blocks: "
                       << allowed_growth_mask->cols << "x" << allowed_growth_mask->rows
                       << " -> " << effective_allowed_growth_mask->cols << "x"
                       << effective_allowed_growth_mask->rows

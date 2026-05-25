@@ -1,7 +1,7 @@
 #pragma once
 
 #include <QPointF>
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <optional>
 #include <unordered_set>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
 from dataclasses import dataclass
@@ -27,6 +28,15 @@ class ExportConfig:
 	voxel_size_um: float | None = None
 
 
+def _valid_xyz_mask(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+	return (
+		np.isfinite(x)
+		& np.isfinite(y)
+		& np.isfinite(z)
+		& ~((x == -1.0) & (y == -1.0) & (z == -1.0))
+	)
+
+
 def _build_parser() -> argparse.ArgumentParser:
 	p = argparse.ArgumentParser(description="Export 3D fit model as tifxyz surfaces (one per winding/depth)")
 	cli_json.add_args(p)
@@ -48,10 +58,10 @@ def _get_area(x: np.ndarray, y: np.ndarray, z: np.ndarray,
 			  step_size: float, voxel_size_um: float | None) -> dict:
 	"""Compute surface area from a tifxyz mesh grid.
 
-	Counts valid quads (all 4 corners finite and != -1) × step_size².
+	Counts valid quads (all 4 corners finite and not the -1/-1/-1 sentinel) × step_size².
 	Returns dict with area_vx2 and optionally area_cm2.
 	"""
-	valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+	valid = _valid_xyz_mask(x, y, z)
 	valid_quads = valid[:-1, :-1] & valid[:-1, 1:] & valid[1:, :-1] & valid[1:, 1:]
 	area_vx2 = int(valid_quads.sum()) * step_size ** 2
 	result = {"area_vx2": area_vx2}
@@ -65,6 +75,520 @@ def _print_area(area: dict) -> None:
 	if "area_cm2" in area:
 		parts.append(f"area_cm2={area['area_cm2']:.4f}")
 	print(f"[fit2tifxyz] {' '.join(parts)}", flush=True)
+
+
+def _bbox_for_xyz(x: np.ndarray, y: np.ndarray, z: np.ndarray, *, out_dir: Path) -> list[list[float]]:
+	valid = _valid_xyz_mask(x, y, z)
+	if not bool(valid.any()):
+		print(f"[fit2tifxyz] WARNING: no valid vertices in {out_dir}; writing invalid bbox", flush=True)
+		return [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
+	return [
+		[float(np.nanmin(x[valid])), float(np.nanmin(y[valid])), float(np.nanmin(z[valid]))],
+		[float(np.nanmax(x[valid])), float(np.nanmax(y[valid])), float(np.nanmax(z[valid]))],
+	]
+
+
+def _mark_segment_vertices(
+	mask: np.ndarray,
+	p0: tuple[float, float],
+	p1: tuple[float, float],
+	*,
+	eps: float = 1.0e-6,
+) -> None:
+	r0, c0 = p0
+	r1, c1 = p1
+	rmin = max(0, int(math.floor(min(r0, r1) - eps)))
+	rmax = min(mask.shape[0] - 1, int(math.ceil(max(r0, r1) + eps)))
+	cmin = max(0, int(math.floor(min(c0, c1) - eps)))
+	cmax = min(mask.shape[1] - 1, int(math.ceil(max(c0, c1) + eps)))
+	seg = np.asarray([r1 - r0, c1 - c0], dtype=np.float64)
+	seg_len2 = float(np.dot(seg, seg))
+	for r in range(rmin, rmax + 1):
+		for c in range(cmin, cmax + 1):
+			v = np.asarray([float(r) - r0, float(c) - c0], dtype=np.float64)
+			if seg_len2 <= eps:
+				dist2 = float(np.dot(v, v))
+			else:
+				t = max(0.0, min(1.0, float(np.dot(v, seg) / seg_len2)))
+				d = v - t * seg
+				dist2 = float(np.dot(d, d))
+			if dist2 <= eps * eps:
+				mask[r, c] = True
+
+
+def _rasterize_contours(
+	contours_rc: list[list[tuple[float, float]]],
+	shape: tuple[int, int],
+) -> np.ndarray:
+	h, w = (int(shape[0]), int(shape[1]))
+	out = np.zeros((h, w), dtype=bool)
+	if h <= 0 or w <= 0:
+		return out
+
+	for r in range(h):
+		y = float(r)
+		xints: list[float] = []
+		for contour in contours_rc:
+			if len(contour) < 3:
+				continue
+			for i, (r0, c0) in enumerate(contour):
+				r1, c1 = contour[(i + 1) % len(contour)]
+				if (r0 > y) != (r1 > y):
+					t = (y - r0) / (r1 - r0)
+					xints.append(float(c0 + t * (c1 - c0)))
+		xints.sort()
+		for i in range(0, len(xints) - 1, 2):
+			c0 = int(math.ceil(min(xints[i], xints[i + 1]) - 1.0e-6))
+			c1 = int(math.floor(max(xints[i], xints[i + 1]) + 1.0e-6))
+			if c1 < 0 or c0 >= w:
+				continue
+			out[r, max(0, c0):min(w, c1 + 1)] = True
+
+	for contour in contours_rc:
+		if len(contour) < 2:
+			continue
+		for i, p0 in enumerate(contour):
+			_mark_segment_vertices(out, p0, contour[(i + 1) % len(contour)])
+	return out
+
+
+def _dilate_chebyshev(mask: np.ndarray, radius: int) -> np.ndarray:
+	r = int(radius)
+	if r <= 0:
+		return mask.astype(bool, copy=True)
+	src = mask.astype(bool, copy=False)
+	out = src.copy()
+	h, w = src.shape
+	for dr in range(-r, r + 1):
+		rs0 = max(0, -dr)
+		rs1 = min(h, h - dr)
+		rd0 = max(0, dr)
+		rd1 = min(h, h + dr)
+		for dc in range(-r, r + 1):
+			cs0 = max(0, -dc)
+			cs1 = min(w, w - dc)
+			cd0 = max(0, dc)
+			cd1 = min(w, w + dc)
+			out[rd0:rd1, cd0:cd1] |= src[rs0:rs1, cs0:cs1]
+	return out
+
+
+def _mask_bbox(mask: np.ndarray) -> list[int] | None:
+	rc = np.argwhere(mask.astype(bool, copy=False))
+	if rc.size == 0:
+		return None
+	rmin, cmin = (int(v) for v in rc.min(axis=0))
+	rmax, cmax = (int(v) for v in rc.max(axis=0))
+	return [rmin, rmax, cmin, cmax]
+
+
+def _points_bbox(points: list[tuple[float, float]]) -> list[float] | None:
+	if not points:
+		return None
+	arr = np.asarray(points, dtype=np.float64)
+	return [
+		round(float(np.min(arr[:, 0])), 3),
+		round(float(np.max(arr[:, 0])), 3),
+		round(float(np.min(arr[:, 1])), 3),
+		round(float(np.max(arr[:, 1])), 3),
+	]
+
+
+def _corr_points_result_list(corr_results: dict) -> list[dict]:
+	points_list = corr_results.get("points_list", None)
+	if isinstance(points_list, list):
+		return [p for p in points_list if isinstance(p, dict)]
+	points = corr_results.get("points", None)
+	if not isinstance(points, dict):
+		return []
+	return [
+		p for _key, p in sorted(
+			points.items(),
+			key=lambda item: (0, int(item[0])) if str(item[0]).isdigit() else (1, str(item[0])),
+		)
+		if isinstance(p, dict)
+	]
+
+
+def _corr_points_result_lookup(corr_results: dict) -> dict[tuple[int, int], dict]:
+	lookup: dict[tuple[int, int], dict] = {}
+	for point in _corr_points_result_list(corr_results):
+		try:
+			cid = int(point.get("collection_id"))
+			pid = int(point.get("point_id"))
+		except (TypeError, ValueError):
+			continue
+		lookup[(cid, pid)] = point
+	return lookup
+
+
+def _approval_mask_corr_collection_ids(payload: dict, fit_config: dict | None) -> set[int]:
+	ids_raw = payload.get("corr_collection_ids", [])
+	ids: set[int] = set()
+	if isinstance(ids_raw, list):
+		for value in ids_raw:
+			try:
+				ids.add(int(value))
+			except (TypeError, ValueError):
+				continue
+	if ids:
+		return ids
+	if not isinstance(fit_config, dict):
+		return ids
+	corr_points = fit_config.get("corr_points", {})
+	if not isinstance(corr_points, dict):
+		return ids
+	collections = corr_points.get("collections", {})
+	if not isinstance(collections, dict):
+		return ids
+	for cid, collection in collections.items():
+		if isinstance(collection, dict) and collection.get("name") == "approval_inpaint":
+			try:
+				ids.add(int(cid))
+			except (TypeError, ValueError):
+				continue
+	return ids
+
+
+def _approval_mask_corr_contours(payload: dict, collection_ids: set[int]) -> list[tuple[int, list[int]]]:
+	raw = payload.get("corr_contours", [])
+	contours: list[tuple[int, list[int]]] = []
+	if not isinstance(raw, list):
+		return contours
+	for item in raw:
+		if not isinstance(item, dict):
+			continue
+		try:
+			cid = int(item.get("collection_id"))
+		except (TypeError, ValueError):
+			continue
+		if cid not in collection_ids:
+			continue
+		point_ids_raw = item.get("point_ids", [])
+		if not isinstance(point_ids_raw, list):
+			continue
+		point_ids = []
+		for value in point_ids_raw:
+			try:
+				point_ids.append(int(value))
+			except (TypeError, ValueError):
+				continue
+		if point_ids:
+			contours.append((cid, point_ids))
+	return contours
+
+
+def _corr_point_model_location_for_layer_reason(
+	point: dict,
+	layer_index: int,
+	shape: tuple[int, int],
+) -> tuple[tuple[float, float] | None, str]:
+	if not bool(point.get("valid", False)):
+		return None, "point_invalid"
+	err = point.get("winding_err", None)
+	if err is None:
+		return None, "missing_winding_err"
+	try:
+		err_f = float(err)
+	except (TypeError, ValueError):
+		return None, "bad_winding_err"
+	if not math.isfinite(err_f):
+		return None, "nonfinite_winding_err"
+	locations = point.get("model_locations", [])
+	if not isinstance(locations, list):
+		return None, "missing_model_locations"
+	best: tuple[float, float, float] | None = None
+	saw_layer = False
+	saw_bad_value = False
+	saw_bad_weight = False
+	saw_out_of_bounds = False
+	hmax = float(shape[0] - 1)
+	wmax = float(shape[1] - 1)
+	for loc in locations:
+		if not isinstance(loc, dict):
+			saw_bad_value = True
+			continue
+		try:
+			d = int(loc.get("d"))
+			h = float(loc.get("h"))
+			w = float(loc.get("w"))
+			weight = float(loc.get("weight", 1.0))
+			residual = float(loc.get("residual"))
+		except (TypeError, ValueError):
+			saw_bad_value = True
+			continue
+		if d != int(layer_index):
+			continue
+		saw_layer = True
+		if not (
+			math.isfinite(h)
+			and math.isfinite(w)
+			and math.isfinite(weight)
+			and math.isfinite(residual)
+		):
+			saw_bad_value = True
+			continue
+		if weight <= 0.0:
+			saw_bad_weight = True
+			continue
+		if h < 0.0 or w < 0.0 or h > hmax or w > wmax:
+			saw_out_of_bounds = True
+			continue
+		if best is None or weight > best[0]:
+			best = (weight, h, w)
+	if best is None:
+		if not locations:
+			return None, "empty_model_locations"
+		if not saw_layer:
+			return None, "no_location_on_layer"
+		if saw_out_of_bounds:
+			return None, "location_out_of_bounds"
+		if saw_bad_weight:
+			return None, "nonpositive_location_weight"
+		if saw_bad_value:
+			return None, "bad_location_value"
+		return None, "no_usable_location"
+	return (best[1], best[2]), "ok"
+
+
+def _corr_point_model_location_for_layer(
+	point: dict,
+	layer_index: int,
+	shape: tuple[int, int],
+) -> tuple[float, float] | None:
+	loc, _reason = _corr_point_model_location_for_layer_reason(point, layer_index, shape)
+	return loc
+
+
+def _approval_output_mask_for_layer_with_debug(
+	payload: dict,
+	x: np.ndarray,
+	y: np.ndarray,
+	z: np.ndarray,
+	*,
+	layer_index: int,
+	corr_results: dict | None,
+	fit_config: dict | None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+	debug: dict = {
+		"layer_index": int(layer_index),
+		"mesh_shape": [int(x.shape[0]), int(x.shape[1])],
+		"mesh_vertices": int(x.size),
+		"payload_version": payload.get("version"),
+		"payload_source": payload.get("source"),
+		"dilation_radius": int(payload.get("dilation_radius", payload.get("dilate", 0))),
+	}
+	if not isinstance(corr_results, dict):
+		raise ValueError("approval output mask requires _corr_points_results_ in the checkpoint")
+	collection_ids = _approval_mask_corr_collection_ids(payload, fit_config)
+	if not collection_ids:
+		raise ValueError("approval output mask has no approval-inpaint corr collection id")
+	debug["collection_ids"] = sorted(int(v) for v in collection_ids)
+	points = []
+	contours_rc: list[list[tuple[float, float]]] = []
+	all_results = _corr_points_result_list(corr_results)
+	lookup = _corr_points_result_lookup(corr_results)
+	payload_contours = _approval_mask_corr_contours(payload, collection_ids)
+	debug["corr_points_total"] = len(all_results)
+	debug["payload_contours"] = len(payload_contours)
+	n_seen = 0
+	skip_reasons: dict[str, int] = {}
+	sample_points: list[list[float]] = []
+	if payload_contours:
+		for cid, point_ids in payload_contours:
+			contour_points: list[tuple[float, float]] = []
+			for pid in point_ids:
+				point = lookup.get((cid, pid))
+				if point is None:
+					skip_reasons["missing_point_id"] = skip_reasons.get("missing_point_id", 0) + 1
+					continue
+				n_seen += 1
+				loc, reason = _corr_point_model_location_for_layer_reason(point, int(layer_index), x.shape)
+				if loc is None:
+					skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+					continue
+				contour_points.append(loc)
+				points.append(loc)
+				if len(sample_points) < 12:
+					sample_points.append([round(float(loc[0]), 3), round(float(loc[1]), 3)])
+			if len(contour_points) >= 3:
+				contours_rc.append(contour_points)
+	else:
+		for point in all_results:
+			try:
+				cid = int(point.get("collection_id"))
+			except (TypeError, ValueError):
+				continue
+			if cid not in collection_ids:
+				continue
+			n_seen += 1
+			loc, reason = _corr_point_model_location_for_layer_reason(point, int(layer_index), x.shape)
+			if loc is None:
+				skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+				continue
+			points.append(loc)
+			if len(sample_points) < 12:
+				sample_points.append([round(float(loc[0]), 3), round(float(loc[1]), 3)])
+		if len(points) >= 3:
+			contours_rc.append(points)
+	n_skipped = sum(skip_reasons.values())
+	debug["corr_points_matching_collection"] = int(n_seen)
+	debug["corr_points_usable"] = int(len(points))
+	debug["usable_contours"] = int(len(contours_rc))
+	debug["corr_points_skipped"] = int(n_skipped)
+	debug["skip_reasons"] = dict(sorted(skip_reasons.items()))
+	debug["usable_points_bbox_rc"] = _points_bbox(points)
+	debug["usable_points_sample_rc"] = sample_points
+	if n_skipped:
+		print(
+			f"[fit2tifxyz] approval output mask skipped {n_skipped}/{n_seen} "
+			f"corr point(s) on layer {layer_index}: {debug['skip_reasons']}",
+			flush=True,
+		)
+	if not contours_rc:
+		print(
+			f"[fit2tifxyz] WARNING: approval output mask has only {len(points)} usable "
+			f"corr point(s) and {len(contours_rc)} drawable contour(s) on layer {layer_index}; masking the layer out",
+			flush=True,
+		)
+		raw = np.zeros(x.shape, dtype=bool)
+		debug["raw_true_vertices"] = 0
+		debug["raw_bbox_rc"] = None
+		debug["dilated_true_vertices"] = 0
+		debug["dilated_bbox_rc"] = None
+		return raw, raw.copy(), debug
+	raw = _rasterize_contours(contours_rc, x.shape)
+	mask = _dilate_chebyshev(raw, debug["dilation_radius"])
+	debug["raw_true_vertices"] = int(raw.sum())
+	debug["raw_bbox_rc"] = _mask_bbox(raw)
+	debug["dilated_true_vertices"] = int(mask.sum())
+	debug["dilated_bbox_rc"] = _mask_bbox(mask)
+	if mask.size > 0:
+		debug["raw_fraction"] = round(float(raw.sum()) / float(mask.size), 6)
+		debug["dilated_fraction"] = round(float(mask.sum()) / float(mask.size), 6)
+	if bool(mask.all()):
+		print(
+			f"[fit2tifxyz] WARNING: approval output mask layer {layer_index} keeps every vertex "
+			f"(usable={len(points)} raw={int(raw.sum())} dilated={int(mask.sum())}/{mask.size})",
+			flush=True,
+		)
+	return mask, raw, debug
+
+
+def _approval_output_mask_for_layer(
+	payload: dict,
+	x: np.ndarray,
+	y: np.ndarray,
+	z: np.ndarray,
+	*,
+	layer_index: int,
+	corr_results: dict | None,
+	fit_config: dict | None,
+) -> np.ndarray:
+	mask, _raw, _debug = _approval_output_mask_for_layer_with_debug(
+		payload, x, y, z,
+		layer_index=layer_index, corr_results=corr_results, fit_config=fit_config,
+	)
+	return mask
+
+
+def _apply_output_vertex_mask(
+	x: np.ndarray,
+	y: np.ndarray,
+	z: np.ndarray,
+	d: np.ndarray | None,
+	mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+	if mask.shape != x.shape:
+		raise ValueError(f"output mask shape mismatch: {mask.shape} vs {x.shape}")
+	x_out = x.astype(np.float32, copy=True)
+	y_out = y.astype(np.float32, copy=True)
+	z_out = z.astype(np.float32, copy=True)
+	x_out[~mask] = -1.0
+	y_out[~mask] = -1.0
+	z_out[~mask] = -1.0
+	d_out = None
+	if d is not None:
+		d_out = d.astype(np.float32, copy=True)
+		d_out[~mask] = -1.0
+	return x_out, y_out, z_out, d_out
+
+
+def _corr_results_debug_summary(corr_results: dict | None) -> dict:
+	if not isinstance(corr_results, dict):
+		return {"present": False}
+	points = _corr_points_result_list(corr_results)
+	model_location_count = 0
+	valid_count = 0
+	collections: dict[str, int] = {}
+	for point in points:
+		try:
+			cid = str(int(point.get("collection_id")))
+		except (TypeError, ValueError):
+			cid = "invalid"
+		collections[cid] = collections.get(cid, 0) + 1
+		if bool(point.get("valid", False)):
+			valid_count += 1
+		locations = point.get("model_locations", [])
+		if isinstance(locations, list):
+			model_location_count += sum(1 for loc in locations if isinstance(loc, dict))
+	return {
+		"present": True,
+		"points_total": len(points),
+		"points_valid": int(valid_count),
+		"model_locations_total": int(model_location_count),
+		"collections": dict(sorted(collections.items())),
+	}
+
+
+def _fit_config_mask_enabled(fit_config: dict | None) -> bool:
+	if not isinstance(fit_config, dict):
+		return False
+	args = fit_config.get("args", {})
+	if not isinstance(args, dict):
+		return False
+	return bool(args.get("approval-inpaint-output-mask", False))
+
+
+def _write_mask_debug_artifacts(
+	out_dir: Path,
+	debug: dict,
+	*,
+	raw_mask: np.ndarray | None = None,
+	mask: np.ndarray | None = None,
+) -> None:
+	(out_dir / "approval_inpaint_output_mask_debug.json").write_text(
+		json.dumps(debug, indent=2) + "\n",
+		encoding="utf-8",
+	)
+	if raw_mask is not None:
+		tifffile.imwrite(
+			str(out_dir / "approval_inpaint_output_mask_raw.tif"),
+			raw_mask.astype(np.uint8) * 255,
+			compression="lzw",
+		)
+	if mask is not None:
+		tifffile.imwrite(
+			str(out_dir / "approval_inpaint_output_mask_dilated.tif"),
+			mask.astype(np.uint8) * 255,
+			compression="lzw",
+		)
+
+
+def _print_mask_debug(debug: dict) -> None:
+	print(
+		"[fit2tifxyz] approval mask "
+		f"layer={debug.get('layer_index')} "
+		f"collections={debug.get('collection_ids')} "
+		f"points={debug.get('corr_points_usable')}/{debug.get('corr_points_matching_collection')} "
+		f"skipped={debug.get('corr_points_skipped')} "
+		f"raw={debug.get('raw_true_vertices')}/{debug.get('mesh_vertices')} "
+		f"dilated={debug.get('dilated_true_vertices')}/{debug.get('mesh_vertices')} "
+		f"valid={debug.get('valid_vertices_before')}->{debug.get('valid_vertices_after')} "
+		f"points_bbox={debug.get('usable_points_bbox_rc')} "
+		f"mask_bbox={debug.get('dilated_bbox_rc')}",
+		flush=True,
+	)
 
 
 def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
@@ -88,10 +612,7 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		"type": "seg",
 		"format": "tifxyz",
 		"scale": [float(scale), float(scale)],
-		"bbox": [
-			[float(np.nanmin(xf)), float(np.nanmin(yf)), float(np.nanmin(zf))],
-			[float(np.nanmax(xf)), float(np.nanmax(yf)), float(np.nanmax(zf))],
-		],
+		"bbox": _bbox_for_xyz(xf, yf, zf, out_dir=out_dir),
 	}
 	if components is not None:
 		meta["components"] = components
@@ -144,6 +665,9 @@ def main(argv: list[str] | None = None) -> int:
 	corr_points_results = st.get("_corr_points_results_", None)
 	if not isinstance(corr_points_results, dict):
 		corr_points_results = None
+	approval_output_mask = st.get("_approval_inpaint_output_mask_", None)
+	if not isinstance(approval_output_mask, dict):
+		approval_output_mask = None
 
 	# Reconstruct mesh (3, D, Hm, Wm) — pyramid stores full xyz positions
 	mdl = model.Model3D.from_checkpoint(st, device=dev)
@@ -165,6 +689,21 @@ def main(argv: list[str] | None = None) -> int:
 
 	print(f"[fit2tifxyz] exporting D={D} Hm={Hm} Wm={Wm}, mesh already in fullres coords"
 		  f", voxel_size_um={cfg.voxel_size_um}")
+	if approval_output_mask is not None:
+		collection_ids = approval_output_mask.get("corr_collection_ids", [])
+		radius = int(approval_output_mask.get("dilation_radius", approval_output_mask.get("dilate", 0)))
+		corr_summary = _corr_results_debug_summary(corr_points_results)
+		print(
+			f"[fit2tifxyz] approval-inpaint output mask: source=corr_points "
+			f"collections={collection_ids} dilate={radius} corr_results={corr_summary}",
+			flush=True,
+		)
+	elif _fit_config_mask_enabled(fit_config):
+		print(
+			"[fit2tifxyz] WARNING: fit_config says approval-inpaint output masking was enabled, "
+			"but checkpoint has no _approval_inpaint_output_mask_ payload; export is unmasked",
+			flush=True,
+		)
 
 	if cfg.single_segment:
 		# Combine all depth layers horizontally
@@ -176,11 +715,37 @@ def main(argv: list[str] | None = None) -> int:
 
 		col = 0
 		components: list[list[int]] = []
+		mask_debug_layers: list[dict] = []
+		raw_mask_all = np.zeros((Hm, total_w), dtype=bool)
+		mask_all = np.zeros((Hm, total_w), dtype=bool)
 		for d in range(D):
-			x_all[:, col:col + Wm] = mesh_np[0, d]  # (Hm, Wm)
-			y_all[:, col:col + Wm] = mesh_np[1, d]
-			z_all[:, col:col + Wm] = mesh_np[2, d]
-			d_all[:, col:col + Wm] = float(d)
+			x_layer = mesh_np[0, d]  # (Hm, Wm)
+			y_layer = mesh_np[1, d]
+			z_layer = mesh_np[2, d]
+			d_layer = np.full((Hm, Wm), float(d), dtype=np.float32)
+			if approval_output_mask is not None:
+				valid_before = int(_valid_xyz_mask(x_layer, y_layer, z_layer).sum())
+				mask, raw_mask, mask_debug = _approval_output_mask_for_layer_with_debug(
+					approval_output_mask, x_layer, y_layer, z_layer,
+					layer_index=d, corr_results=corr_points_results, fit_config=fit_config,
+				)
+				x_layer, y_layer, z_layer, d_layer = _apply_output_vertex_mask(
+					x_layer, y_layer, z_layer, d_layer, mask
+				)
+				mask_debug["valid_vertices_before"] = valid_before
+				mask_debug["valid_vertices_after"] = int(_valid_xyz_mask(x_layer, y_layer, z_layer).sum())
+				mask_debug["single_segment_col_range"] = [int(col), int(col + Wm)]
+				_print_mask_debug(mask_debug)
+				mask_debug_layers.append(mask_debug)
+				raw_mask_all[:, col:col + Wm] = raw_mask
+				mask_all[:, col:col + Wm] = mask
+			else:
+				valid_layer = _valid_xyz_mask(x_layer, y_layer, z_layer)
+				d_layer = np.where(valid_layer, float(d), -1.0).astype(np.float32)
+			x_all[:, col:col + Wm] = x_layer
+			y_all[:, col:col + Wm] = y_layer
+			z_all[:, col:col + Wm] = z_layer
+			d_all[:, col:col + Wm] = d_layer
 			components.append([col, col + Wm])
 			col += Wm + BORDER_W
 
@@ -190,6 +755,18 @@ def main(argv: list[str] | None = None) -> int:
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 					  area=area, components=components if D > 1 else None)
+		if approval_output_mask is not None:
+			_write_mask_debug_artifacts(
+				out_dir,
+				{
+					"mode": "single_segment",
+					"payload": approval_output_mask,
+					"corr_results": _corr_results_debug_summary(corr_points_results),
+					"layers": mask_debug_layers,
+				},
+				raw_mask=raw_mask_all,
+				mask=mask_all,
+			)
 		_print_area(area)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
@@ -204,7 +781,20 @@ def main(argv: list[str] | None = None) -> int:
 			x = mesh_np[0, d]  # (Hm, Wm) already in fullres
 			y = mesh_np[1, d]
 			z = mesh_np[2, d]
-			valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+			mask_debug = None
+			raw_mask = None
+			mask = None
+			if approval_output_mask is not None:
+				valid_before = int(_valid_xyz_mask(x, y, z).sum())
+				mask, raw_mask, mask_debug = _approval_output_mask_for_layer_with_debug(
+					approval_output_mask, x, y, z,
+					layer_index=d, corr_results=corr_points_results, fit_config=fit_config,
+				)
+				x, y, z, _ = _apply_output_vertex_mask(x, y, z, None, mask)
+				mask_debug["valid_vertices_before"] = valid_before
+				mask_debug["valid_vertices_after"] = int(_valid_xyz_mask(x, y, z).sum())
+				_print_mask_debug(mask_debug)
+			valid = _valid_xyz_mask(x, y, z)
 			d_layer = np.where(valid, float(d), -1.0).astype(np.float32)
 			area = _get_area(x, y, z, xy_step_fullres, cfg.voxel_size_um)
 			total_area["area_vx2"] += area["area_vx2"]
@@ -214,6 +804,18 @@ def main(argv: list[str] | None = None) -> int:
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 						  area=area)
+			if approval_output_mask is not None and mask_debug is not None:
+				_write_mask_debug_artifacts(
+					out_dir,
+					{
+						"mode": "per_layer",
+						"payload": approval_output_mask,
+						"corr_results": _corr_results_debug_summary(corr_points_results),
+						"layer": mask_debug,
+					},
+					raw_mask=raw_mask,
+					mask=mask,
+				)
 			if model_params is not None:
 				(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 			if corr_points_results is not None:

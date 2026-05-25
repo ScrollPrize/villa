@@ -2,7 +2,7 @@
 
 #include "SegmentationTool.hpp"
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <vector>
 

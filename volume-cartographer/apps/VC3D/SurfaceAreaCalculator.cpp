@@ -1,6 +1,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "utils/Json.hpp"
 #include <opencv2/imgproc.hpp>

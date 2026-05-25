@@ -15,7 +15,8 @@
     {
       "name": "_ci-base",
       "hidden": true,
-      "inherits": "_base"
+      "inherits": "_base",
+      "cacheVariables": { "VC_USE_PCH": "ON" }
     },
     {
       "name": "_dev-base",
@@ -104,8 +105,6 @@
     { "name": "ci-nsan-clang",           "displayName": "CI NumericalStabilitySanitizer (clang)",
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_NSAN": "ON" } },
 
-    { "name": "ci-coverage-gcc",         "displayName": "CI Coverage (gcc, gcov)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
     { "name": "ci-coverage-clang",       "displayName": "CI Coverage (clang, source-based)",
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_ENABLE_COVERAGE": "ON" } },
 
@@ -173,7 +172,6 @@
     { "name": "ci-tsan-clang",            "configurePreset": "ci-tsan-clang" },
     { "name": "ci-tysan-clang",           "configurePreset": "ci-tysan-clang" },
     { "name": "ci-nsan-clang",            "configurePreset": "ci-nsan-clang" },
-    { "name": "ci-coverage-gcc",          "configurePreset": "ci-coverage-gcc" },
     { "name": "ci-coverage-clang",        "configurePreset": "ci-coverage-clang" },
     { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc" },
     { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" },
@@ -197,7 +195,6 @@
     { "name": "ci-tysan-clang",           "configurePreset": "ci-tysan-clang",          "inherits": "_test-base" },
     { "name": "ci-nsan-clang",            "configurePreset": "ci-nsan-clang",           "inherits": "_test-base",
       "environment": { "NSAN_OPTIONS": "halt_on_error=0:print_stats_on_exit=1" } },
-    { "name": "ci-coverage-gcc",          "configurePreset": "ci-coverage-gcc",         "inherits": "_test-base" },
     { "name": "ci-coverage-clang",        "configurePreset": "ci-coverage-clang",       "inherits": "_test-base" },
     { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc",  "inherits": "_test-base" },
     { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang","inherits": "_test-base" }

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <opencv2/opencv.hpp>
 #include <boost/graph/adjacency_list.hpp>
 #include <vector>
 
@@ -19,7 +18,7 @@ using SkeletonGraph = boost::adjacency_list<boost::vecS, boost::vecS, boost::und
 
 #include "common.hpp"
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 struct PointHash {
     std::size_t operator()(const cv::Point& p) const {

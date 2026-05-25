@@ -37,6 +37,26 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
+struct TestAutosaveRoot {
+    TestAutosaveRoot()
+        : previous(VolumePkg::autosaveRoot())
+        , root(tmpDir("autosave_root"))
+    {
+        VolumePkg::setAutosaveRoot(root);
+    }
+
+    ~TestAutosaveRoot()
+    {
+        VolumePkg::setAutosaveRoot(previous);
+        fs::remove_all(root);
+    }
+
+    fs::path previous;
+    fs::path root;
+};
+
+TestAutosaveRoot testAutosaveRoot;
+
 void stageSegments(const fs::path& root, const std::string& dirName = "paths")
 {
     auto paths = root / dirName;

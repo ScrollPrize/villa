@@ -7,13 +7,13 @@
 #include <unordered_map>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Surface.hpp"
-#include "vc/ui/VCCollection.hpp"
+class VolumePkg;
+class Volume;
+class QuadSurface;
+class Surface;
+class VCCollection;
 
 struct POI
 {

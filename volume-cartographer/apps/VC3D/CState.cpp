@@ -5,6 +5,11 @@
 #include <thread>
 #include <QSettings>
 
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Surface.hpp"
+#include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 

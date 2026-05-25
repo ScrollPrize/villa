@@ -164,6 +164,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergeTifxyzAct, &QAction::triggered,
             this, &MenuActionController::mergeTifxyzFromMenuRequested);
 
+    _mergePatchAct = new QAction(QObject::tr("Patch tifxyz..."), this);
+    connect(_mergePatchAct, &QAction::triggered,
+            this, &MenuActionController::mergePatchFromMenuRequested);
+
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -215,6 +219,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
+    _actionsMenu->addAction(_mergePatchAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);

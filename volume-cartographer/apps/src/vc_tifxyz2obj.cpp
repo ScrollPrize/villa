@@ -1,5 +1,8 @@
 // vc_tifxyz2obj.cpp
+#include <opencv2/core.hpp>  // operator<<(ostream, cv::Size) for the debug prints below
+
 #include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/InpaintSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -42,53 +45,6 @@ static inline cv::Vec3f fd_fallback_normal(const cv::Mat_<cv::Vec3f>& P, int y, 
     return {0.f,0.f,1.f};
 }
 // ---------------------------------------------------------------------------
-
-// Decimates a grid of points by keeping every nth point in both dimensions
-// This reduces the total point count by approximately (1 - 1/stride²)
-// For stride=3, this keeps ~11% of points (close to the 10% target)
-static cv::Mat_<cv::Vec3f> decimate_grid(const cv::Mat_<cv::Vec3f>& points, int iterations = 1)
-{
-    if (iterations <= 0) return points.clone();
-
-    cv::Mat_<cv::Vec3f> result = points.clone();
-
-    for (int iter = 0; iter < iterations; ++iter) {
-        // Use stride of 3 to achieve ~89% reduction (keeping ~11%)
-        const int stride = 3;
-
-        // Calculate new dimensions
-        int new_rows = (result.rows + stride - 1) / stride;
-        int new_cols = (result.cols + stride - 1) / stride;
-
-        cv::Mat_<cv::Vec3f> decimated(new_rows, new_cols);
-
-        // Sample every stride-th point
-        for (int j = 0; j < new_rows; ++j) {
-            for (int i = 0; i < new_cols; ++i) {
-                int src_j = j * stride;
-                int src_i = i * stride;
-
-                // Ensure we don't go out of bounds
-                if (src_j < result.rows && src_i < result.cols) {
-                    decimated(j, i) = result(src_j, src_i);
-                } else {
-                    // Handle edge case - use the last valid point
-                    src_j = std::min(src_j, result.rows - 1);
-                    src_i = std::min(src_i, result.cols - 1);
-                    decimated(j, i) = result(src_j, src_i);
-                }
-            }
-        }
-
-        result = decimated;
-
-        std::cout << "Decimation iteration " << (iter + 1) << ": "
-                  << "reduced to " << new_rows << " x " << new_cols
-                  << " (" << (new_rows * new_cols) << " points)" << std::endl;
-    }
-
-    return result;
-}
 
 // Decimates a grid by a target ratio (e.g., 0.5 keeps ~50% of points)
 // Computes the appropriate stride from the ratio: stride = 1/sqrt(ratio)
@@ -219,7 +175,7 @@ static cv::Mat_<cv::Vec3f> build_vertex_normals_from_faces(
     return nsum;
 }
 
-static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_fn, bool normalize_uv, bool align_grid, int decimate_iterations, bool clean_surface, float clean_sigma_k)
+static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_fn, bool normalize_uv, bool align_grid, float keep_percent, bool clean_surface, float clean_sigma_k, bool inpaint_holes)
 {
     cv::Mat_<cv::Vec3f> points = surf->rawPoints();
     
@@ -258,13 +214,26 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
         }
     }
     
-    // Apply decimation if requested
-    if (decimate_iterations > 0) {
-        std::cout << "Original grid: " << points.rows << " x " << points.cols 
+    // Apply decimation if requested: one pass, stride derived from the
+    // requested keep fraction (decimate_grid_ratio computes stride =
+    // round(1/sqrt(p))). Skip when keep_percent >= 100 (no decimation).
+    if (keep_percent > 0.0f && keep_percent < 100.0f) {
+        std::cout << "Original grid: " << points.rows << " x " << points.cols
                   << " (" << (points.rows * points.cols) << " points)" << std::endl;
-        points = decimate_grid(points, decimate_iterations);
+        points = decimate_grid_ratio(points, keep_percent / 100.0f);
     }
-    
+
+    // Fill isolated interior holes that would otherwise create extra boundary
+    // loops in the OBJ and break downstream flattening (SLIM goes NaN).
+    if (inpaint_holes) {
+        const int filled = vc::core::util::inpaintSurfaceHoles(points);
+        if (filled > 0) {
+            std::cerr << "warning: inpainted " << filled
+                      << " invalid surface cell(s) from local neighbors "
+                      << "(holes can break flattening; pass --no-inpaint to disable)\n";
+        }
+    }
+
     cv::Mat_<int> idxs(points.size(), -1);
 
     std::ofstream out(out_fn);
@@ -320,17 +289,19 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
 int main(int argc, char *argv[])
 {
     if (argc == 2 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
-        std::cout << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--decimate [iterations]] [--clean [K]]\n"
+        std::cout << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n"
                   << "  --normalize-uv : Normalize UVs to [0,1] range\n"
                   << "  --align-grid   : Align grid Z only (flatten Z per row)\n"
-                  << "  --decimate [n] : Reduce points by ~90% per iteration (default n=1)\n"
-                  << "  --clean [K]    : Remove outlier points far from surface using robust distance threshold; K is sigma multiplier (default 5.0)\n";
+                  << "  --keep=<p>     : Percent of source points to keep (1..100). 100 = no decimation. One pass; stride = round(1/sqrt(p/100)).\n"
+                  << "  --clean [K]    : Remove outlier points far from surface using robust distance threshold; K is sigma multiplier (default 5.0)\n"
+                  << "  --inpaint      : Fill isolated invalid cells via Ceres-smoothness solve before emitting OBJ. Off by default.\n"
+                  << "  --no-inpaint   : Legacy alias (inpaint is off by default now).\n";
         return EXIT_SUCCESS;
     }
 
     if (argc < 3) {
     std::cerr << "error: too few arguments\n"
-                  << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--decimate [iterations]] [--clean [K]]\n";
+                  << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n";
         return EXIT_FAILURE;
     }
 
@@ -338,7 +309,8 @@ int main(int argc, char *argv[])
     bool align_grid = false;
     bool clean_surface = false;
     float clean_sigma_k = 5.0f; // default K
-    int decimate_iterations = 0;
+    float keep_percent = 100.0f; // 100 = no decimation
+    bool inpaint_holes = false;
     
     // Parse optional arguments
     for (int i = 3; i < argc; ++i) {
@@ -347,22 +319,22 @@ int main(int argc, char *argv[])
             normalize_uv = true;
         } else if (arg == "--align-grid") {
             align_grid = true;
-        } else if (arg == "--decimate") {
-            decimate_iterations = 1; // Default to 1 iteration
-            
-            // Check if next argument is a number (iterations)
-            if (i + 1 < argc) {
-                std::string next = argv[i + 1];
-                try {
-                    int iters = std::stoi(next);
-                    if (iters > 0) {
-                        decimate_iterations = iters;
-                        ++i; // Skip the number argument
-                    }
-                } catch (...) {
-                    // Not a number, continue with default of 1
+        } else if (arg.rfind("--keep=", 0) == 0) {
+            try {
+                float p = std::stof(arg.substr(7));
+                if (p > 0.0f && p <= 100.0f) keep_percent = p;
+                else {
+                    std::cerr << "error: --keep must be in (0, 100]\n";
+                    return EXIT_FAILURE;
                 }
+            } catch (...) {
+                std::cerr << "error: --keep needs a numeric percent\n";
+                return EXIT_FAILURE;
             }
+        } else if (arg == "--inpaint") {
+            inpaint_holes = true;
+        } else if (arg == "--no-inpaint") {
+            inpaint_holes = false;
         } else if (arg == "--clean") {
             clean_surface = true;
             // Optional numeric K argument following --clean
@@ -397,7 +369,7 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, decimate_iterations, clean_surface, clean_sigma_k);
+    surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
 
     return EXIT_SUCCESS;
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -8,7 +9,21 @@ import numpy as np
 def _normalize_sample_key(sample_key):
     if sample_key is None:
         return None
-    patch_idx, wrap_idx = sample_key
+
+    if isinstance(sample_key, Mapping):
+        patch_idx = sample_key.get("patch_idx")
+        wrap_idx = sample_key.get("target_wrap_idx")
+        if wrap_idx is None:
+            wrap_idx = sample_key.get("wrap_idx")
+        if wrap_idx is None:
+            wrap_idx = sample_key.get("middle_wrap_idx")
+        if wrap_idx is None:
+            wrap_idx = sample_key.get("source_wrap_idx")
+        if patch_idx is None or wrap_idx is None:
+            return None
+    else:
+        patch_idx, wrap_idx = sample_key
+
     if wrap_idx is None:
         return (int(patch_idx), None)
     return (int(patch_idx), int(wrap_idx))

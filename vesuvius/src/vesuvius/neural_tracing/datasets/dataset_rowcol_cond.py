@@ -1,205 +1,50 @@
-import zarr
 import vesuvius.tifxyz as tifxyz
+import hashlib
+import os
 import numpy as np
 import torch
+import time
+import random
 from torch.utils.data import Dataset
-import json
-import tifffile
-import os
 from pathlib import Path
+from tqdm import tqdm
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
-    _compute_triplet_edt_bbox,
-    _compute_wrap_order_stats,
-    _extract_wrap_ids,
-    _filter_triplet_overlap_chunks,
     _prepare_cond_surface_keypoints,
     _parse_z_range,
     _read_volume_crop_from_patch,
     _require_augmented_keypoints,
     _segment_overlaps_z_range,
-    _signed_distance_field,
     _should_attempt_cond_local_perturb,
-    _triplet_close_contact_fractions,
     _trim_to_world_bbox,
-    _triplet_wraps_compatible,
-    _upsample_world_triplet,
+    _upsample_world_surface,
     _validate_result_tensors,
-    create_band_mask,
-    compute_heatmap_targets,
-    edt_dilate_binary_mask,
+    open_zarr_group,
     voxelize_surface_grid,
+    voxelize_surface_grid_into,
 )
-from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
+from vesuvius.neural_tracing.datasets.chunk_finding import find_training_chunks
 from vesuvius.neural_tracing.datasets.direction_helpers import (
-    align_triplet_branch_channels_to_priors,
     build_triplet_direction_priors_from_conditioning_surface,
-    maybe_swap_triplet_branch_channels,
+    build_split_surface_masks_and_trace_targets,
 )
 from vesuvius.neural_tracing.datasets.augmentation import (
     augment_split_payload,
     augment_triplet_payload,
 )
-from vesuvius.neural_tracing.datasets.triplet_resampling import (
-    TripletResampleTracker,
+from vesuvius.neural_tracing.datasets.neighbor_resampling import (
     choose_replacement_index,
 )
-from vesuvius.neural_tracing.datasets.dataset_defaults import (
+from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
 )
 from vesuvius.neural_tracing.datasets.conditioning import (
-    create_centered_conditioning,
     create_split_conditioning,
 )
 from vesuvius.neural_tracing.datasets.perturbation import maybe_perturb_conditioning_surface
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
-import random
-from scipy import ndimage
 import warnings
-
-
-_EDT_BACKEND_CACHE = {
-    "pid": None,
-    "name": None,
-    "fn": None,
-    "cp": None,
-    "kwargs": None,
-    "stream": None,
-}
-
-
-def _resolve_edt_backend():
-    """Resolve EDT backend per-process: prefer cupyx, fallback to scipy."""
-    pid = int(os.getpid())
-    if _EDT_BACKEND_CACHE["pid"] == pid and _EDT_BACKEND_CACHE["fn"] is not None:
-        return _EDT_BACKEND_CACHE
-
-    backend_name = "scipy"
-    backend_fn = ndimage.distance_transform_edt
-    backend_cp = None
-    backend_kwargs = {}
-    backend_stream = None
-
-    try:
-        import cupy as cp
-        from cupyx.scipy import ndimage as cndimage
-
-        if int(cp.cuda.runtime.getDeviceCount()) > 0:
-            backend_name = "cupyx"
-            backend_fn = cndimage.distance_transform_edt
-            backend_cp = cp
-            backend_kwargs = {"float64_distances": False}
-            try:
-                backend_stream = cp.cuda.Stream(non_blocking=True)
-            except Exception:
-                # Fallback to default stream behavior if stream creation fails.
-                backend_stream = None
-    except Exception:
-        # Fallback is scipy; this keeps dataset functionality available on CPU
-        # or when CUDA runtime is unavailable in the current process.
-        pass
-
-    _EDT_BACKEND_CACHE["pid"] = pid
-    _EDT_BACKEND_CACHE["name"] = backend_name
-    _EDT_BACKEND_CACHE["fn"] = backend_fn
-    _EDT_BACKEND_CACHE["cp"] = backend_cp
-    _EDT_BACKEND_CACHE["kwargs"] = backend_kwargs
-    _EDT_BACKEND_CACHE["stream"] = backend_stream
-    return _EDT_BACKEND_CACHE
-
-
-def _distance_transform_edt(
-    input_mask,
-    *,
-    return_distances: bool,
-    return_indices: bool,
-    sampling=None,
-):
-    backend = _resolve_edt_backend()
-    backend_name = backend["name"]
-    edt_fn = backend["fn"]
-
-    if backend_name == "scipy":
-        return edt_fn(
-            input_mask,
-            sampling=sampling,
-            return_distances=bool(return_distances),
-            return_indices=bool(return_indices),
-        )
-
-    cp = backend["cp"]
-    kwargs = backend["kwargs"] or {}
-    stream = backend.get("stream", None)
-
-    if stream is None:
-        input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
-        out = edt_fn(
-            input_gpu,
-            sampling=sampling,
-            return_distances=bool(return_distances),
-            return_indices=bool(return_indices),
-            **kwargs,
-        )
-        if return_distances and return_indices:
-            dist_gpu, idx_gpu = out
-            return cp.asnumpy(dist_gpu), cp.asnumpy(idx_gpu)
-        if return_distances and not return_indices:
-            return cp.asnumpy(out)
-        if (not return_distances) and return_indices:
-            return cp.asnumpy(out)
-        return None
-
-    # Use a dedicated non-blocking stream and async host copies.
-    # We still synchronize before returning to keep outputs ready for callers.
-    try:
-        with stream:
-            input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
-            out = edt_fn(
-                input_gpu,
-                sampling=sampling,
-                return_distances=bool(return_distances),
-                return_indices=bool(return_indices),
-                **kwargs,
-            )
-
-        if return_distances and return_indices:
-            dist_gpu, idx_gpu = out
-            dist_host = np.empty(dist_gpu.shape, dtype=dist_gpu.dtype)
-            idx_host = np.empty(idx_gpu.shape, dtype=idx_gpu.dtype)
-            cp.asnumpy(dist_gpu, stream=stream, out=dist_host, blocking=False)
-            cp.asnumpy(idx_gpu, stream=stream, out=idx_host, blocking=False)
-            stream.synchronize()
-            return dist_host, idx_host
-        if return_distances and not return_indices:
-            out_host = np.empty(out.shape, dtype=out.dtype)
-            cp.asnumpy(out, stream=stream, out=out_host, blocking=False)
-            stream.synchronize()
-            return out_host
-        if (not return_distances) and return_indices:
-            out_host = np.empty(out.shape, dtype=out.dtype)
-            cp.asnumpy(out, stream=stream, out=out_host, blocking=False)
-            stream.synchronize()
-            return out_host
-        return None
-    except Exception:
-        # Safety fallback to blocking transfer behavior.
-        input_gpu = cp.asarray(np.asarray(input_mask, dtype=bool))
-        out = edt_fn(
-            input_gpu,
-            sampling=sampling,
-            return_distances=bool(return_distances),
-            return_indices=bool(return_indices),
-            **kwargs,
-        )
-        if return_distances and return_indices:
-            dist_gpu, idx_gpu = out
-            return cp.asnumpy(dist_gpu), cp.asnumpy(idx_gpu)
-        if return_distances and not return_indices:
-            return cp.asnumpy(out)
-        if (not return_distances) and return_indices:
-            return cp.asnumpy(out)
-        return None
 
 
 class EdtSegDataset(Dataset):
@@ -223,26 +68,11 @@ class EdtSegDataset(Dataset):
             size = int(crop_size_cfg)
             self.crop_size = (size, size, size)
 
-        target_size = self.crop_size
-        self._heatmap_axes = [torch.arange(s, dtype=torch.float32) for s in self.crop_size]
-
         setdefault_rowcol_cond_dataset_config(config)
         validate_rowcol_cond_dataset_config(config)
-        self.displacement_supervision = str(config['displacement_supervision']).lower()
-        self.use_dense_displacement = bool(config['use_dense_displacement'])
-        self.use_triplet_wrap_displacement = bool(config['use_triplet_wrap_displacement'])
-        if not self.use_triplet_wrap_displacement:
-            # Regular split is dense-supervision only.
-            self.use_dense_displacement = True
-        self.use_triplet_direction_priors = bool(config['use_triplet_direction_priors'])
-        self.triplet_direction_prior_mask = str(config['triplet_direction_prior_mask']).lower()
-        self.triplet_random_channel_swap_prob = float(config['triplet_random_channel_swap_prob'])
-        self.triplet_close_check_enabled = bool(config['triplet_close_check_enabled'])
-        self.triplet_close_distance_voxels = float(config['triplet_close_distance_voxels'])
-        self.triplet_close_fraction_threshold = float(config['triplet_close_fraction_threshold'])
-        self.triplet_edt_bbox_padding_voxels = float(config['triplet_edt_bbox_padding_voxels'])
-        self.triplet_close_print = bool(config['triplet_close_print'])
         self._validate_result_tensors_enabled = bool(config['validate_result_tensors'])
+        self._profile_create_split_masks_enabled = bool(config.get("profile_create_split_masks", False))
+        self._profile_create_split_masks = self._new_create_split_masks_profile()
 
         aug_config = config.get('augmentation', {})
         if apply_augmentation and aug_config.get('enabled', True):
@@ -258,31 +88,43 @@ class EdtSegDataset(Dataset):
             config=self.config,
             apply_perturbation=bool(self.apply_perturbation),
         )
-
-        self.sample_mode = str(config['sample_mode']).lower()
-        self._triplet_neighbor_lookup = {}
-        self._triplet_lookup_stats = {}
-        self._triplet_overlap_kept_indices = tuple()
-        self._triplet_resample_tracker = TripletResampleTracker()
+        self.use_triplet_direction_priors = bool(config['use_triplet_direction_priors'])
+        self.triplet_direction_prior_mask = str(config['triplet_direction_prior_mask']).lower()
 
         if patch_metadata is None:
             patches = []
-            for dataset_idx, dataset in enumerate(config['datasets']):
+            dataset_iter = tqdm(
+                list(enumerate(config['datasets'])),
+                desc="Patch finding datasets",
+            )
+            for dataset_idx, dataset in dataset_iter:
                 volume_path = dataset['volume_path']
                 volume_scale = dataset['volume_scale']
-                volume = zarr.open_group(volume_path, mode='r')
+                dataset_iter.set_postfix_str(f"dataset_idx={dataset_idx}")
+                volume = open_zarr_group(
+                    volume_path,
+                    auth_json_path=dataset.get('volume_auth_json'),
+                    config=config,
+                )
                 segments_path = dataset['segments_path']
                 z_range = _parse_z_range(dataset.get('z_range', None))
-                dataset_segments = list(tifxyz.load_folder(segments_path))
+                dataset_segments = list(tqdm(
+                    tifxyz.load_folder(segments_path),
+                    desc=f"Loading segments dataset {dataset_idx}",
+                    unit="segment",
+                ))
 
                 # retarget to the proper scale
                 retarget_factor = 2 ** volume_scale
                 scaled_segments = []
-                dropped_by_z_range = 0
-                for i, seg in enumerate(dataset_segments):
-                    seg_scaled = seg.retarget(retarget_factor)
+                segment_iter = tqdm(
+                    dataset_segments,
+                    desc=f"Retarget/filter segments dataset {dataset_idx}",
+                    unit="segment",
+                )
+                for seg in segment_iter:
+                    seg_scaled = seg if retarget_factor == 1 else seg.retarget(retarget_factor)
                     if not _segment_overlaps_z_range(seg_scaled, z_range):
-                        dropped_by_z_range += 1
                         continue
                     seg_scaled.volume = volume
                     scaled_segments.append(seg_scaled)
@@ -304,195 +146,227 @@ class EdtSegDataset(Dataset):
                 min_points_per_wrap = max(1, int(round(
                     float(config['min_points_per_wrap']) * count_scale_sq
                 )))
-                edge_touch_min_count = max(1, int(round(
-                    float(config['edge_touch_min_count']) * count_scale_sq
-                )))
-
 
                 cache_dir = Path(segments_path) / ".patch_cache" if segments_path else None
-                chunk_results = find_world_chunk_patches(
+                chunk_results = find_training_chunks(
                     segments=scaled_segments,
-                    target_size=target_size,
+                    volume=volume,
+                    scale=volume_scale,
+                    target_size=self.crop_size,
                     overlap_fraction=config['overlap_fraction'],
-                    min_span_ratio=config['min_span_ratio'],
-                    edge_touch_frac=config['edge_touch_frac'],
-                    edge_touch_min_count=edge_touch_min_count,
-                    edge_touch_pad=config['edge_touch_pad'],
                     min_points_per_wrap=min_points_per_wrap,
                     bbox_pad_2d=config['bbox_pad_2d'],
-                    require_all_valid_in_bbox=config['require_all_valid_in_bbox'],
-                    skip_chunk_if_any_invalid=config['skip_chunk_if_any_invalid'],
-                    inner_bbox_fraction=config['inner_bbox_fraction'],
                     cache_dir=cache_dir,
                     force_recompute=config['force_recompute_patches'],
                     verbose=config.get('verbose', False),
                     chunk_pad=config.get('chunk_pad', 0.0),
+                    terminal_chunk_guard_voxels=config.get('terminal_chunk_guard_voxels', None),
+                    training_mode=config.get('training_mode', 'rowcol_hidden'),
                 )
 
-                for chunk in chunk_results:
+                for chunk in tqdm(
+                    chunk_results,
+                    desc=f"Materializing chunk metadata dataset {dataset_idx}",
+                    unit="chunk",
+                ):
+                    if bool(chunk.get("no_neighboring_wraps", False)):
+                        continue
+                    neighbor_sets = {
+                        int(k): tuple(int(v) for v in values)
+                        for k, values in chunk.get("neighbor_sets", {}).items()
+                    }
                     wraps_in_chunk = []
                     for w in chunk["wraps"]:
                         seg_idx = w["segment_idx"]
+                        wrap_idx = int(w.get("wrap_idx", len(wraps_in_chunk)))
                         wraps_in_chunk.append({
                             "segment": scaled_segments[seg_idx],
                             "bbox_2d": tuple(w["bbox_2d"]),
                             "wrap_id": w["wrap_id"],
+                            "wrap_label": int(w.get("wrap_label", w["wrap_id"])),
+                            "wrap_idx": wrap_idx,
                             "segment_idx": seg_idx,
+                            "neighbor_wrap_indices": neighbor_sets.get(wrap_idx, tuple()),
                         })
 
-                    patches.append(ChunkPatch(
+                    patch = ChunkPatch(
                         chunk_id=tuple(chunk["chunk_id"]),
                         volume=volume,
                         scale=volume_scale,
                         world_bbox=tuple(chunk["bbox_3d"]),
                         wraps=wraps_in_chunk,
                         segments=scaled_segments,
-                    ))
-
-            if self.use_triplet_wrap_displacement:
-                patches, self._triplet_overlap_kept_indices = _filter_triplet_overlap_chunks(
-                    patches,
-                    config=self.config,
-                )
+                        dataset_idx=dataset_idx,
+                    )
+                    patch.neighbor_sets = neighbor_sets
+                    patch.eligible_source_wrap_indices = tuple(
+                        int(v) for v in chunk.get("eligible_source_wrap_indices", ())
+                    )
+                    patches.append(patch)
 
             self.patches = patches
             self.sample_index = self._build_sample_index()
-            if self.use_triplet_wrap_displacement:
-                self._triplet_neighbor_lookup = self._build_triplet_neighbor_lookup()
+            self._neighbor_lookup = self._build_neighbor_lookup()
+            if str(self.config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
                 self.sample_index = [
                     (patch_idx, wrap_idx)
                     for patch_idx, wrap_idx in self.sample_index
-                    if (patch_idx, wrap_idx) in self._triplet_neighbor_lookup
+                    if self._has_lower_and_upper_neighbors(patch_idx, wrap_idx)
                 ]
                 if not self.sample_index:
-                    raise ValueError(
-                        "Triplet mode enabled but no wraps have same/adjacent neighbors on both sides."
-                    )
+                    raise ValueError("No copy_neighbors source wraps have adjacent neighbors on both sides.")
+            else:
+                self.sample_index = [
+                    (patch_idx, wrap_idx)
+                    for patch_idx, wrap_idx in self.sample_index
+                    if self._has_lower_and_upper_neighbors(patch_idx, wrap_idx)
+                ]
+                if not self.sample_index:
+                    raise ValueError("No wraps have adjacent neighbors on both sides.")
             spec = self.config['cond_percent']
-            low, high = float(spec[0]), float(spec[1])
-
-            self._cond_percent_min, self._cond_percent_max = low, high
+            self._cond_percent_min, self._cond_percent_max = float(spec[0]), float(spec[1])
         else:
             self._load_patch_metadata(patch_metadata)
-
-        self._dense_axis_cache = {}
-        self._cc_structure_26 = np.ones((3, 3, 3), dtype=np.uint8)
-        self._closing_structure_3 = np.ones((3, 3, 3), dtype=bool)
 
     def __len__(self):
         return len(self.sample_index)
 
     def _build_sample_index(self):
-        if self.sample_mode == 'chunk':
-            return [(patch_idx, None) for patch_idx in range(len(self.patches))]
-
-        # wrap mode: each (chunk, wrap) pair is a unique dataset sample
         sample_index = []
         for patch_idx, patch in enumerate(self.patches):
-            for wrap_idx in range(len(patch.wraps)):
+            eligible = getattr(patch, "eligible_source_wrap_indices", None)
+            wrap_indices = eligible if eligible is not None else range(len(patch.wraps))
+            for wrap_idx in wrap_indices:
                 sample_index.append((patch_idx, wrap_idx))
         return sample_index
 
     def _load_patch_metadata(self, patch_metadata):
-        self.sample_mode = patch_metadata.get('sample_mode', self.sample_mode)
         self.patches = patch_metadata['patches']
         self.sample_index = list(patch_metadata['sample_index'])
-        self._triplet_neighbor_lookup = patch_metadata.get('triplet_neighbor_lookup', {})
-        self._triplet_lookup_stats = patch_metadata.get('triplet_lookup_stats', {})
-        self._triplet_overlap_kept_indices = tuple(
-            int(i) for i in patch_metadata.get('triplet_overlap_kept_indices', tuple())
-        )
+        self._neighbor_lookup = patch_metadata.get('neighbor_lookup', {})
         self._cond_percent_min, self._cond_percent_max = patch_metadata['cond_percent']
 
     def export_patch_metadata(self):
         return {
-            'sample_mode': self.sample_mode,
             'patches': self.patches,
             'sample_index': tuple(self.sample_index),
-            'triplet_neighbor_lookup': self._triplet_neighbor_lookup,
-            'triplet_lookup_stats': self._triplet_lookup_stats,
-            'triplet_overlap_kept_indices': tuple(getattr(self, '_triplet_overlap_kept_indices', tuple())),
+            'neighbor_lookup': self._neighbor_lookup,
             'cond_percent': (self._cond_percent_min, self._cond_percent_max),
-            'use_triplet_wrap_displacement': self.use_triplet_wrap_displacement,
         }
 
-    def _build_triplet_neighbor_lookup(self):
-        """Build (patch_idx, wrap_idx) -> neighbor-wrap metadata for triplet mode.
+    def _build_copy_neighbor_pair_records(self, source_index):
+        target_filter = str(self.config.get("copy_neighbor_target_side", "random"))
+        record_mode = str(self.config.get("copy_neighbor_pair_record_mode", "all_directed"))
+        seed = int(self.config.get("seed", 0)) + int(self.config.get("copy_neighbor_pair_seed_offset", 0))
 
-        A wrap is kept only when it has one compatible neighbor on each side in
-        local wrap ordering. Branches are intentionally unordered in triplet mode:
-        we assign a deterministic side-based mapping so channel layout is stable,
-        and rely on random branch swapping during training.
-        """
-        lookup = {}
-        order_stats = {
-            "candidate_triplets": 0,
-            "kept_triplets": 0,
-            "dropped_missing_neighbors": 0,
-        }
-        for patch_idx, patch in enumerate(self.patches):
-            wrap_stats = []
-            for wrap_idx, wrap in enumerate(patch.wraps):
-                s = _compute_wrap_order_stats(wrap)
-                if s is None:
+        records = []
+        for patch_idx, source_wrap_idx in source_index:
+            neighbor_meta = self._neighbor_lookup.get((patch_idx, source_wrap_idx))
+            if neighbor_meta is None:
+                continue
+            source_wrap_idx = int(source_wrap_idx)
+            pair_records = []
+            for target_wrap_idx in neighbor_meta["neighbor_wrap_indices"]:
+                target_wrap_idx = int(target_wrap_idx)
+                if target_wrap_idx == source_wrap_idx:
                     continue
-                seg = wrap.get("segment")
-                seg_path = getattr(seg, "path", None)
-                seg_name = Path(seg_path).name if seg_path is not None else ""
-                wrap_ids = _extract_wrap_ids(seg_name)
-                if not wrap_ids:
-                    wrap_ids = _extract_wrap_ids(getattr(seg, "uuid", ""))
-                wrap_stats.append({
-                    "wrap_idx": wrap_idx,
-                    "segment_idx": int(wrap["segment_idx"]),
-                    "wrap_ids": wrap_ids,
-                    "x_median": s["x_median"],
-                    "y_median": s["y_median"],
+                target_side = self._neighbor_side(patch_idx, source_wrap_idx, target_wrap_idx)
+                if target_filter != "random" and target_side != target_filter:
+                    continue
+                pair_records.append({
+                    "patch_idx": int(patch_idx),
+                    "source_wrap_idx": int(source_wrap_idx),
+                    "target_wrap_idx": int(target_wrap_idx),
+                    "target_side": target_side,
+                    "neighbor_wrap_indices": tuple(int(v) for v in neighbor_meta["neighbor_wrap_indices"]),
                 })
 
-            if len(wrap_stats) < 3:
-                continue
-
-            x_medians = np.array([s["x_median"] for s in wrap_stats], dtype=np.float32)
-            y_medians = np.array([s["y_median"] for s in wrap_stats], dtype=np.float32)
-            x_spread = float(np.max(x_medians) - np.min(x_medians))
-            y_spread = float(np.max(y_medians) - np.min(y_medians))
-            order_axis = "x" if x_spread >= y_spread else "y"
-
-            if order_axis == "x":
-                ordered = sorted(wrap_stats, key=lambda s: (s["x_median"], s["wrap_idx"]))
+            if record_mode == "one_per_source" and pair_records:
+                key = f"{seed}:{patch_idx}:{source_wrap_idx}".encode("utf8")
+                digest = hashlib.sha256(key).digest()
+                chosen = int.from_bytes(digest[:8], "little") % len(pair_records)
+                records.append(pair_records[chosen])
             else:
-                ordered = sorted(wrap_stats, key=lambda s: (s["y_median"], s["wrap_idx"]))
+                records.extend(pair_records)
+        return records
 
-            for pos, target in enumerate(ordered):
-                prev_neighbor = None
-                for left_pos in range(pos - 1, -1, -1):
-                    candidate = ordered[left_pos]
-                    if _triplet_wraps_compatible(target, candidate):
-                        prev_neighbor = candidate
-                        break
+    @staticmethod
+    def _new_create_split_masks_profile():
+        return {
+            "attempts": 0,
+            "successes": 0,
+            "total": 0.0,
+            "conditioning": 0.0,
+            "volume_read": 0.0,
+            "coord_convert": 0.0,
+            "neighbor_total": 0.0,
+            "neighbor_extract": 0.0,
+            "neighbor_voxelize": 0.0,
+            "tensor_convert": 0.0,
+        }
 
-                next_neighbor = None
-                for right_pos in range(pos + 1, len(ordered)):
-                    candidate = ordered[right_pos]
-                    if _triplet_wraps_compatible(target, candidate):
-                        next_neighbor = candidate
-                        break
+    def create_split_masks_profile_summary(self) -> dict:
+        profile = dict(self._profile_create_split_masks)
+        successes = int(profile.get("successes", 0))
+        attempts = int(profile.get("attempts", 0))
+        denom = max(successes, 1)
+        profile["mean_total"] = float(profile["total"]) / denom
+        profile["mean_by_stage"] = {
+            key: float(profile[key]) / denom
+            for key in (
+                "conditioning",
+                "volume_read",
+                "coord_convert",
+                "neighbor_total",
+                "neighbor_extract",
+                "neighbor_voxelize",
+                "tensor_convert",
+            )
+        }
+        profile["success_rate"] = float(successes) / max(attempts, 1)
+        return profile
 
-                if prev_neighbor is None or next_neighbor is None:
-                    order_stats["dropped_missing_neighbors"] += 1
+    def _build_neighbor_lookup(self):
+        """Build (patch_idx, wrap_idx) -> precomputed neighbor-wrap metadata."""
+        lookup = {}
+        for patch_idx, patch in enumerate(self.patches):
+            for wrap_idx, wrap in enumerate(patch.wraps):
+                neighbor_indices = tuple(int(v) for v in wrap.get("neighbor_wrap_indices", ()))
+                if not neighbor_indices:
                     continue
-
-                order_stats["candidate_triplets"] += 1
-                lookup[(patch_idx, target["wrap_idx"])] = {
-                    "behind_wrap_idx": int(prev_neighbor["wrap_idx"]),
-                    "front_wrap_idx": int(next_neighbor["wrap_idx"]),
+                source_label = int(wrap.get("wrap_label", wrap.get("wrap_id", -1)))
+                lower = [
+                    idx for idx in neighbor_indices
+                    if int(patch.wraps[idx].get("wrap_label", patch.wraps[idx].get("wrap_id", -1))) < source_label
+                ]
+                upper = [
+                    idx for idx in neighbor_indices
+                    if int(patch.wraps[idx].get("wrap_label", patch.wraps[idx].get("wrap_id", -1))) > source_label
+                ]
+                selected = tuple([int(lower[0])] if lower else []) + tuple([int(upper[0])] if upper else [])
+                lookup[(patch_idx, wrap_idx)] = {
+                    "neighbor_wrap_indices": tuple(int(v) for v in neighbor_indices),
+                    "lower_neighbor_wrap_indices": tuple(int(v) for v in lower),
+                    "upper_neighbor_wrap_indices": tuple(int(v) for v in upper),
+                    "rowcol_neighbor_wrap_indices": selected,
                 }
-                order_stats["kept_triplets"] += 1
-        self._triplet_lookup_stats = order_stats
         return lookup
 
-    def _extract_wrap_world_surface(self, patch: ChunkPatch, wrap: dict, require_all_valid: bool = True):
+    def _has_lower_and_upper_neighbors(self, patch_idx: int, wrap_idx: int) -> bool:
+        neighbor_meta = self._neighbor_lookup.get((int(patch_idx), int(wrap_idx)))
+        if neighbor_meta is None:
+            return False
+        return bool(neighbor_meta["lower_neighbor_wrap_indices"]) and bool(neighbor_meta["upper_neighbor_wrap_indices"])
+
+    def _neighbor_side(self, patch_idx: int, source_wrap_idx: int, target_wrap_idx: int) -> str:
+        patch = self.patches[int(patch_idx)]
+        source = patch.wraps[int(source_wrap_idx)]
+        target = patch.wraps[int(target_wrap_idx)]
+        source_label = int(source.get("wrap_label", source.get("wrap_id", -1)))
+        target_label = int(target.get("wrap_label", target.get("wrap_id", -1)))
+        return "lower" if target_label < source_label else "upper"
+
+    def _extract_wrap_world_surface(self, patch: ChunkPatch, wrap: dict):
         """Extract one wrap as upsampled world-coordinate [H, W, 3] (ZYX)."""
         seg = wrap["segment"]
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
@@ -511,23 +385,15 @@ class EdtSegDataset(Dataset):
         if x_s.size == 0:
             return None
         if valid_s is not None:
-            if require_all_valid and not valid_s.all():
-                return None
-            if not require_all_valid and not valid_s.any():
+            if not valid_s.all():
                 return None
 
-        x_full, y_full, z_full = _upsample_world_triplet(x_s, y_s, z_s, scale_y, scale_x)
+        x_full, y_full, z_full = _upsample_world_surface(x_s, y_s, z_s, scale_y, scale_x)
         trimmed = _trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
         if trimmed is None:
             return None
         x_full, y_full, z_full = trimmed
         return np.stack([z_full, y_full, x_full], axis=-1)
-
-    def _extract_wrap_world_surface_by_index(self, patch_idx: int, wrap_idx: int, require_all_valid: bool = True):
-        """Extract one wrap surface by (patch_idx, wrap_idx)."""
-        patch = self.patches[patch_idx]
-        wrap = patch.wraps[wrap_idx]
-        return self._extract_wrap_world_surface(patch, wrap, require_all_valid=require_all_valid)
 
     def _conditioning_from_surface(
         self,
@@ -559,6 +425,96 @@ class EdtSegDataset(Dataset):
             return None
         return cond_seg
 
+    def create_copy_neighbor_masks(self, patch_idx: int, source_wrap_idx: int):
+        patch_idx = int(patch_idx)
+        patch = self.patches[patch_idx]
+        source_wrap_idx = int(source_wrap_idx)
+        neighbor_meta = self._neighbor_lookup.get((patch_idx, source_wrap_idx))
+        if neighbor_meta is None:
+            return None
+        lower = tuple(int(v) for v in neighbor_meta.get("lower_neighbor_wrap_indices", ()))
+        upper = tuple(int(v) for v in neighbor_meta.get("upper_neighbor_wrap_indices", ()))
+        if not lower or not upper:
+            return None
+        lower_wrap_idx = int(lower[0])
+        upper_wrap_idx = int(upper[0])
+
+        source_world = self._extract_wrap_world_surface(patch, patch.wraps[source_wrap_idx])
+        lower_world = self._extract_wrap_world_surface(patch, patch.wraps[lower_wrap_idx])
+        upper_world = self._extract_wrap_world_surface(patch, patch.wraps[upper_wrap_idx])
+        if source_world is None or lower_world is None or upper_world is None:
+            return None
+
+        z_min, _, y_min, _, x_min, _ = patch.world_bbox
+        min_corner = np.round([z_min, y_min, x_min]).astype(np.int64)
+        max_corner = min_corner + np.asarray(self.crop_size, dtype=np.int64)
+
+        source_local = (source_world - min_corner).astype(np.float32, copy=False)
+        lower_local = (lower_world - min_corner).astype(np.float32, copy=False)
+        upper_local = (upper_world - min_corner).astype(np.float32, copy=False)
+
+        vol_crop = _read_volume_crop_from_patch(
+            patch,
+            self.crop_size,
+            min_corner,
+            max_corner,
+        )
+        cond_gt = voxelize_surface_grid(source_local, self.crop_size).astype(np.float32, copy=False)
+        behind_seg = voxelize_surface_grid(lower_local, self.crop_size).astype(np.float32, copy=False)
+        front_seg = voxelize_surface_grid(upper_local, self.crop_size).astype(np.float32, copy=False)
+        if not cond_gt.any() or not behind_seg.any() or not front_seg.any():
+            return None
+        return {
+            "vol": torch.from_numpy(vol_crop).to(torch.float32),
+            "cond_gt": torch.from_numpy(cond_gt).to(torch.float32),
+            "behind_seg": torch.from_numpy(behind_seg).to(torch.float32),
+            "front_seg": torch.from_numpy(front_seg).to(torch.float32),
+            "source_surface_local": source_local,
+            "lower_surface_local": lower_local,
+            "upper_surface_local": upper_local,
+            "min_corner": min_corner,
+            "lower_wrap_idx": lower_wrap_idx,
+            "upper_wrap_idx": upper_wrap_idx,
+        }
+
+    def create_neighbor_targets(
+        self,
+        *,
+        cond_seg_gt: torch.Tensor,
+        behind_seg: torch.Tensor,
+        front_seg: torch.Tensor,
+        cond_surface_local: torch.Tensor | None = None,
+    ):
+        crop_size = self.crop_size
+        cond_np = cond_seg_gt.detach().cpu().numpy()
+        behind_np = behind_seg.detach().cpu().numpy()
+        front_np = front_seg.detach().cpu().numpy()
+
+        cond_bin_full = cond_np > 0.5
+        behind_bin_full = behind_np > 0.5
+        front_bin_full = front_np > 0.5
+        if not behind_bin_full.any() or not front_bin_full.any():
+            return None
+
+        dir_priors_np = None
+        if self.use_triplet_direction_priors:
+            if cond_surface_local is None:
+                return None
+            cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+            dir_priors_np = build_triplet_direction_priors_from_conditioning_surface(
+                crop_size,
+                cond_bin_full,
+                cond_surface_np,
+                mask_mode=self.triplet_direction_prior_mask,
+            )
+            if dir_priors_np is None:
+                return None
+
+        result = {}
+        if dir_priors_np is not None:
+            result["dir_priors"] = torch.from_numpy(dir_priors_np).to(torch.float32)
+        return result
+
     def _restore_cond_surface_from_augmented(
         self,
         *,
@@ -574,428 +530,39 @@ class EdtSegDataset(Dataset):
         )
         return augmented_keypoints.reshape(*cond_surface_shape, 3).contiguous()
 
-    def _resolve_conditioning_segmentation(
-        self,
-        *,
-        mask_bundle: dict,
-        cond_seg_gt: torch.Tensor,
-        cond_surface_local,
-        cond_local_perturb_active: bool,
-    ):
-        if cond_local_perturb_active and cond_surface_local is not None:
-            return self._conditioning_from_surface(
-                cond_surface_local=cond_surface_local,
-                cond_seg_gt=cond_seg_gt,
-            )
-        cond_seg = mask_bundle.get("cond")
-        if cond_seg is None:
-            cond_seg = cond_seg_gt.clone()
-        return cond_seg
+    def create_split_masks(self, patch_idx: int, wrap_idx: int):
+        profile_enabled = self._profile_create_split_masks_enabled
+        profile_start = time.perf_counter() if profile_enabled else 0.0
+        last = profile_start
+        stage_times = None
+        if profile_enabled:
+            self._profile_create_split_masks["attempts"] += 1
+            stage_times = {
+                "conditioning": 0.0,
+                "volume_read": 0.0,
+                "coord_convert": 0.0,
+                "neighbor_total": 0.0,
+                "neighbor_extract": 0.0,
+                "neighbor_voxelize": 0.0,
+                "tensor_convert": 0.0,
+            }
 
-    def create_neighbor_masks(self, idx: int, patch_idx: int, wrap_idx: int):
-        patch = self.patches[patch_idx]
-        conditioning = create_centered_conditioning(self, idx, patch_idx, wrap_idx, patch)
-        if conditioning is None:
-            return None
-        center_zyxs_unperturbed = conditioning["center_zyxs_unperturbed"]
-        behind_zyxs = conditioning["behind_zyxs"]
-        front_zyxs = conditioning["front_zyxs"]
-        min_corner = conditioning["min_corner"]
-        max_corner = conditioning["max_corner"]
-        crop_size = self.crop_size
+        def record_stage(name: str) -> None:
+            nonlocal last
+            if stage_times is None:
+                return
+            now = time.perf_counter()
+            stage_times[name] += now - last
+            last = now
 
-        vol_crop = _read_volume_crop_from_patch(
-            patch,
-            crop_size,
-            min_corner,
-            max_corner,
-        )
-
-        center_local_gt = (center_zyxs_unperturbed - min_corner).astype(np.float32)
-        behind_local = (behind_zyxs - min_corner).astype(np.float32)
-        front_local = (front_zyxs - min_corner).astype(np.float32)
-
-        center_seg_gt = voxelize_surface_grid(center_local_gt, crop_size).astype(np.float32)
-        behind_seg = voxelize_surface_grid(behind_local, crop_size).astype(np.float32)
-        front_seg = voxelize_surface_grid(front_local, crop_size).astype(np.float32)
-
-        if not center_seg_gt.any() or not behind_seg.any() or not front_seg.any():
-            return None
-
-        return {
-            "vol": torch.from_numpy(vol_crop).to(torch.float32),
-            "cond_gt": torch.from_numpy(center_seg_gt).to(torch.float32),
-            "behind_seg": torch.from_numpy(behind_seg).to(torch.float32),
-            "front_seg": torch.from_numpy(front_seg).to(torch.float32),
-            "center_surface_local": torch.from_numpy(center_local_gt).to(torch.float32),
-        }
-
-    def create_neighbor_targets(
-        self,
-        *,
-        cond_seg_gt: torch.Tensor,
-        behind_seg: torch.Tensor,
-        front_seg: torch.Tensor,
-        cond_surface_local: torch.Tensor | None = None,
-        idx: int,
-        patch_idx: int,
-        wrap_idx: int,
-    ):
-        self._triplet_resample_tracker.reset_last_target_failure_reason()
-        crop_size = self.crop_size
-        cond_np = cond_seg_gt.detach().cpu().numpy()
-        behind_np = behind_seg.detach().cpu().numpy()
-        front_np = front_seg.detach().cpu().numpy()
-
-        weight_mode = str(self.config["triplet_dense_weight_mode"]).lower()
-        need_band_mask = weight_mode in {"band", "all_band_boost"}
-        need_neighbor_distances = need_band_mask
-        cond_bin_full = cond_np > 0.5
-        behind_bin_full = behind_np > 0.5
-        front_bin_full = front_np > 0.5
-        triplet_gt_vector_dilation_radius = max(
-            0.0,
-            float(self.config["triplet_gt_vector_dilation_radius"]),
-        )
-        if triplet_gt_vector_dilation_radius > 0.0:
-            behind_bin_for_gt = edt_dilate_binary_mask(
-                behind_bin_full,
-                triplet_gt_vector_dilation_radius,
-            )
-            front_bin_for_gt = edt_dilate_binary_mask(
-                front_bin_full,
-                triplet_gt_vector_dilation_radius,
-            )
-        else:
-            behind_bin_for_gt = behind_bin_full
-            front_bin_for_gt = front_bin_full
-        if not behind_bin_for_gt.any() or not front_bin_for_gt.any():
-            self._triplet_resample_tracker.set_last_target_failure_reason(
-                "empty neighbor mask after dilation"
-            )
-            return None
-
-        if need_neighbor_distances:
-            behind_disp_work = None
-            front_disp_work = None
-            d_behind_work = None
-            d_front_work = None
-            use_triplet_edt_bbox = weight_mode == "band"
-            if use_triplet_edt_bbox:
-                triplet_edt_bbox = _compute_triplet_edt_bbox(
-                    cond_mask=cond_bin_full,
-                    behind_mask=behind_bin_for_gt,
-                    front_mask=front_bin_for_gt,
-                    padding_voxels=self.triplet_edt_bbox_padding_voxels,
-                )
-                if triplet_edt_bbox is not None:
-                    behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field(
-                        behind_bin_for_gt,
-                        return_weights=False,
-                        return_distances=True,
-                        bbox_slices=triplet_edt_bbox,
-                    )
-                    front_disp_work, _, d_front_work = self._compute_dense_displacement_field(
-                        front_bin_for_gt,
-                        return_weights=False,
-                        return_distances=True,
-                        bbox_slices=triplet_edt_bbox,
-                    )
-                    if (
-                        behind_disp_work is not None and
-                        front_disp_work is not None and
-                        d_behind_work is not None and
-                        d_front_work is not None
-                    ):
-                        z_slice, y_slice, x_slice = triplet_edt_bbox
-                        support_mask = (
-                            cond_bin_full[z_slice, y_slice, x_slice] |
-                            behind_bin_for_gt[z_slice, y_slice, x_slice] |
-                            front_bin_for_gt[z_slice, y_slice, x_slice]
-                        )
-                        if (
-                            not np.isfinite(d_behind_work[z_slice, y_slice, x_slice][support_mask]).all() or
-                            not np.isfinite(d_front_work[z_slice, y_slice, x_slice][support_mask]).all()
-                        ):
-                            behind_disp_work = None
-                            front_disp_work = None
-                            d_behind_work = None
-                            d_front_work = None
-
-            if (
-                behind_disp_work is None or
-                front_disp_work is None or
-                d_behind_work is None or
-                d_front_work is None
-            ):
-                behind_disp_work, _, d_behind_work = self._compute_dense_displacement_field(
-                    behind_bin_for_gt,
-                    return_weights=False,
-                    return_distances=True,
-                )
-                front_disp_work, _, d_front_work = self._compute_dense_displacement_field(
-                    front_bin_for_gt,
-                    return_weights=False,
-                    return_distances=True,
-                )
-        else:
-            behind_disp_work, _ = self._compute_dense_displacement_field(behind_bin_for_gt, return_weights=False)
-            front_disp_work, _ = self._compute_dense_displacement_field(front_bin_for_gt, return_weights=False)
-            d_behind_work = None
-            d_front_work = None
-        if behind_disp_work is None or front_disp_work is None:
-            self._triplet_resample_tracker.set_last_target_failure_reason(
-                "dense displacement field unavailable"
-            )
-            return None
-        behind_disp_np = behind_disp_work
-        front_disp_np = front_disp_work
-        if self.triplet_close_check_enabled:
-            cond_behind_frac, cond_front_frac, behind_front_frac = _triplet_close_contact_fractions(
-                cond_mask=cond_bin_full,
-                behind_mask=behind_bin_for_gt,
-                front_mask=front_bin_for_gt,
-                behind_disp_np=behind_disp_np,
-                front_disp_np=front_disp_np,
-                max_distance_voxels=self.triplet_close_distance_voxels,
-            )
-            max_close_frac = max(cond_behind_frac, cond_front_frac, behind_front_frac)
-            if max_close_frac > self.triplet_close_fraction_threshold:
-                if self.triplet_close_print:
-                    print(
-                        "Triplet close-contact reject "
-                        f"idx={idx} patch={patch_idx} wrap={wrap_idx} "
-                        f"cond-behind={cond_behind_frac:.4f} "
-                        f"cond-front={cond_front_frac:.4f} "
-                        f"behind-front={behind_front_frac:.4f} "
-                        f"thr={self.triplet_close_fraction_threshold:.4f} "
-                        f"dist<={self.triplet_close_distance_voxels:.3f}"
-                    )
-                self._triplet_resample_tracker.set_last_target_failure_reason(
-                    "triplet close-contact reject"
-                )
-                return None
-
-        if weight_mode == "all":
-            dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
-        elif need_band_mask:
-            band_padding = max(0.0, float(self.config["triplet_band_padding_voxels"]))
-            band_pct = float(self.config["triplet_band_distance_percentile"])
-            band_pct = min(100.0, max(1.0, band_pct))
-            if d_behind_work is None or d_front_work is None:
-                if weight_mode == "all_band_boost":
-                    dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
-                else:
-                    self._triplet_resample_tracker.set_last_target_failure_reason(
-                        "triplet band distances unavailable"
-                    )
-                    return None
-            else:
-                dense_band = create_band_mask(
-                    cond_bin_full=cond_bin_full,
-                    d_front_work=d_front_work,
-                    d_behind_work=d_behind_work,
-                    front_disp_work=front_disp_work,
-                    behind_disp_work=behind_disp_work,
-                    band_pct=band_pct,
-                    band_padding=band_padding,
-                    cc_structure_26=self._cc_structure_26,
-                    closing_structure_3=self._closing_structure_3,
-                )
-                if dense_band is None:
-                    if weight_mode == "all_band_boost":
-                        dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
-                    else:
-                        self._triplet_resample_tracker.set_last_target_failure_reason(
-                            "triplet band mask unavailable"
-                        )
-                        return None
-                elif weight_mode == "all_band_boost":
-                    band_boost_weight = float(self.config.get("triplet_band_boost_weight", 2.0))
-                    dense_weight_np = np.ones((1, *crop_size), dtype=np.float32)
-                    dense_weight_np += (band_boost_weight - 1.0) * dense_band[None]
-                else:
-                    dense_weight_np = dense_band[None]
-        else:
-            raise ValueError(
-                "triplet_dense_weight_mode must be one of {'all', 'band', 'all_band_boost'}, "
-                f"got {weight_mode!r}"
-            )
-        if float(dense_weight_np.sum()) <= 0:
-            self._triplet_resample_tracker.set_last_target_failure_reason(
-                "triplet dense weight is empty"
-            )
-            return None
-
-        dense_gt_np = np.empty((6, *crop_size), dtype=np.float32)
-        dense_gt_np[:3, ...] = behind_disp_np
-        dense_gt_np[3:, ...] = front_disp_np
-        canonical_channel_order_np = np.array([0, 1], dtype=np.int64)
-        dir_priors_np = None
-        if self.use_triplet_direction_priors:
-            if cond_surface_local is None:
-                self._triplet_resample_tracker.set_last_target_failure_reason(
-                    "conditioning surface missing for direction priors"
-                )
-                return None
-            cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
-            dir_priors_np = build_triplet_direction_priors_from_conditioning_surface(
-                crop_size,
-                cond_bin_full,
-                cond_surface_np,
-                mask_mode=self.triplet_direction_prior_mask,
-            )
-            if dir_priors_np is None:
-                self._triplet_resample_tracker.set_last_target_failure_reason(
-                    "triplet direction priors unavailable"
-                )
-                return None
-            # Canonicalize branch/channel assignment to match prior slots before
-            # optional random swap augmentation.
-            dense_gt_np, dir_priors_np, canonical_channel_order_np = align_triplet_branch_channels_to_priors(
-                dense_gt_np,
-                dir_priors_np,
-                cond_mask=cond_bin_full,
-            )
-        dense_gt_np, dir_priors_np, random_channel_order_np = maybe_swap_triplet_branch_channels(
-            dense_gt_np,
-            dir_priors_np,
-            swap_prob=self.triplet_random_channel_swap_prob,
-            rng=random,
-        )
-        triplet_channel_order_np = canonical_channel_order_np[random_channel_order_np]
-        dense_gt_disp = torch.from_numpy(dense_gt_np).to(torch.float32)
-        dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
-
-        result = {
-            "dense_gt_displacement": dense_gt_disp,  # (6, D, H, W): channel0(dz,dy,dx), channel1(dz,dy,dx)
-            "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
-            "triplet_channel_order": torch.from_numpy(triplet_channel_order_np).to(torch.int64),  # [2]: slot0/slot1 -> canonical A/B
-        }
-        if dir_priors_np is not None:
-            result["dir_priors"] = torch.from_numpy(dir_priors_np).to(torch.float32)
-        return result
-
-    def _get_dense_axis_offsets(self, shape_zyx):
-        shape_key = tuple(int(s) for s in shape_zyx)
-        axes = self._dense_axis_cache.get(shape_key)
-        if axes is None:
-            d, h, w = shape_key
-            axes = (
-                np.arange(d, dtype=np.float32)[:, None, None],
-                np.arange(h, dtype=np.float32)[None, :, None],
-                np.arange(w, dtype=np.float32)[None, None, :],
-            )
-            self._dense_axis_cache[shape_key] = axes
-        return axes
-
-    def _compute_dense_displacement_field(
-        self,
-        full_surface_mask: np.ndarray,
-        return_weights: bool = True,
-        return_distances: bool = False,
-        bbox_slices=None,
-    ):
-        """Compute nearest-surface displacement vector for every voxel.
-
-        Args:
-            full_surface_mask: (D, H, W) binary/boolean mask of GT surface voxels.
-            return_distances: whether to also return nearest-surface Euclidean distance map.
-            bbox_slices: optional (z, y, x) slices to compute on a sub-volume and
-                scatter back into full-volume outputs.
-
-        Returns:
-            disp_field: (3, D, H, W) with components (dz, dy, dx)
-            weight_mask: (1, D, H, W) per-voxel supervision weights
-            distance_map: (D, H, W) nearest-surface distance (optional)
-        """
-        surface = np.asarray(full_surface_mask)
-        if surface.dtype != np.bool_:
-            surface = surface > 0.5
-
-        def _compute_core(surface_bool: np.ndarray):
-            if not surface_bool.any():
-                if return_distances:
-                    return None, None, None
-                return None, None
-
-            if return_distances:
-                distances, nearest_idx = _distance_transform_edt(
-                    ~surface_bool, return_distances=True, return_indices=True
-                )
-                distances = distances.astype(np.float32, copy=False)
-            else:
-                nearest_idx = _distance_transform_edt(
-                    ~surface_bool, return_distances=False, return_indices=True
-                )
-                distances = None
-
-            disp = nearest_idx.astype(np.float32, copy=False)
-            z_axis, y_axis, x_axis = self._get_dense_axis_offsets(surface_bool.shape)
-            disp[0] -= z_axis
-            disp[1] -= y_axis
-            disp[2] -= x_axis
-            weights = np.ones((1, *surface_bool.shape), dtype=np.float32) if return_weights else None
-            if return_distances:
-                return disp, weights, distances
-            return disp, weights
-
-        if bbox_slices is not None:
-            if surface.ndim != 3:
-                raise ValueError(f"full_surface_mask must be 3D, got shape {tuple(surface.shape)}")
-            if len(bbox_slices) != 3:
-                raise ValueError("bbox_slices must be a tuple/list of (z, y, x) slices")
-            z_slice, y_slice, x_slice = bbox_slices
-            sub_surface = surface[z_slice, y_slice, x_slice]
-            if sub_surface.size == 0 or not sub_surface.any():
-                if return_distances:
-                    return None, None, None
-                return None, None
-
-            if return_distances:
-                sub_disp, sub_weights, sub_dist = _compute_core(sub_surface)
-            else:
-                sub_disp, sub_weights = _compute_core(sub_surface)
-                sub_dist = None
-            if sub_disp is None:
-                if return_distances:
-                    return None, None, None
-                return None, None
-
-            disp_full = np.zeros((3, *surface.shape), dtype=np.float32)
-            disp_full[:, z_slice, y_slice, x_slice] = sub_disp
-
-            if return_weights:
-                weights_full = np.zeros((1, *surface.shape), dtype=np.float32)
-                if sub_weights is not None:
-                    weights_full[:, z_slice, y_slice, x_slice] = sub_weights
-            else:
-                weights_full = None
-
-            if return_distances:
-                dist_full = np.full(surface.shape, np.inf, dtype=np.float32)
-                if sub_dist is not None:
-                    dist_full[z_slice, y_slice, x_slice] = sub_dist
-                return disp_full, weights_full, dist_full
-            return disp_full, weights_full
-
-        return _compute_core(surface)
-
-    def create_split_masks(self, idx: int, patch_idx: int, wrap_idx: int):
         patch = self.patches[patch_idx]
         crop_size = self.crop_size  # tuple (D, H, W)
         target_shape = crop_size
 
-        conditioning = create_split_conditioning(self, idx, patch_idx, wrap_idx, patch)
+        conditioning = create_split_conditioning(self, patch_idx, wrap_idx, patch)
+        record_stage("conditioning")
         if conditioning is None:
             return None
-        wrap = conditioning["wrap"]
-        seg = conditioning["seg"]
-        r_min = conditioning["r_min"]
-        r_max = conditioning["r_max"]
-        c_min = conditioning["c_min"]
-        c_max = conditioning["c_max"]
-        conditioning_percent = conditioning["conditioning_percent"]
         cond_direction = conditioning["cond_direction"]
         cond_zyxs_unperturbed = conditioning["cond_zyxs_unperturbed"]
         masked_zyxs = conditioning["masked_zyxs"]
@@ -1008,205 +575,85 @@ class EdtSegDataset(Dataset):
             min_corner,
             max_corner,
         )
+        record_stage("volume_read")
 
         # convert cond and masked coords to crop-local coords (float for line interpolation)
         cond_zyxs_unperturbed_local_float = (cond_zyxs_unperturbed - min_corner).astype(np.float32)
         masked_zyxs_local_float = (masked_zyxs - min_corner).astype(np.float32)
+        record_stage("coord_convert")
 
         crop_shape = target_shape
 
-        # voxelize with line interpolation between adjacent grid points
-        cond_segmentation_gt = voxelize_surface_grid(cond_zyxs_unperturbed_local_float, crop_shape)
-        masked_segmentation = voxelize_surface_grid(masked_zyxs_local_float, crop_shape)
-
-        # make sure we actually have some conditioning
-        if not cond_segmentation_gt.any():
+        neighbor_start = time.perf_counter() if stage_times is not None else 0.0
+        neighbor_segmentation = self._build_neighbor_sheet_mask(
+            patch_idx=patch_idx,
+            wrap_idx=wrap_idx,
+            min_corner=min_corner,
+            crop_shape=crop_shape,
+            stage_times=stage_times,
+        )
+        if stage_times is not None:
+            now = time.perf_counter()
+            stage_times["neighbor_total"] += now - neighbor_start
+            last = now
+        if neighbor_segmentation is None:
             return None
-
-        cond_segmentation_gt_raw = cond_segmentation_gt.copy()
-
-        # add thickness to conditioning segmentation via dilation
-        use_dilation = self.config.get('use_dilation', False)
-        if use_dilation:
-            dilation_radius = self.config['dilation_radius']
-            cond_segmentation = edt_dilate_binary_mask(
-                cond_segmentation_gt > 0.5,
-                dilation_radius,
-            ).astype(np.float32, copy=False)
-        else:
-            cond_segmentation = cond_segmentation_gt
-
-        use_segmentation = self.config['use_segmentation']
-        use_sdt = self.config['use_sdt']
-        full_segmentation = None
-        full_segmentation_raw = None
-        if use_sdt:
-            # combine cond + masked into full segmentation
-            full_segmentation = np.maximum(cond_segmentation, masked_segmentation)
-        if use_segmentation:
-            full_segmentation_raw = np.maximum(cond_segmentation_gt_raw, masked_segmentation)
-
-        if use_sdt:
-            # if already dilated, just compute SDT directly; otherwise dilate first
-            if use_dilation:
-                seg_dilated = full_segmentation
-            else:
-                dilation_radius = self.config['dilation_radius']
-                seg_dilated = edt_dilate_binary_mask(
-                    full_segmentation > 0.5,
-                    dilation_radius,
-                ).astype(np.float32, copy=False)
-            sdt = _signed_distance_field(seg_dilated)
-
-        if use_segmentation:
-            dilation_radius = self.config['dilation_radius']
-            full_segmentation_raw_bin = full_segmentation_raw > 0.5
-            seg_dilated = edt_dilate_binary_mask(
-                full_segmentation_raw_bin,
-                dilation_radius,
-            ).astype(np.float32, copy=False)
-            seg_skel = full_segmentation_raw_bin.astype(np.float32, copy=False)
-
-        # generate heatmap targets for expected positions in masked region
-        use_heatmap = self.config['use_heatmap_targets']
-        if use_heatmap:
-            effective_step = int(self.config['heatmap_step_size'] * (2 ** patch.scale))
-            h_s_full = r_max - r_min + 1
-            w_s_full = c_max - c_min + 1
-            r_cond_s = min(max(int(round(h_s_full * conditioning_percent)), 1), h_s_full - 1)
-            c_cond_s = min(max(int(round(w_s_full * conditioning_percent)), 1), w_s_full - 1)
-            if cond_direction == "down":
-                r_split_s = r_min + (h_s_full - r_cond_s)
-            else:
-                r_split_s = r_min + r_cond_s
-            if cond_direction == "right":
-                c_split_s = c_min + (w_s_full - c_cond_s)
-            else:
-                c_split_s = c_min + c_cond_s
-            heatmap_tensor = compute_heatmap_targets(
-                cond_direction=cond_direction,
-                r_split=r_split_s, c_split=c_split_s,
-                r_min_full=r_min, r_max_full=r_max + 1,
-                c_min_full=c_min, c_max_full=c_max + 1,
-                patch_seg=seg,
-                min_corner=min_corner,
-                crop_size=crop_size,
-                step_size=effective_step,
-                step_count=self.config['heatmap_step_count'],
-                sigma=self.config['heatmap_sigma'],
-                axis_1d=self._heatmap_axes[0],
-            )
-            if heatmap_tensor is None:
-                return None
-
-        # other wrap conditioning: find and voxelize other wraps from the same segment
-        use_other_wrap_cond = self.config['use_other_wrap_cond']
-        other_wraps_vox = np.zeros(crop_shape, dtype=np.float32)
-        if use_other_wrap_cond:
-            primary_segment_idx = wrap["segment_idx"]
-            other_wraps_list = [w for w in patch.wraps
-                                if w["segment_idx"] == primary_segment_idx and w is not wrap]
-
-            # if another wrap exists, get it with some probablity
-            if other_wraps_list and random.random() < self.config['other_wrap_prob']:
-                z_min_w, z_max_w, y_min_w, y_max_w, x_min_w, x_max_w = patch.world_bbox
-
-                for other_wrap in other_wraps_list:
-                    other_seg = other_wrap["segment"]
-                    or_min, or_max, oc_min, oc_max = other_wrap["bbox_2d"]
-
-                    other_seg_h, other_seg_w = other_seg._valid_mask.shape
-                    or_min = max(0, or_min)
-                    or_max = min(other_seg_h - 1, or_max)
-                    oc_min = max(0, oc_min)
-                    oc_max = min(other_seg_w - 1, oc_max)
-                    if or_max < or_min or oc_max < oc_min:
-                        continue
-
-                    other_seg.use_stored_resolution()
-                    o_scale_y, o_scale_x = other_seg._scale
-
-                    ox_s, oy_s, oz_s, ovalid_s = other_seg[or_min:or_max+1, oc_min:oc_max+1]
-                    if not ovalid_s.all():
-                        continue
-
-                    ox_full, oy_full, oz_full = _upsample_world_triplet(ox_s, oy_s, oz_s, o_scale_y, o_scale_x)
-                    trimmed = _trim_to_world_bbox(
-                        ox_full, oy_full, oz_full, (z_min_w, z_max_w, y_min_w, y_max_w, x_min_w, x_max_w)
-                    )
-                    if trimmed is None:
-                        continue
-                    ox_full, oy_full, oz_full = trimmed
-
-                    other_zyxs = np.stack([oz_full, oy_full, ox_full], axis=-1)
-                    other_zyxs_local = (other_zyxs - min_corner).astype(np.float32)
-
-                    other_vox = voxelize_surface_grid(other_zyxs_local, crop_shape)
-                    other_wraps_vox = np.maximum(other_wraps_vox, other_vox)
 
         result = {
             "vol": torch.from_numpy(vol_crop).to(torch.float32),
-            "masked_seg": torch.from_numpy(masked_segmentation).to(torch.float32),
-            "cond_gt": torch.from_numpy(cond_segmentation_gt_raw).to(torch.float32),
-            "other_wraps": torch.from_numpy(other_wraps_vox).to(torch.float32),
-            "cond_surface_local": torch.from_numpy(cond_zyxs_unperturbed_local_float).to(torch.float32),
+            "cond_surface_local": cond_zyxs_unperturbed_local_float,
+            "masked_surface_local": masked_zyxs_local_float,
+            "cond_direction": cond_direction,
         }
-        if use_segmentation:
-            result["segmentation"] = torch.from_numpy(seg_dilated).to(torch.float32)
-            result["segmentation_skel"] = torch.from_numpy(seg_skel).to(torch.float32)
-        if use_sdt:
-            result["sdt"] = torch.from_numpy(sdt).to(torch.float32)
-        if use_heatmap:
-            result["heatmap_target"] = heatmap_tensor.to(torch.float32)
+        result["neighbor_seg"] = torch.from_numpy(neighbor_segmentation).to(torch.float32)
+        record_stage("tensor_convert")
+        if stage_times is not None:
+            profile = self._profile_create_split_masks
+            profile["successes"] += 1
+            profile["total"] += time.perf_counter() - profile_start
+            for name, seconds in stage_times.items():
+                profile[name] += seconds
         return result
 
-    def create_split_targets(
-        self,
-        *,
-        cond_seg_gt: torch.Tensor,
-        masked_seg: torch.Tensor,
-    ):
-        full_dense_surface = torch.maximum(masked_seg, cond_seg_gt)
-        dense_disp_np, dense_weight_np = self._compute_dense_displacement_field(
-            full_dense_surface.detach().cpu().numpy()
-        )
-        if dense_disp_np is None:
+    def _build_neighbor_sheet_mask(self, *, patch_idx: int, wrap_idx: int, min_corner, crop_shape, stage_times=None):
+        neighbor_meta = self._neighbor_lookup.get((patch_idx, wrap_idx))
+        if neighbor_meta is None:
             return None
-        dense_gt_disp = torch.from_numpy(dense_disp_np).to(torch.float32)
-        dense_loss_weight = torch.from_numpy(dense_weight_np).to(torch.float32)
-        return {
-            "dense_gt_displacement": dense_gt_disp,  # (3, D, H, W)
-            "dense_loss_weight": dense_loss_weight,  # (1, D, H, W)
-        }
+        neighbor_indices = tuple(int(v) for v in neighbor_meta.get("rowcol_neighbor_wrap_indices", ()))
+        if len(neighbor_indices) != 2:
+            return None
 
-    def _format_triplet_target_unavailable_reason(self):
-        reason = "triplet target payload unavailable"
-        detail = self._triplet_resample_tracker.last_target_failure_reason
-        if detail:
-            return f"{reason} ({detail})"
-        return reason
+        patch = self.patches[patch_idx]
+        neighbor_vox = np.zeros(crop_shape, dtype=np.uint8)
+        for neighbor_wrap_idx in neighbor_indices:
+            extract_start = time.perf_counter() if stage_times is not None else 0.0
+            neighbor_surface = self._extract_wrap_world_surface(
+                patch,
+                patch.wraps[neighbor_wrap_idx],
+            )
+            extract_done = time.perf_counter() if stage_times is not None else 0.0
+            if stage_times is not None:
+                stage_times["neighbor_extract"] += extract_done - extract_start
+            if neighbor_surface is None:
+                return None
+            neighbor_local = (neighbor_surface - min_corner).astype(np.float32, copy=False)
+            voxelize_surface_grid_into(neighbor_vox, neighbor_local)
+            if stage_times is not None:
+                voxel_done = time.perf_counter()
+                stage_times["neighbor_voxelize"] += voxel_done - extract_done
+
+        if not bool(neighbor_vox.any()):
+            return None
+        return neighbor_vox
 
     def _resample_item(self, idx, reason, patch_idx=None, wrap_idx=None, attempted_indices=None):
         attempted = set(int(i) for i in (attempted_indices or ()))
         if 0 <= int(idx) < len(self):
             attempted.add(int(idx))
 
-        if (
-            self.use_triplet_wrap_displacement and
-            str(reason).startswith("triplet target payload unavailable") and
-            0 <= int(idx) < len(self.sample_index)
-        ):
-            self._triplet_resample_tracker.mark_failed_target_key(self.sample_index[int(idx)])
-
-        blocked_keys = (
-            self._triplet_resample_tracker.failed_target_keys
-            if self.use_triplet_wrap_displacement
-            else None
-        )
         new_idx = choose_replacement_index(
             self.sample_index,
             attempted_indices=attempted,
-            failed_target_keys=blocked_keys,
         )
         if new_idx is None:
             raise RuntimeError(
@@ -1215,11 +662,116 @@ class EdtSegDataset(Dataset):
             )
         patch_str = f" patch={patch_idx}" if patch_idx is not None else ""
         wrap_str = f" wrap={wrap_idx}" if wrap_idx is not None else ""
-        print(
-            f"[EdtSegDataset] Resampling item idx={idx}{patch_str}{wrap_str} "
-            f"reason={reason} replacement_idx={new_idx}"
-        )
+        if bool(self.config.get("verbose", False)):
+            print(
+                f"[EdtSegDataset] Resampling item idx={idx}{patch_str}{wrap_str} "
+                f"reason={reason} replacement_idx={new_idx}"
+            )
         return self.__getitem__(new_idx, _attempted_indices=attempted)
+
+    def _getitem_copy_neighbors(self, idx: int, _attempted_indices):
+        patch_idx, source_wrap_idx = self.sample_index[idx]
+        patch_idx = int(patch_idx)
+        source_wrap_idx = int(source_wrap_idx)
+        mask_bundle = self.create_copy_neighbor_masks(patch_idx, source_wrap_idx)
+        if mask_bundle is None:
+            return self._resample_item(
+                idx,
+                "copy-neighbor triplet mask bundle missing",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        vol_crop = mask_bundle["vol"]
+        cond_seg_gt = mask_bundle["cond_gt"]
+        behind_seg = mask_bundle["behind_seg"]
+        front_seg = mask_bundle["front_seg"]
+        source_surface_source = torch.from_numpy(mask_bundle["source_surface_local"]).to(torch.float32)
+        source_surface_local, source_surface_shape, source_keypoints, valid_source = (
+            _prepare_cond_surface_keypoints(source_surface_source)
+        )
+        if not valid_source:
+            return self._resample_item(
+                idx,
+                "copy-neighbor source surface invalid",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        augmented = augment_triplet_payload(
+            augmentations=self._augmentations,
+            crop_size=self.crop_size,
+            vol_crop=vol_crop,
+            cond_seg_gt=cond_seg_gt,
+            behind_seg=behind_seg,
+            front_seg=front_seg,
+            cond_surface_local=source_surface_local,
+            cond_surface_keypoints=source_keypoints,
+            cond_surface_shape=source_surface_shape,
+            restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
+        )
+        vol_crop = augmented["vol_crop"]
+        cond_seg_gt = augmented["cond_seg_gt"]
+        behind_seg = augmented["behind_seg"]
+        front_seg = augmented["front_seg"]
+        source_surface_local = augmented["cond_surface_local"]
+
+        target_payload = self.create_neighbor_targets(
+            cond_seg_gt=cond_seg_gt,
+            behind_seg=behind_seg,
+            front_seg=front_seg,
+            cond_surface_local=source_surface_local,
+        )
+        if target_payload is None:
+            return self._resample_item(
+                idx,
+                "copy-neighbor dense displacement targets unavailable",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        if self._cond_local_perturb_active:
+            cond_seg = self._conditioning_from_surface(
+                cond_surface_local=source_surface_local,
+                cond_seg_gt=cond_seg_gt,
+            )
+        else:
+            cond_seg = cond_seg_gt.clone()
+        if cond_seg is None:
+            return self._resample_item(
+                idx,
+                "copy-neighbor conditioning segmentation unresolved",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        result = {
+            "vol": vol_crop,
+            "cond": cond_seg,
+            "cond_gt": cond_seg_gt,
+            "behind_seg": behind_seg,
+            "front_seg": front_seg,
+            "triplet_swap_enabled": torch.tensor(float(bool(self.apply_augmentation)), dtype=torch.float32),
+        }
+        result.update(target_payload)
+
+        if not _validate_result_tensors(
+            result,
+            idx,
+            enabled=self._validate_result_tensors_enabled,
+        ):
+            return self._resample_item(
+                idx,
+                "copy-neighbor result tensor validation failed",
+                patch_idx=patch_idx,
+                wrap_idx=source_wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+        return result
 
     def __getitem__(self, idx, _attempted_indices=None):
         idx = int(idx)
@@ -1233,213 +785,117 @@ class EdtSegDataset(Dataset):
             )
         _attempted_indices.add(idx)
 
+        if str(self.config.get("training_mode", "rowcol_hidden")) == "copy_neighbors":
+            return self._getitem_copy_neighbors(idx, _attempted_indices)
+
         patch_idx, wrap_idx = self.sample_index[idx]
-        cond_local_perturb_active = bool(
-            getattr(
-                self,
-                "_cond_local_perturb_active",
-                _should_attempt_cond_local_perturb(
-                    config=self.config,
-                    apply_perturbation=bool(self.apply_perturbation),
-                ),
-            )
-        )
-        if self.use_triplet_wrap_displacement:
-            mask_bundle = self.create_neighbor_masks(idx, patch_idx, wrap_idx)
-            if mask_bundle is None:
-                return self._resample_item(
-                    idx,
-                    "triplet mask bundle missing",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-
-            vol_crop = mask_bundle["vol"]
-            cond_seg_gt = mask_bundle["cond_gt"]
-            behind_seg = mask_bundle["behind_seg"]
-            front_seg = mask_bundle["front_seg"]
-            cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
-                _prepare_cond_surface_keypoints(mask_bundle.get("center_surface_local"))
-            )
-            if not valid_cond_surface:
-                return self._resample_item(
-                    idx,
-                    "triplet conditioning surface invalid",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-
-            triplet_augmented = augment_triplet_payload(
-                augmentations=self._augmentations,
-                crop_size=self.crop_size,
-                vol_crop=vol_crop,
-                cond_seg_gt=cond_seg_gt,
-                behind_seg=behind_seg,
-                front_seg=front_seg,
-                cond_surface_local=cond_surface_local,
-                cond_surface_keypoints=cond_surface_keypoints,
-                cond_surface_shape=cond_surface_shape,
-                restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
-            )
-            vol_crop = triplet_augmented["vol_crop"]
-            cond_seg_gt = triplet_augmented["cond_seg_gt"]
-            behind_seg = triplet_augmented["behind_seg"]
-            front_seg = triplet_augmented["front_seg"]
-            cond_surface_local = triplet_augmented["cond_surface_local"]
-            cond_seg = self._resolve_conditioning_segmentation(
-                mask_bundle=mask_bundle,
-                cond_seg_gt=cond_seg_gt,
-                cond_surface_local=cond_surface_local,
-                cond_local_perturb_active=cond_local_perturb_active,
-            )
-            if cond_seg is None:
-                return self._resample_item(
-                    idx,
-                    "triplet conditioning segmentation unresolved",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-
-            target_payload = self.create_neighbor_targets(
-                cond_seg_gt=cond_seg_gt,
-                behind_seg=behind_seg,
-                front_seg=front_seg,
-                cond_surface_local=cond_surface_local,
-                idx=idx,
+        mask_bundle = self.create_split_masks(patch_idx, wrap_idx)
+        if mask_bundle is None:
+            return self._resample_item(
+                idx,
+                "split mask bundle missing",
                 patch_idx=patch_idx,
                 wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
             )
-            if target_payload is None:
-                return self._resample_item(
-                    idx,
-                    self._format_triplet_target_unavailable_reason(),
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
 
-            result = {
-                "vol": vol_crop,
-                "cond": cond_seg,
-            }
-            result.update(target_payload)
+        vol_crop = mask_bundle["vol"]
+        cond_direction = mask_bundle["cond_direction"]
+        neighbor_seg_tensor = mask_bundle["neighbor_seg"]
+        cond_surface_source = mask_bundle.get("cond_surface_local")
+        masked_surface_source = mask_bundle.get("masked_surface_local")
+        if isinstance(cond_surface_source, np.ndarray):
+            cond_surface_source = torch.from_numpy(cond_surface_source).to(torch.float32)
+        if isinstance(masked_surface_source, np.ndarray):
+            masked_surface_source = torch.from_numpy(masked_surface_source).to(torch.float32)
+        cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
+            _prepare_cond_surface_keypoints(cond_surface_source)
+        )
+        if not valid_cond_surface:
+            return self._resample_item(
+                idx,
+                "split conditioning surface invalid",
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+        masked_surface_local, masked_surface_shape, masked_surface_keypoints, valid_masked_surface = (
+            _prepare_cond_surface_keypoints(masked_surface_source)
+        )
+        if not valid_masked_surface:
+            return self._resample_item(
+                idx,
+                "split masked surface invalid",
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+
+        split_augmented = augment_split_payload(
+            augmentations=self._augmentations,
+            crop_size=self.crop_size,
+            vol_crop=vol_crop,
+            masked_seg=None,
+            cond_seg_gt=None,
+            cond_surface_local=cond_surface_local,
+            cond_surface_keypoints=cond_surface_keypoints,
+            cond_surface_shape=cond_surface_shape,
+            restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
+            masked_surface_local=masked_surface_local,
+            masked_surface_keypoints=masked_surface_keypoints,
+            masked_surface_shape=masked_surface_shape,
+            neighbor_seg_tensor=neighbor_seg_tensor,
+        )
+        vol_crop = split_augmented["vol_crop"]
+        cond_surface_local = split_augmented["cond_surface_local"]
+        masked_surface_local = split_augmented["masked_surface_local"]
+        neighbor_seg_tensor = split_augmented.get("neighbor_seg_tensor", neighbor_seg_tensor)
+        cond_surface_np = cond_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+        masked_surface_np = masked_surface_local.detach().cpu().numpy().astype(np.float32, copy=False)
+        fused_payload = build_split_surface_masks_and_trace_targets(
+            self.crop_size,
+            cond_direction,
+            cond_surface_local=cond_surface_np,
+            masked_surface_local=masked_surface_np,
+        )
+        if fused_payload is None or not bool(fused_payload["cond_gt"].any()):
+            return self._resample_item(
+                idx,
+                "split surface targets unavailable",
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
+            )
+        masked_seg = torch.from_numpy(fused_payload["masked_seg"]).to(torch.float32)
+        cond_seg_gt = torch.from_numpy(fused_payload["cond_gt"]).to(torch.float32)
+        if self._cond_local_perturb_active and cond_surface_local is not None:
+            cond_seg = self._conditioning_from_surface(
+                cond_surface_local=cond_surface_local,
+                cond_seg_gt=cond_seg_gt,
+            )
         else:
-            use_other_wrap_cond = self.config['use_other_wrap_cond']
-            use_sdt = self.config['use_sdt']
-            use_heatmap = self.config['use_heatmap_targets']
-            use_segmentation = self.config['use_segmentation']
-
-            mask_bundle = self.create_split_masks(idx, patch_idx, wrap_idx)
-            if mask_bundle is None:
-                return self._resample_item(
-                    idx,
-                    "split mask bundle missing",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-
-            vol_crop = mask_bundle["vol"]
-            masked_seg = mask_bundle["masked_seg"]
-            cond_seg_gt = mask_bundle["cond_gt"]
-            other_wraps_tensor = mask_bundle["other_wraps"]
-            cond_surface_local, cond_surface_shape, cond_surface_keypoints, valid_cond_surface = (
-                _prepare_cond_surface_keypoints(mask_bundle.get("cond_surface_local"))
+            cond_seg = cond_seg_gt.clone()
+        if cond_seg is None:
+            return self._resample_item(
+                idx,
+                "split conditioning segmentation unresolved",
+                patch_idx=patch_idx,
+                wrap_idx=wrap_idx,
+                attempted_indices=_attempted_indices,
             )
-            if not valid_cond_surface:
-                return self._resample_item(
-                    idx,
-                    "split conditioning surface invalid",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-            if use_segmentation:
-                full_seg = mask_bundle["segmentation"]
-                seg_skel = mask_bundle["segmentation_skel"]
-            if use_sdt:
-                sdt_tensor = mask_bundle["sdt"]
-            if use_heatmap:
-                heatmap_tensor = mask_bundle["heatmap_target"]
 
-            split_augmented = augment_split_payload(
-                augmentations=self._augmentations,
-                crop_size=self.crop_size,
-                vol_crop=vol_crop,
-                masked_seg=masked_seg,
-                other_wraps_tensor=other_wraps_tensor,
-                cond_seg_gt=cond_seg_gt,
-                cond_surface_local=cond_surface_local,
-                cond_surface_keypoints=cond_surface_keypoints,
-                cond_surface_shape=cond_surface_shape,
-                restore_cond_surface_fn=self._restore_cond_surface_from_augmented,
-                use_segmentation=use_segmentation,
-                use_sdt=use_sdt,
-                use_heatmap=use_heatmap,
-                full_seg=full_seg if use_segmentation else None,
-                seg_skel=seg_skel if use_segmentation else None,
-                sdt_tensor=sdt_tensor if use_sdt else None,
-                heatmap_tensor=heatmap_tensor if use_heatmap else None,
-            )
-            vol_crop = split_augmented["vol_crop"]
-            masked_seg = split_augmented["masked_seg"]
-            other_wraps_tensor = split_augmented["other_wraps_tensor"]
-            cond_seg_gt = split_augmented["cond_seg_gt"]
-            cond_surface_local = split_augmented["cond_surface_local"]
-            if use_segmentation:
-                full_seg = split_augmented["full_seg"]
-                seg_skel = split_augmented["seg_skel"]
-            if use_sdt:
-                sdt_tensor = split_augmented["sdt_tensor"]
-            if use_heatmap:
-                heatmap_tensor = split_augmented["heatmap_tensor"]
-            cond_seg = self._resolve_conditioning_segmentation(
-                mask_bundle=mask_bundle,
-                cond_seg_gt=cond_seg_gt,
-                cond_surface_local=cond_surface_local,
-                cond_local_perturb_active=cond_local_perturb_active,
-            )
-            if cond_seg is None:
-                return self._resample_item(
-                    idx,
-                    "split conditioning segmentation unresolved",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
+        result = {
+            "vol": vol_crop,
+            "cond": cond_seg,
+            "masked_seg": masked_seg,
+            "cond_gt": cond_seg_gt,
+            "cond_direction": cond_direction,
+        }
 
-            target_payload = self.create_split_targets(
-                cond_seg_gt=cond_seg_gt,
-                masked_seg=masked_seg,
-            )
-            if target_payload is None:
-                return self._resample_item(
-                    idx,
-                    "split target payload unavailable",
-                    patch_idx=patch_idx,
-                    wrap_idx=wrap_idx,
-                    attempted_indices=_attempted_indices,
-                )
-
-            result = {
-                "vol": vol_crop,                 # raw volume crop
-                "cond": cond_seg,                # conditioning segmentation
-                "masked_seg": masked_seg,        # masked (target) segmentation
-            }
-
-            if use_other_wrap_cond:
-                result["other_wraps"] = other_wraps_tensor  # other wraps from same segment as context
-            if use_sdt:
-                result["sdt"] = sdt_tensor  # signed distance transform of full (dilated) segmentation
-            if use_heatmap:
-                result["heatmap_target"] = heatmap_tensor  # (D, H, W) gaussian heatmap at expected positions
-            if use_segmentation:
-                result["segmentation"] = full_seg  # full segmentation (cond + masked)
-                result["segmentation_skel"] = seg_skel  # skeleton for medial surface recall loss
-            result.update(target_payload)
+        result["neighbor_seg"] = neighbor_seg_tensor
+        result["velocity_dir"] = torch.from_numpy(fused_payload["velocity_dir"]).to(torch.float32)
+        result["velocity_loss_weight"] = torch.from_numpy(fused_payload["trace_loss_weight"]).to(torch.float32)
+        result["trace_loss_weight"] = torch.from_numpy(fused_payload["trace_loss_weight"]).to(torch.float32)
 
         if not _validate_result_tensors(
             result,

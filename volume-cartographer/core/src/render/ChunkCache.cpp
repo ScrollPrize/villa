@@ -1,5 +1,7 @@
 #include "ChunkCache.hpp"
 
+#include <utils/thread_pool.hpp>
+
 #include "vc/core/util/Logging.hpp"
 
 #include <algorithm>

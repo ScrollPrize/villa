@@ -11,7 +11,7 @@
 #include <vector>
 
 #include <omp.h>
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <vc/core/types/Array3D.hpp>
 #include <vc/core/types/Volume.hpp>
 

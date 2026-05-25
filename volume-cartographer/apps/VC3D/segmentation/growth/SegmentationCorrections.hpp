@@ -7,7 +7,7 @@
 #include <QVector>
 #include <QString>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include "SegmentationGrowth.hpp"
 

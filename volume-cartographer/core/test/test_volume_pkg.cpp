@@ -30,6 +30,26 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
+struct TestAutosaveRoot {
+    TestAutosaveRoot()
+        : previous(VolumePkg::autosaveRoot())
+        , root(tmpDir("autosave_root"))
+    {
+        VolumePkg::setAutosaveRoot(root);
+    }
+
+    ~TestAutosaveRoot()
+    {
+        VolumePkg::setAutosaveRoot(previous);
+        fs::remove_all(root);
+    }
+
+    fs::path previous;
+    fs::path root;
+};
+
+TestAutosaveRoot testAutosaveRoot;
+
 } // namespace
 
 // --- Free helpers ---
@@ -205,6 +225,63 @@ TEST_CASE("VolumePkg: save then load round-trips entries")
     CHECK(loaded->volumeEntries()[0].location == "/vol-x");
     CHECK(loaded->segmentEntries().size() == 1);
     CHECK(loaded->normalGridEntries().size() == 1);
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: missing selected_lasagna_dataset loads as empty")
+{
+    auto d = tmpDir("lasagna_missing");
+    auto jsonPath = d / "project.json";
+    {
+        auto p = VolumePkg::newEmpty();
+        p->save(jsonPath);
+    }
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->selectedLasagnaDataset().empty());
+    CHECK(loaded->selectedLasagnaDatasetPath().empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: selected_lasagna_dataset round-trips through save/load")
+{
+    auto d = tmpDir("lasagna_roundtrip");
+    auto jsonPath = d / "project.json";
+    const std::string manifest = (d / "dataset.lasagna.json").string();
+    {
+        auto p = VolumePkg::newEmpty();
+        p->setSelectedLasagnaDataset(manifest);
+        CHECK(p->selectedLasagnaDataset() == manifest);
+        p->save(jsonPath);
+    }
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->selectedLasagnaDataset() == manifest);
+    CHECK(loaded->selectedLasagnaDatasetPath() == fs::path(manifest));
+
+    loaded->clearSelectedLasagnaDataset();
+    CHECK(loaded->selectedLasagnaDataset().empty());
+    CHECK(loaded->selectedLasagnaDatasetPath().empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: selectedLasagnaDatasetPath resolves relative to project file")
+{
+    auto d = tmpDir("lasagna_relative");
+    auto jsonPath = d / "project.json";
+    {
+        auto p = VolumePkg::newEmpty();
+        p->save(jsonPath);
+        p->setSelectedLasagnaDataset("datasets/reference.lasagna.json");
+    }
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->selectedLasagnaDataset() == "datasets/reference.lasagna.json");
+    CHECK(loaded->selectedLasagnaDatasetPath() ==
+          d / "datasets" / "reference.lasagna.json");
     fs::remove_all(d);
 }
 

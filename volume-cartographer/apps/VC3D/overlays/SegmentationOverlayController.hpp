@@ -12,7 +12,7 @@
 #include <optional>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 class CState;
 class SegmentationEditManager;
@@ -43,6 +43,13 @@ public:
             std::vector<cv::Vec3f> worldPoints;
             std::vector<QPointF> surfacePoints;
             bool committed{false};
+        };
+
+        struct ManualAddFillSpan
+        {
+            int row{0};
+            int colFirst{0};
+            int colLast{0};
         };
 
         enum class FalloffMode
@@ -94,7 +101,7 @@ public:
         std::vector<ManualAddLine> manualAddHoverLines;
         std::vector<ManualAddLine> manualAddCommittedLines;
         std::optional<QPointF> manualAddHoverVertex;
-        std::vector<QPointF> manualAddHoverFillVertices;
+        std::vector<ManualAddFillSpan> manualAddHoverFillSpans;
         bool manualAddHoverCrossFill{false};
         std::vector<cv::Vec3f> manualAddPreviewVertices;
         std::vector<std::array<cv::Vec3f, 4>> manualAddPreviewQuads;

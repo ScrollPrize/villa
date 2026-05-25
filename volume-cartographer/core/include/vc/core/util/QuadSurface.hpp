@@ -12,7 +12,7 @@
 #include <string>
 
 #include "Surface.hpp"
-#include "Tiff.hpp"
+#include "Rect3D.hpp"
 
 // Surface loading and channel flags
 #define SURF_LOAD_IGNORE_MASK 1
@@ -20,14 +20,6 @@
 
 // Debug prefix for auto-generated surfaces
 #define Z_DBG_GEN_PREFIX "auto_grown_"
-
-struct Rect3D {
-    cv::Vec3f low = {0,0,0};
-    cv::Vec3f high = {0,0,0};
-};
-
-bool intersect(const Rect3D &a, const Rect3D &b);
-Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p);
 
 // Forward declarations
 class QuadSurface;

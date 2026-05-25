@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include "utils/Json.hpp"
 
 //base surface class

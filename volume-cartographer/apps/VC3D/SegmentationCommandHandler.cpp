@@ -57,6 +57,7 @@
 
 #include "CommandLineToolRunner.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -659,6 +660,8 @@ public:
             int iters,
             double tolerance,
             const QString& energy,
+            double keepPercent,
+            bool inpaintHoles,
             const QString& outputDir,
             double voxelSize)
     : QObject(handler)
@@ -666,14 +669,18 @@ public:
     , handler_(handler)
     , segDir_(segDir)
     , stem_(segmentStem)
-    , objPath_(QDir(segDir).filePath(segmentStem + ".obj"))
-    , flatObj_(QDir(segDir).filePath(segmentStem + "_flatboi.obj"))
+    , objPath_(QDir(segDir).filePath(segmentStem + (keepPercent < 100.0 ? "_coarse.obj" : ".obj")))
+    , objFine_(QDir(segDir).filePath(segmentStem + ".obj"))
+    , flatObj_(QDir(segDir).filePath(segmentStem + (keepPercent < 100.0 ? "_coarse_flatboi.obj" : "_flatboi.obj")))
+    , liftedObj_(QDir(segDir).filePath(segmentStem + "_lifted.obj"))
     , outFinal_(outputDir)
     , outTemp_ (outputDir == segDir ? (segDir + "__rebuild_tmp__") : outputDir)
     , flatboiExe_(flatboiExe)
     , inputIsAlreadyFlat_(outputDir == segDir)
     , tolerance_(tolerance)
     , energy_(energy)
+    , keepPercent_(keepPercent)
+    , inpaintHoles_(inpaintHoles)
     , voxelSize_(voxelSize)
     , proc_(new QProcess(this))
     , progress_(new QProgressDialog(QObject::tr("Preparing SLIM..."), QObject::tr("Cancel"), 0, 0, parentWidget))
@@ -684,6 +691,7 @@ public:
 
         tifxyz2objExe_ = findVcTool("vc_tifxyz2obj");
         obj2tifxyzExe_ = findVcTool("vc_obj2tifxyz");
+        uvLiftExe_     = findVcTool("vc_obj_uv_lift");
 
         // never create outTemp_ here; we'll let vc_obj2tifxyz create it later
         if (QFileInfo::exists(outTemp_)) {
@@ -805,18 +813,54 @@ private:
     }
 
 private:
-    enum class Phase { ToObj, Flatboi, ToTifxyz, Swap, Done };
+    enum class Phase { ToObj, Flatboi, ToObjFine, UVLift, ToTifxyz, Swap, Done };
 
     void startToObj_() {
         if (tifxyz2objExe_.isEmpty()) { showImmediateToolNotFound_("vc_tifxyz2obj"); return; }
         phase_ = Phase::ToObj;
-        progress_->setLabelText(QObject::tr("Converting TIFXYZ -> OBJ..."));
+        const bool decimating = keepPercent_ < 100.0;
+        progress_->setLabelText(decimating
+            ? QObject::tr("Converting TIFXYZ -> coarse OBJ (keep %1%)...")
+                  .arg(keepPercent_, 0, 'f', 2)
+            : QObject::tr("Converting TIFXYZ -> OBJ..."));
         progress_->setMaximum(1 + iters_ + 1);
         progress_->setValue(0);
         ioLog_.clear();
         QStringList args; args << segDir_ << objPath_;
+        if (decimating) {
+            args << QStringLiteral("--keep=%1").arg(keepPercent_, 0, 'f', 4);
+        }
+        if (inpaintHoles_) {
+            args << QStringLiteral("--inpaint");
+        }
         ioLog_ += QStringLiteral("Running: %1 %2\n").arg(tifxyz2objExe_, args.join(' '));
         proc_->start(tifxyz2objExe_, args);
+    }
+
+    void startToObjFine_() {
+        if (tifxyz2objExe_.isEmpty()) { showImmediateToolNotFound_("vc_tifxyz2obj"); return; }
+        phase_ = Phase::ToObjFine;
+        progress_->setLabelText(QObject::tr("Converting TIFXYZ -> full-res OBJ for UV lift..."));
+        ioLog_.clear();
+        QStringList args; args << segDir_ << objFine_;
+        if (inpaintHoles_) {
+            args << QStringLiteral("--inpaint");
+        }
+        ioLog_ += QStringLiteral("Running: %1 %2\n").arg(tifxyz2objExe_, args.join(' '));
+        proc_->start(tifxyz2objExe_, args);
+    }
+
+    void startUVLift_() {
+        if (uvLiftExe_.isEmpty()) { showImmediateToolNotFound_("vc_obj_uv_lift"); return; }
+        phase_ = Phase::UVLift;
+        progress_->setLabelText(QObject::tr("Lifting UVs onto full-res mesh..."));
+        ioLog_.clear();
+        // Grid-space lift: needs the un-flattened coarse OBJ (grid UVs from
+        // vc_tifxyz2obj) plus the flatboi output. 3D-nearest lift produced
+        // streaks where the surface passes close to itself in voxel space.
+        QStringList args; args << objPath_ << flatObj_ << objFine_ << liftedObj_;
+        ioLog_ += QStringLiteral("Running: %1 %2\n").arg(uvLiftExe_, args.join(' '));
+        proc_->start(uvLiftExe_, args);
     }
 
     void startFlatboi_() {
@@ -865,8 +909,12 @@ private:
         }
 
         ioLog_.clear();
+        // If decimation is in play, the UVs have been lifted onto the
+        // full-res mesh (liftedObj_); otherwise flatObj_ itself is the
+        // flattened full-res mesh.
+        const QString srcObj = (keepPercent_ < 100.0) ? liftedObj_ : flatObj_;
         QStringList args;
-        args << flatObj_
+        args << srcObj
              << outTemp_
              // Downsample UV grid by 20x per axis to reduce compute/memory.
              << QStringLiteral("--uv-downsample=20");
@@ -987,9 +1035,11 @@ private:
         }
         QString what;
         switch (phase_) {
-            case Phase::ToObj:    what = QObject::tr("vc_tifxyz2obj failed to start."); break;
-            case Phase::Flatboi:  what = QObject::tr("flatboi failed to start.");       break;
-            case Phase::ToTifxyz: what = QObject::tr("vc_obj2tifxyz failed to start."); break;
+            case Phase::ToObj:     what = QObject::tr("vc_tifxyz2obj failed to start."); break;
+            case Phase::Flatboi:   what = QObject::tr("flatboi failed to start.");       break;
+            case Phase::ToObjFine: what = QObject::tr("vc_tifxyz2obj (full-res) failed to start."); break;
+            case Phase::UVLift:    what = QObject::tr("vc_obj_uv_lift failed to start.");break;
+            case Phase::ToTifxyz:  what = QObject::tr("vc_obj2tifxyz failed to start."); break;
             default: break;
         }
         QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
@@ -1009,9 +1059,11 @@ private:
             const QString err = ioLog_.trimmed();
             QString what;
             switch (phase_) {
-                case Phase::ToObj:    what = QObject::tr("vc_tifxyz2obj failed."); break;
-                case Phase::Flatboi:  what = QObject::tr("flatboi failed.");       break;
-                case Phase::ToTifxyz: what = QObject::tr("vc_obj2tifxyz failed."); break;
+                case Phase::ToObj:     what = QObject::tr("vc_tifxyz2obj failed."); break;
+                case Phase::Flatboi:   what = QObject::tr("flatboi failed.");       break;
+                case Phase::ToObjFine: what = QObject::tr("vc_tifxyz2obj (full-res) failed."); break;
+                case Phase::UVLift:    what = QObject::tr("vc_obj_uv_lift failed.");break;
+                case Phase::ToTifxyz:  what = QObject::tr("vc_obj2tifxyz failed."); break;
                 default: break;
             }
             QMessageBox* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"),
@@ -1041,6 +1093,22 @@ private:
 
         if (phase_ == Phase::Flatboi) {
             if (!QFileInfo::exists(flatObj_)) { onFinished_(1, QProcess::NormalExit); return; }
+            if (keepPercent_ < 100.0) {
+                startToObjFine_();
+            } else {
+                startToTifxyz_();
+            }
+            return;
+        }
+
+        if (phase_ == Phase::ToObjFine) {
+            if (!QFileInfo::exists(objFine_)) { onFinished_(1, QProcess::NormalExit); return; }
+            startUVLift_();
+            return;
+        }
+
+        if (phase_ == Phase::UVLift) {
+            if (!QFileInfo::exists(liftedObj_)) { onFinished_(1, QProcess::NormalExit); return; }
             startToTifxyz_();
             return;
         }
@@ -1088,14 +1156,18 @@ private:
     // paths & flags
     QString segDir_;
     QString stem_;
-    QString objPath_;
-    QString flatObj_;
+    QString objPath_;     // mesh fed to flatboi (coarse if decimate>0, else full-res)
+    QString objFine_;     // full-res mesh used as UV-lift target when decimating
+    QString flatObj_;     // flatboi output (coarse-flat when decimate>0)
+    QString liftedObj_;   // full-res mesh with UVs lifted from flatObj_
     QString outFinal_;
     QString outTemp_;
     QString flatboiExe_;
     bool    inputIsAlreadyFlat_ = false;
     double  tolerance_ = 0.0;
     QString energy_ = QStringLiteral("symmetric_dirichlet");
+    double  keepPercent_ = 100.0;
+    bool    inpaintHoles_ = false;
     double  voxelSize_ = 0.0;
 
     // process & progress
@@ -1115,6 +1187,7 @@ private:
     // resolved executables
     QString tifxyz2objExe_;
     QString obj2tifxyzExe_;
+    QString uvLiftExe_;
 
     bool errorShown_ = false;
 
@@ -1577,6 +1650,8 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
     const int iters = dlg.maxIterations();
     const double tol = dlg.tolerance();
     const QString energy = dlg.energyType();
+    const double keepPercent = dlg.keepPercent();
+    const bool inpaintHoles = dlg.inpaintHoles();
     const QString outputDir = dlg.outputPath();
 
     const QByteArray pastixEnv = qgetenv("PASTIX_NUM_THREADS");
@@ -1588,6 +1663,8 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
               << " iters=" << iters
               << " tol=" << tol
               << " energy=" << energy.toStdString()
+              << " keep_percent=" << keepPercent
+              << " inpaint=" << (inpaintHoles ? "true" : "false")
               << " PASTIX_NUM_THREADS=" << (pastixEnv.isEmpty() ? "<unset, PaStiX auto>" : pastixEnv.toStdString())
               << " hardware_concurrency=" << hwConc
               << std::endl;
@@ -1600,7 +1677,7 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
     } catch (...) {}
     if (!std::isfinite(voxelSize) || voxelSize <= 0.0) voxelSize = 0.0;
 
-    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters, tol, energy, outputDir, voxelSize);
+    new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters, tol, energy, keepPercent, inpaintHoles, outputDir, voxelSize);
 }
 
 void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
@@ -2824,6 +2901,119 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz);
     emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
+}
+
+void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("Open a volpkg first."));
+        return;
+    }
+    if (!_cmdRunner) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("Command runner is not initialized."));
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("A command-line tool is already running."));
+        return;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("No active segmentation directory; pick one "
+                                "before running patch."));
+        return;
+    }
+    const QString pathsDir  = QString::fromStdString(resolvedSeg.string());
+    const QString volpkgDir = QString::fromStdString(
+        resolvedSeg.parent_path().string());
+
+    QStringList availableSegments;
+    {
+        const auto ids = vpkg->segmentationIDs();
+        availableSegments.reserve(static_cast<int>(ids.size()));
+        for (const auto& s : ids) availableSegments << QString::fromStdString(s);
+    }
+    if (availableSegments.size() < 2) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("This volpkg has fewer than 2 segments; "
+                                "patch needs a parent + child."));
+        return;
+    }
+
+    MergePatchDialog dlg(_parentWidget, segmentIds, availableSegments,
+                         vpkg, volpkgDir, pathsDir);
+    if (dlg.exec() != QDialog::Accepted) {
+        emit statusMessage(tr("Patch cancelled"), 3000);
+        return;
+    }
+
+    _cmdRunner->setMergePatchParams(dlg.parentPath(),
+                                    dlg.childPath(),
+                                    dlg.explicitRoles(),
+                                    dlg.borderCells(),
+                                    dlg.blendCells(),
+                                    dlg.idwK(),
+                                    dlg.ransacIters(),
+                                    dlg.ransacMinThresh(),
+                                    dlg.ransacMaxThresh(),
+                                    dlg.ransacMadK(),
+                                    dlg.ransacSeed(),
+                                    dlg.anchorCap());
+    if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+
+    // One-shot handler: on success, force-refresh the parent (and any
+    // other modified) surface from disk. The mask.tif mtime drives the
+    // per-surface reload inside detectSurfaceChanges, so the in-memory
+    // QuadSurface picks up the patched x/y/z without per-surface
+    // bookkeeping here.
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
+                          this,
+                          [this, guard, connection]
+                          (CommandLineToolRunner::Tool tool,
+                           bool success,
+                           const QString& message,
+                           const QString& outputPath,
+                           bool) {
+        if (!guard) {
+            disconnect(*connection);
+            return;
+        }
+        if (tool != CommandLineToolRunner::Tool::MergePatch) {
+            return;
+        }
+        disconnect(*connection);
+        if (success) {
+            if (_surfacePanel) _surfacePanel->reloadSurfacesFromDisk();
+            emit statusMessage(
+                tr("Patch applied to %1")
+                    .arg(QDir::toNativeSeparators(outputPath)), 5000);
+        } else {
+            QMessageBox::critical(_parentWidget, tr("Patch tifxyz"),
+                                  tr("vc_merge_patch failed.\n%1").arg(message));
+            emit statusMessage(tr("Patch failed"), 5000);
+        }
+    });
+
+    _cmdRunner->showConsoleOutput();
+    // If execute() rejects the launch (preflight failure, missing binary),
+    // it never emits toolFinished -- so the one-shot lambda above would
+    // stay attached and fire on the NEXT tool's toolFinished. Disconnect
+    // immediately on launch failure to keep the runner's signal table
+    // clean across subsequent runs.
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
+        QObject::disconnect(*connection);
+        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
+        return;
+    }
+    emit statusMessage(tr("Patching tifxyz..."), 0);
 }
 
 void SegmentationCommandHandler::onAddIgnoreLabel()

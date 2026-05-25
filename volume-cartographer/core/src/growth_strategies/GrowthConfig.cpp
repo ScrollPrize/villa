@@ -1,5 +1,7 @@
 #include "GrowthConfig.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <iostream>

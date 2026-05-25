@@ -813,9 +813,9 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             hoverFillStyle.brushColor = QColor(255, 220, 0, 55);
             hoverFillStyle.penWidth = 0.0;
             hoverFillStyle.z = 104.0;
-            for (const QPointF& grid : state.manualAddHoverFillVertices) {
-                const QPointF topLeft = gridToScene(QPointF(grid.x() - 0.5, grid.y() - 0.5));
-                const QPointF bottomRight = gridToScene(QPointF(grid.x() + 0.5, grid.y() + 0.5));
+            for (const auto& span : state.manualAddHoverFillSpans) {
+                const QPointF topLeft = gridToScene(QPointF(span.colFirst - 0.5, span.row - 0.5));
+                const QPointF bottomRight = gridToScene(QPointF(span.colLast + 0.5, span.row + 0.5));
                 if (!std::isfinite(topLeft.x()) || !std::isfinite(topLeft.y()) ||
                     !std::isfinite(bottomRight.x()) || !std::isfinite(bottomRight.y())) {
                     continue;

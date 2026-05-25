@@ -30,9 +30,10 @@ jobs:
               - 'volume-cartographer/**'
               - '.github/workflows/vc3d-ci.yml'
             dockerfile:
-              - 'volume-cartographer/*.Dockerfile'
+              - 'volume-cartographer/Dockerfile'
               - 'volume-cartographer/.dockerignore'
               - 'volume-cartographer/scripts/ci.sh'
+              - 'volume-cartographer/scripts/install_build_deps.sh'
 
   skip:
     name: Skip (no volume-cartographer changes)
@@ -43,41 +44,18 @@ jobs:
     steps:
       - run: echo "No volume-cartographer changes — skipping build."
 
-  builder:
-    name: Builder image (${{ matrix.image }})
-    needs: changes
-    if: needs.changes.outputs.vc == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        image: ["ubuntu-24.04", "ubuntu-26.04"]
-    env:
-      # If the PR touched a Dockerfile (or ci.sh), the published ghcr image
-      # is stale for this PR. Force a local build with the GHA buildx cache.
-      # Otherwise ci.sh builder will docker pull the published image.
-      VC_BUILDER_FORCE_LOCAL: ${{ needs.changes.outputs.dockerfile == 'true' && '1' || '0' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Pull or build builder image
-        run: volume-cartographer/scripts/ci.sh builder ${{ matrix.image }}
-
   build-test:
     name: ${{ matrix.action }}-${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
-    needs: [changes, builder]
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: ${{ matrix.blocking != true }}
     strategy:
       fail-fast: false
-      # ubuntu-24.04: compile-only smoke (Release, no tests).
-      # ubuntu-26.04: full test + sanitizer matrix + coverage + dead-code.
+      # ubuntu-26.04: Release compile + full test + sanitizer matrix
+      # + coverage + dead-code.
       matrix:
         include:
-          - { image: "ubuntu-24.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
-          - { image: "ubuntu-24.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-release,    action: compile, blocking: true }
           - { image: "ubuntu-26.04", compiler: clang, preset: ci-release,    action: compile, blocking: true }
           - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-tests,      action: test,    blocking: false }
@@ -99,8 +77,8 @@ jobs:
         run: volume-cartographer/scripts/ci.sh ${{ matrix.action }} ${{ matrix.image }} ${{ matrix.compiler }} ${{ matrix.preset }}
 
   coverage:
-    name: Coverage (gcc, gcov)
-    needs: [changes, builder]
+    name: Coverage (clang, source-based)
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: true
@@ -110,8 +88,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Coverage builds are huge: -O0 -g + libgcov instrumentation, every
-      # test executable linked statically against vc_core. The default
+      # Coverage builds are huge: clang source-based instrumentation
+      # (-fprofile-instr-generate -fcoverage-mapping) on every test
+      # executable linked statically against vc_core. The default
       # ubuntu runner ships ~14 GB free, which is not enough — `ar` and
       # the final link step hit ENOSPC intermittently. Free ~25-30 GB by
       # purging preinstalled toolchains we don't use (Android SDK, .NET,
@@ -197,38 +176,9 @@ jobs:
       - name: Configure + build (installs Homebrew deps as needed)
         run: volume-cartographer/scripts/build_macos.sh --install-deps
 
-      - name: Upload build dir for downstream checks
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-build-${{ matrix.os }}
-          path: volume-cartographer/build-macos/bin/
-          retention-days: 1
-
-  macos-checks:
-    name: macOS checks (smoke + toolchain verify)
-    needs: macos-build
-    if: needs.changes.outputs.vc == 'true'
-    runs-on: macos-15
-    timeout-minutes: 10
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-build-macos-15
-          path: volume-cartographer/build-macos/bin/
-      - name: Smoke-test built binaries
-        run: |
-          cd volume-cartographer/build-macos
-          chmod +x bin/* || true
-          file bin/VC3D bin/vc_tifxyz bin/flatboi
-          ./bin/vc_tifxyz --help | head -5 || true
-      - name: Verify Homebrew-only toolchain
-        run: volume-cartographer/scripts/verify_homebrew_toolchain.sh volume-cartographer/build-macos
-
   dead-code:
     name: Dead-code report (clang, nm + --print-gc-sections)
-    needs: [changes, builder]
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: true
@@ -256,7 +206,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [changes, skip, builder, build-test, coverage, macos-build, dead-code]
+    needs: [changes, skip, build-test, coverage, macos-build, dead-code]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -265,18 +215,17 @@ jobs:
         env:
           R_CHANGES: ${{ needs.changes.result }}
           R_SKIP: ${{ needs.skip.result }}
-          R_BUILDER: ${{ needs.builder.result }}
           R_BUILD_TEST: ${{ needs.build-test.result }}
           R_COVERAGE: ${{ needs.coverage.result }}
           R_MACOS: ${{ needs.macos-build.result }}
           R_DEAD_CODE: ${{ needs.dead-code.result }}
         run: |
           set -e
-          echo "changes=$R_CHANGES skip=$R_SKIP builder=$R_BUILDER build-test=$R_BUILD_TEST coverage=$R_COVERAGE macos=$R_MACOS dead-code=$R_DEAD_CODE"
+          echo "changes=$R_CHANGES skip=$R_SKIP build-test=$R_BUILD_TEST coverage=$R_COVERAGE macos=$R_MACOS dead-code=$R_DEAD_CODE"
           # coverage and dead-code are continue-on-error, so accept any result.
           # All other non-skipped jobs must succeed (or be skipped legitimately).
           fail=0
-          for r in "$R_CHANGES" "$R_SKIP" "$R_BUILDER" "$R_BUILD_TEST" "$R_MACOS"; do
+          for r in "$R_CHANGES" "$R_SKIP" "$R_BUILD_TEST" "$R_MACOS"; do
             case "$r" in
               success|skipped) ;;
               *) fail=1 ;;

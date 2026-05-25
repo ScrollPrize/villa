@@ -3305,6 +3305,7 @@ class Model3D(nn.Module):
 		st.pop("_model_params_", None)
 		st.pop("_fit_config_", None)
 		st.pop("_corr_points_results_", None)
+		st.pop("_approval_inpaint_output_mask_", None)
 		# Drop legacy conn_offset_ms pyramid keys
 		for k in list(st.keys()):
 			if k.startswith("conn_offset_ms."):

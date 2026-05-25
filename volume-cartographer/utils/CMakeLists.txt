@@ -1,4 +1,4 @@
-add_library(utils STATIC src/zarr.cpp src/Json.cpp src/aws_auth.cpp)
+add_library(utils src/zarr.cpp src/Json.cpp src/aws_auth.cpp src/http_fetch.cpp)
 target_include_directories(utils PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -13,7 +13,7 @@ target_link_libraries(utils PUBLIC
 target_compile_definitions(utils PUBLIC UTILS_HAS_CURL=1)
 set_target_properties(utils PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
 
-add_library(utils_c3d_codec STATIC src/c3d_codec.cpp)
+add_library(utils_c3d_codec src/c3d_codec.cpp)
 target_include_directories(utils_c3d_codec PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )

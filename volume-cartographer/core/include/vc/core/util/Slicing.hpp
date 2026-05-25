@@ -1,11 +1,12 @@
 #pragma once
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <string>
 
-#include <vc/core/render/IChunkedArray.hpp>
-#include <vc/core/util/Compositing.hpp>
 #include <vc/core/types/Sampling.hpp>
+
+namespace vc::render { class IChunkedArray; }
+struct CompositeParams;
 
 // Read interpolated 3D data from a chunked zarr source.
 void readInterpolated3D(cv::Mat_<uint8_t> &out, vc::render::IChunkedArray* cache, int level, const cv::Mat_<cv::Vec3f> &coords, bool nearest_neighbor=false);

@@ -5,11 +5,7 @@
 
 #include <boost/program_options.hpp>
 
-#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
-#include <CGAL/Polygon_mesh_processing/bbox.h>
-#include <CGAL/Side_of_triangle_mesh.h>
-#include <CGAL/Surface_mesh.h>
-#include <CGAL/alpha_wrap_3.h>
+#include "alpha_wrap.hpp"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -61,11 +57,6 @@ constexpr double kRadPerDeg = kPi / 180.0;
 constexpr double kDefaultRamBudgetGb = 0.0;   // 0 => auto
 constexpr double kDefaultAutoRamFraction = 0.60;
 
-using Shape3 = std::array<std::size_t, 3>;
-using AlphaWrapKernel = CGAL::Exact_predicates_inexact_constructions_kernel;
-using AlphaWrapPoint = AlphaWrapKernel::Point_3;
-using AlphaWrapMesh = CGAL::Surface_mesh<AlphaWrapPoint>;
-
 enum class MapMode {
     legacy,
     exact,
@@ -98,11 +89,6 @@ struct ChunkIndex {
     {
         return z == other.z && y == other.y && x == other.x;
     }
-};
-
-struct Box3 {
-    Shape3 origin = {0, 0, 0};
-    Shape3 shape = {0, 0, 0};
 };
 
 struct ChunkIndexHash {
@@ -2587,81 +2573,6 @@ static std::size_t countNonZeroInRelativeBox(const std::vector<uint8_t>& volume,
     return count;
 }
 
-static AlphaWrapPoint voxelCenterPoint(std::size_t z, std::size_t y, std::size_t x)
-{
-    return AlphaWrapPoint(static_cast<double>(z) + 0.5,
-                          static_cast<double>(y) + 0.5,
-                          static_cast<double>(x) + 0.5);
-}
-
-static bool bboxContains(const CGAL::Bbox_3& bbox, const AlphaWrapPoint& p)
-{
-    return p.x() >= bbox.xmin() && p.x() <= bbox.xmax() &&
-           p.y() >= bbox.ymin() && p.y() <= bbox.ymax() &&
-           p.z() >= bbox.zmin() && p.z() <= bbox.zmax();
-}
-
-static std::vector<uint8_t> classifyOuterAlphaWrapCore(const std::vector<uint8_t>& halo,
-                                                       const Box3& haloBox,
-                                                       const Box3& coreBox,
-                                                       double alpha,
-                                                       double offset)
-{
-    std::vector<AlphaWrapPoint> points;
-    points.reserve(countNonZero(halo.data(), halo.size()));
-    for (std::size_t z = 0; z < haloBox.shape[0]; ++z) {
-        for (std::size_t y = 0; y < haloBox.shape[1]; ++y) {
-            const std::size_t base = linearIndex(haloBox.shape, z, y, 0);
-            for (std::size_t x = 0; x < haloBox.shape[2]; ++x) {
-                if (halo[base + x] == 0) {
-                    continue;
-                }
-                points.push_back(voxelCenterPoint(haloBox.origin[0] + z,
-                                                  haloBox.origin[1] + y,
-                                                  haloBox.origin[2] + x));
-            }
-        }
-    }
-
-    const Shape3 coreRel = relativeOrigin(coreBox, haloBox);
-    std::vector<uint8_t> ignore(volumeElements(coreBox.shape), 0);
-    if (points.size() < 4) {
-        return ignore;
-    }
-
-    AlphaWrapMesh wrap;
-    CGAL::alpha_wrap_3(points, alpha, offset, wrap);
-    if (num_faces(wrap) == 0) {
-        return ignore;
-    }
-
-    const CGAL::Bbox_3 bbox = CGAL::Polygon_mesh_processing::bbox(wrap);
-    CGAL::Side_of_triangle_mesh<AlphaWrapMesh, AlphaWrapKernel> sideOfMesh(wrap);
-
-    for (std::size_t z = 0; z < coreBox.shape[0]; ++z) {
-        for (std::size_t y = 0; y < coreBox.shape[1]; ++y) {
-            for (std::size_t x = 0; x < coreBox.shape[2]; ++x) {
-                const std::size_t haloIdx = linearIndex(haloBox.shape,
-                                                        coreRel[0] + z,
-                                                        coreRel[1] + y,
-                                                        coreRel[2] + x);
-                if (halo[haloIdx] != 0) {
-                    continue;
-                }
-
-                const AlphaWrapPoint p = voxelCenterPoint(coreBox.origin[0] + z,
-                                                          coreBox.origin[1] + y,
-                                                          coreBox.origin[2] + x);
-                if (!bboxContains(bbox, p) || sideOfMesh(p) == CGAL::ON_UNBOUNDED_SIDE) {
-                    ignore[linearIndex(coreBox.shape, z, y, x)] = 255;
-                }
-            }
-        }
-    }
-
-    return ignore;
-}
-
 static void writeReplicatedCoreMaskToLevel0(
     vc::VcDataset& output,
     const Shape3& outShape,
@@ -3160,7 +3071,7 @@ static int processChunkAlphaWrap(
                     std::vector<uint8_t> ignoreCore;
                     {
                         ScopedTimer wrapTimer(localProfile.tMaskBuild);
-                        ignoreCore = classifyOuterAlphaWrapCore(haloBuf,
+                        ignoreCore = classifyOuterAlphaWrap(haloBuf,
                                                                 haloBox,
                                                                 coreBox,
                                                                 cfg.chunkAlpha,
@@ -3697,12 +3608,12 @@ static bool runSelfTest()
         const Box3 localHalo = expandAndClampBox(coreBox, 8, volumeShape);
         const Box3 refHalo = expandAndClampBox(coreBox, 20, volumeShape);
 
-        const auto localIgnore = classifyOuterAlphaWrapCore(extractBox(localHalo),
+        const auto localIgnore = classifyOuterAlphaWrap(extractBox(localHalo),
                                                             localHalo,
                                                             coreBox,
                                                             alpha,
                                                             offset);
-        const auto refIgnore = classifyOuterAlphaWrapCore(extractBox(refHalo),
+        const auto refIgnore = classifyOuterAlphaWrap(extractBox(refHalo),
                                                           refHalo,
                                                           coreBox,
                                                           alpha,

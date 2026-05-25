@@ -12,7 +12,7 @@
 
 #include "utils/Json.hpp"
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include "vc/ui/VCCollection.hpp"
 

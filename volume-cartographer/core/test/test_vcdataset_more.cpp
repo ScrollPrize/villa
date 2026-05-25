@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/types/VcDataset.hpp"
+#include "utils/zarr.hpp"
 
 #include <cstdint>
 #include <cstring>

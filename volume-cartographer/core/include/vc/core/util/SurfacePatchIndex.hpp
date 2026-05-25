@@ -12,9 +12,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
-#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Rect3D.hpp"
 
 class QuadSurface;
 class PlaneSurface;

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 namespace vc { class VcDataset; }
 

@@ -375,6 +375,16 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
             return;
         }
 
+        if (event->modifiers().testFlag(Qt::ControlModifier)) {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            emit sendAnnotationContextMenuRequested(scene_loc,
+                                                    event->globalPosition().toPoint(),
+                                                    event->modifiers());
+            event->accept();
+            return;
+        }
+
         _regular_pan = true;
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         sendPanStart(event->button(), event->modifiers());
@@ -461,4 +471,18 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
     // rely on hover state (e.g. segmentation editing) receive continuous
     // volume coordinates.
     sendMouseMove(scene_loc, event->buttons(), event->modifiers());
+}
+
+void CVolumeViewerView::leaveEvent(QEvent *event)
+{
+    emit sendMouseLeftView();
+    QGraphicsView::leaveEvent(event);
+}
+
+bool CVolumeViewerView::viewportEvent(QEvent* event)
+{
+    if (event && event->type() == QEvent::Leave) {
+        emit sendMouseLeftView();
+    }
+    return QGraphicsView::viewportEvent(event);
 }

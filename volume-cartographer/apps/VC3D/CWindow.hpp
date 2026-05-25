@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <QComboBox>
 #include <QCheckBox>
 #include <QString>
@@ -38,10 +38,11 @@ class CChunkedVolumeViewer;
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/Surface.hpp"
-#include "vc/core/util/QuadSurface.hpp"
+
+class Volume;
+class VolumePkg;
+class Surface;
+class QuadSurface;
 
 #define MAX_RECENT_VOLPKG 10
 
@@ -64,6 +65,7 @@ class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
+class LineAnnotationController;
 
 class CWindow : public QMainWindow
 {
@@ -240,6 +242,7 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
+    std::unique_ptr<LineAnnotationController> _lineAnnotationController;
     // Keyboard shortcuts
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;

@@ -1,4 +1,4 @@
-#include "vc/ui/VCCollection.hpp"
+#include "vc/core/PointCollections.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -169,7 +169,7 @@ int main(int argc, char** argv) {
 
     cv::Mat_<cv::Vec3f> points = surface->rawPoints();
     
-    VCCollection collection;
+    PointCollections collection;
 
     std::cout << "wtf "  << std::endl;
     for (int i = 0; i < num_collections; ++i) {

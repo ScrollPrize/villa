@@ -126,6 +126,10 @@ signals:
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
     void mergeTifxyzRequested(const QStringList& segmentIds);
+    // Emitted when the user right-clicks two selected segments and picks
+    // "Patch tifxyz...". CWindow wires this to
+    // SegmentationCommandHandler::onMergePatch.
+    void mergePatchRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
