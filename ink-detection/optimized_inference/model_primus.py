@@ -14,18 +14,9 @@ which embeds `model_state_dict`, `config` (containing `model_config` or a
 flat patch_size + targets pair), and `metadata`.
 
 Container dependencies: this loader imports from the `vesuvius` Python package
-(`vesuvius.models.build.build_network_from_config`,
-`vesuvius.models.configuration.config_manager`). Those imports are NOT in the
-current `requirements.txt` for the optimized_inference image; integrators
-landing this loader must either:
-
-  (a) install the vesuvius package in the image (preferred — install
-      `villa/vesuvius/src` as an editable or PEP 517 wheel), OR
-  (b) vendor the minimal subset of build_network_from_config + ConfigManager
-      into this directory.
-
-This file deliberately does not edit `requirements.txt` / `Dockerfile`; that
-change has wider container-build implications and belongs in a separate PR.
+(`vesuvius.models.build.build_network_from_config`). The optimized inference
+image must install the local `villa/vesuvius` package for `MODEL_TYPE=primus`
+to be runnable.
 """
 from __future__ import annotations
 
@@ -96,14 +87,10 @@ class PrimusWrapper:
         self.target_key = target_key
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Inference container delivers (B, 1, C, H, W). NetworkFromConfig expects
-        # (B, C, D, H, W) where D = depth-axis = frames. Transpose channel/frame.
+        # Inference container delivers (B, 1, D, H, W), which matches
+        # NetworkFromConfig's single-channel 3D volume contract.
         if x.ndim == 4:
             x = x[:, None]
-        if x.ndim == 5 and x.shape[1] == 1:
-            x = x.permute(0, 2, 1, 3, 4).contiguous()  # (B, 1, D, H, W)
-            # Primus is single-channel input volumes; the depth axis is frames.
-            x = x.permute(0, 2, 1, 3, 4).contiguous()  # back to (B, C=1, D, H, W)
         out = self.model(x)
         if isinstance(out, dict):
             # Multi-task model: pick the configured target or the first available.
