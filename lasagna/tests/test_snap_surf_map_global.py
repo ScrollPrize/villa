@@ -8,9 +8,11 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 
 import torch
 import optimizer
+import fit_data
 
 TEST_DIR = os.path.dirname(__file__)
 if TEST_DIR not in sys.path:
@@ -35,6 +37,43 @@ from snap_surf.map_global import (
 )
 from snap_surf import map_global_cli
 from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz
+
+
+def _constant_grad_data(value: float, *, shape: tuple[int, int, int] = (6, 6, 6)) -> fit_data.FitData3D:
+	return fit_data.FitData3D(
+		cos=None,
+		grad_mag=torch.full((1, 1, *shape), float(value), dtype=torch.float32),
+		nx=None,
+		ny=None,
+		pred_dt=None,
+		corr_points=None,
+		winding_volume=None,
+		origin_fullres=(0.0, 0.0, 0.0),
+		spacing=(1.0, 1.0, 1.0),
+		grad_mag_scale=1.0,
+		cuda_gridsample=False,
+	)
+
+
+class _RejectNonFiniteGradData:
+	def __init__(self, value: float = 0.5) -> None:
+		self.value = float(value)
+		self.origin_fullres = (0.0, 0.0, 0.0)
+		self.spacing = (1.0, 1.0, 1.0)
+		self.channels: list[str] = []
+		self.queries: list[torch.Tensor] = []
+
+	def _spacing_for(self, channel: str) -> tuple[float, float, float]:
+		self.channels.append(channel)
+		return self.spacing
+
+	def grid_sample_fullres(self, xyz_fullres: torch.Tensor, *, channels=None, diff: bool = False):
+		self.queries.append(xyz_fullres.detach().clone())
+		if not bool(torch.isfinite(xyz_fullres).all().detach().cpu()):
+			raise AssertionError("grid_sample_fullres received non-finite coordinates")
+		shape = tuple(int(v) for v in xyz_fullres.shape[:-1])
+		grad_mag = torch.full((1, 1, *shape), self.value, device=xyz_fullres.device, dtype=xyz_fullres.dtype)
+		return SimpleNamespace(grad_mag=grad_mag)
 
 
 def _write_planar_global_fixture(root: str, *, h: int = 5, w: int = 5, offset_h: float = 0.25, offset_w: float = 0.5) -> torch.Tensor:
@@ -115,6 +154,48 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8) -> st
 
 
 class SnapSurfMapGlobalTest(unittest.TestCase):
+	def _snap_loss_case(
+		self,
+		*,
+		offset: float,
+		model_z: float = 2.0,
+		grad_mag: float = 0.5,
+		data=None,
+		mutate_model_xyz=None,
+		mutate_ext_xyz=None,
+	):
+		h, w = 5, 5
+		runtime = GlobalMapRuntime()
+		model_xyz = _plane_xyz(h=h, w=w, z=model_z).unsqueeze(0)
+		model_normals = _normals_3d(1, h, w)
+		model_valid = torch.ones(1, h, w, dtype=torch.bool)
+		ext_xyz = _plane_xyz(h=h, w=w, z=0.0)
+		ext_valid = torch.ones(h, w, dtype=torch.bool)
+		ext_normals = _normals_2d(h, w)
+		ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
+		stdout = StringIO()
+		if mutate_model_xyz is not None:
+			mutate_model_xyz(model_xyz)
+		if mutate_ext_xyz is not None:
+			mutate_ext_xyz(ext_xyz)
+		if data is None:
+			data = _constant_grad_data(grad_mag)
+
+		with redirect_stdout(stdout):
+			loss, _lms, _masks, stats = runtime.snap_loss(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad,
+				offset=offset,
+				data=data,
+				strip_samples=4,
+			)
+		return loss, stats, stdout.getvalue()
+
 	def test_lasagna_stage_parser_routes_model_and_map_params(self) -> None:
 		cfg = {
 			"base": {"snap_surf": 1.0},
@@ -128,6 +209,65 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 		self.assertEqual(stages[0].global_opt.kind, "model")
 		self.assertEqual(stages[1].global_opt.kind, "map")
+
+	def test_snap_loss_zero_offset_preserves_voxel_residual(self) -> None:
+		loss, stats, out = self._snap_loss_case(offset=0.0, model_z=2.0, grad_mag=0.5)
+
+		self.assertAlmostEqual(float(loss.detach()), 4.0, places=6)
+		self.assertAlmostEqual(stats["snaps_map_snap_abs"], 2.0, places=6)
+		self.assertIn("snap loss offset_mode=voxel offset=0", out)
+
+	def test_snap_loss_nonzero_offset_uses_winding_residual(self) -> None:
+		loss, stats, out = self._snap_loss_case(offset=1.0, model_z=2.0, grad_mag=0.5)
+
+		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
+		self.assertAlmostEqual(stats["snaps_map_snap_abs"], 0.0, places=6)
+		self.assertEqual(stats["snaps_map_snap_samples"], 25.0)
+		self.assertIn("snap loss offset_mode=winding offset=1", out)
+
+	def test_snap_loss_nonzero_offset_stats_report_winding_error(self) -> None:
+		loss, stats, _out = self._snap_loss_case(offset=2.0, model_z=2.0, grad_mag=0.5)
+
+		self.assertAlmostEqual(float(loss.detach()), 1.0, places=6)
+		self.assertAlmostEqual(stats["snaps_map_snap_abs"], 1.0, places=6)
+		self.assertAlmostEqual(stats["snaps_map_snap_max"], 1.0, places=6)
+
+	def test_snap_loss_nonzero_offset_masks_invalid_grad_mag_strip(self) -> None:
+		loss, stats, _out = self._snap_loss_case(offset=1.0, model_z=2.0, grad_mag=0.0)
+
+		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
+		self.assertEqual(stats["snaps_map_snap_samples"], 0.0)
+
+	def test_snap_loss_nonzero_offset_sanitizes_nan_external_samples(self) -> None:
+		data = _RejectNonFiniteGradData(0.5)
+
+		loss, stats, _out = self._snap_loss_case(
+			offset=1.0,
+			model_z=2.0,
+			data=data,
+			mutate_ext_xyz=lambda ext_xyz: ext_xyz.__setitem__((1, 2, 0), float("nan")),
+		)
+
+		self.assertGreater(len(data.queries), 0)
+		self.assertTrue(bool(torch.isfinite(data.queries[0]).all()))
+		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
+		self.assertEqual(stats["snaps_map_snap_samples"], 24.0)
+
+	def test_snap_loss_nonzero_offset_sanitizes_invalid_model_samples(self) -> None:
+		data = _RejectNonFiniteGradData(0.5)
+
+		loss, stats, _out = self._snap_loss_case(
+			offset=1.0,
+			model_z=2.0,
+			data=data,
+			mutate_model_xyz=lambda model_xyz: model_xyz.__setitem__((0, 2, 2, 2), float("nan")),
+		)
+
+		self.assertGreater(len(data.queries), 0)
+		self.assertTrue(bool(torch.isfinite(data.queries[0]).all()))
+		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
+		self.assertLess(stats["snaps_map_snap_samples"], 25.0)
+		self.assertGreater(stats["snaps_map_snap_samples"], 0.0)
 
 	def test_lasagna_map_stage_uses_global_map_loss_weights(self) -> None:
 		stages = optimizer.load_stages_cfg({

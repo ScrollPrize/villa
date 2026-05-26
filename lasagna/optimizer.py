@@ -325,7 +325,7 @@ def _parse_opt_settings(
 		if CYLINDER_STAGE_STEP_ARG in args and float(args[CYLINDER_STAGE_STEP_ARG]) <= 0.0:
 			raise ValueError(
 				f"stages_json: stage '{stage_name}' opt.args.{CYLINDER_STAGE_STEP_ARG}: must be > 0"
-			)
+		)
 		if not any(float(eff.get(name, 0.0)) != 0.0 for name in CYLINDER_LOSS_NAMES):
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	if "map_flatten_ms" in params and not any(
@@ -455,7 +455,7 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 			raise ValueError(
 				"stages_json: cylinder_seed stages before cyl_init "
 				"must be only cyl_init; later stages are skipped when cyl_grow is absent"
-			)
+		)
 		return
 	first_non_role = next((i for i, stage in enumerate(stages) if i > role_positions["cyl_init"] and stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES), len(stages))
 	for stage in stages[:first_non_role]:
@@ -463,7 +463,7 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 			raise ValueError(
 				"stages_json: cylinder_seed stages before later stages "
 				"must be only cyl_init/cyl_grow/cyl_grow_refine; later stages run normally"
-			)
+		)
 
 
 def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
@@ -731,26 +731,19 @@ def optimize(
 		offsets = [float(record[4]) if len(record) >= 5 else 0.0 for record in records]
 		print(
 			"[snap_surf.map_global] external surface offsets at first map call: "
-			f"configured={offsets} used_by_snap_surf_map=not_applied "
-			"interpretation=metadata_only; winding-integral offsets are currently used by ext_offset, "
-			"while snap_surf_map matches the provided external surface geometry",
+			f"configured={offsets} used_by_map_optimizer=not_applied "
+			"interpretation=correspondence_only; snap_surf_map loss applies nonzero offsets as winding residuals",
 			flush=True,
 		)
 		_snap_global_offset_debug_printed = True
 
-	def _print_snap_global_model_offset_debug(stage_name: str) -> None:
-		nonlocal _snap_global_offset_debug_printed
-		if _snap_global_offset_debug_printed:
-			return
+	def _snap_global_model_offset_text() -> str:
 		offsets = [float(v) for v in getattr(model, "_ext_offsets", [])]
-		print(
-			"[snap_surf.map_global] external surface offsets at stage setup: "
-			f"stage={stage_name!r} configured={offsets} used_by_snap_surf_map=not_applied "
-			"interpretation=metadata_only; winding-integral offsets are currently used by ext_offset, "
-			"while snap_surf_map matches the provided external surface geometry",
-			flush=True,
-		)
-		_snap_global_offset_debug_printed = True
+		if not offsets:
+			return "none"
+		if len(offsets) == 1:
+			return f"{offsets[0]:.6g}"
+		return "[" + ",".join(f"{v:.6g}" for v in offsets) + "]"
 
 	def _snap_global_runtime_for(stage_args: dict | None = None) -> snap_surf_map_global.GlobalMapRuntime:
 		nonlocal _snap_global_runtime
@@ -807,8 +800,7 @@ def optimize(
 			raise RuntimeError("snap_surf_map requires external_surfaces")
 		if res.normals is None:
 			raise RuntimeError("snap_surf_map requires model normals")
-		_print_snap_global_offset_debug(records)
-		ext_xyz, ext_valid, ext_normals, ext_quad_valid, _offset = _unpack_ext_surface_record(records[0])
+		ext_xyz, ext_valid, ext_normals, ext_quad_valid, offset = _unpack_ext_surface_record(records[0])
 		loss, lms, masks, stats = _snap_global_runtime_for().snap_loss(
 			model_xyz=res.xyz_lr,
 			model_normals=res.normals,
@@ -817,6 +809,9 @@ def optimize(
 			ext_valid=ext_valid,
 			ext_normals=ext_normals,
 			ext_quad_valid=ext_quad_valid,
+			offset=offset,
+			data=res.data,
+			strip_samples=max(2, int(res.params.subsample_mesh) + 1),
 		)
 		opt_loss_snap_surf.update_last_stats(stats)
 		return loss, lms, masks
@@ -1263,7 +1258,11 @@ def optimize(
 			},
 			"snap_surf_map": {
 				"loss": _snap_global_map_loss,
-				"needs": Needs(mesh_normals=True, ext_surfaces=True),
+				"needs": Needs(
+					mesh_normals=True,
+					ext_surfaces=True,
+					lr_prefetch_channels=frozenset({"grad_mag"}),
+				),
 			},
 		"cyl_normal": {
 			"loss": opt_loss_cyl.cyl_normal_loss,
@@ -1690,11 +1689,11 @@ def optimize(
 			f"[optimizer] {label}: snap_surf_weight={snap_surf_legacy_weight:.6g} "
 			f"snap_surf_map_weight={snap_surf_map_weight:.6g} "
 			f"snap_surf_legacy_active={snap_surf_legacy_active} "
-			f"snap_surf_args={snap_surf_legacy_cfg}",
+			f"snap_surf_args={snap_surf_legacy_cfg} "
+			f"snap_surf_map_offset={_snap_global_model_offset_text() if snap_surf_global_map_mode else 'n/a'} "
+			f"snap_surf_map_offset_mode={'auto' if snap_surf_global_map_mode else 'n/a'}",
 			flush=True,
 		)
-		if snap_surf_global_map_mode:
-			_print_snap_global_model_offset_debug(stage.name)
 		opt_loss_snap_surf.configure_snap_surf(
 			cfg=snap_surf_legacy_cfg,
 			seed_xyz=seed_xyz,
@@ -1705,14 +1704,14 @@ def optimize(
 		if snap_surf_legacy_active and not getattr(model, "_ext_surfaces", None):
 			raise ValueError("snap_surf requires external_surfaces")
 
-			opt_loss_flatten.configure(
-				sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
-				orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
-			)
+		opt_loss_flatten.configure(
+			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
+			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
+		)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
-		)
+			)
 		_compile_cyl_normal = _truthy(_compile_cyl_normal_raw)
 		_compile_cyl_normal_backend = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL_BACKEND",
