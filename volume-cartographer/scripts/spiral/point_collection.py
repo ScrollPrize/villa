@@ -118,7 +118,7 @@ def _record_point_patch_link(
     )
 
 
-def _process_point_collections_with_surface_index(
+def _link_points_to_patches_with_surface_index(
     patches: Dict[str, Patch],
     point_collections: Dict[int, Dict[str, Any]],
     tolerance: float,
@@ -162,7 +162,7 @@ def _process_point_collections_with_surface_index(
     return links
 
 
-def _process_point_collections(
+def link_points_to_patches(
     patches: Dict[str, Patch],
     point_collections: Dict[int, Dict[str, Any]],
     tolerance: float = 10.0,
@@ -171,7 +171,7 @@ def _process_point_collections(
 ) -> Dict[str, List[PointPatchLink]]:
     """Process point collections and link them to patches."""
     if surface_index_tolerance is not None:
-        links = _process_point_collections_with_surface_index(
+        links = _link_points_to_patches_with_surface_index(
             patches, point_collections, surface_index_tolerance, distance_scale
         )
         if links is not None:

@@ -23,7 +23,7 @@ from torchdiffeq import odeint
 
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
-from point_collection import load_point_collection, _process_point_collections, can_use_surface_index_backend, normalise_pcl_winding_annotations
+from point_collection import load_point_collection, link_points_to_patches, can_use_surface_index_backend, normalise_pcl_winding_annotations
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
@@ -3246,7 +3246,7 @@ def load_patches(patches_path, segment_id_filter=lambda s: True):
     return patches
 
 
-def process_point_collections_cached(
+def link_points_to_patches_cached(
     patches,
     point_collections,
     tolerance=10.0,
@@ -3276,7 +3276,7 @@ def process_point_collections_cached(
         point_collections.clear()
         point_collections.update(point_collections_cached)
     else:
-        _process_point_collections(
+        link_points_to_patches(
             patches,
             point_collections,
             tolerance,
@@ -3385,7 +3385,7 @@ def main():
         del cross_patch_point_collections[pid]
     print(f'dropped {len(dropped_patch_ids)} patches, {len(dropped_cross_patch_pcl_ids)} cross-patch pcls, and {dropped_unattached_pcl_count} unattached pcls outside z-roi [{z_begin}, {z_end})')
 
-    process_point_collections_cached(
+    link_points_to_patches_cached(
         patches,
         cross_patch_point_collections,
         tolerance=10.0 / downsample_factor,
