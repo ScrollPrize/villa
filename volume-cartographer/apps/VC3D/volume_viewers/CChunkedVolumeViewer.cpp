@@ -15,6 +15,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/ui/VCCollection.hpp"
 
 #include <QApplication>
 #include <QCursor>
@@ -24,6 +25,7 @@
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPointer>
@@ -936,6 +938,7 @@ void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv
         invalidateVis();
         return;
     }
+
 
     auto surf = _surfWeak.lock();
     auto* quad = dynamic_cast<QuadSurface*>(surf.get());
@@ -2927,6 +2930,9 @@ void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton && modifiers.testFlag(Qt::ShiftModifier)) {
+        if (_sameWrapAnnotation.manualPathType()) {
+            return;
+        }
         const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
                                      !_sameWrapAnnotation.shiftReleasedSincePreview();
         if (_sameWrapAnnotation.generatePreview(
@@ -2941,6 +2947,16 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
                     setOverlayGroup(key, items);
                 },
                 [this](const std::string& key) { clearOverlayGroup(key); })) {
+            return;
+        }
+    }
+
+    if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+        if (const auto hit = pointAtScenePosition(scenePos)) {
+            _selectedCollectionId = hit->first;
+            _selectedPointId = hit->second;
+            emit pointClicked(_selectedPointId);
+            emit overlaysUpdated();
             return;
         }
     }
@@ -2968,17 +2984,54 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
     emit sendVolumeClicked(volumePos, n, surf.get(), button, modifiers);
 }
 
+void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
+{
+    _selectedCollectionId = collectionId;
+    if (_selectedPointId != 0) {
+        const auto point = _pointCollection ? _pointCollection->getPoint(_selectedPointId)
+                                            : std::optional<ColPoint>{};
+        if (!point || point->collectionId != collectionId) {
+            _selectedPointId = 0;
+        }
+    }
+    emit overlaysUpdated();
+}
+
+void CChunkedVolumeViewer::onPointSelected(uint64_t pointId)
+{
+    _selectedPointId = pointId;
+    if (_pointCollection && pointId != 0) {
+        if (const auto point = _pointCollection->getPoint(pointId)) {
+            _selectedCollectionId = point->collectionId;
+        }
+    }
+    emit overlaysUpdated();
+}
+
 void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.setEnabled(enabled);
     if (!enabled) {
         clearSameWrapAnnotationPreview();
     }
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
 {
     _sameWrapAnnotation.setSpacing(spacingVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance(double toleranceVx)
+{
+    _sameWrapAnnotation.setMergeTolerance(toleranceVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity(double opacity)
+{
+    _sameWrapAnnotationPolylineOpacity = std::clamp(opacity, 0.0, 1.0);
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
@@ -2988,10 +3041,14 @@ void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
 
 void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
 {
-    _sameWrapAnnotation.setPathType(
-        pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)
-            ? SameWrapAnnotationTool::PathType::ShortestPath
-            : SameWrapAnnotationTool::PathType::ConnectedComponents);
+    SameWrapAnnotationTool::PathType toolPathType = SameWrapAnnotationTool::PathType::ConnectedComponents;
+    if (pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)) {
+        toolPathType = SameWrapAnnotationTool::PathType::ShortestPath;
+    } else if (pathType == static_cast<int>(SameWrapAnnotationTool::PathType::Manual)) {
+        toolPathType = SameWrapAnnotationTool::PathType::Manual;
+    }
+    _sameWrapManualPathDragActive = false;
+    _sameWrapAnnotation.setPathType(toolPathType);
     clearSameWrapAnnotationPreview();
 }
 
@@ -3013,8 +3070,14 @@ void CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize(int kernelSize)
     clearSameWrapAnnotationPreview();
 }
 
+bool CChunkedVolumeViewer::hasSameWrapAnnotationPreview() const
+{
+    return _sameWrapAnnotation.hasPreview();
+}
+
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
 }
 
@@ -3022,7 +3085,18 @@ bool CChunkedVolumeViewer::commitSameWrapAnnotationPreview()
 {
     return _sameWrapAnnotation.commit(
         _pointCollection,
+        [this](const cv::Vec3f& point) { return volumeToScene(point); },
+        QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
         [this](const std::string& key) { clearOverlayGroup(key); });
+}
+
+bool CChunkedVolumeViewer::undoSameWrapAnnotation()
+{
+    if (_sameWrapAnnotation.hasPreview()) {
+        clearSameWrapAnnotationPreview();
+        return true;
+    }
+    return _sameWrapAnnotation.undoLastCommit(_pointCollection);
 }
 
 void CChunkedVolumeViewer::refreshSameWrapAnnotationOverlay()
@@ -3045,10 +3119,71 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    _sameWrapManualMergePressConsumed = false;
+
+    if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
+        modifiers.testFlag(Qt::ShiftModifier)) {
+        if (const auto hit = pointAtScenePosition(scenePos)) {
+            if (_sameWrapAnnotation.manualMergePointClicked(
+                    _pointCollection,
+                    hit->first,
+                    hit->second,
+                    [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                    QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
+                    [this](const SameWrapAnnotationTool::MixedDirectionMergeWarning& warning) {
+                        const auto directionText = [this](const std::string& key) {
+                            return key == "z" ? tr("mostly up/down in Z") : tr("mostly in XY");
+                        };
+                        const QMessageBox::StandardButton reply = QMessageBox::warning(
+                            this,
+                            tr("Same-wrap Merge"),
+                            tr("You are about to merge two same-wrap point collections with different dominant directions:\n\n"
+                               "%1: %2\n"
+                               "%3: %4\n\n"
+                               "Continue merging?")
+                                .arg(QString::fromStdString(warning.firstCollectionName),
+                                     directionText(warning.firstDirectionKey),
+                                     QString::fromStdString(warning.secondCollectionName),
+                                     directionText(warning.secondDirectionKey)),
+                            QMessageBox::Yes | QMessageBox::No,
+                            QMessageBox::No);
+                        return reply == QMessageBox::Yes;
+                    })) {
+                if (_pointCollection && _pointCollection->getPoint(hit->second)) {
+                    _selectedCollectionId = hit->first;
+                    _selectedPointId = hit->second;
+                } else {
+                    _selectedCollectionId = 0;
+                    _selectedPointId = 0;
+                }
+                _sameWrapManualMergePressConsumed = true;
+                if (_selectedPointId != 0) {
+                    emit pointClicked(_selectedPointId);
+                }
+                emit overlaysUpdated();
+                return;
+            }
+        }
+    }
+
     if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton &&
         modifiers.testFlag(Qt::ShiftModifier)) {
+        if (_sameWrapAnnotation.manualPathType()) {
+            const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
+                                         !_sameWrapAnnotation.shiftReleasedSincePreview();
+            _sameWrapManualPathDragActive = _sameWrapAnnotation.beginManualPreview(
+                scenePos,
+                appendToPreview,
+                [this](const QPointF& point) { return sceneToVolume(point); },
+                [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                    setOverlayGroup(key, items);
+                },
+                [this](const std::string& key) { clearOverlayGroup(key); });
+        }
         return;
     }
+
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _bboxStart = QPointF(sp[0], sp[1]);
@@ -3073,7 +3208,6 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
 
 void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     const bool reusedCursorSample = (_lastScenePos == scenePos && _lastCursorVolumePos.has_value());
     if (!reusedCursorSample) {
         _lastCursorVolumePos = cursorVolumePosition(scenePos);
@@ -3081,6 +3215,30 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
     _lastScenePos = scenePos;
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+
+    const uint64_t previousHighlight = _highlightedPointId;
+    if (const auto hit = pointAtScenePosition(scenePos)) {
+        _highlightedPointId = hit->second;
+    } else {
+        _highlightedPointId = 0;
+    }
+    if (_highlightedPointId != previousHighlight) {
+        emit overlaysUpdated();
+    }
+
+    if (_sameWrapManualPathDragActive && (buttons & Qt::LeftButton)) {
+        _sameWrapAnnotation.appendManualPreview(
+            scenePos,
+            _scale,
+            _pointCollection,
+            [this](const QPointF& point) { return sceneToVolume(point); },
+            [this](const cv::Vec3f& point) { return volumeToScene(point); },
+            [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                setOverlayGroup(key, items);
+            },
+            [this](const std::string& key) { clearOverlayGroup(key); });
+        return;
+    }
     if (_bboxMode && _activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _activeBBoxSurfRect = QRectF(_bboxStart, QPointF(sp[0], sp[1])).normalized();
@@ -3109,6 +3267,24 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_sameWrapManualMergePressConsumed && button == Qt::RightButton) {
+        _sameWrapManualMergePressConsumed = false;
+        return;
+    }
+    if (_sameWrapManualPathDragActive && button == Qt::LeftButton) {
+        _sameWrapAnnotation.appendManualPreview(
+            scenePos,
+            _scale,
+            _pointCollection,
+            [this](const QPointF& point) { return sceneToVolume(point); },
+            [this](const cv::Vec3f& point) { return volumeToScene(point); },
+            [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                setOverlayGroup(key, items);
+            },
+            [this](const std::string& key) { clearOverlayGroup(key); });
+        _sameWrapManualPathDragActive = false;
+        return;
+    }
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&
         _activeBBoxSurfRect) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
@@ -3306,6 +3482,38 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
             p += n * _zOff;
     }
     return p;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtScenePosition(const QPointF& scenePos)
+{
+    if (!_pointCollection || !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        return std::nullopt;
+    }
+
+    constexpr qreal kPointHitRadius = 4.0;
+    constexpr qreal kPointHitRadiusSq = kPointHitRadius * kPointHitRadius;
+    qreal bestDistSq = kPointHitRadiusSq;
+    std::optional<std::pair<uint64_t, uint64_t>> bestHit;
+
+    const auto& collections = _pointCollection->getAllCollections();
+    for (const auto& [collectionId, collection] : collections) {
+        for (const auto& [pointId, point] : collection.points) {
+            const QPointF pointScenePos = volumeToScene(point.p);
+            if (!std::isfinite(pointScenePos.x()) || !std::isfinite(pointScenePos.y())) {
+                continue;
+            }
+
+            const qreal dx = pointScenePos.x() - scenePos.x();
+            const qreal dy = pointScenePos.y() - scenePos.y();
+            const qreal distSq = dx * dx + dy * dy;
+            if (distSq <= bestDistSq) {
+                bestDistSq = distSq;
+                bestHit = std::make_pair(collectionId, pointId);
+            }
+        }
+    }
+
+    return bestHit;
 }
 
 void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&)

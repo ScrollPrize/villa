@@ -1601,18 +1601,18 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     if (resume_growth) {
         const int resume_cols = (seed_points.cols + grid_step - 1) / grid_step + 1;
         const int resume_rows = (seed_points.rows + grid_step - 1) / grid_step + 1;
-        const int extra_left = growth_config.grow_left ? grow_initial_extra_cols_lr : 0;
-        const int extra_right = growth_config.grow_right ? grow_initial_extra_cols_lr : 0;
-        const int extra_up = growth_config.grow_up ? grow_initial_extra_rows_lr : 0;
-        const int extra_down = growth_config.grow_down ? grow_initial_extra_rows_lr : 0;
+        const int extra_left = growth_config.expand_left ? grow_initial_extra_cols_lr : 0;
+        const int extra_right = growth_config.expand_right ? grow_initial_extra_cols_lr : 0;
+        const int extra_up = growth_config.expand_up ? grow_initial_extra_rows_lr : 0;
+        const int extra_down = growth_config.expand_down ? grow_initial_extra_rows_lr : 0;
         expanded_left = extra_left;
         expanded_right = extra_right;
         expanded_up = extra_up;
         expanded_down = extra_down;
-        max_extra_left = growth_config.grow_left ? grow_max_extra_cols_lr : 0;
-        max_extra_right = growth_config.grow_right ? grow_max_extra_cols_lr : 0;
-        max_extra_up = growth_config.grow_up ? grow_max_extra_rows_lr : 0;
-        max_extra_down = growth_config.grow_down ? grow_max_extra_rows_lr : 0;
+        max_extra_left = growth_config.expand_left ? grow_max_extra_cols_lr : 0;
+        max_extra_right = growth_config.expand_right ? grow_max_extra_cols_lr : 0;
+        max_extra_up = growth_config.expand_up ? grow_max_extra_rows_lr : 0;
+        max_extra_down = growth_config.expand_down ? grow_max_extra_rows_lr : 0;
         resume_origin = cv::Point(grid_margin + extra_left, grid_margin + extra_up);
         grid_limit_w = grid_margin + max_extra_left + resume_cols + max_extra_right + grid_margin;
         grid_limit_h = grid_margin + max_extra_up + resume_rows + max_extra_down + grid_margin;
@@ -3299,10 +3299,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const int remaining_right = remaining_extra(max_extra_right, expanded_right);
         const int remaining_up = remaining_extra(max_extra_up, expanded_up);
         const int remaining_down = remaining_extra(max_extra_down, expanded_down);
-        const bool can_expand_left = !growth_config.disable_grid_expansion && growth_config.grow_left && remaining_left > 0 && w < max_grid_w;
-        const bool can_expand_right = !growth_config.disable_grid_expansion && growth_config.grow_right && remaining_right > 0 && w < max_grid_w;
-        const bool can_expand_up = !growth_config.disable_grid_expansion && growth_config.grow_up && remaining_up > 0 && h < max_grid_h;
-        const bool can_expand_down = !growth_config.disable_grid_expansion && growth_config.grow_down && remaining_down > 0 && h < max_grid_h;
+        const bool can_expand_left = !growth_config.disable_grid_expansion && growth_config.expand_left && remaining_left > 0 && w < max_grid_w;
+        const bool can_expand_right = !growth_config.disable_grid_expansion && growth_config.expand_right && remaining_right > 0 && w < max_grid_w;
+        const bool can_expand_up = !growth_config.disable_grid_expansion && growth_config.expand_up && remaining_up > 0 && h < max_grid_h;
+        const bool can_expand_down = !growth_config.disable_grid_expansion && growth_config.expand_down && remaining_down > 0 && h < max_grid_h;
         auto emergency_consensus_retry = [&](const char* reason) {
             if (configured_consensus_limit_th <= 2 ||
                 emergency_consensus_limit_th <= 2 ||
@@ -3486,14 +3486,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);
         const bool can_expand_width_now =
             !growth_config.disable_grid_expansion &&
-            ((growth_config.grow_left && current_remaining_left > 0 && w < max_grid_w) ||
-             (growth_config.grow_right && current_remaining_right > 0 && w < max_grid_w));
+            ((growth_config.expand_left && current_remaining_left > 0 && w < max_grid_w) ||
+             (growth_config.expand_right && current_remaining_right > 0 && w < max_grid_w));
         const bool horizontal_growth_requested =
-            growth_config.grow_left || growth_config.grow_right;
+            growth_config.expand_left || growth_config.expand_right;
         const bool horizontal_grid_limit_reached = w >= max_grid_w;
         const bool horizontal_extra_limit_reached =
-            (!growth_config.grow_left || current_remaining_left <= 0) &&
-            (!growth_config.grow_right || current_remaining_right <= 0);
+            (!growth_config.expand_left || current_remaining_left <= 0) &&
+            (!growth_config.expand_right || current_remaining_right <= 0);
         const bool horizontal_expansion_blocked =
             !growth_config.disable_grid_expansion &&
             horizontal_growth_requested &&

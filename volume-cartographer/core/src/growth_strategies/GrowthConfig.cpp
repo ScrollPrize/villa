@@ -10,6 +10,14 @@
 
 namespace {
 
+struct DirectionFlags {
+    bool down = false;
+    bool right = false;
+    bool up = false;
+    bool left = false;
+    bool all_neighbors = false;
+};
+
 void append_unique_neigh(std::vector<cv::Vec2i>& neighs, const cv::Vec2i& value)
 {
     for (const auto& existing : neighs) {
@@ -25,6 +33,77 @@ int64_t nonnegative_int64_param(const nlohmann::json& params,
                                 int64_t default_value)
 {
     return std::max<int64_t>(0, params.value(key, default_value));
+}
+
+DirectionFlags parse_direction_flags(const nlohmann::json& directions)
+{
+    DirectionFlags flags;
+    if (!directions.is_array()) {
+        flags.down = flags.right = flags.up = flags.left = true;
+        flags.all_neighbors = true;
+        return flags;
+    }
+
+    for (const auto& dir : directions) {
+        if (!dir.is_string()) {
+            continue;
+        }
+        const std::string value = dir.get<std::string>();
+        if (value == "all") {
+            flags.down = flags.right = flags.up = flags.left = true;
+            flags.all_neighbors = true;
+            break;
+        }
+        if (value == "down") {
+            flags.down = true;
+        } else if (value == "right") {
+            flags.right = true;
+        } else if (value == "up") {
+            flags.up = true;
+        } else if (value == "left") {
+            flags.left = true;
+        }
+    }
+
+    if (!flags.down && !flags.right && !flags.up && !flags.left) {
+        flags.down = flags.right = flags.up = flags.left = true;
+        flags.all_neighbors = true;
+    }
+    return flags;
+}
+
+void apply_growth_direction_flags(GrowthConfig& config, const DirectionFlags& flags)
+{
+    config.grow_down = flags.down;
+    config.grow_right = flags.right;
+    config.grow_up = flags.up;
+    config.grow_left = flags.left;
+
+    config.neighs.clear();
+    if (flags.all_neighbors) {
+        config.neighs = config.all_8_neighs;
+        return;
+    }
+    if (flags.down) {
+        append_unique_neigh(config.neighs, {1, 0});
+    }
+    if (flags.right) {
+        append_unique_neigh(config.neighs, {0, 1});
+    }
+    if (flags.up) {
+        append_unique_neigh(config.neighs, {-1, 0});
+    }
+    if (flags.left) {
+        append_unique_neigh(config.neighs, {0, -1});
+    }
+}
+
+void apply_expansion_direction_flags(GrowthConfig& config, const DirectionFlags& flags)
+{
+    config.expand_down = flags.down;
+    config.expand_right = flags.right;
+    config.expand_up = flags.up;
+    config.expand_left = flags.left;
 }
 
 } // namespace
@@ -90,42 +169,19 @@ GrowthConfig parse_growth_config(const nlohmann::json& params, bool bidirectiona
     config.rollout_internal_connection_weight = nonnegative_int64_param(params, "rollout_internal_connection_weight", 0);
 
     if (config.has_growth_directions) {
-        config.grow_down = config.grow_right = config.grow_up = config.grow_left = false;
-        config.neighs.clear();
-        for (const auto& dir : params["growth_directions"]) {
-            if (!dir.is_string()) {
-                continue;
-            }
-            const std::string value = dir.get<std::string>();
-            if (value == "all") {
-                config.grow_down = config.grow_right = config.grow_up = config.grow_left = true;
-                config.neighs = config.all_8_neighs;
-                break;
-            }
-            if (value == "down") {
-                config.grow_down = true;
-                append_unique_neigh(config.neighs, {1, 0});
-            }
-            else if (value == "right") {
-                config.grow_right = true;
-                append_unique_neigh(config.neighs, {0, 1});
-            }
-            else if (value == "up") {
-                config.grow_up = true;
-                append_unique_neigh(config.neighs, {-1, 0});
-            }
-            else if (value == "left") {
-                config.grow_left = true;
-                append_unique_neigh(config.neighs, {0, -1});
-            }
-        }
-        if (!config.grow_down && !config.grow_right && !config.grow_up && !config.grow_left) {
-            config.grow_down = config.grow_right = config.grow_up = config.grow_left = true;
-            config.neighs = config.all_8_neighs;
-        }
+        apply_growth_direction_flags(config, parse_direction_flags(params["growth_directions"]));
+    }
+
+    config.expand_down = config.grow_down;
+    config.expand_right = config.grow_right;
+    config.expand_up = config.grow_up;
+    config.expand_left = config.grow_left;
+    if (params.contains("expansion_directions")) {
+        apply_expansion_direction_flags(config, parse_direction_flags(params["expansion_directions"]));
     }
     if (flip_x) {
         std::swap(config.grow_left, config.grow_right);
+        std::swap(config.expand_left, config.expand_right);
         for (auto& neigh : config.neighs) {
             neigh[1] = -neigh[1];
         }
@@ -140,6 +196,10 @@ void GrowthConfig::log(std::ostream& out, int stop_gen) const
         << " right=" << grow_right
         << " up=" << grow_up
         << " left=" << grow_left
+        << " expansion down=" << expand_down
+        << " right=" << expand_right
+        << " up=" << expand_up
+        << " left=" << expand_left
         << " neighbor_count=" << neighs.size()
         << " max_no_growth_expansions=" << max_no_growth_expansions
         << " expand_grid=" << !disable_grid_expansion

@@ -74,6 +74,7 @@
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "CPointCollectionWidget.hpp"
+#include "WrapAnnotationWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "LineAnnotationController.hpp"
@@ -1153,27 +1154,47 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointClicked,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationToggled,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationMergeToggled,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationPathTypeChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationPathType, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationFilterTypeChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterType, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationFilterKernelSizeChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationClearRequested,
-                viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
-        viewer->setSameWrapAnnotationSpacing(_point_collection_widget->sameWrapAnnotationSpacing());
-        viewer->setSameWrapAnnotationMergeExisting(_point_collection_widget->sameWrapAnnotationMergeEnabled());
-        viewer->setSameWrapAnnotationPathType(_point_collection_widget->sameWrapAnnotationPathType());
-        viewer->setSameWrapAnnotationFilterKernelSize(_point_collection_widget->sameWrapAnnotationFilterKernelSize());
-        viewer->setSameWrapAnnotationFilterType(_point_collection_widget->sameWrapAnnotationFilterType());
-        viewer->setSameWrapAnnotationMode(_point_collection_widget->sameWrapAnnotationEnabled());
         viewer->setProperty("vc_points_bound", true);
+    }
+
+    if (_wrapAnnotationWidget && !viewer->property("vc_wrap_annotation_bound").toBool()) {
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::collectionSelected,
+                viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectCollection, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointSelected,
+                viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointSelected,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointClicked,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationToggled,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationSpacingChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationMergeToleranceChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationPolylineOpacityChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationMergeToggled,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationPathTypeChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationPathType, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationFilterTypeChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterType, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationFilterKernelSizeChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationClearRequested,
+                viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
+        viewer->setSameWrapAnnotationSpacing(_wrapAnnotationWidget->sameWrapAnnotationSpacing());
+        viewer->setSameWrapAnnotationMergeTolerance(_wrapAnnotationWidget->sameWrapAnnotationMergeTolerance());
+        viewer->setSameWrapAnnotationPolylineOpacity(_wrapAnnotationWidget->sameWrapAnnotationPolylineOpacity());
+        viewer->setSameWrapAnnotationMergeExisting(_wrapAnnotationWidget->sameWrapAnnotationMergeEnabled());
+        viewer->setSameWrapAnnotationPathType(_wrapAnnotationWidget->sameWrapAnnotationPathType());
+        viewer->setSameWrapAnnotationFilterKernelSize(_wrapAnnotationWidget->sameWrapAnnotationFilterKernelSize());
+        viewer->setSameWrapAnnotationFilterType(_wrapAnnotationWidget->sameWrapAnnotationFilterType());
+        viewer->setSameWrapAnnotationMode(_wrapAnnotationWidget->sameWrapAnnotationEnabled());
+        viewer->setProperty("vc_wrap_annotation_bound", true);
     }
 
     const std::string& surfName = viewer->surfName();
@@ -2230,6 +2251,14 @@ void CWindow::CreateWidgets(void)
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(_state, &CState::surfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
 
+    _wrapAnnotationWidget = new WrapAnnotationWidget(_state->pointCollection(), this);
+    _wrapAnnotationWidget->setObjectName("wrapAnnotationDock");
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _wrapAnnotationWidget);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::relWindingAnnotationToggled,
+            _seedingWidget, &SeedingWidget::setRelWindingAnnotationMode);
+    connect(_seedingWidget, &SeedingWidget::relWindingAnnotationModeChanged,
+            _wrapAnnotationWidget, &WrapAnnotationWidget::setRelWindingAnnotationChecked);
+
     // Create and add the point collection widget
     _point_collection_widget = new CPointCollectionWidget(_state->pointCollection(), this);
     _point_collection_widget->setObjectName("pointCollectionDock");
@@ -2248,6 +2277,8 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, and Point Collections together
     // Wire annotate mode & annotation selection: dock widget <-> segmentation module
@@ -2688,7 +2719,7 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
-    if (_viewerManager && _point_collection_widget && _point_collection_widget->sameWrapAnnotationEnabled()) {
+    if (_viewerManager && _wrapAnnotationWidget && _wrapAnnotationWidget->sameWrapAnnotationEnabled()) {
         if (event->key() == Qt::Key_E && event->modifiers() == Qt::ShiftModifier) {
             bool committed = false;
             _viewerManager->forEachBaseViewer([&committed](VolumeViewerBase* baseViewer) {
@@ -2705,16 +2736,36 @@ void CWindow::keyPressEvent(QKeyEvent* event)
             }
         }
         if (event->key() == Qt::Key_Z && event->modifiers() == Qt::ControlModifier) {
-            _viewerManager->forEachBaseViewer([](VolumeViewerBase* baseViewer) {
+            bool clearedPreview = false;
+            _viewerManager->forEachBaseViewer([&clearedPreview](VolumeViewerBase* baseViewer) {
                 if (!baseViewer) {
                     return;
                 }
                 if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
-                    viewer->clearSameWrapAnnotationPreview();
+                    if (viewer->hasSameWrapAnnotationPreview()) {
+                        viewer->clearSameWrapAnnotationPreview();
+                        clearedPreview = true;
+                    }
                 }
             });
-            event->accept();
-            return;
+            if (clearedPreview) {
+                event->accept();
+                return;
+            }
+
+            bool undone = false;
+            _viewerManager->forEachBaseViewer([&undone](VolumeViewerBase* baseViewer) {
+                if (undone || !baseViewer) {
+                    return;
+                }
+                if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
+                    undone = viewer->undoSameWrapAnnotation();
+                }
+            });
+            if (undone) {
+                event->accept();
+                return;
+            }
         }
     }
 
@@ -2746,8 +2797,8 @@ void CWindow::keyPressEvent(QKeyEvent* event)
 
 void CWindow::keyReleaseEvent(QKeyEvent* event)
 {
-    if (_viewerManager && _point_collection_widget &&
-        _point_collection_widget->sameWrapAnnotationEnabled() &&
+    if (_viewerManager && _wrapAnnotationWidget &&
+        _wrapAnnotationWidget->sameWrapAnnotationEnabled() &&
         event->key() == Qt::Key_Shift) {
         _viewerManager->forEachBaseViewer([event](VolumeViewerBase* baseViewer) {
             if (!baseViewer) {

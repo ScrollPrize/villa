@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -125,10 +126,12 @@ public:
     void setSegmentationCursorMirroring(bool) override {}
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
-    uint64_t highlightedPointId() const override { return 0; }
-    uint64_t selectedPointId() const override { return 0; }
-    uint64_t selectedCollectionId() const override { return 0; }
+    uint64_t highlightedPointId() const override { return _highlightedPointId; }
+    uint64_t selectedPointId() const override { return _selectedPointId; }
+    uint64_t selectedCollectionId() const override { return _selectedCollectionId; }
     bool isPointDragActive() const override { return false; }
+    bool isSameWrapAnnotationModeEnabled() const override { return _sameWrapAnnotation.enabled(); }
+    double sameWrapAnnotationPolylineOpacity() const override { return _sameWrapAnnotationPolylineOpacity; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
 
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) override;
@@ -204,16 +207,20 @@ public slots:
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
-    void onCollectionSelected(uint64_t) {}
-    void onPointSelected(uint64_t) {}
+    void onCollectionSelected(uint64_t collectionId);
+    void onPointSelected(uint64_t pointId);
     void setSameWrapAnnotationMode(bool enabled);
     void setSameWrapAnnotationSpacing(double spacingVx);
+    void setSameWrapAnnotationMergeTolerance(double toleranceVx);
+    void setSameWrapAnnotationPolylineOpacity(double opacity);
     void setSameWrapAnnotationMergeExisting(bool enabled);
     void setSameWrapAnnotationPathType(int pathType);
     void setSameWrapAnnotationFilterType(int filterType);
     void setSameWrapAnnotationFilterKernelSize(int kernelSize);
+    bool hasSameWrapAnnotationPreview() const;
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
+    bool undoSameWrapAnnotation();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
@@ -289,6 +296,7 @@ private:
     void clearLineAnnotationPlacementMarker();
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
+    std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
@@ -480,7 +488,14 @@ private:
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
 
+    uint64_t _highlightedPointId = 0;
+    uint64_t _selectedCollectionId = 0;
+    uint64_t _selectedPointId = 0;
+
     SameWrapAnnotationTool _sameWrapAnnotation;
+    double _sameWrapAnnotationPolylineOpacity = 0.75;
+    bool _sameWrapManualMergePressConsumed = false;
+    bool _sameWrapManualPathDragActive = false;
 
     bool _bboxMode = false;
     QPointF _bboxStart;

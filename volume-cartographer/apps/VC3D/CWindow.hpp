@@ -68,6 +68,7 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
+class WrapAnnotationWidget;
 
 class CWindow : public QMainWindow
 {
@@ -195,6 +196,7 @@ private:
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
     CPointCollectionWidget* _point_collection_widget;
+    WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
     std::unique_ptr<FiberAnnotationController> _fiberController;
 

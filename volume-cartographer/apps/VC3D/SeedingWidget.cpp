@@ -200,11 +200,6 @@ void SeedingWidget::setupUI()
     resetPointsButton->setEnabled(false);
     mainLayout->addWidget(resetPointsButton);
 
-    // Label Wraps mode toggle
-    labelWrapsButton = new QPushButton("Start Label Wraps", this);
-    labelWrapsButton->setToolTip("Enable 'Label Wraps' mode: draw a line to auto-create a new collection with winding labels. Hold Shift for decreasing order.");
-    mainLayout->addWidget(labelWrapsButton);
-
     // Neural Trace from Scratch section
     auto neuralTraceGroup = new QGroupBox("Neural Trace (Python)", this);
     auto neuralLayout = new QVBoxLayout(neuralTraceGroup);
@@ -317,10 +312,9 @@ void SeedingWidget::setupUI()
             currentMode = Mode::PointMode;
             modeButton->setText("Switch to Draw Mode");
             infoLabel->setText("Point Mode: Set a focus point to begin");
-            // Turning off Draw Mode should also disable Label Wraps
+            // Turning off Draw Mode should also disable relative winding annotation.
             if (labelWrapsMode) {
-                labelWrapsMode = false;
-                if (labelWrapsButton) labelWrapsButton->setText("Start Label Wraps");
+                setRelWindingAnnotationMode(false);
             }
         }
         updateModeUI();
@@ -334,10 +328,6 @@ void SeedingWidget::setupUI()
     connect(expandSeedsButton, &QPushButton::clicked, this, &SeedingWidget::onExpandSeedsClicked);
     connect(resetPointsButton, &QPushButton::clicked, this, &SeedingWidget::onResetPointsClicked);
     connect(cancelButton, &QPushButton::clicked, this, &SeedingWidget::onCancelClicked);
-    connect(labelWrapsButton, &QPushButton::clicked, [this]() {
-        setLabelWrapsMode(!labelWrapsMode);
-    });
-
     // Connect neural trace signals
     connect(_btnNeuralTrace, &QPushButton::clicked, this, &SeedingWidget::onNeuralTraceClicked);
     connect(_neuralCheckpointBrowse, &QToolButton::clicked, this, &SeedingWidget::onNeuralCheckpointBrowseClicked);
@@ -1482,7 +1472,7 @@ void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
     currentPath.points.clear();
     displayPaths();
 
-    infoLabel->setText(QString("Label Wraps: added points to '%1' (%2)")
+    infoLabel->setText(QString("Rel winding annotation: added points to '%1' (%2)")
                            .arg(QString::fromStdString(newColName))
                            .arg(shiftHeld ? "decreasing" : "increasing"));
     updateButtonStates();
@@ -1560,20 +1550,23 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
     }
 }
 
-void SeedingWidget::setLabelWrapsMode(bool active)
+void SeedingWidget::setRelWindingAnnotationMode(bool active)
 {
+    if (labelWrapsMode == active) {
+        return;
+    }
+
     labelWrapsMode = active;
     if (labelWrapsMode) {
         currentMode = Mode::DrawMode;
-        infoLabel->setText("Label Wraps: draw a path; release to create a labeled collection. Hold Shift for decreasing order.");
-        labelWrapsButton->setText("Stop Label Wraps");
+        infoLabel->setText("Rel winding annotation: draw a path; release to create a labeled collection. Hold Shift for decreasing order.");
     } else {
         // Revert to default UI language; keep currentMode as-is
         infoLabel->setText("Point Mode: Set a focus point to begin");
-        labelWrapsButton->setText("Start Label Wraps");
     }
     updateModeUI();
     displayPaths();
+    emit relWindingAnnotationModeChanged(labelWrapsMode);
 }
 
 QColor SeedingWidget::generatePathColor()

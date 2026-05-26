@@ -14,6 +14,10 @@ struct GrowthConfig {
     bool grow_right = true;
     bool grow_up = false;
     bool grow_left = false;
+    bool expand_down = false;
+    bool expand_right = true;
+    bool expand_up = false;
+    bool expand_left = false;
     bool disable_grid_expansion = false;
     bool candidate_priority_existing_depth = false;
     bool rollout_growth = false;
