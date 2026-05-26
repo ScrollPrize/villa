@@ -1,0 +1,28 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "nanobind>=2.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "volume-cartographer"
+version = "3.0.3"
+description = "Python bindings for Volume Cartographer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+]
+license = { file = "LICENSE" }
+
+[tool.scikit-build]
+cmake.version = ">=3.22"
+wheel.packages = []
+
+[tool.scikit-build.cmake.define]
+VC_BUILD_PYTHON = "ON"
+VC_BUILD_APPS = "OFF"
+VC_BUILD_UI_TRACER = "OFF"
+VC_BUILD_FLATBOI = "OFF"
+VC_TESTING = "OFF"
