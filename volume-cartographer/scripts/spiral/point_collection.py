@@ -75,19 +75,115 @@ def load_point_collection(filename: str) -> Optional[Dict[int, Dict[str, Any]]]:
         return None
 
 
+def _load_surface_index_backend():
+    try:
+        from vc import surface_index
+        return surface_index
+    except ImportError:
+        pass
+
+    try:
+        import vc_surface_index
+        return vc_surface_index
+    except ImportError:
+        return None
+
+
+def can_use_surface_index_backend(patches: Dict[str, Patch]) -> bool:
+    return _load_surface_index_backend() is not None
+
+
+def _record_point_patch_link(
+    links: Dict[str, List[PointPatchLink]],
+    collection: Dict[str, Any],
+    collection_id: int,
+    point_id: int,
+    point: Dict[str, Any],
+    patch_id: str,
+    distance: float,
+    ij_coords: List[float],
+) -> None:
+    point_zyx = np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float32).tolist()
+    point['on_patch'] = {'id': patch_id, 'distance': float(distance), 'ij': list(ij_coords)}
+    links.setdefault(patch_id, []).append(
+        PointPatchLink(
+            point_id=point_id,
+            collection_id=collection_id,
+            collection_name=collection['name'],
+            point_zyx=point_zyx,
+            ij_coords=list(ij_coords),
+            distance=float(distance),
+            winding_annotation=float(point['winding_annotation']),
+        )
+    )
+
+
+def _process_point_collections_with_surface_index(
+    patches: Dict[str, Patch],
+    point_collections: Dict[int, Dict[str, Any]],
+    tolerance: float,
+    distance_scale: float,
+) -> Optional[Dict[str, List[PointPatchLink]]]:
+    surface_index = _load_surface_index_backend()
+    if surface_index is None:
+        return None
+
+    surface_defs = []
+    for patch_id, patch in patches.items():
+        zyx = patch.zyxs.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
+        scale = patch.scale.detach().cpu().numpy() if hasattr(patch.scale, 'detach') else patch.scale
+        surface_defs.append(surface_index.QuadSurface(patch_id, zyx, float(scale[0]), float(scale[1])))
+
+    links: Dict[str, List[PointPatchLink]] = {}
+    if not surface_defs or not point_collections:
+        return links
+
+    print(f'linking points to patches with vc.surface_index ({len(surface_defs)} patches)')
+    index = surface_index.SurfacePatchIndex()
+    index.rebuild(surface_defs, bbox_padding=tolerance, sampling_stride=1)
+
+    for collection_id, collection in tqdm(point_collections.items(), 'linking points to patches'):
+        for point_id, point in collection['points'].items():
+            point_zyx = np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float32)
+            hit = index.locate_xyz(point_zyx[::-1].copy(), tolerance)
+            if hit is None:
+                continue
+            _record_point_patch_link(
+                links,
+                collection,
+                collection_id,
+                point_id,
+                point,
+                hit['id'],
+                float(hit['distance']) / distance_scale,
+                hit['ij'],
+            )
+
+    return links
+
+
 def _process_point_collections(
     patches: Dict[str, Patch],
     point_collections: Dict[int, Dict[str, Any]],
     tolerance: float = 10.0,
+    surface_index_tolerance: Optional[float] = None,
+    distance_scale: float = 1.0,
 ) -> Dict[str, List[PointPatchLink]]:
     """Process point collections and link them to patches."""
+    if surface_index_tolerance is not None:
+        links = _process_point_collections_with_surface_index(
+            patches, point_collections, surface_index_tolerance, distance_scale
+        )
+        if links is not None:
+            return links
+
     links: Dict[str, List[PointPatchLink]] = {}
     device = torch.device('cpu')
     tolerance_t = torch.tensor(tolerance, device=device, dtype=torch.float32)
 
     for collection_id, collection in tqdm(point_collections.items(), 'linking points to patches'):
         for point_id, point in collection['points'].items():
-            point_zyx = torch.as_tensor(point['p'][::-1], dtype=torch.float32, device=device)
+            point_zyx = torch.as_tensor(point.get('zyx', point['p'][::-1]), dtype=torch.float32, device=device)
 
             nearest_patch_id = None
             nearest_distance = torch.tensor(float('inf'), device=device)
@@ -101,17 +197,15 @@ def _process_point_collections(
                     nearest_ij = ij_coord
 
             if nearest_patch_id:
-                point['on_patch'] = {'id': nearest_patch_id, 'distance': float(nearest_distance.cpu().item()), 'ij': nearest_ij.tolist()}
-                links.setdefault(nearest_patch_id, []).append(
-                    PointPatchLink(
-                        point_id=point_id,
-                        collection_id=collection_id,
-                        collection_name=collection['name'],
-                        point_zyx=point_zyx.cpu().tolist(),
-                        ij_coords=nearest_ij.tolist(),
-                        distance=float(nearest_distance.cpu().item()),
-                        winding_annotation=float(point['winding_annotation']),
-                    )
+                _record_point_patch_link(
+                    links,
+                    collection,
+                    collection_id,
+                    point_id,
+                    point,
+                    nearest_patch_id,
+                    float(nearest_distance.cpu().item()),
+                    nearest_ij.tolist(),
                 )
 
     return links

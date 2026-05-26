@@ -23,7 +23,7 @@ from torchdiffeq import odeint
 
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
-from point_collection import load_point_collection, _process_point_collections, normalise_pcl_winding_annotations
+from point_collection import load_point_collection, _process_point_collections, can_use_surface_index_backend, normalise_pcl_winding_annotations
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
@@ -2772,7 +2772,13 @@ def load_patches(patches_path, segment_id_filter=lambda s: True):
     return patches
 
 
-def process_point_collections_cached(patches, point_collections, tolerance=10.0):
+def process_point_collections_cached(
+    patches,
+    point_collections,
+    tolerance=10.0,
+    surface_index_tolerance=None,
+    distance_scale=1.0,
+):
     patch_ids_str = '_'.join(sorted(patches.keys()))
     hashed_patches = hashlib.sha256(bytes(patch_ids_str, 'ascii')).hexdigest()[:8]
 
@@ -2784,7 +2790,11 @@ def process_point_collections_cached(patches, point_collections, tolerance=10.0)
             pcl_locations.append(tuple(point['p']))
     hashed_pcls = hashlib.sha256(pickle.dumps(pcl_locations)).hexdigest()[:8]
 
-    cache_filename = f'{cache_path}/point_patch_links-{hashed_patches}_{hashed_pcls}_tol-{tolerance}.pkl'
+    backend = 'surface-index' if surface_index_tolerance is not None and can_use_surface_index_backend(patches) else 'torch'
+    cache_filename = (
+        f'{cache_path}/point_patch_links-{hashed_patches}_{hashed_pcls}'
+        f'_backend-{backend}_tol-{tolerance}_idx-tol-{surface_index_tolerance}.pkl'
+    )
 
     if os.path.exists(cache_filename):
         with open(cache_filename, 'rb') as fp:
@@ -2792,7 +2802,13 @@ def process_point_collections_cached(patches, point_collections, tolerance=10.0)
         point_collections.clear()
         point_collections.update(point_collections_cached)
     else:
-        _process_point_collections(patches, point_collections, tolerance)
+        _process_point_collections(
+            patches,
+            point_collections,
+            tolerance,
+            surface_index_tolerance=surface_index_tolerance,
+            distance_scale=distance_scale,
+        )
         os.makedirs(cache_path, exist_ok=True)
         with open(cache_filename, 'wb') as fp:
             pickle.dump(point_collections, fp)
@@ -2828,8 +2844,6 @@ def main():
                     pcl['source_file'] = path
                     target[next_id] = pcl
                     next_id += 1
-
-    process_point_collections_cached(patches, cross_patch_point_collections)
 
     for patch in patches.values():
         patch.scale *= downsample_factor
@@ -2886,6 +2900,14 @@ def main():
     for pid in dropped_cross_patch_pcl_ids:
         del cross_patch_point_collections[pid]
     print(f'dropped {len(dropped_patch_ids)} patches, {len(dropped_cross_patch_pcl_ids)} cross-patch pcls, and {dropped_unattached_pcl_count} unattached pcls outside z-roi [{z_begin}, {z_end})')
+
+    process_point_collections_cached(
+        patches,
+        cross_patch_point_collections,
+        tolerance=10.0 / downsample_factor,
+        surface_index_tolerance=10.0 / downsample_factor,
+        distance_scale=1.0,
+    )
 
     normalise_pcl_winding_annotations(cross_patch_point_collections)
     normalise_pcl_winding_annotations(unattached_point_collections)
