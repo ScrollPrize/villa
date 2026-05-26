@@ -41,6 +41,7 @@ umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.j
 scroll_name = 's1'
 z_begin, z_end = 6000, 16000
 patches_path = '/home/paul/projects/vesuvius-scrolls/spiral/custom_patches'
+shell_path = os.environ.get('FIT_SPIRAL_SHELL_PATH')
 voxel_size_um = 2.4 * 4  # before downsampling
 
 # # PHerc0172
@@ -102,10 +103,23 @@ default_config = {
     'loss_weight_patch_stretch': 40.0,
     'loss_weight_patch_normals': 75.0,
     'loss_weight_umbilicus': 5.,
+    'loss_weight_shell_outer': 0.0,
+    'loss_weight_shell_no_cross': 0.0,
+    'loss_weight_shell_z_drift': 0.0,
     'loss_start_patch_dt': 9000,
     'output_first_winding': 10,
     'output_winding_margin': 4,
     'output_step_size': 20,
+    'shell_outer_winding_idx': 130,
+    'shell_outer_winding_margin': 10,
+    'shell_num_samples': 8192,
+    'shell_num_theta_bins': 720,
+    'shell_near_outer_num_windings': 3,
+    'shell_huber_delta': 4.0,
+    'shell_no_cross_margin': 2.0,
+    'shell_table_smooth_sigma_z': 1.0,
+    'shell_table_smooth_sigma_theta': 1.0,
+    'shell_min_confidence': 0.25,
 }
 
 
@@ -228,6 +242,181 @@ def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3., winding_range=
         return kernel
     result = evaluate_kernel(inner_winding) + evaluate_kernel(outer_winding)
     return result.clip(0., 1.)
+
+
+def shell_losses_enabled():
+    return (
+        cfg['loss_weight_shell_outer'] > 0
+        or cfg['loss_weight_shell_no_cross'] > 0
+        or cfg['loss_weight_shell_z_drift'] > 0
+    )
+
+
+def _huber_abs(residual, delta):
+    abs_residual = residual.abs()
+    return torch.where(
+        abs_residual <= delta,
+        0.5 * residual ** 2 / delta,
+        abs_residual - 0.5 * delta,
+    )
+
+
+def _masked_mean(values, mask):
+    mask_f = mask.to(values.dtype)
+    return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
+
+
+class ShellPolarMap:
+
+    def __init__(self, shell_patch, z_to_umbilicus_yx, z_min, z_max, num_theta_bins, device):
+        self.z_min = int(z_min)
+        self.z_max = int(z_max)
+        self.num_theta_bins = int(num_theta_bins)
+        self.device = device
+
+        shell_zyxs = shell_patch.valid_zyxs.cpu().numpy().astype(np.float32, copy=False)
+        in_z = (shell_zyxs[:, 0] >= self.z_min) & (shell_zyxs[:, 0] <= self.z_max)
+        shell_zyxs = shell_zyxs[in_z]
+        if len(shell_zyxs) == 0:
+            raise RuntimeError(f'shell has no valid points in z range [{self.z_min}, {self.z_max}]')
+
+        centres_yx = z_to_umbilicus_yx(shell_zyxs[:, 0]).astype(np.float32)
+        rel_yx = shell_zyxs[:, 1:] - centres_yx
+        theta = np.mod(np.arctan2(rel_yx[:, 0], rel_yx[:, 1]), 2 * np.pi)
+        radius = np.linalg.norm(rel_yx, axis=-1)
+
+        num_z = self.z_max - self.z_min + 1
+        z_idx = np.rint(shell_zyxs[:, 0] - self.z_min).astype(np.int64).clip(0, num_z - 1)
+        theta_idx = np.floor(theta / (2 * np.pi) * self.num_theta_bins).astype(np.int64) % self.num_theta_bins
+
+        radius_sum = np.zeros([num_z, self.num_theta_bins], dtype=np.float64)
+        counts = np.zeros([num_z, self.num_theta_bins], dtype=np.float64)
+        np.add.at(radius_sum, (z_idx, theta_idx), radius)
+        np.add.at(counts, (z_idx, theta_idx), 1.0)
+        valid = counts > 0
+        if not valid.any():
+            raise RuntimeError('shell polar table has no occupied bins')
+
+        radius_mean = np.zeros_like(radius_sum, dtype=np.float32)
+        radius_mean[valid] = (radius_sum[valid] / counts[valid]).astype(np.float32)
+
+        valid_ext = np.concatenate([valid, valid, valid], axis=1)
+        radius_ext = np.concatenate([radius_mean, radius_mean, radius_mean], axis=1)
+        nearest_indices = scipy.ndimage.distance_transform_edt(~valid_ext, return_distances=False, return_indices=True)
+        filled_ext = radius_ext[nearest_indices[0], nearest_indices[1]]
+        filled = filled_ext[:, self.num_theta_bins:2 * self.num_theta_bins]
+
+        sigma = (cfg['shell_table_smooth_sigma_z'], cfg['shell_table_smooth_sigma_theta'])
+        if sigma[0] > 0 or sigma[1] > 0:
+            smooth_ext = np.concatenate([filled, filled, filled], axis=1)
+            smooth_ext = scipy.ndimage.gaussian_filter(smooth_ext, sigma=sigma, mode=('nearest', 'wrap'))
+            filled = smooth_ext[:, self.num_theta_bins:2 * self.num_theta_bins]
+
+        confidence = scipy.ndimage.gaussian_filter(valid.astype(np.float32), sigma=sigma, mode=('nearest', 'wrap'))
+        if confidence.max() > 0:
+            confidence = confidence / confidence.max()
+
+        radius_with_wrap = np.concatenate([filled, filled[:, :1]], axis=1).astype(np.float32)
+        confidence_with_wrap = np.concatenate([confidence, confidence[:, :1]], axis=1).astype(np.float32)
+
+        self.lookup_table = torch.from_numpy(
+            np.stack([radius_with_wrap, confidence_with_wrap], axis=0)
+        ).to(device=device)
+
+        z_coords = np.arange(self.z_min, self.z_max + 1, dtype=np.float32)
+        self.umbilicus_zyx = torch.from_numpy(
+            np.concatenate([z_coords[:, None], z_to_umbilicus_yx(z_coords).astype(np.float32)], axis=-1)
+        ).to(device=device)
+
+        occupied = int(valid.sum())
+        total = int(valid.size)
+        print(
+            f'shell polar table: {num_z} z bins x {self.num_theta_bins} theta bins, '
+            f'{occupied}/{total} occupied ({occupied / max(total, 1) * 100:.1f}%)'
+        )
+
+    def lookup(self, scan_zyx):
+        centre_yx = interp1d(scan_zyx[..., 0].contiguous(), self.umbilicus_zyx[:, :1], self.umbilicus_zyx[:, 1:])
+        rel_yx = scan_zyx[..., 1:] - centre_yx
+        theta, rel_yx = get_theta(rel_yx)
+        radius = torch.linalg.norm(rel_yx, dim=-1)
+
+        z_normalised = (scan_zyx[..., 0] - self.z_min) / (self.z_max - self.z_min) * 2 - 1
+        theta_normalised = theta / (2 * torch.pi) * 2 - 1
+        grid = torch.stack([theta_normalised, z_normalised], dim=-1).view(1, -1, 1, 2)
+        sampled = F.grid_sample(
+            self.lookup_table[None],
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        ).view(2, -1)
+        target_radius = sampled[0].view(scan_zyx.shape[:-1])
+        confidence = sampled[1].view(scan_zyx.shape[:-1])
+        in_z = (scan_zyx[..., 0] >= self.z_min) & (scan_zyx[..., 0] <= self.z_max)
+        valid = in_z & (confidence >= cfg['shell_min_confidence'])
+        return target_radius, radius, confidence, valid
+
+
+def _canonical_winding_samples(winding_indices, num_samples, dr_per_winding, device):
+    winding_indices_t = torch.as_tensor(winding_indices, device=device, dtype=torch.float32)
+    theta = torch.rand([len(winding_indices), num_samples], device=device) * (2 * torch.pi)
+    z = torch.empty([len(winding_indices), num_samples], device=device).uniform_(float(z_begin), float(z_end - 1))
+    radius = (winding_indices_t[:, None] + theta / (2 * torch.pi)) * dr_per_winding
+    return torch.stack([
+        z,
+        torch.sin(theta) * radius,
+        torch.cos(theta) * radius,
+    ], dim=-1)
+
+
+def get_shell_losses(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx):
+    device = dr_per_winding.device
+    zero = torch.zeros([], device=device)
+    if shell_map is None or outer_winding_idx is None:
+        return zero, zero, zero, {}
+
+    num_samples = max(1, int(cfg['shell_num_samples']))
+    huber_delta = torch.as_tensor(cfg['shell_huber_delta'], device=device, dtype=torch.float32)
+
+    outer_spiral = _canonical_winding_samples([outer_winding_idx], num_samples, dr_per_winding, device)[0]
+    near_count = max(1, int(cfg['shell_near_outer_num_windings']))
+    first_w = max(0, int(outer_winding_idx) - near_count + 1)
+    winding_indices = list(range(first_w, int(outer_winding_idx) + 1))
+    barrier_spiral = _canonical_winding_samples(winding_indices, max(1, num_samples // len(winding_indices)), dr_per_winding, device)
+
+    outer_count = outer_spiral.shape[0]
+    combined_scan = slice_to_spiral_transform.inv(torch.cat([
+        outer_spiral,
+        barrier_spiral.reshape(-1, 3),
+    ], dim=0))
+    outer_scan = combined_scan[:outer_count]
+    barrier_scan = combined_scan[outer_count:].reshape(*barrier_spiral.shape)
+
+    target_r, scan_r, confidence, valid = shell_map.lookup(outer_scan)
+    residual = scan_r - target_r
+    shell_outer_loss = _masked_mean(_huber_abs(residual, huber_delta), valid)
+    shell_z_drift_loss = _masked_mean(_huber_abs(outer_scan[..., 0] - outer_spiral[..., 0], huber_delta), valid)
+
+    barrier_target_r, barrier_scan_r, _, barrier_valid = shell_map.lookup(barrier_scan)
+    violation = F.relu(barrier_scan_r - barrier_target_r - cfg['shell_no_cross_margin'])
+    shell_no_cross_loss = _masked_mean(_huber_abs(violation, huber_delta), barrier_valid)
+
+    metrics = {}
+    with torch.no_grad():
+        if valid.any():
+            abs_residual = residual[valid].abs()
+            metrics = {
+                'shell_outer_error_mean': abs_residual.mean(),
+                'shell_outer_error_p95': torch.quantile(abs_residual, 0.95),
+                'shell_z_drift_mean': (outer_scan[..., 0] - outer_spiral[..., 0]).abs()[valid].mean(),
+                'shell_confidence_mean': confidence[valid].mean(),
+            }
+        if barrier_valid.any():
+            metrics['shell_no_cross_violation_p95'] = torch.quantile(violation[barrier_valid], 0.95)
+            metrics['shell_no_cross_violation_fraction'] = (violation[barrier_valid] > 0).to(torch.float32).mean()
+
+    return shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, metrics
 
 
 class CartesianFlowField(nn.Module):
@@ -1953,6 +2142,23 @@ def _compute_winding_range_and_input_extents(slice_to_spiral_transform, dr_per_w
     return output_winding_range, patch_extents, pcl_extents
 
 
+def _infer_shell_outer_winding_idx(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips):
+    _, patch_extents, pcl_extents = _compute_winding_range_and_input_extents(
+        slice_to_spiral_transform,
+        dr_per_winding,
+        patches,
+        unattached_pcl_strips,
+    )
+    observed_max = None
+    for _, max_w in itertools.chain(patch_extents, pcl_extents):
+        if max_w is None:
+            continue
+        observed_max = max_w if observed_max is None else max(observed_max, max_w)
+    if observed_max is None:
+        observed_max = cfg['output_first_winding']
+    return int(observed_max + cfg['shell_outer_winding_margin'])
+
+
 def _warn_if_inputs_exceed_flow_bounds(patch_ids, patch_extents, unattached_pcl_strips, pcl_extents, flow_field_radius):
     gap_expander_num_windings = cfg['gap_expander_num_windings']
 
@@ -2485,7 +2691,7 @@ def save_overlay(
         visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, z_to_umbilicus_yx, out_path):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, shell_patch, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
@@ -2533,6 +2739,39 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
     spiral_and_transform = SpiralAndTransform(flow_integration_steps=cfg['num_flow_integration_steps'], flow_integration_solver=cfg['flow_integration_solver'], umbilicus_zyx=umbilicus_zyx, flow_min_corner_zyx=flow_min_corner_spiral_zyx, flow_max_corner_zyx=flow_max_corner_spiral_zyx)
     spiral_and_transform.to(device)
+
+    shell_map = None
+    shell_outer_winding_idx = None
+    if shell_patch is not None and shell_losses_enabled():
+        shell_map = ShellPolarMap(
+            shell_patch,
+            z_to_umbilicus_yx,
+            z_min=z_begin - cfg['flow_bounds_z_margin'],
+            z_max=z_end + cfg['flow_bounds_z_margin'],
+            num_theta_bins=cfg['shell_num_theta_bins'],
+            device=device,
+        )
+        initial_transform = spiral_and_transform.get_slice_to_spiral_transform()
+        initial_dr = spiral_and_transform.get_dr_per_winding()
+        if cfg['shell_outer_winding_idx'] is None:
+            shell_outer_winding_idx = _infer_shell_outer_winding_idx(
+                initial_transform,
+                initial_dr,
+                patches_list,
+                unattached_pcl_strips,
+            )
+            print(f'inferred shell_outer_winding_idx = {shell_outer_winding_idx}')
+        else:
+            shell_outer_winding_idx = int(cfg['shell_outer_winding_idx'])
+            print(f'using configured shell_outer_winding_idx = {shell_outer_winding_idx}')
+        min_gap_expander_num_windings = shell_outer_winding_idx + 3
+        if cfg['gap_expander_num_windings'] < min_gap_expander_num_windings:
+            print(
+                f'WARNING: shell_outer_winding_idx {shell_outer_winding_idx} requires '
+                f'gap_expander_num_windings >= {min_gap_expander_num_windings}, got '
+                f'gap_expander_num_windings {cfg["gap_expander_num_windings"]}; '
+                'increase gap_expander_num_windings or lower shell_outer_winding_idx'
+            )
 
     optimiser = torch.optim.Adam(spiral_and_transform.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
     if cfg['exp_lr_schedule']:
@@ -2717,6 +2956,18 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
 
+        shell_metrics = {}
+        if shell_map is not None:
+            shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, shell_metrics = get_shell_losses(
+                shell_map,
+                slice_to_spiral_transform,
+                dr_per_winding,
+                shell_outer_winding_idx,
+            )
+            losses['shell_outer'] = shell_outer_loss * cfg['loss_weight_shell_outer']
+            losses['shell_no_cross'] = shell_no_cross_loss * cfg['loss_weight_shell_no_cross']
+            losses['shell_z_drift'] = shell_z_drift_loss * cfg['loss_weight_shell_z_drift']
+
         losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
 
         loss = sum(losses.values())
@@ -2738,6 +2989,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             wandb.log({
                 'total_loss': loss.item(),
                 **{name + '_loss': value for name, value in losses.items()},
+                **shell_metrics,
             })
 
     suffix = 'fitted'
@@ -2828,6 +3080,10 @@ def main():
         scroll_zarr_array = None
 
     patches = load_patches(patches_path)
+    should_use_shell = shell_losses_enabled()
+    if should_use_shell and not shell_path:
+        raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
+    shell_patch = load_tifxyz(shell_path) if should_use_shell else None
 
     cross_patch_point_collections = {}
     unattached_point_collections = {}
@@ -2850,6 +3106,12 @@ def main():
         patch.zyxs /= downsample_factor
         patch.valid_zyxs /= downsample_factor
         patch.area /= downsample_factor ** 2
+    if shell_patch is not None:
+        shell_patch.scale *= downsample_factor
+        shell_patch.zyxs /= downsample_factor
+        shell_patch.valid_zyxs /= downsample_factor
+        shell_patch.area /= downsample_factor ** 2
+        print(f'loaded shell from {shell_path}: {shell_patch.valid_zyxs.shape[0]} valid points')
     for pcl_dict in (cross_patch_point_collections, unattached_point_collections):
         for pcl in pcl_dict.values():
             for point in pcl['points'].values():
@@ -2945,6 +3207,7 @@ def main():
         patches,
         list(cross_patch_point_collections.values()),
         unattached_pcl_strips,
+        shell_patch,
         umbilicus,
         out_path,
     )
