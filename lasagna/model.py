@@ -245,7 +245,7 @@ class FitResult3D:
 	params: ModelParams3D
 	gt_normal_lr: torch.Tensor | None = None  # (D, Hm, Wm, 3) GT unit normals at LR mesh positions
 	ext_conn: list | None = None
-	ext_surfaces: list | None = None  # per surface: (xyz, corner_valid, normals, quad_valid), detached
+	ext_surfaces: list | None = None  # per surface: (xyz, corner_valid, normals, quad_valid, offset), detached
 	cyl_xyz: torch.Tensor | None = None      # (N*D, Hm, Wm, 3) analytic cylinder samples
 	cyl_normals: torch.Tensor | None = None  # (N*D, Hm, Wm, 3) analytic cylinder normals
 	cyl_centers: torch.Tensor | None = None  # (N, 3) cylinder axis anchor [cx, cy, zc]
@@ -3763,6 +3763,7 @@ class Model3D(nn.Module):
 				corner_valid.detach(),
 				ext_norms.detach(),
 				quad_valid.detach(),
+				float(self._ext_offsets[i]),
 			))
 		return out
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import contextlib
+import io
 import tempfile
 import unittest
 
@@ -73,6 +75,20 @@ class SnapSurfLegacyTest(unittest.TestCase):
 		self.assertTrue(torch.allclose(state.model_to_ext.map[0, 0, 0], torch.tensor([0.0, 0.0])))
 		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sdist"], 0.0, places=6)
 		self.assertAlmostEqual(opt_loss_snap_surf.last_stats()["snaps_sext"], 0.0, places=6)
+
+	def test_first_loss_call_logs_configured_offset_and_current_interpretation(self) -> None:
+		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
+		buf = io.StringIO()
+
+		with contextlib.redirect_stdout(buf):
+			opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz, offset=1.5))
+			opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz, offset=1.5))
+
+		out = buf.getvalue()
+		self.assertEqual(out.count("external surface offsets at first loss call"), 1)
+		self.assertIn("configured=[1.5]", out)
+		self.assertIn("used_by_snap_surf=not_applied", out)
 
 	def test_seed_initialization_detects_flipped_quad_orientation(self) -> None:
 		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)

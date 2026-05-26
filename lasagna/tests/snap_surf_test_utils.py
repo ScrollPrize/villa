@@ -39,6 +39,7 @@ def _result(
 	*,
 	normals: torch.Tensor | None = None,
 	ext_normals: torch.Tensor | None = None,
+	offset: float = 0.0,
 ) -> fit_model.FitResult3D:
 	d, h, w, _ = xyz_lr.shape
 	eh, ew, _ = ext_xyz.shape
@@ -81,5 +82,5 @@ def _result(
 		),
 		gt_normal_lr=None,
 		ext_conn=None,
-		ext_surfaces=[(ext_xyz.detach(), ext_valid, ext_normals.detach(), ext_quad_valid)],
+		ext_surfaces=[(ext_xyz.detach(), ext_valid, ext_normals.detach(), ext_quad_valid, float(offset))],
 	)

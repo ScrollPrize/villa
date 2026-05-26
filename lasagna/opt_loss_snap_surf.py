@@ -25,7 +25,10 @@ _MODULES: tuple[ModuleType, ...] = (
 	_debug_obj,
 	_map_fixture_io,
 )
-_RUNTIME_NAMES = {"_cfg", "_active", "_seed_xyz", "_states", "_last_stats", "_debug_step", "_debug_label", "_stage_label"}
+_RUNTIME_NAMES = {
+	"_cfg", "_active", "_seed_xyz", "_states", "_last_stats", "_offset_debug_printed",
+	"_debug_step", "_debug_label", "_stage_label",
+}
 
 for _module in _MODULES:
 	for _name, _value in vars(_module).items():
