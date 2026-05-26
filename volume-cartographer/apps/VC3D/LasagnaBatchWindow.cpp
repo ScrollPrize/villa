@@ -8,9 +8,11 @@
 #include <QItemSelectionModel>
 #include <QJsonObject>
 #include <QAbstractItemView>
+#include <QLabel>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QSplitter>
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStringList>
@@ -65,6 +67,7 @@ QString outputNameText(const QJsonObject& job)
     const QString outputDir = job[QStringLiteral("output_dir")].toString().trimmed();
     return outputDir.isEmpty() ? QString() : QFileInfo(outputDir).fileName();
 }
+
 }
 
 LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
@@ -84,7 +87,11 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
         tr("Submitted"),
     });
 
-    _table = new QTableView(this);
+    auto* tableSplitter = new QSplitter(Qt::Vertical, this);
+    tableSplitter->setChildrenCollapsible(false);
+    layout->addWidget(tableSplitter, 1);
+
+    _table = new QTableView(tableSplitter);
     _table->setModel(_model);
     _table->setSelectionBehavior(QAbstractItemView::SelectRows);
     _table->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -92,9 +99,30 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
     _table->horizontalHeader()->setStretchLastSection(true);
     _table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     _table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
-    layout->addWidget(_table, 1);
+    tableSplitter->addWidget(_table);
+
+    auto* linkedSurfaceWidget = new QWidget(tableSplitter);
+    auto* linkedSurfaceLayout = new QVBoxLayout(linkedSurfaceWidget);
+    linkedSurfaceLayout->setContentsMargins(0, 0, 0, 0);
+    linkedSurfaceLayout->setSpacing(4);
+    linkedSurfaceLayout->addWidget(new QLabel(tr("Linked Surfaces"), linkedSurfaceWidget));
+    _linkedSurfaceModel = new QStandardItemModel(this);
+    _linkedSurfaceModel->setHorizontalHeaderLabels({tr("Name")});
+    _linkedSurfaceTable = new QTableView(linkedSurfaceWidget);
+    _linkedSurfaceTable->setModel(_linkedSurfaceModel);
+    _linkedSurfaceTable->setSelectionMode(QAbstractItemView::NoSelection);
+    _linkedSurfaceTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _linkedSurfaceTable->horizontalHeader()->setStretchLastSection(true);
+    _linkedSurfaceTable->verticalHeader()->setVisible(false);
+    linkedSurfaceLayout->addWidget(_linkedSurfaceTable, 1);
+    tableSplitter->addWidget(linkedSurfaceWidget);
+    tableSplitter->setStretchFactor(0, 3);
+    tableSplitter->setStretchFactor(1, 1);
+    tableSplitter->setSizes({420, 140});
     connect(_table->selectionModel(), &QItemSelectionModel::selectionChanged,
-            this, [this]() { updateActionState(); });
+            this, [this]() {
+        updateActionState();
+    });
     connect(_table, &QTableView::doubleClicked, this, [this](const QModelIndex& index) {
         if (!index.isValid()) {
             return;
@@ -176,6 +204,17 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
 void LasagnaBatchWindow::setJobs(const QJsonArray& jobs)
 {
     applyJobs(jobs);
+}
+
+void LasagnaBatchWindow::setLinkedSurfaceNames(const QStringList& names)
+{
+    if (!_linkedSurfaceModel) {
+        return;
+    }
+    _linkedSurfaceModel->removeRows(0, _linkedSurfaceModel->rowCount());
+    for (const QString& name : names) {
+        _linkedSurfaceModel->appendRow(new QStandardItem(name));
+    }
 }
 
 void LasagnaBatchWindow::applyJobs(const QJsonArray& jobs, const QString& preferredSelection)

@@ -2018,6 +2018,7 @@ void CWindow::CreateWidgets(void)
     // Create Lasagna dock from the panel already constructed by SegmentationWidget
     {
         auto* panel = _segmentationWidget->lasagnaPanel();
+        panel->setState(_state);
         panel->setVisible(true);
         _lasagnaWorkspaceWindow->setCentralWidget(panel);
 

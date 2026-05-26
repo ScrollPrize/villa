@@ -319,7 +319,8 @@ int main(int argc, char** argv)
     writeFile(segDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
     writeFile(segDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
     writeFile(segDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
-    writeFile(segDir + QStringLiteral("/meta.json"), QByteArrayLiteral("{}"));
+    writeFile(segDir + QStringLiteral("/meta.json"),
+              QByteArrayLiteral(R"({"lasagna_job":{"linked_surfaces":[{"type":"tifxyz_segment","name":"reference_surface.tifxyz","hash":"md5:11111111111111111111111111111111"}]}})"));
     writeFile(segDir + QStringLiteral("/approval.tif"), QByteArrayLiteral("a"));
     writeFile(segDir + QStringLiteral("/d.tif"), QByteArrayLiteral("d"));
     writeFile(segDir + QStringLiteral("/model.pt"), QByteArrayLiteral("model"));
@@ -333,6 +334,10 @@ int main(int argc, char** argv)
 
     CState state(0);
     state.setSurface("segmentation", surface, true);
+    panel._lastLasagnaMode = SegmentationLasagnaPanel::LasagnaMode::NewModel;
+    panel.setState(&state);
+    require(panel.currentLinkedSurfaceNames().contains(QStringLiteral("reference_surface.tifxyz")),
+            "Linked surface preview should load names from the selected segment meta.json");
     panel.startOptimizationAtSeed(
         &state,
         &statusBar,

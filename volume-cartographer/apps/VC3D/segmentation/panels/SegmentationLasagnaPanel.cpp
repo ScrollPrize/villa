@@ -10,6 +10,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+#include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCryptographicHash>
@@ -22,6 +23,7 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -35,8 +37,11 @@
 #include <QSplitter>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStandardItem>
+#include <QStandardItemModel>
 #include <QStatusBar>
 #include <QStringList>
+#include <QTableView>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -160,7 +165,66 @@ QJsonArray linkedSurfacesFromMeta(const std::filesystem::path& segPath)
     }
     const QJsonObject meta = QJsonDocument::fromJson(metaFile.readAll()).object();
     const QJsonObject job = meta[QStringLiteral("lasagna_job")].toObject();
-    return job[QStringLiteral("linked_surfaces")].toArray();
+    QJsonArray links = job[QStringLiteral("linked_surfaces")].toArray();
+    if (!links.isEmpty()) {
+        return links;
+    }
+    links = meta[QStringLiteral("job_spec")].toObject()[QStringLiteral("linked_surfaces")].toArray();
+    if (!links.isEmpty()) {
+        return links;
+    }
+    return meta[QStringLiteral("linked_surfaces")].toArray();
+}
+
+QStringList linkedSurfaceNamesFromRefs(const QJsonArray& refs)
+{
+    QStringList names;
+    for (const QJsonValue& value : refs) {
+        const QString name = value.toObject()[QStringLiteral("name")].toString().trimmed();
+        if (!name.isEmpty()) {
+            names.append(name);
+        }
+    }
+    return names;
+}
+
+QStringList linkedSurfaceNamesFromJobSpec(const QJsonObject& jobSpec)
+{
+    return linkedSurfaceNamesFromRefs(jobSpec[QStringLiteral("linked_surfaces")].toArray());
+}
+
+std::filesystem::path outputSegmentsPathForState(CState* state)
+{
+    if (!state || !state->vpkg()) {
+        return {};
+    }
+    std::filesystem::path path = state->vpkg()->outputSegmentsPath();
+    if (path.empty()) {
+        path = state->vpkg()->findSegmentPathByName(
+            state->vpkg()->getSegmentationDirectory());
+    }
+    if (path.empty()) {
+        const auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
+        path = vpkgRoot / "paths";
+    }
+    return std::filesystem::absolute(path).lexically_normal();
+}
+
+std::filesystem::path selectedSegmentPathForState(CState* state)
+{
+    const std::filesystem::path outputSegmentsPath = outputSegmentsPathForState(state);
+    if (!state) {
+        return {};
+    }
+    auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
+    if (!activeSurface || activeSurface->path.empty()) {
+        return {};
+    }
+    std::filesystem::path segPath = activeSurface->path;
+    if (segPath.is_relative() && !outputSegmentsPath.empty()) {
+        segPath = outputSegmentsPath / segPath.filename();
+    }
+    return segPath;
 }
 }  // namespace
 
@@ -484,6 +548,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     _batchWindow->setMinimumHeight(180);
     _batchWindow->setMinimumWidth(280);
     splitter->addWidget(_batchWindow);
+    updateLinkedSurfaceTables();
     connect(_batchWindow, &LasagnaBatchWindow::finishedOutputActivated,
             this, &SegmentationLasagnaPanel::lasagnaOutputActivated);
     splitter->setStretchFactor(0, 1);
@@ -896,6 +961,31 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 #endif
 }
 
+void SegmentationLasagnaPanel::setState(CState* state)
+{
+    if (_state == state) {
+        updateLinkedSurfaceTables();
+        return;
+    }
+    if (_stateSurfaceChangedConnection) {
+        QObject::disconnect(_stateSurfaceChangedConnection);
+        _stateSurfaceChangedConnection = {};
+    }
+    _state = state;
+    if (_state) {
+        _stateSurfaceChangedConnection = connect(
+            _state,
+            &CState::surfaceChanged,
+            this,
+            [this](const std::string& name, std::shared_ptr<Surface>, bool) {
+                if (name == "segmentation") {
+                    updateLinkedSurfaceTables();
+                }
+            });
+    }
+    updateLinkedSurfaceTables();
+}
+
 QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
 {
     if (_compactView) {
@@ -928,6 +1018,19 @@ QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
     addConfigRow(tr("Re-opt:"), _compactReoptConfigCombo);
     _compactReoptBtn = new QPushButton(tr("Re-optimize"), _compactView);
     layout->addWidget(_compactReoptBtn);
+
+    layout->addWidget(new QLabel(tr("Linked Surfaces"), _compactView));
+    _compactLinkedSurfaceModel = new QStandardItemModel(_compactView);
+    _compactLinkedSurfaceModel->setHorizontalHeaderLabels({tr("Name")});
+    _compactLinkedSurfaceTable = new QTableView(_compactView);
+    _compactLinkedSurfaceTable->setModel(_compactLinkedSurfaceModel);
+    _compactLinkedSurfaceTable->setSelectionMode(QAbstractItemView::NoSelection);
+    _compactLinkedSurfaceTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _compactLinkedSurfaceTable->horizontalHeader()->setStretchLastSection(true);
+    _compactLinkedSurfaceTable->verticalHeader()->setVisible(false);
+    _compactLinkedSurfaceTable->setMinimumHeight(80);
+    _compactLinkedSurfaceTable->setMaximumHeight(140);
+    layout->addWidget(_compactLinkedSurfaceTable);
 
     auto* stopRow = new QHBoxLayout();
     _compactStopBtn = new QPushButton(tr("Stop"), _compactView);
@@ -984,6 +1087,7 @@ QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
 
     syncCompactConfigCombos();
     syncCompactStatusFromFull();
+    updateLinkedSurfaceTables();
     return _compactView;
 }
 
@@ -1033,6 +1137,42 @@ void SegmentationLasagnaPanel::syncCompactStatusFromFull()
         _compactProgressLabel->setStyleSheet(_progressLabel->styleSheet());
         _compactProgressLabel->setVisible(!_progressLabel->isHidden());
     }
+}
+
+void SegmentationLasagnaPanel::updateCompactLinkedSurfaceTable(const QStringList& names)
+{
+    if (!_compactLinkedSurfaceModel) {
+        return;
+    }
+    _compactLinkedSurfaceModel->removeRows(0, _compactLinkedSurfaceModel->rowCount());
+    for (const QString& name : names) {
+        _compactLinkedSurfaceModel->appendRow(new QStandardItem(name));
+    }
+}
+
+void SegmentationLasagnaPanel::updateLinkedSurfaceTables()
+{
+    const QStringList names = currentLinkedSurfaceNames();
+    updateCompactLinkedSurfaceTable(names);
+    if (_batchWindow) {
+        _batchWindow->setLinkedSurfaceNames(names);
+    }
+}
+
+QStringList SegmentationLasagnaPanel::currentLinkedSurfaceNames() const
+{
+    const std::filesystem::path segPath = selectedSegmentPathForState(_state);
+    if (segPath.empty()) {
+        return {};
+    }
+
+    const QStringList storedNames = linkedSurfaceNamesFromRefs(linkedSurfacesFromMeta(segPath));
+    const bool selectedLasagnaModel = std::filesystem::exists(segPath / "model.pt");
+    if (selectedLasagnaModel || !storedNames.isEmpty()) {
+        return storedNames;
+    }
+
+    return {QString::fromStdString(segPath.filename().string())};
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,6 +1237,7 @@ void SegmentationLasagnaPanel::launchLasagnaMode(LasagnaMode mode)
 {
     _lastLasagnaMode = mode;
     _lasagnaMode = static_cast<int>(mode);
+    updateLinkedSurfaceTables();
     triggerOptimization();
 }
 
@@ -1609,7 +1750,8 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         if (launchMode == LasagnaMode::ReOptimize) {
             linkedSurfaces = linkedSurfacesFromMeta(segPath);
         }
-        if (linkedSurfaces.isEmpty()) {
+        const bool selectedLasagnaModel = std::filesystem::exists(segPath / "model.pt");
+        if (linkedSurfaces.isEmpty() && !selectedLasagnaModel) {
             linkedSurfaces.append(currentSegmentUpload[QStringLiteral("object")].toObject());
             appendUploadIfNew(currentSegmentUpload);
         } else if (!outputSegmentsPath.empty()) {
@@ -1653,6 +1795,11 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     jobSpec[QStringLiteral("linked_surfaces")] = linkedSurfaces;
     request[QStringLiteral("job_spec")] = jobSpec;
     request[QStringLiteral("_objects")] = objectUploads;
+    const QStringList linkedSurfaceNames = linkedSurfaceNamesFromJobSpec(jobSpec);
+    updateCompactLinkedSurfaceTable(linkedSurfaceNames);
+    if (_batchWindow) {
+        _batchWindow->setLinkedSurfaceNames(linkedSurfaceNames);
+    }
 
     std::cerr << "[lasagna] request prep:"
               << " mode=" << lasagnaModeDebugName(static_cast<int>(launchMode)).toStdString()
@@ -1832,6 +1979,7 @@ void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimiz
     if (_offsetBtn) _offsetBtn->setEnabled(!optimizing);
     if (_stopBtn) _stopBtn->setEnabled(optimizing);
     syncCompactStatusFromFull();
+    updateLinkedSurfaceTables();
 }
 
 // ---------------------------------------------------------------------------
