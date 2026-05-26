@@ -192,6 +192,14 @@ if(NOT _san AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_link_options(${_lto})
 endif()
 
+# ---- PIC for python bindings -----------------------------------------------------
+# Python bindings link the static libs (vc_core, utils, ...) into .so modules,
+# which requires every translation unit to be -fPIC (otherwise thread_local
+# statics emit local-exec TPOFF32 relocations that ld rejects).
+if(VC_BUILD_PYTHON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # ---- Warnings ---------------------------------------------------------------
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_compile_options(-Wno-unknown-warning-option)
