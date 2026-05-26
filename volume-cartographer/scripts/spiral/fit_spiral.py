@@ -3399,6 +3399,40 @@ def prepare_point_collections(patches):
     return cross_patch_point_collections, unattached_pcl_strips
 
 
+def prepare_patches():
+
+    def scale_patch(patch):
+        patch.scale *= downsample_factor
+        patch.zyxs /= downsample_factor
+        patch.valid_zyxs /= downsample_factor
+        patch.area /= downsample_factor ** 2
+
+    patches = load_patches(patches_path)
+    for patch in patches.values():
+        scale_patch(patch)
+
+    def patch_intersects_z_roi(patch):
+        zs = patch.valid_zyxs[..., 0]
+        if zs.numel() == 0:
+            return False
+        return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+
+    dropped_patch_ids = [pid for pid, patch in patches.items() if not patch_intersects_z_roi(patch)]
+    for pid in dropped_patch_ids:
+        del patches[pid]
+    print(f'dropped {len(dropped_patch_ids)} patches outside z-roi [{z_begin}, {z_end})')
+
+    shell_patch = None
+    if shell_losses_enabled():
+        if not shell_path:
+            raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
+        shell_patch = load_tifxyz(shell_path)
+        scale_patch(shell_patch)
+        print(f'loaded shell from {shell_path}: {shell_patch.valid_zyxs.shape[0]} valid points')
+
+    return patches, shell_patch
+
+
 def main():
 
     np.random.seed(cfg['random_seed'])
@@ -3412,37 +3446,8 @@ def main():
     else:
         scroll_zarr_array = None
 
-    patches = load_patches(patches_path)
-    should_use_shell = shell_losses_enabled()
-    if should_use_shell and not shell_path:
-        raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
-    shell_patch = load_tifxyz(shell_path) if should_use_shell else None
-
-    for patch in patches.values():
-        patch.scale *= downsample_factor
-        patch.zyxs /= downsample_factor
-        patch.valid_zyxs /= downsample_factor
-        patch.area /= downsample_factor ** 2
-    if shell_patch is not None:
-        shell_patch.scale *= downsample_factor
-        shell_patch.zyxs /= downsample_factor
-        shell_patch.valid_zyxs /= downsample_factor
-        shell_patch.area /= downsample_factor ** 2
-        print(f'loaded shell from {shell_path}: {shell_patch.valid_zyxs.shape[0]} valid points')
-
-    def patch_intersects_z_roi(patch):
-        zs = patch.valid_zyxs[..., 0]
-        if zs.numel() == 0:
-            return False
-        return bool(((zs >= z_begin) & (zs < z_end)).any().item())
-
-    dropped_patch_ids = [pid for pid, patch in patches.items() if not patch_intersects_z_roi(patch)]
-    for pid in dropped_patch_ids:
-        del patches[pid]
-    print(f'dropped {len(dropped_patch_ids)} patches outside z-roi [{z_begin}, {z_end})')
-
+    patches, shell_patch = prepare_patches()
     cross_patch_point_collections, unattached_pcl_strips = prepare_point_collections(patches)
-
     pcl_normal_samples = prepare_pcl_normal_samples(
         list(cross_patch_point_collections.values()),
         unattached_pcl_strips,
