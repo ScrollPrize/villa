@@ -1,5 +1,6 @@
 
 import os
+import copy
 import json
 import glob
 import zarr
@@ -33,11 +34,9 @@ scroll_zarr_path = None
 normal_nx_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NX_ZARR_PATH')
 normal_ny_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NY_ZARR_PATH')
 normal_zarr_group = os.environ.get('FIT_SPIRAL_NORMAL_ZARR_GROUP', '4')
-cross_patch_pcl_json_paths = ['/home/paul/projects/vesuvius-scrolls/spiral/windings_8205.json']
-unattached_pcl_json_paths = [
-    '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations.json',
-    '/home/paul/projects/vesuvius-scrolls/spiral/same_winding_annotations_2.json',
-    '/home/paul/projects/vesuvius-scrolls/spiral/s1_relative_windings.json',
+pcl_json_paths = [
+    '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-05-26/s1_relative_windings_fixed.json',
+    '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-05-26/same_winding_annotations_fixed_merged.json',
 ]
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
@@ -3288,62 +3287,25 @@ def link_points_to_patches_cached(
             pickle.dump(point_collections, fp)
 
 
-def main():
+def prepare_point_collections(patches):
+    # Load all pcls, transform into (downsampled) voxel space, link every point to patches,
+    # and split into cross-patch / unattached sets. `patches` must already be downsampled
+    # and filtered to the z-roi.
 
-    np.random.seed(cfg['random_seed'])
-    torch.random.manual_seed(cfg['random_seed'])
-
-    umbilicus = umbilicus_z_to_yx(downsample_factor)
-
-    if scroll_zarr_path:
-        print('loading volume zarr')
-        scroll_zarr_array = zarr.open(scroll_zarr_path, mode='r')
-    else:
-        scroll_zarr_array = None
-
-    patches = load_patches(patches_path)
-    should_use_shell = shell_losses_enabled()
-    if should_use_shell and not shell_path:
-        raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
-    shell_patch = load_tifxyz(shell_path) if should_use_shell else None
-
-    cross_patch_point_collections = {}
-    unattached_point_collections = {}
+    point_collections = {}
     next_id = 0
-    for target, paths in (
-        (cross_patch_point_collections, cross_patch_pcl_json_paths),
-        (unattached_point_collections, unattached_pcl_json_paths),
-    ):
-        for pattern in paths:
-            expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
-            for path in expanded:
-                loaded = load_point_collection(path) or {}
-                for pcl in loaded.values():
-                    pcl['source_file'] = path
-                    target[next_id] = pcl
-                    next_id += 1
+    for pattern in pcl_json_paths:
+        expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
+        for path in expanded:
+            loaded = load_point_collection(path) or {}
+            for pcl in loaded.values():
+                pcl['source_file'] = path
+                point_collections[next_id] = pcl
+                next_id += 1
 
-    for patch in patches.values():
-        patch.scale *= downsample_factor
-        patch.zyxs /= downsample_factor
-        patch.valid_zyxs /= downsample_factor
-        patch.area /= downsample_factor ** 2
-    if shell_patch is not None:
-        shell_patch.scale *= downsample_factor
-        shell_patch.zyxs /= downsample_factor
-        shell_patch.valid_zyxs /= downsample_factor
-        shell_patch.area /= downsample_factor ** 2
-        print(f'loaded shell from {shell_path}: {shell_patch.valid_zyxs.shape[0]} valid points')
-    for pcl_dict in (cross_patch_point_collections, unattached_point_collections):
-        for pcl in pcl_dict.values():
-            for point in pcl['points'].values():
-                point['zyx'] = np.array([point['p'][2], point['p'][1], point['p'][0]]) / downsample_factor
-
-    def patch_intersects_z_roi(patch):
-        zs = patch.valid_zyxs[..., 0]
-        if zs.numel() == 0:
-            return False
-        return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+    for pcl in point_collections.values():
+        for point in pcl['points'].values():
+            point['zyx'] = np.array([point['p'][2], point['p'][1], point['p'][0]]) / downsample_factor
 
     def pcl_intersects_z_roi(pcl):
         for point in pcl['points'].values():
@@ -3352,9 +3314,38 @@ def main():
                 return True
         return False
 
-    dropped_patch_ids = [pid for pid, patch in patches.items() if not patch_intersects_z_roi(patch)]
-    for pid in dropped_patch_ids:
-        del patches[pid]
+    # Drop pcls lying entirely outside the z-roi before linking points to patches.
+    dropped_pcl_ids = [pid for pid, pcl in point_collections.items() if not pcl_intersects_z_roi(pcl)]
+    for pid in dropped_pcl_ids:
+        del point_collections[pid]
+    print(f'dropped {len(dropped_pcl_ids)} pcls outside z-roi [{z_begin}, {z_end})')
+
+    # Link every point of every pcl to patches (adds 'on_patch' to attached points).
+    link_points_to_patches_cached(
+        patches,
+        point_collections,
+        tolerance=10.0 / downsample_factor,
+        surface_index_tolerance=10.0 / downsample_factor,
+        distance_scale=1.0,
+    )
+
+    # Classify each pcl from how its points attach to patches:
+    #  - >= 2 attached points => acts as a cross-patch pcl (winding-number loss), using only
+    #    its attached points (grouped by patch below);
+    #  - >= 1 unattached point => acts as an unattached pcl (unattached loss), using the
+    #    entire pcl.
+    # A pcl can fall into both sets. When it does, the unattached entry is an independent copy
+    # so its z-roi trimming / annotation normalisation cannot perturb the cross-patch entry's
+    # points_by_patch (which is built from all attached points, regardless of z).
+    cross_patch_point_collections = {}
+    unattached_point_collections = {}
+    for pid, pcl in point_collections.items():
+        num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
+        num_unattached = len(pcl['points']) - num_attached
+        if num_attached >= 2:
+            cross_patch_point_collections[pid] = pcl
+        if num_unattached >= 1:
+            unattached_point_collections[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
 
     # For unattached pcls, keep only the longest contiguous subrange (in id-sorted
     # order) of points whose zs lie within [z_begin - margin, z_end + margin); drop
@@ -3379,22 +3370,12 @@ def main():
             dropped_unattached_pcl_count += 1
         else:
             pcl['points'] = dict(kept_items)
-
-    dropped_cross_patch_pcl_ids = [pid for pid, pcl in cross_patch_point_collections.items() if not pcl_intersects_z_roi(pcl)]
-    for pid in dropped_cross_patch_pcl_ids:
-        del cross_patch_point_collections[pid]
-    print(f'dropped {len(dropped_patch_ids)} patches, {len(dropped_cross_patch_pcl_ids)} cross-patch pcls, and {dropped_unattached_pcl_count} unattached pcls outside z-roi [{z_begin}, {z_end})')
-
-    link_points_to_patches_cached(
-        patches,
-        cross_patch_point_collections,
-        tolerance=10.0 / downsample_factor,
-        surface_index_tolerance=10.0 / downsample_factor,
-        distance_scale=1.0,
-    )
+    if dropped_unattached_pcl_count:
+        print(f'dropped {dropped_unattached_pcl_count} unattached pcls with <2 points in z-roi')
 
     normalise_pcl_winding_annotations(cross_patch_point_collections)
     normalise_pcl_winding_annotations(unattached_point_collections)
+
     # Group each cross-patch pcl's attached points by patch, for the
     # winding-number loss. Patches are ordered by the first attached point that
     # hits them when scanning the pcl's points in int(json-key) order; within
@@ -3414,6 +3395,53 @@ def main():
         f'pcls: {len(cross_patch_point_collections)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
+
+    return cross_patch_point_collections, unattached_pcl_strips
+
+
+def main():
+
+    np.random.seed(cfg['random_seed'])
+    torch.random.manual_seed(cfg['random_seed'])
+
+    umbilicus = umbilicus_z_to_yx(downsample_factor)
+
+    if scroll_zarr_path:
+        print('loading volume zarr')
+        scroll_zarr_array = zarr.open(scroll_zarr_path, mode='r')
+    else:
+        scroll_zarr_array = None
+
+    patches = load_patches(patches_path)
+    should_use_shell = shell_losses_enabled()
+    if should_use_shell and not shell_path:
+        raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
+    shell_patch = load_tifxyz(shell_path) if should_use_shell else None
+
+    for patch in patches.values():
+        patch.scale *= downsample_factor
+        patch.zyxs /= downsample_factor
+        patch.valid_zyxs /= downsample_factor
+        patch.area /= downsample_factor ** 2
+    if shell_patch is not None:
+        shell_patch.scale *= downsample_factor
+        shell_patch.zyxs /= downsample_factor
+        shell_patch.valid_zyxs /= downsample_factor
+        shell_patch.area /= downsample_factor ** 2
+        print(f'loaded shell from {shell_path}: {shell_patch.valid_zyxs.shape[0]} valid points')
+
+    def patch_intersects_z_roi(patch):
+        zs = patch.valid_zyxs[..., 0]
+        if zs.numel() == 0:
+            return False
+        return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+
+    dropped_patch_ids = [pid for pid, patch in patches.items() if not patch_intersects_z_roi(patch)]
+    for pid in dropped_patch_ids:
+        del patches[pid]
+    print(f'dropped {len(dropped_patch_ids)} patches outside z-roi [{z_begin}, {z_end})')
+
+    cross_patch_point_collections, unattached_pcl_strips = prepare_point_collections(patches)
 
     pcl_normal_samples = prepare_pcl_normal_samples(
         list(cross_patch_point_collections.values()),
