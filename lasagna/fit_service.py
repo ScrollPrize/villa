@@ -320,11 +320,10 @@ def _decode_tifxyz_for_request(
     snap_surf_enabled: bool = False,
     global_map_enabled: bool = False,
 ) -> str | None:
-    """Decode generic request tifxyz and attach it to configured consumers."""
+    """Decode generic request tifxyz for consumers that still use raw tifxyz transport."""
     import base64
 
     approval_enabled = _approval_inpaint_enabled(args_section)
-    external_surface_enabled = bool(ext_offset_enabled or snap_surf_enabled or global_map_enabled)
     if approval_enabled and model_init != "seed":
         raise ValueError("args.approval-inpaint is only valid with args.model-init=seed")
 
@@ -341,16 +340,16 @@ def _decode_tifxyz_for_request(
         print(f"[fit-service] decoded tifxyz ({len(tifxyz_payload)} files) to {tifxyz_dir}", flush=True)
         if model_init == "ext":
             args_section["tifxyz-init"] = tifxyz_dir
-        if model_init == "flatten" and "external_surfaces" not in cfg:
-            cfg["external_surfaces"] = [{"path": tifxyz_dir}]
         if approval_enabled:
             args_section["approval-inpaint-tifxyz"] = tifxyz_dir
-        if external_surface_enabled:
-            offset_val = float(cfg.pop("offset_value", 1.0))
-            cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
     elif model_init == "ext":
         raise ValueError("model-init=ext requires request tifxyz")
-    elif external_surface_enabled:
+    elif approval_enabled:
+        raise ValueError("approval-inpaint requires request tifxyz")
+    elif model_init == "flatten" and "external_surfaces" not in cfg:
+        raise ValueError("model-init=flatten requires config external_surfaces")
+
+    if (ext_offset_enabled or snap_surf_enabled or global_map_enabled) and "external_surfaces" not in cfg:
         loss_names = []
         if ext_offset_enabled:
             loss_names.append("ext_offset")
@@ -358,11 +357,7 @@ def _decode_tifxyz_for_request(
             loss_names.append("snap_surf")
         if global_map_enabled:
             loss_names.append("snap_surf_map/global_map")
-        raise ValueError(f"{'/'.join(loss_names)} is enabled but request has no tifxyz")
-    elif approval_enabled:
-        raise ValueError("approval-inpaint requires request tifxyz")
-    elif model_init == "flatten" and "external_surfaces" not in cfg:
-        raise ValueError("model-init=flatten requires request tifxyz or config external_surfaces")
+        raise ValueError(f"{'/'.join(loss_names)} is enabled but config has no external_surfaces")
 
     return tifxyz_dir
 
@@ -400,10 +395,6 @@ def _decode_model_for_request(
 def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     """Resolve a Lasagna job spec into the legacy runner transport fields."""
     spec = body.get("job_spec")
-    if spec is None and isinstance(body.get("config"), dict) and (
-        "model" in body or "linked_surfaces" in body
-    ):
-        spec = body
     if not isinstance(spec, dict):
         return body
 
@@ -412,7 +403,22 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("job_spec.config must be an object")
 
     resolved = dict(body)
-    resolved["config"] = dict(cfg)
+    resolved_cfg = dict(cfg)
+    external_surfaces_raw = resolved_cfg.get("external_surfaces")
+    if external_surfaces_raw is not None:
+        if not isinstance(external_surfaces_raw, list):
+            raise ValueError("job_spec.config.external_surfaces must be a list")
+        external_surfaces: list[dict[str, Any]] = []
+        for i, surface_raw in enumerate(external_surfaces_raw):
+            if not isinstance(surface_raw, dict):
+                raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
+            surface = dict(surface_raw)
+            if all(k in surface for k in ("type", "name", "hash")):
+                surface["path"] = str(_resolve_object_ref(surface))
+            external_surfaces.append(surface)
+        resolved_cfg["external_surfaces"] = external_surfaces
+
+    resolved["config"] = resolved_cfg
     resolved["_job_spec_"] = {
         "model": spec.get("model"),
         "linked_surfaces": spec.get("linked_surfaces", []),
@@ -428,13 +434,6 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         linked_refs = []
     if not isinstance(linked_refs, list):
         raise ValueError("job_spec.linked_surfaces must be a list")
-    if len(linked_refs) > 1:
-        raise ValueError("fit-service v2 currently supports exactly one linked surface")
-    if len(linked_refs) == 1:
-        surface_path = _resolve_object_ref(linked_refs[0])
-        offset_val = float(resolved["config"].pop("offset_value", body.get("offset_value", 1.0)))
-        resolved["config"]["external_surfaces"] = [{"path": str(surface_path), "offset": offset_val}]
-        resolved["_resolved_linked_surface"] = str(surface_path)
 
     return resolved
 
@@ -1180,10 +1179,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
 
         if model_init == "model" and not model_input:
             raise ValueError("model-init=model requires request model_data or model_input")
-
-        if external_surface_enabled and tifxyz_dir is not None and "external_surfaces" not in cfg:
-            offset_val = float(cfg.pop("offset_value", 1.0))
-            cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
 
         args_section = dict(cfg.get("args", {}))
         if model_init != "flatten":

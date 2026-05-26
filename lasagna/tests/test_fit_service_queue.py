@@ -173,7 +173,7 @@ class FitServiceObjectStoreTest(unittest.TestCase):
 			finally:
 				fit_service._object_store_dir = old_store
 
-	def test_job_spec_resolves_model_and_one_linked_surface(self):
+	def test_job_spec_resolves_model_and_external_surface_refs(self):
 		with tempfile.TemporaryDirectory() as td:
 			old_store = fit_service._object_store_dir
 			fit_service._object_store_dir = fit_service.Path(td)
@@ -205,12 +205,45 @@ class FitServiceObjectStoreTest(unittest.TestCase):
 					"job_spec": {
 						"model": model_ref,
 						"linked_surfaces": [seg_ref],
-						"config": {"args": {"model-init": "model"}, "offset_value": 2.5},
+						"config": {
+							"args": {"model-init": "model"},
+							"external_surfaces": [{**seg_ref, "offset": 2.5}],
+						},
 					}
 				})
 				self.assertEqual(fit_service.Path(body["model_input"]).read_bytes(), model)
 				self.assertEqual(body["config"]["external_surfaces"][0]["offset"], 2.5)
 				self.assertTrue(fit_service.Path(body["config"]["external_surfaces"][0]["path"]).is_dir())
+				self.assertEqual(body["_job_spec_"]["linked_surfaces"], [seg_ref])
+			finally:
+				fit_service._object_store_dir = old_store
+
+	def test_job_spec_does_not_synthesize_external_surfaces_from_linked_surfaces(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				seg_files = {"x.tif": b"x", "y.tif": b"y", "z.tif": b"z", "meta.json": b"{}"}
+				seg_ref = {
+					"type": "tifxyz_segment",
+					"name": "reference_surface.tifxyz",
+					"hash": fit_service._segment_manifest_hash(seg_files),
+				}
+				fit_service._store_uploaded_object({
+					"object": seg_ref,
+					"files": {
+						name: fit_service.base64.b64encode(data).decode("ascii")
+						for name, data in seg_files.items()
+					},
+				})
+				body = fit_service._body_with_resolved_job_spec({
+					"job_spec": {
+						"linked_surfaces": [seg_ref],
+						"config": {"args": {"model-init": "seed"}},
+					}
+				})
+				self.assertNotIn("external_surfaces", body["config"])
+				self.assertEqual(body["_job_spec_"]["linked_surfaces"], [seg_ref])
 			finally:
 				fit_service._object_store_dir = old_store
 

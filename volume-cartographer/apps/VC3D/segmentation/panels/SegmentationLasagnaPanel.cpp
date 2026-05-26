@@ -1615,7 +1615,6 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     args[QStringLiteral("model-h")] = nmH;
     args[QStringLiteral("windings")] = nmN;
     config[QStringLiteral("args")] = args;
-    config[QStringLiteral("offset_value")] = offsetVal;
 
     std::cerr << "[lasagna] request settings:"
               << " seed=(" << cx << "," << cy << "," << cz << ")"
@@ -1702,10 +1701,8 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         request[QStringLiteral("window_size")] = size;
         request[QStringLiteral("window_overlap")] = overlap;
     }
-    request[QStringLiteral("config")] = config;
 
     QJsonObject jobSpec;
-    jobSpec[QStringLiteral("config")] = config;
     QJsonArray objectUploads;
     QJsonArray linkedSurfaces;
     const bool sendModelData = !isNewModel && !modelPath.isEmpty();
@@ -1747,7 +1744,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             return;
         }
 
-        if (launchMode == LasagnaMode::ReOptimize) {
+        if (launchMode == LasagnaMode::ReOptimize || launchMode == LasagnaMode::Offset) {
             linkedSurfaces = linkedSurfacesFromMeta(segPath);
         }
         const bool selectedLasagnaModel = std::filesystem::exists(segPath / "model.pt");
@@ -1792,7 +1789,21 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         jobSpec[QStringLiteral("model")] = modelUpload[QStringLiteral("object")].toObject();
         appendUploadIfNew(modelUpload);
     }
+    if (!linkedSurfaces.isEmpty()) {
+        QJsonArray externalSurfaces;
+        for (const QJsonValue& value : linkedSurfaces) {
+            QJsonObject surface = value.toObject();
+            if (surface.isEmpty()) {
+                continue;
+            }
+            surface[QStringLiteral("offset")] = offsetVal;
+            externalSurfaces.append(surface);
+        }
+        config[QStringLiteral("external_surfaces")] = externalSurfaces;
+    }
+    jobSpec[QStringLiteral("config")] = config;
     jobSpec[QStringLiteral("linked_surfaces")] = linkedSurfaces;
+    request[QStringLiteral("config")] = config;
     request[QStringLiteral("job_spec")] = jobSpec;
     request[QStringLiteral("_objects")] = objectUploads;
     const QStringList linkedSurfaceNames = linkedSurfaceNamesFromJobSpec(jobSpec);

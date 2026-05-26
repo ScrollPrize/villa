@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <iostream>
 
+extern QJsonObject g_lastLasagnaOptimizationRequest;
+
 namespace {
 
 void require(bool condition, const char* message)
@@ -350,6 +352,23 @@ int main(int argc, char** argv)
             "Offset launch should reserve the next collision-free offset output name");
     require(statusBar.currentMessage().contains(QStringLiteral("sheet_off2")),
             "Offset launch status should include the generated offset output name");
+    QJsonObject jobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    QJsonObject jobConfig = jobSpec[QStringLiteral("config")].toObject();
+    require(!jobConfig.contains(QStringLiteral("offset_value")),
+            "VC3D job config should not transport offset_value");
+    QJsonArray externalSurfaces = jobConfig[QStringLiteral("external_surfaces")].toArray();
+    require(externalSurfaces.size() == 1,
+            "VC3D job config should include one external surface from the linked refs");
+    QJsonObject externalSurface = externalSurfaces[0].toObject();
+    require(externalSurface[QStringLiteral("type")].toString() == QStringLiteral("tifxyz_segment"),
+            "External surface should preserve object ref type");
+    require(externalSurface[QStringLiteral("name")].toString() == QStringLiteral("reference_surface.tifxyz"),
+            "External surface should preserve object ref name");
+    require(externalSurface[QStringLiteral("hash")].toString() ==
+                QStringLiteral("md5:11111111111111111111111111111111"),
+            "External surface should preserve object ref hash");
+    require(externalSurface[QStringLiteral("offset")].toDouble() == panel.offsetValue(),
+            "External surface should carry the offset spinner value");
 
     return 0;
 }

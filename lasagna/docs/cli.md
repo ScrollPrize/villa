@@ -65,7 +65,6 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `external_surfaces`: list of `{"path": "...", "offset": 1.0}` for offset mode, or one `{"path": "..."}` tifxyz source for flatten mode
 - `corr_points`: correction point collections from VC3D
 - `voxel_size_um`: voxel size for area calculations
-- `offset_value`: target offset (injected by VC3D offset mode)
 
 `args.model-init` selects the initial mesh source:
 - `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.windings`.

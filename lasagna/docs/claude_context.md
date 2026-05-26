@@ -167,16 +167,14 @@ lasagna → VC3D:  optimized tifxyz (with updated d.tif channel)
 Generates a new surface at a configurable grad_mag integral offset from an existing tifxyz reference. Used to trace adjacent papyrus windings from a known surface.
 
 **Data flow:**
-1. VC3D sends the existing tifxyz as base64 (`tifxyz` in request body) — no model.pt needed
-2. `fit_service.py` decodes files to temp dir, creates config with:
-   - `tifxyz-init`: initialize model from the tifxyz (via `Model3D.from_tifxyz()`)
-   - `external_surfaces`: same tifxyz registered as frozen reference with target offset
-3. `fit.py` creates model (depth=1) initialized from the tifxyz vertices, then adds the frozen reference surface
+1. VC3D sends the selected model/object refs and a complete `job_spec.config.external_surfaces` list.
+2. `fit_service.py` resolves `external_surfaces` object refs to local `path` values and preserves each entry's `offset`.
+3. `fit.py` creates the model, then adds the resolved frozen reference surface.
 4. Optimization: `ext_offset` loss (in `opt_loss_winding_density.py`) drives the model surface toward the target offset from the reference, using grad_mag integration along ray-bilinear-patch intersections (`model.py:_intersect_ext_surfaces()`)
 5. Result exported as tifxyz back to VC3D
 
 **Config keys** (injected by VC3D in offset mode):
-- `offset_value` (float): target offset in winding-integral space (0 = reoptimize in place, ±1 = adjacent winding)
+- `external_surfaces[].offset` (float): target offset in winding-integral space (0 = reoptimize in place, ±1 = adjacent winding)
 - `args.windings`: forced to 1
 
 **Invalid vertices**: tifxyz surfaces use `(-1,-1,-1)` as invalid sentinel. `tifxyz_io.load_tifxyz()` returns a validity mask. Invalid vertices are inpainted via masked scale-space pyramid reconstruction in `Model3D.from_tifxyz_crop()`. The external surface validity mask is checked during ray intersection so `ext_offset` loss skips rays hitting invalid regions.

@@ -1,6 +1,10 @@
 #include "LasagnaServiceManager.hpp"
 
 #include <QJsonArray>
+#include <QJsonObject>
+
+QJsonObject g_lastLasagnaOptimizationRequest;
+QString g_lastLasagnaOptimizationOutputDir;
 
 LasagnaServiceManager& LasagnaServiceManager::instance()
 {
@@ -34,8 +38,10 @@ bool LasagnaServiceManager::isRunning() const
     return _serviceReady;
 }
 
-void LasagnaServiceManager::startOptimization(const QJsonObject&, const QString&)
+void LasagnaServiceManager::startOptimization(const QJsonObject& request, const QString& outputDir)
 {
+    g_lastLasagnaOptimizationRequest = request;
+    g_lastLasagnaOptimizationOutputDir = outputDir;
     emit optimizationStarted();
 }
 
