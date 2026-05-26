@@ -232,6 +232,70 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertAlmostEqual(stats["snaps_map_snap_abs"], 1.0, places=6)
 		self.assertAlmostEqual(stats["snaps_map_snap_max"], 1.0, places=6)
 
+	def test_snap_loss_nonzero_offset_measures_tangential_segment_length(self) -> None:
+		h, w = 5, 5
+		runtime = GlobalMapRuntime()
+		runtime.affine = AffineMapModel(ext_shape=(h, w), device=torch.device("cpu"), dtype=torch.float32)
+		model_xyz = _plane_xyz(h=h, w=w, z=2.0).unsqueeze(0)
+		model_xyz[..., 0] += 3.0
+		model_normals = _normals_3d(1, h, w)
+		model_valid = torch.ones(1, h, w, dtype=torch.bool)
+		ext_xyz = _plane_xyz(h=h, w=w, z=0.0)
+		ext_valid = torch.ones(h, w, dtype=torch.bool)
+		ext_normals = _normals_2d(h, w)
+		ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
+		grad_mag = 0.5
+		offset = (13.0 ** 0.5) * grad_mag
+
+		loss, _lms, _masks, stats = runtime.snap_loss(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad,
+			offset=offset,
+			data=_RejectNonFiniteGradData(grad_mag),
+			strip_samples=4,
+		)
+
+		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
+		self.assertAlmostEqual(stats["snaps_map_snap_abs"], 0.0, places=6)
+		self.assertEqual(stats["snaps_map_snap_samples"], 25.0)
+
+	def test_snap_loss_nonzero_offset_backprops_only_model_normal_direction(self) -> None:
+		h, w = 5, 5
+		runtime = GlobalMapRuntime()
+		runtime.affine = AffineMapModel(ext_shape=(h, w), device=torch.device("cpu"), dtype=torch.float32)
+		model_xyz = _plane_xyz(h=h, w=w, z=2.0).unsqueeze(0).clone()
+		model_xyz[..., 0] += 3.0
+		model_xyz.requires_grad_()
+		model_normals = _normals_3d(1, h, w)
+		model_valid = torch.ones(1, h, w, dtype=torch.bool)
+		ext_xyz = _plane_xyz(h=h, w=w, z=0.0)
+		ext_valid = torch.ones(h, w, dtype=torch.bool)
+		ext_normals = _normals_2d(h, w)
+		ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
+
+		loss, _lms, _masks, _stats = runtime.snap_loss(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad,
+			offset=1.0,
+			data=_RejectNonFiniteGradData(0.5),
+			strip_samples=4,
+		)
+		loss.backward()
+
+		grad = model_xyz.grad.detach()
+		self.assertLess(float(grad[..., :2].abs().max()), 1.0e-7)
+		self.assertGreater(float(grad[..., 2].abs().max()), 1.0e-5)
+
 	def test_snap_loss_nonzero_offset_masks_invalid_grad_mag_strip(self) -> None:
 		loss, stats, _out = self._snap_loss_case(offset=1.0, model_z=2.0, grad_mag=0.0)
 

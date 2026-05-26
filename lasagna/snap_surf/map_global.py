@@ -1663,7 +1663,7 @@ class GlobalMapRuntime:
 			sample_valid = (
 				valid &
 				torch.isfinite(ext_xyz).all(dim=-1) &
-				torch.isfinite(signed_vox) &
+				torch.isfinite(model_pos).all(dim=-1) &
 				torch.isfinite(model_n).all(dim=-1)
 			)
 			with torch.no_grad():
@@ -1672,12 +1672,10 @@ class GlobalMapRuntime:
 				spacing = torch.tensor(data._spacing_for("grad_mag"), device=model_xyz.device, dtype=model_xyz.dtype)
 				sentinel = origin - 64.0 * spacing
 				ext_xyz_safe = torch.where(sample_valid.unsqueeze(-1), ext_xyz.detach(), sentinel.view(1, 1, 3))
-				signed_vox_safe = torch.where(sample_valid, signed_vox.detach(), torch.zeros_like(signed_vox))
-				strip = (
-					ext_xyz_safe.unsqueeze(-2) +
-					(t.view(*((1,) * (ext_xyz.ndim - 1)), strip_samples_i, 1) *
-					 signed_vox_safe.unsqueeze(-1).unsqueeze(-1) *
-					 model_n.detach().unsqueeze(-2))
+				model_pos_safe = torch.where(sample_valid.unsqueeze(-1), model_pos.detach(), sentinel.view(1, 1, 3))
+				diff = model_pos_safe - ext_xyz_safe
+				strip = ext_xyz_safe.unsqueeze(-2) + (
+					t.view(*((1,) * (ext_xyz.ndim - 1)), strip_samples_i, 1) * diff.unsqueeze(-2)
 				)
 				H, W = int(ext_xyz.shape[0]), int(ext_xyz.shape[1])
 				strip_flat = strip.reshape(1, H, W * strip_samples_i, 3)
@@ -1687,8 +1685,13 @@ class GlobalMapRuntime:
 				mag = sampled.grad_mag.detach().squeeze(0).squeeze(0).reshape(1, H, W, strip_samples_i).squeeze(0)
 				strip_valid = (mag > 0.0).all(dim=-1)
 				mean_grad = mag.mean(dim=-1)
+				strip_len = diff.square().sum(dim=-1).sqrt()
+				int_sign = torch.sign(((model_pos.detach() - ext_xyz.detach()) * model_n.detach()).sum(dim=-1))
+				signed_windings = int_sign * strip_len * mean_grad
+				winding_err = signed_windings - signed_vox.new_tensor(offset_f)
 			valid = sample_valid & strip_valid
-			residual = signed_vox * mean_grad - signed_vox.new_tensor(offset_f)
+			normal_residual = signed_vox * mean_grad
+			residual = normal_residual + (winding_err - normal_residual).detach()
 		vals = residual[valid]
 		if vals.numel() == 0:
 			return z, (lm,), (mask,), {
