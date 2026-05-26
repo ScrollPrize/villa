@@ -1,5 +1,6 @@
 import time
 import threading
+import tempfile
 import unittest
 from unittest import mock
 
@@ -116,6 +117,102 @@ class FitServiceQueueTest(unittest.TestCase):
 		ok, msg = queue.reorder({"job_id": j1.job_id})
 		self.assertFalse(ok)
 		self.assertIn("not reorderable", msg)
+
+
+class FitServiceObjectStoreTest(unittest.TestCase):
+	def test_model_upload_validates_hash_and_resolves_path(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				data = b"checkpoint"
+				ref = {
+					"type": "lasagna_model",
+					"name": "sheet_v001.tifxyz/model.pt",
+					"hash": fit_service._hash_bytes(data),
+				}
+				stored = fit_service._store_uploaded_object({
+					"object": ref,
+					"data": fit_service.base64.b64encode(data).decode("ascii"),
+				})
+				self.assertEqual(stored, ref)
+				self.assertTrue(fit_service._object_present(ref))
+				self.assertEqual(fit_service._resolve_object_ref(ref).read_bytes(), data)
+
+				bad = dict(ref)
+				bad["hash"] = "md5:" + "0" * 32
+				with self.assertRaises(ValueError):
+					fit_service._store_uploaded_object({
+						"object": bad,
+						"data": fit_service.base64.b64encode(data).decode("ascii"),
+					})
+			finally:
+				fit_service._object_store_dir = old_store
+
+	def test_segment_upload_uses_manifest_hash(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				files = {"z.tif": b"z", "meta.json": b"{}", "x.tif": b"x"}
+				ref = {
+					"type": "tifxyz_segment",
+					"name": "reference_surface.tifxyz",
+					"hash": fit_service._segment_manifest_hash(files),
+				}
+				fit_service._store_uploaded_object({
+					"object": ref,
+					"files": {
+						name: fit_service.base64.b64encode(data).decode("ascii")
+						for name, data in files.items()
+					},
+				})
+				path = fit_service._resolve_object_ref(ref)
+				self.assertTrue((path / "x.tif").is_file())
+				self.assertEqual((path / "meta.json").read_bytes(), b"{}")
+			finally:
+				fit_service._object_store_dir = old_store
+
+	def test_job_spec_resolves_model_and_one_linked_surface(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				model = b"model"
+				model_ref = {
+					"type": "lasagna_model",
+					"name": "sheet_v001.tifxyz/model.pt",
+					"hash": fit_service._hash_bytes(model),
+				}
+				fit_service._store_uploaded_object({
+					"object": model_ref,
+					"data": fit_service.base64.b64encode(model).decode("ascii"),
+				})
+				seg_files = {"x.tif": b"x", "y.tif": b"y", "z.tif": b"z", "meta.json": b"{}"}
+				seg_ref = {
+					"type": "tifxyz_segment",
+					"name": "reference_surface.tifxyz",
+					"hash": fit_service._segment_manifest_hash(seg_files),
+				}
+				fit_service._store_uploaded_object({
+					"object": seg_ref,
+					"files": {
+						name: fit_service.base64.b64encode(data).decode("ascii")
+						for name, data in seg_files.items()
+					},
+				})
+				body = fit_service._body_with_resolved_job_spec({
+					"job_spec": {
+						"model": model_ref,
+						"linked_surfaces": [seg_ref],
+						"config": {"args": {"model-init": "model"}, "offset_value": 2.5},
+					}
+				})
+				self.assertEqual(fit_service.Path(body["model_input"]).read_bytes(), model)
+				self.assertEqual(body["config"]["external_surfaces"][0]["offset"], 2.5)
+				self.assertTrue(fit_service.Path(body["config"]["external_surfaces"][0]["path"]).is_dir())
+			finally:
+				fit_service._object_store_dir = old_store
 
 
 if __name__ == "__main__":

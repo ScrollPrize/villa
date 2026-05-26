@@ -12,6 +12,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QElapsedTimer>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
@@ -48,6 +49,7 @@
 #include <iostream>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -66,6 +68,99 @@ QString lasagnaModeDebugName(int mode)
 double bytesToMiB(qint64 bytes)
 {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+QString md5Ref(const QByteArray& bytes)
+{
+    return QStringLiteral("md5:%1").arg(QString::fromLatin1(
+        QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex()));
+}
+
+QJsonObject makeObjectRef(const QString& type, const QString& name, const QString& hash)
+{
+    QJsonObject ref;
+    ref[QStringLiteral("type")] = type;
+    ref[QStringLiteral("name")] = name;
+    ref[QStringLiteral("hash")] = hash;
+    return ref;
+}
+
+QJsonObject modelArtifactForPath(const std::filesystem::path& modelPath,
+                                 const QString& refName,
+                                 qint64* rawBytes)
+{
+    QFile f(QString::fromStdString(modelPath.string()));
+    if (!f.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    const QByteArray bytes = f.readAll();
+    if (rawBytes) {
+        *rawBytes += bytes.size();
+    }
+    QJsonObject upload;
+    upload[QStringLiteral("object")] = makeObjectRef(
+        QStringLiteral("lasagna_model"), refName, md5Ref(bytes));
+    upload[QStringLiteral("data")] = QString::fromLatin1(bytes.toBase64());
+    return upload;
+}
+
+QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
+                                   qint64* rawBytes,
+                                   int* fileCount)
+{
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(segPath, ec)) {
+        if (entry.is_regular_file()) {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+
+    QJsonObject encodedFiles;
+    QByteArray manifest;
+    for (const auto& path : files) {
+        QFile f(QString::fromStdString(path.string()));
+        if (!f.open(QIODevice::ReadOnly)) {
+            return {};
+        }
+        const QByteArray bytes = f.readAll();
+        const auto relPath = std::filesystem::relative(path, segPath, ec);
+        if (ec) {
+            return {};
+        }
+        const QString rel = QString::fromStdString(relPath.generic_string());
+        const QString fileHash = md5Ref(bytes);
+        manifest.append(rel.toUtf8());
+        manifest.append('\t');
+        manifest.append(fileHash.toUtf8());
+        manifest.append('\n');
+        encodedFiles[rel] = QString::fromLatin1(bytes.toBase64());
+        if (rawBytes) {
+            *rawBytes += bytes.size();
+        }
+        if (fileCount) {
+            ++(*fileCount);
+        }
+    }
+
+    const QString segName = QString::fromStdString(segPath.filename().string());
+    QJsonObject upload;
+    upload[QStringLiteral("object")] = makeObjectRef(
+        QStringLiteral("tifxyz_segment"), segName, md5Ref(manifest));
+    upload[QStringLiteral("files")] = encodedFiles;
+    return upload;
+}
+
+QJsonArray linkedSurfacesFromMeta(const std::filesystem::path& segPath)
+{
+    QFile metaFile(QString::fromStdString((segPath / "meta.json").string()));
+    if (!metaFile.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    const QJsonObject meta = QJsonDocument::fromJson(metaFile.readAll()).object();
+    const QJsonObject job = meta[QStringLiteral("lasagna_job")].toObject();
+    return job[QStringLiteral("linked_surfaces")].toArray();
 }
 }  // namespace
 
@@ -1468,7 +1563,11 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     }
     request[QStringLiteral("config")] = config;
 
-    const bool sendModelData = !modelPath.isEmpty();
+    QJsonObject jobSpec;
+    jobSpec[QStringLiteral("config")] = config;
+    QJsonArray objectUploads;
+    QJsonArray linkedSurfaces;
+    const bool sendModelData = !isNewModel && !modelPath.isEmpty();
     const bool sendTifxyz = !segPath.empty();
     qint64 rawTifxyzBytes = 0;
     int tifxyzFileCount = 0;
@@ -1478,66 +1577,82 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
               << " send_tifxyz=" << (sendTifxyz ? "yes" : "no")
               << std::endl;
 
+    auto appendUploadIfNew = [&](const QJsonObject& upload) {
+        const QJsonObject ref = upload[QStringLiteral("object")].toObject();
+        if (ref.isEmpty()) {
+            return;
+        }
+        const QString key = ref[QStringLiteral("type")].toString() + QStringLiteral("\n")
+            + ref[QStringLiteral("name")].toString() + QStringLiteral("\n")
+            + ref[QStringLiteral("hash")].toString();
+        for (const QJsonValue& existingValue : objectUploads) {
+            const QJsonObject existingRef = existingValue.toObject()[QStringLiteral("object")].toObject();
+            const QString existingKey = existingRef[QStringLiteral("type")].toString() + QStringLiteral("\n")
+                + existingRef[QStringLiteral("name")].toString() + QStringLiteral("\n")
+                + existingRef[QStringLiteral("hash")].toString();
+            if (existingKey == key) {
+                return;
+            }
+        }
+        objectUploads.append(upload);
+    };
+
     if (sendTifxyz) {
-        QJsonObject tifxyzData;
-        QStringList coreTifxyzFiles{
-            QStringLiteral("x.tif"),
-            QStringLiteral("y.tif"),
-            QStringLiteral("z.tif"),
-            QStringLiteral("meta.json"),
-        };
-        QStringList extraTifxyzFiles{
-            QStringLiteral("approval.tif"),
-            QStringLiteral("d.tif"),
-        };
-        auto addTifxyzFile = [&](const QString& fname) -> bool {
-            auto filePath = segPath / fname.toStdString();
-            if (!std::filesystem::exists(filePath)) {
-                std::cerr << "[lasagna] selected segment has no optional tifxyz file: "
-                          << fname.toStdString() << std::endl;
-                return true;
-            }
-            QFile f(QString::fromStdString(filePath.string()));
-            if (f.open(QIODevice::ReadOnly)) {
-                QByteArray bytes = f.readAll();
-                rawTifxyzBytes += bytes.size();
-                ++tifxyzFileCount;
-                tifxyzData[fname] =
-                    QString::fromLatin1(bytes.toBase64());
-            } else {
-                auto msg = tr("Cannot read selected segment tifxyz file: %1").arg(fname);
-                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-                showStatus(msg, 5000);
-                return false;
-            }
-            return true;
-        };
-        for (const QString& fname : coreTifxyzFiles) {
-            if (!addTifxyzFile(fname)) {
-                return;
+        QJsonObject currentSegmentUpload = segmentArtifactForPath(segPath, &rawTifxyzBytes, &tifxyzFileCount);
+        if (currentSegmentUpload.isEmpty()) {
+            auto msg = tr("Cannot pack selected tifxyz segment for Lasagna artifact sync.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return;
+        }
+
+        if (launchMode == LasagnaMode::ReOptimize) {
+            linkedSurfaces = linkedSurfacesFromMeta(segPath);
+        }
+        if (linkedSurfaces.isEmpty()) {
+            linkedSurfaces.append(currentSegmentUpload[QStringLiteral("object")].toObject());
+            appendUploadIfNew(currentSegmentUpload);
+        } else if (!outputSegmentsPath.empty()) {
+            for (const QJsonValue& value : linkedSurfaces) {
+                const QJsonObject ref = value.toObject();
+                const QString name = ref[QStringLiteral("name")].toString();
+                if (name.isEmpty()) {
+                    continue;
+                }
+                std::filesystem::path localPath = outputSegmentsPath / name.toStdString();
+                if (std::filesystem::exists(localPath) && std::filesystem::is_directory(localPath)) {
+                    qint64 extraBytes = 0;
+                    int extraFiles = 0;
+                    QJsonObject upload = segmentArtifactForPath(localPath, &extraBytes, &extraFiles);
+                    if (!upload.isEmpty() &&
+                        upload[QStringLiteral("object")].toObject()[QStringLiteral("hash")].toString()
+                            == ref[QStringLiteral("hash")].toString()) {
+                        rawTifxyzBytes += extraBytes;
+                        tifxyzFileCount += extraFiles;
+                        appendUploadIfNew(upload);
+                    }
+                }
             }
         }
-        for (const QString& fname : extraTifxyzFiles) {
-            if (!addTifxyzFile(fname)) {
-                return;
-            }
-        }
-        request[QStringLiteral("tifxyz")] = tifxyzData;
     }
 
     if (sendModelData) {
-        QFile modelFile(modelPath);
-        if (!modelFile.open(QIODevice::ReadOnly)) {
+        const QString modelRefName = QString::fromStdString(segPath.filename().string())
+            + QStringLiteral("/model.pt");
+        QJsonObject modelUpload = modelArtifactForPath(
+            std::filesystem::path(modelPath.toStdString()), modelRefName, &rawModelBytes);
+        if (modelUpload.isEmpty()) {
             auto msg = tr("Cannot read model file: %1").arg(modelPath);
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
             return;
         }
-        QByteArray modelBytes = modelFile.readAll();
-        modelFile.close();
-        rawModelBytes = modelBytes.size();
-        request[QStringLiteral("model_data")] = QString::fromLatin1(modelBytes.toBase64());
+        jobSpec[QStringLiteral("model")] = modelUpload[QStringLiteral("object")].toObject();
+        appendUploadIfNew(modelUpload);
     }
+    jobSpec[QStringLiteral("linked_surfaces")] = linkedSurfaces;
+    request[QStringLiteral("job_spec")] = jobSpec;
+    request[QStringLiteral("_objects")] = objectUploads;
 
     std::cerr << "[lasagna] request prep:"
               << " mode=" << lasagnaModeDebugName(static_cast<int>(launchMode)).toStdString()
