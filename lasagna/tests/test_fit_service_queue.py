@@ -173,6 +173,62 @@ class FitServiceObjectStoreTest(unittest.TestCase):
 			finally:
 				fit_service._object_store_dir = old_store
 
+	def test_same_hash_different_names_do_not_alias(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				model = b"checkpoint"
+				model_hash = fit_service._hash_bytes(model)
+				model_a = {
+					"type": "lasagna_model",
+					"name": "sheet_a.tifxyz/model.pt",
+					"hash": model_hash,
+				}
+				model_b = {
+					"type": "lasagna_model",
+					"name": "sheet_b.tifxyz/model.pt",
+					"hash": model_hash,
+				}
+				for ref in (model_a, model_b):
+					fit_service._store_uploaded_object({
+						"object": ref,
+						"data": fit_service.base64.b64encode(model).decode("ascii"),
+					})
+				self.assertTrue(fit_service._object_present(model_a))
+				self.assertTrue(fit_service._object_present(model_b))
+				self.assertNotEqual(
+					fit_service._resolve_object_ref(model_a),
+					fit_service._resolve_object_ref(model_b),
+				)
+
+				files = {"x.tif": b"x", "y.tif": b"y", "z.tif": b"z", "meta.json": b"{}"}
+				segment_hash = fit_service._segment_manifest_hash(files)
+				segment_a = {
+					"type": "tifxyz_segment",
+					"name": "surface_a.tifxyz",
+					"hash": segment_hash,
+				}
+				segment_b = {
+					"type": "tifxyz_segment",
+					"name": "surface_b.tifxyz",
+					"hash": segment_hash,
+				}
+				encoded_files = {
+					name: fit_service.base64.b64encode(data).decode("ascii")
+					for name, data in files.items()
+				}
+				for ref in (segment_a, segment_b):
+					fit_service._store_uploaded_object({"object": ref, "files": encoded_files})
+				self.assertTrue(fit_service._object_present(segment_a))
+				self.assertTrue(fit_service._object_present(segment_b))
+				self.assertNotEqual(
+					fit_service._resolve_object_ref(segment_a),
+					fit_service._resolve_object_ref(segment_b),
+				)
+			finally:
+				fit_service._object_store_dir = old_store
+
 	def test_job_spec_resolves_model_and_external_surface_refs(self):
 		with tempfile.TemporaryDirectory() as td:
 			old_store = fit_service._object_store_dir

@@ -38,7 +38,7 @@ import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +107,9 @@ def _validate_object_ref(ref: Any) -> dict[str, str]:
 
 
 def _object_dir(ref: dict[str, str]) -> Path:
-    # The hash is content-addressed; name/type are still validated and recorded
-    # so accidental uploads cannot alias a ref with different metadata.
-    return _object_store_root() / ref["type"] / ref["hash"][4:]
+    # Object identity is type + name + hash.  The name is percent-encoded so
+    # refs like "sheet.tifxyz/model.pt" do not create nested store paths.
+    return _object_store_root() / ref["type"] / ref["hash"][4:] / quote(ref["name"], safe="")
 
 
 def _object_metadata_path(ref: dict[str, str]) -> Path:
