@@ -1744,9 +1744,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             return;
         }
 
-        if (launchMode == LasagnaMode::ReOptimize || launchMode == LasagnaMode::Offset) {
-            linkedSurfaces = linkedSurfacesFromMeta(segPath);
-        }
+        linkedSurfaces = linkedSurfacesFromMeta(segPath);
         const bool selectedLasagnaModel = std::filesystem::exists(segPath / "model.pt");
         if (linkedSurfaces.isEmpty() && !selectedLasagnaModel) {
             linkedSurfaces.append(currentSegmentUpload[QStringLiteral("object")].toObject());

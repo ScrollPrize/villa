@@ -343,6 +343,20 @@ int main(int argc, char** argv)
     panel.startOptimizationAtSeed(
         &state,
         &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::NewModel,
+        configPath,
+        4,
+        5,
+        6);
+    QJsonObject newModelJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    QJsonObject newModelJobConfig = newModelJobSpec[QStringLiteral("config")].toObject();
+    QJsonArray newModelExternalSurfaces =
+        newModelJobConfig[QStringLiteral("external_surfaces")].toArray();
+    require(newModelExternalSurfaces.size() == 1,
+            "New Model launch should still send linked refs as external_surfaces");
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
         SegmentationLasagnaPanel::LasagnaMode::Offset,
         configPath,
         4,
