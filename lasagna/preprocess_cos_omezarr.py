@@ -77,6 +77,11 @@ def _ds_index(v: int, f: int) -> int:
 	return max(0, int(v) // int(f))
 
 
+def _grad_mag_factor_from_input_sd(input_sd: int) -> float:
+	"""Scale grad_mag from input-voxel density units to base-voxel density units."""
+	return 1.0 / float(max(1, int(input_sd)))
+
+
 def _pyrdown2d(arr: np.ndarray, *, factor: int) -> np.ndarray:
 	"""Gaussian pyramid downscale using repeated cv2.pyrDown for power-of-2 factors."""
 	f = int(factor)
@@ -2338,8 +2343,9 @@ def run_preprocess_3d(
 			source_to_base=source_to_base,
 			base_shape_zyx=base_shape_zyx,
 		)
-	# grad_mag is predicted per downscaled voxel; factor converts to fullres
-	vol.grad_mag_factor = 1.0 / effective_other_sd
+	# grad_mag values stay in input-voxel density units; the OME pyramid level only
+	# changes coordinate spacing because downsampling averages the values.
+	vol.grad_mag_factor = _grad_mag_factor_from_input_sd(input_sd)
 	# Record this crop in base coordinates (appends if new, deduplicates)
 	if crop_xyzwhd is not None:
 		vol.add_crop(tuple(int(v) for v in crop_xyzwhd))
