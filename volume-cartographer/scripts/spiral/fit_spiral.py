@@ -1493,6 +1493,7 @@ def _build_unattached_pcl_flat_bundle(strips, device):
         'windings': torch.from_numpy(windings_flat).to(device=device),
         'strip_id': torch.from_numpy(strip_id_np).to(device=device),
         'starts': torch.from_numpy(starts_np).to(device=device),
+        'starts_cpu': torch.from_numpy(starts_np),
         'lengths': torch.from_numpy(lengths_np).to(device=device),
         'lengths_cpu': torch.from_numpy(lengths_np),
         'num_strips': len(strips),
@@ -1709,17 +1710,21 @@ def get_unattached_pcl_strip_losses(
     num_to_sample = min(num_pcls_per_step, len(pcl_strips))
     chosen = np.random.choice(len(pcl_strips), num_to_sample, replace=False)
 
-    sampled_zyxs = np.empty([num_to_sample, num_points_per_pcl, 3], dtype=np.float32)
-    sampled_winding = np.empty([num_to_sample, num_points_per_pcl], dtype=np.float32)
+    flat = _get_or_build_unattached_pcl_flat(pcl_strips, device)
+    if flat is None or flat['total'] == 0:
+        return zero, zero
+
+    starts_cpu = flat['starts_cpu'].numpy()
+    sampled_flat_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
     for k, pcl_idx in enumerate(chosen):
         strip = pcl_strips[pcl_idx]
         N = len(strip['zyxs'])
         coords = np.sort(np.random.choice(N, num_points_per_pcl, replace=num_points_per_pcl > N))
-        sampled_zyxs[k] = strip['zyxs'][coords]
-        sampled_winding[k] = strip['windings'][coords]
+        sampled_flat_indices[k] = starts_cpu[pcl_idx] + coords
 
-    zyxs_t = torch.from_numpy(sampled_zyxs).to(device=device)
-    winding_t = torch.from_numpy(sampled_winding).to(device=device)
+    sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
+    zyxs_t = flat['zyxs'][sampled_flat_indices_t]
+    winding_t = flat['windings'][sampled_flat_indices_t]
 
     spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
