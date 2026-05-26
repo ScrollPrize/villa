@@ -59,6 +59,18 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
     },
     {
+      "name": "dev-quickbuild-gcc",
+      "displayName": "QuickBuild (gcc, O1, PCH, no LTO, native arch)",
+      "inherits": ["_dev-base", "_gcc"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "QuickBuild" }
+    },
+    {
+      "name": "dev-quickbuild-clang",
+      "displayName": "QuickBuild (clang, O1, PCH, no LTO, native arch)",
+      "inherits": ["_dev-base", "_clang"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "QuickBuild" }
+    },
+    {
       "name": "dev-profile-clang",
       "displayName": "Compile-time profile (clang, -ftime-trace)",
       "inherits": ["_dev-base", "_clang"],
@@ -154,6 +166,8 @@
   "buildPresets": [
     { "name": "dev-gcc",                  "configurePreset": "dev-gcc" },
     { "name": "dev-clang",                "configurePreset": "dev-clang" },
+    { "name": "dev-quickbuild-gcc",       "configurePreset": "dev-quickbuild-gcc" },
+    { "name": "dev-quickbuild-clang",     "configurePreset": "dev-quickbuild-clang" },
     { "name": "dev-profile-clang",        "configurePreset": "dev-profile-clang" },
 
     { "name": "ci-debug-gcc",             "configurePreset": "ci-debug-gcc" },
