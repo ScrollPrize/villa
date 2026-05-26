@@ -112,6 +112,7 @@ default_config = {
     'loss_weight_shell_outer': 0.0,
     'loss_weight_shell_no_cross': 0.0,
     'loss_weight_shell_z_drift': 0.0,
+    'loss_weight_shell_patch_radius': 1.0,
     'loss_start_patch_dt': 9000,
     'output_first_winding': 10,
     'output_winding_margin': 4,
@@ -255,6 +256,7 @@ def shell_losses_enabled():
         cfg['loss_weight_shell_outer'] > 0
         or cfg['loss_weight_shell_no_cross'] > 0
         or cfg['loss_weight_shell_z_drift'] > 0
+        or cfg['loss_weight_shell_patch_radius'] > 0
     )
 
 
@@ -1047,7 +1049,7 @@ class PatchGpuAtlas:
         return top + (bottom - top) * di
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, umbilicus_zyx=None):
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, extra_zyxs=None):
     if len(patch_indices) == 0:
         raise ValueError('Expected at least one patch index')
 
@@ -1117,23 +1119,22 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     patch_idx_per_sample = patch_indices_gpu[None, :, None].expand(2, N, num_points_per_direction)
     all_slice_zyxs = patch_atlas.lookup(patch_idx_per_sample, combined_ijs_gpu)
 
-    # When the caller also needs umbilicus_spiral (radius loss path), pack it into the same
-    # forward ODE call to amortise the per-call overhead
+    # When the caller has extra points (umbilicus, shell, ...), pack them into the same
+    # forward ODE call to amortise the per-call overhead.
     patches_flat = all_slice_zyxs.reshape(-1, 3)
-    if umbilicus_zyx is not None:
+    if extra_zyxs is not None:
+        combined_spiral = slice_to_spiral_transform(torch.cat([patches_flat, extra_zyxs], dim=0))
         n_patch_pts = patches_flat.shape[0]
-        combined = torch.cat([patches_flat, umbilicus_zyx], dim=0)
-        combined_spiral = slice_to_spiral_transform(combined)
         all_spiral_zyxs = combined_spiral[:n_patch_pts].reshape(*all_slice_zyxs.shape)
-        umbilicus_spiral = combined_spiral[n_patch_pts:]
+        extra_spiral = combined_spiral[n_patch_pts:]
     else:
         all_spiral_zyxs = slice_to_spiral_transform(patches_flat).reshape(*all_slice_zyxs.shape)
-        umbilicus_spiral = None
+        extra_spiral = None
 
     all_theta, _, all_shifted_radii = get_theta_and_radii(all_spiral_zyxs[..., 1:], dr_per_winding)
     all_shifted_radii = _unwrap_track_shifted_radii(all_theta, all_shifted_radii, dr_per_winding)
 
-    return all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii, umbilicus_spiral
+    return all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii, extra_spiral
 
 
 def _get_patch_valid_points(patch, device, max_points=None, fixed_num_points=None):
@@ -1152,21 +1153,31 @@ def _get_patch_valid_points(patch, device, max_points=None, fixed_num_points=Non
     return patch.zyxs[valid_indices[0], valid_indices[1], :].to(device=device, dtype=torch.float32)
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None):
 
     # Sample once and share the tracks between the radius and DT losses; the loss using
     # fewer patches takes a prefix of the larger sample.
     num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
     patch_indices = np.random.choice(len(patches), num_patches_to_sample, p=patch_sampling_probabilities, replace=True)
 
-    all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii, umbilicus_spiral = _sample_patch_tracks(
+    n_umb = umbilicus_zyx.shape[0]
+    if shell_valid_zyxs is not None:
+        num_shell_samples = min(int(cfg['shell_num_samples']), shell_valid_zyxs.shape[0])
+        sample_idx = torch.randint(shell_valid_zyxs.shape[0], (num_shell_samples,), device=shell_valid_zyxs.device)
+        extra_zyxs = torch.cat([umbilicus_zyx, shell_valid_zyxs[sample_idx]], dim=0)
+    else:
+        extra_zyxs = umbilicus_zyx
+
+    all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii, extra_spiral = _sample_patch_tracks(
         slice_to_spiral_transform,
         dr_per_winding,
         patches,
         patch_atlas,
         patch_indices,
-        umbilicus_zyx,
+        extra_zyxs,
     )
+    umbilicus_spiral = extra_spiral[:n_umb]
+    shell_spiral_zyxs = extra_spiral[n_umb:] if shell_valid_zyxs is not None else None
 
     hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
 
@@ -1179,6 +1190,13 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
     umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()
+
+    if shell_spiral_zyxs is not None:
+        _, _, shell_shifted_radii = get_theta_and_radii(shell_spiral_zyxs[..., 1:], dr_per_winding)
+        shell_target = dr_per_winding * float(shell_outer_winding_idx)
+        shell_patch_radius_loss = F.relu((shell_shifted_radii - shell_target).abs() - hinge_margin).mean()
+    else:
+        shell_patch_radius_loss = torch.zeros([], device=dr_per_winding.device)
 
     if compute_dt:
         dt_slice_zyxs = all_slice_zyxs[:, :num_patches_for_dt]
@@ -1210,7 +1228,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
     else:
         patch_dt_loss = torch.zeros([], device=dr_per_winding.device)
 
-    return mean_radius_deviation, umbilicus_loss, patch_dt_loss
+    return mean_radius_deviation, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss
 
 
 def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, num_points):
@@ -2927,15 +2945,23 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
     shell_map = None
     shell_outer_winding_idx = None
+    shell_valid_zyxs_gpu = None
     if shell_patch is not None and shell_losses_enabled():
-        shell_map = ShellPolarMap(
-            shell_patch,
-            z_to_umbilicus_yx,
-            z_min=z_begin - cfg['flow_bounds_z_margin'],
-            z_max=z_end + cfg['flow_bounds_z_margin'],
-            num_theta_bins=cfg['shell_num_theta_bins'],
-            device=device,
-        )
+        if (
+            cfg['loss_weight_shell_outer'] > 0
+            or cfg['loss_weight_shell_no_cross'] > 0
+            or cfg['loss_weight_shell_z_drift'] > 0
+        ):
+            shell_map = ShellPolarMap(
+                shell_patch,
+                z_to_umbilicus_yx,
+                z_min=z_begin - cfg['flow_bounds_z_margin'],
+                z_max=z_end + cfg['flow_bounds_z_margin'],
+                num_theta_bins=cfg['shell_num_theta_bins'],
+                device=device,
+            )
+        if cfg['loss_weight_shell_patch_radius'] > 0:
+            shell_valid_zyxs_gpu = shell_patch.valid_zyxs.to(device=device, dtype=torch.float32)
         initial_transform = spiral_and_transform.get_slice_to_spiral_transform()
         initial_dr = spiral_and_transform.get_dr_per_winding()
         if cfg['shell_outer_winding_idx'] is None:
@@ -3102,7 +3128,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         #  on the patch -- but need to account properly for theta=0
 
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
-        patch_radius_loss, umbilicus_loss, patch_dt_loss = get_patch_and_umbilicus_losses(
+        patch_radius_loss, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss = get_patch_and_umbilicus_losses(
             slice_to_spiral_transform,
             dr_per_winding,
             cfg['num_patches_per_step'],
@@ -3112,9 +3138,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             patch_sampling_probabilities,
             umbilicus_zyx,
             compute_dt=compute_patch_dt,
+            shell_valid_zyxs=shell_valid_zyxs_gpu,
+            shell_outer_winding_idx=shell_outer_winding_idx,
         )
         losses['patch_radius'] = patch_radius_loss * cfg['loss_weight_patch_radius']
         losses['patch_dt'] = patch_dt_loss * cfg['loss_weight_patch_dt']
+        if shell_valid_zyxs_gpu is not None:
+            losses['shell_patch_radius'] = shell_patch_radius_loss * cfg['loss_weight_shell_patch_radius']
 
         if cfg['loss_weight_patch_stretch'] > 0 or cfg['loss_weight_patch_normals'] > 0:
             patch_stretch_loss, patch_normals_loss = get_patch_stretch_and_normals_loss(
