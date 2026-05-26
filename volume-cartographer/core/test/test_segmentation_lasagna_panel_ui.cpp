@@ -92,6 +92,8 @@ int main(int argc, char** argv)
     settings.setValue(QStringLiteral("lasagna_offset_value"), -1.25);
     settings.setValue(QStringLiteral("lasagna_window_size"), 3210);
     settings.setValue(QStringLiteral("lasagna_window_overlap"), 210);
+    const QString altConfigPath = tempDir.filePath(QStringLiteral("alt_config.json"));
+    writeFile(altConfigPath, QByteArrayLiteral(R"({"args":{"alternate":1}})"));
 
     SegmentationLasagnaPanel panel(QStringLiteral("test-lasagna"));
     panel.restoreSettings(settings);
@@ -113,6 +115,8 @@ int main(int argc, char** argv)
     settings.setValue(QStringLiteral("lasagna_reopt_config_file_path"), configPath);
     settings.setValue(QStringLiteral("lasagna_offset_config_file_path"), configPath);
     panel.restoreSettings(settings);
+    QWidget* compactView = panel.createCompactView();
+    require(compactView != nullptr, "createCompactView should return a compact Lasagna widget");
     panel._lasagnaMode = SegmentationLasagnaPanel::LasagnaMode::NewModel;
     require(panel.selectedLasagnaConfigPathForMode(SegmentationLasagnaPanel::LasagnaMode::NewModel) == configPath,
             "Selected new-model config path should restore from settings");
@@ -129,6 +133,22 @@ int main(int argc, char** argv)
     panel.setSeedFromFocus(7, 8, 9);
     require(panel.seedPointText() == QStringLiteral("7, 8, 9"),
             "setSeedFromFocus should update the seed editor");
+
+    panel.populateConfigCombo(panel._newModelConfigCombo,
+                              QFileInfo(configPath).absolutePath(),
+                              QFileInfo(configPath).fileName(),
+                              panel._newModelConfigFilePath);
+    require(panel._compactNewModelConfigCombo->count() == panel._newModelConfigCombo->count(),
+            "Compact new-model config combo should mirror the full combo");
+    const int altIndex = panel._compactNewModelConfigCombo->findData(altConfigPath);
+    require(altIndex >= 0, "Compact config combo should include configs from the full combo");
+    panel._compactNewModelConfigCombo->setCurrentIndex(altIndex);
+    require(panel.selectedLasagnaConfigPathForMode(SegmentationLasagnaPanel::LasagnaMode::NewModel) == altConfigPath,
+            "Changing the compact config selector should update shared panel state");
+    panel._newModelConfigCombo->setCurrentIndex(panel._newModelConfigCombo->findData(configPath));
+    panel.syncCompactConfigCombos();
+    require(panel._compactNewModelConfigCombo->currentData().toString() == configPath,
+            "Changing the full config selector should update the compact selector");
 
     emit LasagnaServiceManager::instance().jobsUpdated(QJsonArray{
         queuedJob(1, QStringLiteral("sheet_v001.tifxyz")),
@@ -165,6 +185,13 @@ int main(int argc, char** argv)
     panel.triggerOptimization();
     require(optimizeRequested.count() == 1,
             "triggerOptimization should emit optimize request for a valid internal config");
+    panel.syncUiState(true, false);
+    panel._compactReoptBtn->click();
+    require(optimizeRequested.count() == 2,
+            "Compact Re-optimize should emit the same optimize request");
+    panel.repeatLastLasagnaAction();
+    require(optimizeRequested.count() == 3,
+            "repeatLastLasagnaAction should repeat the last selected Lasagna action");
 
     panel.onConnectionModeChanged(1);
     require(panel._externalWidget->isVisible() || !panel._externalWidget->isHidden(),
@@ -244,6 +271,8 @@ int main(int argc, char** argv)
     emit LasagnaServiceManager::instance().statusMessage(QStringLiteral("preparing"));
     require(panel._progressLabel->text() == QStringLiteral("preparing"),
             "Status message signal should update the progress label");
+    require(panel._compactProgressLabel->text() == QStringLiteral("preparing"),
+            "Status message signal should update compact progress label");
 
     emit LasagnaServiceManager::instance().optimizationProgress(
         QStringLiteral("stage"), 1, 2, 0.125, 0.5, 0.75, QStringLiteral("fit"));
@@ -251,6 +280,8 @@ int main(int argc, char** argv)
             "Optimization progress should show the progress bar");
     require(panel._progressBar->value() == 750,
             "Optimization progress should map overall progress to the progress bar");
+    require(panel._compactProgressBar->value() == 750,
+            "Optimization progress should map overall progress to the compact progress bar");
     require(panel._progressLabel->text().contains(QStringLiteral("fit")),
             "Optimization progress should include the stage name");
 

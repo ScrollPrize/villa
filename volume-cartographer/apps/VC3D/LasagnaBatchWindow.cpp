@@ -95,6 +95,19 @@ LasagnaBatchWindow::LasagnaBatchWindow(QWidget* parent)
     layout->addWidget(_table, 1);
     connect(_table->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, [this]() { updateActionState(); });
+    connect(_table, &QTableView::doubleClicked, this, [this](const QModelIndex& index) {
+        if (!index.isValid()) {
+            return;
+        }
+        const QJsonObject job = jobAtRow(index.row());
+        if (job[QStringLiteral("state")].toString() != QStringLiteral("finished")) {
+            return;
+        }
+        const QString outputName = outputNameText(job);
+        if (!outputName.isEmpty()) {
+            emit finishedOutputActivated(outputName);
+        }
+    });
 
     auto* buttonRow = new QHBoxLayout();
     _upButton = new QPushButton(tr("Up"), this);

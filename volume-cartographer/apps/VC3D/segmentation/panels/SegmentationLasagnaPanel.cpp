@@ -28,8 +28,10 @@
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSplitter>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -72,9 +74,26 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     : QWidget(parent)
     , _settingsGroup(settingsGroup)
 {
-    auto* panelLayout = new QVBoxLayout(this);
+    auto* rootLayout = new QVBoxLayout(this);
+    rootLayout->setContentsMargins(0, 0, 0, 0);
+    rootLayout->setSpacing(0);
+
+    auto* splitter = new QSplitter(Qt::Horizontal, this);
+    splitter->setChildrenCollapsible(false);
+    rootLayout->addWidget(splitter);
+
+    auto* controlsScrollArea = new QScrollArea(splitter);
+    controlsScrollArea->setFrameShape(QFrame::NoFrame);
+    controlsScrollArea->setWidgetResizable(true);
+    controlsScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    controlsScrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+    auto* controlsWidget = new QWidget(controlsScrollArea);
+    auto* panelLayout = new QVBoxLayout(controlsWidget);
     panelLayout->setContentsMargins(0, 0, 0, 0);
     panelLayout->setSpacing(2);
+    controlsScrollArea->setWidget(controlsWidget);
+    splitter->addWidget(controlsScrollArea);
 
     // =======================================================================
     // Connection section
@@ -353,21 +372,28 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     btnRow->addStretch(1);
     panelLayout->addLayout(btnRow);
 
-    _progressBar = new QProgressBar(this);
+    auto* progressState = new QWidget(this);
+    progressState->hide();
+    _progressBar = new QProgressBar(progressState);
     _progressBar->setRange(0, 100);
     _progressBar->setValue(0);
     _progressBar->setTextVisible(true);
     _progressBar->setVisible(false);
-    panelLayout->addWidget(_progressBar);
 
-    _progressLabel = new QLabel(this);
+    _progressLabel = new QLabel(progressState);
     _progressLabel->setWordWrap(true);
     _progressLabel->setVisible(false);
-    panelLayout->addWidget(_progressLabel);
+    panelLayout->addStretch(1);
 
-    _batchWindow = new LasagnaBatchWindow(this);
+    _batchWindow = new LasagnaBatchWindow(splitter);
     _batchWindow->setMinimumHeight(180);
-    panelLayout->addWidget(_batchWindow);
+    _batchWindow->setMinimumWidth(280);
+    splitter->addWidget(_batchWindow);
+    connect(_batchWindow, &LasagnaBatchWindow::finishedOutputActivated,
+            this, &SegmentationLasagnaPanel::lasagnaOutputActivated);
+    splitter->setStretchFactor(0, 1);
+    splitter->setStretchFactor(1, 2);
+    splitter->setSizes({360, 640});
 
     // -----------------------------------------------------------------------
     // Signal wiring
@@ -484,6 +510,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (!path.isEmpty()) {
             _newModelConfigFilePath = path;
             writeSetting(QStringLiteral("lasagna_new_model_config_file_path"), _newModelConfigFilePath);
+            syncCompactConfigCombos();
         }
     });
     connect(_newModelConfigBrowse, &QToolButton::clicked, this, [this]() {
@@ -497,6 +524,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             writeSetting(QStringLiteral("lasagna_new_model_config_file_path"), _newModelConfigFilePath);
             QFileInfo fi(path);
             populateConfigCombo(_newModelConfigCombo, fi.absolutePath(), fi.fileName(), _newModelConfigFilePath);
+            syncCompactConfigCombos();
         }
     });
 
@@ -508,6 +536,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (!path.isEmpty()) {
             _reoptConfigFilePath = path;
             writeSetting(QStringLiteral("lasagna_reopt_config_file_path"), _reoptConfigFilePath);
+            syncCompactConfigCombos();
         }
     });
     connect(_reoptConfigBrowse, &QToolButton::clicked, this, [this]() {
@@ -521,6 +550,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             writeSetting(QStringLiteral("lasagna_reopt_config_file_path"), _reoptConfigFilePath);
             QFileInfo fi(path);
             populateConfigCombo(_reoptConfigCombo, fi.absolutePath(), fi.fileName(), _reoptConfigFilePath);
+            syncCompactConfigCombos();
         }
     });
 
@@ -532,6 +562,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (!path.isEmpty()) {
             _offsetConfigFilePath = path;
             writeSetting(QStringLiteral("lasagna_offset_config_file_path"), _offsetConfigFilePath);
+            syncCompactConfigCombos();
         }
     });
     connect(_offsetConfigBrowse, &QToolButton::clicked, this, [this]() {
@@ -545,6 +576,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             writeSetting(QStringLiteral("lasagna_offset_config_file_path"), _offsetConfigFilePath);
             QFileInfo fi(path);
             populateConfigCombo(_offsetConfigCombo, fi.absolutePath(), fi.fileName(), _offsetConfigFilePath);
+            syncCompactConfigCombos();
         }
     });
     connect(_offsetValueSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
@@ -560,16 +592,13 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     // -- Action buttons --
     connect(_newModelBtn, &QPushButton::clicked, this, [this]() {
-        _lasagnaMode = 1;
-        triggerOptimization();
+        launchLasagnaMode(LasagnaMode::NewModel);
     });
     connect(_reoptBtn, &QPushButton::clicked, this, [this]() {
-        _lasagnaMode = 0;
-        triggerOptimization();
+        launchLasagnaMode(LasagnaMode::ReOptimize);
     });
     connect(_offsetBtn, &QPushButton::clicked, this, [this]() {
-        _lasagnaMode = 3;
-        triggerOptimization();
+        launchLasagnaMode(LasagnaMode::Offset);
     });
 
     // -- Stop buttons --
@@ -604,6 +633,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
+        syncCompactStatusFromFull();
         emit lasagnaStatusMessage(msg);
     });
     connect(&mgr, &LasagnaServiceManager::serviceStarted, this, [this]() {
@@ -614,6 +644,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_stopServiceBtn) _stopServiceBtn->setEnabled(true);
         // Always fetch datasets from the connected service
         LasagnaServiceManager::instance().fetchDatasets();
+        syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::serviceStopped, this, [this]() {
         if (_progressBar) _progressBar->setVisible(false);
@@ -634,6 +665,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             if (_reoptBtn) _reoptBtn->setEnabled(true);
             if (_offsetBtn) _offsetBtn->setEnabled(true);
             }
+        syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::serviceError, this, [this](const QString& err) {
         std::cerr << "[lasagna] service error: " << err.toStdString() << std::endl;
@@ -648,6 +680,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             if (_reoptBtn) _reoptBtn->setEnabled(false);
             if (_offsetBtn) _offsetBtn->setEnabled(false);
         }
+        syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::optimizationStarted, this, [this]() {
         if (_stopBtn) _stopBtn->setEnabled(true);
@@ -657,6 +690,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
+        syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::optimizationProgress, this,
             [this](const QString& /*stage*/, int /*step*/, int /*total*/, double loss,
@@ -679,6 +713,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
+        syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::jobsUpdated, this, [this](const QJsonArray& jobs) {
         QStringList queued;
@@ -703,6 +738,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }
+        syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::optimizationFinished, this,
             [this](const QString& outputDir) {
@@ -716,6 +752,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QStringLiteral("color: #27ae60;"));
             _progressLabel->setVisible(true);
         }
+        syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::optimizationError, this,
             [this](const QString& err) {
@@ -730,6 +767,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
             _progressLabel->setVisible(true);
         }
+        syncCompactStatusFromFull();
     });
 
 #ifndef VC_TEST_DISABLE_LASAGNA_DISCOVERY
@@ -761,6 +799,145 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         return LasagnaServiceManager::discoverServices();
     }));
 #endif
+}
+
+QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
+{
+    if (_compactView) {
+        _compactView->setParent(parent);
+        return _compactView;
+    }
+
+    _compactView = new QWidget(parent);
+    auto* layout = new QVBoxLayout(_compactView);
+    layout->setContentsMargins(6, 6, 6, 6);
+    layout->setSpacing(6);
+
+    auto* openBtn = new QPushButton(tr("settings"), _compactView);
+    layout->addWidget(openBtn);
+    connect(openBtn, &QPushButton::clicked, this, &SegmentationLasagnaPanel::openLasagnaWorkspaceRequested);
+
+    auto addConfigRow = [this, layout](const QString& labelText, QComboBox*& combo) {
+        auto* row = new QHBoxLayout();
+        row->addWidget(new QLabel(labelText, _compactView));
+        combo = new QComboBox(_compactView);
+        combo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        row->addWidget(combo, 1);
+        layout->addLayout(row);
+    };
+
+    addConfigRow(tr("New:"), _compactNewModelConfigCombo);
+    _compactNewModelBtn = new QPushButton(tr("New Model"), _compactView);
+    layout->addWidget(_compactNewModelBtn);
+
+    addConfigRow(tr("Re-opt:"), _compactReoptConfigCombo);
+    _compactReoptBtn = new QPushButton(tr("Re-optimize"), _compactView);
+    layout->addWidget(_compactReoptBtn);
+
+    auto* stopRow = new QHBoxLayout();
+    _compactStopBtn = new QPushButton(tr("Stop"), _compactView);
+    _compactStopServiceBtn = new QPushButton(tr("Stop Service"), _compactView);
+    stopRow->addWidget(_compactStopBtn);
+    stopRow->addWidget(_compactStopServiceBtn);
+    layout->addLayout(stopRow);
+
+    _compactProgressBar = new QProgressBar(_compactView);
+    layout->addWidget(_compactProgressBar);
+    _compactProgressLabel = new QLabel(_compactView);
+    _compactProgressLabel->setWordWrap(true);
+    layout->addWidget(_compactProgressLabel);
+    layout->addStretch(1);
+
+    connect(_compactNewModelBtn, &QPushButton::clicked, this, [this]() {
+        launchLasagnaMode(LasagnaMode::NewModel);
+    });
+    connect(_compactReoptBtn, &QPushButton::clicked, this, [this]() {
+        launchLasagnaMode(LasagnaMode::ReOptimize);
+    });
+    connect(_compactStopBtn, &QPushButton::clicked, this, [this]() {
+        emit lasagnaStopRequested();
+    });
+    connect(_compactStopServiceBtn, &QPushButton::clicked, this, []() {
+        LasagnaServiceManager::instance().stopService();
+    });
+    connect(_compactNewModelConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (index < 0 || !_compactNewModelConfigCombo) return;
+        const QString path = _compactNewModelConfigCombo->currentData().toString();
+        if (path.isEmpty() || path == _newModelConfigFilePath) return;
+        _newModelConfigFilePath = path;
+        writeSetting(QStringLiteral("lasagna_new_model_config_file_path"), _newModelConfigFilePath);
+        if (_newModelConfigCombo) {
+            const QSignalBlocker blocker(_newModelConfigCombo);
+            const int fullIndex = _newModelConfigCombo->findData(path);
+            if (fullIndex >= 0) _newModelConfigCombo->setCurrentIndex(fullIndex);
+        }
+    });
+    connect(_compactReoptConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (index < 0 || !_compactReoptConfigCombo) return;
+        const QString path = _compactReoptConfigCombo->currentData().toString();
+        if (path.isEmpty() || path == _reoptConfigFilePath) return;
+        _reoptConfigFilePath = path;
+        writeSetting(QStringLiteral("lasagna_reopt_config_file_path"), _reoptConfigFilePath);
+        if (_reoptConfigCombo) {
+            const QSignalBlocker blocker(_reoptConfigCombo);
+            const int fullIndex = _reoptConfigCombo->findData(path);
+            if (fullIndex >= 0) _reoptConfigCombo->setCurrentIndex(fullIndex);
+        }
+    });
+
+    syncCompactConfigCombos();
+    syncCompactStatusFromFull();
+    return _compactView;
+}
+
+void SegmentationLasagnaPanel::syncCompactConfigCombos()
+{
+    auto syncCombo = [](QComboBox* compact, const QComboBox* full, const QString& selectedPath) {
+        if (!compact || !full) {
+            return;
+        }
+        const QSignalBlocker blocker(compact);
+        compact->clear();
+        for (int i = 0; i < full->count(); ++i) {
+            compact->addItem(full->itemText(i), full->itemData(i));
+        }
+        const int index = compact->findData(selectedPath);
+        if (index >= 0) {
+            compact->setCurrentIndex(index);
+        }
+    };
+
+    syncCombo(_compactNewModelConfigCombo, _newModelConfigCombo, _newModelConfigFilePath);
+    syncCombo(_compactReoptConfigCombo, _reoptConfigCombo, _reoptConfigFilePath);
+}
+
+void SegmentationLasagnaPanel::syncCompactStatusFromFull()
+{
+    if (_compactNewModelBtn && _newModelBtn) {
+        _compactNewModelBtn->setEnabled(_newModelBtn->isEnabled());
+    }
+    if (_compactReoptBtn && _reoptBtn) {
+        _compactReoptBtn->setEnabled(_reoptBtn->isEnabled());
+    }
+    if (_compactStopBtn && _stopBtn) {
+        _compactStopBtn->setEnabled(_stopBtn->isEnabled());
+    }
+    if (_compactStopServiceBtn && _stopServiceBtn) {
+        _compactStopServiceBtn->setEnabled(_stopServiceBtn->isEnabled());
+    }
+    if (_compactProgressBar && _progressBar) {
+        _compactProgressBar->setRange(_progressBar->minimum(), _progressBar->maximum());
+        _compactProgressBar->setValue(_progressBar->value());
+        _compactProgressBar->setFormat(_progressBar->format());
+        _compactProgressBar->setVisible(!_progressBar->isHidden());
+    }
+    if (_compactProgressLabel && _progressLabel) {
+        _compactProgressLabel->setText(_progressLabel->text());
+        _compactProgressLabel->setStyleSheet(_progressLabel->styleSheet());
+        _compactProgressLabel->setVisible(!_progressLabel->isHidden());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -821,6 +998,18 @@ void SegmentationLasagnaPanel::triggerOptimization()
     emit lasagnaOptimizeRequested();
 }
 
+void SegmentationLasagnaPanel::launchLasagnaMode(LasagnaMode mode)
+{
+    _lastLasagnaMode = mode;
+    _lasagnaMode = static_cast<int>(mode);
+    triggerOptimization();
+}
+
+void SegmentationLasagnaPanel::repeatLastLasagnaAction()
+{
+    launchLasagnaMode(_lastLasagnaMode);
+}
+
 void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* statusBar)
 {
     startOptimizationWithOverrides(state, statusBar, -1, QString(), false, 0, 0, 0);
@@ -834,6 +1023,7 @@ void SegmentationLasagnaPanel::startOptimizationAtSeed(CState* state,
                                                        int seedY,
                                                        int seedZ)
 {
+    _lastLasagnaMode = mode;
     auto showStatus = [statusBar](const QString& msg, int timeout) {
         if (statusBar) {
             statusBar->showMessage(msg, timeout);
@@ -1511,6 +1701,8 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     }
 
     _restoringSettings = false;
+    syncCompactConfigCombos();
+    syncCompactStatusFromFull();
 }
 
 void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimizing)
@@ -1524,6 +1716,7 @@ void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimiz
     if (_reoptBtn) _reoptBtn->setEnabled(!optimizing);
     if (_offsetBtn) _offsetBtn->setEnabled(!optimizing);
     if (_stopBtn) _stopBtn->setEnabled(optimizing);
+    syncCompactStatusFromFull();
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,6 +1770,7 @@ void SegmentationLasagnaPanel::populateConfigCombo(
         combo->setCurrentIndex(0);
         outPath = combo->currentData().toString();
     }
+    syncCompactConfigCombos();
 }
 
 // ---------------------------------------------------------------------------

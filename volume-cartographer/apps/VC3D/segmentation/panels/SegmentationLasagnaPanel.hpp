@@ -61,6 +61,8 @@ public:
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
+    QWidget* createCompactView(QWidget* parent = nullptr);
+    void repeatLastLasagnaAction();
     void startOptimization(CState* state, QStatusBar* statusBar);
     void startOptimizationAtSeed(CState* state,
                                  QStatusBar* statusBar,
@@ -80,6 +82,8 @@ signals:
     void lasagnaStopRequested();
     void lasagnaStatusMessage(const QString& message);
     void seedFromFocusRequested();
+    void openLasagnaWorkspaceRequested();
+    void lasagnaOutputActivated(const QString& outputName);
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -91,6 +95,9 @@ private:
     void onDiscoveredServiceSelected(int index);
     void updateConnectionWidgets();
     void triggerOptimization();
+    void launchLasagnaMode(LasagnaMode mode);
+    void syncCompactConfigCombos();
+    void syncCompactStatusFromFull();
     void startOptimizationWithOverrides(CState* state,
                                         QStatusBar* statusBar,
                                         int modeOverride,
@@ -153,12 +160,23 @@ private:
     QLabel* _progressLabel{nullptr};
     LasagnaBatchWindow* _batchWindow{nullptr};
 
+    QWidget* _compactView{nullptr};
+    QComboBox* _compactNewModelConfigCombo{nullptr};
+    QComboBox* _compactReoptConfigCombo{nullptr};
+    QPushButton* _compactNewModelBtn{nullptr};
+    QPushButton* _compactReoptBtn{nullptr};
+    QPushButton* _compactStopBtn{nullptr};
+    QPushButton* _compactStopServiceBtn{nullptr};
+    QProgressBar* _compactProgressBar{nullptr};
+    QLabel* _compactProgressLabel{nullptr};
+
     QString _lasagnaDataInputPath;
     QString _newModelConfigFilePath;
     QString _reoptConfigFilePath;
     QString _offsetConfigFilePath;
 
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
+    LasagnaMode _lastLasagnaMode{LasagnaMode::ReOptimize};
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};

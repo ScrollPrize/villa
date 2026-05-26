@@ -48,6 +48,8 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QMenu>
+#include <QMainWindow>
+#include <QTabWidget>
 #include "utils/Json.hpp"
 #include <QPointer>
 #include <QListView>
@@ -112,6 +114,7 @@ using qga = QGuiApplication;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
+constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
 {
@@ -353,13 +356,14 @@ static bool windowStateMetaMatches(const QSettings& settings,
     const QString savedAppVersion =
         settings.value(vc3d::settings::window::STATE_META_APP_VERSION).toString();
 
-    if (savedSignature.isEmpty() || savedQtVersion.isEmpty() || savedAppVersion.isEmpty()) {
+    if (savedSignature.isEmpty() || savedQtVersion.isEmpty()) {
         return false;
     }
 
+    Q_UNUSED(savedAppVersion);
+    Q_UNUSED(appVersion);
     return savedSignature == screenSignature
-        && savedQtVersion == qtVersion
-        && savedAppVersion == appVersion;
+        && savedQtVersion == qtVersion;
 }
 
 // Constructor
@@ -379,6 +383,46 @@ CWindow::CWindow(size_t cacheSizeGB) :
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
+    QWidget* segmentCentralWidget = takeCentralWidget();
+    _segmentWorkspaceWindow = new QMainWindow(this);
+    _segmentWorkspaceWindow->setObjectName(QStringLiteral("segmentWorkspaceWindow"));
+    _segmentWorkspaceWindow->setDockOptions(dockOptions());
+    _segmentWorkspaceWindow->setCentralWidget(segmentCentralWidget);
+
+    auto moveExistingDockToSegment = [this](QDockWidget* dock, Qt::DockWidgetArea area) {
+        if (!dock || !_segmentWorkspaceWindow) {
+            return;
+        }
+        removeDockWidget(dock);
+        _segmentWorkspaceWindow->addDockWidget(area, dock);
+    };
+    moveExistingDockToSegment(ui.dockWidgetVolumes, Qt::LeftDockWidgetArea);
+    moveExistingDockToSegment(ui.dockWidgetSegmentation, Qt::RightDockWidgetArea);
+    moveExistingDockToSegment(ui.dockWidgetDistanceTransform, Qt::RightDockWidgetArea);
+    moveExistingDockToSegment(ui.dockWidgetViewerControls, Qt::LeftDockWidgetArea);
+    for (QDockWidget* dock : {ui.dockWidgetPreprocessing,
+                              ui.dockWidgetNormalVis,
+                              ui.dockWidgetView,
+                              ui.dockWidgetOverlay,
+                              ui.dockWidgetRenderSettings,
+                              ui.dockWidgetComposite,
+                              ui.dockWidgetPostprocessing}) {
+        moveExistingDockToSegment(dock, Qt::LeftDockWidgetArea);
+    }
+
+    _lasagnaWorkspaceWindow = new QMainWindow(this);
+    _lasagnaWorkspaceWindow->setObjectName(QStringLiteral("lasagnaWorkspaceWindow"));
+
+    _workspaceTabs = new QTabWidget(this);
+    _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
+    _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
+    _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
+    setCentralWidget(_workspaceTabs);
+    connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
+    auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
+    lasagnaEscapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(lasagnaEscapeShortcut, &QShortcut::activated, this, &CWindow::switchToMainWorkspace);
+
     const QString baseTitle = windowTitle();
     const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
     if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
@@ -583,7 +627,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         }
         const QByteArray savedState = geometry.value(vc3d::settings::window::STATE).toByteArray();
         if (!savedState.isEmpty()) {
-            restoredState = restoreState(savedState);
+            restoredState = _segmentWorkspaceWindow && _segmentWorkspaceWindow->restoreState(savedState);
             if (!restoredState) {
                 Logger()->warn("Failed to restore main window state; clearing saved state");
                 geometry.remove(vc3d::settings::window::STATE);
@@ -615,9 +659,16 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
     if (!restoredState) {
         // No saved state - set sensible default sizes for dock widgets
-        resizeDocks({ui.dockWidgetVolumes}, {300}, Qt::Horizontal);
-        resizeDocks({ui.dockWidgetVolumes}, {400}, Qt::Vertical);
-        resizeDocks({ui.dockWidgetSegmentation}, {350}, Qt::Horizontal);
+        _segmentWorkspaceWindow->resizeDocks({ui.dockWidgetVolumes}, {300}, Qt::Horizontal);
+        _segmentWorkspaceWindow->resizeDocks({ui.dockWidgetVolumes}, {400}, Qt::Vertical);
+        _segmentWorkspaceWindow->resizeDocks({ui.dockWidgetSegmentation}, {350}, Qt::Horizontal);
+    }
+
+    if (_workspaceTabs) {
+        const int workspaceIndex = geometry.value(WORKSPACE_TAB_SETTING, 0).toInt();
+        if (workspaceIndex >= 0 && workspaceIndex < _workspaceTabs->count()) {
+            _workspaceTabs->setCurrentIndex(workspaceIndex);
+        }
     }
 
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
@@ -842,6 +893,16 @@ CWindow::CWindow(size_t cacheSizeGB) :
     fFocusedViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::FocusedView), this);
     fFocusedViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fFocusedViewShortcut, &QShortcut::activated, this, &CWindow::toggleFocusedView);
+
+    fOpenLasagnaWorkspaceShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+L")), this);
+    fOpenLasagnaWorkspaceShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fOpenLasagnaWorkspaceShortcut, &QShortcut::activated,
+            this, &CWindow::switchToLasagnaWorkspace);
+
+    fRepeatLasagnaActionShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+L")), this);
+    fRepeatLasagnaActionShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fRepeatLasagnaActionShortcut, &QShortcut::activated,
+            this, &CWindow::repeatLastLasagnaAction);
 
     connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested,
             _segmentationCommandHandler.get(), &SegmentationCommandHandler::onMoveSegmentToPaths);
@@ -1390,6 +1451,95 @@ void CWindow::toggleFocusedView()
     }
 }
 
+void CWindow::switchToLasagnaWorkspace()
+{
+    if (!_workspaceTabs || !_lasagnaWorkspaceWindow) {
+        return;
+    }
+    const int index = _workspaceTabs->indexOf(_lasagnaWorkspaceWindow);
+    if (index >= 0) {
+        _workspaceTabs->setCurrentIndex(index);
+        _lasagnaWorkspaceWindow->raise();
+        _lasagnaWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
+    }
+}
+
+void CWindow::switchToMainWorkspace()
+{
+    if (!_workspaceTabs || !_segmentWorkspaceWindow) {
+        return;
+    }
+    const int index = _workspaceTabs->indexOf(_segmentWorkspaceWindow);
+    if (index >= 0) {
+        _workspaceTabs->setCurrentIndex(index);
+        _segmentWorkspaceWindow->raise();
+        _segmentWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
+    }
+}
+
+void CWindow::repeatLastLasagnaAction()
+{
+    if (_segmentationWidget && _segmentationWidget->lasagnaPanel()) {
+        _segmentationWidget->lasagnaPanel()->repeatLastLasagnaAction();
+    }
+}
+
+void CWindow::selectLasagnaOutputSegment(const QString& outputName)
+{
+    switchToMainWorkspace();
+    if (!treeWidgetSurfaces) {
+        return;
+    }
+
+    const QString trimmed = outputName.trimmed();
+    if (trimmed.isEmpty()) {
+        return;
+    }
+
+    QStringList candidates;
+    auto addCandidate = [&candidates](const QString& value) {
+        const QString candidate = value.trimmed();
+        if (!candidate.isEmpty() && !candidates.contains(candidate)) {
+            candidates << candidate;
+        }
+    };
+
+    addCandidate(trimmed);
+    addCandidate(QFileInfo(trimmed).fileName());
+    const QStringList baseCandidates = candidates;
+    for (const QString& candidate : baseCandidates) {
+        if (candidate.endsWith(QStringLiteral(".tifxyz"))) {
+            addCandidate(candidate.left(candidate.size() - 7));
+        } else {
+            addCandidate(candidate + QStringLiteral(".tifxyz"));
+        }
+    }
+
+    auto selectCandidate = [this, &candidates]() -> bool {
+        QTreeWidgetItemIterator it(treeWidgetSurfaces);
+        while (*it) {
+            const QString id = (*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            if (candidates.contains(id)) {
+                treeWidgetSurfaces->setCurrentItem(*it);
+                treeWidgetSurfaces->scrollToItem(*it);
+                ui.dockWidgetVolumes->raise();
+                return true;
+            }
+            ++it;
+        }
+        return false;
+    };
+
+    if (selectCandidate()) {
+        return;
+    }
+
+    if (_surfacePanel) {
+        _surfacePanel->reloadSurfacesFromDisk();
+        selectCandidate();
+    }
+}
+
 bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId)
 {
     if (!_state) {
@@ -1869,10 +2019,18 @@ void CWindow::CreateWidgets(void)
     {
         auto* panel = _segmentationWidget->lasagnaPanel();
         panel->setVisible(true);
-        _lasagnaDock = new QDockWidget(tr("Lasagna Model"), this);
+        _lasagnaWorkspaceWindow->setCentralWidget(panel);
+
+        _lasagnaDock = new QDockWidget(tr("Lasagna"), this);
         _lasagnaDock->setObjectName(QStringLiteral("dockWidgetLasagna"));
-        attachScrollAreaToDock(_lasagnaDock, panel, QStringLiteral("dockWidgetLasagnaContent"));
-        addDockWidget(Qt::RightDockWidgetArea, _lasagnaDock);
+        attachScrollAreaToDock(_lasagnaDock,
+                               panel->createCompactView(_lasagnaDock),
+                               QStringLiteral("dockWidgetLasagnaContent"));
+        _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _lasagnaDock);
+        connect(panel, &SegmentationLasagnaPanel::openLasagnaWorkspaceRequested,
+                this, &CWindow::switchToLasagnaWorkspace);
+        connect(panel, &SegmentationLasagnaPanel::lasagnaOutputActivated,
+                this, &CWindow::selectLasagnaOutputSegment);
     }
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
@@ -2075,7 +2233,7 @@ void CWindow::CreateWidgets(void)
     // Create and add the point collection widget
     _point_collection_widget = new CPointCollectionWidget(_state->pointCollection(), this);
     _point_collection_widget->setObjectName("pointCollectionDock");
-    addDockWidget(Qt::RightDockWidgetArea, _point_collection_widget);
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _point_collection_widget);
 
     // Selection dock (removed per request; selection actions remain in the menu)
     if (_viewerManager) {
@@ -2112,7 +2270,7 @@ void CWindow::CreateWidgets(void)
 
     _fiberWidget = new CFiberWidget(_state->pointCollection(), this);
     _fiberWidget->setObjectName("fiberDock");
-    addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
 
     connect(_fiberWidget, &CFiberWidget::newFiberRequested,
             this, &CWindow::onNewFiberRequested);
@@ -2132,10 +2290,10 @@ void CWindow::CreateWidgets(void)
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
-    tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
-    tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
-    tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
-    tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
+    _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
+    _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
+    _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
+    _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
 
     // Make Segmentation dock the active tab by default
     ui.dockWidgetSegmentation->raise();
@@ -2283,8 +2441,8 @@ void CWindow::CreateWidgets(void)
         },
         this);
 
-    addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
-    splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
+    _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
 
     auto hideLegacyViewerDocks = [this]() {
         for (QDockWidget* dock : { ui.dockWidgetPreprocessing,
@@ -2297,7 +2455,7 @@ void CWindow::CreateWidgets(void)
             if (!dock) {
                 continue;
             }
-            removeDockWidget(dock);
+            _segmentWorkspaceWindow->removeDockWidget(dock);
             dock->setVisible(false);
         }
     };
@@ -2626,7 +2784,14 @@ void CWindow::saveWindowState()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::window::GEOMETRY, saveGeometry());
-    settings.setValue(vc3d::settings::window::STATE, saveState());
+    if (_segmentWorkspaceWindow) {
+        settings.setValue(vc3d::settings::window::STATE, _segmentWorkspaceWindow->saveState());
+    }
+    if (_workspaceTabs) {
+        settings.setValue(WORKSPACE_TAB_SETTING, _workspaceTabs->currentIndex());
+    }
+    settings.setValue(vc3d::settings::window::RESTORE_DISABLED, false);
+    settings.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
     writeWindowStateMeta(settings,
                          windowStateScreenSignature(),
                          windowStateQtVersion(),

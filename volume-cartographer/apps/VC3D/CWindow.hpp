@@ -59,8 +59,10 @@ class MenuActionController;
 class SegmentationGrower;
 class ViewerControlsPanel;
 class QLabel;
+class QMainWindow;
 class QSpinBox;
 class QStandardItemModel;
+class QTabWidget;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
@@ -105,6 +107,11 @@ protected:
 
 private:
     void CreateWidgets(void);
+    QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
+    void switchToLasagnaWorkspace();
+    void switchToMainWorkspace();
+    void repeatLastLasagnaAction();
+    void selectLasagnaOutputSegment(const QString& outputName);
 
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
@@ -203,6 +210,9 @@ private:
 
 
     Ui_VCMainWindow ui;
+    QTabWidget* _workspaceTabs{nullptr};
+    QMainWindow* _segmentWorkspaceWindow{nullptr};
+    QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMdiArea *mdiArea;
 
     bool can_change_volume_();
@@ -251,6 +261,8 @@ private:
     QShortcut* fZoomInShortcut;
     QShortcut* fZoomOutShortcut;
     QShortcut* fResetViewShortcut;
+    QShortcut* fOpenLasagnaWorkspaceShortcut{nullptr};
+    QShortcut* fRepeatLasagnaActionShortcut{nullptr};
 
     // Z offset shortcuts (Ctrl+,/. for normal direction)
     QShortcut* fWorldOffsetZPosShortcut;  // Ctrl+. (further/deeper)

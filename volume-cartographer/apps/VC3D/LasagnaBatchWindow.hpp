@@ -15,6 +15,9 @@ class LasagnaBatchWindow : public QWidget
 public:
     explicit LasagnaBatchWindow(QWidget* parent = nullptr);
 
+signals:
+    void finishedOutputActivated(const QString& outputName);
+
 private:
     void setJobs(const QJsonArray& jobs);
     void applyJobs(const QJsonArray& jobs, const QString& preferredSelection = QString());
