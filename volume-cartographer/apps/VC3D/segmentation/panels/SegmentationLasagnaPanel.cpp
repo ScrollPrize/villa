@@ -876,6 +876,25 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
         syncCompactStatusFromFull();
     });
+    connect(&mgr, &LasagnaServiceManager::artifactUploadProgress, this,
+            [this](const QString& /*jobId*/, int current, int total, double progress,
+                   const QString& label) {
+        if (_progressBar) {
+            _progressBar->setRange(0, 1000);
+            _progressBar->setValue(static_cast<int>(progress * 1000.0));
+            _progressBar->setFormat(tr("Artifact upload: %1%").arg(progress * 100.0, 0, 'f', 1));
+            _progressBar->setVisible(true);
+        }
+        if (_progressLabel) {
+            const QString count = total > 0 ? tr(" (%1/%2)").arg(current).arg(total) : QString();
+            _progressLabel->setText(tr("Artifact upload: %1%2")
+                                        .arg(label.isEmpty() ? tr("Syncing artifacts") : label)
+                                        .arg(count));
+            _progressLabel->setStyleSheet(QString());
+            _progressLabel->setVisible(true);
+        }
+        syncCompactStatusFromFull();
+    });
     connect(&mgr, &LasagnaServiceManager::jobsUpdated, this, [this](const QJsonArray& jobs) {
         QStringList queued;
         bool running = false;
@@ -883,6 +902,8 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             QJsonObject job = value.toObject();
             const QString state = job[QStringLiteral("state")].toString();
             if (state == QStringLiteral("running")) {
+                running = true;
+            } else if (state == QStringLiteral("upload")) {
                 running = true;
             } else if (state == QStringLiteral("waiting")) {
                 const int pos = job[QStringLiteral("queue_position")].toInt();

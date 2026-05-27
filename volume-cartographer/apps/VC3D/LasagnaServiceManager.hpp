@@ -2,6 +2,7 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QList>
 #include <QObject>
 #include <QProcess>
 #include <QHash>
@@ -98,6 +99,8 @@ signals:
     void optimizationProgress(const QString& stage, int step, int totalSteps, double loss,
                               double stageProgress, double overallProgress,
                               const QString& stageName);
+    void artifactUploadProgress(const QString& jobId, int current, int total, double progress,
+                                const QString& label);
     void optimizationFinished(const QString& outputDir);
     void resultsPlaced(const QString& outputDir, const QStringList& segmentNames);
     void optimizationError(const QString& message);
@@ -131,8 +134,24 @@ private:
     void pollStatus();
     void handleStatusReply(QNetworkReply* reply);
     void handleJobsReply(QNetworkReply* reply);
-    void handleOptimizeReply(QNetworkReply* reply);
+    void handleOptimizeReply(QNetworkReply* reply, const QString& localUploadJobId = QString());
     bool validateApiVersion(QNetworkReply* reply, const QString& context);
+    void postOptimizationRequest(const QJsonObject& requestConfig,
+                                 const QString& localOutputDir,
+                                 const QString& localUploadJobId = QString());
+    void enqueueArtifactUpload(const QJsonObject& requestConfig,
+                               const QJsonArray& objects,
+                               const QString& localOutputDir,
+                               const QString& source);
+    void processNextArtifactUpload();
+    void finishActiveArtifactUpload();
+    bool cancelLocalUploadJob(const QString& jobId);
+    void clearLocalUploadJobs();
+    void upsertLocalUploadJob(const QJsonObject& job);
+    void updateLocalUploadJob(const QString& jobId, const QJsonObject& updates);
+    void removeLocalUploadJob(const QString& jobId);
+    QJsonArray jobsWithLocalUploads(const QJsonArray& serviceJobs) const;
+    void emitJobsUpdatedOverlay();
 
     /** Download results archive from service and unpack locally. */
     void downloadResults(const QString& jobId = QString(),
@@ -142,6 +161,15 @@ private:
     std::unique_ptr<QProcess> _process;
     QNetworkAccessManager* _nam{nullptr};
     QTimer* _pollTimer{nullptr};
+
+    struct ArtifactUploadJob
+    {
+        QString jobId;
+        QJsonObject requestConfig;
+        QJsonArray objects;
+        QString localOutputDir;
+        QString source;
+    };
 
     QString _host{"127.0.0.1"};
     int _port{0};
@@ -157,6 +185,15 @@ private:
     QSet<QString> _completedJobIds;
     QHash<QString, QString> _jobOutputDirs;
     QJsonArray _lastJobs;
+    QList<ArtifactUploadJob> _artifactUploadQueue;
+    ArtifactUploadJob _activeArtifactUpload;
+    bool _hasActiveArtifactUpload{false};
+    QNetworkReply* _activeArtifactReply{nullptr};
+    QString _activeArtifactReplyJobId;
+    QSet<QString> _cancelledLocalUploadJobs;
+    QHash<QString, QJsonObject> _localUploadJobs;
+    QStringList _localUploadOrder;
+    quint64 _nextLocalUploadId{1};
     qint64 _lastQueueGeneration{-1};
     qint64 _fetchedQueueGeneration{-1};
     quint64 _requestGeneration{0};

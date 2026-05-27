@@ -26,7 +26,34 @@ QString jobStateText(const QJsonObject& job)
 {
     const QString state = job[QStringLiteral("state")].toString();
     if (state == QStringLiteral("upload")) {
-        return QObject::tr("Upload");
+        const QString uploadState = job[QStringLiteral("upload_state")].toString();
+        const QString label = job[QStringLiteral("upload_label")].toString().trimmed();
+        const int current = job[QStringLiteral("upload_current")].toInt();
+        const int total = job[QStringLiteral("upload_total")].toInt();
+        const double progress = job[QStringLiteral("upload_progress")].toDouble();
+        const QString prefix = uploadState == QStringLiteral("queued")
+            ? QObject::tr("Upload queued")
+            : uploadState == QStringLiteral("checking")
+                ? QObject::tr("Checking artifacts")
+                : uploadState == QStringLiteral("submitting")
+                    ? QObject::tr("Submitting job")
+                    : QObject::tr("Uploading artifacts");
+        const QString detail = !label.isEmpty() && label != prefix ? QStringLiteral(" - %1").arg(label) : QString();
+        if (total > 0) {
+            return QObject::tr("%1 %2/%3 (%4%)%5")
+                .arg(prefix)
+                .arg(current)
+                .arg(total)
+                .arg(progress * 100.0, 0, 'f', 1)
+                .arg(detail);
+        }
+        if (progress > 0.0) {
+            return QObject::tr("%1 (%2%)%3")
+                .arg(prefix)
+                .arg(progress * 100.0, 0, 'f', 1)
+                .arg(detail);
+        }
+        return prefix + detail;
     }
     if (state == QStringLiteral("waiting")) {
         const int pos = job[QStringLiteral("queue_position")].toInt();
