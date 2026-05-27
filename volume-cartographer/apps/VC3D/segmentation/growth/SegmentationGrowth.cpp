@@ -52,7 +52,8 @@ private:
     int _previousThreadCount{1};
 };
 
-void createRotatingBackup(QuadSurface* surface, int maxBackups = 10)
+// maxBackups < 0 -> use QuadSurface's app-configured count (the user setting).
+void createRotatingBackup(QuadSurface* surface, int maxBackups = -1)
 {
     if (!surface) {
         return;
@@ -61,8 +62,8 @@ void createRotatingBackup(QuadSurface* surface, int maxBackups = 10)
     qCInfo(lcSegGrowth) << "Creating backup for:" << QString::fromStdString(surface->path.string());
 
     try {
-        // Create a rotating backup snapshot
-        // This handles path normalization, rotation, and file copying automatically
+        // Rotating snapshot; handles path normalization, rotation, file copying,
+        // the per-segment count, and the per-minute throttle internally.
         surface->saveSnapshot(maxBackups);
         qCInfo(lcSegGrowth) << "Backup creation complete";
     } catch (const std::exception& e) {

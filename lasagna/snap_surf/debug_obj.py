@@ -25,7 +25,7 @@ def set_debug_step(step: int | None, *, label: str | None = None) -> None:
 	_debug_step = None if step is None else int(step)
 	_debug_label = None if label is None else str(label)
 
-def _surface_records_from_res(res: fit_model.FitResult3D) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+def _surface_records_from_res(res: fit_model.FitResult3D) -> list[tuple]:
 	records = getattr(res, "ext_surfaces", None)
 	if records is not None:
 		return list(records)
@@ -51,7 +51,8 @@ def _surface_records_from_res(res: fit_model.FitResult3D) -> list[tuple[torch.Te
 			)
 		else:
 			quad_valid = torch.zeros(0, 0, device=ext_xyz.device, dtype=torch.bool)
-		out.append((ext_xyz, corner_valid.detach(), ext_normals, quad_valid))
+		offset = float(item[1]) if len(item) >= 2 else 0.0
+		out.append((ext_xyz, corner_valid.detach(), ext_normals, quad_valid, offset))
 	return out
 
 def _debug_obj_safe_label(label: str | None) -> str:

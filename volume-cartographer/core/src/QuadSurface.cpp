@@ -25,6 +25,8 @@
 #include <vector>
 #include <fstream>
 #include <iomanip>
+#include <chrono>
+#include <atomic>
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -1214,7 +1216,7 @@ void QuadSurface::saveOverwrite()
     // Failures (disk full, permissions) are logged but never block the
     // user's edit — the backup is best-effort.
     try {
-        saveSnapshot(8);
+        saveSnapshot();  // configured count, throttled
     } catch (const std::exception& e) {
         Logger()->warn("saveOverwrite: snapshot failed for {}: {}",
                        final_path.string(), e.what());
@@ -1240,6 +1242,27 @@ void QuadSurface::invalidateMask()
     }
 }
 
+// Single-channel 8U/16U/32F -> untiled uncompressed TIFF; else cv::imwrite.
+void QuadSurface::writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat)
+{
+    bool wrote = false;
+    if (mat.channels() == 1 &&
+        (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
+    {
+        try {
+            writeTiff(dir / (name + ".tif"), mat, -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
+            wrote = true;
+        } catch (...) {
+            wrote = false; // Fall back to OpenCV
+        }
+    }
+
+    if (!wrote) {
+        std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, COMPRESSION_NONE };
+        cv::imwrite((dir / (name + ".tif")).string(), mat, compression_params);
+    }
+}
+
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
 {
     // Split the points matrix into x, y, z channels
@@ -1251,38 +1274,59 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     writeTiff(dir / "y.tif", xyz[1], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
     writeTiff(dir / "z.tif", xyz[2], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
 
-    // OpenCV compression params for fallback
-    std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, COMPRESSION_NONE };
-
     // Save additional channels
     for (auto const& [name, mat] : _channels) {
         if (!mat.empty() && (skipChannel.empty() || name != skipChannel)) {
-            bool wrote = false;
-
-            // Try untiled, uncompressed TIFF for single-channel ancillary data (8U/16U/32F)
-            if (mat.channels() == 1 &&
-                (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
-            {
-                try {
-                    writeTiff(dir / (name + ".tif"), mat, -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
-                    wrote = true;
-                } catch (...) {
-                    wrote = false; // Fall back to OpenCV
-                }
-            }
-
-            // Fallback to OpenCV for multi-channel or other formats
-            if (!wrote) {
-                cv::imwrite((dir / (name + ".tif")).string(), mat, compression_params);
-            }
+            writeChannelFile(dir, name, mat);
         }
     }
 }
 
-void QuadSurface::saveSnapshot(int maxBackups)
+void QuadSurface::saveChannel(const std::string& name)
+{
+    if (path.empty()) {
+        throw std::runtime_error("QuadSurface::saveChannel() requires a valid path");
+    }
+    auto it = _channels.find(name);
+    if (it == _channels.end() || it->second.empty()) {
+        return;
+    }
+
+    // Write only <name>.tif, no snapshot or x/y/z rewrite. tmp+rename so a
+    // crash mid-write can't tear the existing file.
+    const std::string tmpStem = "." + name + ".tmp" + std::to_string(::getpid());
+    writeChannelFile(path, tmpStem, it->second);
+    std::filesystem::rename(path / (tmpStem + ".tif"), path / (name + ".tif"));
+}
+
+// Minimum wall-clock gap between rotating snapshots of the same segment.
+// saveOverwrite()/autosave/growth all snapshot; without this, edit-cadence
+// saves would copy the whole segment dir into backups/ many times a second.
+static constexpr std::chrono::seconds kSnapshotThrottle{120};
+
+// App-configurable count of rotating snapshots kept per segment (see header).
+static std::atomic<int> g_backupCount{10};
+
+void QuadSurface::setBackupCount(int count)
+{
+    g_backupCount.store(std::max(0, count));
+}
+
+int QuadSurface::backupCount()
+{
+    return g_backupCount.load();
+}
+
+void QuadSurface::saveSnapshot(int maxBackups, bool force)
 {
     if (path.empty()) {
         throw std::runtime_error("QuadSurface::saveSnapshot() requires a valid path");
+    }
+    if (maxBackups < 0) {
+        maxBackups = g_backupCount.load();
+    }
+    if (maxBackups <= 0) {
+        return;  // backups disabled
     }
 
     // No on-disk state to back up yet — the first save will populate
@@ -1307,8 +1351,14 @@ void QuadSurface::saveSnapshot(int maxBackups)
         throw std::runtime_error("Failed to create backups directory: " + ec.message());
     }
 
-    // Find existing backup directories and determine next backup number
+    // Find existing backup directories and determine next backup number.
+    // Also track the newest slot's mtime so we can throttle: many operations
+    // (autosave, push-pull edits, growth steps) snapshot via saveOverwrite,
+    // which at edit cadence would copy the whole segment dir multiple times a
+    // second. Skip if a backup was taken within the throttle window.
     std::vector<int> existingBackups;
+    std::filesystem::file_time_type newestBackup{};
+    bool haveNewest = false;
     if (std::filesystem::exists(backupsDir)) {
         for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
             if (entry.is_directory()) {
@@ -1316,11 +1366,25 @@ void QuadSurface::saveSnapshot(int maxBackups)
                     int backupNum = std::stoi(entry.path().filename().string());
                     if (backupNum >= 0 && backupNum < maxBackups) {
                         existingBackups.push_back(backupNum);
+                        std::error_code mtEc;
+                        const auto mt = std::filesystem::last_write_time(entry.path(), mtEc);
+                        if (!mtEc && (!haveNewest || mt > newestBackup)) {
+                            newestBackup = mt;
+                            haveNewest = true;
+                        }
                     }
                 } catch (...) {
                     // Skip non-numeric directories
                 }
             }
+        }
+    }
+
+    // Throttle: at most one snapshot per segment per kSnapshotThrottle.
+    if (!force && haveNewest) {
+        const auto age = std::filesystem::file_time_type::clock::now() - newestBackup;
+        if (age < kSnapshotThrottle) {
+            return;
         }
     }
 

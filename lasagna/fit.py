@@ -356,7 +356,7 @@ def _run_flatten_mode(
 	scale = _scale_from_tifxyz_meta(meta, mesh_step)
 
 	stage_cfg = copy.deepcopy(cfg)
-	for key in ("external_surfaces", "tifxyz", "offset_value", "voxel_size_um", "corr_points"):
+	for key in ("external_surfaces", "tifxyz", "voxel_size_um", "corr_points"):
 		stage_cfg.pop(key, None)
 	stages = optimizer.load_stages_cfg(stage_cfg, init_mode=None)
 	flatten_args: dict[str, object] = {}
@@ -677,7 +677,6 @@ def main(argv: list[str] | None = None) -> int:
 		cfg.pop("voxel_size_um", None)
 		cfg.pop("external_surfaces", None)
 		cfg.pop("tifxyz", None)
-		cfg.pop("offset_value", None)
 		stages = optimizer.load_stages_cfg(
 			cfg,
 			init_mode=model_cfg.init_mode if model_init == "seed" else None,
@@ -981,7 +980,6 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("voxel_size_um", None)
 	cfg.pop("external_surfaces", None)
 	cfg.pop("tifxyz", None)
-	cfg.pop("offset_value", None)
 	stages = optimizer.load_stages_cfg(
 		cfg,
 		init_mode=model_cfg.init_mode if model_init == "seed" else None,

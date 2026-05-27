@@ -60,6 +60,58 @@ TEST_CASE("save(path, uuid, force_overwrite=true): atomic-exchange replaces exis
     fs::remove_all(root);
 }
 
+TEST_CASE("saveChannel: writes only the channel tif, no snapshot, round-trips")
+{
+    auto root = tmpDir("savechannel");
+    auto segDir = root / "seg";
+
+    // Place the seg dir two levels deep so it mimics <volpkg>/paths/<seg>,
+    // which is where saveSnapshot() would write backups to (../../backups).
+    auto volpkg = root / "scroll.volpkg";
+    auto pathsDir = volpkg / "paths";
+    fs::create_directories(pathsDir);
+    segDir = pathsDir / "seg";
+
+    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
+    qs.save(segDir.string(), "uuid-a", /*force_overwrite=*/false);
+    REQUIRE(fs::exists(segDir / "x.tif"));
+
+    // Capture x.tif mtime so we can assert saveChannel leaves it untouched.
+    auto xMtimeBefore = fs::last_write_time(segDir / "x.tif");
+
+    cv::Mat_<cv::Vec3b> approval(8, 8, cv::Vec3b(0, 0, 0));
+    approval(2, 3) = cv::Vec3b(0, 255, 0);  // BGR
+    qs.setChannel("approval", approval);
+    qs.saveChannel("approval");
+
+    CHECK(fs::exists(segDir / "approval.tif"));
+    // No backups/ directory: saveChannel must not snapshot the segment.
+    CHECK_FALSE(fs::exists(volpkg / "backups"));
+    // x.tif untouched (not rewritten).
+    CHECK(fs::last_write_time(segDir / "x.tif") == xMtimeBefore);
+
+    QuadSurface reloaded(segDir);
+    cv::Mat got = reloaded.channel("approval", SURF_CHANNEL_NORESIZE);
+    REQUIRE(got.channels() == 3);
+    CHECK(got.at<cv::Vec3b>(2, 3) == cv::Vec3b(0, 255, 0));
+    CHECK(got.at<cv::Vec3b>(0, 0) == cv::Vec3b(0, 0, 0));
+
+    fs::remove_all(root);
+}
+
+TEST_CASE("saveChannel: absent or empty channel is a no-op")
+{
+    auto root = tmpDir("savechannel_noop");
+    auto segDir = root / "seg";
+    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
+    qs.save(segDir.string(), "uuid-a", /*force_overwrite=*/false);
+
+    qs.saveChannel("approval");  // never set
+    CHECK_FALSE(fs::exists(segDir / "approval.tif"));
+
+    fs::remove_all(root);
+}
+
 TEST_CASE("save without force_overwrite + existing dir throws (or overwrites)")
 {
     auto root = tmpDir("noforce");

@@ -1410,6 +1410,7 @@ class GlobalMapRuntime:
 		self.station_target: torch.Tensor | None = None
 		self.last: dict[str, float] = {}
 		self.steps_run = 0
+		self._snap_loss_mode_printed: set[tuple[str, float]] = set()
 
 	def _ensure_models(self, fixture: MapFixture, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
 		device = fixture.model_xyz.device
@@ -1601,7 +1602,19 @@ class GlobalMapRuntime:
 		ext_valid: torch.Tensor,
 		ext_normals: torch.Tensor,
 		ext_quad_valid: torch.Tensor,
+		offset: float = 0.0,
+		data=None,
+		strip_samples: int = 5,
 	) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], dict[str, float]]:
+		offset_f = float(offset)
+		offset_mode = "voxel" if offset_f == 0.0 else "winding"
+		mode_key = (offset_mode, offset_f)
+		if mode_key not in self._snap_loss_mode_printed:
+			print(
+				f"[snap_surf.map_global] snap loss offset_mode={offset_mode} offset={offset_f:.6g}",
+				flush=True,
+			)
+			self._snap_loss_mode_printed.add(mode_key)
 		if self.affine is None:
 			fixture = _fixture_from_live_tensors(
 				model_xyz=model_xyz,
@@ -1640,8 +1653,53 @@ class GlobalMapRuntime:
 				"snaps_map_snap_max": 0.0,
 				"snaps_map_snap_samples": 0.0,
 			}
-		signed = ((model_pos - ext_xyz.detach()) * model_n).sum(dim=-1)
-		vals = signed[valid]
+		signed_vox = ((model_pos - ext_xyz.detach()) * model_n.detach()).sum(dim=-1)
+		if offset_f == 0.0:
+			residual = signed_vox
+		else:
+			if data is None:
+				raise RuntimeError("snap_surf_map offset mode requires volume data with grad_mag")
+			strip_samples_i = max(2, int(strip_samples))
+			sample_valid = (
+				valid &
+				torch.isfinite(ext_xyz).all(dim=-1) &
+				torch.isfinite(model_pos).all(dim=-1) &
+				torch.isfinite(model_n).all(dim=-1)
+			)
+			with torch.no_grad():
+				t = torch.linspace(0.0, 1.0, strip_samples_i, device=model_xyz.device, dtype=model_xyz.dtype)
+				origin = torch.tensor(data.origin_fullres, device=model_xyz.device, dtype=model_xyz.dtype)
+				spacing = torch.tensor(data._spacing_for("grad_mag"), device=model_xyz.device, dtype=model_xyz.dtype)
+				sentinel = origin - 64.0 * spacing
+				ext_xyz_safe = torch.where(sample_valid.unsqueeze(-1), ext_xyz.detach(), sentinel.view(1, 1, 3))
+				model_pos_safe = torch.where(sample_valid.unsqueeze(-1), model_pos.detach(), sentinel.view(1, 1, 3))
+				diff = model_pos_safe - ext_xyz_safe
+				strip = ext_xyz_safe.unsqueeze(-2) + (
+					t.view(*((1,) * (ext_xyz.ndim - 1)), strip_samples_i, 1) * diff.unsqueeze(-2)
+				)
+				H, W = int(ext_xyz.shape[0]), int(ext_xyz.shape[1])
+				strip_flat = strip.reshape(1, H, W * strip_samples_i, 3)
+				sampled = data.grid_sample_fullres(strip_flat, channels={"grad_mag"})
+				if sampled.grad_mag is None:
+					raise RuntimeError("snap_surf_map offset mode requires grad_mag samples")
+				mag = sampled.grad_mag.detach().squeeze(0).squeeze(0).reshape(1, H, W, strip_samples_i).squeeze(0)
+				strip_valid = (mag > 0.0).all(dim=-1)
+				mean_grad = mag.mean(dim=-1)
+				strip_len = diff.square().sum(dim=-1).sqrt()
+				int_sign = torch.sign(((model_pos.detach() - ext_xyz.detach()) * model_n.detach()).sum(dim=-1))
+				signed_windings = int_sign * strip_len * mean_grad
+				winding_err = signed_windings - signed_vox.new_tensor(offset_f)
+			valid = sample_valid & strip_valid
+			normal_residual = signed_vox * mean_grad
+			residual = normal_residual + (winding_err - normal_residual).detach()
+		vals = residual[valid]
+		if vals.numel() == 0:
+			return z, (lm,), (mask,), {
+				"snaps_map_snap": 0.0,
+				"snaps_map_snap_abs": 0.0,
+				"snaps_map_snap_max": 0.0,
+				"snaps_map_snap_samples": 0.0,
+			}
 		loss = vals.square().mean()
 		stats = {
 			"snaps_map_snap": float(loss.detach().cpu()),

@@ -2041,6 +2041,7 @@ void CWindow::CreateWidgets(void)
     // Create Lasagna dock from the panel already constructed by SegmentationWidget
     {
         auto* panel = _segmentationWidget->lasagnaPanel();
+        panel->setState(_state);
         panel->setVisible(true);
         _lasagnaWorkspaceWindow->setCentralWidget(panel);
 
@@ -2866,6 +2867,12 @@ void CWindow::closeEvent(QCloseEvent* event)
     // of cells.
     if (_viewerManager) {
         _viewerManager->beginShutdown();
+    }
+    // Flush any pending debounced approval-mask save before teardown so the
+    // last few seconds of approvals aren't lost on exit. No-op if nothing
+    // is pending.
+    if (_segmentationModule && _segmentationModule->overlay()) {
+        _segmentationModule->overlay()->flushPendingApprovalMaskSave();
     }
     if (_state && _state->vpkg()) {
         try { _state->vpkg()->saveAutosave(); } catch (...) {}

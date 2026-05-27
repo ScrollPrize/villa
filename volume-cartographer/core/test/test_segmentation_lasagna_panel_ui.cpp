@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <iostream>
 
+extern QJsonObject g_lastLasagnaOptimizationRequest;
+
 namespace {
 
 void require(bool condition, const char* message)
@@ -319,7 +321,8 @@ int main(int argc, char** argv)
     writeFile(segDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
     writeFile(segDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
     writeFile(segDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
-    writeFile(segDir + QStringLiteral("/meta.json"), QByteArrayLiteral("{}"));
+    writeFile(segDir + QStringLiteral("/meta.json"),
+              QByteArrayLiteral(R"({"lasagna_job":{"linked_surfaces":[{"type":"tifxyz_segment","name":"reference_surface.tifxyz","hash":"md5:11111111111111111111111111111111"}]}})"));
     writeFile(segDir + QStringLiteral("/approval.tif"), QByteArrayLiteral("a"));
     writeFile(segDir + QStringLiteral("/d.tif"), QByteArrayLiteral("d"));
     writeFile(segDir + QStringLiteral("/model.pt"), QByteArrayLiteral("model"));
@@ -333,6 +336,24 @@ int main(int argc, char** argv)
 
     CState state(0);
     state.setSurface("segmentation", surface, true);
+    panel._lastLasagnaMode = SegmentationLasagnaPanel::LasagnaMode::NewModel;
+    panel.setState(&state);
+    require(panel.currentLinkedSurfaceNames().contains(QStringLiteral("reference_surface.tifxyz")),
+            "Linked surface preview should load names from the selected segment meta.json");
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::NewModel,
+        configPath,
+        4,
+        5,
+        6);
+    QJsonObject newModelJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    QJsonObject newModelJobConfig = newModelJobSpec[QStringLiteral("config")].toObject();
+    QJsonArray newModelExternalSurfaces =
+        newModelJobConfig[QStringLiteral("external_surfaces")].toArray();
+    require(newModelExternalSurfaces.size() == 1,
+            "New Model launch should still send linked refs as external_surfaces");
     panel.startOptimizationAtSeed(
         &state,
         &statusBar,
@@ -345,6 +366,23 @@ int main(int argc, char** argv)
             "Offset launch should reserve the next collision-free offset output name");
     require(statusBar.currentMessage().contains(QStringLiteral("sheet_off2")),
             "Offset launch status should include the generated offset output name");
+    QJsonObject jobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    QJsonObject jobConfig = jobSpec[QStringLiteral("config")].toObject();
+    require(!jobConfig.contains(QStringLiteral("offset_value")),
+            "VC3D job config should not transport offset_value");
+    QJsonArray externalSurfaces = jobConfig[QStringLiteral("external_surfaces")].toArray();
+    require(externalSurfaces.size() == 1,
+            "VC3D job config should include one external surface from the linked refs");
+    QJsonObject externalSurface = externalSurfaces[0].toObject();
+    require(externalSurface[QStringLiteral("type")].toString() == QStringLiteral("tifxyz_segment"),
+            "External surface should preserve object ref type");
+    require(externalSurface[QStringLiteral("name")].toString() == QStringLiteral("reference_surface.tifxyz"),
+            "External surface should preserve object ref name");
+    require(externalSurface[QStringLiteral("hash")].toString() ==
+                QStringLiteral("md5:11111111111111111111111111111111"),
+            "External surface should preserve object ref hash");
+    require(externalSurface[QStringLiteral("offset")].toDouble() == panel.offsetValue(),
+            "External surface should carry the offset spinner value");
 
     return 0;
 }

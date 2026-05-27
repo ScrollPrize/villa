@@ -594,6 +594,18 @@ struct Flatboi {
         throw std::runtime_error("Failed to write OBJ with UVs");
     }
     std::cout << "Wrote: " << out << "\n";
+
+    // Flattening preserves vertex order (V/F written unchanged), so a grid-UV
+    // sidecar next to the input applies to the output too. Copy it through.
+    const fs::path in_griduv = fs::path(input_obj + ".griduv");
+    if (fs::exists(in_griduv)) {
+      std::error_code ec;
+      fs::copy_file(in_griduv, fs::path(out.string() + ".griduv"),
+                    fs::copy_options::overwrite_existing, ec);
+      if (ec) {
+        std::cerr << "warning: failed to copy grid-UV sidecar: " << ec.message() << "\n";
+      }
+    }
   }
 
   // === UV heatmaps (OpenCV PNG write; no clipping; V increases downward) ===

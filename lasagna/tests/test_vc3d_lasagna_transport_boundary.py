@@ -40,7 +40,7 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 				self.assertNotIn(literal, self.source)
 
 	def test_vc3d_lasagna_requests_use_versioned_request_helper(self) -> None:
-		self.assertIn('constexpr const char* kFitServiceApiVersion = "1"', self.manager_source)
+		self.assertIn('constexpr const char* kFitServiceApiVersion = "2"', self.manager_source)
 		self.assertIn('constexpr const char* kFitServiceApiVersionHeader = "X-Fit-Service-API-Version"', self.manager_source)
 		self.assertIn("req.setRawHeader(kFitServiceApiVersionHeader, kFitServiceApiVersion)", self.manager_source)
 		self.assertEqual(self.manager_source.count("QNetworkRequest req("), 1)
@@ -52,7 +52,7 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 
 	def test_lasagna_service_enforces_and_returns_api_version_header(self) -> None:
 		source = FIT_SERVICE_PY.read_text(encoding="utf-8")
-		self.assertIn('_API_VERSION = "1"', source)
+		self.assertIn('_API_VERSION = "2"', source)
 		self.assertIn('_API_VERSION_HEADER = "X-Fit-Service-API-Version"', source)
 		self.assertIn("self.send_header(_API_VERSION_HEADER, _API_VERSION)", source)
 		self.assertIn("def _validate_api_version", source)

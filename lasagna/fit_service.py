@@ -21,13 +21,16 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import getpass
+import hashlib
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -35,7 +38,7 @@ import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +46,10 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 
 _data_dir: str | None = None  # Set via --data-dir CLI flag
+_object_store_dir: Path | None = None  # Set via --object-store-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
-_API_VERSION = "1"
+_API_VERSION = "2"
 _API_VERSION_HEADER = "X-Fit-Service-API-Version"
 _VC3D_SOURCE_HEADER = "X-VC3D-Source"
 
@@ -72,6 +76,132 @@ def _dir_size_bytes(path: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+def _default_object_store_dir() -> Path:
+    return Path.home() / ".cache" / "lasagna" / "fit_service" / "objects"
+
+
+def _object_store_root() -> Path:
+    return _object_store_dir or _default_object_store_dir()
+
+
+def _hash_bytes(data: bytes) -> str:
+    return "md5:" + hashlib.md5(data).hexdigest()
+
+
+def _validate_object_ref(ref: Any) -> dict[str, str]:
+    if not isinstance(ref, dict):
+        raise ValueError("object ref must be an object")
+    obj_type = str(ref.get("type") or "").strip()
+    name = str(ref.get("name") or "").strip()
+    digest = str(ref.get("hash") or "").strip().lower()
+    if obj_type not in {"lasagna_model", "tifxyz_segment"}:
+        raise ValueError(f"unsupported object type: {obj_type or '<missing>'}")
+    if not name or Path(name).is_absolute() or ".." in Path(name).parts:
+        raise ValueError("object name must be a non-empty relative path without '..'")
+    if not digest.startswith("md5:") or len(digest) != 36:
+        raise ValueError("object hash must be md5:<32 hex chars>")
+    int(digest[4:], 16)
+    return {"type": obj_type, "name": name, "hash": digest}
+
+
+def _object_dir(ref: dict[str, str]) -> Path:
+    # Object identity is type + name + hash.  The name is percent-encoded so
+    # refs like "sheet.tifxyz/model.pt" do not create nested store paths.
+    return _object_store_root() / ref["type"] / ref["hash"][4:] / quote(ref["name"], safe="")
+
+
+def _object_metadata_path(ref: dict[str, str]) -> Path:
+    return _object_dir(ref) / "object.json"
+
+
+def _object_payload_path(ref: dict[str, str]) -> Path:
+    base = _object_dir(ref)
+    if ref["type"] == "lasagna_model":
+        return base / "model.pt"
+    return base / "segment"
+
+
+def _object_present(ref_raw: Any) -> bool:
+    try:
+        ref = _validate_object_ref(ref_raw)
+    except Exception:
+        return False
+    meta_path = _object_metadata_path(ref)
+    payload_path = _object_payload_path(ref)
+    if not meta_path.is_file():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if {k: meta.get(k) for k in ("type", "name", "hash")} != ref:
+        return False
+    return payload_path.is_file() if ref["type"] == "lasagna_model" else payload_path.is_dir()
+
+
+def _segment_manifest_hash(files: dict[str, bytes]) -> str:
+    lines: list[str] = []
+    for rel in sorted(files):
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts or not rel:
+            raise ValueError(f"invalid artifact file path: {rel!r}")
+        lines.append(f"{rel}\t{_hash_bytes(files[rel])}\n")
+    manifest = "".join(lines).encode("utf-8")
+    return _hash_bytes(manifest)
+
+
+def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
+    ref = _validate_object_ref(body.get("object", body))
+    tmp_parent = _object_store_root() / ".tmp"
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="upload_", dir=str(tmp_parent)))
+    final_dir = _object_dir(ref)
+    try:
+        if ref["type"] == "lasagna_model":
+            data_b64 = body.get("data")
+            if not isinstance(data_b64, str):
+                raise ValueError("lasagna_model upload requires base64 data")
+            data = base64.b64decode(data_b64)
+            actual_hash = _hash_bytes(data)
+            if actual_hash != ref["hash"]:
+                raise ValueError(f"model hash mismatch: declared {ref['hash']} actual {actual_hash}")
+            (tmp_dir / "model.pt").write_bytes(data)
+        else:
+            files_raw = body.get("files")
+            if not isinstance(files_raw, dict) or not files_raw:
+                raise ValueError("tifxyz_segment upload requires non-empty files object")
+            segment_dir = tmp_dir / "segment"
+            segment_dir.mkdir(parents=True, exist_ok=True)
+            decoded: dict[str, bytes] = {}
+            for rel, data_b64 in files_raw.items():
+                if not isinstance(data_b64, str):
+                    raise ValueError(f"artifact file {rel!r} must be base64 text")
+                decoded[str(rel)] = base64.b64decode(data_b64)
+            actual_hash = _segment_manifest_hash(decoded)
+            if actual_hash != ref["hash"]:
+                raise ValueError(f"segment hash mismatch: declared {ref['hash']} actual {actual_hash}")
+            for rel, data in decoded.items():
+                dst = segment_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(data)
+        (tmp_dir / "object.json").write_text(json.dumps(ref, indent=2) + "\n", encoding="utf-8")
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+        if final_dir.exists():
+            shutil.rmtree(final_dir)
+        tmp_dir.rename(final_dir)
+        return ref
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+def _resolve_object_ref(ref_raw: Any) -> Path:
+    ref = _validate_object_ref(ref_raw)
+    if not _object_present(ref):
+        raise ValueError(f"missing object: {ref['type']} {ref['name']} {ref['hash']}")
+    return _object_payload_path(ref)
 
 
 def _truthy_config_bool(value: Any) -> bool:
@@ -190,11 +320,10 @@ def _decode_tifxyz_for_request(
     snap_surf_enabled: bool = False,
     global_map_enabled: bool = False,
 ) -> str | None:
-    """Decode generic request tifxyz and attach it to configured consumers."""
+    """Decode generic request tifxyz for consumers that still use raw tifxyz transport."""
     import base64
 
     approval_enabled = _approval_inpaint_enabled(args_section)
-    external_surface_enabled = bool(ext_offset_enabled or snap_surf_enabled or global_map_enabled)
     if approval_enabled and model_init != "seed":
         raise ValueError("args.approval-inpaint is only valid with args.model-init=seed")
 
@@ -211,16 +340,16 @@ def _decode_tifxyz_for_request(
         print(f"[fit-service] decoded tifxyz ({len(tifxyz_payload)} files) to {tifxyz_dir}", flush=True)
         if model_init == "ext":
             args_section["tifxyz-init"] = tifxyz_dir
-        if model_init == "flatten" and "external_surfaces" not in cfg:
-            cfg["external_surfaces"] = [{"path": tifxyz_dir}]
         if approval_enabled:
             args_section["approval-inpaint-tifxyz"] = tifxyz_dir
-        if external_surface_enabled:
-            offset_val = float(cfg.pop("offset_value", 1.0))
-            cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
     elif model_init == "ext":
         raise ValueError("model-init=ext requires request tifxyz")
-    elif external_surface_enabled:
+    elif approval_enabled:
+        raise ValueError("approval-inpaint requires request tifxyz")
+    elif model_init == "flatten" and "external_surfaces" not in cfg:
+        raise ValueError("model-init=flatten requires config external_surfaces")
+
+    if (ext_offset_enabled or snap_surf_enabled or global_map_enabled) and "external_surfaces" not in cfg:
         loss_names = []
         if ext_offset_enabled:
             loss_names.append("ext_offset")
@@ -228,11 +357,7 @@ def _decode_tifxyz_for_request(
             loss_names.append("snap_surf")
         if global_map_enabled:
             loss_names.append("snap_surf_map/global_map")
-        raise ValueError(f"{'/'.join(loss_names)} is enabled but request has no tifxyz")
-    elif approval_enabled:
-        raise ValueError("approval-inpaint requires request tifxyz")
-    elif model_init == "flatten" and "external_surfaces" not in cfg:
-        raise ValueError("model-init=flatten requires request tifxyz or config external_surfaces")
+        raise ValueError(f"{'/'.join(loss_names)} is enabled but config has no external_surfaces")
 
     return tifxyz_dir
 
@@ -265,6 +390,52 @@ def _decode_model_for_request(
         return str(model_input)
 
     return None
+
+
+def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a Lasagna job spec into the legacy runner transport fields."""
+    spec = body.get("job_spec")
+    if not isinstance(spec, dict):
+        return body
+
+    cfg = spec.get("config", {})
+    if not isinstance(cfg, dict):
+        raise ValueError("job_spec.config must be an object")
+
+    resolved = dict(body)
+    resolved_cfg = dict(cfg)
+    external_surfaces_raw = resolved_cfg.get("external_surfaces")
+    if external_surfaces_raw is not None:
+        if not isinstance(external_surfaces_raw, list):
+            raise ValueError("job_spec.config.external_surfaces must be a list")
+        external_surfaces: list[dict[str, Any]] = []
+        for i, surface_raw in enumerate(external_surfaces_raw):
+            if not isinstance(surface_raw, dict):
+                raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
+            surface = dict(surface_raw)
+            if all(k in surface for k in ("type", "name", "hash")):
+                surface["path"] = str(_resolve_object_ref(surface))
+            external_surfaces.append(surface)
+        resolved_cfg["external_surfaces"] = external_surfaces
+
+    resolved["config"] = resolved_cfg
+    resolved["_job_spec_"] = {
+        "model": spec.get("model"),
+        "linked_surfaces": spec.get("linked_surfaces", []),
+        "config": cfg,
+    }
+
+    model_ref = spec.get("model")
+    if model_ref not in (None, {}, ""):
+        resolved["model_input"] = str(_resolve_object_ref(model_ref))
+
+    linked_refs = spec.get("linked_surfaces", [])
+    if linked_refs is None:
+        linked_refs = []
+    if not isinstance(linked_refs, list):
+        raise ValueError("job_spec.linked_surfaces must be a list")
+
+    return resolved
 
 
 def _apply_window_transport_args(
@@ -919,6 +1090,13 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         flush=True,
     )
 
+    try:
+        body = _body_with_resolved_job_spec(body)
+    except Exception as exc:
+        job.set_error(str(exc))
+        return
+
+    job_spec = body.get("_job_spec_")
     model_output = body.get("model_output")
     data_input = body.get("data_input")
     output_dir = body.get("output_dir")
@@ -1002,10 +1180,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         if model_init == "model" and not model_input:
             raise ValueError("model-init=model requires request model_data or model_input")
 
-        if external_surface_enabled and tifxyz_dir is not None and "external_surfaces" not in cfg:
-            offset_val = float(cfg.pop("offset_value", 1.0))
-            cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
-
         args_section = dict(cfg.get("args", {}))
         if model_init != "flatten":
             args_section["input"] = str(data_input)
@@ -1073,6 +1247,12 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 import fit as fit_mod
                 job.set_running("loading", 0, 0, 0.0)
                 fit_mod.main([cfg_path])
+                if isinstance(job_spec, dict) and Path(model_output).is_file():
+                    import torch
+                    st = torch.load(str(model_output), map_location="cpu", weights_only=False)
+                    if isinstance(st, dict):
+                        st["_job_spec_"] = job_spec
+                        torch.save(st, str(model_output))
             finally:
                 opt_mod.optimize = _orig_optimize
 
@@ -1103,6 +1283,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                         import json as _json
                         _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
                         _meta["uuid"] = dst_name
+                        if isinstance(job_spec, dict):
+                            _meta["lasagna_job"] = job_spec
                         _meta_path.write_text(_json.dumps(_meta, indent=2) + "\n", encoding="utf-8")
                 print(f"[fit-service] windowed mode: moved {len(_window_tifxyz)} "
                       f"window tifxyz to {output_dir}", flush=True)
@@ -1329,6 +1511,33 @@ class _Handler(BaseHTTPRequestHandler):
                 "queue_generation": _jobs.generation,
             })
 
+        elif path == "/objects/query":
+            try:
+                body = self._read_json("objects query")
+                refs = body.get("objects", []) if isinstance(body, dict) else []
+                if not isinstance(refs, list):
+                    raise ValueError("objects must be a list")
+                present = []
+                missing = []
+                for ref_raw in refs:
+                    ref = _validate_object_ref(ref_raw)
+                    (present if _object_present(ref) else missing).append(ref)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            self._send_json({"present": present, "missing": missing})
+
+        elif path == "/objects":
+            try:
+                body = self._read_json("object upload")
+                if not isinstance(body, dict):
+                    raise ValueError("upload body must be an object")
+                ref = _store_uploaded_object(body)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            self._send_json({"status": "stored", "object": ref})
+
         elif path == "/stop":
             ok, msg = _jobs.cancel_active()
             if ok:
@@ -1341,6 +1550,9 @@ class _Handler(BaseHTTPRequestHandler):
             job = _jobs.create_upload(source=self._request_source(), config_name="")
             try:
                 body = self._read_json(f"job {job.job_id} request")
+                if not isinstance(body, dict):
+                    raise ValueError("job request must be an object")
+                body = _body_with_resolved_job_spec(body)
             except Exception as exc:
                 job.set_error(f"bad json: {exc}")
                 self._send_json({"error": f"bad json: {exc}", "job_id": job.job_id}, 400)
@@ -1492,13 +1704,15 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _data_dir, _gpu_pause_enabled, _sparse_prefetch_backend
+    global _data_dir, _object_store_dir, _gpu_pause_enabled, _sparse_prefetch_backend
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
     p.add_argument("--port", type=int, default=9999, help="Port (default 9999)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--data-dir", default=None,
                    help="Directory containing .lasagna.json datasets")
+    p.add_argument("--object-store-dir", default=None,
+                   help="Directory for content-addressed VC3D artifacts")
     p.add_argument("--no-gpu-pause", action="store_true", default=False,
                    help="Disable automatic GPU pause/resume of training")
     p.add_argument("--sparse-prefetch-backend",
@@ -1509,6 +1723,8 @@ def main() -> None:
 
     if args.data_dir:
         _data_dir = str(Path(args.data_dir).resolve())
+    if args.object_store_dir:
+        _object_store_dir = Path(args.object_store_dir).resolve()
     if args.no_gpu_pause:
         _gpu_pause_enabled = False
     _sparse_prefetch_backend = str(args.sparse_prefetch_backend)

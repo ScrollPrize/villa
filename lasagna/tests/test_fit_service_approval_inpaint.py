@@ -111,9 +111,9 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					ext_offset_enabled=False,
 				)
 
-	def test_flatten_wires_generic_tifxyz_as_external_surface(self) -> None:
+	def test_flatten_does_not_synthesize_generic_tifxyz_as_external_surface(self) -> None:
 		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
-		cfg = {"args": {"model-init": "flatten"}}
+		cfg = {"args": {"model-init": "flatten"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz"}]}
 
 		with tempfile.TemporaryDirectory() as td:
 			tifxyz_dir = fit_service._decode_tifxyz_for_request(
@@ -126,14 +126,14 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 			)
 
 			self.assertIsNotNone(tifxyz_dir)
-			self.assertEqual(cfg["external_surfaces"], [{"path": tifxyz_dir}])
+			self.assertEqual(cfg["external_surfaces"], [{"path": "/tmp/ref.tifxyz"}])
 			self.assertNotIn("tifxyz-init", cfg["args"])
 
 	def test_flatten_requires_generic_tifxyz_or_external_surface(self) -> None:
 		cfg = {"args": {"model-init": "flatten"}}
 
 		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "model-init=flatten requires request tifxyz"):
+			with self.assertRaisesRegex(ValueError, "model-init=flatten requires config external_surfaces"):
 				fit_service._decode_tifxyz_for_request(
 					body={},
 					cfg=cfg,
@@ -143,11 +143,11 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					ext_offset_enabled=False,
 				)
 
-	def test_ext_offset_requires_generic_tifxyz(self) -> None:
+	def test_ext_offset_requires_config_external_surfaces(self) -> None:
 		cfg = {"args": {"model-init": "seed"}}
 
 		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "ext_offset is enabled but request has no tifxyz"):
+			with self.assertRaisesRegex(ValueError, "ext_offset is enabled but config has no external_surfaces"):
 				fit_service._decode_tifxyz_for_request(
 					body={},
 					cfg=cfg,
@@ -157,9 +157,9 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					ext_offset_enabled=True,
 				)
 
-	def test_snap_surf_wires_generic_tifxyz_as_external_surface(self) -> None:
+	def test_snap_surf_does_not_synthesize_generic_tifxyz_as_external_surface(self) -> None:
 		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
-		cfg = {"args": {"model-init": "seed"}}
+		cfg = {"args": {"model-init": "seed"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz", "offset": 2.0}]}
 		args = cfg["args"]
 
 		with tempfile.TemporaryDirectory() as td:
@@ -174,14 +174,14 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 			)
 
 			self.assertIsNotNone(tifxyz_dir)
-			self.assertEqual(cfg["external_surfaces"], [{"path": tifxyz_dir, "offset": 1.0}])
+			self.assertEqual(cfg["external_surfaces"], [{"path": "/tmp/ref.tifxyz", "offset": 2.0}])
 			self.assertNotIn("tifxyz-init", args)
 
-	def test_snap_surf_requires_generic_tifxyz(self) -> None:
+	def test_snap_surf_requires_config_external_surfaces(self) -> None:
 		cfg = {"args": {"model-init": "seed"}}
 
 		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "snap_surf is enabled but request has no tifxyz"):
+			with self.assertRaisesRegex(ValueError, "snap_surf is enabled but config has no external_surfaces"):
 				fit_service._decode_tifxyz_for_request(
 					body={},
 					cfg=cfg,
@@ -192,9 +192,9 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 					snap_surf_enabled=True,
 				)
 
-	def test_global_map_wires_generic_tifxyz_as_external_surface(self) -> None:
+	def test_global_map_does_not_synthesize_generic_tifxyz_as_external_surface(self) -> None:
 		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
-		cfg = {"args": {"model-init": "seed"}}
+		cfg = {"args": {"model-init": "seed"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz", "offset": -1.0}]}
 		args = cfg["args"]
 
 		with tempfile.TemporaryDirectory() as td:
@@ -209,14 +209,14 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 			)
 
 			self.assertIsNotNone(tifxyz_dir)
-			self.assertEqual(cfg["external_surfaces"], [{"path": tifxyz_dir, "offset": 1.0}])
+			self.assertEqual(cfg["external_surfaces"], [{"path": "/tmp/ref.tifxyz", "offset": -1.0}])
 			self.assertNotIn("tifxyz-init", args)
 
 	def test_global_map_requires_generic_tifxyz(self) -> None:
 		cfg = {"args": {"model-init": "seed"}}
 
 		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "snap_surf_map/global_map is enabled but request has no tifxyz"):
+			with self.assertRaisesRegex(ValueError, "snap_surf_map/global_map is enabled but config has no external_surfaces"):
 				fit_service._decode_tifxyz_for_request(
 					body={},
 					cfg=cfg,

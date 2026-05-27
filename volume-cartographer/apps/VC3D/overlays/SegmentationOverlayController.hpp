@@ -262,7 +262,7 @@ private:
     // Debounce timer for auto-saving approval mask after painting
     QTimer* _approvalSaveTimer{nullptr};
     QuadSurface* _approvalSaveSurface{nullptr};  // Surface to save to when timer fires
-    static constexpr int kApprovalSaveDelayMs = 500;
+    static constexpr int kApprovalSaveDelayMs = 5000;
     void scheduleApprovalMaskSave(QuadSurface* surface);
     void performDebouncedApprovalSave();
 

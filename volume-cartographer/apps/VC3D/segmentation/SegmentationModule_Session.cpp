@@ -407,9 +407,10 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
         }
 
         if (!gridPositions.empty()) {
+            // performAutoApproval() paints and schedules a debounced save.
+            // A synchronous save here would rewrite approval.tif per growth
+            // step on the GUI thread; the debounce coalesces the burst.
             performAutoApproval(gridPositions);
-            // Save immediately to persist the auto-approval
-            _overlay->saveApprovalMaskToSurface(baseSurf);
             _overlay->clearApprovalMaskUndoHistory();
             qCInfo(lcSegModule) << "Auto-approved growth region:" << gridPositions.size() << "vertices"
                                 << "(rect:" << vertexRect.width << "x" << vertexRect.height << ")";

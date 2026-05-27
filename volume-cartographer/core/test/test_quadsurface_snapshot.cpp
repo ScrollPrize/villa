@@ -72,18 +72,19 @@ TEST_CASE("saveSnapshot rotates when existing backups exceed maxBackups")
         return qs;
     };
 
-    // Take 3 snapshots with maxBackups=2 — third call must rotate.
+    // Take 3 snapshots with maxBackups=2 — third call must rotate. force=true
+    // bypasses the per-minute throttle so the rapid calls actually snapshot.
     {
         auto qs = reload();
-        qs->saveSnapshot(/*maxBackups=*/2);
+        qs->saveSnapshot(/*maxBackups=*/2, /*force=*/true);
     }
     {
         auto qs = reload();
-        qs->saveSnapshot(2);
+        qs->saveSnapshot(2, /*force=*/true);
     }
     {
         auto qs = reload();
-        qs->saveSnapshot(2);
+        qs->saveSnapshot(2, /*force=*/true);
     }
 
     auto backupsRoot = vol / "backups" / "seg1";
@@ -121,5 +122,40 @@ TEST_CASE("saveSnapshot copies all regular files (not just tifs)")
     REQUIRE(fs::exists(slot));
     CHECK(fs::exists(slot / "x.tif"));
     CHECK(fs::exists(slot / "extra.txt"));
+    fs::remove_all(vol);
+}
+
+TEST_CASE("saveSnapshot throttles rapid calls; force bypasses")
+{
+    auto vol = tmpDir("throttle");
+    auto paths = vol / "paths";
+    fs::create_directories(paths);
+    auto segDir = paths / "seg3";
+
+    {
+        QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
+        qs.id = "seg3";
+        qs.save(segDir);
+    }
+    auto reload = [&](){
+        auto qs = std::make_unique<QuadSurface>(segDir);
+        qs->id = "seg3"; qs->path = segDir; return qs;
+    };
+
+    auto backupsRoot = vol / "backups" / "seg3";
+
+    // First snapshot creates slot 0.
+    reload()->saveSnapshot(10);
+    REQUIRE(fs::exists(backupsRoot / "0"));
+
+    // Immediate second snapshot is throttled (within the per-minute window):
+    // no new slot appears.
+    reload()->saveSnapshot(10);
+    CHECK_FALSE(fs::exists(backupsRoot / "1"));
+
+    // force=true bypasses the throttle and creates the next slot.
+    reload()->saveSnapshot(10, /*force=*/true);
+    CHECK(fs::exists(backupsRoot / "1"));
+
     fs::remove_all(vol);
 }

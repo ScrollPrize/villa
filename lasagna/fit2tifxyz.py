@@ -595,6 +595,7 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  scale: float, d: np.ndarray | None = None,
 				  model_source: Path | None = None,
 				  copy_model: bool = False, fit_config: dict | None = None,
+				  job_spec: dict | None = None,
 				  area: dict | None = None,
 				  components: list[list[int]] | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
@@ -631,12 +632,14 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["model_source"] = str(model_source)
 	if fit_config is not None:
 		meta["fit_config"] = fit_config
+	if job_spec is not None:
+		meta["lasagna_job"] = job_spec
 	(out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression="lzw")
-	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression="lzw")
-	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression="lzw")
+	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression=None)
+	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression=None)
+	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression=None)
 	if d is not None:
-		tifffile.imwrite(str(out_dir / "d.tif"), d.astype(np.float32, copy=False), compression="lzw")
+		tifffile.imwrite(str(out_dir / "d.tif"), d.astype(np.float32, copy=False), compression=None)
 
 	if model_source is not None:
 		dest = out_dir / "model.pt"
@@ -663,6 +666,7 @@ def _export_flatten_checkpoint(
 	cfg: ExportConfig,
 	model_params: dict | None,
 	fit_config: dict | None,
+	job_spec: dict | None,
 ) -> int:
 	map_yx = _as_numpy_float32(st["flatten_map_flat"], name="flatten_map_flat")
 	if map_yx.ndim != 3 or map_yx.shape[-1] != 2:
@@ -721,6 +725,7 @@ def _export_flatten_checkpoint(
 		model_source=Path(cfg.input),
 		copy_model=cfg.copy_model,
 		fit_config=fit_config,
+		job_spec=job_spec,
 		area=area,
 	)
 	if model_params is not None:
@@ -753,6 +758,9 @@ def main(argv: list[str] | None = None) -> int:
 	fit_config = st.get("_fit_config_", None)
 	if not isinstance(fit_config, dict):
 		fit_config = None
+	job_spec = st.get("_job_spec_", None)
+	if not isinstance(job_spec, dict):
+		job_spec = None
 	corr_points_results = st.get("_corr_points_results_", None)
 	if not isinstance(corr_points_results, dict):
 		corr_points_results = None
@@ -761,11 +769,12 @@ def main(argv: list[str] | None = None) -> int:
 		approval_output_mask = None
 	if "flatten_map_flat" in st:
 		return _export_flatten_checkpoint(
-			st=st,
-			cfg=cfg,
-			model_params=model_params,
-			fit_config=fit_config,
-		)
+		st=st,
+		cfg=cfg,
+		model_params=model_params,
+		fit_config=fit_config,
+		job_spec=job_spec,
+	)
 
 	# Reconstruct mesh (3, D, Hm, Wm) — pyramid stores full xyz positions
 	mdl = model.Model3D.from_checkpoint(st, device=dev)
@@ -852,6 +861,7 @@ def main(argv: list[str] | None = None) -> int:
 		area = _get_area(x_all, y_all, z_all, xy_step_fullres, cfg.voxel_size_um)
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
+					  job_spec=job_spec,
 					  area=area, components=components if D > 1 else None)
 		if approval_output_mask is not None:
 			_write_mask_debug_artifacts(
@@ -901,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
 			out_dir = out_base / f"{cfg.prefix}{d:04d}.tifxyz"
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
+						  job_spec=job_spec,
 						  area=area)
 			if approval_output_mask is not None and mask_debug is not None:
 				_write_mask_debug_artifacts(

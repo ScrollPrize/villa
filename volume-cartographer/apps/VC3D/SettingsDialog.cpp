@@ -1,6 +1,7 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <thread>
@@ -61,6 +62,12 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
         const QString stored =
             settings.value(viewer::REMOTE_CACHE_DIR).toString();
         edtRemoteCachePath->setText(vc3d::remoteCachePath(stored));
+    }
+
+    // Per-segment rotating-backup count.
+    if (spinSegmentBackupCount) {
+        spinSegmentBackupCount->setValue(
+            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
 
     // IO threads is no longer user-configurable (tracks hardware_concurrency).
@@ -140,6 +147,13 @@ void SettingsDialog::accept()
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
     settings.setValue(perf::DISK_CACHE_COMPRESSED, chkVideoRecompress->isChecked());
+
+    // Per-segment backup count: persist and apply live (no restart needed).
+    if (spinSegmentBackupCount) {
+        const int backupCount = spinSegmentBackupCount->value();
+        settings.setValue(backup::SEGMENT_COUNT, backupCount);
+        QuadSurface::setBackupCount(backupCount);
+    }
 
     // IO_THREADS setting removed — see CState::applyCacheBudget.
 

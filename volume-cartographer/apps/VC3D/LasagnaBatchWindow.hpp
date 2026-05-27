@@ -2,6 +2,7 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QStringList>
 #include <QWidget>
 
 class QPushButton;
@@ -14,6 +15,7 @@ class LasagnaBatchWindow : public QWidget
 
 public:
     explicit LasagnaBatchWindow(QWidget* parent = nullptr);
+    void setLinkedSurfaceNames(const QStringList& names);
 
 signals:
     void finishedOutputActivated(const QString& outputName);
@@ -33,6 +35,8 @@ private:
 
     QTableView* _table{nullptr};
     QStandardItemModel* _model{nullptr};
+    QTableView* _linkedSurfaceTable{nullptr};
+    QStandardItemModel* _linkedSurfaceModel{nullptr};
     QPushButton* _upButton{nullptr};
     QPushButton* _downButton{nullptr};
     QPushButton* _cancelButton{nullptr};

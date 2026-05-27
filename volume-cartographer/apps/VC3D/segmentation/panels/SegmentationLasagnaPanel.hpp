@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QSet>
+#include <QMetaObject>
 #include <QStringList>
 #include <QWidget>
 
@@ -18,7 +19,9 @@ class QStatusBar;
 class QSettings;
 class QDoubleSpinBox;
 class QSpinBox;
+class QStandardItemModel;
 class QStackedWidget;
+class QTableView;
 class QToolButton;
 class QWidget;
 
@@ -58,6 +61,7 @@ public:
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
+    void setState(CState* state);
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
@@ -98,6 +102,9 @@ private:
     void launchLasagnaMode(LasagnaMode mode);
     void syncCompactConfigCombos();
     void syncCompactStatusFromFull();
+    void updateCompactLinkedSurfaceTable(const QStringList& names);
+    void updateLinkedSurfaceTables();
+    [[nodiscard]] QStringList currentLinkedSurfaceNames() const;
     void startOptimizationWithOverrides(CState* state,
                                         QStatusBar* statusBar,
                                         int modeOverride,
@@ -169,6 +176,8 @@ private:
     QPushButton* _compactStopServiceBtn{nullptr};
     QProgressBar* _compactProgressBar{nullptr};
     QLabel* _compactProgressLabel{nullptr};
+    QTableView* _compactLinkedSurfaceTable{nullptr};
+    QStandardItemModel* _compactLinkedSurfaceModel{nullptr};
 
     QString _lasagnaDataInputPath;
     QString _newModelConfigFilePath;
@@ -183,5 +192,7 @@ private:
 
     bool _restoringSettings{false};
     const QString _settingsGroup;
+    CState* _state{nullptr};
+    QMetaObject::Connection _stateSurfaceChangedConnection;
     QSet<QString> _submittedOutputNames;
 };

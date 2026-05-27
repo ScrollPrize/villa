@@ -31,20 +31,28 @@ _active = False
 _seed_xyz: tuple[float, float, float] | None = None
 _states: list[_SurfaceState] = []
 _last_stats: dict[str, float] = {}
+_offset_debug_printed = False
 _debug_step: int | None = None
 _debug_label: str | None = None
 _stage_label: str | None = None
 _stage_steps: int | None = None
 
 def reset_state() -> None:
-	global _states, _last_stats, _debug_step, _debug_label, _stage_label, _stage_steps
+	global _states, _last_stats, _offset_debug_printed, _debug_step, _debug_label, _stage_label, _stage_steps
 	_states = []
 	_last_stats = {}
+	_offset_debug_printed = False
 	_debug_step = None
 	_debug_label = None
 	_stage_label = None
 	_stage_steps = None
 	_set_debug_obj_step(None)
+
+def _normalize_surface_record(record: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+	if len(record) < 4:
+		raise RuntimeError("snap_surf external surface record must have at least 4 fields")
+	offset = float(record[4]) if len(record) >= 5 else 0.0
+	return record[0], record[1], record[2], record[3], offset
 
 def configure_snap_surf(
 	*,
@@ -117,16 +125,17 @@ def configure_snap_surf(
 	_seed_xyz = None if seed_xyz is None else tuple(float(v) for v in seed_xyz)
 	_stage_label = None if stage_label is None else str(stage_label)
 	_stage_steps = None if stage_steps is None else max(0, int(stage_steps))
-	_snap_surf_log(
-		"configured "
-		f"stage={_stage_label!r} "
-		f"active={int(_active)} "
-		f"map_init={int(_cfg.map_init.enabled)} "
-		f"debug_obj_dir={_cfg.debug_obj_dir!r} "
-		f"debug_obj_interval={_cfg.debug_obj_interval} "
-		f"stage_steps={_stage_steps} "
-		f"seed={_seed_xyz}"
-	)
+	if _active:
+		_snap_surf_log(
+			"configured "
+			f"stage={_stage_label!r} "
+			f"active={int(_active)} "
+			f"map_init={int(_cfg.map_init.enabled)} "
+			f"debug_obj_dir={_cfg.debug_obj_dir!r} "
+			f"debug_obj_interval={_cfg.debug_obj_interval} "
+			f"stage_steps={_stage_steps} "
+			f"seed={_seed_xyz}"
+		)
 	if _active and _cfg.map_init.enabled:
 		_map_init_log(
 			"enabled "
@@ -190,7 +199,7 @@ def set_debug_step(step: int | None, *, label: str | None = None) -> None:
 
 def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""Stateful external-surface snapping loss with explicit grown correspondences."""
-	global _last_stats
+	global _last_stats, _offset_debug_printed
 	cfg = _cfg
 	device = res.xyz_lr.device
 	dtype = res.xyz_lr.dtype
@@ -199,9 +208,18 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		return z, (z.reshape(1, 1, 1, 1),), (z.reshape(1, 1, 1, 1),)
 	if _seed_xyz is None:
 		raise RuntimeError("snap_surf requires args.seed")
-	records = _surface_records_from_res(res)
+	records = [_normalize_surface_record(tuple(r)) for r in _surface_records_from_res(res)]
 	if not records:
 		raise RuntimeError("snap_surf requires at least one external_surfaces entry")
+	if not _offset_debug_printed:
+		offsets = [float(r[4]) for r in records]
+		_snap_surf_log(
+			"external surface offsets at first loss call: "
+			f"configured={offsets} used_by_snap_surf=not_applied "
+			"interpretation=metadata_only; winding-integral offsets are currently used by ext_offset, "
+			"while snap_surf/snap_surf_map match the provided external surface geometry"
+		)
+		_offset_debug_printed = True
 
 	if res.normals is None:
 		raise RuntimeError("snap_surf requires model normals")
@@ -232,7 +250,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 		}
 		for k in avg_keys:
 			stats[k] = 0.0
-		for si, (ext_xyz, ext_valid, ext_normals, ext_quad_valid) in enumerate(records):
+		for si, (ext_xyz, ext_valid, ext_normals, ext_quad_valid, _offset) in enumerate(records):
 			state = _states[si]
 			ext_xyz = ext_xyz.to(device=device, dtype=dtype).detach()
 			ext_valid = ext_valid.to(device=device).bool()
@@ -365,7 +383,7 @@ def snap_surf_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[t
 	}
 	total_model_possible = 0
 
-	for si, (ext_xyz, ext_valid, ext_normals, ext_quad_valid) in enumerate(records):
+	for si, (ext_xyz, ext_valid, ext_normals, ext_quad_valid, _offset) in enumerate(records):
 		state = _states[si]
 		ext_xyz = ext_xyz.to(device=device, dtype=dtype).detach()
 		ext_valid = ext_valid.to(device=device).bool()

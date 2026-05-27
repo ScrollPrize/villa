@@ -22,6 +22,7 @@
 #include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
+#include <functional>
 #include <iostream>
 #include <memory>
 
@@ -43,7 +44,7 @@ namespace
 constexpr int kServiceStartTimeoutMs = 60000;  // 1 minute (no torch compile)
 constexpr int kServiceStopTimeoutMs = 500;
 constexpr int kPollIntervalMs = 500;
-constexpr const char* kFitServiceApiVersion = "1";
+constexpr const char* kFitServiceApiVersion = "2";
 constexpr const char* kFitServiceApiVersionHeader = "X-Fit-Service-API-Version";
 constexpr const char* kVc3dSourceHeader = "X-VC3D-Source";
 
@@ -87,6 +88,13 @@ QString stripVersionSuffix(const QString& base)
         }
     }
     return base.left(pos);
+}
+
+QString objectRefKey(const QJsonObject& ref)
+{
+    return ref[QStringLiteral("type")].toString() + QStringLiteral("\n")
+        + ref[QStringLiteral("name")].toString() + QStringLiteral("\n")
+        + ref[QStringLiteral("hash")].toString();
 }
 
 QString uniqueSegmentName(const QString& targetDir, const QString& requestedName)
@@ -704,6 +712,128 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
     if (!requestConfig.contains(QStringLiteral("source"))
         || requestConfig[QStringLiteral("source")].toString().trimmed().isEmpty()) {
         requestConfig[QStringLiteral("source")] = source;
+    }
+
+    const QJsonArray objects = requestConfig[QStringLiteral("_objects")].toArray();
+    requestConfig.remove(QStringLiteral("_objects"));
+    if (!objects.isEmpty()) {
+        QJsonArray refs;
+        QSet<QString> refKeys;
+        const QJsonObject jobSpec = requestConfig[QStringLiteral("job_spec")].toObject();
+        const QJsonObject modelRef = jobSpec[QStringLiteral("model")].toObject();
+        if (!modelRef.isEmpty()) {
+            refs.append(modelRef);
+            refKeys.insert(objectRefKey(modelRef));
+        }
+        for (const QJsonValue& value : jobSpec[QStringLiteral("linked_surfaces")].toArray()) {
+            const QJsonObject ref = value.toObject();
+            if (!ref.isEmpty() && !refKeys.contains(objectRefKey(ref))) {
+                refs.append(ref);
+                refKeys.insert(objectRefKey(ref));
+            }
+        }
+        for (const QJsonValue& value : objects) {
+            const QJsonObject upload = value.toObject();
+            const QJsonObject ref = upload[QStringLiteral("object")].toObject();
+            if (!ref.isEmpty() && !refKeys.contains(objectRefKey(ref))) {
+                refs.append(ref);
+                refKeys.insert(objectRefKey(ref));
+            }
+        }
+
+        QJsonObject queryBody;
+        queryBody[QStringLiteral("objects")] = refs;
+        QUrl queryUrl(QStringLiteral("%1/objects/query").arg(baseUrl()));
+        QNetworkRequest queryReq = fitServiceRequest(queryUrl);
+        queryReq.setRawHeader(kVc3dSourceHeader, source.toUtf8());
+        queryReq.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        const quint64 generation = _requestGeneration;
+        QNetworkReply* queryReply = _nam->post(
+            queryReq, QJsonDocument(queryBody).toJson(QJsonDocument::Compact));
+        connect(queryReply, &QNetworkReply::finished, this,
+                [this, queryReply, objects, requestConfig, localOutputDir, source, generation]() {
+            if (generation != _requestGeneration) {
+                queryReply->deleteLater();
+                return;
+            }
+            queryReply->deleteLater();
+            if (isTransportError(queryReply)) {
+                emit optimizationError(tr("Artifact query failed: %1").arg(queryReply->errorString()));
+                return;
+            }
+            if (!validateApiVersion(queryReply, tr("Artifact query"))) {
+                emit optimizationError(_lastError);
+                return;
+            }
+            if (queryReply->error() != QNetworkReply::NoError) {
+                emit optimizationError(tr("Artifact query failed: %1").arg(queryReply->errorString()));
+                return;
+            }
+            const QJsonObject response = QJsonDocument::fromJson(queryReply->readAll()).object();
+            if (response.contains(QStringLiteral("error"))) {
+                emit optimizationError(response[QStringLiteral("error")].toString());
+                return;
+            }
+            QSet<QString> missing;
+            for (const QJsonValue& value : response[QStringLiteral("missing")].toArray()) {
+                missing.insert(objectRefKey(value.toObject()));
+            }
+            auto uploads = std::make_shared<QJsonArray>();
+            for (const QJsonValue& value : objects) {
+                const QJsonObject upload = value.toObject();
+                if (missing.contains(objectRefKey(upload[QStringLiteral("object")].toObject()))) {
+                    uploads->append(upload);
+                }
+            }
+
+            auto index = std::make_shared<int>(0);
+            auto uploadNext = std::make_shared<std::function<void()>>();
+            *uploadNext = [this, uploads, index, requestConfig, localOutputDir, source, generation, uploadNext]() {
+                if (generation != _requestGeneration) {
+                    return;
+                }
+                if (*index >= uploads->size()) {
+                    startOptimization(requestConfig, localOutputDir);
+                    return;
+                }
+                const QJsonObject upload = uploads->at(*index).toObject();
+                QUrl url(QStringLiteral("%1/objects").arg(baseUrl()));
+                QNetworkRequest req = fitServiceRequest(url);
+                req.setRawHeader(kVc3dSourceHeader, source.toUtf8());
+                req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+                QNetworkReply* reply = _nam->post(req, QJsonDocument(upload).toJson(QJsonDocument::Compact));
+                connect(reply, &QNetworkReply::finished, this,
+                        [this, reply, uploads, index, requestConfig, localOutputDir, generation, uploadNext]() {
+                    if (generation != _requestGeneration) {
+                        reply->deleteLater();
+                        return;
+                    }
+                    reply->deleteLater();
+                    if (isTransportError(reply)) {
+                        emit optimizationError(tr("Artifact upload failed: %1").arg(reply->errorString()));
+                        return;
+                    }
+                    if (!validateApiVersion(reply, tr("Artifact upload"))) {
+                        emit optimizationError(_lastError);
+                        return;
+                    }
+                    if (reply->error() != QNetworkReply::NoError) {
+                        emit optimizationError(tr("Artifact upload failed: %1").arg(reply->errorString()));
+                        return;
+                    }
+                    const QJsonObject response = QJsonDocument::fromJson(reply->readAll()).object();
+                    if (response.contains(QStringLiteral("error"))) {
+                        emit optimizationError(response[QStringLiteral("error")].toString());
+                        return;
+                    }
+                    ++(*index);
+                    (*uploadNext)();
+                });
+            };
+            (*uploadNext)();
+        });
+        emit statusMessage(tr("Syncing Lasagna artifacts..."));
+        return;
     }
 
     QUrl url(QStringLiteral("%1/jobs").arg(baseUrl()));

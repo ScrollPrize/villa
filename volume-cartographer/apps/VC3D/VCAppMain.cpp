@@ -16,6 +16,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/CrashHandler.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
 #include <iostream>
@@ -203,6 +204,10 @@ auto main(int argc, char* argv[]) -> int
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         cacheSizeGB = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+
+        // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
+        QuadSurface::setBackupCount(
+            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;

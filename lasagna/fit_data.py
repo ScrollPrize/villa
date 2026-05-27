@@ -205,6 +205,50 @@ def _debug_check_sample_coords(
 		)
 
 
+def _omezarr_level_shape(
+	base_shape: tuple[int, int, int],
+	level: int,
+) -> tuple[int, int, int]:
+	"""Shape at a pyramid level, matching the writer's ceil-halving rule."""
+	z, y, x = (int(v) for v in base_shape)
+	for _ in range(max(0, int(level))):
+		z = max(1, (z + 1) // 2)
+		y = max(1, (y + 1) // 2)
+		x = max(1, (x + 1) // 2)
+	return z, y, x
+
+
+def _zarr_spatial_shape(zarr_path: str, shape: tuple[int, ...]) -> tuple[tuple[int, int, int], bool]:
+	"""Return ((Z, Y, X), is_3d) for a 3D/4D channel zarr shape."""
+	is_3d = len(shape) == 3
+	if is_3d:
+		return (int(shape[0]), int(shape[1]), int(shape[2])), True
+	if len(shape) == 4:
+		return (int(shape[1]), int(shape[2]), int(shape[3])), False
+	raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
+
+
+def _validate_group_zarr_shape(
+	*,
+	vol: LasagnaVolume,
+	group_name: str,
+	group: object,
+	zarr_path: str,
+	shape: tuple[int, ...],
+) -> tuple[int, int, int, bool]:
+	"""Validate opened zarr shape against manifest base_shape_zyx when available."""
+	(Z, Y, X), is_3d = _zarr_spatial_shape(zarr_path, shape)
+	if vol.base_shape_zyx is not None:
+		expected = _omezarr_level_shape(vol.base_shape_zyx, int(group.scaledown))
+		if (Z, Y, X) != expected:
+			raise ValueError(
+				f"zarr shape mismatch for group {group_name!r} at {zarr_path}: "
+				f"shape={(Z, Y, X)} expected={expected} from "
+				f"base_shape_zyx={vol.base_shape_zyx} scaledown={group.scaledown}"
+			)
+	return Z, Y, X, is_3d
+
+
 def _record_chunks(data: "FitData3D", xyz_fullres: torch.Tensor) -> None:
     """Record which 32-voxel chunks are touched by this sampling call."""
     dev = xyz_fullres.device
@@ -655,14 +699,14 @@ def load_single_channel(
 	if not isinstance(zsrc, zarr.Array):
 		raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
 	shape = tuple(int(v) for v in zsrc.shape)
-	is_3d = len(shape) == 3
-	if not is_3d and len(shape) != 4:
-		raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
+	Z_all, Y_all, X_all, is_3d = _validate_group_zarr_shape(
+		vol=vol,
+		group_name=next((name for name, g in vol.groups.items() if g is group), channel),
+		group=group,
+		zarr_path=zarr_path,
+		shape=shape,
+	)
 	ds_i = int(round(group.sd_fac * s2b))
-	if is_3d:
-		Z_all, Y_all, X_all = shape
-	else:
-		_, Z_all, Y_all, X_all = shape
 	if crop is not None:
 		x0, y0, z0, cw, ch_, cd = (int(v) for v in crop)
 		x0v = max(0, x0 // ds_i)
@@ -912,40 +956,56 @@ def get_preprocessed_params(path: str) -> dict:
 	scaledown is the finest channel scaledown relative to source volume.
 	"""
 	vol = LasagnaVolume.load(path)
+	if not vol.groups:
+		raise ValueError(f"no groups in {path}")
 	s2b = vol.source_to_base
-	# Use finest-resolution group to determine volume extent
 	min_sd = min(g.sd_fac for g in vol.groups.values())
-	# Find a group at finest resolution, open its zarr to get spatial dims
-	for g in vol.groups.values():
-		if g.sd_fac == min_sd:
-			zarr_path = str(vol.path.parent / g.zarr_path)
+
+	def _params_from_shape(*, scaledown: int, shape_zyx: tuple[int, int, int]) -> dict:
+		Z, Y, X = (int(v) for v in shape_zyx)
+		return {
+			"scaledown": float(scaledown),
+			"volume_extent_fullres": (
+				int(X * s2b),
+				int(Y * s2b),
+				int(Z * s2b),
+			),
+			"source_to_base": s2b,
+			"init_shell_dir": (
+				str(vol.init_shell_dir_abs_path())
+				if vol.init_shell_dir
+				else None
+			),
+		}
+
+	if vol.base_shape_zyx is not None:
+		return _params_from_shape(scaledown=min_sd, shape_zyx=vol.base_shape_zyx)
+
+	# Legacy manifests without base_shape_zyx need one zarr open to infer extent.
+	# This is a fallback only; modern manifests do not validate data at startup.
+	last_exc: Exception | None = None
+	for group_name, g in sorted(vol.groups.items(), key=lambda item: item[1].sd_fac):
+		zarr_path = str(vol.path.parent / g.zarr_path)
+		try:
 			zsrc = zarr.open(zarr_path, mode="r")
 			if not isinstance(zsrc, zarr.Array):
 				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
 			shape = tuple(int(v) for v in zsrc.shape)
-			if len(shape) == 3:
-				Z, Y, X = shape
-			elif len(shape) == 4:
-				_, Z, Y, X = shape
-			else:
-				raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
-			# Extent in source coords, then scale to base (VC3D) coords
-			volume_extent_fullres = (
-				int(X * min_sd * s2b),
-				int(Y * min_sd * s2b),
-				int(Z * min_sd * s2b),
+			Z, Y, X, _is_3d = _validate_group_zarr_shape(
+				vol=vol,
+				group_name=group_name,
+				group=g,
+				zarr_path=zarr_path,
+				shape=shape,
 			)
-			return {
-				"scaledown": float(min_sd),
-				"volume_extent_fullres": volume_extent_fullres,
-				"source_to_base": s2b,
-				"init_shell_dir": (
-					str(vol.init_shell_dir_abs_path())
-					if vol.init_shell_dir
-					else None
-				),
-			}
-	raise ValueError(f"no groups in {path}")
+			return _params_from_shape(
+				scaledown=g.sd_fac,
+				shape_zyx=(Z * g.sd_fac, Y * g.sd_fac, X * g.sd_fac),
+			)
+		except Exception as exc:
+			last_exc = exc
+			continue
+	raise ValueError(f"could not open any zarr group from {path}") from last_exc
 
 
 def load_3d(
@@ -967,10 +1027,11 @@ def load_3d(
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
 	umb_pts, umb_lookup, umb_z0, umb_z_step = _load_umbilicus_lookup(vol, device=device)
+	_skip = skip_channels or set()
 
 	# Resolve which channels are available
 	all_ch = vol.all_channels()
-	req = ["cos", "grad_mag", "nx", "ny"]
+	req = [ch for ch in ["cos", "grad_mag", "nx", "ny"] if ch not in _skip]
 	miss = [k for k in req if k not in all_ch]
 	if miss:
 		raise ValueError(f"lasagna volume missing required channels: {miss}; available={all_ch}")
@@ -987,16 +1048,16 @@ def load_3d(
 		if not isinstance(zsrc, zarr.Array):
 			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
 		shape = tuple(int(v) for v in zsrc.shape)
-		is_3d = len(shape) == 3
-		if not is_3d and len(shape) != 4:
-			raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
+		Z_all, Y_all, X_all, is_3d = _validate_group_zarr_shape(
+			vol=vol,
+			group_name=next((group_name for group_name, g in vol.groups.items() if g is group), name),
+			group=group,
+			zarr_path=zarr_path,
+			shape=shape,
+		)
 
 		# Full base-to-zarr factor: crop is in base coords
 		ds_i = int(round(group.sd_fac * s2b))
-		if is_3d:
-			Z_all, Y_all, X_all = shape
-		else:
-			C, Z_all, Y_all, X_all = shape
 
 		if crop is not None:
 			x0, y0, z0, cw, ch, cd = (int(v) for v in crop)
@@ -1021,7 +1082,6 @@ def load_3d(
 		t = torch.from_numpy(a).to(device=device, dtype=torch.uint8)
 		return t.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, Y, X)
 
-	_skip = skip_channels or set()
 	cos_t = None if "cos" in _skip else _read_channel("cos")
 	mag_t = _read_channel("grad_mag")
 	nx_t = _read_channel("nx")
@@ -1036,7 +1096,17 @@ def load_3d(
 	primary_spacing = (primary_sd, primary_sd, primary_sd)
 
 	channel_spacing: dict[str, tuple[float, float, float]] = {}
-	for name in ["cos", "grad_mag", "nx", "ny"] + (["pred_dt"] if pred_dt_t is not None else []):
+	loaded_channel_names = [
+		name for name, tensor in [
+			("cos", cos_t),
+			("grad_mag", mag_t),
+			("nx", nx_t),
+			("ny", ny_t),
+			("pred_dt", pred_dt_t),
+		]
+		if tensor is not None
+	]
+	for name in loaded_channel_names:
 		g, _ = vol.channel_group(name)
 		sd = float(g.sd_fac) * s2b
 		channel_spacing[name] = (sd, sd, sd)
@@ -1126,13 +1196,13 @@ def load_3d_streaming(
 		if not isinstance(zsrc, zarr.Array):
 			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
 		shape = tuple(int(v) for v in zsrc.shape)
-		is_3d = len(shape) == 3
-		if is_3d:
-			Z, Y, X = shape
-		elif len(shape) == 4:
-			_, Z, Y, X = shape
-		else:
-			raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
+		Z, Y, X, is_3d = _validate_group_zarr_shape(
+			vol=vol,
+			group_name=group_name,
+			group=group,
+			zarr_path=zarr_path,
+			shape=shape,
+		)
 
 		# Build channel index mapping
 		channel_indices: dict[str, int] = {}

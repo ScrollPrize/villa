@@ -365,5 +365,17 @@ int main(int argc, char** argv) {
         std::cerr << "failed to write " << out_path << "\n"; return 3;
     }
     std::cout << "Wrote: " << out_path << "\n";
+
+    // The output mesh is the fine mesh (same Vf/Ff, same vertex order), so the
+    // fine grid-UV sidecar applies unchanged. Copy it through for vc_obj2tifxyz.
+    const fs::path fine_griduv = fs::path(fine_grid_path.string() + ".griduv");
+    if (fs::exists(fine_griduv)) {
+        std::error_code ec;
+        fs::copy_file(fine_griduv, fs::path(out_path.string() + ".griduv"),
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            std::cerr << "warning: failed to copy grid-UV sidecar: " << ec.message() << "\n";
+        }
+    }
     return 0;
 }

@@ -213,6 +213,25 @@ class Fit2TifxyzOutputMaskHelpersTest(unittest.TestCase):
 			self.assertEqual(area["area_vx2"], 0.0)
 			self.assertEqual(meta["bbox"], [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]])
 
+	def test_write_tifxyz_preserves_job_spec_and_uses_uncompressed_tiffs(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		job_spec = {
+			"model": {"type": "lasagna_model", "name": "sheet/model.pt", "hash": "md5:" + "1" * 32},
+			"linked_surfaces": [
+				{"type": "tifxyz_segment", "name": "ref.tifxyz", "hash": "md5:" + "2" * 32}
+			],
+			"config": {},
+		}
+		with tempfile.TemporaryDirectory() as td:
+			out_dir = Path(td) / "job.tifxyz"
+			fit2tifxyz._write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, scale=1.0, job_spec=job_spec)
+			meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+			with tifffile.TiffFile(out_dir / "x.tif") as tif:
+				compression = tif.pages[0].compression.name
+
+		self.assertEqual(meta["lasagna_job"], job_spec)
+		self.assertEqual(compression, "NONE")
+
 
 class CorrWindingResultsOutputMaskTest(unittest.TestCase):
 	def test_winding_results_store_model_surface_locations(self) -> None:
