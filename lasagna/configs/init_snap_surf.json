@@ -17,7 +17,6 @@
 		"corr": 0.0,
 		"bend": 100.0,
 		"ext_offset": 0.0,
-		"snap_surf": 0.0,
 		"snap_surf_map": 0.0001,
 		"map_dist": 0.0001,
 		"map_vec_normal": 1.0,
@@ -41,7 +40,6 @@
 				"pred_dt": 0.0,
 				"station_n": 10.0,
 				"station_t": 10.0,
-				"snap_surf": 0.0,
 				"snap_surf_map": 0.0
 			}
 		},
@@ -55,7 +53,6 @@
 				"pred_dt": 0.0,
 				"station_n": 10.0,
 				"station_t": 10.0,
-				"snap_surf": 0.0,
 				"snap_surf_map": 0.0
 			}
 		},
@@ -146,7 +143,6 @@
 			"min_scaledown": 0,
 			"w_fac": {
 				"pred_dt": 0.0,
-				"snap_surf": 0.0,
 				"snap_surf_map": 1.0
 			},
 			"args": {

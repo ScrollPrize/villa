@@ -255,29 +255,6 @@ def _set_pred_dt_flow_gate_debug_out_dir(cfg: dict[str, Any], out_dir: str) -> N
             gate.setdefault("debug_out_dir", out_dir)
 
 
-def _set_snap_surf_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
-    stages = cfg.get("stages")
-    if not isinstance(stages, list):
-        return
-    for stage in stages:
-        if not isinstance(stage, dict):
-            continue
-        opt_cfg = stage.get("global_opt")
-        if not isinstance(opt_cfg, dict):
-            opt_cfg = stage
-        args = opt_cfg.get("args")
-        if not isinstance(args, dict):
-            args = {}
-            opt_cfg["args"] = args
-        snap = args.get("snap_surf")
-        if snap is None:
-            snap = {}
-            args["snap_surf"] = snap
-        if isinstance(snap, dict):
-            snap["debug_obj_dir"] = out_dir
-            snap.pop("debug_obj_per_iteration", None)
-
-
 def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
     stages = cfg.get("stages")
     if not isinstance(stages, list):
@@ -317,7 +294,6 @@ def _decode_tifxyz_for_request(
     tmp_dir: str,
     model_init: str,
     ext_offset_enabled: bool,
-    snap_surf_enabled: bool = False,
     global_map_enabled: bool = False,
 ) -> str | None:
     """Decode generic request tifxyz for consumers that still use raw tifxyz transport."""
@@ -349,12 +325,10 @@ def _decode_tifxyz_for_request(
     elif model_init == "flatten" and "external_surfaces" not in cfg:
         raise ValueError("model-init=flatten requires config external_surfaces")
 
-    if (ext_offset_enabled or snap_surf_enabled or global_map_enabled) and "external_surfaces" not in cfg:
+    if (ext_offset_enabled or global_map_enabled) and "external_surfaces" not in cfg:
         loss_names = []
         if ext_offset_enabled:
             loss_names.append("ext_offset")
-        if snap_surf_enabled:
-            loss_names.append("snap_surf")
         if global_map_enabled:
             loss_names.append("snap_surf_map/global_map")
         raise ValueError(f"{'/'.join(loss_names)} is enabled but config has no external_surfaces")
@@ -543,10 +517,6 @@ def _config_effective_ext_offset_enabled(cfg: dict[str, Any]) -> bool:
     return _config_effective_loss_enabled(cfg, "ext_offset")
 
 
-def _config_effective_snap_surf_enabled(cfg: dict[str, Any]) -> bool:
-    return _config_effective_loss_enabled(cfg, "snap_surf")
-
-
 def _stage_params_list(opt_cfg: dict[str, Any]) -> list[str]:
     params = opt_cfg.get("params", [])
     if isinstance(params, str):
@@ -576,9 +546,6 @@ def _config_global_map_enabled(cfg: dict[str, Any]) -> bool:
             continue
         snap_map = args.get("snap_surf_map")
         if isinstance(snap_map, dict) and snap_map.get("map_opt") is not None:
-            return True
-        legacy_snap = args.get("snap_surf")
-        if isinstance(legacy_snap, dict) and legacy_snap.get("map_opt") is not None:
             return True
     return False
 
@@ -1150,9 +1117,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         args_section_pre["model-init"] = model_init
         cfg["args"] = args_section_pre
         ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
-        snap_surf_enabled = _config_effective_snap_surf_enabled(cfg)
         global_map_enabled = _config_global_map_enabled(cfg)
-        external_surface_enabled = ext_offset_enabled or snap_surf_enabled or global_map_enabled
+        external_surface_enabled = ext_offset_enabled or global_map_enabled
         if model_init == "flatten" and ext_offset_enabled:
             raise ValueError("model-init=flatten does not support ext_offset")
         model_input = _decode_model_for_request(
@@ -1173,7 +1139,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             tmp_dir=tmp_dir,
             model_init=model_init,
             ext_offset_enabled=ext_offset_enabled,
-            snap_surf_enabled=snap_surf_enabled,
             global_map_enabled=global_map_enabled,
         )
 
@@ -1194,9 +1159,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             args_section["out-dir"] = str(body["out_dir"])
         elif _config_enables_pred_dt_flow_gate(cfg):
             _set_pred_dt_flow_gate_debug_out_dir(cfg, str(service_workdir))
-        if snap_surf_enabled:
-            snap_debug_dir = Path(service_workdir) / "snap_surf_objs"
-            _set_snap_surf_debug_obj_dir(cfg, str(snap_debug_dir))
         if global_map_enabled:
             snap_debug_dir = Path(service_workdir) / "snap_surf_objs"
             _set_snap_surf_map_debug_obj_dir(cfg, str(snap_debug_dir))

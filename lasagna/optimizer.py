@@ -362,7 +362,6 @@ lambda_global: dict[str, float] = {
 	"station_t": 0.0,
 	"bend": 0.0,
 	"ext_offset": 0.0,
-	"snap_surf": 0.0,
 	"snap_surf_map": 0.0,
 	"map_dist": 1.0,
 	"map_vec_normal": 1.0,
@@ -752,9 +751,6 @@ def optimize(
 			if isinstance(stage_args, dict):
 				if isinstance(stage_args.get("map_global"), dict):
 					base = dict(stage_args.get("map_global"))
-				snap_args = stage_args.get("snap_surf")
-				if isinstance(snap_args, dict) and isinstance(snap_args.get("map_global"), dict):
-					base = dict(snap_args.get("map_global", {})) if isinstance(snap_args.get("map_global"), dict) else {}
 			_snap_global_runtime = snap_surf_map_global.GlobalMapRuntime(base=base, seed_xyz=seed_xyz)
 		return _snap_global_runtime
 
@@ -1252,18 +1248,14 @@ def optimize(
 			"loss": opt_loss_winding_density.ext_offset_loss,
 			"needs": Needs(ext_conn=True, prefetch_ext_offset=True),
 		},
-			"snap_surf": {
-				"loss": opt_loss_snap_surf.snap_surf_loss,
-				"needs": Needs(mesh_normals=True, ext_surfaces=True),
-			},
-			"snap_surf_map": {
-				"loss": _snap_global_map_loss,
-				"needs": Needs(
-					mesh_normals=True,
-					ext_surfaces=True,
-					lr_prefetch_channels=frozenset({"grad_mag"}),
-				),
-			},
+		"snap_surf_map": {
+			"loss": _snap_global_map_loss,
+			"needs": Needs(
+				mesh_normals=True,
+				ext_surfaces=True,
+				lr_prefetch_channels=frozenset({"grad_mag"}),
+			),
+		},
 		"cyl_normal": {
 			"loss": opt_loss_cyl.cyl_normal_loss,
 			"needs": Needs(
@@ -1626,14 +1618,6 @@ def optimize(
 			seed_xyz=seed_xyz,
 			out_dir=out_dir,
 		)
-		snap_surf_args = stage_args.get("snap_surf")
-		if snap_surf_args is not None and not isinstance(snap_surf_args, dict):
-			raise ValueError(f"stage '{stage.name}' opt.args.snap_surf must be an object")
-		if isinstance(snap_surf_args, dict):
-			snap_surf_args = dict(snap_surf_args)
-			if snap_surf_args.get("debug_obj_dir") and "debug_obj_interval" not in snap_surf_args:
-				snap_surf_args["debug_obj_interval"] = max(1, int(status_interval or opt_cfg.steps or 1))
-
 		snap_surf_map_args = stage_args.get("snap_surf_map")
 		if snap_surf_map_args is not None and not isinstance(snap_surf_map_args, dict):
 			raise ValueError(f"stage '{stage.name}' opt.args.snap_surf_map must be an object")
@@ -1644,13 +1628,6 @@ def optimize(
 		raw_map_opt = None
 		if isinstance(snap_surf_map_args, dict) and "map_opt" in snap_surf_map_args:
 			raw_map_opt = snap_surf_map_args.get("map_opt")
-		if isinstance(snap_surf_args, dict) and "map_opt" in snap_surf_args:
-			if raw_map_opt is not None:
-				raise ValueError(
-					f"stage '{stage.name}' configures both opt.args.snap_surf.map_opt and "
-					"opt.args.snap_surf_map.map_opt; use snap_surf_map.map_opt"
-				)
-			raw_map_opt = snap_surf_args.pop("map_opt")
 		if raw_map_opt is not None:
 			if not isinstance(raw_map_opt, dict):
 				raise ValueError(f"stage '{stage.name}' opt.args.snap_surf_map.map_opt must be an object or null")
@@ -1669,40 +1646,14 @@ def optimize(
 				args=map_opt_cfg.args or {},
 			)
 
-		if isinstance(snap_surf_args, dict) and "map_global" in snap_surf_args:
-			snap_surf_args.pop("map_global")
-		snap_surf_legacy_weight = _need_term("snap_surf", stage_eff)
 		snap_surf_map_weight = _need_term("snap_surf_map", stage_eff)
 		snap_surf_global_map_mode = snap_surf_map_opt_stage is not None or snap_surf_map_weight > 0.0
-		if snap_surf_global_map_mode and snap_surf_legacy_weight > 0.0:
-			raise ValueError(
-				f"stage '{stage.name}' enables global snap-surf mapping but also has snap_surf weight "
-				f"{snap_surf_legacy_weight:.6g}; set snap_surf to 0 and use snap_surf_map for the model loss"
-			)
-		if snap_surf_global_map_mode:
-			snap_surf_legacy_cfg = None
-			snap_surf_legacy_active = False
-		else:
-			snap_surf_legacy_cfg = snap_surf_args
-			snap_surf_legacy_active = snap_surf_legacy_weight > 0.0
 		print(
-			f"[optimizer] {label}: snap_surf_weight={snap_surf_legacy_weight:.6g} "
-			f"snap_surf_map_weight={snap_surf_map_weight:.6g} "
-			f"snap_surf_legacy_active={snap_surf_legacy_active} "
-			f"snap_surf_args={snap_surf_legacy_cfg} "
+			f"[optimizer] {label}: snap_surf_map_weight={snap_surf_map_weight:.6g} "
 			f"snap_surf_map_offset={_snap_global_model_offset_text() if snap_surf_global_map_mode else 'n/a'} "
 			f"snap_surf_map_offset_mode={'auto' if snap_surf_global_map_mode else 'n/a'}",
 			flush=True,
 		)
-		opt_loss_snap_surf.configure_snap_surf(
-			cfg=snap_surf_legacy_cfg,
-			seed_xyz=seed_xyz,
-			active=snap_surf_legacy_active,
-			stage_label=f"{label}:{stage.name}",
-			stage_steps=opt_cfg.steps,
-		)
-		if snap_surf_legacy_active and not getattr(model, "_ext_surfaces", None):
-			raise ValueError("snap_surf requires external_surfaces")
 
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
@@ -1878,7 +1829,6 @@ def optimize(
 				"pred_dt_pull_samples_m": "psampM",
 				"pred_dt_pull_prefix_mean": "pullpre",
 				"pred_dt_pull_weight_mean": "pullw",
-				"snap_surf": "snaps",
 				"snap_surf_map": "smap",
 				"snaps_map_snap": "sms_los",
 				"snaps_map_snap_abs": "sms_abs",
@@ -2002,7 +1952,6 @@ def optimize(
 				"pred_dt_pull_samples_m": "pull samples M",
 				"pred_dt_pull_prefix_mean": "pull prefix",
 				"pred_dt_pull_weight_mean": "pull weight",
-				"snap_surf": "snap loss",
 				"snap_surf_map": "map winding snap loss",
 				"snaps_map_snap": "map winding snap loss",
 				"snaps_map_snap_abs": "map winding snap abs residual",
@@ -2103,13 +2052,12 @@ def optimize(
 				"pred_dt_pull_samples_m": 111,
 				"pred_dt_pull_prefix_mean": 112,
 				"pred_dt_pull_weight_mean": 113,
-				"snap_surf": 114,
-				"snap_surf_map": 115,
-				"snaps_map_snap": 116,
-				"snaps_map_snap_abs": 117,
-				"snaps_map_snap_max": 118,
-				"snaps_map_snap_samples": 119,
-				"snaps_seed": 120,
+				"snap_surf_map": 114,
+				"snaps_map_snap": 115,
+				"snaps_map_snap_abs": 116,
+				"snaps_map_snap_max": 117,
+				"snaps_map_snap_samples": 118,
+				"snaps_seed": 119,
 				"snaps_sext": 121,
 				"snaps_sdist": 122,
 				"snaps_m2e": 123,
@@ -2448,8 +2396,6 @@ def optimize(
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
 						tv.update(opt_loss_cyl.last_stats())
-					if name == "snap_surf":
-						tv.update(opt_loss_snap_surf.last_stats())
 					if name == "snap_surf_map":
 						tv.update(opt_loss_snap_surf.last_stats())
 					if name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):

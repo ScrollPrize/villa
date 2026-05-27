@@ -12,11 +12,6 @@ from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz, _result, 
 class SnapSurfMapObjectiveTest(unittest.TestCase):
 	def setUp(self) -> None:
 		opt_loss_snap_surf.reset_state()
-		opt_loss_snap_surf.configure_snap_surf(
-			cfg={"init_distance": 10.0, "point_distance": 10.0, "grid_error": 0.25},
-			seed_xyz=(1.0, 1.0, 0.0),
-			active=True,
-		)
 
 	def test_map_init_one_active_quad_produces_subdiv_squared_samples(self) -> None:
 		uv = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])

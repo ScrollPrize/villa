@@ -683,11 +683,11 @@ def main(argv: list[str] | None = None) -> int:
 		)
 		print("[fit] optimizer stages:", flush=True)
 		for i, st in enumerate(stages):
-			args_snap = st.global_opt.args.get("snap_surf") if isinstance(st.global_opt.args, dict) else None
+			args_snap_map = st.global_opt.args.get("snap_surf_map") if isinstance(st.global_opt.args, dict) else None
 			print(
 				f"[fit]   stage{i} name={st.name!r} steps={st.global_opt.steps} "
-				f"snap_surf_eff={st.global_opt.eff.get('snap_surf', 0.0):.6g} "
-				f"snap_surf_args={args_snap}",
+				f"snap_surf_map_eff={st.global_opt.eff.get('snap_surf_map', 0.0):.6g} "
+				f"snap_surf_map_args={args_snap_map}",
 				flush=True,
 			)
 
@@ -986,11 +986,11 @@ def main(argv: list[str] | None = None) -> int:
 	)
 	print("[fit] optimizer stages:", flush=True)
 	for i, st in enumerate(stages):
-		args_snap = st.global_opt.args.get("snap_surf") if isinstance(st.global_opt.args, dict) else None
+		args_snap_map = st.global_opt.args.get("snap_surf_map") if isinstance(st.global_opt.args, dict) else None
 		print(
 			f"[fit]   stage{i} name={st.name!r} steps={st.global_opt.steps} "
-			f"snap_surf_eff={st.global_opt.eff.get('snap_surf', 0.0):.6g} "
-			f"snap_surf_args={args_snap}",
+			f"snap_surf_map_eff={st.global_opt.eff.get('snap_surf_map', 0.0):.6g} "
+			f"snap_surf_map_args={args_snap_map}",
 			flush=True,
 		)
 	_stage_done("load_optimizer_stages", _t)
