@@ -202,6 +202,36 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 
 		self.assertFalse(bool(ok[0]))
 
+	def test_map_init_sample_angle_limit_accepts_front_and_back_normal_connections(self) -> None:
+		uv = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+				subdiv=1,
+				max_sample_distance=500.0,
+				max_sample_angle_deg=45.0,
+			),
+		)
+
+		def accepted(model_z: float) -> bool:
+			ok = opt_loss_snap_surf._map_init_candidate_quad_samples_ok(
+				uv_full=uv,
+				quad_hw=torch.tensor([[0, 0]], dtype=torch.long),
+				ext_pos=_plane_xyz(h=2, w=2, z=0.0),
+				ext_normals=_normals_2d(2, 2),
+				ext_valid=torch.ones(2, 2, dtype=torch.bool),
+				ext_quad_valid=torch.ones(1, 1, dtype=torch.bool),
+				model_xyz=_plane_xyz(h=2, w=2, z=model_z).unsqueeze(0),
+				model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+				model_normals=_normals_3d(1, 2, 2),
+				model_depth=0,
+				sign=1,
+				cfg=cfg,
+			)
+			return bool(ok[0])
+
+		self.assertTrue(accepted(1.0))
+		self.assertTrue(accepted(-1.0))
+
 	def test_map_init_sample_angle_limit_scales_with_quad_step(self) -> None:
 		uv = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
 		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
@@ -363,6 +393,85 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		)
 
 		self.assertAlmostEqual(float(got[0]), 10.0, places=5)
+
+	def test_map_init_connection_terms_are_front_back_invariant(self) -> None:
+		uv = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+				subdiv=2,
+				w_dist=1.0,
+				w_vec_normal=1.0,
+				w_surface_normal=1.0,
+				angle_dist_mult=3.0,
+				w_smooth=0.0,
+				w_bend=0.0,
+				w_jac=0.0,
+				w_metric_smooth=0.0,
+				w_area_smooth=0.0,
+				w_dense_prior=0.0,
+			),
+		)
+
+		def terms_for(model_z: float) -> dict[str, torch.Tensor]:
+			_, terms = opt_loss_snap_surf._map_init_objective(
+				uv_full=uv,
+				active_quad=torch.ones(1, 1, dtype=torch.bool),
+				ext_pos=_plane_xyz(h=2, w=2, z=0.0),
+				ext_normals=_normals_2d(2, 2),
+				ext_valid=torch.ones(2, 2, dtype=torch.bool),
+				ext_quad_valid=torch.ones(1, 1, dtype=torch.bool),
+				model_xyz=_plane_xyz(h=2, w=2, z=model_z).unsqueeze(0),
+				model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+				model_normals=_normals_3d(1, 2, 2),
+				model_depth=0,
+				sign=1,
+				cfg=cfg,
+			)
+			return terms
+
+		front = terms_for(1.0)
+		back = terms_for(-1.0)
+		self.assertAlmostEqual(float(front["vec"].detach()), float(back["vec"].detach()), places=6)
+		self.assertAlmostEqual(float(front["dist"].detach()), float(back["dist"].detach()), places=6)
+		self.assertAlmostEqual(float(front["norm"].detach()), float(back["norm"].detach()), places=6)
+		self.assertAlmostEqual(float(front["vec"].detach()), 0.0, places=6)
+
+	def test_map_init_surface_normal_loss_uses_model_alignment_sign(self) -> None:
+		uv = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
+		model_normals = -_normals_3d(1, 2, 2)
+
+		def norm_loss(sign: int) -> float:
+			_, terms = opt_loss_snap_surf._map_init_objective(
+				uv_full=uv,
+				active_quad=torch.ones(1, 1, dtype=torch.bool),
+				ext_pos=_plane_xyz(h=2, w=2, z=0.0),
+				ext_normals=_normals_2d(2, 2),
+				ext_valid=torch.ones(2, 2, dtype=torch.bool),
+				ext_quad_valid=torch.ones(1, 1, dtype=torch.bool),
+				model_xyz=_plane_xyz(h=2, w=2, z=1.0).unsqueeze(0),
+				model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+				model_normals=model_normals,
+				model_depth=0,
+				sign=sign,
+				cfg=opt_loss_snap_surf.SnapSurfConfig(
+					map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+						subdiv=2,
+						w_dist=0.0,
+						w_vec_normal=0.0,
+						w_surface_normal=1.0,
+						w_smooth=0.0,
+						w_bend=0.0,
+						w_jac=0.0,
+						w_metric_smooth=0.0,
+						w_area_smooth=0.0,
+						w_dense_prior=0.0,
+					),
+				),
+			)
+			return float(terms["norm"].detach())
+
+		self.assertGreater(norm_loss(1), 1.9)
+		self.assertLess(norm_loss(-1), 1.0e-6)
 
 	def test_map_init_jacobian_penalty_catches_flipped_cells(self) -> None:
 		active = torch.ones(1, 1, dtype=torch.bool)

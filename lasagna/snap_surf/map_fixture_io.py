@@ -172,6 +172,7 @@ def fixture_metadata(
 		"map_init_config": asdict(cfg.map_init),
 		"stats": dict(stats or {}),
 		"sign": int(mi.sign),
+		"sign_semantics": "model_normal_alignment",
 		"seed_ext_sample_hw": None if mi.seed_ext_sample_hw is None else [int(v) for v in mi.seed_ext_sample_hw],
 		"seed_model_quad": None if mi.seed_model_quad is None else [int(v) for v in mi.seed_model_quad],
 		"seed_model_distance": float(mi.seed_model_distance),

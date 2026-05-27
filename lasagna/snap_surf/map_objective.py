@@ -631,7 +631,7 @@ def _map_init_objective(
 		p_ext_f = p_ext.reshape(Q * S, 3)
 		n_ext_raw_f = n_ext_raw.reshape(Q * S, 3)
 		sign_f = 1.0 if int(sign) >= 0 else -1.0
-		n_ext = F.normalize(n_ext_raw_f, dim=-1, eps=1.0e-8) * sign_f
+		n_ext = F.normalize(n_ext_raw_f, dim=-1, eps=1.0e-8)
 		p_model = _sample_surface_grid(model_xyz, safe_coords)
 		n_model_raw = _sample_surface_grid(model_normals, safe_coords)
 		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f
@@ -655,8 +655,8 @@ def _map_init_objective(
 		v = p_model - p_ext_f
 		d = v.norm(dim=-1)
 		u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
-		c_ext = (u * n_ext).sum(dim=-1)
-		c_model = (u * n_model).sum(dim=-1)
+		c_ext = (u * n_ext).sum(dim=-1).abs()
+		c_model = (u * n_model).sum(dim=-1).abs()
 		c_norm = (n_ext * n_model).sum(dim=-1)
 		sample_limit_ok = _map_init_sample_geometry_limit_ok(
 			p_ext=p_ext_f,

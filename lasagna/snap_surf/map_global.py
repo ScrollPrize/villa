@@ -759,15 +759,15 @@ def _seed_quad_affine_sample_terms(
 	p_model = _sample_surface_grid(fixture.model_xyz, safe_coords)
 	n_model_raw = _sample_surface_grid(fixture.model_normals, safe_coords)
 	sign_f = 1.0 if int(sign) >= 0 else -1.0
-	n_ext = torch.nn.functional.normalize(ext_normals.to(device=pred_uv.device, dtype=pred_uv.dtype), dim=-1, eps=1.0e-8) * sign_f
+	n_ext = torch.nn.functional.normalize(ext_normals.to(device=pred_uv.device, dtype=pred_uv.dtype), dim=-1, eps=1.0e-8)
 	n_model = torch.nn.functional.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f
 	coord_ok = _quad_valid_at_coords(fixture.model_valid.bool(), safe_coords, tuple(int(v) for v in fixture.model_valid.shape))
 	p_ext = ext_points.to(device=pred_uv.device, dtype=pred_uv.dtype)
 	v = p_model - p_ext
 	d = v.norm(dim=-1)
 	u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
-	c_ext = (u * n_ext).sum(dim=-1)
-	c_model = (u * n_model).sum(dim=-1)
+	c_ext = (u * n_ext).sum(dim=-1).abs()
+	c_model = (u * n_model).sum(dim=-1).abs()
 	c_norm = (n_ext * n_model).sum(dim=-1)
 	dist_values = _huber(d, delta=stage_cfg.huber_delta) * _map_init_distance_multiplier(c_ext, c_model, stage_cfg.map_init)
 	vec_values = (1.0 - c_ext) + (1.0 - c_model)
@@ -814,6 +814,43 @@ def _seed_quad_affine_sample_terms(
 		"vec": vec,
 		"norm": norm,
 	}
+
+
+def _seed_quad_affine_alignment_sign(
+	*,
+	affine: torch.Tensor,
+	ext_hw: torch.Tensor,
+	ext_normals: torch.Tensor,
+	fixture: MapFixture,
+	fallback: int = 1,
+) -> int:
+	x = torch.cat(
+		[ext_hw.to(device=affine.device, dtype=affine.dtype), torch.ones((int(ext_hw.shape[0]), 1), device=affine.device, dtype=affine.dtype)],
+		dim=1,
+	)
+	pred_uv = x @ affine.transpose(0, 1)
+	depth = int(fixture.metadata.get("model_depth", 0) or 0)
+	coords3 = _map_init_coords3(pred_uv, depth=depth)
+	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+	n_ext = torch.nn.functional.normalize(ext_normals.to(device=pred_uv.device, dtype=pred_uv.dtype), dim=-1, eps=1.0e-8)
+	n_model_raw = _sample_surface_grid(fixture.model_normals, safe_coords)
+	n_model = torch.nn.functional.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+	coord_ok = _quad_valid_at_coords(fixture.model_valid.bool(), safe_coords, tuple(int(v) for v in fixture.model_valid.shape))
+	valid = (
+		coord_ok &
+		torch.isfinite(pred_uv).all(dim=-1) &
+		torch.isfinite(n_ext).all(dim=-1) &
+		torch.isfinite(n_model_raw).all(dim=-1) &
+		torch.isfinite(n_model).all(dim=-1) &
+		(n_ext.norm(dim=-1) > 1.0e-8) &
+		(n_model.norm(dim=-1) > 1.0e-8)
+	)
+	if not bool(valid.any().detach().cpu()):
+		return 1 if int(fallback) >= 0 else -1
+	mean_dot = (n_ext[valid] * n_model[valid]).sum(dim=-1).mean()
+	if not bool(torch.isfinite(mean_dot).detach().cpu()):
+		return 1 if int(fallback) >= 0 else -1
+	return 1 if float(mean_dot.detach().cpu()) >= 0.0 else -1
 
 
 def _seed_quad_affine_init_result(
@@ -871,21 +908,7 @@ def _seed_quad_affine_init_result(
 		ext_normals=fixture.ext_normals,
 		samples=samples,
 	)
-	model_seed_point, _model_seed_uv, _model_seed_dist = _closest_point_uv_on_model_quad(
-		point=seed,
-		model_xyz=fixture.model_xyz,
-		model_quad=model_quad,
-	)
-	if bool(torch.isfinite(model_seed_point).all().detach().cpu()) and bool(torch.isfinite(seed_ext_point).all().detach().cpu()):
-		to_model = model_seed_point.to(device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype) - seed_ext_point
-	else:
-		to_model = model_corners.mean(dim=0) - ext_corners.mean(dim=0)
 	raw_dirs = ext_sample_normals
-	avg_dir = raw_dirs[torch.isfinite(raw_dirs).all(dim=-1)].mean(dim=0)
-	if not bool(torch.isfinite(avg_dir).all().detach().cpu()) or float(avg_dir.norm().detach().cpu()) <= 1.0e-8:
-		avg_dir = ext_normal
-	sign = 1 if float((to_model * avg_dir).sum().detach().cpu()) >= 0.0 else -1
-	ray_dirs = raw_dirs * (1.0 if sign >= 0 else -1.0)
 	kept_hw: list[torch.Tensor] = []
 	kept_uv: list[torch.Tensor] = []
 	kept_points: list[torch.Tensor] = []
@@ -894,7 +917,7 @@ def _seed_quad_affine_init_result(
 	rejected_far = 0
 	for i in range(int(ext_points.shape[0])):
 		p = ext_points[i]
-		direction = ray_dirs[i]
+		direction = raw_dirs[i]
 		if (
 			not bool(torch.isfinite(p).all().detach().cpu()) or
 			not bool(torch.isfinite(direction).all().detach().cpu()) or
@@ -902,7 +925,10 @@ def _seed_quad_affine_init_result(
 		):
 			continue
 		direction = torch.nn.functional.normalize(direction, dim=0, eps=1.0e-8)
-		t, uv = _ray_triangle_intersections(p, direction, tri, tri_uv)
+		t_fwd, uv_fwd = _ray_triangle_intersections(p, direction, tri, tri_uv)
+		t_back, uv_back = _ray_triangle_intersections(p, -direction, tri, tri_uv)
+		t = torch.cat([t_fwd, t_back], dim=0)
+		uv = torch.cat([uv_fwd, uv_back], dim=0)
 		if t.numel() == 0:
 			continue
 		dist = t.abs()
@@ -940,6 +966,12 @@ def _seed_quad_affine_init_result(
 	affine = sol.transpose(0, 1).contiguous()
 	if not bool(torch.isfinite(affine).all().detach().cpu()):
 		return None
+	sign = _seed_quad_affine_alignment_sign(
+		affine=affine,
+		ext_hw=x_hw,
+		ext_normals=y_normals,
+		fixture=fixture,
+	)
 	sample_terms = _seed_quad_affine_sample_terms(
 		affine=affine,
 		ext_hw=x_hw,
@@ -953,7 +985,7 @@ def _seed_quad_affine_init_result(
 	print(
 		f"[snap_surf.map_global] affine seed quad ray init "
 		f"ext_quad={seed_ext_quad} model_quad={model_quad} "
-		f"sign={sign} "
+		f"sign={sign} sign_semantics=model_normal_alignment "
 		f"ext_step=({ext_h:.6g},{ext_w:.6g}) model_step=({model_h:.6g},{model_w:.6g}) "
 		f"model_radius=({radius_h},{radius_w}) model_quads={int(patch_quads.shape[0])} "
 		f"samples={samples * samples} hits={hit_count} kept={len(kept_hw)} rejected_far={rejected_far}",
@@ -1011,6 +1043,7 @@ def _apply_seed_quad_init_metadata(fixture: MapFixture, result: SeedQuadAffineIn
 		"ext_quad": [int(v) for v in result.ext_quad],
 		"model_quad": [int(v) for v in result.model_quad],
 		"sign": int(result.sign),
+		"sign_semantics": "model_normal_alignment",
 		"samples": int(result.sampled_count),
 		"hits": int(result.hit_count),
 		"kept": int(result.kept_count),
@@ -2696,6 +2729,7 @@ def optimize_fixture(
 		"station_seed_ext_hw": seed_hw.detach().cpu(),
 		"station_target_uv": station_target.detach().cpu(),
 		"sign": int(fixture.metadata.get("sign", 1) or 1),
+		"sign_semantics": "model_normal_alignment",
 		"seed_quad_init": fixture.metadata.get("seed_quad_init"),
 		"stages": [asdict(stage) for stage in cfg_global.stages],
 	}

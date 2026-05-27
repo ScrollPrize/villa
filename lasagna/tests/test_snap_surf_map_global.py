@@ -166,9 +166,11 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		data=None,
 		mutate_model_xyz=None,
 		mutate_ext_xyz=None,
+		runtime_sign: int = 1,
 	):
 		h, w = 5, 5
 		runtime = GlobalMapRuntime()
+		runtime.sign = int(runtime_sign)
 		model_xyz = _plane_xyz(h=h, w=w, z=model_z).unsqueeze(0)
 		model_normals = _normals_3d(1, h, w)
 		model_valid = torch.ones(1, h, w, dtype=torch.bool)
@@ -304,6 +306,30 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
 		self.assertEqual(stats["snaps_map_snap_samples"], 0.0)
+
+	def test_snap_loss_nonzero_offset_positive_side_follows_aligned_model_normal(self) -> None:
+		loss_pos, stats_pos, _out = self._snap_loss_case(offset=1.0, model_z=2.0, grad_mag=0.5, runtime_sign=1)
+		above_ext = lambda ext_xyz: ext_xyz.__setitem__((slice(None), slice(None), 2), 4.0)
+		loss_neg, stats_neg, _out = self._snap_loss_case(
+			offset=1.0,
+			model_z=2.0,
+			grad_mag=0.5,
+			runtime_sign=-1,
+			mutate_ext_xyz=above_ext,
+		)
+		loss_wrong, stats_wrong, _out = self._snap_loss_case(
+			offset=1.0,
+			model_z=2.0,
+			grad_mag=0.5,
+			runtime_sign=1,
+			mutate_ext_xyz=above_ext,
+		)
+
+		self.assertAlmostEqual(float(loss_pos.detach()), 0.0, places=6)
+		self.assertAlmostEqual(float(loss_neg.detach()), 0.0, places=6)
+		self.assertAlmostEqual(stats_pos["snaps_map_snap_abs"], 0.0, places=6)
+		self.assertAlmostEqual(stats_neg["snaps_map_snap_abs"], 0.0, places=6)
+		self.assertGreater(stats_wrong["snaps_map_snap_abs"], 1.9)
 
 	def test_snap_loss_nonzero_offset_sanitizes_nan_external_samples(self) -> None:
 		data = _RejectNonFiniteGradData(0.5)
@@ -687,7 +713,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			pred = torch.tensor([0.0, 0.0, 1.0]) @ affine.transpose(0, 1)
 			self.assertTrue(torch.allclose(pred, torch.tensor([0.25, 0.5]), atol=1.0e-4))
 
-	def test_seed_quad_affine_sign_orients_normals_toward_model(self) -> None:
+	def test_seed_quad_affine_sign_ignores_which_side_model_is_on(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			_write_planar_global_fixture(tmp)
 			fixture_json = Path(tmp, "fixture.json")
@@ -710,9 +736,36 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 			self.assertIsNotNone(result)
 			assert result is not None
-			self.assertEqual(result.sign, -1)
+			self.assertEqual(result.sign, 1)
 			self.assertEqual(result.sampled_count, 256)
 			self.assertGreaterEqual(result.kept_count, 3)
+			self.assertLess(result.seed_vec, 1.0e-4)
+
+	def test_seed_quad_affine_sign_aligns_model_normal_convention(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp)
+			fixture_json = Path(tmp, "fixture.json")
+			meta = json.loads(fixture_json.read_text(encoding="utf-8"))
+			meta["seed_model_quad"] = [0, 1, 1]
+			fixture_json.write_text(json.dumps(meta), encoding="utf-8")
+			fixture = load_map_fixture(tmp)
+			model_xyz = fixture.model_xyz.clone()
+			model_xyz[..., 2] = 1.0
+			fixture = replace(fixture, model_xyz=model_xyz, model_normals=-fixture.model_normals)
+			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+
+			result = _seed_quad_affine_init_result(
+				fixture=fixture,
+				stage_cfg=cfg,
+				seed_hw=torch.tensor([2.0, 2.0]),
+				seed_model_uv=torch.tensor([4.0, 2.0]),
+				raw={"grid_search": False},
+			)
+
+			self.assertIsNotNone(result)
+			assert result is not None
+			self.assertEqual(result.sign, -1)
+			self.assertLess(result.seed_norm, 1.0e-4)
 			self.assertLess(result.seed_vec, 1.0e-4)
 
 	def test_config_parses_stage_args(self) -> None:
