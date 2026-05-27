@@ -1606,6 +1606,8 @@ def optimize(
 							("sm_trn", "lifted z-heading loss"),
 							("sm_ts", "valid lifted z-heading samples"),
 							("sm_smp", "valid map samples"),
+							("lr", "effective map optimizer learning rate"),
+							("lr_scl", "map LR autoscale factor"),
 							("it/s", "optimizer it/s"),
 						],
 					)
@@ -1614,7 +1616,7 @@ def optimize(
 					print(
 						f"{'step':>{_map_status_width}s} {'sm_los':>8s} {'sm_dst':>8s} "
 						f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} {'sm_ts':>8s} "
-						f"{'sm_smp':>8s} {'it/s':>5s}",
+						f"{'sm_smp':>8s} {'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
 						flush=True,
 					)
 				now = time.perf_counter()
@@ -1633,6 +1635,8 @@ def optimize(
 					f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_lr', opt_cfg.lr if isinstance(opt_cfg.lr, (int, float)) else _lr_last(opt_cfg.lr)))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_lr_autoscale', 1.0))):>8s} "
 					f"{its_str}",
 					flush=True,
 				)

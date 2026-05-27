@@ -105,7 +105,7 @@
 		{
 			"name": "map_uv_coarse",
 			"steps": "auto",
-			"lr": 0.1,
+			"lr": 1.0,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
@@ -117,7 +117,7 @@
 		{
 			"name": "map_uv_refine",
 			"steps": "auto",
-			"lr": 0.1,
+			"lr": 1.0,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {

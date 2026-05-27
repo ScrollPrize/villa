@@ -3748,6 +3748,7 @@ class GlobalMapRuntime:
 		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
 		_t_startup = time.perf_counter()
 		initial_stats = _stats_for_current_uv()
+		initial_stats["snaps_map_lr"] = float(stage.lr)
 		startup_initial_eval_s = time.perf_counter() - _t_startup
 		initial_stats["snaps_map_startup_initial_eval_ms"] = 1000.0 * float(startup_initial_eval_s)
 		if startup_timing:
@@ -3832,7 +3833,10 @@ class GlobalMapRuntime:
 					auto_stopped or
 					(status_interval > 0 and (step1 % status_interval) == 0)
 				):
-					status_fn(step=step1, total=int(stage.steps), stats=_stats_for_current_uv())
+					status_stats = _stats_for_current_uv()
+					status_stats["snaps_map_lr"] = _optimizer_lr_for_display(opt, float(stage.lr))
+					status_stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+					status_fn(step=step1, total=int(stage.steps), stats=status_stats)
 				if auto_stopped:
 					break
 			if not persistent_optimizer:
@@ -3840,6 +3844,7 @@ class GlobalMapRuntime:
 				self.optimizer_key = None
 				self.lr_autoscale = None
 		stats = _stats_for_current_uv()
+		stats["snaps_map_lr"] = _optimizer_lr_for_display(opt if params and int(stage.steps) > 0 else None, float(stage.lr))
 		stats["snaps_map_stage_steps"] = float(steps_completed)
 		stats["snaps_map_auto_stopped"] = 1.0 if auto_stopped else 0.0
 		stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
