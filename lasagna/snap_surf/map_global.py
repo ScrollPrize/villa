@@ -853,6 +853,172 @@ def _seed_quad_affine_alignment_sign(
 	return 1 if float(mean_dot.detach().cpu()) >= 0.0 else -1
 
 
+def _affine_uv_field(
+	affine: torch.Tensor,
+	ext_shape: tuple[int, int],
+) -> torch.Tensor:
+	H, W = int(ext_shape[0]), int(ext_shape[1])
+	hh = torch.arange(H, device=affine.device, dtype=affine.dtype).view(H, 1).expand(H, W)
+	ww = torch.arange(W, device=affine.device, dtype=affine.dtype).view(1, W).expand(H, W)
+	return (
+		hh.unsqueeze(-1) * affine[:, 0] +
+		ww.unsqueeze(-1) * affine[:, 1] +
+		affine[:, 2]
+	)
+
+
+def _seed_quad_expansion_radii(
+	active: torch.Tensor,
+	seed_ext_quad: tuple[int, int],
+) -> list[int]:
+	coords = active.bool().nonzero(as_tuple=False)
+	if int(coords.shape[0]) == 0:
+		return [0]
+	seed_h, seed_w = (int(v) for v in seed_ext_quad)
+	dh = (coords[:, 0] - seed_h).abs()
+	dw = (coords[:, 1] - seed_w).abs()
+	max_radius = int(torch.maximum(dh, dw).max().detach().cpu())
+	radii = [0]
+	r = 8
+	while r < max_radius:
+		radii.append(r)
+		r *= 2
+	if max_radius > 0:
+		radii.append(max(r, max_radius))
+	return radii
+
+
+def _seed_quad_expansion_active_mask(
+	active: torch.Tensor,
+	seed_ext_quad: tuple[int, int],
+	radius: int,
+) -> torch.Tensor:
+	QH, QW = int(active.shape[0]), int(active.shape[1])
+	seed_h, seed_w = (int(v) for v in seed_ext_quad)
+	hh = torch.arange(QH, device=active.device).view(QH, 1).expand(QH, QW)
+	ww = torch.arange(QW, device=active.device).view(1, QW).expand(QH, QW)
+	near = torch.maximum((hh - seed_h).abs(), (ww - seed_w).abs()) <= int(radius)
+	return active.bool() & near
+
+
+def _affine_seed_quad_expansion_rows(
+	*,
+	affine: torch.Tensor,
+	seed_ext_quad: tuple[int, int],
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	sign: int | None = None,
+) -> list[dict[str, float]]:
+	active_full = _full_active_quad(fixture)
+	uv = _affine_uv_field(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
+	sign_i = int(fixture.metadata.get("sign", 1) or 1) if sign is None else int(sign)
+	rows: list[dict[str, float]] = []
+	for radius in _seed_quad_expansion_radii(active_full, seed_ext_quad):
+		active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius)
+		loss, terms = _map_init_objective(
+			uv_full=uv,
+			active_quad=active,
+			ext_pos=fixture.ext_xyz,
+			ext_normals=fixture.ext_normals,
+			ext_valid=fixture.ext_valid,
+			ext_quad_valid=fixture.ext_quad_valid,
+			ext_coords=None,
+			model_xyz=fixture.model_xyz,
+			model_valid=fixture.model_valid,
+			model_normals=fixture.model_normals,
+			model_depth=int(fixture.metadata.get("model_depth", 0) or 0),
+			sign=sign_i,
+			cfg=stage_cfg,
+			allow_partial_model_samples=True,
+		)
+		rows.append({
+			"radius": float(radius),
+			"quads": float(int(active.sum().detach().cpu())),
+			"loss": float(loss.detach().cpu()),
+			"dist": _global_term_value(terms, "dist"),
+			"dist_avg": _global_term_value(terms, "dist_avg"),
+			"vec": _global_term_value(terms, "vec"),
+			"norm": _global_term_value(terms, "norm"),
+			"smooth": _global_term_value(terms, "smooth"),
+			"jac": _global_term_value(terms, "jac"),
+			"samples": _global_term_value(terms, "samples"),
+			"sample_bad": _global_term_value(terms, "sample_bad"),
+			"quad_success": _global_term_value(terms, "quad_success"),
+		})
+	return rows
+
+
+_SEED_EXPANSION_COLUMNS = (
+	ProgressColumn("radius", "rad", "Chebyshev radius from seed external quad; 0 is just the seed quad", min_width=5),
+	ProgressColumn("quads", "quads", "active external quads in radius", min_width=7),
+	ProgressColumn("loss", "loss", "map objective loss with optimizer terms", min_width=7),
+	ProgressColumn("dist", "dist", "map distance loss", min_width=7),
+	ProgressColumn("dist_avg", "avgd", "mean connection distance", min_width=7),
+	ProgressColumn("vec", "vec", "vector-normal loss", min_width=7),
+	ProgressColumn("norm", "nrm", "surface-normal loss", min_width=7),
+	ProgressColumn("smooth", "smo", "smoothness loss", min_width=7),
+	ProgressColumn("jac", "jac", "jacobian loss", min_width=7),
+	ProgressColumn("samples", "smp", "objective samples", min_width=7),
+	ProgressColumn("sample_bad", "bad", "samples rejected by objective limits", min_width=7),
+	ProgressColumn("quad_success", "okq", "quads passing objective checks", min_width=7),
+)
+
+
+def _print_affine_seed_quad_expansion_diagnostic(
+	*,
+	affine: torch.Tensor,
+	seed_ext_quad: tuple[int, int],
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	sign: int | None = None,
+) -> None:
+	rows = _affine_seed_quad_expansion_rows(
+		affine=affine,
+		seed_ext_quad=seed_ext_quad,
+		fixture=fixture,
+		stage_cfg=stage_cfg,
+		sign=sign,
+	)
+	widths = progress_widths(
+		_SEED_EXPANSION_COLUMNS,
+		{
+			"radius": "1000000",
+			"quads": "100000000",
+			"loss": "-1.0e+99",
+			"dist": "-1.0e+99",
+			"dist_avg": "-1.0e+99",
+			"vec": "-1.0e+99",
+			"norm": "-1.0e+99",
+			"smooth": "-1.0e+99",
+			"jac": "-1.0e+99",
+			"samples": "100000000",
+			"sample_bad": "100000000",
+			"quad_success": "100000000",
+		},
+	)
+	print_progress_legend(
+		prefix="[snap_surf.map_global] affine seed quad expansion loss",
+		items=[(col.label, col.description) for col in _SEED_EXPANSION_COLUMNS],
+	)
+	print(progress_header(_SEED_EXPANSION_COLUMNS, widths), flush=True)
+	for row in rows:
+		values = {
+			"radius": str(int(row["radius"])),
+			"quads": str(int(row["quads"])),
+			"loss": format_progress_value(float(row["loss"])),
+			"dist": format_progress_value(float(row["dist"])),
+			"dist_avg": format_progress_value(float(row["dist_avg"])),
+			"vec": format_progress_value(float(row["vec"])),
+			"norm": format_progress_value(float(row["norm"])),
+			"smooth": format_progress_value(float(row["smooth"])),
+			"jac": format_progress_value(float(row["jac"])),
+			"samples": str(int(row["samples"])),
+			"sample_bad": str(int(row["sample_bad"])),
+			"quad_success": str(int(row["quad_success"])),
+		}
+		print(progress_row(_SEED_EXPANSION_COLUMNS, widths, values), flush=True)
+
+
 def _seed_quad_affine_init_result(
 	*,
 	fixture: MapFixture,
@@ -1010,6 +1176,14 @@ def _seed_quad_affine_init_result(
 		f"uv_rmse={sample_terms['uv_rmse']:.6g} uv_max={sample_terms['uv_max']:.6g}",
 		flush=True,
 	)
+	if bool(cfg.get("expansion_loss_diag", cfg.get("expansion_diagnostic", True))):
+		_print_affine_seed_quad_expansion_diagnostic(
+			affine=affine,
+			seed_ext_quad=seed_ext_quad,
+			fixture=fixture,
+			stage_cfg=stage_cfg,
+			sign=sign,
+		)
 	return SeedQuadAffineInitResult(
 		affine=affine,
 		sign=sign,

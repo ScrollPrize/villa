@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -28,6 +29,7 @@ from snap_surf.map_global import (
 	GlobalMapConfig,
 	_affine_from_seed_ext_quads,
 	_affine_multistart_candidates,
+	_affine_seed_quad_expansion_rows,
 	_affine_seed_grid_candidates,
 	_objective_for_uv,
 	_select_affine_seed_grid_candidate,
@@ -767,6 +769,26 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual(result.sign, -1)
 			self.assertLess(result.seed_norm, 1.0e-4)
 			self.assertLess(result.seed_vec, 1.0e-4)
+
+	def test_seed_quad_affine_expansion_rows_grow_to_full_ext_model(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=20, w=20)
+			fixture = load_map_fixture(tmp)
+			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+			affine = torch.tensor([[1.0, 0.0, 0.25], [0.0, 1.0, 0.5]], dtype=fixture.model_xyz.dtype)
+
+			rows = _affine_seed_quad_expansion_rows(
+				affine=affine,
+				seed_ext_quad=(9, 9),
+				fixture=fixture,
+				stage_cfg=cfg,
+				sign=1,
+			)
+
+			self.assertEqual([int(row["radius"]) for row in rows], [0, 8, 16])
+			self.assertEqual([int(row["quads"]) for row in rows], [1, 17 * 17, 19 * 19])
+			self.assertTrue(all(math.isfinite(float(row["loss"])) for row in rows))
+			self.assertTrue(all(int(row["samples"]) > 0 for row in rows))
 
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
