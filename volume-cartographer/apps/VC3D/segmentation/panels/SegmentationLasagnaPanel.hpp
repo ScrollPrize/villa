@@ -105,6 +105,11 @@ private:
     void updateCompactLinkedSurfaceTable(const QStringList& names);
     void updateLinkedSurfaceTables();
     [[nodiscard]] QStringList currentLinkedSurfaceNames() const;
+    void showLasagnaConfigError(const QString& message,
+                                QStatusBar* statusBar,
+                                int timeoutMs);
+    [[nodiscard]] bool validateLasagnaConfigPath(const QString& configPath,
+                                                 QStatusBar* statusBar);
     void startOptimizationWithOverrides(CState* state,
                                         QStatusBar* statusBar,
                                         int modeOverride,

@@ -29,6 +29,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
@@ -1191,16 +1192,7 @@ void SegmentationLasagnaPanel::triggerOptimization()
               << " connection=" << (_connectionMode == 1 ? "external" : "internal")
               << std::endl;
 
-    if (configPath.isEmpty()) {
-        _progressLabel->setText(tr("No config file selected."));
-        _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
-        _progressLabel->setVisible(true);
-        return;
-    }
-    if (!QFileInfo::exists(configPath)) {
-        _progressLabel->setText(tr("Config file not found: %1").arg(configPath));
-        _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
-        _progressLabel->setVisible(true);
+    if (!validateLasagnaConfigPath(configPath, nullptr)) {
         return;
     }
 
@@ -1260,18 +1252,8 @@ void SegmentationLasagnaPanel::startOptimizationAtSeed(CState* state,
                                                        int seedZ)
 {
     _lastLasagnaMode = mode;
-    auto showStatus = [statusBar](const QString& msg, int timeout) {
-        if (statusBar) {
-            statusBar->showMessage(msg, timeout);
-        }
-    };
 
-    if (configPath.isEmpty()) {
-        showStatus(tr("No Lasagna config file selected."), 5000);
-        return;
-    }
-    if (!QFileInfo::exists(configPath)) {
-        showStatus(tr("Config file not found: %1").arg(configPath), 7000);
+    if (!validateLasagnaConfigPath(configPath, statusBar)) {
         return;
     }
 
@@ -1334,6 +1316,47 @@ QStringList SegmentationLasagnaPanel::lasagnaConfigPathsForMode(LasagnaMode mode
     return paths;
 }
 
+void SegmentationLasagnaPanel::showLasagnaConfigError(const QString& message,
+                                                      QStatusBar* statusBar,
+                                                      int timeoutMs)
+{
+    std::cerr << "[lasagna] " << message.toStdString() << std::endl;
+    if (statusBar) {
+        statusBar->showMessage(message, timeoutMs);
+    }
+    if (_progressLabel) {
+        _progressLabel->setText(message);
+        _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
+        _progressLabel->setVisible(true);
+    }
+    QMessageBox::warning(this, tr("Lasagna config error"), message);
+}
+
+bool SegmentationLasagnaPanel::validateLasagnaConfigPath(const QString& configPath,
+                                                         QStatusBar* statusBar)
+{
+    if (configPath.isEmpty()) {
+        showLasagnaConfigError(tr("No Lasagna config file selected."), statusBar, 5000);
+        return false;
+    }
+
+    const QFileInfo configInfo(configPath);
+    if (!configInfo.exists()) {
+        showLasagnaConfigError(tr("Lasagna config file not found: %1").arg(configPath),
+                               statusBar,
+                               7000);
+        return false;
+    }
+    if (!configInfo.isFile()) {
+        showLasagnaConfigError(tr("Lasagna config path is not a file: %1").arg(configPath),
+                               statusBar,
+                               7000);
+        return false;
+    }
+
+    return true;
+}
+
 void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
                                                               QStatusBar* statusBar,
                                                               int modeOverride,
@@ -1360,16 +1383,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         : _reoptConfigFilePath;
     const bool isNewModel = (launchMode == LasagnaMode::NewModel);
 
-    if (configPath.isEmpty()) {
-        auto msg = tr("No Lasagna config file selected.");
-        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-        showStatus(msg, 5000);
-        return;
-    }
-    if (!QFileInfo::exists(configPath)) {
-        auto msg = tr("Config file not found: %1").arg(configPath);
-        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-        showStatus(msg, 7000);
+    if (!validateLasagnaConfigPath(configPath, statusBar)) {
         return;
     }
 
@@ -1537,9 +1551,9 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     {
         QFile f(configPath);
         if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            auto msg = tr("Cannot read Lasagna config: %1").arg(configPath);
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 7000);
+            auto msg = tr("Cannot read Lasagna config %1: %2")
+                .arg(configPath, f.errorString());
+            showLasagnaConfigError(msg, statusBar, 7000);
             return;
         }
         configText = QString::fromUtf8(f.readAll()).trimmed();
@@ -1551,14 +1565,12 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             auto msg = tr("Invalid Lasagna config JSON at byte %1: %2")
                 .arg(parseError.offset)
                 .arg(parseError.errorString());
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 7000);
+            showLasagnaConfigError(msg, statusBar, 7000);
             return;
         }
         if (!doc.isObject()) {
             auto msg = tr("Invalid Lasagna config JSON: top-level value must be an object.");
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 7000);
+            showLasagnaConfigError(msg, statusBar, 7000);
             return;
         }
         config = doc.object();
