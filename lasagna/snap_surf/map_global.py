@@ -27,9 +27,9 @@ from .legacy import (
 from .map_fixture_io import MapFixture, _float_tif, _write_json, load_map_fixture
 from .map_objective import (
 	_map_init_distance_multiplier,
-	_map_init_lifted_z_heading_branches,
+	_map_init_lifted_z_heading_field,
 	_map_init_objective,
-	_map_init_z_lift_turn_values,
+	_map_init_sample_scalar_quad_field,
 )
 from .map_pyramid import (
 	_map_init_coords3,
@@ -631,7 +631,7 @@ def _map_init_z_lift_for_fixture(
 		if external_cache is not None and ext_key is not None:
 			_bump("zext_miss")
 		ext_base = _external_quad_base_valid(fixture.ext_xyz, fixture.ext_valid.bool(), fixture.ext_quad_valid.bool())
-		ext_k, ext_valid, ext_stats = _map_init_lifted_z_heading_branches(
+		ext_theta, ext_valid, ext_stats = _map_init_lifted_z_heading_field(
 			fixture.ext_normals,
 			ext_base,
 			seed_ext,
@@ -639,7 +639,7 @@ def _map_init_z_lift_for_fixture(
 			sign=1,
 		)
 		ext_part = None if float(ext_stats["valid"]) <= 0.0 else {
-			"k": ext_k.detach(),
+			"theta_lifted": ext_theta.detach(),
 			"valid": ext_valid.detach(),
 			"stats": dict(ext_stats),
 		}
@@ -648,6 +648,8 @@ def _map_init_z_lift_for_fixture(
 
 	model_key = None
 	if mesh_epoch is not None:
+		# The model z-rotation field is valid only for the fixed map-init
+		# mesh/normals represented by this epoch. Rebuild it if geometry moves.
 		model_key = (
 			int(mesh_epoch),
 			sign_i,
@@ -666,7 +668,7 @@ def _map_init_z_lift_for_fixture(
 		if model_cache is not None and model_key is not None:
 			_bump("zmdl_miss")
 		model_base = _model_quad_base_valid(fixture.model_xyz, fixture.model_valid.bool())
-		model_k, model_valid, model_stats = _map_init_lifted_z_heading_branches(
+		model_theta, model_valid, model_stats = _map_init_lifted_z_heading_field(
 			fixture.model_normals,
 			model_base,
 			seed_model,
@@ -674,7 +676,7 @@ def _map_init_z_lift_for_fixture(
 			sign=sign_i,
 		)
 		model_part = None if float(model_stats["valid"]) <= 0.0 else {
-			"k": model_k.detach(),
+			"theta_lifted": model_theta.detach(),
 			"valid": model_valid.detach(),
 			"stats": dict(model_stats),
 		}
@@ -684,9 +686,9 @@ def _map_init_z_lift_for_fixture(
 	if ext_part is None or model_part is None:
 		return None
 	out = {
-		"ext_k": ext_part["k"],
+		"ext_theta_lifted": ext_part["theta_lifted"],
 		"ext_valid": ext_part["valid"],
-		"model_k": model_part["k"],
+		"model_theta_lifted": model_part["theta_lifted"],
 		"model_valid": model_part["valid"],
 		"stats": {
 			"ext_valid": float(ext_part["stats"]["valid"]),
@@ -1395,24 +1397,24 @@ def _seed_quad_affine_sample_terms(
 	turn_valid = torch.ones_like(coord_ok, dtype=torch.bool)
 	if z_lift is not None:
 		quad_hw = torch.floor(ext_hw.to(device=affine.device, dtype=affine.dtype)).long()
-		quad_hw[:, 0] = quad_hw[:, 0].clamp(0, max(0, int(z_lift["ext_k"].shape[0]) - 1))
-		quad_hw[:, 1] = quad_hw[:, 1].clamp(0, max(0, int(z_lift["ext_k"].shape[1]) - 1))
-		Q = int(quad_hw.shape[0])
-		turn_values, turn_valid = _map_init_z_lift_turn_values(
-			quad_hw=quad_hw,
-			sample_count=1,
-			n_ext=n_ext,
-			n_model_raw=n_model_raw,
-			coords3=safe_coords.reshape(Q, 1, 3),
-			sign=sign,
-			ext_k=z_lift["ext_k"],
-			ext_valid=z_lift["ext_valid"],
-			model_k=z_lift["model_k"],
-			model_valid=z_lift["model_valid"],
-			cfg=stage_cfg.map_init,
+		ext_theta = z_lift["ext_theta_lifted"].to(device=affine.device, dtype=affine.dtype)
+		ext_valid = z_lift["ext_valid"].to(device=affine.device).bool()
+		quad_hw[:, 0] = quad_hw[:, 0].clamp(0, max(0, int(ext_theta.shape[0]) - 1))
+		quad_hw[:, 1] = quad_hw[:, 1].clamp(0, max(0, int(ext_theta.shape[1]) - 1))
+		model_theta, model_theta_valid = _map_init_sample_scalar_quad_field(
+			z_lift["model_theta_lifted"].to(device=affine.device, dtype=affine.dtype),
+			z_lift["model_valid"].to(device=affine.device).bool(),
+			safe_coords,
+			tuple(int(v) for v in z_lift["model_valid"].shape),
 		)
-		turn_values = turn_values.reshape(-1)
-		turn_valid = turn_valid.reshape(-1)
+		ext_theta_sample = ext_theta[quad_hw[:, 0], quad_hw[:, 1]]
+		turn_valid = (
+			ext_valid[quad_hw[:, 0], quad_hw[:, 1]] &
+			model_theta_valid &
+			torch.isfinite(ext_theta_sample) &
+			torch.isfinite(model_theta)
+		)
+		turn_values = _huber(ext_theta_sample - model_theta, delta=float(stage_cfg.map_init.z_lift_huber_delta))
 	valid = (
 		coord_ok &
 		turn_valid &
@@ -1566,7 +1568,6 @@ def _objective_for_active_uv(
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
 	need_stats: bool = True,
-	active_quad_hw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	sign_i = int(fixture.metadata.get("sign", 1) or 1)
 	z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
@@ -1586,10 +1587,9 @@ def _objective_for_active_uv(
 		cfg=cfg,
 		allow_partial_model_samples=True,
 		need_stats=bool(need_stats),
-		active_quad_hw=active_quad_hw,
-		ext_z_lift_k=None if z_lift is None else z_lift["ext_k"],
+		ext_z_lift_theta=None if z_lift is None else z_lift["ext_theta_lifted"],
 		ext_z_lift_valid=None if z_lift is None else z_lift["ext_valid"],
-		model_z_lift_k=None if z_lift is None else z_lift["model_k"],
+		model_z_lift_theta=None if z_lift is None else z_lift["model_theta_lifted"],
 		model_z_lift_valid=None if z_lift is None else z_lift["model_valid"],
 	)
 
@@ -1866,7 +1866,6 @@ def _run_affine_seed_quad_expansion_reopt(
 		if cancel_fn is not None:
 			cancel_fn()
 		active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius)
-		active_hw = active.nonzero(as_tuple=False)
 		init_row = eval_row(radius, active, 0, 0.0)
 		init_loss = float(init_row["loss"])
 		init_row["init_loss"] = init_loss
@@ -1902,7 +1901,6 @@ def _run_affine_seed_quad_expansion_reopt(
 				fixture=fixture,
 				cfg=stage_cfg,
 				need_stats=False,
-				active_quad_hw=active_hw,
 			)
 			if float(w_station) > 0.0:
 				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
@@ -2298,7 +2296,6 @@ def _optimize_affine_candidate(
 	opt = torch.optim.Adam([affine_model.affine], lr=float(lr)) if int(steps) > 0 else None
 	last_loss = float("inf")
 	stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
-	stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 	for _ in range(max(1, int(steps))):
 		if cancel_fn is not None:
 			cancel_fn()
@@ -2312,7 +2309,6 @@ def _optimize_affine_candidate(
 			level=0,
 			need_stats=False,
 			active_quad=stage_active_quad,
-			active_quad_hw=stage_active_quad_hw,
 		)
 		if float(w_station) > 0.0:
 			loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
@@ -2891,7 +2887,6 @@ def _run_affine_seed_quad_init(
 	last_status_step = 0
 	progress_rows = int(prep_progress_rows)
 	stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
-	stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 	with torch.no_grad():
 		report_loss, report_terms, report_err = _global_progress_state(
 			uv=affine(),
@@ -2901,7 +2896,6 @@ def _run_affine_seed_quad_init(
 			station_target=station_target,
 			w_station=w_station,
 			active_quad=stage_active_quad,
-			active_quad_hw=stage_active_quad_hw,
 		)
 	_print_global_progress(
 		row_idx=int(progress_row_idx) + progress_rows,
@@ -2927,7 +2921,6 @@ def _run_affine_seed_quad_init(
 			level=0,
 			need_stats=False,
 			active_quad=stage_active_quad,
-			active_quad_hw=stage_active_quad_hw,
 		)
 		station_raw = loss.new_zeros(())
 		if float(w_station) > 0.0:
@@ -2960,7 +2953,6 @@ def _run_affine_seed_quad_init(
 					station_target=station_target,
 					w_station=w_station,
 					active_quad=stage_active_quad,
-					active_quad_hw=stage_active_quad_hw,
 				)
 			now = time.monotonic()
 			it_s = None
@@ -3094,7 +3086,6 @@ def _objective_for_uv(
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 	need_stats: bool = True,
 	active_quad: torch.Tensor | None = None,
-	active_quad_hw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	active = _level_active_quad(_full_active_quad(fixture), int(level)) if active_quad is None else active_quad
 	ext_coords = None if int(level) == 0 else _level_coords(fixture.ext_xyz.shape[:2], int(level), uv)
@@ -3118,10 +3109,9 @@ def _objective_for_uv(
 		cfg=cfg,
 		allow_partial_model_samples=True,
 		need_stats=bool(need_stats),
-		active_quad_hw=active_quad_hw,
-		ext_z_lift_k=None if z_lift_d is None else z_lift_d["ext_k"],
+		ext_z_lift_theta=None if z_lift_d is None else z_lift_d["ext_theta_lifted"],
 		ext_z_lift_valid=None if z_lift_d is None else z_lift_d["ext_valid"],
-		model_z_lift_k=None if z_lift_d is None else z_lift_d["model_k"],
+		model_z_lift_theta=None if z_lift_d is None else z_lift_d["model_theta_lifted"],
 		model_z_lift_valid=None if z_lift_d is None else z_lift_d["model_valid"],
 	)
 
@@ -3407,7 +3397,6 @@ def _global_progress_state(
 	w_station: float,
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 	active_quad: torch.Tensor | None = None,
-	active_quad_hw: torch.Tensor | None = None,
 ) -> tuple[float, dict[str, torch.Tensor], dict[str, float]]:
 	loss, terms = _objective_for_uv(
 		uv=uv,
@@ -3416,7 +3405,6 @@ def _global_progress_state(
 		level=0,
 		z_lift=z_lift,
 		active_quad=active_quad,
-		active_quad_hw=active_quad_hw,
 	)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
@@ -3690,7 +3678,6 @@ class GlobalMapRuntime:
 		)
 		startup_z_lift_s = time.perf_counter() - _t_startup
 		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
-		stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 		startup_initial_eval_s = 0.0
 		startup_timing_printed = False
 		def _maybe_print_startup_timing() -> None:
@@ -3761,7 +3748,6 @@ class GlobalMapRuntime:
 					w_station=w_station,
 					z_lift=stage_z_lift,
 					active_quad=stage_active_quad,
-					active_quad_hw=stage_active_quad_hw,
 				)
 			return _stats_from_eval(loss_f, terms, err)
 
@@ -3815,7 +3801,6 @@ class GlobalMapRuntime:
 					z_lift=stage_z_lift,
 					need_stats=status_due,
 					active_quad=stage_active_quad,
-					active_quad_hw=stage_active_quad_hw,
 				)
 				if w_station > 0.0:
 					station_raw = _station_loss(uv, seed_hw, station_target)
@@ -4145,7 +4130,6 @@ def optimize_fixture(
 			cache_stats=stage_cache_stats,
 		)
 		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
-		stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 		opt = torch.optim.Adam(params, lr=float(stage.lr))
 		_capture_optimizer_target_lrs(opt)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
@@ -4167,7 +4151,6 @@ def optimize_fixture(
 				w_station=w_station,
 				z_lift=stage_z_lift,
 				active_quad=stage_active_quad,
-				active_quad_hw=stage_active_quad_hw,
 			)
 		_print_global_progress(
 			row_idx=progress_rows,
@@ -4196,7 +4179,6 @@ def optimize_fixture(
 				z_lift=stage_z_lift,
 				need_stats=False,
 				active_quad=stage_active_quad,
-				active_quad_hw=stage_active_quad_hw,
 			)
 			station_raw = loss.new_zeros(())
 			if w_station > 0.0:
@@ -4232,7 +4214,6 @@ def optimize_fixture(
 					w_station=w_station,
 					z_lift=stage_z_lift,
 					active_quad=stage_active_quad,
-					active_quad_hw=stage_active_quad_hw,
 				)
 				now = time.monotonic()
 				it_s = None
@@ -4263,7 +4244,6 @@ def optimize_fixture(
 						w_station=w_station,
 						z_lift=stage_z_lift,
 						active_quad=stage_active_quad,
-						active_quad_hw=stage_active_quad_hw,
 					)
 				history.append({
 					"stage": stage_idx,
