@@ -1134,6 +1134,11 @@ def _run_affine_seed_quad_expansion_reopt(
 		f"prior:{float(mi.w_dense_prior):.6g},station:{float(w_station):.6g}",
 		flush=True,
 	)
+	if debug_obj_root is not None:
+		print(
+			f"[snap_surf.map_global] affine seed quad expansion debug objs dir={debug_obj_root}",
+			flush=True,
+		)
 	def opt_lr(opt: torch.optim.Optimizer | None) -> float:
 		if opt is None or not opt.param_groups:
 			return float(lr)
@@ -1162,6 +1167,7 @@ def _run_affine_seed_quad_expansion_reopt(
 				"sample_bad": int(row["sample_bad"]),
 				"quad_success": int(row["quad_success"]),
 			},
+			active_quad=active,
 		)
 	def eval_row(radius: int, active: torch.Tensor, step_count: int, init_loss: float) -> dict[str, float]:
 		with torch.no_grad():
@@ -2380,6 +2386,55 @@ def _fixture_mapping_error(uv: torch.Tensor, fixture: MapFixture) -> dict[str, f
 	}
 
 
+def _vertex_mask_from_quad_mask(active_quad: torch.Tensor, shape: torch.Size | tuple[int, int]) -> torch.Tensor:
+	H, W = int(shape[0]), int(shape[1])
+	mask = torch.zeros((H, W), device=active_quad.device, dtype=torch.bool)
+	if int(active_quad.numel()) == 0:
+		return mask
+	active = active_quad.bool()
+	mask[:-1, :-1] |= active
+	mask[1:, :-1] |= active
+	mask[:-1, 1:] |= active
+	mask[1:, 1:] |= active
+	return mask
+
+
+def _model_vertex_mask_for_uv(
+	uv: torch.Tensor,
+	ok: torch.Tensor,
+	fixture: MapFixture,
+) -> torch.Tensor:
+	mask = torch.zeros_like(fixture.model_valid.bool())
+	if not bool(ok.any().detach().cpu()):
+		return mask
+	D, H, W = (int(v) for v in fixture.model_valid.shape)
+	if H <= 0 or W <= 0 or D <= 0:
+		return mask
+	depth = max(0, min(D - 1, int(fixture.metadata.get("model_depth", 0) or 0)))
+	coords = uv[ok]
+	finite = torch.isfinite(coords).all(dim=-1)
+	if not bool(finite.any().detach().cpu()):
+		return mask
+	coords = coords[finite]
+	if H == 1:
+		h0 = torch.zeros(coords.shape[0], device=coords.device, dtype=torch.long)
+		h1 = h0
+	else:
+		h0 = torch.floor(coords[:, 0]).clamp(0, H - 2).long()
+		h1 = h0 + 1
+	if W == 1:
+		w0 = torch.zeros(coords.shape[0], device=coords.device, dtype=torch.long)
+		w1 = w0
+	else:
+		w0 = torch.floor(coords[:, 1]).clamp(0, W - 2).long()
+		w1 = w0 + 1
+	mask[depth, h0, w0] = True
+	mask[depth, h1, w0] = True
+	mask[depth, h0, w1] = True
+	mask[depth, h1, w1] = True
+	return mask
+
+
 def _write_stage_objs(
 	out_root: Path,
 	*,
@@ -2408,13 +2463,22 @@ def _write_map_objs(
 	uv: torch.Tensor,
 	fixture: MapFixture,
 	meta: dict[str, Any],
+	active_quad: torch.Tensor | None = None,
 ) -> None:
 	out.mkdir(parents=True, exist_ok=True)
-	_write_obj_mesh_2d(out / "ext_surface.obj", fixture.ext_xyz, fixture.ext_valid)
-	_write_obj_mesh_3d_surfaces(out / "model_surface.obj", fixture.model_xyz, fixture.model_valid)
 	model_pos, model_ok = _uv_model_positions(uv, fixture)
 	ext_ok = fixture.ext_valid.bool() & torch.isfinite(fixture.ext_xyz).all(dim=-1)
+	ext_vertex_mask = None
+	if active_quad is not None:
+		ext_vertex_mask = _vertex_mask_from_quad_mask(active_quad.to(device=fixture.ext_xyz.device), fixture.ext_xyz.shape[:2])
+		ext_ok = ext_ok & ext_vertex_mask
 	ok = model_ok & ext_ok
+	ext_valid_debug = fixture.ext_valid if ext_vertex_mask is None else (fixture.ext_valid.bool() & ext_vertex_mask)
+	_write_obj_mesh_2d(out / "ext_surface.obj", fixture.ext_xyz, ext_valid_debug)
+	model_valid_debug = fixture.model_valid
+	if active_quad is not None:
+		model_valid_debug = fixture.model_valid.bool() & _model_vertex_mask_for_uv(uv, ok, fixture)
+	_write_obj_mesh_3d_surfaces(out / "model_surface.obj", fixture.model_xyz, model_valid_debug)
 	if bool(ok.any().detach().cpu()):
 		_write_obj_lines(out / "map_ext_to_model.obj", fixture.ext_xyz[ok], model_pos[ok], label="global_map_ext_to_model")
 	else:
@@ -2741,8 +2805,8 @@ class GlobalMapRuntime:
 			raw_seed = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
 			runtime_progress_widths = _global_progress_widths(GlobalMapConfig(base=self.cfg_global.base, stages=(stage,)))
 			debug_obj_root = None
-			debug_obj_dir = stage.args.get("debug_obj_dir", None)
-			if debug_obj_dir:
+			debug_obj_dir = stage.args.get("debug_obj_dir", True)
+			if debug_obj_dir is not None and debug_obj_dir is not False:
 				if isinstance(debug_obj_dir, bool):
 					debug_root = Path("snap_surf_objs")
 				else:

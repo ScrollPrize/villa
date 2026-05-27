@@ -37,6 +37,7 @@ from snap_surf.map_global import (
 	_seed_quad_affine_init_result,
 	_stage_loss_cfg,
 	_stage_station_weight,
+	_write_map_objs,
 	optimize_fixture,
 	parse_global_map_stage_item,
 	parse_global_map_config,
@@ -900,7 +901,11 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				steps=0,
 				lr=0.05,
 				params=("affine",),
-				args={"lr_warmup_steps": 4, "affine_seed_quad_init": {"expansion_reopt_steps": 1, "grid_search": False}},
+				args={
+					"debug_obj_dir": str(Path(tmp, "runtime_debug")),
+					"lr_warmup_steps": 4,
+					"affine_seed_quad_init": {"expansion_reopt_steps": 1, "grid_search": False},
+				},
 			)
 			stdout = StringIO()
 
@@ -926,8 +931,36 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertIn("start_radius=8", text)
 			self.assertIn("weights=", text)
 			self.assertIn("grow-r", text)
+			self.assertIn("affine seed quad expansion debug objs dir=", text)
+			self.assertTrue(Path(tmp, "runtime_debug", "map_global_affine_seed_quad_init", "expansion_reopt", "rad_000008_init", "map_ext_to_model.obj").exists())
 			self.assertIn("snaps_map_loss", stats)
 			self.assertEqual(runtime.sign, 1)
+
+	def test_expansion_debug_objs_are_scoped_to_active_radius(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			uv = _write_planar_global_fixture(tmp, h=5, w=5)
+			fixture = load_map_fixture(tmp)
+			active = torch.zeros(4, 4, dtype=torch.bool)
+			active[1, 1] = True
+			out = Path(tmp, "objs")
+
+			_write_map_objs(
+				out,
+				uv=uv,
+				fixture=fixture,
+				meta={"phase": "test"},
+				active_quad=active,
+			)
+
+			def count_prefix(path: Path, prefix: str) -> int:
+				return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.startswith(prefix))
+
+			self.assertEqual(count_prefix(out / "ext_surface.obj", "v "), 4)
+			self.assertEqual(count_prefix(out / "ext_surface.obj", "f "), 1)
+			self.assertEqual(count_prefix(out / "map_ext_to_model.obj", "l "), 4)
+			self.assertLess(count_prefix(out / "model_surface.obj", "v "), int(fixture.model_valid.sum()))
+			meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+			self.assertEqual(meta["valid_vectors"], 4)
 
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
