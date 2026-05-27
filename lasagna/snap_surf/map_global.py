@@ -1062,89 +1062,6 @@ def _print_affine_seed_quad_expansion_diagnostic(
 		print(progress_row(_SEED_EXPANSION_COLUMNS, widths, values), flush=True)
 
 
-_SEED_EXPANSION_REOPT_COLUMNS = (
-	ProgressColumn("radius", "rad", "Euclidean radius in external quad-grid coordinates", min_width=5),
-	ProgressColumn("iters", "it", "optimization iterations at this radius", min_width=5),
-	ProgressColumn("quads", "quads", "active external quads in radius", min_width=7),
-	ProgressColumn("init_loss", "init", "baseline init objective at this radius", min_width=7),
-	ProgressColumn("loss", "loss", "post-reopt objective including station term", min_width=7),
-	ProgressColumn("loss_gain", "gain", "baseline loss minus post-reopt loss", min_width=7),
-	ProgressColumn("dist", "dist", "map distance loss", min_width=7),
-	ProgressColumn("dist_avg", "avgd", "mean connection distance", min_width=7),
-	ProgressColumn("vec", "vec", "vector-normal loss", min_width=7),
-	ProgressColumn("norm", "nrm", "surface-normal loss", min_width=7),
-	ProgressColumn("smooth", "smo", "smoothness loss", min_width=7),
-	ProgressColumn("jac", "jac", "jacobian loss", min_width=7),
-	ProgressColumn("station", "stat", "station loss", min_width=7),
-	ProgressColumn("samples", "smp", "objective samples", min_width=7),
-	ProgressColumn("sample_bad", "bad", "samples rejected by objective limits", min_width=7),
-	ProgressColumn("quad_success", "okq", "quads passing objective checks", min_width=7),
-)
-
-
-def _affine_seed_quad_expansion_reopt_widths() -> dict[str, int]:
-	return progress_widths(
-		_SEED_EXPANSION_REOPT_COLUMNS,
-		{
-			"radius": "1000000",
-			"iters": "1000000",
-			"quads": "100000000",
-			"init_loss": "-1.0e+99",
-			"loss": "-1.0e+99",
-			"loss_gain": "-1.0e+99",
-			"dist": "-1.0e+99",
-			"dist_avg": "-1.0e+99",
-			"vec": "-1.0e+99",
-			"norm": "-1.0e+99",
-			"smooth": "-1.0e+99",
-			"jac": "-1.0e+99",
-			"station": "-1.0e+99",
-			"samples": "100000000",
-			"sample_bad": "100000000",
-			"quad_success": "100000000",
-		},
-	)
-
-
-def _print_affine_seed_quad_expansion_reopt_header(widths: dict[str, int]) -> None:
-	print_progress_legend(
-		prefix="[snap_surf.map_global] affine seed quad expansion reopt",
-		items=[(col.label, col.description) for col in _SEED_EXPANSION_REOPT_COLUMNS],
-	)
-	print(progress_header(_SEED_EXPANSION_REOPT_COLUMNS, widths), flush=True)
-
-
-def _print_affine_seed_quad_expansion_reopt_row(row: dict[str, float], widths: dict[str, int]) -> None:
-	values = {
-		"radius": str(int(row["radius"])),
-		"iters": str(int(row["iters"])),
-		"quads": str(int(row["quads"])),
-		"init_loss": format_progress_value(float(row["init_loss"])),
-		"loss": format_progress_value(float(row["loss"])),
-		"loss_gain": format_progress_value(float(row["loss_gain"])),
-		"dist": format_progress_value(float(row["dist"])),
-		"dist_avg": format_progress_value(float(row["dist_avg"])),
-		"vec": format_progress_value(float(row["vec"])),
-		"norm": format_progress_value(float(row["norm"])),
-		"smooth": format_progress_value(float(row["smooth"])),
-		"jac": format_progress_value(float(row["jac"])),
-		"station": format_progress_value(float(row["station"])),
-		"samples": str(int(row["samples"])),
-		"sample_bad": str(int(row["sample_bad"])),
-		"quad_success": str(int(row["quad_success"])),
-	}
-	print(progress_row(_SEED_EXPANSION_REOPT_COLUMNS, widths, values), flush=True)
-
-
-def _print_affine_seed_quad_expansion_reopt_rows(rows: list[dict[str, float]]) -> None:
-	if not rows:
-		return
-	widths = _affine_seed_quad_expansion_reopt_widths()
-	_print_affine_seed_quad_expansion_reopt_header(widths)
-	for row in rows:
-		_print_affine_seed_quad_expansion_reopt_row(row, widths)
-
-
 def _run_affine_seed_quad_expansion_reopt(
 	*,
 	affine: AffineMapModel,
@@ -1157,19 +1074,19 @@ def _run_affine_seed_quad_expansion_reopt(
 	steps: int,
 	lr: float,
 	status_interval: int,
-	progress: bool = False,
+	stage_idx: int,
+	progress_widths_run: dict[str, int] | None = None,
+	progress_row_idx: int = 0,
 	cancel_fn=None,
-) -> list[dict[str, float]]:
+) -> tuple[list[dict[str, float]], int]:
 	steps_i = max(0, int(steps))
 	if steps_i <= 0:
-		return []
+		return [], 0
 	status_interval_i = max(0, int(status_interval))
 	active_full = _full_active_quad(fixture)
 	radii = _seed_quad_expansion_radii(active_full, seed_ext_quad)
 	rows: list[dict[str, float]] = []
-	progress_widths_reopt = _affine_seed_quad_expansion_reopt_widths() if bool(progress) else None
-	if progress_widths_reopt is not None:
-		_print_affine_seed_quad_expansion_reopt_header(progress_widths_reopt)
+	progress_rows = 0
 	def eval_row(radius: int, active: torch.Tensor, step_count: int, init_loss: float) -> dict[str, float]:
 		with torch.no_grad():
 			uv = affine()
@@ -1194,6 +1111,28 @@ def _run_affine_seed_quad_expansion_reopt(
 		row["init_loss"] = float(init_loss)
 		row["loss_gain"] = float(init_loss) - float(row["loss"])
 		return row
+	def eval_progress(
+		radius: int,
+		active: torch.Tensor,
+		step_count: int,
+		init_loss: float,
+	) -> tuple[float, dict[str, torch.Tensor], dict[str, float]]:
+		with torch.no_grad():
+			uv = affine()
+			loss, terms = _objective_for_active_uv(
+				uv=uv,
+				active_quad=active,
+				fixture=fixture,
+				cfg=stage_cfg,
+			)
+			station_raw = loss.new_zeros(())
+			if float(w_station) > 0.0:
+				station_raw = _station_loss(uv, seed_hw, station_target)
+				loss = loss + float(w_station) * station_raw
+			progress_terms = dict(terms)
+			progress_terms["station"] = station_raw.detach()
+			err = _fixture_mapping_error(uv.detach(), fixture)
+		return float(loss.detach().cpu()), progress_terms, err
 	for radius in radii:
 		if cancel_fn is not None:
 			cancel_fn()
@@ -1225,9 +1164,22 @@ def _run_affine_seed_quad_expansion_reopt(
 			if status_due:
 				row = eval_row(radius, active, step1, init_loss)
 				rows.append(row)
-				if progress_widths_reopt is not None:
-					_print_affine_seed_quad_expansion_reopt_row(row, progress_widths_reopt)
-	return rows
+				if progress_widths_run is not None:
+					report_loss, report_terms, report_err = eval_progress(radius, active, step1, init_loss)
+					_print_global_progress(
+						row_idx=int(progress_row_idx) + progress_rows,
+						widths=progress_widths_run,
+						stage_idx=stage_idx,
+						iter_label=f"grow-r{int(radius)} {step1}/{steps_i}",
+						params=("affine",),
+						level=0,
+						loss=report_loss,
+						terms=report_terms,
+						it_s=None,
+						err=report_err,
+					)
+					progress_rows += 1
+	return rows, progress_rows
 
 
 def _seed_quad_affine_init_result(
@@ -1956,12 +1908,15 @@ def _prepare_affine_seed_quad_candidate(
 	w_station: float,
 	raw: Any,
 	lr: float,
+	stage_idx: int,
+	progress_widths_run: dict[str, int] | None,
+	progress_row_idx: int = 0,
 	cancel_fn=None,
-) -> tuple[SeedQuadAffineInitResult | None, torch.Tensor | None, float]:
+) -> tuple[SeedQuadAffineInitResult | None, torch.Tensor | None, float, int]:
 	if isinstance(raw, dict) and not bool(raw.get("enabled", True)):
-		return None, None, float("nan")
+		return None, None, float("nan"), 0
 	if not isinstance(raw, dict) and not bool(raw):
-		return None, None, float("nan")
+		return None, None, float("nan"), 0
 	seed_result = _seed_quad_affine_init_result(
 		fixture=fixture,
 		stage_cfg=stage_cfg,
@@ -1971,9 +1926,10 @@ def _prepare_affine_seed_quad_candidate(
 	)
 	if seed_result is None:
 		print("[snap_surf.map_global] affine seed quad init unavailable", flush=True)
-		return None, None, float("nan")
+		return None, None, float("nan"), 0
 	_apply_seed_quad_init_metadata(fixture, seed_result)
 	candidate = seed_result.affine
+	progress_rows = 0
 	reopt_cfg = raw if isinstance(raw, dict) else {}
 	reopt_enabled = bool(reopt_cfg.get("expansion_reopt", reopt_cfg.get("grow_reopt", True)))
 	if reopt_enabled:
@@ -1985,7 +1941,7 @@ def _prepare_affine_seed_quad_candidate(
 		)))
 		with torch.no_grad():
 			affine.affine.copy_(candidate)
-		reopt_rows = _run_affine_seed_quad_expansion_reopt(
+		_reopt_rows, progress_rows = _run_affine_seed_quad_expansion_reopt(
 			affine=affine,
 			fixture=fixture,
 			stage_cfg=stage_cfg,
@@ -1996,7 +1952,9 @@ def _prepare_affine_seed_quad_candidate(
 			steps=reopt_steps,
 			lr=reopt_lr,
 			status_interval=status_interval,
-			progress=True,
+			stage_idx=stage_idx,
+			progress_widths_run=progress_widths_run,
+			progress_row_idx=progress_row_idx,
 			cancel_fn=cancel_fn,
 		)
 		candidate = affine.affine.detach().clone()
@@ -2024,7 +1982,7 @@ def _prepare_affine_seed_quad_candidate(
 		initial_loss = seed_loss
 	with torch.no_grad():
 		affine.affine.copy_(candidate)
-	return seed_result, candidate.detach().clone(), initial_loss
+	return seed_result, candidate.detach().clone(), initial_loss, progress_rows
 
 
 def _run_affine_seed_quad_init(
@@ -2051,7 +2009,7 @@ def _run_affine_seed_quad_init(
 			return 0
 		steps = max(0, int(stage.steps))
 		lr = float(stage.lr)
-	seed_result, candidate, initial_loss = _prepare_affine_seed_quad_candidate(
+	seed_result, candidate, initial_loss, prep_progress_rows = _prepare_affine_seed_quad_candidate(
 		stage=stage,
 		affine=affine,
 		fixture=fixture,
@@ -2061,6 +2019,9 @@ def _run_affine_seed_quad_init(
 		w_station=w_station,
 		raw=raw,
 		lr=lr,
+		stage_idx=stage_idx,
+		progress_widths_run=progress_widths_run,
+		progress_row_idx=progress_row_idx,
 	)
 	if seed_result is None or candidate is None:
 		return 0
@@ -2068,7 +2029,7 @@ def _run_affine_seed_quad_init(
 	status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
 	last_status_time: float | None = None
 	last_status_step = 0
-	progress_rows = 0
+	progress_rows = int(prep_progress_rows)
 	with torch.no_grad():
 		report_loss, report_terms, report_err = _global_progress_state(
 			uv=affine(),
@@ -2660,7 +2621,8 @@ class GlobalMapRuntime:
 		w_station = _stage_station_weight(self.cfg_global, stage)
 		if _is_affine_seed_quad_init(stage):
 			raw_seed = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
-			seed_result, _candidate, _initial_loss = _prepare_affine_seed_quad_candidate(
+			runtime_progress_widths = _global_progress_widths(GlobalMapConfig(base=self.cfg_global.base, stages=(stage,)))
+			seed_result, _candidate, _initial_loss, _prep_progress_rows = _prepare_affine_seed_quad_candidate(
 				stage=stage,
 				affine=self.affine,
 				fixture=fixture,
@@ -2670,6 +2632,9 @@ class GlobalMapRuntime:
 				w_station=w_station,
 				raw=raw_seed,
 				lr=float(stage.lr),
+				stage_idx=0,
+				progress_widths_run=runtime_progress_widths,
+				progress_row_idx=0,
 				cancel_fn=cancel_fn,
 			)
 			if seed_result is not None:

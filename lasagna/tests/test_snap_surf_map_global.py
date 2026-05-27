@@ -810,7 +810,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				sign=1,
 			)
 
-			rows = _run_affine_seed_quad_expansion_reopt(
+			rows, progress_rows = _run_affine_seed_quad_expansion_reopt(
 				affine=affine,
 				fixture=fixture,
 				stage_cfg=cfg,
@@ -821,9 +821,12 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				steps=2,
 				lr=0.05,
 				status_interval=1,
+				stage_idx=0,
+				progress_widths_run=None,
 			)
 
 			self.assertEqual([int(row["radius"]) for row in rows], [0, 0, 8, 8])
+			self.assertEqual(progress_rows, 0)
 			self.assertEqual([int(row["iters"]) for row in rows], [1, 2, 1, 2])
 			self.assertLess(float(rows[1]["loss"]), float(initial[0]["loss"]))
 			self.assertGreater(float(rows[1]["loss_gain"]), 0.0)
@@ -855,7 +858,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 					ext_quad_valid=fixture.ext_quad_valid,
 				)
 
-			self.assertIn("affine seed quad expansion reopt", stdout.getvalue())
+			self.assertIn("grow-r", stdout.getvalue())
 			self.assertIn("snaps_map_loss", stats)
 			self.assertEqual(runtime.sign, 1)
 
