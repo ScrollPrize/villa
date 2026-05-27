@@ -510,8 +510,9 @@ def _map_init_sample_geometry_limit_ok(
 ) -> torch.Tensor:
 	if p_ext.numel() == 0:
 		return torch.zeros(p_ext.shape[:-1], device=p_ext.device, dtype=torch.bool)
-	n_ext_base = F.normalize(n_ext, dim=-1, eps=1.0e-8)
-	n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * (1.0 if int(sign) >= 0 else -1.0)
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	n_ext_base = F.normalize(n_ext, dim=-1, eps=1.0e-8) * sign_f
+	n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f
 	v = p_model - p_ext
 	d = v.norm(dim=-1)
 	ok = (

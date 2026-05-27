@@ -758,8 +758,9 @@ def _seed_quad_affine_sample_terms(
 	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
 	p_model = _sample_surface_grid(fixture.model_xyz, safe_coords)
 	n_model_raw = _sample_surface_grid(fixture.model_normals, safe_coords)
-	n_ext = torch.nn.functional.normalize(ext_normals.to(device=pred_uv.device, dtype=pred_uv.dtype), dim=-1, eps=1.0e-8)
-	n_model = torch.nn.functional.normalize(n_model_raw, dim=-1, eps=1.0e-8) * (1.0 if int(sign) >= 0 else -1.0)
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	n_ext = torch.nn.functional.normalize(ext_normals.to(device=pred_uv.device, dtype=pred_uv.dtype), dim=-1, eps=1.0e-8) * sign_f
+	n_model = torch.nn.functional.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f
 	coord_ok = _quad_valid_at_coords(fixture.model_valid.bool(), safe_coords, tuple(int(v) for v in fixture.model_valid.shape))
 	p_ext = ext_points.to(device=pred_uv.device, dtype=pred_uv.dtype)
 	v = p_model - p_ext
@@ -853,7 +854,6 @@ def _seed_quad_affine_init_result(
 		return None
 	ext_h, ext_w = ext_steps
 	model_h, model_w = model_steps
-	sign = _sign_from_dot(model_normal, ext_normal, fallback=1)
 	radius_h = max(1, int(math.ceil(ext_h / max(model_h, 1.0e-8)))) + safety_margin
 	radius_w = max(1, int(math.ceil(ext_w / max(model_w, 1.0e-8)))) + safety_margin
 	patch_quads = _model_seed_patch_quads(
@@ -880,12 +880,12 @@ def _seed_quad_affine_init_result(
 		to_model = model_seed_point.to(device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype) - seed_ext_point
 	else:
 		to_model = model_corners.mean(dim=0) - ext_corners.mean(dim=0)
-	ray_dirs = ext_sample_normals
-	avg_dir = ray_dirs[torch.isfinite(ray_dirs).all(dim=-1)].mean(dim=0)
+	raw_dirs = ext_sample_normals
+	avg_dir = raw_dirs[torch.isfinite(raw_dirs).all(dim=-1)].mean(dim=0)
 	if not bool(torch.isfinite(avg_dir).all().detach().cpu()) or float(avg_dir.norm().detach().cpu()) <= 1.0e-8:
 		avg_dir = ext_normal
-	if float((to_model * avg_dir).sum().detach().cpu()) < 0.0:
-		ray_dirs = -ray_dirs
+	sign = 1 if float((to_model * avg_dir).sum().detach().cpu()) >= 0.0 else -1
+	ray_dirs = raw_dirs * (1.0 if sign >= 0 else -1.0)
 	kept_hw: list[torch.Tensor] = []
 	kept_uv: list[torch.Tensor] = []
 	kept_points: list[torch.Tensor] = []

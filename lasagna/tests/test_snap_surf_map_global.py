@@ -687,16 +687,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			pred = torch.tensor([0.0, 0.0, 1.0]) @ affine.transpose(0, 1)
 			self.assertTrue(torch.allclose(pred, torch.tensor([0.25, 0.5]), atol=1.0e-4))
 
-	def test_seed_quad_affine_records_flipped_seed_quad_sign(self) -> None:
+	def test_seed_quad_affine_sign_orients_normals_toward_model(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			_write_planar_global_fixture(tmp)
 			fixture_json = Path(tmp, "fixture.json")
 			meta = json.loads(fixture_json.read_text(encoding="utf-8"))
-			meta["seed_model_quad"] = [0, 3, 1]
+			meta["seed_model_quad"] = [0, 1, 1]
 			fixture_json.write_text(json.dumps(meta), encoding="utf-8")
 			fixture = load_map_fixture(tmp)
 			model_xyz = fixture.model_xyz.clone()
-			model_xyz[..., 1] = 6.0 - model_xyz[..., 1]
+			model_xyz[..., 2] = -1.0
 			fixture = replace(fixture, model_xyz=model_xyz)
 			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
 
@@ -713,6 +713,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual(result.sign, -1)
 			self.assertEqual(result.sampled_count, 256)
 			self.assertGreaterEqual(result.kept_count, 3)
+			self.assertLess(result.seed_vec, 1.0e-4)
 
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:

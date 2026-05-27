@@ -372,13 +372,11 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		ok_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv_ok,
 			active,
-			sign=1,
 			jac_margin=0.05,
 		)
 		flip_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv_flip,
 			active,
-			sign=1,
 			jac_margin=0.05,
 		)
 
@@ -393,13 +391,11 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		ok_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
 			uv_ok,
 			active,
-			sign=1,
 			jac_margin=0.05,
 		)
 		compressed_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
 			uv_compressed,
 			active,
-			sign=1,
 			jac_margin=0.05,
 		)
 
@@ -413,13 +409,11 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		forward_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv_expanded,
 			active,
-			sign=1,
 			jac_margin=0.05,
 		)
 		reverse_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
 			uv_expanded,
 			active,
-			sign=1,
 			jac_margin=0.05,
 		)
 
@@ -638,7 +632,6 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			active_quad,
 			h=0,
 			w=0,
-			sign=1,
 			jac_margin=0.05,
 		))
 
@@ -727,7 +720,6 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv,
 			active_quad,
-			sign=1,
 			jac_margin=0.05,
 		)
 
