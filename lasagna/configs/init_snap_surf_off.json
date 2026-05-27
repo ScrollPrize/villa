@@ -64,13 +64,13 @@
 			"args": {
 				"lr_warmup_steps": 50,
 				"status_interval": 1,
-				"subdiv": 2,
+				"subdiv": 1,
 				"map_global": {
 					"distance_scale": 1.0,
 					"huber_delta": 5.0,
 					"map_station_t": 1.0,
 					"map_init": {
-						"subdiv": 2,
+						"subdiv": 1,
 						"scale_levels": 5,
 						"w_dist": 0.0001,
 						"w_vec_normal": 1.0,
@@ -99,7 +99,7 @@
 			"params": ["map_surf_affine"],
 			"args": {
 				"status_interval": 1,
-				"subdiv": 2
+				"subdiv": 1
 			}
 		},
 		{
@@ -109,7 +109,7 @@
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
-				"subdiv": 2,
+				"subdiv": 1,
 				"status_interval": 20
 			}
 		},
@@ -120,7 +120,7 @@
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
-				"subdiv": 2,
+				"subdiv": 1,
 				"status_interval": 20
 			}
 		},
@@ -145,7 +145,7 @@
 						"params": ["map_surf_ms"],
 						"min_scaledown": 0,
 						"args": {
-							"subdiv": 2,
+							"subdiv": 1,
 							"debug_obj_dir": "snap_surf_objs"
 						}
 					}

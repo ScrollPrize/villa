@@ -239,8 +239,6 @@ def _map_init_jacobian_values(
 		return torch.empty(0, device=uv.device, dtype=uv.dtype)
 	finite_uv = torch.isfinite(uv).all(dim=-1)
 	cell = active_quad.bool() & _map_init_quad_corner_all(finite_uv)
-	if not bool(cell.any().detach().cpu()):
-		return torch.empty(0, device=uv.device, dtype=uv.dtype)
 	p00 = uv[:-1, :-1]
 	p10 = uv[1:, :-1]
 	p01 = uv[:-1, 1:]
@@ -256,9 +254,21 @@ def _map_init_jacobian_values(
 		dh1[..., 0] * dw1[..., 1] - dh1[..., 1] * dw1[..., 0],
 	], dim=-1)
 	finite = cell.unsqueeze(-1) & torch.isfinite(dets)
-	if not bool(finite.any().detach().cpu()):
-		return torch.empty(0, device=uv.device, dtype=uv.dtype)
 	return dets[finite]
+
+def _map_init_masked_mean_values(
+	pairs: list[tuple[torch.Tensor, torch.Tensor]],
+	z: torch.Tensor,
+) -> torch.Tensor:
+	total = z
+	count = torch.zeros((), device=z.device, dtype=z.dtype)
+	for values, mask in pairs:
+		if values.numel() == 0:
+			continue
+		finite = mask.bool() & torch.isfinite(values)
+		total = total + torch.where(finite, values, torch.zeros_like(values)).sum()
+		count = count + finite.to(dtype=z.dtype).sum()
+	return torch.where(count > 0.0, total / count.clamp_min(1.0), z)
 
 def _map_init_jacobian_bad_quad_mask(
 	uv: torch.Tensor,
@@ -326,13 +336,29 @@ def _map_init_jacobian_penalty(
 	*,
 	jac_margin: float,
 ) -> torch.Tensor:
-	values = _map_init_jacobian_values(uv, active_quad)
-	if values.numel() == 0:
-		finite = uv[torch.isfinite(uv)]
-		if finite.numel():
-			return finite.sum() * 0.0
-		return torch.zeros((), device=uv.device, dtype=uv.dtype)
-	return F.relu(float(jac_margin) - values).square().mean()
+	z = uv[torch.isfinite(uv)].sum() * 0.0 if uv.numel() else torch.zeros((), device=uv.device, dtype=uv.dtype)
+	H, W = int(uv.shape[0]), int(uv.shape[1])
+	if H < 2 or W < 2 or active_quad.numel() == 0:
+		return z
+	finite_uv = torch.isfinite(uv).all(dim=-1)
+	cell = active_quad.bool() & _map_init_quad_corner_all(finite_uv)
+	p00 = uv[:-1, :-1]
+	p10 = uv[1:, :-1]
+	p01 = uv[:-1, 1:]
+	p11 = uv[1:, 1:]
+	dh0 = p10 - p00
+	dh1 = p11 - p01
+	dw0 = p01 - p00
+	dw1 = p11 - p10
+	dets = torch.stack([
+		dh0[..., 0] * dw0[..., 1] - dh0[..., 1] * dw0[..., 0],
+		dh0[..., 0] * dw1[..., 1] - dh0[..., 1] * dw1[..., 0],
+		dh1[..., 0] * dw0[..., 1] - dh1[..., 1] * dw0[..., 0],
+		dh1[..., 0] * dw1[..., 1] - dh1[..., 1] * dw1[..., 0],
+	], dim=-1)
+	finite = cell.unsqueeze(-1) & torch.isfinite(dets)
+	values = F.relu(float(jac_margin) - dets).square()
+	return _map_init_masked_mean_values([(values, finite)], z)
 
 def _map_init_inverse_regularization_terms(
 	uv: torch.Tensor,
@@ -357,56 +383,44 @@ def _map_init_inverse_regularization_terms(
 	dw = uv[:-1, 1:] - uv[:-1, :-1]
 	det = dh[..., 0] * dw[..., 1] - dh[..., 1] * dw[..., 0]
 	finite = cell & torch.isfinite(dh).all(dim=-1) & torch.isfinite(dw).all(dim=-1) & torch.isfinite(det)
-	if not bool(finite.any().detach().cpu()):
-		return {
-			"smooth": z,
-			"bend": z,
-			"jac": z,
-			"jac_min": z,
-			"jac_bad": torch.tensor(0.0, device=uv.device, dtype=uv.dtype),
-		}
-
 	det_signed = det
-	det_v = det_signed[finite]
-	dh_v = dh[finite]
-	dw_v = dw[finite]
 	eps = max(1.0e-3, 0.1 * float(jac_margin))
-	safe_det = det_v.clamp_min(eps)
-	fro2 = dh_v.square().sum(dim=-1) + dw_v.square().sum(dim=-1)
+	safe_det = det_signed.clamp_min(eps)
+	fro2 = dh.square().sum(dim=-1) + dw.square().sum(dim=-1)
 	# This is the Frobenius norm of d(source)/d(model). Identity maps to 1,
 	# matching the forward smooth term's identity scale.
-	smooth_rev = (0.5 * fro2 / safe_det.square()).mean()
-	det_for_recip = det_v.clamp_min(eps)
-	inv_det = torch.where(det_v > eps, det_for_recip.reciprocal(), torch.zeros_like(det_v))
-	jac_rev = F.relu(float(jac_margin) - inv_det).square().mean()
-	jac_inv_min = inv_det.min()
-	jac_inv_bad = (inv_det < float(jac_margin)).sum()
+	smooth_rev = _map_init_masked_mean_values([(0.5 * fro2 / safe_det.square(), finite)], z)
+	inv_det = torch.where(det_signed > eps, safe_det.reciprocal(), torch.zeros_like(det_signed))
+	jac_rev = _map_init_masked_mean_values([(F.relu(float(jac_margin) - inv_det).square(), finite)], z)
+	inf = torch.full_like(inv_det, float("inf"))
+	jac_inv_min_raw = torch.where(finite, inv_det, inf).min()
+	finite_count = finite.to(dtype=uv.dtype).sum()
+	jac_inv_min = torch.where(finite_count > 0.0, jac_inv_min_raw, z)
+	jac_inv_bad = (finite & (inv_det < float(jac_margin))).to(dtype=uv.dtype).sum()
 
 	raw_safe_det = safe_det
 	inv_j = torch.zeros((*det.shape, 2, 2), device=uv.device, dtype=uv.dtype)
 	inv_j_finite = torch.stack([
-		torch.stack([dw_v[:, 1] / raw_safe_det, -dw_v[:, 0] / raw_safe_det], dim=-1),
-		torch.stack([-dh_v[:, 1] / raw_safe_det, dh_v[:, 0] / raw_safe_det], dim=-1),
+		torch.stack([dw[..., 1] / raw_safe_det, -dw[..., 0] / raw_safe_det], dim=-1),
+		torch.stack([-dh[..., 1] / raw_safe_det, dh[..., 0] / raw_safe_det], dim=-1),
 	], dim=-2)
-	inv_j[finite] = inv_j_finite
-	bend_vals: list[torch.Tensor] = []
+	inv_j = torch.where(finite.unsqueeze(-1).unsqueeze(-1), inv_j_finite, inv_j)
+	bend_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
 	if int(inv_j.shape[0]) > 1:
 		m = finite[1:, :] & finite[:-1, :]
 		dj = inv_j[1:, :] - inv_j[:-1, :]
-		if bool(m.any().detach().cpu()):
-			bend_vals.append(dj.square().sum(dim=(-1, -2))[m])
+		bend_pairs.append((dj.square().sum(dim=(-1, -2)), m))
 	if int(inv_j.shape[1]) > 1:
 		m = finite[:, 1:] & finite[:, :-1]
 		dj = inv_j[:, 1:] - inv_j[:, :-1]
-		if bool(m.any().detach().cpu()):
-			bend_vals.append(dj.square().sum(dim=(-1, -2))[m])
-	bend_rev = torch.cat(bend_vals).mean() if bend_vals else z
+		bend_pairs.append((dj.square().sum(dim=(-1, -2)), m))
+	bend_rev = _map_init_masked_mean_values(bend_pairs, z)
 	return {
 		"smooth": smooth_rev,
 		"bend": bend_rev,
 		"jac": jac_rev,
 		"jac_min": jac_inv_min,
-		"jac_bad": torch.tensor(float(int(jac_inv_bad.detach().cpu())), device=uv.device, dtype=uv.dtype),
+		"jac_bad": jac_inv_bad,
 	}
 
 def _map_init_mean_square_diffs(
@@ -537,7 +551,7 @@ def _map_init_forward_smooth_bend_terms(
 ) -> dict[str, torch.Tensor]:
 	H, W = int(field.shape[0]), int(field.shape[1])
 	field_safe = torch.where(vertex_valid.bool().unsqueeze(-1), field, torch.zeros_like(field))
-	smooth_vals: list[torch.Tensor] = []
+	smooth_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
 	if H > 1:
 		edge = torch.zeros(H - 1, W, device=field.device, dtype=torch.bool)
 		if reg_quad.numel():
@@ -546,8 +560,7 @@ def _map_init_forward_smooth_bend_terms(
 		m = edge & vertex_valid[1:, :] & vertex_valid[:-1, :]
 		dv = field_safe[1:, :] - field_safe[:-1, :]
 		finite = m & torch.isfinite(dv).all(dim=-1)
-		if bool(finite.any().detach().cpu()):
-			smooth_vals.append(dv.square().sum(dim=-1)[finite])
+		smooth_pairs.append((dv.square().sum(dim=-1), finite))
 	if W > 1:
 		edge = torch.zeros(H, W - 1, device=field.device, dtype=torch.bool)
 		if reg_quad.numel():
@@ -556,9 +569,8 @@ def _map_init_forward_smooth_bend_terms(
 		m = edge & vertex_valid[:, 1:] & vertex_valid[:, :-1]
 		dv = field_safe[:, 1:] - field_safe[:, :-1]
 		finite = m & torch.isfinite(dv).all(dim=-1)
-		if bool(finite.any().detach().cpu()):
-			smooth_vals.append(dv.square().sum(dim=-1)[finite])
-	smooth = torch.cat(smooth_vals).mean() if smooth_vals else z
+		smooth_pairs.append((dv.square().sum(dim=-1), finite))
+	smooth = _map_init_masked_mean_values(smooth_pairs, z)
 
 	if H > 2 and W > 2:
 		m = (
@@ -576,7 +588,7 @@ def _map_init_forward_smooth_bend_terms(
 			4.0 * field_safe[1:-1, 1:-1]
 		)
 		finite = m & torch.isfinite(lap).all(dim=-1)
-		bend = lap.square().sum(dim=-1)[finite].mean() if bool(finite.any().detach().cpu()) else z
+		bend = _map_init_masked_mean_values([(lap.square().sum(dim=-1), finite)], z)
 	else:
 		bend = z
 	return {"smooth": smooth, "bend": bend}
@@ -588,7 +600,7 @@ def _map_init_reference_edge_square(
 	z: torch.Tensor,
 ) -> torch.Tensor:
 	H, W = int(ext_pos.shape[0]), int(ext_pos.shape[1])
-	values: list[torch.Tensor] = []
+	pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
 	if H > 1:
 		edge = torch.zeros(H - 1, W, device=ext_pos.device, dtype=torch.bool)
 		if reg_quad.numel():
@@ -596,8 +608,7 @@ def _map_init_reference_edge_square(
 			edge[:, 1:] |= reg_quad
 		dv = ext_pos[1:, :] - ext_pos[:-1, :]
 		valid = edge & finite_ext[1:, :] & finite_ext[:-1, :] & torch.isfinite(dv).all(dim=-1)
-		if bool(valid.any().detach().cpu()):
-			values.append(dv.square().sum(dim=-1)[valid])
+		pairs.append((dv.square().sum(dim=-1), valid))
 	if W > 1:
 		edge = torch.zeros(H, W - 1, device=ext_pos.device, dtype=torch.bool)
 		if reg_quad.numel():
@@ -605,11 +616,9 @@ def _map_init_reference_edge_square(
 			edge[1:, :] |= reg_quad
 		dv = ext_pos[:, 1:] - ext_pos[:, :-1]
 		valid = edge & finite_ext[:, 1:] & finite_ext[:, :-1] & torch.isfinite(dv).all(dim=-1)
-		if bool(valid.any().detach().cpu()):
-			values.append(dv.square().sum(dim=-1)[valid])
-	if not values:
-		return torch.ones((), device=z.device, dtype=z.dtype)
-	return torch.cat(values).mean().clamp_min(1.0e-6)
+		pairs.append((dv.square().sum(dim=-1), valid))
+	mean = _map_init_masked_mean_values(pairs, torch.ones((), device=z.device, dtype=z.dtype))
+	return mean.clamp_min(1.0e-6)
 
 def _map_init_local_evenness_terms(
 	uv: torch.Tensor,
@@ -786,6 +795,8 @@ def _map_init_objective(
 	w_jac_mult: float = 1.0,
 	uv_prior: torch.Tensor | None = None,
 	allow_partial_model_samples: bool = False,
+	need_stats: bool = True,
+	active_quad_hw: torch.Tensor | None = None,
 	ext_z_lift_k: torch.Tensor | None = None,
 	ext_z_lift_valid: torch.Tensor | None = None,
 	model_z_lift_k: torch.Tensor | None = None,
@@ -802,20 +813,24 @@ def _map_init_objective(
 	)
 	uv_finite = torch.isfinite(uv_full).all(dim=-1)
 	active_quad = active_quad.bool()
-	active_count = int(active_quad.sum().detach().cpu())
-	quad_uv_ok_grid = active_quad & _map_init_quad_corner_all(uv_finite)
-	active_bad_count = int((active_quad & ~quad_uv_ok_grid).sum().detach().cpu())
-	finite_count = 0
-	model_bad_count = 0
-	sample_total_count = 0
-	sample_bad_count = 0
-	sample_valid_count = 0
+	active_count_t = active_quad.to(dtype=uv_full.dtype).sum() if bool(need_stats) else uv_full.new_zeros(())
+	quad_uv_ok_grid = active_quad & _map_init_quad_corner_all(uv_finite) if bool(need_stats) else None
+	active_bad_count_t = (
+		(active_quad & ~quad_uv_ok_grid).to(dtype=uv_full.dtype).sum()
+		if quad_uv_ok_grid is not None else
+		uv_full.new_zeros(())
+	)
+	finite_count_t = uv_full.new_zeros(())
+	model_bad_count_t = uv_full.new_zeros(())
+	sample_total_count_t = uv_full.new_zeros(())
+	sample_bad_count_t = uv_full.new_zeros(())
+	sample_valid_count_t = uv_full.new_zeros(())
 	sample_loss = z
 	sample_bad_frac = z
-	sample_quad_ok_grid = torch.zeros_like(active_quad, dtype=torch.bool)
+	sample_quad_ok_grid = torch.zeros_like(active_quad, dtype=torch.bool) if bool(need_stats) else None
 	turn_loss = z
-	turn_sample_count = 0
-	quad_hw = active_quad.nonzero(as_tuple=False)
+	turn_sample_count_t = uv_full.new_zeros(())
+	quad_hw = active_quad.nonzero(as_tuple=False) if active_quad_hw is None else active_quad_hw.to(device=uv_full.device)
 	if int(quad_hw.shape[0]) > 0:
 		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
 			uv_full=uv_full,
@@ -926,55 +941,47 @@ def _map_init_objective(
 		else:
 			loss_quad = finite_qs.all(dim=1)
 			valid_quad = limited_finite_qs.all(dim=1)
-		sample_quad_ok_grid[quad_hw[:, 0], quad_hw[:, 1]] = valid_quad
-		sample_total_count = Q * S
-		sample_valid_count = int(finite.sum().detach().cpu())
-		sample_bad_count = int((~limited_finite).sum().detach().cpu())
-		sample_bad_frac = torch.tensor(
-			float(sample_bad_count) / float(max(1, sample_total_count)),
-			device=uv_full.device,
-			dtype=uv_full.dtype,
-		)
-		if bool(finite.any().detach().cpu()):
+		if sample_quad_ok_grid is not None:
+			sample_quad_ok_grid[quad_hw[:, 0], quad_hw[:, 1]] = valid_quad
+		sample_total_count_t = torch.tensor(float(Q * S), device=uv_full.device, dtype=uv_full.dtype)
+		if bool(need_stats):
+			sample_valid_count_t = finite.to(dtype=uv_full.dtype).sum()
+			sample_bad_count_t = (~limited_finite).to(dtype=uv_full.dtype).sum()
+			sample_bad_frac = sample_bad_count_t / sample_total_count_t.clamp_min(1.0)
 			sample_values = (
 				float(mi.w_dist) * dist_values +
 				float(mi.w_vec_normal) * vec_values +
 				float(mi.w_surface_normal) * norm_values +
 				float(mi.w_z_lift) * turn_values
 			)
-			sample_loss = sample_values[finite].mean()
-		if bool(loss_quad.any().detach().cpu()):
-			loss_sample = finite_qs & loss_quad.unsqueeze(1)
-			loss_count = loss_sample.to(dtype=uv_full.dtype).sum(dim=1).clamp_min(1.0)
-			finite_count = int(loss_sample.sum().detach().cpu())
-			model_bad_count = int((~valid_quad).sum().detach().cpu())
-			dist_grid = dist_values.reshape(Q, S)
-			vec_grid = vec_values.reshape(Q, S)
-			norm_grid = norm_values.reshape(Q, S)
-			turn_grid = turn_values.reshape(Q, S)
-			d_grid = d.reshape(Q, S)
-			dist_q_all = torch.where(loss_sample, dist_grid, dist_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
-			vec_q_all = torch.where(loss_sample, vec_grid, vec_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
-			norm_q_all = torch.where(loss_sample, norm_grid, norm_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
-			turn_q_all = torch.where(loss_sample, turn_grid, turn_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
-			d_q_all = torch.where(loss_sample, d_grid, d_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
-			dist_q = dist_q_all[loss_quad]
-			vec_q = vec_q_all[loss_quad]
-			norm_q = norm_q_all[loss_quad]
-			turn_q = turn_q_all[loss_quad]
-			d_q = d_q_all[loss_quad]
-			dist_loss = dist_q.mean()
-			vec_loss = vec_q.mean()
-			norm_loss = norm_q.mean()
-			turn_loss = turn_q.mean()
-			turn_sample_count = int(loss_sample.sum().detach().cpu())
-			dist_avg = d_q.mean()
-		else:
-			model_bad_count = active_count
-			dist_loss = z
-			vec_loss = z
-			norm_loss = z
-			dist_avg = z
+			sample_loss = _map_init_masked_mean_values([(sample_values, finite)], z)
+		loss_sample = finite_qs & loss_quad.unsqueeze(1)
+		loss_count = loss_sample.to(dtype=uv_full.dtype).sum(dim=1).clamp_min(1.0)
+		if bool(need_stats):
+			finite_count_t = loss_sample.to(dtype=uv_full.dtype).sum()
+			model_bad_count_t = (~valid_quad).to(dtype=uv_full.dtype).sum()
+			turn_sample_count_t = finite_count_t
+		dist_grid = dist_values.reshape(Q, S)
+		vec_grid = vec_values.reshape(Q, S)
+		norm_grid = norm_values.reshape(Q, S)
+		turn_grid = turn_values.reshape(Q, S)
+		d_grid = d.reshape(Q, S)
+		dist_q_all = torch.where(loss_sample, dist_grid, dist_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
+		vec_q_all = torch.where(loss_sample, vec_grid, vec_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
+		norm_q_all = torch.where(loss_sample, norm_grid, norm_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
+		turn_q_all = torch.where(loss_sample, turn_grid, turn_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
+		d_q_all = torch.where(loss_sample, d_grid, d_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
+		dist_loss = _map_init_masked_mean_values([(dist_q_all, loss_quad)], z)
+		vec_loss = _map_init_masked_mean_values([(vec_q_all, loss_quad)], z)
+		norm_loss = _map_init_masked_mean_values([(norm_q_all, loss_quad)], z)
+		turn_loss = _map_init_masked_mean_values([(turn_q_all, loss_quad)], z)
+		dist_avg = _map_init_masked_mean_values([(d_q_all, loss_quad)], z)
+		if bool(need_stats):
+			model_bad_count_t = torch.where(
+				loss_quad.to(dtype=uv_full.dtype).sum() > 0.0,
+				model_bad_count_t,
+				active_count_t,
+			)
 	else:
 		dist_loss = z
 		vec_loss = z
@@ -988,7 +995,7 @@ def _map_init_objective(
 		uv_finite=uv_finite,
 		cfg=mi,
 	)
-	reg_count = int(reg_finite.sum().detach().cpu())
+	reg_count_t = reg_finite.to(dtype=uv_full.dtype).sum() if bool(need_stats) else uv_full.new_zeros(())
 	uv_safe = torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
 	model_metric_pos, model_metric_valid = _map_init_model_metric_positions(
 		uv_safe,
@@ -1042,53 +1049,58 @@ def _map_init_objective(
 	smooth_loss = smooth_fwd_loss + smooth_rev_loss
 	bend_loss = bend_fwd_loss + bend_rev_loss
 	jac_loss = jac_fwd_loss + jac_rev_loss
-	jac_vals = _map_init_jacobian_values(uv_safe, reg_quad)
-	jac_min = jac_vals.min() if jac_vals.numel() else z
-	if jac_vals.numel():
-		jac_bad = jac_vals < float(mi.jac_margin)
-		jac_bad_count = int(jac_bad.sum().detach().cpu())
-		jac_bad_frac = float(jac_bad_count) / float(max(1, int(jac_vals.numel())))
-	else:
-		jac_bad_count = 0
-		jac_bad_frac = 0.0
-	jac_bad_quad_grid = _map_init_jacobian_bad_quad_mask(
-		uv_safe,
-		reg_quad,
-		jac_margin=mi.jac_margin,
-	)
-	jac_inv_bad_quad_grid = _map_init_inverse_jacobian_bad_quad_mask(
-		uv_safe,
-		reg_quad,
-		jac_margin=mi.jac_margin,
-	)
-	step_bad_quad_grid = _map_init_step_neighbor_bad_quad_mask(
-		uv_safe,
-		reg_quad,
-		model_xyz=model_xyz,
-		model_valid=model_valid,
-		model_depth=int(model_depth),
-		max_ratio=float(mi.max_step_neighbor_ratio),
-	)
-	quad_success_grid = (
-		active_quad &
-		quad_uv_ok_grid &
-		sample_quad_ok_grid &
-		~jac_bad_quad_grid &
-		~jac_inv_bad_quad_grid &
-		~step_bad_quad_grid
-	)
-	quad_success_count = int(quad_success_grid.sum().detach().cpu())
-	quad_success_frac = torch.tensor(
-		float(quad_success_count) / float(max(1, active_count)),
-		device=uv_full.device,
-		dtype=uv_full.dtype,
-	)
+	jac_min = z
+	jac_bad_count_t = uv_full.new_zeros(())
+	jac_bad_frac = z
+	jac_bad_quad_count_t = uv_full.new_zeros(())
+	jac_inv_bad_quad_count_t = uv_full.new_zeros(())
+	step_bad_quad_count_t = uv_full.new_zeros(())
+	quad_success_count_t = uv_full.new_zeros(())
+	quad_success_frac = z
+	if bool(need_stats):
+		jac_vals = _map_init_jacobian_values(uv_safe, reg_quad)
+		jac_min = jac_vals.min() if jac_vals.numel() else z
+		if jac_vals.numel():
+			jac_bad = jac_vals < float(mi.jac_margin)
+			jac_bad_count_t = jac_bad.to(dtype=uv_full.dtype).sum()
+			jac_bad_frac = jac_bad_count_t / float(max(1, int(jac_vals.numel())))
+		jac_bad_quad_grid = _map_init_jacobian_bad_quad_mask(
+			uv_safe,
+			reg_quad,
+			jac_margin=mi.jac_margin,
+		)
+		jac_inv_bad_quad_grid = _map_init_inverse_jacobian_bad_quad_mask(
+			uv_safe,
+			reg_quad,
+			jac_margin=mi.jac_margin,
+		)
+		step_bad_quad_grid = _map_init_step_neighbor_bad_quad_mask(
+			uv_safe,
+			reg_quad,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_depth=int(model_depth),
+			max_ratio=float(mi.max_step_neighbor_ratio),
+		)
+		assert quad_uv_ok_grid is not None
+		assert sample_quad_ok_grid is not None
+		quad_success_grid = (
+			active_quad &
+			quad_uv_ok_grid &
+			sample_quad_ok_grid &
+			~jac_bad_quad_grid &
+			~jac_inv_bad_quad_grid &
+			~step_bad_quad_grid
+		)
+		quad_success_count_t = quad_success_grid.to(dtype=uv_full.dtype).sum()
+		quad_success_frac = quad_success_count_t / active_count_t.clamp_min(1.0)
+		jac_bad_quad_count_t = jac_bad_quad_grid.to(dtype=uv_full.dtype).sum()
+		jac_inv_bad_quad_count_t = jac_inv_bad_quad_grid.to(dtype=uv_full.dtype).sum()
+		step_bad_quad_count_t = step_bad_quad_grid.to(dtype=uv_full.dtype).sum()
 	if bool(mi.dense_opt) and uv_prior is not None:
 		prior_finite = reg_finite & torch.isfinite(uv_prior).all(dim=-1)
-		if bool(prior_finite.any().detach().cpu()):
-			prior_loss = (uv_full - uv_prior).square().sum(dim=-1)[prior_finite].mean()
-		else:
-			prior_loss = z
+		prior_values = (uv_full - uv_prior).square().sum(dim=-1)
+		prior_loss = _map_init_masked_mean_values([(prior_values, prior_finite)], z)
 	else:
 		prior_loss = z
 	loss = (
@@ -1103,6 +1115,20 @@ def _map_init_objective(
 		float(mi.w_area_smooth) * area_smooth_loss +
 		float(mi.w_dense_prior) * prior_loss
 	)
+	if not bool(need_stats):
+		return loss, {
+			"loss": loss.detach(),
+			"dist": dist_loss.detach(),
+			"vec": vec_loss.detach(),
+			"norm": norm_loss.detach(),
+			"turn": turn_loss.detach(),
+			"smooth": smooth_loss.detach(),
+			"bend": bend_loss.detach(),
+			"jac": jac_loss.detach(),
+			"metric_smooth": metric_smooth_loss.detach(),
+			"area_smooth": area_smooth_loss.detach(),
+			"prior": prior_loss.detach(),
+		}
 	return loss, {
 		"loss": loss.detach(),
 		"dist": dist_loss.detach(),
@@ -1128,26 +1154,26 @@ def _map_init_objective(
 		"jac_inv_min": inv_terms["jac_min"].detach(),
 		"prior": prior_loss.detach(),
 		"dist_avg": dist_avg.detach(),
-		"active": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
-		"reg": torch.tensor(float(reg_count), device=uv_full.device, dtype=uv_full.dtype),
-		"samples": torch.tensor(float(finite_count), device=uv_full.device, dtype=uv_full.dtype),
-		"turn_smp": torch.tensor(float(turn_sample_count), device=uv_full.device, dtype=uv_full.dtype),
+		"active": active_count_t.detach(),
+		"reg": reg_count_t.detach(),
+		"samples": finite_count_t.detach(),
+		"turn_smp": turn_sample_count_t.detach(),
 		"sample_loss": sample_loss.detach(),
-		"sample_total": torch.tensor(float(sample_total_count), device=uv_full.device, dtype=uv_full.dtype),
-		"sample_valid": torch.tensor(float(sample_valid_count), device=uv_full.device, dtype=uv_full.dtype),
-		"sample_bad": torch.tensor(float(sample_bad_count), device=uv_full.device, dtype=uv_full.dtype),
+		"sample_total": sample_total_count_t.detach(),
+		"sample_valid": sample_valid_count_t.detach(),
+		"sample_bad": sample_bad_count_t.detach(),
 		"sample_bad_frac": sample_bad_frac.detach(),
-		"quad_total": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
-		"quad_success": torch.tensor(float(quad_success_count), device=uv_full.device, dtype=uv_full.dtype),
+		"quad_total": active_count_t.detach(),
+		"quad_success": quad_success_count_t.detach(),
 		"quad_success_frac": quad_success_frac.detach(),
-		"uv_bad": torch.tensor(float(active_bad_count), device=uv_full.device, dtype=uv_full.dtype),
-		"model_bad": torch.tensor(float(model_bad_count), device=uv_full.device, dtype=uv_full.dtype),
-		"jac_bad": torch.tensor(float(jac_bad_count), device=uv_full.device, dtype=uv_full.dtype),
-		"jac_bad_frac": torch.tensor(float(jac_bad_frac), device=uv_full.device, dtype=uv_full.dtype),
-		"jac_bad_quad": torch.tensor(float(int(jac_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
+		"uv_bad": active_bad_count_t.detach(),
+		"model_bad": model_bad_count_t.detach(),
+		"jac_bad": jac_bad_count_t.detach(),
+		"jac_bad_frac": jac_bad_frac.detach(),
+		"jac_bad_quad": jac_bad_quad_count_t.detach(),
 		"jac_inv_bad": inv_terms["jac_bad"].detach(),
-		"jac_inv_bad_quad": torch.tensor(float(int(jac_inv_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
-		"step_bad_quad": torch.tensor(float(int(step_bad_quad_grid.sum().detach().cpu())), device=uv_full.device, dtype=uv_full.dtype),
+		"jac_inv_bad_quad": jac_inv_bad_quad_count_t.detach(),
+		"step_bad_quad": step_bad_quad_count_t.detach(),
 	}
 
 def _map_init_surface_normal_loss(

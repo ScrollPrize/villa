@@ -1439,6 +1439,8 @@ def _objective_for_active_uv(
 	active_quad: torch.Tensor,
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
+	need_stats: bool = True,
+	active_quad_hw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	sign_i = int(fixture.metadata.get("sign", 1) or 1)
 	z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
@@ -1457,6 +1459,8 @@ def _objective_for_active_uv(
 		sign=sign_i,
 		cfg=cfg,
 		allow_partial_model_samples=True,
+		need_stats=bool(need_stats),
+		active_quad_hw=active_quad_hw,
 		ext_z_lift_k=None if z_lift is None else z_lift["ext_k"],
 		ext_z_lift_valid=None if z_lift is None else z_lift["ext_valid"],
 		model_z_lift_k=None if z_lift is None else z_lift["model_k"],
@@ -1738,6 +1742,7 @@ def _run_affine_seed_quad_expansion_reopt(
 		if cancel_fn is not None:
 			cancel_fn()
 		active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius)
+		active_hw = active.nonzero(as_tuple=False)
 		init_row = eval_row(radius, active, 0, 0.0)
 		init_loss = float(init_row["loss"])
 		init_row["init_loss"] = init_loss
@@ -1771,6 +1776,8 @@ def _run_affine_seed_quad_expansion_reopt(
 				active_quad=active,
 				fixture=fixture,
 				cfg=stage_cfg,
+				need_stats=False,
+				active_quad_hw=active_hw,
 			)
 			if float(w_station) > 0.0:
 				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
@@ -2159,13 +2166,23 @@ def _optimize_affine_candidate(
 		affine_model.affine.copy_(candidate)
 	opt = torch.optim.Adam([affine_model.affine], lr=float(lr)) if int(steps) > 0 else None
 	last_loss = float("inf")
+	stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+	stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 	for _ in range(max(1, int(steps))):
 		if cancel_fn is not None:
 			cancel_fn()
 		if opt is not None:
 			opt.zero_grad(set_to_none=True)
 		uv = affine_model()
-		loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+		loss, _terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=stage_cfg,
+			level=0,
+			need_stats=False,
+			active_quad=stage_active_quad,
+			active_quad_hw=stage_active_quad_hw,
+		)
 		if float(w_station) > 0.0:
 			loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
 		last_loss = float(loss.detach().cpu())
@@ -2741,6 +2758,8 @@ def _run_affine_seed_quad_init(
 	last_status_time: float | None = None
 	last_status_step = 0
 	progress_rows = int(prep_progress_rows)
+	stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+	stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 	with torch.no_grad():
 		report_loss, report_terms, report_err = _global_progress_state(
 			uv=affine(),
@@ -2749,6 +2768,8 @@ def _run_affine_seed_quad_init(
 			seed_hw=seed_hw,
 			station_target=station_target,
 			w_station=w_station,
+			active_quad=stage_active_quad,
+			active_quad_hw=stage_active_quad_hw,
 		)
 	_print_global_progress(
 		row_idx=int(progress_row_idx) + progress_rows,
@@ -2767,7 +2788,15 @@ def _run_affine_seed_quad_init(
 		if opt is not None:
 			opt.zero_grad(set_to_none=True)
 		uv = affine()
-		loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+		loss, _terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=stage_cfg,
+			level=0,
+			need_stats=False,
+			active_quad=stage_active_quad,
+			active_quad_hw=stage_active_quad_hw,
+		)
 		station_raw = loss.new_zeros(())
 		if float(w_station) > 0.0:
 			station_raw = _station_loss(uv, seed_hw, station_target)
@@ -2792,6 +2821,8 @@ def _run_affine_seed_quad_init(
 					seed_hw=seed_hw,
 					station_target=station_target,
 					w_station=w_station,
+					active_quad=stage_active_quad,
+					active_quad_hw=stage_active_quad_hw,
 				)
 			now = time.monotonic()
 			it_s = None
@@ -2923,8 +2954,11 @@ def _objective_for_uv(
 	cfg: SnapSurfConfig,
 	level: int,
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
+	need_stats: bool = True,
+	active_quad: torch.Tensor | None = None,
+	active_quad_hw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-	active = _level_active_quad(_full_active_quad(fixture), int(level))
+	active = _level_active_quad(_full_active_quad(fixture), int(level)) if active_quad is None else active_quad
 	ext_coords = None if int(level) == 0 else _level_coords(fixture.ext_xyz.shape[:2], int(level), uv)
 	sign_i = int(fixture.metadata.get("sign", 1) or 1)
 	if z_lift is _NO_Z_LIFT:
@@ -2945,6 +2979,8 @@ def _objective_for_uv(
 		sign=sign_i,
 		cfg=cfg,
 		allow_partial_model_samples=True,
+		need_stats=bool(need_stats),
+		active_quad_hw=active_quad_hw,
 		ext_z_lift_k=None if z_lift_d is None else z_lift_d["ext_k"],
 		ext_z_lift_valid=None if z_lift_d is None else z_lift_d["ext_valid"],
 		model_z_lift_k=None if z_lift_d is None else z_lift_d["model_k"],
@@ -3232,8 +3268,18 @@ def _global_progress_state(
 	station_target: torch.Tensor,
 	w_station: float,
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
+	active_quad: torch.Tensor | None = None,
+	active_quad_hw: torch.Tensor | None = None,
 ) -> tuple[float, dict[str, torch.Tensor], dict[str, float]]:
-	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=cfg, level=0, z_lift=z_lift)
+	loss, terms = _objective_for_uv(
+		uv=uv,
+		fixture=fixture,
+		cfg=cfg,
+		level=0,
+		z_lift=z_lift,
+		active_quad=active_quad,
+		active_quad_hw=active_quad_hw,
+	)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
 		station_raw = _station_loss(uv, seed_hw, station_target)
@@ -3504,6 +3550,8 @@ class GlobalMapRuntime:
 			cache_stats=cache_stats,
 		)
 		startup_z_lift_s = time.perf_counter() - _t_startup
+		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+		stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 		def _stats_for_current_uv() -> dict[str, float]:
 			with torch.no_grad():
 				loss_f, terms, err = _global_progress_state(
@@ -3514,6 +3562,8 @@ class GlobalMapRuntime:
 					station_target=station_target,
 					w_station=w_station,
 					z_lift=stage_z_lift,
+					active_quad=stage_active_quad,
+					active_quad_hw=stage_active_quad_hw,
 				)
 			stats = {
 				"snaps_map_loss": float(loss_f),
@@ -3594,7 +3644,16 @@ class GlobalMapRuntime:
 					cancel_fn()
 				opt.zero_grad(set_to_none=True)
 				uv = self._uv()
-				loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0, z_lift=stage_z_lift)
+				loss, _terms = _objective_for_uv(
+					uv=uv,
+					fixture=fixture,
+					cfg=stage_cfg,
+					level=0,
+					z_lift=stage_z_lift,
+					need_stats=False,
+					active_quad=stage_active_quad,
+					active_quad_hw=stage_active_quad_hw,
+				)
 				if w_station > 0.0:
 					loss = loss + w_station * _station_loss(uv, seed_hw, station_target)
 				loss.backward()
@@ -3780,6 +3839,8 @@ def optimize_fixture(
 	cfg_global = parse_global_map_config(config_path)
 	base_cfg = snap_surf_config_from_global_config(cfg_global)
 	fixture = _apply_external_quad_health_filter(fixture, base_cfg, label="fixture")
+	fixture_z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+	fixture_z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 	dtype = fixture.model_xyz.dtype
 	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
 	seed_uv = _seed_model_uv(fixture, seed_hw)
@@ -3885,6 +3946,19 @@ def optimize_fixture(
 				station_target=station_target,
 				w_station=w_station,
 			)
+		stage_cache_stats: _CacheStats = {}
+		stage_z_lift = _map_init_z_lift_for_fixture(
+			fixture,
+			stage_cfg,
+			sign=int(fixture.metadata.get("sign", 1) or 1),
+			external_surface_index=0,
+			mesh_epoch=0,
+			external_cache=fixture_z_lift_external_cache,
+			model_cache=fixture_z_lift_model_cache,
+			cache_stats=stage_cache_stats,
+		)
+		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+		stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
 		opt = torch.optim.Adam(params, lr=float(stage.lr))
 		_capture_optimizer_target_lrs(opt)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
@@ -3903,6 +3977,9 @@ def optimize_fixture(
 				seed_hw=seed_hw,
 				station_target=station_target,
 				w_station=w_station,
+				z_lift=stage_z_lift,
+				active_quad=stage_active_quad,
+				active_quad_hw=stage_active_quad_hw,
 			)
 		_print_global_progress(
 			row_idx=progress_rows,
@@ -3923,7 +4000,16 @@ def optimize_fixture(
 				uv = global_model(active_level=0)
 			else:
 				uv = affine()
-			loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+			loss, _terms = _objective_for_uv(
+				uv=uv,
+				fixture=fixture,
+				cfg=stage_cfg,
+				level=0,
+				z_lift=stage_z_lift,
+				need_stats=False,
+				active_quad=stage_active_quad,
+				active_quad_hw=stage_active_quad_hw,
+			)
 			station_raw = loss.new_zeros(())
 			if w_station > 0.0:
 				station_raw = _station_loss(uv, seed_hw, station_target)
@@ -3950,6 +4036,9 @@ def optimize_fixture(
 					seed_hw=seed_hw,
 					station_target=station_target,
 					w_station=w_station,
+					z_lift=stage_z_lift,
+					active_quad=stage_active_quad,
+					active_quad_hw=stage_active_quad_hw,
 				)
 				now = time.monotonic()
 				it_s = None
@@ -3970,15 +4059,18 @@ def optimize_fixture(
 					err=err,
 				)
 				progress_rows += 1
-			if step == int(stage.steps) - 1:
-				report_loss, report_terms, err = _global_progress_state(
-					uv=uv_after,
-					fixture=fixture,
-					cfg=stage_cfg,
-					seed_hw=seed_hw,
-					station_target=station_target,
-					w_station=w_station,
-				)
+				if step == int(stage.steps) - 1:
+					report_loss, report_terms, err = _global_progress_state(
+						uv=uv_after,
+						fixture=fixture,
+						cfg=stage_cfg,
+						seed_hw=seed_hw,
+						station_target=station_target,
+						w_station=w_station,
+						z_lift=stage_z_lift,
+						active_quad=stage_active_quad,
+						active_quad_hw=stage_active_quad_hw,
+					)
 				history.append({
 					"stage": stage_idx,
 					"step": step,
