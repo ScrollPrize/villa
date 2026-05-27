@@ -98,7 +98,7 @@ default_config = {
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
     'pcl_normals_sample_radius': 1,
-    'dense_normals_num_points': 8192,
+    'dense_normals_num_points': 20_000,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
@@ -107,9 +107,9 @@ default_config = {
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_patch_stretch': 40.0,
-    'loss_weight_patch_normals': 75.0,
+    'loss_weight_patch_normals': 0.0,
     'loss_weight_pcl_normals': 0.0,
-    'loss_weight_dense_normals': 0.0,
+    'loss_weight_dense_normals': 1.e2,
     'loss_weight_umbilicus': 5.,
     'loss_weight_shell_outer': 4.0,
     'loss_weight_shell_no_cross': 0.0,
@@ -1708,7 +1708,41 @@ def _pcl_normal_samples_to_gpu(pcl_normal_samples, device):
     }
 
 
-def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_points, epsilon=1.0):
+def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, epsilon=6.0):
+    # At each scroll-space point, pull the spiral-space cylinder normal (the outward radial
+    # direction normalize(spiral_yx)) back to scroll space as a covector, J^T n_spiral, where
+    # J = d(spiral) / d(scroll) is estimated by central differences. This is the geometrically
+    # correct transport of a surface normal (covector) -- unlike a tangent-vector pushforward J n.
+    # Returns the normalised scroll-space normal direction (num_points, 3) in zyx.
+    #
+    # Gradient flows through the transform parameters via the Jacobian only; the sample positions
+    # (scroll_zyx) and the radial direction are held fixed, matching the dense-normals loss. If the
+    # forward image spiral_zyx is supplied it is reused for the radial direction (and treated as a
+    # constant); otherwise it is computed here from scroll_zyx.
+    device = scroll_zyx.device
+    num_points = scroll_zyx.shape[0]
+    scroll_zyx = scroll_zyx.detach()
+
+    basis_zyx = torch.eye(3, device=device, dtype=scroll_zyx.dtype) * epsilon
+    scroll_plus = (scroll_zyx[None, :, :] + basis_zyx[:, None, :]).reshape(-1, 3)
+    scroll_minus = (scroll_zyx[None, :, :] - basis_zyx[:, None, :]).reshape(-1, 3)
+    if spiral_zyx is None:
+        combined_spiral = slice_to_spiral_transform(torch.cat([scroll_zyx, scroll_plus, scroll_minus], dim=0))
+        spiral_zyx = combined_spiral[:num_points]
+        spiral_plus, spiral_minus = combined_spiral[num_points:].chunk(2, dim=0)
+    else:
+        spiral_plus, spiral_minus = slice_to_spiral_transform(torch.cat([scroll_plus, scroll_minus], dim=0)).chunk(2, dim=0)
+
+    spiral_outward_yx = F.normalize(spiral_zyx[:, 1:].detach(), dim=-1)
+    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
+
+    spiral_plus = spiral_plus.view(3, num_points, 3)
+    spiral_minus = spiral_minus.view(3, num_points, 3)
+    jacobian_columns = (spiral_plus - spiral_minus) / (2.0 * epsilon)  # scroll basis axis, point, spiral zyx
+    return F.normalize((jacobian_columns * spiral_outward_zyx[None, :, :]).sum(dim=-1).transpose(0, 1), dim=-1)
+
+
+def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_points, epsilon=6.0):
     if pcl_normal_samples is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         return torch.zeros([], device=device)
@@ -1720,16 +1754,10 @@ def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_poin
     sampled = np.random.choice(n, num_points, replace=n < num_points)
     sampled_t = torch.from_numpy(sampled).to(device=device, dtype=torch.long)
     scroll_zyx = pcl_normal_samples['zyxs'][sampled_t]
-    scroll_normal = pcl_normal_samples['normals'][sampled_t]
+    target_normal = F.normalize(pcl_normal_samples['normals'][sampled_t], dim=-1)
 
-    scroll_shift_n = scroll_zyx + scroll_normal * epsilon
-    combined_spiral = slice_to_spiral_transform(torch.cat([scroll_zyx, scroll_shift_n], dim=0))
-    spiral_zyx, spiral_shift_n = combined_spiral.chunk(2, dim=0)
-
-    spiral_outward_yx = F.normalize(spiral_zyx[:, 1:], dim=-1)
-    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
-    spiral_normal_step = F.normalize(spiral_shift_n - spiral_zyx, dim=-1)
-    return (1. - (spiral_normal_step * spiral_outward_zyx).sum(dim=-1).abs()).mean()
+    scroll_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, epsilon=epsilon)
+    return (1. - (scroll_normal * target_normal).sum(dim=-1).abs()).mean()
 
 
 def prepare_dense_normal_volume(scroll_zarr):
@@ -1818,17 +1846,7 @@ def get_dense_normals_loss(slice_to_spiral_transform, dr_per_winding, dense_norm
     nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
     target_normal = F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
 
-    spiral_outward_yx = F.normalize(spiral_zyx[:, 1:], dim=-1)
-    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
-
-    basis_zyx = torch.eye(3, device=device, dtype=scroll_zyx_detached.dtype) * epsilon
-    scroll_plus = (scroll_zyx_detached[None, :, :] + basis_zyx[:, None, :]).reshape(-1, 3)
-    scroll_minus = (scroll_zyx_detached[None, :, :] - basis_zyx[:, None, :]).reshape(-1, 3)
-    spiral_plus, spiral_minus = slice_to_spiral_transform(torch.cat([scroll_plus, scroll_minus], dim=0)).chunk(2, dim=0)
-    spiral_plus = spiral_plus.view(3, num_points, 3)
-    spiral_minus = spiral_minus.view(3, num_points, 3)
-    jacobian_columns = (spiral_plus - spiral_minus) / (2.0 * epsilon)  # scroll basis axis, point, spiral zyx
-    scroll_normal = F.normalize((jacobian_columns * spiral_outward_zyx[None, :, :]).sum(dim=-1).transpose(0, 1), dim=-1)
+    scroll_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx_detached, spiral_zyx=spiral_zyx, epsilon=epsilon)
 
     residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
     return (residual * weight).sum() / weight.sum().clamp(min=1)
@@ -1913,10 +1931,10 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
     # Sample patch points and enforce, at each point, two local rigidity properties of the scroll->spiral transform:
     #   (stretch) epsilon-steps along the discrete patch tangents (+i and +j neighbors in patch coordinates) preserve
     #             length in spiral space;
-    #   (normals) an epsilon-step along the patch surface normal -- taken as the cross-product of the +i and +j patch
-    #             coordinate deltas -- maps to a step in the outward radial direction in spiral space (since the
-    #             spiral centre is at the origin, that's normalize(spiral_yx)). We only enforce direction match (not
-    #             magnitude) since the local scale of the normal can differ from the in-surface scale.
+    #   (normals) the patch surface normal -- the cross-product of the +i and +j patch coordinate deltas -- matches the
+    #             outward radial direction in spiral space. This is checked in scroll space: the spiral-space radial
+    #             direction is pulled back to scroll space as a covector via J^T (see get_radial_normal_in_scroll_space)
+    #             and compared against the measured normal there.
     # The normal's sign relative to outward is ambiguous; |cosine| absorbs that.
     patch_idx = int(np.random.choice(len(patches), p=patch_sampling_probabilities))
     patch = patches[patch_idx]
@@ -1946,20 +1964,17 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
 
     scroll_shift_i = scroll_zyx + tangent_i * epsilon
     scroll_shift_j = scroll_zyx + tangent_j * epsilon
-    scroll_shift_n = scroll_zyx + scroll_normal * epsilon
-    combined_scroll = torch.cat([scroll_zyx, scroll_shift_i, scroll_shift_j, scroll_shift_n], dim=0)
+    combined_scroll = torch.cat([scroll_zyx, scroll_shift_i, scroll_shift_j], dim=0)
     combined_spiral = slice_to_spiral_transform(combined_scroll)
-    spiral_zyx, spiral_shift_i, spiral_shift_j, spiral_shift_n = combined_spiral.chunk(4, dim=0)
+    spiral_zyx, spiral_shift_i, spiral_shift_j = combined_spiral.chunk(3, dim=0)
 
     stretch_residual = 0.5 * (
         (torch.linalg.norm(spiral_shift_i - spiral_zyx, dim=-1) - epsilon).abs() +
         (torch.linalg.norm(spiral_shift_j - spiral_zyx, dim=-1) - epsilon).abs()
     )
 
-    spiral_outward_yx = F.normalize(spiral_zyx[:, 1:], dim=-1)
-    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
-    spiral_normal_step = F.normalize(spiral_shift_n - spiral_zyx, dim=-1)
-    normals_residual = 1. - (spiral_normal_step * spiral_outward_zyx).sum(dim=-1).abs()
+    predicted_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx)
+    normals_residual = 1. - (predicted_normal * scroll_normal).sum(dim=-1).abs()
 
     denom = mask.sum().clamp(min=1)
     stretch_loss = (stretch_residual * mask).sum() / denom
