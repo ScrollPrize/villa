@@ -1103,6 +1103,7 @@ def _run_affine_seed_quad_expansion_reopt(
 	stage_idx: int,
 	progress_widths_run: dict[str, int] | None = None,
 	progress_row_idx: int = 0,
+	debug_obj_root: Path | None = None,
 	cancel_fn=None,
 ) -> tuple[list[dict[str, float]], int]:
 	steps_i = max(0, int(steps))
@@ -1137,6 +1138,31 @@ def _run_affine_seed_quad_expansion_reopt(
 		if opt is None or not opt.param_groups:
 			return float(lr)
 		return float(opt.param_groups[0].get("lr", lr))
+	def write_debug_map(radius: int, phase: str, step_count: int, active: torch.Tensor, row: dict[str, float]) -> None:
+		if debug_obj_root is None:
+			return
+		_write_map_objs(
+			debug_obj_root / f"rad_{int(radius):06d}_{_debug_obj_safe_label(phase)}",
+			uv=affine().detach(),
+			fixture=fixture,
+			meta={
+				"phase": str(phase),
+				"radius": int(radius),
+				"steps": int(step_count),
+				"active_quads": int(active.sum().detach().cpu()),
+				"lr": float(row.get("lr", lr)),
+				"loss": float(row["loss"]),
+				"dist": float(row["dist"]),
+				"dist_avg": float(row["dist_avg"]),
+				"vec": float(row["vec"]),
+				"norm": float(row["norm"]),
+				"smooth": float(row["smooth"]),
+				"jac": float(row["jac"]),
+				"samples": int(row["samples"]),
+				"sample_bad": int(row["sample_bad"]),
+				"quad_success": int(row["quad_success"]),
+			},
+		)
 	def eval_row(radius: int, active: torch.Tensor, step_count: int, init_loss: float) -> dict[str, float]:
 		with torch.no_grad():
 			uv = affine()
@@ -1193,6 +1219,7 @@ def _run_affine_seed_quad_expansion_reopt(
 		init_row["init_loss"] = init_loss
 		init_row["loss_gain"] = 0.0
 		rows.append(init_row)
+		write_debug_map(radius, "init", 0, active, init_row)
 		if progress_widths_run is not None:
 			report_loss, report_terms, report_err = eval_progress(radius, active, 0, init_loss)
 			_print_global_progress(
@@ -1252,6 +1279,9 @@ def _run_affine_seed_quad_expansion_reopt(
 						err=report_err,
 					)
 					progress_rows += 1
+		final_row = eval_row(radius, active, steps_i, init_loss)
+		final_row["lr"] = opt_lr(opt)
+		write_debug_map(radius, "final", steps_i, active, final_row)
 	return rows, progress_rows
 
 
@@ -1984,6 +2014,7 @@ def _prepare_affine_seed_quad_candidate(
 	stage_idx: int,
 	progress_widths_run: dict[str, int] | None,
 	progress_row_idx: int = 0,
+	debug_obj_root: Path | None = None,
 	cancel_fn=None,
 ) -> tuple[SeedQuadAffineInitResult | None, torch.Tensor | None, float, int]:
 	if isinstance(raw, dict) and not bool(raw.get("enabled", True)):
@@ -2031,6 +2062,7 @@ def _prepare_affine_seed_quad_candidate(
 			stage_idx=stage_idx,
 			progress_widths_run=progress_widths_run,
 			progress_row_idx=progress_row_idx,
+			debug_obj_root=debug_obj_root,
 			cancel_fn=cancel_fn,
 		)
 		candidate = affine.affine.detach().clone()
@@ -2073,6 +2105,7 @@ def _run_affine_seed_quad_init(
 	w_station: float,
 	progress_widths_run: dict[str, int],
 	progress_row_idx: int,
+	out_root: Path | None = None,
 ) -> int:
 	raw = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
 	if isinstance(raw, dict):
@@ -2085,6 +2118,10 @@ def _run_affine_seed_quad_init(
 			return 0
 		steps = max(0, int(stage.steps))
 		lr = float(stage.lr)
+	debug_obj_root = None
+	if out_root is not None:
+		label = stage.name or _stage_param_label(stage.params, fallback="affine_seed_quad_init")
+		debug_obj_root = Path(out_root) / "objs" / f"stage_{int(stage_idx):03d}_{_debug_obj_safe_label(label)}" / "expansion_reopt"
 	seed_result, candidate, initial_loss, prep_progress_rows = _prepare_affine_seed_quad_candidate(
 		stage=stage,
 		affine=affine,
@@ -2098,6 +2135,7 @@ def _run_affine_seed_quad_init(
 		stage_idx=stage_idx,
 		progress_widths_run=progress_widths_run,
 		progress_row_idx=progress_row_idx,
+		debug_obj_root=debug_obj_root,
 	)
 	if seed_result is None or candidate is None:
 		return 0
@@ -2702,6 +2740,15 @@ class GlobalMapRuntime:
 		if _is_affine_seed_quad_init(stage):
 			raw_seed = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
 			runtime_progress_widths = _global_progress_widths(GlobalMapConfig(base=self.cfg_global.base, stages=(stage,)))
+			debug_obj_root = None
+			debug_obj_dir = stage.args.get("debug_obj_dir", None)
+			if debug_obj_dir:
+				if isinstance(debug_obj_dir, bool):
+					debug_root = Path("snap_surf_objs")
+				else:
+					debug_root = Path(str(debug_obj_dir))
+				label = stage.name or _stage_param_label(stage.params, fallback="affine_seed_quad_init")
+				debug_obj_root = debug_root / f"map_global_{_debug_obj_safe_label(label)}" / "expansion_reopt"
 			seed_result, _candidate, _initial_loss, _prep_progress_rows = _prepare_affine_seed_quad_candidate(
 				stage=stage,
 				affine=self.affine,
@@ -2715,6 +2762,7 @@ class GlobalMapRuntime:
 				stage_idx=0,
 				progress_widths_run=runtime_progress_widths,
 				progress_row_idx=0,
+				debug_obj_root=debug_obj_root,
 				cancel_fn=cancel_fn,
 			)
 			if seed_result is not None:
@@ -3018,6 +3066,7 @@ def optimize_fixture(
 				w_station=w_station,
 				progress_widths_run=progress_widths_run,
 				progress_row_idx=progress_rows,
+				out_root=out,
 			)
 			stage_uv = affine().detach()
 			err = _fixture_mapping_error(stage_uv, fixture)

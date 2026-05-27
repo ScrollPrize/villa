@@ -824,6 +824,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				lr_warmup_steps=0,
 				stage_idx=0,
 				progress_widths_run=None,
+				debug_obj_root=Path(tmp, "grow_debug"),
 			)
 
 			self.assertEqual([int(row["radius"]) for row in rows], [8, 8, 8])
@@ -836,6 +837,11 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertLess(float(rows[2]["loss"]), float(initial[1]["loss"]))
 			self.assertGreater(float(rows[2]["loss_gain"]), 0.0)
 			self.assertTrue(torch.isfinite(affine.affine).all())
+			self.assertTrue(Path(tmp, "grow_debug", "rad_000008_init", "map_ext_to_model.obj").exists())
+			self.assertTrue(Path(tmp, "grow_debug", "rad_000008_final", "map_ext_to_model.obj").exists())
+			meta = json.loads(Path(tmp, "grow_debug", "rad_000008_final", "meta.json").read_text(encoding="utf-8"))
+			self.assertEqual(meta["phase"], "final")
+			self.assertEqual(meta["radius"], 8)
 
 	def test_seed_quad_affine_expansion_reopt_uses_stage_lr_warmup(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
