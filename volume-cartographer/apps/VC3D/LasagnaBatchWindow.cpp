@@ -20,8 +20,22 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
+#include <algorithm>
+
 namespace
 {
+double jobProgressFraction(const QJsonObject& job)
+{
+    double progress = job[QStringLiteral("overall_progress")].toDouble();
+    const int step = job[QStringLiteral("step")].toInt();
+    const int total = job[QStringLiteral("total_steps")].toInt();
+    if ((!job.contains(QStringLiteral("overall_progress")) || progress <= 0.0)
+        && step > 0 && total > 0) {
+        progress = static_cast<double>(step) / static_cast<double>(total);
+    }
+    return std::clamp(progress, 0.0, 1.0);
+}
+
 QString jobStateText(const QJsonObject& job)
 {
     const QString state = job[QStringLiteral("state")].toString();
@@ -60,8 +74,18 @@ QString jobStateText(const QJsonObject& job)
         return pos > 0 ? QObject::tr("Waiting #%1").arg(pos) : QObject::tr("Waiting");
     }
     if (state == QStringLiteral("running")) {
-        const double progress = job[QStringLiteral("overall_progress")].toDouble();
-        return QObject::tr("Running %1%").arg(progress * 100.0, 0, 'f', 1);
+        const double progress = jobProgressFraction(job);
+        const int step = job[QStringLiteral("step")].toInt();
+        const int total = job[QStringLiteral("total_steps")].toInt();
+        const QString stageName = job[QStringLiteral("stage_name")].toString().trimmed();
+        QString text = QObject::tr("Running %1%").arg(progress * 100.0, 0, 'f', 1);
+        if (total > 0) {
+            text += QObject::tr(" (%1/%2)").arg(step).arg(total);
+        }
+        if (!stageName.isEmpty()) {
+            text += QStringLiteral(" - %1").arg(stageName);
+        }
+        return text;
     }
     if (state == QStringLiteral("finished")) {
         return QObject::tr("Finished");

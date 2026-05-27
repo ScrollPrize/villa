@@ -22,7 +22,7 @@ class _DirectionState:
 		self.target_shape: tuple[int, ...] | None = None
 		self.map: torch.Tensor | None = None
 		self.valid: torch.Tensor | None = None
-		self.orientation_sign: int = 1
+		self.sign: int = 1
 		self.seed_base_idx: tuple[int, ...] | None = None
 
 	def ensure(
@@ -46,7 +46,7 @@ class _DirectionState:
 		self.target_shape = tuple(int(v) for v in target_shape)
 		self.map = torch.full((*self.source_shape, self.target_rank), float("nan"), device=device, dtype=dtype)
 		self.valid = torch.zeros(self.source_shape, device=device, dtype=torch.bool)
-		self.orientation_sign = 1
+		self.sign = 1
 		self.seed_base_idx = None
 
 	def count(self) -> int:
@@ -78,8 +78,7 @@ class _MapInitState:
 		self.seed_model_distance: float = float("inf")
 		self.seed_ext_distance: float = float("inf")
 		self.seed_init_count: int = 0
-		self.orientation_sign: int = 1
-		self.normal_sign: int = 1
+		self.sign: int = 1
 		self.total_iters: int = 0
 		self.grow_steps: int = 0
 		self.opt_blocks: int = 0

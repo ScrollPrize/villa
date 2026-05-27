@@ -27,8 +27,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
 			model_normals=_normals_3d(1, 2, 2),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(subdiv=3),
 			),
@@ -53,8 +52,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
 			model_normals=_normals_3d(1, 2, 2),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(subdiv=3),
 			),
@@ -273,8 +271,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=model_valid,
 			model_normals=_normals_3d(1, H, W),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(subdiv=2),
 			),
@@ -304,8 +301,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=model_valid,
 			model_normals=_normals_3d(1, 3, 3),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=cfg,
 		)
 		_, coarse_terms = opt_loss_snap_surf._map_init_objective(
@@ -319,8 +315,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=model_valid,
 			model_normals=_normals_3d(1, 3, 3),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=cfg,
 			allow_partial_model_samples=True,
 		)
@@ -348,8 +343,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, H, W, dtype=torch.bool),
 			model_normals=_normals_3d(1, H, W),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(subdiv=2),
 			),
@@ -378,13 +372,13 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		ok_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv_ok,
 			active,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		)
 		flip_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv_flip,
 			active,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		)
 
@@ -399,13 +393,13 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		ok_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
 			uv_ok,
 			active,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		)
 		compressed_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
 			uv_compressed,
 			active,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		)
 
@@ -419,13 +413,13 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		forward_pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv_expanded,
 			active,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		)
 		reverse_terms = opt_loss_snap_surf._map_init_inverse_regularization_terms(
 			uv_expanded,
 			active,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		)
 
@@ -501,8 +495,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, H, W, dtype=torch.bool),
 			model_normals=_normals_3d(1, H, W),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
 					w_dist=0.0,
@@ -544,8 +537,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 				model_valid=torch.ones(1, H, W, dtype=torch.bool),
 				model_normals=_normals_3d(1, H, W),
 				model_depth=0,
-				normal_sign=1,
-				orientation_sign=1,
+				sign=1,
 				cfg=opt_loss_snap_surf.SnapSurfConfig(
 					map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
 						w_dist=0.0,
@@ -616,8 +608,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, 2, 5, dtype=torch.bool),
 			model_normals=_normals_3d(1, 2, 5),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
 					w_dist=0.0,
@@ -647,7 +638,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			active_quad,
 			h=0,
 			w=0,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		))
 
@@ -672,8 +663,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, 3, 3, dtype=torch.bool),
 			model_normals=_normals_3d(1, 3, 3),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(),
 		)
 		_, dense_terms = opt_loss_snap_surf._map_init_objective(
@@ -687,8 +677,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, 3, 3, dtype=torch.bool),
 			model_normals=_normals_3d(1, 3, 3),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(dense_opt=True),
 			),
@@ -719,8 +708,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_valid=torch.ones(1, H, W, dtype=torch.bool),
 			model_normals=_normals_3d(1, H, W),
 			model_depth=0,
-			normal_sign=1,
-			orientation_sign=1,
+			sign=1,
 			cfg=opt_loss_snap_surf.SnapSurfConfig(
 				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
 					dense_opt=True,
@@ -739,7 +727,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		pen = opt_loss_snap_surf._map_init_jacobian_penalty(
 			uv,
 			active_quad,
-			orientation_sign=1,
+			sign=1,
 			jac_margin=0.05,
 		)
 

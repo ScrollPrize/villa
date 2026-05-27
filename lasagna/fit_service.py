@@ -1136,13 +1136,16 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
 
         _orig_optimize = opt_mod.optimize
 
+        def _check_cancel() -> None:
+            if job.cancelled:
+                raise KeyboardInterrupt("cancelled by user")
+
         def _patched_optimize(**kwargs: Any) -> Any:
             orig_snapshot = kwargs.get("snapshot_fn")
             orig_progress = kwargs.get("progress_fn")
 
             def _wrapped_snapshot(*, stage: str, step: int, loss: float, **kw: Any) -> None:
-                if job.cancelled:
-                    raise KeyboardInterrupt("cancelled by user")
+                _check_cancel()
                 if orig_snapshot is not None:
                     orig_snapshot(stage=stage, step=step, loss=loss, **kw)
 
@@ -1153,13 +1156,13 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     overall_progress=float(kw.get("overall_progress", 0.0)),
                     stage_name=str(kw.get("stage_name", "")),
                 )
-                if job.cancelled:
-                    raise KeyboardInterrupt("cancelled by user")
+                _check_cancel()
                 if orig_progress is not None:
                     orig_progress(step=step, total=total, loss=loss, **kw)
 
             kwargs["snapshot_fn"] = _wrapped_snapshot
             kwargs["progress_fn"] = _wrapped_progress
+            kwargs["cancel_fn"] = _check_cancel
             return _orig_optimize(**kwargs)
 
         from contextlib import nullcontext
@@ -1198,7 +1201,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             voxel_size_um = config.get("voxel_size_um")
             if voxel_size_um is not None:
                 export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
-            fit2tifxyz.main(export_argv)
+            _check_cancel()
+            fit2tifxyz.main(export_argv, cancel_fn=_check_cancel)
+            _check_cancel()
             save_s = time.perf_counter() - save_t0
             try:
                 saved_bytes = _dir_size_bytes(Path(output_dir))

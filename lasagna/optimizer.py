@@ -607,7 +607,7 @@ def _auto_steps_window(args: dict | None) -> int:
 
 def _auto_steps_min(args: dict | None, *, window: int) -> int:
 	args = args or {}
-	return max(1, int(args.get("auto_steps_min", int(window))))
+	return max(1, int(args.get("auto_steps_min", 2 * int(window))))
 
 
 def _auto_steps_rel_threshold(args: dict | None) -> float:
@@ -630,6 +630,33 @@ def _auto_steps_relative_improvement(history: list[float], *, window: int) -> fl
 
 def _auto_steps_should_stop(history: list[float], *, window: int, rel_threshold: float) -> bool:
 	return _auto_steps_relative_improvement(history, window=window) < float(rel_threshold)
+
+
+def _lr_warmup_steps(args: dict | None) -> int:
+	args = args or {}
+	raw = args.get("lr_warmup_steps", args.get("warmup_steps", 0))
+	return max(0, int(raw))
+
+
+def _lr_warmup_factor(*, step1: int, warmup_steps: int) -> float:
+	warmup_steps = max(0, int(warmup_steps))
+	if warmup_steps <= 0:
+		return 1.0
+	return min(1.0, max(0.0, float(step1) / float(warmup_steps)))
+
+
+def _capture_optimizer_target_lrs(opt: torch.optim.Optimizer) -> None:
+	for group in opt.param_groups:
+		group.setdefault("_target_lr", float(group.get("lr", 0.0)))
+
+
+def _apply_optimizer_lr_warmup(opt: torch.optim.Optimizer, *, step1: int, warmup_steps: int) -> None:
+	if int(warmup_steps) <= 0:
+		return
+	scale = _lr_warmup_factor(step1=int(step1), warmup_steps=int(warmup_steps))
+	for group in opt.param_groups:
+		target_lr = float(group.setdefault("_target_lr", float(group.get("lr", 0.0))))
+		group["lr"] = target_lr * scale
 
 
 def _flatten_max_update_base(args: dict | None) -> float:
@@ -705,6 +732,7 @@ def optimize(
 	snapshot_interval: int,
 	snapshot_fn,
 	progress_fn=None,
+	cancel_fn=None,
 	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
 	out_dir: str | None = None,
@@ -761,6 +789,7 @@ def optimize(
 		stage_args: dict | None,
 		persistent_optimizer: bool,
 		status_fn=None,
+		auto_stop_fn=None,
 	) -> dict[str, float]:
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
@@ -781,6 +810,8 @@ def optimize(
 			ext_quad_valid=ext_quad_valid,
 			persistent_optimizer=persistent_optimizer,
 			status_fn=status_fn,
+			cancel_fn=cancel_fn,
+			auto_stop_fn=auto_stop_fn,
 		)
 
 	def _compact_snap_global_map_stats(stats: dict[str, float]) -> dict[str, float]:
@@ -1503,6 +1534,7 @@ def optimize(
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
 		status_interval = max(0, int(status_interval_raw))
 		steps_label = _steps_label(opt_cfg)
+		lr_warmup_steps = _lr_warmup_steps(stage_args)
 		auto_window = _auto_steps_window(stage_args) if opt_cfg.steps_auto else 0
 		auto_min = _auto_steps_min(stage_args, window=auto_window) if opt_cfg.steps_auto else 0
 		auto_rel_threshold = _auto_steps_rel_threshold(stage_args) if opt_cfg.steps_auto else 0.0
@@ -1526,6 +1558,11 @@ def optimize(
 				f"min={auto_min} rel_threshold={auto_rel_threshold:g}",
 				flush=True,
 			)
+		if lr_warmup_steps > 0 and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: lr warmup steps={lr_warmup_steps}",
+				flush=True,
+			)
 
 		if opt_cfg.kind == "map":
 			if not getattr(model, "_ext_surfaces", None):
@@ -1535,6 +1572,17 @@ def optimize(
 			_map_status_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
 			_map_wall = time.perf_counter()
 			_map_last_step = 0
+			_map_auto_stop_info: dict[str, float] = {}
+
+			def _map_auto_stop_fn(*, history: list[float], step: int) -> bool:
+				if int(step) < int(auto_min):
+					return False
+				rel_improvement = _auto_steps_relative_improvement(history, window=auto_window)
+				if rel_improvement >= float(auto_rel_threshold):
+					return False
+				_map_auto_stop_info["post_warmup_step"] = float(step)
+				_map_auto_stop_info["rel_improvement"] = float(rel_improvement)
+				return True
 
 			def _print_map_status(*, step: int, total: int, stats: dict[str, float]) -> None:
 				nonlocal _map_status_rows, _map_wall, _map_last_step
@@ -1574,6 +1622,22 @@ def optimize(
 					flush=True,
 				)
 				_map_status_rows += 1
+				if progress_fn is not None:
+					_stage_total = max(1, int(total))
+					_stage_step = min(max(0, int(step)), _stage_total)
+					_scheduled_stage_steps = max(0, int(opt_cfg.steps))
+					_done = _done_steps[0] + min(_stage_step, _scheduled_stage_steps)
+					progress_fn(
+						step=_done,
+						total=_total_steps,
+						loss=float(stats.get("snaps_map_loss", 0.0)),
+						stage_progress=_stage_step / _stage_total,
+						overall_progress=(
+							(si + (_stage_step / _stage_total)) / _num_stages
+							if _num_stages > 0 else 1.0
+						),
+						stage_name=stage.name,
+					)
 
 			res_map = model(data, needs=_map_forward_needs)
 			stats = _run_snap_global_map_stage(
@@ -1582,17 +1646,31 @@ def optimize(
 				stage_args=stage_args,
 				persistent_optimizer=False,
 				status_fn=_print_map_status,
+				auto_stop_fn=_map_auto_stop_fn if opt_cfg.steps_auto else None,
 			)
 			opt_loss_snap_surf.update_last_stats(stats)
-			_done_steps[0] += max(0, int(opt_cfg.steps))
+			stage_steps_done = int(stats.get("snaps_map_stage_steps", opt_cfg.steps))
+			stage_steps_done = min(max(0, stage_steps_done), max(0, int(opt_cfg.steps)))
+			_done_steps[0] += stage_steps_done
 			if progress_fn is not None:
 				progress_fn(
 					step=_done_steps[0],
 					total=_total_steps,
 					loss=float(stats.get("snaps_map_loss", 0.0)),
 					stage_progress=1.0,
-					overall_progress=(si + 1) / _num_stages if _num_stages > 0 else 1.0,
+					overall_progress=(
+						(si + 1) / _num_stages if _num_stages > 0 else 1.0
+					),
 					stage_name=stage.name,
+				)
+			if opt_cfg.steps_auto and _map_auto_stop_info:
+				print(
+					f"[optimizer] {label}: auto steps stopped at "
+					f"{stage_steps_done}/{opt_cfg.steps} "
+					f"post_warmup={int(_map_auto_stop_info['post_warmup_step'])} "
+					f"rel_improvement_{auto_window}={_map_auto_stop_info['rel_improvement']:.6g} "
+					f"< {auto_rel_threshold:g}",
+					flush=True,
 				)
 			print(
 				f"[optimizer] {label}: snap_surf_global_map "
@@ -1763,6 +1841,7 @@ def optimize(
 		if not param_groups:
 			return data
 		opt = torch.optim.Adam(param_groups)
+		_capture_optimizer_target_lrs(opt)
 		if flatten_max_update > 0.0 and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: flatten_max_update={flatten_max_update:g} "
@@ -1792,6 +1871,7 @@ def optimize(
 				if not param_groups:
 					return data
 				opt = torch.optim.Adam(param_groups)
+				_capture_optimizer_target_lrs(opt)
 		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
 		_status_rows = 0
@@ -2584,6 +2664,7 @@ def optimize(
 				if not param_groups:
 					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
 				opt = torch.optim.Adam(param_groups)
+				_capture_optimizer_target_lrs(opt)
 				resample_count = 0
 				resampled_this_pass = False
 				step1 = 0
@@ -2725,6 +2806,7 @@ def optimize(
 						_opt_timing.add("backward", time.perf_counter() - _t_part)
 
 					_t_part = time.perf_counter()
+					_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 					opt.step()
 					if _opt_timing is not None:
 						_opt_timing.sync()
@@ -2742,8 +2824,7 @@ def optimize(
 					_done_steps[0] += 1
 					_stage_progress = step1 / pass_max_steps if pass_max_steps > 0 else 1.0
 					_overall_progress = (
-						min(1.0, _done_steps[0] / max(1, _total_steps))
-						if _total_steps > 0 else 1.0
+						(si + _stage_progress) / _num_stages if _num_stages > 0 else 1.0
 					)
 
 					_t_part = time.perf_counter()
@@ -3137,6 +3218,7 @@ def optimize(
 				if not param_groups:
 					return data
 				opt = torch.optim.Adam(param_groups)
+				_capture_optimizer_target_lrs(opt)
 			_stage_done(f"{label}.initial_eval.cylinder_prune", _t_prune)
 			_t_params = _stage_start(f"{label}.initial_eval.param_values")
 			param_vals0: dict[str, float] = {}
@@ -3166,7 +3248,7 @@ def optimize(
 
 		max_steps = opt_cfg.steps
 		final_step = 0
-		auto_loss_history = [float(loss0.detach().cpu())] if opt_cfg.steps_auto else []
+		auto_loss_history = [float(loss0.detach().cpu())] if opt_cfg.steps_auto and lr_warmup_steps <= 0 else []
 		_t_wall_start = time.perf_counter()
 		_t_steps_acc = 0
 		loss = loss0
@@ -3257,6 +3339,7 @@ def optimize(
 			_flatten_update_params = all_params.get("flatten_map_ms", [])
 			if flatten_max_update > 0.0 and _flatten_update_params:
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
+			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			opt.step()
 			if _flatten_update_before is not None:
 				_clamp_flatten_map_ms_update(
@@ -3317,7 +3400,9 @@ def optimize(
 			step1 = step + 1
 			final_step = step1
 			_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
-			_overall_progress = (si + _stage_progress) / _num_stages if _num_stages > 0 else 1.0
+			_overall_progress = (
+				(si + _stage_progress) / _num_stages if _num_stages > 0 else 1.0
+			)
 
 			_t_part = time.perf_counter()
 			if progress_fn is not None:
@@ -3330,9 +3415,10 @@ def optimize(
 			if _opt_timing is not None:
 				_opt_timing.add("progress", time.perf_counter() - _t_part)
 
-			if opt_cfg.steps_auto:
+			if opt_cfg.steps_auto and step1 > lr_warmup_steps:
+				auto_step = step1 - lr_warmup_steps
 				auto_loss_history.append(float(loss.detach().cpu()))
-				if step1 >= auto_min and _auto_steps_should_stop(
+				if auto_step >= auto_min and _auto_steps_should_stop(
 					auto_loss_history,
 					window=auto_window,
 					rel_threshold=auto_rel_threshold,

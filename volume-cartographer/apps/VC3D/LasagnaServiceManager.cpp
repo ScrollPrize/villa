@@ -741,6 +741,58 @@ void LasagnaServiceManager::removeLocalUploadJob(const QString& jobId)
     emitJobsUpdatedOverlay();
 }
 
+void LasagnaServiceManager::updateCachedJobFromStatus(const QJsonObject& status)
+{
+    const QString state = status[QStringLiteral("state")].toString();
+    if (state.isEmpty() || state == QStringLiteral("idle")) {
+        return;
+    }
+
+    QString jobId = status[QStringLiteral("job_id")].toString();
+    if (jobId.isEmpty()) {
+        jobId = _activeJobId;
+    }
+    if (jobId.isEmpty()) {
+        return;
+    }
+
+    bool changed = false;
+    bool found = false;
+    QJsonArray updated;
+    for (const QJsonValue& value : _lastJobs) {
+        QJsonObject job = value.toObject();
+        if (job[QStringLiteral("job_id")].toString() == jobId) {
+            found = true;
+            for (auto it = status.constBegin(); it != status.constEnd(); ++it) {
+                if (it.key() == QStringLiteral("api_version")
+                    || it.key() == QStringLiteral("queue_generation")) {
+                    continue;
+                }
+                if (job.value(it.key()) != it.value()) {
+                    job[it.key()] = it.value();
+                    changed = true;
+                }
+            }
+        }
+        updated.append(job);
+    }
+
+    if (!found && _submittedJobIds.contains(jobId)) {
+        QJsonObject job = status;
+        job.remove(QStringLiteral("api_version"));
+        job.remove(QStringLiteral("queue_generation"));
+        job[QStringLiteral("job_id")] = jobId;
+        updated.append(job);
+        changed = true;
+    }
+
+    if (!changed) {
+        return;
+    }
+    _lastJobs = updated;
+    emitJobsUpdatedOverlay();
+}
+
 QJsonArray LasagnaServiceManager::jobsWithLocalUploads(const QJsonArray& serviceJobs) const
 {
     QJsonArray jobs;
@@ -1670,6 +1722,7 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
         if (!jobId.isEmpty()) {
             _activeJobId = jobId;
         }
+        updateCachedJobFromStatus(obj);
         emit optimizationProgress(stage, step, totalSteps, loss,
                                   stageProgress, overallProgress, stageName);
     }

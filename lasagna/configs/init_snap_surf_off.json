@@ -58,11 +58,11 @@
 		},
 		{
 			"name": "affine_seed_quad_init",
-			"steps": 100,
-			"lr": 0.1,
+			"steps": "auto",
+			"lr": 0.001,
 			"params": ["map_surf_affine"],
 			"args": {
-				"status_interval": 10,
+				"status_interval": 1,
 				"subdiv": 2,
 				"map_global": {
 					"distance_scale": 1.0,
@@ -70,7 +70,7 @@
 					"map_station_t": 1.0,
 					"map_init": {
 						"subdiv": 2,
-						"scale_levels": 4,
+						"scale_levels": 5,
 						"w_dist": 0.0001,
 						"w_vec_normal": 1.0,
 						"w_surface_normal": 1.0,
@@ -93,18 +93,18 @@
 		},
 		{
 			"name": "map_surf_affine_refine",
-			"steps": 500,
-			"lr": 0.01,
+			"steps": "auto",
+			"lr": 0.001,
 			"params": ["map_surf_affine"],
 			"args": {
-				"status_interval": 100,
+				"status_interval": 1,
 				"subdiv": 2
 			}
 		},
 		{
 			"name": "map_uv_coarse",
-			"steps": 500,
-			"lr": 0.1,
+			"steps": "auto",
+			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
@@ -114,8 +114,8 @@
 		},
 		{
 			"name": "map_uv_refine",
-			"steps": 200,
-			"lr": 0.1,
+			"steps": "auto",
+			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
@@ -124,20 +124,8 @@
 			}
 		},
 		{
-			"name": "map_uv_fine",
-			"steps": 200,
-			"lr": 0.01,
-			"params": ["map_surf_ms"],
-			"min_scaledown": 0,
-			"args": {
-				"subdiv": 2,
-				"status_interval": 20,
-				"debug_obj_dir": "snap_surf_objs"
-			}
-		},
-		{
 			"name": "snap",
-			"steps": 2000,
+			"steps": "auto",
 			"lr": 1.0,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,

@@ -522,7 +522,7 @@ def _similarity_predict(
 	target: torch.Tensor,
 	query: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 ) -> torch.Tensor | None:
 	n = int(source.shape[0])
 	if n < 2:
@@ -549,7 +549,7 @@ def _similarity_predict(
 	a = (q * e).sum() / len2
 	b = (q * p).sum() / len2
 	pred = t0 + a * f
-	orient = 1.0 if int(orientation_sign) >= 0 else -1.0
+	orient = 1.0 if int(sign) >= 0 else -1.0
 	if target.shape[1] == 2:
 		f_perp = torch.stack([-f[1], f[0]])
 		pred = pred + b * orient * f_perp
@@ -567,7 +567,7 @@ def _predict_target_coord(
 	target: torch.Tensor,
 	query: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 ) -> torch.Tensor | None:
 	if int(source.shape[0]) < 2:
 		return None
@@ -579,16 +579,16 @@ def _predict_target_coord(
 		except RuntimeError:
 			sol = torch.linalg.pinv(S) @ target
 		return q @ sol
-	return _similarity_predict(source, target, query, orientation_sign=orientation_sign)
+	return _similarity_predict(source, target, query, sign=sign)
 
 def _affine_orientation_pass(
 	count: torch.Tensor,
 	det: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 	eps: float = 1.0e-4,
 ) -> torch.Tensor:
-	expected = 1.0 if int(orientation_sign) >= 0 else -1.0
+	expected = 1.0 if int(sign) >= 0 else -1.0
 	confident = (count >= 3) & torch.isfinite(det) & (det.abs() > float(eps))
 	return (~confident) | ((det * expected) >= 0.0)
 
@@ -925,7 +925,7 @@ def _revalidate_direction(
 		if cfg.orientation == "none":
 			orient_pass = torch.ones_like(grid_pass)
 		else:
-			orient_pass = _affine_orientation_pass(count, det, orientation_sign=state.orientation_sign)
+			orient_pass = _affine_orientation_pass(count, det, sign=state.sign)
 		grid_fail = check & ~grid_pass
 		if bool(grid_fail.any().detach().cpu()):
 			fail_vals = grid_err[grid_fail]

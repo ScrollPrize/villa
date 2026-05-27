@@ -49,6 +49,7 @@
 
 #include "utils/Json.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -860,9 +861,14 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::optimizationProgress, this,
-            [this](const QString& /*stage*/, int /*step*/, int /*total*/, double loss,
+            [this](const QString& /*stage*/, int step, int total, double loss,
                    double stageProgress, double overallProgress,
                    const QString& stageName) {
+        if ((overallProgress <= 0.0) && step > 0 && total > 0) {
+            overallProgress = static_cast<double>(step) / static_cast<double>(total);
+        }
+        overallProgress = std::clamp(overallProgress, 0.0, 1.0);
+        stageProgress = std::clamp(stageProgress, 0.0, 1.0);
         if (_progressBar) {
             _progressBar->setRange(0, 1000);
             _progressBar->setValue(static_cast<int>(overallProgress * 1000.0));
@@ -871,12 +877,21 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _progressBar->setVisible(true);
         }
         if (_progressLabel) {
-            _progressLabel->setText(
-                tr("Stage: %1 (%2%)  |  Overall: %3%  |  Loss: %4")
-                    .arg(stageName.isEmpty() ? QStringLiteral("...") : stageName)
+            const QString stageText = stageName.isEmpty() ? QStringLiteral("...") : stageName;
+            const QString label = total > 0
+                ? tr("Stage: %1 (%2%)  |  Overall: %3%  |  Step: %4/%5  |  Loss: %6")
+                    .arg(stageText)
                     .arg(stageProgress * 100.0, 0, 'f', 1)
                     .arg(overallProgress * 100.0, 0, 'f', 1)
-                    .arg(loss, 0, 'g', 5));
+                    .arg(step)
+                    .arg(total)
+                    .arg(loss, 0, 'g', 5)
+                : tr("Stage: %1 (%2%)  |  Overall: %3%  |  Loss: %4")
+                    .arg(stageText)
+                    .arg(stageProgress * 100.0, 0, 'f', 1)
+                    .arg(overallProgress * 100.0, 0, 'f', 1)
+                    .arg(loss, 0, 'g', 5);
+            _progressLabel->setText(label);
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }

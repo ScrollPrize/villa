@@ -122,6 +122,24 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(stages[0].global_opt.steps, 12)
 		self.assertEqual(optimizer.total_steps_for_stages(stages), 12)
 
+	def test_auto_steps_min_defaults_to_two_windows(self) -> None:
+		self.assertEqual(optimizer._auto_steps_min({}, window=7), 14)
+		self.assertEqual(optimizer._auto_steps_min({"auto_steps_min": 5}, window=7), 5)
+
+	def test_lr_warmup_scales_each_optimizer_group_to_target_lr(self) -> None:
+		p0 = torch.nn.Parameter(torch.tensor([0.0]))
+		p1 = torch.nn.Parameter(torch.tensor([0.0]))
+		opt = torch.optim.Adam([
+			{"params": [p0], "lr": 0.2},
+			{"params": [p1], "lr": 0.05},
+		])
+
+		optimizer._capture_optimizer_target_lrs(opt)
+		optimizer._apply_optimizer_lr_warmup(opt, step1=2, warmup_steps=4)
+
+		self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.1)
+		self.assertAlmostEqual(opt.param_groups[1]["lr"], 0.025)
+
 	def test_auto_steps_relative_improvement_uses_best_before_and_recent_window(self) -> None:
 		history = [10.0, 1.0, 9.0, 8.0, 0.9]
 
@@ -163,6 +181,42 @@ class FlattenLossTest(unittest.TestCase):
 		)
 
 		self.assertEqual(progress_steps[-1], 3)
+		self.assertLess(progress_steps[-1], stages[0].global_opt.steps)
+
+	def test_auto_steps_min_counts_after_lr_warmup(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {"flatten_avg_offset": 1.0},
+			"stages": [{
+				"name": "flatten",
+				"global_opt": {
+					"steps": "auto",
+					"lr": 0.0,
+					"params": ["map_flatten_ms"],
+					"args": {
+						"auto_steps_max": 10,
+						"auto_steps_window": 2,
+						"auto_steps_rel_threshold": 1.0e-6,
+						"lr_warmup_steps": 2,
+						"status_interval": 0,
+						"flatten_max_update": 0.0,
+					},
+				},
+			}],
+		})
+		progress_steps: list[int] = []
+
+		optimizer.optimize(
+			model=mdl,
+			data=fit._dummy_flatten_data(),
+			stages=stages,
+			snapshot_interval=0,
+			snapshot_fn=lambda **_kw: None,
+			progress_fn=lambda **kw: progress_steps.append(int(kw["step"])),
+		)
+
+		self.assertEqual(progress_steps[-1], 6)
 		self.assertLess(progress_steps[-1], stages[0].global_opt.steps)
 
 	def test_flatten_pyramid_reaches_two_in_longer_dimension(self) -> None:

@@ -735,7 +735,11 @@ def _export_flatten_checkpoint(
 	return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
+	def _check_cancel() -> None:
+		if cancel_fn is not None:
+			cancel_fn()
+
 	parser = _build_parser()
 	args = cli_json.parse_args(parser, argv)
 	cfg = ExportConfig(
@@ -749,7 +753,9 @@ def main(argv: list[str] | None = None) -> int:
 	)
 
 	dev = torch.device(cfg.device)
+	_check_cancel()
 	st = torch.load(cfg.input, map_location=dev, weights_only=False)
+	_check_cancel()
 	if not isinstance(st, dict):
 		raise ValueError("expected a state_dict checkpoint")
 	model_params = st.get("_model_params_", None)
@@ -768,6 +774,7 @@ def main(argv: list[str] | None = None) -> int:
 	if not isinstance(approval_output_mask, dict):
 		approval_output_mask = None
 	if "flatten_map_flat" in st:
+		_check_cancel()
 		return _export_flatten_checkpoint(
 		st=st,
 		cfg=cfg,
@@ -777,8 +784,10 @@ def main(argv: list[str] | None = None) -> int:
 	)
 
 	# Reconstruct mesh (3, D, Hm, Wm) — pyramid stores full xyz positions
+	_check_cancel()
 	mdl = model.Model3D.from_checkpoint(st, device=dev)
 	mesh = mdl.mesh_coarse()
+	_check_cancel()
 
 	_, D, Hm, Wm = (int(v) for v in mesh.shape)
 	mesh_np = mesh.detach().cpu().numpy()  # (3, D, Hm, Wm)
@@ -826,6 +835,7 @@ def main(argv: list[str] | None = None) -> int:
 		raw_mask_all = np.zeros((Hm, total_w), dtype=bool)
 		mask_all = np.zeros((Hm, total_w), dtype=bool)
 		for d in range(D):
+			_check_cancel()
 			x_layer = mesh_np[0, d]  # (Hm, Wm)
 			y_layer = mesh_np[1, d]
 			z_layer = mesh_np[2, d]
@@ -856,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
 			components.append([col, col + Wm])
 			col += Wm + BORDER_W
 
+		_check_cancel()
 		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
 		out_dir = out_base / seg_name
 		area = _get_area(x_all, y_all, z_all, xy_step_fullres, cfg.voxel_size_um)
@@ -886,6 +897,7 @@ def main(argv: list[str] | None = None) -> int:
 		if cfg.voxel_size_um is not None:
 			total_area["area_cm2"] = 0.0
 		for d in range(D):
+			_check_cancel()
 			x = mesh_np[0, d]  # (Hm, Wm) already in fullres
 			y = mesh_np[1, d]
 			z = mesh_np[2, d]
@@ -909,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
 			if "area_cm2" in area:
 				total_area["area_cm2"] += area["area_cm2"]
 			out_dir = out_base / f"{cfg.prefix}{d:04d}.tifxyz"
+			_check_cancel()
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 						  job_spec=job_spec,

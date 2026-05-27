@@ -15,7 +15,6 @@ import opt_loss_winding_density
 from .config import SnapSurfConfig, SnapSurfMapInitConfig, _map_init_log
 from .state import _MapInitState, _SurfaceState, _DirectionState
 from .tensor import *
-from .legacy import _closest_external_seed_surface, _closest_model_surface_quad, _closest_point_uv_on_model_quad, _choose_seed_transform
 
 def _map_init_empty_stats() -> dict[str, float]:
 	return {
@@ -504,7 +503,7 @@ def _map_init_sample_geometry_limit_ok(
 	n_ext: torch.Tensor,
 	p_model: torch.Tensor,
 	n_model_raw: torch.Tensor,
-	normal_sign: int | None,
+	sign: int,
 	cfg: SnapSurfMapInitConfig,
 	ext_step: torch.Tensor | None = None,
 	model_step: torch.Tensor | None = None,
@@ -512,7 +511,7 @@ def _map_init_sample_geometry_limit_ok(
 	if p_ext.numel() == 0:
 		return torch.zeros(p_ext.shape[:-1], device=p_ext.device, dtype=torch.bool)
 	n_ext_base = F.normalize(n_ext, dim=-1, eps=1.0e-8)
-	n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+	n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * (1.0 if int(sign) >= 0 else -1.0)
 	v = p_model - p_ext
 	d = v.norm(dim=-1)
 	ok = (
@@ -536,21 +535,18 @@ def _map_init_sample_geometry_limit_ok(
 		u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
 		cos_min_ext = _map_init_connection_cos_min(d, model_step, cfg=cfg)
 		cos_min_model = _map_init_connection_cos_min(d, ext_step, cfg=cfg)
-		signs = (1.0, -1.0) if normal_sign is None else (1.0 if int(normal_sign) >= 0 else -1.0,)
 		angle_ok = torch.zeros_like(ok)
-		for sign in signs:
-			n_ext_s = n_ext_base * float(sign)
-			c_ext = (u * n_ext_s).sum(dim=-1)
-			c_model = (u * n_model).sum(dim=-1)
-			c_norm = (n_ext_s * n_model).sum(dim=-1)
-			angle_ok = angle_ok | (
-				torch.isfinite(c_ext) &
-				torch.isfinite(c_model) &
-				torch.isfinite(c_norm) &
-				torch.isfinite(cos_min_ext) &
-				torch.isfinite(cos_min_model) &
-				((near_zero | (c_ext >= cos_min_ext)) & (near_zero | (c_model >= cos_min_model)) & (c_norm >= cos_min))
-			)
+		c_ext = (u * n_ext_base).sum(dim=-1)
+		c_model = (u * n_model).sum(dim=-1)
+		c_norm = (n_ext_base * n_model).sum(dim=-1)
+		angle_ok = angle_ok | (
+			torch.isfinite(c_ext) &
+			torch.isfinite(c_model) &
+			torch.isfinite(c_norm) &
+			torch.isfinite(cos_min_ext) &
+			torch.isfinite(cos_min_model) &
+			((near_zero | (c_ext >= cos_min_ext)) & (near_zero | (c_model >= cos_min_model)) & (c_norm >= cos_min))
+		)
 		ok = ok & angle_ok
 	return ok
 
@@ -567,7 +563,7 @@ def _map_init_candidate_quad_samples_ok(
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	model_depth: int,
-	normal_sign: int | None = 1,
+	sign: int = 1,
 	cfg: SnapSurfConfig,
 	allow_partial_model_samples: bool = False,
 	enforce_sample_limits: bool = True,
@@ -608,7 +604,7 @@ def _map_init_candidate_quad_samples_ok(
 			n_ext=n_ext,
 			p_model=p_model,
 			n_model_raw=n_model_raw,
-			normal_sign=normal_sign,
+			sign=sign,
 			cfg=cfg.map_init,
 			ext_step=ext_step[:, None].expand_as(model_ok),
 			model_step=model_step[:, None].expand_as(model_ok),

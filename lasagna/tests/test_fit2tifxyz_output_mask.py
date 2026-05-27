@@ -312,6 +312,40 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 		self.assertTrue(np.all(d_out[~expected] == -1.0))
 		self.assertEqual(meta["area_vx2"], 4.0)
 
+	def test_checkpoint_export_observes_cancel_callback(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": {
+				"mesh_step": 1,
+				"winding_step": 1,
+				"subsample_mesh": 1,
+				"subsample_winding": 1,
+				"scaledown": 1.0,
+				"z_step_eff": 1,
+				"volume_extent": None,
+				"pyramid_d": False,
+			},
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+
+			calls = 0
+
+			def cancel() -> None:
+				nonlocal calls
+				calls += 1
+				raise KeyboardInterrupt("cancelled")
+
+			with self.assertRaises(KeyboardInterrupt):
+				fit2tifxyz.main(["--input", str(ckpt), "--output", str(out)], cancel_fn=cancel)
+			self.assertGreaterEqual(calls, 1)
+
 
 if __name__ == "__main__":
 	unittest.main()

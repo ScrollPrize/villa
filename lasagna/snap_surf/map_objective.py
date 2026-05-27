@@ -37,7 +37,7 @@ def _map_init_jacobian_values(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 ) -> torch.Tensor:
 	H, W = int(uv.shape[0]), int(uv.shape[1])
 	if H < 2 or W < 2 or active_quad.numel() == 0:
@@ -63,14 +63,14 @@ def _map_init_jacobian_values(
 	finite = cell.unsqueeze(-1) & torch.isfinite(dets)
 	if not bool(finite.any().detach().cpu()):
 		return torch.empty(0, device=uv.device, dtype=uv.dtype)
-	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
-	return (dets * sign)[finite]
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	return (dets * sign_f)[finite]
 
 def _map_init_jacobian_bad_quad_mask(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 	jac_margin: float,
 ) -> torch.Tensor:
 	if active_quad.numel() == 0:
@@ -97,16 +97,16 @@ def _map_init_jacobian_bad_quad_mask(
 		dh1[..., 0] * dw0[..., 1] - dh1[..., 1] * dw0[..., 0],
 		dh1[..., 0] * dw1[..., 1] - dh1[..., 1] * dw1[..., 0],
 	], dim=-1)
-	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
 	finite = cell.unsqueeze(-1) & torch.isfinite(dets)
-	bad = cell & (~finite.all(dim=-1) | ((dets * sign) < float(jac_margin)).any(dim=-1))
+	bad = cell & (~finite.all(dim=-1) | ((dets * sign_f) < float(jac_margin)).any(dim=-1))
 	return bad
 
 def _map_init_inverse_jacobian_bad_quad_mask(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 	jac_margin: float,
 ) -> torch.Tensor:
 	if active_quad.numel() == 0:
@@ -123,8 +123,8 @@ def _map_init_inverse_jacobian_bad_quad_mask(
 	dw = uv[:-1, 1:] - uv[:-1, :-1]
 	det = dh[..., 0] * dw[..., 1] - dh[..., 1] * dw[..., 0]
 	finite = cell & torch.isfinite(dh).all(dim=-1) & torch.isfinite(dw).all(dim=-1) & torch.isfinite(det)
-	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
-	det_signed = det * sign
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	det_signed = det * sign_f
 	eps = max(1.0e-3, 0.1 * float(jac_margin))
 	inv_det = torch.where(det_signed > eps, det_signed.clamp_min(eps).reciprocal(), torch.zeros_like(det_signed))
 	bad = cell & (~finite | (inv_det < float(jac_margin)))
@@ -134,10 +134,10 @@ def _map_init_jacobian_penalty(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 	jac_margin: float,
 ) -> torch.Tensor:
-	values = _map_init_jacobian_values(uv, active_quad, orientation_sign=orientation_sign)
+	values = _map_init_jacobian_values(uv, active_quad, sign=sign)
 	if values.numel() == 0:
 		finite = uv[torch.isfinite(uv)]
 		if finite.numel():
@@ -149,7 +149,7 @@ def _map_init_inverse_regularization_terms(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
 	*,
-	orientation_sign: int,
+	sign: int,
 	jac_margin: float,
 ) -> dict[str, torch.Tensor]:
 	z = uv[torch.isfinite(uv)].sum() * 0.0 if uv.numel() else torch.zeros((), device=uv.device, dtype=uv.dtype)
@@ -178,8 +178,8 @@ def _map_init_inverse_regularization_terms(
 			"jac_bad": torch.tensor(0.0, device=uv.device, dtype=uv.dtype),
 		}
 
-	sign = 1.0 if int(orientation_sign) >= 0 else -1.0
-	det_signed = det * sign
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	det_signed = det * sign_f
 	det_v = det_signed[finite]
 	dh_v = dh[finite]
 	dw_v = dw[finite]
@@ -540,7 +540,7 @@ def _map_init_local_jacobian_pass(
 	*,
 	h: int,
 	w: int,
-	orientation_sign: int,
+	sign: int,
 	jac_margin: float,
 ) -> bool:
 	QH, QW = int(active_quad.shape[0]), int(active_quad.shape[1])
@@ -552,7 +552,7 @@ def _map_init_local_jacobian_pass(
 				continue
 			cell = torch.zeros_like(active_quad, dtype=torch.bool)
 			cell[bh, bw] = True
-			vals = _map_init_jacobian_values(uv, cell, orientation_sign=orientation_sign)
+			vals = _map_init_jacobian_values(uv, cell, sign=sign)
 			if vals.numel() == 0:
 				return False
 			if float(vals.min().detach().cpu()) < float(jac_margin):
@@ -595,8 +595,7 @@ def _map_init_objective(
 	model_valid: torch.Tensor,
 	model_normals: torch.Tensor,
 	model_depth: int,
-	normal_sign: int,
-	orientation_sign: int,
+	sign: int,
 	cfg: SnapSurfConfig,
 	w_jac_mult: float = 1.0,
 	uv_prior: torch.Tensor | None = None,
@@ -642,10 +641,10 @@ def _map_init_objective(
 		safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
 		p_ext_f = p_ext.reshape(Q * S, 3)
 		n_ext_raw_f = n_ext_raw.reshape(Q * S, 3)
-		n_ext = F.normalize(n_ext_raw_f, dim=-1, eps=1.0e-8) * (1.0 if int(normal_sign) >= 0 else -1.0)
+		n_ext = F.normalize(n_ext_raw_f, dim=-1, eps=1.0e-8)
 		p_model = _sample_surface_grid(model_xyz, safe_coords)
 		n_model_raw = _sample_surface_grid(model_normals, safe_coords)
-		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * (1.0 if int(sign) >= 0 else -1.0)
 		ext_step_q, model_step_q = _map_init_quad_physical_step_lengths(
 			uv_full=uv_full,
 			quad_hw=quad_hw,
@@ -674,7 +673,7 @@ def _map_init_objective(
 			n_ext=n_ext_raw_f,
 			p_model=p_model,
 			n_model_raw=n_model_raw,
-			normal_sign=normal_sign,
+			sign=sign,
 			cfg=mi,
 			ext_step=ext_step_f,
 			model_step=model_step_f,
@@ -801,13 +800,13 @@ def _map_init_objective(
 	jac_fwd_loss = _map_init_jacobian_penalty(
 		uv_safe,
 		reg_quad,
-		orientation_sign=orientation_sign,
+		sign=sign,
 		jac_margin=mi.jac_margin,
 	)
 	inv_terms = _map_init_inverse_regularization_terms(
 		uv_safe,
 		reg_quad,
-		orientation_sign=orientation_sign,
+		sign=sign,
 		jac_margin=mi.jac_margin,
 	)
 	even_terms = _map_init_local_evenness_terms(
@@ -825,7 +824,7 @@ def _map_init_objective(
 	smooth_loss = smooth_fwd_loss + smooth_rev_loss
 	bend_loss = bend_fwd_loss + bend_rev_loss
 	jac_loss = jac_fwd_loss + jac_rev_loss
-	jac_vals = _map_init_jacobian_values(uv_safe, reg_quad, orientation_sign=orientation_sign)
+	jac_vals = _map_init_jacobian_values(uv_safe, reg_quad, sign=sign)
 	jac_min = jac_vals.min() if jac_vals.numel() else z
 	if jac_vals.numel():
 		jac_bad = jac_vals < float(mi.jac_margin)
@@ -837,13 +836,13 @@ def _map_init_objective(
 	jac_bad_quad_grid = _map_init_jacobian_bad_quad_mask(
 		uv_safe,
 		reg_quad,
-		orientation_sign=orientation_sign,
+		sign=sign,
 		jac_margin=mi.jac_margin,
 	)
 	jac_inv_bad_quad_grid = _map_init_inverse_jacobian_bad_quad_mask(
 		uv_safe,
 		reg_quad,
-		orientation_sign=orientation_sign,
+		sign=sign,
 		jac_margin=mi.jac_margin,
 	)
 	step_bad_quad_grid = _map_init_step_neighbor_bad_quad_mask(

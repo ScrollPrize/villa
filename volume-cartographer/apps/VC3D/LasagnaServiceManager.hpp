@@ -150,6 +150,7 @@ private:
     void upsertLocalUploadJob(const QJsonObject& job);
     void updateLocalUploadJob(const QString& jobId, const QJsonObject& updates);
     void removeLocalUploadJob(const QString& jobId);
+    void updateCachedJobFromStatus(const QJsonObject& status);
     QJsonArray jobsWithLocalUploads(const QJsonArray& serviceJobs) const;
     void emitJobsUpdatedOverlay();
 

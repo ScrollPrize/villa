@@ -19,15 +19,15 @@ from progress_table import (
 from .config import SnapSurfConfig, SnapSurfMapInitConfig, _parse_map_init_config
 from .debug_obj import _debug_obj_safe_label, _write_obj_lines, _write_obj_mesh_2d, _write_obj_mesh_3d_surfaces, _write_obj_points
 from .legacy import (
-	_choose_seed_transform,
 	_closest_external_seed_surface,
 	_closest_model_surface_quad,
 	_closest_point_uv_on_model_quad,
-	_map_init_seed_quad_uv_for_points,
+	_huber,
 )
 from .map_fixture_io import MapFixture, _float_tif, _write_json, load_map_fixture
-from .map_objective import _map_init_objective
+from .map_objective import _map_init_distance_multiplier, _map_init_objective
 from .map_pyramid import (
+	_map_init_coords3,
 	_map_init_dyadic_level_shape,
 	_map_init_dyadic_strides,
 	_map_init_integrate_dyadic_uv_pyramid,
@@ -51,6 +51,60 @@ class GlobalMapStageConfig:
 class GlobalMapConfig:
 	base: dict[str, Any] = field(default_factory=dict)
 	stages: tuple[GlobalMapStageConfig, ...] = ()
+
+
+@dataclass(frozen=True)
+class SeedQuadAffineInitResult:
+	affine: torch.Tensor
+	sign: int
+	ext_quad: tuple[int, int]
+	model_quad: tuple[int, int, int]
+	sampled_count: int
+	hit_count: int
+	kept_count: int
+	rejected_far_count: int
+	model_quad_count: int
+	ext_step_h: float
+	ext_step_w: float
+	model_step_h: float
+	model_step_w: float
+	model_radius_h: int
+	model_radius_w: int
+	seed_uv_rmse: float
+	seed_uv_max: float
+	seed_valid_count: int
+	seed_loss: float
+	seed_dist: float
+	seed_dist_avg: float
+	seed_vec: float
+	seed_norm: float
+
+
+def _lr_warmup_steps(args: dict[str, Any] | None) -> int:
+	args = args or {}
+	raw = args.get("lr_warmup_steps", args.get("warmup_steps", 0))
+	return max(0, int(raw))
+
+
+def _lr_warmup_factor(*, step1: int, warmup_steps: int) -> float:
+	warmup_steps = max(0, int(warmup_steps))
+	if warmup_steps <= 0:
+		return 1.0
+	return min(1.0, max(0.0, float(step1) / float(warmup_steps)))
+
+
+def _capture_optimizer_target_lrs(opt: torch.optim.Optimizer) -> None:
+	for group in opt.param_groups:
+		group.setdefault("_target_lr", float(group.get("lr", 0.0)))
+
+
+def _apply_optimizer_lr_warmup(opt: torch.optim.Optimizer, *, step1: int, warmup_steps: int) -> None:
+	if int(warmup_steps) <= 0:
+		return
+	scale = _lr_warmup_factor(step1=int(step1), warmup_steps=int(warmup_steps))
+	for group in opt.param_groups:
+		target_lr = float(group.setdefault("_target_lr", float(group.get("lr", 0.0))))
+		group["lr"] = target_lr * scale
 
 
 def _public_stage_param(name: str) -> str:
@@ -354,6 +408,68 @@ def _affine_multistart_candidates(
 	return candidates
 
 
+def _affine_seed_grid_cfg(stage: GlobalMapStageConfig) -> dict[str, Any]:
+	init_raw = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
+	grid_raw: Any = {}
+	if isinstance(init_raw, dict):
+		grid_raw = init_raw.get("grid_search", init_raw.get("grid", init_raw.get("candidate_grid", {})))
+	stage_raw = stage.args.get("affine_seed_grid", stage.args.get("affine_seed_quad_grid", {}))
+	cfg: dict[str, Any] = {
+		"enabled": False,
+		"rot_deg": [-10.0, -5.0, 0.0, 5.0, 10.0],
+		"scales": [0.75, 0.9, 1.0, 1.1, 1.25],
+	}
+	for raw in (grid_raw, stage_raw):
+		if isinstance(raw, bool):
+			cfg["enabled"] = bool(raw)
+		elif isinstance(raw, dict):
+			values = dict(raw)
+			if "rotations_deg" in values and "rot_deg" not in values:
+				values["rot_deg"] = values["rotations_deg"]
+			cfg.update(values)
+	return cfg
+
+
+def _float_list(raw: Any, *, name: str) -> list[float]:
+	if isinstance(raw, (int, float)):
+		return [float(raw)]
+	if not isinstance(raw, list):
+		raise ValueError(f"{name} must be a number or list")
+	return [float(v) for v in raw]
+
+
+def _affine_seed_grid_candidates(
+	*,
+	base_affine: torch.Tensor,
+	seed_ext_hw: torch.Tensor,
+	rot_deg: list[float],
+	scales: list[float],
+) -> list[tuple[int | str, float | None, float | None, torch.Tensor]]:
+	device = base_affine.device
+	dtype = base_affine.dtype
+	base = base_affine.to(device=device, dtype=dtype)
+	seed_hw = seed_ext_hw.to(device=device, dtype=dtype)
+	seed_uv = base[:, :2] @ seed_hw + base[:, 2]
+	candidates: list[tuple[int | str, float | None, float | None, torch.Tensor]] = [("seedq", None, None, base.detach().clone())]
+	idx = 0
+	for scale in scales:
+		for deg in rot_deg:
+			if abs(float(deg)) <= 1.0e-12 and abs(float(scale) - 1.0) <= 1.0e-12:
+				continue
+			rad = math.radians(float(deg))
+			c = math.cos(rad)
+			s = math.sin(rad)
+			perturb = torch.tensor(
+				[[float(scale) * c, -float(scale) * s], [float(scale) * s, float(scale) * c]],
+				device=device,
+				dtype=dtype,
+			)
+			linear = perturb @ base[:, :2]
+			candidates.append((idx, float(deg), float(scale), _affine_from_linear(seed_hw, seed_uv, linear)))
+			idx += 1
+	return candidates
+
+
 def _valid_ext_quad(fixture: MapFixture, h: int, w: int) -> bool:
 	Hq, Wq = int(fixture.ext_quad_valid.shape[0]), int(fixture.ext_quad_valid.shape[1])
 	if h < 0 or w < 0 or h >= Hq or w >= Wq:
@@ -397,22 +513,326 @@ def _seed_ext_quad(fixture: MapFixture, seed_hw: torch.Tensor) -> tuple[int, int
 	return None
 
 
-def _affine_from_seed_ext_quads(
+def _quad2_corners(grid: torch.Tensor, quad: tuple[int, int]) -> torch.Tensor:
+	h, w = (int(v) for v in quad)
+	return torch.stack([
+		grid[h, w],
+		grid[h + 1, w],
+		grid[h, w + 1],
+		grid[h + 1, w + 1],
+	], dim=0)
+
+
+def _quad3_corners(grid: torch.Tensor, quad: tuple[int, int, int]) -> torch.Tensor:
+	d, h, w = (int(v) for v in quad)
+	return torch.stack([
+		grid[d, h, w],
+		grid[d, h + 1, w],
+		grid[d, h, w + 1],
+		grid[d, h + 1, w + 1],
+	], dim=0)
+
+
+def _quad_edge_lengths(corners: torch.Tensor) -> tuple[float, float] | None:
+	if not bool(torch.isfinite(corners).all().detach().cpu()):
+		return None
+	h_edges = torch.stack([corners[1] - corners[0], corners[3] - corners[2]], dim=0)
+	w_edges = torch.stack([corners[2] - corners[0], corners[3] - corners[1]], dim=0)
+	h = h_edges.norm(dim=-1).mean()
+	w = w_edges.norm(dim=-1).mean()
+	if not bool(torch.isfinite(h).detach().cpu()) or not bool(torch.isfinite(w).detach().cpu()):
+		return None
+	if float(h.detach().cpu()) <= 1.0e-8 or float(w.detach().cpu()) <= 1.0e-8:
+		return None
+	return float(h.detach().cpu()), float(w.detach().cpu())
+
+
+def _quad_geom_normal(corners: torch.Tensor) -> torch.Tensor | None:
+	if not bool(torch.isfinite(corners).all().detach().cpu()):
+		return None
+	h_axis = 0.5 * ((corners[1] - corners[0]) + (corners[3] - corners[2]))
+	w_axis = 0.5 * ((corners[2] - corners[0]) + (corners[3] - corners[1]))
+	n = torch.linalg.cross(h_axis, w_axis, dim=0)
+	n_norm = n.norm()
+	if not bool(torch.isfinite(n_norm).detach().cpu()) or float(n_norm.detach().cpu()) <= 1.0e-8:
+		return None
+	return n / n_norm
+
+
+def _sign_from_dot(a: torch.Tensor | None, b: torch.Tensor | None, *, fallback: int = 1) -> int:
+	if a is None or b is None:
+		return 1 if int(fallback) >= 0 else -1
+	dot = (a * b).sum()
+	if not bool(torch.isfinite(dot).detach().cpu()):
+		return 1 if int(fallback) >= 0 else -1
+	return 1 if float(dot.detach().cpu()) >= 0.0 else -1
+
+
+def _model_seed_patch_quads(
+	*,
+	model_valid: torch.Tensor,
+	model_quad: tuple[int, int, int],
+	radius_h: int,
+	radius_w: int,
+) -> torch.Tensor:
+	d, h, w = (int(v) for v in model_quad)
+	D, H, W = (int(v) for v in model_valid.shape)
+	if d < 0 or d >= D or H < 2 or W < 2:
+		return torch.empty(0, 3, device=model_valid.device, dtype=torch.long)
+	h0 = max(0, h - max(0, int(radius_h)))
+	h1 = min(H - 2, h + max(0, int(radius_h)))
+	w0 = max(0, w - max(0, int(radius_w)))
+	w1 = min(W - 2, w + max(0, int(radius_w)))
+	if h0 > h1 or w0 > w1:
+		return torch.empty(0, 3, device=model_valid.device, dtype=torch.long)
+	quad_valid = (
+		model_valid[d, h0:h1 + 2, w0:w1 + 2][:-1, :-1]
+		& model_valid[d, h0:h1 + 2, w0:w1 + 2][1:, :-1]
+		& model_valid[d, h0:h1 + 2, w0:w1 + 2][:-1, 1:]
+		& model_valid[d, h0:h1 + 2, w0:w1 + 2][1:, 1:]
+	)
+	local = quad_valid.nonzero(as_tuple=False)
+	if local.numel() == 0:
+		return torch.empty(0, 3, device=model_valid.device, dtype=torch.long)
+	out = torch.empty(local.shape[0], 3, device=model_valid.device, dtype=torch.long)
+	out[:, 0] = int(d)
+	out[:, 1] = local[:, 0] + int(h0)
+	out[:, 2] = local[:, 1] + int(w0)
+	return out
+
+
+def _model_patch_triangles(
+	*,
+	model_xyz: torch.Tensor,
+	patch_quads: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	if patch_quads.numel() == 0:
+		empty_tri = torch.empty(0, 3, 3, device=model_xyz.device, dtype=model_xyz.dtype)
+		empty_uv = torch.empty(0, 3, 2, device=model_xyz.device, dtype=model_xyz.dtype)
+		return empty_tri, empty_uv
+	d = patch_quads[:, 0]
+	h = patch_quads[:, 1]
+	w = patch_quads[:, 2]
+	p00 = model_xyz[d, h, w]
+	p10 = model_xyz[d, h + 1, w]
+	p01 = model_xyz[d, h, w + 1]
+	p11 = model_xyz[d, h + 1, w + 1]
+	tri = torch.cat([
+		torch.stack([p00, p10, p11], dim=1),
+		torch.stack([p00, p11, p01], dim=1),
+	], dim=0)
+	h_f = h.to(dtype=model_xyz.dtype)
+	w_f = w.to(dtype=model_xyz.dtype)
+	uv00 = torch.stack([h_f, w_f], dim=-1)
+	uv10 = torch.stack([h_f + 1.0, w_f], dim=-1)
+	uv01 = torch.stack([h_f, w_f + 1.0], dim=-1)
+	uv11 = torch.stack([h_f + 1.0, w_f + 1.0], dim=-1)
+	uv = torch.cat([
+		torch.stack([uv00, uv10, uv11], dim=1),
+		torch.stack([uv00, uv11, uv01], dim=1),
+	], dim=0)
+	finite = torch.isfinite(tri).all(dim=(1, 2))
+	return tri[finite], uv[finite]
+
+
+def _ray_triangle_intersections(
+	origin: torch.Tensor,
+	direction: torch.Tensor,
+	tri: torch.Tensor,
+	tri_uv: torch.Tensor,
+	*,
+	eps: float = 1.0e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	if tri.numel() == 0:
+		return (
+			torch.empty(0, device=origin.device, dtype=origin.dtype),
+			torch.empty(0, 2, device=origin.device, dtype=origin.dtype),
+		)
+	v0 = tri[:, 0]
+	v1 = tri[:, 1]
+	v2 = tri[:, 2]
+	e1 = v1 - v0
+	e2 = v2 - v0
+	pvec = torch.linalg.cross(direction.view(1, 3).expand_as(e2), e2, dim=-1)
+	det = (e1 * pvec).sum(dim=-1)
+	det_ok = det.abs() > float(eps)
+	inv_det = torch.where(det_ok, det.reciprocal(), torch.zeros_like(det))
+	tvec = origin.view(1, 3) - v0
+	u = (tvec * pvec).sum(dim=-1) * inv_det
+	qvec = torch.linalg.cross(tvec, e1, dim=-1)
+	v = (direction.view(1, 3) * qvec).sum(dim=-1) * inv_det
+	t = (e2 * qvec).sum(dim=-1) * inv_det
+	ok = (
+		det_ok &
+		torch.isfinite(t) &
+		torch.isfinite(u) &
+		torch.isfinite(v) &
+		(t >= -float(eps)) &
+		(u >= -float(eps)) &
+		(v >= -float(eps)) &
+		((u + v) <= 1.0 + float(eps))
+	)
+	if not bool(ok.any().detach().cpu()):
+		return (
+			torch.empty(0, device=origin.device, dtype=origin.dtype),
+			torch.empty(0, 2, device=origin.device, dtype=origin.dtype),
+		)
+	w = 1.0 - u - v
+	bary = torch.stack([w, u, v], dim=-1)
+	uv = (bary.unsqueeze(-1) * tri_uv).sum(dim=1)
+	return t[ok], uv[ok]
+
+
+def _seed_quad_sample_grid(
+	*,
+	ext_quad: tuple[int, int],
+	ext_xyz: torch.Tensor,
+	ext_normals: torch.Tensor,
+	samples: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	n = max(2, int(samples))
+	h, w = (int(v) for v in ext_quad)
+	lin = torch.linspace(0.0, 1.0, n, device=ext_xyz.device, dtype=ext_xyz.dtype)
+	fh, fw = torch.meshgrid(lin, lin, indexing="ij")
+	hw = torch.stack([fh + float(h), fw + float(w)], dim=-1).reshape(n * n, 2)
+	p00 = ext_xyz[h, w]
+	p10 = ext_xyz[h + 1, w]
+	p01 = ext_xyz[h, w + 1]
+	p11 = ext_xyz[h + 1, w + 1]
+	n00 = ext_normals[h, w]
+	n10 = ext_normals[h + 1, w]
+	n01 = ext_normals[h, w + 1]
+	n11 = ext_normals[h + 1, w + 1]
+	fh_f = fh.reshape(n * n, 1)
+	fw_f = fw.reshape(n * n, 1)
+	points = (
+		(1.0 - fh_f) * (1.0 - fw_f) * p00 +
+		fh_f * (1.0 - fw_f) * p10 +
+		(1.0 - fh_f) * fw_f * p01 +
+		fh_f * fw_f * p11
+	)
+	normals = (
+		(1.0 - fh_f) * (1.0 - fw_f) * n00 +
+		fh_f * (1.0 - fw_f) * n10 +
+		(1.0 - fh_f) * fw_f * n01 +
+		fh_f * fw_f * n11
+	)
+	normals = torch.nn.functional.normalize(normals, dim=-1, eps=1.0e-8)
+	return hw, points, normals
+
+
+def _seed_quad_affine_cfg(raw: Any) -> dict[str, Any]:
+	if isinstance(raw, dict):
+		return dict(raw)
+	return {}
+
+
+def _seed_quad_affine_sample_terms(
+	*,
+	affine: torch.Tensor,
+	ext_hw: torch.Tensor,
+	target_uv: torch.Tensor,
+	ext_points: torch.Tensor,
+	ext_normals: torch.Tensor,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	sign: int,
+) -> dict[str, float]:
+	x = torch.cat(
+		[ext_hw.to(device=affine.device, dtype=affine.dtype), torch.ones((int(ext_hw.shape[0]), 1), device=affine.device, dtype=affine.dtype)],
+		dim=1,
+	)
+	pred_uv = x @ affine.transpose(0, 1)
+	target_uv = target_uv.to(device=pred_uv.device, dtype=pred_uv.dtype)
+	uv_err = pred_uv - target_uv
+	uv_finite = torch.isfinite(uv_err).all(dim=-1)
+	if bool(uv_finite.any().detach().cpu()):
+		uv_norm = uv_err[uv_finite].norm(dim=-1)
+		uv_rmse = math.sqrt(float(uv_norm.square().mean().detach().cpu()))
+		uv_max = float(uv_norm.max().detach().cpu())
+	else:
+		uv_rmse = float("nan")
+		uv_max = float("nan")
+	depth = int(fixture.metadata.get("model_depth", 0) or 0)
+	coords3 = _map_init_coords3(pred_uv, depth=depth)
+	safe_coords = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
+	p_model = _sample_surface_grid(fixture.model_xyz, safe_coords)
+	n_model_raw = _sample_surface_grid(fixture.model_normals, safe_coords)
+	n_ext = torch.nn.functional.normalize(ext_normals.to(device=pred_uv.device, dtype=pred_uv.dtype), dim=-1, eps=1.0e-8)
+	n_model = torch.nn.functional.normalize(n_model_raw, dim=-1, eps=1.0e-8) * (1.0 if int(sign) >= 0 else -1.0)
+	coord_ok = _quad_valid_at_coords(fixture.model_valid.bool(), safe_coords, tuple(int(v) for v in fixture.model_valid.shape))
+	p_ext = ext_points.to(device=pred_uv.device, dtype=pred_uv.dtype)
+	v = p_model - p_ext
+	d = v.norm(dim=-1)
+	u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
+	c_ext = (u * n_ext).sum(dim=-1)
+	c_model = (u * n_model).sum(dim=-1)
+	c_norm = (n_ext * n_model).sum(dim=-1)
+	dist_values = _huber(d, delta=stage_cfg.huber_delta) * _map_init_distance_multiplier(c_ext, c_model, stage_cfg.map_init)
+	vec_values = (1.0 - c_ext) + (1.0 - c_model)
+	norm_values = 1.0 - c_norm
+	valid = (
+		coord_ok &
+		torch.isfinite(p_ext).all(dim=-1) &
+		torch.isfinite(p_model).all(dim=-1) &
+		torch.isfinite(n_ext).all(dim=-1) &
+		torch.isfinite(n_model_raw).all(dim=-1) &
+		torch.isfinite(n_model).all(dim=-1) &
+		(n_ext.norm(dim=-1) > 1.0e-8) &
+		(n_model.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(dist_values) &
+		torch.isfinite(vec_values) &
+		torch.isfinite(norm_values)
+	)
+	if not bool(valid.any().detach().cpu()):
+		return {
+			"uv_rmse": uv_rmse,
+			"uv_max": uv_max,
+			"valid": 0.0,
+			"loss": float("nan"),
+			"dist": float("nan"),
+			"dist_avg": float("nan"),
+			"vec": float("nan"),
+			"norm": float("nan"),
+		}
+	dist = float(dist_values[valid].mean().detach().cpu())
+	vec = float(vec_values[valid].mean().detach().cpu())
+	norm = float(norm_values[valid].mean().detach().cpu())
+	loss = (
+		float(stage_cfg.map_init.w_dist) * dist +
+		float(stage_cfg.map_init.w_vec_normal) * vec +
+		float(stage_cfg.map_init.w_surface_normal) * norm
+	)
+	return {
+		"uv_rmse": uv_rmse,
+		"uv_max": uv_max,
+		"valid": float(int(valid.sum().detach().cpu())),
+		"loss": loss,
+		"dist": dist,
+		"dist_avg": float(d[valid].mean().detach().cpu()),
+		"vec": vec,
+		"norm": norm,
+	}
+
+
+def _seed_quad_affine_init_result(
 	*,
 	fixture: MapFixture,
 	stage_cfg: SnapSurfConfig,
 	seed_hw: torch.Tensor,
 	seed_model_uv: torch.Tensor,
-) -> torch.Tensor | None:
+	raw: Any = None,
+) -> SeedQuadAffineInitResult | None:
+	cfg = _seed_quad_affine_cfg(raw)
+	samples = max(2, int(cfg.get("samples", cfg.get("sample_grid", 16))))
+	max_distance = float(cfg.get("max_ray_distance", cfg.get("max_intersection_distance", 100.0)))
+	safety_margin = max(0, int(cfg.get("model_patch_margin", cfg.get("safety_margin", 2))))
 	raw_quad = fixture.metadata.get("seed_model_quad")
 	raw_seed = fixture.metadata.get("seed_xyz")
 	if not (isinstance(raw_quad, (list, tuple)) and len(raw_quad) == 3 and isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3):
 		return None
 	model_quad = (int(raw_quad[0]), int(raw_quad[1]), int(raw_quad[2]))
 	seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
-	ext_quad = _seed_ext_quad(fixture, seed_hw)
-	if ext_quad is None:
-		return None
 	seed_ext_quad, seed_ext_point, _seed_ext_dist = _closest_external_seed_surface(
 		seed=seed,
 		ext_xyz=fixture.ext_xyz,
@@ -421,49 +841,216 @@ def _affine_from_seed_ext_quads(
 	)
 	if seed_ext_quad is None or seed_ext_point is None:
 		return None
-	transform, _transform_sign = _choose_seed_transform(
-		model_xyz=fixture.model_xyz,
-		ext_xyz=fixture.ext_xyz,
+	if _seed_ext_quad(fixture, seed_hw) is None:
+		return None
+	ext_corners = _quad2_corners(fixture.ext_xyz, seed_ext_quad)
+	model_corners = _quad3_corners(fixture.model_xyz, model_quad)
+	ext_steps = _quad_edge_lengths(ext_corners)
+	model_steps = _quad_edge_lengths(model_corners)
+	ext_normal = _quad_geom_normal(ext_corners)
+	model_normal = _quad_geom_normal(model_corners)
+	if ext_steps is None or model_steps is None or ext_normal is None or model_normal is None:
+		return None
+	ext_h, ext_w = ext_steps
+	model_h, model_w = model_steps
+	sign = _sign_from_dot(model_normal, ext_normal, fallback=1)
+	radius_h = max(1, int(math.ceil(ext_h / max(model_h, 1.0e-8)))) + safety_margin
+	radius_w = max(1, int(math.ceil(ext_w / max(model_w, 1.0e-8)))) + safety_margin
+	patch_quads = _model_seed_patch_quads(
+		model_valid=fixture.model_valid.bool(),
 		model_quad=model_quad,
-		ext_quad=seed_ext_quad,
-		cfg=stage_cfg,
+		radius_h=radius_h,
+		radius_w=radius_w,
 	)
-	seen: set[tuple[int, int]] = set()
-	coords: list[tuple[int, int]] = []
-	h, w = seed_ext_quad
-	for dh, dw in ((0, 0), (1, 0), (0, 1), (1, 1)):
-		key = (h + dh, w + dw)
-		if key in seen:
+	tri, tri_uv = _model_patch_triangles(model_xyz=fixture.model_xyz, patch_quads=patch_quads)
+	if tri.numel() == 0:
+		return None
+	ext_hw, ext_points, ext_sample_normals = _seed_quad_sample_grid(
+		ext_quad=seed_ext_quad,
+		ext_xyz=fixture.ext_xyz,
+		ext_normals=fixture.ext_normals,
+		samples=samples,
+	)
+	model_seed_point, _model_seed_uv, _model_seed_dist = _closest_point_uv_on_model_quad(
+		point=seed,
+		model_xyz=fixture.model_xyz,
+		model_quad=model_quad,
+	)
+	if bool(torch.isfinite(model_seed_point).all().detach().cpu()) and bool(torch.isfinite(seed_ext_point).all().detach().cpu()):
+		to_model = model_seed_point.to(device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype) - seed_ext_point
+	else:
+		to_model = model_corners.mean(dim=0) - ext_corners.mean(dim=0)
+	ray_dirs = ext_sample_normals
+	avg_dir = ray_dirs[torch.isfinite(ray_dirs).all(dim=-1)].mean(dim=0)
+	if not bool(torch.isfinite(avg_dir).all().detach().cpu()) or float(avg_dir.norm().detach().cpu()) <= 1.0e-8:
+		avg_dir = ext_normal
+	if float((to_model * avg_dir).sum().detach().cpu()) < 0.0:
+		ray_dirs = -ray_dirs
+	kept_hw: list[torch.Tensor] = []
+	kept_uv: list[torch.Tensor] = []
+	kept_points: list[torch.Tensor] = []
+	kept_normals: list[torch.Tensor] = []
+	hit_count = 0
+	rejected_far = 0
+	for i in range(int(ext_points.shape[0])):
+		p = ext_points[i]
+		direction = ray_dirs[i]
+		if (
+			not bool(torch.isfinite(p).all().detach().cpu()) or
+			not bool(torch.isfinite(direction).all().detach().cpu()) or
+			float(direction.norm().detach().cpu()) <= 1.0e-8
+		):
 			continue
-		seen.add(key)
-		coords.append(key)
-	if len(coords) < 3:
+		direction = torch.nn.functional.normalize(direction, dim=0, eps=1.0e-8)
+		t, uv = _ray_triangle_intersections(p, direction, tri, tri_uv)
+		if t.numel() == 0:
+			continue
+		dist = t.abs()
+		best = int(torch.argmin(dist).detach().cpu())
+		best_dist = float(dist[best].detach().cpu())
+		hit_count += 1
+		if best_dist > max_distance:
+			rejected_far += 1
+			continue
+		best_uv = uv[best]
+		if not bool(torch.isfinite(best_uv).all().detach().cpu()):
+			continue
+		kept_hw.append(ext_hw[i])
+		kept_uv.append(best_uv)
+		kept_points.append(p)
+		kept_normals.append(ext_sample_normals[i])
+	if len(kept_hw) < 3:
+		print(
+			f"[snap_surf.map_global] affine seed quad ray init unavailable "
+			f"ext_quad={seed_ext_quad} model_quad={model_quad} samples={samples * samples} "
+			f"hits={hit_count} kept={len(kept_hw)} rejected_far={rejected_far} "
+			f"model_quads={int(patch_quads.shape[0])}",
+			flush=True,
+		)
 		return None
-	ext_hw = torch.tensor(coords, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
-	points = fixture.ext_xyz[ext_hw[:, 0].long(), ext_hw[:, 1].long()]
-	uv, ok, _reason = _map_init_seed_quad_uv_for_points(
-		points,
-		ext_xyz=fixture.ext_xyz,
-		model_xyz=fixture.model_xyz,
-		ext_quad=seed_ext_quad,
-		model_quad=model_quad,
-		transform=transform,
-		ext_anchor=seed_ext_point.to(device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype),
-		model_anchor_uv=seed_model_uv.to(device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype),
-	)
-	valid = ok & torch.isfinite(ext_hw).all(dim=-1) & torch.isfinite(uv).all(dim=-1)
-	if int(valid.sum().detach().cpu()) < 3:
-		return None
-	x = torch.cat([ext_hw[valid], torch.ones((int(valid.sum().detach().cpu()), 1), device=ext_hw.device, dtype=ext_hw.dtype)], dim=1)
-	y = uv[valid]
+	x_hw = torch.stack(kept_hw, dim=0)
+	y_uv = torch.stack(kept_uv, dim=0)
+	y_points = torch.stack(kept_points, dim=0)
+	y_normals = torch.stack(kept_normals, dim=0)
+	x = torch.cat([x_hw, torch.ones((len(kept_hw), 1), device=x_hw.device, dtype=x_hw.dtype)], dim=1)
 	try:
-		sol = torch.linalg.lstsq(x, y).solution
+		sol = torch.linalg.lstsq(x, y_uv).solution
 	except RuntimeError:
 		return None
 	affine = sol.transpose(0, 1).contiguous()
 	if not bool(torch.isfinite(affine).all().detach().cpu()):
 		return None
-	return affine
+	sample_terms = _seed_quad_affine_sample_terms(
+		affine=affine,
+		ext_hw=x_hw,
+		target_uv=y_uv,
+		ext_points=y_points,
+		ext_normals=y_normals,
+		fixture=fixture,
+		stage_cfg=stage_cfg,
+		sign=sign,
+	)
+	print(
+		f"[snap_surf.map_global] affine seed quad ray init "
+		f"ext_quad={seed_ext_quad} model_quad={model_quad} "
+		f"sign={sign} "
+		f"ext_step=({ext_h:.6g},{ext_w:.6g}) model_step=({model_h:.6g},{model_w:.6g}) "
+		f"model_radius=({radius_h},{radius_w}) model_quads={int(patch_quads.shape[0])} "
+		f"samples={samples * samples} hits={hit_count} kept={len(kept_hw)} rejected_far={rejected_far}",
+		flush=True,
+	)
+	print(
+		f"[snap_surf.map_global] affine seed quad fitted matrix "
+		f"a00={float(affine[0, 0].detach().cpu()):.9g} "
+		f"a01={float(affine[0, 1].detach().cpu()):.9g} "
+		f"a02={float(affine[0, 2].detach().cpu()):.9g} "
+		f"a10={float(affine[1, 0].detach().cpu()):.9g} "
+		f"a11={float(affine[1, 1].detach().cpu()):.9g} "
+		f"a12={float(affine[1, 2].detach().cpu()):.9g}",
+		flush=True,
+	)
+	print(
+		f"[snap_surf.map_global] affine seed quad 16x16 loss "
+		f"valid={int(sample_terms['valid'])}/{len(kept_hw)} "
+		f"loss={sample_terms['loss']:.6g} "
+		f"dist={sample_terms['dist']:.6g} dist_avg={sample_terms['dist_avg']:.6g} "
+		f"vec={sample_terms['vec']:.6g} norm={sample_terms['norm']:.6g} "
+		f"uv_rmse={sample_terms['uv_rmse']:.6g} uv_max={sample_terms['uv_max']:.6g}",
+		flush=True,
+	)
+	return SeedQuadAffineInitResult(
+		affine=affine,
+		sign=sign,
+		ext_quad=seed_ext_quad,
+		model_quad=model_quad,
+		sampled_count=samples * samples,
+		hit_count=hit_count,
+		kept_count=len(kept_hw),
+		rejected_far_count=rejected_far,
+		model_quad_count=int(patch_quads.shape[0]),
+		ext_step_h=ext_h,
+		ext_step_w=ext_w,
+		model_step_h=model_h,
+		model_step_w=model_w,
+		model_radius_h=radius_h,
+		model_radius_w=radius_w,
+		seed_uv_rmse=float(sample_terms["uv_rmse"]),
+		seed_uv_max=float(sample_terms["uv_max"]),
+		seed_valid_count=int(sample_terms["valid"]),
+		seed_loss=float(sample_terms["loss"]),
+		seed_dist=float(sample_terms["dist"]),
+		seed_dist_avg=float(sample_terms["dist_avg"]),
+		seed_vec=float(sample_terms["vec"]),
+		seed_norm=float(sample_terms["norm"]),
+	)
+
+
+def _apply_seed_quad_init_metadata(fixture: MapFixture, result: SeedQuadAffineInitResult) -> None:
+	fixture.metadata["sign"] = int(result.sign)
+	fixture.metadata["seed_quad_init"] = {
+		"ext_quad": [int(v) for v in result.ext_quad],
+		"model_quad": [int(v) for v in result.model_quad],
+		"sign": int(result.sign),
+		"samples": int(result.sampled_count),
+		"hits": int(result.hit_count),
+		"kept": int(result.kept_count),
+		"rejected_far": int(result.rejected_far_count),
+		"model_quads": int(result.model_quad_count),
+		"ext_step_h": float(result.ext_step_h),
+		"ext_step_w": float(result.ext_step_w),
+		"model_step_h": float(result.model_step_h),
+		"model_step_w": float(result.model_step_w),
+		"model_radius_h": int(result.model_radius_h),
+		"model_radius_w": int(result.model_radius_w),
+		"seed_loss": float(result.seed_loss),
+		"seed_dist": float(result.seed_dist),
+		"seed_dist_avg": float(result.seed_dist_avg),
+		"seed_vec": float(result.seed_vec),
+		"seed_norm": float(result.seed_norm),
+		"seed_uv_rmse": float(result.seed_uv_rmse),
+		"seed_uv_max": float(result.seed_uv_max),
+		"seed_valid": int(result.seed_valid_count),
+	}
+
+
+def _affine_from_seed_ext_quads(
+	*,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	seed_hw: torch.Tensor,
+	seed_model_uv: torch.Tensor,
+	raw: Any = None,
+) -> torch.Tensor | None:
+	result = _seed_quad_affine_init_result(
+		fixture=fixture,
+		stage_cfg=stage_cfg,
+		seed_hw=seed_hw,
+		seed_model_uv=seed_model_uv,
+		raw=raw,
+	)
+	if result is None:
+		return None
+	return result.affine
 
 
 def _is_affine_init_scan(stage: GlobalMapStageConfig) -> bool:
@@ -509,12 +1096,15 @@ def _optimize_affine_candidate(
 	w_station: float,
 	steps: int,
 	lr: float,
+	cancel_fn=None,
 ) -> tuple[float, torch.Tensor]:
 	with torch.no_grad():
 		affine_model.affine.copy_(candidate)
 	opt = torch.optim.Adam([affine_model.affine], lr=float(lr)) if int(steps) > 0 else None
 	last_loss = float("inf")
 	for _ in range(max(1, int(steps))):
+		if cancel_fn is not None:
+			cancel_fn()
 		if opt is not None:
 			opt.zero_grad(set_to_none=True)
 		uv = affine_model()
@@ -675,6 +1265,85 @@ def _print_affine_diag_row(widths: dict[str, int], values: dict[str, str]) -> No
 	print(progress_row(_AFFINE_DIAG_COLUMNS, widths, values), flush=True)
 
 
+def _select_affine_seed_grid_candidate(
+	*,
+	base_affine: torch.Tensor,
+	stage: GlobalMapStageConfig,
+	affine_model: AffineMapModel,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	seed_hw: torch.Tensor,
+	station_target: torch.Tensor,
+	w_station: float,
+	cancel_fn=None,
+) -> tuple[torch.Tensor, float]:
+	cfg = _affine_seed_grid_cfg(stage)
+	if not bool(cfg.get("enabled", True)):
+		return base_affine.detach().clone(), float("nan")
+	rot_deg = _float_list(cfg.get("rot_deg", cfg.get("rotations_deg", [-10.0, -5.0, 0.0, 5.0, 10.0])), name="affine_seed_grid rot_deg")
+	scales = _float_list(cfg.get("scales", [0.75, 0.9, 1.0, 1.1, 1.25]), name="affine_seed_grid scales")
+	candidates = _affine_seed_grid_candidates(
+		base_affine=base_affine,
+		seed_ext_hw=seed_hw,
+		rot_deg=rot_deg,
+		scales=scales,
+	)
+	if not candidates:
+		return base_affine.detach().clone(), float("nan")
+	base_loss, _base_terms, _base_err, base_scored = _score_affine_tensor(
+		base_affine,
+		affine_model=affine_model,
+		fixture=fixture,
+		stage_cfg=stage_cfg,
+		seed_hw=seed_hw,
+		station_target=station_target,
+		w_station=w_station,
+	)
+	best_loss = base_loss if math.isfinite(base_loss) else float("inf")
+	best_idx: int | str = "seedq"
+	best_affine = base_scored
+	widths = _affine_diag_widths()
+	_print_affine_diag_header("affine seed quad grid", widths)
+	for cand_idx, rot, scale, cand in candidates:
+		if cancel_fn is not None:
+			cancel_fn()
+		loss, terms, err, scored_affine = _score_affine_tensor(
+			cand,
+			affine_model=affine_model,
+			fixture=fixture,
+			stage_cfg=stage_cfg,
+			seed_hw=seed_hw,
+			station_target=station_target,
+			w_station=w_station,
+		)
+		_print_affine_diag_row(
+			widths,
+			_affine_diag_values(
+				idx=cand_idx,
+				rot=rot,
+				scale=scale,
+				initial_loss=base_loss,
+				final_loss=loss,
+				terms=terms,
+				err=err,
+				initial_affine_tensor=base_affine,
+				affine_tensor=scored_affine,
+			),
+		)
+		if math.isfinite(loss) and loss < best_loss:
+			best_loss = loss
+			best_idx = cand_idx
+			best_affine = scored_affine
+	with torch.no_grad():
+		affine_model.affine.copy_(best_affine)
+	print(
+		f"[snap_surf.map_global] affine seed quad grid candidates={len(candidates)} "
+		f"best_idx={best_idx} base_loss={base_loss:.6g} best_loss={best_loss:.6g}",
+		flush=True,
+	)
+	return best_affine.detach().clone(), best_loss
+
+
 def _fit_reference_affine(fixture: MapFixture) -> tuple[torch.Tensor, float] | None:
 	ref = fixture.reference_uv
 	valid = torch.isfinite(ref).all(dim=-1)
@@ -752,10 +1421,11 @@ def _run_affine_multistart(
 	seed_hw: torch.Tensor,
 	station_target: torch.Tensor,
 	w_station: float,
-) -> None:
+	cancel_fn=None,
+) -> SeedQuadAffineInitResult | None:
 	cfg = _affine_multistart_cfg(cfg_global, stage)
 	if not bool(cfg.get("enabled", False)):
-		return
+		return None
 	rot_raw = cfg.get("rot_deg", cfg.get("rotations_deg", [-30.0, -15.0, 0.0, 15.0, 30.0]))
 	scale_raw = cfg.get("scales", [0.75, 1.0, 1.25])
 	if not isinstance(rot_raw, list) or not isinstance(scale_raw, list):
@@ -772,27 +1442,32 @@ def _run_affine_multistart(
 		scales=scales,
 	)
 	seed_quad_cfg = cfg.get("seed_quad_affine", True)
+	seed_quad_result: SeedQuadAffineInitResult | None = None
 	if isinstance(seed_quad_cfg, dict):
 		seed_quad_enabled = bool(seed_quad_cfg.get("enabled", True))
 	else:
 		seed_quad_enabled = bool(seed_quad_cfg)
 	if seed_quad_enabled:
-		seed_quad_affine = _affine_from_seed_ext_quads(
+		seed_quad_result = _seed_quad_affine_init_result(
 			fixture=fixture,
 			stage_cfg=stage_cfg,
 			seed_hw=seed_hw,
 			seed_model_uv=seed_model_uv,
+			raw=seed_quad_cfg,
 		)
-		if seed_quad_affine is not None:
-			candidates.insert(0, ("seedq", None, None, seed_quad_affine))
+		if seed_quad_result is not None:
+			_apply_seed_quad_init_metadata(fixture, seed_quad_result)
+			candidates.insert(0, ("seedq", None, None, seed_quad_result.affine))
 	if not candidates:
-		return
+		return seed_quad_result
 	start_affine = affine.affine.detach().clone()
 	best_loss = float("inf")
 	best_affine = start_affine
 	widths = _affine_diag_widths()
 	_print_affine_diag_header("affine multistart", widths)
 	for cand_idx, rot, scale, cand in candidates:
+		if cancel_fn is not None:
+			cancel_fn()
 		initial_loss, _initial_terms, _initial_err, _initial_affine = _score_affine_tensor(
 			cand,
 			affine_model=affine,
@@ -812,6 +1487,7 @@ def _run_affine_multistart(
 			w_station=w_station,
 			steps=steps,
 			lr=lr,
+			cancel_fn=cancel_fn,
 		)
 		final_loss, final_terms, final_err, final_affine = _score_affine_tensor(
 			value,
@@ -848,6 +1524,7 @@ def _run_affine_multistart(
 		f"steps={steps} best_loss={best_loss:.6g}",
 		flush=True,
 	)
+	return seed_quad_result
 
 
 def _run_affine_seed_quad_init(
@@ -875,16 +1552,19 @@ def _run_affine_seed_quad_init(
 		steps = max(0, int(stage.steps))
 		lr = float(stage.lr)
 	seed_model_uv = _seed_model_uv(fixture, seed_hw)
-	candidate = _affine_from_seed_ext_quads(
+	seed_result = _seed_quad_affine_init_result(
 		fixture=fixture,
 		stage_cfg=stage_cfg,
 		seed_hw=seed_hw,
 		seed_model_uv=seed_model_uv,
+		raw=raw,
 	)
-	if candidate is None:
+	if seed_result is None:
 		print("[snap_surf.map_global] affine seed quad init unavailable", flush=True)
 		return 0
-	initial_loss, _initial_terms, _initial_err, _initial_affine = _score_affine_tensor(
+	_apply_seed_quad_init_metadata(fixture, seed_result)
+	candidate = seed_result.affine
+	seed_loss, _initial_terms, _initial_err, _initial_affine = _score_affine_tensor(
 		candidate,
 		affine_model=affine,
 		fixture=fixture,
@@ -893,6 +1573,18 @@ def _run_affine_seed_quad_init(
 		station_target=station_target,
 		w_station=w_station,
 	)
+	candidate, initial_loss = _select_affine_seed_grid_candidate(
+		base_affine=candidate,
+		stage=stage,
+		affine_model=affine,
+		fixture=fixture,
+		stage_cfg=stage_cfg,
+		seed_hw=seed_hw,
+		station_target=station_target,
+		w_station=w_station,
+	)
+	if not math.isfinite(initial_loss):
+		initial_loss = seed_loss
 	with torch.no_grad():
 		affine.affine.copy_(candidate)
 	opt = torch.optim.Adam([affine.affine], lr=float(lr)) if steps > 0 else None
@@ -1093,8 +1785,7 @@ def _objective_for_uv(
 		model_valid=fixture.model_valid,
 		model_normals=fixture.model_normals,
 		model_depth=int(fixture.metadata.get("model_depth", 0) or 0),
-		normal_sign=int(fixture.metadata.get("normal_sign", 1) or 1),
-		orientation_sign=int(fixture.metadata.get("orientation_sign", 1) or 1),
+		sign=int(fixture.metadata.get("sign", 1) or 1),
 		cfg=cfg,
 		allow_partial_model_samples=True,
 	)
@@ -1345,13 +2036,13 @@ def _fixture_from_live_tensors(
 	ext_normals: torch.Tensor,
 	ext_quad_valid: torch.Tensor,
 	seed_xyz: tuple[float, float, float] | None,
+	sign: int = 1,
 ) -> MapFixture:
 	device = model_xyz.device
 	dtype = model_xyz.dtype
 	metadata: dict[str, Any] = {
 		"model_depth": 0,
-		"normal_sign": 1,
-		"orientation_sign": 1,
+		"sign": int(sign),
 	}
 	if seed_xyz is not None:
 		seed = torch.tensor(seed_xyz, device=device, dtype=dtype)
@@ -1411,6 +2102,7 @@ class GlobalMapRuntime:
 		self.last: dict[str, float] = {}
 		self.steps_run = 0
 		self._snap_loss_mode_printed: set[tuple[str, float]] = set()
+		self.sign = 1
 
 	def _ensure_models(self, fixture: MapFixture, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
 		device = fixture.model_xyz.device
@@ -1468,6 +2160,8 @@ class GlobalMapRuntime:
 		ext_quad_valid: torch.Tensor,
 		persistent_optimizer: bool = False,
 		status_fn=None,
+		cancel_fn=None,
+		auto_stop_fn=None,
 	) -> dict[str, float]:
 		fixture = _fixture_from_live_tensors(
 			model_xyz=model_xyz,
@@ -1478,6 +2172,7 @@ class GlobalMapRuntime:
 			ext_normals=ext_normals,
 			ext_quad_valid=ext_quad_valid,
 			seed_xyz=self.seed_xyz,
+			sign=self.sign,
 		)
 		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
@@ -1487,17 +2182,33 @@ class GlobalMapRuntime:
 		station_target = self.station_target if self.station_target is not None else self.affine.eval_at(seed_hw).detach()
 		w_station = _stage_station_weight(self.cfg_global, stage)
 		if _is_affine_seed_quad_init(stage):
-			candidate = _affine_from_seed_ext_quads(
+			raw_seed = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
+			seed_result = _seed_quad_affine_init_result(
 				fixture=fixture,
 				stage_cfg=stage_cfg,
 				seed_hw=seed_hw,
 				seed_model_uv=_seed_model_uv(fixture, seed_hw),
+				raw=raw_seed,
 			)
-			if candidate is not None:
+			if seed_result is not None:
+				_apply_seed_quad_init_metadata(fixture, seed_result)
+				self.sign = int(seed_result.sign)
+				candidate = seed_result.affine
+				candidate, _grid_loss = _select_affine_seed_grid_candidate(
+					base_affine=candidate,
+					stage=stage,
+					affine_model=self.affine,
+					fixture=fixture,
+					stage_cfg=stage_cfg,
+					seed_hw=seed_hw,
+					station_target=station_target,
+					w_station=w_station,
+					cancel_fn=cancel_fn,
+				)
 				with torch.no_grad():
 					self.affine.affine.copy_(candidate)
 		if _is_affine_init_scan(stage):
-			_run_affine_multistart(
+			seed_result = _run_affine_multistart(
 				cfg_global=self.cfg_global,
 				stage=stage,
 				affine=self.affine,
@@ -1506,7 +2217,10 @@ class GlobalMapRuntime:
 				seed_hw=seed_hw,
 				station_target=station_target,
 				w_station=w_station,
+				cancel_fn=cancel_fn,
 			)
+			if seed_result is not None:
+				self.sign = int(seed_result.sign)
 		def _stats_for_current_uv() -> dict[str, float]:
 			with torch.no_grad():
 				loss_f, terms, err = _global_progress_state(
@@ -1541,35 +2255,60 @@ class GlobalMapRuntime:
 
 		params, level = self._params_for_stage(stage)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		initial_stats = _stats_for_current_uv()
 		if status_fn is not None:
-			status_fn(step=0, total=int(stage.steps), stats=_stats_for_current_uv())
+			status_fn(step=0, total=int(stage.steps), stats=initial_stats)
+		auto_loss_history = (
+			[float(initial_stats["snaps_map_loss"])]
+			if auto_stop_fn is not None and lr_warmup_steps <= 0 else []
+		)
+		steps_completed = 0
+		auto_stopped = False
 		if params and int(stage.steps) > 0:
 			key = (tuple(stage.params), int(level), float(stage.lr), int(stage.min_scaledown))
 			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
 				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
+				_capture_optimizer_target_lrs(self.optimizer)
 				self.optimizer_key = key
 			opt = self.optimizer
 			assert opt is not None
 			for _ in range(int(stage.steps)):
+				if cancel_fn is not None:
+					cancel_fn()
 				opt.zero_grad(set_to_none=True)
 				uv = self._uv()
 				loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
 				if w_station > 0.0:
 					loss = loss + w_station * _station_loss(uv, seed_hw, station_target)
 				loss.backward()
+				warmup_step1 = self.steps_run + 1 if persistent_optimizer else _ + 1
+				_apply_optimizer_lr_warmup(opt, step1=warmup_step1, warmup_steps=lr_warmup_steps)
 				opt.step()
+				if cancel_fn is not None:
+					cancel_fn()
 				self.steps_run += 1
 				step1 = _ + 1
+				steps_completed = step1
+				if auto_stop_fn is not None and step1 > lr_warmup_steps:
+					auto_step = step1 - lr_warmup_steps
+					auto_loss_history.append(float(loss.detach().cpu()))
+					auto_stopped = bool(auto_stop_fn(history=auto_loss_history, step=auto_step))
 				if status_fn is not None and (
 					step1 == 1 or
 					step1 == int(stage.steps) or
+					auto_stopped or
 					(status_interval > 0 and (step1 % status_interval) == 0)
 				):
 					status_fn(step=step1, total=int(stage.steps), stats=_stats_for_current_uv())
+				if auto_stopped:
+					break
 			if not persistent_optimizer:
 				self.optimizer = None
 				self.optimizer_key = None
 		stats = _stats_for_current_uv()
+		stats["snaps_map_stage_steps"] = float(steps_completed)
+		stats["snaps_map_auto_stopped"] = 1.0 if auto_stopped else 0.0
 		self.last = stats
 		debug_obj_dir = stage.args.get("debug_obj_dir", None)
 		if debug_obj_dir:
@@ -1625,6 +2364,7 @@ class GlobalMapRuntime:
 				ext_normals=ext_normals,
 				ext_quad_valid=ext_quad_valid,
 				seed_xyz=self.seed_xyz,
+				sign=self.sign,
 			)
 			base_cfg = snap_surf_config_from_global_config(self.cfg_global)
 			self._ensure_models(fixture, base_cfg, GlobalMapStageConfig(params=("affine",)))
@@ -1642,6 +2382,7 @@ class GlobalMapRuntime:
 			dim=-1,
 			eps=1.0e-8,
 		)
+		model_n = model_n * (1.0 if int(self.sign) >= 0 else -1.0)
 		valid = valid & torch.isfinite(model_pos).all(dim=-1) & torch.isfinite(model_n).all(dim=-1)
 		z = model_xyz.sum() * 0.0
 		lm = torch.zeros(model_xyz.shape[:3], device=model_xyz.device, dtype=model_xyz.dtype).unsqueeze(1)
@@ -1954,6 +2695,8 @@ def optimize_fixture(
 		"affine": affine.affine.detach().cpu(),
 		"station_seed_ext_hw": seed_hw.detach().cpu(),
 		"station_target_uv": station_target.detach().cpu(),
+		"sign": int(fixture.metadata.get("sign", 1) or 1),
+		"seed_quad_init": fixture.metadata.get("seed_quad_init"),
 		"stages": [asdict(stage) for stage in cfg_global.stages],
 	}
 	_write_json(out / "meta.json", meta)
