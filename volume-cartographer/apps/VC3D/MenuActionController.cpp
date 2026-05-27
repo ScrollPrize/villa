@@ -5,6 +5,7 @@
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
+#include "WrapAnnotationWidget.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
@@ -207,6 +208,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     if (qWindow->_point_collection_widget) {
         _viewMenu->addAction(qWindow->_point_collection_widget->toggleViewAction());
+    }
+    if (qWindow->_wrapAnnotationWidget) {
+        _viewMenu->addAction(qWindow->_wrapAnnotationWidget->toggleViewAction());
     }
 
     _viewMenu->addAction(_mirrorCursorAct);

@@ -675,6 +675,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
+                               static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                ui.dockWidgetVolumes,
                                ui.dockWidgetViewerControls  }) {
         ensureDockWidgetFeatures(dock);
@@ -702,6 +703,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
         for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                    _lasagnaDock,
                                    ui.dockWidgetDistanceTransform,
+                                   static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
@@ -2279,6 +2281,11 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
     connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    if (_pointsOverlay) {
+        _pointsOverlay->setViewTolerance(_point_collection_widget->pointViewTolerance());
+        connect(_point_collection_widget, &CPointCollectionWidget::pointViewToleranceChanged,
+                _pointsOverlay.get(), &PointsOverlayController::setViewTolerance);
+    }
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, and Point Collections together
     // Wire annotate mode & annotation selection: dock widget <-> segmentation module

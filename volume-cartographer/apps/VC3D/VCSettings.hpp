@@ -128,6 +128,7 @@ namespace viewer {
     constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
     constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "viewer/max_displayed_resolution";
+    constexpr auto POINT_COLLECTION_VIEW_TOLERANCE = "viewer/point_collection_view_tolerance";
 
     constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
     constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
@@ -141,6 +142,7 @@ namespace viewer {
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr double POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT = 10.0;
 
     // Volume Window (Base Grayscale Window)
     constexpr auto BASE_WINDOW_LOW = "viewer/base_window_low";

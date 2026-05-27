@@ -1,6 +1,7 @@
 #include "CPointCollectionWidget.hpp"
 
 #include "Keybinds.hpp"
+#include "VCSettings.hpp"
 
 // Qt compat: stateChanged(int) works on all Qt6 versions.
 // Lambda bridges to Qt::CheckState for the slot signature.
@@ -18,6 +19,7 @@
 #include <QMessageBox>
 #include <QLabel>
 #include <QMenu>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -71,6 +73,34 @@ void CPointCollectionWidget::setupUi()
     _chkAnnotate->setToolTip("Toggle annotation mode for placing correction points on surfaces.");
     layout->addWidget(_chkAnnotate);
     connect(_chkAnnotate, &QCheckBox::toggled, this, &CPointCollectionWidget::annotateToggled);
+
+    QGroupBox *view_group = new QGroupBox("Display", main_widget);
+    QHBoxLayout *view_layout = new QHBoxLayout(view_group);
+    view_layout->addWidget(new QLabel("Tolerance:"));
+    _pointViewToleranceSpinbox = new QDoubleSpinBox(view_group);
+    _pointViewToleranceSpinbox->setRange(0.0, 10000.0);
+    _pointViewToleranceSpinbox->setDecimals(1);
+    _pointViewToleranceSpinbox->setSingleStep(1.0);
+    _pointViewToleranceSpinbox->setSuffix(" vx");
+    _pointViewToleranceSpinbox->setMaximumWidth(100);
+    _pointViewToleranceSpinbox->setToolTip("Maximum distance from the current plane or surface for point collection markers to be shown.");
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _pointViewToleranceSpinbox->setValue(settings.value(
+            vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE,
+            vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT).toDouble());
+    }
+    view_layout->addWidget(_pointViewToleranceSpinbox);
+    view_layout->addStretch();
+    layout->addWidget(view_group);
+    connect(_pointViewToleranceSpinbox,
+            QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this,
+            [this](double value) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE, value);
+                emit pointViewToleranceChanged(value);
+            });
 
     _tree_view = new QTreeView(main_widget);
     _model = new QStandardItemModel(this);
@@ -936,6 +966,12 @@ void CPointCollectionWidget::setAnnotateChecked(bool checked)
     }
 }
 
+double CPointCollectionWidget::pointViewTolerance() const
+{
+    return _pointViewToleranceSpinbox
+        ? _pointViewToleranceSpinbox->value()
+        : vc3d::settings::viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT;
+}
 
 CPointCollectionWidget::~CPointCollectionWidget() {
     if (_tree_view && _tree_view->selectionModel()) {

@@ -17,6 +17,8 @@ public:
     ~PointsOverlayController() override;
 
     void setCollection(VCCollection* collection);
+    void setViewTolerance(double tolerance);
+    [[nodiscard]] double viewTolerance() const { return _viewTolerance; }
 
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
@@ -29,4 +31,5 @@ private:
 
     VCCollection* _collection{nullptr};
     std::array<QMetaObject::Connection, 8> _collectionConnections{};
+    double _viewTolerance{10.0};
 };
