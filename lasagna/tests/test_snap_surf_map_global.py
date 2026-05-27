@@ -31,7 +31,9 @@ from snap_surf.map_global import (
 	_affine_multistart_candidates,
 	_affine_seed_quad_expansion_rows,
 	_affine_seed_grid_candidates,
+	_apply_external_quad_health_filter,
 	_objective_for_uv,
+	_full_active_quad,
 	_run_affine_seed_quad_expansion_reopt,
 	_select_affine_seed_grid_candidate,
 	_seed_quad_affine_init_result,
@@ -904,7 +906,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				args={
 					"debug_obj_dir": str(Path(tmp, "runtime_debug")),
 					"lr_warmup_steps": 4,
-					"affine_seed_quad_init": {"expansion_reopt_steps": 1, "grid_search": False},
+					"affine_seed_quad_init": {"expansion_reopt": True, "expansion_reopt_steps": 1, "grid_search": False},
 				},
 			)
 			stdout = StringIO()
@@ -927,14 +929,54 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertIn("lr=0.05", text)
 			self.assertIn("steps_per_radius=1", text)
 			self.assertIn("lr_warmup_steps=4", text)
-			self.assertIn("grow-r8 1/1 lr=0.0125", text)
+			self.assertIn("grow-r8:1/1", text)
+			self.assertIn("  0.0125", text)
 			self.assertIn("start_radius=8", text)
 			self.assertIn("weights=", text)
 			self.assertIn("grow-r", text)
 			self.assertIn("affine seed quad expansion debug objs dir=", text)
+			self.assertIn("affine seed quad initial debug objs radius=128", text)
+			self.assertTrue(Path(tmp, "runtime_debug", "map_global_affine_seed_quad_init", "expansion_reopt", "rad_000128_initial_filtered", "map_ext_to_model.obj").exists())
 			self.assertTrue(Path(tmp, "runtime_debug", "map_global_affine_seed_quad_init", "expansion_reopt", "rad_000008_init", "map_ext_to_model.obj").exists())
 			self.assertIn("snaps_map_loss", stats)
 			self.assertEqual(runtime.sign, 1)
+
+	def test_live_runtime_seed_quad_init_skips_expansion_reopt_by_default(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp)
+			fixture = load_map_fixture(tmp)
+			runtime = GlobalMapRuntime(seed_xyz=(2.0, 2.0, 0.0))
+			stage = GlobalMapStageConfig(
+				name="affine_seed_quad_init",
+				steps=0,
+				lr=0.05,
+				params=("affine",),
+				args={
+					"debug_obj_dir": str(Path(tmp, "runtime_debug")),
+					"affine_seed_quad_init": {"grid_search": False},
+				},
+			)
+			stdout = StringIO()
+
+			with redirect_stdout(stdout):
+				runtime.run_stage(
+					stage=stage,
+					model_xyz=fixture.model_xyz,
+					model_normals=fixture.model_normals,
+					model_valid=fixture.model_valid,
+					ext_xyz=fixture.ext_xyz,
+					ext_valid=fixture.ext_valid,
+					ext_normals=fixture.ext_normals,
+					ext_quad_valid=fixture.ext_quad_valid,
+				)
+
+			text = stdout.getvalue()
+			root = Path(tmp, "runtime_debug", "map_global_affine_seed_quad_init", "expansion_reopt")
+			self.assertIn("affine seed quad initial debug objs radius=128", text)
+			self.assertNotIn("affine seed quad expansion reopt opts", text)
+			self.assertNotIn("grow-r", text)
+			self.assertTrue((root / "rad_000128_initial_filtered" / "map_ext_to_model.obj").exists())
+			self.assertFalse((root / "rad_000008_init").exists())
 
 	def test_expansion_debug_objs_are_scoped_to_active_radius(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -961,6 +1003,63 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertLess(count_prefix(out / "model_surface.obj", "v "), int(fixture.model_valid.sum()))
 			meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
 			self.assertEqual(meta["valid_vectors"], 4)
+
+	def test_external_quad_health_filter_rejects_spike_artifact(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=6, w=6)
+			fixture = load_map_fixture(tmp)
+			ext_xyz = fixture.ext_xyz.clone()
+			ext_xyz[2, 2, 2] = 1000.0
+			fixture = replace(fixture, ext_xyz=ext_xyz)
+			cfg = snap_surf_config_from_global_config(
+				GlobalMapConfig(
+					base={
+						"map_init": {
+							"ext_mesh_health_filter": True,
+							"ext_mesh_health_max_edge_ratio": 10.0,
+						}
+					}
+				)
+			)
+			stdout = StringIO()
+
+			with redirect_stdout(stdout):
+				filtered = _apply_external_quad_health_filter(fixture, cfg, label="test")
+
+			active = _full_active_quad(filtered)
+			self.assertLess(int(active.sum()), int(_full_active_quad(fixture).sum()))
+			self.assertFalse(bool(active[1, 1]))
+			self.assertFalse(bool(active[1, 2]))
+			self.assertFalse(bool(active[2, 1]))
+			self.assertFalse(bool(active[2, 2]))
+			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected"], 0.0)
+			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected_padding"], 0.0)
+			self.assertIn("external quad health filter test", stdout.getvalue())
+
+	def test_external_quad_health_filter_rejects_twisted_quad(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=3, w=3)
+			fixture = load_map_fixture(tmp)
+			ext_xyz = fixture.ext_xyz.clone()
+			ext_xyz[1, 1] = ext_xyz[0, 0]
+			fixture = replace(fixture, ext_xyz=ext_xyz)
+			cfg = snap_surf_config_from_global_config(
+				GlobalMapConfig(
+					base={
+						"map_init": {
+							"ext_mesh_health_filter": True,
+							"ext_mesh_health_min_triangle_normal_dot": 0.5,
+						}
+					}
+				)
+			)
+
+			filtered = _apply_external_quad_health_filter(fixture, cfg, label="test")
+
+			active = _full_active_quad(filtered)
+			self.assertFalse(bool(active[0, 0]))
+			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected"], 0.0)
+			self.assertIn("min_triangle_normal_dot", filtered.metadata["ext_mesh_health"])
 
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -1047,7 +1146,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertIn("1/3", text)
 			self.assertIn("3/3", text)
 			self.assertNotIn("2/3", text)
-			self.assertRegex(text, r"0/2\s+map_surf_ms")
+			self.assertRegex(text, r"0/2\s+0\.0200\s+2")
 			self.assertIn("stat", text)
 			self.assertIn("station loss", text)
 			self.assertIn("dst", text)

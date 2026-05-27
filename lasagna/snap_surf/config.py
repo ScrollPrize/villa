@@ -50,6 +50,11 @@ class SnapSurfMapInitConfig:
 	w_dist: float = 1.0
 	w_vec_normal: float = 1.0
 	w_surface_normal: float = 1.0
+	z_lift_enabled: bool = True
+	z_lift_refine_enabled: bool = False
+	z_lift_norm_xy_min: float = 0.1
+	w_z_lift: float = 10.0
+	z_lift_huber_delta: float = math.pi / 4.0
 	w_smooth: float = 0.05
 	w_bend: float = 0.01
 	w_jac: float = 1.0
@@ -60,6 +65,15 @@ class SnapSurfMapInitConfig:
 	max_sample_angle_deg: float = 45.0
 	sample_angle_step_fraction: float = 0.1
 	max_step_neighbor_ratio: float = 10.0
+	ext_mesh_health_filter: bool = True
+	ext_mesh_health_max_edge_ratio: float = 2.0
+	ext_mesh_health_max_area_ratio: float = 2.0
+	ext_mesh_health_min_area_ratio: float = 0.75
+	ext_mesh_health_max_aspect_ratio: float = 1.5
+	ext_mesh_health_max_diag_ratio: float = 1.5
+	ext_mesh_health_min_triangle_normal_dot: float = 0.25
+	ext_mesh_health_min_normal_dot: float = 0.0
+	ext_mesh_health_reject_radius: int = 4
 	jac_margin: float = 0.05
 	fixture_export_dir: str | None = None
 	fixture_export_once: bool = True
@@ -141,6 +155,11 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			w_dist=float(raw_cfg.get("w_dist", defaults.w_dist)),
 			w_vec_normal=float(raw_cfg.get("w_vec_normal", defaults.w_vec_normal)),
 			w_surface_normal=float(raw_cfg.get("w_surface_normal", defaults.w_surface_normal)),
+			z_lift_enabled=bool(raw_cfg.get("z_lift_enabled", defaults.z_lift_enabled)),
+			z_lift_refine_enabled=bool(raw_cfg.get("z_lift_refine_enabled", defaults.z_lift_refine_enabled)),
+			z_lift_norm_xy_min=float(raw_cfg.get("z_lift_norm_xy_min", defaults.z_lift_norm_xy_min)),
+			w_z_lift=float(raw_cfg.get("w_z_lift", defaults.w_z_lift)),
+			z_lift_huber_delta=float(raw_cfg.get("z_lift_huber_delta", defaults.z_lift_huber_delta)),
 			w_smooth=float(raw_cfg.get("w_smooth", defaults.w_smooth)),
 			w_bend=float(raw_cfg.get("w_bend", defaults.w_bend)),
 			w_jac=float(raw_cfg.get("w_jac", defaults.w_jac)),
@@ -151,6 +170,15 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			max_sample_angle_deg=float(raw_cfg.get("max_sample_angle_deg", defaults.max_sample_angle_deg)),
 			sample_angle_step_fraction=float(raw_cfg.get("sample_angle_step_fraction", defaults.sample_angle_step_fraction)),
 			max_step_neighbor_ratio=float(raw_cfg.get("max_step_neighbor_ratio", defaults.max_step_neighbor_ratio)),
+			ext_mesh_health_filter=bool(raw_cfg.get("ext_mesh_health_filter", defaults.ext_mesh_health_filter)),
+			ext_mesh_health_max_edge_ratio=float(raw_cfg.get("ext_mesh_health_max_edge_ratio", defaults.ext_mesh_health_max_edge_ratio)),
+			ext_mesh_health_max_area_ratio=float(raw_cfg.get("ext_mesh_health_max_area_ratio", defaults.ext_mesh_health_max_area_ratio)),
+			ext_mesh_health_min_area_ratio=float(raw_cfg.get("ext_mesh_health_min_area_ratio", defaults.ext_mesh_health_min_area_ratio)),
+			ext_mesh_health_max_aspect_ratio=float(raw_cfg.get("ext_mesh_health_max_aspect_ratio", defaults.ext_mesh_health_max_aspect_ratio)),
+			ext_mesh_health_max_diag_ratio=float(raw_cfg.get("ext_mesh_health_max_diag_ratio", defaults.ext_mesh_health_max_diag_ratio)),
+			ext_mesh_health_min_triangle_normal_dot=float(raw_cfg.get("ext_mesh_health_min_triangle_normal_dot", defaults.ext_mesh_health_min_triangle_normal_dot)),
+			ext_mesh_health_min_normal_dot=float(raw_cfg.get("ext_mesh_health_min_normal_dot", defaults.ext_mesh_health_min_normal_dot)),
+			ext_mesh_health_reject_radius=max(0, int(raw_cfg.get("ext_mesh_health_reject_radius", defaults.ext_mesh_health_reject_radius))),
 			jac_margin=float(raw_cfg.get("jac_margin", defaults.jac_margin)),
 			fixture_export_dir=(
 				None
@@ -175,9 +203,14 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 	for name in (
 		"w_dist", "w_vec_normal", "w_surface_normal", "w_smooth", "w_bend", "w_jac",
 		"w_metric_smooth", "w_area_smooth", "w_dense_prior", "angle_dist_mult",
+		"w_z_lift",
 	):
 		if float(getattr(cfg, name)) < 0.0:
 			raise ValueError(f"snap_surf args.map_init.{name} must be >= 0")
+	if cfg.z_lift_norm_xy_min < 0.0:
+		raise ValueError("snap_surf args.map_init.z_lift_norm_xy_min must be >= 0")
+	if cfg.z_lift_huber_delta <= 0.0:
+		raise ValueError("snap_surf args.map_init.z_lift_huber_delta must be > 0")
 	if cfg.max_sample_distance < 0.0:
 		raise ValueError("snap_surf args.map_init.max_sample_distance must be >= 0")
 	if cfg.max_sample_angle_deg < 0.0 or cfg.max_sample_angle_deg > 180.0:
@@ -186,6 +219,20 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 		raise ValueError("snap_surf args.map_init.sample_angle_step_fraction must be >= 0")
 	if cfg.max_step_neighbor_ratio < 0.0:
 		raise ValueError("snap_surf args.map_init.max_step_neighbor_ratio must be >= 0")
+	if cfg.ext_mesh_health_max_edge_ratio < 0.0:
+		raise ValueError("snap_surf args.map_init.ext_mesh_health_max_edge_ratio must be >= 0")
+	if cfg.ext_mesh_health_max_area_ratio < 0.0:
+		raise ValueError("snap_surf args.map_init.ext_mesh_health_max_area_ratio must be >= 0")
+	if cfg.ext_mesh_health_min_area_ratio < 0.0:
+		raise ValueError("snap_surf args.map_init.ext_mesh_health_min_area_ratio must be >= 0")
+	if cfg.ext_mesh_health_max_aspect_ratio < 0.0:
+		raise ValueError("snap_surf args.map_init.ext_mesh_health_max_aspect_ratio must be >= 0")
+	if cfg.ext_mesh_health_max_diag_ratio < 0.0:
+		raise ValueError("snap_surf args.map_init.ext_mesh_health_max_diag_ratio must be >= 0")
+	if cfg.ext_mesh_health_min_triangle_normal_dot < -1.0 or cfg.ext_mesh_health_min_triangle_normal_dot > 1.0:
+		raise ValueError("snap_surf args.map_init.ext_mesh_health_min_triangle_normal_dot must be in [-1, 1]")
+	if cfg.ext_mesh_health_min_normal_dot < 0.0 or cfg.ext_mesh_health_min_normal_dot > 1.0:
+		raise ValueError("snap_surf args.map_init.ext_mesh_health_min_normal_dot must be in [0, 1]")
 	if cfg.jac_margin < 0.0:
 		raise ValueError("snap_surf args.map_init.jac_margin must be >= 0")
 	if cfg.progress_mode not in ("block", "periodic", "both", "none"):

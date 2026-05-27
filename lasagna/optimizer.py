@@ -817,7 +817,7 @@ def optimize(
 	def _compact_snap_global_map_stats(stats: dict[str, float]) -> dict[str, float]:
 		return {
 			k: float(stats[k])
-			for k in ("snaps_map_loss", "snaps_map_dist", "snaps_map_vec", "snaps_map_norm")
+			for k in ("snaps_map_loss", "snaps_map_dist", "snaps_map_vec", "snaps_map_norm", "snaps_map_turn", "snaps_map_turn_smp")
 			if k in stats
 		}
 
@@ -1572,6 +1572,7 @@ def optimize(
 			_map_status_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
 			_map_wall = time.perf_counter()
 			_map_last_step = 0
+			_map_legend_printed = False
 			_map_auto_stop_info: dict[str, float] = {}
 
 			def _map_auto_stop_fn(*, history: list[float], step: int) -> bool:
@@ -1585,8 +1586,8 @@ def optimize(
 				return True
 
 			def _print_map_status(*, step: int, total: int, stats: dict[str, float]) -> None:
-				nonlocal _map_status_rows, _map_wall, _map_last_step
-				if _map_status_rows % 20 == 0:
+				nonlocal _map_status_rows, _map_wall, _map_last_step, _map_legend_printed
+				if not _map_legend_printed:
 					print_progress_legend(
 						prefix="[optimizer]",
 						items=[
@@ -1595,13 +1596,18 @@ def optimize(
 							("sm_dst", "map distance loss"),
 							("sm_vec", "map vector-normal loss"),
 							("sm_nrm", "map normal alignment loss"),
+							("sm_trn", "lifted z-heading loss"),
+							("sm_ts", "valid lifted z-heading samples"),
 							("sm_smp", "valid map samples"),
 							("it/s", "optimizer it/s"),
 						],
 					)
+					_map_legend_printed = True
+				if _map_status_rows % 20 == 0:
 					print(
 						f"{'step':>{_map_status_width}s} {'sm_los':>8s} {'sm_dst':>8s} "
-						f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_smp':>8s} {'it/s':>5s}",
+						f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} {'sm_ts':>8s} "
+						f"{'sm_smp':>8s} {'it/s':>5s}",
 						flush=True,
 					)
 				now = time.perf_counter()
@@ -1617,6 +1623,8 @@ def optimize(
 					f"{format_progress_value(float(stats.get('snaps_map_dist', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_vec', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
 					f"{its_str}",
 					flush=True,
@@ -1675,6 +1683,8 @@ def optimize(
 			print(
 				f"[optimizer] {label}: snap_surf_global_map "
 				f"loss={stats.get('snaps_map_loss', 0.0):.6g} "
+				f"turn={stats.get('snaps_map_turn', 0.0):.6g} "
+				f"turn_smp={stats.get('snaps_map_turn_smp', 0.0):.0f} "
 				f"samples={stats.get('snaps_map_samples', 0.0):.0f}",
 				flush=True,
 			)
@@ -1954,6 +1964,12 @@ def optimize(
 				"snaps_map_dist": "sm_dst",
 				"snaps_map_vec": "sm_vec",
 				"snaps_map_norm": "sm_nrm",
+				"snaps_map_turn": "sm_trn",
+				"snaps_map_turn_smp": "sm_ts",
+				"snaps_map_zext_bad": "sm_zeb",
+				"snaps_map_zext_unr": "sm_zeu",
+				"snaps_map_zmdl_bad": "sm_zmb",
+				"snaps_map_zmdl_unr": "sm_zmu",
 				"snaps_map_smooth": "sm_smo",
 				"snaps_map_bend": "sm_bnd",
 				"snaps_map_jac": "sm_jac",
@@ -2077,6 +2093,12 @@ def optimize(
 				"snaps_map_dist": "map distance",
 				"snaps_map_vec": "vector normal",
 				"snaps_map_norm": "normal align",
+				"snaps_map_turn": "lifted z heading",
+				"snaps_map_turn_smp": "lifted z samples",
+				"snaps_map_zext_bad": "invalid external z-lift quads",
+				"snaps_map_zext_unr": "unreachable external z-lift quads",
+				"snaps_map_zmdl_bad": "invalid model z-lift quads",
+				"snaps_map_zmdl_unr": "unreachable model z-lift quads",
 				"snaps_map_smooth": "smooth reg",
 				"snaps_map_bend": "bend reg",
 				"snaps_map_jac": "jac reg",
@@ -2175,15 +2197,17 @@ def optimize(
 				"snaps_map_dist": 155,
 				"snaps_map_vec": 156,
 				"snaps_map_norm": 157,
-				"snaps_map_smooth": 158,
-				"snaps_map_bend": 159,
-				"snaps_map_jac": 160,
-				"snaps_map_avg": 161,
-				"snaps_map_max": 162,
-				"snaps_map_smooth_fwd": 163,
-				"snaps_map_bend_fwd": 164,
-				"snaps_map_jac_fwd": 165,
-				"snaps_map_metric_smooth": 166,
+				"snaps_map_turn": 158,
+				"snaps_map_turn_smp": 159,
+				"snaps_map_smooth": 160,
+				"snaps_map_bend": 161,
+				"snaps_map_jac": 162,
+				"snaps_map_avg": 163,
+				"snaps_map_max": 164,
+				"snaps_map_smooth_fwd": 165,
+				"snaps_map_bend_fwd": 166,
+				"snaps_map_jac_fwd": 167,
+				"snaps_map_metric_smooth": 168,
 				"snaps_map_area_smooth": 167,
 				"snaps_map_smooth_rev": 168,
 				"snaps_map_bend_rev": 169,

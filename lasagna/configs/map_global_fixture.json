@@ -32,6 +32,7 @@
 				"subdiv": 2,
 				"affine_seed_quad_init": {
 					"enabled": true,
+					"expansion_reopt": false,
 					"quads": 1
 				}
 			}

@@ -25,7 +25,12 @@ from .legacy import (
 	_huber,
 )
 from .map_fixture_io import MapFixture, _float_tif, _write_json, load_map_fixture
-from .map_objective import _map_init_distance_multiplier, _map_init_objective
+from .map_objective import (
+	_map_init_distance_multiplier,
+	_map_init_lifted_z_heading_branches,
+	_map_init_objective,
+	_map_init_z_lift_turn_values,
+)
 from .map_pyramid import (
 	_map_init_coords3,
 	_map_init_dyadic_level_shape,
@@ -37,6 +42,7 @@ from .tensor import _quad_valid_at_coords, _sample_surface_grid
 
 
 _PRINTED_PROGRESS_LEGENDS: set[str] = set()
+_Z_LIFT_CACHE: dict[tuple[int, int, float, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]], dict[str, Any] | None] = {}
 
 
 def _print_progress_legend_once(*, prefix: str, items: list[tuple[str, str]]) -> None:
@@ -88,6 +94,8 @@ class SeedQuadAffineInitResult:
 	seed_dist_avg: float
 	seed_vec: float
 	seed_norm: float
+	seed_turn: float
+	seed_turn_smp: int
 
 
 def _lr_warmup_steps(args: dict[str, Any] | None) -> int:
@@ -167,6 +175,8 @@ _STAGE_W_FAC_KEYS = {
 	"map_vec_normal": "vec",
 	"norm": "norm",
 	"map_surface_normal": "norm",
+	"turn": "turn",
+	"map_z_lift": "turn",
 	"smooth": "smooth",
 	"map_smooth": "smooth",
 	"bend": "bend",
@@ -329,6 +339,345 @@ def _full_active_quad(fixture: MapFixture) -> torch.Tensor:
 		fixture.ext_valid[1:, 1:].bool() &
 		fixture.ext_quad_valid.bool()
 	)
+
+
+def _external_quad_base_valid(
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+) -> torch.Tensor:
+	finite = torch.isfinite(ext_xyz).all(dim=-1)
+	return (
+		ext_valid[:-1, :-1].bool() &
+		ext_valid[1:, :-1].bool() &
+		ext_valid[:-1, 1:].bool() &
+		ext_valid[1:, 1:].bool() &
+		finite[:-1, :-1] &
+		finite[1:, :-1] &
+		finite[:-1, 1:] &
+		finite[1:, 1:] &
+		ext_quad_valid.bool()
+	)
+
+def _model_quad_base_valid(model_xyz: torch.Tensor, model_valid: torch.Tensor) -> torch.Tensor:
+	D, H, W = (int(model_xyz.shape[0]), int(model_xyz.shape[1]), int(model_xyz.shape[2]))
+	if H < 2 or W < 2:
+		return torch.zeros(D, max(0, H - 1), max(0, W - 1), device=model_xyz.device, dtype=torch.bool)
+	finite = torch.isfinite(model_xyz).all(dim=-1)
+	v = model_valid.bool() & finite
+	return v[:, :-1, :-1] & v[:, 1:, :-1] & v[:, :-1, 1:] & v[:, 1:, 1:]
+
+def _fixture_seed_ext_quad(fixture: MapFixture) -> tuple[int, int] | None:
+	raw_init = fixture.metadata.get("seed_quad_init")
+	if isinstance(raw_init, dict):
+		raw_ext = raw_init.get("ext_quad")
+		if isinstance(raw_ext, (list, tuple)) and len(raw_ext) == 2:
+			return int(raw_ext[0]), int(raw_ext[1])
+	raw_ext = fixture.metadata.get("seed_ext_sample_hw")
+	if isinstance(raw_ext, (list, tuple)) and len(raw_ext) >= 2:
+		return int(raw_ext[0]), int(raw_ext[1])
+	raw_seed = fixture.metadata.get("seed_xyz")
+	if isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3:
+		seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
+		quad, _point, _dist = _closest_external_seed_surface(
+			seed=seed,
+			ext_xyz=fixture.ext_xyz,
+			ext_valid=fixture.ext_valid.bool(),
+			ext_quad_valid=fixture.ext_quad_valid.bool(),
+		)
+		return None if quad is None else (int(quad[0]), int(quad[1]))
+	return None
+
+def _fixture_seed_model_quad(fixture: MapFixture) -> tuple[int, int, int] | None:
+	raw_init = fixture.metadata.get("seed_quad_init")
+	if isinstance(raw_init, dict):
+		raw_model = raw_init.get("model_quad")
+		if isinstance(raw_model, (list, tuple)) and len(raw_model) == 3:
+			return int(raw_model[0]), int(raw_model[1]), int(raw_model[2])
+	raw_model = fixture.metadata.get("seed_model_quad")
+	if isinstance(raw_model, (list, tuple)) and len(raw_model) == 3:
+		return int(raw_model[0]), int(raw_model[1]), int(raw_model[2])
+	raw_seed = fixture.metadata.get("seed_xyz")
+	if isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3:
+		seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+		quad, _dist = _closest_model_surface_quad(
+			point=seed,
+			model_xyz=fixture.model_xyz,
+			model_valid=fixture.model_valid.bool(),
+		)
+		return None if quad is None else (int(quad[0]), int(quad[1]), int(quad[2]))
+	return None
+
+def _map_init_z_lift_for_fixture(
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	*,
+	sign: int | None = None,
+) -> dict[str, Any] | None:
+	mi = cfg.map_init
+	if not bool(mi.z_lift_enabled) or float(mi.w_z_lift) <= 0.0:
+		return None
+	seed_ext = _fixture_seed_ext_quad(fixture)
+	seed_model = _fixture_seed_model_quad(fixture)
+	if seed_ext is None or seed_model is None:
+		return None
+	sign_i = int(fixture.metadata.get("sign", 1) or 1) if sign is None else int(sign)
+	key = (
+		id(fixture),
+		sign_i,
+		float(mi.z_lift_norm_xy_min),
+		tuple(int(v) for v in fixture.ext_normals.shape),
+		tuple(int(v) for v in fixture.model_normals.shape),
+		tuple(int(v) for v in fixture.ext_quad_valid.shape),
+		tuple(int(v) for v in fixture.model_valid.shape),
+	)
+	if key in _Z_LIFT_CACHE:
+		return _Z_LIFT_CACHE[key]
+	ext_base = _external_quad_base_valid(fixture.ext_xyz, fixture.ext_valid.bool(), fixture.ext_quad_valid.bool())
+	model_base = _model_quad_base_valid(fixture.model_xyz, fixture.model_valid.bool())
+	ext_k, ext_valid, ext_stats = _map_init_lifted_z_heading_branches(
+		fixture.ext_normals,
+		ext_base,
+		seed_ext,
+		norm_xy_min=float(mi.z_lift_norm_xy_min),
+		sign=1,
+	)
+	model_k, model_valid, model_stats = _map_init_lifted_z_heading_branches(
+		fixture.model_normals,
+		model_base,
+		seed_model,
+		norm_xy_min=float(mi.z_lift_norm_xy_min),
+		sign=sign_i,
+	)
+	if float(ext_stats["valid"]) <= 0.0 or float(model_stats["valid"]) <= 0.0:
+		_Z_LIFT_CACHE[key] = None
+		return None
+	out = {
+		"ext_k": ext_k.detach(),
+		"ext_valid": ext_valid.detach(),
+		"model_k": model_k.detach(),
+		"model_valid": model_valid.detach(),
+		"stats": {
+			"ext_valid": float(ext_stats["valid"]),
+			"ext_invalid": float(ext_stats["invalid"]),
+			"ext_unreachable": float(ext_stats["unreachable"]),
+			"model_valid": float(model_stats["valid"]),
+			"model_invalid": float(model_stats["invalid"]),
+			"model_unreachable": float(model_stats["unreachable"]),
+		},
+	}
+	_Z_LIFT_CACHE[key] = out
+	return out
+
+
+def _dilate_quad_mask_euclidean(mask: torch.Tensor, radius: int) -> torch.Tensor:
+	r = max(0, int(radius))
+	if r <= 0 or int(mask.numel()) == 0:
+		return mask.bool()
+	H, W = int(mask.shape[0]), int(mask.shape[1])
+	src = mask.bool()
+	out = torch.zeros_like(src)
+	for dh in range(-r, r + 1):
+		for dw in range(-r, r + 1):
+			if dh * dh + dw * dw > r * r:
+				continue
+			src_h0 = max(0, -dh)
+			src_h1 = H - max(0, dh)
+			src_w0 = max(0, -dw)
+			src_w1 = W - max(0, dw)
+			if src_h0 >= src_h1 or src_w0 >= src_w1:
+				continue
+			dst_h0 = max(0, dh)
+			dst_h1 = H - max(0, -dh)
+			dst_w0 = max(0, dw)
+			dst_w1 = W - max(0, -dw)
+			out[dst_h0:dst_h1, dst_w0:dst_w1] |= src[src_h0:src_h1, src_w0:src_w1]
+	return out
+
+
+def _external_quad_health_filter(
+	*,
+	ext_xyz: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor,
+	ext_normals: torch.Tensor | None,
+	cfg: SnapSurfMapInitConfig,
+) -> tuple[torch.Tensor, dict[str, float]]:
+	base = _external_quad_base_valid(ext_xyz, ext_valid, ext_quad_valid)
+	empty_stats = {
+		"quads_input": float(int(base.sum().detach().cpu())),
+		"quads_kept": 0.0,
+		"quads_rejected": float(int(base.sum().detach().cpu())),
+		"median_edge": 0.0,
+		"median_area": 0.0,
+		"max_edge": 0.0,
+		"max_area": 0.0,
+	}
+	if not bool(base.any().detach().cpu()):
+		return ext_quad_valid.bool() & base, empty_stats
+
+	p00 = ext_xyz[:-1, :-1]
+	p10 = ext_xyz[1:, :-1]
+	p01 = ext_xyz[:-1, 1:]
+	p11 = ext_xyz[1:, 1:]
+	e0 = (p10 - p00).norm(dim=-1)
+	e1 = (p11 - p01).norm(dim=-1)
+	e2 = (p01 - p00).norm(dim=-1)
+	e3 = (p11 - p10).norm(dim=-1)
+	edges = torch.stack([e0, e1, e2, e3], dim=-1)
+	edge_min = edges.min(dim=-1).values
+	edge_max = edges.max(dim=-1).values
+	d0 = (p11 - p00).norm(dim=-1)
+	d1 = (p10 - p01).norm(dim=-1)
+	diag_min = torch.minimum(d0, d1)
+	diag_max = torch.maximum(d0, d1)
+	tri0 = torch.linalg.cross(p10 - p00, p01 - p00, dim=-1)
+	tri1 = torch.linalg.cross(p01 - p11, p10 - p11, dim=-1)
+	area0 = tri0.norm(dim=-1) * 0.5
+	area1 = tri1.norm(dim=-1) * 0.5
+	area = area0 + area1
+	tri_dot = (
+		torch.nn.functional.normalize(tri0, dim=-1, eps=1.0e-8) *
+		torch.nn.functional.normalize(tri1, dim=-1, eps=1.0e-8)
+	).sum(dim=-1)
+	finite_metrics = (
+		torch.isfinite(edges).all(dim=-1) &
+		torch.isfinite(d0) &
+		torch.isfinite(d1) &
+		torch.isfinite(area) &
+		torch.isfinite(tri_dot)
+	)
+	positive = finite_metrics & (edge_min > 0.0) & (diag_min > 0.0) & (area > 0.0)
+	usable = base & positive
+	if not bool(usable.any().detach().cpu()):
+		stats = dict(empty_stats)
+		stats["quads_rejected"] = float(int(base.sum().detach().cpu()))
+		return ext_quad_valid.bool() & usable, stats
+
+	edge_ref = edges[usable.unsqueeze(-1).expand_as(edges)].median()
+	area_ref = area[usable].median()
+	eps = torch.finfo(ext_xyz.dtype).eps if ext_xyz.dtype.is_floating_point else 1.0e-12
+	edge_ref_safe = torch.clamp(edge_ref, min=float(eps))
+	area_ref_safe = torch.clamp(area_ref, min=float(eps))
+	aspect = edge_max / torch.clamp(edge_min, min=float(eps))
+	diag_ratio = diag_max / torch.clamp(diag_min, min=float(eps))
+	healthy = usable
+	if float(cfg.ext_mesh_health_max_aspect_ratio) > 0.0:
+		healthy = healthy & (aspect <= float(cfg.ext_mesh_health_max_aspect_ratio))
+	if float(cfg.ext_mesh_health_max_diag_ratio) > 0.0:
+		healthy = healthy & (diag_ratio <= float(cfg.ext_mesh_health_max_diag_ratio))
+	if float(cfg.ext_mesh_health_max_edge_ratio) > 0.0:
+		healthy = healthy & (edge_max <= edge_ref_safe * float(cfg.ext_mesh_health_max_edge_ratio))
+	if float(cfg.ext_mesh_health_max_area_ratio) > 0.0:
+		healthy = healthy & (area <= area_ref_safe * float(cfg.ext_mesh_health_max_area_ratio))
+	if float(cfg.ext_mesh_health_min_area_ratio) > 0.0:
+		healthy = healthy & (area >= area_ref_safe * float(cfg.ext_mesh_health_min_area_ratio))
+	if float(cfg.ext_mesh_health_min_triangle_normal_dot) > -1.0:
+		healthy = healthy & (tri_dot >= float(cfg.ext_mesh_health_min_triangle_normal_dot))
+	if ext_normals is not None and float(cfg.ext_mesh_health_min_normal_dot) > 0.0:
+		n_quad = torch.nn.functional.normalize(
+			torch.linalg.cross(p10 - p00, p01 - p00, dim=-1),
+			dim=-1,
+			eps=1.0e-8,
+		)
+		n_avg = (
+			ext_normals[:-1, :-1] +
+			ext_normals[1:, :-1] +
+			ext_normals[:-1, 1:] +
+			ext_normals[1:, 1:]
+		) * 0.25
+		n_avg = torch.nn.functional.normalize(n_avg, dim=-1, eps=1.0e-8)
+		normal_dot = (n_quad * n_avg).sum(dim=-1).abs()
+		healthy = healthy & torch.isfinite(normal_dot) & (normal_dot >= float(cfg.ext_mesh_health_min_normal_dot))
+	else:
+		normal_dot = torch.zeros_like(area)
+	stats = {
+		"quads_input": float(int(base.sum().detach().cpu())),
+		"quads_kept": float(int(healthy.sum().detach().cpu())),
+		"quads_rejected": float(int((base & ~healthy).sum().detach().cpu())),
+		"median_edge": float(edge_ref.detach().cpu()),
+		"median_area": float(area_ref.detach().cpu()),
+		"max_edge": float(edge_max[base].max().detach().cpu()),
+		"max_area": float(area[base].max().detach().cpu()),
+		"max_aspect": float(aspect[base].max().detach().cpu()),
+		"max_diag_ratio": float(diag_ratio[base].max().detach().cpu()),
+		"min_triangle_normal_dot": float(tri_dot[base].min().detach().cpu()),
+		"min_normal_dot": float(normal_dot[base].min().detach().cpu()) if ext_normals is not None and float(cfg.ext_mesh_health_min_normal_dot) > 0.0 else 0.0,
+	}
+	initial_rejected = base & ~healthy
+	reject_radius = max(0, int(cfg.ext_mesh_health_reject_radius))
+	padding_rejected = torch.zeros_like(base)
+	if reject_radius > 0 and bool(initial_rejected.any().detach().cpu()):
+		padding_rejected = _dilate_quad_mask_euclidean(initial_rejected, reject_radius) & base & ~initial_rejected
+		healthy = healthy & ~padding_rejected
+		stats["quads_rejected_initial"] = float(int(initial_rejected.sum().detach().cpu()))
+		stats["quads_rejected_padding"] = float(int(padding_rejected.sum().detach().cpu()))
+		stats["quads_reject_radius"] = float(reject_radius)
+		stats["quads_kept"] = float(int(healthy.sum().detach().cpu()))
+		stats["quads_rejected"] = float(int((base & ~healthy).sum().detach().cpu()))
+	else:
+		stats["quads_rejected_initial"] = float(int(initial_rejected.sum().detach().cpu()))
+		stats["quads_rejected_padding"] = 0.0
+		stats["quads_reject_radius"] = float(reject_radius)
+	return ext_quad_valid.bool() & healthy, stats
+
+
+def _apply_external_quad_health_filter(
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	*,
+	label: str,
+) -> MapFixture:
+	mi = cfg.map_init
+	if not bool(mi.ext_mesh_health_filter):
+		return fixture
+	filtered_quad, stats = _external_quad_health_filter(
+		ext_xyz=fixture.ext_xyz,
+		ext_valid=fixture.ext_valid,
+		ext_quad_valid=fixture.ext_quad_valid,
+		ext_normals=fixture.ext_normals,
+		cfg=mi,
+	)
+	before = int(stats["quads_input"])
+	after = int(stats["quads_kept"])
+	rejected = int(stats["quads_rejected"])
+	metadata = dict(fixture.metadata)
+	metadata["ext_mesh_health"] = stats
+	if rejected > 0:
+		print(
+			"[snap_surf.map_global] external quad health filter "
+			f"{label} kept={after}/{before} rejected={rejected} "
+			f"median_edge={stats['median_edge']:.6g} max_edge={stats['max_edge']:.6g} "
+			f"median_area={stats['median_area']:.6g} max_area={stats['max_area']:.6g} "
+			f"max_aspect={stats.get('max_aspect', 0.0):.6g} max_diag={stats.get('max_diag_ratio', 0.0):.6g} "
+			f"min_tri_dot={stats.get('min_triangle_normal_dot', 0.0):.6g} "
+			f"pad_r={int(stats.get('quads_reject_radius', 0.0))} pad_rejected={int(stats.get('quads_rejected_padding', 0.0))}",
+			flush=True,
+		)
+	seed_raw = metadata.get("seed_ext_sample_hw")
+	seed_valid = False
+	if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
+		h, w = int(seed_raw[0]), int(seed_raw[1])
+		if 0 <= h < int(filtered_quad.shape[0]) and 0 <= w < int(filtered_quad.shape[1]):
+			seed_valid = bool(filtered_quad[h, w].detach().cpu())
+	if not seed_valid and metadata.get("seed_xyz") is not None:
+		seed_vals = metadata.get("seed_xyz")
+		if isinstance(seed_vals, (list, tuple)) and len(seed_vals) == 3:
+			seed = torch.tensor(seed_vals, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
+			ext_quad, _point, _dist = _closest_external_seed_surface(
+				seed=seed,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_quad_valid=filtered_quad,
+			)
+			if ext_quad is not None:
+				metadata["seed_ext_sample_hw"] = [int(ext_quad[0]), int(ext_quad[1])]
+				if rejected > 0:
+					print(
+						f"[snap_surf.map_global] external quad health filter {label} moved seed_ext_sample_hw={metadata['seed_ext_sample_hw']}",
+						flush=True,
+					)
+	return replace(fixture, metadata=metadata, ext_quad_valid=filtered_quad)
 
 
 def _max_supported_level(ext_shape: tuple[int, int], requested: int) -> int:
@@ -788,8 +1137,32 @@ def _seed_quad_affine_sample_terms(
 	dist_values = _huber(d, delta=stage_cfg.huber_delta) * _map_init_distance_multiplier(c_ext, c_model, stage_cfg.map_init)
 	vec_values = (1.0 - c_ext) + (1.0 - c_model)
 	norm_values = 1.0 - c_norm
+	z_lift = _map_init_z_lift_for_fixture(fixture, stage_cfg, sign=sign)
+	turn_values = torch.zeros_like(norm_values)
+	turn_valid = torch.ones_like(coord_ok, dtype=torch.bool)
+	if z_lift is not None:
+		quad_hw = torch.floor(ext_hw.to(device=affine.device, dtype=affine.dtype)).long()
+		quad_hw[:, 0] = quad_hw[:, 0].clamp(0, max(0, int(z_lift["ext_k"].shape[0]) - 1))
+		quad_hw[:, 1] = quad_hw[:, 1].clamp(0, max(0, int(z_lift["ext_k"].shape[1]) - 1))
+		Q = int(quad_hw.shape[0])
+		turn_values, turn_valid = _map_init_z_lift_turn_values(
+			quad_hw=quad_hw,
+			sample_count=1,
+			n_ext=n_ext,
+			n_model_raw=n_model_raw,
+			coords3=safe_coords.reshape(Q, 1, 3),
+			sign=sign,
+			ext_k=z_lift["ext_k"],
+			ext_valid=z_lift["ext_valid"],
+			model_k=z_lift["model_k"],
+			model_valid=z_lift["model_valid"],
+			cfg=stage_cfg.map_init,
+		)
+		turn_values = turn_values.reshape(-1)
+		turn_valid = turn_valid.reshape(-1)
 	valid = (
 		coord_ok &
+		turn_valid &
 		torch.isfinite(p_ext).all(dim=-1) &
 		torch.isfinite(p_model).all(dim=-1) &
 		torch.isfinite(n_ext).all(dim=-1) &
@@ -799,7 +1172,8 @@ def _seed_quad_affine_sample_terms(
 		(n_model.norm(dim=-1) > 1.0e-8) &
 		torch.isfinite(dist_values) &
 		torch.isfinite(vec_values) &
-		torch.isfinite(norm_values)
+		torch.isfinite(norm_values) &
+		torch.isfinite(turn_values)
 	)
 	if not bool(valid.any().detach().cpu()):
 		return {
@@ -811,14 +1185,18 @@ def _seed_quad_affine_sample_terms(
 			"dist_avg": float("nan"),
 			"vec": float("nan"),
 			"norm": float("nan"),
+			"turn": float("nan"),
+			"turn_smp": 0.0,
 		}
 	dist = float(dist_values[valid].mean().detach().cpu())
 	vec = float(vec_values[valid].mean().detach().cpu())
 	norm = float(norm_values[valid].mean().detach().cpu())
+	turn = float(turn_values[valid].mean().detach().cpu())
 	loss = (
 		float(stage_cfg.map_init.w_dist) * dist +
 		float(stage_cfg.map_init.w_vec_normal) * vec +
-		float(stage_cfg.map_init.w_surface_normal) * norm
+		float(stage_cfg.map_init.w_surface_normal) * norm +
+		float(stage_cfg.map_init.w_z_lift) * turn
 	)
 	return {
 		"uv_rmse": uv_rmse,
@@ -829,6 +1207,8 @@ def _seed_quad_affine_sample_terms(
 		"dist_avg": float(d[valid].mean().detach().cpu()),
 		"vec": vec,
 		"norm": norm,
+		"turn": turn,
+		"turn_smp": float(int(valid.sum().detach().cpu())),
 	}
 
 
@@ -933,6 +1313,8 @@ def _objective_for_active_uv(
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+	sign_i = int(fixture.metadata.get("sign", 1) or 1)
+	z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
 	return _map_init_objective(
 		uv_full=uv,
 		active_quad=active_quad,
@@ -945,9 +1327,13 @@ def _objective_for_active_uv(
 		model_valid=fixture.model_valid,
 		model_normals=fixture.model_normals,
 		model_depth=int(fixture.metadata.get("model_depth", 0) or 0),
-		sign=int(fixture.metadata.get("sign", 1) or 1),
+		sign=sign_i,
 		cfg=cfg,
 		allow_partial_model_samples=True,
+		ext_z_lift_k=None if z_lift is None else z_lift["ext_k"],
+		ext_z_lift_valid=None if z_lift is None else z_lift["ext_valid"],
+		model_z_lift_k=None if z_lift is None else z_lift["model_k"],
+		model_z_lift_valid=None if z_lift is None else z_lift["model_valid"],
 	)
 
 
@@ -967,6 +1353,7 @@ def _affine_seed_quad_expansion_row_from_terms(
 		"dist_avg": _global_term_value(terms, "dist_avg"),
 		"vec": _global_term_value(terms, "vec"),
 		"norm": _global_term_value(terms, "norm"),
+		"turn": _global_term_value(terms, "turn"),
 		"smooth": _global_term_value(terms, "smooth"),
 		"jac": _global_term_value(terms, "jac"),
 		"samples": _global_term_value(terms, "samples"),
@@ -1023,6 +1410,7 @@ _SEED_EXPANSION_COLUMNS = (
 	ProgressColumn("dist_avg", "avgd", "mean connection distance", min_width=7),
 	ProgressColumn("vec", "vec", "vector-normal loss", min_width=7),
 	ProgressColumn("norm", "nrm", "surface-normal loss", min_width=7),
+	ProgressColumn("turn", "turn", "lifted z-heading loss", min_width=7),
 	ProgressColumn("smooth", "smo", "smoothness loss", min_width=7),
 	ProgressColumn("jac", "jac", "jacobian loss", min_width=7),
 	ProgressColumn("samples", "smp", "objective samples", min_width=7),
@@ -1056,6 +1444,7 @@ def _print_affine_seed_quad_expansion_diagnostic(
 			"dist_avg": "-1.0e+99",
 			"vec": "-1.0e+99",
 			"norm": "-1.0e+99",
+			"turn": "-1.0e+99",
 			"smooth": "-1.0e+99",
 			"jac": "-1.0e+99",
 			"samples": "100000000",
@@ -1077,6 +1466,7 @@ def _print_affine_seed_quad_expansion_diagnostic(
 			"dist_avg": format_progress_value(float(row["dist_avg"])),
 			"vec": format_progress_value(float(row["vec"])),
 			"norm": format_progress_value(float(row["norm"])),
+			"turn": format_progress_value(float(row["turn"])),
 			"smooth": format_progress_value(float(row["smooth"])),
 			"jac": format_progress_value(float(row["jac"])),
 			"samples": str(int(row["samples"])),
@@ -1129,6 +1519,7 @@ def _run_affine_seed_quad_expansion_reopt(
 		f"w_fac={w_fac} "
 		"weights="
 		f"dist:{float(mi.w_dist):.6g},vec:{float(mi.w_vec_normal):.6g},norm:{float(mi.w_surface_normal):.6g},"
+		f"turn:{float(mi.w_z_lift):.6g},"
 		f"smooth:{float(mi.w_smooth):.6g},bend:{float(mi.w_bend):.6g},jac:{float(mi.w_jac):.6g},"
 		f"metric:{float(mi.w_metric_smooth):.6g},area:{float(mi.w_area_smooth):.6g},"
 		f"prior:{float(mi.w_dense_prior):.6g},station:{float(w_station):.6g}",
@@ -1232,8 +1623,8 @@ def _run_affine_seed_quad_expansion_reopt(
 				row_idx=int(progress_row_idx) + progress_rows,
 				widths=progress_widths_run,
 				stage_idx=stage_idx,
-				iter_label=f"grow-r{int(radius)} 0/{steps_i} lr={format_progress_value(float(lr))}",
-				params=("affine",),
+				iter_label=f"grow-r{int(radius)}:0/{steps_i}",
+				lr=float(lr),
 				level=0,
 				loss=report_loss,
 				terms=report_terms,
@@ -1276,8 +1667,8 @@ def _run_affine_seed_quad_expansion_reopt(
 						row_idx=int(progress_row_idx) + progress_rows,
 						widths=progress_widths_run,
 						stage_idx=stage_idx,
-						iter_label=f"grow-r{int(radius)} {step1}/{steps_i} lr={format_progress_value(step_lr)}",
-						params=("affine",),
+						iter_label=f"grow-r{int(radius)}:{step1}/{steps_i}",
+						lr=float(step_lr),
 						level=0,
 						loss=report_loss,
 						terms=report_terms,
@@ -1289,6 +1680,61 @@ def _run_affine_seed_quad_expansion_reopt(
 		final_row["lr"] = opt_lr(opt)
 		write_debug_map(radius, "final", steps_i, active, final_row)
 	return rows, progress_rows
+
+
+def _write_affine_seed_initial_debug_radius(
+	*,
+	debug_obj_root: Path | None,
+	affine_tensor: torch.Tensor,
+	fixture: MapFixture,
+	stage_cfg: SnapSurfConfig,
+	seed_ext_quad: tuple[int, int],
+	radius: int = 128,
+) -> None:
+	if debug_obj_root is None:
+		return
+	radius_i = max(0, int(radius))
+	uv = _affine_uv_field(affine_tensor, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
+	active = _seed_quad_expansion_active_mask(_full_active_quad(fixture), seed_ext_quad, radius_i)
+	loss, terms = _objective_for_active_uv(
+		uv=uv,
+		active_quad=active,
+		fixture=fixture,
+		cfg=stage_cfg,
+	)
+	row = _affine_seed_quad_expansion_row_from_terms(
+		radius=radius_i,
+		active=active,
+		loss=loss,
+		terms=terms,
+	)
+	out = debug_obj_root / f"rad_{radius_i:06d}_initial_filtered"
+	_write_map_objs(
+		out,
+		uv=uv,
+		fixture=fixture,
+		meta={
+			"phase": "initial_filtered",
+			"radius": radius_i,
+			"active_quads": int(active.sum().detach().cpu()),
+			"loss": float(row["loss"]),
+			"dist": float(row["dist"]),
+			"dist_avg": float(row["dist_avg"]),
+			"vec": float(row["vec"]),
+			"norm": float(row["norm"]),
+			"smooth": float(row["smooth"]),
+			"jac": float(row["jac"]),
+			"samples": int(row["samples"]),
+			"sample_bad": int(row["sample_bad"]),
+			"quad_success": int(row["quad_success"]),
+			"ext_mesh_health": fixture.metadata.get("ext_mesh_health"),
+		},
+		active_quad=active,
+	)
+	print(
+		f"[snap_surf.map_global] affine seed quad initial debug objs radius={radius_i} dir={out}",
+		flush=True,
+	)
 
 
 def _seed_quad_affine_init_result(
@@ -1445,6 +1891,7 @@ def _seed_quad_affine_init_result(
 		f"loss={sample_terms['loss']:.6g} "
 		f"dist={sample_terms['dist']:.6g} dist_avg={sample_terms['dist_avg']:.6g} "
 		f"vec={sample_terms['vec']:.6g} norm={sample_terms['norm']:.6g} "
+		f"turn={sample_terms['turn']:.6g} turn_smp={int(sample_terms['turn_smp'])} "
 		f"uv_rmse={sample_terms['uv_rmse']:.6g} uv_max={sample_terms['uv_max']:.6g}",
 		flush=True,
 	)
@@ -1480,6 +1927,8 @@ def _seed_quad_affine_init_result(
 		seed_dist_avg=float(sample_terms["dist_avg"]),
 		seed_vec=float(sample_terms["vec"]),
 		seed_norm=float(sample_terms["norm"]),
+		seed_turn=float(sample_terms["turn"]),
+		seed_turn_smp=int(sample_terms["turn_smp"]),
 	)
 
 
@@ -1506,6 +1955,8 @@ def _apply_seed_quad_init_metadata(fixture: MapFixture, result: SeedQuadAffineIn
 		"seed_dist_avg": float(result.seed_dist_avg),
 		"seed_vec": float(result.seed_vec),
 		"seed_norm": float(result.seed_norm),
+		"seed_turn": float(result.seed_turn),
+		"seed_turn_smp": int(result.seed_turn_smp),
 		"seed_uv_rmse": float(result.seed_uv_rmse),
 		"seed_uv_max": float(result.seed_uv_max),
 		"seed_valid": int(result.seed_valid_count),
@@ -1615,6 +2066,7 @@ _AFFINE_DIAG_COLUMNS = (
 	ProgressColumn("dist", "dst", "distance loss", min_width=7),
 	ProgressColumn("vec", "vec", "vector-normal loss", min_width=7),
 	ProgressColumn("norm", "nrm", "surface-normal loss", min_width=7),
+	ProgressColumn("turn", "turn", "lifted z-heading loss", min_width=7),
 	ProgressColumn("smooth", "smo", "uv smooth loss", min_width=7),
 	ProgressColumn("bend", "bnd", "uv bend loss", min_width=7),
 	ProgressColumn("jac", "jac", "jacobian loss", min_width=7),
@@ -1624,7 +2076,7 @@ _AFFINE_DIAG_COLUMNS = (
 	ProgressColumn("station", "stat", "station loss", min_width=7),
 	ProgressColumn("avgd", "avgd", "avg fixture model quad distance", min_width=7),
 	ProgressColumn("maxd", "maxd", "max fixture model quad distance", min_width=7),
-	ProgressColumn("smp", "smp", "fixture comparison samples", min_width=6),
+	ProgressColumn("smp", "smp", "objective samples", min_width=6),
 	ProgressColumn("i00", "i00", "initial affine h-from-h", min_width=8),
 	ProgressColumn("i01", "i01", "initial affine h-from-w", min_width=8),
 	ProgressColumn("i02", "i02", "initial affine h offset", min_width=8),
@@ -1707,6 +2159,7 @@ def _affine_diag_values(
 		"dist": format_progress_value(_global_term_value(terms, "dist")),
 		"vec": format_progress_value(_global_term_value(terms, "vec")),
 		"norm": format_progress_value(_global_term_value(terms, "norm")),
+		"turn": format_progress_value(_global_term_value(terms, "turn")),
 		"smooth": format_progress_value(_global_term_value(terms, "smooth")),
 		"bend": format_progress_value(_global_term_value(terms, "bend")),
 		"jac": format_progress_value(_global_term_value(terms, "jac")),
@@ -2028,7 +2481,7 @@ def _prepare_affine_seed_quad_candidate(
 	if not isinstance(raw, dict) and not bool(raw):
 		return None, None, float("nan"), 0
 	reopt_cfg = raw if isinstance(raw, dict) else {}
-	reopt_enabled = bool(reopt_cfg.get("expansion_reopt", reopt_cfg.get("grow_reopt", True)))
+	reopt_enabled = bool(reopt_cfg.get("expansion_reopt", reopt_cfg.get("grow_reopt", False)))
 	reopt_steps = max(0, int(reopt_cfg.get("expansion_reopt_steps", reopt_cfg.get("grow_reopt_steps", 100))))
 	reopt_lr = float(reopt_cfg.get("expansion_reopt_lr", reopt_cfg.get("grow_reopt_lr", lr)))
 	status_interval = max(0, int(reopt_cfg.get(
@@ -2048,6 +2501,14 @@ def _prepare_affine_seed_quad_candidate(
 		return None, None, float("nan"), 0
 	_apply_seed_quad_init_metadata(fixture, seed_result)
 	candidate = seed_result.affine
+	_write_affine_seed_initial_debug_radius(
+		debug_obj_root=debug_obj_root,
+		affine_tensor=candidate,
+		fixture=fixture,
+		stage_cfg=stage_cfg,
+		seed_ext_quad=seed_result.ext_quad,
+		radius=128,
+	)
 	progress_rows = 0
 	if reopt_enabled:
 		with torch.no_grad():
@@ -2167,7 +2628,7 @@ def _run_affine_seed_quad_init(
 		widths=progress_widths_run,
 		stage_idx=stage_idx,
 		iter_label=f"0/{steps}",
-		params=stage.params,
+		lr=float(lr),
 		level=0,
 		loss=report_loss,
 		terms=report_terms,
@@ -2216,7 +2677,7 @@ def _run_affine_seed_quad_init(
 				widths=progress_widths_run,
 				stage_idx=stage_idx,
 				iter_label=f"{step1}/{steps}",
-				params=stage.params,
+				lr=float(opt.param_groups[0].get("lr", lr)) if opt is not None and opt.param_groups else float(lr),
 				level=0,
 				loss=report_loss,
 				terms=report_terms,
@@ -2273,6 +2734,7 @@ def _stage_loss_cfg(base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> Sn
 				w_dist=float(mi.w_dist) * weights.get("dist", 1.0),
 				w_vec_normal=float(mi.w_vec_normal) * weights.get("vec", 1.0),
 				w_surface_normal=float(mi.w_surface_normal) * weights.get("norm", 1.0),
+				w_z_lift=float(mi.w_z_lift) * weights.get("turn", 1.0),
 				w_smooth=float(mi.w_smooth) * weights.get("smooth", 1.0),
 				w_bend=float(mi.w_bend) * weights.get("bend", 1.0),
 				w_jac=float(mi.w_jac) * weights.get("jac", 1.0),
@@ -2289,6 +2751,7 @@ def _stage_loss_cfg(base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> Sn
 			w_dist=float(mi.w_dist) * scale,
 			w_vec_normal=float(mi.w_vec_normal) * scale,
 			w_surface_normal=float(mi.w_surface_normal) * scale,
+			w_z_lift=float(mi.w_z_lift) * scale,
 			w_smooth=float(mi.w_smooth) * scale,
 			w_bend=float(mi.w_bend) * scale,
 			w_jac=float(mi.w_jac) * scale,
@@ -2335,6 +2798,8 @@ def _objective_for_uv(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	active = _level_active_quad(_full_active_quad(fixture), int(level))
 	ext_coords = None if int(level) == 0 else _level_coords(fixture.ext_xyz.shape[:2], int(level), uv)
+	sign_i = int(fixture.metadata.get("sign", 1) or 1)
+	z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
 	return _map_init_objective(
 		uv_full=uv,
 		active_quad=active,
@@ -2347,9 +2812,13 @@ def _objective_for_uv(
 		model_valid=fixture.model_valid,
 		model_normals=fixture.model_normals,
 		model_depth=int(fixture.metadata.get("model_depth", 0) or 0),
-		sign=int(fixture.metadata.get("sign", 1) or 1),
+		sign=sign_i,
 		cfg=cfg,
 		allow_partial_model_samples=True,
+		ext_z_lift_k=None if z_lift is None else z_lift["ext_k"],
+		ext_z_lift_valid=None if z_lift is None else z_lift["ext_valid"],
+		model_z_lift_k=None if z_lift is None else z_lift["model_k"],
+		model_z_lift_valid=None if z_lift is None else z_lift["model_valid"],
 	)
 
 
@@ -2534,12 +3003,13 @@ def _level_coords(ext_shape: torch.Size | tuple[int, int], level: int, uv: torch
 _GLOBAL_PROGRESS_COLUMNS = (
 	ProgressColumn("stg", "stg", "stage index"),
 	ProgressColumn("it", "it", "stage step"),
-	ProgressColumn("params", "params", "optimized params", min_width=6),
+	ProgressColumn("lr", "lr", "optimizer learning rate", min_width=7),
 	ProgressColumn("lvl", "lvl", "minimum trained pyramid level"),
 	ProgressColumn("loss", "loss", "objective", min_width=7),
 	ProgressColumn("dist", "dst", "distance loss", min_width=7),
 	ProgressColumn("vec", "vec", "vector-normal loss", min_width=7),
 	ProgressColumn("norm", "nrm", "surface-normal loss", min_width=7),
+	ProgressColumn("turn", "turn", "lifted z-heading loss", min_width=7),
 	ProgressColumn("smooth", "smo", "uv smooth loss", min_width=7),
 	ProgressColumn("bend", "bnd", "uv bend loss", min_width=7),
 	ProgressColumn("jac", "jac", "jacobian loss", min_width=7),
@@ -2550,7 +3020,7 @@ _GLOBAL_PROGRESS_COLUMNS = (
 	ProgressColumn("it_s", "it/s", "optimizer it/s", min_width=6),
 	ProgressColumn("avgd", "avgd", "avg fixture model quad distance", min_width=7),
 	ProgressColumn("maxd", "maxd", "max fixture model quad distance", min_width=7),
-	ProgressColumn("smp", "smp", "fixture comparison samples", min_width=6),
+	ProgressColumn("smp", "smp", "objective samples", min_width=6),
 )
 
 
@@ -2559,11 +3029,11 @@ def _global_progress_widths(cfg: GlobalMapConfig) -> dict[str, int]:
 	stage_count = max(1, len(cfg.stages))
 	max_steps = max((int(stage.steps) for stage in cfg.stages), default=1)
 	values["stg"] = str(stage_count - 1)
-	values["it"] = f"{max_steps}/{max_steps}"
-	values["params"] = max((",".join(_public_stage_params(stage.params)) or "-" for stage in cfg.stages), key=len, default="-")
+	values["it"] = f"grow-r1000000:{max_steps}/{max_steps}"
+	values["lr"] = "-1.0e+99"
 	values["lvl"] = str(max((int(stage.min_scaledown) for stage in cfg.stages), default=0))
 	values["loss"] = "-1.0e+99"
-	for key in ("dist", "vec", "norm", "smooth", "bend", "jac", "metric_smooth", "area_smooth", "prior", "station"):
+	for key in ("dist", "vec", "norm", "turn", "smooth", "bend", "jac", "metric_smooth", "area_smooth", "prior", "station"):
 		values[key] = "-1.0e+99"
 	values["it_s"] = "-1.0e+99"
 	values["avgd"] = "-1.0e+99"
@@ -2585,7 +3055,7 @@ def _print_global_progress(
 	widths: dict[str, int],
 	stage_idx: int,
 	iter_label: str,
-	params: tuple[str, ...],
+	lr: float | None,
 	level: int,
 	loss: float,
 	terms: dict[str, torch.Tensor],
@@ -2595,12 +3065,13 @@ def _print_global_progress(
 	values = {
 		"stg": str(int(stage_idx)),
 		"it": str(iter_label),
-		"params": ",".join(_public_stage_params(params)) or "-",
+		"lr": format_progress_value(float(lr)) if lr is not None else "",
 		"lvl": str(int(level)),
 		"loss": format_progress_value(float(loss)),
 		"dist": format_progress_value(_global_term_value(terms, "dist")),
 		"vec": format_progress_value(_global_term_value(terms, "vec")),
 		"norm": format_progress_value(_global_term_value(terms, "norm")),
+		"turn": format_progress_value(_global_term_value(terms, "turn")),
 		"smooth": format_progress_value(_global_term_value(terms, "smooth")),
 		"bend": format_progress_value(_global_term_value(terms, "bend")),
 		"jac": format_progress_value(_global_term_value(terms, "jac")),
@@ -2611,7 +3082,7 @@ def _print_global_progress(
 		"it_s": format_progress_value(float(it_s)) if it_s is not None else "",
 		"avgd": format_progress_value(float(err["avg_model_quad_distance"])),
 		"maxd": format_progress_value(float(err["max_model_quad_distance"])),
-		"smp": str(int(err["mapping_error_samples"])),
+		"smp": str(int(_global_term_value(terms, "samples"))),
 	}
 	if int(row_idx) % 20 == 0:
 		_print_progress_legend_once(
@@ -2795,6 +3266,7 @@ class GlobalMapRuntime:
 			sign=self.sign,
 		)
 		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
+		fixture = _apply_external_quad_health_filter(fixture, base_cfg, label="runtime")
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
 		self._ensure_models(fixture, base_cfg, stage)
 		assert self.affine is not None
@@ -2864,6 +3336,8 @@ class GlobalMapRuntime:
 				("dist", "snaps_map_dist"),
 				("vec", "snaps_map_vec"),
 				("norm", "snaps_map_norm"),
+				("turn", "snaps_map_turn"),
+				("turn_smp", "snaps_map_turn_smp"),
 				("smooth", "snaps_map_smooth"),
 				("bend", "snaps_map_bend"),
 				("jac", "snaps_map_jac"),
@@ -2872,6 +3346,13 @@ class GlobalMapRuntime:
 				("prior", "snaps_map_prior"),
 			):
 				stats[stat_key] = float(_global_term_value(terms, term_key))
+			z_lift = _map_init_z_lift_for_fixture(fixture, stage_cfg, sign=int(fixture.metadata.get("sign", 1) or 1))
+			if z_lift is not None:
+				zs = z_lift["stats"]
+				stats["snaps_map_zext_bad"] = float(zs["ext_invalid"])
+				stats["snaps_map_zext_unr"] = float(zs["ext_unreachable"])
+				stats["snaps_map_zmdl_bad"] = float(zs["model_invalid"])
+				stats["snaps_map_zmdl_unr"] = float(zs["model_unreachable"])
 			if int(err["mapping_error_samples"]) > 0:
 				stats["snaps_map_avg"] = float(err["avg_model_quad_distance"])
 				stats["snaps_map_max"] = float(err["max_model_quad_distance"])
@@ -3087,6 +3568,7 @@ def optimize_fixture(
 	fixture = load_map_fixture(fixture_dir, device=device_t)
 	cfg_global = parse_global_map_config(config_path)
 	base_cfg = snap_surf_config_from_global_config(cfg_global)
+	fixture = _apply_external_quad_health_filter(fixture, base_cfg, label="fixture")
 	dtype = fixture.model_xyz.dtype
 	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
 	seed_uv = _seed_model_uv(fixture, seed_hw)
@@ -3216,7 +3698,7 @@ def optimize_fixture(
 			widths=progress_widths_run,
 			stage_idx=stage_idx,
 			iter_label=f"0/{int(stage.steps)}",
-			params=stage.params,
+			lr=float(stage.lr),
 			level=level,
 			loss=report_loss,
 			terms=report_terms,
@@ -3269,7 +3751,7 @@ def optimize_fixture(
 					widths=progress_widths_run,
 					stage_idx=stage_idx,
 					iter_label=f"{step1}/{int(stage.steps)}",
-					params=stage.params,
+					lr=float(opt.param_groups[0].get("lr", stage.lr)) if opt.param_groups else float(stage.lr),
 					level=level,
 					loss=report_loss,
 					terms=report_terms,

@@ -46,6 +46,11 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 			"progress_interval": 7,
 			"w_metric_smooth": 0.12,
 			"w_area_smooth": 0.03,
+			"z_lift_enabled": False,
+			"z_lift_refine_enabled": True,
+			"z_lift_norm_xy_min": 0.2,
+			"w_z_lift": 12.0,
+			"z_lift_huber_delta": 0.5,
 			"max_sample_distance": 500.0,
 			"max_sample_angle_deg": 45.0,
 			"sample_angle_step_fraction": 0.2,
@@ -85,6 +90,11 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertEqual(cfg.progress_interval, 100)
 		self.assertAlmostEqual(cfg.w_metric_smooth, 0.12)
 		self.assertAlmostEqual(cfg.w_area_smooth, 0.03)
+		self.assertFalse(cfg.z_lift_enabled)
+		self.assertTrue(cfg.z_lift_refine_enabled)
+		self.assertAlmostEqual(cfg.z_lift_norm_xy_min, 0.2)
+		self.assertAlmostEqual(cfg.w_z_lift, 12.0)
+		self.assertAlmostEqual(cfg.z_lift_huber_delta, 0.5)
 		self.assertAlmostEqual(cfg.max_sample_distance, 500.0)
 		self.assertAlmostEqual(cfg.max_sample_angle_deg, 45.0)
 		self.assertAlmostEqual(cfg.sample_angle_step_fraction, 0.2)
@@ -94,9 +104,11 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertFalse(cfg.fixture_export_objs)
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf._parse_map_init_config({"unknown": 1})
-		for key in ("w_metric_smooth", "w_area_smooth", "max_sample_distance", "sample_angle_step_fraction", "max_step_neighbor_ratio"):
+		for key in ("w_metric_smooth", "w_area_smooth", "w_z_lift", "z_lift_norm_xy_min", "max_sample_distance", "sample_angle_step_fraction", "max_step_neighbor_ratio"):
 			with self.assertRaises(ValueError):
 				opt_loss_snap_surf._parse_map_init_config({key: -0.1})
+		with self.assertRaises(ValueError):
+			opt_loss_snap_surf._parse_map_init_config({"z_lift_huber_delta": 0.0})
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf._parse_map_init_config({"max_sample_angle_deg": 181.0})
 		for key in ("candidate_lr", "fringe_lr"):

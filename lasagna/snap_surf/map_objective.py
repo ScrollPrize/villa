@@ -17,6 +17,183 @@ from .tensor import *
 from .legacy import _huber
 from .map_pyramid import *
 
+def _principal_angle_delta(to_angle: torch.Tensor, from_angle: torch.Tensor) -> torch.Tensor:
+	two_pi = 2.0 * math.pi
+	return torch.remainder(to_angle - from_angle + math.pi, two_pi) - math.pi
+
+def _map_init_quad_normal_headings(
+	normals: torch.Tensor,
+	*,
+	sign: int = 1,
+) -> torch.Tensor:
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	n = normals * sign_f
+	if n.ndim == 3:
+		q = 0.25 * (n[:-1, :-1] + n[1:, :-1] + n[:-1, 1:] + n[1:, 1:])
+	elif n.ndim == 4:
+		q = 0.25 * (n[:, :-1, :-1] + n[:, 1:, :-1] + n[:, :-1, 1:] + n[:, 1:, 1:])
+	else:
+		raise ValueError(f"expected 2D/3D normal grid, got shape {tuple(normals.shape)}")
+	return torch.atan2(q[..., 1], q[..., 0])
+
+def _map_init_lifted_z_heading_branches(
+	normals: torch.Tensor,
+	base_quad_valid: torch.Tensor,
+	seed_quad: tuple[int, ...],
+	*,
+	norm_xy_min: float,
+	sign: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+	if base_quad_valid.numel() == 0:
+		k_empty = torch.zeros_like(base_quad_valid, dtype=normals.dtype)
+		return k_empty, base_quad_valid.bool(), {"valid": 0.0, "invalid": 0.0, "unreachable": 0.0}
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	n = normals * sign_f
+	if n.ndim == 3:
+		q = 0.25 * (n[:-1, :-1] + n[1:, :-1] + n[:-1, 1:] + n[1:, 1:])
+	elif n.ndim == 4:
+		q = 0.25 * (n[:, :-1, :-1] + n[:, 1:, :-1] + n[:, :-1, 1:] + n[:, 1:, 1:])
+	else:
+		raise ValueError(f"expected 2D/3D normal grid, got shape {tuple(normals.shape)}")
+	phi = torch.atan2(q[..., 1], q[..., 0])
+	xy_norm = q[..., :2].norm(dim=-1)
+	valid = (
+		base_quad_valid.bool() &
+		torch.isfinite(q).all(dim=-1) &
+		torch.isfinite(phi) &
+		torch.isfinite(xy_norm) &
+		(xy_norm >= float(norm_xy_min))
+	)
+	valid_cpu = valid.detach().cpu()
+	phi_cpu = phi.detach().cpu()
+	reached_cpu = torch.zeros_like(valid_cpu, dtype=torch.bool)
+	theta_cpu = torch.full_like(phi_cpu, float("nan"))
+	k_cpu = torch.zeros_like(phi_cpu)
+	shape = tuple(int(v) for v in valid_cpu.shape)
+	if len(seed_quad) != len(shape) or any(int(seed_quad[i]) < 0 or int(seed_quad[i]) >= shape[i] for i in range(len(shape))):
+		invalid = int((base_quad_valid.bool() & ~valid).sum().detach().cpu())
+		reachable = int(reached_cpu.sum().detach().cpu())
+		valid_count = int(valid.sum().detach().cpu())
+		return k_cpu.to(device=normals.device, dtype=normals.dtype), reached_cpu.to(device=normals.device), {"valid": float(reachable), "invalid": float(invalid), "unreachable": float(valid_count)}
+	seed = tuple(int(v) for v in seed_quad)
+	if not bool(valid_cpu[seed]):
+		invalid = int((base_quad_valid.bool() & ~valid).sum().detach().cpu())
+		valid_count = int(valid.sum().detach().cpu())
+		return k_cpu.to(device=normals.device, dtype=normals.dtype), reached_cpu.to(device=normals.device), {"valid": 0.0, "invalid": float(invalid), "unreachable": float(valid_count)}
+
+	from collections import deque
+
+	reached_cpu[seed] = True
+	theta_cpu[seed] = phi_cpu[seed]
+	q_idx: deque[tuple[int, ...]] = deque([seed])
+	while q_idx:
+		idx = q_idx.popleft()
+		cur_phi = phi_cpu[idx]
+		cur_theta = theta_cpu[idx]
+		for axis in (-2, -1):
+			axis_i = len(shape) + axis
+			for step in (-1, 1):
+				nb = list(idx)
+				nb[axis_i] += step
+				if nb[axis_i] < 0 or nb[axis_i] >= shape[axis_i]:
+					continue
+				nb_t = tuple(nb)
+				if bool(reached_cpu[nb_t]) or not bool(valid_cpu[nb_t]):
+					continue
+				theta_cpu[nb_t] = cur_theta + _principal_angle_delta(phi_cpu[nb_t], cur_phi)
+				reached_cpu[nb_t] = True
+				q_idx.append(nb_t)
+	two_pi = 2.0 * math.pi
+	k_cpu = torch.where(reached_cpu, torch.round((theta_cpu - phi_cpu) / two_pi), torch.zeros_like(phi_cpu))
+	invalid = int((base_quad_valid.bool() & ~valid).sum().detach().cpu())
+	reachable = int(reached_cpu.sum().detach().cpu())
+	valid_count = int(valid.sum().detach().cpu())
+	return k_cpu.to(device=normals.device, dtype=normals.dtype), reached_cpu.to(device=normals.device), {
+		"valid": float(reachable),
+		"invalid": float(invalid),
+		"unreachable": float(max(0, valid_count - reachable)),
+	}
+
+def _map_init_z_lift_model_quad_values(
+	k_model: torch.Tensor,
+	valid_model: torch.Tensor,
+	coords3: torch.Tensor,
+	shape: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+	flat = coords3.reshape(-1, 3)
+	finite = torch.isfinite(flat).all(dim=-1)
+	safe = torch.where(torch.isfinite(flat), flat, torch.zeros_like(flat))
+	D, QH, QW = int(shape[0]), int(shape[1]), int(shape[2])
+	d = safe[:, 0]
+	h = safe[:, 1]
+	w = safe[:, 2]
+	in_bounds = finite & (d >= 0.0) & (d <= float(D - 1)) & (h >= 0.0) & (h <= float(QH)) & (w >= 0.0) & (w <= float(QW))
+	di = torch.round(d.clamp(0.0, float(D - 1))).long()
+	h0 = torch.floor(h.clamp(0.0, float(QH))).clamp(0, max(0, QH - 1)).long()
+	w0 = torch.floor(w.clamp(0.0, float(QW))).clamp(0, max(0, QW - 1)).long()
+	ok = in_bounds & valid_model[di, h0, w0].bool()
+	return k_model[di, h0, w0].reshape(coords3.shape[:-1]), ok.reshape(coords3.shape[:-1])
+
+def _map_init_z_lift_turn_values(
+	*,
+	quad_hw: torch.Tensor,
+	sample_count: int,
+	n_ext: torch.Tensor,
+	n_model_raw: torch.Tensor,
+	coords3: torch.Tensor,
+	sign: int,
+	ext_k: torch.Tensor | None,
+	ext_valid: torch.Tensor | None,
+	model_k: torch.Tensor | None,
+	model_valid: torch.Tensor | None,
+	cfg: SnapSurfMapInitConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	if (
+		not bool(cfg.z_lift_enabled)
+		or ext_k is None
+		or ext_valid is None
+		or model_k is None
+		or model_valid is None
+		or quad_hw.numel() == 0
+	):
+		return n_ext.new_zeros(n_ext.shape[:-1]), torch.zeros(n_ext.shape[:-1], device=n_ext.device, dtype=torch.bool)
+	Q = int(quad_hw.shape[0])
+	S = int(sample_count)
+	ek = ext_k[quad_hw[:, 0], quad_hw[:, 1]].to(device=n_ext.device, dtype=n_ext.dtype)
+	ev = ext_valid[quad_hw[:, 0], quad_hw[:, 1]].to(device=n_ext.device).bool()
+	ek_f = ek[:, None].expand(Q, S).reshape(Q * S)
+	ev_f = ev[:, None].expand(Q, S).reshape(Q * S)
+	mk, mv = _map_init_z_lift_model_quad_values(
+		model_k.to(device=n_ext.device, dtype=n_ext.dtype),
+		model_valid.to(device=n_ext.device).bool(),
+		coords3,
+		tuple(int(v) for v in model_valid.shape),
+	)
+	mk_f = mk.reshape(Q * S)
+	mv_f = mv.reshape(Q * S)
+	sign_f = 1.0 if int(sign) >= 0 else -1.0
+	n_model_signed = n_model_raw * sign_f
+	phi_ext = torch.atan2(n_ext[..., 1], n_ext[..., 0])
+	phi_model = torch.atan2(n_model_signed[..., 1], n_model_signed[..., 0])
+	ext_xy = n_ext[..., :2].norm(dim=-1)
+	model_xy = n_model_signed[..., :2].norm(dim=-1)
+	valid = (
+		ev_f &
+		mv_f &
+		torch.isfinite(phi_ext) &
+		torch.isfinite(phi_model) &
+		torch.isfinite(ek_f) &
+		torch.isfinite(mk_f) &
+		torch.isfinite(ext_xy) &
+		torch.isfinite(model_xy) &
+		(ext_xy >= float(cfg.z_lift_norm_xy_min)) &
+		(model_xy >= float(cfg.z_lift_norm_xy_min))
+	)
+	two_pi = 2.0 * math.pi
+	residual = (phi_ext + two_pi * ek_f) - (phi_model + two_pi * mk_f)
+	values = _huber(residual, delta=float(cfg.z_lift_huber_delta))
+	return values, valid & torch.isfinite(values)
+
 def _map_init_distance_multiplier(
 	c_ext: torch.Tensor,
 	c_model: torch.Tensor,
@@ -589,6 +766,10 @@ def _map_init_objective(
 	w_jac_mult: float = 1.0,
 	uv_prior: torch.Tensor | None = None,
 	allow_partial_model_samples: bool = False,
+	ext_z_lift_k: torch.Tensor | None = None,
+	ext_z_lift_valid: torch.Tensor | None = None,
+	model_z_lift_k: torch.Tensor | None = None,
+	model_z_lift_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
@@ -612,6 +793,8 @@ def _map_init_objective(
 	sample_loss = z
 	sample_bad_frac = z
 	sample_quad_ok_grid = torch.zeros_like(active_quad, dtype=torch.bool)
+	turn_loss = z
+	turn_sample_count = 0
 	quad_hw = active_quad.nonzero(as_tuple=False)
 	if int(quad_hw.shape[0]) > 0:
 		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_quad_sample_tensors(
@@ -672,6 +855,19 @@ def _map_init_objective(
 		dist_values = _huber(d, delta=cfg.huber_delta) * dist_mult
 		vec_values = (1.0 - c_ext) + (1.0 - c_model)
 		norm_values = 1.0 - c_norm
+		turn_values, turn_valid = _map_init_z_lift_turn_values(
+			quad_hw=quad_hw,
+			sample_count=S,
+			n_ext=n_ext,
+			n_model_raw=n_model_raw,
+			coords3=safe_coords,
+			sign=sign,
+			ext_k=ext_z_lift_k,
+			ext_valid=ext_z_lift_valid,
+			model_k=model_z_lift_k,
+			model_valid=model_z_lift_valid,
+			cfg=mi,
+		)
 		base_finite = (
 			sample_ext_ok.reshape(Q * S) &
 			quad_uv_ok[:, None].expand(Q, S).reshape(Q * S) &
@@ -691,6 +887,14 @@ def _map_init_objective(
 			torch.isfinite(vec_values) &
 			torch.isfinite(norm_values)
 		)
+		if (
+			bool(mi.z_lift_enabled)
+			and ext_z_lift_k is not None
+			and ext_z_lift_valid is not None
+			and model_z_lift_k is not None
+			and model_z_lift_valid is not None
+		):
+			model_finite = model_finite & turn_valid
 		finite = base_finite & model_finite
 		limited_finite = finite & sample_limit_ok
 		finite_qs = finite.reshape(Q, S)
@@ -715,7 +919,8 @@ def _map_init_objective(
 			sample_values = (
 				float(mi.w_dist) * dist_values +
 				float(mi.w_vec_normal) * vec_values +
-				float(mi.w_surface_normal) * norm_values
+				float(mi.w_surface_normal) * norm_values +
+				float(mi.w_z_lift) * turn_values
 			)
 			sample_loss = sample_values[finite].mean()
 		if bool(loss_quad.any().detach().cpu()):
@@ -726,18 +931,23 @@ def _map_init_objective(
 			dist_grid = dist_values.reshape(Q, S)
 			vec_grid = vec_values.reshape(Q, S)
 			norm_grid = norm_values.reshape(Q, S)
+			turn_grid = turn_values.reshape(Q, S)
 			d_grid = d.reshape(Q, S)
 			dist_q_all = torch.where(loss_sample, dist_grid, dist_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
 			vec_q_all = torch.where(loss_sample, vec_grid, vec_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
 			norm_q_all = torch.where(loss_sample, norm_grid, norm_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
+			turn_q_all = torch.where(loss_sample, turn_grid, turn_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
 			d_q_all = torch.where(loss_sample, d_grid, d_grid.new_zeros(Q, S)).sum(dim=1) / loss_count
 			dist_q = dist_q_all[loss_quad]
 			vec_q = vec_q_all[loss_quad]
 			norm_q = norm_q_all[loss_quad]
+			turn_q = turn_q_all[loss_quad]
 			d_q = d_q_all[loss_quad]
 			dist_loss = dist_q.mean()
 			vec_loss = vec_q.mean()
 			norm_loss = norm_q.mean()
+			turn_loss = turn_q.mean()
+			turn_sample_count = int(loss_sample.sum().detach().cpu())
 			dist_avg = d_q.mean()
 		else:
 			model_bad_count = active_count
@@ -865,6 +1075,7 @@ def _map_init_objective(
 		float(mi.w_dist) * dist_loss +
 		float(mi.w_vec_normal) * vec_loss +
 		float(mi.w_surface_normal) * norm_loss +
+		float(mi.w_z_lift) * turn_loss +
 		float(mi.w_smooth) * smooth_loss +
 		float(mi.w_bend) * bend_loss +
 		float(mi.w_jac) * float(w_jac_mult) * jac_loss +
@@ -877,6 +1088,7 @@ def _map_init_objective(
 		"dist": dist_loss.detach(),
 		"vec": vec_loss.detach(),
 		"norm": norm_loss.detach(),
+		"turn": turn_loss.detach(),
 		"smooth": smooth_loss.detach(),
 		"bend": bend_loss.detach(),
 		"jac": jac_loss.detach(),
@@ -899,6 +1111,7 @@ def _map_init_objective(
 		"active": torch.tensor(float(active_count), device=uv_full.device, dtype=uv_full.dtype),
 		"reg": torch.tensor(float(reg_count), device=uv_full.device, dtype=uv_full.dtype),
 		"samples": torch.tensor(float(finite_count), device=uv_full.device, dtype=uv_full.dtype),
+		"turn_smp": torch.tensor(float(turn_sample_count), device=uv_full.device, dtype=uv_full.dtype),
 		"sample_loss": sample_loss.detach(),
 		"sample_total": torch.tensor(float(sample_total_count), device=uv_full.device, dtype=uv_full.dtype),
 		"sample_valid": torch.tensor(float(sample_valid_count), device=uv_full.device, dtype=uv_full.dtype),
