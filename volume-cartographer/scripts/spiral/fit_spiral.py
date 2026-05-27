@@ -113,6 +113,8 @@ default_config = {
     'loss_weight_shell_no_cross': 0.0,
     'loss_weight_shell_z_drift': 0.0,
     'loss_weight_shell_patch_radius': 1.0,
+    'weight_decay_gap_expander': 0.0,
+    'weight_decay_flow_field': 0.0,
     'loss_start_patch_dt': 9000,
     'output_first_winding': 10,
     'output_winding_margin': 4,
@@ -3007,7 +3009,18 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 'increase gap_expander_num_windings or lower shell_outer_winding_idx'
             )
 
-    optimiser = torch.optim.Adam(spiral_and_transform.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
+    flow_field_params = list(spiral_and_transform.flow_field_1.parameters())
+    gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
+    linear_params = [spiral_and_transform.linear_logits]
+    grouped_ids = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
+    other_params = [p for p in spiral_and_transform.parameters() if id(p) not in grouped_ids]
+    param_groups = [
+        {'params': other_params, 'weight_decay': 0.0},
+        {'params': linear_params, 'weight_decay': 0.0},
+        {'params': gap_expander_params, 'weight_decay': cfg['weight_decay_gap_expander']},
+        {'params': flow_field_params, 'weight_decay': cfg['weight_decay_flow_field']},
+    ]
+    optimiser = torch.optim.AdamW(param_groups, lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
     if cfg['exp_lr_schedule']:
         gamma = cfg['lr_final_factor'] ** (1.0 / max(1, num_training_steps))
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=gamma)
