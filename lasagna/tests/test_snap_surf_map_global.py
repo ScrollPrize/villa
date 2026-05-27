@@ -32,6 +32,7 @@ from snap_surf.map_global import (
 	_affine_seed_quad_expansion_rows,
 	_affine_seed_grid_candidates,
 	_objective_for_uv,
+	_run_affine_seed_quad_expansion_reopt,
 	_select_affine_seed_grid_candidate,
 	_seed_quad_affine_init_result,
 	_stage_loss_cfg,
@@ -789,6 +790,42 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual([int(row["quads"]) for row in rows], [1, 17 * 17, 19 * 19])
 			self.assertTrue(all(math.isfinite(float(row["loss"])) for row in rows))
 			self.assertTrue(all(int(row["samples"]) > 0 for row in rows))
+
+	def test_seed_quad_affine_expansion_reopt_runs_each_radius(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=12, w=12)
+			fixture = load_map_fixture(tmp)
+			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+			affine = AffineMapModel(
+				ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+				device=fixture.model_xyz.device,
+				dtype=fixture.model_xyz.dtype,
+				initial=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=fixture.model_xyz.dtype),
+			)
+			initial = _affine_seed_quad_expansion_rows(
+				affine=affine.affine.detach(),
+				seed_ext_quad=(5, 5),
+				fixture=fixture,
+				stage_cfg=cfg,
+				sign=1,
+			)
+
+			rows = _run_affine_seed_quad_expansion_reopt(
+				affine=affine,
+				fixture=fixture,
+				stage_cfg=cfg,
+				seed_ext_quad=(5, 5),
+				seed_hw=torch.tensor([5.0, 5.0]),
+				station_target=torch.tensor([5.25, 5.5]),
+				w_station=0.0,
+				steps=2,
+				lr=0.05,
+			)
+
+			self.assertEqual([int(row["radius"]) for row in rows], [0, 8])
+			self.assertTrue(all(int(row["iters"]) == 2 for row in rows))
+			self.assertLess(float(rows[0]["loss"]), float(initial[0]["loss"]))
+			self.assertTrue(torch.isfinite(affine.affine).all())
 
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
