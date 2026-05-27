@@ -3786,6 +3786,10 @@ class GlobalMapRuntime:
 		startup_health_s = time.perf_counter() - _t_startup
 		cache_stats["health_ms"] = float(cache_stats.get("health_ms", 0.0)) + 1000.0 * float(startup_health_s)
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
+		stage_cfg = replace(
+			stage_cfg,
+			map_init=replace(stage_cfg.map_init, z_lift_enabled=False, w_z_lift=0.0),
+		)
 		self._ensure_models(fixture, base_cfg, stage)
 		assert self.affine is not None
 		seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
@@ -3837,13 +3841,7 @@ class GlobalMapRuntime:
 				self.sign = int(seed_result.sign)
 		fixture.metadata["sign"] = int(self.sign)
 		_t_startup = time.perf_counter()
-		stage_z_lift = self._z_lift_for_stage(
-			fixture,
-			stage_cfg,
-			external_surface_index=int(external_surface_index),
-			mesh_epoch=int(mesh_epoch),
-			cache_stats=cache_stats,
-		)
+		stage_z_lift = None
 		startup_z_lift_s = time.perf_counter() - _t_startup
 		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
 		startup_initial_eval_s = 0.0

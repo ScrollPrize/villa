@@ -602,7 +602,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertNotIn("snaps_map_avg", stats)
 			self.assertNotIn("snaps_map_max", stats)
 
-	def test_live_runtime_reuses_map_init_caches_by_surface_index_and_mesh_epoch(self) -> None:
+	def test_live_runtime_disables_z_lift_by_default(self) -> None:
 		runtime = GlobalMapRuntime(base={}, seed_xyz=(2.0, 2.0, 0.0))
 		h, w = 5, 5
 		model_xyz = _plane_xyz(h=h + 2, w=w + 2, z=0.0).unsqueeze(0)
@@ -612,15 +612,14 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
 		model_normals = _xy_normals_like((1, h + 2, w + 2))
 		ext_normals = _xy_normals_like((h, w))
-		stage = GlobalMapStageConfig(
-			steps=0,
-			lr=0.0,
-			params=("affine",),
-			args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "w_z_lift": 1.0},
-		)
 
-		first = runtime.run_stage(
-			stage=stage,
+		stats = runtime.run_stage(
+			stage=GlobalMapStageConfig(
+				steps=0,
+				lr=0.0,
+				params=("affine",),
+				args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "w_z_lift": 1.0},
+			),
 			model_xyz=model_xyz,
 			model_normals=model_normals,
 			model_valid=model_valid,
@@ -631,42 +630,12 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			external_surface_index=0,
 			mesh_epoch=0,
 		)
-		second = runtime.run_stage(
-			stage=stage,
-			model_xyz=model_xyz.clone(),
-			model_normals=model_normals.clone(),
-			model_valid=model_valid.clone(),
-			ext_xyz=ext_xyz.clone(),
-			ext_valid=ext_valid.clone(),
-			ext_normals=ext_normals.clone(),
-			ext_quad_valid=ext_quad.clone(),
-			external_surface_index=0,
-			mesh_epoch=0,
-		)
-		third = runtime.run_stage(
-			stage=stage,
-			model_xyz=model_xyz.clone(),
-			model_normals=model_normals.clone(),
-			model_valid=model_valid.clone(),
-			ext_xyz=ext_xyz.clone(),
-			ext_valid=ext_valid.clone(),
-			ext_normals=ext_normals.clone(),
-			ext_quad_valid=ext_quad.clone(),
-			external_surface_index=0,
-			mesh_epoch=1,
-		)
 
-		self.assertEqual(first["snaps_map_health_cache_miss"], 1.0)
-		self.assertEqual(first["snaps_map_zext_cache_miss"], 1.0)
-		self.assertEqual(first["snaps_map_zmdl_cache_miss"], 1.0)
-		self.assertEqual(second["snaps_map_health_cache_hit"], 1.0)
-		self.assertEqual(second["snaps_map_zext_cache_hit"], 1.0)
-		self.assertEqual(second["snaps_map_zmdl_cache_hit"], 1.0)
-		self.assertEqual(second["snaps_map_zext_cache_miss"], 0.0)
-		self.assertEqual(second["snaps_map_zmdl_cache_miss"], 0.0)
-		self.assertEqual(third["snaps_map_health_cache_hit"], 1.0)
-		self.assertEqual(third["snaps_map_zext_cache_hit"], 1.0)
-		self.assertEqual(third["snaps_map_zmdl_cache_miss"], 1.0)
+		self.assertEqual(stats["snaps_map_turn"], 0.0)
+		self.assertEqual(stats["snaps_map_turn_smp"], 0.0)
+		self.assertEqual(stats["snaps_map_zext_cache_miss"], 0.0)
+		self.assertEqual(stats["snaps_map_zmdl_cache_miss"], 0.0)
+		self.assertEqual(stats["snaps_map_startup_turn_model_ms"], 0.0)
 
 	def test_live_runtime_auto_stop_callback_stops_map_stage(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:

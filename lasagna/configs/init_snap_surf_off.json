@@ -104,7 +104,7 @@
 		},
 		{
 			"name": "map_uv_coarse",
-			"steps": 200,
+			"steps": "auto",
 			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
@@ -115,7 +115,7 @@
 		},
 		{
 			"name": "map_uv_refine",
-			"steps": 200,
+			"steps": "auto",
 			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
@@ -126,7 +126,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": "auto",
+			"steps": 0,
 			"lr": 1.0,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,

@@ -3448,19 +3448,19 @@ def optimize(
 			if snap_surf_map_opt_stage is not None:
 				with torch.no_grad():
 					res_map_after = model(data, needs=_map_forward_needs)
-				map_stage_for_step = snap_surf_map_opt_stage
+				map_args = dict(snap_surf_map_opt_stage.args)
+				map_args["startup_timing"] = False
 				if step + 1 != max_steps:
-					map_args = dict(snap_surf_map_opt_stage.args)
 					map_args.pop("debug_obj_dir", None)
-					map_stage_for_step = snap_surf_map_global.GlobalMapStageConfig(
-						name=snap_surf_map_opt_stage.name,
-						steps=snap_surf_map_opt_stage.steps,
-						lr=snap_surf_map_opt_stage.lr,
-						params=snap_surf_map_opt_stage.params,
-						min_scaledown=snap_surf_map_opt_stage.min_scaledown,
-						w_fac=snap_surf_map_opt_stage.w_fac,
-						args=map_args,
-					)
+				map_stage_for_step = snap_surf_map_global.GlobalMapStageConfig(
+					name=snap_surf_map_opt_stage.name,
+					steps=snap_surf_map_opt_stage.steps,
+					lr=snap_surf_map_opt_stage.lr,
+					params=snap_surf_map_opt_stage.params,
+					min_scaledown=snap_surf_map_opt_stage.min_scaledown,
+					w_fac=snap_surf_map_opt_stage.w_fac,
+					args=map_args,
+				)
 				map_stats = _run_snap_global_map_stage(
 					stage=map_stage_for_step,
 					res=res_map_after,

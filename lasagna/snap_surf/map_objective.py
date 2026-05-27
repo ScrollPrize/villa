@@ -1197,13 +1197,14 @@ def _map_init_objective(
 			torch.isfinite(vec_values) &
 			torch.isfinite(norm_values)
 		)
-		if (
+		z_lift_active = (
 			bool(mi.z_lift_enabled)
 			and ext_z_lift_theta is not None
 			and ext_z_lift_valid is not None
 			and model_z_lift_theta is not None
 			and model_z_lift_valid is not None
-		):
+		)
+		if z_lift_active:
 			model_finite = model_finite & turn_valid
 		finite = base_finite & model_finite
 		limited_finite = finite & sample_limit_ok
@@ -1238,7 +1239,7 @@ def _map_init_objective(
 			model_bad_count_t = (active_quad & ~valid_quad).to(dtype=uv_full.dtype).sum()
 			loss_quad_count_t = loss_quad.to(dtype=uv_full.dtype).sum()
 			valid_quad_count_t = valid_quad.to(dtype=uv_full.dtype).sum()
-			turn_sample_count_t = finite_count_t
+			turn_sample_count_t = finite_count_t if z_lift_active else uv_full.new_zeros(())
 		dist_q_all = torch.where(loss_sample, dist_values, dist_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
 		vec_q_all = torch.where(loss_sample, vec_values, vec_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
 		norm_q_all = torch.where(loss_sample, norm_values, norm_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
