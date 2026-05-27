@@ -4067,6 +4067,72 @@ class GlobalMapRuntime:
 			)
 		return stats
 
+	def snap_loss_prefetch_items(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		ext_xyz: torch.Tensor,
+		ext_valid: torch.Tensor,
+		ext_normals: torch.Tensor,
+		ext_quad_valid: torch.Tensor,
+		offset: float = 0.0,
+		data=None,
+		strip_samples: int = 5,
+	) -> dict[str, torch.Tensor]:
+		if float(offset) == 0.0:
+			return {}
+		if data is None:
+			return {}
+		if self.affine is None:
+			fixture = _fixture_from_live_tensors(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad_valid,
+				seed_xyz=self.seed_xyz,
+				sign=self.sign,
+			)
+			base_cfg = snap_surf_config_from_global_config(self.cfg_global)
+			self._ensure_models(fixture, base_cfg, GlobalMapStageConfig(params=("affine",)))
+		with torch.no_grad():
+			uv = self._uv().detach()
+			depth = torch.zeros((*uv.shape[:-1], 1), device=uv.device, dtype=uv.dtype)
+			coords = torch.cat([depth, uv], dim=-1)
+			model_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+			ext_ok = ext_valid.bool() & torch.isfinite(ext_xyz).all(dim=-1)
+			finite = torch.isfinite(coords).all(dim=-1)
+			valid = finite & ext_ok & model_ok
+			if not bool(valid.any().detach().cpu()):
+				return {}
+			safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+			model_pos = _sample_surface_grid(model_xyz, safe_coords)
+			model_n = torch.nn.functional.normalize(
+				_sample_surface_grid(model_normals.detach(), safe_coords),
+				dim=-1,
+				eps=1.0e-8,
+			)
+			model_n = model_n * (1.0 if int(self.sign) >= 0 else -1.0)
+			sample_valid = (
+				valid &
+				torch.isfinite(ext_xyz).all(dim=-1) &
+				torch.isfinite(model_pos).all(dim=-1) &
+				torch.isfinite(model_n).all(dim=-1)
+			)
+			if not bool(sample_valid.any().detach().cpu()):
+				return {}
+			strip_samples_i = max(2, int(strip_samples))
+			t = torch.linspace(0.0, 1.0, strip_samples_i, device=model_xyz.device, dtype=model_xyz.dtype)
+			ext_xyz_valid = ext_xyz.detach()[sample_valid]
+			model_pos_valid = model_pos.detach()[sample_valid]
+			diff = model_pos_valid - ext_xyz_valid
+			strip = ext_xyz_valid.unsqueeze(-2) + t.view(1, strip_samples_i, 1) * diff.unsqueeze(-2)
+			return {"grad_mag": strip.reshape(1, 1, -1, 3).contiguous()}
+
 	def snap_loss(
 		self,
 		*,

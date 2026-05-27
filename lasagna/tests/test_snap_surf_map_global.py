@@ -255,6 +255,47 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertAlmostEqual(stats["snaps_map_snap_abs"], 1.0, places=6)
 		self.assertAlmostEqual(stats["snaps_map_snap_max"], 1.0, places=6)
 
+	def test_snap_loss_prefetch_items_cover_winding_strip_query(self) -> None:
+		h, w = 5, 5
+		runtime = GlobalMapRuntime()
+		model_xyz = _plane_xyz(h=h, w=w, z=2.0).unsqueeze(0)
+		model_normals = _normals_3d(1, h, w)
+		model_valid = torch.ones(1, h, w, dtype=torch.bool)
+		ext_xyz = _plane_xyz(h=h, w=w, z=0.0)
+		ext_valid = torch.ones(h, w, dtype=torch.bool)
+		ext_normals = _normals_2d(h, w)
+		ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
+		data = _RejectNonFiniteGradData(value=0.5)
+
+		items = runtime.snap_loss_prefetch_items(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad,
+			offset=1.0,
+			data=data,
+			strip_samples=3,
+		)
+		runtime.snap_loss(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad,
+			offset=1.0,
+			data=data,
+			strip_samples=3,
+		)
+
+		self.assertIn("grad_mag", items)
+		self.assertEqual(int(items["grad_mag"].reshape(-1, 3).shape[0]), int(data.queries[0].reshape(-1, 3).shape[0]))
+		self.assertTrue(torch.allclose(items["grad_mag"].reshape(-1, 3), data.queries[0].reshape(-1, 3)))
+
 	def test_snap_loss_nonzero_offset_measures_tangential_segment_length(self) -> None:
 		h, w = 5, 5
 		runtime = GlobalMapRuntime()

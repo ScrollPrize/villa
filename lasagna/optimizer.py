@@ -1292,6 +1292,7 @@ def optimize(
 				mesh_normals=True,
 				ext_surfaces=True,
 				lr_prefetch_channels=frozenset({"grad_mag"}),
+				prefetch_snap_surf_map=True,
 			),
 		},
 		"cyl_normal": {
@@ -2468,6 +2469,25 @@ def optimize(
 						_loss_prefetch_items,
 						opt_loss_winding_density.ext_offset_prefetch_items_for_result(res=res_),
 					)
+				if needs_.prefetch_snap_surf_map:
+					records = getattr(res_, "ext_surfaces", None)
+					if records and res_.normals is not None:
+						ext_xyz, ext_valid, ext_normals, ext_quad_valid, offset = _unpack_ext_surface_record(records[0])
+						_add_prefetch_items(
+							_loss_prefetch_items,
+							_snap_global_runtime_for().snap_loss_prefetch_items(
+								model_xyz=res_.xyz_lr,
+								model_normals=res_.normals,
+								model_valid=torch.isfinite(res_.xyz_lr).all(dim=-1),
+								ext_xyz=ext_xyz,
+								ext_valid=ext_valid,
+								ext_normals=ext_normals,
+								ext_quad_valid=ext_quad_valid,
+								offset=offset,
+								data=res_.data,
+								strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
+							),
+						)
 			if not _loss_prefetch_items:
 				return
 			for _cache in _active_caches:

@@ -62,6 +62,7 @@ class ModelForwardNeeds:
 	prefetch_cyl_grad_mask: bool = False
 	prefetch_ext_offset: bool = False
 	prefetch_corr_points: bool = False
+	prefetch_snap_surf_map: bool = False
 	flatten: bool = False
 
 	def __post_init__(self) -> None:
@@ -131,6 +132,7 @@ class ModelForwardNeeds:
 				prefetch_cyl_grad_mask=out.prefetch_cyl_grad_mask or other.prefetch_cyl_grad_mask,
 				prefetch_ext_offset=out.prefetch_ext_offset or other.prefetch_ext_offset,
 				prefetch_corr_points=out.prefetch_corr_points or other.prefetch_corr_points,
+				prefetch_snap_surf_map=out.prefetch_snap_surf_map or other.prefetch_snap_surf_map,
 				flatten=out.flatten or other.flatten,
 			)
 		return out
@@ -157,6 +159,8 @@ class ModelForwardNeeds:
 			nograd_channels.add("grad_mag")
 		if self.prefetch_corr_points:
 			nograd_channels.update({"grad_mag", "nx", "ny"})
+		if self.prefetch_snap_surf_map:
+			nograd_channels.add("grad_mag")
 		return frozenset(grad_channels), frozenset(nograd_channels)
 
 	def prefetch_channels(self) -> frozenset[str]:
