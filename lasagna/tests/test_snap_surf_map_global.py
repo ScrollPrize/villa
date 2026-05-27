@@ -821,16 +821,68 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				steps=2,
 				lr=0.05,
 				status_interval=1,
+				lr_warmup_steps=0,
 				stage_idx=0,
 				progress_widths_run=None,
 			)
 
-			self.assertEqual([int(row["radius"]) for row in rows], [0, 0, 8, 8])
+			self.assertEqual([int(row["radius"]) for row in rows], [8, 8, 8])
 			self.assertEqual(progress_rows, 0)
-			self.assertEqual([int(row["iters"]) for row in rows], [1, 2, 1, 2])
-			self.assertLess(float(rows[1]["loss"]), float(initial[0]["loss"]))
-			self.assertGreater(float(rows[1]["loss_gain"]), 0.0)
+			self.assertEqual([int(row["iters"]) for row in rows], [0, 1, 2])
+			self.assertAlmostEqual(float(rows[0]["loss"]), float(initial[1]["loss"]), places=5)
+			self.assertEqual(float(rows[0]["loss_gain"]), 0.0)
+			self.assertEqual(float(rows[0]["lr"]), 0.05)
+			self.assertEqual(float(rows[1]["lr"]), 0.05)
+			self.assertLess(float(rows[2]["loss"]), float(initial[1]["loss"]))
+			self.assertGreater(float(rows[2]["loss_gain"]), 0.0)
 			self.assertTrue(torch.isfinite(affine.affine).all())
+
+	def test_seed_quad_affine_expansion_reopt_uses_stage_lr_warmup(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=12, w=12)
+			fixture = load_map_fixture(tmp)
+			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+			initial = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=fixture.model_xyz.dtype)
+			warm = AffineMapModel(
+				ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+				device=fixture.model_xyz.device,
+				dtype=fixture.model_xyz.dtype,
+				initial=initial,
+			)
+			half_lr = AffineMapModel(
+				ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+				device=fixture.model_xyz.device,
+				dtype=fixture.model_xyz.dtype,
+				initial=initial,
+			)
+			common = dict(
+				fixture=fixture,
+				stage_cfg=cfg,
+				seed_ext_quad=(5, 5),
+				seed_hw=torch.tensor([5.0, 5.0]),
+				station_target=torch.tensor([5.25, 5.5]),
+				w_station=0.0,
+				steps=1,
+				status_interval=1,
+				stage_idx=0,
+				progress_widths_run=None,
+			)
+
+			_run_affine_seed_quad_expansion_reopt(
+				affine=warm,
+				lr=0.05,
+				lr_warmup_steps=2,
+				**common,
+			)
+			rows, _progress_rows = _run_affine_seed_quad_expansion_reopt(
+				affine=half_lr,
+				lr=0.025,
+				lr_warmup_steps=0,
+				**common,
+			)
+
+			self.assertEqual(float(rows[1]["lr"]), 0.025)
+			self.assertTrue(torch.allclose(warm.affine, half_lr.affine, atol=1.0e-6, rtol=1.0e-6))
 
 	def test_live_runtime_seed_quad_init_uses_shared_expansion_reopt(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -842,7 +894,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				steps=0,
 				lr=0.05,
 				params=("affine",),
-				args={"affine_seed_quad_init": {"expansion_reopt_steps": 1, "grid_search": False}},
+				args={"lr_warmup_steps": 4, "affine_seed_quad_init": {"expansion_reopt_steps": 1, "grid_search": False}},
 			)
 			stdout = StringIO()
 
@@ -858,7 +910,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 					ext_quad_valid=fixture.ext_quad_valid,
 				)
 
-			self.assertIn("grow-r", stdout.getvalue())
+			text = stdout.getvalue()
+			self.assertIn("affine seed quad expansion reopt opts", text)
+			self.assertIn("stage_lr=0.05", text)
+			self.assertIn("lr=0.05", text)
+			self.assertIn("steps_per_radius=1", text)
+			self.assertIn("lr_warmup_steps=4", text)
+			self.assertIn("grow-r8 1/1 lr=0.0125", text)
+			self.assertIn("start_radius=8", text)
+			self.assertIn("weights=", text)
+			self.assertIn("grow-r", text)
 			self.assertIn("snaps_map_loss", stats)
 			self.assertEqual(runtime.sign, 1)
 

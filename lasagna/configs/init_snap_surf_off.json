@@ -59,9 +59,10 @@
 		{
 			"name": "affine_seed_quad_init",
 			"steps": "auto",
-			"lr": 0.001,
+			"lr": 0.0001,
 			"params": ["map_surf_affine"],
 			"args": {
+				"lr_warmup_steps": 50,
 				"status_interval": 1,
 				"subdiv": 2,
 				"map_global": {

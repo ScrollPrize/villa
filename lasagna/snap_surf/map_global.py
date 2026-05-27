@@ -36,6 +36,16 @@ from .map_pyramid import (
 from .tensor import _quad_valid_at_coords, _sample_surface_grid
 
 
+_PRINTED_PROGRESS_LEGENDS: set[str] = set()
+
+
+def _print_progress_legend_once(*, prefix: str, items: list[tuple[str, str]]) -> None:
+	if prefix in _PRINTED_PROGRESS_LEGENDS:
+		return
+	_PRINTED_PROGRESS_LEGENDS.add(prefix)
+	print_progress_legend(prefix=prefix, items=items)
+
+
 @dataclass(frozen=True)
 class GlobalMapStageConfig:
 	name: str = ""
@@ -118,6 +128,12 @@ def _public_stage_params(params: tuple[str, ...]) -> tuple[str, ...]:
 def _stage_param_label(params: tuple[str, ...], *, fallback: str) -> str:
 	public = _public_stage_params(params)
 	return "_".join(public) if public else fallback
+
+
+def _stage_w_fac_label(w_fac: float | dict[str, float]) -> str:
+	if isinstance(w_fac, dict):
+		return json.dumps({str(k): float(v) for k, v in sorted(w_fac.items())}, sort_keys=True, separators=(",", ":"))
+	return format_progress_value(float(w_fac))
 
 
 def _canonical_stage_params(params: tuple[str, ...], *, normal_lasagna: bool = False) -> tuple[str, ...]:
@@ -888,6 +904,14 @@ def _seed_quad_expansion_radii(
 	return radii
 
 
+def _seed_quad_expansion_reopt_radii(
+	active: torch.Tensor,
+	seed_ext_quad: tuple[int, int],
+) -> list[int]:
+	radii = _seed_quad_expansion_radii(active, seed_ext_quad)
+	return radii[1:] if len(radii) > 1 else radii
+
+
 def _seed_quad_expansion_active_mask(
 	active: torch.Tensor,
 	seed_ext_quad: tuple[int, int],
@@ -1039,7 +1063,7 @@ def _print_affine_seed_quad_expansion_diagnostic(
 			"quad_success": "100000000",
 		},
 	)
-	print_progress_legend(
+	_print_progress_legend_once(
 		prefix="[snap_surf.map_global] affine seed quad expansion loss",
 		items=[(col.label, col.description) for col in _SEED_EXPANSION_COLUMNS],
 	)
@@ -1067,6 +1091,7 @@ def _run_affine_seed_quad_expansion_reopt(
 	affine: AffineMapModel,
 	fixture: MapFixture,
 	stage_cfg: SnapSurfConfig,
+	stage: GlobalMapStageConfig | None = None,
 	seed_ext_quad: tuple[int, int],
 	seed_hw: torch.Tensor,
 	station_target: torch.Tensor,
@@ -1074,6 +1099,7 @@ def _run_affine_seed_quad_expansion_reopt(
 	steps: int,
 	lr: float,
 	status_interval: int,
+	lr_warmup_steps: int,
 	stage_idx: int,
 	progress_widths_run: dict[str, int] | None = None,
 	progress_row_idx: int = 0,
@@ -1082,11 +1108,35 @@ def _run_affine_seed_quad_expansion_reopt(
 	steps_i = max(0, int(steps))
 	if steps_i <= 0:
 		return [], 0
+	lr_warmup_steps_i = max(0, int(lr_warmup_steps))
 	status_interval_i = max(0, int(status_interval))
 	active_full = _full_active_quad(fixture)
-	radii = _seed_quad_expansion_radii(active_full, seed_ext_quad)
+	radii = _seed_quad_expansion_reopt_radii(active_full, seed_ext_quad)
 	rows: list[dict[str, float]] = []
 	progress_rows = 0
+	mi = stage_cfg.map_init
+	params = "map_surf_affine"
+	stage_name = "-" if stage is None or not stage.name else stage.name
+	stage_lr = float("nan") if stage is None else float(stage.lr)
+	w_fac = "-" if stage is None else _stage_w_fac_label(stage.w_fac)
+	print(
+		"[snap_surf.map_global] affine seed quad expansion reopt opts "
+		f"stg={int(stage_idx)} name={stage_name} params={params} optimizer=Adam "
+		f"stage_lr={stage_lr:.6g} lr={float(lr):.6g} steps_per_radius={steps_i} "
+		f"lr_warmup_steps={lr_warmup_steps_i} status_interval={status_interval_i} radii={len(radii)} "
+		f"start_radius={int(radii[0]) if radii else 0} max_radius={int(radii[-1]) if radii else 0} "
+		f"w_fac={w_fac} "
+		"weights="
+		f"dist:{float(mi.w_dist):.6g},vec:{float(mi.w_vec_normal):.6g},norm:{float(mi.w_surface_normal):.6g},"
+		f"smooth:{float(mi.w_smooth):.6g},bend:{float(mi.w_bend):.6g},jac:{float(mi.w_jac):.6g},"
+		f"metric:{float(mi.w_metric_smooth):.6g},area:{float(mi.w_area_smooth):.6g},"
+		f"prior:{float(mi.w_dense_prior):.6g},station:{float(w_station):.6g}",
+		flush=True,
+	)
+	def opt_lr(opt: torch.optim.Optimizer | None) -> float:
+		if opt is None or not opt.param_groups:
+			return float(lr)
+		return float(opt.param_groups[0].get("lr", lr))
 	def eval_row(radius: int, active: torch.Tensor, step_count: int, init_loss: float) -> dict[str, float]:
 		with torch.no_grad():
 			uv = affine()
@@ -1110,6 +1160,7 @@ def _run_affine_seed_quad_expansion_reopt(
 		row["iters"] = float(step_count)
 		row["init_loss"] = float(init_loss)
 		row["loss_gain"] = float(init_loss) - float(row["loss"])
+		row["lr"] = float(lr)
 		return row
 	def eval_progress(
 		radius: int,
@@ -1139,7 +1190,26 @@ def _run_affine_seed_quad_expansion_reopt(
 		active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius)
 		init_row = eval_row(radius, active, 0, 0.0)
 		init_loss = float(init_row["loss"])
+		init_row["init_loss"] = init_loss
+		init_row["loss_gain"] = 0.0
+		rows.append(init_row)
+		if progress_widths_run is not None:
+			report_loss, report_terms, report_err = eval_progress(radius, active, 0, init_loss)
+			_print_global_progress(
+				row_idx=int(progress_row_idx) + progress_rows,
+				widths=progress_widths_run,
+				stage_idx=stage_idx,
+				iter_label=f"grow-r{int(radius)} 0/{steps_i} lr={format_progress_value(float(lr))}",
+				params=("affine",),
+				level=0,
+				loss=report_loss,
+				terms=report_terms,
+				it_s=None,
+				err=report_err,
+			)
+			progress_rows += 1
 		opt = torch.optim.Adam([affine.affine], lr=float(lr))
+		_capture_optimizer_target_lrs(opt)
 		for step in range(steps_i):
 			if cancel_fn is not None:
 				cancel_fn()
@@ -1154,8 +1224,10 @@ def _run_affine_seed_quad_expansion_reopt(
 			if float(w_station) > 0.0:
 				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
 			loss.backward()
-			opt.step()
 			step1 = step + 1
+			_apply_optimizer_lr_warmup(opt, step1=step1, warmup_steps=lr_warmup_steps_i)
+			step_lr = opt_lr(opt)
+			opt.step()
 			status_due = (
 				step == 0 or
 				step1 == steps_i or
@@ -1163,6 +1235,7 @@ def _run_affine_seed_quad_expansion_reopt(
 			)
 			if status_due:
 				row = eval_row(radius, active, step1, init_loss)
+				row["lr"] = float(step_lr)
 				rows.append(row)
 				if progress_widths_run is not None:
 					report_loss, report_terms, report_err = eval_progress(radius, active, step1, init_loss)
@@ -1170,7 +1243,7 @@ def _run_affine_seed_quad_expansion_reopt(
 						row_idx=int(progress_row_idx) + progress_rows,
 						widths=progress_widths_run,
 						stage_idx=stage_idx,
-						iter_label=f"grow-r{int(radius)} {step1}/{steps_i}",
+						iter_label=f"grow-r{int(radius)} {step1}/{steps_i} lr={format_progress_value(step_lr)}",
 						params=("affine",),
 						level=0,
 						loss=report_loss,
@@ -1624,7 +1697,7 @@ def _affine_diag_values(
 
 
 def _print_affine_diag_header(label: str, widths: dict[str, int]) -> None:
-	print_progress_legend(
+	_print_progress_legend_once(
 		prefix=f"[snap_surf.map_global] {label}",
 		items=[(col.label, col.description) for col in _AFFINE_DIAG_COLUMNS],
 	)
@@ -1917,6 +1990,15 @@ def _prepare_affine_seed_quad_candidate(
 		return None, None, float("nan"), 0
 	if not isinstance(raw, dict) and not bool(raw):
 		return None, None, float("nan"), 0
+	reopt_cfg = raw if isinstance(raw, dict) else {}
+	reopt_enabled = bool(reopt_cfg.get("expansion_reopt", reopt_cfg.get("grow_reopt", True)))
+	reopt_steps = max(0, int(reopt_cfg.get("expansion_reopt_steps", reopt_cfg.get("grow_reopt_steps", 100))))
+	reopt_lr = float(reopt_cfg.get("expansion_reopt_lr", reopt_cfg.get("grow_reopt_lr", lr)))
+	status_interval = max(0, int(reopt_cfg.get(
+		"status_interval",
+		reopt_cfg.get("debug_print_interval", stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))),
+	)))
+	lr_warmup_steps = _lr_warmup_steps(stage.args)
 	seed_result = _seed_quad_affine_init_result(
 		fixture=fixture,
 		stage_cfg=stage_cfg,
@@ -1930,21 +2012,14 @@ def _prepare_affine_seed_quad_candidate(
 	_apply_seed_quad_init_metadata(fixture, seed_result)
 	candidate = seed_result.affine
 	progress_rows = 0
-	reopt_cfg = raw if isinstance(raw, dict) else {}
-	reopt_enabled = bool(reopt_cfg.get("expansion_reopt", reopt_cfg.get("grow_reopt", True)))
 	if reopt_enabled:
-		reopt_steps = max(0, int(reopt_cfg.get("expansion_reopt_steps", reopt_cfg.get("grow_reopt_steps", 100))))
-		reopt_lr = float(reopt_cfg.get("expansion_reopt_lr", reopt_cfg.get("grow_reopt_lr", lr)))
-		status_interval = max(0, int(reopt_cfg.get(
-			"status_interval",
-			reopt_cfg.get("debug_print_interval", stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))),
-		)))
 		with torch.no_grad():
 			affine.affine.copy_(candidate)
 		_reopt_rows, progress_rows = _run_affine_seed_quad_expansion_reopt(
 			affine=affine,
 			fixture=fixture,
 			stage_cfg=stage_cfg,
+			stage=stage,
 			seed_ext_quad=seed_result.ext_quad,
 			seed_hw=seed_hw,
 			station_target=station_target,
@@ -1952,6 +2027,7 @@ def _prepare_affine_seed_quad_candidate(
 			steps=reopt_steps,
 			lr=reopt_lr,
 			status_interval=status_interval,
+			lr_warmup_steps=lr_warmup_steps,
 			stage_idx=stage_idx,
 			progress_widths_run=progress_widths_run,
 			progress_row_idx=progress_row_idx,
@@ -2026,7 +2102,10 @@ def _run_affine_seed_quad_init(
 	if seed_result is None or candidate is None:
 		return 0
 	opt = torch.optim.Adam([affine.affine], lr=float(lr)) if steps > 0 else None
+	if opt is not None:
+		_capture_optimizer_target_lrs(opt)
 	status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+	lr_warmup_steps = _lr_warmup_steps(stage.args)
 	last_status_time: float | None = None
 	last_status_step = 0
 	progress_rows = int(prep_progress_rows)
@@ -2063,6 +2142,7 @@ def _run_affine_seed_quad_init(
 			loss = loss + float(w_station) * station_raw
 		if opt is not None:
 			loss.backward()
+			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			opt.step()
 		step1 = step + 1
 		status_due = (
@@ -2432,7 +2512,7 @@ def _print_global_progress(
 		"smp": str(int(err["mapping_error_samples"])),
 	}
 	if int(row_idx) % 20 == 0:
-		print_progress_legend(
+		_print_progress_legend_once(
 			prefix="[snap_surf.map_global]",
 			items=[(col.label, col.description) for col in _GLOBAL_PROGRESS_COLUMNS],
 		)
@@ -2890,6 +2970,7 @@ def optimize_fixture(
 	out_dir: str | Path,
 	device: torch.device | str = "cpu",
 ) -> dict[str, Any]:
+	_PRINTED_PROGRESS_LEGENDS.clear()
 	device_t = torch.device(str(device))
 	fixture = load_map_fixture(fixture_dir, device=device_t)
 	cfg_global = parse_global_map_config(config_path)
@@ -2999,7 +3080,9 @@ def optimize_fixture(
 				w_station=w_station,
 			)
 		opt = torch.optim.Adam(params, lr=float(stage.lr))
+		_capture_optimizer_target_lrs(opt)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		lr_warmup_steps = _lr_warmup_steps(stage.args)
 		last_status_time: float | None = None
 		last_status_step = 0
 		with torch.no_grad():
@@ -3040,6 +3123,7 @@ def optimize_fixture(
 				station_raw = _station_loss(uv, seed_hw, station_target)
 				loss = loss + w_station * station_raw
 			loss.backward()
+			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			opt.step()
 			with torch.no_grad():
 				if "map_uv_ms" in stage.params and global_model is not None:
