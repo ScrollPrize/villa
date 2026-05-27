@@ -42,7 +42,8 @@ from .tensor import _quad_valid_at_coords, _sample_surface_grid
 
 
 _PRINTED_PROGRESS_LEGENDS: set[str] = set()
-_Z_LIFT_CACHE: dict[tuple[int, int, float, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]], dict[str, Any] | None] = {}
+_Z_LIFT_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+_EXT_HEALTH_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, dict[str, float], list[int] | None]] = {}
 
 
 def _print_progress_legend_once(*, prefix: str, items: list[tuple[str, str]]) -> None:
@@ -408,6 +409,50 @@ def _fixture_seed_model_quad(fixture: MapFixture) -> tuple[int, int, int] | None
 		return None if quad is None else (int(quad[0]), int(quad[1]), int(quad[2]))
 	return None
 
+def _tensor_cache_token(t: torch.Tensor) -> tuple[Any, ...]:
+	return (
+		str(t.device),
+		str(t.dtype),
+		tuple(int(v) for v in t.shape),
+		tuple(int(v) for v in t.stride()),
+		int(t.storage_offset()),
+		int(t.untyped_storage().data_ptr()),
+		int(getattr(t, "_version", 0)),
+	)
+
+def _external_health_cfg_token(cfg: SnapSurfMapInitConfig) -> tuple[Any, ...]:
+	return (
+		float(cfg.ext_mesh_health_max_edge_ratio),
+		float(cfg.ext_mesh_health_max_area_ratio),
+		float(cfg.ext_mesh_health_min_area_ratio),
+		float(cfg.ext_mesh_health_max_aspect_ratio),
+		float(cfg.ext_mesh_health_max_diag_ratio),
+		float(cfg.ext_mesh_health_min_triangle_normal_dot),
+		float(cfg.ext_mesh_health_min_normal_dot),
+		int(cfg.ext_mesh_health_reject_radius),
+	)
+
+def _external_health_cache_key(fixture: MapFixture, cfg: SnapSurfMapInitConfig) -> tuple[Any, ...]:
+	seed_raw = fixture.metadata.get("seed_ext_sample_hw")
+	if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
+		seed_ext = (int(seed_raw[0]), int(seed_raw[1]))
+	else:
+		seed_ext = None
+	seed_xyz_raw = fixture.metadata.get("seed_xyz")
+	if isinstance(seed_xyz_raw, (list, tuple)) and len(seed_xyz_raw) == 3:
+		seed_xyz = tuple(float(v) for v in seed_xyz_raw)
+	else:
+		seed_xyz = None
+	return (
+		_external_health_cfg_token(cfg),
+		seed_ext,
+		seed_xyz,
+		_tensor_cache_token(fixture.ext_xyz),
+		_tensor_cache_token(fixture.ext_valid),
+		_tensor_cache_token(fixture.ext_quad_valid),
+		_tensor_cache_token(fixture.ext_normals),
+	)
+
 def _map_init_z_lift_for_fixture(
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
@@ -423,13 +468,17 @@ def _map_init_z_lift_for_fixture(
 		return None
 	sign_i = int(fixture.metadata.get("sign", 1) or 1) if sign is None else int(sign)
 	key = (
-		id(fixture),
 		sign_i,
 		float(mi.z_lift_norm_xy_min),
-		tuple(int(v) for v in fixture.ext_normals.shape),
-		tuple(int(v) for v in fixture.model_normals.shape),
-		tuple(int(v) for v in fixture.ext_quad_valid.shape),
-		tuple(int(v) for v in fixture.model_valid.shape),
+		seed_ext,
+		seed_model,
+		_tensor_cache_token(fixture.ext_xyz),
+		_tensor_cache_token(fixture.ext_valid),
+		_tensor_cache_token(fixture.ext_quad_valid),
+		_tensor_cache_token(fixture.ext_normals),
+		_tensor_cache_token(fixture.model_xyz),
+		_tensor_cache_token(fixture.model_valid),
+		_tensor_cache_token(fixture.model_normals),
 	)
 	if key in _Z_LIFT_CACHE:
 		return _Z_LIFT_CACHE[key]
@@ -631,18 +680,47 @@ def _apply_external_quad_health_filter(
 	mi = cfg.map_init
 	if not bool(mi.ext_mesh_health_filter):
 		return fixture
-	filtered_quad, stats = _external_quad_health_filter(
-		ext_xyz=fixture.ext_xyz,
-		ext_valid=fixture.ext_valid,
-		ext_quad_valid=fixture.ext_quad_valid,
-		ext_normals=fixture.ext_normals,
-		cfg=mi,
-	)
+	metadata = dict(fixture.metadata)
+	cache_key = _external_health_cache_key(fixture, mi)
+	cached = _EXT_HEALTH_CACHE.get(cache_key)
+	if cached is None:
+		filtered_quad, stats = _external_quad_health_filter(
+			ext_xyz=fixture.ext_xyz,
+			ext_valid=fixture.ext_valid,
+			ext_quad_valid=fixture.ext_quad_valid,
+			ext_normals=fixture.ext_normals,
+			cfg=mi,
+		)
+		moved_seed: list[int] | None = None
+		seed_raw = metadata.get("seed_ext_sample_hw")
+		seed_valid = False
+		if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
+			h, w = int(seed_raw[0]), int(seed_raw[1])
+			if 0 <= h < int(filtered_quad.shape[0]) and 0 <= w < int(filtered_quad.shape[1]):
+				seed_valid = bool(filtered_quad[h, w].detach().cpu())
+		if not seed_valid and metadata.get("seed_xyz") is not None:
+			seed_vals = metadata.get("seed_xyz")
+			if isinstance(seed_vals, (list, tuple)) and len(seed_vals) == 3:
+				seed = torch.tensor(seed_vals, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
+				ext_quad, _point, _dist = _closest_external_seed_surface(
+					seed=seed,
+					ext_xyz=fixture.ext_xyz,
+					ext_valid=fixture.ext_valid,
+					ext_quad_valid=filtered_quad,
+				)
+				if ext_quad is not None:
+					moved_seed = [int(ext_quad[0]), int(ext_quad[1])]
+		_EXT_HEALTH_CACHE[cache_key] = (filtered_quad.detach(), dict(stats), moved_seed)
+	else:
+		filtered_quad, stats, moved_seed = cached
+		stats = dict(stats)
+		filtered_quad = filtered_quad.to(device=fixture.ext_quad_valid.device)
+	metadata["ext_mesh_health"] = stats
+	if moved_seed is not None:
+		metadata["seed_ext_sample_hw"] = [int(moved_seed[0]), int(moved_seed[1])]
 	before = int(stats["quads_input"])
 	after = int(stats["quads_kept"])
 	rejected = int(stats["quads_rejected"])
-	metadata = dict(fixture.metadata)
-	metadata["ext_mesh_health"] = stats
 	if rejected > 0:
 		print(
 			"[snap_surf.map_global] external quad health filter "
@@ -654,29 +732,11 @@ def _apply_external_quad_health_filter(
 			f"pad_r={int(stats.get('quads_reject_radius', 0.0))} pad_rejected={int(stats.get('quads_rejected_padding', 0.0))}",
 			flush=True,
 		)
-	seed_raw = metadata.get("seed_ext_sample_hw")
-	seed_valid = False
-	if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
-		h, w = int(seed_raw[0]), int(seed_raw[1])
-		if 0 <= h < int(filtered_quad.shape[0]) and 0 <= w < int(filtered_quad.shape[1]):
-			seed_valid = bool(filtered_quad[h, w].detach().cpu())
-	if not seed_valid and metadata.get("seed_xyz") is not None:
-		seed_vals = metadata.get("seed_xyz")
-		if isinstance(seed_vals, (list, tuple)) and len(seed_vals) == 3:
-			seed = torch.tensor(seed_vals, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
-			ext_quad, _point, _dist = _closest_external_seed_surface(
-				seed=seed,
-				ext_xyz=fixture.ext_xyz,
-				ext_valid=fixture.ext_valid,
-				ext_quad_valid=filtered_quad,
-			)
-			if ext_quad is not None:
-				metadata["seed_ext_sample_hw"] = [int(ext_quad[0]), int(ext_quad[1])]
-				if rejected > 0:
-					print(
-						f"[snap_surf.map_global] external quad health filter {label} moved seed_ext_sample_hw={metadata['seed_ext_sample_hw']}",
-						flush=True,
-					)
+	if moved_seed is not None and rejected > 0:
+		print(
+			f"[snap_surf.map_global] external quad health filter {label} moved seed_ext_sample_hw={metadata['seed_ext_sample_hw']}",
+			flush=True,
+		)
 	return replace(fixture, metadata=metadata, ext_quad_valid=filtered_quad)
 
 
