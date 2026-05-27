@@ -1606,6 +1606,9 @@ def optimize(
 							("sm_trn", "lifted z-heading loss"),
 							("sm_ts", "valid lifted z-heading samples"),
 							("sm_smp", "valid map samples"),
+							("sm_bad", "map samples rejected by validity/limits"),
+							("sm_uvb", "active quads with non-finite UV"),
+							("sm_mbd", "active quads rejected by model/sample checks"),
 							("lr", "effective map optimizer learning rate"),
 							("lr_scl", "map LR autoscale factor"),
 							("it/s", "optimizer it/s"),
@@ -1616,7 +1619,8 @@ def optimize(
 					print(
 						f"{'step':>{_map_status_width}s} {'sm_los':>8s} {'sm_dst':>8s} "
 						f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} {'sm_ts':>8s} "
-						f"{'sm_smp':>8s} {'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
+						f"{'sm_smp':>8s} {'sm_bad':>8s} {'sm_uvb':>8s} {'sm_mbd':>8s} "
+						f"{'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
 						flush=True,
 					)
 				now = time.perf_counter()
@@ -1635,6 +1639,9 @@ def optimize(
 					f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_sample_bad', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_uvbad', 0.0))):>8s} "
+					f"{format_progress_value(float(stats.get('snaps_map_model_bad', 0.0))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_lr', opt_cfg.lr if isinstance(opt_cfg.lr, (int, float)) else _lr_last(opt_cfg.lr)))):>8s} "
 					f"{format_progress_value(float(stats.get('snaps_map_lr_autoscale', 1.0))):>8s} "
 					f"{its_str}",
@@ -2000,8 +2007,18 @@ def optimize(
 				"snaps_map_jbad": "sm_jbd",
 				"snaps_map_jbadf": "sm_jbf",
 				"snaps_map_samples": "sm_smp",
+				"snaps_map_sample_total": "sm_stot",
+				"snaps_map_sample_valid": "sm_sval",
+				"snaps_map_sample_base": "sm_sbas",
+				"snaps_map_sample_model": "sm_smdl",
+				"snaps_map_sample_limit": "sm_slim",
+				"snaps_map_sample_bad": "sm_sbad",
+				"snaps_map_turn_valid": "sm_tval",
+				"snaps_map_loss_quad": "sm_lq",
+				"snaps_map_valid_quad": "sm_vq",
+				"snaps_map_loss_finite": "sm_lfin",
 				"snaps_map_runtime_steps": "sm_it",
-				"snaps_map_uvbad": "sm_bad",
+				"snaps_map_uvbad": "sm_uvb",
 				"snaps_map_model_bad": "sm_mbd",
 				"snaps_map_surf": "sm_srf",
 				"snaps_map_surf_n": "sm_sn",
@@ -2129,6 +2146,16 @@ def optimize(
 				"snaps_map_jbad": "bad jac",
 				"snaps_map_jbadf": "bad jac frac",
 				"snaps_map_samples": "valid samples",
+				"snaps_map_sample_total": "active sample slots",
+				"snaps_map_sample_valid": "finite map samples before quad filtering",
+				"snaps_map_sample_base": "external/uv-valid sample slots",
+				"snaps_map_sample_model": "model-valid sample slots",
+				"snaps_map_sample_limit": "samples passing objective limits",
+				"snaps_map_sample_bad": "samples rejected by validity/limits",
+				"snaps_map_turn_valid": "valid lifted-z sample slots",
+				"snaps_map_loss_quad": "quads contributing sample loss",
+				"snaps_map_valid_quad": "quads passing objective limits",
+				"snaps_map_loss_finite": "finite map loss flag",
 				"snaps_map_runtime_steps": "persistent map optimizer steps",
 				"snaps_map_uvbad": "bad uv quads",
 				"snaps_map_model_bad": "bad model quads",

@@ -3355,6 +3355,9 @@ _GLOBAL_PROGRESS_COLUMNS = (
 	ProgressColumn("avgd", "avgd", "avg fixture model quad distance", min_width=7),
 	ProgressColumn("maxd", "maxd", "max fixture model quad distance", min_width=7),
 	ProgressColumn("smp", "smp", "objective samples", min_width=6),
+	ProgressColumn("sample_bad", "bad", "objective samples rejected by limits or validity", min_width=6),
+	ProgressColumn("uv_bad", "uvb", "active quads with non-finite UV corners", min_width=5),
+	ProgressColumn("model_bad", "mbd", "active quads rejected by model/sample checks", min_width=5),
 )
 
 
@@ -3373,6 +3376,9 @@ def _global_progress_widths(cfg: GlobalMapConfig) -> dict[str, int]:
 	values["avgd"] = "-1.0e+99"
 	values["maxd"] = "-1.0e+99"
 	values["smp"] = "1000000"
+	values["sample_bad"] = "1000000"
+	values["uv_bad"] = "1000000"
+	values["model_bad"] = "1000000"
 	return progress_widths(_GLOBAL_PROGRESS_COLUMNS, values)
 
 
@@ -3417,6 +3423,9 @@ def _print_global_progress(
 		"avgd": format_progress_value(float(err["avg_model_quad_distance"])),
 		"maxd": format_progress_value(float(err["max_model_quad_distance"])),
 		"smp": str(int(_global_term_value(terms, "samples"))),
+		"sample_bad": str(int(_global_term_value(terms, "sample_bad"))),
+		"uv_bad": str(int(_global_term_value(terms, "uv_bad"))),
+		"model_bad": str(int(_global_term_value(terms, "model_bad"))),
 	}
 	if int(row_idx) % 20 == 0:
 		_print_progress_legend_once(
@@ -3764,6 +3773,18 @@ class GlobalMapRuntime:
 				("metric_smooth", "snaps_map_metric_smooth"),
 				("area_smooth", "snaps_map_area_smooth"),
 				("prior", "snaps_map_prior"),
+				("sample_total", "snaps_map_sample_total"),
+				("sample_valid", "snaps_map_sample_valid"),
+				("sample_base", "snaps_map_sample_base"),
+				("sample_model", "snaps_map_sample_model"),
+				("sample_limit", "snaps_map_sample_limit"),
+				("sample_bad", "snaps_map_sample_bad"),
+				("turn_valid", "snaps_map_turn_valid"),
+				("loss_quad", "snaps_map_loss_quad"),
+				("valid_quad", "snaps_map_valid_quad"),
+				("uv_bad", "snaps_map_uvbad"),
+				("model_bad", "snaps_map_model_bad"),
+				("loss_finite", "snaps_map_loss_finite"),
 			):
 				stats[stat_key] = float(_global_term_value(terms, term_key))
 			if stage_z_lift is not None:

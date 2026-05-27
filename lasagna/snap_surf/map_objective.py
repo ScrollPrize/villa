@@ -152,6 +152,12 @@ def _map_init_lifted_z_heading_branches(
 	k = torch.where(valid.bool(), torch.round((theta - phi) / two_pi), torch.zeros_like(theta))
 	return k, valid, stats
 
+def _map_init_valid_field_values(field: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+	valid_b = valid.to(device=field.device).bool()
+	while valid_b.ndim < field.ndim:
+		valid_b = valid_b.unsqueeze(-1)
+	return torch.where(valid_b & torch.isfinite(field), field, torch.zeros_like(field))
+
 def _map_init_sample_scalar_quad_field(
 	field: torch.Tensor,
 	valid: torch.Tensor,
@@ -173,6 +179,8 @@ def _map_init_sample_scalar_quad_field(
 				field.new_zeros(coords3.shape[:-1]),
 				torch.zeros(coords3.shape[:-1], device=coords3.device, dtype=torch.bool),
 			)
+		valid_field = valid.to(device=field.device).bool() & torch.isfinite(field)
+		field_safe = torch.where(valid_field, field, torch.zeros_like(field))
 		h = safe[:, 0]
 		w = safe[:, 1]
 		in_bounds = finite & (h >= 0.0) & (h <= float(H)) & (w >= 0.0) & (w <= float(W))
@@ -192,17 +200,17 @@ def _map_init_sample_scalar_quad_field(
 			w0 = torch.floor(wc).clamp(0, W - 2).long()
 			w1 = w0 + 1
 			fw = wc - w0.to(dtype=field.dtype)
-		v00 = field[h0, w0]
-		v10 = field[h1, w0]
-		v01 = field[h0, w1]
-		v11 = field[h1, w1]
+		v00 = field_safe[h0, w0]
+		v10 = field_safe[h1, w0]
+		v01 = field_safe[h0, w1]
+		v11 = field_safe[h1, w1]
 		out = (1.0 - fh) * (1.0 - fw) * v00 + fh * (1.0 - fw) * v10 + (1.0 - fh) * fw * v01 + fh * fw * v11
 		ok = (
 			in_bounds &
-			valid[h0, w0].bool() &
-			valid[h1, w0].bool() &
-			valid[h0, w1].bool() &
-			valid[h1, w1].bool() &
+			valid_field[h0, w0].bool() &
+			valid_field[h1, w0].bool() &
+			valid_field[h0, w1].bool() &
+			valid_field[h1, w1].bool() &
 			torch.isfinite(out)
 		)
 		return out.reshape(coords3.shape[:-1]), ok.reshape(coords3.shape[:-1])
@@ -213,6 +221,8 @@ def _map_init_sample_scalar_quad_field(
 			field.new_zeros(coords3.shape[:-1]),
 			torch.zeros(coords3.shape[:-1], device=coords3.device, dtype=torch.bool),
 		)
+	valid_field = valid.to(device=field.device).bool() & torch.isfinite(field)
+	field_safe = torch.where(valid_field, field, torch.zeros_like(field))
 	d = safe[:, 0]
 	h = safe[:, 1]
 	w = safe[:, 2]
@@ -234,17 +244,17 @@ def _map_init_sample_scalar_quad_field(
 		w0 = torch.floor(wc).clamp(0, W - 2).long()
 		w1 = w0 + 1
 		fw = wc - w0.to(dtype=field.dtype)
-	v00 = field[di, h0, w0]
-	v10 = field[di, h1, w0]
-	v01 = field[di, h0, w1]
-	v11 = field[di, h1, w1]
+	v00 = field_safe[di, h0, w0]
+	v10 = field_safe[di, h1, w0]
+	v01 = field_safe[di, h0, w1]
+	v11 = field_safe[di, h1, w1]
 	out = (1.0 - fh) * (1.0 - fw) * v00 + fh * (1.0 - fw) * v10 + (1.0 - fh) * fw * v01 + fh * fw * v11
 	ok = (
 		in_bounds &
-		valid[di, h0, w0].bool() &
-		valid[di, h1, w0].bool() &
-		valid[di, h0, w1].bool() &
-		valid[di, h1, w1].bool() &
+		valid_field[di, h0, w0].bool() &
+		valid_field[di, h1, w0].bool() &
+		valid_field[di, h0, w1].bool() &
+		valid_field[di, h1, w1].bool() &
 		torch.isfinite(out)
 	)
 	return out.reshape(coords3.shape[:-1]), ok.reshape(coords3.shape[:-1])
@@ -273,6 +283,7 @@ def _map_init_z_lift_turn_values(
 		ext_valid.to(device=coords3.device).bool().unsqueeze(-1).expand(coords3.shape[:-1]) &
 		torch.isfinite(ext_theta)
 	)
+	ext_theta = torch.where(ext_ok, ext_theta, torch.zeros_like(ext_theta))
 	model_theta, model_ok = _map_init_sample_scalar_quad_field(
 		model_theta_lifted.to(device=coords3.device, dtype=coords3.dtype),
 		model_valid.to(device=coords3.device).bool(),
@@ -284,7 +295,7 @@ def _map_init_z_lift_turn_values(
 		model_ok &
 		torch.isfinite(model_theta)
 	)
-	residual = ext_theta - model_theta
+	residual = torch.where(valid, ext_theta - model_theta, torch.zeros_like(model_theta))
 	values = _huber(residual, delta=float(cfg.z_lift_huber_delta))
 	return values, valid & torch.isfinite(values)
 
@@ -524,7 +535,8 @@ def _map_init_model_metric_positions(
 			return uv, finite_uv
 		coords = _map_init_coords3(uv, depth=int(model_depth))
 		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
-		pos = _sample_surface_grid(model_xyz, safe_coords)
+		model_xyz_safe = model_xyz if model_valid is None else _map_init_valid_field_values(model_xyz, model_valid)
+		pos = _sample_surface_grid(model_xyz_safe, safe_coords)
 		valid = torch.isfinite(coords).all(dim=-1) & torch.isfinite(pos).all(dim=-1)
 		if model_valid is not None:
 			valid = valid & _quad_valid_at_coords(
@@ -535,7 +547,8 @@ def _map_init_model_metric_positions(
 		return pos, valid
 	if model_xyz.ndim == 3:
 		safe_coords = torch.where(torch.isfinite(uv), uv, torch.zeros_like(uv))
-		pos = _sample_surface_grid(model_xyz, safe_coords)
+		model_xyz_safe = model_xyz if model_valid is None else _map_init_valid_field_values(model_xyz, model_valid)
+		pos = _sample_surface_grid(model_xyz_safe, safe_coords)
 		valid = finite_uv & torch.isfinite(pos).all(dim=-1)
 		if model_valid is not None:
 			valid = valid & _quad_valid_at_coords(
@@ -883,14 +896,18 @@ def _map_init_dense_quad_sample_tensors(
 	offsets = _map_init_quad_offsets(subdiv=s, device=uv_full.device, dtype=uv_full.dtype)
 	uv_samples = _map_init_dense_bilerp_quad(uv_full, offsets)
 	if ext_coords is None:
-		ext_samples = _map_init_dense_bilerp_quad(ext_pos, offsets.to(dtype=ext_pos.dtype))
-		n_raw = _map_init_dense_bilerp_quad(ext_normals, offsets.to(dtype=ext_normals.dtype))
+		ext_pos_safe = _map_init_valid_field_values(ext_pos, ext_valid)
+		ext_normals_safe = _map_init_valid_field_values(ext_normals, ext_valid)
+		ext_samples = _map_init_dense_bilerp_quad(ext_pos_safe, offsets.to(dtype=ext_pos.dtype))
+		n_raw = _map_init_dense_bilerp_quad(ext_normals_safe, offsets.to(dtype=ext_normals.dtype))
 		quad_ext_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
 	else:
 		sample_coords = _map_init_dense_bilerp_quad(ext_coords, offsets.to(dtype=ext_coords.dtype))
 		safe_coords = torch.where(torch.isfinite(sample_coords), sample_coords, torch.zeros_like(sample_coords))
-		ext_samples = _sample_surface_grid(ext_pos, safe_coords)
-		n_raw = _sample_surface_grid(ext_normals, safe_coords)
+		ext_pos_safe = _map_init_valid_field_values(ext_pos, ext_valid)
+		ext_normals_safe = _map_init_valid_field_values(ext_normals, ext_valid)
+		ext_samples = _sample_surface_grid(ext_pos_safe, safe_coords)
+		n_raw = _sample_surface_grid(ext_normals_safe, safe_coords)
 		sample_coord_ok = (
 			torch.isfinite(sample_coords).all(dim=-1) &
 			_quad_valid_at_coords(ext_valid.bool(), safe_coords, tuple(int(v) for v in ext_valid.shape)) &
@@ -940,11 +957,12 @@ def _map_init_dense_quad_physical_step_lengths(
 	model_depth: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	if ext_coords is None:
+		ext_pos_safe = _map_init_valid_field_values(ext_pos, ext_valid)
 		ext_corners = torch.stack([
-			ext_pos[:-1, :-1],
-			ext_pos[1:, :-1],
-			ext_pos[:-1, 1:],
-			ext_pos[1:, 1:],
+			ext_pos_safe[:-1, :-1],
+			ext_pos_safe[1:, :-1],
+			ext_pos_safe[:-1, 1:],
+			ext_pos_safe[1:, 1:],
 		], dim=-2)
 		ext_corner_valid = torch.stack([
 			ext_valid[:-1, :-1],
@@ -960,7 +978,7 @@ def _map_init_dense_quad_physical_step_lengths(
 			ext_coords[1:, 1:],
 		], dim=-2)
 		safe = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
-		ext_corners = _sample_surface_grid(ext_pos, safe)
+		ext_corners = _sample_surface_grid(_map_init_valid_field_values(ext_pos, ext_valid), safe)
 		ext_corner_valid = (
 			torch.isfinite(coords).all(dim=-1) &
 			_quad_valid_at_coords(ext_valid.bool(), safe, tuple(int(v) for v in ext_valid.shape))
@@ -975,7 +993,7 @@ def _map_init_dense_quad_physical_step_lengths(
 	], dim=-2)
 	coords3 = _map_init_coords3(uv_corners, depth=int(model_depth))
 	safe3 = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
-	model_corners = _sample_surface_grid(model_xyz, safe3)
+	model_corners = _sample_surface_grid(_map_init_valid_field_values(model_xyz, model_valid), safe3)
 	model_corner_valid = (
 		torch.isfinite(coords3).all(dim=-1) &
 		_quad_valid_at_coords(model_valid.bool(), safe3, tuple(int(v) for v in model_valid.shape)) &
@@ -1082,8 +1100,14 @@ def _map_init_objective(
 	sample_loss = z
 	sample_bad_frac = z
 	sample_quad_ok_grid = torch.zeros_like(active_quad, dtype=torch.bool) if bool(need_stats) else None
+	sample_base_count_t = uv_full.new_zeros(())
+	sample_model_count_t = uv_full.new_zeros(())
+	sample_limit_count_t = uv_full.new_zeros(())
+	loss_quad_count_t = uv_full.new_zeros(())
+	valid_quad_count_t = uv_full.new_zeros(())
 	turn_loss = z
 	turn_sample_count_t = uv_full.new_zeros(())
+	turn_valid_count_t = uv_full.new_zeros(())
 	if active_quad.numel() > 0 and bool(active_quad.any().detach().cpu()):
 		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_dense_quad_sample_tensors(
 			uv_full=uv_full,
@@ -1102,8 +1126,10 @@ def _map_init_objective(
 		n_ext_raw_f = n_ext_raw
 		sign_f = 1.0 if int(sign) >= 0 else -1.0
 		n_ext = F.normalize(n_ext_raw_f, dim=-1, eps=1.0e-8)
-		p_model = _sample_surface_grid(model_xyz, safe_coords)
-		n_model_raw = _sample_surface_grid(model_normals, safe_coords)
+		model_xyz_safe = _map_init_valid_field_values(model_xyz, model_valid)
+		model_normals_safe = _map_init_valid_field_values(model_normals, model_valid)
+		p_model = _sample_surface_grid(model_xyz_safe, safe_coords)
+		n_model_raw = _sample_surface_grid(model_normals_safe, safe_coords)
 		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f
 		ext_step_q, model_step_q = _map_init_dense_quad_physical_step_lengths(
 			uv_full=uv_full,
@@ -1193,6 +1219,10 @@ def _map_init_objective(
 		if bool(need_stats):
 			sample_valid_count_t = finite.to(dtype=uv_full.dtype).sum()
 			sample_bad_count_t = (active_sample & ~limited_finite).to(dtype=uv_full.dtype).sum()
+			sample_base_count_t = base_finite.to(dtype=uv_full.dtype).sum()
+			sample_model_count_t = (active_sample & model_finite).to(dtype=uv_full.dtype).sum()
+			sample_limit_count_t = limited_finite.to(dtype=uv_full.dtype).sum()
+			turn_valid_count_t = (active_sample & turn_valid).to(dtype=uv_full.dtype).sum()
 			sample_bad_frac = sample_bad_count_t / sample_total_count_t.clamp_min(1.0)
 			sample_values = (
 				float(mi.w_dist) * dist_values +
@@ -1206,6 +1236,8 @@ def _map_init_objective(
 		if bool(need_stats):
 			finite_count_t = loss_sample.to(dtype=uv_full.dtype).sum()
 			model_bad_count_t = (active_quad & ~valid_quad).to(dtype=uv_full.dtype).sum()
+			loss_quad_count_t = loss_quad.to(dtype=uv_full.dtype).sum()
+			valid_quad_count_t = valid_quad.to(dtype=uv_full.dtype).sum()
 			turn_sample_count_t = finite_count_t
 		dist_q_all = torch.where(loss_sample, dist_values, dist_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
 		vec_q_all = torch.where(loss_sample, vec_values, vec_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
@@ -1356,6 +1388,7 @@ def _map_init_objective(
 		float(mi.w_area_smooth) * area_smooth_loss +
 		float(mi.w_dense_prior) * prior_loss
 	)
+	loss_finite_t = torch.isfinite(loss.detach()).to(dtype=uv_full.dtype)
 	if not bool(need_stats):
 		return loss, {
 			"loss": loss.detach(),
@@ -1402,8 +1435,15 @@ def _map_init_objective(
 		"sample_loss": sample_loss.detach(),
 		"sample_total": sample_total_count_t.detach(),
 		"sample_valid": sample_valid_count_t.detach(),
+		"sample_base": sample_base_count_t.detach(),
+		"sample_model": sample_model_count_t.detach(),
+		"sample_limit": sample_limit_count_t.detach(),
 		"sample_bad": sample_bad_count_t.detach(),
 		"sample_bad_frac": sample_bad_frac.detach(),
+		"turn_valid": turn_valid_count_t.detach(),
+		"loss_quad": loss_quad_count_t.detach(),
+		"valid_quad": valid_quad_count_t.detach(),
+		"loss_finite": loss_finite_t.detach(),
 		"quad_total": active_count_t.detach(),
 		"quad_success": quad_success_count_t.detach(),
 		"quad_success_frac": quad_success_frac.detach(),
