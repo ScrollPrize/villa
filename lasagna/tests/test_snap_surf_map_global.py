@@ -125,6 +125,12 @@ def _write_planar_global_fixture(root: str, *, h: int = 5, w: int = 5, offset_h:
 	return reference_uv
 
 
+def _xy_normals_like(shape: tuple[int, ...]) -> torch.Tensor:
+	n = torch.zeros(*shape, 3, dtype=torch.float32)
+	n[..., 0] = 1.0
+	return n
+
+
 def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8) -> str:
 	path = Path(root, "cfg.json")
 	_write_json(
@@ -500,6 +506,72 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertIn("snaps_map_norm", stats)
 			self.assertNotIn("snaps_map_avg", stats)
 			self.assertNotIn("snaps_map_max", stats)
+
+	def test_live_runtime_reuses_map_init_caches_by_surface_index_and_mesh_epoch(self) -> None:
+		runtime = GlobalMapRuntime(base={}, seed_xyz=(2.0, 2.0, 0.0))
+		h, w = 5, 5
+		model_xyz = _plane_xyz(h=h + 2, w=w + 2, z=0.0).unsqueeze(0)
+		ext_xyz = _plane_xyz(h=h, w=w, z=0.0, offset_h=0.25, offset_w=0.5)
+		model_valid = torch.ones(1, h + 2, w + 2, dtype=torch.bool)
+		ext_valid = torch.ones(h, w, dtype=torch.bool)
+		ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
+		model_normals = _xy_normals_like((1, h + 2, w + 2))
+		ext_normals = _xy_normals_like((h, w))
+		stage = GlobalMapStageConfig(
+			steps=0,
+			lr=0.0,
+			params=("affine",),
+			args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "w_z_lift": 1.0},
+		)
+
+		first = runtime.run_stage(
+			stage=stage,
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			ext_xyz=ext_xyz,
+			ext_valid=ext_valid,
+			ext_normals=ext_normals,
+			ext_quad_valid=ext_quad,
+			external_surface_index=0,
+			mesh_epoch=0,
+		)
+		second = runtime.run_stage(
+			stage=stage,
+			model_xyz=model_xyz.clone(),
+			model_normals=model_normals.clone(),
+			model_valid=model_valid.clone(),
+			ext_xyz=ext_xyz.clone(),
+			ext_valid=ext_valid.clone(),
+			ext_normals=ext_normals.clone(),
+			ext_quad_valid=ext_quad.clone(),
+			external_surface_index=0,
+			mesh_epoch=0,
+		)
+		third = runtime.run_stage(
+			stage=stage,
+			model_xyz=model_xyz.clone(),
+			model_normals=model_normals.clone(),
+			model_valid=model_valid.clone(),
+			ext_xyz=ext_xyz.clone(),
+			ext_valid=ext_valid.clone(),
+			ext_normals=ext_normals.clone(),
+			ext_quad_valid=ext_quad.clone(),
+			external_surface_index=0,
+			mesh_epoch=1,
+		)
+
+		self.assertEqual(first["snaps_map_health_cache_miss"], 1.0)
+		self.assertEqual(first["snaps_map_zext_cache_miss"], 1.0)
+		self.assertEqual(first["snaps_map_zmdl_cache_miss"], 1.0)
+		self.assertEqual(second["snaps_map_health_cache_hit"], 1.0)
+		self.assertEqual(second["snaps_map_zext_cache_hit"], 1.0)
+		self.assertEqual(second["snaps_map_zmdl_cache_hit"], 1.0)
+		self.assertEqual(second["snaps_map_zext_cache_miss"], 0.0)
+		self.assertEqual(second["snaps_map_zmdl_cache_miss"], 0.0)
+		self.assertEqual(third["snaps_map_health_cache_hit"], 1.0)
+		self.assertEqual(third["snaps_map_zext_cache_hit"], 1.0)
+		self.assertEqual(third["snaps_map_zmdl_cache_miss"], 1.0)
 
 	def test_live_runtime_auto_stop_callback_stops_map_stage(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:

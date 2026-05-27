@@ -34,6 +34,45 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertEqual(int(k[0, 0].item()), 0)
 		self.assertEqual(int(k[0, -1].item()), 2)
 
+	def test_z_lift_branch_construction_unwraps_pi_boundary(self) -> None:
+		angles = torch.tensor([math.radians(170.0), math.radians(-170.0), math.radians(-150.0)])
+		normals = torch.zeros(2, 3, 3)
+		normals[..., 0] = torch.cos(angles).view(1, 3)
+		normals[..., 1] = torch.sin(angles).view(1, 3)
+		base_valid = torch.ones(1, 2, dtype=torch.bool)
+
+		k, valid, stats = opt_loss_snap_surf._map_init_lifted_z_heading_branches(
+			normals,
+			base_valid,
+			(0, 0),
+			norm_xy_min=0.01,
+		)
+
+		self.assertTrue(torch.equal(valid, base_valid))
+		self.assertEqual(stats["unreachable"], 0.0)
+		self.assertEqual(int(k[0, 0].item()), 0)
+		self.assertEqual(int(k[0, 1].item()), 1)
+
+	def test_z_lift_branch_construction_does_not_cross_depth_planes(self) -> None:
+		angles = torch.linspace(0.0, 2.0 * math.pi, 5)
+		normals = torch.zeros(2, 2, 5, 3)
+		normals[..., 0] = torch.cos(angles).view(1, 1, 5)
+		normals[..., 1] = torch.sin(angles).view(1, 1, 5)
+		base_valid = torch.ones(2, 1, 4, dtype=torch.bool)
+
+		k, valid, stats = opt_loss_snap_surf._map_init_lifted_z_heading_branches(
+			normals,
+			base_valid,
+			(0, 0, 0),
+			norm_xy_min=0.01,
+		)
+
+		self.assertTrue(valid[0].all())
+		self.assertFalse(valid[1].any())
+		self.assertEqual(stats["invalid"], 0.0)
+		self.assertEqual(stats["unreachable"], 4.0)
+		self.assertEqual(int(k[0, 0, -1].item()), 1)
+
 	def test_z_lift_branch_construction_blocks_invalid_and_unreachable_quads(self) -> None:
 		normals = torch.zeros(2, 5, 3)
 		normals[..., 0] = 1.0

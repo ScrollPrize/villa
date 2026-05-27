@@ -64,51 +64,71 @@ def _map_init_lifted_z_heading_branches(
 		torch.isfinite(xy_norm) &
 		(xy_norm >= float(norm_xy_min))
 	)
-	valid_cpu = valid.detach().cpu()
-	phi_cpu = phi.detach().cpu()
-	reached_cpu = torch.zeros_like(valid_cpu, dtype=torch.bool)
-	theta_cpu = torch.full_like(phi_cpu, float("nan"))
-	k_cpu = torch.zeros_like(phi_cpu)
-	shape = tuple(int(v) for v in valid_cpu.shape)
+	reached = torch.zeros_like(valid, dtype=torch.bool)
+	theta = torch.full_like(phi, float("nan"))
+	k = torch.zeros_like(phi)
+	shape = tuple(int(v) for v in valid.shape)
 	if len(seed_quad) != len(shape) or any(int(seed_quad[i]) < 0 or int(seed_quad[i]) >= shape[i] for i in range(len(shape))):
 		invalid = int((base_quad_valid.bool() & ~valid).sum().detach().cpu())
-		reachable = int(reached_cpu.sum().detach().cpu())
+		reachable = int(reached.sum().detach().cpu())
 		valid_count = int(valid.sum().detach().cpu())
-		return k_cpu.to(device=normals.device, dtype=normals.dtype), reached_cpu.to(device=normals.device), {"valid": float(reachable), "invalid": float(invalid), "unreachable": float(valid_count)}
+		return k.to(device=normals.device, dtype=normals.dtype), reached.to(device=normals.device), {"valid": float(reachable), "invalid": float(invalid), "unreachable": float(valid_count)}
 	seed = tuple(int(v) for v in seed_quad)
-	if not bool(valid_cpu[seed]):
+	if not bool(valid[seed].detach().cpu()):
 		invalid = int((base_quad_valid.bool() & ~valid).sum().detach().cpu())
 		valid_count = int(valid.sum().detach().cpu())
-		return k_cpu.to(device=normals.device, dtype=normals.dtype), reached_cpu.to(device=normals.device), {"valid": 0.0, "invalid": float(invalid), "unreachable": float(valid_count)}
+		return k.to(device=normals.device, dtype=normals.dtype), reached.to(device=normals.device), {"valid": 0.0, "invalid": float(invalid), "unreachable": float(valid_count)}
 
-	from collections import deque
+	def _shift(src: torch.Tensor, *, axis: int, step: int, fill: float | bool) -> torch.Tensor:
+		if src.dtype == torch.bool:
+			out = torch.full_like(src, bool(fill))
+		else:
+			out = torch.full_like(src, float(fill))
+		dst_slice = [slice(None)] * src.ndim
+		src_slice = [slice(None)] * src.ndim
+		if step > 0:
+			dst_slice[axis] = slice(1, None)
+			src_slice[axis] = slice(None, -1)
+		else:
+			dst_slice[axis] = slice(None, -1)
+			src_slice[axis] = slice(1, None)
+		out[tuple(dst_slice)] = src[tuple(src_slice)]
+		return out
 
-	reached_cpu[seed] = True
-	theta_cpu[seed] = phi_cpu[seed]
-	q_idx: deque[tuple[int, ...]] = deque([seed])
-	while q_idx:
-		idx = q_idx.popleft()
-		cur_phi = phi_cpu[idx]
-		cur_theta = theta_cpu[idx]
-		for axis in (-2, -1):
-			axis_i = len(shape) + axis
-			for step in (-1, 1):
-				nb = list(idx)
-				nb[axis_i] += step
-				if nb[axis_i] < 0 or nb[axis_i] >= shape[axis_i]:
-					continue
-				nb_t = tuple(nb)
-				if bool(reached_cpu[nb_t]) or not bool(valid_cpu[nb_t]):
-					continue
-				theta_cpu[nb_t] = cur_theta + _principal_angle_delta(phi_cpu[nb_t], cur_phi)
-				reached_cpu[nb_t] = True
-				q_idx.append(nb_t)
+	reached[seed] = True
+	theta[seed] = phi[seed]
+	frontier = torch.zeros_like(valid, dtype=torch.bool)
+	frontier[seed] = True
+	directions = (
+		(len(shape) - 2, -1),
+		(len(shape) - 2, 1),
+		(len(shape) - 1, -1),
+		(len(shape) - 1, 1),
+	)
+	while bool(frontier.any().detach().cpu()):
+		next_frontier = torch.zeros_like(frontier, dtype=torch.bool)
+		accepted = torch.zeros_like(frontier, dtype=torch.bool)
+		next_theta = theta.clone()
+		for axis, step in directions:
+			source_frontier = _shift(frontier, axis=axis, step=step, fill=False)
+			source_phi = _shift(phi, axis=axis, step=step, fill=float("nan"))
+			source_theta = _shift(theta, axis=axis, step=step, fill=float("nan"))
+			propose = source_frontier & valid & ~reached & ~accepted
+			proposed_theta = source_theta + _principal_angle_delta(phi, source_phi)
+			next_theta = torch.where(propose, proposed_theta, next_theta)
+			accepted = accepted | propose
+			next_frontier = next_frontier | propose
+		if not bool(next_frontier.any().detach().cpu()):
+			break
+		theta = next_theta
+		reached = reached | next_frontier
+		frontier = next_frontier
 	two_pi = 2.0 * math.pi
-	k_cpu = torch.where(reached_cpu, torch.round((theta_cpu - phi_cpu) / two_pi), torch.zeros_like(phi_cpu))
+	k = torch.where(reached, torch.round((theta - phi) / two_pi), torch.zeros_like(phi))
 	invalid = int((base_quad_valid.bool() & ~valid).sum().detach().cpu())
-	reachable = int(reached_cpu.sum().detach().cpu())
+	reachable = int(reached.sum().detach().cpu())
 	valid_count = int(valid.sum().detach().cpu())
-	return k_cpu.to(device=normals.device, dtype=normals.dtype), reached_cpu.to(device=normals.device), {
+	return k.to(device=normals.device, dtype=normals.dtype), reached.to(device=normals.device), {
 		"valid": float(reachable),
 		"invalid": float(invalid),
 		"unreachable": float(max(0, valid_count - reachable)),

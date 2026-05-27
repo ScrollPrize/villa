@@ -744,6 +744,11 @@ def optimize(
 	_snap_global_runtime: snap_surf_map_global.GlobalMapRuntime | None = None
 	_snap_global_offset_debug_printed = False
 	_map_forward_needs = fit_model.ModelForwardNeeds(mesh_normals=True, ext_surfaces=True)
+	snap_global_mesh_epoch = 0
+
+	def _bump_snap_global_mesh_epoch() -> None:
+		nonlocal snap_global_mesh_epoch
+		snap_global_mesh_epoch += 1
 
 	def _unpack_ext_surface_record(record):
 		if len(record) < 4:
@@ -808,6 +813,8 @@ def optimize(
 			ext_valid=ext_valid,
 			ext_normals=ext_normals,
 			ext_quad_valid=ext_quad_valid,
+			external_surface_index=0,
+			mesh_epoch=snap_global_mesh_epoch,
 			persistent_optimizer=persistent_optimizer,
 			status_fn=status_fn,
 			cancel_fn=cancel_fn,
@@ -2724,11 +2731,13 @@ def optimize(
 							int(resample_width_count),
 							target_step=resample_width_step,
 						)
+						_bump_snap_global_mesh_epoch()
 					else:
 						model_step_ref = max(1.0, float(model_step))
 						if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
 							raise RuntimeError(f"{shell_label}: model cannot resample cylinder shell width to model-step")
 						model.resample_current_cylinder_shell_width_to_step(data, model_step_ref)
+						_bump_snap_global_mesh_epoch()
 					resample_count += 1
 					resampled_this_pass = True
 					return True
@@ -2832,6 +2841,7 @@ def optimize(
 					_t_part = time.perf_counter()
 					_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 					opt.step()
+					_bump_snap_global_mesh_epoch()
 					if _opt_timing is not None:
 						_opt_timing.sync()
 						_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
@@ -2975,6 +2985,7 @@ def optimize(
 				)
 				if result_.get("error") is None and hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
+					_bump_snap_global_mesh_epoch()
 					_emit_cylinder_shell_callback(refine_label)
 					max_ifrac = _cyl_refine_max_ifrac(refine_opt)
 					debug_values = result_.get("debug")
@@ -3008,6 +3019,7 @@ def optimize(
 								shell_no=1)
 				if hasattr(model, "complete_current_cylinder_shell"):
 					model.complete_current_cylinder_shell(data)
+					_bump_snap_global_mesh_epoch()
 					_emit_cylinder_shell_callback(f"{label}.cyl_init")
 				if _cyl_init_only:
 					_stage_done(f"{label}.total", _t_stage_total)
@@ -3126,6 +3138,7 @@ def optimize(
 						break
 					if hasattr(model, "complete_current_cylinder_shell"):
 						model.complete_current_cylinder_shell(data)
+						_bump_snap_global_mesh_epoch()
 						_emit_cylinder_shell_callback(f"{label}.cyl_grow_shell{shell_i + 1}")
 					if grow_refine_opt is not None:
 						result = _run_grow_refine_pass(
@@ -3168,9 +3181,11 @@ def optimize(
 			if abs(float(stage_model_step) - float(prev_model_step)) > 1.0e-6:
 				if hasattr(model, "resample_current_cylinder_shell_height_to_step"):
 					model.resample_current_cylinder_shell_height_to_step(data, float(stage_model_step))
+					_bump_snap_global_mesh_epoch()
 				if not hasattr(model, "resample_current_cylinder_shell_width_to_step"):
 					raise RuntimeError(f"{label}: model cannot resample cylinder shell width to model-step")
 				model.resample_current_cylinder_shell_width_to_step(data, float(stage_model_step))
+				_bump_snap_global_mesh_epoch()
 			shell_stage_eff = dict(stage_eff)
 			shell_stage_eff["cyl_radial_mean"] = 0.0
 			shell_stage_eff["cyl_step_push"] = 0.0
@@ -3184,6 +3199,7 @@ def optimize(
 			)
 			if hasattr(model, "complete_current_cylinder_shell"):
 				model.complete_current_cylinder_shell(data)
+				_bump_snap_global_mesh_epoch()
 				_emit_cylinder_shell_callback(f"{label}.{stage.name}")
 			_collapse_cylinder_shells_to_last()
 			_stage_done(f"{label}.total", _t_stage_total)
@@ -3365,6 +3381,7 @@ def optimize(
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			opt.step()
+			_bump_snap_global_mesh_epoch()
 			if _flatten_update_before is not None:
 				_clamp_flatten_map_ms_update(
 					_flatten_update_params,

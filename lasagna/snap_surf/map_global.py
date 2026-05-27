@@ -42,8 +42,8 @@ from .tensor import _quad_valid_at_coords, _sample_surface_grid
 
 
 _PRINTED_PROGRESS_LEGENDS: set[str] = set()
-_Z_LIFT_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
-_EXT_HEALTH_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, dict[str, float], list[int] | None]] = {}
+_CacheStats = dict[str, int]
+_NO_Z_LIFT = object()
 
 
 def _print_progress_legend_once(*, prefix: str, items: list[tuple[str, str]]) -> None:
@@ -51,6 +51,16 @@ def _print_progress_legend_once(*, prefix: str, items: list[tuple[str, str]]) ->
 		return
 	_PRINTED_PROGRESS_LEGENDS.add(prefix)
 	print_progress_legend(prefix=prefix, items=items)
+
+
+def _truthy_arg(value: Any) -> bool:
+	if isinstance(value, bool):
+		return value
+	if value is None:
+		return False
+	if isinstance(value, (int, float)):
+		return value != 0
+	return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -432,7 +442,12 @@ def _external_health_cfg_token(cfg: SnapSurfMapInitConfig) -> tuple[Any, ...]:
 		int(cfg.ext_mesh_health_reject_radius),
 	)
 
-def _external_health_cache_key(fixture: MapFixture, cfg: SnapSurfMapInitConfig) -> tuple[Any, ...]:
+def _external_health_cache_key(
+	fixture: MapFixture,
+	cfg: SnapSurfMapInitConfig,
+	*,
+	external_surface_index: int,
+) -> tuple[Any, ...]:
 	seed_raw = fixture.metadata.get("seed_ext_sample_hw")
 	if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
 		seed_ext = (int(seed_raw[0]), int(seed_raw[1]))
@@ -444,13 +459,10 @@ def _external_health_cache_key(fixture: MapFixture, cfg: SnapSurfMapInitConfig) 
 	else:
 		seed_xyz = None
 	return (
+		int(external_surface_index),
 		_external_health_cfg_token(cfg),
 		seed_ext,
 		seed_xyz,
-		_tensor_cache_token(fixture.ext_xyz),
-		_tensor_cache_token(fixture.ext_valid),
-		_tensor_cache_token(fixture.ext_quad_valid),
-		_tensor_cache_token(fixture.ext_normals),
 	)
 
 def _map_init_z_lift_for_fixture(
@@ -458,6 +470,11 @@ def _map_init_z_lift_for_fixture(
 	cfg: SnapSurfConfig,
 	*,
 	sign: int | None = None,
+	external_surface_index: int | None = None,
+	mesh_epoch: int | None = None,
+	external_cache: dict[tuple[Any, ...], dict[str, Any] | None] | None = None,
+	model_cache: dict[tuple[Any, ...], dict[str, Any] | None] | None = None,
+	cache_stats: _CacheStats | None = None,
 ) -> dict[str, Any] | None:
 	mi = cfg.map_init
 	if not bool(mi.z_lift_enabled) or float(mi.w_z_lift) <= 0.0:
@@ -467,55 +484,94 @@ def _map_init_z_lift_for_fixture(
 	if seed_ext is None or seed_model is None:
 		return None
 	sign_i = int(fixture.metadata.get("sign", 1) or 1) if sign is None else int(sign)
-	key = (
-		sign_i,
-		float(mi.z_lift_norm_xy_min),
-		seed_ext,
-		seed_model,
-		_tensor_cache_token(fixture.ext_xyz),
-		_tensor_cache_token(fixture.ext_valid),
-		_tensor_cache_token(fixture.ext_quad_valid),
-		_tensor_cache_token(fixture.ext_normals),
-		_tensor_cache_token(fixture.model_xyz),
-		_tensor_cache_token(fixture.model_valid),
-		_tensor_cache_token(fixture.model_normals),
-	)
-	if key in _Z_LIFT_CACHE:
-		return _Z_LIFT_CACHE[key]
-	ext_base = _external_quad_base_valid(fixture.ext_xyz, fixture.ext_valid.bool(), fixture.ext_quad_valid.bool())
-	model_base = _model_quad_base_valid(fixture.model_xyz, fixture.model_valid.bool())
-	ext_k, ext_valid, ext_stats = _map_init_lifted_z_heading_branches(
-		fixture.ext_normals,
-		ext_base,
-		seed_ext,
-		norm_xy_min=float(mi.z_lift_norm_xy_min),
-		sign=1,
-	)
-	model_k, model_valid, model_stats = _map_init_lifted_z_heading_branches(
-		fixture.model_normals,
-		model_base,
-		seed_model,
-		norm_xy_min=float(mi.z_lift_norm_xy_min),
-		sign=sign_i,
-	)
-	if float(ext_stats["valid"]) <= 0.0 or float(model_stats["valid"]) <= 0.0:
-		_Z_LIFT_CACHE[key] = None
+	norm_xy_min = float(mi.z_lift_norm_xy_min)
+
+	def _bump(name: str) -> None:
+		if cache_stats is not None:
+			cache_stats[name] = int(cache_stats.get(name, 0)) + 1
+
+	ext_key = None
+	if external_surface_index is not None:
+		ext_key = (
+			int(external_surface_index),
+			_external_health_cache_key(fixture, mi, external_surface_index=int(external_surface_index)),
+			seed_ext,
+			norm_xy_min,
+		)
+	ext_part: dict[str, Any] | None
+	if external_cache is not None and ext_key is not None and ext_key in external_cache:
+		_bump("zext_hit")
+		ext_part = external_cache[ext_key]
+	else:
+		if external_cache is not None and ext_key is not None:
+			_bump("zext_miss")
+		ext_base = _external_quad_base_valid(fixture.ext_xyz, fixture.ext_valid.bool(), fixture.ext_quad_valid.bool())
+		ext_k, ext_valid, ext_stats = _map_init_lifted_z_heading_branches(
+			fixture.ext_normals,
+			ext_base,
+			seed_ext,
+			norm_xy_min=norm_xy_min,
+			sign=1,
+		)
+		ext_part = None if float(ext_stats["valid"]) <= 0.0 else {
+			"k": ext_k.detach(),
+			"valid": ext_valid.detach(),
+			"stats": dict(ext_stats),
+		}
+		if external_cache is not None and ext_key is not None:
+			external_cache[ext_key] = ext_part
+
+	model_key = None
+	if mesh_epoch is not None:
+		model_key = (
+			int(mesh_epoch),
+			sign_i,
+			int(fixture.metadata.get("model_depth", 0) or 0),
+			seed_model,
+			norm_xy_min,
+			tuple(int(v) for v in fixture.model_normals.shape),
+			str(fixture.model_normals.device),
+			str(fixture.model_normals.dtype),
+		)
+	model_part: dict[str, Any] | None
+	if model_cache is not None and model_key is not None and model_key in model_cache:
+		_bump("zmdl_hit")
+		model_part = model_cache[model_key]
+	else:
+		if model_cache is not None and model_key is not None:
+			_bump("zmdl_miss")
+		model_base = _model_quad_base_valid(fixture.model_xyz, fixture.model_valid.bool())
+		model_k, model_valid, model_stats = _map_init_lifted_z_heading_branches(
+			fixture.model_normals,
+			model_base,
+			seed_model,
+			norm_xy_min=norm_xy_min,
+			sign=sign_i,
+		)
+		model_part = None if float(model_stats["valid"]) <= 0.0 else {
+			"k": model_k.detach(),
+			"valid": model_valid.detach(),
+			"stats": dict(model_stats),
+		}
+		if model_cache is not None and model_key is not None:
+			model_cache[model_key] = model_part
+
+	if ext_part is None or model_part is None:
 		return None
 	out = {
-		"ext_k": ext_k.detach(),
-		"ext_valid": ext_valid.detach(),
-		"model_k": model_k.detach(),
-		"model_valid": model_valid.detach(),
+		"ext_k": ext_part["k"],
+		"ext_valid": ext_part["valid"],
+		"model_k": model_part["k"],
+		"model_valid": model_part["valid"],
 		"stats": {
-			"ext_valid": float(ext_stats["valid"]),
-			"ext_invalid": float(ext_stats["invalid"]),
-			"ext_unreachable": float(ext_stats["unreachable"]),
-			"model_valid": float(model_stats["valid"]),
-			"model_invalid": float(model_stats["invalid"]),
-			"model_unreachable": float(model_stats["unreachable"]),
+			"ext_valid": float(ext_part["stats"]["valid"]),
+			"ext_invalid": float(ext_part["stats"]["invalid"]),
+			"ext_unreachable": float(ext_part["stats"]["unreachable"]),
+			"model_valid": float(model_part["stats"]["valid"]),
+			"model_invalid": float(model_part["stats"]["invalid"]),
+			"model_unreachable": float(model_part["stats"]["unreachable"]),
 		},
 	}
-	_Z_LIFT_CACHE[key] = out
 	return out
 
 
@@ -676,14 +732,22 @@ def _apply_external_quad_health_filter(
 	cfg: SnapSurfConfig,
 	*,
 	label: str,
+	external_surface_index: int | None = None,
+	cache: dict[tuple[Any, ...], tuple[torch.Tensor, dict[str, float], list[int] | None]] | None = None,
+	cache_stats: _CacheStats | None = None,
 ) -> MapFixture:
 	mi = cfg.map_init
 	if not bool(mi.ext_mesh_health_filter):
 		return fixture
 	metadata = dict(fixture.metadata)
-	cache_key = _external_health_cache_key(fixture, mi)
-	cached = _EXT_HEALTH_CACHE.get(cache_key)
+	cache_key = (
+		_external_health_cache_key(fixture, mi, external_surface_index=int(external_surface_index))
+		if external_surface_index is not None else None
+	)
+	cached = cache.get(cache_key) if cache is not None and cache_key is not None else None
 	if cached is None:
+		if cache is not None and cache_key is not None and cache_stats is not None:
+			cache_stats["health_miss"] = int(cache_stats.get("health_miss", 0)) + 1
 		filtered_quad, stats = _external_quad_health_filter(
 			ext_xyz=fixture.ext_xyz,
 			ext_valid=fixture.ext_valid,
@@ -710,11 +774,14 @@ def _apply_external_quad_health_filter(
 				)
 				if ext_quad is not None:
 					moved_seed = [int(ext_quad[0]), int(ext_quad[1])]
-		_EXT_HEALTH_CACHE[cache_key] = (filtered_quad.detach(), dict(stats), moved_seed)
+		if cache is not None and cache_key is not None:
+			cache[cache_key] = (filtered_quad.detach(), dict(stats), moved_seed)
 	else:
+		if cache_stats is not None:
+			cache_stats["health_hit"] = int(cache_stats.get("health_hit", 0)) + 1
 		filtered_quad, stats, moved_seed = cached
 		stats = dict(stats)
-		filtered_quad = filtered_quad.to(device=fixture.ext_quad_valid.device)
+		filtered_quad = filtered_quad.to(device=fixture.ext_quad_valid.device, dtype=torch.bool)
 	metadata["ext_mesh_health"] = stats
 	if moved_seed is not None:
 		metadata["seed_ext_sample_hw"] = [int(moved_seed[0]), int(moved_seed[1])]
@@ -2855,11 +2922,14 @@ def _objective_for_uv(
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
 	level: int,
+	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	active = _level_active_quad(_full_active_quad(fixture), int(level))
 	ext_coords = None if int(level) == 0 else _level_coords(fixture.ext_xyz.shape[:2], int(level), uv)
 	sign_i = int(fixture.metadata.get("sign", 1) or 1)
-	z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
+	if z_lift is _NO_Z_LIFT:
+		z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
+	z_lift_d = None if z_lift is _NO_Z_LIFT else z_lift
 	return _map_init_objective(
 		uv_full=uv,
 		active_quad=active,
@@ -2875,10 +2945,10 @@ def _objective_for_uv(
 		sign=sign_i,
 		cfg=cfg,
 		allow_partial_model_samples=True,
-		ext_z_lift_k=None if z_lift is None else z_lift["ext_k"],
-		ext_z_lift_valid=None if z_lift is None else z_lift["ext_valid"],
-		model_z_lift_k=None if z_lift is None else z_lift["model_k"],
-		model_z_lift_valid=None if z_lift is None else z_lift["model_valid"],
+		ext_z_lift_k=None if z_lift_d is None else z_lift_d["ext_k"],
+		ext_z_lift_valid=None if z_lift_d is None else z_lift_d["ext_valid"],
+		model_z_lift_k=None if z_lift_d is None else z_lift_d["model_k"],
+		model_z_lift_valid=None if z_lift_d is None else z_lift_d["model_valid"],
 	)
 
 
@@ -3161,8 +3231,9 @@ def _global_progress_state(
 	seed_hw: torch.Tensor,
 	station_target: torch.Tensor,
 	w_station: float,
+	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 ) -> tuple[float, dict[str, torch.Tensor], dict[str, float]]:
-	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=cfg, level=0)
+	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=cfg, level=0, z_lift=z_lift)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
 		station_raw = _station_loss(uv, seed_hw, station_target)
@@ -3254,6 +3325,29 @@ class GlobalMapRuntime:
 		self.steps_run = 0
 		self._snap_loss_mode_printed: set[tuple[str, float]] = set()
 		self.sign = 1
+		self._external_health_cache: dict[tuple[Any, ...], tuple[torch.Tensor, dict[str, float], list[int] | None]] = {}
+		self._z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+		self._z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+
+	def _z_lift_for_stage(
+		self,
+		fixture: MapFixture,
+		cfg: SnapSurfConfig,
+		*,
+		external_surface_index: int,
+		mesh_epoch: int,
+		cache_stats: _CacheStats,
+	) -> dict[str, Any] | None:
+		return _map_init_z_lift_for_fixture(
+			fixture,
+			cfg,
+			sign=int(fixture.metadata.get("sign", self.sign) or self.sign),
+			external_surface_index=int(external_surface_index),
+			mesh_epoch=int(mesh_epoch),
+			external_cache=self._z_lift_external_cache,
+			model_cache=self._z_lift_model_cache,
+			cache_stats=cache_stats,
+		)
 
 	def _ensure_models(self, fixture: MapFixture, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
 		device = fixture.model_xyz.device
@@ -3309,11 +3403,25 @@ class GlobalMapRuntime:
 		ext_valid: torch.Tensor,
 		ext_normals: torch.Tensor,
 		ext_quad_valid: torch.Tensor,
+		external_surface_index: int = 0,
+		mesh_epoch: int = 0,
 		persistent_optimizer: bool = False,
 		status_fn=None,
 		cancel_fn=None,
 		auto_stop_fn=None,
 	) -> dict[str, float]:
+		cache_stats: _CacheStats = {
+			"zext_hit": 0,
+			"zext_miss": 0,
+			"zmdl_hit": 0,
+			"zmdl_miss": 0,
+			"health_hit": 0,
+			"health_miss": 0,
+		}
+		startup_timing = _truthy_arg(stage.args.get("startup_timing", stage.args.get("opt_timing", False)))
+		startup_health_s = 0.0
+		startup_z_lift_s = 0.0
+		startup_initial_eval_s = 0.0
 		fixture = _fixture_from_live_tensors(
 			model_xyz=model_xyz,
 			model_normals=model_normals,
@@ -3326,7 +3434,16 @@ class GlobalMapRuntime:
 			sign=self.sign,
 		)
 		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
-		fixture = _apply_external_quad_health_filter(fixture, base_cfg, label="runtime")
+		_t_startup = time.perf_counter()
+		fixture = _apply_external_quad_health_filter(
+			fixture,
+			base_cfg,
+			label="runtime",
+			external_surface_index=int(external_surface_index),
+			cache=self._external_health_cache,
+			cache_stats=cache_stats,
+		)
+		startup_health_s = time.perf_counter() - _t_startup
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
 		self._ensure_models(fixture, base_cfg, stage)
 		assert self.affine is not None
@@ -3377,6 +3494,16 @@ class GlobalMapRuntime:
 			)
 			if seed_result is not None:
 				self.sign = int(seed_result.sign)
+		fixture.metadata["sign"] = int(self.sign)
+		_t_startup = time.perf_counter()
+		stage_z_lift = self._z_lift_for_stage(
+			fixture,
+			stage_cfg,
+			external_surface_index=int(external_surface_index),
+			mesh_epoch=int(mesh_epoch),
+			cache_stats=cache_stats,
+		)
+		startup_z_lift_s = time.perf_counter() - _t_startup
 		def _stats_for_current_uv() -> dict[str, float]:
 			with torch.no_grad():
 				loss_f, terms, err = _global_progress_state(
@@ -3386,11 +3513,21 @@ class GlobalMapRuntime:
 					seed_hw=seed_hw,
 					station_target=station_target,
 					w_station=w_station,
+					z_lift=stage_z_lift,
 				)
 			stats = {
 				"snaps_map_loss": float(loss_f),
 				"snaps_map_samples": float(_global_term_value(terms, "samples")),
 				"snaps_map_runtime_steps": float(self.steps_run),
+				"snaps_map_zext_cache_hit": float(cache_stats["zext_hit"]),
+				"snaps_map_zext_cache_miss": float(cache_stats["zext_miss"]),
+				"snaps_map_zmdl_cache_hit": float(cache_stats["zmdl_hit"]),
+				"snaps_map_zmdl_cache_miss": float(cache_stats["zmdl_miss"]),
+				"snaps_map_health_cache_hit": float(cache_stats["health_hit"]),
+				"snaps_map_health_cache_miss": float(cache_stats["health_miss"]),
+				"snaps_map_startup_health_ms": 1000.0 * float(startup_health_s),
+				"snaps_map_startup_z_lift_ms": 1000.0 * float(startup_z_lift_s),
+				"snaps_map_startup_initial_eval_ms": 1000.0 * float(startup_initial_eval_s),
 			}
 			for term_key, stat_key in (
 				("dist", "snaps_map_dist"),
@@ -3406,9 +3543,8 @@ class GlobalMapRuntime:
 				("prior", "snaps_map_prior"),
 			):
 				stats[stat_key] = float(_global_term_value(terms, term_key))
-			z_lift = _map_init_z_lift_for_fixture(fixture, stage_cfg, sign=int(fixture.metadata.get("sign", 1) or 1))
-			if z_lift is not None:
-				zs = z_lift["stats"]
+			if stage_z_lift is not None:
+				zs = stage_z_lift["stats"]
 				stats["snaps_map_zext_bad"] = float(zs["ext_invalid"])
 				stats["snaps_map_zext_unr"] = float(zs["ext_unreachable"])
 				stats["snaps_map_zmdl_bad"] = float(zs["model_invalid"])
@@ -3421,7 +3557,22 @@ class GlobalMapRuntime:
 		params, level = self._params_for_stage(stage)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
 		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		_t_startup = time.perf_counter()
 		initial_stats = _stats_for_current_uv()
+		startup_initial_eval_s = time.perf_counter() - _t_startup
+		initial_stats["snaps_map_startup_initial_eval_ms"] = 1000.0 * float(startup_initial_eval_s)
+		if startup_timing:
+			label = stage.name or _stage_param_label(stage.params, fallback="map_stage")
+			print(
+				f"[snap_surf.map_global] {label}: startup "
+				f"health={1000.0 * startup_health_s:.3f}ms "
+				f"z_lift={1000.0 * startup_z_lift_s:.3f}ms "
+				f"initial_eval={1000.0 * startup_initial_eval_s:.3f}ms "
+				f"health_hit={cache_stats['health_hit']} health_miss={cache_stats['health_miss']} "
+				f"zext_hit={cache_stats['zext_hit']} zext_miss={cache_stats['zext_miss']} "
+				f"zmdl_hit={cache_stats['zmdl_hit']} zmdl_miss={cache_stats['zmdl_miss']}",
+				flush=True,
+			)
 		if status_fn is not None:
 			status_fn(step=0, total=int(stage.steps), stats=initial_stats)
 		auto_loss_history = (
@@ -3443,7 +3594,7 @@ class GlobalMapRuntime:
 					cancel_fn()
 				opt.zero_grad(set_to_none=True)
 				uv = self._uv()
-				loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+				loss, _terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0, z_lift=stage_z_lift)
 				if w_station > 0.0:
 					loss = loss + w_station * _station_loss(uv, seed_hw, station_target)
 				loss.backward()
