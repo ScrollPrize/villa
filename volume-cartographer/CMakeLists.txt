@@ -42,6 +42,8 @@ option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 option(VC_USE_PCH "Precompile common headers into vc_core; downstream targets REUSE_FROM it" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
+set(VC_CCACHE_PCH_SLOPPINESS "pch_defines,time_macros" CACHE STRING
+    "ccache sloppiness required when VC_USE_PCH and VC_USE_CCACHE are both ON")
 
 set(_vc_build_types Debug Release RelWithDebInfo MinSizeRel QuickBuild)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -63,13 +65,15 @@ if(VC_USE_CCACHE)
     if(NOT CCACHE_PROGRAM)
         message(FATAL_ERROR "VC_USE_CCACHE=ON but ccache was not found on PATH.")
     endif()
-    set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-endif()
-
-# PCH and ccache fight (PCH tanks ccache's hit rate). Pick at most one.
-if(VC_USE_PCH AND (VC_USE_CCACHE OR CMAKE_C_COMPILER_LAUNCHER MATCHES "ccache" OR CMAKE_CXX_COMPILER_LAUNCHER MATCHES "ccache"))
-    message(FATAL_ERROR "VC_USE_PCH and ccache are mutually exclusive — disable one.")
+    if(VC_USE_PCH)
+        set(_vc_ccache_launcher
+            "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=${VC_CCACHE_PCH_SLOPPINESS};${CCACHE_PROGRAM}")
+        message(STATUS "ccache with PCH: CCACHE_SLOPPINESS=${VC_CCACHE_PCH_SLOPPINESS}")
+    else()
+        set(_vc_ccache_launcher "${CCACHE_PROGRAM}")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER "${_vc_ccache_launcher}" CACHE STRING "Compiler launcher for C" FORCE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${_vc_ccache_launcher}" CACHE STRING "Compiler launcher for CXX" FORCE)
 endif()
 
 # Skip building app executables (vc_*, VC3D) when generating coverage:

@@ -60,15 +60,21 @@
     },
     {
       "name": "dev-quickbuild-gcc",
-      "displayName": "QuickBuild (gcc, O1, PCH, no LTO, native arch)",
+      "displayName": "QuickBuild (gcc, O1, PCH, ccache, no LTO, native arch)",
       "inherits": ["_dev-base", "_gcc"],
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "QuickBuild" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "QuickBuild",
+        "VC_USE_CCACHE": "ON"
+      }
     },
     {
       "name": "dev-quickbuild-clang",
-      "displayName": "QuickBuild (clang, O1, PCH, no LTO, native arch)",
+      "displayName": "QuickBuild (clang, O1, PCH, ccache, no LTO, native arch)",
       "inherits": ["_dev-base", "_clang"],
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "QuickBuild" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "QuickBuild",
+        "VC_USE_CCACHE": "ON"
+      }
     },
     {
       "name": "dev-profile-clang",
