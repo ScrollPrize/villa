@@ -198,7 +198,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 	def test_lasagna_stage_parser_routes_model_and_map_params(self) -> None:
 		cfg = {
-			"base": {"snap_surf": 1.0},
+			"base": {"snap_surf_map": 1.0},
 			"stages": [
 				{"name": "model", "steps": 1, "lr": 0.1, "params": ["mesh_ms"]},
 				{"name": "map", "steps": 1, "lr": 0.01, "params": ["map_surf_affine"], "w_fac": 1.0},

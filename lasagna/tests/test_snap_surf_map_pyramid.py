@@ -12,147 +12,104 @@ from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz, _result, 
 class SnapSurfMapPyramidTest(unittest.TestCase):
 	def setUp(self) -> None:
 		opt_loss_snap_surf.reset_state()
-		opt_loss_snap_surf.configure_snap_surf(
-			cfg={"init_distance": 10.0, "point_distance": 10.0, "grid_error": 0.25},
-			seed_xyz=(1.0, 1.0, 0.0),
-			active=True,
-		)
 
 	def test_map_init_config_parse_and_validation(self) -> None:
 		self.assertEqual(opt_loss_snap_surf.SnapSurfMapInitConfig().global_opt_interval, 10)
-		opt_loss_snap_surf.configure_snap_surf(
-			cfg={
-				"map_init": {
-					"enabled": True,
-					"surface_loss": True,
-					"initial_iters": 11,
-					"update_interval": 13,
-					"update_global_opt_iters": 17,
-					"tracking_opt_iters": 29,
-					"first_global_opt_iters": 19,
-					"last_global_opt_iters": 23,
-					"subdiv": 2,
-					"iters": 3,
-					"seed_opt_iters": 7,
-					"candidate_opt_iters": 4,
-					"candidate_lr": 0.07,
-					"fringe_opt_iters": 5,
-					"fringe_lr": 0.03,
-					"global_opt_interval": 6,
-					"progress_mode": "both",
-					"no_progress_iters": 31,
-					"scale_levels": 4,
-					"min_scale_level": 2,
-					"dense_opt": True,
-					"dense_reg_radius": 5,
-					"w_dense_prior": 0.25,
-					"repair_max_blocks": 2,
-					"repair_lr_mult": 0.5,
-					"repair_w_jac_mult": 8.0,
-					"edge_init_radius": 3,
-					"progress_interval": 7,
-					"w_metric_smooth": 0.12,
-					"w_area_smooth": 0.03,
-					"max_sample_distance": 500.0,
-					"max_sample_angle_deg": 45.0,
-					"sample_angle_step_fraction": 0.2,
-					"max_step_neighbor_ratio": 10.0,
-					"fixture_export_dir": "fixture_out",
-					"fixture_export_once": False,
-					"fixture_export_objs": False,
-				}
-			},
-			seed_xyz=(1.0, 1.0, 0.0),
-			active=True,
-		)
+		cfg = opt_loss_snap_surf._parse_map_init_config({
+			"enabled": True,
+			"surface_loss": True,
+			"initial_iters": 11,
+			"update_interval": 13,
+			"update_global_opt_iters": 17,
+			"tracking_opt_iters": 29,
+			"first_global_opt_iters": 19,
+			"last_global_opt_iters": 23,
+			"subdiv": 2,
+			"iters": 3,
+			"seed_opt_iters": 7,
+			"candidate_opt_iters": 4,
+			"candidate_lr": 0.07,
+			"fringe_opt_iters": 5,
+			"fringe_lr": 0.03,
+			"global_opt_interval": 6,
+			"progress_mode": "both",
+			"no_progress_iters": 31,
+			"scale_levels": 4,
+			"min_scale_level": 2,
+			"dense_opt": True,
+			"dense_reg_radius": 5,
+			"w_dense_prior": 0.25,
+			"repair_max_blocks": 2,
+			"repair_lr_mult": 0.5,
+			"repair_w_jac_mult": 8.0,
+			"edge_init_radius": 3,
+			"progress_interval": 7,
+			"w_metric_smooth": 0.12,
+			"w_area_smooth": 0.03,
+			"max_sample_distance": 500.0,
+			"max_sample_angle_deg": 45.0,
+			"sample_angle_step_fraction": 0.2,
+			"max_step_neighbor_ratio": 10.0,
+			"fixture_export_dir": "fixture_out",
+			"fixture_export_once": False,
+			"fixture_export_objs": False,
+		})
 
-		self.assertTrue(opt_loss_snap_surf._cfg.map_init.enabled)
-		self.assertTrue(opt_loss_snap_surf._cfg.map_init.surface_loss)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.initial_iters, 11)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.update_interval, 13)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.update_global_opt_iters, 17)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.tracking_opt_iters, 29)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.first_global_opt_iters, 19)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.last_global_opt_iters, 23)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.subdiv, 2)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.iters, 3)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.seed_opt_iters, 7)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.candidate_opt_iters, 4)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.candidate_lr, 0.07)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.fringe_opt_iters, 5)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.fringe_lr, 0.03)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.global_opt_interval, 6)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.progress_mode, "both")
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.no_progress_iters, 31)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.scale_levels, 4)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.min_scale_level, 2)
-		self.assertTrue(opt_loss_snap_surf._cfg.map_init.dense_opt)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.dense_reg_radius, 5)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.w_dense_prior, 0.25)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.repair_max_blocks, 2)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.repair_lr_mult, 0.5)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.repair_w_jac_mult, 8.0)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.edge_init_radius, 3)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.progress_interval, 100)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.w_metric_smooth, 0.12)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.w_area_smooth, 0.03)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.max_sample_distance, 500.0)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.max_sample_angle_deg, 45.0)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.sample_angle_step_fraction, 0.2)
-		self.assertAlmostEqual(opt_loss_snap_surf._cfg.map_init.max_step_neighbor_ratio, 10.0)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.fixture_export_dir, "fixture_out")
-		self.assertFalse(opt_loss_snap_surf._cfg.map_init.fixture_export_once)
-		self.assertFalse(opt_loss_snap_surf._cfg.map_init.fixture_export_objs)
+		self.assertTrue(cfg.enabled)
+		self.assertTrue(cfg.surface_loss)
+		self.assertEqual(cfg.initial_iters, 11)
+		self.assertEqual(cfg.update_interval, 13)
+		self.assertEqual(cfg.update_global_opt_iters, 17)
+		self.assertEqual(cfg.tracking_opt_iters, 29)
+		self.assertEqual(cfg.first_global_opt_iters, 19)
+		self.assertEqual(cfg.last_global_opt_iters, 23)
+		self.assertEqual(cfg.subdiv, 2)
+		self.assertEqual(cfg.iters, 3)
+		self.assertEqual(cfg.seed_opt_iters, 7)
+		self.assertEqual(cfg.candidate_opt_iters, 4)
+		self.assertAlmostEqual(cfg.candidate_lr, 0.07)
+		self.assertEqual(cfg.fringe_opt_iters, 5)
+		self.assertAlmostEqual(cfg.fringe_lr, 0.03)
+		self.assertEqual(cfg.global_opt_interval, 6)
+		self.assertEqual(cfg.progress_mode, "both")
+		self.assertEqual(cfg.no_progress_iters, 31)
+		self.assertEqual(cfg.scale_levels, 4)
+		self.assertEqual(cfg.min_scale_level, 2)
+		self.assertTrue(cfg.dense_opt)
+		self.assertEqual(cfg.dense_reg_radius, 5)
+		self.assertAlmostEqual(cfg.w_dense_prior, 0.25)
+		self.assertEqual(cfg.repair_max_blocks, 2)
+		self.assertAlmostEqual(cfg.repair_lr_mult, 0.5)
+		self.assertAlmostEqual(cfg.repair_w_jac_mult, 8.0)
+		self.assertEqual(cfg.edge_init_radius, 3)
+		self.assertEqual(cfg.progress_interval, 100)
+		self.assertAlmostEqual(cfg.w_metric_smooth, 0.12)
+		self.assertAlmostEqual(cfg.w_area_smooth, 0.03)
+		self.assertAlmostEqual(cfg.max_sample_distance, 500.0)
+		self.assertAlmostEqual(cfg.max_sample_angle_deg, 45.0)
+		self.assertAlmostEqual(cfg.sample_angle_step_fraction, 0.2)
+		self.assertAlmostEqual(cfg.max_step_neighbor_ratio, 10.0)
+		self.assertEqual(cfg.fixture_export_dir, "fixture_out")
+		self.assertFalse(cfg.fixture_export_once)
+		self.assertFalse(cfg.fixture_export_objs)
 		with self.assertRaises(ValueError):
-			opt_loss_snap_surf.configure_snap_surf(
-				cfg={"map_init": {"unknown": 1}},
-				seed_xyz=(1.0, 1.0, 0.0),
-				active=True,
-			)
+			opt_loss_snap_surf._parse_map_init_config({"unknown": 1})
 		for key in ("w_metric_smooth", "w_area_smooth", "max_sample_distance", "sample_angle_step_fraction", "max_step_neighbor_ratio"):
 			with self.assertRaises(ValueError):
-				opt_loss_snap_surf.configure_snap_surf(
-					cfg={"map_init": {key: -0.1}},
-					seed_xyz=(1.0, 1.0, 0.0),
-					active=True,
-				)
+				opt_loss_snap_surf._parse_map_init_config({key: -0.1})
 		with self.assertRaises(ValueError):
-			opt_loss_snap_surf.configure_snap_surf(
-				cfg={"map_init": {"max_sample_angle_deg": 181.0}},
-				seed_xyz=(1.0, 1.0, 0.0),
-				active=True,
-			)
+			opt_loss_snap_surf._parse_map_init_config({"max_sample_angle_deg": 181.0})
 		for key in ("candidate_lr", "fringe_lr"):
 			with self.assertRaises(ValueError):
-				opt_loss_snap_surf.configure_snap_surf(
-					cfg={"map_init": {key: 0.0}},
-					seed_xyz=(1.0, 1.0, 0.0),
-					active=True,
-				)
+				opt_loss_snap_surf._parse_map_init_config({key: 0.0})
 		with self.assertRaises(ValueError):
-			opt_loss_snap_surf.configure_snap_surf(
-				cfg={"map_init": {"progress_mode": "loud"}},
-				seed_xyz=(1.0, 1.0, 0.0),
-				active=True,
-			)
+			opt_loss_snap_surf._parse_map_init_config({"progress_mode": "loud"})
 		with self.assertRaises(ValueError):
-			opt_loss_snap_surf.configure_snap_surf(
-				cfg={"map_init": {"scale_levels": 2, "scale_factor": 3}},
-				seed_xyz=(1.0, 1.0, 0.0),
-				active=True,
-			)
-		opt_loss_snap_surf.configure_snap_surf(
-			cfg={"map_init": {"minscale": 1}},
-			seed_xyz=(1.0, 1.0, 0.0),
-			active=True,
-		)
-		self.assertEqual(opt_loss_snap_surf._cfg.map_init.min_scale_level, 1)
+			opt_loss_snap_surf._parse_map_init_config({"scale_levels": 2, "scale_factor": 3})
+		cfg = opt_loss_snap_surf._parse_map_init_config({"minscale": 1})
+		self.assertEqual(cfg.min_scale_level, 1)
 		with self.assertRaises(ValueError):
-			opt_loss_snap_surf.configure_snap_surf(
-				cfg={"map_init": {"minscale": 1, "min_scale_level": 1}},
-				seed_xyz=(1.0, 1.0, 0.0),
-				active=True,
-			)
+			opt_loss_snap_surf._parse_map_init_config({"minscale": 1, "min_scale_level": 1})
 
 	def test_map_init_dyadic_level_helpers_are_exact(self) -> None:
 		strides = opt_loss_snap_surf._map_init_dyadic_strides(
@@ -388,50 +345,6 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 
 		self.assertTrue(torch.isfinite(got).all())
 		self.assertTrue(torch.equal(got[2, 2], uv[2, 2]))
-
-	def test_map_init_dyadic_final_state_is_full_lr_sized(self) -> None:
-		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
-		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
-		opt_loss_snap_surf.configure_snap_surf(
-			cfg={"map_init": {"enabled": True, "subdiv": 1, "iters": 1, "grow_opt_iters": 1, "seed_radius": 0, "scale_levels": 3}},
-			seed_xyz=(2.0, 2.0, 0.0),
-			active=True,
-		)
-
-		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
-		mi = opt_loss_snap_surf._states[0].map_init
-
-		self.assertEqual(tuple(mi.uv.shape), (5, 5, 2))
-		self.assertEqual(tuple(mi.active_quad.shape), (4, 4))
-		self.assertEqual(mi.scale_level, 0)
-		self.assertEqual(opt_loss_snap_surf.last_stats()["snaps_map_scales"], 3.0)
-
-	def test_map_init_min_scale_level_stops_before_full_lr(self) -> None:
-		model_xyz = _plane_xyz(h=5, w=5, z=1.0).unsqueeze(0)
-		ext_xyz = _plane_xyz(h=5, w=5, z=0.0)
-		opt_loss_snap_surf.configure_snap_surf(
-			cfg={
-				"map_init": {
-					"enabled": True,
-					"subdiv": 1,
-					"iters": 3,
-					"grow_opt_iters": 1,
-					"seed_radius": 0,
-					"scale_levels": 3,
-					"min_scale_level": 1,
-				}
-			},
-			seed_xyz=(2.0, 2.0, 0.0),
-			active=True,
-		)
-
-		opt_loss_snap_surf.snap_surf_loss(res=_result(model_xyz, ext_xyz))
-		mi = opt_loss_snap_surf._states[0].map_init
-
-		self.assertEqual(mi.scale_level, 1)
-		self.assertEqual(tuple(mi.uv.shape), (3, 3, 2))
-		self.assertEqual(tuple(mi.active_quad.shape), (2, 2))
-		self.assertEqual(opt_loss_snap_surf.last_stats()["snaps_map_scales"], 2.0)
 
 if __name__ == "__main__":
 	unittest.main()

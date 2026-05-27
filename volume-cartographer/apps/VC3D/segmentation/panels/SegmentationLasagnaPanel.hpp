@@ -50,14 +50,13 @@ public:
     [[nodiscard]] QString lasagnaConfigText() const;
     [[nodiscard]] utils::Json lasagnaConfigJson() const;
     [[nodiscard]] LasagnaMode lasagnaMode() const { return static_cast<LasagnaMode>(_lasagnaMode); }
-    [[nodiscard]] int newModelWidth() const;
+    [[nodiscard]] double newModelWidth() const;
+    [[nodiscard]] QString newModelWidthUnit() const;
     [[nodiscard]] int newModelHeight() const;
     [[nodiscard]] int newModelWindings() const;
     [[nodiscard]] QString seedPointText() const;
     [[nodiscard]] QString newModelOutputName() const;
     [[nodiscard]] double offsetValue() const;
-    [[nodiscard]] int windowSize() const;
-    [[nodiscard]] int windowOverlap() const;
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
@@ -143,7 +142,8 @@ private:
     QToolButton* _dataInputBrowse{nullptr};
 
     // New model settings
-    QSpinBox* _widthSpin{nullptr};
+    QDoubleSpinBox* _widthSpin{nullptr};
+    QComboBox* _widthUnitCombo{nullptr};
     QSpinBox* _heightSpin{nullptr};
     QSpinBox* _windingsSpin{nullptr};
     QLineEdit* _seedEdit{nullptr};
@@ -158,8 +158,6 @@ private:
     QComboBox* _offsetConfigCombo{nullptr};
     QToolButton* _offsetConfigBrowse{nullptr};
     QDoubleSpinBox* _offsetValueSpin{nullptr};
-    QSpinBox* _windowSizeSpin{nullptr};
-    QSpinBox* _windowOverlapSpin{nullptr};
 
     // Action buttons
     QPushButton* _newModelBtn{nullptr};

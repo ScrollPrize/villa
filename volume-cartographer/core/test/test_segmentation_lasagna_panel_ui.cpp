@@ -92,8 +92,6 @@ int main(int argc, char** argv)
     settings.setValue(QStringLiteral("lasagna_new_model_height"), 456);
     settings.setValue(QStringLiteral("lasagna_new_model_windings"), 7);
     settings.setValue(QStringLiteral("lasagna_offset_value"), -1.25);
-    settings.setValue(QStringLiteral("lasagna_window_size"), 3210);
-    settings.setValue(QStringLiteral("lasagna_window_overlap"), 210);
     const QString altConfigPath = tempDir.filePath(QStringLiteral("alt_config.json"));
     writeFile(altConfigPath, QByteArrayLiteral(R"({"args":{"alternate":1}})"));
 
@@ -109,9 +107,9 @@ int main(int argc, char** argv)
     require(panel.newModelWidth() == 123 && panel.newModelHeight() == 456 &&
                 panel.newModelWindings() == 7,
             "New-model dimensions were not restored");
+    require(panel.newModelWidthUnit() == QStringLiteral("voxels"),
+            "New-model width unit should default to voxels");
     require(panel.offsetValue() == -1.25, "Offset value was not restored");
-    require(panel.windowSize() == 3210 && panel.windowOverlap() == 210,
-            "Offset window settings were not restored");
 
     settings.setValue(QStringLiteral("lasagna_new_model_config_file_path"), configPath);
     settings.setValue(QStringLiteral("lasagna_reopt_config_file_path"), configPath);
@@ -326,7 +324,7 @@ int main(int argc, char** argv)
     writeFile(segDir + QStringLiteral("/approval.tif"), QByteArrayLiteral("a"));
     writeFile(segDir + QStringLiteral("/d.tif"), QByteArrayLiteral("d"));
     writeFile(segDir + QStringLiteral("/model.pt"), QByteArrayLiteral("model"));
-    require(QDir().mkpath(tempDir.filePath(QStringLiteral("sheet_off1_w000.tifxyz"))),
+    require(QDir().mkpath(tempDir.filePath(QStringLiteral("sheet_off1.tifxyz"))),
             "Failed to create offset collision directory");
 
     cv::Mat_<cv::Vec3f> points(2, 2);
@@ -350,6 +348,11 @@ int main(int argc, char** argv)
         6);
     QJsonObject newModelJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
     QJsonObject newModelJobConfig = newModelJobSpec[QStringLiteral("config")].toObject();
+    QJsonObject newModelJobArgs = newModelJobConfig[QStringLiteral("args")].toObject();
+    require(newModelJobArgs[QStringLiteral("model-w")].toDouble() == 123.0,
+            "New Model launch should preserve the saved voxel width value");
+    require(newModelJobArgs[QStringLiteral("model-w-unit")].toString() == QStringLiteral("voxels"),
+            "New Model launch should send the default voxel width unit");
     QJsonArray newModelExternalSurfaces =
         newModelJobConfig[QStringLiteral("external_surfaces")].toArray();
     require(newModelExternalSurfaces.size() == 1,
@@ -362,9 +365,9 @@ int main(int argc, char** argv)
         4,
         5,
         6);
-    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_off2")),
+    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_off2.tifxyz")),
             "Offset launch should reserve the next collision-free offset output name");
-    require(statusBar.currentMessage().contains(QStringLiteral("sheet_off2")),
+    require(statusBar.currentMessage().contains(QStringLiteral("sheet_off2.tifxyz")),
             "Offset launch status should include the generated offset output name");
     QJsonObject jobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
     QJsonObject jobConfig = jobSpec[QStringLiteral("config")].toObject();
@@ -383,6 +386,28 @@ int main(int argc, char** argv)
             "External surface should preserve object ref hash");
     require(externalSurface[QStringLiteral("offset")].toDouble() == panel.offsetValue(),
             "External surface should carry the offset spinner value");
+
+    settings.setValue(QStringLiteral("lasagna_new_model_width_unit"), QStringLiteral("wraps"));
+    settings.setValue(QStringLiteral("lasagna_new_model_width_wraps"), 1.5);
+    panel.restoreSettings(settings);
+    require(panel.newModelWidth() == 1.5 &&
+                panel.newModelWidthUnit() == QStringLiteral("wraps"),
+            "Wrap width settings were not restored");
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::NewModel,
+        configPath,
+        4,
+        5,
+        6);
+    QJsonObject wrapJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    QJsonObject wrapJobConfig = wrapJobSpec[QStringLiteral("config")].toObject();
+    QJsonObject wrapJobArgs = wrapJobConfig[QStringLiteral("args")].toObject();
+    require(wrapJobArgs[QStringLiteral("model-w")].toDouble() == 1.5,
+            "New Model launch should send the saved wraps width value");
+    require(wrapJobArgs[QStringLiteral("model-w-unit")].toString() == QStringLiteral("wraps"),
+            "New Model launch should send the wraps width unit");
 
     return 0;
 }

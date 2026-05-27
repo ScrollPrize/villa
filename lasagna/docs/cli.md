@@ -38,8 +38,6 @@ Each part provides `add_args(parser)` + `from_args(args)`:
 - `--model-init` (`seed`, `ext`, `model`, or `flatten`; default `seed`)
 - `--flatten-solver` (`torch`, `inverse`, or `forward`; default `torch`) selects the flattening variant when `--model-init flatten`
 - `--tifxyz-init` tifxyz directory used when `--model-init ext`
-- `--window-size` window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)
-- `--window-overlap` overlap between windows in fullres voxels (default 0)
 - `--progress` print machine-readable `PROGRESS` lines to stdout
 
 ## JSON config
@@ -50,9 +48,7 @@ All arguments can be set via JSON config files (merged left-to-right). The `args
 {
   "args": {
     "input": "path/to/vol.lasagna.json",
-    "mesh-step": 100,
-    "window-size": 5000,
-    "window-overlap": 500
+    "mesh-step": 100
   },
   "stage_1": { "steps": 200, "global_opt": { ... } },
   "stage_2": { "steps": 100, "global_opt": { ... } }
