@@ -46,6 +46,44 @@ _CacheStats = dict[str, int]
 _NO_Z_LIFT = object()
 
 
+@dataclass(frozen=True)
+class _LrAutoscaleConfig:
+	enabled: bool = False
+	window: int = 10
+	eps: float = 1.0e-12
+	min_scale: float | None = None
+	max_scale: float | None = None
+
+
+class _LrAutoscaleState:
+	def __init__(self, cfg: _LrAutoscaleConfig) -> None:
+		self.cfg = cfg
+		self.losses: list[torch.Tensor] = []
+		self.last_scale: torch.Tensor | None = None
+
+	def scale_for_loss(self, loss: torch.Tensor) -> torch.Tensor:
+		cfg = self.cfg
+		value = loss.detach()
+		if value.ndim != 0:
+			value = value.mean()
+		value = torch.where(
+			torch.isfinite(value),
+			value.abs().clamp_min(float(cfg.eps)),
+			value.new_tensor(1.0),
+		)
+		self.losses.append(value)
+		if len(self.losses) > int(cfg.window):
+			del self.losses[:len(self.losses) - int(cfg.window)]
+		max_loss = torch.stack(self.losses).max().clamp_min(float(cfg.eps))
+		scale = value.new_tensor(1.0) / max_loss
+		if cfg.min_scale is not None or cfg.max_scale is not None:
+			min_scale = -float("inf") if cfg.min_scale is None else float(cfg.min_scale)
+			max_scale = float("inf") if cfg.max_scale is None else float(cfg.max_scale)
+			scale = scale.clamp(min=min_scale, max=max_scale)
+		self.last_scale = scale
+		return scale
+
+
 def _print_progress_legend_once(*, prefix: str, items: list[tuple[str, str]]) -> None:
 	if prefix in _PRINTED_PROGRESS_LEGENDS:
 		return
@@ -122,9 +160,56 @@ def _lr_warmup_factor(*, step1: int, warmup_steps: int) -> float:
 	return min(1.0, max(0.0, float(step1) / float(warmup_steps)))
 
 
+def _optional_positive_float(value: Any, *, name: str) -> float | None:
+	if value is None:
+		return None
+	out = float(value)
+	if out <= 0.0:
+		raise ValueError(f"{name} must be > 0")
+	return out
+
+
+def _lr_autoscale_config(args: dict[str, Any] | None) -> _LrAutoscaleConfig:
+	args = args or {}
+	raw = args.get("lr_autoscale", args.get("lr_auto_scale", False))
+	raw_cfg: dict[str, Any] = {}
+	if isinstance(raw, dict):
+		enabled = _truthy_arg(raw.get("enabled", True))
+		raw_cfg.update(raw)
+	else:
+		enabled = _truthy_arg(raw)
+	window = int(raw_cfg.get(
+		"window",
+		raw_cfg.get("steps", args.get("lr_autoscale_window", args.get("lr_autoscale_steps", 10))),
+	))
+	if window <= 0:
+		raise ValueError("lr_autoscale_window must be > 0")
+	eps = float(raw_cfg.get("eps", args.get("lr_autoscale_eps", 1.0e-12)))
+	if eps <= 0.0:
+		raise ValueError("lr_autoscale_eps must be > 0")
+	min_scale = _optional_positive_float(
+		raw_cfg.get("min_scale", args.get("lr_autoscale_min_scale", None)),
+		name="lr_autoscale_min_scale",
+	)
+	max_scale = _optional_positive_float(
+		raw_cfg.get("max_scale", args.get("lr_autoscale_max_scale", None)),
+		name="lr_autoscale_max_scale",
+	)
+	if min_scale is not None and max_scale is not None and min_scale > max_scale:
+		raise ValueError("lr_autoscale_min_scale must be <= lr_autoscale_max_scale")
+	return _LrAutoscaleConfig(
+		enabled=enabled,
+		window=window,
+		eps=eps,
+		min_scale=min_scale,
+		max_scale=max_scale,
+	)
+
+
 def _capture_optimizer_target_lrs(opt: torch.optim.Optimizer) -> None:
 	for group in opt.param_groups:
-		group.setdefault("_target_lr", float(group.get("lr", 0.0)))
+		if "_target_lr" not in group:
+			group["_target_lr"] = float(group.get("lr", 0.0))
 
 
 def _apply_optimizer_lr_warmup(opt: torch.optim.Optimizer, *, step1: int, warmup_steps: int) -> None:
@@ -132,8 +217,48 @@ def _apply_optimizer_lr_warmup(opt: torch.optim.Optimizer, *, step1: int, warmup
 		return
 	scale = _lr_warmup_factor(step1=int(step1), warmup_steps=int(warmup_steps))
 	for group in opt.param_groups:
-		target_lr = float(group.setdefault("_target_lr", float(group.get("lr", 0.0))))
+		if "_target_lr" not in group:
+			group["_target_lr"] = float(group.get("lr", 0.0))
+		target_lr = float(group["_target_lr"])
 		group["lr"] = target_lr * scale
+
+
+def _make_lr_autoscale_state(args: dict[str, Any] | None) -> _LrAutoscaleState | None:
+	cfg = _lr_autoscale_config(args)
+	return _LrAutoscaleState(cfg) if cfg.enabled else None
+
+
+def _apply_optimizer_lr_schedule(
+	opt: torch.optim.Optimizer,
+	*,
+	step1: int,
+	warmup_steps: int,
+	autoscale: _LrAutoscaleState | None,
+	loss: torch.Tensor,
+) -> None:
+	warmup = _lr_warmup_factor(step1=int(step1), warmup_steps=int(warmup_steps))
+	auto_scale = autoscale.scale_for_loss(loss) if autoscale is not None else None
+	for group in opt.param_groups:
+		if "_target_lr" not in group:
+			group["_target_lr"] = float(group.get("lr", 0.0))
+		target_lr = float(group["_target_lr"])
+		lr = target_lr * warmup
+		group["lr"] = auto_scale * lr if auto_scale is not None else lr
+
+
+def _optimizer_lr_for_display(opt: torch.optim.Optimizer | None, fallback: float) -> float:
+	if opt is None or not opt.param_groups:
+		return float(fallback)
+	return float(opt.param_groups[0].get("lr", fallback))
+
+
+def _lr_autoscale_stats(prefix: str, autoscale: _LrAutoscaleState | None) -> dict[str, float]:
+	if autoscale is None or autoscale.last_scale is None:
+		return {}
+	return {
+		f"{prefix}_lr_autoscale": float(autoscale.last_scale.detach().cpu()),
+		f"{prefix}_lr_autoscale_window": float(len(autoscale.losses)),
+	}
 
 
 def _public_stage_param(name: str) -> str:
@@ -1662,9 +1787,7 @@ def _run_affine_seed_quad_expansion_reopt(
 			flush=True,
 		)
 	def opt_lr(opt: torch.optim.Optimizer | None) -> float:
-		if opt is None or not opt.param_groups:
-			return float(lr)
-		return float(opt.param_groups[0].get("lr", lr))
+		return _optimizer_lr_for_display(opt, float(lr))
 	def write_debug_map(radius: int, phase: str, step_count: int, active: torch.Tensor, row: dict[str, float]) -> None:
 		if debug_obj_root is None:
 			return
@@ -1766,6 +1889,7 @@ def _run_affine_seed_quad_expansion_reopt(
 			progress_rows += 1
 		opt = torch.optim.Adam([affine.affine], lr=float(lr))
 		_capture_optimizer_target_lrs(opt)
+		lr_autoscale = _make_lr_autoscale_state(stage.args if stage is not None else None)
 		for step in range(steps_i):
 			if cancel_fn is not None:
 				cancel_fn()
@@ -1783,8 +1907,13 @@ def _run_affine_seed_quad_expansion_reopt(
 				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
 			loss.backward()
 			step1 = step + 1
-			_apply_optimizer_lr_warmup(opt, step1=step1, warmup_steps=lr_warmup_steps_i)
-			step_lr = opt_lr(opt)
+			_apply_optimizer_lr_schedule(
+				opt,
+				step1=step1,
+				warmup_steps=lr_warmup_steps_i,
+				autoscale=lr_autoscale,
+				loss=loss,
+			)
 			opt.step()
 			status_due = (
 				step == 0 or
@@ -1792,6 +1921,7 @@ def _run_affine_seed_quad_expansion_reopt(
 				(status_interval_i > 0 and (step1 % status_interval_i) == 0)
 			)
 			if status_due:
+				step_lr = opt_lr(opt)
 				row = eval_row(radius, active, step1, init_loss)
 				row["lr"] = float(step_lr)
 				rows.append(row)
@@ -2753,6 +2883,7 @@ def _run_affine_seed_quad_init(
 	opt = torch.optim.Adam([affine.affine], lr=float(lr)) if steps > 0 else None
 	if opt is not None:
 		_capture_optimizer_target_lrs(opt)
+	lr_autoscale = _make_lr_autoscale_state(stage.args)
 	status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
 	lr_warmup_steps = _lr_warmup_steps(stage.args)
 	last_status_time: float | None = None
@@ -2803,7 +2934,13 @@ def _run_affine_seed_quad_init(
 			loss = loss + float(w_station) * station_raw
 		if opt is not None:
 			loss.backward()
-			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
+			_apply_optimizer_lr_schedule(
+				opt,
+				step1=step + 1,
+				warmup_steps=lr_warmup_steps,
+				autoscale=lr_autoscale,
+				loss=loss,
+			)
 			opt.step()
 		step1 = step + 1
 		status_due = (
@@ -2835,7 +2972,7 @@ def _run_affine_seed_quad_init(
 				widths=progress_widths_run,
 				stage_idx=stage_idx,
 				iter_label=f"{step1}/{steps}",
-				lr=float(opt.param_groups[0].get("lr", lr)) if opt is not None and opt.param_groups else float(lr),
+				lr=_optimizer_lr_for_display(opt, float(lr)),
 				level=0,
 				loss=report_loss,
 				terms=report_terms,
@@ -3366,6 +3503,7 @@ class GlobalMapRuntime:
 		self.global_model: GlobalMapModel | None = None
 		self.optimizer: torch.optim.Optimizer | None = None
 		self.optimizer_key: tuple[tuple[str, ...], int, float, int] | None = None
+		self.lr_autoscale: _LrAutoscaleState | None = None
 		self.station_target: torch.Tensor | None = None
 		self.last: dict[str, float] = {}
 		self.steps_run = 0
@@ -3607,6 +3745,7 @@ class GlobalMapRuntime:
 		params, level = self._params_for_stage(stage)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
 		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
 		_t_startup = time.perf_counter()
 		initial_stats = _stats_for_current_uv()
 		startup_initial_eval_s = time.perf_counter() - _t_startup
@@ -3631,14 +3770,26 @@ class GlobalMapRuntime:
 		)
 		steps_completed = 0
 		auto_stopped = False
+		lr_autoscale: _LrAutoscaleState | None = None
 		if params and int(stage.steps) > 0:
 			key = (tuple(stage.params), int(level), float(stage.lr), int(stage.min_scaledown))
 			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
 				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
 				_capture_optimizer_target_lrs(self.optimizer)
 				self.optimizer_key = key
+				self.lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None
 			opt = self.optimizer
 			assert opt is not None
+			if persistent_optimizer:
+				lr_autoscale = getattr(self, "lr_autoscale", None)
+				if lr_autoscale_cfg.enabled and lr_autoscale is None:
+					lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg)
+					self.lr_autoscale = lr_autoscale
+				elif lr_autoscale is not None and lr_autoscale.cfg != lr_autoscale_cfg:
+					lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None
+					self.lr_autoscale = lr_autoscale
+			else:
+				lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None
 			for _ in range(int(stage.steps)):
 				if cancel_fn is not None:
 					cancel_fn()
@@ -3658,7 +3809,13 @@ class GlobalMapRuntime:
 					loss = loss + w_station * _station_loss(uv, seed_hw, station_target)
 				loss.backward()
 				warmup_step1 = self.steps_run + 1 if persistent_optimizer else _ + 1
-				_apply_optimizer_lr_warmup(opt, step1=warmup_step1, warmup_steps=lr_warmup_steps)
+				_apply_optimizer_lr_schedule(
+					opt,
+					step1=warmup_step1,
+					warmup_steps=lr_warmup_steps,
+					autoscale=lr_autoscale,
+					loss=loss,
+				)
 				opt.step()
 				if cancel_fn is not None:
 					cancel_fn()
@@ -3681,9 +3838,11 @@ class GlobalMapRuntime:
 			if not persistent_optimizer:
 				self.optimizer = None
 				self.optimizer_key = None
+				self.lr_autoscale = None
 		stats = _stats_for_current_uv()
 		stats["snaps_map_stage_steps"] = float(steps_completed)
 		stats["snaps_map_auto_stopped"] = 1.0 if auto_stopped else 0.0
+		stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
 		self.last = stats
 		debug_obj_dir = stage.args.get("debug_obj_dir", None)
 		if debug_obj_dir:
@@ -3963,6 +4122,7 @@ def optimize_fixture(
 		_capture_optimizer_target_lrs(opt)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
 		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		lr_autoscale = _make_lr_autoscale_state(stage.args)
 		last_status_time: float | None = None
 		last_status_step = 0
 		with torch.no_grad():
@@ -4015,7 +4175,13 @@ def optimize_fixture(
 				station_raw = _station_loss(uv, seed_hw, station_target)
 				loss = loss + w_station * station_raw
 			loss.backward()
-			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
+			_apply_optimizer_lr_schedule(
+				opt,
+				step1=step + 1,
+				warmup_steps=lr_warmup_steps,
+				autoscale=lr_autoscale,
+				loss=loss,
+			)
 			opt.step()
 			with torch.no_grad():
 				if "map_uv_ms" in stage.params and global_model is not None:
@@ -4051,7 +4217,7 @@ def optimize_fixture(
 					widths=progress_widths_run,
 					stage_idx=stage_idx,
 					iter_label=f"{step1}/{int(stage.steps)}",
-					lr=float(opt.param_groups[0].get("lr", stage.lr)) if opt.param_groups else float(stage.lr),
+					lr=_optimizer_lr_for_display(opt, float(stage.lr)),
 					level=level,
 					loss=report_loss,
 					terms=report_terms,

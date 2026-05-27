@@ -27,13 +27,16 @@ from snap_surf.map_global import (
 	GlobalMapRuntime,
 	GlobalMapStageConfig,
 	GlobalMapConfig,
+	_LrAutoscaleState,
 	_affine_from_seed_ext_quads,
 	_affine_multistart_candidates,
 	_affine_seed_quad_expansion_rows,
 	_affine_seed_grid_candidates,
 	_apply_external_quad_health_filter,
+	_apply_optimizer_lr_schedule,
 	_objective_for_uv,
 	_full_active_quad,
+	_lr_autoscale_config,
 	_run_affine_seed_quad_expansion_reopt,
 	_select_affine_seed_grid_candidate,
 	_seed_quad_affine_init_result,
@@ -455,6 +458,54 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				"params": ["map_surf_ms"],
 				"w_fac": {"not_a_loss": 1.0},
 			})
+
+	def test_lr_autoscale_scales_inverse_to_recent_max_loss(self) -> None:
+		p = torch.nn.Parameter(torch.tensor([0.0]))
+		opt = torch.optim.Adam([p], lr=0.2)
+		cfg = _lr_autoscale_config({"lr_autoscale": True, "lr_autoscale_window": 2})
+		state = _LrAutoscaleState(cfg)
+
+		_apply_optimizer_lr_schedule(
+			opt,
+			step1=1,
+			warmup_steps=0,
+			autoscale=state,
+			loss=torch.tensor(2.0),
+		)
+		self.assertAlmostEqual(float(opt.param_groups[0]["lr"]), 0.1)
+
+		_apply_optimizer_lr_schedule(
+			opt,
+			step1=2,
+			warmup_steps=0,
+			autoscale=state,
+			loss=torch.tensor(0.5),
+		)
+		self.assertAlmostEqual(float(opt.param_groups[0]["lr"]), 0.1)
+
+		_apply_optimizer_lr_schedule(
+			opt,
+			step1=3,
+			warmup_steps=0,
+			autoscale=state,
+			loss=torch.tensor(0.5),
+		)
+		self.assertAlmostEqual(float(opt.param_groups[0]["lr"]), 0.4)
+
+	def test_lr_autoscale_combines_with_warmup(self) -> None:
+		p = torch.nn.Parameter(torch.tensor([0.0]))
+		opt = torch.optim.Adam([p], lr=0.2)
+		state = _LrAutoscaleState(_lr_autoscale_config({"lr_autoscale": {"enabled": True, "window": 10}}))
+
+		_apply_optimizer_lr_schedule(
+			opt,
+			step1=2,
+			warmup_steps=4,
+			autoscale=state,
+			loss=torch.tensor(0.5),
+		)
+
+		self.assertAlmostEqual(float(opt.param_groups[0]["lr"]), 0.2)
 
 	def test_lasagna_stage_parser_rejects_plain_affine_and_mixed_params(self) -> None:
 		with self.assertRaisesRegex(ValueError, "map_surf_affine"):

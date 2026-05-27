@@ -62,7 +62,7 @@
 			"lr": 0.01,
 			"params": ["map_surf_affine"],
 			"args": {
-				"lr_warmup_steps": 50,
+				"lr_warmup_steps": 10,
 				"status_interval": 1,
 				"subdiv": 1,
 				"map_global": {
@@ -105,10 +105,11 @@
 		{
 			"name": "map_uv_coarse",
 			"steps": "auto",
-			"lr": 0.01,
+			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
+				"lr_autoscale": true,
 				"subdiv": 1,
 				"status_interval": 20
 			}
@@ -116,10 +117,11 @@
 		{
 			"name": "map_uv_refine",
 			"steps": "auto",
-			"lr": 0.01,
+			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
+				"lr_autoscale": true,
 				"subdiv": 1,
 				"status_interval": 20
 			}
