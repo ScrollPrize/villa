@@ -870,6 +870,7 @@ def _apply_external_quad_health_filter(
 		if external_surface_index is not None else None
 	)
 	cached = cache.get(cache_key) if cache is not None and cache_key is not None else None
+	cache_hit = cached is not None
 	if cached is None:
 		if cache is not None and cache_key is not None and cache_stats is not None:
 			cache_stats["health_miss"] = int(cache_stats.get("health_miss", 0)) + 1
@@ -913,7 +914,7 @@ def _apply_external_quad_health_filter(
 	before = int(stats["quads_input"])
 	after = int(stats["quads_kept"])
 	rejected = int(stats["quads_rejected"])
-	if rejected > 0:
+	if rejected > 0 and not cache_hit:
 		print(
 			"[snap_surf.map_global] external quad health filter "
 			f"{label} kept={after}/{before} rejected={rejected} "
@@ -3690,19 +3691,26 @@ class GlobalMapRuntime:
 		startup_z_lift_s = time.perf_counter() - _t_startup
 		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
 		stage_active_quad_hw = stage_active_quad.nonzero(as_tuple=False)
-		def _stats_for_current_uv() -> dict[str, float]:
-			with torch.no_grad():
-				loss_f, terms, err = _global_progress_state(
-					uv=self._uv(),
-					fixture=fixture,
-					cfg=stage_cfg,
-					seed_hw=seed_hw,
-					station_target=station_target,
-					w_station=w_station,
-					z_lift=stage_z_lift,
-					active_quad=stage_active_quad,
-					active_quad_hw=stage_active_quad_hw,
-				)
+		startup_initial_eval_s = 0.0
+		startup_timing_printed = False
+		def _maybe_print_startup_timing() -> None:
+			nonlocal startup_timing_printed
+			if startup_timing_printed or not startup_timing:
+				return
+			startup_timing_printed = True
+			label = stage.name or _stage_param_label(stage.params, fallback="map_stage")
+			print(
+				f"[snap_surf.map_global] {label}: startup "
+				f"health={1000.0 * startup_health_s:.3f}ms "
+				f"z_lift={1000.0 * startup_z_lift_s:.3f}ms "
+				f"initial_eval={1000.0 * startup_initial_eval_s:.3f}ms "
+				f"health_hit={cache_stats['health_hit']} health_miss={cache_stats['health_miss']} "
+				f"zext_hit={cache_stats['zext_hit']} zext_miss={cache_stats['zext_miss']} "
+				f"zmdl_hit={cache_stats['zmdl_hit']} zmdl_miss={cache_stats['zmdl_miss']}",
+				flush=True,
+			)
+
+		def _stats_from_eval(loss_f: float, terms: dict[str, torch.Tensor], err: dict[str, float]) -> dict[str, float]:
 			stats = {
 				"snaps_map_loss": float(loss_f),
 				"snaps_map_samples": float(_global_term_value(terms, "samples")),
@@ -3742,36 +3750,30 @@ class GlobalMapRuntime:
 				stats["snaps_map_max"] = float(err["max_model_quad_distance"])
 			return stats
 
+		def _stats_for_current_uv() -> dict[str, float]:
+			with torch.no_grad():
+				loss_f, terms, err = _global_progress_state(
+					uv=self._uv(),
+					fixture=fixture,
+					cfg=stage_cfg,
+					seed_hw=seed_hw,
+					station_target=station_target,
+					w_station=w_station,
+					z_lift=stage_z_lift,
+					active_quad=stage_active_quad,
+					active_quad_hw=stage_active_quad_hw,
+				)
+			return _stats_from_eval(loss_f, terms, err)
+
 		params, level = self._params_for_stage(stage)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
 		lr_warmup_steps = _lr_warmup_steps(stage.args)
 		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
-		_t_startup = time.perf_counter()
-		initial_stats = _stats_for_current_uv()
-		initial_stats["snaps_map_lr"] = float(stage.lr)
-		startup_initial_eval_s = time.perf_counter() - _t_startup
-		initial_stats["snaps_map_startup_initial_eval_ms"] = 1000.0 * float(startup_initial_eval_s)
-		if startup_timing:
-			label = stage.name or _stage_param_label(stage.params, fallback="map_stage")
-			print(
-				f"[snap_surf.map_global] {label}: startup "
-				f"health={1000.0 * startup_health_s:.3f}ms "
-				f"z_lift={1000.0 * startup_z_lift_s:.3f}ms "
-				f"initial_eval={1000.0 * startup_initial_eval_s:.3f}ms "
-				f"health_hit={cache_stats['health_hit']} health_miss={cache_stats['health_miss']} "
-				f"zext_hit={cache_stats['zext_hit']} zext_miss={cache_stats['zext_miss']} "
-				f"zmdl_hit={cache_stats['zmdl_hit']} zmdl_miss={cache_stats['zmdl_miss']}",
-				flush=True,
-			)
-		if status_fn is not None:
-			status_fn(step=0, total=int(stage.steps), stats=initial_stats)
-		auto_loss_history = (
-			[float(initial_stats["snaps_map_loss"])]
-			if auto_stop_fn is not None and lr_warmup_steps <= 0 else []
-		)
+		auto_loss_history: list[float] = []
 		steps_completed = 0
 		auto_stopped = False
 		lr_autoscale: _LrAutoscaleState | None = None
+		opt: torch.optim.Optimizer | None = None
 		if params and int(stage.steps) > 0:
 			key = (tuple(stage.params), int(level), float(stage.lr), int(stage.min_scaledown))
 			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
@@ -3796,19 +3798,33 @@ class GlobalMapRuntime:
 					cancel_fn()
 				opt.zero_grad(set_to_none=True)
 				uv = self._uv()
-				loss, _terms = _objective_for_uv(
+				step1 = _ + 1
+				status_due = (
+					status_fn is not None and (
+						_ == 0 or
+						_ == int(stage.steps) - 1 or
+						(status_interval > 0 and (_ % status_interval) == 0)
+					)
+				)
+				_t_initial_eval = time.perf_counter() if _ == 0 else None
+				loss, terms = _objective_for_uv(
 					uv=uv,
 					fixture=fixture,
 					cfg=stage_cfg,
 					level=0,
 					z_lift=stage_z_lift,
-					need_stats=False,
+					need_stats=status_due,
 					active_quad=stage_active_quad,
 					active_quad_hw=stage_active_quad_hw,
 				)
 				if w_station > 0.0:
-					loss = loss + w_station * _station_loss(uv, seed_hw, station_target)
-				loss.backward()
+					station_raw = _station_loss(uv, seed_hw, station_target)
+					loss = loss + w_station * station_raw
+				else:
+					station_raw = loss.new_zeros(())
+				if _t_initial_eval is not None:
+					startup_initial_eval_s = time.perf_counter() - _t_initial_eval
+					_maybe_print_startup_timing()
 				warmup_step1 = self.steps_run + 1 if persistent_optimizer else _ + 1
 				_apply_optimizer_lr_schedule(
 					opt,
@@ -3817,32 +3833,39 @@ class GlobalMapRuntime:
 					autoscale=lr_autoscale,
 					loss=loss,
 				)
+				if status_due:
+					progress_terms = dict(terms)
+					progress_terms["station"] = station_raw.detach()
+					err = _fixture_mapping_error(uv.detach(), fixture)
+					status_stats = _stats_from_eval(float(loss.detach().cpu()), progress_terms, err)
+					status_stats["snaps_map_lr"] = _optimizer_lr_for_display(opt, float(stage.lr))
+					status_stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+					status_fn(step=_, total=int(stage.steps), stats=status_stats)
+				loss.backward()
 				opt.step()
 				if cancel_fn is not None:
 					cancel_fn()
 				self.steps_run += 1
-				step1 = _ + 1
 				steps_completed = step1
 				if auto_stop_fn is not None and step1 > lr_warmup_steps:
 					auto_step = step1 - lr_warmup_steps
 					auto_loss_history.append(float(loss.detach().cpu()))
 					auto_stopped = bool(auto_stop_fn(history=auto_loss_history, step=auto_step))
-				if status_fn is not None and (
-					step1 == 1 or
-					step1 == int(stage.steps) or
-					auto_stopped or
-					(status_interval > 0 and (step1 % status_interval) == 0)
-				):
-					status_stats = _stats_for_current_uv()
-					status_stats["snaps_map_lr"] = _optimizer_lr_for_display(opt, float(stage.lr))
-					status_stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
-					status_fn(step=step1, total=int(stage.steps), stats=status_stats)
 				if auto_stopped:
 					break
 			if not persistent_optimizer:
 				self.optimizer = None
 				self.optimizer_key = None
 				self.lr_autoscale = None
+		else:
+			_t_startup = time.perf_counter()
+			initial_stats = _stats_for_current_uv()
+			initial_stats["snaps_map_lr"] = float(stage.lr)
+			startup_initial_eval_s = time.perf_counter() - _t_startup
+			initial_stats["snaps_map_startup_initial_eval_ms"] = 1000.0 * float(startup_initial_eval_s)
+			_maybe_print_startup_timing()
+			if status_fn is not None:
+				status_fn(step=0, total=int(stage.steps), stats=initial_stats)
 		stats = _stats_for_current_uv()
 		stats["snaps_map_lr"] = _optimizer_lr_for_display(opt if params and int(stage.steps) > 0 else None, float(stage.lr))
 		stats["snaps_map_stage_steps"] = float(steps_completed)

@@ -105,11 +105,10 @@
 		{
 			"name": "map_uv_coarse",
 			"steps": "auto",
-			"lr": 1.0,
+			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
-				"lr_autoscale": true,
 				"subdiv": 1,
 				"status_interval": 20
 			}
@@ -117,11 +116,10 @@
 		{
 			"name": "map_uv_refine",
 			"steps": "auto",
-			"lr": 1.0,
+			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
-				"lr_autoscale": true,
 				"subdiv": 1,
 				"status_interval": 20
 			}

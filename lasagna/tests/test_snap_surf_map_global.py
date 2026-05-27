@@ -665,8 +665,46 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 			self.assertEqual(stats["snaps_map_stage_steps"], 3.0)
 			self.assertEqual(stats["snaps_map_auto_stopped"], 1.0)
-			self.assertIn(3, status_steps)
+			self.assertEqual(status_steps, [0])
 			self.assertNotIn(10, status_steps)
+
+	def test_live_runtime_status_zero_reports_current_autoscaled_warmup_lr(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			cfg = parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0))
+			runtime = GlobalMapRuntime(base=cfg.base)
+			h, w = 5, 5
+			model_xyz = _plane_xyz(h=h + 2, w=w + 2, z=0.0).unsqueeze(0)
+			ext_xyz = _plane_xyz(h=h, w=w, z=0.0, offset_h=0.25, offset_w=0.5)
+			model_valid = torch.ones(1, h + 2, w + 2, dtype=torch.bool)
+			ext_valid = torch.ones(h, w, dtype=torch.bool)
+			ext_quad = torch.ones(h - 1, w - 1, dtype=torch.bool)
+			model_normals = _normals_3d(1, h + 2, w + 2)
+			ext_normals = _normals_2d(h, w)
+			rows: list[dict[str, float]] = []
+
+			runtime.run_stage(
+				stage=GlobalMapStageConfig(
+					steps=1,
+					lr=1.0,
+					params=("map_uv_ms",),
+					args={"subdiv": 2, "status_interval": 0, "lr_autoscale": True, "lr_warmup_steps": 2},
+				),
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad,
+				status_fn=lambda **kw: rows.append(dict(kw["stats"])),
+			)
+
+			self.assertEqual(len(rows), 1)
+			loss = rows[0]["snaps_map_loss"]
+			expected_scale = 1.0 / loss
+			self.assertGreater(loss, 0.0)
+			self.assertAlmostEqual(rows[0]["snaps_map_lr_autoscale"], expected_scale, places=6)
+			self.assertAlmostEqual(rows[0]["snaps_map_lr"], 0.5 * expected_scale, places=6)
 
 	def test_live_runtime_auto_stop_counts_after_lr_warmup(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
