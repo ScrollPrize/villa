@@ -5,6 +5,7 @@
 
 QJsonObject g_lastLasagnaOptimizationRequest;
 QString g_lastLasagnaOptimizationOutputDir;
+double g_lastLasagnaOptimizationOutputScale = 1.0;
 
 LasagnaServiceManager& LasagnaServiceManager::instance()
 {
@@ -38,10 +39,13 @@ bool LasagnaServiceManager::isRunning() const
     return _serviceReady;
 }
 
-void LasagnaServiceManager::startOptimization(const QJsonObject& request, const QString& outputDir)
+void LasagnaServiceManager::startOptimization(const QJsonObject& request,
+                                               const QString& outputDir,
+                                               double outputScaleFactor)
 {
     g_lastLasagnaOptimizationRequest = request;
     g_lastLasagnaOptimizationOutputDir = outputDir;
+    g_lastLasagnaOptimizationOutputScale = outputScaleFactor;
     emit optimizationStarted();
 }
 

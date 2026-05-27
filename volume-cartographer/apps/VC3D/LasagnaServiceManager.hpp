@@ -59,11 +59,13 @@ public:
      * @param localOutputDir  Where to unpack results after completion.
      */
     void startOptimization(const QJsonObject& config,
-                           const QString& localOutputDir = QString());
+                           const QString& localOutputDir = QString(),
+                           double outputScaleFactor = 1.0);
     void submitOptimization(const QJsonObject& config,
-                            const QString& localOutputDir = QString())
+                            const QString& localOutputDir = QString(),
+                            double outputScaleFactor = 1.0)
     {
-        startOptimization(config, localOutputDir);
+        startOptimization(config, localOutputDir, outputScaleFactor);
     }
 
     /** Request cancellation of the running optimization. */
@@ -131,12 +133,13 @@ private:
     void pollStatus();
     void handleStatusReply(QNetworkReply* reply);
     void handleJobsReply(QNetworkReply* reply);
-    void handleOptimizeReply(QNetworkReply* reply);
+    void handleOptimizeReply(QNetworkReply* reply, double outputScaleFactor);
     bool validateApiVersion(QNetworkReply* reply, const QString& context);
 
     /** Download results archive from service and unpack locally. */
     void downloadResults(const QString& jobId = QString(),
-                         const QString& outputDir = QString());
+                         const QString& outputDir = QString(),
+                         double outputScaleFactor = 1.0);
     QString localSourceName() const;
 
     std::unique_ptr<QProcess> _process;
@@ -156,6 +159,7 @@ private:
     QSet<QString> _startedJobIds;
     QSet<QString> _completedJobIds;
     QHash<QString, QString> _jobOutputDirs;
+    QHash<QString, double> _jobOutputScales;
     QJsonArray _lastJobs;
     qint64 _lastQueueGeneration{-1};
     qint64 _fetchedQueueGeneration{-1};

@@ -1,5 +1,8 @@
 #include "LasagnaServiceManager.hpp"
 
+#include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -22,9 +25,12 @@
 #include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
+#include <cmath>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <vector>
 
 #ifdef Q_OS_UNIX
 #include <signal.h>
@@ -95,6 +101,89 @@ QString objectRefKey(const QJsonObject& ref)
     return ref[QStringLiteral("type")].toString() + QStringLiteral("\n")
         + ref[QStringLiteral("name")].toString() + QStringLiteral("\n")
         + ref[QStringLiteral("hash")].toString();
+}
+
+double normalizedScaleFactor(double factor)
+{
+    return (std::isfinite(factor) && factor > 0.0) ? factor : 1.0;
+}
+
+bool isIdentityScale(double factor)
+{
+    return std::abs(normalizedScaleFactor(factor) - 1.0) < 1e-9;
+}
+
+bool isTifxyzDir(const std::filesystem::path& path)
+{
+    return std::filesystem::is_directory(path)
+        && std::filesystem::exists(path / "x.tif")
+        && std::filesystem::exists(path / "y.tif")
+        && std::filesystem::exists(path / "z.tif")
+        && std::filesystem::exists(path / "meta.json");
+}
+
+void loadAllSurfaceChannels(QuadSurface& surface)
+{
+    const std::vector<std::string> names = surface.channelNames();
+    for (const std::string& name : names) {
+        (void)surface.channel(name, SURF_CHANNEL_NORESIZE);
+    }
+}
+
+int countValidSurfacePoints(const QuadSurface& surface)
+{
+    const auto* points = surface.rawPointsPtr();
+    if (!points) {
+        return 0;
+    }
+
+    int valid = 0;
+    for (int row = 0; row < points->rows; ++row) {
+        for (int col = 0; col < points->cols; ++col) {
+            const cv::Vec3f& point = (*points)(row, col);
+            if (point[0] != -1.0f
+                && std::isfinite(point[0])
+                && std::isfinite(point[1])
+                && std::isfinite(point[2])) {
+                ++valid;
+            }
+        }
+    }
+    return valid;
+}
+
+bool scaleTifxyzInPlace(const std::filesystem::path& dir, double scaleFactor, QString* error)
+{
+    try {
+        auto surface = load_quad_from_tifxyz(dir.string());
+        if (!surface) {
+            if (error) {
+                *error = QObject::tr("failed to load %1").arg(QString::fromStdString(dir.string()));
+            }
+            return false;
+        }
+
+        loadAllSurfaceChannels(*surface);
+        vc::core::util::transformSurfacePoints(
+            surface.get(), normalizedScaleFactor(scaleFactor), std::nullopt, 1.0);
+        vc::core::util::refreshTransformedSurfaceState(surface.get());
+        if (countValidSurfacePoints(*surface) == 0) {
+            if (error) {
+                *error = QObject::tr("%1: scaled tifxyz has no valid points")
+                    .arg(QString::fromStdString(dir.string()));
+            }
+            return false;
+        }
+        surface->save(dir.string(), surface->id.empty() ? dir.filename().string() : surface->id, true);
+        return true;
+    } catch (const std::exception& e) {
+        if (error) {
+            *error = QObject::tr("%1: %2")
+                .arg(QString::fromStdString(dir.string()))
+                .arg(e.what());
+        }
+        return false;
+    }
 }
 
 QString uniqueSegmentName(const QString& targetDir, const QString& requestedName)
@@ -180,7 +269,9 @@ struct ResultsPlacementResult
     QStringList placedNames;
 };
 
-ResultsPlacementResult placeResultsArchive(const QByteArray& data, const QString& targetDir)
+ResultsPlacementResult placeResultsArchive(const QByteArray& data,
+                                           const QString& targetDir,
+                                           double outputScaleFactor)
 {
     ResultsPlacementResult result;
     result.targetDir = targetDir;
@@ -236,6 +327,20 @@ ResultsPlacementResult placeResultsArchive(const QByteArray& data, const QString
         if (!QDir().rename(child.absoluteFilePath(), finalPath)) {
             result.error = QObject::tr("Cannot place downloaded result: %1").arg(finalPath);
             return result;
+        }
+        if (!isIdentityScale(outputScaleFactor)
+            && isTifxyzDir(std::filesystem::path(finalPath.toStdString()))) {
+            QString scaleError;
+            if (!scaleTifxyzInPlace(std::filesystem::path(finalPath.toStdString()),
+                                    outputScaleFactor,
+                                    &scaleError)) {
+                result.error = QObject::tr("Failed to scale returned tifxyz: %1").arg(scaleError);
+                return result;
+            }
+            std::cout << "[lasagna] scaled returned tifxyz "
+                      << finalPath.toStdString()
+                      << " by factor " << normalizedScaleFactor(outputScaleFactor)
+                      << std::endl;
         }
         result.placedNames << finalName;
     }
@@ -542,6 +647,7 @@ void LasagnaServiceManager::stopService()
         _startedJobIds.clear();
         _completedJobIds.clear();
         _jobOutputDirs.clear();
+        _jobOutputScales.clear();
         _lastJobs = QJsonArray();
         _lastQueueGeneration = -1;
         _fetchedQueueGeneration = -1;
@@ -694,7 +800,8 @@ void LasagnaServiceManager::handleReadyReadStderr()
 // ---------------------------------------------------------------------------
 
 void LasagnaServiceManager::startOptimization(const QJsonObject& config,
-                                           const QString& localOutputDir)
+                                           const QString& localOutputDir,
+                                           double outputScaleFactor)
 {
     if (!isRunning()) {
         emit optimizationError(tr("Lasagna service is not running"));
@@ -702,6 +809,7 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
     }
 
     _localOutputDir = localOutputDir;
+    outputScaleFactor = normalizedScaleFactor(outputScaleFactor);
     QJsonObject requestConfig = config;
     QString source = requestConfig.contains(QStringLiteral("source"))
         ? requestConfig[QStringLiteral("source")].toString()
@@ -751,7 +859,7 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
         QNetworkReply* queryReply = _nam->post(
             queryReq, QJsonDocument(queryBody).toJson(QJsonDocument::Compact));
         connect(queryReply, &QNetworkReply::finished, this,
-                [this, queryReply, objects, requestConfig, localOutputDir, source, generation]() {
+                [this, queryReply, objects, requestConfig, localOutputDir, outputScaleFactor, source, generation]() {
             if (generation != _requestGeneration) {
                 queryReply->deleteLater();
                 return;
@@ -788,12 +896,12 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
 
             auto index = std::make_shared<int>(0);
             auto uploadNext = std::make_shared<std::function<void()>>();
-            *uploadNext = [this, uploads, index, requestConfig, localOutputDir, source, generation, uploadNext]() {
+            *uploadNext = [this, uploads, index, requestConfig, localOutputDir, outputScaleFactor, source, generation, uploadNext]() {
                 if (generation != _requestGeneration) {
                     return;
                 }
                 if (*index >= uploads->size()) {
-                    startOptimization(requestConfig, localOutputDir);
+                    startOptimization(requestConfig, localOutputDir, outputScaleFactor);
                     return;
                 }
                 const QJsonObject upload = uploads->at(*index).toObject();
@@ -803,7 +911,7 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
                 req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
                 QNetworkReply* reply = _nam->post(req, QJsonDocument(upload).toJson(QJsonDocument::Compact));
                 connect(reply, &QNetworkReply::finished, this,
-                        [this, reply, uploads, index, requestConfig, localOutputDir, generation, uploadNext]() {
+                        [this, reply, uploads, index, requestConfig, localOutputDir, outputScaleFactor, generation, uploadNext]() {
                     if (generation != _requestGeneration) {
                         reply->deleteLater();
                         return;
@@ -865,7 +973,7 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
         }
     });
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, sendTimer, uploadLogged, bodyBytes, generation]() {
+            [this, reply, sendTimer, uploadLogged, bodyBytes, outputScaleFactor, generation]() {
         if (generation != _requestGeneration) {
             reply->deleteLater();
             return;
@@ -885,7 +993,7 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config,
         std::cout << " error=" << reply->error()
                   << " bytes_available=" << reply->bytesAvailable()
                   << std::endl;
-        handleOptimizeReply(reply);
+        handleOptimizeReply(reply, outputScaleFactor);
     });
 }
 
@@ -1056,7 +1164,7 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject& config)
     });
 }
 
-void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply)
+void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply, double outputScaleFactor)
 {
     reply->deleteLater();
 
@@ -1092,6 +1200,7 @@ void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply)
         _submittedJobIds.insert(jobId);
         _startedJobIds.insert(jobId);
         _jobOutputDirs.insert(jobId, _localOutputDir);
+        _jobOutputScales.insert(jobId, outputScaleFactor);
         QJsonObject optimisticJob;
         optimisticJob[QStringLiteral("job_id")] = jobId;
         optimisticJob[QStringLiteral("sequence")] = obj[QStringLiteral("sequence")].toInt();
@@ -1227,8 +1336,9 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
         } else if (state == QStringLiteral("finished") && !_completedJobIds.contains(jobId)) {
             _completedJobIds.insert(jobId);
             const QString localOutputDir = _jobOutputDirs.value(jobId);
+            const double outputScaleFactor = _jobOutputScales.value(jobId, 1.0);
             if (!localOutputDir.isEmpty()) {
-                downloadResults(jobId, localOutputDir);
+                downloadResults(jobId, localOutputDir, outputScaleFactor);
             } else {
                 const QString outputDir = obj[QStringLiteral("output_dir")].toString();
                 emit jobFinished(jobId, outputDir);
@@ -1306,7 +1416,8 @@ void LasagnaServiceManager::handleStatusReply(QNetworkReply* reply)
 // ---------------------------------------------------------------------------
 
 void LasagnaServiceManager::downloadResults(const QString& jobId,
-                                            const QString& outputDir)
+                                            const QString& outputDir,
+                                            double outputScaleFactor)
 {
     emit statusMessage(tr("Downloading results from external service..."));
 
@@ -1318,7 +1429,7 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
 
     const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, jobId, targetDir, generation]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, jobId, targetDir, outputScaleFactor, generation]() {
         if (generation != _requestGeneration) {
             reply->deleteLater();
             return;
@@ -1380,8 +1491,8 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
             }
             emit optimizationFinished(result.targetDir);
         });
-        watcher->setFuture(QtConcurrent::run([data = std::move(data), targetDir]() {
-            return placeResultsArchive(data, targetDir);
+        watcher->setFuture(QtConcurrent::run([data = std::move(data), targetDir, outputScaleFactor]() {
+            return placeResultsArchive(data, targetDir, outputScaleFactor);
         }));
     });
 }

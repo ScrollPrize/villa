@@ -8,6 +8,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/AffineTransform.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 #include <QAbstractItemView>
@@ -18,6 +19,7 @@
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
+#include <QDoubleSpinBox>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -43,10 +45,12 @@
 #include <QStringList>
 #include <QTableView>
 #include <QToolButton>
+#include <QTemporaryDir>
 #include <QVBoxLayout>
 
 #include "utils/Json.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -58,6 +62,118 @@
 
 namespace
 {
+
+double normalizedLasagnaScaleFactor(double factor)
+{
+    return (std::isfinite(factor) && factor > 0.0) ? factor : 1.0;
+}
+
+bool isIdentityLasagnaScale(double factor)
+{
+    return std::abs(normalizedLasagnaScaleFactor(factor) - 1.0) < 1e-9;
+}
+
+double legacyLasagnaScaleLevelToFactor(int level)
+{
+    const int clampedLevel = std::clamp(level, 0, 5);
+    return 1.0 / static_cast<double>(1 << clampedLevel);
+}
+
+void loadAllSurfaceChannels(QuadSurface& surface)
+{
+    const std::vector<std::string> names = surface.channelNames();
+    for (const std::string& name : names) {
+        (void)surface.channel(name, SURF_CHANNEL_NORESIZE);
+    }
+}
+
+int countValidSurfacePoints(const QuadSurface& surface)
+{
+    const auto* points = surface.rawPointsPtr();
+    if (!points) {
+        return 0;
+    }
+
+    int valid = 0;
+    for (int row = 0; row < points->rows; ++row) {
+        for (int col = 0; col < points->cols; ++col) {
+            const cv::Vec3f& point = (*points)(row, col);
+            if (point[0] != -1.0f
+                && std::isfinite(point[0])
+                && std::isfinite(point[1])
+                && std::isfinite(point[2])) {
+                ++valid;
+            }
+        }
+    }
+    return valid;
+}
+
+QJsonObject scaleCorrectionPoints(QJsonObject corrPoints, double scaleFactor)
+{
+    const double scale = normalizedLasagnaScaleFactor(scaleFactor);
+    if (isIdentityLasagnaScale(scale)) {
+        return corrPoints;
+    }
+
+    QJsonObject collections = corrPoints[QStringLiteral("collections")].toObject();
+    for (auto colIt = collections.begin(); colIt != collections.end(); ++colIt) {
+        QJsonObject collection = colIt.value().toObject();
+        QJsonObject points = collection[QStringLiteral("points")].toObject();
+        for (auto pointIt = points.begin(); pointIt != points.end(); ++pointIt) {
+            QJsonObject point = pointIt.value().toObject();
+            QJsonArray coords = point[QStringLiteral("p")].toArray();
+            if (coords.size() >= 3) {
+                for (int i = 0; i < 3; ++i) {
+                    coords[i] = coords[i].toDouble() * scale;
+                }
+                point[QStringLiteral("p")] = coords;
+                points[pointIt.key()] = point;
+            }
+        }
+        collection[QStringLiteral("points")] = points;
+        collections[colIt.key()] = collection;
+    }
+    corrPoints[QStringLiteral("collections")] = collections;
+    return corrPoints;
+}
+
+bool writeScaledTifxyz(const std::filesystem::path& inputDir,
+                       const std::filesystem::path& outputDir,
+                       double scaleFactor,
+                       QString* error)
+{
+    try {
+        auto surface = load_quad_from_tifxyz(inputDir.string());
+        if (!surface) {
+            if (error) {
+                *error = QObject::tr("Failed to load selected tifxyz.");
+            }
+            return false;
+        }
+
+        loadAllSurfaceChannels(*surface);
+        vc::core::util::transformSurfacePoints(
+            surface.get(), normalizedLasagnaScaleFactor(scaleFactor), std::nullopt, 1.0);
+        vc::core::util::refreshTransformedSurfaceState(surface.get());
+        if (countValidSurfacePoints(*surface) == 0) {
+            if (error) {
+                *error = QObject::tr("Scaled tifxyz has no valid points.");
+            }
+            return false;
+        }
+        surface->save(outputDir.string(),
+                      surface->id.empty() ? outputDir.filename().string() : surface->id,
+                      false);
+        return true;
+    } catch (const std::exception& e) {
+        if (error) {
+            *error = QObject::tr("Failed to scale tifxyz: %1").arg(e.what());
+        }
+        return false;
+    }
+}
+
 QString lasagnaModeDebugName(int mode)
 {
     switch (mode) {
@@ -335,6 +451,27 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     _connectionGroup->addRow(tr("Data:"), [&](QHBoxLayout* row) {
         row->addWidget(_dataInputStack, 1);
     }, tr("Input data (.lasagna.json) required by the lasagna."));
+
+    _connectionGroup->addRow(tr("Scale:"), [&](QHBoxLayout* row) {
+        row->addWidget(new QLabel(tr("In:"), connContent));
+        _inputScaleSpin = new QDoubleSpinBox(connContent);
+        _inputScaleSpin->setRange(0.000001, 1024.0);
+        _inputScaleSpin->setDecimals(6);
+        _inputScaleSpin->setSingleStep(0.25);
+        _inputScaleSpin->setValue(1.0);
+        _inputScaleSpin->setToolTip(tr("Input tifxyz scale factor. Coordinates are scaled and the tifxyz grid is resampled back to its native vertex spacing."));
+        row->addWidget(_inputScaleSpin);
+
+        row->addWidget(new QLabel(tr("Out:"), connContent));
+        _outputScaleSpin = new QDoubleSpinBox(connContent);
+        _outputScaleSpin->setRange(0.000001, 1024.0);
+        _outputScaleSpin->setDecimals(6);
+        _outputScaleSpin->setSingleStep(0.25);
+        _outputScaleSpin->setValue(1.0);
+        _outputScaleSpin->setToolTip(tr("Returned tifxyz scale factor. Coordinates are scaled and the tifxyz grid is resampled back to its native vertex spacing."));
+        row->addWidget(_outputScaleSpin);
+        row->addStretch(1);
+    }, tr("Scale factors for tifxyz sent to and returned from the lasagna service."));
 
     panelLayout->addWidget(_connectionGroup);
 
@@ -641,6 +778,17 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _lasagnaDataInputPath = path;
             _dataInputEdit->setText(path);
         }
+    });
+
+    connect(_inputScaleSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double value) {
+        writeSetting(QStringLiteral("lasagna_input_scale_factor"),
+                     normalizedLasagnaScaleFactor(value));
+    });
+    connect(_outputScaleSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double value) {
+        writeSetting(QStringLiteral("lasagna_output_scale_factor"),
+                     normalizedLasagnaScaleFactor(value));
     });
 
     // -- New model settings persistence --
@@ -1606,23 +1754,42 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     const double offsetVal = offsetValue();
     const int size = windowSize();
     const int overlap = windowOverlap();
+    const double inputScale = inputScaleFactor();
+    const double outputScale = outputScaleFactor();
+    const double serviceCoordScale = normalizedLasagnaScaleFactor(inputScale);
+    auto scaleCoordInt = [serviceCoordScale](int value) -> int {
+        return static_cast<int>(std::llround(static_cast<double>(value) * serviceCoordScale));
+    };
+    const int serviceCx = scaleCoordInt(cx);
+    const int serviceCy = scaleCoordInt(cy);
+    const int serviceCz = scaleCoordInt(cz);
+    const int serviceNmW = scaleCoordInt(nmW);
+    const int serviceNmH = scaleCoordInt(nmH);
+    const int serviceWindowSize = scaleCoordInt(size);
+    const int serviceWindowOverlap = scaleCoordInt(overlap);
 
     QJsonObject args = config[QStringLiteral("args")].toObject();
     // VC3D is transport only. Do not add config-semantic branching here.
     // Config interpretation belongs in fit_service.py / fit.py.
-    args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
-    args[QStringLiteral("model-w")] = nmW;
-    args[QStringLiteral("model-h")] = nmH;
+    args[QStringLiteral("seed")] = QJsonArray{serviceCx, serviceCy, serviceCz};
+    args[QStringLiteral("model-w")] = serviceNmW;
+    args[QStringLiteral("model-h")] = serviceNmH;
     args[QStringLiteral("windings")] = nmN;
     config[QStringLiteral("args")] = args;
 
     std::cerr << "[lasagna] request settings:"
               << " seed=(" << cx << "," << cy << "," << cz << ")"
+              << " service_seed=(" << serviceCx << "," << serviceCy << "," << serviceCz << ")"
               << " w=" << nmW << " h=" << nmH
+              << " service_w=" << serviceNmW << " service_h=" << serviceNmH
               << " windings=" << nmN
               << " offset=" << offsetVal
               << " window_size=" << size
-              << " window_overlap=" << overlap << std::endl;
+              << " window_overlap=" << overlap
+              << " service_window_size=" << serviceWindowSize
+              << " service_window_overlap=" << serviceWindowOverlap
+              << " input_scale=" << inputScale
+              << " output_scale=" << outputScale << std::endl;
 
     if (isOffsetMode && !segPath.empty()) {
 
@@ -1672,9 +1839,10 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             QJsonDocument corrDoc = QJsonDocument::fromJson(
                 QByteArray::fromStdString(corrJson.dump()));
             if (corrDoc.isObject()) {
-                config[QStringLiteral("corr_points")] = corrDoc.object();
+                config[QStringLiteral("corr_points")] = scaleCorrectionPoints(corrDoc.object(), inputScale);
                 std::cerr << "[lasagna] injected " << cols.size()
-                          << " point collection(s) as corr_points" << std::endl;
+                          << " point collection(s) as corr_points"
+                          << " scale=" << serviceCoordScale << std::endl;
             }
         }
     }
@@ -1697,10 +1865,12 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
     }
-    if (size > 0) {
-        request[QStringLiteral("window_size")] = size;
-        request[QStringLiteral("window_overlap")] = overlap;
+    if (serviceWindowSize > 0) {
+        request[QStringLiteral("window_size")] = serviceWindowSize;
+        request[QStringLiteral("window_overlap")] = serviceWindowOverlap;
     }
+    request[QStringLiteral("input_scale")] = inputScale;
+    request[QStringLiteral("output_scale")] = outputScale;
 
     QJsonObject jobSpec;
     QJsonArray objectUploads;
@@ -1736,7 +1906,30 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     };
 
     if (sendTifxyz) {
-        QJsonObject currentSegmentUpload = segmentArtifactForPath(segPath, &rawTifxyzBytes, &tifxyzFileCount);
+        std::filesystem::path tifxyzPathForUpload = segPath;
+        QTemporaryDir scaledInputDir;
+        if (!isIdentityLasagnaScale(inputScale)) {
+            if (!scaledInputDir.isValid()) {
+                auto msg = tr("Failed to create temporary scaled tifxyz directory.");
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                showStatus(msg, 5000);
+                return;
+            }
+            const std::filesystem::path scaledPath =
+                std::filesystem::path(scaledInputDir.path().toStdString()) / segPath.filename();
+            QString scaleError;
+            if (!writeScaledTifxyz(segPath, scaledPath, inputScale, &scaleError)) {
+                std::cerr << "[lasagna] " << scaleError.toStdString() << std::endl;
+                showStatus(scaleError, 7000);
+                return;
+            }
+            tifxyzPathForUpload = scaledPath;
+            std::cerr << "[lasagna] staged input tifxyz at scale factor "
+                      << inputScale << std::endl;
+        }
+
+        QJsonObject currentSegmentUpload = segmentArtifactForPath(
+            tifxyzPathForUpload, &rawTifxyzBytes, &tifxyzFileCount);
         if (currentSegmentUpload.isEmpty()) {
             auto msg = tr("Cannot pack selected tifxyz segment for Lasagna artifact sync.");
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
@@ -1750,6 +1943,8 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             linkedSurfaces.append(currentSegmentUpload[QStringLiteral("object")].toObject());
             appendUploadIfNew(currentSegmentUpload);
         } else if (!outputSegmentsPath.empty()) {
+            QJsonArray scaledLinkedSurfaces;
+            QTemporaryDir scaledLinkedDir;
             for (const QJsonValue& value : linkedSurfaces) {
                 const QJsonObject ref = value.toObject();
                 const QString name = ref[QStringLiteral("name")].toString();
@@ -1757,19 +1952,69 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
                     continue;
                 }
                 std::filesystem::path localPath = outputSegmentsPath / name.toStdString();
+                bool resolvedLocal = false;
                 if (std::filesystem::exists(localPath) && std::filesystem::is_directory(localPath)) {
-                    qint64 extraBytes = 0;
-                    int extraFiles = 0;
-                    QJsonObject upload = segmentArtifactForPath(localPath, &extraBytes, &extraFiles);
+                    qint64 originalBytes = 0;
+                    int originalFiles = 0;
+                    QJsonObject upload = segmentArtifactForPath(localPath, &originalBytes, &originalFiles);
                     if (!upload.isEmpty() &&
                         upload[QStringLiteral("object")].toObject()[QStringLiteral("hash")].toString()
                             == ref[QStringLiteral("hash")].toString()) {
+                        resolvedLocal = true;
+                        qint64 extraBytes = originalBytes;
+                        int extraFiles = originalFiles;
+                        if (!isIdentityLasagnaScale(inputScale)) {
+                            if (!scaledLinkedDir.isValid()) {
+                                auto msg = tr("Failed to create temporary scaled linked-surface directory.");
+                                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                                showStatus(msg, 5000);
+                                return;
+                            }
+                            const std::filesystem::path scaledPath =
+                                std::filesystem::path(scaledLinkedDir.path().toStdString()) / localPath.filename();
+                            QString scaleError;
+                            if (!writeScaledTifxyz(localPath, scaledPath, inputScale, &scaleError)) {
+                                std::cerr << "[lasagna] " << scaleError.toStdString() << std::endl;
+                                showStatus(scaleError, 7000);
+                                return;
+                            }
+                            extraBytes = 0;
+                            extraFiles = 0;
+                            upload = segmentArtifactForPath(scaledPath, &extraBytes, &extraFiles);
+                            if (upload.isEmpty()) {
+                                auto msg = tr("Cannot pack scaled linked tifxyz segment for Lasagna artifact sync.");
+                                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                                showStatus(msg, 5000);
+                                return;
+                            }
+                            std::cerr << "[lasagna] staged linked tifxyz "
+                                      << name.toStdString()
+                                      << " at scale factor " << inputScale << std::endl;
+                        }
                         rawTifxyzBytes += extraBytes;
                         tifxyzFileCount += extraFiles;
                         appendUploadIfNew(upload);
+                        scaledLinkedSurfaces.append(upload[QStringLiteral("object")].toObject());
                     }
                 }
+                if (!resolvedLocal) {
+                    if (!isIdentityLasagnaScale(inputScale)) {
+                        auto msg = tr("Cannot apply input scale to linked Lasagna surface: %1").arg(name);
+                        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                        showStatus(msg, 7000);
+                        return;
+                    }
+                    scaledLinkedSurfaces.append(ref);
+                }
             }
+            if (!scaledLinkedSurfaces.isEmpty()) {
+                linkedSurfaces = scaledLinkedSurfaces;
+            }
+        } else if (!linkedSurfaces.isEmpty() && !isIdentityLasagnaScale(inputScale)) {
+            auto msg = tr("Cannot apply input scale to linked Lasagna surfaces without a local segment directory.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 7000);
+            return;
         }
     }
 
@@ -1818,7 +2063,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
               << " model_raw=" << bytesToMiB(rawModelBytes) << " MiB"
               << std::endl;
 
-    mgr.startOptimization(request, outputDir);
+    mgr.startOptimization(request, outputDir, outputScale);
     if (!outputName.isEmpty()) {
         _submittedOutputNames.insert(outputName);
     }
@@ -1899,6 +2144,27 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     if (_portEdit) {
         const QSignalBlocker b(_portEdit);
         _portEdit->setText(QString::number(_externalPort));
+    }
+    auto restoredScaleFactor = [&settings](const QString& factorKey, const QString& levelKey) {
+        if (settings.contains(factorKey)) {
+            return normalizedLasagnaScaleFactor(settings.value(factorKey, 1.0).toDouble());
+        }
+        if (settings.contains(levelKey)) {
+            return legacyLasagnaScaleLevelToFactor(settings.value(levelKey, 0).toInt());
+        }
+        return 1.0;
+    };
+    if (_inputScaleSpin) {
+        const QSignalBlocker b(_inputScaleSpin);
+        _inputScaleSpin->setValue(
+            restoredScaleFactor(QStringLiteral("lasagna_input_scale_factor"),
+                                QStringLiteral("lasagna_input_scale_level")));
+    }
+    if (_outputScaleSpin) {
+        const QSignalBlocker b(_outputScaleSpin);
+        _outputScaleSpin->setValue(
+            restoredScaleFactor(QStringLiteral("lasagna_output_scale_factor"),
+                                QStringLiteral("lasagna_output_scale_level")));
     }
     updateConnectionWidgets();
 
@@ -2120,6 +2386,16 @@ int SegmentationLasagnaPanel::windowSize() const
 int SegmentationLasagnaPanel::windowOverlap() const
 {
     return _windowOverlapSpin ? _windowOverlapSpin->value() : 500;
+}
+
+double SegmentationLasagnaPanel::inputScaleFactor() const
+{
+    return _inputScaleSpin ? normalizedLasagnaScaleFactor(_inputScaleSpin->value()) : 1.0;
+}
+
+double SegmentationLasagnaPanel::outputScaleFactor() const
+{
+    return _outputScaleSpin ? normalizedLasagnaScaleFactor(_outputScaleSpin->value()) : 1.0;
 }
 
 void SegmentationLasagnaPanel::setSeedFromFocus(int x, int y, int z)

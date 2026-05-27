@@ -58,6 +58,8 @@ public:
     [[nodiscard]] double offsetValue() const;
     [[nodiscard]] int windowSize() const;
     [[nodiscard]] int windowOverlap() const;
+    [[nodiscard]] double inputScaleFactor() const;
+    [[nodiscard]] double outputScaleFactor() const;
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
@@ -136,6 +138,8 @@ private:
     QStackedWidget* _dataInputStack{nullptr};
     QLineEdit* _dataInputEdit{nullptr};
     QToolButton* _dataInputBrowse{nullptr};
+    QDoubleSpinBox* _inputScaleSpin{nullptr};
+    QDoubleSpinBox* _outputScaleSpin{nullptr};
 
     // New model settings
     QSpinBox* _widthSpin{nullptr};

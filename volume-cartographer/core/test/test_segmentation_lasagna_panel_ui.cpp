@@ -13,6 +13,7 @@
 #include <QTemporaryDir>
 #include <QFile>
 #include <QDir>
+#include <QDoubleSpinBox>
 
 #define private public
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
@@ -28,6 +29,7 @@
 #include <iostream>
 
 extern QJsonObject g_lastLasagnaOptimizationRequest;
+extern double g_lastLasagnaOptimizationOutputScale;
 
 namespace {
 
@@ -94,6 +96,8 @@ int main(int argc, char** argv)
     settings.setValue(QStringLiteral("lasagna_offset_value"), -1.25);
     settings.setValue(QStringLiteral("lasagna_window_size"), 3210);
     settings.setValue(QStringLiteral("lasagna_window_overlap"), 210);
+    settings.setValue(QStringLiteral("lasagna_input_scale_factor"), 2.5);
+    settings.setValue(QStringLiteral("lasagna_output_scale_factor"), 0.25);
     const QString altConfigPath = tempDir.filePath(QStringLiteral("alt_config.json"));
     writeFile(altConfigPath, QByteArrayLiteral(R"({"args":{"alternate":1}})"));
 
@@ -112,6 +116,16 @@ int main(int argc, char** argv)
     require(panel.offsetValue() == -1.25, "Offset value was not restored");
     require(panel.windowSize() == 3210 && panel.windowOverlap() == 210,
             "Offset window settings were not restored");
+    require(panel.inputScaleFactor() == 2.5 && panel.outputScaleFactor() == 0.25,
+            "Lasagna input/output scale factors were not restored");
+
+    QSettings legacySettings(tempDir.filePath(QStringLiteral("legacy-settings.ini")), QSettings::IniFormat);
+    legacySettings.setValue(QStringLiteral("lasagna_input_scale_level"), 2);
+    legacySettings.setValue(QStringLiteral("lasagna_output_scale_level"), 3);
+    SegmentationLasagnaPanel legacyPanel(QStringLiteral("legacy-lasagna"));
+    legacyPanel.restoreSettings(legacySettings);
+    require(legacyPanel.inputScaleFactor() == 0.25 && legacyPanel.outputScaleFactor() == 0.125,
+            "Legacy Lasagna scale levels should migrate to scale factors");
 
     settings.setValue(QStringLiteral("lasagna_new_model_config_file_path"), configPath);
     settings.setValue(QStringLiteral("lasagna_reopt_config_file_path"), configPath);
@@ -257,6 +271,8 @@ int main(int argc, char** argv)
             "startOptimizationAtSeed should reject a missing config path");
 
     panel.syncUiState(true, false);
+    panel._inputScaleSpin->setValue(2.0);
+    panel._outputScaleSpin->setValue(3.0);
     panel.startOptimizationAtSeed(
         nullptr,
         &statusBar,
@@ -269,6 +285,52 @@ int main(int argc, char** argv)
             "New-model launch should reserve the generated output name");
     require(statusBar.currentMessage().contains(QStringLiteral("sheet_v001.tifxyz")),
             "New-model launch status should include the generated output name");
+    require(g_lastLasagnaOptimizationRequest[QStringLiteral("input_scale")].toDouble() == 2.0,
+            "Lasagna request should include the selected input scale factor");
+    require(g_lastLasagnaOptimizationRequest[QStringLiteral("output_scale")].toDouble() == 3.0,
+            "Lasagna request should include the selected output scale factor");
+    QJsonObject scaledConfig = g_lastLasagnaOptimizationRequest[QStringLiteral("config")].toObject();
+    QJsonObject scaledArgs = scaledConfig[QStringLiteral("args")].toObject();
+    QJsonArray scaledSeed = scaledArgs[QStringLiteral("seed")].toArray();
+    require(scaledSeed.size() == 3
+                && scaledSeed[0].toInt() == 2
+                && scaledSeed[1].toInt() == 4
+                && scaledSeed[2].toInt() == 6,
+            "Lasagna seed coordinates should be scaled with the input tifxyz");
+    require(scaledArgs[QStringLiteral("model-w")].toInt() == 4096,
+            "Lasagna model width should be scaled with the input tifxyz");
+    require(scaledArgs[QStringLiteral("model-h")].toInt() == 4096,
+            "Lasagna model height should be scaled with the input tifxyz");
+    CState corrScaleState(0);
+    ColPoint corrPoint = corrScaleState.pointCollection()->addPoint(
+        "corr", cv::Vec3f{1.0f, 2.0f, 3.0f});
+    corrPoint.winding_annotation = 7.0f;
+    corrScaleState.pointCollection()->updatePoint(corrPoint);
+    panel.startOptimizationAtSeed(
+        &corrScaleState,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::NewModel,
+        configPath,
+        1,
+        2,
+        3);
+    QJsonObject corrConfig = g_lastLasagnaOptimizationRequest[QStringLiteral("config")].toObject();
+    QJsonObject corrPoints = corrConfig[QStringLiteral("corr_points")].toObject();
+    QJsonObject corrCollections = corrPoints[QStringLiteral("collections")].toObject();
+    QJsonObject corrCollection = corrCollections[QStringLiteral("1")].toObject();
+    QJsonObject corrPointJson = corrCollection[QStringLiteral("points")].toObject()[QStringLiteral("1")].toObject();
+    QJsonArray corrCoords = corrPointJson[QStringLiteral("p")].toArray();
+    require(corrCoords.size() == 3
+                && corrCoords[0].toDouble() == 2.0
+                && corrCoords[1].toDouble() == 4.0
+                && corrCoords[2].toDouble() == 6.0,
+            "Lasagna correction point coordinates should be scaled with the input tifxyz");
+    require(corrPointJson[QStringLiteral("wind_a")].toDouble() == 7.0,
+            "Lasagna correction point winding annotations should not be coordinate-scaled");
+    require(g_lastLasagnaOptimizationOutputScale == 3.0,
+            "Lasagna service manager should receive the selected output scale factor");
+    panel._inputScaleSpin->setValue(1.0);
+    panel._outputScaleSpin->setValue(1.0);
 
     emit LasagnaServiceManager::instance().statusMessage(QStringLiteral("preparing"));
     require(panel._progressLabel->text() == QStringLiteral("preparing"),
