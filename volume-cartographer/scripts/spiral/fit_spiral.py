@@ -82,6 +82,7 @@ default_config = {
     'linear_z_resolution': 12,
     'initial_dr_per_winding': 4.,
     'radius_loss_margin': 0.025,
+    'patch_radius_loss_inv': False,
     'patch_loss_z_margin': 0,
     'patch_dt_norm_p': 0.5,
     'patch_dt_within_patch_norm_p': 3.0,
@@ -1180,12 +1181,35 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
     hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
 
-    # Each patch row/col should lie at constant shifted-radius
+    # Each patch row/col should lie at constant shifted-radius.
     radius_shifted_radii = all_shifted_radii[:, :num_patches_for_radius]
-    mean_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
-    radius_deviations = (radius_shifted_radii - mean_radii).abs()
-    radius_deviations_hinge = F.relu(radius_deviations - hinge_margin)
-    mean_radius_deviation = radius_deviations_hinge.mean()
+    if cfg['patch_radius_loss_inv']:
+        # Express the loss in scroll space like the DT loss below: construct target
+        # spiral-space points at the track's mean shifted-radius (continuous, not snapped
+        # to an integer winding) but with each point's own z and theta, transform back to
+        # scroll space, and penalise the distance from the original sampled points.
+        radius_slice_zyxs = all_slice_zyxs[:, :num_patches_for_radius]
+        radius_spiral_zyxs = all_spiral_zyxs[:, :num_patches_for_radius]
+        radius_theta = all_theta[:, :num_patches_for_radius]
+
+        mean_shifted_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
+        radius_target_radii = mean_shifted_radii + radius_theta / (2 * np.pi) * dr_per_winding
+        radius_target_spiral_zyxs = torch.stack([
+            radius_spiral_zyxs[..., 0],
+            torch.sin(radius_theta) * radius_target_radii,
+            torch.cos(radius_theta) * radius_target_radii,
+        ], dim=-1).detach()
+
+        radius_target_scroll_zyxs = slice_to_spiral_transform.inv(radius_target_spiral_zyxs.reshape(-1, 3)).reshape(*radius_target_spiral_zyxs.shape)
+
+        radius_point_distances = torch.linalg.norm(radius_slice_zyxs - radius_target_scroll_zyxs, dim=-1)
+        mean_radius_deviation = F.relu(radius_point_distances - hinge_margin).mean()
+    else:
+        # Penalise deviation from the track's mean shifted-radius directly in spiral space.
+        mean_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
+        radius_deviations = (radius_shifted_radii - mean_radii).abs()
+        radius_deviations_hinge = F.relu(radius_deviations - hinge_margin)
+        mean_radius_deviation = radius_deviations_hinge.mean()
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
     umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()
