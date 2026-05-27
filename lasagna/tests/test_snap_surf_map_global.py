@@ -134,28 +134,31 @@ def _xy_normals_like(shape: tuple[int, ...]) -> torch.Tensor:
 	return n
 
 
-def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8) -> str:
+def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8, write_objs: bool = False) -> str:
 	path = Path(root, "cfg.json")
+	base = {
+		"map_station_t": 0.001,
+		"map_init": {
+			"subdiv": 2,
+			"scale_levels": 4,
+			"w_dist": 1.0,
+			"w_vec_normal": 0.0,
+			"w_surface_normal": 0.0,
+			"w_smooth": 0.0,
+			"w_bend": 0.0,
+			"w_jac": 0.0,
+			"w_metric_smooth": 0.0,
+			"w_area_smooth": 0.0,
+			"max_sample_angle_deg": 180.0,
+			"max_step_neighbor_ratio": 0.0,
+		},
+	}
+	if bool(write_objs):
+		base["write_objs"] = True
 	_write_json(
 		path,
 		{
-			"base": {
-				"map_station_t": 0.001,
-				"map_init": {
-					"subdiv": 2,
-					"scale_levels": 4,
-					"w_dist": 1.0,
-					"w_vec_normal": 0.0,
-					"w_surface_normal": 0.0,
-					"w_smooth": 0.0,
-					"w_bend": 0.0,
-					"w_jac": 0.0,
-					"w_metric_smooth": 0.0,
-					"w_area_smooth": 0.0,
-					"max_sample_angle_deg": 180.0,
-					"max_step_neighbor_ratio": 0.0,
-				},
-			},
+			"base": base,
 			"stages": [
 				{"steps": affine_steps, "lr": 0.05, "params": ["map_surf_affine"], "args": {"subdiv": 2}},
 				{
@@ -1249,7 +1252,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual(float(terms["samples"]), 0.0)
 			self.assertTrue(torch.equal(uv, torch.full((5, 5, 2), -10.0)))
 
-	def test_fixture_cli_writes_global_outputs_without_growth_masks(self) -> None:
+	def test_fixture_cli_writes_final_outputs_without_debug_objs_by_default(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			fixture_dir = os.path.join(tmp, "fixture")
 			out_dir = os.path.join(tmp, "out")
@@ -1263,6 +1266,23 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "model_y.tif")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "meta.json")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "metrics.json")))
+			self.assertFalse(os.path.exists(os.path.join(out_dir, "objs")))
+			self.assertFalse(os.path.exists(os.path.join(out_dir, "active_quad.tif")))
+			self.assertFalse(os.path.exists(os.path.join(out_dir, "blocked_quad.tif")))
+			metrics = json.loads(Path(out_dir, "metrics.json").read_text(encoding="utf-8"))
+			self.assertEqual(metrics["common_vertices"], 25)
+			self.assertIn("avg_model_quad_distance", metrics)
+
+	def test_fixture_cli_writes_debug_objs_when_enabled(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, write_objs=True)
+
+			rc = map_global_cli.main(["optimize-fixture", fixture_dir, cfg_path, "--out", out_dir, "--device", "cpu"])
+
+			self.assertEqual(rc, 0)
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_map_surf_affine", "map_ext_to_model.obj")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_001_map_surf_ms", "map_ext_to_model.obj")))
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "final", "map_ext_to_model.obj")))
@@ -1270,11 +1290,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			final_meta = json.loads(Path(out_dir, "objs", "final", "meta.json").read_text(encoding="utf-8"))
 			self.assertEqual(final_meta["name"], "final")
 			self.assertIn("worst_1pct_vectors", final_meta)
-			self.assertFalse(os.path.exists(os.path.join(out_dir, "active_quad.tif")))
-			self.assertFalse(os.path.exists(os.path.join(out_dir, "blocked_quad.tif")))
 			metrics = json.loads(Path(out_dir, "metrics.json").read_text(encoding="utf-8"))
-			self.assertEqual(metrics["common_vertices"], 25)
-			self.assertIn("avg_model_quad_distance", metrics)
 			self.assertIn("avg_model_quad_distance", metrics["history"][-1])
 			self.assertLess(metrics["model_l2_max_delta"], 1.0)
 
@@ -1349,6 +1365,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				cfg_path,
 				{
 					"base": {
+						"write_objs": True,
 						"map_station_t": 0.001,
 						"map_init": {
 							"subdiv": 2,
@@ -1404,6 +1421,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				cfg_path,
 				{
 					"base": {
+						"write_objs": True,
 						"map_station_t": 0.001,
 						"map_init": {
 							"subdiv": 2,

@@ -42,8 +42,15 @@ from .tensor import _quad_valid_at_coords, _sample_surface_grid
 
 
 _PRINTED_PROGRESS_LEGENDS: set[str] = set()
-_CacheStats = dict[str, int]
+_CacheStats = dict[str, float]
 _NO_Z_LIFT = object()
+
+
+def _sync_timing_device(*values: Any) -> None:
+	for value in values:
+		if torch.is_tensor(value) and value.is_cuda:
+			torch.cuda.synchronize(value.device)
+			return
 
 
 @dataclass(frozen=True)
@@ -99,6 +106,18 @@ def _truthy_arg(value: Any) -> bool:
 	if isinstance(value, (int, float)):
 		return value != 0
 	return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _obj_outputs_enabled(cfg: GlobalMapConfig, stage: GlobalMapStageConfig | None = None) -> bool:
+	keys = ("write_objs", "debug_objs", "write_debug_objs", "write_stage_objs")
+	if stage is not None:
+		for key in keys:
+			if key in stage.args:
+				return _truthy_arg(stage.args.get(key))
+	for key in keys:
+		if key in cfg.base:
+			return _truthy_arg(cfg.base.get(key))
+	return False
 
 
 @dataclass(frozen=True)
@@ -601,6 +620,7 @@ def _map_init_z_lift_for_fixture(
 	model_cache: dict[tuple[Any, ...], dict[str, Any] | None] | None = None,
 	cache_stats: _CacheStats | None = None,
 ) -> dict[str, Any] | None:
+	t_total = time.perf_counter()
 	mi = cfg.map_init
 	if not bool(mi.z_lift_enabled) or float(mi.w_z_lift) <= 0.0:
 		return None
@@ -624,6 +644,7 @@ def _map_init_z_lift_for_fixture(
 			norm_xy_min,
 		)
 	ext_part: dict[str, Any] | None
+	t_ext = time.perf_counter()
 	if external_cache is not None and ext_key is not None and ext_key in external_cache:
 		_bump("zext_hit")
 		ext_part = external_cache[ext_key]
@@ -645,6 +666,7 @@ def _map_init_z_lift_for_fixture(
 		}
 		if external_cache is not None and ext_key is not None:
 			external_cache[ext_key] = ext_part
+	ext_ms = 1000.0 * (time.perf_counter() - t_ext)
 
 	model_key = None
 	if mesh_epoch is not None:
@@ -661,6 +683,7 @@ def _map_init_z_lift_for_fixture(
 			str(fixture.model_normals.dtype),
 		)
 	model_part: dict[str, Any] | None
+	t_model = time.perf_counter()
 	if model_cache is not None and model_key is not None and model_key in model_cache:
 		_bump("zmdl_hit")
 		model_part = model_cache[model_key]
@@ -682,9 +705,11 @@ def _map_init_z_lift_for_fixture(
 		}
 		if model_cache is not None and model_key is not None:
 			model_cache[model_key] = model_part
+	model_ms = 1000.0 * (time.perf_counter() - t_model)
 
 	if ext_part is None or model_part is None:
 		return None
+	total_ms = 1000.0 * (time.perf_counter() - t_total)
 	out = {
 		"ext_theta_lifted": ext_part["theta_lifted"],
 		"ext_valid": ext_part["valid"],
@@ -697,8 +722,15 @@ def _map_init_z_lift_for_fixture(
 			"model_valid": float(model_part["stats"]["valid"]),
 			"model_invalid": float(model_part["stats"]["invalid"]),
 			"model_unreachable": float(model_part["stats"]["unreachable"]),
+			"ext_ms": float(ext_ms),
+			"model_ms": float(model_ms),
+			"total_ms": float(total_ms),
 		},
 	}
+	if cache_stats is not None:
+		cache_stats["zext_ms"] = float(cache_stats.get("zext_ms", 0.0)) + float(ext_ms)
+		cache_stats["zmdl_ms"] = float(cache_stats.get("zmdl_ms", 0.0)) + float(model_ms)
+		cache_stats["z_lift_ms"] = float(cache_stats.get("z_lift_ms", 0.0)) + float(total_ms)
 	return out
 
 
@@ -1653,17 +1685,30 @@ def _affine_seed_quad_expansion_rows(
 	fixture: MapFixture,
 	stage_cfg: SnapSurfConfig,
 	sign: int | None = None,
+	timing_prefix: str | None = None,
 ) -> list[dict[str, float]]:
+	t_total = time.perf_counter()
 	active_full = _full_active_quad(fixture)
 	uv = _affine_uv_field(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
 	sign_i = int(fixture.metadata.get("sign", 1) or 1) if sign is None else int(sign)
 	old_sign = fixture.metadata.get("sign")
 	fixture.metadata["sign"] = sign_i
 	rows: list[dict[str, float]] = []
+	radii = _seed_quad_expansion_radii(active_full, seed_ext_quad)
+	if timing_prefix is not None:
+		print(
+			f"{timing_prefix} start radii={len(radii)} full_quads={int(active_full.sum().detach().cpu())}",
+			flush=True,
+		)
 	try:
-		for radius in _seed_quad_expansion_radii(active_full, seed_ext_quad):
+		for radius in radii:
+			_sync_timing_device(active_full)
+			t_radius = time.perf_counter()
 			active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius)
 			crop = _seed_quad_expansion_crop_slices(active_full, seed_ext_quad, radius, stage_cfg.map_init)
+			_sync_timing_device(active)
+			mask_ms = 1000.0 * (time.perf_counter() - t_radius)
+			t_obj = time.perf_counter()
 			loss, terms = _objective_for_active_uv(
 				uv=uv,
 				active_quad=active,
@@ -1671,17 +1716,34 @@ def _affine_seed_quad_expansion_rows(
 				cfg=stage_cfg,
 				active_quad_crop=crop,
 			)
+			_sync_timing_device(loss)
+			obj_ms = 1000.0 * (time.perf_counter() - t_obj)
 			rows.append(_affine_seed_quad_expansion_row_from_terms(
 				radius=radius,
 				active=active,
 				loss=loss,
 				terms=terms,
 			))
+			if timing_prefix is not None:
+				total_ms = 1000.0 * (time.perf_counter() - t_radius)
+				vert_h, vert_w, quad_h, quad_w = crop
+				print(
+					f"{timing_prefix} rad={int(radius)} quads={int(active.sum().detach().cpu())} "
+					f"quad_crop=({quad_h.start}:{quad_h.stop},{quad_w.start}:{quad_w.stop}) "
+					f"vert_crop=({vert_h.start}:{vert_h.stop},{vert_w.start}:{vert_w.stop}) "
+					f"mask={mask_ms:.3f}ms objective={obj_ms:.3f}ms total={total_ms:.3f}ms",
+					flush=True,
+				)
 	finally:
 		if old_sign is None:
 			fixture.metadata.pop("sign", None)
 		else:
 			fixture.metadata["sign"] = old_sign
+	if timing_prefix is not None:
+		print(
+			f"{timing_prefix} done total={1000.0 * (time.perf_counter() - t_total):.3f}ms",
+			flush=True,
+		)
 	return rows
 
 
@@ -1716,6 +1778,7 @@ def _print_affine_seed_quad_expansion_diagnostic(
 		fixture=fixture,
 		stage_cfg=stage_cfg,
 		sign=sign,
+		timing_prefix="[snap_surf.map_global] affine seed quad expansion loss timing",
 	)
 	widths = progress_widths(
 		_SEED_EXPANSION_COLUMNS,
@@ -1818,8 +1881,15 @@ def _run_affine_seed_quad_expansion_reopt(
 	def write_debug_map(radius: int, phase: str, step_count: int, active: torch.Tensor, row: dict[str, float]) -> None:
 		if debug_obj_root is None:
 			return
+		out = debug_obj_root / f"rad_{int(radius):06d}_{_debug_obj_safe_label(phase)}"
+		t_write = time.perf_counter()
+		print(
+			f"[snap_surf.map_global] affine seed quad expansion debug obj start "
+			f"radius={int(radius)} phase={phase} dir={out}",
+			flush=True,
+		)
 		_write_map_objs(
-			debug_obj_root / f"rad_{int(radius):06d}_{_debug_obj_safe_label(phase)}",
+			out,
 			uv=affine().detach(),
 			fixture=fixture,
 			meta={
@@ -1840,6 +1910,11 @@ def _run_affine_seed_quad_expansion_reopt(
 				"quad_success": int(row["quad_success"]),
 			},
 			active_quad=active,
+		)
+		print(
+			f"[snap_surf.map_global] affine seed quad expansion debug obj "
+			f"radius={int(radius)} phase={phase} write={1000.0 * (time.perf_counter() - t_write):.3f}ms",
+			flush=True,
 		)
 	def eval_row(
 		radius: int,
@@ -1994,10 +2069,23 @@ def _write_affine_seed_initial_debug_radius(
 	if debug_obj_root is None:
 		return
 	radius_i = max(0, int(radius))
+	t_total = time.perf_counter()
+	print(
+		f"[snap_surf.map_global] affine seed quad initial debug objs start radius={radius_i} dir={debug_obj_root}",
+		flush=True,
+	)
+	_sync_timing_device(affine_tensor)
+	t_uv = time.perf_counter()
 	uv = _affine_uv_field(affine_tensor, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
+	_sync_timing_device(uv)
+	uv_ms = 1000.0 * (time.perf_counter() - t_uv)
+	t_mask = time.perf_counter()
 	active_full = _full_active_quad(fixture)
 	active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius_i)
 	crop = _seed_quad_expansion_crop_slices(active_full, seed_ext_quad, radius_i, stage_cfg.map_init)
+	_sync_timing_device(active)
+	mask_ms = 1000.0 * (time.perf_counter() - t_mask)
+	t_obj = time.perf_counter()
 	loss, terms = _objective_for_active_uv(
 		uv=uv,
 		active_quad=active,
@@ -2005,6 +2093,8 @@ def _write_affine_seed_initial_debug_radius(
 		cfg=stage_cfg,
 		active_quad_crop=crop,
 	)
+	_sync_timing_device(loss)
+	obj_ms = 1000.0 * (time.perf_counter() - t_obj)
 	row = _affine_seed_quad_expansion_row_from_terms(
 		radius=radius_i,
 		active=active,
@@ -2012,6 +2102,7 @@ def _write_affine_seed_initial_debug_radius(
 		terms=terms,
 	)
 	out = debug_obj_root / f"rad_{radius_i:06d}_initial_filtered"
+	t_write = time.perf_counter()
 	_write_map_objs(
 		out,
 		uv=uv,
@@ -2034,8 +2125,12 @@ def _write_affine_seed_initial_debug_radius(
 		},
 		active_quad=active,
 	)
+	write_ms = 1000.0 * (time.perf_counter() - t_write)
+	total_ms = 1000.0 * (time.perf_counter() - t_total)
 	print(
-		f"[snap_surf.map_global] affine seed quad initial debug objs radius={radius_i} dir={out}",
+		f"[snap_surf.map_global] affine seed quad initial debug objs radius={radius_i} dir={out} "
+		f"uv={uv_ms:.3f}ms mask={mask_ms:.3f}ms objective={obj_ms:.3f}ms "
+		f"write={write_ms:.3f}ms total={total_ms:.3f}ms",
 		flush=True,
 	)
 
@@ -2198,7 +2293,7 @@ def _seed_quad_affine_init_result(
 		f"uv_rmse={sample_terms['uv_rmse']:.6g} uv_max={sample_terms['uv_max']:.6g}",
 		flush=True,
 	)
-	if bool(cfg.get("expansion_loss_diag", cfg.get("expansion_diagnostic", True))):
+	if bool(cfg.get("expansion_loss_diag", False)):
 		_print_affine_seed_quad_expansion_diagnostic(
 			affine=affine,
 			seed_ext_quad=seed_ext_quad,
@@ -2791,6 +2886,7 @@ def _prepare_affine_seed_quad_candidate(
 		return None, None, float("nan"), 0
 	if not isinstance(raw, dict) and not bool(raw):
 		return None, None, float("nan"), 0
+	t_prepare = time.perf_counter()
 	reopt_cfg = raw if isinstance(raw, dict) else {}
 	reopt_enabled = bool(reopt_cfg.get("expansion_reopt", reopt_cfg.get("grow_reopt", False)))
 	reopt_steps = max(0, int(reopt_cfg.get("expansion_reopt_steps", reopt_cfg.get("grow_reopt_steps", 100))))
@@ -2800,12 +2896,17 @@ def _prepare_affine_seed_quad_candidate(
 		reopt_cfg.get("debug_print_interval", stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))),
 	)))
 	lr_warmup_steps = _lr_warmup_steps(stage.args)
+	t_seed = time.perf_counter()
 	seed_result = _seed_quad_affine_init_result(
 		fixture=fixture,
 		stage_cfg=stage_cfg,
 		seed_hw=seed_hw,
 		seed_model_uv=_seed_model_uv(fixture, seed_hw),
 		raw=raw,
+	)
+	print(
+		f"[snap_surf.map_global] affine seed quad prepare seed_fit={1000.0 * (time.perf_counter() - t_seed):.3f}ms",
+		flush=True,
 	)
 	if seed_result is None:
 		print("[snap_surf.map_global] affine seed quad init unavailable", flush=True)
@@ -2822,6 +2923,7 @@ def _prepare_affine_seed_quad_candidate(
 	)
 	progress_rows = 0
 	if reopt_enabled:
+		t_reopt = time.perf_counter()
 		with torch.no_grad():
 			affine.affine.copy_(candidate)
 		_reopt_rows, progress_rows = _run_affine_seed_quad_expansion_reopt(
@@ -2844,6 +2946,11 @@ def _prepare_affine_seed_quad_candidate(
 			cancel_fn=cancel_fn,
 		)
 		candidate = affine.affine.detach().clone()
+		print(
+			f"[snap_surf.map_global] affine seed quad prepare expansion_reopt={1000.0 * (time.perf_counter() - t_reopt):.3f}ms",
+			flush=True,
+		)
+	t_score = time.perf_counter()
 	seed_loss, _initial_terms, _initial_err, _initial_affine = _score_affine_tensor(
 		candidate,
 		affine_model=affine,
@@ -2853,6 +2960,11 @@ def _prepare_affine_seed_quad_candidate(
 		station_target=station_target,
 		w_station=w_station,
 	)
+	print(
+		f"[snap_surf.map_global] affine seed quad prepare score={1000.0 * (time.perf_counter() - t_score):.3f}ms",
+		flush=True,
+	)
+	t_grid = time.perf_counter()
 	candidate, initial_loss = _select_affine_seed_grid_candidate(
 		base_affine=candidate,
 		stage=stage,
@@ -2863,6 +2975,11 @@ def _prepare_affine_seed_quad_candidate(
 		station_target=station_target,
 		w_station=w_station,
 		cancel_fn=cancel_fn,
+	)
+	print(
+		f"[snap_surf.map_global] affine seed quad prepare grid={1000.0 * (time.perf_counter() - t_grid):.3f}ms "
+		f"total={1000.0 * (time.perf_counter() - t_prepare):.3f}ms",
+		flush=True,
 	)
 	if not math.isfinite(initial_loss):
 		initial_loss = seed_loss
@@ -2884,6 +3001,7 @@ def _run_affine_seed_quad_init(
 	progress_widths_run: dict[str, int],
 	progress_row_idx: int,
 	out_root: Path | None = None,
+	write_objs: bool = False,
 ) -> int:
 	raw = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
 	if isinstance(raw, dict):
@@ -2897,7 +3015,7 @@ def _run_affine_seed_quad_init(
 		steps = max(0, int(stage.steps))
 		lr = float(stage.lr)
 	debug_obj_root = None
-	if out_root is not None:
+	if out_root is not None and bool(write_objs):
 		label = stage.name or _stage_param_label(stage.params, fallback="affine_seed_quad_init")
 		debug_obj_root = Path(out_root) / "objs" / f"stage_{int(stage_idx):03d}_{_debug_obj_safe_label(label)}" / "expansion_reopt"
 	seed_result, candidate, initial_loss, prep_progress_rows = _prepare_affine_seed_quad_candidate(
@@ -3640,7 +3758,7 @@ class GlobalMapRuntime:
 			"health_hit": 0,
 			"health_miss": 0,
 		}
-		startup_timing = _truthy_arg(stage.args.get("startup_timing", stage.args.get("opt_timing", False)))
+		startup_timing = _truthy_arg(stage.args.get("startup_timing", stage.args.get("opt_timing", True)))
 		startup_health_s = 0.0
 		startup_z_lift_s = 0.0
 		startup_initial_eval_s = 0.0
@@ -3666,6 +3784,7 @@ class GlobalMapRuntime:
 			cache_stats=cache_stats,
 		)
 		startup_health_s = time.perf_counter() - _t_startup
+		cache_stats["health_ms"] = float(cache_stats.get("health_ms", 0.0)) + 1000.0 * float(startup_health_s)
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
 		self._ensure_models(fixture, base_cfg, stage)
 		assert self.affine is not None
@@ -3676,7 +3795,7 @@ class GlobalMapRuntime:
 			raw_seed = stage.args.get("affine_seed_quad_init", stage.args.get("seed_quad_affine", {}))
 			runtime_progress_widths = _global_progress_widths(GlobalMapConfig(base=self.cfg_global.base, stages=(stage,)))
 			debug_obj_root = None
-			debug_obj_dir = stage.args.get("debug_obj_dir", True)
+			debug_obj_dir = stage.args.get("debug_obj_dir", None)
 			if debug_obj_dir is not None and debug_obj_dir is not False:
 				if isinstance(debug_obj_dir, bool):
 					debug_root = Path("snap_surf_objs")
@@ -3737,8 +3856,10 @@ class GlobalMapRuntime:
 			label = stage.name or _stage_param_label(stage.params, fallback="map_stage")
 			print(
 				f"[snap_surf.map_global] {label}: startup "
-				f"health={1000.0 * startup_health_s:.3f}ms "
-				f"z_lift={1000.0 * startup_z_lift_s:.3f}ms "
+				f"mesh_filter={1000.0 * startup_health_s:.3f}ms "
+				f"turn={1000.0 * startup_z_lift_s:.3f}ms "
+				f"turn_ext={float(cache_stats.get('zext_ms', 0.0)):.3f}ms "
+				f"turn_model={float(cache_stats.get('zmdl_ms', 0.0)):.3f}ms "
 				f"initial_eval={1000.0 * startup_initial_eval_s:.3f}ms "
 				f"health_hit={cache_stats['health_hit']} health_miss={cache_stats['health_miss']} "
 				f"zext_hit={cache_stats['zext_hit']} zext_miss={cache_stats['zext_miss']} "
@@ -3759,6 +3880,10 @@ class GlobalMapRuntime:
 				"snaps_map_health_cache_miss": float(cache_stats["health_miss"]),
 				"snaps_map_startup_health_ms": 1000.0 * float(startup_health_s),
 				"snaps_map_startup_z_lift_ms": 1000.0 * float(startup_z_lift_s),
+				"snaps_map_startup_mesh_filter_ms": 1000.0 * float(startup_health_s),
+				"snaps_map_startup_turn_ms": 1000.0 * float(startup_z_lift_s),
+				"snaps_map_startup_turn_ext_ms": float(cache_stats.get("zext_ms", 0.0)),
+				"snaps_map_startup_turn_model_ms": float(cache_stats.get("zmdl_ms", 0.0)),
 				"snaps_map_startup_initial_eval_ms": 1000.0 * float(startup_initial_eval_s),
 			}
 			for term_key, stat_key in (
@@ -3793,6 +3918,9 @@ class GlobalMapRuntime:
 				stats["snaps_map_zext_unr"] = float(zs["ext_unreachable"])
 				stats["snaps_map_zmdl_bad"] = float(zs["model_invalid"])
 				stats["snaps_map_zmdl_unr"] = float(zs["model_unreachable"])
+				stats["snaps_map_zext_ms"] = float(zs.get("ext_ms", 0.0))
+				stats["snaps_map_zmdl_ms"] = float(zs.get("model_ms", 0.0))
+				stats["snaps_map_zlift_ms"] = float(zs.get("total_ms", 0.0))
 			if int(err["mapping_error_samples"]) > 0:
 				stats["snaps_map_avg"] = float(err["avg_model_quad_distance"])
 				stats["snaps_map_max"] = float(err["max_model_quad_distance"])
@@ -4106,6 +4234,7 @@ def optimize_fixture(
 		stage_cfg = _stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, stage), stage)
 		w_station = _stage_station_weight(cfg_global, stage)
 		if _is_affine_seed_quad_init(stage):
+			write_stage_objs = _obj_outputs_enabled(cfg_global, stage)
 			progress_rows += _run_affine_seed_quad_init(
 				stage_idx=stage_idx,
 				stage=stage,
@@ -4118,6 +4247,7 @@ def optimize_fixture(
 				progress_widths_run=progress_widths_run,
 				progress_row_idx=progress_rows,
 				out_root=out,
+				write_objs=write_stage_objs,
 			)
 			stage_uv = affine().detach()
 			err = _fixture_mapping_error(stage_uv, fixture)
@@ -4129,7 +4259,8 @@ def optimize_fixture(
 				"train_min_level": 0,
 				**err,
 			})
-			_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
+			if write_stage_objs:
+				_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
 			continue
 		if _is_affine_init_scan(stage):
 			_run_affine_multistart(
@@ -4152,7 +4283,8 @@ def optimize_fixture(
 				"train_min_level": 0,
 				**err,
 			})
-			_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
+			if _obj_outputs_enabled(cfg_global, stage):
+				_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
 			continue
 		params: list[torch.nn.Parameter] = []
 		max_level = _max_supported_level(tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(stage.min_scaledown))
@@ -4319,19 +4451,21 @@ def optimize_fixture(
 			stage_uv = global_model(active_level=0).detach()
 		else:
 			stage_uv = affine().detach()
-		_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
+		if _obj_outputs_enabled(cfg_global, stage):
+			_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
 
 	final_uv = global_model(active_level=0).detach() if global_model is not None else affine().detach()
-	_write_map_objs(
-		out / "objs" / "final",
-		uv=final_uv,
-		fixture=fixture,
-		meta={
-			"name": "final",
-			"params": ["map_surf_ms"] if global_model is not None else ["map_surf_affine"],
-			"stages_completed": len(cfg_global.stages),
-		},
-	)
+	if _obj_outputs_enabled(cfg_global):
+		_write_map_objs(
+			out / "objs" / "final",
+			uv=final_uv,
+			fixture=fixture,
+			meta={
+				"name": "final",
+				"params": ["map_surf_ms"] if global_model is not None else ["map_surf_affine"],
+				"stages_completed": len(cfg_global.stages),
+			},
+		)
 	_float_tif(out / "model_x.tif", final_uv[..., 1])
 	_float_tif(out / "model_y.tif", final_uv[..., 0])
 	meta = {
