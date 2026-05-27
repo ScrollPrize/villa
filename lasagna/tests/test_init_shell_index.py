@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,7 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 import fit
+import cli_data
 import init_shell_index
 import lasagna_volume
 import model as fit_model
@@ -202,6 +204,20 @@ class InitShellIndexLookupTest(unittest.TestCase):
 
 
 class InitShellCropTest(unittest.TestCase):
+	def test_cli_data_accepts_fractional_wrap_width_unit(self) -> None:
+		parser = argparse.ArgumentParser()
+		cli_data.add_args(parser)
+		args = parser.parse_args([
+			"--input", "/tmp/input.lasagna.json",
+			"--model-w", "1.5",
+			"--model-w-unit", "wraps",
+		])
+
+		cfg = cli_data.from_args(args)
+
+		self.assertEqual(cfg.model_w, 1.5)
+		self.assertEqual(cfg.model_w_unit, "wraps")
+
 	def test_full_width_crop_cuts_opposite_anchor_and_is_nonperiodic(self) -> None:
 		surface = init_shell_index.InitShellSurface(
 			shell_id="shell_0001.tifxyz",
@@ -238,6 +254,73 @@ class InitShellCropTest(unittest.TestCase):
 		self.assertLess(float(crop[:, 0, 0].mean()), -8.0)
 		self.assertLess(float(crop[:, -1, 0].mean()), -8.0)
 		self.assertFalse(torch.allclose(crop[:, 0], crop[:, -1], atol=1.0e-4, rtol=1.0e-4))
+
+	def test_wrap_width_unrolls_multiple_circumferences(self) -> None:
+		surface = init_shell_index.InitShellSurface(
+			shell_id="shell_0001.tifxyz",
+			path=Path("shell_0001.tifxyz"),
+			xyz_wrapped=_wrapped_cylinder(radius=10.0, z_values=[0.0, 10.0, 20.0], width=64),
+			unique_w=64,
+		)
+		closest = _closest_for_surface(surface, h=1.0, w=0.0, xyz=(10.0, 0.0, 10.0))
+
+		legacy_crop, _legacy_valid, legacy_info = init_shell_index.crop_shell_surface(
+			surface,
+			closest,
+			seed=(10.0, 0.0, 10.0),
+			model_w=0.0,
+			model_h=20.0,
+			mesh_step=5.0,
+			device="cpu",
+		)
+		crop, _valid, info = init_shell_index.crop_shell_surface(
+			surface,
+			closest,
+			seed=(10.0, 0.0, 10.0),
+			model_w=2.0,
+			model_w_unit="wraps",
+			model_h=20.0,
+			mesh_step=5.0,
+			device="cpu",
+		)
+
+		self.assertTrue(legacy_info.full_width)
+		self.assertFalse(info.full_width)
+		self.assertGreater(crop.shape[1], legacy_crop.shape[1])
+		self.assertGreaterEqual((crop.shape[1] - 1) * 5.0, 2.0 * info.circumference)
+		self.assertLess((crop.shape[1] - 2) * 5.0, 2.0 * info.circumference)
+
+	def test_voxel_width_larger_than_circumference_unrolls(self) -> None:
+		surface = init_shell_index.InitShellSurface(
+			shell_id="shell_0001.tifxyz",
+			path=Path("shell_0001.tifxyz"),
+			xyz_wrapped=_wrapped_cylinder(radius=10.0, z_values=[0.0, 10.0, 20.0], width=64),
+			unique_w=64,
+		)
+		closest = _closest_for_surface(surface, h=1.0, w=0.0, xyz=(10.0, 0.0, 10.0))
+		legacy_crop, _legacy_valid, legacy_info = init_shell_index.crop_shell_surface(
+			surface,
+			closest,
+			seed=(10.0, 0.0, 10.0),
+			model_w=0.0,
+			model_h=20.0,
+			mesh_step=5.0,
+			device="cpu",
+		)
+
+		crop, _valid, info = init_shell_index.crop_shell_surface(
+			surface,
+			closest,
+			seed=(10.0, 0.0, 10.0),
+			model_w=1.5 * legacy_info.circumference,
+			model_w_unit="voxels",
+			model_h=20.0,
+			mesh_step=5.0,
+			device="cpu",
+		)
+
+		self.assertFalse(info.full_width)
+		self.assertGreater(crop.shape[1], legacy_crop.shape[1])
 
 	def test_narrow_crop_is_anchor_centered_and_nonperiodic(self) -> None:
 		surface = init_shell_index.InitShellSurface(

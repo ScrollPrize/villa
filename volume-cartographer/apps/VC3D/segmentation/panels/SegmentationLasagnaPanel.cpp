@@ -22,6 +22,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
+#include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -370,11 +371,16 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         dimLayout->setSpacing(4);
 
         dimLayout->addWidget(new QLabel(tr("W:"), dimWidget));
-        _widthSpin = new QSpinBox(dimWidget);
-        _widthSpin->setRange(1, 999999);
-        _widthSpin->setValue(2048);
-        _widthSpin->setSingleStep(64);
+        _widthSpin = new QDoubleSpinBox(dimWidget);
+        _widthSpin->setRange(0.001, 999999.0);
+        _widthSpin->setDecimals(0);
+        _widthSpin->setValue(2048.0);
+        _widthSpin->setSingleStep(64.0);
         dimLayout->addWidget(_widthSpin, 1);
+        _widthUnitCombo = new QComboBox(dimWidget);
+        _widthUnitCombo->addItem(QStringLiteral("vx"), QStringLiteral("voxels"));
+        _widthUnitCombo->addItem(QStringLiteral("wraps"), QStringLiteral("wraps"));
+        dimLayout->addWidget(_widthUnitCombo);
 
         dimLayout->addWidget(new QLabel(tr("H:"), dimWidget));
         _heightSpin = new QSpinBox(dimWidget);
@@ -494,24 +500,6 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _offsetValueSpin->setToolTip(tr("Target grad_mag integral offset (-1, 0, +1 typical)"));
         row->addWidget(_offsetValueSpin);
     }, tr("Offset in winding-integral space. 0=reoptimize in place, ±1=adjacent winding."));
-
-    _offsetGroup->addRow(tr("Window:"), [&](QHBoxLayout* row) {
-        _windowSizeSpin = new QSpinBox(offsetContent);
-        _windowSizeSpin->setRange(0, 100000);
-        _windowSizeSpin->setSingleStep(1000);
-        _windowSizeSpin->setValue(5000);
-        _windowSizeSpin->setToolTip(tr("Window size in fullres voxels (0 = no windowing)"));
-        row->addWidget(_windowSizeSpin);
-    }, tr("Split large surfaces into windows for memory efficiency. 0 = process whole surface."));
-
-    _offsetGroup->addRow(tr("Overlap:"), [&](QHBoxLayout* row) {
-        _windowOverlapSpin = new QSpinBox(offsetContent);
-        _windowOverlapSpin->setRange(0, 50000);
-        _windowOverlapSpin->setSingleStep(100);
-        _windowOverlapSpin->setValue(500);
-        _windowOverlapSpin->setToolTip(tr("Overlap between windows in fullres voxels"));
-        row->addWidget(_windowOverlapSpin);
-    }, tr("Overlap ensures smooth transitions at window boundaries."));
 
     panelLayout->addWidget(_offsetGroup);
 
@@ -644,8 +632,34 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
 
     // -- New model settings persistence --
-    connect(_widthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_new_model_width"), v);
+    connect(_widthSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        const QString unit = newModelWidthUnit();
+        if (unit == QStringLiteral("wraps")) {
+            writeSetting(QStringLiteral("lasagna_new_model_width_wraps"), v);
+        } else {
+            writeSetting(QStringLiteral("lasagna_new_model_width"), v);
+        }
+    });
+    connect(_widthUnitCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0) return;
+        const QString unit = newModelWidthUnit();
+        writeSetting(QStringLiteral("lasagna_new_model_width_unit"), unit);
+        if (!_widthSpin) return;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.beginGroup(_settingsGroup);
+        const double value = unit == QStringLiteral("wraps")
+            ? settings.value(QStringLiteral("lasagna_new_model_width_wraps"), 1.0).toDouble()
+            : settings.value(QStringLiteral("lasagna_new_model_width"), 2048.0).toDouble();
+        settings.endGroup();
+        const QSignalBlocker b(_widthSpin);
+        if (unit == QStringLiteral("wraps")) {
+            _widthSpin->setDecimals(3);
+            _widthSpin->setSingleStep(0.25);
+        } else {
+            _widthSpin->setDecimals(0);
+            _widthSpin->setSingleStep(64.0);
+        }
+        _widthSpin->setValue(value);
     });
     connect(_heightSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
         writeSetting(QStringLiteral("lasagna_new_model_height"), v);
@@ -742,14 +756,6 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     connect(_offsetValueSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         writeSetting(QStringLiteral("lasagna_offset_value"), v);
     });
-    connect(_windowSizeSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_window_size"), v);
-    });
-    connect(_windowOverlapSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
-        writeSetting(QStringLiteral("lasagna_window_overlap"), v);
-    });
-
-
     // -- Action buttons --
     connect(_newModelBtn, &QPushButton::clicked, this, [this]() {
         launchLasagnaMode(LasagnaMode::NewModel);
@@ -1564,7 +1570,8 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         config = doc.object();
     }
 
-    int nmW = newModelWidth();
+    double nmW = newModelWidth();
+    QString nmWUnit = newModelWidthUnit();
     int nmH = newModelHeight();
     int nmN = newModelWindings();
 
@@ -1604,57 +1611,47 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     }
 
     const double offsetVal = offsetValue();
-    const int size = windowSize();
-    const int overlap = windowOverlap();
 
     QJsonObject args = config[QStringLiteral("args")].toObject();
     // VC3D is transport only. Do not add config-semantic branching here.
     // Config interpretation belongs in fit_service.py / fit.py.
     args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
     args[QStringLiteral("model-w")] = nmW;
+    args[QStringLiteral("model-w-unit")] = nmWUnit;
     args[QStringLiteral("model-h")] = nmH;
     args[QStringLiteral("windings")] = nmN;
     config[QStringLiteral("args")] = args;
 
     std::cerr << "[lasagna] request settings:"
               << " seed=(" << cx << "," << cy << "," << cz << ")"
-              << " w=" << nmW << " h=" << nmH
+              << " w=" << nmW << " " << nmWUnit.toStdString() << " h=" << nmH
               << " windings=" << nmN
-              << " offset=" << offsetVal
-              << " window_size=" << size
-              << " window_overlap=" << overlap << std::endl;
+              << " offset=" << offsetVal << std::endl;
 
     if (isOffsetMode && !segPath.empty()) {
 
-        if (size > 0 && !outputDir.isEmpty()) {
+        if (!outputDir.isEmpty()) {
             int offIdx = 1;
             std::error_code ec2;
             for (bool collision = true; collision; ++offIdx) {
                 collision = false;
-                std::string offPrefix = rootName + "_off" + std::to_string(offIdx) + "_w";
-                const QString reservedPrefix = QString::fromStdString(
-                    rootName + "_off" + std::to_string(offIdx));
-                if (_submittedOutputNames.contains(reservedPrefix)) {
+                const std::string offName = rootName + "_off" + std::to_string(offIdx) + tifxyzSuffix;
+                if (_submittedOutputNames.contains(QString::fromStdString(offName))) {
                     collision = true;
                     continue;
                 }
                 for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec2)) {
                     auto name = entry.path().filename().string();
-                    if (name.size() > offPrefix.size() + tifxyzSuffix.size() &&
-                        name.compare(0, offPrefix.size(), offPrefix) == 0 &&
-                        name.compare(name.size() - tifxyzSuffix.size(),
-                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                    if (name == offName) {
                         collision = true;
                         break;
                     }
                 }
             }
-            outputName = QString::fromStdString(rootName + "_off" + std::to_string(offIdx - 1));
+            outputName = QString::fromStdString(rootName + "_off" + std::to_string(offIdx - 1) + tifxyzSuffix);
         }
 
         std::cerr << "[lasagna] offset mode: offset=" << offsetVal
-                  << " window_size=" << size
-                  << " window_overlap=" << overlap
                   << " outputName=" << outputName.toStdString() << std::endl;
     }
 
@@ -1697,11 +1694,6 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
     }
-    if (size > 0) {
-        request[QStringLiteral("window_size")] = size;
-        request[QStringLiteral("window_overlap")] = overlap;
-    }
-
     QJsonObject jobSpec;
     QJsonArray objectUploads;
     QJsonArray linkedSurfaces;
@@ -1870,9 +1862,33 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         _outputNameEdit->setText(settings.value(QStringLiteral("lasagna_output_name"), QString()).toString());
     }
     // Dimensions
+    QString widthUnit = settings.value(
+        QStringLiteral("lasagna_new_model_width_unit"),
+        QStringLiteral("voxels")).toString().trimmed().toLower();
+    if (widthUnit == QStringLiteral("vx")) {
+        widthUnit = QStringLiteral("voxels");
+    }
+    if (widthUnit != QStringLiteral("wraps")) {
+        widthUnit = QStringLiteral("voxels");
+    }
+    if (_widthUnitCombo) {
+        const QSignalBlocker b(_widthUnitCombo);
+        const int idx = _widthUnitCombo->findData(widthUnit);
+        _widthUnitCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+    }
     if (_widthSpin) {
         const QSignalBlocker b(_widthSpin);
-        _widthSpin->setValue(settings.value(QStringLiteral("lasagna_new_model_width"), 2048).toInt());
+        if (widthUnit == QStringLiteral("wraps")) {
+            _widthSpin->setDecimals(3);
+            _widthSpin->setSingleStep(0.25);
+            _widthSpin->setValue(
+                settings.value(QStringLiteral("lasagna_new_model_width_wraps"), 1.0).toDouble());
+        } else {
+            _widthSpin->setDecimals(0);
+            _widthSpin->setSingleStep(64.0);
+            _widthSpin->setValue(
+                settings.value(QStringLiteral("lasagna_new_model_width"), 2048).toDouble());
+        }
     }
     if (_heightSpin) {
         const QSignalBlocker b(_heightSpin);
@@ -1913,16 +1929,6 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         const QSignalBlocker b(_offsetValueSpin);
         _offsetValueSpin->setValue(
             settings.value(QStringLiteral("lasagna_offset_value"), 1.0).toDouble());
-    }
-    if (_windowSizeSpin) {
-        const QSignalBlocker b(_windowSizeSpin);
-        _windowSizeSpin->setValue(
-            settings.value(QStringLiteral("lasagna_window_size"), 5000).toInt());
-    }
-    if (_windowOverlapSpin) {
-        const QSignalBlocker b(_windowOverlapSpin);
-        _windowOverlapSpin->setValue(
-            settings.value(QStringLiteral("lasagna_window_overlap"), 500).toInt());
     }
     // Populate config combos from saved paths
     if (!_newModelConfigFilePath.isEmpty()) {
@@ -2082,9 +2088,18 @@ utils::Json SegmentationLasagnaPanel::lasagnaConfigJson() const
 // Lasagna mode helpers
 // ---------------------------------------------------------------------------
 
-int SegmentationLasagnaPanel::newModelWidth() const
+double SegmentationLasagnaPanel::newModelWidth() const
 {
-    return _widthSpin ? _widthSpin->value() : 2048;
+    return _widthSpin ? _widthSpin->value() : 2048.0;
+}
+
+QString SegmentationLasagnaPanel::newModelWidthUnit() const
+{
+    if (!_widthUnitCombo) {
+        return QStringLiteral("voxels");
+    }
+    const QString unit = _widthUnitCombo->currentData().toString();
+    return unit == QStringLiteral("wraps") ? unit : QStringLiteral("voxels");
 }
 
 int SegmentationLasagnaPanel::newModelHeight() const
@@ -2110,16 +2125,6 @@ QString SegmentationLasagnaPanel::newModelOutputName() const
 double SegmentationLasagnaPanel::offsetValue() const
 {
     return _offsetValueSpin ? _offsetValueSpin->value() : 1.0;
-}
-
-int SegmentationLasagnaPanel::windowSize() const
-{
-    return _windowSizeSpin ? _windowSizeSpin->value() : 5000;
-}
-
-int SegmentationLasagnaPanel::windowOverlap() const
-{
-    return _windowOverlapSpin ? _windowOverlapSpin->value() : 500;
 }
 
 void SegmentationLasagnaPanel::setSeedFromFocus(int x, int y, int z)

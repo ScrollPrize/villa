@@ -195,10 +195,6 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input, flatten optimizes one external tifxyz inverse map")
 	p.add_argument("--flatten-solver", choices=("torch", "inverse", "forward"), default="torch",
 		help="Flatten solver variant for model-init=flatten: torch/inverse keeps the existing inverse-map Adam path; forward optimizes source-vertex UVs and inverts at export")
-	p.add_argument("--window-size", type=int, default=None,
-		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
-	p.add_argument("--window-overlap", type=int, default=0,
-		help="Overlap between windows in fullres voxels")
 	p.add_argument("--approval-inpaint", action=argparse.BooleanOptionalAction, default=False,
 		help="Use selected approval mask/tifxyz data to inpaint the seed-region setup")
 	p.add_argument("--approval-inpaint-corr-spacing", type=float, default=None,
@@ -213,36 +209,6 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
-
-
-def _compute_window_grid(
-	H: int, W: int, mesh_step: int, window_size: int, overlap: int,
-) -> list[tuple[int, int, int, int]]:
-	"""Compute window tiles over a (H, W) vertex grid.
-
-	window_size and overlap are in fullres voxels.
-	Returns list of (h0, h1, w0, w1) in vertex indices.
-	"""
-	if overlap >= window_size:
-		raise ValueError(f"overlap ({overlap}) must be less than window_size ({window_size})")
-	win_verts = window_size // mesh_step + 1
-	overlap_verts = overlap // mesh_step
-	stride = max(1, win_verts - overlap_verts)
-	windows = []
-	h = 0
-	while h < H:
-		h1 = min(h + win_verts, H)
-		w = 0
-		while w < W:
-			w1 = min(w + win_verts, W)
-			windows.append((h, h1, w, w1))
-			if w1 == W:
-				break
-			w += stride
-		if h1 == H:
-			break
-		h += stride
-	return windows
 
 
 def _dummy_flatten_data() -> fit_data.FitData3D:
@@ -644,214 +610,7 @@ def main(argv: list[str] | None = None) -> int:
 			  f"(umbilicus tube search grid; final mesh bake uses model-w/model-h/mesh-step)", flush=True)
 	_stage_done("derive_initial_model_params", _t)
 
-	# --- Windowed tifxyz mode ---
 	tifxyz_init = getattr(args, "tifxyz_init", None)
-	window_size = getattr(args, "window_size", None) or 0
-	window_overlap = getattr(args, "window_overlap", 0)
-	if model_init != "ext" and window_size > 0:
-		raise ValueError("windowed optimization currently requires model-init=ext")
-
-	if model_init == "ext" and tifxyz_init and window_size > 0:
-		from tifxyz_io import load_tifxyz, surface_step_stats
-		import fit2tifxyz as _f2t
-		import json as _json
-
-		# Load full tifxyz to CPU (save GPU mem)
-		full_xyz, full_valid, _full_meta = load_tifxyz(tifxyz_init, device="cpu")
-		H_full, W_full, _ = full_xyz.shape
-		mesh_step = model_cfg.mesh_step
-		_step_h, _step_w, _step_diag, step_avg = surface_step_stats(full_xyz, full_valid)
-		if math.isfinite(step_avg) and step_avg > 0.0:
-			mesh_step = max(1, int(round(step_avg)))
-
-		# Get offset from external_surfaces config
-		ext_surfaces_cfg = cfg.pop("external_surfaces", None)
-		offset_val = 1.0
-		if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
-			offset_val = float(ext_surfaces_cfg[0].get("offset", 1.0))
-		ext_margin = max(4, int(2 * abs(offset_val) / mesh_step) + 2)
-
-		# Parse stages and channel skipping (shared across windows)
-		cfg.pop("corr_points", None)
-		cfg.pop("args", None)
-		cfg.pop("voxel_size_um", None)
-		cfg.pop("external_surfaces", None)
-		cfg.pop("tifxyz", None)
-		stages = optimizer.load_stages_cfg(
-			cfg,
-			init_mode=model_cfg.init_mode if model_init == "seed" else None,
-		)
-		print("[fit] optimizer stages:", flush=True)
-		for i, st in enumerate(stages):
-			args_snap_map = st.global_opt.args.get("snap_surf_map") if isinstance(st.global_opt.args, dict) else None
-			print(
-				f"[fit]   stage{i} name={st.name!r} steps={st.global_opt.steps} "
-				f"snap_surf_map_eff={st.global_opt.eff.get('snap_surf_map', 0.0):.6g} "
-				f"snap_surf_map_args={args_snap_map}",
-				flush=True,
-			)
-
-		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
-		n_windows = len(windows)
-		overlap_verts = window_overlap // mesh_step
-		print(f"[fit] windowed mode: {n_windows} windows, window_size={window_size} "
-			  f"overlap={window_overlap} mesh_step={mesh_step} grid={H_full}x{W_full}",
-			  flush=True)
-
-		# Output directory for window tifxyz exports
-		output_dir = model_cfg.model_output
-		if output_dir is not None:
-			output_dir = str(Path(output_dir).parent)
-		elif _out_dir is not None:
-			output_dir = _out_dir
-		else:
-			raise ValueError("windowed mode requires --model-output or --out-dir")
-		Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-		voxel_size_um = fit_config.get("voxel_size_um")
-
-		for wi, (h0, h1, w0, w1) in enumerate(windows):
-			print(f"\n[fit] === window {wi+1}/{n_windows}: rows [{h0}:{h1}], cols [{w0}:{w1}] "
-				  f"({h1-h0}x{w1-w0} verts) ===", flush=True)
-
-			# Crop tifxyz to window
-			crop_xyz = full_xyz[h0:h1, w0:w1].to(device)
-			crop_valid = full_valid[h0:h1, w0:w1].to(device)
-
-			# Create model from crop
-			mdl = model.Model3D.from_tifxyz_crop(
-				crop_xyz, crop_valid, device=device, mesh_step=mesh_step,
-				winding_step=model_cfg.winding_step,
-				subsample_mesh=model_cfg.subsample_mesh,
-				subsample_winding=model_cfg.subsample_winding,
-			)
-
-			# Crop external surface with margin for ray intersection at boundaries
-			eh0 = max(0, h0 - ext_margin)
-			eh1 = min(H_full, h1 + ext_margin)
-			ew0 = max(0, w0 - ext_margin)
-			ew1 = min(W_full, w1 + ext_margin)
-			ext_xyz = full_xyz[eh0:eh1, ew0:ew1].to(device)
-			ext_valid = full_valid[eh0:eh1, ew0:ew1].to(device)
-			ext_idx = mdl.add_external_surface(ext_xyz, valid=ext_valid, offset=offset_val)
-			# ext→model mapping: ext corner r → model grid r + h_off
-			# ext grid 0 = fullres eh0, model grid 0 = fullres h0
-			# so model_h = r + (eh0 - h0)
-			mdl._ext_conn_offsets[ext_idx][0] = float(eh0 - h0)
-			mdl._ext_conn_offsets[ext_idx][1] = float(ew0 - w0)
-
-			# Streaming data loader for this window
-			def _streaming_skip_channels(needed_channels: set[str]) -> set[str]:
-				optional = {"cos", "pred_dt"}
-				return optional - set(needed_channels)
-
-			def _streaming_loaded_channels(d: fit_data.FitData3D) -> set[str]:
-				if not d.sparse_caches:
-					return set()
-				return {
-					ch
-					for cache in d.sparse_caches.values()
-					for ch in cache.channels
-				}
-
-			def _load_streaming_win(needed_channels: set[str]) -> fit_data.FitData3D:
-				d = fit_data.load_3d_streaming(
-					path=str(data_cfg.input),
-					device=device,
-					sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
-					skip_channels=_streaming_skip_channels(needed_channels),
-				)
-				Z, Y, X = d.size
-				sx, sy, sz = d.spacing
-				volume_extent = (
-					d.origin_fullres[0], d.origin_fullres[1], d.origin_fullres[2],
-					d.origin_fullres[0] + (X - 1) * sx,
-					d.origin_fullres[1] + (Y - 1) * sy,
-					d.origin_fullres[2] + (Z - 1) * sz,
-				)
-				mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
-				return d
-
-			def _ensure_data_win(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
-				if data is None:
-					return _load_streaming_win(needed_channels)
-				loaded = _streaming_loaded_channels(data)
-				required = {"grad_mag", "nx", "ny"} | set(needed_channels)
-				if not required.issubset(loaded) or (loaded & {"cos", "pred_dt"}) != (required & {"cos", "pred_dt"}):
-					return _load_streaming_win(needed_channels)
-				return data
-
-			data = _ensure_data_win(None, set())
-
-			# Progress wrapper: prefix window index, scale overall progress
-			def _make_progress(wi_=wi, n_=n_windows):
-				def _progress_win(*, step: int, total: int, loss: float, **kw: object) -> None:
-					if progress_enabled:
-						inner = float(kw.get("overall_progress", 0.0))
-						overall = (wi_ + inner) / n_
-						stage_name = kw.get("stage_name", "")
-						print(f"PROGRESS {step} {total} {loss:.6f} win={wi_+1}/{n_} "
-							  f"overall={overall:.3f} {stage_name}", flush=True)
-				return _progress_win
-
-			opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
-
-			# Seed from center of model grid (matches h_mid/w_mid in station loss)
-			center_pt = _grid_center(mdl)
-			win_seed = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
-			print(f"[fit] window seed: ({win_seed[0]:.0f}, {win_seed[1]:.0f}, {win_seed[2]:.0f})",
-				  flush=True)
-
-			optimizer.optimize(
-				model=mdl,
-				data=data,
-				stages=stages,
-				snapshot_interval=0,
-				snapshot_fn=lambda **kw: None,
-				progress_fn=_make_progress(),
-				ensure_data_fn=_ensure_data_win,
-				seed_xyz=win_seed,
-				out_dir=str(Path(output_dir) / f"window_{wi:04d}"),
-			)
-
-			# Export this window's tifxyz
-			mesh = mdl.mesh_coarse()  # (3, 1, Hm, Wm)
-			mesh_np = mesh.detach().cpu().numpy()
-			Hm, Wm = mesh_np.shape[2], mesh_np.shape[3]
-			x_out = mesh_np[0, 0]  # (Hm, Wm)
-			y_out = mesh_np[1, 0]
-			z_out = mesh_np[2, 0]
-			meta_scale = 1.0 / float(mesh_step)
-
-			win_name = f"window_{wi:04d}.tifxyz"
-			win_dir = Path(output_dir) / win_name
-			area = _f2t._get_area(x_out, y_out, z_out, float(mesh_step),
-								  float(voxel_size_um) if voxel_size_um else None)
-			_f2t._write_tifxyz(
-				out_dir=win_dir, x=x_out, y=y_out, z=z_out,
-				scale=meta_scale, area=area,
-			)
-			# Add window metadata to meta.json
-			meta_path = win_dir / "meta.json"
-			meta = _json.loads(meta_path.read_text(encoding="utf-8"))
-			meta["window_index"] = wi
-			meta["window_origin_verts"] = [h0, w0]
-			meta["window_size_verts"] = [h1 - h0, w1 - w0]
-			meta["source_grid_size_verts"] = [H_full, W_full]
-			meta["overlap_verts"] = overlap_verts
-			meta_path.write_text(_json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-
-			_f2t._print_area(area)
-			print(f"[fit] exported {win_name}", flush=True)
-
-			# Free GPU memory before next window
-			del mdl, data, crop_xyz, crop_valid, ext_xyz, ext_valid, mesh, mesh_np
-			if device.type == "cuda":
-				torch.cuda.empty_cache()
-
-		print(f"\n[fit] windowed mode complete: {n_windows} windows exported to {output_dir}",
-			  flush=True)
-		return 0
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
 	_t = _stage_start("construct_model")
@@ -878,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
 				seed=tuple(float(v) for v in data_cfg.seed),
 				model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
 				model_h=float(data_cfg.model_h),
+				model_w_unit=data_cfg.model_w_unit,
 				mesh_step=float(model_cfg.mesh_step),
 				device=device,
 			)

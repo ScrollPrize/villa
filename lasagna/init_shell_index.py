@@ -450,6 +450,7 @@ def crop_shell_surface(
 	seed: tuple[float, float, float],
 	model_w: float | None,
 	model_h: float,
+	model_w_unit: str = "voxels",
 	mesh_step: float,
 	device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, ShellCropInfo]:
@@ -487,15 +488,19 @@ def crop_shell_surface(
 	_cumulative, _edges, circ_anchor = _row_cumulative_lengths(anchor_row)
 	circ_anchor_f = float(circ_anchor.detach().cpu())
 	model_w_f = 0.0 if model_w is None else float(model_w)
-	full_width = model_w_f <= 0.0 or model_w_f >= circ_anchor_f - step
+	unit = str(model_w_unit).strip().lower()
+	if unit not in {"voxels", "wraps"}:
+		raise ValueError(f"model_w_unit must be 'voxels' or 'wraps', got {model_w_unit!r}")
+	target_width = model_w_f * circ_anchor_f if unit == "wraps" else model_w_f
+	full_width = target_width <= 0.0
 	if full_width:
 		w_count = max(3, int(math.ceil(circ_anchor_f / step)))
 		base_offsets = None
 	else:
-		w_count = max(2, int(math.ceil(model_w_f / step)) + 1)
+		w_count = max(2, int(math.ceil(target_width / step)) + 1)
 		base_offsets = torch.linspace(
-			-0.5 * model_w_f,
-			0.5 * model_w_f,
+			-0.5 * target_width,
+			0.5 * target_width,
 			w_count,
 			device=dev,
 			dtype=torch.float32,

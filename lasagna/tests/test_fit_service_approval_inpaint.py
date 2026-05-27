@@ -270,30 +270,5 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 			self.assertIsNotNone(model_input)
 			self.assertEqual(Path(model_input).read_bytes(), b"checkpoint")
 
-	def test_ext_mode_applies_window_transport(self) -> None:
-		args: dict[str, object] = {"model-init": "ext"}
-
-		fit_service._apply_window_transport_args(
-			body={"window_size": 4096, "window_overlap": 256},
-			args_section=args,
-			model_init="ext",
-		)
-
-		self.assertEqual(args["window-size"], 4096)
-		self.assertEqual(args["window-overlap"], 256)
-
-	def test_model_mode_ignores_window_transport(self) -> None:
-		args: dict[str, object] = {"model-init": "model"}
-
-		fit_service._apply_window_transport_args(
-			body={"window_size": 4096, "window_overlap": 256},
-			args_section=args,
-			model_init="model",
-		)
-
-		self.assertNotIn("window-size", args)
-		self.assertNotIn("window-overlap", args)
-
-
 if __name__ == "__main__":
 	unittest.main()

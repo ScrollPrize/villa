@@ -15,7 +15,8 @@ class DataConfig:
 	downscale: float
 	crop: tuple[int, int, int, int, int, int] | None  # (x, y, z, w, h, d) fullres
 	seed: tuple[int, int, int] | None                   # (cx, cy, cz) fullres seed point
-	model_w: int | None                                  # model width in fullres voxels
+	model_w: float | None                                # model width value
+	model_w_unit: str                                    # "voxels" or "wraps"
 	model_h: int | None                                  # model height in fullres voxels
 	windings: int | None                                 # number of windings
 	winding_volume: str | None                           # path to winding volume zarr
@@ -35,8 +36,10 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--seed", type=int, nargs=3, default=None,
 		metavar=("CX", "CY", "CZ"),
 		help="Seed point in fullres voxels")
-	g.add_argument("--model-w", type=int, default=None,
-		help="Model width in fullres voxels")
+	g.add_argument("--model-w", type=float, default=None,
+		help="Model width value; interpreted by --model-w-unit")
+	g.add_argument("--model-w-unit", choices=("voxels", "wraps"), default="voxels",
+		help="Unit for --model-w")
 	g.add_argument("--model-h", type=int, default=None,
 		help="Model height in fullres voxels")
 	g.add_argument("--windings", type=int, default=None,
@@ -64,7 +67,8 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		seed = tuple(int(v) for v in args.seed)
 		if len(seed) != 3:
 			raise ValueError("--seed requires exactly 3 values: cx cy cz")
-	model_w = None if getattr(args, "model_w", None) is None else int(args.model_w)
+	model_w = None if getattr(args, "model_w", None) is None else float(args.model_w)
+	model_w_unit = str(getattr(args, "model_w_unit", "voxels"))
 	model_h = None if getattr(args, "model_h", None) is None else int(args.model_h)
 	windings = None if getattr(args, "windings", None) is None else int(args.windings)
 	winding_volume = getattr(args, "winding_volume", None)
@@ -77,6 +81,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		crop=crop,
 		seed=seed,
 		model_w=model_w,
+		model_w_unit=model_w_unit,
 		model_h=model_h,
 		windings=windings,
 		winding_volume=winding_volume,
