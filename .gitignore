@@ -52,3 +52,4 @@ volume-cartographer/AGENTS.md
 # ccache (mounted into builder docker)
 /volume-cartographer/.ccache/
 /.ccache/
+/volume-cartographer/scripts/spiral/out
