@@ -787,7 +787,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			)
 
 			self.assertEqual([int(row["radius"]) for row in rows], [0, 8, 16])
-			self.assertEqual([int(row["quads"]) for row in rows], [1, 17 * 17, 19 * 19])
+			self.assertEqual([int(row["quads"]) for row in rows], [1, 197, 19 * 19])
 			self.assertTrue(all(math.isfinite(float(row["loss"])) for row in rows))
 			self.assertTrue(all(int(row["samples"]) > 0 for row in rows))
 
@@ -820,12 +820,44 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				w_station=0.0,
 				steps=2,
 				lr=0.05,
+				status_interval=1,
 			)
 
-			self.assertEqual([int(row["radius"]) for row in rows], [0, 8])
-			self.assertTrue(all(int(row["iters"]) == 2 for row in rows))
-			self.assertLess(float(rows[0]["loss"]), float(initial[0]["loss"]))
+			self.assertEqual([int(row["radius"]) for row in rows], [0, 0, 8, 8])
+			self.assertEqual([int(row["iters"]) for row in rows], [1, 2, 1, 2])
+			self.assertLess(float(rows[1]["loss"]), float(initial[0]["loss"]))
+			self.assertGreater(float(rows[1]["loss_gain"]), 0.0)
 			self.assertTrue(torch.isfinite(affine.affine).all())
+
+	def test_live_runtime_seed_quad_init_uses_shared_expansion_reopt(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp)
+			fixture = load_map_fixture(tmp)
+			runtime = GlobalMapRuntime(seed_xyz=(2.0, 2.0, 0.0))
+			stage = GlobalMapStageConfig(
+				name="affine_seed_quad_init",
+				steps=0,
+				lr=0.05,
+				params=("affine",),
+				args={"affine_seed_quad_init": {"expansion_reopt_steps": 1, "grid_search": False}},
+			)
+			stdout = StringIO()
+
+			with redirect_stdout(stdout):
+				stats = runtime.run_stage(
+					stage=stage,
+					model_xyz=fixture.model_xyz,
+					model_normals=fixture.model_normals,
+					model_valid=fixture.model_valid,
+					ext_xyz=fixture.ext_xyz,
+					ext_valid=fixture.ext_valid,
+					ext_normals=fixture.ext_normals,
+					ext_quad_valid=fixture.ext_quad_valid,
+				)
+
+			self.assertIn("affine seed quad expansion reopt", stdout.getvalue())
+			self.assertIn("snaps_map_loss", stats)
+			self.assertEqual(runtime.sign, 1)
 
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
