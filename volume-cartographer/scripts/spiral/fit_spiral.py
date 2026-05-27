@@ -98,6 +98,7 @@ default_config = {
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
     'pcl_normals_sample_radius': 1,
+    'dense_normals_num_points': 8192,
     'regularisation_num_points': 1500,
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
@@ -108,6 +109,7 @@ default_config = {
     'loss_weight_patch_stretch': 40.0,
     'loss_weight_patch_normals': 75.0,
     'loss_weight_pcl_normals': 0.0,
+    'loss_weight_dense_normals': 0.0,
     'loss_weight_umbilicus': 5.,
     'loss_weight_shell_outer': 0.0,
     'loss_weight_shell_no_cross': 0.0,
@@ -1730,6 +1732,108 @@ def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_poin
     return (1. - (spiral_normal_step * spiral_outward_zyx).sum(dim=-1).abs()).mean()
 
 
+def prepare_dense_normal_volume(scroll_zarr):
+    # Densely load the precomputed nx/ny normal-component zarrs over the z-ROI into a compact
+    # uint8 volume that can be pushed to the GPU and sampled by get_dense_normals_loss. The raw
+    # bytes are kept as-is (no radius averaging, no decode) and only rescaled to floats at sample
+    # time; channel layout is (nx_u8, ny_u8), nz is reconstructed as sqrt(1 - nx^2 - ny^2), and
+    # validity is derived per-voxel from (nx_u8 != 0) | (ny_u8 != 0) so invalid voxels can be
+    # masked out of the loss.
+    if cfg['loss_weight_dense_normals'] <= 0:
+        return None
+    if not normal_nx_zarr_path or not normal_ny_zarr_path:
+        raise RuntimeError('dense normal loss is enabled, but FIT_SPIRAL_NORMAL_NX_ZARR_PATH/FIT_SPIRAL_NORMAL_NY_ZARR_PATH is not set')
+
+    print(f'loading dense normal zarrs group {normal_zarr_group}')
+    nx_root = zarr.open(normal_nx_zarr_path, mode='r')
+    ny_root = zarr.open(normal_ny_zarr_path, mode='r')
+    nx_array = nx_root[normal_zarr_group]
+    ny_array = ny_root[normal_zarr_group]
+    if nx_array.shape != ny_array.shape:
+        raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
+
+    if scroll_zarr is not None:
+        expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / downsample_factor).astype(np.int64))
+        if tuple(nx_array.shape) != expected_shape:
+            print(
+                f'WARNING: normal zarr shape {nx_array.shape} does not match '
+                f'ceil(scroll_zarr.shape / downsample_factor) {expected_shape}'
+            )
+
+    z_size = int(nx_array.shape[0])
+    z_lo = max(0, z_begin)
+    z_hi = min(z_size, z_end)
+    if z_hi <= z_lo:
+        raise RuntimeError(f'dense normal z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
+
+    print(f'loading dense normals for z in [{z_lo}, {z_hi}) (shape {z_hi - z_lo}, {nx_array.shape[1]}, {nx_array.shape[2]})')
+    nx_u8 = np.ascontiguousarray(nx_array[z_lo:z_hi], dtype=np.uint8)
+    ny_u8 = np.ascontiguousarray(ny_array[z_lo:z_hi], dtype=np.uint8)
+    volume = np.stack([nx_u8, ny_u8], axis=0)  # 2 (nx, ny), z, y, x  uint8
+    print(f'dense normals: loaded {volume.nbytes / 1e9:.2f} GB volume {volume.shape}')
+    volume = torch.from_numpy(volume).to(device='cuda')
+    return {
+        'volume': volume,
+        'z_origin': z_lo,
+        'shape': tuple(volume.shape[1:]),  # z, y, x
+    }
+
+
+def get_dense_normals_loss(slice_to_spiral_transform, dr_per_winding, dense_normal_volume, outer_winding_idx, num_points, epsilon=2.0):
+    # Sample points uniformly over the spiral cylinder (a disk of radius
+    # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI), transform the local
+    # spiral-space normal into scroll space as a covector using a central-difference estimate of
+    # the scroll->spiral Jacobian, then match that direction to the dense scroll-space normal.
+    device = dr_per_winding.device
+    if dense_normal_volume is None or outer_winding_idx is None:
+        return torch.zeros([], device=device)
+
+    volume = dense_normal_volume['volume']  # 2 (nx, ny), z, y, x  uint8
+    z_size, y_size, x_size = dense_normal_volume['shape']
+    z_origin = dense_normal_volume['z_origin']
+
+    max_radius = dr_per_winding.detach() * float(outer_winding_idx)
+    theta = torch.rand([num_points], device=device) * (2 * torch.pi)
+    radius = max_radius * torch.sqrt(torch.rand([num_points], device=device))
+    z = torch.empty([num_points], device=device).uniform_(float(z_begin), float(z_end - 1))
+    spiral_zyx = torch.stack([z, torch.sin(theta) * radius, torch.cos(theta) * radius], dim=-1)
+
+    scroll_zyx = slice_to_spiral_transform.inv(spiral_zyx)
+    scroll_zyx_detached = scroll_zyx.detach()
+
+    # Nearest-voxel gather keeps the volume at byte precision on the GPU; decode to floats here.
+    sample_zyx = scroll_zyx_detached.round().long()
+    zi = sample_zyx[:, 0] - z_origin
+    yi = sample_zyx[:, 1]
+    xi = sample_zyx[:, 2]
+    in_bounds = (zi >= 0) & (zi < z_size) & (yi >= 0) & (yi < y_size) & (xi >= 0) & (xi < x_size)
+    zi = zi.clamp(0, z_size - 1)
+    yi = yi.clamp(0, y_size - 1)
+    xi = xi.clamp(0, x_size - 1)
+    nx_u8 = volume[0, zi, yi, xi]
+    ny_u8 = volume[1, zi, yi, xi]
+    weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
+    nx = _decode_uint8_normal_component(nx_u8.float())
+    ny = _decode_uint8_normal_component(ny_u8.float())
+    nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
+    target_normal = F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
+
+    spiral_outward_yx = F.normalize(spiral_zyx[:, 1:], dim=-1)
+    spiral_outward_zyx = torch.cat([torch.zeros_like(spiral_outward_yx[:, :1]), spiral_outward_yx], dim=-1)
+
+    basis_zyx = torch.eye(3, device=device, dtype=scroll_zyx_detached.dtype) * epsilon
+    scroll_plus = (scroll_zyx_detached[None, :, :] + basis_zyx[:, None, :]).reshape(-1, 3)
+    scroll_minus = (scroll_zyx_detached[None, :, :] - basis_zyx[:, None, :]).reshape(-1, 3)
+    spiral_plus, spiral_minus = slice_to_spiral_transform(torch.cat([scroll_plus, scroll_minus], dim=0)).chunk(2, dim=0)
+    spiral_plus = spiral_plus.view(3, num_points, 3)
+    spiral_minus = spiral_minus.view(3, num_points, 3)
+    jacobian_columns = (spiral_plus - spiral_minus) / (2.0 * epsilon)  # scroll basis axis, point, spiral zyx
+    scroll_normal = F.normalize((jacobian_columns * spiral_outward_zyx[None, :, :]).sum(dim=-1).transpose(0, 1), dim=-1)
+
+    residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
+    return (residual * weight).sum() / weight.sum().clamp(min=1)
+
+
 def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
@@ -2918,7 +3022,7 @@ def save_overlay(
         visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, pcl_normal_samples, shell_patch, z_to_umbilicus_yx, out_path):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, pcl_normal_samples, dense_normal_volume, shell_patch, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
@@ -3201,6 +3305,15 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 pcl_normal_samples,
                 cfg['pcl_normals_num_points'],
             ) * cfg['loss_weight_pcl_normals']
+
+        if cfg['loss_weight_dense_normals'] > 0 and dense_normal_volume is not None:
+            losses['dense_normals'] = get_dense_normals_loss(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                dense_normal_volume,
+                shell_outer_winding_idx,
+                cfg['dense_normals_num_points'],
+            ) * cfg['loss_weight_dense_normals']
 
         if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
             unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
@@ -3490,6 +3603,7 @@ def main():
         unattached_pcl_strips,
         scroll_zarr_array,
     )
+    dense_normal_volume = prepare_dense_normal_volume(scroll_zarr_array)
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
     out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch'
@@ -3506,6 +3620,7 @@ def main():
         list(cross_patch_point_collections.values()),
         unattached_pcl_strips,
         pcl_normal_samples,
+        dense_normal_volume,
         shell_patch,
         umbilicus,
         out_path,
