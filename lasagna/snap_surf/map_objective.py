@@ -986,6 +986,28 @@ def _map_init_dense_quad_physical_step_lengths(
 		_map_init_dense_mean_quad_edge_length(model_corners, model_corner_valid),
 	)
 
+def _map_init_active_quad_crop_slices(
+	active_quad: torch.Tensor,
+	cfg: SnapSurfMapInitConfig,
+) -> tuple[slice, slice, slice, slice] | None:
+	if active_quad.numel() == 0:
+		return None
+	active_hw = active_quad.bool().nonzero(as_tuple=False)
+	if int(active_hw.shape[0]) == 0:
+		return None
+	QH, QW = int(active_quad.shape[0]), int(active_quad.shape[1])
+	pad = max(0, int(cfg.dense_reg_radius)) if bool(cfg.dense_opt) else 0
+	h0 = max(0, int(active_hw[:, 0].min().detach().cpu()) - pad)
+	h1 = min(QH - 1, int(active_hw[:, 0].max().detach().cpu()) + pad)
+	w0 = max(0, int(active_hw[:, 1].min().detach().cpu()) - pad)
+	w1 = min(QW - 1, int(active_hw[:, 1].max().detach().cpu()) + pad)
+	return (
+		slice(h0, h1 + 2),
+		slice(w0, w1 + 2),
+		slice(h0, h1 + 1),
+		slice(w0, w1 + 1),
+	)
+
 def _map_init_objective(
 	*,
 	uv_full: torch.Tensor,
@@ -1005,6 +1027,8 @@ def _map_init_objective(
 	uv_prior: torch.Tensor | None = None,
 	allow_partial_model_samples: bool = False,
 	need_stats: bool = True,
+	crop_active_quad: bool = False,
+	active_quad_crop: tuple[slice, slice, slice, slice] | None = None,
 	ext_z_lift_theta: torch.Tensor | None = None,
 	ext_z_lift_valid: torch.Tensor | None = None,
 	model_z_lift_theta: torch.Tensor | None = None,
@@ -1012,6 +1036,29 @@ def _map_init_objective(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
+	active_quad = active_quad.bool()
+	original_quad_shape = tuple(int(v) for v in active_quad.shape)
+	crop = active_quad_crop
+	if crop is None and bool(crop_active_quad):
+		crop = _map_init_active_quad_crop_slices(active_quad, mi)
+	if crop is not None:
+		vh, vw, qh, qw = crop
+		uv_full = uv_full[vh, vw]
+		active_quad = active_quad[qh, qw]
+		if uv_prior is not None:
+			uv_prior = uv_prior[vh, vw]
+		if ext_coords is None:
+			ext_pos = ext_pos[vh, vw]
+			ext_normals = ext_normals[vh, vw]
+			ext_valid = ext_valid[vh, vw]
+			if ext_quad_valid is not None and tuple(ext_quad_valid.shape) == original_quad_shape:
+				ext_quad_valid = ext_quad_valid[qh, qw]
+			if ext_z_lift_theta is not None and tuple(ext_z_lift_theta.shape) == original_quad_shape:
+				ext_z_lift_theta = ext_z_lift_theta[qh, qw]
+			if ext_z_lift_valid is not None and tuple(ext_z_lift_valid.shape) == original_quad_shape:
+				ext_z_lift_valid = ext_z_lift_valid[qh, qw]
+		else:
+			ext_coords = ext_coords[vh, vw]
 	ext_vertex_pos, _ext_vertex_normals, ext_vertex_valid, ext_level_quad_valid = _map_init_level_external_tensors(
 		ext_pos=ext_pos,
 		ext_normals=ext_normals,
@@ -1020,7 +1067,6 @@ def _map_init_objective(
 		ext_coords=ext_coords,
 	)
 	uv_finite = torch.isfinite(uv_full).all(dim=-1)
-	active_quad = active_quad.bool()
 	active_count_t = active_quad.to(dtype=uv_full.dtype).sum() if bool(need_stats) else uv_full.new_zeros(())
 	quad_uv_ok_grid = active_quad & _map_init_quad_corner_all(uv_finite) if bool(need_stats) else None
 	active_bad_count_t = (
@@ -1038,7 +1084,7 @@ def _map_init_objective(
 	sample_quad_ok_grid = torch.zeros_like(active_quad, dtype=torch.bool) if bool(need_stats) else None
 	turn_loss = z
 	turn_sample_count_t = uv_full.new_zeros(())
-	if active_quad.numel() > 0:
+	if active_quad.numel() > 0 and bool(active_quad.any().detach().cpu()):
 		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_dense_quad_sample_tensors(
 			uv_full=uv_full,
 			ext_pos=ext_pos,

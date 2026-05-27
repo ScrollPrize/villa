@@ -1560,6 +1560,27 @@ def _seed_quad_expansion_active_mask(
 	near = dist2 <= int(radius) * int(radius)
 	return active.bool() & near
 
+def _seed_quad_expansion_crop_slices(
+	active: torch.Tensor,
+	seed_ext_quad: tuple[int, int],
+	radius: int,
+	cfg: SnapSurfMapInitConfig,
+) -> tuple[slice, slice, slice, slice]:
+	QH, QW = int(active.shape[0]), int(active.shape[1])
+	seed_h, seed_w = (int(v) for v in seed_ext_quad)
+	pad = max(0, int(cfg.dense_reg_radius)) if bool(cfg.dense_opt) else 0
+	r = max(0, int(radius)) + pad
+	h0 = max(0, seed_h - r)
+	h1 = min(QH - 1, seed_h + r)
+	w0 = max(0, seed_w - r)
+	w1 = min(QW - 1, seed_w + r)
+	return (
+		slice(h0, h1 + 2),
+		slice(w0, w1 + 2),
+		slice(h0, h1 + 1),
+		slice(w0, w1 + 1),
+	)
+
 
 def _objective_for_active_uv(
 	*,
@@ -1568,6 +1589,7 @@ def _objective_for_active_uv(
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
 	need_stats: bool = True,
+	active_quad_crop: tuple[slice, slice, slice, slice] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	sign_i = int(fixture.metadata.get("sign", 1) or 1)
 	z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
@@ -1587,6 +1609,8 @@ def _objective_for_active_uv(
 		cfg=cfg,
 		allow_partial_model_samples=True,
 		need_stats=bool(need_stats),
+		crop_active_quad=True,
+		active_quad_crop=active_quad_crop,
 		ext_z_lift_theta=None if z_lift is None else z_lift["ext_theta_lifted"],
 		ext_z_lift_valid=None if z_lift is None else z_lift["ext_valid"],
 		model_z_lift_theta=None if z_lift is None else z_lift["model_theta_lifted"],
@@ -1639,11 +1663,13 @@ def _affine_seed_quad_expansion_rows(
 	try:
 		for radius in _seed_quad_expansion_radii(active_full, seed_ext_quad):
 			active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius)
+			crop = _seed_quad_expansion_crop_slices(active_full, seed_ext_quad, radius, stage_cfg.map_init)
 			loss, terms = _objective_for_active_uv(
 				uv=uv,
 				active_quad=active,
 				fixture=fixture,
 				cfg=stage_cfg,
+				active_quad_crop=crop,
 			)
 			rows.append(_affine_seed_quad_expansion_row_from_terms(
 				radius=radius,
@@ -1815,7 +1841,13 @@ def _run_affine_seed_quad_expansion_reopt(
 			},
 			active_quad=active,
 		)
-	def eval_row(radius: int, active: torch.Tensor, step_count: int, init_loss: float) -> dict[str, float]:
+	def eval_row(
+		radius: int,
+		active: torch.Tensor,
+		crop: tuple[slice, slice, slice, slice],
+		step_count: int,
+		init_loss: float,
+	) -> dict[str, float]:
 		with torch.no_grad():
 			uv = affine()
 			loss, terms = _objective_for_active_uv(
@@ -1823,6 +1855,7 @@ def _run_affine_seed_quad_expansion_reopt(
 				active_quad=active,
 				fixture=fixture,
 				cfg=stage_cfg,
+				active_quad_crop=crop,
 			)
 			station_raw = loss.new_zeros(())
 			if float(w_station) > 0.0:
@@ -1843,6 +1876,7 @@ def _run_affine_seed_quad_expansion_reopt(
 	def eval_progress(
 		radius: int,
 		active: torch.Tensor,
+		crop: tuple[slice, slice, slice, slice],
 		step_count: int,
 		init_loss: float,
 	) -> tuple[float, dict[str, torch.Tensor], dict[str, float]]:
@@ -1853,6 +1887,7 @@ def _run_affine_seed_quad_expansion_reopt(
 				active_quad=active,
 				fixture=fixture,
 				cfg=stage_cfg,
+				active_quad_crop=crop,
 			)
 			station_raw = loss.new_zeros(())
 			if float(w_station) > 0.0:
@@ -1866,14 +1901,15 @@ def _run_affine_seed_quad_expansion_reopt(
 		if cancel_fn is not None:
 			cancel_fn()
 		active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius)
-		init_row = eval_row(radius, active, 0, 0.0)
+		crop = _seed_quad_expansion_crop_slices(active_full, seed_ext_quad, radius, stage_cfg.map_init)
+		init_row = eval_row(radius, active, crop, 0, 0.0)
 		init_loss = float(init_row["loss"])
 		init_row["init_loss"] = init_loss
 		init_row["loss_gain"] = 0.0
 		rows.append(init_row)
 		write_debug_map(radius, "init", 0, active, init_row)
 		if progress_widths_run is not None:
-			report_loss, report_terms, report_err = eval_progress(radius, active, 0, init_loss)
+			report_loss, report_terms, report_err = eval_progress(radius, active, crop, 0, init_loss)
 			_print_global_progress(
 				row_idx=int(progress_row_idx) + progress_rows,
 				widths=progress_widths_run,
@@ -1901,6 +1937,7 @@ def _run_affine_seed_quad_expansion_reopt(
 				fixture=fixture,
 				cfg=stage_cfg,
 				need_stats=False,
+				active_quad_crop=crop,
 			)
 			if float(w_station) > 0.0:
 				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
@@ -1921,11 +1958,11 @@ def _run_affine_seed_quad_expansion_reopt(
 			)
 			if status_due:
 				step_lr = opt_lr(opt)
-				row = eval_row(radius, active, step1, init_loss)
+				row = eval_row(radius, active, crop, step1, init_loss)
 				row["lr"] = float(step_lr)
 				rows.append(row)
 				if progress_widths_run is not None:
-					report_loss, report_terms, report_err = eval_progress(radius, active, step1, init_loss)
+					report_loss, report_terms, report_err = eval_progress(radius, active, crop, step1, init_loss)
 					_print_global_progress(
 						row_idx=int(progress_row_idx) + progress_rows,
 						widths=progress_widths_run,
@@ -1939,7 +1976,7 @@ def _run_affine_seed_quad_expansion_reopt(
 						err=report_err,
 					)
 					progress_rows += 1
-		final_row = eval_row(radius, active, steps_i, init_loss)
+		final_row = eval_row(radius, active, crop, steps_i, init_loss)
 		final_row["lr"] = opt_lr(opt)
 		write_debug_map(radius, "final", steps_i, active, final_row)
 	return rows, progress_rows
@@ -1958,12 +1995,15 @@ def _write_affine_seed_initial_debug_radius(
 		return
 	radius_i = max(0, int(radius))
 	uv = _affine_uv_field(affine_tensor, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
-	active = _seed_quad_expansion_active_mask(_full_active_quad(fixture), seed_ext_quad, radius_i)
+	active_full = _full_active_quad(fixture)
+	active = _seed_quad_expansion_active_mask(active_full, seed_ext_quad, radius_i)
+	crop = _seed_quad_expansion_crop_slices(active_full, seed_ext_quad, radius_i, stage_cfg.map_init)
 	loss, terms = _objective_for_active_uv(
 		uv=uv,
 		active_quad=active,
 		fixture=fixture,
 		cfg=stage_cfg,
+		active_quad_crop=crop,
 	)
 	row = _affine_seed_quad_expansion_row_from_terms(
 		radius=radius_i,
