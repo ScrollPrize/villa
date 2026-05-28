@@ -115,6 +115,19 @@
 			}
 		},
 		{
+			"name": "map_uv_refine2",
+			"steps": "auto",
+			"lr": 0.01,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20,
+				"z_lift_enabled": false,
+				"w_z_lift": 0.0
+			}
+		},
+		{
 			"name": "snap_light",
 			"steps": 500,
 			"lr": 0.1,
@@ -122,7 +135,7 @@
 			"min_scaledown": 0,
 			"w_fac": {
 				"pred_dt": 0.0,
-				"snap_surf_map": 0.1,
+				"snap_surf_map": 0.01,
 				"station_n": 0.0,
 				"station_t": 0.001
 			},
@@ -161,7 +174,7 @@
 					"map_opt": {
 						"name": "snap_map_opt_final",
 						"steps": 1,
-						"lr": 0.01,
+						"lr": 0.1,
 						"params": ["map_surf_ms"],
 						"min_scaledown": 0,
 						"args": {
