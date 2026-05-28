@@ -1383,7 +1383,9 @@ void SegmentationLasagnaPanel::showLasagnaConfigError(const QString& message,
         _progressLabel->setStyleSheet(QStringLiteral("color: #c0392b;"));
         _progressLabel->setVisible(true);
     }
+#ifndef VC_TEST_DISABLE_LASAGNA_DIALOGS
     QMessageBox::warning(this, tr("Lasagna config error"), message);
+#endif
 }
 
 bool SegmentationLasagnaPanel::validateLasagnaConfigPath(const QString& configPath,
