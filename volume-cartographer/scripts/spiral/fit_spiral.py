@@ -1746,24 +1746,25 @@ def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spi
 
 
 def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
-    # Sample points uniformly over an annulus of the spiral cylinder (inner radius dr_per_winding to
-    # outer radius dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI) and return each
-    # point's orthonormal in-surface frame in spiral space: e1 = z-axis, e2 = the azimuthal tangent
-    # (perpendicular, within the yx plane, to the outward radial direction normalize(spiral_yx)). The
-    # cylinder normal is the radial direction, which we omit. The inner core is excluded because
-    # there is no scroll surface there and the azimuthal tangent is undefined at the cylinder axis.
+    # Sample points from discrete spiral windings embedded in spiral yx (over the z-ROI) and return
+    # each point's orthonormal in-surface frame in spiral space: e1 = z-axis, e2 = the winding tangent.
+    # Winding indices are sampled with probability proportional to their approximate circumference,
+    # which is the simple large-radius approximation to uniform area over the wound surface. The inner
+    # core is excluded because there is no scroll surface there.
     # Returns (spiral_zyx, e1, e2), each (num_points, 3) in zyx.
     device = dr_per_winding.device
-    r_max = dr_per_winding.detach() * float(outer_winding_idx)
-    r_min = dr_per_winding.detach()
+    winding_weights = torch.arange(1, int(outer_winding_idx), device=device, dtype=dr_per_winding.dtype) + 0.5
+    winding_idx = torch.multinomial(winding_weights, num_points, replacement=True).to(dr_per_winding.dtype) + 1.0
     theta = torch.rand([num_points], device=device) * (2 * torch.pi)
-    radius = torch.sqrt(torch.rand([num_points], device=device) * (r_max ** 2 - r_min ** 2) + r_min ** 2)
+    radius = (winding_idx + theta / (2 * torch.pi)) * dr_per_winding.detach()
     z = torch.empty([num_points], device=device).uniform_(float(z_begin), float(z_end - 1))
     spiral_zyx = torch.stack([z, torch.sin(theta) * radius, torch.cos(theta) * radius], dim=-1)
 
-    radial_yx = F.normalize(spiral_zyx[:, 1:], dim=-1)  # (y, x)
-    tangential_yx = torch.stack([radial_yx[:, 1], -radial_yx[:, 0]], dim=-1)
-    e1 = F.pad(torch.zeros_like(radial_yx), (1, 0), value=1.)  # (1, 0, 0) -> z-axis
+    dr_dtheta = dr_per_winding.detach() / (2 * torch.pi)
+    tangent_y = torch.cos(theta) * radius + torch.sin(theta) * dr_dtheta
+    tangent_x = -torch.sin(theta) * radius + torch.cos(theta) * dr_dtheta
+    tangential_yx = F.normalize(torch.stack([tangent_y, tangent_x], dim=-1), dim=-1)
+    e1 = F.pad(torch.zeros_like(tangential_yx), (1, 0), value=1.)  # (1, 0, 0) -> z-axis
     e2 = F.pad(tangential_yx, (1, 0), value=0.)  # (0, ty, tx)
     return spiral_zyx, e1, e2
 
