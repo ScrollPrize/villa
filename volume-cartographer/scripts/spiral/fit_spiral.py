@@ -2859,6 +2859,8 @@ def _build_snapped_overlay(
 def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips, out_path, name='mesh'):
 
     (min_winding_idx, max_winding_idx), _, _ = _compute_winding_range_and_input_extents(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl_strips)
+    if cfg['shell_outer_winding_idx'] is not None:
+        max_winding_idx = min(max_winding_idx, cfg['shell_outer_winding_idx'])
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size'] // downsample_factor  # voxels in downsampled volume
     z_margin = cfg['flow_bounds_z_margin']
@@ -3144,7 +3146,8 @@ def save_overlay(
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
         overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
-        visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
+        if os.environ.get('FIT_SPIRAL_SAVE_DISPLACEMENT') == '1':
+            visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
 def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, pcl_normal_samples, dense_normal_volume, shell_patch, z_to_umbilicus_yx, out_path):
@@ -3352,7 +3355,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
             satisfied_quads_flat.to(torch.int64),
         )
-        if os.environ.get('FIT_SPIRAL_SKIP_FITTED_OVERLAY') != '1':
+        if os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
             winding_range, patch_extents, pcl_extents = _compute_winding_range_and_input_extents(
                 slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             )
@@ -3372,6 +3375,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 winding_range,
                 out_path, suffix
             )
+        if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
             save_mesh(slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips, out_path, name=suffix)
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
@@ -3507,8 +3511,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             })
 
     suffix = 'fitted'
-    save_overlay_and_print_satisfaction(suffix)
     save_model(suffix)
+    save_overlay_and_print_satisfaction(suffix)
 
 
 def load_patches(patches_path, segment_id_filter=lambda s: True):
