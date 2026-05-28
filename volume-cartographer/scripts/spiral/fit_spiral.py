@@ -29,21 +29,21 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
 # PHercParis4
-volpkg_path = '/home/paul/projects/vesuvius-scrolls/volpkgs/s1_ds2.volpkg'
+dataset_path = '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-05-28'
 scroll_zarr_path = None
 normal_nx_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NX_ZARR_PATH')
 normal_ny_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NY_ZARR_PATH')
 normal_zarr_group = os.environ.get('FIT_SPIRAL_NORMAL_ZARR_GROUP', '4')
 pcl_json_paths = [
-    '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-05-26/s1_relative_windings_fixed.json',
-    '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-05-26/same_winding_annotations_fixed_merged.json',
+    f'{dataset_path}/s1_relative_windings_fixed.json',
+    f'{dataset_path}/same_winding_annotations_fixed_merged.json',
 ]
+patches_path = f'{dataset_path}/patches'
+shell_path = f'{dataset_path}/s1_outer_shell'
 spiral_outward_sense = 'CW'  # CW | ACW
-umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{volpkg_path}/umbilicus.json', downsample_factor=f)
+umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
 z_begin, z_end = 6000, 16000
-patches_path = '/home/paul/projects/vesuvius-scrolls/spiral/custom_patches'
-shell_path = os.environ.get('FIT_SPIRAL_SHELL_PATH')
 voxel_size_um = 2.4 * 4  # before downsampling
 
 # # PHerc0172
@@ -748,7 +748,7 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
     def _call(self, input_zyx):
         theta, original_radius, inner_winding, _ = get_bounding_windings(input_zyx[..., 1:], self.dr_per_winding)
         transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
-        inner_winding_clipped = inner_winding.to(torch.int64).clip(max=transformed_winding_radii.shape[-1] - 2)
+        inner_winding_clipped = inner_winding.to(torch.int64).clip(min=0, max=transformed_winding_radii.shape[-1] - 2)
         transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
         transformed_outer_radius = torch.gather(transformed_winding_radii, dim=-1, index=(inner_winding_clipped + 1)[..., None]).squeeze(-1)
         original_inner_radius = (inner_winding_clipped + theta / (2 * torch.pi)) * self.dr_per_winding
