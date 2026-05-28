@@ -40,6 +40,7 @@ from snap_surf.map_global import (
 	_run_affine_seed_quad_expansion_reopt,
 	_select_affine_seed_grid_candidate,
 	_seed_quad_affine_init_result,
+	_stage_objective_level,
 	_stage_loss_cfg,
 	_stage_station_weight,
 	_write_map_objs,
@@ -232,6 +233,103 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 		self.assertEqual(stages[0].global_opt.kind, "model")
 		self.assertEqual(stages[1].global_opt.kind, "map")
+
+	def test_map_objective_can_use_min_scaledown_sampling_grid(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=9, w=9)
+			fixture = load_map_fixture(tmp)
+			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+			affine = AffineMapModel(
+				ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+				device=torch.device("cpu"),
+				dtype=torch.float32,
+			)
+			full_uv = affine()
+			global_model = GlobalMapModel(full_uv.detach(), levels=4, factor=2)
+
+			_loss0, terms0 = _objective_for_uv(
+				uv=global_model(active_level=0),
+				fixture=fixture,
+				cfg=cfg,
+				level=0,
+				z_lift=None,
+			)
+			_loss3, terms3 = _objective_for_uv(
+				uv=global_model(active_level=3),
+				fixture=fixture,
+				cfg=cfg,
+				level=3,
+				z_lift=None,
+			)
+
+			self.assertEqual(int(terms0["sample_total"].detach().cpu()), 8 * 8 * 4)
+			self.assertEqual(int(terms3["sample_total"].detach().cpu()), 1 * 1 * 4)
+
+	def test_map_objective_sampling_defaults_to_full_resolution(self) -> None:
+		ext_shape = (9, 9)
+		stage = GlobalMapStageConfig(params=("map_uv_ms",), min_scaledown=3)
+		coarse = GlobalMapStageConfig(
+			params=("map_uv_ms",),
+			min_scaledown=3,
+			args={"use_min_scaledown_sampling": True},
+		)
+		explicit = GlobalMapStageConfig(
+			params=("map_uv_ms",),
+			min_scaledown=3,
+			args={"objective_min_scaledown": 2},
+		)
+
+		self.assertEqual(_stage_objective_level(stage, 3, ext_shape), 0)
+		self.assertEqual(_stage_objective_level(coarse, 3, ext_shape), 3)
+		self.assertEqual(_stage_objective_level(explicit, 3, ext_shape), 2)
+
+	def test_runtime_map_init_keeps_z_lift_unless_disabled(self) -> None:
+		h, w = 5, 5
+		angles = torch.linspace(0.0, math.pi, w)
+		ext_normals = torch.zeros(h, w, 3)
+		ext_normals[..., 0] = torch.cos(angles).view(1, w)
+		ext_normals[..., 1] = torch.sin(angles).view(1, w)
+		model_normals = torch.zeros(1, h, w, 3)
+		model_normals[..., 0] = 1.0
+		base = {
+			"map_init": {
+				"subdiv": 1,
+				"w_dist": 0.0,
+				"w_vec_normal": 0.0,
+				"w_surface_normal": 0.0,
+				"w_z_lift": 1.0,
+				"w_smooth": 0.0,
+				"w_bend": 0.0,
+				"w_jac": 0.0,
+				"w_metric_smooth": 0.0,
+				"w_area_smooth": 0.0,
+				"max_sample_angle_deg": 180.0,
+				"max_step_neighbor_ratio": 0.0,
+			},
+		}
+		common = dict(
+			model_xyz=_plane_xyz(h=h, w=w, z=0.0).unsqueeze(0),
+			model_normals=model_normals,
+			model_valid=torch.ones(1, h, w, dtype=torch.bool),
+			ext_xyz=_plane_xyz(h=h, w=w, z=0.0),
+			ext_valid=torch.ones(h, w, dtype=torch.bool),
+			ext_normals=ext_normals,
+			ext_quad_valid=torch.ones(h - 1, w - 1, dtype=torch.bool),
+		)
+		stage = GlobalMapStageConfig(steps=0, lr=0.01, params=("affine",), args={"startup_timing": False})
+		runtime = GlobalMapRuntime(base=base, seed_xyz=(0.5, 0.5, 0.0))
+		stats = runtime.run_stage(stage=stage, **common)
+
+		disabled = GlobalMapRuntime(base=base, seed_xyz=(0.5, 0.5, 0.0))
+		disabled_stats = disabled.run_stage(
+			stage=GlobalMapStageConfig(steps=0, lr=0.01, params=("affine",), args={"startup_timing": False, "disable_z_lift": True}),
+			**common,
+		)
+
+		self.assertGreater(stats["snaps_map_turn"], 0.0)
+		self.assertGreater(stats["snaps_map_turn_smp"], 0.0)
+		self.assertEqual(disabled_stats["snaps_map_turn"], 0.0)
+		self.assertEqual(disabled_stats["snaps_map_turn_smp"], 0.0)
 
 	def test_snap_loss_zero_offset_preserves_voxel_residual(self) -> None:
 		loss, stats, out = self._snap_loss_case(offset=0.0, model_z=2.0, grad_mag=0.5)
@@ -602,7 +700,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertNotIn("snaps_map_avg", stats)
 			self.assertNotIn("snaps_map_max", stats)
 
-	def test_live_runtime_disables_z_lift_by_default(self) -> None:
+	def test_live_runtime_disables_z_lift_when_requested(self) -> None:
 		runtime = GlobalMapRuntime(base={}, seed_xyz=(2.0, 2.0, 0.0))
 		h, w = 5, 5
 		model_xyz = _plane_xyz(h=h + 2, w=w + 2, z=0.0).unsqueeze(0)
@@ -618,7 +716,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				steps=0,
 				lr=0.0,
 				params=("affine",),
-				args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "w_z_lift": 1.0},
+				args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "w_z_lift": 1.0, "disable_z_lift": True},
 			),
 			model_xyz=model_xyz,
 			model_normals=model_normals,

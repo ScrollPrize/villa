@@ -22,7 +22,7 @@ _h_frac: list[float] = []           # tracked h position per winding
 _w_frac: list[float] = []           # tracked w position per winding
 _printed_initial: bool = False
 
-_STATION_N_LOCAL_RADIUS_IDX = 8.0
+_STATION_N_LOCAL_SIGMA_IDX = 20.0
 _STATION_N_OUTSIDE_WEIGHT = 0.1
 
 
@@ -88,9 +88,8 @@ def _station_normal_weights(
     h = torch.arange(Hm, device=device, dtype=dtype).view(Hm, 1)
     w = torch.arange(Wm, device=device, dtype=dtype).view(1, Wm)
     dist_idx = torch.sqrt((h - float(h_center)).square() + (w - float(w_center)).square())
-    radius = max(1.0e-6, float(_STATION_N_LOCAL_RADIUS_IDX))
-    t = (1.0 - dist_idx / radius).clamp(min=0.0, max=1.0)
-    falloff = t * t * (3.0 - 2.0 * t)
+    sigma = max(1.0e-6, float(_STATION_N_LOCAL_SIGMA_IDX))
+    falloff = torch.exp(-0.5 * (dist_idx / sigma).square())
     weights = float(_STATION_N_OUTSIDE_WEIGHT) + (1.0 - float(_STATION_N_OUTSIDE_WEIGHT)) * falloff
     return weights.view(1, Hm, Wm).expand(D, Hm, Wm)
 

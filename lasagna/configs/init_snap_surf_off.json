@@ -133,7 +133,8 @@
 			"w_fac": {
 				"pred_dt": 0.0,
 				"snap_surf_map": 1.0,
-				"station_n": 0.0
+				"station_n": 0.0,
+				"station_t": 0.001
 			},
 			"args": {
 				"status_interval": 50,

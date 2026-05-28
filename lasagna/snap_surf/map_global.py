@@ -404,6 +404,7 @@ class AffineMapModel(torch.nn.Module):
 	) -> None:
 		super().__init__()
 		H, W = int(ext_shape[0]), int(ext_shape[1])
+		self.ext_shape = (H, W)
 		hh = torch.arange(H, device=device, dtype=dtype).view(H, 1).expand(H, W)
 		ww = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
 		self.register_buffer("ext_hw", torch.stack([hh, ww], dim=-1).contiguous())
@@ -3235,6 +3236,36 @@ def _station_loss(uv: torch.Tensor, seed_ext_hw: torch.Tensor, target_uv: torch.
 	return (value - target_uv).square().mean()
 
 
+def _level_seed_hw(seed_ext_hw: torch.Tensor, level: int) -> torch.Tensor:
+	stride = float(1 << max(0, int(level)))
+	return seed_ext_hw / stride
+
+
+def _affine_uv_for_level(affine: AffineMapModel, ext_shape: tuple[int, int], level: int) -> torch.Tensor:
+	level_i = max(0, int(level))
+	if level_i == 0:
+		return affine()
+	coords = _level_coords(ext_shape, level_i, affine.affine)
+	return affine.eval_at(coords)
+
+
+def _stage_objective_level(stage: GlobalMapStageConfig, train_level: int, ext_shape: tuple[int, int]) -> int:
+	args = stage.args if isinstance(stage.args, dict) else {}
+	if "objective_min_scaledown" in args:
+		level = max(0, int(args["objective_min_scaledown"]))
+	elif "sample_min_scaledown" in args:
+		level = max(0, int(args["sample_min_scaledown"]))
+	elif (
+		_truthy_arg(args.get("use_min_scaledown_sampling", False)) or
+		_truthy_arg(args.get("sample_at_min_scaledown", False)) or
+		_truthy_arg(args.get("coarse_sampling", False))
+	):
+		level = max(0, int(train_level))
+	else:
+		level = 0
+	return min(level, _max_supported_level(ext_shape, level))
+
+
 def _objective_for_uv(
 	*,
 	uv: torch.Tensor,
@@ -3251,6 +3282,8 @@ def _objective_for_uv(
 	if z_lift is _NO_Z_LIFT:
 		z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
 	z_lift_d = None if z_lift is _NO_Z_LIFT else z_lift
+	ext_z_lift_theta = None if z_lift_d is None else z_lift_d["ext_theta_lifted"]
+	ext_z_lift_valid = None if z_lift_d is None else z_lift_d["ext_valid"]
 	return _map_init_objective(
 		uv_full=uv,
 		active_quad=active,
@@ -3267,8 +3300,8 @@ def _objective_for_uv(
 		cfg=cfg,
 		allow_partial_model_samples=True,
 		need_stats=bool(need_stats),
-		ext_z_lift_theta=None if z_lift_d is None else z_lift_d["ext_theta_lifted"],
-		ext_z_lift_valid=None if z_lift_d is None else z_lift_d["ext_valid"],
+		ext_z_lift_theta=ext_z_lift_theta,
+		ext_z_lift_valid=ext_z_lift_valid,
 		model_z_lift_theta=None if z_lift_d is None else z_lift_d["model_theta_lifted"],
 		model_z_lift_valid=None if z_lift_d is None else z_lift_d["model_valid"],
 	)
@@ -3291,7 +3324,36 @@ def _uv_model_positions(
 
 def _fixture_mapping_error(uv: torch.Tensor, fixture: MapFixture) -> dict[str, float]:
 	pos, valid = _uv_model_positions(uv, fixture)
-	ref_pos, ref_valid = _uv_model_positions(fixture.reference_uv.to(device=uv.device, dtype=uv.dtype), fixture)
+	if tuple(fixture.reference_uv.shape[:2]) == tuple(uv.shape[:2]):
+		reference_uv = fixture.reference_uv.to(device=uv.device, dtype=uv.dtype)
+	else:
+		level = 0
+		for candidate in range(1, 32):
+			try:
+				if _map_init_dyadic_level_shape(
+					int(fixture.reference_uv.shape[0]),
+					int(fixture.reference_uv.shape[1]),
+					candidate,
+				) == tuple(int(v) for v in uv.shape[:2]):
+					level = candidate
+					break
+			except ValueError:
+				break
+		if level > 0:
+			coords = _level_coords(tuple(int(v) for v in fixture.reference_uv.shape[:2]), level, uv)
+			reference_uv = _sample_surface_grid(
+				fixture.reference_uv.to(device=uv.device, dtype=uv.dtype),
+				coords,
+			)
+		else:
+			reference_uv = fixture.reference_uv.to(device=uv.device, dtype=uv.dtype)
+	ref_pos, ref_valid = _uv_model_positions(reference_uv, fixture)
+	if tuple(valid.shape) != tuple(ref_valid.shape):
+		return {
+			"avg_model_quad_distance": 0.0,
+			"max_model_quad_distance": 0.0,
+			"mapping_error_samples": 0.0,
+		}
 	common = valid & ref_valid
 	if not bool(common.any().detach().cpu()):
 		return {
@@ -3559,6 +3621,7 @@ def _global_progress_state(
 	uv: torch.Tensor,
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
+	level: int = 0,
 	seed_hw: torch.Tensor,
 	station_target: torch.Tensor,
 	w_station: float,
@@ -3569,13 +3632,13 @@ def _global_progress_state(
 		uv=uv,
 		fixture=fixture,
 		cfg=cfg,
-		level=0,
+		level=int(level),
 		z_lift=z_lift,
 		active_quad=active_quad,
 	)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
-		station_raw = _station_loss(uv, seed_hw, station_target)
+		station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(level)), station_target)
 		loss = loss + float(w_station) * station_raw
 	progress_terms = dict(terms)
 	progress_terms["station"] = station_raw.detach()
@@ -3711,12 +3774,12 @@ class GlobalMapRuntime:
 			self.station_target = self.affine.eval_at(seed_hw).detach()
 			self.global_model = GlobalMapModel(self.affine().detach(), levels=levels, factor=2)
 
-	def _uv(self) -> torch.Tensor:
+	def _uv(self, *, active_level: int = 0) -> torch.Tensor:
 		if self.global_model is not None:
-			return self.global_model(active_level=0)
+			return self.global_model(active_level=int(active_level))
 		if self.affine is None:
 			raise RuntimeError("global map runtime is not initialized")
-		return self.affine()
+		return _affine_uv_for_level(self.affine, tuple(int(v) for v in self.affine.ext_shape), int(active_level))
 
 	def _params_for_stage(self, stage: GlobalMapStageConfig) -> tuple[list[torch.nn.Parameter], int]:
 		params: list[torch.nn.Parameter] = []
@@ -3786,10 +3849,12 @@ class GlobalMapRuntime:
 		startup_health_s = time.perf_counter() - _t_startup
 		cache_stats["health_ms"] = float(cache_stats.get("health_ms", 0.0)) + 1000.0 * float(startup_health_s)
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
-		stage_cfg = replace(
-			stage_cfg,
-			map_init=replace(stage_cfg.map_init, z_lift_enabled=False, w_z_lift=0.0),
-		)
+		disable_z_lift = _truthy_arg(stage.args.get("disable_z_lift", stage.args.get("disable_turn", False)))
+		if disable_z_lift:
+			stage_cfg = replace(
+				stage_cfg,
+				map_init=replace(stage_cfg.map_init, z_lift_enabled=False, w_z_lift=0.0),
+			)
 		self._ensure_models(fixture, base_cfg, stage)
 		assert self.affine is not None
 		seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
@@ -3841,9 +3906,17 @@ class GlobalMapRuntime:
 				self.sign = int(seed_result.sign)
 		fixture.metadata["sign"] = int(self.sign)
 		_t_startup = time.perf_counter()
-		stage_z_lift = None
+		stage_z_lift = None if disable_z_lift else self._z_lift_for_stage(
+			fixture,
+			stage_cfg,
+			external_surface_index=int(external_surface_index),
+			mesh_epoch=int(mesh_epoch),
+			cache_stats=cache_stats,
+		)
 		startup_z_lift_s = time.perf_counter() - _t_startup
-		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+		params, train_level = self._params_for_stage(stage)
+		sample_level = _stage_objective_level(stage, train_level, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
+		stage_active_quad = _level_active_quad(_full_active_quad(fixture), int(sample_level))
 		startup_initial_eval_s = 0.0
 		startup_timing_printed = False
 		def _maybe_print_startup_timing() -> None:
@@ -3927,9 +4000,10 @@ class GlobalMapRuntime:
 		def _stats_for_current_uv() -> dict[str, float]:
 			with torch.no_grad():
 				loss_f, terms, err = _global_progress_state(
-					uv=self._uv(),
+					uv=self._uv(active_level=int(sample_level)),
 					fixture=fixture,
 					cfg=stage_cfg,
+					level=int(sample_level),
 					seed_hw=seed_hw,
 					station_target=station_target,
 					w_station=w_station,
@@ -3938,7 +4012,6 @@ class GlobalMapRuntime:
 				)
 			return _stats_from_eval(loss_f, terms, err)
 
-		params, level = self._params_for_stage(stage)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
 		lr_warmup_steps = _lr_warmup_steps(stage.args)
 		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
@@ -3948,7 +4021,7 @@ class GlobalMapRuntime:
 		lr_autoscale: _LrAutoscaleState | None = None
 		opt: torch.optim.Optimizer | None = None
 		if params and int(stage.steps) > 0:
-			key = (tuple(stage.params), int(level), float(stage.lr), int(stage.min_scaledown))
+			key = (tuple(stage.params), int(train_level), int(sample_level), float(stage.lr), int(stage.min_scaledown))
 			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
 				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
 				_capture_optimizer_target_lrs(self.optimizer)
@@ -3970,7 +4043,7 @@ class GlobalMapRuntime:
 				if cancel_fn is not None:
 					cancel_fn()
 				opt.zero_grad(set_to_none=True)
-				uv = self._uv()
+				uv = self._uv(active_level=int(sample_level))
 				step1 = _ + 1
 				status_due = (
 					status_fn is not None and (
@@ -3984,13 +4057,13 @@ class GlobalMapRuntime:
 					uv=uv,
 					fixture=fixture,
 					cfg=stage_cfg,
-					level=0,
+					level=int(sample_level),
 					z_lift=stage_z_lift,
 					need_stats=status_due,
 					active_quad=stage_active_quad,
 				)
 				if w_station > 0.0:
-					station_raw = _station_loss(uv, seed_hw, station_target)
+					station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target)
 					loss = loss + w_station * station_raw
 				else:
 					station_raw = loss.new_zeros(())
@@ -4053,7 +4126,7 @@ class GlobalMapRuntime:
 			label = stage.name or _stage_param_label(stage.params, fallback="map_stage")
 			_write_map_objs(
 				debug_root / f"map_global_{_debug_obj_safe_label(label)}",
-				uv=self._uv().detach(),
+				uv=self._uv(active_level=0).detach(),
 				fixture=fixture,
 				meta={
 					"name": label,
@@ -4386,7 +4459,8 @@ def optimize_fixture(
 			model_cache=fixture_z_lift_model_cache,
 			cache_stats=stage_cache_stats,
 		)
-		stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+		sample_level = _stage_objective_level(stage, level, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
+		stage_active_quad = _level_active_quad(_full_active_quad(fixture), int(sample_level))
 		opt = torch.optim.Adam(params, lr=float(stage.lr))
 		_capture_optimizer_target_lrs(opt)
 		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
@@ -4396,13 +4470,14 @@ def optimize_fixture(
 		last_status_step = 0
 		with torch.no_grad():
 			if "map_uv_ms" in stage.params and global_model is not None:
-				uv_report = global_model(active_level=0)
+				uv_report = global_model(active_level=int(sample_level))
 			else:
-				uv_report = affine()
+				uv_report = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
 			report_loss, report_terms, report_err = _global_progress_state(
 				uv=uv_report,
 				fixture=fixture,
 				cfg=stage_cfg,
+				level=int(sample_level),
 				seed_hw=seed_hw,
 				station_target=station_target,
 				w_station=w_station,
@@ -4425,21 +4500,21 @@ def optimize_fixture(
 		for step in range(int(stage.steps)):
 			opt.zero_grad(set_to_none=True)
 			if "map_uv_ms" in stage.params and global_model is not None:
-				uv = global_model(active_level=0)
+				uv = global_model(active_level=int(sample_level))
 			else:
-				uv = affine()
+				uv = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
 			loss, _terms = _objective_for_uv(
 				uv=uv,
 				fixture=fixture,
 				cfg=stage_cfg,
-				level=0,
+				level=int(sample_level),
 				z_lift=stage_z_lift,
 				need_stats=False,
 				active_quad=stage_active_quad,
 			)
 			station_raw = loss.new_zeros(())
 			if w_station > 0.0:
-				station_raw = _station_loss(uv, seed_hw, station_target)
+				station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target)
 				loss = loss + w_station * station_raw
 			loss.backward()
 			_apply_optimizer_lr_schedule(
@@ -4452,9 +4527,9 @@ def optimize_fixture(
 			opt.step()
 			with torch.no_grad():
 				if "map_uv_ms" in stage.params and global_model is not None:
-					uv_after = global_model(active_level=0)
+					uv_after = global_model(active_level=int(sample_level))
 				else:
-					uv_after = affine()
+					uv_after = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
 			step1 = step + 1
 			status_due = (
 				step == 0 or
@@ -4466,6 +4541,7 @@ def optimize_fixture(
 					uv=uv_after,
 					fixture=fixture,
 					cfg=stage_cfg,
+					level=int(sample_level),
 					seed_hw=seed_hw,
 					station_target=station_target,
 					w_station=w_station,
@@ -4496,6 +4572,7 @@ def optimize_fixture(
 						uv=uv_after,
 						fixture=fixture,
 						cfg=stage_cfg,
+						level=int(sample_level),
 						seed_hw=seed_hw,
 						station_target=station_target,
 						w_station=w_station,

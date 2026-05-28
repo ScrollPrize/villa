@@ -264,8 +264,10 @@ def _map_init_z_lift_turn_values(
 	active_quad: torch.Tensor,
 	ext_theta_lifted: torch.Tensor | None,
 	ext_valid: torch.Tensor | None,
-	model_theta_lifted: torch.Tensor | None,
-	model_valid: torch.Tensor | None,
+	ext_theta_samples: torch.Tensor | None = None,
+	ext_sample_valid: torch.Tensor | None = None,
+	model_theta_lifted: torch.Tensor | None = None,
+	model_valid: torch.Tensor | None = None,
 	coords3: torch.Tensor,
 	cfg: SnapSurfMapInitConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -277,12 +279,17 @@ def _map_init_z_lift_turn_values(
 		or model_valid is None
 	):
 		return coords3.new_zeros(coords3.shape[:-1]), torch.zeros(coords3.shape[:-1], device=coords3.device, dtype=torch.bool)
-	ext_theta = ext_theta_lifted.to(device=coords3.device, dtype=coords3.dtype).unsqueeze(-1).expand(coords3.shape[:-1])
-	ext_ok = (
-		active_quad.to(device=coords3.device).bool().unsqueeze(-1).expand(coords3.shape[:-1]) &
-		ext_valid.to(device=coords3.device).bool().unsqueeze(-1).expand(coords3.shape[:-1]) &
-		torch.isfinite(ext_theta)
-	)
+	active_sample = active_quad.to(device=coords3.device).bool().unsqueeze(-1).expand(coords3.shape[:-1])
+	if ext_theta_samples is not None and ext_sample_valid is not None:
+		ext_theta = ext_theta_samples.to(device=coords3.device, dtype=coords3.dtype)
+		ext_ok = active_sample & ext_sample_valid.to(device=coords3.device).bool() & torch.isfinite(ext_theta)
+	else:
+		ext_theta = ext_theta_lifted.to(device=coords3.device, dtype=coords3.dtype).unsqueeze(-1).expand(coords3.shape[:-1])
+		ext_ok = (
+			active_sample &
+			ext_valid.to(device=coords3.device).bool().unsqueeze(-1).expand(coords3.shape[:-1]) &
+			torch.isfinite(ext_theta)
+		)
 	ext_theta = torch.where(ext_ok, ext_theta, torch.zeros_like(ext_theta))
 	model_theta, model_ok = _map_init_sample_scalar_quad_field(
 		model_theta_lifted.to(device=coords3.device, dtype=coords3.dtype),
@@ -298,6 +305,31 @@ def _map_init_z_lift_turn_values(
 	residual = torch.where(valid, ext_theta - model_theta, torch.zeros_like(model_theta))
 	values = _huber(residual, delta=float(cfg.z_lift_huber_delta))
 	return values, valid & torch.isfinite(values)
+
+
+def _map_init_sample_external_quad_scalar_field(
+	field: torch.Tensor,
+	valid: torch.Tensor,
+	coords2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	if coords2.numel() == 0:
+		return coords2.new_zeros(coords2.shape[:-1]), torch.zeros(coords2.shape[:-1], device=coords2.device, dtype=torch.bool)
+	QH, QW = int(field.shape[0]), int(field.shape[1])
+	if QH <= 0 or QW <= 0:
+		return coords2.new_zeros(coords2.shape[:-1]), torch.zeros(coords2.shape[:-1], device=coords2.device, dtype=torch.bool)
+	field_f = field.to(device=coords2.device, dtype=coords2.dtype)
+	valid_f = valid.to(device=coords2.device).bool()
+	flat = coords2.reshape(-1, 2)
+	finite = torch.isfinite(flat).all(dim=-1)
+	safe = torch.where(torch.isfinite(flat), flat, torch.zeros_like(flat))
+	h = safe[:, 0]
+	w = safe[:, 1]
+	in_bounds = finite & (h >= 0.0) & (h < float(QH)) & (w >= 0.0) & (w < float(QW))
+	h0 = torch.floor(h.clamp(0.0, float(max(0, QH - 1)))).long()
+	w0 = torch.floor(w.clamp(0.0, float(max(0, QW - 1)))).long()
+	out = field_f[h0, w0]
+	ok = in_bounds & valid_f[h0, w0] & torch.isfinite(out)
+	return out.reshape(coords2.shape[:-1]), ok.reshape(coords2.shape[:-1])
 
 def _map_init_distance_multiplier(
 	c_ext: torch.Tensor,
@@ -1167,10 +1199,22 @@ def _map_init_objective(
 		dist_values = _huber(d, delta=cfg.huber_delta) * dist_mult
 		vec_values = (1.0 - c_ext) + (1.0 - c_model)
 		norm_values = 1.0 - c_norm
+		ext_theta_samples = None
+		ext_theta_sample_valid = None
+		if ext_coords is not None and ext_z_lift_theta is not None and ext_z_lift_valid is not None:
+			offsets = _map_init_quad_offsets(subdiv=int(mi.subdiv), device=uv_full.device, dtype=uv_full.dtype)
+			sample_ext_coords = _map_init_dense_bilerp_quad(ext_coords, offsets.to(dtype=ext_coords.dtype))
+			ext_theta_samples, ext_theta_sample_valid = _map_init_sample_external_quad_scalar_field(
+				ext_z_lift_theta,
+				ext_z_lift_valid,
+				sample_ext_coords,
+			)
 		turn_values, turn_valid = _map_init_z_lift_turn_values(
 			active_quad=active_quad,
 			ext_theta_lifted=ext_z_lift_theta,
 			ext_valid=ext_z_lift_valid,
+			ext_theta_samples=ext_theta_samples,
+			ext_sample_valid=ext_theta_sample_valid,
 			model_theta_lifted=model_z_lift_theta,
 			model_valid=model_z_lift_valid,
 			coords3=safe_coords,

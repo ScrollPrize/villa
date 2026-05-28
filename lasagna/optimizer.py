@@ -2293,7 +2293,23 @@ def optimize(
 				print_progress_legend(prefix="[optimizer]", items=items)
 			def _fmt_val(k: str, v: float) -> str:
 				return format_progress_value(v)
-			tv_keys = sorted(tv.keys(), key=_sort_key)
+			verbose_map_status = bool((stage_args or {}).get("verbose_map_status", (stage_args or {}).get("debug_map_status", False)))
+			visible_map_status_keys = {
+				"snaps_map_snap",
+				"snaps_map_snap_abs",
+				"snaps_map_snap_max",
+				"snaps_map_snap_samples",
+				"snaps_map_loss",
+				"snaps_map_dist",
+				"snaps_map_vec",
+				"snaps_map_norm",
+				"snaps_map_samples",
+			}
+			def _show_status_key(k: str) -> bool:
+				if not str(k).startswith("snaps_map_"):
+					return True
+				return verbose_map_status or k in visible_map_status_keys
+			tv_keys = sorted((k for k in tv.keys() if _show_status_key(k)), key=_sort_key)
 			pv_keys = sorted(pv.keys())
 			cols = tv_keys + [f"p:{k}" for k in pv_keys]
 			values = {k: _fmt_val(k, tv[k]) for k in tv_keys}
@@ -3294,7 +3310,7 @@ def optimize(
 					params=snap_surf_map_opt_stage.params,
 					min_scaledown=snap_surf_map_opt_stage.min_scaledown,
 					w_fac=snap_surf_map_opt_stage.w_fac,
-					args=dict(snap_surf_map_opt_stage.args),
+					args={**dict(snap_surf_map_opt_stage.args), "disable_z_lift": True},
 				)
 				map_initial_stats = _run_snap_global_map_stage(
 					stage=map_initial_stage,
@@ -3450,6 +3466,7 @@ def optimize(
 					res_map_after = model(data, needs=_map_forward_needs)
 				map_args = dict(snap_surf_map_opt_stage.args)
 				map_args["startup_timing"] = False
+				map_args["disable_z_lift"] = True
 				if step + 1 != max_steps:
 					map_args.pop("debug_obj_dir", None)
 				map_stage_for_step = snap_surf_map_global.GlobalMapStageConfig(

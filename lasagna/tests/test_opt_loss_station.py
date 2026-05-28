@@ -184,7 +184,7 @@ class StationLossHuberTest(unittest.TestCase):
 		self.assertGreater(float(right_edge_grad[0]), 1.0e-4)
 		self.assertGreater(float(right_edge_grad[2]), 1.0e-4)
 
-	def test_normal_loss_smoothly_falls_to_tenth_weight(self) -> None:
+	def test_normal_loss_uses_wide_gaussian_weight_falloff(self) -> None:
 		H = W = 21
 		x = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W) * 10.0
 		y = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W) * 10.0
@@ -203,8 +203,8 @@ class StationLossHuberTest(unittest.TestCase):
 		mid_grad = abs(float(xyz.grad[0, 10, 14, 2]))
 		far_grad = abs(float(xyz.grad[0, 0, 0, 2]))
 		self.assertGreater(center_grad, 1.0e-6)
-		self.assertAlmostEqual(mid_grad / center_grad, 0.55, delta=1.0e-5)
-		self.assertAlmostEqual(far_grad / center_grad, 0.1, delta=1.0e-5)
+		self.assertGreater(mid_grad / center_grad, 0.95)
+		self.assertLess(far_grad / center_grad, mid_grad / center_grad)
 
 	def test_tangent_loss_is_vector_huber_after_mesh_step_normalization(self) -> None:
 		x = torch.arange(3, dtype=torch.float32).view(1, 3).expand(3, 3) * 10.0
