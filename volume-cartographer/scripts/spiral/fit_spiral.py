@@ -100,6 +100,7 @@ default_config = {
     'pcl_normals_sample_radius': 1,
     'dense_normals_num_points': 20_000,
     'regularisation_num_points': 1500,
+    'patch_stretch_loss_norm': 'L2',
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
@@ -1845,9 +1846,10 @@ def get_dense_normals_loss(slice_to_spiral_transform, dr_per_winding, dense_norm
     z_size, y_size, x_size = dense_normal_volume['shape']
     z_origin = dense_normal_volume['z_origin']
 
-    max_radius = dr_per_winding.detach() * float(outer_winding_idx)
+    r_max = dr_per_winding.detach() * float(outer_winding_idx)
+    r_min = dr_per_winding.detach()
     theta = torch.rand([num_points], device=device) * (2 * torch.pi)
-    radius = max_radius * torch.sqrt(torch.rand([num_points], device=device))
+    radius = torch.sqrt(torch.rand([num_points], device=device) * (r_max ** 2 - r_min ** 2) + r_min ** 2)
     z = torch.empty([num_points], device=device).uniform_(float(z_begin), float(z_end - 1))
     spiral_zyx = torch.stack([z, torch.sin(theta) * radius, torch.cos(theta) * radius], dim=-1)
 
@@ -1993,10 +1995,14 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
     combined_spiral = slice_to_spiral_transform(combined_scroll)
     spiral_zyx, spiral_shift_i, spiral_shift_j = combined_spiral.chunk(3, dim=0)
 
-    stretch_residual = 0.5 * (
-        (torch.linalg.norm(spiral_shift_i - spiral_zyx, dim=-1) - epsilon).abs() +
-        (torch.linalg.norm(spiral_shift_j - spiral_zyx, dim=-1) - epsilon).abs()
-    )
+    stretch_i = torch.linalg.norm(spiral_shift_i - spiral_zyx, dim=-1) - epsilon
+    stretch_j = torch.linalg.norm(spiral_shift_j - spiral_zyx, dim=-1) - epsilon
+    if cfg['patch_stretch_loss_norm'] == 'L2':
+        stretch_residual = 0.5 * (stretch_i ** 2 + stretch_j ** 2)
+    elif cfg['patch_stretch_loss_norm'] == 'L1':
+        stretch_residual = 0.5 * (stretch_i.abs() + stretch_j.abs())
+    else:
+        raise ValueError(f"patch_stretch_loss_norm must be 'L1' or 'L2', got {cfg['patch_stretch_loss_norm']!r}")
 
     predicted_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx)
     normals_residual = 1. - (predicted_normal * scroll_normal).sum(dim=-1).abs()
