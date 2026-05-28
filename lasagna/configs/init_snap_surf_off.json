@@ -32,7 +32,7 @@
 	"stages": [
 		{
 			"name": "stage1",
-			"steps": 300,
+			"steps": "auto",
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
@@ -45,7 +45,7 @@
 		},
 		{
 			"name": "stage2",
-			"steps": 200,
+			"steps": "auto",
 			"lr": 0.01,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
