@@ -351,28 +351,28 @@ class InitShellCropTest(unittest.TestCase):
 		surface = init_shell_index.InitShellSurface(
 			shell_id="shell_0001.tifxyz",
 			path=Path("shell_0001.tifxyz"),
-			xyz_wrapped=_wrapped_cylinder(radius=10.0, z_values=[0.0, 10.0, 20.0], width=64),
+			xyz_wrapped=_wrapped_cylinder(radius=10.0, z_values=[0.0, 10.0, 20.0, 30.0, 40.0], width=64),
 			unique_w=64,
 		)
-		closest = _closest_for_surface(surface, h=2.0, w=0.0, xyz=(10.0, 0.0, 20.0))
+		closest = _closest_for_surface(surface, h=3.0, w=0.0, xyz=(10.0, 0.0, 30.0))
 
 		crop, valid, info = init_shell_index.crop_shell_surface(
 			surface,
 			closest,
-			seed=(10.0, 0.0, 20.0),
+			seed=(10.0, 0.0, 30.0),
 			model_w=10.0,
-			model_h=40.0,
+			model_h=60.0,
 			mesh_step=10.0,
 			device="cpu",
 		)
 
-		self.assertEqual(info.requested_mesh_h, 5)
+		self.assertEqual(info.requested_mesh_h, 7)
 		self.assertEqual(info.mesh_h, 3)
-		self.assertEqual(info.height_dropped_low, 0)
+		self.assertEqual(info.height_dropped_low, 2)
 		self.assertEqual(info.height_dropped_high, 2)
 		self.assertEqual(tuple(crop.shape[:2]), (3, 2))
 		self.assertTrue(bool(valid.all()))
-		self.assertTrue(torch.allclose((crop[2, 0] + crop[2, 1]) * 0.5, torch.tensor(closest.closest_xyz), atol=1.0e-5))
+		self.assertTrue(torch.allclose(_grid_center(crop), torch.tensor(closest.closest_xyz), atol=1.0e-5))
 		self.assertGreater(float((crop[1] - crop[0]).norm(dim=-1).mean()), 5.0)
 		self.assertGreater(float((crop[2] - crop[1]).norm(dim=-1).mean()), 5.0)
 

@@ -553,10 +553,15 @@ def _height_targets_from_anchor(
 	h_frac = h_anchor - float(h0)
 	s_anchor = cumulative[h0] + h_frac * (cumulative[h0 + 1] - cumulative[h0])
 	target_s_raw = s_anchor + height_offsets.to(device=shell.device, dtype=shell.dtype)
-	keep = (target_s_raw >= 0.0) & (target_s_raw <= cumulative[-1])
-	dropped_low = int((target_s_raw < 0.0).sum().detach().cpu())
-	dropped_high = int((target_s_raw > cumulative[-1]).sum().detach().cpu())
-	target_s = target_s_raw[keep]
+	out_low = int((target_s_raw < 0.0).sum().detach().cpu())
+	out_high = int((target_s_raw > cumulative[-1]).sum().detach().cpu())
+	drop_each_side = max(out_low, out_high)
+	if drop_each_side > 0:
+		target_s = target_s_raw[drop_each_side:-drop_each_side]
+	else:
+		target_s = target_s_raw
+	dropped_low = drop_each_side
+	dropped_high = drop_each_side
 	if int(target_s.numel()) < 2:
 		raise ValueError(
 			"init shell crop has fewer than two in-range height samples; "
@@ -646,7 +651,7 @@ def crop_shell_surface(
 			width_offsets = base_offsets
 		out_rows.append(_sample_periodic_row_by_arclength(row, center_arc + width_offsets))
 	crop = torch.stack(out_rows, dim=0).contiguous()
-	h_mid = float(h_count - 1) * 0.5 - float(height_dropped_low)
+	h_mid = float(int(crop.shape[0]) - 1) * 0.5
 	w_mid = float(int(crop.shape[1]) - 1) * 0.5
 	h0 = int(math.floor(h_mid))
 	w0 = int(math.floor(w_mid))

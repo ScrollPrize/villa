@@ -32,8 +32,8 @@
 	"stages": [
 		{
 			"name": "stage1",
-			"steps": 500,
-			"lr": 1.0,
+			"steps": 200,
+			"lr": 10.0,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
@@ -45,8 +45,8 @@
 		},
 		{
 			"name": "stage2",
-			"steps": 500,
-			"lr": 0.1,
+			"steps": 200,
+			"lr": 1.0,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
@@ -95,7 +95,7 @@
 		{
 			"name": "map_uv_coarse",
 			"steps": "auto",
-			"lr": 0.1,
+			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
@@ -106,7 +106,7 @@
 		{
 			"name": "map_uv_refine",
 			"steps": "auto",
-			"lr": 0.1,
+			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
@@ -158,7 +158,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 0,
+			"steps": "auto",
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
