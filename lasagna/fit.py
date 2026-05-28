@@ -665,8 +665,8 @@ def main(argv: list[str] | None = None) -> int:
 			trimmed_surface, trim_top, trim_bottom = trim_shell_surface_rows_by_quality(
 				surface,
 				target_step=source_step,
-				lo_ratio=0.67,
-				hi_ratio=1.5,
+				lo_ratio=0.5,
+				hi_ratio=2.0,
 			)
 			if trim_top or trim_bottom:
 				if not (float(trim_top) <= float(closest.h) <= float(trim_top + trimmed_surface.xyz_wrapped.shape[0] - 1)):
@@ -767,6 +767,8 @@ def main(argv: list[str] | None = None) -> int:
 				f"crop={crop_info.mesh_h}x{crop_info.mesh_w} "
 				f"requested_h={crop_info.requested_mesh_h} "
 				f"dropped_h={crop_info.requested_mesh_h - crop_info.mesh_h} "
+				f"dropped_h_low={crop_info.height_dropped_low} "
+				f"dropped_h_high={crop_info.height_dropped_high} "
 				f"source={crop_info.source_h}x{crop_info.source_w} "
 				f"full_width={crop_info.full_width}",
 				flush=True,

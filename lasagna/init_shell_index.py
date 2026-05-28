@@ -49,6 +49,8 @@ class ShellCropInfo:
 	source_h: int
 	source_w: int
 	requested_mesh_h: int
+	height_dropped_low: int
+	height_dropped_high: int
 	mesh_h: int
 	mesh_w: int
 
@@ -532,7 +534,7 @@ def _height_targets_from_anchor(
 	anchor_h: float,
 	anchor_w: float,
 	height_offsets: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int, int]:
 	curve = torch.stack([
 		_sample_periodic_row_by_param(shell[row_i], anchor_w)
 		for row_i in range(int(shell.shape[0]))
@@ -550,17 +552,23 @@ def _height_targets_from_anchor(
 	h0 = min(max(0, h0), int(shell.shape[0]) - 2)
 	h_frac = h_anchor - float(h0)
 	s_anchor = cumulative[h0] + h_frac * (cumulative[h0 + 1] - cumulative[h0])
-	target_s = (s_anchor + height_offsets.to(device=shell.device, dtype=shell.dtype)).clamp(
-		min=0.0,
-		max=cumulative[-1],
-	)
+	target_s_raw = s_anchor + height_offsets.to(device=shell.device, dtype=shell.dtype)
+	keep = (target_s_raw >= 0.0) & (target_s_raw <= cumulative[-1])
+	dropped_low = int((target_s_raw < 0.0).sum().detach().cpu())
+	dropped_high = int((target_s_raw > cumulative[-1]).sum().detach().cpu())
+	target_s = target_s_raw[keep]
+	if int(target_s.numel()) < 2:
+		raise ValueError(
+			"init shell crop has fewer than two in-range height samples; "
+			"seed is too close to the source shell boundary for the requested model height"
+		)
 	idx_hi = torch.searchsorted(cumulative.contiguous(), target_s.contiguous(), right=False)
 	idx_hi = idx_hi.clamp(min=1, max=int(shell.shape[0]) - 1)
 	idx0 = idx_hi - 1
 	s0 = cumulative.index_select(0, idx0.reshape(-1)).reshape_as(target_s)
 	s1 = cumulative.index_select(0, idx_hi.reshape(-1)).reshape_as(target_s)
 	frac = ((target_s - s0) / (s1 - s0).clamp(min=1.0e-8)).clamp(min=0.0, max=1.0)
-	return idx0.to(dtype=shell.dtype) + frac
+	return idx0.to(dtype=shell.dtype) + frac, dropped_low, dropped_high
 
 
 def crop_shell_surface(
@@ -594,7 +602,7 @@ def crop_shell_surface(
 		device=dev,
 		dtype=torch.float32,
 	)
-	target_h = _height_targets_from_anchor(
+	target_h, height_dropped_low, height_dropped_high = _height_targets_from_anchor(
 		shell,
 		anchor_h=float(closest.h),
 		anchor_w=float(closest.w),
@@ -638,7 +646,7 @@ def crop_shell_surface(
 			width_offsets = base_offsets
 		out_rows.append(_sample_periodic_row_by_arclength(row, center_arc + width_offsets))
 	crop = torch.stack(out_rows, dim=0).contiguous()
-	h_mid = float(int(crop.shape[0]) - 1) * 0.5
+	h_mid = float(h_count - 1) * 0.5 - float(height_dropped_low)
 	w_mid = float(int(crop.shape[1]) - 1) * 0.5
 	h0 = int(math.floor(h_mid))
 	w0 = int(math.floor(w_mid))
@@ -664,6 +672,8 @@ def crop_shell_surface(
 		source_h=int(shell.shape[0]),
 		source_w=int(shell.shape[1]),
 		requested_mesh_h=int(h_count),
+		height_dropped_low=int(height_dropped_low),
+		height_dropped_high=int(height_dropped_high),
 		mesh_h=int(crop.shape[0]),
 		mesh_w=int(crop.shape[1]),
 	)
