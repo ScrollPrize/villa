@@ -3241,7 +3241,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 'increase gap_expander_num_windings or lower shell_outer_winding_idx'
             )
 
-    flow_field_params = list(spiral_and_transform.flow_field_1.parameters())
+    flow_field_params = list(spiral_and_transform.flow_field.parameters())
     gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
     linear_params = [spiral_and_transform.linear_logits]
     grouped_ids = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
