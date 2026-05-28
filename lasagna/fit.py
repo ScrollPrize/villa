@@ -16,6 +16,7 @@ import fit_data
 import model
 import opt_loss_corr
 import opt_loss_dir
+import opt_loss_step
 import optimizer
 
 
@@ -626,11 +627,87 @@ def main(argv: list[str] | None = None) -> int:
 	elif model_init == "seed":
 		if init_mode == "shell-dir-crop":
 			print("[fit] model-init=seed/init-mode=shell-dir-crop: constructing model from init shells", flush=True)
-			from init_shell_index import InitShellIndex, crop_shell_surface
+			from init_shell_index import (
+				InitShellIndex,
+				crop_shell_surface,
+				shell_quality_analysis,
+				trim_shell_surface_rows_by_quality,
+			)
 			init_shell_dir = _require_manifest_init_shell_dir(prep_params)
 			shell_index = InitShellIndex.from_directory(init_shell_dir)
 			closest = shell_index.closest_point(tuple(float(v) for v in data_cfg.seed), device=device)
 			surface = shell_index.surfaces[closest.shell_index]
+			source_step = float(surface.source_step) if surface.source_step is not None else float(model_cfg.mesh_step)
+			selected_shell = surface.xyz_wrapped[:, :surface.unique_w].to(device=device, dtype=torch.float32)
+			print(
+				f"[fit] shell-dir-crop closest shell before crop: "
+				f"id={closest.shell_id} path={surface.path} "
+				f"source_step={source_step:.3f} "
+				f"source_shape={int(surface.xyz_wrapped.shape[0])}x{int(surface.xyz_wrapped.shape[1])} "
+				f"unique_shape={int(selected_shell.shape[0])}x{int(selected_shell.shape[1])} "
+				f"quad=({closest.quad_row},{closest.quad_col}) tri={closest.triangle_id} "
+				f"h={closest.h:.3f} w={closest.w:.3f} dist={closest.distance:.3f}",
+				flush=True,
+			)
+			source_quality = shell_quality_analysis(selected_shell, target_step=source_step)
+			print(
+				f"[fit] shell-dir-crop source-shell quality before row trim: "
+				f"target_step={source_quality['target_step']:.3f} target_area={source_quality['target_area']:.3f} "
+				f"h=({source_quality['h_min']:.3f},{source_quality['h_med']:.3f},{source_quality['h_max']:.3f}) "
+				f"w_top=({source_quality['w_top_min']:.3f},{source_quality['w_top_med']:.3f},{source_quality['w_top_max']:.3f}) "
+				f"w_bottom=({source_quality['w_bottom_min']:.3f},{source_quality['w_bottom_med']:.3f},{source_quality['w_bottom_max']:.3f}) "
+				f"diag_main=({source_quality['diag_main_min']:.3f},{source_quality['diag_main_med']:.3f},{source_quality['diag_main_max']:.3f}) "
+				f"diag_anti=({source_quality['diag_anti_min']:.3f},{source_quality['diag_anti_med']:.3f},{source_quality['diag_anti_max']:.3f}) "
+				f"area=({source_quality['area_min']:.3f},{source_quality['area_med']:.3f},{source_quality['area_max']:.3f}) "
+				f"area_sqrt=({source_quality['area_sqrt_min']:.3f},{source_quality['area_sqrt_med']:.3f},{source_quality['area_sqrt_max']:.3f})",
+				flush=True,
+			)
+			trimmed_surface, trim_top, trim_bottom = trim_shell_surface_rows_by_quality(
+				surface,
+				target_step=source_step,
+				lo_ratio=0.67,
+				hi_ratio=1.5,
+			)
+			if trim_top or trim_bottom:
+				if not (float(trim_top) <= float(closest.h) <= float(trim_top + trimmed_surface.xyz_wrapped.shape[0] - 1)):
+					raise ValueError(
+						f"shell-dir-crop source row trim removed closest seed row: "
+						f"h={closest.h:.3f} trim_top={trim_top} kept_h={int(trimmed_surface.xyz_wrapped.shape[0])}"
+					)
+				closest = dataclasses.replace(
+					closest,
+					h=float(closest.h) - float(trim_top),
+					quad_row=max(0, int(closest.quad_row) - int(trim_top)),
+				)
+				surface = trimmed_surface
+				selected_shell = surface.xyz_wrapped[:, :surface.unique_w].to(device=device, dtype=torch.float32)
+				trim_quality = shell_quality_analysis(selected_shell, target_step=source_step)
+				print(
+					f"[fit] shell-dir-crop source-shell row trim: "
+					f"trim_top={trim_top} trim_bottom={trim_bottom} "
+					f"kept_shape={int(surface.xyz_wrapped.shape[0])}x{int(surface.xyz_wrapped.shape[1])} "
+					f"adjusted_h={closest.h:.3f} "
+					f"h=({trim_quality['h_min']:.3f},{trim_quality['h_med']:.3f},{trim_quality['h_max']:.3f}) "
+					f"w_top=({trim_quality['w_top_min']:.3f},{trim_quality['w_top_med']:.3f},{trim_quality['w_top_max']:.3f}) "
+					f"w_bottom=({trim_quality['w_bottom_min']:.3f},{trim_quality['w_bottom_med']:.3f},{trim_quality['w_bottom_max']:.3f}) "
+					f"diag_main=({trim_quality['diag_main_min']:.3f},{trim_quality['diag_main_med']:.3f},{trim_quality['diag_main_max']:.3f}) "
+					f"diag_anti=({trim_quality['diag_anti_min']:.3f},{trim_quality['diag_anti_med']:.3f},{trim_quality['diag_anti_max']:.3f}) "
+					f"area=({trim_quality['area_min']:.3f},{trim_quality['area_med']:.3f},{trim_quality['area_max']:.3f}) "
+					f"area_sqrt=({trim_quality['area_sqrt_min']:.3f},{trim_quality['area_sqrt_med']:.3f},{trim_quality['area_sqrt_max']:.3f})",
+					flush=True,
+				)
+			step_stats = opt_loss_step.step_loss_analysis(selected_shell, mesh_step=source_step)
+			print(
+				f"[fit] shell-dir-crop selected-shell step analysis before crop: "
+				f"loss={step_stats['loss']:.6g} target={step_stats['target']:.3f} "
+				f"step_min={step_stats['step_min']:.3f} step_avg={step_stats['step_avg']:.3f} "
+				f"step_med={step_stats['step_med']:.3f} step_max={step_stats['step_max']:.3f} "
+				f"h_avg={step_stats['h_avg']:.3f} w_avg={step_stats['w_avg']:.3f} "
+				f"diag_avg={step_stats['diag_avg']:.3f} "
+				f"h_max={step_stats['h_max']:.3f} w_max={step_stats['w_max']:.3f} "
+				f"diag_max={step_stats['diag_max']:.3f} max_kind={step_stats['max_kind']}",
+				flush=True,
+			)
 			crop_xyz, crop_valid, crop_info = crop_shell_surface(
 				surface,
 				closest,
@@ -640,6 +717,18 @@ def main(argv: list[str] | None = None) -> int:
 				model_w_unit=data_cfg.model_w_unit,
 				mesh_step=float(model_cfg.mesh_step),
 				device=device,
+			)
+			crop_step_stats = opt_loss_step.step_loss_analysis(crop_xyz, mesh_step=float(model_cfg.mesh_step))
+			print(
+				f"[fit] shell-dir-crop resampled-crop step analysis: "
+				f"loss={crop_step_stats['loss']:.6g} target={crop_step_stats['target']:.3f} "
+				f"step_min={crop_step_stats['step_min']:.3f} step_avg={crop_step_stats['step_avg']:.3f} "
+				f"step_med={crop_step_stats['step_med']:.3f} step_max={crop_step_stats['step_max']:.3f} "
+				f"h_avg={crop_step_stats['h_avg']:.3f} w_avg={crop_step_stats['w_avg']:.3f} "
+				f"diag_avg={crop_step_stats['diag_avg']:.3f} "
+				f"h_max={crop_step_stats['h_max']:.3f} w_max={crop_step_stats['w_max']:.3f} "
+				f"diag_max={crop_step_stats['diag_max']:.3f} max_kind={crop_step_stats['max_kind']}",
+				flush=True,
 			)
 			mdl = model.Model3D.from_tifxyz_crop(
 				crop_xyz,
@@ -658,12 +747,28 @@ def main(argv: list[str] | None = None) -> int:
 				model_w=(None if data_cfg.model_w is None else float(data_cfg.model_w)),
 				model_h=float(data_cfg.model_h),
 			)
+			model_step_stats = opt_loss_step.step_loss_analysis(mdl._grid_xyz().detach(), mesh_step=float(model_cfg.mesh_step))
+			print(
+				f"[fit] shell-dir-crop model-init step analysis: "
+				f"loss={model_step_stats['loss']:.6g} target={model_step_stats['target']:.3f} "
+				f"step_min={model_step_stats['step_min']:.3f} step_avg={model_step_stats['step_avg']:.3f} "
+				f"step_med={model_step_stats['step_med']:.3f} step_max={model_step_stats['step_max']:.3f} "
+				f"h_avg={model_step_stats['h_avg']:.3f} w_avg={model_step_stats['w_avg']:.3f} "
+				f"diag_avg={model_step_stats['diag_avg']:.3f} "
+				f"h_max={model_step_stats['h_max']:.3f} w_max={model_step_stats['w_max']:.3f} "
+				f"diag_max={model_step_stats['diag_max']:.3f} max_kind={model_step_stats['max_kind']}",
+				flush=True,
+			)
 			print(
 				f"[fit] shell-dir-crop selected {closest.shell_id}: "
 				f"quad=({closest.quad_row},{closest.quad_col}) tri={closest.triangle_id} "
 				f"h={closest.h:.3f} w={closest.w:.3f} "
 				f"dist={closest.distance:.3f} "
-				f"crop={crop_info.mesh_h}x{crop_info.mesh_w} full_width={crop_info.full_width}",
+				f"crop={crop_info.mesh_h}x{crop_info.mesh_w} "
+				f"requested_h={crop_info.requested_mesh_h} "
+				f"dropped_h={crop_info.requested_mesh_h - crop_info.mesh_h} "
+				f"source={crop_info.source_h}x{crop_info.source_w} "
+				f"full_width={crop_info.full_width}",
 				flush=True,
 			)
 		elif init_mode == "cylinder_seed":

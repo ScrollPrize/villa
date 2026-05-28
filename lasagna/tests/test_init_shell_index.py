@@ -347,6 +347,34 @@ class InitShellCropTest(unittest.TestCase):
 		self.assertTrue(torch.allclose(crop[2, 1], torch.tensor([10.0, 0.0, 10.0]), atol=0.25))
 		self.assertFalse(torch.allclose(crop[:, 0], crop[:, -1], atol=1.0e-4, rtol=1.0e-4))
 
+	def test_source_shell_row_quality_trim_removes_bad_full_rows(self) -> None:
+		width = 64
+		angles = torch.arange(width, dtype=torch.float32) * (2.0 * math.pi / float(width))
+		rows = []
+		for radius, z in [(5.0, 0.0), (100.0, 10.0), (100.0, 20.0), (100.0, 30.0), (5.0, 40.0)]:
+			rows.append(torch.stack([
+				float(radius) * torch.cos(angles),
+				float(radius) * torch.sin(angles),
+				torch.full_like(angles, float(z)),
+			], dim=-1))
+		unique = torch.stack(rows, dim=0)
+		surface = init_shell_index.InitShellSurface(
+			shell_id="shell_0001.tifxyz",
+			path=Path("shell_0001.tifxyz"),
+			xyz_wrapped=torch.cat([unique, unique[:, :1]], dim=1).contiguous(),
+			unique_w=width,
+			source_step=10.0,
+		)
+
+		trimmed, trim_top, trim_bottom = init_shell_index.trim_shell_surface_rows_by_quality(
+			surface,
+			target_step=10.0,
+		)
+
+		self.assertEqual(trim_top, 1)
+		self.assertEqual(trim_bottom, 1)
+		self.assertEqual(tuple(trimmed.xyz_wrapped.shape[:2]), (3, 65))
+
 	def test_crop_grid_center_uses_exact_closest_xyz_not_resampled_hw(self) -> None:
 		unique = torch.tensor(
 			[

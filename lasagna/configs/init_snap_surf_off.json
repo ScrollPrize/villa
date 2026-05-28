@@ -32,8 +32,8 @@
 	"stages": [
 		{
 			"name": "stage1",
-			"steps": "auto",
-			"lr": 0.1,
+			"steps": 500,
+			"lr": 1.0,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
@@ -45,8 +45,8 @@
 		},
 		{
 			"name": "stage2",
-			"steps": "auto",
-			"lr": 0.01,
+			"steps": 500,
+			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
@@ -59,7 +59,7 @@
 		{
 			"name": "affine_seed_quad_init",
 			"steps": 50,
-			"lr": 0.01,
+			"lr": 0.1,
 			"params": ["map_surf_affine"],
 			"args": {
 				"lr_warmup_steps": 10,
@@ -93,19 +93,9 @@
 			}
 		},
 		{
-			"name": "map_surf_affine_refine",
-			"steps": 0,
-			"lr": 0.01,
-			"params": ["map_surf_affine"],
-			"args": {
-				"status_interval": 1,
-				"subdiv": 1
-			}
-		},
-		{
 			"name": "map_uv_coarse",
 			"steps": "auto",
-			"lr": 0.01,
+			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
@@ -116,7 +106,7 @@
 		{
 			"name": "map_uv_refine",
 			"steps": "auto",
-			"lr": 0.01,
+			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
@@ -125,8 +115,37 @@
 			}
 		},
 		{
+			"name": "snap_light",
+			"steps": 500,
+			"lr": 0.1,
+			"params": ["mesh_ms"],
+			"min_scaledown": 0,
+			"w_fac": {
+				"pred_dt": 0.0,
+				"snap_surf_map": 0.1,
+				"station_n": 0.0,
+				"station_t": 0.001
+			},
+			"args": {
+				"status_interval": 50,
+				"snap_surf_map": {
+					"map_opt": {
+						"name": "snap_map_opt_final",
+						"steps": 1,
+						"lr": 0.01,
+						"params": ["map_surf_ms"],
+						"min_scaledown": 0,
+						"args": {
+							"subdiv": 1,
+							"debug_obj_dir": "snap_surf_objs"
+						}
+					}
+				}
+			}
+		},
+		{
 			"name": "snap",
-			"steps": "auto",
+			"steps": 0,
 			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,

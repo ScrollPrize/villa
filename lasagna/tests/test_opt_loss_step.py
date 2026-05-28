@@ -68,6 +68,18 @@ class StepLossTest(unittest.TestCase):
 		self.assertLess(float(lm.max()), 1.0e-10)
 		self.assertLess(float(loss), 1.0e-10)
 
+	def test_step_loss_analysis_reports_uncropped_grid_stats(self) -> None:
+		xyz = _planar_grid(4, 5, step=2.0)[0]
+
+		stats = opt_loss_step.step_loss_analysis(xyz, mesh_step=2.0)
+
+		self.assertLess(stats["loss"], 1.0e-10)
+		self.assertAlmostEqual(stats["target"], 2.0, delta=1.0e-6)
+		self.assertAlmostEqual(stats["step_min"], 2.0, delta=1.0e-6)
+		self.assertAlmostEqual(stats["step_avg"], 2.0, delta=1.0e-6)
+		self.assertAlmostEqual(stats["step_med"], 2.0, delta=1.0e-6)
+		self.assertAlmostEqual(stats["step_max"], 2.0, delta=1.0e-6)
+
 	def test_short_h_and_w_edges_gradients_follow_local_edge_direction(self) -> None:
 		diff_h = torch.tensor(
 			[[[[0.0, 1.0, 0.0], [0.0, 0.5, 0.0], [0.0, 1.0, 0.0]]]],

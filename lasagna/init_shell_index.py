@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import math
 
@@ -19,6 +20,8 @@ class InitShellSurface:
 	path: Path
 	xyz_wrapped: torch.Tensor
 	unique_w: int
+	meta: dict | None = None
+	source_step: float | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,9 @@ class ShellCropInfo:
 	anchor_w: float
 	anchor_arc: float
 	circumference: float
+	source_h: int
+	source_w: int
+	requested_mesh_h: int
 	mesh_h: int
 	mesh_w: int
 
@@ -73,6 +79,117 @@ def _load_wrapped_tifxyz(path: Path) -> torch.Tensor:
 	if not np.allclose(xyz_np[:, 0], xyz_np[:, -1], atol=WRAP_ATOL, rtol=WRAP_RTOL):
 		raise ValueError(f"init shell is not explicitly wrapped: first and last columns differ in {path}")
 	return torch.from_numpy(xyz_np).to(dtype=torch.float32).contiguous()
+
+
+def _load_tifxyz_meta(path: Path) -> dict:
+	meta_path = path / "meta.json"
+	if not meta_path.exists():
+		return {}
+	try:
+		raw = json.loads(meta_path.read_text(encoding="utf-8"))
+	except Exception:
+		return {}
+	return raw if isinstance(raw, dict) else {}
+
+
+def _source_step_from_meta(meta: dict) -> float | None:
+	scale = meta.get("scale") if isinstance(meta, dict) else None
+	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
+		return 1.0 / float(scale[0])
+	return None
+
+
+def _quad_area(p00: torch.Tensor, p10: torch.Tensor, p11: torch.Tensor, p01: torch.Tensor) -> torch.Tensor:
+	a0 = torch.cross(p10 - p00, p01 - p00, dim=-1).norm(dim=-1) * 0.5
+	a1 = torch.cross(p11 - p10, p01 - p10, dim=-1).norm(dim=-1) * 0.5
+	return a0 + a1
+
+
+def shell_quality_analysis(shell: torch.Tensor, *, target_step: float) -> dict[str, float]:
+	if shell.ndim != 3 or int(shell.shape[-1]) != 3:
+		raise ValueError(f"shell must have shape (H, W, 3), got {tuple(shell.shape)}")
+	if int(shell.shape[0]) < 2 or int(shell.shape[1]) < 2:
+		raise ValueError(f"shell quality analysis requires H>=2 and W>=2, got {tuple(shell.shape)}")
+	step = max(1.0e-6, float(target_step))
+	p00 = shell[:-1]
+	p10 = shell[1:]
+	p01 = torch.roll(shell[:-1], shifts=-1, dims=1)
+	p11 = torch.roll(shell[1:], shifts=-1, dims=1)
+	h = (p10 - p00).norm(dim=-1)
+	w0 = (p01 - p00).norm(dim=-1)
+	w1 = (p11 - p10).norm(dim=-1)
+	d0 = (p11 - p00).norm(dim=-1) / math.sqrt(2.0)
+	d1 = (p10 - p01).norm(dim=-1) / math.sqrt(2.0)
+	area = _quad_area(p00, p10, p11, p01)
+
+	def _stats(prefix: str, values: torch.Tensor, out: dict[str, float]) -> None:
+		flat = values.reshape(-1)
+		out[f"{prefix}_min"] = float(flat.amin().detach().cpu())
+		out[f"{prefix}_avg"] = float(flat.mean().detach().cpu())
+		out[f"{prefix}_med"] = float(flat.median().detach().cpu())
+		out[f"{prefix}_max"] = float(flat.amax().detach().cpu())
+
+	out: dict[str, float] = {"target_step": step, "target_area": step * step}
+	_stats("h", h, out)
+	_stats("w_top", w0, out)
+	_stats("w_bottom", w1, out)
+	_stats("diag_main", d0, out)
+	_stats("diag_anti", d1, out)
+	_stats("area", area, out)
+	_stats("area_sqrt", area.sqrt(), out)
+	return out
+
+
+def trim_shell_surface_rows_by_quality(
+	surface: InitShellSurface,
+	*,
+	target_step: float,
+	lo_ratio: float = 0.67,
+	hi_ratio: float = 1.5,
+) -> tuple[InitShellSurface, int, int]:
+	"""Trim full source rows from top/bottom until shell edge/area bands are sane."""
+	shell = surface.xyz_wrapped[:, :surface.unique_w].contiguous()
+	if int(shell.shape[0]) < 3:
+		return surface, 0, 0
+	step = max(1.0e-6, float(target_step))
+	lo = float(lo_ratio) * step
+	hi = float(hi_ratio) * step
+	p00 = shell[:-1]
+	p10 = shell[1:]
+	p01 = torch.roll(shell[:-1], shifts=-1, dims=1)
+	p11 = torch.roll(shell[1:], shifts=-1, dims=1)
+	metrics = [
+		(p10 - p00).norm(dim=-1),
+		(p01 - p00).norm(dim=-1),
+		(p11 - p10).norm(dim=-1),
+		(p11 - p00).norm(dim=-1) / math.sqrt(2.0),
+		(p10 - p01).norm(dim=-1) / math.sqrt(2.0),
+		_quad_area(p00, p10, p11, p01).sqrt(),
+	]
+	good = torch.ones(int(shell.shape[0]) - 1, dtype=torch.bool, device=shell.device)
+	for values in metrics:
+		good &= (values.amin(dim=1) >= lo) & (values.amax(dim=1) <= hi)
+	good_idx = torch.nonzero(good.detach().cpu(), as_tuple=False).flatten()
+	if int(good_idx.numel()) == 0:
+		raise ValueError(
+			f"no source shell rows pass quality bounds for {surface.shell_id}: "
+			f"target_step={step:.3f} bounds=({lo:.3f}, {hi:.3f})"
+		)
+	first_band = int(good_idx[0])
+	last_band = int(good_idx[-1])
+	row_start = first_band
+	row_stop = last_band + 2
+	if row_start == 0 and row_stop == int(surface.xyz_wrapped.shape[0]):
+		return surface, 0, 0
+	trimmed = InitShellSurface(
+		shell_id=surface.shell_id,
+		path=surface.path,
+		xyz_wrapped=surface.xyz_wrapped[row_start:row_stop].contiguous(),
+		unique_w=surface.unique_w,
+		meta=surface.meta,
+		source_step=surface.source_step,
+	)
+	return trimmed, row_start, int(surface.xyz_wrapped.shape[0]) - row_stop
 
 
 def _quad_span(corners: torch.Tensor) -> torch.Tensor:
@@ -249,11 +366,14 @@ class InitShellIndex:
 		surfaces = []
 		for path in paths:
 			xyz = _load_wrapped_tifxyz(path)
+			meta = _load_tifxyz_meta(path)
 			surfaces.append(InitShellSurface(
 				shell_id=path.name,
 				path=path,
 				xyz_wrapped=xyz,
 				unique_w=int(xyz.shape[1]) - 1,
+				meta=meta,
+				source_step=_source_step_from_meta(meta),
 			))
 		return cls(surfaces)
 
@@ -541,6 +661,9 @@ def crop_shell_surface(
 		anchor_w=float(closest.w),
 		anchor_arc=float(anchor_arc.detach().cpu()),
 		circumference=circ_anchor_f,
+		source_h=int(shell.shape[0]),
+		source_w=int(shell.shape[1]),
+		requested_mesh_h=int(h_count),
 		mesh_h=int(crop.shape[0]),
 		mesh_w=int(crop.shape[1]),
 	)
