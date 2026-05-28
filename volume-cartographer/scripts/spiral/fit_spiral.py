@@ -107,6 +107,8 @@ default_config = {
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_patch_stretch': 40.0,
+    'loss_weight_bending': 0.0,
+    'loss_weight_sym_dirichlet': 0.0,
     'loss_weight_patch_normals': 0.0,
     'loss_weight_pcl_normals': 0.0,
     'loss_weight_dense_normals': 1.e2,
@@ -1742,6 +1744,29 @@ def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spi
     return F.normalize((jacobian_columns * spiral_outward_zyx[None, :, :]).sum(dim=-1).transpose(0, 1), dim=-1)
 
 
+def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
+    # Sample points uniformly over an annulus of the spiral cylinder (inner radius dr_per_winding to
+    # outer radius dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI) and return each
+    # point's orthonormal in-surface frame in spiral space: e1 = z-axis, e2 = the azimuthal tangent
+    # (perpendicular, within the yx plane, to the outward radial direction normalize(spiral_yx)). The
+    # cylinder normal is the radial direction, which we omit. The inner core is excluded because
+    # there is no scroll surface there and the azimuthal tangent is undefined at the cylinder axis.
+    # Returns (spiral_zyx, e1, e2), each (num_points, 3) in zyx.
+    device = dr_per_winding.device
+    r_max = dr_per_winding.detach() * float(outer_winding_idx)
+    r_min = dr_per_winding.detach()
+    theta = torch.rand([num_points], device=device) * (2 * torch.pi)
+    radius = torch.sqrt(torch.rand([num_points], device=device) * (r_max ** 2 - r_min ** 2) + r_min ** 2)
+    z = torch.empty([num_points], device=device).uniform_(float(z_begin), float(z_end - 1))
+    spiral_zyx = torch.stack([z, torch.sin(theta) * radius, torch.cos(theta) * radius], dim=-1)
+
+    radial_yx = F.normalize(spiral_zyx[:, 1:], dim=-1)  # (y, x)
+    tangential_yx = torch.stack([radial_yx[:, 1], -radial_yx[:, 0]], dim=-1)
+    e1 = F.pad(torch.zeros_like(radial_yx), (1, 0), value=1.)  # (1, 0, 0) -> z-axis
+    e2 = F.pad(tangential_yx, (1, 0), value=0.)  # (0, ty, tx)
+    return spiral_zyx, e1, e2
+
+
 def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_points, epsilon=6.0):
     if pcl_normal_samples is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1980,6 +2005,84 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
     stretch_loss = (stretch_residual * mask).sum() / denom
     normals_loss = (normals_residual * mask).sum() / denom
     return stretch_loss, normals_loss
+
+
+def get_bending_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=1.0):
+    # Extrinsic bending penalty on the scroll-space image of the spiral surface, evaluated at points
+    # sampled uniformly over the spiral cylinder (see sample_spiral_surface_frame).
+    # At each point we take the orthonormal in-surface frame (e1, e2) in spiral space, form
+    # collinear triples (centre, centre +- e * epsilon) along it, map them to scroll space through the
+    # inverse transform, and take the second difference of the resulting scroll positions along each
+    # frame axis (a discrete directional second derivative of the map). We then project that onto the
+    # scroll-space surface normal (from cross of the pushed-forward frame vectors) and penalise its
+    # magnitude squared, so non-isometric stretching of the parameterisation (which lives in the
+    # tangent plane and is covered by the symmetric Dirichlet term) does not contribute.
+    device = dr_per_winding.device
+    if outer_winding_idx is None:
+        return torch.zeros([], device=device)
+
+    spiral_center, e1, e2 = sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points)
+
+    spiral_1_prev = spiral_center - e1 * epsilon
+    spiral_1_next = spiral_center + e1 * epsilon
+    spiral_2_prev = spiral_center - e2 * epsilon
+    spiral_2_next = spiral_center + e2 * epsilon
+    combined_spiral = torch.cat([spiral_center, spiral_1_prev, spiral_1_next, spiral_2_prev, spiral_2_next], dim=0)
+    combined_scroll = slice_to_spiral_transform.inv(combined_spiral)
+    scroll_center, scroll_1_prev, scroll_1_next, scroll_2_prev, scroll_2_next = combined_scroll.chunk(5, dim=0)
+
+    # Pushforward of e1, e2 via central differences (scroll-space tangent vectors).
+    tangent_1 = (scroll_1_next - scroll_1_prev) / (2.0 * epsilon)
+    tangent_2 = (scroll_2_next - scroll_2_prev) / (2.0 * epsilon)
+    normal = torch.linalg.cross(tangent_1, tangent_2, dim=-1)
+    normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    second_diff_1 = (scroll_1_next + scroll_1_prev - 2.0 * scroll_center) / (epsilon ** 2)
+    second_diff_2 = (scroll_2_next + scroll_2_prev - 2.0 * scroll_center) / (epsilon ** 2)
+    bending_1 = ((second_diff_1 * normal).sum(dim=-1)) ** 2
+    bending_2 = ((second_diff_2 * normal).sum(dim=-1)) ** 2
+    return (bending_1 + bending_2).mean()
+
+
+def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=1.0):
+    # In-surface symmetric Dirichlet energy of the spiral<->scroll map, evaluated at points sampled
+    # uniformly over the spiral cylinder (see sample_spiral_surface_frame).
+    # At each point we take the orthonormal in-surface frame (e1, e2) in spiral space, map it to scroll
+    # space through the inverse transform by finite differences to get its scroll-space image (a, b), and
+    # form the 2x2 induced metric G = [[a.a, a.b], [a.b, b.b]]. The energy ||J||_F^2 + ||J^{-1}||_F^2 =
+    # tr(G) + tr(G^{-1}) = (s1^2 + s2^2) + (1/s1^2 + 1/s2^2) is minimised (value 4) at an in-surface
+    # isometry and diverges as the map degenerates (singular value -> 0 or inf), acting as a barrier
+    # against in-surface collapse / element flips. We subtract 4 so the reported value is 0 at rest.
+    device = dr_per_winding.device
+    if outer_winding_idx is None:
+        return torch.zeros([], device=device)
+
+    spiral_zyx, e1, e2 = sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points)
+
+    spiral_shift_1 = spiral_zyx + e1 * epsilon
+    spiral_shift_2 = spiral_zyx + e2 * epsilon
+    combined_spiral = torch.cat([spiral_zyx, spiral_shift_1, spiral_shift_2], dim=0)
+    combined_scroll = slice_to_spiral_transform.inv(combined_spiral)
+    scroll_zyx, scroll_shift_1, scroll_shift_2 = combined_scroll.chunk(3, dim=0)
+
+    a = (scroll_shift_1 - scroll_zyx) / epsilon
+    b = (scroll_shift_2 - scroll_zyx) / epsilon
+    g11 = (a * a).sum(dim=-1)
+    g22 = (b * b).sum(dim=-1)
+    g12 = (a * b).sum(dim=-1)
+    trace_g = g11 + g22
+    det_g = g11 * g22 - g12 * g12
+    # Energy is tr(G) + tr(G^{-1}) = (s1^2 + s2^2) + (1/s1^2 + 1/s2^2), regularised per-eigenvalue so a
+    # vanishing singular value contributes a finite-but-large 1/(lambda+eps) barrier. We compute the
+    # regularised inverse-eigenvalue sum directly from trace_g, det_g via the algebraic identity
+    #   1/(l1+eps) + 1/(l2+eps) = ((l1+eps) + (l2+eps)) / ((l1+eps)(l2+eps))
+    #                           = (trace_g + 2*eps) / (det_g + eps*trace_g + eps**2)
+    inverse_eps = 1e-3
+    inverse_term = (trace_g + 2.0 * inverse_eps) / (det_g + inverse_eps * trace_g + inverse_eps ** 2)
+    energy = (trace_g + inverse_term - 4.0).clamp(min=0.0)
+    # Per-sample cap so a single near-degenerate sample doesn't dominate the batch mean / gradient.
+    energy = energy.clamp(max=1.e2)
+    return energy.mean()
 
 
 def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches, verbose=False):
@@ -3310,6 +3413,24 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             )
             losses['patch_stretch'] = patch_stretch_loss * cfg['loss_weight_patch_stretch']
             losses['patch_normals'] = patch_normals_loss * cfg['loss_weight_patch_normals']
+
+        if cfg['loss_weight_bending'] > 0:
+            bending_loss = get_bending_loss(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                shell_outer_winding_idx,
+                cfg['regularisation_num_points'],
+            )
+            losses['bending'] = bending_loss * cfg['loss_weight_bending']
+
+        if cfg['loss_weight_sym_dirichlet'] > 0:
+            sym_dirichlet_loss = get_symmetric_dirichlet_loss(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                shell_outer_winding_idx,
+                cfg['regularisation_num_points'],
+            )
+            losses['sym_dirichlet'] = sym_dirichlet_loss * cfg['loss_weight_sym_dirichlet']
 
         if cfg['loss_weight_winding_number'] > 0 and point_collections:
             losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_winding_number']
