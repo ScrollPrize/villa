@@ -126,8 +126,8 @@
 		},
 		{
 			"name": "snap",
-			"steps": 0,
-			"lr": 1.0,
+			"steps": "auto",
+			"lr": 0.1,
 			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
