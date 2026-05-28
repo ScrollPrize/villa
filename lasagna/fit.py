@@ -21,6 +21,9 @@ import optimizer
 import volume_scale
 
 
+_SHELL_STEP_ANALYSIS_ENABLED = False
+
+
 def _stage_start(label: str) -> float:
 	return 0.0
 
@@ -661,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
 			data_cfg,
 			seed=result.seed,
 			model_w=result.model_w,
+			model_w_unit="voxels",
 			model_h=result.model_h,
 		)
 		cfg["corr_points"] = result.corr_points
@@ -668,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
 		fit_config.setdefault("args", {}).update({
 			"seed": [float(v) for v in result.seed],
 			"model-w": int(result.model_w),
+			"model-w-unit": "voxels",
 			"model-h": int(result.model_h),
 			"approval-inpaint": True,
 			"approval-inpaint-output-mask": bool(approval_inpaint_output_mask_enabled),
@@ -835,18 +840,19 @@ def main(argv: list[str] | None = None) -> int:
 					f"area_sqrt=({trim_quality['area_sqrt_min']:.3f},{trim_quality['area_sqrt_med']:.3f},{trim_quality['area_sqrt_max']:.3f})",
 					flush=True,
 				)
-			step_stats = opt_loss_step.step_loss_analysis(selected_shell, mesh_step=source_step)
-			print(
-				f"[fit] shell-dir-crop selected-shell step analysis before crop: "
-				f"loss={step_stats['loss']:.6g} target={step_stats['target']:.3f} "
-				f"step_min={step_stats['step_min']:.3f} step_avg={step_stats['step_avg']:.3f} "
-				f"step_med={step_stats['step_med']:.3f} step_max={step_stats['step_max']:.3f} "
-				f"h_avg={step_stats['h_avg']:.3f} w_avg={step_stats['w_avg']:.3f} "
-				f"diag_avg={step_stats['diag_avg']:.3f} "
-				f"h_max={step_stats['h_max']:.3f} w_max={step_stats['w_max']:.3f} "
-				f"diag_max={step_stats['diag_max']:.3f} max_kind={step_stats['max_kind']}",
-				flush=True,
-			)
+			if _SHELL_STEP_ANALYSIS_ENABLED:
+				step_stats = opt_loss_step.step_loss_analysis(selected_shell, mesh_step=source_step)
+				print(
+					f"[fit] shell-dir-crop selected-shell step analysis before crop: "
+					f"loss={step_stats['loss']:.6g} target={step_stats['target']:.3f} "
+					f"step_min={step_stats['step_min']:.3f} step_avg={step_stats['step_avg']:.3f} "
+					f"step_med={step_stats['step_med']:.3f} step_max={step_stats['step_max']:.3f} "
+					f"h_avg={step_stats['h_avg']:.3f} w_avg={step_stats['w_avg']:.3f} "
+					f"diag_avg={step_stats['diag_avg']:.3f} "
+					f"h_max={step_stats['h_max']:.3f} w_max={step_stats['w_max']:.3f} "
+					f"diag_max={step_stats['diag_max']:.3f} max_kind={step_stats['max_kind']}",
+					flush=True,
+				)
 			crop_xyz, crop_valid, crop_info = crop_shell_surface(
 				surface,
 				closest,
@@ -857,18 +863,19 @@ def main(argv: list[str] | None = None) -> int:
 				mesh_step=float(model_cfg.mesh_step),
 				device=device,
 			)
-			crop_step_stats = opt_loss_step.step_loss_analysis(crop_xyz, mesh_step=float(model_cfg.mesh_step))
-			print(
-				f"[fit] shell-dir-crop resampled-crop step analysis: "
-				f"loss={crop_step_stats['loss']:.6g} target={crop_step_stats['target']:.3f} "
-				f"step_min={crop_step_stats['step_min']:.3f} step_avg={crop_step_stats['step_avg']:.3f} "
-				f"step_med={crop_step_stats['step_med']:.3f} step_max={crop_step_stats['step_max']:.3f} "
-				f"h_avg={crop_step_stats['h_avg']:.3f} w_avg={crop_step_stats['w_avg']:.3f} "
-				f"diag_avg={crop_step_stats['diag_avg']:.3f} "
-				f"h_max={crop_step_stats['h_max']:.3f} w_max={crop_step_stats['w_max']:.3f} "
-				f"diag_max={crop_step_stats['diag_max']:.3f} max_kind={crop_step_stats['max_kind']}",
-				flush=True,
-			)
+			if _SHELL_STEP_ANALYSIS_ENABLED:
+				crop_step_stats = opt_loss_step.step_loss_analysis(crop_xyz, mesh_step=float(model_cfg.mesh_step))
+				print(
+					f"[fit] shell-dir-crop resampled-crop step analysis: "
+					f"loss={crop_step_stats['loss']:.6g} target={crop_step_stats['target']:.3f} "
+					f"step_min={crop_step_stats['step_min']:.3f} step_avg={crop_step_stats['step_avg']:.3f} "
+					f"step_med={crop_step_stats['step_med']:.3f} step_max={crop_step_stats['step_max']:.3f} "
+					f"h_avg={crop_step_stats['h_avg']:.3f} w_avg={crop_step_stats['w_avg']:.3f} "
+					f"diag_avg={crop_step_stats['diag_avg']:.3f} "
+					f"h_max={crop_step_stats['h_max']:.3f} w_max={crop_step_stats['w_max']:.3f} "
+					f"diag_max={crop_step_stats['diag_max']:.3f} max_kind={crop_step_stats['max_kind']}",
+					flush=True,
+				)
 			mdl = model.Model3D.from_tifxyz_crop(
 				crop_xyz,
 				crop_valid,
@@ -886,18 +893,19 @@ def main(argv: list[str] | None = None) -> int:
 				model_w=(None if data_cfg.model_w is None else float(data_cfg.model_w)),
 				model_h=float(data_cfg.model_h),
 			)
-			model_step_stats = opt_loss_step.step_loss_analysis(mdl._grid_xyz().detach(), mesh_step=float(model_cfg.mesh_step))
-			print(
-				f"[fit] shell-dir-crop model-init step analysis: "
-				f"loss={model_step_stats['loss']:.6g} target={model_step_stats['target']:.3f} "
-				f"step_min={model_step_stats['step_min']:.3f} step_avg={model_step_stats['step_avg']:.3f} "
-				f"step_med={model_step_stats['step_med']:.3f} step_max={model_step_stats['step_max']:.3f} "
-				f"h_avg={model_step_stats['h_avg']:.3f} w_avg={model_step_stats['w_avg']:.3f} "
-				f"diag_avg={model_step_stats['diag_avg']:.3f} "
-				f"h_max={model_step_stats['h_max']:.3f} w_max={model_step_stats['w_max']:.3f} "
-				f"diag_max={model_step_stats['diag_max']:.3f} max_kind={model_step_stats['max_kind']}",
-				flush=True,
-			)
+			if _SHELL_STEP_ANALYSIS_ENABLED:
+				model_step_stats = opt_loss_step.step_loss_analysis(mdl._grid_xyz().detach(), mesh_step=float(model_cfg.mesh_step))
+				print(
+					f"[fit] shell-dir-crop model-init step analysis: "
+					f"loss={model_step_stats['loss']:.6g} target={model_step_stats['target']:.3f} "
+					f"step_min={model_step_stats['step_min']:.3f} step_avg={model_step_stats['step_avg']:.3f} "
+					f"step_med={model_step_stats['step_med']:.3f} step_max={model_step_stats['step_max']:.3f} "
+					f"h_avg={model_step_stats['h_avg']:.3f} w_avg={model_step_stats['w_avg']:.3f} "
+					f"diag_avg={model_step_stats['diag_avg']:.3f} "
+					f"h_max={model_step_stats['h_max']:.3f} w_max={model_step_stats['w_max']:.3f} "
+					f"diag_max={model_step_stats['diag_max']:.3f} max_kind={model_step_stats['max_kind']}",
+					flush=True,
+				)
 			print(
 				f"[fit] shell-dir-crop selected {closest.shell_id}: "
 				f"quad=({closest.quad_row},{closest.quad_col}) tri={closest.triangle_id} "
