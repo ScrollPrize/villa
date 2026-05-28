@@ -21,6 +21,11 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 		self.assertIn("VC3D is transport only", self.source)
 		self.assertIn("Config interpretation belongs in fit_service.py / fit.py", self.source)
 
+	def test_vc3d_sends_active_volume_shape_for_lasagna_scaling(self) -> None:
+		self.assertIn("volumeShapeZyxForState", self.source)
+		self.assertIn('request[QStringLiteral("volume_shape_zyx")] = volumeShapeZyx', self.source)
+		self.assertIn('jobSpec[QStringLiteral("volume_shape_zyx")] = volumeShapeZyx', self.source)
+
 	def test_vc3d_does_not_branch_on_known_lasagna_config_semantics(self) -> None:
 		forbidden_literals = [
 			"lasagnaModelInit",

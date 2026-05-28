@@ -346,6 +346,47 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 				fit2tifxyz.main(["--input", str(ckpt), "--output", str(out)], cancel_fn=cancel)
 			self.assertGreaterEqual(calls, 1)
 
+	def test_checkpoint_export_scales_to_target_volume_shape(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": {
+				"mesh_step": 2,
+				"winding_step": 1,
+				"subsample_mesh": 1,
+				"subsample_winding": 1,
+				"scaledown": 1.0,
+				"z_step_eff": 1,
+				"volume_extent": None,
+				"pyramid_d": False,
+				"lasagna_base_shape_zyx": [100, 100, 100],
+			},
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+
+			fit2tifxyz.main([
+				"--input", str(ckpt),
+				"--output", str(out),
+				"--target-volume-shape-zyx", "50", "50", "50",
+			])
+
+			tifxyz = out / "winding_0000.tifxyz"
+			x_out = tifffile.imread(str(tifxyz / "x.tif"))
+			meta = json.loads((tifxyz / "meta.json").read_text(encoding="utf-8"))
+
+		np.testing.assert_allclose(x_out, x * 0.5)
+		self.assertEqual(meta["base_shape_zyx"], [50, 50, 50])
+		self.assertEqual(meta["lasagna_base_shape_zyx"], [100, 100, 100])
+		self.assertEqual(meta["scale"], [1.0, 1.0])
+		self.assertEqual(meta["bbox"], [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+		self.assertEqual(meta["area_vx2"], 4.0)
+
 
 if __name__ == "__main__":
 	unittest.main()

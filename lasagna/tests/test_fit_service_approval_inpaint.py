@@ -20,6 +20,21 @@ def _b64(data: bytes) -> str:
 
 
 class FitServiceApprovalInpaintTest(unittest.TestCase):
+	def test_request_volume_shape_accepts_top_level_and_job_spec(self) -> None:
+		body = {
+			"volume_shape_zyx": [10, 20, 30],
+			"job_spec": {"volume_shape_zyx": [10, 20, 30]},
+		}
+
+		self.assertEqual(fit_service._request_volume_shape_zyx(body), (10, 20, 30))
+
+	def test_request_volume_shape_rejects_mismatch(self) -> None:
+		with self.assertRaisesRegex(ValueError, "must match"):
+			fit_service._request_volume_shape_zyx({
+				"volume_shape_zyx": [10, 20, 30],
+				"job_spec": {"volume_shape_zyx": [10, 20, 31]},
+			})
+
 	def test_seed_mode_accepts_generic_tifxyz_and_ignores_without_consumer(self) -> None:
 		body = {
 			"tifxyz": {

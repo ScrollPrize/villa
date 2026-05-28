@@ -18,6 +18,7 @@ import opt_loss_corr
 import opt_loss_dir
 import opt_loss_step
 import optimizer
+import volume_scale
 
 
 def _stage_start(label: str) -> float:
@@ -243,6 +244,90 @@ def _scale_from_tifxyz_meta(meta: dict, mesh_step: int) -> float:
 	return 1.0 / float(max(1, int(mesh_step)))
 
 
+def _shape_list(shape: tuple[int, int, int] | None) -> list[int] | None:
+	return None if shape is None else [int(v) for v in shape]
+
+
+def _source_shape_from_tifxyz_meta(meta: dict, fallback_shape_zyx: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+	return volume_scale.tifxyz_source_shape(meta, fallback_shape_zyx)
+
+
+def _tifxyz_scale_to_base(
+	meta: dict,
+	*,
+	base_shape_zyx: tuple[int, int, int] | None,
+	request_shape_zyx: tuple[int, int, int] | None,
+	path_label: str,
+) -> volume_scale.CoordinateScale:
+	source_shape = _source_shape_from_tifxyz_meta(meta, request_shape_zyx)
+	return volume_scale.coordinate_scale_to_base(
+		base_shape_zyx=base_shape_zyx,
+		source_shape_zyx=source_shape,
+		source_name=f"{path_label}.base_shape_zyx",
+	)
+
+
+def _load_scaled_tifxyz(
+	path: str,
+	*,
+	device: torch.device,
+	base_shape_zyx: tuple[int, int, int] | None,
+	request_shape_zyx: tuple[int, int, int] | None,
+	path_label: str,
+):
+	from tifxyz_io import load_tifxyz
+	xyz, valid, meta = load_tifxyz(path, device=device)
+	scale = _tifxyz_scale_to_base(
+		meta,
+		base_shape_zyx=base_shape_zyx,
+		request_shape_zyx=request_shape_zyx,
+		path_label=path_label,
+	)
+	xyz = volume_scale.scale_tifxyz_tensor(xyz, valid, scale.factor)
+	if not scale.is_identity:
+		print(
+			f"[fit] scaled {path_label} coordinates by {scale.factor:.9g} "
+			f"from source_shape={_shape_list(scale.source_shape_zyx)} "
+			f"to base_shape={_shape_list(scale.base_shape_zyx)}",
+			flush=True,
+		)
+	return xyz, valid, meta, scale
+
+
+def _scaled_approval_tifxyz_path(
+	path: str,
+	*,
+	tmp_parent: Path | None,
+	base_shape_zyx: tuple[int, int, int] | None,
+	request_shape_zyx: tuple[int, int, int] | None,
+) -> str:
+	meta = volume_scale.read_tifxyz_meta(path)
+	scale = _tifxyz_scale_to_base(
+		meta,
+		base_shape_zyx=base_shape_zyx,
+		request_shape_zyx=request_shape_zyx,
+		path_label="approval-inpaint tifxyz",
+	)
+	if scale.is_identity:
+		return path
+	parent = tmp_parent if tmp_parent is not None else Path(path).parent
+	parent.mkdir(parents=True, exist_ok=True)
+	dst = parent / "approval_inpaint_base_scale.tifxyz"
+	volume_scale.copy_scaled_tifxyz_dir(
+		path,
+		dst,
+		factor=scale.factor,
+		base_shape_zyx=base_shape_zyx,
+	)
+	print(
+		f"[fit] approval-inpaint tifxyz scaled by {scale.factor:.9g} "
+		f"from source_shape={_shape_list(scale.source_shape_zyx)} "
+		f"to base_shape={_shape_list(scale.base_shape_zyx)}",
+		flush=True,
+	)
+	return str(dst)
+
+
 def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData3D, fit_config: dict) -> None:
 	st = dict(mdl.state_dict())
 	for k in [k for k in st if k.startswith("mesh_ms.")]:
@@ -254,7 +339,10 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 		st["mesh_flat"] = xyz.permute(3, 0, 1, 2).detach().cpu()
 		st["flatten_map_flat"] = map_yx.detach().cpu()
 		st["flatten_point_mask"] = point_mask.detach().cpu()
-	st["_model_params_"] = asdict(mdl.params)
+	params = asdict(mdl.params)
+	if fit_config.get("lasagna_base_shape_zyx") is not None:
+		params["lasagna_base_shape_zyx"] = list(fit_config["lasagna_base_shape_zyx"])
+	st["_model_params_"] = params
 	st["_fit_config_"] = fit_config
 	torch.save(st, path)
 
@@ -291,6 +379,10 @@ def _export_flatten_result(
 		model_source=model_source,
 		fit_config=fit_config,
 		area=area,
+		base_shape_zyx=volume_scale.parse_shape_zyx(
+			fit_config.get("lasagna_base_shape_zyx"), name="lasagna_base_shape_zyx"),
+		lasagna_base_shape_zyx=volume_scale.parse_shape_zyx(
+			fit_config.get("lasagna_base_shape_zyx"), name="lasagna_base_shape_zyx"),
 	)
 	fit2tifxyz._print_area(area)
 
@@ -495,6 +587,33 @@ def main(argv: list[str] | None = None) -> int:
 	_t = _stage_start("probe_preprocessed_data")
 	prep_params = fit_data.get_preprocessed_params(str(data_cfg.input))
 	source_to_base = float(prep_params.get("source_to_base", 1.0))
+	lasagna_base_shape_zyx = volume_scale.parse_shape_zyx(
+		prep_params.get("base_shape_zyx"), name="lasagna_base_shape_zyx")
+	vc3d_volume_shape_zyx = volume_scale.parse_shape_zyx(
+		cfg.get("vc3d_volume_shape_zyx"), name="vc3d_volume_shape_zyx")
+	request_scale = volume_scale.coordinate_scale_to_base(
+		base_shape_zyx=lasagna_base_shape_zyx,
+		source_shape_zyx=vc3d_volume_shape_zyx,
+		source_name="vc3d_volume_shape_zyx",
+	)
+	fit_config["lasagna_base_shape_zyx"] = _shape_list(lasagna_base_shape_zyx)
+	if vc3d_volume_shape_zyx is not None:
+		fit_config["vc3d_volume_shape_zyx"] = _shape_list(vc3d_volume_shape_zyx)
+	if not request_scale.is_identity:
+		print(
+			f"[fit] VC3D coordinate import scale={request_scale.factor:.9g} "
+			f"vc3d_shape={_shape_list(vc3d_volume_shape_zyx)} "
+			f"lasagna_base_shape={_shape_list(lasagna_base_shape_zyx)}",
+			flush=True,
+		)
+	if data_cfg.seed is not None:
+		scaled_seed = tuple(float(v) for v in volume_scale.scale_xyz_point(data_cfg.seed, request_scale.factor)[:3])
+		data_cfg = dataclasses.replace(data_cfg, seed=scaled_seed)
+		fit_config.setdefault("args", {})["seed"] = [float(v) for v in scaled_seed]
+	if isinstance(cfg.get("corr_points"), dict):
+		scaled_corr = volume_scale.scale_corr_points_json(cfg["corr_points"], request_scale.factor)
+		cfg["corr_points"] = scaled_corr
+		fit_config["corr_points"] = copy.deepcopy(scaled_corr)
 	# Model scaledown in base coords = channel_scaledown * source_to_base
 	scaledown = float(prep_params["scaledown"]) * source_to_base
 	volume_extent_fullres = prep_params.get("volume_extent_fullres")
@@ -520,6 +639,12 @@ def main(argv: list[str] | None = None) -> int:
 		if not approval_tifxyz:
 			raise ValueError("approval-inpaint requires service arg approval-inpaint-tifxyz")
 		from approval_inpaint import build_approval_inpaint
+		approval_tifxyz = _scaled_approval_tifxyz_path(
+			str(approval_tifxyz),
+			tmp_parent=None,
+			base_shape_zyx=lasagna_base_shape_zyx,
+			request_shape_zyx=vc3d_volume_shape_zyx,
+		)
 
 		result = build_approval_inpaint(
 			tifxyz_path=str(approval_tifxyz),
@@ -616,9 +741,23 @@ def main(argv: list[str] | None = None) -> int:
 	# --- Construct / load model (before data, so we can compute bbox) ---
 	_t = _stage_start("construct_model")
 	if model_init == "ext":
-		mdl = model.Model3D.from_tifxyz(
-			tifxyz_init, device=device,
-			mesh_step=model_cfg.mesh_step,
+		from tifxyz_io import surface_step_stats
+		xyz_init, valid_init, _meta_init, _scale_init = _load_scaled_tifxyz(
+			str(tifxyz_init),
+			device=device,
+			base_shape_zyx=lasagna_base_shape_zyx,
+			request_shape_zyx=vc3d_volume_shape_zyx,
+			path_label="tifxyz-init",
+		)
+		_step_h, _step_w, _step_diag, step_avg = surface_step_stats(xyz_init, valid_init)
+		mesh_step_init = model_cfg.mesh_step
+		if math.isfinite(step_avg) and step_avg > 0.0:
+			mesh_step_init = max(1, int(round(step_avg)))
+		mdl = model.Model3D.from_tifxyz_crop(
+			xyz_init,
+			valid_init,
+			device=device,
+			mesh_step=mesh_step_init,
 			winding_step=model_cfg.winding_step,
 			subsample_mesh=model_cfg.subsample_mesh,
 			subsample_winding=model_cfg.subsample_winding,
@@ -812,13 +951,25 @@ def main(argv: list[str] | None = None) -> int:
 	_t = _stage_start("load_external_surfaces")
 	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
 	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
-		from tifxyz_io import load_tifxyz, surface_step_stats
+		from tifxyz_io import surface_step_stats
 		for es in ext_surfaces_cfg:
 			es_path = str(es["path"])
 			es_offset = float(es.get("offset", 1.0))
-			xyz_ext, valid_ext, meta_ext = load_tifxyz(es_path, device=device)
+			xyz_ext, valid_ext, meta_ext, es_scale = _load_scaled_tifxyz(
+				es_path,
+				device=device,
+				base_shape_zyx=lasagna_base_shape_zyx,
+				request_shape_zyx=vc3d_volume_shape_zyx,
+				path_label=f"external surface {es_path}",
+			)
 			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
-			scale = meta_ext.get("scale") if isinstance(meta_ext, dict) else None
+			meta_ext_base = volume_scale.scale_tifxyz_meta(
+				meta_ext,
+				es_scale.factor,
+				base_shape_zyx=lasagna_base_shape_zyx,
+				lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+			)
+			scale = meta_ext_base.get("scale") if isinstance(meta_ext_base, dict) else None
 			meta_step = float("nan")
 			if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
 				meta_step = 1.0 / float(scale[0])
@@ -979,7 +1130,10 @@ def main(argv: list[str] | None = None) -> int:
 			st["conn_offsets"] = torch.zeros_like(st["conn_offsets"])
 		with torch.no_grad():
 			st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
-		st["_model_params_"] = asdict(mdl.params)
+		params = asdict(mdl.params)
+		if lasagna_base_shape_zyx is not None:
+			params["lasagna_base_shape_zyx"] = [int(v) for v in lasagna_base_shape_zyx]
+		st["_model_params_"] = params
 		st["_fit_config_"] = fit_config
 		corr_results = opt_loss_corr.get_last_results()
 		if corr_results is not None:

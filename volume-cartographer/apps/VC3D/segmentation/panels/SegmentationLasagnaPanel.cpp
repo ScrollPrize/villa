@@ -196,6 +196,19 @@ QStringList linkedSurfaceNamesFromJobSpec(const QJsonObject& jobSpec)
     return linkedSurfaceNamesFromRefs(jobSpec[QStringLiteral("linked_surfaces")].toArray());
 }
 
+QJsonArray volumeShapeZyxForState(CState* state)
+{
+    if (!state || !state->currentVolume()) {
+        return {};
+    }
+    const auto shape = state->currentVolume()->shape();
+    return QJsonArray{
+        static_cast<int>(shape[0]),
+        static_cast<int>(shape[1]),
+        static_cast<int>(shape[2]),
+    };
+}
+
 std::filesystem::path outputSegmentsPathForState(CState* state)
 {
     if (!state || !state->vpkg()) {
@@ -1733,6 +1746,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         } catch (...) {
         }
     }
+    const QJsonArray volumeShapeZyx = volumeShapeZyxForState(state);
 
     QJsonObject request;
     request[QStringLiteral("data_input")] = dataInput;
@@ -1741,6 +1755,9 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     request[QStringLiteral("config_name")] = QFileInfo(configPath).fileName();
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
+    }
+    if (!volumeShapeZyx.isEmpty()) {
+        request[QStringLiteral("volume_shape_zyx")] = volumeShapeZyx;
     }
     QJsonObject jobSpec;
     QJsonArray objectUploads;
@@ -1841,6 +1858,9 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     }
     jobSpec[QStringLiteral("config")] = config;
     jobSpec[QStringLiteral("linked_surfaces")] = linkedSurfaces;
+    if (!volumeShapeZyx.isEmpty()) {
+        jobSpec[QStringLiteral("volume_shape_zyx")] = volumeShapeZyx;
+    }
     request[QStringLiteral("config")] = config;
     request[QStringLiteral("job_spec")] = jobSpec;
     request[QStringLiteral("_objects")] = objectUploads;

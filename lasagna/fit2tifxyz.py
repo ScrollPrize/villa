@@ -14,6 +14,7 @@ import torch
 
 import cli_json
 import model
+import volume_scale
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class ExportConfig:
 	copy_model: bool = False
 	output_name: str | None = None
 	voxel_size_um: float | None = None
+	target_volume_shape_zyx: tuple[int, int, int] | None = None
 
 
 def _valid_xyz_mask(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -51,6 +53,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	g.add_argument("--output-name", default=None, help="Override tifxyz directory name")
 	g.add_argument("--voxel-size-um", type=float, default=None,
 		help="Voxel size in micrometers (for area calculation)")
+	g.add_argument("--target-volume-shape-zyx", type=int, nargs=3, metavar=("Z", "Y", "X"), default=None,
+		help="Export coordinates into this VC3D target volume coordinate scale")
 	return p
 
 
@@ -86,6 +90,52 @@ def _bbox_for_xyz(x: np.ndarray, y: np.ndarray, z: np.ndarray, *, out_dir: Path)
 		[float(np.nanmin(x[valid])), float(np.nanmin(y[valid])), float(np.nanmin(z[valid]))],
 		[float(np.nanmax(x[valid])), float(np.nanmax(y[valid])), float(np.nanmax(z[valid]))],
 	]
+
+
+def _shape_from_model_params(model_params: dict | None, key: str) -> tuple[int, int, int] | None:
+	if not isinstance(model_params, dict):
+		return None
+	return volume_scale.parse_shape_zyx(model_params.get(key), name=f"_model_params_.{key}")
+
+
+def _export_coordinate_scale(
+	*,
+	model_params: dict | None,
+	target_volume_shape_zyx: tuple[int, int, int] | None,
+) -> tuple[float, tuple[int, int, int] | None, tuple[int, int, int] | None]:
+	lasagna_base_shape = _shape_from_model_params(model_params, "lasagna_base_shape_zyx")
+	if target_volume_shape_zyx is None:
+		return 1.0, lasagna_base_shape, lasagna_base_shape
+	if lasagna_base_shape is None:
+		print(
+			"[fit2tifxyz] WARNING: checkpoint has no lasagna_base_shape_zyx; "
+			"export target volume shape is recorded without coordinate scaling",
+			flush=True,
+		)
+		return 1.0, None, target_volume_shape_zyx
+	scale = volume_scale.coordinate_scale_between_shapes(
+		from_shape_zyx=lasagna_base_shape,
+		to_shape_zyx=target_volume_shape_zyx,
+		from_name="lasagna_base_shape_zyx",
+		to_name="target_volume_shape_zyx",
+	)
+	if not scale.is_identity:
+		print(
+			f"[fit2tifxyz] export coordinate scale={scale.factor:.9g} "
+			f"lasagna_base_shape={list(lasagna_base_shape)} "
+			f"target_shape={list(target_volume_shape_zyx)}",
+			flush=True,
+		)
+	return scale.factor, lasagna_base_shape, target_volume_shape_zyx
+
+
+def _scaled_xyz_for_export(
+	x: np.ndarray,
+	y: np.ndarray,
+	z: np.ndarray,
+	factor: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	return volume_scale.scale_tifxyz_arrays(x, y, z, factor)
 
 
 def _mark_segment_vertices(
@@ -597,7 +647,9 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  copy_model: bool = False, fit_config: dict | None = None,
 				  job_spec: dict | None = None,
 				  area: dict | None = None,
-				  components: list[list[int]] | None = None) -> None:
+				  components: list[list[int]] | None = None,
+				  base_shape_zyx: tuple[int, int, int] | None = None,
+				  lasagna_base_shape_zyx: tuple[int, int, int] | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -624,6 +676,10 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		"scale": [float(scale), float(scale)],
 		"bbox": _bbox_for_xyz(xf, yf, zf, out_dir=out_dir),
 	}
+	if base_shape_zyx is not None:
+		meta["base_shape_zyx"] = [int(v) for v in base_shape_zyx]
+	if lasagna_base_shape_zyx is not None:
+		meta["lasagna_base_shape_zyx"] = [int(v) for v in lasagna_base_shape_zyx]
 	if components is not None:
 		meta["components"] = components
 	if area is not None:
@@ -667,6 +723,9 @@ def _export_flatten_checkpoint(
 	model_params: dict | None,
 	fit_config: dict | None,
 	job_spec: dict | None,
+	export_factor: float = 1.0,
+	lasagna_base_shape_zyx: tuple[int, int, int] | None = None,
+	output_base_shape_zyx: tuple[int, int, int] | None = None,
 ) -> int:
 	map_yx = _as_numpy_float32(st["flatten_map_flat"], name="flatten_map_flat")
 	if map_yx.ndim != 3 or map_yx.shape[-1] != 2:
@@ -704,7 +763,8 @@ def _export_flatten_checkpoint(
 	if model_params is not None:
 		mesh_step = int(model_params.get("mesh_step", 100))
 	xy_step_fullres = float(mesh_step)
-	meta_scale = 1.0 / xy_step_fullres
+	xy_step_export = xy_step_fullres * float(export_factor)
+	meta_scale = 1.0 / xy_step_export
 
 	out_base = Path(cfg.output)
 	out_base.mkdir(parents=True, exist_ok=True)
@@ -714,7 +774,8 @@ def _export_flatten_checkpoint(
 	d = np.where(valid, 0.0, -1.0).astype(np.float32, copy=False)
 	seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}0000.tifxyz"
 	out_dir = out_base / seg_name
-	area = _get_area(x, y, z, xy_step_fullres, cfg.voxel_size_um)
+	x, y, z = _scaled_xyz_for_export(x, y, z, export_factor)
+	area = _get_area(x, y, z, xy_step_export, cfg.voxel_size_um)
 	_write_tifxyz(
 		out_dir=out_dir,
 		x=x,
@@ -727,6 +788,8 @@ def _export_flatten_checkpoint(
 		fit_config=fit_config,
 		job_spec=job_spec,
 		area=area,
+		base_shape_zyx=output_base_shape_zyx,
+		lasagna_base_shape_zyx=lasagna_base_shape_zyx,
 	)
 	if model_params is not None:
 		(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
@@ -750,6 +813,10 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		copy_model=bool(args.copy_model),
 		output_name=None if args.output_name in (None, "") else str(args.output_name),
 		voxel_size_um=args.voxel_size_um,
+		target_volume_shape_zyx=(
+			None if args.target_volume_shape_zyx is None
+			else tuple(int(v) for v in args.target_volume_shape_zyx)
+		),
 	)
 
 	dev = torch.device(cfg.device)
@@ -773,6 +840,10 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 	approval_output_mask = st.get("_approval_inpaint_output_mask_", None)
 	if not isinstance(approval_output_mask, dict):
 		approval_output_mask = None
+	export_factor, lasagna_base_shape_zyx, output_base_shape_zyx = _export_coordinate_scale(
+		model_params=model_params,
+		target_volume_shape_zyx=cfg.target_volume_shape_zyx,
+	)
 	if "flatten_map_flat" in st:
 		_check_cancel()
 		return _export_flatten_checkpoint(
@@ -781,6 +852,9 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		model_params=model_params,
 		fit_config=fit_config,
 		job_spec=job_spec,
+		export_factor=export_factor,
+		lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+		output_base_shape_zyx=output_base_shape_zyx,
 	)
 
 	# Reconstruct mesh (3, D, Hm, Wm) — pyramid stores full xyz positions
@@ -796,14 +870,15 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 	if model_params is not None:
 		mesh_step = int(model_params.get("mesh_step", 100))
 	xy_step_fullres = float(mesh_step)
-	meta_scale = 1.0 / xy_step_fullres
+	xy_step_export = xy_step_fullres * float(export_factor)
+	meta_scale = 1.0 / xy_step_export
 
 	out_base = Path(cfg.output)
 	out_base.mkdir(parents=True, exist_ok=True)
 
 	BORDER_W = 2
 
-	print(f"[fit2tifxyz] exporting D={D} Hm={Hm} Wm={Wm}, mesh already in fullres coords"
+	print(f"[fit2tifxyz] exporting D={D} Hm={Hm} Wm={Wm}, mesh stored in Lasagna base coords"
 		  f", voxel_size_um={cfg.voxel_size_um}")
 	if approval_output_mask is not None:
 		collection_ids = approval_output_mask.get("corr_collection_ids", [])
@@ -869,11 +944,14 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		_check_cancel()
 		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
 		out_dir = out_base / seg_name
-		area = _get_area(x_all, y_all, z_all, xy_step_fullres, cfg.voxel_size_um)
+		x_all, y_all, z_all = _scaled_xyz_for_export(x_all, y_all, z_all, export_factor)
+		area = _get_area(x_all, y_all, z_all, xy_step_export, cfg.voxel_size_um)
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 					  job_spec=job_spec,
-					  area=area, components=components if D > 1 else None)
+					  area=area, components=components if D > 1 else None,
+					  base_shape_zyx=output_base_shape_zyx,
+					  lasagna_base_shape_zyx=lasagna_base_shape_zyx)
 		if approval_output_mask is not None:
 			_write_mask_debug_artifacts(
 				out_dir,
@@ -916,7 +994,8 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 				_print_mask_debug(mask_debug)
 			valid = _valid_xyz_mask(x, y, z)
 			d_layer = np.where(valid, float(d), -1.0).astype(np.float32)
-			area = _get_area(x, y, z, xy_step_fullres, cfg.voxel_size_um)
+			x, y, z = _scaled_xyz_for_export(x, y, z, export_factor)
+			area = _get_area(x, y, z, xy_step_export, cfg.voxel_size_um)
 			total_area["area_vx2"] += area["area_vx2"]
 			if "area_cm2" in area:
 				total_area["area_cm2"] += area["area_cm2"]
@@ -925,7 +1004,9 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 						  job_spec=job_spec,
-						  area=area)
+						  area=area,
+						  base_shape_zyx=output_base_shape_zyx,
+						  lasagna_base_shape_zyx=lasagna_base_shape_zyx)
 			if approval_output_mask is not None and mask_debug is not None:
 				_write_mask_debug_artifacts(
 					out_dir,

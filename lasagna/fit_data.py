@@ -965,6 +965,7 @@ def get_preprocessed_params(path: str) -> dict:
 		Z, Y, X = (int(v) for v in shape_zyx)
 		return {
 			"scaledown": float(scaledown),
+			"base_shape_zyx": (int(Z), int(Y), int(X)),
 			"volume_extent_fullres": (
 				int(X * s2b),
 				int(Y * s2b),

@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
+import volume_scale
+
 
 # ---------------------------------------------------------------------------
 # Global config
@@ -212,6 +214,19 @@ def _truthy_config_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return False
+
+
+def _request_volume_shape_zyx(body: dict[str, Any]) -> tuple[int, int, int] | None:
+    shape = volume_scale.parse_shape_zyx(body.get("volume_shape_zyx"), name="volume_shape_zyx")
+    spec = body.get("job_spec")
+    if isinstance(spec, dict):
+        spec_shape = volume_scale.parse_shape_zyx(
+            spec.get("volume_shape_zyx"), name="job_spec.volume_shape_zyx")
+        if shape is not None and spec_shape is not None and tuple(shape) != tuple(spec_shape):
+            raise ValueError("volume_shape_zyx and job_spec.volume_shape_zyx must match")
+        if shape is None:
+            shape = spec_shape
+    return shape
 
 
 def _approval_inpaint_enabled(args_section: dict[str, Any]) -> bool:
@@ -398,6 +413,8 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         "linked_surfaces": spec.get("linked_surfaces", []),
         "config": cfg,
     }
+    if "volume_shape_zyx" in spec:
+        resolved["_job_spec_"]["volume_shape_zyx"] = spec.get("volume_shape_zyx")
 
     model_ref = spec.get("model")
     if model_ref not in (None, {}, ""):
@@ -1040,6 +1057,11 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     if not isinstance(config, dict):
         job.set_error("request config must be an object")
         return
+    try:
+        request_volume_shape_zyx = _request_volume_shape_zyx(body)
+    except Exception as exc:
+        job.set_error(str(exc))
+        return
     args_section_initial = config.get("args", {})
     if not isinstance(args_section_initial, dict):
         args_section_initial = {}
@@ -1077,6 +1099,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
 
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
+        if request_volume_shape_zyx is not None:
+            cfg["vc3d_volume_shape_zyx"] = [int(v) for v in request_volume_shape_zyx]
         args_section_pre = cfg.get("args", {})
         if not isinstance(args_section_pre, dict):
             args_section_pre = {}
@@ -1201,6 +1225,13 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             voxel_size_um = config.get("voxel_size_um")
             if voxel_size_um is not None:
                 export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
+            if request_volume_shape_zyx is not None:
+                export_argv.extend([
+                    "--target-volume-shape-zyx",
+                    str(int(request_volume_shape_zyx[0])),
+                    str(int(request_volume_shape_zyx[1])),
+                    str(int(request_volume_shape_zyx[2])),
+                ])
             _check_cancel()
             fit2tifxyz.main(export_argv, cancel_fn=_check_cancel)
             _check_cancel()
