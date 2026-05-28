@@ -1223,8 +1223,7 @@ QStringList SegmentationLasagnaPanel::currentLinkedSurfaceNames() const
     }
 
     const QStringList storedNames = linkedSurfaceNamesFromRefs(linkedSurfacesFromMeta(segPath));
-    const bool selectedLasagnaModel = std::filesystem::exists(segPath / "model.pt");
-    if (selectedLasagnaModel || !storedNames.isEmpty()) {
+    if (!storedNames.isEmpty()) {
         return storedNames;
     }
 
@@ -1802,8 +1801,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         }
 
         linkedSurfaces = linkedSurfacesFromMeta(segPath);
-        const bool selectedLasagnaModel = std::filesystem::exists(segPath / "model.pt");
-        if (linkedSurfaces.isEmpty() && !selectedLasagnaModel) {
+        if (linkedSurfaces.isEmpty()) {
             linkedSurfaces.append(currentSegmentUpload[QStringLiteral("object")].toObject());
             appendUploadIfNew(currentSegmentUpload);
         } else if (!outputSegmentsPath.empty()) {

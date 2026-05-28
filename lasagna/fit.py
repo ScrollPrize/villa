@@ -951,6 +951,9 @@ def main(argv: list[str] | None = None) -> int:
 	_t = _stage_start("load_external_surfaces")
 	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
 	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
+		if len(ext_surfaces_cfg) != 1:
+			raise ValueError(
+				f"external_surfaces currently requires exactly one entry, got {len(ext_surfaces_cfg)}")
 		from tifxyz_io import surface_step_stats
 		for es in ext_surfaces_cfg:
 			es_path = str(es["path"])

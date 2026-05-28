@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import os
 import sys
 import tempfile
@@ -16,7 +15,7 @@ import fit_service
 
 
 def _b64(data: bytes) -> str:
-	return base64.b64encode(data).decode("ascii")
+	return fit_service.base64.b64encode(data).decode("ascii")
 
 
 class FitServiceApprovalInpaintTest(unittest.TestCase):
@@ -35,177 +34,154 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 				"job_spec": {"volume_shape_zyx": [10, 20, 31]},
 			})
 
-	def test_seed_mode_accepts_generic_tifxyz_and_ignores_without_consumer(self) -> None:
-		body = {
-			"tifxyz": {
-				"x.tif": _b64(b"x"),
-				"y.tif": _b64(b"y"),
-				"z.tif": _b64(b"z"),
-				"meta.json": _b64(b"{}"),
-				"approval.tif": _b64(b"approval"),
-				"d.tif": _b64(b"d"),
-			}
-		}
-		cfg = {"args": {"model-init": "seed"}}
+	def test_seed_mode_ignores_external_surface_without_consumer(self) -> None:
+		cfg = {"args": {"model-init": "seed"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz"}]}
 		args = cfg["args"]
 
-		with tempfile.TemporaryDirectory() as td:
-			tifxyz_dir = fit_service._decode_tifxyz_for_request(
-				body=body,
-				cfg=cfg,
-				args_section=args,
-				tmp_dir=td,
-				model_init="seed",
-				ext_offset_enabled=False,
-			)
+		tifxyz_dir = fit_service._wire_external_surface_for_request(
+			cfg=cfg,
+			args_section=args,
+			model_init="seed",
+			ext_offset_enabled=False,
+		)
 
-			self.assertIsNotNone(tifxyz_dir)
-			self.assertEqual((Path(tifxyz_dir) / "approval.tif").read_bytes(), b"approval")
-			self.assertNotIn("approval-inpaint-tifxyz", args)
-			self.assertNotIn("tifxyz-init", args)
+		self.assertIsNone(tifxyz_dir)
+		self.assertNotIn("approval-inpaint-tifxyz", args)
+		self.assertNotIn("tifxyz-init", args)
 
-	def test_approval_inpaint_wires_generic_tifxyz(self) -> None:
-		body = {"tifxyz": {"x.tif": _b64(b"x"), "approval.tif": _b64(b"approval")}}
-		cfg = {"args": {"model-init": "seed", "approval-inpaint": True}}
+	def test_approval_inpaint_wires_external_surface(self) -> None:
+		cfg = {"args": {"model-init": "seed", "approval-inpaint": True}, "external_surfaces": [{"path": "/tmp/ref.tifxyz"}]}
 		args = cfg["args"]
 
-		with tempfile.TemporaryDirectory() as td:
-			tifxyz_dir = fit_service._decode_tifxyz_for_request(
-				body=body,
-				cfg=cfg,
-				args_section=args,
-				tmp_dir=td,
-				model_init="seed",
-				ext_offset_enabled=False,
-			)
+		tifxyz_dir = fit_service._wire_external_surface_for_request(
+			cfg=cfg,
+			args_section=args,
+			model_init="seed",
+			ext_offset_enabled=False,
+		)
 
-			self.assertIsNotNone(tifxyz_dir)
-			self.assertEqual(args["approval-inpaint-tifxyz"], tifxyz_dir)
-			self.assertNotIn("tifxyz-init", args)
+		self.assertEqual(tifxyz_dir, "/tmp/ref.tifxyz")
+		self.assertEqual(args["approval-inpaint-tifxyz"], "/tmp/ref.tifxyz")
+		self.assertNotIn("tifxyz-init", args)
 
 	def test_approval_inpaint_requires_seed_model_init(self) -> None:
-		body = {"tifxyz": {"x.tif": _b64(b"x")}}
 		cfg = {"args": {"model-init": "ext", "approval-inpaint": True}}
 
-		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "only valid with args.model-init=seed"):
-				fit_service._decode_tifxyz_for_request(
-					body=body,
-					cfg=cfg,
-					args_section=cfg["args"],
-					tmp_dir=td,
-					model_init="ext",
-					ext_offset_enabled=False,
-				)
-
-	def test_approval_inpaint_requires_generic_tifxyz(self) -> None:
-		cfg = {"args": {"model-init": "seed", "approval-inpaint": True}}
-
-		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "approval-inpaint requires request tifxyz"):
-				fit_service._decode_tifxyz_for_request(
-					body={},
-					cfg=cfg,
-					args_section=cfg["args"],
-					tmp_dir=td,
-					model_init="seed",
-					ext_offset_enabled=False,
-				)
-
-	def test_ext_init_requires_generic_tifxyz(self) -> None:
-		cfg = {"args": {"model-init": "ext"}}
-
-		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "model-init=ext requires request tifxyz"):
-				fit_service._decode_tifxyz_for_request(
-					body={},
-					cfg=cfg,
-					args_section=cfg["args"],
-					tmp_dir=td,
-					model_init="ext",
-					ext_offset_enabled=False,
-				)
-
-	def test_flatten_does_not_synthesize_generic_tifxyz_as_external_surface(self) -> None:
-		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
-		cfg = {"args": {"model-init": "flatten"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz"}]}
-
-		with tempfile.TemporaryDirectory() as td:
-			tifxyz_dir = fit_service._decode_tifxyz_for_request(
-				body=body,
+		with self.assertRaisesRegex(ValueError, "only valid with args.model-init=seed"):
+			fit_service._wire_external_surface_for_request(
 				cfg=cfg,
 				args_section=cfg["args"],
-				tmp_dir=td,
+				model_init="ext",
+				ext_offset_enabled=False,
+			)
+
+	def test_approval_inpaint_requires_one_external_surface(self) -> None:
+		cfg = {"args": {"model-init": "seed", "approval-inpaint": True}}
+
+		with self.assertRaisesRegex(ValueError, "approval-inpaint requires exactly one external_surfaces entry, got 0"):
+			fit_service._wire_external_surface_for_request(
+				cfg=cfg,
+				args_section=cfg["args"],
+				model_init="seed",
+				ext_offset_enabled=False,
+			)
+
+		cfg["external_surfaces"] = [{"path": "/tmp/a.tifxyz"}, {"path": "/tmp/b.tifxyz"}]
+		with self.assertRaisesRegex(ValueError, "approval-inpaint requires exactly one external_surfaces entry, got 2"):
+			fit_service._wire_external_surface_for_request(
+				cfg=cfg,
+				args_section=cfg["args"],
+				model_init="seed",
+				ext_offset_enabled=False,
+			)
+
+	def test_ext_init_wires_external_surface(self) -> None:
+		cfg = {"args": {"model-init": "ext"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz"}]}
+
+		tifxyz_dir = fit_service._wire_external_surface_for_request(
+			cfg=cfg,
+			args_section=cfg["args"],
+			model_init="ext",
+			ext_offset_enabled=False,
+		)
+
+		self.assertEqual(tifxyz_dir, "/tmp/ref.tifxyz")
+		self.assertEqual(cfg["args"]["tifxyz-init"], "/tmp/ref.tifxyz")
+
+	def test_ext_init_requires_one_external_surface(self) -> None:
+		cfg = {"args": {"model-init": "ext"}}
+
+		with self.assertRaisesRegex(ValueError, "model-init=ext requires exactly one external_surfaces entry, got 0"):
+			fit_service._wire_external_surface_for_request(
+				cfg=cfg,
+				args_section=cfg["args"],
+				model_init="ext",
+				ext_offset_enabled=False,
+			)
+
+	def test_flatten_validates_external_surface_without_wiring_tifxyz_init(self) -> None:
+		cfg = {"args": {"model-init": "flatten"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz"}]}
+
+		tifxyz_dir = fit_service._wire_external_surface_for_request(
+			cfg=cfg,
+			args_section=cfg["args"],
+			model_init="flatten",
+			ext_offset_enabled=False,
+		)
+
+		self.assertIsNone(tifxyz_dir)
+		self.assertEqual(cfg["external_surfaces"], [{"path": "/tmp/ref.tifxyz"}])
+		self.assertNotIn("tifxyz-init", cfg["args"])
+
+	def test_flatten_requires_external_surface(self) -> None:
+		cfg = {"args": {"model-init": "flatten"}}
+
+		with self.assertRaisesRegex(ValueError, "model-init=flatten requires exactly one external_surfaces entry, got 0"):
+			fit_service._wire_external_surface_for_request(
+				cfg=cfg,
+				args_section=cfg["args"],
 				model_init="flatten",
 				ext_offset_enabled=False,
 			)
 
-			self.assertIsNotNone(tifxyz_dir)
-			self.assertEqual(cfg["external_surfaces"], [{"path": "/tmp/ref.tifxyz"}])
-			self.assertNotIn("tifxyz-init", cfg["args"])
-
-	def test_flatten_requires_generic_tifxyz_or_external_surface(self) -> None:
-		cfg = {"args": {"model-init": "flatten"}}
-
-		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "model-init=flatten requires config external_surfaces"):
-				fit_service._decode_tifxyz_for_request(
-					body={},
-					cfg=cfg,
-					args_section=cfg["args"],
-					tmp_dir=td,
-					model_init="flatten",
-					ext_offset_enabled=False,
-				)
-
 	def test_ext_offset_requires_config_external_surfaces(self) -> None:
 		cfg = {"args": {"model-init": "seed"}}
 
-		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "ext_offset is enabled but config has no external_surfaces"):
-				fit_service._decode_tifxyz_for_request(
-					body={},
-					cfg=cfg,
-					args_section=cfg["args"],
-					tmp_dir=td,
-					model_init="seed",
-					ext_offset_enabled=True,
-				)
+		with self.assertRaisesRegex(ValueError, "ext_offset requires exactly one external_surfaces entry, got 0"):
+			fit_service._wire_external_surface_for_request(
+				cfg=cfg,
+				args_section=cfg["args"],
+				model_init="seed",
+				ext_offset_enabled=True,
+			)
 
-	def test_global_map_does_not_synthesize_generic_tifxyz_as_external_surface(self) -> None:
-		body = {"tifxyz": {"x.tif": _b64(b"x"), "y.tif": _b64(b"y"), "z.tif": _b64(b"z")}}
+	def test_global_map_validates_external_surface_without_wiring_tifxyz_init(self) -> None:
 		cfg = {"args": {"model-init": "seed"}, "external_surfaces": [{"path": "/tmp/ref.tifxyz", "offset": -1.0}]}
 		args = cfg["args"]
 
-		with tempfile.TemporaryDirectory() as td:
-			tifxyz_dir = fit_service._decode_tifxyz_for_request(
-				body=body,
+		tifxyz_dir = fit_service._wire_external_surface_for_request(
+			cfg=cfg,
+			args_section=args,
+			model_init="seed",
+			ext_offset_enabled=False,
+			global_map_enabled=True,
+		)
+
+		self.assertIsNone(tifxyz_dir)
+		self.assertEqual(cfg["external_surfaces"], [{"path": "/tmp/ref.tifxyz", "offset": -1.0}])
+		self.assertNotIn("tifxyz-init", args)
+
+	def test_global_map_requires_external_surfaces(self) -> None:
+		cfg = {"args": {"model-init": "seed"}}
+
+		with self.assertRaisesRegex(ValueError, "snap_surf_map/global_map requires exactly one external_surfaces entry, got 0"):
+			fit_service._wire_external_surface_for_request(
 				cfg=cfg,
-				args_section=args,
-				tmp_dir=td,
+				args_section=cfg["args"],
 				model_init="seed",
 				ext_offset_enabled=False,
 				global_map_enabled=True,
 			)
-
-			self.assertIsNotNone(tifxyz_dir)
-			self.assertEqual(cfg["external_surfaces"], [{"path": "/tmp/ref.tifxyz", "offset": -1.0}])
-			self.assertNotIn("tifxyz-init", args)
-
-	def test_global_map_requires_generic_tifxyz(self) -> None:
-		cfg = {"args": {"model-init": "seed"}}
-
-		with tempfile.TemporaryDirectory() as td:
-			with self.assertRaisesRegex(ValueError, "snap_surf_map/global_map is enabled but config has no external_surfaces"):
-				fit_service._decode_tifxyz_for_request(
-					body={},
-					cfg=cfg,
-					args_section=cfg["args"],
-					tmp_dir=td,
-					model_init="seed",
-					ext_offset_enabled=False,
-					global_map_enabled=True,
-				)
 
 	def test_global_map_detection_from_map_stage_params(self) -> None:
 		cfg = {

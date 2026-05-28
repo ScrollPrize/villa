@@ -301,52 +301,46 @@ def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
                     map_args["debug_obj_dir"] = out_dir
 
 
-def _decode_tifxyz_for_request(
+def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str:
+    external_surfaces = cfg.get("external_surfaces")
+    if not isinstance(external_surfaces, list) or len(external_surfaces) != 1:
+        count = len(external_surfaces) if isinstance(external_surfaces, list) else 0
+        raise ValueError(f"{consumer} requires exactly one external_surfaces entry, got {count}")
+    surface = external_surfaces[0]
+    if not isinstance(surface, dict) or not surface.get("path"):
+        raise ValueError(f"{consumer} external_surfaces[0] requires path")
+    return str(surface["path"])
+
+
+def _wire_external_surface_for_request(
     *,
-    body: dict[str, Any],
     cfg: dict[str, Any],
     args_section: dict[str, Any],
-    tmp_dir: str,
     model_init: str,
     ext_offset_enabled: bool,
     global_map_enabled: bool = False,
 ) -> str | None:
-    """Decode generic request tifxyz for consumers that still use raw tifxyz transport."""
-    import base64
-
+    """Wire external_surfaces[0] into fit.py args for consumers."""
     approval_enabled = _approval_inpaint_enabled(args_section)
     if approval_enabled and model_init != "seed":
         raise ValueError("args.approval-inpaint is only valid with args.model-init=seed")
 
-    tifxyz_payload = body.get("tifxyz")
-    if "tifxyz" in body and not isinstance(tifxyz_payload, dict):
-        raise ValueError("request tifxyz must be an object mapping filenames to base64 data")
-
     tifxyz_dir: str | None = None
-    if isinstance(tifxyz_payload, dict):
-        tifxyz_dir = str(Path(tmp_dir) / "tifxyz_input")
-        Path(tifxyz_dir).mkdir(parents=True, exist_ok=True)
-        for fname, b64 in tifxyz_payload.items():
-            (Path(tifxyz_dir) / fname).write_bytes(base64.b64decode(b64))
-        print(f"[fit-service] decoded tifxyz ({len(tifxyz_payload)} files) to {tifxyz_dir}", flush=True)
-        if model_init == "ext":
-            args_section["tifxyz-init"] = tifxyz_dir
-        if approval_enabled:
-            args_section["approval-inpaint-tifxyz"] = tifxyz_dir
-    elif model_init == "ext":
-        raise ValueError("model-init=ext requires request tifxyz")
-    elif approval_enabled:
-        raise ValueError("approval-inpaint requires request tifxyz")
-    elif model_init == "flatten" and "external_surfaces" not in cfg:
-        raise ValueError("model-init=flatten requires config external_surfaces")
-
-    if (ext_offset_enabled or global_map_enabled) and "external_surfaces" not in cfg:
+    if model_init == "ext":
+        tifxyz_dir = _single_external_surface_path(cfg, consumer="model-init=ext")
+        args_section["tifxyz-init"] = tifxyz_dir
+    if approval_enabled:
+        tifxyz_dir = _single_external_surface_path(cfg, consumer="approval-inpaint")
+        args_section["approval-inpaint-tifxyz"] = tifxyz_dir
+    if model_init == "flatten":
+        _single_external_surface_path(cfg, consumer="model-init=flatten")
+    if ext_offset_enabled or global_map_enabled:
         loss_names = []
         if ext_offset_enabled:
             loss_names.append("ext_offset")
         if global_map_enabled:
             loss_names.append("snap_surf_map/global_map")
-        raise ValueError(f"{'/'.join(loss_names)} is enabled but config has no external_surfaces")
+        _single_external_surface_path(cfg, consumer="/".join(loss_names))
 
     return tifxyz_dir
 
@@ -382,7 +376,7 @@ def _decode_model_for_request(
 
 
 def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a Lasagna job spec into the legacy runner transport fields."""
+    """Resolve a Lasagna job spec into local runner transport fields."""
     spec = body.get("job_spec")
     if not isinstance(spec, dict):
         return body
@@ -1110,7 +1104,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         cfg["args"] = args_section_pre
         ext_offset_enabled = _config_effective_ext_offset_enabled(cfg)
         global_map_enabled = _config_global_map_enabled(cfg)
-        external_surface_enabled = ext_offset_enabled or global_map_enabled
         if model_init == "flatten" and ext_offset_enabled:
             raise ValueError("model-init=flatten does not support ext_offset")
         model_input = _decode_model_for_request(
@@ -1118,11 +1111,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             tmp_dir=tmp_dir,
             model_init=model_init,
         )
-        tifxyz_dir = _decode_tifxyz_for_request(
-            body=body,
+        tifxyz_dir = _wire_external_surface_for_request(
             cfg=cfg,
             args_section=args_section_pre,
-            tmp_dir=tmp_dir,
             model_init=model_init,
             ext_offset_enabled=ext_offset_enabled,
             global_map_enabled=global_map_enabled,
