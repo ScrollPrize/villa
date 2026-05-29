@@ -1,5 +1,6 @@
 import json
 import math
+import numpy as np
 import os
 from copy import deepcopy
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ import random
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 import accelerate
 from accelerate.utils import (
     DistributedDataParallelKwargs,
@@ -23,8 +24,10 @@ from vesuvius.models.training.optimizers import (
 )
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from koine_machines.models.make_model import make_model
+from koine_machines.data.coord_patch_dataset import CoordPatchDataset
 from koine_machines.data.dino_guided_labels import DinoGuidedLabelGenerator
 from koine_machines.data.ink_dataset import InkDataset
+from koine_machines.data.self_distill_labels import SelfDistillLabelGenerator
 from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
 from koine_machines.evaluation.metrics.balanced_accuracy import BalancedAccuracy
 from koine_machines.evaluation.metrics.confusion import Confusion, ConfusionCounts
@@ -131,18 +134,23 @@ def _apply_cucim_label_dilation(batch, label_dilation_distance, supervision_dila
 
 
 def _apply_dynamic_label_substitution(batch, generator):
-    """Replace batch['inklabels'] with DINO-guided pseudo-labels.
+    """Replace batch['inklabels'] with pseudo-labels from a label generator.
 
-    Labels are computed from batch['image_for_label'] when available (the
-    photometrically-clean but geometrically-augmented image emitted by
-    InkDataset), falling back to batch['image']. When batch['image_mask_for_label']
-    is present, it is forwarded to the generator and multiplied into UNet
-    predictions to suppress background voxels. supervision_mask is left
-    untouched so the loss is still gated by the wrap region.
+    Works for both DinoGuidedLabelGenerator (v1/v2) and SelfDistillLabelGenerator
+    (v3). The latter requires per-sample raw uint8 stats (mean/std), which the
+    dataset emits as scalar tensors when `_emit_image_for_label` is on.
     """
     image_for_label = batch.get('image_for_label', batch['image'])
     mask_for_label = batch.get('image_mask_for_label', None)
-    new_labels = generator.generate(image_for_label, mask_b1zyx=mask_for_label)
+    if isinstance(generator, SelfDistillLabelGenerator):
+        new_labels = generator.generate(
+            image_for_label,
+            mask_b1zyx=mask_for_label,
+            raw_mean=batch['image_raw_mean'],
+            raw_std=batch['image_raw_std'],
+        )
+    else:
+        new_labels = generator.generate(image_for_label, mask_b1zyx=mask_for_label)
     batch['inklabels'] = new_labels.to(dtype=batch['inklabels'].dtype)
 
 
@@ -329,6 +337,44 @@ def train(config_path):
     train_subset = train_ds
     val_subset = val_ds
 
+    extra_patches_cfg = config.get('extra_patches') or {}
+    train_sampler = None
+    if extra_patches_cfg.get('enabled'):
+        if not native_3d_mode or normal_pooled_mode:
+            raise ValueError(
+                "extra_patches is currently only supported in full_3d-style modes "
+                "(no normal_pooled_3d) where the dataset returns axis-aligned cubes."
+            )
+        coords_xyz = list(extra_patches_cfg.get('coords_xyz') or [])
+        if not coords_xyz:
+            raise ValueError("extra_patches.enabled but extra_patches.coords_xyz is empty")
+        first_dataset_cfg = config['datasets'][0]
+        coord_ds = CoordPatchDataset(
+            volume_uri=first_dataset_cfg['volume_path'],
+            resolution=str(first_dataset_cfg.get('volume_scale', 0)),
+            coords_xyz=coords_xyz,
+            jitter=int(extra_patches_cfg.get('jitter', 1024)),
+            length=max(64, len(train_ds) // 8),
+            normalize_config=config,
+            input_mask_threshold=float(
+                (config.get('dynamic_label') or {}).get('input_mask_threshold', 50.0)
+            ),
+        )
+        combined = ConcatDataset([train_ds, coord_ds])
+        fraction = float(extra_patches_cfg.get('fraction', 0.25))
+        if not 0.0 < fraction < 1.0:
+            raise ValueError(f"extra_patches.fraction must be in (0,1), got {fraction}")
+        N = len(train_ds)
+        M = len(coord_ds)
+        weights = ([(1.0 - fraction) / N] * N) + ([fraction / M] * M)
+        train_sampler = WeightedRandomSampler(
+            weights,
+            num_samples=int(config['num_iterations']) * int(config['batch_size']),
+            replacement=True,
+            generator=torch.Generator().manual_seed(config['seed']),
+        )
+        train_subset = combined
+
     dataloader_workers = int(config.get('dataloader_workers', 0))
     dataloader_kwargs = {
         'pin_memory': bool(config.get('pin_memory', accelerator.device.type == 'cuda')),
@@ -340,14 +386,23 @@ def train(config_path):
     if normal_pooled_mode:
         dataloader_kwargs['collate_fn'] = collate_normal_pooled_batch
 
-    train_dl = DataLoader(
-        train_subset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        generator=torch.Generator().manual_seed(config['seed']),
-        num_workers=dataloader_workers,
-        **dataloader_kwargs,
-    )
+    if train_sampler is not None:
+        train_dl = DataLoader(
+            train_subset,
+            batch_size=config['batch_size'],
+            sampler=train_sampler,
+            num_workers=dataloader_workers,
+            **dataloader_kwargs,
+        )
+    else:
+        train_dl = DataLoader(
+            train_subset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            generator=torch.Generator().manual_seed(config['seed']),
+            num_workers=dataloader_workers,
+            **dataloader_kwargs,
+        )
     # Validation only consumes a capped number of batches (`val_steps`), so
     # shuffle to sample a different deterministic subset on each pass.
     val_dl = DataLoader(
@@ -431,16 +486,33 @@ def train(config_path):
     dynamic_label_cfg = config.get('dynamic_label') or {}
     dynamic_label_generator = None
     if dynamic_label_cfg.get('enabled'):
-        dynamic_label_generator = DinoGuidedLabelGenerator(
-            device=accelerator.device,
-            unet_ckpt=dynamic_label_cfg['unet_ckpt'],
-            dino_ckpt=dynamic_label_cfg['dino_ckpt'],
-            ref_embedding=dynamic_label_cfg['ref_embedding'],
-            dino_stride=dynamic_label_cfg.get('dino_stride', 64),
-            dino_minibatch=dynamic_label_cfg.get('dino_minibatch', 8),
-            dino_blend_sigma=dynamic_label_cfg.get('dino_blend_sigma', 4.0),
-            threshold=dynamic_label_cfg.get('threshold', 0.5),
-        )
+        kind = str(dynamic_label_cfg.get('kind', 'dino_guided')).strip().lower()
+        if kind == 'self_distill':
+            dynamic_label_generator = SelfDistillLabelGenerator(
+                device=accelerator.device,
+                primary_ckpt=dynamic_label_cfg['primary_ckpt'],
+                ensemble_ckpt=dynamic_label_cfg['ensemble_ckpt'],
+                primary_threshold=dynamic_label_cfg['primary_threshold'],
+                ensemble_threshold=dynamic_label_cfg['ensemble_threshold'],
+                mean_hi=dynamic_label_cfg['mean_hi'],
+                std_lo=dynamic_label_cfg['std_lo'],
+                tta=bool(dynamic_label_cfg.get('tta', True)),
+            )
+        elif kind == 'dino_guided':
+            dynamic_label_generator = DinoGuidedLabelGenerator(
+                device=accelerator.device,
+                unet_ckpt=dynamic_label_cfg['unet_ckpt'],
+                dino_ckpt=dynamic_label_cfg['dino_ckpt'],
+                ref_embedding=dynamic_label_cfg['ref_embedding'],
+                dino_stride=dynamic_label_cfg.get('dino_stride', 64),
+                dino_minibatch=dynamic_label_cfg.get('dino_minibatch', 8),
+                dino_blend_sigma=dynamic_label_cfg.get('dino_blend_sigma', 4.0),
+                threshold=dynamic_label_cfg.get('threshold', 0.5),
+            )
+        else:
+            raise ValueError(
+                f"Unknown dynamic_label.kind {kind!r}; expected 'dino_guided' or 'self_distill'"
+            )
     # NOTE: we intentionally do NOT prepare lr_scheduler with Accelerate.
     # AcceleratedScheduler calls scheduler.step() num_processes times per
     # optimizer step (when split_batches=False), which makes the LR schedule
@@ -542,12 +614,18 @@ def train(config_path):
                     align_corners=True,
                 )
             targets = batch['inklabels']
-            ignore_mask = (batch['supervision_mask'] <= 0).to(dtype=targets.dtype)
+            if bool(config.get('force_full_supervision', False)):
+                ignore_mask = torch.zeros_like(targets)
+            else:
+                ignore_mask = (batch['supervision_mask'] <= 0).to(dtype=targets.dtype)
             return preds, targets, ignore_mask
 
         targets = (torch.amax(batch['inklabels'], dim=2) > 0).to(dtype=batch['inklabels'].dtype)
-        supervision_mask = torch.amax(batch['supervision_mask'], dim=2)
-        ignore_mask = (supervision_mask <= 0).to(dtype=targets.dtype)
+        if bool(config.get('force_full_supervision', False)):
+            ignore_mask = torch.zeros_like(targets)
+        else:
+            supervision_mask = torch.amax(batch['supervision_mask'], dim=2)
+            ignore_mask = (supervision_mask <= 0).to(dtype=targets.dtype)
         return preds, targets, ignore_mask
 
     def refresh_progress_bar(current_train_loss):
@@ -579,9 +657,17 @@ def train(config_path):
             label_mask = batch.get('image_mask_for_label', None)
             if step_will_validate and accelerator.is_main_process:
                 original_inklabels = batch['inklabels'].detach().clone()
-                new_labels, debug = dynamic_label_generator.generate_with_debug(
-                    label_input, mask_b1zyx=label_mask
-                )
+                if isinstance(dynamic_label_generator, SelfDistillLabelGenerator):
+                    new_labels, debug = dynamic_label_generator.generate_with_debug(
+                        label_input,
+                        mask_b1zyx=label_mask,
+                        raw_mean=batch['image_raw_mean'],
+                        raw_std=batch['image_raw_std'],
+                    )
+                else:
+                    new_labels, debug = dynamic_label_generator.generate_with_debug(
+                        label_input, mask_b1zyx=label_mask
+                    )
                 batch['inklabels'] = new_labels.to(dtype=batch['inklabels'].dtype)
                 dynamic_label_debug_payload = (
                     batch['image'].detach(),
@@ -593,6 +679,12 @@ def train(config_path):
                 _apply_dynamic_label_substitution(batch, dynamic_label_generator)
             batch.pop('image_for_label', None)
             batch.pop('image_mask_for_label', None)
+            batch.pop('image_raw_mean', None)
+            batch.pop('image_raw_std', None)
+            # Release reserved memory from pseudo-label generation so the
+            # student forward+backward has headroom.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
             _apply_cucim_label_dilation(batch, full_3d_label_dilation, full_3d_supervision_dilation)
 
@@ -865,24 +957,45 @@ def train(config_path):
                     }
                 )
                 if dynamic_label_debug_payload is not None and wandb.run is not None:
-                    from koine_machines.data.dino_guided_labels import (
-                        make_dynamic_label_debug_figure,
-                    )
                     import matplotlib.pyplot as _plt
                     _img_aug, _img_clean, _orig, _debug = dynamic_label_debug_payload
-                    _extra = {}
-                    if 'unet_prob_pre_mask' in _debug and 'input_mask' in _debug:
-                        _extra['unet_prob_pre_mask'] = _debug['unet_prob_pre_mask'][0, 0].float().cpu().numpy()
-                        _extra['input_mask'] = _debug['input_mask'][0, 0].float().cpu().numpy()
-                    _fig = make_dynamic_label_debug_figure(
-                        image=_img_clean[0, 0].float().cpu().numpy(),
-                        original_label=_orig[0, 0].float().cpu().numpy(),
-                        unet_prob=_debug['unet_prob'][0, 0].float().cpu().numpy(),
-                        sim_map=_debug['sim_map'][0, 0].float().cpu().numpy(),
-                        union=_debug['union'][0, 0].float().cpu().numpy(),
-                        binarized=_debug['binarized'][0, 0].float().cpu().numpy(),
-                        **_extra,
-                    )
+                    if isinstance(dynamic_label_generator, SelfDistillLabelGenerator):
+                        from koine_machines.data.self_distill_labels import (
+                            make_self_distill_debug_figure,
+                        )
+                        _rec = _debug['per_sample'][0]
+                        _ens = _rec.get('prob_ensemble')
+                        _fig = make_self_distill_debug_figure(
+                            image=_img_clean[0, 0].float().cpu().numpy(),
+                            original_label=_orig[0, 0].float().cpu().numpy(),
+                            input_mask=_rec['mask'][0, 0].float().cpu().numpy() if _rec['mask'] is not None
+                                       else np.ones_like(_img_clean[0, 0].float().cpu().numpy()),
+                            prob_primary=_rec['prob_primary'][0, 0].float().cpu().numpy(),
+                            prob_combined=_rec['prob_combined'][0, 0].float().cpu().numpy(),
+                            prob_ensemble=_ens[0, 0].float().cpu().numpy() if _ens is not None else None,
+                            binarized=_rec['binarized'][0, 0].float().cpu().numpy(),
+                            use_ensemble=bool(_rec['use_ensemble']),
+                            threshold=float(_rec['threshold']),
+                            raw_mean=float(_rec['raw_mean']),
+                            raw_std=float(_rec['raw_std']),
+                        )
+                    else:
+                        from koine_machines.data.dino_guided_labels import (
+                            make_dynamic_label_debug_figure,
+                        )
+                        _extra = {}
+                        if 'unet_prob_pre_mask' in _debug and 'input_mask' in _debug:
+                            _extra['unet_prob_pre_mask'] = _debug['unet_prob_pre_mask'][0, 0].float().cpu().numpy()
+                            _extra['input_mask'] = _debug['input_mask'][0, 0].float().cpu().numpy()
+                        _fig = make_dynamic_label_debug_figure(
+                            image=_img_clean[0, 0].float().cpu().numpy(),
+                            original_label=_orig[0, 0].float().cpu().numpy(),
+                            unet_prob=_debug['unet_prob'][0, 0].float().cpu().numpy(),
+                            sim_map=_debug['sim_map'][0, 0].float().cpu().numpy(),
+                            union=_debug['union'][0, 0].float().cpu().numpy(),
+                            binarized=_debug['binarized'][0, 0].float().cpu().numpy(),
+                            **_extra,
+                        )
                     log_dict['dynamic_label/debug'] = wandb.Image(_fig)
                     _plt.close(_fig)
                 if wandb.run is not None:

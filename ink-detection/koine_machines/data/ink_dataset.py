@@ -2019,11 +2019,16 @@ class InkDataset(Dataset):
                 # (e.g. uint8 0-255). Used by the dynamic-label generator to
                 # zero out UNet predictions over background voxels.
                 image_mask_for_label_np = None
+                image_raw_mean = None
+                image_raw_std = None
                 if self._emit_image_for_label:
                     mask_threshold = float(
                         (self.config.get('dynamic_label') or {}).get('input_mask_threshold', 50.0)
                     )
                     image_mask_for_label_np = (image_crop > mask_threshold).astype(np.float32)
+                    # Raw uint8-scale stats for self-distill kind dispatch (full cube).
+                    image_raw_mean = float(image_crop.mean())
+                    image_raw_std = float(image_crop.std())
 
                 if image_valid_slices is not None:
                     image_crop[image_valid_slices] = _normalize_image_crop(
@@ -2068,6 +2073,14 @@ class InkDataset(Dataset):
                 if image_mask_for_label_np is not None:
                     data['image_mask_for_label'] = torch.from_numpy(image_mask_for_label_np).float().unsqueeze(0)
 
+                # Raw-input scalar stats are not affected by augmentations
+                # (geometric augs are area-preserving, photometric augs do not
+                # touch image_for_label). Attach AFTER the augmentation step so
+                # they don't get fed to Albumentations as unknown keys.
+                _raw_stats_to_attach = None
+                if image_raw_mean is not None and image_raw_std is not None:
+                    _raw_stats_to_attach = (image_raw_mean, image_raw_std)
+
                 if self.do_augmentations and self.augmentations is not None:
                     if self.mode == "normal_pooled_3d":
                         augmentation_data, flat_valid_mask = _pack_normal_pooled_augmentation_data(data)
@@ -2106,6 +2119,10 @@ class InkDataset(Dataset):
 
             if isinstance(result, dict):
                 result['is_unlabeled'] = torch.tensor(bool(getattr(patch, 'is_unlabeled', False)), dtype=torch.bool)
+                if _raw_stats_to_attach is not None:
+                    _mean_v, _std_v = _raw_stats_to_attach
+                    result['image_raw_mean'] = torch.tensor(float(_mean_v), dtype=torch.float32)
+                    result['image_raw_std'] = torch.tensor(float(_std_v), dtype=torch.float32)
 
             return result
 
