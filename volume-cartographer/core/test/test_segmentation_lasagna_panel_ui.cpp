@@ -175,11 +175,11 @@ int main(int argc, char** argv)
     panel._lasagnaMode = SegmentationLasagnaPanel::LasagnaMode::ReOptimize;
     panel._reoptConfigFilePath.clear();
     panel.triggerOptimization();
-    require(panel._progressLabel->text().contains(QStringLiteral("No config")),
+    require(panel._progressLabel->text().contains(QStringLiteral("No Lasagna config")),
             "triggerOptimization should report a missing config");
     panel._reoptConfigFilePath = tempDir.filePath(QStringLiteral("missing.json"));
     panel.triggerOptimization();
-    require(panel._progressLabel->text().contains(QStringLiteral("Config file not found")),
+    require(panel._progressLabel->text().contains(QStringLiteral("config file not found")),
             "triggerOptimization should report a missing config file");
     panel._reoptConfigFilePath = configPath;
     panel.triggerOptimization();
@@ -251,7 +251,7 @@ int main(int argc, char** argv)
         1,
         2,
         3);
-    require(statusBar.currentMessage().contains(QStringLiteral("Config file not found")),
+    require(statusBar.currentMessage().contains(QStringLiteral("config file not found")),
             "startOptimizationAtSeed should reject a missing config path");
 
     panel.syncUiState(true, false);
