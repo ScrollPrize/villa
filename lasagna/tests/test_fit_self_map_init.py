@@ -9,9 +9,45 @@ if TEST_DIR not in sys.path:
 	sys.path.insert(0, TEST_DIR)
 
 import fit
+import cli_json
+import cli_model
 
 
 class FitSelfMapInitTest(unittest.TestCase):
+	def _model_cfg_from_json_args(self, args_cfg: dict) -> cli_model.ModelConfig:
+		parser = fit._build_parser()
+		cli_json.apply_defaults_from_cfg_args(parser, {"args": args_cfg})
+		args = parser.parse_args([])
+		return cli_model.from_args(args)
+
+	def test_json_depth_sets_model_depth_for_multi_wrap_full(self) -> None:
+		model_cfg = self._model_cfg_from_json_args({"depth": 1})
+
+		self.assertEqual(model_cfg.depth, 1)
+		mode = fit._validate_self_map_init_args(
+			self_map_init="multi_wrap_full",
+			model_init="seed",
+			init_mode="shell-dir-crop",
+			model_depth=model_cfg.depth,
+			model_w=1.5,
+			model_w_unit="wraps",
+		)
+		self.assertEqual(mode, "multi_wrap_full")
+
+	def test_json_windings_alias_sets_model_depth(self) -> None:
+		model_cfg = self._model_cfg_from_json_args({"windings": 1})
+
+		self.assertEqual(model_cfg.depth, 1)
+
+	def test_json_depth_and_windings_match_sets_model_depth(self) -> None:
+		model_cfg = self._model_cfg_from_json_args({"depth": 1, "windings": 1})
+
+		self.assertEqual(model_cfg.depth, 1)
+
+	def test_json_depth_and_windings_mismatch_is_clear_error(self) -> None:
+		with self.assertRaisesRegex(ValueError, "args.depth and args.windings must match"):
+			self._model_cfg_from_json_args({"depth": 3, "windings": 1})
+
 	def test_multi_wrap_full_accepts_single_depth_wide_wrap_crop(self) -> None:
 		mode = fit._validate_self_map_init_args(
 			self_map_init="multi_wrap_full",

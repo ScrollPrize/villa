@@ -38,6 +38,7 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 			"args.remove(QStringLiteral(\"model-w\"))",
 			"args.remove(QStringLiteral(\"model-h\"))",
 			"args.remove(QStringLiteral(\"windings\"))",
+			"args[QStringLiteral(\"windings\")]",
 		]
 
 		for literal in forbidden_literals:
@@ -54,6 +55,12 @@ class VC3DLasagnaTransportBoundaryTest(unittest.TestCase):
 		]:
 			with self.subTest(request_line=request_line):
 				self.assertIn(request_line, self.manager_source)
+
+	def test_vc3d_new_model_sends_depth_not_windings(self) -> None:
+		self.assertIn('args[QStringLiteral("depth")] = nmN', self.source)
+		self.assertIn("windings/depth=", self.source)
+		self.assertIn("Number of windings / model depth layers", self.source)
+		self.assertNotIn('args[QStringLiteral("windings")] = nmN', self.source)
 
 	def test_lasagna_service_enforces_and_returns_api_version_header(self) -> None:
 		source = FIT_SERVICE_PY.read_text(encoding="utf-8")
