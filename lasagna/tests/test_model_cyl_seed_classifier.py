@@ -255,6 +255,45 @@ class CylinderSeedShellBakeTest(unittest.TestCase):
 		finally:
 			opt_loss_station.reset()
 
+	def test_baked_multiwrap_seed_patch_anchors_center_station_copy(self) -> None:
+		mdl = fit_model.Model3D(
+			device=torch.device("cpu"),
+			depth=1,
+			mesh_h=2,
+			mesh_w=3,
+			mesh_step=50,
+			winding_step=50,
+			subsample_mesh=1,
+			subsample_winding=1,
+			init_mode="cylinder_seed",
+			pyramid_d=False,
+		)
+		seed = torch.tensor([1000.0, 0.0, 0.0])
+		circumference = 2.0 * math.pi * 1000.0
+		mdl.init_cylinder_seed(
+			seed=tuple(float(v) for v in seed),
+			model_w=5.0 * circumference,
+			model_h=200.0,
+			volume_extent_fullres=None,
+		)
+		mdl.cyl_shell_completed = [
+			_cylinder_shell(
+				radius=1000.0,
+				z_by_row=torch.linspace(-100.0, 100.0, 5),
+				width=4096,
+			)
+		]
+		mdl.bake_cylinder_into_mesh(None)
+		data = _StationData()
+		try:
+			opt_loss_station.set_seed(seed, data, Hm=mdl.mesh_h, Wm=mdl.mesh_w, D=mdl.depth)
+			res = mdl(data, needs=fit_model.ModelForwardNeeds())
+			losses = opt_loss_station.station_loss(res=res)
+			self.assertLess(float(losses["station_t"][0].detach()), 1.0e-6)
+			self.assertLess(float(losses["station_n"][0].detach()), 1.0e-6)
+		finally:
+			opt_loss_station.reset()
+
 
 if __name__ == "__main__":
 	unittest.main()
