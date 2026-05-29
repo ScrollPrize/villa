@@ -3,11 +3,9 @@
 		"model-init": "seed",
 		"init-mode": "shell-dir-crop",
 		"mesh-step": 50.0,
-		"approval-inpaint": true,
-		"approval-inpaint-corr-spacing": 50.0,
-		"approval-inpaint-padding-frac": 0.25,
-		"approval-inpaint-output-mask": true,
-		"approval-inpaint-output-mask-dilate": 3,
+		"corr-point-roi": true,
+		"corr-point-roi-init-margin": 80,
+		"corr-point-roi-output-radius": 20,
 		"tifxyz-flow-gate-channels": true
 	},
 	"base": {

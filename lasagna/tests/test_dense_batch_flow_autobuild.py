@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import ctypes
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -119,6 +120,38 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 		self.assertEqual(captured["grid_step"], 4)
 		self.assertEqual(captured["backtrack_distance"], 12.0)
 		self.assertEqual(captured["local_boost"], 0.5)
+
+	def test_compute_flow_grid_optionally_returns_gate_components(self) -> None:
+		def fake_dense_batch_flow_grid_u8(*args):
+			query_count = int(args[8])
+			final = np.ctypeslib.as_array(args[9], shape=(query_count,))
+			local = np.ctypeslib.as_array(
+				ctypes.cast(args[35], ctypes.POINTER(ctypes.c_float)),
+				shape=(query_count,),
+			)
+			normalized = np.ctypeslib.as_array(
+				ctypes.cast(args[36], ctypes.POINTER(ctypes.c_float)),
+				shape=(query_count,),
+			)
+			final[:] = [0.25, 0.75]
+			local[:] = [0.1, 0.9]
+			normalized[:] = [0.2, 0.8]
+			return 0
+
+		fake_lib = SimpleNamespace(
+			dense_batch_flow_grid_u8=fake_dense_batch_flow_grid_u8
+		)
+		with mock.patch.object(dense_batch_flow, "_load_library", return_value=fake_lib):
+			query_flow, _dense_flow, components = dense_batch_flow.compute_flow_grid(
+				np.zeros((4, 4), dtype=np.uint8),
+				source_xy=(1, 1),
+				query_xy=np.array([[1.0, 1.0], [2.0, 2.0]], dtype=np.float32),
+				return_components=True,
+			)
+
+		np.testing.assert_allclose(query_flow, [0.25, 0.75])
+		np.testing.assert_allclose(components["flow_gate_local_contrast"], [0.1, 0.9])
+		np.testing.assert_allclose(components["flow_gate_component_normalized"], [0.2, 0.8])
 
 	def test_flow_gate_debug_intervals_default_to_disabled(self) -> None:
 		self.assertEqual(
@@ -242,11 +275,28 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 		body = source[start:end]
 
 		self.assertIn("normalize_flow_by_regions(flow, normalization_labels", body)
+		self.assertIn("out_component_normalized", body)
+		self.assertIn("local_contrast", body)
 		self.assertIn("normalized_flow.setTo(1.0f, source_reach_mask)", body)
 		self.assertIn("cv::dilate(normalized_flow, local_max, kernel)", body)
 		self.assertIn("local_max_scope: global_after_region_normalization", body)
 		self.assertNotIn("label_local_max", body)
 		self.assertNotIn("normalized_flow.copyTo(label_flow", body)
+
+	def test_flow_bridge_samples_component_channels_separately(self) -> None:
+		source_path = Path(ROOT) / "dense_batch_min_cut/src/dense_batch_preprocess.cpp"
+		source = source_path.read_text()
+		start = source.index('extern "C" int dense_batch_flow_grid_u8')
+		end = source.index("return 0;", start)
+		body = source[start:end]
+
+		self.assertIn("query_flow_local_contrast", body)
+		self.assertIn("query_flow_component_normalized", body)
+		self.assertIn("sample_flow(flow_gate_weight", body)
+		self.assertIn("query_flow_local_contrast[i] = sample_flow", body)
+		self.assertIn("flow_gate_local_contrast", body)
+		self.assertIn("query_flow_component_normalized[i] = sample_flow", body)
+		self.assertIn("flow_gate_component_normalized", body)
 
 	def test_gate_normalization_uses_pre_merge_component_regions(self) -> None:
 		source_path = Path(ROOT) / "dense_batch_min_cut/src/dense_batch_preprocess.cpp"

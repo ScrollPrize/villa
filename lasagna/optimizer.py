@@ -736,6 +736,7 @@ def optimize(
 	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
 	out_dir: str | None = None,
+	capture_flow_gate_channels: bool = False,
 	cylinder_shell_callback=None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
@@ -1724,6 +1725,7 @@ def optimize(
 			stage_name=stage.name or label,
 			seed_xyz=seed_xyz,
 			out_dir=out_dir,
+			capture_channels=bool(capture_flow_gate_channels),
 		)
 		snap_surf_map_args = stage_args.get("snap_surf_map")
 		if snap_surf_map_args is not None and not isinstance(snap_surf_map_args, dict):

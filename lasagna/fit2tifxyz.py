@@ -28,6 +28,7 @@ class ExportConfig:
 	output_name: str | None = None
 	voxel_size_um: float | None = None
 	target_volume_shape_zyx: tuple[int, int, int] | None = None
+	flow_gate_channels: str = "auto"
 
 
 def _valid_xyz_mask(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -55,6 +56,8 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Voxel size in micrometers (for area calculation)")
 	g.add_argument("--target-volume-shape-zyx", type=int, nargs=3, metavar=("Z", "Y", "X"), default=None,
 		help="Export coordinates into this VC3D target volume coordinate scale")
+	g.add_argument("--flow-gate-channels", choices=("auto", "on", "off"), default="auto",
+		help="Export captured flow-gate component channels when available")
 	return p
 
 
@@ -564,6 +567,87 @@ def _apply_output_vertex_mask(
 	return x_out, y_out, z_out, d_out
 
 
+def _as_channel_numpy(value: object, *, name: str) -> np.ndarray:
+	if isinstance(value, torch.Tensor):
+		return value.detach().cpu().numpy().astype(np.float32, copy=False)
+	return np.asarray(value, dtype=np.float32)
+
+
+def _fit_config_flow_gate_channels_enabled(fit_config: dict | None) -> bool:
+	if not isinstance(fit_config, dict):
+		return False
+	args = fit_config.get("args", {})
+	if not isinstance(args, dict):
+		return False
+	return bool(args.get("tifxyz-flow-gate-channels", False))
+
+
+def _flow_gate_source_config(payload: dict | None) -> dict:
+	if not isinstance(payload, dict):
+		return {}
+	source = payload.get("source_config", {})
+	return dict(source) if isinstance(source, dict) else {}
+
+
+def _flow_gate_extra_channel_specs(payload: dict | None) -> list[dict]:
+	source_config = _flow_gate_source_config(payload)
+	return [
+		{
+			"name": "flow_gate_local_contrast",
+			"file": "flow_gate_local_contrast.tif",
+			"dtype": "float32",
+			"range": [0.0, 1.0],
+			"source": "pred_dt_flow_gate.local_contrast",
+			"source_config": source_config,
+		},
+		{
+			"name": "flow_gate_component_normalized",
+			"file": "flow_gate_component_normalized.tif",
+			"dtype": "float32",
+			"range": [0.0, 1.0],
+			"source": "pred_dt_flow_gate.component_normalized",
+			"source_config": source_config,
+		},
+	]
+
+
+def _flow_gate_payload_for_export(
+	st: dict,
+	fit_config: dict | None,
+	mode: str,
+) -> dict | None:
+	mode = str(mode)
+	if mode == "off":
+		return None
+	payload = st.get("_flow_gate_channels_", None)
+	if not isinstance(payload, dict):
+		if mode == "on":
+			raise ValueError("flow-gate channel export requested, but checkpoint has no _flow_gate_channels_ payload")
+		return None
+	if mode == "auto" and not _fit_config_flow_gate_channels_enabled(fit_config):
+		return None
+	return payload
+
+
+def _flow_gate_channel_arrays(payload: dict | None, *, shape_dhw: tuple[int, int, int]) -> dict[str, np.ndarray] | None:
+	if payload is None:
+		return None
+	D, H, W = (int(v) for v in shape_dhw)
+	channels: dict[str, np.ndarray] = {}
+	for name in ("flow_gate_local_contrast", "flow_gate_component_normalized"):
+		if name not in payload:
+			raise ValueError(f"flow-gate channel payload missing {name!r}")
+		arr = _as_channel_numpy(payload[name], name=name)
+		if arr.shape == (H, W):
+			arr = arr.reshape(1, H, W)
+		if arr.shape != (D, H, W):
+			raise ValueError(
+				f"flow-gate channel {name!r} shape {arr.shape} does not match exported mesh shape {(D, H, W)}"
+			)
+		channels[name] = np.clip(arr.astype(np.float32, copy=False), 0.0, 1.0)
+	return channels
+
+
 def _corr_results_debug_summary(corr_results: dict | None) -> dict:
 	if not isinstance(corr_results, dict):
 		return {"present": False}
@@ -649,7 +733,9 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  area: dict | None = None,
 				  components: list[list[int]] | None = None,
 				  base_shape_zyx: tuple[int, int, int] | None = None,
-				  lasagna_base_shape_zyx: tuple[int, int, int] | None = None) -> None:
+				  lasagna_base_shape_zyx: tuple[int, int, int] | None = None,
+				  extra_channels: dict[str, np.ndarray] | None = None,
+				  extra_channel_specs: list[dict] | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -690,12 +776,37 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["fit_config"] = fit_config
 	if job_spec is not None:
 		meta["lasagna_job"] = job_spec
+	if extra_channels:
+		meta["extra_channels"] = extra_channel_specs or [
+			{
+				"name": name,
+				"file": f"{name}.tif",
+				"dtype": "float32",
+				"range": [0.0, 1.0],
+			}
+			for name in sorted(extra_channels)
+		]
 	(out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression=None)
 	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression=None)
 	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression=None)
 	if d is not None:
 		tifffile.imwrite(str(out_dir / "d.tif"), d.astype(np.float32, copy=False), compression=None)
+	if extra_channels:
+		spec_by_name = {
+			str(spec.get("name")): spec
+			for spec in (extra_channel_specs or [])
+			if isinstance(spec, dict) and spec.get("name") is not None
+		}
+		for name, values in extra_channels.items():
+			arr = np.asarray(values, dtype=np.float32)
+			if arr.shape != xf.shape:
+				raise ValueError(f"extra channel {name!r} shape mismatch: {arr.shape} vs {xf.shape}")
+			arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+			arr = np.where(valid, arr, 0.0).astype(np.float32, copy=False)
+			spec = spec_by_name.get(name, {})
+			file_name = str(spec.get("file", f"{name}.tif"))
+			tifffile.imwrite(str(out_dir / file_name), arr, compression=None)
 
 	if model_source is not None:
 		dest = out_dir / "model.pt"
@@ -817,6 +928,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			None if args.target_volume_shape_zyx is None
 			else tuple(int(v) for v in args.target_volume_shape_zyx)
 		),
+		flow_gate_channels=str(args.flow_gate_channels),
 	)
 
 	dev = torch.device(cfg.device)
@@ -840,6 +952,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 	approval_output_mask = st.get("_approval_inpaint_output_mask_", None)
 	if not isinstance(approval_output_mask, dict):
 		approval_output_mask = None
+	flow_gate_payload = _flow_gate_payload_for_export(st, fit_config, cfg.flow_gate_channels)
 	export_factor, lasagna_base_shape_zyx, output_base_shape_zyx = _export_coordinate_scale(
 		model_params=model_params,
 		target_volume_shape_zyx=cfg.target_volume_shape_zyx,
@@ -865,6 +978,15 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 
 	_, D, Hm, Wm = (int(v) for v in mesh.shape)
 	mesh_np = mesh.detach().cpu().numpy()  # (3, D, Hm, Wm)
+	flow_gate_channels = _flow_gate_channel_arrays(
+		flow_gate_payload,
+		shape_dhw=(D, Hm, Wm),
+	)
+	flow_gate_channel_specs = (
+		_flow_gate_extra_channel_specs(flow_gate_payload)
+		if flow_gate_channels is not None
+		else None
+	)
 
 	mesh_step = 100
 	if model_params is not None:
@@ -903,6 +1025,12 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		y_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
 		z_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
 		d_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
+		extra_all: dict[str, np.ndarray] | None = None
+		if flow_gate_channels is not None:
+			extra_all = {
+				name: np.zeros((Hm, total_w), dtype=np.float32)
+				for name in flow_gate_channels
+			}
 
 		col = 0
 		components: list[list[int]] = []
@@ -938,6 +1066,11 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			y_all[:, col:col + Wm] = y_layer
 			z_all[:, col:col + Wm] = z_layer
 			d_all[:, col:col + Wm] = d_layer
+			if extra_all is not None and flow_gate_channels is not None:
+				valid_layer = _valid_xyz_mask(x_layer, y_layer, z_layer)
+				for name, arr in flow_gate_channels.items():
+					ch_layer = np.clip(arr[d], 0.0, 1.0).astype(np.float32, copy=False)
+					extra_all[name][:, col:col + Wm] = np.where(valid_layer, ch_layer, 0.0)
 			components.append([col, col + Wm])
 			col += Wm + BORDER_W
 
@@ -951,7 +1084,9 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 					  job_spec=job_spec,
 					  area=area, components=components if D > 1 else None,
 					  base_shape_zyx=output_base_shape_zyx,
-					  lasagna_base_shape_zyx=lasagna_base_shape_zyx)
+					  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+					  extra_channels=extra_all,
+					  extra_channel_specs=flow_gate_channel_specs)
 		if approval_output_mask is not None:
 			_write_mask_debug_artifacts(
 				out_dir,
@@ -993,6 +1128,12 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 				mask_debug["valid_vertices_after"] = int(_valid_xyz_mask(x, y, z).sum())
 				_print_mask_debug(mask_debug)
 			valid = _valid_xyz_mask(x, y, z)
+			extra_layer = None
+			if flow_gate_channels is not None:
+				extra_layer = {
+					name: np.where(valid, np.clip(arr[d], 0.0, 1.0), 0.0).astype(np.float32, copy=False)
+					for name, arr in flow_gate_channels.items()
+				}
 			d_layer = np.where(valid, float(d), -1.0).astype(np.float32)
 			x, y, z = _scaled_xyz_for_export(x, y, z, export_factor)
 			area = _get_area(x, y, z, xy_step_export, cfg.voxel_size_um)
@@ -1006,7 +1147,9 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 						  job_spec=job_spec,
 						  area=area,
 						  base_shape_zyx=output_base_shape_zyx,
-						  lasagna_base_shape_zyx=lasagna_base_shape_zyx)
+						  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+						  extra_channels=extra_layer,
+						  extra_channel_specs=flow_gate_channel_specs)
 			if approval_output_mask is not None and mask_debug is not None:
 				_write_mask_debug_artifacts(
 					out_dir,

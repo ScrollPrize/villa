@@ -75,6 +75,33 @@ def _square_corr_results(*, include_invalid: bool = False) -> dict:
 	return {"points_list": points, "collection_avgs": {"7": 0.0}}
 
 
+def _model_params(*, mesh_step: int = 1) -> dict:
+	return {
+		"mesh_step": mesh_step,
+		"winding_step": 1,
+		"subsample_mesh": 1,
+		"subsample_winding": 1,
+		"scaledown": 1.0,
+		"z_step_eff": 1,
+		"volume_extent": None,
+		"pyramid_d": False,
+	}
+
+
+def _flow_gate_payload(local: np.ndarray, normalized: np.ndarray) -> dict:
+	return {
+		"version": 1,
+		"stage_name": "snap",
+		"mesh_shape_dhw": list(local.shape),
+		"flow_gate_local_contrast": torch.from_numpy(local.astype(np.float32)),
+		"flow_gate_component_normalized": torch.from_numpy(normalized.astype(np.float32)),
+		"source_config": {
+			"local_boost": 0.5,
+			"backtrack_distance": 50.0,
+		},
+	}
+
+
 class Fit2TifxyzOutputMaskHelpersTest(unittest.TestCase):
 	def test_corr_point_roi_mask_seeds_fractional_four_corners_and_maxpools(self) -> None:
 		import fit
@@ -348,6 +375,109 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 		self.assertTrue(np.all(d_out[expected] == 0.0))
 		self.assertTrue(np.all(d_out[~expected] == -1.0))
 		self.assertEqual(meta["area_vx2"], 4.0)
+
+	def test_checkpoint_export_writes_flow_gate_channels_with_output_mask(self) -> None:
+		x, y, z = _plane_mesh(7, 7)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		local = np.linspace(-0.5, 1.5, 49, dtype=np.float32).reshape(1, 7, 7)
+		normalized = np.full((1, 7, 7), 0.75, dtype=np.float32)
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": _model_params(),
+			"_fit_config_": {"args": {"tifxyz-flow-gate-channels": True}},
+			"_approval_inpaint_output_mask_": _square_payload(radius=0),
+			"_corr_points_results_": _square_corr_results(),
+			"_flow_gate_channels_": _flow_gate_payload(local, normalized),
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+
+			fit2tifxyz.main(["--input", str(ckpt), "--output", str(out)])
+
+			tifxyz = out / "winding_0000.tifxyz"
+			local_out = tifffile.imread(str(tifxyz / "flow_gate_local_contrast.tif"))
+			normalized_out = tifffile.imread(str(tifxyz / "flow_gate_component_normalized.tif"))
+			meta = json.loads((tifxyz / "meta.json").read_text(encoding="utf-8"))
+
+		expected_mask = np.zeros((7, 7), dtype=bool)
+		expected_mask[2:5, 2:5] = True
+		self.assertEqual(local_out.dtype, np.float32)
+		self.assertTrue(float(local_out.min()) >= 0.0)
+		self.assertTrue(float(local_out.max()) <= 1.0)
+		self.assertTrue(np.all(local_out[~expected_mask] == 0.0))
+		self.assertTrue(np.all(normalized_out[~expected_mask] == 0.0))
+		np.testing.assert_allclose(normalized_out[expected_mask], 0.75)
+		self.assertEqual(
+			[name["name"] for name in meta["extra_channels"]],
+			["flow_gate_local_contrast", "flow_gate_component_normalized"],
+		)
+		self.assertEqual(meta["extra_channels"][0]["source_config"]["local_boost"], 0.5)
+
+	def test_single_segment_export_concatenates_flow_gate_channels_with_border_zeroes(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack(
+			[
+				np.stack([x, x + 10.0], axis=0),
+				np.stack([y, y], axis=0),
+				np.stack([z, z + 1.0], axis=0),
+			],
+			axis=0,
+		)
+		local = np.stack([
+			np.full((3, 3), 0.25, dtype=np.float32),
+			np.full((3, 3), 0.5, dtype=np.float32),
+		], axis=0)
+		normalized = np.stack([
+			np.full((3, 3), 0.75, dtype=np.float32),
+			np.full((3, 3), 1.0, dtype=np.float32),
+		], axis=0)
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": _model_params(),
+			"_fit_config_": {"args": {"tifxyz-flow-gate-channels": True}},
+			"_flow_gate_channels_": _flow_gate_payload(local, normalized),
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+
+			fit2tifxyz.main(["--input", str(ckpt), "--output", str(out), "--single-segment"])
+
+			tifxyz = out / "winding_.tifxyz"
+			local_out = tifffile.imread(str(tifxyz / "flow_gate_local_contrast.tif"))
+
+		self.assertEqual(local_out.shape, (3, 8))
+		np.testing.assert_allclose(local_out[:, :3], 0.25)
+		np.testing.assert_allclose(local_out[:, 3:5], 0.0)
+		np.testing.assert_allclose(local_out[:, 5:8], 0.5)
+
+	def test_flow_gate_channels_on_requires_payload(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": _model_params(),
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+
+			with self.assertRaisesRegex(ValueError, "no _flow_gate_channels_ payload"):
+				fit2tifxyz.main([
+					"--input", str(ckpt),
+					"--output", str(out),
+					"--flow-gate-channels", "on",
+				])
 
 	def test_checkpoint_export_observes_cancel_callback(self) -> None:
 		x, y, z = _plane_mesh(3, 3)

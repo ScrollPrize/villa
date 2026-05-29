@@ -17,6 +17,7 @@ import fit_data
 import model
 import opt_loss_corr
 import opt_loss_dir
+import opt_loss_pred_dt
 import opt_loss_step
 import optimizer
 import volume_scale
@@ -621,6 +622,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--approval-inpaint-output-mask-dilate", type=int, default=3,
 		help="Output-mask dilation radius in exported mesh vertices")
 	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
+	p.add_argument("--tifxyz-flow-gate-channels", action=argparse.BooleanOptionalAction, default=False,
+		help="Store flow-gate component maps in the final checkpoint for tifxyz export")
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
@@ -1623,7 +1626,15 @@ def main(argv: list[str] | None = None) -> int:
 			  f"min={[round(v, 1) for v in mn]} max={[round(v, 1) for v in mx]}")
 	_stage_done("initial_mesh_stats", _t)
 
-	def _save_model(path: str, *, apply_corr_point_roi_mask: bool = True) -> None:
+	tifxyz_flow_gate_channels = bool(getattr(args, "tifxyz_flow_gate_channels", False))
+	last_flow_gate_channels_payload: dict | None = None
+
+	def _save_model(
+		path: str,
+		*,
+		apply_corr_point_roi_mask: bool = True,
+		flow_gate_channels_payload: dict | None = None,
+	) -> None:
 		st = dict(mdl.state_dict())
 		# Store flat mesh instead of pyramid levels
 		ms_keys = [k for k in st if k.startswith("mesh_ms.")]
@@ -1685,6 +1696,8 @@ def main(argv: list[str] | None = None) -> int:
 					"corr point results were produced; fit2tifxyz cannot project the mask",
 					flush=True,
 				)
+		if flow_gate_channels_payload is not None:
+			st["_flow_gate_channels_"] = copy.deepcopy(flow_gate_channels_payload)
 		# Store winding volume auto-offset if computed
 		from opt_loss_winding_volume import _winding_offset, _winding_direction
 		if _winding_offset is not None:
@@ -1693,6 +1706,11 @@ def main(argv: list[str] | None = None) -> int:
 		torch.save(st, path)
 
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
+		nonlocal last_flow_gate_channels_payload
+		if tifxyz_flow_gate_channels and res is not None:
+			payload = opt_loss_pred_dt.flow_gate_last_channels()
+			if payload is not None:
+				last_flow_gate_channels_payload = payload
 		if _out_dir is not None:
 			out = Path(_out_dir)
 			out.mkdir(parents=True, exist_ok=True)
@@ -1728,6 +1746,7 @@ def main(argv: list[str] | None = None) -> int:
 		ensure_data_fn=_ensure_data,
 		seed_xyz=seed_xyz,
 		out_dir=_out_dir,
+		capture_flow_gate_channels=tifxyz_flow_gate_channels,
 	)
 	_stage_done("optimizer", _t)
 
@@ -1738,7 +1757,7 @@ def main(argv: list[str] | None = None) -> int:
 	# Save final model
 	if model_cfg.model_output is not None:
 		_t = _stage_start("save_model_output")
-		_save_model(str(model_cfg.model_output))
+		_save_model(str(model_cfg.model_output), flow_gate_channels_payload=last_flow_gate_channels_payload)
 		print(f"[fit] saved model to {model_cfg.model_output}")
 		_stage_done("save_model_output", _t)
 
@@ -1747,7 +1766,7 @@ def main(argv: list[str] | None = None) -> int:
 		_t = _stage_start("save_final_snapshot")
 		out = Path(_out_dir)
 		out.mkdir(parents=True, exist_ok=True)
-		_save_model(str(out / "model_final.pt"))
+		_save_model(str(out / "model_final.pt"), flow_gate_channels_payload=last_flow_gate_channels_payload)
 		_stage_done("save_final_snapshot", _t)
 
 	# Export tifxyz

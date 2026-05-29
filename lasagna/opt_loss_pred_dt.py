@@ -20,6 +20,7 @@ _flow_gate_out_dir: Path | None = None
 _flow_gate_debug_counts: dict[str, int] = {}
 _flow_gate_last_stats: dict[str, float] = {}
 _flow_gate_last_timing: dict[str, float] = {}
+_flow_gate_last_channels: dict | None = None
 _flow_gate_seed_hw_cache: tuple[int, int, float, float] | None = None
 _flow_gate_jpg_warned: bool = False
 _pred_dt_normal_source: str = "model"
@@ -1009,9 +1010,11 @@ def configure_flow_gate(
 	stage_name: str,
 	seed_xyz: tuple[float, float, float] | None,
 	out_dir: str | None,
+	capture_channels: bool = False,
 ) -> None:
-	global _flow_gate_cfg, _flow_gate_stage, _flow_gate_seed_xyz, _flow_gate_out_dir, _flow_gate_debug_counts, _flow_gate_last_stats, _flow_gate_seed_hw_cache
+	global _flow_gate_cfg, _flow_gate_stage, _flow_gate_seed_xyz, _flow_gate_out_dir, _flow_gate_debug_counts, _flow_gate_last_stats, _flow_gate_last_channels, _flow_gate_seed_hw_cache
 	_flow_gate_last_stats = {}
+	_flow_gate_last_channels = None
 	_flow_gate_seed_hw_cache = None
 	if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
 		_flow_gate_cfg = None
@@ -1020,6 +1023,7 @@ def configure_flow_gate(
 		_flow_gate_out_dir = Path(out_dir) if out_dir else None
 		return
 	_flow_gate_cfg = dict(cfg)
+	_flow_gate_cfg["_capture_tifxyz_channels"] = bool(capture_channels)
 	_flow_gate_stage = str(stage_name)
 	_flow_gate_seed_xyz = seed_xyz
 	debug_out_dir = _flow_gate_cfg.get("debug_out_dir", None)
@@ -1048,6 +1052,17 @@ def flow_gate_last_stats() -> dict[str, float]:
 
 def flow_gate_last_timing() -> dict[str, float]:
 	return dict(_flow_gate_last_timing)
+
+
+def flow_gate_last_channels() -> dict | None:
+	if _flow_gate_last_channels is None:
+		return None
+	out = dict(_flow_gate_last_channels)
+	for name in ("flow_gate_local_contrast", "flow_gate_component_normalized"):
+		value = out.get(name)
+		if isinstance(value, torch.Tensor):
+			out[name] = value.detach().cpu().clone()
+	return out
 
 
 def _normalize_positive_debug_image(image: np.ndarray | None) -> np.ndarray | None:
@@ -1495,9 +1510,10 @@ def _write_flow_gate_weight_jpg(
 
 
 def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.Tensor, dict | None] | None:
-	global _flow_gate_last_stats, _flow_gate_last_timing, _flow_gate_seed_hw_cache
+	global _flow_gate_last_stats, _flow_gate_last_timing, _flow_gate_last_channels, _flow_gate_seed_hw_cache
 	_flow_gate_last_stats = {}
 	_flow_gate_last_timing = {}
+	_flow_gate_last_channels = None
 	cfg = _flow_gate_cfg
 	if cfg is None:
 		return None
@@ -1513,6 +1529,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 	local_boost = float(cfg.get("local_boost", 1.0))
 	pred_dt_pool_radius = int(cfg.get("pred_dt_pool_radius", 0))
 	pred_dt_pool_step_scale = float(cfg.get("pred_dt_pool_step_scale", 0.5))
+	capture_tifxyz_channels = bool(cfg.get("_capture_tifxyz_channels", False))
 	pull_cfg = _anticipatory_pull_cfg(cfg)
 	if not 0.0 <= gate_factor <= 1.0:
 		raise ValueError("pred_dt_flow_gate requires gate_factor in [0, 1]")
@@ -1655,6 +1672,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					verbose=False,
 					return_debug=return_flow_debug,
 					return_metadata=True,
+					return_components=capture_tifxyz_channels,
 					grid_step=grid_step,
 					backtrack_distance=backtrack_distance,
 					local_boost=local_boost,
@@ -1666,25 +1684,50 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			flow_outputs = _compute_flow_outputs()
 			publish_timing()
 			if return_flow_debug:
-				(
-					query_flow,
-					dense_flow,
-					smooth_grid_flow,
-					gate_basis_flow,
-					graph_edge_flow_rgb,
-					island_obstacle_factor_rgb,
-					island_removed_mask_hr,
-					island_flow_passability_rgb,
-					island_propagated_edge_flow_rgb,
-					island_bonus_edge_flow_rgb,
-					island_tree_dense_no_backtrack_hr,
-					island_tree_dense_greedy_ascent_hr,
-					source_edge_mask_hr,
-					source_component_mask_hr,
-					flow_metadata,
-				) = flow_outputs
+				if capture_tifxyz_channels:
+					(
+						query_flow,
+						dense_flow,
+						smooth_grid_flow,
+						gate_basis_flow,
+						graph_edge_flow_rgb,
+						island_obstacle_factor_rgb,
+						island_removed_mask_hr,
+						island_flow_passability_rgb,
+						island_propagated_edge_flow_rgb,
+						island_bonus_edge_flow_rgb,
+						island_tree_dense_no_backtrack_hr,
+						island_tree_dense_greedy_ascent_hr,
+						source_edge_mask_hr,
+						source_component_mask_hr,
+						flow_components,
+						flow_metadata,
+					) = flow_outputs
+				else:
+					(
+						query_flow,
+						dense_flow,
+						smooth_grid_flow,
+						gate_basis_flow,
+						graph_edge_flow_rgb,
+						island_obstacle_factor_rgb,
+						island_removed_mask_hr,
+						island_flow_passability_rgb,
+						island_propagated_edge_flow_rgb,
+						island_bonus_edge_flow_rgb,
+						island_tree_dense_no_backtrack_hr,
+						island_tree_dense_greedy_ascent_hr,
+						source_edge_mask_hr,
+						source_component_mask_hr,
+						flow_metadata,
+					) = flow_outputs
+					flow_components = None
 			else:
-				query_flow, dense_flow, flow_metadata = flow_outputs
+				if capture_tifxyz_channels:
+					query_flow, dense_flow, flow_components, flow_metadata = flow_outputs
+				else:
+					query_flow, dense_flow, flow_metadata = flow_outputs
+					flow_components = None
 				smooth_grid_flow = None
 				gate_basis_flow = None
 				graph_edge_flow_rgb = None
@@ -1783,6 +1826,33 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			device=res.xyz_lr.device,
 			dtype=torch.float32,
 		).view(1, 1, Hm, Wm)
+		if capture_tifxyz_channels and isinstance(flow_components, dict):
+			local_arr = flow_components.get("flow_gate_local_contrast")
+			normalized_arr = flow_components.get("flow_gate_component_normalized")
+			if local_arr is not None and normalized_arr is not None:
+				local_t = torch.as_tensor(
+					np.asarray(local_arr, dtype=np.float32).reshape(Hm, Wm),
+					device=res.xyz_lr.device,
+					dtype=torch.float32,
+				).view(1, Hm, Wm).clamp(0.0, 1.0)
+				normalized_t = torch.as_tensor(
+					np.asarray(normalized_arr, dtype=np.float32).reshape(Hm, Wm),
+					device=res.xyz_lr.device,
+					dtype=torch.float32,
+				).view(1, Hm, Wm).clamp(0.0, 1.0)
+				_flow_gate_last_channels = {
+					"version": 1,
+					"stage_name": str(_flow_gate_stage),
+					"mesh_shape_dhw": [1, int(Hm), int(Wm)],
+					"flow_gate_local_contrast": local_t.detach().cpu(),
+					"flow_gate_component_normalized": normalized_t.detach().cpu(),
+					"source_config": {
+						"local_boost": float(local_boost),
+						"backtrack_distance": float(backtrack_distance),
+						"gate_factor": float(gate_factor),
+						"grid_step": int(grid_step),
+					},
+				}
 		_t = mark("compute_weight")
 		gate_weight = flow_lr.clamp(0.0, 1.0)
 		weight = gate_weight

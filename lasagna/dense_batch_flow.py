@@ -147,6 +147,8 @@ def _load_library_from_path(path: Path) -> ctypes.CDLL:
 		ctypes.c_char_p,
 		ctypes.c_int,
 		ctypes.c_int,
+		ctypes.POINTER(ctypes.c_float),
+		ctypes.POINTER(ctypes.c_float),
 	]
 	lib.dense_batch_flow_grid_u8.restype = ctypes.c_int
 	return lib
@@ -194,6 +196,7 @@ def compute_flow_grid(
 	grid_step: int = 50,
 	backtrack_distance: float = 10.0,
 	local_boost: float = 1.0,
+	return_components: bool = False,
 ) -> tuple[np.ndarray, ...]:
 	"""Run dense source flow gating and sample it at explicit image-space points.
 
@@ -201,6 +204,8 @@ def compute_flow_grid(
 	source_xy and extra_source_xy are image coordinates, x then y.
 	query_xy: (N, 2) float32 image coordinates, x then y.
 	Returns (query_weight, dense_weight), both float32 gate weights in [0, 1].
+	When return_components is true, also returns a dict with query-sampled
+	flow_gate_local_contrast and flow_gate_component_normalized arrays.
 	When return_debug is true, also returns smooth grid flow, greedy-ascent gate
 	basis flow, graph edge flow, island obstacle-factor labels, the island
 	removal mask, island-flow propagation debug images, and island-propagated
@@ -223,6 +228,12 @@ def compute_flow_grid(
 
 	height, width = image.shape
 	query_flow = np.zeros((query.shape[0],), dtype=np.float32)
+	query_flow_local_contrast = (
+		np.zeros((query.shape[0],), dtype=np.float32) if return_components else None
+	)
+	query_flow_component_normalized = (
+		np.zeros((query.shape[0],), dtype=np.float32) if return_components else None
+	)
 	dense_flow = np.zeros((height, width), dtype=np.float32)
 	smooth_grid_flow = np.zeros((height, width), dtype=np.float32) if return_debug else None
 	gate_basis_flow = (
@@ -352,6 +363,16 @@ def compute_flow_grid(
 		err,
 		ctypes.sizeof(err),
 		1 if verbose else 0,
+		(
+			query_flow_local_contrast.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if query_flow_local_contrast is not None
+			else None
+		),
+		(
+			query_flow_component_normalized.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if query_flow_component_normalized is not None
+			else None
+		),
 	)
 	if rc != 0:
 		message = err.value.decode("utf-8", errors="replace")
@@ -384,6 +405,14 @@ def compute_flow_grid(
 		)
 	else:
 		result = (query_flow, dense_flow)
+	if return_components:
+		result = (
+			*result,
+			{
+				"flow_gate_local_contrast": query_flow_local_contrast,
+				"flow_gate_component_normalized": query_flow_component_normalized,
+			},
+		)
 	if return_metadata:
 		return (*result, metadata)
 	return result

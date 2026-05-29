@@ -13,6 +13,24 @@ if ROOT not in sys.path:
 
 
 class ApprovalInpaintConfigTest(unittest.TestCase):
+	def test_fit_arg_defaults_disable_tifxyz_flow_gate_channels(self) -> None:
+		import fit
+
+		parser = fit._build_parser()
+		args = parser.parse_args([])
+		self.assertFalse(args.tifxyz_flow_gate_channels)
+
+	def test_init_corr_point_roi_enables_tifxyz_flow_gate_channels(self) -> None:
+		cfg = json.loads((Path(ROOT) / "configs" / "init_corr_point_roi.json").read_text(encoding="utf-8"))
+		args = cfg.get("args", {})
+		self.assertTrue(args.get("tifxyz-flow-gate-channels"))
+
+	def test_crop_flow_config_enables_tifxyz_flow_gate_channels(self) -> None:
+		cfg = json.loads((Path(ROOT) / "configs" / "init_corr_approval_inpaint_flow.json").read_text(encoding="utf-8"))
+		args = cfg.get("args", {})
+		self.assertEqual(args.get("init-mode"), "shell-dir-crop")
+		self.assertTrue(args.get("tifxyz-flow-gate-channels"))
+
 	def test_approval_inpaint_export_configs_enable_output_mask(self) -> None:
 		config_names = [
 			"init_corr_approval_inpaint.json",

@@ -9478,7 +9478,9 @@ cv::Mat compute_flow_gate_weight_image(
         const float backtrack_distance,
         const float local_boost,
         const cv::Mat& normalization_labels = cv::Mat(),
-        const cv::Mat& source_reach_mask = cv::Mat()) {
+        const cv::Mat& source_reach_mask = cv::Mat(),
+        cv::Mat* out_local_contrast = nullptr,
+        cv::Mat* out_component_normalized = nullptr) {
     CV_Assert(flow.type() == CV_32F);
     CV_Assert(normalization_labels.empty() ||
               (normalization_labels.type() == CV_32S &&
@@ -9517,10 +9519,12 @@ cv::Mat compute_flow_gate_weight_image(
     } else {
         local_max = normalized_flow;
     }
+    cv::Mat local_contrast(flow.size(), CV_32F, cv::Scalar(0));
 
     cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             float* out_row = weight.ptr<float>(y);
+            float* local_row = local_contrast.ptr<float>(y);
             const float* norm_row = normalized_flow.ptr<float>(y);
             const float* max_row = local_max.ptr<float>(y);
             for (int x = 0; x < cols; ++x) {
@@ -9534,11 +9538,18 @@ cv::Mat compute_flow_gate_weight_image(
                         ? std::clamp(normalized_gate / local_denominator,
                                      0.0f, 1.0f)
                         : 0.0f;
+                local_row[x] = local_gate;
                 out_row[x] = local_blend * local_gate +
                              (1.0f - local_blend) * normalized_gate;
             }
         }
     });
+    if (out_local_contrast != nullptr) {
+        *out_local_contrast = local_contrast;
+    }
+    if (out_component_normalized != nullptr) {
+        *out_component_normalized = normalized_flow;
+    }
 
     std::cout << "Flow gate weight:\n"
               << "  local_max_radius: " << local_radius << "\n"
@@ -9952,7 +9963,9 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                                         int* resolved_seeded_nodes,
                                         char* error_message,
                                         int error_message_size,
-                                        int verbose) {
+                                        int verbose,
+                                        float* query_flow_local_contrast,
+                                        float* query_flow_component_normalized) {
     const auto set_error = [&](const std::string& message) {
         if (error_message != nullptr && error_message_size > 0) {
             const std::size_t n = std::min<std::size_t>(
@@ -10138,11 +10151,15 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         timings.insert(timings.end(), dense_flow_result.timings.begin(),
                        dense_flow_result.timings.end());
 
+        cv::Mat flow_gate_local_contrast;
+        cv::Mat flow_gate_component_normalized;
         const cv::Mat flow_gate_weight = compute_flow_gate_weight_image(
             dense_flow_result.tree_dense_flow_greedy_ascent,
             backtrack_distance, local_boost,
             dense_flow_result.flow_gate_component_regions,
-            dense_flow_result.source_reach_mask);
+            dense_flow_result.source_reach_mask,
+            &flow_gate_local_contrast,
+            &flow_gate_component_normalized);
         cv::Mat flow_gate_basis = normalize_flow_by_regions(
             dense_flow_result.tree_dense_flow_greedy_ascent,
             dense_flow_result.flow_gate_component_regions);
@@ -10284,7 +10301,8 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             }
         }
 
-        const auto sample_flow = [&](const float x, const float y) {
+        const auto sample_flow = [&](const cv::Mat& image,
+                                     const float x, const float y) {
             if (x < 0.0f || y < 0.0f || x > static_cast<float>(width - 1) ||
                 y > static_cast<float>(height - 1)) {
                 return 0.0f;
@@ -10297,18 +10315,28 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             const int y1 = std::min(y0 + 1, height - 1);
             const float fx = x - static_cast<float>(x0);
             const float fy = y - static_cast<float>(y0);
-            const float v00 = flow_gate_weight.at<float>(y0, x0);
-            const float v10 = flow_gate_weight.at<float>(y0, x1);
-            const float v01 = flow_gate_weight.at<float>(y1, x0);
-            const float v11 = flow_gate_weight.at<float>(y1, x1);
+            const float v00 = image.at<float>(y0, x0);
+            const float v10 = image.at<float>(y0, x1);
+            const float v01 = image.at<float>(y1, x0);
+            const float v11 = image.at<float>(y1, x1);
             const float v0 = v00 * (1.0f - fx) + v10 * fx;
             const float v1 = v01 * (1.0f - fx) + v11 * fx;
             return v0 * (1.0f - fy) + v1 * fy;
         };
 
         for (int i = 0; i < query_count; ++i) {
-            query_flow[i] = sample_flow(query_xy[2 * i],
+            query_flow[i] = sample_flow(flow_gate_weight, query_xy[2 * i],
                                         query_xy[2 * i + 1]);
+            if (query_flow_local_contrast != nullptr) {
+                query_flow_local_contrast[i] = sample_flow(
+                    flow_gate_local_contrast, query_xy[2 * i],
+                    query_xy[2 * i + 1]);
+            }
+            if (query_flow_component_normalized != nullptr) {
+                query_flow_component_normalized[i] = sample_flow(
+                    flow_gate_component_normalized, query_xy[2 * i],
+                    query_xy[2 * i + 1]);
+            }
         }
 
         timings.push_back(finish_timing("total", total_start));
