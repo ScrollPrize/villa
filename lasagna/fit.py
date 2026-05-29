@@ -609,6 +609,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
 	p.add_argument("--model-init", choices=("seed", "ext", "model", "flatten"), default="seed",
 		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input, flatten optimizes one external tifxyz inverse map")
+	p.add_argument("--self-map-init", choices=("off", "multi_wrap_full", "multi_wrap_d"), default="off",
+		help="Initialize snap_surf_map from the model itself instead of external_surfaces")
 	p.add_argument("--flatten-solver", choices=("torch", "inverse", "forward"), default="torch",
 		help="Flatten solver variant for model-init=flatten: torch/inverse keeps the existing inverse-map Adam path; forward optimizes source-vertex UVs and inverts at export")
 	p.add_argument("--approval-inpaint", action=argparse.BooleanOptionalAction, default=False,
@@ -627,6 +629,40 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
+
+
+def _validate_self_map_init_args(
+	*,
+	self_map_init: str,
+	model_init: str,
+	init_mode: str,
+	model_depth: int,
+	model_w: float | None,
+	model_w_unit: str,
+) -> str:
+	mode = str(self_map_init if self_map_init is not None else "off").strip().lower().replace("-", "_")
+	if mode not in {"off", "multi_wrap_full", "multi_wrap_d"}:
+		raise ValueError(f"invalid self-map-init '{self_map_init}' (expected off, multi_wrap_full, or multi_wrap_d)")
+	if mode == "off":
+		return mode
+	if str(model_init).strip().lower() != "seed":
+		raise ValueError("self-map-init requires args.model-init=seed")
+	if str(init_mode).strip().lower() != "shell-dir-crop":
+		raise ValueError("self-map-init requires args.init-mode=shell-dir-crop")
+	if str(model_w_unit).strip().lower() != "wraps":
+		raise ValueError("self-map-init requires args.model-w-unit=wraps")
+	model_w_f = 0.0 if model_w is None else float(model_w)
+	if mode == "multi_wrap_full":
+		if int(model_depth) != 1:
+			raise ValueError("self-map-init=multi_wrap_full requires args.depth=1")
+		if model_w_f <= 1.0:
+			raise ValueError("self-map-init=multi_wrap_full requires args.model-w > 1.0 wraps")
+	if mode == "multi_wrap_d":
+		if int(model_depth) <= 1:
+			raise ValueError("self-map-init=multi_wrap_d requires args.depth > 1")
+		if not (0.0 < model_w_f < 1.0):
+			raise ValueError("self-map-init=multi_wrap_d requires 0 < args.model-w < 1.0 wraps")
+	return mode
 
 
 def _dummy_flatten_data() -> fit_data.FitData3D:
@@ -973,6 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
 	_stage_done("parse_config", _t)
 
 	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
+	self_map_init = str(getattr(args, "self_map_init", "off")).strip().lower().replace("-", "_")
 	if model_init not in {"seed", "ext", "model", "flatten"}:
 		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, model, or flatten)")
 	if model_init == "flatten":
@@ -994,6 +1031,14 @@ def main(argv: list[str] | None = None) -> int:
 	device = torch.device(data_cfg.device)
 	_require_torch_device_available(device)
 	init_mode = str(model_cfg.init_mode).strip().lower()
+	self_map_init = _validate_self_map_init_args(
+		self_map_init=self_map_init,
+		model_init=model_init,
+		init_mode=init_mode,
+		model_depth=int(model_cfg.depth),
+		model_w=data_cfg.model_w,
+		model_w_unit=data_cfg.model_w_unit,
+	)
 	if init_mode == "shell-dir-crop" and model_init != "seed":
 		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")
 	if init_mode == "shell-dir-crop" and "init_shell_dir" in cfg:
@@ -1384,6 +1429,7 @@ def main(argv: list[str] | None = None) -> int:
 				winding_step=model_cfg.winding_step,
 				subsample_mesh=model_cfg.subsample_mesh,
 				subsample_winding=model_cfg.subsample_winding,
+				depth=(model_cfg.depth if self_map_init == "multi_wrap_d" else 1),
 			)
 			mdl.params = dataclasses.replace(
 				mdl.params,
@@ -1747,6 +1793,8 @@ def main(argv: list[str] | None = None) -> int:
 		seed_xyz=seed_xyz,
 		out_dir=_out_dir,
 		capture_flow_gate_channels=tifxyz_flow_gate_channels,
+		self_map_init=self_map_init,
+		self_map_model_w_wraps=(None if data_cfg.model_w is None else float(data_cfg.model_w)),
 	)
 	_stage_done("optimizer", _t)
 

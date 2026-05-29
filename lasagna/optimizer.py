@@ -738,14 +738,18 @@ def optimize(
 	out_dir: str | None = None,
 	capture_flow_gate_channels: bool = False,
 	cylinder_shell_callback=None,
+	self_map_init: str = "off",
+	self_map_model_w_wraps: float | None = None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
 	opt_loss_snap_surf.reset_state()
 	_snap_global_runtime: snap_surf_map_global.GlobalMapRuntime | None = None
+	_snap_self_runtimes: dict[str, snap_surf_map_global.SelfMapRuntime] = {}
 	_snap_global_offset_debug_printed = False
 	_map_forward_needs = fit_model.ModelForwardNeeds(mesh_normals=True, ext_surfaces=True)
 	snap_global_mesh_epoch = 0
+	self_map_mode = snap_surf_map_global.normalize_self_map_init(self_map_init)
 
 	def _bump_snap_global_mesh_epoch() -> None:
 		nonlocal snap_global_mesh_epoch
@@ -788,6 +792,33 @@ def optimize(
 			_snap_global_runtime = snap_surf_map_global.GlobalMapRuntime(base=base, seed_xyz=seed_xyz)
 		return _snap_global_runtime
 
+	def _snap_self_runtime_for(direction: str, stage_args: dict | None = None) -> snap_surf_map_global.SelfMapRuntime:
+		direction_i = str(direction).strip().lower()
+		runtime = _snap_self_runtimes.get(direction_i)
+		if runtime is None:
+			base = {}
+			if isinstance(stage_args, dict) and isinstance(stage_args.get("map_global"), dict):
+				base = dict(stage_args.get("map_global"))
+			runtime = snap_surf_map_global.SelfMapRuntime(
+				mode=self_map_mode,
+				direction=direction_i,
+				model_w_wraps=self_map_model_w_wraps,
+				base=base,
+			)
+			_snap_self_runtimes[direction_i] = runtime
+		return runtime
+
+	def _self_map_directions(stage_args: dict | None = None) -> list[str]:
+		if self_map_mode == "off":
+			return []
+		raw = (stage_args or {}).get("self_map_direction", (stage_args or {}).get("self-map-direction", "both"))
+		mode = str(raw).strip().lower()
+		if mode in {"both", "all"}:
+			return ["out", "in"]
+		if mode in {"out", "in"}:
+			return [mode]
+		raise ValueError(f"invalid self_map_direction {raw!r} (expected out, in, or both)")
+
 	def _run_snap_global_map_stage(
 		*,
 		stage: snap_surf_map_global.GlobalMapStageConfig,
@@ -797,6 +828,24 @@ def optimize(
 		status_fn=None,
 		auto_stop_fn=None,
 	) -> dict[str, float]:
+		if self_map_mode != "off":
+			if res.normals is None:
+				raise RuntimeError("self snap_surf global map optimizer requires model normals")
+			all_stats: dict[str, float] = {}
+			for direction in _self_map_directions(stage_args):
+				stats = _snap_self_runtime_for(direction, stage_args).run_stage(
+					stage=stage,
+					model_xyz=res.xyz_lr,
+					model_normals=res.normals,
+					model_valid=torch.isfinite(res.xyz_lr).all(dim=-1),
+					persistent_optimizer=persistent_optimizer,
+					status_fn=status_fn,
+					cancel_fn=cancel_fn,
+					auto_stop_fn=auto_stop_fn,
+				)
+				for k, v in stats.items():
+					all_stats[k] = all_stats.get(k, 0.0) + float(v) / float(max(1, len(_self_map_directions(stage_args))))
+			return all_stats
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
 			raise RuntimeError("snap_surf global map optimizer requires external_surfaces")
@@ -830,6 +879,30 @@ def optimize(
 		}
 
 	def _snap_global_map_loss(*, res) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+		if self_map_mode != "off":
+			if res.normals is None:
+				raise RuntimeError("self snap_surf_map requires model normals")
+			loss_total = res.xyz_lr.sum() * 0.0
+			lms_all: tuple[torch.Tensor, ...] = ()
+			masks_all: tuple[torch.Tensor, ...] = ()
+			stats_acc: dict[str, float] = {}
+			directions = _self_map_directions()
+			for direction in directions:
+				loss, lms, masks, stats = _snap_self_runtime_for(direction).snap_loss(
+					model_xyz=res.xyz_lr,
+					model_normals=res.normals,
+					model_valid=torch.isfinite(res.xyz_lr).all(dim=-1),
+					offset=1.0,
+					data=res.data,
+					strip_samples=max(2, int(res.params.subsample_mesh) + 1),
+				)
+				loss_total = loss_total + loss / float(max(1, len(directions)))
+				lms_all = lms_all + tuple(lms)
+				masks_all = masks_all + tuple(masks)
+				for k, v in stats.items():
+					stats_acc[k] = stats_acc.get(k, 0.0) + float(v) / float(max(1, len(directions)))
+			opt_loss_snap_surf.update_last_stats(stats_acc)
+			return loss_total, lms_all, masks_all
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
 			raise RuntimeError("snap_surf_map requires external_surfaces")
@@ -1574,7 +1647,7 @@ def optimize(
 			)
 
 		if opt_cfg.kind == "map":
-			if not getattr(model, "_ext_surfaces", None):
+			if self_map_mode == "off" and not getattr(model, "_ext_surfaces", None):
 				raise ValueError("snap_surf global map stages require external_surfaces")
 			map_stage = _global_map_stage_from_opt_settings(name=stage.name, opt_cfg=opt_cfg, args=stage_args)
 			_map_status_rows = 0
@@ -2488,24 +2561,38 @@ def optimize(
 						opt_loss_winding_density.ext_offset_prefetch_items_for_result(res=res_),
 					)
 				if needs_.prefetch_snap_surf_map:
-					records = getattr(res_, "ext_surfaces", None)
-					if records and res_.normals is not None:
-						ext_xyz, ext_valid, ext_normals, ext_quad_valid, offset = _unpack_ext_surface_record(records[0])
-						_add_prefetch_items(
-							_loss_prefetch_items,
-							_snap_global_runtime_for().snap_loss_prefetch_items(
-								model_xyz=res_.xyz_lr,
-								model_normals=res_.normals,
-								model_valid=torch.isfinite(res_.xyz_lr).all(dim=-1),
-								ext_xyz=ext_xyz,
-								ext_valid=ext_valid,
-								ext_normals=ext_normals,
-								ext_quad_valid=ext_quad_valid,
-								offset=offset,
-								data=res_.data,
-								strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
-							),
-						)
+					if self_map_mode != "off" and res_.normals is not None:
+						for direction in _self_map_directions():
+							_add_prefetch_items(
+								_loss_prefetch_items,
+								_snap_self_runtime_for(direction).snap_loss_prefetch_items(
+									model_xyz=res_.xyz_lr,
+									model_normals=res_.normals,
+									model_valid=torch.isfinite(res_.xyz_lr).all(dim=-1),
+									offset=1.0,
+									data=res_.data,
+									strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
+								),
+							)
+					else:
+						records = getattr(res_, "ext_surfaces", None)
+						if records and res_.normals is not None:
+							ext_xyz, ext_valid, ext_normals, ext_quad_valid, offset = _unpack_ext_surface_record(records[0])
+							_add_prefetch_items(
+								_loss_prefetch_items,
+								_snap_global_runtime_for().snap_loss_prefetch_items(
+									model_xyz=res_.xyz_lr,
+									model_normals=res_.normals,
+									model_valid=torch.isfinite(res_.xyz_lr).all(dim=-1),
+									ext_xyz=ext_xyz,
+									ext_valid=ext_valid,
+									ext_normals=ext_normals,
+									ext_quad_valid=ext_quad_valid,
+									offset=offset,
+									data=res_.data,
+									strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
+								),
+							)
 			if not _loss_prefetch_items:
 				return
 			for _cache in _active_caches:

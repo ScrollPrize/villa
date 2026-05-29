@@ -687,6 +687,7 @@ def _map_init_integrate_dyadic_uv_pyramid(
 	pyr: list[torch.Tensor],
 	*,
 	active_level: int = 0,
+	preserve_batch: bool = False,
 ) -> torch.Tensor:
 	if not pyr:
 		raise ValueError("empty map-init UV pyramid")
@@ -696,14 +697,16 @@ def _map_init_integrate_dyadic_uv_pyramid(
 	v = pyr[-1]
 	for i in range(len(pyr) - 2, level - 1, -1):
 		v = F.interpolate(v, size=(int(pyr[i].shape[2]), int(pyr[i].shape[3])), mode="bilinear", align_corners=True) + pyr[i]
-	return v.permute(0, 2, 3, 1).squeeze(0).contiguous()
+	out = v.permute(0, 2, 3, 1).contiguous()
+	return out if bool(preserve_batch) else out.squeeze(0).contiguous()
 
 def _map_init_integrate_dyadic_uv_to_nchw(
 	pyr: list[torch.Tensor],
 	*,
 	active_level: int,
 ) -> torch.Tensor:
-	return _map_init_integrate_dyadic_uv_pyramid(pyr, active_level=active_level).permute(2, 0, 1).unsqueeze(0).contiguous()
+	out = _map_init_integrate_dyadic_uv_pyramid(pyr, active_level=active_level, preserve_batch=True)
+	return out.permute(0, 3, 1, 2).contiguous()
 
 def _map_init_coarser_dyadic_uv_nchw(
 	pyr: list[torch.Tensor],
@@ -1020,11 +1023,15 @@ def _map_init_uv_pyr_from_dense(
 	levels: int,
 	factor: int,
 ) -> torch.nn.ParameterList:
-	if uv.ndim != 3 or int(uv.shape[-1]) != 2:
-		raise ValueError("map-init dense uv must be (H,W,2)")
-	H, W = int(uv.shape[0]), int(uv.shape[1])
+	if uv.ndim == 3 and int(uv.shape[-1]) == 2:
+		uv_n = uv.unsqueeze(0)
+	elif uv.ndim == 4 and int(uv.shape[-1]) == 2:
+		uv_n = uv
+	else:
+		raise ValueError("map-init dense uv must be (H,W,2) or (N,H,W,2)")
+	H, W = int(uv_n.shape[1]), int(uv_n.shape[2])
 	shapes = _map_init_scale_shapes(H, W, levels=levels, factor=factor)
-	targets: list[torch.Tensor] = [uv.permute(2, 0, 1).unsqueeze(0).contiguous()]
+	targets: list[torch.Tensor] = [uv_n.permute(0, 3, 1, 2).contiguous()]
 	for h_t, w_t in shapes[1:]:
 		targets.append(F.interpolate(targets[-1], size=(int(h_t), int(w_t)), mode="bilinear", align_corners=True))
 
