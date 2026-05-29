@@ -33,6 +33,8 @@ _STATION_N_LOCAL_SIGMA_IDX = 20.0
 _STATION_N_OUTSIDE_WEIGHT = 0.1
 _STATION_LOCAL_UPDATE_MAX_ITERS = 20
 _STATION_RECOVERY_PRINT_LIMIT = 20
+_STATION_INTERSECTION_EPS = 1.0e-2
+_STATION_RECOVERY_PRINT_MOVE = 0.25
 
 
 def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
@@ -444,16 +446,27 @@ def _station_anchor_from_local_ray_update(
             return None, it
         if not (torch.isfinite(torch.tensor([u, v], device=surf.device, dtype=surf.dtype)).all().item()):
             return None, it
-        if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
-            h_frac = max(0.0, min(float(Hm - 1), float(row) + float(u)))
-            w_frac = max(0.0, min(float(Wm - 1), float(col) + float(v)))
+        eps = float(_STATION_INTERSECTION_EPS)
+        if -eps <= u <= 1.0 + eps and -eps <= v <= 1.0 + eps:
+            u_c = max(0.0, min(1.0, float(u)))
+            v_c = max(0.0, min(1.0, float(v)))
+            h_frac = max(0.0, min(float(Hm - 1), float(row) + u_c))
+            w_frac = max(0.0, min(float(Wm - 1), float(col) + v_c))
+            point = _bilinear_point(
+                surf[row, col],
+                surf[row + 1, col],
+                surf[row, col + 1],
+                surf[row + 1, col + 1],
+                u_c,
+                v_c,
+            )
             normal = _quad_model_normal(
                 surf[row, col],
                 surf[row + 1, col],
                 surf[row, col + 1],
                 surf[row + 1, col + 1],
-                float(u),
-                float(v),
+                u_c,
+                v_c,
             )
             return (point, h_frac, w_frac, normal), it
 
@@ -619,7 +632,10 @@ def station_loss(
                         w_ref=_w_frac[d],
                         n_ray=ray,
                     )
-                if anchor is not None and update_iters > 1:
+                local_move = float("inf")
+                if anchor is not None:
+                    local_move = max(abs(float(anchor[1]) - float(_h_frac[d])), abs(float(anchor[2]) - float(_w_frac[d])))
+                if anchor is not None and update_iters > 1 and local_move >= float(_STATION_RECOVERY_PRINT_MOVE):
                     _print_station_recovery_event(
                         f"[station] local ray recovery d={d} iters={update_iters} "
                         f"from=({_h_frac[d]:.3f},{_w_frac[d]:.3f}) "
