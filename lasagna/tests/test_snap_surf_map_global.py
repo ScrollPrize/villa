@@ -27,6 +27,7 @@ from snap_surf.map_global import (
 	GlobalMapRuntime,
 	GlobalMapStageConfig,
 	GlobalMapConfig,
+	SelfMapRuntime,
 	_LrAutoscaleState,
 	_affine_from_seed_ext_quads,
 	_affine_multistart_candidates,
@@ -44,11 +45,16 @@ from snap_surf.map_global import (
 	_stage_loss_cfg,
 	_stage_station_weight,
 	_write_map_objs,
+	_self_map_objective_for_uv,
+	self_map_active_quads,
+	self_map_initial_uv,
+	self_map_pair_depths,
 	optimize_fixture,
 	parse_global_map_stage_item,
 	parse_global_map_config,
 	snap_surf_config_from_global_config,
 )
+from snap_surf.map_pyramid import _map_init_integrate_dyadic_uv_pyramid, _map_init_uv_pyr_from_dense
 from snap_surf import map_global_cli
 from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz
 
@@ -282,6 +288,165 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertEqual(_stage_objective_level(stage, 3, ext_shape), 0)
 		self.assertEqual(_stage_objective_level(coarse, 3, ext_shape), 3)
 		self.assertEqual(_stage_objective_level(explicit, 3, ext_shape), 2)
+
+	def test_self_map_mode1_initializes_single_shifted_map(self) -> None:
+		uv_out = self_map_initial_uv(
+			mode="multi_wrap_full",
+			direction="out",
+			depth=1,
+			height=3,
+			width=6,
+			model_w_wraps=2.5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		uv_in = self_map_initial_uv(
+			mode="multi_wrap_full",
+			direction="in",
+			depth=1,
+			height=3,
+			width=6,
+			model_w_wraps=2.5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+
+		self.assertEqual(tuple(uv_out.shape), (1, 3, 6, 2))
+		self.assertTrue(torch.allclose(uv_out[0, :, :, 0], torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 6)))
+		self.assertAlmostEqual(float(uv_out[0, 0, 0, 1]), 2.0)
+		self.assertAlmostEqual(float(uv_in[0, 0, 0, 1]), -2.0)
+		self.assertEqual(self_map_pair_depths("multi_wrap_full", "out", 1), ([0], [0]))
+
+	def test_self_map_mode2_initializes_identity_pairs(self) -> None:
+		uv = self_map_initial_uv(
+			mode="multi_wrap_d",
+			direction="out",
+			depth=4,
+			height=3,
+			width=5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+
+		self.assertEqual(tuple(uv.shape), (3, 3, 5, 2))
+		self.assertEqual(self_map_pair_depths("multi_wrap_d", "out", 4), ([0, 1, 2], [1, 2, 3]))
+		self.assertEqual(self_map_pair_depths("multi_wrap_d", "in", 4), ([1, 2, 3], [0, 1, 2]))
+		hh = torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 5)
+		ww = torch.arange(5, dtype=torch.float32).view(1, 5).expand(3, 5)
+		self.assertTrue(torch.allclose(uv[2, :, :, 0], hh))
+		self.assertTrue(torch.allclose(uv[2, :, :, 1], ww))
+
+	def test_stacked_uv_pyramid_preserves_batch_axis(self) -> None:
+		uv = self_map_initial_uv(
+			mode="multi_wrap_d",
+			direction="out",
+			depth=3,
+			height=5,
+			width=5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		pyr = _map_init_uv_pyr_from_dense(uv, levels=3, factor=2)
+		recon = _map_init_integrate_dyadic_uv_pyramid(list(pyr), preserve_batch=True)
+
+		self.assertEqual(tuple(pyr[0].shape), (2, 2, 5, 5))
+		self.assertEqual(tuple(pyr[1].shape[:2]), (2, 2))
+		self.assertEqual(tuple(recon.shape), tuple(uv.shape))
+		self.assertTrue(torch.allclose(recon, uv, atol=1.0e-6))
+
+	def test_self_map_batched_objective_matches_pair_average(self) -> None:
+		D, H, W = 3, 4, 4
+		model_xyz = torch.stack([_plane_xyz(h=H, w=W, z=float(d)) for d in range(D)], dim=0)
+		model_normals = _normals_3d(D, H, W)
+		model_valid = torch.ones(D, H, W, dtype=torch.bool)
+		uv = self_map_initial_uv(
+			mode="multi_wrap_d",
+			direction="out",
+			depth=D,
+			height=H,
+			width=W,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		cfg = snap_surf_config_from_global_config(
+			GlobalMapConfig(base={
+				"map_init": {
+					"subdiv": 1,
+					"w_vec_normal": 0.0,
+					"w_surface_normal": 0.0,
+					"w_smooth": 0.0,
+					"w_bend": 0.0,
+					"w_jac": 0.0,
+					"w_metric_smooth": 0.0,
+					"w_area_smooth": 0.0,
+					"w_z_lift": 0.0,
+					"max_sample_angle_deg": 180.0,
+					"max_step_neighbor_ratio": 0.0,
+				}
+			}, stages=())
+		)
+		active = self_map_active_quads(mode="multi_wrap_d", direction="out", model_valid=model_valid, uv=uv)
+
+		loss_b, _terms = _self_map_objective_for_uv(
+			uv=uv,
+			mode="multi_wrap_d",
+			direction="out",
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			cfg=cfg,
+			level=0,
+			active_quad=active,
+		)
+		per_pair = []
+		for i in range(D - 1):
+			loss_i, _ = _self_map_objective_for_uv(
+				uv=uv[i:i + 1],
+				mode="multi_wrap_d",
+				direction="out",
+				model_xyz=model_xyz[i:i + 2],
+				model_normals=model_normals[i:i + 2],
+				model_valid=model_valid[i:i + 2],
+				cfg=cfg,
+				level=0,
+				active_quad=active[i:i + 1],
+			)
+			per_pair.append(loss_i)
+		expected = torch.stack(per_pair).mean()
+
+		self.assertTrue(torch.allclose(loss_b, expected, atol=1.0e-6))
+
+	def test_self_map_batched_snap_loss_matches_pair_average(self) -> None:
+		D, H, W = 3, 4, 4
+		model_xyz = torch.stack([_plane_xyz(h=H, w=W, z=float(d)) for d in range(D)], dim=0)
+		model_normals = _normals_3d(D, H, W)
+		model_valid = torch.ones(D, H, W, dtype=torch.bool)
+		runtime = SelfMapRuntime(mode="multi_wrap_d", direction="out")
+		loss_b, _lms, _masks, stats_b = runtime.snap_loss(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			offset=1.0,
+			data=None,
+		)
+		per_pair = []
+		samples = 0.0
+		for i in range(D - 1):
+			pair_runtime = SelfMapRuntime(mode="multi_wrap_d", direction="out")
+			loss_i, _lms_i, _masks_i, stats_i = pair_runtime.snap_loss(
+				model_xyz=model_xyz[i:i + 2],
+				model_normals=model_normals[i:i + 2],
+				model_valid=model_valid[i:i + 2],
+				offset=1.0,
+				data=None,
+			)
+			per_pair.append(loss_i)
+			samples += stats_i["snaps_map_snap_samples"]
+
+		expected = torch.stack(per_pair).mean()
+
+		self.assertTrue(torch.allclose(loss_b, expected, atol=1.0e-6))
+		self.assertEqual(stats_b["snaps_map_snap_samples"], samples)
 
 	def test_runtime_map_init_keeps_z_lift_unless_disabled(self) -> None:
 		h, w = 5, 5

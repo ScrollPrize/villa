@@ -439,12 +439,211 @@ class GlobalMapModel(torch.nn.Module):
 		*,
 		levels: int,
 		factor: int = 2,
+		preserve_batch: bool | None = None,
 	) -> None:
 		super().__init__()
+		self.preserve_batch = bool(full_uv.ndim == 4) if preserve_batch is None else bool(preserve_batch)
 		self.map_uv_ms = _map_init_uv_pyr_from_dense(full_uv.detach(), levels=int(levels), factor=int(factor))
 
 	def forward(self, *, active_level: int = 0) -> torch.Tensor:
-		return _map_init_integrate_dyadic_uv_pyramid(list(self.map_uv_ms), active_level=int(active_level))
+		return _map_init_integrate_dyadic_uv_pyramid(
+			list(self.map_uv_ms),
+			active_level=int(active_level),
+			preserve_batch=bool(self.preserve_batch),
+		)
+
+
+SELF_MAP_MODES = ("off", "multi_wrap_full", "multi_wrap_d")
+SELF_MAP_DIRECTIONS = ("out", "in")
+
+
+def normalize_self_map_init(value: object) -> str:
+	mode = str(value if value is not None else "off").strip().lower().replace("-", "_")
+	if mode not in SELF_MAP_MODES:
+		raise ValueError(f"invalid self-map-init '{value}' (expected off, multi_wrap_full, or multi_wrap_d)")
+	return mode
+
+
+def self_map_pair_depths(mode: str, direction: str, depth: int) -> tuple[list[int], list[int]]:
+	mode_i = normalize_self_map_init(mode)
+	direction_i = str(direction).strip().lower()
+	if direction_i not in SELF_MAP_DIRECTIONS:
+		raise ValueError(f"invalid self-map direction '{direction}' (expected out or in)")
+	D = int(depth)
+	if mode_i == "off":
+		return [], []
+	if mode_i == "multi_wrap_full":
+		if D != 1:
+			raise ValueError("self-map-init=multi_wrap_full requires model depth D=1")
+		return [0], [0]
+	if D <= 1:
+		raise ValueError("self-map-init=multi_wrap_d requires model depth D>1")
+	if direction_i == "out":
+		return list(range(0, D - 1)), list(range(1, D))
+	return list(range(1, D)), list(range(0, D - 1))
+
+
+def self_map_initial_uv(
+	*,
+	mode: str,
+	direction: str,
+	depth: int,
+	height: int,
+	width: int,
+	model_w_wraps: float | None = None,
+	device: torch.device,
+	dtype: torch.dtype,
+) -> torch.Tensor:
+	src, _dst = self_map_pair_depths(mode, direction, int(depth))
+	N = len(src)
+	H = int(height)
+	W = int(width)
+	if N <= 0:
+		return torch.empty(0, H, W, 2, device=device, dtype=dtype)
+	hh = torch.arange(H, device=device, dtype=dtype).view(1, H, 1).expand(N, H, W)
+	ww = torch.arange(W, device=device, dtype=dtype).view(1, 1, W).expand(N, H, W)
+	uv = torch.stack([hh, ww], dim=-1).contiguous()
+	if normalize_self_map_init(mode) == "multi_wrap_full":
+		wraps = 1.0 if model_w_wraps is None else float(model_w_wraps)
+		if not math.isfinite(wraps) or wraps <= 0.0:
+			raise ValueError("self-map-init=multi_wrap_full requires positive model_w_wraps")
+		wrap_cols = float(max(1, W - 1)) / wraps
+		sign = 1.0 if str(direction).strip().lower() == "out" else -1.0
+		uv[..., 1] = uv[..., 1] + sign * wrap_cols
+	return uv
+
+
+def self_map_active_quads(
+	*,
+	mode: str,
+	direction: str,
+	model_valid: torch.Tensor,
+	uv: torch.Tensor,
+) -> torch.Tensor:
+	if uv.ndim != 4 or int(uv.shape[-1]) != 2:
+		raise ValueError("self-map uv must be (N,H,W,2)")
+	src, dst = self_map_pair_depths(mode, direction, int(model_valid.shape[0]))
+	N, H, W = int(uv.shape[0]), int(uv.shape[1]), int(uv.shape[2])
+	if len(src) != N:
+		raise ValueError(f"self-map uv batch {N} does not match topology batch {len(src)}")
+	if H < 2 or W < 2:
+		return torch.zeros(N, max(0, H - 1), max(0, W - 1), device=uv.device, dtype=torch.bool)
+	full_h, full_w = int(model_valid.shape[1]), int(model_valid.shape[2])
+	source_valid = model_valid[torch.tensor(src, device=model_valid.device, dtype=torch.long)].to(device=uv.device).bool()
+	source_quad_full = (
+		source_valid[:, :-1, :-1] &
+		source_valid[:, 1:, :-1] &
+		source_valid[:, :-1, 1:] &
+		source_valid[:, 1:, 1:]
+	)
+	if (H, W) == (full_h, full_w):
+		source_quad = source_quad_full
+	else:
+		level = 0
+		for candidate in range(1, 32):
+			try:
+				if _map_init_dyadic_level_shape(full_h, full_w, candidate) == (H, W):
+					level = candidate
+					break
+			except ValueError:
+				break
+		if level <= 0:
+			raise ValueError(f"self-map uv shape {(H, W)} is not a dyadic level of model shape {(full_h, full_w)}")
+		stride = 1 << level
+		QH, QW = int(source_quad_full.shape[1]), int(source_quad_full.shape[2])
+		if QH % stride != 0 or QW % stride != 0:
+			raise ValueError(f"self-map source quad grid {(QH, QW)} is not divisible by dyadic stride {stride}")
+		pooled = torch.nn.functional.avg_pool2d(
+			source_quad_full.to(dtype=uv.dtype).unsqueeze(1),
+			kernel_size=stride,
+			stride=stride,
+		).squeeze(1)
+		source_quad = pooled >= 1.0
+	target_depth = torch.tensor(dst, device=uv.device, dtype=uv.dtype).view(N, 1, 1, 1).expand(N, H, W, 1)
+	coords = torch.cat([target_depth, uv], dim=-1)
+	target_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+	target_quad = target_ok[:, :-1, :-1] & target_ok[:, 1:, :-1] & target_ok[:, :-1, 1:] & target_ok[:, 1:, 1:]
+	return source_quad & target_quad
+
+
+def _combine_term_dicts(term_dicts: list[dict[str, torch.Tensor]], weights: list[torch.Tensor], z: torch.Tensor) -> dict[str, torch.Tensor]:
+	if not term_dicts:
+		return {"loss": z.detach()}
+	keys = sorted(set().union(*(d.keys() for d in term_dicts)))
+	total_w = z
+	for w in weights:
+		total_w = total_w + w
+	out: dict[str, torch.Tensor] = {}
+	for key in keys:
+		acc = z
+		for terms, w in zip(term_dicts, weights):
+			acc = acc + terms.get(key, z).to(device=z.device, dtype=z.dtype) * w.to(device=z.device, dtype=z.dtype)
+		out[key] = (acc / total_w.clamp_min(1.0)).detach()
+	return out
+
+
+def _self_map_objective_for_uv(
+	*,
+	uv: torch.Tensor,
+	mode: str,
+	direction: str,
+	model_xyz: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	level: int,
+	need_stats: bool = True,
+	active_quad: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+	if uv.ndim != 4 or int(uv.shape[-1]) != 2:
+		raise ValueError("self-map objective uv must be (N,H,W,2)")
+	src, dst = self_map_pair_depths(mode, direction, int(model_xyz.shape[0]))
+	if len(src) != int(uv.shape[0]):
+		raise ValueError(f"self-map uv batch {int(uv.shape[0])} does not match topology batch {len(src)}")
+	active = active_quad
+	if active is None:
+		active = self_map_active_quads(mode=mode, direction=direction, model_valid=model_valid, uv=uv)
+	z = model_xyz.sum() * 0.0 + uv.sum() * 0.0
+	losses: list[torch.Tensor] = []
+	terms_list: list[dict[str, torch.Tensor]] = []
+	weights: list[torch.Tensor] = []
+	for i, (src_d, dst_d) in enumerate(zip(src, dst)):
+		ext_coords = None
+		if tuple(int(v) for v in uv.shape[1:3]) != tuple(int(v) for v in model_xyz.shape[1:3]):
+			ext_coords = _level_coords(tuple(int(v) for v in model_xyz.shape[1:3]), int(level), uv[i])
+		loss_i, terms_i = _map_init_objective(
+			uv_full=uv[i],
+			active_quad=active[i],
+			ext_pos=model_xyz[int(src_d)].detach(),
+			ext_normals=model_normals[int(src_d)].detach(),
+			ext_valid=model_valid[int(src_d)].detach().bool(),
+			ext_quad_valid=None,
+			ext_coords=ext_coords,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(dst_d),
+			sign=1,
+			cfg=cfg,
+			allow_partial_model_samples=True,
+			need_stats=bool(need_stats),
+			ext_z_lift_theta=None,
+			ext_z_lift_valid=None,
+			model_z_lift_theta=None,
+			model_z_lift_valid=None,
+		)
+		w = active[i].to(dtype=uv.dtype).sum().clamp_min(1.0)
+		losses.append(loss_i * w)
+		terms_list.append(terms_i)
+		weights.append(w)
+	if not losses:
+		return z, {"loss": z.detach()}
+	total_w = z
+	total = z
+	for loss_i, w in zip(losses, weights):
+		total = total + loss_i
+		total_w = total_w + w
+	return total / total_w.clamp_min(1.0), _combine_term_dicts(terms_list, weights, z)
 
 
 def parse_global_map_config(path: str | Path) -> GlobalMapConfig:
@@ -3710,6 +3909,342 @@ def _fixture_from_live_tensors(
 			dtype=torch.bool,
 		),
 	)
+
+
+class SelfMapRuntime:
+	"""Persistent batched self-map optimizer for init-shell winding pairs."""
+
+	def __init__(
+		self,
+		*,
+		mode: str,
+		direction: str,
+		model_w_wraps: float | None = None,
+		base: dict[str, Any] | None = None,
+	) -> None:
+		self.mode = normalize_self_map_init(mode)
+		self.direction = str(direction).strip().lower()
+		if self.direction not in SELF_MAP_DIRECTIONS:
+			raise ValueError(f"invalid self-map direction '{direction}'")
+		self.model_w_wraps = None if model_w_wraps is None else float(model_w_wraps)
+		self.cfg_global = GlobalMapConfig(base=dict(base or {}), stages=())
+		self.global_model: GlobalMapModel | None = None
+		self.optimizer: torch.optim.Optimizer | None = None
+		self.optimizer_key: tuple[tuple[str, ...], int, int, float, int] | None = None
+		self.lr_autoscale: _LrAutoscaleState | None = None
+		self.last: dict[str, float] = {}
+		self.steps_run = 0
+		self._snap_loss_mode_printed: set[tuple[str, float]] = set()
+
+	def _ensure_model(self, model_xyz: torch.Tensor, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
+		if self.global_model is not None:
+			return
+		D, H, W = int(model_xyz.shape[0]), int(model_xyz.shape[1]), int(model_xyz.shape[2])
+		initial_uv = self.initial_uv(depth=D, height=H, width=W, device=model_xyz.device, dtype=model_xyz.dtype)
+		levels = _max_supported_level(
+			(H, W),
+			max(int(stage.min_scaledown), int(base_cfg.map_init.scale_levels) - 1),
+		) + 1
+		self.global_model = GlobalMapModel(initial_uv.detach(), levels=levels, factor=2, preserve_batch=True)
+
+	def initial_uv(
+		self,
+		*,
+		depth: int,
+		height: int,
+		width: int,
+		device: torch.device,
+		dtype: torch.dtype,
+	) -> torch.Tensor:
+		return self_map_initial_uv(
+			mode=self.mode,
+			direction=self.direction,
+			depth=int(depth),
+			height=int(height),
+			width=int(width),
+			model_w_wraps=self.model_w_wraps,
+			device=device,
+			dtype=dtype,
+		)
+
+	def _uv(self, *, active_level: int = 0) -> torch.Tensor:
+		if self.global_model is None:
+			raise RuntimeError("self-map runtime is not initialized")
+		return self.global_model(active_level=int(active_level))
+
+	def _params_for_stage(self, stage: GlobalMapStageConfig) -> tuple[list[torch.nn.Parameter], int]:
+		if self.global_model is None:
+			raise RuntimeError("self-map runtime is not initialized")
+		params: list[torch.nn.Parameter] = []
+		level = 0
+		if "map_uv_ms" in stage.params or "affine" in stage.params:
+			level = min(max(0, int(stage.min_scaledown)), len(self.global_model.map_uv_ms) - 1)
+			params.extend(list(self.global_model.map_uv_ms.parameters())[level:])
+		return params, level
+
+	def _stats_from_terms(self, loss: torch.Tensor, terms: dict[str, torch.Tensor]) -> dict[str, float]:
+		stats = {
+			"snaps_map_loss": float(loss.detach().cpu()),
+			"snaps_map_runtime_steps": float(self.steps_run),
+			"snaps_map_samples": float(_global_term_value(terms, "samples")),
+		}
+		for term_key, stat_key in (
+			("dist", "snaps_map_dist"),
+			("vec", "snaps_map_vec"),
+			("norm", "snaps_map_norm"),
+			("turn", "snaps_map_turn"),
+			("turn_smp", "snaps_map_turn_smp"),
+			("smooth", "snaps_map_smooth"),
+			("bend", "snaps_map_bend"),
+			("jac", "snaps_map_jac"),
+			("metric_smooth", "snaps_map_metric_smooth"),
+			("area_smooth", "snaps_map_area_smooth"),
+			("prior", "snaps_map_prior"),
+			("sample_total", "snaps_map_sample_total"),
+			("sample_valid", "snaps_map_sample_valid"),
+			("sample_bad", "snaps_map_sample_bad"),
+			("uv_bad", "snaps_map_uvbad"),
+			("model_bad", "snaps_map_model_bad"),
+			("loss_finite", "snaps_map_loss_finite"),
+		):
+			stats[stat_key] = float(_global_term_value(terms, term_key))
+		return stats
+
+	def run_stage(
+		self,
+		*,
+		stage: GlobalMapStageConfig,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		persistent_optimizer: bool = False,
+		status_fn=None,
+		cancel_fn=None,
+		auto_stop_fn=None,
+		**_unused,
+	) -> dict[str, float]:
+		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
+		stage_cfg = _stage_loss_cfg(base_cfg, stage)
+		self._ensure_model(model_xyz, base_cfg, stage)
+		params, train_level = self._params_for_stage(stage)
+		sample_level = _stage_objective_level(stage, train_level, tuple(int(v) for v in model_xyz.shape[1:3]))
+		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
+		auto_loss_history: list[float] = []
+		steps_completed = 0
+		auto_stopped = False
+		lr_autoscale: _LrAutoscaleState | None = None
+		opt: torch.optim.Optimizer | None = None
+		if params and int(stage.steps) > 0:
+			key = (tuple(stage.params), int(train_level), int(sample_level), float(stage.lr), int(stage.min_scaledown))
+			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
+				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
+				_capture_optimizer_target_lrs(self.optimizer)
+				self.optimizer_key = key
+				self.lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None
+			opt = self.optimizer
+			assert opt is not None
+			lr_autoscale = self.lr_autoscale if persistent_optimizer else (_LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None)
+			for step in range(int(stage.steps)):
+				if cancel_fn is not None:
+					cancel_fn()
+				opt.zero_grad(set_to_none=True)
+				uv = self._uv(active_level=int(sample_level))
+				status_due = (
+					status_fn is not None and (
+						step == 0 or step == int(stage.steps) - 1 or (status_interval > 0 and (step % status_interval) == 0)
+					)
+				)
+				active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=model_valid, uv=uv)
+				loss, terms = _self_map_objective_for_uv(
+					uv=uv,
+					mode=self.mode,
+					direction=self.direction,
+					model_xyz=model_xyz,
+					model_normals=model_normals,
+					model_valid=model_valid,
+					cfg=stage_cfg,
+					level=int(sample_level),
+					need_stats=status_due,
+					active_quad=active,
+				)
+				_apply_optimizer_lr_schedule(
+					opt,
+					step1=(self.steps_run + 1 if persistent_optimizer else step + 1),
+					warmup_steps=lr_warmup_steps,
+					autoscale=lr_autoscale,
+					loss=loss,
+				)
+				if status_due:
+					status_stats = self._stats_from_terms(loss, terms)
+					status_stats["snaps_map_lr"] = _optimizer_lr_for_display(opt, float(stage.lr))
+					status_stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+					status_fn(step=step, total=int(stage.steps), stats=status_stats)
+				loss.backward()
+				opt.step()
+				self.steps_run += 1
+				steps_completed = step + 1
+				if auto_stop_fn is not None and steps_completed > lr_warmup_steps:
+					auto_loss_history.append(float(loss.detach().cpu()))
+					auto_stopped = bool(auto_stop_fn(history=auto_loss_history, step=steps_completed - lr_warmup_steps))
+				if auto_stopped:
+					break
+			if not persistent_optimizer:
+				self.optimizer = None
+				self.optimizer_key = None
+				self.lr_autoscale = None
+		with torch.no_grad():
+			uv = self._uv(active_level=int(sample_level))
+			active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=model_valid, uv=uv)
+			loss, terms = _self_map_objective_for_uv(
+				uv=uv,
+				mode=self.mode,
+				direction=self.direction,
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				cfg=stage_cfg,
+				level=int(sample_level),
+				need_stats=True,
+				active_quad=active,
+			)
+		stats = self._stats_from_terms(loss, terms)
+		stats["snaps_map_lr"] = _optimizer_lr_for_display(opt if params and int(stage.steps) > 0 else None, float(stage.lr))
+		stats["snaps_map_stage_steps"] = float(steps_completed)
+		stats["snaps_map_auto_stopped"] = 1.0 if auto_stopped else 0.0
+		stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+		self.last = stats
+		return stats
+
+	def _snap_inputs(
+		self,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+		self._ensure_model(model_xyz, snap_surf_config_from_global_config(self.cfg_global), GlobalMapStageConfig(params=("map_uv_ms",)))
+		uv = self._uv().detach()
+		src, dst = self_map_pair_depths(self.mode, self.direction, int(model_xyz.shape[0]))
+		src_t = torch.tensor(src, device=model_xyz.device, dtype=torch.long)
+		dst_t = torch.tensor(dst, device=model_xyz.device, dtype=torch.long)
+		source_xyz = model_xyz[src_t].detach()
+		source_normals = model_normals[src_t].detach()
+		source_valid = model_valid[src_t].detach().bool()
+		active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=model_valid, uv=uv)
+		active_vertex = torch.zeros_like(source_valid, dtype=torch.bool)
+		if active.numel():
+			active_vertex[:, :-1, :-1] |= active
+			active_vertex[:, 1:, :-1] |= active
+			active_vertex[:, :-1, 1:] |= active
+			active_vertex[:, 1:, 1:] |= active
+		return uv, dst_t, source_xyz, source_normals, source_valid & active_vertex, active
+
+	def snap_loss_prefetch_items(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> dict[str, torch.Tensor]:
+		if data is None:
+			return {}
+		uv, dst_t, source_xyz, _source_normals, source_valid, _active = self._snap_inputs(model_xyz, model_normals, model_valid)
+		target_depth = dst_t.to(dtype=uv.dtype).view(-1, 1, 1, 1).expand(*uv.shape[:-1], 1)
+		coords = torch.cat([target_depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		if not bool(valid.any().detach().cpu()):
+			return {}
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		model_pos = _sample_surface_grid(model_xyz, safe_coords)
+		sample_valid = valid & torch.isfinite(model_pos).all(dim=-1)
+		if not bool(sample_valid.any().detach().cpu()):
+			return {}
+		t = torch.linspace(0.0, 1.0, max(2, int(strip_samples)), device=model_xyz.device, dtype=model_xyz.dtype)
+		source_valid_xyz = source_xyz[sample_valid]
+		target_valid_xyz = model_pos.detach()[sample_valid]
+		strip = source_valid_xyz.unsqueeze(-2) + t.view(1, -1, 1) * (target_valid_xyz - source_valid_xyz).unsqueeze(-2)
+		return {"grad_mag": strip.reshape(1, 1, -1, 3).contiguous()}
+
+	def snap_loss(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], dict[str, float]]:
+		offset_f = float(offset)
+		mode_key = ("self_winding", offset_f)
+		if mode_key not in self._snap_loss_mode_printed:
+			print(
+				f"[snap_surf.map_global] self snap loss mode={self.mode}/{self.direction} offset={offset_f:.6g}",
+				flush=True,
+			)
+			self._snap_loss_mode_printed.add(mode_key)
+		uv, dst_t, source_xyz, _source_normals, source_valid, _active = self._snap_inputs(model_xyz, model_normals, model_valid)
+		target_depth = dst_t.to(dtype=uv.dtype).view(-1, 1, 1, 1).expand(*uv.shape[:-1], 1)
+		coords = torch.cat([target_depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		model_pos = _sample_surface_grid(model_xyz, safe_coords)
+		model_n = torch.nn.functional.normalize(_sample_surface_grid(model_normals.detach(), safe_coords), dim=-1, eps=1.0e-8)
+		valid = valid & torch.isfinite(model_pos).all(dim=-1) & torch.isfinite(model_n).all(dim=-1)
+		z = model_xyz.sum() * 0.0
+		lm = torch.zeros(model_xyz.shape[:3], device=model_xyz.device, dtype=model_xyz.dtype).unsqueeze(1)
+		mask = torch.zeros_like(lm)
+		if not bool(valid.any().detach().cpu()):
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		signed_vox = ((model_pos - source_xyz.detach()) * model_n.detach()).sum(dim=-1)
+		if data is None:
+			residual = signed_vox - signed_vox.new_tensor(offset_f)
+			valid_final = valid
+		else:
+			strip_samples_i = max(2, int(strip_samples))
+			sample_valid = valid & torch.isfinite(model_pos).all(dim=-1) & torch.isfinite(model_n).all(dim=-1)
+			with torch.no_grad():
+				t = torch.linspace(0.0, 1.0, strip_samples_i, device=model_xyz.device, dtype=model_xyz.dtype)
+				origin = torch.tensor(data.origin_fullres, device=model_xyz.device, dtype=model_xyz.dtype)
+				spacing = torch.tensor(data._spacing_for("grad_mag"), device=model_xyz.device, dtype=model_xyz.dtype)
+				sentinel = origin - 64.0 * spacing
+				source_safe = torch.where(sample_valid.unsqueeze(-1), source_xyz.detach(), sentinel.view(1, 1, 1, 3))
+				target_safe = torch.where(sample_valid.unsqueeze(-1), model_pos.detach(), sentinel.view(1, 1, 1, 3))
+				diff = target_safe - source_safe
+				strip = source_safe.unsqueeze(-2) + t.view(1, 1, 1, strip_samples_i, 1) * diff.unsqueeze(-2)
+				N, H, W = int(source_xyz.shape[0]), int(source_xyz.shape[1]), int(source_xyz.shape[2])
+				sampled = data.grid_sample_fullres(strip.reshape(1, N * H, W * strip_samples_i, 3), channels={"grad_mag"})
+				if sampled.grad_mag is None:
+					raise RuntimeError("self snap_surf_map offset mode requires grad_mag samples")
+				mag = sampled.grad_mag.detach().squeeze(0).squeeze(0).reshape(N, H, W, strip_samples_i)
+				strip_valid = (mag > 0.0).all(dim=-1)
+				mean_grad = mag.mean(dim=-1)
+				strip_len = diff.square().sum(dim=-1).sqrt()
+				int_sign = torch.sign(((model_pos.detach() - source_xyz.detach()) * model_n.detach()).sum(dim=-1))
+				signed_windings = int_sign * strip_len * mean_grad
+				winding_err = signed_windings - signed_vox.new_tensor(offset_f)
+			valid_final = sample_valid & strip_valid
+			normal_residual = signed_vox * mean_grad
+			residual = normal_residual + (winding_err - normal_residual).detach()
+		vals = residual[valid_final]
+		if vals.numel() == 0:
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		loss = vals.square().mean()
+		stats = {
+			"snaps_map_snap": float(loss.detach().cpu()),
+			"snaps_map_snap_abs": float(vals.detach().abs().mean().cpu()),
+			"snaps_map_snap_max": float(vals.detach().abs().max().cpu()),
+			"snaps_map_snap_samples": float(int(vals.numel())),
+		}
+		return loss, (lm,), (mask,), stats
 
 
 class GlobalMapRuntime:

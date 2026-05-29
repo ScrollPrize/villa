@@ -3570,10 +3570,12 @@ class Model3D(nn.Module):
 	def from_tifxyz_crop(xyz: torch.Tensor, valid: torch.Tensor, *,
 						 device: torch.device, mesh_step: int = 100,
 						 winding_step: int = 25, subsample_mesh: int = 4,
-						 subsample_winding: int = 4) -> "Model3D":
-		"""Create a depth=1 model from pre-cropped tifxyz tensors.
+						 subsample_winding: int = 4,
+						 depth: int = 1) -> "Model3D":
+		"""Create a model from pre-cropped tifxyz tensors.
 
 		xyz: (H, W, 3) float32 — invalid vertices should already be zeroed.
+		depth: number of identical initial D slices to stack.
 		valid: (H, W) bool — True for valid vertices.
 
 		Invalid vertices are inpainted via masked scale-space pyramid reconstruction.
@@ -3581,14 +3583,14 @@ class Model3D(nn.Module):
 		H, W, _ = xyz.shape
 		import math
 		mdl = Model3D(
-			device=device, depth=1, mesh_h=H, mesh_w=W,
+			device=device, depth=max(1, int(depth)), mesh_h=H, mesh_w=W,
 			mesh_step=mesh_step, winding_step=winding_step,
 			subsample_mesh=subsample_mesh, subsample_winding=subsample_winding,
 			arc_cx=0.0, arc_cy=0.0, arc_radius=1000.0,
 			arc_angle0=-0.5, arc_angle1=0.5,
 			init_mode="arc", pyramid_d=False,
 		)
-		flat_mesh = xyz.to(device=device).permute(2, 0, 1).unsqueeze(1)  # (3, 1, H, W)
+		flat_mesh = xyz.to(device=device).permute(2, 0, 1).unsqueeze(1).expand(3, mdl.depth, H, W).contiguous()
 		valid_dev = valid.to(device=device)
 		mdl.arc_enabled = False
 		mdl.straight_enabled = False
