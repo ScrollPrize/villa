@@ -67,7 +67,7 @@ const LatestPosts = () => {
       <TopCard
         title="Get Started"
         href="/get_started"
-        subtext="$1.5M+ already awarded"
+        subtext="$1.7M+ already awarded"
         useArrow={true}
       />
       {posts.map((post, index) => (
