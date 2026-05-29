@@ -20,9 +20,11 @@ class ApprovalInpaintConfigTest(unittest.TestCase):
 		args = parser.parse_args([])
 		self.assertFalse(args.tifxyz_flow_gate_channels)
 
-	def test_init_corr_point_roi_enables_tifxyz_flow_gate_channels(self) -> None:
-		cfg = json.loads((Path(ROOT) / "configs" / "init_corr_point_roi.json").read_text(encoding="utf-8"))
+	def test_point_strip_config_enables_tifxyz_flow_gate_channels(self) -> None:
+		cfg = json.loads((Path(ROOT) / "configs" / "new_point_strip.json").read_text(encoding="utf-8"))
 		args = cfg.get("args", {})
+		self.assertEqual(args.get("init-mode"), "shell-dir-crop")
+		self.assertTrue(args.get("corr-point-roi"))
 		self.assertTrue(args.get("tifxyz-flow-gate-channels"))
 
 	def test_crop_flow_config_enables_tifxyz_flow_gate_channels(self) -> None:
