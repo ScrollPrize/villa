@@ -404,12 +404,12 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _heightSpin->setSingleStep(64);
         dimLayout->addWidget(_heightSpin, 1);
 
-        dimLayout->addWidget(new QLabel(tr("N:"), dimWidget));
+        dimLayout->addWidget(new QLabel(tr("D:"), dimWidget));
         _windingsSpin = new QSpinBox(dimWidget);
         _windingsSpin->setRange(1, 999);
         _windingsSpin->setValue(3);
         _windingsSpin->setSingleStep(1);
-        _windingsSpin->setToolTip(tr("Number of windings"));
+        _windingsSpin->setToolTip(tr("Number of windings / model depth layers"));
         dimLayout->addWidget(_windingsSpin, 1);
 
         _newModelGroup->contentLayout()->addWidget(dimWidget);
@@ -1681,13 +1681,13 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
     args[QStringLiteral("model-w")] = nmW;
     args[QStringLiteral("model-w-unit")] = nmWUnit;
     args[QStringLiteral("model-h")] = nmH;
-    args[QStringLiteral("windings")] = nmN;
+    args[QStringLiteral("depth")] = nmN;
     config[QStringLiteral("args")] = args;
 
     std::cerr << "[lasagna] request settings:"
               << " seed=(" << cx << "," << cy << "," << cz << ")"
               << " w=" << nmW << " " << nmWUnit.toStdString() << " h=" << nmH
-              << " windings=" << nmN
+              << " windings/depth=" << nmN
               << " offset=" << offsetVal << std::endl;
 
     if (isOffsetMode && !segPath.empty()) {

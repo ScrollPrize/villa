@@ -61,7 +61,7 @@ python lasagna/fit.py \
     --winding-volume winding.zarr \
     --seed <cx> <cy> <cz> \
     --model-w <width> --model-h <height> \
-    --windings <n> \
+    --depth <n> \
     --out-dir work/fit_output \
     --model-output work/fit_output/model.pt
 ```
@@ -106,6 +106,6 @@ Optional flags: `--slices` (default: xy xz yz), `--channels` (default: cos pred_
 
 - `--seed`: center of the region to fit, in full-resolution voxel coordinates.
 - `--model-w`, `--model-h`: mesh dimensions in fullres voxels.
-- `--windings`: number of sheet windings to model.
+- `--depth`: number of sheet windings / model depth layers to model (`--windings` is a legacy alias).
 - `--device`: compute device (default cpu, use `cuda` for GPU).
 - `--downscale`: should match `--step` from preprocessing (default 4).

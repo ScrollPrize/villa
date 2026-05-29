@@ -631,6 +631,15 @@ def _build_parser() -> argparse.ArgumentParser:
 	return p
 
 
+def _fit_config_args_from_namespace(args: argparse.Namespace) -> dict[str, object]:
+	out: dict[str, object] = {}
+	for k, v in vars(args).items():
+		if k == "windings":
+			continue
+		out[k.replace("_", "-")] = v
+	return out
+
+
 def _validate_self_map_init_args(
 	*,
 	self_map_init: str,
@@ -998,11 +1007,12 @@ def main(argv: list[str] | None = None) -> int:
 	fit_config = copy.deepcopy(cfg)
 	cli_json.apply_defaults_from_cfg_args(parser, cfg)
 	args = parser.parse_args(argv_rest or [])
-	# Merge final parsed args into fit_config so checkpoint has all values
-	fit_config.setdefault("args", {}).update(
-		{k.replace("_", "-"): v for k, v in vars(args).items()})
 
 	model_cfg = cli_model.from_args(args)
+	# Merge final parsed args into fit_config so checkpoint has all values.
+	# depth is canonical; legacy args.windings is accepted only as an input alias.
+	fit_config.setdefault("args", {}).update(_fit_config_args_from_namespace(args))
+	fit_config["args"].pop("windings", None)
 	opt_cfg = cli_opt.from_args(args)
 	progress_enabled = bool(args.progress)
 	_out_dir = args.out_dir
