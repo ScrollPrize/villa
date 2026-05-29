@@ -267,6 +267,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Unsupervised Ink Detection with DINO](https://github.com/jgcarrasco/dino-ink-detection) by Jorge García. Contains experiments related to detecting ink without labels, including a Colab notebook.
 
+- [Vesuvius AutoResearch](https://github.com/mojomast/vesuvius-autoresearch) by mojomast. Autonomous, evidence-gated experiment search for Vesuvius ink-detection research, with reproducible configs, metric contracts, synthetic demo data, and promotion checks.
+
 - [Vesuvius GP+](https://github.com/jaredlandau/Vesuvius-Grandprize-Winner-Plus) by Jared Landau. Updated version of the Grand Prize Ink Detection script with extra features.
   
 - [Segment-to-segment label mapping](https://github.com/OliverDaubney/s2slabmap) by Oliver Daubney
