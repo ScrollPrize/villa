@@ -408,14 +408,23 @@ class InitShellIndex:
 		*,
 		device: torch.device | str = "cpu",
 		batch_quads: int = 65536,
+		shell_index: int | None = None,
+		anchor_hw: tuple[float, float] | None = None,
 	) -> ShellClosestPoint:
 		seed_np = np.asarray(seed, dtype=np.float64)
 		if seed_np.shape != (3,) or not np.all(np.isfinite(seed_np)):
 			raise ValueError(f"seed must be three finite coordinates, got {seed}")
+		if shell_index is not None and (int(shell_index) < 0 or int(shell_index) >= len(self.surfaces)):
+			raise ValueError(f"shell_index out of range: {shell_index}")
 		d_vertex, _idx = self.tree.query(seed_np, k=1)
 		radius = float(d_vertex) + float(self.max_quad_span)
 		vertex_indices = self.tree.query_ball_point(seed_np, r=radius)
+		if shell_index is not None:
+			si = int(shell_index)
+			vertex_indices = [idx for idx in vertex_indices if int(self.vertex_shell[int(idx)]) == si]
 		candidate_ids = self._candidate_quads_from_vertices(vertex_indices)
+		if shell_index is not None and candidate_ids.size:
+			candidate_ids = candidate_ids[self.quad_shell[candidate_ids] == int(shell_index)]
 		if candidate_ids.size == 0:
 			raise ValueError("shell-dir-crop lookup found no candidate quads")
 
@@ -426,6 +435,29 @@ class InitShellIndex:
 		best_triangle = -1
 		best_bary: tuple[float, float, float] | None = None
 		best_xyz: tuple[float, float, float] | None = None
+		best_tie = float("inf")
+
+		def _candidate_tie_key(global_quad: int, tri_id: int, bary_values: tuple[float, float, float]) -> float:
+			if anchor_hw is None:
+				return 0.0
+			shell_i = int(self.quad_shell[global_quad])
+			row = int(self.quad_row[global_quad])
+			col = int(self.quad_col[global_quad])
+			a_bary, b_bary, c_bary = bary_values
+			if tri_id == 0:
+				h = float(row) + b_bary + c_bary
+				w = float(col) + c_bary
+			else:
+				h = float(row) + b_bary
+				w = float(col) + b_bary + c_bary
+			width = float(self.surfaces[shell_i].unique_w)
+			anchor_h, anchor_w = float(anchor_hw[0]), float(anchor_hw[1])
+			dw = math.fmod(w - anchor_w + 0.5 * width, width)
+			if dw < 0.0:
+				dw += width
+			dw -= 0.5 * width
+			dh = h - anchor_h
+			return dh * dh + dw * dw
 
 		candidate_ids = np.sort(candidate_ids)
 		for start in range(0, int(candidate_ids.size), int(batch_quads)):
@@ -437,12 +469,18 @@ class InitShellIndex:
 				dist_sq = ((closest - seed_t.view(1, 3)) ** 2).sum(dim=-1)
 				local_i = int(torch.argmin(dist_sq).detach().cpu())
 				dist_sq_f = float(dist_sq[local_i].detach().cpu())
-				if dist_sq_f < best_dist_sq:
+				bary_tuple = tuple(float(v) for v in bary[local_i].detach().cpu().tolist())
+				tie_key = _candidate_tie_key(int(batch_np[local_i]), int(tri_id), bary_tuple)
+				eps = max(1.0e-8, 1.0e-6 * max(1.0, best_dist_sq))
+				if dist_sq_f < best_dist_sq - eps or (
+					abs(dist_sq_f - best_dist_sq) <= eps and tie_key < best_tie
+				):
 					best_dist_sq = dist_sq_f
 					best_quad_global = int(batch_np[local_i])
 					best_triangle = int(tri_id)
-					best_bary = tuple(float(v) for v in bary[local_i].detach().cpu().tolist())
+					best_bary = bary_tuple
 					best_xyz = tuple(float(v) for v in closest[local_i].detach().cpu().tolist())
+					best_tie = float(tie_key)
 
 		if best_quad_global < 0 or best_bary is None or best_xyz is None:
 			raise ValueError("shell-dir-crop lookup failed to select a closest point")
@@ -472,6 +510,30 @@ class InitShellIndex:
 			h=h,
 			w=w,
 		)
+
+	def closest_point_on_surface(
+		self,
+		surface: InitShellSurface,
+		seed: tuple[float, float, float],
+		*,
+		device: torch.device | str = "cpu",
+		anchor_hw: tuple[float, float] | None = None,
+	) -> ShellClosestPoint:
+		"""Project a point to one selected surface using optional 2D anchor tie-breaks."""
+		for shell_i, candidate in enumerate(self.surfaces):
+			if (
+				candidate.shell_id == surface.shell_id
+				and candidate.path == surface.path
+				and tuple(candidate.xyz_wrapped.shape) == tuple(surface.xyz_wrapped.shape)
+				and candidate.xyz_wrapped.data_ptr() == surface.xyz_wrapped.data_ptr()
+			):
+				return self.closest_point(
+					seed,
+					device=device,
+					shell_index=shell_i,
+					anchor_hw=anchor_hw,
+				)
+		return InitShellIndex([surface]).closest_point(seed, device=device, anchor_hw=anchor_hw)
 
 
 def _row_cumulative_lengths(row: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

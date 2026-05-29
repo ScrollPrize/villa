@@ -17,12 +17,15 @@ class DataConfig:
 	seed: tuple[int, int, int] | None                   # (cx, cy, cz) fullres seed point
 	model_w: float | None                                # model width value
 	model_w_unit: str                                    # "voxels" or "wraps"
-	model_h: int | None                                  # model height in fullres voxels
+	model_h: float | None                                # model height in fullres voxels
 	windings: int | None                                 # number of windings
 	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 	erode_valid_mask: int                                # erode grad_mag validity mask by N voxels
 	sparse_prefetch_backend: str                         # "tensorstore" or "python-zarr" streaming prefetcher
+	corr_point_roi: bool                                 # derive shell-dir-crop ROI from corr_points
+	corr_point_roi_init_margin: int                      # crop margin in mesh grid points
+	corr_point_roi_output_radius: int                    # export/output dilation radius in mesh grid points
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -52,6 +55,12 @@ def add_args(p: argparse.ArgumentParser) -> None:
 		help="Erode grad_mag validity mask inward by N voxels (excludes noisy borders from all losses)")
 	g.add_argument("--sparse-prefetch-backend", choices=("tensorstore", "python-zarr"), default="tensorstore",
 		help="Sparse streaming prefetch backend: tensorstore uses TensorStore Python, python-zarr uses the zarr fallback")
+	g.add_argument("--corr-point-roi", action=argparse.BooleanOptionalAction, default=False,
+		help="For shell-dir-crop seed init, ignore seed/size args and derive a single-depth ROI from corr_points")
+	g.add_argument("--corr-point-roi-init-margin", type=int, default=80,
+		help="Corr-point ROI initialization margin in mesh grid points")
+	g.add_argument("--corr-point-roi-output-radius", type=int, default=20,
+		help="Corr-point ROI output mask square dilation radius in mesh grid points")
 
 
 def from_args(args: argparse.Namespace) -> DataConfig:
@@ -69,7 +78,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 			raise ValueError("--seed requires exactly 3 values: cx cy cz")
 	model_w = None if getattr(args, "model_w", None) is None else float(args.model_w)
 	model_w_unit = str(getattr(args, "model_w_unit", "voxels"))
-	model_h = None if getattr(args, "model_h", None) is None else int(args.model_h)
+	model_h = None if getattr(args, "model_h", None) is None else float(args.model_h)
 	windings = None if getattr(args, "windings", None) is None else int(args.windings)
 	winding_volume = getattr(args, "winding_volume", None)
 	if winding_volume is not None:
@@ -88,6 +97,9 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 		cuda_gridsample=bool(int(getattr(args, "cuda_gridsample", 1))),
 		erode_valid_mask=int(getattr(args, "erode_valid_mask", 0)),
 		sparse_prefetch_backend=str(getattr(args, "sparse_prefetch_backend", "tensorstore")),
+		corr_point_roi=bool(getattr(args, "corr_point_roi", False)),
+		corr_point_roi_init_margin=int(getattr(args, "corr_point_roi_init_margin", 80)),
+		corr_point_roi_output_radius=int(getattr(args, "corr_point_roi_output_radius", 20)),
 	)
 
 

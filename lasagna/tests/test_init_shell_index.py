@@ -217,6 +217,169 @@ class InitShellCropTest(unittest.TestCase):
 
 		self.assertEqual(cfg.model_w, 1.5)
 		self.assertEqual(cfg.model_w_unit, "wraps")
+		self.assertFalse(cfg.corr_point_roi)
+		self.assertEqual(cfg.corr_point_roi_init_margin, 80)
+		self.assertEqual(cfg.corr_point_roi_output_radius, 20)
+
+	def test_cli_data_accepts_corr_point_roi_args(self) -> None:
+		parser = argparse.ArgumentParser()
+		cli_data.add_args(parser)
+		args = parser.parse_args([
+			"--input", "/tmp/input.lasagna.json",
+			"--corr-point-roi",
+			"--corr-point-roi-init-margin", "5",
+			"--corr-point-roi-output-radius", "2",
+		])
+
+		cfg = cli_data.from_args(args)
+
+		self.assertTrue(cfg.corr_point_roi)
+		self.assertEqual(cfg.corr_point_roi_init_margin, 5)
+		self.assertEqual(cfg.corr_point_roi_output_radius, 2)
+
+	def test_corr_point_roi_init_recenters_and_computes_exact_crop_extents(self) -> None:
+		width = 32
+		radius = 50.0
+		angles = [0.0, 0.25 * math.pi, 0.5 * math.pi]
+		points_xyz = [
+			(radius * math.cos(angles[0]), radius * math.sin(angles[0]), 10.0),
+			(radius * math.cos(angles[1]), radius * math.sin(angles[1]), 20.0),
+			(radius * math.cos(angles[2]), radius * math.sin(angles[2]), 20.0),
+		]
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			_write_tifxyz(
+				root / "shell_0001.tifxyz",
+				_wrapped_cylinder(radius=radius, z_values=[0.0, 10.0, 20.0, 30.0], width=width),
+			)
+			idx = init_shell_index.InitShellIndex.from_directory(root)
+			corr = fit.fit_data.CorrPoints3D(
+				points_xyz_winda=torch.tensor([[*p, 0.0] for p in points_xyz], dtype=torch.float32),
+				collection_idx=torch.zeros(3, dtype=torch.int64),
+				point_ids=torch.arange(3, dtype=torch.int64),
+				is_absolute=torch.zeros(3, dtype=torch.bool),
+			)
+			normals = torch.tensor(
+				[[math.cos(a), math.sin(a), 0.0] for a in angles],
+				dtype=torch.float32,
+			)
+
+			roi = fit._derive_corr_point_roi_init(
+				shell_index=idx,
+				corr_points=corr,
+				normals_xyz=normals,
+				mesh_step=10.0,
+				init_margin_grid_points=2,
+				device=torch.device("cpu"),
+			)
+
+		self.assertEqual(roi.payload["usable_point_count"], 3)
+		self.assertEqual(roi.payload["projection_mode"], "normal-line")
+		self.assertEqual(roi.payload["windings"], 1)
+		self.assertAlmostEqual(roi.payload["projected_h_span_grid"], 1.0, delta=1.0e-3)
+		self.assertAlmostEqual(roi.payload["projected_w_span_grid"], 8.0, delta=1.0e-3)
+		self.assertAlmostEqual(roi.model_h, 50.0, delta=1.0e-3)
+		self.assertAlmostEqual(roi.model_w, 120.0, delta=1.0e-3)
+		self.assertEqual([round(v, 3) for v in roi.payload["effective_seed"]], [round(v, 3) for v in points_xyz[1]])
+
+	def test_corr_point_roi_line_projection_selects_anchor_nearest_opposite_hit(self) -> None:
+		surface = init_shell_index.InitShellSurface(
+			shell_id="shell_0001.tifxyz",
+			path=Path("shell_0001.tifxyz"),
+			xyz_wrapped=_wrapped_cylinder(radius=10.0, z_values=[0.0, 10.0, 20.0], width=64),
+			unique_w=64,
+		)
+		points = torch.tensor([[10.0, 0.0, 10.0]], dtype=torch.float32)
+		normals = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+
+		valid, h, w, sign = fit._line_project_points_to_selected_shell(
+			surface,
+			points,
+			normals,
+			anchor_hw=(1.0, 32.0),
+			device=torch.device("cpu"),
+		)
+
+		self.assertTrue(bool(valid[0]))
+		self.assertAlmostEqual(float(h[0]), 1.0, delta=1.0e-3)
+		self.assertAlmostEqual(float(w[0]), 32.0, delta=1.0e-3)
+		self.assertEqual(int(sign[0]), -1)
+
+	def test_corr_point_roi_line_projection_uses_periodic_anchor_distance(self) -> None:
+		surface = init_shell_index.InitShellSurface(
+			shell_id="shell_0001.tifxyz",
+			path=Path("shell_0001.tifxyz"),
+			xyz_wrapped=_wrapped_cylinder(radius=10.0, z_values=[0.0, 10.0, 20.0], width=64),
+			unique_w=64,
+		)
+		points = torch.tensor([[10.0, 0.0, 10.0]], dtype=torch.float32)
+		normals = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+
+		valid, _h, w, _sign = fit._line_project_points_to_selected_shell(
+			surface,
+			points,
+			normals,
+			anchor_hw=(1.0, 63.8),
+			device=torch.device("cpu"),
+		)
+
+		self.assertTrue(bool(valid[0]))
+		self.assertLess(float(w[0]), 0.5)
+
+	def test_corr_point_roi_line_projection_prefers_grid_nearest_fold_hit(self) -> None:
+		width = 8
+		base_angles = (torch.arange(width, dtype=torch.float32) % 4.0) * (2.0 * math.pi / 4.0)
+		x = 10.0 * torch.cos(base_angles)
+		y = 10.0 * torch.sin(base_angles)
+		unique = torch.stack([
+			torch.stack([x, y, torch.zeros_like(x)], dim=-1),
+			torch.stack([x, y, torch.full_like(x, 10.0)], dim=-1),
+		], dim=0)
+		surface = init_shell_index.InitShellSurface(
+			shell_id="folded.tifxyz",
+			path=Path("folded.tifxyz"),
+			xyz_wrapped=torch.cat([unique, unique[:, :1]], dim=1).contiguous(),
+			unique_w=width,
+		)
+		points = torch.tensor([[0.0, 10.0, 5.0]], dtype=torch.float32)
+		normals = torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+
+		valid, h, w, _sign = fit._line_project_points_to_selected_shell(
+			surface,
+			points,
+			normals,
+			anchor_hw=(0.5, 5.0),
+			device=torch.device("cpu"),
+		)
+
+		self.assertTrue(bool(valid[0]))
+		self.assertTrue(math.isfinite(float(h[0])))
+		self.assertAlmostEqual(float(w[0]), 5.0, delta=1.0e-4)
+
+	def test_corr_point_roi_line_projection_skips_top_bottom_misses(self) -> None:
+		surface = init_shell_index.InitShellSurface(
+			shell_id="shell_0001.tifxyz",
+			path=Path("shell_0001.tifxyz"),
+			xyz_wrapped=_wrapped_cylinder(radius=10.0, z_values=[0.0, 10.0, 20.0], width=64),
+			unique_w=64,
+		)
+		corr = fit.fit_data.CorrPoints3D(
+			points_xyz_winda=torch.tensor([[10.0, 0.0, 100.0, 0.0]], dtype=torch.float32),
+			collection_idx=torch.zeros(1, dtype=torch.int64),
+			point_ids=torch.zeros(1, dtype=torch.int64),
+			is_absolute=torch.zeros(1, dtype=torch.bool),
+		)
+
+		projections, skipped = fit._project_corr_points_to_shell(
+			surface,
+			corr,
+			torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+			anchor_hw=(1.0, 0.0),
+			device=torch.device("cpu"),
+		)
+
+		self.assertEqual(projections, [])
+		self.assertEqual(skipped[0]["reason"], "no_line_shell_intersection")
 
 	def test_full_width_crop_cuts_opposite_anchor_and_is_nonperiodic(self) -> None:
 		surface = init_shell_index.InitShellSurface(

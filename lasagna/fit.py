@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 import cli_data
 import cli_json
@@ -86,6 +87,415 @@ def _optimization_seed_xyz(
 		center_pt = _grid_center(mdl)
 		return (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 	return config_seed
+
+
+@dataclasses.dataclass(frozen=True)
+class _CorrPointRoiProjection:
+	row_index: int
+	point_id: int
+	collection_id: int
+	xyz: tuple[float, float, float]
+	h: float
+	w: float
+	distance: float
+	direction_sign: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class _CorrPointRoiInit:
+	surface: object
+	closest: object
+	effective_seed: tuple[float, float, float]
+	model_w: float
+	model_h: float
+	projections: list[_CorrPointRoiProjection]
+	skipped: list[dict]
+	payload: dict
+
+
+def _unwrap_w_near(w: float, anchor_w: float, width: int) -> float:
+	width_f = float(max(1, int(width)))
+	dw = math.fmod(float(w) - float(anchor_w) + 0.5 * width_f, width_f)
+	if dw < 0.0:
+		dw += width_f
+	dw -= 0.5 * width_f
+	return float(anchor_w) + dw
+
+
+def _trim_shell_for_anchor(surface, closest, *, source_step: float):
+	from init_shell_index import trim_shell_surface_rows_by_quality
+
+	trimmed_surface, trim_top, trim_bottom = trim_shell_surface_rows_by_quality(
+		surface,
+		target_step=source_step,
+		lo_ratio=0.5,
+		hi_ratio=2.0,
+	)
+	if trim_top or trim_bottom:
+		if not (float(trim_top) <= float(closest.h) <= float(trim_top + trimmed_surface.xyz_wrapped.shape[0] - 1)):
+			raise ValueError(
+				f"corr-point-roi source row trim removed closest seed row: "
+				f"h={closest.h:.3f} trim_top={trim_top} kept_h={int(trimmed_surface.xyz_wrapped.shape[0])}"
+			)
+		closest = dataclasses.replace(
+			closest,
+			h=float(closest.h) - float(trim_top),
+			quad_row=max(0, int(closest.quad_row) - int(trim_top)),
+		)
+		surface = trimmed_surface
+	return surface, closest, int(trim_top), int(trim_bottom)
+
+
+def _projection_skip_reasons(skipped: list[dict]) -> dict[str, int]:
+	reasons: dict[str, int] = {}
+	for item in skipped:
+		reason = str(item.get("reason", "unknown"))
+		reasons[reason] = reasons.get(reason, 0) + 1
+	return dict(sorted(reasons.items()))
+
+
+def _sample_corr_point_roi_normals(
+	*,
+	data: fit_data.FitData3D,
+	corr_points: fit_data.CorrPoints3D,
+	device: torch.device,
+) -> torch.Tensor:
+	points = corr_points.points_xyz_winda[:, :3].to(device=device, dtype=torch.float32)
+	if points.numel() <= 0:
+		return points.reshape(0, 3)
+	sample_xyz = points.reshape(1, 1, int(points.shape[0]), 3)
+	if data.sparse_caches:
+		for cache in data.sparse_caches.values():
+			if not ({"nx", "ny"} & set(cache.channels)):
+				continue
+			cache.prefetch(sample_xyz, data.origin_fullres, data._spacing_for(cache.channels[0]))
+		for cache in data.sparse_caches.values():
+			if {"nx", "ny"} & set(cache.channels):
+				cache.sync()
+	sampled = data.grid_sample_fullres(sample_xyz, channels={"nx", "ny"})
+	normals = sampled.normal_3d
+	if normals is None:
+		raise ValueError("corr-point-roi requires nx and ny channels to sample corr point normals")
+	normals = normals.reshape(int(points.shape[0]), 3)
+	return normals / (normals.norm(dim=-1, keepdim=True) + 1.0e-8)
+
+
+def _line_project_points_to_selected_shell(
+	surface,
+	points_xyz: torch.Tensor,
+	normals_xyz: torch.Tensor,
+	*,
+	anchor_hw: tuple[float, float],
+	device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	points = points_xyz.to(device=device, dtype=torch.float32)
+	normals = normals_xyz.to(device=device, dtype=torch.float32)
+	K = int(points.shape[0])
+	if K <= 0:
+		empty_f = torch.empty(0, device=device, dtype=torch.float32)
+		empty_b = torch.empty(0, device=device, dtype=torch.bool)
+		empty_i = torch.empty(0, device=device, dtype=torch.int64)
+		return empty_b, empty_f, empty_f, empty_i
+	if points.shape != normals.shape or points.shape[-1] != 3:
+		raise ValueError(
+			f"corr-point-roi line projection expects points/normals shape (K,3), "
+			f"got points={tuple(points.shape)} normals={tuple(normals.shape)}"
+		)
+	shell = surface.xyz_wrapped.to(device=device, dtype=torch.float32)
+	H = int(shell.shape[0])
+	W = int(surface.unique_w)
+	if H < 2 or W < 1:
+		raise ValueError(f"corr-point-roi selected shell is too small: shape={tuple(shell.shape[:2])} unique_w={W}")
+	p00 = shell[:-1, :W].reshape(-1, 3).contiguous()
+	p10 = shell[1:, :W].reshape(-1, 3).contiguous()
+	p01 = shell[:-1, 1:W + 1].reshape(-1, 3).contiguous()
+	p11 = shell[1:, 1:W + 1].reshape(-1, 3).contiguous()
+	Q = int(p00.shape[0])
+	row_ids = torch.arange(H - 1, device=device, dtype=torch.float32).view(H - 1, 1).expand(H - 1, W).reshape(-1)
+	col_ids = torch.arange(W, device=device, dtype=torch.float32).view(1, W).expand(H - 1, W).reshape(-1)
+	best_score = torch.full((K,), float("inf"), device=device, dtype=torch.float32)
+	best_h = torch.full((K,), float("nan"), device=device, dtype=torch.float32)
+	best_w = torch.full((K,), float("nan"), device=device, dtype=torch.float32)
+	best_sign = torch.zeros((K,), device=device, dtype=torch.int64)
+	anchor_h, anchor_w = (float(anchor_hw[0]), float(anchor_hw[1]))
+	width_f = float(max(1, W))
+	batch_quads = max(1, min(32768, 2_000_000 // max(1, K)))
+	for q0 in range(0, Q, batch_quads):
+		q1 = min(q0 + batch_quads, Q)
+		B = int(q1 - q0)
+		M00 = p00[q0:q1].view(1, B, 3).expand(K, B, 3)
+		M10 = p10[q0:q1].view(1, B, 3).expand(K, B, 3)
+		M01 = p01[q0:q1].view(1, B, 3).expand(K, B, 3)
+		M11 = p11[q0:q1].view(1, B, 3).expand(K, B, 3)
+		O = points.view(K, 1, 3).expand(K, B, 3)
+		frac_h = torch.full((K, B), 0.5, device=device, dtype=torch.float32)
+		frac_w = torch.full((K, B), 0.5, device=device, dtype=torch.float32)
+		rows = row_ids[q0:q1].view(1, B)
+		cols = col_ids[q0:q1].view(1, B)
+		for sign in (1, -1):
+			direction = normals.view(K, 1, 3).expand(K, B, 3) * float(sign)
+			u, v = model.Model3D._ray_bilinear_intersect(O, direction, M00, M10, M01, M11, frac_h, frac_w)
+			hit = M00 * (1.0 - u.unsqueeze(-1)) * (1.0 - v.unsqueeze(-1))
+			hit = hit + M10 * u.unsqueeze(-1) * (1.0 - v.unsqueeze(-1))
+			hit = hit + M01 * (1.0 - u.unsqueeze(-1)) * v.unsqueeze(-1)
+			hit = hit + M11 * u.unsqueeze(-1) * v.unsqueeze(-1)
+			ray_t = ((hit - O) * direction).sum(dim=-1)
+			h = rows + u
+			w = torch.remainder(cols + v, width_f)
+			dw = torch.remainder(w - anchor_w + 0.5 * width_f, width_f) - 0.5 * width_f
+			score = (h - anchor_h) ** 2 + dw ** 2
+			valid = (
+				torch.isfinite(u) & torch.isfinite(v) &
+				torch.isfinite(score) & torch.isfinite(ray_t) &
+				(u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0) &
+				(ray_t >= -1.0e-4)
+			)
+			score = torch.where(valid, score, torch.full_like(score, float("inf")))
+			chunk_score, chunk_idx = score.min(dim=1)
+			better = chunk_score < best_score
+			if bool(better.any().detach().cpu()):
+				best_score = torch.where(better, chunk_score, best_score)
+				best_h = torch.where(better, h.gather(1, chunk_idx.view(K, 1)).squeeze(1), best_h)
+				best_w = torch.where(better, w.gather(1, chunk_idx.view(K, 1)).squeeze(1), best_w)
+				best_sign = torch.where(
+					better,
+					torch.full_like(best_sign, int(sign)),
+					best_sign,
+				)
+	valid = torch.isfinite(best_score)
+	return valid, best_h, best_w, best_sign
+
+
+def _project_corr_points_to_shell(
+	surface,
+	corr_points: fit_data.CorrPoints3D,
+	normals_xyz: torch.Tensor,
+	*,
+	anchor_hw: tuple[float, float],
+	device: torch.device,
+) -> tuple[list[_CorrPointRoiProjection], list[dict]]:
+	points = corr_points.points_xyz_winda[:, :3].detach().cpu()
+	cols = corr_points.collection_idx.detach().cpu()
+	pids = corr_points.point_ids.detach().cpu()
+	valid, h_t, w_t, sign_t = _line_project_points_to_selected_shell(
+		surface,
+		corr_points.points_xyz_winda[:, :3],
+		normals_xyz,
+		anchor_hw=anchor_hw,
+		device=device,
+	)
+	valid_cpu = valid.detach().cpu()
+	h_cpu = h_t.detach().cpu()
+	w_cpu = w_t.detach().cpu()
+	sign_cpu = sign_t.detach().cpu()
+	projections: list[_CorrPointRoiProjection] = []
+	skipped: list[dict] = []
+	for i in range(int(points.shape[0])):
+		xyz = tuple(float(v) for v in points[i].tolist())
+		if not bool(valid_cpu[i].item()):
+			skipped.append({
+				"row_index": int(i),
+				"point_id": int(pids[i].item()),
+				"collection_id": int(cols[i].item()),
+				"reason": "no_line_shell_intersection",
+			})
+			continue
+		dh = float(h_cpu[i].item()) - float(anchor_hw[0])
+		dw = _unwrap_w_near(float(w_cpu[i].item()), float(anchor_hw[1]), int(surface.unique_w)) - float(anchor_hw[1])
+		projections.append(_CorrPointRoiProjection(
+			row_index=int(i),
+			point_id=int(pids[i].item()),
+			collection_id=int(cols[i].item()),
+			xyz=xyz,
+			h=float(h_cpu[i].item()),
+			w=float(w_cpu[i].item()),
+			distance=float(math.sqrt(dh * dh + dw * dw)),
+			direction_sign=int(sign_cpu[i].item()),
+		))
+	return projections, skipped
+
+
+def _derive_corr_point_roi_init(
+	*,
+	shell_index,
+	corr_points: fit_data.CorrPoints3D,
+	normals_xyz: torch.Tensor,
+	mesh_step: float,
+	init_margin_grid_points: int,
+	device: torch.device,
+):
+	if corr_points.points_xyz_winda.shape[0] <= 0:
+		raise ValueError("corr-point-roi requires nonempty corr_points")
+	points = corr_points.points_xyz_winda[:, :3].to(device=device, dtype=torch.float32)
+	mean_xyz = points.mean(dim=0)
+	initial_idx = int(torch.argmin(((points - mean_xyz.view(1, 3)) ** 2).sum(dim=-1)).detach().cpu())
+	initial_seed = tuple(float(v) for v in points[initial_idx].detach().cpu().tolist())
+
+	def _select_from_seed(seed_xyz: tuple[float, float, float]):
+		closest = shell_index.closest_point(seed_xyz, device=device)
+		surface = shell_index.surfaces[closest.shell_index]
+		source_step = float(surface.source_step) if surface.source_step is not None else float(mesh_step)
+		surface, closest, trim_top, trim_bottom = _trim_shell_for_anchor(
+			surface,
+			closest,
+			source_step=source_step,
+		)
+		projections, skipped = _project_corr_points_to_shell(
+			surface,
+			corr_points,
+			normals_xyz,
+			anchor_hw=(float(closest.h), float(closest.w)),
+			device=device,
+		)
+		return closest, surface, projections, skipped, trim_top, trim_bottom
+
+	closest0, surface0, projections0, skipped0, trim_top0, trim_bottom0 = _select_from_seed(initial_seed)
+	if not projections0:
+		raise ValueError("corr-point-roi could not project any corr_points onto the initial shell")
+	width0 = int(surface0.unique_w)
+	h_avg = sum(float(p.h) for p in projections0) / float(len(projections0))
+	w_unwrapped0 = [_unwrap_w_near(float(p.w), float(closest0.w), width0) for p in projections0]
+	w_avg = sum(w_unwrapped0) / float(len(w_unwrapped0))
+	recenter_projection = min(
+		zip(projections0, w_unwrapped0),
+		key=lambda item: (float(item[0].h) - h_avg) ** 2 + (float(item[1]) - w_avg) ** 2,
+	)[0]
+
+	closest, surface, projections, skipped, trim_top, trim_bottom = _select_from_seed(recenter_projection.xyz)
+	if not projections:
+		raise ValueError("corr-point-roi could not project any corr_points onto the final shell")
+	width = int(surface.unique_w)
+	w_unwrapped = [_unwrap_w_near(float(p.w), float(closest.w), width) for p in projections]
+	h_vals = [float(p.h) for p in projections]
+	h_span = max(h_vals) - min(h_vals)
+	w_span = max(w_unwrapped) - min(w_unwrapped)
+	margin_vx = float(max(0, int(init_margin_grid_points))) * float(mesh_step)
+	model_h = max(float(mesh_step), h_span * float(mesh_step) + 2.0 * margin_vx)
+	model_w = max(float(mesh_step), w_span * float(mesh_step) + 2.0 * margin_vx)
+	payload = {
+		"mode": "corr-point-roi",
+		"projection_mode": "normal-line",
+		"init_margin_grid_points": int(init_margin_grid_points),
+		"effective_seed": [float(v) for v in recenter_projection.xyz],
+		"initial_seed": [float(v) for v in initial_seed],
+		"initial_shell_id": str(closest0.shell_id),
+		"final_shell_id": str(closest.shell_id),
+		"initial_trim_top": int(trim_top0),
+		"initial_trim_bottom": int(trim_bottom0),
+		"final_trim_top": int(trim_top),
+		"final_trim_bottom": int(trim_bottom),
+		"model_w": float(model_w),
+		"model_h": float(model_h),
+		"model_w_unit": "voxels",
+		"windings": 1,
+		"parsed_point_count": int(corr_points.points_xyz_winda.shape[0]),
+		"initial_usable_point_count": int(len(projections0)),
+		"initial_skipped_point_count": int(len(skipped0)),
+		"initial_skipped_reasons": _projection_skip_reasons(skipped0),
+		"usable_point_count": int(len(projections)),
+		"skipped_point_count": int(len(skipped)),
+		"skipped_reasons": _projection_skip_reasons(skipped),
+		"skipped_points": skipped,
+		"projected_points": [
+			{
+				"row_index": int(p.row_index),
+				"point_id": int(p.point_id),
+				"collection_id": int(p.collection_id),
+				"h": float(p.h),
+				"w": float(p.w),
+				"direction_sign": int(p.direction_sign),
+				"grid_distance_to_anchor": float(p.distance),
+			}
+			for p in projections
+		],
+		"final_anchor_h": float(closest.h),
+		"final_anchor_w": float(closest.w),
+		"projected_h_span_grid": float(h_span),
+		"projected_w_span_grid": float(w_span),
+		"projected_h_span_vx": float(h_span * float(mesh_step)),
+		"projected_w_span_vx": float(w_span * float(mesh_step)),
+	}
+	return _CorrPointRoiInit(
+		surface=surface,
+		closest=closest,
+		effective_seed=recenter_projection.xyz,
+		model_w=float(model_w),
+		model_h=float(model_h),
+		projections=projections,
+		skipped=skipped,
+		payload=payload,
+	)
+
+
+def _corr_point_roi_mask_from_results(
+	corr_results: dict | None,
+	*,
+	shape: tuple[int, int],
+	radius: int,
+	device: torch.device,
+) -> tuple[torch.Tensor, dict]:
+	if not isinstance(corr_results, dict):
+		raise ValueError("corr-point-roi output mask requires _corr_points_results_ in the checkpoint")
+	points = corr_results.get("points_list", None)
+	if not isinstance(points, list):
+		raw_points = corr_results.get("points", {})
+		points = list(raw_points.values()) if isinstance(raw_points, dict) else []
+	H, W = int(shape[0]), int(shape[1])
+	seed = torch.zeros((1, 1, H, W), device=device, dtype=torch.float32)
+	usable = 0
+	skipped: dict[str, int] = {}
+	for point in points:
+		if not isinstance(point, dict):
+			continue
+		if not bool(point.get("valid", False)):
+			skipped["point_invalid"] = skipped.get("point_invalid", 0) + 1
+			continue
+		locations = point.get("model_locations", [])
+		if not isinstance(locations, list) or not locations:
+			skipped["missing_model_locations"] = skipped.get("missing_model_locations", 0) + 1
+			continue
+		point_used = False
+		for loc in locations:
+			if not isinstance(loc, dict):
+				continue
+			try:
+				d = int(loc.get("d"))
+				h = float(loc.get("h"))
+				w = float(loc.get("w"))
+			except (TypeError, ValueError):
+				skipped["bad_location_value"] = skipped.get("bad_location_value", 0) + 1
+				continue
+			if d != 0:
+				skipped["nonzero_depth_location"] = skipped.get("nonzero_depth_location", 0) + 1
+				continue
+			if not (math.isfinite(h) and math.isfinite(w)):
+				skipped["nonfinite_location"] = skipped.get("nonfinite_location", 0) + 1
+				continue
+			h0 = math.floor(h)
+			h1 = math.ceil(h)
+			w0 = math.floor(w)
+			w1 = math.ceil(w)
+			for hh in {h0, h1}:
+				for ww in {w0, w1}:
+					if 0 <= hh < H and 0 <= ww < W:
+						seed[0, 0, int(hh), int(ww)] = 1.0
+						point_used = True
+		if point_used:
+			usable += 1
+	if usable <= 0:
+		raise ValueError(f"corr-point-roi output mask has no usable final corr projections; skipped={skipped}")
+	r = max(0, int(radius))
+	if r > 0:
+		mask = F.max_pool2d(seed, kernel_size=2 * r + 1, stride=1, padding=r) > 0.0
+	else:
+		mask = seed > 0.0
+	debug = {
+		"usable_point_count": int(usable),
+		"seed_vertex_count": int(seed.sum().detach().cpu().item()),
+		"dilated_vertex_count": int(mask.sum().detach().cpu().item()),
+		"skipped_reasons": dict(sorted(skipped.items())),
+	}
+	return mask[0, 0], debug
 
 
 def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | None:
@@ -695,6 +1105,87 @@ def main(argv: list[str] | None = None) -> int:
 		)
 	_stage_done("approval_inpaint", _t)
 
+	_t = _stage_start("corr_point_roi_init")
+	corr_point_roi_enabled = _truthy_config_bool(getattr(args, "corr_point_roi", False))
+	corr_point_roi_init: _CorrPointRoiInit | None = None
+	corr_point_roi_shell_index = None
+	if corr_point_roi_enabled:
+		if model_init != "seed":
+			raise ValueError("corr-point-roi requires args.model-init=seed")
+		if init_mode != "shell-dir-crop":
+			raise ValueError("corr-point-roi requires args.init-mode=shell-dir-crop")
+		corr_points_obj_for_roi = cfg.get("corr_points")
+		if not isinstance(corr_points_obj_for_roi, dict):
+			raise ValueError("corr-point-roi requires nonempty corr_points")
+		corr_points_3d_for_roi = _parse_corr_points(corr_points_obj_for_roi, device)
+		if corr_points_3d_for_roi is None or corr_points_3d_for_roi.points_xyz_winda.shape[0] <= 0:
+			raise ValueError("corr-point-roi requires nonempty corr_points")
+		from init_shell_index import InitShellIndex
+		init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
+		if device.type == "cuda":
+			corr_point_roi_normal_data = fit_data.load_3d_streaming(
+				path=str(data_cfg.input),
+				device=device,
+				sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
+				skip_channels={"cos", "pred_dt"},
+			)
+		else:
+			corr_point_roi_normal_data = fit_data.load_3d(
+				path=str(data_cfg.input),
+				device=device,
+				cuda_gridsample=(device.type == "cuda" and bool(data_cfg.cuda_gridsample)),
+				skip_channels={"cos", "pred_dt"},
+			)
+		corr_point_roi_normals = _sample_corr_point_roi_normals(
+			data=corr_point_roi_normal_data,
+			corr_points=corr_points_3d_for_roi,
+			device=device,
+		)
+		corr_point_roi_init = _derive_corr_point_roi_init(
+			shell_index=corr_point_roi_shell_index,
+			corr_points=corr_points_3d_for_roi,
+			normals_xyz=corr_point_roi_normals,
+			mesh_step=float(model_cfg.mesh_step),
+			init_margin_grid_points=int(data_cfg.corr_point_roi_init_margin),
+			device=device,
+		)
+		corr_point_roi_init.payload["output_radius_grid_points"] = int(data_cfg.corr_point_roi_output_radius)
+		data_cfg = dataclasses.replace(
+			data_cfg,
+			seed=corr_point_roi_init.effective_seed,
+			model_w=corr_point_roi_init.model_w,
+			model_w_unit="voxels",
+			model_h=corr_point_roi_init.model_h,
+			windings=1,
+		)
+		model_cfg = dataclasses.replace(model_cfg, depth=1, pyramid_d=False)
+		fit_config.setdefault("args", {}).update({
+			"corr-point-roi": True,
+			"corr-point-roi-init-margin": int(data_cfg.corr_point_roi_init_margin),
+			"corr-point-roi-output-radius": int(data_cfg.corr_point_roi_output_radius),
+			"seed": [float(v) for v in corr_point_roi_init.effective_seed],
+			"model-w": float(corr_point_roi_init.model_w),
+			"model-w-unit": "voxels",
+			"model-h": float(corr_point_roi_init.model_h),
+			"windings": 1,
+			"depth": 1,
+			"pyramid-d": False,
+		})
+		fit_config["_corr_point_roi_init_"] = copy.deepcopy(corr_point_roi_init.payload)
+		print(
+			f"[fit] corr-point-roi: shell={corr_point_roi_init.payload['final_shell_id']} "
+			f"line_hits={corr_point_roi_init.payload['usable_point_count']}/"
+			f"{corr_point_roi_init.payload['parsed_point_count']} "
+			f"skipped={corr_point_roi_init.payload['skipped_reasons']} "
+			f"seed=({corr_point_roi_init.effective_seed[0]:.1f},"
+			f"{corr_point_roi_init.effective_seed[1]:.1f},"
+			f"{corr_point_roi_init.effective_seed[2]:.1f}) "
+			f"model_w={corr_point_roi_init.model_w:.1f} model_h={corr_point_roi_init.model_h:.1f}",
+			flush=True,
+		)
+	_stage_done("corr_point_roi_init", _t)
+
 	# --- Init from seed (new model only) ---
 	_t = _stage_start("derive_initial_model_params")
 	if model_init == "seed":
@@ -778,9 +1269,14 @@ def main(argv: list[str] | None = None) -> int:
 				trim_shell_surface_rows_by_quality,
 			)
 			init_shell_dir = _require_manifest_init_shell_dir(prep_params)
-			shell_index = InitShellIndex.from_directory(init_shell_dir)
-			closest = shell_index.closest_point(tuple(float(v) for v in data_cfg.seed), device=device)
-			surface = shell_index.surfaces[closest.shell_index]
+			if corr_point_roi_init is not None:
+				shell_index = corr_point_roi_shell_index if corr_point_roi_shell_index is not None else InitShellIndex.from_directory(init_shell_dir)
+				closest = corr_point_roi_init.closest
+				surface = corr_point_roi_init.surface
+			else:
+				shell_index = InitShellIndex.from_directory(init_shell_dir)
+				closest = shell_index.closest_point(tuple(float(v) for v in data_cfg.seed), device=device)
+				surface = shell_index.surfaces[closest.shell_index]
 			source_step = float(surface.source_step) if surface.source_step is not None else float(model_cfg.mesh_step)
 			selected_shell = surface.xyz_wrapped[:, :surface.unique_w].to(device=device, dtype=torch.float32)
 			print(
@@ -806,40 +1302,41 @@ def main(argv: list[str] | None = None) -> int:
 				f"area_sqrt=({source_quality['area_sqrt_min']:.3f},{source_quality['area_sqrt_med']:.3f},{source_quality['area_sqrt_max']:.3f})",
 				flush=True,
 			)
-			trimmed_surface, trim_top, trim_bottom = trim_shell_surface_rows_by_quality(
-				surface,
-				target_step=source_step,
-				lo_ratio=0.5,
-				hi_ratio=2.0,
-			)
-			if trim_top or trim_bottom:
-				if not (float(trim_top) <= float(closest.h) <= float(trim_top + trimmed_surface.xyz_wrapped.shape[0] - 1)):
-					raise ValueError(
-						f"shell-dir-crop source row trim removed closest seed row: "
-						f"h={closest.h:.3f} trim_top={trim_top} kept_h={int(trimmed_surface.xyz_wrapped.shape[0])}"
+			if corr_point_roi_init is None:
+				trimmed_surface, trim_top, trim_bottom = trim_shell_surface_rows_by_quality(
+					surface,
+					target_step=source_step,
+					lo_ratio=0.5,
+					hi_ratio=2.0,
+				)
+				if trim_top or trim_bottom:
+					if not (float(trim_top) <= float(closest.h) <= float(trim_top + trimmed_surface.xyz_wrapped.shape[0] - 1)):
+						raise ValueError(
+							f"shell-dir-crop source row trim removed closest seed row: "
+							f"h={closest.h:.3f} trim_top={trim_top} kept_h={int(trimmed_surface.xyz_wrapped.shape[0])}"
+						)
+					closest = dataclasses.replace(
+						closest,
+						h=float(closest.h) - float(trim_top),
+						quad_row=max(0, int(closest.quad_row) - int(trim_top)),
 					)
-				closest = dataclasses.replace(
-					closest,
-					h=float(closest.h) - float(trim_top),
-					quad_row=max(0, int(closest.quad_row) - int(trim_top)),
-				)
-				surface = trimmed_surface
-				selected_shell = surface.xyz_wrapped[:, :surface.unique_w].to(device=device, dtype=torch.float32)
-				trim_quality = shell_quality_analysis(selected_shell, target_step=source_step)
-				print(
-					f"[fit] shell-dir-crop source-shell row trim: "
-					f"trim_top={trim_top} trim_bottom={trim_bottom} "
-					f"kept_shape={int(surface.xyz_wrapped.shape[0])}x{int(surface.xyz_wrapped.shape[1])} "
-					f"adjusted_h={closest.h:.3f} "
-					f"h=({trim_quality['h_min']:.3f},{trim_quality['h_med']:.3f},{trim_quality['h_max']:.3f}) "
-					f"w_top=({trim_quality['w_top_min']:.3f},{trim_quality['w_top_med']:.3f},{trim_quality['w_top_max']:.3f}) "
-					f"w_bottom=({trim_quality['w_bottom_min']:.3f},{trim_quality['w_bottom_med']:.3f},{trim_quality['w_bottom_max']:.3f}) "
-					f"diag_main=({trim_quality['diag_main_min']:.3f},{trim_quality['diag_main_med']:.3f},{trim_quality['diag_main_max']:.3f}) "
-					f"diag_anti=({trim_quality['diag_anti_min']:.3f},{trim_quality['diag_anti_med']:.3f},{trim_quality['diag_anti_max']:.3f}) "
-					f"area=({trim_quality['area_min']:.3f},{trim_quality['area_med']:.3f},{trim_quality['area_max']:.3f}) "
-					f"area_sqrt=({trim_quality['area_sqrt_min']:.3f},{trim_quality['area_sqrt_med']:.3f},{trim_quality['area_sqrt_max']:.3f})",
-					flush=True,
-				)
+					surface = trimmed_surface
+					selected_shell = surface.xyz_wrapped[:, :surface.unique_w].to(device=device, dtype=torch.float32)
+					trim_quality = shell_quality_analysis(selected_shell, target_step=source_step)
+					print(
+						f"[fit] shell-dir-crop source-shell row trim: "
+						f"trim_top={trim_top} trim_bottom={trim_bottom} "
+						f"kept_shape={int(surface.xyz_wrapped.shape[0])}x{int(surface.xyz_wrapped.shape[1])} "
+						f"adjusted_h={closest.h:.3f} "
+						f"h=({trim_quality['h_min']:.3f},{trim_quality['h_med']:.3f},{trim_quality['h_max']:.3f}) "
+						f"w_top=({trim_quality['w_top_min']:.3f},{trim_quality['w_top_med']:.3f},{trim_quality['w_top_max']:.3f}) "
+						f"w_bottom=({trim_quality['w_bottom_min']:.3f},{trim_quality['w_bottom_med']:.3f},{trim_quality['w_bottom_max']:.3f}) "
+						f"diag_main=({trim_quality['diag_main_min']:.3f},{trim_quality['diag_main_med']:.3f},{trim_quality['diag_main_max']:.3f}) "
+						f"diag_anti=({trim_quality['diag_anti_min']:.3f},{trim_quality['diag_anti_med']:.3f},{trim_quality['diag_anti_max']:.3f}) "
+						f"area=({trim_quality['area_min']:.3f},{trim_quality['area_med']:.3f},{trim_quality['area_max']:.3f}) "
+						f"area_sqrt=({trim_quality['area_sqrt_min']:.3f},{trim_quality['area_sqrt_med']:.3f},{trim_quality['area_sqrt_max']:.3f})",
+						flush=True,
+					)
 			if _SHELL_STEP_ANALYSIS_ENABLED:
 				step_stats = opt_loss_step.step_loss_analysis(selected_shell, mesh_step=source_step)
 				print(
@@ -1126,7 +1623,7 @@ def main(argv: list[str] | None = None) -> int:
 			  f"min={[round(v, 1) for v in mn]} max={[round(v, 1) for v in mx]}")
 	_stage_done("initial_mesh_stats", _t)
 
-	def _save_model(path: str) -> None:
+	def _save_model(path: str, *, apply_corr_point_roi_mask: bool = True) -> None:
 		st = dict(mdl.state_dict())
 		# Store flat mesh instead of pyramid levels
 		ms_keys = [k for k in st if k.startswith("mesh_ms.")]
@@ -1140,7 +1637,7 @@ def main(argv: list[str] | None = None) -> int:
 		elif getattr(mdl, "cylinder_enabled", False) and "conn_offsets" in st:
 			st["conn_offsets"] = torch.zeros_like(st["conn_offsets"])
 		with torch.no_grad():
-			st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
+			mesh_flat = mdl.mesh_flat_for_save(data=data)
 		params = asdict(mdl.params)
 		if lasagna_base_shape_zyx is not None:
 			params["lasagna_base_shape_zyx"] = [int(v) for v in lasagna_base_shape_zyx]
@@ -1149,6 +1646,30 @@ def main(argv: list[str] | None = None) -> int:
 		corr_results = opt_loss_corr.get_last_results()
 		if corr_results is not None:
 			st["_corr_points_results_"] = corr_results
+		if corr_point_roi_init is not None:
+			payload = copy.deepcopy(corr_point_roi_init.payload)
+			payload["output_radius_grid_points"] = int(data_cfg.corr_point_roi_output_radius)
+			if apply_corr_point_roi_mask:
+				if int(mesh_flat.shape[1]) != 1:
+					raise ValueError(f"corr-point-roi requires final mesh depth 1, got {int(mesh_flat.shape[1])}")
+				mask, mask_debug = _corr_point_roi_mask_from_results(
+					corr_results,
+					shape=(int(mesh_flat.shape[2]), int(mesh_flat.shape[3])),
+					radius=int(data_cfg.corr_point_roi_output_radius),
+					device=mesh_flat.device,
+				)
+				sentinel = torch.full_like(mesh_flat, -1.0)
+				mesh_flat = torch.where(mask.view(1, 1, int(mesh_flat.shape[2]), int(mesh_flat.shape[3])), mesh_flat, sentinel)
+				payload["output_mask"] = mask_debug
+				print(
+					f"[fit] corr-point-roi output mask: usable={mask_debug['usable_point_count']} "
+					f"seed_vertices={mask_debug['seed_vertex_count']} "
+					f"dilated_vertices={mask_debug['dilated_vertex_count']} "
+					f"radius={payload['output_radius_grid_points']}",
+					flush=True,
+				)
+			st["_corr_point_roi_"] = payload
+		st["mesh_flat"] = mesh_flat
 		if approval_inpaint_output_mask is not None:
 			st["_approval_inpaint_output_mask_"] = copy.deepcopy(approval_inpaint_output_mask)
 			print(
@@ -1177,7 +1698,7 @@ def main(argv: list[str] | None = None) -> int:
 			out.mkdir(parents=True, exist_ok=True)
 			snaps = out / "model_snapshots"
 			snaps.mkdir(parents=True, exist_ok=True)
-			_save_model(str(snaps / f"model_{stage}_{step:06d}.pt"))
+			_save_model(str(snaps / f"model_{stage}_{step:06d}.pt"), apply_corr_point_roi_mask=False)
 
 	def _progress(*, step: int, total: int, loss: float, **_kw: object) -> None:
 		if progress_enabled:

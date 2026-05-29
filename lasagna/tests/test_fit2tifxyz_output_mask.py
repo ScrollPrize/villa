@@ -76,6 +76,43 @@ def _square_corr_results(*, include_invalid: bool = False) -> dict:
 
 
 class Fit2TifxyzOutputMaskHelpersTest(unittest.TestCase):
+	def test_corr_point_roi_mask_seeds_fractional_four_corners_and_maxpools(self) -> None:
+		import fit
+
+		corr_results = {
+			"points_list": [
+				_corr_point_result(0, 2.2, 3.7),
+			],
+		}
+
+		mask, debug = fit._corr_point_roi_mask_from_results(
+			corr_results,
+			shape=(8, 8),
+			radius=1,
+			device=torch.device("cpu"),
+		)
+
+		expected_seed = np.zeros((8, 8), dtype=bool)
+		expected_seed[2, 3] = True
+		expected_seed[2, 4] = True
+		expected_seed[3, 3] = True
+		expected_seed[3, 4] = True
+		expected = np.zeros((8, 8), dtype=bool)
+		expected[1:5, 2:6] = True
+		self.assertEqual(debug["seed_vertex_count"], int(expected_seed.sum()))
+		self.assertEqual(mask.detach().cpu().numpy().tolist(), expected.tolist())
+
+	def test_corr_point_roi_mask_requires_usable_locations(self) -> None:
+		import fit
+
+		with self.assertRaisesRegex(ValueError, "no usable final corr projections"):
+			fit._corr_point_roi_mask_from_results(
+				{"points_list": [_corr_point_result(0, 1.0, 1.0, valid=False)]},
+				shape=(4, 4),
+				radius=1,
+				device=torch.device("cpu"),
+			)
+
 	def test_corr_point_polygon_fills_expected_vertices(self) -> None:
 		x, y, z = _plane_mesh(7, 7)
 		mask = fit2tifxyz._approval_output_mask_for_layer(
