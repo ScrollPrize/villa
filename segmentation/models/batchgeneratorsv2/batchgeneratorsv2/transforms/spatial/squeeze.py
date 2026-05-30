@@ -149,8 +149,10 @@ class SqueezeTransform(BasicTransform):
         # normalised cumulative integral -> strictly monotonic resampling map
         m = torch.cumsum(c, dim=0)
         m = (m - m[0]) / (m[-1] - m[0]) * (L - 1)
+        # m is pinned to [0, L-1]: endpoints fixed, so the warp stays fully
+        # in-bounds (no zero padding) and never folds. Do NOT subtract the
+        # mean -- that unpins the endpoints and pushes content off-grid.
         delta = m - xs
-        delta = delta - delta.mean()  # remove net translation; keep content centered
         return {'displacement': delta, 'axis': axis}
 
     # -- core warp ----------------------------------------------------------- #
