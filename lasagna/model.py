@@ -2491,6 +2491,101 @@ class Model3D(nn.Module):
 		n = torch.cross(edge_h, edge_w, dim=-1)
 		return n
 
+	def mesh_conn_prefetch_points(self, xyz_lr: torch.Tensor) -> tuple[torch.Tensor, ...]:
+		"""Return grad_mag sample points used by mesh connection masks.
+
+		The optimizer calls this during sparse-cache prefetch, before the model
+		forward that will sample these exact points in _xyz_conn().
+		"""
+		D, Hm, Wm, _ = xyz_lr.shape
+		if D < 2:
+			return ()
+		device = xyz_lr.device
+		normals = self._vertex_normals(xyz_lr).detach()
+		prev_h_off = self.conn_offsets[0]
+		prev_w_off = self.conn_offsets[1]
+		next_h_off = self.conn_offsets[2]
+		next_w_off = self.conn_offsets[3]
+
+		def _intersect_direction(src_xyz: torch.Tensor, src_n: torch.Tensor, nb_xyz: torch.Tensor, h_off: torch.Tensor, w_off: torch.Tensor) -> torch.Tensor:
+			B = src_xyz.shape[0]
+			h_idx_b = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(B, Hm, Wm)
+			w_idx_b = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(B, Hm, Wm)
+			target_h = h_idx_b + h_off
+			target_w = w_idx_b + w_off
+			row = target_h.floor().clamp(0, Hm - 2).long()
+			col = target_w.floor().clamp(0, Wm - 2).long()
+			frac_h = target_h - row.float()
+
+			d_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, Hm, Wm)
+			P00 = nb_xyz[d_idx, row, col]
+			P10 = nb_xyz[d_idx, row + 1, col]
+			P01 = nb_xyz[d_idx, row, col + 1]
+			P11 = nb_xyz[d_idx, row + 1, col + 1]
+
+			O = src_xyz
+			n = src_n
+			a = P10 - P00
+			b = P01 - P00
+			c = P11 - P10 - P01 + P00
+			g = P00 - O
+
+			def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
+				return vec[..., i] * n[..., j] - vec[..., j] * n[..., i]
+
+			Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
+			Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
+			Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
+			Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
+			qpairs = [(0, 1), (0, 2), (1, 2)]
+			alphas = []
+			betas_q = []
+			gammas = []
+			for p, q in qpairs:
+				alphas.append(Ap[p] * Cp[q] - Ap[q] * Cp[p])
+				betas_q.append(Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p])
+				gammas.append(Gp[p] * Bp[q] - Gp[q] * Bp[p])
+
+			abs_a = [aa.abs() for aa in alphas]
+			sel_q0 = (abs_a[0] >= abs_a[1]) & (abs_a[0] >= abs_a[2])
+			sel_q1 = (~sel_q0) & (abs_a[1] >= abs_a[2])
+			alpha = torch.where(sel_q0, alphas[0], torch.where(sel_q1, alphas[1], alphas[2]))
+			beta = torch.where(sel_q0, betas_q[0], torch.where(sel_q1, betas_q[1], betas_q[2]))
+			gamma = torch.where(sel_q0, gammas[0], torch.where(sel_q1, gammas[1], gammas[2]))
+
+			eps = 1e-12
+			disc_safe = (beta * beta - 4.0 * alpha * gamma).clamp(min=0.0)
+			sqrt_disc = torch.sqrt(disc_safe + 1e-12)
+			is_linear = alpha.abs() < eps
+			u1 = (-beta + sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+			u2 = (-beta - sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+			u_lin = -gamma / (beta + eps * (beta.abs() < eps).float())
+			u1 = torch.where(is_linear, u_lin, u1)
+			u2 = torch.where(is_linear, u_lin, u2)
+			u = torch.where((u1 - frac_h).abs() <= (u2 - frac_h).abs(), u1, u2)
+
+			denom_v = [Bp[k] + u * Cp[k] for k in range(3)]
+			numer_v = [-(Gp[k] + u * Ap[k]) for k in range(3)]
+			abs_dv = [d.abs() for d in denom_v]
+			sel_v0 = (abs_dv[0] >= abs_dv[1]) & (abs_dv[0] >= abs_dv[2])
+			sel_v1 = (~sel_v0) & (abs_dv[1] >= abs_dv[2])
+			dv = torch.where(sel_v0, denom_v[0], torch.where(sel_v1, denom_v[1], denom_v[2]))
+			nv = torch.where(sel_v0, numer_v[0], torch.where(sel_v1, numer_v[1], numer_v[2]))
+			v = nv / (dv + eps * (dv.abs() < eps).float())
+			return P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
+
+		prev_conn = _intersect_direction(
+			xyz_lr[1:], normals[1:], xyz_lr[:-1], prev_h_off[1:], prev_w_off[1:]
+		)
+		next_conn = _intersect_direction(
+			xyz_lr[:-1], normals[:-1], xyz_lr[1:], next_h_off[:-1], next_w_off[:-1]
+		)
+		boundary_prev = (2.0 * xyz_lr[0] - next_conn[0]).detach()
+		boundary_next = (2.0 * xyz_lr[-1] - prev_conn[-1]).detach()
+		prev_full = torch.cat([boundary_prev.unsqueeze(0), prev_conn], dim=0)
+		next_full = torch.cat([next_conn, boundary_next.unsqueeze(0)], dim=0)
+		return prev_full.detach(), xyz_lr.detach(), next_full.detach()
+
 	def _xyz_conn(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 		"""Compute connection points to neighbor depth slices.
 
@@ -2664,19 +2759,6 @@ class Model3D(nn.Module):
 			# Connection masks: sample validity AND patch intersection validity
 			def _valid_mask(gm: torch.Tensor) -> torch.Tensor:
 				return (gm.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz_lr.dtype).unsqueeze(1)
-
-			if data.sparse_caches:
-				with torch.no_grad():
-					for cache in data.sparse_caches.values():
-						if "grad_mag" not in cache.channels:
-							continue
-						spacing = data._spacing_for(cache.channels[0])
-						cache.prefetch(prev_full.detach(), data.origin_fullres, spacing)
-						cache.prefetch(xyz_lr.detach(), data.origin_fullres, spacing)
-						cache.prefetch(next_full.detach(), data.origin_fullres, spacing)
-					for cache in data.sparse_caches.values():
-						if "grad_mag" in cache.channels:
-							cache.sync()
 
 			mask_prev = _valid_mask(data.grid_sample_fullres(prev_full.detach(), channels={"grad_mag"}).grad_mag)
 			mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr.detach(), channels={"grad_mag"}).grad_mag)

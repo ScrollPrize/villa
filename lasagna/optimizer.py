@@ -2488,6 +2488,10 @@ def optimize(
 					)
 					if needs_.prefetch_pred_dt_flow and _xyz_hr_pf is not None else None
 				)
+				_mesh_conn_pf = (
+					model.mesh_conn_prefetch_points(_xyz_lr_pf)
+					if needs_.mesh_conn and hasattr(model, "mesh_conn_prefetch_points") else ()
+				)
 				_cyl_pf = None
 				if (
 					needs_.prefetch_cyl_gt_normals
@@ -2515,6 +2519,9 @@ def optimize(
 					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
 				if _cache_channels & _lr_channels:
 					_cache.prefetch(_xyz_lr_pf, data.origin_fullres, _sp)
+				if _mesh_conn_pf and "grad_mag" in _cache_channels:
+					for _pf in _mesh_conn_pf:
+						_cache.prefetch(_pf, data.origin_fullres, _sp)
 				if _pred_dt_extra_pf is not None and "pred_dt" in _cache_channels:
 					_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
 				if _cyl_pf is not None and ({"grad_mag", "nx", "ny"} & _cache_channels):
@@ -2528,8 +2535,18 @@ def optimize(
 		def _prefetch_loss_points_for_result(res_, needs_: fit_model.ModelForwardNeeds) -> None:
 			if not _active_caches:
 				return
+			_prefetched_channels: set[str] = set()
 			with torch.no_grad():
 				_loss_prefetch_items: dict[str, torch.Tensor] = {}
+				if needs_.mesh_conn:
+					for _pf in opt_loss_winding_density.winding_density_prefetch_grad_mag_batches_for_result(res=res_):
+						for _cache in _active_caches:
+							_cache_channels = set(_cache.channels)
+							if "grad_mag" not in _cache_channels:
+								continue
+							_sp = data._spacing_for(_cache.channels[0])
+							_cache.prefetch(_pf, data.origin_fullres, _sp)
+							_prefetched_channels.add("grad_mag")
 				if needs_.prefetch_pred_dt_loss:
 					_add_prefetch_items(
 						_loss_prefetch_items,
@@ -2591,7 +2608,7 @@ def optimize(
 									strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
 								),
 							)
-			if not _loss_prefetch_items:
+			if not _loss_prefetch_items and not _prefetched_channels:
 				return
 			for _cache in _active_caches:
 				points = [
@@ -2603,8 +2620,9 @@ def optimize(
 					_pf = torch.cat(points, dim=2) if len(points) > 1 else points[0]
 					_sp = data._spacing_for(_cache.channels[0])
 					_cache.prefetch(_pf, data.origin_fullres, _sp)
+					_prefetched_channels.update(ch for ch in _cache.channels if ch in _loss_prefetch_items)
 			for _cache in _active_caches:
-				if any(ch in _loss_prefetch_items for ch in _cache.channels):
+				if any(ch in _prefetched_channels for ch in _cache.channels):
 					_cache.sync()
 
 		# Initial evaluation
