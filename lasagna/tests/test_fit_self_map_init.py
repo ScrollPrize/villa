@@ -72,6 +72,26 @@ class FitSelfMapInitTest(unittest.TestCase):
 
 		self.assertEqual(mode, "multi_wrap_d")
 
+	def test_multi_wrap_d_accepts_voxel_width_for_late_shell_width_check(self) -> None:
+		mode = fit._validate_self_map_init_args(
+			self_map_init="multi_wrap_d",
+			model_init="seed",
+			init_mode="shell-dir-crop",
+			model_depth=3,
+			model_w=120.0,
+			model_w_unit="voxels",
+		)
+
+		self.assertEqual(mode, "multi_wrap_d")
+
+	def test_self_map_width_contract_checks_effective_wrap_count(self) -> None:
+		fit._validate_self_map_width_contract(mode="multi_wrap_d", model_w_wraps=0.5)
+		fit._validate_self_map_width_contract(mode="multi_wrap_full", model_w_wraps=1.5)
+		with self.assertRaisesRegex(ValueError, "0 < args.model-w < 1.0 wraps"):
+			fit._validate_self_map_width_contract(mode="multi_wrap_d", model_w_wraps=1.5)
+		with self.assertRaisesRegex(ValueError, "args.model-w > 1.0 wraps"):
+			fit._validate_self_map_width_contract(mode="multi_wrap_full", model_w_wraps=0.5)
+
 	def test_self_map_rejects_non_seed_or_non_shell_init(self) -> None:
 		with self.assertRaisesRegex(ValueError, "model-init=seed"):
 			fit._validate_self_map_init_args(

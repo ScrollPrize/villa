@@ -46,6 +46,8 @@ class ShellCropInfo:
 	anchor_w: float
 	anchor_arc: float
 	circumference: float
+	requested_width: float
+	requested_width_wraps: float
 	source_h: int
 	source_w: int
 	requested_mesh_h: int
@@ -626,6 +628,7 @@ def crop_shell_surface(
 		raise ValueError(f"model_w_unit must be 'voxels' or 'wraps', got {model_w_unit!r}")
 	target_width = model_w_f * circ_anchor_f if unit == "wraps" else model_w_f
 	full_width = target_width <= 0.0
+	requested_width_wraps = 1.0 if full_width else (target_width / circ_anchor_f)
 	if full_width:
 		w_count = max(3, int(math.ceil(circ_anchor_f / step)))
 		base_offsets = None
@@ -674,6 +677,8 @@ def crop_shell_surface(
 		anchor_w=float(closest.w),
 		anchor_arc=float(anchor_arc.detach().cpu()),
 		circumference=circ_anchor_f,
+		requested_width=float(target_width),
+		requested_width_wraps=float(requested_width_wraps),
 		source_h=int(shell.shape[0]),
 		source_w=int(shell.shape[1]),
 		requested_mesh_h=int(h_count),
