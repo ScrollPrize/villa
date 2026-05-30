@@ -148,8 +148,15 @@ def trim_shell_surface_rows_by_quality(
 	target_step: float,
 	lo_ratio: float = 0.67,
 	hi_ratio: float = 1.5,
+	lo_quantile: float = 0.25,
+	hi_quantile: float = 0.75,
 ) -> tuple[InitShellSurface, int, int]:
-	"""Trim full source rows from top/bottom until shell edge/area bands are sane."""
+	"""Trim full source rows from top/bottom until shell edge/area bands are sane.
+
+	Snapped init shells can contain duplicate vertices, outlier edges, or
+	an artificial wrap seam. Use interquartile row bounds by default so sparse
+	bad edges do not reject an otherwise usable row band.
+	"""
 	shell = surface.xyz_wrapped[:, :surface.unique_w].contiguous()
 	if int(shell.shape[0]) < 3:
 		return surface, 0, 0
@@ -168,14 +175,29 @@ def trim_shell_surface_rows_by_quality(
 		(p10 - p01).norm(dim=-1) / math.sqrt(2.0),
 		_quad_area(p00, p10, p11, p01).sqrt(),
 	]
+	qlo = min(max(float(lo_quantile), 0.0), 1.0)
+	qhi = min(max(float(hi_quantile), 0.0), 1.0)
+	if qlo > qhi:
+		qlo, qhi = qhi, qlo
+
+	def row_low_high(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+		if qlo <= 0.0 and qhi >= 1.0:
+			return values.amin(dim=1), values.amax(dim=1)
+		return (
+			torch.quantile(values, qlo, dim=1),
+			torch.quantile(values, qhi, dim=1),
+		)
+
 	good = torch.ones(int(shell.shape[0]) - 1, dtype=torch.bool, device=shell.device)
 	for values in metrics:
-		good &= (values.amin(dim=1) >= lo) & (values.amax(dim=1) <= hi)
+		row_lo, row_hi = row_low_high(values)
+		good &= (row_lo >= lo) & (row_hi <= hi)
 	good_idx = torch.nonzero(good.detach().cpu(), as_tuple=False).flatten()
 	if int(good_idx.numel()) == 0:
 		raise ValueError(
 			f"no source shell rows pass quality bounds for {surface.shell_id}: "
-			f"target_step={step:.3f} bounds=({lo:.3f}, {hi:.3f})"
+			f"target_step={step:.3f} bounds=({lo:.3f}, {hi:.3f}) "
+			f"quantiles=({qlo:.3f}, {qhi:.3f})"
 		)
 	first_band = int(good_idx[0])
 	last_band = int(good_idx[-1])

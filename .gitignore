@@ -52,3 +52,5 @@ volume-cartographer/AGENTS.md
 # ccache (mounted into builder docker)
 /volume-cartographer/.ccache/
 /.ccache/
+/volume-cartographer/scripts/spiral/out
+/lasagna/snap_surf_objs
