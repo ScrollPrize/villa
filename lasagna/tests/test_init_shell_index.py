@@ -484,6 +484,7 @@ class InitShellCropTest(unittest.TestCase):
 
 		self.assertFalse(info.full_width)
 		self.assertGreater(crop.shape[1], legacy_crop.shape[1])
+		self.assertAlmostEqual(info.requested_width_wraps, 1.5, places=6)
 
 	def test_narrow_crop_is_anchor_centered_and_nonperiodic(self) -> None:
 		surface = init_shell_index.InitShellSurface(

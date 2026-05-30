@@ -12,6 +12,20 @@ WINDING_DENSITY_BARRIER_MARGIN = 0.2
 WINDING_DENSITY_BARRIER_SCALE = 10.0
 
 
+def _prefetch_sparse_grad_mag(data, xyz_fullres: torch.Tensor) -> None:
+	if not getattr(data, "sparse_caches", None):
+		return
+	with torch.no_grad():
+		for cache in data.sparse_caches.values():
+			if "grad_mag" not in cache.channels:
+				continue
+			spacing = data._spacing_for(cache.channels[0])
+			cache.prefetch(xyz_fullres.detach(), data.origin_fullres, spacing)
+		for cache in data.sparse_caches.values():
+			if "grad_mag" in cache.channels:
+				cache.sync()
+
+
 def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Return (lm, mask) for winding-density period-sum loss.
 
@@ -74,6 +88,7 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 
 		# Flatten strip into W for grid_sample
 		strip_flat = strip.reshape(D_, H_, W_ * strip_samples, 3)
+		_prefetch_sparse_grad_mag(res.data, strip_flat)
 		sampled = res.data.grid_sample_fullres(strip_flat, channels={"grad_mag"})
 		mag = sampled.grad_mag.squeeze(0).squeeze(0)  # (D, H, W*S)
 		mag = mag.reshape(D_, H_, W_, strip_samples)

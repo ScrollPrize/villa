@@ -658,20 +658,29 @@ def _validate_self_map_init_args(
 		raise ValueError("self-map-init requires args.model-init=seed")
 	if str(init_mode).strip().lower() != "shell-dir-crop":
 		raise ValueError("self-map-init requires args.init-mode=shell-dir-crop")
-	if str(model_w_unit).strip().lower() != "wraps":
-		raise ValueError("self-map-init requires args.model-w-unit=wraps")
-	model_w_f = 0.0 if model_w is None else float(model_w)
 	if mode == "multi_wrap_full":
 		if int(model_depth) != 1:
 			raise ValueError("self-map-init=multi_wrap_full requires args.depth=1")
-		if model_w_f <= 1.0:
-			raise ValueError("self-map-init=multi_wrap_full requires args.model-w > 1.0 wraps")
 	if mode == "multi_wrap_d":
 		if int(model_depth) <= 1:
 			raise ValueError("self-map-init=multi_wrap_d requires args.depth > 1")
-		if not (0.0 < model_w_f < 1.0):
-			raise ValueError("self-map-init=multi_wrap_d requires 0 < args.model-w < 1.0 wraps")
+	unit = str(model_w_unit).strip().lower()
+	if unit == "wraps":
+		_validate_self_map_width_contract(mode=mode, model_w_wraps=None if model_w is None else float(model_w))
 	return mode
+
+
+def _validate_self_map_width_contract(*, mode: str, model_w_wraps: float | None) -> None:
+	mode_i = str(mode if mode is not None else "off").strip().lower().replace("-", "_")
+	if mode_i == "off":
+		return
+	wraps = 0.0 if model_w_wraps is None else float(model_w_wraps)
+	if mode_i == "multi_wrap_full":
+		if wraps <= 1.0:
+			raise ValueError("self-map-init=multi_wrap_full requires args.model-w > 1.0 wraps")
+	elif mode_i == "multi_wrap_d":
+		if not (0.0 < wraps < 1.0):
+			raise ValueError("self-map-init=multi_wrap_d requires 0 < args.model-w < 1.0 wraps")
 
 
 def _dummy_flatten_data() -> fit_data.FitData3D:
@@ -1049,6 +1058,9 @@ def main(argv: list[str] | None = None) -> int:
 		model_w=data_cfg.model_w,
 		model_w_unit=data_cfg.model_w_unit,
 	)
+	self_map_model_w_wraps: float | None = (
+		None if data_cfg.model_w is None else float(data_cfg.model_w)
+	) if data_cfg.model_w_unit == "wraps" else None
 	if init_mode == "shell-dir-crop" and model_init != "seed":
 		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")
 	if init_mode == "shell-dir-crop" and "init_shell_dir" in cfg:
@@ -1418,6 +1430,12 @@ def main(argv: list[str] | None = None) -> int:
 				mesh_step=float(model_cfg.mesh_step),
 				device=device,
 			)
+			if self_map_init != "off":
+				self_map_model_w_wraps = float(crop_info.requested_width_wraps)
+				_validate_self_map_width_contract(
+					mode=self_map_init,
+					model_w_wraps=self_map_model_w_wraps,
+				)
 			if _SHELL_STEP_ANALYSIS_ENABLED:
 				crop_step_stats = opt_loss_step.step_loss_analysis(crop_xyz, mesh_step=float(model_cfg.mesh_step))
 				print(
@@ -1473,7 +1491,8 @@ def main(argv: list[str] | None = None) -> int:
 				f"dropped_h_low={crop_info.height_dropped_low} "
 				f"dropped_h_high={crop_info.height_dropped_high} "
 				f"source={crop_info.source_h}x{crop_info.source_w} "
-				f"full_width={crop_info.full_width}",
+				f"full_width={crop_info.full_width} "
+				f"requested_width_wraps={crop_info.requested_width_wraps:.6g}",
 				flush=True,
 			)
 		elif init_mode == "cylinder_seed":
@@ -1804,7 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
 		out_dir=_out_dir,
 		capture_flow_gate_channels=tifxyz_flow_gate_channels,
 		self_map_init=self_map_init,
-		self_map_model_w_wraps=(None if data_cfg.model_w is None else float(data_cfg.model_w)),
+		self_map_model_w_wraps=self_map_model_w_wraps,
 	)
 	_stage_done("optimizer", _t)
 

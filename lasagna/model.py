@@ -2665,6 +2665,19 @@ class Model3D(nn.Module):
 			def _valid_mask(gm: torch.Tensor) -> torch.Tensor:
 				return (gm.squeeze(0).squeeze(0) > 0.0).to(dtype=xyz_lr.dtype).unsqueeze(1)
 
+			if data.sparse_caches:
+				with torch.no_grad():
+					for cache in data.sparse_caches.values():
+						if "grad_mag" not in cache.channels:
+							continue
+						spacing = data._spacing_for(cache.channels[0])
+						cache.prefetch(prev_full.detach(), data.origin_fullres, spacing)
+						cache.prefetch(xyz_lr.detach(), data.origin_fullres, spacing)
+						cache.prefetch(next_full.detach(), data.origin_fullres, spacing)
+					for cache in data.sparse_caches.values():
+						if "grad_mag" in cache.channels:
+							cache.sync()
+
 			mask_prev = _valid_mask(data.grid_sample_fullres(prev_full.detach(), channels={"grad_mag"}).grad_mag)
 			mask_center = _valid_mask(data.grid_sample_fullres(xyz_lr.detach(), channels={"grad_mag"}).grad_mag)
 			mask_next = _valid_mask(data.grid_sample_fullres(next_full.detach(), channels={"grad_mag"}).grad_mag)
