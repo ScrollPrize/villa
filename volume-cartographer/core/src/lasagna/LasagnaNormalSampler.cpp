@@ -78,6 +78,178 @@ struct ChunkKeyHash {
     }
 };
 
+struct CachedChunk {
+    std::vector<uint8_t> values;
+    std::array<size_t, 3> dimsZYX{0, 0, 0};
+};
+
+struct ChannelBinding {
+    const LasagnaChannelGroup* group = nullptr;
+    size_t channelIndex = 0;
+    std::filesystem::path path;
+    std::shared_ptr<utils::ZarrArray> array;
+    bool hasChannelDimension = false;
+    std::array<size_t, 3> shapeZYX{0, 0, 0};
+    std::array<size_t, 3> chunksZYX{0, 0, 0};
+    double spacing = 1.0;
+};
+
+[[nodiscard]] std::vector<size_t> chunkIndicesForVoxel(
+    const ChannelBinding& binding,
+    size_t z,
+    size_t y,
+    size_t x)
+{
+    if (binding.hasChannelDimension) {
+        const auto& chunks = binding.array->metadata().chunks;
+        return {
+            binding.channelIndex / chunks[0],
+            z / binding.chunksZYX[0],
+            y / binding.chunksZYX[1],
+            x / binding.chunksZYX[2],
+        };
+    }
+    return {
+        z / binding.chunksZYX[0],
+        y / binding.chunksZYX[1],
+        x / binding.chunksZYX[2],
+    };
+}
+
+[[nodiscard]] ChunkKey chunkKeyForVoxel(
+    const ChannelBinding& binding,
+    size_t z,
+    size_t y,
+    size_t x)
+{
+    return {binding.path, chunkIndicesForVoxel(binding, z, y, x)};
+}
+
+[[nodiscard]] size_t originalChunkOffset(
+    const ChannelBinding& binding,
+    size_t localZ,
+    size_t localY,
+    size_t localX)
+{
+    const auto& chunks = binding.array->metadata().chunks;
+    if (binding.hasChannelDimension) {
+        const size_t chunkC = chunks[0];
+        const size_t chunkZ = chunks[1];
+        const size_t chunkY = chunks[2];
+        const size_t chunkX = chunks[3];
+        return (((binding.channelIndex % chunkC) * chunkZ + localZ) * chunkY + localY) * chunkX + localX;
+    }
+    return (localZ * binding.chunksZYX[1] + localY) * binding.chunksZYX[2] + localX;
+}
+
+[[nodiscard]] std::shared_ptr<const CachedChunk> buildHaloChunk(
+    const ChannelBinding& binding,
+    const utils::ZarrArray& array,
+    const ChunkKey& key)
+{
+    if (key.indices.size() < 3) {
+        return nullptr;
+    }
+
+    const size_t spatialOffset = binding.hasChannelDimension ? 1 : 0;
+    const size_t chunkZIndex = key.indices[spatialOffset + 0];
+    const size_t chunkYIndex = key.indices[spatialOffset + 1];
+    const size_t chunkXIndex = key.indices[spatialOffset + 2];
+    const size_t originZ = chunkZIndex * binding.chunksZYX[0];
+    const size_t originY = chunkYIndex * binding.chunksZYX[1];
+    const size_t originX = chunkXIndex * binding.chunksZYX[2];
+    if (originZ >= binding.shapeZYX[0] ||
+        originY >= binding.shapeZYX[1] ||
+        originX >= binding.shapeZYX[2]) {
+        return nullptr;
+    }
+
+    auto cached = std::make_shared<CachedChunk>();
+    cached->dimsZYX = {
+        binding.chunksZYX[0] + 2,
+        binding.chunksZYX[1] + 2,
+        binding.chunksZYX[2] + 2,
+    };
+    cached->values.resize(cached->dimsZYX[0] * cached->dimsZYX[1] * cached->dimsZYX[2], 0);
+
+    std::unordered_map<ChunkKey, std::optional<std::vector<std::byte>>, ChunkKeyHash> sourceChunks;
+    sourceChunks.reserve(27);
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int64_t nz = static_cast<int64_t>(chunkZIndex) + dz;
+                const int64_t ny = static_cast<int64_t>(chunkYIndex) + dy;
+                const int64_t nx = static_cast<int64_t>(chunkXIndex) + dx;
+                if (nz < 0 || ny < 0 || nx < 0) {
+                    continue;
+                }
+                const size_t neighborOriginZ = static_cast<size_t>(nz) * binding.chunksZYX[0];
+                const size_t neighborOriginY = static_cast<size_t>(ny) * binding.chunksZYX[1];
+                const size_t neighborOriginX = static_cast<size_t>(nx) * binding.chunksZYX[2];
+                if (neighborOriginZ >= binding.shapeZYX[0] ||
+                    neighborOriginY >= binding.shapeZYX[1] ||
+                    neighborOriginX >= binding.shapeZYX[2]) {
+                    continue;
+                }
+                std::vector<size_t> indices;
+                if (binding.hasChannelDimension) {
+                    indices = {
+                        key.indices[0],
+                        static_cast<size_t>(nz),
+                        static_cast<size_t>(ny),
+                        static_cast<size_t>(nx),
+                    };
+                } else {
+                    indices = {
+                        static_cast<size_t>(nz),
+                        static_cast<size_t>(ny),
+                        static_cast<size_t>(nx),
+                    };
+                }
+                ChunkKey neighborKey{binding.path, std::move(indices)};
+                sourceChunks.emplace(neighborKey, array.read_chunk(neighborKey.indices));
+            }
+        }
+    }
+
+    const auto readSourceVoxel = [&](size_t gz, size_t gy, size_t gx) -> uint8_t {
+        gz = std::min(gz, binding.shapeZYX[0] - 1);
+        gy = std::min(gy, binding.shapeZYX[1] - 1);
+        gx = std::min(gx, binding.shapeZYX[2] - 1);
+        const ChunkKey sourceKey = chunkKeyForVoxel(binding, gz, gy, gx);
+        auto it = sourceChunks.find(sourceKey);
+        if (it == sourceChunks.end() || !it->second.has_value()) {
+            return 0;
+        }
+        const size_t localZ = gz % binding.chunksZYX[0];
+        const size_t localY = gy % binding.chunksZYX[1];
+        const size_t localX = gx % binding.chunksZYX[2];
+        const size_t offset = originalChunkOffset(binding, localZ, localY, localX);
+        if (offset >= it->second->size()) {
+            throw std::runtime_error("Lasagna zarr chunk is smaller than expected at chunk " +
+                                     indicesToString(sourceKey.indices));
+        }
+        return static_cast<uint8_t>((*it->second)[offset]);
+    };
+
+    for (size_t hz = 0; hz < cached->dimsZYX[0]; ++hz) {
+        const int64_t gzSigned = static_cast<int64_t>(originZ) + static_cast<int64_t>(hz) - 1;
+        const size_t gz = gzSigned < 0 ? 0 : static_cast<size_t>(gzSigned);
+        for (size_t hy = 0; hy < cached->dimsZYX[1]; ++hy) {
+            const int64_t gySigned = static_cast<int64_t>(originY) + static_cast<int64_t>(hy) - 1;
+            const size_t gy = gySigned < 0 ? 0 : static_cast<size_t>(gySigned);
+            for (size_t hx = 0; hx < cached->dimsZYX[2]; ++hx) {
+                const int64_t gxSigned = static_cast<int64_t>(originX) + static_cast<int64_t>(hx) - 1;
+                const size_t gx = gxSigned < 0 ? 0 : static_cast<size_t>(gxSigned);
+                cached->values[(hz * cached->dimsZYX[1] + hy) * cached->dimsZYX[2] + hx] =
+                    readSourceVoxel(gz, gy, gx);
+            }
+        }
+    }
+
+    return cached;
+}
+
 class ChunkCache {
 public:
     explicit ChunkCache(size_t capacityBytes)
@@ -85,7 +257,8 @@ public:
     {
     }
 
-    [[nodiscard]] std::shared_ptr<const std::vector<std::byte>> get(
+    [[nodiscard]] std::shared_ptr<const CachedChunk> get(
+        const ChannelBinding& binding,
         const utils::ZarrArray& array,
         const ChunkKey& key) const
     {
@@ -97,15 +270,12 @@ public:
             }
         }
 
-        std::optional<std::vector<std::byte>> bytes = array.read_chunk(key.indices);
-        auto sharedBytes = bytes
-            ? std::make_shared<const std::vector<std::byte>>(std::move(*bytes))
-            : std::shared_ptr<const std::vector<std::byte>>{};
-        store(key, std::move(sharedBytes));
+        store(key, buildHaloChunk(binding, array, key));
         return getCached(key);
     }
 
     void prefetch(
+        const ChannelBinding& binding,
         const utils::ZarrArray& array,
         const std::vector<ChunkKey>& keys,
         size_t maxWorkers) const
@@ -133,7 +303,7 @@ public:
         futures.reserve(maxWorkers);
         std::atomic<size_t> next{0};
         for (size_t worker = 0; worker < maxWorkers; ++worker) {
-            futures.push_back(std::async(std::launch::async, [this, &array, &missing, &next]() {
+            futures.push_back(std::async(std::launch::async, [this, &binding, &array, &missing, &next]() {
                 while (true) {
                     const size_t index = next.fetch_add(1);
                     if (index >= missing.size()) {
@@ -143,11 +313,7 @@ public:
                     if (getCached(key)) {
                         continue;
                     }
-                    std::optional<std::vector<std::byte>> bytes = array.read_chunk(key.indices);
-                    auto sharedBytes = bytes
-                        ? std::make_shared<const std::vector<std::byte>>(std::move(*bytes))
-                        : std::shared_ptr<const std::vector<std::byte>>{};
-                    store(key, std::move(sharedBytes));
+                    store(key, buildHaloChunk(binding, array, key));
                 }
             }));
         }
@@ -157,7 +323,7 @@ public:
     }
 
 private:
-    [[nodiscard]] std::shared_ptr<const std::vector<std::byte>> getCached(const ChunkKey& key) const
+    [[nodiscard]] std::shared_ptr<const CachedChunk> getCached(const ChunkKey& key) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(key);
@@ -168,14 +334,14 @@ private:
         return it->second.bytes;
     }
 
-    void store(ChunkKey key, std::shared_ptr<const std::vector<std::byte>> bytes) const
+    void store(ChunkKey key, std::shared_ptr<const CachedChunk> bytes) const
     {
-        const size_t byteSize = bytes ? bytes->size() : 0;
+        const size_t byteSize = bytes ? bytes->values.size() : 0;
         std::lock_guard<std::mutex> lock(mutex_);
         if (auto it = entries_.find(key); it != entries_.end()) {
             lru_.splice(lru_.begin(), lru_, it->second.lruIt);
             if (it->second.bytes) {
-                cachedBytes_ -= it->second.bytes->size();
+                cachedBytes_ -= it->second.bytes->values.size();
             }
             it->second.bytes = std::move(bytes);
             cachedBytes_ += byteSize;
@@ -190,7 +356,7 @@ private:
     }
 
     struct Entry {
-        std::shared_ptr<const std::vector<std::byte>> bytes;
+        std::shared_ptr<const CachedChunk> bytes;
         std::list<ChunkKey>::iterator lruIt;
     };
 
@@ -202,7 +368,7 @@ private:
             auto it = entries_.find(evicted);
             if (it != entries_.end()) {
                 if (it->second.bytes) {
-                    cachedBytes_ -= it->second.bytes->size();
+                    cachedBytes_ -= it->second.bytes->values.size();
                 }
                 entries_.erase(it);
             }
@@ -214,17 +380,6 @@ private:
     mutable std::mutex mutex_;
     mutable std::list<ChunkKey> lru_;
     mutable std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
-};
-
-struct ChannelBinding {
-    const LasagnaChannelGroup* group = nullptr;
-    size_t channelIndex = 0;
-    std::filesystem::path path;
-    std::shared_ptr<utils::ZarrArray> array;
-    bool hasChannelDimension = false;
-    std::array<size_t, 3> shapeZYX{0, 0, 0};
-    std::array<size_t, 3> chunksZYX{0, 0, 0};
-    double spacing = 1.0;
 };
 
 [[nodiscard]] ChannelBinding bindChannel(
@@ -286,23 +441,6 @@ struct ChannelBinding {
     return binding;
 }
 
-[[nodiscard]] size_t localChunkOffset(
-    const ChannelBinding& binding,
-    size_t localZ,
-    size_t localY,
-    size_t localX)
-{
-    const auto& chunks = binding.array->metadata().chunks;
-    if (binding.hasChannelDimension) {
-        const size_t chunkC = chunks[0];
-        const size_t chunkZ = chunks[1];
-        const size_t chunkY = chunks[2];
-        const size_t chunkX = chunks[3];
-        return (((binding.channelIndex % chunkC) * chunkZ + localZ) * chunkY + localY) * chunkX + localX;
-    }
-    return (localZ * binding.chunksZYX[1] + localY) * binding.chunksZYX[2] + localX;
-}
-
 [[nodiscard]] std::optional<uint8_t> readVoxel(
     const ChannelBinding& binding,
     const ChunkCache& cache,
@@ -314,38 +452,88 @@ struct ChannelBinding {
         return std::nullopt;
     }
 
-    std::vector<size_t> chunkIndices;
-    size_t localZ = z % binding.chunksZYX[0];
-    size_t localY = y % binding.chunksZYX[1];
-    size_t localX = x % binding.chunksZYX[2];
-    if (binding.hasChannelDimension) {
-        const auto& chunks = binding.array->metadata().chunks;
-        chunkIndices = {
-            binding.channelIndex / chunks[0],
-            z / binding.chunksZYX[0],
-            y / binding.chunksZYX[1],
-            x / binding.chunksZYX[2],
-        };
-    } else {
-        chunkIndices = {
-            z / binding.chunksZYX[0],
-            y / binding.chunksZYX[1],
-            x / binding.chunksZYX[2],
-        };
-    }
-
-    const ChunkKey key{binding.path, std::move(chunkIndices)};
-    const std::shared_ptr<const std::vector<std::byte>> bytes = cache.get(*binding.array, key);
-    if (bytes == nullptr) {
+    const ChunkKey key = chunkKeyForVoxel(binding, z, y, x);
+    const auto chunk = cache.get(binding, *binding.array, key);
+    if (chunk == nullptr) {
         return std::nullopt;
     }
 
-    const size_t offset = localChunkOffset(binding, localZ, localY, localX);
-    if (offset >= bytes->size()) {
-        throw std::runtime_error("Lasagna zarr chunk is smaller than expected at chunk " +
+    const size_t localZ = (z % binding.chunksZYX[0]) + 1;
+    const size_t localY = (y % binding.chunksZYX[1]) + 1;
+    const size_t localX = (x % binding.chunksZYX[2]) + 1;
+    const size_t offset = (localZ * chunk->dimsZYX[1] + localY) * chunk->dimsZYX[2] + localX;
+    if (offset >= chunk->values.size()) {
+        throw std::runtime_error("Lasagna cached halo chunk is smaller than expected at chunk " +
                                  indicesToString(key.indices));
     }
-    return static_cast<uint8_t>((*bytes)[offset]);
+    return chunk->values[offset];
+}
+
+struct CubeValues {
+    double c000 = 0.0;
+    double c001 = 0.0;
+    double c010 = 0.0;
+    double c011 = 0.0;
+    double c100 = 0.0;
+    double c101 = 0.0;
+    double c110 = 0.0;
+    double c111 = 0.0;
+};
+
+[[nodiscard]] std::optional<CubeValues> readInterpolationCube(
+    const ChannelBinding& binding,
+    const ChunkCache& cache,
+    size_t z0,
+    size_t y0,
+    size_t x0)
+{
+    const ChunkKey key = chunkKeyForVoxel(binding, z0, y0, x0);
+    struct LastChunk {
+        ChunkKey key;
+        std::shared_ptr<const CachedChunk> chunk;
+        bool valid = false;
+    };
+    thread_local std::array<LastChunk, 8> lastChunks;
+    const size_t slot =
+        (std::filesystem::hash_value(binding.path) + binding.channelIndex) % lastChunks.size();
+    auto& last = lastChunks[slot];
+    std::shared_ptr<const CachedChunk> chunk;
+    if (last.valid && last.key == key) {
+        chunk = last.chunk;
+    } else {
+        chunk = cache.get(binding, *binding.array, key);
+        last.key = key;
+        last.chunk = chunk;
+        last.valid = true;
+    }
+    if (chunk == nullptr) {
+        return std::nullopt;
+    }
+
+    const size_t localZ = (z0 % binding.chunksZYX[0]) + 1;
+    const size_t localY = (y0 % binding.chunksZYX[1]) + 1;
+    const size_t localX = (x0 % binding.chunksZYX[2]) + 1;
+    const auto value = [&](size_t dz, size_t dy, size_t dx) -> double {
+        const size_t offset = ((localZ + dz) * chunk->dimsZYX[1] + (localY + dy)) *
+                                  chunk->dimsZYX[2] +
+                              (localX + dx);
+        if (offset >= chunk->values.size()) {
+            throw std::runtime_error("Lasagna cached halo chunk is smaller than expected at chunk " +
+                                     indicesToString(key.indices));
+        }
+        return static_cast<double>(chunk->values[offset]);
+    };
+
+    return CubeValues{
+        value(0, 0, 0),
+        value(0, 0, 1),
+        value(0, 1, 0),
+        value(0, 1, 1),
+        value(1, 0, 0),
+        value(1, 0, 1),
+        value(1, 1, 0),
+        value(1, 1, 1),
+    };
 }
 
 void appendInterpolationChunkKeys(
@@ -369,38 +557,7 @@ void appendInterpolationChunkKeys(
     const size_t x0 = static_cast<size_t>(std::floor(x));
     const size_t y0 = static_cast<size_t>(std::floor(y));
     const size_t z0 = static_cast<size_t>(std::floor(z));
-    const size_t x1 = std::min(x0 + 1, binding.shapeZYX[2] - 1);
-    const size_t y1 = std::min(y0 + 1, binding.shapeZYX[1] - 1);
-    const size_t z1 = std::min(z0 + 1, binding.shapeZYX[0] - 1);
-
-    auto append = [&](size_t zz, size_t yy, size_t xx) {
-        std::vector<size_t> chunkIndices;
-        if (binding.hasChannelDimension) {
-            const auto& chunks = binding.array->metadata().chunks;
-            chunkIndices = {
-                binding.channelIndex / chunks[0],
-                zz / binding.chunksZYX[0],
-                yy / binding.chunksZYX[1],
-                xx / binding.chunksZYX[2],
-            };
-        } else {
-            chunkIndices = {
-                zz / binding.chunksZYX[0],
-                yy / binding.chunksZYX[1],
-                xx / binding.chunksZYX[2],
-            };
-        }
-        keys.push_back(ChunkKey{binding.path, std::move(chunkIndices)});
-    };
-
-    append(z0, y0, x0);
-    append(z0, y0, x1);
-    append(z0, y1, x0);
-    append(z0, y1, x1);
-    append(z1, y0, x0);
-    append(z1, y0, x1);
-    append(z1, y1, x0);
-    append(z1, y1, x1);
+    keys.push_back(chunkKeyForVoxel(binding, z0, y0, x0));
 }
 
 [[nodiscard]] std::optional<double> sampleChannel(
@@ -424,36 +581,19 @@ void appendInterpolationChunkKeys(
     const size_t x0 = static_cast<size_t>(std::floor(x));
     const size_t y0 = static_cast<size_t>(std::floor(y));
     const size_t z0 = static_cast<size_t>(std::floor(z));
-    const size_t x1 = std::min(x0 + 1, binding.shapeZYX[2] - 1);
-    const size_t y1 = std::min(y0 + 1, binding.shapeZYX[1] - 1);
-    const size_t z1 = std::min(z0 + 1, binding.shapeZYX[0] - 1);
     const double fx = x - static_cast<double>(x0);
     const double fy = y - static_cast<double>(y0);
     const double fz = z - static_cast<double>(z0);
 
-    auto voxel = [&](size_t zz, size_t yy, size_t xx) -> std::optional<double> {
-        if (auto value = readVoxel(binding, cache, zz, yy, xx)) {
-            return static_cast<double>(*value);
-        }
-        return std::nullopt;
-    };
-
-    const auto c000 = voxel(z0, y0, x0);
-    const auto c001 = voxel(z0, y0, x1);
-    const auto c010 = voxel(z0, y1, x0);
-    const auto c011 = voxel(z0, y1, x1);
-    const auto c100 = voxel(z1, y0, x0);
-    const auto c101 = voxel(z1, y0, x1);
-    const auto c110 = voxel(z1, y1, x0);
-    const auto c111 = voxel(z1, y1, x1);
-    if (!c000 || !c001 || !c010 || !c011 || !c100 || !c101 || !c110 || !c111) {
+    const auto cube = readInterpolationCube(binding, cache, z0, y0, x0);
+    if (!cube.has_value()) {
         return std::nullopt;
     }
 
-    const double c00 = *c000 * (1.0 - fx) + *c001 * fx;
-    const double c01 = *c010 * (1.0 - fx) + *c011 * fx;
-    const double c10 = *c100 * (1.0 - fx) + *c101 * fx;
-    const double c11 = *c110 * (1.0 - fx) + *c111 * fx;
+    const double c00 = cube->c000 * (1.0 - fx) + cube->c001 * fx;
+    const double c01 = cube->c010 * (1.0 - fx) + cube->c011 * fx;
+    const double c10 = cube->c100 * (1.0 - fx) + cube->c101 * fx;
+    const double c11 = cube->c110 * (1.0 - fx) + cube->c111 * fx;
     const double c0 = c00 * (1.0 - fy) + c01 * fy;
     const double c1 = c10 * (1.0 - fy) + c11 * fy;
     return c0 * (1.0 - fz) + c1 * fz;
@@ -485,42 +625,25 @@ struct ChannelSampleWithGradient {
     const size_t x0 = static_cast<size_t>(std::floor(x));
     const size_t y0 = static_cast<size_t>(std::floor(y));
     const size_t z0 = static_cast<size_t>(std::floor(z));
-    const size_t x1 = std::min(x0 + 1, binding.shapeZYX[2] - 1);
-    const size_t y1 = std::min(y0 + 1, binding.shapeZYX[1] - 1);
-    const size_t z1 = std::min(z0 + 1, binding.shapeZYX[0] - 1);
     const double fx = x - static_cast<double>(x0);
     const double fy = y - static_cast<double>(y0);
     const double fz = z - static_cast<double>(z0);
 
-    auto voxel = [&](size_t zz, size_t yy, size_t xx) -> std::optional<double> {
-        if (auto value = readVoxel(binding, cache, zz, yy, xx)) {
-            return static_cast<double>(*value);
-        }
-        return std::nullopt;
-    };
-
-    const auto c000 = voxel(z0, y0, x0);
-    const auto c001 = voxel(z0, y0, x1);
-    const auto c010 = voxel(z0, y1, x0);
-    const auto c011 = voxel(z0, y1, x1);
-    const auto c100 = voxel(z1, y0, x0);
-    const auto c101 = voxel(z1, y0, x1);
-    const auto c110 = voxel(z1, y1, x0);
-    const auto c111 = voxel(z1, y1, x1);
-    if (!c000 || !c001 || !c010 || !c011 || !c100 || !c101 || !c110 || !c111) {
+    const auto cube = readInterpolationCube(binding, cache, z0, y0, x0);
+    if (!cube.has_value()) {
         return std::nullopt;
     }
 
-    const double c00 = *c000 * (1.0 - fx) + *c001 * fx;
-    const double c01 = *c010 * (1.0 - fx) + *c011 * fx;
-    const double c10 = *c100 * (1.0 - fx) + *c101 * fx;
-    const double c11 = *c110 * (1.0 - fx) + *c111 * fx;
+    const double c00 = cube->c000 * (1.0 - fx) + cube->c001 * fx;
+    const double c01 = cube->c010 * (1.0 - fx) + cube->c011 * fx;
+    const double c10 = cube->c100 * (1.0 - fx) + cube->c101 * fx;
+    const double c11 = cube->c110 * (1.0 - fx) + cube->c111 * fx;
     const double c0 = c00 * (1.0 - fy) + c01 * fy;
     const double c1 = c10 * (1.0 - fy) + c11 * fy;
 
     const double dcDGridX =
-        ((*c001 - *c000) * (1.0 - fy) + (*c011 - *c010) * fy) * (1.0 - fz) +
-        ((*c101 - *c100) * (1.0 - fy) + (*c111 - *c110) * fy) * fz;
+        ((cube->c001 - cube->c000) * (1.0 - fy) + (cube->c011 - cube->c010) * fy) * (1.0 - fz) +
+        ((cube->c101 - cube->c100) * (1.0 - fy) + (cube->c111 - cube->c110) * fy) * fz;
     const double dcDGridY =
         ((c01 - c00) * (1.0 - fz)) +
         ((c11 - c10) * fz);
@@ -652,13 +775,13 @@ public:
             8);
 
         auto gradMagPrefetch = std::async(std::launch::async, [&]() {
-            cache_.prefetch(*gradMag_.array, gradMagKeys, workers);
+            cache_.prefetch(gradMag_, *gradMag_.array, gradMagKeys, workers);
         });
         auto nxPrefetch = std::async(std::launch::async, [&]() {
-            cache_.prefetch(*nx_.array, nxKeys, workers);
+            cache_.prefetch(nx_, *nx_.array, nxKeys, workers);
         });
         auto nyPrefetch = std::async(std::launch::async, [&]() {
-            cache_.prefetch(*ny_.array, nyKeys, workers);
+            cache_.prefetch(ny_, *ny_.array, nyKeys, workers);
         });
         gradMagPrefetch.get();
         nxPrefetch.get();
