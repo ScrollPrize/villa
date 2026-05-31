@@ -2,10 +2,12 @@
 
 #include "ViewerManager.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QBrush>
 #include <QComboBox>
+#include <QEvent>
 #include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QMdiArea>
@@ -15,6 +17,8 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace {
 
@@ -96,9 +100,11 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _initialDirectionCombo->addItem(tr("sideways"), static_cast<int>(InitialDirectionMode::Sideways));
     _initialDirectionCombo->addItem(tr("z (in/out)"), static_cast<int>(InitialDirectionMode::ZInOut));
     _initialDirectionCombo->setCurrentIndex(1);
+    _initialDirectionCombo->installEventFilter(this);
     buttonLayout->addWidget(_initialDirectionCombo);
     _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
     _showAsMeshButton->setEnabled(false);
+    _showAsMeshButton->installEventFilter(this);
     buttonLayout->addWidget(_showAsMeshButton);
     buttonLayout->addStretch(1);
     _layout->addWidget(buttonRow, 0);
@@ -258,7 +264,162 @@ void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
     viewer->connectOverlaysUpdated(this, apply);
 }
 
+bool LineAnnotationDialog::setGeneratedLineViews(
+    const GeneratedViews& views,
+    const CChunkedVolumeViewer::CameraState& camera)
+{
+    if (!_viewerManager || !_layout || views.linePoints.empty() ||
+        !views.currentCutSurface || views.bottomCutSurfaces.empty()) {
+        return false;
+    }
+
+    if (_showAsMeshButton) {
+        _showAsMeshButton->setEnabled(false);
+    }
+
+    _suppressPaneClosed = true;
+    if (_mdiArea) {
+        _layout->removeWidget(_mdiArea);
+        delete _mdiArea;
+        _mdiArea = nullptr;
+    }
+    _suppressPaneClosed = false;
+    for (auto& container : _generatedContainers) {
+        if (container) {
+            _layout->removeWidget(container);
+            delete container;
+        }
+    }
+    _generatedContainers.clear();
+    _generatedTopWidget = nullptr;
+    _panes.clear();
+    _stripViewers.clear();
+    _bottomSliceViewers.clear();
+    _currentCutViewer = nullptr;
+
+    _generatedViews = views;
+    _hasGeneratedViews = true;
+    const double maxLinePosition = static_cast<double>(views.linePoints.size() - 1);
+    _currentLinePosition = std::clamp(static_cast<double>(views.initialCenterIndex),
+                                      0.0,
+                                      maxLinePosition);
+    _bottomCenterPosition = _currentLinePosition;
+    updatePlaneSurface(views.currentCutSurface.get(), _currentLinePosition);
+
+    auto* topWidget = new QWidget(this);
+    auto* topLayout = new QHBoxLayout(topWidget);
+    topLayout->setContentsMargins(0, 0, 0, 0);
+    topLayout->setSpacing(0);
+    topWidget->installEventFilter(this);
+    _generatedTopWidget = topWidget;
+    _generatedContainers.push_back(topWidget);
+    _layout->addWidget(topWidget, 2);
+
+    auto* currentBase = _viewerManager->createViewerInWidget(
+        views.currentCutName,
+        topWidget,
+        ViewerManager::ViewerRole::Annotation);
+    auto* currentViewer = currentBase
+        ? qobject_cast<CChunkedVolumeViewer*>(currentBase->asQObject())
+        : nullptr;
+    if (!currentViewer) {
+        return false;
+    }
+    currentViewer->setObjectName(tr("Current Line Cut"));
+    currentViewer->applyCameraState(generatedPaneCamera(currentViewer, camera), false);
+    bindPaneInteractions(views.currentCutName, currentViewer, false);
+    topLayout->addWidget(currentViewer, 0);
+    _currentCutViewer = currentViewer;
+    _panes.push_back(Pane{views.currentCutName, currentViewer, {}});
+
+    auto* stripStack = new QWidget(topWidget);
+    auto* stripLayout = new QVBoxLayout(stripStack);
+    stripLayout->setContentsMargins(0, 0, 0, 0);
+    stripLayout->setSpacing(0);
+    topLayout->addWidget(stripStack, 1);
+
+    const std::pair<std::string, QString> stripSpecs[] = {
+        {views.lineSurfaceName, views.lineSurfaceTitle},
+        {views.lineSideSliceName, views.lineSideSliceTitle},
+    };
+    for (const auto& [surfaceName, title] : stripSpecs) {
+        auto* base = _viewerManager->createViewerInWidget(
+            surfaceName,
+            stripStack,
+            ViewerManager::ViewerRole::Annotation);
+        auto* viewer = base ? qobject_cast<CChunkedVolumeViewer*>(base->asQObject()) : nullptr;
+        if (!viewer) {
+            return false;
+        }
+        viewer->setObjectName(title);
+        viewer->applyCameraState(generatedPaneCamera(viewer, camera), false);
+        bindPaneInteractions(surfaceName, viewer, false);
+        connect(viewer,
+                &CChunkedVolumeViewer::sendMouseMoveVolume,
+                this,
+                [this, viewer](cv::Vec3f, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF scenePoint) {
+                    const double position = linePositionFromStripScene(viewer, scenePoint);
+                    if (std::isfinite(position)) {
+                        setCurrentLinePosition(position);
+                    }
+                });
+        stripLayout->addWidget(viewer, 1);
+        _stripViewers.push_back(viewer);
+        _panes.push_back(Pane{surfaceName, viewer, {}});
+    }
+
+    auto* bottomWidget = new QWidget(this);
+    auto* bottomLayout = new QHBoxLayout(bottomWidget);
+    bottomLayout->setContentsMargins(0, 0, 0, 0);
+    bottomLayout->setSpacing(0);
+    _generatedContainers.push_back(bottomWidget);
+    _layout->addWidget(bottomWidget, 1);
+
+    const int bottomCount = std::min<int>(7, static_cast<int>(views.bottomCutSurfaces.size()));
+    const double first = std::clamp(_bottomCenterPosition - static_cast<double>(bottomCount / 2),
+                                    0.0,
+                                    std::max(0.0, maxLinePosition - static_cast<double>(bottomCount - 1)));
+    for (int slot = 0; slot < bottomCount; ++slot) {
+        const double position = std::clamp(first + static_cast<double>(slot),
+                                           0.0,
+                                           maxLinePosition);
+        const auto& [surfaceName, plane] = views.bottomCutSurfaces[static_cast<size_t>(slot)];
+        updatePlaneSurface(plane.get(), position);
+        auto* base = _viewerManager->createViewerInWidget(
+            surfaceName,
+            bottomWidget,
+            ViewerManager::ViewerRole::Annotation);
+        auto* viewer = base ? qobject_cast<CChunkedVolumeViewer*>(base->asQObject()) : nullptr;
+        if (!viewer) {
+            return false;
+        }
+        viewer->setObjectName(tr("Line Z Slice %1").arg(slot));
+        viewer->applyCameraState(generatedPaneCamera(viewer, camera), false);
+        bindPaneInteractions(surfaceName, viewer, false);
+        bottomLayout->addWidget(viewer, 1);
+        _bottomSliceViewers.push_back(viewer);
+        _panes.push_back(Pane{surfaceName, viewer, {}});
+    }
+
+    if (_generatedTopWidget && _currentCutViewer) {
+        _currentCutViewer->setFixedWidth(std::max(1, _generatedTopWidget->height()));
+    }
+
+    rebuildGeneratedOverlays();
+    if (_showAsMeshButton) {
+        _showAsMeshButton->setEnabled(true);
+    }
+    return true;
+}
+
 void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
+                                                 CChunkedVolumeViewer* viewer,
+                                                 const GeneratedOverlay& overlay)
+{
+    applyOverlayForViewer(surfaceName, viewer, overlay);
+}
+
+void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
                                                  CChunkedVolumeViewer* viewer,
                                                  const GeneratedOverlay& overlay)
 {
@@ -281,6 +442,18 @@ void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
     seedStyle.penWidth = 1.5;
     seedStyle.z = 152.0;
 
+    ViewerOverlayControllerBase::OverlayStyle markerStyle;
+    markerStyle.penColor = QColor(0, 220, 255, 210);
+    markerStyle.brushColor = QColor(0, 220, 255, 150);
+    markerStyle.penWidth = 1.0;
+    markerStyle.z = 151.0;
+
+    ViewerOverlayControllerBase::OverlayStyle currentMarkerStyle = markerStyle;
+    currentMarkerStyle.penColor = QColor(0, 245, 255, 245);
+    currentMarkerStyle.brushColor = QColor(0, 245, 255, 210);
+    currentMarkerStyle.penWidth = 1.5;
+    currentMarkerStyle.z = 153.0;
+
     std::vector<QPointF> sceneLine;
     QPointF seedScene;
     bool hasSeedScene = false;
@@ -298,8 +471,36 @@ void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
                 }
             }
             if (overlay.seedLineIndex >= 0 && overlay.seedLineIndex < points->cols) {
-                seedScene = quadGridToScene(viewer, quad, row, overlay.seedLineIndex);
+                seedScene = stripLinePositionToScene(viewer, quad, overlay.seedLineIndex);
                 hasSeedScene = finiteScenePoint(seedScene);
+            }
+            if (std::isfinite(overlay.currentLinePosition)) {
+                const QPointF markerScene =
+                    stripLinePositionToScene(viewer, quad, overlay.currentLinePosition);
+                if (finiteScenePoint(markerScene)) {
+                    primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                        markerScene,
+                        4.0,
+                        true,
+                        currentMarkerStyle});
+                }
+            }
+            for (const double position : overlay.markerLinePositions) {
+                if (!std::isfinite(position) ||
+                    position < 0.0 ||
+                    position > static_cast<double>(points->cols - 1) ||
+                    std::abs(position - static_cast<double>(overlay.seedLineIndex)) < 1.0e-6 ||
+                    std::abs(position - overlay.currentLinePosition) < 1.0e-6) {
+                    continue;
+                }
+                const QPointF markerScene = stripLinePositionToScene(viewer, quad, position);
+                if (finiteScenePoint(markerScene)) {
+                    primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                        markerScene,
+                        2.5,
+                        true,
+                        markerStyle});
+                }
             }
         }
     } else if (!overlay.linePoints.empty()) {
@@ -333,9 +534,15 @@ void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
     }
 
     if (hasSeedScene) {
+        const qreal radius = overlay.emphasizedPointMarker ? 6.0 : 4.0;
+        if (overlay.emphasizedPointMarker) {
+            seedStyle.penColor = QColor(255, 245, 0, 255);
+            seedStyle.brushColor = QColor(255, 245, 0, 220);
+            seedStyle.penWidth = 2.0;
+        }
         primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
             seedScene,
-            4.0,
+            radius,
             true,
             seedStyle});
     }
@@ -343,8 +550,237 @@ void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
     ViewerOverlayControllerBase::applyPrimitives(viewer, key, std::move(primitives));
 }
 
+double LineAnnotationDialog::linePositionFromStripScene(CChunkedVolumeViewer* viewer,
+                                                        const QPointF& scenePoint) const
+{
+    if (!viewer || !_hasGeneratedViews) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    const auto* points = quad ? quad->rawPointsPtr() : nullptr;
+    if (!points || points->cols <= 0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const cv::Vec2f surfacePoint = viewer->sceneToSurfaceCoords(scenePoint);
+    const cv::Vec2f scale = quad->scale();
+    if (scale[0] == 0.0f || !std::isfinite(surfacePoint[0])) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double position = static_cast<double>(surfacePoint[0] * scale[0]) +
+                            static_cast<double>(points->cols) / 2.0;
+    return std::clamp(position, 0.0, static_cast<double>(points->cols - 1));
+}
+
+void LineAnnotationDialog::setCurrentLinePosition(double position)
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return;
+    }
+    position = std::clamp(position, 0.0, static_cast<double>(_generatedViews.linePoints.size() - 1));
+    if (std::abs(position - _currentLinePosition) < 1.0e-3 && _currentCutViewer) {
+        return;
+    }
+    _currentLinePosition = position;
+    if (_generatedViews.currentCutSurface) {
+        updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+    }
+    if (_currentCutViewer) {
+        _currentCutViewer->renderVisible(true, "line annotation current cut");
+    }
+    rebuildGeneratedOverlays();
+}
+
+void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return;
+    }
+    _bottomCenterPosition = _currentLinePosition;
+    const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
+    if (bottomCount <= 0) {
+        return;
+    }
+    const double maxLinePosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
+    const double first = std::clamp(_bottomCenterPosition - static_cast<double>(bottomCount / 2),
+                                    0.0,
+                                    std::max(0.0, maxLinePosition - static_cast<double>(bottomCount - 1)));
+    for (int slot = 0; slot < bottomCount; ++slot) {
+        auto* viewer = _bottomSliceViewers[static_cast<size_t>(slot)].data();
+        if (!viewer) {
+            continue;
+        }
+        const double position = std::clamp(first + static_cast<double>(slot),
+                                           0.0,
+                                           maxLinePosition);
+        const auto& plane = _generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].second;
+        updatePlaneSurface(plane.get(), position);
+        viewer->renderVisible(true, "line annotation bottom cuts");
+    }
+    rebuildGeneratedOverlays();
+}
+
+LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::stripOverlay() const
+{
+    GeneratedOverlay overlay;
+    overlay.linePoints = _generatedViews.linePoints;
+    overlay.seedPoint = _generatedViews.seedPoint;
+    overlay.seedLineIndex = _generatedViews.seedLineIndex;
+    overlay.useSurfaceCenterLine = true;
+    overlay.currentLinePosition = _currentLinePosition;
+
+    const int count = static_cast<int>(_generatedViews.linePoints.size());
+    const int visibleCount = std::min(7, count);
+    const double maxFirst = std::max(0.0, static_cast<double>(count - visibleCount));
+    const double first = visibleCount > 0
+        ? std::clamp(_bottomCenterPosition - static_cast<double>(visibleCount / 2),
+                     0.0,
+                     maxFirst)
+        : 0.0;
+    overlay.markerLinePositions.reserve(static_cast<size_t>(visibleCount + 1));
+    for (int i = 0; i < visibleCount; ++i) {
+        overlay.markerLinePositions.push_back(std::clamp(first + static_cast<double>(i),
+                                                         0.0,
+                                                         static_cast<double>(count - 1)));
+    }
+    return overlay;
+}
+
+LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(double linePosition,
+                                                                           bool emphasized) const
+{
+    GeneratedOverlay overlay;
+    overlay.pointMarker = interpolatedLinePoint(linePosition);
+    overlay.emphasizedPointMarker = emphasized;
+    return overlay;
+}
+
+void LineAnnotationDialog::rebuildGeneratedOverlays()
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+
+    const GeneratedOverlay strip = stripOverlay();
+    for (size_t i = 0; i < _stripViewers.size(); ++i) {
+        auto* viewer = _stripViewers[i].data();
+        if (!viewer) {
+            continue;
+        }
+        const std::string key = i == 0 ? _generatedViews.lineSurfaceName
+                                       : _generatedViews.lineSideSliceName;
+        applyOverlayForViewer(key, viewer, strip);
+    }
+
+    if (_currentCutViewer) {
+        applyOverlayForViewer("line-z-slice-current",
+                              _currentCutViewer,
+                              zSliceOverlay(_currentLinePosition, true));
+    }
+
+    const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
+    if (bottomCount <= 0 || _generatedViews.linePoints.empty()) {
+        return;
+    }
+    const double maxLinePosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
+    const double first = std::clamp(_bottomCenterPosition - static_cast<double>(bottomCount / 2),
+                                    0.0,
+                                    std::max(0.0, maxLinePosition - static_cast<double>(bottomCount - 1)));
+    for (int slot = 0; slot < bottomCount; ++slot) {
+        auto* viewer = _bottomSliceViewers[static_cast<size_t>(slot)].data();
+        if (!viewer) {
+            continue;
+        }
+        const double position = std::clamp(first + static_cast<double>(slot),
+                                           0.0,
+                                           maxLinePosition);
+        applyOverlayForViewer(_generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].first,
+                              viewer,
+                              zSliceOverlay(position, false));
+    }
+}
+
+cv::Vec3f LineAnnotationDialog::interpolatedLinePoint(double linePosition) const
+{
+    if (_generatedViews.linePoints.empty()) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+    }
+    linePosition = std::clamp(linePosition,
+                              0.0,
+                              static_cast<double>(_generatedViews.linePoints.size() - 1));
+    const int lower = static_cast<int>(std::floor(linePosition));
+    const int upper = std::min<int>(lower + 1, static_cast<int>(_generatedViews.linePoints.size()) - 1);
+    const float t = static_cast<float>(linePosition - static_cast<double>(lower));
+    return _generatedViews.linePoints[static_cast<size_t>(lower)] * (1.0f - t) +
+           _generatedViews.linePoints[static_cast<size_t>(upper)] * t;
+}
+
+cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) const
+{
+    if (_generatedViews.linePoints.size() < 2) {
+        return {1.0f, 0.0f, 0.0f};
+    }
+    linePosition = std::clamp(linePosition,
+                              0.0,
+                              static_cast<double>(_generatedViews.linePoints.size() - 1));
+    int lower = static_cast<int>(std::floor(linePosition));
+    int upper = std::min<int>(lower + 1, static_cast<int>(_generatedViews.linePoints.size()) - 1);
+    if (lower == upper && lower > 0) {
+        --lower;
+    }
+    cv::Vec3f tangent = _generatedViews.linePoints[static_cast<size_t>(upper)] -
+                        _generatedViews.linePoints[static_cast<size_t>(lower)];
+    if (cv::norm(tangent) <= 1.0e-6f) {
+        tangent = {1.0f, 0.0f, 0.0f};
+    } else {
+        cv::normalize(tangent, tangent);
+    }
+    return tangent;
+}
+
+void LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePosition) const
+{
+    if (!plane) {
+        return;
+    }
+    const cv::Vec3f origin = interpolatedLinePoint(linePosition);
+    const cv::Vec3f tangent = interpolatedLineTangent(linePosition);
+    const cv::Vec3f upHint = std::abs(tangent[2]) < 0.9f
+        ? cv::Vec3f{0.0f, 0.0f, 1.0f}
+        : cv::Vec3f{0.0f, 1.0f, 0.0f};
+    plane->setFromNormalAndUp(origin, tangent, upHint);
+}
+
+QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* viewer,
+                                                       QuadSurface* surface,
+                                                       double linePosition) const
+{
+    if (!viewer || !surface) {
+        return {};
+    }
+    const auto* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return {};
+    }
+    const cv::Vec2f scale = surface->scale();
+    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+        return {};
+    }
+    const float surfaceX = (static_cast<float>(linePosition) -
+                            static_cast<float>(points->cols) / 2.0f) / scale[0];
+    const float centerRow = static_cast<float>(points->rows / 2);
+    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
+    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+}
+
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
 {
+    if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
+        recenterBottomSlicesOnCurrentPosition();
+        event->accept();
+        return;
+    }
     if (event->key() == Qt::Key_Escape ||
         (event->key() == Qt::Key_X && event->modifiers() == Qt::NoModifier)) {
         close();
@@ -352,4 +788,21 @@ void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
         return;
     }
     QDialog::keyPressEvent(event);
+}
+
+bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
+{
+    if ((watched == _initialDirectionCombo || watched == _showAsMeshButton) &&
+        event->type() == QEvent::KeyPress) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->key() == Qt::Key_Space && keyEvent->modifiers() == Qt::NoModifier) {
+            recenterBottomSlicesOnCurrentPosition();
+            keyEvent->accept();
+            return true;
+        }
+    }
+    if (watched == _generatedTopWidget && event->type() == QEvent::Resize && _currentCutViewer) {
+        _currentCutViewer->setFixedWidth(std::max(1, _generatedTopWidget->height()));
+    }
+    return QDialog::eventFilter(watched, event);
 }

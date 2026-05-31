@@ -241,7 +241,7 @@ void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, co
         _state->setSurface(surfaceName, _state->surface("segmentation"));
     }
 
-    auto* dialog = new LineAnnotationDialog(_viewerManager, _parentWidget);
+    auto* dialog = new LineAnnotationDialog(_viewerManager, nullptr);
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
@@ -480,11 +480,6 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     }
     session.generatedSurfaceNames.clear();
 
-    std::vector<std::vector<std::pair<std::string, QString>>> rows;
-    std::map<std::string, LineAnnotationDialog::GeneratedOverlay> overlays;
-    rows.push_back({{"line-surface", tr("Line Surface")}});
-    rows.push_back({{"line-side-slice", tr("Line Side Slice")}});
-
     _state->setSurface("line-surface", views.lineSurface);
     _state->setSurface("line-side-slice", views.lineSideSlice);
     session.generatedSurfaceNames.push_back("line-surface");
@@ -501,38 +496,31 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     const cv::Vec3f seedPoint{static_cast<float>(session.seedPoint[0]),
                               static_cast<float>(session.seedPoint[1]),
                               static_cast<float>(session.seedPoint[2])};
-    LineAnnotationDialog::GeneratedOverlay lineOverlay;
-    lineOverlay.linePoints = linePoints;
-    lineOverlay.seedPoint = seedPoint;
-    lineOverlay.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
-    lineOverlay.useSurfaceCenterLine = true;
-    overlays.emplace("line-surface", lineOverlay);
-    overlays.emplace("line-side-slice", lineOverlay);
 
-    std::vector<std::pair<std::string, QString>> zSliceRow;
-    zSliceRow.reserve(views.lineZSlices.size());
-    const size_t zSliceCount = views.lineZSlices.size();
-    const size_t firstVisibleZSlice = zSliceCount > 7 ? (zSliceCount - 7) / 2 : 0;
-    const size_t endVisibleZSlice = zSliceCount > 7 ? firstVisibleZSlice + 7 : zSliceCount;
-    for (size_t i = firstVisibleZSlice; i < endVisibleZSlice; ++i) {
-        std::ostringstream name;
-        name << "line-z-slice-" << std::setw(3) << std::setfill('0') << i;
-        const std::string surfaceName = name.str();
-        _state->setSurface(surfaceName, views.lineZSlices[i]);
+    LineAnnotationDialog::GeneratedViews generatedViews;
+    generatedViews.lineSurfaceName = "line-surface";
+    generatedViews.lineSurfaceTitle = tr("Line Surface");
+    generatedViews.lineSideSliceName = "line-side-slice";
+    generatedViews.lineSideSliceTitle = tr("Line Side Slice");
+    generatedViews.linePoints = std::move(linePoints);
+    generatedViews.seedPoint = seedPoint;
+    generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
+    generatedViews.initialCenterIndex = generatedViews.seedLineIndex;
+
+    generatedViews.currentCutName = "line-current-cut";
+    generatedViews.currentCutSurface = std::make_shared<PlaneSurface>(
+        seedPoint,
+        cv::Vec3f{1.0f, 0.0f, 0.0f});
+    _state->setSurface(generatedViews.currentCutName, generatedViews.currentCutSurface);
+    session.generatedSurfaceNames.push_back(generatedViews.currentCutName);
+
+    generatedViews.bottomCutSurfaces.reserve(7);
+    for (int i = 0; i < 7; ++i) {
+        const std::string surfaceName = "line-bottom-cut-" + std::to_string(i);
+        auto plane = std::make_shared<PlaneSurface>(seedPoint, cv::Vec3f{1.0f, 0.0f, 0.0f});
+        _state->setSurface(surfaceName, plane);
         session.generatedSurfaceNames.push_back(surfaceName);
-        zSliceRow.push_back({surfaceName,
-                             tr("Line Z Slice %1").arg(static_cast<int>(i))});
-        if (i < session.optimizedLine.points.size()) {
-            const auto& point = session.optimizedLine.points[i].position;
-            LineAnnotationDialog::GeneratedOverlay overlay;
-            overlay.pointMarker = {static_cast<float>(point[0]),
-                                   static_cast<float>(point[1]),
-                                   static_cast<float>(point[2])};
-            overlays.emplace(surfaceName, overlay);
-        }
-    }
-    if (!zSliceRow.empty()) {
-        rows.push_back(std::move(zSliceRow));
+        generatedViews.bottomCutSurfaces.push_back({surfaceName, std::move(plane)});
     }
 
     auto* pane = paneForSurface(session.surfaceName);
@@ -548,7 +536,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         camera.zOffsetWorldDir = {0, 0, 0};
     }
 
-    if (!pane->dialog->setGeneratedRows(rows, camera, overlays)) {
+    if (!pane->dialog->setGeneratedLineViews(generatedViews, camera)) {
         for (const auto& name : session.generatedSurfaceNames) {
             _state->setSurface(name, nullptr);
         }

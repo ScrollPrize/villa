@@ -22,6 +22,8 @@ class QMdiSubWindow;
 class QPushButton;
 class QVBoxLayout;
 class ViewerManager;
+class PlaneSurface;
+class QuadSurface;
 
 class LineAnnotationDialog : public QDialog
 {
@@ -48,7 +50,26 @@ public:
                               std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN()};
         int seedLineIndex = -1;
+        std::vector<double> markerLinePositions;
+        double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
+        bool emphasizedPointMarker = false;
         bool useSurfaceCenterLine = false;
+    };
+
+    struct GeneratedViews {
+        std::string lineSurfaceName;
+        QString lineSurfaceTitle;
+        std::string lineSideSliceName;
+        QString lineSideSliceTitle;
+        std::string currentCutName;
+        std::shared_ptr<PlaneSurface> currentCutSurface;
+        std::vector<std::pair<std::string, std::shared_ptr<PlaneSurface>>> bottomCutSurfaces;
+        std::vector<cv::Vec3f> linePoints;
+        cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN()};
+        int seedLineIndex = -1;
+        int initialCenterIndex = 0;
     };
 
     explicit LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent = nullptr);
@@ -60,6 +81,8 @@ public:
         const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
         const CChunkedVolumeViewer::CameraState& camera,
         const std::map<std::string, GeneratedOverlay>& overlays = {});
+    bool setGeneratedLineViews(const GeneratedViews& views,
+                               const CChunkedVolumeViewer::CameraState& camera);
     const std::vector<Pane>& panes() const { return _panes; }
     InitialDirectionMode initialDirectionMode() const;
 
@@ -70,6 +93,7 @@ signals:
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
     void bindPaneInteractions(const std::string& surfaceName,
@@ -81,6 +105,21 @@ private:
     void applyGeneratedOverlay(const std::string& surfaceName,
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
+    double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
+    void setCurrentLinePosition(double position);
+    void recenterBottomSlicesOnCurrentPosition();
+    void rebuildGeneratedOverlays();
+    void applyOverlayForViewer(const std::string& overlayKey,
+                               CChunkedVolumeViewer* viewer,
+                               const GeneratedOverlay& overlay);
+    GeneratedOverlay stripOverlay() const;
+    GeneratedOverlay zSliceOverlay(double linePosition, bool emphasized) const;
+    cv::Vec3f interpolatedLinePoint(double linePosition) const;
+    cv::Vec3f interpolatedLineTangent(double linePosition) const;
+    void updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
+    QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
+                                     QuadSurface* surface,
+                                     double linePosition) const;
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
@@ -89,4 +128,14 @@ private:
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
+
+    QWidget* _generatedTopWidget = nullptr;
+    std::vector<QPointer<QWidget>> _generatedContainers;
+    QPointer<CChunkedVolumeViewer> _currentCutViewer;
+    std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
+    std::vector<QPointer<CChunkedVolumeViewer>> _bottomSliceViewers;
+    GeneratedViews _generatedViews;
+    bool _hasGeneratedViews = false;
+    double _currentLinePosition = 0.0;
+    double _bottomCenterPosition = 0.0;
 };
