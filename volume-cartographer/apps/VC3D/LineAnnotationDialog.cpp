@@ -3,10 +3,16 @@
 #include "ViewerManager.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <QBrush>
+#include <QComboBox>
+#include <QGraphicsEllipseItem>
 #include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QMdiArea>
+#include <QPen>
 #include <QMdiSubWindow>
+#include <QPushButton>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -56,8 +62,34 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _layout->setContentsMargins(0, 0, 0, 0);
     _layout->setSpacing(0);
 
+    auto* buttonRow = new QWidget(this);
+    auto* buttonLayout = new QHBoxLayout(buttonRow);
+    buttonLayout->setContentsMargins(6, 6, 6, 6);
+    buttonLayout->setSpacing(6);
+    _initialDirectionCombo = new QComboBox(buttonRow);
+    _initialDirectionCombo->addItem(tr("sideways"), static_cast<int>(InitialDirectionMode::Sideways));
+    _initialDirectionCombo->addItem(tr("z (in/out)"), static_cast<int>(InitialDirectionMode::ZInOut));
+    _initialDirectionCombo->setCurrentIndex(0);
+    buttonLayout->addWidget(_initialDirectionCombo);
+    _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
+    _showAsMeshButton->setEnabled(false);
+    buttonLayout->addWidget(_showAsMeshButton);
+    buttonLayout->addStretch(1);
+    _layout->addWidget(buttonRow, 0);
+    connect(_showAsMeshButton, &QPushButton::clicked, this, [this]() {
+        emit showAsMeshRequested();
+    });
+
     _mdiArea = new QMdiArea(this);
     _layout->addWidget(_mdiArea);
+}
+
+LineAnnotationDialog::InitialDirectionMode LineAnnotationDialog::initialDirectionMode() const
+{
+    if (!_initialDirectionCombo) {
+        return InitialDirectionMode::Sideways;
+    }
+    return static_cast<InitialDirectionMode>(_initialDirectionCombo->currentData().toInt());
 }
 
 CChunkedVolumeViewer* LineAnnotationDialog::addPane(
@@ -100,10 +132,15 @@ CChunkedVolumeViewer* LineAnnotationDialog::addPane(
 
 bool LineAnnotationDialog::setGeneratedRows(
     const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
-    const CChunkedVolumeViewer::CameraState& camera)
+    const CChunkedVolumeViewer::CameraState& camera,
+    const std::map<std::string, cv::Vec3f>& pointMarkers)
 {
     if (!_viewerManager || !_layout) {
         return false;
+    }
+
+    if (_showAsMeshButton) {
+        _showAsMeshButton->setEnabled(false);
     }
 
     _suppressPaneClosed = true;
@@ -143,9 +180,16 @@ bool LineAnnotationDialog::setGeneratedRows(
             bindPaneInteractions(surfaceName, viewer, false);
             rowLayout->addWidget(viewer, 1);
             _panes.push_back(Pane{surfaceName, viewer, {}});
+            if (auto marker = pointMarkers.find(surfaceName); marker != pointMarkers.end()) {
+                setLinePointMarker(surfaceName, viewer, marker->second);
+            }
         }
     }
-    return !_panes.empty();
+    const bool ok = !_panes.empty();
+    if (_showAsMeshButton) {
+        _showAsMeshButton->setEnabled(ok);
+    }
+    return ok;
 }
 
 void LineAnnotationDialog::bindPaneInteractions(const std::string& surfaceName,
@@ -166,6 +210,41 @@ void LineAnnotationDialog::bindPaneInteractions(const std::string& surfaceName,
             [this, surfaceName](cv::Vec3f volumePoint, QPointF scenePoint) {
                 emit lineSeedRequested(surfaceName, volumePoint, scenePoint);
             });
+}
+
+void LineAnnotationDialog::setLinePointMarker(const std::string& surfaceName,
+                                              CChunkedVolumeViewer* viewer,
+                                              const cv::Vec3f& volumePoint)
+{
+    if (!viewer) {
+        return;
+    }
+
+    const auto key = "line_annotation_point_" + surfaceName;
+    QPointer<CChunkedVolumeViewer> viewerPtr(viewer);
+    QTimer::singleShot(0, this, [viewerPtr, volumePoint, key]() {
+        if (!viewerPtr) {
+            return;
+        }
+        viewerPtr->renderVisible(true, "line annotation point marker");
+        const QPointF scenePoint = viewerPtr->volumeToScene(volumePoint);
+        if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
+            return;
+        }
+
+        auto* marker = new QGraphicsEllipseItem(scenePoint.x() - 5.0,
+                                                scenePoint.y() - 5.0,
+                                                10.0,
+                                                10.0);
+        QPen pen(QColor(255, 230, 0), 2.0);
+        pen.setCosmetic(true);
+        marker->setPen(pen);
+        marker->setBrush(QBrush(QColor(255, 230, 0, 180)));
+        marker->setZValue(150.0);
+        marker->setAcceptedMouseButtons(Qt::NoButton);
+
+        viewerPtr->setOverlayGroup(key, {marker});
+    });
 }
 
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)

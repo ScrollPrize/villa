@@ -56,9 +56,36 @@ constexpr double kEpsilon = 1.0e-12;
     config.straightnessWeight = std::max(0.0, config.straightnessWeight);
     config.normalAlignmentWeight = std::max(0.0, config.normalAlignmentWeight);
     config.distanceWeight = std::max(0.0, config.distanceWeight);
+    config.initialTangentWeight = std::max(0.0, config.initialTangentWeight);
     config.samplesPerSegment = std::max(1, config.samplesPerSegment);
     config.maxIterations = std::max(0, config.maxIterations);
     return config;
+}
+
+[[nodiscard]] cv::Vec3d initialTangentFromConfig(
+    const NormalSample& seedNormal,
+    const LineOptimizationConfig& config)
+{
+    if (!config.useInitialTangent) {
+        return deterministicTangentFromNormal(seedNormal);
+    }
+
+    cv::Vec3d tangent = normalizedOrZero(config.initialTangent);
+    if (length(tangent) <= kEpsilon) {
+        return deterministicTangentFromNormal(seedNormal);
+    }
+
+    if (seedNormal.valid) {
+        const cv::Vec3d normal = normalizedOrZero(seedNormal.normal);
+        if (length(normal) > kEpsilon) {
+            tangent = normalizedOrZero(tangent - normal * tangent.dot(normal));
+        }
+    }
+
+    if (length(tangent) <= kEpsilon) {
+        return deterministicTangentFromNormal(seedNormal);
+    }
+    return tangent;
 }
 
 [[nodiscard]] cv::Vec3d lerp(const cv::Vec3d& a, const cv::Vec3d& b, double t)
@@ -157,34 +184,105 @@ struct StraightnessResidual {
     double weight = 1.0;
 };
 
-struct NormalAlignmentResidual {
-    NormalAlignmentResidual(cv::Vec3d normal, double weight)
-        : normal(normalizedOrZero(normal))
+struct LiveNormalAlignmentResidual final : public ceres::SizedCostFunction<1, 3, 3> {
+    LiveNormalAlignmentResidual(const NormalSampler& sampler, double t, double weight)
+        : sampler(sampler)
+        , t(t)
+        , weight(weight)
+    {
+    }
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const cv::Vec3d a{parameters[0][0], parameters[0][1], parameters[0][2]};
+        const cv::Vec3d b{parameters[1][0], parameters[1][1], parameters[1][2]};
+        const cv::Vec3d d = b - a;
+        const double len = length(d);
+        if (len <= kEpsilon) {
+            residuals[0] = 0.0;
+            if (jacobians) {
+                for (int block = 0; block < 2; ++block) {
+                    if (jacobians[block]) {
+                        std::fill(jacobians[block], jacobians[block] + 3, 0.0);
+                    }
+                }
+            }
+            return true;
+        }
+
+        NormalSample sample = sampler.sampleNormal(lerp(a, b, t));
+        const cv::Vec3d normal = normalizedOrZero(sample.normal);
+        if (!sample.valid || length(normal) <= kEpsilon) {
+            residuals[0] = 0.0;
+            if (jacobians) {
+                for (int block = 0; block < 2; ++block) {
+                    if (jacobians[block]) {
+                        std::fill(jacobians[block], jacobians[block] + 3, 0.0);
+                    }
+                }
+            }
+            return true;
+        }
+
+        const cv::Vec3d tangent = d / len;
+        const double dot = tangent.dot(normal);
+        residuals[0] = weight * dot;
+
+        if (jacobians) {
+            const cv::Vec3d gradD = (normal - tangent * dot) * (weight / len);
+            if (jacobians[0]) {
+                jacobians[0][0] = -gradD[0];
+                jacobians[0][1] = -gradD[1];
+                jacobians[0][2] = -gradD[2];
+            }
+            if (jacobians[1]) {
+                jacobians[1][0] = gradD[0];
+                jacobians[1][1] = gradD[1];
+                jacobians[1][2] = gradD[2];
+            }
+        }
+        return true;
+    }
+
+    const NormalSampler& sampler;
+    double t = 0.0;
+    double weight = 1.0;
+};
+
+struct DirectionResidual {
+    DirectionResidual(cv::Vec3d direction, double weight)
+        : direction(normalizedOrZero(direction))
         , weight(weight)
     {
     }
 
     template <typename T>
-    bool operator()(const T* const a, const T* const b, T* residual) const
+    bool operator()(const T* const a, const T* const b, T* residuals) const
     {
         const T dx = b[0] - a[0];
         const T dy = b[1] - a[1];
         const T dz = b[2] - a[2];
         const T invLength = T(1.0) / ceres::sqrt(dx * dx + dy * dy + dz * dz + T(kEpsilon));
-        const T dot = (dx * T(normal[0]) + dy * T(normal[1]) + dz * T(normal[2])) * invLength;
-        residual[0] = T(weight) * dot;
+        const T ux = dx * invLength;
+        const T uy = dy * invLength;
+        const T uz = dz * invLength;
+        residuals[0] = T(weight) * (uy * T(direction[2]) - uz * T(direction[1]));
+        residuals[1] = T(weight) * (uz * T(direction[0]) - ux * T(direction[2]));
+        residuals[2] = T(weight) * (ux * T(direction[1]) - uy * T(direction[0]));
         return true;
     }
 
-    cv::Vec3d normal{0.0, 0.0, 0.0};
+    cv::Vec3d direction{0.0, 0.0, 0.0};
     double weight = 1.0;
 };
 
 void addResiduals(
     ceres::Problem& problem,
     std::vector<std::array<double, 3>>& points,
-    const std::vector<LineSegmentSamples>& initialSamples,
-    const LineOptimizationConfig& config)
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config,
+    int seedIndex,
+    const cv::Vec3d& seedTangent)
 {
     for (size_t i = 0; i + 1 < points.size(); ++i) {
         auto* cost = new ceres::AutoDiffCostFunction<DistanceResidual, 1, 3, 3>(
@@ -198,16 +296,27 @@ void addResiduals(
         problem.AddResidualBlock(cost, nullptr, points[i - 1].data(), points[i].data(), points[i + 1].data());
     }
 
-    for (size_t segment = 0; segment < initialSamples.size(); ++segment) {
-        for (const auto& sample : initialSamples[segment].samples) {
-            if (!sample.sampledNormal.valid) {
-                continue;
-            }
-
-            auto* cost = new ceres::AutoDiffCostFunction<NormalAlignmentResidual, 1, 3, 3>(
-                new NormalAlignmentResidual(sample.sampledNormal.normal, config.normalAlignmentWeight));
+    for (size_t segment = 0; segment + 1 < points.size(); ++segment) {
+        for (int sample = 0; sample <= config.samplesPerSegment; ++sample) {
+            const double t = static_cast<double>(sample) /
+                             static_cast<double>(config.samplesPerSegment);
+            auto* cost = new LiveNormalAlignmentResidual(sampler, t, config.normalAlignmentWeight);
             problem.AddResidualBlock(cost, nullptr, points[segment].data(), points[segment + 1].data());
         }
+    }
+
+    if (config.useInitialTangent &&
+        config.initialTangentWeight > 0.0 &&
+        length(seedTangent) > kEpsilon &&
+        seedIndex > 0 &&
+        seedIndex + 1 < static_cast<int>(points.size())) {
+        auto* prevCost = new ceres::AutoDiffCostFunction<DirectionResidual, 3, 3, 3>(
+            new DirectionResidual(seedTangent, config.initialTangentWeight));
+        problem.AddResidualBlock(prevCost, nullptr, points[seedIndex - 1].data(), points[seedIndex].data());
+
+        auto* nextCost = new ceres::AutoDiffCostFunction<DirectionResidual, 3, 3, 3>(
+            new DirectionResidual(seedTangent, config.initialTangentWeight));
+        problem.AddResidualBlock(nextCost, nullptr, points[seedIndex].data(), points[seedIndex + 1].data());
     }
 }
 
@@ -245,7 +354,7 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
     const NormalSample seedNormal = normalSampler_.sampleNormal(seedPoint);
-    const cv::Vec3d tangent = deterministicTangentFromNormal(seedNormal);
+    const cv::Vec3d tangent = initialTangentFromConfig(seedNormal, config);
 
     const int pointCount = config.segmentsPerSide * 2 + 1;
     const int seedIndex = config.segmentsPerSide;
@@ -258,19 +367,12 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
         points.push_back({point[0], point[1], point[2]});
     }
 
-    const auto initialSamples = sampleSegments(
-        points,
-        normalSampler_,
-        config.samplesPerSegment,
-        nullptr,
-        nullptr);
-
     ceres::Problem problem;
     for (auto& point : points) {
         problem.AddParameterBlock(point.data(), 3);
     }
     problem.SetParameterBlockConstant(points[seedIndex].data());
-    addResiduals(problem, points, initialSamples, config);
+    addResiduals(problem, points, normalSampler_, config, seedIndex, tangent);
 
     double initialCost = 0.0;
     problem.Evaluate(ceres::Problem::EvaluateOptions{}, &initialCost, nullptr, nullptr, nullptr);

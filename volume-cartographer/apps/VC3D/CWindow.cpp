@@ -1802,6 +1802,9 @@ void CWindow::CreateWidgets(void)
     if (_segmentationGrower) {
         _segmentationGrower->setSurfacePanel(_surfacePanel.get());
     }
+    if (_lineAnnotationController) {
+        _lineAnnotationController->setSurfacePanel(_surfacePanel.get());
+    }
     connect(_surfacePanel.get(), &SurfacePanelController::surfacesLoaded, this, [this]() {
         emit _state->surfacesLoaded();
         // Update surface overlay dropdown when surfaces are loaded

@@ -32,6 +32,17 @@ public:
     }
 };
 
+class CountingNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& /*volumePoint*/) const override
+    {
+        ++calls;
+        return {{0.0, 0.0, 1.0}, true, {}};
+    }
+
+    mutable int calls = 0;
+};
+
 double norm(const cv::Vec3d& vector)
 {
     return std::sqrt(vector.dot(vector));
@@ -153,6 +164,46 @@ TEST_CASE("LineOptimizer handles invalid and zero seed normals with deterministi
     CHECK(zeroResult.line.points.front().position[0] == doctest::Approx(3.0));
     CHECK(zeroResult.line.points.back().position[0] == doctest::Approx(17.0));
     CHECK(zeroResult.report.invalidNormalSamples == 2 * 5);
+}
+
+TEST_CASE("LineOptimizer accepts an initial tangent constrained to the sampled tangent plane")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 10.0;
+    config.maxIterations = 0;
+    config.useInitialTangent = true;
+    config.initialTangent = {0.0, 1.0, 5.0};
+
+    const auto result = optimizer.optimizeFromSeed({10.0, 20.0, 30.0}, config);
+
+    REQUIRE(result.line.points.size() == 3);
+    CHECK(result.line.points.front().position[0] == doctest::Approx(10.0));
+    CHECK(result.line.points.front().position[1] == doctest::Approx(10.0));
+    CHECK(result.line.points.front().position[2] == doctest::Approx(30.0));
+    CHECK(result.line.points.back().position[0] == doctest::Approx(10.0));
+    CHECK(result.line.points.back().position[1] == doctest::Approx(30.0));
+    CHECK(result.line.points.back().position[2] == doctest::Approx(30.0));
+}
+
+TEST_CASE("LineOptimizer resamples normals during solver residual evaluation")
+{
+    CountingNormalSampler sampler;
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 10.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 1;
+
+    const auto result = optimizer.optimizeFromSeed({10.0, 20.0, 30.0}, config);
+
+    REQUIRE(result.line.points.size() == 3);
+    CHECK(sampler.calls > 8);
 }
 
 TEST_CASE("LineOptimizer supports zero iterations and single-seed optimizeFromSeeds")

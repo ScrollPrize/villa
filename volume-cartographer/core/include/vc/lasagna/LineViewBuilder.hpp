@@ -13,7 +13,7 @@ namespace vc::lasagna {
 struct LineViewConfig {
     double surfaceHalfWidth = 50.0;
     double sideSliceHalfDepth = 50.0;
-    int crossSamples = 3;
+    int crossSamples = 21;
 };
 
 struct LineViewSurfaces {

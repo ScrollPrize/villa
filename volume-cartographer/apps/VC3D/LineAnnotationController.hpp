@@ -20,6 +20,7 @@ class CChunkedVolumeViewer;
 class CState;
 class LineAnnotationDialog;
 class Surface;
+class SurfacePanelController;
 class ViewerManager;
 class QWidget;
 
@@ -28,10 +29,17 @@ class LineAnnotationController : public QObject
     Q_OBJECT
 
 public:
+    enum class InitialDirectionMode {
+        Sideways,
+        ZInOut,
+    };
+
     struct OptimizationTaskResult {
         bool ok = false;
         std::filesystem::path manifestPath;
         cv::Vec3d seedPoint{0.0, 0.0, 0.0};
+        cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
+        InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
         std::string error;
     };
@@ -39,7 +47,10 @@ public:
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using OptimizationTaskFactory =
-        std::function<OptimizationTaskResult(std::filesystem::path, cv::Vec3d)>;
+        std::function<OptimizationTaskResult(std::filesystem::path,
+                                             cv::Vec3d,
+                                             cv::Vec3d,
+                                             InitialDirectionMode)>;
 
     LineAnnotationController(CState* state,
                              ViewerManager* viewerManager,
@@ -51,6 +62,7 @@ public:
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
+    void setSurfacePanel(SurfacePanelController* panel);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -73,21 +85,31 @@ private:
 
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
-    void handleLineSeed(const std::string& surfaceName, cv::Vec3f volumePoint);
+    void handleLineSeed(const std::string& surfaceName,
+                        cv::Vec3f volumePoint,
+                        InitialDirectionMode directionMode);
     bool ensureDatasetForSession(LineAnnotationSession& session);
     void startOptimization(LineAnnotationSession& session, cv::Vec3d seedPoint);
     void finishOptimization(const std::string& surfaceName);
     bool materializeGeneratedViews(LineAnnotationSession& session);
+    void handleShowAsMesh(const std::string& surfaceName);
+    [[nodiscard]] std::filesystem::path resolveMeshExportPathsDir() const;
+    [[nodiscard]] std::filesystem::path nextMeshExportPath(const std::filesystem::path& pathsDir,
+                                                           const std::string& stem) const;
+    [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
-                                                             cv::Vec3d seedPoint) const;
+                                                             cv::Vec3d seedPoint,
+                                                             cv::Vec3d sourceSliceNormal,
+                                                             InitialDirectionMode directionMode) const;
     void showError(const QString& message) const;
 
     CState* _state = nullptr;
     ViewerManager* _viewerManager = nullptr;
+    SurfacePanelController* _surfacePanel = nullptr;
     QPointer<QWidget> _parentWidget;
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;

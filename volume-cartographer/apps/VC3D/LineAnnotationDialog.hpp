@@ -4,6 +4,7 @@
 #include <QPointer>
 
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 #include <utility>
@@ -13,8 +14,10 @@
 #include <opencv2/core/mat.hpp>
 
 class CState;
+class QComboBox;
 class QMdiArea;
 class QMdiSubWindow;
+class QPushButton;
 class QVBoxLayout;
 class ViewerManager;
 
@@ -23,6 +26,11 @@ class LineAnnotationDialog : public QDialog
     Q_OBJECT
 
 public:
+    enum class InitialDirectionMode {
+        Sideways,
+        ZInOut,
+    };
+
     struct Pane {
         std::string surfaceName;
         QPointer<CChunkedVolumeViewer> viewer;
@@ -36,12 +44,15 @@ public:
                                   const CChunkedVolumeViewer::CameraState& camera);
     bool setGeneratedRows(
         const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
-        const CChunkedVolumeViewer::CameraState& camera);
+        const CChunkedVolumeViewer::CameraState& camera,
+        const std::map<std::string, cv::Vec3f>& pointMarkers = {});
     const std::vector<Pane>& panes() const { return _panes; }
+    InitialDirectionMode initialDirectionMode() const;
 
 signals:
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
+    void showAsMeshRequested();
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -50,9 +61,14 @@ private:
     void bindPaneInteractions(const std::string& surfaceName,
                               CChunkedVolumeViewer* viewer,
                               bool seedPlacementEnabled);
+    void setLinePointMarker(const std::string& surfaceName,
+                            CChunkedVolumeViewer* viewer,
+                            const cv::Vec3f& volumePoint);
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
+    QComboBox* _initialDirectionCombo = nullptr;
+    QPushButton* _showAsMeshButton = nullptr;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;

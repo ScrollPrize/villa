@@ -80,6 +80,16 @@ std::vector<double> crossOffsets(double halfWidth, int samples)
     return offsets;
 }
 
+std::vector<SegmentNormalSample> controlPointSamples(const LineModel& line)
+{
+    std::vector<SegmentNormalSample> samples;
+    samples.reserve(line.points.size());
+    for (const auto& point : line.points) {
+        samples.push_back({0.0, point.position, point.sampledNormal});
+    }
+    return samples;
+}
+
 std::vector<SegmentNormalSample> denseSamples(const LineModel& line)
 {
     std::vector<SegmentNormalSample> samples;
@@ -90,14 +100,6 @@ std::vector<SegmentNormalSample> denseSamples(const LineModel& line)
             }
             samples.push_back(sample);
         }
-    }
-    if (!samples.empty()) {
-        return samples;
-    }
-
-    samples.reserve(line.points.size());
-    for (const auto& point : line.points) {
-        samples.push_back({0.0, point.position, point.sampledNormal});
     }
     return samples;
 }
@@ -179,10 +181,15 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
 {
     cv::Mat_<cv::Vec3f> points(static_cast<int>(samples.size()),
                                static_cast<int>(offsets.size()));
+    cv::Vec3d previousDirection{0.0, 0.0, 0.0};
     for (int row = 0; row < points.rows; ++row) {
         const cv::Vec3d tangent = tangentAt(samples, static_cast<size_t>(row));
         const cv::Vec3d normal = normalizedOrZero(normals[static_cast<size_t>(row)]);
-        const cv::Vec3d direction = useSide ? sideDirection(normal, tangent) : normal;
+        cv::Vec3d direction = useSide ? sideDirection(normal, tangent) : normal;
+        if (validDirection(previousDirection) && direction.dot(previousDirection) < 0.0) {
+            direction *= -1.0;
+        }
+        previousDirection = direction;
         for (int col = 0; col < points.cols; ++col) {
             points(row, col) = toVec3f(samples[static_cast<size_t>(row)].position
                                      + direction * offsets[static_cast<size_t>(col)]);
@@ -215,7 +222,7 @@ cv::Vec3d pointTangent(const LineModel& line, size_t index)
 
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConfig& config)
 {
-    const auto samples = denseSamples(line);
+    const auto samples = controlPointSamples(line);
     if (samples.empty()) {
         throw std::invalid_argument("Cannot build line annotation views for an empty LineModel");
     }
