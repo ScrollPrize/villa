@@ -3,6 +3,7 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 class PlaneSurface;
@@ -24,7 +25,30 @@ struct LineViewSurfaces {
     std::vector<std::shared_ptr<PlaneSurface>> lineZSlices;
 };
 
+struct LineViewFrameIssue {
+    size_t index = 0;
+    double rollDeltaRadians = 0.0;
+    double normalContinuityDot = 1.0;
+    double sideContinuityDot = 1.0;
+    double sampledAxisContinuityDot = 1.0;
+    double meshToSampledAxisDot = 1.0;
+    std::string reason;
+};
+
+struct LineViewFrameDiagnostics {
+    size_t frameCount = 0;
+    double maxAbsRollDeltaRadians = 0.0;
+    double minNormalContinuityDot = 1.0;
+    double minSideContinuityDot = 1.0;
+    double minSampledAxisContinuityDot = 1.0;
+    double minMeshToSampledAxisDot = 1.0;
+    std::vector<LineViewFrameIssue> issues;
+};
+
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line,
                                        const LineViewConfig& config = {});
+
+LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line,
+                                                const LineViewConfig& config = {});
 
 } // namespace vc::lasagna
