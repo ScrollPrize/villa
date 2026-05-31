@@ -2,6 +2,8 @@
 
 #include <opencv2/core/types.hpp>
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,6 +27,12 @@ struct NormalPrefetchReport {
     uint64_t chunksRead = 0;
 };
 
+struct NormalBatchReport {
+    NormalPrefetchReport prefetch;
+    double prefetchMs = 0.0;
+    double materializeMs = 0.0;
+};
+
 class NormalSampler {
 public:
     virtual ~NormalSampler() = default;
@@ -39,6 +47,33 @@ public:
         bool /*withDerivative*/) const
     {
         return {};
+    }
+    [[nodiscard]] virtual NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool withDerivative,
+        std::vector<NormalSampleWithDerivative>& samples) const
+    {
+        using Clock = std::chrono::steady_clock;
+        const auto prefetchStart = Clock::now();
+        NormalBatchReport report;
+        report.prefetch = prefetchNormalSamples(volumePoints, withDerivative);
+        const auto prefetchEnd = Clock::now();
+        samples.clear();
+        samples.resize(volumePoints.size());
+        for (size_t index = 0; index < volumePoints.size(); ++index) {
+            samples[index] = withDerivative
+                ? sampleNormalWithDerivative(volumePoints[index])
+                : NormalSampleWithDerivative{
+                      sampleNormal(volumePoints[index]),
+                      cv::Matx33d::zeros(),
+                      false};
+        }
+        const auto materializeEnd = Clock::now();
+        report.prefetchMs = std::chrono::duration<double, std::milli>(
+            prefetchEnd - prefetchStart).count();
+        report.materializeMs = std::chrono::duration<double, std::milli>(
+            materializeEnd - prefetchEnd).count();
+        return report;
     }
 };
 

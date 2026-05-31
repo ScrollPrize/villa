@@ -1570,63 +1570,16 @@ void fillPrefetchedNormalSamples(
         }
     }
 
-    const auto prefetchStart = Clock::now();
-    const NormalPrefetchReport prefetchReport =
-        sampler.prefetchNormalSamples(samplePoints, config.differentiableNormalSampling);
-    const auto prefetchEnd = Clock::now();
-
-    const unsigned hardwareThreads = std::thread::hardware_concurrency();
-    const size_t workers = std::min(samplePoints.size(), std::clamp<size_t>(
-        hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads),
-        1,
-        8));
-    if (workers <= 1) {
-        for (size_t index = 0; index < samplePoints.size(); ++index) {
-            prefetched.samples[index] = config.differentiableNormalSampling
-                ? sampler.sampleNormalWithDerivative(samplePoints[index])
-                : NormalSampleWithDerivative{
-                      sampler.sampleNormal(samplePoints[index]),
-                      cv::Matx33d::zeros(),
-                      false};
-        }
-        if (timing) {
-            ++timing->calls;
-            timing->chunkPrefetchMs += elapsedMs(prefetchStart, prefetchEnd);
-            timing->materializeMs += elapsedMs(prefetchEnd, Clock::now());
-            timing->requestedChunks += prefetchReport.requestedChunks;
-            timing->chunksRead += prefetchReport.chunksRead;
-        }
-        return;
-    }
-
-    std::vector<std::future<void>> futures;
-    futures.reserve(workers);
-    std::atomic<size_t> next{0};
-    for (size_t worker = 0; worker < workers; ++worker) {
-        futures.push_back(std::async(std::launch::async, [&]() {
-            while (true) {
-                const size_t index = next.fetch_add(1);
-                if (index >= samplePoints.size()) {
-                    return;
-                }
-                prefetched.samples[index] = config.differentiableNormalSampling
-                    ? sampler.sampleNormalWithDerivative(samplePoints[index])
-                    : NormalSampleWithDerivative{
-                          sampler.sampleNormal(samplePoints[index]),
-                          cv::Matx33d::zeros(),
-                          false};
-            }
-        }));
-    }
-    for (auto& future : futures) {
-        future.get();
-    }
+    const NormalBatchReport batchReport =
+        sampler.sampleNormalBatch(samplePoints,
+                                  config.differentiableNormalSampling,
+                                  prefetched.samples);
     if (timing) {
         ++timing->calls;
-        timing->chunkPrefetchMs += elapsedMs(prefetchStart, prefetchEnd);
-        timing->materializeMs += elapsedMs(prefetchEnd, Clock::now());
-        timing->requestedChunks += prefetchReport.requestedChunks;
-        timing->chunksRead += prefetchReport.chunksRead;
+        timing->chunkPrefetchMs += batchReport.prefetchMs;
+        timing->materializeMs += batchReport.materializeMs;
+        timing->requestedChunks += batchReport.prefetch.requestedChunks;
+        timing->chunksRead += batchReport.prefetch.chunksRead;
     }
 }
 

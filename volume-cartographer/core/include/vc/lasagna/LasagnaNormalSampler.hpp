@@ -31,6 +31,10 @@ public:
     [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(
         const std::vector<cv::Vec3d>& volumePoints,
         bool withDerivative) const override;
+    [[nodiscard]] NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool withDerivative,
+        std::vector<NormalSampleWithDerivative>& samples) const override;
 
 private:
     class Impl;
