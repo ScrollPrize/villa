@@ -124,8 +124,13 @@ TEST_CASE("LineViewBuilder creates one z slice per optimized control point")
     const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
 
     REQUIRE(views.lineZSlices.size() == 3);
+    REQUIRE(views.lineUpVectors.size() == 3);
     for (const auto& slice : views.lineZSlices) {
         REQUIRE(slice);
+        checkVec(slice->basisY(), {0.0, 0.0, 1.0});
+    }
+    for (const auto& up : views.lineUpVectors) {
+        checkVec(up, {0.0, 0.0, 1.0});
     }
 }
 

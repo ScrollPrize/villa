@@ -74,6 +74,7 @@ public:
         std::shared_ptr<PlaneSurface> currentCutSurface;
         std::vector<std::pair<std::string, std::shared_ptr<PlaneSurface>>> bottomCutSurfaces;
         std::vector<cv::Vec3f> linePoints;
+        std::vector<cv::Vec3f> lineUpVectors;
         cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                             std::numeric_limits<float>::quiet_NaN(),
                             std::numeric_limits<float>::quiet_NaN()};
@@ -130,7 +131,8 @@ private:
     GeneratedOverlay zSliceOverlay(double linePosition, bool emphasized) const;
     cv::Vec3f interpolatedLinePoint(double linePosition) const;
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
-    void updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
+    cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
+    bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,
                                      double linePosition) const;

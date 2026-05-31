@@ -23,6 +23,7 @@ struct LineViewSurfaces {
     std::shared_ptr<QuadSurface> lineSurface;
     std::shared_ptr<QuadSurface> lineSideSlice;
     std::vector<std::shared_ptr<PlaneSurface>> lineZSlices;
+    std::vector<cv::Vec3f> lineUpVectors;
 };
 
 struct LineViewFrameIssue {

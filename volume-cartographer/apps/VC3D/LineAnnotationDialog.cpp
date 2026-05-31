@@ -269,6 +269,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     const CChunkedVolumeViewer::CameraState& camera)
 {
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
+        views.lineUpVectors.size() != views.linePoints.size() ||
         !views.currentCutSurface || views.bottomCutSurfaces.empty()) {
         return false;
     }
@@ -304,7 +305,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                       0.0,
                                       maxLinePosition);
     _bottomCenterPosition = _currentLinePosition;
-    updatePlaneSurface(views.currentCutSurface.get(), _currentLinePosition);
+    if (!updatePlaneSurface(views.currentCutSurface.get(), _currentLinePosition)) {
+        return false;
+    }
 
     auto* topWidget = new QWidget(this);
     auto* topLayout = new QHBoxLayout(topWidget);
@@ -415,7 +418,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                            0.0,
                                            maxLinePosition);
         const auto& [surfaceName, plane] = views.bottomCutSurfaces[static_cast<size_t>(slot)];
-        updatePlaneSurface(plane.get(), position);
+        if (!updatePlaneSurface(plane.get(), position)) {
+            return false;
+        }
         auto* base = _viewerManager->createViewerInWidget(
             surfaceName,
             bottomWidget,
@@ -610,19 +615,27 @@ void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
             lineStyle});
     }
 
-    if (!hasSeedScene) {
-        const cv::Vec3f markerPoint = finitePoint(overlay.seedPoint)
-            ? overlay.seedPoint
-            : overlay.pointMarker;
-        if (finitePoint(markerPoint)) {
-            seedScene = viewer->volumeToScene(markerPoint);
-            hasSeedScene = finiteScenePoint(seedScene);
+    if (finitePoint(overlay.pointMarker)) {
+        const QPointF markerScene = viewer->volumeToScene(overlay.pointMarker);
+        if (finiteScenePoint(markerScene)) {
+            primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                markerScene,
+                overlay.emphasizedPointMarker ? 6.0 : 4.0,
+                true,
+                overlay.emphasizedPointMarker ? currentMarkerStyle : markerStyle});
         }
     }
 
+    if (!hasSeedScene && finitePoint(overlay.seedPoint)) {
+        seedScene = viewer->volumeToScene(overlay.seedPoint);
+        hasSeedScene = finiteScenePoint(seedScene);
+    }
+
     if (hasSeedScene) {
-        const qreal radius = overlay.emphasizedPointMarker ? 6.0 : 4.0;
-        if (overlay.emphasizedPointMarker) {
+        const bool emphasizedSeed = overlay.emphasizedPointMarker &&
+                                    !finitePoint(overlay.pointMarker);
+        const qreal radius = emphasizedSeed ? 6.0 : 4.0;
+        if (emphasizedSeed) {
             seedStyle.penColor = QColor(255, 245, 0, 255);
             seedStyle.brushColor = QColor(255, 245, 0, 220);
             seedStyle.penWidth = 2.0;
@@ -669,7 +682,7 @@ void LineAnnotationDialog::setCurrentLinePosition(double position)
     }
     _currentLinePosition = position;
     if (_generatedViews.currentCutSurface) {
-        updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+        (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
     }
     if (_currentCutViewer) {
         _currentCutViewer->renderVisible(true, "line annotation current cut");
@@ -684,7 +697,7 @@ void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
     }
     _currentLinePosition = snappedControlPointPosition(_currentLinePosition);
     if (_generatedViews.currentCutSurface) {
-        updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+        (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
     }
     if (_currentCutViewer) {
         _currentCutViewer->renderVisible(true, "line annotation current cut");
@@ -707,7 +720,7 @@ void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
                                            0.0,
                                            maxLinePosition);
         const auto& plane = _generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].second;
-        updatePlaneSurface(plane.get(), position);
+        (void)updatePlaneSurface(plane.get(), position);
         viewer->renderVisible(true, "line annotation bottom cuts");
     }
     rebuildGeneratedOverlays();
@@ -768,7 +781,12 @@ LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(doubl
     GeneratedOverlay overlay;
     overlay.pointMarker = interpolatedLinePoint(linePosition);
     overlay.emphasizedPointMarker = emphasized;
-    overlay.controlPoints = _generatedViews.controlPoints;
+    for (const auto& control : _generatedViews.controlPoints) {
+        if (std::isfinite(control.linePosition) &&
+            std::abs(control.linePosition - linePosition) <= 0.5) {
+            overlay.controlPoints.push_back(control);
+        }
+    }
     return overlay;
 }
 
@@ -837,7 +855,9 @@ cv::Vec3f LineAnnotationDialog::interpolatedLinePoint(double linePosition) const
 cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) const
 {
     if (_generatedViews.linePoints.size() < 2) {
-        return {1.0f, 0.0f, 0.0f};
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
     }
     linePosition = std::clamp(linePosition,
                               0.0,
@@ -850,24 +870,67 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) con
     cv::Vec3f tangent = _generatedViews.linePoints[static_cast<size_t>(upper)] -
                         _generatedViews.linePoints[static_cast<size_t>(lower)];
     if (cv::norm(tangent) <= 1.0e-6f) {
-        tangent = {1.0f, 0.0f, 0.0f};
-    } else {
-        cv::normalize(tangent, tangent);
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
     }
+    cv::normalize(tangent, tangent);
     return tangent;
 }
 
-void LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePosition) const
+cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const
+{
+    if (_generatedViews.lineUpVectors.empty()) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+    }
+
+    linePosition = std::clamp(linePosition,
+                              0.0,
+                              static_cast<double>(_generatedViews.lineUpVectors.size() - 1));
+    const int lower = static_cast<int>(std::floor(linePosition));
+    const int upper = std::min<int>(lower + 1, static_cast<int>(_generatedViews.lineUpVectors.size()) - 1);
+    cv::Vec3f lowerUp = _generatedViews.lineUpVectors[static_cast<size_t>(lower)];
+    cv::Vec3f upperUp = _generatedViews.lineUpVectors[static_cast<size_t>(upper)];
+    if (!finitePoint(lowerUp) || !finitePoint(upperUp) ||
+        cv::norm(lowerUp) <= 1.0e-6f ||
+        cv::norm(upperUp) <= 1.0e-6f) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+    }
+    if (lowerUp.dot(upperUp) < 0.0f) {
+        upperUp *= -1.0f;
+    }
+
+    const float t = static_cast<float>(linePosition - static_cast<double>(lower));
+    cv::Vec3f up = lowerUp * (1.0f - t) + upperUp * t;
+    up -= tangent * up.dot(tangent);
+    if (cv::norm(up) <= 1.0e-6f) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+    }
+    cv::normalize(up, up);
+    return up;
+}
+
+bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePosition) const
 {
     if (!plane) {
-        return;
+        return false;
     }
     const cv::Vec3f origin = interpolatedLinePoint(linePosition);
     const cv::Vec3f tangent = interpolatedLineTangent(linePosition);
-    const cv::Vec3f upHint = std::abs(tangent[2]) < 0.9f
-        ? cv::Vec3f{0.0f, 0.0f, 1.0f}
-        : cv::Vec3f{0.0f, 1.0f, 0.0f};
+    const cv::Vec3f upHint = interpolatedLineUp(linePosition, tangent);
+    if (!finitePoint(origin) || !finitePoint(tangent) || !finitePoint(upHint) ||
+        cv::norm(tangent) <= 1.0e-6f ||
+        cv::norm(upHint) <= 1.0e-6f) {
+        return false;
+    }
     plane->setFromNormalAndUp(origin, tangent, upHint);
+    return true;
 }
 
 QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* viewer,

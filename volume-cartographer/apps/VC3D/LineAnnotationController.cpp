@@ -628,6 +628,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSliceName = "line-side-slice";
     generatedViews.lineSideSliceTitle = tr("Line Side Slice");
     generatedViews.linePoints = std::move(linePoints);
+    generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.seedPoint = seedPoint;
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
     for (const auto& control : session.controlPoints) {
