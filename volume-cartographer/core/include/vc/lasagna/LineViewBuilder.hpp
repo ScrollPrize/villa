@@ -11,8 +11,10 @@ class QuadSurface;
 namespace vc::lasagna {
 
 struct LineViewConfig {
-    double surfaceHalfWidth = 50.0;
-    double sideSliceHalfDepth = 50.0;
+    // Non-positive values auto-size from the optimized control-point step and
+    // crossSamples, so cross-strip spacing matches the line step.
+    double surfaceHalfWidth = 0.0;
+    double sideSliceHalfDepth = 0.0;
     int crossSamples = 21;
 };
 

@@ -69,7 +69,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _initialDirectionCombo = new QComboBox(buttonRow);
     _initialDirectionCombo->addItem(tr("sideways"), static_cast<int>(InitialDirectionMode::Sideways));
     _initialDirectionCombo->addItem(tr("z (in/out)"), static_cast<int>(InitialDirectionMode::ZInOut));
-    _initialDirectionCombo->setCurrentIndex(0);
+    _initialDirectionCombo->setCurrentIndex(1);
     buttonLayout->addWidget(_initialDirectionCombo);
     _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
     _showAsMeshButton->setEnabled(false);

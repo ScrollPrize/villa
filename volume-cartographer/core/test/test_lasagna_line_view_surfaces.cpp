@@ -67,6 +67,19 @@ TEST_CASE("LineViewBuilder creates ribbons from optimized control points")
     checkVec(surfacePoints(2, 10), {20.0, 0.0, 0.0});
 }
 
+TEST_CASE("LineViewBuilder default strip spacing matches optimized step")
+{
+    const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
+    const auto surfacePoints = views.lineSurface->rawPoints();
+
+    REQUIRE(surfacePoints.rows == 3);
+    REQUIRE(surfacePoints.cols == 21);
+
+    checkVec(surfacePoints(1, 9), {10.0, -10.0, 0.0});
+    checkVec(surfacePoints(1, 10), {10.0, 0.0, 0.0});
+    checkVec(surfacePoints(1, 11), {10.0, 10.0, 0.0});
+}
+
 TEST_CASE("LineViewBuilder offsets line-surface along side and side-slice along normal")
 {
     vc::lasagna::LineViewConfig config;
