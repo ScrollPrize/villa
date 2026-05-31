@@ -140,8 +140,8 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
         config.segmentsPerSide = 100;
         config.segmentLength = 16.0;
         config.straightnessWeight = 0.1;
-        config.tangentStraightnessWeight = 0.5;
-        config.normalStraightnessWeight = 0.05;
+        config.tangentStraightnessWeight = 5.0;
+        config.normalStraightnessWeight = 0.5;
         config.samplesPerSegment = 1;
         config.differentiableNormalSampling = true;
         config.initialTangent = initialTangentForMode(

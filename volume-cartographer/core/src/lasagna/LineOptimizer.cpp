@@ -1686,9 +1686,11 @@ struct LineDifference {
 [[nodiscard]] LineModel buildLineModel(
     const std::vector<std::array<double, 3>>& points,
     const NormalSampler& sampler,
-    std::vector<LineSegmentSamples> segmentSamples)
+    std::vector<LineSegmentSamples> segmentSamples,
+    int displayFrameAnchorIndex)
 {
     LineModel model;
+    model.displayFrameAnchorIndex = displayFrameAnchorIndex;
     model.points.reserve(points.size());
     for (const auto& point : points) {
         LinePoint linePoint;
@@ -1744,7 +1746,10 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
         &finalInvalidSamples);
 
     LineOptimizationResult result;
-    result.line = buildLineModel(selected.points, normalSampler_, std::move(finalSamples));
+    result.line = buildLineModel(selected.points,
+                                 normalSampler_,
+                                 std::move(finalSamples),
+                                 seedIndex);
     result.report.initialCost = selected.initialCost;
     result.report.finalCost = selected.finalCost;
     result.report.iterations = selected.iterations;
@@ -1842,7 +1847,17 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
         &finalInvalidSamples);
 
     LineOptimizationResult result;
-    result.line = buildLineModel(selected.points, normalSampler_, std::move(finalSamples));
+    int displayFrameAnchorIndex = seedIndex;
+    for (const auto& control : init.controlPoints) {
+        if (control.isSeed && control.optimizedIndex >= 0) {
+            displayFrameAnchorIndex = control.optimizedIndex;
+            break;
+        }
+    }
+    result.line = buildLineModel(selected.points,
+                                 normalSampler_,
+                                 std::move(finalSamples),
+                                 displayFrameAnchorIndex);
     result.report.initialCost = selected.initialCost;
     result.report.finalCost = selected.finalCost;
     result.report.iterations = selected.iterations;

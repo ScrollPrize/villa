@@ -137,13 +137,15 @@ TEST_CASE("LineViewBuilder creates one z slice per optimized control point")
 TEST_CASE("LineViewBuilder diagnostics flag sampled normal axis jumps")
 {
     auto line = simpleLine();
-    line.points[0].sampledNormal = normal({0.0, 0.0, 1.0});
-    line.points[1].sampledNormal = normal({0.0, 1.0, 0.0});
-    line.points[2].sampledNormal = normal({0.0, 0.0, 1.0});
+    line.points[0].sampledNormal = normal({0.0, 1.0, 0.0});
+    line.points[1].sampledNormal = normal({0.0, 0.0, 1.0});
+    line.points[2].sampledNormal = normal({0.0, 1.0, 0.0});
 
     const auto diagnostics = vc::lasagna::diagnoseLineViewFrames(line);
 
     CHECK(diagnostics.minSampledAxisContinuityDot < 0.5);
+    CHECK(diagnostics.minDisplayUpContinuityDot > 0.99);
+    CHECK(diagnostics.maxAbsDisplayUpRollDeltaRadians < 1.0e-9);
     REQUIRE(!diagnostics.issues.empty());
     CHECK(diagnostics.issues.front().reason == "sampled_normal_axis_jump");
 }
@@ -151,25 +153,36 @@ TEST_CASE("LineViewBuilder diagnostics flag sampled normal axis jumps")
 TEST_CASE("LineViewBuilder uses transported up vectors for cross-slice orientation")
 {
     auto line = simpleLine();
-    line.points[0].sampledNormal = normal({0.0, 0.0, 1.0});
-    line.points[1].sampledNormal = normal({0.0, 1.0, 0.0});
-    line.points[2].sampledNormal = normal({0.0, 0.0, 1.0});
+    line.points[0].sampledNormal = normal({0.0, 1.0, 0.0});
+    line.points[1].sampledNormal = normal({0.0, 0.0, 1.0});
+    line.points[2].sampledNormal = normal({0.0, 1.0, 0.0});
 
     const auto views = vc::lasagna::buildLineViewSurfaces(line);
 
     REQUIRE(views.lineUpVectors.size() == 3);
     for (const auto& up : views.lineUpVectors) {
-        checkVec(up, {0.0, 1.0, 0.0});
+        checkVec(up, {0.0, 0.0, 1.0});
     }
     for (const auto& slice : views.lineZSlices) {
         REQUIRE(slice);
-        checkVec(slice->basisY(), {0.0, 1.0, 0.0});
+        checkVec(slice->basisY(), {0.0, 0.0, 1.0});
     }
+}
+
+TEST_CASE("LineViewBuilder rejects invalid display-frame anchor normals")
+{
+    auto invalidAnchorLine = simpleLine();
+    invalidAnchorLine.points[1].sampledNormal = normal({0.0, 0.0, 0.0}, false);
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(invalidAnchorLine), std::runtime_error);
+
+    auto parallelAnchorLine = simpleLine();
+    parallelAnchorLine.points[1].sampledNormal = normal({1.0, 0.0, 0.0});
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(parallelAnchorLine), std::runtime_error);
 }
 
 TEST_CASE("LineViewBuilder uses finite deterministic fallback frames")
 {
-    auto line = simpleLine({1.0, 0.0, 0.0});
+    auto line = simpleLine();
     line.points[0].sampledNormal = normal({0.0, 0.0, 0.0}, false);
     line.points[2].sampledNormal = normal({0.0, 0.0, 0.0}, false);
 
@@ -245,23 +258,14 @@ TEST_CASE("LineViewBuilder falls back when all normals or tangents are degenerat
     config.surfaceHalfWidth = 4.0;
     config.sideSliceHalfDepth = 6.0;
     config.crossSamples = 3;
-    auto views = vc::lasagna::buildLineViewSurfaces(invalidNormalLine, config);
-    auto surfacePoints = views.lineSurface->rawPoints();
-    auto sideSlicePoints = views.lineSideSlice->rawPoints();
-
-    for (int row = 0; row < surfacePoints.rows; ++row) {
-        for (int col = 0; col < surfacePoints.cols; ++col) {
-            CHECK(finitePoint(surfacePoints(row, col)));
-            CHECK(finitePoint(sideSlicePoints(row, col)));
-        }
-    }
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(invalidNormalLine, config), std::runtime_error);
 
     auto degenerateTangentLine = simpleLine();
     for (auto& point : degenerateTangentLine.points) {
         point.position = {5.0, 5.0, 5.0};
     }
-    views = vc::lasagna::buildLineViewSurfaces(degenerateTangentLine, config);
-    surfacePoints = views.lineSurface->rawPoints();
+    auto views = vc::lasagna::buildLineViewSurfaces(degenerateTangentLine, config);
+    auto surfacePoints = views.lineSurface->rawPoints();
     REQUIRE(surfacePoints.rows == 3);
     REQUIRE(surfacePoints.cols == 3);
     CHECK(finitePoint(surfacePoints(0, 0)));

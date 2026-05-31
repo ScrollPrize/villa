@@ -53,6 +53,9 @@ struct LineSegmentSamples {
 struct LineModel {
     std::vector<LinePoint> points;
     std::vector<LineSegmentSamples> segmentSamples;
+    // Preferred optimized control-point index for generated cut-plane roll.
+    // Negative values fall back to the middle seed index.
+    int displayFrameAnchorIndex = -1;
 };
 
 struct LineOptimizationConfig {

@@ -33,6 +33,8 @@ struct LineViewFrameIssue {
     double sideContinuityDot = 1.0;
     double sampledAxisContinuityDot = 1.0;
     double meshToSampledAxisDot = 1.0;
+    double displayUpRollDeltaRadians = 0.0;
+    double displayUpContinuityDot = 1.0;
     std::string reason;
 };
 
@@ -43,6 +45,8 @@ struct LineViewFrameDiagnostics {
     double minSideContinuityDot = 1.0;
     double minSampledAxisContinuityDot = 1.0;
     double minMeshToSampledAxisDot = 1.0;
+    double maxAbsDisplayUpRollDeltaRadians = 0.0;
+    double minDisplayUpContinuityDot = 1.0;
     std::vector<LineViewFrameIssue> issues;
 };
 

@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -34,18 +36,32 @@ public:
 
 class CountingNormalSampler final : public vc::lasagna::NormalSampler {
 public:
-    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& /*volumePoint*/) const override
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override
     {
         ++calls;
+        sampledPoints.push_back(volumePoint);
         return {{0.0, 0.0, 1.0}, true, {}};
     }
 
     mutable int calls = 0;
+    mutable std::vector<cv::Vec3d> sampledPoints;
 };
 
 double norm(const cv::Vec3d& vector)
 {
     return std::sqrt(vector.dot(vector));
+}
+
+const vc::lasagna::LineOptimizationLossReport& lossByName(
+    const vc::lasagna::LineOptimizationReport& report,
+    const std::string& name)
+{
+    for (const auto& loss : report.finalLosses) {
+        if (loss.name == name) {
+            return loss;
+        }
+    }
+    throw std::runtime_error("missing loss " + name);
 }
 
 } // namespace
@@ -63,6 +79,7 @@ TEST_CASE("LineOptimizer grows a centered line tangent to sampled normals")
     const auto result = optimizer.optimizeFromSeed({100.0, 200.0, 30.0}, config);
 
     REQUIRE(result.line.points.size() == 21);
+    CHECK(result.line.displayFrameAnchorIndex == 10);
     REQUIRE(result.line.segmentSamples.size() == 20);
     CHECK(result.report.converged);
     CHECK(result.report.validNormalSamples == 20 * 5);
@@ -167,6 +184,7 @@ TEST_CASE("LineOptimizer supports multiple fixed control points")
     const auto result = optimizer.optimizeFromControlPoints(controls, config);
 
     REQUIRE(result.line.points.size() == 6);
+    CHECK(result.line.displayFrameAnchorIndex == 1);
     CHECK(result.line.points[1].position[0] == doctest::Approx(0.0).epsilon(1.0e-9));
     CHECK(result.line.points[1].position[1] == doctest::Approx(0.0).epsilon(1.0e-9));
     CHECK(result.line.points[1].position[2] == doctest::Approx(0.0).epsilon(1.0e-9));
@@ -174,20 +192,12 @@ TEST_CASE("LineOptimizer supports multiple fixed control points")
     CHECK(result.line.points[4].position[1] == doctest::Approx(0.0).epsilon(1.0e-9));
     CHECK(result.line.points[4].position[2] == doctest::Approx(0.0).epsilon(1.0e-9));
 
-    auto lossByName = [&](const std::string& name) -> const vc::lasagna::LineOptimizationLossReport& {
-        for (const auto& loss : result.report.finalLosses) {
-            if (loss.name == name) {
-                return loss;
-            }
-        }
-        throw std::runtime_error("missing loss " + name);
-    };
-    CHECK(lossByName("step_distance").residuals == 2);
-    CHECK(lossByName("even_step").residuals == 2);
-    CHECK(lossByName("tangent_straightness").residuals > 0);
-    CHECK(lossByName("normal_straightness").residuals > 0);
-    CHECK(lossByName("initial_direction").residuals == 0);
-    CHECK(lossByName("tangent_guide").residuals == 0);
+    CHECK(lossByName(result.report, "step_distance").residuals == 2);
+    CHECK(lossByName(result.report, "even_step").residuals == 2);
+    CHECK(lossByName(result.report, "tangent_straightness").residuals > 0);
+    CHECK(lossByName(result.report, "normal_straightness").residuals > 0);
+    CHECK(lossByName(result.report, "initial_direction").residuals == 0);
+    CHECK(lossByName(result.report, "tangent_guide").residuals == 0);
 
     const auto fromSeeds = optimizer.optimizeFromSeeds({{0.0, 0.0, 0.0}, {30.0, 0.0, 0.0}}, config);
     REQUIRE(fromSeeds.line.points.size() == result.line.points.size());
@@ -280,6 +290,88 @@ TEST_CASE("LineOptimizer resamples normals during solver residual evaluation")
 
     REQUIRE(result.line.points.size() == 3);
     CHECK(sampler.calls > 8);
+}
+
+TEST_CASE("LineOptimizer split straightness reports match equal-weight 3D straightness")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 10.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.straightnessWeight = 2.0;
+    config.tangentStraightnessWeight = -1.0;
+    config.normalStraightnessWeight = -1.0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, true, -1},
+        {1.0, {10.0, 0.0, 3.0}, false, -1},
+        {2.0, {20.0, 0.0, 0.0}, false, -1},
+    };
+    const auto result = optimizer.optimizeFromControlPoints(std::move(controls), config);
+
+    const auto& tangent = lossByName(result.report, "tangent_straightness");
+    const auto& normal = lossByName(result.report, "normal_straightness");
+    CHECK(tangent.weight == doctest::Approx(2.0));
+    CHECK(normal.weight == doctest::Approx(2.0));
+    CHECK(tangent.residuals == normal.residuals * 3);
+
+    double expectedWeightedCost = 0.0;
+    for (size_t i = 1; i + 1 < result.line.points.size(); ++i) {
+        const cv::Vec3d curvature = result.line.points[i - 1].position -
+                                    2.0 * result.line.points[i].position +
+                                    result.line.points[i + 1].position;
+        expectedWeightedCost += 0.5 * 2.0 * 2.0 * curvature.dot(curvature);
+    }
+    CHECK(tangent.weightedCost + normal.weightedCost ==
+          doctest::Approx(expectedWeightedCost).epsilon(1.0e-10));
+}
+
+TEST_CASE("LineOptimizer split straightness samples the normal sampler at stencil centers")
+{
+    CountingNormalSampler sampler;
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 10.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 1;
+    config.straightnessWeight = 0.0;
+    config.tangentStraightnessWeight = 1.0;
+    config.normalStraightnessWeight = 1.0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, true, -1},
+        {1.0, {10.0, 0.0, 3.0}, false, -1},
+        {2.0, {20.0, 0.0, 0.0}, false, -1},
+    };
+    const auto result = optimizer.optimizeFromControlPoints(std::move(controls), config);
+
+    REQUIRE(lossByName(result.report, "tangent_straightness").residuals > 0);
+    REQUIRE(lossByName(result.report, "normal_straightness").residuals > 0);
+
+    int centerSamples = 0;
+    for (const auto& sampled : sampler.sampledPoints) {
+        for (size_t i = 1; i + 1 < result.line.points.size(); ++i) {
+            if (norm(sampled - result.line.points[i].position) < 1.0e-9) {
+                ++centerSamples;
+                break;
+            }
+        }
+    }
+    CHECK(centerSamples > static_cast<int>(result.line.points.size() - 2));
 }
 
 TEST_CASE("LineOptimizer supports zero iterations and single-seed optimizeFromSeeds")

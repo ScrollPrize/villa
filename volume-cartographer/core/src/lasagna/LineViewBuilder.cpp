@@ -18,6 +18,8 @@ constexpr int kRollSmoothIterations = 80;
 constexpr double kMaxFrameRollDelta = 0.78539816339744830962;
 constexpr double kSampledAxisContinuityIssueDot = 0.5;
 constexpr double kMeshToSampledAxisIssueDot = 0.5;
+constexpr double kDisplayUpContinuityIssueDot = 0.0;
+constexpr double kMaxDisplayUpRollDelta = 1.57079632679489661923;
 
 bool finite(const cv::Vec3d& v)
 {
@@ -254,6 +256,35 @@ cv::Vec3d transportNormal(const cv::Vec3d& previousNormal,
     return {0.0, 0.0, 1.0};
 }
 
+size_t displayFrameAnchorIndex(const LineModel& line, size_t sampleCount)
+{
+    if (sampleCount == 0) {
+        return 0;
+    }
+    if (line.displayFrameAnchorIndex >= 0 &&
+        line.displayFrameAnchorIndex < static_cast<int>(sampleCount)) {
+        return static_cast<size_t>(line.displayFrameAnchorIndex);
+    }
+    return sampleCount / 2;
+}
+
+cv::Vec3d requiredDisplayAnchorUp(const std::vector<SegmentNormalSample>& samples,
+                                  const std::vector<cv::Vec3d>& tangents,
+                                  size_t anchor)
+{
+    const NormalSample& sample = samples[anchor].sampledNormal;
+    const cv::Vec3d normal = normalizedOrZero(sample.normal);
+    if (!sample.valid || !validDirection(normal)) {
+        throw std::runtime_error("Line view display frame anchor normal is invalid");
+    }
+
+    const cv::Vec3d up = projectToTangentPlane(normal, tangents[anchor]);
+    if (!validDirection(up)) {
+        throw std::runtime_error("Line view display frame anchor normal is parallel to the line tangent");
+    }
+    return up;
+}
+
 double unwrapNear(double angle, double reference)
 {
     constexpr double twoPi = 2.0 * 3.14159265358979323846;
@@ -475,7 +506,7 @@ std::vector<LineFrame> buildFrames(const std::vector<SegmentNormalSample>& sampl
 }
 
 std::vector<cv::Vec3d> buildTransportedUpVectors(const std::vector<SegmentNormalSample>& samples,
-                                                 const std::vector<cv::Vec3d>& normals)
+                                                 size_t anchor)
 {
     std::vector<cv::Vec3d> upVectors(samples.size(), {0.0, 0.0, 0.0});
     if (samples.empty()) {
@@ -488,12 +519,7 @@ std::vector<cv::Vec3d> buildTransportedUpVectors(const std::vector<SegmentNormal
         tangents.push_back(tangentAt(samples, row));
     }
 
-    const size_t anchor = samples.size() / 2;
-    upVectors[anchor] = projectToTangentPlane(normalizedOrZero(normals[anchor]), tangents[anchor]);
-    if (!validDirection(upVectors[anchor])) {
-        upVectors[anchor] = fallbackMeshNormalForTangent(tangents[anchor]);
-    }
-
+    upVectors[anchor] = requiredDisplayAnchorUp(samples, tangents, anchor);
     for (size_t row = anchor + 1; row < samples.size(); ++row) {
         upVectors[row] = transportNormal(upVectors[row - 1], tangents[row - 1], tangents[row]);
     }
@@ -560,7 +586,9 @@ LineViewFrameData buildControlFrameData(const LineModel& line)
 
     data.normals = resolvedNormals(data.samples);
     data.frames = buildFrames(data.samples, data.normals);
-    data.transportedUpVectors = buildTransportedUpVectors(data.samples, data.normals);
+    data.transportedUpVectors = buildTransportedUpVectors(
+        data.samples,
+        displayFrameAnchorIndex(line, data.samples.size()));
     data.tangents.reserve(data.samples.size());
     for (size_t row = 0; row < data.samples.size(); ++row) {
         data.tangents.push_back(tangentAt(data.samples, row));
@@ -655,6 +683,10 @@ LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const Lin
                                                                    frameData.tangents[i - 1],
                                                                    tangent);
         const cv::Vec3d sampledNormal = projectToTangentPlane(frameData.normals[i], tangent);
+        const cv::Vec3d transportedDisplayUp = transportNormal(frameData.transportedUpVectors[i - 1],
+                                                               frameData.tangents[i - 1],
+                                                               tangent);
+        const cv::Vec3d displayUp = projectToTangentPlane(frameData.transportedUpVectors[i], tangent);
 
         const double normalDot = validDirection(transportedNormal)
             ? frame.meshNormal.dot(transportedNormal)
@@ -668,6 +700,9 @@ LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const Lin
         const double meshToSampledAxisDot = validDirection(sampledNormal)
             ? std::abs(frame.meshNormal.dot(sampledNormal))
             : 1.0;
+        const double displayUpDot = validDirection(transportedDisplayUp) && validDirection(displayUp)
+            ? displayUp.dot(transportedDisplayUp)
+            : 1.0;
 
         double rollDelta = 0.0;
         if (validDirection(transportedNormal)) {
@@ -675,6 +710,14 @@ LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const Lin
             if (validDirection(binormal)) {
                 rollDelta = std::atan2(frame.meshNormal.dot(binormal),
                                        frame.meshNormal.dot(transportedNormal));
+            }
+        }
+        double displayUpRollDelta = 0.0;
+        if (validDirection(transportedDisplayUp) && validDirection(displayUp)) {
+            const cv::Vec3d binormal = normalizedOrZero(tangent.cross(transportedDisplayUp));
+            if (validDirection(binormal)) {
+                displayUpRollDelta = std::atan2(displayUp.dot(binormal),
+                                                displayUp.dot(transportedDisplayUp));
             }
         }
 
@@ -688,12 +731,21 @@ LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const Lin
                                                            sampledAxisDot);
         diagnostics.minMeshToSampledAxisDot = std::min(diagnostics.minMeshToSampledAxisDot,
                                                        meshToSampledAxisDot);
+        diagnostics.maxAbsDisplayUpRollDeltaRadians =
+            std::max(diagnostics.maxAbsDisplayUpRollDeltaRadians,
+                     std::abs(displayUpRollDelta));
+        diagnostics.minDisplayUpContinuityDot = std::min(diagnostics.minDisplayUpContinuityDot,
+                                                         displayUpDot);
 
         std::string reason;
         if (normalDot < 0.0 || sideDot < 0.0) {
             reason = "generated_frame_flip";
         } else if (std::abs(rollDelta) > 1.57079632679489661923) {
             reason = "large_generated_roll_jump";
+        } else if (displayUpDot < kDisplayUpContinuityIssueDot) {
+            reason = "display_frame_flip";
+        } else if (std::abs(displayUpRollDelta) > kMaxDisplayUpRollDelta) {
+            reason = "large_display_frame_roll_jump";
         } else if (sampledAxisDot < kSampledAxisContinuityIssueDot) {
             reason = "sampled_normal_axis_jump";
         } else if (meshToSampledAxisDot < kMeshToSampledAxisIssueDot) {
@@ -701,13 +753,17 @@ LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const Lin
         }
 
         if (!reason.empty()) {
-            diagnostics.issues.push_back({i,
-                                          rollDelta,
-                                          normalDot,
-                                          sideDot,
-                                          sampledAxisDot,
-                                          meshToSampledAxisDot,
-                                          std::move(reason)});
+            LineViewFrameIssue issue;
+            issue.index = i;
+            issue.rollDeltaRadians = rollDelta;
+            issue.normalContinuityDot = normalDot;
+            issue.sideContinuityDot = sideDot;
+            issue.sampledAxisContinuityDot = sampledAxisDot;
+            issue.meshToSampledAxisDot = meshToSampledAxisDot;
+            issue.displayUpRollDeltaRadians = displayUpRollDelta;
+            issue.displayUpContinuityDot = displayUpDot;
+            issue.reason = std::move(reason);
+            diagnostics.issues.push_back(std::move(issue));
         }
     }
     return diagnostics;
