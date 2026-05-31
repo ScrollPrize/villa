@@ -432,6 +432,8 @@ struct PrefetchTiming {
     int calls = 0;
     double chunkPrefetchMs = 0.0;
     double materializeMs = 0.0;
+    uint64_t requestedChunks = 0;
+    uint64_t chunksRead = 0;
 };
 
 struct PrefetchedNormalAlignmentResidual final : public ceres::SizedCostFunction<1, 3, 3> {
@@ -1535,6 +1537,7 @@ struct GlobalSolveResult {
     int iterations = 0;
     bool usable = false;
     double milliseconds = 0.0;
+    double ceresSolveMs = 0.0;
     PrefetchTiming prefetchTiming;
     std::string report;
 };
@@ -1568,7 +1571,8 @@ void fillPrefetchedNormalSamples(
     }
 
     const auto prefetchStart = Clock::now();
-    sampler.prefetchNormalSamples(samplePoints, config.differentiableNormalSampling);
+    const NormalPrefetchReport prefetchReport =
+        sampler.prefetchNormalSamples(samplePoints, config.differentiableNormalSampling);
     const auto prefetchEnd = Clock::now();
 
     const unsigned hardwareThreads = std::thread::hardware_concurrency();
@@ -1589,6 +1593,8 @@ void fillPrefetchedNormalSamples(
             ++timing->calls;
             timing->chunkPrefetchMs += elapsedMs(prefetchStart, prefetchEnd);
             timing->materializeMs += elapsedMs(prefetchEnd, Clock::now());
+            timing->requestedChunks += prefetchReport.requestedChunks;
+            timing->chunksRead += prefetchReport.chunksRead;
         }
         return;
     }
@@ -1619,6 +1625,8 @@ void fillPrefetchedNormalSamples(
         ++timing->calls;
         timing->chunkPrefetchMs += elapsedMs(prefetchStart, prefetchEnd);
         timing->materializeMs += elapsedMs(prefetchEnd, Clock::now());
+        timing->requestedChunks += prefetchReport.requestedChunks;
+        timing->chunksRead += prefetchReport.chunksRead;
     }
 }
 
@@ -1698,7 +1706,13 @@ private:
     ceres::Solver::Options options = solverOptions(config, config.printSolverProgress);
     options.update_state_every_iteration = true;
     options.callbacks.push_back(&prefetchCallback);
+    const double normalMsBeforeSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
+    const auto solveStart = Clock::now();
     ceres::Solve(options, &problem, &summary);
+    const auto solveEnd = Clock::now();
+    const double normalMsAfterSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
+    const double normalCallbackMs = std::max(0.0, normalMsAfterSolve - normalMsBeforeSolve);
+    const double ceresWallMs = elapsedMs(solveStart, solveEnd);
 
     GlobalSolveResult result;
     result.name = std::move(name);
@@ -1708,6 +1722,7 @@ private:
     result.iterations = static_cast<int>(summary.iterations.size());
     result.usable = summary.IsSolutionUsable();
     result.milliseconds = elapsedMs(chainStart, Clock::now());
+    result.ceresSolveMs = std::max(0.0, ceresWallMs - normalCallbackMs);
     result.prefetchTiming = prefetchTiming;
     result.report = summary.FullReport();
     return result;
@@ -1836,8 +1851,11 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
         result.report.invalidNormalSamples = finalInvalidSamples;
         result.report.converged = true;
         result.report.normalPrefetchCalls = 0;
+        result.report.ceresSolveMs = 0.0;
         result.report.normalChunkPrefetchMs = 0.0;
         result.report.normalMaterializeMs = 0.0;
+        result.report.normalPrefetchRequestedChunks = 0;
+        result.report.normalPrefetchChunksRead = 0;
         std::ostringstream message;
         message.imbue(std::locale::classic());
         message << std::scientific << std::setprecision(3)
@@ -1884,8 +1902,11 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     result.report.invalidNormalSamples = finalInvalidSamples;
     result.report.converged = selected.usable;
     result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
+    result.report.ceresSolveMs = selected.ceresSolveMs;
     result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+    result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
+    result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
     std::ostringstream message;
     message.imbue(std::locale::classic());
     message << std::scientific << std::setprecision(3)
@@ -1898,8 +1919,11 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
             << std::setw(13) << selected.finalCost
             << "\n\nNormal prefetch/materialization:\n"
             << "calls=" << selected.prefetchTiming.calls
+            << " ceres_solve_ms=" << selected.ceresSolveMs
             << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
             << " materialize_ms=" << selected.prefetchTiming.materializeMs
+            << " requested_chunks=" << selected.prefetchTiming.requestedChunks
+            << " chunks_read=" << selected.prefetchTiming.chunksRead
             << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
                                 selected.prefetchTiming.materializeMs)
             << "\n\nSelected candidate report:\n"
@@ -1992,8 +2016,11 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
     result.report.invalidNormalSamples = finalInvalidSamples;
     result.report.converged = selected.usable;
     result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
+    result.report.ceresSolveMs = selected.ceresSolveMs;
     result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+    result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
+    result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
 
     std::ostringstream message;
     message.imbue(std::locale::classic());
@@ -2011,8 +2038,11 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
     }
     message << "\n\nNormal prefetch/materialization:\n"
             << "calls=" << selected.prefetchTiming.calls
+            << " ceres_solve_ms=" << selected.ceresSolveMs
             << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
             << " materialize_ms=" << selected.prefetchTiming.materializeMs
+            << " requested_chunks=" << selected.prefetchTiming.requestedChunks
+            << " chunks_read=" << selected.prefetchTiming.chunksRead
             << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
                                 selected.prefetchTiming.materializeMs)
             << "\n\nSelected candidate report:\n"

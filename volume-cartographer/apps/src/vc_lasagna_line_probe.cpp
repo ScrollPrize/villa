@@ -41,7 +41,7 @@ bool finiteDirection(const cv::Vec3d& v)
 
 void printUsage(const char* argv0)
 {
-    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--trace-init] [--seed=x,y,z]\n"
+    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode.\n";
 }
@@ -56,6 +56,21 @@ cv::Vec3d parseSeed(const std::string& value)
         throw std::invalid_argument("seed must be formatted as x,y,z");
     }
     return {x, y, z};
+}
+
+int parsePositiveInt(const std::string& value, const char* name)
+{
+    size_t consumed = 0;
+    int parsed = 0;
+    try {
+        parsed = std::stoi(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string(name) + " must be a positive integer");
+    }
+    if (consumed != value.size() || parsed <= 0) {
+        throw std::invalid_argument(std::string(name) + " must be a positive integer");
+    }
+    return parsed;
 }
 
 cv::Vec3d initialZInOutTangent(const cv::Vec3d& sourceSliceNormal,
@@ -292,7 +307,9 @@ int main(int argc, char** argv)
     }
     bool differentiableNormalSampling = true;
     bool benchmarkSolvers = false;
+    bool benchmarkThreads = false;
     bool traceInit = false;
+    int segmentsPerSide = 200;
     cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -300,8 +317,12 @@ int main(int argc, char** argv)
             differentiableNormalSampling = false;
         } else if (arg == "--benchmark-solvers") {
             benchmarkSolvers = true;
+        } else if (arg == "--benchmark-threads") {
+            benchmarkThreads = true;
         } else if (arg == "--trace-init") {
             traceInit = true;
+        } else if (arg.rfind("--segments-per-side=", 0) == 0) {
+            segmentsPerSide = parsePositiveInt(arg.substr(20), "segments-per-side");
         } else if (arg.rfind("--seed=", 0) == 0) {
             seedPoint = parseSeed(arg.substr(7));
         } else {
@@ -320,7 +341,7 @@ int main(int argc, char** argv)
         const auto seedNormal = sampler.sampleNormal(seedPoint);
 
         vc::lasagna::LineOptimizationConfig config;
-        config.segmentsPerSide = 200;
+        config.segmentsPerSide = segmentsPerSide;
         config.segmentLength = 32.0;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
@@ -349,6 +370,40 @@ int main(int argc, char** argv)
             printInitTrace(seedPoint, config.initialTangent, sampler, config);
         }
 
+        if (benchmarkThreads) {
+            const std::vector<int> threadCounts{1, 2, 4, 8, 16, 32};
+            std::cout.imbue(std::locale::classic());
+            std::cout << std::scientific << std::setprecision(3);
+            std::cout << "Thread benchmark:\n"
+                      << "threads   run       ms  ceres_ms prefetch_ms materialize_ms prefetch_calls chunks_read chunks_requested  iters   final_cost normal_cost status\n";
+            for (const int threads : threadCounts) {
+                auto trialConfig = config;
+                trialConfig.numThreads = threads;
+                trialConfig.printSolverProgress = false;
+                (void)optimizer.optimizeFromSeed(seedPoint, trialConfig);
+                for (int run = 1; run <= 3; ++run) {
+                    const auto start = std::chrono::steady_clock::now();
+                    const auto result = optimizer.optimizeFromSeed(seedPoint, trialConfig);
+                    const auto end = std::chrono::steady_clock::now();
+                    const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    std::cout << std::right << std::setw(7) << threads
+                              << std::setw(6) << run
+                              << std::setw(10) << ms
+                              << std::setw(10) << result.report.ceresSolveMs
+                              << std::setw(12) << result.report.normalChunkPrefetchMs
+                              << std::setw(14) << result.report.normalMaterializeMs
+                              << std::setw(15) << result.report.normalPrefetchCalls
+                              << std::setw(12) << result.report.normalPrefetchChunksRead
+                              << std::setw(17) << result.report.normalPrefetchRequestedChunks
+                              << std::setw(7) << result.report.iterations
+                              << std::setw(13) << result.report.finalCost
+                              << std::setw(12) << normalAlignmentCost(result.report)
+                              << " " << (result.report.converged ? "ok" : "not_converged") << '\n';
+                }
+            }
+            return 0;
+        }
+
         if (benchmarkSolvers) {
             using LinearSolver = vc::lasagna::LineOptimizationConfig::LinearSolver;
             const std::vector<LinearSolver> solvers{
@@ -364,13 +419,13 @@ int main(int argc, char** argv)
             std::cout.imbue(std::locale::classic());
             std::cout << std::scientific << std::setprecision(3);
             std::cout << "Solver benchmark:\n"
-                      << "solver                    threads   run       ms  iters   final_cost normal_cost prefetch_ms materialize_ms status\n";
+                      << "solver                    threads   run       ms  ceres_ms prefetch_ms materialize_ms prefetch_calls chunks_read chunks_requested  iters   final_cost normal_cost status\n";
             for (const auto solver : solvers) {
                 for (const int threads : threadCounts) {
                     if (isSchurSolver(solver)) {
                         std::cout << std::left << std::setw(25) << solverName(solver)
                                   << std::right << std::setw(7) << threads
-                                  << "    --        --     --          --          --          --            -- unsupported_residual_graph\n";
+                                  << "    --        --        --          --            --              --          --               --     --          --          -- unsupported_residual_graph\n";
                         continue;
                     }
                     auto trialConfig = config;
@@ -386,11 +441,15 @@ int main(int argc, char** argv)
                                   << std::right << std::setw(7) << threads
                                   << std::setw(6) << (run == 1 ? "cold" : "warm")
                                   << std::setw(10) << ms
+                                  << std::setw(10) << result.report.ceresSolveMs
+                                  << std::setw(12) << result.report.normalChunkPrefetchMs
+                                  << std::setw(14) << result.report.normalMaterializeMs
+                                  << std::setw(15) << result.report.normalPrefetchCalls
+                                  << std::setw(12) << result.report.normalPrefetchChunksRead
+                                  << std::setw(17) << result.report.normalPrefetchRequestedChunks
                                   << std::setw(7) << result.report.iterations
                                   << std::setw(13) << result.report.finalCost
                                   << std::setw(12) << normalAlignmentCost(result.report)
-                                  << std::setw(12) << result.report.normalChunkPrefetchMs
-                                  << std::setw(14) << result.report.normalMaterializeMs
                                   << " " << (result.report.converged ? "ok" : "not_converged") << '\n';
                     }
                 }

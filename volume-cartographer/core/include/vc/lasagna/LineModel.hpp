@@ -2,6 +2,7 @@
 
 #include <opencv2/core/types.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,11 @@ struct NormalSampleWithDerivative {
     bool hasDerivative = false;
 };
 
+struct NormalPrefetchReport {
+    uint64_t requestedChunks = 0;
+    uint64_t chunksRead = 0;
+};
+
 class NormalSampler {
 public:
     virtual ~NormalSampler() = default;
@@ -28,9 +34,11 @@ public:
     {
         return {sampleNormal(volumePoint), cv::Matx33d::zeros(), false};
     }
-    virtual void prefetchNormalSamples(const std::vector<cv::Vec3d>& /*volumePoints*/,
-                                       bool /*withDerivative*/) const
+    [[nodiscard]] virtual NormalPrefetchReport prefetchNormalSamples(
+        const std::vector<cv::Vec3d>& /*volumePoints*/,
+        bool /*withDerivative*/) const
     {
+        return {};
     }
 };
 

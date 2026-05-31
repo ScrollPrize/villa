@@ -28,8 +28,9 @@ public:
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(
         const cv::Vec3d& volumePoint) const override;
-    void prefetchNormalSamples(const std::vector<cv::Vec3d>& volumePoints,
-                               bool withDerivative) const override;
+    [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool withDerivative) const override;
 
 private:
     class Impl;

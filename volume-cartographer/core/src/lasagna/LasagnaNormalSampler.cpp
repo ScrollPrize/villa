@@ -11,6 +11,7 @@
 #include <cstring>
 #include <future>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -284,12 +285,13 @@ public:
         return getCached(key);
     }
 
-    void prefetch(
+    [[nodiscard]] NormalPrefetchReport prefetch(
         const ChannelBinding& binding,
         const utils::ZarrArray& array,
         const std::vector<ChunkKey>& keys,
         size_t maxWorkers) const
     {
+        NormalPrefetchReport report;
         std::vector<ChunkKey> missing;
         missing.reserve(keys.size());
         {
@@ -297,15 +299,20 @@ public:
             std::unordered_set<ChunkKey, ChunkKeyHash> seen;
             seen.reserve(keys.size());
             for (const auto& key : keys) {
-                if (!seen.insert(key).second || entries_.find(key) != entries_.end()) {
+                if (!seen.insert(key).second) {
+                    continue;
+                }
+                ++report.requestedChunks;
+                if (entries_.find(key) != entries_.end()) {
                     continue;
                 }
                 missing.push_back(key);
             }
         }
+        report.chunksRead = missing.size();
 
         if (missing.empty()) {
-            return;
+            return report;
         }
 
         maxWorkers = std::clamp<size_t>(maxWorkers, 1, missing.size());
@@ -330,6 +337,7 @@ public:
         for (auto& future : futures) {
             future.get();
         }
+        return report;
     }
 
 private:
@@ -391,6 +399,17 @@ private:
     mutable std::list<ChunkKey> lru_;
     mutable std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
 };
+
+[[nodiscard]] std::shared_ptr<ChunkCache> sharedNormalChunkCache(size_t capacityBytes)
+{
+    static std::mutex mutex;
+    static std::shared_ptr<ChunkCache> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!cache) {
+        cache = std::make_shared<ChunkCache>(capacityBytes);
+    }
+    return cache;
+}
 
 [[nodiscard]] ChannelBinding bindChannel(
     const LasagnaDatasetManifest& manifest,
@@ -766,7 +785,7 @@ public:
         , ny_(bindChannel(dataset.manifest(), "ny"))
         , gradMag_(bindChannel(dataset.manifest(), "grad_mag"))
         , options_(options)
-        , cache_(options.maxCachedBytes)
+        , cache_(sharedNormalChunkCache(options.maxCachedBytes))
     {
         if (nx_.shapeZYX != ny_.shapeZYX) {
             throw std::runtime_error("Lasagna nx and ny channels must have matching spatial shapes");
@@ -775,7 +794,7 @@ public:
 
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleChannel(gradMag_, cache_, volumePoint);
+        const auto gradMag = sampleChannel(gradMag_, *cache_, volumePoint);
         if (!gradMag.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"};
         }
@@ -783,7 +802,7 @@ public:
             return {{0.0, 0.0, 0.0}, false, "Lasagna grad_mag sample is zero"};
         }
 
-        const auto normal = sampleNormalTensor(nx_, ny_, cache_, volumePoint);
+        const auto normal = sampleNormalTensor(nx_, ny_, *cache_, volumePoint);
         if (!normal.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"};
         }
@@ -795,7 +814,7 @@ public:
 
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleChannel(gradMag_, cache_, volumePoint);
+        const auto gradMag = sampleChannel(gradMag_, *cache_, volumePoint);
         if (!gradMag.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"},
                     cv::Matx33d::zeros(),
@@ -807,7 +826,7 @@ public:
                     false};
         }
 
-        const auto normal = sampleNormalTensor(nx_, ny_, cache_, volumePoint);
+        const auto normal = sampleNormalTensor(nx_, ny_, *cache_, volumePoint);
         if (!normal.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"},
                     cv::Matx33d::zeros(),
@@ -821,10 +840,12 @@ public:
         return {{*normal, true, {}}, cv::Matx33d::zeros(), false};
     }
 
-    void prefetchNormalSamples(const std::vector<cv::Vec3d>& volumePoints, bool withDerivative) const
+    [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool withDerivative) const
     {
         if (volumePoints.empty()) {
-            return;
+            return {};
         }
 
         std::vector<ChunkKey> gradMagKeys;
@@ -847,18 +868,26 @@ public:
             8);
 
         auto gradMagPrefetch = std::async(std::launch::async, [&]() {
-            cache_.prefetch(gradMag_, *gradMag_.array, gradMagKeys, workers);
+            return cache_->prefetch(gradMag_, *gradMag_.array, gradMagKeys, workers);
         });
         auto nxPrefetch = std::async(std::launch::async, [&]() {
-            cache_.prefetch(nx_, *nx_.array, nxKeys, workers);
+            return cache_->prefetch(nx_, *nx_.array, nxKeys, workers);
         });
         auto nyPrefetch = std::async(std::launch::async, [&]() {
-            cache_.prefetch(ny_, *ny_.array, nyKeys, workers);
+            return cache_->prefetch(ny_, *ny_.array, nyKeys, workers);
         });
-        gradMagPrefetch.get();
-        nxPrefetch.get();
-        nyPrefetch.get();
+        NormalPrefetchReport report;
+        const NormalPrefetchReport gradMagReport = gradMagPrefetch.get();
+        const NormalPrefetchReport nxReport = nxPrefetch.get();
+        const NormalPrefetchReport nyReport = nyPrefetch.get();
+        report.requestedChunks = gradMagReport.requestedChunks +
+                                 nxReport.requestedChunks +
+                                 nyReport.requestedChunks;
+        report.chunksRead = gradMagReport.chunksRead +
+                            nxReport.chunksRead +
+                            nyReport.chunksRead;
         (void)withDerivative;
+        return report;
     }
 
 private:
@@ -866,7 +895,7 @@ private:
     ChannelBinding ny_;
     ChannelBinding gradMag_;
     LasagnaNormalSamplerOptions options_;
-    ChunkCache cache_;
+    std::shared_ptr<ChunkCache> cache_;
 };
 
 LasagnaNormalSampler::LasagnaNormalSampler(
@@ -893,11 +922,11 @@ NormalSampleWithDerivative LasagnaNormalSampler::sampleNormalWithDerivative(
     return impl_->sampleNormalWithDerivative(volumePoint);
 }
 
-void LasagnaNormalSampler::prefetchNormalSamples(
+NormalPrefetchReport LasagnaNormalSampler::prefetchNormalSamples(
     const std::vector<cv::Vec3d>& volumePoints,
     bool withDerivative) const
 {
-    impl_->prefetchNormalSamples(volumePoints, withDerivative);
+    return impl_->prefetchNormalSamples(volumePoints, withDerivative);
 }
 
 } // namespace vc::lasagna

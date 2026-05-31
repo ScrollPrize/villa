@@ -46,6 +46,8 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string surfaceName;
     std::string selectedDatasetLocation;
     fs::path selectedManifestPath;
+    std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
+    std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
     TaskState taskState = TaskState::Idle;
     cv::Vec3d seedPoint{0.0, 0.0, 0.0};
     std::string sourceAnnotationSurfaceName;
@@ -110,11 +112,35 @@ void validateLasagnaManifest(const fs::path& manifestPath)
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
 }
 
+LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
+    fs::path manifestPath,
+    std::vector<vc::lasagna::LineControlPoint> controlPoints,
+    cv::Vec3d sourceSliceNormal,
+    LineAnnotationController::InitialDirectionMode directionMode,
+    const vc::lasagna::NormalSampler& sampler);
+
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     fs::path manifestPath,
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode)
+{
+    vc::lasagna::LasagnaDataset dataset =
+        vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    return optimizeLineWithSampler(std::move(manifestPath),
+                                   std::move(controlPoints),
+                                   sourceSliceNormal,
+                                   directionMode,
+                                   sampler);
+}
+
+LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
+    fs::path manifestPath,
+    std::vector<vc::lasagna::LineControlPoint> controlPoints,
+    cv::Vec3d sourceSliceNormal,
+    LineAnnotationController::InitialDirectionMode directionMode,
+    const vc::lasagna::NormalSampler& sampler)
 {
     LineAnnotationController::OptimizationTaskResult task;
     task.manifestPath = std::move(manifestPath);
@@ -132,9 +158,6 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     task.sourceSliceNormal = sourceSliceNormal;
     task.initialDirectionMode = directionMode;
     try {
-        vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(task.manifestPath);
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
         vc::lasagna::LineOptimizer optimizer(sampler);
         vc::lasagna::LineOptimizationConfig config;
         config.segmentsPerSide = 200;
@@ -428,19 +451,29 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         selected = *picked;
         manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
-            validateLasagnaManifest(manifestPath);
+            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                vc::lasagna::LasagnaDataset::open(manifestPath));
+            auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+            session.dataset = std::move(dataset);
+            session.normalSampler = std::move(sampler);
         } catch (const std::exception& ex) {
             showError(tr("Invalid Lasagna dataset: %1").arg(QString::fromStdString(ex.what())));
             return false;
         }
         vpkg->setSelectedLasagnaDataset(selected);
     } else {
-        try {
-            validateLasagnaManifest(manifestPath);
-        } catch (const std::exception& ex) {
-            showError(tr("Invalid selected Lasagna dataset: %1")
-                          .arg(QString::fromStdString(ex.what())));
-            return false;
+        if (!session.normalSampler || session.selectedManifestPath != manifestPath) {
+            try {
+                auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                    vc::lasagna::LasagnaDataset::open(manifestPath));
+                auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+                session.dataset = std::move(dataset);
+                session.normalSampler = std::move(sampler);
+            } catch (const std::exception& ex) {
+                showError(tr("Invalid selected Lasagna dataset: %1")
+                              .arg(QString::fromStdString(ex.what())));
+                return false;
+            }
         }
     }
 
@@ -483,9 +516,25 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session)
     auto controlPoints = session.controlPoints;
     const cv::Vec3d sourceSliceNormal = session.sourceSliceNormal;
     const InitialDirectionMode directionMode = session.initialDirectionMode;
-    watcher->setFuture(QtConcurrent::run([factory, manifestPath, controlPoints, sourceSliceNormal, directionMode]() mutable {
+    auto dataset = session.dataset;
+    auto normalSampler = session.normalSampler;
+    watcher->setFuture(QtConcurrent::run([factory,
+                                           manifestPath,
+                                           controlPoints,
+                                           sourceSliceNormal,
+                                           directionMode,
+                                           dataset,
+                                           normalSampler]() mutable {
         if (factory) {
             return factory(manifestPath, std::move(controlPoints), sourceSliceNormal, directionMode);
+        }
+        if (normalSampler) {
+            (void)dataset;
+            return optimizeLineWithSampler(manifestPath,
+                                           std::move(controlPoints),
+                                           sourceSliceNormal,
+                                           directionMode,
+                                           *normalSampler);
         }
         return optimizeLineFromManifest(manifestPath, std::move(controlPoints), sourceSliceNormal, directionMode);
     }));

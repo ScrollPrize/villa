@@ -2,6 +2,7 @@
 
 #include "vc/lasagna/LineModel.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -34,8 +35,11 @@ struct LineOptimizationReport {
     int invalidNormalSamples = 0;
     bool converged = false;
     int normalPrefetchCalls = 0;
+    double ceresSolveMs = 0.0;
     double normalChunkPrefetchMs = 0.0;
     double normalMaterializeMs = 0.0;
+    uint64_t normalPrefetchRequestedChunks = 0;
+    uint64_t normalPrefetchChunksRead = 0;
     std::string message;
     std::vector<LineOptimizationLossReport> finalLosses;
     std::vector<LineOptimizationIterationReport> iterationProgress;
