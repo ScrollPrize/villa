@@ -58,6 +58,17 @@ bool finitePoint(const cv::Vec3f& point)
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 }
 
+cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
+{
+    const float n = cv::norm(vector);
+    if (!finitePoint(vector) || n <= 1.0e-6f) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+    }
+    return vector * (1.0f / n);
+}
+
 bool finiteScenePoint(const QPointF& point)
 {
     return std::isfinite(point.x()) && std::isfinite(point.y());
@@ -921,8 +932,7 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) con
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    cv::normalize(tangent, tangent);
-    return tangent;
+    return normalizedOrNan(tangent);
 }
 
 cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const
@@ -959,8 +969,7 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    cv::normalize(up, up);
-    return up;
+    return normalizedOrNan(up);
 }
 
 bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePosition) const

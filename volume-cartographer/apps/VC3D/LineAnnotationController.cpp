@@ -199,7 +199,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.segmentLength = 32.0;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.005;
+        config.normalStraightnessWeight = 0.0005;
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
@@ -1333,7 +1333,9 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
     }
 
     std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
-    normalSampler->sampleNormalBatch(points, false, samples);
+    const vc::lasagna::NormalBatchReport batchReport =
+        normalSampler->sampleNormalBatch(points, false, samples);
+    (void)batchReport;
     if (samples.size() != points.size()) {
         throw std::runtime_error("Normal sampler returned the wrong number of samples");
     }

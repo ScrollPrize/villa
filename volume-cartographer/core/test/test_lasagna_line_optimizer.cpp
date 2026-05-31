@@ -216,6 +216,57 @@ TEST_CASE("LineOptimizer supports multiple fixed control points")
     CHECK_THROWS_AS(optimizer.optimizeFromSeeds({}), std::invalid_argument);
 }
 
+TEST_CASE("LineOptimizer reoptimizes only a local existing-line window for added controls")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 10.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 20;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 1.0;
+    config.normalStraightnessWeight = 1.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    for (int i = 0; i <= 20; ++i) {
+        config.initialLinePoints.push_back({static_cast<double>(i) * 10.0, 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls;
+    for (int i = 0; i <= 20; i += 2) {
+        controls.push_back({static_cast<double>(i),
+                            config.initialLinePoints[static_cast<size_t>(i)],
+                            i == 10,
+                            -1});
+    }
+    controls[5].volumePoint += cv::Vec3d{0.0, 0.0, 5.0};
+    auto baselineConfig = config;
+    baselineConfig.maxIterations = 0;
+    const auto baseline = optimizer.optimizeFromControlPoints(controls, baselineConfig);
+    const auto result = optimizer.optimizeFromControlPoints(std::move(controls), config);
+
+    REQUIRE(result.line.points.size() == baseline.line.points.size());
+    CHECK(result.report.message.find("control-points-local") != std::string::npos);
+    CHECK(result.report.message.find("control_indices=[2, 8]") != std::string::npos);
+    CHECK(result.line.points[11].position[2] == doctest::Approx(5.0).epsilon(1.0e-9));
+
+    for (int i = 0; i < 4; ++i) {
+        CHECK(norm(result.line.points[static_cast<size_t>(i)].position -
+                   baseline.line.points[static_cast<size_t>(i)].position) ==
+              doctest::Approx(0.0).epsilon(1.0e-12));
+    }
+    for (size_t i = 19; i < result.line.points.size(); ++i) {
+        CHECK(norm(result.line.points[static_cast<size_t>(i)].position -
+                   baseline.line.points[static_cast<size_t>(i)].position) ==
+              doctest::Approx(0.0).epsilon(1.0e-12));
+    }
+}
+
 TEST_CASE("LineOptimizer sanitizes degenerate config values")
 {
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});
