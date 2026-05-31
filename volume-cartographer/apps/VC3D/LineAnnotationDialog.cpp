@@ -351,6 +351,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
     _generatedViews = views;
     _hasGeneratedViews = true;
+    _currentCutFollowsStripMouse = true;
     const double maxLinePosition = static_cast<double>(views.linePoints.size() - 1);
     _currentLinePosition = replacingGeneratedViews
         ? std::clamp(previousCurrentLinePosition, 0.0, maxLinePosition)
@@ -396,6 +397,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    Qt::KeyboardModifiers modifiers,
                    QPointF) {
                 if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                    setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
                                                         _currentLinePosition);
@@ -436,6 +438,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 &CChunkedVolumeViewer::sendMouseMoveVolume,
                 this,
                 [this, viewer](cv::Vec3f, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF scenePoint) {
+                    if (!_currentCutFollowsStripMouse) {
+                        return;
+                    }
                     const double position = linePositionFromStripScene(viewer, scenePoint);
                     if (std::isfinite(position)) {
                         setCurrentLinePosition(position);
@@ -454,6 +459,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     }
                     const double position = linePositionFromStripScene(viewer, scenePoint);
                     if (std::isfinite(position)) {
+                        setCurrentCutFollowsStripMouse(true);
                         setCurrentLinePosition(position);
                         emit generatedControlPointRequested(surfaceName, volumePoint, position);
                     }
@@ -505,6 +511,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                         const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
                         const double linePosition = bottomSliceLinePosition(slot, bottomCount);
+                        setCurrentCutFollowsStripMouse(true);
                         setCurrentLinePosition(linePosition);
                         emit generatedControlPointRequested(surfaceName, volumePoint, linePosition);
                     }
@@ -743,6 +750,11 @@ void LineAnnotationDialog::setCurrentLinePosition(double position)
         _currentCutViewer->renderVisible(true, "line annotation current cut");
     }
     rebuildGeneratedOverlays();
+}
+
+void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
+{
+    _currentCutFollowsStripMouse = follows;
 }
 
 void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
@@ -1004,7 +1016,7 @@ QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* vie
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
 {
     if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
-        recenterBottomSlicesOnCurrentPosition();
+        setCurrentCutFollowsStripMouse(!_currentCutFollowsStripMouse);
         event->accept();
         return;
     }
@@ -1023,7 +1035,7 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
         event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (keyEvent->key() == Qt::Key_Space && keyEvent->modifiers() == Qt::NoModifier) {
-            recenterBottomSlicesOnCurrentPosition();
+            setCurrentCutFollowsStripMouse(!_currentCutFollowsStripMouse);
             keyEvent->accept();
             return true;
         }

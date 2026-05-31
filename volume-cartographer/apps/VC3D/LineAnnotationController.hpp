@@ -50,6 +50,7 @@ public:
     using OptimizationTaskFactory =
         std::function<OptimizationTaskResult(std::filesystem::path,
                                              std::vector<vc::lasagna::LineControlPoint>,
+                                             std::vector<cv::Vec3d>,
                                              cv::Vec3d,
                                              InitialDirectionMode)>;
 
@@ -107,6 +108,7 @@ private:
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
                                                              std::vector<vc::lasagna::LineControlPoint> controlPoints,
+                                                             std::vector<cv::Vec3d> initialLinePoints,
                                                              cv::Vec3d sourceSliceNormal,
                                                              InitialDirectionMode directionMode) const;
     void showError(const QString& message) const;

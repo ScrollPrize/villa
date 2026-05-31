@@ -115,6 +115,7 @@ void validateLasagnaManifest(const fs::path& manifestPath)
 LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     fs::path manifestPath,
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
+    std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
     const vc::lasagna::NormalSampler& sampler);
@@ -122,6 +123,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     fs::path manifestPath,
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
+    std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode)
 {
@@ -130,6 +132,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
     return optimizeLineWithSampler(std::move(manifestPath),
                                    std::move(controlPoints),
+                                   std::move(initialLinePoints),
                                    sourceSliceNormal,
                                    directionMode,
                                    sampler);
@@ -138,6 +141,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
 LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     fs::path manifestPath,
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
+    std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
     const vc::lasagna::NormalSampler& sampler)
@@ -164,8 +168,9 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.segmentLength = 32.0;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.00005;
+        config.normalStraightnessWeight = 0.005;
         config.samplesPerSegment = 1;
+        config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
         config.initialTangent = initialTangentForMode(
             directionMode,
@@ -177,6 +182,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.tangentGuideMode = directionMode == LineAnnotationController::InitialDirectionMode::ZInOut
             ? vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane
             : vc::lasagna::LineOptimizationConfig::TangentGuideMode::CrossVectorWithNormal;
+        config.initialLinePoints = std::move(initialLinePoints);
         task.result = optimizer.optimizeFromControlPoints(task.controlPoints, config);
         task.ok = true;
     } catch (const std::exception& ex) {
@@ -204,10 +210,12 @@ LineAnnotationController::LineAnnotationController(CState* state,
     })
     , _optimizationTaskFactory([](fs::path manifestPath,
                                   std::vector<vc::lasagna::LineControlPoint> controlPoints,
+                                  std::vector<cv::Vec3d> initialLinePoints,
                                   cv::Vec3d sourceSliceNormal,
                                   InitialDirectionMode directionMode) {
         return optimizeLineFromManifest(std::move(manifestPath),
                                         std::move(controlPoints),
+                                        std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode);
     })
@@ -514,6 +522,11 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session)
     const auto manifestPath = session.selectedManifestPath;
     auto factory = _optimizationTaskFactory;
     auto controlPoints = session.controlPoints;
+    std::vector<cv::Vec3d> initialLinePoints;
+    initialLinePoints.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points) {
+        initialLinePoints.push_back(point.position);
+    }
     const cv::Vec3d sourceSliceNormal = session.sourceSliceNormal;
     const InitialDirectionMode directionMode = session.initialDirectionMode;
     auto dataset = session.dataset;
@@ -521,22 +534,32 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session)
     watcher->setFuture(QtConcurrent::run([factory,
                                            manifestPath,
                                            controlPoints,
+                                           initialLinePoints,
                                            sourceSliceNormal,
                                            directionMode,
                                            dataset,
                                            normalSampler]() mutable {
         if (factory) {
-            return factory(manifestPath, std::move(controlPoints), sourceSliceNormal, directionMode);
+            return factory(manifestPath,
+                           std::move(controlPoints),
+                           std::move(initialLinePoints),
+                           sourceSliceNormal,
+                           directionMode);
         }
         if (normalSampler) {
             (void)dataset;
             return optimizeLineWithSampler(manifestPath,
                                            std::move(controlPoints),
+                                           std::move(initialLinePoints),
                                            sourceSliceNormal,
                                            directionMode,
                                            *normalSampler);
         }
-        return optimizeLineFromManifest(manifestPath, std::move(controlPoints), sourceSliceNormal, directionMode);
+        return optimizeLineFromManifest(manifestPath,
+                                        std::move(controlPoints),
+                                        std::move(initialLinePoints),
+                                        sourceSliceNormal,
+                                        directionMode);
     }));
 }
 
@@ -969,17 +992,20 @@ std::optional<std::string> LineAnnotationController::pickDataset(
 LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOptimizationTask(
     fs::path manifestPath,
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
+    std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     InitialDirectionMode directionMode) const
 {
     if (_optimizationTaskFactory) {
         return _optimizationTaskFactory(std::move(manifestPath),
                                         std::move(controlPoints),
+                                        std::move(initialLinePoints),
                                         sourceSliceNormal,
                                         directionMode);
     }
     return optimizeLineFromManifest(std::move(manifestPath),
                                     std::move(controlPoints),
+                                    std::move(initialLinePoints),
                                     sourceSliceNormal,
                                     directionMode);
 }

@@ -345,8 +345,9 @@ int main(int argc, char** argv)
         config.segmentLength = 32.0;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.00005;
+        config.normalStraightnessWeight = 0.005;
         config.samplesPerSegment = 1;
+        config.maxIterations = 1000;
         config.differentiableNormalSampling = differentiableNormalSampling;
         config.initialTangent = initialZInOutTangent(sourceSliceNormal, seedNormal);
         config.useInitialTangent = finiteDirection(config.initialTangent);

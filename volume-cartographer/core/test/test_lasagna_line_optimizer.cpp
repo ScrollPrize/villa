@@ -205,7 +205,7 @@ TEST_CASE("LineOptimizer supports multiple fixed control points")
     CHECK(result.line.points[4].position[2] == doctest::Approx(0.0).epsilon(1.0e-9));
 
     CHECK(lossByName(result.report, "step_distance").residuals == 2);
-    CHECK(lossByName(result.report, "even_step").residuals == 2);
+    CHECK(lossByName(result.report, "even_step").residuals == 0);
     CHECK(lossByName(result.report, "tangent_straightness").residuals > 0);
     CHECK(lossByName(result.report, "normal_straightness").residuals > 0);
     CHECK(lossByName(result.report, "initial_direction").residuals == 0);

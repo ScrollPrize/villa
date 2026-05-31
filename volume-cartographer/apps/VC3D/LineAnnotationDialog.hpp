@@ -123,6 +123,7 @@ private:
                                const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
     void setCurrentLinePosition(double position);
+    void setCurrentCutFollowsStripMouse(bool follows);
     void recenterBottomSlicesOnCurrentPosition();
     double snappedControlPointPosition(double position) const;
     void rebuildGeneratedOverlays();
@@ -158,4 +159,5 @@ private:
     bool _hasGeneratedViews = false;
     double _currentLinePosition = 0.0;
     double _bottomCenterPosition = 0.0;
+    bool _currentCutFollowsStripMouse = true;
 };

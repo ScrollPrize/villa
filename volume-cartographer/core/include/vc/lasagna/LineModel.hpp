@@ -140,6 +140,9 @@ struct LineOptimizationConfig {
     LinearSolver linearSolver = LinearSolver::SparseNormalCholesky;
     int numThreads = 1;
     bool printSolverProgress = true;
+    // Optional previous line used to initialize control-point reoptimization.
+    // Indices correspond to line positions.
+    std::vector<cv::Vec3d> initialLinePoints;
 };
 
 } // namespace vc::lasagna
