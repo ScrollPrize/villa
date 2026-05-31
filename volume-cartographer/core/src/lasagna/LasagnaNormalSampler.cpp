@@ -45,6 +45,14 @@ constexpr double kEpsilon = 1.0e-12;
     return (raw - 128.0) / 127.0;
 }
 
+[[nodiscard]] cv::Vec3d decodedNormalFromRaw(double rawNx, double rawNy)
+{
+    const double nx = decodeNormalComponent(rawNx);
+    const double ny = decodeNormalComponent(rawNy);
+    const double nzSq = std::max(0.0, 1.0 - nx * nx - ny * ny);
+    return normalizedOrZero({nx, ny, std::sqrt(nzSq)});
+}
+
 [[nodiscard]] std::string indicesToString(const std::vector<size_t>& indices)
 {
     std::ostringstream out;
@@ -59,11 +67,12 @@ constexpr double kEpsilon = 1.0e-12;
 
 struct ChunkKey {
     std::filesystem::path path;
+    size_t channelIndex = 0;
     std::vector<size_t> indices;
 
     [[nodiscard]] bool operator==(const ChunkKey& other) const noexcept
     {
-        return path == other.path && indices == other.indices;
+        return path == other.path && channelIndex == other.channelIndex && indices == other.indices;
     }
 };
 
@@ -71,6 +80,7 @@ struct ChunkKeyHash {
     [[nodiscard]] size_t operator()(const ChunkKey& key) const noexcept
     {
         size_t hash = std::filesystem::hash_value(key.path);
+        hash ^= key.channelIndex + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
         for (const size_t index : key.indices) {
             hash ^= index + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
         }
@@ -122,7 +132,7 @@ struct ChannelBinding {
     size_t y,
     size_t x)
 {
-    return {binding.path, chunkIndicesForVoxel(binding, z, y, x)};
+    return {binding.path, binding.channelIndex, chunkIndicesForVoxel(binding, z, y, x)};
 }
 
 [[nodiscard]] size_t originalChunkOffset(
@@ -206,7 +216,7 @@ struct ChannelBinding {
                         static_cast<size_t>(nx),
                     };
                 }
-                ChunkKey neighborKey{binding.path, std::move(indices)};
+                ChunkKey neighborKey{binding.path, binding.channelIndex, std::move(indices)};
                 sourceChunks.emplace(neighborKey, array.read_chunk(neighborKey.indices));
             }
         }
@@ -599,26 +609,74 @@ void appendInterpolationChunkKeys(
     return c0 * (1.0 - fz) + c1 * fz;
 }
 
-struct ChannelSampleWithGradient {
-    double value = 0.0;
-    cv::Vec3d dValueDVolume{0.0, 0.0, 0.0};
-};
+[[nodiscard]] cv::Vec3d tensorTimesVector(const cv::Matx33d& tensor, const cv::Vec3d& vector)
+{
+    return {
+        tensor(0, 0) * vector[0] + tensor(0, 1) * vector[1] + tensor(0, 2) * vector[2],
+        tensor(1, 0) * vector[0] + tensor(1, 1) * vector[1] + tensor(1, 2) * vector[2],
+        tensor(2, 0) * vector[0] + tensor(2, 1) * vector[1] + tensor(2, 2) * vector[2],
+    };
+}
 
-[[nodiscard]] std::optional<ChannelSampleWithGradient> sampleChannelWithGradient(
-    const ChannelBinding& binding,
+[[nodiscard]] cv::Vec3d fallbackTensorAxis(const cv::Matx33d& tensor)
+{
+    int axis = 0;
+    double value = tensor(0, 0);
+    if (tensor(1, 1) > value) {
+        axis = 1;
+        value = tensor(1, 1);
+    }
+    if (tensor(2, 2) > value) {
+        axis = 2;
+    }
+    cv::Vec3d result{0.0, 0.0, 0.0};
+    result[axis] = 1.0;
+    return result;
+}
+
+[[nodiscard]] cv::Vec3d principalTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d& hint)
+{
+    cv::Vec3d axis = normalizedOrZero(hint);
+    if (length(axis) <= kEpsilon) {
+        axis = fallbackTensorAxis(tensor);
+    }
+    for (int iteration = 0; iteration < 16; ++iteration) {
+        const cv::Vec3d next = normalizedOrZero(tensorTimesVector(tensor, axis));
+        if (length(next) <= kEpsilon) {
+            break;
+        }
+        axis = next;
+    }
+    if (length(axis) <= kEpsilon) {
+        return {0.0, 0.0, 0.0};
+    }
+    const cv::Vec3d normalizedHint = normalizedOrZero(hint);
+    if (length(normalizedHint) > kEpsilon) {
+        if (axis.dot(normalizedHint) < 0.0) {
+            axis *= -1.0;
+        }
+    } else if (axis[2] < 0.0) {
+        axis *= -1.0;
+    }
+    return axis;
+}
+
+[[nodiscard]] std::optional<cv::Vec3d> sampleNormalTensor(
+    const ChannelBinding& nxBinding,
+    const ChannelBinding& nyBinding,
     const ChunkCache& cache,
     const cv::Vec3d& volumePoint)
 {
-    const double x = volumePoint[0] / binding.spacing;
-    const double y = volumePoint[1] / binding.spacing;
-    const double z = volumePoint[2] / binding.spacing;
+    const double x = volumePoint[0] / nxBinding.spacing;
+    const double y = volumePoint[1] / nxBinding.spacing;
+    const double z = volumePoint[2] / nxBinding.spacing;
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
         return std::nullopt;
     }
     if (x < 0.0 || y < 0.0 || z < 0.0 ||
-        x > static_cast<double>(binding.shapeZYX[2] - 1) ||
-        y > static_cast<double>(binding.shapeZYX[1] - 1) ||
-        z > static_cast<double>(binding.shapeZYX[0] - 1)) {
+        x > static_cast<double>(nxBinding.shapeZYX[2] - 1) ||
+        y > static_cast<double>(nxBinding.shapeZYX[1] - 1) ||
+        z > static_cast<double>(nxBinding.shapeZYX[0] - 1)) {
         return std::nullopt;
     }
 
@@ -629,30 +687,74 @@ struct ChannelSampleWithGradient {
     const double fy = y - static_cast<double>(y0);
     const double fz = z - static_cast<double>(z0);
 
-    const auto cube = readInterpolationCube(binding, cache, z0, y0, x0);
-    if (!cube.has_value()) {
+    const auto nxCube = readInterpolationCube(nxBinding, cache, z0, y0, x0);
+    const auto nyCube = readInterpolationCube(nyBinding, cache, z0, y0, x0);
+    if (!nxCube.has_value() || !nyCube.has_value()) {
         return std::nullopt;
     }
 
-    const double c00 = cube->c000 * (1.0 - fx) + cube->c001 * fx;
-    const double c01 = cube->c010 * (1.0 - fx) + cube->c011 * fx;
-    const double c10 = cube->c100 * (1.0 - fx) + cube->c101 * fx;
-    const double c11 = cube->c110 * (1.0 - fx) + cube->c111 * fx;
-    const double c0 = c00 * (1.0 - fy) + c01 * fy;
-    const double c1 = c10 * (1.0 - fy) + c11 * fy;
-
-    const double dcDGridX =
-        ((cube->c001 - cube->c000) * (1.0 - fy) + (cube->c011 - cube->c010) * fy) * (1.0 - fz) +
-        ((cube->c101 - cube->c100) * (1.0 - fy) + (cube->c111 - cube->c110) * fy) * fz;
-    const double dcDGridY =
-        ((c01 - c00) * (1.0 - fz)) +
-        ((c11 - c10) * fz);
-    const double dcDGridZ = c1 - c0;
-
-    return ChannelSampleWithGradient{
-        c0 * (1.0 - fz) + c1 * fz,
-        {dcDGridX / binding.spacing, dcDGridY / binding.spacing, dcDGridZ / binding.spacing},
+    const auto cubeValue = [](const CubeValues& cube, int dz, int dy, int dx) -> double {
+        if (dz == 0 && dy == 0 && dx == 0) {
+            return cube.c000;
+        }
+        if (dz == 0 && dy == 0 && dx == 1) {
+            return cube.c001;
+        }
+        if (dz == 0 && dy == 1 && dx == 0) {
+            return cube.c010;
+        }
+        if (dz == 0 && dy == 1 && dx == 1) {
+            return cube.c011;
+        }
+        if (dz == 1 && dy == 0 && dx == 0) {
+            return cube.c100;
+        }
+        if (dz == 1 && dy == 0 && dx == 1) {
+            return cube.c101;
+        }
+        if (dz == 1 && dy == 1 && dx == 0) {
+            return cube.c110;
+        }
+        return cube.c111;
     };
+
+    cv::Matx33d tensor = cv::Matx33d::zeros();
+    cv::Vec3d hint{0.0, 0.0, 0.0};
+    double totalWeight = 0.0;
+    for (int dz = 0; dz <= 1; ++dz) {
+        const double wz = dz == 0 ? (1.0 - fz) : fz;
+        for (int dy = 0; dy <= 1; ++dy) {
+            const double wy = dy == 0 ? (1.0 - fy) : fy;
+            for (int dx = 0; dx <= 1; ++dx) {
+                const double wx = dx == 0 ? (1.0 - fx) : fx;
+                const double weight = wx * wy * wz;
+                if (weight <= 0.0) {
+                    continue;
+                }
+                const cv::Vec3d normal = decodedNormalFromRaw(
+                    cubeValue(*nxCube, dz, dy, dx),
+                    cubeValue(*nyCube, dz, dy, dx));
+                if (length(normal) <= kEpsilon) {
+                    continue;
+                }
+                for (int row = 0; row < 3; ++row) {
+                    for (int col = 0; col < 3; ++col) {
+                        tensor(row, col) += weight * normal[row] * normal[col];
+                    }
+                }
+                hint += normal * weight;
+                totalWeight += weight;
+            }
+        }
+    }
+    if (totalWeight <= kEpsilon) {
+        return std::nullopt;
+    }
+    const cv::Vec3d normal = principalTensorAxis(tensor, hint);
+    if (length(normal) <= kEpsilon) {
+        return std::nullopt;
+    }
+    return normal;
 }
 
 } // namespace
@@ -681,20 +783,14 @@ public:
             return {{0.0, 0.0, 0.0}, false, "Lasagna grad_mag sample is zero"};
         }
 
-        const auto rawNx = sampleChannel(nx_, cache_, volumePoint);
-        const auto rawNy = sampleChannel(ny_, cache_, volumePoint);
-        if (!rawNx.has_value() || !rawNy.has_value()) {
+        const auto normal = sampleNormalTensor(nx_, ny_, cache_, volumePoint);
+        if (!normal.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"};
         }
-
-        const double nx = decodeNormalComponent(*rawNx);
-        const double ny = decodeNormalComponent(*rawNy);
-        const double nzSq = std::max(0.0, 1.0 - nx * nx - ny * ny);
-        const cv::Vec3d normal = normalizedOrZero({nx, ny, std::sqrt(nzSq)});
-        if (length(normal) <= kEpsilon) {
+        if (length(*normal) <= kEpsilon) {
             return {{0.0, 0.0, 0.0}, false, "degenerate Lasagna normal sample"};
         }
-        return {normal, true, {}};
+        return {*normal, true, {}};
     }
 
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const
@@ -711,42 +807,18 @@ public:
                     false};
         }
 
-        const auto rawNx = sampleChannelWithGradient(nx_, cache_, volumePoint);
-        const auto rawNy = sampleChannelWithGradient(ny_, cache_, volumePoint);
-        if (!rawNx.has_value() || !rawNy.has_value()) {
+        const auto normal = sampleNormalTensor(nx_, ny_, cache_, volumePoint);
+        if (!normal.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"},
                     cv::Matx33d::zeros(),
                     false};
         }
-
-        const double nx = decodeNormalComponent(rawNx->value);
-        const double ny = decodeNormalComponent(rawNy->value);
-        const cv::Vec3d dNx = rawNx->dValueDVolume * (1.0 / 127.0);
-        const cv::Vec3d dNy = rawNy->dValueDVolume * (1.0 / 127.0);
-
-        const double nzSq = std::max(0.0, 1.0 - nx * nx - ny * ny);
-        const double nz = std::sqrt(nzSq);
-        cv::Vec3d dNz{0.0, 0.0, 0.0};
-        if (nz > kEpsilon) {
-            dNz = -(dNx * nx + dNy * ny) * (1.0 / nz);
-        }
-
-        const cv::Vec3d rawNormal{nx, ny, nz};
-        const double normalLength = length(rawNormal);
-        if (normalLength <= kEpsilon) {
+        if (length(*normal) <= kEpsilon) {
             return {{{0.0, 0.0, 0.0}, false, "degenerate Lasagna normal sample"},
                     cv::Matx33d::zeros(),
                     false};
         }
-
-        const cv::Vec3d normal = rawNormal * (1.0 / normalLength);
-        cv::Matx33d dRawDVolume(
-            dNx[0], dNx[1], dNx[2],
-            dNy[0], dNy[1], dNy[2],
-            dNz[0], dNz[1], dNz[2]);
-        cv::Matx33d projection = cv::Matx33d::eye() - normal * normal.t();
-        cv::Matx33d dNormalDVolume = (1.0 / normalLength) * projection * dRawDVolume;
-        return {{normal, true, {}}, dNormalDVolume, true};
+        return {{*normal, true, {}}, cv::Matx33d::zeros(), false};
     }
 
     void prefetchNormalSamples(const std::vector<cv::Vec3d>& volumePoints, bool withDerivative) const

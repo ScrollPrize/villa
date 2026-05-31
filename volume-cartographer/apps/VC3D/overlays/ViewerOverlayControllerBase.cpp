@@ -662,6 +662,17 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                 if constexpr (std::is_same_v<T, PointPrimitive>) {
                     PointGroup& group = groupForPoint(prim);
                     group.path.addEllipse(prim.position, prim.radius, prim.radius);
+                } else if constexpr (std::is_same_v<T, VolumePointPrimitive>) {
+                    PointPrimitive scenePoint;
+                    scenePoint.position = viewer->volumeToScene(prim.position);
+                    scenePoint.radius = prim.radius;
+                    scenePoint.style = prim.style;
+                    if (!std::isfinite(scenePoint.position.x()) ||
+                        !std::isfinite(scenePoint.position.y())) {
+                        return;
+                    }
+                    PointGroup& group = groupForPoint(scenePoint);
+                    group.path.addEllipse(scenePoint.position, scenePoint.radius, scenePoint.radius);
                 } else if constexpr (std::is_same_v<T, CirclePrimitive>) {
                     flushPointGroups();
                     auto* item = new QGraphicsEllipseItem(

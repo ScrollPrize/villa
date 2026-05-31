@@ -137,14 +137,13 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         vc::lasagna::LineOptimizer optimizer(sampler);
         vc::lasagna::LineOptimizationConfig config;
-        config.segmentsPerSide = 100;
-        config.segmentLength = 16.0;
+        config.segmentsPerSide = 200;
+        config.segmentLength = 32.0;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.5;
+        config.normalStraightnessWeight = 0.00005;
         config.samplesPerSegment = 1;
         config.differentiableNormalSampling = true;
-        config.runGlobalOptimization = false;
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,

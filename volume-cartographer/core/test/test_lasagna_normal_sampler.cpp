@@ -129,6 +129,42 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
     fs::remove_all(dir);
 }
 
+TEST_CASE("LasagnaNormalSampler interpolates unoriented normal tensors")
+{
+    const auto dir = tmpDir("tensor_interp");
+    std::vector<uint8_t> gradMag(2 * 2 * 2, 255);
+    std::vector<uint8_t> nx{
+        255, 1,
+        255, 1,
+        255, 1,
+        255, 1,
+    };
+    std::vector<uint8_t> ny(2 * 2 * 2, 128);
+    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &nx);
+    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, &ny);
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    writeText(manifestPath, R"({
+        "version": 2,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+
+    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+    const auto sample = sampler.sampleNormal({0.5, 0.5, 0.5});
+
+    REQUIRE(sample.valid);
+    CHECK(std::abs(sample.normal[0]) == doctest::Approx(1.0).epsilon(1.0e-9));
+    CHECK(sample.normal[1] == doctest::Approx(0.0).epsilon(1.0e-9));
+    CHECK(sample.normal[2] == doctest::Approx(0.0).epsilon(1.0e-9));
+    fs::remove_all(dir);
+}
+
 TEST_CASE("LasagnaNormalSampler requires grad_mag channel")
 {
     const auto dir = tmpDir("missing_grad_mag_channel");

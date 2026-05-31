@@ -113,6 +113,8 @@ private:
     void bindPaneInteractions(const std::string& surfaceName,
                               CChunkedVolumeViewer* viewer,
                               bool seedPlacementEnabled);
+    void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
+    void clearGeneratedOverlayRefreshConnections();
     void setGeneratedOverlay(const std::string& surfaceName,
                              CChunkedVolumeViewer* viewer,
                              const GeneratedOverlay& overlay);
@@ -133,6 +135,7 @@ private:
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
+    double bottomSliceLinePosition(int slot, int bottomCount) const;
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,
                                      double linePosition) const;
@@ -147,6 +150,7 @@ private:
 
     QWidget* _generatedTopWidget = nullptr;
     std::vector<QPointer<QWidget>> _generatedContainers;
+    std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     std::vector<QPointer<CChunkedVolumeViewer>> _bottomSliceViewers;

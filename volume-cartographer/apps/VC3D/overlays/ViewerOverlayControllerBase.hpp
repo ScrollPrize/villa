@@ -52,6 +52,12 @@ public:
         OverlayStyle style{};
     };
 
+    struct VolumePointPrimitive {
+        cv::Vec3f position{0.0f, 0.0f, 0.0f};
+        qreal radius{3.0};
+        OverlayStyle style{};
+    };
+
     struct CirclePrimitive {
         QPointF center;
         qreal radius{3.0};
@@ -125,6 +131,7 @@ public:
     };
 
     using OverlayPrimitive = std::variant<PointPrimitive,
+                                          VolumePointPrimitive,
                                           CirclePrimitive,
                                           LineStripPrimitive,
                                           RectPrimitive,

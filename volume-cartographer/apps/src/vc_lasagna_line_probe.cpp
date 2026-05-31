@@ -41,7 +41,7 @@ bool finiteDirection(const cv::Vec3d& v)
 
 void printUsage(const char* argv0)
 {
-    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--seed=x,y,z]\n"
+    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--trace-init] [--seed=x,y,z]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode.\n";
 }
@@ -159,6 +159,129 @@ bool isSchurSolver(vc::lasagna::LineOptimizationConfig::LinearSolver solver)
            solver == LinearSolver::IterativeSchur;
 }
 
+cv::Vec3d projectDirectionToNormalPlane(const cv::Vec3d& direction,
+                                        const cv::Vec3d& normal)
+{
+    cv::Vec3d projected = direction - normal * direction.dot(normal);
+    projected = normalizedOrZero(projected);
+    const cv::Vec3d normalizedDirection = normalizedOrZero(direction);
+    if (finiteDirection(projected) &&
+        finiteDirection(normalizedDirection) &&
+        projected.dot(normalizedDirection) < 0.0) {
+        projected *= -1.0;
+    }
+    return finiteDirection(projected) ? projected : normalizedDirection;
+}
+
+cv::Vec3d rotateAroundAxis(const cv::Vec3d& vector,
+                           const cv::Vec3d& axis,
+                           double angle)
+{
+    const cv::Vec3d unitAxis = normalizedOrZero(axis);
+    if (!finiteDirection(unitAxis)) {
+        return vector;
+    }
+    const double c = std::cos(angle);
+    const double s = std::sin(angle);
+    return vector * c + unitAxis.cross(vector) * s +
+           unitAxis * (unitAxis.dot(vector) * (1.0 - c));
+}
+
+double angleDegrees(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    const cv::Vec3d an = normalizedOrZero(a);
+    const cv::Vec3d bn = normalizedOrZero(b);
+    if (!finiteDirection(an) || !finiteDirection(bn)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::acos(std::clamp(an.dot(bn), -1.0, 1.0)) * 180.0 / 3.14159265358979323846;
+}
+
+void printInitTraceDirection(const char* label,
+                             int sign,
+                             const cv::Vec3d& seedPoint,
+                             const cv::Vec3d& seedTangent,
+                             const vc::lasagna::NormalSampler& sampler,
+                             const vc::lasagna::LineOptimizationConfig& config)
+{
+    cv::Vec3d point = seedPoint;
+    cv::Vec3d direction = normalizedOrZero(seedTangent) * static_cast<double>(sign);
+    vc::lasagna::NormalSample previousSample = sampler.sampleNormal(point);
+    cv::Vec3d previousNormal = normalizedOrZero(previousSample.normal);
+    if (!previousSample.valid || !finiteDirection(previousNormal)) {
+        previousNormal = {0.0, 0.0, 0.0};
+    }
+
+    std::cout << "Init trace " << label << ":\n"
+              << "step raw_normal_dot flip normal_angle_deg dir_turn_deg pred_to_actual normal_dot step_end[x,y,z]\n";
+    for (int step = 1; step <= config.segmentsPerSide; ++step) {
+        const cv::Vec3d oldDirection = direction;
+        const cv::Vec3d predicted = point + oldDirection * config.segmentLength;
+        const auto sample = sampler.sampleNormal(predicted);
+        cv::Vec3d normal = normalizedOrZero(sample.normal);
+        const bool validNormal = sample.valid && finiteDirection(normal);
+
+        double rawNormalDot = std::numeric_limits<double>::quiet_NaN();
+        bool flipped = false;
+        double normalAngleDeg = 0.0;
+        if (validNormal && finiteDirection(previousNormal)) {
+            rawNormalDot = previousNormal.dot(normal);
+            const auto transportedFor = [&](const cv::Vec3d& candidateNormal) {
+                cv::Vec3d candidateDirection = oldDirection;
+                const cv::Vec3d axis = previousNormal.cross(candidateNormal);
+                const double sinAngle = std::sqrt(axis.dot(axis));
+                const double cosAngle = std::clamp(previousNormal.dot(candidateNormal), -1.0, 1.0);
+                if (sinAngle > kEpsilon) {
+                    candidateDirection = rotateAroundAxis(oldDirection,
+                                                          axis,
+                                                          std::atan2(sinAngle, cosAngle));
+                }
+                return projectDirectionToNormalPlane(candidateDirection, candidateNormal);
+            };
+            const cv::Vec3d sameDirection = transportedFor(normal);
+            const cv::Vec3d flippedNormal = normal * -1.0;
+            const cv::Vec3d flippedDirection = transportedFor(flippedNormal);
+            if (flippedDirection.dot(oldDirection) > sameDirection.dot(oldDirection)) {
+                normal = flippedNormal;
+                direction = flippedDirection;
+                flipped = true;
+            } else {
+                direction = sameDirection;
+            }
+            normalAngleDeg = angleDegrees(previousNormal, normal);
+            previousNormal = normal;
+        } else if (validNormal) {
+            direction = projectDirectionToNormalPlane(direction, normal);
+            previousNormal = normal;
+        }
+
+        const cv::Vec3d next = point + direction * config.segmentLength;
+        const double dirTurnDeg = angleDegrees(oldDirection, direction);
+        const double predToActual = std::sqrt((next - predicted).dot(next - predicted));
+        const double normalDot = validNormal ? direction.dot(normal) : std::numeric_limits<double>::quiet_NaN();
+        std::cout << std::setw(4) << step
+                  << std::setw(15) << rawNormalDot
+                  << std::setw(5) << (flipped ? "yes" : "no")
+                  << std::setw(17) << normalAngleDeg
+                  << std::setw(13) << dirTurnDeg
+                  << std::setw(15) << predToActual
+                  << std::setw(11) << normalDot
+                  << " [" << next[0] << ", " << next[1] << ", " << next[2] << "]\n";
+        point = next;
+    }
+}
+
+void printInitTrace(const cv::Vec3d& seedPoint,
+                    const cv::Vec3d& seedTangent,
+                    const vc::lasagna::NormalSampler& sampler,
+                    const vc::lasagna::LineOptimizationConfig& config)
+{
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(3);
+    printInitTraceDirection("forward", 1, seedPoint, seedTangent, sampler, config);
+    printInitTraceDirection("backward", -1, seedPoint, seedTangent, sampler, config);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -169,6 +292,7 @@ int main(int argc, char** argv)
     }
     bool differentiableNormalSampling = true;
     bool benchmarkSolvers = false;
+    bool traceInit = false;
     cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -176,6 +300,8 @@ int main(int argc, char** argv)
             differentiableNormalSampling = false;
         } else if (arg == "--benchmark-solvers") {
             benchmarkSolvers = true;
+        } else if (arg == "--trace-init") {
+            traceInit = true;
         } else if (arg.rfind("--seed=", 0) == 0) {
             seedPoint = parseSeed(arg.substr(7));
         } else {
@@ -194,14 +320,13 @@ int main(int argc, char** argv)
         const auto seedNormal = sampler.sampleNormal(seedPoint);
 
         vc::lasagna::LineOptimizationConfig config;
-        config.segmentsPerSide = 100;
-        config.segmentLength = 16.0;
+        config.segmentsPerSide = 200;
+        config.segmentLength = 32.0;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.5;
+        config.normalStraightnessWeight = 0.00005;
         config.samplesPerSegment = 1;
         config.differentiableNormalSampling = differentiableNormalSampling;
-        config.runGlobalOptimization = benchmarkSolvers;
         config.initialTangent = initialZInOutTangent(sourceSliceNormal, seedNormal);
         config.useInitialTangent = finiteDirection(config.initialTangent);
         config.tangentGuideVector = normalizedOrZero(sourceSliceNormal);
@@ -220,6 +345,9 @@ int main(int argc, char** argv)
                   << ", " << config.initialTangent[1]
                   << ", " << config.initialTangent[2] << "]\n";
         std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
+        if (traceInit) {
+            printInitTrace(seedPoint, config.initialTangent, sampler, config);
+        }
 
         if (benchmarkSolvers) {
             using LinearSolver = vc::lasagna::LineOptimizationConfig::LinearSolver;
