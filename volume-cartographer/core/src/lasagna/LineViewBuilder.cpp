@@ -201,22 +201,65 @@ cv::Vec3d sideDirection(const cv::Vec3d& normal, const cv::Vec3d& tangent)
     return {0.0, 1.0, 0.0};
 }
 
+struct LineFrame {
+    cv::Vec3d side;
+    cv::Vec3d meshNormal;
+};
+
+std::vector<LineFrame> buildFrames(const std::vector<SegmentNormalSample>& samples,
+                                   const std::vector<cv::Vec3d>& normals)
+{
+    std::vector<LineFrame> frames;
+    frames.reserve(samples.size());
+
+    cv::Vec3d previousSide{0.0, 0.0, 0.0};
+    cv::Vec3d previousNormal{0.0, 0.0, 0.0};
+    for (size_t row = 0; row < samples.size(); ++row) {
+        const cv::Vec3d tangent = tangentAt(samples, row);
+        const cv::Vec3d sampledNormal = normalizedOrZero(normals[row]);
+
+        cv::Vec3d side = sideDirection(sampledNormal, tangent);
+        if (validDirection(previousSide) && side.dot(previousSide) < 0.0) {
+            side *= -1.0;
+        }
+
+        cv::Vec3d meshNormal = normalizedOrZero(tangent.cross(side));
+        if (!validDirection(meshNormal)) {
+            meshNormal = sampledNormal;
+        }
+        if (!validDirection(meshNormal)) {
+            meshNormal = normalizedOrZero(tangent.cross(sideDirection(axisFallbackLeastAlignedWith(tangent),
+                                                                       tangent)));
+        }
+        if (!validDirection(meshNormal)) {
+            meshNormal = {0.0, 0.0, 1.0};
+        }
+        if (validDirection(sampledNormal) && meshNormal.dot(sampledNormal) < 0.0) {
+            meshNormal *= -1.0;
+            side *= -1.0;
+        }
+        if (validDirection(previousNormal) && meshNormal.dot(previousNormal) < 0.0) {
+            meshNormal *= -1.0;
+            side *= -1.0;
+        }
+
+        previousSide = side;
+        previousNormal = meshNormal;
+        frames.push_back({side, meshNormal});
+    }
+    return frames;
+}
+
 std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>& samples,
-                                         const std::vector<cv::Vec3d>& normals,
                                          const std::vector<double>& offsets,
+                                         const std::vector<LineFrame>& frames,
                                          bool useSide)
 {
     cv::Mat_<cv::Vec3f> points(static_cast<int>(samples.size()),
                                static_cast<int>(offsets.size()));
-    cv::Vec3d previousDirection{0.0, 0.0, 0.0};
     for (int row = 0; row < points.rows; ++row) {
-        const cv::Vec3d tangent = tangentAt(samples, static_cast<size_t>(row));
-        const cv::Vec3d normal = normalizedOrZero(normals[static_cast<size_t>(row)]);
-        cv::Vec3d direction = useSide ? sideDirection(normal, tangent) : normal;
-        if (validDirection(previousDirection) && direction.dot(previousDirection) < 0.0) {
-            direction *= -1.0;
-        }
-        previousDirection = direction;
+        const auto& frame = frames[static_cast<size_t>(row)];
+        const cv::Vec3d direction = useSide ? frame.side : frame.meshNormal;
         for (int col = 0; col < points.cols; ++col) {
             points(row, col) = toVec3f(samples[static_cast<size_t>(row)].position
                                      + direction * offsets[static_cast<size_t>(col)]);
@@ -255,6 +298,7 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
     }
 
     const auto normals = resolvedNormals(samples);
+    const auto frames = buildFrames(samples, normals);
     const double surfaceHalfWidth = resolvedHalfExtent(config.surfaceHalfWidth,
                                                        samples,
                                                        config.crossSamples);
@@ -264,12 +308,12 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
 
     LineViewSurfaces surfaces;
     surfaces.lineSurface = buildRibbon(samples,
-                                       normals,
                                        crossOffsets(surfaceHalfWidth, config.crossSamples),
+                                       frames,
                                        true);
     surfaces.lineSideSlice = buildRibbon(samples,
-                                         normals,
                                          crossOffsets(sideSliceHalfDepth, config.crossSamples),
+                                         frames,
                                          false);
 
     surfaces.lineZSlices.reserve(line.points.size());

@@ -100,6 +100,25 @@ TEST_CASE("LineViewBuilder offsets line-surface along side and side-slice along 
     checkVec(sideSlicePoints(1, 2), {10.0, 0.0, 3.0});
 }
 
+TEST_CASE("LineViewBuilder uses fitted mesh normal for side-slice")
+{
+    vc::lasagna::LineViewConfig config;
+    config.surfaceHalfWidth = 2.0;
+    config.sideSliceHalfDepth = 3.0;
+    config.crossSamples = 3;
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine({1.0, 0.0, 1.0}),
+                                                          config);
+    const auto sideSlicePoints = views.lineSideSlice->rawPoints();
+
+    checkVec(sideSlicePoints(1, 0), {10.0, 0.0, -3.0});
+    checkVec(sideSlicePoints(1, 1), {10.0, 0.0, 0.0});
+    checkVec(sideSlicePoints(1, 2), {10.0, 0.0, 3.0});
+
+    const cv::Vec3f offset = sideSlicePoints(1, 2) - sideSlicePoints(1, 1);
+    CHECK(offset[0] == doctest::Approx(0.0));
+}
+
 TEST_CASE("LineViewBuilder creates one z slice per optimized control point")
 {
     const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
