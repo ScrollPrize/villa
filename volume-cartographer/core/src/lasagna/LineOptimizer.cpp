@@ -26,9 +26,6 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kControlSpanInitPriorWeight = 0.05;
 constexpr int kLocalControlOptimizationSegments = 3;
 constexpr double kMovedControlDistanceThreshold = 1.0e-6;
-constexpr double kCeresFunctionTolerance = 1.0e-10;
-constexpr double kCeresGradientTolerance = 1.0e-12;
-constexpr double kCeresParameterTolerance = 1.0e-10;
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -1161,9 +1158,6 @@ ceres::Solver::Options solverOptions(const LineOptimizationConfig& config, bool 
     options.minimizer_progress_to_stdout = progress;
     options.logging_type = progress ? ceres::PER_MINIMIZER_ITERATION : ceres::SILENT;
     options.num_threads = config.numThreads;
-    options.function_tolerance = kCeresFunctionTolerance;
-    options.gradient_tolerance = kCeresGradientTolerance;
-    options.parameter_tolerance = kCeresParameterTolerance;
     return options;
 }
 
@@ -2245,28 +2239,35 @@ struct LineDifference {
                                      0,
                                      static_cast<int>(controlPoints.size()) - 1);
     const int lastControlIndex = static_cast<int>(controlPoints.size()) - 1;
-    int activeStart = 0;
-    if (changedControlIndex - spanRadius > 0) {
-        const int firstControl = changedControlIndex - spanRadius;
-        activeStart = std::clamp(controlPoints[static_cast<size_t>(firstControl)].optimizedIndex,
-                                 0,
-                                 maxIndex);
+    int leftControl = changedControlIndex;
+    bool includeLeftOpenEnd = false;
+    for (int span = 0; span < spanRadius; ++span) {
+        if (leftControl == 0) {
+            includeLeftOpenEnd = true;
+            break;
+        }
+        --leftControl;
+    }
+    int rightControl = changedControlIndex;
+    bool includeRightOpenEnd = false;
+    for (int span = 0; span < spanRadius; ++span) {
+        if (rightControl == lastControlIndex) {
+            includeRightOpenEnd = true;
+            break;
+        }
+        ++rightControl;
     }
 
-    int activeEnd = maxIndex;
-    if (changedControlIndex + spanRadius < lastControlIndex) {
-        const int lastControl = changedControlIndex + spanRadius;
-        activeEnd = std::clamp(controlPoints[static_cast<size_t>(lastControl)].optimizedIndex,
-                               0,
-                               maxIndex);
-    }
-
-    if (changedControlIndex == 0) {
-        activeStart = 0;
-    }
-    if (changedControlIndex == lastControlIndex) {
-        activeEnd = maxIndex;
-    }
+    int activeStart = includeLeftOpenEnd
+        ? 0
+        : std::clamp(controlPoints[static_cast<size_t>(leftControl)].optimizedIndex,
+                     0,
+                     maxIndex);
+    int activeEnd = includeRightOpenEnd
+        ? maxIndex
+        : std::clamp(controlPoints[static_cast<size_t>(rightControl)].optimizedIndex,
+                     0,
+                     maxIndex);
     if (activeEnd < activeStart) {
         std::swap(activeStart, activeEnd);
     }

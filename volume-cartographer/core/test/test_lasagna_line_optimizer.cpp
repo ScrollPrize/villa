@@ -488,6 +488,37 @@ TEST_CASE("LineOptimizer open-end control update grows a new extension")
     CHECK(update.linePoints[10][1] == doctest::Approx(0.0));
 }
 
+TEST_CASE("LineOptimizer two-control first-control update optimizes both open ends")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 10; ++i) {
+        linePoints.push_back({static_cast<double>(i), 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {3.0, {3.0, 0.0, 0.0}, false, -1},
+        {5.0, linePoints[5], true, 5},
+    };
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 1.0;
+    config.segmentsPerSide = 3;
+
+    const auto update = vc::lasagna::updateExistingLineControlPoint(linePoints,
+                                                                    std::move(controls),
+                                                                    0,
+                                                                    sampler,
+                                                                    config);
+
+    REQUIRE(update.linePoints.size() == linePoints.size());
+    REQUIRE(update.controlPoints.size() == 2);
+    CHECK(update.changedControlIndex == 0);
+    CHECK(update.activeStart == 0);
+    CHECK(update.activeEnd == static_cast<int>(update.linePoints.size()) - 1);
+}
+
 TEST_CASE("LineOptimizer full existing-line solve uses current samples directly")
 {
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});
