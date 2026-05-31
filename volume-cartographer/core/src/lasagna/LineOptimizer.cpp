@@ -2613,6 +2613,11 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     if (fixedPointIndices.empty()) {
         fixedPointIndices.push_back(displayFrameAnchorIndex);
     }
+    std::vector<int> controlAnchorIndices = fixedPointIndices;
+    std::sort(controlAnchorIndices.begin(), controlAnchorIndices.end());
+    controlAnchorIndices.erase(std::unique(controlAnchorIndices.begin(), controlAnchorIndices.end()),
+                               controlAnchorIndices.end());
+
     if (activeStart > 0 || activeEnd < maxIndex) {
         fixedPointIndices.push_back(activeStart);
         fixedPointIndices.push_back(activeEnd);
@@ -2622,19 +2627,18 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
                             fixedPointIndices.end());
 
     std::vector<SegmentSpacingConstraint> spacing(
-        points.size() > 0 ? points.size() - 1 : 0,
+        points.size() - 1,
         SegmentSpacingConstraint{SegmentSpacingMode::None, -1});
-    int spanId = 0;
-    for (size_t i = 0; i + 1 < fixedPointIndices.size(); ++i) {
-        const int left = fixedPointIndices[i];
-        const int right = fixedPointIndices[i + 1];
-        if (right <= left + 1) {
-            continue;
+    if (controlAnchorIndices.empty()) {
+        spacing = fixedStepConstraints(points.size() - 1);
+    } else {
+        const int firstAnchor = controlAnchorIndices.front();
+        const int lastAnchor = controlAnchorIndices.back();
+        for (int segment = 0; segment + 1 < static_cast<int>(points.size()); ++segment) {
+            if (segment < firstAnchor || segment >= lastAnchor) {
+                spacing[static_cast<size_t>(segment)] = {SegmentSpacingMode::FixedStep, -1};
+            }
         }
-        for (int segment = left; segment < right; ++segment) {
-            spacing[static_cast<size_t>(segment)] = {SegmentSpacingMode::EvenStep, spanId};
-        }
-        ++spanId;
     }
 
     const int tangentLeft = std::max(0, displayFrameAnchorIndex - 1);

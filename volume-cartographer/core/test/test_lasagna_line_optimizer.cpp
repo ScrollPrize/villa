@@ -445,6 +445,7 @@ TEST_CASE("LineOptimizer full existing-line solve uses current samples directly"
         {1.0, 0.0, 0.25},
         {2.0, 0.0, 0.0},
         {3.0, 0.0, -0.25},
+        {4.0, 0.0, 0.0},
     };
     const auto result = optimizer.optimizeExistingLine(linePoints,
                                                        {1, 3},
@@ -458,6 +459,8 @@ TEST_CASE("LineOptimizer full existing-line solve uses current samples directly"
     CHECK(result.report.message.find("existing-line+global") != std::string::npos);
     CHECK(result.report.message.find("control-points+global") == std::string::npos);
     CHECK(result.report.message.find("normal-construct") == std::string::npos);
+    CHECK(lossByName(result.report, "step_distance").residuals == 2);
+    CHECK(lossByName(result.report, "even_step").residuals == 0);
     for (size_t i = 0; i < linePoints.size(); ++i) {
         CHECK(norm(result.line.points[i].position - linePoints[i]) == doctest::Approx(0.0));
     }
