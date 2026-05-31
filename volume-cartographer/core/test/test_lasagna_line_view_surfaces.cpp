@@ -134,6 +134,20 @@ TEST_CASE("LineViewBuilder creates one z slice per optimized control point")
     }
 }
 
+TEST_CASE("LineViewBuilder diagnostics flag sampled normal axis jumps")
+{
+    auto line = simpleLine();
+    line.points[0].sampledNormal = normal({0.0, 0.0, 1.0});
+    line.points[1].sampledNormal = normal({0.0, 1.0, 0.0});
+    line.points[2].sampledNormal = normal({0.0, 0.0, 1.0});
+
+    const auto diagnostics = vc::lasagna::diagnoseLineViewFrames(line);
+
+    CHECK(diagnostics.minSampledAxisContinuityDot < 0.5);
+    REQUIRE(!diagnostics.issues.empty());
+    CHECK(diagnostics.issues.front().reason == "sampled_normal_axis_jump");
+}
+
 TEST_CASE("LineViewBuilder uses finite deterministic fallback frames")
 {
     auto line = simpleLine({1.0, 0.0, 0.0});

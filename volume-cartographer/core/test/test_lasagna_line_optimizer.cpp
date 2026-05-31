@@ -229,7 +229,7 @@ TEST_CASE("LineOptimizer handles invalid and zero seed normals with deterministi
     REQUIRE(missingResult.line.points.size() == 3);
     CHECK(missingResult.line.points.front().position[0] == doctest::Approx(3.0));
     CHECK(missingResult.line.points.back().position[0] == doctest::Approx(17.0));
-    CHECK(missingResult.report.invalidNormalSamples == 2 * 5);
+    CHECK(missingResult.report.invalidNormalSamples == 2 * 2);
 
     ConstantNormalSampler zeroSampler({0.0, 0.0, 0.0});
     vc::lasagna::LineOptimizer zeroOptimizer(zeroSampler);
@@ -237,7 +237,7 @@ TEST_CASE("LineOptimizer handles invalid and zero seed normals with deterministi
     REQUIRE(zeroResult.line.points.size() == 3);
     CHECK(zeroResult.line.points.front().position[0] == doctest::Approx(3.0));
     CHECK(zeroResult.line.points.back().position[0] == doctest::Approx(17.0));
-    CHECK(zeroResult.report.invalidNormalSamples == 2 * 5);
+    CHECK(zeroResult.report.invalidNormalSamples == 2 * 2);
 }
 
 TEST_CASE("LineOptimizer accepts an initial tangent constrained to the sampled tangent plane")
@@ -296,6 +296,6 @@ TEST_CASE("LineOptimizer supports zero iterations and single-seed optimizeFromSe
     CHECK(result.line.points[1].position[0] == doctest::Approx(100.0));
     CHECK(result.line.points[1].position[1] == doctest::Approx(200.0));
     CHECK(result.line.points[1].position[2] == doctest::Approx(300.0));
-    CHECK(result.report.validNormalSamples == 2 * 5);
+    CHECK(result.report.validNormalSamples == 2 * 2);
     CHECK(result.report.invalidNormalSamples == 0);
 }

@@ -72,8 +72,8 @@ struct LineOptimizationConfig {
         CGNR,
     };
 
-    int segmentsPerSide = 10;
-    double segmentLength = 50.0;
+    int segmentsPerSide = 100;
+    double segmentLength = 16.0;
     double straightnessWeight = 1.0;
     double normalAlignmentWeight = 1.0;
     double distanceWeight = 1.0;
@@ -83,9 +83,9 @@ struct LineOptimizationConfig {
     TangentGuideMode tangentGuideMode = TangentGuideMode::None;
     cv::Vec3d tangentGuideVector{0.0, 0.0, 0.0};
     double tangentGuideWeight = 1.0;
-    // Number of equal intervals evaluated per segment. A value of 4 stores
-    // endpoints plus 3 intermediate samples, for 5 samples per segment.
-    int samplesPerSegment = 4;
+    // Number of equal intervals evaluated per segment. A value of 1 stores
+    // only segment endpoints, with no interior sub-samples.
+    int samplesPerSegment = 1;
     int maxIterations = 50;
     bool differentiableNormalSampling = false;
     LinearSolver linearSolver = LinearSolver::SparseNormalCholesky;

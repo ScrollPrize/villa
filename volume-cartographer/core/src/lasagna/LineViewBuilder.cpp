@@ -16,6 +16,8 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kRollSmoothness = 4.0;
 constexpr int kRollSmoothIterations = 80;
 constexpr double kMaxFrameRollDelta = 0.78539816339744830962;
+constexpr double kSampledAxisContinuityIssueDot = 0.5;
+constexpr double kMeshToSampledAxisIssueDot = 0.5;
 
 bool finite(const cv::Vec3d& v)
 {
@@ -661,6 +663,10 @@ LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const Lin
             reason = "generated_frame_flip";
         } else if (std::abs(rollDelta) > 1.57079632679489661923) {
             reason = "large_generated_roll_jump";
+        } else if (sampledAxisDot < kSampledAxisContinuityIssueDot) {
+            reason = "sampled_normal_axis_jump";
+        } else if (meshToSampledAxisDot < kMeshToSampledAxisIssueDot) {
+            reason = "mesh_normal_drift_from_sampled_axis";
         }
 
         if (!reason.empty()) {
