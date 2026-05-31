@@ -417,7 +417,10 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return;
         }
-        Logger()->info("Line annotation Lasagna optimization complete: points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={}",
+        Logger()->info("Line annotation Lasagna optimization complete: seed=[{}, {}, {}] points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={}",
+                       session.seedPoint[0],
+                       session.seedPoint[1],
+                       session.seedPoint[2],
                        session.optimizedLine.points.size(),
                        session.optimizationReport.iterations,
                        session.optimizationReport.initialCost,
