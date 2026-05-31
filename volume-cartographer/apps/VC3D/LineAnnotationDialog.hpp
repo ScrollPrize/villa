@@ -104,6 +104,7 @@ signals:
                                         cv::Vec3f volumePoint,
                                         double linePosition);
     void showAsMeshRequested();
+    void fullOptimizationRequested();
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -145,6 +146,7 @@ private:
     QVBoxLayout* _layout = nullptr;
     QComboBox* _initialDirectionCombo = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
+    QPushButton* _fullOptimizationButton = nullptr;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;

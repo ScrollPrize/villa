@@ -120,10 +120,17 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _showAsMeshButton->setEnabled(false);
     _showAsMeshButton->installEventFilter(this);
     buttonLayout->addWidget(_showAsMeshButton);
+    _fullOptimizationButton = new QPushButton(tr("full optimization"), buttonRow);
+    _fullOptimizationButton->setEnabled(false);
+    _fullOptimizationButton->installEventFilter(this);
+    buttonLayout->addWidget(_fullOptimizationButton);
     buttonLayout->addStretch(1);
     _layout->addWidget(buttonRow, 0);
     connect(_showAsMeshButton, &QPushButton::clicked, this, [this]() {
         emit showAsMeshRequested();
+    });
+    connect(_fullOptimizationButton, &QPushButton::clicked, this, [this]() {
+        emit fullOptimizationRequested();
     });
 
     _mdiArea = new QMdiArea(this);
@@ -188,6 +195,9 @@ bool LineAnnotationDialog::setGeneratedRows(
     if (_showAsMeshButton) {
         _showAsMeshButton->setEnabled(false);
     }
+    if (_fullOptimizationButton) {
+        _fullOptimizationButton->setEnabled(false);
+    }
 
     clearGeneratedOverlayRefreshConnections();
     _suppressPaneClosed = true;
@@ -235,6 +245,9 @@ bool LineAnnotationDialog::setGeneratedRows(
     const bool ok = !_panes.empty();
     if (_showAsMeshButton) {
         _showAsMeshButton->setEnabled(ok);
+    }
+    if (_fullOptimizationButton) {
+        _fullOptimizationButton->setEnabled(ok);
     }
     return ok;
 }
@@ -310,6 +323,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
     if (_showAsMeshButton) {
         _showAsMeshButton->setEnabled(false);
+    }
+    if (_fullOptimizationButton) {
+        _fullOptimizationButton->setEnabled(false);
     }
 
     const bool replacingGeneratedViews = _hasGeneratedViews;
@@ -540,6 +556,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     rebuildGeneratedOverlays();
     if (_showAsMeshButton) {
         _showAsMeshButton->setEnabled(true);
+    }
+    if (_fullOptimizationButton) {
+        _fullOptimizationButton->setEnabled(true);
     }
     return true;
 }
@@ -1040,7 +1059,9 @@ void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
 
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
-    if ((watched == _initialDirectionCombo || watched == _showAsMeshButton) &&
+    if ((watched == _initialDirectionCombo ||
+         watched == _showAsMeshButton ||
+         watched == _fullOptimizationButton) &&
         event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (keyEvent->key() == Qt::Key_Space && keyEvent->modifiers() == Qt::NoModifier) {

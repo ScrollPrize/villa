@@ -57,6 +57,20 @@ struct LineControlPoint {
     int optimizedIndex = -1;
 };
 
+struct LineControlPointUpdateResult {
+    std::vector<cv::Vec3d> linePoints;
+    std::vector<LineControlPoint> controlPoints;
+    int changedControlIndex = -1;
+    int activeStart = -1;
+    int activeEnd = -1;
+};
+
+[[nodiscard]] LineControlPointUpdateResult updateExistingLineControlPoint(
+    std::vector<cv::Vec3d> linePoints,
+    std::vector<LineControlPoint> controlPoints,
+    size_t changedControlIndex,
+    double segmentLength);
+
 class LineOptimizer {
 public:
     explicit LineOptimizer(const NormalSampler& normalSampler);
@@ -72,6 +86,15 @@ public:
     [[nodiscard]] LineOptimizationResult optimizeFromControlPoints(
         std::vector<LineControlPoint> controlPoints,
         const LineOptimizationConfig& config = {}) const;
+
+    [[nodiscard]] LineOptimizationResult optimizeExistingLine(
+        std::vector<cv::Vec3d> linePoints,
+        std::vector<int> fixedPointIndices,
+        int displayFrameAnchorIndex,
+        const LineOptimizationConfig& config = {},
+        int activeStart = -1,
+        int activeEnd = -1,
+        std::string candidateName = "existing-line+global") const;
 
 private:
     const NormalSampler& normalSampler_;

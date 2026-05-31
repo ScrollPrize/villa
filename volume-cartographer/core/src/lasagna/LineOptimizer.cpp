@@ -26,6 +26,9 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kControlSpanInitPriorWeight = 0.05;
 constexpr int kLocalControlOptimizationSegments = 3;
 constexpr double kMovedControlDistanceThreshold = 1.0e-6;
+constexpr double kCeresFunctionTolerance = 1.0e-10;
+constexpr double kCeresGradientTolerance = 1.0e-12;
+constexpr double kCeresParameterTolerance = 1.0e-10;
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -1158,6 +1161,9 @@ ceres::Solver::Options solverOptions(const LineOptimizationConfig& config, bool 
     options.minimizer_progress_to_stdout = progress;
     options.logging_type = progress ? ceres::PER_MINIMIZER_ITERATION : ceres::SILENT;
     options.num_threads = config.numThreads;
+    options.function_tolerance = kCeresFunctionTolerance;
+    options.gradient_tolerance = kCeresGradientTolerance;
+    options.parameter_tolerance = kCeresParameterTolerance;
     return options;
 }
 
@@ -1590,6 +1596,68 @@ void growNormalConstructedExtension(
     return static_cast<size_t>(std::distance(linePositions.begin(), it));
 }
 
+[[nodiscard]] bool controlMovedFromInitialLine(const LineControlPoint& control,
+                                               const LineOptimizationConfig& config)
+{
+    const cv::Vec3d base = interpolateInitialLinePoint(config.initialLinePoints, control.linePosition);
+    return length(control.volumePoint - base) > kMovedControlDistanceThreshold;
+}
+
+[[nodiscard]] bool shouldOptimizeControlSpanInitialization(
+    const std::vector<LineControlPoint>& controls,
+    const LineOptimizationConfig& config,
+    size_t controlIndex)
+{
+    if (controlIndex + 1 >= controls.size()) {
+        return false;
+    }
+    return controlMovedFromInitialLine(controls[controlIndex], config) ||
+           controlMovedFromInitialLine(controls[controlIndex + 1], config);
+}
+
+[[nodiscard]] bool solveControlSpanInitializationStage(
+    std::vector<std::array<double, 3>>& localPoints,
+    const std::vector<std::array<double, 3>>* priorPoints,
+    size_t controlIndex,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config)
+{
+    if (localPoints.size() < 3) {
+        return false;
+    }
+
+    ceres::Problem problem;
+    for (auto& point : localPoints) {
+        problem.AddParameterBlock(point.data(), 3);
+    }
+    problem.SetParameterBlockConstant(localPoints.front().data());
+    problem.SetParameterBlockConstant(localPoints.back().data());
+
+    std::vector<SegmentSpacingConstraint> noSpacing(
+        localPoints.size() - 1,
+        SegmentSpacingConstraint{SegmentSpacingMode::None, static_cast<int>(controlIndex)});
+    addResiduals(problem,
+                 localPoints,
+                 noSpacing,
+                 sampler,
+                 config,
+                 0,
+                 {0.0, 0.0, 0.0},
+                 false);
+
+    if (priorPoints != nullptr && priorPoints->size() == localPoints.size()) {
+        for (size_t i = 1; i + 1 < localPoints.size(); ++i) {
+            auto* prior = new ceres::AutoDiffCostFunction<PositionPriorResidual, 3, 3>(
+                new PositionPriorResidual(toVec3d((*priorPoints)[i]), kControlSpanInitPriorWeight));
+            problem.AddResidualBlock(prior, nullptr, localPoints[i].data());
+        }
+    }
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(solverOptions(config, false), &problem, &summary);
+    return summary.IsSolutionUsable();
+}
+
 void optimizeControlSpanInitialization(
     std::vector<std::array<double, 3>>& spanPoints,
     const std::vector<double>& linePositions,
@@ -1602,6 +1670,10 @@ void optimizeControlSpanInitialization(
     }
 
     for (size_t controlIndex = 0; controlIndex + 1 < controls.size(); ++controlIndex) {
+        if (!shouldOptimizeControlSpanInitialization(controls, config, controlIndex)) {
+            continue;
+        }
+
         const std::optional<size_t> startIndex = linePositionIndex(linePositions, controls[controlIndex].linePosition);
         const std::optional<size_t> endIndex = linePositionIndex(linePositions, controls[controlIndex + 1].linePosition);
         if (!startIndex.has_value() || !endIndex.has_value() || *endIndex <= *startIndex) {
@@ -1612,7 +1684,7 @@ void optimizeControlSpanInitialization(
             spanPoints.begin() + static_cast<std::ptrdiff_t>(*startIndex),
             spanPoints.begin() + static_cast<std::ptrdiff_t>(*endIndex + 1));
         const std::vector<std::array<double, 3>> priorPoints = localPoints;
-        if (localPoints.size() < 2) {
+        if (localPoints.size() < 3) {
             continue;
         }
 
@@ -1620,36 +1692,18 @@ void optimizeControlSpanInitialization(
         localConfig.maxIterations = std::min(config.maxIterations, 100);
         localConfig.printSolverProgress = false;
 
-        ceres::Problem problem;
-        for (auto& point : localPoints) {
-            problem.AddParameterBlock(point.data(), 3);
-        }
-        problem.SetParameterBlockConstant(localPoints.front().data());
-        problem.SetParameterBlockConstant(localPoints.back().data());
-
-        std::vector<SegmentSpacingConstraint> noSpacing(
-            localPoints.size() - 1,
-            SegmentSpacingConstraint{SegmentSpacingMode::None, static_cast<int>(controlIndex)});
-        addResiduals(problem,
-                     localPoints,
-                     noSpacing,
-                     sampler,
-                     localConfig,
-                     0,
-                     {0.0, 0.0, 0.0},
-                     false);
-
-        for (size_t i = 1; i + 1 < localPoints.size(); ++i) {
-            auto* prior = new ceres::AutoDiffCostFunction<PositionPriorResidual, 3, 3>(
-                new PositionPriorResidual(toVec3d(priorPoints[i]), kControlSpanInitPriorWeight));
-            problem.AddResidualBlock(prior, nullptr, localPoints[i].data());
-        }
-
-        ceres::Solver::Summary summary;
-        ceres::Solve(solverOptions(localConfig, false), &problem, &summary);
-        if (!summary.IsSolutionUsable()) {
+        if (!solveControlSpanInitializationStage(localPoints,
+                                                 &priorPoints,
+                                                 controlIndex,
+                                                 sampler,
+                                                 localConfig)) {
             continue;
         }
+        (void)solveControlSpanInitializationStage(localPoints,
+                                                 nullptr,
+                                                 controlIndex,
+                                                 sampler,
+                                                 localConfig);
         std::copy(localPoints.begin(),
                   localPoints.end(),
                   spanPoints.begin() + static_cast<std::ptrdiff_t>(*startIndex));
@@ -1676,24 +1730,18 @@ void optimizeControlSpanInitialization(
     growNormalConstructedExtension(lastPoint, lastPoint - beforeLastPoint, sampler, config, forward);
 
     const double firstLinePosition = controlPoints.front().linePosition;
-    const double lastLinePosition = controlPoints.back().linePosition;
     std::vector<double> linePositions;
     linePositions.reserve(config.initialLinePoints.size() + controlPoints.size());
-    const int firstInteger = static_cast<int>(std::ceil(firstLinePosition));
-    const int lastInteger = static_cast<int>(std::floor(lastLinePosition));
-    for (int position = firstInteger; position <= lastInteger; ++position) {
-        linePositions.push_back(static_cast<double>(position));
+    linePositions.push_back(firstLinePosition);
+    for (size_t controlIndex = 0; controlIndex + 1 < controlPoints.size(); ++controlIndex) {
+        const double a = controlPoints[controlIndex].linePosition;
+        const double b = controlPoints[controlIndex + 1].linePosition;
+        const int segments = std::max(1, static_cast<int>(std::llround(std::abs(b - a))));
+        for (int segment = 1; segment <= segments; ++segment) {
+            const double t = static_cast<double>(segment) / static_cast<double>(segments);
+            linePositions.push_back(a * (1.0 - t) + b * t);
+        }
     }
-    for (const auto& control : controlPoints) {
-        linePositions.push_back(control.linePosition);
-    }
-    std::sort(linePositions.begin(), linePositions.end());
-    linePositions.erase(std::unique(linePositions.begin(),
-                                    linePositions.end(),
-                                    [](double a, double b) {
-                                        return std::abs(a - b) <= 1.0e-6;
-                                    }),
-                        linePositions.end());
 
     ControlPointInitialization init;
     init.controlPoints = std::move(controlPoints);
@@ -2179,355 +2227,200 @@ struct LineDifference {
     return positions;
 }
 
-[[nodiscard]] std::optional<LineOptimizationResult> optimizeLocalExistingLineUpdate(
+} // namespace
+
+LineControlPointUpdateResult updateExistingLineControlPoint(
+    std::vector<cv::Vec3d> linePoints,
     std::vector<LineControlPoint> controlPoints,
-    const NormalSampler& sampler,
-    const LineOptimizationConfig& config)
+    size_t changedControlIndex,
+    double segmentLength)
 {
-    if (!canInitializeFromExistingLine(controlPoints, config)) {
-        return std::nullopt;
+    if (linePoints.size() < 2) {
+        throw std::invalid_argument("Existing line update requires at least two samples");
+    }
+    if (changedControlIndex >= controlPoints.size()) {
+        throw std::invalid_argument("Changed control index is out of range");
     }
 
-    std::stable_sort(controlPoints.begin(),
-                     controlPoints.end(),
-                     [](const LineControlPoint& a, const LineControlPoint& b) {
-                         return a.linePosition < b.linePosition;
+    segmentLength = std::max(kEpsilon, segmentLength);
+    const LineControlPoint changedBeforeSort = controlPoints[changedControlIndex];
+    std::vector<std::pair<LineControlPoint, bool>> taggedControls;
+    taggedControls.reserve(controlPoints.size());
+    for (size_t i = 0; i < controlPoints.size(); ++i) {
+        taggedControls.push_back({controlPoints[i], i == changedControlIndex});
+    }
+    std::stable_sort(taggedControls.begin(),
+                     taggedControls.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.first.linePosition < b.first.linePosition;
                      });
 
-    std::vector<LineControlPoint> movedControls;
-    for (const auto& control : controlPoints) {
-        const cv::Vec3d base = interpolateInitialLinePoint(config.initialLinePoints,
-                                                           control.linePosition);
-        if (length(control.volumePoint - base) > kMovedControlDistanceThreshold) {
-            movedControls.push_back(control);
+    int changedSortedIndex = -1;
+    controlPoints.clear();
+    controlPoints.reserve(taggedControls.size());
+    for (size_t i = 0; i < taggedControls.size(); ++i) {
+        taggedControls[i].first.linePosition = std::clamp(
+            taggedControls[i].first.linePosition,
+            0.0,
+            static_cast<double>(linePoints.size() - 1));
+        if (taggedControls[i].second) {
+            changedSortedIndex = static_cast<int>(i);
         }
+        controlPoints.push_back(taggedControls[i].first);
     }
-    if (movedControls.empty()) {
-        std::vector<std::array<double, 3>> points;
-        points.reserve(config.initialLinePoints.size());
-        for (const auto& point : config.initialLinePoints) {
-            points.push_back(toArray(point));
-        }
+    if (changedSortedIndex < 0) {
+        throw std::invalid_argument("Changed control point was not found after sorting");
+    }
+    (void)changedBeforeSort;
 
-        int finalValidSamples = 0;
-        int finalInvalidSamples = 0;
-        auto finalSamples = sampleSegments(points,
-                                           sampler,
-                                           config.samplesPerSegment,
-                                           &finalValidSamples,
-                                           &finalInvalidSamples);
-        std::vector<SegmentSpacingConstraint> noSpacing(
-            points.size() > 0 ? points.size() - 1 : 0,
-            SegmentSpacingConstraint{SegmentSpacingMode::None, -1});
-        const int seedIndex = [&]() {
-            for (const auto& control : controlPoints) {
-                if (control.isSeed) {
-                    const int index = nearestPointIndex(points, control.volumePoint);
-                    return index < 0 ? static_cast<int>(points.size() / 2) : index;
-                }
+    const auto controlDelta = [&](const LineControlPoint& control) {
+        return control.volumePoint - interpolateInitialLinePoint(linePoints, control.linePosition);
+    };
+    const auto resampleSpan = [&](const LineControlPoint& left,
+                                  const LineControlPoint& right) {
+        const double leftPosition = left.linePosition;
+        const double rightPosition = right.linePosition;
+        std::vector<double> positions;
+        positions.push_back(leftPosition);
+        const int firstInteger = static_cast<int>(std::floor(leftPosition)) + 1;
+        const int lastInteger = static_cast<int>(std::ceil(rightPosition)) - 1;
+        for (int position = firstInteger; position <= lastInteger; ++position) {
+            if (position > leftPosition + kEpsilon &&
+                position < rightPosition - kEpsilon) {
+                positions.push_back(static_cast<double>(position));
             }
-            return static_cast<int>(points.size() / 2);
-        }();
-        const cv::Vec3d seedTangent = points.size() >= 2
-            ? normalizedOrZero(toVec3d(points[std::min<size_t>(points.size() - 1,
-                                                               static_cast<size_t>(std::max(1, seedIndex)))]) -
-                               toVec3d(points[static_cast<size_t>(std::max(0, seedIndex - 1))]))
-            : cv::Vec3d{1.0, 0.0, 0.0};
-        auto losses = evaluateLosses(points,
-                                     noSpacing,
-                                     sampler,
-                                     config,
-                                     seedIndex,
-                                     seedTangent,
-                                     false);
+        }
+        positions.push_back(rightPosition);
+        positions = uniqueSortedPositions(std::move(positions));
 
-        LineOptimizationResult result;
-        result.line = buildLineModel(points,
-                                     sampler,
-                                     std::move(finalSamples),
-                                     seedIndex);
-        result.report.initialCost = totalWeightedCost(losses);
-        result.report.finalCost = result.report.initialCost;
-        result.report.iterations = 0;
-        result.report.validNormalSamples = finalValidSamples;
-        result.report.invalidNormalSamples = finalInvalidSamples;
-        result.report.converged = true;
-        result.report.message =
-            "Line annotation Lasagna selected candidate:\n"
-            "candidate                   ms  iters    init_cost   final_cost\n"
-            "control-point-local-unchanged";
-        result.report.finalLosses = std::move(losses);
-        return result;
+        const cv::Vec3d leftDelta = controlDelta(left);
+        const cv::Vec3d rightDelta = controlDelta(right);
+        std::vector<cv::Vec3d> provisional;
+        provisional.reserve(positions.size());
+        for (const double position : positions) {
+            const double denom = rightPosition - leftPosition;
+            const double t = std::abs(denom) <= kEpsilon
+                ? 0.0
+                : std::clamp((position - leftPosition) / denom, 0.0, 1.0);
+            provisional.push_back(interpolateInitialLinePoint(linePoints, position) +
+                                  lerp(leftDelta, rightDelta, t));
+        }
+
+        double spanLength = 0.0;
+        for (size_t i = 0; i + 1 < provisional.size(); ++i) {
+            spanLength += length(provisional[i + 1] - provisional[i]);
+        }
+        const int segments = std::max(1, static_cast<int>(std::llround(spanLength / segmentLength)));
+        std::vector<cv::Vec3d> resampled;
+        resampled.reserve(static_cast<size_t>(segments + 1));
+        if (spanLength <= kEpsilon || provisional.size() < 2) {
+            for (int segment = 0; segment <= segments; ++segment) {
+                const double t = static_cast<double>(segment) / static_cast<double>(segments);
+                resampled.push_back(lerp(left.volumePoint, right.volumePoint, t));
+            }
+            return resampled;
+        }
+
+        std::vector<double> cumulative(provisional.size(), 0.0);
+        for (size_t i = 1; i < provisional.size(); ++i) {
+            cumulative[i] = cumulative[i - 1] + length(provisional[i] - provisional[i - 1]);
+        }
+        for (int segment = 0; segment <= segments; ++segment) {
+            const double target = spanLength * static_cast<double>(segment) /
+                                  static_cast<double>(segments);
+            auto upper = std::lower_bound(cumulative.begin(), cumulative.end(), target);
+            if (upper == cumulative.begin()) {
+                resampled.push_back(provisional.front());
+            } else if (upper == cumulative.end()) {
+                resampled.push_back(provisional.back());
+            } else {
+                const size_t index = static_cast<size_t>(std::distance(cumulative.begin(), upper));
+                const double a = cumulative[index - 1];
+                const double b = cumulative[index];
+                const double t = std::abs(b - a) <= kEpsilon ? 0.0 : (target - a) / (b - a);
+                resampled.push_back(lerp(provisional[index - 1], provisional[index], t));
+            }
+        }
+        resampled.front() = left.volumePoint;
+        resampled.back() = right.volumePoint;
+        return resampled;
+    };
+
+    const bool hasLeft = changedSortedIndex > 0;
+    const bool hasRight = changedSortedIndex + 1 < static_cast<int>(controlPoints.size());
+    if (!hasLeft && !hasRight) {
+        LineControlPointUpdateResult unchanged;
+        unchanged.linePoints = std::move(linePoints);
+        unchanged.controlPoints = std::move(controlPoints);
+        unchanged.changedControlIndex = changedSortedIndex;
+        unchanged.activeStart = 0;
+        unchanged.activeEnd = static_cast<int>(unchanged.linePoints.size()) - 1;
+        return unchanged;
     }
 
-    int minMovedControlIndex = static_cast<int>(controlPoints.size());
-    int maxMovedControlIndex = -1;
-    for (size_t controlIndex = 0; controlIndex < controlPoints.size(); ++controlIndex) {
-        const cv::Vec3d base = interpolateInitialLinePoint(
-            config.initialLinePoints,
-            controlPoints[controlIndex].linePosition);
-        if (length(controlPoints[controlIndex].volumePoint - base) > kMovedControlDistanceThreshold) {
-            const int index = static_cast<int>(controlIndex);
-            minMovedControlIndex = std::min(minMovedControlIndex, index);
-            maxMovedControlIndex = std::max(maxMovedControlIndex, index);
+    const double replaceStartPosition = hasLeft
+        ? controlPoints[static_cast<size_t>(changedSortedIndex - 1)].linePosition
+        : controlPoints[static_cast<size_t>(changedSortedIndex)].linePosition;
+    const double replaceEndPosition = hasRight
+        ? controlPoints[static_cast<size_t>(changedSortedIndex + 1)].linePosition
+        : controlPoints[static_cast<size_t>(changedSortedIndex)].linePosition;
+
+    std::vector<cv::Vec3d> replacement;
+    if (hasLeft) {
+        replacement = resampleSpan(controlPoints[static_cast<size_t>(changedSortedIndex - 1)],
+                                   controlPoints[static_cast<size_t>(changedSortedIndex)]);
+    }
+    if (hasRight) {
+        std::vector<cv::Vec3d> rightSpan =
+            resampleSpan(controlPoints[static_cast<size_t>(changedSortedIndex)],
+                         controlPoints[static_cast<size_t>(changedSortedIndex + 1)]);
+        if (!replacement.empty() && !rightSpan.empty()) {
+            replacement.insert(replacement.end(), rightSpan.begin() + 1, rightSpan.end());
+        } else {
+            replacement = std::move(rightSpan);
         }
     }
-    if (maxMovedControlIndex < 0) {
-        return std::nullopt;
-    }
 
-    const int maxIndex = static_cast<int>(config.initialLinePoints.size()) - 1;
-    const int leftBoundaryControlIndex = std::max(
-        0,
-        minMovedControlIndex - kLocalControlOptimizationSegments);
-    const int rightBoundaryControlIndex = std::min(
-        static_cast<int>(controlPoints.size()) - 1,
-        maxMovedControlIndex + kLocalControlOptimizationSegments);
-    const double leftBoundaryPosition =
-        controlPoints[static_cast<size_t>(leftBoundaryControlIndex)].linePosition;
-    const double rightBoundaryPosition =
-        controlPoints[static_cast<size_t>(rightBoundaryControlIndex)].linePosition;
-
-    const int mutableStart = std::clamp(static_cast<int>(std::floor(leftBoundaryPosition)),
-                                        0,
-                                        maxIndex);
-    const int mutableEnd = std::clamp(static_cast<int>(std::ceil(rightBoundaryPosition)),
+    const int eraseStart = std::clamp(static_cast<int>(std::ceil(replaceStartPosition)),
                                       0,
-                                      maxIndex);
-    const int problemStart = std::max(0, mutableStart - 1);
-    const int problemEnd = std::min(maxIndex, mutableEnd + 1);
-    if (problemEnd <= problemStart) {
-        return std::nullopt;
-    }
+                                      static_cast<int>(linePoints.size()) - 1);
+    const int eraseEnd = std::clamp(static_cast<int>(std::floor(replaceEndPosition)),
+                                    eraseStart,
+                                    static_cast<int>(linePoints.size()) - 1);
 
-    std::vector<LineControlPoint> localWarpControls;
-    localWarpControls.reserve(controlPoints.size() + 2);
-    localWarpControls.push_back({static_cast<double>(problemStart),
-                                 config.initialLinePoints[static_cast<size_t>(problemStart)],
-                                 false,
-                                 -1});
-    for (const auto& control : controlPoints) {
-        if (control.linePosition + kEpsilon >= static_cast<double>(problemStart) &&
-            control.linePosition <= static_cast<double>(problemEnd) + kEpsilon) {
-            localWarpControls.push_back(control);
-        }
-    }
-    localWarpControls.push_back({static_cast<double>(problemEnd),
-                                 config.initialLinePoints[static_cast<size_t>(problemEnd)],
-                                 false,
-                                 -1});
-    std::stable_sort(localWarpControls.begin(),
-                     localWarpControls.end(),
-                     [](const LineControlPoint& a, const LineControlPoint& b) {
-                         return a.linePosition < b.linePosition;
-                     });
+    std::vector<cv::Vec3d> updatedLine;
+    updatedLine.reserve(linePoints.size() + replacement.size());
+    updatedLine.insert(updatedLine.end(), linePoints.begin(), linePoints.begin() + eraseStart);
+    const int activeStart = static_cast<int>(updatedLine.size());
+    updatedLine.insert(updatedLine.end(), replacement.begin(), replacement.end());
+    const int activeEnd = std::max(activeStart, static_cast<int>(updatedLine.size()) - 1);
+    updatedLine.insert(updatedLine.end(),
+                       linePoints.begin() + static_cast<std::ptrdiff_t>(eraseEnd + 1),
+                       linePoints.end());
 
-    std::vector<double> localLinePositions;
-    localLinePositions.reserve(static_cast<size_t>(problemEnd - problemStart + 1) +
-                               localWarpControls.size());
-    for (int index = problemStart; index <= problemEnd; ++index) {
-        localLinePositions.push_back(static_cast<double>(index));
-    }
-    for (const auto& control : localWarpControls) {
-        localLinePositions.push_back(control.linePosition);
-    }
-    localLinePositions = uniqueSortedPositions(std::move(localLinePositions));
-
-    std::vector<std::array<double, 3>> localPoints;
-    localPoints.reserve(localLinePositions.size());
-    std::vector<int> fixedIndices;
-    for (size_t i = 0; i < localLinePositions.size(); ++i) {
-        const double position = localLinePositions[i];
-        cv::Vec3d point = interpolateInitialLinePoint(config.initialLinePoints, position) +
-                          warpedDeltaAtPosition(localWarpControls,
-                                                config.initialLinePoints,
-                                                position);
-        for (const auto& control : controlPoints) {
-            if (std::abs(control.linePosition - position) <= 1.0e-6) {
-                point = control.volumePoint;
-                fixedIndices.push_back(static_cast<int>(i));
-                break;
+    for (auto& control : controlPoints) {
+        int bestIndex = 0;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < updatedLine.size(); ++i) {
+            const double distance = length(updatedLine[i] - control.volumePoint);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = static_cast<int>(i);
             }
         }
-        if (std::abs(position - static_cast<double>(problemStart)) <= 1.0e-6 ||
-            std::abs(position - static_cast<double>(problemEnd)) <= 1.0e-6) {
-            point = interpolateInitialLinePoint(config.initialLinePoints, position);
-            fixedIndices.push_back(static_cast<int>(i));
-        }
-        localPoints.push_back(toArray(point));
-    }
-    std::sort(fixedIndices.begin(), fixedIndices.end());
-    fixedIndices.erase(std::unique(fixedIndices.begin(), fixedIndices.end()),
-                       fixedIndices.end());
-
-    std::vector<SegmentSpacingConstraint> localSpacing(
-        localPoints.size() > 0 ? localPoints.size() - 1 : 0,
-        SegmentSpacingConstraint{SegmentSpacingMode::None, -1});
-
-    const auto start = Clock::now();
-    const int seedIndex = fixedIndices.empty() ? 0 : fixedIndices.front();
-    const cv::Vec3d seedTangent = localPoints.size() >= 2
-        ? normalizedOrZero(toVec3d(localPoints[std::min<size_t>(1, localPoints.size() - 1)]) -
-                           toVec3d(localPoints.front()))
-        : cv::Vec3d{1.0, 0.0, 0.0};
-    const GlobalSolveResult selected = solveGlobalCandidate("control-point-local",
-                                                            std::move(localPoints),
-                                                            localSpacing,
-                                                            fixedIndices,
-                                                            sampler,
-                                                            config,
-                                                            seedTangent,
-                                                            false,
-                                                            start);
-    if (!selected.usable) {
-        return std::nullopt;
+        control.optimizedIndex = bestIndex;
+        control.linePosition = static_cast<double>(bestIndex);
+        control.volumePoint = updatedLine[static_cast<size_t>(bestIndex)];
     }
 
-    std::vector<std::array<double, 3>> mergedPoints;
-    mergedPoints.reserve(config.initialLinePoints.size() + selected.points.size());
-    for (int index = 0; index < problemStart; ++index) {
-        mergedPoints.push_back(toArray(config.initialLinePoints[static_cast<size_t>(index)]));
-    }
-    mergedPoints.insert(mergedPoints.end(), selected.points.begin(), selected.points.end());
-    for (int index = problemEnd + 1; index <= maxIndex; ++index) {
-        mergedPoints.push_back(toArray(config.initialLinePoints[static_cast<size_t>(index)]));
-    }
-
-    int finalValidSamples = 0;
-    int finalInvalidSamples = 0;
-    auto finalSamples = sampleSegments(mergedPoints,
-                                       sampler,
-                                       config.samplesPerSegment,
-                                       &finalValidSamples,
-                                       &finalInvalidSamples);
-
-    int displayFrameAnchorIndex = static_cast<int>(mergedPoints.size() / 2);
-    for (const auto& control : controlPoints) {
-        if (control.isSeed) {
-            displayFrameAnchorIndex = nearestPointIndex(mergedPoints, control.volumePoint);
-            break;
-        }
-    }
-    if (displayFrameAnchorIndex < 0) {
-        displayFrameAnchorIndex = static_cast<int>(mergedPoints.size() / 2);
-    }
-
-    LineOptimizationResult result;
-    result.line = buildLineModel(mergedPoints,
-                                 sampler,
-                                 std::move(finalSamples),
-                                 displayFrameAnchorIndex);
-    result.report.initialCost = selected.initialCost;
-    result.report.finalCost = selected.finalCost;
-    result.report.iterations = selected.iterations;
-    result.report.validNormalSamples = finalValidSamples;
-    result.report.invalidNormalSamples = finalInvalidSamples;
-    result.report.converged = selected.usable;
-    result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
-    result.report.ceresSolveMs = selected.ceresSolveMs;
-    result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
-    result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
-    result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
-    result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
-    result.report.finalLosses = evaluateLosses(selected.points,
-                                               localSpacing,
-                                               sampler,
-                                               config,
-                                               seedIndex,
-                                               seedTangent,
-                                               false);
-
-    std::ostringstream message;
-    message.imbue(std::locale::classic());
-    message << std::scientific << std::setprecision(3)
-            << "Line annotation Lasagna selected candidate:\n"
-            << "candidate                   ms  iters    init_cost   final_cost\n"
-            << std::left << std::setw(24) << selected.name
-            << std::right << std::setw(10) << selected.milliseconds
-            << std::setw(7) << selected.iterations
-            << std::setw(13) << selected.initialCost
-            << std::setw(13) << selected.finalCost
-            << "\n\nLocal control-point window:\n"
-            << "control_indices=[" << leftBoundaryControlIndex << ", "
-            << rightBoundaryControlIndex << "]"
-            << " positions=[" << problemStart << ", " << problemEnd << "]"
-            << " mutable=[" << mutableStart << ", " << mutableEnd << "]"
-            << " local_points=" << selected.points.size()
-            << " merged_points=" << mergedPoints.size()
-            << "\nfixed local indices:";
-    for (const int index : fixedIndices) {
-        message << ' ' << index;
-    }
-    message << "\n\nNormal prefetch/materialization:\n"
-            << "calls=" << selected.prefetchTiming.calls
-            << " ceres_solve_ms=" << selected.ceresSolveMs
-            << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
-            << " materialize_ms=" << selected.prefetchTiming.materializeMs
-            << " requested_chunks=" << selected.prefetchTiming.requestedChunks
-            << " chunks_read=" << selected.prefetchTiming.chunksRead
-            << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
-                                selected.prefetchTiming.materializeMs)
-            << "\n\nSelected candidate report:\n"
-            << selected.report;
-    result.report.message = message.str();
+    LineControlPointUpdateResult result;
+    result.linePoints = std::move(updatedLine);
+    result.controlPoints = std::move(controlPoints);
+    result.changedControlIndex = changedSortedIndex;
+    result.activeStart = std::max(0, activeStart - 1);
+    result.activeEnd = std::min(static_cast<int>(result.linePoints.size()) - 1, activeEnd + 1);
     return result;
 }
-
-[[nodiscard]] std::vector<int> fixedIndicesOutsideLocalControlWindow(
-    const std::vector<std::array<double, 3>>& points,
-    const std::vector<LineControlPoint>& controlPoints,
-    const LineOptimizationConfig& config)
-{
-    if (!canInitializeFromExistingLine(controlPoints, config) ||
-        points.empty() ||
-        controlPoints.empty()) {
-        return {};
-    }
-
-    int minMovedControlIndex = static_cast<int>(controlPoints.size());
-    int maxMovedControlIndex = -1;
-    for (size_t controlIndex = 0; controlIndex < controlPoints.size(); ++controlIndex) {
-        const auto& control = controlPoints[controlIndex];
-        const cv::Vec3d base = interpolateInitialLinePoint(config.initialLinePoints,
-                                                           control.linePosition);
-        if (length(control.volumePoint - base) > kMovedControlDistanceThreshold) {
-            const int index = static_cast<int>(controlIndex);
-            minMovedControlIndex = std::min(minMovedControlIndex, index);
-            maxMovedControlIndex = std::max(maxMovedControlIndex, index);
-        }
-    }
-    if (maxMovedControlIndex < 0) {
-        return {};
-    }
-
-    const int leftBoundaryControlIndex = std::max(
-        0,
-        minMovedControlIndex - kLocalControlOptimizationSegments);
-    const int rightBoundaryControlIndex = std::min(
-        static_cast<int>(controlPoints.size()) - 1,
-        maxMovedControlIndex + kLocalControlOptimizationSegments);
-
-    const int leftOptimizedIndex =
-        controlPoints[static_cast<size_t>(leftBoundaryControlIndex)].optimizedIndex;
-    const int rightOptimizedIndex =
-        controlPoints[static_cast<size_t>(rightBoundaryControlIndex)].optimizedIndex;
-    if (leftOptimizedIndex < 0 ||
-        rightOptimizedIndex < 0 ||
-        leftOptimizedIndex > rightOptimizedIndex) {
-        return {};
-    }
-
-    std::vector<int> fixed;
-    fixed.reserve(points.size());
-    for (int index = 0; index < static_cast<int>(points.size()); ++index) {
-        if (index < leftOptimizedIndex || index > rightOptimizedIndex) {
-            fixed.push_back(index);
-        }
-    }
-    return fixed;
-}
-
-} // namespace
 
 LineOptimizer::LineOptimizer(const NormalSampler& normalSampler)
     : normalSampler_(normalSampler)
@@ -2683,6 +2576,155 @@ LineOptimizationResult LineOptimizer::optimizeFromSeeds(
     return optimizeFromControlPoints(std::move(controls), config);
 }
 
+LineOptimizationResult LineOptimizer::optimizeExistingLine(
+    std::vector<cv::Vec3d> linePoints,
+    std::vector<int> fixedPointIndices,
+    int displayFrameAnchorIndex,
+    const LineOptimizationConfig& rawConfig,
+    int activeStart,
+    int activeEnd,
+    std::string candidateName) const
+{
+    const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    if (linePoints.size() < 2) {
+        throw std::invalid_argument("Existing line optimization requires at least two samples");
+    }
+    if (candidateName.empty()) {
+        candidateName = "existing-line+global";
+    }
+
+    std::vector<std::array<double, 3>> points;
+    points.reserve(linePoints.size());
+    for (const auto& point : linePoints) {
+        points.push_back(toArray(point));
+    }
+
+    const int maxIndex = static_cast<int>(points.size()) - 1;
+    activeStart = activeStart < 0 ? 0 : std::clamp(activeStart, 0, maxIndex);
+    activeEnd = activeEnd < 0 ? maxIndex : std::clamp(activeEnd, activeStart, maxIndex);
+    displayFrameAnchorIndex = std::clamp(displayFrameAnchorIndex, 0, maxIndex);
+
+    fixedPointIndices.erase(std::remove_if(fixedPointIndices.begin(),
+                                           fixedPointIndices.end(),
+                                           [maxIndex](int index) {
+                                               return index < 0 || index > maxIndex;
+                                           }),
+                            fixedPointIndices.end());
+    if (fixedPointIndices.empty()) {
+        fixedPointIndices.push_back(displayFrameAnchorIndex);
+    }
+    if (activeStart > 0 || activeEnd < maxIndex) {
+        fixedPointIndices.push_back(activeStart);
+        fixedPointIndices.push_back(activeEnd);
+    }
+    std::sort(fixedPointIndices.begin(), fixedPointIndices.end());
+    fixedPointIndices.erase(std::unique(fixedPointIndices.begin(), fixedPointIndices.end()),
+                            fixedPointIndices.end());
+
+    std::vector<SegmentSpacingConstraint> spacing(
+        points.size() > 0 ? points.size() - 1 : 0,
+        SegmentSpacingConstraint{SegmentSpacingMode::None, -1});
+    int spanId = 0;
+    for (size_t i = 0; i + 1 < fixedPointIndices.size(); ++i) {
+        const int left = fixedPointIndices[i];
+        const int right = fixedPointIndices[i + 1];
+        if (right <= left + 1) {
+            continue;
+        }
+        for (int segment = left; segment < right; ++segment) {
+            spacing[static_cast<size_t>(segment)] = {SegmentSpacingMode::EvenStep, spanId};
+        }
+        ++spanId;
+    }
+
+    const int tangentLeft = std::max(0, displayFrameAnchorIndex - 1);
+    const int tangentRight = std::min(maxIndex, displayFrameAnchorIndex + 1);
+    cv::Vec3d seedTangent = tangentRight > tangentLeft
+        ? normalizedOrZero(linePoints[static_cast<size_t>(tangentRight)] -
+                           linePoints[static_cast<size_t>(tangentLeft)])
+        : cv::Vec3d{1.0, 0.0, 0.0};
+    if (length(seedTangent) <= kEpsilon) {
+        seedTangent = {1.0, 0.0, 0.0};
+    }
+
+    const auto start = Clock::now();
+    const GlobalSolveResult selected = solveGlobalCandidate(std::move(candidateName),
+                                                            std::move(points),
+                                                            spacing,
+                                                            fixedPointIndices,
+                                                            normalSampler_,
+                                                            config,
+                                                            seedTangent,
+                                                            false,
+                                                            start,
+                                                            activeStart,
+                                                            activeEnd);
+
+    int finalValidSamples = 0;
+    int finalInvalidSamples = 0;
+    auto finalSamples = sampleSegments(selected.points,
+                                       normalSampler_,
+                                       config.samplesPerSegment,
+                                       &finalValidSamples,
+                                       &finalInvalidSamples);
+
+    LineOptimizationResult result;
+    result.line = buildLineModel(selected.points,
+                                 normalSampler_,
+                                 std::move(finalSamples),
+                                 displayFrameAnchorIndex);
+    result.report.initialCost = selected.initialCost;
+    result.report.finalCost = selected.finalCost;
+    result.report.iterations = selected.iterations;
+    result.report.validNormalSamples = finalValidSamples;
+    result.report.invalidNormalSamples = finalInvalidSamples;
+    result.report.converged = selected.usable;
+    result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
+    result.report.ceresSolveMs = selected.ceresSolveMs;
+    result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
+    result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+    result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
+    result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
+    result.report.finalLosses = evaluateLosses(selected.points,
+                                               spacing,
+                                               normalSampler_,
+                                               config,
+                                               displayFrameAnchorIndex,
+                                               seedTangent,
+                                               false);
+
+    std::ostringstream message;
+    message.imbue(std::locale::classic());
+    message << std::scientific << std::setprecision(3)
+            << "Line annotation Lasagna selected candidate:\n"
+            << "candidate                   ms  iters    init_cost   final_cost\n"
+            << std::left << std::setw(24) << selected.name
+            << std::right << std::setw(10) << selected.milliseconds
+            << std::setw(7) << selected.iterations
+            << std::setw(13) << selected.initialCost
+            << std::setw(13) << selected.finalCost
+            << "\n\nExisting-line optimization:\n"
+            << "active_points=[" << activeStart << ", " << activeEnd << "]"
+            << " total_points=" << selected.points.size()
+            << "\nfixed sample indices:";
+    for (const int index : fixedPointIndices) {
+        message << ' ' << index;
+    }
+    message << "\n\nNormal prefetch/materialization:\n"
+            << "calls=" << selected.prefetchTiming.calls
+            << " ceres_solve_ms=" << selected.ceresSolveMs
+            << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
+            << " materialize_ms=" << selected.prefetchTiming.materializeMs
+            << " requested_chunks=" << selected.prefetchTiming.requestedChunks
+            << " chunks_read=" << selected.prefetchTiming.chunksRead
+            << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
+                                selected.prefetchTiming.materializeMs)
+            << "\n\nSelected candidate report:\n"
+            << selected.report;
+    result.report.message = message.str();
+    return result;
+}
+
 LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
     std::vector<LineControlPoint> controlPoints,
     const LineOptimizationConfig& rawConfig) const
@@ -2696,9 +2738,7 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
     }
 
     const auto start = Clock::now();
-    ControlPointInitialization init = initializeFromControlPoints(std::move(controlPoints),
-                                                                  normalSampler_,
-                                                                  config);
+    ControlPointInitialization init = initializeFromControlPoints(std::move(controlPoints), normalSampler_, config);
     const std::vector<SegmentSpacingConstraint> finalSpacing = init.spacingConstraints;
     const std::vector<int> fixedPointIndices = init.fixedPointIndices;
     int seedIndex = fixedPointIndices.empty() ? config.segmentsPerSide : fixedPointIndices.front();

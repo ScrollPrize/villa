@@ -45,6 +45,7 @@ public:
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
         std::string error;
+        std::string eventName;
     };
 
     struct FiberSummary {
@@ -61,7 +62,10 @@ public:
                                              std::vector<vc::lasagna::LineControlPoint>,
                                              std::vector<cv::Vec3d>,
                                              cv::Vec3d,
-                                             InitialDirectionMode)>;
+                                             InitialDirectionMode,
+                                             bool,
+                                             int,
+                                             int)>;
 
     LineAnnotationController(CState* state,
                              ViewerManager* viewerManager,
@@ -122,7 +126,10 @@ private:
                                      cv::Vec3f volumePoint,
                                      double linePosition);
     bool ensureDatasetForSession(LineAnnotationSession& session);
-    void startOptimization(LineAnnotationSession& session);
+    void startOptimization(LineAnnotationSession& session,
+                           bool fullOptimization = false,
+                           int activeStart = -1,
+                           int activeEnd = -1);
     void finishOptimization(const std::string& surfaceName);
     bool materializeGeneratedViews(LineAnnotationSession& session);
     void handleShowAsMesh(const std::string& surfaceName);
@@ -138,7 +145,10 @@ private:
                                                              std::vector<vc::lasagna::LineControlPoint> controlPoints,
                                                              std::vector<cv::Vec3d> initialLinePoints,
                                                              cv::Vec3d sourceSliceNormal,
-                                                             InitialDirectionMode directionMode) const;
+                                                             InitialDirectionMode directionMode,
+                                                             bool fullOptimization = false,
+                                                             int activeStart = -1,
+                                                             int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
     void emitFiberSummaries();
     [[nodiscard]] std::filesystem::path fibersDir() const;

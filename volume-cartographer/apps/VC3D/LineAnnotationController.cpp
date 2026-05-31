@@ -26,7 +26,10 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
@@ -72,6 +75,7 @@ struct LineAnnotationController::LineAnnotationSession {
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
+constexpr double kLineSegmentLength = 32.0;
 
 bool finiteDirection(const cv::Vec3d& v)
 {
@@ -99,6 +103,111 @@ bool finitePoint(const cv::Vec3d& v)
 nlohmann::json pointToJson(const cv::Vec3d& point)
 {
     return nlohmann::json::array({point[0], point[1], point[2]});
+}
+
+nlohmann::json controlsToJson(const std::vector<vc::lasagna::LineControlPoint>& controls)
+{
+    nlohmann::json array = nlohmann::json::array();
+    for (const auto& control : controls) {
+        array.push_back({
+            {"line_position", control.linePosition},
+            {"optimized_index", control.optimizedIndex},
+            {"is_seed", control.isSeed},
+            {"xyz", pointToJson(control.volumePoint)},
+        });
+    }
+    return array;
+}
+
+nlohmann::json linePointsToJson(const std::vector<cv::Vec3d>& points)
+{
+    nlohmann::json array = nlohmann::json::array();
+    for (const auto& point : points) {
+        array.push_back(pointToJson(point));
+    }
+    return array;
+}
+
+nlohmann::json linePointsToJson(const vc::lasagna::LineModel& line)
+{
+    nlohmann::json array = nlohmann::json::array();
+    for (const auto& point : line.points) {
+        array.push_back(pointToJson(point.position));
+    }
+    return array;
+}
+
+std::string sanitizedEventName(std::string event)
+{
+    for (char& ch : event) {
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_') {
+            ch = '_';
+        }
+    }
+    return event.empty() ? "event" : event;
+}
+
+void writeLineDebugJson(const std::string& eventName,
+                        const std::vector<vc::lasagna::LineControlPoint>& controls,
+                        const nlohmann::json& linePoints,
+                        const vc::lasagna::LineOptimizationReport* report = nullptr)
+{
+    const char* debugDir = std::getenv("VC3D_LINE_DEBUG_DIR");
+    if (!debugDir || *debugDir == '\0') {
+        return;
+    }
+
+    static std::atomic<int> sequence{0};
+    const int id = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    std::error_code ec;
+    fs::create_directories(debugDir, ec);
+    if (ec) {
+        Logger()->warn("Could not create VC3D_LINE_DEBUG_DIR {}: {}", debugDir, ec.message());
+        return;
+    }
+
+    nlohmann::json root;
+    root["event"] = eventName;
+    root["control_points"] = controlsToJson(controls);
+    root["line_points"] = linePoints;
+    if (report) {
+        root["optimization_report"] = {
+            {"initial_cost", report->initialCost},
+            {"final_cost", report->finalCost},
+            {"iterations", report->iterations},
+            {"valid_normal_samples", report->validNormalSamples},
+            {"invalid_normal_samples", report->invalidNormalSamples},
+            {"converged", report->converged},
+            {"normal_prefetch_calls", report->normalPrefetchCalls},
+            {"ceres_solve_ms", report->ceresSolveMs},
+            {"normal_chunk_prefetch_ms", report->normalChunkPrefetchMs},
+            {"normal_materialize_ms", report->normalMaterializeMs},
+            {"message", report->message},
+        };
+        root["optimization_report"]["losses"] = nlohmann::json::array();
+        for (const auto& loss : report->finalLosses) {
+            root["optimization_report"]["losses"].push_back({
+                {"name", loss.name},
+                {"weight", loss.weight},
+                {"residuals", loss.residuals},
+                {"raw_cost", loss.rawCost},
+                {"weighted_cost", loss.weightedCost},
+            });
+        }
+    }
+
+    std::ostringstream fileName;
+    fileName.imbue(std::locale::classic());
+    fileName << "line_edit_" << std::setw(4) << std::setfill('0') << id
+             << '_' << sanitizedEventName(eventName) << ".json";
+    const fs::path path = fs::path(debugDir) / fileName.str();
+    std::ofstream output(path);
+    if (!output.good()) {
+        Logger()->warn("Could not write line debug JSON {}", path.string());
+        return;
+    }
+    output << root.dump(2) << '\n';
 }
 
 cv::Vec3d pointFromJson(const nlohmann::json& value)
@@ -149,6 +258,9 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    bool forceFullOptimization,
+    int activeStart,
+    int activeEnd,
     const vc::lasagna::NormalSampler& sampler);
 
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
@@ -156,7 +268,10 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
-    LineAnnotationController::InitialDirectionMode directionMode)
+    LineAnnotationController::InitialDirectionMode directionMode,
+    bool forceFullOptimization,
+    int activeStart,
+    int activeEnd)
 {
     vc::lasagna::LasagnaDataset dataset =
         vc::lasagna::LasagnaDataset::open(manifestPath);
@@ -166,6 +281,9 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
                                    std::move(initialLinePoints),
                                    sourceSliceNormal,
                                    directionMode,
+                                   forceFullOptimization,
+                                   activeStart,
+                                   activeEnd,
                                    sampler);
 }
 
@@ -175,6 +293,9 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode,
+    bool forceFullOptimization,
+    int activeStart,
+    int activeEnd,
     const vc::lasagna::NormalSampler& sampler)
 {
     LineAnnotationController::OptimizationTaskResult task;
@@ -192,14 +313,17 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     }
     task.sourceSliceNormal = sourceSliceNormal;
     task.initialDirectionMode = directionMode;
+    task.eventName = initialLinePoints.empty()
+        ? "seed"
+        : (forceFullOptimization ? "full_optimization" : "control_optimization");
     try {
         vc::lasagna::LineOptimizer optimizer(sampler);
         vc::lasagna::LineOptimizationConfig config;
         config.segmentsPerSide = 200;
-        config.segmentLength = 32.0;
+        config.segmentLength = kLineSegmentLength;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.0005;
+        config.normalStraightnessWeight = 0.05;
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
@@ -213,8 +337,36 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.tangentGuideMode = directionMode == LineAnnotationController::InitialDirectionMode::ZInOut
             ? vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane
             : vc::lasagna::LineOptimizationConfig::TangentGuideMode::CrossVectorWithNormal;
-        config.initialLinePoints = std::move(initialLinePoints);
-        task.result = optimizer.optimizeFromControlPoints(task.controlPoints, config);
+        if (initialLinePoints.size() >= 2) {
+            std::vector<int> fixedIndices;
+            fixedIndices.reserve(task.controlPoints.size());
+            int displayFrameAnchorIndex = static_cast<int>(initialLinePoints.size() / 2);
+            for (const auto& control : task.controlPoints) {
+                if (!std::isfinite(control.linePosition)) {
+                    continue;
+                }
+                const int index = std::clamp(static_cast<int>(std::llround(control.linePosition)),
+                                             0,
+                                             static_cast<int>(initialLinePoints.size()) - 1);
+                fixedIndices.push_back(index);
+                if (control.isSeed) {
+                    displayFrameAnchorIndex = index;
+                }
+            }
+            const bool hasLocalRange = activeStart >= 0 && activeEnd >= activeStart;
+            const std::string candidateName = forceFullOptimization || !hasLocalRange
+                ? "existing-line+global"
+                : "existing-line+local";
+            task.result = optimizer.optimizeExistingLine(std::move(initialLinePoints),
+                                                         std::move(fixedIndices),
+                                                         displayFrameAnchorIndex,
+                                                         config,
+                                                         forceFullOptimization ? -1 : activeStart,
+                                                         forceFullOptimization ? -1 : activeEnd,
+                                                         candidateName);
+        } else {
+            task.result = optimizer.optimizeFromControlPoints(task.controlPoints, config);
+        }
         task.ok = true;
     } catch (const std::exception& ex) {
         task.ok = false;
@@ -243,12 +395,18 @@ LineAnnotationController::LineAnnotationController(CState* state,
                                   std::vector<vc::lasagna::LineControlPoint> controlPoints,
                                   std::vector<cv::Vec3d> initialLinePoints,
                                   cv::Vec3d sourceSliceNormal,
-                                  InitialDirectionMode directionMode) {
+                                  InitialDirectionMode directionMode,
+                                  bool forceFullOptimization,
+                                  int activeStart,
+                                  int activeEnd) {
         return optimizeLineFromManifest(std::move(manifestPath),
                                         std::move(controlPoints),
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
-                                        directionMode);
+                                        directionMode,
+                                        forceFullOptimization,
+                                        activeStart,
+                                        activeEnd);
     })
 {
     if (_state) {
@@ -387,6 +545,24 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             });
     connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
         handleShowAsMesh(surfaceName);
+    });
+    connect(dialog, &LineAnnotationDialog::fullOptimizationRequested, this, [this, surfaceName]() {
+        auto* pane = paneForSurface(surfaceName);
+        if (!pane || !pane->session) {
+            return;
+        }
+        auto& session = *pane->session;
+        if (session.taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."));
+            return;
+        }
+        if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
+            return;
+        }
+        if (!ensureDatasetForSession(session)) {
+            return;
+        }
+        startOptimization(session, true);
     });
     connect(dialog, &QObject::destroyed, this, [this, surfaceName]() {
         cleanupSurfaceName(surfaceName);
@@ -636,7 +812,11 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         }
     }
 
+    size_t changedControlIndex = 0;
+    bool editedExistingControl = false;
     if (nearest != session.controlPoints.end() && nearestDistance <= 0.5) {
+        editedExistingControl = true;
+        changedControlIndex = static_cast<size_t>(std::distance(session.controlPoints.begin(), nearest));
         nearest->volumePoint = clicked;
         nearest->optimizedIndex = -1;
         linePosition = nearest->linePosition;
@@ -645,17 +825,42 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         }
     } else {
         session.controlPoints.push_back({linePosition, clicked, false, -1});
+        changedControlIndex = session.controlPoints.size() - 1;
     }
 
     session.focusedLinePosition = linePosition;
     session.focusedControlPoint = clicked;
-    std::stable_sort(session.controlPoints.begin(),
-                     session.controlPoints.end(),
-                     [](const vc::lasagna::LineControlPoint& a,
-                        const vc::lasagna::LineControlPoint& b) {
-                         return a.linePosition < b.linePosition;
-                     });
-    startOptimization(session);
+    std::vector<cv::Vec3d> currentLinePoints;
+    currentLinePoints.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points) {
+        currentLinePoints.push_back(point.position);
+    }
+
+    vc::lasagna::LineControlPointUpdateResult update;
+    try {
+        update = vc::lasagna::updateExistingLineControlPoint(std::move(currentLinePoints),
+                                                             std::move(session.controlPoints),
+                                                             changedControlIndex,
+                                                             kLineSegmentLength);
+    } catch (const std::exception& ex) {
+        showError(tr("Could not update line control point: %1").arg(QString::fromStdString(ex.what())));
+        return;
+    }
+    session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
+    session.controlPoints = update.controlPoints;
+    if (update.changedControlIndex >= 0 &&
+        update.changedControlIndex < static_cast<int>(session.controlPoints.size())) {
+        const auto& changed = session.controlPoints[static_cast<size_t>(update.changedControlIndex)];
+        session.focusedLinePosition = changed.linePosition;
+        session.focusedControlPoint = changed.volumePoint;
+        if (changed.isSeed) {
+            session.seedPoint = changed.volumePoint;
+        }
+    }
+    writeLineDebugJson(editedExistingControl ? "control_edit_span_update" : "control_add_span_update",
+                       session.controlPoints,
+                       linePointsToJson(session.optimizedLine));
+    startOptimization(session, false, update.activeStart, update.activeEnd);
 }
 
 bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session)
@@ -712,7 +917,10 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     return true;
 }
 
-void LineAnnotationController::startOptimization(LineAnnotationSession& session)
+void LineAnnotationController::startOptimization(LineAnnotationSession& session,
+                                                 bool forceFullOptimization,
+                                                 int activeStart,
+                                                 int activeEnd)
 {
     if (session.controlPoints.empty()) {
         return;
@@ -759,6 +967,9 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session)
                                            initialLinePoints,
                                            sourceSliceNormal,
                                            directionMode,
+                                           forceFullOptimization,
+                                           activeStart,
+                                           activeEnd,
                                            dataset,
                                            normalSampler]() mutable {
         if (factory) {
@@ -766,7 +977,10 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session)
                            std::move(controlPoints),
                            std::move(initialLinePoints),
                            sourceSliceNormal,
-                           directionMode);
+                           directionMode,
+                           forceFullOptimization,
+                           activeStart,
+                           activeEnd);
         }
         if (normalSampler) {
             (void)dataset;
@@ -775,13 +989,19 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session)
                                            std::move(initialLinePoints),
                                            sourceSliceNormal,
                                            directionMode,
+                                           forceFullOptimization,
+                                           activeStart,
+                                           activeEnd,
                                            *normalSampler);
         }
         return optimizeLineFromManifest(manifestPath,
                                         std::move(controlPoints),
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
-                                        directionMode);
+                                        directionMode,
+                                        forceFullOptimization,
+                                        activeStart,
+                                        activeEnd);
     }));
 }
 
@@ -834,6 +1054,13 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                 session.seedPoint = control.volumePoint;
             }
         }
+        const std::string resultEvent = task.eventName.empty()
+            ? "optimization_result"
+            : task.eventName + "_result";
+        writeLineDebugJson(resultEvent,
+                           session.controlPoints,
+                           linePointsToJson(session.optimizedLine),
+                           &session.optimizationReport);
         if (!materializeGeneratedViews(session)) {
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return;
@@ -1222,20 +1449,29 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
-    InitialDirectionMode directionMode) const
+    InitialDirectionMode directionMode,
+    bool forceFullOptimization,
+    int activeStart,
+    int activeEnd) const
 {
     if (_optimizationTaskFactory) {
         return _optimizationTaskFactory(std::move(manifestPath),
                                         std::move(controlPoints),
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
-                                        directionMode);
+                                        directionMode,
+                                        forceFullOptimization,
+                                        activeStart,
+                                        activeEnd);
     }
     return optimizeLineFromManifest(std::move(manifestPath),
                                     std::move(controlPoints),
                                     std::move(initialLinePoints),
                                     sourceSliceNormal,
-                                    directionMode);
+                                    directionMode,
+                                    forceFullOptimization,
+                                    activeStart,
+                                    activeEnd);
 }
 
 void LineAnnotationController::loadFibersForCurrentPackage()
