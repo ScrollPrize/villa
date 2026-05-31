@@ -148,6 +148,25 @@ TEST_CASE("LineViewBuilder diagnostics flag sampled normal axis jumps")
     CHECK(diagnostics.issues.front().reason == "sampled_normal_axis_jump");
 }
 
+TEST_CASE("LineViewBuilder uses transported up vectors for cross-slice orientation")
+{
+    auto line = simpleLine();
+    line.points[0].sampledNormal = normal({0.0, 0.0, 1.0});
+    line.points[1].sampledNormal = normal({0.0, 1.0, 0.0});
+    line.points[2].sampledNormal = normal({0.0, 0.0, 1.0});
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line);
+
+    REQUIRE(views.lineUpVectors.size() == 3);
+    for (const auto& up : views.lineUpVectors) {
+        checkVec(up, {0.0, 1.0, 0.0});
+    }
+    for (const auto& slice : views.lineZSlices) {
+        REQUIRE(slice);
+        checkVec(slice->basisY(), {0.0, 1.0, 0.0});
+    }
+}
+
 TEST_CASE("LineViewBuilder uses finite deterministic fallback frames")
 {
     auto line = simpleLine({1.0, 0.0, 0.0});

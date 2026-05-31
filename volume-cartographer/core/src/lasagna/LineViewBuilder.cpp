@@ -474,6 +474,35 @@ std::vector<LineFrame> buildFrames(const std::vector<SegmentNormalSample>& sampl
     return frames;
 }
 
+std::vector<cv::Vec3d> buildTransportedUpVectors(const std::vector<SegmentNormalSample>& samples,
+                                                 const std::vector<cv::Vec3d>& normals)
+{
+    std::vector<cv::Vec3d> upVectors(samples.size(), {0.0, 0.0, 0.0});
+    if (samples.empty()) {
+        return upVectors;
+    }
+
+    std::vector<cv::Vec3d> tangents;
+    tangents.reserve(samples.size());
+    for (size_t row = 0; row < samples.size(); ++row) {
+        tangents.push_back(tangentAt(samples, row));
+    }
+
+    const size_t anchor = samples.size() / 2;
+    upVectors[anchor] = projectToTangentPlane(normalizedOrZero(normals[anchor]), tangents[anchor]);
+    if (!validDirection(upVectors[anchor])) {
+        upVectors[anchor] = fallbackMeshNormalForTangent(tangents[anchor]);
+    }
+
+    for (size_t row = anchor + 1; row < samples.size(); ++row) {
+        upVectors[row] = transportNormal(upVectors[row - 1], tangents[row - 1], tangents[row]);
+    }
+    for (size_t row = anchor; row > 0; --row) {
+        upVectors[row - 1] = transportNormal(upVectors[row], tangents[row], tangents[row - 1]);
+    }
+    return upVectors;
+}
+
 std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>& samples,
                                          const std::vector<double>& offsets,
                                          const std::vector<LineFrame>& frames,
@@ -518,6 +547,7 @@ struct LineViewFrameData {
     std::vector<cv::Vec3d> normals;
     std::vector<cv::Vec3d> tangents;
     std::vector<LineFrame> frames;
+    std::vector<cv::Vec3d> transportedUpVectors;
 };
 
 LineViewFrameData buildControlFrameData(const LineModel& line)
@@ -530,6 +560,7 @@ LineViewFrameData buildControlFrameData(const LineModel& line)
 
     data.normals = resolvedNormals(data.samples);
     data.frames = buildFrames(data.samples, data.normals);
+    data.transportedUpVectors = buildTransportedUpVectors(data.samples, data.normals);
     data.tangents.reserve(data.samples.size());
     for (size_t row = 0; row < data.samples.size(); ++row) {
         data.tangents.push_back(tangentAt(data.samples, row));
@@ -590,7 +621,7 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
     for (size_t i = 0; i < line.points.size(); ++i) {
         const cv::Vec3f origin = toVec3f(line.points[i].position);
         const cv::Vec3f tangent = toVec3f(pointTangent(line, i));
-        const cv::Vec3f up = toVec3f(frames[i].meshNormal);
+        const cv::Vec3f up = toVec3f(frameData.transportedUpVectors[i]);
         auto plane = std::make_shared<PlaneSurface>();
         plane->setFromNormalAndUp(origin, tangent, up);
         surfaces.lineZSlices.push_back(std::move(plane));

@@ -63,6 +63,14 @@ constexpr double kEpsilon = 1.0e-12;
     config.segmentsPerSide = std::max(1, config.segmentsPerSide);
     config.segmentLength = std::max(kEpsilon, config.segmentLength);
     config.straightnessWeight = std::max(0.0, config.straightnessWeight);
+    if (config.tangentStraightnessWeight < 0.0) {
+        config.tangentStraightnessWeight = config.straightnessWeight;
+    }
+    if (config.normalStraightnessWeight < 0.0) {
+        config.normalStraightnessWeight = config.straightnessWeight;
+    }
+    config.tangentStraightnessWeight = std::max(0.0, config.tangentStraightnessWeight);
+    config.normalStraightnessWeight = std::max(0.0, config.normalStraightnessWeight);
     config.normalAlignmentWeight = std::max(0.0, config.normalAlignmentWeight);
     config.distanceWeight = std::max(0.0, config.distanceWeight);
     config.initialTangentWeight = std::max(0.0, config.initialTangentWeight);
@@ -201,22 +209,68 @@ struct EvenStepResidual {
     double weight = 1.0;
 };
 
-struct StraightnessResidual {
-    explicit StraightnessResidual(double weight)
-        : weight(weight)
+struct LiveSurfaceStraightnessResidual final : public ceres::SizedCostFunction<4, 3, 3, 3> {
+    LiveSurfaceStraightnessResidual(const NormalSampler& sampler,
+                                    double tangentWeight,
+                                    double normalWeight)
+        : sampler(sampler)
+        , tangentWeight(tangentWeight)
+        , normalWeight(normalWeight)
     {
     }
 
-    template <typename T>
-    bool operator()(const T* const prev, const T* const point, const T* const next, T* residuals) const
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
     {
+        const cv::Vec3d point{parameters[1][0], parameters[1][1], parameters[1][2]};
+        NormalSample sample = sampler.sampleNormal(point);
+        cv::Vec3d normal = normalizedOrZero(sample.normal);
+        if (!sample.valid || length(normal) <= kEpsilon) {
+            normal = {0.0, 0.0, 1.0};
+        }
+
+        cv::Vec3d curvature;
         for (int axis = 0; axis < 3; ++axis) {
-            residuals[axis] = T(weight) * (prev[axis] - T(2.0) * point[axis] + next[axis]);
+            curvature[axis] = parameters[0][axis] -
+                              2.0 * parameters[1][axis] +
+                              parameters[2][axis];
+        }
+
+        const double normalComponent = curvature.dot(normal);
+        const cv::Vec3d tangentComponent = curvature - normal * normalComponent;
+        for (int axis = 0; axis < 3; ++axis) {
+            residuals[axis] = tangentWeight * tangentComponent[axis];
+        }
+        residuals[3] = normalWeight * normalComponent;
+
+        if (jacobians) {
+            double tangentProjection[3][3];
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    tangentProjection[r][c] = (r == c ? 1.0 : 0.0) - normal[r] * normal[c];
+                }
+            }
+            for (int block = 0; block < 3; ++block) {
+                if (!jacobians[block]) {
+                    continue;
+                }
+                const double coefficient = block == 1 ? -2.0 : 1.0;
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        jacobians[block][r * 3 + c] =
+                            coefficient * tangentWeight * tangentProjection[r][c];
+                    }
+                }
+                for (int c = 0; c < 3; ++c) {
+                    jacobians[block][3 * 3 + c] = coefficient * normalWeight * normal[c];
+                }
+            }
         }
         return true;
     }
 
-    double weight = 1.0;
+    const NormalSampler& sampler;
+    double tangentWeight = 1.0;
+    double normalWeight = 1.0;
 };
 
 enum class SegmentSpacingMode {
@@ -698,6 +752,17 @@ struct LossAccumulator {
     return {loss.name, loss.weight, loss.residuals, loss.rawCost, loss.weightedCost};
 }
 
+[[nodiscard]] cv::Vec3d straightnessSplitNormalAt(const std::array<double, 3>& point,
+                                                  const NormalSampler& sampler)
+{
+    const NormalSample sample = sampler.sampleNormal({point[0], point[1], point[2]});
+    const cv::Vec3d normal = normalizedOrZero(sample.normal);
+    if (sample.valid && length(normal) > kEpsilon) {
+        return normal;
+    }
+    return {0.0, 0.0, 1.0};
+}
+
 [[nodiscard]] std::vector<LineOptimizationLossReport> evaluateLosses(
     const std::vector<std::array<double, 3>>& points,
     const std::vector<SegmentSpacingConstraint>& spacingConstraints,
@@ -709,7 +774,8 @@ struct LossAccumulator {
 {
     LossAccumulator stepDistance{"step_distance", config.distanceWeight};
     LossAccumulator evenStep{"even_step", config.distanceWeight};
-    LossAccumulator straightness{"straightness", config.straightnessWeight};
+    LossAccumulator tangentStraightness{"tangent_straightness", config.tangentStraightnessWeight};
+    LossAccumulator normalStraightness{"normal_straightness", config.normalStraightnessWeight};
     LossAccumulator normalAlignment{"normal_alignment", config.normalAlignmentWeight};
     LossAccumulator initialDirection{"initial_direction", config.initialTangentWeight};
     LossAccumulator tangentGuide{"tangent_guide", config.tangentGuideWeight};
@@ -755,9 +821,18 @@ struct LossAccumulator {
     }
 
     for (size_t i = 1; i + 1 < points.size(); ++i) {
+        const cv::Vec3d normal = straightnessSplitNormalAt(points[i], sampler);
+        const cv::Vec3d curvature{
+            points[i - 1][0] - 2.0 * points[i][0] + points[i + 1][0],
+            points[i - 1][1] - 2.0 * points[i][1] + points[i + 1][1],
+            points[i - 1][2] - 2.0 * points[i][2] + points[i + 1][2],
+        };
+        const double normalComponent = curvature.dot(normal);
+        const cv::Vec3d tangentComponent = curvature - normal * normalComponent;
         for (int axis = 0; axis < 3; ++axis) {
-            straightness.add(points[i - 1][axis] - 2.0 * points[i][axis] + points[i + 1][axis]);
+            tangentStraightness.add(tangentComponent[axis]);
         }
+        normalStraightness.add(normalComponent);
     }
 
     for (size_t segment = 0; segment + 1 < points.size(); ++segment) {
@@ -824,10 +899,11 @@ struct LossAccumulator {
     }
 
     std::vector<LineOptimizationLossReport> losses;
-    losses.reserve(6);
+    losses.reserve(7);
     losses.push_back(toReport(stepDistance));
     losses.push_back(toReport(evenStep));
-    losses.push_back(toReport(straightness));
+    losses.push_back(toReport(tangentStraightness));
+    losses.push_back(toReport(normalStraightness));
     losses.push_back(toReport(normalAlignment));
     losses.push_back(toReport(initialDirection));
     losses.push_back(toReport(tangentGuide));
@@ -895,8 +971,12 @@ void addResiduals(
     }
 
     for (size_t i = 1; i + 1 < points.size(); ++i) {
-        auto* cost = new ceres::AutoDiffCostFunction<StraightnessResidual, 3, 3, 3, 3>(
-            new StraightnessResidual(config.straightnessWeight));
+        if (config.tangentStraightnessWeight <= 0.0 && config.normalStraightnessWeight <= 0.0) {
+            continue;
+        }
+        auto* cost = new LiveSurfaceStraightnessResidual(sampler,
+                                                         config.tangentStraightnessWeight,
+                                                         config.normalStraightnessWeight);
         problem.AddResidualBlock(cost, nullptr, points[i - 1].data(), points[i].data(), points[i + 1].data());
     }
 
@@ -960,9 +1040,11 @@ void addSingleSegmentResiduals(ceres::Problem& problem,
         new DistanceResidual(config.segmentLength, config.distanceWeight));
     problem.AddResidualBlock(distanceCost, nullptr, fixed.data(), moving.data());
 
-    if (previous != nullptr && config.straightnessWeight > 0.0) {
-        auto* straightnessCost = new ceres::AutoDiffCostFunction<StraightnessResidual, 3, 3, 3, 3>(
-            new StraightnessResidual(config.straightnessWeight));
+    if (previous != nullptr &&
+        (config.tangentStraightnessWeight > 0.0 || config.normalStraightnessWeight > 0.0)) {
+        auto* straightnessCost = new LiveSurfaceStraightnessResidual(sampler,
+                                                                     config.tangentStraightnessWeight,
+                                                                     config.normalStraightnessWeight);
         problem.AddResidualBlock(straightnessCost, nullptr, previous->data(), fixed.data(), moving.data());
     }
 

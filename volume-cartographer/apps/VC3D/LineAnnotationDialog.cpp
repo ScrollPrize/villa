@@ -278,6 +278,33 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _showAsMeshButton->setEnabled(false);
     }
 
+    const bool replacingGeneratedViews = _hasGeneratedViews;
+    const double previousCurrentLinePosition = _currentLinePosition;
+    const double previousBottomCenterPosition = _bottomCenterPosition;
+
+    bool haveCurrentCutCamera = false;
+    CChunkedVolumeViewer::CameraState currentCutCamera;
+    if (_currentCutViewer) {
+        currentCutCamera = _currentCutViewer->cameraState();
+        haveCurrentCutCamera = true;
+    }
+
+    std::vector<CChunkedVolumeViewer::CameraState> stripCameras;
+    stripCameras.reserve(_stripViewers.size());
+    for (const auto& viewer : _stripViewers) {
+        if (viewer) {
+            stripCameras.push_back(viewer->cameraState());
+        }
+    }
+
+    std::vector<CChunkedVolumeViewer::CameraState> bottomSliceCameras;
+    bottomSliceCameras.reserve(_bottomSliceViewers.size());
+    for (const auto& viewer : _bottomSliceViewers) {
+        if (viewer) {
+            bottomSliceCameras.push_back(viewer->cameraState());
+        }
+    }
+
     _suppressPaneClosed = true;
     if (_mdiArea) {
         _layout->removeWidget(_mdiArea);
@@ -301,10 +328,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedViews = views;
     _hasGeneratedViews = true;
     const double maxLinePosition = static_cast<double>(views.linePoints.size() - 1);
-    _currentLinePosition = std::clamp(static_cast<double>(views.initialCenterIndex),
-                                      0.0,
-                                      maxLinePosition);
-    _bottomCenterPosition = _currentLinePosition;
+    _currentLinePosition = replacingGeneratedViews
+        ? std::clamp(previousCurrentLinePosition, 0.0, maxLinePosition)
+        : std::clamp(static_cast<double>(views.initialCenterIndex), 0.0, maxLinePosition);
+    _bottomCenterPosition = replacingGeneratedViews
+        ? std::clamp(previousBottomCenterPosition, 0.0, maxLinePosition)
+        : _currentLinePosition;
     if (!updatePlaneSurface(views.currentCutSurface.get(), _currentLinePosition)) {
         return false;
     }
@@ -329,7 +358,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         return false;
     }
     currentViewer->setObjectName(tr("Current Line Cut"));
-    currentViewer->applyCameraState(generatedPaneCamera(currentViewer, camera), false);
+    currentViewer->applyCameraState(haveCurrentCutCamera
+                                        ? currentCutCamera
+                                        : generatedPaneCamera(currentViewer, camera),
+                                    false);
     bindPaneInteractions(views.currentCutName, currentViewer, false);
     connect(currentViewer,
             &CChunkedVolumeViewer::sendMousePressVolume,
@@ -359,6 +391,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         {views.lineSurfaceName, views.lineSurfaceTitle},
         {views.lineSideSliceName, views.lineSideSliceTitle},
     };
+    int stripIndex = 0;
     for (const auto& [surfaceName, title] : stripSpecs) {
         auto* base = _viewerManager->createViewerInWidget(
             surfaceName,
@@ -369,7 +402,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             return false;
         }
         viewer->setObjectName(title);
-        viewer->applyCameraState(generatedPaneCamera(viewer, camera), false);
+        viewer->applyCameraState(static_cast<size_t>(stripIndex) < stripCameras.size()
+                                     ? stripCameras[static_cast<size_t>(stripIndex)]
+                                     : generatedPaneCamera(viewer, camera),
+                                 false);
         bindPaneInteractions(surfaceName, viewer, false);
         connect(viewer,
                 &CChunkedVolumeViewer::sendMouseMoveVolume,
@@ -400,6 +436,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         stripLayout->addWidget(viewer, 1);
         _stripViewers.push_back(viewer);
         _panes.push_back(Pane{surfaceName, viewer, {}});
+        ++stripIndex;
     }
 
     auto* bottomWidget = new QWidget(this);
@@ -430,7 +467,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             return false;
         }
         viewer->setObjectName(tr("Line Z Slice %1").arg(slot));
-        viewer->applyCameraState(generatedPaneCamera(viewer, camera), false);
+        viewer->applyCameraState(static_cast<size_t>(slot) < bottomSliceCameras.size()
+                                     ? bottomSliceCameras[static_cast<size_t>(slot)]
+                                     : generatedPaneCamera(viewer, camera),
+                                 false);
         bindPaneInteractions(surfaceName, viewer, false);
         connect(viewer,
                 &CChunkedVolumeViewer::sendMousePressVolume,

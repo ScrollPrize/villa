@@ -75,6 +75,8 @@ struct LineOptimizationConfig {
     int segmentsPerSide = 100;
     double segmentLength = 16.0;
     double straightnessWeight = 1.0;
+    double tangentStraightnessWeight = -1.0;
+    double normalStraightnessWeight = -1.0;
     double normalAlignmentWeight = 1.0;
     double distanceWeight = 1.0;
     bool useInitialTangent = false;

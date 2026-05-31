@@ -67,7 +67,7 @@ TEST_CASE("LineOptimizer grows a centered line tangent to sampled normals")
     CHECK(result.report.converged);
     CHECK(result.report.validNormalSamples == 20 * 5);
     CHECK(result.report.invalidNormalSamples == 0);
-    REQUIRE(result.report.finalLosses.size() == 6);
+    REQUIRE(result.report.finalLosses.size() == 7);
     double weightedCost = 0.0;
     for (const auto& loss : result.report.finalLosses) {
         CHECK(loss.residuals >= 0);
@@ -184,6 +184,8 @@ TEST_CASE("LineOptimizer supports multiple fixed control points")
     };
     CHECK(lossByName("step_distance").residuals == 2);
     CHECK(lossByName("even_step").residuals == 2);
+    CHECK(lossByName("tangent_straightness").residuals > 0);
+    CHECK(lossByName("normal_straightness").residuals > 0);
     CHECK(lossByName("initial_direction").residuals == 0);
     CHECK(lossByName("tangent_guide").residuals == 0);
 
