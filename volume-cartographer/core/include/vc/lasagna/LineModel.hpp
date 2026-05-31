@@ -41,6 +41,12 @@ struct LineModel {
 };
 
 struct LineOptimizationConfig {
+    enum class TangentGuideMode {
+        None,
+        ProjectVectorOntoTangentPlane,
+        CrossVectorWithNormal,
+    };
+
     int segmentsPerSide = 10;
     double segmentLength = 50.0;
     double straightnessWeight = 1.0;
@@ -49,6 +55,9 @@ struct LineOptimizationConfig {
     bool useInitialTangent = false;
     cv::Vec3d initialTangent{0.0, 0.0, 0.0};
     double initialTangentWeight = 1.0;
+    TangentGuideMode tangentGuideMode = TangentGuideMode::None;
+    cv::Vec3d tangentGuideVector{0.0, 0.0, 0.0};
+    double tangentGuideWeight = 1.0;
     // Number of equal intervals evaluated per segment. A value of 4 stores
     // endpoints plus 3 intermediate samples, for 5 samples per segment.
     int samplesPerSegment = 4;

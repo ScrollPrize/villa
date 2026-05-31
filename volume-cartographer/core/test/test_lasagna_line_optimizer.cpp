@@ -67,7 +67,7 @@ TEST_CASE("LineOptimizer grows a centered line tangent to sampled normals")
     CHECK(result.report.converged);
     CHECK(result.report.validNormalSamples == 20 * 5);
     CHECK(result.report.invalidNormalSamples == 0);
-    REQUIRE(result.report.finalLosses.size() == 4);
+    REQUIRE(result.report.finalLosses.size() == 5);
     double weightedCost = 0.0;
     for (const auto& loss : result.report.finalLosses) {
         CHECK(loss.residuals >= 0);
@@ -96,6 +96,34 @@ TEST_CASE("LineOptimizer grows a centered line tangent to sampled normals")
         CHECK(segment.samples[2].t == doctest::Approx(0.5));
         CHECK(segment.samples[3].t == doctest::Approx(0.75));
     }
+}
+
+TEST_CASE("LineOptimizer follows live tangent guide inside sampled tangent plane")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 10.0;
+    config.straightnessWeight = 0.0;
+    config.normalAlignmentWeight = 0.0;
+    config.tangentGuideMode = vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
+    config.tangentGuideVector = {0.0, 1.0, 0.0};
+    config.tangentGuideWeight = 10.0;
+    config.useInitialTangent = true;
+    config.initialTangent = {1.0, 0.0, 0.0};
+    config.initialTangentWeight = 0.0;
+
+    const auto result = optimizer.optimizeFromSeed({0.0, 0.0, 0.0}, config);
+
+    REQUIRE(result.line.points.size() == 3);
+    const cv::Vec3d prevDelta = result.line.points[1].position - result.line.points[0].position;
+    const cv::Vec3d nextDelta = result.line.points[2].position - result.line.points[1].position;
+    CHECK(std::abs(prevDelta[0]) < 1.0e-3);
+    CHECK(std::abs(nextDelta[0]) < 1.0e-3);
+    CHECK(std::abs(prevDelta[1]) == doctest::Approx(10.0).epsilon(1.0e-5));
+    CHECK(std::abs(nextDelta[1]) == doctest::Approx(10.0).epsilon(1.0e-5));
 }
 
 TEST_CASE("LineOptimizer completes with missing normals and reports invalid samples")

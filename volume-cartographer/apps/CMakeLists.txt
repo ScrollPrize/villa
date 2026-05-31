@@ -129,6 +129,9 @@ target_link_libraries(vc_tifxyz_winding vc_core)
 add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
 target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
 
+add_executable(vc_lasagna_line_probe src/vc_lasagna_line_probe.cpp)
+target_link_libraries(vc_lasagna_line_probe vc_lasagna)
+
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
@@ -234,7 +237,7 @@ if(VC_USE_PCH)
         vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
         vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
         vc_cut_windings vc_tifxyz_winding vc_calc_surface_metrics
-        vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
+        vc_lasagna_line_probe vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
         vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
         vc_gen_normalgrids vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning
         vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress

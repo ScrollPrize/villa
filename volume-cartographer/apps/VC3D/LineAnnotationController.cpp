@@ -29,6 +29,7 @@
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
+#include <locale>
 #include <sstream>
 #include <utility>
 
@@ -125,13 +126,18 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
         vc::lasagna::LineOptimizationConfig config;
         config.segmentsPerSide = 50;
         config.segmentLength = 50.0;
-        config.straightnessWeight = 0.1;
+        config.straightnessWeight = 1.0;
         config.samplesPerSegment = 4;
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,
             sampler.sampleNormal(seedPoint));
         config.useInitialTangent = finiteDirection(config.initialTangent);
+        config.tangentGuideVector = normalizedOrZero(sourceSliceNormal);
+        config.tangentGuideWeight = 1.0;
+        config.tangentGuideMode = directionMode == LineAnnotationController::InitialDirectionMode::ZInOut
+            ? vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane
+            : vc::lasagna::LineOptimizationConfig::TangentGuideMode::CrossVectorWithNormal;
         task.result = optimizer.optimizeFromSeed(seedPoint, config);
         task.ok = true;
     } catch (const std::exception& ex) {
@@ -410,41 +416,31 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return;
         }
-        Logger()->info("Line annotation Lasagna optimization complete: points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={} termination=\"{}\"",
+        Logger()->info("Line annotation Lasagna optimization complete: points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={}",
                        session.optimizedLine.points.size(),
                        session.optimizationReport.iterations,
                        session.optimizationReport.initialCost,
                        session.optimizationReport.finalCost,
                        session.optimizationReport.validNormalSamples,
                        session.optimizationReport.invalidNormalSamples,
-                       session.optimizationReport.converged,
-                       session.optimizationReport.message);
-        if (!session.optimizationReport.iterationProgress.empty()) {
-            std::ostringstream progress;
-            progress << "Line annotation Lasagna Ceres iterations:";
-            for (const auto& iteration : session.optimizationReport.iterationProgress) {
-                progress << " iter=" << iteration.iteration
-                         << "{cost=" << iteration.cost
-                         << ", cost_change=" << iteration.costChange
-                         << ", gradient_max_norm=" << iteration.gradientMaxNorm
-                         << ", step_norm=" << iteration.stepNorm
-                         << ", trust_region_radius=" << iteration.trustRegionRadius
-                         << ", linear_solver_iterations=" << iteration.linearSolverIterations
-                         << ", step_successful=" << iteration.stepSuccessful
-                         << '}';
-            }
-            Logger()->info("{}", progress.str());
+                       session.optimizationReport.converged);
+        if (!session.optimizationReport.message.empty()) {
+            Logger()->info("Line annotation Lasagna Ceres report:\n{}",
+                           session.optimizationReport.message);
         }
         if (!session.optimizationReport.finalLosses.empty()) {
             std::ostringstream losses;
-            losses << "Line annotation Lasagna final loss breakdown:";
+            losses.imbue(std::locale::classic());
+            losses << std::scientific << std::setprecision(3);
+            losses << "Line annotation Lasagna final loss breakdown:\n"
+                   << "term                 n      weight    raw_cost weighted_cost\n";
             for (const auto& loss : session.optimizationReport.finalLosses) {
-                losses << ' ' << loss.name
-                       << "{residuals=" << loss.residuals
-                       << ", weight=" << loss.weight
-                       << ", raw_cost=" << loss.rawCost
-                       << ", weighted_cost=" << loss.weightedCost
-                       << '}';
+                losses << std::left << std::setw(18) << loss.name
+                       << std::right << std::setw(6) << loss.residuals
+                       << std::setw(12) << loss.weight
+                       << std::setw(12) << loss.rawCost
+                       << std::setw(14) << loss.weightedCost
+                       << '\n';
             }
             Logger()->info("{}", losses.str());
         }
