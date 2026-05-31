@@ -67,6 +67,15 @@ TEST_CASE("LineOptimizer grows a centered line tangent to sampled normals")
     CHECK(result.report.converged);
     CHECK(result.report.validNormalSamples == 20 * 5);
     CHECK(result.report.invalidNormalSamples == 0);
+    REQUIRE(result.report.finalLosses.size() == 4);
+    double weightedCost = 0.0;
+    for (const auto& loss : result.report.finalLosses) {
+        CHECK(loss.residuals >= 0);
+        CHECK(loss.rawCost >= 0.0);
+        CHECK(loss.weightedCost >= 0.0);
+        weightedCost += loss.weightedCost;
+    }
+    CHECK(weightedCost == doctest::Approx(result.report.finalCost).epsilon(1.0e-8));
 
     const auto& seedPoint = result.line.points[10].position;
     CHECK(seedPoint[0] == doctest::Approx(100.0));

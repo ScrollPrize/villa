@@ -7,6 +7,25 @@
 
 namespace vc::lasagna {
 
+struct LineOptimizationLossReport {
+    std::string name;
+    double weight = 0.0;
+    int residuals = 0;
+    double rawCost = 0.0;
+    double weightedCost = 0.0;
+};
+
+struct LineOptimizationIterationReport {
+    int iteration = 0;
+    double cost = 0.0;
+    double costChange = 0.0;
+    double gradientMaxNorm = 0.0;
+    double stepNorm = 0.0;
+    double trustRegionRadius = 0.0;
+    int linearSolverIterations = 0;
+    bool stepSuccessful = false;
+};
+
 struct LineOptimizationReport {
     double initialCost = 0.0;
     double finalCost = 0.0;
@@ -15,6 +34,8 @@ struct LineOptimizationReport {
     int invalidNormalSamples = 0;
     bool converged = false;
     std::string message;
+    std::vector<LineOptimizationLossReport> finalLosses;
+    std::vector<LineOptimizationIterationReport> iterationProgress;
 };
 
 struct LineOptimizationResult {

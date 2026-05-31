@@ -255,14 +255,14 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
                                          const std::vector<LineFrame>& frames,
                                          bool useSide)
 {
-    cv::Mat_<cv::Vec3f> points(static_cast<int>(samples.size()),
-                               static_cast<int>(offsets.size()));
-    for (int row = 0; row < points.rows; ++row) {
-        const auto& frame = frames[static_cast<size_t>(row)];
+    cv::Mat_<cv::Vec3f> points(static_cast<int>(offsets.size()),
+                               static_cast<int>(samples.size()));
+    for (int col = 0; col < points.cols; ++col) {
+        const auto& frame = frames[static_cast<size_t>(col)];
         const cv::Vec3d direction = useSide ? frame.side : frame.meshNormal;
-        for (int col = 0; col < points.cols; ++col) {
-            points(row, col) = toVec3f(samples[static_cast<size_t>(row)].position
-                                     + direction * offsets[static_cast<size_t>(col)]);
+        for (int row = 0; row < points.rows; ++row) {
+            points(row, col) = toVec3f(samples[static_cast<size_t>(col)].position
+                                     + direction * offsets[static_cast<size_t>(row)]);
         }
     }
     return std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});

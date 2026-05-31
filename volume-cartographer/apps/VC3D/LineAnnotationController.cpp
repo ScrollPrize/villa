@@ -410,14 +410,44 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return;
         }
-        Logger()->info("Line annotation Lasagna optimization complete: points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={}",
+        Logger()->info("Line annotation Lasagna optimization complete: points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={} termination=\"{}\"",
                        session.optimizedLine.points.size(),
                        session.optimizationReport.iterations,
                        session.optimizationReport.initialCost,
                        session.optimizationReport.finalCost,
                        session.optimizationReport.validNormalSamples,
                        session.optimizationReport.invalidNormalSamples,
-                       session.optimizationReport.converged);
+                       session.optimizationReport.converged,
+                       session.optimizationReport.message);
+        if (!session.optimizationReport.iterationProgress.empty()) {
+            std::ostringstream progress;
+            progress << "Line annotation Lasagna Ceres iterations:";
+            for (const auto& iteration : session.optimizationReport.iterationProgress) {
+                progress << " iter=" << iteration.iteration
+                         << "{cost=" << iteration.cost
+                         << ", cost_change=" << iteration.costChange
+                         << ", gradient_max_norm=" << iteration.gradientMaxNorm
+                         << ", step_norm=" << iteration.stepNorm
+                         << ", trust_region_radius=" << iteration.trustRegionRadius
+                         << ", linear_solver_iterations=" << iteration.linearSolverIterations
+                         << ", step_successful=" << iteration.stepSuccessful
+                         << '}';
+            }
+            Logger()->info("{}", progress.str());
+        }
+        if (!session.optimizationReport.finalLosses.empty()) {
+            std::ostringstream losses;
+            losses << "Line annotation Lasagna final loss breakdown:";
+            for (const auto& loss : session.optimizationReport.finalLosses) {
+                losses << ' ' << loss.name
+                       << "{residuals=" << loss.residuals
+                       << ", weight=" << loss.weight
+                       << ", raw_cost=" << loss.rawCost
+                       << ", weighted_cost=" << loss.weightedCost
+                       << '}';
+            }
+            Logger()->info("{}", losses.str());
+        }
         return;
     }
 
@@ -451,7 +481,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     session.generatedSurfaceNames.clear();
 
     std::vector<std::vector<std::pair<std::string, QString>>> rows;
-    std::map<std::string, cv::Vec3f> pointMarkers;
+    std::map<std::string, LineAnnotationDialog::GeneratedOverlay> overlays;
     rows.push_back({{"line-surface", tr("Line Surface")}});
     rows.push_back({{"line-side-slice", tr("Line Side Slice")}});
 
@@ -459,6 +489,25 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     _state->setSurface("line-side-slice", views.lineSideSlice);
     session.generatedSurfaceNames.push_back("line-surface");
     session.generatedSurfaceNames.push_back("line-side-slice");
+
+    std::vector<cv::Vec3f> linePoints;
+    linePoints.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points) {
+        linePoints.push_back({static_cast<float>(point.position[0]),
+                              static_cast<float>(point.position[1]),
+                              static_cast<float>(point.position[2])});
+    }
+
+    const cv::Vec3f seedPoint{static_cast<float>(session.seedPoint[0]),
+                              static_cast<float>(session.seedPoint[1]),
+                              static_cast<float>(session.seedPoint[2])};
+    LineAnnotationDialog::GeneratedOverlay lineOverlay;
+    lineOverlay.linePoints = linePoints;
+    lineOverlay.seedPoint = seedPoint;
+    lineOverlay.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
+    lineOverlay.useSurfaceCenterLine = true;
+    overlays.emplace("line-surface", lineOverlay);
+    overlays.emplace("line-side-slice", lineOverlay);
 
     std::vector<std::pair<std::string, QString>> zSliceRow;
     zSliceRow.reserve(views.lineZSlices.size());
@@ -475,10 +524,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
                              tr("Line Z Slice %1").arg(static_cast<int>(i))});
         if (i < session.optimizedLine.points.size()) {
             const auto& point = session.optimizedLine.points[i].position;
-            pointMarkers.emplace(surfaceName,
-                                 cv::Vec3f{static_cast<float>(point[0]),
-                                           static_cast<float>(point[1]),
-                                           static_cast<float>(point[2])});
+            LineAnnotationDialog::GeneratedOverlay overlay;
+            overlay.pointMarker = {static_cast<float>(point[0]),
+                                   static_cast<float>(point[1]),
+                                   static_cast<float>(point[2])};
+            overlays.emplace(surfaceName, overlay);
         }
     }
     if (!zSliceRow.empty()) {
@@ -498,7 +548,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         camera.zOffsetWorldDir = {0, 0, 0};
     }
 
-    if (!pane->dialog->setGeneratedRows(rows, camera, pointMarkers)) {
+    if (!pane->dialog->setGeneratedRows(rows, camera, overlays)) {
         for (const auto& name : session.generatedSurfaceNames) {
             _state->setSurface(name, nullptr);
         }

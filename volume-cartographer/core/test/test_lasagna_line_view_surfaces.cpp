@@ -57,14 +57,14 @@ TEST_CASE("LineViewBuilder creates ribbons from optimized control points")
     const auto surfacePoints = views.lineSurface->rawPoints();
     const auto sideSlicePoints = views.lineSideSlice->rawPoints();
 
-    REQUIRE(surfacePoints.rows == 3);
-    REQUIRE(surfacePoints.cols == 21);
-    REQUIRE(sideSlicePoints.rows == 3);
-    REQUIRE(sideSlicePoints.cols == 21);
+    REQUIRE(surfacePoints.rows == 21);
+    REQUIRE(surfacePoints.cols == 3);
+    REQUIRE(sideSlicePoints.rows == 21);
+    REQUIRE(sideSlicePoints.cols == 3);
 
-    checkVec(surfacePoints(0, 10), {0.0, 0.0, 0.0});
-    checkVec(surfacePoints(1, 10), {10.0, 0.0, 0.0});
-    checkVec(surfacePoints(2, 10), {20.0, 0.0, 0.0});
+    checkVec(surfacePoints(10, 0), {0.0, 0.0, 0.0});
+    checkVec(surfacePoints(10, 1), {10.0, 0.0, 0.0});
+    checkVec(surfacePoints(10, 2), {20.0, 0.0, 0.0});
 }
 
 TEST_CASE("LineViewBuilder default strip spacing matches optimized step")
@@ -72,12 +72,12 @@ TEST_CASE("LineViewBuilder default strip spacing matches optimized step")
     const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
     const auto surfacePoints = views.lineSurface->rawPoints();
 
-    REQUIRE(surfacePoints.rows == 3);
-    REQUIRE(surfacePoints.cols == 21);
+    REQUIRE(surfacePoints.rows == 21);
+    REQUIRE(surfacePoints.cols == 3);
 
-    checkVec(surfacePoints(1, 9), {10.0, -10.0, 0.0});
-    checkVec(surfacePoints(1, 10), {10.0, 0.0, 0.0});
-    checkVec(surfacePoints(1, 11), {10.0, 10.0, 0.0});
+    checkVec(surfacePoints(9, 1), {10.0, -10.0, 0.0});
+    checkVec(surfacePoints(10, 1), {10.0, 0.0, 0.0});
+    checkVec(surfacePoints(11, 1), {10.0, 10.0, 0.0});
 }
 
 TEST_CASE("LineViewBuilder offsets line-surface along side and side-slice along normal")
@@ -91,13 +91,13 @@ TEST_CASE("LineViewBuilder offsets line-surface along side and side-slice along 
     const auto surfacePoints = views.lineSurface->rawPoints();
     const auto sideSlicePoints = views.lineSideSlice->rawPoints();
 
-    checkVec(surfacePoints(1, 0), {10.0, -2.0, 0.0});
+    checkVec(surfacePoints(0, 1), {10.0, -2.0, 0.0});
     checkVec(surfacePoints(1, 1), {10.0, 0.0, 0.0});
-    checkVec(surfacePoints(1, 2), {10.0, 2.0, 0.0});
+    checkVec(surfacePoints(2, 1), {10.0, 2.0, 0.0});
 
-    checkVec(sideSlicePoints(1, 0), {10.0, 0.0, -3.0});
+    checkVec(sideSlicePoints(0, 1), {10.0, 0.0, -3.0});
     checkVec(sideSlicePoints(1, 1), {10.0, 0.0, 0.0});
-    checkVec(sideSlicePoints(1, 2), {10.0, 0.0, 3.0});
+    checkVec(sideSlicePoints(2, 1), {10.0, 0.0, 3.0});
 }
 
 TEST_CASE("LineViewBuilder uses fitted mesh normal for side-slice")
@@ -111,11 +111,11 @@ TEST_CASE("LineViewBuilder uses fitted mesh normal for side-slice")
                                                           config);
     const auto sideSlicePoints = views.lineSideSlice->rawPoints();
 
-    checkVec(sideSlicePoints(1, 0), {10.0, 0.0, -3.0});
+    checkVec(sideSlicePoints(0, 1), {10.0, 0.0, -3.0});
     checkVec(sideSlicePoints(1, 1), {10.0, 0.0, 0.0});
-    checkVec(sideSlicePoints(1, 2), {10.0, 0.0, 3.0});
+    checkVec(sideSlicePoints(2, 1), {10.0, 0.0, 3.0});
 
-    const cv::Vec3f offset = sideSlicePoints(1, 2) - sideSlicePoints(1, 1);
+    const cv::Vec3f offset = sideSlicePoints(2, 1) - sideSlicePoints(1, 1);
     CHECK(offset[0] == doctest::Approx(0.0));
 }
 
@@ -140,14 +140,14 @@ TEST_CASE("LineViewBuilder uses finite deterministic fallback frames")
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();
 
-    REQUIRE(points.rows == 3);
-    REQUIRE(points.cols == 21);
+    REQUIRE(points.rows == 21);
+    REQUIRE(points.cols == 3);
     for (int row = 0; row < points.rows; ++row) {
         for (int col = 0; col < points.cols; ++col) {
             CHECK(finitePoint(points(row, col)));
         }
     }
-    checkVec(points(1, 10), {10.0, 0.0, 0.0});
+    checkVec(points(10, 1), {10.0, 0.0, 0.0});
 }
 
 TEST_CASE("LineViewBuilder rejects empty models and invalid cross-sample counts")
@@ -169,11 +169,11 @@ TEST_CASE("LineViewBuilder ignores dense segment samples for generated mesh rows
     REQUIRE(views.lineSurface);
     const auto points = views.lineSurface->rawPoints();
 
-    REQUIRE(points.rows == 3);
-    REQUIRE(points.cols == 21);
-    checkVec(points(0, 10), {0.0, 0.0, 0.0});
-    checkVec(points(1, 10), {10.0, 0.0, 0.0});
-    checkVec(points(2, 10), {20.0, 0.0, 0.0});
+    REQUIRE(points.rows == 21);
+    REQUIRE(points.cols == 3);
+    checkVec(points(10, 0), {0.0, 0.0, 0.0});
+    checkVec(points(10, 1), {10.0, 0.0, 0.0});
+    checkVec(points(10, 2), {20.0, 0.0, 0.0});
 }
 
 TEST_CASE("LineViewBuilder uses control point count even with duplicated segment-boundary samples")
@@ -187,8 +187,8 @@ TEST_CASE("LineViewBuilder uses control point count even with duplicated segment
     const auto views = vc::lasagna::buildLineViewSurfaces(line);
     const auto points = views.lineSurface->rawPoints();
 
-    REQUIRE(points.rows == 3);
-    checkVec(points(1, 10), {10.0, 0.0, 0.0});
+    REQUIRE(points.cols == 3);
+    checkVec(points(10, 1), {10.0, 0.0, 0.0});
 }
 
 TEST_CASE("LineViewBuilder falls back when all normals or tangents are degenerate")

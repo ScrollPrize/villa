@@ -1,18 +1,16 @@
 #include "LineAnnotationDialog.hpp"
 
 #include "ViewerManager.hpp"
+#include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QBrush>
 #include <QComboBox>
-#include <QGraphicsEllipseItem>
 #include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QMdiArea>
-#include <QPen>
 #include <QMdiSubWindow>
 #include <QPushButton>
-#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -46,6 +44,34 @@ CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* view
     const float scaleY = kNominalGeneratedRowHeight / static_cast<float>(std::max(1, size.height));
     camera.scale = std::clamp(std::min(scaleX, scaleY) * kPadding, 0.5f, 16.0f);
     return camera;
+}
+
+bool finitePoint(const cv::Vec3f& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+bool finiteScenePoint(const QPointF& point)
+{
+    return std::isfinite(point.x()) && std::isfinite(point.y());
+}
+
+QPointF quadGridToScene(CChunkedVolumeViewer* viewer, QuadSurface* surface, int row, int col)
+{
+    if (!viewer || !surface) {
+        return {};
+    }
+    const auto* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return {};
+    }
+    const cv::Vec2f scale = surface->scale();
+    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+        return {};
+    }
+    const float surfaceX = (static_cast<float>(col) - static_cast<float>(points->cols) / 2.0f) / scale[0];
+    const float surfaceY = (static_cast<float>(row) - static_cast<float>(points->rows) / 2.0f) / scale[1];
+    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
 }
 
 } // namespace
@@ -133,7 +159,7 @@ CChunkedVolumeViewer* LineAnnotationDialog::addPane(
 bool LineAnnotationDialog::setGeneratedRows(
     const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
     const CChunkedVolumeViewer::CameraState& camera,
-    const std::map<std::string, cv::Vec3f>& pointMarkers)
+    const std::map<std::string, GeneratedOverlay>& overlays)
 {
     if (!_viewerManager || !_layout) {
         return false;
@@ -180,8 +206,8 @@ bool LineAnnotationDialog::setGeneratedRows(
             bindPaneInteractions(surfaceName, viewer, false);
             rowLayout->addWidget(viewer, 1);
             _panes.push_back(Pane{surfaceName, viewer, {}});
-            if (auto marker = pointMarkers.find(surfaceName); marker != pointMarkers.end()) {
-                setLinePointMarker(surfaceName, viewer, marker->second);
+            if (auto overlay = overlays.find(surfaceName); overlay != overlays.end()) {
+                setGeneratedOverlay(surfaceName, viewer, overlay->second);
             }
         }
     }
@@ -212,39 +238,109 @@ void LineAnnotationDialog::bindPaneInteractions(const std::string& surfaceName,
             });
 }
 
-void LineAnnotationDialog::setLinePointMarker(const std::string& surfaceName,
-                                              CChunkedVolumeViewer* viewer,
-                                              const cv::Vec3f& volumePoint)
+void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
+                                               CChunkedVolumeViewer* viewer,
+                                               const GeneratedOverlay& overlay)
 {
     if (!viewer) {
         return;
     }
 
-    const auto key = "line_annotation_point_" + surfaceName;
     QPointer<CChunkedVolumeViewer> viewerPtr(viewer);
-    QTimer::singleShot(0, this, [viewerPtr, volumePoint, key]() {
+    const auto apply = [this, surfaceName, viewerPtr, overlay]() {
         if (!viewerPtr) {
             return;
         }
-        viewerPtr->renderVisible(true, "line annotation point marker");
-        const QPointF scenePoint = viewerPtr->volumeToScene(volumePoint);
-        if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
-            return;
+        applyGeneratedOverlay(surfaceName, viewerPtr, overlay);
+    };
+    viewer->renderVisible(true, "line annotation overlay");
+    apply();
+    viewer->connectOverlaysUpdated(this, apply);
+}
+
+void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
+                                                 CChunkedVolumeViewer* viewer,
+                                                 const GeneratedOverlay& overlay)
+{
+    if (!viewer) {
+        return;
+    }
+
+    const auto key = "line_annotation_overlay_" + surfaceName;
+    std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
+    primitives.reserve(3);
+
+    ViewerOverlayControllerBase::OverlayStyle lineStyle;
+    lineStyle.penColor = QColor(0, 220, 255, 190);
+    lineStyle.penWidth = 1.0;
+    lineStyle.z = 150.0;
+
+    ViewerOverlayControllerBase::OverlayStyle seedStyle;
+    seedStyle.penColor = QColor(255, 230, 0, 220);
+    seedStyle.brushColor = QColor(255, 230, 0, 170);
+    seedStyle.penWidth = 1.5;
+    seedStyle.z = 152.0;
+
+    std::vector<QPointF> sceneLine;
+    QPointF seedScene;
+    bool hasSeedScene = false;
+
+    if (overlay.useSurfaceCenterLine) {
+        auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        const auto* points = quad ? quad->rawPointsPtr() : nullptr;
+        if (points && !points->empty()) {
+            const int row = points->rows / 2;
+            sceneLine.reserve(static_cast<size_t>(points->cols));
+            for (int col = 0; col < points->cols; ++col) {
+                const QPointF scenePoint = quadGridToScene(viewer, quad, row, col);
+                if (finiteScenePoint(scenePoint)) {
+                    sceneLine.push_back(scenePoint);
+                }
+            }
+            if (overlay.seedLineIndex >= 0 && overlay.seedLineIndex < points->cols) {
+                seedScene = quadGridToScene(viewer, quad, row, overlay.seedLineIndex);
+                hasSeedScene = finiteScenePoint(seedScene);
+            }
         }
+    } else if (!overlay.linePoints.empty()) {
+        sceneLine.reserve(overlay.linePoints.size());
+        for (const auto& point : overlay.linePoints) {
+            if (!finitePoint(point)) {
+                continue;
+            }
+            const QPointF scenePoint = viewer->volumeToScene(point);
+            if (finiteScenePoint(scenePoint)) {
+                sceneLine.push_back(scenePoint);
+            }
+        }
+    }
 
-        auto* marker = new QGraphicsEllipseItem(scenePoint.x() - 5.0,
-                                                scenePoint.y() - 5.0,
-                                                10.0,
-                                                10.0);
-        QPen pen(QColor(255, 230, 0), 2.0);
-        pen.setCosmetic(true);
-        marker->setPen(pen);
-        marker->setBrush(QBrush(QColor(255, 230, 0, 180)));
-        marker->setZValue(150.0);
-        marker->setAcceptedMouseButtons(Qt::NoButton);
+    if (sceneLine.size() >= 2) {
+        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+            sceneLine,
+            false,
+            lineStyle});
+    }
 
-        viewerPtr->setOverlayGroup(key, {marker});
-    });
+    if (!hasSeedScene) {
+        const cv::Vec3f markerPoint = finitePoint(overlay.seedPoint)
+            ? overlay.seedPoint
+            : overlay.pointMarker;
+        if (finitePoint(markerPoint)) {
+            seedScene = viewer->volumeToScene(markerPoint);
+            hasSeedScene = finiteScenePoint(seedScene);
+        }
+    }
+
+    if (hasSeedScene) {
+        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+            seedScene,
+            4.0,
+            true,
+            seedStyle});
+    }
+
+    ViewerOverlayControllerBase::applyPrimitives(viewer, key, std::move(primitives));
 }
 
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)

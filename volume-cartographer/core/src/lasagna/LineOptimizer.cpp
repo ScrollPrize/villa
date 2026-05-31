@@ -276,6 +276,125 @@ struct DirectionResidual {
     double weight = 1.0;
 };
 
+struct LossAccumulator {
+    std::string name;
+    double weight = 0.0;
+    int residuals = 0;
+    double rawCost = 0.0;
+    double weightedCost = 0.0;
+
+    void add(double rawResidual)
+    {
+        if (!std::isfinite(rawResidual)) {
+            rawResidual = 0.0;
+        }
+        const double weightedResidual = rawResidual * weight;
+        rawCost += 0.5 * rawResidual * rawResidual;
+        weightedCost += 0.5 * weightedResidual * weightedResidual;
+        ++residuals;
+    }
+};
+
+[[nodiscard]] LineOptimizationLossReport toReport(const LossAccumulator& loss)
+{
+    return {loss.name, loss.weight, loss.residuals, loss.rawCost, loss.weightedCost};
+}
+
+[[nodiscard]] std::vector<LineOptimizationLossReport> evaluateLosses(
+    const std::vector<std::array<double, 3>>& points,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config,
+    int seedIndex,
+    const cv::Vec3d& seedTangent)
+{
+    LossAccumulator distance{"distance", config.distanceWeight};
+    LossAccumulator straightness{"straightness", config.straightnessWeight};
+    LossAccumulator normalAlignment{"normal_alignment", config.normalAlignmentWeight};
+    LossAccumulator initialDirection{"initial_direction", config.initialTangentWeight};
+
+    for (size_t i = 0; i + 1 < points.size(); ++i) {
+        const cv::Vec3d a{points[i][0], points[i][1], points[i][2]};
+        const cv::Vec3d b{points[i + 1][0], points[i + 1][1], points[i + 1][2]};
+        distance.add(std::sqrt((b - a).dot(b - a) + kEpsilon) - config.segmentLength);
+    }
+
+    for (size_t i = 1; i + 1 < points.size(); ++i) {
+        for (int axis = 0; axis < 3; ++axis) {
+            straightness.add(points[i - 1][axis] - 2.0 * points[i][axis] + points[i + 1][axis]);
+        }
+    }
+
+    for (size_t segment = 0; segment + 1 < points.size(); ++segment) {
+        const cv::Vec3d a{points[segment][0], points[segment][1], points[segment][2]};
+        const cv::Vec3d b{points[segment + 1][0], points[segment + 1][1], points[segment + 1][2]};
+        const cv::Vec3d d = b - a;
+        const double len = length(d);
+        for (int sample = 0; sample <= config.samplesPerSegment; ++sample) {
+            if (len <= kEpsilon) {
+                normalAlignment.add(0.0);
+                continue;
+            }
+            const double t = static_cast<double>(sample) /
+                             static_cast<double>(config.samplesPerSegment);
+            const NormalSample normalSample = sampler.sampleNormal(lerp(a, b, t));
+            const cv::Vec3d normal = normalizedOrZero(normalSample.normal);
+            if (!normalSample.valid || length(normal) <= kEpsilon) {
+                normalAlignment.add(0.0);
+                continue;
+            }
+            normalAlignment.add((d / len).dot(normal));
+        }
+    }
+
+    if (config.useInitialTangent &&
+        config.initialTangentWeight > 0.0 &&
+        length(seedTangent) > kEpsilon &&
+        seedIndex > 0 &&
+        seedIndex + 1 < static_cast<int>(points.size())) {
+        const cv::Vec3d direction = normalizedOrZero(seedTangent);
+        const auto addDirection = [&](const std::array<double, 3>& p0,
+                                      const std::array<double, 3>& p1) {
+            const cv::Vec3d d{p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+            const double len = std::sqrt(d.dot(d) + kEpsilon);
+            const cv::Vec3d unit = d * (1.0 / len);
+            const cv::Vec3d cross = unit.cross(direction);
+            initialDirection.add(cross[0]);
+            initialDirection.add(cross[1]);
+            initialDirection.add(cross[2]);
+        };
+        addDirection(points[seedIndex - 1], points[seedIndex]);
+        addDirection(points[seedIndex], points[seedIndex + 1]);
+    }
+
+    std::vector<LineOptimizationLossReport> losses;
+    losses.reserve(4);
+    losses.push_back(toReport(distance));
+    losses.push_back(toReport(straightness));
+    losses.push_back(toReport(normalAlignment));
+    losses.push_back(toReport(initialDirection));
+    return losses;
+}
+
+[[nodiscard]] std::vector<LineOptimizationIterationReport> iterationReports(
+    const ceres::Solver::Summary& summary)
+{
+    std::vector<LineOptimizationIterationReport> reports;
+    reports.reserve(summary.iterations.size());
+    for (const auto& iteration : summary.iterations) {
+        reports.push_back({
+            iteration.iteration,
+            iteration.cost,
+            iteration.cost_change,
+            iteration.gradient_max_norm,
+            iteration.step_norm,
+            iteration.trust_region_radius,
+            iteration.linear_solver_iterations,
+            iteration.step_is_successful,
+        });
+    }
+    return reports;
+}
+
 void addResiduals(
     ceres::Problem& problem,
     std::vector<std::array<double, 3>>& points,
@@ -404,7 +523,9 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     result.report.validNormalSamples = finalValidSamples;
     result.report.invalidNormalSamples = finalInvalidSamples;
     result.report.converged = summary.IsSolutionUsable();
-    result.report.message = summary.BriefReport();
+    result.report.message = summary.FullReport();
+    result.report.finalLosses = evaluateLosses(points, normalSampler_, config, seedIndex, tangent);
+    result.report.iterationProgress = iterationReports(summary);
 
     return result;
 }

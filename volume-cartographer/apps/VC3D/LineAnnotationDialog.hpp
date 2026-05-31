@@ -1,10 +1,12 @@
 #pragma once
 
 #include <QDialog>
+#include <QMetaObject>
 #include <QPointer>
 
 #include <memory>
 #include <map>
+#include <limits>
 #include <string>
 #include <vector>
 #include <utility>
@@ -37,6 +39,18 @@ public:
         QPointer<QMdiSubWindow> subWindow;
     };
 
+    struct GeneratedOverlay {
+        std::vector<cv::Vec3f> linePoints;
+        cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f pointMarker{std::numeric_limits<float>::quiet_NaN(),
+                              std::numeric_limits<float>::quiet_NaN(),
+                              std::numeric_limits<float>::quiet_NaN()};
+        int seedLineIndex = -1;
+        bool useSurfaceCenterLine = false;
+    };
+
     explicit LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent = nullptr);
 
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
@@ -45,7 +59,7 @@ public:
     bool setGeneratedRows(
         const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
         const CChunkedVolumeViewer::CameraState& camera,
-        const std::map<std::string, cv::Vec3f>& pointMarkers = {});
+        const std::map<std::string, GeneratedOverlay>& overlays = {});
     const std::vector<Pane>& panes() const { return _panes; }
     InitialDirectionMode initialDirectionMode() const;
 
@@ -61,9 +75,12 @@ private:
     void bindPaneInteractions(const std::string& surfaceName,
                               CChunkedVolumeViewer* viewer,
                               bool seedPlacementEnabled);
-    void setLinePointMarker(const std::string& surfaceName,
-                            CChunkedVolumeViewer* viewer,
-                            const cv::Vec3f& volumePoint);
+    void setGeneratedOverlay(const std::string& surfaceName,
+                             CChunkedVolumeViewer* viewer,
+                             const GeneratedOverlay& overlay);
+    void applyGeneratedOverlay(const std::string& surfaceName,
+                               CChunkedVolumeViewer* viewer,
+                               const GeneratedOverlay& overlay);
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
