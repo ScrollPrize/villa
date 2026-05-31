@@ -126,7 +126,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
         vc::lasagna::LineOptimizationConfig config;
         config.segmentsPerSide = 50;
         config.segmentLength = 50.0;
-        config.straightnessWeight = 1.0;
+        config.straightnessWeight = 0.1;
         config.samplesPerSegment = 4;
         config.initialTangent = initialTangentForMode(
             directionMode,

@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace vc::lasagna {
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
+constexpr double kRollSmoothness = 4.0;
+constexpr int kRollSmoothIterations = 80;
 
 bool finite(const cv::Vec3d& v)
 {
@@ -201,6 +204,115 @@ cv::Vec3d sideDirection(const cv::Vec3d& normal, const cv::Vec3d& tangent)
     return {0.0, 1.0, 0.0};
 }
 
+cv::Vec3d projectToTangentPlane(const cv::Vec3d& vector, const cv::Vec3d& tangent)
+{
+    const cv::Vec3d projected = vector - tangent * vector.dot(tangent);
+    return normalizedOrZero(projected);
+}
+
+double clamped(double value, double minValue, double maxValue)
+{
+    return std::max(minValue, std::min(maxValue, value));
+}
+
+cv::Vec3d rotateAroundAxis(const cv::Vec3d& vector, const cv::Vec3d& axis, double angle)
+{
+    const cv::Vec3d unitAxis = normalizedOrZero(axis);
+    if (!validDirection(unitAxis)) {
+        return vector;
+    }
+    const double c = std::cos(angle);
+    const double s = std::sin(angle);
+    return vector * c + unitAxis.cross(vector) * s + unitAxis * (unitAxis.dot(vector) * (1.0 - c));
+}
+
+cv::Vec3d transportNormal(const cv::Vec3d& previousNormal,
+                          const cv::Vec3d& previousTangent,
+                          const cv::Vec3d& tangent)
+{
+    const cv::Vec3d axis = previousTangent.cross(tangent);
+    const double sinAngle = norm(axis);
+    const double cosAngle = clamped(previousTangent.dot(tangent), -1.0, 1.0);
+    cv::Vec3d transported = previousNormal;
+    if (sinAngle > kEpsilon) {
+        transported = rotateAroundAxis(previousNormal, axis, std::atan2(sinAngle, cosAngle));
+    }
+    transported = projectToTangentPlane(transported, tangent);
+    if (validDirection(transported)) {
+        return transported;
+    }
+
+    const cv::Vec3d side = sideDirection(axisFallbackLeastAlignedWith(tangent), tangent);
+    transported = normalizedOrZero(tangent.cross(side));
+    if (validDirection(transported)) {
+        return transported;
+    }
+    return {0.0, 0.0, 1.0};
+}
+
+double unwrapNear(double angle, double reference)
+{
+    constexpr double twoPi = 2.0 * 3.14159265358979323846;
+    while (angle - reference > 3.14159265358979323846) {
+        angle -= twoPi;
+    }
+    while (angle - reference < -3.14159265358979323846) {
+        angle += twoPi;
+    }
+    return angle;
+}
+
+std::vector<double> smoothRollAngles(const std::vector<double>& targets)
+{
+    std::vector<double> angles = targets;
+    if (angles.size() < 2) {
+        return angles;
+    }
+
+    for (int iteration = 0; iteration < kRollSmoothIterations; ++iteration) {
+        for (size_t i = 0; i < angles.size(); ++i) {
+            double neighborSum = 0.0;
+            double neighborCount = 0.0;
+            if (i > 0) {
+                neighborSum += angles[i - 1];
+                neighborCount += 1.0;
+            }
+            if (i + 1 < angles.size()) {
+                neighborSum += angles[i + 1];
+                neighborCount += 1.0;
+            }
+            angles[i] = (targets[i] + kRollSmoothness * neighborSum) /
+                        (1.0 + kRollSmoothness * neighborCount);
+        }
+    }
+    return angles;
+}
+
+std::vector<cv::Vec3d> alignedTargetNormals(const std::vector<cv::Vec3d>& normals,
+                                            const std::vector<cv::Vec3d>& tangents,
+                                            const std::vector<cv::Vec3d>& baseNormals)
+{
+    std::vector<cv::Vec3d> targets(normals.size(), {0.0, 0.0, 0.0});
+    cv::Vec3d previous{0.0, 0.0, 0.0};
+    for (size_t row = 0; row < normals.size(); ++row) {
+        cv::Vec3d target = projectToTangentPlane(normalizedOrZero(normals[row]), tangents[row]);
+        if (!validDirection(target)) {
+            targets[row] = previous;
+            continue;
+        }
+
+        const cv::Vec3d reference = validDirection(previous) && row > 0
+            ? transportNormal(previous, tangents[row - 1], tangents[row])
+            : baseNormals[row];
+        if (validDirection(reference) && target.dot(reference) < 0.0) {
+            target *= -1.0;
+        }
+        targets[row] = target;
+        previous = target;
+    }
+    return targets;
+}
+
 struct LineFrame {
     cv::Vec3d side;
     cv::Vec3d meshNormal;
@@ -212,39 +324,71 @@ std::vector<LineFrame> buildFrames(const std::vector<SegmentNormalSample>& sampl
     std::vector<LineFrame> frames;
     frames.reserve(samples.size());
 
-    cv::Vec3d previousSide{0.0, 0.0, 0.0};
-    cv::Vec3d previousNormal{0.0, 0.0, 0.0};
+    std::vector<cv::Vec3d> tangents;
+    std::vector<cv::Vec3d> baseNormals;
+    tangents.reserve(samples.size());
+    baseNormals.reserve(samples.size());
+
     for (size_t row = 0; row < samples.size(); ++row) {
-        const cv::Vec3d tangent = tangentAt(samples, row);
-        const cv::Vec3d sampledNormal = normalizedOrZero(normals[row]);
+        tangents.push_back(tangentAt(samples, row));
+    }
 
-        cv::Vec3d side = sideDirection(sampledNormal, tangent);
-        if (validDirection(previousSide) && side.dot(previousSide) < 0.0) {
-            side *= -1.0;
-        }
+    cv::Vec3d normal = projectToTangentPlane(normalizedOrZero(normals.front()), tangents.front());
+    if (!validDirection(normal)) {
+        normal = normalizedOrZero(tangents.front().cross(sideDirection(axisFallbackLeastAlignedWith(tangents.front()),
+                                                                       tangents.front())));
+    }
+    if (!validDirection(normal)) {
+        normal = {0.0, 0.0, 1.0};
+    }
+    baseNormals.push_back(normal);
 
-        cv::Vec3d meshNormal = normalizedOrZero(tangent.cross(side));
-        if (!validDirection(meshNormal)) {
-            meshNormal = sampledNormal;
-        }
-        if (!validDirection(meshNormal)) {
-            meshNormal = normalizedOrZero(tangent.cross(sideDirection(axisFallbackLeastAlignedWith(tangent),
-                                                                       tangent)));
-        }
-        if (!validDirection(meshNormal)) {
-            meshNormal = {0.0, 0.0, 1.0};
-        }
-        if (validDirection(sampledNormal) && meshNormal.dot(sampledNormal) < 0.0) {
-            meshNormal *= -1.0;
-            side *= -1.0;
-        }
-        if (validDirection(previousNormal) && meshNormal.dot(previousNormal) < 0.0) {
-            meshNormal *= -1.0;
-            side *= -1.0;
+    for (size_t row = 1; row < samples.size(); ++row) {
+        baseNormals.push_back(transportNormal(baseNormals.back(), tangents[row - 1], tangents[row]));
+    }
+
+    const std::vector<cv::Vec3d> targetNormals = alignedTargetNormals(normals, tangents, baseNormals);
+    std::vector<double> rollTargets(samples.size(), 0.0);
+    for (size_t row = 0; row < samples.size(); ++row) {
+        const cv::Vec3d targetNormal = targetNormals[row];
+        if (!validDirection(targetNormal)) {
+            rollTargets[row] = row > 0 ? rollTargets[row - 1] : 0.0;
+            continue;
         }
 
-        previousSide = side;
-        previousNormal = meshNormal;
+        const cv::Vec3d binormal = normalizedOrZero(tangents[row].cross(baseNormals[row]));
+        if (!validDirection(binormal)) {
+            rollTargets[row] = row > 0 ? rollTargets[row - 1] : 0.0;
+            continue;
+        }
+
+        double angle = std::atan2(targetNormal.dot(binormal), targetNormal.dot(baseNormals[row]));
+        if (row > 0) {
+            angle = unwrapNear(angle, rollTargets[row - 1]);
+        }
+        rollTargets[row] = angle;
+    }
+
+    const std::vector<double> rollAngles = smoothRollAngles(rollTargets);
+    cv::Vec3d previousFrameNormal{0.0, 0.0, 0.0};
+    for (size_t row = 0; row < samples.size(); ++row) {
+        cv::Vec3d meshNormal = rotateAroundAxis(baseNormals[row], tangents[row], rollAngles[row]);
+        meshNormal = projectToTangentPlane(meshNormal, tangents[row]);
+        if (!validDirection(meshNormal)) {
+            meshNormal = baseNormals[row];
+        }
+        if (validDirection(previousFrameNormal) && row > 0) {
+            const cv::Vec3d reference = transportNormal(previousFrameNormal, tangents[row - 1], tangents[row]);
+            if (validDirection(reference) && meshNormal.dot(reference) < 0.0) {
+                meshNormal *= -1.0;
+            }
+        }
+        cv::Vec3d side = normalizedOrZero(meshNormal.cross(tangents[row]));
+        if (!validDirection(side)) {
+            side = sideDirection(axisFallbackLeastAlignedWith(tangents[row]), tangents[row]);
+            meshNormal = normalizedOrZero(tangents[row].cross(side));
+        }
+        previousFrameNormal = meshNormal;
         frames.push_back({side, meshNormal});
     }
     return frames;
@@ -266,6 +410,27 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
         }
     }
     return std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+}
+
+std::vector<LineFrame> framesAtControlPoints(const std::vector<SegmentNormalSample>& controlSamples,
+                                             const std::vector<SegmentNormalSample>& frameSamples,
+                                             const std::vector<LineFrame>& frameSamplesFrames)
+{
+    std::vector<LineFrame> frames;
+    frames.reserve(controlSamples.size());
+    for (const auto& controlSample : controlSamples) {
+        size_t bestIndex = 0;
+        double bestDistance = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < frameSamples.size(); ++i) {
+            const double distance = norm(frameSamples[i].position - controlSample.position);
+            if (distance < bestDistance) {
+                bestIndex = i;
+                bestDistance = distance;
+            }
+        }
+        frames.push_back(frameSamplesFrames[bestIndex]);
+    }
+    return frames;
 }
 
 cv::Vec3d pointTangent(const LineModel& line, size_t index)
@@ -297,8 +462,13 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         throw std::invalid_argument("Cannot build line annotation views for an empty LineModel");
     }
 
-    const auto normals = resolvedNormals(samples);
-    const auto frames = buildFrames(samples, normals);
+    auto frameSamples = denseSamples(line);
+    if (frameSamples.empty()) {
+        frameSamples = samples;
+    }
+    const auto frameNormals = resolvedNormals(frameSamples);
+    const auto denseFrames = buildFrames(frameSamples, frameNormals);
+    const auto frames = framesAtControlPoints(samples, frameSamples, denseFrames);
     const double surfaceHalfWidth = resolvedHalfExtent(config.surfaceHalfWidth,
                                                        samples,
                                                        config.crossSamples);
