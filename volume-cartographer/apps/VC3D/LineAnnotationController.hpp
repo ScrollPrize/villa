@@ -38,6 +38,7 @@ public:
         bool ok = false;
         std::filesystem::path manifestPath;
         cv::Vec3d seedPoint{0.0, 0.0, 0.0};
+        std::vector<vc::lasagna::LineControlPoint> controlPoints;
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
@@ -48,7 +49,7 @@ public:
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using OptimizationTaskFactory =
         std::function<OptimizationTaskResult(std::filesystem::path,
-                                             cv::Vec3d,
+                                             std::vector<vc::lasagna::LineControlPoint>,
                                              cv::Vec3d,
                                              InitialDirectionMode)>;
 
@@ -88,8 +89,11 @@ private:
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
                         InitialDirectionMode directionMode);
+    void handleGeneratedControlPoint(const std::string& surfaceName,
+                                     cv::Vec3f volumePoint,
+                                     double linePosition);
     bool ensureDatasetForSession(LineAnnotationSession& session);
-    void startOptimization(LineAnnotationSession& session, cv::Vec3d seedPoint);
+    void startOptimization(LineAnnotationSession& session);
     void finishOptimization(const std::string& surfaceName);
     bool materializeGeneratedViews(LineAnnotationSession& session);
     void handleShowAsMesh(const std::string& surfaceName);
@@ -102,7 +106,7 @@ private:
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
-                                                             cv::Vec3d seedPoint,
+                                                             std::vector<vc::lasagna::LineControlPoint> controlPoints,
                                                              cv::Vec3d sourceSliceNormal,
                                                              InitialDirectionMode directionMode) const;
     void showError(const QString& message) const;

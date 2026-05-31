@@ -177,6 +177,30 @@ struct DistanceResidual {
     double weight = 1.0;
 };
 
+struct EvenStepResidual {
+    explicit EvenStepResidual(double weight)
+        : weight(weight)
+    {
+    }
+
+    template <typename T>
+    bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const
+    {
+        const T abx = b[0] - a[0];
+        const T aby = b[1] - a[1];
+        const T abz = b[2] - a[2];
+        const T bcx = c[0] - b[0];
+        const T bcy = c[1] - b[1];
+        const T bcz = c[2] - b[2];
+        const T ab = ceres::sqrt(abx * abx + aby * aby + abz * abz + T(kEpsilon));
+        const T bc = ceres::sqrt(bcx * bcx + bcy * bcy + bcz * bcz + T(kEpsilon));
+        residual[0] = T(weight) * (ab - bc);
+        return true;
+    }
+
+    double weight = 1.0;
+};
+
 struct StraightnessResidual {
     explicit StraightnessResidual(double weight)
         : weight(weight)
@@ -193,6 +217,16 @@ struct StraightnessResidual {
     }
 
     double weight = 1.0;
+};
+
+enum class SegmentSpacingMode {
+    FixedStep,
+    EvenStep,
+};
+
+struct SegmentSpacingConstraint {
+    SegmentSpacingMode mode = SegmentSpacingMode::FixedStep;
+    int spanId = -1;
 };
 
 struct LiveNormalAlignmentResidual final : public ceres::SizedCostFunction<1, 3, 3> {
@@ -666,17 +700,21 @@ struct LossAccumulator {
 
 [[nodiscard]] std::vector<LineOptimizationLossReport> evaluateLosses(
     const std::vector<std::array<double, 3>>& points,
+    const std::vector<SegmentSpacingConstraint>& spacingConstraints,
     const NormalSampler& sampler,
     const LineOptimizationConfig& config,
     int seedIndex,
-    const cv::Vec3d& seedTangent)
+    const cv::Vec3d& seedTangent,
+    bool useSeedGuides)
 {
-    LossAccumulator distance{"distance", config.distanceWeight};
+    LossAccumulator stepDistance{"step_distance", config.distanceWeight};
+    LossAccumulator evenStep{"even_step", config.distanceWeight};
     LossAccumulator straightness{"straightness", config.straightnessWeight};
     LossAccumulator normalAlignment{"normal_alignment", config.normalAlignmentWeight};
     LossAccumulator initialDirection{"initial_direction", config.initialTangentWeight};
     LossAccumulator tangentGuide{"tangent_guide", config.tangentGuideWeight};
-    const bool useTangentGuide = config.tangentGuideMode != LineOptimizationConfig::TangentGuideMode::None;
+    const bool useTangentGuide = useSeedGuides &&
+                                 config.tangentGuideMode != LineOptimizationConfig::TangentGuideMode::None;
     const auto addZeroTangentGuide = [&]() {
         if (!useTangentGuide) {
             return;
@@ -689,7 +727,31 @@ struct LossAccumulator {
     for (size_t i = 0; i + 1 < points.size(); ++i) {
         const cv::Vec3d a{points[i][0], points[i][1], points[i][2]};
         const cv::Vec3d b{points[i + 1][0], points[i + 1][1], points[i + 1][2]};
-        distance.add(std::sqrt((b - a).dot(b - a) + kEpsilon) - config.segmentLength);
+        const SegmentSpacingConstraint spacing = i < spacingConstraints.size()
+            ? spacingConstraints[i]
+            : SegmentSpacingConstraint{};
+        if (spacing.mode == SegmentSpacingMode::FixedStep) {
+            stepDistance.add(std::sqrt((b - a).dot(b - a) + kEpsilon) - config.segmentLength);
+        }
+    }
+
+    for (size_t i = 0; i + 2 < points.size(); ++i) {
+        const SegmentSpacingConstraint left = i < spacingConstraints.size()
+            ? spacingConstraints[i]
+            : SegmentSpacingConstraint{};
+        const SegmentSpacingConstraint right = i + 1 < spacingConstraints.size()
+            ? spacingConstraints[i + 1]
+            : SegmentSpacingConstraint{};
+        if (left.mode != SegmentSpacingMode::EvenStep ||
+            right.mode != SegmentSpacingMode::EvenStep ||
+            left.spanId != right.spanId) {
+            continue;
+        }
+        const cv::Vec3d a{points[i][0], points[i][1], points[i][2]};
+        const cv::Vec3d b{points[i + 1][0], points[i + 1][1], points[i + 1][2]};
+        const cv::Vec3d c{points[i + 2][0], points[i + 2][1], points[i + 2][2]};
+        evenStep.add(std::sqrt((b - a).dot(b - a) + kEpsilon) -
+                     std::sqrt((c - b).dot(c - b) + kEpsilon));
     }
 
     for (size_t i = 1; i + 1 < points.size(); ++i) {
@@ -740,7 +802,8 @@ struct LossAccumulator {
         }
     }
 
-    if (config.useInitialTangent &&
+    if (useSeedGuides &&
+        config.useInitialTangent &&
         config.initialTangentWeight > 0.0 &&
         length(seedTangent) > kEpsilon &&
         seedIndex > 0 &&
@@ -761,8 +824,9 @@ struct LossAccumulator {
     }
 
     std::vector<LineOptimizationLossReport> losses;
-    losses.reserve(4);
-    losses.push_back(toReport(distance));
+    losses.reserve(6);
+    losses.push_back(toReport(stepDistance));
+    losses.push_back(toReport(evenStep));
     losses.push_back(toReport(straightness));
     losses.push_back(toReport(normalAlignment));
     losses.push_back(toReport(initialDirection));
@@ -793,16 +857,41 @@ struct LossAccumulator {
 void addResiduals(
     ceres::Problem& problem,
     std::vector<std::array<double, 3>>& points,
+    const std::vector<SegmentSpacingConstraint>& spacingConstraints,
     const NormalSampler& sampler,
     const LineOptimizationConfig& config,
     int seedIndex,
     const cv::Vec3d& seedTangent,
+    bool useSeedGuides,
     const PrefetchedNormalSamples* prefetchedSamples = nullptr)
 {
     for (size_t i = 0; i + 1 < points.size(); ++i) {
+        const SegmentSpacingConstraint spacing = i < spacingConstraints.size()
+            ? spacingConstraints[i]
+            : SegmentSpacingConstraint{};
+        if (spacing.mode != SegmentSpacingMode::FixedStep) {
+            continue;
+        }
         auto* cost = new ceres::AutoDiffCostFunction<DistanceResidual, 1, 3, 3>(
             new DistanceResidual(config.segmentLength, config.distanceWeight));
         problem.AddResidualBlock(cost, nullptr, points[i].data(), points[i + 1].data());
+    }
+
+    for (size_t i = 0; i + 2 < points.size(); ++i) {
+        const SegmentSpacingConstraint left = i < spacingConstraints.size()
+            ? spacingConstraints[i]
+            : SegmentSpacingConstraint{};
+        const SegmentSpacingConstraint right = i + 1 < spacingConstraints.size()
+            ? spacingConstraints[i + 1]
+            : SegmentSpacingConstraint{};
+        if (left.mode != SegmentSpacingMode::EvenStep ||
+            right.mode != SegmentSpacingMode::EvenStep ||
+            left.spanId != right.spanId) {
+            continue;
+        }
+        auto* cost = new ceres::AutoDiffCostFunction<EvenStepResidual, 1, 3, 3, 3>(
+            new EvenStepResidual(config.distanceWeight));
+        problem.AddResidualBlock(cost, nullptr, points[i].data(), points[i + 1].data(), points[i + 2].data());
     }
 
     for (size_t i = 1; i + 1 < points.size(); ++i) {
@@ -829,7 +918,8 @@ void addResiduals(
 
             const bool seedAdjacent = static_cast<int>(segment) == seedIndex ||
                                       static_cast<int>(segment + 1) == seedIndex;
-            if (seedAdjacent &&
+            if (useSeedGuides &&
+                seedAdjacent &&
                 config.tangentGuideMode != LineOptimizationConfig::TangentGuideMode::None &&
                 config.tangentGuideWeight > 0.0) {
                 ceres::CostFunction* guideCost = prefetchedSamples
@@ -842,7 +932,8 @@ void addResiduals(
         }
     }
 
-    if (config.useInitialTangent &&
+    if (useSeedGuides &&
+        config.useInitialTangent &&
         config.initialTangentWeight > 0.0 &&
         length(seedTangent) > kEpsilon &&
         seedIndex > 0 &&
@@ -1156,6 +1247,123 @@ using Clock = std::chrono::steady_clock;
     return points;
 }
 
+[[nodiscard]] std::vector<SegmentSpacingConstraint> fixedStepConstraints(size_t segmentCount)
+{
+    return std::vector<SegmentSpacingConstraint>(segmentCount, SegmentSpacingConstraint{});
+}
+
+struct ControlPointInitialization {
+    std::vector<std::array<double, 3>> points;
+    std::vector<SegmentSpacingConstraint> spacingConstraints;
+    std::vector<int> fixedPointIndices;
+    std::vector<LineControlPoint> controlPoints;
+    cv::Vec3d seedTangent{1.0, 0.0, 0.0};
+};
+
+void growNormalConstructedExtension(
+    const cv::Vec3d& startPoint,
+    cv::Vec3d direction,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config,
+    std::vector<std::array<double, 3>>& out)
+{
+    cv::Vec3d point = startPoint;
+    direction = normalizedOrZero(direction);
+    if (length(direction) <= kEpsilon) {
+        direction = {1.0, 0.0, 0.0};
+    }
+    out.reserve(static_cast<size_t>(config.segmentsPerSide));
+    for (int i = 0; i < config.segmentsPerSide; ++i) {
+        const cv::Vec3d predicted = point + direction * config.segmentLength;
+        const NormalSample sample = sampler.sampleNormal(predicted);
+        const cv::Vec3d normal = normalizedOrZero(sample.normal);
+        if (sample.valid && length(normal) > kEpsilon) {
+            direction = projectDirectionToNormalPlane(direction, normal);
+        }
+        point += direction * config.segmentLength;
+        out.push_back(toArray(point));
+    }
+}
+
+[[nodiscard]] ControlPointInitialization initializeFromControlPoints(
+    std::vector<LineControlPoint> controlPoints,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config)
+{
+    if (controlPoints.empty()) {
+        throw std::invalid_argument("LineOptimizer requires at least one control point");
+    }
+
+    std::stable_sort(controlPoints.begin(), controlPoints.end(),
+                     [](const LineControlPoint& a, const LineControlPoint& b) {
+                         return a.linePosition < b.linePosition;
+                     });
+
+    ControlPointInitialization init;
+    init.controlPoints = controlPoints;
+    if (controlPoints.size() == 1) {
+        const NormalSample seedNormal = sampler.sampleNormal(controlPoints.front().volumePoint);
+        init.seedTangent = initialTangentFromConfig(seedNormal, config);
+        init.points = directNormalConstructedPoints(controlPoints.front().volumePoint,
+                                                   init.seedTangent,
+                                                   sampler,
+                                                   config);
+        init.spacingConstraints = fixedStepConstraints(init.points.size() - 1);
+        init.fixedPointIndices = {config.segmentsPerSide};
+        init.controlPoints.front().optimizedIndex = config.segmentsPerSide;
+        return init;
+    }
+
+    const cv::Vec3d firstPoint = controlPoints.front().volumePoint;
+    const cv::Vec3d secondPoint = controlPoints[1].volumePoint;
+    const cv::Vec3d lastPoint = controlPoints.back().volumePoint;
+    const cv::Vec3d beforeLastPoint = controlPoints[controlPoints.size() - 2].volumePoint;
+    init.seedTangent = normalizedOrZero(secondPoint - firstPoint);
+    if (length(init.seedTangent) <= kEpsilon) {
+        const NormalSample firstNormal = sampler.sampleNormal(firstPoint);
+        init.seedTangent = initialTangentFromConfig(firstNormal, config);
+    }
+
+    std::vector<std::array<double, 3>> backward;
+    std::vector<std::array<double, 3>> forward;
+    growNormalConstructedExtension(firstPoint, firstPoint - secondPoint, sampler, config, backward);
+    growNormalConstructedExtension(lastPoint, lastPoint - beforeLastPoint, sampler, config, forward);
+
+    init.points.reserve(backward.size() + controlPoints.size() + forward.size() + 16);
+    init.spacingConstraints.reserve(init.points.capacity() > 0 ? init.points.capacity() - 1 : 0);
+    for (auto it = backward.rbegin(); it != backward.rend(); ++it) {
+        init.points.push_back(*it);
+        init.spacingConstraints.push_back({SegmentSpacingMode::FixedStep, -1});
+    }
+
+    init.points.push_back(toArray(firstPoint));
+    init.controlPoints.front().optimizedIndex = static_cast<int>(init.points.size() - 1);
+    init.fixedPointIndices.push_back(init.controlPoints.front().optimizedIndex);
+
+    int spanId = 0;
+    for (size_t controlIndex = 0; controlIndex + 1 < controlPoints.size(); ++controlIndex) {
+        const cv::Vec3d a = controlPoints[controlIndex].volumePoint;
+        const cv::Vec3d b = controlPoints[controlIndex + 1].volumePoint;
+        const double distance = length(b - a);
+        const int segments = std::max(1, static_cast<int>(std::llround(distance / config.segmentLength)));
+        for (int segment = 1; segment <= segments; ++segment) {
+            const double t = static_cast<double>(segment) / static_cast<double>(segments);
+            init.spacingConstraints.push_back({SegmentSpacingMode::EvenStep, spanId});
+            init.points.push_back(toArray(lerp(a, b, t)));
+        }
+        init.controlPoints[controlIndex + 1].optimizedIndex =
+            static_cast<int>(init.points.size() - 1);
+        init.fixedPointIndices.push_back(init.controlPoints[controlIndex + 1].optimizedIndex);
+        ++spanId;
+    }
+
+    for (const auto& point : forward) {
+        init.spacingConstraints.push_back({SegmentSpacingMode::FixedStep, -1});
+        init.points.push_back(point);
+    }
+    return init;
+}
+
 struct GlobalSolveResult {
     std::string name;
     std::vector<std::array<double, 3>> points;
@@ -1284,12 +1492,15 @@ private:
 [[nodiscard]] GlobalSolveResult solveGlobalCandidate(
     std::string name,
     std::vector<std::array<double, 3>> initialPoints,
+    std::vector<SegmentSpacingConstraint> spacingConstraints,
+    std::vector<int> fixedPointIndices,
     const NormalSampler& sampler,
     const LineOptimizationConfig& config,
     const cv::Vec3d& seedTangent,
+    bool useSeedGuides,
     Clock::time_point chainStart)
 {
-    const int seedIndex = config.segmentsPerSide;
+    int seedIndex = fixedPointIndices.empty() ? config.segmentsPerSide : fixedPointIndices.front();
 
     PrefetchedNormalSamples prefetchedSamples;
     PrefetchTiming prefetchTiming;
@@ -1297,8 +1508,23 @@ private:
     for (auto& point : initialPoints) {
         problem.AddParameterBlock(point.data(), 3);
     }
-    problem.SetParameterBlockConstant(initialPoints[static_cast<size_t>(seedIndex)].data());
-    addResiduals(problem, initialPoints, sampler, config, seedIndex, seedTangent, &prefetchedSamples);
+    std::sort(fixedPointIndices.begin(), fixedPointIndices.end());
+    fixedPointIndices.erase(std::unique(fixedPointIndices.begin(), fixedPointIndices.end()),
+                            fixedPointIndices.end());
+    for (const int index : fixedPointIndices) {
+        if (index >= 0 && index < static_cast<int>(initialPoints.size())) {
+            problem.SetParameterBlockConstant(initialPoints[static_cast<size_t>(index)].data());
+        }
+    }
+    addResiduals(problem,
+                 initialPoints,
+                 spacingConstraints,
+                 sampler,
+                 config,
+                 seedIndex,
+                 seedTangent,
+                 useSeedGuides,
+                 &prefetchedSamples);
 
     fillPrefetchedNormalSamples(initialPoints, sampler, config, prefetchedSamples, &prefetchTiming);
     double initialCost = 0.0;
@@ -1415,11 +1641,15 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
 
     const auto directNormalStart = Clock::now();
     auto directNormalInit = directNormalConstructedPoints(seedPoint, tangent, normalSampler_, config);
+    auto spacingConstraints = fixedStepConstraints(directNormalInit.size() - 1);
     const GlobalSolveResult selected = solveGlobalCandidate("normal-construct+global",
                                                             std::move(directNormalInit),
+                                                            std::move(spacingConstraints),
+                                                            {seedIndex},
                                                             normalSampler_,
                                                             config,
                                                             tangent,
+                                                            true,
                                                             directNormalStart);
 
     int finalValidSamples = 0;
@@ -1461,7 +1691,13 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
             << "\n\nSelected candidate report:\n"
             << selected.report;
     result.report.message = message.str();
-    result.report.finalLosses = evaluateLosses(selected.points, normalSampler_, config, seedIndex, tangent);
+    result.report.finalLosses = evaluateLosses(selected.points,
+                                               fixedStepConstraints(selected.points.size() - 1),
+                                               normalSampler_,
+                                               config,
+                                               seedIndex,
+                                               tangent,
+                                               true);
 
     return result;
 }
@@ -1470,10 +1706,103 @@ LineOptimizationResult LineOptimizer::optimizeFromSeeds(
     const std::vector<cv::Vec3d>& seedPoints,
     const LineOptimizationConfig& config) const
 {
-    if (seedPoints.size() != 1) {
-        throw std::invalid_argument("LineOptimizer V1 requires exactly one seed point");
+    if (seedPoints.empty()) {
+        throw std::invalid_argument("LineOptimizer requires at least one seed point");
     }
-    return optimizeFromSeed(seedPoints.front(), config);
+    if (seedPoints.size() == 1) {
+        return optimizeFromSeed(seedPoints.front(), config);
+    }
+    std::vector<LineControlPoint> controls;
+    controls.reserve(seedPoints.size());
+    for (size_t i = 0; i < seedPoints.size(); ++i) {
+        controls.push_back({static_cast<double>(i), seedPoints[i], i == 0, -1});
+    }
+    return optimizeFromControlPoints(std::move(controls), config);
+}
+
+LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
+    std::vector<LineControlPoint> controlPoints,
+    const LineOptimizationConfig& rawConfig) const
+{
+    const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    if (controlPoints.empty()) {
+        throw std::invalid_argument("LineOptimizer requires at least one control point");
+    }
+    if (controlPoints.size() == 1) {
+        return optimizeFromSeed(controlPoints.front().volumePoint, config);
+    }
+
+    const auto start = Clock::now();
+    ControlPointInitialization init = initializeFromControlPoints(std::move(controlPoints),
+                                                                  normalSampler_,
+                                                                  config);
+    const std::vector<SegmentSpacingConstraint> finalSpacing = init.spacingConstraints;
+    const std::vector<int> fixedPointIndices = init.fixedPointIndices;
+    const int seedIndex = fixedPointIndices.empty() ? config.segmentsPerSide : fixedPointIndices.front();
+    const cv::Vec3d seedTangent = init.seedTangent;
+    const GlobalSolveResult selected = solveGlobalCandidate("control-points+global",
+                                                            std::move(init.points),
+                                                            std::move(init.spacingConstraints),
+                                                            fixedPointIndices,
+                                                            normalSampler_,
+                                                            config,
+                                                            seedTangent,
+                                                            false,
+                                                            start);
+
+    int finalValidSamples = 0;
+    int finalInvalidSamples = 0;
+    auto finalSamples = sampleSegments(
+        selected.points,
+        normalSampler_,
+        config.samplesPerSegment,
+        &finalValidSamples,
+        &finalInvalidSamples);
+
+    LineOptimizationResult result;
+    result.line = buildLineModel(selected.points, normalSampler_, std::move(finalSamples));
+    result.report.initialCost = selected.initialCost;
+    result.report.finalCost = selected.finalCost;
+    result.report.iterations = selected.iterations;
+    result.report.validNormalSamples = finalValidSamples;
+    result.report.invalidNormalSamples = finalInvalidSamples;
+    result.report.converged = selected.usable;
+    result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
+    result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
+    result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+
+    std::ostringstream message;
+    message.imbue(std::locale::classic());
+    message << std::scientific << std::setprecision(3)
+            << "Line annotation Lasagna selected candidate:\n"
+            << "candidate                   ms  iters    init_cost   final_cost\n"
+            << std::left << std::setw(24) << selected.name
+            << std::right << std::setw(10) << selected.milliseconds
+            << std::setw(7) << selected.iterations
+            << std::setw(13) << selected.initialCost
+            << std::setw(13) << selected.finalCost
+            << "\n\nFixed control point indices:";
+    for (const int index : fixedPointIndices) {
+        message << ' ' << index;
+    }
+    message << "\n\nNormal prefetch/materialization:\n"
+            << "calls=" << selected.prefetchTiming.calls
+            << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
+            << " materialize_ms=" << selected.prefetchTiming.materializeMs
+            << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
+                                selected.prefetchTiming.materializeMs)
+            << "\n\nSelected candidate report:\n"
+            << selected.report;
+    result.report.message = message.str();
+    result.report.finalLosses = evaluateLosses(selected.points,
+                                               finalSpacing,
+                                               normalSampler_,
+                                               config,
+                                               seedIndex,
+                                               seedTangent,
+                                               false);
+
+    return result;
 }
 
 } // namespace vc::lasagna

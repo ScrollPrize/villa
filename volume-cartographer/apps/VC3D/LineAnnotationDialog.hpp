@@ -42,6 +42,14 @@ public:
     };
 
     struct GeneratedOverlay {
+        struct ControlPointMarker {
+            cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN()};
+            double linePosition = std::numeric_limits<double>::quiet_NaN();
+            bool isSeed = false;
+        };
+
         std::vector<cv::Vec3f> linePoints;
         cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                             std::numeric_limits<float>::quiet_NaN(),
@@ -51,6 +59,7 @@ public:
                               std::numeric_limits<float>::quiet_NaN()};
         int seedLineIndex = -1;
         std::vector<double> markerLinePositions;
+        std::vector<ControlPointMarker> controlPoints;
         double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
         bool emphasizedPointMarker = false;
         bool useSurfaceCenterLine = false;
@@ -70,6 +79,7 @@ public:
                             std::numeric_limits<float>::quiet_NaN()};
         int seedLineIndex = -1;
         int initialCenterIndex = 0;
+        std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     };
 
     explicit LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent = nullptr);
@@ -89,6 +99,9 @@ public:
 signals:
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
+    void generatedControlPointRequested(const std::string& surfaceName,
+                                        cv::Vec3f volumePoint,
+                                        double linePosition);
     void showAsMeshRequested();
 
 protected:
@@ -108,6 +121,7 @@ private:
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
     void setCurrentLinePosition(double position);
     void recenterBottomSlicesOnCurrentPosition();
+    double snappedControlPointPosition(double position) const;
     void rebuildGeneratedOverlays();
     void applyOverlayForViewer(const std::string& overlayKey,
                                CChunkedVolumeViewer* viewer,

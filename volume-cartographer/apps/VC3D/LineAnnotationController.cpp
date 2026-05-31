@@ -51,6 +51,9 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string sourceAnnotationSurfaceName;
     vc::lasagna::LineOptimizationReport optimizationReport;
     vc::lasagna::LineModel optimizedLine;
+    std::vector<vc::lasagna::LineControlPoint> controlPoints;
+    double focusedLinePosition = 0.0;
+    std::optional<cv::Vec3d> focusedControlPoint;
     cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
     LineAnnotationController::InitialDirectionMode initialDirectionMode =
         LineAnnotationController::InitialDirectionMode::Sideways;
@@ -109,13 +112,23 @@ void validateLasagnaManifest(const fs::path& manifestPath)
 
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     fs::path manifestPath,
-    cv::Vec3d seedPoint,
+    std::vector<vc::lasagna::LineControlPoint> controlPoints,
     cv::Vec3d sourceSliceNormal,
     LineAnnotationController::InitialDirectionMode directionMode)
 {
     LineAnnotationController::OptimizationTaskResult task;
     task.manifestPath = std::move(manifestPath);
-    task.seedPoint = seedPoint;
+    task.controlPoints = std::move(controlPoints);
+    if (!task.controlPoints.empty()) {
+        const auto seedIt = std::find_if(task.controlPoints.begin(),
+                                         task.controlPoints.end(),
+                                         [](const vc::lasagna::LineControlPoint& control) {
+                                             return control.isSeed;
+                                         });
+        task.seedPoint = (seedIt == task.controlPoints.end()
+            ? task.controlPoints.front()
+            : *seedIt).volumePoint;
+    }
     task.sourceSliceNormal = sourceSliceNormal;
     task.initialDirectionMode = directionMode;
     try {
@@ -132,14 +145,14 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,
-            sampler.sampleNormal(seedPoint));
+            sampler.sampleNormal(task.seedPoint));
         config.useInitialTangent = finiteDirection(config.initialTangent);
         config.tangentGuideVector = normalizedOrZero(sourceSliceNormal);
         config.tangentGuideWeight = 1.0;
         config.tangentGuideMode = directionMode == LineAnnotationController::InitialDirectionMode::ZInOut
             ? vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane
             : vc::lasagna::LineOptimizationConfig::TangentGuideMode::CrossVectorWithNormal;
-        task.result = optimizer.optimizeFromSeed(seedPoint, config);
+        task.result = optimizer.optimizeFromControlPoints(task.controlPoints, config);
         task.ok = true;
     } catch (const std::exception& ex) {
         task.ok = false;
@@ -165,11 +178,11 @@ LineAnnotationController::LineAnnotationController(CState* state,
         return pickDataset(parent, startDir);
     })
     , _optimizationTaskFactory([](fs::path manifestPath,
-                                  cv::Vec3d seedPoint,
+                                  std::vector<vc::lasagna::LineControlPoint> controlPoints,
                                   cv::Vec3d sourceSliceNormal,
                                   InitialDirectionMode directionMode) {
         return optimizeLineFromManifest(std::move(manifestPath),
-                                        seedPoint,
+                                        std::move(controlPoints),
                                         sourceSliceNormal,
                                         directionMode);
     })
@@ -274,6 +287,12 @@ void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, co
                 }
                 handleLineSeed(name, volumePoint, mode);
             });
+    connect(dialog,
+            &LineAnnotationDialog::generatedControlPointRequested,
+            this,
+            [this](const std::string& name, cv::Vec3f volumePoint, double linePosition) {
+                handleGeneratedControlPoint(name, volumePoint, linePosition);
+            });
     connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
         handleShowAsMesh(surfaceName);
     });
@@ -316,7 +335,72 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
     }
 
     session.initialDirectionMode = directionMode;
-    startOptimization(session, cv::Vec3d(volumePoint[0], volumePoint[1], volumePoint[2]));
+    const cv::Vec3d seedPoint(volumePoint[0], volumePoint[1], volumePoint[2]);
+    session.seedPoint = seedPoint;
+    session.focusedLinePosition = 0.0;
+    session.focusedControlPoint = seedPoint;
+    session.controlPoints = {{0.0, seedPoint, true, -1}};
+    startOptimization(session);
+}
+
+void LineAnnotationController::handleGeneratedControlPoint(const std::string& surfaceName,
+                                                          cv::Vec3f volumePoint,
+                                                          double linePosition)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+
+    auto& session = *pane->session;
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        showError(tr("Line optimization is already running."));
+        return;
+    }
+    if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
+        return;
+    }
+    if (!ensureDatasetForSession(session)) {
+        return;
+    }
+
+    const double maxPosition = static_cast<double>(session.optimizedLine.points.size() - 1);
+    linePosition = std::clamp(linePosition, 0.0, maxPosition);
+    const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
+
+    auto nearest = session.controlPoints.end();
+    double nearestDistance = std::numeric_limits<double>::infinity();
+    for (auto it = session.controlPoints.begin(); it != session.controlPoints.end(); ++it) {
+        if (!std::isfinite(it->linePosition)) {
+            continue;
+        }
+        const double distance = std::abs(it->linePosition - linePosition);
+        if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = it;
+        }
+    }
+
+    if (nearest != session.controlPoints.end() && nearestDistance <= 0.5) {
+        nearest->volumePoint = clicked;
+        nearest->optimizedIndex = -1;
+        linePosition = nearest->linePosition;
+        if (nearest->isSeed) {
+            session.seedPoint = clicked;
+        }
+    } else {
+        session.controlPoints.push_back({linePosition, clicked, false, -1});
+    }
+
+    session.focusedLinePosition = linePosition;
+    session.focusedControlPoint = clicked;
+    std::stable_sort(session.controlPoints.begin(),
+                     session.controlPoints.end(),
+                     [](const vc::lasagna::LineControlPoint& a,
+                        const vc::lasagna::LineControlPoint& b) {
+                         return a.linePosition < b.linePosition;
+                     });
+    startOptimization(session);
 }
 
 bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session)
@@ -363,11 +447,23 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     return true;
 }
 
-void LineAnnotationController::startOptimization(LineAnnotationSession& session, cv::Vec3d seedPoint)
+void LineAnnotationController::startOptimization(LineAnnotationSession& session)
 {
+    if (session.controlPoints.empty()) {
+        return;
+    }
     session.taskState = LineAnnotationSession::TaskState::Running;
-    session.seedPoint = seedPoint;
     session.error.clear();
+    auto seedIt = std::find_if(session.controlPoints.begin(),
+                               session.controlPoints.end(),
+                               [](const vc::lasagna::LineControlPoint& control) {
+                                   return control.isSeed;
+                               });
+    if (seedIt == session.controlPoints.end()) {
+        session.controlPoints.front().isSeed = true;
+        seedIt = session.controlPoints.begin();
+    }
+    session.seedPoint = seedIt->volumePoint;
 
     auto* watcher = new QFutureWatcher<OptimizationTaskResult>(this);
     session.watcher = watcher;
@@ -382,13 +478,14 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
 
     const auto manifestPath = session.selectedManifestPath;
     auto factory = _optimizationTaskFactory;
+    auto controlPoints = session.controlPoints;
     const cv::Vec3d sourceSliceNormal = session.sourceSliceNormal;
     const InitialDirectionMode directionMode = session.initialDirectionMode;
-    watcher->setFuture(QtConcurrent::run([factory, manifestPath, seedPoint, sourceSliceNormal, directionMode]() mutable {
+    watcher->setFuture(QtConcurrent::run([factory, manifestPath, controlPoints, sourceSliceNormal, directionMode]() mutable {
         if (factory) {
-            return factory(manifestPath, seedPoint, sourceSliceNormal, directionMode);
+            return factory(manifestPath, std::move(controlPoints), sourceSliceNormal, directionMode);
         }
-        return optimizeLineFromManifest(manifestPath, seedPoint, sourceSliceNormal, directionMode);
+        return optimizeLineFromManifest(manifestPath, std::move(controlPoints), sourceSliceNormal, directionMode);
     }));
 }
 
@@ -413,6 +510,34 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         session.selectedManifestPath = task.manifestPath;
         session.optimizationReport = task.result.report;
         session.optimizedLine = std::move(task.result.line);
+        session.controlPoints = std::move(task.controlPoints);
+        for (auto& control : session.controlPoints) {
+            double bestDistance = std::numeric_limits<double>::infinity();
+            int bestIndex = -1;
+            for (size_t i = 0; i < session.optimizedLine.points.size(); ++i) {
+                const cv::Vec3d delta = session.optimizedLine.points[i].position - control.volumePoint;
+                const double distance = std::sqrt(delta.dot(delta));
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = static_cast<int>(i);
+                }
+            }
+            if (bestIndex >= 0) {
+                control.optimizedIndex = bestIndex;
+                control.linePosition = static_cast<double>(bestIndex);
+                control.volumePoint = session.optimizedLine.points[static_cast<size_t>(bestIndex)].position;
+                const bool matchesFocusedControl = session.focusedControlPoint.has_value() &&
+                    std::sqrt((control.volumePoint - *session.focusedControlPoint).dot(
+                        control.volumePoint - *session.focusedControlPoint)) <= 1.0e-6;
+                if (std::abs(session.focusedLinePosition - control.linePosition) <= 0.5 ||
+                    matchesFocusedControl) {
+                    session.focusedLinePosition = control.linePosition;
+                }
+            }
+            if (control.isSeed) {
+                session.seedPoint = control.volumePoint;
+            }
+        }
         if (!materializeGeneratedViews(session)) {
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return;
@@ -505,7 +630,24 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.seedPoint = seedPoint;
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
-    generatedViews.initialCenterIndex = generatedViews.seedLineIndex;
+    for (const auto& control : session.controlPoints) {
+        LineAnnotationDialog::GeneratedOverlay::ControlPointMarker marker;
+        marker.point = {static_cast<float>(control.volumePoint[0]),
+                        static_cast<float>(control.volumePoint[1]),
+                        static_cast<float>(control.volumePoint[2])};
+        marker.linePosition = std::isfinite(control.linePosition)
+            ? control.linePosition
+            : static_cast<double>(control.optimizedIndex);
+        marker.isSeed = control.isSeed;
+        generatedViews.controlPoints.push_back(marker);
+        if (control.isSeed && std::isfinite(marker.linePosition)) {
+            generatedViews.seedLineIndex = static_cast<int>(std::llround(marker.linePosition));
+        }
+    }
+    generatedViews.initialCenterIndex = static_cast<int>(std::llround(std::clamp(
+        session.focusedLinePosition,
+        0.0,
+        static_cast<double>(std::max<size_t>(1, session.optimizedLine.points.size()) - 1))));
 
     generatedViews.currentCutName = "line-current-cut";
     generatedViews.currentCutSurface = std::make_shared<PlaneSurface>(
@@ -731,7 +873,13 @@ LineAnnotationController::PaneRecord*
 LineAnnotationController::paneForSurface(const std::string& surfaceName)
 {
     auto it = std::find_if(_panes.begin(), _panes.end(), [&surfaceName](const PaneRecord& pane) {
-        return pane.surfaceName == surfaceName;
+        if (pane.surfaceName == surfaceName) {
+            return true;
+        }
+        return pane.session &&
+               std::find(pane.session->generatedSurfaceNames.begin(),
+                         pane.session->generatedSurfaceNames.end(),
+                         surfaceName) != pane.session->generatedSurfaceNames.end();
     });
     return it == _panes.end() ? nullptr : &*it;
 }
@@ -740,7 +888,13 @@ const LineAnnotationController::PaneRecord*
 LineAnnotationController::paneForSurface(const std::string& surfaceName) const
 {
     auto it = std::find_if(_panes.begin(), _panes.end(), [&surfaceName](const PaneRecord& pane) {
-        return pane.surfaceName == surfaceName;
+        if (pane.surfaceName == surfaceName) {
+            return true;
+        }
+        return pane.session &&
+               std::find(pane.session->generatedSurfaceNames.begin(),
+                         pane.session->generatedSurfaceNames.end(),
+                         surfaceName) != pane.session->generatedSurfaceNames.end();
     });
     return it == _panes.end() ? nullptr : &*it;
 }
@@ -762,18 +916,18 @@ std::optional<std::string> LineAnnotationController::pickDataset(
 
 LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOptimizationTask(
     fs::path manifestPath,
-    cv::Vec3d seedPoint,
+    std::vector<vc::lasagna::LineControlPoint> controlPoints,
     cv::Vec3d sourceSliceNormal,
     InitialDirectionMode directionMode) const
 {
     if (_optimizationTaskFactory) {
         return _optimizationTaskFactory(std::move(manifestPath),
-                                        seedPoint,
+                                        std::move(controlPoints),
                                         sourceSliceNormal,
                                         directionMode);
     }
     return optimizeLineFromManifest(std::move(manifestPath),
-                                    seedPoint,
+                                    std::move(controlPoints),
                                     sourceSliceNormal,
                                     directionMode);
 }

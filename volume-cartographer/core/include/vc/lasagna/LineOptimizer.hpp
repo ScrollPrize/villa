@@ -46,6 +46,13 @@ struct LineOptimizationResult {
     LineOptimizationReport report;
 };
 
+struct LineControlPoint {
+    double linePosition = 0.0;
+    cv::Vec3d volumePoint{0.0, 0.0, 0.0};
+    bool isSeed = false;
+    int optimizedIndex = -1;
+};
+
 class LineOptimizer {
 public:
     explicit LineOptimizer(const NormalSampler& normalSampler);
@@ -56,6 +63,10 @@ public:
 
     [[nodiscard]] LineOptimizationResult optimizeFromSeeds(
         const std::vector<cv::Vec3d>& seedPoints,
+        const LineOptimizationConfig& config = {}) const;
+
+    [[nodiscard]] LineOptimizationResult optimizeFromControlPoints(
+        std::vector<LineControlPoint> controlPoints,
         const LineOptimizationConfig& config = {}) const;
 
 private:

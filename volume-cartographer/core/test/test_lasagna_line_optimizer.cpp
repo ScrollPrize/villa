@@ -67,7 +67,7 @@ TEST_CASE("LineOptimizer grows a centered line tangent to sampled normals")
     CHECK(result.report.converged);
     CHECK(result.report.validNormalSamples == 20 * 5);
     CHECK(result.report.invalidNormalSamples == 0);
-    REQUIRE(result.report.finalLosses.size() == 5);
+    REQUIRE(result.report.finalLosses.size() == 6);
     double weightedCost = 0.0;
     for (const auto& loss : result.report.finalLosses) {
         CHECK(loss.residuals >= 0);
@@ -145,13 +145,50 @@ TEST_CASE("LineOptimizer completes with missing normals and reports invalid samp
     CHECK(result.report.converged);
 }
 
-TEST_CASE("LineOptimizer V1 rejects multi-seed requests explicitly")
+TEST_CASE("LineOptimizer supports multiple fixed control points")
 {
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});
     vc::lasagna::LineOptimizer optimizer(sampler);
 
-    std::vector<cv::Vec3d> seeds{{0.0, 0.0, 0.0}, {10.0, 0.0, 0.0}};
-    CHECK_THROWS_AS(optimizer.optimizeFromSeeds(seeds), std::invalid_argument);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 10.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 5;
+    config.useInitialTangent = true;
+    config.initialTangent = {0.0, 1.0, 0.0};
+    config.tangentGuideMode = vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
+    config.tangentGuideVector = {0.0, 1.0, 0.0};
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, true, -1},
+        {3.0, {30.0, 0.0, 0.0}, false, -1},
+    };
+    const auto result = optimizer.optimizeFromControlPoints(controls, config);
+
+    REQUIRE(result.line.points.size() == 6);
+    CHECK(result.line.points[1].position[0] == doctest::Approx(0.0).epsilon(1.0e-9));
+    CHECK(result.line.points[1].position[1] == doctest::Approx(0.0).epsilon(1.0e-9));
+    CHECK(result.line.points[1].position[2] == doctest::Approx(0.0).epsilon(1.0e-9));
+    CHECK(result.line.points[4].position[0] == doctest::Approx(30.0).epsilon(1.0e-9));
+    CHECK(result.line.points[4].position[1] == doctest::Approx(0.0).epsilon(1.0e-9));
+    CHECK(result.line.points[4].position[2] == doctest::Approx(0.0).epsilon(1.0e-9));
+
+    auto lossByName = [&](const std::string& name) -> const vc::lasagna::LineOptimizationLossReport& {
+        for (const auto& loss : result.report.finalLosses) {
+            if (loss.name == name) {
+                return loss;
+            }
+        }
+        throw std::runtime_error("missing loss " + name);
+    };
+    CHECK(lossByName("step_distance").residuals == 2);
+    CHECK(lossByName("even_step").residuals == 2);
+    CHECK(lossByName("initial_direction").residuals == 0);
+    CHECK(lossByName("tangent_guide").residuals == 0);
+
+    const auto fromSeeds = optimizer.optimizeFromSeeds({{0.0, 0.0, 0.0}, {30.0, 0.0, 0.0}}, config);
+    REQUIRE(fromSeeds.line.points.size() == result.line.points.size());
     CHECK_THROWS_AS(optimizer.optimizeFromSeeds({}), std::invalid_argument);
 }
 
