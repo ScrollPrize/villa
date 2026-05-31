@@ -1,21 +1,16 @@
 #include "CFiberWidget.hpp"
 
-#include <QVBoxLayout>
+#include <QAbstractItemView>
 #include <QHBoxLayout>
-#include <QLabel>
+#include <QItemSelectionModel>
+#include <QVBoxLayout>
 
-CFiberWidget::CFiberWidget(VCCollection* collection, QWidget* parent)
-    : QDockWidget(tr("Fibers"), parent), _collection(collection)
+#include <algorithm>
+
+CFiberWidget::CFiberWidget(QWidget* parent)
+    : QDockWidget(tr("Fibers"), parent)
 {
     setupUi();
-
-    connect(_collection, &VCCollection::collectionsAdded, this, &CFiberWidget::onCollectionsAdded);
-    connect(_collection, &VCCollection::collectionChanged, this, &CFiberWidget::onCollectionChanged);
-    connect(_collection, &VCCollection::collectionRemoved, this, &CFiberWidget::onCollectionRemoved);
-    connect(_collection, &VCCollection::pointAdded, this, &CFiberWidget::onPointAdded);
-    connect(_collection, &VCCollection::pointRemoved, this, &CFiberWidget::onPointRemoved);
-
-    refreshList();
 }
 
 CFiberWidget::~CFiberWidget() = default;
@@ -29,86 +24,55 @@ void CFiberWidget::setupUi()
     _listView = new QListView(mainWidget);
     _listView->setModel(_model);
     _listView->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    layout->addWidget(_listView);
+    _listView->setSelectionMode(QAbstractItemView::SingleSelection);
+    layout->addWidget(_listView, 1);
 
     connect(_listView->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &CFiberWidget::onSelectionChanged);
+    connect(_listView, &QListView::doubleClicked,
+            this, &CFiberWidget::onDoubleClicked);
 
-    // Step toggle buttons
-    auto* stepLayout = new QHBoxLayout();
-    stepLayout->addWidget(new QLabel("Step:"));
-    _stepGroup = new QButtonGroup(this);
-    _stepGroup->setExclusive(true);
-    for (int step : {1, 5, 10, 25, 50, 100}) {
-        auto* btn = new QPushButton(QString::number(step), mainWidget);
-        btn->setCheckable(true);
-        btn->setMinimumWidth(30);
-        if (step == 50) btn->setChecked(true);
-        _stepGroup->addButton(btn, step);
-        stepLayout->addWidget(btn);
-    }
-    layout->addLayout(stepLayout);
+    auto* buttonLayout = new QHBoxLayout();
+    _deleteButton = new QPushButton(tr("Delete"), mainWidget);
+    _deleteButton->setEnabled(false);
+    buttonLayout->addWidget(_deleteButton);
+    buttonLayout->addStretch(1);
+    layout->addLayout(buttonLayout);
 
-    connect(_stepGroup, &QButtonGroup::idClicked, this, &CFiberWidget::onStepButtonClicked);
+    connect(_deleteButton, &QPushButton::clicked, this, &CFiberWidget::onDeleteClicked);
 
-    // Buttons
-    _newFiberButton = new QPushButton(tr("New Fiber"), mainWidget);
-    _newFiberButton->setToolTip("Create a new fiber and start annotation (crosshair pick mode)");
-    layout->addWidget(_newFiberButton);
-
-    _invertDirButton = new QPushButton(tr("Invert Direction"), mainWidget);
-    _invertDirButton->setToolTip("Jump to the other end of the fiber chain and continue annotating in the opposite direction");
-    layout->addWidget(_invertDirButton);
-
-    connect(_newFiberButton, &QPushButton::clicked, this, &CFiberWidget::onNewFiberClicked);
-    connect(_invertDirButton, &QPushButton::clicked, this, &CFiberWidget::onInvertDirClicked);
-
-    layout->addStretch();
     setWidget(mainWidget);
 }
 
-void CFiberWidget::refreshList()
+QString CFiberWidget::labelForFiber(const FiberEntry& fiber)
 {
+    return tr("Fiber %1  cp=%2  pts=%3  len=%4 vx")
+        .arg(fiber.id)
+        .arg(fiber.controlPointCount)
+        .arg(fiber.linePointCount)
+        .arg(fiber.lengthVx, 0, 'f', 1);
+}
+
+void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
+{
+    const uint64_t previousSelection = _selectedFiberId;
+    _fibers = fibers;
+    std::sort(_fibers.begin(), _fibers.end(), [](const FiberEntry& a, const FiberEntry& b) {
+        return a.id < b.id;
+    });
+
     _model->clear();
-
-    if (!_collection) return;
-
-    const auto& all = _collection->getAllCollections();
-
-    // Collect fiber collections, sort by name
-    std::vector<const VCCollection::Collection*> fibers;
-    for (const auto& [id, col] : all) {
-        if (isFiber(id)) {
-            fibers.push_back(&col);
-        }
-    }
-    std::sort(fibers.begin(), fibers.end(),
-              [](const auto* a, const auto* b) { return a->name < b->name; });
-
-    for (const auto* col : fibers) {
-        auto* item = new QStandardItem(
-            QString("%1 (%2 pts)").arg(QString::fromStdString(col->name)).arg(col->points.size()));
-        item->setData(QVariant::fromValue(col->id));
-        QColor color(col->color[0] * 255, col->color[1] * 255, col->color[2] * 255);
-        item->setData(QBrush(color), Qt::DecorationRole);
+    for (const auto& fiber : _fibers) {
+        auto* item = new QStandardItem(labelForFiber(fiber));
+        item->setData(QVariant::fromValue(fiber.id));
         _model->appendRow(item);
     }
 
-    // Re-select if still valid
-    if (_selectedFiberId != 0) {
-        auto* item = findFiberItem(_selectedFiberId);
-        if (item) {
-            _listView->selectionModel()->select(item->index(), QItemSelectionModel::Select);
-        } else {
-            _selectedFiberId = 0;
-        }
+    _selectedFiberId = 0;
+    if (previousSelection != 0) {
+        selectFiber(previousSelection);
     }
-}
-
-bool CFiberWidget::isFiber(uint64_t collectionId) const
-{
-    auto tag = _collection->getCollectionTag(collectionId, "fiber");
-    return tag.has_value() && *tag == "true";
+    _deleteButton->setEnabled(_selectedFiberId != 0);
 }
 
 QStandardItem* CFiberWidget::findFiberItem(uint64_t fiberId)
@@ -125,27 +89,23 @@ QStandardItem* CFiberWidget::findFiberItem(uint64_t fiberId)
 void CFiberWidget::selectFiber(uint64_t fiberId)
 {
     auto* item = findFiberItem(fiberId);
-    if (item) {
-        _listView->selectionModel()->clearSelection();
-        _listView->selectionModel()->select(item->index(), QItemSelectionModel::Select);
-        _listView->scrollTo(item->index());
+    if (!item) {
+        _selectedFiberId = 0;
+        if (_listView && _listView->selectionModel()) {
+            _listView->selectionModel()->clearSelection();
+        }
+        if (_deleteButton) {
+            _deleteButton->setEnabled(false);
+        }
+        return;
     }
-}
 
-void CFiberWidget::onNewFiberClicked()
-{
-    emit newFiberRequested();
-}
-
-void CFiberWidget::onInvertDirClicked()
-{
-    emit invertDirectionRequested();
-}
-
-void CFiberWidget::onStepButtonClicked(int id)
-{
-    _currentStep = id;
-    emit stepChanged(id);
+    _listView->selectionModel()->clearSelection();
+    _listView->selectionModel()->select(item->index(),
+                                        QItemSelectionModel::ClearAndSelect);
+    _listView->scrollTo(item->index());
+    _selectedFiberId = fiberId;
+    _deleteButton->setEnabled(true);
 }
 
 void CFiberWidget::onSelectionChanged()
@@ -160,48 +120,24 @@ void CFiberWidget::onSelectionChanged()
         }
     }
 
-    emit fiberSelected(_selectedFiberId);
+    _deleteButton->setEnabled(_selectedFiberId != 0);
 }
 
-void CFiberWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)
+void CFiberWidget::onDoubleClicked(const QModelIndex& index)
 {
-    bool anyFiber = false;
-    for (auto id : collectionIds) {
-        if (isFiber(id)) { anyFiber = true; break; }
+    auto* item = _model->itemFromIndex(index);
+    if (!item) {
+        return;
     }
-    if (anyFiber) refreshList();
-}
-
-void CFiberWidget::onCollectionChanged(uint64_t collectionId)
-{
-    refreshList();
-}
-
-void CFiberWidget::onCollectionRemoved(uint64_t collectionId)
-{
-    if (_selectedFiberId == collectionId) {
-        _selectedFiberId = 0;
-    }
-    refreshList();
-}
-
-void CFiberWidget::onPointAdded(const ColPoint& point)
-{
-    if (isFiber(point.collectionId)) {
-        auto* item = findFiberItem(point.collectionId);
-        if (item) {
-            const auto& all = _collection->getAllCollections();
-            if (all.count(point.collectionId)) {
-                const auto& col = all.at(point.collectionId);
-                item->setText(QString("%1 (%2 pts)")
-                    .arg(QString::fromStdString(col.name))
-                    .arg(col.points.size()));
-            }
-        }
+    const uint64_t fiberId = item->data().toULongLong();
+    if (fiberId != 0) {
+        emit fiberOpenRequested(fiberId);
     }
 }
 
-void CFiberWidget::onPointRemoved(uint64_t pointId)
+void CFiberWidget::onDeleteClicked()
 {
-    refreshList();
+    if (_selectedFiberId != 0) {
+        emit deleteFiberRequested(_selectedFiberId);
+    }
 }

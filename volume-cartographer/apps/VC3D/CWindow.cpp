@@ -930,6 +930,9 @@ CWindow::~CWindow()
     }
     setStatusBar(nullptr);
 
+    if (_lineAnnotationController) {
+        _lineAnnotationController->saveOpenFibers();
+    }
     CloseVolume();
 }
 
@@ -2272,16 +2275,40 @@ void CWindow::CreateWidgets(void)
         _state, _state->pointCollection(), this);
     _fiberController->setMdiArea(mdiArea);
 
-    _fiberWidget = new CFiberWidget(_state->pointCollection(), this);
+    _fiberWidget = new CFiberWidget(this);
     _fiberWidget->setObjectName("fiberDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
 
-    connect(_fiberWidget, &CFiberWidget::newFiberRequested,
-            this, &CWindow::onNewFiberRequested);
-    connect(_fiberWidget, &CFiberWidget::stepChanged,
-            _fiberController.get(), &FiberAnnotationController::onStepChanged);
-    connect(_fiberWidget, &CFiberWidget::invertDirectionRequested,
-            _fiberController.get(), &FiberAnnotationController::invertDirection);
+    if (_lineAnnotationController) {
+        auto updateFiberList = [this](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
+            std::vector<CFiberWidget::FiberEntry> entries;
+            entries.reserve(fibers.size());
+            for (const auto& fiber : fibers) {
+                entries.push_back(CFiberWidget::FiberEntry{
+                    fiber.id,
+                    fiber.controlPointCount,
+                    fiber.linePointCount,
+                    fiber.lengthVx,
+                });
+            }
+            if (_fiberWidget) {
+                _fiberWidget->setFibers(entries);
+            }
+        };
+        connect(_lineAnnotationController.get(),
+                &LineAnnotationController::fibersChanged,
+                this,
+                updateFiberList);
+        connect(_fiberWidget,
+                &CFiberWidget::fiberOpenRequested,
+                _lineAnnotationController.get(),
+                &LineAnnotationController::openFiber);
+        connect(_fiberWidget,
+                &CFiberWidget::deleteFiberRequested,
+                _lineAnnotationController.get(),
+                &LineAnnotationController::deleteFiber);
+        updateFiberList(_lineAnnotationController->fiberSummaries());
+    }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
             this, &CWindow::onFiberCrosshairModeChanged);
     connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
@@ -2818,6 +2845,9 @@ void CWindow::closeEvent(QCloseEvent* event)
     // is pending.
     if (_segmentationModule && _segmentationModule->overlay()) {
         _segmentationModule->overlay()->flushPendingApprovalMaskSave();
+    }
+    if (_lineAnnotationController) {
+        _lineAnnotationController->saveOpenFibers();
     }
     if (_state && _state->vpkg()) {
         try { _state->vpkg()->saveAutosave(); } catch (...) {}
