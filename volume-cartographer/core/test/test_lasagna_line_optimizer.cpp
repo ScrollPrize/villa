@@ -424,6 +424,70 @@ TEST_CASE("LineOptimizer resamples fractional control insertion spans evenly")
     }
 }
 
+TEST_CASE("LineOptimizer local update range covers three neighboring control spans")
+{
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 40; ++i) {
+        linePoints.push_back({static_cast<double>(i), 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls;
+    for (int i = 0; i <= 40; i += 5) {
+        controls.push_back({static_cast<double>(i),
+                            linePoints[static_cast<size_t>(i)],
+                            i == 20,
+                            i});
+    }
+    controls[4].volumePoint = {20.0, 1.0, 0.0};
+
+    const auto update = vc::lasagna::updateExistingLineControlPoint(linePoints,
+                                                                    std::move(controls),
+                                                                    4,
+                                                                    1.0);
+
+    REQUIRE(update.controlPoints.size() == 9);
+    CHECK(update.changedControlIndex == 4);
+    CHECK(update.activeStart == update.controlPoints[1].optimizedIndex);
+    CHECK(update.activeEnd == update.controlPoints[7].optimizedIndex);
+}
+
+TEST_CASE("LineOptimizer open-end control update grows a new extension")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 10; ++i) {
+        const double staleY = i > 7 ? 100.0 : 0.0;
+        linePoints.push_back({static_cast<double>(i), staleY, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {5.0, linePoints[5], true, 5},
+        {7.0, {7.0, 0.0, 0.0}, false, -1},
+    };
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 1.0;
+    config.segmentsPerSide = 3;
+
+    const auto update = vc::lasagna::updateExistingLineControlPoint(linePoints,
+                                                                    std::move(controls),
+                                                                    1,
+                                                                    sampler,
+                                                                    config);
+
+    REQUIRE(update.linePoints.size() == 11);
+    REQUIRE(update.controlPoints.size() == 2);
+    CHECK(update.changedControlIndex == 1);
+    CHECK(update.controlPoints[1].optimizedIndex == 7);
+    CHECK(update.activeStart == 0);
+    CHECK(update.activeEnd == static_cast<int>(update.linePoints.size()) - 1);
+    CHECK(update.linePoints[8][0] == doctest::Approx(8.0));
+    CHECK(update.linePoints[8][1] == doctest::Approx(0.0));
+    CHECK(update.linePoints[9][1] == doctest::Approx(0.0));
+    CHECK(update.linePoints[10][1] == doctest::Approx(0.0));
+}
+
 TEST_CASE("LineOptimizer full existing-line solve uses current samples directly")
 {
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});

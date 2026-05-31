@@ -71,6 +71,13 @@ struct LineControlPointUpdateResult {
     size_t changedControlIndex,
     double segmentLength);
 
+[[nodiscard]] LineControlPointUpdateResult updateExistingLineControlPoint(
+    std::vector<cv::Vec3d> linePoints,
+    std::vector<LineControlPoint> controlPoints,
+    size_t changedControlIndex,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config);
+
 class LineOptimizer {
 public:
     explicit LineOptimizer(const NormalSampler& normalSampler);

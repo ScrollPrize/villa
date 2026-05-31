@@ -2227,6 +2227,52 @@ struct LineDifference {
     return positions;
 }
 
+[[nodiscard]] std::pair<int, int> activeRangeAroundControlSpans(
+    const std::vector<LineControlPoint>& controlPoints,
+    int changedControlIndex,
+    int pointCount,
+    int spanRadius)
+{
+    if (pointCount <= 0) {
+        return {-1, -1};
+    }
+    const int maxIndex = pointCount - 1;
+    if (controlPoints.empty() || changedControlIndex < 0) {
+        return {0, maxIndex};
+    }
+
+    changedControlIndex = std::clamp(changedControlIndex,
+                                     0,
+                                     static_cast<int>(controlPoints.size()) - 1);
+    const int lastControlIndex = static_cast<int>(controlPoints.size()) - 1;
+    int activeStart = 0;
+    if (changedControlIndex - spanRadius > 0) {
+        const int firstControl = changedControlIndex - spanRadius;
+        activeStart = std::clamp(controlPoints[static_cast<size_t>(firstControl)].optimizedIndex,
+                                 0,
+                                 maxIndex);
+    }
+
+    int activeEnd = maxIndex;
+    if (changedControlIndex + spanRadius < lastControlIndex) {
+        const int lastControl = changedControlIndex + spanRadius;
+        activeEnd = std::clamp(controlPoints[static_cast<size_t>(lastControl)].optimizedIndex,
+                               0,
+                               maxIndex);
+    }
+
+    if (changedControlIndex == 0) {
+        activeStart = 0;
+    }
+    if (changedControlIndex == lastControlIndex) {
+        activeEnd = maxIndex;
+    }
+    if (activeEnd < activeStart) {
+        std::swap(activeStart, activeEnd);
+    }
+    return {activeStart, activeEnd};
+}
+
 } // namespace
 
 LineControlPointUpdateResult updateExistingLineControlPoint(
@@ -2391,9 +2437,7 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
     std::vector<cv::Vec3d> updatedLine;
     updatedLine.reserve(linePoints.size() + replacement.size());
     updatedLine.insert(updatedLine.end(), linePoints.begin(), linePoints.begin() + eraseStart);
-    const int activeStart = static_cast<int>(updatedLine.size());
     updatedLine.insert(updatedLine.end(), replacement.begin(), replacement.end());
-    const int activeEnd = std::max(activeStart, static_cast<int>(updatedLine.size()) - 1);
     updatedLine.insert(updatedLine.end(),
                        linePoints.begin() + static_cast<std::ptrdiff_t>(eraseEnd + 1),
                        linePoints.end());
@@ -2417,8 +2461,106 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
     result.linePoints = std::move(updatedLine);
     result.controlPoints = std::move(controlPoints);
     result.changedControlIndex = changedSortedIndex;
-    result.activeStart = std::max(0, activeStart - 1);
-    result.activeEnd = std::min(static_cast<int>(result.linePoints.size()) - 1, activeEnd + 1);
+    const auto activeRange = activeRangeAroundControlSpans(result.controlPoints,
+                                                          result.changedControlIndex,
+                                                          static_cast<int>(result.linePoints.size()),
+                                                          3);
+    result.activeStart = activeRange.first;
+    result.activeEnd = activeRange.second;
+    return result;
+}
+
+LineControlPointUpdateResult updateExistingLineControlPoint(
+    std::vector<cv::Vec3d> linePoints,
+    std::vector<LineControlPoint> controlPoints,
+    size_t changedControlIndex,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& rawConfig)
+{
+    const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    LineControlPointUpdateResult result =
+        updateExistingLineControlPoint(std::move(linePoints),
+                                       std::move(controlPoints),
+                                       changedControlIndex,
+                                       config.segmentLength);
+    if (result.linePoints.size() < 2 ||
+        result.controlPoints.empty() ||
+        result.changedControlIndex < 0 ||
+        result.changedControlIndex >= static_cast<int>(result.controlPoints.size())) {
+        return result;
+    }
+
+    const int changed = result.changedControlIndex;
+    const int lastControl = static_cast<int>(result.controlPoints.size()) - 1;
+    if (changed != 0 && changed != lastControl) {
+        const auto activeRange = activeRangeAroundControlSpans(result.controlPoints,
+                                                              result.changedControlIndex,
+                                                              static_cast<int>(result.linePoints.size()),
+                                                              3);
+        result.activeStart = activeRange.first;
+        result.activeEnd = activeRange.second;
+        return result;
+    }
+
+    if (changed == 0 && result.controlPoints.size() >= 2) {
+        const LineControlPoint& first = result.controlPoints.front();
+        const LineControlPoint& second = result.controlPoints[1];
+        std::vector<std::array<double, 3>> grown;
+        growNormalConstructedExtension(first.volumePoint,
+                                       first.volumePoint - second.volumePoint,
+                                       sampler,
+                                       config,
+                                       grown);
+
+        const int firstIndex = std::clamp(first.optimizedIndex,
+                                          0,
+                                          static_cast<int>(result.linePoints.size()) - 1);
+        std::vector<cv::Vec3d> expanded;
+        expanded.reserve(grown.size() + result.linePoints.size() - static_cast<size_t>(firstIndex));
+        for (auto it = grown.rbegin(); it != grown.rend(); ++it) {
+            expanded.push_back(toVec3d(*it));
+        }
+        expanded.insert(expanded.end(),
+                        result.linePoints.begin() + static_cast<std::ptrdiff_t>(firstIndex),
+                        result.linePoints.end());
+
+        const int shift = static_cast<int>(grown.size()) - firstIndex;
+        for (auto& control : result.controlPoints) {
+            control.optimizedIndex += shift;
+            control.linePosition = static_cast<double>(control.optimizedIndex);
+        }
+        result.linePoints = std::move(expanded);
+    } else if (changed == lastControl && result.controlPoints.size() >= 2) {
+        const LineControlPoint& last = result.controlPoints.back();
+        const LineControlPoint& beforeLast =
+            result.controlPoints[static_cast<size_t>(lastControl - 1)];
+        std::vector<std::array<double, 3>> grown;
+        growNormalConstructedExtension(last.volumePoint,
+                                       last.volumePoint - beforeLast.volumePoint,
+                                       sampler,
+                                       config,
+                                       grown);
+
+        const int lastIndex = std::clamp(last.optimizedIndex,
+                                         0,
+                                         static_cast<int>(result.linePoints.size()) - 1);
+        std::vector<cv::Vec3d> expanded;
+        expanded.reserve(static_cast<size_t>(lastIndex + 1) + grown.size());
+        expanded.insert(expanded.end(),
+                        result.linePoints.begin(),
+                        result.linePoints.begin() + static_cast<std::ptrdiff_t>(lastIndex + 1));
+        for (const auto& point : grown) {
+            expanded.push_back(toVec3d(point));
+        }
+        result.linePoints = std::move(expanded);
+    }
+
+    const auto activeRange = activeRangeAroundControlSpans(result.controlPoints,
+                                                          result.changedControlIndex,
+                                                          static_cast<int>(result.linePoints.size()),
+                                                          3);
+    result.activeStart = activeRange.first;
+    result.activeEnd = activeRange.second;
     return result;
 }
 

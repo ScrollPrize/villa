@@ -838,10 +838,14 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     vc::lasagna::LineControlPointUpdateResult update;
     try {
+        vc::lasagna::LineOptimizationConfig updateConfig;
+        updateConfig.segmentsPerSide = 200;
+        updateConfig.segmentLength = kLineSegmentLength;
         update = vc::lasagna::updateExistingLineControlPoint(std::move(currentLinePoints),
                                                              std::move(session.controlPoints),
                                                              changedControlIndex,
-                                                             kLineSegmentLength);
+                                                             *session.normalSampler,
+                                                             updateConfig);
     } catch (const std::exception& ex) {
         showError(tr("Could not update line control point: %1").arg(QString::fromStdString(ex.what())));
         return;
