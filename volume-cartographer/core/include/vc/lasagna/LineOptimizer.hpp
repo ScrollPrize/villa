@@ -33,6 +33,9 @@ struct LineOptimizationReport {
     int validNormalSamples = 0;
     int invalidNormalSamples = 0;
     bool converged = false;
+    int normalPrefetchCalls = 0;
+    double normalChunkPrefetchMs = 0.0;
+    double normalMaterializeMs = 0.0;
     std::string message;
     std::vector<LineOptimizationLossReport> finalLosses;
     std::vector<LineOptimizationIterationReport> iterationProgress;

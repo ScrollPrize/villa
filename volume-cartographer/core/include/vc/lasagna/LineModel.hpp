@@ -13,10 +13,25 @@ struct NormalSample {
     std::string reason;
 };
 
+struct NormalSampleWithDerivative {
+    NormalSample sample;
+    cv::Matx33d dNormalDVolume = cv::Matx33d::zeros();
+    bool hasDerivative = false;
+};
+
 class NormalSampler {
 public:
     virtual ~NormalSampler() = default;
     [[nodiscard]] virtual NormalSample sampleNormal(const cv::Vec3d& volumePoint) const = 0;
+    [[nodiscard]] virtual NormalSampleWithDerivative sampleNormalWithDerivative(
+        const cv::Vec3d& volumePoint) const
+    {
+        return {sampleNormal(volumePoint), cv::Matx33d::zeros(), false};
+    }
+    virtual void prefetchNormalSamples(const std::vector<cv::Vec3d>& /*volumePoints*/,
+                                       bool /*withDerivative*/) const
+    {
+    }
 };
 
 struct LinePoint {
@@ -47,6 +62,16 @@ struct LineOptimizationConfig {
         CrossVectorWithNormal,
     };
 
+    enum class LinearSolver {
+        DenseQR,
+        DenseNormalCholesky,
+        SparseNormalCholesky,
+        DenseSchur,
+        SparseSchur,
+        IterativeSchur,
+        CGNR,
+    };
+
     int segmentsPerSide = 10;
     double segmentLength = 50.0;
     double straightnessWeight = 1.0;
@@ -62,6 +87,10 @@ struct LineOptimizationConfig {
     // endpoints plus 3 intermediate samples, for 5 samples per segment.
     int samplesPerSegment = 4;
     int maxIterations = 50;
+    bool differentiableNormalSampling = false;
+    LinearSolver linearSolver = LinearSolver::SparseNormalCholesky;
+    int numThreads = 1;
+    bool printSolverProgress = true;
 };
 
 } // namespace vc::lasagna

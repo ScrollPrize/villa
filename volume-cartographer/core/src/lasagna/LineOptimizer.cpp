@@ -4,15 +4,18 @@
 #include <opencv2/core.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <locale>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace vc::lasagna {
@@ -66,6 +69,7 @@ constexpr double kEpsilon = 1.0e-12;
     config.tangentGuideWeight = std::max(0.0, config.tangentGuideWeight);
     config.samplesPerSegment = std::max(1, config.samplesPerSegment);
     config.maxIterations = std::max(0, config.maxIterations);
+    config.numThreads = std::max(1, config.numThreads);
     return config;
 }
 
@@ -256,6 +260,164 @@ struct LiveNormalAlignmentResidual final : public ceres::SizedCostFunction<1, 3,
     double weight = 1.0;
 };
 
+struct DifferentiableNormalAlignmentResidual final : public ceres::SizedCostFunction<1, 3, 3> {
+    DifferentiableNormalAlignmentResidual(const NormalSampler& sampler, double t, double weight)
+        : sampler(sampler)
+        , t(t)
+        , weight(weight)
+    {
+    }
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const cv::Vec3d a{parameters[0][0], parameters[0][1], parameters[0][2]};
+        const cv::Vec3d b{parameters[1][0], parameters[1][1], parameters[1][2]};
+        const cv::Vec3d d = b - a;
+        const double len = length(d);
+        if (len <= kEpsilon) {
+            residuals[0] = 0.0;
+            if (jacobians) {
+                for (int block = 0; block < 2; ++block) {
+                    if (jacobians[block]) {
+                        std::fill(jacobians[block], jacobians[block] + 3, 0.0);
+                    }
+                }
+            }
+            return true;
+        }
+
+        const cv::Vec3d samplePoint = lerp(a, b, t);
+        const NormalSampleWithDerivative sampled = sampler.sampleNormalWithDerivative(samplePoint);
+        const cv::Vec3d normal = normalizedOrZero(sampled.sample.normal);
+        if (!sampled.sample.valid || length(normal) <= kEpsilon) {
+            residuals[0] = 0.0;
+            if (jacobians) {
+                for (int block = 0; block < 2; ++block) {
+                    if (jacobians[block]) {
+                        std::fill(jacobians[block], jacobians[block] + 3, 0.0);
+                    }
+                }
+            }
+            return true;
+        }
+
+        const cv::Vec3d tangent = d / len;
+        const double dot = tangent.dot(normal);
+        residuals[0] = weight * dot;
+
+        if (jacobians) {
+            const cv::Vec3d gradD = (normal - tangent * dot) * (weight / len);
+            cv::Vec3d gradSamplePoint{0.0, 0.0, 0.0};
+            if (sampled.hasDerivative) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    gradSamplePoint[axis] = weight *
+                        (tangent[0] * sampled.dNormalDVolume(0, axis) +
+                         tangent[1] * sampled.dNormalDVolume(1, axis) +
+                         tangent[2] * sampled.dNormalDVolume(2, axis));
+                }
+            }
+
+            if (jacobians[0]) {
+                jacobians[0][0] = -gradD[0] + (1.0 - t) * gradSamplePoint[0];
+                jacobians[0][1] = -gradD[1] + (1.0 - t) * gradSamplePoint[1];
+                jacobians[0][2] = -gradD[2] + (1.0 - t) * gradSamplePoint[2];
+            }
+            if (jacobians[1]) {
+                jacobians[1][0] = gradD[0] + t * gradSamplePoint[0];
+                jacobians[1][1] = gradD[1] + t * gradSamplePoint[1];
+                jacobians[1][2] = gradD[2] + t * gradSamplePoint[2];
+            }
+        }
+        return true;
+    }
+
+    const NormalSampler& sampler;
+    double t = 0.0;
+    double weight = 1.0;
+};
+
+struct PrefetchedNormalSamples {
+    std::vector<NormalSampleWithDerivative> samples;
+};
+
+struct PrefetchTiming {
+    int calls = 0;
+    double chunkPrefetchMs = 0.0;
+    double materializeMs = 0.0;
+};
+
+struct PrefetchedNormalAlignmentResidual final : public ceres::SizedCostFunction<1, 3, 3> {
+    PrefetchedNormalAlignmentResidual(const PrefetchedNormalSamples& prefetched, size_t sampleIndex, double t, double weight)
+        : prefetched(prefetched)
+        , sampleIndex(sampleIndex)
+        , t(t)
+        , weight(weight)
+    {
+    }
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const cv::Vec3d a{parameters[0][0], parameters[0][1], parameters[0][2]};
+        const cv::Vec3d b{parameters[1][0], parameters[1][1], parameters[1][2]};
+        const cv::Vec3d d = b - a;
+        const double len = length(d);
+        const auto zero = [&]() {
+            residuals[0] = 0.0;
+            if (jacobians) {
+                for (int block = 0; block < 2; ++block) {
+                    if (jacobians[block]) {
+                        std::fill(jacobians[block], jacobians[block] + 3, 0.0);
+                    }
+                }
+            }
+            return true;
+        };
+        if (len <= kEpsilon || sampleIndex >= prefetched.samples.size()) {
+            return zero();
+        }
+
+        const NormalSampleWithDerivative& sampled = prefetched.samples[sampleIndex];
+        const cv::Vec3d normal = normalizedOrZero(sampled.sample.normal);
+        if (!sampled.sample.valid || length(normal) <= kEpsilon) {
+            return zero();
+        }
+
+        const cv::Vec3d tangent = d / len;
+        const double dot = tangent.dot(normal);
+        residuals[0] = weight * dot;
+
+        if (jacobians) {
+            const cv::Vec3d gradD = (normal - tangent * dot) * (weight / len);
+            cv::Vec3d gradSamplePoint{0.0, 0.0, 0.0};
+            if (sampled.hasDerivative) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    gradSamplePoint[axis] = weight *
+                        (tangent[0] * sampled.dNormalDVolume(0, axis) +
+                         tangent[1] * sampled.dNormalDVolume(1, axis) +
+                         tangent[2] * sampled.dNormalDVolume(2, axis));
+                }
+            }
+
+            if (jacobians[0]) {
+                jacobians[0][0] = -gradD[0] + (1.0 - t) * gradSamplePoint[0];
+                jacobians[0][1] = -gradD[1] + (1.0 - t) * gradSamplePoint[1];
+                jacobians[0][2] = -gradD[2] + (1.0 - t) * gradSamplePoint[2];
+            }
+            if (jacobians[1]) {
+                jacobians[1][0] = gradD[0] + t * gradSamplePoint[0];
+                jacobians[1][1] = gradD[1] + t * gradSamplePoint[1];
+                jacobians[1][2] = gradD[2] + t * gradSamplePoint[2];
+            }
+        }
+        return true;
+    }
+
+    const PrefetchedNormalSamples& prefetched;
+    size_t sampleIndex = 0;
+    double weight = 1.0;
+    double t = 0.0;
+};
+
 struct DirectionResidual {
     DirectionResidual(cv::Vec3d direction, double weight)
         : direction(normalizedOrZero(direction))
@@ -386,6 +548,95 @@ struct LiveTangentGuideResidual final : public ceres::SizedCostFunction<3, 3, 3>
 
     const NormalSampler& sampler;
     double t = 0.0;
+    LineOptimizationConfig config;
+};
+
+struct PrefetchedTangentGuideResidual final : public ceres::SizedCostFunction<3, 3, 3> {
+    PrefetchedTangentGuideResidual(
+        const PrefetchedNormalSamples& prefetched,
+        size_t sampleIndex,
+        LineOptimizationConfig config)
+        : prefetched(prefetched)
+        , sampleIndex(sampleIndex)
+        , config(config)
+    {
+    }
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const cv::Vec3d a{parameters[0][0], parameters[0][1], parameters[0][2]};
+        const cv::Vec3d b{parameters[1][0], parameters[1][1], parameters[1][2]};
+        const cv::Vec3d d = b - a;
+        const double len = length(d);
+        const auto zero = [&]() {
+            std::fill(residuals, residuals + 3, 0.0);
+            if (jacobians) {
+                for (int block = 0; block < 2; ++block) {
+                    if (jacobians[block]) {
+                        std::fill(jacobians[block], jacobians[block] + 9, 0.0);
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (len <= kEpsilon || sampleIndex >= prefetched.samples.size()) {
+            return zero();
+        }
+
+        const NormalSampleWithDerivative& sampled = prefetched.samples[sampleIndex];
+        const cv::Vec3d normal = normalizedOrZero(sampled.sample.normal);
+        if (!sampled.sample.valid || length(normal) <= kEpsilon) {
+            return zero();
+        }
+
+        const cv::Vec3d guide = tangentGuideDirection(normal, config);
+        if (length(guide) <= kEpsilon) {
+            return zero();
+        }
+
+        const cv::Vec3d tangent = d / len;
+        const cv::Vec3d residual = (tangent - guide) * config.tangentGuideWeight;
+        residuals[0] = residual[0];
+        residuals[1] = residual[1];
+        residuals[2] = residual[2];
+
+        if (jacobians) {
+            const double w = config.tangentGuideWeight / len;
+            double projection[3][3];
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    projection[r][c] = (r == c ? 1.0 : 0.0) - tangent[r] * tangent[c];
+                }
+            }
+
+            double jd[3][3] = {};
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    jd[r][c] = w * projection[r][c];
+                }
+            }
+
+            if (jacobians[0]) {
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        jacobians[0][r * 3 + c] = -jd[r][c];
+                    }
+                }
+            }
+            if (jacobians[1]) {
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        jacobians[1][r * 3 + c] = jd[r][c];
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    const PrefetchedNormalSamples& prefetched;
+    size_t sampleIndex = 0;
     LineOptimizationConfig config;
 };
 
@@ -545,7 +796,8 @@ void addResiduals(
     const NormalSampler& sampler,
     const LineOptimizationConfig& config,
     int seedIndex,
-    const cv::Vec3d& seedTangent)
+    const cv::Vec3d& seedTangent,
+    const PrefetchedNormalSamples* prefetchedSamples = nullptr)
 {
     for (size_t i = 0; i + 1 < points.size(); ++i) {
         auto* cost = new ceres::AutoDiffCostFunction<DistanceResidual, 1, 3, 3>(
@@ -563,7 +815,16 @@ void addResiduals(
         for (int sample = 0; sample <= config.samplesPerSegment; ++sample) {
             const double t = static_cast<double>(sample) /
                              static_cast<double>(config.samplesPerSegment);
-            auto* cost = new LiveNormalAlignmentResidual(sampler, t, config.normalAlignmentWeight);
+            const size_t sampleIndex = segment * static_cast<size_t>(config.samplesPerSegment + 1) +
+                                       static_cast<size_t>(sample);
+            ceres::CostFunction* cost = prefetchedSamples
+                ? static_cast<ceres::CostFunction*>(
+                      new PrefetchedNormalAlignmentResidual(*prefetchedSamples, sampleIndex, t, config.normalAlignmentWeight))
+                : (config.differentiableNormalSampling
+                       ? static_cast<ceres::CostFunction*>(
+                             new DifferentiableNormalAlignmentResidual(sampler, t, config.normalAlignmentWeight))
+                       : static_cast<ceres::CostFunction*>(
+                             new LiveNormalAlignmentResidual(sampler, t, config.normalAlignmentWeight)));
             problem.AddResidualBlock(cost, nullptr, points[segment].data(), points[segment + 1].data());
 
             const bool seedAdjacent = static_cast<int>(segment) == seedIndex ||
@@ -571,7 +832,11 @@ void addResiduals(
             if (seedAdjacent &&
                 config.tangentGuideMode != LineOptimizationConfig::TangentGuideMode::None &&
                 config.tangentGuideWeight > 0.0) {
-                auto* guideCost = new LiveTangentGuideResidual(sampler, t, config);
+                ceres::CostFunction* guideCost = prefetchedSamples
+                    ? static_cast<ceres::CostFunction*>(
+                          new PrefetchedTangentGuideResidual(*prefetchedSamples, sampleIndex, config))
+                    : static_cast<ceres::CostFunction*>(
+                          new LiveTangentGuideResidual(sampler, t, config));
                 problem.AddResidualBlock(guideCost, nullptr, points[segment].data(), points[segment + 1].data());
             }
         }
@@ -613,7 +878,11 @@ void addSingleSegmentResiduals(ceres::Problem& problem,
     for (int sample = 0; sample <= config.samplesPerSegment; ++sample) {
         const double t = static_cast<double>(sample) /
                          static_cast<double>(config.samplesPerSegment);
-        auto* normalCost = new LiveNormalAlignmentResidual(sampler, t, config.normalAlignmentWeight);
+        ceres::CostFunction* normalCost = config.differentiableNormalSampling
+            ? static_cast<ceres::CostFunction*>(
+                  new DifferentiableNormalAlignmentResidual(sampler, t, config.normalAlignmentWeight))
+            : static_cast<ceres::CostFunction*>(
+                  new LiveNormalAlignmentResidual(sampler, t, config.normalAlignmentWeight));
         problem.AddResidualBlock(normalCost, nullptr, fixed.data(), moving.data());
 
         if (useTangentGuide &&
@@ -629,10 +898,32 @@ ceres::Solver::Options solverOptions(const LineOptimizationConfig& config, bool 
 {
     ceres::Solver::Options options;
     options.max_num_iterations = config.maxIterations;
-    options.linear_solver_type = ceres::DENSE_QR;
+    switch (config.linearSolver) {
+    case LineOptimizationConfig::LinearSolver::DenseQR:
+        options.linear_solver_type = ceres::DENSE_QR;
+        break;
+    case LineOptimizationConfig::LinearSolver::DenseNormalCholesky:
+        options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
+        break;
+    case LineOptimizationConfig::LinearSolver::SparseNormalCholesky:
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+        break;
+    case LineOptimizationConfig::LinearSolver::DenseSchur:
+        options.linear_solver_type = ceres::DENSE_SCHUR;
+        break;
+    case LineOptimizationConfig::LinearSolver::SparseSchur:
+        options.linear_solver_type = ceres::SPARSE_SCHUR;
+        break;
+    case LineOptimizationConfig::LinearSolver::IterativeSchur:
+        options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+        break;
+    case LineOptimizationConfig::LinearSolver::CGNR:
+        options.linear_solver_type = ceres::CGNR;
+        break;
+    }
     options.minimizer_progress_to_stdout = progress;
     options.logging_type = progress ? ceres::PER_MINIMIZER_ITERATION : ceres::SILENT;
-    options.num_threads = 1;
+    options.num_threads = config.numThreads;
     return options;
 }
 
@@ -873,7 +1164,121 @@ struct GlobalSolveResult {
     int iterations = 0;
     bool usable = false;
     double milliseconds = 0.0;
+    PrefetchTiming prefetchTiming;
     std::string report;
+};
+
+void fillPrefetchedNormalSamples(
+    const std::vector<std::array<double, 3>>& points,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config,
+    PrefetchedNormalSamples& prefetched,
+    PrefetchTiming* timing = nullptr)
+{
+    const size_t sampleCount = points.size() < 2
+        ? 0
+        : (points.size() - 1) * static_cast<size_t>(config.samplesPerSegment + 1);
+    prefetched.samples.clear();
+    prefetched.samples.resize(sampleCount);
+    if (sampleCount == 0) {
+        return;
+    }
+
+    std::vector<cv::Vec3d> samplePoints;
+    samplePoints.reserve(sampleCount);
+    for (size_t segment = 0; segment + 1 < points.size(); ++segment) {
+        const cv::Vec3d a{points[segment][0], points[segment][1], points[segment][2]};
+        const cv::Vec3d b{points[segment + 1][0], points[segment + 1][1], points[segment + 1][2]};
+        for (int sample = 0; sample <= config.samplesPerSegment; ++sample) {
+            const double t = static_cast<double>(sample) /
+                             static_cast<double>(config.samplesPerSegment);
+            samplePoints.push_back(lerp(a, b, t));
+        }
+    }
+
+    const auto prefetchStart = Clock::now();
+    sampler.prefetchNormalSamples(samplePoints, config.differentiableNormalSampling);
+    const auto prefetchEnd = Clock::now();
+
+    const unsigned hardwareThreads = std::thread::hardware_concurrency();
+    const size_t workers = std::min(samplePoints.size(), std::clamp<size_t>(
+        hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads),
+        1,
+        8));
+    if (workers <= 1) {
+        for (size_t index = 0; index < samplePoints.size(); ++index) {
+            prefetched.samples[index] = config.differentiableNormalSampling
+                ? sampler.sampleNormalWithDerivative(samplePoints[index])
+                : NormalSampleWithDerivative{
+                      sampler.sampleNormal(samplePoints[index]),
+                      cv::Matx33d::zeros(),
+                      false};
+        }
+        if (timing) {
+            ++timing->calls;
+            timing->chunkPrefetchMs += elapsedMs(prefetchStart, prefetchEnd);
+            timing->materializeMs += elapsedMs(prefetchEnd, Clock::now());
+        }
+        return;
+    }
+
+    std::vector<std::future<void>> futures;
+    futures.reserve(workers);
+    std::atomic<size_t> next{0};
+    for (size_t worker = 0; worker < workers; ++worker) {
+        futures.push_back(std::async(std::launch::async, [&]() {
+            while (true) {
+                const size_t index = next.fetch_add(1);
+                if (index >= samplePoints.size()) {
+                    return;
+                }
+                prefetched.samples[index] = config.differentiableNormalSampling
+                    ? sampler.sampleNormalWithDerivative(samplePoints[index])
+                    : NormalSampleWithDerivative{
+                          sampler.sampleNormal(samplePoints[index]),
+                          cv::Matx33d::zeros(),
+                          false};
+            }
+        }));
+    }
+    for (auto& future : futures) {
+        future.get();
+    }
+    if (timing) {
+        ++timing->calls;
+        timing->chunkPrefetchMs += elapsedMs(prefetchStart, prefetchEnd);
+        timing->materializeMs += elapsedMs(prefetchEnd, Clock::now());
+    }
+}
+
+class LineNormalIterationPrefetchCallback final : public ceres::IterationCallback {
+public:
+    LineNormalIterationPrefetchCallback(
+        const std::vector<std::array<double, 3>>& points,
+        const NormalSampler& sampler,
+        const LineOptimizationConfig& config,
+        PrefetchedNormalSamples& prefetched,
+        PrefetchTiming& timing)
+        : points_(points)
+        , sampler_(sampler)
+        , config_(config)
+        , prefetched_(prefetched)
+        , timing_(timing)
+    {
+    }
+
+    ceres::CallbackReturnType operator()(const ceres::IterationSummary& /*summary*/) override
+    {
+        fillPrefetchedNormalSamples(points_, sampler_, config_, prefetched_, &timing_);
+        return ceres::SOLVER_CONTINUE;
+    }
+
+private:
+    const std::vector<std::array<double, 3>>& points_;
+    const NormalSampler& sampler_;
+    const LineOptimizationConfig& config_;
+    PrefetchedNormalSamples& prefetched_;
+    PrefetchTiming& timing_;
 };
 
 [[nodiscard]] GlobalSolveResult solveGlobalCandidate(
@@ -886,18 +1291,25 @@ struct GlobalSolveResult {
 {
     const int seedIndex = config.segmentsPerSide;
 
+    PrefetchedNormalSamples prefetchedSamples;
+    PrefetchTiming prefetchTiming;
     ceres::Problem problem;
     for (auto& point : initialPoints) {
         problem.AddParameterBlock(point.data(), 3);
     }
     problem.SetParameterBlockConstant(initialPoints[static_cast<size_t>(seedIndex)].data());
-    addResiduals(problem, initialPoints, sampler, config, seedIndex, seedTangent);
+    addResiduals(problem, initialPoints, sampler, config, seedIndex, seedTangent, &prefetchedSamples);
 
+    fillPrefetchedNormalSamples(initialPoints, sampler, config, prefetchedSamples, &prefetchTiming);
     double initialCost = 0.0;
     problem.Evaluate(ceres::Problem::EvaluateOptions{}, &initialCost, nullptr, nullptr, nullptr);
 
     ceres::Solver::Summary summary;
-    ceres::Solve(solverOptions(config, true), &problem, &summary);
+    LineNormalIterationPrefetchCallback prefetchCallback(initialPoints, sampler, config, prefetchedSamples, prefetchTiming);
+    ceres::Solver::Options options = solverOptions(config, config.printSolverProgress);
+    options.update_state_every_iteration = true;
+    options.callbacks.push_back(&prefetchCallback);
+    ceres::Solve(options, &problem, &summary);
 
     GlobalSolveResult result;
     result.name = std::move(name);
@@ -907,6 +1319,7 @@ struct GlobalSolveResult {
     result.iterations = static_cast<int>(summary.iterations.size());
     result.usable = summary.IsSolutionUsable();
     result.milliseconds = elapsedMs(chainStart, Clock::now());
+    result.prefetchTiming = prefetchTiming;
     result.report = summary.FullReport();
     return result;
 }
@@ -1000,37 +1413,14 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
 
     const int seedIndex = config.segmentsPerSide;
 
-    std::vector<GlobalSolveResult> candidates;
-    candidates.reserve(3);
-
-    const auto sequentialStart = Clock::now();
-    SequentialSolveResult sequential = growSequentialLine(seedPoint, tangent, normalSampler_, config);
-    candidates.push_back(solveGlobalCandidate("incremental+global",
-                                              sequential.points,
-                                              normalSampler_,
-                                              config,
-                                              tangent,
-                                              sequentialStart));
-
-    const auto straightStart = Clock::now();
-    auto straightInit = straightLinePoints(seedPoint, tangent, config);
-    candidates.push_back(solveGlobalCandidate("straight+global",
-                                              std::move(straightInit),
-                                              normalSampler_,
-                                              config,
-                                              tangent,
-                                              straightStart));
-
     const auto directNormalStart = Clock::now();
     auto directNormalInit = directNormalConstructedPoints(seedPoint, tangent, normalSampler_, config);
-    candidates.push_back(solveGlobalCandidate("normal-construct+global",
-                                              std::move(directNormalInit),
-                                              normalSampler_,
-                                              config,
-                                              tangent,
-                                              directNormalStart));
-
-    const auto& selected = candidates[2];
+    const GlobalSolveResult selected = solveGlobalCandidate("normal-construct+global",
+                                                            std::move(directNormalInit),
+                                                            normalSampler_,
+                                                            config,
+                                                            tangent,
+                                                            directNormalStart);
 
     int finalValidSamples = 0;
     int finalInvalidSamples = 0;
@@ -1049,7 +1439,28 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     result.report.validNormalSamples = finalValidSamples;
     result.report.invalidNormalSamples = finalInvalidSamples;
     result.report.converged = selected.usable;
-    result.report.message = comparisonReport(candidates) + "\nSelected candidate report:\n" + selected.report;
+    result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
+    result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
+    result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+    std::ostringstream message;
+    message.imbue(std::locale::classic());
+    message << std::scientific << std::setprecision(3)
+            << "Line annotation Lasagna selected candidate:\n"
+            << "candidate                   ms  iters    init_cost   final_cost\n"
+            << std::left << std::setw(24) << selected.name
+            << std::right << std::setw(10) << selected.milliseconds
+            << std::setw(7) << selected.iterations
+            << std::setw(13) << selected.initialCost
+            << std::setw(13) << selected.finalCost
+            << "\n\nNormal prefetch/materialization:\n"
+            << "calls=" << selected.prefetchTiming.calls
+            << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
+            << " materialize_ms=" << selected.prefetchTiming.materializeMs
+            << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
+                                selected.prefetchTiming.materializeMs)
+            << "\n\nSelected candidate report:\n"
+            << selected.report;
+    result.report.message = message.str();
     result.report.finalLosses = evaluateLosses(selected.points, normalSampler_, config, seedIndex, tangent);
 
     return result;
