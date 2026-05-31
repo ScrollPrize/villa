@@ -1,0 +1,293 @@
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
+#include "vc/lasagna/LineOptimizer.hpp"
+#include "vc/lasagna/LineViewBuilder.hpp"
+
+#include <opencv2/core.hpp>
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <locale>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr double kEpsilon = 1.0e-12;
+
+cv::Vec3d normalizedOrZero(const cv::Vec3d& v)
+{
+    if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
+        return {0.0, 0.0, 0.0};
+    }
+    const double n = std::sqrt(v.dot(v));
+    if (n <= kEpsilon) {
+        return {0.0, 0.0, 0.0};
+    }
+    return v * (1.0 / n);
+}
+
+bool finiteDirection(const cv::Vec3d& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]) &&
+           std::sqrt(v.dot(v)) > kEpsilon;
+}
+
+void printUsage(const char* argv0)
+{
+    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--seed=x,y,z]\n"
+              << "Runs line annotation optimization at seed "
+              << "[17955,15141,37891] with initial z-axis mode.\n";
+}
+
+cv::Vec3d parseSeed(const std::string& value)
+{
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    char trailing = '\0';
+    if (std::sscanf(value.c_str(), "%lf,%lf,%lf%c", &x, &y, &z, &trailing) != 3) {
+        throw std::invalid_argument("seed must be formatted as x,y,z");
+    }
+    return {x, y, z};
+}
+
+cv::Vec3d initialZInOutTangent(const cv::Vec3d& sourceSliceNormal,
+                               const vc::lasagna::NormalSample& seedNormal)
+{
+    const cv::Vec3d sliceNormal = normalizedOrZero(sourceSliceNormal);
+    const cv::Vec3d gtNormal = seedNormal.valid
+        ? normalizedOrZero(seedNormal.normal)
+        : cv::Vec3d{0.0, 0.0, 0.0};
+    if (!finiteDirection(sliceNormal) || !finiteDirection(gtNormal)) {
+        return {0.0, 0.0, 0.0};
+    }
+    return normalizedOrZero(sliceNormal - gtNormal * sliceNormal.dot(gtNormal));
+}
+
+void printLosses(const vc::lasagna::LineOptimizationReport& report)
+{
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(3);
+    std::cout << "Final loss breakdown:\n"
+              << "term                 n      weight    raw_cost weighted_cost\n";
+    for (const auto& loss : report.finalLosses) {
+        std::cout << std::left << std::setw(18) << loss.name
+                  << std::right << std::setw(6) << loss.residuals
+                  << std::setw(12) << loss.weight
+                  << std::setw(12) << loss.rawCost
+                  << std::setw(14) << loss.weightedCost
+                  << '\n';
+    }
+}
+
+const char* solverName(vc::lasagna::LineOptimizationConfig::LinearSolver solver)
+{
+    using LinearSolver = vc::lasagna::LineOptimizationConfig::LinearSolver;
+    switch (solver) {
+    case LinearSolver::DenseQR:
+        return "dense_qr";
+    case LinearSolver::DenseNormalCholesky:
+        return "dense_normal_cholesky";
+    case LinearSolver::SparseNormalCholesky:
+        return "sparse_normal_cholesky";
+    case LinearSolver::DenseSchur:
+        return "dense_schur";
+    case LinearSolver::SparseSchur:
+        return "sparse_schur";
+    case LinearSolver::IterativeSchur:
+        return "iterative_schur";
+    case LinearSolver::CGNR:
+        return "cgnr";
+    }
+    return "unknown";
+}
+
+double normalAlignmentCost(const vc::lasagna::LineOptimizationReport& report)
+{
+    for (const auto& loss : report.finalLosses) {
+        if (loss.name == "normal_alignment") {
+            return loss.weightedCost;
+        }
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+void printLineViewDiagnostics(const vc::lasagna::LineModel& line)
+{
+    const auto diagnostics = vc::lasagna::diagnoseLineViewFrames(line);
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(3);
+    std::cout << "Line view frame diagnostics:\n"
+              << "frames=" << diagnostics.frameCount
+              << " issues=" << diagnostics.issues.size()
+              << " max_abs_roll_delta_rad=" << diagnostics.maxAbsRollDeltaRadians
+              << " min_normal_dot=" << diagnostics.minNormalContinuityDot
+              << " min_side_dot=" << diagnostics.minSideContinuityDot
+              << " min_sampled_axis_dot=" << diagnostics.minSampledAxisContinuityDot
+              << " min_mesh_to_sampled_axis_dot=" << diagnostics.minMeshToSampledAxisDot
+              << " max_abs_display_up_roll_delta_rad=" << diagnostics.maxAbsDisplayUpRollDeltaRadians
+              << " min_display_up_dot=" << diagnostics.minDisplayUpContinuityDot
+              << '\n';
+    if (!diagnostics.issues.empty()) {
+        std::cout << "idx     roll_delta  normal_dot    side_dot sampled_axis mesh_sampled_axis display_roll display_up reason\n";
+        for (const auto& issue : diagnostics.issues) {
+            std::cout << std::setw(3) << issue.index
+                      << std::setw(15) << issue.rollDeltaRadians
+                      << std::setw(12) << issue.normalContinuityDot
+                      << std::setw(12) << issue.sideContinuityDot
+                      << std::setw(13) << issue.sampledAxisContinuityDot
+                      << std::setw(18) << issue.meshToSampledAxisDot
+                      << std::setw(13) << issue.displayUpRollDeltaRadians
+                      << std::setw(11) << issue.displayUpContinuityDot
+                      << ' ' << issue.reason << '\n';
+        }
+    }
+}
+
+bool isSchurSolver(vc::lasagna::LineOptimizationConfig::LinearSolver solver)
+{
+    using LinearSolver = vc::lasagna::LineOptimizationConfig::LinearSolver;
+    return solver == LinearSolver::DenseSchur ||
+           solver == LinearSolver::SparseSchur ||
+           solver == LinearSolver::IterativeSchur;
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    if (argc < 2) {
+        printUsage(argv[0]);
+        return 2;
+    }
+    bool differentiableNormalSampling = true;
+    bool benchmarkSolvers = false;
+    cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
+    for (int i = 2; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--constant-normal-jacobian") {
+            differentiableNormalSampling = false;
+        } else if (arg == "--benchmark-solvers") {
+            benchmarkSolvers = true;
+        } else if (arg.rfind("--seed=", 0) == 0) {
+            seedPoint = parseSeed(arg.substr(7));
+        } else {
+            printUsage(argv[0]);
+            return 2;
+        }
+    }
+
+    try {
+        const std::filesystem::path manifestPath = argv[1];
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        vc::lasagna::LineOptimizer optimizer(sampler);
+
+        const cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
+        const auto seedNormal = sampler.sampleNormal(seedPoint);
+
+        vc::lasagna::LineOptimizationConfig config;
+        config.segmentsPerSide = 100;
+        config.segmentLength = 16.0;
+        config.straightnessWeight = 0.1;
+        config.tangentStraightnessWeight = 5.0;
+        config.normalStraightnessWeight = 0.5;
+        config.samplesPerSegment = 1;
+        config.differentiableNormalSampling = differentiableNormalSampling;
+        config.runGlobalOptimization = benchmarkSolvers;
+        config.initialTangent = initialZInOutTangent(sourceSliceNormal, seedNormal);
+        config.useInitialTangent = finiteDirection(config.initialTangent);
+        config.tangentGuideVector = normalizedOrZero(sourceSliceNormal);
+        config.tangentGuideWeight = 1.0;
+        config.tangentGuideMode =
+            vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
+
+        std::cout << "Seed: [" << seedPoint[0] << ", " << seedPoint[1] << ", " << seedPoint[2] << "]\n";
+        std::cout << "Source direction: [0, 0, 1]\n";
+        std::cout << "Seed normal valid=" << seedNormal.valid
+                  << " normal=[" << seedNormal.normal[0]
+                  << ", " << seedNormal.normal[1]
+                  << ", " << seedNormal.normal[2] << "]\n";
+        std::cout << "Initial tangent valid=" << config.useInitialTangent
+                  << " tangent=[" << config.initialTangent[0]
+                  << ", " << config.initialTangent[1]
+                  << ", " << config.initialTangent[2] << "]\n";
+        std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
+
+        if (benchmarkSolvers) {
+            using LinearSolver = vc::lasagna::LineOptimizationConfig::LinearSolver;
+            const std::vector<LinearSolver> solvers{
+                LinearSolver::DenseQR,
+                LinearSolver::DenseNormalCholesky,
+                LinearSolver::SparseNormalCholesky,
+                LinearSolver::CGNR,
+                LinearSolver::DenseSchur,
+                LinearSolver::SparseSchur,
+                LinearSolver::IterativeSchur,
+            };
+            const std::vector<int> threadCounts{1, 2, 4, 8};
+            std::cout.imbue(std::locale::classic());
+            std::cout << std::scientific << std::setprecision(3);
+            std::cout << "Solver benchmark:\n"
+                      << "solver                    threads   run       ms  iters   final_cost normal_cost prefetch_ms materialize_ms status\n";
+            for (const auto solver : solvers) {
+                for (const int threads : threadCounts) {
+                    if (isSchurSolver(solver)) {
+                        std::cout << std::left << std::setw(25) << solverName(solver)
+                                  << std::right << std::setw(7) << threads
+                                  << "    --        --     --          --          --          --            -- unsupported_residual_graph\n";
+                        continue;
+                    }
+                    auto trialConfig = config;
+                    trialConfig.linearSolver = solver;
+                    trialConfig.numThreads = threads;
+                    trialConfig.printSolverProgress = false;
+                    for (int run = 1; run <= 2; ++run) {
+                        const auto start = std::chrono::steady_clock::now();
+                        const auto result = optimizer.optimizeFromSeed(seedPoint, trialConfig);
+                        const auto end = std::chrono::steady_clock::now();
+                        const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+                        std::cout << std::left << std::setw(25) << solverName(solver)
+                                  << std::right << std::setw(7) << threads
+                                  << std::setw(6) << (run == 1 ? "cold" : "warm")
+                                  << std::setw(10) << ms
+                                  << std::setw(7) << result.report.iterations
+                                  << std::setw(13) << result.report.finalCost
+                                  << std::setw(12) << normalAlignmentCost(result.report)
+                                  << std::setw(12) << result.report.normalChunkPrefetchMs
+                                  << std::setw(14) << result.report.normalMaterializeMs
+                                  << " " << (result.report.converged ? "ok" : "not_converged") << '\n';
+                    }
+                }
+            }
+            return 0;
+        }
+
+        const auto result = optimizer.optimizeFromSeed(seedPoint, config);
+
+        std::cout << "Optimization complete: points=" << result.line.points.size()
+                  << " iterations=" << result.report.iterations
+                  << " initial_cost=" << result.report.initialCost
+                  << " final_cost=" << result.report.finalCost
+                  << " valid_normals=" << result.report.validNormalSamples
+                  << " invalid_normals=" << result.report.invalidNormalSamples
+                  << " converged=" << result.report.converged << "\n";
+        if (!result.report.message.empty()) {
+            std::cout << result.report.message << '\n';
+        }
+        printLosses(result.report);
+        printLineViewDiagnostics(result.line);
+    } catch (const std::exception& ex) {
+        std::cerr << "vc_lasagna_line_probe failed: " << ex.what() << '\n';
+        return 1;
+    }
+
+    return 0;
+}
