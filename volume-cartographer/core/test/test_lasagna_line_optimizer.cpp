@@ -47,6 +47,18 @@ public:
     mutable std::vector<cv::Vec3d> sampledPoints;
 };
 
+class SeedThenTiltedNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override
+    {
+        if (std::sqrt(volumePoint.dot(volumePoint)) < 1.0e-9) {
+            return {{0.0, 0.0, 1.0}, true, {}};
+        }
+        const double invSqrt2 = 1.0 / std::sqrt(2.0);
+        return {{invSqrt2, 0.0, invSqrt2}, true, {}};
+    }
+};
+
 double norm(const cv::Vec3d& vector)
 {
     return std::sqrt(vector.dot(vector));
@@ -273,6 +285,34 @@ TEST_CASE("LineOptimizer accepts an initial tangent constrained to the sampled t
     CHECK(result.line.points.back().position[0] == doctest::Approx(10.0));
     CHECK(result.line.points.back().position[1] == doctest::Approx(30.0));
     CHECK(result.line.points.back().position[2] == doctest::Approx(30.0));
+}
+
+TEST_CASE("LineOptimizer seed initialization transports tangent by normal rotation")
+{
+    SeedThenTiltedNormalSampler sampler;
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 1.0;
+    config.samplesPerSegment = 1;
+    config.runGlobalOptimization = false;
+    config.useInitialTangent = true;
+    config.initialTangent = {1.0, 1.0, 0.0};
+
+    const auto result = optimizer.optimizeFromSeed({0.0, 0.0, 0.0}, config);
+
+    REQUIRE(result.line.points.size() == 3);
+    CHECK(result.report.iterations == 0);
+    const cv::Vec3d forward = result.line.points[2].position - result.line.points[1].position;
+    const cv::Vec3d direction = forward * (1.0 / norm(forward));
+    CHECK(direction[0] == doctest::Approx(0.5).epsilon(1.0e-9));
+    CHECK(direction[1] == doctest::Approx(1.0 / std::sqrt(2.0)).epsilon(1.0e-9));
+    CHECK(direction[2] == doctest::Approx(-0.5).epsilon(1.0e-9));
+
+    const double invSqrt2 = 1.0 / std::sqrt(2.0);
+    CHECK(direction.dot(cv::Vec3d{invSqrt2, 0.0, invSqrt2}) ==
+          doctest::Approx(0.0).epsilon(1.0e-9));
 }
 
 TEST_CASE("LineOptimizer resamples normals during solver residual evaluation")

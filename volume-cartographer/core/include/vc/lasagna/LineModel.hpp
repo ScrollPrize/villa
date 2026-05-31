@@ -93,6 +93,7 @@ struct LineOptimizationConfig {
     int samplesPerSegment = 1;
     int maxIterations = 50;
     bool differentiableNormalSampling = false;
+    bool runGlobalOptimization = true;
     LinearSolver linearSolver = LinearSolver::SparseNormalCholesky;
     int numThreads = 1;
     bool printSolverProgress = true;

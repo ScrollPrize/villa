@@ -144,6 +144,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
         config.normalStraightnessWeight = 0.5;
         config.samplesPerSegment = 1;
         config.differentiableNormalSampling = true;
+        config.runGlobalOptimization = false;
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,

@@ -752,6 +752,15 @@ struct LossAccumulator {
     return {loss.name, loss.weight, loss.residuals, loss.rawCost, loss.weightedCost};
 }
 
+[[nodiscard]] double totalWeightedCost(const std::vector<LineOptimizationLossReport>& losses)
+{
+    double total = 0.0;
+    for (const auto& loss : losses) {
+        total += loss.weightedCost;
+    }
+    return total;
+}
+
 [[nodiscard]] cv::Vec3d straightnessSplitNormalAt(const std::array<double, 3>& point,
                                                   const NormalSampler& sampler)
 {
@@ -1290,6 +1299,60 @@ using Clock = std::chrono::steady_clock;
     return projected;
 }
 
+[[nodiscard]] cv::Vec3d rotateAroundAxis(const cv::Vec3d& vector,
+                                         const cv::Vec3d& axis,
+                                         double angle)
+{
+    const cv::Vec3d unitAxis = normalizedOrZero(axis);
+    if (length(unitAxis) <= kEpsilon) {
+        return vector;
+    }
+    const double c = std::cos(angle);
+    const double s = std::sin(angle);
+    return vector * c + unitAxis.cross(vector) * s +
+           unitAxis * (unitAxis.dot(vector) * (1.0 - c));
+}
+
+[[nodiscard]] cv::Vec3d transportedDirectionToNormalPlane(
+    const cv::Vec3d& direction,
+    const cv::Vec3d& previousNormal,
+    cv::Vec3d targetNormal)
+{
+    const cv::Vec3d normalizedDirection = normalizedOrZero(direction);
+    if (length(normalizedDirection) <= kEpsilon) {
+        return {1.0, 0.0, 0.0};
+    }
+
+    cv::Vec3d previous = normalizedOrZero(previousNormal);
+    targetNormal = normalizedOrZero(targetNormal);
+    if (length(targetNormal) <= kEpsilon) {
+        return normalizedDirection;
+    }
+    if (length(previous) <= kEpsilon) {
+        return projectDirectionToNormalPlane(normalizedDirection, targetNormal);
+    }
+
+    if (previous.dot(targetNormal) < 0.0) {
+        targetNormal *= -1.0;
+    }
+
+    const cv::Vec3d axis = previous.cross(targetNormal);
+    const double sinAngle = length(axis);
+    const double cosAngle = std::clamp(previous.dot(targetNormal), -1.0, 1.0);
+    cv::Vec3d transported = normalizedDirection;
+    if (sinAngle > kEpsilon) {
+        transported = rotateAroundAxis(normalizedDirection,
+                                       axis,
+                                       std::atan2(sinAngle, cosAngle));
+    }
+
+    transported = projectDirectionToNormalPlane(transported, targetNormal);
+    if (length(transported) <= kEpsilon) {
+        return normalizedDirection;
+    }
+    return transported;
+}
+
 [[nodiscard]] std::vector<std::array<double, 3>> directNormalConstructedPoints(
     const cv::Vec3d& seedPoint,
     const cv::Vec3d& seedTangent,
@@ -1304,12 +1367,21 @@ using Clock = std::chrono::steady_clock;
     auto grow = [&](int sign, std::vector<std::array<double, 3>>& out) {
         cv::Vec3d point = seedPoint;
         cv::Vec3d direction = normalizedOrZero(seedTangent) * static_cast<double>(sign);
+        NormalSample previousSample = sampler.sampleNormal(point);
+        cv::Vec3d previousNormal = normalizedOrZero(previousSample.normal);
+        if (!previousSample.valid || length(previousNormal) <= kEpsilon) {
+            previousNormal = {0.0, 0.0, 0.0};
+        }
         for (int i = 0; i < config.segmentsPerSide; ++i) {
             const cv::Vec3d predicted = point + direction * config.segmentLength;
             const NormalSample sample = sampler.sampleNormal(predicted);
-            const cv::Vec3d normal = normalizedOrZero(sample.normal);
+            cv::Vec3d normal = normalizedOrZero(sample.normal);
             if (sample.valid && length(normal) > kEpsilon) {
-                direction = projectDirectionToNormalPlane(direction, normal);
+                direction = transportedDirectionToNormalPlane(direction, previousNormal, normal);
+                if (length(previousNormal) > kEpsilon && previousNormal.dot(normal) < 0.0) {
+                    normal *= -1.0;
+                }
+                previousNormal = normal;
             }
             point += direction * config.segmentLength;
             out.push_back(toArray(point));
@@ -1354,13 +1426,22 @@ void growNormalConstructedExtension(
     if (length(direction) <= kEpsilon) {
         direction = {1.0, 0.0, 0.0};
     }
+    NormalSample previousSample = sampler.sampleNormal(point);
+    cv::Vec3d previousNormal = normalizedOrZero(previousSample.normal);
+    if (!previousSample.valid || length(previousNormal) <= kEpsilon) {
+        previousNormal = {0.0, 0.0, 0.0};
+    }
     out.reserve(static_cast<size_t>(config.segmentsPerSide));
     for (int i = 0; i < config.segmentsPerSide; ++i) {
         const cv::Vec3d predicted = point + direction * config.segmentLength;
         const NormalSample sample = sampler.sampleNormal(predicted);
-        const cv::Vec3d normal = normalizedOrZero(sample.normal);
+        cv::Vec3d normal = normalizedOrZero(sample.normal);
         if (sample.valid && length(normal) > kEpsilon) {
-            direction = projectDirectionToNormalPlane(direction, normal);
+            direction = transportedDirectionToNormalPlane(direction, previousNormal, normal);
+            if (length(previousNormal) > kEpsilon && previousNormal.dot(normal) < 0.0) {
+                normal *= -1.0;
+            }
+            previousNormal = normal;
         }
         point += direction * config.segmentLength;
         out.push_back(toArray(point));
@@ -1726,6 +1807,52 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     const auto directNormalStart = Clock::now();
     auto directNormalInit = directNormalConstructedPoints(seedPoint, tangent, normalSampler_, config);
     auto spacingConstraints = fixedStepConstraints(directNormalInit.size() - 1);
+    if (!config.runGlobalOptimization) {
+        int finalValidSamples = 0;
+        int finalInvalidSamples = 0;
+        auto finalSamples = sampleSegments(
+            directNormalInit,
+            normalSampler_,
+            config.samplesPerSegment,
+            &finalValidSamples,
+            &finalInvalidSamples);
+
+        LineOptimizationResult result;
+        result.line = buildLineModel(directNormalInit,
+                                     normalSampler_,
+                                     std::move(finalSamples),
+                                     seedIndex);
+        result.report.finalLosses = evaluateLosses(directNormalInit,
+                                                   spacingConstraints,
+                                                   normalSampler_,
+                                                   config,
+                                                   seedIndex,
+                                                   tangent,
+                                                   true);
+        result.report.initialCost = totalWeightedCost(result.report.finalLosses);
+        result.report.finalCost = result.report.initialCost;
+        result.report.iterations = 0;
+        result.report.validNormalSamples = finalValidSamples;
+        result.report.invalidNormalSamples = finalInvalidSamples;
+        result.report.converged = true;
+        result.report.normalPrefetchCalls = 0;
+        result.report.normalChunkPrefetchMs = 0.0;
+        result.report.normalMaterializeMs = 0.0;
+        std::ostringstream message;
+        message.imbue(std::locale::classic());
+        message << std::scientific << std::setprecision(3)
+                << "Line annotation Lasagna selected candidate:\n"
+                << "candidate                   ms  iters    init_cost   final_cost\n"
+                << std::left << std::setw(24) << "normal-construct-init"
+                << std::right << std::setw(10) << elapsedMs(directNormalStart, Clock::now())
+                << std::setw(7) << 0
+                << std::setw(13) << result.report.initialCost
+                << std::setw(13) << result.report.finalCost
+                << "\n\nGlobal optimization disabled; returning normal-transport initialization.";
+        result.report.message = message.str();
+        return result;
+    }
+
     const GlobalSolveResult selected = solveGlobalCandidate("normal-construct+global",
                                                             std::move(directNormalInit),
                                                             std::move(spacingConstraints),
