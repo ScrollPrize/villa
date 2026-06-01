@@ -159,8 +159,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Affinity Prediction with Unet](https://discordapp.com/channels/1079907749569237093/1407379961417039953) by Ayush Mishra
     - Unet trained on affinity labels using pytorch_connectomics and experiments with watershed
 - [Gabor Filter for surface prediction](https://www.kaggle.com/code/bluetriad/scroll4-gaborfilters/notebook?scriptVersionId=265957590) by Ayush Mishra
-
-
+  
+- [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
 
 ### 📦 Materials
 
