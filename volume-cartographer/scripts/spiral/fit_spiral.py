@@ -3140,7 +3140,12 @@ def save_overlay(
     for vis_slice_idx, slice_z in enumerate(tqdm(zs_for_visualisation, desc='visualising slices')):
         slice_zyx = torch.cat([torch.full([*slice_yx.shape[:2], 1], slice_z, device=device), slice_yx], dim=-1)
 
-        spiral_zyx = slice_to_spiral_transform(slice_zyx)
+        slice_zyx_flat = slice_zyx.reshape(-1, 3)
+        chunk = 65536
+        spiral_pieces = []
+        for start in range(0, slice_zyx_flat.shape[0], chunk):
+            spiral_pieces.append(slice_to_spiral_transform(slice_zyx_flat[start:start + chunk]))
+        spiral_zyx = torch.cat(spiral_pieces, dim=0).reshape(*slice_zyx.shape)
         spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx, winding_range=winding_range)
         slice = scroll_slices_for_visualisation[vis_slice_idx].to(device)
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
