@@ -38,6 +38,7 @@ struct LineOptimizationReport {
     double ceresSolveMs = 0.0;
     double normalChunkPrefetchMs = 0.0;
     double normalMaterializeMs = 0.0;
+    double totalMs = 0.0;
     uint64_t normalPrefetchRequestedChunks = 0;
     uint64_t normalPrefetchChunksRead = 0;
     std::string message;
