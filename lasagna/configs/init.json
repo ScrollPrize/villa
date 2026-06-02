@@ -10,7 +10,7 @@
 		"smooth": 10.0,
 		"station_n": 0.1,
 		"station_t": 0.1,
-		"winding_density": 0.01,
+		"winding_density": 0.0,
 		"data": 0.0,
 		"data_plain": 0.0,
 		"pred_dt": 0.001,

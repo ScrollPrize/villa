@@ -4,7 +4,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -103,7 +103,13 @@ class OptSettings:
 @dataclass(frozen=True)
 class Stage:
 	name: str
-	global_opt: OptSettings
+	global_opt: OptSettings | None
+	children: tuple["Stage", ...] = ()
+	grow: dict | None = None
+
+	@property
+	def is_expand(self) -> bool:
+		return self.name.startswith("expand-")
 
 
 @dataclass(frozen=True)
@@ -524,23 +530,46 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 		raise ValueError("stages_json: expected key 'stages' to be a non-empty list, got an empty list")
 	_require_consumed_dict(where="top-level", cfg=cfg)
 
-	out: list[Stage] = []
-	for s in stages_cfg:
-		if not isinstance(s, dict):
-			raise ValueError("stages_json: each stage must be an object")
-		s = dict(s)
-		name = str(s.pop("name", ""))
-		global_opt_cfg = s.pop("global_opt", None)
-		if global_opt_cfg is None:
-			global_opt_cfg = dict(s)
-			s.clear()
-		_require_consumed_dict(where=f"stage '{name}'", cfg=s)
-		if not isinstance(global_opt_cfg, dict):
-			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
-		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
-		out.append(Stage(name=name, global_opt=global_opt))
+	def _load_stage_list(raw_stages: list, *, where: str) -> list[Stage]:
+		out: list[Stage] = []
+		for s in raw_stages:
+			if not isinstance(s, dict):
+				raise ValueError(f"stages_json: each stage in {where} must be an object")
+			s = dict(s)
+			name = str(s.pop("name", ""))
+			children_cfg = s.pop("stages", None)
+			grow_cfg = s.pop("grow", None)
+			if children_cfg is not None or name.startswith("expand-"):
+				if not name.startswith("expand-"):
+					raise ValueError(f"stages_json: wrapper stage '{name}' must be named expand-*")
+				if name not in {"expand-z", "expand-xyz"}:
+					raise ValueError(f"stages_json: unsupported expand stage '{name}' (expected expand-z or expand-xyz)")
+				if not isinstance(children_cfg, list) or not children_cfg:
+					raise ValueError(f"stages_json: stage '{name}' requires non-empty nested 'stages' list")
+				if grow_cfg is not None and not isinstance(grow_cfg, dict):
+					raise ValueError(f"stages_json: stage '{name}' field 'grow' must be an object or null")
+				_require_consumed_dict(where=f"stage '{name}'", cfg=s)
+				out.append(Stage(
+					name=name,
+					global_opt=None,
+					children=tuple(_load_stage_list(children_cfg, where=f"stage '{name}'.stages")),
+					grow=None if grow_cfg is None else dict(grow_cfg),
+				))
+				continue
+			global_opt_cfg = s.pop("global_opt", None)
+			if global_opt_cfg is None:
+				global_opt_cfg = dict(s)
+				s.clear()
+			_require_consumed_dict(where=f"stage '{name}'", cfg=s)
+			if not isinstance(global_opt_cfg, dict):
+				raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
+			global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
+			out.append(Stage(name=name, global_opt=global_opt))
+		return out
+
+	out = _load_stage_list(stages_cfg, where="top-level stages")
 	if init_mode == "cylinder_seed":
-		_validate_cylinder_seed_stage_roles(out)
+		_validate_cylinder_seed_stage_roles([s for s in out if s.global_opt is not None])
 	return out
 
 
@@ -560,6 +589,11 @@ def load_stages(path: str) -> list[Stage]:
 def total_steps_for_stages(stages: list[Stage]) -> int:
 	total = 0
 	for stage in stages:
+		if stage.children:
+			total += total_steps_for_stages(list(stage.children))
+			continue
+		if stage.global_opt is None:
+			continue
 		total += max(0, stage.global_opt.steps)
 	return total
 
@@ -768,6 +802,7 @@ def optimize(
 	cylinder_shell_callback=None,
 	self_map_init: str = "off",
 	self_map_model_w_wraps: float | None = None,
+	init_grow: dict | None = None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
@@ -1000,7 +1035,7 @@ def optimize(
 		return _truthy(raw)
 
 	def _is_cyl_stage(stage_: Stage) -> bool:
-		return "cyl_params" in stage_.global_opt.params
+		return stage_.global_opt is not None and "cyl_params" in stage_.global_opt.params
 
 	def _cyl_stage_width_target_step(opt_cfg_: OptSettings) -> float | None:
 		args = opt_cfg_.args if isinstance(opt_cfg_.args, dict) else {}
@@ -1013,6 +1048,8 @@ def optimize(
 
 	def _cyl_stage_output_all_shells() -> bool:
 		for stage_ in stages:
+			if stage_.global_opt is None:
+				continue
 			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
 			for key in CYLINDER_OUTPUT_ALL_SHELLS_ARGS:
 				if key in args and _truthy(args.get(key)):
@@ -1021,6 +1058,8 @@ def optimize(
 
 	def _cyl_stage_max_search_shells(default: int) -> int:
 		for stage_ in stages:
+			if stage_.global_opt is None:
+				continue
 			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
 			for key in CYLINDER_MAX_SEARCH_SHELLS_ARGS:
 				if key not in args or args.get(key) is None:
@@ -1174,6 +1213,8 @@ def optimize(
 			return total_steps_for_stages(stages)
 		total = 0
 		for stage_ in stages:
+			if stage_.global_opt is None:
+				continue
 			steps_ = max(0, int(stage_.global_opt.steps))
 			total += steps_
 		return total
@@ -3764,14 +3805,14 @@ def optimize(
 	_num_stages = len(stages)
 	_cyl_init_only = (
 		bool(getattr(model, "cyl_shell_mode", False))
-		and any(stage.name == "cyl_init" for stage in stages)
-		and not any(stage.name == "cyl_grow" for stage in stages)
+		and any(stage.name == "cyl_init" for stage in stages if stage.global_opt is not None)
+		and not any(stage.name == "cyl_grow" for stage in stages if stage.global_opt is not None)
 	)
 
 	# Debug: show corr status
 	_corr_terms = ("corr",)
 	has_corr_pts = data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0
-	corr_weights = {t: [(_need_term(t, s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
+	corr_weights = {t: [(_need_term(t, s.global_opt.eff), s.name) for s in stages if s.global_opt is not None and s.global_opt.steps > 0]
 					for t in _corr_terms}
 	active_corr = {t: ws for t, ws in corr_weights.items() if any(w > 0 for w, _ in ws)}
 	print(f"[optimizer] corr_points={has_corr_pts} active_corr_terms={list(active_corr.keys())}", flush=True)
@@ -3782,7 +3823,106 @@ def optimize(
 		if not active_corr:
 			print(f"[optimizer] WARNING: corr points loaded but no corr weight > 0 in any stage!", flush=True)
 
+	def _fuse_expand_z_append(temp_model: fit_model.Model3D) -> None:
+		with torch.no_grad():
+			old_flat = fit_model.Model3D._integrate_pyramid_3d(model.mesh_ms, pyramid_d=model.pyramid_d).detach()
+			new_flat = fit_model.Model3D._integrate_pyramid_3d(temp_model.mesh_ms, pyramid_d=temp_model.pyramid_d).detach()
+			if tuple(old_flat.shape[2:]) != tuple(new_flat.shape[2:]):
+				raise RuntimeError(
+					f"expand-z fuse requires matching H/W, got old={tuple(old_flat.shape)} new={tuple(new_flat.shape)}"
+				)
+			flat = torch.cat([old_flat, new_flat], dim=1).contiguous()
+			amp = torch.cat([model.amp.detach(), temp_model.amp.detach()], dim=0).contiguous()
+			bias = torch.cat([model.bias.detach(), temp_model.bias.detach()], dim=0).contiguous()
+		n_scales = len(model.mesh_ms)
+		model.depth = int(flat.shape[1])
+		model.pyramid_d = bool(model.params.pyramid_d) and model.depth > 1
+		model.mesh_ms = fit_model.Model3D._construct_pyramid_from_flat_3d(
+			flat,
+			n_scales,
+			pyramid_d=model.pyramid_d,
+		)
+		model.conn_offsets = torch.zeros(
+			4,
+			model.depth,
+			model.mesh_h,
+			model.mesh_w,
+			device=flat.device,
+			dtype=torch.float32,
+		)
+		model.amp = torch.nn.Parameter(amp.to(device=flat.device, dtype=torch.float32))
+		model.bias = torch.nn.Parameter(bias.to(device=flat.device, dtype=torch.float32))
+		print(f"[optimizer] expand-z fuse append: depth={model.depth}", flush=True)
+
+	def _run_expand_z_stage(*, si: int, stage: Stage, data: fit_data.FitData3D) -> fit_data.FitData3D:
+		if init_grow is None:
+			raise ValueError("expand-z requires args.init-grow")
+		order = tuple(str(v).strip().lower() for v in init_grow.get("order", ("up",)))
+		if order != ("up",):
+			raise NotImplementedError("expand-z currently implements init-grow order ['up'] only")
+		target_depth = int(init_grow.get("target_depth", model.depth))
+		step_depth = max(1, int(init_grow.get("step", 1)))
+		if target_depth <= model.depth:
+			print(f"[optimizer] expand-z: target_depth={target_depth} already reached", flush=True)
+			return data
+		while model.depth < target_depth:
+			add_depth = min(step_depth, target_depth - model.depth)
+			with torch.no_grad():
+				ref_xyz = model._grid_xyz().detach()[-1].contiguous()
+				ref_valid = torch.isfinite(ref_xyz).all(dim=-1)
+			print(
+				f"[optimizer] expand-z: building temporary +{add_depth} winding model "
+				f"from reference depth {model.depth - 1} toward target_depth={target_depth}",
+				flush=True,
+			)
+			temp_model = fit_model.Model3D.from_tifxyz_crop(
+				ref_xyz,
+				ref_valid,
+				device=ref_xyz.device,
+				mesh_step=model.params.mesh_step,
+				winding_step=model.params.winding_step,
+				subsample_mesh=model.params.subsample_mesh,
+				subsample_winding=model.params.subsample_winding,
+				depth=add_depth,
+			)
+			temp_model.params = replace(
+				temp_model.params,
+				scaledown=model.params.scaledown,
+				z_step_eff=model.params.z_step_eff,
+				volume_extent=model.params.volume_extent,
+				model_w=model.params.model_w,
+				model_h=model.params.model_h,
+			)
+			with torch.no_grad():
+				temp_model.amp.copy_(model.amp.detach()[-1:].expand_as(temp_model.amp))
+				temp_model.bias.copy_(model.bias.detach()[-1:].expand_as(temp_model.bias))
+			temp_model.add_external_surface(ref_xyz, valid=ref_valid, offset=1.0)
+			data = optimize(
+				model=temp_model,
+				data=data,
+				stages=list(stage.children),
+				snapshot_interval=0,
+				snapshot_fn=lambda **_kw: None,
+				progress_fn=progress_fn,
+				cancel_fn=cancel_fn,
+				ensure_data_fn=ensure_data_fn,
+				seed_xyz=seed_xyz,
+				out_dir=out_dir,
+				self_map_init="off",
+				self_map_model_w_wraps=None,
+				init_grow=None,
+			)
+			_fuse_expand_z_append(temp_model)
+		return data
+
 	for si, stage in enumerate(stages):
+		if stage.children:
+			if stage.name == "expand-z":
+				data = _run_expand_z_stage(si=si, stage=stage, data=data)
+				continue
+			raise NotImplementedError(f"unsupported wrapper stage '{stage.name}'")
+		if stage.global_opt is None:
+			continue
 		run_zero_step_cyl = "cyl_params" in stage.global_opt.params
 		if stage.global_opt.steps > 0 or run_zero_step_cyl:
 			_stage_wall_t0 = time.perf_counter()

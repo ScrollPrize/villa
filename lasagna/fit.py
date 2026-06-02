@@ -3,7 +3,7 @@ import copy
 import dataclasses
 import math
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
@@ -40,6 +40,112 @@ def _truthy_config_bool(value: object) -> bool:
 	if isinstance(value, str):
 		return value.strip().lower() in {"1", "true", "yes", "on"}
 	return False
+
+
+@dataclass(frozen=True)
+class InitGrowConfig:
+	enabled: bool = False
+	axis: str = "z"
+	initial_depth: int = 1
+	target_depth_from: str = "depth"
+	order: tuple[str, ...] = ("up",)
+	step: int = 1
+
+
+def _raw_init_grow_initial_depth(args_cfg: dict | None) -> int:
+	if not isinstance(args_cfg, dict):
+		return 1
+	raw = args_cfg.get("init-grow", args_cfg.get("init_grow"))
+	if not isinstance(raw, dict):
+		return 1
+	return max(1, int(raw.get("initial_depth", raw.get("initial-depth", 1))))
+
+
+def _raw_init_grow_enabled(args_cfg: dict | None) -> bool:
+	if not isinstance(args_cfg, dict):
+		return False
+	raw = args_cfg.get("init-grow", args_cfg.get("init_grow"))
+	if raw is None:
+		return False
+	if not isinstance(raw, dict):
+		return True
+	return _truthy_config_bool(raw.get("enabled", True))
+
+
+def _init_grow_stage_depth_delta(cfg: dict) -> int:
+	def _grow_value(grow: object, keys: tuple[str, ...]) -> int:
+		if not isinstance(grow, dict):
+			return 0
+		total = 0
+		for key in keys:
+			if key in grow:
+				total += max(0, int(grow[key]))
+		return total
+
+	def _walk(stages: object) -> int:
+		if not isinstance(stages, list):
+			return 0
+		total = 0
+		for stage in stages:
+			if not isinstance(stage, dict):
+				continue
+			name = str(stage.get("name", ""))
+			if name == "expand-z":
+				total += _grow_value(
+					stage.get("grow"),
+					("d_pos", "d-pos", "z_pos", "z-pos", "depth_pos", "depth-pos", "up"),
+				)
+				total += _grow_value(
+					stage.get("grow"),
+					("d_neg", "d-neg", "z_neg", "z-neg", "depth_neg", "depth-neg", "down"),
+				)
+			total += _walk(stage.get("stages"))
+		return total
+
+	return _walk(cfg.get("stages"))
+
+
+def _parse_init_grow_config(args_cfg: dict | None, *, target_depth: int) -> InitGrowConfig:
+	if not isinstance(args_cfg, dict):
+		return InitGrowConfig(enabled=False)
+	raw = args_cfg.get("init-grow", args_cfg.get("init_grow"))
+	if raw is None:
+		return InitGrowConfig(enabled=False)
+	if not isinstance(raw, dict):
+		raise ValueError("args.init-grow must be an object")
+	enabled = _truthy_config_bool(raw.get("enabled", True))
+	axis = str(raw.get("axis", "z")).strip().lower()
+	if axis not in {"z", "d", "depth"}:
+		raise ValueError("args.init-grow.axis must be 'z'")
+	initial_depth = int(raw.get("initial_depth", raw.get("initial-depth", 1)))
+	if initial_depth < 1:
+		raise ValueError("args.init-grow.initial_depth must be >= 1")
+	if initial_depth > int(target_depth):
+		raise ValueError("args.init-grow.initial_depth must be <= args.depth")
+	target_depth_from = str(raw.get("target_depth_from", raw.get("target-depth-from", "depth"))).strip().lower()
+	if target_depth_from != "depth":
+		raise ValueError("args.init-grow.target_depth_from currently only supports 'depth'")
+	order_raw = raw.get("order", ["up"])
+	if isinstance(order_raw, str):
+		order = (order_raw.strip().lower(),)
+	elif isinstance(order_raw, list):
+		order = tuple(str(v).strip().lower() for v in order_raw)
+	else:
+		raise ValueError("args.init-grow.order must be a string or list")
+	for item in order:
+		if item not in {"up", "down"}:
+			raise ValueError("args.init-grow.order entries must be 'up' or 'down'")
+	step = int(raw.get("step", 1))
+	if step < 1:
+		raise ValueError("args.init-grow.step must be >= 1")
+	return InitGrowConfig(
+		enabled=enabled,
+		axis="z",
+		initial_depth=initial_depth,
+		target_depth_from=target_depth_from,
+		order=order,
+		step=step,
+	)
 
 
 def _require_torch_device_available(device: torch.device) -> None:
@@ -90,6 +196,8 @@ def _optimization_seed_xyz(
 
 def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | None:
 	for stage in stages:
+		if stage.global_opt is None:
+			continue
 		if "cyl_params" not in stage.global_opt.params:
 			continue
 		args = stage.global_opt.args or {}
@@ -605,6 +713,19 @@ def main(argv: list[str] | None = None) -> int:
 	args = parser.parse_args(argv_rest or [])
 
 	model_cfg = cli_model.from_args(args)
+	requested_model_depth = int(model_cfg.depth)
+	args_cfg = cfg.get("args") if isinstance(cfg.get("args"), dict) else None
+	grow_enabled = _raw_init_grow_enabled(args_cfg)
+	grow_initial_depth = _raw_init_grow_initial_depth(args_cfg) if grow_enabled else requested_model_depth
+	grow_stage_depth_delta = _init_grow_stage_depth_delta(cfg) if grow_enabled else 0
+	final_model_depth = max(requested_model_depth, grow_initial_depth + grow_stage_depth_delta)
+	if final_model_depth != requested_model_depth:
+		setattr(args, "depth", final_model_depth)
+		model_cfg = dataclasses.replace(model_cfg, depth=final_model_depth)
+	init_grow_cfg = _parse_init_grow_config(
+		args_cfg,
+		target_depth=final_model_depth,
+	)
 	# Merge final parsed args into fit_config so checkpoint has all values.
 	# depth is canonical; legacy args.windings is accepted only as an input alias.
 	fit_config.setdefault("args", {}).update(_fit_config_args_from_namespace(args))
@@ -630,6 +751,16 @@ def main(argv: list[str] | None = None) -> int:
 		)
 
 	data_cfg = cli_data.from_args(args)
+	if init_grow_cfg.enabled:
+		if model_init != "seed" or str(model_cfg.init_mode).strip().lower() != "shell-dir-crop":
+			raise ValueError("args.init-grow requires args.model-init=seed and args.init-mode=shell-dir-crop")
+		if self_map_init != "multi_wrap_d":
+			raise ValueError("args.init-grow currently requires args.self-map-init=multi_wrap_d")
+		print(
+			f"[fit] init-grow enabled: initial_depth={init_grow_cfg.initial_depth} "
+			f"target_depth={final_model_depth} order={list(init_grow_cfg.order)} step={init_grow_cfg.step}",
+			flush=True,
+		)
 	print("data:", data_cfg)
 	print("model:", model_cfg)
 	print("opt:", opt_cfg)
@@ -957,7 +1088,11 @@ def main(argv: list[str] | None = None) -> int:
 				winding_step=model_cfg.winding_step,
 				subsample_mesh=model_cfg.subsample_mesh,
 				subsample_winding=model_cfg.subsample_winding,
-				depth=(model_cfg.depth if self_map_init == "multi_wrap_d" else 1),
+				depth=(
+					init_grow_cfg.initial_depth
+					if init_grow_cfg.enabled
+					else (model_cfg.depth if self_map_init == "multi_wrap_d" else 1)
+				),
 			)
 			mdl.params = dataclasses.replace(
 				mdl.params,
@@ -1090,6 +1225,26 @@ def main(argv: list[str] | None = None) -> int:
 	)
 	print("[fit] optimizer stages:", flush=True)
 	for i, st in enumerate(stages):
+		if st.children:
+			print(
+				f"[fit]   stage{i} name={st.name!r} expand wrapper children={len(st.children)} grow={st.grow}",
+				flush=True,
+			)
+			for j, child in enumerate(st.children):
+				if child.global_opt is None:
+					print(f"[fit]     child{j} name={child.name!r} wrapper", flush=True)
+					continue
+				args_snap_map = child.global_opt.args.get("snap_surf_map") if isinstance(child.global_opt.args, dict) else None
+				print(
+					f"[fit]     child{j} name={child.name!r} steps={child.global_opt.steps} "
+					f"snap_surf_map_eff={child.global_opt.eff.get('snap_surf_map', 0.0):.6g} "
+					f"snap_surf_map_args={args_snap_map}",
+					flush=True,
+				)
+			continue
+		if st.global_opt is None:
+			print(f"[fit]   stage{i} name={st.name!r} empty wrapper", flush=True)
+			continue
 		args_snap_map = st.global_opt.args.get("snap_surf_map") if isinstance(st.global_opt.args, dict) else None
 		print(
 			f"[fit]   stage{i} name={st.name!r} steps={st.global_opt.steps} "
@@ -1272,6 +1427,9 @@ def main(argv: list[str] | None = None) -> int:
 			  flush=True)
 	_stage_done("prepare_optimization", _t)
 	_t = _stage_start("optimizer")
+	init_grow_runtime = asdict(init_grow_cfg) if init_grow_cfg.enabled else None
+	if init_grow_runtime is not None:
+		init_grow_runtime["target_depth"] = final_model_depth
 	optimizer.optimize(
 		model=mdl,
 		data=data,
@@ -1284,6 +1442,7 @@ def main(argv: list[str] | None = None) -> int:
 		out_dir=_out_dir,
 		self_map_init=self_map_init,
 		self_map_model_w_wraps=self_map_model_w_wraps,
+		init_grow=init_grow_runtime,
 	)
 	_stage_done("optimizer", _t)
 
