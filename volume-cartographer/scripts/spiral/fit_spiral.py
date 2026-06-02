@@ -3478,11 +3478,14 @@ def get_track_radius_loss(slice_to_spiral_transform, dr_per_winding, prepared_tr
     track_lengths_sample = lengths[track_idx]
     track_offsets_sample = offsets[track_idx]
     point_idx_within = (torch.rand([k, num_points_per_track], device=device) * track_lengths_sample[:, None].to(torch.float32)).to(torch.int64)
+    point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
     flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
     sampled_scroll = flat_zyx[flat_idx]
     sampled_spiral = slice_to_spiral_transform(sampled_scroll)
-    _, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
+    theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
+    theta = theta.view(k, num_points_per_track)
     shifted_radii = shifted_radii.view(k, num_points_per_track)
+    shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
     hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
     mean_per_track = shifted_radii.mean(dim=-1, keepdim=True)
     deviations = (shifted_radii - mean_per_track).abs()
