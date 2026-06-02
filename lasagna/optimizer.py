@@ -39,6 +39,35 @@ def _debug_cuda_sync(label: str) -> None:
 			raise RuntimeError(f"CUDA failure after {label}") from exc
 
 
+def _cuda_mem_debug_enabled() -> bool:
+	return os.environ.get("LASAGNA_CUDA_MEM_DEBUG", "0") != "0"
+
+
+def _fmt_mib(value: int | float) -> str:
+	return f"{float(value) / 1024.0 ** 2:.1f}MiB"
+
+
+def _log_cuda_memory(label: str, *, device: torch.device | int | None = None) -> None:
+	if not _cuda_mem_debug_enabled() or not torch.cuda.is_available():
+		return
+	try:
+		dev = device if device is not None else torch.cuda.current_device()
+		allocated = torch.cuda.memory_allocated(dev)
+		reserved = torch.cuda.memory_reserved(dev)
+		max_allocated = torch.cuda.max_memory_allocated(dev)
+		max_reserved = torch.cuda.max_memory_reserved(dev)
+		free, total = torch.cuda.mem_get_info(dev)
+		print(
+			f"[cuda_mem] {label}: "
+			f"alloc={_fmt_mib(allocated)} reserved={_fmt_mib(reserved)} "
+			f"peak_alloc={_fmt_mib(max_allocated)} peak_reserved={_fmt_mib(max_reserved)} "
+			f"free={_fmt_mib(free)} total={_fmt_mib(total)}",
+			flush=True,
+		)
+	except RuntimeError as exc:
+		print(f"[cuda_mem] {label}: unavailable ({exc})", flush=True)
+
+
 def _fmt_duration(seconds: float) -> str:
 	seconds = max(0.0, float(seconds))
 	if seconds < 60.0:
@@ -2539,7 +2568,11 @@ def optimize(
 			with torch.no_grad():
 				_loss_prefetch_items: dict[str, torch.Tensor] = {}
 				if needs_.mesh_conn:
-					for _pf in opt_loss_winding_density.winding_density_prefetch_grad_mag_batches_for_result(res=res_):
+					_log_cuda_memory(f"{label}.loss_prefetch.winding_density.begin")
+					for _i, _pf in enumerate(opt_loss_winding_density.winding_density_prefetch_grad_mag_batches_for_result(res=res_)):
+						_log_cuda_memory(
+							f"{label}.loss_prefetch.winding_density.batch{_i}.ready"
+						)
 						for _cache in _active_caches:
 							_cache_channels = set(_cache.channels)
 							if "grad_mag" not in _cache_channels:
@@ -2547,6 +2580,9 @@ def optimize(
 							_sp = data._spacing_for(_cache.channels[0])
 							_cache.prefetch(_pf, data.origin_fullres, _sp)
 							_prefetched_channels.add("grad_mag")
+						_log_cuda_memory(
+							f"{label}.loss_prefetch.winding_density.batch{_i}.prefetched"
+						)
 				if needs_.prefetch_pred_dt_loss:
 					_add_prefetch_items(
 						_loss_prefetch_items,
@@ -2655,10 +2691,13 @@ def optimize(
 						f"{profile_label or label}: active loss '{name}' missing forward artifact(s): "
 						f"{', '.join(missing)}"
 					)
+				loss_label = f"{profile_label or label}.{name}"
+				_log_cuda_memory(f"{loss_label}.before")
 				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				_t_loss_wall = time.perf_counter() if timing is not None else None
 				result = t["loss"](res=res_)
 				_debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
+				_log_cuda_memory(f"{loss_label}.after_raw")
 				if timing is not None and _t_loss_wall is not None:
 					timing.sync()
 					timing.add(f"loss:{name}", time.perf_counter() - _t_loss_wall)
@@ -3380,7 +3419,9 @@ def optimize(
 		# Initial prefetch for streaming mode
 		if _active_caches:
 			_t = _stage_start(f"{label}.initial_prefetch")
+			_log_cuda_memory(f"{label}.initial_prefetch.before")
 			_prefetch_model_points(stage_needs)
+			_log_cuda_memory(f"{label}.initial_prefetch.after")
 			_stage_done(f"{label}.initial_prefetch", _t)
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
@@ -3395,17 +3436,23 @@ def optimize(
 		_t = _stage_start(f"{label}.initial_eval")
 		with torch.no_grad():
 			_t_forward = _stage_start(f"{label}.initial_eval.model_forward")
+			_log_cuda_memory(f"{label}.initial_eval.model_forward.before")
 			res0 = model(data, needs=stage_needs)
 			_debug_cuda_sync(f"{label}.initial_eval.model_forward")
+			_log_cuda_memory(f"{label}.initial_eval.model_forward.after")
 			_stage_done(f"{label}.initial_eval.model_forward", _t_forward)
 			_t_loss_prefetch = _stage_start(f"{label}.initial_eval.loss_prefetch")
+			_log_cuda_memory(f"{label}.initial_eval.loss_prefetch.before")
 			_prefetch_loss_points_for_result(res0, stage_needs)
 			_debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
+			_log_cuda_memory(f"{label}.initial_eval.loss_prefetch.after")
 			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
 			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
+			_log_cuda_memory(f"{label}.initial_eval.loss_terms.before")
 			opt_loss_snap_surf.set_debug_step(0, label=f"{label}_initial")
 			loss0, term_vals0, display_loss0 = _eval_terms(
 				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
+			_log_cuda_memory(f"{label}.initial_eval.loss_terms.after")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
 			if snap_surf_map_opt_stage is not None:
 				map_initial_stage = snap_surf_map_global.GlobalMapStageConfig(
@@ -3482,11 +3529,13 @@ def optimize(
 		for step in range(max_steps):
 			_t_iter = time.perf_counter()
 			auto_stop = False
+			_log_cuda_memory(f"{label}.{step + 1}.iter.begin")
 			# Sync: wait for chunks loaded by last prefetch
 			_t_io = time.perf_counter()
 			if _active_caches:
 				for _cache in _active_caches:
 					_cache.sync()
+			_log_cuda_memory(f"{label}.{step + 1}.cache_sync.after")
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			if _opt_timing is not None:
@@ -3499,8 +3548,10 @@ def optimize(
 				_opt_timing.add("chunk_stats", time.perf_counter() - _t_part)
 
 			_t_forward = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.model_forward.before")
 			res = model(data, needs=stage_needs)
 			_debug_cuda_sync(f"{label}.{step + 1}.model_forward")
+			_log_cuda_memory(f"{label}.{step + 1}.model_forward.after")
 			if _flow_timing is not None:
 				_timing_cuda_sync()
 				_flow_timing.add("model_forward", time.perf_counter() - _t_forward)
@@ -3509,8 +3560,10 @@ def optimize(
 				_opt_timing.add("model_forward", time.perf_counter() - _t_forward)
 
 			_t_io = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.before")
 			_prefetch_loss_points_for_result(res, stage_needs)
 			_debug_cuda_sync(f"{label}.{step + 1}.loss_prefetch")
+			_log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.after")
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			if _opt_timing is not None:
@@ -3519,7 +3572,9 @@ def optimize(
 
 			_t_loss_eval = time.perf_counter()
 			opt_loss_snap_surf.set_debug_step(step + 1, label=label)
+			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.before")
 			loss, term_vals, display_loss = _eval_terms(res, stage_eff, timing=_opt_timing)
+			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.after")
 			if _flow_timing is not None:
 				_timing_cuda_sync()
 				_flow_timing.add("loss_eval", time.perf_counter() - _t_loss_eval)
@@ -3538,11 +3593,15 @@ def optimize(
 
 			_t_opt = time.perf_counter()
 			_t_part = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.zero_grad.before")
 			opt.zero_grad(set_to_none=True)
+			_log_cuda_memory(f"{label}.{step + 1}.zero_grad.after")
 			if _opt_timing is not None:
 				_opt_timing.add("zero_grad", time.perf_counter() - _t_part)
 			_t_part = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.backward.before")
 			loss.backward()
+			_log_cuda_memory(f"{label}.{step + 1}.backward.after")
 			if _opt_timing is not None:
 				_opt_timing.sync()
 				_opt_timing.add("backward", time.perf_counter() - _t_part)
@@ -3552,7 +3611,9 @@ def optimize(
 			if flatten_max_update > 0.0 and _flatten_update_params:
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
+			_log_cuda_memory(f"{label}.{step + 1}.opt_step.before")
 			opt.step()
+			_log_cuda_memory(f"{label}.{step + 1}.opt_step.after")
 			_bump_snap_global_mesh_epoch()
 			if _flatten_update_before is not None:
 				_clamp_flatten_map_ms_update(

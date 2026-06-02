@@ -459,6 +459,52 @@ class FitData3D:
 			umbilicus_z_step=self.umbilicus_z_step,
 		)
 
+	def _print_sparse_cuda_oom_diagnostics(
+		self,
+		*,
+		context: str,
+		exc: BaseException,
+		xyz_fullres: torch.Tensor | None = None,
+		channels: set[str] | None = None,
+	) -> None:
+		try:
+			shape = tuple(int(v) for v in xyz_fullres.shape) if xyz_fullres is not None else None
+			print(
+				f"[fit_data_oom] {context}: channels={sorted(channels) if channels else 'all'} "
+				f"sample_shape={shape} oom={exc}",
+				flush=True,
+			)
+			for group_name, cache in self.sparse_caches.items():
+				if hasattr(cache, "cache_diagnostics"):
+					print(
+						f"[fit_data_oom] {context}: cache_group={group_name} "
+						f"{cache.cache_diagnostics()}",
+						flush=True,
+					)
+				else:
+					loaded = cache.loaded_chunks() if hasattr(cache, "loaded_chunks") else "unknown"
+					print(
+						f"[fit_data_oom] {context}: cache_group={group_name} "
+						f"type={type(cache).__name__} loaded_chunks={loaded}",
+						flush=True,
+					)
+			if torch.cuda.is_available():
+				dev = xyz_fullres.device if xyz_fullres is not None and xyz_fullres.is_cuda else torch.cuda.current_device()
+				allocated = torch.cuda.memory_allocated(dev)
+				reserved = torch.cuda.memory_reserved(dev)
+				free, total = torch.cuda.mem_get_info(dev)
+				print(
+					f"[fit_data_oom] {context}: torch_alloc={allocated / 1024**2:.1f}MiB "
+					f"torch_reserved={reserved / 1024**2:.1f}MiB "
+					f"free={free / 1024**2:.1f}MiB total={total / 1024**2:.1f}MiB",
+					flush=True,
+				)
+		except Exception as diag_exc:
+			print(
+				f"[fit_data_oom] {context}: diagnostics failed: {diag_exc}; original_oom={exc}",
+				flush=True,
+			)
+
 	def _grid_sample_sparse(
 		self,
 		xyz_fullres: torch.Tensor,
@@ -486,15 +532,24 @@ class FitData3D:
 			sp = self._spacing_for(cache.channels[0])
 			inv_scale = torch.tensor([1.0 / s for s in sp], dtype=torch.float32, device=dev)
 			# (C, D, H, W) raw interpolated values
-			sampled = cache.grid_sample(
-				xyz_fullres,
-				offset,
-				inv_scale,
-				diff=diff,
-				context=f"FitData3D.grid_sample_fullres(diff={diff})",
-			)
-			if not diff:
-				sampled = sampled.float()
+			try:
+				sampled = cache.grid_sample(
+					xyz_fullres,
+					offset,
+					inv_scale,
+					diff=diff,
+					context=f"FitData3D.grid_sample_fullres(diff={diff})",
+				)
+				if not diff:
+					sampled = sampled.float()
+			except torch.OutOfMemoryError as exc:
+				self._print_sparse_cuda_oom_diagnostics(
+					context=f"FitData3D._grid_sample_sparse(group={group_name}, diff={diff})",
+					exc=exc,
+					xyz_fullres=xyz_fullres,
+					channels=channels,
+				)
+				raise
 			for i, ch_name in selected:
 				raw[ch_name] = sampled[i:i+1].unsqueeze(0)  # (1, 1, D, H, W)
 
