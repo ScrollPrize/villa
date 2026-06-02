@@ -12,6 +12,7 @@ To set up a new experiment, work with the user to:
    - `fit_spiral.py` — the file you modify. Losses, optimization, flow model, etc.
    - `tifxyz.py` — helper for loading grid-topo quad-mesh patches.
    - `point_collection.py` — helper for loading sets of annotated points, and linking them to nearby patches.
+   - `extract_surface_tracks.py` — precomputes the 'tracks' DBM used by fit_spiral; you won't run/modify this.
 4. **Initialize results.tsv**: Create `results_mar5.tsv` with just the header row. The baseline will be recorded after the first run. Change `mar5` to whatever branch tag is chosen.
 5. **Confirm and go**: Confirm setup looks good.
 
@@ -19,7 +20,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The fitting script runs for a **fixed iteration budget of 10000 steps**; this will take around 20 minutes in the baseline configuration (and you should avoid increasing this time by too large a factor).
+Each experiment runs on a single GPU. The fitting script runs for a **fixed iteration budget of 10000 steps**; this will take around 30 minutes in the baseline configuration (and you should avoid increasing this time by too large a factor).
 You launch it as: `WANDB_MODE=disabled python fit_spiral.py > run.log`.
 
 **What you CAN do:**
@@ -29,7 +30,7 @@ You launch it as: `WANDB_MODE=disabled python fit_spiral.py > run.log`.
 - Change the number of iterations (num_training_steps in config) above 10000. It must stay fixed (or can be reduced if that actually gives better results).
 - Install new packages or add dependencies. You can only use what's already installed in this conda env.
 - Modify the evaluation metrics (get_patch_satisfied_areas, get_unattached_pcl_satisfied_counts, and related methods) or their parameters (in metrics_config).
-- Change from the 'global' `working_set_mode` to another. Only the global mode is in scope here.
+- Make use of the patches for the optimisation itself (e.g. as part of a loss) -- since it would be cheating to use them given they are used to define the metrics.
 
 **The goal: improve a balance of `satisfied_patches` and `satisfied_unattached_pcls`.** These are the two primary metrics. These can be extracted from the process output using grep, if you redirect it to a file.
 
@@ -62,8 +63,6 @@ grep -E "^(satisfied_patches|satisfied_area|satisfied_unattached_pcls|satisfied_
 ```
 
 If the four lines aren't present, the run did not finish cleanly. (Note: depending on the computing platform the absolute numbers might look different — only relative comparisons against the baseline on the same machine matter.)
-
-`working-set.txt` is still useful as a diagnostic for *when* in training patches become satisfied (see the "early growth matters" hint above), even though the final size itself isn't the metric.
 
 ## Logging results
 
@@ -121,4 +120,4 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~10 minutes then you can run approx 6/hour, for a total of about 50 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~30 minutes then you can run approx 2/hour, for a total of about 16 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
