@@ -22,6 +22,20 @@ class ModelParams3D:
 	pyramid_d: bool         # whether depth axis participates in pyramid
 	model_w: float | None = None
 	model_h: float | None = None
+	depth_windings: tuple[int, ...] = field(default_factory=tuple)
+
+
+def _normalize_depth_windings(raw, *, depth: int, where: str) -> tuple[int, ...]:
+	if not isinstance(raw, (list, tuple)):
+		raise ValueError(f"{where}: missing required depth_windings list")
+	out = tuple(int(v) for v in raw)
+	if len(out) != int(depth):
+		raise ValueError(f"{where}: depth_windings length {len(out)} must match depth {int(depth)}")
+	if len(set(out)) != len(out):
+		raise ValueError(f"{where}: depth_windings must not contain duplicates")
+	if any(b <= a for a, b in zip(out, out[1:])):
+		raise ValueError(f"{where}: depth_windings must be strictly increasing")
+	return out
 
 
 def _frozen_channels(channels: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None) -> frozenset[str]:
@@ -340,6 +354,7 @@ class Model3D(nn.Module):
 			z_step_eff=max(1, int(z_step_eff)),
 			volume_extent=volume_extent,
 			pyramid_d=self.pyramid_d,
+			depth_windings=tuple(range(self.depth)),
 		)
 
 		# Arc parameters (fullres coordinates)
@@ -4237,6 +4252,16 @@ class Model3D(nn.Module):
 			z_step_eff=int(mp["z_step_eff"]),
 			volume_extent=mp.get("volume_extent"),
 			pyramid_d=bool(mp.get("pyramid_d", True)),
+		)
+		mdl.params = replace(
+			mdl.params,
+			model_w=None if mp.get("model_w") is None else float(mp["model_w"]),
+			model_h=None if mp.get("model_h") is None else float(mp["model_h"]),
+			depth_windings=_normalize_depth_windings(
+				mp.get("depth_windings"),
+				depth=D,
+				where="_model_params_",
+			),
 		)
 		# Reconstruct pyramid from flat
 		n_scales = len(mdl.mesh_ms)

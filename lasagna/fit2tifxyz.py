@@ -272,6 +272,19 @@ def _corr_points_result_lookup(corr_results: dict) -> dict[tuple[int, int], dict
 	return lookup
 
 
+def _winding_for_layer(layer_index: int, model_params: dict | None) -> float:
+	if not isinstance(model_params, dict):
+		raise ValueError("_model_params_ is required to resolve depth_windings")
+	depth_windings = model_params.get("depth_windings")
+	if not isinstance(depth_windings, (list, tuple)):
+		raise ValueError("_model_params_.depth_windings is required")
+	if not (0 <= int(layer_index) < len(depth_windings)):
+		raise ValueError(
+			f"layer index {int(layer_index)} is outside depth_windings length {len(depth_windings)}"
+		)
+	return float(depth_windings[int(layer_index)])
+
+
 def _approval_mask_corr_collection_ids(payload: dict, fit_config: dict | None) -> set[int]:
 	ids_raw = payload.get("corr_collection_ids", [])
 	ids: set[int] = set()
@@ -911,10 +924,11 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		mask_all = np.zeros((Hm, total_w), dtype=bool)
 		for d in range(D):
 			_check_cancel()
+			d_value = _winding_for_layer(d, model_params)
 			x_layer = mesh_np[0, d]  # (Hm, Wm)
 			y_layer = mesh_np[1, d]
 			z_layer = mesh_np[2, d]
-			d_layer = np.full((Hm, Wm), float(d), dtype=np.float32)
+			d_layer = np.full((Hm, Wm), d_value, dtype=np.float32)
 			if approval_output_mask is not None:
 				valid_before = int(_valid_xyz_mask(x_layer, y_layer, z_layer).sum())
 				mask, raw_mask, mask_debug = _approval_output_mask_for_layer_with_debug(
@@ -933,7 +947,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 				mask_all[:, col:col + Wm] = mask
 			else:
 				valid_layer = _valid_xyz_mask(x_layer, y_layer, z_layer)
-				d_layer = np.where(valid_layer, float(d), -1.0).astype(np.float32)
+				d_layer = np.where(valid_layer, d_value, -1.0).astype(np.float32)
 			x_all[:, col:col + Wm] = x_layer
 			y_all[:, col:col + Wm] = y_layer
 			z_all[:, col:col + Wm] = z_layer
@@ -976,6 +990,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			total_area["area_cm2"] = 0.0
 		for d in range(D):
 			_check_cancel()
+			d_value = _winding_for_layer(d, model_params)
 			x = mesh_np[0, d]  # (Hm, Wm) already in fullres
 			y = mesh_np[1, d]
 			z = mesh_np[2, d]
@@ -993,7 +1008,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 				mask_debug["valid_vertices_after"] = int(_valid_xyz_mask(x, y, z).sum())
 				_print_mask_debug(mask_debug)
 			valid = _valid_xyz_mask(x, y, z)
-			d_layer = np.where(valid, float(d), -1.0).astype(np.float32)
+			d_layer = np.where(valid, d_value, -1.0).astype(np.float32)
 			x, y, z = _scaled_xyz_for_export(x, y, z, export_factor)
 			area = _get_area(x, y, z, xy_step_export, cfg.voxel_size_um)
 			total_area["area_vx2"] += area["area_vx2"]

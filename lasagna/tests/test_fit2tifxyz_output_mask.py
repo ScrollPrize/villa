@@ -17,6 +17,7 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 import fit2tifxyz
+import model
 import opt_loss_corr
 
 
@@ -234,6 +235,55 @@ class Fit2TifxyzOutputMaskHelpersTest(unittest.TestCase):
 
 
 class CorrWindingResultsOutputMaskTest(unittest.TestCase):
+	def test_winding_for_layer_uses_depth_windings(self) -> None:
+		params = {"depth_windings": [-2, -1, 0, 1]}
+
+		self.assertEqual(fit2tifxyz._winding_for_layer(0, params), -2.0)
+		self.assertEqual(fit2tifxyz._winding_for_layer(2, params), 0.0)
+		self.assertEqual(fit2tifxyz._winding_for_layer(3, params), 1.0)
+
+	def test_checkpoint_load_preserves_depth_windings(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": {
+				"mesh_step": 1,
+				"winding_step": 1,
+				"subsample_mesh": 1,
+				"subsample_winding": 1,
+				"scaledown": 1.0,
+				"z_step_eff": 1,
+				"volume_extent": None,
+				"pyramid_d": False,
+				"depth_windings": [-2],
+			},
+		}
+
+		mdl = model.Model3D.from_checkpoint(state, device=torch.device("cpu"))
+
+		self.assertEqual(mdl.params.depth_windings, (-2,))
+
+	def test_checkpoint_load_requires_depth_windings(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": {
+				"mesh_step": 1,
+				"winding_step": 1,
+				"subsample_mesh": 1,
+				"subsample_winding": 1,
+				"scaledown": 1.0,
+				"z_step_eff": 1,
+				"volume_extent": None,
+				"pyramid_d": False,
+			},
+		}
+
+		with self.assertRaisesRegex(ValueError, "depth_windings"):
+			model.Model3D.from_checkpoint(state, device=torch.device("cpu"))
+
 	def test_winding_results_store_model_surface_locations(self) -> None:
 		result = opt_loss_corr._build_winding_results(
 			winding_obs=torch.tensor([0.0], dtype=torch.float32),
@@ -286,10 +336,11 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 				"z_step_eff": 1,
 				"volume_extent": None,
 				"pyramid_d": False,
-				},
-				"_approval_inpaint_output_mask_": _square_payload(radius=0),
-				"_corr_points_results_": _square_corr_results(),
-			}
+				"depth_windings": [0],
+			},
+			"_approval_inpaint_output_mask_": _square_payload(radius=0),
+			"_corr_points_results_": _square_corr_results(),
+		}
 
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
@@ -326,6 +377,7 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 				"z_step_eff": 1,
 				"volume_extent": None,
 				"pyramid_d": False,
+				"depth_windings": [0],
 			},
 		}
 
@@ -361,6 +413,7 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 				"volume_extent": None,
 				"pyramid_d": False,
 				"lasagna_base_shape_zyx": [100, 100, 100],
+				"depth_windings": [0],
 			},
 		}
 

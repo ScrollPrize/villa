@@ -16,6 +16,7 @@
 		"smooth": 10.0,
 		"station_n": 1.0,
 		"station_t": 1.0,
+		"corr": 0.0001,
 		"pred_dt": 0.0,
 		"bend": 100.0,
 		"snap_surf_map": 0.1,

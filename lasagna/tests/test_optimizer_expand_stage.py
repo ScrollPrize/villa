@@ -108,6 +108,7 @@ class OptimizerExpandStageTest(unittest.TestCase):
 		)
 
 		self.assertEqual(mdl.depth, 2)
+		self.assertEqual(mdl.params.depth_windings, (0, 1))
 		grid = mdl._grid_xyz().detach()
 		self.assertTrue(torch.allclose(grid[0], grid[1], atol=1.0e-6))
 

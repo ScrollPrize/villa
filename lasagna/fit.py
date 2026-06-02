@@ -513,6 +513,7 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 		st["flatten_map_flat"] = map_yx.detach().cpu()
 		st["flatten_point_mask"] = point_mask.detach().cpu()
 	params = asdict(mdl.params)
+	params["depth_windings"] = [int(v) for v in mdl.params.depth_windings]
 	if fit_config.get("lasagna_base_shape_zyx") is not None:
 		params["lasagna_base_shape_zyx"] = list(fit_config["lasagna_base_shape_zyx"])
 	st["_model_params_"] = params
@@ -1400,6 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
 		with torch.no_grad():
 			st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
 		params = asdict(mdl.params)
+		params["depth_windings"] = [int(v) for v in mdl.params.depth_windings]
 		if lasagna_base_shape_zyx is not None:
 			params["lasagna_base_shape_zyx"] = [int(v) for v in lasagna_base_shape_zyx]
 		st["_model_params_"] = params

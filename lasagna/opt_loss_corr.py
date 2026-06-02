@@ -33,6 +33,41 @@ def set_splat_sigma(sigma: float) -> None:
 	_corr_splat_sigma = float(sigma)
 
 
+def _depth_windings_tensor(params, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+	raw = getattr(params, "depth_windings", None)
+	if not isinstance(raw, (list, tuple)) or len(raw) < 1:
+		raise ValueError("corr winding loss requires params.depth_windings")
+	return torch.as_tensor([float(v) for v in raw], device=device, dtype=dtype)
+
+
+def _corr_relative_to_model_winding(winda: torch.Tensor, params) -> torch.Tensor:
+	depth_windings = _depth_windings_tensor(params, device=winda.device, dtype=winda.dtype)
+	if int(depth_windings.numel()) == 1:
+		return winda - depth_windings[0]
+	segments = depth_windings[1:] - depth_windings[:-1]
+	if bool((segments == 0).any().detach().cpu()):
+		raise ValueError("params.depth_windings must not contain duplicate adjacent values")
+	if bool((segments < 0).any().detach().cpu()):
+		raise ValueError("corr winding loss requires params.depth_windings to be increasing")
+	seg_idx = torch.bucketize(winda.contiguous(), depth_windings[1:].contiguous())
+	seg_idx = seg_idx.clamp(min=0, max=int(depth_windings.numel()) - 2)
+	w0 = depth_windings[seg_idx]
+	w1 = depth_windings[seg_idx + 1]
+	return seg_idx.to(dtype=winda.dtype) + (winda - w0) / (w1 - w0)
+
+
+def _corr_model_to_relative_winding(winda: torch.Tensor, params) -> torch.Tensor:
+	depth_windings = _depth_windings_tensor(params, device=winda.device, dtype=winda.dtype)
+	if int(depth_windings.numel()) == 1:
+		return winda + depth_windings[0]
+	idx0 = torch.floor(winda).to(dtype=torch.long)
+	idx0 = idx0.clamp(min=0, max=int(depth_windings.numel()) - 2)
+	frac = winda - idx0.to(dtype=winda.dtype)
+	w0 = depth_windings[idx0]
+	w1 = depth_windings[idx0 + 1]
+	return w0 + frac * (w1 - w0)
+
+
 def reset_state() -> None:
 	"""Reset persistent corr state between independent optimization jobs."""
 	global _dbg_call_count, _last_results
@@ -865,7 +900,8 @@ def _corr_winding_loss(
 	is_absolute = pts_c.is_absolute.to(device=dev)
 	K = int(pts.shape[0])
 	P = pts[:, :3]
-	winda = pts[:, 3]
+	winda_input = pts[:, 3]
+	winda = _corr_relative_to_model_winding(winda_input, res.params)
 
 	xyz_lr = res.xyz_lr
 	D, Hm, Wm, _ = xyz_lr.shape
@@ -1181,9 +1217,11 @@ def _corr_winding_loss(
 		is_absolute & torch.isfinite(target_obs),
 		target_obs,
 		_wind_obs_per_point)
+	report_obs = _corr_model_to_relative_winding(report_obs, res.params)
+	report_target = _corr_model_to_relative_winding(target, res.params)
 	_last_results = _build_winding_results(
-		winding_obs=report_obs, target=target,
-		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
+		winding_obs=report_obs, target=report_target,
+		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda_input,
 		valid=point_valid, is_absolute=is_absolute,
 		point_normal=gt_n, target_normal=target_normal,
 		normal_alignment=normal_alignment,
