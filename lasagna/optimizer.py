@@ -886,6 +886,115 @@ def optimize(
 		if state is not None:
 			setattr(model, "_snap_surf_map_state_for_save", state)
 
+	def _identity_self_map_state_for_model(direction: str) -> dict:
+		with torch.no_grad():
+			model_xyz = model._grid_xyz().detach()
+		runtime = snap_surf_map_global.SelfMapRuntime(
+			mode=self_map_mode,
+			direction=direction,
+			model_w_wraps=self_map_model_w_wraps,
+		)
+		runtime._ensure_model(
+			model_xyz,
+			snap_surf_map_global.snap_surf_config_from_global_config(runtime.cfg_global),
+			snap_surf_map_global.GlobalMapStageConfig(params=("map_uv_ms",)),
+		)
+		state = _runtime_map_model_state(runtime)
+		if state is None:
+			raise RuntimeError(f"failed to initialize identity self map state for direction {direction!r}")
+		state.update({
+			"mode": self_map_mode,
+			"direction": direction,
+			"model_w_wraps": self_map_model_w_wraps,
+			"steps_run": 0,
+		})
+		return state
+
+	def _state_level_batches(state: dict) -> list[torch.Tensor]:
+		raw = state.get("map_uv_ms")
+		if not isinstance(raw, list) or not raw:
+			raise RuntimeError("snap-surf map state is missing map_uv_ms tensors")
+		out: list[torch.Tensor] = []
+		for t in raw:
+			if not torch.is_tensor(t):
+				raise RuntimeError("snap-surf map state contains non-tensor map_uv_ms entry")
+			tt = t.detach().cpu()
+			if tt.ndim == 3:
+				tt = tt.unsqueeze(0)
+			if tt.ndim != 4 or (int(tt.shape[-1]) != 2 and int(tt.shape[1]) != 2):
+				raise RuntimeError(f"snap-surf map tensor must be batchable UV data, got {tuple(tt.shape)}")
+			out.append(tt)
+		return out
+
+	def _replace_self_map_batch(base_state: dict, source_state: dict, *, batch_index: int) -> dict:
+		base_levels = _state_level_batches(base_state)
+		source_levels = _state_level_batches(source_state)
+		if len(base_levels) != len(source_levels):
+			raise RuntimeError(
+				f"cannot fuse snap-surf map levels: self={len(base_levels)} source={len(source_levels)}"
+			)
+		fused_levels: list[torch.Tensor] = []
+		for bi, si in zip(base_levels, source_levels):
+			if int(si.shape[0]) != 1:
+				raise RuntimeError(f"expand-z boundary map must have one batch, got {int(si.shape[0])}")
+			if tuple(bi.shape[1:]) != tuple(si.shape[1:]):
+				raise RuntimeError(
+					f"cannot fuse snap-surf map level shape self={tuple(bi.shape)} source={tuple(si.shape)}"
+				)
+			if not (0 <= int(batch_index) < int(bi.shape[0])):
+				raise RuntimeError(
+					f"self-map batch index {int(batch_index)} outside tensor batch {int(bi.shape[0])}"
+				)
+			bf = bi.clone()
+			bf[int(batch_index)] = si[0]
+			fused_levels.append(bf)
+		out = dict(base_state)
+		out["preserve_batch"] = True
+		out["map_uv_ms"] = fused_levels
+		return out
+
+	def _fuse_expand_z_snap_surf_maps_append(
+		*,
+		old_state: dict | None,
+		temp_state: dict | None,
+		old_depth: int,
+		add_depth: int,
+	) -> None:
+		if self_map_mode == "off":
+			return
+		if add_depth != 1:
+			raise NotImplementedError("expand-z map fusion currently requires init-grow.step=1")
+		if temp_state is None or not isinstance(temp_state.get("global_map"), dict):
+			raise RuntimeError("expand-z map fusion requires optimized temporary snap-surf global_map")
+		old_self = old_state.get("self_maps", {}) if isinstance(old_state, dict) else {}
+		if old_self is not None and not isinstance(old_self, dict):
+			raise RuntimeError("existing snap-surf self map state is malformed")
+		boundary_batch = int(old_depth) - 1
+		self_maps: dict[str, dict] = {}
+		for direction in ("out", "in"):
+			base_state = (
+				old_self.get(direction)
+				if isinstance(old_self, dict) and isinstance(old_self.get(direction), dict)
+				else _identity_self_map_state_for_model(direction)
+			)
+			base_state = _replace_self_map_batch(
+				base_state,
+				temp_state["global_map"],
+				batch_index=boundary_batch,
+			)
+			base_state["steps_run"] = int(temp_state["global_map"].get("steps_run", 0))
+			base_state.update({
+				"mode": self_map_mode,
+				"direction": direction,
+				"model_w_wraps": self_map_model_w_wraps,
+			})
+			self_maps[direction] = base_state
+		setattr(model, "_snap_surf_map_state_for_save", {
+			"version": 1,
+			"self_map_init": self_map_mode,
+			"self_maps": self_maps,
+		})
+
 	if require_snap_surf_map_state and self_map_mode != "off":
 		if _loaded_snap_surf_map_state is None or not isinstance(_loaded_snap_surf_map_state.get("self_maps"), dict):
 			raise ValueError("self-map reopt requires checkpoint snap-surf self maps")
@@ -3918,8 +4027,15 @@ def optimize(
 		if not active_corr:
 			print(f"[optimizer] WARNING: corr points loaded but no corr weight > 0 in any stage!", flush=True)
 
-	def _fuse_expand_z_append(temp_model: fit_model.Model3D) -> None:
+	def _fuse_expand_z_append(
+		temp_model: fit_model.Model3D,
+		*,
+		old_snap_surf_map_state: dict | None,
+		temp_snap_surf_map_state: dict | None,
+		add_depth: int,
+	) -> None:
 		with torch.no_grad():
+			old_depth = int(model.depth)
 			old_flat = fit_model.Model3D._integrate_pyramid_3d(model.mesh_ms, pyramid_d=model.pyramid_d).detach()
 			new_flat = fit_model.Model3D._integrate_pyramid_3d(temp_model.mesh_ms, pyramid_d=temp_model.pyramid_d).detach()
 			if tuple(old_flat.shape[2:]) != tuple(new_flat.shape[2:]):
@@ -3958,6 +4074,12 @@ def optimize(
 		)
 		model.amp = torch.nn.Parameter(amp.to(device=flat.device, dtype=torch.float32))
 		model.bias = torch.nn.Parameter(bias.to(device=flat.device, dtype=torch.float32))
+		_fuse_expand_z_snap_surf_maps_append(
+			old_state=old_snap_surf_map_state,
+			temp_state=temp_snap_surf_map_state,
+			old_depth=old_depth,
+			add_depth=int(add_depth),
+		)
 		print(
 			f"[optimizer] expand-z fuse append: depth={model.depth} "
 			f"depth_windings={list(model.params.depth_windings)}",
@@ -4011,6 +4133,7 @@ def optimize(
 				temp_model.amp.copy_(model.amp.detach()[-1:].expand_as(temp_model.amp))
 				temp_model.bias.copy_(model.bias.detach()[-1:].expand_as(temp_model.bias))
 			temp_model.add_external_surface(ref_xyz, valid=ref_valid, offset=1.0)
+			old_snap_surf_map_state = getattr(model, "_snap_surf_map_state_for_save", None)
 			data = optimize(
 				model=temp_model,
 				data=data,
@@ -4026,7 +4149,13 @@ def optimize(
 				self_map_model_w_wraps=None,
 				init_grow=None,
 			)
-			_fuse_expand_z_append(temp_model)
+			temp_snap_surf_map_state = getattr(temp_model, "_snap_surf_map_state_for_save", None)
+			_fuse_expand_z_append(
+				temp_model,
+				old_snap_surf_map_state=old_snap_surf_map_state if isinstance(old_snap_surf_map_state, dict) else None,
+				temp_snap_surf_map_state=temp_snap_surf_map_state if isinstance(temp_snap_surf_map_state, dict) else None,
+				add_depth=add_depth,
+			)
 		return data
 
 	for si, stage in enumerate(stages):

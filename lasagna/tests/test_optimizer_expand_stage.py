@@ -112,6 +112,83 @@ class OptimizerExpandStageTest(unittest.TestCase):
 		grid = mdl._grid_xyz().detach()
 		self.assertTrue(torch.allclose(grid[0], grid[1], atol=1.0e-6))
 
+	def test_expand_z_fuses_boundary_map_into_self_map_state(self) -> None:
+		device = torch.device("cpu")
+		yy = torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 3)
+		xx = torch.arange(3, dtype=torch.float32).view(1, 3).expand(3, 3)
+		xyz = torch.stack([xx, yy, torch.zeros_like(xx)], dim=-1)
+		valid = torch.ones(3, 3, dtype=torch.bool)
+		mdl = model.Model3D.from_tifxyz_crop(
+			xyz,
+			valid,
+			device=device,
+			mesh_step=1,
+			winding_step=1,
+			subsample_mesh=1,
+			subsample_winding=1,
+			depth=1,
+		)
+		data = fit_data.FitData3D(
+			cos=None,
+			grad_mag=torch.ones(1, 1, 4, 4, 4, dtype=torch.float32),
+			nx=None,
+			ny=None,
+			pred_dt=None,
+			corr_points=None,
+			winding_volume=None,
+			origin_fullres=(0.0, 0.0, 0.0),
+			spacing=(1.0, 1.0, 1.0),
+			cuda_gridsample=False,
+		)
+		stages = optimizer.load_stages_cfg({
+			"base": {
+				"normal": 0.0,
+				"snap_surf_map": 0.1,
+				"map_dist": 0.0001,
+				"map_vec_normal": 1.0,
+				"map_surface_normal": 1.0,
+			},
+			"stages": [
+				{
+					"name": "expand-z",
+					"stages": [
+						{
+							"name": "expand_up",
+							"steps": 1,
+							"lr": 0.0,
+							"params": ["mesh_ms"],
+							"args": {
+								"snap_surf_map": {
+									"map_opt": {
+										"steps": 0,
+										"lr": 0.01,
+										"params": ["map_surf_ms"],
+									}
+								}
+							},
+						}
+					],
+				}
+			],
+		})
+
+		optimizer.optimize(
+			model=mdl,
+			data=data,
+			stages=stages,
+			snapshot_interval=0,
+			snapshot_fn=lambda **_kw: None,
+			init_grow={"order": ("up",), "step": 1, "target_depth": 2},
+			self_map_init="multi_wrap_d",
+		)
+
+		state = getattr(mdl, "_snap_surf_map_state_for_save", None)
+		self.assertIsInstance(state, dict)
+		self.assertIn("out", state["self_maps"])
+		self.assertIn("in", state["self_maps"])
+		self.assertEqual(state["self_maps"]["out"]["map_uv_ms"][0].shape[0], 1)
+		self.assertEqual(state["self_maps"]["in"]["map_uv_ms"][0].shape[0], 1)
+
 	def test_self_d_snap_surf_maps_are_published_and_required_for_reopt(self) -> None:
 		device = torch.device("cpu")
 		yy = torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 3)
