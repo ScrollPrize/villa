@@ -122,6 +122,60 @@ class FitSelfMapInitTest(unittest.TestCase):
 				model_w=1.5,
 				model_w_unit="wraps",
 			)
+
+	def test_init_grow_parses_single_winding_to_target_depth(self) -> None:
+		cfg = fit._parse_init_grow_config(
+			{
+				"init-grow": {
+					"enabled": True,
+					"initial_depth": 1,
+					"order": ["up"],
+					"step": 1,
+				}
+			},
+			target_depth=3,
+		)
+
+		self.assertTrue(cfg.enabled)
+		self.assertEqual(cfg.initial_depth, 1)
+		self.assertEqual(cfg.order, ("up",))
+		self.assertEqual(cfg.step, 1)
+
+	def test_init_grow_stage_delta_allows_depth_one_request_to_expand(self) -> None:
+		raw_cfg = {
+			"args": {
+				"init-grow": {
+					"initial_depth": 1,
+				}
+			},
+			"stages": [
+				{
+					"name": "expand-z",
+					"grow": {"d_pos": 1},
+					"stages": [
+						{"name": "expand_up", "steps": 0, "lr": 1.0, "params": ["mesh_ms"]}
+					],
+				}
+			],
+		}
+		args_cfg = raw_cfg["args"]
+		target_depth = max(
+			1,
+			fit._raw_init_grow_initial_depth(args_cfg) + fit._init_grow_stage_depth_delta(raw_cfg),
+		)
+
+		cfg = fit._parse_init_grow_config(args_cfg, target_depth=target_depth)
+
+		self.assertEqual(target_depth, 2)
+		self.assertTrue(cfg.enabled)
+		self.assertEqual(cfg.initial_depth, 1)
+
+	def test_init_grow_rejects_initial_depth_past_target(self) -> None:
+		with self.assertRaisesRegex(ValueError, "initial_depth must be <= args.depth"):
+			fit._parse_init_grow_config(
+				{"init-grow": {"initial_depth": 4}},
+				target_depth=3,
+			)
 		with self.assertRaisesRegex(ValueError, "0 < args.model-w < 1.0"):
 			fit._validate_self_map_init_args(
 				self_map_init="multi_wrap_d",
