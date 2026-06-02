@@ -114,6 +114,7 @@ default_config = {
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_track_radius': 0.,
+    'loss_weight_track_dt': 0.,
     'loss_weight_patch_stretch': 0.0,
     'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
@@ -3462,16 +3463,19 @@ def _prepare_main_phase_tracks(tracks, patch_atlas, unattached_pcl_strips, exclu
     }
 
 
-def get_track_radius_loss(slice_to_spiral_transform, dr_per_winding, prepared_tracks, num_tracks_per_step, num_points_per_track):
+def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, num_tracks_per_step, num_points_per_track, compute_dt=True):
     # Sample K tracks (with replacement) and M points per track, transform to spiral space, and
-    # penalise per-point deviation from each track's mean shifted-radius beyond the radius
-    # hinge margin.
+    # compute two losses analogous to the patch radius/DT losses: (1) each point's deviation
+    # from the track's mean shifted-radius beyond the radius hinge margin; (2) each point
+    # should snap to its target integer winding, with the target taken from the snapped
+    # track median.
+    device = dr_per_winding.device
+    zero = torch.zeros([], device=device)
     if prepared_tracks is None:
-        return torch.zeros([], device=dr_per_winding.device)
+        return zero, zero
     flat_zyx = prepared_tracks['flat_zyx']
     offsets = prepared_tracks['offsets']
     lengths = prepared_tracks['lengths']
-    device = flat_zyx.device
     num_tracks = lengths.numel()
     k = min(num_tracks_per_step, num_tracks)
     track_idx = torch.randint(num_tracks, (k,), device=device)
@@ -3480,16 +3484,36 @@ def get_track_radius_loss(slice_to_spiral_transform, dr_per_winding, prepared_tr
     point_idx_within = (torch.rand([k, num_points_per_track], device=device) * track_lengths_sample[:, None].to(torch.float32)).to(torch.int64)
     point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
     flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
-    sampled_scroll = flat_zyx[flat_idx]
-    sampled_spiral = slice_to_spiral_transform(sampled_scroll)
+    sampled_scroll = flat_zyx[flat_idx].view(k, num_points_per_track, 3)
+    sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, num_points_per_track, 3)
     theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
-    theta = theta.view(k, num_points_per_track)
-    shifted_radii = shifted_radii.view(k, num_points_per_track)
     shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
     hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
+
     mean_per_track = shifted_radii.mean(dim=-1, keepdim=True)
     deviations = (shifted_radii - mean_per_track).abs()
-    return F.relu(deviations - hinge_margin).mean()
+    radius_loss = F.relu(deviations - hinge_margin).mean()
+
+    if not compute_dt:
+        return radius_loss, zero
+
+    target_shifted_radii = torch.round(shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
+    target_radii = target_shifted_radii + theta / (2 * np.pi) * dr_per_winding
+    target_spiral_zyxs = torch.stack([
+        sampled_spiral[..., 0],
+        torch.sin(theta) * target_radii,
+        torch.cos(theta) * target_radii,
+    ], dim=-1).detach()
+    target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
+
+    within_p = cfg['patch_dt_within_patch_norm_p']
+    across_p = cfg['patch_dt_norm_p']
+    point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
+    point_distances = F.relu(point_distances - hinge_margin) + 1.e-5
+    track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
+    dt_loss = ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
+
+    return radius_loss, dt_loss
 
 
 def _build_snap_track_set(slice_to_spiral_transform, dr_per_winding, tracks, device, lower_fraction, upper_fraction, anchor_scroll, exclusion_radius):
@@ -3860,7 +3884,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             save_mesh(slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips, out_path, name=suffix)
 
     prepared_main_tracks = None
-    if cfg['loss_weight_track_radius'] > 0 and tracks:
+    if (cfg['loss_weight_track_radius'] > 0 or cfg['loss_weight_track_dt'] > 0) and tracks:
         prepared_main_tracks = _prepare_main_phase_tracks(
             tracks, patch_atlas, unattached_pcl_strips,
             float(cfg['track_exclusion_radius']), device,
@@ -3963,13 +3987,16 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
 
         if prepared_main_tracks is not None:
-            losses['track_radius'] = get_track_radius_loss(
+            track_radius_loss, track_dt_loss = get_track_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
                 prepared_main_tracks,
                 cfg['track_num_per_step'],
                 cfg['track_num_points_per_step'],
-            ) * cfg['loss_weight_track_radius']
+                compute_dt=compute_patch_dt,
+            )
+            losses['track_radius'] = track_radius_loss * cfg['loss_weight_track_radius']
+            losses['track_dt'] = track_dt_loss * cfg['loss_weight_track_dt']
 
         shell_metrics = {}
         if shell_map is not None:
