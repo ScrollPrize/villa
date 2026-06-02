@@ -42,7 +42,7 @@ pcl_json_paths = [
 ]
 patches_path = f'{dataset_path}/patches'
 shell_path = f'{dataset_path}/s1_outer_shell'
-tracks_dbm_path = '/home/paul/projects/vesuvius-scrolls/spiral/tracks/2um_ds2_ps256_surf_v2.dbm'
+tracks_dbm_path = None
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
@@ -98,6 +98,9 @@ default_config = {
     'unattached_pcl_num_per_step': 28,
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 4.,
+    'track_num_per_step': 200,
+    'track_num_points_per_step': 8,
+    'track_exclusion_radius': 12.0,
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
     'pcl_normals_sample_radius': 1,
@@ -110,6 +113,7 @@ default_config = {
     'loss_weight_winding_number': 20.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
+    'loss_weight_track_radius': 0.,
     'loss_weight_patch_stretch': 0.0,
     'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
@@ -124,7 +128,7 @@ default_config = {
     'weight_decay_gap_expander': 1.e-2,
     'weight_decay_flow_field': 0.0,
     'loss_start_patch_dt': 9000,
-    'num_snapping_subpasses': 10,
+    'num_snapping_subpasses': 0,
     'snapping_steps_per_subpass': 500,
     'snapping_num_anchor_points': 2000,
     'snapping_num_track_points': 2000,
@@ -1028,18 +1032,30 @@ class PatchGpuAtlas:
         offsets = [0]
         widths = []
         heights = []
+        valid_in_roi_pieces = []
         for p in patches_by_id.values():
             z = p.zyxs  # (H, W, 3) on CPU
             H, W = z.shape[:2]
-            flat_pieces.append(z.reshape(-1, 3).to(device=device, dtype=torch.float32))
+            z_flat = z.reshape(-1, 3).to(device=device, dtype=torch.float32)
+            flat_pieces.append(z_flat)
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
+            valid_flat = p.valid_vertex_mask.reshape(-1).to(device=device)
+            z_in_roi = (z_flat[:, 0] >= z_begin) & (z_flat[:, 0] < z_end)
+            valid_in_roi_pieces.append(z_flat[valid_flat & z_in_roi])
         self.zyxs_flat = torch.cat(flat_pieces, dim=0)
         self.offsets = torch.tensor(offsets, device=device, dtype=torch.int64)  # (N+1,)
         self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
         self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
+        # Flat (N, 3) of every patch vertex with valid_vertex_mask & z-in-ROI, kept on GPU so
+        # callers (track-exclusion masking, snap anchors) can do batched pairwise comparisons
+        # without re-walking patches on the CPU each time.
+        self.valid_in_roi_zyxs = (
+            torch.cat(valid_in_roi_pieces, dim=0) if valid_in_roi_pieces
+            else torch.empty([0, 3], device=device, dtype=torch.float32)
+        )
 
     def memory_mb(self):
         return self.zyxs_flat.numel() * 4 / 1e6
@@ -3343,27 +3359,28 @@ def save_overlay(
             visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
-def _build_snap_anchors(slice_to_spiral_transform, patches, unattached_pcl_strips, device):
-    # Collect every patch valid in-ROI vertex and every unattached-pcl strip point
-    # (in-ROI) as scroll-space zyxs, transform them once to spiral space with the
-    # current transform, and return both flat tensors so the snapping phase can
-    # later sample a subset and anchor them back to these stored spiral targets.
-    pieces = []
-    for patch in patches:
-        valid_mask = patch.valid_vertex_mask
-        z_in_roi = (patch.zyxs[..., 0] >= z_begin) & (patch.zyxs[..., 0] < z_end)
-        valid_indices = torch.where(valid_mask & z_in_roi)
-        if len(valid_indices[0]) == 0:
-            continue
-        pieces.append(patch.zyxs[valid_indices[0], valid_indices[1], :].to(device=device, dtype=torch.float32))
+def _collect_anchor_scroll_zyxs(patch_atlas, unattached_pcl_strips, device):
+    # Concatenate every in-ROI patch vertex (sourced from PatchGpuAtlas.valid_in_roi_zyxs,
+    # already on GPU) and every in-ROI unattached-pcl strip point as scroll-space zyxs on
+    # `device`. The result is the trusted point cloud used both to build snap anchors and to
+    # mask out track points near already-constrained regions.
+    pieces = [patch_atlas.valid_in_roi_zyxs]
     for strip in unattached_pcl_strips:
         zyxs = torch.from_numpy(strip['zyxs']).to(device=device, dtype=torch.float32)
         in_roi = (zyxs[..., 0] >= z_begin) & (zyxs[..., 0] < z_end)
         if in_roi.any():
             pieces.append(zyxs[in_roi])
-    if not pieces:
-        return torch.empty([0, 3]), torch.empty([0, 3])
-    anchor_scroll = torch.cat(pieces, dim=0)
+    return torch.cat(pieces, dim=0)
+
+
+def _build_snap_anchors(slice_to_spiral_transform, patch_atlas, unattached_pcl_strips, device):
+    # Collect every patch valid in-ROI vertex and every unattached-pcl strip point
+    # (in-ROI) as scroll-space zyxs, transform them once to spiral space with the
+    # current transform, and return both flat tensors so the snapping phase can
+    # later sample a subset and anchor them back to these stored spiral targets.
+    anchor_scroll = _collect_anchor_scroll_zyxs(patch_atlas, unattached_pcl_strips, device)
+    if anchor_scroll.shape[0] == 0:
+        return anchor_scroll, torch.empty([0, 3], device=device)
     chunk = 65536
     with torch.no_grad():
         out_pieces = []
@@ -3395,6 +3412,78 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_zyx, threshold):
             min_d2 = torch.minimum(min_d2, chunk_min)
         keep[ts:te] = min_d2 > threshold_sq
     return keep
+
+
+def _prepare_main_phase_tracks(tracks, patch_atlas, unattached_pcl_strips, exclusion_radius, device):
+    # Drop every track point that lies within `exclusion_radius` of any patch vertex / pcl
+    # strip point, then drop tracks left with fewer than 2 points. Returns a flat per-point
+    # zyx tensor plus per-track offsets and lengths, all on `device`.
+    if not tracks:
+        return None
+    anchor_scroll = _collect_anchor_scroll_zyxs(patch_atlas, unattached_pcl_strips, device)
+    flat_zyx_np = np.concatenate([t.astype(np.float32) for t in tracks], axis=0)
+    track_id_np = np.concatenate([
+        np.full(len(t), i, dtype=np.int64) for i, t in enumerate(tracks)
+    ])
+    flat_zyx = torch.from_numpy(flat_zyx_np).to(device=device)
+    with torch.no_grad():
+        keep = _track_points_far_from_anchors_mask(flat_zyx, anchor_scroll, exclusion_radius)
+    keep_np = keep.cpu().numpy()
+    flat_zyx_np = flat_zyx_np[keep_np]
+    track_id_np = track_id_np[keep_np]
+    num_tracks_orig = len(tracks)
+    new_lengths = np.bincount(track_id_np, minlength=num_tracks_orig)
+    surviving = np.where(new_lengths >= 2)[0]
+    if len(surviving) == 0:
+        return None
+    old_to_new = -np.ones(num_tracks_orig, dtype=np.int64)
+    old_to_new[surviving] = np.arange(len(surviving))
+    new_id = old_to_new[track_id_np]
+    keep2 = new_id >= 0
+    flat_zyx_np = flat_zyx_np[keep2]
+    new_id = new_id[keep2]
+    # Stable sort by new track id so same-track points end up contiguous; the within-track
+    # ordering is preserved.
+    sort_idx = np.argsort(new_id, kind='stable')
+    flat_zyx_np = flat_zyx_np[sort_idx]
+    lengths_new = new_lengths[surviving].astype(np.int64)
+    offsets_new = np.concatenate([[0], np.cumsum(lengths_new)]).astype(np.int64)
+    print(
+        f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
+        f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
+    )
+    return {
+        'flat_zyx': torch.from_numpy(flat_zyx_np).to(device=device),
+        'offsets': torch.from_numpy(offsets_new).to(device=device),
+        'lengths': torch.from_numpy(lengths_new).to(device=device),
+    }
+
+
+def get_track_radius_loss(slice_to_spiral_transform, dr_per_winding, prepared_tracks, num_tracks_per_step, num_points_per_track):
+    # Sample K tracks (with replacement) and M points per track, transform to spiral space, and
+    # penalise per-point deviation from each track's mean shifted-radius beyond the radius
+    # hinge margin.
+    if prepared_tracks is None:
+        return torch.zeros([], device=dr_per_winding.device)
+    flat_zyx = prepared_tracks['flat_zyx']
+    offsets = prepared_tracks['offsets']
+    lengths = prepared_tracks['lengths']
+    device = flat_zyx.device
+    num_tracks = lengths.numel()
+    k = min(num_tracks_per_step, num_tracks)
+    track_idx = torch.randint(num_tracks, (k,), device=device)
+    track_lengths_sample = lengths[track_idx]
+    track_offsets_sample = offsets[track_idx]
+    point_idx_within = (torch.rand([k, num_points_per_track], device=device) * track_lengths_sample[:, None].to(torch.float32)).to(torch.int64)
+    flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
+    sampled_scroll = flat_zyx[flat_idx]
+    sampled_spiral = slice_to_spiral_transform(sampled_scroll)
+    _, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
+    shifted_radii = shifted_radii.view(k, num_points_per_track)
+    hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
+    mean_per_track = shifted_radii.mean(dim=-1, keepdim=True)
+    deviations = (shifted_radii - mean_per_track).abs()
+    return F.relu(deviations - hinge_margin).mean()
 
 
 def _build_snap_track_set(slice_to_spiral_transform, dr_per_winding, tracks, device, lower_fraction, upper_fraction, anchor_scroll, exclusion_radius):
@@ -3750,6 +3839,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
             save_mesh(slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips, out_path, name=suffix)
 
+    prepared_main_tracks = None
+    if cfg['loss_weight_track_radius'] > 0 and tracks:
+        prepared_main_tracks = _prepare_main_phase_tracks(
+            tracks, patch_atlas, unattached_pcl_strips,
+            float(cfg['track_exclusion_radius']), device,
+        )
+
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
@@ -3846,6 +3942,15 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
 
+        if prepared_main_tracks is not None:
+            losses['track_radius'] = get_track_radius_loss(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                prepared_main_tracks,
+                cfg['track_num_per_step'],
+                cfg['track_num_points_per_step'],
+            ) * cfg['loss_weight_track_radius']
+
         shell_metrics = {}
         if shell_map is not None:
             shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, shell_metrics = get_shell_losses(
@@ -3896,7 +4001,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         # spiral space; the snapping phase pulls them back towards these targets.
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         anchor_scroll, anchor_spiral_target = _build_snap_anchors(
-            slice_to_spiral_transform, patches_list, unattached_pcl_strips, device,
+            slice_to_spiral_transform, patch_atlas, unattached_pcl_strips, device,
         )
         print(f'snap anchors: {anchor_scroll.shape[0]} points')
 
@@ -4270,9 +4375,12 @@ def main():
     )
     dense_normal_volume = prepare_dense_normal_volume(scroll_zarr_array)
 
-    print(f'loading tracks from {tracks_dbm_path}')
-    tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
-    print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
+    if tracks_dbm_path is not None:
+        print(f'loading tracks from {tracks_dbm_path}')
+        tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
+        print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
+    else:
+        tracks = None
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
     out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch'
