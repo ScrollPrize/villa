@@ -112,7 +112,7 @@ class OptimizerExpandStageTest(unittest.TestCase):
 		grid = mdl._grid_xyz().detach()
 		self.assertTrue(torch.allclose(grid[0], grid[1], atol=1.0e-6))
 
-	def test_expand_z_fuses_boundary_map_into_self_map_state(self) -> None:
+	def test_expand_z_appends_boundary_self_maps_into_self_map_state(self) -> None:
 		device = torch.device("cpu")
 		yy = torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 3)
 		xx = torch.arange(3, dtype=torch.float32).view(1, 3).expand(3, 3)
@@ -185,10 +185,13 @@ class OptimizerExpandStageTest(unittest.TestCase):
 		self.assertEqual(mdl.depth, 3)
 		state = getattr(mdl, "_snap_surf_map_state_for_save", None)
 		self.assertIsInstance(state, dict)
+		self.assertNotIn("global_map", state)
 		self.assertIn("out", state["self_maps"])
 		self.assertIn("in", state["self_maps"])
 		self.assertEqual(state["self_maps"]["out"]["map_uv_ms"][0].shape[0], 2)
 		self.assertEqual(state["self_maps"]["in"]["map_uv_ms"][0].shape[0], 2)
+		self.assertEqual(state["self_maps"]["out"]["direction"], "out")
+		self.assertEqual(state["self_maps"]["in"]["direction"], "in")
 		reopt_stages = optimizer.load_stages_cfg({
 			"base": {
 				"normal": 0.0,

@@ -805,6 +805,7 @@ def optimize(
 	init_grow: dict | None = None,
 	snap_surf_map_state: dict | None = None,
 	require_snap_surf_map_state: bool = False,
+	snap_surf_boundary: dict | None = None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
@@ -812,6 +813,7 @@ def optimize(
 	_snap_global_runtime: snap_surf_map_global.GlobalMapRuntime | None = None
 	_snap_self_runtimes: dict[str, snap_surf_map_global.SelfMapRuntime] = {}
 	_loaded_snap_surf_map_state = snap_surf_map_state if isinstance(snap_surf_map_state, dict) else None
+	_snap_surf_boundary = snap_surf_boundary if isinstance(snap_surf_boundary, dict) else None
 	_snap_global_offset_debug_printed = False
 	_map_forward_needs = fit_model.ModelForwardNeeds(mesh_normals=True, ext_surfaces=True)
 	snap_global_mesh_epoch = 0
@@ -1001,8 +1003,17 @@ def optimize(
 			return
 		if add_depth != 1:
 			raise NotImplementedError("expand-z map fusion currently requires init-grow.step=1")
-		if temp_state is None or not isinstance(temp_state.get("global_map"), dict):
-			raise RuntimeError("expand-z map fusion requires optimized temporary snap-surf global_map")
+		if temp_state is None or not isinstance(temp_state.get("self_maps"), dict):
+			raise RuntimeError("expand-z map fusion requires optimized temporary boundary snap-surf self_maps")
+		if "global_map" in temp_state:
+			raise RuntimeError("expand-z map fusion no longer accepts temporary snap-surf global_map state")
+		temp_self = temp_state["self_maps"]
+		missing = [
+			d for d in ("out", "in")
+			if not isinstance(temp_self.get(d), dict)
+		]
+		if missing:
+			raise RuntimeError(f"expand-z map fusion requires boundary snap-surf self maps: missing {missing}")
 		old_self = old_state.get("self_maps", {}) if isinstance(old_state, dict) else {}
 		if old_self is not None and not isinstance(old_self, dict):
 			raise RuntimeError("existing snap-surf self map state is malformed")
@@ -1018,12 +1029,13 @@ def optimize(
 				_identity_self_map_state_for_model(direction),
 				old_direction_state,
 			)
+			boundary_state = temp_self[direction]
 			base_state = _replace_self_map_batch(
 				base_state,
-				temp_state["global_map"],
+				boundary_state,
 				batch_index=boundary_batch,
 			)
-			base_state["steps_run"] = int(temp_state["global_map"].get("steps_run", 0))
+			base_state["steps_run"] = int(boundary_state.get("steps_run", 0))
 			base_state.update({
 				"mode": self_map_mode,
 				"direction": direction,
@@ -1091,12 +1103,29 @@ def optimize(
 			base = {}
 			if isinstance(stage_args, dict) and isinstance(stage_args.get("map_global"), dict):
 				base = dict(stage_args.get("map_global"))
-			runtime = snap_surf_map_global.SelfMapRuntime(
-				mode=self_map_mode,
-				direction=direction_i,
-				model_w_wraps=self_map_model_w_wraps,
-				base=base,
-			)
+			if _snap_surf_boundary is not None:
+				missing = [
+					k for k in ("fixed_xyz", "fixed_normals", "fixed_valid")
+					if k not in _snap_surf_boundary
+				]
+				if missing:
+					raise ValueError(f"boundary self-map grow is missing fixed tensors: {missing}")
+				runtime = snap_surf_map_global.BoundarySelfMapRuntime(
+					mode=self_map_mode,
+					direction=direction_i,
+					model_w_wraps=self_map_model_w_wraps,
+					base=base,
+					fixed_xyz=_snap_surf_boundary["fixed_xyz"],
+					fixed_normals=_snap_surf_boundary["fixed_normals"],
+					fixed_valid=_snap_surf_boundary["fixed_valid"],
+				)
+			else:
+				runtime = snap_surf_map_global.SelfMapRuntime(
+					mode=self_map_mode,
+					direction=direction_i,
+					model_w_wraps=self_map_model_w_wraps,
+					base=base,
+				)
 			if _loaded_snap_surf_map_state is not None:
 				self_maps = _loaded_snap_surf_map_state.get("self_maps", {})
 				if isinstance(self_maps, dict) and direction_i in self_maps:
@@ -4140,8 +4169,14 @@ def optimize(
 			return data
 		while model.depth < target_depth:
 			add_depth = min(step_depth, target_depth - model.depth)
+			if add_depth != 1 and self_map_mode != "off":
+				raise NotImplementedError("expand-z self-map grow currently requires init-grow.step=1")
 			with torch.no_grad():
-				ref_xyz = model._grid_xyz().detach()[-1].contiguous()
+				ref_res = model(data, needs=fit_model.ModelForwardNeeds(mesh_normals=True))
+				if ref_res.normals is None:
+					raise RuntimeError("expand-z boundary self-map grow requires reference model normals")
+				ref_xyz = ref_res.xyz_lr.detach()[-1].contiguous()
+				ref_normals = ref_res.normals.detach()[-1].contiguous()
 				ref_valid = torch.isfinite(ref_xyz).all(dim=-1)
 			print(
 				f"[optimizer] expand-z: building temporary +{add_depth} winding model "
@@ -4173,7 +4208,6 @@ def optimize(
 			with torch.no_grad():
 				temp_model.amp.copy_(model.amp.detach()[-1:].expand_as(temp_model.amp))
 				temp_model.bias.copy_(model.bias.detach()[-1:].expand_as(temp_model.bias))
-			temp_model.add_external_surface(ref_xyz, valid=ref_valid, offset=1.0)
 			old_snap_surf_map_state = getattr(model, "_snap_surf_map_state_for_save", None)
 			data = optimize(
 				model=temp_model,
@@ -4186,9 +4220,14 @@ def optimize(
 				ensure_data_fn=ensure_data_fn,
 				seed_xyz=seed_xyz,
 				out_dir=out_dir,
-				self_map_init="off",
-				self_map_model_w_wraps=None,
+				self_map_init=self_map_mode,
+				self_map_model_w_wraps=self_map_model_w_wraps,
 				init_grow=None,
+				snap_surf_boundary={
+					"fixed_xyz": ref_xyz,
+					"fixed_normals": ref_normals,
+					"fixed_valid": ref_valid,
+				},
 			)
 			temp_snap_surf_map_state = getattr(temp_model, "_snap_surf_map_state_for_save", None)
 			_fuse_expand_z_append(

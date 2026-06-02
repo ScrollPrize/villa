@@ -4260,6 +4260,334 @@ class SelfMapRuntime:
 		return loss, (lm,), (mask,), stats
 
 
+class BoundarySelfMapRuntime(SelfMapRuntime):
+	"""Self-map runtime for grow boundaries with one fixed and one trainable surface."""
+
+	def __init__(
+		self,
+		*,
+		mode: str,
+		direction: str,
+		fixed_xyz: torch.Tensor,
+		fixed_normals: torch.Tensor,
+		fixed_valid: torch.Tensor,
+		model_w_wraps: float | None = None,
+		base: dict[str, Any] | None = None,
+	) -> None:
+		super().__init__(
+			mode=mode,
+			direction=direction,
+			model_w_wraps=model_w_wraps,
+			base=base,
+		)
+		if self.mode != "multi_wrap_d":
+			raise ValueError("boundary self-map grow currently requires self-map-init=multi_wrap_d")
+		self.fixed_xyz = fixed_xyz.detach()
+		self.fixed_normals = fixed_normals.detach()
+		self.fixed_valid = fixed_valid.detach().bool()
+
+	def _fixed_tensors_for(self, model_xyz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		device = model_xyz.device
+		dtype = model_xyz.dtype
+		return (
+			self.fixed_xyz.to(device=device, dtype=dtype),
+			self.fixed_normals.to(device=device, dtype=dtype),
+			self.fixed_valid.to(device=device).bool(),
+		)
+
+	def _ensure_model(self, model_xyz: torch.Tensor, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
+		if self.global_model is not None:
+			return
+		if int(model_xyz.shape[0]) != 1:
+			raise ValueError(f"boundary self-map grow expects temporary model depth 1, got {int(model_xyz.shape[0])}")
+		H, W = int(model_xyz.shape[1]), int(model_xyz.shape[2])
+		initial_uv = self.initial_uv(depth=2, height=H, width=W, device=model_xyz.device, dtype=model_xyz.dtype)
+		levels = _max_supported_level(
+			(H, W),
+			max(int(stage.min_scaledown), int(base_cfg.map_init.scale_levels) - 1),
+		) + 1
+		self.global_model = GlobalMapModel(initial_uv.detach(), levels=levels, factor=2, preserve_batch=True)
+
+	def _stacked_boundary(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		if int(model_xyz.shape[0]) != 1:
+			raise ValueError(f"boundary self-map grow expects temporary model depth 1, got {int(model_xyz.shape[0])}")
+		fixed_xyz, fixed_normals, fixed_valid = self._fixed_tensors_for(model_xyz)
+		return (
+			torch.stack([fixed_xyz, model_xyz[0]], dim=0),
+			torch.stack([fixed_normals, model_normals[0]], dim=0),
+			torch.stack([fixed_valid, model_valid[0].bool()], dim=0),
+		)
+
+	def run_stage(
+		self,
+		*,
+		stage: GlobalMapStageConfig,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		persistent_optimizer: bool = False,
+		status_fn=None,
+		cancel_fn=None,
+		auto_stop_fn=None,
+		**_unused,
+	) -> dict[str, float]:
+		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
+		stage_cfg = _stage_loss_cfg(base_cfg, stage)
+		self._ensure_model(model_xyz, base_cfg, stage)
+		params, train_level = self._params_for_stage(stage)
+		sample_level = _stage_objective_level(stage, train_level, tuple(int(v) for v in model_xyz.shape[1:3]))
+		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
+		auto_loss_history: list[float] = []
+		steps_completed = 0
+		auto_stopped = False
+		lr_autoscale: _LrAutoscaleState | None = None
+		opt: torch.optim.Optimizer | None = None
+		stacked_xyz, stacked_normals, stacked_valid = self._stacked_boundary(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+		)
+		if params and int(stage.steps) > 0:
+			key = (tuple(stage.params), int(train_level), int(sample_level), float(stage.lr), int(stage.min_scaledown))
+			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
+				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
+				_capture_optimizer_target_lrs(self.optimizer)
+				self.optimizer_key = key
+				self.lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None
+			opt = self.optimizer
+			assert opt is not None
+			lr_autoscale = self.lr_autoscale if persistent_optimizer else (_LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None)
+			for step in range(int(stage.steps)):
+				if cancel_fn is not None:
+					cancel_fn()
+				opt.zero_grad(set_to_none=True)
+				uv = self._uv(active_level=int(sample_level))
+				status_due = (
+					status_fn is not None and (
+						step == 0 or step == int(stage.steps) - 1 or (status_interval > 0 and (step % status_interval) == 0)
+					)
+				)
+				active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=stacked_valid, uv=uv)
+				loss, terms = _self_map_objective_for_uv(
+					uv=uv,
+					mode=self.mode,
+					direction=self.direction,
+					model_xyz=stacked_xyz,
+					model_normals=stacked_normals,
+					model_valid=stacked_valid,
+					cfg=stage_cfg,
+					level=int(sample_level),
+					need_stats=status_due,
+					active_quad=active,
+				)
+				_apply_optimizer_lr_schedule(
+					opt,
+					step1=(self.steps_run + 1 if persistent_optimizer else step + 1),
+					warmup_steps=lr_warmup_steps,
+					autoscale=lr_autoscale,
+					loss=loss,
+				)
+				if status_due:
+					status_stats = self._stats_from_terms(loss, terms)
+					status_stats["snaps_map_lr"] = _optimizer_lr_for_display(opt, float(stage.lr))
+					status_stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+					status_fn(step=step, total=int(stage.steps), stats=status_stats)
+				loss.backward()
+				opt.step()
+				self.steps_run += 1
+				steps_completed = step + 1
+				if auto_stop_fn is not None and steps_completed > lr_warmup_steps:
+					auto_loss_history.append(float(loss.detach().cpu()))
+					auto_stopped = bool(auto_stop_fn(history=auto_loss_history, step=steps_completed - lr_warmup_steps))
+				if auto_stopped:
+					break
+			if not persistent_optimizer:
+				self.optimizer = None
+				self.optimizer_key = None
+				self.lr_autoscale = None
+		with torch.no_grad():
+			uv = self._uv(active_level=int(sample_level))
+			active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=stacked_valid, uv=uv)
+			loss, terms = _self_map_objective_for_uv(
+				uv=uv,
+				mode=self.mode,
+				direction=self.direction,
+				model_xyz=stacked_xyz,
+				model_normals=stacked_normals,
+				model_valid=stacked_valid,
+				cfg=stage_cfg,
+				level=int(sample_level),
+				need_stats=True,
+				active_quad=active,
+			)
+		stats = self._stats_from_terms(loss, terms)
+		stats["snaps_map_lr"] = _optimizer_lr_for_display(opt if params and int(stage.steps) > 0 else None, float(stage.lr))
+		stats["snaps_map_stage_steps"] = float(steps_completed)
+		stats["snaps_map_auto_stopped"] = 1.0 if auto_stopped else 0.0
+		stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+		self.last = stats
+		return stats
+
+	def _snap_inputs(
+		self,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+		self._ensure_model(model_xyz, snap_surf_config_from_global_config(self.cfg_global), GlobalMapStageConfig(params=("map_uv_ms",)))
+		uv = self._uv().detach()
+		fixed_xyz, fixed_normals, fixed_valid = self._fixed_tensors_for(model_xyz)
+		if self.direction == "out":
+			source_xyz = fixed_xyz.detach().unsqueeze(0)
+			source_valid = fixed_valid.detach().bool().unsqueeze(0)
+			target_xyz = model_xyz[0].unsqueeze(0)
+			target_normals = model_normals[0].unsqueeze(0)
+			target_valid = model_valid[0].bool().unsqueeze(0)
+			source_trainable = False
+		else:
+			source_xyz = model_xyz[0].unsqueeze(0)
+			source_valid = model_valid[0].bool().unsqueeze(0)
+			target_xyz = fixed_xyz.detach().unsqueeze(0)
+			target_normals = fixed_normals.detach().unsqueeze(0)
+			target_valid = fixed_valid.detach().bool().unsqueeze(0)
+			source_trainable = True
+		stacked_valid = torch.cat([fixed_valid.unsqueeze(0), model_valid[0].bool().unsqueeze(0)], dim=0)
+		active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=stacked_valid, uv=uv)
+		active_vertex = torch.zeros_like(source_valid, dtype=torch.bool)
+		if active.numel():
+			active_vertex[:, :-1, :-1] |= active
+			active_vertex[:, 1:, :-1] |= active
+			active_vertex[:, :-1, 1:] |= active
+			active_vertex[:, 1:, 1:] |= active
+		return uv, target_xyz, target_normals, target_valid, source_xyz, source_valid & active_vertex, active, source_trainable
+
+	def snap_loss_prefetch_items(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> dict[str, torch.Tensor]:
+		if data is None:
+			return {}
+		uv, target_xyz, _target_normals, target_valid, source_xyz, source_valid, _active, _source_trainable = self._snap_inputs(
+			model_xyz,
+			model_normals,
+			model_valid,
+		)
+		depth = torch.zeros((*uv.shape[:-1], 1), device=uv.device, dtype=uv.dtype)
+		coords = torch.cat([depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(target_valid.bool(), coords, tuple(int(v) for v in target_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		if not bool(valid.any().detach().cpu()):
+			return {}
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		target_pos = _sample_surface_grid(target_xyz, safe_coords)
+		sample_valid = valid & torch.isfinite(target_pos).all(dim=-1)
+		if not bool(sample_valid.any().detach().cpu()):
+			return {}
+		t = torch.linspace(0.0, 1.0, max(2, int(strip_samples)), device=model_xyz.device, dtype=model_xyz.dtype)
+		source_valid_xyz = source_xyz.detach()[sample_valid]
+		target_valid_xyz = target_pos.detach()[sample_valid]
+		strip = source_valid_xyz.unsqueeze(-2) + t.view(1, -1, 1) * (target_valid_xyz - source_valid_xyz).unsqueeze(-2)
+		return {"grad_mag": strip.reshape(1, 1, -1, 3).contiguous()}
+
+	def snap_loss(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], dict[str, float]]:
+		offset_f = float(offset)
+		signed_offset = self_map_signed_offset(self.mode, self.direction, offset_f)
+		mode_key = ("boundary_self_winding", offset_f, signed_offset)
+		if mode_key not in self._snap_loss_mode_printed:
+			print(
+				f"[snap_surf.map_global] boundary self snap loss mode={self.mode}/{self.direction} "
+				f"offset={offset_f:.6g} signed_offset={signed_offset:.6g}",
+				flush=True,
+			)
+			self._snap_loss_mode_printed.add(mode_key)
+		uv, target_xyz, target_normals, target_valid, source_xyz, source_valid, _active, source_trainable = self._snap_inputs(
+			model_xyz,
+			model_normals,
+			model_valid,
+		)
+		depth = torch.zeros((*uv.shape[:-1], 1), device=uv.device, dtype=uv.dtype)
+		coords = torch.cat([depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(target_valid.bool(), coords, tuple(int(v) for v in target_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		target_pos = _sample_surface_grid(target_xyz, safe_coords)
+		target_n = torch.nn.functional.normalize(_sample_surface_grid(target_normals.detach(), safe_coords), dim=-1, eps=1.0e-8)
+		valid = valid & torch.isfinite(target_pos).all(dim=-1) & torch.isfinite(target_n).all(dim=-1)
+		z = model_xyz.sum() * 0.0
+		lm = torch.zeros(model_xyz.shape[:3], device=model_xyz.device, dtype=model_xyz.dtype).unsqueeze(1)
+		mask = torch.zeros_like(lm)
+		if not bool(valid.any().detach().cpu()):
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		source_for_residual = source_xyz if source_trainable else source_xyz.detach()
+		target_for_residual = target_pos.detach() if source_trainable else target_pos
+		signed_vox = ((target_for_residual - source_for_residual) * target_n.detach()).sum(dim=-1)
+		if data is None:
+			residual = signed_vox - signed_vox.new_tensor(signed_offset)
+			valid_final = valid
+		else:
+			strip_samples_i = max(2, int(strip_samples))
+			sample_valid = valid & torch.isfinite(target_pos).all(dim=-1) & torch.isfinite(target_n).all(dim=-1)
+			with torch.no_grad():
+				t = torch.linspace(0.0, 1.0, strip_samples_i, device=model_xyz.device, dtype=model_xyz.dtype)
+				origin = torch.tensor(data.origin_fullres, device=model_xyz.device, dtype=model_xyz.dtype)
+				spacing = torch.tensor(data._spacing_for("grad_mag"), device=model_xyz.device, dtype=model_xyz.dtype)
+				sentinel = origin - 64.0 * spacing
+				source_safe = torch.where(sample_valid.unsqueeze(-1), source_xyz.detach(), sentinel.view(1, 1, 1, 3))
+				target_safe = torch.where(sample_valid.unsqueeze(-1), target_pos.detach(), sentinel.view(1, 1, 1, 3))
+				diff = target_safe - source_safe
+				strip = source_safe.unsqueeze(-2) + t.view(1, 1, 1, strip_samples_i, 1) * diff.unsqueeze(-2)
+				N, H, W = int(source_xyz.shape[0]), int(source_xyz.shape[1]), int(source_xyz.shape[2])
+				sampled = data.grid_sample_fullres(strip.reshape(1, N * H, W * strip_samples_i, 3), channels={"grad_mag"})
+				if sampled.grad_mag is None:
+					raise RuntimeError("boundary self snap_surf_map offset mode requires grad_mag samples")
+				mag = sampled.grad_mag.detach().squeeze(0).squeeze(0).reshape(N, H, W, strip_samples_i)
+				strip_valid = (mag > 0.0).all(dim=-1)
+				mean_grad = mag.mean(dim=-1)
+				strip_len = diff.square().sum(dim=-1).sqrt()
+				int_sign = torch.sign(((target_pos.detach() - source_xyz.detach()) * target_n.detach()).sum(dim=-1))
+				signed_windings = int_sign * strip_len * mean_grad
+				winding_err = signed_windings - signed_vox.new_tensor(signed_offset)
+			valid_final = sample_valid & strip_valid
+			normal_residual = signed_vox * mean_grad
+			residual = normal_residual + (winding_err - normal_residual).detach()
+		vals = residual[valid_final]
+		if vals.numel() == 0:
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		loss = vals.square().mean()
+		stats = {
+			"snaps_map_snap": float(loss.detach().cpu()),
+			"snaps_map_snap_abs": float(vals.detach().abs().mean().cpu()),
+			"snaps_map_snap_max": float(vals.detach().abs().max().cpu()),
+			"snaps_map_snap_samples": float(int(vals.numel())),
+		}
+		return loss, (lm,), (mask,), stats
+
+
 class GlobalMapRuntime:
 	"""Persistent global rectangular map optimizer for live snap-surf tensors."""
 
