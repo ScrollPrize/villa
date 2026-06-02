@@ -132,6 +132,13 @@ class SqueezeTransform(BasicTransform):
             return {'displacement': None, 'axis': None}
 
         axes = tuple(self.allowed_axes) if self.allowed_axes is not None else tuple(range(dim))
+        # A length-1 axis has no extent to compress: the cumulative map would
+        # normalise by (m[-1] - m[0]) == 0 -> NaN, which grid_sample then turns
+        # into all-padding output. Keep only axes of length >= 2; if none remain
+        # (e.g. a (C, 1, H, W) patch with allowed_axes on the singleton), skip.
+        axes = tuple(a for a in axes if int(spatial[a]) >= 2)
+        if len(axes) == 0:
+            return {'displacement': None, 'axis': None}
         axis = int(axes[torch.randint(len(axes), (1,)).item()])
         L = int(spatial[axis])
 
@@ -142,8 +149,8 @@ class SqueezeTransform(BasicTransform):
         for _ in range(n_bands):
             # keep band centers away from the very edges so the squeeze is visible
             center = float(torch.empty(1, device=device).uniform_(0.15 * L, 0.85 * L).item())
-            sigma_px = max(1.0, float(sample_scalar(self.sigma, image=img, axis=axis)) * L)
-            strength = max(0.0, float(sample_scalar(self.strength, image=img, axis=axis)))
+            sigma_px = max(1.0, float(sample_scalar(self.sigma, image=img, dim=axis)) * L)
+            strength = max(0.0, float(sample_scalar(self.strength, image=img, dim=axis)))
             c = c + strength * torch.exp(-((xs - center) ** 2) / (2.0 * sigma_px ** 2))
 
         # normalised cumulative integral -> strictly monotonic resampling map
