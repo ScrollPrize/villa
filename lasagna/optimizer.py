@@ -849,11 +849,20 @@ def optimize(
 			if not torch.is_tensor(t):
 				raise ValueError("snap-surf map checkpoint contains non-tensor map_uv_ms entries")
 			params.append(t.to(device=device, dtype=torch.float32).detach().clone())
+		first = params[0]
+		if first.ndim == 4 and int(first.shape[1]) == 2:
+			dense0 = first.permute(0, 2, 3, 1).contiguous()
+		elif first.ndim == 4 and int(first.shape[-1]) == 2:
+			dense0 = first
+		elif first.ndim == 3 and int(first.shape[-1]) == 2:
+			dense0 = first
+		else:
+			raise ValueError(f"snap-surf map checkpoint has unsupported map_uv_ms[0] shape {tuple(first.shape)}")
 		global_model = snap_surf_map_global.GlobalMapModel(
-			params[0],
+			dense0,
 			levels=1,
 			factor=2,
-			preserve_batch=bool(state.get("preserve_batch", params[0].ndim == 4)),
+			preserve_batch=bool(state.get("preserve_batch", first.ndim == 4)),
 		)
 		global_model.map_uv_ms = torch.nn.ParameterList([torch.nn.Parameter(p) for p in params])
 		runtime.global_model = global_model
@@ -954,6 +963,34 @@ def optimize(
 		out["map_uv_ms"] = fused_levels
 		return out
 
+	def _copy_self_map_existing_batches(base_state: dict, old_state: dict | None) -> dict:
+		if old_state is None:
+			return base_state
+		base_levels = _state_level_batches(base_state)
+		old_levels = _state_level_batches(old_state)
+		if len(base_levels) != len(old_levels):
+			raise RuntimeError(
+				f"cannot preserve snap-surf map levels: new={len(base_levels)} old={len(old_levels)}"
+			)
+		fused_levels: list[torch.Tensor] = []
+		for bi, oi in zip(base_levels, old_levels):
+			if tuple(bi.shape[1:]) != tuple(oi.shape[1:]):
+				raise RuntimeError(
+					f"cannot preserve snap-surf map level shape new={tuple(bi.shape)} old={tuple(oi.shape)}"
+				)
+			if int(oi.shape[0]) > int(bi.shape[0]):
+				raise RuntimeError(
+					f"old snap-surf map batch {int(oi.shape[0])} exceeds new batch {int(bi.shape[0])}"
+				)
+			bf = bi.clone()
+			if int(oi.shape[0]) > 0:
+				bf[:int(oi.shape[0])] = oi
+			fused_levels.append(bf)
+		out = dict(base_state)
+		out["preserve_batch"] = True
+		out["map_uv_ms"] = fused_levels
+		return out
+
 	def _fuse_expand_z_snap_surf_maps_append(
 		*,
 		old_state: dict | None,
@@ -973,10 +1010,14 @@ def optimize(
 		boundary_batch = int(old_depth) - 1
 		self_maps: dict[str, dict] = {}
 		for direction in ("out", "in"):
-			base_state = (
+			old_direction_state = (
 				old_self.get(direction)
 				if isinstance(old_self, dict) and isinstance(old_self.get(direction), dict)
-				else _identity_self_map_state_for_model(direction)
+				else None
+			)
+			base_state = _copy_self_map_existing_batches(
+				_identity_self_map_state_for_model(direction),
+				old_direction_state,
 			)
 			base_state = _replace_self_map_batch(
 				base_state,
