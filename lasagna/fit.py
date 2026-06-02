@@ -753,23 +753,31 @@ def _validate_self_map_init_args(
 	self_map_init: str,
 	model_init: str,
 	init_mode: str,
-	model_depth: int,
+	model_depth: int | None,
 	model_w: float | None,
 	model_w_unit: str,
+	validate_shape_contract: bool = True,
 ) -> str:
 	mode = str(self_map_init if self_map_init is not None else "off").strip().lower().replace("-", "_")
 	if mode not in {"off", "multi_wrap_full", "multi_wrap_d"}:
 		raise ValueError(f"invalid self-map-init '{self_map_init}' (expected off, multi_wrap_full, or multi_wrap_d)")
 	if mode == "off":
 		return mode
-	if str(model_init).strip().lower() != "seed":
-		raise ValueError("self-map-init requires args.model-init=seed")
-	if str(init_mode).strip().lower() != "shell-dir-crop":
+	model_init_i = str(model_init).strip().lower()
+	if model_init_i not in {"seed", "model"}:
+		raise ValueError("self-map-init requires args.model-init=seed or args.model-init=model")
+	if model_init_i == "seed" and str(init_mode).strip().lower() != "shell-dir-crop":
 		raise ValueError("self-map-init requires args.init-mode=shell-dir-crop")
+	if not validate_shape_contract:
+		return mode
 	if mode == "multi_wrap_full":
+		if model_depth is None:
+			raise ValueError("self-map-init=multi_wrap_full requires known args.depth")
 		if int(model_depth) != 1:
 			raise ValueError("self-map-init=multi_wrap_full requires args.depth=1")
 	if mode == "multi_wrap_d":
+		if model_depth is None:
+			raise ValueError("self-map-init=multi_wrap_d requires known args.depth")
 		if int(model_depth) <= 1:
 			raise ValueError("self-map-init=multi_wrap_d requires args.depth > 1")
 	unit = str(model_w_unit).strip().lower()
@@ -1188,6 +1196,7 @@ def main(argv: list[str] | None = None) -> int:
 		model_depth=int(model_cfg.depth),
 		model_w=data_cfg.model_w,
 		model_w_unit=data_cfg.model_w_unit,
+		validate_shape_contract=(model_init != "model"),
 	)
 	self_map_model_w_wraps: float | None = (
 		None if data_cfg.model_w is None else float(data_cfg.model_w)
@@ -1434,6 +1443,7 @@ def main(argv: list[str] | None = None) -> int:
 	_stage_done("derive_initial_model_params", _t)
 
 	tifxyz_init = getattr(args, "tifxyz_init", None)
+	loaded_snap_surf_map_state: dict | None = None
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
 	_t = _stage_start("construct_model")
@@ -1659,7 +1669,25 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] model-init=model: loading checkpoint {model_cfg.model_input}", flush=True)
 		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)
+		loaded_snap_surf_map_state = st.get("_snap_surf_map_state_") if isinstance(st, dict) else None
 		mdl = model.Model3D.from_checkpoint(st, device=device)
+		if self_map_init != "off":
+			checkpoint_model_w = getattr(mdl.params, "model_w", None)
+			model_w_wraps = (
+				float(data_cfg.model_w)
+				if data_cfg.model_w is not None
+				else (None if checkpoint_model_w is None else float(checkpoint_model_w))
+			)
+			_validate_self_map_init_args(
+				self_map_init=self_map_init,
+				model_init=model_init,
+				init_mode=init_mode,
+				model_depth=int(mdl.depth),
+				model_w=model_w_wraps,
+				model_w_unit=data_cfg.model_w_unit,
+			)
+			if data_cfg.model_w_unit == "wraps":
+				self_map_model_w_wraps = model_w_wraps
 
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"cylinder_enabled={getattr(mdl, 'cylinder_enabled', False)}")
@@ -1911,6 +1939,9 @@ def main(argv: list[str] | None = None) -> int:
 				)
 			st["_corr_point_roi_"] = payload
 		st["mesh_flat"] = mesh_flat
+		snap_surf_map_state = getattr(mdl, "_snap_surf_map_state_for_save", None)
+		if snap_surf_map_state is not None:
+			st["_snap_surf_map_state_"] = snap_surf_map_state
 		if approval_inpaint_output_mask is not None:
 			st["_approval_inpaint_output_mask_"] = copy.deepcopy(approval_inpaint_output_mask)
 			print(
@@ -1983,6 +2014,8 @@ def main(argv: list[str] | None = None) -> int:
 		self_map_init=self_map_init,
 		self_map_model_w_wraps=self_map_model_w_wraps,
 		init_grow=init_grow_runtime,
+		snap_surf_map_state=loaded_snap_surf_map_state,
+		require_snap_surf_map_state=(model_init == "model" and self_map_init != "off"),
 	)
 	_stage_done("optimizer", _t)
 
