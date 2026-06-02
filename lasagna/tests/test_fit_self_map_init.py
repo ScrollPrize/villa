@@ -241,6 +241,52 @@ class FitSelfMapInitTest(unittest.TestCase):
 				model_w_unit="wraps",
 			)
 
+	def test_self_map_snap_config_does_not_request_external_surface_maps(self) -> None:
+		cfg = {
+			"args": {"self-map-init": "multi_wrap_d"},
+			"base": {"snap_surf_map": 0.1},
+			"external_surfaces": [{"path": "/tmp/ref.tifxyz"}],
+			"stages": [
+				{
+					"name": "self_map",
+					"steps": 1,
+					"lr": 0.1,
+					"params": ["mesh_ms"],
+					"args": {"snap_surf_map": {"map_opt": {"steps": 1, "params": ["map_surf_ms"]}}},
+				}
+			],
+		}
+
+		self.assertFalse(fit._config_requests_external_surface_maps(cfg, self_map_init="multi_wrap_d"))
+
+	def test_self_d_grow_config_does_not_request_external_surface_maps(self) -> None:
+		cfg_path = os.path.join(os.path.dirname(TEST_DIR), "configs", "init_snap_surf_self_d_grow.json")
+		with open(cfg_path, "r", encoding="utf-8") as f:
+			cfg = json.load(f)
+
+		self.assertFalse(fit._config_requests_external_surface_maps(cfg, self_map_init="multi_wrap_d"))
+
+	def test_global_snap_config_requests_external_surface_maps(self) -> None:
+		cfg = {
+			"args": {"self-map-init": "off"},
+			"base": {"snap_surf_map": 0.1},
+			"stages": [
+				{"name": "global", "steps": 1, "lr": 0.1, "params": ["mesh_ms"]},
+			],
+		}
+
+		self.assertTrue(fit._config_requests_external_surface_maps(cfg, self_map_init="off"))
+
+	def test_ext_offset_config_requests_external_surface_maps(self) -> None:
+		cfg = {
+			"base": {"ext_offset": 1.0},
+			"stages": [
+				{"name": "ext", "steps": 1, "lr": 0.1, "params": ["mesh_ms"]},
+			],
+		}
+
+		self.assertTrue(fit._config_requests_external_surface_maps(cfg, self_map_init="multi_wrap_d"))
+
 
 if __name__ == "__main__":
 	unittest.main()

@@ -620,6 +620,101 @@ def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | N
 	return None
 
 
+def _stage_opt_cfgs(raw_stages: object):
+	if not isinstance(raw_stages, list):
+		return
+	for stage in raw_stages:
+		if not isinstance(stage, dict):
+			continue
+		children = stage.get("stages")
+		if isinstance(children, list):
+			yield from _stage_opt_cfgs(children)
+			continue
+		opt_cfg = stage.get("global_opt")
+		yield opt_cfg if isinstance(opt_cfg, dict) else stage
+
+
+def _stage_params_list(opt_cfg: dict) -> list[str]:
+	params = opt_cfg.get("params", [])
+	if isinstance(params, str):
+		return [params]
+	if isinstance(params, list):
+		return [str(p) for p in params]
+	return []
+
+
+def _stage_runs(opt_cfg: dict) -> bool:
+	steps = opt_cfg.get("steps", 0)
+	if isinstance(steps, str) and steps.strip().lower() == "auto":
+		return True
+	try:
+		return int(steps) > 0
+	except (TypeError, ValueError):
+		return False
+
+
+def _config_effective_loss_enabled(cfg: dict, term_name: str) -> bool:
+	base = dict(optimizer.lambda_global)
+	base_cfg = cfg.get("base")
+	if isinstance(base_cfg, dict):
+		for k, v in base_cfg.items():
+			try:
+				base[str(k)] = float(v)
+			except (TypeError, ValueError):
+				base[str(k)] = 0.0
+	base_term = float(base.get(term_name, 0.0))
+	map_loss_names = set(optimizer.MAP_LOSS_NAMES)
+	for opt_cfg in _stage_opt_cfgs(cfg.get("stages")):
+		if not isinstance(opt_cfg, dict) or not _stage_runs(opt_cfg):
+			continue
+		eff = base_term
+		params = set(_stage_params_list(opt_cfg))
+		kind = "map" if (params & optimizer.MAP_OPT_PARAMS) and not (params & optimizer.MODEL_OPT_PARAMS) else "model"
+		default_mul = opt_cfg.get("default_mul")
+		if default_mul is not None:
+			try:
+				eff = base_term * float(default_mul)
+			except (TypeError, ValueError):
+				eff = 0.0
+		w_fac = opt_cfg.get("w_fac")
+		if isinstance(w_fac, (int, float)):
+			scalar_applies = (kind == "map" and term_name in map_loss_names) or (
+				kind == "model" and term_name not in map_loss_names
+			)
+			if scalar_applies:
+				eff = base_term * float(w_fac)
+		elif isinstance(w_fac, dict) and term_name in w_fac and w_fac.get(term_name) is not None:
+			try:
+				eff = base_term * float(w_fac.get(term_name))
+			except (TypeError, ValueError):
+				eff = 0.0
+		if abs(float(eff)) > 0.0:
+			return True
+	return False
+
+
+def _config_requests_external_surface_maps(cfg: dict, *, self_map_init: str) -> bool:
+	if _config_effective_loss_enabled(cfg, "ext_offset"):
+		return True
+	if str(self_map_init).strip().lower().replace("-", "_") != "off":
+		return False
+	if _config_effective_loss_enabled(cfg, "snap_surf_map"):
+		return True
+	for opt_cfg in _stage_opt_cfgs(cfg.get("stages")):
+		if not isinstance(opt_cfg, dict) or not _stage_runs(opt_cfg):
+			continue
+		params = set(_stage_params_list(opt_cfg))
+		if params & optimizer.MAP_OPT_PARAMS:
+			return True
+		args = opt_cfg.get("args")
+		if not isinstance(args, dict):
+			continue
+		snap_map = args.get("snap_surf_map")
+		if isinstance(snap_map, dict) and snap_map.get("map_opt") is not None:
+			return True
+	return False
+
+
 def _apply_cylinder_prepare_model_step(mdl: "model.Model3D", model_step: float | None) -> None:
 	if model_step is None:
 		return
@@ -1697,7 +1792,17 @@ def main(argv: list[str] | None = None) -> int:
 	# Load external reference surfaces
 	_t = _stage_start("load_external_surfaces")
 	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
-	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
+	external_surface_maps_requested = (
+		_config_requests_external_surface_maps(fit_config, self_map_init=self_map_init)
+		or bool(getattr(mdl, "_ext_surfaces", None))
+	)
+	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg and not external_surface_maps_requested:
+		print(
+			"[fit] external_surfaces present but no external-surface map consumer is active; "
+			"skipping model external-surface registration",
+			flush=True,
+		)
+	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg and external_surface_maps_requested:
 		if len(ext_surfaces_cfg) != 1:
 			raise ValueError(
 				f"external_surfaces currently requires exactly one entry, got {len(ext_surfaces_cfg)}")

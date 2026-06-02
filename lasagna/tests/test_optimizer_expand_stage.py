@@ -142,6 +142,7 @@ class OptimizerExpandStageTest(unittest.TestCase):
 		)
 		stages = optimizer.load_stages_cfg({
 			"base": {
+				"step": 1.0,
 				"normal": 0.0,
 				"snap_surf_map": 0.1,
 				"map_dist": 0.0001,
@@ -157,6 +158,9 @@ class OptimizerExpandStageTest(unittest.TestCase):
 							"steps": 1,
 							"lr": 0.0,
 							"params": ["mesh_ms"],
+							"w_fac": {
+								"snap_surf_map": 0.0,
+							},
 							"args": {
 								"snap_surf_map": {
 									"map_opt": {

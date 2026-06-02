@@ -2246,6 +2246,11 @@ def optimize(
 			pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
 			pred_dt_normal_source_=pred_dt_normal_source,
 		)
+		if snap_surf_map_opt_stage is not None:
+			stage_needs = stage_needs.merged(Needs(
+				mesh_normals=True,
+				ext_surfaces=(self_map_mode == "off"),
+			))
 		if not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: forward_needs={stage_needs.summary()} "
