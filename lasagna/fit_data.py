@@ -270,7 +270,7 @@ def _record_chunks(data: "FitData3D", xyz_fullres: torch.Tensor) -> None:
 
 @dataclass(frozen=True)
 class CorrPoints3D:
-	points_xyz_winda: torch.Tensor  # (K, 4) — x, y, z, winda in fullres (winda = depth index from d.tif)
+	points_xyz_winda: torch.Tensor  # (K, 4) — x, y, z, central-relative winding from d.tif
 	collection_idx: torch.Tensor    # (K,) — integer collection ID per point
 	point_ids: torch.Tensor         # (K,) — integer point ID per point
 	is_absolute: torch.Tensor       # (K,) bool — True if winding is absolute (not relative/averaged)

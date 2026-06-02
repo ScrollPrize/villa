@@ -3931,9 +3931,20 @@ def optimize(
 			flat = torch.cat([old_flat, new_flat], dim=1).contiguous()
 			amp = torch.cat([model.amp.detach(), temp_model.amp.detach()], dim=0).contiguous()
 			bias = torch.cat([model.bias.detach(), temp_model.bias.detach()], dim=0).contiguous()
+			depth_windings = tuple(model.params.depth_windings) + tuple(temp_model.params.depth_windings)
+			if len(depth_windings) != int(flat.shape[1]):
+				raise RuntimeError(
+					f"expand-z fuse depth_windings length {len(depth_windings)} "
+					f"must match fused depth {int(flat.shape[1])}"
+				)
 		n_scales = len(model.mesh_ms)
 		model.depth = int(flat.shape[1])
 		model.pyramid_d = bool(model.params.pyramid_d) and model.depth > 1
+		model.params = replace(
+			model.params,
+			pyramid_d=model.pyramid_d,
+			depth_windings=depth_windings,
+		)
 		model.mesh_ms = fit_model.Model3D._construct_pyramid_from_flat_3d(
 			flat,
 			n_scales,
@@ -3949,7 +3960,11 @@ def optimize(
 		)
 		model.amp = torch.nn.Parameter(amp.to(device=flat.device, dtype=torch.float32))
 		model.bias = torch.nn.Parameter(bias.to(device=flat.device, dtype=torch.float32))
-		print(f"[optimizer] expand-z fuse append: depth={model.depth}", flush=True)
+		print(
+			f"[optimizer] expand-z fuse append: depth={model.depth} "
+			f"depth_windings={list(model.params.depth_windings)}",
+			flush=True,
+		)
 
 	def _run_expand_z_stage(*, si: int, stage: Stage, data: fit_data.FitData3D) -> fit_data.FitData3D:
 		if init_grow is None:
@@ -3989,6 +4004,10 @@ def optimize(
 				volume_extent=model.params.volume_extent,
 				model_w=model.params.model_w,
 				model_h=model.params.model_h,
+				depth_windings=tuple(
+					int(model.params.depth_windings[-1]) + i + 1
+					for i in range(add_depth)
+				),
 			)
 			with torch.no_grad():
 				temp_model.amp.copy_(model.amp.detach()[-1:].expand_as(temp_model.amp))
