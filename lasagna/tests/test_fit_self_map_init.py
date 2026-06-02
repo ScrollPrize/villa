@@ -92,11 +92,11 @@ class FitSelfMapInitTest(unittest.TestCase):
 		with self.assertRaisesRegex(ValueError, "args.model-w > 1.0 wraps"):
 			fit._validate_self_map_width_contract(mode="multi_wrap_full", model_w_wraps=0.5)
 
-	def test_self_map_rejects_non_seed_or_non_shell_init(self) -> None:
-		with self.assertRaisesRegex(ValueError, "model-init=seed"):
+	def test_self_map_rejects_non_seed_model_or_non_shell_seed_init(self) -> None:
+		with self.assertRaisesRegex(ValueError, "model-init=seed or args.model-init=model"):
 			fit._validate_self_map_init_args(
 				self_map_init="multi_wrap_full",
-				model_init="model",
+				model_init="ext",
 				init_mode="shell-dir-crop",
 				model_depth=1,
 				model_w=1.5,
@@ -175,6 +175,40 @@ class FitSelfMapInitTest(unittest.TestCase):
 			fit._parse_init_grow_config(
 				{"init-grow": {"initial_depth": 4}},
 				target_depth=3,
+			)
+
+	def test_self_map_model_reopt_defers_checkpoint_shape_validation(self) -> None:
+		self.assertEqual(
+			fit._validate_self_map_init_args(
+				self_map_init="multi_wrap_d",
+				model_init="model",
+				init_mode="cylinder_seed",
+				model_depth=None,
+				model_w=None,
+				model_w_unit="voxels",
+				validate_shape_contract=False,
+			),
+			"multi_wrap_d",
+		)
+		with self.assertRaisesRegex(ValueError, "depth > 1"):
+			fit._validate_self_map_init_args(
+				self_map_init="multi_wrap_d",
+				model_init="model",
+				init_mode="cylinder_seed",
+				model_depth=1,
+				model_w=None,
+				model_w_unit="voxels",
+			)
+
+	def test_self_map_rejects_unsupported_reopt_source(self) -> None:
+		with self.assertRaisesRegex(ValueError, "model-init=seed or args.model-init=model"):
+			fit._validate_self_map_init_args(
+				self_map_init="multi_wrap_d",
+				model_init="ext",
+				init_mode="cylinder_seed",
+				model_depth=2,
+				model_w=None,
+				model_w_unit="voxels",
 			)
 		with self.assertRaisesRegex(ValueError, "0 < args.model-w < 1.0"):
 			fit._validate_self_map_init_args(

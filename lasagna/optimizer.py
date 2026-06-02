@@ -803,16 +803,95 @@ def optimize(
 	self_map_init: str = "off",
 	self_map_model_w_wraps: float | None = None,
 	init_grow: dict | None = None,
+	snap_surf_map_state: dict | None = None,
+	require_snap_surf_map_state: bool = False,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
 	opt_loss_snap_surf.reset_state()
 	_snap_global_runtime: snap_surf_map_global.GlobalMapRuntime | None = None
 	_snap_self_runtimes: dict[str, snap_surf_map_global.SelfMapRuntime] = {}
+	_loaded_snap_surf_map_state = snap_surf_map_state if isinstance(snap_surf_map_state, dict) else None
 	_snap_global_offset_debug_printed = False
 	_map_forward_needs = fit_model.ModelForwardNeeds(mesh_normals=True, ext_surfaces=True)
 	snap_global_mesh_epoch = 0
 	self_map_mode = snap_surf_map_global.normalize_self_map_init(self_map_init)
+
+	def _runtime_map_model_state(runtime) -> dict | None:
+		global_model = getattr(runtime, "global_model", None)
+		if global_model is None:
+			return None
+		return {
+			"preserve_batch": bool(getattr(global_model, "preserve_batch", False)),
+			"map_uv_ms": [p.detach().cpu() for p in list(getattr(global_model, "map_uv_ms", []))],
+		}
+
+	def _restore_runtime_map_model(
+		runtime,
+		state: dict,
+		*,
+		expected_mode: str | None = None,
+		expected_direction: str | None = None,
+	) -> None:
+		if expected_mode is not None and str(state.get("mode", expected_mode)).replace("-", "_") != str(expected_mode):
+			raise ValueError(f"snap-surf map checkpoint mode mismatch: expected {expected_mode}, got {state.get('mode')}")
+		if expected_direction is not None and str(state.get("direction", expected_direction)) != str(expected_direction):
+			raise ValueError(
+				f"snap-surf map checkpoint direction mismatch: expected {expected_direction}, got {state.get('direction')}"
+			)
+		tensors = state.get("map_uv_ms")
+		if not isinstance(tensors, list) or not tensors:
+			raise ValueError("snap-surf map checkpoint is missing map_uv_ms tensors")
+		device = next(model.parameters()).device
+		params = []
+		for t in tensors:
+			if not torch.is_tensor(t):
+				raise ValueError("snap-surf map checkpoint contains non-tensor map_uv_ms entries")
+			params.append(t.to(device=device, dtype=torch.float32).detach().clone())
+		global_model = snap_surf_map_global.GlobalMapModel(
+			params[0],
+			levels=1,
+			factor=2,
+			preserve_batch=bool(state.get("preserve_batch", params[0].ndim == 4)),
+		)
+		global_model.map_uv_ms = torch.nn.ParameterList([torch.nn.Parameter(p) for p in params])
+		runtime.global_model = global_model
+		if state.get("model_w_wraps") is not None:
+			runtime.model_w_wraps = float(state["model_w_wraps"])
+		runtime.steps_run = int(state.get("steps_run", getattr(runtime, "steps_run", 0)))
+
+	def _current_snap_surf_map_state() -> dict | None:
+		self_maps: dict[str, dict] = {}
+		for direction, runtime in sorted(_snap_self_runtimes.items()):
+			model_state = _runtime_map_model_state(runtime)
+			if model_state is None:
+				continue
+			model_state.update({
+				"mode": runtime.mode,
+				"direction": direction,
+				"model_w_wraps": runtime.model_w_wraps,
+				"steps_run": int(getattr(runtime, "steps_run", 0)),
+			})
+			self_maps[direction] = model_state
+		out: dict[str, object] = {"version": 1, "self_map_init": self_map_mode}
+		if self_maps:
+			out["self_maps"] = self_maps
+		global_state = _runtime_map_model_state(_snap_global_runtime) if _snap_global_runtime is not None else None
+		if global_state is not None:
+			out["global_map"] = global_state
+		return out if ("self_maps" in out or "global_map" in out) else None
+
+	def _publish_snap_surf_map_state() -> None:
+		state = _current_snap_surf_map_state()
+		if state is not None:
+			setattr(model, "_snap_surf_map_state_for_save", state)
+
+	if require_snap_surf_map_state and self_map_mode != "off":
+		if _loaded_snap_surf_map_state is None or not isinstance(_loaded_snap_surf_map_state.get("self_maps"), dict):
+			raise ValueError("self-map reopt requires checkpoint snap-surf self maps")
+		missing = [d for d in ("out", "in") if d not in _loaded_snap_surf_map_state["self_maps"]]
+		if missing:
+			raise ValueError(f"self-map reopt checkpoint is missing snap-surf self maps: {missing}")
 
 	def _bump_snap_global_mesh_epoch() -> None:
 		nonlocal snap_global_mesh_epoch
@@ -868,6 +947,17 @@ def optimize(
 				model_w_wraps=self_map_model_w_wraps,
 				base=base,
 			)
+			if _loaded_snap_surf_map_state is not None:
+				self_maps = _loaded_snap_surf_map_state.get("self_maps", {})
+				if isinstance(self_maps, dict) and direction_i in self_maps:
+					_restore_runtime_map_model(
+						runtime,
+						self_maps[direction_i],
+						expected_mode=self_map_mode,
+						expected_direction=direction_i,
+					)
+				elif require_snap_surf_map_state and self_map_mode != "off":
+					raise ValueError(f"self-map reopt checkpoint is missing snap-surf self map '{direction_i}'")
 			_snap_self_runtimes[direction_i] = runtime
 		return runtime
 
@@ -908,6 +998,7 @@ def optimize(
 				)
 				for k, v in stats.items():
 					all_stats[k] = all_stats.get(k, 0.0) + float(v) / float(max(1, len(_self_map_directions(stage_args))))
+			_publish_snap_surf_map_state()
 			return all_stats
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
@@ -917,7 +1008,7 @@ def optimize(
 		_print_snap_global_offset_debug(records)
 		ext_xyz, ext_valid, ext_normals, ext_quad_valid, _offset = _unpack_ext_surface_record(records[0])
 		runtime = _snap_global_runtime_for(stage_args)
-		return runtime.run_stage(
+		stats = runtime.run_stage(
 			stage=stage,
 			model_xyz=res.xyz_lr,
 			model_normals=res.normals,
@@ -933,6 +1024,8 @@ def optimize(
 			cancel_fn=cancel_fn,
 			auto_stop_fn=auto_stop_fn,
 		)
+		_publish_snap_surf_map_state()
+		return stats
 
 	def _compact_snap_global_map_stats(stats: dict[str, float]) -> dict[str, float]:
 		return {
@@ -965,6 +1058,7 @@ def optimize(
 				for k, v in stats.items():
 					stats_acc[k] = stats_acc.get(k, 0.0) + float(v) / float(max(1, len(directions)))
 			opt_loss_snap_surf.update_last_stats(stats_acc)
+			_publish_snap_surf_map_state()
 			return loss_total, lms_all, masks_all
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
@@ -985,6 +1079,7 @@ def optimize(
 			strip_samples=max(2, int(res.params.subsample_mesh) + 1),
 		)
 		opt_loss_snap_surf.update_last_stats(stats)
+		_publish_snap_surf_map_state()
 		return loss, lms, masks
 
 	def _stage_start(name: str) -> float:
@@ -1433,7 +1528,7 @@ def optimize(
 			"loss": _snap_global_map_loss,
 			"needs": Needs(
 				mesh_normals=True,
-				ext_surfaces=True,
+				ext_surfaces=(self_map_mode == "off"),
 				lr_prefetch_channels=frozenset({"grad_mag"}),
 				prefetch_snap_surf_map=True,
 			),
@@ -3962,5 +4057,6 @@ def optimize(
 	elif has_corr_pts:
 		print("[optimizer] corr points present but no corr weight > 0, no corr loss computed", flush=True)
 
+	_publish_snap_surf_map_state()
 	print(f"[optimizer] total optimize time: {_fmt_duration(time.perf_counter() - _optimize_t0)}", flush=True)
 	return data
