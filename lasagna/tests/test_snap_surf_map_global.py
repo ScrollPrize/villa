@@ -23,6 +23,7 @@ if TEST_DIR not in sys.path:
 from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_vector_dir, load_map_fixture
 from snap_surf.map_global import (
 	AffineMapModel,
+	BoundarySelfMapRuntime,
 	GlobalMapModel,
 	GlobalMapRuntime,
 	GlobalMapStageConfig,
@@ -479,6 +480,111 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertLess(float(loss_out.detach()), 1.0e-6)
 			self.assertLess(float(loss_in.detach()), 1.0e-6)
 			self.assertEqual(stats_out["snaps_map_snap_samples"], stats_in["snaps_map_snap_samples"])
+
+	def test_boundary_self_map_snap_loss_identity_maps_both_directions(self) -> None:
+		H, W = 4, 4
+		fixed_xyz = _plane_xyz(h=H, w=W, z=0.0)
+		new_xyz = _plane_xyz(h=H, w=W, z=1.0).unsqueeze(0)
+		fixed_normals = _normals_2d(H, W)
+		new_normals = _normals_3d(1, H, W)
+		fixed_valid = torch.ones(H, W, dtype=torch.bool)
+		new_valid = torch.ones(1, H, W, dtype=torch.bool)
+
+		loss_out, _lms_o, _masks_o, stats_out = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="out",
+			fixed_xyz=fixed_xyz,
+			fixed_normals=fixed_normals,
+			fixed_valid=fixed_valid,
+		).snap_loss(
+			model_xyz=new_xyz,
+			model_normals=new_normals,
+			model_valid=new_valid,
+			offset=1.0,
+			data=None,
+		)
+		loss_in, _lms_i, _masks_i, stats_in = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="in",
+			fixed_xyz=fixed_xyz,
+			fixed_normals=fixed_normals,
+			fixed_valid=fixed_valid,
+		).snap_loss(
+			model_xyz=new_xyz,
+			model_normals=new_normals,
+			model_valid=new_valid,
+			offset=1.0,
+			data=None,
+		)
+
+		self.assertLess(float(loss_out.detach()), 1.0e-6)
+		self.assertLess(float(loss_in.detach()), 1.0e-6)
+		self.assertEqual(stats_out["snaps_map_snap_samples"], stats_in["snaps_map_snap_samples"])
+		self.assertGreater(stats_out["snaps_map_snap_samples"], 0.0)
+
+	def test_boundary_self_map_in_direction_grads_trainable_source_only(self) -> None:
+		H, W = 4, 4
+		fixed_xyz = _plane_xyz(h=H, w=W, z=0.0).requires_grad_(True)
+		new_xyz = _plane_xyz(h=H, w=W, z=1.25).unsqueeze(0).detach().requires_grad_(True)
+		runtime = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="in",
+			fixed_xyz=fixed_xyz,
+			fixed_normals=_normals_2d(H, W),
+			fixed_valid=torch.ones(H, W, dtype=torch.bool),
+		)
+
+		loss, _lms, _masks, stats = runtime.snap_loss(
+			model_xyz=new_xyz,
+			model_normals=_normals_3d(1, H, W),
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+			offset=1.0,
+			data=None,
+		)
+		loss.backward()
+
+		self.assertGreater(stats["snaps_map_snap_samples"], 0.0)
+		self.assertIsNotNone(new_xyz.grad)
+		self.assertGreater(float(new_xyz.grad.detach().abs().sum()), 0.0)
+		self.assertIsNone(fixed_xyz.grad)
+
+	def test_boundary_self_map_runtime_serializes_like_self_map_state(self) -> None:
+		H, W = 5, 5
+		runtime = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="out",
+			fixed_xyz=_plane_xyz(h=H, w=W, z=0.0),
+			fixed_normals=_normals_2d(H, W),
+			fixed_valid=torch.ones(H, W, dtype=torch.bool),
+		)
+		stage = GlobalMapStageConfig(
+			steps=0,
+			lr=0.01,
+			params=("map_uv_ms",),
+			args={"startup_timing": False},
+		)
+
+		stats = runtime.run_stage(
+			stage=stage,
+			model_xyz=_plane_xyz(h=H, w=W, z=1.0).unsqueeze(0),
+			model_normals=_normals_3d(1, H, W),
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+		)
+
+		self.assertIsNotNone(runtime.global_model)
+		assert runtime.global_model is not None
+		state = {
+			"preserve_batch": bool(runtime.global_model.preserve_batch),
+			"map_uv_ms": [p.detach().cpu() for p in runtime.global_model.map_uv_ms],
+			"mode": runtime.mode,
+			"direction": runtime.direction,
+			"steps_run": runtime.steps_run,
+		}
+		self.assertTrue(state["preserve_batch"])
+		self.assertEqual(state["mode"], "multi_wrap_d")
+		self.assertEqual(state["direction"], "out")
+		self.assertEqual(state["map_uv_ms"][0].shape[0], 1)
+		self.assertIn("snaps_map_loss", stats)
 
 	def test_runtime_map_init_keeps_z_lift_unless_disabled(self) -> None:
 		h, w = 5, 5
