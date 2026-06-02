@@ -42,8 +42,8 @@ class DecohesionTransform(ImageOnlyTransform):
             return {'apply': False}
         axes = tuple(self.allowed_axes) if self.allowed_axes is not None else tuple(range(dim))
         axis = int(axes[torch.randint(len(axes), (1,)).item()])
-        tau = max(0.3, float(sample_scalar(self.tau, image=img, axis=axis)))
-        strength = float(min(1.0, max(0.0, sample_scalar(self.strength, image=img, axis=axis))))
+        tau = max(0.3, float(sample_scalar(self.tau, image=img, dim=axis)))
+        strength = float(min(1.0, max(0.0, sample_scalar(self.strength, image=img, dim=axis))))
         K = int(min(img.shape[axis + 1], max(3, round(3 * tau) + 1)))
         return {'apply': True, 'axis': axis, 'tau': tau, 'strength': strength, 'K': K}
 

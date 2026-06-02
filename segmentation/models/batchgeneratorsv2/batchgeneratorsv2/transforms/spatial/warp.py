@@ -95,7 +95,7 @@ class WarpTransform(BasicTransform):
         axis = int(axes[torch.randint(len(axes), (1,)).item()])
         L = int(spatial[axis])
         in_plane = [ax for ax in range(dim) if ax != axis]
-        amp = max(1.0, float(sample_scalar(self.amplitude, image=img, axis=axis)) * L)
+        amp = max(1.0, float(sample_scalar(self.amplitude, image=img, dim=axis)) * L)
         nc = int(torch.randint(self.coarse[0], self.coarse[1] + 1, (1,)).item())
 
         if dim == 3:
