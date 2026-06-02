@@ -76,7 +76,7 @@ def _square_corr_results(*, include_invalid: bool = False) -> dict:
 	return {"points_list": points, "collection_avgs": {"7": 0.0}}
 
 
-def _model_params(*, mesh_step: int = 1) -> dict:
+def _model_params(*, mesh_step: int = 1, depth_windings: tuple[int, ...] = (0,)) -> dict:
 	return {
 		"mesh_step": mesh_step,
 		"winding_step": 1,
@@ -86,6 +86,7 @@ def _model_params(*, mesh_step: int = 1) -> dict:
 		"z_step_eff": 1,
 		"volume_extent": None,
 		"pyramid_d": False,
+		"depth_windings": [int(v) for v in depth_windings],
 	}
 
 
@@ -488,7 +489,7 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 		], axis=0)
 		state = {
 			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
-			"_model_params_": _model_params(),
+			"_model_params_": _model_params(depth_windings=(0, 1)),
 			"_fit_config_": {"args": {"tifxyz-flow-gate-channels": True}},
 			"_flow_gate_channels_": _flow_gate_payload(local, normalized),
 		}
