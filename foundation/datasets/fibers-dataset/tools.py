@@ -16,20 +16,29 @@ from scipy import ndimage
 from skimage.restoration import denoise_nl_means, estimate_sigma
 from skimage.exposure import equalize_adapthist
 
-# TODO: some cupy acceleration
-xp = np
-from numpy import linalg as LA
-xndimage = ndimage
+try:
+    import cupy as cp
+    from cupyx.scipy import ndimage as cupy_ndimage
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
+def get_backend(volume):
+    if HAS_CUPY and isinstance(volume, cp.ndarray):
+        return cp, cupy_ndimage
+    return np, ndimage
 
 def divide_nonzero(array1, array2, eps=1e-10):
     """
     Divides two arrays. Returns zero when dividing by zero.
     """
-    denominator = np.copy(array2)
+    xp, _ = get_backend(array1)
+    denominator = xp.copy(array2)
     denominator[denominator == 0] = eps
-    return np.divide(array1, denominator)
+    return xp.divide(array1, denominator)
 
 def normalize(volume):
+    xp, _ = get_backend(volume)
     minim = xp.min(volume)
     maxim = xp.max(volume)
     volume -= minim
@@ -129,6 +138,7 @@ def adjust_contrast(volume, kernel_size=8):
     return equalize_adapthist(volume, kernel_size, clip_limit=0.01, nbins=256)
 
 def hessian(volume, gauss_sigma=2, sigma=6):
+    xp, xndimage = get_backend(volume)
     # N.B. this only returns the upper triangular matrix to save time
     volume = xndimage.gaussian_filter(volume, sigma=gauss_sigma)
     volume = normalize(volume)
@@ -160,27 +170,66 @@ def hessian(volume, gauss_sigma=2, sigma=6):
     
     return joint_hessian, zero_mask
 
+def compute_eigenvalues_3x3_batch(J):
+    """
+    Compute eigenvalues for batched 3x3 symmetric matrices using Cardano's analytical formula.
+    Avoids CuPy's batched eigvalsh failure on large arrays (cuSolver errors).
+    Works interchangeably with NumPy and CuPy via xp.
+    Input: J of shape (..., 3, 3)
+    Output: eigenvalues of shape (..., 3) in ascending order
+    """
+    xp, _ = get_backend(J)
+    a11 = J[..., 0, 0]
+    a22 = J[..., 1, 1]
+    a33 = J[..., 2, 2]
+    a12 = J[..., 0, 1]
+    a13 = J[..., 0, 2]
+    a23 = J[..., 1, 2]
+    
+    p1 = a11 + a22 + a33
+    p2 = a11*a22 + a11*a33 + a22*a33 - a12*a12 - a13*a13 - a23*a23
+    p3 = a11*(a22*a33 - a23*a23) - a12*(a12*a33 - a13*a23) + a13*(a12*a23 - a13*a22)
+    
+    q = p1 * p1 / 9.0 - p2 / 3.0
+    r = p1 * p1 * p1 / 27.0 - p1 * p2 / 6.0 + p3 / 2.0
+    
+    eps = 1e-12
+    sqrt_q = xp.sqrt(xp.clip(q, a_min=eps, a_max=None))
+    theta = xp.arccos(xp.clip(r / (sqrt_q ** 3 + eps), a_min=-1.0, a_max=1.0))
+    
+    sqrt_q_2 = 2.0 * sqrt_q
+    p1_3 = p1 / 3.0
+    
+    lambda1 = p1_3 + sqrt_q_2 * xp.cos(theta / 3.0)
+    lambda2 = p1_3 + sqrt_q_2 * xp.cos((theta - 2.0 * math.pi) / 3.0)
+    lambda3 = p1_3 + sqrt_q_2 * xp.cos((theta - 4.0 * math.pi) / 3.0)
+    
+    eigenvalues = xp.stack([lambda1, lambda2, lambda3], axis=-1)
+    eigenvalues = xp.sort(eigenvalues, axis=-1)
+    return eigenvalues
+
 def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
+    xp, _ = get_backend(volume)
     joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
-    eigvals = LA.eigvalsh(joint_hessian, "U")
+    eigvals = compute_eigenvalues_3x3_batch(joint_hessian)
     # Sort in increasing size of the absolute value of the eigenvalues
-    idxs = np.argsort(np.abs(eigvals), axis=-1)
-    eigvals = np.take_along_axis(eigvals, idxs, axis=-1)
+    idxs = xp.argsort(xp.abs(eigvals), axis=-1)
+    eigvals = xp.take_along_axis(eigvals, idxs, axis=-1)
     eigvals[zero_mask, :] = 0
 
-    L1 = np.abs(eigvals[:, :, :, 0])
-    L2 = np.abs(eigvals[:, :, :, 1])
+    L1 = xp.abs(eigvals[:, :, :, 0])
+    L2 = xp.abs(eigvals[:, :, :, 1])
     L3 = eigvals[:, :, :, 2]
-    L3abs = np.abs(L3)
+    L3abs = xp.abs(L3)
     
-    S = np.sqrt(np.square(eigvals).sum(axis=-1))
-    background_term = 1 - np.exp(-(.5 * np.square(S / gamma)))
+    S = xp.sqrt(xp.square(eigvals).sum(axis=-1))
+    background_term = 1 - xp.exp(-(.5 * xp.square(S / gamma)))
     
     Ra = divide_nonzero(L2, L3abs)
-    planar_term = np.exp(-(0.5 * np.square(Ra / beta1)))
+    planar_term = xp.exp(-(0.5 * xp.square(Ra / beta1)))
     
-    Rb = divide_nonzero(L1, np.sqrt(np.multiply(L2, L3abs)))
-    blob_term = np.exp(-(0.5 * np.square(Rb / beta2)))
+    Rb = divide_nonzero(L1, xp.sqrt(xp.multiply(L2, L3abs)))
+    blob_term = xp.exp(-(0.5 * xp.square(Rb / beta2)))
     
     ridges = background_term * planar_term * blob_term
     ridges[L3 > 0] = 0
@@ -202,11 +251,12 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
     Returns:
     - vesselness: 3D array representing vesselness probability at each voxel.
     """
+    xp, _ = get_backend(volume)
     joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
-    eigvals = LA.eigvalsh(joint_hessian, "U")
+    eigvals = compute_eigenvalues_3x3_batch(joint_hessian)
     # Sort eigenvalues by magnitude (ascending order)
-    idxs = np.argsort(np.abs(eigvals), axis=-1)
-    eigvals = np.take_along_axis(eigvals, idxs, axis=-1)
+    idxs = xp.argsort(xp.abs(eigvals), axis=-1)
+    eigvals = xp.take_along_axis(eigvals, idxs, axis=-1)
     eigvals[zero_mask, :] = 0  # Ignore zero regions
 
     # Extract eigenvalues
@@ -215,14 +265,14 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
     L3 = eigvals[:, :, :, 2]
 
     # Compute terms for Frangi filter
-    Ra = divide_nonzero(np.abs(L2), np.abs(L3))  # Tubularity ratio
-    Rb = divide_nonzero(np.abs(L1), np.sqrt(np.abs(L2 * L3)))  # Blobness ratio
-    S = np.sqrt(np.square(eigvals).sum(axis=-1))  # Frobenius norm
+    Ra = divide_nonzero(xp.abs(L2), xp.abs(L3))  # Tubularity ratio
+    Rb = divide_nonzero(xp.abs(L1), xp.sqrt(xp.abs(L2 * L3)))  # Blobness ratio
+    S = xp.sqrt(xp.square(eigvals).sum(axis=-1))  # Frobenius norm
 
     # Frangi vesselness components
-    planar_term = 1 - np.exp(-0.5 * np.square(Ra / beta1))
-    blob_term = np.exp(-0.5 * np.square(Rb / beta2))
-    background_term = 1 - np.exp(-0.5 * np.square(S / gamma))
+    planar_term = 1 - xp.exp(-0.5 * xp.square(Ra / beta1))
+    blob_term = xp.exp(-0.5 * xp.square(Rb / beta2))
+    background_term = 1 - xp.exp(-0.5 * xp.square(S / gamma))
 
     # Combine terms
     vesselness = background_term * planar_term * blob_term
