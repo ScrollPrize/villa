@@ -31,22 +31,22 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
 # PHercParis4
-dataset_path = '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-05-28'
+dataset_path = '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-06-02'
 scroll_zarr_path = None
-normal_nx_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NX_ZARR_PATH')
-normal_ny_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NY_ZARR_PATH')
-normal_zarr_group = os.environ.get('FIT_SPIRAL_NORMAL_ZARR_GROUP', '4')
+normal_nx_zarr_path = f'{dataset_path}/normals/las_008_nx.ome.zarr'
+normal_ny_zarr_path = f'{dataset_path}/normals/las_008_ny.ome.zarr'
+normal_zarr_group = '4'
 pcl_json_paths = [
     f'{dataset_path}/s1_relative_windings_fixed.json',
     f'{dataset_path}/same_winding_annotations_fixed_merged.json',
 ]
 patches_path = f'{dataset_path}/patches'
 shell_path = f'{dataset_path}/s1_outer_shell'
-tracks_dbm_path = None
+tracks_dbm_path = '/home/paul/projects/vesuvius-scrolls/spiral/tracks/2um_ds2_ps256_surf_10-13K_ds4.dbm'
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 6000, 16000
+z_begin, z_end = 10000, 13000
 voxel_size_um = 2.4 * 4  # before downsampling
 
 # # PHerc0172
@@ -107,14 +107,14 @@ default_config = {
     'dense_normals_num_points': 20_000,
     'regularisation_num_points': 1500,
     'patch_stretch_loss_norm': 'L2',
-    'loss_weight_patch_radius': 32.e0,
+    'loss_weight_patch_radius': 0.e0,
     'loss_weight_uv_distance': 0.,
-    'loss_weight_patch_dt': 16.e0,
-    'loss_weight_winding_number': 20.,
+    'loss_weight_patch_dt': 0.e0,
+    'loss_weight_winding_number': 0.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
-    'loss_weight_track_radius': 0.,
-    'loss_weight_track_dt': 0.,
+    'loss_weight_track_radius': 50.,
+    'loss_weight_track_dt': 20.,
     'loss_weight_patch_stretch': 0.0,
     'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
