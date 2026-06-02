@@ -3214,6 +3214,7 @@ def save_overlay(
     unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
     umbilicus_zyx, z_to_umbilicus_yx,
     winding_range,
+    tracks,
     out_path, suffix
 ):
 
@@ -3341,21 +3342,23 @@ def save_overlay(
                         )
         canvas.save(f'{out_path}/spiral_on_{name}_{suffix}.png', compress_level=3)
 
+    dr_per_winding = spiral_and_transform.get_dr_per_winding()
     for vis_slice_idx, slice_z in enumerate(tqdm(zs_for_visualisation, desc='visualising slices')):
-        slice_zyx = torch.cat([torch.full([*slice_yx.shape[:2], 1], slice_z, device=device), slice_yx], dim=-1)
-
-        slice_zyx_flat = slice_zyx.reshape(-1, 3)
-        chunk = 65536
-        spiral_pieces = []
-        for start in range(0, slice_zyx_flat.shape[0], chunk):
-            spiral_pieces.append(slice_to_spiral_transform(slice_zyx_flat[start:start + chunk]))
-        spiral_zyx = torch.cat(spiral_pieces, dim=0).reshape(*slice_zyx.shape)
-        spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx, winding_range=winding_range)
+        spiral_zyx, spiral_density = _rasterize_spiral_for_slice(
+            spiral_and_transform, slice_to_spiral_transform, slice_yx, slice_z, winding_range,
+        )
         slice = scroll_slices_for_visualisation[vis_slice_idx].to(device)
         # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
         overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
+        if tracks:
+            _render_spiral_on_tracks_for_slice(
+                spiral_zyx, spiral_density, dr_per_winding,
+                slice_z, tracks, [],
+                out_path, suffix,
+            )
         if os.environ.get('FIT_SPIRAL_SAVE_DISPLACEMENT') == '1':
+            slice_zyx = torch.cat([torch.full([*slice_yx.shape[:2], 1], slice_z, device=device), slice_yx], dim=-1)
             visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
 
 
@@ -3531,29 +3534,32 @@ def _build_snap_track_set(slice_to_spiral_transform, dr_per_winding, tracks, dev
 
 
 @torch.no_grad()
-def save_snapping_tracks_overlay(
-    spiral_and_transform,
-    slice_yx,
-    zs_for_visualisation,
-    all_tracks,
-    snapped_tracks,
-    patches_list,
-    unattached_pcl_strips,
-    out_path,
-    snap_iter,
-):
-    # Render one image per visualisation slice showing the transformed spiral
-    # density (per-winding hued, mirroring save_overlay) with every track point
-    # within a narrow z slab around the slice drawn on top; points from tracks in
-    # `snapped_tracks` are drawn in a different colour so it's easy to see which
-    # tracks are currently being snapped to.
+def _rasterize_spiral_for_slice(spiral_and_transform, slice_to_spiral_transform, slice_yx, slice_z, winding_range):
+    # Transform a full slice from scroll into spiral space (in chunks to bound peak VRAM)
+    # and evaluate the per-winding spiral density there. Returns (spiral_zyx, spiral_density).
     device = slice_yx.device
-    slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
-    dr_per_winding = spiral_and_transform.get_dr_per_winding()
-    winding_range, _, _ = _compute_winding_range_and_input_extents(
-        slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
-    )
+    slice_zyx = torch.cat([
+        torch.full([*slice_yx.shape[:2], 1], float(slice_z), device=device),
+        slice_yx,
+    ], dim=-1)
+    slice_zyx_flat = slice_zyx.reshape(-1, 3)
+    chunk = 65536
+    spiral_pieces = []
+    for start in range(0, slice_zyx_flat.shape[0], chunk):
+        spiral_pieces.append(slice_to_spiral_transform(slice_zyx_flat[start:start + chunk]))
+    spiral_zyx = torch.cat(spiral_pieces, dim=0).reshape(*slice_zyx.shape)
+    spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx, winding_range=winding_range)
+    return spiral_zyx, spiral_density
 
+
+def _render_spiral_on_tracks_for_slice(
+    spiral_zyx, spiral_density, dr_per_winding,
+    slice_z, all_tracks, snapped_tracks,
+    out_path, name_suffix,
+):
+    # Per-slice render of the spiral density (per-winding hued) with track points within
+    # a narrow z slab drawn on top; points from tracks in `snapped_tracks` use a brighter
+    # palette so it's easy to see which tracks are currently being snapped to.
     z_window = 5
     point_radius = 1
     target_ids = {id(t) for t in snapped_tracks}
@@ -3566,49 +3572,59 @@ def save_snapping_tracks_overlay(
         r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
         return (int(r * 255), int(g * 255), int(b * 255))
 
-    chunk = 65536
-    for vis_slice_idx, slice_z in enumerate(zs_for_visualisation):
-        slice_zyx = torch.cat([
-            torch.full([*slice_yx.shape[:2], 1], float(slice_z), device=device),
-            slice_yx,
-        ], dim=-1)
-        slice_zyx_flat = slice_zyx.reshape(-1, 3)
-        spiral_pieces = []
-        for start in range(0, slice_zyx_flat.shape[0], chunk):
-            spiral_pieces.append(slice_to_spiral_transform(slice_zyx_flat[start:start + chunk]))
-        spiral_zyx = torch.cat(spiral_pieces, dim=0).reshape(*slice_zyx.shape)
-        spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx, winding_range=winding_range)
+    _, _, shifted_radius = get_theta_and_radii(spiral_zyx[..., 1:], dr_per_winding)
+    winding_idx = (shifted_radius / dr_per_winding).round().to(torch.int64).clamp_min(0)
+    num_winding_hues = 6
+    hue_min, hue_max = 1.5 / 6, 5.25 / 6
+    hue_fraction = hue_min + (winding_idx % num_winding_hues).to(torch.float32) / num_winding_hues * (hue_max - hue_min)
+    hue = hue_fraction * 2 * np.pi
+    hsv = torch.stack([hue, torch.full_like(hue, 0.5), torch.ones_like(hue)])
+    spiral_colours = kornia.color.hsv_to_rgb(hsv).permute(1, 2, 0) * 255
+    canvas = (spiral_colours * spiral_density[..., None]).to(torch.uint8).cpu().numpy()
+    image = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(image)
 
-        _, _, shifted_radius = get_theta_and_radii(spiral_zyx[..., 1:], dr_per_winding)
-        winding_idx = (shifted_radius / dr_per_winding).round().to(torch.int64).clamp_min(0)
-        num_winding_hues = 6
-        hue_min, hue_max = 1.5 / 6, 5.25 / 6
-        hue_fraction = hue_min + (winding_idx % num_winding_hues).to(torch.float32) / num_winding_hues * (hue_max - hue_min)
-        hue = hue_fraction * 2 * np.pi
-        hsv = torch.stack([hue, torch.full_like(hue, 0.5), torch.ones_like(hue)])
-        spiral_colours = kornia.color.hsv_to_rgb(hsv).permute(1, 2, 0) * 255
-        canvas = (spiral_colours * spiral_density[..., None]).to(torch.uint8).cpu().numpy()
-        image = Image.fromarray(canvas)
-        draw = ImageDraw.Draw(image)
+    # Draw non-target tracks first so target tracks paint on top.
+    for is_target in (False, True):
+        for track in all_tracks:
+            if (id(track) in target_ids) != is_target:
+                continue
+            zs = track[:, 0]
+            in_slab = np.abs(zs.astype(np.float32) - float(slice_z)) <= z_window
+            if not in_slab.any():
+                continue
+            colour = track_colour(track, is_target)
+            for idx in np.nonzero(in_slab)[0]:
+                y = float(track[idx, 1])
+                x = float(track[idx, 2])
+                draw.ellipse(
+                    [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
+                    fill=colour,
+                )
+    image.save(f'{out_path}/spiral_on_tracks_s{int(slice_z) * downsample_factor:05}_{name_suffix}.png', compress_level=3)
 
-        # Draw non-target tracks first so target tracks paint on top.
-        for is_target in (False, True):
-            for track in all_tracks:
-                if (id(track) in target_ids) != is_target:
-                    continue
-                zs = track[:, 0]
-                in_slab = np.abs(zs.astype(np.float32) - float(slice_z)) <= z_window
-                if not in_slab.any():
-                    continue
-                colour = track_colour(track, is_target)
-                for idx in np.nonzero(in_slab)[0]:
-                    y = float(track[idx, 1])
-                    x = float(track[idx, 2])
-                    draw.ellipse(
-                        [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
-                        fill=colour,
-                    )
-        image.save(f'{out_path}/snap_tracks_s{int(slice_z) * downsample_factor:05}_iter{snap_iter:04}.png', compress_level=3)
+
+def save_spiral_on_tracks_overlay(
+    spiral_and_transform,
+    slice_yx,
+    zs_for_visualisation,
+    all_tracks,
+    snapped_tracks,
+    winding_range,
+    out_path,
+    name_suffix,
+):
+    slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
+    dr_per_winding = spiral_and_transform.get_dr_per_winding()
+    for slice_z in zs_for_visualisation:
+        spiral_zyx, spiral_density = _rasterize_spiral_for_slice(
+            spiral_and_transform, slice_to_spiral_transform, slice_yx, slice_z, winding_range,
+        )
+        _render_spiral_on_tracks_for_slice(
+            spiral_zyx, spiral_density, dr_per_winding,
+            slice_z, all_tracks, snapped_tracks,
+            out_path, name_suffix,
+        )
 
 
 def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, tracks, pcl_normal_samples, dense_normal_volume, shell_patch, z_to_umbilicus_yx, out_path):
@@ -3834,6 +3850,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
                 umbilicus_zyx, z_to_umbilicus_yx,
                 winding_range,
+                tracks,
                 out_path, suffix
             )
         if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
@@ -4027,16 +4044,18 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             num_points = 0 if snap_track_scroll is None else snap_track_scroll.shape[0]
             print(f'snap iter {snap_iter}: working set has {num_partial} tracks ({num_points} points); discarded {num_below} below and {num_above} above satisfaction thresholds')
             if os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
-                save_snapping_tracks_overlay(
+                snap_winding_range, _, _ = _compute_winding_range_and_input_extents(
+                    slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
+                )
+                save_spiral_on_tracks_overlay(
                     spiral_and_transform,
                     slice_yx,
                     zs_for_visualisation,
                     tracks,
                     snap_target_tracks,
-                    patches_list,
-                    unattached_pcl_strips,
+                    snap_winding_range,
                     out_path,
-                    snap_iter,
+                    f'iter{snap_iter:04}',
                 )
 
             for inner_iter in range(steps_per_subpass):
@@ -4114,9 +4133,10 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 pbar.update(1)
         pbar.close()
 
-    suffix = 'snapped'
-    save_model(suffix)
-    save_overlay_and_print_satisfaction(suffix)
+    if num_subpasses > 0:
+        suffix = 'snapped'
+        save_model(suffix)
+        save_overlay_and_print_satisfaction(suffix)
 
 
 def load_patches(patches_path, segment_id_filter=lambda s: True):
