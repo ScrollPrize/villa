@@ -2948,7 +2948,7 @@ def _rasterize_triangles_into_mesh(
 
 
 @torch.inference_mode
-def _build_snapped_overlay(
+def _build_spliced_overlay(
     scroll_zyxs,  # (num_zs, total_thetas, 3) — modified in place
     num_thetas_by_winding,  # list[int]
     z0,  # scalar — spiral z corresponding to scroll_zyxs[0]
@@ -3082,15 +3082,15 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl
         scroll_pieces.append(slice_to_spiral_transform.inv(flat_spiral_zyxs[start : start + chunk]))
     scroll_zyxs = torch.cat(scroll_pieces, dim=0).reshape(*spiral_zyxs.shape)
 
-    # Snapped variant: replace cells covered by quads of overall- or boundary-satisfied
+    # Spliced variant: replace cells covered by quads of overall- or boundary-satisfied
     # patches with patch-derived points, interpolated bilinearly across each quad in the
     # flattened-spiral UV coords of its target winding.
-    snapped_scroll_zyxs = scroll_zyxs.clone()
+    spliced_scroll_zyxs = scroll_zyxs.clone()
     satisfied_patches, _, _, _, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
         slice_to_spiral_transform, dr_per_winding, patches,
     )
-    _build_snapped_overlay(
-        snapped_scroll_zyxs, num_thetas_by_winding, z0, grid_spacing,
+    _build_spliced_overlay(
+        spliced_scroll_zyxs, num_thetas_by_winding, z0, grid_spacing,
         slice_to_spiral_transform, dr_per_winding,
         patches,
         satisfied_patches, boundary_satisfied_patches, target_winding_idx_per_patch,
@@ -3099,7 +3099,7 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl
     step_size = grid_spacing * downsample_factor
     out_dir = f'{out_path}/meshes/{name}'
     os.makedirs(out_dir, exist_ok=True)
-    for uuid_suffix, variant_zyxs in [('', scroll_zyxs), ('_snapped', snapped_scroll_zyxs)]:
+    for uuid_suffix, variant_zyxs in [('', scroll_zyxs), ('_spliced', spliced_scroll_zyxs)]:
         offset = 0
         for winding_idx, num_thetas in enumerate(tqdm(num_thetas_by_winding, desc=f'saving winding patches ({name}{uuid_suffix})')):
             if num_thetas >= 2 and winding_idx >= min_winding_idx:
