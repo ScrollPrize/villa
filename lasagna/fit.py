@@ -494,7 +494,7 @@ def _derive_corr_point_roi_init(
 		"model_w": float(model_w),
 		"model_h": float(model_h),
 		"model_w_unit": "voxels",
-		"windings": 1,
+		"depth": 1,
 		"parsed_point_count": int(corr_points.points_xyz_winda.shape[0]),
 		"initial_usable_point_count": int(len(projections0)),
 		"initial_skipped_point_count": int(len(skipped0)),
@@ -742,10 +742,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def _fit_config_args_from_namespace(args: argparse.Namespace) -> dict[str, object]:
 	out: dict[str, object] = {}
 	for k, v in vars(args).items():
-		if k == "windings":
-			continue
 		out[k.replace("_", "-")] = v
 	return out
+
+
+def _reject_removed_windings_arg(args_cfg: dict | None) -> None:
+	if isinstance(args_cfg, dict) and "windings" in args_cfg:
+		raise ValueError("args.windings has been removed; use args.depth")
 
 
 def _validate_self_map_init_args(
@@ -1137,6 +1140,7 @@ def main(argv: list[str] | None = None) -> int:
 	model_cfg = cli_model.from_args(args)
 	requested_model_depth = int(model_cfg.depth)
 	args_cfg = cfg.get("args") if isinstance(cfg.get("args"), dict) else None
+	_reject_removed_windings_arg(args_cfg)
 	grow_enabled = _raw_init_grow_enabled(args_cfg)
 	grow_initial_depth = _raw_init_grow_initial_depth(args_cfg) if grow_enabled else requested_model_depth
 	grow_stage_depth_delta = _init_grow_stage_depth_delta(cfg) if grow_enabled else 0
@@ -1149,9 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
 		target_depth=final_model_depth,
 	)
 	# Merge final parsed args into fit_config so checkpoint has all values.
-	# depth is canonical; legacy args.windings is accepted only as an input alias.
 	fit_config.setdefault("args", {}).update(_fit_config_args_from_namespace(args))
-	fit_config["args"].pop("windings", None)
 	opt_cfg = cli_opt.from_args(args)
 	progress_enabled = bool(args.progress)
 	_out_dir = args.out_dir
@@ -1368,7 +1370,6 @@ def main(argv: list[str] | None = None) -> int:
 			model_w=corr_point_roi_init.model_w,
 			model_w_unit="voxels",
 			model_h=corr_point_roi_init.model_h,
-			windings=1,
 		)
 		model_cfg = dataclasses.replace(model_cfg, depth=1, pyramid_d=False)
 		fit_config.setdefault("args", {}).update({
@@ -1379,7 +1380,6 @@ def main(argv: list[str] | None = None) -> int:
 			"model-w": float(corr_point_roi_init.model_w),
 			"model-w-unit": "voxels",
 			"model-h": float(corr_point_roi_init.model_h),
-			"windings": 1,
 			"depth": 1,
 			"pyramid-d": False,
 		})

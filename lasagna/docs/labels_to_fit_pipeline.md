@@ -106,6 +106,6 @@ Optional flags: `--slices` (default: xy xz yz), `--channels` (default: cos pred_
 
 - `--seed`: center of the region to fit, in full-resolution voxel coordinates.
 - `--model-w`, `--model-h`: mesh dimensions in fullres voxels.
-- `--depth`: number of sheet windings / model depth layers to model (`--windings` is a legacy alias).
+- `--depth`: number of sheet windings / model depth layers to model.
 - `--device`: compute device (default cpu, use `cuda` for GPU).
 - `--downscale`: should match `--step` from preprocessing (default 4).

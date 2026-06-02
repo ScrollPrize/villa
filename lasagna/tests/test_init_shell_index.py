@@ -275,7 +275,7 @@ class InitShellCropTest(unittest.TestCase):
 
 		self.assertEqual(roi.payload["usable_point_count"], 3)
 		self.assertEqual(roi.payload["projection_mode"], "normal-line")
-		self.assertEqual(roi.payload["windings"], 1)
+		self.assertEqual(roi.payload["depth"], 1)
 		self.assertAlmostEqual(roi.payload["projected_h_span_grid"], 1.0, delta=1.0e-3)
 		self.assertAlmostEqual(roi.payload["projected_w_span_grid"], 8.0, delta=1.0e-3)
 		self.assertAlmostEqual(roi.model_h, 50.0, delta=1.0e-3)

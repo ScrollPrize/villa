@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 TEST_DIR = os.path.dirname(__file__)
@@ -10,6 +12,7 @@ if TEST_DIR not in sys.path:
 
 import fit
 import cli_json
+import cli_data
 import cli_model
 
 
@@ -34,19 +37,37 @@ class FitSelfMapInitTest(unittest.TestCase):
 		)
 		self.assertEqual(mode, "multi_wrap_full")
 
-	def test_json_windings_alias_sets_model_depth(self) -> None:
-		model_cfg = self._model_cfg_from_json_args({"windings": 1})
+	def test_parser_rejects_windings_cli_arg(self) -> None:
+		parser = fit._build_parser()
 
-		self.assertEqual(model_cfg.depth, 1)
+		with self.assertRaises(SystemExit):
+			parser.parse_args(["--windings", "1"])
 
-	def test_json_depth_and_windings_match_sets_model_depth(self) -> None:
-		model_cfg = self._model_cfg_from_json_args({"depth": 1, "windings": 1})
+	def test_json_windings_arg_is_removed(self) -> None:
+		with self.assertRaisesRegex(ValueError, "args.windings has been removed"):
+			fit._reject_removed_windings_arg({"windings": 1})
 
-		self.assertEqual(model_cfg.depth, 1)
+	def test_fit_main_rejects_json_windings_arg(self) -> None:
+		with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as f:
+			json.dump({"args": {"input": "/tmp/volume.zarr", "device": "cpu", "windings": 1}}, f)
+			f.flush()
+			with self.assertRaisesRegex(ValueError, "args.windings has been removed"):
+				fit.main([f.name])
 
-	def test_json_depth_and_windings_mismatch_is_clear_error(self) -> None:
-		with self.assertRaisesRegex(ValueError, "args.depth and args.windings must match"):
-			self._model_cfg_from_json_args({"depth": 3, "windings": 1})
+	def test_cli_data_from_merged_parser_does_not_own_depth(self) -> None:
+		parser = fit._build_parser()
+		cli_json.apply_defaults_from_cfg_args(
+			parser,
+			{"args": {"input": "/tmp/volume.zarr", "device": "cpu", "depth": 2}},
+		)
+		args = parser.parse_args([])
+
+		model_cfg = cli_model.from_args(args)
+		data_cfg = cli_data.from_args(args)
+
+		self.assertEqual(model_cfg.depth, 2)
+		self.assertFalse(hasattr(data_cfg, "depth"))
+		self.assertFalse(hasattr(data_cfg, "windings"))
 
 	def test_multi_wrap_full_accepts_single_depth_wide_wrap_crop(self) -> None:
 		mode = fit._validate_self_map_init_args(

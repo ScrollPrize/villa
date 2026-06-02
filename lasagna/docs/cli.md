@@ -21,7 +21,6 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--winding-step` (default 25) radial step per winding
   - `--mesh-h`, `--mesh-w` mesh grid dimensions
   - `--depth` number of windings / model depth layers
-  - `--windings` legacy alias for `--depth`
   - `--subsample-mesh`, `--subsample-winding` HR subsampling factors (default 4)
   - `--model-input`, `--model-output` checkpoint paths
   - `--init-mode` (`arc` or `straight`)

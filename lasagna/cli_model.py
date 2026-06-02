@@ -28,8 +28,6 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--subsample-winding", type=int, default=4)
 	g.add_argument("--depth", type=int, default=None,
 		help="Number of windings / model depth layers")
-	g.add_argument("--windings", type=int, default=None,
-		help="Alias for --depth")
 	g.add_argument("--mesh-h", type=int, default=32)
 	g.add_argument("--mesh-w", type=int, default=32)
 	g.add_argument("--init-mode", default="cylinder_seed", choices=["cylinder_seed", "shell-dir-crop"])
@@ -41,12 +39,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 
 def _resolved_depth(args: argparse.Namespace) -> int:
 	depth_raw = getattr(args, "depth", None)
-	windings_raw = getattr(args, "windings", None)
 	depth = None if depth_raw is None else int(depth_raw)
-	windings = None if windings_raw is None else int(windings_raw)
-	if depth is not None and windings is not None and depth != windings:
-		raise ValueError("args.depth and args.windings must match")
-	resolved = depth if depth is not None else windings
+	resolved = depth
 	if resolved is None:
 		resolved = 3
 	resolved = max(1, int(resolved))

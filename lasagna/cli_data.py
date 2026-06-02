@@ -18,7 +18,6 @@ class DataConfig:
 	model_w: float | None                                # model width value
 	model_w_unit: str                                    # "voxels" or "wraps"
 	model_h: float | None                                # model height in fullres voxels
-	windings: int | None                                 # number of windings
 	winding_volume: str | None                           # path to winding volume zarr
 	cuda_gridsample: bool                                # use custom CUDA uint8 grid_sample kernel
 	erode_valid_mask: int                                # erode grad_mag validity mask by N voxels
@@ -77,7 +76,6 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 	model_w = None if getattr(args, "model_w", None) is None else float(args.model_w)
 	model_w_unit = str(getattr(args, "model_w_unit", "voxels"))
 	model_h = None if getattr(args, "model_h", None) is None else float(args.model_h)
-	windings = None if getattr(args, "windings", None) is None else int(args.windings)
 	winding_volume = getattr(args, "winding_volume", None)
 	if winding_volume is not None:
 		winding_volume = str(winding_volume)

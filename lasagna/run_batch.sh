@@ -136,7 +136,7 @@ run_sample() {
         --input "${outdir}/normals.zarr" \
         --seed 150 150 150 \
         --model-w 1000 --model-h 1000 \
-        --windings 20 \
+        --depth 20 \
         --out-dir "${outdir}/fit_output" \
         --model-output "${outdir}/fit_output/model.pt" \
         --winding-volume "${outdir}/winding.zarr" \
