@@ -362,3 +362,85 @@ def detect_edges(volume, filter):
 
     
     return first_derivative, det, gradient
+
+def detect_ridges_tiled(volume, block_size=128, halo=16, **kwargs):
+    """
+    Run detect_ridges in blocks to fit in GPU memory.
+    """
+    xp, _ = get_backend(volume)
+    Z, Y, X = volume.shape
+    result = xp.zeros((Z, Y, X), dtype=volume.dtype)
+    
+    for z in range(0, Z, block_size):
+        for y in range(0, Y, block_size):
+            for x in range(0, X, block_size):
+                # Calculate coordinates with halo
+                z0, z1 = max(0, z - halo), min(Z, z + block_size + halo)
+                y0, y1 = max(0, y - halo), min(Y, y + block_size + halo)
+                x0, x1 = max(0, x - halo), min(X, x + block_size + halo)
+                
+                # Extract block
+                block = volume[z0:z1, y0:y1, x0:x1]
+                
+                # Process block
+                block_res = detect_ridges(block, **kwargs)
+                
+                # Calculate crop boundaries
+                bz0 = z - z0
+                bz1 = bz0 + min(block_size, Z - z)
+                by0 = y - y0
+                by1 = by0 + min(block_size, Y - y)
+                bx0 = x - x0
+                bx1 = bx0 + min(block_size, X - x)
+                
+                # Write back
+                result[z:z+bz1-bz0, y:y+by1-by0, x:x+bx1-bx0] = block_res[bz0:bz1, by0:by1, bx0:bx1]
+                
+                # Free memory aggressively inside loop if using CuPy
+                if HAS_CUPY and isinstance(volume, cp.ndarray):
+                    del block
+                    del block_res
+                    cp.get_default_memory_pool().free_all_blocks()
+                
+    return result
+
+def detect_vesselness_tiled(volume, block_size=128, halo=16, **kwargs):
+    """
+    Run detect_vesselness in blocks to fit in GPU memory.
+    """
+    xp, _ = get_backend(volume)
+    Z, Y, X = volume.shape
+    result = xp.zeros((Z, Y, X), dtype=volume.dtype)
+    
+    for z in range(0, Z, block_size):
+        for y in range(0, Y, block_size):
+            for x in range(0, X, block_size):
+                # Calculate coordinates with halo
+                z0, z1 = max(0, z - halo), min(Z, z + block_size + halo)
+                y0, y1 = max(0, y - halo), min(Y, y + block_size + halo)
+                x0, x1 = max(0, x - halo), min(X, x + block_size + halo)
+                
+                # Extract block
+                block = volume[z0:z1, y0:y1, x0:x1]
+                
+                # Process block
+                block_res = detect_vesselness(block, **kwargs)
+                
+                # Calculate crop boundaries
+                bz0 = z - z0
+                bz1 = bz0 + min(block_size, Z - z)
+                by0 = y - y0
+                by1 = by0 + min(block_size, Y - y)
+                bx0 = x - x0
+                bx1 = bx0 + min(block_size, X - x)
+                
+                # Write back
+                result[z:z+bz1-bz0, y:y+by1-by0, x:x+bx1-bx0] = block_res[bz0:bz1, by0:by1, bx0:bx1]
+                
+                # Free memory aggressively inside loop if using CuPy
+                if HAS_CUPY and isinstance(volume, cp.ndarray):
+                    del block
+                    del block_res
+                    cp.get_default_memory_pool().free_all_blocks()
+                
+    return result
