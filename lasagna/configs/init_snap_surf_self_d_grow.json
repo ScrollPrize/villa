@@ -1,0 +1,68 @@
+{
+	"args": {
+		"model-init": "seed",
+		"init-mode": "shell-dir-crop",
+		"self-map-init": "multi_wrap_d",
+		"mesh-step": 50.0,
+		"init-grow": {
+			"enabled": true,
+			"initial_depth": 1,
+			"order": ["up"],
+			"step": 1
+		}
+	},
+	"base": {
+		"step": 10.0,
+		"smooth": 10.0,
+		"station_n": 1.0,
+		"station_t": 1.0,
+		"pred_dt": 0.0,
+		"bend": 100.0,
+		"snap_surf_map": 0.1,
+		"map_dist": 0.0001
+	},
+	"stages": [
+		{
+			"name": "init_center",
+			"steps": 500,
+			"lr": 10.0,
+			"params": ["mesh_ms"],
+			"w_fac": {
+				"snap_surf_map": 0.0
+			},
+			"args": {
+				"status_interval": 50
+			}
+		},
+		{
+			"name": "expand-z",
+			"stages": [
+				{
+					"name": "expand_up",
+					"steps": "auto",
+					"lr": 0.1,
+					"params": ["mesh_ms"],
+					"w_fac": {
+						"station_n": 0.0,
+						"station_t": 0.0001
+					},
+					"args": {
+						"status_interval": 50,
+						"snap_surf_map": {
+							"map_opt": {
+								"name": "expand_boundary_map",
+								"steps": 1,
+								"lr": 0.01,
+								"params": ["map_surf_ms"],
+								"args": {
+									"subdiv": 1,
+									"debug_obj_dir": "snap_surf_objs"
+								}
+							}
+						}
+					}
+				}
+			]
+		}
+	]
+}
