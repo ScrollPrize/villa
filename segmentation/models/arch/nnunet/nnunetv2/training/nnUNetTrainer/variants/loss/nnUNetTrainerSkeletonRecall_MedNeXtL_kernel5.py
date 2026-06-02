@@ -107,6 +107,46 @@ class _MedNeXtSkeletonRecallTrainer(nnUNetTrainerSkeletonRecall):
             mod = mod._orig_mod
         mod.do_ds = enabled
 
+    @staticmethod
+    def _build_mednext(
+        kernel_size: int,
+        num_input_channels: int,
+        num_output_channels: int,
+        enable_deep_supervision: bool,
+    ) -> nn.Module:
+        """Build MedNeXt-L with the deep-supervision heads ALWAYS constructed.
+
+        MedNeXt only registers its ``out_1``..``out_4`` deep-supervision heads when
+        it is constructed with ``deep_supervision=True`` (``out_0`` is always
+        present). nnU-Net's inference path (``predict_from_raw_data``) rebuilds the
+        network with ``enable_deep_supervision=False`` and then strict-loads a
+        checkpoint that was trained WITH deep supervision, so a ``False`` build is
+        missing those head weights and ``load_state_dict`` fails on unexpected
+        ``out_*`` keys. We therefore always construct the heads and use ``do_ds``
+        (set here, toggled by ``set_deep_supervision_enabled``) to select single-
+        vs deep-supervision output, so both kernel sizes load for inference.
+
+        Channel/block schedule matches ``nnUNetTrainerV2_MedNeXt_L_kernel5`` from the
+        upstream MedNeXt repo. nnUNetv2's deep_supervision_scales for a 5-pool 3D
+        U-Net is 5 levels (full, /2, /4, /8, /16); MedNeXt returns exactly that list
+        shape with ``output[0]`` = full resolution.
+        """
+        MedNeXt = _load_mednext()
+        network = MedNeXt(
+            in_channels=num_input_channels,
+            n_channels=32,
+            n_classes=num_output_channels,
+            exp_r=[3, 4, 8, 8, 8, 8, 8, 4, 3],
+            kernel_size=kernel_size,
+            deep_supervision=True,
+            do_res=True,
+            do_res_up_down=True,
+            block_counts=[3, 4, 8, 8, 8, 8, 8, 4, 3],
+            checkpoint_style="outside_block",
+        )
+        network.do_ds = enable_deep_supervision
+        return network
+
 
 class nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5(_MedNeXtSkeletonRecallTrainer):
     """MedNeXt-L kernel5 architecture + SkeletonRecall loss."""
@@ -120,25 +160,10 @@ class nnUNetTrainerSkeletonRecall_MedNeXtL_kernel5(_MedNeXtSkeletonRecallTrainer
         num_output_channels: int,
         enable_deep_supervision: bool = True,
     ) -> nn.Module:
-        """Match ``nnUNetTrainerV2_MedNeXt_L_kernel5.initialize_network()`` from mednextv1.
-
-        nnUNetv2's deep_supervision_scales for a 5-pool 3D U-Net is 5 levels
-        (full, /2, /4, /8, /16). MedNeXt with these settings returns exactly
-        that list shape, with ``output[0]`` = full resolution.
-        """
-        MedNeXt = _load_mednext()
-        return MedNeXt(
-            in_channels=num_input_channels,
-            n_channels=32,
-            n_classes=num_output_channels,
-            exp_r=[3, 4, 8, 8, 8, 8, 8, 4, 3],
-            kernel_size=5,
-            deep_supervision=enable_deep_supervision,
-            do_res=True,
-            do_res_up_down=True,
-            block_counts=[3, 4, 8, 8, 8, 8, 8, 4, 3],
-            checkpoint_style="outside_block",
-        )
+        """MedNeXt-L, kernel size 5. See ``_build_mednext`` for the deep-supervision
+        head handling that lets a trained checkpoint load on the inference path."""
+        return _MedNeXtSkeletonRecallTrainer._build_mednext(
+            5, num_input_channels, num_output_channels, enable_deep_supervision)
 
 
 class nnUNetTrainerSkeletonRecall_MedNeXtL_kernel3(_MedNeXtSkeletonRecallTrainer):
@@ -155,16 +180,6 @@ class nnUNetTrainerSkeletonRecall_MedNeXtL_kernel3(_MedNeXtSkeletonRecallTrainer
         num_output_channels: int,
         enable_deep_supervision: bool = True,
     ) -> nn.Module:
-        MedNeXt = _load_mednext()
-        return MedNeXt(
-            in_channels=num_input_channels,
-            n_channels=32,
-            n_classes=num_output_channels,
-            exp_r=[3, 4, 8, 8, 8, 8, 8, 4, 3],
-            kernel_size=3,
-            deep_supervision=enable_deep_supervision,
-            do_res=True,
-            do_res_up_down=True,
-            block_counts=[3, 4, 8, 8, 8, 8, 8, 4, 3],
-            checkpoint_style="outside_block",
-        )
+        """MedNeXt-L, kernel size 3 (VRAM fallback). See ``_build_mednext``."""
+        return _MedNeXtSkeletonRecallTrainer._build_mednext(
+            3, num_input_channels, num_output_channels, enable_deep_supervision)
