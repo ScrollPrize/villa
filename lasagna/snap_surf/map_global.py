@@ -483,6 +483,17 @@ def self_map_pair_depths(mode: str, direction: str, depth: int) -> tuple[list[in
 	return list(range(1, D)), list(range(0, D - 1))
 
 
+def self_map_signed_offset(mode: str, direction: str, offset: float) -> float:
+	mode_i = normalize_self_map_init(mode)
+	if mode_i == "off":
+		return 0.0
+	direction_i = str(direction).strip().lower()
+	if direction_i not in SELF_MAP_DIRECTIONS:
+		raise ValueError(f"invalid self-map direction '{direction}' (expected out or in)")
+	sign = 1.0 if direction_i == "out" else -1.0
+	return sign * float(offset)
+
+
 def self_map_initial_uv(
 	*,
 	mode: str,
@@ -4183,10 +4194,12 @@ class SelfMapRuntime:
 		**_unused,
 	) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], dict[str, float]]:
 		offset_f = float(offset)
-		mode_key = ("self_winding", offset_f)
+		signed_offset = self_map_signed_offset(self.mode, self.direction, offset_f)
+		mode_key = ("self_winding", offset_f, signed_offset)
 		if mode_key not in self._snap_loss_mode_printed:
 			print(
-				f"[snap_surf.map_global] self snap loss mode={self.mode}/{self.direction} offset={offset_f:.6g}",
+				f"[snap_surf.map_global] self snap loss mode={self.mode}/{self.direction} "
+				f"offset={offset_f:.6g} signed_offset={signed_offset:.6g}",
 				flush=True,
 			)
 			self._snap_loss_mode_printed.add(mode_key)
@@ -4206,7 +4219,7 @@ class SelfMapRuntime:
 			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
 		signed_vox = ((model_pos - source_xyz.detach()) * model_n.detach()).sum(dim=-1)
 		if data is None:
-			residual = signed_vox - signed_vox.new_tensor(offset_f)
+			residual = signed_vox - signed_vox.new_tensor(signed_offset)
 			valid_final = valid
 		else:
 			strip_samples_i = max(2, int(strip_samples))
@@ -4230,7 +4243,7 @@ class SelfMapRuntime:
 				strip_len = diff.square().sum(dim=-1).sqrt()
 				int_sign = torch.sign(((model_pos.detach() - source_xyz.detach()) * model_n.detach()).sum(dim=-1))
 				signed_windings = int_sign * strip_len * mean_grad
-				winding_err = signed_windings - signed_vox.new_tensor(offset_f)
+				winding_err = signed_windings - signed_vox.new_tensor(signed_offset)
 			valid_final = sample_valid & strip_valid
 			normal_residual = signed_vox * mean_grad
 			residual = normal_residual + (winding_err - normal_residual).detach()

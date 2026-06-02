@@ -448,6 +448,38 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertTrue(torch.allclose(loss_b, expected, atol=1.0e-6))
 		self.assertEqual(stats_b["snaps_map_snap_samples"], samples)
 
+	def test_self_map_in_direction_uses_negative_signed_offset(self) -> None:
+		D, H, W = 2, 4, 4
+		model_xyz = torch.stack([_plane_xyz(h=H, w=W, z=float(d)) for d in range(D)], dim=0)
+		model_normals = _normals_3d(D, H, W)
+		model_valid = torch.ones(D, H, W, dtype=torch.bool)
+
+		for data in (None, _constant_grad_data(1.0)):
+			loss_out, _lms_o, _masks_o, stats_out = SelfMapRuntime(
+				mode="multi_wrap_d",
+				direction="out",
+			).snap_loss(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				offset=1.0,
+				data=data,
+			)
+			loss_in, _lms_i, _masks_i, stats_in = SelfMapRuntime(
+				mode="multi_wrap_d",
+				direction="in",
+			).snap_loss(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				offset=1.0,
+				data=data,
+			)
+
+			self.assertLess(float(loss_out.detach()), 1.0e-6)
+			self.assertLess(float(loss_in.detach()), 1.0e-6)
+			self.assertEqual(stats_out["snaps_map_snap_samples"], stats_in["snaps_map_snap_samples"])
+
 	def test_runtime_map_init_keeps_z_lift_unless_disabled(self) -> None:
 		h, w = 5, 5
 		angles = torch.linspace(0.0, math.pi, w)

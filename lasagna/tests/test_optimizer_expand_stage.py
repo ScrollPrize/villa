@@ -178,16 +178,41 @@ class OptimizerExpandStageTest(unittest.TestCase):
 			stages=stages,
 			snapshot_interval=0,
 			snapshot_fn=lambda **_kw: None,
-			init_grow={"order": ("up",), "step": 1, "target_depth": 2},
+			init_grow={"order": ("up",), "step": 1, "target_depth": 3},
 			self_map_init="multi_wrap_d",
 		)
 
+		self.assertEqual(mdl.depth, 3)
 		state = getattr(mdl, "_snap_surf_map_state_for_save", None)
 		self.assertIsInstance(state, dict)
 		self.assertIn("out", state["self_maps"])
 		self.assertIn("in", state["self_maps"])
-		self.assertEqual(state["self_maps"]["out"]["map_uv_ms"][0].shape[0], 1)
-		self.assertEqual(state["self_maps"]["in"]["map_uv_ms"][0].shape[0], 1)
+		self.assertEqual(state["self_maps"]["out"]["map_uv_ms"][0].shape[0], 2)
+		self.assertEqual(state["self_maps"]["in"]["map_uv_ms"][0].shape[0], 2)
+		reopt_stages = optimizer.load_stages_cfg({
+			"base": {
+				"normal": 0.0,
+				"snap_surf_map": 0.1,
+			},
+			"stages": [
+				{
+					"name": "reopt",
+					"steps": 1,
+					"lr": 0.0,
+					"params": ["mesh_ms"],
+				}
+			],
+		})
+		optimizer.optimize(
+			model=mdl,
+			data=data,
+			stages=reopt_stages,
+			snapshot_interval=0,
+			snapshot_fn=lambda **_kw: None,
+			self_map_init="multi_wrap_d",
+			snap_surf_map_state=state,
+			require_snap_surf_map_state=True,
+		)
 
 	def test_self_d_snap_surf_maps_are_published_and_required_for_reopt(self) -> None:
 		device = torch.device("cpu")
