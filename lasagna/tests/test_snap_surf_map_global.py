@@ -1648,6 +1648,35 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			named = parse_global_map_config(path)
 			self.assertEqual(named.stages[0].name, "affine_init_scan")
 
+	def test_global_map_config_translates_lasagna_weight_aliases(self) -> None:
+		stage = GlobalMapStageConfig(params=("map_uv_ms",))
+		cfg = GlobalMapConfig(
+			base={
+				"map_dist": 0.0001,
+				"map_vec_normal": 2.0,
+				"map_surface_normal": 3.0,
+				"map_smooth": 4.0,
+				"map_bend": 5.0,
+				"map_jac": 6.0,
+				"map_metric_smooth": 7.0,
+				"map_area_smooth": 8.0,
+				"map_dense_prior": 9.0,
+			},
+			stages=(stage,),
+		)
+
+		parsed = snap_surf_config_from_global_config(cfg, stage)
+
+		self.assertEqual(parsed.map_init.w_dist, 0.0001)
+		self.assertEqual(parsed.map_init.w_vec_normal, 2.0)
+		self.assertEqual(parsed.map_init.w_surface_normal, 3.0)
+		self.assertEqual(parsed.map_init.w_smooth, 4.0)
+		self.assertEqual(parsed.map_init.w_bend, 5.0)
+		self.assertEqual(parsed.map_init.w_jac, 6.0)
+		self.assertEqual(parsed.map_init.w_metric_smooth, 7.0)
+		self.assertEqual(parsed.map_init.w_area_smooth, 8.0)
+		self.assertEqual(parsed.map_init.w_dense_prior, 9.0)
+
 	def test_out_of_bounds_samples_are_skipped_without_clamping(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			_write_planar_global_fixture(tmp)
@@ -1734,6 +1763,33 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			exported = load_map_fixture(export_dir)
 			self.assertEqual(tuple(exported.reference_uv.shape), tuple(fixture.reference_uv.shape))
 			self.assertEqual(int(exported.reference_active_quad.sum()), int(_full_active_quad(fixture).sum()))
+
+	def test_fixture_cli_stage_export_writes_fixture_under_out(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=1)
+			cfg_raw = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+			cfg_raw["stages"][1]["args"]["export_fixture"] = {
+				"dir": "rerun_fixture",
+				"once": True,
+				"objs": True,
+			}
+			Path(cfg_path).write_text(json.dumps(cfg_raw), encoding="utf-8")
+
+			rc = map_global_cli.main(["benchmark-fixture", fixture_dir, cfg_path, "--out", out_dir, "--device", "cpu"])
+
+			self.assertEqual(rc, 0)
+			export_dir = Path(out_dir, "rerun_fixture")
+			self.assertTrue(Path(export_dir, "fixture.json").exists())
+			self.assertTrue(Path(export_dir, "map", "model_x.tif").exists())
+			self.assertTrue(Path(export_dir, "ext_surface", "x.tif").exists())
+			self.assertTrue(Path(export_dir, "model_stack", "x.tif").exists())
+			self.assertTrue(Path(export_dir, "objs", "map_ext_to_model.obj").exists())
+			exported = load_map_fixture(export_dir)
+			source = load_map_fixture(fixture_dir)
+			self.assertEqual(tuple(exported.reference_uv.shape), tuple(source.reference_uv.shape))
 
 	def test_fixture_cli_writes_debug_objs_when_enabled(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -1884,9 +1940,9 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 			text = stdout.getvalue()
 			self.assertIn("0/3", text)
-			self.assertIn("1/3", text)
-			self.assertIn("3/3", text)
-			self.assertNotIn("2/3", text)
+			self.assertIn("2/3", text)
+			self.assertNotIn("1/3", text)
+			self.assertNotIn("3/3", text)
 			self.assertRegex(text, r"0/2\s+0\.0200\s+2")
 			self.assertIn("stat", text)
 			self.assertIn("station loss", text)
@@ -2016,9 +2072,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				metrics = optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
 
 			text = stdout.getvalue()
-			self.assertIn("affine seed quad init", text)
+			self.assertIn("affine seed quad prepare", text)
 			self.assertIn("0/1", text)
-			self.assertIn("1/1", text)
 			self.assertNotIn("affine multistart candidates", text)
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_affine_seed_quad_init", "map_ext_to_model.obj")))
 			self.assertEqual(metrics["history"][0]["name"], "affine_seed_quad_init")

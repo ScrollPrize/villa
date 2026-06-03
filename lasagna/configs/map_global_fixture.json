@@ -38,6 +38,7 @@
 			}
 		},
 		{
+			"name": "map_surf_affine_refine",
 			"steps": 500,
 			"lr": 0.01,
 			"params": ["map_surf_affine"],
@@ -48,6 +49,7 @@
 			}
 		},
 		{
+			"name": "map_uv_coarse",
 			"steps": 500,
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
@@ -59,6 +61,7 @@
 			}
 		},
 		{
+			"name": "map_uv_refine",
 			"steps": 200,
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
@@ -70,6 +73,7 @@
 			}
 		},
 		{
+			"name": "map_uv_fine",
 			"steps": 200,
 			"lr": 0.01,
 			"params": ["map_surf_ms"],
@@ -77,7 +81,13 @@
 			"w_fac": 1.0,
 			"args": {
 				"subdiv": 2,
-				"status_interval": 20
+				"status_interval": 20,
+				"debug_obj_dir": "snap_surf_objs",
+				"export_fixture": {
+					"dir": "bench_fixtures_dbg/init",
+					"once": true,
+					"objs": true
+				}
 			}
 		}
 	]
