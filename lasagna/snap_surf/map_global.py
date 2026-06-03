@@ -27,9 +27,10 @@ from .legacy import (
 from .map_fixture_io import MapFixture, _float_tif, _mask_tif, _write_json, compare_map_tensors, export_map_fixture, load_map_fixture
 from .map_objective import (
 	_map_init_distance_multiplier,
-	_map_init_lifted_z_heading_field,
+	_map_init_lifted_z_vertex_heading_field,
 	_map_init_objective,
-	_map_init_sample_scalar_quad_field,
+	_map_init_sample_scalar_plan,
+	_map_init_surface_sample_plan,
 )
 from .map_pyramid import (
 	_map_init_coords3,
@@ -822,6 +823,85 @@ def _model_quad_base_valid(model_xyz: torch.Tensor, model_valid: torch.Tensor) -
 	v = model_valid.bool() & finite
 	return v[:, :-1, :-1] & v[:, 1:, :-1] & v[:, :-1, 1:] & v[:, 1:, 1:]
 
+def _external_vertex_base_valid(ext_xyz: torch.Tensor, ext_valid: torch.Tensor) -> torch.Tensor:
+	return ext_valid.bool() & torch.isfinite(ext_xyz).all(dim=-1)
+
+def _model_vertex_base_valid(model_xyz: torch.Tensor, model_valid: torch.Tensor) -> torch.Tensor:
+	return model_valid.bool() & torch.isfinite(model_xyz).all(dim=-1)
+
+def _nearest_valid_vertex_by_xyz(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	target: torch.Tensor,
+) -> tuple[int, ...] | None:
+	valid_b = valid.to(device=xyz.device).bool() & torch.isfinite(xyz).all(dim=-1)
+	idx = valid_b.nonzero(as_tuple=False)
+	if idx.numel() == 0:
+		return None
+	points = xyz[tuple(idx[:, i] for i in range(idx.shape[1]))]
+	target_t = target.to(device=xyz.device, dtype=xyz.dtype)
+	dist2 = (points - target_t).square().sum(dim=-1)
+	if not bool(torch.isfinite(dist2).any().detach().cpu()):
+		return None
+	best = int(torch.where(torch.isfinite(dist2), dist2, torch.full_like(dist2, float("inf"))).argmin().detach().cpu())
+	return tuple(int(v) for v in idx[best].detach().cpu().tolist())
+
+def _valid_quad_corner_vertices_2d(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	quad: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+	h, w = (int(v) for v in quad)
+	H, W = int(valid.shape[0]), int(valid.shape[1])
+	corners = [(h, w), (h + 1, w), (h, w + 1), (h + 1, w + 1)]
+	idx: list[tuple[int, int]] = []
+	points: list[torch.Tensor] = []
+	for hh, ww in corners:
+		if hh < 0 or ww < 0 or hh >= H or ww >= W:
+			continue
+		if not bool((valid[hh, ww].bool() & torch.isfinite(xyz[hh, ww]).all()).detach().cpu()):
+			continue
+		idx.append((hh, ww))
+		points.append(xyz[hh, ww])
+	if not points:
+		return None
+	return torch.tensor(idx, device=xyz.device, dtype=torch.long), torch.stack(points, dim=0)
+
+def _valid_quad_corner_vertices_3d(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	quad: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+	d, h, w = (int(v) for v in quad)
+	D, H, W = int(valid.shape[0]), int(valid.shape[1]), int(valid.shape[2])
+	corners = [(d, h, w), (d, h + 1, w), (d, h, w + 1), (d, h + 1, w + 1)]
+	idx: list[tuple[int, int, int]] = []
+	points: list[torch.Tensor] = []
+	for dd, hh, ww in corners:
+		if dd < 0 or hh < 0 or ww < 0 or dd >= D or hh >= H or ww >= W:
+			continue
+		if not bool((valid[dd, hh, ww].bool() & torch.isfinite(xyz[dd, hh, ww]).all()).detach().cpu()):
+			continue
+		idx.append((dd, hh, ww))
+		points.append(xyz[dd, hh, ww])
+	if not points:
+		return None
+	return torch.tensor(idx, device=xyz.device, dtype=torch.long), torch.stack(points, dim=0)
+
+def _nearest_corner_from_legacy_quad(
+	idx: torch.Tensor,
+	points: torch.Tensor,
+	seed: torch.Tensor | None,
+) -> tuple[int, ...] | None:
+	if idx.numel() == 0:
+		return None
+	target = points.mean(dim=0) if seed is None else seed.to(device=points.device, dtype=points.dtype)
+	dist2 = (points - target).square().sum(dim=-1)
+	if not bool(torch.isfinite(dist2).any().detach().cpu()):
+		return None
+	best = int(torch.where(torch.isfinite(dist2), dist2, torch.full_like(dist2, float("inf"))).argmin().detach().cpu())
+	return tuple(int(v) for v in idx[best].detach().cpu().tolist())
+
 def _fixture_seed_ext_quad(fixture: MapFixture) -> tuple[int, int] | None:
 	raw_init = fixture.metadata.get("seed_quad_init")
 	if isinstance(raw_init, dict):
@@ -843,6 +923,28 @@ def _fixture_seed_ext_quad(fixture: MapFixture) -> tuple[int, int] | None:
 		return None if quad is None else (int(quad[0]), int(quad[1]))
 	return None
 
+def _fixture_seed_ext_vertex(fixture: MapFixture) -> tuple[int, int] | None:
+	raw_vertex = fixture.metadata.get("seed_ext_vertex_hw")
+	if isinstance(raw_vertex, (list, tuple)) and len(raw_vertex) >= 2:
+		return int(raw_vertex[0]), int(raw_vertex[1])
+	raw_seed = fixture.metadata.get("seed_xyz")
+	seed = None
+	if isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3:
+		seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
+		vertex = _nearest_valid_vertex_by_xyz(fixture.ext_xyz, _external_vertex_base_valid(fixture.ext_xyz, fixture.ext_valid), seed)
+		if vertex is not None and len(vertex) == 2:
+			return int(vertex[0]), int(vertex[1])
+	raw_init = fixture.metadata.get("seed_quad_init")
+	raw_ext = raw_init.get("ext_quad") if isinstance(raw_init, dict) else fixture.metadata.get("seed_ext_sample_hw")
+	if isinstance(raw_ext, (list, tuple)) and len(raw_ext) >= 2:
+		# Compatibility-only fallback for legacy quad seed metadata.
+		corners = _valid_quad_corner_vertices_2d(fixture.ext_xyz, _external_vertex_base_valid(fixture.ext_xyz, fixture.ext_valid), (int(raw_ext[0]), int(raw_ext[1])))
+		if corners is not None:
+			vertex = _nearest_corner_from_legacy_quad(corners[0], corners[1], seed)
+			if vertex is not None and len(vertex) == 2:
+				return int(vertex[0]), int(vertex[1])
+	return None
+
 def _fixture_seed_model_quad(fixture: MapFixture) -> tuple[int, int, int] | None:
 	raw_init = fixture.metadata.get("seed_quad_init")
 	if isinstance(raw_init, dict):
@@ -861,6 +963,32 @@ def _fixture_seed_model_quad(fixture: MapFixture) -> tuple[int, int, int] | None
 			model_valid=fixture.model_valid.bool(),
 		)
 		return None if quad is None else (int(quad[0]), int(quad[1]), int(quad[2]))
+	return None
+
+def _fixture_seed_model_vertex(fixture: MapFixture) -> tuple[int, int, int] | None:
+	raw_vertex = fixture.metadata.get("seed_model_vertex")
+	if isinstance(raw_vertex, (list, tuple)) and len(raw_vertex) == 3:
+		return int(raw_vertex[0]), int(raw_vertex[1]), int(raw_vertex[2])
+	raw_seed = fixture.metadata.get("seed_xyz")
+	seed = None
+	if isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3:
+		seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+		vertex = _nearest_valid_vertex_by_xyz(fixture.model_xyz, _model_vertex_base_valid(fixture.model_xyz, fixture.model_valid), seed)
+		if vertex is not None and len(vertex) == 3:
+			return int(vertex[0]), int(vertex[1]), int(vertex[2])
+	raw_init = fixture.metadata.get("seed_quad_init")
+	raw_model = raw_init.get("model_quad") if isinstance(raw_init, dict) else fixture.metadata.get("seed_model_quad")
+	if isinstance(raw_model, (list, tuple)) and len(raw_model) == 3:
+		# Compatibility-only fallback for legacy quad seed metadata.
+		corners = _valid_quad_corner_vertices_3d(
+			fixture.model_xyz,
+			_model_vertex_base_valid(fixture.model_xyz, fixture.model_valid),
+			(int(raw_model[0]), int(raw_model[1]), int(raw_model[2])),
+		)
+		if corners is not None:
+			vertex = _nearest_corner_from_legacy_quad(corners[0], corners[1], seed)
+			if vertex is not None and len(vertex) == 3:
+				return int(vertex[0]), int(vertex[1]), int(vertex[2])
 	return None
 
 def _tensor_cache_token(t: torch.Tensor) -> tuple[Any, ...]:
@@ -924,8 +1052,8 @@ def _map_init_z_lift_for_fixture(
 	mi = cfg.map_init
 	if not bool(mi.z_lift_enabled) or float(mi.w_z_lift) <= 0.0:
 		return None
-	seed_ext = _fixture_seed_ext_quad(fixture)
-	seed_model = _fixture_seed_model_quad(fixture)
+	seed_ext = _fixture_seed_ext_vertex(fixture)
+	seed_model = _fixture_seed_model_vertex(fixture)
 	if seed_ext is None or seed_model is None:
 		return None
 	sign_i = int(fixture.metadata.get("sign", 1) or 1) if sign is None else int(sign)
@@ -951,8 +1079,8 @@ def _map_init_z_lift_for_fixture(
 	else:
 		if external_cache is not None and ext_key is not None:
 			_bump("zext_miss")
-		ext_base = _external_quad_base_valid(fixture.ext_xyz, fixture.ext_valid.bool(), fixture.ext_quad_valid.bool())
-		ext_theta, ext_valid, ext_stats = _map_init_lifted_z_heading_field(
+		ext_base = _external_vertex_base_valid(fixture.ext_xyz, fixture.ext_valid.bool())
+		ext_theta, ext_valid, ext_stats = _map_init_lifted_z_vertex_heading_field(
 			fixture.ext_normals,
 			ext_base,
 			seed_ext,
@@ -990,8 +1118,8 @@ def _map_init_z_lift_for_fixture(
 	else:
 		if model_cache is not None and model_key is not None:
 			_bump("zmdl_miss")
-		model_base = _model_quad_base_valid(fixture.model_xyz, fixture.model_valid.bool())
-		model_theta, model_valid, model_stats = _map_init_lifted_z_heading_field(
+		model_base = _model_vertex_base_valid(fixture.model_xyz, fixture.model_valid.bool())
+		model_theta, model_valid, model_stats = _map_init_lifted_z_vertex_heading_field(
 			fixture.model_normals,
 			model_base,
 			seed_model,
@@ -2038,20 +2166,18 @@ def _seed_quad_affine_sample_terms(
 	turn_values = torch.zeros_like(norm_values)
 	turn_valid = torch.ones_like(coord_ok, dtype=torch.bool)
 	if z_lift is not None:
-		quad_hw = torch.floor(ext_hw.to(device=affine.device, dtype=affine.dtype)).long()
 		ext_theta = z_lift["ext_theta_lifted"].to(device=affine.device, dtype=affine.dtype)
 		ext_valid = z_lift["ext_valid"].to(device=affine.device).bool()
-		quad_hw[:, 0] = quad_hw[:, 0].clamp(0, max(0, int(ext_theta.shape[0]) - 1))
-		quad_hw[:, 1] = quad_hw[:, 1].clamp(0, max(0, int(ext_theta.shape[1]) - 1))
-		model_theta, model_theta_valid = _map_init_sample_scalar_quad_field(
+		ext_theta_plan = _map_init_surface_sample_plan(ext_hw.to(device=affine.device, dtype=affine.dtype), tuple(int(v) for v in ext_valid.shape))
+		ext_theta_sample, ext_theta_valid = _map_init_sample_scalar_plan(ext_theta, ext_valid, ext_theta_plan)
+		model_theta_plan = _map_init_surface_sample_plan(safe_coords, tuple(int(v) for v in z_lift["model_valid"].shape))
+		model_theta, model_theta_valid = _map_init_sample_scalar_plan(
 			z_lift["model_theta_lifted"].to(device=affine.device, dtype=affine.dtype),
 			z_lift["model_valid"].to(device=affine.device).bool(),
-			safe_coords,
-			tuple(int(v) for v in z_lift["model_valid"].shape),
+			model_theta_plan,
 		)
-		ext_theta_sample = ext_theta[quad_hw[:, 0], quad_hw[:, 1]]
 		turn_valid = (
-			ext_valid[quad_hw[:, 0], quad_hw[:, 1]] &
+			ext_theta_valid &
 			model_theta_valid &
 			torch.isfinite(ext_theta_sample) &
 			torch.isfinite(model_theta)
@@ -4319,6 +4445,8 @@ def _fixture_from_live_tensors(
 	}
 	if seed_xyz is not None:
 		seed = torch.tensor(seed_xyz, device=device, dtype=dtype)
+		ext_vertex = _nearest_valid_vertex_by_xyz(ext_xyz, _external_vertex_base_valid(ext_xyz, ext_valid), seed)
+		model_vertex = _nearest_valid_vertex_by_xyz(model_xyz, _model_vertex_base_valid(model_xyz, model_valid), seed)
 		ext_quad, _ext_point, _ext_dist = _closest_external_seed_surface(
 			seed=seed,
 			ext_xyz=ext_xyz,
@@ -4332,8 +4460,12 @@ def _fixture_from_live_tensors(
 		)
 		if ext_quad is not None:
 			metadata["seed_ext_sample_hw"] = [int(ext_quad[0]), int(ext_quad[1])]
+		if ext_vertex is not None and len(ext_vertex) == 2:
+			metadata["seed_ext_vertex_hw"] = [int(ext_vertex[0]), int(ext_vertex[1])]
 		if model_quad is not None:
 			metadata["seed_model_quad"] = [int(model_quad[0]), int(model_quad[1]), int(model_quad[2])]
+		if model_vertex is not None and len(model_vertex) == 3:
+			metadata["seed_model_vertex"] = [int(model_vertex[0]), int(model_vertex[1]), int(model_vertex[2])]
 		metadata["seed_xyz"] = [float(v) for v in seed_xyz]
 	return MapFixture(
 		root=Path("."),

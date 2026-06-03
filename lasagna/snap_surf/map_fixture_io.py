@@ -82,6 +82,19 @@ def _read_mask_tif(path: Path, *, device: torch.device | str) -> torch.Tensor:
 	arr = np.array(tifffile.imread(str(path)), copy=True)
 	return torch.from_numpy(arr != 0).to(device=device)
 
+def _nearest_valid_vertex_by_xyz(xyz: torch.Tensor, valid: torch.Tensor, seed_xyz: tuple[float, float, float]) -> list[int] | None:
+	valid_b = valid.to(device=xyz.device).bool() & torch.isfinite(xyz).all(dim=-1)
+	idx = valid_b.nonzero(as_tuple=False)
+	if idx.numel() == 0:
+		return None
+	seed = torch.tensor([float(v) for v in seed_xyz], device=xyz.device, dtype=xyz.dtype)
+	points = xyz[tuple(idx[:, i] for i in range(idx.shape[1]))]
+	dist2 = (points - seed).square().sum(dim=-1)
+	if not bool(torch.isfinite(dist2).any().detach().cpu()):
+		return None
+	best = int(torch.where(torch.isfinite(dist2), dist2, torch.full_like(dist2, float("inf"))).argmin().detach().cpu())
+	return [int(v) for v in idx[best].detach().cpu().tolist()]
+
 
 def _write_vector_dir(path: Path, tensor: torch.Tensor, valid: torch.Tensor, *, meta: dict[str, Any]) -> None:
 	if int(tensor.shape[-1]) != 3:
@@ -221,6 +234,12 @@ def export_map_fixture(
 		step=step,
 		stats=stats,
 	)
+	ext_seed_vertex = _nearest_valid_vertex_by_xyz(ext_xyz.detach(), ext_valid.detach().bool(), seed_xyz)
+	model_seed_vertex = _nearest_valid_vertex_by_xyz(model_xyz.detach(), model_valid.detach().bool(), seed_xyz)
+	if ext_seed_vertex is not None and len(ext_seed_vertex) == 2:
+		meta["seed_ext_vertex_hw"] = ext_seed_vertex
+	if model_seed_vertex is not None and len(model_seed_vertex) == 3:
+		meta["seed_model_vertex"] = model_seed_vertex
 	map_counts = write_map_outputs(out / "map", state, meta={"model_depth": meta["model_depth"]})
 	meta["map_counts"] = map_counts
 	if write_geometry:

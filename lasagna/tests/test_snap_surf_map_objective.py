@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import math
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,8 @@ if TEST_DIR not in sys.path:
 	sys.path.insert(0, TEST_DIR)
 
 from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz, _result, opt_loss_snap_surf
+import snap_surf.map_global as map_global
+import snap_surf.map_objective as map_objective
 
 
 class SnapSurfMapObjectiveTest(unittest.TestCase):
@@ -82,6 +85,30 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertIsNot(packed_epoch0, packed_epoch1)
 		self.assertIsNot(packed_epoch0, packed_clone)
 
+	def test_shared_sample_plan_matches_model_and_theta_sampling(self) -> None:
+		model_xyz = torch.arange(1 * 4 * 5 * 3, dtype=torch.float32).reshape(1, 4, 5, 3) / 10.0
+		model_normals = torch.flip(model_xyz, dims=(-1,)) + 1.0
+		model_valid = torch.ones(1, 4, 5, dtype=torch.bool)
+		model_valid[0, 2, 3] = False
+		theta = torch.arange(1 * 4 * 5, dtype=torch.float32).reshape(1, 4, 5) / 7.0
+		coords = torch.tensor([
+			[[[0.0, 0.25, 0.25], [0.0, 1.5, 2.25]]],
+			[[[0.0, 2.25, 3.5], [0.0, 0.75, 1.25]]],
+		], dtype=torch.float32)
+		packed = opt_loss_snap_surf._map_init_packed_pos_norm_values(model_xyz, model_normals, model_valid)
+
+		plan = opt_loss_snap_surf._map_init_surface_sample_plan(coords, tuple(model_valid.shape))
+		shared_packed = opt_loss_snap_surf._map_init_sample_surface_grid_plan(packed, plan)
+		shared_valid = opt_loss_snap_surf._map_init_sample_valid_plan(model_valid, plan)
+		theta_sample, theta_valid = opt_loss_snap_surf._map_init_sample_scalar_plan(theta, model_valid, plan)
+		old_packed, old_valid = opt_loss_snap_surf._map_init_sample_surface_grid_with_valid(packed, model_valid, coords)
+		old_theta, old_theta_valid = opt_loss_snap_surf._map_init_sample_scalar_quad_field(theta, model_valid, coords, tuple(model_valid.shape))
+
+		torch.testing.assert_close(shared_packed, old_packed)
+		self.assertTrue(torch.equal(shared_valid, old_valid))
+		torch.testing.assert_close(theta_sample, old_theta)
+		self.assertTrue(torch.equal(theta_valid, old_theta_valid))
+
 	def test_map_init_objective_reuses_cached_external_samples(self) -> None:
 		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)
 		cfg = opt_loss_snap_surf.SnapSurfConfig(
@@ -136,14 +163,156 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertIn("sample_ext_cached", second_profile)
 		self.assertNotIn("sample_ext_packed_bilerp", second_profile)
 
+	def test_map_init_objective_gates_sample_model_metric_vertices(self) -> None:
+		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)
+		base_kwargs = dict(
+			uv_full=uv,
+			active_quad=torch.ones(2, 2, dtype=torch.bool),
+			ext_pos=_plane_xyz(h=3, w=3, z=0.0),
+			ext_normals=_normals_2d(3, 3),
+			ext_valid=torch.ones(3, 3, dtype=torch.bool),
+			ext_quad_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_xyz=_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0),
+			model_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			model_normals=_normals_3d(1, 3, 3),
+			model_depth=0,
+			sign=1,
+			need_stats=False,
+		)
+		no_step_profile: dict[str, list[float]] = {}
+		opt_loss_snap_surf._map_init_objective(
+			**base_kwargs,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					subdiv=2,
+					w_dist=1.0,
+					w_vec_normal=0.0,
+					w_surface_normal=0.0,
+					w_z_lift=0.0,
+					w_smooth=0.0,
+					w_bend=0.0,
+					w_jac=0.0,
+					w_metric_smooth=0.0,
+					w_area_smooth=0.0,
+					max_sample_angle_deg=180.0,
+				),
+			),
+			profile_blocks=no_step_profile,
+		)
+		step_profile: dict[str, list[float]] = {}
+		opt_loss_snap_surf._map_init_objective(
+			**base_kwargs,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					subdiv=2,
+					w_dist=1.0,
+					w_vec_normal=0.0,
+					w_surface_normal=0.0,
+					w_z_lift=0.0,
+					w_smooth=0.0,
+					w_bend=0.0,
+					w_jac=0.0,
+					w_metric_smooth=0.0,
+					w_area_smooth=0.0,
+					max_sample_angle_deg=45.0,
+					sample_angle_step_fraction=0.1,
+				),
+			),
+			profile_blocks=step_profile,
+		)
+
+		self.assertIn("sample_model_context", no_step_profile)
+		self.assertNotIn("sample_model_metric_steps", no_step_profile)
+		self.assertIn("sample_model_metric_steps", step_profile)
+
+	def test_map_init_objective_samples_model_metric_in_regularization_only_when_active(self) -> None:
+		uv = torch.stack(torch.meshgrid(torch.arange(4, dtype=torch.float32), torch.arange(4, dtype=torch.float32), indexing="ij"), dim=-1)
+		profile: dict[str, list[float]] = {}
+		opt_loss_snap_surf._map_init_objective(
+			uv_full=uv,
+			active_quad=torch.ones(3, 3, dtype=torch.bool),
+			ext_pos=_plane_xyz(h=4, w=4, z=0.0),
+			ext_normals=_normals_2d(4, 4),
+			ext_valid=torch.ones(4, 4, dtype=torch.bool),
+			ext_quad_valid=torch.ones(3, 3, dtype=torch.bool),
+			model_xyz=_plane_xyz(h=4, w=4, z=1.0).unsqueeze(0),
+			model_valid=torch.ones(1, 4, 4, dtype=torch.bool),
+			model_normals=_normals_3d(1, 4, 4),
+			model_depth=0,
+			sign=1,
+			cfg=opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					w_dist=0.0,
+					w_vec_normal=0.0,
+					w_surface_normal=0.0,
+					w_z_lift=0.0,
+					w_smooth=1.0,
+					w_bend=0.0,
+					w_jac=0.0,
+					w_metric_smooth=0.0,
+					w_area_smooth=0.0,
+					max_sample_angle_deg=180.0,
+				),
+			),
+			need_stats=False,
+			profile_blocks=profile,
+		)
+
+		self.assertNotIn("sample_model_metric_steps", profile)
+		self.assertIn("reg_model_metric_sample", profile)
+
+	def test_map_init_objective_reuses_cached_reg_physical_ref(self) -> None:
+		uv = torch.stack(torch.meshgrid(torch.arange(4, dtype=torch.float32), torch.arange(4, dtype=torch.float32), indexing="ij"), dim=-1)
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+				w_dist=0.0,
+				w_vec_normal=0.0,
+				w_surface_normal=0.0,
+				w_z_lift=0.0,
+				w_smooth=1.0,
+				w_bend=0.0,
+				w_jac=0.0,
+				w_metric_smooth=0.0,
+				w_area_smooth=0.0,
+			),
+		)
+		cache: dict[tuple[object, ...], object] = {}
+		kwargs = dict(
+			uv_full=uv,
+			active_quad=torch.ones(3, 3, dtype=torch.bool),
+			ext_pos=_plane_xyz(h=4, w=4, z=0.0),
+			ext_normals=_normals_2d(4, 4),
+			ext_valid=torch.ones(4, 4, dtype=torch.bool),
+			ext_quad_valid=torch.ones(3, 3, dtype=torch.bool),
+			model_xyz=_plane_xyz(h=4, w=4, z=1.0).unsqueeze(0),
+			model_valid=torch.ones(1, 4, 4, dtype=torch.bool),
+			model_normals=_normals_3d(1, 4, 4),
+			model_depth=0,
+			sign=1,
+			cfg=cfg,
+			need_stats=False,
+			runtime_cache=cache,
+			cache_key_prefix=("stage", 0),
+			external_static_cache_key=("level", 0),
+		)
+		with mock.patch.object(
+			map_objective,
+			"_map_init_reference_edge_square",
+			wraps=map_objective._map_init_reference_edge_square,
+		) as ref_mock:
+			opt_loss_snap_surf._map_init_objective(**kwargs)
+			opt_loss_snap_surf._map_init_objective(**kwargs)
+
+		self.assertEqual(ref_mock.call_count, 1)
+
 	def test_z_lift_field_construction_unwraps_multiple_turns(self) -> None:
 		angles = torch.linspace(0.0, 4.0 * math.pi, 9)
-		normals = torch.zeros(2, 9, 3)
+		normals = torch.zeros(1, 9, 3)
 		normals[..., 0] = torch.cos(angles).view(1, 9)
 		normals[..., 1] = torch.sin(angles).view(1, 9)
-		base_valid = torch.ones(1, 8, dtype=torch.bool)
+		base_valid = torch.ones(1, 9, dtype=torch.bool)
 
-		theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_heading_field(
+		theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_vertex_heading_field(
 			normals,
 			base_valid,
 			(0, 0),
@@ -155,16 +324,16 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertEqual(stats["unreachable"], 0.0)
 		self.assertAlmostEqual(float(theta[0, 0].item()), 0.0, places=5)
 		self.assertAlmostEqual(float(theta[0, 4].item()), 2.0 * math.pi, places=5)
-		self.assertAlmostEqual(float(theta[0, -1].item()), 3.5 * math.pi, places=5)
+		self.assertAlmostEqual(float(theta[0, -1].item()), 4.0 * math.pi, places=5)
 
 	def test_z_lift_field_construction_unwraps_pi_boundary(self) -> None:
 		angles = torch.tensor([math.radians(170.0), math.radians(-170.0), math.radians(-150.0)])
-		normals = torch.zeros(2, 3, 3)
+		normals = torch.zeros(1, 3, 3)
 		normals[..., 0] = torch.cos(angles).view(1, 3)
 		normals[..., 1] = torch.sin(angles).view(1, 3)
-		base_valid = torch.ones(1, 2, dtype=torch.bool)
+		base_valid = torch.ones(1, 3, dtype=torch.bool)
 
-		theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_heading_field(
+		theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_vertex_heading_field(
 			normals,
 			base_valid,
 			(0, 0),
@@ -178,12 +347,12 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 
 	def test_z_lift_field_construction_does_not_cross_depth_planes(self) -> None:
 		angles = torch.linspace(0.0, 2.0 * math.pi, 5)
-		normals = torch.zeros(2, 2, 5, 3)
+		normals = torch.zeros(2, 1, 5, 3)
 		normals[..., 0] = torch.cos(angles).view(1, 1, 5)
 		normals[..., 1] = torch.sin(angles).view(1, 1, 5)
-		base_valid = torch.ones(2, 1, 4, dtype=torch.bool)
+		base_valid = torch.ones(2, 1, 5, dtype=torch.bool)
 
-		theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_heading_field(
+		theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_vertex_heading_field(
 			normals,
 			base_valid,
 			(0, 0, 0),
@@ -193,19 +362,19 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertTrue(valid[0].all())
 		self.assertFalse(valid[1].any())
 		self.assertEqual(stats["invalid"], 0.0)
-		self.assertEqual(stats["unreachable"], 4.0)
+		self.assertEqual(stats["unreachable"], 5.0)
 		self.assertAlmostEqual(float(theta[0, 0, 0].item()), 0.0, places=5)
-		self.assertAlmostEqual(float(theta[0, 0, -1].item()), 1.5 * math.pi, places=5)
+		self.assertAlmostEqual(float(theta[0, 0, -1].item()), 2.0 * math.pi, places=5)
 
-	def test_z_lift_field_construction_blocks_invalid_and_unreachable_quads(self) -> None:
-		normals = torch.zeros(2, 5, 3)
+	def test_z_lift_field_construction_blocks_invalid_and_unreachable_vertices(self) -> None:
+		normals = torch.zeros(1, 5, 3)
 		normals[..., 0] = 1.0
 		normals[:, 2, 0] = 0.0
 		normals[:, 2, 1] = 0.0
 		normals[:, 2, 2] = 1.0
-		base_valid = torch.ones(1, 4, dtype=torch.bool)
+		base_valid = torch.ones(1, 5, dtype=torch.bool)
 
-		_theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_heading_field(
+		_theta, valid, stats = opt_loss_snap_surf._map_init_lifted_z_vertex_heading_field(
 			normals,
 			base_valid,
 			(0, 0),
@@ -213,11 +382,58 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		)
 
 		self.assertTrue(bool(valid[0, 0]))
-		self.assertFalse(bool(valid[0, 1]))
+		self.assertTrue(bool(valid[0, 1]))
 		self.assertFalse(bool(valid[0, 2]))
 		self.assertFalse(bool(valid[0, 3]))
-		self.assertEqual(stats["invalid"], 2.0)
-		self.assertEqual(stats["unreachable"], 1.0)
+		self.assertFalse(bool(valid[0, 4]))
+		self.assertEqual(stats["invalid"], 1.0)
+		self.assertEqual(stats["unreachable"], 2.0)
+
+	def test_z_lift_legacy_quad_seed_metadata_falls_back_to_nearest_vertex(self) -> None:
+		ext_xyz = _plane_xyz(h=2, w=2, z=0.0)
+		model_xyz = _plane_xyz(h=2, w=2, z=0.0).unsqueeze(0)
+		ext_normals = torch.zeros(2, 2, 3)
+		ext_normals[..., 0] = 1.0
+		model_normals = torch.zeros(1, 2, 2, 3)
+		model_normals[..., 0] = 1.0
+		fixture = map_global.MapFixture(
+			root=Path("."),
+			metadata={
+				"seed_xyz": [1.0, 0.0, 0.0],
+				"seed_ext_sample_hw": [0, 0],
+				"seed_model_quad": [0, 0, 0],
+				"model_depth": 0,
+				"sign": 1,
+			},
+			ext_xyz=ext_xyz,
+			ext_valid=torch.ones(2, 2, dtype=torch.bool),
+			ext_quad_valid=torch.ones(1, 1, dtype=torch.bool),
+			ext_normals=ext_normals,
+			model_xyz=model_xyz,
+			model_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+			model_normals=model_normals,
+			reference_uv=torch.zeros(2, 2, 2),
+			reference_active_quad=torch.ones(1, 1, dtype=torch.bool),
+			reference_blocked_quad=torch.zeros(1, 1, dtype=torch.bool),
+		)
+
+		self.assertEqual(map_global._fixture_seed_ext_vertex(fixture), (0, 1))
+		self.assertEqual(map_global._fixture_seed_model_vertex(fixture), (0, 0, 1))
+		z_lift = map_global._map_init_z_lift_for_fixture(
+			fixture,
+			opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					w_z_lift=1.0,
+					z_lift_norm_xy_min=0.01,
+				),
+			),
+			sign=1,
+		)
+
+		self.assertIsNotNone(z_lift)
+		assert z_lift is not None
+		self.assertEqual(tuple(z_lift["ext_theta_lifted"].shape), (2, 2))
+		self.assertEqual(tuple(z_lift["model_theta_lifted"].shape), (1, 2, 2))
 
 	def test_map_init_z_lift_turn_distinguishes_winding_branch_without_wrapping(self) -> None:
 		uv = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
@@ -249,10 +465,10 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_depth=0,
 			sign=1,
 			cfg=cfg,
-			ext_z_lift_theta=torch.zeros(1, 1),
-			ext_z_lift_valid=torch.ones(1, 1, dtype=torch.bool),
-			model_z_lift_theta=torch.zeros(1, 1, 1),
-			model_z_lift_valid=torch.ones(1, 1, 1, dtype=torch.bool),
+			ext_z_lift_theta=torch.zeros(2, 2),
+			ext_z_lift_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_z_lift_theta=torch.zeros(1, 2, 2),
+			model_z_lift_valid=torch.ones(1, 2, 2, dtype=torch.bool),
 		)
 		high_loss, high_terms = opt_loss_snap_surf._map_init_objective(
 			uv_full=uv,
@@ -267,10 +483,10 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			model_depth=0,
 			sign=1,
 			cfg=cfg,
-			ext_z_lift_theta=torch.zeros(1, 1),
-			ext_z_lift_valid=torch.ones(1, 1, dtype=torch.bool),
-			model_z_lift_theta=torch.full((1, 1, 1), 2.0 * math.pi),
-			model_z_lift_valid=torch.ones(1, 1, 1, dtype=torch.bool),
+			ext_z_lift_theta=torch.zeros(2, 2),
+			ext_z_lift_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_z_lift_theta=torch.full((1, 2, 2), 2.0 * math.pi),
+			model_z_lift_valid=torch.ones(1, 2, 2, dtype=torch.bool),
 		)
 
 		self.assertAlmostEqual(float(low_terms["turn"].detach()), 0.0)
@@ -306,28 +522,33 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 					w_z_lift=1.0,
 				),
 			),
-			ext_z_lift_theta=torch.zeros(1, 1),
-			ext_z_lift_valid=torch.ones(1, 1, dtype=torch.bool),
-			model_z_lift_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+			ext_z_lift_theta=torch.zeros(2, 2),
+			ext_z_lift_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_z_lift_valid=torch.ones(1, 3, 3, dtype=torch.bool),
 		)
 
+		profile: dict[str, list[float]] = {}
 		_, low = opt_loss_snap_surf._map_init_objective(
-			model_z_lift_theta=torch.zeros(1, 2, 2),
+			model_z_lift_theta=torch.zeros(1, 3, 3),
+			profile_blocks=profile,
 			**kwargs,
 		)
 		_, high = opt_loss_snap_surf._map_init_objective(
-			model_z_lift_theta=torch.full((1, 2, 2), 2.0 * math.pi),
+			model_z_lift_theta=torch.full((1, 3, 3), 2.0 * math.pi),
 			**kwargs,
 		)
 
 		self.assertAlmostEqual(float(low["turn"].detach()), 0.0)
 		self.assertGreater(float(high["turn"].detach()), 4.0)
+		self.assertIn("sample_model_context", profile)
+		self.assertNotIn("sample_turn_field", profile)
+		self.assertNotIn("sample_turn_ext_field", profile)
 
 	def test_map_init_z_lift_samples_full_external_theta_at_coarse_level(self) -> None:
 		uv = torch.tensor([[[0.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 1.0]]])
 		active_quad = torch.ones(1, 1, dtype=torch.bool)
 		ext_coords = torch.tensor([[[0.0, 0.0], [0.0, 4.0]], [[4.0, 0.0], [4.0, 4.0]]])
-		ext_theta = torch.zeros(4, 4)
+		ext_theta = torch.zeros(5, 5)
 		ext_theta[0, 0] = 2.0 * math.pi
 		cfg = opt_loss_snap_surf.SnapSurfConfig(
 			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
@@ -359,9 +580,9 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			sign=1,
 			cfg=cfg,
 			ext_z_lift_theta=ext_theta,
-			ext_z_lift_valid=torch.ones(4, 4, dtype=torch.bool),
-			model_z_lift_theta=torch.zeros(1, 1, 1),
-			model_z_lift_valid=torch.ones(1, 1, 1, dtype=torch.bool),
+			ext_z_lift_valid=torch.ones(5, 5, dtype=torch.bool),
+			model_z_lift_theta=torch.zeros(1, 2, 2),
+			model_z_lift_valid=torch.ones(1, 2, 2, dtype=torch.bool),
 		)
 
 		self.assertGreater(float(terms["turn"].detach()), 4.0)
@@ -398,10 +619,10 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 					w_area_smooth=0.0,
 				),
 			),
-			ext_z_lift_theta=torch.zeros(1, 1),
-			ext_z_lift_valid=torch.ones(1, 1, dtype=torch.bool),
-			model_z_lift_theta=torch.full((1, 1, 1), float("nan")),
-			model_z_lift_valid=torch.zeros(1, 1, 1, dtype=torch.bool),
+			ext_z_lift_theta=torch.zeros(2, 2),
+			ext_z_lift_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_z_lift_theta=torch.full((1, 2, 2), float("nan")),
+			model_z_lift_valid=torch.zeros(1, 2, 2, dtype=torch.bool),
 			allow_partial_model_samples=True,
 		)
 
