@@ -85,6 +85,7 @@
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
+			"w_fac": { "map_area_smooth": 0.0 },
 			"args": {
 				"subdiv": 1,
 				"status_interval": 20

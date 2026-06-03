@@ -1201,6 +1201,111 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertGreater(float(terms["metric_smooth"].detach()), 0.0)
 		self.assertAlmostEqual(float(terms["area_smooth"].detach()), 0.0, places=6)
 
+	def test_map_init_local_evenness_metric_only_skips_area_cross_products(self) -> None:
+		H, W = 3, 3
+		uv = torch.stack(torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing="ij"), dim=-1)
+		uv[1, 1] = uv[1, 1] + torch.tensor([0.25, 0.0])
+		with mock.patch.object(torch, "cross", side_effect=AssertionError("area path should be inactive")):
+			terms = opt_loss_snap_surf._map_init_local_evenness_terms(
+				uv,
+				_plane_xyz(h=H, w=W, z=0.0),
+				torch.ones(H - 1, W - 1, dtype=torch.bool),
+				need_metric=True,
+				need_area=False,
+			)
+
+		self.assertGreater(float(terms["metric_smooth"].detach()), 0.0)
+		self.assertAlmostEqual(float(terms["area_smooth"].detach()), 0.0, places=6)
+
+	def test_map_init_local_evenness_area_only_skips_metric_lengths(self) -> None:
+		H, W = 2, 3
+		uv = torch.stack(torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing="ij"), dim=-1)
+		ext = uv.detach().clone()
+		uv[:, 2, 1] = 4.0
+		with mock.patch.object(torch.Tensor, "norm", side_effect=AssertionError("metric length path should be inactive")):
+			terms = opt_loss_snap_surf._map_init_local_evenness_terms(
+				uv,
+				ext,
+				torch.ones(H - 1, W - 1, dtype=torch.bool),
+				need_metric=False,
+				need_area=True,
+			)
+
+		self.assertAlmostEqual(float(terms["metric_smooth"].detach()), 0.0, places=6)
+		self.assertGreater(float(terms["area_smooth"].detach()), 0.0)
+
+	def test_map_init_evenness_external_context_cache_matches_direct(self) -> None:
+		H, W = 3, 4
+		ext = _plane_xyz(h=H, w=W, z=0.0)
+		ext[2, 3] = float("nan")
+		active = torch.ones(H - 1, W - 1, dtype=torch.bool)
+		active[1, 2] = False
+		cache: dict[tuple[object, ...], object] = {}
+		key = opt_loss_snap_surf._map_init_evenness_external_context_cache_key(
+			ext_pos=ext,
+			active_quad=active,
+			prefix=("test",),
+			external_static_cache_key=("level", 0),
+		)
+
+		direct = opt_loss_snap_surf._map_init_build_evenness_external_context(ext, active, need_metric=True, need_area=True)
+		cached = opt_loss_snap_surf._map_init_cached_evenness_external_context(
+			ext_pos=ext,
+			active_quad=active,
+			need_metric=True,
+			need_area=True,
+			cache=cache,
+			key=key,
+		)
+
+		for name in (
+			"finite_ext", "static_quad", "ext_len_h_valid", "ext_len_w_valid",
+			"metric_h_pair_down", "metric_h_pair_right", "metric_w_pair_down", "metric_w_pair_right",
+			"ext_area_valid", "area_pair_down", "area_pair_right",
+		):
+			self.assertTrue(torch.equal(getattr(cached, name), getattr(direct, name)), name)
+		torch.testing.assert_close(cached.ext_len_h, direct.ext_len_h)
+		torch.testing.assert_close(cached.ext_len_w, direct.ext_len_w)
+		torch.testing.assert_close(cached.ext_area, direct.ext_area)
+
+	def test_map_init_evenness_external_context_cache_upgrades_for_area(self) -> None:
+		H, W = 3, 3
+		ext = _plane_xyz(h=H, w=W, z=0.0)
+		active = torch.ones(H - 1, W - 1, dtype=torch.bool)
+		cache: dict[tuple[object, ...], object] = {}
+		key = opt_loss_snap_surf._map_init_evenness_external_context_cache_key(ext_pos=ext, active_quad=active)
+
+		metric_ctx = opt_loss_snap_surf._map_init_cached_evenness_external_context(
+			ext_pos=ext,
+			active_quad=active,
+			need_metric=True,
+			need_area=False,
+			cache=cache,
+			key=key,
+		)
+		area_ctx = opt_loss_snap_surf._map_init_cached_evenness_external_context(
+			ext_pos=ext,
+			active_quad=active,
+			need_metric=False,
+			need_area=True,
+			cache=cache,
+			key=key,
+		)
+
+		self.assertIsNone(metric_ctx.ext_area)
+		self.assertIsNotNone(area_ctx.ext_area)
+		self.assertIsNotNone(area_ctx.ext_len_h)
+
+	def test_map_init_signed_reciprocal_scale_keeps_expansion_sign(self) -> None:
+		eps_t = torch.tensor(0.0)
+		scale = opt_loss_snap_surf._map_init_signed_reciprocal_scale(
+			torch.tensor([2.0, 0.5]),
+			torch.tensor([1.0, 1.0]),
+			eps_t,
+		)
+
+		torch.testing.assert_close(scale, torch.tensor([0.75, -0.75]))
+
 	def test_map_init_local_evenness_uses_model_surface_lengths(self) -> None:
 		H, W = 4, 3
 		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)

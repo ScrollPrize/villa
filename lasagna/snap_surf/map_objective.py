@@ -26,6 +26,23 @@ class _MapInitSurfaceSamplePlan:
 	idx: tuple[torch.Tensor, ...]
 	weights: tuple[torch.Tensor, ...]
 
+@dataclass(frozen=True)
+class _MapInitEvennessExternalContext:
+	finite_ext: torch.Tensor
+	static_quad: torch.Tensor
+	ext_len_h: torch.Tensor | None = None
+	ext_len_w: torch.Tensor | None = None
+	ext_len_h_valid: torch.Tensor | None = None
+	ext_len_w_valid: torch.Tensor | None = None
+	metric_h_pair_down: torch.Tensor | None = None
+	metric_h_pair_right: torch.Tensor | None = None
+	metric_w_pair_down: torch.Tensor | None = None
+	metric_w_pair_right: torch.Tensor | None = None
+	ext_area: torch.Tensor | None = None
+	ext_area_valid: torch.Tensor | None = None
+	area_pair_down: torch.Tensor | None = None
+	area_pair_right: torch.Tensor | None = None
+
 def _principal_angle_delta(to_angle: torch.Tensor, from_angle: torch.Tensor) -> torch.Tensor:
 	two_pi = 2.0 * math.pi
 	return torch.remainder(to_angle - from_angle + math.pi, two_pi) - math.pi
@@ -1197,6 +1214,176 @@ def _map_init_cached_reg_physical_ref(
 		return cached
 	return _map_init_cache_put(cache, key, _map_init_reference_edge_square(ext_pos, finite_ext, reg_quad, z))
 
+def _map_init_evenness_external_context_cache_key(
+	*,
+	ext_pos: torch.Tensor,
+	active_quad: torch.Tensor,
+	prefix: tuple[Any, ...] = (),
+	external_static_cache_key: Any | None = None,
+) -> tuple[Any, ...]:
+	return (
+		"reg_evenness_external",
+		*tuple(prefix),
+		external_static_cache_key,
+		_map_init_tensor_cache_key(ext_pos),
+		_map_init_tensor_cache_key(active_quad),
+	)
+
+def _map_init_signed_reciprocal_scale(
+	model_value: torch.Tensor,
+	ext_value: torch.Tensor,
+	eps_t: torch.Tensor,
+) -> torch.Tensor:
+	model_safe = model_value + eps_t
+	ext_safe = ext_value + eps_t
+	return 0.5 * ((model_safe / ext_safe) - (ext_safe / model_safe))
+
+def _map_init_evenness_context_has(
+	ctx: _MapInitEvennessExternalContext,
+	*,
+	need_metric: bool,
+	need_area: bool,
+) -> bool:
+	if bool(need_metric) and (
+		ctx.ext_len_h is None or ctx.ext_len_w is None or
+		ctx.ext_len_h_valid is None or ctx.ext_len_w_valid is None or
+		ctx.metric_h_pair_down is None or ctx.metric_h_pair_right is None or
+		ctx.metric_w_pair_down is None or ctx.metric_w_pair_right is None
+	):
+		return False
+	if bool(need_area) and (
+		ctx.ext_area is None or ctx.ext_area_valid is None or
+		ctx.area_pair_down is None or ctx.area_pair_right is None
+	):
+		return False
+	return True
+
+def _map_init_build_evenness_external_context(
+	ext_pos: torch.Tensor,
+	active_quad: torch.Tensor,
+	*,
+	need_metric: bool,
+	need_area: bool,
+	base: _MapInitEvennessExternalContext | None = None,
+) -> _MapInitEvennessExternalContext:
+	H, W = int(ext_pos.shape[0]), int(ext_pos.shape[1])
+	finite_ext = base.finite_ext if base is not None else torch.isfinite(ext_pos).all(dim=-1)
+	static_quad = base.static_quad if base is not None else (active_quad.bool() & _map_init_quad_corner_all(finite_ext))
+	safe_ext = None
+
+	ext_len_h = base.ext_len_h if base is not None else None
+	ext_len_w = base.ext_len_w if base is not None else None
+	ext_len_h_valid = base.ext_len_h_valid if base is not None else None
+	ext_len_w_valid = base.ext_len_w_valid if base is not None else None
+	metric_h_pair_down = base.metric_h_pair_down if base is not None else None
+	metric_h_pair_right = base.metric_h_pair_right if base is not None else None
+	metric_w_pair_down = base.metric_w_pair_down if base is not None else None
+	metric_w_pair_right = base.metric_w_pair_right if base is not None else None
+	if bool(need_metric) and (
+		ext_len_h is None or ext_len_w is None or
+		ext_len_h_valid is None or ext_len_w_valid is None or
+		metric_h_pair_down is None or metric_h_pair_right is None or
+		metric_w_pair_down is None or metric_w_pair_right is None
+	):
+		safe_ext = torch.where(finite_ext.unsqueeze(-1), ext_pos, torch.zeros_like(ext_pos))
+		edge_h = torch.zeros(H - 1, W, device=ext_pos.device, dtype=torch.bool)
+		edge_h[:, :-1] |= static_quad
+		edge_h[:, 1:] |= static_quad
+		dext_h = safe_ext[1:, :] - safe_ext[:-1, :]
+		ext_len_h = dext_h.norm(dim=-1)
+		ext_len_h_valid = (
+			edge_h &
+			finite_ext[1:, :] & finite_ext[:-1, :] &
+			torch.isfinite(dext_h).all(dim=-1) &
+			torch.isfinite(ext_len_h)
+		)
+		metric_h_pair_down = ext_len_h_valid[1:, :] & ext_len_h_valid[:-1, :] if H > 2 else torch.zeros((0, W), device=ext_pos.device, dtype=torch.bool)
+		metric_h_pair_right = ext_len_h_valid[:, 1:] & ext_len_h_valid[:, :-1] if W > 1 else torch.zeros((H - 1, 0), device=ext_pos.device, dtype=torch.bool)
+
+		edge_w = torch.zeros(H, W - 1, device=ext_pos.device, dtype=torch.bool)
+		edge_w[:-1, :] |= static_quad
+		edge_w[1:, :] |= static_quad
+		dext_w = safe_ext[:, 1:] - safe_ext[:, :-1]
+		ext_len_w = dext_w.norm(dim=-1)
+		ext_len_w_valid = (
+			edge_w &
+			finite_ext[:, 1:] & finite_ext[:, :-1] &
+			torch.isfinite(dext_w).all(dim=-1) &
+			torch.isfinite(ext_len_w)
+		)
+		metric_w_pair_down = ext_len_w_valid[1:, :] & ext_len_w_valid[:-1, :] if H > 1 else torch.zeros((0, W - 1), device=ext_pos.device, dtype=torch.bool)
+		metric_w_pair_right = ext_len_w_valid[:, 1:] & ext_len_w_valid[:, :-1] if W > 2 else torch.zeros((H, 0), device=ext_pos.device, dtype=torch.bool)
+
+	ext_area = base.ext_area if base is not None else None
+	ext_area_valid = base.ext_area_valid if base is not None else None
+	area_pair_down = base.area_pair_down if base is not None else None
+	area_pair_right = base.area_pair_right if base is not None else None
+	if bool(need_area) and (ext_area is None or ext_area_valid is None or area_pair_down is None or area_pair_right is None):
+		if safe_ext is None:
+			safe_ext = torch.where(finite_ext.unsqueeze(-1), ext_pos, torch.zeros_like(ext_pos))
+		e00 = safe_ext[:-1, :-1]
+		e10 = safe_ext[1:, :-1]
+		e01 = safe_ext[:-1, 1:]
+		e11 = safe_ext[1:, 1:]
+		if int(safe_ext.shape[-1]) == 2:
+			def cross2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+				return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+			ext_area = 0.5 * cross2(e10 - e00, e01 - e00).abs() + 0.5 * cross2(e11 - e10, e11 - e01).abs()
+		else:
+			ext_area = (
+				0.5 * torch.cross(e10 - e00, e01 - e00, dim=-1).norm(dim=-1) +
+				0.5 * torch.cross(e11 - e10, e11 - e01, dim=-1).norm(dim=-1)
+			)
+		ext_area_valid = static_quad & torch.isfinite(ext_area)
+		area_pair_down = ext_area_valid[1:, :] & ext_area_valid[:-1, :] if H > 2 else torch.zeros((0, W - 1), device=ext_pos.device, dtype=torch.bool)
+		area_pair_right = ext_area_valid[:, 1:] & ext_area_valid[:, :-1] if W > 2 else torch.zeros((H - 1, 0), device=ext_pos.device, dtype=torch.bool)
+
+	return _MapInitEvennessExternalContext(
+		finite_ext=finite_ext,
+		static_quad=static_quad,
+		ext_len_h=ext_len_h,
+		ext_len_w=ext_len_w,
+		ext_len_h_valid=ext_len_h_valid,
+		ext_len_w_valid=ext_len_w_valid,
+		metric_h_pair_down=metric_h_pair_down,
+		metric_h_pair_right=metric_h_pair_right,
+		metric_w_pair_down=metric_w_pair_down,
+		metric_w_pair_right=metric_w_pair_right,
+		ext_area=ext_area,
+		ext_area_valid=ext_area_valid,
+		area_pair_down=area_pair_down,
+		area_pair_right=area_pair_right,
+	)
+
+def _map_init_cached_evenness_external_context(
+	*,
+	ext_pos: torch.Tensor,
+	active_quad: torch.Tensor,
+	need_metric: bool,
+	need_area: bool,
+	cache: dict[tuple[Any, ...], Any] | None,
+	key: tuple[Any, ...],
+) -> _MapInitEvennessExternalContext:
+	cached = _map_init_cache_get(cache, key)
+	if isinstance(cached, _MapInitEvennessExternalContext):
+		if _map_init_evenness_context_has(cached, need_metric=need_metric, need_area=need_area):
+			return cached
+		ctx = _map_init_build_evenness_external_context(
+			ext_pos,
+			active_quad,
+			need_metric=need_metric,
+			need_area=need_area,
+			base=cached,
+		)
+	else:
+		ctx = _map_init_build_evenness_external_context(
+			ext_pos,
+			active_quad,
+			need_metric=need_metric,
+			need_area=need_area,
+		)
+	return _map_init_cache_put(cache, key, ctx)
+
 def _map_init_local_evenness_terms(
 	uv: torch.Tensor,
 	ext_pos: torch.Tensor,
@@ -1208,14 +1395,44 @@ def _map_init_local_evenness_terms(
 	model_valid: torch.Tensor | None = None,
 	model_depth: int | None = None,
 	eps: float = 1.0e-6,
+	need_metric: bool = True,
+	need_area: bool = True,
+	external_context: _MapInitEvennessExternalContext | None = None,
+	cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+	external_static_cache_key: Any | None = None,
+	external_active_quad: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
 	z = uv[torch.isfinite(uv)].sum() * 0.0 if uv.numel() else torch.zeros((), device=uv.device, dtype=uv.dtype)
 	H, W = int(uv.shape[0]), int(uv.shape[1])
-	if H < 2 or W < 2 or active_quad.numel() == 0:
+	if H < 2 or W < 2 or active_quad.numel() == 0 or (not bool(need_metric) and not bool(need_area)):
 		return {"metric_smooth": z, "area_smooth": z}
 
-	finite_uv = torch.isfinite(uv).all(dim=-1)
-	finite_ext = torch.isfinite(ext_pos).all(dim=-1)
+	context_quad = active_quad if external_active_quad is None else external_active_quad
+	if external_context is None:
+		ctx_key = _map_init_evenness_external_context_cache_key(
+			ext_pos=ext_pos,
+			active_quad=context_quad,
+			prefix=cache_key_prefix,
+			external_static_cache_key=external_static_cache_key,
+		)
+		external_context = _map_init_cached_evenness_external_context(
+			ext_pos=ext_pos,
+			active_quad=context_quad,
+			need_metric=bool(need_metric),
+			need_area=bool(need_area),
+			cache=cache,
+			key=ctx_key,
+		)
+	elif not _map_init_evenness_context_has(external_context, need_metric=bool(need_metric), need_area=bool(need_area)):
+		external_context = _map_init_build_evenness_external_context(
+			ext_pos,
+			context_quad,
+			need_metric=bool(need_metric),
+			need_area=bool(need_area),
+			base=external_context,
+		)
+
 	if metric_pos is None or metric_valid is None:
 		if model_xyz is not None:
 			metric_pos, metric_valid = _map_init_model_metric_positions(
@@ -1226,84 +1443,84 @@ def _map_init_local_evenness_terms(
 			)
 		else:
 			metric_pos = uv
-			metric_valid = finite_uv
-	quad = active_quad.bool() & _map_init_quad_corner_all(metric_valid) & _map_init_quad_corner_all(finite_ext)
-	safe_metric = torch.where(metric_valid.unsqueeze(-1), metric_pos, torch.zeros_like(metric_pos))
-	safe_ext = torch.where(finite_ext.unsqueeze(-1), ext_pos, torch.zeros_like(ext_pos))
+			metric_valid = torch.isfinite(uv).all(dim=-1)
+	finite_metric = metric_valid.bool() & torch.isfinite(metric_pos).all(dim=-1)
+	safe_metric = torch.where(finite_metric.unsqueeze(-1), metric_pos, torch.zeros_like(metric_pos))
 	eps_t = torch.tensor(float(eps), device=uv.device, dtype=uv.dtype)
-
-	edge_h = torch.zeros(H - 1, W, device=uv.device, dtype=torch.bool)
-	edge_h[:, :-1] |= quad
-	edge_h[:, 1:] |= quad
 	duv_h = safe_metric[1:, :] - safe_metric[:-1, :]
-	dext_h = safe_ext[1:, :] - safe_ext[:-1, :]
-	uv_len_h = duv_h.norm(dim=-1)
-	ext_len_h = dext_h.norm(dim=-1)
-	valid_h = (
-		edge_h &
-		metric_valid[1:, :] & metric_valid[:-1, :] &
-		finite_ext[1:, :] & finite_ext[:-1, :] &
-		torch.isfinite(uv_len_h) & torch.isfinite(ext_len_h)
-	)
-	scale_h = torch.log((uv_len_h + eps_t) / (ext_len_h + eps_t))
-
-	edge_w = torch.zeros(H, W - 1, device=uv.device, dtype=torch.bool)
-	edge_w[:-1, :] |= quad
-	edge_w[1:, :] |= quad
 	duv_w = safe_metric[:, 1:] - safe_metric[:, :-1]
-	dext_w = safe_ext[:, 1:] - safe_ext[:, :-1]
-	uv_len_w = duv_w.norm(dim=-1)
-	ext_len_w = dext_w.norm(dim=-1)
-	valid_w = (
-		edge_w &
-		metric_valid[:, 1:] & metric_valid[:, :-1] &
-		finite_ext[:, 1:] & finite_ext[:, :-1] &
-		torch.isfinite(uv_len_w) & torch.isfinite(ext_len_w)
-	)
-	scale_w = torch.log((uv_len_w + eps_t) / (ext_len_w + eps_t))
 
-	metric_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
-	if int(scale_h.shape[0]) > 1:
-		metric_pairs.append((scale_h[1:, :] - scale_h[:-1, :], valid_h[1:, :] & valid_h[:-1, :]))
-	if int(scale_h.shape[1]) > 1:
-		metric_pairs.append((scale_h[:, 1:] - scale_h[:, :-1], valid_h[:, 1:] & valid_h[:, :-1]))
-	if int(scale_w.shape[0]) > 1:
-		metric_pairs.append((scale_w[1:, :] - scale_w[:-1, :], valid_w[1:, :] & valid_w[:-1, :]))
-	if int(scale_w.shape[1]) > 1:
-		metric_pairs.append((scale_w[:, 1:] - scale_w[:, :-1], valid_w[:, 1:] & valid_w[:, :-1]))
-	metric_smooth = _map_init_mean_square_diffs(metric_pairs, z)
-
-	def cross2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-		return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
-
-	p00 = safe_metric[:-1, :-1]
-	p10 = safe_metric[1:, :-1]
-	p01 = safe_metric[:-1, 1:]
-	p11 = safe_metric[1:, 1:]
-	if int(safe_metric.shape[-1]) == 2:
-		uv_area = 0.5 * cross2(p10 - p00, p01 - p00).abs() + 0.5 * cross2(p11 - p10, p11 - p01).abs()
-	else:
-		uv_area = (
-			0.5 * torch.cross(p10 - p00, p01 - p00, dim=-1).norm(dim=-1) +
-			0.5 * torch.cross(p11 - p10, p11 - p01, dim=-1).norm(dim=-1)
+	if bool(need_metric):
+		assert external_context.ext_len_h is not None and external_context.ext_len_w is not None
+		assert external_context.ext_len_h_valid is not None and external_context.ext_len_w_valid is not None
+		assert external_context.metric_h_pair_down is not None and external_context.metric_h_pair_right is not None
+		assert external_context.metric_w_pair_down is not None and external_context.metric_w_pair_right is not None
+		metric_quad = external_context.static_quad & _map_init_quad_corner_all(finite_metric)
+		edge_h = torch.zeros(H - 1, W, device=uv.device, dtype=torch.bool)
+		edge_h[:, :-1] |= metric_quad
+		edge_h[:, 1:] |= metric_quad
+		uv_len_h = duv_h.norm(dim=-1)
+		valid_h = (
+			edge_h &
+			external_context.ext_len_h_valid &
+			finite_metric[1:, :] & finite_metric[:-1, :] &
+			torch.isfinite(duv_h).all(dim=-1) &
+			torch.isfinite(uv_len_h)
 		)
+		scale_h = _map_init_signed_reciprocal_scale(uv_len_h, external_context.ext_len_h.to(device=uv.device, dtype=uv.dtype), eps_t)
 
-	e00 = safe_ext[:-1, :-1]
-	e10 = safe_ext[1:, :-1]
-	e01 = safe_ext[:-1, 1:]
-	e11 = safe_ext[1:, 1:]
-	ext_area = (
-		0.5 * torch.cross(e10 - e00, e01 - e00, dim=-1).norm(dim=-1) +
-		0.5 * torch.cross(e11 - e10, e11 - e01, dim=-1).norm(dim=-1)
-	)
-	area_valid = quad & torch.isfinite(uv_area) & torch.isfinite(ext_area)
-	area_scale = torch.log((uv_area + eps_t) / (ext_area + eps_t))
-	area_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
-	if int(area_scale.shape[0]) > 1:
-		area_pairs.append((area_scale[1:, :] - area_scale[:-1, :], area_valid[1:, :] & area_valid[:-1, :]))
-	if int(area_scale.shape[1]) > 1:
-		area_pairs.append((area_scale[:, 1:] - area_scale[:, :-1], area_valid[:, 1:] & area_valid[:, :-1]))
-	area_smooth = _map_init_mean_square_diffs(area_pairs, z)
+		edge_w = torch.zeros(H, W - 1, device=uv.device, dtype=torch.bool)
+		edge_w[:-1, :] |= metric_quad
+		edge_w[1:, :] |= metric_quad
+		uv_len_w = duv_w.norm(dim=-1)
+		valid_w = (
+			edge_w &
+			external_context.ext_len_w_valid &
+			finite_metric[:, 1:] & finite_metric[:, :-1] &
+			torch.isfinite(duv_w).all(dim=-1) &
+			torch.isfinite(uv_len_w)
+		)
+		scale_w = _map_init_signed_reciprocal_scale(uv_len_w, external_context.ext_len_w.to(device=uv.device, dtype=uv.dtype), eps_t)
+
+		metric_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+		if int(scale_h.shape[0]) > 1:
+			metric_pairs.append((scale_h[1:, :] - scale_h[:-1, :], external_context.metric_h_pair_down & valid_h[1:, :] & valid_h[:-1, :]))
+		if int(scale_h.shape[1]) > 1:
+			metric_pairs.append((scale_h[:, 1:] - scale_h[:, :-1], external_context.metric_h_pair_right & valid_h[:, 1:] & valid_h[:, :-1]))
+		if int(scale_w.shape[0]) > 1:
+			metric_pairs.append((scale_w[1:, :] - scale_w[:-1, :], external_context.metric_w_pair_down & valid_w[1:, :] & valid_w[:-1, :]))
+		if int(scale_w.shape[1]) > 1:
+			metric_pairs.append((scale_w[:, 1:] - scale_w[:, :-1], external_context.metric_w_pair_right & valid_w[:, 1:] & valid_w[:, :-1]))
+		metric_smooth = _map_init_mean_square_diffs(metric_pairs, z)
+	else:
+		metric_smooth = z
+
+	if bool(need_area):
+		assert external_context.ext_area is not None and external_context.ext_area_valid is not None
+		assert external_context.area_pair_down is not None and external_context.area_pair_right is not None
+		if int(safe_metric.shape[-1]) == 2:
+			def cross2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+				return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+			uv_area = 0.5 * cross2(duv_h[:, :-1], duv_w[:-1, :]).abs() + 0.5 * cross2(duv_w[1:, :], duv_h[:, 1:]).abs()
+		else:
+			uv_area = (
+				0.5 * torch.cross(duv_h[:, :-1], duv_w[:-1, :], dim=-1).norm(dim=-1) +
+				0.5 * torch.cross(duv_w[1:, :], duv_h[:, 1:], dim=-1).norm(dim=-1)
+			)
+		area_valid = (
+			external_context.ext_area_valid &
+			_map_init_quad_corner_all(finite_metric) &
+			torch.isfinite(uv_area)
+		)
+		area_scale = _map_init_signed_reciprocal_scale(uv_area, external_context.ext_area.to(device=uv.device, dtype=uv.dtype), eps_t)
+		area_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+		if int(area_scale.shape[0]) > 1:
+			area_pairs.append((area_scale[1:, :] - area_scale[:-1, :], external_context.area_pair_down & area_valid[1:, :] & area_valid[:-1, :]))
+		if int(area_scale.shape[1]) > 1:
+			area_pairs.append((area_scale[:, 1:] - area_scale[:, :-1], external_context.area_pair_right & area_valid[:, 1:] & area_valid[:, :-1]))
+		area_smooth = _map_init_mean_square_diffs(area_pairs, z)
+	else:
+		area_smooth = z
 
 	return {"metric_smooth": metric_smooth, "area_smooth": area_smooth}
 
@@ -1353,6 +1570,67 @@ def _map_init_regularization_masks(
 	vertex = band & ext_valid.bool() & uv_finite
 	quad = _map_init_quad_corner_all(vertex) & _map_init_external_quad_valid(ext_valid, ext_quad_valid)
 	return vertex, quad
+
+def _map_init_static_regularization_quad_mask(
+	*,
+	active_quad: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	vertex_shape: tuple[int, int],
+	cfg: SnapSurfMapInitConfig,
+) -> torch.Tensor:
+	if not bool(cfg.dense_opt):
+		return active_quad.bool() & _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	active_vertex = _map_init_active_vertex_mask(active_quad, tuple(int(v) for v in vertex_shape))
+	band = _dilate_mask_2d(
+		active_vertex.unsqueeze(0),
+		radius=int(cfg.dense_reg_radius),
+	)[0]
+	vertex = band & ext_valid.bool()
+	return _map_init_quad_corner_all(vertex) & _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+
+def _map_init_static_reg_quad_cache_key(
+	*,
+	active_quad: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	vertex_shape: tuple[int, int],
+	cfg: SnapSurfMapInitConfig,
+	prefix: tuple[Any, ...] = (),
+	external_static_cache_key: Any | None = None,
+) -> tuple[Any, ...]:
+	return (
+		"reg_evenness_static_quad",
+		*tuple(prefix),
+		external_static_cache_key,
+		bool(cfg.dense_opt),
+		int(cfg.dense_reg_radius),
+		tuple(int(v) for v in vertex_shape),
+		_map_init_tensor_cache_key(active_quad),
+		_map_init_tensor_cache_key(ext_valid),
+		None if ext_quad_valid is None else _map_init_tensor_cache_key(ext_quad_valid),
+	)
+
+def _map_init_cached_static_regularization_quad_mask(
+	*,
+	active_quad: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	vertex_shape: tuple[int, int],
+	cfg: SnapSurfMapInitConfig,
+	cache: dict[tuple[Any, ...], Any] | None,
+	key: tuple[Any, ...],
+) -> torch.Tensor:
+	cached = _map_init_cache_get(cache, key)
+	if torch.is_tensor(cached):
+		return cached
+	return _map_init_cache_put(cache, key, _map_init_static_regularization_quad_mask(
+		active_quad=active_quad,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		vertex_shape=vertex_shape,
+		cfg=cfg,
+	))
 
 def _map_init_dense_bilerp_quad(grid: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
 	H, W = int(grid.shape[0]), int(grid.shape[1])
@@ -2301,13 +2579,40 @@ def _map_init_objective(
 	else:
 		inv_terms = {"smooth": z, "bend": z, "jac": z, "jac_min": z, "jac_bad": z}
 	if metric_term_active or area_term_active:
-		even_terms = _timed("reg_evenness_terms", lambda: _map_init_local_evenness_terms(
-			uv_safe,
-			ext_vertex_pos,
-			reg_quad,
-			metric_pos=model_metric_pos,
-			metric_valid=model_metric_valid,
-		))
+		def _evenness_terms():
+			even_static_quad_key = _map_init_static_reg_quad_cache_key(
+				active_quad=active_quad,
+				ext_valid=ext_vertex_valid,
+				ext_quad_valid=ext_level_quad_valid,
+				vertex_shape=tuple(int(v) for v in uv_full.shape[:2]),
+				cfg=mi,
+				prefix=cache_key_prefix,
+				external_static_cache_key=external_static_cache_key,
+			)
+			even_static_quad = _map_init_cached_static_regularization_quad_mask(
+				active_quad=active_quad,
+				ext_valid=ext_vertex_valid,
+				ext_quad_valid=ext_level_quad_valid,
+				vertex_shape=tuple(int(v) for v in uv_full.shape[:2]),
+				cfg=mi,
+				cache=runtime_cache,
+				key=even_static_quad_key,
+			)
+			return _map_init_local_evenness_terms(
+				uv_safe,
+				ext_vertex_pos,
+				reg_quad,
+				metric_pos=model_metric_pos,
+				metric_valid=model_metric_valid,
+				need_metric=metric_term_active,
+				need_area=area_term_active,
+				cache=runtime_cache,
+				cache_key_prefix=cache_key_prefix,
+				external_static_cache_key=external_static_cache_key,
+				external_active_quad=even_static_quad,
+			)
+
+		even_terms = _timed("reg_evenness_terms", _evenness_terms)
 	else:
 		even_terms = {"metric_smooth": z, "area_smooth": z}
 	metric_smooth_loss = even_terms["metric_smooth"] if metric_term_active else z
