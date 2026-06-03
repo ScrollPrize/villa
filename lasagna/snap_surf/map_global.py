@@ -24,7 +24,7 @@ from .legacy import (
 	_closest_point_uv_on_model_quad,
 	_huber,
 )
-from .map_fixture_io import MapFixture, _float_tif, _write_json, compare_map_tensors, export_map_fixture, load_map_fixture
+from .map_fixture_io import MapFixture, _float_tif, _mask_tif, _write_json, compare_map_tensors, export_map_fixture, load_map_fixture
 from .map_objective import (
 	_map_init_distance_multiplier,
 	_map_init_lifted_z_heading_field,
@@ -35,6 +35,7 @@ from .map_pyramid import (
 	_map_init_coords3,
 	_map_init_dyadic_level_shape,
 	_map_init_dyadic_strides,
+	_map_init_external_quad_valid,
 	_map_init_integrate_dyadic_uv_pyramid,
 	_map_init_uv_pyr_from_dense,
 )
@@ -130,6 +131,10 @@ class MapRuntimeStatusPrinter:
 					("sm_vec", "map vector-normal loss"),
 					("sm_nrm", "map normal alignment loss"),
 					("sm_trn", "lifted z-heading loss"),
+					("sm_smo", "uv smooth loss"),
+					("sm_bnd", "uv bend loss"),
+					("sm_met", "model metric smoothness loss"),
+					("sm_ar", "external physical area smoothness loss"),
 					("sm_ts", "valid lifted z-heading samples"),
 					("sm_smp", "valid map samples"),
 					("sm_bad", "map samples rejected by validity/limits"),
@@ -142,12 +147,14 @@ class MapRuntimeStatusPrinter:
 			)
 			self.legend_printed = True
 		if self.rows % 20 == 0:
-			print(
-				f"{'step':>{self.width}s} {'sm_los':>8s} {'sm_dst':>8s} "
-				f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} {'sm_ts':>8s} "
-				f"{'sm_smp':>8s} {'sm_bad':>8s} {'sm_uvb':>8s} {'sm_mbd':>8s} "
-				f"{'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
-				flush=True,
+				print(
+					f"{'step':>{self.width}s} {'sm_los':>8s} {'sm_dst':>8s} "
+					f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} "
+					f"{'sm_smo':>8s} {'sm_bnd':>8s} {'sm_met':>8s} {'sm_ar':>8s} "
+					f"{'sm_ts':>8s} "
+					f"{'sm_smp':>8s} {'sm_bad':>8s} {'sm_uvb':>8s} {'sm_mbd':>8s} "
+					f"{'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
+					flush=True,
 			)
 		now = time.perf_counter()
 		its = None
@@ -161,10 +168,14 @@ class MapRuntimeStatusPrinter:
 			f"{format_progress_value(float(stats.get('snaps_map_loss', 0.0))):>8s} "
 			f"{format_progress_value(float(stats.get('snaps_map_dist', 0.0))):>8s} "
 			f"{format_progress_value(float(stats.get('snaps_map_vec', 0.0))):>8s} "
-			f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
-			f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
-			f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
-			f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_smooth', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_bend', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_metric_smooth', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_area_smooth', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
 			f"{format_progress_value(float(stats.get('snaps_map_sample_bad', 0.0))):>8s} "
 			f"{format_progress_value(float(stats.get('snaps_map_uvbad', 0.0))):>8s} "
 			f"{format_progress_value(float(stats.get('snaps_map_model_bad', 0.0))):>8s} "
@@ -1080,6 +1091,110 @@ def _quad_seed_connected_component(mask: torch.Tensor, seed_hw: tuple[int, int] 
 	return out
 
 
+def _mask_component_summary(mask: torch.Tensor, *, max_components: int = 5) -> tuple[int, str]:
+	src = mask.detach().bool().cpu()
+	if src.ndim != 2 or int(src.numel()) == 0 or not bool(src.any()):
+		return 0, "none"
+	H, W = int(src.shape[0]), int(src.shape[1])
+	remaining = src.clone()
+	components: list[tuple[int, int, int, int, int, bool]] = []
+	while bool(remaining.any()):
+		start = remaining.nonzero(as_tuple=False)[0]
+		seed = (int(start[0]), int(start[1]))
+		comp = _quad_seed_connected_component(remaining.to(device=mask.device), seed).cpu()
+		ids = comp.nonzero(as_tuple=False)
+		h0 = int(ids[:, 0].min())
+		h1 = int(ids[:, 0].max())
+		w0 = int(ids[:, 1].min())
+		w1 = int(ids[:, 1].max())
+		touches_edge = h0 == 0 or w0 == 0 or h1 == H - 1 or w1 == W - 1
+		components.append((int(ids.shape[0]), h0, h1, w0, w1, touches_edge))
+		remaining &= ~comp
+	components.sort(key=lambda item: item[0], reverse=True)
+	parts = [
+		f"{size}@h{h0}-{h1},w{w0}-{w1},edge={int(touches_edge)}"
+		for size, h0, h1, w0, w1, touches_edge in components[:max(1, int(max_components))]
+	]
+	return len(components), ";".join(parts)
+
+
+def _print_external_quad_initial_mask_stats(fixture: MapFixture, *, label: str) -> None:
+	ext_valid = fixture.ext_valid.bool()
+	ext_xyz = fixture.ext_xyz
+	ext_normals = fixture.ext_normals
+	ext_quad_valid = fixture.ext_quad_valid.bool()
+	finite_xyz = torch.isfinite(ext_xyz).all(dim=-1)
+	finite_norm = torch.isfinite(ext_normals).all(dim=-1)
+	normal_norm = ext_normals.norm(dim=-1)
+	nonzero_norm = normal_norm > 1.0e-8
+	vertex_total = int(ext_valid.numel())
+	raw_quad = _map_init_external_quad_valid(ext_valid, None)
+	base_quad = _external_quad_base_valid(ext_xyz, ext_valid, ext_quad_valid)
+	norm_quad = _map_init_external_quad_valid(ext_valid & finite_xyz & finite_norm & nonzero_norm, ext_quad_valid)
+	raw_components, raw_top = _mask_component_summary(raw_quad)
+	ext_quad_components, ext_quad_top = _mask_component_summary(ext_quad_valid)
+	base_components, base_top = _mask_component_summary(base_quad)
+	norm_components, norm_top = _mask_component_summary(norm_quad)
+
+	def _count(mask: torch.Tensor) -> int:
+		return int(mask.sum().detach().cpu())
+
+	print(
+		f"[snap_surf.map_global] external quad initial vertex mask {label} "
+		f"valid={_count(ext_valid)}/{vertex_total} "
+		f"finite_xyz={_count(ext_valid & finite_xyz)} "
+		f"finite_norm={_count(ext_valid & finite_norm)} "
+		f"nonzero_norm={_count(ext_valid & finite_norm & nonzero_norm)} "
+		f"reject_xyz={_count(ext_valid & ~finite_xyz)} "
+		f"reject_norm_finite={_count(ext_valid & finite_xyz & ~finite_norm)} "
+		f"reject_norm_zero={_count(ext_valid & finite_xyz & finite_norm & ~nonzero_norm)}",
+		flush=True,
+	)
+	print(
+		f"[snap_surf.map_global] external quad initial components {label} "
+		f"raw_quad={_count(raw_quad)} comps={raw_components} top={raw_top} "
+		f"ext_quad_valid={_count(ext_quad_valid)} comps={ext_quad_components} top={ext_quad_top} "
+		f"base_quad={_count(base_quad)} comps={base_components} top={base_top} "
+		f"norm_quad={_count(norm_quad)} comps={norm_components} top={norm_top}",
+		flush=True,
+	)
+
+
+def _format_external_quad_reject_values(
+	*,
+	name: str,
+	mask: torch.Tensor,
+	values: torch.Tensor,
+	threshold: float,
+	over: bool,
+	factors: torch.Tensor | None = None,
+	limit: int = 20,
+) -> str | None:
+	count = int(mask.sum().detach().cpu())
+	if count <= 0:
+		return None
+	idx = mask.nonzero(as_tuple=False).detach().cpu()
+	vals = values[mask].detach().cpu()
+	facs = factors[mask].detach().cpu() if factors is not None else None
+	order = torch.argsort(vals, descending=bool(over))
+	limit = max(1, min(int(limit), int(order.numel())))
+	entries = []
+	for j in order[:limit].tolist():
+		h = int(idx[j, 0])
+		w = int(idx[j, 1])
+		entry = f"{h},{w}:{float(vals[j]):.6g}"
+		if facs is not None:
+			entry += f"(factor={float(facs[j]):.6g})"
+		entries.append(entry)
+	more = count - limit
+	more_text = f" +{more} more" if more > 0 else ""
+	op = ">" if over else "<"
+	return (
+		f"{name} count={count} threshold{op}{float(threshold):.6g} "
+		f"values={','.join(entries)}{more_text}"
+	)
+
+
 def _external_quad_health_filter(
 	*,
 	ext_xyz: torch.Tensor,
@@ -1087,6 +1202,7 @@ def _external_quad_health_filter(
 	ext_quad_valid: torch.Tensor,
 	ext_normals: torch.Tensor | None,
 	cfg: SnapSurfMapInitConfig,
+	label: str,
 ) -> tuple[torch.Tensor, dict[str, float]]:
 	base = _external_quad_base_valid(ext_xyz, ext_valid, ext_quad_valid)
 	empty_stats = {
@@ -1177,6 +1293,25 @@ def _external_quad_health_filter(
 		healthy = healthy & torch.isfinite(normal_dot) & (normal_dot >= float(cfg.ext_mesh_health_min_normal_dot))
 	else:
 		normal_dot = torch.zeros_like(area)
+
+	zero_quad = torch.zeros_like(base)
+	positive_metrics = finite_metrics & (edge_min > 0.0) & (diag_min > 0.0) & (area > 0.0)
+	reject_nonfinite = base & ~finite_metrics
+	reject_nonpositive = base & finite_metrics & ~positive_metrics
+	reject_aspect = usable & (aspect > float(cfg.ext_mesh_health_max_aspect_ratio)) if float(cfg.ext_mesh_health_max_aspect_ratio) > 0.0 else zero_quad
+	reject_diag = usable & (diag_ratio > float(cfg.ext_mesh_health_max_diag_ratio)) if float(cfg.ext_mesh_health_max_diag_ratio) > 0.0 else zero_quad
+	reject_edge = usable & (edge_max > edge_ref_safe * float(cfg.ext_mesh_health_max_edge_ratio)) if float(cfg.ext_mesh_health_max_edge_ratio) > 0.0 else zero_quad
+	reject_area_max = usable & (area > area_ref_safe * float(cfg.ext_mesh_health_max_area_ratio)) if float(cfg.ext_mesh_health_max_area_ratio) > 0.0 else zero_quad
+	reject_area_min = usable & (area < area_ref_safe * float(cfg.ext_mesh_health_min_area_ratio)) if float(cfg.ext_mesh_health_min_area_ratio) > 0.0 else zero_quad
+	reject_tri_dot = usable & (tri_dot < float(cfg.ext_mesh_health_min_triangle_normal_dot)) if float(cfg.ext_mesh_health_min_triangle_normal_dot) > -1.0 else zero_quad
+	reject_normal_dot = (
+		usable & (~torch.isfinite(normal_dot) | (normal_dot < float(cfg.ext_mesh_health_min_normal_dot)))
+		if ext_normals is not None and float(cfg.ext_mesh_health_min_normal_dot) > 0.0 else zero_quad
+	)
+
+	def _count(mask: torch.Tensor) -> float:
+		return float(int(mask.sum().detach().cpu()))
+
 	stats = {
 		"quads_input": float(int(base.sum().detach().cpu())),
 		"quads_kept": float(int(healthy.sum().detach().cpu())),
@@ -1189,7 +1324,88 @@ def _external_quad_health_filter(
 		"max_diag_ratio": float(diag_ratio[base].max().detach().cpu()),
 		"min_triangle_normal_dot": float(tri_dot[base].min().detach().cpu()),
 		"min_normal_dot": float(normal_dot[base].min().detach().cpu()) if ext_normals is not None and float(cfg.ext_mesh_health_min_normal_dot) > 0.0 else 0.0,
+		"threshold_max_aspect": float(cfg.ext_mesh_health_max_aspect_ratio),
+		"threshold_max_diag_ratio": float(cfg.ext_mesh_health_max_diag_ratio),
+		"threshold_max_edge_ratio": float(cfg.ext_mesh_health_max_edge_ratio),
+		"threshold_max_edge": float((edge_ref_safe * float(cfg.ext_mesh_health_max_edge_ratio)).detach().cpu()) if float(cfg.ext_mesh_health_max_edge_ratio) > 0.0 else 0.0,
+		"threshold_max_area_ratio": float(cfg.ext_mesh_health_max_area_ratio),
+		"threshold_max_area": float((area_ref_safe * float(cfg.ext_mesh_health_max_area_ratio)).detach().cpu()) if float(cfg.ext_mesh_health_max_area_ratio) > 0.0 else 0.0,
+		"threshold_min_area_ratio": float(cfg.ext_mesh_health_min_area_ratio),
+		"threshold_min_area": float((area_ref_safe * float(cfg.ext_mesh_health_min_area_ratio)).detach().cpu()) if float(cfg.ext_mesh_health_min_area_ratio) > 0.0 else 0.0,
+		"threshold_min_triangle_normal_dot": float(cfg.ext_mesh_health_min_triangle_normal_dot),
+		"threshold_min_normal_dot": float(cfg.ext_mesh_health_min_normal_dot) if ext_normals is not None else 0.0,
+		"reject_reason_nonfinite": _count(reject_nonfinite),
+		"reject_reason_nonpositive": _count(reject_nonpositive),
+		"reject_reason_aspect": _count(reject_aspect),
+		"reject_reason_diag": _count(reject_diag),
+		"reject_reason_edge": _count(reject_edge),
+		"reject_reason_area_max": _count(reject_area_max),
+		"reject_reason_area_min": _count(reject_area_min),
+		"reject_reason_triangle_normal": _count(reject_tri_dot),
+		"reject_reason_normal": _count(reject_normal_dot),
 	}
+	reject_value_lines = [
+		_format_external_quad_reject_values(
+			name="aspect",
+			mask=reject_aspect,
+			values=aspect,
+			threshold=float(cfg.ext_mesh_health_max_aspect_ratio),
+			over=True,
+		),
+		_format_external_quad_reject_values(
+			name="diag",
+			mask=reject_diag,
+			values=diag_ratio,
+			threshold=float(cfg.ext_mesh_health_max_diag_ratio),
+			over=True,
+		),
+		_format_external_quad_reject_values(
+			name="edge",
+			mask=reject_edge,
+			values=edge_max,
+			threshold=float(stats["threshold_max_edge"]),
+			over=True,
+			factors=edge_max / edge_ref_safe,
+		),
+		_format_external_quad_reject_values(
+			name="area_hi",
+			mask=reject_area_max,
+			values=area,
+			threshold=float(stats["threshold_max_area"]),
+			over=True,
+			factors=area / area_ref_safe,
+		),
+		_format_external_quad_reject_values(
+			name="area_lo",
+			mask=reject_area_min,
+			values=area,
+			threshold=float(stats["threshold_min_area"]),
+			over=False,
+			factors=area / area_ref_safe,
+		),
+		_format_external_quad_reject_values(
+			name="tri_dot",
+			mask=reject_tri_dot,
+			values=tri_dot,
+			threshold=float(cfg.ext_mesh_health_min_triangle_normal_dot),
+			over=False,
+		),
+		_format_external_quad_reject_values(
+			name="normal_dot",
+			mask=reject_normal_dot,
+			values=normal_dot,
+			threshold=float(cfg.ext_mesh_health_min_normal_dot),
+			over=False,
+		),
+	]
+	reject_value_lines = [line for line in reject_value_lines if line is not None]
+	if label != "test" and reject_value_lines:
+		print(
+			f"[snap_surf.map_global] external quad health reject values {label} pre_dilation worst=20",
+			flush=True,
+		)
+		for line in reject_value_lines:
+			print(f"[snap_surf.map_global]   {line}", flush=True)
 	initial_rejected = base & ~healthy
 	reject_radius = max(0, int(cfg.ext_mesh_health_reject_radius))
 	padding_rejected = torch.zeros_like(base)
@@ -1212,6 +1428,8 @@ def _filter_external_quad_connected_component(
 	filtered_quad: torch.Tensor,
 	fixture: MapFixture,
 	metadata: dict[str, Any],
+	*,
+	label: str,
 ) -> tuple[torch.Tensor, dict[str, float], list[int] | None]:
 	seed_raw = metadata.get("seed_ext_sample_hw")
 	seed_hw: tuple[int, int] | None = None
@@ -1237,6 +1455,16 @@ def _filter_external_quad_connected_component(
 		return filtered_quad, {"quads_rejected_disconnected": 0.0, "quads_connected_kept": float(int(filtered_quad.sum().detach().cpu()))}, None
 	component = _quad_seed_connected_component(filtered_quad, seed_hw)
 	disconnected = filtered_quad & ~component
+	if label != "test" and bool(disconnected.any().detach().cpu()):
+		prefix = f"snap_surf_ext_quad_cc_{_debug_obj_safe_label(label)}"
+		_mask_tif(Path.cwd() / f"{prefix}_input.tif", filtered_quad.detach().bool())
+		_mask_tif(Path.cwd() / f"{prefix}_kept.tif", component.detach().bool())
+		_mask_tif(Path.cwd() / f"{prefix}_removed.tif", disconnected.detach().bool())
+		print(
+			f"[snap_surf.map_global] external quad connected component masks "
+			f"{label} input={prefix}_input.tif kept={prefix}_kept.tif removed={prefix}_removed.tif",
+			flush=True,
+		)
 	stats = {
 		"quads_rejected_disconnected": float(int(disconnected.sum().detach().cpu())),
 		"quads_connected_kept": float(int(component.sum().detach().cpu())),
@@ -1266,17 +1494,20 @@ def _apply_external_quad_health_filter(
 	if cached is None:
 		if cache is not None and cache_key is not None and cache_stats is not None:
 			cache_stats["health_miss"] = int(cache_stats.get("health_miss", 0)) + 1
+		_print_external_quad_initial_mask_stats(fixture, label=label)
 		filtered_quad, stats = _external_quad_health_filter(
 			ext_xyz=fixture.ext_xyz,
-			ext_valid=fixture.ext_valid,
-			ext_quad_valid=fixture.ext_quad_valid,
-			ext_normals=fixture.ext_normals,
-			cfg=mi,
-		)
+				ext_valid=fixture.ext_valid,
+				ext_quad_valid=fixture.ext_quad_valid,
+				ext_normals=fixture.ext_normals,
+				cfg=mi,
+				label=label,
+			)
 		filtered_quad, component_stats, moved_seed = _filter_external_quad_connected_component(
 			filtered_quad,
 			fixture,
 			metadata,
+			label=label,
 		)
 		stats.update(component_stats)
 		stats["quads_kept"] = float(int(filtered_quad.sum().detach().cpu()))
@@ -1296,6 +1527,14 @@ def _apply_external_quad_health_filter(
 	after = int(stats["quads_kept"])
 	rejected = int(stats["quads_rejected"])
 	if rejected > 0 and not cache_hit:
+		def _threshold_text(key: str, *, disabled_if_le: float | None = 0.0, disabled_if_lt: float | None = None) -> str:
+			value = float(stats.get(key, 0.0))
+			if disabled_if_lt is not None and value < float(disabled_if_lt):
+				return "off"
+			if disabled_if_le is not None and value <= float(disabled_if_le):
+				return "off"
+			return f"{value:.6g}"
+
 		print(
 			"[snap_surf.map_global] external quad health filter "
 			f"{label} kept={after}/{before} rejected={rejected} "
@@ -1305,6 +1544,35 @@ def _apply_external_quad_health_filter(
 			f"min_tri_dot={stats.get('min_triangle_normal_dot', 0.0):.6g} "
 			f"pad_r={int(stats.get('quads_reject_radius', 0.0))} pad_rejected={int(stats.get('quads_rejected_padding', 0.0))} "
 			f"disconnected={int(stats.get('quads_rejected_disconnected', 0.0))}",
+			flush=True,
+		)
+		print(
+			"[snap_surf.map_global] external quad health thresholds "
+			f"{label} "
+			f"edge<={_threshold_text('threshold_max_edge')} "
+			f"(ratio={_threshold_text('threshold_max_edge_ratio')}) "
+			f"area>={_threshold_text('threshold_min_area')} "
+			f"(ratio={_threshold_text('threshold_min_area_ratio')}) "
+			f"area<={_threshold_text('threshold_max_area')} "
+			f"(ratio={_threshold_text('threshold_max_area_ratio')}) "
+			f"aspect<={_threshold_text('threshold_max_aspect')} "
+			f"diag<={_threshold_text('threshold_max_diag_ratio')} "
+			f"tri_dot>={_threshold_text('threshold_min_triangle_normal_dot', disabled_if_le=None, disabled_if_lt=-1.0)} "
+			f"normal_dot>={_threshold_text('threshold_min_normal_dot')}",
+			flush=True,
+		)
+		print(
+			"[snap_surf.map_global] external quad health reject reasons "
+			f"{label} pre_dilation "
+			f"nonfinite={int(stats.get('reject_reason_nonfinite', 0.0))} "
+			f"nonpositive={int(stats.get('reject_reason_nonpositive', 0.0))} "
+			f"aspect={int(stats.get('reject_reason_aspect', 0.0))} "
+			f"diag={int(stats.get('reject_reason_diag', 0.0))} "
+			f"edge={int(stats.get('reject_reason_edge', 0.0))} "
+			f"area_hi={int(stats.get('reject_reason_area_max', 0.0))} "
+			f"area_lo={int(stats.get('reject_reason_area_min', 0.0))} "
+			f"tri_dot={int(stats.get('reject_reason_triangle_normal', 0.0))} "
+			f"normal_dot={int(stats.get('reject_reason_normal', 0.0))}",
 			flush=True,
 		)
 	if moved_seed is not None and rejected > 0:
@@ -4923,6 +5191,7 @@ class GlobalMapRuntime:
 			)
 		else:
 			fixture = replace(map_fixture, metadata=dict(map_fixture.metadata))
+		fixture_source = replace(fixture, metadata=dict(fixture.metadata))
 		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
 		_t_startup = time.perf_counter()
 		fixture = _apply_external_quad_health_filter(
@@ -5246,11 +5515,11 @@ class GlobalMapRuntime:
 					model_xyz=fixture.model_xyz,
 					model_valid=fixture.model_valid,
 					model_normals=fixture.model_normals,
-					ext_xyz=fixture.ext_xyz,
-					ext_valid=fixture.ext_valid,
-					ext_normals=fixture.ext_normals,
-					ext_quad_valid=fixture.ext_quad_valid,
-					seed_xyz=tuple(float(v) for v in fixture.metadata.get("seed_xyz", (0.0, 0.0, 0.0))),
+					ext_xyz=fixture_source.ext_xyz,
+					ext_valid=fixture_source.ext_valid,
+					ext_normals=fixture_source.ext_normals,
+					ext_quad_valid=fixture_source.ext_quad_valid,
+					seed_xyz=tuple(float(v) for v in fixture_source.metadata.get("seed_xyz", (0.0, 0.0, 0.0))),
 					surface_index=int(external_surface_index),
 					surface_count=1,
 					step=int(self.steps_run),

@@ -67,10 +67,10 @@ class SnapSurfMapInitConfig:
 	max_step_neighbor_ratio: float = 10.0
 	ext_mesh_health_filter: bool = True
 	ext_mesh_health_max_edge_ratio: float = 2.0
-	ext_mesh_health_max_area_ratio: float = 2.0
+	ext_mesh_health_max_area_ratio: float = 3.0
 	ext_mesh_health_min_area_ratio: float = 0.75
-	ext_mesh_health_max_aspect_ratio: float = 1.5
-	ext_mesh_health_max_diag_ratio: float = 1.5
+	ext_mesh_health_max_aspect_ratio: float = 2.0
+	ext_mesh_health_max_diag_ratio: float = 2.0
 	ext_mesh_health_min_triangle_normal_dot: float = 0.25
 	ext_mesh_health_min_normal_dot: float = 0.0
 	ext_mesh_health_reject_radius: int = 4

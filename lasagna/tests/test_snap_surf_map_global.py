@@ -28,6 +28,7 @@ from snap_surf.map_global import (
 	GlobalMapRuntime,
 	GlobalMapStageConfig,
 	GlobalMapConfig,
+	MapRuntimeStatusPrinter,
 	SelfMapRuntime,
 	_LrAutoscaleState,
 	_affine_from_seed_ext_quads,
@@ -183,6 +184,33 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8, write
 
 
 class SnapSurfMapGlobalTest(unittest.TestCase):
+	def test_map_runtime_status_printer_includes_smoothing_losses(self) -> None:
+		stdout = StringIO()
+		stats = {
+			"snaps_map_loss": 1.0,
+			"snaps_map_dist": 2.0,
+			"snaps_map_vec": 3.0,
+			"snaps_map_norm": 4.0,
+			"snaps_map_turn": 5.0,
+			"snaps_map_smooth": 6.0,
+			"snaps_map_bend": 7.0,
+			"snaps_map_metric_smooth": 8.0,
+			"snaps_map_area_smooth": 9.0,
+		}
+
+		with redirect_stdout(stdout):
+			MapRuntimeStatusPrinter(label="stage", total_steps=1).print(
+				step=0,
+				total=1,
+				stats=stats,
+			)
+
+		out = stdout.getvalue()
+		self.assertIn("sm_smo", out)
+		self.assertIn("sm_bnd", out)
+		self.assertIn("sm_met", out)
+		self.assertIn("sm_ar", out)
+
 	def _snap_loss_case(
 		self,
 		*,
@@ -1599,7 +1627,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			stdout = StringIO()
 
 			with redirect_stdout(stdout):
-				filtered = _apply_external_quad_health_filter(fixture, cfg, label="test")
+				filtered = _apply_external_quad_health_filter(fixture, cfg, label="debug_values")
 
 			active = _full_active_quad(filtered)
 			self.assertLess(int(active.sum()), int(_full_active_quad(fixture).sum()))
@@ -1609,7 +1637,11 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertFalse(bool(active[2, 2]))
 			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected"], 0.0)
 			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected_padding"], 0.0)
-			self.assertIn("external quad health filter test", stdout.getvalue())
+			out_text = stdout.getvalue()
+			self.assertIn("external quad health filter debug_values", out_text)
+			self.assertIn("external quad health reject values debug_values", out_text)
+			self.assertIn("aspect count=", out_text)
+			self.assertIn("values=", out_text)
 
 	def test_external_quad_health_filter_rejects_twisted_quad(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -1747,9 +1779,20 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as tmp:
 			fixture_dir = os.path.join(tmp, "fixture")
 			export_dir = os.path.join(tmp, "exported_fixture")
-			_write_planar_global_fixture(fixture_dir)
+			_write_planar_global_fixture(fixture_dir, h=6, w=6)
 			fixture = load_map_fixture(fixture_dir)
-			runtime = GlobalMapRuntime(seed_xyz=(2.0, 2.0, 0.0))
+			ext_xyz = fixture.ext_xyz.clone()
+			ext_xyz[2, 2, 2] = 1000.0
+			fixture = replace(fixture, ext_xyz=ext_xyz)
+			runtime = GlobalMapRuntime(
+				seed_xyz=(2.0, 2.0, 0.0),
+				base={
+					"map_init": {
+						"ext_mesh_health_filter": True,
+						"ext_mesh_health_reject_radius": 0,
+					},
+				},
+			)
 			stage = GlobalMapStageConfig(
 				name="export_init",
 				steps=0,
@@ -1792,7 +1835,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertFalse(Path(export_dir, "objs").exists())
 			exported = load_map_fixture(export_dir)
 			self.assertEqual(tuple(exported.reference_uv.shape), tuple(fixture.reference_uv.shape))
-			self.assertEqual(int(exported.reference_active_quad.sum()), int(_full_active_quad(fixture).sum()))
+			self.assertEqual(int(exported.ext_quad_valid.sum()), int(fixture.ext_quad_valid.sum()))
+			self.assertLess(int(exported.reference_active_quad.sum()), int(_full_active_quad(fixture).sum()))
 
 	def test_fixture_cli_stage_export_writes_fixture_under_out(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:

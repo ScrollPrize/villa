@@ -21,12 +21,12 @@
 		"map_dist": 0.0001,
 		"map_vec_normal": 1.0,
 		"map_surface_normal": 1.0,
-		"map_smooth": 0.05,
+		"map_smooth": 0.1,
 		"map_bend": 0.01,
-		"map_z_lift": 1.0,
+		"map_z_lift": 0.1,
 		"map_jac": 1.0,
-		"map_metric_smooth": 0.05,
-		"map_area_smooth": 0.02,
+		"map_metric_smooth": 0.1,
+		"map_area_smooth": 0.1,
 		"map_dense_prior": 0.001,
 		"map_station_t": 1.0
 	},
@@ -36,6 +36,7 @@
 			"steps": 100,
 			"lr": 0.1,
 			"params": ["map_surf_affine"],
+			"w_fac" : { "map_z_lift" : 100.0 },
 			"args": {
 				"status_interval": 10,
 				"subdiv": 2,
@@ -75,7 +76,8 @@
 			"args": {
 				"status_interval": 100,
 				"subdiv": 2
-			}
+			},
+			"w_fac" : { "map_z_lift" : 100.0 }
 		},
 		{
 			"name": "map_uv_coarse5",

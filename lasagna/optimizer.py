@@ -2711,10 +2711,14 @@ def optimize(
 				"snaps_map_snap_samples",
 				"snaps_map_loss",
 				"snaps_map_dist",
-				"snaps_map_vec",
-				"snaps_map_norm",
-				"snaps_map_samples",
-			}
+					"snaps_map_vec",
+					"snaps_map_norm",
+					"snaps_map_smooth",
+					"snaps_map_bend",
+					"snaps_map_metric_smooth",
+					"snaps_map_area_smooth",
+					"snaps_map_samples",
+				}
 			def _show_status_key(k: str) -> bool:
 				if not str(k).startswith("snaps_map_"):
 					return True
