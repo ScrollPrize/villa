@@ -802,6 +802,40 @@ def _map_init_sample_geometry_limit_ok_precomputed(
 		ok = ok & angle_ok
 	return ok
 
+def _map_init_sample_geometry_limit_ok_steps_q(
+	*,
+	p_ext: torch.Tensor,
+	n_ext_raw: torch.Tensor,
+	n_ext: torch.Tensor,
+	p_model: torch.Tensor,
+	n_model_raw: torch.Tensor,
+	n_model: torch.Tensor,
+	d: torch.Tensor,
+	c_ext: torch.Tensor,
+	c_model: torch.Tensor,
+	c_norm: torch.Tensor,
+	cfg: SnapSurfMapInitConfig,
+	ext_step_q: torch.Tensor | None = None,
+	model_step_q: torch.Tensor | None = None,
+) -> torch.Tensor:
+	ext_step = None if ext_step_q is None else ext_step_q.unsqueeze(-1)
+	model_step = None if model_step_q is None else model_step_q.unsqueeze(-1)
+	return _map_init_sample_geometry_limit_ok_precomputed(
+		p_ext=p_ext,
+		n_ext_raw=n_ext_raw,
+		n_ext=n_ext,
+		p_model=p_model,
+		n_model_raw=n_model_raw,
+		n_model=n_model,
+		d=d,
+		c_ext=c_ext,
+		c_model=c_model,
+		c_norm=c_norm,
+		cfg=cfg,
+		ext_step=ext_step,
+		model_step=model_step,
+	)
+
 def _map_init_jacobian_values(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
@@ -2087,6 +2121,28 @@ def _map_init_dense_quad_model_physical_step_lengths_from_metric(
 	], dim=-1).bool()
 	return _map_init_dense_mean_quad_edge_length(corners, corner_valid)
 
+def _map_init_model_metric_steps_tensor(
+	uv_full: torch.Tensor,
+	model_xyz_safe: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_depth: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	model_metric_pos, model_metric_valid = _map_init_model_metric_positions(
+		uv_full,
+		model_xyz=model_xyz_safe,
+		model_valid=model_valid,
+		model_depth=int(model_depth),
+		model_xyz_safe=model_xyz_safe,
+	)
+	return (
+		model_metric_pos,
+		model_metric_valid,
+		_map_init_dense_quad_model_physical_step_lengths_from_metric(
+			model_metric_pos,
+			model_metric_valid,
+		),
+	)
+
 def _map_init_dense_quad_physical_step_lengths(
 	*,
 	uv_full: torch.Tensor,
@@ -2522,29 +2578,22 @@ def _map_init_objective(
 				cache_key_prefix=cache_key_prefix,
 				ext_coords_cache_key=external_static_cache_key,
 			))
-			def _sample_model_metric_steps():
-				model_metric_pos_i, model_metric_valid_i = _map_init_model_metric_positions(
-					uv_full,
-					model_xyz=model_xyz,
-					model_valid=model_valid,
-					model_depth=int(model_depth),
-					model_xyz_safe=model_xyz_safe,
+			model_metric_step_args = (uv_full, model_xyz_safe, model_valid, int(model_depth))
+			if bool(compile_objective):
+				model_metric_pos_cached, model_metric_valid_cached, model_step_q = _timed("sample_model_metric_steps", lambda: _map_init_call_compiled(
+					"model_metric_steps",
+					_map_init_model_metric_steps_tensor,
+					model_metric_step_args,
+					mode=compile_mode,
+				))
+			else:
+				model_metric_pos_cached, model_metric_valid_cached, model_step_q = _timed(
+					"sample_model_metric_steps",
+					lambda: _map_init_model_metric_steps_tensor(*model_metric_step_args),
 				)
-				return (
-					model_metric_pos_i,
-					model_metric_valid_i,
-					_map_init_dense_quad_model_physical_step_lengths_from_metric(
-						model_metric_pos_i,
-						model_metric_valid_i,
-					),
-				)
-
-			model_metric_pos_cached, model_metric_valid_cached, model_step_q = _timed("sample_model_metric_steps", _sample_model_metric_steps)
-			ext_step_f = ext_step_q.unsqueeze(-1).expand(Hq, Wq, S)
-			model_step_f = model_step_q.unsqueeze(-1).expand(Hq, Wq, S)
 		else:
-			ext_step_f = None
-			model_step_f = None
+			ext_step_q = None
+			model_step_q = None
 
 		def _sample_dot_product_tensors():
 			v_i = p_model - p_ext_f
@@ -2560,7 +2609,7 @@ def _map_init_objective(
 			)
 
 		v, d, u, c_ext, c_model, c_norm = _timed("dot_products", _sample_dot_product_tensors)
-		sample_limit_ok = _timed("geometry_limit", lambda: _map_init_sample_geometry_limit_ok_precomputed(
+		sample_limit_ok = _timed("geometry_limit", lambda: _map_init_sample_geometry_limit_ok_steps_q(
 			p_ext=p_ext_f,
 			n_ext_raw=n_ext_raw_f,
 			n_ext=n_ext,
@@ -2572,8 +2621,8 @@ def _map_init_objective(
 			c_model=c_model,
 			c_norm=c_norm,
 			cfg=mi,
-			ext_step=ext_step_f,
-			model_step=model_step_f,
+			ext_step_q=ext_step_q,
+			model_step_q=model_step_q,
 		))
 		dist_mult = _timed("dist_multiplier", lambda: _map_init_distance_multiplier(c_ext, c_model, mi))
 		dist_values, vec_values, norm_values = _timed("loss_values", lambda: (
