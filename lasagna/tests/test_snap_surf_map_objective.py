@@ -224,6 +224,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertIn("sample_model_context", no_step_profile)
 		self.assertNotIn("sample_model_metric_steps", no_step_profile)
 		self.assertIn("sample_model_metric_steps", step_profile)
+		self.assertEqual(len(step_profile["sample_model_metric_steps"]), 1)
 
 	def test_map_init_objective_samples_model_metric_in_regularization_only_when_active(self) -> None:
 		uv = torch.stack(torch.meshgrid(torch.arange(4, dtype=torch.float32), torch.arange(4, dtype=torch.float32), indexing="ij"), dim=-1)
