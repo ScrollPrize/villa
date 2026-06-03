@@ -1054,6 +1054,32 @@ def _dilate_quad_mask_euclidean(mask: torch.Tensor, radius: int) -> torch.Tensor
 	return out
 
 
+def _quad_seed_connected_component(mask: torch.Tensor, seed_hw: tuple[int, int] | None) -> torch.Tensor:
+	src = mask.bool()
+	out = torch.zeros_like(src)
+	if seed_hw is None or src.ndim != 2 or int(src.numel()) == 0:
+		return out
+	h, w = int(seed_hw[0]), int(seed_hw[1])
+	H, W = int(src.shape[0]), int(src.shape[1])
+	if h < 0 or h >= H or w < 0 or w >= W or not bool(src[h, w].detach().cpu()):
+		return out
+	out[h, w] = True
+	frontier = torch.zeros_like(src)
+	frontier[h, w] = True
+	while bool(frontier.any().detach().cpu()):
+		expanded = torch.zeros_like(src)
+		expanded[1:, :] |= frontier[:-1, :]
+		expanded[:-1, :] |= frontier[1:, :]
+		expanded[:, 1:] |= frontier[:, :-1]
+		expanded[:, :-1] |= frontier[:, 1:]
+		next_frontier = expanded & src & ~out
+		if not bool(next_frontier.any().detach().cpu()):
+			break
+		out |= next_frontier
+		frontier = next_frontier
+	return out
+
+
 def _external_quad_health_filter(
 	*,
 	ext_xyz: torch.Tensor,
@@ -1067,6 +1093,7 @@ def _external_quad_health_filter(
 		"quads_input": float(int(base.sum().detach().cpu())),
 		"quads_kept": 0.0,
 		"quads_rejected": float(int(base.sum().detach().cpu())),
+		"quads_rejected_disconnected": 0.0,
 		"median_edge": 0.0,
 		"median_area": 0.0,
 		"max_edge": 0.0,
@@ -1181,6 +1208,42 @@ def _external_quad_health_filter(
 	return ext_quad_valid.bool() & healthy, stats
 
 
+def _filter_external_quad_connected_component(
+	filtered_quad: torch.Tensor,
+	fixture: MapFixture,
+	metadata: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, float], list[int] | None]:
+	seed_raw = metadata.get("seed_ext_sample_hw")
+	seed_hw: tuple[int, int] | None = None
+	moved_seed: list[int] | None = None
+	if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
+		h, w = int(seed_raw[0]), int(seed_raw[1])
+		if 0 <= h < int(filtered_quad.shape[0]) and 0 <= w < int(filtered_quad.shape[1]) and bool(filtered_quad[h, w].detach().cpu()):
+			seed_hw = (h, w)
+	if seed_hw is None and metadata.get("seed_xyz") is not None:
+		seed_vals = metadata.get("seed_xyz")
+		if isinstance(seed_vals, (list, tuple)) and len(seed_vals) == 3:
+			seed = torch.tensor(seed_vals, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
+			ext_quad, _point, _dist = _closest_external_seed_surface(
+				seed=seed,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_quad_valid=filtered_quad,
+			)
+			if ext_quad is not None:
+				seed_hw = (int(ext_quad[0]), int(ext_quad[1]))
+				moved_seed = [int(ext_quad[0]), int(ext_quad[1])]
+	if seed_hw is None:
+		return filtered_quad, {"quads_rejected_disconnected": 0.0, "quads_connected_kept": float(int(filtered_quad.sum().detach().cpu()))}, None
+	component = _quad_seed_connected_component(filtered_quad, seed_hw)
+	disconnected = filtered_quad & ~component
+	stats = {
+		"quads_rejected_disconnected": float(int(disconnected.sum().detach().cpu())),
+		"quads_connected_kept": float(int(component.sum().detach().cpu())),
+	}
+	return component, stats, moved_seed
+
+
 def _apply_external_quad_health_filter(
 	fixture: MapFixture,
 	cfg: SnapSurfConfig,
@@ -1210,25 +1273,14 @@ def _apply_external_quad_health_filter(
 			ext_normals=fixture.ext_normals,
 			cfg=mi,
 		)
-		moved_seed: list[int] | None = None
-		seed_raw = metadata.get("seed_ext_sample_hw")
-		seed_valid = False
-		if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
-			h, w = int(seed_raw[0]), int(seed_raw[1])
-			if 0 <= h < int(filtered_quad.shape[0]) and 0 <= w < int(filtered_quad.shape[1]):
-				seed_valid = bool(filtered_quad[h, w].detach().cpu())
-		if not seed_valid and metadata.get("seed_xyz") is not None:
-			seed_vals = metadata.get("seed_xyz")
-			if isinstance(seed_vals, (list, tuple)) and len(seed_vals) == 3:
-				seed = torch.tensor(seed_vals, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
-				ext_quad, _point, _dist = _closest_external_seed_surface(
-					seed=seed,
-					ext_xyz=fixture.ext_xyz,
-					ext_valid=fixture.ext_valid,
-					ext_quad_valid=filtered_quad,
-				)
-				if ext_quad is not None:
-					moved_seed = [int(ext_quad[0]), int(ext_quad[1])]
+		filtered_quad, component_stats, moved_seed = _filter_external_quad_connected_component(
+			filtered_quad,
+			fixture,
+			metadata,
+		)
+		stats.update(component_stats)
+		stats["quads_kept"] = float(int(filtered_quad.sum().detach().cpu()))
+		stats["quads_rejected"] = float(int(stats["quads_input"]) - int(stats["quads_kept"]))
 		if cache is not None and cache_key is not None:
 			cache[cache_key] = (filtered_quad.detach(), dict(stats), moved_seed)
 	else:
@@ -1251,7 +1303,8 @@ def _apply_external_quad_health_filter(
 			f"median_area={stats['median_area']:.6g} max_area={stats['max_area']:.6g} "
 			f"max_aspect={stats.get('max_aspect', 0.0):.6g} max_diag={stats.get('max_diag_ratio', 0.0):.6g} "
 			f"min_tri_dot={stats.get('min_triangle_normal_dot', 0.0):.6g} "
-			f"pad_r={int(stats.get('quads_reject_radius', 0.0))} pad_rejected={int(stats.get('quads_rejected_padding', 0.0))}",
+			f"pad_r={int(stats.get('quads_reject_radius', 0.0))} pad_rejected={int(stats.get('quads_rejected_padding', 0.0))} "
+			f"disconnected={int(stats.get('quads_rejected_disconnected', 0.0))}",
 			flush=True,
 		)
 	if moved_seed is not None and rejected > 0:

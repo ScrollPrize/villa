@@ -23,6 +23,7 @@
 		"map_surface_normal": 1.0,
 		"map_smooth": 0.05,
 		"map_bend": 0.01,
+		"map_z_lift": 1.0,
 		"map_jac": 1.0,
 		"map_metric_smooth": 0.05,
 		"map_area_smooth": 0.02,
@@ -68,7 +69,7 @@
 		},
 		{
 			"name": "map_surf_affine_refine5",
-			"steps": 0,
+			"steps": 500,
 			"lr": 0.01,
 			"params": ["map_surf_affine"],
 			"args": {
@@ -78,7 +79,7 @@
 		},
 		{
 			"name": "map_uv_coarse5",
-			"steps": 0,
+			"steps": 500,
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
@@ -100,7 +101,7 @@
 		},
 		{
 			"name": "map_uv_refine_noturn",
-			"steps": 0,
+			"steps": 200,
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,

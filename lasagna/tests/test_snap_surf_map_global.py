@@ -1636,6 +1636,36 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected"], 0.0)
 			self.assertIn("min_triangle_normal_dot", filtered.metadata["ext_mesh_health"])
 
+	def test_external_quad_health_filter_removes_disconnected_islands(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=6, w=6)
+			fixture = load_map_fixture(tmp)
+			ext_quad_valid = fixture.ext_quad_valid.clone()
+			ext_quad_valid[:, 3] = False
+			fixture = replace(fixture, ext_quad_valid=ext_quad_valid)
+			cfg = snap_surf_config_from_global_config(
+				GlobalMapConfig(
+					base={
+						"map_init": {
+							"ext_mesh_health_filter": True,
+							"ext_mesh_health_reject_radius": 0,
+						}
+					}
+				)
+			)
+
+			filtered = _apply_external_quad_health_filter(fixture, cfg, label="test")
+
+			active = _full_active_quad(filtered)
+			self.assertTrue(bool(active[2, 2]))
+			self.assertFalse(bool(active[2, 4]))
+			self.assertEqual(int(active[:, 4].sum()), 0)
+			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected_disconnected"], 0.0)
+			self.assertEqual(
+				int(filtered.metadata["ext_mesh_health"]["quads_connected_kept"]),
+				int(active.sum()),
+			)
+
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			cfg = parse_global_map_config(_write_config(tmp, affine_steps=1, map_steps=1))
