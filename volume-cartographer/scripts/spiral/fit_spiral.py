@@ -36,6 +36,7 @@ scroll_zarr_path = None
 normal_nx_zarr_path = f'{dataset_path}/normals/las_008_nx.ome.zarr'
 normal_ny_zarr_path = f'{dataset_path}/normals/las_008_ny.ome.zarr'
 normal_zarr_group = '4'
+grad_mag_zarr_path = None
 pcl_json_paths = [
     f'{dataset_path}/s1_relative_windings_fixed.json',
     f'{dataset_path}/same_winding_annotations_fixed_merged.json',
@@ -98,6 +99,9 @@ default_config = {
     'pcl_normals_sample_radius': 1,
     'dense_normals_num_points': 20_000,
     'regularisation_num_points': 1500,
+    'grad_mag_encode_scale': 1000.0,
+    'grad_mag_factor': 0.25 * 4,  # 4 maps from 2um to 8um
+    'spacing_integration_steps': 8,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_track_radius': 50.,
@@ -106,6 +110,7 @@ default_config = {
     'loss_weight_sym_dirichlet': 10.0,
     'loss_weight_pcl_normals': 0.0,
     'loss_weight_dense_normals': 2.5e2,
+    'loss_weight_dense_spacing': 0.,
     'loss_weight_umbilicus': 5.,
     'loss_weight_shell_outer': 4.0,
     'loss_weight_shell_no_cross': 0.0,
@@ -1291,45 +1296,63 @@ def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_poin
     return (1. - (scroll_normal * target_normal).sum(dim=-1).abs()).mean()
 
 
-def prepare_dense_normal_volume(scroll_zarr):
-    # Densely load the precomputed nx/ny normal-component zarrs over the z-ROI into a compact
-    # uint8 volume that can be pushed to the GPU and sampled by get_dense_normals_loss. The raw
-    # bytes are kept as-is (no radius averaging, no decode) and only rescaled to floats at sample
-    # time; channel layout is (nx_u8, ny_u8), nz is reconstructed as sqrt(1 - nx^2 - ny^2), and
-    # validity is derived per-voxel from (nx_u8 != 0) | (ny_u8 != 0) so invalid voxels can be
-    # masked out of the loss.
-    if cfg['loss_weight_dense_normals'] <= 0:
+def prepare_lasagna_volume(scroll_zarr):
+    # Densely load the precomputed nx/ny normal-component and grad_mag (windings-per-base-voxel)
+    # zarrs over the z-ROI into a compact uint8 volume that can be pushed to the GPU and sampled by
+    # get_lasagna_losses. The raw bytes are kept as-is (no radius averaging, no decode) and
+    # only rescaled to floats at sample time; channel layout is (nx_u8, ny_u8, grad_mag_u8), nz is
+    # reconstructed as sqrt(1 - nx^2 - ny^2), and per-channel validity is derived from
+    # (nx_u8 != 0) | (ny_u8 != 0) for the normal direction and (grad_mag_u8 != 0) for the spacing.
+    if cfg['loss_weight_dense_normals'] <= 0 and cfg['loss_weight_dense_spacing'] <= 0:
         return None
-    if not normal_nx_zarr_path or not normal_ny_zarr_path:
-        raise RuntimeError('dense normal loss is enabled, but FIT_SPIRAL_NORMAL_NX_ZARR_PATH/FIT_SPIRAL_NORMAL_NY_ZARR_PATH is not set')
 
-    print(f'loading dense normal zarrs group {normal_zarr_group}')
-    nx_root = zarr.open(normal_nx_zarr_path, mode='r')
-    ny_root = zarr.open(normal_ny_zarr_path, mode='r')
-    nx_array = nx_root[normal_zarr_group]
-    ny_array = ny_root[normal_zarr_group]
-    if nx_array.shape != ny_array.shape:
-        raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
+    use_normals = cfg['loss_weight_dense_normals'] > 0
+    use_spacing = cfg['loss_weight_dense_spacing'] > 0
+    if use_normals and (not normal_nx_zarr_path or not normal_ny_zarr_path):
+        raise RuntimeError('dense normal loss is enabled, but one of the nx/ny zarr paths is not set')
+    if use_spacing and not grad_mag_zarr_path:
+        raise RuntimeError('dense spacing loss is enabled, but grad_mag zarr path is not set')
+
+    print(f'loading lasagna zarrs group {normal_zarr_group}')
+    nx_array = ny_array = grad_mag_array = None
+    reference_shape = None
+    if use_normals:
+        nx_root = zarr.open(normal_nx_zarr_path, mode='r')
+        ny_root = zarr.open(normal_ny_zarr_path, mode='r')
+        nx_array = nx_root[normal_zarr_group]
+        ny_array = ny_root[normal_zarr_group]
+        if nx_array.shape != ny_array.shape:
+            raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
+        reference_shape = nx_array.shape
+    if use_spacing:
+        grad_mag_root = zarr.open(grad_mag_zarr_path, mode='r')
+        grad_mag_array = grad_mag_root[normal_zarr_group]
+        if reference_shape is None:
+            reference_shape = grad_mag_array.shape
+        elif grad_mag_array.shape != reference_shape:
+            raise ValueError(f'grad_mag zarr shape {grad_mag_array.shape} differs from dense normal shape {reference_shape}')
 
     if scroll_zarr is not None:
         expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / downsample_factor).astype(np.int64))
-        if tuple(nx_array.shape) != expected_shape:
+        if tuple(reference_shape) != expected_shape:
             print(
-                f'WARNING: normal zarr shape {nx_array.shape} does not match '
+                f'WARNING: lasagna zarr shape {reference_shape} does not match '
                 f'ceil(scroll_zarr.shape / downsample_factor) {expected_shape}'
             )
 
-    z_size = int(nx_array.shape[0])
+    z_size = int(reference_shape[0])
     z_lo = max(0, z_begin)
     z_hi = min(z_size, z_end)
     if z_hi <= z_lo:
-        raise RuntimeError(f'dense normal z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
+        raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
 
-    print(f'loading dense normals for z in [{z_lo}, {z_hi}) (shape {z_hi - z_lo}, {nx_array.shape[1]}, {nx_array.shape[2]})')
-    nx_u8 = np.ascontiguousarray(nx_array[z_lo:z_hi], dtype=np.uint8)
-    ny_u8 = np.ascontiguousarray(ny_array[z_lo:z_hi], dtype=np.uint8)
-    volume = np.stack([nx_u8, ny_u8], axis=0)  # 2 (nx, ny), z, y, x  uint8
-    print(f'dense normals: loaded {volume.nbytes / 1e9:.2f} GB volume {volume.shape}')
+    roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
+    print(f'loading lasagna for z in [{z_lo}, {z_hi}) (shape {roi_shape[0]}, {roi_shape[1]}, {roi_shape[2]})')
+    nx_u8 = np.ascontiguousarray(nx_array[z_lo:z_hi], dtype=np.uint8) if use_normals else np.zeros(roi_shape, dtype=np.uint8)
+    ny_u8 = np.ascontiguousarray(ny_array[z_lo:z_hi], dtype=np.uint8) if use_normals else np.zeros(roi_shape, dtype=np.uint8)
+    grad_mag_u8 = np.ascontiguousarray(grad_mag_array[z_lo:z_hi], dtype=np.uint8) if use_spacing else np.zeros(roi_shape, dtype=np.uint8)
+    volume = np.stack([nx_u8, ny_u8, grad_mag_u8], axis=0)  # 3 (nx, ny, grad_mag), z, y, x  uint8
+    print(f'lasagna: loaded {volume.nbytes / 1e9:.2f} GB volume {volume.shape}')
     volume = torch.from_numpy(volume).to(device='cuda')
     return {
         'volume': volume,
@@ -1338,31 +1361,52 @@ def prepare_dense_normal_volume(scroll_zarr):
     }
 
 
-def get_dense_normals_loss(slice_to_spiral_transform, dr_per_winding, dense_normal_volume, outer_winding_idx, num_points, epsilon=2.0):
+def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=2.0):
     # Sample points uniformly over the spiral cylinder (a disk of radius
-    # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI), transform the local
-    # spiral-space normal into scroll space as a covector using a central-difference estimate of
-    # the scroll->spiral Jacobian, then match that direction to the dense scroll-space normal.
+    # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI). Two losses are computed:
+    #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
+    #             central-difference J^T (a normal is a covector, not a finite-length displacement)
+    #             and matched in direction to the precomputed nx/ny scroll-space normal.
+    #   (spacing) at each sample, shift inward and outward by dr_per_winding/2 along the spiral
+    #             radial direction (so the two endpoints span exactly one winding in spiral
+    #             space), map both endpoints to scroll space, and integrate the winding-density
+    #             field (grad_mag, windings per voxel) along the scroll-space segment between
+    #             them. grad_mag is a density, not a distance, so the number of windings the
+    #             segment actually crosses is the line integral of that density along it; for a
+    #             correct fit the integral equals 1 (one winding). The density is decoded from
+    #             grad_mag and converted from base-volume to current-grid voxels via
+    #             downsample_factor.
     device = dr_per_winding.device
-    if dense_normal_volume is None or outer_winding_idx is None:
-        return torch.zeros([], device=device)
+    zero = torch.zeros([], device=device)
+    if lasagna_volume is None or outer_winding_idx is None:
+        return zero, zero
 
-    volume = dense_normal_volume['volume']  # 2 (nx, ny), z, y, x  uint8
-    z_size, y_size, x_size = dense_normal_volume['shape']
-    z_origin = dense_normal_volume['z_origin']
+    volume = lasagna_volume['volume']  # 3 (nx, ny, grad_mag), z, y, x  uint8
+    z_size, y_size, x_size = lasagna_volume['shape']
+    z_origin = lasagna_volume['z_origin']
 
-    r_max = dr_per_winding.detach() * float(outer_winding_idx)
-    r_min = dr_per_winding.detach()
+    dr = dr_per_winding.detach()
+    r_max = dr * float(outer_winding_idx)
+    r_min = dr  # inner endpoint sits at radius - dr/2 >= dr/2 > 0
     theta = torch.rand([num_points], device=device) * (2 * torch.pi)
     radius = torch.sqrt(torch.rand([num_points], device=device) * (r_max ** 2 - r_min ** 2) + r_min ** 2)
     z = torch.empty([num_points], device=device).uniform_(float(z_begin), float(z_end - 1))
-    spiral_zyx = torch.stack([z, torch.sin(theta) * radius, torch.cos(theta) * radius], dim=-1)
+    sin_theta, cos_theta = torch.sin(theta), torch.cos(theta)
+    spiral_zyx = torch.stack([z, sin_theta * radius, cos_theta * radius], dim=-1)
+    radius_inner = radius - dr / 2
+    radius_outer = radius + dr / 2
+    spiral_inner = torch.stack([z, sin_theta * radius_inner, cos_theta * radius_inner], dim=-1)
+    spiral_outer = torch.stack([z, sin_theta * radius_outer, cos_theta * radius_outer], dim=-1)
 
-    scroll_zyx = slice_to_spiral_transform.inv(spiral_zyx)
-    scroll_zyx_detached = scroll_zyx.detach()
+    scroll_samples = slice_to_spiral_transform.inv(torch.cat([spiral_inner, spiral_outer, spiral_zyx], dim=0))
+    scroll_inner, scroll_outer, scroll_center = scroll_samples.chunk(3, dim=0)
+    scroll_displacement = scroll_outer - scroll_inner  # spans exactly one winding in spiral space
+    scroll_segment_length = torch.linalg.norm(scroll_displacement, dim=-1).clamp(min=1.e-8)
 
-    # Nearest-voxel gather keeps the volume at byte precision on the GPU; decode to floats here.
-    sample_zyx = scroll_zyx_detached.round().long()
+    # Look up the precomputed scroll-space targets at the midpoint of the displacement (the
+    # geometric centre of the one-winding step in scroll space).
+    scroll_mid = ((scroll_inner + scroll_outer) / 2).detach()
+    sample_zyx = scroll_mid.round().long()
     zi = sample_zyx[:, 0] - z_origin
     yi = sample_zyx[:, 1]
     xi = sample_zyx[:, 2]
@@ -1372,16 +1416,48 @@ def get_dense_normals_loss(slice_to_spiral_transform, dr_per_winding, dense_norm
     xi = xi.clamp(0, x_size - 1)
     nx_u8 = volume[0, zi, yi, xi]
     ny_u8 = volume[1, zi, yi, xi]
-    weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
+    normal_weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
     nx = _decode_uint8_normal_component(nx_u8.float())
     ny = _decode_uint8_normal_component(ny_u8.float())
     nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
     target_normal = F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
 
-    scroll_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx_detached, spiral_zyx=spiral_zyx, epsilon=epsilon)
+    scroll_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_center, spiral_zyx=spiral_zyx, epsilon=epsilon)
+    normals_residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
+    normals_loss = (normals_residual * normal_weight).sum() / normal_weight.sum().clamp(min=1)
 
-    residual = 1. - (scroll_normal * target_normal).sum(dim=-1).abs()
-    return (residual * weight).sum() / weight.sum().clamp(min=1)
+    # grad_mag encodes a winding density (windings per base-volume voxel); the decode factor below
+    # also rescales it to current-grid windings/voxel. The number of windings actually crossed by
+    # the one-winding scroll-space segment (scroll_inner -> scroll_outer) is the line integral of
+    # this density along it, so we sample the density at evenly spaced midpoints along the segment
+    # and accumulate density * dl (a midpoint Riemann sum). For a correct fit the integral equals 1.
+    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * downsample_factor
+    num_steps = int(cfg['spacing_integration_steps'])
+    step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps  # midpoints in [0, 1]
+    # [num_points, num_steps, 3] scroll-space samples along scroll_inner -> scroll_outer
+    integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
+    int_idx = integration_zyx.detach().round().long()
+    izi = int_idx[..., 0] - z_origin
+    iyi = int_idx[..., 1]
+    ixi = int_idx[..., 2]
+    int_in_bounds = (izi >= 0) & (izi < z_size) & (iyi >= 0) & (iyi < y_size) & (ixi >= 0) & (ixi < x_size)
+    izi = izi.clamp(0, z_size - 1)
+    iyi = iyi.clamp(0, y_size - 1)
+    ixi = ixi.clamp(0, x_size - 1)
+    grad_mag_u8 = volume[2, izi, iyi, ixi]  # [num_points, num_steps]
+    sample_valid = (grad_mag_u8 != 0) & int_in_bounds
+    density = grad_mag_u8.float() * density_decode  # current-grid windings/voxel
+    # dl is the per-step scroll-space length (current-grid voxels); gradient flows through it so the
+    # loss can stretch/compress the mapping until the integrated winding count matches.
+    dl = scroll_segment_length / num_steps
+    integrated_windings = (density * sample_valid.float()).sum(dim=-1) * dl
+    # Only score samples whose whole segment lies inside the valid field; a partially covered path
+    # would under-integrate and unfairly compare against 1.
+    spacing_weight = sample_valid.all(dim=-1).float()
+    spacing_residual = (integrated_windings - 1.).abs()
+    spacing_loss = (spacing_residual * spacing_weight).sum() / spacing_weight.sum().clamp(min=1)
+
+    return normals_loss, spacing_loss
 
 
 def get_unattached_pcl_strip_losses(
@@ -3044,7 +3120,7 @@ def save_spiral_on_tracks_overlay(
         )
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, unattached_pcl_strips, tracks, pcl_normal_samples, dense_normal_volume, shell_patch, z_to_umbilicus_yx, out_path):
+def fit_spiral_3d(scroll_zarr, patches_dict, unattached_pcl_strips, tracks, pcl_normal_samples, lasagna_volume, shell_patch, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
 
     num_patches = len(patches_list)
@@ -3308,14 +3384,16 @@ def fit_spiral_3d(scroll_zarr, patches_dict, unattached_pcl_strips, tracks, pcl_
                 cfg['pcl_normals_num_points'],
             ) * cfg['loss_weight_pcl_normals']
 
-        if cfg['loss_weight_dense_normals'] > 0 and dense_normal_volume is not None:
-            losses['dense_normals'] = get_dense_normals_loss(
+        if (cfg['loss_weight_dense_normals'] > 0 or cfg['loss_weight_dense_spacing'] > 0) and lasagna_volume is not None:
+            dense_normals_loss, dense_spacing_loss = get_lasagna_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
-                dense_normal_volume,
+                lasagna_volume,
                 shell_outer_winding_idx,
                 cfg['dense_normals_num_points'],
-            ) * cfg['loss_weight_dense_normals']
+            )
+            losses['dense_normals'] = dense_normals_loss * cfg['loss_weight_dense_normals']
+            losses['dense_spacing'] = dense_spacing_loss * cfg['loss_weight_dense_spacing']
 
         if (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0) and unattached_pcl_strips:
             unattached_pcl_radius_loss, unattached_pcl_dt_loss = get_unattached_pcl_strip_losses(
@@ -3476,14 +3554,16 @@ def fit_spiral_3d(scroll_zarr, patches_dict, unattached_pcl_strips, tracks, pcl_
                     )
                     losses['sym_dirichlet'] = sym_dirichlet_loss * cfg['loss_weight_sym_dirichlet']
 
-                if cfg['loss_weight_dense_normals'] > 0 and dense_normal_volume is not None:
-                    losses['dense_normals'] = get_dense_normals_loss(
+                if (cfg['loss_weight_dense_normals'] > 0 or cfg['loss_weight_dense_spacing'] > 0) and lasagna_volume is not None:
+                    dense_normals_loss, dense_spacing_loss = get_lasagna_losses(
                         slice_to_spiral_transform,
                         dr_per_winding,
-                        dense_normal_volume,
+                        lasagna_volume,
                         shell_outer_winding_idx,
                         cfg['dense_normals_num_points'],
-                    ) * cfg['loss_weight_dense_normals']
+                    )
+                    losses['dense_normals'] = dense_normals_loss * cfg['loss_weight_dense_normals']
+                    losses['dense_spacing'] = dense_spacing_loss * cfg['loss_weight_dense_spacing']
 
                 loss = sum(losses.values())
 
@@ -3766,7 +3846,7 @@ def main():
         unattached_pcl_strips,
         scroll_zarr_array,
     )
-    dense_normal_volume = prepare_dense_normal_volume(scroll_zarr_array)
+    lasagna_volume = prepare_lasagna_volume(scroll_zarr_array)
 
     if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
@@ -3790,7 +3870,7 @@ def main():
         unattached_pcl_strips,
         tracks,
         pcl_normal_samples,
-        dense_normal_volume,
+        lasagna_volume,
         shell_patch,
         umbilicus,
         out_path,
