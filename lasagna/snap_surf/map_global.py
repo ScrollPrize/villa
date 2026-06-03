@@ -3900,9 +3900,25 @@ def _objective_for_uv(
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 	need_stats: bool = True,
 	active_quad: torch.Tensor | None = None,
+	profile_blocks: dict[str, list[float]] | None = None,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	active = _level_active_quad(_full_active_quad(fixture), int(level)) if active_quad is None else active_quad
 	ext_coords = None if int(level) == 0 else _level_coords(fixture.ext_xyz.shape[:2], int(level), uv)
+	external_static_cache_key = (
+		"level0",
+		tuple(int(v) for v in uv.shape[:2]),
+		str(uv.dtype),
+		str(uv.device),
+	) if int(level) == 0 else (
+		"level_coords",
+		int(level),
+		tuple(int(v) for v in uv.shape[:2]),
+		tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+		str(uv.dtype),
+		str(uv.device),
+	)
 	sign_i = int(fixture.metadata.get("sign", 1) or 1)
 	if z_lift is _NO_Z_LIFT:
 		z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
@@ -3929,6 +3945,10 @@ def _objective_for_uv(
 		ext_z_lift_valid=ext_z_lift_valid,
 		model_z_lift_theta=None if z_lift_d is None else z_lift_d["model_theta_lifted"],
 		model_z_lift_valid=None if z_lift_d is None else z_lift_d["model_valid"],
+		profile_blocks=profile_blocks,
+		runtime_cache=runtime_cache,
+		cache_key_prefix=cache_key_prefix,
+		external_static_cache_key=external_static_cache_key,
 	)
 
 
@@ -4252,6 +4272,8 @@ def _global_progress_state(
 	w_station: float,
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 	active_quad: torch.Tensor | None = None,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
 ) -> tuple[float, dict[str, torch.Tensor], dict[str, float]]:
 	loss, terms = _objective_for_uv(
 		uv=uv,
@@ -4260,6 +4282,8 @@ def _global_progress_state(
 		level=int(level),
 		z_lift=z_lift,
 		active_quad=active_quad,
+		runtime_cache=runtime_cache,
+		cache_key_prefix=cache_key_prefix,
 	)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
@@ -5091,6 +5115,7 @@ class GlobalMapRuntime:
 		self._external_health_cache: dict[tuple[Any, ...], tuple[torch.Tensor, dict[str, float], list[int] | None]] = {}
 		self._z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 		self._z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+		self._map_objective_cache: dict[tuple[Any, ...], Any] = {}
 		self._fixture_exports_done: set[str] = set()
 		self.last_fixture: MapFixture | None = None
 
@@ -5289,6 +5314,14 @@ class GlobalMapRuntime:
 		params, train_level = self._params_for_stage(stage)
 		sample_level = _stage_objective_level(stage, train_level, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
 		stage_active_quad = _level_active_quad(_full_active_quad(fixture), int(sample_level))
+		objective_cache_key_prefix = (
+			"runtime",
+			int(mesh_epoch),
+			int(external_surface_index),
+			int(sample_level),
+			int(self.sign),
+			stage.name or _stage_param_label(stage.params, fallback="map_stage"),
+		)
 		startup_initial_eval_s = 0.0
 		startup_timing_printed = False
 		def _maybe_print_startup_timing() -> None:
@@ -5381,6 +5414,8 @@ class GlobalMapRuntime:
 					w_station=w_station,
 					z_lift=stage_z_lift,
 					active_quad=stage_active_quad,
+					runtime_cache=self._map_objective_cache,
+					cache_key_prefix=objective_cache_key_prefix,
 				)
 			return _stats_from_eval(loss_f, terms, err)
 
@@ -5433,6 +5468,8 @@ class GlobalMapRuntime:
 					z_lift=stage_z_lift,
 					need_stats=status_due,
 					active_quad=stage_active_quad,
+					runtime_cache=self._map_objective_cache,
+					cache_key_prefix=objective_cache_key_prefix,
 				)
 				if w_station > 0.0:
 					station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target, active_quad=stage_active_quad)
@@ -6135,6 +6172,8 @@ def _time_profile_component(
 	level: int,
 	z_lift: dict[str, Any] | None | object,
 	active_quad: torch.Tensor,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
 	times: list[float] = []
 	loss_value = 0.0
@@ -6153,6 +6192,8 @@ def _time_profile_component(
 			z_lift=z_lift,
 			need_stats=False,
 			active_quad=active_quad,
+			runtime_cache=runtime_cache,
+			cache_key_prefix=cache_key_prefix,
 		)
 		loss.backward()
 		if fixture.model_xyz.is_cuda:
@@ -6172,6 +6213,120 @@ def _time_profile_component(
 		"median_s": float(times_sorted[n // 2]),
 		"max_s": float(times_sorted[-1]),
 	}
+
+
+def _profile_timing_row(component: str, times: list[float], *, loss_value: float = 0.0) -> dict[str, Any]:
+	times_sorted = sorted(times)
+	n = len(times_sorted)
+	return {
+		"component": component,
+		"repeats": int(n),
+		"loss": float(loss_value),
+		"mean_s": float(sum(times) / max(1, len(times))),
+		"min_s": float(times_sorted[0]),
+		"median_s": float(times_sorted[n // 2]),
+		"max_s": float(times_sorted[-1]),
+	}
+
+
+def _time_profile_shared_phase(
+	*,
+	component: str,
+	repeats: int,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+	include_objective: bool,
+	include_backward: bool,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+) -> dict[str, Any]:
+	times: list[float] = []
+	loss_value = 0.0
+	for _ in range(max(1, int(repeats))):
+		for p in params:
+			p.grad = None
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		start = time.perf_counter()
+		uv = uv_fn()
+		if include_objective:
+			loss, terms = _objective_for_uv(
+				uv=uv,
+				fixture=fixture,
+				cfg=cfg,
+				level=int(level),
+				z_lift=z_lift,
+				need_stats=False,
+				active_quad=active_quad,
+				runtime_cache=runtime_cache,
+				cache_key_prefix=cache_key_prefix,
+			)
+			loss_value = float(terms["loss"].detach().cpu())
+			if include_backward:
+				loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		times.append(time.perf_counter() - start)
+	for p in params:
+		p.grad = None
+	row = _profile_timing_row(component, times, loss_value=loss_value)
+	row["profile_phase"] = component
+	row["include_objective"] = bool(include_objective)
+	row["include_backward"] = bool(include_backward)
+	return row
+
+
+def _time_profile_objective_blocks(
+	*,
+	repeats: int,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+	block_times: dict[str, list[float]] = {}
+	for _ in range(max(1, int(repeats))):
+		for p in params:
+			p.grad = None
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		uv = uv_fn()
+		loss, _terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=cfg,
+			level=int(level),
+			z_lift=z_lift,
+			need_stats=False,
+			active_quad=active_quad,
+			profile_blocks=block_times,
+			runtime_cache=runtime_cache,
+			cache_key_prefix=cache_key_prefix,
+		)
+		loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+	for p in params:
+		p.grad = None
+	rows: list[dict[str, Any]] = []
+	for name in sorted(block_times):
+		row = _profile_timing_row(name, block_times[name])
+		row["block"] = name
+		rows.append(row)
+	total = sum(float(row["mean_s"]) for row in rows)
+	for row in rows:
+		row["mean_pct_of_block_sum"] = 0.0 if total <= 0.0 else 100.0 * float(row["mean_s"]) / total
+	return rows
 
 
 def _annotate_profile_percentages(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6211,7 +6366,7 @@ def _print_profile_component_table(rows: list[dict[str, Any]]) -> None:
 	if not rows:
 		return
 	columns = (
-		("component", "component", 14, "text"),
+		("component", "component", 16, "text"),
 		("mean_s", "mean_ms", 12, "ms"),
 		("mean_net_s", "single_ms", 12, "ms"),
 		("mean_net_pct_of_all", "single%", 9, "pct"),
@@ -6222,6 +6377,34 @@ def _print_profile_component_table(rows: list[dict[str, Any]]) -> None:
 		("median_removed_delta_s", "remove_md_ms", 12, "ms"),
 	)
 	print("[snap_surf.map_global] component profile", flush=True)
+	print(" ".join(label.rjust(width) for _key, label, width, _kind in columns), flush=True)
+	for row in rows:
+		values: list[str] = []
+		for key, _label, width, kind in columns:
+			if kind == "text":
+				text = str(row.get(key, ""))
+			elif kind == "pct":
+				text = f"{float(row.get(key, 0.0)):.1f}%"
+			elif kind == "ms":
+				text = f"{float(row.get(key, 0.0)) * 1000.0:.3e}"
+			else:
+				text = f"{float(row.get(key, 0.0)):.6g}"
+			values.append(text.rjust(width))
+		print(" ".join(values), flush=True)
+
+
+def _print_profile_block_table(rows: list[dict[str, Any]]) -> None:
+	if not rows:
+		return
+	columns = (
+		("block", "block", 26, "text"),
+		("mean_s", "mean_ms", 12, "ms"),
+		("mean_pct_of_block_sum", "%sum", 8, "pct"),
+		("median_s", "median_ms", 12, "ms"),
+		("min_s", "min_ms", 12, "ms"),
+		("max_s", "max_ms", 12, "ms"),
+	)
+	print("[snap_surf.map_global] objective block profile", flush=True)
 	print(" ".join(label.rjust(width) for _key, label, width, _kind in columns), flush=True)
 	for row in rows:
 		values: list[str] = []
@@ -6347,10 +6530,46 @@ def profile_fixture_components(
 		)
 		sample_level = _stage_objective_level(stage_cfg_raw, level, tuple(int(v) for v in stage_fixture.ext_xyz.shape[:2]))
 		stage_active_quad = _level_active_quad(_full_active_quad(stage_fixture), int(sample_level))
+		objective_cache_key_prefix = (
+			"profile_fixture",
+			int(sample_level),
+			stage_cfg_raw.name or _stage_param_label(stage_cfg_raw.params, fallback="map_stage"),
+		)
 		profile_params = list(runtime.global_model.map_uv_ms.parameters())[level:]
 		before = _snapshot_parameters([runtime.affine.affine] + list(runtime.global_model.map_uv_ms.parameters()))
 		uv_fn = lambda: runtime.global_model(active_level=int(sample_level))
 		rows: list[dict[str, Any]] = []
+		none_cfg = _profile_component_cfg(stage_cfg, "none")
+		rows.append(_time_profile_shared_phase(
+			component="uv_fwd",
+			repeats=int(repeats),
+			uv_fn=uv_fn,
+			params=profile_params,
+			fixture=stage_fixture,
+			cfg=none_cfg,
+			level=int(sample_level),
+			z_lift=stage_z_lift,
+			active_quad=stage_active_quad,
+			include_objective=False,
+			include_backward=False,
+			runtime_cache=runtime._map_objective_cache,
+			cache_key_prefix=objective_cache_key_prefix,
+		))
+		rows.append(_time_profile_shared_phase(
+			component="none_fwd",
+			repeats=int(repeats),
+			uv_fn=uv_fn,
+			params=profile_params,
+			fixture=stage_fixture,
+			cfg=none_cfg,
+			level=int(sample_level),
+			z_lift=stage_z_lift,
+			active_quad=stage_active_quad,
+			include_objective=True,
+			include_backward=False,
+			runtime_cache=runtime._map_objective_cache,
+			cache_key_prefix=objective_cache_key_prefix,
+		))
 		component_names = list(_PROFILE_COMPONENT_WEIGHTS.keys())
 		components = ["none", "all"] + component_names + [f"without_{name}" for name in component_names]
 		for component in components:
@@ -6365,12 +6584,27 @@ def profile_fixture_components(
 				level=int(sample_level),
 				z_lift=stage_z_lift,
 				active_quad=stage_active_quad,
+				runtime_cache=runtime._map_objective_cache,
+				cache_key_prefix=objective_cache_key_prefix,
 			))
 		rows = _annotate_profile_percentages(rows)
 		_print_profile_component_table([
 			row for row in rows
 			if not str(row.get("component", "")).startswith("without_")
 		])
+		block_rows = _time_profile_objective_blocks(
+			repeats=int(repeats),
+			uv_fn=uv_fn,
+			params=profile_params,
+			fixture=stage_fixture,
+			cfg=stage_cfg,
+			level=int(sample_level),
+			z_lift=stage_z_lift,
+			active_quad=stage_active_quad,
+			runtime_cache=runtime._map_objective_cache,
+			cache_key_prefix=objective_cache_key_prefix,
+		)
+		_print_profile_block_table(block_rows)
 		if profiler_trace is not None:
 			_write_profile_trace(
 				path=profiler_trace,
@@ -6394,6 +6628,7 @@ def profile_fixture_components(
 			"sample_level": int(sample_level),
 			"repeats": int(repeats),
 			"rows": rows,
+			"block_rows": block_rows,
 			"profiler_trace": None if profiler_trace is None else str(profiler_trace),
 		}
 		_write_json(out / "profile_components.json", payload)

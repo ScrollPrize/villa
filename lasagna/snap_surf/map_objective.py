@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import math
 from pathlib import Path
 import time
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -157,6 +158,82 @@ def _map_init_valid_field_values(field: torch.Tensor, valid: torch.Tensor) -> to
 	while valid_b.ndim < field.ndim:
 		valid_b = valid_b.unsqueeze(-1)
 	return torch.where(valid_b & torch.isfinite(field), field, torch.zeros_like(field))
+
+def _map_init_tensor_cache_key(tensor: torch.Tensor) -> tuple[Any, ...]:
+	return (
+		id(tensor),
+		int(tensor.data_ptr()) if tensor.numel() else 0,
+		tuple(int(v) for v in tensor.shape),
+		tuple(int(v) for v in tensor.stride()),
+		str(tensor.dtype),
+		str(tensor.device),
+		int(tensor.storage_offset()),
+		int(getattr(tensor, "_version", 0)),
+		bool(tensor.requires_grad),
+	)
+
+def _map_init_cache_get(cache: dict[tuple[Any, ...], Any] | None, key: tuple[Any, ...]) -> Any:
+	if cache is None:
+		return None
+	return cache.get(key)
+
+def _map_init_cache_put(cache: dict[tuple[Any, ...], Any] | None, key: tuple[Any, ...], value: Any) -> Any:
+	if cache is None:
+		return value
+	if len(cache) > 64:
+		cache.clear()
+	cache[key] = value
+	return value
+
+def _map_init_packed_pos_norm_values(
+	pos: torch.Tensor,
+	normals: torch.Tensor,
+	valid: torch.Tensor,
+) -> torch.Tensor:
+	return torch.cat([
+		_map_init_valid_field_values(pos, valid),
+		_map_init_valid_field_values(normals, valid),
+	], dim=-1)
+
+def _map_init_packed_pos_norm_cache_key(
+	kind: str,
+	pos: torch.Tensor,
+	normals: torch.Tensor,
+	valid: torch.Tensor,
+	*,
+	prefix: tuple[Any, ...] = (),
+) -> tuple[Any, ...]:
+	return (
+		"packed_pos_norm",
+		str(kind),
+		*tuple(prefix),
+		_map_init_tensor_cache_key(pos),
+		_map_init_tensor_cache_key(normals),
+		_map_init_tensor_cache_key(valid),
+	)
+
+def _map_init_cached_packed_pos_norm_values(
+	*,
+	kind: str,
+	pos: torch.Tensor,
+	normals: torch.Tensor,
+	valid: torch.Tensor,
+	cache: dict[tuple[Any, ...], Any] | None = None,
+	prefix: tuple[Any, ...] = (),
+) -> torch.Tensor:
+	key = _map_init_packed_pos_norm_cache_key(kind, pos, normals, valid, prefix=prefix)
+	cached = _map_init_cache_get(cache, key)
+	if torch.is_tensor(cached):
+		return cached
+	packed = _map_init_packed_pos_norm_values(pos, normals, valid)
+	if pos.requires_grad or normals.requires_grad:
+		return packed
+	return _map_init_cache_put(cache, key, packed)
+
+def _map_init_split_packed_pos_norm(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	if int(packed.shape[-1]) != 6:
+		raise ValueError(f"expected packed pos/norm tensor with 6 channels, got shape {tuple(packed.shape)}")
+	return packed[..., :3], packed[..., 3:6]
 
 def _map_init_sample_scalar_quad_field(
 	field: torch.Tensor,
@@ -914,6 +991,107 @@ def _map_init_dense_bilerp_quad(grid: torch.Tensor, offsets: torch.Tensor) -> to
 		fh * fw * v11
 	)
 
+def _map_init_dense_quad_external_sample_cache_key(
+	*,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	ext_coords: torch.Tensor | None,
+	subdiv: int,
+	prefix: tuple[Any, ...] = (),
+	ext_coords_key: Any | None = None,
+) -> tuple[Any, ...]:
+	return (
+		"dense_quad_external_samples",
+		*tuple(prefix),
+		int(subdiv),
+		_map_init_tensor_cache_key(ext_pos),
+		_map_init_tensor_cache_key(ext_normals),
+		_map_init_tensor_cache_key(ext_valid),
+		None if ext_quad_valid is None else _map_init_tensor_cache_key(ext_quad_valid),
+		ext_coords_key if ext_coords_key is not None else (None if ext_coords is None else _map_init_tensor_cache_key(ext_coords)),
+	)
+
+def _map_init_dense_quad_external_sample_tensors(
+	*,
+	uv_full: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_normals: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_quad_valid: torch.Tensor | None,
+	ext_coords: torch.Tensor | None,
+	subdiv: int,
+	profile_blocks: dict[str, list[float]] | None = None,
+	cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+	ext_coords_cache_key: Any | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	def _timed(name: str, fn):
+		if profile_blocks is None:
+			return fn()
+		if uv_full.is_cuda:
+			torch.cuda.synchronize(uv_full.device)
+		start = time.perf_counter()
+		out = fn()
+		if uv_full.is_cuda:
+			torch.cuda.synchronize(uv_full.device)
+		profile_blocks.setdefault(name, []).append(time.perf_counter() - start)
+		return out
+
+	key = _map_init_dense_quad_external_sample_cache_key(
+		ext_pos=ext_pos,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		ext_coords=ext_coords,
+		subdiv=int(subdiv),
+		prefix=cache_key_prefix,
+		ext_coords_key=ext_coords_cache_key,
+	)
+	cached = _map_init_cache_get(cache, key)
+	if cached is not None:
+		if profile_blocks is not None:
+			profile_blocks.setdefault("sample_ext_cached", []).append(0.0)
+		return cached
+
+	s = max(1, int(subdiv))
+	offsets = _map_init_quad_offsets(subdiv=s, device=uv_full.device, dtype=uv_full.dtype)
+	ext_pos_norm_safe = _timed("sample_ext_packed_source_prepare", lambda: _map_init_cached_packed_pos_norm_values(
+		kind="external",
+		pos=ext_pos,
+		normals=ext_normals,
+		valid=ext_valid,
+		cache=cache,
+		prefix=cache_key_prefix,
+	))
+	if ext_coords is None:
+		ext_samples_packed = _timed("sample_ext_packed_bilerp", lambda: _map_init_dense_bilerp_quad(
+			ext_pos_norm_safe,
+			offsets.to(dtype=ext_pos_norm_safe.dtype),
+		))
+		quad_ext_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
+	else:
+		sample_coords = _timed("sample_ext_coord_bilerp", lambda: _map_init_dense_bilerp_quad(ext_coords, offsets.to(dtype=ext_coords.dtype)))
+		safe_coords = torch.where(torch.isfinite(sample_coords), sample_coords, torch.zeros_like(sample_coords))
+		ext_samples_packed = _timed("sample_ext_packed_grid", lambda: _sample_surface_grid(ext_pos_norm_safe, safe_coords))
+		sample_coord_ok = (
+			torch.isfinite(sample_coords).all(dim=-1) &
+			_quad_valid_at_coords(ext_valid.bool(), safe_coords, tuple(int(v) for v in ext_valid.shape)) &
+			_map_init_ext_quad_valid_at_coords(ext_quad_valid, safe_coords, tuple(int(v) for v in ext_valid.shape))
+		)
+		quad_ext_valid = sample_coord_ok.all(dim=-1)
+	ext_samples, n_raw = _map_init_split_packed_pos_norm(ext_samples_packed)
+	n_samples = F.normalize(n_raw, dim=-1, eps=1.0e-8)
+	sample_ext_ok = (
+		quad_ext_valid.unsqueeze(-1) &
+		torch.isfinite(ext_samples).all(dim=-1) &
+		torch.isfinite(n_raw).all(dim=-1) &
+		torch.isfinite(n_samples).all(dim=-1) &
+		(n_samples.norm(dim=-1) > 1.0e-8)
+	)
+	return _map_init_cache_put(cache, key, (ext_samples, n_samples, sample_ext_ok))
+
 def _map_init_dense_quad_sample_tensors(
 	*,
 	uv_full: torch.Tensor,
@@ -923,38 +1101,40 @@ def _map_init_dense_quad_sample_tensors(
 	ext_quad_valid: torch.Tensor | None,
 	ext_coords: torch.Tensor | None = None,
 	subdiv: int,
+	profile_blocks: dict[str, list[float]] | None = None,
+	cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+	ext_coords_cache_key: Any | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	def _timed(name: str, fn):
+		if profile_blocks is None:
+			return fn()
+		if uv_full.is_cuda:
+			torch.cuda.synchronize(uv_full.device)
+		start = time.perf_counter()
+		out = fn()
+		if uv_full.is_cuda:
+			torch.cuda.synchronize(uv_full.device)
+		profile_blocks.setdefault(name, []).append(time.perf_counter() - start)
+		return out
+
 	s = max(1, int(subdiv))
 	offsets = _map_init_quad_offsets(subdiv=s, device=uv_full.device, dtype=uv_full.dtype)
-	uv_samples = _map_init_dense_bilerp_quad(uv_full, offsets)
-	if ext_coords is None:
-		ext_pos_safe = _map_init_valid_field_values(ext_pos, ext_valid)
-		ext_normals_safe = _map_init_valid_field_values(ext_normals, ext_valid)
-		ext_samples = _map_init_dense_bilerp_quad(ext_pos_safe, offsets.to(dtype=ext_pos.dtype))
-		n_raw = _map_init_dense_bilerp_quad(ext_normals_safe, offsets.to(dtype=ext_normals.dtype))
-		quad_ext_valid = _map_init_external_quad_valid(ext_valid, ext_quad_valid)
-	else:
-		sample_coords = _map_init_dense_bilerp_quad(ext_coords, offsets.to(dtype=ext_coords.dtype))
-		safe_coords = torch.where(torch.isfinite(sample_coords), sample_coords, torch.zeros_like(sample_coords))
-		ext_pos_safe = _map_init_valid_field_values(ext_pos, ext_valid)
-		ext_normals_safe = _map_init_valid_field_values(ext_normals, ext_valid)
-		ext_samples = _sample_surface_grid(ext_pos_safe, safe_coords)
-		n_raw = _sample_surface_grid(ext_normals_safe, safe_coords)
-		sample_coord_ok = (
-			torch.isfinite(sample_coords).all(dim=-1) &
-			_quad_valid_at_coords(ext_valid.bool(), safe_coords, tuple(int(v) for v in ext_valid.shape)) &
-			_map_init_ext_quad_valid_at_coords(ext_quad_valid, safe_coords, tuple(int(v) for v in ext_valid.shape))
-		)
-		quad_ext_valid = sample_coord_ok.all(dim=-1)
-	n_samples = F.normalize(n_raw, dim=-1, eps=1.0e-8)
-	quad_uv_ok = _map_init_quad_corner_all(torch.isfinite(uv_full).all(dim=-1))
-	sample_ext_ok = (
-		quad_ext_valid.unsqueeze(-1) &
-		torch.isfinite(ext_samples).all(dim=-1) &
-		torch.isfinite(n_raw).all(dim=-1) &
-		torch.isfinite(n_samples).all(dim=-1) &
-		(n_samples.norm(dim=-1) > 1.0e-8)
+	uv_samples = _timed("sample_uv_bilerp", lambda: _map_init_dense_bilerp_quad(uv_full, offsets))
+	ext_samples, n_samples, sample_ext_ok = _map_init_dense_quad_external_sample_tensors(
+		uv_full=uv_full,
+		ext_pos=ext_pos,
+		ext_normals=ext_normals,
+		ext_valid=ext_valid,
+		ext_quad_valid=ext_quad_valid,
+		ext_coords=ext_coords,
+		subdiv=int(subdiv),
+		profile_blocks=profile_blocks,
+		cache=cache,
+		cache_key_prefix=cache_key_prefix,
+		ext_coords_cache_key=ext_coords_cache_key,
 	)
+	quad_uv_ok = _map_init_quad_corner_all(torch.isfinite(uv_full).all(dim=-1))
 	return uv_samples, ext_samples, n_samples, sample_ext_ok, quad_uv_ok
 
 def _map_init_dense_mean_quad_edge_length(corners: torch.Tensor, corner_valid: torch.Tensor) -> torch.Tensor:
@@ -978,16 +1158,12 @@ def _map_init_dense_mean_quad_edge_length(corners: torch.Tensor, corner_valid: t
 	total = torch.where(valid, length, torch.zeros_like(length)).sum(dim=-1)
 	return torch.where(count > 0.0, total / count.clamp_min(1.0), torch.zeros_like(total))
 
-def _map_init_dense_quad_physical_step_lengths(
+def _map_init_dense_quad_external_physical_step_lengths(
 	*,
-	uv_full: torch.Tensor,
 	ext_pos: torch.Tensor,
 	ext_valid: torch.Tensor,
 	ext_coords: torch.Tensor | None,
-	model_xyz: torch.Tensor,
-	model_valid: torch.Tensor,
-	model_depth: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
 	if ext_coords is None:
 		ext_pos_safe = _map_init_valid_field_values(ext_pos, ext_valid)
 		ext_corners = torch.stack([
@@ -1016,7 +1192,57 @@ def _map_init_dense_quad_physical_step_lengths(
 			_quad_valid_at_coords(ext_valid.bool(), safe, tuple(int(v) for v in ext_valid.shape))
 		)
 	ext_corner_valid = ext_corner_valid & torch.isfinite(ext_corners).all(dim=-1)
+	return _map_init_dense_mean_quad_edge_length(ext_corners, ext_corner_valid)
 
+def _map_init_dense_quad_external_step_cache_key(
+	*,
+	ext_pos: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_coords: torch.Tensor | None,
+	prefix: tuple[Any, ...] = (),
+	ext_coords_key: Any | None = None,
+) -> tuple[Any, ...]:
+	return (
+		"dense_quad_external_step_lengths",
+		*tuple(prefix),
+		_map_init_tensor_cache_key(ext_pos),
+		_map_init_tensor_cache_key(ext_valid),
+		ext_coords_key if ext_coords_key is not None else (None if ext_coords is None else _map_init_tensor_cache_key(ext_coords)),
+	)
+
+def _map_init_cached_dense_quad_external_physical_step_lengths(
+	*,
+	ext_pos: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_coords: torch.Tensor | None,
+	cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+	ext_coords_cache_key: Any | None = None,
+) -> torch.Tensor:
+	key = _map_init_dense_quad_external_step_cache_key(
+		ext_pos=ext_pos,
+		ext_valid=ext_valid,
+		ext_coords=ext_coords,
+		prefix=cache_key_prefix,
+		ext_coords_key=ext_coords_cache_key,
+	)
+	cached = _map_init_cache_get(cache, key)
+	if torch.is_tensor(cached):
+		return cached
+	return _map_init_cache_put(cache, key, _map_init_dense_quad_external_physical_step_lengths(
+		ext_pos=ext_pos,
+		ext_valid=ext_valid,
+		ext_coords=ext_coords,
+	))
+
+def _map_init_dense_quad_model_physical_step_lengths(
+	*,
+	uv_full: torch.Tensor,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_depth: int,
+	model_xyz_safe: torch.Tensor | None = None,
+) -> torch.Tensor:
 	uv_corners = torch.stack([
 		uv_full[:-1, :-1],
 		uv_full[1:, :-1],
@@ -1025,15 +1251,37 @@ def _map_init_dense_quad_physical_step_lengths(
 	], dim=-2)
 	coords3 = _map_init_coords3(uv_corners, depth=int(model_depth))
 	safe3 = torch.where(torch.isfinite(coords3), coords3, torch.zeros_like(coords3))
-	model_corners = _sample_surface_grid(_map_init_valid_field_values(model_xyz, model_valid), safe3)
+	model_source = _map_init_valid_field_values(model_xyz, model_valid) if model_xyz_safe is None else model_xyz_safe
+	model_corners = _sample_surface_grid(model_source, safe3)
 	model_corner_valid = (
 		torch.isfinite(coords3).all(dim=-1) &
 		_quad_valid_at_coords(model_valid.bool(), safe3, tuple(int(v) for v in model_valid.shape)) &
 		torch.isfinite(model_corners).all(dim=-1)
 	)
+	return _map_init_dense_mean_quad_edge_length(model_corners, model_corner_valid)
+
+def _map_init_dense_quad_physical_step_lengths(
+	*,
+	uv_full: torch.Tensor,
+	ext_pos: torch.Tensor,
+	ext_valid: torch.Tensor,
+	ext_coords: torch.Tensor | None,
+	model_xyz: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_depth: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
 	return (
-		_map_init_dense_mean_quad_edge_length(ext_corners, ext_corner_valid),
-		_map_init_dense_mean_quad_edge_length(model_corners, model_corner_valid),
+		_map_init_dense_quad_external_physical_step_lengths(
+			ext_pos=ext_pos,
+			ext_valid=ext_valid,
+			ext_coords=ext_coords,
+		),
+		_map_init_dense_quad_model_physical_step_lengths(
+			uv_full=uv_full,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_depth=int(model_depth),
+		),
 	)
 
 def _map_init_active_quad_crop_slices(
@@ -1083,9 +1331,25 @@ def _map_init_objective(
 	ext_z_lift_valid: torch.Tensor | None = None,
 	model_z_lift_theta: torch.Tensor | None = None,
 	model_z_lift_valid: torch.Tensor | None = None,
+	profile_blocks: dict[str, list[float]] | None = None,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+	external_static_cache_key: Any | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
+	def _timed(name: str, fn):
+		if profile_blocks is None:
+			return fn()
+		if uv_full.is_cuda:
+			torch.cuda.synchronize(uv_full.device)
+		start = time.perf_counter()
+		out = fn()
+		if uv_full.is_cuda:
+			torch.cuda.synchronize(uv_full.device)
+		profile_blocks.setdefault(name, []).append(time.perf_counter() - start)
+		return out
+
 	train_fast = not bool(need_stats)
 	sample_dist_active = (not train_fast) or float(mi.w_dist) > 0.0
 	sample_vec_active = (not train_fast) or float(mi.w_vec_normal) > 0.0
@@ -1165,6 +1429,10 @@ def _map_init_objective(
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=ext_coords,
 			subdiv=int(mi.subdiv),
+			profile_blocks=profile_blocks,
+			cache=runtime_cache,
+			cache_key_prefix=cache_key_prefix,
+			ext_coords_cache_key=external_static_cache_key,
 		)
 		Hq, Wq, S = int(uv_samples.shape[0]), int(uv_samples.shape[1]), int(uv_samples.shape[2])
 		uv = uv_samples
@@ -1174,34 +1442,54 @@ def _map_init_objective(
 		n_ext_raw_f = n_ext_raw
 		sign_f = 1.0 if int(sign) >= 0 else -1.0
 		n_ext = F.normalize(n_ext_raw_f, dim=-1, eps=1.0e-8)
-		model_xyz_safe = _map_init_valid_field_values(model_xyz, model_valid)
-		model_normals_safe = _map_init_valid_field_values(model_normals, model_valid)
-		p_model = _sample_surface_grid(model_xyz_safe, safe_coords)
-		n_model_raw = _sample_surface_grid(model_normals_safe, safe_coords)
-		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f
-		ext_step_q, model_step_q = _map_init_dense_quad_physical_step_lengths(
-			uv_full=uv_full,
+		model_pos_norm_safe = _timed("sample_model_packed_source_prepare", lambda: _map_init_cached_packed_pos_norm_values(
+			kind="model",
+			pos=model_xyz,
+			normals=model_normals,
+			valid=model_valid,
+			cache=runtime_cache,
+			prefix=cache_key_prefix,
+		))
+		model_xyz_safe, _model_normals_safe = _map_init_split_packed_pos_norm(model_pos_norm_safe)
+		model_sample_packed = _timed("sample_model_packed_grid", lambda: _sample_surface_grid(model_pos_norm_safe, safe_coords))
+		p_model, n_model_raw = _map_init_split_packed_pos_norm(model_sample_packed)
+		n_model = _timed("sample_normalize", lambda: F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f)
+		ext_step_q = _timed("sample_ext_step_lengths", lambda: _map_init_cached_dense_quad_external_physical_step_lengths(
 			ext_pos=ext_pos,
 			ext_valid=ext_valid,
 			ext_coords=ext_coords,
+			cache=runtime_cache,
+			cache_key_prefix=cache_key_prefix,
+			ext_coords_cache_key=external_static_cache_key,
+		))
+		model_step_q = _timed("sample_model_step_lengths", lambda: _map_init_dense_quad_model_physical_step_lengths(
+			uv_full=uv_full,
 			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_depth=int(model_depth),
-		)
+			model_xyz_safe=model_xyz_safe,
+		))
 		ext_step_f = ext_step_q.unsqueeze(-1).expand(Hq, Wq, S)
 		model_step_f = model_step_q.unsqueeze(-1).expand(Hq, Wq, S)
-		coord_ok = _quad_valid_at_coords(
+		coord_ok = _timed("sample_model_valid_mask", lambda: _quad_valid_at_coords(
 			model_valid.bool(),
 			safe_coords,
 			tuple(int(v) for v in model_valid.shape),
-		)
-		v = p_model - p_ext_f
-		d = v.norm(dim=-1)
-		u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
-		c_ext = (u * n_ext).sum(dim=-1).abs()
-		c_model = (u * n_model).sum(dim=-1).abs()
-		c_norm = (n_ext * n_model).sum(dim=-1)
-		sample_limit_ok = _map_init_sample_geometry_limit_ok(
+		))
+		def _sample_dot_product_tensors():
+			v_i = p_model - p_ext_f
+			d_i = v_i.norm(dim=-1)
+			u_i = v_i / d_i.clamp_min(1.0e-8).unsqueeze(-1)
+			return (
+				v_i,
+				d_i,
+				u_i,
+				(u_i * n_ext).sum(dim=-1).abs(),
+				(u_i * n_model).sum(dim=-1).abs(),
+				(n_ext * n_model).sum(dim=-1),
+			)
+		v, d, u, c_ext, c_model, c_norm = _timed("sample_dot_products", _sample_dot_product_tensors)
+		sample_limit_ok = _timed("sample_geometry_limit", lambda: _map_init_sample_geometry_limit_ok(
 			p_ext=p_ext_f,
 			n_ext=n_ext_raw_f,
 			p_model=p_model,
@@ -1210,23 +1498,25 @@ def _map_init_objective(
 			cfg=mi,
 			ext_step=ext_step_f,
 			model_step=model_step_f,
-		)
-		dist_mult = _map_init_distance_multiplier(c_ext, c_model, mi)
-		dist_values = _huber(d, delta=cfg.huber_delta) * dist_mult
-		vec_values = (1.0 - c_ext) + (1.0 - c_model)
-		norm_values = 1.0 - c_norm
+		))
+		dist_mult = _timed("sample_dist_multiplier", lambda: _map_init_distance_multiplier(c_ext, c_model, mi))
+		dist_values, vec_values, norm_values = _timed("sample_loss_values", lambda: (
+			_huber(d, delta=cfg.huber_delta) * dist_mult,
+			(1.0 - c_ext) + (1.0 - c_model),
+			1.0 - c_norm,
+		))
 		ext_theta_samples = None
 		ext_theta_sample_valid = None
 		if turn_term_active and ext_coords is not None and ext_z_lift_theta is not None and ext_z_lift_valid is not None:
 			offsets = _map_init_quad_offsets(subdiv=int(mi.subdiv), device=uv_full.device, dtype=uv_full.dtype)
-			sample_ext_coords = _map_init_dense_bilerp_quad(ext_coords, offsets.to(dtype=ext_coords.dtype))
-			ext_theta_samples, ext_theta_sample_valid = _map_init_sample_external_quad_scalar_field(
+			sample_ext_coords = _timed("turn_ext_coord_bilerp", lambda: _map_init_dense_bilerp_quad(ext_coords, offsets.to(dtype=ext_coords.dtype)))
+			ext_theta_samples, ext_theta_sample_valid = _timed("turn_ext_theta_sample", lambda: _map_init_sample_external_quad_scalar_field(
 				ext_z_lift_theta,
 				ext_z_lift_valid,
 				sample_ext_coords,
-			)
+			))
 		if turn_term_active:
-			turn_values, turn_valid = _map_init_z_lift_turn_values(
+			turn_values, turn_valid = _timed("turn_values", lambda: _map_init_z_lift_turn_values(
 				active_quad=active_quad,
 				ext_theta_lifted=ext_z_lift_theta,
 				ext_valid=ext_z_lift_valid,
@@ -1236,22 +1526,20 @@ def _map_init_objective(
 				model_valid=model_z_lift_valid,
 				coords3=safe_coords,
 				cfg=mi,
-			)
+			))
 		else:
 			turn_values = z.expand(Hq, Wq, S)
 			turn_valid = torch.zeros((Hq, Wq, S), device=uv_full.device, dtype=torch.bool)
-		active_sample = active_quad.unsqueeze(-1).expand(Hq, Wq, S)
-		base_finite = (
-			active_sample &
+		active_sample, base_finite, model_finite = _timed("sample_finite_masks", lambda: (
+			active_quad.unsqueeze(-1).expand(Hq, Wq, S),
+			active_quad.unsqueeze(-1).expand(Hq, Wq, S) &
 			sample_ext_ok &
 			quad_uv_ok.unsqueeze(-1).expand(Hq, Wq, S) &
 			torch.isfinite(uv).all(dim=-1) &
 			torch.isfinite(p_ext_f).all(dim=-1) &
 			torch.isfinite(n_ext_raw_f).all(dim=-1) &
 			torch.isfinite(n_ext).all(dim=-1) &
-			(n_ext.norm(dim=-1) > 1.0e-8)
-		)
-		model_finite = (
+			(n_ext.norm(dim=-1) > 1.0e-8),
 			coord_ok &
 			torch.isfinite(p_model).all(dim=-1) &
 			torch.isfinite(n_model_raw).all(dim=-1) &
@@ -1259,8 +1547,8 @@ def _map_init_objective(
 			(n_model.norm(dim=-1) > 1.0e-8) &
 			torch.isfinite(dist_values) &
 			torch.isfinite(vec_values) &
-			torch.isfinite(norm_values)
-		)
+			torch.isfinite(norm_values),
+		))
 		z_lift_active = (
 			turn_term_active
 			and bool(mi.z_lift_enabled)
@@ -1278,14 +1566,17 @@ def _map_init_objective(
 		)
 		if z_lift_active:
 			model_finite = model_finite & turn_valid
-		finite = base_finite & model_finite
-		limited_finite = finite & sample_limit_ok
-		if bool(allow_partial_model_samples):
-			loss_quad = active_quad & base_finite.all(dim=-1) & finite.any(dim=-1)
-			valid_quad = active_quad & base_finite.all(dim=-1) & limited_finite.any(dim=-1)
-		else:
-			loss_quad = active_quad & finite.all(dim=-1)
-			valid_quad = active_quad & limited_finite.all(dim=-1)
+		def _sample_quad_mask_tensors():
+			finite_i = base_finite & model_finite
+			limited_finite_i = finite_i & sample_limit_ok
+			if bool(allow_partial_model_samples):
+				loss_quad_i = active_quad & base_finite.all(dim=-1) & finite_i.any(dim=-1)
+				valid_quad_i = active_quad & base_finite.all(dim=-1) & limited_finite_i.any(dim=-1)
+			else:
+				loss_quad_i = active_quad & finite_i.all(dim=-1)
+				valid_quad_i = active_quad & limited_finite_i.all(dim=-1)
+			return finite_i, limited_finite_i, loss_quad_i, valid_quad_i
+		finite, limited_finite, loss_quad, valid_quad = _timed("sample_quad_masks", _sample_quad_mask_tensors)
 		if sample_quad_ok_grid is not None:
 			sample_quad_ok_grid = valid_quad
 		sample_total_count_t = active_sample.to(dtype=uv_full.dtype).sum()
@@ -1304,24 +1595,28 @@ def _map_init_objective(
 				float(mi.w_z_lift) * turn_values
 			)
 			sample_loss = _map_init_masked_mean_values([(sample_values, finite)], z)
-		loss_sample = finite & loss_quad.unsqueeze(-1)
-		loss_count = loss_sample.to(dtype=uv_full.dtype).sum(dim=-1).clamp_min(1.0)
+		loss_sample = _timed("sample_loss_mask", lambda: finite & loss_quad.unsqueeze(-1))
+		loss_count = _timed("sample_loss_count", lambda: loss_sample.to(dtype=uv_full.dtype).sum(dim=-1).clamp_min(1.0))
 		if bool(need_stats):
 			finite_count_t = loss_sample.to(dtype=uv_full.dtype).sum()
 			model_bad_count_t = (active_quad & ~valid_quad).to(dtype=uv_full.dtype).sum()
 			loss_quad_count_t = loss_quad.to(dtype=uv_full.dtype).sum()
 			valid_quad_count_t = valid_quad.to(dtype=uv_full.dtype).sum()
 			turn_sample_count_t = finite_count_t if z_lift_stats_active else uv_full.new_zeros(())
-		dist_q_all = torch.where(loss_sample, dist_values, dist_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
-		vec_q_all = torch.where(loss_sample, vec_values, vec_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
-		norm_q_all = torch.where(loss_sample, norm_values, norm_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
-		turn_q_all = torch.where(loss_sample, turn_values, turn_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
-		d_q_all = torch.where(loss_sample, d, d.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
-		dist_loss = _map_init_masked_mean_values([(dist_q_all, loss_quad)], z)
-		vec_loss = _map_init_masked_mean_values([(vec_q_all, loss_quad)], z)
-		norm_loss = _map_init_masked_mean_values([(norm_q_all, loss_quad)], z)
-		turn_loss = _map_init_masked_mean_values([(turn_q_all, loss_quad)], z)
-		dist_avg = _map_init_masked_mean_values([(d_q_all, loss_quad)], z)
+		dist_q_all, vec_q_all, norm_q_all, turn_q_all, d_q_all = _timed("sample_quad_reduce", lambda: (
+			torch.where(loss_sample, dist_values, dist_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count,
+			torch.where(loss_sample, vec_values, vec_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count,
+			torch.where(loss_sample, norm_values, norm_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count,
+			torch.where(loss_sample, turn_values, turn_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count,
+			torch.where(loss_sample, d, d.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count,
+		))
+		dist_loss, vec_loss, norm_loss, turn_loss, dist_avg = _timed("sample_loss_reduce", lambda: (
+			_map_init_masked_mean_values([(dist_q_all, loss_quad)], z),
+			_map_init_masked_mean_values([(vec_q_all, loss_quad)], z),
+			_map_init_masked_mean_values([(norm_q_all, loss_quad)], z),
+			_map_init_masked_mean_values([(turn_q_all, loss_quad)], z),
+			_map_init_masked_mean_values([(d_q_all, loss_quad)], z),
+		))
 		if bool(need_stats):
 			model_bad_count_t = torch.where(
 				loss_quad.to(dtype=uv_full.dtype).sum() > 0.0,
@@ -1335,14 +1630,14 @@ def _map_init_objective(
 		dist_avg = z
 
 	if reg_terms_active:
-		reg_finite, reg_quad = _map_init_regularization_masks(
+		reg_finite, reg_quad = _timed("reg_masks", lambda: _map_init_regularization_masks(
 			active_quad=active_quad,
 			ext_valid=ext_vertex_valid,
 			ext_quad_valid=ext_level_quad_valid,
 			uv_finite=uv_finite,
 			cfg=mi,
-		)
-		uv_safe = torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
+		))
+		uv_safe = _timed("reg_uv_safe", lambda: torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full)))
 	else:
 		reg_finite = torch.zeros_like(uv_finite, dtype=torch.bool)
 		reg_quad = torch.zeros_like(active_quad, dtype=torch.bool)
@@ -1350,12 +1645,12 @@ def _map_init_objective(
 	reg_count_t = reg_finite.to(dtype=uv_full.dtype).sum() if bool(need_stats) else uv_full.new_zeros(())
 	metric_positions_needed = smooth_term_active or bend_term_active or metric_term_active or area_term_active
 	if metric_positions_needed:
-		model_metric_pos, model_metric_valid = _map_init_model_metric_positions(
+		model_metric_pos, model_metric_valid = _timed("reg_model_metric_sample", lambda: _map_init_model_metric_positions(
 			uv_safe,
 			model_xyz=model_xyz,
 			model_valid=model_valid,
 			model_depth=model_depth,
-		)
+		))
 		model_metric_valid = model_metric_valid & reg_finite
 	else:
 		model_metric_pos = torch.zeros((*uv_full.shape[:2], 3), device=uv_full.device, dtype=uv_full.dtype)
@@ -1366,14 +1661,14 @@ def _map_init_objective(
 		torch.zeros_like(model_metric_pos),
 	)
 	if smooth_term_active or bend_term_active:
-		uv_fwd_terms = _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z)
-		model_raw_fwd_terms = _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z)
-		physical_ref2 = _map_init_reference_edge_square(
+		uv_fwd_terms = _timed("reg_uv_smooth_bend_fwd", lambda: _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z))
+		model_raw_fwd_terms = _timed("reg_model_smooth_bend_fwd", lambda: _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z))
+		physical_ref2 = _timed("reg_physical_ref", lambda: _map_init_reference_edge_square(
 			ext_vertex_pos,
 			torch.isfinite(ext_vertex_pos).all(dim=-1) & ext_vertex_valid,
 			reg_quad,
 			z,
-		)
+		))
 		smooth_uv_fwd_loss = uv_fwd_terms["smooth"] if smooth_term_active else z
 		bend_uv_fwd_loss = uv_fwd_terms["bend"] if bend_term_active else z
 		smooth_model_fwd_loss = model_raw_fwd_terms["smooth"] / physical_ref2 if smooth_term_active else z
@@ -1387,29 +1682,29 @@ def _map_init_objective(
 	bend_fwd_loss = bend_uv_fwd_loss + bend_model_fwd_loss
 
 	if jac_term_active:
-		jac_fwd_loss = _map_init_jacobian_penalty(
+		jac_fwd_loss = _timed("reg_jac_fwd", lambda: _map_init_jacobian_penalty(
 			uv_safe,
 			reg_quad,
 			jac_margin=mi.jac_margin,
-		)
+		))
 	else:
 		jac_fwd_loss = z
 	if smooth_term_active or bend_term_active or jac_term_active or bool(need_stats):
-		inv_terms = _map_init_inverse_regularization_terms(
+		inv_terms = _timed("reg_inverse_terms", lambda: _map_init_inverse_regularization_terms(
 			uv_safe,
 			reg_quad,
 			jac_margin=mi.jac_margin,
-		)
+		))
 	else:
 		inv_terms = {"smooth": z, "bend": z, "jac": z, "jac_min": z, "jac_bad": z}
 	if metric_term_active or area_term_active:
-		even_terms = _map_init_local_evenness_terms(
+		even_terms = _timed("reg_evenness_terms", lambda: _map_init_local_evenness_terms(
 			uv_safe,
 			ext_vertex_pos,
 			reg_quad,
 			metric_pos=model_metric_pos,
 			metric_valid=model_metric_valid,
-		)
+		))
 	else:
 		even_terms = {"metric_smooth": z, "area_smooth": z}
 	metric_smooth_loss = even_terms["metric_smooth"] if metric_term_active else z
@@ -1469,9 +1764,9 @@ def _map_init_objective(
 		jac_inv_bad_quad_count_t = jac_inv_bad_quad_grid.to(dtype=uv_full.dtype).sum()
 		step_bad_quad_count_t = step_bad_quad_grid.to(dtype=uv_full.dtype).sum()
 	if prior_term_active and bool(mi.dense_opt) and uv_prior is not None:
-		prior_finite = reg_finite & torch.isfinite(uv_prior).all(dim=-1)
-		prior_values = (uv_full - uv_prior).square().sum(dim=-1)
-		prior_loss = _map_init_masked_mean_values([(prior_values, prior_finite)], z)
+		prior_loss = _timed("reg_prior", lambda: _map_init_masked_mean_values([
+			((uv_full - uv_prior).square().sum(dim=-1), reg_finite & torch.isfinite(uv_prior).all(dim=-1))
+		], z))
 	else:
 		prior_loss = z
 	loss = (

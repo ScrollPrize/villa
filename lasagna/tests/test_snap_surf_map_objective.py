@@ -20,6 +20,122 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 	def setUp(self) -> None:
 		opt_loss_snap_surf.reset_state()
 
+	def test_packed_pos_norm_sampling_matches_separate_sampling(self) -> None:
+		model_xyz = torch.arange(1 * 4 * 5 * 3, dtype=torch.float32).reshape(1, 4, 5, 3) / 10.0
+		model_normals = torch.flip(model_xyz, dims=(-1,)) + 1.0
+		model_valid = torch.ones(1, 4, 5, dtype=torch.bool)
+		model_valid[0, 1, 2] = False
+		coords = torch.tensor([
+			[[0.0, 0.25, 0.25], [0.0, 1.5, 2.25]],
+			[[0.0, 2.25, 3.5], [0.0, 0.75, 1.25]],
+		], dtype=torch.float32)
+
+		pos_safe = opt_loss_snap_surf._map_init_valid_field_values(model_xyz, model_valid)
+		norm_safe = opt_loss_snap_surf._map_init_valid_field_values(model_normals, model_valid)
+		packed = opt_loss_snap_surf._map_init_packed_pos_norm_values(model_xyz, model_normals, model_valid)
+		packed_sample = opt_loss_snap_surf._sample_surface_grid(packed, coords)
+		pos_sample, norm_sample = opt_loss_snap_surf._map_init_split_packed_pos_norm(packed_sample)
+
+		torch.testing.assert_close(pos_sample, opt_loss_snap_surf._sample_surface_grid(pos_safe, coords))
+		torch.testing.assert_close(norm_sample, opt_loss_snap_surf._sample_surface_grid(norm_safe, coords))
+
+	def test_packed_pos_norm_cache_invalidates_by_prefix_and_tensor_identity(self) -> None:
+		model_xyz = _plane_xyz(h=3, w=3, z=1.0).unsqueeze(0)
+		model_normals = _normals_3d(1, 3, 3)
+		model_valid = torch.ones(1, 3, 3, dtype=torch.bool)
+		cache: dict[tuple[object, ...], object] = {}
+
+		packed_epoch0 = opt_loss_snap_surf._map_init_cached_packed_pos_norm_values(
+			kind="model",
+			pos=model_xyz,
+			normals=model_normals,
+			valid=model_valid,
+			cache=cache,
+			prefix=("mesh_epoch", 0),
+		)
+		packed_epoch0_again = opt_loss_snap_surf._map_init_cached_packed_pos_norm_values(
+			kind="model",
+			pos=model_xyz,
+			normals=model_normals,
+			valid=model_valid,
+			cache=cache,
+			prefix=("mesh_epoch", 0),
+		)
+		packed_epoch1 = opt_loss_snap_surf._map_init_cached_packed_pos_norm_values(
+			kind="model",
+			pos=model_xyz,
+			normals=model_normals,
+			valid=model_valid,
+			cache=cache,
+			prefix=("mesh_epoch", 1),
+		)
+		packed_clone = opt_loss_snap_surf._map_init_cached_packed_pos_norm_values(
+			kind="model",
+			pos=model_xyz.clone(),
+			normals=model_normals,
+			valid=model_valid,
+			cache=cache,
+			prefix=("mesh_epoch", 0),
+		)
+
+		self.assertIs(packed_epoch0, packed_epoch0_again)
+		self.assertIsNot(packed_epoch0, packed_epoch1)
+		self.assertIsNot(packed_epoch0, packed_clone)
+
+	def test_map_init_objective_reuses_cached_external_samples(self) -> None:
+		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+				subdiv=2,
+				w_dist=1.0,
+				w_vec_normal=1.0,
+				w_surface_normal=1.0,
+				w_smooth=0.0,
+				w_bend=0.0,
+				w_jac=0.0,
+				w_metric_smooth=0.0,
+				w_area_smooth=0.0,
+			),
+		)
+		cache: dict[tuple[object, ...], object] = {}
+		ext_pos = _plane_xyz(h=3, w=3, z=0.0)
+		ext_normals = _normals_2d(3, 3)
+		ext_valid = torch.ones(3, 3, dtype=torch.bool)
+		ext_quad_valid = torch.ones(2, 2, dtype=torch.bool)
+		model_xyz = _plane_xyz(h=3, w=3, z=1.0).unsqueeze(0)
+		model_valid = torch.ones(1, 3, 3, dtype=torch.bool)
+		model_normals = _normals_3d(1, 3, 3)
+
+		def _run(profile_blocks: dict[str, list[float]]) -> None:
+			opt_loss_snap_surf._map_init_objective(
+				uv_full=uv,
+				active_quad=torch.ones(2, 2, dtype=torch.bool),
+				ext_pos=ext_pos,
+				ext_normals=ext_normals,
+				ext_valid=ext_valid,
+				ext_quad_valid=ext_quad_valid,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				model_depth=0,
+				sign=1,
+				cfg=cfg,
+				need_stats=False,
+				profile_blocks=profile_blocks,
+				runtime_cache=cache,
+				cache_key_prefix=("stage", 0),
+				external_static_cache_key=("level0",),
+			)
+
+		first_profile: dict[str, list[float]] = {}
+		second_profile: dict[str, list[float]] = {}
+		_run(first_profile)
+		_run(second_profile)
+
+		self.assertIn("sample_ext_packed_bilerp", first_profile)
+		self.assertIn("sample_ext_cached", second_profile)
+		self.assertNotIn("sample_ext_packed_bilerp", second_profile)
+
 	def test_z_lift_field_construction_unwraps_multiple_turns(self) -> None:
 		angles = torch.linspace(0.0, 4.0 * math.pi, 9)
 		normals = torch.zeros(2, 9, 3)
