@@ -3900,14 +3900,6 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
         losses = {}
 
-        # TODO
-        # patches may be >1 winding; thus the track radius loss needs fixing to not 'force apart' windings
-        # for pcl's, edges link patches, and relative w-n should be applied everywhere over the patch
-        # ...but for multi-winding patches this is not directly true, again need to adjust for winding changes
-        # also note the existing track loss does not correctly handle >1 winding tracks crossing theta=0
-        # for single-winding patches, and local regions of larger ones, the relative numbering *should* hold everywhere
-        #  on the patch -- but need to account properly for theta=0
-
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
         patch_radius_loss, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss = get_patch_and_umbilicus_losses(
             slice_to_spiral_transform,
