@@ -1260,7 +1260,6 @@ def _map_init_reg_physical_ref_cache_key(
 	ext_quad_valid: torch.Tensor | None,
 	ext_coords: torch.Tensor | None,
 	active_quad: torch.Tensor,
-	uv_full: torch.Tensor,
 	cfg: SnapSurfMapInitConfig,
 	prefix: tuple[Any, ...] = (),
 	external_static_cache_key: Any | None = None,
@@ -1276,7 +1275,6 @@ def _map_init_reg_physical_ref_cache_key(
 		None if ext_quad_valid is None else _map_init_tensor_cache_key(ext_quad_valid),
 		None if ext_coords is None else _map_init_tensor_cache_key(ext_coords),
 		_map_init_tensor_cache_key(active_quad),
-		_map_init_tensor_cache_key(uv_full),
 	)
 
 def _map_init_cached_reg_physical_ref(
@@ -2748,7 +2746,6 @@ def _map_init_objective(
 			ext_quad_valid=ext_quad_valid,
 			ext_coords=ext_coords,
 			active_quad=active_quad,
-			uv_full=uv_full,
 			cfg=mi,
 			prefix=cache_key_prefix,
 			external_static_cache_key=external_static_cache_key,

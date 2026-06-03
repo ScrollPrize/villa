@@ -302,7 +302,9 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			wraps=map_objective._map_init_reference_edge_square,
 		) as ref_mock:
 			opt_loss_snap_surf._map_init_objective(**kwargs)
-			opt_loss_snap_surf._map_init_objective(**kwargs)
+			uv2 = uv.clone()
+			uv2[..., 0] = uv2[..., 0] + 0.25
+			opt_loss_snap_surf._map_init_objective(**{**kwargs, "uv_full": uv2})
 
 		self.assertEqual(ref_mock.call_count, 1)
 
