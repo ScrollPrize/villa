@@ -26,7 +26,7 @@
 		"map_turn": 0.1,
 		"map_jac": 1.0,
 		"map_metric_smooth": 0.1,
-		"map_area_smooth": 0.1,
+		"map_area_smooth": 0.0,
 		"map_dense_prior": 0.001,
 		"map_station_t": 0.001
 	},
@@ -54,7 +54,7 @@
 						"w_bend": 0.01,
 						"w_jac": 1.0,
 						"w_metric_smooth": 0.05,
-						"w_area_smooth": 0.02,
+						"w_area_smooth": 0.0,
 						"w_dense_prior": 0.001,
 						"max_sample_distance": 1000.0,
 						"max_sample_angle_deg": 180.0,
@@ -85,7 +85,6 @@
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
-			"w_fac": { "map_area_smooth": 0.0 },
 			"args": {
 				"subdiv": 1,
 				"status_interval": 20
