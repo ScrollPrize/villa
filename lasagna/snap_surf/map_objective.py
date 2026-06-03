@@ -235,6 +235,90 @@ def _map_init_split_packed_pos_norm(packed: torch.Tensor) -> tuple[torch.Tensor,
 		raise ValueError(f"expected packed pos/norm tensor with 6 channels, got shape {tuple(packed.shape)}")
 	return packed[..., :3], packed[..., 3:6]
 
+def _map_init_sample_surface_grid_with_valid(
+	grid: torch.Tensor,
+	valid: torch.Tensor,
+	coords: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	if grid.ndim == 3:
+		H, W, C = int(grid.shape[0]), int(grid.shape[1]), int(grid.shape[2])
+		if H < 2 or W < 2:
+			return (
+				torch.full((*coords.shape[:-1], C), float("nan"), device=grid.device, dtype=grid.dtype),
+				torch.zeros(coords.shape[:-1], device=valid.device, dtype=torch.bool),
+			)
+		flat = coords.reshape(-1, 2)
+		finite = torch.isfinite(flat).all(dim=-1)
+		safe = torch.where(torch.isfinite(flat), flat, torch.zeros_like(flat))
+		h = safe[:, 0]
+		w = safe[:, 1]
+		in_bounds = finite & (h >= 0.0) & (h <= float(H - 1)) & (w >= 0.0) & (w <= float(W - 1))
+		hc = h.clamp(0.0, float(H - 1))
+		wc = w.clamp(0.0, float(W - 1))
+		h0 = torch.floor(hc).clamp(0, H - 2).long()
+		w0 = torch.floor(wc).clamp(0, W - 2).long()
+		h1 = h0 + 1
+		w1 = w0 + 1
+		fh = (hc - h0.to(dtype=grid.dtype)).unsqueeze(-1)
+		fw = (wc - w0.to(dtype=grid.dtype)).unsqueeze(-1)
+		out = (
+			(1.0 - fh) * (1.0 - fw) * grid[h0, w0] +
+			fh * (1.0 - fw) * grid[h1, w0] +
+			(1.0 - fh) * fw * grid[h0, w1] +
+			fh * fw * grid[h1, w1]
+		)
+		ok = (
+			valid[h0, w0].bool() &
+			valid[h1, w0].bool() &
+			valid[h0, w1].bool() &
+			valid[h1, w1].bool() &
+			in_bounds
+		)
+		return out.reshape(*coords.shape[:-1], C), ok.reshape(coords.shape[:-1])
+	if grid.ndim != 4:
+		raise ValueError(f"expected 2D/3D surface grid with vector channel, got shape {tuple(grid.shape)}")
+	D, H, W, C = int(grid.shape[0]), int(grid.shape[1]), int(grid.shape[2]), int(grid.shape[3])
+	if H < 2 or W < 2:
+		return (
+			torch.full((*coords.shape[:-1], C), float("nan"), device=grid.device, dtype=grid.dtype),
+			torch.zeros(coords.shape[:-1], device=valid.device, dtype=torch.bool),
+		)
+	flat = coords.reshape(-1, 3)
+	finite = torch.isfinite(flat).all(dim=-1)
+	safe = torch.where(torch.isfinite(flat), flat, torch.zeros_like(flat))
+	d = safe[:, 0]
+	h = safe[:, 1]
+	w = safe[:, 2]
+	in_bounds = (
+		finite &
+		(d >= 0.0) & (d <= float(D - 1)) &
+		(h >= 0.0) & (h <= float(H - 1)) &
+		(w >= 0.0) & (w <= float(W - 1))
+	)
+	di = torch.round(d.clamp(0.0, float(D - 1))).long()
+	hc = h.clamp(0.0, float(H - 1))
+	wc = w.clamp(0.0, float(W - 1))
+	h0 = torch.floor(hc).clamp(0, H - 2).long()
+	w0 = torch.floor(wc).clamp(0, W - 2).long()
+	h1 = h0 + 1
+	w1 = w0 + 1
+	fh = (hc - h0.to(dtype=grid.dtype)).unsqueeze(-1)
+	fw = (wc - w0.to(dtype=grid.dtype)).unsqueeze(-1)
+	out = (
+		(1.0 - fh) * (1.0 - fw) * grid[di, h0, w0] +
+		fh * (1.0 - fw) * grid[di, h1, w0] +
+		(1.0 - fh) * fw * grid[di, h0, w1] +
+		fh * fw * grid[di, h1, w1]
+	)
+	ok = (
+		valid[di, h0, w0].bool() &
+		valid[di, h1, w0].bool() &
+		valid[di, h0, w1].bool() &
+		valid[di, h1, w1].bool() &
+		in_bounds
+	)
+	return out.reshape(*coords.shape[:-1], C), ok.reshape(coords.shape[:-1])
+
 def _map_init_sample_scalar_quad_field(
 	field: torch.Tensor,
 	valid: torch.Tensor,
@@ -423,6 +507,54 @@ def _map_init_distance_multiplier(
 	a_model = angle(c_model)
 	angle_sum = ((a_ext + a_model) / (math.pi / 2.0)).clamp(0.0, 2.0)
 	return 1.0 + float(cfg.angle_dist_mult) * angle_sum.square()
+
+def _map_init_sample_geometry_limit_ok_precomputed(
+	*,
+	p_ext: torch.Tensor,
+	n_ext_raw: torch.Tensor,
+	n_ext: torch.Tensor,
+	p_model: torch.Tensor,
+	n_model_raw: torch.Tensor,
+	n_model: torch.Tensor,
+	d: torch.Tensor,
+	c_ext: torch.Tensor,
+	c_model: torch.Tensor,
+	c_norm: torch.Tensor,
+	cfg: SnapSurfMapInitConfig,
+	ext_step: torch.Tensor | None = None,
+	model_step: torch.Tensor | None = None,
+) -> torch.Tensor:
+	if p_ext.numel() == 0:
+		return torch.zeros(p_ext.shape[:-1], device=p_ext.device, dtype=torch.bool)
+	ok = (
+		torch.isfinite(p_ext).all(dim=-1) &
+		torch.isfinite(p_model).all(dim=-1) &
+		torch.isfinite(n_ext_raw).all(dim=-1) &
+		torch.isfinite(n_ext).all(dim=-1) &
+		(n_ext.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(n_model_raw).all(dim=-1) &
+		torch.isfinite(n_model).all(dim=-1) &
+		(n_model.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(d)
+	)
+	max_dist = float(cfg.max_sample_distance)
+	if max_dist > 0.0:
+		ok = ok & (d <= max_dist)
+	max_angle = float(cfg.max_sample_angle_deg)
+	if max_angle < 180.0:
+		near_zero = d <= 1.0
+		cos_min_ext = _map_init_connection_cos_min(d, model_step, cfg=cfg)
+		cos_min_model = _map_init_connection_cos_min(d, ext_step, cfg=cfg)
+		angle_ok = (
+			torch.isfinite(c_ext) &
+			torch.isfinite(c_model) &
+			torch.isfinite(c_norm) &
+			torch.isfinite(cos_min_ext) &
+			torch.isfinite(cos_min_model) &
+			((near_zero | (c_ext >= cos_min_ext)) & (near_zero | (c_model >= cos_min_model)))
+		)
+		ok = ok & angle_ok
+	return ok
 
 def _map_init_jacobian_values(
 	uv: torch.Tensor,
@@ -637,6 +769,7 @@ def _map_init_model_metric_positions(
 	model_xyz: torch.Tensor,
 	model_valid: torch.Tensor | None,
 	model_depth: int | None,
+	model_xyz_safe: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	finite_uv = torch.isfinite(uv).all(dim=-1)
 	if model_xyz.ndim == 4:
@@ -644,8 +777,10 @@ def _map_init_model_metric_positions(
 			return uv, finite_uv
 		coords = _map_init_coords3(uv, depth=int(model_depth))
 		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
-		model_xyz_safe = model_xyz if model_valid is None else _map_init_valid_field_values(model_xyz, model_valid)
-		pos = _sample_surface_grid(model_xyz_safe, safe_coords)
+		model_source = model_xyz if model_xyz_safe is None and model_valid is None else model_xyz_safe
+		if model_source is None:
+			model_source = _map_init_valid_field_values(model_xyz, model_valid)
+		pos = _sample_surface_grid(model_source, safe_coords)
 		valid = torch.isfinite(coords).all(dim=-1) & torch.isfinite(pos).all(dim=-1)
 		if model_valid is not None:
 			valid = valid & _quad_valid_at_coords(
@@ -656,8 +791,10 @@ def _map_init_model_metric_positions(
 		return pos, valid
 	if model_xyz.ndim == 3:
 		safe_coords = torch.where(torch.isfinite(uv), uv, torch.zeros_like(uv))
-		model_xyz_safe = model_xyz if model_valid is None else _map_init_valid_field_values(model_xyz, model_valid)
-		pos = _sample_surface_grid(model_xyz_safe, safe_coords)
+		model_source = model_xyz if model_xyz_safe is None and model_valid is None else model_xyz_safe
+		if model_source is None:
+			model_source = _map_init_valid_field_values(model_xyz, model_valid)
+		pos = _sample_surface_grid(model_source, safe_coords)
 		valid = finite_uv & torch.isfinite(pos).all(dim=-1)
 		if model_valid is not None:
 			valid = valid & _quad_valid_at_coords(
@@ -1260,6 +1397,26 @@ def _map_init_dense_quad_model_physical_step_lengths(
 	)
 	return _map_init_dense_mean_quad_edge_length(model_corners, model_corner_valid)
 
+def _map_init_dense_quad_model_physical_step_lengths_from_metric(
+	model_metric_pos: torch.Tensor,
+	model_metric_valid: torch.Tensor,
+) -> torch.Tensor:
+	if model_metric_pos.numel() == 0:
+		return torch.zeros(model_metric_pos.shape[:2], device=model_metric_pos.device, dtype=model_metric_pos.dtype)
+	corners = torch.stack([
+		model_metric_pos[:-1, :-1],
+		model_metric_pos[1:, :-1],
+		model_metric_pos[:-1, 1:],
+		model_metric_pos[1:, 1:],
+	], dim=-2)
+	corner_valid = torch.stack([
+		model_metric_valid[:-1, :-1],
+		model_metric_valid[1:, :-1],
+		model_metric_valid[:-1, 1:],
+		model_metric_valid[1:, 1:],
+	], dim=-1).bool()
+	return _map_init_dense_mean_quad_edge_length(corners, corner_valid)
+
 def _map_init_dense_quad_physical_step_lengths(
 	*,
 	uv_full: torch.Tensor,
@@ -1362,6 +1519,7 @@ def _map_init_objective(
 	metric_term_active = (not train_fast) or float(mi.w_metric_smooth) > 0.0
 	area_term_active = (not train_fast) or float(mi.w_area_smooth) > 0.0
 	prior_term_active = (not train_fast) or (bool(mi.dense_opt) and float(mi.w_dense_prior) > 0.0 and uv_prior is not None)
+	metric_positions_needed = smooth_term_active or bend_term_active or metric_term_active or area_term_active
 	reg_terms_active = (
 		smooth_term_active or bend_term_active or jac_term_active or
 		metric_term_active or area_term_active or prior_term_active or bool(need_stats)
@@ -1420,6 +1578,8 @@ def _map_init_objective(
 	turn_loss = z
 	turn_sample_count_t = uv_full.new_zeros(())
 	turn_valid_count_t = uv_full.new_zeros(())
+	model_metric_pos_cached: torch.Tensor | None = None
+	model_metric_valid_cached: torch.Tensor | None = None
 	if sample_terms_active and active_quad.numel() > 0 and bool(active_quad.any().detach().cpu()):
 		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_dense_quad_sample_tensors(
 			uv_full=uv_full,
@@ -1451,7 +1611,18 @@ def _map_init_objective(
 			prefix=cache_key_prefix,
 		))
 		model_xyz_safe, _model_normals_safe = _map_init_split_packed_pos_norm(model_pos_norm_safe)
-		model_sample_packed = _timed("sample_model_packed_grid", lambda: _sample_surface_grid(model_pos_norm_safe, safe_coords))
+		model_metric_pos_cached, model_metric_valid_cached = _timed("sample_model_metric_vertices", lambda: _map_init_model_metric_positions(
+			uv_full,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_depth=int(model_depth),
+			model_xyz_safe=model_xyz_safe,
+		))
+		model_sample_packed, coord_ok = _timed("sample_model_packed_grid_valid", lambda: _map_init_sample_surface_grid_with_valid(
+			model_pos_norm_safe,
+			model_valid.bool(),
+			safe_coords,
+		))
 		p_model, n_model_raw = _map_init_split_packed_pos_norm(model_sample_packed)
 		n_model = _timed("sample_normalize", lambda: F.normalize(n_model_raw, dim=-1, eps=1.0e-8) * sign_f)
 		ext_step_q = _timed("sample_ext_step_lengths", lambda: _map_init_cached_dense_quad_external_physical_step_lengths(
@@ -1462,20 +1633,12 @@ def _map_init_objective(
 			cache_key_prefix=cache_key_prefix,
 			ext_coords_cache_key=external_static_cache_key,
 		))
-		model_step_q = _timed("sample_model_step_lengths", lambda: _map_init_dense_quad_model_physical_step_lengths(
-			uv_full=uv_full,
-			model_xyz=model_xyz,
-			model_valid=model_valid,
-			model_depth=int(model_depth),
-			model_xyz_safe=model_xyz_safe,
+		model_step_q = _timed("sample_model_step_lengths", lambda: _map_init_dense_quad_model_physical_step_lengths_from_metric(
+			model_metric_pos_cached,
+			model_metric_valid_cached,
 		))
 		ext_step_f = ext_step_q.unsqueeze(-1).expand(Hq, Wq, S)
 		model_step_f = model_step_q.unsqueeze(-1).expand(Hq, Wq, S)
-		coord_ok = _timed("sample_model_valid_mask", lambda: _quad_valid_at_coords(
-			model_valid.bool(),
-			safe_coords,
-			tuple(int(v) for v in model_valid.shape),
-		))
 		def _sample_dot_product_tensors():
 			v_i = p_model - p_ext_f
 			d_i = v_i.norm(dim=-1)
@@ -1489,12 +1652,17 @@ def _map_init_objective(
 				(n_ext * n_model).sum(dim=-1),
 			)
 		v, d, u, c_ext, c_model, c_norm = _timed("sample_dot_products", _sample_dot_product_tensors)
-		sample_limit_ok = _timed("sample_geometry_limit", lambda: _map_init_sample_geometry_limit_ok(
+		sample_limit_ok = _timed("sample_geometry_limit", lambda: _map_init_sample_geometry_limit_ok_precomputed(
 			p_ext=p_ext_f,
-			n_ext=n_ext_raw_f,
+			n_ext_raw=n_ext_raw_f,
+			n_ext=n_ext,
 			p_model=p_model,
 			n_model_raw=n_model_raw,
-			sign=sign,
+			n_model=n_model,
+			d=d,
+			c_ext=c_ext,
+			c_model=c_model,
+			c_norm=c_norm,
 			cfg=mi,
 			ext_step=ext_step_f,
 			model_step=model_step_f,
@@ -1643,14 +1811,19 @@ def _map_init_objective(
 		reg_quad = torch.zeros_like(active_quad, dtype=torch.bool)
 		uv_safe = torch.where(uv_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
 	reg_count_t = reg_finite.to(dtype=uv_full.dtype).sum() if bool(need_stats) else uv_full.new_zeros(())
-	metric_positions_needed = smooth_term_active or bend_term_active or metric_term_active or area_term_active
 	if metric_positions_needed:
-		model_metric_pos, model_metric_valid = _timed("reg_model_metric_sample", lambda: _map_init_model_metric_positions(
-			uv_safe,
-			model_xyz=model_xyz,
-			model_valid=model_valid,
-			model_depth=model_depth,
-		))
+		if model_metric_pos_cached is None or model_metric_valid_cached is None:
+			model_metric_pos, model_metric_valid = _timed("reg_model_metric_sample", lambda: _map_init_model_metric_positions(
+				uv_safe,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_depth=model_depth,
+			))
+		else:
+			model_metric_pos, model_metric_valid = _timed("reg_model_metric_reuse", lambda: (
+				model_metric_pos_cached,
+				model_metric_valid_cached,
+			))
 		model_metric_valid = model_metric_valid & reg_finite
 	else:
 		model_metric_pos = torch.zeros((*uv_full.shape[:2], 3), device=uv_full.device, dtype=uv_full.dtype)

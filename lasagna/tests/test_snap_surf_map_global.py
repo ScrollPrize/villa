@@ -2238,7 +2238,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertFalse(Path(out_dir, "benchmark.json").exists())
 			block_names = {row["block"] for row in profile["block_rows"]}
 			self.assertIn("sample_model_packed_source_prepare", block_names)
-			self.assertIn("sample_model_packed_grid", block_names)
+			self.assertIn("sample_model_packed_grid_valid", block_names)
 			uv_fwd_row = next(row for row in profile["rows"] if row["component"] == "uv_fwd")
 			none_fwd_row = next(row for row in profile["rows"] if row["component"] == "none_fwd")
 			none_row = next(row for row in profile["rows"] if row["component"] == "none")
