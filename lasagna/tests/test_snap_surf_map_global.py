@@ -43,6 +43,7 @@ from snap_surf.map_global import (
 	_run_affine_seed_quad_expansion_reopt,
 	_select_affine_seed_grid_candidate,
 	_seed_quad_affine_init_result,
+	_station_loss,
 	_stage_objective_level,
 	_stage_loss_cfg,
 	_stage_station_weight,
@@ -210,6 +211,25 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertIn("sm_bnd", out)
 		self.assertIn("sm_met", out)
 		self.assertIn("sm_ar", out)
+
+	def test_station_loss_applies_proxy_shift_to_active_vertices(self) -> None:
+		uv = torch.zeros(3, 3, 2, dtype=torch.float32, requires_grad=True)
+		active_quad = torch.zeros(2, 2, dtype=torch.bool)
+		active_quad[0, 0] = True
+
+		loss = _station_loss(
+			uv,
+			torch.tensor([1.0, 1.0]),
+			torch.tensor([-2.0, 3.0]),
+			active_quad=active_quad,
+		)
+		loss.backward()
+
+		expected = torch.tensor([0.5, -0.75])
+		active_vertex = torch.zeros(3, 3, dtype=torch.bool)
+		active_vertex[:2, :2] = True
+		self.assertTrue(torch.allclose(uv.grad[active_vertex], expected.expand(4, 2)))
+		self.assertTrue(torch.equal(uv.grad[~active_vertex], torch.zeros_like(uv.grad[~active_vertex])))
 
 	def _snap_loss_case(
 		self,

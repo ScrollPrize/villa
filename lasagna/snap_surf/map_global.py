@@ -2550,7 +2550,7 @@ def _run_affine_seed_quad_expansion_reopt(
 			)
 			station_raw = loss.new_zeros(())
 			if float(w_station) > 0.0:
-				station_raw = _station_loss(uv, seed_hw, station_target)
+				station_raw = _station_loss(uv, seed_hw, station_target, active_quad=active)
 				loss = loss + float(w_station) * station_raw
 			row = _affine_seed_quad_expansion_row_from_terms(
 				radius=radius,
@@ -2582,7 +2582,7 @@ def _run_affine_seed_quad_expansion_reopt(
 			)
 			station_raw = loss.new_zeros(())
 			if float(w_station) > 0.0:
-				station_raw = _station_loss(uv, seed_hw, station_target)
+				station_raw = _station_loss(uv, seed_hw, station_target, active_quad=active)
 				loss = loss + float(w_station) * station_raw
 			progress_terms = dict(terms)
 			progress_terms["station"] = station_raw.detach()
@@ -2631,7 +2631,7 @@ def _run_affine_seed_quad_expansion_reopt(
 				active_quad_crop=crop,
 			)
 			if float(w_station) > 0.0:
-				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
+				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target, active_quad=active)
 			loss.backward()
 			step1 = step + 1
 			_apply_optimizer_lr_schedule(
@@ -3018,10 +3018,11 @@ def _score_affine_tensor(
 	with torch.no_grad():
 		affine_model.affine.copy_(affine_tensor)
 	uv = affine_model()
-	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+	stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0, active_quad=stage_active_quad)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
-		station_raw = _station_loss(uv, seed_hw, station_target)
+		station_raw = _station_loss(uv, seed_hw, station_target, active_quad=stage_active_quad)
 		loss = loss + float(w_station) * station_raw
 	terms = dict(terms)
 	terms["station"] = station_raw.detach()
@@ -3062,7 +3063,7 @@ def _optimize_affine_candidate(
 			active_quad=stage_active_quad,
 		)
 		if float(w_station) > 0.0:
-			loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
+			loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target, active_quad=stage_active_quad)
 		last_loss = float(loss.detach().cpu())
 		if opt is None:
 			break
@@ -3698,7 +3699,7 @@ def _run_affine_seed_quad_init(
 		)
 		station_raw = loss.new_zeros(())
 		if float(w_station) > 0.0:
-			station_raw = _station_loss(uv, seed_hw, station_target)
+			station_raw = _station_loss(uv, seed_hw, station_target, active_quad=stage_active_quad)
 			loss = loss + float(w_station) * station_raw
 		if opt is not None:
 			loss.backward()
@@ -3831,7 +3832,12 @@ def _stage_station_weight(cfg_global: GlobalMapConfig, stage: GlobalMapStageConf
 	return base * float(stage.w_fac)
 
 
-def _station_loss(uv: torch.Tensor, seed_ext_hw: torch.Tensor, target_uv: torch.Tensor) -> torch.Tensor:
+def _station_loss(
+	uv: torch.Tensor,
+	seed_ext_hw: torch.Tensor,
+	target_uv: torch.Tensor,
+	active_quad: torch.Tensor | None = None,
+) -> torch.Tensor:
 	H, W = int(uv.shape[0]), int(uv.shape[1])
 	coords = seed_ext_hw.view(1, 2)
 	h = coords[:, 0].clamp(0.0, float(max(0, H - 1)))
@@ -3848,7 +3854,15 @@ def _station_loss(uv: torch.Tensor, seed_ext_hw: torch.Tensor, target_uv: torch.
 		(1.0 - fh) * fw * uv[h0, w1] +
 		fh * fw * uv[h1, w1]
 	).view(2)
-	return (value - target_uv).square().mean()
+	seed_error = (value - target_uv.to(device=uv.device, dtype=uv.dtype)).detach()
+	finite = torch.isfinite(uv).all(dim=-1)
+	if active_quad is not None:
+		active_vertex = _vertex_mask_from_quad_mask(active_quad.to(device=uv.device), (H, W))
+		finite = finite & active_vertex
+	if not bool(finite.any().detach().cpu()):
+		return uv.new_zeros(())
+	target = uv.detach() - seed_error.view(1, 1, 2)
+	return (uv[finite] - target[finite]).square().mean()
 
 
 def _level_seed_hw(seed_ext_hw: torch.Tensor, level: int) -> torch.Tensor:
@@ -4253,7 +4267,7 @@ def _global_progress_state(
 	)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
-		station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(level)), station_target)
+		station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(level)), station_target, active_quad=active_quad)
 		loss = loss + float(w_station) * station_raw
 	progress_terms = dict(terms)
 	progress_terms["station"] = station_raw.detach()
@@ -5423,7 +5437,7 @@ class GlobalMapRuntime:
 					active_quad=stage_active_quad,
 				)
 				if w_station > 0.0:
-					station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target)
+					station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target, active_quad=stage_active_quad)
 					loss = loss + w_station * station_raw
 				else:
 					station_raw = loss.new_zeros(())
@@ -6145,7 +6159,7 @@ def _run_fixture_stage_training_step_loop(
 			active_quad=stage_active_quad,
 		)
 		if float(w_station) > 0.0:
-			loss = loss + float(w_station) * _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target)
+			loss = loss + float(w_station) * _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target, active_quad=stage_active_quad)
 		loss.backward()
 		_apply_optimizer_lr_schedule(
 			opt,
