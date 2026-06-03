@@ -1097,8 +1097,11 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		n_ext_raw[..., 2] = 1.0
 		n_model_raw = torch.zeros_like(p_ext)
 		n_model_raw[..., 2] = 1.0
+		p_ext[0, 0, 1] = torch.tensor([float("nan"), 0.0, 0.0])
 		n_ext_raw[0, 1, 2] = torch.tensor([float("nan"), 0.0, 1.0])
 		p_model[1, 0, 1] = torch.tensor([float("nan"), 0.0, 0.0])
+		p_model[0, 1, 1] = p_ext[0, 1, 1] + torch.tensor([10.0, 0.0, 0.0])
+		n_model_raw[1, 2, 1] = torch.tensor([0.0, float("nan"), 1.0])
 		n_ext = F.normalize(n_ext_raw, dim=-1, eps=1.0e-8)
 		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
 		coord_ok = torch.ones(Hq, Wq, S, dtype=torch.bool)
@@ -1204,13 +1207,50 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 				float(cfg.max_sample_angle_deg),
 				float(cfg.sample_angle_step_fraction),
 			)
+			new_with_values = opt_loss_snap_surf._map_init_reduce_sample_terms_with_values_and_geometry_limit_tensor(
+				active_quad,
+				quad_uv_ok,
+				uv,
+				p_ext,
+				n_ext_raw,
+				n_ext,
+				coord_ok,
+				p_model,
+				n_model_raw,
+				n_model,
+				turn_values,
+				turn_valid,
+				sample_ext_ok,
+				allow_partial,
+				need_stats,
+				False,
+				False,
+				float(cfg.w_dist),
+				float(cfg.w_vec_normal),
+				float(cfg.w_surface_normal),
+				float(cfg.w_z_lift),
+				z,
+				1.0,
+				float(cfg.angle_dist_mult),
+				ext_steps,
+				model_steps,
+				float(cfg.max_sample_distance),
+				float(cfg.max_sample_angle_deg),
+				float(cfg.sample_angle_step_fraction),
+			)
 			self.assertEqual(set(new), set(old))
+			self.assertEqual(set(new_with_values), set(old))
 			for key, old_value in old.items():
 				new_value = new[key]
 				if old_value.dtype == torch.bool:
 					self.assertTrue(torch.equal(new_value, old_value), key)
 				else:
 					torch.testing.assert_close(new_value, old_value, rtol=1.0e-6, atol=1.0e-6, msg=key)
+				new_with_values_value = new_with_values[key]
+				if old_value.dtype == torch.bool:
+					self.assertTrue(torch.equal(new_with_values_value, old_value), key)
+				else:
+					torch.testing.assert_close(new_with_values_value, old_value, rtol=1.0e-6, atol=1.0e-6, msg=key)
 
 		for allow_partial in (False, True):
 			for need_stats in (False, True):
@@ -1967,7 +2007,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		torch.testing.assert_close(compiled_grad, eager_grad, rtol=1.0e-6, atol=1.0e-6)
 		compiled_names = {str(key[0]) for key in map_objective._MAP_INIT_COMPILED_FN_CACHE}
 		self.assertTrue({
-			"sample_reduce_with_geometry_limit",
+			"sample_reduce_with_values_and_geometry_limit",
 			"sample_model_context",
 			"forward_smooth_bend",
 			"jacobian_penalty",
@@ -1976,6 +2016,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			"model_metric_steps",
 			"prior_loss",
 		}.issubset(compiled_names))
+		self.assertNotIn("sample_reduce_with_geometry_limit", compiled_names)
 		self.assertNotIn("sample_reduce", compiled_names)
 		self.assertNotIn("area_evenness", compiled_names)
 
