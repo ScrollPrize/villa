@@ -5992,6 +5992,7 @@ def benchmark_fixture(
 	reference_dir: str | Path | None = None,
 	max_model_abs_delta: float = 1.0,
 	max_model_l2_delta: float = 1.0,
+	max_model_valid_miss_frac: float = 0.01,
 	require_mask_equal: bool = True,
 	profile_components: bool = False,
 	profile_repeats: int = 3,
@@ -6025,16 +6026,20 @@ def benchmark_fixture(
 		rerun_uv=rerun_uv,
 		rerun_active_quad=rerun_active,
 		rerun_blocked_quad=rerun_blocked,
+		model_valid=fixture.model_valid,
+		model_depth=int(fixture.metadata.get("model_depth", 0) or 0),
 	)
 	thresholds = {
 		"max_model_abs_delta": float(max_model_abs_delta),
 		"max_model_l2_delta": float(max_model_l2_delta),
+		"max_model_valid_miss_frac": float(max_model_valid_miss_frac),
 		"require_mask_equal": bool(require_mask_equal),
 	}
 	max_abs_observed = max(float(compare["model_y_max_abs_delta"]), float(compare["model_x_max_abs_delta"]))
 	passed = (
 		max_abs_observed <= float(max_model_abs_delta) and
 		float(compare["model_l2_max_delta"]) <= float(max_model_l2_delta) and
+		float(compare["model_valid_missed_frac"]) <= float(max_model_valid_miss_frac) and
 		((not bool(require_mask_equal)) or (bool(compare["active_quad_equal"]) and bool(compare["blocked_quad_equal"])))
 	)
 	profile_rows: list[dict[str, Any]] = []

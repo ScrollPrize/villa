@@ -24,6 +24,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	bench.add_argument("--reference-dir", default=None, help="Reference fixture directory or map directory; defaults to fixture map")
 	bench.add_argument("--max-model-abs-delta", type=float, default=1.0, help="Maximum allowed per-axis absolute UV delta")
 	bench.add_argument("--max-model-l2-delta", type=float, default=1.0, help="Maximum allowed per-vertex L2 UV delta")
+	bench.add_argument("--max-model-valid-miss-frac", type=float, default=0.01, help="Maximum fraction of reference model-valid samples the rerun may miss")
 	bench.add_argument("--allow-mask-diff", action="store_true", help="Do not fail when active/blocked masks differ")
 	bench.add_argument("--profile-components", action="store_true", help="Time all and single map objective components without optimizer steps")
 	bench.add_argument("--profile-repeats", type=int, default=3, help="Component profiling repeats per component")
@@ -66,10 +67,11 @@ def main(argv: list[str] | None = None) -> int:
 			args.config,
 			out_dir=Path(args.out),
 			device=device,
-			reference_dir=args.reference_dir,
-			max_model_abs_delta=float(args.max_model_abs_delta),
-			max_model_l2_delta=float(args.max_model_l2_delta),
-			require_mask_equal=not bool(args.allow_mask_diff),
+				reference_dir=args.reference_dir,
+				max_model_abs_delta=float(args.max_model_abs_delta),
+				max_model_l2_delta=float(args.max_model_l2_delta),
+				max_model_valid_miss_frac=float(args.max_model_valid_miss_frac),
+				require_mask_equal=not bool(args.allow_mask_diff),
 			profile_components=bool(args.profile_components),
 			profile_repeats=int(args.profile_repeats),
 			profile_stage=args.profile_stage,
@@ -79,10 +81,14 @@ def main(argv: list[str] | None = None) -> int:
 		print(
 			"[map_global_cli] "
 			f"status={result['status']} "
-			f"elapsed_s={result['elapsed_s']:.6g} "
-			f"common_vertices={deltas['common_vertices']} "
-			f"model_l2_max_delta={deltas['model_l2_max_delta']:.9g} "
-			f"active_quad_diff={deltas['active_quad_diff']} "
+				f"elapsed_s={result['elapsed_s']:.6g} "
+				f"common_vertices={deltas['common_vertices']} "
+				f"model_l2_max_delta={deltas['model_l2_max_delta']:.9g} "
+				f"model_l2_mean_delta={float(deltas.get('model_l2_mean_delta', 0.0)):.9g} "
+				f"model_l2_mse_delta={float(deltas.get('model_l2_mse_delta', 0.0)):.9g} "
+				f"model_valid_missed={deltas.get('model_valid_missed_vertices', 0)} "
+				f"model_valid_missed_frac={float(deltas.get('model_valid_missed_frac', 0.0)):.6g} "
+				f"active_quad_diff={deltas['active_quad_diff']} "
 			f"blocked_quad_diff={deltas['blocked_quad_diff']}",
 			flush=True,
 		)

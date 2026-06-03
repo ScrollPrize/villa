@@ -20,7 +20,7 @@ TEST_DIR = os.path.dirname(__file__)
 if TEST_DIR not in sys.path:
 	sys.path.insert(0, TEST_DIR)
 
-from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_vector_dir, load_map_fixture
+from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_vector_dir, compare_map_tensors, load_map_fixture
 from snap_surf.map_global import (
 	AffineMapModel,
 	BoundarySelfMapRuntime,
@@ -230,6 +230,70 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		active_vertex[:2, :2] = True
 		self.assertTrue(torch.allclose(uv.grad[active_vertex], expected.expand(4, 2)))
 		self.assertTrue(torch.equal(uv.grad[~active_vertex], torch.zeros_like(uv.grad[~active_vertex])))
+
+	def test_compare_map_tensors_ignores_uvs_that_do_not_land_on_model(self) -> None:
+		active_quad = torch.ones(1, 1, dtype=torch.bool)
+		blocked_quad = torch.zeros(1, 1, dtype=torch.bool)
+		reference_uv = torch.tensor(
+			[
+				[[0.0, 0.0], [5.0, 5.0]],
+				[[5.0, 5.0], [5.0, 5.0]],
+			],
+			dtype=torch.float32,
+		)
+		rerun_uv = reference_uv.clone()
+		rerun_uv[0, 1] = torch.tensor([100.0, 100.0])
+		model_valid = torch.ones(1, 2, 2, dtype=torch.bool)
+
+		deltas = compare_map_tensors(
+			reference_uv=reference_uv,
+			reference_active_quad=active_quad,
+			reference_blocked_quad=blocked_quad,
+			rerun_uv=rerun_uv,
+			rerun_active_quad=active_quad,
+			rerun_blocked_quad=blocked_quad,
+			model_valid=model_valid,
+			model_depth=0,
+		)
+
+		self.assertEqual(deltas["finite_common_vertices"], 4)
+		self.assertEqual(deltas["common_vertices"], 1)
+		self.assertEqual(deltas["model_l2_max_delta"], 0.0)
+		self.assertEqual(deltas["model_l2_mean_delta"], 0.0)
+		self.assertEqual(deltas["model_l2_mse_delta"], 0.0)
+
+	def test_compare_map_tensors_reports_model_valid_coverage_misses(self) -> None:
+		active_quad = torch.ones(1, 1, dtype=torch.bool)
+		blocked_quad = torch.zeros(1, 1, dtype=torch.bool)
+		reference_uv = torch.tensor(
+			[
+				[[0.0, 0.0], [0.0, 1.0]],
+				[[1.0, 0.0], [1.0, 1.0]],
+			],
+			dtype=torch.float32,
+		)
+		rerun_uv = reference_uv.clone()
+		rerun_uv[0, 1] = torch.tensor([100.0, 100.0])
+		model_valid = torch.ones(1, 2, 2, dtype=torch.bool)
+
+		deltas = compare_map_tensors(
+			reference_uv=reference_uv,
+			reference_active_quad=active_quad,
+			reference_blocked_quad=blocked_quad,
+			rerun_uv=rerun_uv,
+			rerun_active_quad=active_quad,
+			rerun_blocked_quad=blocked_quad,
+			model_valid=model_valid,
+			model_depth=0,
+		)
+
+		self.assertEqual(deltas["reference_model_valid_vertices"], 4)
+		self.assertEqual(deltas["rerun_model_valid_vertices"], 3)
+		self.assertEqual(deltas["model_valid_missed_vertices"], 1)
+		self.assertAlmostEqual(deltas["model_valid_missed_frac"], 0.25)
+		self.assertEqual(deltas["common_vertices"], 3)
+		self.assertEqual(deltas["model_l2_mean_delta"], 0.0)
+		self.assertEqual(deltas["model_l2_mse_delta"], 0.0)
 
 	def _snap_loss_case(
 		self,

@@ -14,6 +14,7 @@ from .config import SnapSurfConfig, _parse_map_init_config
 from .debug_obj import _write_map_init_objs_to_dir
 from .map_pyramid import _map_init_active_vertex_mask, _map_init_external_quad_valid
 from .state import _SurfaceState
+from .tensor import _quad_valid_at_coords
 
 MAP_FIXTURE_SCHEMA_VERSION = 1
 
@@ -327,6 +328,8 @@ def compare_map_tensors(
 	rerun_uv: torch.Tensor,
 	rerun_active_quad: torch.Tensor,
 	rerun_blocked_quad: torch.Tensor,
+	model_valid: torch.Tensor | None = None,
+	model_depth: int = 0,
 ) -> dict[str, Any]:
 	if tuple(reference_uv.shape) != tuple(rerun_uv.shape):
 		raise ValueError(f"map uv shape mismatch: reference={tuple(reference_uv.shape)} rerun={tuple(rerun_uv.shape)}")
@@ -338,12 +341,32 @@ def compare_map_tensors(
 	rerun_vertex = _map_init_active_vertex_mask(rerun_active_quad.bool(), tuple(int(v) for v in rerun_uv.shape[:2]))
 	ref_finite = ref_vertex & torch.isfinite(reference_uv).all(dim=-1)
 	rerun_finite = rerun_vertex & torch.isfinite(rerun_uv).all(dim=-1)
-	common = ref_finite & rerun_finite
+	finite_common = ref_finite & rerun_finite
+	if model_valid is not None:
+		model_valid = model_valid.to(device=reference_uv.device).bool()
+		depth = int(model_depth)
+		def _model_ok(uv: torch.Tensor, finite: torch.Tensor) -> torch.Tensor:
+			d = torch.full((*uv.shape[:-1], 1), float(depth), device=uv.device, dtype=uv.dtype)
+			coords = torch.cat([d, uv], dim=-1)
+			safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+			return finite & _quad_valid_at_coords(model_valid, safe_coords, tuple(int(v) for v in model_valid.shape))
+		ref_model = _model_ok(reference_uv, ref_finite)
+		rerun_model = _model_ok(rerun_uv, rerun_finite)
+	else:
+		ref_model = ref_finite
+		rerun_model = rerun_finite
+	common = finite_common & ref_model & rerun_model
+	model_valid_missed = ref_model & ~rerun_model
+	model_valid_gained = rerun_model & ~ref_model
+	model_valid_coverage_diff = ref_model ^ rerun_model
+	ref_model_count = ref_model.to(dtype=reference_uv.dtype).sum().clamp_min(1.0)
 	delta = rerun_uv - reference_uv
 	if bool(common.any().detach().cpu()):
 		d_common = delta[common]
 		abs_common = d_common.abs()
 		l2_common = d_common.square().sum(dim=-1).sqrt()
+		l2_mean = l2_common.mean()
+		l2_mse = d_common.square().sum(dim=-1).mean()
 		max_abs = abs_common.max(dim=0).values
 		mean_abs = abs_common.mean(dim=0)
 		rms = d_common.square().mean(dim=0).sqrt()
@@ -353,6 +376,8 @@ def compare_map_tensors(
 		mean_abs = reference_uv.new_zeros(2)
 		rms = reference_uv.new_zeros(2)
 		max_l2 = reference_uv.new_zeros(())
+		l2_mean = reference_uv.new_zeros(())
+		l2_mse = reference_uv.new_zeros(())
 	active_diff = reference_active_quad.bool() ^ rerun_active_quad.bool()
 	blocked_diff = reference_blocked_quad.bool() ^ rerun_blocked_quad.bool()
 	return {
@@ -364,17 +389,26 @@ def compare_map_tensors(
 		"rerun_blocked_quads": int(rerun_blocked_quad.bool().sum().detach().cpu()),
 		"blocked_quad_diff": int(blocked_diff.sum().detach().cpu()),
 		"blocked_quad_equal": bool(not bool(blocked_diff.any().detach().cpu())),
-		"reference_finite_vertices": int(ref_finite.sum().detach().cpu()),
-		"rerun_finite_vertices": int(rerun_finite.sum().detach().cpu()),
-		"common_vertices": int(common.sum().detach().cpu()),
+			"reference_finite_vertices": int(ref_finite.sum().detach().cpu()),
+			"rerun_finite_vertices": int(rerun_finite.sum().detach().cpu()),
+			"finite_common_vertices": int(finite_common.sum().detach().cpu()),
+			"reference_model_valid_vertices": int(ref_model.sum().detach().cpu()),
+			"rerun_model_valid_vertices": int(rerun_model.sum().detach().cpu()),
+			"model_valid_missed_vertices": int(model_valid_missed.sum().detach().cpu()),
+			"model_valid_missed_frac": float((model_valid_missed.to(dtype=reference_uv.dtype).sum() / ref_model_count).detach().cpu()),
+			"model_valid_gained_vertices": int(model_valid_gained.sum().detach().cpu()),
+			"model_valid_coverage_diff_vertices": int(model_valid_coverage_diff.sum().detach().cpu()),
+			"common_vertices": int(common.sum().detach().cpu()),
 		"model_y_max_abs_delta": float(max_abs[0].detach().cpu()),
 		"model_x_max_abs_delta": float(max_abs[1].detach().cpu()),
 		"model_y_mean_abs_delta": float(mean_abs[0].detach().cpu()),
 		"model_x_mean_abs_delta": float(mean_abs[1].detach().cpu()),
-		"model_y_rms_delta": float(rms[0].detach().cpu()),
-		"model_x_rms_delta": float(rms[1].detach().cpu()),
-		"model_l2_max_delta": float(max_l2.detach().cpu()),
-	}
+			"model_y_rms_delta": float(rms[0].detach().cpu()),
+			"model_x_rms_delta": float(rms[1].detach().cpu()),
+			"model_l2_max_delta": float(max_l2.detach().cpu()),
+			"model_l2_mean_delta": float(l2_mean.detach().cpu()),
+			"model_l2_mse_delta": float(l2_mse.detach().cpu()),
+		}
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

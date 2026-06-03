@@ -115,7 +115,7 @@
 		},
 		{
 			"name": "map_uv_fine2",
-			"steps": 0,
+			"steps": 200,
 			"lr": 0.01,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
