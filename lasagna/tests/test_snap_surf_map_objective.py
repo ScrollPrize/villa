@@ -964,6 +964,12 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			old_pos,
 			old_valid,
 		)
+		fast_pos, fast_valid = opt_loss_snap_surf._map_init_model_metric_positions_tensor(
+			uv,
+			model_xyz_safe,
+			model_valid,
+			1,
+		)
 		new_pos, new_valid, new_step = opt_loss_snap_surf._map_init_model_metric_steps_tensor(
 			uv,
 			model_xyz_safe,
@@ -971,6 +977,8 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			1,
 		)
 
+		torch.testing.assert_close(fast_pos, old_pos, equal_nan=True)
+		self.assertTrue(torch.equal(fast_valid, old_valid))
 		torch.testing.assert_close(new_pos, old_pos, equal_nan=True)
 		self.assertTrue(torch.equal(new_valid, old_valid))
 		torch.testing.assert_close(new_step, old_step, equal_nan=True)
@@ -1564,6 +1572,64 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 
 		self.assertGreater(float(terms["metric_smooth"].detach()), 0.0)
 		self.assertAlmostEqual(float(terms["area_smooth"].detach()), 0.0, places=6)
+
+	def test_map_init_local_metric_evenness_fast_matches_general_path(self) -> None:
+		H, W = 4, 5
+		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		ww = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		uv = torch.stack([hh, ww], dim=-1)
+		ext = _plane_xyz(h=H, w=W, z=0.0)
+		ext[..., 0] *= 2.0
+		metric_pos = _plane_xyz(h=H, w=W, z=1.0)
+		metric_pos[..., 1] = metric_pos[..., 1] * 1.5 + 0.1 * metric_pos[..., 0].square()
+		active = torch.ones(H - 1, W - 1, dtype=torch.bool)
+
+		general = opt_loss_snap_surf._map_init_local_evenness_terms(
+			uv,
+			ext,
+			active,
+			metric_pos=metric_pos,
+			metric_valid=torch.ones(H, W, dtype=torch.bool),
+			need_metric=True,
+			need_area=False,
+		)
+		fast = opt_loss_snap_surf._map_init_local_metric_evenness_terms_fast(
+			metric_pos,
+			torch.ones(H, W, dtype=torch.bool),
+			ext,
+			active,
+		)
+
+		torch.testing.assert_close(fast, general["metric_smooth"], rtol=0.0, atol=0.0)
+
+	def test_map_init_local_metric_evenness_fast_matches_general_path_with_invalid_vertices(self) -> None:
+		H, W = 4, 5
+		uv = torch.stack(torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing="ij"), dim=-1)
+		ext = _plane_xyz(h=H, w=W, z=0.0)
+		metric_pos = _plane_xyz(h=H, w=W, z=1.0)
+		metric_pos[..., 0] = metric_pos[..., 0] + 0.2 * metric_pos[..., 1]
+		metric_valid = torch.ones(H, W, dtype=torch.bool)
+		metric_valid[1, 2] = False
+		metric_pos[2, 3] = torch.tensor([float("nan"), float("nan"), float("nan")])
+		active = torch.ones(H - 1, W - 1, dtype=torch.bool)
+
+		general = opt_loss_snap_surf._map_init_local_evenness_terms(
+			uv,
+			ext,
+			active,
+			metric_pos=metric_pos,
+			metric_valid=metric_valid,
+			need_metric=True,
+			need_area=False,
+		)
+		fast = opt_loss_snap_surf._map_init_local_metric_evenness_terms_fast(
+			metric_pos,
+			metric_valid,
+			ext,
+			active,
+		)
+
+		torch.testing.assert_close(fast, general["metric_smooth"], rtol=0.0, atol=0.0)
 
 	def test_map_init_local_evenness_area_only_skips_metric_lengths(self) -> None:
 		H, W = 2, 3

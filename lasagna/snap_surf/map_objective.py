@@ -1613,6 +1613,83 @@ def _map_init_local_metric_evenness_term(
 		metric_pairs.append((scale_w[:, 1:] - scale_w[:, :-1], metric_w_pair_right.bool() & valid_w[:, 1:] & valid_w[:, :-1]))
 	return _map_init_mean_square_diffs(metric_pairs, z)
 
+def _map_init_local_metric_evenness_terms_fast(
+	metric_pos: torch.Tensor,
+	metric_valid: torch.Tensor,
+	ext_pos: torch.Tensor,
+	active_quad: torch.Tensor,
+	*,
+	eps: float = 1.0e-6,
+	external_context: _MapInitEvennessExternalContext | None = None,
+	cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+	external_static_cache_key: Any | None = None,
+	external_active_quad: torch.Tensor | None = None,
+	compile_objective: bool = False,
+	compile_mode: str | None = None,
+) -> torch.Tensor:
+	z = metric_pos[torch.isfinite(metric_pos)].sum() * 0.0 if metric_pos.numel() else torch.zeros((), device=metric_pos.device, dtype=metric_pos.dtype)
+	H, W = int(metric_pos.shape[0]), int(metric_pos.shape[1])
+	if H < 2 or W < 2 or active_quad.numel() == 0:
+		return z
+
+	context_quad = active_quad if external_active_quad is None else external_active_quad
+	if external_context is None:
+		ctx_key = _map_init_evenness_external_context_cache_key(
+			ext_pos=ext_pos,
+			active_quad=context_quad,
+			prefix=cache_key_prefix,
+			external_static_cache_key=external_static_cache_key,
+		)
+		external_context = _map_init_cached_evenness_external_context(
+			ext_pos=ext_pos,
+			active_quad=context_quad,
+			need_metric=True,
+			need_area=False,
+			cache=cache,
+			key=ctx_key,
+		)
+	elif not _map_init_evenness_context_has(external_context, need_metric=True, need_area=False):
+		external_context = _map_init_build_evenness_external_context(
+			ext_pos,
+			context_quad,
+			need_metric=True,
+			need_area=False,
+			base=external_context,
+		)
+
+	assert external_context.ext_len_h is not None and external_context.ext_len_w is not None
+	assert external_context.ext_len_h_valid is not None and external_context.ext_len_w_valid is not None
+	assert external_context.metric_h_pair_down is not None and external_context.metric_h_pair_right is not None
+	assert external_context.metric_w_pair_down is not None and external_context.metric_w_pair_right is not None
+	finite_metric = metric_valid.bool() & torch.isfinite(metric_pos).all(dim=-1)
+	safe_metric = torch.where(finite_metric.unsqueeze(-1), metric_pos, torch.zeros_like(metric_pos))
+	eps_t = torch.tensor(float(eps), device=metric_pos.device, dtype=metric_pos.dtype)
+	metric_args = (
+		safe_metric[1:, :] - safe_metric[:-1, :],
+		safe_metric[:, 1:] - safe_metric[:, :-1],
+		finite_metric,
+		external_context.static_quad,
+		external_context.ext_len_h,
+		external_context.ext_len_w,
+		external_context.ext_len_h_valid,
+		external_context.ext_len_w_valid,
+		external_context.metric_h_pair_down,
+		external_context.metric_h_pair_right,
+		external_context.metric_w_pair_down,
+		external_context.metric_w_pair_right,
+		z,
+		eps_t,
+	)
+	if bool(compile_objective):
+		return _map_init_call_compiled(
+			"metric_evenness",
+			_map_init_local_metric_evenness_term,
+			metric_args,
+			mode=compile_mode,
+		)
+	return _map_init_local_metric_evenness_term(*metric_args)
+
 def _map_init_local_evenness_terms(
 	uv: torch.Tensor,
 	ext_pos: torch.Tensor,
@@ -2184,18 +2261,54 @@ def _map_init_dense_quad_model_physical_step_lengths_from_metric(
 	], dim=-1).bool()
 	return _map_init_dense_mean_quad_edge_length(corners, corner_valid)
 
+def _map_init_model_metric_positions_tensor(
+	uv_full: torch.Tensor,
+	model_xyz_safe: torch.Tensor,
+	model_valid: torch.Tensor,
+	model_depth: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	if (
+		model_xyz_safe.ndim == 4
+		and model_valid.ndim == 3
+		and int(model_xyz_safe.shape[-1]) == 3
+		and int(model_xyz_safe.shape[1]) >= 2
+		and int(model_xyz_safe.shape[2]) >= 2
+	):
+		coords = _map_init_coords3(uv_full, depth=int(model_depth))
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		model_metric_pos, coord_ok = _map_init_sample_model_context_tensor(
+			safe_coords,
+			model_xyz_safe,
+			model_valid.bool(),
+		)
+		model_metric_valid = (
+			torch.isfinite(coords).all(dim=-1) &
+			coord_ok &
+			torch.isfinite(model_metric_pos).all(dim=-1)
+		)
+		return (
+			model_metric_pos,
+			model_metric_valid,
+		)
+	return _map_init_model_metric_positions(
+		uv_full,
+		model_xyz=model_xyz_safe,
+		model_valid=model_valid,
+		model_depth=int(model_depth),
+		model_xyz_safe=model_xyz_safe,
+	)
+
 def _map_init_model_metric_steps_tensor(
 	uv_full: torch.Tensor,
 	model_xyz_safe: torch.Tensor,
 	model_valid: torch.Tensor,
 	model_depth: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-	model_metric_pos, model_metric_valid = _map_init_model_metric_positions(
+	model_metric_pos, model_metric_valid = _map_init_model_metric_positions_tensor(
 		uv_full,
-		model_xyz=model_xyz_safe,
-		model_valid=model_valid,
-		model_depth=int(model_depth),
-		model_xyz_safe=model_xyz_safe,
+		model_xyz_safe,
+		model_valid,
+		int(model_depth),
 	)
 	return (
 		model_metric_pos,
@@ -2945,6 +3058,7 @@ def _map_init_objective(
 	turn_valid_count_t = uv_full.new_zeros(())
 	model_metric_pos_cached: torch.Tensor | None = None
 	model_metric_valid_cached: torch.Tensor | None = None
+	model_xyz_safe_for_reg: torch.Tensor | None = None
 	if sample_terms_active and active_quad.numel() > 0 and bool(active_quad.any().detach().cpu()):
 		z_lift_fields_available = (
 			bool(mi.z_lift_enabled)
@@ -3019,6 +3133,7 @@ def _map_init_objective(
 
 		model_source, model_sample_packed, coord_ok, _model_sample_plan = _timed("sample_model_context", _sample_model_context)
 		model_xyz_safe = model_source[..., :3]
+		model_xyz_safe_for_reg = model_xyz_safe
 		p_model, n_model_raw, model_theta_samples, model_theta_valid_samples = _map_init_split_packed_model_vertex_sample(model_sample_packed)
 		model_theta_sample_valid = None
 		if model_theta_samples is not None and model_theta_valid_samples is not None:
@@ -3238,13 +3353,30 @@ def _map_init_objective(
 	reg_count_t = reg_finite.to(dtype=uv_full.dtype).sum() if bool(need_stats) else uv_full.new_zeros(())
 	if model_reg_metric_needed:
 		if model_metric_pos_cached is None or model_metric_valid_cached is None:
-			model_metric_pos, model_metric_valid = _timed("reg_model_metric_sample", lambda: _map_init_model_metric_positions_masked(
-				uv_safe,
-				reg_finite,
-				model_xyz=model_xyz,
-				model_valid=model_valid,
-				model_depth=model_depth,
-			))
+			if model_xyz_safe_for_reg is not None and model_xyz_safe_for_reg.ndim == 4 and model_valid.ndim == 3:
+				def _reg_model_metric_sample_fast():
+					if bool(compile_objective):
+						return _map_init_call_compiled(
+							"model_metric_positions",
+							_map_init_model_metric_positions_tensor,
+							(uv_safe, model_xyz_safe_for_reg, model_valid, int(model_depth)),
+							mode=compile_mode,
+						)
+					return _map_init_model_metric_positions_tensor(
+						uv_safe,
+						model_xyz_safe_for_reg,
+						model_valid,
+						int(model_depth),
+					)
+				model_metric_pos, model_metric_valid = _timed("reg_model_metric_sample", _reg_model_metric_sample_fast)
+			else:
+				model_metric_pos, model_metric_valid = _timed("reg_model_metric_sample", lambda: _map_init_model_metric_positions_masked(
+					uv_safe,
+					reg_finite,
+					model_xyz=model_xyz,
+					model_valid=model_valid,
+					model_depth=model_depth,
+				))
 		else:
 			model_metric_pos, model_metric_valid = _timed("reg_model_metric_reuse", lambda: (
 				model_metric_pos_cached,
@@ -3358,6 +3490,22 @@ def _map_init_objective(
 				cache=runtime_cache,
 				key=even_static_quad_key,
 			)
+			if bool(metric_term_active) and not bool(area_term_active) and not bool(need_stats):
+				return {
+					"metric_smooth": _map_init_local_metric_evenness_terms_fast(
+						model_metric_pos,
+						model_metric_valid,
+						ext_vertex_pos,
+						reg_quad,
+						cache=runtime_cache,
+						cache_key_prefix=cache_key_prefix,
+						external_static_cache_key=external_static_cache_key,
+						external_active_quad=even_static_quad,
+						compile_objective=bool(compile_objective),
+						compile_mode=compile_mode,
+					),
+					"area_smooth": z,
+				}
 			return _map_init_local_evenness_terms(
 				uv_safe,
 				ext_vertex_pos,

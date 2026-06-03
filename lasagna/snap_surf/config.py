@@ -63,7 +63,7 @@ class SnapSurfMapInitConfig:
 	angle_dist_mult: float = 9.0
 	max_sample_distance: float = 1000.0
 	max_sample_angle_deg: float = 45.0
-	sample_angle_step_fraction: float = 0.1
+	sample_angle_step_fraction: float = 0.0
 	max_step_neighbor_ratio: float = 10.0
 	ext_mesh_health_filter: bool = True
 	ext_mesh_health_max_edge_ratio: float = 2.0
