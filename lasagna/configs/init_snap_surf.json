@@ -137,12 +137,6 @@
 			"args": {
 				"subdiv": 1,
 				"status_interval": 20,
-				"debug_obj_dir": "snap_surf_objs",
-				"export_fixture": {
-					"dir": "bench_fixtures_dbg/init",
-					"once": true,
-					"objs": true
-				}
 			}
 		},
 		{
@@ -167,7 +161,6 @@
 						"w_fac" : { "map_turn" : 0.0 },
 						"args": {
 							"subdiv": 1,
-							"debug_obj_dir": "snap_surf_objs"
 						}
 					}
 				}
@@ -195,7 +188,6 @@
 						"w_fac" : { "map_turn" : 0.0 },
 						"args": {
 							"subdiv": 1,
-							"debug_obj_dir": "snap_surf_objs"
 						}
 					}
 				}
