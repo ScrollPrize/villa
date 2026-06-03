@@ -186,7 +186,7 @@ def _map_init_quad_corner_all(mask: torch.Tensor) -> torch.Tensor:
 
 def _map_init_quad_offsets(*, subdiv: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 	s = max(1, int(subdiv))
-	v = (torch.arange(s, device=device, dtype=dtype) + 0.5) / float(s)
+	v = torch.arange(s, device=device, dtype=dtype) / float(s)
 	oh, ow = torch.meshgrid(v, v, indexing="ij")
 	return torch.stack([oh.reshape(-1), ow.reshape(-1)], dim=-1)
 

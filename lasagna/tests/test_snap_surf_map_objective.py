@@ -212,7 +212,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		active_quad = torch.ones(1, 1, dtype=torch.bool)
 		ext_coords = torch.tensor([[[0.0, 0.0], [0.0, 4.0]], [[4.0, 0.0], [4.0, 4.0]]])
 		ext_theta = torch.zeros(4, 4)
-		ext_theta[2, 2] = 2.0 * math.pi
+		ext_theta[0, 0] = 2.0 * math.pi
 		cfg = opt_loss_snap_surf.SnapSurfConfig(
 			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
 				subdiv=1,

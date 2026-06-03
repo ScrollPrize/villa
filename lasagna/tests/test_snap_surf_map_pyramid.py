@@ -6,6 +6,7 @@ import unittest
 
 import torch
 
+from snap_surf.map_pyramid import _map_init_quad_offsets
 from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz, _result, opt_loss_snap_surf
 
 
@@ -135,6 +136,19 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertEqual(opt_loss_snap_surf._map_init_dyadic_level_shape(9, 5, 2), (3, 2))
 		coords = opt_loss_snap_surf._map_init_dyadic_level_coords(torch.zeros(9, 5, 3), 2)
 		self.assertTrue(torch.equal(coords[1, 1], torch.tensor([4.0, 4.0])))
+
+	def test_map_init_quad_offsets_are_unshifted(self) -> None:
+		one = _map_init_quad_offsets(subdiv=1, device=torch.device("cpu"), dtype=torch.float32)
+		self.assertTrue(torch.equal(one, torch.tensor([[0.0, 0.0]])))
+
+		two = _map_init_quad_offsets(subdiv=2, device=torch.device("cpu"), dtype=torch.float32)
+		expected = torch.tensor([
+			[0.0, 0.0],
+			[0.0, 0.5],
+			[0.5, 0.0],
+			[0.5, 0.5],
+		])
+		self.assertTrue(torch.equal(two, expected))
 
 	def test_map_init_single_neighbor_prediction_uses_source_to_uv_transform(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=2, target_rank=2)
