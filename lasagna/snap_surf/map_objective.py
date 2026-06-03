@@ -550,6 +550,69 @@ def _map_init_sample_valid_plan(valid: torch.Tensor, plan: _MapInitSurfaceSample
 	ok = valid_b[di, h0, w0] & valid_b[di, h1, w0] & valid_b[di, h0, w1] & valid_b[di, h1, w1] & plan.in_bounds.to(device=valid.device)
 	return ok.reshape(plan.coords_shape)
 
+def _map_init_sample_model_context_tensor(
+	safe_coords: torch.Tensor,
+	model_source: torch.Tensor,
+	model_valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	if model_source.ndim != 4 or model_valid.ndim != 3 or int(safe_coords.shape[-1]) != 3:
+		raise ValueError(
+			"expected safe_coords [..., 3], model_source [D, H, W, C], and model_valid [D, H, W], "
+			f"got {tuple(safe_coords.shape)}, {tuple(model_source.shape)}, {tuple(model_valid.shape)}"
+		)
+	D, H, W, C = int(model_source.shape[0]), int(model_source.shape[1]), int(model_source.shape[2]), int(model_source.shape[3])
+	if D < 1 or H < 1 or W < 1:
+		return (
+			torch.full((*safe_coords.shape[:-1], C), float("nan"), device=model_source.device, dtype=model_source.dtype),
+			torch.zeros(safe_coords.shape[:-1], device=model_valid.device, dtype=torch.bool),
+		)
+	flat = safe_coords.reshape(-1, 3)
+	finite = torch.isfinite(flat).all(dim=-1)
+	safe = torch.where(torch.isfinite(flat), flat, torch.zeros_like(flat))
+	d = safe[:, 0]
+	h = safe[:, 1]
+	w = safe[:, 2]
+	in_bounds = (
+		finite &
+		(d >= 0.0) & (d <= float(D - 1)) &
+		(h >= 0.0) & (h <= float(H - 1)) &
+		(w >= 0.0) & (w <= float(W - 1))
+	)
+	di = torch.round(d.clamp(0.0, float(max(0, D - 1)))).long()
+	hc = h.clamp(0.0, float(max(0, H - 1)))
+	wc = w.clamp(0.0, float(max(0, W - 1)))
+	if H <= 1:
+		h0 = h1 = torch.zeros_like(hc, dtype=torch.long)
+		fh = torch.zeros_like(hc, dtype=model_source.dtype)
+	else:
+		h0 = torch.floor(hc).clamp(0, H - 2).long()
+		h1 = h0 + 1
+		fh = (hc - h0.to(dtype=safe_coords.dtype)).to(dtype=model_source.dtype)
+	if W <= 1:
+		w0 = w1 = torch.zeros_like(wc, dtype=torch.long)
+		fw = torch.zeros_like(wc, dtype=model_source.dtype)
+	else:
+		w0 = torch.floor(wc).clamp(0, W - 2).long()
+		w1 = w0 + 1
+		fw = (wc - w0.to(dtype=safe_coords.dtype)).to(dtype=model_source.dtype)
+	fh = fh.unsqueeze(-1)
+	fw = fw.unsqueeze(-1)
+	model_sample_packed = (
+		(1.0 - fh) * (1.0 - fw) * model_source[di, h0, w0] +
+		fh * (1.0 - fw) * model_source[di, h1, w0] +
+		(1.0 - fh) * fw * model_source[di, h0, w1] +
+		fh * fw * model_source[di, h1, w1]
+	)
+	valid_b = model_valid.bool()
+	coord_ok = (
+		valid_b[di, h0, w0] &
+		valid_b[di, h1, w0] &
+		valid_b[di, h0, w1] &
+		valid_b[di, h1, w1] &
+		in_bounds.to(device=model_valid.device)
+	)
+	return model_sample_packed.reshape(*safe_coords.shape[:-1], C), coord_ok.reshape(safe_coords.shape[:-1])
+
 def _map_init_sample_scalar_plan(field: torch.Tensor, valid: torch.Tensor, plan: _MapInitSurfaceSamplePlan) -> tuple[torch.Tensor, torch.Tensor]:
 	valid_field = valid.to(device=field.device).bool() & torch.isfinite(field)
 	field_safe = torch.where(valid_field, field, torch.zeros_like(field))
@@ -2297,6 +2360,187 @@ def _map_init_reduce_sample_terms_tensor(
 		"turn_sample_count": turn_sample_count_t,
 	}
 
+def _map_init_reduce_sample_terms_with_geometry_limit_tensor(
+	active_quad: torch.Tensor,
+	quad_uv_ok: torch.Tensor,
+	uv: torch.Tensor,
+	p_ext: torch.Tensor,
+	n_ext_raw: torch.Tensor,
+	n_ext: torch.Tensor,
+	coord_ok: torch.Tensor,
+	p_model: torch.Tensor,
+	n_model_raw: torch.Tensor,
+	n_model: torch.Tensor,
+	dist_values: torch.Tensor,
+	vec_values: torch.Tensor,
+	norm_values: torch.Tensor,
+	turn_values: torch.Tensor,
+	turn_valid: torch.Tensor,
+	sample_ext_ok: torch.Tensor,
+	allow_partial_model_samples: bool,
+	need_stats: bool,
+	z_lift_active: bool,
+	z_lift_stats_active: bool,
+	w_dist: float,
+	w_vec_normal: float,
+	w_surface_normal: float,
+	w_z_lift: float,
+	z: torch.Tensor,
+	d: torch.Tensor,
+	c_ext: torch.Tensor,
+	c_model: torch.Tensor,
+	c_norm: torch.Tensor,
+	ext_step_q: torch.Tensor | None,
+	model_step_q: torch.Tensor | None,
+	max_sample_distance: float,
+	max_sample_angle_deg: float,
+	sample_angle_step_fraction: float,
+) -> dict[str, torch.Tensor]:
+	Hq, Wq, S = int(uv.shape[0]), int(uv.shape[1]), int(uv.shape[2])
+	active_sample = active_quad.unsqueeze(-1).expand(Hq, Wq, S)
+	base_finite = (
+		active_sample &
+		sample_ext_ok &
+		quad_uv_ok.unsqueeze(-1).expand(Hq, Wq, S) &
+		torch.isfinite(uv).all(dim=-1) &
+		torch.isfinite(p_ext).all(dim=-1) &
+		torch.isfinite(n_ext_raw).all(dim=-1) &
+		torch.isfinite(n_ext).all(dim=-1) &
+		(n_ext.norm(dim=-1) > 1.0e-8)
+	)
+	model_finite = (
+		coord_ok &
+		torch.isfinite(p_model).all(dim=-1) &
+		torch.isfinite(n_model_raw).all(dim=-1) &
+		torch.isfinite(n_model).all(dim=-1) &
+		(n_model.norm(dim=-1) > 1.0e-8) &
+		torch.isfinite(dist_values) &
+		torch.isfinite(vec_values) &
+		torch.isfinite(norm_values)
+	)
+	if bool(z_lift_active):
+		model_finite = model_finite & turn_valid
+	finite = base_finite & model_finite
+	limited_finite = finite
+	if float(max_sample_distance) > 0.0:
+		limited_finite = limited_finite & (d <= float(max_sample_distance))
+	if float(max_sample_angle_deg) < 180.0:
+		base_angle = math.radians(max(0.0, min(180.0, float(max_sample_angle_deg))))
+		near_zero = d <= 1.0
+		if model_step_q is None or float(sample_angle_step_fraction) <= 0.0:
+			cos_min_ext = torch.full_like(d, math.cos(base_angle))
+		else:
+			model_step = model_step_q.unsqueeze(-1)
+			model_step = torch.where(
+				torch.isfinite(model_step),
+				model_step.clamp_min(0.0),
+				torch.zeros_like(model_step),
+			).to(device=d.device, dtype=d.dtype)
+			extra_ext = torch.atan2(
+				float(sample_angle_step_fraction) * model_step,
+				d.clamp_min(1.0e-6),
+			)
+			cap = math.pi if base_angle > (math.pi / 2.0) else (math.pi / 2.0)
+			cos_min_ext = torch.cos((base_angle + extra_ext).clamp(max=cap))
+		if ext_step_q is None or float(sample_angle_step_fraction) <= 0.0:
+			cos_min_model = torch.full_like(d, math.cos(base_angle))
+		else:
+			ext_step = ext_step_q.unsqueeze(-1)
+			ext_step = torch.where(
+				torch.isfinite(ext_step),
+				ext_step.clamp_min(0.0),
+				torch.zeros_like(ext_step),
+			).to(device=d.device, dtype=d.dtype)
+			extra_model = torch.atan2(
+				float(sample_angle_step_fraction) * ext_step,
+				d.clamp_min(1.0e-6),
+			)
+			cap = math.pi if base_angle > (math.pi / 2.0) else (math.pi / 2.0)
+			cos_min_model = torch.cos((base_angle + extra_model).clamp(max=cap))
+		angle_ok = (
+			torch.isfinite(c_ext) &
+			torch.isfinite(c_model) &
+			torch.isfinite(c_norm) &
+			torch.isfinite(cos_min_ext) &
+			torch.isfinite(cos_min_model) &
+			((near_zero | (c_ext >= cos_min_ext)) & (near_zero | (c_model >= cos_min_model)))
+		)
+		limited_finite = limited_finite & angle_ok
+	if bool(allow_partial_model_samples):
+		loss_quad = active_quad & base_finite.all(dim=-1) & finite.any(dim=-1)
+		valid_quad = active_quad & base_finite.all(dim=-1) & limited_finite.any(dim=-1)
+	else:
+		loss_quad = active_quad & finite.all(dim=-1)
+		valid_quad = active_quad & limited_finite.all(dim=-1)
+
+	sample_total_count_t = active_sample.to(dtype=z.dtype).sum()
+	sample_valid_count_t = z.new_zeros(())
+	sample_bad_count_t = z.new_zeros(())
+	sample_base_count_t = z.new_zeros(())
+	sample_model_count_t = z.new_zeros(())
+	sample_limit_count_t = z.new_zeros(())
+	turn_valid_count_t = z.new_zeros(())
+	sample_bad_frac = z
+	sample_loss = z
+	if bool(need_stats):
+		sample_valid_count_t = finite.to(dtype=z.dtype).sum()
+		sample_bad_count_t = (active_sample & ~limited_finite).to(dtype=z.dtype).sum()
+		sample_base_count_t = base_finite.to(dtype=z.dtype).sum()
+		sample_model_count_t = (active_sample & model_finite).to(dtype=z.dtype).sum()
+		sample_limit_count_t = limited_finite.to(dtype=z.dtype).sum()
+		turn_valid_count_t = (active_sample & turn_valid).to(dtype=z.dtype).sum()
+		sample_bad_frac = sample_bad_count_t / sample_total_count_t.clamp_min(1.0)
+		sample_values = (
+			float(w_dist) * dist_values +
+			float(w_vec_normal) * vec_values +
+			float(w_surface_normal) * norm_values +
+			float(w_z_lift) * turn_values
+		)
+		sample_loss = _map_init_masked_mean_values([(sample_values, finite)], z)
+
+	loss_sample = finite & loss_quad.unsqueeze(-1)
+	loss_count = loss_sample.to(dtype=z.dtype).sum(dim=-1).clamp_min(1.0)
+	finite_count_t = loss_sample.to(dtype=z.dtype).sum() if bool(need_stats) else z.new_zeros(())
+	model_bad_count_t = (active_quad & ~valid_quad).to(dtype=z.dtype).sum() if bool(need_stats) else z.new_zeros(())
+	loss_quad_count_t = loss_quad.to(dtype=z.dtype).sum() if bool(need_stats) else z.new_zeros(())
+	valid_quad_count_t = valid_quad.to(dtype=z.dtype).sum() if bool(need_stats) else z.new_zeros(())
+	turn_sample_count_t = finite_count_t if bool(need_stats) and bool(z_lift_stats_active) else z.new_zeros(())
+
+	dist_q_all = torch.where(loss_sample, dist_values, dist_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
+	vec_q_all = torch.where(loss_sample, vec_values, vec_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
+	norm_q_all = torch.where(loss_sample, norm_values, norm_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
+	turn_q_all = torch.where(loss_sample, turn_values, turn_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
+	d_q_all = torch.where(loss_sample, d, d.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
+	dist_loss = _map_init_masked_mean_values([(dist_q_all, loss_quad)], z)
+	vec_loss = _map_init_masked_mean_values([(vec_q_all, loss_quad)], z)
+	norm_loss = _map_init_masked_mean_values([(norm_q_all, loss_quad)], z)
+	turn_loss = _map_init_masked_mean_values([(turn_q_all, loss_quad)], z)
+	dist_avg = _map_init_masked_mean_values([(d_q_all, loss_quad)], z)
+	return {
+		"finite": finite,
+		"loss_quad": loss_quad,
+		"valid_quad": valid_quad,
+		"dist_loss": dist_loss,
+		"vec_loss": vec_loss,
+		"norm_loss": norm_loss,
+		"turn_loss": turn_loss,
+		"dist_avg": dist_avg,
+		"sample_total_count": sample_total_count_t,
+		"sample_valid_count": sample_valid_count_t,
+		"sample_bad_count": sample_bad_count_t,
+		"sample_base_count": sample_base_count_t,
+		"sample_model_count": sample_model_count_t,
+		"sample_limit_count": sample_limit_count_t,
+		"turn_valid_count": turn_valid_count_t,
+		"sample_bad_frac": sample_bad_frac,
+		"sample_loss": sample_loss,
+		"finite_count": finite_count_t,
+		"model_bad_count": model_bad_count_t,
+		"loss_quad_count": loss_quad_count_t,
+		"valid_quad_count": valid_quad_count_t,
+		"turn_sample_count": turn_sample_count_t,
+	}
+
 def _map_init_reduce_sample_terms(
 	*,
 	active_quad: torch.Tensor,
@@ -2554,6 +2798,19 @@ def _map_init_objective(
 					cache=runtime_cache,
 					prefix=cache_key_prefix,
 				)
+			if bool(compile_objective) and model_source_i.ndim == 4 and model_valid.ndim == 3 and int(safe_coords.shape[-1]) == 3:
+				model_sample_packed_i, coord_ok_i = _map_init_call_compiled(
+					"sample_model_context",
+					_map_init_sample_model_context_tensor,
+					(safe_coords, model_source_i, model_valid.bool()),
+					mode=compile_mode,
+				)
+				return (
+					model_source_i,
+					model_sample_packed_i,
+					coord_ok_i,
+					None,
+				)
 			model_plan_i = _map_init_surface_sample_plan(safe_coords, tuple(int(v) for v in model_valid.shape))
 			return (
 				model_source_i,
@@ -2609,21 +2866,24 @@ def _map_init_objective(
 			)
 
 		v, d, u, c_ext, c_model, c_norm = _timed("dot_products", _sample_dot_product_tensors)
-		sample_limit_ok = _timed("geometry_limit", lambda: _map_init_sample_geometry_limit_ok_steps_q(
-			p_ext=p_ext_f,
-			n_ext_raw=n_ext_raw_f,
-			n_ext=n_ext,
-			p_model=p_model,
-			n_model_raw=n_model_raw,
-			n_model=n_model,
-			d=d,
-			c_ext=c_ext,
-			c_model=c_model,
-			c_norm=c_norm,
-			cfg=mi,
-			ext_step_q=ext_step_q,
-			model_step_q=model_step_q,
-		))
+		if bool(compile_objective):
+			sample_limit_ok = None
+		else:
+			sample_limit_ok = _timed("geometry_limit", lambda: _map_init_sample_geometry_limit_ok_steps_q(
+				p_ext=p_ext_f,
+				n_ext_raw=n_ext_raw_f,
+				n_ext=n_ext,
+				p_model=p_model,
+				n_model_raw=n_model_raw,
+				n_model=n_model,
+				d=d,
+				c_ext=c_ext,
+				c_model=c_model,
+				c_norm=c_norm,
+				cfg=mi,
+				ext_step_q=ext_step_q,
+				model_step_q=model_step_q,
+			))
 		dist_mult = _timed("dist_multiplier", lambda: _map_init_distance_multiplier(c_ext, c_model, mi))
 		dist_values, vec_values, norm_values = _timed("loss_values", lambda: (
 			_huber(d, delta=cfg.huber_delta) * dist_mult,
@@ -2661,43 +2921,79 @@ def _map_init_objective(
 			turn_valid = torch.zeros((Hq, Wq, S), device=uv_full.device, dtype=torch.bool)
 		z_lift_active = turn_term_active and z_lift_fields_available
 		z_lift_stats_active = z_lift_fields_available
-		sample_reduce_args = (
-			active_quad,
-			quad_uv_ok,
-			uv,
-			p_ext_f,
-			n_ext_raw_f,
-			n_ext,
-			coord_ok,
-			p_model,
-			n_model_raw,
-			n_model,
-			dist_values,
-			vec_values,
-			norm_values,
-			turn_values,
-			turn_valid,
-			sample_ext_ok,
-			sample_limit_ok,
-			bool(allow_partial_model_samples),
-			bool(need_stats),
-			bool(z_lift_active),
-			bool(z_lift_stats_active),
-			float(mi.w_dist),
-			float(mi.w_vec_normal),
-			float(mi.w_surface_normal),
-			float(mi.w_z_lift),
-			z,
-			d,
-		)
 		if bool(compile_objective):
+			sample_reduce_args = (
+				active_quad,
+				quad_uv_ok,
+				uv,
+				p_ext_f,
+				n_ext_raw_f,
+				n_ext,
+				coord_ok,
+				p_model,
+				n_model_raw,
+				n_model,
+				dist_values,
+				vec_values,
+				norm_values,
+				turn_values,
+				turn_valid,
+				sample_ext_ok,
+				bool(allow_partial_model_samples),
+				bool(need_stats),
+				bool(z_lift_active),
+				bool(z_lift_stats_active),
+				float(mi.w_dist),
+				float(mi.w_vec_normal),
+				float(mi.w_surface_normal),
+				float(mi.w_z_lift),
+				z,
+				d,
+				c_ext,
+				c_model,
+				c_norm,
+				ext_step_q,
+				model_step_q,
+				float(mi.max_sample_distance),
+				float(mi.max_sample_angle_deg),
+				float(mi.sample_angle_step_fraction),
+			)
 			sample_reduced = _timed("sample_reduce", lambda: _map_init_call_compiled(
-				"sample_reduce",
-				_map_init_reduce_sample_terms_tensor,
+				"sample_reduce_with_geometry_limit",
+				_map_init_reduce_sample_terms_with_geometry_limit_tensor,
 				sample_reduce_args,
 				mode=compile_mode,
 			))
 		else:
+			sample_reduce_args = (
+				active_quad,
+				quad_uv_ok,
+				uv,
+				p_ext_f,
+				n_ext_raw_f,
+				n_ext,
+				coord_ok,
+				p_model,
+				n_model_raw,
+				n_model,
+				dist_values,
+				vec_values,
+				norm_values,
+				turn_values,
+				turn_valid,
+				sample_ext_ok,
+				sample_limit_ok,
+				bool(allow_partial_model_samples),
+				bool(need_stats),
+				bool(z_lift_active),
+				bool(z_lift_stats_active),
+				float(mi.w_dist),
+				float(mi.w_vec_normal),
+				float(mi.w_surface_normal),
+				float(mi.w_z_lift),
+				z,
+				d,
+			)
 			sample_reduced = _timed("sample_reduce", lambda: _map_init_reduce_sample_terms_tensor(*sample_reduce_args))
 		finite = sample_reduced["finite"]
 		loss_quad = sample_reduced["loss_quad"]

@@ -110,6 +110,30 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		torch.testing.assert_close(theta_sample, old_theta)
 		self.assertTrue(torch.equal(theta_valid, old_theta_valid))
 
+	def test_map_init_sample_model_context_tensor_matches_plan_sampling(self) -> None:
+		model_source = torch.arange(2 * 3 * 4 * 6, dtype=torch.float32).reshape(2, 3, 4, 6) / 13.0
+		model_valid = torch.ones(2, 3, 4, dtype=torch.bool)
+		model_valid[0, 1, 2] = False
+		model_valid[1, 2, 3] = False
+		coords = torch.tensor([
+			[
+				[[0.0, 0.25, 0.25], [0.0, 1.5, 1.5], [0.0, float("nan"), 1.0]],
+				[[1.0, 2.0, 3.0], [1.0, -0.1, 0.0], [1.0, 1.0, 4.1]],
+			],
+			[
+				[[1.0, 0.0, 0.0], [1.4, 1.25, 2.5], [0.0, 2.0, 3.0]],
+				[[0.0, 2.2, 3.0], [0.0, 0.0, -0.25], [2.0, 1.0, 1.0]],
+			],
+		], dtype=torch.float32)
+
+		plan = opt_loss_snap_surf._map_init_surface_sample_plan(coords, tuple(model_valid.shape))
+		expected_sample = opt_loss_snap_surf._map_init_sample_surface_grid_plan(model_source, plan)
+		expected_ok = opt_loss_snap_surf._map_init_sample_valid_plan(model_valid, plan)
+		actual_sample, actual_ok = opt_loss_snap_surf._map_init_sample_model_context_tensor(coords, model_source, model_valid)
+
+		torch.testing.assert_close(actual_sample, expected_sample)
+		self.assertTrue(torch.equal(actual_ok, expected_ok))
+
 	def test_map_init_objective_reuses_cached_external_samples(self) -> None:
 		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)
 		cfg = opt_loss_snap_surf.SnapSurfConfig(
@@ -1049,6 +1073,150 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		_check(1)
 		_check(4)
 
+	def test_map_init_reduce_sample_terms_with_geometry_limit_matches_composition(self) -> None:
+		cfg = opt_loss_snap_surf.SnapSurfMapInitConfig(
+			w_dist=0.7,
+			w_vec_normal=0.2,
+			w_surface_normal=0.3,
+			w_z_lift=0.0,
+			max_sample_distance=6.0,
+			max_sample_angle_deg=45.0,
+			sample_angle_step_fraction=0.1,
+		)
+		Hq, Wq, S = 2, 3, 4
+		hh = torch.arange(Hq, dtype=torch.float32).view(Hq, 1, 1).expand(Hq, Wq, S)
+		ww = torch.arange(Wq, dtype=torch.float32).view(1, Wq, 1).expand(Hq, Wq, S)
+		ss = torch.arange(S, dtype=torch.float32).view(1, 1, S).expand(Hq, Wq, S)
+		uv = torch.stack([hh + 0.1 * ss, ww + 0.05 * ss], dim=-1)
+		uv[1, 2, 3, 0] = float("nan")
+		active_quad = torch.tensor([[True, True, False], [True, True, True]])
+		quad_uv_ok = torch.tensor([[True, True, True], [True, False, True]])
+		p_ext = torch.stack([hh, ww, ss * 0.2], dim=-1)
+		p_model = p_ext + torch.tensor([2.0, 0.25, 1.0])
+		n_ext_raw = torch.zeros_like(p_ext)
+		n_ext_raw[..., 2] = 1.0
+		n_model_raw = torch.zeros_like(p_ext)
+		n_model_raw[..., 2] = 1.0
+		n_ext_raw[0, 1, 2] = torch.tensor([float("nan"), 0.0, 1.0])
+		p_model[1, 0, 1] = torch.tensor([float("nan"), 0.0, 0.0])
+		n_ext = F.normalize(n_ext_raw, dim=-1, eps=1.0e-8)
+		n_model = F.normalize(n_model_raw, dim=-1, eps=1.0e-8)
+		coord_ok = torch.ones(Hq, Wq, S, dtype=torch.bool)
+		coord_ok[0, 0, 3] = False
+		sample_ext_ok = torch.ones(Hq, Wq, S, dtype=torch.bool)
+		sample_ext_ok[1, 1, 0] = False
+		v = p_model - p_ext
+		d = v.norm(dim=-1)
+		u = v / d.clamp_min(1.0e-8).unsqueeze(-1)
+		c_ext = (u * n_ext).sum(dim=-1).abs()
+		c_model = (u * n_model).sum(dim=-1).abs()
+		c_norm = (n_ext * n_model).sum(dim=-1)
+		dist_mult = opt_loss_snap_surf._map_init_distance_multiplier(c_ext, c_model, cfg)
+		dist_values = opt_loss_snap_surf._huber(d, delta=1.0) * dist_mult
+		vec_values = (1.0 - c_ext) + (1.0 - c_model)
+		norm_values = 1.0 - c_norm
+		turn_values = torch.zeros(Hq, Wq, S)
+		turn_valid = torch.zeros(Hq, Wq, S, dtype=torch.bool)
+		z = torch.tensor(0.0)
+		ext_step_q = torch.tensor([[1.0, 5.0, float("nan")], [10.0, 20.0, 40.0]])
+		model_step_q = torch.tensor([[2.0, 4.0, 6.0], [8.0, float("nan"), 12.0]])
+
+		def _compare(*, allow_partial: bool, need_stats: bool, use_steps: bool) -> None:
+			ext_steps = ext_step_q if use_steps else None
+			model_steps = model_step_q if use_steps else None
+			sample_limit_ok = opt_loss_snap_surf._map_init_sample_geometry_limit_ok_steps_q(
+				p_ext=p_ext,
+				n_ext_raw=n_ext_raw,
+				n_ext=n_ext,
+				p_model=p_model,
+				n_model_raw=n_model_raw,
+				n_model=n_model,
+				d=d,
+				c_ext=c_ext,
+				c_model=c_model,
+				c_norm=c_norm,
+				cfg=cfg,
+				ext_step_q=ext_steps,
+				model_step_q=model_steps,
+			)
+			old = opt_loss_snap_surf._map_init_reduce_sample_terms_tensor(
+				active_quad,
+				quad_uv_ok,
+				uv,
+				p_ext,
+				n_ext_raw,
+				n_ext,
+				coord_ok,
+				p_model,
+				n_model_raw,
+				n_model,
+				dist_values,
+				vec_values,
+				norm_values,
+				turn_values,
+				turn_valid,
+				sample_ext_ok,
+				sample_limit_ok,
+				allow_partial,
+				need_stats,
+				False,
+				False,
+				float(cfg.w_dist),
+				float(cfg.w_vec_normal),
+				float(cfg.w_surface_normal),
+				float(cfg.w_z_lift),
+				z,
+				d,
+			)
+			new = opt_loss_snap_surf._map_init_reduce_sample_terms_with_geometry_limit_tensor(
+				active_quad,
+				quad_uv_ok,
+				uv,
+				p_ext,
+				n_ext_raw,
+				n_ext,
+				coord_ok,
+				p_model,
+				n_model_raw,
+				n_model,
+				dist_values,
+				vec_values,
+				norm_values,
+				turn_values,
+				turn_valid,
+				sample_ext_ok,
+				allow_partial,
+				need_stats,
+				False,
+				False,
+				float(cfg.w_dist),
+				float(cfg.w_vec_normal),
+				float(cfg.w_surface_normal),
+				float(cfg.w_z_lift),
+				z,
+				d,
+				c_ext,
+				c_model,
+				c_norm,
+				ext_steps,
+				model_steps,
+				float(cfg.max_sample_distance),
+				float(cfg.max_sample_angle_deg),
+				float(cfg.sample_angle_step_fraction),
+			)
+			self.assertEqual(set(new), set(old))
+			for key, old_value in old.items():
+				new_value = new[key]
+				if old_value.dtype == torch.bool:
+					self.assertTrue(torch.equal(new_value, old_value), key)
+				else:
+					torch.testing.assert_close(new_value, old_value, rtol=1.0e-6, atol=1.0e-6, msg=key)
+
+		for allow_partial in (False, True):
+			for need_stats in (False, True):
+				for use_steps in (False, True):
+					_compare(allow_partial=allow_partial, need_stats=need_stats, use_steps=use_steps)
+
 	def test_map_init_step_neighbor_ratio_marks_long_step_quad(self) -> None:
 		H, W = 3, 4
 		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
@@ -1799,7 +1967,8 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		torch.testing.assert_close(compiled_grad, eager_grad, rtol=1.0e-6, atol=1.0e-6)
 		compiled_names = {str(key[0]) for key in map_objective._MAP_INIT_COMPILED_FN_CACHE}
 		self.assertTrue({
-			"sample_reduce",
+			"sample_reduce_with_geometry_limit",
+			"sample_model_context",
 			"forward_smooth_bend",
 			"jacobian_penalty",
 			"inverse_regularization",
@@ -1807,6 +1976,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 			"model_metric_steps",
 			"prior_loss",
 		}.issubset(compiled_names))
+		self.assertNotIn("sample_reduce", compiled_names)
 		self.assertNotIn("area_evenness", compiled_names)
 
 	def test_map_init_objective_skips_zero_weight_training_branches(self) -> None:
