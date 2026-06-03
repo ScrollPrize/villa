@@ -1008,8 +1008,14 @@ int main(int argc, char** argv) {
 
     WBLogger wblog(obj_path, iters); // optional; becomes no-op if unavailable
 
-    // Run SLIM from original UVs (matches Python default), with W&B logging
-    auto [uv_out, energies] = fb.slim_run("original", wblog.enabled()? &wblog : nullptr);
+    // Use the input's UVs as the initial condition when present (matches the
+    // Python/VC3D default); otherwise fall back to a harmonic parametrization
+    // so flatboi can flatten a raw mesh that has no UVs (e.g. a scrollfiesta
+    // surface mesh streamed straight from the mesher).
+    const std::string ic = fb.have_per_corner_uv ? "original" : "harmonic";
+    if (!fb.have_per_corner_uv)
+      std::cout << "No per-corner UVs in input; using harmonic initial condition.\n";
+    auto [uv_out, energies] = fb.slim_run(ic, wblog.enabled()? &wblog : nullptr);
 
     // Persist
     save_energies(obj_path, energies);
