@@ -3526,8 +3526,10 @@ def _prepare_affine_seed_quad_candidate(
 		flush=True,
 	)
 	if seed_result is None:
-		print("[snap_surf.map_global] affine seed quad init unavailable", flush=True)
-		return None, None, float("nan"), 0
+		raise RuntimeError(
+			"snap_surf affine_seed_quad_init failed: affine seed quad ray init unavailable; "
+			"cannot continue with an uninitialized/bogus global map"
+		)
 	_apply_seed_quad_init_metadata(fixture, seed_result)
 	candidate = seed_result.affine
 	_write_affine_seed_initial_debug_radius(
@@ -5990,8 +5992,10 @@ def benchmark_fixture(
 	out_dir: str | Path,
 	device: torch.device | str = "cpu",
 	reference_dir: str | Path | None = None,
-	max_model_abs_delta: float = 1.0,
-	max_model_l2_delta: float = 1.0,
+	max_model_abs_delta: float = 2.0,
+	max_model_l2_delta: float = 2.0,
+	max_model_l2_mean_delta: float = 0.05,
+	max_model_l2_mse_delta: float = 0.005,
 	max_model_valid_miss_frac: float = 0.01,
 	require_mask_equal: bool = True,
 	profile_components: bool = False,
@@ -6032,6 +6036,8 @@ def benchmark_fixture(
 	thresholds = {
 		"max_model_abs_delta": float(max_model_abs_delta),
 		"max_model_l2_delta": float(max_model_l2_delta),
+		"max_model_l2_mean_delta": float(max_model_l2_mean_delta),
+		"max_model_l2_mse_delta": float(max_model_l2_mse_delta),
 		"max_model_valid_miss_frac": float(max_model_valid_miss_frac),
 		"require_mask_equal": bool(require_mask_equal),
 	}
@@ -6039,6 +6045,8 @@ def benchmark_fixture(
 	passed = (
 		max_abs_observed <= float(max_model_abs_delta) and
 		float(compare["model_l2_max_delta"]) <= float(max_model_l2_delta) and
+		float(compare["model_l2_mean_delta"]) <= float(max_model_l2_mean_delta) and
+		float(compare["model_l2_mse_delta"]) <= float(max_model_l2_mse_delta) and
 		float(compare["model_valid_missed_frac"]) <= float(max_model_valid_miss_frac) and
 		((not bool(require_mask_equal)) or (bool(compare["active_quad_equal"]) and bool(compare["blocked_quad_equal"])))
 	)

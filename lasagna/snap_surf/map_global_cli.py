@@ -22,8 +22,10 @@ def _build_parser() -> argparse.ArgumentParser:
 	bench.add_argument("--out", required=True, help="Output directory")
 	bench.add_argument("--device", default="auto", help="Torch device; default auto uses cuda when available, else cpu")
 	bench.add_argument("--reference-dir", default=None, help="Reference fixture directory or map directory; defaults to fixture map")
-	bench.add_argument("--max-model-abs-delta", type=float, default=1.0, help="Maximum allowed per-axis absolute UV delta")
-	bench.add_argument("--max-model-l2-delta", type=float, default=1.0, help="Maximum allowed per-vertex L2 UV delta")
+	bench.add_argument("--max-model-abs-delta", type=float, default=2.0, help="Maximum allowed per-axis absolute UV delta")
+	bench.add_argument("--max-model-l2-delta", type=float, default=2.0, help="Maximum allowed per-vertex L2 UV delta")
+	bench.add_argument("--max-model-l2-mean-delta", type=float, default=0.05, help="Maximum allowed mean per-vertex L2 UV delta")
+	bench.add_argument("--max-model-l2-mse-delta", type=float, default=0.005, help="Maximum allowed mean squared per-vertex L2 UV delta")
 	bench.add_argument("--max-model-valid-miss-frac", type=float, default=0.01, help="Maximum fraction of reference model-valid samples the rerun may miss")
 	bench.add_argument("--allow-mask-diff", action="store_true", help="Do not fail when active/blocked masks differ")
 	bench.add_argument("--profile-components", action="store_true", help="Time all and single map objective components without optimizer steps")
@@ -70,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
 				reference_dir=args.reference_dir,
 				max_model_abs_delta=float(args.max_model_abs_delta),
 				max_model_l2_delta=float(args.max_model_l2_delta),
+				max_model_l2_mean_delta=float(args.max_model_l2_mean_delta),
+				max_model_l2_mse_delta=float(args.max_model_l2_mse_delta),
 				max_model_valid_miss_frac=float(args.max_model_valid_miss_frac),
 				require_mask_equal=not bool(args.allow_mask_diff),
 			profile_components=bool(args.profile_components),

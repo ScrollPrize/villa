@@ -20,6 +20,13 @@ TEST_DIR = os.path.dirname(__file__)
 if TEST_DIR not in sys.path:
 	sys.path.insert(0, TEST_DIR)
 
+_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS = [
+	"--max-model-l2-mean-delta",
+	"1.0",
+	"--max-model-l2-mse-delta",
+	"1.0",
+]
+
 from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_vector_dir, compare_map_tensors, load_map_fixture
 from snap_surf.map_global import (
 	AffineMapModel,
@@ -182,6 +189,25 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8, write
 		},
 	)
 	return str(path)
+
+
+def _map_init_small_fixture_dir() -> tuple[Path | None, bool]:
+	explicit = os.environ.get("LASAGNA_MAP_INIT_SMALL_FIXTURE", "")
+	if explicit:
+		return Path(os.path.expandvars(os.path.expanduser(explicit))), True
+	candidates: list[Path] = []
+	data_root = os.environ.get("LASAGNA_TEST_DATA_ROOT", "")
+	if data_root:
+		candidates.append(Path(os.path.expandvars(os.path.expanduser(data_root))) / "map_init_small" / "init")
+	ves_root = os.environ.get("VES", "")
+	if ves_root:
+		candidates.append(Path(os.path.expandvars(os.path.expanduser(ves_root))) / "data" / "test_data" / "map_init_small" / "init")
+	repo_root = Path(__file__).resolve().parents[2]
+	candidates.append(repo_root.parent / "data" / "test_data" / "map_init_small" / "init")
+	for candidate in candidates:
+		if (candidate / "fixture.json").exists():
+			return candidate, False
+	return None, False
 
 
 class SnapSurfMapGlobalTest(unittest.TestCase):
@@ -1936,7 +1962,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			}
 			Path(cfg_path).write_text(json.dumps(cfg_raw), encoding="utf-8")
 
-			rc = map_global_cli.main(["benchmark-fixture", fixture_dir, cfg_path, "--out", out_dir, "--device", "cpu"])
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
+			])
 
 			self.assertEqual(rc, 0)
 			export_dir = Path(out_dir, "rerun_fixture")
@@ -1977,7 +2012,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			_write_planar_global_fixture(fixture_dir)
 			cfg_path = _write_config(tmp, affine_steps=2, map_steps=2)
 
-			rc = map_global_cli.main(["benchmark-fixture", fixture_dir, cfg_path, "--out", out_dir, "--device", "cpu"])
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
+			])
 
 			self.assertEqual(rc, 0)
 			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
@@ -2017,6 +2061,37 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				self.assertEqual(bench["status"], "fail")
 				self.assertFalse(bench["passed"])
 
+	def test_benchmark_fixture_cli_mean_and_mse_thresholds_fail(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=0)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--max-model-abs-delta",
+				"10",
+				"--max-model-l2-delta",
+				"10",
+				"--max-model-l2-mean-delta",
+				"1e-12",
+				"--max-model-l2-mse-delta",
+				"1e-12",
+			])
+
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertEqual(rc, 1)
+			self.assertEqual(bench["status"], "fail")
+			self.assertGreater(bench["map_deltas"]["model_l2_mean_delta"], bench["thresholds"]["max_model_l2_mean_delta"])
+			self.assertGreater(bench["map_deltas"]["model_l2_mse_delta"], bench["thresholds"]["max_model_l2_mse_delta"])
+
 	def test_benchmark_fixture_cli_accepts_explicit_reference_map_dir(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			fixture_dir = os.path.join(tmp, "fixture")
@@ -2034,6 +2109,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				"cpu",
 				"--reference-dir",
 				os.path.join(fixture_dir, "map"),
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
 			])
 
 			self.assertEqual(rc, 0)
@@ -2059,6 +2135,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				"--profile-components",
 				"--profile-repeats",
 				"1",
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
 			])
 
 			self.assertEqual(rc, 0)
@@ -2071,6 +2148,45 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				self.assertGreaterEqual(row["mean_s"], 0.0)
 			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
 			self.assertGreaterEqual(len(bench["profile_components"]), 3)
+
+	def test_reference_map_global_fixture_config_matches_small_fixture_thresholds(self) -> None:
+		fixture_dir, explicit = _map_init_small_fixture_dir()
+		if fixture_dir is None:
+			self.skipTest("map_init_small fixture unavailable; set LASAGNA_MAP_INIT_SMALL_FIXTURE or LASAGNA_TEST_DATA_ROOT")
+		if not (fixture_dir / "fixture.json").exists():
+			if explicit:
+				self.fail(f"LASAGNA_MAP_INIT_SMALL_FIXTURE does not contain fixture.json: {fixture_dir}")
+			self.skipTest(f"map_init_small fixture unavailable: {fixture_dir}")
+		cfg_path = Path(__file__).resolve().parents[1] / "reference_configs" / "map_global_fixture.json"
+		self.assertTrue(cfg_path.exists(), str(cfg_path))
+		device = os.environ.get("LASAGNA_MAP_FIXTURE_TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+		with tempfile.TemporaryDirectory() as tmp:
+			out_dir = os.path.join(tmp, "out")
+			stdout = StringIO()
+			with redirect_stdout(stdout):
+				rc = map_global_cli.main([
+					"benchmark-fixture",
+					str(fixture_dir),
+					str(cfg_path),
+					"--out",
+					out_dir,
+					"--device",
+					device,
+				])
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			thresholds = bench["thresholds"]
+			self.assertEqual(thresholds["max_model_abs_delta"], 2.0)
+			self.assertEqual(thresholds["max_model_l2_delta"], 2.0)
+			self.assertEqual(thresholds["max_model_l2_mean_delta"], 0.05)
+			self.assertEqual(thresholds["max_model_l2_mse_delta"], 0.005)
+			self.assertEqual(thresholds["max_model_valid_miss_frac"], 0.01)
+			deltas = bench["map_deltas"]
+			self.assertLessEqual(deltas["model_l2_max_delta"], thresholds["max_model_l2_delta"])
+			self.assertLessEqual(deltas["model_l2_mean_delta"], thresholds["max_model_l2_mean_delta"])
+			self.assertLessEqual(deltas["model_l2_mse_delta"], thresholds["max_model_l2_mse_delta"])
+			self.assertLessEqual(deltas["model_valid_missed_frac"], thresholds["max_model_valid_miss_frac"])
+			self.assertEqual(rc, 0, stdout.getvalue()[-4000:])
+			self.assertEqual(bench["status"], "pass")
 
 	def test_optimize_fixture_returns_full_rectangular_map(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -2235,6 +2351,50 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertNotIn("affine multistart candidates", text)
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_affine_seed_quad_init", "map_ext_to_model.obj")))
 			self.assertEqual(metrics["history"][0]["name"], "affine_seed_quad_init")
+
+	def test_affine_seed_quad_init_unavailable_fails_instead_of_continuing(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			fixture = load_map_fixture(fixture_dir)
+			_float_tif(Path(fixture_dir) / "model_stack" / "z.tif", torch.full_like(fixture.model_xyz[..., 2], 100.0))
+			fixture_json = Path(fixture_dir, "fixture.json")
+			meta = json.loads(fixture_json.read_text(encoding="utf-8"))
+			meta["seed_model_quad"] = [0, 1, 1]
+			fixture_json.write_text(json.dumps(meta), encoding="utf-8")
+			cfg_path = Path(tmp, "cfg.json")
+			_write_json(
+				cfg_path,
+				{
+					"base": {
+						"map_init": {
+							"subdiv": 2,
+							"w_dist": 1.0,
+							"w_vec_normal": 0.0,
+							"w_surface_normal": 0.0,
+							"w_smooth": 0.0,
+							"w_bend": 0.0,
+							"w_jac": 0.0,
+							"w_metric_smooth": 0.0,
+							"w_area_smooth": 0.0,
+						},
+					},
+					"stages": [
+						{
+							"name": "affine_seed_quad_init",
+							"steps": 1,
+							"lr": 0.05,
+							"params": ["map_surf_affine"],
+							"args": {"affine_seed_quad_init": {"enabled": True, "max_ray_distance": 1.0}},
+						}
+					],
+				},
+			)
+
+			with self.assertRaisesRegex(RuntimeError, "affine seed quad ray init unavailable"):
+				optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
+			self.assertFalse(Path(out_dir, "model_x.tif").exists())
 
 
 if __name__ == "__main__":
