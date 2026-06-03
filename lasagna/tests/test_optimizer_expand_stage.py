@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 
 import torch
@@ -10,6 +12,27 @@ import optimizer
 
 
 class OptimizerExpandStageTest(unittest.TestCase):
+	def test_snap_surf_map_fixture_export_paths_resolve_under_out_dir(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			resolved = optimizer._resolve_snap_surf_map_fixture_export_args(
+				{
+					"fixture_export_dir": "flat_fixture",
+					"export_fixture": {
+						"dir": "nested_fixture",
+						"once": True,
+						"objs": False,
+					},
+					"fixture_export": {
+						"path": os.path.join(tmp, "absolute_fixture"),
+					},
+				},
+				out_dir=tmp,
+			)
+
+			self.assertEqual(resolved["fixture_export_dir"], os.path.join(tmp, "flat_fixture"))
+			self.assertEqual(resolved["export_fixture"]["dir"], os.path.join(tmp, "nested_fixture"))
+			self.assertEqual(resolved["fixture_export"]["path"], os.path.join(tmp, "absolute_fixture"))
+
 	def test_expand_z_wrapper_parses_nested_stages_and_counts_steps(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"base": {

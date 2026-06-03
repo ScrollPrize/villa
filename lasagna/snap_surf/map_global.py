@@ -24,7 +24,7 @@ from .legacy import (
 	_closest_point_uv_on_model_quad,
 	_huber,
 )
-from .map_fixture_io import MapFixture, _float_tif, _write_json, compare_map_tensors, load_map_fixture
+from .map_fixture_io import MapFixture, _float_tif, _write_json, compare_map_tensors, export_map_fixture, load_map_fixture
 from .map_objective import (
 	_map_init_distance_multiplier,
 	_map_init_lifted_z_heading_field,
@@ -38,6 +38,7 @@ from .map_pyramid import (
 	_map_init_integrate_dyadic_uv_pyramid,
 	_map_init_uv_pyr_from_dense,
 )
+from .state import _SurfaceState
 from .tensor import _quad_valid_at_coords, _sample_surface_grid
 
 
@@ -3922,6 +3923,75 @@ def _fixture_from_live_tensors(
 	)
 
 
+def _map_fixture_export_spec(stage: GlobalMapStageConfig) -> dict[str, Any] | None:
+	raw = stage.args.get("export_fixture", stage.args.get("fixture_export", None))
+	if raw is None:
+		raw_dir = stage.args.get("fixture_export_dir", stage.args.get("map_fixture_export_dir", None))
+		if raw_dir in (None, "", False):
+			return None
+		raw = {"dir": raw_dir}
+	if raw in (False, None, ""):
+		return None
+	if raw is True:
+		raw = {"dir": stage.args.get("fixture_export_dir", "map_fixture")}
+	if isinstance(raw, str):
+		raw = {"dir": raw}
+	if not isinstance(raw, dict):
+		raise ValueError("map fixture export config must be an object, string, bool, or null")
+	out_dir = raw.get("dir", raw.get("out_dir", raw.get("path", stage.args.get("fixture_export_dir", None))))
+	if out_dir in (None, "", False):
+		raise ValueError("map fixture export requires 'dir' or fixture_export_dir")
+	once = _truthy_arg(raw.get("once", stage.args.get("fixture_export_once", True)))
+	export_objs = _truthy_arg(raw.get("objs", raw.get("export_objs", stage.args.get("fixture_export_objs", False))))
+	write_geometry = _truthy_arg(raw.get("geometry", raw.get("write_geometry", True)))
+	return {
+		"dir": str(out_dir),
+		"once": bool(once),
+		"objs": bool(export_objs),
+		"geometry": bool(write_geometry),
+		"tag": str(raw.get("tag", raw.get("name", ""))),
+	}
+
+
+def _surface_state_for_fixture_export(
+	*,
+	fixture: MapFixture,
+	uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	sign: int,
+) -> _SurfaceState:
+	state = _SurfaceState()
+	state.ensure(
+		model_shape=tuple(int(v) for v in fixture.model_xyz.shape[:3]),
+		ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+		device=fixture.model_xyz.device,
+		dtype=fixture.model_xyz.dtype,
+	)
+	mi = state.map_init
+	mi.uv = uv.detach()
+	mi.active_quad = active_quad.detach().bool()
+	mi.blocked_quad = torch.zeros_like(mi.active_quad)
+	mi.ext_pos = fixture.ext_xyz.detach()
+	mi.ext_normals = fixture.ext_normals.detach()
+	mi.ext_valid = fixture.ext_valid.detach().bool()
+	mi.ext_quad_valid = fixture.ext_quad_valid.detach().bool()
+	mi.model_depth = int(fixture.metadata.get("model_depth", 0) or 0)
+	mi.sign = int(sign)
+	seed_hw = fixture.metadata.get("seed_ext_sample_hw")
+	if isinstance(seed_hw, (list, tuple)) and len(seed_hw) >= 2:
+		mi.seed_ext_sample_hw = (int(seed_hw[0]), int(seed_hw[1]))
+		state.ext_seed_hw = mi.seed_ext_sample_hw
+	seed_model = fixture.metadata.get("seed_model_quad")
+	if isinstance(seed_model, (list, tuple)) and len(seed_model) >= 3:
+		mi.seed_model_quad = (int(seed_model[0]), int(seed_model[1]), int(seed_model[2]))
+	mi.scale_level = 0
+	mi.target_scale_level = 0
+	mi.scale_strides = [1]
+	mi.scale_levels_used = 1
+	mi.done = True
+	return state
+
+
 class SelfMapRuntime:
 	"""Persistent batched self-map optimizer for init-shell winding pairs."""
 
@@ -4607,6 +4677,7 @@ class GlobalMapRuntime:
 		self._external_health_cache: dict[tuple[Any, ...], tuple[torch.Tensor, dict[str, float], list[int] | None]] = {}
 		self._z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 		self._z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+		self._fixture_exports_done: set[str] = set()
 
 	def _z_lift_for_stage(
 		self,
@@ -5012,6 +5083,48 @@ class GlobalMapRuntime:
 					**stats,
 				},
 			)
+		export_spec = _map_fixture_export_spec(stage)
+		if export_spec is not None:
+			export_dir = Path(str(export_spec["dir"]))
+			export_key = str(export_dir.resolve()) if export_dir.is_absolute() else str(export_dir)
+			if (not bool(export_spec["once"])) or export_key not in self._fixture_exports_done:
+				final_uv = self._uv(active_level=0).detach()
+				state = _surface_state_for_fixture_export(
+					fixture=fixture,
+					uv=final_uv,
+					active_quad=_full_active_quad(fixture),
+					sign=int(self.sign),
+				)
+				export_meta = export_map_fixture(
+					export_dir,
+					cfg=stage_cfg,
+					state=state,
+					model_xyz=fixture.model_xyz,
+					model_valid=fixture.model_valid,
+					model_normals=fixture.model_normals,
+					ext_xyz=fixture.ext_xyz,
+					ext_valid=fixture.ext_valid,
+					ext_normals=fixture.ext_normals,
+					ext_quad_valid=fixture.ext_quad_valid,
+					seed_xyz=tuple(float(v) for v in fixture.metadata.get("seed_xyz", (0.0, 0.0, 0.0))),
+					surface_index=int(external_surface_index),
+					surface_count=1,
+					step=int(self.steps_run),
+					stats=stats,
+					export_objs=bool(export_spec["objs"]),
+					write_geometry=bool(export_spec["geometry"]),
+				)
+				self._fixture_exports_done.add(export_key)
+				stats["snaps_map_fixture_exported"] = 1.0
+				stats["snaps_map_fixture_export_active_quads"] = float(export_meta.get("map_counts", {}).get("active_quads", 0))
+				print(
+					f"[snap_surf.map_global] exported map fixture dir={export_dir} "
+					f"stage={stage.name or _stage_param_label(stage.params, fallback='map_stage')} "
+					f"step={int(self.steps_run)}",
+					flush=True,
+				)
+			else:
+				stats["snaps_map_fixture_exported"] = 0.0
 		return stats
 
 	def snap_loss_prefetch_items(

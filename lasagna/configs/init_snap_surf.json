@@ -133,7 +133,12 @@
 			"args": {
 				"subdiv": 2,
 				"status_interval": 20,
-				"debug_obj_dir": "snap_surf_objs"
+				"debug_obj_dir": "snap_surf_objs",
+				"export_fixture": {
+					"dir": "bench_fixtures/init",
+					"once": true,
+					"objs": true
+				}
 			}
 		},
 		{

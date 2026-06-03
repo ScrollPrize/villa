@@ -1684,6 +1684,57 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual(metrics["common_vertices"], 25)
 			self.assertIn("avg_model_quad_distance", metrics)
 
+	def test_runtime_stage_exports_fixture_once_from_stage_args(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			export_dir = os.path.join(tmp, "exported_fixture")
+			_write_planar_global_fixture(fixture_dir)
+			fixture = load_map_fixture(fixture_dir)
+			runtime = GlobalMapRuntime(seed_xyz=(2.0, 2.0, 0.0))
+			stage = GlobalMapStageConfig(
+				name="export_init",
+				steps=0,
+				lr=0.05,
+				params=("affine",),
+				args={
+					"subdiv": 1,
+					"fixture_export_dir": export_dir,
+					"fixture_export_once": True,
+					"fixture_export_objs": False,
+				},
+			)
+
+			stats1 = runtime.run_stage(
+				stage=stage,
+				model_xyz=fixture.model_xyz,
+				model_normals=fixture.model_normals,
+				model_valid=fixture.model_valid,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_normals=fixture.ext_normals,
+				ext_quad_valid=fixture.ext_quad_valid,
+			)
+			stats2 = runtime.run_stage(
+				stage=stage,
+				model_xyz=fixture.model_xyz,
+				model_normals=fixture.model_normals,
+				model_valid=fixture.model_valid,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_normals=fixture.ext_normals,
+				ext_quad_valid=fixture.ext_quad_valid,
+			)
+
+			self.assertEqual(stats1["snaps_map_fixture_exported"], 1.0)
+			self.assertEqual(stats2["snaps_map_fixture_exported"], 0.0)
+			self.assertTrue(Path(export_dir, "fixture.json").exists())
+			self.assertTrue(Path(export_dir, "map", "model_x.tif").exists())
+			self.assertTrue(Path(export_dir, "ext_surface", "x.tif").exists())
+			self.assertFalse(Path(export_dir, "objs").exists())
+			exported = load_map_fixture(export_dir)
+			self.assertEqual(tuple(exported.reference_uv.shape), tuple(fixture.reference_uv.shape))
+			self.assertEqual(int(exported.reference_active_quad.sum()), int(_full_active_quad(fixture).sum()))
+
 	def test_fixture_cli_writes_debug_objs_when_enabled(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			fixture_dir = os.path.join(tmp, "fixture")

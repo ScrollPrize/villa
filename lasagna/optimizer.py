@@ -5,6 +5,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import torch
 
@@ -644,6 +645,36 @@ def _global_map_stage_from_opt_settings(*, name: str, opt_cfg: OptSettings, args
 		w_fac=_global_map_w_fac_from_eff(base=opt_cfg.base_eff, eff=opt_cfg.eff),
 		args=_global_map_args_from_eff(args, base=opt_cfg.base_eff, eff=opt_cfg.eff),
 	)
+
+
+def _resolve_snap_surf_map_fixture_export_args(args: dict, *, out_dir: str | None) -> dict:
+	if not isinstance(args, dict):
+		return args
+	if out_dir is None:
+		return dict(args)
+	out = dict(args)
+	base = Path(out_dir)
+
+	def _resolve_path(value):
+		if value in (None, "", False):
+			return value
+		path = Path(str(value))
+		return str(path if path.is_absolute() else base / path)
+
+	for key in ("fixture_export_dir", "map_fixture_export_dir"):
+		if key in out:
+			out[key] = _resolve_path(out[key])
+	for key in ("export_fixture", "fixture_export"):
+		raw = out.get(key)
+		if isinstance(raw, str):
+			out[key] = _resolve_path(raw)
+		elif isinstance(raw, dict):
+			nested = dict(raw)
+			for path_key in ("dir", "out_dir", "path"):
+				if path_key in nested:
+					nested[path_key] = _resolve_path(nested[path_key])
+			out[key] = nested
+	return out
 
 
 def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
@@ -1994,6 +2025,10 @@ def optimize(
 			if self_map_mode == "off" and not getattr(model, "_ext_surfaces", None):
 				raise ValueError("snap_surf global map stages require external_surfaces")
 			map_stage = _global_map_stage_from_opt_settings(name=stage.name, opt_cfg=opt_cfg, args=stage_args)
+			map_stage = replace(
+				map_stage,
+				args=_resolve_snap_surf_map_fixture_export_args(map_stage.args, out_dir=out_dir),
+			)
 			_map_status_rows = 0
 			_map_status_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
 			_map_wall = time.perf_counter()
@@ -2170,6 +2205,10 @@ def optimize(
 				name=raw_map_name,
 				opt_cfg=map_opt_cfg,
 				args=map_opt_cfg.args or {},
+			)
+			snap_surf_map_opt_stage = replace(
+				snap_surf_map_opt_stage,
+				args=_resolve_snap_surf_map_fixture_export_args(snap_surf_map_opt_stage.args, out_dir=out_dir),
 			)
 
 		snap_surf_map_weight = _need_term("snap_surf_map", stage_eff)
